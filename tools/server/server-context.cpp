@@ -3495,7 +3495,6 @@ void server_routes::init_routes() {
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
-            { "memory_mb",                   meta->model_size / (1024 * 1024) },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
                 {"audio",  meta->has_inp_audio},

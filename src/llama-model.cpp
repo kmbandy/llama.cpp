@@ -9253,35 +9253,6 @@ uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
 
-uint64_t llama_model_size_from_path(const char * path) {
-    if (!path) {
-        return 0;
-    }
-
-    try {
-        std::vector<std::string> splits;
-
-        llama_model_loader loader(
-            /* metadata                      */ nullptr,
-            /* set_tensor_data               */ nullptr,
-            /* set_tensor_data_ud            */ nullptr,
-            /* fname                         */ path,
-            /* splits                        */ splits,
-            /* file                          */ nullptr,
-            /* use_mmap                      */ false,
-            /* use_direct_io                 */ false,
-            /* check_tensors                 */ false,
-            /* no_alloc                      */ true,
-            /* param_overrides_p             */ nullptr,
-            /* param_tensor_buft_overrides_p */ nullptr
-        );
-
-        return loader.n_bytes;
-    } catch (...) {
-        return 0;
-    }
-}
-
 const char * llama_model_chat_template(const llama_model * model, const char * name) {
     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);

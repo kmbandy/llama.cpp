@@ -538,6 +538,49 @@ void server_models::unload_lru(uint64_t new_model_memory_mb) {
     }
 }
 
+static uint64_t get_model_memory_mb(const common_preset& preset) {
+    common_params params;
+    preset.apply_to_params(params);
+
+    if(params.model.path.empty()) {
+        return 0;
+    }
+
+    struct log_ud_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original;
+        ggml_log_level min_level;
+    } log_ud;
+    llama_log_get(&log_ud.original.callback, &log_ud.original.user_data);
+    log_ud.min_level = GGML_LOG_LEVEL_WARN;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+        log_ud_t * d = (log_ud_t *) ud;
+        const ggml_log_level eff = level >= d->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        d->original.callback(eff, text, d->original.user_data);
+    }, &log_ud);
+
+    llama_model_params mparams = common_model_params_to_llama(params);
+    mparams.no_alloc = true;
+    mparams.use_mmap = false;
+    mparams.use_mlock = false;
+
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+
+    llama_log_set(log_ud.original.callback, log_ud.original.user_data);
+
+    if (!model) {
+        return 0;
+    }
+
+    uint64_t size_bytes = llama_model_size(model);
+    llama_model_free(model);
+
+    return size_bytes / (1024 * 1024);
+}
+
 void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -545,19 +588,13 @@ void server_models::load(const std::string & name) {
 
     uint64_t new_model_memory_mb = 0;
     if (base_params.models_memory_max > 0) {
-        std::string model_path;
-        {
-            std::lock_guard<std::mutex> lk(mutex);
-            auto & meta = mapping[name].meta;
-            if (meta.preset.get_option("LLAMA_ARG_MODEL", model_path) && !model_path.empty()) {
-                uint64_t size_bytes = llama_model_size_from_path(model_path.c_str());
-                new_model_memory_mb = size_bytes / (1024 * 1024);
-                meta.memory_mb = new_model_memory_mb;
-                if (new_model_memory_mb > 0) {
-                    SRV_INF("model %s estimated size: %lu MB\n", name.c_str(),
-                            (unsigned long)new_model_memory_mb);
-                }
-            }
+        std::lock_guard<std::mutex> lk(mutex);
+        auto & meta = mapping[name].meta;
+        new_model_memory_mb = get_model_memory_mb(meta.preset);
+        meta.memory_mb = new_model_memory_mb;
+        if (new_model_memory_mb > 0) {
+            SRV_INF("model %s memory requirements: %lu MB\n", name.c_str(),
+                    (unsigned long)new_model_memory_mb);
         }
     }
 
@@ -643,33 +680,10 @@ void server_models::load(const std::string & name) {
             // also handle status report from child process
             if (stdout_file) {
                 char buffer[4096];
-                bool ready_received = false;
                 while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
-                        if (!ready_received) {
-                            ready_received = true;
-                            try {
-                                httplib::Client cli("http://CHILD_ADDR");
-                                cli.set_connection_timeout(5, 0);
-                                if (auto res = cli.Get("/props")) {
-                                    if (res->status == 200) {
-                                        json props = json::parse(res->body);
-                                        if (props.contains("memory_mb")) {
-                                            uint64_t memory_mb = props["memory_mb"].get<uint64_t>();
-                                            SRV_INF("model %s loaded, actual memory: %lu MB\n", name.c_str(), (unsigned long)memory_mb);
-                                            std::lock_guard<std::mutex> lk(this->mutex);
-                                            if (mapping.find(name) != mapping.end()) {
-                                                mapping[name].meta.memory_mb = memory_mb;
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch (const std::exception & e) {
-                                SRV_WRN("failed to query memory for model %s: %s\n", name.c_str(), e.what());
-                            }
-                        }
                         this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
                         this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0);

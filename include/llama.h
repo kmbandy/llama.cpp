@@ -614,12 +614,6 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
-    // Returns the total size of all the tensors in the model in bytes from a model path
-    // without fully loading the model. Uses llama_model_loader with no_alloc=true.
-    // Returns 0 if the model cannot be loaded or the path is invalid.
-    // This function can be used to estimate memory requirements before loading a model.
-    LLAMA_API uint64_t llama_model_size_from_path(const char * path);
-
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
