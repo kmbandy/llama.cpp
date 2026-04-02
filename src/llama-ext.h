@@ -54,3 +54,9 @@ LLAMA_API void llama_quant_compute_types(
         ggml_tensor ** tensors,
         ggml_type * result_types,
         size_t n_tensors);
+
+// Returns the projected memory use (model + context + compute) in bytes
+// for the given device within this context. Returns 0 if the device is not used.
+LLAMA_API uint64_t llama_context_device_memory(
+        const struct llama_context * ctx,
+        ggml_backend_dev_t           device);

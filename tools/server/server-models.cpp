@@ -7,6 +7,8 @@
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <sheredom/subprocess.h>
 
+#include "../../src/llama-ext.h"
+
 #include <functional>
 #include <algorithm>
 #include <thread>
