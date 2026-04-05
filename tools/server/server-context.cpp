@@ -155,8 +155,8 @@ struct server_slot {
     int64_t t_start_process_prompt;
     int64_t t_start_generation;
 
-    double t_prompt_processing = 0.0; // ms
-    double t_token_generation = 0.0;  // ms
+    double t_prompt_processing; // ms
+    double t_token_generation;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
 
@@ -758,8 +758,8 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
+            // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
         }
 
         slots.clear();
