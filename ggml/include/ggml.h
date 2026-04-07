@@ -434,6 +434,8 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 44, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 45, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_Q1_0    = 41,
+        GGML_TYPE_COUNT   = 42,
     };
 
     // precision
@@ -470,6 +472,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_BF16    = 24, // except 1d tensors
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
     };
 
     // available tensor operations:
