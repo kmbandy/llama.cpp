@@ -2942,7 +2942,7 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_k)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         const bool k_is_turbo = (params.type_k == GGML_TYPE_TURBO2_0 ||
                                  params.type_k == GGML_TYPE_TURBO3_0 ||
@@ -2961,7 +2961,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         const bool v_is_turbo = (params.type_v == GGML_TYPE_TURBO2_0 ||
                                  params.type_v == GGML_TYPE_TURBO3_0 ||
