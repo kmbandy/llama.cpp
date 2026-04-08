@@ -146,3 +146,4 @@ poetry.toml
 # emscripten
 a.out.*
 .gitnexus
+.claude/
