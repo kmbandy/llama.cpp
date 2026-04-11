@@ -3119,16 +3119,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
-        // if the backend scheduler is making copies of CPU tensors, the src pointers can be the same but with different data, see:
-        // https://github.com/ggml-org/llama.cpp/pull/21472#discussion_r3052235188
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j] ? cgraph->nodes[i]->src[j]->data : nullptr;
+            if (cgraph->nodes[i]->src[j]) {
+                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
+                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            }
         }
 
-        if (!res && memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            graph->node_props[i] = prop;
             res = true;
         }
-        graph->node_props[i] = prop;
     }
 
     return res;
@@ -3807,10 +3809,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
-                    if (node->op == GGML_OP_ADD) {
+                    if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
                         int n_fuse = 0;
                         ggml_op ops[8];
-                        std::fill(ops, ops + 8, GGML_OP_ADD);
+                        std::fill(ops, ops + 8, node->op);
 
                         for (; n_fuse <= 6; ++n_fuse){
                             if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
@@ -3827,13 +3829,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         n_fuse++;
 
                         if (n_fuse > 1) {
-                            ggml_tensor fused_add_node;
-                            memcpy(&fused_add_node, node, sizeof(ggml_tensor));
+                            ggml_tensor fused_node;
+                            memcpy(&fused_node, node, sizeof(ggml_tensor));
                             for (int j = 0; j < n_fuse - 1; ++j) {
-                                fused_add_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
+                                fused_node.src[j + 2] = cgraph->nodes[i + j + 1]->src[1];
                             }
-                            fused_add_node.data = cgraph->nodes[i + n_fuse - 1]->data;
-                            ggml_cuda_op_fused_add(*cuda_ctx, &fused_add_node, n_fuse);
+                            fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
+                            if (node->op == GGML_OP_ADD) {
+                                ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
+                            } else {
+                                ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
+                            }
                             i += n_fuse - 1;
 
                             continue;
