@@ -103,6 +103,11 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
+    # dkq640 tile kernels exceed Pascal (sm_61) shared memory limit (51456 > 49152 bytes)
+    # Exclude when building natively for GTX 1070; Ampere+ can handle it
+    if (GGML_NATIVE AND CMAKE_CUDA_ARCHITECTURES MATCHES "61")
+        list(FILTER SRCS EXCLUDE REGEX "dkq640")
+    endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
