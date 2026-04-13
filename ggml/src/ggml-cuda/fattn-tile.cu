@@ -46,12 +46,12 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<576, 512>(ctx, dst);
         } break;
-#ifndef GGML_USE_HIP
+#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_FATTN_DKQ640)
         case 640: {
             GGML_ASSERT(V->ne[0] == 512);
             ggml_cuda_flash_attn_ext_tile_case<640, 512>(ctx, dst);
         } break;
-#endif // GGML_USE_HIP
+#endif // !GGML_USE_HIP && !GGML_CUDA_NO_FATTN_DKQ640
         default: {
             GGML_ABORT("Unsupported head size");
         } break;

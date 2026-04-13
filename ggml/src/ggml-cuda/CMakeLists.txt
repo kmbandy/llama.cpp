@@ -107,6 +107,7 @@ if (CUDAToolkit_FOUND)
     # Exclude when building natively for GTX 1070; Ampere+ can handle it
     if (GGML_NATIVE AND CMAKE_CUDA_ARCHITECTURES MATCHES "61")
         list(FILTER SRCS EXCLUDE REGEX "dkq640")
+        add_compile_definitions(GGML_CUDA_NO_FATTN_DKQ640)
     endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
