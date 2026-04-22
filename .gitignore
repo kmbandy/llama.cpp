@@ -147,3 +147,4 @@ poetry.toml
 a.out.*
 .gitnexus
 .claude/
+.agent.md
