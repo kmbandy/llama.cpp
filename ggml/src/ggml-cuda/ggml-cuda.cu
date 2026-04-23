@@ -681,32 +681,6 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 
-    // TQ4_1S → q8_0 load-time conversion
-    if (tensor->type == GGML_TYPE_TQ4_1S && offset == 0 && size == ggml_nbytes(tensor)) {
-        const int64_t n_elements = ggml_nelements(tensor);
-
-        // Upload TQ4_1S to a temp GPU buffer
-        void * tmp_tq4;
-        CUDA_CHECK(cudaMalloc(&tmp_tq4, size));
-        CUDA_CHECK(cudaMemcpyAsync(tmp_tq4, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-
-        // Convert TQ4_1S (tmp) → q8_0 (tensor->data, which has q8_0-sized allocation)
-        ggml_cuda_convert_tq4_1s_to_q8_0(tmp_tq4, tensor->data, n_elements, cudaStreamPerThread);
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-
-        CUDA_CHECK(cudaFree(tmp_tq4));
-
-        // Update tensor metadata to q8_0
-        tensor->type = GGML_TYPE_Q8_0;
-        tensor->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
-        tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(GGML_TYPE_Q8_0));
-        for (int i = 2; i < GGML_MAX_DIMS; i++) {
-            tensor->nb[i] = tensor->nb[i-1] * tensor->ne[i-1];
-        }
-
-        return;
-    }
-
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -826,13 +800,6 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t size = ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
-
-    // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space in VRAM
-    if (tensor->type == GGML_TYPE_TQ4_1S) {
-        // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
-        const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
-        size = n_blocks * sizeof(block_q8_0);
-    }
 
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
