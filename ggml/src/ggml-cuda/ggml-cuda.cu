@@ -1642,10 +1642,26 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
     p.extent = make_cudaExtent(width, height, 1);
     return cudaMemcpy3DPeerAsync(&p, stream);
 #else
-    // HIP does not support cudaMemcpy3DPeerAsync or vmm pools
-    GGML_UNUSED(dstDevice);
-    GGML_UNUSED(srcDevice);
-    return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, stream);
+    // HIP does not support cudaMemcpy3DPeerAsync or vmm pools.
+    // hipMemcpy2DAsync with hipMemcpyDeviceToDevice requires P2P access between devices.
+    // For mixed-architecture multi-GPU setups (e.g. gfx1201 + gfx1030) without P2P,
+    // hipMemcpy2DAsync submits successfully but fails asynchronously with
+    // hipErrorNoBinaryForGpu when the internal copy kernel isn't compiled for the
+    // destination device. Use hipMemcpyPeerAsync row-by-row instead, which handles
+    // non-P2P cross-device copies correctly via CPU staging.
+    if (dstDevice == srcDevice) {
+        return hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, hipMemcpyDeviceToDevice, stream);
+    }
+    for (size_t i = 0; i < height; ++i) {
+        cudaError_t err = cudaMemcpyPeerAsync(
+            (char *) dst + i*dpitch, dstDevice,
+            (const char *) src + i*spitch, srcDevice,
+            width, stream);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
