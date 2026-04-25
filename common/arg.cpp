@@ -1359,6 +1359,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-warm-device"}, "DEVICE",
+        "HIP device index to use as warm KV cache tier (e.g. 1 for 6900XT eGPU); requires --kv-tiered",
+        [](common_params & params, int value) {
+            params.kv_warm_device = value;
+        }
+    ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

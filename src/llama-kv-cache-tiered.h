@@ -182,7 +182,11 @@ public:
     bool resize(uint32_t new_total_ctx);
     bool set_eviction_policy(llama_eviction_policy policy);
     bool set_attention_threshold(float threshold);
+#ifdef GGML_USE_HIP
     void set_warm_elem_bytes(size_t n) { warm_elem_bytes = n; }
+#else
+    void set_warm_elem_bytes(size_t) {}
+#endif
 
     // Eviction interface
     bool evict_tokens(uint32_t n_tokens_to_evict, llama_cache_tier from_tier);

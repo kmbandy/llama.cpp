@@ -582,6 +582,7 @@ struct common_params {
     int kv_tier_eviction_policy = 3;     // 0=LRU, 1=LFU, 2=attention, 3=hybrid (default)
     int kv_tier_compression   = 1;       // 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized
     float kv_tier_attention_threshold = 0.1f;  // attention threshold for eviction
+    int   kv_warm_device        = -1;    // HIP device index for warm KV tier (-1 = disabled)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

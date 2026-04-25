@@ -61,6 +61,7 @@ bool server_tiered_cache::init_slot(int slot_id, const llama_model& model) {
     config.warm_percent = params.kv_tier_warm_pct;
     config.cold_percent = params.kv_tier_cold_pct;
     config.total_ctx = params.n_ctx;
+    config.warm_device = params.kv_warm_device;
 
     // Create tiered cache instance
     manager.tiered_cache = std::make_unique<llama_kv_cache_tiered>(
@@ -71,6 +72,14 @@ bool server_tiered_cache::init_slot(int slot_id, const llama_model& model) {
         compression,
         attention_threshold
     );
+
+    // set bytes-per-token for warm device hipMalloc sizing
+    if (params.kv_warm_device >= 0) {
+        int32_t n_kv_heads = llama_model_n_head_kv(&model);
+        int32_t head_dim   = llama_model_n_embd(&model) / llama_model_n_head(&model);
+        manager.tiered_cache->set_warm_elem_bytes(
+            (size_t)n_kv_heads * head_dim * sizeof(ggml_fp16_t));
+    }
 
     // Initialize the tiered cache
     if (!manager.tiered_cache->init()) {
