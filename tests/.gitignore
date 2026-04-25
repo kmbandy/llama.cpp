@@ -5,3 +5,7 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+
+cmake_install.cmake
+CTestTestfile.cmake
+*.a

@@ -173,3 +173,5 @@ llama.pc
 ggml/ggml-config.cmake
 ggml/ggml-version.cmake
 tests/libgguf-model-data.a
+*.a
+tests/cmake_install.cmake
