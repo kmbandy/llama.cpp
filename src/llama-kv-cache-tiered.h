@@ -182,14 +182,13 @@ public:
     bool resize(uint32_t new_total_ctx);
     bool set_eviction_policy(llama_eviction_policy policy);
     bool set_attention_threshold(float threshold);
-#ifdef GGML_USE_HIP
-    void set_warm_elem_bytes(size_t n) { warm_elem_bytes = n; }
-#else
-    void set_warm_elem_bytes(size_t) {}
-#endif
+    // Wire real KV layer tensors for actual data movement
+    void set_kv_layers_from_cache(llama_kv_cache * cache);
 
     // Eviction interface
     bool evict_tokens(uint32_t n_tokens_to_evict, llama_cache_tier from_tier);
+    // Pre-register hot positions 0..n_hot-1 so eviction candidates are available
+    void track_hot_range(uint32_t n_hot);
     
     // Migration with tensor handles - requires actual KV cache tensor pointers
     bool migrate_tokens(const std::vector<llama_pos>& positions,
@@ -246,24 +245,39 @@ private:
     // Thread safety
     mutable std::mutex mutex;
 
-    // KV cache tensor handles for actual data movement
-    // These point to the underlying ggml_tensor objects containing K and V data
-    const ggml_tensor* k_tensor = nullptr;
-    const ggml_tensor* v_tensor = nullptr;
-
+    // Per-layer KV tensor info — populated by set_kv_layers_from_cache()
+    // K layout: [n_embd_k_gqa, kv_size, n_stream] — token p is contiguous at row p
+    // V layout: [n_embd_v_gqa, kv_size, n_stream] — when v_trans=true, token p's
+    //   element j is at flat index (j*kv_size + p), requiring scatter/gather
+    struct TieredKVLayer {
+        ggml_tensor * k     = nullptr;   // raw K tensor in VRAM (or host)
+        ggml_tensor * v     = nullptr;   // raw V tensor in VRAM (or host)
+        bool v_trans        = false;     // true = V stored transposed (default)
+        int64_t kv_size     = 0;         // n_ctx_max (= k->ne[1])
+        size_t k_bytes      = 0;         // bytes per token for K (contiguous row)
+        size_t v_bytes      = 0;         // bytes per token for V (de-transposed)
+        uint8_t * warm_k    = nullptr;   // warm_slots * k_bytes, host RAM
+        uint8_t * warm_v    = nullptr;   // warm_slots * v_bytes, host RAM (de-transposed)
 #ifdef GGML_USE_HIP
-    // 6900XT warm tier: device buffers on warm_device
-    void * warm_k_dev = nullptr;     // hipMalloc'd on warm_device
-    void * warm_v_dev = nullptr;
-    size_t warm_dev_capacity = 0;    // max tokens in warm device buffer
-    size_t warm_elem_bytes  = 0;     // bytes per token per layer for K or V
+        void * warm_k_dev   = nullptr;   // optional: device (eGPU) warm K buffer
+        void * warm_v_dev   = nullptr;   // optional: device (eGPU) warm V buffer
+#endif
+    };
+    std::vector<TieredKVLayer> kv_layers;
+
+    // Warm slot occupancy (shared across all layers)
     struct WarmSlot { bool occupied = false; llama_pos pos = -1; };
-    std::vector<WarmSlot>                warm_slots;
-    std::unordered_map<llama_pos, int>   warm_pos_to_slot;
+    std::vector<WarmSlot>              warm_slots;
+    std::unordered_map<llama_pos, int> warm_pos_to_slot;
     int  warm_alloc_slot();
     void warm_free_slot(llama_pos pos);
-    bool warm_copy_to_device(int slot, const void * k_host, const void * v_host, size_t nbytes);
-    bool warm_copy_from_device(int slot, void * k_host, void * v_host, size_t nbytes);
+
+    // Per-layer warm copy helpers: VRAM ↔ RAM (or VRAM ↔ device)
+    bool warm_copy_to_host(uint32_t il, int slot, llama_pos pos);
+    bool warm_copy_from_host(uint32_t il, int slot, llama_pos pos);
+#ifdef GGML_USE_HIP
+    bool warm_copy_to_dev(uint32_t il, int slot, llama_pos pos);
+    bool warm_copy_from_dev(uint32_t il, int slot, llama_pos pos);
 #endif
 
     // Helper methods

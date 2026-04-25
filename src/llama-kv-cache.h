@@ -174,6 +174,12 @@ public:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
+    // Raw layer tensor access for tiered KV cache data movement
+    ggml_tensor * get_layer_k_raw(uint32_t layer_idx) const { return layers.at(layer_idx).k; }
+    ggml_tensor * get_layer_v_raw(uint32_t layer_idx) const { return layers.at(layer_idx).v; }
+    uint32_t      get_num_kv_layers() const { return (uint32_t)layers.size(); }
+    bool          is_v_transposed()   const { return v_trans; }
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;

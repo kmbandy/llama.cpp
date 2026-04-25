@@ -27,13 +27,13 @@ struct server_tiered_cache {
     ~server_tiered_cache();
 
     // Initialize tier manager for a slot
-    bool init_slot(int slot_id, const llama_model& model);
+    bool init_slot(int slot_id, const llama_model& model, struct llama_context * lctx = nullptr);
 
     // Get tier manager for a slot
     slot_tier_manager* get_slot_manager(int slot_id);
 
     // Evict tokens from a slot
-    bool evict_from_slot(int slot_id, uint32_t n_tokens);
+    bool evict_from_slot(int slot_id, uint32_t n_tokens, uint32_t n_hot_positions = 0);
 
     // Migrate tokens between tiers for a slot
     bool migrate_in_slot(int slot_id, const std::vector<llama_pos>& positions,

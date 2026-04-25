@@ -922,7 +922,7 @@ private:
 
             // initialize tier manager for slot if enabled
             if (params_base.kv_tiered_enabled) {
-                if (!tiered_cache->init_slot(i, *model)) {
+                if (!tiered_cache->init_slot(i, *model, ctx)) {
                     SRV_WRN("failed to initialize tier manager for slot %d\n", i);
                 } else {
                     SLT_INF(slot, "tier manager initialized for slot %s\n", "");
@@ -1408,6 +1408,24 @@ private:
 
         if (incomplete) {
             slot.has_next_token = true;
+        }
+
+        // Proactive tiered cache eviction: when hot tier reaches 80% capacity,
+        // evict oldest tokens to warm/cold to make room. Works for all architectures
+        // including hybrids that don't support ctx_shift.
+        if (params_base.kv_tiered_enabled && tiered_cache) {
+            const int n_tokens = slot.prompt.n_tokens();
+            const int evict_threshold = (int)(slot.n_ctx * 0.80f);
+            if (n_tokens >= evict_threshold) {
+                auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                if (slot_tier && slot_tier->initialized) {
+                    const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
+                    if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
+                        SLT_INF(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
+                                n_evict, n_tokens, slot.n_ctx);
+                    }
+                }
+            }
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
@@ -2209,7 +2227,7 @@ private:
                         // Evict tokens to tiered cache before context shift
                         int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
                         if (n_evict > 0) {
-                            if (tiered_cache->evict_from_slot(slot.id, n_evict)) {
+                            if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)slot.prompt.n_tokens())) {
                                 SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
                             }
                         }

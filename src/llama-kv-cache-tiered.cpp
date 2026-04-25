@@ -313,7 +313,14 @@ llama_kv_cache_tiered::llama_kv_cache_tiered(
 }
 
 llama_kv_cache_tiered::~llama_kv_cache_tiered() {
-    // Cleanup
+    for (auto & tl : kv_layers) {
+        delete[] tl.warm_k;
+        delete[] tl.warm_v;
+#ifdef GGML_USE_HIP
+        if (tl.warm_k_dev) { hipFree(tl.warm_k_dev); }
+        if (tl.warm_v_dev) { hipFree(tl.warm_v_dev); }
+#endif
+    }
 }
 
 bool llama_kv_cache_tiered::init() {
@@ -323,37 +330,12 @@ bool llama_kv_cache_tiered::init() {
         std::filesystem::create_directories(ssd_dir);
     }
 
-#ifdef GGML_USE_HIP
-    if (config.warm_device >= 0) {
-        // Allocate warm tier buffers on 6900XT (or whatever warm_device is)
-        int prev_dev = 0;
-        hipGetDevice(&prev_dev);
-        hipSetDevice(config.warm_device);
-
-        // Each warm slot holds n_kv_heads * head_dim elements per position.
-        // We allocate config.warm_ctx slots; each slot is warm_elem_bytes bytes
-        // for K and the same for V.
-        // warm_elem_bytes is set by the caller via set_warm_elem_bytes().
-        if (warm_elem_bytes > 0 && config.warm_capacity() > 0) {
-            warm_dev_capacity = warm_elem_bytes * config.warm_capacity();
-            hipError_t err_k = hipMalloc(&warm_k_dev, warm_dev_capacity);
-            hipError_t err_v = hipMalloc(&warm_v_dev, warm_dev_capacity);
-            if (err_k != hipSuccess || err_v != hipSuccess) {
-                LLAMA_LOG_WARN("%s: hipMalloc warm tier on device %d failed, falling back to SSD\n",
-                               __func__, config.warm_device);
-                if (warm_k_dev) { hipFree(warm_k_dev); warm_k_dev = nullptr; }
-                if (warm_v_dev) { hipFree(warm_v_dev); warm_v_dev = nullptr; }
-                warm_dev_capacity = 0;
-            } else {
-                warm_slots.assign(config.warm_capacity(), WarmSlot{});
-                LLAMA_LOG_INFO("%s: warm tier on device %d: %.1f MB K + %.1f MB V\n",
-                               __func__, config.warm_device,
-                               warm_dev_capacity / 1e6, warm_dev_capacity / 1e6);
-            }
-        }
-        hipSetDevice(prev_dev);
+    // Warm slot tracking — per-layer buffers allocated later in set_kv_layers_from_cache()
+    if (config.warm_capacity() > 0) {
+        warm_slots.assign(config.warm_capacity(), WarmSlot{});
+        LLAMA_LOG_INFO("%s: warm tier: %u slots reserved (buffers wired after KV layers available)\n",
+                       __func__, config.warm_capacity());
     }
-#endif
 
     return true;
 }
@@ -376,25 +358,59 @@ bool llama_kv_cache_tiered::set_attention_threshold(float threshold) {
     return true;
 }
 
+void llama_kv_cache_tiered::track_hot_range(uint32_t n_hot) {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (uint32_t p = 0; p < n_hot; p++) {
+        token_metadata.record_access((llama_pos)p);
+    }
+    stats.hot_tokens = n_hot;
+}
+
 bool llama_kv_cache_tiered::evict_tokens(uint32_t n_tokens_to_evict, llama_cache_tier from_tier) {
     std::lock_guard<std::mutex> lock(mutex);
 
-    // Get eviction candidates based on policy
-    auto candidates = token_metadata.get_eviction_candidates(
-        eviction_policy,
-        n_tokens_to_evict);
+    auto candidates = token_metadata.get_eviction_candidates(eviction_policy, n_tokens_to_evict);
+    if (candidates.empty()) {
+        return false;
+    }
 
-    // Evict tokens
+    std::vector<llama_pos> to_warm, to_cold;
+
+    // Route to warm if slots available (RAM or GPU), otherwise cold
+    int free_warm = 0;
+    for (const auto & s : warm_slots) {
+        if (!s.occupied) free_warm++;
+    }
     for (auto pos : candidates) {
-        // Move to cold tier or remove
-        // Implementation depends on tier architecture
+        if (free_warm > 0) {
+            to_warm.push_back(pos);
+            free_warm--;
+        } else {
+            to_cold.push_back(pos);
+        }
+    }
+
+    // migrate_tokens handles null k_tensor/v_tensor as metadata-only (no-copy) path
+    if (!to_warm.empty()) {
+        migrate_tokens(to_warm, TIER_HOT, TIER_WARM);
+        stats.warm_tokens += (uint32_t)to_warm.size();
+        stats.hot_tokens   = stats.hot_tokens >= (uint32_t)to_warm.size()
+                           ? stats.hot_tokens - (uint32_t)to_warm.size() : 0;
+        LLAMA_LOG_INFO("%s: evicted %zu hot->warm\n", __func__, to_warm.size());
+    }
+    if (!to_cold.empty()) {
+        migrate_tokens(to_cold, TIER_HOT, TIER_COLD);
+        stats.cold_tokens += (uint32_t)to_cold.size();
+        stats.hot_tokens   = stats.hot_tokens >= (uint32_t)to_cold.size()
+                           ? stats.hot_tokens - (uint32_t)to_cold.size() : 0;
+        LLAMA_LOG_INFO("%s: evicted %zu hot->cold\n", __func__, to_cold.size());
     }
 
     stats.eviction_count += candidates.size();
     return true;
 }
 
-#ifdef GGML_USE_HIP
+// Warm slot management — unconditional (works for RAM and GPU warm tiers)
 int llama_kv_cache_tiered::warm_alloc_slot() {
     for (int i = 0; i < (int)warm_slots.size(); i++) {
         if (!warm_slots[i].occupied) {
@@ -415,95 +431,289 @@ void llama_kv_cache_tiered::warm_free_slot(llama_pos pos) {
     }
 }
 
-bool llama_kv_cache_tiered::warm_copy_to_device(int slot, const void * k_host, const void * v_host, size_t nbytes) {
-    if (!warm_k_dev || !warm_v_dev || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
-    int prev_dev = 0;
-    hipGetDevice(&prev_dev);
-    hipSetDevice(config.warm_device);
-    size_t offset = (size_t)slot * nbytes;
-    bool ok = (hipMemcpy((char*)warm_k_dev + offset, k_host, nbytes, hipMemcpyHostToDevice) == hipSuccess) &&
-              (hipMemcpy((char*)warm_v_dev + offset, v_host, nbytes, hipMemcpyHostToDevice) == hipSuccess);
-    hipSetDevice(prev_dev);
-    return ok;
+// Copy one token's K data from VRAM (or host) into warm slot — K is always contiguous
+bool llama_kv_cache_tiered::warm_copy_to_host(uint32_t il, int slot, llama_pos pos) {
+    if (il >= kv_layers.size() || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    const auto & tl = kv_layers[il];
+    if (!tl.k || !tl.warm_k || !tl.v || !tl.warm_v) return false;
+
+    const size_t elem_k = ggml_element_size(tl.k);
+    const size_t n_embd_k = (size_t)tl.k->ne[0];
+    uint8_t * dst_k = tl.warm_k + (size_t)slot * tl.k_bytes;
+
+    // K: contiguous row at pos — single copy
+#ifdef GGML_USE_HIP
+    hipMemcpy(dst_k, (uint8_t *)tl.k->data + (size_t)pos * tl.k_bytes, tl.k_bytes, hipMemcpyDeviceToHost);
+#else
+    memcpy(dst_k, (uint8_t *)tl.k->data + (size_t)pos * tl.k_bytes, tl.k_bytes);
+#endif
+
+    const size_t elem_v = ggml_element_size(tl.v);
+    const size_t n_embd_v = (size_t)tl.v->ne[0];
+    uint8_t * dst_v = tl.warm_v + (size_t)slot * tl.v_bytes;
+
+    if (!tl.v_trans) {
+        // V: also contiguous when not transposed
+#ifdef GGML_USE_HIP
+        hipMemcpy(dst_v, (uint8_t *)tl.v->data + (size_t)pos * tl.v_bytes, tl.v_bytes, hipMemcpyDeviceToHost);
+#else
+        memcpy(dst_v, (uint8_t *)tl.v->data + (size_t)pos * tl.v_bytes, tl.v_bytes);
+#endif
+    } else {
+        // V transposed: element j at (j*kv_size + pos)*elem_v — gather into contiguous warm buf
+        // Use hipMemcpy2D (src column → dst row): copies n_embd_v elements, each elem_v bytes apart
+#ifdef GGML_USE_HIP
+        hipMemcpy2D(dst_v,                                          // dst (contiguous)
+                    elem_v,                                          // dst pitch
+                    (uint8_t *)tl.v->data + (size_t)pos * elem_v,  // src (column pos)
+                    (size_t)tl.kv_size * elem_v,                    // src pitch (stride between rows)
+                    elem_v,                                          // width per row
+                    n_embd_v,                                        // number of rows
+                    hipMemcpyDeviceToHost);
+#else
+        for (size_t j = 0; j < n_embd_v; j++) {
+            memcpy(dst_v + j * elem_v,
+                   (uint8_t *)tl.v->data + ((size_t)j * (size_t)tl.kv_size + (size_t)pos) * elem_v,
+                   elem_v);
+        }
+#endif
+    }
+    return true;
 }
 
-bool llama_kv_cache_tiered::warm_copy_from_device(int slot, void * k_host, void * v_host, size_t nbytes) {
-    if (!warm_k_dev || !warm_v_dev || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
-    int prev_dev = 0;
-    hipGetDevice(&prev_dev);
-    hipSetDevice(config.warm_device);
-    size_t offset = (size_t)slot * nbytes;
-    bool ok = (hipMemcpy(k_host, (char*)warm_k_dev + offset, nbytes, hipMemcpyDeviceToHost) == hipSuccess) &&
-              (hipMemcpy(v_host, (char*)warm_v_dev + offset, nbytes, hipMemcpyDeviceToHost) == hipSuccess);
+// Restore one token's K/V from warm slot back into the hot VRAM tensor
+bool llama_kv_cache_tiered::warm_copy_from_host(uint32_t il, int slot, llama_pos pos) {
+    if (il >= kv_layers.size() || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    const auto & tl = kv_layers[il];
+    if (!tl.k || !tl.warm_k || !tl.v || !tl.warm_v) return false;
+
+    const size_t elem_k = ggml_element_size(tl.k);
+    const size_t n_embd_k = (size_t)tl.k->ne[0];
+    const uint8_t * src_k = tl.warm_k + (size_t)slot * tl.k_bytes;
+
+#ifdef GGML_USE_HIP
+    hipMemcpy((uint8_t *)tl.k->data + (size_t)pos * tl.k_bytes, src_k, tl.k_bytes, hipMemcpyHostToDevice);
+#else
+    memcpy((uint8_t *)tl.k->data + (size_t)pos * tl.k_bytes, src_k, tl.k_bytes);
+#endif
+
+    const size_t elem_v = ggml_element_size(tl.v);
+    const size_t n_embd_v = (size_t)tl.v->ne[0];
+    const uint8_t * src_v = tl.warm_v + (size_t)slot * tl.v_bytes;
+
+    if (!tl.v_trans) {
+#ifdef GGML_USE_HIP
+        hipMemcpy((uint8_t *)tl.v->data + (size_t)pos * tl.v_bytes, src_v, tl.v_bytes, hipMemcpyHostToDevice);
+#else
+        memcpy((uint8_t *)tl.v->data + (size_t)pos * tl.v_bytes, src_v, tl.v_bytes);
+#endif
+    } else {
+        // Scatter: warm contiguous → V transposed column at pos
+#ifdef GGML_USE_HIP
+        hipMemcpy2D((uint8_t *)tl.v->data + (size_t)pos * elem_v,  // dst column pos
+                    (size_t)tl.kv_size * elem_v,                     // dst pitch
+                    src_v,                                            // src (contiguous)
+                    elem_v,                                           // src pitch
+                    elem_v,                                           // width
+                    n_embd_v,                                         // height
+                    hipMemcpyHostToDevice);
+#else
+        for (size_t j = 0; j < n_embd_v; j++) {
+            memcpy((uint8_t *)tl.v->data + ((size_t)j * (size_t)tl.kv_size + (size_t)pos) * elem_v,
+                   src_v + j * elem_v,
+                   elem_v);
+        }
+#endif
+    }
+    return true;
+}
+
+#ifdef GGML_USE_HIP
+// VRAM (R9700) → device VRAM (6900XT warm tier): K contiguous, V gather/scatter
+bool llama_kv_cache_tiered::warm_copy_to_dev(uint32_t il, int slot, llama_pos pos) {
+    if (il >= kv_layers.size() || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    const auto & tl = kv_layers[il];
+    if (!tl.warm_k_dev || !tl.warm_v_dev || !tl.k || !tl.v) return false;
+    int prev_dev = 0; hipGetDevice(&prev_dev); hipSetDevice(config.warm_device);
+    // K: contiguous D2D copy
+    hipMemcpy((uint8_t *)tl.warm_k_dev + (size_t)slot * tl.k_bytes,
+              (uint8_t *)tl.k->data   + (size_t)pos  * tl.k_bytes,
+              tl.k_bytes, hipMemcpyDeviceToDevice);
+    const size_t ev = ggml_element_size(tl.v);
+    const size_t nv = (size_t)tl.v->ne[0]; // n_embd_v_gqa
+    if (!tl.v_trans) {
+        hipMemcpy((uint8_t *)tl.warm_v_dev + (size_t)slot * tl.v_bytes,
+                  (uint8_t *)tl.v->data   + (size_t)pos  * tl.v_bytes,
+                  tl.v_bytes, hipMemcpyDeviceToDevice);
+    } else {
+        // Gather column pos into contiguous warm buf
+        hipMemcpy2D((uint8_t *)tl.warm_v_dev + (size_t)slot * tl.v_bytes, ev,
+                    (uint8_t *)tl.v->data    + (size_t)pos  * ev,
+                    (size_t)tl.kv_size * ev, ev, nv, hipMemcpyDeviceToDevice);
+    }
     hipSetDevice(prev_dev);
-    return ok;
+    return true;
+}
+
+bool llama_kv_cache_tiered::warm_copy_from_dev(uint32_t il, int slot, llama_pos pos) {
+    if (il >= kv_layers.size() || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    const auto & tl = kv_layers[il];
+    if (!tl.warm_k_dev || !tl.warm_v_dev || !tl.k || !tl.v) return false;
+    int prev_dev = 0; hipGetDevice(&prev_dev); hipSetDevice(config.warm_device);
+    hipMemcpy((uint8_t *)tl.k->data    + (size_t)pos  * tl.k_bytes,
+              (uint8_t *)tl.warm_k_dev + (size_t)slot * tl.k_bytes,
+              tl.k_bytes, hipMemcpyDeviceToDevice);
+    const size_t ev = ggml_element_size(tl.v);
+    const size_t nv = (size_t)tl.v->ne[0];
+    if (!tl.v_trans) {
+        hipMemcpy((uint8_t *)tl.v->data    + (size_t)pos  * tl.v_bytes,
+                  (uint8_t *)tl.warm_v_dev + (size_t)slot * tl.v_bytes,
+                  tl.v_bytes, hipMemcpyDeviceToDevice);
+    } else {
+        hipMemcpy2D((uint8_t *)tl.v->data    + (size_t)pos  * ev,
+                    (size_t)tl.kv_size * ev,
+                    (uint8_t *)tl.warm_v_dev + (size_t)slot * tl.v_bytes, ev,
+                    ev, nv, hipMemcpyDeviceToDevice);
+    }
+    hipSetDevice(prev_dev);
+    return true;
 }
 #endif  // GGML_USE_HIP
+
+void llama_kv_cache_tiered::set_kv_layers_from_cache(llama_kv_cache * cache) {
+    if (!cache) return;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    uint32_t n = cache->get_num_kv_layers();
+    bool vtrans = cache->is_v_transposed();
+    int64_t kvsz = (int64_t)cache->get_size();
+
+    kv_layers.resize(n);
+    for (uint32_t il = 0; il < n; il++) {
+        auto & tl = kv_layers[il];
+        tl.k      = cache->get_layer_k_raw(il);
+        tl.v      = cache->get_layer_v_raw(il);
+        tl.v_trans = vtrans;
+        tl.kv_size = kvsz;
+        if (tl.k) tl.k_bytes = (size_t)tl.k->ne[0] * ggml_element_size(tl.k);
+        if (tl.v) tl.v_bytes = (size_t)tl.v->ne[0] * ggml_element_size(tl.v);
+    }
+
+    // (Re)allocate per-layer warm buffers using already-reserved slot count
+    uint32_t n_warm = (uint32_t)warm_slots.size();
+    if (n_warm == 0 && config.warm_capacity() > 0) {
+        n_warm = config.warm_capacity();
+        warm_slots.assign(n_warm, WarmSlot{});
+    }
+
+    for (auto & tl : kv_layers) {
+        delete[] tl.warm_k;
+        delete[] tl.warm_v;
+        tl.warm_k = tl.warm_v = nullptr;
+        if (n_warm > 0 && tl.k_bytes > 0) tl.warm_k = new uint8_t[n_warm * tl.k_bytes]();
+        if (n_warm > 0 && tl.v_bytes > 0) tl.warm_v = new uint8_t[n_warm * tl.v_bytes]();
+
+#ifdef GGML_USE_HIP
+        if (config.warm_device >= 0 && n_warm > 0) {
+            hipSetDevice(config.warm_device);
+            if (tl.warm_k_dev) hipFree(tl.warm_k_dev);
+            if (tl.warm_v_dev) hipFree(tl.warm_v_dev);
+            tl.warm_k_dev = tl.warm_v_dev = nullptr;
+            if (tl.k_bytes > 0) hipMalloc(&tl.warm_k_dev, n_warm * tl.k_bytes);
+            if (tl.v_bytes > 0) hipMalloc(&tl.warm_v_dev, n_warm * tl.v_bytes);
+        }
+#endif
+    }
+
+    size_t total_mb = 0;
+    for (const auto & tl : kv_layers)
+        total_mb += (tl.k_bytes + tl.v_bytes) * n_warm;
+    total_mb /= (1024*1024);
+
+    LLAMA_LOG_INFO("%s: wired %u KV layers (v_trans=%d, kv_size=%lld), warm RAM: ~%zu MB (%u slots x %u layers)\n",
+                   __func__, n, (int)vtrans, (long long)kvsz, total_mb, n_warm, n);
+}
 
 bool llama_kv_cache_tiered::migrate_tokens(const std::vector<llama_pos>& positions,
                                             llama_cache_tier from_tier,
                                             llama_cache_tier to_tier,
-                                            const ggml_tensor* k_tensor,
-                                            const ggml_tensor* v_tensor) {
+                                            const ggml_tensor* /*unused_k*/,
+                                            const ggml_tensor* /*unused_v*/) {
     auto start = std::chrono::high_resolution_clock::now();
+    bool success = true;
 
-    // Migration logic based on tier direction
-    // - Hot (VRAM) to Warm (RAM): copy with compression
-    // - Warm (RAM) to Cold (SSD): compress and write to SSD
-    // - Cold (SSD) to Warm/Hot: decompress and load to RAM/VRAM
-    
-    // Check if we have tensor pointers for actual data movement
-    if (k_tensor == nullptr || v_tensor == nullptr) {
-        // Metadata-only migration (no actual data movement)
+    if (kv_layers.empty() || warm_slots.empty()) {
+        // Metadata-only path: layer tensors not yet wired (set_kv_layers_from_cache not called)
         for (auto pos : positions) {
             token_metadata.record_access(pos);
         }
     } else {
-        // Actual data migration with tensor pointers
-        // Determine source and destination based on tier
-        bool is_hot_to_warm = (from_tier == TIER_HOT && to_tier == TIER_WARM);
-        bool is_warm_to_cold = (from_tier == TIER_WARM && to_tier == TIER_COLD);
-        bool is_cold_to_warm = (from_tier == TIER_COLD && to_tier == TIER_WARM);
-        bool is_cold_to_hot = (from_tier == TIER_COLD && to_tier == TIER_HOT);
-        
-        if (is_warm_to_cold) {
-            // Warm→Cold: serialize to SSD
-            save_to_ssd(positions, k_tensor, v_tensor, false);
-        } else if (is_hot_to_warm) {
-#ifdef GGML_USE_HIP
-            if (warm_k_dev && warm_elem_bytes > 0) {
-                // R9700 VRAM → host staging → 6900XT VRAM
-                size_t nbytes = warm_elem_bytes;
-                std::vector<uint8_t> k_buf(nbytes), v_buf(nbytes);
-                // copy device→host on current (hot) device
-                hipMemcpy(k_buf.data(), k_tensor->data, nbytes, hipMemcpyDeviceToHost);
-                hipMemcpy(v_buf.data(), v_tensor->data, nbytes, hipMemcpyDeviceToHost);
-                for (auto pos : positions) {
-                    int slot = warm_alloc_slot();
-                    if (slot < 0) {
-                        // warm tier full — spill to SSD
-                        save_to_ssd({pos}, k_tensor, v_tensor, true);
-                        continue;
-                    }
-                    warm_copy_to_device(slot, k_buf.data(), v_buf.data(), nbytes);
-                    warm_slots[slot].pos = pos;
-                    warm_pos_to_slot[pos] = slot;
+        bool is_hot_to_warm  = (from_tier == TIER_HOT  && to_tier == TIER_WARM);
+        bool is_warm_to_cold = (from_tier == TIER_WARM  && to_tier == TIER_COLD);
+        bool is_cold_to_hot  = (from_tier == TIER_COLD  && to_tier == TIER_HOT);
+        bool is_cold_to_warm = (from_tier == TIER_COLD  && to_tier == TIER_WARM);
+        bool is_warm_to_hot  = (from_tier == TIER_WARM  && to_tier == TIER_HOT);
+
+        if (is_hot_to_warm) {
+            // VRAM → RAM (or eGPU): copy K/V for every layer and every evicted position
+            for (auto pos : positions) {
+                int slot = warm_alloc_slot();
+                if (slot < 0) {
+                    LLAMA_LOG_WARN("%s: warm full, dropping pos %d (cold SSD TODO)\n", __func__, pos);
+                    token_metadata.record_access(pos);
+                    continue;
                 }
-            } else
+                warm_slots[slot].pos = pos;
+                warm_pos_to_slot[pos] = slot;
+
+                for (uint32_t il = 0; il < (uint32_t)kv_layers.size(); il++) {
+#ifdef GGML_USE_HIP
+                    if (kv_layers[il].warm_k_dev) {
+                        success &= warm_copy_to_dev(il, slot, pos);
+                    } else {
+                        success &= warm_copy_to_host(il, slot, pos);
+                    }
+#else
+                    success &= warm_copy_to_host(il, slot, pos);
 #endif
-            {
-                save_to_ssd(positions, k_tensor, v_tensor, true);
+                }
+                token_metadata.record_access(pos);
             }
-        } else if (is_cold_to_warm || is_cold_to_hot) {
-            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);
+            if (success)
+                LLAMA_LOG_INFO("%s: hot→warm: %zu positions x %zu layers\n",
+                               __func__, positions.size(), kv_layers.size());
+        } else if (is_warm_to_hot) {
+            // RAM (or eGPU) → VRAM: restore
+            for (auto pos : positions) {
+                auto it = warm_pos_to_slot.find(pos);
+                if (it == warm_pos_to_slot.end()) continue;
+                int slot = it->second;
+                for (uint32_t il = 0; il < (uint32_t)kv_layers.size(); il++) {
+#ifdef GGML_USE_HIP
+                    if (kv_layers[il].warm_k_dev) {
+                        success &= warm_copy_from_dev(il, slot, pos);
+                    } else {
+                        success &= warm_copy_from_host(il, slot, pos);
+                    }
+#else
+                    success &= warm_copy_from_host(il, slot, pos);
+#endif
+                }
+                warm_free_slot(pos);
+                token_metadata.record_access(pos);
+            }
+        } else if (is_warm_to_cold || is_cold_to_hot || is_cold_to_warm) {
+            // SSD paths: TODO — per-layer serialization
+            for (auto pos : positions) {
+                token_metadata.record_access(pos);
+            }
         }
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    stats.total_migration_latency_us += duration.count();
-
-    return true;
+    stats.total_migration_latency_us +=
+        (double)std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    return success;
 }
 
 bool llama_kv_cache_tiered::batch_migrate_tokens(const std::vector<llama_pos>& positions,
@@ -513,58 +723,8 @@ bool llama_kv_cache_tiered::batch_migrate_tokens(const std::vector<llama_pos>& p
                                                   const ggml_tensor* v_tensor) {
     auto start = std::chrono::high_resolution_clock::now();
 
-    // Batch migration optimization:
-    // - Group tokens by layer for efficient I/O
-    // - Compress data before transfer if moving to colder tier
-    // - Decompress data when loading from colder tier
-    
-    if (k_tensor == nullptr || v_tensor == nullptr) {
-        // Metadata-only batch migration
-        for (auto pos : positions) {
-            token_metadata.record_access(pos);
-        }
-    } else {
-        // Batch migration with actual data movement
-        // Group by layer for efficient I/O
-        // For AMD ROCm/HIP: use hipMemcpy for device-to-host or host-to-device transfers
-        
-        bool is_warm_to_cold = (from_tier == TIER_WARM && to_tier == TIER_COLD);
-        bool is_hot_to_warm = (from_tier == TIER_HOT && to_tier == TIER_WARM);
-        
-        if (is_warm_to_cold) {
-            save_to_ssd(positions, k_tensor, v_tensor, false);
-        } else if (is_hot_to_warm) {
-#ifdef GGML_USE_HIP
-            if (warm_k_dev && warm_elem_bytes > 0) {
-                size_t nbytes = warm_elem_bytes;
-                std::vector<uint8_t> k_buf(nbytes), v_buf(nbytes);
-                hipMemcpy(k_buf.data(), k_tensor->data, nbytes, hipMemcpyDeviceToHost);
-                hipMemcpy(v_buf.data(), v_tensor->data, nbytes, hipMemcpyDeviceToHost);
-                for (auto pos : positions) {
-                    int slot = warm_alloc_slot();
-                    if (slot < 0) {
-                        save_to_ssd({pos}, k_tensor, v_tensor, true);
-                        continue;
-                    }
-                    warm_copy_to_device(slot, k_buf.data(), v_buf.data(), nbytes);
-                    warm_slots[slot].pos = pos;
-                    warm_pos_to_slot[pos] = slot;
-                }
-            } else
-#endif
-            {
-                save_to_ssd(positions, k_tensor, v_tensor, true);
-            }
-        } else {
-            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);
-        }
-    }
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    stats.total_migration_latency_us += duration.count();
-
-    return true;
+    // Delegate to migrate_tokens which handles the real per-layer data movement
+    return migrate_tokens(positions, from_tier, to_tier);
 }
 
 bool llama_kv_cache_tiered::prefetch_tokens(const std::vector<llama_pos>& positions,

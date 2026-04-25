@@ -38,7 +38,7 @@ server_tiered_cache::~server_tiered_cache() {
     slot_managers.clear();
 }
 
-bool server_tiered_cache::init_slot(int slot_id, const llama_model& model) {
+bool server_tiered_cache::init_slot(int slot_id, const llama_model& model, struct llama_context * lctx) {
     if (!enabled) {
         return false;
     }
@@ -73,17 +73,20 @@ bool server_tiered_cache::init_slot(int slot_id, const llama_model& model) {
         attention_threshold
     );
 
-    // set bytes-per-token for warm device hipMalloc sizing
-    if (params.kv_warm_device >= 0) {
-        int32_t n_kv_heads = llama_model_n_head_kv(&model);
-        int32_t head_dim   = llama_model_n_embd(&model) / llama_model_n_head(&model);
-        manager.tiered_cache->set_warm_elem_bytes(
-            (size_t)n_kv_heads * head_dim * sizeof(ggml_fp16_t));
-    }
-
-    // Initialize the tiered cache
+    // Initialize the tiered cache (warm slots reserved, buffers come after layer wiring)
     if (!manager.tiered_cache->init()) {
         return false;
+    }
+
+    // Wire per-layer K/V tensor pointers for actual data movement
+    if (lctx) {
+        auto * mem = llama_get_memory(lctx);
+        auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+        if (kv) {
+            manager.tiered_cache->set_kv_layers_from_cache(kv);
+        } else {
+            SRV_WRN("tiered cache: could not cast memory to llama_kv_cache for slot %d — metadata-only mode\n", slot_id);
+        }
     }
 
     manager.initialized = true;
@@ -104,7 +107,7 @@ server_tiered_cache::slot_tier_manager* server_tiered_cache::get_slot_manager(in
     return &it->second;
 }
 
-bool server_tiered_cache::evict_from_slot(int slot_id, uint32_t n_tokens) {
+bool server_tiered_cache::evict_from_slot(int slot_id, uint32_t n_tokens, uint32_t n_hot_positions) {
     if (!enabled) {
         return false;
     }
@@ -112,6 +115,11 @@ bool server_tiered_cache::evict_from_slot(int slot_id, uint32_t n_tokens) {
     auto* manager = get_slot_manager(slot_id);
     if (!manager || !manager->initialized) {
         return false;
+    }
+
+    // Populate metadata so eviction scoring has candidates to work with
+    if (n_hot_positions > 0) {
+        manager->tiered_cache->track_hot_range(n_hot_positions);
     }
 
     // Evict tokens using the tiered cache
