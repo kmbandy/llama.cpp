@@ -28,7 +28,7 @@ server_tiered_cache::server_tiered_cache(const common_params& params)
         // Extract attention threshold
         attention_threshold = params.kv_tier_attention_threshold;
 
-        global_stats.reset();
+        stats_.reset();
     }
 }
 
@@ -120,7 +120,7 @@ bool server_tiered_cache::evict_from_slot(int slot_id, uint32_t n_tokens) {
     if (result) {
         // Update global stats
         std::lock_guard<std::mutex> lock(mutex);
-        global_stats.total_evictions += n_tokens;
+        stats_.total_evictions += n_tokens;
     }
 
     return result;
@@ -145,7 +145,7 @@ bool server_tiered_cache::migrate_in_slot(int slot_id,
     if (result) {
         // Update global stats
         std::lock_guard<std::mutex> lock(mutex);
-        global_stats.total_migrations += positions.size();
+        stats_.total_migrations += positions.size();
     }
 
     return result;
@@ -166,10 +166,10 @@ llama_tier_stats server_tiered_cache::get_slot_stats(int slot_id) {
 
 server_tiered_cache::global_stats server_tiered_cache::get_global_stats() {
     std::lock_guard<std::mutex> lock(mutex);
-    return global_stats;
+    return stats_;
 }
 
 void server_tiered_cache::reset_stats() {
     std::lock_guard<std::mutex> lock(mutex);
-    global_stats.reset();
+    stats_.reset();
 }

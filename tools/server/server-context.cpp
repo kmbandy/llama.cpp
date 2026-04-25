@@ -634,6 +634,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -683,7 +684,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-    server_tiered_cache tiered_cache;
+    std::unique_ptr<server_tiered_cache> tiered_cache;
 
     server_metrics metrics;
 
@@ -858,7 +859,7 @@ private:
 
         // Initialize tiered cache if enabled
         if (params_base.kv_tiered_enabled) {
-            tiered_cache = server_tiered_cache(params_base);
+            tiered_cache = std::make_unique<server_tiered_cache>(params_base);
             SRV_INF("tiered cache initialized, hot=%f%%, warm=%f%%, cold=%f%%\n",
                     params_base.kv_tier_hot_pct, params_base.kv_tier_warm_pct, params_base.kv_tier_cold_pct);
         }
@@ -916,10 +917,10 @@ private:
 
             // initialize tier manager for slot if enabled
             if (params_base.kv_tiered_enabled) {
-                if (!tiered_cache.init_slot(i, *model)) {
+                if (!tiered_cache->init_slot(i, *model)) {
                     SRV_WRN("failed to initialize tier manager for slot %d\n", i);
                 } else {
-                    SLT_INF(slot, "tier manager initialized for slot\n");
+                    SLT_INF(slot, "tier manager initialized for slot %s\n", "");
                 }
             }
 
@@ -2184,20 +2185,6 @@ private:
                     continue;
                 }
 
-                // Try tiered cache eviction before context shift
-                if (params_base.kv_tiered_enabled) {
-                    auto* slot_tier = tiered_cache.get_slot_manager(slot.id);
-                    if (slot_tier && slot_tier->initialized) {
-                        // Evict tokens to tiered cache before context shift
-                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
-                        if (n_evict > 0) {
-                            if (tiered_cache.evict_from_slot(slot.id, n_evict)) {
-                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
-                            }
-                        }
-                    }
-                }
-
                 // Shift context
                 int n_keep = slot.task->params.n_keep < 0 ? slot.task->n_tokens() : slot.task->params.n_keep;
 
@@ -2209,6 +2196,20 @@ private:
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+
+                // Try tiered cache eviction before context shift
+                if (params_base.kv_tiered_enabled) {
+                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                    if (slot_tier && slot_tier->initialized) {
+                        // Evict tokens to tiered cache before context shift
+                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
+                        if (n_evict > 0) {
+                            if (tiered_cache->evict_from_slot(slot.id, n_evict)) {
+                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
+                            }
+                        }
+                    }
+                }
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
@@ -3532,33 +3533,13 @@ void server_routes::init_routes() {
         };
 
         // Add tiered cache metrics if enabled
-        if (params.kv_tiered_enabled) {
-            auto global_stats = tiered_cache.get_global_stats();
-            all_metrics_def["counter"].push({
-                {"name",  "tier_evictions_total"},
-                {"help",  "Total number of tier evictions"},
-                {"value", global_stats.total_evictions}
-            });
-            all_metrics_def["counter"].push({
-                {"name",  "tier_migrations_total"},
-                {"help",  "Total number of tier migrations"},
-                {"value", global_stats.total_migrations}
-            });
-            all_metrics_def["counter"].push({
-                {"name",  "tier_cache_hits_total"},
-                {"help",  "Total cache hits"},
-                {"value", global_stats.total_cache_hits}
-            });
-            all_metrics_def["counter"].push({
-                {"name",  "tier_cache_misses_total"},
-                {"help",  "Total cache misses"},
-                {"value", global_stats.total_cache_misses}
-            });
-            all_metrics_def["gauge"].push({
-                {"name",  "tier_migration_latency_seconds"},
-                {"help",  "Total migration latency in seconds"},
-                {"value", global_stats.total_migration_latency_us / 1e6}
-            });
+        if (params.kv_tiered_enabled && ctx_server.tiered_cache) {
+            auto global_stats = ctx_server.tiered_cache->get_global_stats();
+            { json m; m["name"] = "tier_evictions_total"; m["help"] = "Total number of tier evictions"; m["value"] = global_stats.total_evictions; all_metrics_def["counter"].push_back(m); }
+            { json m; m["name"] = "tier_migrations_total"; m["help"] = "Total number of tier migrations"; m["value"] = global_stats.total_migrations; all_metrics_def["counter"].push_back(m); }
+            { json m; m["name"] = "tier_cache_hits_total"; m["help"] = "Total cache hits"; m["value"] = global_stats.total_cache_hits; all_metrics_def["counter"].push_back(m); }
+            { json m; m["name"] = "tier_cache_misses_total"; m["help"] = "Total cache misses"; m["value"] = global_stats.total_cache_misses; all_metrics_def["counter"].push_back(m); }
+            { json m; m["name"] = "tier_migration_latency_seconds"; m["help"] = "Total migration latency in seconds"; m["value"] = global_stats.total_migration_latency_us / 1e6; all_metrics_def["gauge"].push_back(m); }
         }
 
         std::stringstream prometheus;

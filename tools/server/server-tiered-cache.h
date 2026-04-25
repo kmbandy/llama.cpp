@@ -22,6 +22,7 @@ struct server_tiered_cache {
         }
     };
 
+    server_tiered_cache() : enabled(false) {}
     server_tiered_cache(const common_params& params);
     ~server_tiered_cache();
 
@@ -69,7 +70,7 @@ struct server_tiered_cache {
 private:
     bool enabled = false;
     std::unordered_map<int, slot_tier_manager> slot_managers;
-    global_stats global_stats;
+    global_stats stats_;
     mutable std::mutex mutex;
 
     common_params params;
