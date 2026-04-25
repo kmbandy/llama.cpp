@@ -322,6 +322,39 @@ bool llama_kv_cache_tiered::init() {
     if (!std::filesystem::exists(ssd_dir)) {
         std::filesystem::create_directories(ssd_dir);
     }
+
+#ifdef GGML_USE_HIP
+    if (config.warm_device >= 0) {
+        // Allocate warm tier buffers on 6900XT (or whatever warm_device is)
+        int prev_dev = 0;
+        hipGetDevice(&prev_dev);
+        hipSetDevice(config.warm_device);
+
+        // Each warm slot holds n_kv_heads * head_dim elements per position.
+        // We allocate config.warm_ctx slots; each slot is warm_elem_bytes bytes
+        // for K and the same for V.
+        // warm_elem_bytes is set by the caller via set_warm_elem_bytes().
+        if (warm_elem_bytes > 0 && config.warm_capacity() > 0) {
+            warm_dev_capacity = warm_elem_bytes * config.warm_capacity();
+            hipError_t err_k = hipMalloc(&warm_k_dev, warm_dev_capacity);
+            hipError_t err_v = hipMalloc(&warm_v_dev, warm_dev_capacity);
+            if (err_k != hipSuccess || err_v != hipSuccess) {
+                LLAMA_LOG_WARN("%s: hipMalloc warm tier on device %d failed, falling back to SSD\n",
+                               __func__, config.warm_device);
+                if (warm_k_dev) { hipFree(warm_k_dev); warm_k_dev = nullptr; }
+                if (warm_v_dev) { hipFree(warm_v_dev); warm_v_dev = nullptr; }
+                warm_dev_capacity = 0;
+            } else {
+                warm_slots.assign(config.warm_capacity(), WarmSlot{});
+                LLAMA_LOG_INFO("%s: warm tier on device %d: %.1f MB K + %.1f MB V\n",
+                               __func__, config.warm_device,
+                               warm_dev_capacity / 1e6, warm_dev_capacity / 1e6);
+            }
+        }
+        hipSetDevice(prev_dev);
+    }
+#endif
+
     return true;
 }
 
@@ -361,6 +394,52 @@ bool llama_kv_cache_tiered::evict_tokens(uint32_t n_tokens_to_evict, llama_cache
     return true;
 }
 
+#ifdef GGML_USE_HIP
+int llama_kv_cache_tiered::warm_alloc_slot() {
+    for (int i = 0; i < (int)warm_slots.size(); i++) {
+        if (!warm_slots[i].occupied) {
+            warm_slots[i].occupied = true;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void llama_kv_cache_tiered::warm_free_slot(llama_pos pos) {
+    auto it = warm_pos_to_slot.find(pos);
+    if (it != warm_pos_to_slot.end()) {
+        int slot = it->second;
+        warm_slots[slot].occupied = false;
+        warm_slots[slot].pos = -1;
+        warm_pos_to_slot.erase(it);
+    }
+}
+
+bool llama_kv_cache_tiered::warm_copy_to_device(int slot, const void * k_host, const void * v_host, size_t nbytes) {
+    if (!warm_k_dev || !warm_v_dev || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    int prev_dev = 0;
+    hipGetDevice(&prev_dev);
+    hipSetDevice(config.warm_device);
+    size_t offset = (size_t)slot * nbytes;
+    bool ok = (hipMemcpy((char*)warm_k_dev + offset, k_host, nbytes, hipMemcpyHostToDevice) == hipSuccess) &&
+              (hipMemcpy((char*)warm_v_dev + offset, v_host, nbytes, hipMemcpyHostToDevice) == hipSuccess);
+    hipSetDevice(prev_dev);
+    return ok;
+}
+
+bool llama_kv_cache_tiered::warm_copy_from_device(int slot, void * k_host, void * v_host, size_t nbytes) {
+    if (!warm_k_dev || !warm_v_dev || slot < 0 || (size_t)slot >= warm_slots.size()) return false;
+    int prev_dev = 0;
+    hipGetDevice(&prev_dev);
+    hipSetDevice(config.warm_device);
+    size_t offset = (size_t)slot * nbytes;
+    bool ok = (hipMemcpy(k_host, (char*)warm_k_dev + offset, nbytes, hipMemcpyDeviceToHost) == hipSuccess) &&
+              (hipMemcpy(v_host, (char*)warm_v_dev + offset, nbytes, hipMemcpyDeviceToHost) == hipSuccess);
+    hipSetDevice(prev_dev);
+    return ok;
+}
+#endif  // GGML_USE_HIP
+
 bool llama_kv_cache_tiered::migrate_tokens(const std::vector<llama_pos>& positions,
                                             llama_cache_tier from_tier,
                                             llama_cache_tier to_tier,
@@ -388,15 +467,35 @@ bool llama_kv_cache_tiered::migrate_tokens(const std::vector<llama_pos>& positio
         bool is_cold_to_hot = (from_tier == TIER_COLD && to_tier == TIER_HOT);
         
         if (is_warm_to_cold) {
-            // Warm→Cold: data is already in RAM, can serialize directly
-            save_to_ssd(positions, k_tensor, v_tensor, false);  // is_device_data = false
+            // Warm→Cold: serialize to SSD
+            save_to_ssd(positions, k_tensor, v_tensor, false);
         } else if (is_hot_to_warm) {
-            // Hot→Warm: data is in VRAM (device), need to copy to host first
-            save_to_ssd(positions, k_tensor, v_tensor, true);  // is_device_data = true
+#ifdef GGML_USE_HIP
+            if (warm_k_dev && warm_elem_bytes > 0) {
+                // R9700 VRAM → host staging → 6900XT VRAM
+                size_t nbytes = warm_elem_bytes;
+                std::vector<uint8_t> k_buf(nbytes), v_buf(nbytes);
+                // copy device→host on current (hot) device
+                hipMemcpy(k_buf.data(), k_tensor->data, nbytes, hipMemcpyDeviceToHost);
+                hipMemcpy(v_buf.data(), v_tensor->data, nbytes, hipMemcpyDeviceToHost);
+                for (auto pos : positions) {
+                    int slot = warm_alloc_slot();
+                    if (slot < 0) {
+                        // warm tier full — spill to SSD
+                        save_to_ssd({pos}, k_tensor, v_tensor, true);
+                        continue;
+                    }
+                    warm_copy_to_device(slot, k_buf.data(), v_buf.data(), nbytes);
+                    warm_slots[slot].pos = pos;
+                    warm_pos_to_slot[pos] = slot;
+                }
+            } else
+#endif
+            {
+                save_to_ssd(positions, k_tensor, v_tensor, true);
+            }
         } else if (is_cold_to_warm || is_cold_to_hot) {
-            // Loading from cold tier - load from SSD
-            // Note: requires mutable tensors for destination
-            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);  // to_device = false
+            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);
         }
     }
 
@@ -433,14 +532,31 @@ bool llama_kv_cache_tiered::batch_migrate_tokens(const std::vector<llama_pos>& p
         bool is_hot_to_warm = (from_tier == TIER_HOT && to_tier == TIER_WARM);
         
         if (is_warm_to_cold) {
-            // Warm→Cold: data is already in RAM, can serialize directly
-            save_to_ssd(positions, k_tensor, v_tensor, false);  // is_device_data = false
+            save_to_ssd(positions, k_tensor, v_tensor, false);
         } else if (is_hot_to_warm) {
-            // Hot→Warm: data is in VRAM (device), need to copy to host first
-            save_to_ssd(positions, k_tensor, v_tensor, true);  // is_device_data = true
+#ifdef GGML_USE_HIP
+            if (warm_k_dev && warm_elem_bytes > 0) {
+                size_t nbytes = warm_elem_bytes;
+                std::vector<uint8_t> k_buf(nbytes), v_buf(nbytes);
+                hipMemcpy(k_buf.data(), k_tensor->data, nbytes, hipMemcpyDeviceToHost);
+                hipMemcpy(v_buf.data(), v_tensor->data, nbytes, hipMemcpyDeviceToHost);
+                for (auto pos : positions) {
+                    int slot = warm_alloc_slot();
+                    if (slot < 0) {
+                        save_to_ssd({pos}, k_tensor, v_tensor, true);
+                        continue;
+                    }
+                    warm_copy_to_device(slot, k_buf.data(), v_buf.data(), nbytes);
+                    warm_slots[slot].pos = pos;
+                    warm_pos_to_slot[pos] = slot;
+                }
+            } else
+#endif
+            {
+                save_to_ssd(positions, k_tensor, v_tensor, true);
+            }
         } else {
-            // Load from SSD
-            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);  // to_device = false
+            load_from_ssd(positions, const_cast<ggml_tensor*>(k_tensor), const_cast<ggml_tensor*>(v_tensor), false);
         }
     }
 

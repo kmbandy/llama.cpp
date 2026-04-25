@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "llama-io-uring.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1434,6 +1435,12 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+
+#ifdef LLAMA_HAVE_IO_URING
+    // io_uring reader: pre-submit NVMe reads so they overlap GPU DMA uploads.
+    std::unique_ptr<llama_io_uring> io_reader;
+    std::vector<struct iovec> io_iovs;
+#endif
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1515,6 +1522,27 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+#ifdef LLAMA_HAVE_IO_URING
+    if (upload_backend && !files.empty()) {
+        int fd = files.at(0)->file_id();
+        if (fd >= 0) {
+            io_reader = std::make_unique<llama_io_uring>(fd);
+            if (io_reader->valid()) {
+                // Register all pinned staging buffers for zero-copy DMA
+                io_iovs.resize(host_ptrs.size());
+                for (size_t i = 0; i < host_ptrs.size(); i++)
+                    io_iovs[i] = { host_ptrs[i], buffer_size };
+                if (!io_reader->register_buffers(io_iovs.data(), (int)io_iovs.size()))
+                    io_reader.reset();
+                else
+                    LLAMA_LOG_DEBUG("%s: io_uring reader active\n", __func__);
+            } else {
+                io_reader.reset();
+            }
+        }
+    }
+#endif
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1595,6 +1623,18 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file
+#ifdef LLAMA_HAVE_IO_URING
+                        if (io_reader && io_reader->valid()) {
+                            io_reader->submit_read((int)buffer_idx,
+                                reinterpret_cast<void *>(ptr_dest_aligned),
+                                read_size,
+                                aligned_offset + bytes_read,
+                                buffer_idx);
+                            io_reader->submit();
+                            int nr = 0;
+                            io_reader->wait_one(&nr);
+                        } else
+#endif
                         file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
 
                         // Calculate actual data portion (excluding alignment padding)

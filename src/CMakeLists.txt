@@ -30,6 +30,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
+            llama-io-uring.cpp
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
@@ -52,6 +53,17 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (UNIX AND NOT APPLE)
+    find_library(LIBURING_LIBRARY NAMES uring)
+    if (LIBURING_LIBRARY)
+        target_compile_definitions(llama PRIVATE LLAMA_HAVE_IO_URING)
+        target_link_libraries(llama PRIVATE ${LIBURING_LIBRARY})
+        message(STATUS "Found liburing: ${LIBURING_LIBRARY} — io_uring model loader enabled")
+    else()
+        message(STATUS "liburing not found — io_uring model loader disabled")
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

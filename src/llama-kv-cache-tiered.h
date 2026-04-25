@@ -44,6 +44,9 @@ struct llama_tier_config {
     uint32_t warm_capacity() const { return uint32_t(total_ctx * warm_percent / 100.0f); }
     uint32_t cold_capacity() const { return uint32_t(total_ctx * cold_percent / 100.0f); }
 
+    // HIP device index for warm tier (-1 = RAM/SSD fallback, 1 = 6900XT)
+    int warm_device = -1;
+
     // Default configuration: 25% hot, 25% warm, 50% cold
     static llama_tier_config default_config(uint32_t total_ctx) {
         return {25.0f, 25.0f, 50.0f, total_ctx};
@@ -179,6 +182,7 @@ public:
     bool resize(uint32_t new_total_ctx);
     bool set_eviction_policy(llama_eviction_policy policy);
     bool set_attention_threshold(float threshold);
+    void set_warm_elem_bytes(size_t n) { warm_elem_bytes = n; }
 
     // Eviction interface
     bool evict_tokens(uint32_t n_tokens_to_evict, llama_cache_tier from_tier);
@@ -242,6 +246,21 @@ private:
     // These point to the underlying ggml_tensor objects containing K and V data
     const ggml_tensor* k_tensor = nullptr;
     const ggml_tensor* v_tensor = nullptr;
+
+#ifdef GGML_USE_HIP
+    // 6900XT warm tier: device buffers on warm_device
+    void * warm_k_dev = nullptr;     // hipMalloc'd on warm_device
+    void * warm_v_dev = nullptr;
+    size_t warm_dev_capacity = 0;    // max tokens in warm device buffer
+    size_t warm_elem_bytes  = 0;     // bytes per token per layer for K or V
+    struct WarmSlot { bool occupied = false; llama_pos pos = -1; };
+    std::vector<WarmSlot>                warm_slots;
+    std::unordered_map<llama_pos, int>   warm_pos_to_slot;
+    int  warm_alloc_slot();
+    void warm_free_slot(llama_pos pos);
+    bool warm_copy_to_device(int slot, const void * k_host, const void * v_host, size_t nbytes);
+    bool warm_copy_from_device(int slot, void * k_host, void * v_host, size_t nbytes);
+#endif
 
     // Helper methods
     std::string get_ssd_file_path(llama_pos pos) const;
