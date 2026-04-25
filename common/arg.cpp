@@ -31,6 +31,7 @@
 #include <list>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread> // for hardware_concurrency
 #include <vector>
@@ -1310,6 +1311,53 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tiered"}, "VRAM%,RAM%,SSD%",
+        "enable tiered KV cache with percentages for VRAM, RAM, SSD (e.g., 25,25,50 for 25% VRAM, 25% RAM, 50% SSD)",
+        [](common_params & params, const std::string & value) {
+            params.kv_tiered_enabled = true;
+            // Parse the percentage string
+            std::vector<std::string> parts;
+            std::stringstream ss(value);
+            std::string part;
+            while (std::getline(ss, part, ',')) {
+                parts.push_back(part);
+            }
+            if (parts.size() == 3) {
+                params.kv_tier_hot_pct = std::stof(parts[0]);
+                params.kv_tier_warm_pct = std::stof(parts[1]);
+                params.kv_tier_cold_pct = std::stof(parts[2]);
+            }
+        }
+    ).set_env("LLAMA_ARG_KT_TIERED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tier-ssd-path"}, "PATH",
+        "directory for cold tier (SSD) storage",
+        [](common_params & params, const std::string & value) {
+            params.kv_tier_ssd_path = value;
+        }
+    ).set_env("LLAMA_ARG_TIER_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tier-eviction-policy"}, "POLICY",
+        "eviction policy: 0=LRU, 1=LFU, 2=attention, 3=hybrid (default)",
+        [](common_params & params, int value) {
+            params.kv_tier_eviction_policy = value;
+        }
+    ).set_env("LLAMA_ARG_TIER_EVICTION_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tier-compression"}, "TYPE",
+        "compression type: 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized",
+        [](common_params & params, int value) {
+            params.kv_tier_compression = value;
+        }
+    ).set_env("LLAMA_ARG_TIER_COMPRESSION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--tier-attention-threshold"}, "THRESH",
+        "attention threshold for eviction (0.0-1.0, default: 0.1)",
+        [](common_params & params, int value) {
+            params.kv_tier_attention_threshold = float(value) / 100.0f;
+        }
+    ).set_env("LLAMA_ARG_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

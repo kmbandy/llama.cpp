@@ -148,3 +148,28 @@ a.out.*
 .gitnexus
 .claude/
 .agent.md
+
+# cmake root-level build artifacts
+/CMakeFiles/
+/CMakeCache.txt
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/cmake_install.cmake
+/bin/
+/CPackConfig.cmake
+/CPackSourceConfig.cmake
+*.so
+*.so.*
+
+# nested cmake build artifacts
+**/CMakeFiles/
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/Makefile
+compile_commands.json
+error.txt
+license.cpp
+llama.pc
+ggml/ggml-config.cmake
+ggml/ggml-version.cmake
+tests/libgguf-model-data.a

@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-tiered-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -682,6 +683,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    server_tiered_cache tiered_cache;
 
     server_metrics metrics;
 
@@ -854,6 +856,13 @@ private:
             }
         }
 
+        // Initialize tiered cache if enabled
+        if (params_base.kv_tiered_enabled) {
+            tiered_cache = server_tiered_cache(params_base);
+            SRV_INF("tiered cache initialized, hot=%f%%, warm=%f%%, cold=%f%%\n",
+                    params_base.kv_tier_hot_pct, params_base.kv_tier_warm_pct, params_base.kv_tier_cold_pct);
+        }
+
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
@@ -902,6 +911,15 @@ private:
 
                 if (slot.spec) {
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                }
+            }
+
+            // initialize tier manager for slot if enabled
+            if (params_base.kv_tiered_enabled) {
+                if (!tiered_cache.init_slot(i, *model)) {
+                    SRV_WRN("failed to initialize tier manager for slot %d\n", i);
+                } else {
+                    SLT_INF(slot, "tier manager initialized for slot\n");
                 }
             }
 
@@ -2164,6 +2182,20 @@ private:
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
                     slot.release();
                     continue;
+                }
+
+                // Try tiered cache eviction before context shift
+                if (params_base.kv_tiered_enabled) {
+                    auto* slot_tier = tiered_cache.get_slot_manager(slot.id);
+                    if (slot_tier && slot_tier->initialized) {
+                        // Evict tokens to tiered cache before context shift
+                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
+                        if (n_evict > 0) {
+                            if (tiered_cache.evict_from_slot(slot.id, n_evict)) {
+                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
+                            }
+                        }
+                    }
                 }
 
                 // Shift context
@@ -3498,6 +3530,36 @@ void server_routes::init_routes() {
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
             }}}
         };
+
+        // Add tiered cache metrics if enabled
+        if (params.kv_tiered_enabled) {
+            auto global_stats = tiered_cache.get_global_stats();
+            all_metrics_def["counter"].push({
+                {"name",  "tier_evictions_total"},
+                {"help",  "Total number of tier evictions"},
+                {"value", global_stats.total_evictions}
+            });
+            all_metrics_def["counter"].push({
+                {"name",  "tier_migrations_total"},
+                {"help",  "Total number of tier migrations"},
+                {"value", global_stats.total_migrations}
+            });
+            all_metrics_def["counter"].push({
+                {"name",  "tier_cache_hits_total"},
+                {"help",  "Total cache hits"},
+                {"value", global_stats.total_cache_hits}
+            });
+            all_metrics_def["counter"].push({
+                {"name",  "tier_cache_misses_total"},
+                {"help",  "Total cache misses"},
+                {"value", global_stats.total_cache_misses}
+            });
+            all_metrics_def["gauge"].push({
+                {"name",  "tier_migration_latency_seconds"},
+                {"help",  "Total migration latency in seconds"},
+                {"value", global_stats.total_migration_latency_us / 1e6}
+            });
+        }
 
         std::stringstream prometheus;
 

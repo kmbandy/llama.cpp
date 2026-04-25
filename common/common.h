@@ -573,6 +573,16 @@ struct common_params {
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // tiered KV cache parameters
+    bool kv_tiered_enabled    = false;   // enable tiered KV cache
+    float kv_tier_hot_pct     = 25.0f;   // hot tier percentage (VRAM)
+    float kv_tier_warm_pct    = 25.0f;   // warm tier percentage (RAM)
+    float kv_tier_cold_pct    = 50.0f;   // cold tier percentage (SSD)
+    std::string kv_tier_ssd_path = "";   // SSD path for cold tier storage
+    int kv_tier_eviction_policy = 3;     // 0=LRU, 1=LFU, 2=attention, 3=hybrid (default)
+    int kv_tier_compression   = 1;       // 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized
+    float kv_tier_attention_threshold = 0.1f;  // attention threshold for eviction
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

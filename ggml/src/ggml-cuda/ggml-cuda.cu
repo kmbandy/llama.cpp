@@ -1426,6 +1426,54 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     const int64_t i1_diff = i1_high - i1_low;
 
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
+
+#if defined(GGML_USE_HIP)
+    // hipMemcpy2DAsync with hipMemcpyDeviceToDevice requires P2P access between devices.
+    // For mixed-architecture multi-GPU setups (e.g. gfx1201 + gfx1030) without P2P,
+    // it fails asynchronously with hipErrorNoBinaryForGpu when the internal copy kernel
+    // isn't compiled for the destination device. Detect cross-device copies via pointer
+    // attributes and fall back to row-wise hipMemcpyPeerAsync, which stages through the
+    // host when P2P is unavailable. Mirrors the fix in ggml_cuda_Memcpy2DPeerAsync.
+    hipPointerAttribute_t src_attr = {};
+    hipPointerAttribute_t dst_attr = {};
+    const bool src_ok = hipPointerGetAttributes(&src_attr, x)       == hipSuccess;
+    const bool dst_ok = hipPointerGetAttributes(&dst_attr, dst_ptr) == hipSuccess;
+    if (src_ok && dst_ok && src_attr.device != dst_attr.device) {
+        const int src_dev = src_attr.device;
+        const int dst_dev = dst_attr.device;
+        if (nb0 == ts && nb1 == ts*ne0/bs) {
+            return hipMemcpyPeerAsync(dst_ptr, dst_dev, x, src_dev, i1_diff*nb1, stream);
+        } else if (nb0 == ts) {
+            const size_t row_bytes = ts*ne0/bs;
+            for (int64_t i1 = 0; i1 < i1_diff; i1++) {
+                hipError_t err = hipMemcpyPeerAsync(
+                    dst_ptr + i1*row_bytes, dst_dev,
+                    x + i1*nb1,             src_dev,
+                    row_bytes, stream);
+                if (err != hipSuccess) {
+                    return err;
+                }
+            }
+            return hipSuccess;
+        } else {
+            for (int64_t i1 = 0; i1 < i1_diff; i1++) {
+                const char * rx = x + i1*nb1;
+                char       * rd = dst_ptr + i1*ts*ne0/bs;
+                for (int64_t e = 0; e < ne0; e++) {
+                    hipError_t err = hipMemcpyPeerAsync(
+                        rd + e*(ts/bs), dst_dev,
+                        rx + e*nb0,     src_dev,
+                        ts/bs, stream);
+                    if (err != hipSuccess) {
+                        return err;
+                    }
+                }
+            }
+            return hipSuccess;
+        }
+    }
+#endif
+
     if (nb0 == ts && nb1 == ts*ne0/bs) {
         return cudaMemcpyAsync(dst_ptr, x, i1_diff*nb1, cudaMemcpyDeviceToDevice, stream);
     } else if (nb0 == ts) {
