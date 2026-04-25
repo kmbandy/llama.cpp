@@ -750,6 +750,11 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {
+            params_base.kv_tier_total_ctx = params_base.n_ctx;
+            params_base.n_ctx = std::max(512, (int)(params_base.n_ctx * params_base.kv_tier_hot_pct / 100.0f));
+            SRV_INF("tiered KV: total ctx=%d, hot ctx=%d (%.0f%%)\n", params_base.kv_tier_total_ctx, params_base.n_ctx, params_base.kv_tier_hot_pct);
+        }
 
         llama_init = common_init_from_params(params_base);
 

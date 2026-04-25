@@ -60,7 +60,7 @@ bool server_tiered_cache::init_slot(int slot_id, const llama_model& model) {
     config.hot_percent = params.kv_tier_hot_pct;
     config.warm_percent = params.kv_tier_warm_pct;
     config.cold_percent = params.kv_tier_cold_pct;
-    config.total_ctx = params.n_ctx;
+    config.total_ctx = params.kv_tier_total_ctx > 0 ? params.kv_tier_total_ctx : params.n_ctx;
     config.warm_device = params.kv_warm_device;
 
     // Create tiered cache instance

@@ -583,6 +583,7 @@ struct common_params {
     int kv_tier_compression   = 1;       // 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized
     float kv_tier_attention_threshold = 0.1f;  // attention threshold for eviction
     int   kv_warm_device        = -1;    // HIP device index for warm KV tier (-1 = disabled)
+    int   kv_tier_total_ctx     = 0;     // full ctx budget across all tiers (set at load time)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
