@@ -877,7 +877,9 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx);
+        int n_ctx_slot = (params_base.kv_tiered_enabled && params_base.kv_tier_total_ctx > 0)
+                         ? params_base.kv_tier_total_ctx
+                         : llama_n_ctx_seq(ctx);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
             // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
