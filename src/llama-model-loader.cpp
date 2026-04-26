@@ -1533,8 +1533,7 @@ bool llama_model_loader::load_all_data(
                 for (size_t i = 0; i < host_ptrs.size(); i++)
                     io_iovs[i] = { host_ptrs[i], buffer_size };
                 if (!io_reader->register_buffers(io_iovs.data(), (int)io_iovs.size()))
-                    io_reader.reset();
-                else
+                    LLAMA_LOG_WARN("%s: io_uring buffer registration failed, continuing without fixed buffers\n", __func__);
                     LLAMA_LOG_DEBUG("%s: io_uring reader active\n", __func__);
             } else {
                 io_reader.reset();
