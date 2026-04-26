@@ -34,6 +34,7 @@ add_library(llama
             llama-io-uring.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-weight-pager.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp

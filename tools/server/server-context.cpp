@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-tiered-cache.h"
+#include "../src/llama-model.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -3628,14 +3629,18 @@ void server_routes::init_routes() {
             }}}
         };
 
-        // Add tiered cache metrics if enabled
-        if (params.kv_tiered_enabled && ctx_server.tiered_cache) {
-            auto global_stats = ctx_server.tiered_cache->get_global_stats();
-            { json m; m["name"] = "tier_evictions_total"; m["help"] = "Total number of tier evictions"; m["value"] = global_stats.total_evictions; all_metrics_def["counter"].push_back(m); }
-            { json m; m["name"] = "tier_migrations_total"; m["help"] = "Total number of tier migrations"; m["value"] = global_stats.total_migrations; all_metrics_def["counter"].push_back(m); }
-            { json m; m["name"] = "tier_cache_hits_total"; m["help"] = "Total cache hits"; m["value"] = global_stats.total_cache_hits; all_metrics_def["counter"].push_back(m); }
-            { json m; m["name"] = "tier_cache_misses_total"; m["help"] = "Total cache misses"; m["value"] = global_stats.total_cache_misses; all_metrics_def["counter"].push_back(m); }
-            { json m; m["name"] = "tier_migration_latency_seconds"; m["help"] = "Total migration latency in seconds"; m["value"] = global_stats.total_migration_latency_us / 1e6; all_metrics_def["gauge"].push_back(m); }
+        // Add weight pager metrics if enabled
+        if (ctx_server.model && ctx_server.model->weight_pager) {
+            auto * pager = ctx_server.model->weight_pager.get();
+            { json m; m["name"] = "llama_weight_pager_pages_total"; m["help"] = "Total number of weight pages tracked"; m["value"] = (double)pager->pages.size(); all_metrics_def["gauge"].push_back(m); }
+            { json m; m["name"] = "llama_weight_pager_loaded_pages"; m["help"] = "Number of pages currently loaded in VRAM";
+              size_t loaded = 0;
+              for (const auto & page : pager->pages) { if (page.slot_idx >= 0) loaded++; }
+              m["value"] = (double)loaded; all_metrics_def["gauge"].push_back(m); }
+#ifdef LLAMA_HAVE_IO_URING
+            { json m; m["name"] = "llama_weight_pager_in_flight_prefetches"; m["help"] = "Number of in-flight prefetch requests"; m["value"] = (double)pager->in_flight.size(); all_metrics_def["gauge"].push_back(m); }
+            { json m; m["name"] = "llama_weight_pager_async_prefetch_enabled"; m["help"] = "Async prefetch enabled (1=true, 0=false)"; m["value"] = pager->async_prefetch ? 1.0 : 0.0; all_metrics_def["gauge"].push_back(m); }
+#endif
         }
 
         std::stringstream prometheus;

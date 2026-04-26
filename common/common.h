@@ -533,6 +533,11 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // weight paging parameters
+    bool    weight_paging_enabled = false;  // enable NVMe→VRAM demand paging for model weights
+    int32_t weight_paging_slots   = -1;     // number of VRAM slots for weight paging (-1 = auto)
+    bool    weight_paging_prefetch = true;  // enable async prefetch of next layer
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
