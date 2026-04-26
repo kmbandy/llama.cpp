@@ -2257,6 +2257,7 @@ private:
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
+                slot.prompt.checkpoints.clear();
                 slot.truncated = true;
             }
         }
