@@ -1421,7 +1421,7 @@ private:
                 if (slot_tier && slot_tier->initialized) {
                     const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
                     if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
-                        SLT_INF(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
+                        SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
                                 n_evict, n_tokens, slot.n_ctx);
                     }
                 }
