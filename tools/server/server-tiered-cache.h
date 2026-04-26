@@ -32,7 +32,7 @@ struct server_tiered_cache {
     // Get tier manager for a slot
     slot_tier_manager* get_slot_manager(int slot_id);
 
-    // Evict tokens from a slot
+    // Evict tokens from a slot (with fingerprint computation if semantic index enabled)
     bool evict_from_slot(int slot_id, uint32_t n_tokens, uint32_t n_hot_positions = 0);
 
     // Migrate tokens between tiers for a slot
@@ -67,6 +67,10 @@ struct server_tiered_cache {
     // Check if tiered cache is enabled
     bool is_enabled() const { return enabled; }
 
+    // Semantic embedding
+    bool sem_enabled() const { return sem_model != nullptr; }
+    std::vector<float> embed(const std::string & text);
+
 private:
     bool enabled = false;
     std::unordered_map<int, slot_tier_manager> slot_managers;
@@ -75,7 +79,23 @@ private:
 
     common_params params;
     std::string ssd_path;
+    std::string fingerprints_path;
     llama_eviction_policy eviction_policy;
     llama_cache_compression compression;
     float attention_threshold;
+
+    // Semantic embedding model for KV fingerprints
+    struct llama_model * sem_model = nullptr;
+    struct llama_context * sem_ctx = nullptr;
+    
+    // Model pointer for detokenization (set during init_slot)
+    const llama_model* detokenize_model = nullptr;
+    
+    // Semantic threshold (private)
+    float semantic_threshold = 0.65f;
+
+public:
+    int semantic_top_k = 5;
+    std::vector<llama_kv_cache_tiered::PrefetchHint>
+    get_prefetch_hints(int slot_id, const std::string& input_text, int top_k = 5);
 };

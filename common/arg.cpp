@@ -1366,6 +1366,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-semantic-index"}, "PATH",
+        "path to embedding model (GGUF) for semantic KV cache indexing (e.g. bge-small); empty = disabled",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_index = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-semantic-threshold"}, "THRESHOLD",
+        "minimum cosine similarity threshold for semantic prefetch hints (default: 0.65)",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_threshold = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-semantic-topk"}, "K",
+        "number of prefetch hints to return (default: 5)",
+        [](common_params & params, int value) {
+            params.kv_semantic_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

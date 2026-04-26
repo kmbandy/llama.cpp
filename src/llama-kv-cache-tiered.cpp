@@ -374,6 +374,62 @@ bool llama_kv_cache_tiered::evict_tokens(uint32_t n_tokens_to_evict, llama_cache
         return false;
     }
 
+    // Apply semantic eviction weighting if we have a current query embedding
+    if (!current_query_emb.empty() && !fingerprints.empty()) {
+        std::vector<std::pair<llama_pos, float>> candidates_with_similarity;
+        
+        for (auto pos : candidates) {
+            float similarity = 0.0f; // Default similarity if no fingerprint found
+            
+            // Find fingerprint for this position
+            for (const auto& fp : fingerprints) {
+                bool found = false;
+                for (auto fp_pos : fp.positions) {
+                    if (fp_pos == pos) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    // Compute cosine similarity (dot product since both are L2-normalized)
+                    similarity = 0.0f;
+                    for (size_t i = 0; i < current_query_emb.size() && i < fp.embedding.size(); i++) {
+                        similarity += current_query_emb[i] * fp.embedding[i];
+                    }
+                    break;
+                }
+            }
+            
+            candidates_with_similarity.emplace_back(pos, similarity);
+        }
+        
+        // Reorder candidates: positions with similarity < 0.3 evicted first,
+        // positions with similarity > 0.65 moved to back of eviction queue
+        std::sort(candidates_with_similarity.begin(), candidates_with_similarity.end(),
+                  [](const auto& a, const auto& b) {
+                      if (a.second > 0.65f) return false;  // Keep high similarity at back
+                      if (b.second > 0.65f) return true;   // Keep high similarity at back
+                      if (a.second < 0.3f) return true;    // Evict low similarity first
+                      if (b.second < 0.3f) return false;   // Evict low similarity first
+                      return a.second < b.second;          // Otherwise by similarity
+                  });
+        
+        // Update candidates with reordered positions
+        candidates.clear();
+        for (const auto& candidate : candidates_with_similarity) {
+            candidates.push_back(candidate.first);
+        }
+        
+        // Count semantic eviction saves
+        uint32_t saves = 0;
+        for (const auto& candidate : candidates_with_similarity) {
+            if (candidate.second > 0.65f) {
+                saves++;
+            }
+        }
+        stats.semantic_eviction_saves += saves;
+    }
+
     std::vector<llama_pos> to_warm, to_cold;
 
     // Route to warm if slots available (RAM or GPU), otherwise cold
@@ -765,6 +821,145 @@ llama_tier_stats llama_kv_cache_tiered::get_stats() const {
 void llama_kv_cache_tiered::reset_stats() {
     std::lock_guard<std::mutex> lock(mutex);
     stats.reset();
+}
+
+void llama_kv_cache_tiered::add_fingerprint(const std::vector<llama_pos>& positions,
+                                             const std::vector<float>& embedding,
+                                             llama_cache_tier tier) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    semantic_fingerprint fp;
+    fp.positions = positions;
+    fp.embedding = embedding;
+    fp.tier = tier;
+    fp.turn = fingerprint_turn++;
+    
+    // Cap at 1000 entries - evict oldest when over cap
+    if (fingerprints.size() >= 1000) {
+        fingerprints.erase(fingerprints.begin());
+    }
+    
+    fingerprints.push_back(fp);
+}
+
+std::vector<llama_kv_cache_tiered::PrefetchHint> llama_kv_cache_tiered::score_fingerprints(
+    const std::vector<float>& query_emb, int top_k, float threshold) const {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    std::vector<PrefetchHint> results;
+    
+    if (fingerprints.empty() || query_emb.empty()) {
+        return results;
+    }
+    
+    // Compute cosine similarity between query_emb and each fingerprint
+    // Since both are L2-normalized, cosine similarity = dot product
+    for (const auto& fp : fingerprints) {
+        // Compute dot product
+        float dot_product = 0.0f;
+        size_t min_size = std::min(query_emb.size(), fp.embedding.size());
+        for (size_t i = 0; i < min_size; ++i) {
+            dot_product += query_emb[i] * fp.embedding[i];
+        }
+        
+        // Check if above threshold
+        if (dot_product >= threshold) {
+            PrefetchHint hint;
+            hint.positions = fp.positions;
+            hint.score = dot_product;
+            hint.current_tier = fp.tier;
+            results.push_back(hint);
+        }
+    }
+    
+    // Sort by score descending
+    std::sort(results.begin(), results.end(),
+              [](const PrefetchHint& a, const PrefetchHint& b) {
+                  return a.score > b.score;
+              });
+    
+    // Return top_k results
+    if (static_cast<int>(results.size()) > top_k) {
+        results.resize(top_k);
+    }
+    
+    return results;
+}
+
+void llama_kv_cache_tiered::set_current_query_embedding(const std::vector<float>& emb) {
+    std::lock_guard<std::mutex> lock(mutex);
+    current_query_emb = emb;
+}
+
+bool llama_kv_cache_tiered::save_fingerprints_to_disk(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex);
+    
+    std::ofstream file(path, std::ofstream::binary);
+    if (!file) {
+        return false;
+    }
+    
+    // Write number of entries
+    uint32_t n_entries = uint32_t(fingerprints.size());
+    file.write(reinterpret_cast<char*>(&n_entries), sizeof(uint32_t));
+    
+    // Write each fingerprint
+    for (const auto& fp : fingerprints) {
+        // Write positions count and positions
+        uint32_t n_pos = uint32_t(fp.positions.size());
+        file.write(reinterpret_cast<const char*>(&n_pos), sizeof(uint32_t));
+        file.write(reinterpret_cast<const char*>(fp.positions.data()), n_pos * sizeof(llama_pos));
+        
+        // Write embedding dimension and embedding
+        uint32_t n_embd = uint32_t(fp.embedding.size());
+        file.write(reinterpret_cast<const char*>(&n_embd), sizeof(uint32_t));
+        file.write(reinterpret_cast<const char*>(fp.embedding.data()), n_embd * sizeof(float));
+        
+        // Write tier and turn
+        file.write(reinterpret_cast<const char*>(&fp.tier), sizeof(llama_cache_tier));
+        file.write(reinterpret_cast<const char*>(&fp.turn), sizeof(uint64_t));
+    }
+    
+    return file.good();
+}
+
+bool llama_kv_cache_tiered::load_fingerprints_from_disk(const std::string& path) {
+    std::ifstream file(path, std::ifstream::binary);
+    if (!file) {
+        return false;
+    }
+    
+    // Read number of entries
+    uint32_t n_entries;
+    file.read(reinterpret_cast<char*>(&n_entries), sizeof(uint32_t));
+    
+    // Clear existing fingerprints
+    fingerprints.clear();
+    
+    // Read each fingerprint
+    for (uint32_t i = 0; i < n_entries; i++) {
+        semantic_fingerprint fp;
+        
+        // Read positions
+        uint32_t n_pos;
+        file.read(reinterpret_cast<char*>(&n_pos), sizeof(uint32_t));
+        fp.positions.resize(n_pos);
+        file.read(reinterpret_cast<char*>(fp.positions.data()), n_pos * sizeof(llama_pos));
+        
+        // Read embedding
+        uint32_t n_embd;
+        file.read(reinterpret_cast<char*>(&n_embd), sizeof(uint32_t));
+        fp.embedding.resize(n_embd);
+        file.read(reinterpret_cast<char*>(fp.embedding.data()), n_embd * sizeof(float));
+        
+        // Read tier and turn
+        file.read(reinterpret_cast<char*>(&fp.tier), sizeof(llama_cache_tier));
+        file.read(reinterpret_cast<char*>(&fp.turn), sizeof(uint64_t));
+        
+        fingerprints.push_back(fp);
+    }
+    
+    return file.good();
 }
 
 std::string llama_kv_cache_tiered::get_ssd_file_path(llama_pos pos) const {

@@ -144,7 +144,7 @@ poetry.toml
 /*.code-workspace
 /.windsurf/
 # emscripten
-a.out.*
+a.out.*x
 .gitnexus
 .claude/
 .agent.md

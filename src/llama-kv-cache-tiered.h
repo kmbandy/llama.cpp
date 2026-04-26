@@ -23,6 +23,14 @@ enum llama_cache_tier {
     TIER_COLD   // SSD - less frequently accessed context
 };
 
+// Semantic fingerprint for KV cache tokens
+struct semantic_fingerprint {
+    std::vector<llama_pos> positions;  // token positions this covers
+    std::vector<float>     embedding;  // normalized embedding vector
+    llama_cache_tier       tier;       // TIER_WARM or TIER_COLD
+    uint64_t               turn;       // conversation turn when evicted
+};
+
 // Compression types for cold tier storage
 enum llama_cache_compression {
     COMPRESSION_NONE,
@@ -145,6 +153,8 @@ struct llama_tier_stats {
     uint64_t cache_hits;
     uint64_t cache_misses;
     double total_migration_latency_us;
+    uint32_t semantic_prefetch_hits = 0;
+    uint32_t semantic_eviction_saves = 0;
 
     void reset() {
         hot_tokens = 0;
@@ -154,6 +164,8 @@ struct llama_tier_stats {
         cache_hits = 0;
         cache_misses = 0;
         total_migration_latency_us = 0.0;
+        semantic_prefetch_hits = 0;
+        semantic_eviction_saves = 0;
     }
 
     double get_hit_rate() const {
@@ -211,6 +223,25 @@ public:
     bool contains_token(llama_pos pos) const;
     bool load_token(llama_pos pos, llama_cache_tier target_tier);
 
+    // Prefetch hint for semantic similarity
+    struct PrefetchHint {
+        std::vector<llama_pos> positions;
+        float                  score;
+        llama_cache_tier       current_tier;
+    };
+
+    // Fingerprint management
+    void add_fingerprint(const std::vector<llama_pos>& positions,
+                         const std::vector<float>& embedding,
+                         llama_cache_tier tier);
+    bool save_fingerprints_to_disk(const std::string& path);
+    bool load_fingerprints_from_disk(const std::string& path);
+
+    // Semantic similarity scoring
+    std::vector<PrefetchHint> score_fingerprints(
+        const std::vector<float>& query_emb, int top_k, float threshold) const;
+    void set_current_query_embedding(const std::vector<float>& emb);
+
     // Statistics
     llama_tier_stats get_stats() const;
     void reset_stats();
@@ -241,6 +272,13 @@ private:
 
     // Statistics
     llama_tier_stats stats;
+
+    // Semantic fingerprints for evicted tokens
+    std::vector<semantic_fingerprint> fingerprints;
+    uint64_t fingerprint_turn = 0;
+
+    // Current query embedding for semantic eviction weighting
+    std::vector<float> current_query_emb;
 
     // Thread safety
     mutable std::mutex mutex;

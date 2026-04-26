@@ -2740,6 +2740,76 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        
+                        // Get and log prefetch hints if semantic index is enabled
+                        if (params_base.kv_tiered_enabled && tiered_cache->sem_enabled()) {
+                            auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                            if (slot_tier && slot_tier->initialized) {
+                                // Get the input text from the prompt tokens
+                                std::string input_text;
+                                const auto & input_tokens = slot.task->tokens;
+                                for (size_t i = 0; i < input_tokens.size(); ++i) {
+                                    auto piece = common_token_to_piece(ctx, input_tokens[i]);
+                                    input_text += piece;
+                                }
+                                
+                                // Get prefetch hints
+                                auto hints = tiered_cache->get_prefetch_hints(slot.id, input_text, tiered_cache->semantic_top_k);
+                                
+                                // Log the hints
+                                for (const auto& hint : hints) {
+                                    std::string positions_str;
+                                    if (!hint.positions.empty()) {
+                                        std::ostringstream oss;
+                                        oss << hint.positions.front() << ".." << hint.positions.back();
+                                        positions_str = oss.str();
+                                    } else {
+                                        positions_str = "empty";
+                                    }
+                                    const char* tier_name = hint.current_tier == TIER_WARM ? "warm" :
+                                                            hint.current_tier == TIER_COLD ? "cold" : "hot";
+                                    SLT_INF(slot, "semantic prefetch: score=%.2f positions=[%s] tier=%s\n",
+                                            hint.score, positions_str.c_str(), tier_name);
+                                }
+                                
+                                // Apply prefetch migration for WARM tier hints
+                                for (const auto& hint : hints) {
+                                    if (hint.current_tier == TIER_WARM) {
+                                        // Migrate WARM tokens to HOT tier
+                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
+                                            SLT_INF(slot, "semantic prefetch: migrated %zu warm tokens to hot\n", hint.positions.size());
+                                            auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
+                                            if (slot_mgr) {
+                                                slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
+                                            }
+                                        } else {
+                                            SLT_WRN(slot, "semantic prefetch: failed to migrate %zu warm tokens\n", hint.positions.size());
+                                        }
+                                    } else if (hint.current_tier == TIER_COLD) {
+                                        // Stage cold→warm→hot: first bring cold to warm, then warm to hot
+                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_COLD, TIER_WARM)) {
+                                            if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
+                                                SLT_INF(slot, "semantic prefetch: staged %zu cold tokens to hot\n", hint.positions.size());
+                                                auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
+                                                if (slot_mgr) {
+                                                    slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
+                                                }
+                                            } else {
+                                                SLT_WRN(slot, "semantic prefetch: cold->warm ok but warm->hot failed for %zu tokens\n", hint.positions.size());
+                                            }
+                                        } else {
+                                            SLT_WRN(slot, "semantic prefetch: failed to stage %zu cold tokens\n", hint.positions.size());
+                                        }
+                                    }
+                                }
+                                
+                                // Set the current query embedding for semantic eviction weighting
+                                auto embedding = tiered_cache->embed(input_text);
+                                if (!embedding.empty()) {
+                                    slot_tier->tiered_cache->set_current_query_embedding(embedding);
+                                }
+                            }
+                        }
                     } else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
