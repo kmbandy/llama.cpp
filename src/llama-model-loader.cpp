@@ -1,6 +1,10 @@
 #include "llama-model-loader.h"
 #include "llama-io-uring.h"
 
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#endif
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1434,6 +1438,9 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    std::vector<void *> sam_ptrs; // fine-grained VRAM staging for SAM direct path
+#endif
     size_t buffer_idx = 0; // buffer to use for async loads
 
 #ifdef LLAMA_HAVE_IO_URING
@@ -1482,8 +1489,36 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
-        // If the backend is supported, create pinned memory buffers and events for synchronisation.
+        // If the backend is supported, create staging buffers and events for synchronisation.
+        // With --direct-io on ROCm+SAM: allocate fine-grained VRAM so io_uring writes go
+        // NVMe -> BAR1 -> VRAM directly, bypassing CPU RAM entirely.
+        const bool use_sam_staging = use_direct_io &&
+            (strncmp(ggml_backend_dev_name(dev), "ROCm", 4) == 0);
         for (size_t idx = 0; idx < n_buffers; ++idx) {
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+            if (use_sam_staging) {
+                void * sam_ptr = nullptr;
+                hipError_t herr = hipExtMallocWithFlags(&sam_ptr, buffer_size, hipDeviceMallocFinegrained);
+                if (herr != hipSuccess || !sam_ptr) {
+                    LLAMA_LOG_WARN("%s: hipExtMallocWithFlags failed (%s), falling back to pinned host\n",
+                        func, hipGetErrorString(herr));
+                    // fall through to normal host alloc below
+                } else {
+                    sam_ptrs.emplace_back(sam_ptr);
+                    host_ptrs.emplace_back(sam_ptr);
+                    auto * event = ggml_backend_event_new(dev);
+                    if (!event) {
+                        LLAMA_LOG_DEBUG("%s: failed to create event for SAM staging\n", func);
+                        hipFree(sam_ptr);
+                        sam_ptrs.pop_back();
+                        host_ptrs.pop_back();
+                        return nullptr;
+                    }
+                    events.emplace_back(event);
+                    continue;
+                }
+            }
+#endif
             auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
             if (!buf) {
@@ -1682,6 +1717,11 @@ bool llama_model_loader::load_all_data(
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
     }
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    for (auto * ptr : sam_ptrs) {
+        hipFree(ptr);
+    }
+#endif
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);
     }
