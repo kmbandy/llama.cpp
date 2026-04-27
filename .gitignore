@@ -176,3 +176,4 @@ tests/libgguf-model-data.a
 *.a
 tests/cmake_install.cmake
 Makefile
+*.cmake
