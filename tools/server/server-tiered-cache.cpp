@@ -2,6 +2,10 @@
 
 #include "server-common.h"
 #include "llama.h"
+#include "../../src/llama-memory-hybrid-iswa.h"
+#include "../../src/llama-memory-hybrid.h"
+#include "../../src/llama-kv-cache-iswa.h"
+#include "../../src/llama-kv-cache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -186,12 +190,20 @@ bool server_tiered_cache::init_slot(int slot_id, const llama_model& model, struc
         return false;
     }
 
-    // Wire per-layer K/V tensor pointers for actual data movement
+    // Wire per-layer K/V tensor pointers for actual data movement.
+    // Handle both pure-attention (llama_kv_cache) and hybrid (llama_memory_hybrid_iswa)
+    // models like Qwen3-27B which wrap an iswa KV cache inside a hybrid container.
     if (lctx) {
-        auto * mem = llama_get_memory(lctx);
-        auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+        auto * mem        = llama_get_memory(lctx);
+        auto * kv         = dynamic_cast<llama_kv_cache *>(mem);
+        auto * hybrid     = dynamic_cast<llama_memory_hybrid *>(mem);
+        auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
         if (kv) {
             manager.tiered_cache->set_kv_layers_from_cache(kv);
+        } else if (hybrid && hybrid->get_mem_attn()) {
+            manager.tiered_cache->set_kv_layers_from_cache(hybrid->get_mem_attn());
+        } else if (hybrid_iswa && hybrid_iswa->get_mem_attn()) {
+            manager.tiered_cache->set_kv_layers_from_cache(hybrid_iswa->get_mem_attn()->get_base());
         } else {
             SRV_WRN("tiered cache: could not cast memory to llama_kv_cache for slot %d — metadata-only mode\n", slot_id);
         }

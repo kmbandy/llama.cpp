@@ -536,7 +536,7 @@ struct common_params {
     // weight paging parameters
     bool    weight_paging_enabled = false;  // enable NVMe→VRAM demand paging for model weights
     int32_t weight_paging_slots   = -1;     // number of VRAM slots for weight paging (-1 = auto)
-    bool    weight_paging_prefetch = true;  // enable async prefetch of next layer
+    bool    weight_paging_prefetch = false;  // enable async prefetch of next layer
 
     bool single_turn       = false; // single turn chat conversation
 

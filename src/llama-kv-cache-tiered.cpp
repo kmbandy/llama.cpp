@@ -336,6 +336,10 @@ bool llama_kv_cache_tiered::init() {
         LLAMA_LOG_INFO("%s: warm tier: %u slots reserved (buffers wired after KV layers available)\n",
                        __func__, config.warm_capacity());
     }
+    if (config.cold_capacity() > 0) {
+        LLAMA_LOG_INFO("%s: cold tier: %u slots reserved (SSD path: %s)\n",
+                       __func__, config.cold_capacity(), ssd_path.c_str());
+    }
 
     return true;
 }
@@ -651,8 +655,12 @@ void llama_kv_cache_tiered::set_kv_layers_from_cache(llama_kv_cache * cache) {
         tl.v      = cache->get_layer_v_raw(il);
         tl.v_trans = vtrans;
         tl.kv_size = kvsz;
-        if (tl.k) tl.k_bytes = (size_t)tl.k->ne[0] * ggml_element_size(tl.k);
-        if (tl.v) tl.v_bytes = (size_t)tl.v->ne[0] * ggml_element_size(tl.v);
+        // Use nb[1] (the actual row stride) for per-token byte size so that
+        // block-quantized types (turbo4, Q4_K, etc.) are sized correctly.
+        // ggml_element_size returns the block size, not bytes-per-element, so
+        // ne[0]*element_size is wildly wrong for quantized caches.
+        if (tl.k) tl.k_bytes = tl.k->nb[1];
+        if (tl.v) tl.v_bytes = tl.v->nb[1];
     }
 
     // (Re)allocate per-layer warm buffers using already-reserved slot count
@@ -666,8 +674,18 @@ void llama_kv_cache_tiered::set_kv_layers_from_cache(llama_kv_cache * cache) {
         delete[] tl.warm_k;
         delete[] tl.warm_v;
         tl.warm_k = tl.warm_v = nullptr;
+        // Skip RAM staging buffers when a GPU warm device is configured — the
+        // GPU VRAM path (warm_k_dev/warm_v_dev) is used instead, so allocating
+        // n_warm * kv_bytes of RAM here would just trigger OOM for large contexts.
+#ifndef GGML_USE_HIP
         if (n_warm > 0 && tl.k_bytes > 0) tl.warm_k = new uint8_t[n_warm * tl.k_bytes]();
         if (n_warm > 0 && tl.v_bytes > 0) tl.warm_v = new uint8_t[n_warm * tl.v_bytes]();
+#else
+        if (config.warm_device < 0) {
+            if (n_warm > 0 && tl.k_bytes > 0) tl.warm_k = new uint8_t[n_warm * tl.k_bytes]();
+            if (n_warm > 0 && tl.v_bytes > 0) tl.warm_v = new uint8_t[n_warm * tl.v_bytes]();
+        }
+#endif
 
 #ifdef GGML_USE_HIP
         if (config.warm_device >= 0 && n_warm > 0) {
@@ -686,8 +704,24 @@ void llama_kv_cache_tiered::set_kv_layers_from_cache(llama_kv_cache * cache) {
         total_mb += (tl.k_bytes + tl.v_bytes) * n_warm;
     total_mb /= (1024*1024);
 
-    LLAMA_LOG_INFO("%s: wired %u KV layers (v_trans=%d, kv_size=%lld), warm RAM: ~%zu MB (%u slots x %u layers)\n",
+#ifdef GGML_USE_HIP
+    if (config.warm_device >= 0) {
+        LLAMA_LOG_INFO("%s: wired %u KV layers (v_trans=%d, kv_size=%lld), warm GPU: ~%zu MiB (%u slots x %u layers)\n",
+                       __func__, n, (int)vtrans, (long long)kvsz, total_mb, n_warm, n);
+    } else {
+        LLAMA_LOG_INFO("%s: wired %u KV layers (v_trans=%d, kv_size=%lld), warm RAM: ~%zu MiB (%u slots x %u layers)\n",
+                       __func__, n, (int)vtrans, (long long)kvsz, total_mb, n_warm, n);
+    }
+#else
+    LLAMA_LOG_INFO("%s: wired %u KV layers (v_trans=%d, kv_size=%lld), warm RAM: ~%zu MiB (%u slots x %u layers)\n",
                    __func__, n, (int)vtrans, (long long)kvsz, total_mb, n_warm, n);
+#endif
+#ifdef GGML_USE_HIP
+    if (config.warm_device >= 0 && n_warm > 0 && !kv_layers.empty() && kv_layers[0].warm_k_dev) {
+        LLAMA_LOG_INFO("llama_kv_cache_tiered:      ROCm%d KV warm buffer size = %6.2f MiB (%u slots x %u layers)\n",
+                       config.warm_device, (float)total_mb, n_warm, n);
+    }
+#endif
 }
 
 bool llama_kv_cache_tiered::migrate_tokens(const std::vector<llama_pos>& positions,

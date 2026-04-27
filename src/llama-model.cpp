@@ -9146,7 +9146,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.weight_paging_enabled       =*/ false,
         /*.weight_paging_slots         =*/ -1,
-        /*.weight_paging_prefetch      =*/ true,
+        /*.weight_paging_prefetch      =*/ false,
     };
 
     return result;

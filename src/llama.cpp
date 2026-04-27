@@ -1,4 +1,5 @@
 #include "llama.h"
+#include <fcntl.h>
 
 #include "llama-impl.h"
 
@@ -145,24 +146,32 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                        __func__, model.weight_pager->weight_tensor_ptrs.size());
     }
 
+    // Always dup model file descriptors — page_in uses pread regardless of prefetch.
+    // Clear O_DIRECT on the dup'd fds: GGUF tensor offsets are not sector-aligned,
+    // so O_DIRECT would silently read from a rounded-down offset on some filesystems.
+    if (!ml.files.empty()) {
+        for (const auto & f : ml.files) {
+            int fd = dup(f->file_id());
+#ifdef O_DIRECT
+            int fl = fcntl(fd, F_GETFL);
+            if (fl != -1 && (fl & O_DIRECT)) fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+#endif
+            model.weight_pager->fds.push_back(fd);
+        }
+    }
+
 #ifdef LLAMA_HAVE_IO_URING
-    // Enable async prefetch if requested and io_uring is available
+    // Enable async prefetch via io_uring only when explicitly requested.
     model.weight_pager->async_prefetch = params.weight_paging_prefetch;
 
-    if (params.weight_paging_prefetch) {
-        // Open the model file for io_uring reads
-        if (!ml.files.empty()) {
-            for (const auto & f : ml.files) {
-                model.weight_pager->fds.push_back(dup(f->file_id()));
-            }
-            int fd = model.weight_pager->fds.empty() ? -1 : model.weight_pager->fds[0];
-            if (fd >= 0) {
-                if (model.weight_pager->init_io_uring(64)) {
-                    LLAMA_LOG_INFO("%s: io_uring initialized for async prefetch\n", __func__);
-                } else {
-                    LLAMA_LOG_WARN("%s: failed to initialize io_uring, disabling async prefetch\n", __func__);
-                    model.weight_pager->async_prefetch = false;
-                }
+    if (params.weight_paging_prefetch && !model.weight_pager->fds.empty()) {
+        int fd = model.weight_pager->fds[0];
+        if (fd >= 0) {
+            if (model.weight_pager->init_io_uring(64)) {
+                LLAMA_LOG_INFO("%s: io_uring initialized for async prefetch\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: failed to initialize io_uring, disabling async prefetch\n", __func__);
+                model.weight_pager->async_prefetch = false;
             }
         }
     }

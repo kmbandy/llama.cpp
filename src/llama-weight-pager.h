@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 struct ggml_tensor;
+struct ggml_backend_buffer;
+typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
 #ifdef LLAMA_HAVE_IO_URING
 struct io_uring;
@@ -37,14 +39,15 @@ struct llama_weight_page {
 
 /// VRAM slot pool for managing contiguous weight allocations
 struct llama_vram_pool {
-    void   *base;              // hipMalloc'd contiguous VRAM block
+    void   *base;              // device base pointer for the pool
+    ggml_backend_buffer_t ggml_buf; // ggml CUDA buffer wrapping the pool
     void   *pinned_staging;    // pinned host staging buffer
     size_t  slot_size;         // bytes per slot (= max single-layer weight size)
     int     n_slots;           // total slots = floor(pool_bytes / slot_size)
     std::vector<bool>      used;
     std::vector<uint64_t>  lru_tick; // per-slot last-used tick
 
-    llama_vram_pool() : base(nullptr), pinned_staging(nullptr), slot_size(0), n_slots(0) {}
+    llama_vram_pool() : base(nullptr), ggml_buf(nullptr), pinned_staging(nullptr), slot_size(0), n_slots(0) {}
 
     /// Allocate a slot, evicting LRU if necessary. Returns slot index.
     int alloc_slot();
@@ -73,7 +76,7 @@ struct llama_weight_pager {
     // Async io_uring reader for prefetch
     struct llama_io_uring * io_reader = nullptr;
     std::unordered_map<int, prefetch_req> in_flight;  // page_idx -> in-flight request
-    bool                         async_prefetch = true; // enabled by default when io_uring available
+    bool                         async_prefetch = false; // TODO: re-enable after fixing page-index tracking in complete_prefetch
 #endif
 
     // Async GPU transfer stream for overlapping data transfer with compute

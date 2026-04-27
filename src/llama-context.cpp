@@ -13,6 +13,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1201,8 +1202,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         
         // Use weight pager callback if model has weight_pager enabled
         if (model.weight_pager) {
-            // The weight pager callback handles paging weights from NVMe to VRAM
-            // It takes precedence over the user-provided callback for weight tensors
+            // hipGraph bakes tensor->data pointers at capture time; our eval callback
+            // changes tensor->data dynamically, so graphs must be disabled.
+            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
             ggml_backend_sched_set_eval_callback(sched.get(), weight_pager_eval_cb, model.weight_pager.get());
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
