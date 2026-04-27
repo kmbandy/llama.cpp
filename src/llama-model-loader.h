@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-weight-pager.h"
 
 #include "ggml-cpp.h"
 
@@ -27,6 +28,14 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+// Information about a weight tensor for the weight pager
+struct llama_weight_page_info {
+    std::string name;     // tensor name
+    uint16_t    file_idx; // source file index (for split GGUFs)
+    size_t      offset;   // file offset in GGUF
+    size_t      size;     // tensor size in bytes
+};
 
 struct llama_model_loader {
     // Holds information on a model weight
@@ -89,6 +98,9 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+
+    // weight pager info (Phase 2)
+    std::vector<llama_weight_page_info> weight_page_infos;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set

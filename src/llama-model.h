@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-weight-pager.h"
 
 #include <map>
 #include <memory>
@@ -570,6 +571,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // weight paging for NVMe→VRAM demand paging
+    std::unique_ptr<llama_weight_pager> weight_pager;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

@@ -5,6 +5,8 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-tiered-cache.h"
+#include "../src/llama-model.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -633,6 +635,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -682,6 +685,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_tiered_cache> tiered_cache;
 
     server_metrics metrics;
 
@@ -747,6 +751,11 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {
+            params_base.kv_tier_total_ctx = params_base.n_ctx;
+            params_base.n_ctx = std::max(512, (int)(params_base.n_ctx * params_base.kv_tier_hot_pct / 100.0f));
+            SRV_INF("tiered KV: total ctx=%d, hot ctx=%d (%.0f%%)\n", params_base.kv_tier_total_ctx, params_base.n_ctx, params_base.kv_tier_hot_pct);
+        }
 
         llama_init = common_init_from_params(params_base);
 
@@ -854,6 +863,13 @@ private:
             }
         }
 
+        // Initialize tiered cache if enabled
+        if (params_base.kv_tiered_enabled) {
+            tiered_cache = std::make_unique<server_tiered_cache>(params_base);
+            SRV_INF("tiered cache initialized, hot=%f%%, warm=%f%%, cold=%f%%\n",
+                    params_base.kv_tier_hot_pct, params_base.kv_tier_warm_pct, params_base.kv_tier_cold_pct);
+        }
+
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
@@ -862,7 +878,9 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx);
+        int n_ctx_slot = (params_base.kv_tiered_enabled && params_base.kv_tier_total_ctx > 0)
+                         ? params_base.kv_tier_total_ctx
+                         : llama_n_ctx_seq(ctx);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
             // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
@@ -902,6 +920,15 @@ private:
 
                 if (slot.spec) {
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                }
+            }
+
+            // initialize tier manager for slot if enabled
+            if (params_base.kv_tiered_enabled) {
+                if (!tiered_cache->init_slot(i, *model, ctx)) {
+                    SRV_WRN("failed to initialize tier manager for slot %d\n", i);
+                } else {
+                    SLT_INF(slot, "tier manager initialized for slot %s\n", "");
                 }
             }
 
@@ -1384,6 +1411,24 @@ private:
 
         if (incomplete) {
             slot.has_next_token = true;
+        }
+
+        // Proactive tiered cache eviction: when hot tier reaches 80% capacity,
+        // evict oldest tokens to warm/cold to make room. Works for all architectures
+        // including hybrids that don't support ctx_shift.
+        if (params_base.kv_tiered_enabled && tiered_cache) {
+            const int n_tokens = slot.prompt.n_tokens();
+            const int evict_threshold = (int)(slot.n_ctx * 0.80f);
+            if (n_tokens >= evict_threshold) {
+                auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                if (slot_tier && slot_tier->initialized) {
+                    const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
+                    if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
+                        SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
+                                n_evict, n_tokens, slot.n_ctx);
+                    }
+                }
+            }
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
@@ -2178,6 +2223,20 @@ private:
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
+                // Try tiered cache eviction before context shift
+                if (params_base.kv_tiered_enabled) {
+                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                    if (slot_tier && slot_tier->initialized) {
+                        // Evict tokens to tiered cache before context shift
+                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
+                        if (n_evict > 0) {
+                            if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)slot.prompt.n_tokens())) {
+                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
+                            }
+                        }
+                    }
+                }
+
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
@@ -2685,6 +2744,76 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        
+                        // Get and log prefetch hints if semantic index is enabled
+                        if (params_base.kv_tiered_enabled && tiered_cache->sem_enabled()) {
+                            auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                            if (slot_tier && slot_tier->initialized) {
+                                // Get the input text from the prompt tokens
+                                std::string input_text;
+                                const auto & input_tokens = slot.task->tokens;
+                                for (size_t i = 0; i < input_tokens.size(); ++i) {
+                                    auto piece = common_token_to_piece(ctx, input_tokens[i]);
+                                    input_text += piece;
+                                }
+                                
+                                // Get prefetch hints
+                                auto hints = tiered_cache->get_prefetch_hints(slot.id, input_text, tiered_cache->semantic_top_k);
+                                
+                                // Log the hints
+                                for (const auto& hint : hints) {
+                                    std::string positions_str;
+                                    if (!hint.positions.empty()) {
+                                        std::ostringstream oss;
+                                        oss << hint.positions.front() << ".." << hint.positions.back();
+                                        positions_str = oss.str();
+                                    } else {
+                                        positions_str = "empty";
+                                    }
+                                    const char* tier_name = hint.current_tier == TIER_WARM ? "warm" :
+                                                            hint.current_tier == TIER_COLD ? "cold" : "hot";
+                                    SLT_INF(slot, "semantic prefetch: score=%.2f positions=[%s] tier=%s\n",
+                                            hint.score, positions_str.c_str(), tier_name);
+                                }
+                                
+                                // Apply prefetch migration for WARM tier hints
+                                for (const auto& hint : hints) {
+                                    if (hint.current_tier == TIER_WARM) {
+                                        // Migrate WARM tokens to HOT tier
+                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
+                                            SLT_INF(slot, "semantic prefetch: migrated %zu warm tokens to hot\n", hint.positions.size());
+                                            auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
+                                            if (slot_mgr) {
+                                                slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
+                                            }
+                                        } else {
+                                            SLT_WRN(slot, "semantic prefetch: failed to migrate %zu warm tokens\n", hint.positions.size());
+                                        }
+                                    } else if (hint.current_tier == TIER_COLD) {
+                                        // Stage cold→warm→hot: first bring cold to warm, then warm to hot
+                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_COLD, TIER_WARM)) {
+                                            if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
+                                                SLT_INF(slot, "semantic prefetch: staged %zu cold tokens to hot\n", hint.positions.size());
+                                                auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
+                                                if (slot_mgr) {
+                                                    slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
+                                                }
+                                            } else {
+                                                SLT_WRN(slot, "semantic prefetch: cold->warm ok but warm->hot failed for %zu tokens\n", hint.positions.size());
+                                            }
+                                        } else {
+                                            SLT_WRN(slot, "semantic prefetch: failed to stage %zu cold tokens\n", hint.positions.size());
+                                        }
+                                    }
+                                }
+                                
+                                // Set the current query embedding for semantic eviction weighting
+                                auto embedding = tiered_cache->embed(input_text);
+                                if (!embedding.empty()) {
+                                    slot_tier->tiered_cache->set_current_query_embedding(embedding);
+                                }
+                            }
+                        }
                     } else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
@@ -3499,6 +3628,20 @@ void server_routes::init_routes() {
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
             }}}
         };
+
+        // Add weight pager metrics if enabled
+        if (ctx_server.model && ctx_server.model->weight_pager) {
+            auto * pager = ctx_server.model->weight_pager.get();
+            { json m; m["name"] = "llama_weight_pager_pages_total"; m["help"] = "Total number of weight pages tracked"; m["value"] = (double)pager->pages.size(); all_metrics_def["gauge"].push_back(m); }
+            { json m; m["name"] = "llama_weight_pager_loaded_pages"; m["help"] = "Number of pages currently loaded in VRAM";
+              size_t loaded = 0;
+              for (const auto & page : pager->pages) { if (page.slot_idx >= 0) loaded++; }
+              m["value"] = (double)loaded; all_metrics_def["gauge"].push_back(m); }
+#ifdef LLAMA_HAVE_IO_URING
+            { json m; m["name"] = "llama_weight_pager_in_flight_prefetches"; m["help"] = "Number of in-flight prefetch requests"; m["value"] = (double)pager->in_flight.size(); all_metrics_def["gauge"].push_back(m); }
+            { json m; m["name"] = "llama_weight_pager_async_prefetch_enabled"; m["help"] = "Async prefetch enabled (1=true, 0=false)"; m["value"] = pager->async_prefetch ? 1.0 : 0.0; all_metrics_def["gauge"].push_back(m); }
+#endif
+        }
 
         std::stringstream prometheus;
 

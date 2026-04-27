@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-tiered-cache.cpp
+    server-tiered-cache.h
     server-tools.cpp
     server-tools.h
 )
@@ -25,6 +27,11 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(GGML_HIP)
+    target_include_directories(${TARGET} PRIVATE /opt/rocm/include)
+    target_compile_definitions(${TARGET} PRIVATE __HIP_PLATFORM_AMD__)
+endif()
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 
@@ -70,6 +77,11 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(GGML_HIP)
+    target_include_directories(${TARGET} PRIVATE /opt/rocm/include)
+endif()
+    target_compile_definitions(${TARGET} PRIVATE __HIP_PLATFORM_AMD__)
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

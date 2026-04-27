@@ -144,7 +144,7 @@ poetry.toml
 /*.code-workspace
 /.windsurf/
 # emscripten
-a.out.*
+a.out.*x
 .gitnexus
 .claude/
 .agent.md
@@ -175,4 +175,5 @@ ggml/ggml-version.cmake
 tests/libgguf-model-data.a
 *.a
 tests/cmake_install.cmake
+Makefile
 *.cmake

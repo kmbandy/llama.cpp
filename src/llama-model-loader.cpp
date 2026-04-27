@@ -1,4 +1,9 @@
 #include "llama-model-loader.h"
+#include "llama-io-uring.h"
+
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#endif
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1433,7 +1438,16 @@ bool llama_model_loader::load_all_data(
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    std::vector<void *> sam_ptrs; // fine-grained VRAM staging for SAM direct path
+#endif
     size_t buffer_idx = 0; // buffer to use for async loads
+
+#ifdef LLAMA_HAVE_IO_URING
+    // io_uring reader: pre-submit NVMe reads so they overlap GPU DMA uploads.
+    std::unique_ptr<llama_io_uring> io_reader;
+    std::vector<struct iovec> io_iovs;
+#endif
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
         if (use_mmap || check_tensors) {
             return nullptr;
@@ -1475,8 +1489,36 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
-        // If the backend is supported, create pinned memory buffers and events for synchronisation.
+        // If the backend is supported, create staging buffers and events for synchronisation.
+        // With --direct-io on ROCm+SAM: allocate fine-grained VRAM so io_uring writes go
+        // NVMe -> BAR1 -> VRAM directly, bypassing CPU RAM entirely.
+        const bool use_sam_staging = use_direct_io &&
+            (strncmp(ggml_backend_dev_name(dev), "ROCm", 4) == 0);
         for (size_t idx = 0; idx < n_buffers; ++idx) {
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+            if (use_sam_staging) {
+                void * sam_ptr = nullptr;
+                hipError_t herr = hipExtMallocWithFlags(&sam_ptr, buffer_size, hipDeviceMallocFinegrained);
+                if (herr != hipSuccess || !sam_ptr) {
+                    LLAMA_LOG_WARN("%s: hipExtMallocWithFlags failed (%s), falling back to pinned host\n",
+                        func, hipGetErrorString(herr));
+                    // fall through to normal host alloc below
+                } else {
+                    sam_ptrs.emplace_back(sam_ptr);
+                    host_ptrs.emplace_back(sam_ptr);
+                    auto * event = ggml_backend_event_new(dev);
+                    if (!event) {
+                        LLAMA_LOG_DEBUG("%s: failed to create event for SAM staging\n", func);
+                        hipFree(sam_ptr);
+                        sam_ptrs.pop_back();
+                        host_ptrs.pop_back();
+                        return nullptr;
+                    }
+                    events.emplace_back(event);
+                    continue;
+                }
+            }
+#endif
             auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
             if (!buf) {
@@ -1515,6 +1557,39 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+#ifdef LLAMA_HAVE_IO_URING
+    if (upload_backend && !files.empty()) {
+        int fd = files.at(0)->file_id();
+        if (fd >= 0) {
+            io_reader = std::make_unique<llama_io_uring>(fd);
+            if (io_reader->valid()) {
+                // Register all pinned staging buffers for zero-copy DMA
+                io_iovs.resize(host_ptrs.size());
+                for (size_t i = 0; i < host_ptrs.size(); i++)
+                    io_iovs[i] = { host_ptrs[i], buffer_size };
+                if (!io_reader->register_buffers(io_iovs.data(), (int)io_iovs.size()))
+                    LLAMA_LOG_WARN("%s: io_uring buffer registration failed, continuing without fixed buffers\n", __func__);
+                    LLAMA_LOG_DEBUG("%s: io_uring reader active\n", __func__);
+            } else {
+                io_reader.reset();
+            }
+        }
+    }
+#endif
+
+    // Phase 2: Collect weight tensor info for the weight pager
+    // This is done before the main loading loop to record file offsets
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr) {
+            // this can happen with split experts models
+            continue;
+        }
+
+
+    }
+
+    // Reset to first tensor for main loading loop
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1595,6 +1670,18 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file
+#ifdef LLAMA_HAVE_IO_URING
+                        if (io_reader && io_reader->valid()) {
+                            io_reader->submit_read((int)buffer_idx,
+                                reinterpret_cast<void *>(ptr_dest_aligned),
+                                read_size,
+                                aligned_offset + bytes_read,
+                                buffer_idx);
+                            io_reader->submit();
+                            int nr = 0;
+                            io_reader->wait_one(&nr);
+                        } else
+#endif
                         file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
 
                         // Calculate actual data portion (excluding alignment padding)
@@ -1643,6 +1730,11 @@ bool llama_model_loader::load_all_data(
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
     }
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    for (auto * ptr : sam_ptrs) {
+        hipFree(ptr);
+    }
+#endif
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);
     }

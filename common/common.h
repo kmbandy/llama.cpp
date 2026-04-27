@@ -533,6 +533,11 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // weight paging parameters
+    bool    weight_paging_enabled = false;  // enable NVMe→VRAM demand paging for model weights
+    int32_t weight_paging_slots   = -1;     // number of VRAM slots for weight paging (-1 = auto)
+    bool    weight_paging_prefetch = false;  // enable async prefetch of next layer
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -572,6 +577,21 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    // tiered KV cache parameters
+    bool kv_tiered_enabled    = false;   // enable tiered KV cache
+    float kv_tier_hot_pct     = 25.0f;   // hot tier percentage (VRAM)
+    float kv_tier_warm_pct    = 25.0f;   // warm tier percentage (RAM)
+    float kv_tier_cold_pct    = 50.0f;   // cold tier percentage (SSD)
+    std::string kv_tier_ssd_path = "";   // SSD path for cold tier storage
+    int kv_tier_eviction_policy = 3;     // 0=LRU, 1=LFU, 2=attention, 3=hybrid (default)
+    int kv_tier_compression   = 1;       // 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized
+    float kv_tier_attention_threshold = 0.1f;  // attention threshold for eviction
+    int   kv_warm_device        = -1;    // HIP device index for warm KV tier (-1 = disabled)
+    int   kv_tier_total_ctx     = 0;     // full ctx budget across all tiers (set at load time)
+    std::string kv_semantic_index = "";   // path to embedding model for semantic KV index (empty = disabled)
+    float kv_semantic_threshold = 0.65f;  // minimum cosine similarity threshold for prefetch hints
+    int   kv_semantic_top_k     = 5;      // number of prefetch hints to return
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
