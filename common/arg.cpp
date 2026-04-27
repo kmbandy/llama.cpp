@@ -2431,9 +2431,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"--weight-paging"}, "",
+        {"--weight-paging"},
         "enable NVMe→VRAM demand paging for model weights (allows models larger than VRAM)",
-        [](common_params & params, const std::string & value) {
+        [](common_params & params) {
             params.weight_paging_enabled = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
@@ -2445,9 +2445,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
     add_opt(common_arg(
-        {"--weight-paging-prefetch"}, "",
+        {"--weight-paging-prefetch"},
         "enable async prefetch of next layer (default: enabled)",
-        [](common_params & params, const std::string & value) {
+        [](common_params & params) {
             params.weight_paging_prefetch = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));

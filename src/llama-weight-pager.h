@@ -4,6 +4,9 @@
 #include <vector>
 #include <unordered_map>
 #include <stdint.h>
+#include <unistd.h>
+
+struct ggml_tensor;
 
 #ifdef LLAMA_HAVE_IO_URING
 struct io_uring;
@@ -22,24 +25,26 @@ struct prefetch_req {
 /// Represents a single weight tensor page that can be paged in/out of VRAM
 struct llama_weight_page {
     std::string  tensor_name;   // ggml tensor name (e.g. "blk.0.attn_q.weight")
+    uint16_t     file_idx;      // source file index (for split GGUFs)
     size_t       file_offset;   // byte offset in GGUF file
     size_t       size;          // tensor size in bytes
     int          slot_idx;      // VRAM slot index, -1 = not in VRAM
     uint64_t     last_used;     // monotonic counter for LRU
     void        *vram_ptr;      // pointer into slot pool, null if not loaded
 
-    llama_weight_page() : file_offset(0), size(0), slot_idx(-1), last_used(0), vram_ptr(nullptr) {}
+    llama_weight_page() : file_idx(0), file_offset(0), size(0), slot_idx(-1), last_used(0), vram_ptr(nullptr) {}
 };
 
 /// VRAM slot pool for managing contiguous weight allocations
 struct llama_vram_pool {
     void   *base;              // hipMalloc'd contiguous VRAM block
+    void   *pinned_staging;    // pinned host staging buffer
     size_t  slot_size;         // bytes per slot (= max single-layer weight size)
     int     n_slots;           // total slots = floor(pool_bytes / slot_size)
     std::vector<bool>      used;
     std::vector<uint64_t>  lru_tick; // per-slot last-used tick
 
-    llama_vram_pool() : base(nullptr), slot_size(0), n_slots(0) {}
+    llama_vram_pool() : base(nullptr), pinned_staging(nullptr), slot_size(0), n_slots(0) {}
 
     /// Allocate a slot, evicting LRU if necessary. Returns slot index.
     int alloc_slot();
@@ -57,10 +62,11 @@ struct llama_vram_pool {
 /// Weight pager: manages paging model weights between NVMe and VRAM
 struct llama_weight_pager {
     std::string              model_path;
-    int                      fd;           // open fd for io_uring reads
+    std::vector<int>         fds;          // file descriptors for each split file
     llama_vram_pool          pool;
     std::vector<llama_weight_page> pages;  // one per weight tensor
     std::unordered_map<std::string, int> name_to_page;  // tensor_name -> page index
+    std::vector<ggml_tensor*> weight_tensor_ptrs;  // actual model tensor pointers
     uint64_t                 tick = 0;
 
 #ifdef LLAMA_HAVE_IO_URING
@@ -70,7 +76,11 @@ struct llama_weight_pager {
     bool                         async_prefetch = true; // enabled by default when io_uring available
 #endif
 
-    llama_weight_pager() : fd(-1) {}
+    // Async GPU transfer stream for overlapping data transfer with compute
+    void * transfer_stream = nullptr;  // hipStream_t
+
+    llama_weight_pager() {}
+    ~llama_weight_pager();
 
     /// Ensure tensor is in VRAM. Returns VRAM pointer.
     /// If tensor already in VRAM, updates tick and returns pointer.
@@ -87,7 +97,7 @@ struct llama_weight_pager {
     void page_in(llama_weight_page & page);
 
     /// Initialize the VRAM pool with given parameters
-    void init_pool(size_t slot_size, int n_slots);
+    bool init_pool(size_t slot_size, int n_slots);
 
     /// Get the LRU slot index (for testing/debugging)
     int get_lru_slot() const;

@@ -8,6 +8,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-weight-pager.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -1197,7 +1198,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        
+        // Use weight pager callback if model has weight_pager enabled
+        if (model.weight_pager) {
+            // The weight pager callback handles paging weights from NVMe to VRAM
+            // It takes precedence over the user-provided callback for weight tensors
+            ggml_backend_sched_set_eval_callback(sched.get(), weight_pager_eval_cb, model.weight_pager.get());
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1211,11 +1220,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        LLAMA_LOG_INFO("%s: calling ggml_backend_sched_alloc_graph\n", __func__);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph returned false\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        LLAMA_LOG_INFO("%s: ggml_backend_sched_alloc_graph succeeded\n", __func__);
     }
 
     // set the input data for the input tensors
@@ -2188,10 +2199,12 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    LLAMA_LOG_INFO("%s: calling ggml_backend_sched_graph_compute_async\n", __func__);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
+    LLAMA_LOG_INFO("%s: ggml_backend_sched_graph_compute_async returned status=%d\n", __func__, status);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 

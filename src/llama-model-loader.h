@@ -31,9 +31,10 @@ const char * llama_file_version_name(llama_fver version);
 
 // Information about a weight tensor for the weight pager
 struct llama_weight_page_info {
-    std::string name;   // tensor name
-    size_t      offset; // file offset in GGUF
-    size_t      size;   // tensor size in bytes
+    std::string name;     // tensor name
+    uint16_t    file_idx; // source file index (for split GGUFs)
+    size_t      offset;   // file offset in GGUF
+    size_t      size;     // tensor size in bytes
 };
 
 struct llama_model_loader {

@@ -1343,7 +1343,7 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    if (params.warmup && !params.weight_paging_enabled) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
@@ -1487,6 +1487,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+
+    // Weight paging parameters
+    mparams.weight_paging_enabled  = params.weight_paging_enabled;
+    mparams.weight_paging_slots    = params.weight_paging_slots;
+    mparams.weight_paging_prefetch = params.weight_paging_prefetch;
 
     return mparams;
 }

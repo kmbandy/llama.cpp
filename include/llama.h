@@ -321,6 +321,11 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+
+        // Weight paging parameters (NVMe→VRAM demand paging)
+        bool weight_paging_enabled;    // enable NVMe→VRAM demand paging for model weights
+        int32_t weight_paging_slots;   // number of VRAM slots for weight paging (-1 = auto)
+        bool weight_paging_prefetch;   // enable async prefetch of next layer
     };
 
     struct llama_sampler_seq_config {

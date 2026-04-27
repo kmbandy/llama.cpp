@@ -9,6 +9,7 @@
 #include <limits>
 #include <cstring>
 #include <fcntl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
 
@@ -32,25 +33,41 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
 
-    // Collect page indices for all weight tensors in this tensor's sources
+    // DIAGNOSTIC: Log callback invocation
+    LLAMA_LOG_INFO("weight_pager_eval_cb: tensor=%s ask=%s\n",
+                   ggml_get_name(t), ask ? "true" : "false");
+    LLAMA_LOG_INFO("weight_pager_eval_cb: pager=%p pool.base=%p pool.n_slots=%d\n",
+                   pager, pager->pool.base, pager->pool.n_slots);
+
+    // Collect page indices for all weight tensors in this tensor's sources.
+    // Also detect view tensors of tracked weights (ggml_gallocr_alloc_graph initialises
+    // their data to (char*)1 + view_offs -- garbage -- so we must overwrite it
+    // with the real paged-in VRAM address before every op that uses them).
     std::vector<int> page_indices;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (!t->src[i]) {
+        struct ggml_tensor * src = t->src[i];
+        if (!src) {
             break;
         }
 
-        struct ggml_tensor * src = t->src[i];
-        if (!src) {
+        // Direct weight tensor match
+        int page_idx = pager->find_page(ggml_get_name(src));
+
+        // View tensor whose source is a tracked weight
+        if (page_idx < 0 && src->view_src != nullptr) {
+            page_idx = pager->find_page(ggml_get_name(src->view_src));
+        }
+
+        if (page_idx < 0) {
             continue;
         }
 
-        const char * tensor_name = ggml_get_name(src);
-        int page_idx = pager->find_page(tensor_name);
-        if (page_idx < 0) {
-            continue; // not a weight tensor tracked by pager
+        // Deduplicate (e.g. two views of the same weight in one op)
+        bool already = false;
+        for (int idx : page_indices) { if (idx == page_idx) { already = true; break; } }
+        if (!already) {
+            page_indices.push_back(page_idx);
         }
-
-        page_indices.push_back(page_idx);
     }
 
     if (page_indices.empty()) {
@@ -66,20 +83,26 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 #endif
 
-    // Phase 3: Ensure each tensor is in VRAM and redirect data pointers
+    // Phase 3: Ensure each tensor is in VRAM and redirect data pointers.
+    // Handles both direct weight sources and view tensors of those weights.
     for (int page_idx : page_indices) {
         llama_weight_page & page = pager->pages[page_idx];
         void * vram = pager->ensure(page.tensor_name);
         if (vram) {
-            // Redirect tensor data pointer to current VRAM slot
-            // Find the source tensor and update its data pointer
             for (int i = 0; i < GGML_MAX_SRC; i++) {
-                if (!t->src[i]) {
+                struct ggml_tensor * src = t->src[i];
+                if (!src) {
                     break;
                 }
-                struct ggml_tensor * src = t->src[i];
-                if (src && strcmp(ggml_get_name(src), page.tensor_name.c_str()) == 0) {
+                // Direct weight tensor
+                if (strcmp(ggml_get_name(src), page.tensor_name.c_str()) == 0) {
                     src->data = vram;
+                }
+                // View of this weight: gallocr sets data=(char*)sentinel+view_offs;
+                // overwrite with the real paged-in slot address + offset.
+                else if (src->view_src != nullptr &&
+                         strcmp(ggml_get_name(src->view_src), page.tensor_name.c_str()) == 0) {
+                    src->data = (char *)vram + src->view_offs;
                 }
             }
         }
@@ -147,9 +170,29 @@ void llama_vram_pool::free_slot(int idx) {
 // llama_weight_pager implementation
 // ============================================================================
 
-void llama_weight_pager::init_pool(size_t slot_size, int n_slots) {
+llama_weight_pager::~llama_weight_pager() {
+    for (int fd : fds) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    if (pool.pinned_staging != nullptr) {
+        hipHostFree(pool.pinned_staging);
+    }
+    if (pool.base != nullptr) {
+        hipFree(pool.base);
+    }
+    if (transfer_stream != nullptr) {
+        hipStreamDestroy((hipStream_t)transfer_stream);
+    }
+#endif
+}
+
+bool llama_weight_pager::init_pool(size_t slot_size, int n_slots) {
     if (n_slots <= 0) {
-        return;  // invalid configuration
+        LLAMA_LOG_WARN("init_pool: invalid n_slots=%d\n", n_slots);
+        return false;
     }
 
     pool.slot_size = slot_size;
@@ -157,14 +200,48 @@ void llama_weight_pager::init_pool(size_t slot_size, int n_slots) {
     pool.used.resize(n_slots, false);
     pool.lru_tick.resize(n_slots, 0);
 
+    LLAMA_LOG_INFO("init_pool: allocating %d slots of %zu bytes each\n", n_slots, slot_size);
+
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    // Allocate the VRAM pool using hipMalloc
     hipError_t err = hipMalloc(&pool.base, (size_t)n_slots * slot_size);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("llama_weight_pager: hipMalloc failed (%s), weight paging disabled\n", hipGetErrorString(err));
+        LLAMA_LOG_WARN("llama_weight_pager: hipMalloc failed: %s\n", hipGetErrorString(err));
         pool.base = nullptr;
+        return false;
     }
+
+    // Allocate the pinned host staging buffer
+    err = hipHostMalloc(&pool.pinned_staging, slot_size, hipHostMallocDefault);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("llama_weight_pager: hipHostMalloc for pinned_staging failed: %s\n", hipGetErrorString(err));
+        hipFree(pool.base);
+        pool.base = nullptr;
+        pool.pinned_staging = nullptr;
+        return false;
+    }
+
+    // Create the async transfer stream
+    err = hipStreamCreate((hipStream_t*)&transfer_stream);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("llama_weight_pager: hipStreamCreate failed: %s\n", hipGetErrorString(err));
+        hipHostFree(pool.pinned_staging);
+        hipFree(pool.base);
+        pool.base = nullptr;
+        pool.pinned_staging = nullptr;
+        transfer_stream = nullptr;
+        return false;
+    }
+
+    LLAMA_LOG_INFO("init_pool: allocated pool.base=%p pinned_staging=%p transfer_stream=%p (slot_size=%zu, n_slots=%d)\n",
+                   pool.base, pool.pinned_staging, transfer_stream, slot_size, n_slots);
+    return true;
 #else
+    LLAMA_LOG_WARN("init_pool: HIP not available, falling back\n");
     pool.base = nullptr;
+    pool.pinned_staging = nullptr;
+    transfer_stream = nullptr;
+    return false;
 #endif
 }
 
@@ -176,6 +253,10 @@ void* llama_weight_pager::ensure(const std::string & name) {
     }
 
     llama_weight_page & page = pages[page_idx];
+
+    // DIAGNOSTIC: Log ensure call
+    LLAMA_LOG_INFO("ensure: tensor=%s page_idx=%d slot_idx=%d vram_ptr=%p\n",
+                   name.c_str(), page_idx, page.slot_idx, page.vram_ptr);
 
     // If already in VRAM, update tick and return pointer
     if (page.slot_idx >= 0 && page.vram_ptr != nullptr) {
@@ -191,13 +272,18 @@ void* llama_weight_pager::ensure(const std::string & name) {
     // Not in VRAM - need to page in
     // Phase 1 stub: page_in() returns nullptr, so we return nullptr
     // In Phase 2, this will actually load from NVMe
+    LLAMA_LOG_INFO("ensure: calling page_in for tensor %s\n", name.c_str());
     page_in(page);
+    LLAMA_LOG_INFO("ensure: page_in returned, page.slot_idx=%d page.vram_ptr=%p\n",
+                   page.slot_idx, page.vram_ptr);
 
     if (page.vram_ptr != nullptr) {
         page.last_used = ++tick;
         if (page.slot_idx >= 0 && page.slot_idx < pool.n_slots) {
             pool.lru_tick[page.slot_idx] = tick;
         }
+    } else {
+        LLAMA_LOG_WARN("ensure: page_in returned nullptr for tensor %s\n", name.c_str());
     }
 
     return page.vram_ptr;
@@ -231,6 +317,8 @@ void llama_weight_pager::evict_lru() {
 static void pager_invalidate_slot(llama_weight_pager * pager, int slot_idx) {
     for (auto & page : pager->pages) {
         if (page.slot_idx == slot_idx) {
+            LLAMA_LOG_INFO("pager_invalidate_slot: invalidating slot=%d tensor=%s\n",
+                           slot_idx, page.tensor_name.c_str());
             page.slot_idx = -1;
             page.vram_ptr = nullptr;
             return;
@@ -247,26 +335,54 @@ int llama_weight_pager::find_page(const std::string & name) const {
 }
 
 void llama_weight_pager::page_in(llama_weight_page & page) {
-    // Phase 2: actual page-in from NVMe to VRAM
+    LLAMA_LOG_INFO("page_in: loading tensor %s (file_idx=%u, offset=%zu, size=%zu)\n",
+                   page.tensor_name.c_str(), (unsigned)page.file_idx, page.file_offset, page.size);
+    // Phase 3: two-step path with async stream - NVMe → pinned staging → VRAM
     // Check if we have a valid pool and file descriptor
-    if (!pool.is_valid() || fd < 0) {
-        return;  // cannot page in without pool or fd
+    if (!pool.is_valid() || pool.pinned_staging == nullptr || fds.empty() || fds[0] < 0) {
+        LLAMA_LOG_WARN("page_in: no valid pool or fd (pool.valid=%s pool.pinned_staging=%p fds.empty=%s fds[0]=%d)\n",
+                       pool.is_valid() ? "true" : "false",
+                       pool.pinned_staging,
+                       fds.empty() ? "true" : "false",
+                       fds.empty() ? -1 : fds[0]);
+        return;  // cannot page in without pool, pinned_staging, or fd
     }
 
-    // Allocate a slot (may evict LRU if full — invalidate the displaced page)
+    // Step 1: Read from NVMe into pinned host staging buffer
+    int read_fd = (page.file_idx < (uint16_t)fds.size()) ? fds[page.file_idx] : (fds.empty() ? -1 : fds[0]);
+    LLAMA_LOG_INFO("page_in: pread fd=%d pinned_staging=%p size=%zu offset=%zu\n",
+                   read_fd, pool.pinned_staging, page.size, page.file_offset);
+    ssize_t n = pread(read_fd, pool.pinned_staging, page.size, page.file_offset);
+    LLAMA_LOG_INFO("page_in: pread returned %zd (errno=%d)\n", n, errno);
+    if (n != (ssize_t)page.size) {
+        LLAMA_LOG_WARN("page_in: failed to read tensor (read %zd/%zu bytes)\n", n, page.size);
+        return;
+    }
+
+    // Step 2: Allocate a slot (may evict LRU if full — invalidate the displaced page)
     int slot = pool.alloc_slot();
     pager_invalidate_slot(this, slot);
     void * dst = pool.slot_ptr(slot);
 
-    // Read from file directly into VRAM via pread
-    // For SAM/ReBAR, this goes NVMe → BAR1 → VRAM directly
-    ssize_t n = pread(fd, dst, page.size, page.file_offset);
-    if (n != (ssize_t)page.size) {
-        LLAMA_LOG_WARN("page_in: failed to read tensor (read %zd/%zu bytes)\n", n, page.size);
-        // On failure, free the slot and return
+    // Step 3: Copy from pinned staging to VRAM slot using hipMemcpyAsync on transfer_stream
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+    LLAMA_LOG_INFO("page_in: hipMemcpyAsync dst=%p pinned_staging=%p size=%zu stream=%p\n",
+                   dst, pool.pinned_staging, page.size, transfer_stream);
+    hipError_t err = hipMemcpyAsync(dst, pool.pinned_staging, page.size, hipMemcpyHostToDevice, (hipStream_t)transfer_stream);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("page_in: hipMemcpyAsync failed: %s\n", hipGetErrorString(err));
         pool.free_slot(slot);
         return;
     }
+
+    // Synchronize to ensure transfer completes before returning (synchronous case)
+    err = hipStreamSynchronize((hipStream_t)transfer_stream);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("page_in: hipStreamSynchronize failed: %s\n", hipGetErrorString(err));
+        pool.free_slot(slot);
+        return;
+    }
+#endif
 
     // Update page state
     page.slot_idx = slot;
@@ -302,10 +418,10 @@ int llama_weight_pager::get_lru_slot() const {
 #include "llama-io-uring.h"
 
 bool llama_weight_pager::init_io_uring(int queue_depth) {
-    if (fd < 0) {
+    if (fds.empty() || fds[0] < 0) {
         return false;
     }
-    io_reader = new llama_io_uring(fd, queue_depth);
+    io_reader = new llama_io_uring(fds.empty() ? -1 : fds[0], queue_depth);
     if (!io_reader->valid()) {
         delete io_reader;
         io_reader = nullptr;
@@ -338,9 +454,11 @@ void llama_weight_pager::submit_prefetch(int page_idx) {
     pager_invalidate_slot(this, slot);
     void * dst = pool.slot_ptr(slot);
 
-    // Submit async read via io_uring
+    // Submit async read via io_uring to pinned staging buffer
     // Use page_idx as user_data to identify completion
-    io_reader->submit_read(0, dst, page.size, page.file_offset, (uint64_t)page_idx);
+    // The read goes into pinned_staging, not directly into VRAM
+    void * staging_dst = pool.pinned_staging;
+    io_reader->submit_read(0, staging_dst, page.size, page.file_offset, (uint64_t)page_idx);
 
     in_flight[page_idx] = { page_idx, slot, dst };
 }
@@ -383,6 +501,18 @@ bool llama_weight_pager::complete_prefetch(int page_idx) {
         }
 
         auto & req = fit->second;
+
+        // Issue async GPU transfer from pinned_staging to VRAM slot
+#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
+        if (pool.pinned_staging != nullptr && transfer_stream != nullptr) {
+            hipError_t err = hipMemcpyAsync(req.dst, pool.pinned_staging, page.size, hipMemcpyHostToDevice, (hipStream_t)transfer_stream);
+            if (err != hipSuccess) {
+                LLAMA_LOG_WARN("complete_prefetch: hipMemcpyAsync failed: %s\n", hipGetErrorString(err));
+                in_flight.erase(fit);
+                continue;
+            }
+        }
+#endif
 
         // Update page state with the loaded data
         completed_page.slot_idx = req.slot_idx;

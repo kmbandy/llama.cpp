@@ -7987,10 +7987,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml.no_alloc || params.weight_paging_enabled) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                // Only set the dummy buffer on non-weight tensors.
+                // Weight tensors must have buffer == NULL and data == NULL so that
+                // ggml_gallocr_alloc_graph skips allocation for them.
+                // The weight pager callback will set the correct VRAM slot before each op.
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                    if (params.weight_paging_enabled && ml.get_weight(ggml_get_name(t))) {
+                        // Skip weight tensors - they will be handled by the weight pager
+                        // Leave buffer == NULL and data == NULL
+                        continue;
+                    }
+                    // Set dummy buffer on non-weight tensors (RoPE freqs, positional embeddings, etc.)
+                    t->buffer = buf;
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
@@ -8045,14 +8055,36 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (ml.no_alloc) {
+    if (ml.no_alloc && !params.weight_paging_enabled) {
         return true;
     }
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
+    // Populate weight page info for the pager before load_all_data is conditionally skipped
+    if (params.weight_paging_enabled) {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const auto * weight = ml.get_weight(ggml_get_name(t));
+                if (!weight) { continue; }
+                llama_weight_page_info info;
+                info.name     = ggml_get_name(t);
+                info.file_idx = weight->idx;
+                info.offset   = weight->offs;
+                info.size     = ggml_nbytes(t);
+                ml.weight_page_infos.push_back(info);
+                // Collect the actual model tensor pointer for the weight pager
+                if (weight_pager) {
+                    weight_pager->weight_tensor_ptrs.push_back(t);
+                }
+            }
+        }
+    }
+
+    // load tensor data (skip when weight paging is enabled — weights are paged in on-demand)
+    if (!params.weight_paging_enabled) {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
         }
     }
 
@@ -9112,6 +9144,9 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.weight_paging_enabled       =*/ false,
+        /*.weight_paging_slots         =*/ -1,
+        /*.weight_paging_prefetch      =*/ true,
     };
 
     return result;

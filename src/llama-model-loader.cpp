@@ -1577,6 +1577,19 @@ bool llama_model_loader::load_all_data(
     }
 #endif
 
+    // Phase 2: Collect weight tensor info for the weight pager
+    // This is done before the main loading loop to record file offsets
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr) {
+            // this can happen with split experts models
+            continue;
+        }
+
+
+    }
+
+    // Reset to first tensor for main loading loop
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
