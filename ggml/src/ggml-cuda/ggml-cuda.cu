@@ -720,7 +720,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
+#if defined(GGML_CUDA_NO_PEER_COPY) || defined(GGML_USE_HIP)
             return false;
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
@@ -1004,12 +1004,28 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
         }
 
         const char * buf_host = (const char *)data + offset_split;
+        ggml_cuda_set_device(id);
+#if defined(GGML_USE_HIP)
+        // hipStreamPerThread is not per-device on ROCm 7.x: after hipSetDevice switches,
+        // the per-thread stream still belongs to the previous device, causing P2P faults
+        // on mixed-arch setups (gfx1201+gfx1030). Use an explicit stream created after
+        // hipSetDevice to guarantee the copy runs on the correct device DMA engine.
+        hipStream_t _hip_copy_stream;
+        CUDA_CHECK(hipStreamCreate(&_hip_copy_stream));
+        CUDA_CHECK(hipMemcpyAsync(extra->data_device[id], buf_host, original_size, hipMemcpyHostToDevice, _hip_copy_stream));
+        CUDA_CHECK(hipStreamSynchronize(_hip_copy_stream));
+        hipStreamDestroy(_hip_copy_stream);
+#else
         CUDA_CHECK(cudaMemcpyAsync(extra->data_device[id], buf_host, original_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+#endif
     }
 
+#if !defined(GGML_USE_HIP)
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+        ggml_cuda_set_device(id);
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     }
+#endif
 }
 
 static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1428,12 +1444,9 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     const char * x = src_ptr + i1_low*nb1 + i2*nb2 + i3*nb3;
 
 #if defined(GGML_USE_HIP)
-    // hipMemcpy2DAsync with hipMemcpyDeviceToDevice requires P2P access between devices.
-    // For mixed-architecture multi-GPU setups (e.g. gfx1201 + gfx1030) without P2P,
-    // it fails asynchronously with hipErrorNoBinaryForGpu when the internal copy kernel
-    // isn't compiled for the destination device. Detect cross-device copies via pointer
-    // attributes and fall back to row-wise hipMemcpyPeerAsync, which stages through the
-    // host when P2P is unavailable. Mirrors the fix in ggml_cuda_Memcpy2DPeerAsync.
+    // hipMemcpyPeerAsync's internal copy kernel is not compiled for all ISAs in a
+    // mixed-architecture ROCm build (e.g. gfx1201 + gfx1030), causing async GPU page
+    // faults. Use explicit synchronous CPU staging for cross-device copies instead.
     hipPointerAttribute_t src_attr = {};
     hipPointerAttribute_t dst_attr = {};
     const bool src_ok = hipPointerGetAttributes(&src_attr, x)       == hipSuccess;
@@ -1441,36 +1454,37 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     if (src_ok && dst_ok && src_attr.device != dst_attr.device) {
         const int src_dev = src_attr.device;
         const int dst_dev = dst_attr.device;
-        if (nb0 == ts && nb1 == ts*ne0/bs) {
-            return hipMemcpyPeerAsync(dst_ptr, dst_dev, x, src_dev, i1_diff*nb1, stream);
-        } else if (nb0 == ts) {
-            const size_t row_bytes = ts*ne0/bs;
-            for (int64_t i1 = 0; i1 < i1_diff; i1++) {
-                hipError_t err = hipMemcpyPeerAsync(
-                    dst_ptr + i1*row_bytes, dst_dev,
-                    x + i1*nb1,             src_dev,
-                    row_bytes, stream);
-                if (err != hipSuccess) {
-                    return err;
+        // Flush stream so prior GPU work writing to src is complete.
+        hipStreamSynchronize(stream);
+        int saved_dev;
+        hipGetDevice(&saved_dev);
+        const size_t row_bytes = (nb0 == ts) ? ts*ne0/bs : ts/bs;
+        const size_t total_bytes = i1_diff * ((nb0 == ts) ? ts*ne0/bs : ne0*(ts/bs));
+        void * host_buf = nullptr;
+        if (total_bytes > 0 && hipHostMalloc(&host_buf, total_bytes, hipHostMallocDefault) == hipSuccess) {
+            hipSetDevice(src_dev);
+            if (nb0 == ts && nb1 == ts*ne0/bs) {
+                hipMemcpy(host_buf, x, total_bytes, hipMemcpyDeviceToHost);
+            } else if (nb0 == ts) {
+                for (int64_t i1 = 0; i1 < i1_diff; i1++) {
+                    hipMemcpy((char*)host_buf + i1*row_bytes, x + i1*nb1, row_bytes, hipMemcpyDeviceToHost);
                 }
-            }
-            return hipSuccess;
-        } else {
-            for (int64_t i1 = 0; i1 < i1_diff; i1++) {
-                const char * rx = x + i1*nb1;
-                char       * rd = dst_ptr + i1*ts*ne0/bs;
-                for (int64_t e = 0; e < ne0; e++) {
-                    hipError_t err = hipMemcpyPeerAsync(
-                        rd + e*(ts/bs), dst_dev,
-                        rx + e*nb0,     src_dev,
-                        ts/bs, stream);
-                    if (err != hipSuccess) {
-                        return err;
+            } else {
+                const size_t elem = ts/bs;
+                for (int64_t i1 = 0; i1 < i1_diff; i1++) {
+                    for (int64_t e = 0; e < ne0; e++) {
+                        hipMemcpy((char*)host_buf + (i1*ne0+e)*elem, x + i1*nb1 + e*nb0, elem, hipMemcpyDeviceToHost);
                     }
                 }
             }
+            hipSetDevice(dst_dev);
+            hipMemcpy(dst_ptr, host_buf, total_bytes, hipMemcpyHostToDevice);
+            hipHostFree(host_buf);
+            hipSetDevice(saved_dev);
             return hipSuccess;
         }
+        hipSetDevice(saved_dev);
+        return hipErrorOutOfMemory;
     }
 #endif
 
@@ -1691,25 +1705,62 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
     return cudaMemcpy3DPeerAsync(&p, stream);
 #else
     // HIP does not support cudaMemcpy3DPeerAsync or vmm pools.
-    // hipMemcpy2DAsync with hipMemcpyDeviceToDevice requires P2P access between devices.
-    // For mixed-architecture multi-GPU setups (e.g. gfx1201 + gfx1030) without P2P,
-    // hipMemcpy2DAsync submits successfully but fails asynchronously with
-    // hipErrorNoBinaryForGpu when the internal copy kernel isn't compiled for the
-    // destination device. Use hipMemcpyPeerAsync row-by-row instead, which handles
-    // non-P2P cross-device copies correctly via CPU staging.
     if (dstDevice == srcDevice) {
         return hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, hipMemcpyDeviceToDevice, stream);
     }
-    for (size_t i = 0; i < height; ++i) {
-        cudaError_t err = cudaMemcpyPeerAsync(
-            (char *) dst + i*dpitch, dstDevice,
-            (const char *) src + i*spitch, srcDevice,
-            width, stream);
-        if (err != cudaSuccess) {
-            return err;
-        }
+
+    // Only attempt P2P if GGML_CUDA_P2P is set, which also calls hipDeviceEnablePeerAccess
+    // in ggml_cuda_init(). Without explicit enablement, hipMemcpyPeerAsync (and its internal
+    // fallback path) uses a GPU copy kernel that may not be compiled for all ISAs in a
+    // mixed-architecture build (e.g. gfx1201 + gfx1030), causing async GPU page faults.
+    int can_access_peer = 0;
+    if (getenv("GGML_CUDA_P2P") != nullptr) {
+        hipDeviceCanAccessPeer(&can_access_peer, dstDevice, srcDevice);
     }
-    return cudaSuccess;
+
+    if (can_access_peer) {
+        // P2P explicitly enabled: async row-by-row peer copies.
+        for (size_t i = 0; i < height; ++i) {
+            cudaError_t err = cudaMemcpyPeerAsync(
+                (char *) dst + i*dpitch, dstDevice,
+                (const char *) src + i*spitch, srcDevice,
+                width, stream);
+            if (err != cudaSuccess) { return err; }
+        }
+        return cudaSuccess;
+    }
+
+    // No P2P: synchronous CPU staging avoids the ROCm mixed-ISA copy-kernel bug.
+    // The pinned buffer is cached across calls to avoid hipHostMalloc overhead at
+    // inference rates (alloc+free per token would dominate the copy cost).
+    static std::mutex s_staging_mtx;
+    static void *     s_staging_buf = nullptr;
+    static size_t     s_staging_cap = 0;
+
+    hipStreamSynchronize(stream);
+
+    const size_t staging_size = width * height;
+    int saved_device;
+    hipGetDevice(&saved_device);
+
+    std::lock_guard<std::mutex> lk(s_staging_mtx);
+    if (staging_size > s_staging_cap) {
+        if (s_staging_buf) { hipHostFree(s_staging_buf); s_staging_buf = nullptr; }
+        if (hipHostMalloc(&s_staging_buf, staging_size, hipHostMallocDefault) != hipSuccess) {
+            hipSetDevice(saved_device);
+            return hipErrorOutOfMemory;
+        }
+        s_staging_cap = staging_size;
+    }
+
+    hipSetDevice(srcDevice);
+    hipError_t err = hipMemcpy2D(s_staging_buf, width, src, spitch, width, height, hipMemcpyDeviceToHost);
+    if (err == hipSuccess) {
+        hipSetDevice(dstDevice);
+        err = hipMemcpy2D(dst, dpitch, s_staging_buf, width, width, height, hipMemcpyHostToDevice);
+    }
+    hipSetDevice(saved_device);
+    return (err == hipSuccess) ? cudaSuccess : (cudaError_t)err;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -1952,14 +2003,14 @@ static void ggml_cuda_op_mul_mat(
                                 const size_t height = src1_padded_col_size/(4*QK8_1);
                                 CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(src1_ddq_i, id, pitch, src1_ddq_i_source, ctx.device, pitch, width, height, stream));
                             } else {
-                                CUDA_CHECK(cudaMemcpyPeerAsync(
-                                    src1_ddq_i, id, src1_ddq_i_source, ctx.device, src1_ncols*src1_padded_col_size*q8_1_ts/q8_1_bs, stream));
+                                const size_t nbytes_q = src1_ncols*src1_padded_col_size*q8_1_ts/q8_1_bs;
+                                CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(src1_ddq_i, id, nbytes_q, src1_ddq_i_source, ctx.device, nbytes_q, nbytes_q, 1, stream));
                             }
                         } else {
                             float * src1_ddf_i_source = (float *) src1->data;
                             src1_ddf_i_source += (i0*ne11 + src1_col_0) * ne10;
-                            CUDA_CHECK(cudaMemcpyPeerAsync(src1_ddf_i, id, src1_ddf_i_source, ctx.device,
-                                                            src1_ncols*ne10*sizeof(float), stream));
+                            const size_t nbytes_f = src1_ncols*ne10*sizeof(float);
+                            CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(src1_ddf_i, id, nbytes_f, src1_ddf_i_source, ctx.device, nbytes_f, nbytes_f, 1, stream));
                         }
                     }
                 } else if (src1_on_device && !src1_is_contiguous) {
@@ -3135,7 +3186,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
+#if defined(GGML_CUDA_NO_PEER_COPY) || defined(GGML_USE_HIP)
             return false;
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
