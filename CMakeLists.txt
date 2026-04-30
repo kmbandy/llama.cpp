@@ -182,6 +182,9 @@ endif()
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
+    # Upstream flipped GGML_HIP_GRAPHS to ON by default (b8904+). Keep it OFF
+    # until we validate it against our tiered KV cache and VMM work — see MAD-13.
+    set(GGML_HIP_GRAPHS OFF CACHE BOOL "ggml: use HIP graph (disabled in fork pending VMM validation)" FORCE)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
