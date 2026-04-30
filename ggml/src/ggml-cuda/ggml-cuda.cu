@@ -713,6 +713,9 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
+    void * dst, int dstDevice, size_t dpitch, void * src, int srcDevice, size_t spitch, size_t width, size_t height, cudaStream_t stream);
+
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
@@ -720,8 +723,14 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
-#if defined(GGML_CUDA_NO_PEER_COPY) || defined(GGML_USE_HIP)
+#ifdef GGML_CUDA_NO_PEER_COPY
             return false;
+#elif defined(GGML_USE_HIP)
+            {
+                const size_t nb = ggml_nbytes(src);
+                CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, dst_ctx->device, nb,
+                    const_cast<void *>(src->data), src_ctx->device, nb, nb, 1, cudaStreamPerThread));
+            }
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
 #endif
@@ -3186,8 +3195,14 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
-#if defined(GGML_CUDA_NO_PEER_COPY) || defined(GGML_USE_HIP)
+#ifdef GGML_CUDA_NO_PEER_COPY
             return false;
+#elif defined(GGML_USE_HIP)
+            {
+                const size_t nb = ggml_nbytes(dst);
+                CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, nb,
+                    const_cast<void *>(src->data), cuda_ctx_src->device, nb, nb, 1, cuda_ctx_src->stream()));
+            }
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
