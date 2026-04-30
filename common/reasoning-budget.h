@@ -40,3 +40,4 @@ struct llama_sampler * common_reasoning_budget_init(
         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+int32_t                       common_reasoning_budget_get_n_thinking(const struct llama_sampler * smpl);

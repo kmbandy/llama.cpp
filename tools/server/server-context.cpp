@@ -13,6 +13,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "reasoning-budget.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -1358,6 +1359,14 @@ private:
             }
 
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
+
+            {
+                const auto * rbudget  = common_sampler_get_rbudget(slot.smpl.get());
+                const auto   rb_state = common_reasoning_budget_get_state(rbudget);
+                SLT_INF(slot, "reasoning budget: %s initial_state=%d budget_tokens=%d\n",
+                        rbudget ? "active" : "inactive", (int)rb_state,
+                        task.params.sampling.reasoning_budget_tokens);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -1379,6 +1388,10 @@ private:
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
+
+        SLT_DBG(slot, "token: id=%d '%s' rbudget_state=%d\n",
+                (int)result.tok, token_str.c_str(),
+                (int)common_reasoning_budget_get_state(common_sampler_get_rbudget(slot.smpl.get())));
 
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
@@ -3068,6 +3081,16 @@ private:
                 }
 
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+                if (slot.n_decoded % 64 == 0 || slot.n_decoded == 1) {
+                    const float tps = slot.t_token_generation > 0
+                        ? (float)slot.n_decoded / (slot.t_token_generation / 1e3f) : 0.0f;
+                    const auto * rbudget  = common_sampler_get_rbudget(slot.smpl.get());
+                    const int32_t n_think = common_reasoning_budget_get_n_thinking(rbudget);
+                    const auto    rb_st   = common_reasoning_budget_get_state(rbudget);
+                    SLT_INF(slot, "generate: n_decoded=%d n_past=%d t/s=%.2f rbudget_state=%d n_thinking=%d token_id=%d\n",
+                            slot.n_decoded, slot.prompt.n_tokens(), tps, (int)rb_st, n_think, (int)id);
+                }
 
                 completion_token_output result;
                 result.tok          = id;

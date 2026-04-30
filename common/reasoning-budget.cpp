@@ -50,6 +50,9 @@ struct common_reasoning_budget_ctx {
 
     // for forcing
     size_t force_pos;         // next position in forced_tokens to force
+
+    // diagnostic counter
+    int32_t n_thinking;       // thinking tokens counted since activation
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
@@ -98,7 +101,13 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                     LOG_INF("reasoning-budget: UTF-8 complete, now forcing end sequence\n");
                 }
             } else if (ctx->state == REASONING_BUDGET_COUNTING) {
+                ctx->n_thinking++;
                 ctx->remaining--;
+                if (ctx->n_thinking % 256 == 0) {
+                    const std::string piece = ctx->vocab ? common_token_to_piece(ctx->vocab, token, false) : "";
+                    LOG_INF("reasoning-budget: thinking token #%d, token_id=%d '%s', remaining=%d\n",
+                            ctx->n_thinking, (int)token, piece.c_str(), ctx->remaining);
+                }
                 if (ctx->remaining <= 0) {
                     if (utf8_complete) {
                         ctx->state = REASONING_BUDGET_FORCING;
@@ -169,6 +178,7 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->start_matcher.reset();
     ctx->end_matcher.reset();
     ctx->force_pos = 0;
+    ctx->n_thinking = 0;
 }
 
 // forward declaration for use in clone
@@ -228,6 +238,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .remaining     = */ budget,
             /* .state         = */ initial_state,
             /* .force_pos     = */ 0,
+            /* .n_thinking    = */ 0,
         }
     );
 }
@@ -247,4 +258,11 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
         return REASONING_BUDGET_IDLE;
     }
     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
+}
+
+int32_t common_reasoning_budget_get_n_thinking(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return 0;
+    }
+    return ((const common_reasoning_budget_ctx *)smpl->ctx)->n_thinking;
 }

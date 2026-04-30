@@ -87,6 +87,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// Returns the internal reasoning-budget llama_sampler (nullptr if not active).
+const struct llama_sampler * common_sampler_get_rbudget(const struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens
