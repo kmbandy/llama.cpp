@@ -1222,13 +1222,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        LLAMA_LOG_INFO("%s: calling ggml_backend_sched_alloc_graph\n", __func__);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: ggml_backend_sched_alloc_graph returned false\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        LLAMA_LOG_INFO("%s: ggml_backend_sched_alloc_graph succeeded\n", __func__);
     }
 
     // set the input data for the input tensors
@@ -2201,12 +2199,10 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    LLAMA_LOG_INFO("%s: calling ggml_backend_sched_graph_compute_async\n", __func__);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
-    LLAMA_LOG_INFO("%s: ggml_backend_sched_graph_compute_async returned status=%d\n", __func__, status);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
