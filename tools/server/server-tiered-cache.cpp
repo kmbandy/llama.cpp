@@ -113,14 +113,13 @@ std::vector<float> server_tiered_cache::embed(const std::string & text) {
     }
 
     // Create a batch and decode to get embeddings
+    // Note: llama_batch_get_one borrows the tokens pointer — do NOT call llama_batch_free on it.
     auto batch = llama_batch_get_one(tokens.data(), n_tokens);
     int32_t result = llama_decode(sem_ctx, batch);
     if (result != 0) {
         SRV_WRN("embed: llama_decode failed with code %d\n", result);
-        llama_batch_free(batch);
         return {};
     }
-    llama_batch_free(batch);
 
     // Extract embeddings for sequence 0
     float * embd_ptr = llama_get_embeddings_seq(sem_ctx, 0);
