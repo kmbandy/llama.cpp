@@ -384,6 +384,47 @@ uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   s
     return restored;
 }
 
+void llama_memory_tiered::record_chunk_fingerprint(std::vector<llama_pos> positions,
+                                                     std::vector<float>     embedding,
+                                                     SemanticIndex::Tier    tier) {
+    semantic_.add_fingerprint(std::move(positions), std::move(embedding), tier);
+}
+
+std::vector<SemanticIndex::Hint>
+llama_memory_tiered::find_similar_chunks(const std::vector<float> & query_embedding,
+                                          int                        top_k,
+                                          float                      threshold) const {
+    return semantic_.score(query_embedding, top_k, threshold);
+}
+
+uint32_t llama_memory_tiered::restore_semantic(llama_seq_id              seq_id,
+                                                 const std::vector<float> & query_embedding,
+                                                 int                        top_k,
+                                                 float                      threshold) {
+    auto hints = find_similar_chunks(query_embedding, top_k, threshold);
+    if (hints.empty()) return 0;
+
+    // Flatten hint position lists. Drop positions already resident in
+    // hot (we'd otherwise double-allocate slots) and dedupe across
+    // hints in case two semantic matches overlap.
+    std::vector<llama_pos> wanted;
+    std::unordered_set<llama_pos> seen;
+    for (const auto & h : hints) {
+        for (auto p : h.positions) {
+            if (seen.insert(p).second && has_warm(seq_id, p)) {
+                wanted.push_back(p);
+            }
+        }
+    }
+    if (wanted.empty()) return 0;
+
+    LLAMA_LOG_INFO("mt::restore_semantic: %zu hints -> %zu positions to restore "
+                   "(seq %d, top_k=%d, threshold=%.2f)\n",
+                   hints.size(), wanted.size(), seq_id, top_k, threshold);
+
+    return restore_from_warm(seq_id, wanted);
+}
+
 void llama_memory_tiered::forget_warm(const std::vector<llama_pos> & positions) {
     for (auto pos : positions) {
         auto it = warm_pos_to_slot_.find(pos);

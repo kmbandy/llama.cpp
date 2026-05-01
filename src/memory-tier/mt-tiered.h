@@ -128,6 +128,39 @@ public:
     // wired). After this, has_warm() returns false for those positions.
     void forget_warm(const std::vector<llama_pos> & positions);
 
+    // ---- public semantic-restore API ----
+    //
+    // Caller provides L2-normalized embeddings; the wrapper stores them
+    // in its internal SemanticIndex and uses them to find chunks that
+    // semantically match a future query. The embedding model itself
+    // lives outside the wrapper (loaded by the integration layer —
+    // typically a small CPU model like bge-small or nomic-embed-text).
+
+    // Record a fingerprint for a chunk. positions identifies the cells
+    // covered by the chunk; embedding should be L2-normalized (caller's
+    // responsibility). tier records where the chunk currently lives so
+    // the policy can prefer chunks already cheap to fetch.
+    void record_chunk_fingerprint(std::vector<llama_pos> positions,
+                                  std::vector<float>     embedding,
+                                  SemanticIndex::Tier    tier);
+
+    // Find the top-K semantically similar chunks to query_embedding,
+    // filtered to cosine similarity >= threshold. Returns hints in
+    // descending-score order.
+    std::vector<SemanticIndex::Hint>
+    find_similar_chunks(const std::vector<float> & query_embedding,
+                        int                        top_k     = 5,
+                        float                      threshold = 0.65f) const;
+
+    // Convenience: find_similar_chunks + restore_from_warm in one call.
+    // Returns total positions actually restored. Skips hints whose
+    // positions are already in the inner cache (caller can avoid that
+    // double-allocation by querying has_warm before restore).
+    uint32_t restore_semantic(llama_seq_id              seq_id,
+                              const std::vector<float> & query_embedding,
+                              int                        top_k     = 5,
+                              float                      threshold = 0.65f);
+
 private:
     // Poll inner_->seq_pos_min / seq_pos_max across 0..n_seq_max_, sum
     // active token counts, push the result into capacity_, and refresh
