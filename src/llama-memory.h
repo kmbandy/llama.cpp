@@ -160,6 +160,22 @@ struct llama_memory_i {
     // this header avoid including the mt header.
     //
     virtual mt::InnerView make_tier_view() const;
+
+    // Find a free slot in the cache and tag it with (position, seq_id).
+    // After this returns, the slot is reserved (cells consider it filled)
+    // but the K/V tensor data at that slot is whatever was there before;
+    // the caller (the tier wrapper) immediately copies the backed-up
+    // K/V via AttentionMover, completing the restoration.
+    //
+    // Returns the slot index on success, or -1 if no free slot is
+    // available. Default: -1 (backend doesn't support tier restoration).
+    //
+    // For composite caches (iswa, hybrid), the slot is in the
+    // restorable sub-cache (base attention only). The wrapper uses
+    // make_tier_view's attn_caches list (skipping is_swa entries) to
+    // know which layers to fill; the non-SWA layers all live in the
+    // physical cache that owns this slot.
+    virtual int mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position);
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

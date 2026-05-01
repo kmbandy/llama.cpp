@@ -176,6 +176,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+int llama_memory_hybrid::mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position) {
+    return mem_attn ? mem_attn->mt_restore_tag_slot(seq_id, position) : -1;
+}
+
 mt::InnerView llama_memory_hybrid::make_tier_view() const {
     mt::InnerView view = mem_attn ? mem_attn->make_tier_view() : mt::InnerView{};
     if (mem_recr) {

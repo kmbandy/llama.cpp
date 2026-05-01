@@ -98,6 +98,35 @@ public:
     AttentionMover      & mover_attn()      { return mover_attn_; }
     RecurrentStateMover & mover_recur()     { return mover_recur_; }
 
+    // ---- public tier-restore API ----
+    //
+    // Used by upstream (server-context's slot prefix-matching, or test
+    // harnesses) to learn what positions are recoverable from warm and
+    // to trigger restoration before submitting a batch.
+
+    // True iff the wrapper has a warm-tier copy of (seq_id, position).
+    // Caller can include such positions in the cached-prefix length
+    // when computing what tokens to send to llama_decode.
+    bool has_warm(llama_seq_id seq_id, llama_pos position) const;
+
+    // Restore the listed positions from warm to the inner cache. Returns
+    // the count actually restored. Caller is responsible for ensuring
+    // the inner cache doesn't already hold those positions (otherwise
+    // duplicates would be created); the typical caller already knows
+    // this from its own prefix-match logic.
+    //
+    // After successful restore, the warm slot remains held — the same
+    // chunk can be restored again in a future query without re-fetching.
+    // Use forget_warm to release it.
+    uint32_t restore_from_warm(llama_seq_id                  seq_id,
+                                const std::vector<llama_pos> & positions);
+
+    // Release warm-tier copies of the given positions. Used after the
+    // upstream lifecycle determines a chunk will not be needed again
+    // (or to make room when warm is full and 2d-evict-cold isn't yet
+    // wired). After this, has_warm() returns false for those positions.
+    void forget_warm(const std::vector<llama_pos> & positions);
+
 private:
     // Poll inner_->seq_pos_min / seq_pos_max across 0..n_seq_max_, sum
     // active token counts, push the result into capacity_, and refresh

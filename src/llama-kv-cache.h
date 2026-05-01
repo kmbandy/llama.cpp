@@ -145,6 +145,7 @@ public:
 
     // tier-system inner view (declared on llama_memory_i; populates attn_layers)
     mt::InnerView make_tier_view() const override;
+    int mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position) override;
 
     //
     // llama_kv_cache specific API

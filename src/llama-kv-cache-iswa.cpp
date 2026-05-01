@@ -123,6 +123,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+int llama_kv_cache_iswa::mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position) {
+    // Restore only into the base cache. SWA cache slots would mask the
+    // restored data the next time the head moves past n_swa positions.
+    return kv_base ? kv_base->mt_restore_tag_slot(seq_id, position) : -1;
+}
+
 mt::InnerView llama_kv_cache_iswa::make_tier_view() const {
     mt::InnerView view;
     // base cache: full attention, source of truth for tier eviction.

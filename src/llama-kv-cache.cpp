@@ -856,6 +856,27 @@ mt::InnerView llama_kv_cache::make_tier_view() const {
     return view;
 }
 
+int llama_kv_cache::mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size()) {
+        return -1;
+    }
+    auto & cells = v_cells[stream];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i)) continue;
+        cells.pos_set(i, position);
+        cells.seq_add(i, seq_id);
+        // Slot index returned is global (stream * per_stream + i) so it
+        // matches the cell snapshot indexing in make_tier_view. For
+        // single-stream (the default) this is just i.
+        return (int)((size_t) stream * cells.size() + i);
+    }
+    return -1;  // no free slot
+}
+
 llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

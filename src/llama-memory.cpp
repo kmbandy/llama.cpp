@@ -49,6 +49,11 @@ mt::InnerView llama_memory_i::make_tier_view() const {
     return {};
 }
 
+// Default: no tier restoration support.
+int llama_memory_i::mt_restore_tag_slot(llama_seq_id /*seq_id*/, llama_pos /*position*/) {
+    return -1;
+}
+
 bool llama_memory_status_is_fail(llama_memory_status status) {
     switch (status) {
         case LLAMA_MEMORY_STATUS_SUCCESS:

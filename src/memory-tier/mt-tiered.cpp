@@ -131,6 +131,105 @@ bool llama_memory_tiered::ensure_warm_staging() {
     return true;
 }
 
+// ---- public tier-restore API ----
+
+bool llama_memory_tiered::has_warm(llama_seq_id /*seq_id*/, llama_pos position) const {
+    // NOTE: seq_id is currently ignored — warm_pos_to_slot_ is keyed by
+    // position only. This is correct for single-seq workloads (the most
+    // common case, including llama-cli single-turn and most server
+    // slots). Multi-seq separation in warm requires keying by (seq, pos)
+    // and is a documented follow-up. Caller should be aware that for
+    // now, two seqs with overlapping position ranges share warm slots.
+    return warm_pos_to_slot_.find(position) != warm_pos_to_slot_.end();
+}
+
+uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   seq_id,
+                                                  const std::vector<llama_pos> & positions) {
+    if (!inner_ || !warm_initialized_ || positions.empty()) return 0;
+
+    uint32_t restored = 0;
+    for (auto pos : positions) {
+        auto it = warm_pos_to_slot_.find(pos);
+        if (it == warm_pos_to_slot_.end()) continue;  // not in warm
+        const uint32_t warm_slot = it->second;
+
+        // Ask the inner cache for a free slot tagged with this position.
+        // For iswa caches this returns a slot in the base cache only;
+        // make_tier_view's first non-SWA AttentionCacheSnapshot is the
+        // one that owns this slot.
+        const int inner_slot = inner_->mt_restore_tag_slot(seq_id, pos);
+        if (inner_slot < 0) {
+            LLAMA_LOG_WARN("mt::restore_from_warm: no free slot in inner cache for "
+                           "pos %d (seq %d)\n", pos, seq_id);
+            break;
+        }
+
+        // Walk the same restorable-layer order ensure_warm_staging used
+        // when laying out warm_buf_. Per-cache layers are contiguous in
+        // the warm slab; flat_idx is the global non-SWA layer index.
+        bool ok = true;
+        size_t flat_idx = 0;
+        for (const auto & c : tier_view_.attn_caches) {
+            if (c.is_swa) continue;
+            for (const auto & layer : c.layers) {
+                const uint8_t * src_k = warm_buf_.data()
+                                        + warm_layer_off_[flat_idx]
+                                        + (size_t) warm_slot * layer.k_row_bytes;
+                const uint8_t * src_v = warm_buf_.data()
+                                        + warm_layer_v_off_[flat_idx]
+                                        + (size_t) warm_slot * layer.v_row_bytes;
+                if (!mover_attn_.restore_k(layer, src_k, inner_slot) ||
+                    !mover_attn_.restore_v(layer, src_v, inner_slot)) {
+                    ok = false;
+                    break;
+                }
+                ++flat_idx;
+            }
+            if (!ok) break;
+        }
+
+        if (ok) {
+            ++restored;
+            // Keep the warm copy: the same chunk may be requested again
+            // (e.g. another seq with the same prefix). forget_warm()
+            // is the explicit release.
+        } else {
+            LLAMA_LOG_WARN("mt::restore_from_warm: mover failed restoring pos %d "
+                           "into slot %d; some layers may be inconsistent\n",
+                           pos, inner_slot);
+            // We can't easily roll back the inner_slot tagging without
+            // exposing more API surface — leave it. In practice failure
+            // here means HIP error and the whole context is suspect.
+        }
+    }
+
+    if (restored > 0) {
+        capacity_.on_migrate(restored,
+                             TierCapacityManager::Tier::Warm,
+                             TierCapacityManager::Tier::Hot);
+        // Refresh tier metadata: the restored positions are now in hot
+        // and policy scoring should consider them.
+        update_tier_state();
+        LLAMA_LOG_INFO("mt::restore_from_warm: restored %u positions for seq %d "
+                       "(warm now %u/%u)\n",
+                       restored, seq_id,
+                       warm_capacity_ - (uint32_t) warm_free_slots_.size(),
+                       warm_capacity_);
+    }
+    return restored;
+}
+
+void llama_memory_tiered::forget_warm(const std::vector<llama_pos> & positions) {
+    for (auto pos : positions) {
+        auto it = warm_pos_to_slot_.find(pos);
+        if (it == warm_pos_to_slot_.end()) continue;
+        warm_free_slots_.push_back((int) it->second);
+        warm_pos_to_slot_.erase(it);
+        evicted_to_warm_.erase(pos);
+        capacity_.on_remove_warm(1);
+    }
+}
+
 // Back up positions [p0, p1) of seq_id from hot to warm. Driven by
 // seq_rm: upstream is about to delete those positions, so this is the
 // last chance to capture their K/V data for later restoration.
