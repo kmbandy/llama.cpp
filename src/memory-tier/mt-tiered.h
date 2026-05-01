@@ -33,6 +33,7 @@
 
 #include "llama-memory.h"
 
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -141,6 +142,23 @@ private:
     // (recurrent-only models — handled in 2d-recur).
     bool ensure_warm_staging();
 
+    // Open KvtcStore on the configured SSD path the first time cold
+    // is needed. Returns false if cold_capacity is 0 or KvtcStore::init
+    // fails.
+    bool ensure_cold_store();
+
+    // Spill ONE warm entry to cold to make room. Picks the oldest by
+    // FIFO (warm_insertion_order_). Writes K and V for every restorable
+    // layer to KvtcStore, frees the warm slot, records the position in
+    // cold_positions_. Returns true on success.
+    bool spill_one_to_cold();
+
+    // Pull a position from cold into a free warm slot. Used when restore
+    // is requested for a position that lives in cold. May trigger
+    // spill_one_to_cold internally if warm is full. Returns true if the
+    // position is now in warm and warm_pos_to_slot_ has its slot.
+    bool load_one_from_cold(llama_pos pos);
+
     // Back up positions [p0, p1) of seq_id from hot to warm before
     // upstream's seq_rm frees them. Refreshes the cell snapshot to map
     // each position to its current slot, copies K/V from every non-SWA
@@ -180,6 +198,17 @@ private:
     std::unordered_map<llama_pos, uint32_t> warm_pos_to_slot_;
     std::vector<int>                        warm_free_slots_;  // stack
     std::unordered_set<llama_pos>           evicted_to_warm_;  // = key set of warm_pos_to_slot_, kept for fast O(1) skip in update_tier_state
+
+    // FIFO queue of warm positions in insertion order, used to pick
+    // spill victims when warm fills. Deque so removal of restored
+    // entries from the front (after load_one_from_cold) is cheap.
+    std::deque<llama_pos>                   warm_insertion_order_;
+
+    // Positions currently stored in cold tier (KvtcStore). Disjoint from
+    // warm_pos_to_slot_'s key set — a position is in either warm or
+    // cold, never both. (load_one_from_cold removes from cold and adds
+    // to warm; spill_one_to_cold does the inverse.)
+    std::unordered_set<llama_pos>           cold_positions_;
 
     bool                  store_initialized_  = false;
     bool                  pressure_announced_ = false;  // edge-trigger for hot_pressure logging

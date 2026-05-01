@@ -4,6 +4,7 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 
 #include <cassert>
+#include <unistd.h>  // getpid
 
 namespace mt {
 
@@ -61,6 +62,160 @@ llama_memory_tiered::~llama_memory_tiered() {
 // Phase 2d-pt: passthrough delegation. Each method forwards to inner_.
 // Tier-aware behaviour is added in subsequent sub-iterations.
 // ---------------------------------------------------------------------------
+
+// Lazy-open the cold-tier KvtcStore. Path comes from cfg_.ssd_path,
+// which the CLI populates from --kv-tier-ssd-path. We append a unique
+// per-process filename so multiple wrapper instances (e.g. tests) in
+// the same directory don't collide.
+bool llama_memory_tiered::ensure_cold_store() {
+    if (store_initialized_) return true;
+    if (capacity_.cold_capacity() == 0) {
+        return false;
+    }
+
+    // Use cfg_.ssd_path as a directory hint; cold file lives inside it.
+    std::string path = cfg_.ssd_path;
+    if (path.empty()) {
+        path = "./tiered-cache";  // matches TieredConfig default
+    }
+    if (!path.empty() && path.back() != '/') {
+        path += "/";
+    }
+    path += "mt-cold-";
+    path += std::to_string((long) ::getpid());
+    path += ".kvtc";
+
+    if (!store_.init(path, cfg_.compression)) {
+        LLAMA_LOG_WARN("mt::llama_memory_tiered: KvtcStore::init(%s) failed; "
+                       "cold tier disabled\n", path.c_str());
+        return false;
+    }
+    store_initialized_ = true;
+    LLAMA_LOG_INFO("mt::llama_memory_tiered: cold tier opened at %s "
+                   "(compression=%d)\n", path.c_str(), (int) cfg_.compression);
+    return true;
+}
+
+// Spill one warm entry to cold. FIFO: the oldest warm entry goes first.
+// For each restorable layer, write the K and V bytes to KvtcStore keyed
+// by (flat_layer_idx, position). On success: free the warm slot, drop
+// from warm_pos_to_slot_, add to cold_positions_, decrement warm count
+// and increment cold count via on_migrate.
+bool llama_memory_tiered::spill_one_to_cold() {
+    if (!ensure_cold_store()) return false;
+    if (warm_insertion_order_.empty()) return false;
+
+    const llama_pos victim_pos = warm_insertion_order_.front();
+    auto it = warm_pos_to_slot_.find(victim_pos);
+    if (it == warm_pos_to_slot_.end()) {
+        // Stale FIFO entry (e.g. forgotten via forget_warm) — skip.
+        warm_insertion_order_.pop_front();
+        return spill_one_to_cold();
+    }
+    const uint32_t warm_slot = it->second;
+
+    // Write K/V for every restorable layer.
+    bool ok = true;
+    size_t flat_idx = 0;
+    for (const auto & c : tier_view_.attn_caches) {
+        if (c.is_swa) continue;
+        for (const auto & layer : c.layers) {
+            const uint8_t * k_src = warm_buf_.data()
+                                    + warm_layer_off_[flat_idx]
+                                    + (size_t) warm_slot * layer.k_row_bytes;
+            const uint8_t * v_src = warm_buf_.data()
+                                    + warm_layer_v_off_[flat_idx]
+                                    + (size_t) warm_slot * layer.v_row_bytes;
+            if (!store_.write_attn_k((int) flat_idx, victim_pos, k_src, layer.k_row_bytes) ||
+                !store_.write_attn_v((int) flat_idx, victim_pos, v_src, layer.v_row_bytes)) {
+                ok = false;
+                break;
+            }
+            ++flat_idx;
+        }
+        if (!ok) break;
+    }
+
+    if (!ok) {
+        LLAMA_LOG_WARN("mt::spill_one_to_cold: KvtcStore write failed for pos %d; "
+                       "leaving in warm\n", victim_pos);
+        return false;
+    }
+
+    // Free the warm slot, drop from warm bookkeeping, add to cold.
+    warm_free_slots_.push_back((int) warm_slot);
+    warm_pos_to_slot_.erase(it);
+    evicted_to_warm_.erase(victim_pos);
+    warm_insertion_order_.pop_front();
+    cold_positions_.insert(victim_pos);
+
+    capacity_.on_migrate(1, TierCapacityManager::Tier::Warm,
+                            TierCapacityManager::Tier::Cold);
+    return true;
+}
+
+// Pull one position from cold into warm. Reads K/V for every restorable
+// layer from KvtcStore into a freshly-allocated warm slot. If warm is
+// full, recursively spills another entry to cold to make room.
+//
+// On success: warm_pos_to_slot_ has the position, cold_positions_ does
+// not, capacity counters reflect the migration. On failure (KvtcStore
+// read error or permanent warm-full), returns false.
+bool llama_memory_tiered::load_one_from_cold(llama_pos pos) {
+    if (cold_positions_.find(pos) == cold_positions_.end()) {
+        return false;
+    }
+    if (!store_initialized_) return false;
+
+    // Need a free warm slot. If none, evict another warm entry to cold first.
+    if (warm_free_slots_.empty()) {
+        if (!spill_one_to_cold()) {
+            LLAMA_LOG_WARN("mt::load_one_from_cold: warm full and spill failed; "
+                           "cannot load pos %d\n", pos);
+            return false;
+        }
+    }
+    const int warm_slot = warm_free_slots_.back();
+    warm_free_slots_.pop_back();
+
+    // Read K/V for every restorable layer.
+    bool ok = true;
+    size_t flat_idx = 0;
+    for (const auto & c : tier_view_.attn_caches) {
+        if (c.is_swa) continue;
+        for (const auto & layer : c.layers) {
+            uint8_t * k_dst = warm_buf_.data()
+                              + warm_layer_off_[flat_idx]
+                              + (size_t) warm_slot * layer.k_row_bytes;
+            uint8_t * v_dst = warm_buf_.data()
+                              + warm_layer_v_off_[flat_idx]
+                              + (size_t) warm_slot * layer.v_row_bytes;
+            if (!store_.read_attn_k((int) flat_idx, pos, k_dst, layer.k_row_bytes) ||
+                !store_.read_attn_v((int) flat_idx, pos, v_dst, layer.v_row_bytes)) {
+                ok = false;
+                break;
+            }
+            ++flat_idx;
+        }
+        if (!ok) break;
+    }
+
+    if (!ok) {
+        warm_free_slots_.push_back(warm_slot);
+        LLAMA_LOG_WARN("mt::load_one_from_cold: KvtcStore read failed for pos %d\n", pos);
+        return false;
+    }
+
+    // Promote to warm.
+    warm_pos_to_slot_[pos] = (uint32_t) warm_slot;
+    evicted_to_warm_.insert(pos);
+    warm_insertion_order_.push_back(pos);
+    cold_positions_.erase(pos);
+
+    capacity_.on_migrate(1, TierCapacityManager::Tier::Cold,
+                            TierCapacityManager::Tier::Warm);
+    return true;
+}
 
 // Lazy-allocate the warm-tier host staging buffer.
 //
@@ -134,13 +289,17 @@ bool llama_memory_tiered::ensure_warm_staging() {
 // ---- public tier-restore API ----
 
 bool llama_memory_tiered::has_warm(llama_seq_id /*seq_id*/, llama_pos position) const {
-    // NOTE: seq_id is currently ignored — warm_pos_to_slot_ is keyed by
-    // position only. This is correct for single-seq workloads (the most
-    // common case, including llama-cli single-turn and most server
-    // slots). Multi-seq separation in warm requires keying by (seq, pos)
-    // and is a documented follow-up. Caller should be aware that for
-    // now, two seqs with overlapping position ranges share warm slots.
-    return warm_pos_to_slot_.find(position) != warm_pos_to_slot_.end();
+    // NOTE: seq_id is currently ignored — warm_pos_to_slot_ / cold_positions_
+    // are keyed by position only. This is correct for single-seq workloads
+    // (the most common case, including llama-cli single-turn and most
+    // server slots). Multi-seq separation requires keying by (seq, pos)
+    // and is a documented follow-up.
+    //
+    // "warm" in the API name is historical — this query returns true for
+    // anything in warm OR cold, since restore_from_warm transparently
+    // demand-loads from cold via load_one_from_cold.
+    return warm_pos_to_slot_.find(position) != warm_pos_to_slot_.end()
+        || cold_positions_.find(position)   != cold_positions_.end();
 }
 
 uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   seq_id,
@@ -149,8 +308,14 @@ uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   s
 
     uint32_t restored = 0;
     for (auto pos : positions) {
+        // Demand-load from cold if the position is there but not in warm.
+        if (warm_pos_to_slot_.find(pos) == warm_pos_to_slot_.end() &&
+            cold_positions_.find(pos)   != cold_positions_.end()) {
+            if (!load_one_from_cold(pos)) continue;
+        }
+
         auto it = warm_pos_to_slot_.find(pos);
-        if (it == warm_pos_to_slot_.end()) continue;  // not in warm
+        if (it == warm_pos_to_slot_.end()) continue;  // not in warm or cold
         const uint32_t warm_slot = it->second;
 
         // Ask the inner cache for a free slot tagged with this position.
@@ -222,11 +387,27 @@ uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   s
 void llama_memory_tiered::forget_warm(const std::vector<llama_pos> & positions) {
     for (auto pos : positions) {
         auto it = warm_pos_to_slot_.find(pos);
-        if (it == warm_pos_to_slot_.end()) continue;
-        warm_free_slots_.push_back((int) it->second);
-        warm_pos_to_slot_.erase(it);
-        evicted_to_warm_.erase(pos);
-        capacity_.on_remove_warm(1);
+        if (it != warm_pos_to_slot_.end()) {
+            warm_free_slots_.push_back((int) it->second);
+            warm_pos_to_slot_.erase(it);
+            evicted_to_warm_.erase(pos);
+            // Also lazy-purge from FIFO; spill_one_to_cold tolerates
+            // stale entries by re-trying.
+            capacity_.on_remove_warm(1);
+        }
+        if (cold_positions_.erase(pos) > 0 && store_initialized_) {
+            // Drop cold entries for every restorable layer.
+            size_t flat_idx = 0;
+            for (const auto & c : tier_view_.attn_caches) {
+                if (c.is_swa) continue;
+                for (size_t li = 0; li < c.layers.size(); ++li) {
+                    store_.erase_attn((int) flat_idx, pos);
+                    ++flat_idx;
+                }
+            }
+            // No on_remove_cold helper yet; capacity counter is best-effort
+            // because cold size isn't load-bearing for any current logic.
+        }
     }
 }
 
@@ -288,11 +469,13 @@ uint32_t llama_memory_tiered::backup_seq_rm_range(llama_seq_id seq_id,
             // Skip if we've already backed this position up.
             if (evicted_to_warm_.count(cs.pos)) continue;
 
-            if (warm_free_slots_.empty()) {
-                LLAMA_LOG_DEBUG("mt::backup_seq_rm_range: warm full at %u; "
-                                "remaining positions in this seq_rm will be lost "
-                                "(2d-evict-cold will spill warm to SSD)\n",
-                                warm_capacity_);
+            // If warm is full, try to make room by spilling to cold.
+            // If that also fails (no cold storage / SSD error), give up
+            // on the rest of this seq_rm — the remaining positions are
+            // lost.
+            if (warm_free_slots_.empty() && !spill_one_to_cold()) {
+                LLAMA_LOG_DEBUG("mt::backup_seq_rm_range: warm full and cold "
+                                "spill unavailable; remaining positions lost\n");
                 goto warm_full;
             }
 
@@ -320,6 +503,7 @@ uint32_t llama_memory_tiered::backup_seq_rm_range(llama_seq_id seq_id,
             if (ok) {
                 warm_pos_to_slot_.emplace(cs.pos, (uint32_t) warm_slot);
                 evicted_to_warm_.insert(cs.pos);
+                warm_insertion_order_.push_back(cs.pos);
                 ++backed_up;
             } else {
                 warm_free_slots_.push_back(warm_slot);
@@ -443,6 +627,8 @@ void llama_memory_tiered::clear(bool data) {
     pressure_announced_ = false;
     warm_pos_to_slot_.clear();
     evicted_to_warm_.clear();
+    warm_insertion_order_.clear();
+    cold_positions_.clear();
     if (warm_initialized_) {
         // Refill the free-slot stack to its full warm capacity.
         warm_free_slots_.clear();
@@ -451,8 +637,18 @@ void llama_memory_tiered::clear(bool data) {
             warm_free_slots_.push_back((int) s);
         }
     }
-    // Note: KvtcStore is NOT cleared on clear() — its file persists for
-    // the run. clear() corresponds to seq_rm-everything, not shutdown.
+    // KvtcStore's index is dropped, but its file persists with stale
+    // payloads. We don't reclaim the disk space here — clear() can
+    // happen mid-run, and re-opening the file on next backup re-uses
+    // the descriptor and just appends. (This means clear() does leak
+    // some on-disk space until shutdown; acceptable for a tier cache.)
+    //
+    // The store_'s in-memory index is what matters for lookup; we wipe
+    // that by closing and re-init-on-demand.
+    if (store_initialized_) {
+        store_.shutdown();
+        store_initialized_ = false;
+    }
 }
 
 bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
