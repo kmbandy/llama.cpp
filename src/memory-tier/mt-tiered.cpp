@@ -3,6 +3,7 @@
 
 #include "llama-impl.h"  // LLAMA_LOG_*
 
+#include <algorithm>
 #include <cassert>
 #include <unistd.h>  // getpid
 
@@ -417,6 +418,46 @@ uint32_t llama_memory_tiered::restore_semantic(llama_seq_id              seq_id,
         }
     }
     if (wanted.empty()) return 0;
+
+    // Conflict resolution: if the inner cache currently holds any of
+    // our target positions (e.g. post-shift content occupying the
+    // slots whose original tokens we're trying to restore), we must
+    // free them before restoration. Calling seq_rm here trips our
+    // own backup hook, so the displaced content lands in warm and
+    // becomes recoverable in turn — symmetric, no data loss.
+    //
+    // We coalesce wanted into contiguous ranges so seq_rm is called
+    // O(ranges) times, not O(positions). Sort first.
+    std::vector<llama_pos> sorted_wanted = wanted;
+    std::sort(sorted_wanted.begin(), sorted_wanted.end());
+
+    // Snapshot inner cells once and check which wanted positions
+    // collide with currently-occupied (seq_id) slots.
+    const auto fresh = inner_->make_tier_view();
+    std::unordered_set<llama_pos> in_inner;
+    for (const auto & c : fresh.attn_caches) {
+        if (c.is_swa) continue;
+        for (const auto & cs : c.cells) {
+            if (cs.pos >= 0 && cs.seq_id == seq_id) {
+                in_inner.insert(cs.pos);
+            }
+        }
+    }
+
+    // Walk sorted_wanted, build contiguous conflict ranges, seq_rm them.
+    size_t i = 0;
+    while (i < sorted_wanted.size()) {
+        if (!in_inner.count(sorted_wanted[i])) { ++i; continue; }
+        size_t j = i + 1;
+        while (j < sorted_wanted.size() &&
+               sorted_wanted[j] == sorted_wanted[j-1] + 1 &&
+               in_inner.count(sorted_wanted[j])) {
+            ++j;
+        }
+        // [i, j) is a contiguous run of colliding positions.
+        seq_rm(seq_id, sorted_wanted[i], sorted_wanted[j-1] + 1);
+        i = j;
+    }
 
     LLAMA_LOG_INFO("mt::restore_semantic: %zu hints -> %zu positions to restore "
                    "(seq %d, top_k=%d, threshold=%.2f)\n",
