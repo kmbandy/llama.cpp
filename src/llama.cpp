@@ -72,8 +72,8 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         return true;
     }
 
-    LLAMA_LOG_INFO("%s: initializing weight pager with %zu pages\n",
-                   __func__, ml.weight_page_infos.size());
+    LLAMA_LOG_ERROR("%s: [DIAG] initializing weight pager with %zu pages\n",
+                    __func__, ml.weight_page_infos.size());
 
     // The legacy llama_weight_pager is created in llama_model_load before
     // load_tensors so the latter can populate weight_tensor_ptrs. We only
@@ -92,24 +92,33 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     //    Weight tensors themselves have buffer == NULL when paging is on
     //    (allocator skips them on purpose; see llama-model.cpp ~7995).
     //    load_tensors records the distinct bufts that own paged weights
-    //    in weight_pager->weight_bufts. Phase 1 is single-device by
+    //    in weight_pager->weight_bufts. Some of those will be host
+    //    (token embedding output, RoPE freqs, etc. that always live on
+    //    CPU); we only care about the GPU-side bufts because that's what
+    //    the pager pool allocates against. Phase 1 is single-device by
     //    design (B-P7).
-    if (model.weight_pager->weight_bufts.empty()) {
-        throw std::runtime_error("weight pager: no buffer types collected for paged weights (load_tensors integration bug?)");
+    std::vector<ggml_backend_buffer_type_t> gpu_bufts;
+    for (auto * b : model.weight_pager->weight_bufts) {
+        if (b == nullptr) continue;
+        if (ggml_backend_buft_is_host(b)) continue;  // CPU/host: not paged
+        gpu_bufts.push_back(b);
     }
-    if (model.weight_pager->weight_bufts.size() > 1) {
+    if (gpu_bufts.empty()) {
+        throw std::runtime_error("weight pager: no GPU buffer types found among paged weights — paging requires a GPU device");
+    }
+    if (gpu_bufts.size() > 1) {
         std::string names;
-        for (size_t i = 0; i < model.weight_pager->weight_bufts.size(); ++i) {
+        for (size_t i = 0; i < gpu_bufts.size(); ++i) {
             if (i > 0) names += ", ";
-            names += ggml_backend_buft_name(model.weight_pager->weight_bufts[i]);
+            names += ggml_backend_buft_name(gpu_bufts[i]);
         }
         throw std::runtime_error(format(
-            "weight pager: paged weights span multiple devices (%s); "
+            "weight pager: paged weights span multiple GPU devices (%s); "
             "weight paging requires a single device. Run with one device "
             "(e.g. --device ROCm0) or without --weight-paging.",
             names.c_str()));
     }
-    ggml_backend_buffer_type_t buft = model.weight_pager->weight_bufts.front();
+    ggml_backend_buffer_type_t buft = gpu_bufts.front();
 
     // 2. Resolve the integer device index. We need it for hipSetDevice
     //    inside the GpuTransport. The dev name encodes it, e.g. "ROCm0".
@@ -123,8 +132,9 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
             "weight pager: could not parse device index from name '%s'",
             ggml_backend_dev_name(dev)));
     }
-    LLAMA_LOG_INFO("%s: paged weights on device %d (%s)\n",
-                   __func__, device_idx, ggml_backend_dev_name(dev));
+    LLAMA_LOG_ERROR("%s: [DIAG] paged weights on device %d (%s), buft=%s\n",
+                    __func__, device_idx, ggml_backend_dev_name(dev),
+                    ggml_backend_buft_name(buft));
 
     // 3. Build the new pager: catalog + init.
     model.wp_pager = std::make_unique<wp::WeightPager>();
@@ -132,21 +142,24 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size);
     }
 
-    // 4. Determine number of slots: user override or auto = layer count,
-    //    capped to fit in free VRAM with a 3 GiB headroom.
+    // 4. Determine number of slots.
+    //    - If the user supplied --weight-paging-slots N (positive), honour it.
+    //      No auto-cap: if it's too big, hipMalloc will fail loudly with OOM
+    //      and the user can tune down. Caller-knows-best.
+    //    - Otherwise (auto), pick the layer count and cap to free VRAM with
+    //      a 3 GiB headroom so we don't OOM on KV cache + compute buffers.
     int n_slots = params.weight_paging_slots;
+    const bool slots_user_override = (n_slots > 0);
     if (n_slots <= 0) {
         n_slots = (int) model.hparams.n_layer;
         if (n_slots <= 0) n_slots = 32;
     }
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
-    {
+    if (!slots_user_override) {
         size_t free_vram = 0, total_vram = 0;
         hipMemGetInfo(&free_vram, &total_vram);
         const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
         const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
-
-        // We need max_page_size for the slot stride. Compute it on the fly.
         size_t max_page_size = 0;
         for (const auto & info : ml.weight_page_infos) {
             if (info.size > max_page_size) max_page_size = info.size;
@@ -154,7 +167,7 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
         if (n_slots > n_slots_fit && n_slots_fit >= 1) {
             LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
-                           "(%zu MiB free, %zu MiB/slot)\n",
+                           "(%zu MiB free, %zu MiB/slot); pass --weight-paging-slots to override\n",
                            __func__, n_slots, n_slots_fit,
                            free_vram / (1024 * 1024), max_page_size / (1024 * 1024));
             n_slots = n_slots_fit;
@@ -196,12 +209,20 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     }
 
     // 7. Set placeholder data on every paged tensor so the graph allocator
-    //    skips them. The eval callback overwrites with the real VRAM slot
-    //    pointer before each op. Use a non-null sentinel — the buffer-type
-    //    pointer itself is convenient and definitely non-null.
+    //    skips them. Use the pool's actual VRAM base as the placeholder —
+    //    if a kernel ever runs against a tensor that the eval callback
+    //    failed to patch, it'll read from a real device address (slot 0
+    //    of the pool) rather than a host address that looks like a GPU
+    //    pointer and produces garbage. The data is still wrong in that
+    //    case (slot 0 doesn't contain the right tensor) but at least the
+    //    GPU doesn't fault and we get diagnosable garbage.
     {
-        void * placeholder = (void *) buft;
-        size_t n_placed    = 0;
+        ggml_backend_buffer_t pool_buf = model.wp_pager->pool_buf();
+        void * placeholder = pool_buf ? ggml_backend_buffer_get_base(pool_buf) : nullptr;
+        if (placeholder == nullptr) {
+            throw std::runtime_error("weight pager: pool_buf has null base — pool init bug");
+        }
+        size_t n_placed = 0;
         for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
             if (t && t->data == nullptr) {
                 t->data   = placeholder;
@@ -209,11 +230,11 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                 ++n_placed;
             }
         }
-        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors\n",
-                       __func__, n_placed);
+        LLAMA_LOG_ERROR("%s: [DIAG] placeholder data set on %zu weight tensors (placeholder=%p)\n",
+                        __func__, n_placed, placeholder);
     }
 
-    LLAMA_LOG_INFO("%s: weight pager ready (device=%d, n_slots=%d, prefetch=%s)\n",
+    LLAMA_LOG_ERROR("%s: [DIAG] weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",
                    __func__, device_idx, n_slots,
                    cfg.prefer_async_io ? "async" : "sync");
     return true;

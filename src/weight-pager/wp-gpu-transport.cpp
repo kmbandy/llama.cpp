@@ -35,14 +35,14 @@ bool GpuTransport::init(int device_idx, int n_events) {
         return false;
     }
 
-    hipStream_t s = nullptr;
-    err = hipStreamCreate(&s);
-    if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::init: hipStreamCreate failed: %s\n",
-                       hipGetErrorString(err));
-        hipSetDevice(prev_device);
-        return false;
-    }
+    // Use hipStreamPerThread (== cudaStreamPerThread under HIP) instead of
+    // a freshly-created stream. Reason: ggml-cuda's compute kernels run on
+    // the per-thread default stream; H2D copies on a separate stream are
+    // not ordered against those kernels and can overwrite VRAM that an
+    // in-flight kernel is still reading. Phase 1e may revisit this with
+    // explicit hipStreamWaitEvent to recover transfer/compute overlap.
+    hipStream_t s = hipStreamPerThread;
+    (void) err;
 
     events_.reserve(n_events);
     free_events_.reserve(n_events);
@@ -86,8 +86,8 @@ void GpuTransport::shutdown() {
     hipSetDevice(device_idx_);
 
     if (stream_) {
+        // We don't own hipStreamPerThread; just sync, don't destroy.
         hipStreamSynchronize((hipStream_t) stream_);
-        hipStreamDestroy((hipStream_t) stream_);
         stream_ = nullptr;
     }
     for (void * ev : events_) {
@@ -117,39 +117,43 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     hipStream_t s  = (hipStream_t) stream_;
     hipError_t  err;
 
-    err = hipMemcpyAsync(dst, src_pinned, payload_size, hipMemcpyHostToDevice, s);
+    // Synchronous hipMemcpy: blocks until done, runs on device's default
+    // stream which synchronises with all other streams on that device.
+    // This sidesteps the stream-ordering trap where an async H2D on a
+    // separate stream could race ggml-cuda's compute kernels reading
+    // from the same VRAM slot. Phase 1e may revisit with proper
+    // hipStreamWaitEvent ordering once correctness is locked.
+    (void) s;  // unused for sync path
+    err = hipMemcpy(dst, src_pinned, payload_size, hipMemcpyHostToDevice);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemcpyAsync failed: %s\n",
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemcpy failed: %s\n",
                        hipGetErrorString(err));
         hipSetDevice(prev_device);
         return -1;
     }
 
     if (slot_size > payload_size) {
-        err = hipMemsetAsync((char *) dst + payload_size, 0,
-                             slot_size - payload_size, s);
+        err = hipMemset((char *) dst + payload_size, 0,
+                        slot_size - payload_size);
         if (err != hipSuccess) {
-            // Best-effort: log and continue. Padding is a safety belt for
-            // quantized kernels reading past the tensor's payload; without
-            // the zero we may get garbage but the H2D copy itself is OK.
-            LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemsetAsync (padding) failed: %s\n",
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemset (padding) failed: %s\n",
                            hipGetErrorString(err));
+            // Best-effort: don't fail the whole call.
         }
     }
 
+    // The copy is already complete (sync). We still hand back a recyclable
+    // event for API consistency with the (future) async path. The event is
+    // recorded on the per-thread stream so query() / synchronize() against
+    // it always returns true immediately, since nothing is queued before it.
     int evt_idx = free_events_.back();
     free_events_.pop_back();
     hipEvent_t ev = (hipEvent_t) events_[evt_idx];
-    err = hipEventRecord(ev, s);
+    err = hipEventRecord(ev, hipStreamPerThread);
     if (err != hipSuccess) {
+        // Non-fatal — the data is already on VRAM; just log.
         LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipEventRecord failed: %s\n",
                        hipGetErrorString(err));
-        // Return the event to the free list; caller's stage_in failed but
-        // the H2D may still complete. The completion is now unreachable
-        // from the caller's perspective.
-        free_events_.push_back(evt_idx);
-        hipSetDevice(prev_device);
-        return -1;
     }
 
     hipSetDevice(prev_device);
