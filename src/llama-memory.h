@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "memory-tier/mt-inner-access.h"  // mt::InnerView (returned by value from make_tier_view)
 
 #include <map>
 #include <memory>
@@ -142,6 +143,23 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // Inner-access protocol for the tiered KV wrapper.
+    //
+    // Default returns an empty view, meaning "this backend does not
+    // participate in tiering". Concrete backends (llama_kv_cache,
+    // llama_kv_cache_iswa, llama_memory_recurrent,
+    // llama_memory_hybrid_iswa) override to expose per-layer K/V tensors
+    // and per-sequence recurrent state. The returned view is a non-owning
+    // snapshot; the pointers must remain stable for the lifetime of the
+    // backend (or until the next structural change).
+    //
+    // Defined in src/memory-tier/mt-inner-access.h. mt::InnerView is a
+    // value type (vectors of POD-ish structs) — returning by value lets
+    // this header avoid including the mt header.
+    //
+    virtual mt::InnerView make_tier_view() const;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

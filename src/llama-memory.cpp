@@ -41,6 +41,14 @@ llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_me
     return has_update ? LLAMA_MEMORY_STATUS_SUCCESS : LLAMA_MEMORY_STATUS_NO_UPDATE;
 }
 
+// Default tier-view: empty. Concrete backends (llama_kv_cache,
+// llama_kv_cache_iswa, llama_memory_recurrent, llama_memory_hybrid_iswa)
+// override this to populate the view with their per-layer K/V tensors
+// and per-sequence recurrent state.
+mt::InnerView llama_memory_i::make_tier_view() const {
+    return {};
+}
+
 bool llama_memory_status_is_fail(llama_memory_status status) {
     switch (status) {
         case LLAMA_MEMORY_STATUS_SUCCESS:

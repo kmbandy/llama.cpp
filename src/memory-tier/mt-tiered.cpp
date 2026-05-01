@@ -32,6 +32,17 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
 
     LLAMA_LOG_INFO("mt::llama_memory_tiered: %s n_seq_max=%u\n",
                    describe(cfg_).c_str(), n_seq_max_);
+
+    // Snapshot the inner view once at init so we know whether the inner
+    // backend is tierable. Backends that don't override make_tier_view
+    // (or that have no layers / no recurrent state) return an empty view —
+    // the wrapper still functions as passthrough but tier movement is a
+    // no-op for them.
+    const auto view = inner_->make_tier_view();
+    LLAMA_LOG_INFO("mt::llama_memory_tiered: tier view: attn_layers=%zu recur_seqs=%zu%s\n",
+                   view.attn_layers.size(),
+                   view.recur_seqs.size(),
+                   view.empty() ? " (not tierable; will run as passthrough)" : "");
 }
 
 llama_memory_tiered::~llama_memory_tiered() {

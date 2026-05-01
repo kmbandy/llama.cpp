@@ -799,6 +799,29 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     return ret;
 }
 
+mt::InnerView llama_kv_cache::make_tier_view() const {
+    mt::InnerView view;
+    view.attn_layers.reserve(layers.size());
+    for (const auto & l : layers) {
+        mt::AttentionLayerView a;
+        a.k = l.k;
+        a.v = l.v;
+        a.v_trans = v_trans;
+        // Per-token row stride. Use nb[1] (B-K1: nb[0] gives quant block
+        // bytes for Q-types, not the per-row stride).
+        a.k_row_bytes = l.k ? l.k->nb[1] : 0;
+        a.v_row_bytes = l.v ? l.v->nb[1] : 0;
+        // ne[1] for non-transposed V (and K) is the slot ring length.
+        // For transposed V (the default on HIP/CUDA) ne[1] is n_embd_v
+        // and ne[0] is the slot count, but kv_size is still the same
+        // logical capacity — read it off the K tensor where layout is
+        // always [n_embd_k, kv_size].
+        a.kv_size = l.k ? l.k->ne[1] : 0;
+        view.attn_layers.push_back(a);
+    }
+    return view;
+}
+
 llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

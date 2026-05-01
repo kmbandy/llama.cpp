@@ -123,6 +123,17 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+mt::InnerView llama_kv_cache_iswa::make_tier_view() const {
+    mt::InnerView view = kv_base ? kv_base->make_tier_view() : mt::InnerView{};
+    if (kv_swa) {
+        auto swa_view = kv_swa->make_tier_view();
+        view.attn_layers.insert(view.attn_layers.end(),
+                                swa_view.attn_layers.begin(),
+                                swa_view.attn_layers.end());
+    }
+    return view;
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
 

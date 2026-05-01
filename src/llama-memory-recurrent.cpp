@@ -376,6 +376,38 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+mt::InnerView llama_memory_recurrent::make_tier_view() const {
+    mt::InnerView view;
+
+    // Walk cells: every non-empty cell is one slot for one seq. The
+    // recurrent storage is (cell_index, layer) -> r/s tensors arranged
+    // [n_embd_X, n_cells]. seq_slot is therefore the cell index.
+    for (uint32_t cell_idx = 0; cell_idx < (uint32_t) cells.size(); ++cell_idx) {
+        const auto & c = cells[cell_idx];
+        if (c.is_empty()) continue;
+        for (auto sid : c.seq_id) {
+            mt::RecurrentStateView seq_view;
+            seq_view.seq_id   = sid;
+            seq_view.seq_slot = (int) cell_idx;
+            seq_view.layers.reserve(r_l.size());
+            for (size_t il = 0; il < r_l.size(); ++il) {
+                mt::RecurrentStateView::Layer L;
+                L.r = r_l[il];
+                L.s = (il < s_l.size()) ? s_l[il] : nullptr;
+                // [n_embd_X, n_cells] => one cell's slice is nb[1] bytes.
+                L.r_bytes_per_seq = L.r ? L.r->nb[1] : 0;
+                L.s_bytes_per_seq = L.s ? L.s->nb[1] : 0;
+                seq_view.r_bytes_total += L.r_bytes_per_seq;
+                seq_view.s_bytes_total += L.s_bytes_per_seq;
+                seq_view.layers.push_back(L);
+            }
+            view.recur_seqs.push_back(std::move(seq_view));
+        }
+    }
+
+    return view;
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();

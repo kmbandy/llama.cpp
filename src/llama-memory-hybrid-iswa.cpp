@@ -182,6 +182,17 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
     return mb;
 }
 
+mt::InnerView llama_memory_hybrid_iswa::make_tier_view() const {
+    mt::InnerView view = mem_attn ? mem_attn->make_tier_view() : mt::InnerView{};
+    if (mem_recr) {
+        auto recr_view = mem_recr->make_tier_view();
+        view.recur_seqs.insert(view.recur_seqs.end(),
+                               std::make_move_iterator(recr_view.recur_seqs.begin()),
+                               std::make_move_iterator(recr_view.recur_seqs.end()));
+    }
+    return view;
+}
+
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
