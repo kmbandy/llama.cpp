@@ -16,6 +16,8 @@
 
 #include "weight-pager/wp-pager.h"  // complete type for unique_ptr<wp::WeightPager> dtor
 
+#include "memory-tier/mt-tiered.h"  // mt::llama_memory_tiered wrapper (Phase 2)
+
 #include "models/models.h"
 
 #include "ggml.h"
@@ -8623,6 +8625,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // Phase 2 rewrite: tiered KV wrapper. When --kv-tiered is set, wrap the
+    // inner cache in mt::llama_memory_tiered. In Phase 2d-pt the wrapper is
+    // pure passthrough; tier behaviour is wired in subsequent sub-iterations.
+    if (res && params.kv_tier_enabled) {
+        mt::TieredConfig tcfg;
+        tcfg.hot_pct             = params.kv_tier_hot_pct;
+        tcfg.warm_pct            = params.kv_tier_warm_pct;
+        tcfg.cold_pct            = params.kv_tier_cold_pct;
+        tcfg.total_ctx           = params.kv_tier_total_ctx > 0
+                                       ? (uint32_t) params.kv_tier_total_ctx
+                                       : cparams.n_ctx_seq;
+        if (params.kv_tier_ssd_path && params.kv_tier_ssd_path[0]) {
+            tcfg.ssd_path = params.kv_tier_ssd_path;
+        }
+        tcfg.eviction            = (mt::EvictionPolicy) params.kv_tier_eviction_policy;
+        tcfg.compression         = (mt::Compression)    params.kv_tier_compression;
+        tcfg.attention_threshold = params.kv_tier_attention_threshold;
+        tcfg.warm_device         = params.kv_tier_warm_device;
+        if (params.kv_tier_semantic_index && params.kv_tier_semantic_index[0]) {
+            tcfg.semantic_index = params.kv_tier_semantic_index;
+        }
+        tcfg.semantic_threshold  = params.kv_tier_semantic_threshold;
+        tcfg.semantic_top_k      = params.kv_tier_semantic_topk;
+
+        res = new mt::llama_memory_tiered(
+                std::unique_ptr<llama_memory_i>(res), tcfg);
     }
 
     return res;

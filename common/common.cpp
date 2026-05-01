@@ -1529,6 +1529,25 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    // tiered KV cache (Phase 2 rewrite)
+    cparams.kv_tier_enabled             = params.kv_tiered_enabled;
+    cparams.kv_tier_hot_pct             = params.kv_tier_hot_pct;
+    cparams.kv_tier_warm_pct            = params.kv_tier_warm_pct;
+    cparams.kv_tier_cold_pct            = params.kv_tier_cold_pct;
+    cparams.kv_tier_ssd_path            = params.kv_tier_ssd_path.empty()
+                                              ? nullptr
+                                              : params.kv_tier_ssd_path.c_str();
+    cparams.kv_tier_eviction_policy     = params.kv_tier_eviction_policy;
+    cparams.kv_tier_compression         = params.kv_tier_compression;
+    cparams.kv_tier_attention_threshold = params.kv_tier_attention_threshold;
+    cparams.kv_tier_warm_device         = params.kv_warm_device;
+    cparams.kv_tier_total_ctx           = params.kv_tier_total_ctx;
+    cparams.kv_tier_semantic_index      = params.kv_semantic_index.empty()
+                                              ? nullptr
+                                              : params.kv_semantic_index.c_str();
+    cparams.kv_tier_semantic_threshold  = params.kv_semantic_threshold;
+    cparams.kv_tier_semantic_topk       = params.kv_semantic_top_k;
+
     return cparams;
 }
 

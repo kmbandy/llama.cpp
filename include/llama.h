@@ -387,6 +387,22 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // Tiered KV cache (hot VRAM / warm RAM / cold SSD).
+        // When kv_tier_enabled is false the rest of these fields are ignored.
+        bool         kv_tier_enabled;
+        float        kv_tier_hot_pct;            // 0..100
+        float        kv_tier_warm_pct;           // 0..100
+        float        kv_tier_cold_pct;           // 0..100
+        const char * kv_tier_ssd_path;           // nullptr => $TMPDIR or /tmp
+        int32_t      kv_tier_eviction_policy;    // mt::EvictionPolicy
+        int32_t      kv_tier_compression;        // mt::Compression
+        float        kv_tier_attention_threshold;
+        int32_t      kv_tier_warm_device;        // -1 = host RAM
+        int32_t      kv_tier_total_ctx;          // 0 = use n_ctx
+        const char * kv_tier_semantic_index;     // nullptr => disabled
+        float        kv_tier_semantic_threshold;
+        int32_t      kv_tier_semantic_topk;
     };
 
     struct llama_model_tensor_override {

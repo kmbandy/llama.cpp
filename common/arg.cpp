@@ -1325,74 +1325,150 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-    // Phase 0.3 stub-out: tiered KV flags accepted but inert. The tier
-    // subsystem is being rewritten (see /home/kmbandy/.claude/plans/proud-stargazing-engelbart.md
-    // and docs/dev/memory-tier-bug-catalog.md). Each handler logs a one-shot
-    // warning and does NOT set kv_tiered_enabled, so no tier code is reached
-    // at runtime. Re-enabled by Phase 2.
+    // Tiered KV cache (Phase 2 rewrite). Canonical flag names use the
+    // "--kv-tier-*" prefix; a few legacy spellings are still accepted as
+    // deprecation aliases that emit a one-shot warning.
     add_opt(common_arg(
         {"--kv-tiered"}, "VRAM%,RAM%,SSD%",
-        "[REWRITE IN PROGRESS] tiered KV cache disabled in Phase 0.3 stub-out; flag accepted, inert",
-        [](common_params & /*params*/, const std::string & /*value*/) {
-            LOG_WRN("--kv-tiered: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub). See docs/dev/memory-tier-bug-catalog.md\n");
+        "enable tiered KV cache: percentage split across hot (VRAM), warm (RAM), and cold (SSD) tiers (sums to 100)",
+        [](common_params & params, const std::string & value) {
+            float h = 0, w = 0, c = 0;
+            if (sscanf(value.c_str(), "%f,%f,%f", &h, &w, &c) != 3) {
+                throw std::invalid_argument("--kv-tiered expects three comma-separated percentages, e.g. 25,25,50");
+            }
+            params.kv_tiered_enabled = true;
+            params.kv_tier_hot_pct   = h;
+            params.kv_tier_warm_pct  = w;
+            params.kv_tier_cold_pct  = c;
         }
-    ).set_env("LLAMA_ARG_KT_TIERED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_TIERED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-ssd-path"}, "PATH",
+        "directory for the cold tier KVTC store (default: $TMPDIR or /tmp)",
+        [](common_params & params, const std::string & value) {
+            params.kv_tier_ssd_path = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--tier-ssd-path"}, "PATH",
-        "[REWRITE IN PROGRESS] directory for cold tier (inert in Phase 0.3)",
-        [](common_params & /*params*/, const std::string & /*value*/) {
-            LOG_WRN("--tier-ssd-path: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        "[DEPRECATED — use --kv-tier-ssd-path] directory for the cold tier",
+        [](common_params & params, const std::string & value) {
+            LOG_WRN("--tier-ssd-path is deprecated; please use --kv-tier-ssd-path\n");
+            params.kv_tier_ssd_path = value;
         }
-    ).set_env("LLAMA_ARG_TIER_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_TIER_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--tier-eviction-policy"}, "POLICY",
-        "[REWRITE IN PROGRESS] eviction policy (inert in Phase 0.3)",
-        [](common_params & /*params*/, int /*value*/) {
-            LOG_WRN("--tier-eviction-policy: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--kv-tier-eviction-policy"}, "N",
+        "eviction policy: 0=LRU, 1=LFU, 2=attention, 3=hybrid (default: 3)",
+        [](common_params & params, int value) {
+            params.kv_tier_eviction_policy = value;
         }
-    ).set_env("LLAMA_ARG_TIER_EVICTION_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_TIER_EVICTION_POLICY").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--tier-compression"}, "TYPE",
-        "[REWRITE IN PROGRESS] compression type (inert in Phase 0.3)",
-        [](common_params & /*params*/, int /*value*/) {
-            LOG_WRN("--tier-compression: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--tier-eviction-policy"}, "N",
+        "[DEPRECATED — use --kv-tier-eviction-policy] eviction policy",
+        [](common_params & params, int value) {
+            LOG_WRN("--tier-eviction-policy is deprecated; please use --kv-tier-eviction-policy\n");
+            params.kv_tier_eviction_policy = value;
         }
-    ).set_env("LLAMA_ARG_TIER_COMPRESSION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_TIER_EVICTION_POLICY").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--tier-attention-threshold"}, "THRESH",
-        "[REWRITE IN PROGRESS] attention threshold for eviction (inert in Phase 0.3)",
-        [](common_params & /*params*/, int /*value*/) {
-            LOG_WRN("--tier-attention-threshold: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--kv-tier-compression"}, "N",
+        "cold tier compression: 0=none, 1=int4 (default), 2=int8",
+        [](common_params & params, int value) {
+            params.kv_tier_compression = value;
         }
-    ).set_env("LLAMA_ARG_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_TIER_COMPRESSION").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--kv-warm-device"}, "DEVICE",
-        "[REWRITE IN PROGRESS] warm KV tier device (inert in Phase 0.3)",
-        [](common_params & /*params*/, int /*value*/) {
-            LOG_WRN("--kv-warm-device: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--tier-compression"}, "N",
+        "[DEPRECATED — use --kv-tier-compression] cold tier compression",
+        [](common_params & params, int value) {
+            LOG_WRN("--tier-compression is deprecated; please use --kv-tier-compression\n");
+            params.kv_tier_compression = value;
         }
-    ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_TIER_COMPRESSION").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-attention-threshold"}, "F",
+        "attention-policy eviction threshold (default: 0.1)",
+        [](common_params & params, const std::string & value) {
+            params.kv_tier_attention_threshold = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--tier-attention-threshold"}, "F",
+        "[DEPRECATED — use --kv-tier-attention-threshold] attention threshold",
+        [](common_params & params, const std::string & value) {
+            LOG_WRN("--tier-attention-threshold is deprecated; please use --kv-tier-attention-threshold\n");
+            params.kv_tier_attention_threshold = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-warm-device"}, "N",
+        "HIP device index for warm tier (-1 = host RAM, default)",
+        [](common_params & params, int value) {
+            params.kv_warm_device = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-warm-device"}, "N",
+        "[DEPRECATED — use --kv-tier-warm-device] warm tier device",
+        [](common_params & params, int value) {
+            LOG_WRN("--kv-warm-device is deprecated; please use --kv-tier-warm-device\n");
+            params.kv_warm_device = value;
+        }
+    ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-total-ctx"}, "N",
+        "full ctx budget across all tiers (0 = use n_ctx)",
+        [](common_params & params, int value) {
+            params.kv_tier_total_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_TOTAL_CTX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-index"}, "PATH",
+        "embedding-model path for semantic prefetch index (empty = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_index = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--kv-semantic-index"}, "PATH",
-        "[REWRITE IN PROGRESS] semantic embedding model (inert in Phase 0.3)",
-        [](common_params & /*params*/, const std::string & /*value*/) {
-            LOG_WRN("--kv-semantic-index: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        "[DEPRECATED — use --kv-tier-semantic-index] semantic prefetch index",
+        [](common_params & params, const std::string & value) {
+            LOG_WRN("--kv-semantic-index is deprecated; please use --kv-tier-semantic-index\n");
+            params.kv_semantic_index = value;
         }
-    ).set_env("LLAMA_ARG_KV_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--kv-semantic-threshold"}, "THRESHOLD",
-        "[REWRITE IN PROGRESS] semantic similarity threshold (inert in Phase 0.3)",
-        [](common_params & /*params*/, const std::string & /*value*/) {
-            LOG_WRN("--kv-semantic-threshold: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--kv-tier-semantic-threshold"}, "F",
+        "minimum cosine similarity for semantic prefetch (default: 0.65)",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_threshold = std::stof(value);
         }
-    ).set_env("LLAMA_ARG_KV_SEMANTIC_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--kv-semantic-topk"}, "K",
-        "[REWRITE IN PROGRESS] semantic prefetch hints (inert in Phase 0.3)",
-        [](common_params & /*params*/, int /*value*/) {
-            LOG_WRN("--kv-semantic-topk: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
+        {"--kv-semantic-threshold"}, "F",
+        "[DEPRECATED — use --kv-tier-semantic-threshold] semantic threshold",
+        [](common_params & params, const std::string & value) {
+            LOG_WRN("--kv-semantic-threshold is deprecated; please use --kv-tier-semantic-threshold\n");
+            params.kv_semantic_threshold = std::stof(value);
         }
-    ).set_env("LLAMA_ARG_KV_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-topk"}, "N",
+        "number of semantic prefetch hints to return (default: 5)",
+        [](common_params & params, int value) {
+            params.kv_semantic_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-semantic-topk"}, "N",
+        "[DEPRECATED — use --kv-tier-semantic-topk] semantic top-k",
+        [](common_params & params, int value) {
+            LOG_WRN("--kv-semantic-topk is deprecated; please use --kv-tier-semantic-topk\n");
+            params.kv_semantic_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

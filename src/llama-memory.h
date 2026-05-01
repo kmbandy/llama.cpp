@@ -20,6 +20,22 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    // tiered KV cache (Phase 2 rewrite). When kv_tier_enabled is false the
+    // rest of these fields are ignored and the inner cache is returned as-is.
+    bool         kv_tier_enabled;
+    float        kv_tier_hot_pct;
+    float        kv_tier_warm_pct;
+    float        kv_tier_cold_pct;
+    const char * kv_tier_ssd_path;
+    int32_t      kv_tier_eviction_policy;
+    int32_t      kv_tier_compression;
+    float        kv_tier_attention_threshold;
+    int32_t      kv_tier_warm_device;
+    int32_t      kv_tier_total_ctx;
+    const char * kv_tier_semantic_index;
+    float        kv_tier_semantic_threshold;
+    int32_t      kv_tier_semantic_topk;
 };
 
 enum llama_memory_status {

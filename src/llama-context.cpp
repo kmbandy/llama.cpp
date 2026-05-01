@@ -279,9 +279,22 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k                      =*/ params.type_k,
+            /*.type_v                      =*/ params.type_v,
+            /*.swa_full                    =*/ params.swa_full,
+            /*.kv_tier_enabled             =*/ params.kv_tier_enabled,
+            /*.kv_tier_hot_pct             =*/ params.kv_tier_hot_pct,
+            /*.kv_tier_warm_pct            =*/ params.kv_tier_warm_pct,
+            /*.kv_tier_cold_pct            =*/ params.kv_tier_cold_pct,
+            /*.kv_tier_ssd_path            =*/ params.kv_tier_ssd_path,
+            /*.kv_tier_eviction_policy     =*/ params.kv_tier_eviction_policy,
+            /*.kv_tier_compression         =*/ params.kv_tier_compression,
+            /*.kv_tier_attention_threshold =*/ params.kv_tier_attention_threshold,
+            /*.kv_tier_warm_device         =*/ params.kv_tier_warm_device,
+            /*.kv_tier_total_ctx           =*/ params.kv_tier_total_ctx,
+            /*.kv_tier_semantic_index      =*/ params.kv_tier_semantic_index,
+            /*.kv_tier_semantic_threshold  =*/ params.kv_tier_semantic_threshold,
+            /*.kv_tier_semantic_topk       =*/ params.kv_tier_semantic_topk,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -2933,6 +2946,19 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.kv_tier_enabled             =*/ false,
+        /*.kv_tier_hot_pct             =*/ 25.0f,
+        /*.kv_tier_warm_pct            =*/ 25.0f,
+        /*.kv_tier_cold_pct            =*/ 50.0f,
+        /*.kv_tier_ssd_path            =*/ nullptr,
+        /*.kv_tier_eviction_policy     =*/ 3,
+        /*.kv_tier_compression         =*/ 1,
+        /*.kv_tier_attention_threshold =*/ 0.1f,
+        /*.kv_tier_warm_device         =*/ -1,
+        /*.kv_tier_total_ctx           =*/ 0,
+        /*.kv_tier_semantic_index      =*/ nullptr,
+        /*.kv_tier_semantic_threshold  =*/ 0.65f,
+        /*.kv_tier_semantic_topk       =*/ 5,
     };
 
     return result;

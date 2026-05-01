@@ -41,21 +41,33 @@ llama_memory_tiered::~llama_memory_tiered() {
 // Tier-aware behaviour is added in subsequent sub-iterations.
 // ---------------------------------------------------------------------------
 
+// init_* return the *inner* context directly rather than our wrapper.
+//
+// Why: the graph builder (src/llama-graph.cpp) downcasts the memory_context
+// to its concrete type with static_cast (e.g. to llama_memory_hybrid_iswa_context
+// or llama_memory_recurrent_context). That cast is undefined behaviour when
+// the dynamic type is anything else, so any wrapper context — even one that
+// pure-passthroughs every method — corrupts the cast and SIGSEGVs.
+//
+// Tier interception therefore happens at the llama_memory_i level (here on
+// init_batch entry, plus the seq_* mutators) rather than at the
+// llama_memory_context_i level. Hot->warm eviction in 2d-evict will run at
+// init_batch boundary before delegating; cold prefetch can run before
+// init_batch returns. apply()-level hooks (if needed later) will require a
+// different mechanism — likely changing the graph downcasts to go through a
+// virtual accessor.
 llama_memory_context_ptr llama_memory_tiered::init_batch(llama_batch_allocr & balloc,
                                                          uint32_t             n_ubatch,
                                                          bool                 embd_all) {
-    auto inner_ctx = inner_->init_batch(balloc, n_ubatch, embd_all);
-    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+    return inner_->init_batch(balloc, n_ubatch, embd_all);
 }
 
 llama_memory_context_ptr llama_memory_tiered::init_full() {
-    auto inner_ctx = inner_->init_full();
-    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+    return inner_->init_full();
 }
 
 llama_memory_context_ptr llama_memory_tiered::init_update(llama_context * lctx, bool optimize) {
-    auto inner_ctx = inner_->init_update(lctx, optimize);
-    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+    return inner_->init_update(lctx, optimize);
 }
 
 bool llama_memory_tiered::get_can_shift() const {
