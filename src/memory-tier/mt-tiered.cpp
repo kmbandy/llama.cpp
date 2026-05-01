@@ -1,0 +1,120 @@
+#include "mt-tiered.h"
+#include "mt-context.h"
+
+#include "llama-impl.h"  // LLAMA_LOG_*
+
+#include <cassert>
+
+namespace mt {
+
+llama_memory_tiered::llama_memory_tiered(llama_memory_ptr inner, const TieredConfig & cfg)
+    : inner_(std::move(inner)),
+      cfg_(cfg),
+      capacity_(cfg) {
+    if (!inner_) {
+        LLAMA_LOG_ERROR("mt::llama_memory_tiered: null inner cache\n");
+        return;
+    }
+
+    std::string err;
+    if (!validate(cfg_, &err)) {
+        LLAMA_LOG_WARN("mt::llama_memory_tiered: config invalid (%s) — proceeding with passthrough\n",
+                       err.c_str());
+    }
+
+    // Cold tier opens lazily — defer KvtcStore::init until the first
+    // eviction would actually use it. This keeps "tiering enabled but
+    // never reached cold pressure" runs from creating an unused file.
+    // (Phase 2d sub-iteration that wires eviction will set this.)
+
+    LLAMA_LOG_INFO("mt::llama_memory_tiered: %s\n", describe(cfg_).c_str());
+}
+
+llama_memory_tiered::~llama_memory_tiered() {
+    if (store_initialized_) {
+        store_.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2d-pt: passthrough delegation. Each method forwards to inner_.
+// Tier-aware behaviour is added in subsequent sub-iterations.
+// ---------------------------------------------------------------------------
+
+llama_memory_context_ptr llama_memory_tiered::init_batch(llama_batch_allocr & balloc,
+                                                         uint32_t             n_ubatch,
+                                                         bool                 embd_all) {
+    auto inner_ctx = inner_->init_batch(balloc, n_ubatch, embd_all);
+    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+}
+
+llama_memory_context_ptr llama_memory_tiered::init_full() {
+    auto inner_ctx = inner_->init_full();
+    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+}
+
+llama_memory_context_ptr llama_memory_tiered::init_update(llama_context * lctx, bool optimize) {
+    auto inner_ctx = inner_->init_update(lctx, optimize);
+    return std::make_unique<llama_memory_tiered_context>(this, std::move(inner_ctx));
+}
+
+bool llama_memory_tiered::get_can_shift() const {
+    return inner_ ? inner_->get_can_shift() : false;
+}
+
+void llama_memory_tiered::clear(bool data) {
+    if (inner_) inner_->clear(data);
+    capacity_.reset();
+    eviction_.clear();
+    semantic_.clear();
+    // Note: KvtcStore is NOT cleared on clear() — its file persists for
+    // the run. clear() corresponds to seq_rm-everything, not shutdown.
+}
+
+bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return inner_ ? inner_->seq_rm(seq_id, p0, p1) : false;
+}
+
+void llama_memory_tiered::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+                                  llama_pos p0, llama_pos p1) {
+    if (inner_) inner_->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+void llama_memory_tiered::seq_keep(llama_seq_id seq_id) {
+    if (inner_) inner_->seq_keep(seq_id);
+}
+
+void llama_memory_tiered::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (inner_) inner_->seq_add(seq_id, p0, p1, shift);
+}
+
+void llama_memory_tiered::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (inner_) inner_->seq_div(seq_id, p0, p1, d);
+}
+
+llama_pos llama_memory_tiered::seq_pos_min(llama_seq_id seq_id) const {
+    return inner_ ? inner_->seq_pos_min(seq_id) : -1;
+}
+
+llama_pos llama_memory_tiered::seq_pos_max(llama_seq_id seq_id) const {
+    return inner_ ? inner_->seq_pos_max(seq_id) : -1;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_tiered::memory_breakdown() const {
+    return inner_ ? inner_->memory_breakdown()
+                  : std::map<ggml_backend_buffer_type_t, size_t>{};
+}
+
+void llama_memory_tiered::state_write(llama_io_write_i & io,
+                                       llama_seq_id          seq_id,
+                                       llama_state_seq_flags flags) const {
+    if (inner_) inner_->state_write(io, seq_id, flags);
+}
+
+void llama_memory_tiered::state_read(llama_io_read_i & io,
+                                      llama_seq_id          seq_id,
+                                      llama_state_seq_flags flags) {
+    if (inner_) inner_->state_read(io, seq_id, flags);
+}
+
+}  // namespace mt
