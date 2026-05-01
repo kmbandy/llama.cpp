@@ -801,24 +801,58 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
 
 mt::InnerView llama_kv_cache::make_tier_view() const {
     mt::InnerView view;
-    view.attn_layers.reserve(layers.size());
+
+    if (layers.empty()) {
+        return view;
+    }
+
+    mt::AttentionCacheSnapshot cache;
+    cache.is_swa = (swa_type != LLAMA_SWA_TYPE_NONE);
+
+    // ne[1] for K is the slot ring length. (Transposed V uses ne[0]
+    // for the slot count, but K's layout is consistent.)
+    cache.kv_size = layers[0].k ? layers[0].k->ne[1] : 0;
+
+    // K/V layer views.
+    cache.layers.reserve(layers.size());
     for (const auto & l : layers) {
         mt::AttentionLayerView a;
-        a.k = l.k;
-        a.v = l.v;
-        a.v_trans = v_trans;
-        // Per-token row stride. Use nb[1] (B-K1: nb[0] gives quant block
-        // bytes for Q-types, not the per-row stride).
-        a.k_row_bytes = l.k ? l.k->nb[1] : 0;
+        a.k          = l.k;
+        a.v          = l.v;
+        a.v_trans    = v_trans;
+        a.k_row_bytes = l.k ? l.k->nb[1] : 0;  // B-K1: nb[1] for row stride
         a.v_row_bytes = l.v ? l.v->nb[1] : 0;
-        // ne[1] for non-transposed V (and K) is the slot ring length.
-        // For transposed V (the default on HIP/CUDA) ne[1] is n_embd_v
-        // and ne[0] is the slot count, but kv_size is still the same
-        // logical capacity — read it off the K tensor where layout is
-        // always [n_embd_k, kv_size].
-        a.kv_size = l.k ? l.k->ne[1] : 0;
-        view.attn_layers.push_back(a);
+        a.kv_size    = cache.kv_size;
+        cache.layers.push_back(a);
     }
+
+    // Cell occupancy snapshot. For multi-stream caches each stream has
+    // its own cell ring; we snapshot all of them concatenated. Slot
+    // index in the result equals (stream_idx * stream_size) + cell_idx,
+    // matching how the K/V tensors are laid out in memory.
+    if (!v_cells.empty()) {
+        const uint32_t per_stream = v_cells[0].size();
+        cache.cells.resize((size_t) per_stream * v_cells.size());
+        for (size_t si = 0; si < v_cells.size(); ++si) {
+            const auto & cells = v_cells[si];
+            for (uint32_t i = 0; i < per_stream; ++i) {
+                mt::CellSnapshot cs;
+                if (!cells.is_empty(i)) {
+                    cs.pos = cells.pos_get(i);
+                    // seq_get asserts on multi-seq cells; check first.
+                    // For tier purposes we conservatively skip multi-seq
+                    // cells by leaving seq_id = -1.
+                    // (llama_kv_cells exposes per-cell seq via seq_get
+                    // but it's only valid when the cell holds exactly
+                    // one seq — multi-seq cells are left untagged.)
+                    cs.seq_id = cells.seq_get_one_or(i, -1);
+                }
+                cache.cells[si * per_stream + i] = cs;
+            }
+        }
+    }
+
+    view.attn_caches.push_back(std::move(cache));
     return view;
 }
 

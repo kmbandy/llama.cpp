@@ -329,6 +329,22 @@ public:
         return -1;
     }
 
+    // Non-asserting variant: returns the seq_id if the cell holds exactly
+    // one sequence, else returns the fallback. Used by the tier wrapper
+    // to snapshot per-cell ownership without crashing on multi-seq cells.
+    llama_seq_id seq_get_one_or(uint32_t i, llama_seq_id fallback) const {
+        assert(i < pos.size());
+        if (seq[i].count() != 1) {
+            return fallback;
+        }
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (seq[i].test(s)) {
+                return s;
+            }
+        }
+        return fallback;
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {

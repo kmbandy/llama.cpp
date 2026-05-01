@@ -38,13 +38,55 @@ namespace mt {
 // stride from ggml's metadata), NOT `ne[0] * element_size`. The latter
 // returns block size for quantized types like turbo4 / Q4_K and gives
 // wildly wrong values — this was bug B-K1 in the legacy pager.
+//
+// Layer view is *just the K/V tensors*. Slot occupancy (which slot
+// holds which position) is shared across every layer in the same
+// physical cache and lives on the parent AttentionCacheSnapshot.
 struct AttentionLayerView {
     ggml_tensor * k          = nullptr;
     ggml_tensor * v          = nullptr;
     bool          v_trans    = false;  // true: V stored transposed (default for HIP/CUDA)
-    int64_t       kv_size    = 0;      // max tokens (n_ctx_max for this slot ring)
     size_t        k_row_bytes = 0;
     size_t        v_row_bytes = 0;
+
+    // kv_size is duplicated from the parent AttentionCacheSnapshot. Kept
+    // here because AttentionMover takes a layer view by reference and
+    // needs the slot count for bounds checks and (for transposed V) the
+    // pitch in hipMemcpy2D. All layers in one cache share the same value.
+    int64_t       kv_size    = 0;
+};
+
+// Per-cell occupancy snapshot. Captured once per make_tier_view call;
+// reflects the cache state at that moment. Index in the parent
+// AttentionCacheSnapshot::cells vector IS the slot index.
+//
+// pos == -1 means the slot is empty. seq_id == -1 means either empty
+// or "multi-seq cell" (the underlying cell ring can hold cells shared
+// by multiple seqs; the wrapper picks the primary seq for tier
+// purposes). Tier eviction only acts on cells with pos >= 0 AND a
+// single owner seq — cells shared across seqs are conservatively left
+// alone.
+struct CellSnapshot {
+    llama_pos    pos    = -1;
+    llama_seq_id seq_id = -1;
+};
+
+// One physical attention cache. For a non-SWA model this is the only
+// AttentionCacheSnapshot in InnerView::attn_caches. For an iswa model
+// there are two: one with is_swa=false (the base cache, full-attention
+// layers, restorable) and one with is_swa=true (the SWA cache, layers
+// that attend only within a rolling window, NOT restorable because
+// the SWA mask hides positions older than n_swa back from the head).
+//
+// Tier eviction must consult is_swa: for backup it can copy from base
+// (the SWA layers are a subset of those positions) and for restore it
+// must only fill base cache slots. Restoring into an SWA cache silently
+// fails — the cache holds the data but the mask makes it invisible.
+struct AttentionCacheSnapshot {
+    std::vector<AttentionLayerView> layers;        // K/V per layer in this cache
+    std::vector<CellSnapshot>       cells;         // index = slot, value = (pos, seq_id)
+    int64_t                         kv_size = 0;   // == cells.size()
+    bool                            is_swa  = false;
 };
 
 // One sequence's recurrent state. Per the architecture, recurrent layers
@@ -82,17 +124,26 @@ struct RecurrentStateView {
 };
 
 // Composite snapshot. Either or both fields may be empty:
-//   - attn_layers empty + recur_seqs populated  -> pure-recurrent model
-//     (e.g. mamba-only)
-//   - attn_layers populated + recur_seqs empty  -> standard attention
-//     model (e.g. llama, gemma, qwen2)
-//   - both populated                            -> hybrid (qwen3.5,
-//     qwen3-next, falcon-h1, nemotron-h)
+//   - attn_caches empty + recur_seqs populated   -> pure-recurrent
+//     model (e.g. mamba-only)
+//   - attn_caches populated + recur_seqs empty   -> standard attention
+//     model. Single cache for non-SWA (e.g. llama, qwen2). Two caches
+//     (base + swa) for iswa (e.g. qwen3.6 SWA).
+//   - both populated                             -> hybrid (qwen3.5,
+//     qwen3-next, falcon-h1, nemotron-h).
 struct InnerView {
-    std::vector<AttentionLayerView> attn_layers;
-    std::vector<RecurrentStateView> recur_seqs;
+    std::vector<AttentionCacheSnapshot> attn_caches;
+    std::vector<RecurrentStateView>     recur_seqs;
 
-    bool empty() const { return attn_layers.empty() && recur_seqs.empty(); }
+    bool empty() const { return attn_caches.empty() && recur_seqs.empty(); }
+
+    // Total attention layer count across all caches. Used by the
+    // wrapper for warm staging sizing and progress logging.
+    size_t attn_layer_count() const {
+        size_t n = 0;
+        for (const auto & c : attn_caches) n += c.layers.size();
+        return n;
+    }
 };
 
 }  // namespace mt

@@ -39,8 +39,14 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
     // the wrapper still functions as passthrough but tier movement is a
     // no-op for them.
     tier_view_ = inner_->make_tier_view();
-    LLAMA_LOG_INFO("mt::llama_memory_tiered: tier view: attn_layers=%zu recur_seqs=%zu%s\n",
-                   tier_view_.attn_layers.size(),
+    size_t base_layers = 0, swa_layers = 0;
+    for (const auto & c : tier_view_.attn_caches) {
+        (c.is_swa ? swa_layers : base_layers) += c.layers.size();
+    }
+    LLAMA_LOG_INFO("mt::llama_memory_tiered: tier view: attn_caches=%zu "
+                   "(base_layers=%zu swa_layers=%zu) recur_seqs=%zu%s\n",
+                   tier_view_.attn_caches.size(),
+                   base_layers, swa_layers,
                    tier_view_.recur_seqs.size(),
                    tier_view_.empty() ? " (not tierable; will run as passthrough)" : "");
 }
@@ -69,11 +75,18 @@ llama_memory_tiered::~llama_memory_tiered() {
 bool llama_memory_tiered::ensure_warm_staging() {
     if (warm_initialized_) return true;
 
-    if (tier_view_.attn_layers.empty()) {
+    // Count restorable (non-SWA) layers. We only allocate warm storage
+    // for those — SWA layers can't be restored (their distance mask hides
+    // any position older than n_swa back from the head) so backing them
+    // up is wasted RAM.
+    size_t restorable_layers = 0;
+    for (const auto & c : tier_view_.attn_caches) {
+        if (!c.is_swa) restorable_layers += c.layers.size();
+    }
+    if (restorable_layers == 0) {
         if (!no_attn_warned_) {
-            LLAMA_LOG_WARN("mt::llama_memory_tiered: no attention layers in tier view; "
-                           "hot->warm eviction is a no-op for this model "
-                           "(recurrent-only models are handled in Phase 2d-recur)\n");
+            LLAMA_LOG_WARN("mt::llama_memory_tiered: no restorable (non-SWA) attention "
+                           "layers in tier view; hot->warm eviction is a no-op for this model\n");
             no_attn_warned_ = true;
         }
         return false;
@@ -85,16 +98,21 @@ bool llama_memory_tiered::ensure_warm_staging() {
         return false;
     }
 
-    // Compute per-layer offsets. Layout: each layer's slab is a K block
-    // (warm_cap * k_row_bytes) followed by a V block (warm_cap * v_row_bytes).
-    warm_layer_off_.resize(tier_view_.attn_layers.size());
-    warm_layer_v_off_.resize(tier_view_.attn_layers.size());
+    // Layout: each restorable layer gets a [K slab | V slab] block,
+    // each sized warm_cap * row_bytes. Indexed by a flat "restorable
+    // layer index" — we walk the same iteration order in evict_hot_to_warm.
+    warm_layer_off_.resize(restorable_layers);
+    warm_layer_v_off_.resize(restorable_layers);
     size_t cursor = 0;
-    for (size_t i = 0; i < tier_view_.attn_layers.size(); ++i) {
-        const auto & a = tier_view_.attn_layers[i];
-        warm_layer_off_[i]   = cursor;
-        warm_layer_v_off_[i] = cursor + (size_t) warm_capacity_ * a.k_row_bytes;
-        cursor              += (size_t) warm_capacity_ * (a.k_row_bytes + a.v_row_bytes);
+    size_t flat_idx = 0;
+    for (const auto & c : tier_view_.attn_caches) {
+        if (c.is_swa) continue;
+        for (const auto & a : c.layers) {
+            warm_layer_off_[flat_idx]   = cursor;
+            warm_layer_v_off_[flat_idx] = cursor + (size_t) warm_capacity_ * a.k_row_bytes;
+            cursor                     += (size_t) warm_capacity_ * (a.k_row_bytes + a.v_row_bytes);
+            ++flat_idx;
+        }
     }
     warm_buf_.assign(cursor, 0);
 
@@ -104,9 +122,10 @@ bool llama_memory_tiered::ensure_warm_staging() {
     }
 
     LLAMA_LOG_INFO("mt::llama_memory_tiered: warm staging: capacity=%u tokens, "
-                   "buffer=%.1f MiB across %zu layers\n",
+                   "buffer=%.1f MiB across %zu restorable layers (skipped %zu SWA layers)\n",
                    warm_capacity_, (double) warm_buf_.size() / (1024.0 * 1024.0),
-                   tier_view_.attn_layers.size());
+                   restorable_layers,
+                   tier_view_.attn_layer_count() - restorable_layers);
 
     warm_initialized_ = true;
     return true;
@@ -146,16 +165,27 @@ uint32_t llama_memory_tiered::evict_hot_to_warm(uint32_t n) {
         warm_free_slots_.pop_back();
 
         bool ok = true;
-        for (size_t li = 0; li < tier_view_.attn_layers.size(); ++li) {
-            const auto & layer = tier_view_.attn_layers[li];
-            uint8_t * k_dst = warm_buf_.data() + warm_layer_off_[li]
-                              + (size_t) slot * layer.k_row_bytes;
-            uint8_t * v_dst = warm_buf_.data() + warm_layer_v_off_[li]
-                              + (size_t) slot * layer.v_row_bytes;
-            ok = ok && mover_attn_.evict_k(layer, pos, k_dst);
-            ok = ok && mover_attn_.evict_v(layer, pos, v_dst);
-            if (!ok) break;
+        size_t flat_idx = 0;
+        for (const auto & c : tier_view_.attn_caches) {
+            if (c.is_swa) continue;
+            for (const auto & layer : c.layers) {
+                uint8_t * k_dst = warm_buf_.data() + warm_layer_off_[flat_idx]
+                                  + (size_t) slot * layer.k_row_bytes;
+                uint8_t * v_dst = warm_buf_.data() + warm_layer_v_off_[flat_idx]
+                                  + (size_t) slot * layer.v_row_bytes;
+                // NOTE: this still passes `pos` as the slot index — that's
+                // wrong on rotating-window layouts. 2d-evict-restore-bk
+                // (next commit) replaces this with a proper position->slot
+                // mapping using cache.cells. For now this matches the
+                // pre-restructure behaviour so this commit is no-behavior-
+                // change.
+                ok = ok && mover_attn_.evict_k(layer, pos, k_dst);
+                ok = ok && mover_attn_.evict_v(layer, pos, v_dst);
+                if (!ok) goto eviction_failed;
+                ++flat_idx;
+            }
         }
+eviction_failed:;
 
         if (ok) {
             warm_pos_to_slot_.emplace(pos, (uint32_t) slot);

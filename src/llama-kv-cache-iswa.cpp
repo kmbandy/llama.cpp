@@ -124,12 +124,27 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
 }
 
 mt::InnerView llama_kv_cache_iswa::make_tier_view() const {
-    mt::InnerView view = kv_base ? kv_base->make_tier_view() : mt::InnerView{};
+    mt::InnerView view;
+    // base cache: full attention, source of truth for tier eviction.
+    if (kv_base) {
+        auto base_view = kv_base->make_tier_view();
+        for (auto & c : base_view.attn_caches) {
+            c.is_swa = false;  // explicit: base never SWA from iswa's POV
+        }
+        view.attn_caches.insert(view.attn_caches.end(),
+                                std::make_move_iterator(base_view.attn_caches.begin()),
+                                std::make_move_iterator(base_view.attn_caches.end()));
+    }
+    // swa cache: marked is_swa=true. Wrapper skips for backup/restore
+    // because the SWA distance mask hides anything outside the window.
     if (kv_swa) {
         auto swa_view = kv_swa->make_tier_view();
-        view.attn_layers.insert(view.attn_layers.end(),
-                                swa_view.attn_layers.begin(),
-                                swa_view.attn_layers.end());
+        for (auto & c : swa_view.attn_caches) {
+            c.is_swa = true;
+        }
+        view.attn_caches.insert(view.attn_caches.end(),
+                                std::make_move_iterator(swa_view.attn_caches.begin()),
+                                std::make_move_iterator(swa_view.attn_caches.end()));
     }
     return view;
 }
