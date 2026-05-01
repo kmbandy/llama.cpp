@@ -12,11 +12,17 @@
 #include "memory-tier/mt-capacity.h"
 #include "memory-tier/mt-eviction.h"
 #include "memory-tier/mt-quant.h"
+#include "memory-tier/mt-kvtc-store.h"
+#include "memory-tier/mt-semantic.h"
+
+#include <cstdlib>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -299,6 +305,179 @@ static int test_quant_int8_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// KvtcStore round-trip
+// ---------------------------------------------------------------------------
+
+static std::string make_tmp_path(const char * suffix) {
+    const char * tmpdir = std::getenv("TMPDIR");
+    if (!tmpdir) tmpdir = "/tmp";
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "%s/mt-test-%d-%s", tmpdir, (int) getpid(), suffix);
+    return std::string(buf);
+}
+
+static int test_kvtc_attn_round_trip() {
+    int fails = 0;
+
+    // Use Compression::None so the test is bit-exact and not subject to
+    // INT4 quantization tolerance — that's covered separately.
+    mt::KvtcStore store;
+    const std::string path = make_tmp_path("attn.kvtc");
+    EXPECT(store.init(path, mt::Compression::None), "init");
+    EXPECT(store.is_initialized(), "is_initialized");
+
+    // Layer 0 / pos 5: K = [1,2,3,4], V = [5,6,7,8] (32 bytes each).
+    float k0[4] = { 1.0f, 2.0f, 3.0f, 4.0f };
+    float v0[4] = { 5.0f, 6.0f, 7.0f, 8.0f };
+    EXPECT(store.write_attn_k(0, 5, k0, sizeof(k0)), "write_attn_k l0p5");
+    EXPECT(store.write_attn_v(0, 5, v0, sizeof(v0)), "write_attn_v l0p5");
+
+    // Layer 1 / pos 7
+    float k1[4] = { 9.0f, 10.0f, 11.0f, 12.0f };
+    EXPECT(store.write_attn_k(1, 7, k1, sizeof(k1)), "write_attn_k l1p7");
+
+    EXPECT_EQ_INT(store.n_entries(), 3, "n_entries == 3");
+
+    float k_out[4] = {};
+    float v_out[4] = {};
+    EXPECT(store.read_attn_k(0, 5, k_out, sizeof(k_out)), "read_attn_k l0p5");
+    EXPECT(std::memcmp(k_out, k0, sizeof(k0)) == 0, "k0 round-trip");
+
+    EXPECT(store.read_attn_v(0, 5, v_out, sizeof(v_out)), "read_attn_v l0p5");
+    EXPECT(std::memcmp(v_out, v0, sizeof(v0)) == 0, "v0 round-trip");
+
+    float k1_out[4] = {};
+    EXPECT(store.read_attn_k(1, 7, k1_out, sizeof(k1_out)), "read_attn_k l1p7");
+    EXPECT(std::memcmp(k1_out, k1, sizeof(k1)) == 0, "k1 round-trip");
+
+    // Missing key returns false.
+    float scratch[4] = {};
+    EXPECT(!store.read_attn_k(2, 0, scratch, sizeof(scratch)), "missing key returns false");
+
+    // Erase + re-read.
+    EXPECT(store.erase_attn(0, 5), "erase_attn l0p5");
+    EXPECT(!store.read_attn_k(0, 5, scratch, sizeof(scratch)), "post-erase k unreachable");
+    EXPECT(!store.read_attn_v(0, 5, scratch, sizeof(scratch)), "post-erase v unreachable");
+
+    store.shutdown();
+    EXPECT(!store.is_initialized(), "post-shutdown");
+    unlink(path.c_str());
+    return fails;
+}
+
+static int test_kvtc_int4_round_trip() {
+    int fails = 0;
+    mt::KvtcStore store;
+    const std::string path = make_tmp_path("int4.kvtc");
+    EXPECT(store.init(path, mt::Compression::Int4), "init int4");
+
+    // Use representable values so dequant is near-exact.
+    float k[8];
+    for (int i = 0; i < 8; ++i) k[i] = (float)(i - 4) / 7.0f;  // -4/7 .. 3/7
+    EXPECT(store.write_attn_k(0, 0, k, sizeof(k)), "write int4");
+
+    float k_out[8] = {};
+    EXPECT(store.read_attn_k(0, 0, k_out, sizeof(k_out)), "read int4");
+    for (int i = 0; i < 8; ++i) {
+        EXPECT_NEAR(k_out[i], k[i], 1e-5, "int4 round-trip element");
+    }
+    store.shutdown();
+    unlink(path.c_str());
+    return fails;
+}
+
+static int test_kvtc_recurrent_round_trip() {
+    int fails = 0;
+    mt::KvtcStore store;
+    const std::string path = make_tmp_path("recur.kvtc");
+    EXPECT(store.init(path, mt::Compression::None), "init");
+
+    // Recurrent state stored uncompressed regardless of cfg — so even
+    // with non-None compression, the recurrent path should be raw bytes.
+    float r[16];
+    float s[16];
+    for (int i = 0; i < 16; ++i) { r[i] = (float) i;       s[i] = (float)(100 - i); }
+
+    EXPECT(store.write_recurrent(3, /*seq=*/2, /*is_s=*/false, r, sizeof(r)), "write r");
+    EXPECT(store.write_recurrent(3, /*seq=*/2, /*is_s=*/true,  s, sizeof(s)), "write s");
+    EXPECT_EQ_INT(store.n_entries(), 2, "n_entries");
+
+    float r_out[16] = {};
+    float s_out[16] = {};
+    EXPECT(store.read_recurrent(3, 2, false, r_out, sizeof(r_out)), "read r");
+    EXPECT(std::memcmp(r_out, r, sizeof(r)) == 0, "r exact");
+    EXPECT(store.read_recurrent(3, 2, true, s_out, sizeof(s_out)), "read s");
+    EXPECT(std::memcmp(s_out, s, sizeof(s)) == 0, "s exact");
+
+    EXPECT(store.erase_recurrent(3, 2, false), "erase r");
+    EXPECT(!store.read_recurrent(3, 2, false, r_out, sizeof(r_out)), "r erased");
+    // s still present.
+    EXPECT(store.read_recurrent(3, 2, true,  s_out, sizeof(s_out)), "s still present");
+
+    store.shutdown();
+    unlink(path.c_str());
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// SemanticIndex
+// ---------------------------------------------------------------------------
+
+static int test_semantic_score_basic() {
+    int fails = 0;
+    mt::SemanticIndex idx;
+
+    // Fingerprints with embeddings on the unit sphere in 4D.
+    idx.add_fingerprint({1, 2, 3}, {1.0f, 0.0f, 0.0f, 0.0f}, mt::SemanticIndex::Tier::Cold);
+    idx.add_fingerprint({4, 5},    {0.0f, 1.0f, 0.0f, 0.0f}, mt::SemanticIndex::Tier::Warm);
+    idx.add_fingerprint({6},       {0.7071f, 0.7071f, 0.0f, 0.0f}, mt::SemanticIndex::Tier::Cold);
+
+    // Query aligned with the first FP -> highest score.
+    auto hints = idx.score({1.0f, 0.0f, 0.0f, 0.0f}, /*top_k=*/3, /*threshold=*/0.0f);
+    EXPECT_EQ_INT(hints.size(), 3, "all three above 0.0 threshold");
+    EXPECT_NEAR(hints[0].score, 1.0f, 1e-4, "perfect match scores 1");
+    EXPECT_EQ_INT(hints[0].positions.front(), 1, "perfect match is FP0");
+
+    // Threshold filters: only FP0 (score 1.0) is above 0.8; FP2 is at
+    // 0.7071. So one hint passes.
+    auto hints_filtered = idx.score({1.0f, 0.0f, 0.0f, 0.0f}, 3, 0.8f);
+    EXPECT_EQ_INT(hints_filtered.size(), 1, "one above 0.8");
+
+    // Lower threshold catches FP2 too.
+    auto hints_lower = idx.score({1.0f, 0.0f, 0.0f, 0.0f}, 3, 0.5f);
+    EXPECT_EQ_INT(hints_lower.size(), 2, "two above 0.5");
+
+    // Top-k clamp.
+    auto hints_topk1 = idx.score({1.0f, 0.0f, 0.0f, 0.0f}, 1, 0.0f);
+    EXPECT_EQ_INT(hints_topk1.size(), 1, "top-k=1");
+
+    return fails;
+}
+
+static int test_semantic_persistence() {
+    int fails = 0;
+    const std::string path = make_tmp_path("fp.bin");
+
+    {
+        mt::SemanticIndex idx;
+        idx.add_fingerprint({1, 2}, {0.5f, 0.5f, 0.5f, 0.5f}, mt::SemanticIndex::Tier::Cold);
+        idx.add_fingerprint({9},    {1.0f, 0.0f, 0.0f, 0.0f}, mt::SemanticIndex::Tier::Warm);
+        EXPECT(idx.save_to_disk(path), "save_to_disk");
+    }
+    {
+        mt::SemanticIndex idx;
+        EXPECT(idx.load_from_disk(path), "load_from_disk");
+        EXPECT_EQ_INT(idx.size(), 2, "loaded 2 fingerprints");
+        // Score the second one (perfect match).
+        auto hints = idx.score({1.0f, 0.0f, 0.0f, 0.0f}, 1, 0.99f);
+        EXPECT_EQ_INT(hints.size(), 1, "found loaded FP");
+        EXPECT_EQ_INT(hints[0].positions.front(), 9, "right positions");
+    }
+    unlink(path.c_str());
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -320,6 +499,11 @@ int main() {
         { "eviction_count_clamp",   test_eviction_count_clamp   },
         { "quant_int4_round_trip",  test_quant_int4_round_trip  },
         { "quant_int8_round_trip",  test_quant_int8_round_trip  },
+        { "kvtc_attn_round_trip",   test_kvtc_attn_round_trip   },
+        { "kvtc_int4_round_trip",   test_kvtc_int4_round_trip   },
+        { "kvtc_recurrent",         test_kvtc_recurrent_round_trip },
+        { "semantic_score_basic",   test_semantic_score_basic   },
+        { "semantic_persistence",   test_semantic_persistence   },
     };
 
     for (const auto & t : tests) {
