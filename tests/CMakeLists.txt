@@ -245,6 +245,9 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-weight-pager.cpp)
 target_include_directories(test-weight-pager PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+llama_build_and_test(test-memory-tier.cpp)
+target_include_directories(test-memory-tier PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

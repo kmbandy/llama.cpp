@@ -8,6 +8,7 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 file(GLOB LLAMA_WEIGHT_PAGER_SOURCES "weight-pager/*.cpp")
+file(GLOB LLAMA_MEMORY_TIER_SOURCES "memory-tier/*.cpp")
 
 add_library(llama
             ../include/llama.h
@@ -44,6 +45,7 @@ add_library(llama
             unicode.h
             ${LLAMA_MODELS_SOURCES}
             ${LLAMA_WEIGHT_PAGER_SOURCES}
+            ${LLAMA_MEMORY_TIER_SOURCES}
             )
 
 set_target_properties(llama PROPERTIES
