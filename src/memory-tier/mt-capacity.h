@@ -55,6 +55,12 @@ public:
     // touch warm/cold counters or migration totals.
     void set_hot_tokens(uint32_t n);
 
+    // n tokens were just removed from the warm tier without migration
+    // (e.g. seq_rm freed a position whose backup we held). Used by the
+    // wrapper when an evicted-to-warm position is explicitly deleted by
+    // upstream — symmetric to on_remove_hot.
+    void on_remove_warm(uint32_t n);
+
     // n tokens migrated from one tier to another. Updates both counters
     // and the per-direction migration counters.
     enum class Tier { Hot, Warm, Cold };

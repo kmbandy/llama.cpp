@@ -38,11 +38,11 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
     // (or that have no layers / no recurrent state) return an empty view —
     // the wrapper still functions as passthrough but tier movement is a
     // no-op for them.
-    const auto view = inner_->make_tier_view();
+    tier_view_ = inner_->make_tier_view();
     LLAMA_LOG_INFO("mt::llama_memory_tiered: tier view: attn_layers=%zu recur_seqs=%zu%s\n",
-                   view.attn_layers.size(),
-                   view.recur_seqs.size(),
-                   view.empty() ? " (not tierable; will run as passthrough)" : "");
+                   tier_view_.attn_layers.size(),
+                   tier_view_.recur_seqs.size(),
+                   tier_view_.empty() ? " (not tierable; will run as passthrough)" : "");
 }
 
 llama_memory_tiered::~llama_memory_tiered() {
@@ -55,6 +55,129 @@ llama_memory_tiered::~llama_memory_tiered() {
 // Phase 2d-pt: passthrough delegation. Each method forwards to inner_.
 // Tier-aware behaviour is added in subsequent sub-iterations.
 // ---------------------------------------------------------------------------
+
+// Lazy-allocate the warm-tier host staging buffer.
+//
+// Sizing: warm capacity tokens × Σ_layers(k_row_bytes + v_row_bytes).
+// For Qwen3.6-27B at ctx=8192 with warm=25%, 16 attn layers and ~2KB per
+// row this is ~16 MB — totally reasonable for host RAM. For 97B at ctx
+// 131072 this could climb into the GBs and we'd want pinned + paged
+// allocation; for now plain new uint8_t[].
+//
+// Returns false if the inner cache has no attention layers (recurrent-only
+// models — Phase 2d-recur will own those).
+bool llama_memory_tiered::ensure_warm_staging() {
+    if (warm_initialized_) return true;
+
+    if (tier_view_.attn_layers.empty()) {
+        if (!no_attn_warned_) {
+            LLAMA_LOG_WARN("mt::llama_memory_tiered: no attention layers in tier view; "
+                           "hot->warm eviction is a no-op for this model "
+                           "(recurrent-only models are handled in Phase 2d-recur)\n");
+            no_attn_warned_ = true;
+        }
+        return false;
+    }
+
+    warm_capacity_ = capacity_.warm_capacity();
+    if (warm_capacity_ == 0) {
+        LLAMA_LOG_WARN("mt::llama_memory_tiered: warm_capacity=0; eviction disabled\n");
+        return false;
+    }
+
+    // Compute per-layer offsets. Layout: each layer's slab is a K block
+    // (warm_cap * k_row_bytes) followed by a V block (warm_cap * v_row_bytes).
+    warm_layer_off_.resize(tier_view_.attn_layers.size());
+    warm_layer_v_off_.resize(tier_view_.attn_layers.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < tier_view_.attn_layers.size(); ++i) {
+        const auto & a = tier_view_.attn_layers[i];
+        warm_layer_off_[i]   = cursor;
+        warm_layer_v_off_[i] = cursor + (size_t) warm_capacity_ * a.k_row_bytes;
+        cursor              += (size_t) warm_capacity_ * (a.k_row_bytes + a.v_row_bytes);
+    }
+    warm_buf_.assign(cursor, 0);
+
+    warm_free_slots_.reserve(warm_capacity_);
+    for (uint32_t s = warm_capacity_; s-- > 0; ) {
+        warm_free_slots_.push_back((int) s);
+    }
+
+    LLAMA_LOG_INFO("mt::llama_memory_tiered: warm staging: capacity=%u tokens, "
+                   "buffer=%.1f MiB across %zu layers\n",
+                   warm_capacity_, (double) warm_buf_.size() / (1024.0 * 1024.0),
+                   tier_view_.attn_layers.size());
+
+    warm_initialized_ = true;
+    return true;
+}
+
+// Migrate up to n victim positions from hot to warm. Returns count moved.
+//
+// Only positions NOT already in warm are eligible. Eviction order is
+// determined by the configured policy (LRU / LFU / Attention / Hybrid).
+// On success, capacity_ migration counters are bumped and warm_pos_to_slot_
+// is updated. The inner cache is NOT seq_rm'd — this is a backup-style
+// eviction; the hot copy stays valid until the upstream lifecycle frees it
+// (via context shift or explicit seq_rm). Future restoration support
+// (2d-evict-restore) will rely on warm_pos_to_slot_ to find the backup
+// data when seq_rm fires.
+uint32_t llama_memory_tiered::evict_hot_to_warm(uint32_t n) {
+    if (n == 0) return 0;
+    if (!ensure_warm_staging()) return 0;
+
+    // Ask the policy for more candidates than we need so we can skip
+    // already-evicted ones without a second policy pass.
+    const uint32_t over_request = n + (uint32_t) evicted_to_warm_.size();
+    auto candidates = eviction_.get_eviction_candidates(cfg_.eviction, over_request);
+
+    uint32_t moved = 0;
+    for (auto pos : candidates) {
+        if (moved >= n) break;
+        if (warm_free_slots_.empty()) {
+            // Warm tier full. 2d-evict-cold will spill to KvtcStore here.
+            LLAMA_LOG_DEBUG("mt::llama_memory_tiered: warm full at %u; deferring "
+                            "spill until 2d-evict-cold lands\n", warm_capacity_);
+            break;
+        }
+        if (evicted_to_warm_.count(pos)) continue;
+
+        const int slot = warm_free_slots_.back();
+        warm_free_slots_.pop_back();
+
+        bool ok = true;
+        for (size_t li = 0; li < tier_view_.attn_layers.size(); ++li) {
+            const auto & layer = tier_view_.attn_layers[li];
+            uint8_t * k_dst = warm_buf_.data() + warm_layer_off_[li]
+                              + (size_t) slot * layer.k_row_bytes;
+            uint8_t * v_dst = warm_buf_.data() + warm_layer_v_off_[li]
+                              + (size_t) slot * layer.v_row_bytes;
+            ok = ok && mover_attn_.evict_k(layer, pos, k_dst);
+            ok = ok && mover_attn_.evict_v(layer, pos, v_dst);
+            if (!ok) break;
+        }
+
+        if (ok) {
+            warm_pos_to_slot_.emplace(pos, (uint32_t) slot);
+            evicted_to_warm_.insert(pos);
+            ++moved;
+        } else {
+            // mover failed — return the slot. (HIP error already logged.)
+            warm_free_slots_.push_back(slot);
+        }
+    }
+
+    if (moved > 0) {
+        capacity_.on_migrate(moved, TierCapacityManager::Tier::Hot,
+                                    TierCapacityManager::Tier::Warm);
+        LLAMA_LOG_INFO("mt::llama_memory_tiered: evicted %u tokens hot->warm "
+                       "(warm now %u/%u)\n",
+                       moved, warm_capacity_ - (uint32_t) warm_free_slots_.size(),
+                       warm_capacity_);
+    }
+
+    return moved;
+}
 
 // Resync our tier bookkeeping from inner_'s ground truth.
 //
@@ -74,11 +197,13 @@ void llama_memory_tiered::update_tier_state() {
         const uint32_t n = (uint32_t)(hi - lo + 1);
         total += n;
 
-        // Add positions to the eviction store. add() is idempotent on
-        // the position key, so re-adding is a no-op. record_access()
-        // bumps the LRU/LFU counters so the policy can score these.
+        // Record accesses for positions still resident in hot. Skip
+        // ones we've already moved to warm — re-adding would put them
+        // back in the eviction policy's candidate pool and we'd churn.
         for (llama_pos p = lo; p <= hi; ++p) {
-            eviction_.record_access(p);
+            if (evicted_to_warm_.count(p) == 0) {
+                eviction_.record_access(p);
+            }
         }
     }
 
@@ -88,12 +213,17 @@ void llama_memory_tiered::update_tier_state() {
     if (now_pressured && !pressure_announced_) {
         const auto stats = capacity_.snapshot();
         LLAMA_LOG_WARN("mt::llama_memory_tiered: hot pressure reached "
-                       "(hot=%u cap=%u recommended_evict=%u) — eviction not yet implemented in 2d-evict-meta\n",
+                       "(hot=%u cap=%u recommended_evict=%u)\n",
                        stats.hot_tokens, capacity_.hot_capacity(),
                        capacity_.recommended_evict_count());
         pressure_announced_ = true;
     } else if (!now_pressured && pressure_announced_) {
         pressure_announced_ = false;  // re-arm; next flip-on logs again
+    }
+
+    if (now_pressured) {
+        const uint32_t want = capacity_.recommended_evict_count();
+        if (want > 0) evict_hot_to_warm(want);
     }
 }
 
@@ -137,6 +267,16 @@ void llama_memory_tiered::clear(bool data) {
     eviction_.clear();
     semantic_.clear();
     pressure_announced_ = false;
+    warm_pos_to_slot_.clear();
+    evicted_to_warm_.clear();
+    if (warm_initialized_) {
+        // Refill the free-slot stack to its full warm capacity.
+        warm_free_slots_.clear();
+        warm_free_slots_.reserve(warm_capacity_);
+        for (uint32_t s = warm_capacity_; s-- > 0; ) {
+            warm_free_slots_.push_back((int) s);
+        }
+    }
     // Note: KvtcStore is NOT cleared on clear() — its file persists for
     // the run. clear() corresponds to seq_rm-everything, not shutdown.
 }
@@ -145,12 +285,19 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!inner_) return false;
     const bool ok = inner_->seq_rm(seq_id, p0, p1);
     if (ok) {
-        // Drop the removed positions from the eviction store; resync hot
-        // count from inner state to absorb any whole-seq reshuffling
-        // (seq_rm with p0=-1 wipes the whole seq).
+        // Drop the removed positions from the eviction store and the
+        // warm tier. seq_rm with p0=-1 wipes the whole seq — the
+        // resync at the end picks up that case.
         if (p0 >= 0 && p1 > p0) {
             for (llama_pos p = p0; p < p1; ++p) {
                 eviction_.remove(p);
+                auto it = warm_pos_to_slot_.find(p);
+                if (it != warm_pos_to_slot_.end()) {
+                    warm_free_slots_.push_back((int) it->second);
+                    warm_pos_to_slot_.erase(it);
+                    evicted_to_warm_.erase(p);
+                    capacity_.on_remove_warm(1);
+                }
             }
         }
         update_tier_state();

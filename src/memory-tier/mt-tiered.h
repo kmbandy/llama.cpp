@@ -34,6 +34,9 @@
 #include "llama-memory.h"
 
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace mt {
 
@@ -102,6 +105,19 @@ private:
     // a one-shot message when hot_pressure() flips from off to on.
     void update_tier_state();
 
+    // Allocate the warm-tier host staging buffer the first time it's
+    // needed. Sized for warm_capacity tokens × Σ(k_row + v_row) over
+    // all attention layers, populated from the cached tier view.
+    // Returns false if there are no attention layers to back up
+    // (recurrent-only models — handled in 2d-recur).
+    bool ensure_warm_staging();
+
+    // Migrate up to `n` victim positions from hot tier to warm staging.
+    // Picks victims via eviction_.get_eviction_candidates filtered to
+    // positions not already in evicted_to_warm_. Returns the count
+    // actually moved.
+    uint32_t evict_hot_to_warm(uint32_t n);
+
     llama_memory_ptr      inner_;
     TieredConfig          cfg_;
     uint32_t              n_seq_max_;
@@ -113,8 +129,28 @@ private:
     KvtcStore             store_;
     SemanticIndex         semantic_;
 
+    // Cached tier view captured at construction. Pointers stay stable
+    // for the lifetime of inner_ — see mt-inner-access.h.
+    InnerView             tier_view_;
+
+    // Warm-tier host staging. Lazily allocated on first eviction.
+    // Per-attn-layer base offsets:
+    //   warm_buf_[layer_off_[i]] ... + warm_cap * k_row_bytes_[i]   = K slab
+    //   ... + warm_cap * v_row_bytes_[i]                            = V slab
+    std::vector<uint8_t>  warm_buf_;
+    std::vector<size_t>   warm_layer_off_;   // byte offset of layer i's K slab
+    std::vector<size_t>   warm_layer_v_off_; // byte offset of layer i's V slab within layer
+    uint32_t              warm_capacity_ = 0;
+    bool                  warm_initialized_ = false;
+
+    // pos -> slot index for positions currently in warm
+    std::unordered_map<llama_pos, uint32_t> warm_pos_to_slot_;
+    std::vector<int>                        warm_free_slots_;  // stack
+    std::unordered_set<llama_pos>           evicted_to_warm_;  // = key set of warm_pos_to_slot_, kept for fast O(1) skip in update_tier_state
+
     bool                  store_initialized_  = false;
     bool                  pressure_announced_ = false;  // edge-trigger for hot_pressure logging
+    bool                  no_attn_warned_     = false;  // one-shot: "no attn layers, can't migrate"
 };
 
 }  // namespace mt
