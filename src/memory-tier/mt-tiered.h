@@ -43,7 +43,12 @@ class llama_memory_tiered : public llama_memory_i {
 public:
     // Take ownership of the inner cache. The wrapper's lifetime is the
     // outer model's; inner_ is destroyed when the wrapper is.
-    explicit llama_memory_tiered(llama_memory_ptr inner, const TieredConfig & cfg);
+    //
+    // n_seq_max sets the upper bound for the seq_id polling loop used by
+    // capacity tracking. Pass cparams.n_seq_max from the dispatch site.
+    explicit llama_memory_tiered(llama_memory_ptr     inner,
+                                 const TieredConfig & cfg,
+                                 uint32_t             n_seq_max);
     ~llama_memory_tiered() override;
 
     llama_memory_tiered(const llama_memory_tiered &)             = delete;
@@ -91,8 +96,15 @@ public:
     RecurrentStateMover & mover_recur()     { return mover_recur_; }
 
 private:
+    // Poll inner_->seq_pos_min / seq_pos_max across 0..n_seq_max_, sum
+    // active token counts, push the result into capacity_, and refresh
+    // eviction_ position metadata for any newly observed tokens. Logs
+    // a one-shot message when hot_pressure() flips from off to on.
+    void update_tier_state();
+
     llama_memory_ptr      inner_;
     TieredConfig          cfg_;
+    uint32_t              n_seq_max_;
 
     TierCapacityManager   capacity_;
     TokenMetadataStore    eviction_;
@@ -101,7 +113,8 @@ private:
     KvtcStore             store_;
     SemanticIndex         semantic_;
 
-    bool                  store_initialized_ = false;
+    bool                  store_initialized_  = false;
+    bool                  pressure_announced_ = false;  // edge-trigger for hot_pressure logging
 };
 
 }  // namespace mt

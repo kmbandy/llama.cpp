@@ -8652,7 +8652,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         tcfg.semantic_top_k      = params.kv_tier_semantic_topk;
 
         res = new mt::llama_memory_tiered(
-                std::unique_ptr<llama_memory_i>(res), tcfg);
+                std::unique_ptr<llama_memory_i>(res), tcfg, cparams.n_seq_max);
     }
 
     return res;

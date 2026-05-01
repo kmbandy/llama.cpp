@@ -34,6 +34,12 @@ void TierCapacityManager::on_remove_hot(uint32_t n) {
     s_.hot_tokens = (n >= s_.hot_tokens) ? 0 : (s_.hot_tokens - n);
 }
 
+void TierCapacityManager::set_hot_tokens(uint32_t n) {
+    std::lock_guard<std::mutex> lk(mu_);
+    s_.hot_tokens     = n;
+    s_.hot_high_water = std::max(s_.hot_high_water, s_.hot_tokens);
+}
+
 void TierCapacityManager::on_migrate(uint32_t n, Tier from, Tier to) {
     if (n == 0 || from == to) return;
     std::lock_guard<std::mutex> lk(mu_);

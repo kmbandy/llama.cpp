@@ -50,6 +50,11 @@ public:
     // (e.g. context shift / seq erase). Use on_migrate for tier moves.
     void on_remove_hot(uint32_t n);
 
+    // Set the hot-tier count to an absolute value (e.g. resync from
+    // the inner cache's seq state). Updates high-water mark. Does not
+    // touch warm/cold counters or migration totals.
+    void set_hot_tokens(uint32_t n);
+
     // n tokens migrated from one tier to another. Updates both counters
     // and the per-direction migration counters.
     enum class Tier { Hot, Warm, Cold };
