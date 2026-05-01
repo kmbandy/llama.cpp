@@ -11,6 +11,10 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-weight-pager.h"
+#include "weight-pager/wp-pager.h"
+#include "weight-pager/wp-file-io.h"
+
+#include <cstdlib>  // strtol
 
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
@@ -44,141 +48,174 @@
 // Weight pager initialization helper
 //
 
+// Parse a HIP/CUDA backend device name like "ROCm0" / "ROCm1" / "CUDA0" /
+// "CUDA1" into the integer device index. Returns -1 if the name doesn't
+// match the expected pattern.
+static int parse_backend_dev_idx(const char * dev_name) {
+    if (dev_name == nullptr) return -1;
+    // Skip any leading non-digit characters.
+    const char * p = dev_name;
+    while (*p != '\0' && (*p < '0' || *p > '9')) ++p;
+    if (*p == '\0') return -1;
+    char * end = nullptr;
+    long v = std::strtol(p, &end, 10);
+    if (end == p) return -1;
+    return (int) v;
+}
+
 static bool init_weight_pager(llama_model & model, llama_model_loader & ml, const llama_model_params & params) {
     if (!params.weight_paging_enabled) {
         return true;
     }
-
     if (ml.weight_page_infos.empty()) {
         LLAMA_LOG_WARN("%s: weight paging enabled but no weight page info available\n", __func__);
         return true;
     }
 
-    LLAMA_LOG_INFO("%s: initializing weight pager with %zu pages\n", __func__, ml.weight_page_infos.size());
+    LLAMA_LOG_INFO("%s: initializing weight pager with %zu pages\n",
+                   __func__, ml.weight_page_infos.size());
 
-    // Create the weight pager if not already created (it may have been created early to allow
-    // load_tensors to collect tensor pointers into it before pool init)
+    // The legacy llama_weight_pager is created in llama_model_load before
+    // load_tensors so the latter can populate weight_tensor_ptrs. We only
+    // use that vector here — the legacy pager's pool/io_uring paths are
+    // not invoked.
     if (!model.weight_pager) {
-        model.weight_pager = std::make_unique<llama_weight_pager>();
+        throw std::runtime_error("weight pager: legacy weight_pager carrier not initialised before init_weight_pager (caller bug)");
+    }
+    if (model.weight_pager->weight_tensor_ptrs.empty()) {
+        LLAMA_LOG_WARN("%s: no weight tensor pointers collected — nothing to page\n", __func__);
+        return true;
     }
 
-    // Initialize the page table with weight tensor info
-    size_t max_weight_size = 0;
-    for (const auto & info : ml.weight_page_infos) {
-        llama_weight_page page;
-        page.tensor_name = info.name;
-        page.file_idx    = info.file_idx;
-        page.file_offset = info.offset;
-        page.size = info.size;
-        model.weight_pager->pages.push_back(page);
-        model.weight_pager->name_to_page[info.name] = (int(model.weight_pager->pages.size()) - 1);
-        if (info.size > max_weight_size) {
-            max_weight_size = info.size;
+    // 1. Validate single-device + pick the buft for the pool.
+    //
+    //    Weight tensors themselves have buffer == NULL when paging is on
+    //    (allocator skips them on purpose; see llama-model.cpp ~7995).
+    //    load_tensors records the distinct bufts that own paged weights
+    //    in weight_pager->weight_bufts. Phase 1 is single-device by
+    //    design (B-P7).
+    if (model.weight_pager->weight_bufts.empty()) {
+        throw std::runtime_error("weight pager: no buffer types collected for paged weights (load_tensors integration bug?)");
+    }
+    if (model.weight_pager->weight_bufts.size() > 1) {
+        std::string names;
+        for (size_t i = 0; i < model.weight_pager->weight_bufts.size(); ++i) {
+            if (i > 0) names += ", ";
+            names += ggml_backend_buft_name(model.weight_pager->weight_bufts[i]);
         }
+        throw std::runtime_error(format(
+            "weight pager: paged weights span multiple devices (%s); "
+            "weight paging requires a single device. Run with one device "
+            "(e.g. --device ROCm0) or without --weight-paging.",
+            names.c_str()));
+    }
+    ggml_backend_buffer_type_t buft = model.weight_pager->weight_bufts.front();
+
+    // 2. Resolve the integer device index. We need it for hipSetDevice
+    //    inside the GpuTransport. The dev name encodes it, e.g. "ROCm0".
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        throw std::runtime_error("weight pager: ggml_backend_buft_get_device returned null");
+    }
+    const int device_idx = parse_backend_dev_idx(ggml_backend_dev_name(dev));
+    if (device_idx < 0) {
+        throw std::runtime_error(format(
+            "weight pager: could not parse device index from name '%s'",
+            ggml_backend_dev_name(dev)));
+    }
+    LLAMA_LOG_INFO("%s: paged weights on device %d (%s)\n",
+                   __func__, device_idx, ggml_backend_dev_name(dev));
+
+    // 3. Build the new pager: catalog + init.
+    model.wp_pager = std::make_unique<wp::WeightPager>();
+    for (const auto & info : ml.weight_page_infos) {
+        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size);
     }
 
-    // Determine number of slots
+    // 4. Determine number of slots: user override or auto = layer count,
+    //    capped to fit in free VRAM with a 3 GiB headroom.
     int n_slots = params.weight_paging_slots;
     if (n_slots <= 0) {
-        // Auto: use the number of layers as default
-        n_slots = (int)model.hparams.n_layer;
-        if (n_slots <= 0) {
-            n_slots = 32; // fallback
-        }
+        n_slots = (int) model.hparams.n_layer;
+        if (n_slots <= 0) n_slots = 32;
     }
-
-    // Query free VRAM before allocating the pool
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
     {
         size_t free_vram = 0, total_vram = 0;
         hipMemGetInfo(&free_vram, &total_vram);
-        LLAMA_LOG_INFO("%s: VRAM: %zu MiB free / %zu MiB total\n",
-                       __func__, free_vram / (1024*1024), total_vram / (1024*1024));
-        // Leave headroom for KV cache, compute buffers
-        const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;
-        const size_t usable = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
-        int n_slots_fit = (max_weight_size > 0) ? (int)(usable / max_weight_size) : 0;
-        if (n_slots_fit < 1) {
-            n_slots_fit = 1; // always try at least 1
+        const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
+        const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
+
+        // We need max_page_size for the slot stride. Compute it on the fly.
+        size_t max_page_size = 0;
+        for (const auto & info : ml.weight_page_infos) {
+            if (info.size > max_page_size) max_page_size = info.size;
         }
-        if (n_slots > n_slots_fit) {
-            LLAMA_LOG_WARN("%s: capping slots %d → %d to fit in available VRAM (%zu MiB free, %zu MiB/slot)\n",
+        const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
+        if (n_slots > n_slots_fit && n_slots_fit >= 1) {
+            LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
+                           "(%zu MiB free, %zu MiB/slot)\n",
                            __func__, n_slots, n_slots_fit,
-                           free_vram / (1024*1024), max_weight_size / (1024*1024));
+                           free_vram / (1024 * 1024), max_page_size / (1024 * 1024));
             n_slots = n_slots_fit;
         }
+        if (n_slots < 1) n_slots = 1;
     }
 #endif
 
-    LLAMA_LOG_INFO("%s: initializing VRAM pool with %d slots (%zu MiB each = %zu MiB total)\n",
-                   __func__, n_slots, max_weight_size / (1024*1024),
-                   (size_t)n_slots * max_weight_size / (1024*1024));
-
-    // Initialize the VRAM pool
-    LLAMA_LOG_INFO("%s: calling init_pool with slot_size=%zu n_slots=%d\n",
-                   __func__, max_weight_size, n_slots);
-    if (!model.weight_pager->init_pool(max_weight_size, n_slots)) {
-        LLAMA_LOG_ERROR("%s: init_pool returned false\n", __func__);
-        throw std::runtime_error(format(
-            "weight pager: VRAM pool allocation failed "
-            "(%d slots x %zu MiB = %zu MiB required). "
-            "Try reducing --weight-paging-slots.",
-            n_slots,
-            max_weight_size / (1024*1024),
-            (size_t)n_slots * max_weight_size / (1024*1024)));
+    // 5. Prepare fds — dup + clear O_DIRECT (B-P3).
+    std::vector<int> fds;
+    fds.reserve(ml.files.size());
+    for (const auto & f : ml.files) {
+        int fd = wp::dup_clear_o_direct(f->file_id());
+        if (fd >= 0) {
+            fds.push_back(fd);
+        } else {
+            LLAMA_LOG_WARN("%s: dup_clear_o_direct failed for file %d\n", __func__, f->file_id());
+        }
     }
-    LLAMA_LOG_INFO("%s: init_pool succeeded\n", __func__);
+    if (fds.empty()) {
+        model.wp_pager.reset();
+        throw std::runtime_error("weight pager: no usable file descriptors");
+    }
 
-    // Set a placeholder data pointer on all weight tensors so the graph allocator
-    // skips them (it checks tensor->data != NULL to determine if allocation is needed).
-    // The eval callback will overwrite tensor->data with the correct VRAM slot before each kernel.
-    // Use the actual model tensor pointers collected during load_tensors, not the GGUF metadata tensors.
+    // 6. Initialise. Single-device guard: the discovery loop above
+    //    confirms one buft, so we pass {device_idx} as devices_used.
+    wp::WeightPager::Config cfg;
+    cfg.n_slots         = n_slots;
+    cfg.prefetch_depth  = 4;
+    cfg.prefer_async_io = params.weight_paging_prefetch;
+
+    if (!model.wp_pager->init(cfg, buft, device_idx,
+                              std::move(fds),
+                              /*devices_used=*/{device_idx})) {
+        model.wp_pager.reset();
+        throw std::runtime_error(format(
+            "weight pager: wp::WeightPager::init failed (device=%d, n_slots=%d)",
+            device_idx, n_slots));
+    }
+
+    // 7. Set placeholder data on every paged tensor so the graph allocator
+    //    skips them. The eval callback overwrites with the real VRAM slot
+    //    pointer before each op. Use a non-null sentinel — the buffer-type
+    //    pointer itself is convenient and definitely non-null.
     {
-        void * placeholder = model.weight_pager->pool.base;
+        void * placeholder = (void *) buft;
+        size_t n_placed    = 0;
         for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
             if (t && t->data == nullptr) {
-                t->data = placeholder;
-                // Also clear the buffer so the allocator skips this tensor
+                t->data   = placeholder;
                 t->buffer = nullptr;
+                ++n_placed;
             }
         }
-        LLAMA_LOG_INFO("%s: set placeholder data pointers on %zu weight tensors\n",
-                       __func__, model.weight_pager->weight_tensor_ptrs.size());
+        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors\n",
+                       __func__, n_placed);
     }
 
-    // Always dup model file descriptors — page_in uses pread regardless of prefetch.
-    // Clear O_DIRECT on the dup'd fds: GGUF tensor offsets are not sector-aligned,
-    // so O_DIRECT would silently read from a rounded-down offset on some filesystems.
-    if (!ml.files.empty()) {
-        for (const auto & f : ml.files) {
-            int fd = dup(f->file_id());
-#ifdef O_DIRECT
-            int fl = fcntl(fd, F_GETFL);
-            if (fl != -1 && (fl & O_DIRECT)) fcntl(fd, F_SETFL, fl & ~O_DIRECT);
-#endif
-            model.weight_pager->fds.push_back(fd);
-        }
-    }
-
-#ifdef LLAMA_HAVE_IO_URING
-    // Enable async prefetch via io_uring only when explicitly requested.
-    model.weight_pager->async_prefetch = params.weight_paging_prefetch;
-
-    if (params.weight_paging_prefetch && !model.weight_pager->fds.empty()) {
-        int fd = model.weight_pager->fds[0];
-        if (fd >= 0) {
-            if (model.weight_pager->init_io_uring(64)) {
-                LLAMA_LOG_INFO("%s: io_uring initialized for async prefetch\n", __func__);
-            } else {
-                LLAMA_LOG_WARN("%s: failed to initialize io_uring, disabling async prefetch\n", __func__);
-                model.weight_pager->async_prefetch = false;
-            }
-        }
-    }
-#endif
-
-    LLAMA_LOG_INFO("%s: weight pager initialized\n", __func__);
-
+    LLAMA_LOG_INFO("%s: weight pager ready (device=%d, n_slots=%d, prefetch=%s)\n",
+                   __func__, device_idx, n_slots,
+                   cfg.prefer_async_io ? "async" : "sync");
     return true;
 }
 

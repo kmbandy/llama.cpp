@@ -9,6 +9,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-weight-pager.h"
+#include "weight-pager/wp-pager.h"
+#include "weight-pager/wp-eval-cb.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -1200,14 +1202,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
         
-        // Use weight pager callback if model has weight_pager enabled
-        if (model.weight_pager) {
-            // hipGraph bakes tensor->data pointers at capture time; our eval callback
-            // changes tensor->data dynamically, so graphs must be disabled.
-            setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
-            ggml_backend_sched_set_eval_callback(sched.get(), weight_pager_eval_cb, model.weight_pager.get());
+        // Use the new wp::WeightPager eval callback when paging is enabled.
+        // Note: GGML_CUDA_DISABLE_GRAPHS is now managed by wp::WeightPager
+        // itself (RAII over init/shutdown — fixes B-P5 env-var leak), so
+        // we no longer setenv here.
+        if (model.wp_pager) {
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                wp::weight_pager_eval_cb, model.wp_pager.get());
         } else {
-            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                cparams.cb_eval, cparams.cb_eval_user_data);
         }
 
         //const auto t_start_us = ggml_time_us();

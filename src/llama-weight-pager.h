@@ -70,6 +70,12 @@ struct llama_weight_pager {
     std::vector<llama_weight_page> pages;  // one per weight tensor
     std::unordered_map<std::string, int> name_to_page;  // tensor_name -> page index
     std::vector<ggml_tensor*> weight_tensor_ptrs;  // actual model tensor pointers
+    // Distinct buffer types that own at least one paged weight tensor.
+    // Populated by load_tensors during the page-collection loop because
+    // weight tensors themselves have buffer == NULL when paging is on
+    // (they're skipped by the allocator on purpose). Read by the new
+    // wp::WeightPager init path to enforce the single-device guard (B-P7).
+    std::vector<struct ggml_backend_buffer_type *> weight_bufts;
     uint64_t                 tick = 0;
 
 #ifdef LLAMA_HAVE_IO_URING

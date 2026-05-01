@@ -8,6 +8,8 @@
 #include "llama-vocab.h"
 #include "llama-weight-pager.h"
 
+namespace wp { class WeightPager; }
+
 #include <map>
 #include <memory>
 #include <string>
@@ -572,8 +574,18 @@ struct llama_model {
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
-    // weight paging for NVMe→VRAM demand paging
+    // weight paging for NVMe→VRAM demand paging.
+    //
+    // - `weight_pager` (legacy): kept only as the carrier for
+    //   weight_tensor_ptrs which load_tensors populates. The legacy code
+    //   inside it is dormant — its init_pool/io_uring paths are not
+    //   exercised. Phase 2.0 will delete the type entirely once nothing
+    //   in load_tensors needs it.
+    // - `wp_pager` (new): the actual pager. Populated and init'd by
+    //   init_weight_pager in llama.cpp. The eval callback on the
+    //   scheduler points at wp::weight_pager_eval_cb.
     std::unique_ptr<llama_weight_pager> weight_pager;
+    std::unique_ptr<wp::WeightPager>    wp_pager;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

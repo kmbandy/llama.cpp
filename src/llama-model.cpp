@@ -14,6 +14,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "weight-pager/wp-pager.h"  // complete type for unique_ptr<wp::WeightPager> dtor
+
 #include "models/models.h"
 
 #include "ggml.h"
@@ -8062,6 +8064,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // Populate weight page info for the pager before load_all_data is conditionally skipped
     if (params.weight_paging_enabled) {
         for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            // Determine the buft this ctx is bound to. Weight tensors have
+            // buffer == NULL when paging is enabled (the allocator skips
+            // them — see lines ~7995). The dummy buffer assigned to
+            // non-weight tensors in the same ctx carries the buft, so
+            // that's our handle on which device this ctx targets.
+            ggml_backend_buffer_type_t ctx_buft = nullptr;
+            for (const auto & [_, buf] : buf_map) {
+                if (buf != nullptr) {
+                    ctx_buft = ggml_backend_buffer_get_type(buf);
+                    break;
+                }
+            }
+
+            bool ctx_has_weights = false;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 const auto * weight = ml.get_weight(ggml_get_name(t));
                 if (!weight) { continue; }
@@ -8074,6 +8090,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 // Collect the actual model tensor pointer for the weight pager
                 if (weight_pager) {
                     weight_pager->weight_tensor_ptrs.push_back(t);
+                }
+                ctx_has_weights = true;
+            }
+
+            // Record the buft once per ctx that owns weight tensors.
+            // De-dupe so the multi-device guard reads a clean set.
+            if (ctx_has_weights && ctx_buft != nullptr && weight_pager) {
+                bool seen = false;
+                for (auto * existing : weight_pager->weight_bufts) {
+                    if (existing == ctx_buft) { seen = true; break; }
+                }
+                if (!seen) {
+                    weight_pager->weight_bufts.push_back(ctx_buft);
                 }
             }
         }
