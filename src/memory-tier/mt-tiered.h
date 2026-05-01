@@ -112,11 +112,15 @@ private:
     // (recurrent-only models — handled in 2d-recur).
     bool ensure_warm_staging();
 
-    // Migrate up to `n` victim positions from hot tier to warm staging.
-    // Picks victims via eviction_.get_eviction_candidates filtered to
-    // positions not already in evicted_to_warm_. Returns the count
-    // actually moved.
-    uint32_t evict_hot_to_warm(uint32_t n);
+    // Back up positions [p0, p1) of seq_id from hot to warm before
+    // upstream's seq_rm frees them. Refreshes the cell snapshot to map
+    // each position to its current slot, copies K/V from every non-SWA
+    // attention cache via AttentionMover, and records the position->slot
+    // mapping in warm_pos_to_slot_ so the future restore path can find
+    // the backup data. Returns the count actually backed up. Skips
+    // positions already in warm (e.g. seq_rm called twice on the same
+    // range — second call is a no-op).
+    uint32_t backup_seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
     llama_memory_ptr      inner_;
     TieredConfig          cfg_;

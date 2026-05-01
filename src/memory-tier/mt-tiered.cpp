@@ -131,82 +131,125 @@ bool llama_memory_tiered::ensure_warm_staging() {
     return true;
 }
 
-// Migrate up to n victim positions from hot to warm. Returns count moved.
+// Back up positions [p0, p1) of seq_id from hot to warm. Driven by
+// seq_rm: upstream is about to delete those positions, so this is the
+// last chance to capture their K/V data for later restoration.
 //
-// Only positions NOT already in warm are eligible. Eviction order is
-// determined by the configured policy (LRU / LFU / Attention / Hybrid).
-// On success, capacity_ migration counters are bumped and warm_pos_to_slot_
-// is updated. The inner cache is NOT seq_rm'd — this is a backup-style
-// eviction; the hot copy stays valid until the upstream lifecycle frees it
-// (via context shift or explicit seq_rm). Future restoration support
-// (2d-evict-restore) will rely on warm_pos_to_slot_ to find the backup
-// data when seq_rm fires.
-uint32_t llama_memory_tiered::evict_hot_to_warm(uint32_t n) {
-    if (n == 0) return 0;
+// Slot lookup uses a freshly snapshotted InnerView (the cell layout
+// changes as the cache evolves; the cached tier_view_ from construction
+// has stale cells). We re-snapshot per call — cheap relative to the
+// hipMemcpy work that follows.
+//
+// SWA caches are skipped: their distance mask hides any restored
+// position older than n_swa back from the head, so backing them up
+// would be wasted work.
+uint32_t llama_memory_tiered::backup_seq_rm_range(llama_seq_id seq_id,
+                                                   llama_pos    p0,
+                                                   llama_pos    p1) {
+    if (!inner_ || p0 < 0 || p1 <= p0) return 0;
     if (!ensure_warm_staging()) return 0;
 
-    // Ask the policy for more candidates than we need so we can skip
-    // already-evicted ones without a second policy pass.
-    const uint32_t over_request = n + (uint32_t) evicted_to_warm_.size();
-    auto candidates = eviction_.get_eviction_candidates(cfg_.eviction, over_request);
+    // Fresh cell snapshot. We only need the cell occupancy maps; the
+    // K/V tensor pointers in tier_view_ are stable for the cache's
+    // lifetime, so we keep using those.
+    const auto fresh = inner_->make_tier_view();
 
-    uint32_t moved = 0;
-    for (auto pos : candidates) {
-        if (moved >= n) break;
-        if (warm_free_slots_.empty()) {
-            // Warm tier full. 2d-evict-cold will spill to KvtcStore here.
-            LLAMA_LOG_DEBUG("mt::llama_memory_tiered: warm full at %u; deferring "
-                            "spill until 2d-evict-cold lands\n", warm_capacity_);
-            break;
-        }
-        if (evicted_to_warm_.count(pos)) continue;
-
-        const int slot = warm_free_slots_.back();
-        warm_free_slots_.pop_back();
-
-        bool ok = true;
-        size_t flat_idx = 0;
-        for (const auto & c : tier_view_.attn_caches) {
-            if (c.is_swa) continue;
-            for (const auto & layer : c.layers) {
-                uint8_t * k_dst = warm_buf_.data() + warm_layer_off_[flat_idx]
-                                  + (size_t) slot * layer.k_row_bytes;
-                uint8_t * v_dst = warm_buf_.data() + warm_layer_v_off_[flat_idx]
-                                  + (size_t) slot * layer.v_row_bytes;
-                // NOTE: this still passes `pos` as the slot index — that's
-                // wrong on rotating-window layouts. 2d-evict-restore-bk
-                // (next commit) replaces this with a proper position->slot
-                // mapping using cache.cells. For now this matches the
-                // pre-restructure behaviour so this commit is no-behavior-
-                // change.
-                ok = ok && mover_attn_.evict_k(layer, pos, k_dst);
-                ok = ok && mover_attn_.evict_v(layer, pos, v_dst);
-                if (!ok) goto eviction_failed;
-                ++flat_idx;
-            }
-        }
-eviction_failed:;
-
-        if (ok) {
-            warm_pos_to_slot_.emplace(pos, (uint32_t) slot);
-            evicted_to_warm_.insert(pos);
-            ++moved;
-        } else {
-            // mover failed — return the slot. (HIP error already logged.)
-            warm_free_slots_.push_back(slot);
-        }
+    // Pair restorable caches in tier_view_ (which has K/V pointers and
+    // matched warm_layer_off_) with their corresponding fresh cell
+    // snapshot. Indices line up because both views walk the same
+    // make_tier_view dispatch path; we assert that defensively.
+    if (fresh.attn_caches.size() != tier_view_.attn_caches.size()) {
+        LLAMA_LOG_WARN("mt::backup_seq_rm_range: cache topology changed (%zu->%zu); "
+                       "skipping backup to avoid mis-mapped slots\n",
+                       tier_view_.attn_caches.size(), fresh.attn_caches.size());
+        return 0;
     }
 
-    if (moved > 0) {
-        capacity_.on_migrate(moved, TierCapacityManager::Tier::Hot,
-                                    TierCapacityManager::Tier::Warm);
-        LLAMA_LOG_INFO("mt::llama_memory_tiered: evicted %u tokens hot->warm "
-                       "(warm now %u/%u)\n",
-                       moved, warm_capacity_ - (uint32_t) warm_free_slots_.size(),
+    uint32_t backed_up = 0;
+    size_t flat_layer_idx = 0;
+
+    for (size_t ci = 0; ci < tier_view_.attn_caches.size(); ++ci) {
+        const auto & cache_view = tier_view_.attn_caches[ci];
+        const auto & cells      = fresh.attn_caches[ci].cells;
+
+        if (cache_view.is_swa) {
+            // Layers in this cache aren't in warm staging — flat_layer_idx
+            // doesn't advance.
+            continue;
+        }
+
+        // Find slots whose (pos, seq_id) match the seq_rm range.
+        // O(kv_size) per call — acceptable; kv_size is typically <= ctx
+        // and seq_rm is a control-plane event not a hot loop.
+        for (uint32_t slot = 0; slot < cells.size(); ++slot) {
+            const auto & cs = cells[slot];
+            if (cs.pos < p0 || cs.pos >= p1) continue;
+            if (cs.seq_id != seq_id) continue;
+
+            // Skip if we've already backed this position up.
+            if (evicted_to_warm_.count(cs.pos)) continue;
+
+            if (warm_free_slots_.empty()) {
+                LLAMA_LOG_DEBUG("mt::backup_seq_rm_range: warm full at %u; "
+                                "remaining positions in this seq_rm will be lost "
+                                "(2d-evict-cold will spill warm to SSD)\n",
+                                warm_capacity_);
+                goto warm_full;
+            }
+
+            const int warm_slot = warm_free_slots_.back();
+            warm_free_slots_.pop_back();
+
+            // Copy this slot's K/V across every layer in this cache.
+            bool ok = true;
+            size_t layer_idx_in_warm = flat_layer_idx;
+            for (const auto & layer : cache_view.layers) {
+                uint8_t * k_dst = warm_buf_.data()
+                                  + warm_layer_off_[layer_idx_in_warm]
+                                  + (size_t) warm_slot * layer.k_row_bytes;
+                uint8_t * v_dst = warm_buf_.data()
+                                  + warm_layer_v_off_[layer_idx_in_warm]
+                                  + (size_t) warm_slot * layer.v_row_bytes;
+                if (!mover_attn_.evict_k(layer, slot, k_dst) ||
+                    !mover_attn_.evict_v(layer, slot, v_dst)) {
+                    ok = false;
+                    break;
+                }
+                ++layer_idx_in_warm;
+            }
+
+            if (ok) {
+                warm_pos_to_slot_.emplace(cs.pos, (uint32_t) warm_slot);
+                evicted_to_warm_.insert(cs.pos);
+                ++backed_up;
+            } else {
+                warm_free_slots_.push_back(warm_slot);
+                LLAMA_LOG_WARN("mt::backup_seq_rm_range: mover failed at slot %u "
+                               "(pos %d); aborting this seq_rm's backup\n",
+                               slot, cs.pos);
+                goto mover_failed;
+            }
+        }
+
+        // Advance flat_layer_idx by the number of layers we just iterated.
+        flat_layer_idx += cache_view.layers.size();
+    }
+
+warm_full:
+mover_failed:
+
+    if (backed_up > 0) {
+        capacity_.on_migrate(backed_up,
+                             TierCapacityManager::Tier::Hot,
+                             TierCapacityManager::Tier::Warm);
+        LLAMA_LOG_INFO("mt::backup_seq_rm_range: seq=%d range=[%d,%d) "
+                       "backed up %u positions (warm now %u/%u)\n",
+                       seq_id, p0, p1, backed_up,
+                       warm_capacity_ - (uint32_t) warm_free_slots_.size(),
                        warm_capacity_);
     }
 
-    return moved;
+    return backed_up;
 }
 
 // Resync our tier bookkeeping from inner_'s ground truth.
@@ -239,21 +282,23 @@ void llama_memory_tiered::update_tier_state() {
 
     capacity_.set_hot_tokens(total);
 
+    // Pressure logging is now informational only — the actual eviction
+    // trigger has moved to seq_rm-time (see backup_seq_rm_range). This
+    // matches what tier KV can actually do under llama.cpp's existing
+    // graph contract: capture data when upstream is about to delete it,
+    // restore on demand. Pressure-poll-triggered eviction would require
+    // freeing hot slots without upstream knowing, which would either
+    // strand attention reads or require graph changes per architecture.
     const bool now_pressured = capacity_.hot_pressure();
     if (now_pressured && !pressure_announced_) {
         const auto stats = capacity_.snapshot();
-        LLAMA_LOG_WARN("mt::llama_memory_tiered: hot pressure reached "
-                       "(hot=%u cap=%u recommended_evict=%u)\n",
-                       stats.hot_tokens, capacity_.hot_capacity(),
-                       capacity_.recommended_evict_count());
+        LLAMA_LOG_INFO("mt::llama_memory_tiered: hot pressure reached "
+                       "(hot=%u cap=%u) — eviction fires on next seq_rm in "
+                       "this range\n",
+                       stats.hot_tokens, capacity_.hot_capacity());
         pressure_announced_ = true;
     } else if (!now_pressured && pressure_announced_) {
-        pressure_announced_ = false;  // re-arm; next flip-on logs again
-    }
-
-    if (now_pressured) {
-        const uint32_t want = capacity_.recommended_evict_count();
-        if (want > 0) evict_hot_to_warm(want);
+        pressure_announced_ = false;
     }
 }
 
@@ -313,21 +358,33 @@ void llama_memory_tiered::clear(bool data) {
 
 bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (!inner_) return false;
+
+    // Tier backup: capture K/V for positions [p0, p1) BEFORE delegating
+    // to the inner cache. After inner_->seq_rm the slots are reusable
+    // and reading from them returns whatever the next batch wrote.
+    //
+    // p0 < 0 / p1 < 0 are sentinels meaning "from the beginning" /
+    // "to the end". We don't try to resolve those into concrete bounds
+    // for backup — those wholesale-wipe calls are typically clear/reset
+    // events where restoration isn't useful, and computing concrete
+    // bounds requires polling the inner. Skip backup for sentinels;
+    // capture happens for explicit ranges only (which is what context
+    // shift produces).
+    if (p0 >= 0 && p1 > p0) {
+        backup_seq_rm_range(seq_id, p0, p1);
+    }
+
     const bool ok = inner_->seq_rm(seq_id, p0, p1);
     if (ok) {
-        // Drop the removed positions from the eviction store and the
-        // warm tier. seq_rm with p0=-1 wipes the whole seq — the
-        // resync at the end picks up that case.
+        // Drop the removed positions from the eviction store. We keep
+        // the warm copies — those are now the only source of truth for
+        // restoration. (warm_pos_to_slot_ is unchanged here; we only
+        // free a warm slot when the warm copy itself becomes obsolete,
+        // e.g. via clear() or when the same position is re-added then
+        // re-removed.)
         if (p0 >= 0 && p1 > p0) {
             for (llama_pos p = p0; p < p1; ++p) {
                 eviction_.remove(p);
-                auto it = warm_pos_to_slot_.find(p);
-                if (it != warm_pos_to_slot_.end()) {
-                    warm_free_slots_.push_back((int) it->second);
-                    warm_pos_to_slot_.erase(it);
-                    evicted_to_warm_.erase(p);
-                    capacity_.on_remove_warm(1);
-                }
             }
         }
         update_tier_state();
