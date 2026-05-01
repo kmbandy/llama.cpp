@@ -146,6 +146,16 @@ private:
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).
     bool        env_was_present_ = false;
     std::string env_prior_value_;
+
+    // Shared pinned staging buffer for page_in_sync_. Allocated once at
+    // init, sized to max_page_size, reused across every sync page-in.
+    // Pinning a fresh buffer per call (the original design) costs
+    // hundreds of ms per allocation for hundred-MB tensors and dominates
+    // the paging path for dense layers. Single shared buffer matches
+    // the OLD pager's pool.pinned_staging behaviour.
+    void * sync_staging_       = nullptr;
+    size_t sync_staging_size_  = 0;
+    bool   sync_staging_pinned_ = false;  // true if hipHostMalloc, false if malloc fallback
 };
 
 }  // namespace wp

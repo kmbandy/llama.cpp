@@ -159,11 +159,40 @@ bool WeightPager::init(const Config &             cfg,
     page_loaded_.assign((size_t)  catalog_.size(), false);
     slot_to_page_.assign((size_t) cfg_.n_slots,    -1);
 
+    // 6. Shared sync staging buffer (max_page_size pinned host). Allocated
+    //    ONCE here so page_in_sync_ doesn't pay hipHostMalloc latency per
+    //    call. For a 540 MB token-embed tensor that's ~10+ seconds saved
+    //    per access.
+    sync_staging_size_ = slot_size;
+    sync_staging_      = nullptr;
+#if defined(GGML_USE_HIP)
+    if (hipHostMalloc(&sync_staging_, sync_staging_size_, hipHostMallocDefault) == hipSuccess) {
+        sync_staging_pinned_ = true;
+    } else {
+        LLAMA_LOG_WARN("wp::WeightPager: hipHostMalloc(%zu) for shared sync staging failed; falling back to malloc\n",
+                       sync_staging_size_);
+        sync_staging_        = std::malloc(sync_staging_size_);
+        sync_staging_pinned_ = false;
+    }
+#else
+    sync_staging_ = std::malloc(sync_staging_size_);
+#endif
+    if (sync_staging_ == nullptr) {
+        LLAMA_LOG_ERROR("wp::WeightPager::init: shared sync staging allocation failed\n");
+        prefetch_.shutdown();
+        file_io_.reset();
+        transport_.shutdown();
+        pool_.~PoolAllocator();
+        new (&pool_) PoolAllocator{};
+        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        return false;
+    }
+
     initialized_ = true;
-    LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d\n",
+    LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d\n",
                    catalog_.size(), cfg_.n_slots, slot_size,
                    (double) cfg_.n_slots * (double) slot_size / 1048576.0,
-                   cfg_.prefetch_depth);
+                   cfg_.prefetch_depth, (int) sync_staging_pinned_);
     return true;
 }
 
@@ -183,6 +212,20 @@ void WeightPager::shutdown() {
     prefetch_.shutdown();
     file_io_.reset();
     transport_.shutdown();
+    if (sync_staging_ != nullptr) {
+#if defined(GGML_USE_HIP)
+        if (sync_staging_pinned_) {
+            hipHostFree(sync_staging_);
+        } else {
+            std::free(sync_staging_);
+        }
+#else
+        std::free(sync_staging_);
+#endif
+        sync_staging_       = nullptr;
+        sync_staging_size_  = 0;
+        sync_staging_pinned_ = false;
+    }
     // PoolAllocator dtor frees the ggml buffer.
     pool_.~PoolAllocator();
     new (&pool_) PoolAllocator{};
@@ -288,24 +331,30 @@ int WeightPager::page_in_sync_(int page_idx) {
     // FileIOLayer (sync if iouring, but pinned still helps DMA on async),
     // then hands off to GpuTransport for the H2D + padding zero.
 
+    static int s_diag_count = 0;
+    const bool diag = (s_diag_count < 5);
+    if (diag) {
+        const PageMeta & dm = catalog_.at(page_idx);
+        LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: ENTER page=%d name=%s file_idx=%u offset=%lu size=%zu\n",
+                        s_diag_count, page_idx, dm.tensor_name.c_str(),
+                        (unsigned) dm.file_idx, (unsigned long) dm.file_offset, dm.size);
+    }
+
     const int slot = pool_.alloc_slot();
     if (slot < 0) return -1;
     void * dst = slot_ptr_(slot);
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: alloc_slot ok, slot=%d dst=%p\n", s_diag_count, slot, dst);
 
     const PageMeta & m = catalog_.at(page_idx);
 
-    // Use the prefetch scheduler's slabs would be racy; instead, since the
-    // synchronous path is for single-shot misses, allocate a one-off pinned
-    // staging buffer. Cheap relative to the I/O.
-    void * staging = nullptr;
-#if defined(GGML_USE_HIP)
-    if (hipHostMalloc(&staging, m.size, hipHostMallocDefault) != hipSuccess) {
-        staging = std::malloc(m.size);  // fallback
-    }
-#else
-    staging = std::malloc(m.size);
-#endif
-    if (staging == nullptr) {
+    // Use the shared pinned staging buffer allocated at init time. Pinning
+    // a fresh buffer per call costs hundreds of ms for hundred-MB tensors
+    // and would dominate the paging path; the shared buffer is sized to
+    // max_page_size so any individual page fits.
+    void * staging = sync_staging_;
+    if (staging == nullptr || m.size > sync_staging_size_) {
+        LLAMA_LOG_ERROR("wp::WeightPager::page_in_sync_: page %d size %zu exceeds shared staging size %zu\n",
+                        page_idx, m.size, sync_staging_size_);
         pool_.release_slot(slot);
         return -1;
     }
@@ -313,9 +362,12 @@ int WeightPager::page_in_sync_(int page_idx) {
     // Stage 1: blocking read into staging via the file IO layer.
     const uint64_t req_id = (uint64_t) -1;  // synthetic; not pipelined
     bool ok = file_io_->submit(req_id, (int) m.file_idx, m.file_offset, m.size, staging);
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: submit returned ok=%d\n", s_diag_count, (int)ok);
     if (ok) file_io_->flush();
     while (ok) {
         IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
+        if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: wait_any returned req_id=%lu status=%d bytes=%d\n",
+                                  s_diag_count, (unsigned long) r.req_id, (int) r.status, r.bytes_read);
         if (r.req_id == req_id) {
             ok = (r.status == IoStatus::Ok && r.bytes_read == (int) m.size);
             break;
@@ -323,41 +375,32 @@ int WeightPager::page_in_sync_(int page_idx) {
         // Unrelated completion (could be a stale prefetch). Drop it; the
         // prefetch path treats unknown req_ids as no-ops in process_io_.
     }
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage1 done ok=%d\n", s_diag_count, (int)ok);
     if (!ok) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: file IO failed for page %d\n", page_idx);
-#if defined(GGML_USE_HIP)
-        if (hipHostFree(staging) != hipSuccess) std::free(staging);
-#else
-        std::free(staging);
-#endif
         pool_.release_slot(slot);
         return -1;
     }
 
     // Stage 2: H2D + padding zero, blocking.
     int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size());
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
     if (evt < 0 || !transport_.synchronize(evt)) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: gpu stage_in failed for page %d\n", page_idx);
         if (evt >= 0) transport_.release_event(evt);
-#if defined(GGML_USE_HIP)
-        if (hipHostFree(staging) != hipSuccess) std::free(staging);
-#else
-        std::free(staging);
-#endif
         pool_.release_slot(slot);
         return -1;
     }
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: synchronize ok\n", s_diag_count);
     transport_.release_event(evt);
 
-#if defined(GGML_USE_HIP)
-    if (hipHostFree(staging) != hipSuccess) std::free(staging);
-#else
-    std::free(staging);
-#endif
+    // Shared sync_staging_ is owned by the WeightPager; no per-call free.
 
     page_to_slot_[page_idx] = slot;
     page_loaded_[page_idx]  = true;
     slot_to_page_[slot]     = page_idx;
+    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT slot=%d\n", s_diag_count, slot);
+    ++s_diag_count;
     return slot;
 }
 
