@@ -55,21 +55,28 @@ struct AttentionLayerView {
 // Some hybrid architectures only have one of these; absent ones are
 // represented by null pointers in the corresponding entry.
 //
+// Storage model: r and s tensors are 2D `[n_embd_X, n_seqs]` (or 3D
+// equivalent). One sequence's slice starts at `tensor->data + seq_slot
+// * nb[1]` and is `nb[1]` bytes long. The view carries the slot index
+// and per-seq byte size so the mover can compute offsets without
+// re-walking ggml metadata.
+//
 // Migration unit is the WHOLE sequence's r+s across all recurrent
 // layers. Per-layer pointers are exposed so the mover can copy without
 // extra abstraction overhead.
 struct RecurrentStateView {
-    llama_seq_id seq_id = 0;
-    // Per-layer r tensors. layers[i] is the i-th recurrent layer in the
-    // model; layers[i].r may be null if this layer doesn't have an r
-    // state (rare; SSM-only).
+    llama_seq_id seq_id    = 0;
+    int          seq_slot  = -1;  // index into the [n_embd_X, n_seqs] tensors
     struct Layer {
-        ggml_tensor * r = nullptr;
-        ggml_tensor * s = nullptr;
+        ggml_tensor * r              = nullptr;
+        size_t        r_bytes_per_seq = 0;  // == r->nb[1] for a 2D [n_embd_r, n_seqs] tensor
+        ggml_tensor * s              = nullptr;
+        size_t        s_bytes_per_seq = 0;
     };
     std::vector<Layer> layers;
-    // Total bytes-per-sequence for r and s respectively. The mover uses
-    // these to size warm/cold buffers without re-walking the layer list.
+    // Total bytes-per-sequence for r and s respectively, summed across
+    // layers. The mover uses these to size warm/cold buffers without
+    // re-walking the layer list.
     size_t r_bytes_total = 0;
     size_t s_bytes_total = 0;
 };
