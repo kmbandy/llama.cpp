@@ -1325,79 +1325,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    // Phase 0.3 stub-out: tiered KV flags accepted but inert. The tier
+    // subsystem is being rewritten (see /home/kmbandy/.claude/plans/proud-stargazing-engelbart.md
+    // and docs/dev/memory-tier-bug-catalog.md). Each handler logs a one-shot
+    // warning and does NOT set kv_tiered_enabled, so no tier code is reached
+    // at runtime. Re-enabled by Phase 2.
     add_opt(common_arg(
         {"--kv-tiered"}, "VRAM%,RAM%,SSD%",
-        "enable tiered KV cache with percentages for VRAM, RAM, SSD (e.g., 25,25,50 for 25% VRAM, 25% RAM, 50% SSD)",
-        [](common_params & params, const std::string & value) {
-            params.kv_tiered_enabled = true;
-            // Parse the percentage string
-            std::vector<std::string> parts;
-            std::stringstream ss(value);
-            std::string part;
-            while (std::getline(ss, part, ',')) {
-                parts.push_back(part);
-            }
-            if (parts.size() == 3) {
-                params.kv_tier_hot_pct = std::stof(parts[0]);
-                params.kv_tier_warm_pct = std::stof(parts[1]);
-                params.kv_tier_cold_pct = std::stof(parts[2]);
-            }
+        "[REWRITE IN PROGRESS] tiered KV cache disabled in Phase 0.3 stub-out; flag accepted, inert",
+        [](common_params & /*params*/, const std::string & /*value*/) {
+            LOG_WRN("--kv-tiered: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub). See docs/dev/memory-tier-bug-catalog.md\n");
         }
     ).set_env("LLAMA_ARG_KT_TIERED").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tier-ssd-path"}, "PATH",
-        "directory for cold tier (SSD) storage",
-        [](common_params & params, const std::string & value) {
-            params.kv_tier_ssd_path = value;
+        "[REWRITE IN PROGRESS] directory for cold tier (inert in Phase 0.3)",
+        [](common_params & /*params*/, const std::string & /*value*/) {
+            LOG_WRN("--tier-ssd-path: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_TIER_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tier-eviction-policy"}, "POLICY",
-        "eviction policy: 0=LRU, 1=LFU, 2=attention, 3=hybrid (default)",
-        [](common_params & params, int value) {
-            params.kv_tier_eviction_policy = value;
+        "[REWRITE IN PROGRESS] eviction policy (inert in Phase 0.3)",
+        [](common_params & /*params*/, int /*value*/) {
+            LOG_WRN("--tier-eviction-policy: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_TIER_EVICTION_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tier-compression"}, "TYPE",
-        "compression type: 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized",
-        [](common_params & params, int value) {
-            params.kv_tier_compression = value;
+        "[REWRITE IN PROGRESS] compression type (inert in Phase 0.3)",
+        [](common_params & /*params*/, int /*value*/) {
+            LOG_WRN("--tier-compression: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_TIER_COMPRESSION").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--tier-attention-threshold"}, "THRESH",
-        "attention threshold for eviction (0.0-1.0, default: 0.1)",
-        [](common_params & params, int value) {
-            params.kv_tier_attention_threshold = float(value) / 100.0f;
+        "[REWRITE IN PROGRESS] attention threshold for eviction (inert in Phase 0.3)",
+        [](common_params & /*params*/, int /*value*/) {
+            LOG_WRN("--tier-attention-threshold: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_TIER_ATTENTION_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kv-warm-device"}, "DEVICE",
-        "HIP device index to use as warm KV cache tier (e.g. 1 for 6900XT eGPU); requires --kv-tiered",
-        [](common_params & params, int value) {
-            params.kv_warm_device = value;
+        "[REWRITE IN PROGRESS] warm KV tier device (inert in Phase 0.3)",
+        [](common_params & /*params*/, int /*value*/) {
+            LOG_WRN("--kv-warm-device: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kv-semantic-index"}, "PATH",
-        "path to embedding model (GGUF) for semantic KV cache indexing (e.g. bge-small); empty = disabled",
-        [](common_params & params, const std::string & value) {
-            params.kv_semantic_index = value;
+        "[REWRITE IN PROGRESS] semantic embedding model (inert in Phase 0.3)",
+        [](common_params & /*params*/, const std::string & /*value*/) {
+            LOG_WRN("--kv-semantic-index: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_KV_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kv-semantic-threshold"}, "THRESHOLD",
-        "minimum cosine similarity threshold for semantic prefetch hints (default: 0.65)",
-        [](common_params & params, const std::string & value) {
-            params.kv_semantic_threshold = std::stof(value);
+        "[REWRITE IN PROGRESS] semantic similarity threshold (inert in Phase 0.3)",
+        [](common_params & /*params*/, const std::string & /*value*/) {
+            LOG_WRN("--kv-semantic-threshold: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_KV_SEMANTIC_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--kv-semantic-topk"}, "K",
-        "number of prefetch hints to return (default: 5)",
-        [](common_params & params, int value) {
-            params.kv_semantic_top_k = value;
+        "[REWRITE IN PROGRESS] semantic prefetch hints (inert in Phase 0.3)",
+        [](common_params & /*params*/, int /*value*/) {
+            LOG_WRN("--kv-semantic-topk: tiered KV is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_env("LLAMA_ARG_KV_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -2417,25 +2410,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
+    // Phase 0.3 stub-out: weight paging flags accepted but inert. Pager being
+    // rewritten (Phase 1). Handlers do NOT set weight_paging_enabled, so init
+    // never invokes the pager. Re-enabled by Phase 1 exit.
     add_opt(common_arg(
         {"--weight-paging"},
-        "enable NVMe→VRAM demand paging for model weights (allows models larger than VRAM)",
-        [](common_params & params) {
-            params.weight_paging_enabled = true;
+        "[REWRITE IN PROGRESS] NVMe→VRAM weight paging disabled in Phase 0.3 stub-out",
+        [](common_params & /*params*/) {
+            LOG_WRN("--weight-paging: pager is being rewritten and is inert in this build (Phase 0.3 stub). See docs/dev/memory-tier-bug-catalog.md\n");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
     add_opt(common_arg(
         {"--weight-paging-slots"}, "N",
-        "number of VRAM slots for weight paging (-1 = auto, default: -1)",
-        [](common_params & params, const std::string & value) {
-            params.weight_paging_slots = std::stoi(value);
+        "[REWRITE IN PROGRESS] pager slot count (inert in Phase 0.3)",
+        [](common_params & /*params*/, const std::string & /*value*/) {
+            LOG_WRN("--weight-paging-slots: pager is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
     add_opt(common_arg(
         {"--weight-paging-prefetch"},
-        "enable async prefetch of next layer (default: enabled)",
-        [](common_params & params) {
-            params.weight_paging_prefetch = true;
+        "[REWRITE IN PROGRESS] pager async prefetch (inert in Phase 0.3)",
+        [](common_params & /*params*/) {
+            LOG_WRN("--weight-paging-prefetch: pager is being rewritten and is inert in this build (Phase 0.3 stub).\n");
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));
     add_opt(common_arg(
