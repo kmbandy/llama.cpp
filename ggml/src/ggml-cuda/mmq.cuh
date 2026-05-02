@@ -3545,7 +3545,8 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx,
+        const void * const * __restrict__ expert_ptrs) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3625,11 +3626,24 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        // Routing-aware weight paging hook (MAD-88). When expert_ptrs is
+        // non-null, the per-expert weight base comes from the array rather
+        // than (x + channel_idx*stride_channel_x). The path with
+        // expert_ptrs == nullptr is bit-identical to the pre-MAD-88 code.
+        const int channel_idx = fastdiv(zt, channel_ratio);
+        const char * x_for_channel;
+        int offset_x;
+        if (expert_ptrs != nullptr) {
+            x_for_channel = (const char *) expert_ptrs[channel_idx];
+            offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*mmq_y*stride_row_x;
+        } else {
+            x_for_channel = x;
+            offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_idx*stride_channel_x + it*mmq_y*stride_row_x;
+        }
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x_for_channel, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
@@ -3705,11 +3719,22 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+        // Routing-aware weight paging hook (MAD-88) — see comment in the
+        // non-stream-k branch above.
+        const int channel_idx = fastdiv(zt, channel_ratio);
+        const char * x_for_channel;
+        int offset_x;
+        if (expert_ptrs != nullptr) {
+            x_for_channel = (const char *) expert_ptrs[channel_idx];
+            offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*mmq_y*stride_row_x;
+        } else {
+            x_for_channel = x;
+            offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_idx*stride_channel_x + it*mmq_y*stride_row_x;
+        }
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x_for_channel, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00.z;
@@ -3774,11 +3799,22 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
     const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
+    // Routing-aware weight paging hook (MAD-88) — see comment in the
+    // non-stream-k branch above.
+    const int channel_idx_tail = fastdiv(zt, channel_ratio);
+    const char * x_for_channel_tail;
+    int offset_x;
+    if (expert_ptrs != nullptr) {
+        x_for_channel_tail = (const char *) expert_ptrs[channel_idx_tail];
+        offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*mmq_y*stride_row_x;
+    } else {
+        x_for_channel_tail = x;
+        offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_idx_tail*stride_channel_x + it*mmq_y*stride_row_x;
+    }
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        (x_for_channel_tail, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
@@ -3927,6 +3963,12 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
+    // Optional per-expert weight pointer array for routing-aware weight
+    // paging on consolidated MoE (MAD-88). When non-null, the kernel reads
+    // weights for channel (== expert index) `c` from expert_ptrs[c] instead
+    // of (x + c * stride_channel_x). Length must be >= nchannels_x.
+    // nullptr (default) preserves existing behavior identically.
+    const void * const * expert_ptrs = nullptr;
 };
 
 template<ggml_type type>
@@ -3980,7 +4022,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.expert_ptrs);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -3988,7 +4030,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd);
+                 ntx_fd, args.expert_ptrs);
         }
         return;
     }
@@ -4020,7 +4062,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.expert_ptrs);
 
         if (!fixup_needed) {
             return;
@@ -4038,7 +4080,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.expert_ptrs);
 
         if (!fixup_needed) {
             return;
