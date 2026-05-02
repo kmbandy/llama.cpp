@@ -3,6 +3,32 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+namespace {
+// Thread-local side channel for routing-aware MMQ on consolidated MoE
+// (MAD-88 Phase 2). The weight-pager eval callback sets this just
+// before a MUL_MAT_ID op runs, supplying a device-resident array of
+// per-expert weight pointers. ggml_cuda_mul_mat_q reads it via
+// take_routed_expert_ptrs() (which clears it) and threads it into the
+// mmq_args struct.
+//
+// Lifetime: the caller (eval cb) owns the array memory and guarantees
+// it stays valid until the kernel completes. Single-shot — the
+// dispatcher clears it after read, so a missed-set or a pure
+// MUL_MAT (no MoE) op uses the default nullptr (legacy path,
+// bit-identical to pre-MAD-88).
+thread_local const void * const * tls_routed_expert_ptrs = nullptr;
+}  // namespace
+
+void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr) {
+    tls_routed_expert_ptrs = ptr;
+}
+
+const void * const * ggml_cuda_take_routed_expert_ptrs() {
+    const void * const * p = tls_routed_expert_ptrs;
+    tls_routed_expert_ptrs = nullptr;
+    return p;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -124,6 +150,11 @@ void ggml_cuda_mul_mat_q(
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
+    // Pull any routing-aware expert pointer array set by the weight-pager
+    // eval callback. take_*() clears the TLS, so this op consumes it
+    // exactly once. nullptr (default) is the legacy bit-identical path.
+    const void * const * routed_expert_ptrs = ggml_cuda_take_routed_expert_ptrs();
+
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
@@ -151,12 +182,13 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
-        const mmq_args args = {
+        mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1};
+        args.expert_ptrs = routed_expert_ptrs;
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -212,12 +244,13 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};
+    args.expert_ptrs = routed_expert_ptrs;
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

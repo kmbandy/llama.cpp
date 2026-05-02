@@ -4216,3 +4216,11 @@ void ggml_cuda_op_mul_mat_q(
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
+// Routing-aware MMQ side channel (MAD-88). Set the per-expert weight
+// pointer array just before a MUL_MAT_ID op runs; the dispatcher reads
+// and clears it on the next ggml_cuda_mul_mat_q invocation. The caller
+// owns the pointer-array memory and guarantees it stays valid until
+// the kernel completes.
+void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+const void * const *  ggml_cuda_take_routed_expert_ptrs();
+
