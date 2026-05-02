@@ -182,6 +182,11 @@ endif()
 if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_NUMBER ${LLAMA_BUILD_NUMBER})
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
+    # Enable rocWMMA FlashAttention by default in this fork. Validated on
+    # R9700 (gfx1201) + 6900XT (gfx1030): RDNA3+/CDNA paths use WMMA tensor
+    # cores; RDNA2 falls back cleanly via ggml_cuda_should_use_wmma_fattn at
+    # runtime. To disable, comment out this line or remove the FORCE.
+    set(GGML_HIP_ROCWMMA_FATTN ON CACHE BOOL "ggml: enable rocWMMA for FlashAttention (fork default ON)" FORCE)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
