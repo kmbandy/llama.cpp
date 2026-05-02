@@ -1008,15 +1008,22 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
         const char * buf_host = (const char *)data + offset_split;
         ggml_cuda_set_device(id);
 #if defined(GGML_USE_HIP)
-        // hipStreamPerThread is not per-device on ROCm 7.x: after hipSetDevice switches,
-        // the per-thread stream still belongs to the previous device, causing P2P faults
-        // on mixed-arch setups (gfx1201+gfx1030). Use an explicit stream created after
-        // hipSetDevice to guarantee the copy runs on the correct device DMA engine.
-        hipStream_t _hip_copy_stream;
-        CUDA_CHECK(hipStreamCreate(&_hip_copy_stream));
-        CUDA_CHECK(hipMemcpyAsync(extra->data_device[id], buf_host, original_size, hipMemcpyHostToDevice, _hip_copy_stream));
-        CUDA_CHECK(hipStreamSynchronize(_hip_copy_stream));
-        hipStreamDestroy(_hip_copy_stream);
+        // hipStreamPerThread is not per-device on ROCm 7.x: after hipSetDevice
+        // switches, the per-thread stream still belongs to the previous device,
+        // causing P2P faults on mixed-arch setups (gfx1201+gfx1030). Use an
+        // explicit per-device stream created lazily on first use and reused
+        // across calls — model load fires this loop ~once per weight tensor,
+        // and per-call hipStreamCreate/Destroy was ~10-20us overhead each.
+        // (Phase 3 I1 in the rewrite plan.)
+        static hipStream_t s_split_copy_streams[GGML_CUDA_MAX_DEVICES] = {};
+        static std::once_flag s_split_copy_flags[GGML_CUDA_MAX_DEVICES];
+        std::call_once(s_split_copy_flags[id], [id]() {
+            ggml_cuda_set_device(id);
+            CUDA_CHECK(hipStreamCreate(&s_split_copy_streams[id]));
+        });
+        const hipStream_t copy_stream = s_split_copy_streams[id];
+        CUDA_CHECK(hipMemcpyAsync(extra->data_device[id], buf_host, original_size, hipMemcpyHostToDevice, copy_stream));
+        CUDA_CHECK(hipStreamSynchronize(copy_stream));
 #else
         CUDA_CHECK(cudaMemcpyAsync(extra->data_device[id], buf_host, original_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
 #endif
@@ -1733,11 +1740,23 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
     }
 
     // No P2P: synchronous CPU staging avoids the ROCm mixed-ISA copy-kernel bug.
-    // The pinned buffer is cached across calls to avoid hipHostMalloc overhead at
-    // inference rates (alloc+free per token would dominate the copy cost).
-    static std::mutex s_staging_mtx;
-    static void *     s_staging_buf = nullptr;
-    static size_t     s_staging_cap = 0;
+    // 8-slab ring of pinned host buffers, each with its own mutex. Concurrent
+    // peer copies (e.g. in row-split matmul, where one src1 gets staged to
+    // every device) pick different slabs and don't serialize on a global lock.
+    // (Phase 3 I2 in the rewrite plan.)
+    //
+    // Async via hipMemcpy2DAsync was tried and made things worse on our
+    // hardware: caller's stream still has both ops queued in order, so the
+    // consuming op blocks the same way it did before — but now with extra
+    // event-sync overhead. Sync sticks until I3's full pipelining lands.
+    constexpr size_t kStagingSlabs = 8;
+    struct staging_slab {
+        std::mutex mtx;
+        void *     buf = nullptr;
+        size_t     cap = 0;
+    };
+    static staging_slab          s_slabs[kStagingSlabs];
+    static std::atomic<uint32_t> s_next_slab{0};
 
     hipStreamSynchronize(stream);
 
@@ -1745,21 +1764,24 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
     int saved_device;
     hipGetDevice(&saved_device);
 
-    std::lock_guard<std::mutex> lk(s_staging_mtx);
-    if (staging_size > s_staging_cap) {
-        if (s_staging_buf) { hipHostFree(s_staging_buf); s_staging_buf = nullptr; }
-        if (hipHostMalloc(&s_staging_buf, staging_size, hipHostMallocDefault) != hipSuccess) {
+    const uint32_t slab_idx = s_next_slab.fetch_add(1, std::memory_order_relaxed) % kStagingSlabs;
+    staging_slab & slab = s_slabs[slab_idx];
+
+    std::lock_guard<std::mutex> lk(slab.mtx);
+    if (staging_size > slab.cap) {
+        if (slab.buf) { hipHostFree(slab.buf); slab.buf = nullptr; }
+        if (hipHostMalloc(&slab.buf, staging_size, hipHostMallocDefault) != hipSuccess) {
             hipSetDevice(saved_device);
             return hipErrorOutOfMemory;
         }
-        s_staging_cap = staging_size;
+        slab.cap = staging_size;
     }
 
     hipSetDevice(srcDevice);
-    hipError_t err = hipMemcpy2D(s_staging_buf, width, src, spitch, width, height, hipMemcpyDeviceToHost);
+    hipError_t err = hipMemcpy2D(slab.buf, width, src, spitch, width, height, hipMemcpyDeviceToHost);
     if (err == hipSuccess) {
         hipSetDevice(dstDevice);
-        err = hipMemcpy2D(dst, dpitch, s_staging_buf, width, width, height, hipMemcpyHostToDevice);
+        err = hipMemcpy2D(dst, dpitch, slab.buf, width, width, height, hipMemcpyHostToDevice);
     }
     hipSetDevice(saved_device);
     return (err == hipSuccess) ? cudaSuccess : (cudaError_t)err;
