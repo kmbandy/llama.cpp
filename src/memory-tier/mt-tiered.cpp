@@ -493,6 +493,62 @@ void llama_memory_tiered::forget_warm(const std::vector<llama_pos> & positions) 
     }
 }
 
+// Back up the entire recurrent state for seq_id before upstream's
+// seq_rm wipes it. Migration unit is whole-sequence, not per-position
+// — recurrent state (Mamba/DeltaNet/RWKV/linear-attention) is an
+// accumulated function of all positions, so partial-range copies
+// don't make architectural sense. Driven by seq_rm hooks the same
+// way as the attention path.
+//
+// Per-seq host buffer layout matches RecurrentStateMover::evict_seq:
+//     [r tensors of all layers concatenated]
+//     [s tensors of all layers concatenated]
+//
+// For Qwen3.5-REAP-97B (36 recurrent layers) this is ~149 MiB per
+// seq. For most workloads only one or two seqs are active at once;
+// the buffer count is bounded by n_seq_max.
+bool llama_memory_tiered::backup_seq_rm_recurrent(llama_seq_id seq_id) {
+    if (!inner_) return false;
+
+    // Fresh view to find this seq's RecurrentStateView. Recurrent
+    // state moves around as seqs come and go; the cached tier_view_
+    // from ctor is stale.
+    const auto fresh = inner_->make_tier_view();
+    if (fresh.recur_seqs.empty()) return false;  // not a recurrent model
+
+    const RecurrentStateView * found = nullptr;
+    for (const auto & rs : fresh.recur_seqs) {
+        if (rs.seq_id == seq_id) {
+            found = &rs;
+            break;
+        }
+    }
+    if (!found) return false;  // seq has no active recurrent state
+
+    const size_t total = found->r_bytes_total + found->s_bytes_total;
+    if (total == 0) return false;
+
+    // Skip if we already have a backup for this seq from a prior
+    // wipe (forget_warm clears it; otherwise it's stale-but-present).
+    if (warm_recur_buf_.count(seq_id)) return false;
+
+    auto & buf = warm_recur_buf_[seq_id];
+    buf.assign(total, 0);
+    if (!mover_recur_.evict_seq(*found, buf.data())) {
+        warm_recur_buf_.erase(seq_id);
+        LLAMA_LOG_WARN("mt::backup_seq_rm_recurrent: mover failed for seq %d "
+                       "(%zu bytes); recurrent state will be lost\n",
+                       seq_id, total);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("mt::backup_seq_rm_recurrent: seq %d backed up "
+                   "(%.1f MiB across %zu layers)\n",
+                   seq_id, (double) total / (1024.0 * 1024.0),
+                   found->layers.size());
+    return true;
+}
+
 // Back up positions [p0, p1) of seq_id from hot to warm. Driven by
 // seq_rm: upstream is about to delete those positions, so this is the
 // last chance to capture their K/V data for later restoration.
@@ -711,6 +767,7 @@ void llama_memory_tiered::clear(bool data) {
     evicted_to_warm_.clear();
     warm_insertion_order_.clear();
     cold_positions_.clear();
+    warm_recur_buf_.clear();
     if (warm_initialized_) {
         // Refill the free-slot stack to its full warm capacity.
         warm_free_slots_.clear();
@@ -741,14 +798,21 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     // and reading from them returns whatever the next batch wrote.
     //
     // p0 < 0 / p1 < 0 are sentinels meaning "from the beginning" /
-    // "to the end". We don't try to resolve those into concrete bounds
-    // for backup — those wholesale-wipe calls are typically clear/reset
-    // events where restoration isn't useful, and computing concrete
-    // bounds requires polling the inner. Skip backup for sentinels;
-    // capture happens for explicit ranges only (which is what context
-    // shift produces).
+    // "to the end" (whole-seq wipe). For attention, those typically map
+    // to clear/reset events where per-position restoration isn't useful.
+    // For recurrent state the opposite is true — whole-seq wipes are
+    // exactly when per-seq state needs to be captured before it's lost.
     if (p0 >= 0 && p1 > p0) {
         backup_seq_rm_range(seq_id, p0, p1);
+    }
+
+    // Recurrent state: capture the seq's whole r+s state on whole-seq
+    // wipes (sentinel p0/p1) and on partial wipes that include the seq
+    // tail. The implementation conservatively backs up on every seq_rm
+    // call against this seq_id — it's idempotent (no-op when already
+    // backed up) and the cost is bounded by n_seq_max.
+    if (seq_id >= 0) {
+        backup_seq_rm_recurrent(seq_id);
     }
 
     const bool ok = inner_->seq_rm(seq_id, p0, p1);

@@ -202,6 +202,15 @@ private:
     // range — second call is a no-op).
     uint32_t backup_seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
+    // Back up the entire recurrent state for seq_id before upstream's
+    // seq_rm wipes it. Migration unit is whole-sequence (the state is
+    // an accumulated function of all positions so partial-range copies
+    // don't make sense). Stores a contiguous host buffer of r+s data
+    // keyed by seq_id in warm_recur_buf_. Returns true iff something
+    // was actually backed up (false when the model has no recurrent
+    // state, or the seq has no active state in the cache).
+    bool backup_seq_rm_recurrent(llama_seq_id seq_id);
+
     llama_memory_ptr      inner_;
     TieredConfig          cfg_;
     uint32_t              n_seq_max_;
@@ -242,6 +251,12 @@ private:
     // cold, never both. (load_one_from_cold removes from cold and adds
     // to warm; spill_one_to_cold does the inverse.)
     std::unordered_set<llama_pos>           cold_positions_;
+
+    // Per-seq recurrent state backups. Each entry is a contiguous host
+    // buffer holding the full r+s state (layout per RecurrentStateMover:
+    // all r layers concatenated, then all s layers). Sized to the seq's
+    // r_bytes_total + s_bytes_total at backup time.
+    std::unordered_map<llama_seq_id, std::vector<uint8_t>> warm_recur_buf_;
 
     bool                  store_initialized_  = false;
     bool                  pressure_announced_ = false;  // edge-trigger for hot_pressure logging
