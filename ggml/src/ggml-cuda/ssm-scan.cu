@@ -1,10 +1,21 @@
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
-#define USE_CUB
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#if !defined(GGML_USE_MUSA)
+#  if defined(GGML_USE_HIP)
+#    define USE_CUB
+#  elif CUDART_VERSION >= 11070
+#    define USE_CUB
+#  endif
+#endif
 
 #ifdef USE_CUB
-#include <cub/cub.cuh>
-using namespace cub;
+#  if defined(GGML_USE_HIP)
+// Granular includes — full hipcub.hpp pulls in amd_hip_fp8.h which conflicts
+// with our existing FP8 / internal namespace usage in ggml-cuda.
+#    include <hipcub/block/block_load.hpp>
+#    include <hipcub/block/block_store.hpp>
+namespace cub = hipcub;
+#  else
+#    include <cub/cub.cuh>
+#  endif
 #endif // USE_CUB
 
 #include "ssm-scan.cuh"
