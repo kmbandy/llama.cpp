@@ -1,8 +1,17 @@
 #include "mean.cuh"
 #include "reduce_rows.cuh"
 
+#if defined(GGML_USE_HIP)
+#  define GGML_CUDA_USE_CUB
+#endif
+
 #ifdef GGML_CUDA_USE_CUB
-#include <cub/cub.cuh>
+#  if defined(GGML_USE_HIP)
+#    include <hipcub/device/device_reduce.hpp>
+namespace cub = hipcub;
+#  else
+#    include <cub/cub.cuh>
+#  endif
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB
 

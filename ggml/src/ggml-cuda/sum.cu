@@ -1,8 +1,17 @@
 #include "sum.cuh"
 #include "sumrows.cuh"
 
+#if defined(GGML_USE_HIP)
+#  define GGML_CUDA_USE_CUB
+#endif
+
 #ifdef GGML_CUDA_USE_CUB
-#include <cub/cub.cuh>
+#  if defined(GGML_USE_HIP)
+#    include <hipcub/device/device_reduce.hpp>
+namespace cub = hipcub;
+#  else
+#    include <cub/cub.cuh>
+#  endif
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB
 
@@ -16,7 +25,6 @@ void sum_f32_cuda(ggml_cuda_pool & pool, const float * x, float * dst, const int
     DeviceReduce::Sum(tmp_alloc.ptr, tmp_size, x, dst, ne, stream);
 #else
     // Use (inefficient) sum_rows implementation as a fallback.
-    // For AMD there is rocPRIM which could be used as a drop-in replacement via hipcub but this would require C++11 -> C++14.
     sum_rows_f32_cuda(x, dst, ne, 1, stream);
     GGML_UNUSED(pool);
 #endif // GGML_CUDA_USE_CUB
