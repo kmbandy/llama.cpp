@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-tiered-cache.h"
 #include "../src/llama-model.h"
+#include "../src/memory-tier/mt-tiered.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2266,6 +2267,35 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                // mt:: tier semantic fingerprint: capture an embedding of the
+                // tokens about to be shifted out so a future query can
+                // semantically retrieve the chunk via restore_semantic. Fires
+                // only when --kv-tier-semantic-index is set AND the active
+                // memory is the tier wrapper. The wrapper's seq_rm-time
+                // attention K/V backup runs separately on the seq_rm call
+                // below; this just attaches the fingerprint to that backup.
+                if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
+                    if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
+                        const auto & toks = slot.prompt.tokens.get_text_tokens();
+                        const int hi = std::min<int>(n_keep + n_discard, (int) toks.size());
+                        if (n_keep >= 0 && hi > n_keep) {
+                            llama_tokens chunk(toks.begin() + n_keep, toks.begin() + hi);
+                            const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+                            const auto emb = mt_tier->embed_text(text);
+                            if (!emb.empty()) {
+                                std::vector<llama_pos> positions;
+                                positions.reserve(hi - n_keep);
+                                for (int i = n_keep; i < hi; ++i) positions.push_back((llama_pos) i);
+                                mt_tier->record_chunk_fingerprint(
+                                    std::move(positions), emb,
+                                    mt::SemanticIndex::Tier::Warm);
+                                SLT_INF(slot, "tier semantic: fingerprinted %d tokens (%zu-dim) for context shift\n",
+                                        hi - n_keep, emb.size());
+                            }
+                        }
+                    }
+                }
+
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
@@ -2424,6 +2454,40 @@ private:
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;
+                            }
+
+                            // mt:: tier semantic restore: BEFORE prefix-match,
+                            // try to pull any semantically-similar warm-tier
+                            // chunks back into hot. The restored content gets
+                            // tagged with its original positions, so when
+                            // get_common_prefix runs next it can extend its
+                            // match if the new prompt happens to overlap
+                            // with what was just restored. Fires only when
+                            // --kv-tier-semantic-index is set and the wrapper
+                            // is the active memory.
+                            if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
+                                if (!params_base.kv_semantic_index.empty() && !input_tokens.has_mtmd) {
+                                    // Embed the new prompt (or its leading window).
+                                    // bge-small caps at ~512 tokens; truncate the
+                                    // prompt to that for the query embedding.
+                                    const auto & qtoks = input_tokens.get_text_tokens();
+                                    const int q_max = std::min<int>(512, (int) qtoks.size());
+                                    if (q_max > 0) {
+                                        llama_tokens q(qtoks.begin(), qtoks.begin() + q_max);
+                                        const std::string qtext = common_detokenize(ctx, q, /*special=*/ false);
+                                        const auto qemb = mt_tier->embed_text(qtext);
+                                        if (!qemb.empty()) {
+                                            const uint32_t restored = mt_tier->restore_semantic(
+                                                slot.id, qemb,
+                                                params_base.kv_semantic_top_k,
+                                                params_base.kv_semantic_threshold);
+                                            if (restored > 0) {
+                                                SLT_INF(slot, "tier semantic: restored %u positions from warm via cosine search\n",
+                                                        restored);
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             if (slot.task->params.cache_prompt) {
