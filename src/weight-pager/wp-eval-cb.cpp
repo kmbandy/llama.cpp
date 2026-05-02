@@ -20,6 +20,8 @@ struct DebugState {
     int  patches_total     = 0;  // total src->data overwrites
     int  views_patched     = 0;  // of those, how many were view tensors
     int  ensures_failed    = 0;  // ensure() returned null
+    int  mmid_ops_seen     = 0;  // GGML_OP_MUL_MAT_ID ops total (ask=true)
+    int  mmid_consolidated = 0;  // of those, src[0] resolved to a consolidated parent
     static constexpr int kVerboseLimit = 8;  // log details for first N ops only
 };
 DebugState g_debug;
@@ -32,6 +34,43 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
+
+    // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
+    // source is a consolidated MoE parent. This is the entry point for
+    // routing-aware paging (MAD-88 Phase 2 part 2). Currently informational
+    // only — without the kernel-side scatter variant the per-expert paging
+    // can't replace the consolidated tensor read, so this just counts and
+    // reports what would be needed.
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        ++g_debug.mmid_ops_seen;
+        if (t->src[0] != nullptr) {
+            const int weight_page = pager->find_page(ggml_get_name(t->src[0]));
+            if (weight_page >= 0) {
+                const auto & meta = pager->page_meta(weight_page);
+                if (meta.is_consolidated) {
+                    ++g_debug.mmid_consolidated;
+                    // First few only — log the parent + how many sub-experts
+                    // it splits into so the kernel-side hookup can be wired.
+                    if (g_debug.mmid_consolidated <= 4) {
+                        // The sub-page indices are weight_page+1 .. weight_page+n_experts
+                        // (insertion order from add_consolidated_experts).
+                        // Walk forward to find how many sub-experts belong to this parent.
+                        int n_subs = 0;
+                        for (int i = weight_page + 1; i < pager->n_pages(); ++i) {
+                            const auto & sub = pager->page_meta(i);
+                            if (!sub.is_sub_expert || sub.parent_page_idx != weight_page) {
+                                break;
+                            }
+                            ++n_subs;
+                        }
+                        LLAMA_LOG_INFO("[wp::eval_cb] MUL_MAT_ID over consolidated tensor '%s' (parent=%d, %d sub-experts)\n",
+                                       ggml_get_name(t->src[0]),
+                                       weight_page, n_subs);
+                    }
+                }
+            }
+        }
+    }
 
     // Step 1: walk t->src[] and collect distinct paged-weight page indices.
     // A source counts as paged if either its own name or its view_src's
