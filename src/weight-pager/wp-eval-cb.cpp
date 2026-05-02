@@ -4,8 +4,17 @@
 #include "ggml.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
 
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime.h>
+// Forward decl of the ggml-cuda side channel — the actual symbol lives in
+// libggml-hip.so and we link against it. Avoids dragging the full
+// ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
+extern "C++" void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+#endif
+
 #include <cstdlib>       // getenv
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 
 namespace wp {
@@ -49,24 +58,111 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 const auto & meta = pager->page_meta(weight_page);
                 if (meta.is_consolidated) {
                     ++g_debug.mmid_consolidated;
-                    // First few only — log the parent + how many sub-experts
-                    // it splits into so the kernel-side hookup can be wired.
-                    if (g_debug.mmid_consolidated <= 4) {
-                        // The sub-page indices are weight_page+1 .. weight_page+n_experts
-                        // (insertion order from add_consolidated_experts).
-                        // Walk forward to find how many sub-experts belong to this parent.
-                        int n_subs = 0;
-                        for (int i = weight_page + 1; i < pager->n_pages(); ++i) {
-                            const auto & sub = pager->page_meta(i);
-                            if (!sub.is_sub_expert || sub.parent_page_idx != weight_page) {
-                                break;
-                            }
-                            ++n_subs;
+
+                    // Count sub-experts of this parent (contiguous insertion
+                    // order — see PageCatalog::add_consolidated_experts).
+                    int n_subs = 0;
+                    for (int i = weight_page + 1; i < pager->n_pages(); ++i) {
+                        const auto & sub = pager->page_meta(i);
+                        if (!sub.is_sub_expert || sub.parent_page_idx != weight_page) {
+                            break;
                         }
-                        LLAMA_LOG_INFO("[wp::eval_cb] MUL_MAT_ID over consolidated tensor '%s' (parent=%d, %d sub-experts)\n",
-                                       ggml_get_name(t->src[0]),
-                                       weight_page, n_subs);
+                        ++n_subs;
                     }
+
+                    if (g_debug.mmid_consolidated <= 4) {
+                        LLAMA_LOG_INFO("[wp::eval_cb] MUL_MAT_ID over consolidated tensor '%s' (parent=%d, %d sub-experts)\n",
+                                       ggml_get_name(t->src[0]), weight_page, n_subs);
+                    }
+
+#if defined(GGML_USE_HIP)
+                    // MAD-88 Phase 2-6: routing-aware paging.
+                    //
+                    // Read the indices tensor (t->src[2], shape
+                    // [n_expert_used, n_tokens, n_seqs]), build the unique
+                    // active expert set, ensure() each active sub-expert
+                    // page, populate a device-side pointer array, and
+                    // hand it to the kernel via the TLS side channel.
+                    //
+                    // The ensure()d slot pointers are valid for the
+                    // duration of this op — the kernel reads them before
+                    // we get the next eval_cb invocation, and the wp pool
+                    // doesn't evict slots that were just ensure()d (LRU
+                    // tracks insertion order).
+                    //
+                    // Single-buffer device pointer cache: we reuse a
+                    // statically-allocated device array sized for
+                    // kMaxExperts. cudaMemcpyAsync + kernel launch on the
+                    // same stream serialise correctly — no race with the
+                    // previous op.
+                    struct ggml_tensor * idx_tensor = t->src[2];
+                    if (n_subs > 0 && idx_tensor != nullptr) {
+                        constexpr int kMaxExperts = 256;
+                        if (n_subs > kMaxExperts) {
+                            LLAMA_LOG_WARN("[wp::eval_cb] consolidated tensor has %d experts > kMaxExperts=%d, skipping routing\n",
+                                           n_subs, kMaxExperts);
+                        } else {
+                            // Lazy device-buffer init.
+                            static const void * * s_dev_expert_ptrs = nullptr;
+                            if (s_dev_expert_ptrs == nullptr) {
+                                hipError_t alloc_err = hipMalloc(&s_dev_expert_ptrs,
+                                                                 kMaxExperts * sizeof(const void *));
+                                if (alloc_err != hipSuccess) {
+                                    LLAMA_LOG_WARN("[wp::eval_cb] hipMalloc for expert_ptrs failed: %s\n",
+                                                   hipGetErrorString(alloc_err));
+                                    s_dev_expert_ptrs = nullptr;
+                                }
+                            }
+
+                            if (s_dev_expert_ptrs != nullptr) {
+                                // Read indices to host. Sync the default
+                                // stream first to ensure the gating op
+                                // that produced the indices has completed.
+                                // This is a real stall — Phase 2-7 will
+                                // replace it with event-based wait or
+                                // one-batch-ahead overlap.
+                                const int64_t n_indices = ggml_nelements(idx_tensor);
+                                std::vector<int32_t> host_indices((size_t) n_indices, 0);
+
+                                hipDeviceSynchronize();
+                                hipError_t mc_err = hipMemcpy(host_indices.data(),
+                                                              idx_tensor->data,
+                                                              (size_t) n_indices * sizeof(int32_t),
+                                                              hipMemcpyDeviceToHost);
+                                if (mc_err == hipSuccess) {
+                                    // Build active expert set + slot ptrs.
+                                    std::vector<const void *> host_ptrs((size_t) n_subs, nullptr);
+                                    std::unordered_set<int> active;
+                                    int n_ensures = 0;
+                                    for (int32_t idx : host_indices) {
+                                        if (idx < 0 || idx >= n_subs) continue;
+                                        if (!active.insert((int) idx).second) continue;
+                                        const int sub_page_idx = weight_page + 1 + idx;
+                                        void * slot = pager->ensure(sub_page_idx);
+                                        if (slot != nullptr) {
+                                            host_ptrs[(size_t) idx] = slot;
+                                            ++n_ensures;
+                                        }
+                                    }
+
+                                    // Async copy host pointer table to
+                                    // device. The kernel will read after
+                                    // this completes (same stream order).
+                                    hipMemcpy(s_dev_expert_ptrs,
+                                              host_ptrs.data(),
+                                              (size_t) n_subs * sizeof(const void *),
+                                              hipMemcpyHostToDevice);
+                                    ggml_cuda_set_routed_expert_ptrs(s_dev_expert_ptrs);
+
+                                    if (g_debug.mmid_consolidated <= 4) {
+                                        LLAMA_LOG_INFO("[wp::eval_cb] routed: %d/%zu unique active experts ensured\n",
+                                                       n_ensures, active.size());
+                                    }
+                                }
+                            }
+                        }
+                    }
+#endif // GGML_USE_HIP
                 }
             }
         }
