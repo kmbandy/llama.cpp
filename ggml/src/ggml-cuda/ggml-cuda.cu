@@ -1718,13 +1718,47 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
         return hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, hipMemcpyDeviceToDevice, stream);
     }
 
+    // Strategy selection (env-overridable):
+    //   GGML_HIP_COPY_STRATEGY=auto (default): P2P if GGML_CUDA_P2P set, else staging
+    //   GGML_HIP_COPY_STRATEGY=peer:   force peer-async row-by-row (requires P2P-capable pair)
+    //   GGML_HIP_COPY_STRATEGY=stage:  force staging-buffer path
+    //
     // Only attempt P2P if GGML_CUDA_P2P is set, which also calls hipDeviceEnablePeerAccess
     // in ggml_cuda_init(). Without explicit enablement, hipMemcpyPeerAsync (and its internal
     // fallback path) uses a GPU copy kernel that may not be compiled for all ISAs in a
     // mixed-architecture build (e.g. gfx1201 + gfx1030), causing async GPU page faults.
+    enum copy_strategy { COPY_AUTO, COPY_PEER, COPY_STAGE };
+    static const copy_strategy s_strategy = []() {
+        const char * env = getenv("GGML_HIP_COPY_STRATEGY");
+        if (env) {
+            if (!strcmp(env, "peer"))  { return COPY_PEER;  }
+            if (!strcmp(env, "stage")) { return COPY_STAGE; }
+        }
+        return COPY_AUTO;
+    }();
+
+    // Cache P2P capability per (dst, src) pair — hipDeviceCanAccessPeer is a host call but
+    // not free, and ggml_cuda_op_mul_mat hits this every multi-GPU matmul.
+    static int s_p2p_cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {{-1}};
+    static std::once_flag s_p2p_cache_init;
+    std::call_once(s_p2p_cache_init, []() {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+            for (int j = 0; j < GGML_CUDA_MAX_DEVICES; ++j) {
+                s_p2p_cache[i][j] = -1;
+            }
+        }
+    });
+
     int can_access_peer = 0;
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
-        hipDeviceCanAccessPeer(&can_access_peer, dstDevice, srcDevice);
+    if (s_strategy != COPY_STAGE) {
+        const bool p2p_env_set = (s_strategy == COPY_PEER) || (getenv("GGML_CUDA_P2P") != nullptr);
+        if (p2p_env_set) {
+            int & cached = s_p2p_cache[dstDevice][srcDevice];
+            if (cached < 0) {
+                hipDeviceCanAccessPeer(&cached, dstDevice, srcDevice);
+            }
+            can_access_peer = cached;
+        }
     }
 
     if (can_access_peer) {
