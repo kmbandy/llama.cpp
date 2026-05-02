@@ -77,6 +77,150 @@ static int test_page_catalog() {
 }
 
 // ---------------------------------------------------------------------------
+// PageCatalog — MoE / block classification (Phase 1 of MAD-88)
+// ---------------------------------------------------------------------------
+
+static int test_page_catalog_moe_classification() {
+    int fails = 0;
+    wp::PageCatalog cat;
+
+    // Non-block tensor — no block prefix at all.
+    int i_embed = cat.add("token_embd.weight", 0, 0, 1024);
+
+    // Block-scoped non-expert — attention.
+    int i_attnq = cat.add("blk.0.attn_q.weight", 0, 1024, 4096);
+
+    // Block-scoped non-expert — dense FFN (no _exps suffix, no expert idx).
+    int i_dense_ffn = cat.add("blk.1.ffn_down.weight", 0, 5120, 8192);
+
+    // Consolidated MoE expert — Qwen3-MoE style. One tensor packs all
+    // experts of one role.
+    int i_cons_gate = cat.add("blk.5.ffn_gate_exps.weight", 0, 10000, 65536);
+    int i_cons_up   = cat.add("blk.5.ffn_up_exps.weight",   0, 75536, 65536);
+    int i_cons_down = cat.add("blk.5.ffn_down_exps.weight", 0, 141072, 65536);
+
+    // Per-expert MoE — Mixtral style. One tensor per (role, expert).
+    int i_pe_up_7   = cat.add("blk.10.ffn_up.7.weight",   0, 200000, 4096);
+    int i_pe_gate_3 = cat.add("blk.10.ffn_gate.3.weight", 0, 204096, 4096);
+    int i_pe_down_0 = cat.add("blk.12.ffn_down.0.weight", 0, 208192, 4096);
+
+    // 1. Non-block tensor: all block/expert fields default.
+    {
+        const auto & m = cat.at(i_embed);
+        EXPECT_EQ_INT(m.block_idx, -1, "embed: block_idx defaults to -1");
+        EXPECT_EQ_INT(m.expert_idx, -1, "embed: expert_idx defaults to -1");
+        EXPECT(!m.is_expert, "embed: not an expert");
+    }
+
+    // 2. Block-scoped non-expert: block_idx parsed, expert fields default.
+    {
+        const auto & m = cat.at(i_attnq);
+        EXPECT_EQ_INT(m.block_idx, 0, "attn_q: block_idx parsed");
+        EXPECT_EQ_INT(m.expert_idx, -1, "attn_q: expert_idx default");
+        EXPECT(!m.is_expert, "attn_q: not an expert");
+        EXPECT_EQ_INT(m.expert_role_mask, 0, "attn_q: no role bits");
+    }
+
+    // 3. Dense FFN: looks like role-prefixed but no _exps and no expert idx —
+    //    must NOT be classified as expert.
+    {
+        const auto & m = cat.at(i_dense_ffn);
+        EXPECT_EQ_INT(m.block_idx, 1, "dense ffn: block_idx parsed");
+        EXPECT(!m.is_expert, "dense ffn: not classified as expert");
+        EXPECT_EQ_INT(m.expert_role_mask, 0, "dense ffn: no role bits");
+    }
+
+    // 4. Consolidated experts: is_expert=true, is_consolidated=true,
+    //    role mask set, expert_idx stays -1 (tensor packs all experts).
+    {
+        const auto & g = cat.at(i_cons_gate);
+        EXPECT_EQ_INT(g.block_idx, 5, "cons gate: block");
+        EXPECT(g.is_expert, "cons gate: is_expert");
+        EXPECT(g.is_consolidated, "cons gate: is_consolidated");
+        EXPECT_EQ_INT(g.expert_idx, -1, "cons gate: expert_idx -1");
+        EXPECT_EQ_INT(g.expert_role_mask, wp::ROLE_GATE, "cons gate: role bit");
+
+        const auto & u = cat.at(i_cons_up);
+        EXPECT(u.is_expert && u.is_consolidated, "cons up: is_expert + cons");
+        EXPECT_EQ_INT(u.expert_role_mask, wp::ROLE_UP, "cons up: role bit");
+
+        const auto & d = cat.at(i_cons_down);
+        EXPECT(d.is_expert && d.is_consolidated, "cons down: is_expert + cons");
+        EXPECT_EQ_INT(d.expert_role_mask, wp::ROLE_DOWN, "cons down: role bit");
+    }
+
+    // 5. Per-expert: is_expert=true, is_consolidated=false, expert_idx set.
+    {
+        const auto & u7 = cat.at(i_pe_up_7);
+        EXPECT_EQ_INT(u7.block_idx, 10, "pe up7: block");
+        EXPECT(u7.is_expert, "pe up7: is_expert");
+        EXPECT(!u7.is_consolidated, "pe up7: not consolidated");
+        EXPECT_EQ_INT(u7.expert_idx, 7, "pe up7: expert idx");
+        EXPECT_EQ_INT(u7.expert_role_mask, wp::ROLE_UP, "pe up7: role bit");
+
+        const auto & g3 = cat.at(i_pe_gate_3);
+        EXPECT_EQ_INT(g3.expert_idx, 3, "pe gate3: expert idx");
+        EXPECT_EQ_INT(g3.expert_role_mask, wp::ROLE_GATE, "pe gate3: role bit");
+
+        const auto & d0 = cat.at(i_pe_down_0);
+        EXPECT_EQ_INT(d0.block_idx, 12, "pe down0: block");
+        EXPECT_EQ_INT(d0.expert_idx, 0, "pe down0: expert idx");
+        EXPECT_EQ_INT(d0.expert_role_mask, wp::ROLE_DOWN, "pe down0: role bit");
+    }
+
+    // 6. has_experts() / n_expert_pages() summary.
+    EXPECT(cat.has_experts(), "catalog has experts");
+    EXPECT_EQ_INT(cat.n_expert_pages(), 6, "n_expert_pages: 3 cons + 3 per-expert");
+
+    // 7. pages_for_block lookup.
+    {
+        auto blk5 = cat.pages_for_block(5);
+        EXPECT_EQ_INT(blk5.size(), 3, "blk 5 has 3 consolidated experts");
+
+        auto blk10 = cat.pages_for_block(10);
+        EXPECT_EQ_INT(blk10.size(), 2, "blk 10 has 2 per-expert tensors");
+
+        auto blk_none = cat.pages_for_block(99);
+        EXPECT_EQ_INT(blk_none.size(), 0, "non-existent block returns empty");
+    }
+
+    // 8. pages_for_expert lookup — per-expert path.
+    {
+        auto blk10_e7 = cat.pages_for_expert(10, 7);
+        EXPECT_EQ_INT(blk10_e7.size(), 1, "blk 10 expert 7: just up.7");
+        if (!blk10_e7.empty()) {
+            EXPECT(cat.at(blk10_e7[0]).expert_role_mask == wp::ROLE_UP,
+                   "blk 10 expert 7 is the up tensor");
+        }
+
+        auto blk12_e0 = cat.pages_for_expert(12, 0);
+        EXPECT_EQ_INT(blk12_e0.size(), 1, "blk 12 expert 0: just down.0");
+
+        // Consolidated experts have expert_idx=-1; pass -1 to retrieve them.
+        auto blk5_cons = cat.pages_for_expert(5, -1);
+        EXPECT_EQ_INT(blk5_cons.size(), 3, "blk 5 consolidated: 3 role tensors");
+    }
+
+    // 9. Bad input: block prefix with non-numeric idx must not classify.
+    {
+        wp::PageCatalog c2;
+        int idx = c2.add("blk.bad.attn_q.weight", 0, 0, 100);
+        EXPECT_EQ_INT(c2.at(idx).block_idx, -1, "non-numeric block idx not parsed");
+        EXPECT(!c2.at(idx).is_expert, "no expert classification on bad block");
+    }
+
+    // 10. Bad input: per-expert with non-numeric expert idx must not classify.
+    {
+        wp::PageCatalog c2;
+        int idx = c2.add("blk.0.ffn_up.bad.weight", 0, 0, 100);
+        EXPECT_EQ_INT(c2.at(idx).block_idx, 0, "block parsed despite bad expert");
+        EXPECT(!c2.at(idx).is_expert, "bad expert idx not classified");
+    }
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // dup_clear_o_direct
 // ---------------------------------------------------------------------------
 
@@ -285,7 +429,8 @@ int main() {
         int (*fn)();
     };
     named_test tests[] = {
-        { "page_catalog",       test_page_catalog       },
+        { "page_catalog",                test_page_catalog                },
+        { "page_catalog_moe_classify",   test_page_catalog_moe_classification },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
         { "pool_allocator",     test_pool_allocator     },
