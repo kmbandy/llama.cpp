@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstdlib>
+#include <vector>
+
 namespace {
 // Thread-local side channel for routing-aware MMQ on consolidated MoE
 // (MAD-88 Phase 2). The weight-pager eval callback sets this just
@@ -154,6 +157,36 @@ void ggml_cuda_mul_mat_q(
     // eval callback. take_*() clears the TLS, so this op consumes it
     // exactly once. nullptr (default) is the legacy bit-identical path.
     const void * const * routed_expert_ptrs = ggml_cuda_take_routed_expert_ptrs();
+
+    // Validation harness for MAD-88 Phase 2 (kernel hook correctness).
+    // When WP_MMQ_VALIDATE_EXPERT_PTRS=1 is set in the environment, build
+    // a "golden" expert_ptrs array of pointers that match exactly what the
+    // legacy x + c*stride_channel_x address computation produces. Both
+    // paths must yield bit-identical output — token sequences from the
+    // same prompt + seed should match between WP_MMQ_VALIDATE_EXPERT_PTRS
+    // off and on. Only fires for MUL_MAT_ID (ids != nullptr); regular
+    // MUL_MAT has nchannels_x==1 so the test is meaningless.
+    static const bool s_validate_expert_ptrs = []() {
+        const char * env = std::getenv("WP_MMQ_VALIDATE_EXPERT_PTRS");
+        return env != nullptr && env[0] == '1';
+    }();
+    ggml_cuda_pool_alloc<const void *> validate_expert_ptrs_buf(ctx.pool());
+    if (s_validate_expert_ptrs && ids != nullptr && routed_expert_ptrs == nullptr) {
+        const int64_t n_experts = src0->ne[2];
+        if (n_experts > 1) {
+            std::vector<const void *> host_ptrs((size_t) n_experts);
+            const char * base = (const char *) src0->data;
+            const size_t expert_stride_bytes = src0->nb[2];
+            for (int64_t e = 0; e < n_experts; ++e) {
+                host_ptrs[(size_t) e] = base + (size_t) e * expert_stride_bytes;
+            }
+            validate_expert_ptrs_buf.alloc((size_t) n_experts);
+            CUDA_CHECK(cudaMemcpyAsync(validate_expert_ptrs_buf.ptr, host_ptrs.data(),
+                                       (size_t) n_experts * sizeof(const void *),
+                                       cudaMemcpyHostToDevice, stream));
+            routed_expert_ptrs = validate_expert_ptrs_buf.ptr;
+        }
+    }
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
