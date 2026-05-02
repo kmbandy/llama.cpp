@@ -162,6 +162,20 @@ public:
                               int                        top_k     = 5,
                               float                      threshold = 0.65f);
 
+    // Restore the warm-tier recurrent state for seq_id back into the
+    // inner cache. Allocates a fresh recurrent slot via the inner
+    // cache's mt_restore_recurrent_slot, then copies the stored r/s
+    // bytes via RecurrentStateMover. Returns true on success; false
+    // if seq_id has no warm recurrent backup, the cache is full, or
+    // the mover fails. The warm copy is dropped after a successful
+    // restore (single-shot: per-seq state is unique, no reuse).
+    bool restore_recurrent_from_warm(llama_seq_id seq_id);
+
+    // Diagnostic: does seq_id have a warm-tier recurrent state backup
+    // available? Pairs with restore_recurrent_from_warm so callers can
+    // check before attempting a restore.
+    bool has_warm_recurrent(llama_seq_id seq_id) const;
+
     // Compute an L2-normalized embedding for `text` via the embedding
     // model loaded from cfg_.semantic_index. Lazy-initializes the model
     // on first call. Returns empty vector if the model failed to load

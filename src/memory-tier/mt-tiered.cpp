@@ -297,6 +297,59 @@ std::vector<float> llama_memory_tiered::embed_text(const std::string & text) {
     return embed_model_->embed(text);
 }
 
+bool llama_memory_tiered::has_warm_recurrent(llama_seq_id seq_id) const {
+    return warm_recur_buf_.find(seq_id) != warm_recur_buf_.end();
+}
+
+bool llama_memory_tiered::restore_recurrent_from_warm(llama_seq_id seq_id) {
+    auto it = warm_recur_buf_.find(seq_id);
+    if (it == warm_recur_buf_.end()) {
+        return false;  // no backup
+    }
+
+    // Allocate a fresh slot in the inner recurrent cache.
+    const int slot = inner_->mt_restore_recurrent_slot(seq_id);
+    if (slot < 0) {
+        LLAMA_LOG_WARN("mt::restore_recurrent_from_warm: no free slot for seq %d "
+                       "(cache full or backend has no recurrent state)\n", seq_id);
+        return false;
+    }
+
+    // Refresh the view to find the freshly-allocated RecurrentStateView.
+    // We need the per-layer pointers and the slot index it picked.
+    const auto fresh = inner_->make_tier_view();
+    const RecurrentStateView * target = nullptr;
+    for (const auto & rs : fresh.recur_seqs) {
+        if (rs.seq_id == seq_id && rs.seq_slot == slot) {
+            target = &rs;
+            break;
+        }
+    }
+    if (!target) {
+        LLAMA_LOG_WARN("mt::restore_recurrent_from_warm: inner allocated slot %d "
+                       "but make_tier_view didn't surface it for seq %d\n",
+                       slot, seq_id);
+        return false;
+    }
+
+    if (!mover_recur_.restore_seq(*target, it->second.data())) {
+        LLAMA_LOG_WARN("mt::restore_recurrent_from_warm: mover failed for seq %d\n", seq_id);
+        return false;
+    }
+
+    LLAMA_LOG_INFO("mt::restore_recurrent_from_warm: seq %d restored "
+                   "(%.1f MiB) into slot %d\n",
+                   seq_id, (double) it->second.size() / (1024.0 * 1024.0), slot);
+
+    // Drop the warm copy. Recurrent state is per-seq atomic — a future
+    // wipe will back it up fresh.
+    warm_recur_buf_.erase(it);
+
+    capacity_.on_migrate(1, TierCapacityManager::Tier::Warm,
+                            TierCapacityManager::Tier::Hot);
+    return true;
+}
+
 // ---- public tier-restore API ----
 
 bool llama_memory_tiered::has_warm(llama_seq_id /*seq_id*/, llama_pos position) const {

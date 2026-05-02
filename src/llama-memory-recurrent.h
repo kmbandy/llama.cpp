@@ -67,6 +67,7 @@ public:
 
     // tier-system inner view — populates recur_seqs (one entry per active seq).
     mt::InnerView make_tier_view() const override;
+    int mt_restore_recurrent_slot(llama_seq_id seq_id) override;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences

@@ -376,6 +376,37 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+int llama_memory_recurrent::mt_restore_recurrent_slot(llama_seq_id seq_id) {
+    if (seq_id < 0 || (uint32_t) seq_id >= cells.size()) {
+        return -1;
+    }
+
+    // Find a free cell. cells[seq_id] holds the seq's tail pointer; the
+    // actual state cell is whichever index cells[seq_id].tail points at.
+    // After seq_rm, cells[seq_id].tail == -1 and the previous tail cell
+    // is empty. We allocate the lowest-index empty cell and wire it as
+    // the new tail. Behaves like a minimal find_slot for a single seq
+    // without going through the full ubatch-allocation path.
+    int free_slot = -1;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells[i].is_empty() && cells[i].pos == -1) {
+            free_slot = (int) i;
+            break;
+        }
+    }
+    if (free_slot < 0) {
+        return -1;  // cache full
+    }
+
+    cells[free_slot].pos = 0;  // any non-negative value marks the cell occupied
+    cells[free_slot].seq_id.insert(seq_id);
+    cells[seq_id].tail = free_slot;
+
+    used = std::max<uint32_t>(used, free_slot + 1);
+
+    return free_slot;
+}
+
 mt::InnerView llama_memory_recurrent::make_tier_view() const {
     mt::InnerView view;
 

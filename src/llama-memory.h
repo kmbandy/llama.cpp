@@ -176,6 +176,17 @@ struct llama_memory_i {
     // know which layers to fill; the non-SWA layers all live in the
     // physical cache that owns this slot.
     virtual int mt_restore_tag_slot(llama_seq_id seq_id, llama_pos position);
+
+    // Recurrent counterpart: allocate a fresh recurrent cell for seq_id
+    // and wire it as the seq's tail, so the next make_tier_view will
+    // surface a RecurrentStateView for this seq pointing at the
+    // newly-allocated slot. The wrapper then copies the backed-up
+    // r/s state into that slot via RecurrentStateMover.
+    //
+    // Returns the slot (cell index) on success, or -1 on failure.
+    // Default: -1 (backend has no recurrent state). Composite caches
+    // (hybrid, hybrid_iswa) forward to their recurrent sub-cache.
+    virtual int mt_restore_recurrent_slot(llama_seq_id seq_id);
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

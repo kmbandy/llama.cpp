@@ -54,6 +54,10 @@ int llama_memory_i::mt_restore_tag_slot(llama_seq_id /*seq_id*/, llama_pos /*pos
     return -1;
 }
 
+int llama_memory_i::mt_restore_recurrent_slot(llama_seq_id /*seq_id*/) {
+    return -1;
+}
+
 bool llama_memory_status_is_fail(llama_memory_status status) {
     switch (status) {
         case LLAMA_MEMORY_STATUS_SUCCESS:
