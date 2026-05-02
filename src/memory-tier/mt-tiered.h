@@ -25,6 +25,7 @@
 
 #include "mt-config.h"
 #include "mt-capacity.h"
+#include "mt-embed.h"
 #include "mt-eviction.h"
 #include "mt-mover-attn.h"
 #include "mt-mover-recurrent.h"
@@ -161,6 +162,19 @@ public:
                               int                        top_k     = 5,
                               float                      threshold = 0.65f);
 
+    // Compute an L2-normalized embedding for `text` via the embedding
+    // model loaded from cfg_.semantic_index. Lazy-initializes the model
+    // on first call. Returns empty vector if the model failed to load
+    // or the path was empty.
+    //
+    // Typical use: caller feeds the original chunk text at backup time
+    // to record_chunk_fingerprint, and the new query text to
+    // restore_semantic. The wrapper itself does NOT compute fingerprints
+    // automatically — token-IDs-to-text decoding requires upstream
+    // (e.g. server-context's slot.prompt.tokens) since the inner cache
+    // doesn't store the original token IDs.
+    std::vector<float> embed_text(const std::string & text);
+
 private:
     // Poll inner_->seq_pos_min / seq_pos_max across 0..n_seq_max_, sum
     // active token counts, push the result into capacity_, and refresh
@@ -225,6 +239,10 @@ private:
     // Cached tier view captured at construction. Pointers stay stable
     // for the lifetime of inner_ — see mt-inner-access.h.
     InnerView             tier_view_;
+
+    // Lazy-loaded embedding model (only constructed when
+    // cfg_.semantic_index is non-empty). nullptr otherwise.
+    std::unique_ptr<EmbeddingModel> embed_model_;
 
     // Warm-tier host staging. Lazily allocated on first eviction.
     // Per-attn-layer base offsets:

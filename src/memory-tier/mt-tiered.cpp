@@ -287,6 +287,16 @@ bool llama_memory_tiered::ensure_warm_staging() {
     return true;
 }
 
+std::vector<float> llama_memory_tiered::embed_text(const std::string & text) {
+    if (cfg_.semantic_index.empty()) {
+        return {};
+    }
+    if (!embed_model_) {
+        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
+    }
+    return embed_model_->embed(text);
+}
+
 // ---- public tier-restore API ----
 
 bool llama_memory_tiered::has_warm(llama_seq_id /*seq_id*/, llama_pos position) const {

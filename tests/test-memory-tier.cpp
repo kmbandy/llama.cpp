@@ -10,6 +10,7 @@
 
 #include "memory-tier/mt-config.h"
 #include "memory-tier/mt-capacity.h"
+#include "memory-tier/mt-embed.h"
 #include "memory-tier/mt-eviction.h"
 #include "memory-tier/mt-quant.h"
 #include "memory-tier/mt-kvtc-store.h"
@@ -478,6 +479,48 @@ static int test_semantic_persistence() {
 }
 
 // ---------------------------------------------------------------------------
+// EmbeddingModel
+// ---------------------------------------------------------------------------
+
+static int test_embed_basic() {
+    int fails = 0;
+    const char * path = std::getenv("MT_TEST_EMBED_MODEL");
+    if (!path) {
+        std::fprintf(stderr, "  SKIP: MT_TEST_EMBED_MODEL not set (set to bge-small-en-v1.5-q8_0.gguf path)\n");
+        return 0;
+    }
+
+    mt::EmbeddingModel m(path);
+    EXPECT(!m.ready(), "lazy: not ready before first embed()");
+
+    auto v1 = m.embed("the capital of France is Paris");
+    EXPECT(!v1.empty(), "embed produced a non-empty vector");
+    EXPECT(m.ready(), "ready after first embed()");
+    EXPECT_EQ_INT(static_cast<int>(v1.size()), m.n_embd(), "vector dim matches n_embd");
+
+    // L2 norm should be ~1
+    double norm_sq = 0.0;
+    for (float x : v1) norm_sq += static_cast<double>(x) * x;
+    EXPECT_NEAR(std::sqrt(norm_sq), 1.0, 1e-3, "L2-normalized");
+
+    auto v2 = m.embed("the capital of France is Paris");
+    EXPECT(v1 == v2, "deterministic: same text -> same vector");
+
+    auto v3 = m.embed("recipes for chocolate cake");
+    EXPECT(!v3.empty(), "second text embeds");
+    // Cosine similarity (dot product since both normalized)
+    double sim_self = 0.0, sim_other = 0.0;
+    for (int i = 0; i < m.n_embd(); ++i) {
+        sim_self  += static_cast<double>(v1[i]) * v2[i];
+        sim_other += static_cast<double>(v1[i]) * v3[i];
+    }
+    EXPECT_NEAR(sim_self, 1.0, 1e-3, "self-similarity ~= 1");
+    EXPECT(sim_other < sim_self, "different text scores lower than self");
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -504,6 +547,7 @@ int main() {
         { "kvtc_recurrent",         test_kvtc_recurrent_round_trip },
         { "semantic_score_basic",   test_semantic_score_basic   },
         { "semantic_persistence",   test_semantic_persistence   },
+        { "embed_basic",            test_embed_basic            },
     };
 
     for (const auto & t : tests) {
