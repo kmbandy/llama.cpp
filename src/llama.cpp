@@ -139,7 +139,7 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     // 3. Build the new pager: catalog + init.
     model.wp_pager = std::make_unique<wp::WeightPager>();
     for (const auto & info : ml.weight_page_infos) {
-        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size);
+        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts);
     }
 
     // 4. Determine number of slots.

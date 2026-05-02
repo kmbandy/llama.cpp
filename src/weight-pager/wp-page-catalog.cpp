@@ -125,6 +125,81 @@ int PageCatalog::add(const std::string & name, uint16_t file_idx,
     return idx;
 }
 
+int PageCatalog::add_consolidated_experts(const std::string & name, uint16_t file_idx,
+                                          uint64_t file_offset, size_t total_size,
+                                          int n_experts) {
+    if (n_experts <= 1) {
+        // Degenerate case — caller should have used add() directly.
+        return add(name, file_idx, file_offset, total_size);
+    }
+    if (total_size % static_cast<size_t>(n_experts) != 0) {
+        // Non-uniform experts aren't expected for the consolidated layout
+        // we target. Bail to non-consolidated behaviour rather than silently
+        // sub-divide unevenly. Caller can detect this via the returned
+        // single-page result (no sub_expert children registered).
+        return add(name, file_idx, file_offset, total_size);
+    }
+
+    // Step 1: register the parent (consolidated) page. No slot will be
+    // allocated for it by the pool — it's pure metadata so the eval
+    // callback can resolve "this op uses src[0] = consolidated tensor"
+    // and walk to the children.
+    PageMeta parent;
+    parent.tensor_name     = name;
+    parent.file_idx        = file_idx;
+    parent.file_offset     = file_offset;
+    parent.size            = total_size;
+    parent.is_consolidated = true;
+    // Re-run the standard parser to fill block_idx + expert_role_mask on
+    // the parent, but is_expert stays false (the parent isn't paged itself
+    // — only its children are).
+    {
+        std::string rest;
+        if (parse_block_prefix(name, parent.block_idx, rest)) {
+            classify_expert(rest, parent);
+            // classify_expert sets is_expert / is_consolidated / role —
+            // we want role + block but NOT to count the parent as an
+            // expert page (children are the slottable units).
+            parent.is_expert = false;
+        }
+    }
+
+    const int parent_idx = static_cast<int>(pages_.size());
+    pages_.push_back(std::move(parent));
+    name_to_idx_.emplace(name, parent_idx);
+    // Note: parent's `size` is the full consolidated size; we deliberately
+    // do NOT update max_size_ from the parent — only sub-experts allocate
+    // slots, and the per-expert size is what determines slot stride.
+
+    // Step 2: register N sub-pages, one per expert. Each gets a synthetic
+    // name so it's directly findable by name. Per-expert offset = base +
+    // e * per_expert_size; per-expert size = total_size / n_experts.
+    const size_t per_expert_size = total_size / static_cast<size_t>(n_experts);
+    const int    first_sub_idx   = static_cast<int>(pages_.size());
+
+    for (int e = 0; e < n_experts; ++e) {
+        PageMeta sub = pages_[parent_idx];  // copy to inherit block_idx + role
+        sub.tensor_name      = name + "#expert." + std::to_string(e);
+        sub.file_offset      = file_offset + static_cast<uint64_t>(e) * per_expert_size;
+        sub.size             = per_expert_size;
+        sub.expert_idx       = static_cast<int16_t>(e);
+        sub.is_expert        = true;
+        sub.is_consolidated  = false;
+        sub.is_sub_expert    = true;
+        sub.parent_page_idx  = parent_idx;
+
+        const int sub_idx = static_cast<int>(pages_.size());
+        pages_.push_back(std::move(sub));
+        name_to_idx_.emplace(pages_.back().tensor_name, sub_idx);
+        ++n_expert_pages_;
+    }
+
+    if (per_expert_size > max_size_) {
+        max_size_ = per_expert_size;
+    }
+    return first_sub_idx;
+}
+
 int PageCatalog::find(const std::string & name) const {
     const auto it = name_to_idx_.find(name);
     return it == name_to_idx_.end() ? -1 : it->second;

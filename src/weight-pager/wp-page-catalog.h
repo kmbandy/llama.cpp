@@ -34,10 +34,14 @@ struct PageMeta {
     // Layer / MoE classification (parsed from tensor_name in PageCatalog::add).
     // Useful for MoE-aware prefetch and eviction policy. See MAD-88.
     int16_t  block_idx        = -1;     // 0..n_layer-1, -1 if non-block tensor
-    int16_t  expert_idx       = -1;     // 0..n_expert-1; -1 for consolidated or non-expert
+    int16_t  expert_idx       = -1;     // 0..n_expert-1; -1 for consolidated parent or non-expert
     uint8_t  expert_role_mask = 0;      // ROLE_UP / ROLE_GATE / ROLE_DOWN
     bool     is_expert        = false;  // true for any MoE expert weight tensor
-    bool     is_consolidated  = false;  // true if one tensor holds all experts of a role
+    bool     is_consolidated  = false;  // true if this entry holds all experts of a role
+                                        // (parent meta — has children but no own slot)
+    bool     is_sub_expert    = false;  // true if this entry is a synthesized sub-page
+                                        // (one expert of a consolidated parent)
+    int      parent_page_idx  = -1;     // for sub-experts: index of consolidated parent
 };
 
 // Insertion-ordered, read-mostly map: name -> PageMeta.
@@ -50,6 +54,23 @@ public:
     // Returns the assigned page index.
     int add(const std::string & name, uint16_t file_idx,
             uint64_t file_offset, size_t size);
+
+    // Add a consolidated MoE expert tensor as a parent + N sub-page entries
+    // (one per expert). The parent has the original tensor name; sub-pages
+    // have synthetic names "<name>#expert.<E>" so the eval-callback's
+    // name-based lookup can resolve a specific (block, expert) directly.
+    //
+    // The parent's PageMeta has is_consolidated=true with no slot allocated
+    // by the pool — it's pure metadata. Each sub-page has is_sub_expert=true,
+    // parent_page_idx pointing at the parent, and a per-expert offset/size
+    // (file_offset + e * (size / n_experts), size / n_experts).
+    //
+    // Returns the page index of the FIRST sub-expert. The parent is at
+    // (first_sub - 1) since insertion is in-order. Subsequent experts are
+    // at first_sub + e for 0 <= e < n_experts.
+    int add_consolidated_experts(const std::string & name, uint16_t file_idx,
+                                 uint64_t file_offset, size_t total_size,
+                                 int n_experts);
 
     // Number of registered pages.
     int size() const { return (int) pages_.size(); }

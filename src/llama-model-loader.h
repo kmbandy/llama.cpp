@@ -31,10 +31,16 @@ const char * llama_file_version_name(llama_fver version);
 
 // Information about a weight tensor for the weight pager
 struct llama_weight_page_info {
-    std::string name;     // tensor name
-    uint16_t    file_idx; // source file index (for split GGUFs)
-    size_t      offset;   // file offset in GGUF
-    size_t      size;     // tensor size in bytes
+    std::string name;       // tensor name
+    uint16_t    file_idx;   // source file index (for split GGUFs)
+    size_t      offset;     // file offset in GGUF
+    size_t      size;       // tensor size in bytes
+
+    // For consolidated MoE expert tensors (e.g. blk.N.ffn_<role>_exps.weight)
+    // n_experts > 1 signals that the tensor packs multiple experts and the
+    // pager may split it into per-expert sub-pages for routing-aware paging
+    // (MAD-88 Phase 2). Set to 1 for non-MoE or per-expert tensors.
+    int  n_experts = 1;
 };
 
 struct llama_model_loader {

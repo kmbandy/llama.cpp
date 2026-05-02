@@ -221,6 +221,123 @@ static int test_page_catalog_moe_classification() {
 }
 
 // ---------------------------------------------------------------------------
+// PageCatalog — consolidated MoE expert splitting (Phase 2 of MAD-88)
+// ---------------------------------------------------------------------------
+
+static int test_page_catalog_consolidated_split() {
+    int fails = 0;
+    wp::PageCatalog cat;
+
+    // Register a consolidated MoE tensor: 4 experts, total 4096 bytes.
+    // Per-expert size = 4096 / 4 = 1024 bytes.
+    const std::string parent_name = "blk.5.ffn_gate_exps.weight";
+    constexpr int     n_experts   = 4;
+    constexpr size_t  total_size  = 4096;
+    constexpr size_t  per_expert  = total_size / n_experts;
+    constexpr uint64_t base_off   = 100000;
+
+    int first_sub = cat.add_consolidated_experts(parent_name, 0, base_off, total_size, n_experts);
+
+    // The catalog should now have 1 parent + N sub-pages = 5 entries.
+    EXPECT_EQ_INT(cat.size(), 1 + n_experts, "size after consolidated add");
+
+    // First sub-expert is at index 1 (parent at 0).
+    EXPECT_EQ_INT(first_sub, 1, "first sub-expert index");
+
+    // 1. Parent meta — pure metadata, is_consolidated, is_expert=false
+    //    (parent isn't slottable; its children are).
+    {
+        const auto & p = cat.at(0);
+        EXPECT(p.tensor_name == parent_name, "parent name");
+        EXPECT_EQ_INT(p.size, total_size, "parent size = full consolidated");
+        EXPECT(p.is_consolidated, "parent is_consolidated");
+        EXPECT(!p.is_expert, "parent NOT counted as expert (children are)");
+        EXPECT(!p.is_sub_expert, "parent is NOT a sub-expert");
+        EXPECT_EQ_INT(p.block_idx, 5, "parent block parsed");
+        EXPECT_EQ_INT(p.expert_role_mask, wp::ROLE_GATE, "parent role parsed");
+        EXPECT_EQ_INT(p.parent_page_idx, -1, "parent has no parent");
+    }
+
+    // 2. Sub-experts — N entries with synthetic names + per-expert offsets.
+    for (int e = 0; e < n_experts; ++e) {
+        const int  sub_idx = first_sub + e;
+        const auto & s     = cat.at(sub_idx);
+
+        const std::string expected_name = parent_name + "#expert." + std::to_string(e);
+        EXPECT(s.tensor_name == expected_name, "sub: synthetic name");
+        EXPECT_EQ_INT(s.file_offset, base_off + (uint64_t)e * per_expert, "sub: offset");
+        EXPECT_EQ_INT(s.size, per_expert, "sub: per-expert size");
+        EXPECT(s.is_expert, "sub: is_expert");
+        EXPECT(s.is_sub_expert, "sub: is_sub_expert");
+        EXPECT(!s.is_consolidated, "sub: NOT consolidated itself");
+        EXPECT_EQ_INT(s.block_idx, 5, "sub: inherited block_idx");
+        EXPECT_EQ_INT(s.expert_idx, e, "sub: expert_idx");
+        EXPECT_EQ_INT(s.expert_role_mask, wp::ROLE_GATE, "sub: inherited role");
+        EXPECT_EQ_INT(s.parent_page_idx, 0, "sub: parent_page_idx");
+    }
+
+    // 3. Synthetic names are findable via the standard find() lookup.
+    {
+        EXPECT_EQ_INT(cat.find(parent_name), 0, "find: parent by original name");
+        EXPECT_EQ_INT(cat.find(parent_name + "#expert.0"), 1, "find: sub by synthetic name");
+        EXPECT_EQ_INT(cat.find(parent_name + "#expert.3"), 4, "find: last sub");
+        EXPECT_EQ_INT(cat.find(parent_name + "#expert.4"), -1, "find: out-of-range expert");
+    }
+
+    // 4. has_experts / n_expert_pages — only sub-experts count.
+    EXPECT(cat.has_experts(), "has_experts after consolidated add");
+    EXPECT_EQ_INT(cat.n_expert_pages(), n_experts, "n_expert_pages = sub-experts only");
+
+    // 5. max_page_size tracks per-expert size (not the consolidated total),
+    //    since only sub-experts allocate slots.
+    EXPECT_EQ_INT(cat.max_page_size(), per_expert, "max_page_size = per-expert");
+
+    // 6. pages_for_block(5) returns parent + all sub-experts.
+    {
+        auto blk5 = cat.pages_for_block(5);
+        EXPECT_EQ_INT(blk5.size(), 1 + n_experts, "blk 5 includes parent + N subs");
+    }
+
+    // 7. pages_for_expert(5, 2) returns just the e=2 sub-expert.
+    {
+        auto e2 = cat.pages_for_expert(5, 2);
+        EXPECT_EQ_INT(e2.size(), 1, "blk 5 expert 2: one sub");
+        if (!e2.empty()) {
+            EXPECT_EQ_INT(cat.at(e2[0]).expert_idx, 2, "found the e=2 sub");
+        }
+    }
+
+    // 8. Non-uniform sizes: total not divisible by n_experts → falls back
+    //    to single-page registration (no children registered, no sub-experts).
+    //    The name still classifies as consolidated by string pattern, but
+    //    no slottable per-expert children exist.
+    {
+        wp::PageCatalog c2;
+        int idx = c2.add_consolidated_experts("blk.0.ffn_up_exps.weight", 0, 0,
+                                              /*total_size=*/100, /*n_experts=*/3);
+        EXPECT_EQ_INT(c2.size(), 1, "non-uniform: single-page fallback");
+        EXPECT_EQ_INT(idx, 0, "non-uniform: returned single-page index");
+        EXPECT(!c2.at(0).is_sub_expert, "non-uniform: not a sub-expert");
+        // n_expert_pages counts entries with is_expert=true. The fallback
+        // registers ONE entry which the parser sees as a consolidated
+        // expert tensor (by name) — so n_expert_pages = 1 is consistent
+        // (the unsplittable parent IS itself an expert page in this case).
+        EXPECT_EQ_INT(c2.n_expert_pages(), 1, "non-uniform: parent counted as expert");
+    }
+
+    // 9. n_experts <= 1 → falls back to plain add().
+    {
+        wp::PageCatalog c2;
+        int idx = c2.add_consolidated_experts("blk.0.ffn_up_exps.weight", 0, 0, 1024, 1);
+        EXPECT_EQ_INT(c2.size(), 1, "n_experts=1: single-page");
+        EXPECT_EQ_INT(idx, 0, "n_experts=1: returned single-page index");
+        EXPECT(!c2.at(0).is_sub_expert, "n_experts=1: not a sub-expert");
+    }
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // dup_clear_o_direct
 // ---------------------------------------------------------------------------
 
@@ -431,6 +548,7 @@ int main() {
     named_test tests[] = {
         { "page_catalog",                test_page_catalog                },
         { "page_catalog_moe_classify",   test_page_catalog_moe_classification },
+        { "page_catalog_consolidated",   test_page_catalog_consolidated_split },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
         { "pool_allocator",     test_pool_allocator     },

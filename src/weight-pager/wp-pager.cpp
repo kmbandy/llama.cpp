@@ -61,8 +61,16 @@ WeightPager::~WeightPager() {
 }
 
 int WeightPager::add_page(const std::string & name, uint16_t file_idx,
-                          uint64_t file_offset, size_t size) {
-    return catalog_.add(name, file_idx, file_offset, size);
+                          uint64_t file_offset, size_t size, int n_experts) {
+    // Non-MoE / per-expert tensor: add as-is.
+    if (n_experts <= 1) {
+        return catalog_.add(name, file_idx, file_offset, size);
+    }
+    // Consolidated MoE tensor: register N sub-pages, one per expert.
+    // Returns the index of the FIRST sub-page (subsequent experts are at
+    // sequential indices). Per-expert size is the consolidated size
+    // divided by n_experts; per-expert offset is base_offset + e * size_e.
+    return catalog_.add_consolidated_experts(name, file_idx, file_offset, size, n_experts);
 }
 
 bool WeightPager::init(const Config &             cfg,

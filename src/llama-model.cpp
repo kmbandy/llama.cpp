@@ -8088,6 +8088,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 info.file_idx = weight->idx;
                 info.offset   = weight->offs;
                 info.size     = ggml_nbytes(t);
+                // Detect consolidated MoE expert tensors: name pattern
+                // "ffn_<role>_exps.weight" plus a 3D shape where ne[2] is
+                // the expert count. ne[2] > 1 distinguishes from non-MoE
+                // (which use 2D weights for the same role names without
+                // _exps suffix; those never reach this branch because the
+                // name match fails).
+                {
+                    const char * tname  = info.name.c_str();
+                    const char * exps_p = std::strstr(tname, "ffn_");
+                    bool is_consolidated = false;
+                    if (exps_p != nullptr) {
+                        // Match "ffn_(up|gate|down)_exps."
+                        is_consolidated =
+                            std::strstr(exps_p, "ffn_up_exps.")   != nullptr ||
+                            std::strstr(exps_p, "ffn_gate_exps.") != nullptr ||
+                            std::strstr(exps_p, "ffn_down_exps.") != nullptr;
+                    }
+                    if (is_consolidated && t->ne[2] > 1) {
+                        info.n_experts = (int) t->ne[2];
+                    }
+                }
                 ml.weight_page_infos.push_back(info);
                 // Collect the actual model tensor pointer for the weight pager
                 if (weight_pager) {

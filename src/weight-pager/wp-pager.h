@@ -51,10 +51,21 @@ public:
     WeightPager & operator=(const WeightPager &) = delete;
 
     // Catalog population. Must be called before init().
+    //
+    // n_experts > 1 marks a consolidated MoE expert tensor (Qwen3-MoE
+    // style: blk.<N>.ffn_<role>_exps.weight packs all experts as a 3D
+    // tensor with ne[2] == n_experts). The catalog will register one
+    // sub-page per expert with synthetic names of the form
+    // "<base_name>#expert.<E>", letting the pager and prefetch scheduler
+    // page individual experts rather than the full consolidated tensor.
+    // (MAD-88 Phase 2.) Use n_experts = 1 (default) for non-MoE tensors
+    // and Mixtral-style per-expert tensors, which are already separate
+    // pages by name.
     int add_page(const std::string & name,
                  uint16_t            file_idx,
                  uint64_t            file_offset,
-                 size_t              size);
+                 size_t              size,
+                 int                 n_experts = 1);
 
     // Initialise the pool, transport, file-io layer, and prefetch scheduler.
     //
