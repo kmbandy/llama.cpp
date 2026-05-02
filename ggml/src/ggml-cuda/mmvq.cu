@@ -368,6 +368,34 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return 1;
     }
+    if (table_id == MMVQ_PARAMETERS_RDNA2) {
+        // RDNA2 (gfx1030, e.g. 6900XT): no WMMA tensor cores; vec_dot uses
+        // dp4a (4-way 8-bit packed dot product). Smaller register file and
+        // LDS than RDNA3+, so peak occupancy at fewer warps. Empirically
+        // 4 warps for simple dp4a types maps each warp to one SIMD32 column
+        // on the CU (wave32 × 4 SIMDs/CU); complex K-quants (Q2_K..Q6_K)
+        // hit register pressure earlier and prefer 2.
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    return 4;
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    return 2;
+                default:
+                    return 1;
+            }
+        }
+        return 1;
+    }
     return 1;
 }
 
