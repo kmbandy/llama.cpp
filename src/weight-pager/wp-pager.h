@@ -92,9 +92,10 @@ public:
     void shutdown();
 
     // Lookup helpers.
-    int  find_page(const std::string & name) const { return catalog_.find(name); }
-    int  n_pages()                            const { return catalog_.size(); }
-    bool is_initialized()                     const { return initialized_; }
+    int    find_page(const std::string & name) const { return catalog_.find(name); }
+    int    n_pages()                            const { return catalog_.size(); }
+    size_t max_page_size()                      const { return catalog_.max_page_size(); }
+    bool   is_initialized()                     const { return initialized_; }
 
     // Ensure a page is in VRAM, returning the slot pointer. Synchronous
     // fallback if the page is not (yet) prefetched. Returns nullptr if

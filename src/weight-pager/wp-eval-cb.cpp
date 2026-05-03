@@ -158,6 +158,20 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         LLAMA_LOG_INFO("[wp::eval_cb] routed: %d/%zu unique active experts ensured\n",
                                                        n_ensures, active.size());
                                     }
+
+                                    // Patch the consolidated parent's buffer so ggml-cuda's
+                                    // mul_mat_id assertions don't NULL-deref. The kernel
+                                    // never reads parent->data when routed_expert_ptrs is
+                                    // set, but ggml_cuda_mul_mat_id dereferences
+                                    // src0->buffer->buft on entry to check for split
+                                    // buffers (ggml-cuda.cu:2667). init_weight_pager left
+                                    // src0->buffer = nullptr for paged tensors, so without
+                                    // this patch we NULL-deref before reaching the
+                                    // routing-aware dispatcher gate.
+                                    ggml_backend_buffer_t pool_buf = pager->pool_buf();
+                                    if (t->src[0]->buffer == nullptr && pool_buf != nullptr) {
+                                        t->src[0]->buffer = pool_buf;
+                                    }
                                 }
                             }
                         }
@@ -187,6 +201,19 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             page_idx = pager->find_page(ggml_get_name(src->view_src));
         }
         if (page_idx < 0) continue;
+
+        // MAD-88: skip consolidated MoE parents in the standard ensure()
+        // path. The parent is metadata-only (no slot allocated, full
+        // tensor size exceeds per-expert staging buffer). For MUL_MAT_ID
+        // the routing-aware block above ensures the active sub-experts.
+        // For any other op that references the consolidated tensor by
+        // name (rare in practice — only views from the model loader
+        // itself), the kernel reads from src->data which still points
+        // at the placeholder. That's a known limitation; if it bites a
+        // real model we'd need to ensure ALL sub-experts for that op.
+        if (pager->page_meta(page_idx).is_consolidated) {
+            continue;
+        }
 
         // Dedupe: two views of the same weight in one op resolve to the
         // same page; we only need to ensure() once.
@@ -255,14 +282,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // the eval cb is doing without relying on env var. Use WARN level so
     // llama-cli's default log filter doesn't suppress it.
     if (g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
-        LLAMA_LOG_ERROR("[DIAG] wp::eval_cb[%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d)\n",
+        LLAMA_LOG_INFO("[wp::eval_cb][%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d)\n",
                         g_debug.ops_with_pages, ggml_op_name(t->op),
                         ggml_get_name(t),
                         n_page_indices, patches_this_op, views_this_op,
                         g_debug.patches_total, g_debug.views_patched, g_debug.ensures_failed);
     } else if (g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
-        LLAMA_LOG_ERROR("[DIAG] wp::eval_cb: suppressing further per-op logs after first %d paged ops\n",
-                        DebugState::kVerboseLimit);
+        LLAMA_LOG_INFO("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
+                       DebugState::kVerboseLimit);
     }
 
     // Step 3: drive the prefetch pipeline forward.

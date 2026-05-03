@@ -2669,9 +2669,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+
+    // MAD-88 Phase 2 (A1): if the weight-pager eval callback armed routing-
+    // aware expert pointers for this op (the consolidated MoE parent has no
+    // valid base ptr — only per-expert slot ptrs), bypass kernel paths that
+    // don't honor expert_ptrs and force the MMQ path which does. Without
+    // this gate, mmvq/mmvf would dereference src0->data (the placeholder)
+    // with the consolidated stride and fault on garbage memory.
+    const bool routing_active = ggml_cuda_has_routed_expert_ptrs();
+
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (!routing_active && ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -2691,9 +2700,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!routing_active && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
+        }
+
+        if (routing_active) {
+            // Routing was armed but no kernel path honors expert_ptrs for this
+            // op shape. Falling through to the dequant path below would read
+            // the consolidated placeholder and fault. Abort with a clear
+            // message — Phase A2 work is to extend the hook to mmvq/mmvf.
+            GGML_ABORT("weight-pager routing armed but no routing-aware kernel "
+                       "matched (src0 type %s, ne12=%lld, ne02=%lld). "
+                       "Phase A2: extend expert_ptrs to mmvq/mmvf.",
+                       ggml_type_name(src0->type), (long long) ne12, (long long) ne02);
         }
     }
 

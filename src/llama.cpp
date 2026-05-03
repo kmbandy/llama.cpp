@@ -72,8 +72,8 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         return true;
     }
 
-    LLAMA_LOG_ERROR("%s: [DIAG] initializing weight pager with %zu pages\n",
-                    __func__, ml.weight_page_infos.size());
+    LLAMA_LOG_INFO("%s: initializing weight pager with %zu pages\n",
+                   __func__, ml.weight_page_infos.size());
 
     // The legacy llama_weight_pager is created in llama_model_load before
     // load_tensors so the latter can populate weight_tensor_ptrs. We only
@@ -132,26 +132,34 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
             "weight pager: could not parse device index from name '%s'",
             ggml_backend_dev_name(dev)));
     }
-    LLAMA_LOG_ERROR("%s: [DIAG] paged weights on device %d (%s), buft=%s\n",
-                    __func__, device_idx, ggml_backend_dev_name(dev),
-                    ggml_backend_buft_name(buft));
+    LLAMA_LOG_INFO("%s: paged weights on device %d (%s), buft=%s\n",
+                   __func__, device_idx, ggml_backend_dev_name(dev),
+                   ggml_backend_buft_name(buft));
 
     // 3. Build the new pager: catalog + init.
     model.wp_pager = std::make_unique<wp::WeightPager>();
     for (const auto & info : ml.weight_page_infos) {
         model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts);
     }
+    LLAMA_LOG_INFO("%s: catalog populated: %d page entries (source had %zu)\n",
+                   __func__, model.wp_pager->n_pages(), ml.weight_page_infos.size());
 
     // 4. Determine number of slots.
     //    - If the user supplied --weight-paging-slots N (positive), honour it.
     //      No auto-cap: if it's too big, hipMalloc will fail loudly with OOM
     //      and the user can tune down. Caller-knows-best.
-    //    - Otherwise (auto), pick the layer count and cap to free VRAM with
-    //      a 3 GiB headroom so we don't OOM on KV cache + compute buffers.
+    //    - Otherwise (auto): aim to keep most catalog entries resident.
+    //      For consolidated MoE that split into per-expert sub-pages
+    //      (MAD-88), the catalog can have tens of thousands of small pages,
+    //      so the slot budget should be computed from the catalog max
+    //      page size (post-split), not the source list (pre-split).
     int n_slots = params.weight_paging_slots;
     const bool slots_user_override = (n_slots > 0);
     if (n_slots <= 0) {
-        n_slots = (int) model.hparams.n_layer;
+        // Default target: enough slots to hold the whole catalog if it fits,
+        // or as many as VRAM allows. For non-MoE models the catalog ~= source
+        // list, so this matches the old layer-count default in practice.
+        n_slots = model.wp_pager->n_pages();
         if (n_slots <= 0) n_slots = 32;
     }
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -160,10 +168,8 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         hipMemGetInfo(&free_vram, &total_vram);
         const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
         const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
-        size_t max_page_size = 0;
-        for (const auto & info : ml.weight_page_infos) {
-            if (info.size > max_page_size) max_page_size = info.size;
-        }
+        // Post-split per-expert max — small for MoE catalogs.
+        const size_t max_page_size = model.wp_pager->max_page_size();
         const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
         if (n_slots > n_slots_fit && n_slots_fit >= 1) {
             LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
@@ -230,11 +236,11 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                 ++n_placed;
             }
         }
-        LLAMA_LOG_ERROR("%s: [DIAG] placeholder data set on %zu weight tensors (placeholder=%p)\n",
-                        __func__, n_placed, placeholder);
+        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p)\n",
+                       __func__, n_placed, placeholder);
     }
 
-    LLAMA_LOG_ERROR("%s: [DIAG] weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",
+    LLAMA_LOG_INFO("%s: weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",
                    __func__, device_idx, n_slots,
                    cfg.prefer_async_io ? "async" : "sync");
     return true;

@@ -32,6 +32,13 @@ const void * const * ggml_cuda_take_routed_expert_ptrs() {
     return p;
 }
 
+bool ggml_cuda_has_routed_expert_ptrs() {
+    // Non-consuming peek. The MUL_MAT_ID dispatcher uses this to decide
+    // whether to bypass kernel paths (mmvq, mmvf, mmf) that don't support
+    // routing-aware paging and force the MMQ path which does.
+    return tls_routed_expert_ptrs != nullptr;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:

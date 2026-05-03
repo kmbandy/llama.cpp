@@ -4223,4 +4223,5 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // the kernel completes.
 void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
 const void * const *  ggml_cuda_take_routed_expert_ptrs();
+bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
 

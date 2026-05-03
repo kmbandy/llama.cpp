@@ -8083,30 +8083,54 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 const auto * weight = ml.get_weight(ggml_get_name(t));
                 if (!weight) { continue; }
+                // MAD-88: skip huge non-block tensors from paging. token_embd
+                // and output are needed every forward pass (vocab embed +
+                // logits), so paging them just adds SSD churn for no win.
+                // Keeping them resident also lets the pool's slot stride
+                // shrink to per-block-weight size, fitting many more slots.
+                {
+                    const char * n = ggml_get_name(t);
+                    if (std::strncmp(n, "token_embd", 10) == 0 ||
+                        std::strncmp(n, "output_norm", 11) == 0 ||
+                        std::strcmp (n, "output.weight") == 0) {
+                        continue;
+                    }
+                }
                 llama_weight_page_info info;
                 info.name     = ggml_get_name(t);
                 info.file_idx = weight->idx;
                 info.offset   = weight->offs;
                 info.size     = ggml_nbytes(t);
-                // Detect consolidated MoE expert tensors: name pattern
-                // "ffn_<role>_exps.weight" plus a 3D shape where ne[2] is
-                // the expert count. ne[2] > 1 distinguishes from non-MoE
-                // (which use 2D weights for the same role names without
-                // _exps suffix; those never reach this branch because the
-                // name match fails).
+                // Detect consolidated MoE expert tensors. Pattern:
+                // "ffn_<role>_exps.weight" with a dim > 1 holding the
+                // expert axis. Different ggml model loaders place the
+                // expert axis in different ne[] slots — Qwen3-MoE puts
+                // it at ne[2], some MiniMax-class models at ne[3] or
+                // even in stride-only form. Pick the largest "extra"
+                // dim beyond the standard input/output axes.
                 {
                     const char * tname  = info.name.c_str();
                     const char * exps_p = std::strstr(tname, "ffn_");
                     bool is_consolidated = false;
                     if (exps_p != nullptr) {
-                        // Match "ffn_(up|gate|down)_exps."
                         is_consolidated =
                             std::strstr(exps_p, "ffn_up_exps.")   != nullptr ||
                             std::strstr(exps_p, "ffn_gate_exps.") != nullptr ||
                             std::strstr(exps_p, "ffn_down_exps.") != nullptr;
                     }
-                    if (is_consolidated && t->ne[2] > 1) {
-                        info.n_experts = (int) t->ne[2];
+                    if (is_consolidated) {
+                        // Expert axis: ne[2] in Qwen3-MoE convention,
+                        // ne[3] in some MiniMax-class layouts. Pick the
+                        // largest dim beyond input/output (ne[0]/ne[1]).
+                        int n_exp = 0;
+                        if (t->ne[2] > 1) {
+                            n_exp = (int) t->ne[2];
+                        } else if (t->ne[3] > 1) {
+                            n_exp = (int) t->ne[3];
+                        }
+                        if (n_exp > 1) {
+                            info.n_experts = n_exp;
+                        }
                     }
                 }
                 ml.weight_page_infos.push_back(info);
