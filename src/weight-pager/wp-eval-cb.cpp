@@ -116,16 +116,18 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                             }
 
                             if (s_dev_expert_ptrs != nullptr) {
-                                // Read indices to host. Sync the default
-                                // stream first to ensure the gating op
-                                // that produced the indices has completed.
-                                // This is a real stall — Phase 2-7 will
-                                // replace it with event-based wait or
-                                // one-batch-ahead overlap.
+                                // Read indices to host. hipMemcpy is
+                                // synchronous-w.r.t.-host and serialises
+                                // against any prior async work on the
+                                // source memory's stream — the explicit
+                                // hipDeviceSynchronize that used to live
+                                // here forced a device-wide stall between
+                                // every MoE op (240/token), preventing
+                                // any cross-op GPU pipelining. Drop it;
+                                // hipMemcpy waits as needed. Phase 9b.
                                 const int64_t n_indices = ggml_nelements(idx_tensor);
                                 std::vector<int32_t> host_indices((size_t) n_indices, 0);
 
-                                hipDeviceSynchronize();
                                 hipError_t mc_err = hipMemcpy(host_indices.data(),
                                                               idx_tensor->data,
                                                               (size_t) n_indices * sizeof(int32_t),
