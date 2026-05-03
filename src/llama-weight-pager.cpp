@@ -398,10 +398,16 @@ int llama_weight_pager::get_lru_slot() const {
 }
 
 // ============================================================================
-// Async Prefetch via io_uring (Phase 4)
+// Async Prefetch via io_uring (Phase 4) — LEGACY, dead code.
 // ============================================================================
+//
+// The new wp:: pager owns the async-IO path now (src/weight-pager/
+// wp-file-io.cpp). This block referenced llama-io-uring.h which has
+// been removed; gating on LLAMA_LEGACY_PAGER_IO_URING (never defined)
+// keeps the file compilable while preserving the original code as a
+// reference. Delete on the next legacy-pager cleanup pass.
 
-#ifdef LLAMA_HAVE_IO_URING
+#ifdef LLAMA_LEGACY_PAGER_IO_URING
 
 #include "llama-io-uring.h"
 
@@ -523,4 +529,4 @@ void llama_weight_pager::drain_prefetches() {
     }
 }
 
-#endif // LLAMA_HAVE_IO_URING
+#endif // LLAMA_LEGACY_PAGER_IO_URING

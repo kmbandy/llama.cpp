@@ -63,6 +63,22 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# Optional liburing for the weight pager's async file IO path. When found,
+# the IoUringAsync FileIOLayer is compiled and selected at runtime when
+# --weight-paging-prefetch is on. Without it, the pager falls back to
+# SyncPread which serialises all pread()s on the eval-callback thread.
+find_package(PkgConfig QUIET)
+if (PkgConfig_FOUND)
+    pkg_check_modules(LIBURING IMPORTED_TARGET liburing)
+    if (LIBURING_FOUND)
+        message(STATUS "Found liburing ${LIBURING_VERSION} - enabling async weight-pager IO")
+        target_compile_definitions(llama PRIVATE LLAMA_HAVE_IO_URING)
+        target_link_libraries(llama PRIVATE PkgConfig::LIBURING)
+    else()
+        message(STATUS "liburing not found - weight pager will use SyncPread fallback")
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

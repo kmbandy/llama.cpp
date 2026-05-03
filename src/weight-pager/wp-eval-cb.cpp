@@ -14,6 +14,7 @@ extern "C++" void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
 
 #include <cstdlib>       // getenv
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -171,6 +172,40 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     ggml_backend_buffer_t pool_buf = pager->pool_buf();
                                     if (t->src[0]->buffer == nullptr && pool_buf != nullptr) {
                                         t->src[0]->buffer = pool_buf;
+                                    }
+
+                                    // MAD-88 Phase 9a: same-layer prefetch.
+                                    // gate / up / down at one MoE layer all share
+                                    // the same active expert set (the router runs
+                                    // once per layer, before any of them). When we
+                                    // process the first MUL_MAT_ID over a sister
+                                    // parent, fire async prefetches for the OTHER
+                                    // sister parents' same expert sub-pages so by
+                                    // the time their MUL_MAT_IDs fire they're
+                                    // either cache hits or already in flight.
+                                    //
+                                    // Sister discovery is O(catalog) on first
+                                    // hit per parent; cached after that.
+                                    static std::unordered_map<int, std::vector<int>> s_sister_cache;
+                                    auto sister_it = s_sister_cache.find(weight_page);
+                                    if (sister_it == s_sister_cache.end()) {
+                                        std::vector<int> sisters;
+                                        const int my_block = meta.block_idx;
+                                        for (int i = 0; i < pager->n_pages(); ++i) {
+                                            if (i == weight_page) continue;
+                                            const auto & p = pager->page_meta(i);
+                                            if (!p.is_consolidated) continue;
+                                            if (p.block_idx != my_block) continue;
+                                            sisters.push_back(i);
+                                        }
+                                        sister_it = s_sister_cache.emplace(weight_page, std::move(sisters)).first;
+                                    }
+                                    for (int sister_parent : sister_it->second) {
+                                        for (int e : active) {
+                                            if (e < 0 || e >= n_subs) continue;
+                                            const int sister_sub = sister_parent + 1 + e;
+                                            pager->prefetch_page(sister_sub);
+                                        }
                                     }
                                 }
                             }
