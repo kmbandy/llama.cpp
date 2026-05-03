@@ -2670,17 +2670,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
 
-    // MAD-88 Phase 2 (A1): if the weight-pager eval callback armed routing-
-    // aware expert pointers for this op (the consolidated MoE parent has no
-    // valid base ptr — only per-expert slot ptrs), bypass kernel paths that
-    // don't honor expert_ptrs and force the MMQ path which does. Without
-    // this gate, mmvq/mmvf would dereference src0->data (the placeholder)
-    // with the consolidated stride and fault on garbage memory.
+    // MAD-88 Phase 2 (A2): when the weight-pager eval callback armed
+    // routing-aware expert pointers for this op, both MMVQ and MMQ honor
+    // them (MMVQ via Phase A2, MMQ via Phase A1). MMVF does not — gate
+    // it off when routing is active. The consolidated parent's
+    // src0->data is a placeholder; kernels that ignore expert_ptrs and
+    // dereference it with the per-expert stride will fault.
     const bool routing_active = ggml_cuda_has_routed_expert_ptrs();
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (!routing_active && ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -2688,7 +2688,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else if (!ggml_is_quantized(src0->type)) {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (!routing_active && GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2706,13 +2706,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (routing_active) {
-            // Routing was armed but no kernel path honors expert_ptrs for this
-            // op shape. Falling through to the dequant path below would read
-            // the consolidated placeholder and fault. Abort with a clear
-            // message — Phase A2 work is to extend the hook to mmvq/mmvf.
+            // Routing was armed but no kernel path honors expert_ptrs for
+            // this op shape. Falling through to the dequant path below
+            // would read the consolidated placeholder and fault. Abort
+            // with a clear message — at this point only the cuBLAS
+            // dequant path is left, which would need its own hook.
             GGML_ABORT("weight-pager routing armed but no routing-aware kernel "
-                       "matched (src0 type %s, ne12=%lld, ne02=%lld). "
-                       "Phase A2: extend expert_ptrs to mmvq/mmvf.",
+                       "matched (src0 type %s, ne12=%lld, ne02=%lld).",
                        ggml_type_name(src0->type), (long long) ne12, (long long) ne02);
         }
     }
@@ -4015,8 +4015,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
+    // MAD-88 (A2): the fused-mmvq paths below bundle gate + up into a
+    // single mmvq call with fusion.gate set. When routing is active, the
+    // gate and up consolidated parents have placeholder data; honoring
+    // routing for both vx AND vgate would require a parallel expert_ptrs
+    // array for the gate weight. Out of scope for tonight — let the op
+    // fall through to the unfused dispatcher path which already routes
+    // correctly via Phase A2.
+    const bool routing_active_for_fusion = ggml_cuda_has_routed_expert_ptrs();
+
     // gate + glu + up
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+        if (routing_active_for_fusion && op == GGML_OP_MUL_MAT_ID) continue;
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {
@@ -4144,6 +4154,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // gate + add + glu + up + add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+        if (routing_active_for_fusion && op == GGML_OP_MUL_MAT_ID) continue;
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
