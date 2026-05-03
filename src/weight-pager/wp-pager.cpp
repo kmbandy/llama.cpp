@@ -390,16 +390,19 @@ int WeightPager::page_in_sync_(int page_idx) {
         return -1;
     }
 
-    // Stage 2: H2D + padding zero, blocking.
+    // Stage 2: H2D + padding zero. GpuTransport uses hipStreamPerThread
+    // (same stream as ggml-cuda's compute kernels), so stream ordering
+    // already serialises the H2D before any kernel that reads from this
+    // slot. The explicit transport_.synchronize that used to live here
+    // forced the eval-cb thread to block on every page-in, defeating
+    // io_uring depth-N pipelining. (MAD-88 Phase 9d.)
     int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size());
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
-    if (evt < 0 || !transport_.synchronize(evt)) {
+    if (evt < 0) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: gpu stage_in failed for page %d\n", page_idx);
-        if (evt >= 0) transport_.release_event(evt);
         pool_.release_slot(slot);
         return -1;
     }
-    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: synchronize ok\n", s_diag_count);
     transport_.release_event(evt);
 
     // Shared sync_staging_ is owned by the WeightPager; no per-call free.
