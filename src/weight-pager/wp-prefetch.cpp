@@ -187,8 +187,11 @@ bool PrefetchScheduler::submit(int page_idx, int fd_idx, uint64_t file_offset,
     page_to_slot_[page_idx] = handle;
     req_to_slot_[s.req_id]  = handle;
 
-    // Submit may batch in io_uring; flush now to make the read live.
-    file_io_->flush();
+    // No flush here — io_uring SQEs are accumulated and submitted in batch
+    // by tick() (PrefetchScheduler::tick → file_io.flush). Batching N
+    // submissions into one io_uring_submit syscall saves N-1 syscall
+    // round-trips per layer; with N=16 active experts and 80 layers per
+    // token that's ~1280 saved syscalls/token. (MAD-88 Phase 9e.)
     return true;
 }
 
@@ -240,6 +243,13 @@ void PrefetchScheduler::poll_stage2_() {
 
 void PrefetchScheduler::tick() {
     if (!initialized_) return;
+
+    // 0. Flush any accumulated SQEs to the kernel. submit() no longer
+    //    auto-flushes per-call (see Phase 9e comment in submit), so
+    //    tick is the single submission point per layer's prefetch
+    //    burst. One io_uring_submit syscall covers all 16 active
+    //    expert reads instead of 16 separate calls.
+    file_io_->flush();
 
     // 1. Drain any completed file reads (non-blocking).
     while (file_io_->pending() > 0) {
