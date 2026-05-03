@@ -133,17 +133,43 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                               (size_t) n_indices * sizeof(int32_t),
                                                               hipMemcpyDeviceToHost);
                                 if (mc_err == hipSuccess) {
-                                    // Build active expert set + slot ptrs.
+                                    // Build active expert set first so we can
+                                    // pipeline the page-ins. (MAD-88 Phase 9c.)
                                     std::vector<const void *> host_ptrs((size_t) n_subs, nullptr);
                                     std::unordered_set<int> active;
-                                    int n_ensures = 0;
                                     for (int32_t idx : host_indices) {
                                         if (idx < 0 || idx >= n_subs) continue;
-                                        if (!active.insert((int) idx).second) continue;
-                                        const int sub_page_idx = weight_page + 1 + idx;
+                                        active.insert((int) idx);
+                                    }
+
+                                    // Pass 1: fire async prefetch for every
+                                    // active expert. With io_uring (depth 4),
+                                    // multiple preads can be in flight at
+                                    // once. ensure() in pass 2 will see slots
+                                    // already reserved + in-flight, and
+                                    // wait_for completion instead of doing
+                                    // a fresh sync pread.
+                                    for (int e : active) {
+                                        const int sub_page_idx = weight_page + 1 + e;
+                                        pager->prefetch_page(sub_page_idx);
+                                    }
+                                    // Drive the prefetch state machine forward
+                                    // so submitted reads get out the door
+                                    // before we start blocking on completions.
+                                    pager->tick();
+
+                                    // Pass 2: ensure() each, harvesting slot
+                                    // pointers. For pages whose prefetch is
+                                    // already reaped, this is a fast cache
+                                    // hit; for in-flight pages it waits on
+                                    // the async completion; for unloaded
+                                    // pages it falls back to sync.
+                                    int n_ensures = 0;
+                                    for (int e : active) {
+                                        const int sub_page_idx = weight_page + 1 + e;
                                         void * slot = pager->ensure(sub_page_idx);
                                         if (slot != nullptr) {
-                                            host_ptrs[(size_t) idx] = slot;
+                                            host_ptrs[(size_t) e] = slot;
                                             ++n_ensures;
                                         }
                                     }
