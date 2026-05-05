@@ -2184,6 +2184,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         }
         tcfg.semantic_threshold  = params.kv_tier_semantic_threshold;
         tcfg.semantic_top_k      = params.kv_tier_semantic_topk;
+        tcfg.paged_blocks        = params.kv_tier_paged_blocks;
+        if (params.kv_tier_paged_block_size > 0) {
+            tcfg.paged_block_size = (uint32_t) params.kv_tier_paged_block_size;
+        }
 
         res = new mt::llama_memory_tiered(
                 std::unique_ptr<llama_memory_i>(res), tcfg, cparams.n_seq_max);

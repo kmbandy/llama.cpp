@@ -1547,6 +1547,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
                                               : params.kv_semantic_index.c_str();
     cparams.kv_tier_semantic_threshold  = params.kv_semantic_threshold;
     cparams.kv_tier_semantic_topk       = params.kv_semantic_top_k;
+    cparams.kv_tier_paged_blocks        = params.kv_tier_paged_blocks;
+    cparams.kv_tier_paged_block_size    = params.kv_tier_paged_block_size;
 
     return cparams;
 }

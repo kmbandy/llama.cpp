@@ -31,6 +31,8 @@
 #include "mt-mover-recurrent.h"
 #include "mt-kvtc-store.h"
 #include "mt-semantic.h"
+#include "mt-block-pool.h"
+#include "mt-block-table.h"
 
 #include "llama-memory.h"
 
@@ -281,6 +283,13 @@ private:
     RecurrentStateMover   mover_recur_;
     KvtcStore             store_;
     SemanticIndex         semantic_;
+
+    // Phase 2a paged-blocks scaffolding. Allocated only when
+    // cfg_.paged_blocks=true; otherwise these stay default-constructed
+    // and the existing position-keyed paths are unaffected. Phase 2b+
+    // wires them into the live read/write paths behind the same flag.
+    BlockPool             paged_pool_;
+    BlockTable            paged_table_;
 
     // Cached tier view captured at construction. Pointers stay stable
     // for the lifetime of inner_ — see mt-inner-access.h.

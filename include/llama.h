@@ -403,6 +403,8 @@ extern "C" {
         const char * kv_tier_semantic_index;     // nullptr => disabled
         float        kv_tier_semantic_threshold;
         int32_t      kv_tier_semantic_topk;
+        bool         kv_tier_paged_blocks;       // Phase 2a opt-in (off => current path)
+        int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
     };
 
     struct llama_model_tensor_override {

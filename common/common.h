@@ -612,6 +612,8 @@ struct common_params {
     std::string kv_semantic_index = "";   // path to embedding model for semantic KV index (empty = disabled)
     float kv_semantic_threshold = 0.65f;  // minimum cosine similarity threshold for prefetch hints
     int   kv_semantic_top_k     = 5;      // number of prefetch hints to return
+    bool  kv_tier_paged_blocks    = false;  // Phase 2a: opt-in paged-blocks scaffolding (no behavior change yet)
+    int   kv_tier_paged_block_size = 16;    // tokens per block when paged_blocks is enabled
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

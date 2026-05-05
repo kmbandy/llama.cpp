@@ -78,6 +78,20 @@ struct TieredConfig {
     std::string semantic_index;
     float       semantic_threshold = 0.65f;
     int         semantic_top_k     = 5;
+
+    // Paged-blocks refactor (PHASE 2a, opt-in, off by default).
+    //
+    // When true, llama_memory_tiered allocates a mt::BlockPool +
+    // mt::BlockTable alongside the existing position-keyed bookkeeping.
+    // Phase 2a only INSTANTIATES the new structures and logs init —
+    // no live wiring yet. Phase 2b will start using BlockTable on the
+    // write side; Phase 2c on the read side; Phase 2d makes paged
+    // the default and removes the position-keyed paths.
+    //
+    // block_size is fixed at 16 tokens for now (matches vLLM default).
+    // Configurable in a later phase if benchmarks show otherwise.
+    bool     paged_blocks    = false;
+    uint32_t paged_block_size = 16;
 };
 
 // Returns true iff cfg's percentages sum within tolerance and all numeric

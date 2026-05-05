@@ -1475,6 +1475,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_SEMANTIC_TOPK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-tier-paged-blocks"},
+        {"--no-kv-tier-paged-blocks"},
+        "Phase 2a opt-in: instantiate mt::BlockPool + mt::BlockTable alongside the position-keyed tier (no behavior change yet — scaffolding for the paged refactor)",
+        [](common_params & params, bool value) {
+            params.kv_tier_paged_blocks = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-paged-block-size"}, "N",
+        "tokens per block when --kv-tier-paged-blocks is enabled (default: 16, matches vLLM)",
+        [](common_params & params, int value) {
+            if (value <= 0 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("--kv-tier-paged-block-size must be a positive power of 2");
+            }
+            params.kv_tier_paged_block_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

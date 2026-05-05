@@ -66,6 +66,31 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
                    base_layers, swa_layers,
                    tier_view_.recur_seqs.size(),
                    tier_view_.empty() ? " (not tierable; will run as passthrough)" : "");
+
+    // Phase 2a: paged-blocks scaffolding. When the flag is set, allocate
+    // BlockPool + BlockTable sized to the warm/cold tier capacities so
+    // we can start exercising allocation patterns. NO read/write paths
+    // touch these structures yet — Phase 2b/2c wire them in. This lets
+    // us validate that the structures behave under realistic sizing
+    // (right number of blocks, init logs make sense, no mem blowup)
+    // before changing any behavior.
+    if (cfg_.paged_blocks) {
+        const uint32_t bsize = cfg_.paged_block_size > 0 ? cfg_.paged_block_size : 16u;
+        // Hot tier corresponds to "GPU blocks" in vLLM terminology.
+        // Warm tier (RAM) is "CPU blocks." Cold tier (NVMe) doesn't get
+        // a block ID — it's KvtcStore-keyed and managed separately.
+        const uint32_t n_gpu = capacity_.hot_capacity()  / bsize;
+        const uint32_t n_cpu = capacity_.warm_capacity() / bsize;
+        // Watermark default of 0.05 mirrors vLLM. Scaffolding only —
+        // no admission control consults it yet.
+        paged_pool_.init(n_gpu, n_cpu, /*watermark=*/0.05f);
+        paged_table_.init(n_seq_max_, bsize);
+        LLAMA_LOG_INFO("mt::llama_memory_tiered: paged-blocks scaffolding "
+                       "ON (block_size=%u, n_gpu_blocks=%u, n_cpu_blocks=%u, "
+                       "n_seq_max=%u) — no live wiring yet, Phase 2b will "
+                       "start using them\n",
+                       bsize, n_gpu, n_cpu, n_seq_max_);
+    }
 }
 
 llama_memory_tiered::~llama_memory_tiered() {

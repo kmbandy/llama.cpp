@@ -37,6 +37,8 @@ struct llama_memory_params {
     const char * kv_tier_semantic_index;
     float        kv_tier_semantic_threshold;
     int32_t      kv_tier_semantic_topk;
+    bool         kv_tier_paged_blocks;       // Phase 2a opt-in
+    int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
 };
 
 enum llama_memory_status {
