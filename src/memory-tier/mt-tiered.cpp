@@ -451,22 +451,46 @@ bool llama_memory_tiered::restore_recurrent_from_warm(llama_seq_id seq_id) {
 
 // ---- public tier-restore API ----
 
-bool llama_memory_tiered::has_warm(llama_seq_id /*seq_id*/, llama_pos position) const {
-    // NOTE: seq_id is currently ignored — warm_pos_to_slot_ / cold_positions_
-    // are keyed by position only. This is correct for single-seq workloads
-    // (the most common case, including llama-cli single-turn and most
-    // server slots). Multi-seq separation requires keying by (seq, pos)
-    // and is a documented follow-up.
+bool llama_memory_tiered::has_warm(llama_seq_id seq_id, llama_pos position) const {
+    // Phase 2b-C: hard-branch to paged variant when flag is set.
+    if (cfg_.paged_blocks) {
+        return paged_has_warm(seq_id, position);
+    }
+
+    // NOTE: in the position-keyed path seq_id is ignored — warm_pos_to_slot_
+    // / cold_positions_ are keyed by position only. Correct for single-seq
+    // workloads (the most common case, including llama-cli single-turn and
+    // most server slots). Multi-seq separation is what the paged refactor
+    // is for.
     //
     // "warm" in the API name is historical — this query returns true for
     // anything in warm OR cold, since restore_from_warm transparently
     // demand-loads from cold via load_one_from_cold.
+    (void) seq_id;
     return warm_pos_to_slot_.find(position) != warm_pos_to_slot_.end()
         || cold_positions_.find(position)   != cold_positions_.end();
 }
 
+bool llama_memory_tiered::paged_has_warm(llama_seq_id seq_id, llama_pos position) const {
+    if (!paged_warm_initialized_) return false;
+    const uint32_t bsize = paged_table_.block_size();
+    if (bsize == 0) return false;
+    const uint32_t lblock = (uint32_t) position / bsize;
+    const uint32_t physical = paged_table_.get_physical(seq_id, lblock);
+    if (physical == kInvalidBlockId) return false;
+    // GPU blocks are still in hot — caller doesn't need to restore.
+    // CPU blocks are in warm — restore-able.
+    // (Cold tier not yet wired into the paged path; comes in a later phase.)
+    return !paged_pool_.is_gpu(physical);
+}
+
 uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   seq_id,
                                                   const std::vector<llama_pos> & positions) {
+    // Phase 2b-C: hard-branch to paged variant when flag is set.
+    if (cfg_.paged_blocks) {
+        return paged_restore_from_warm(seq_id, positions);
+    }
+
     if (!inner_ || !warm_initialized_ || positions.empty()) return 0;
 
     uint32_t restored = 0;
@@ -543,6 +567,92 @@ uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   s
                        restored, seq_id,
                        warm_capacity_ - (uint32_t) warm_free_slots_.size(),
                        warm_capacity_);
+    }
+    return restored;
+}
+
+// Phase 2b-C: paged-blocks restore. For each requested position, looks
+// up the physical block via paged_table_, copies K/V from
+// paged_warm_buf_ back into the inner cache via mover_attn_.restore_*.
+// CPU block stays mapped after restore — same chunk may be requested
+// again by a related query (semantic prefetch). Phase 2c will validate
+// parity by toggling cfg_.paged_blocks and confirming identical
+// observable behavior.
+uint32_t llama_memory_tiered::paged_restore_from_warm(
+        llama_seq_id                   seq_id,
+        const std::vector<llama_pos> & positions) {
+    if (!inner_ || !paged_warm_initialized_ || positions.empty()) return 0;
+
+    const uint32_t bsize = paged_table_.block_size();
+    if (bsize == 0) return 0;
+
+    // Group requested positions by their containing logical block. We
+    // restore at block granularity — the inner cache slots get tagged
+    // per position, but the block lookup happens once per block.
+    uint32_t restored = 0;
+
+    for (auto pos : positions) {
+        if (pos < 0) continue;
+        const uint32_t lblock = (uint32_t) pos / bsize;
+        const uint32_t physical = paged_table_.get_physical(seq_id, lblock);
+        if (physical == kInvalidBlockId) continue;       // never backed up
+        if (paged_pool_.is_gpu(physical))   continue;    // still in hot, no-op
+
+        const uint32_t cpu_block_idx = physical - paged_pool_.total_gpu_blocks();
+        const uint8_t * block_base = paged_warm_buf_.data() +
+                                     (size_t) cpu_block_idx * paged_block_bytes_;
+        const uint32_t row_in_block = (uint32_t) pos % bsize;
+
+        // Ask inner cache for a free slot tagged with this position.
+        const int inner_slot = inner_->mt_restore_tag_slot(seq_id, pos);
+        if (inner_slot < 0) {
+            LLAMA_LOG_WARN("mt::paged_restore_from_warm: no free slot in inner "
+                           "cache for pos %d (seq %d, lblock=%u)\n",
+                           pos, seq_id, lblock);
+            break;
+        }
+
+        // Walk restorable layers in the same flat order as
+        // ensure_paged_warm_staging used to lay out paged_layer_off_.
+        bool ok = true;
+        size_t flat_idx = 0;
+        for (const auto & c : tier_view_.attn_caches) {
+            if (c.is_swa) continue;
+            for (const auto & layer : c.layers) {
+                const uint8_t * src_k = block_base
+                                      + paged_layer_off_[flat_idx]
+                                      + (size_t) row_in_block * layer.k_row_bytes;
+                const uint8_t * src_v = block_base
+                                      + paged_layer_v_off_[flat_idx]
+                                      + (size_t) row_in_block * layer.v_row_bytes;
+                if (!mover_attn_.restore_k(layer, src_k, inner_slot) ||
+                    !mover_attn_.restore_v(layer, src_v, inner_slot)) {
+                    ok = false;
+                    break;
+                }
+                ++flat_idx;
+            }
+            if (!ok) break;
+        }
+
+        if (ok) {
+            ++restored;
+        } else {
+            LLAMA_LOG_WARN("mt::paged_restore_from_warm: mover failed restoring "
+                           "pos %d into slot %d (lblock=%u, cpu_block=%u)\n",
+                           pos, inner_slot, lblock, physical);
+        }
+    }
+
+    if (restored > 0) {
+        capacity_.on_migrate(restored,
+                             TierCapacityManager::Tier::Warm,
+                             TierCapacityManager::Tier::Hot);
+        update_tier_state();
+        LLAMA_LOG_INFO("mt::paged_restore_from_warm: restored %u positions "
+                       "for seq %d (paged_pool free: gpu=%zu cpu=%zu)\n",
+                       restored, seq_id,
+                       paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu());
     }
     return restored;
 }

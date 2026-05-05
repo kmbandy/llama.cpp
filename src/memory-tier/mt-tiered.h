@@ -251,6 +251,21 @@ private:
     // called by backup_seq_rm_range when cfg_.paged_blocks=true.
     uint32_t paged_backup_seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
+    // Phase 2b-C: paged-blocks variant of restore_from_warm. For each
+    // requested position, looks up the physical block via paged_table_,
+    // copies K/V from paged_warm_buf_ back into the inner cache via
+    // mover_attn_.restore_*. The CPU block stays mapped in paged_table_
+    // after restore (the same chunk may be requested again, e.g. by
+    // semantic prefetch on a related query). Phase 2c will validate
+    // that toggling cfg_.paged_blocks gives identical observable
+    // behavior to the position-keyed path.
+    uint32_t paged_restore_from_warm(llama_seq_id seq_id,
+                                     const std::vector<llama_pos> & positions);
+
+    // Phase 2b-C: paged-blocks variant of has_warm. Checks paged_table_
+    // for a CPU-mapped physical block covering the position.
+    bool paged_has_warm(llama_seq_id seq_id, llama_pos position) const;
+
     // Open KvtcStore on the configured SSD path the first time cold
     // is needed. Returns false if cold_capacity is 0 or KvtcStore::init
     // fails.
