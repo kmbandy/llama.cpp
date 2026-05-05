@@ -783,6 +783,13 @@ uint32_t llama_memory_tiered::backup_proactive(llama_seq_id seq_id,
     return backed_up;
 }
 
+uint32_t llama_memory_tiered::physical_attn_cells() const {
+    for (const auto & c : tier_view_.attn_caches) {
+        if (!c.is_swa) return (uint32_t)c.kv_size;
+    }
+    return 0;
+}
+
 // Resync our tier bookkeeping from inner_'s ground truth.
 //
 // Walks 0..n_seq_max_, sums (seq_pos_max - seq_pos_min + 1) for every

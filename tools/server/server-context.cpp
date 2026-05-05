@@ -1462,27 +1462,39 @@ private:
         //  2. Else fall back to the older tiered_cache->evict_from_slot
         //     (transformer paths that haven't migrated to mt::).
         //
-        // **Hot freeing is a separate problem**: backup preserves the data
-        // but does not free hot slots in the inner cache. For hybrids, freeing
-        // is gated on a partial seq_rm path that doesn't exist yet (recurrent
-        // can't seq_rm). This commit unblocks the read side; the write-side
-        // hot-free wiring is a focused follow-up.
+        // **Threshold capacity**: for the mt:: path use the physical
+        // attention cache cell count, NOT slot.n_ctx. For hybrid models
+        // (Qwen3.6, DeepSeek V4) the attention KV cache is sized for a
+        // sliding window — much smaller than the user-facing context
+        // (recurrent layers carry the long context). Comparing against
+        // slot.n_ctx makes the trigger fire too late and the inner cache
+        // 500s with "failed to find free space in the KV cache" before
+        // we ever get a chance to evict. The old tiered_cache path keeps
+        // slot.n_ctx since its semantics haven't changed.
         if (params_base.kv_tiered_enabled) {
             const int n_tokens = slot.prompt.n_tokens();
-            const int evict_threshold = (int)(slot.n_ctx * 0.80f);
+
+            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx));
+            uint32_t cap = (uint32_t)slot.n_ctx;
+            if (mt_tier) {
+                const uint32_t phys = mt_tier->physical_attn_cells();
+                if (phys > 0) cap = phys;
+            }
+
+            const int evict_threshold = (int)(cap * 0.80f);
             if (n_tokens >= evict_threshold) {
-                const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
+                const int n_evict = std::max(1, (int)(cap * 0.20f));
 
                 bool routed_to_mt = false;
-                if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
+                if (mt_tier) {
                     // mt::-routed: oldest n_evict positions are [0, n_evict).
                     // (Slot uses monotonic position assignment; pos 0 is the
                     // oldest cell still in hot.)
                     const uint32_t backed_up = mt_tier->backup_proactive(
                         slot.id, /*p0=*/0, /*p1=*/(llama_pos)n_evict);
                     if (backed_up > 0) {
-                        SLT_DBG(slot, "proactive mt:: backup: %u/%d positions at %d/%d hot capacity\\n",
-                                backed_up, n_evict, n_tokens, slot.n_ctx);
+                        SLT_DBG(slot, "proactive mt:: backup: %u/%d positions at %d/%u hot capacity\\n",
+                                backed_up, n_evict, n_tokens, cap);
                     }
                     routed_to_mt = true;
                 }

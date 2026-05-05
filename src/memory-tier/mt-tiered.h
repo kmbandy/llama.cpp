@@ -189,12 +189,24 @@ public:
     // to warm; when warm is full, spills to cold via KvtcStore. Returns
     // the count actually backed up.
     //
-    // Note: this only PRESERVES data — it does not free hot-tier slots
-    // (the inner attention cache still holds those positions). The hot
-    // freeing path is a follow-up; this commit unblocks the read-side
-    // (restore_from_warm / restore_semantic) for hybrid agents that
-    // share a slot across sessions.
+    // After backup completes, frees the hot-tier attention slots so the
+    // reclaimed positions can be reused by subsequent prefill — that's
+    // the whole point of "proactive eviction." For hybrids we reach past
+    // the wrapper to mem_attn->seq_rm directly to leave recurrent state
+    // alone (upstream's hybrid::seq_rm aborts on partial ranges since
+    // recurrent can't be sliced positionally). For pure-attention models
+    // inner_->seq_rm works as usual.
     uint32_t backup_proactive(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
+    // Physical attention cache cell count from the inner view (base,
+    // non-SWA). For hybrid models this is much smaller than the user-
+    // facing context size — recurrent layers carry the long context, so
+    // the attention KV cache is sized for a sliding window. Server-side
+    // eviction triggers should compare against THIS, not slot.n_ctx,
+    // otherwise the trigger fires too late and the inner cache 500s.
+    // Returns 0 if pure-recurrent or the inner backend isn't tierable.
+    // Cached from tier_view_ at init — cheap, no allocation.
+    uint32_t physical_attn_cells() const;
 
     // Compute an L2-normalized embedding for `text` via the embedding
     // model loaded from cfg_.semantic_index. Lazy-initializes the model
