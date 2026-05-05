@@ -1442,18 +1442,52 @@ private:
         }
 
         // Proactive tiered cache eviction: when hot tier reaches 80% capacity,
-        // evict oldest tokens to warm/cold to make room. Works for all architectures
-        // including hybrids that don't support ctx_shift.
-        if (params_base.kv_tiered_enabled && tiered_cache) {
+        // back up oldest tokens to warm/cold so the read side can restore
+        // them later. Works for all architectures including hybrids that
+        // auto-disable ctx_shift (Qwen3.6, DeepSeek V4) — for those, this
+        // is the ONLY path that populates mt::'s warm + cold tiers
+        // (otherwise the seq_rm-time backup hook never fires).
+        //
+        // Dispatch order (precedence: newer mt:: rewrite over the older
+        // per-slot tiered_cache implementation):
+        //  1. If the active memory is mt::llama_memory_tiered, call its
+        //     public backup_proactive — uses the real KV mover + KvtcStore
+        //     pipeline.
+        //  2. Else fall back to the older tiered_cache->evict_from_slot
+        //     (transformer paths that haven't migrated to mt::).
+        //
+        // **Hot freeing is a separate problem**: backup preserves the data
+        // but does not free hot slots in the inner cache. For hybrids, freeing
+        // is gated on a partial seq_rm path that doesn't exist yet (recurrent
+        // can't seq_rm). This commit unblocks the read side; the write-side
+        // hot-free wiring is a focused follow-up.
+        if (params_base.kv_tiered_enabled) {
             const int n_tokens = slot.prompt.n_tokens();
             const int evict_threshold = (int)(slot.n_ctx * 0.80f);
             if (n_tokens >= evict_threshold) {
-                auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                if (slot_tier && slot_tier->initialized) {
-                    const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
-                    if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
-                        SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
-                                n_evict, n_tokens, slot.n_ctx);
+                const int n_evict = std::max(1, (int)(slot.n_ctx * 0.20f));
+
+                bool routed_to_mt = false;
+                if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
+                    // mt::-routed: oldest n_evict positions are [0, n_evict).
+                    // (Slot uses monotonic position assignment; pos 0 is the
+                    // oldest cell still in hot.)
+                    const uint32_t backed_up = mt_tier->backup_proactive(
+                        slot.id, /*p0=*/0, /*p1=*/(llama_pos)n_evict);
+                    if (backed_up > 0) {
+                        SLT_DBG(slot, "proactive mt:: backup: %u/%d positions at %d/%d hot capacity\\n",
+                                backed_up, n_evict, n_tokens, slot.n_ctx);
+                    }
+                    routed_to_mt = true;
+                }
+
+                if (!routed_to_mt && tiered_cache) {
+                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
+                    if (slot_tier && slot_tier->initialized) {
+                        if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
+                            SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
+                                    n_evict, n_tokens, slot.n_ctx);
+                        }
                     }
                 }
             }

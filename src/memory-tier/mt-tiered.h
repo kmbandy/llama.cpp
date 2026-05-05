@@ -176,6 +176,26 @@ public:
     // check before attempting a restore.
     bool has_warm_recurrent(llama_seq_id seq_id) const;
 
+    // **Proactive eviction backup** — public entry to the same backup
+    // pipeline that runs at seq_rm time, but without requiring an actual
+    // seq_rm. Use case: hybrid models (Qwen3.6, future DeepSeek V4) auto-
+    // disable ctx_shift because their recurrent state can't support
+    // partial seq_rm. Without this entry, mt::'s backup never fires for
+    // those architectures and the cold tier stays empty.
+    //
+    // Caller (the server-side proactive trigger when slot capacity
+    // crosses ~80%) supplies the position range to back up — typically
+    // the OLDEST 20% of the slot's tokens. Backup writes attention K/V
+    // to warm; when warm is full, spills to cold via KvtcStore. Returns
+    // the count actually backed up.
+    //
+    // Note: this only PRESERVES data — it does not free hot-tier slots
+    // (the inner attention cache still holds those positions). The hot
+    // freeing path is a follow-up; this commit unblocks the read-side
+    // (restore_from_warm / restore_semantic) for hybrid agents that
+    // share a slot across sessions.
+    uint32_t backup_proactive(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     // Compute an L2-normalized embedding for `text` via the embedding
     // model loaded from cfg_.semantic_index. Lazy-initializes the model
     // on first call. Returns empty vector if the model failed to load

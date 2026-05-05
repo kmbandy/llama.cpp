@@ -736,6 +736,22 @@ mover_failed:
     return backed_up;
 }
 
+// Public proactive entry point — bypasses the seq_rm hook so the
+// server-side trigger can fire backup for hybrid models (Qwen3.6,
+// DeepSeek V4) where ctx_shift is auto-disabled and the seq_rm path
+// never executes. Behavior is identical to the seq_rm-time backup:
+// copies attention K/V to warm; spills to cold via KvtcStore when warm
+// is full. Does NOT touch recurrent state and does NOT delegate to
+// inner_->seq_rm — caller decides separately whether to free the hot
+// slots (which is a problem for hybrids today; that's tracked
+// separately as the hot-freeing follow-up).
+uint32_t llama_memory_tiered::backup_proactive(llama_seq_id seq_id,
+                                                 llama_pos    p0,
+                                                 llama_pos    p1) {
+    if (!inner_ || p0 < 0 || p1 <= p0) return 0;
+    return backup_seq_rm_range(seq_id, p0, p1);
+}
+
 // Resync our tier bookkeeping from inner_'s ground truth.
 //
 // Walks 0..n_seq_max_, sums (seq_pos_max - seq_pos_min + 1) for every

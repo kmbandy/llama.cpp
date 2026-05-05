@@ -72,7 +72,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Phase 4: Complete any in-flight prefetches for the pages we need
-#ifdef LLAMA_HAVE_IO_URING
+#ifdef LLAMA_LEGACY_PAGER_IO_URING
     if (pager->async_prefetch && pager->io_reader != nullptr) {
         for (int page_idx : page_indices) {
             pager->complete_prefetch(page_idx);
@@ -108,7 +108,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Phase 4: Submit prefetch for the next page (pipeline NVMe reads with GPU compute)
-#ifdef LLAMA_HAVE_IO_URING
+#ifdef LLAMA_LEGACY_PAGER_IO_URING
     if (pager->async_prefetch && pager->io_reader != nullptr) {
         // Find the highest page index we just processed
         int max_page = -1;
