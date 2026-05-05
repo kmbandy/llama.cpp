@@ -936,15 +936,54 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (ok) {
         // Drop the removed positions from the eviction store. We keep
         // the warm copies — those are now the only source of truth for
-        // restoration. (warm_pos_to_slot_ is unchanged here; we only
-        // free a warm slot when the warm copy itself becomes obsolete,
-        // e.g. via clear() or when the same position is re-added then
-        // re-removed.)
+        // restoration.
         if (p0 >= 0 && p1 > p0) {
             for (llama_pos p = p0; p < p1; ++p) {
                 eviction_.remove(p);
             }
         }
+
+        // Whole-seq wipe (sentinel p0=-1 or p1=-1) is the "task done"
+        // signal for an agent-style worker reusing a slot for unrelated
+        // tasks. Free warm slots so VRAM/RAM is reclaimed, drop cold-tier
+        // index entries (the on-disk file persists as scratch and gets
+        // overwritten by the next eviction), and crucially wipe the
+        // semantic fingerprint index — without this, fingerprints from
+        // the prior task can cosine-match against the new task's queries
+        // and trigger restoration of stale K/V from warm/cold, which
+        // attention would then read as garbage.
+        //
+        // n_seq_max=1 today so "for this seq" === "all of it." When mt::
+        // grows multi-seq tracking, scope these wipes by seq_id.
+        if (p0 < 0 || p1 < 0) {
+            const size_t n_warm   = warm_pos_to_slot_.size();
+            const size_t n_cold   = cold_positions_.size();
+            const size_t n_finger = semantic_.size();
+
+            warm_pos_to_slot_.clear();
+            evicted_to_warm_.clear();
+            warm_insertion_order_.clear();
+            cold_positions_.clear();
+            warm_recur_buf_.clear();
+            semantic_.clear();
+            pressure_announced_ = false;
+
+            if (warm_initialized_) {
+                warm_free_slots_.clear();
+                warm_free_slots_.reserve(warm_capacity_);
+                for (uint32_t s = warm_capacity_; s-- > 0; ) {
+                    warm_free_slots_.push_back((int) s);
+                }
+            }
+
+            if (n_warm + n_cold + n_finger > 0) {
+                LLAMA_LOG_INFO("mt::seq_rm: whole-seq wipe for seq %d — freed "
+                               "%zu warm slots, dropped %zu cold entries, "
+                               "cleared %zu semantic fingerprints\n",
+                               seq_id, n_warm, n_cold, n_finger);
+            }
+        }
+
         update_tier_state();
     }
     return ok;

@@ -1490,6 +1490,17 @@ private:
             }
 
             const int evict_threshold = (int)(cap * 0.80f);
+
+            // If the slot was truncated (new task with no shared prefix
+            // wipes the inner cache via memory_seq_rm), kv_evict_through
+            // is stale — it points past the now-much-smaller live cache.
+            // Reset to start eviction from scratch on this fresh slot.
+            // Self-heals without having to instrument every memory_seq_rm
+            // site in the server.
+            if ((int)slot.kv_evict_through > n_tokens) {
+                slot.kv_evict_through = 0;
+            }
+
             // Live-in-hot count = total positions minus what we've already
             // backed up. Without subtracting, the trigger keeps firing on
             // every step once n_tokens passes the threshold but does nothing
