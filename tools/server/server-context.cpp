@@ -88,6 +88,13 @@ struct server_slot {
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // High-water mark of positions backed up to warm by the proactive eviction
+    // trigger. The next eviction starts here so we don't repeatedly try to
+    // back up positions that are already in warm (which would be a no-op and
+    // would leave the inner cache to overflow on long generations). Reset
+    // when the slot's KV gets cleared (prompt_clear / reset).
+    llama_pos kv_evict_through = 0;
+
     // multimodal
     mtmd_context * mctx = nullptr;
 
@@ -170,6 +177,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        kv_evict_through = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1482,19 +1490,29 @@ private:
             }
 
             const int evict_threshold = (int)(cap * 0.80f);
-            if (n_tokens >= evict_threshold) {
+            // Live-in-hot count = total positions minus what we've already
+            // backed up. Without subtracting, the trigger keeps firing on
+            // every step once n_tokens passes the threshold but does nothing
+            // (the [0, n_evict) range is already in warm) and the inner
+            // cache overflows on long generations.
+            const int n_live_hot = n_tokens - (int)slot.kv_evict_through;
+            if (n_live_hot >= evict_threshold) {
                 const int n_evict = std::max(1, (int)(cap * 0.20f));
 
                 bool routed_to_mt = false;
                 if (mt_tier) {
-                    // mt::-routed: oldest n_evict positions are [0, n_evict).
-                    // (Slot uses monotonic position assignment; pos 0 is the
-                    // oldest cell still in hot.)
+                    // Eviction window starts at the cursor — the next
+                    // not-yet-backed-up positions. Cursor advances by the
+                    // returned count so subsequent triggers walk forward
+                    // through position space.
+                    const llama_pos p0 = slot.kv_evict_through;
+                    const llama_pos p1 = p0 + (llama_pos)n_evict;
                     const uint32_t backed_up = mt_tier->backup_proactive(
-                        slot.id, /*p0=*/0, /*p1=*/(llama_pos)n_evict);
+                        slot.id, p0, p1);
                     if (backed_up > 0) {
-                        SLT_DBG(slot, "proactive mt:: backup: %u/%d positions at %d/%u hot capacity\\n",
-                                backed_up, n_evict, n_tokens, cap);
+                        slot.kv_evict_through += (llama_pos)backed_up;
+                        SLT_DBG(slot, "proactive mt:: backup: %u/%d positions [%d,%d) at %d live / %u hot capacity\\n",
+                                backed_up, n_evict, p0, p1, n_live_hot, cap);
                     }
                     routed_to_mt = true;
                 }
