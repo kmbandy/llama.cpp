@@ -23,6 +23,19 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
         return;
     }
 
+    // Multi-seq is not yet supported — the tier bookkeeping
+    // (warm_pos_to_slot_, evicted_to_warm_, cold_positions_, KvtcStore
+    // disk keys, semantic fingerprints) all key on llama_pos without
+    // seq_id scoping. With n_seq_max > 1, two seqs holding the same
+    // position number would step on each other's tier state and the
+    // restore path would return wrong K/V. Until the paged refactor
+    // adds proper per-seq scoping (block-table per seq), refuse to
+    // load with multi-seq instead of silently corrupting.
+    GGML_ASSERT(n_seq_max_ == 1u && "mt::llama_memory_tiered: --parallel > 1 "
+                "is not supported (mt:: tier bookkeeping is single-seq only). "
+                "Run with --parallel 1, or disable --kv-tiered. Multi-seq "
+                "support lands with the paged refactor.");
+
     std::string err;
     if (!validate(cfg_, &err)) {
         LLAMA_LOG_WARN("mt::llama_memory_tiered: config invalid (%s) — proceeding with passthrough\n",
