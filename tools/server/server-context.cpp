@@ -1510,6 +1510,32 @@ private:
                     const uint32_t backed_up = mt_tier->backup_proactive(
                         slot.id, p0, p1);
                     if (backed_up > 0) {
+                        // Semantic fingerprint: embed the detokenized chunk
+                        // so a future query (likely a separate request with
+                        // no shared prefix) can find this chunk via cosine
+                        // similarity and prefetch it back to hot before
+                        // attention runs. Mirrors the context-shift-time
+                        // fingerprinting; only fires when --kv-tier-semantic-index
+                        // is set and the chunk isn't multimodal.
+                        if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
+                            const auto & toks = slot.prompt.tokens.get_text_tokens();
+                            const int hi = std::min<int>(p1, (int) toks.size());
+                            if (hi > p0) {
+                                llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
+                                const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+                                const auto emb = mt_tier->embed_text(text);
+                                if (!emb.empty()) {
+                                    std::vector<llama_pos> positions;
+                                    positions.reserve(hi - p0);
+                                    for (int i = p0; i < hi; ++i) positions.push_back((llama_pos) i);
+                                    mt_tier->record_chunk_fingerprint(
+                                        std::move(positions), emb,
+                                        mt::SemanticIndex::Tier::Warm);
+                                    SLT_INF(slot, "tier semantic: fingerprinted %d tokens [%d,%d) (%zu-dim) for proactive backup\n",
+                                            hi - p0, p0, hi, emb.size());
+                                }
+                            }
+                        }
                         slot.kv_evict_through += (llama_pos)backed_up;
                         SLT_DBG(slot, "proactive mt:: backup: %u/%d positions [%d,%d) at %d live / %u hot capacity\\n",
                                 backed_up, n_evict, p0, p1, n_live_hot, cap);
