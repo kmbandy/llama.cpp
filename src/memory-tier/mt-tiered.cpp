@@ -2,6 +2,8 @@
 #include "mt-context.h"
 
 #include "llama-impl.h"  // LLAMA_LOG_*
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 
 #include <algorithm>
 #include <cassert>
@@ -739,17 +741,46 @@ mover_failed:
 // Public proactive entry point — bypasses the seq_rm hook so the
 // server-side trigger can fire backup for hybrid models (Qwen3.6,
 // DeepSeek V4) where ctx_shift is auto-disabled and the seq_rm path
-// never executes. Behavior is identical to the seq_rm-time backup:
-// copies attention K/V to warm; spills to cold via KvtcStore when warm
-// is full. Does NOT touch recurrent state and does NOT delegate to
-// inner_->seq_rm — caller decides separately whether to free the hot
-// slots (which is a problem for hybrids today; that's tracked
-// separately as the hot-freeing follow-up).
+// never executes. After backup, frees hot attention slots so the
+// reclaimed positions can be reused by subsequent prefill — the whole
+// point of "proactive eviction" is making room.
+//
+// Hybrid models need a partial seq_rm path that only touches attention,
+// not recurrent state. Upstream's llama_memory_hybrid::seq_rm tries
+// recurrent first and aborts the whole call if recurrent rejects the
+// range — which it does for any partial wipe, since recurrent state is
+// a fixed-size summary that can't be sliced positionally. So for
+// hybrids we reach past the wrapper to mem_attn->seq_rm directly.
+// For pure-attention models the regular inner_->seq_rm works fine.
 uint32_t llama_memory_tiered::backup_proactive(llama_seq_id seq_id,
                                                  llama_pos    p0,
                                                  llama_pos    p1) {
     if (!inner_ || p0 < 0 || p1 <= p0) return 0;
-    return backup_seq_rm_range(seq_id, p0, p1);
+
+    const uint32_t backed_up = backup_seq_rm_range(seq_id, p0, p1);
+    if (backed_up == 0) return 0;
+
+    bool freed = false;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(inner_.get())) {
+        freed = h->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    } else if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(inner_.get())) {
+        freed = h->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    } else {
+        freed = inner_->seq_rm(seq_id, p0, p1);
+    }
+
+    if (freed) {
+        for (llama_pos p = p0; p < p1; ++p) {
+            eviction_.remove(p);
+        }
+        update_tier_state();
+    } else {
+        LLAMA_LOG_WARN("mt::backup_proactive: backed up %u positions in [%d,%d) "
+                       "for seq %d but inner cache refused to free hot slots — "
+                       "no room reclaimed\n",
+                       backed_up, p0, p1, seq_id);
+    }
+    return backed_up;
 }
 
 // Resync our tier bookkeeping from inner_'s ground truth.
