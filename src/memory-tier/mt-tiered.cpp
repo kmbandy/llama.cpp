@@ -1329,31 +1329,61 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         // n_seq_max=1 today so "for this seq" === "all of it." When mt::
         // grows multi-seq tracking, scope these wipes by seq_id.
         if (p0 < 0 || p1 < 0) {
-            const size_t n_warm   = warm_pos_to_slot_.size();
-            const size_t n_cold   = cold_positions_.size();
-            const size_t n_finger = semantic_.size();
+            // Phase 2b-C-3: hard-branch to paged variant when flag is set.
+            // semantic_ / pressure_announced_ wipes are shared (not
+            // paged-specific) but the tier bookkeeping diverges.
+            if (cfg_.paged_blocks) {
+                // Block-keyed wipe. Per-seq scoping is real here (paged_table_
+                // is indexed by seq_id), unlike the position-keyed path which
+                // wipes globally because its maps don't carry seq scope.
+                const size_t n_finger = semantic_.size();
 
-            warm_pos_to_slot_.clear();
-            evicted_to_warm_.clear();
-            warm_insertion_order_.clear();
-            cold_positions_.clear();
-            warm_recur_buf_.clear();
-            semantic_.clear();
-            pressure_announced_ = false;
-
-            if (warm_initialized_) {
-                warm_free_slots_.clear();
-                warm_free_slots_.reserve(warm_capacity_);
-                for (uint32_t s = warm_capacity_; s-- > 0; ) {
-                    warm_free_slots_.push_back((int) s);
+                std::vector<uint32_t> freed = paged_table_.clear_seq(seq_id);
+                const size_t n_blocks_freed = freed.size();
+                for (uint32_t bid : freed) {
+                    if (bid != kInvalidBlockId) {
+                        paged_pool_.free_block(bid);
+                    }
                 }
-            }
 
-            if (n_warm + n_cold + n_finger > 0) {
-                LLAMA_LOG_INFO("mt::seq_rm: whole-seq wipe for seq %d — freed "
-                               "%zu warm slots, dropped %zu cold entries, "
-                               "cleared %zu semantic fingerprints\n",
-                               seq_id, n_warm, n_cold, n_finger);
+                semantic_.clear();
+                pressure_announced_ = false;
+
+                if (n_blocks_freed + n_finger > 0) {
+                    LLAMA_LOG_INFO("mt::seq_rm: paged whole-seq wipe for seq %d "
+                                   "— freed %zu blocks (paged_pool free: gpu=%zu "
+                                   "cpu=%zu), cleared %zu semantic fingerprints\n",
+                                   seq_id, n_blocks_freed,
+                                   paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu(),
+                                   n_finger);
+                }
+            } else {
+                const size_t n_warm   = warm_pos_to_slot_.size();
+                const size_t n_cold   = cold_positions_.size();
+                const size_t n_finger = semantic_.size();
+
+                warm_pos_to_slot_.clear();
+                evicted_to_warm_.clear();
+                warm_insertion_order_.clear();
+                cold_positions_.clear();
+                warm_recur_buf_.clear();
+                semantic_.clear();
+                pressure_announced_ = false;
+
+                if (warm_initialized_) {
+                    warm_free_slots_.clear();
+                    warm_free_slots_.reserve(warm_capacity_);
+                    for (uint32_t s = warm_capacity_; s-- > 0; ) {
+                        warm_free_slots_.push_back((int) s);
+                    }
+                }
+
+                if (n_warm + n_cold + n_finger > 0) {
+                    LLAMA_LOG_INFO("mt::seq_rm: whole-seq wipe for seq %d — freed "
+                                   "%zu warm slots, dropped %zu cold entries, "
+                                   "cleared %zu semantic fingerprints\n",
+                                   seq_id, n_warm, n_cold, n_finger);
+                }
             }
         }
 
