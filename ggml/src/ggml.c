@@ -1092,6 +1092,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
+    "PAGED_ATTN_MT",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1121,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1203,6 +1204,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
+    "paged_attn_mt(q,k,v,bt,cl,ql)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1232,7 +1234,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5408,6 +5410,54 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paged_attn_mt(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_cache,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * block_tables,
+        struct ggml_tensor  * context_lens,
+        struct ggml_tensor  * q_lens,
+        int                   block_size,
+        int                   n_kv_heads,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
+    GGML_ASSERT(block_tables->type == GGML_TYPE_I32);
+    GGML_ASSERT(context_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(q_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
+    GGML_ASSERT(n_kv_heads > 0);
+
+    // Output shape mirrors q: [head_dim, n_heads, sum(q_lens), 1]
+    int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 4, ne);
+
+    // op_params (matches mt::ggml_cuda_op_paged_attn_mt's expected layout):
+    //   [0]: float scale
+    //   [1]: int32_t block_size
+    //   [2]: int32_t max_blocks_per_seq (= block_tables->ne[0])
+    //   [3]: int32_t n_kv_heads
+    int32_t max_blocks_per_seq = (int32_t) block_tables->ne[0];
+    int32_t params_i32[4];
+    memcpy(&params_i32[0], &scale, sizeof(scale));
+    params_i32[1] = block_size;
+    params_i32[2] = max_blocks_per_seq;
+    params_i32[3] = n_kv_heads;
+    ggml_set_op_params(result, params_i32, sizeof(params_i32));
+
+    result->op     = GGML_OP_PAGED_ATTN_MT;
+    result->src[0] = q;
+    result->src[1] = k_cache;
+    result->src[2] = v_cache;
+    result->src[3] = block_tables;
+    result->src[4] = context_lens;
+    result->src[5] = q_lens;
 
     return result;
 }

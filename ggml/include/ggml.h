@@ -561,6 +561,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_PAGED_ATTN_MT,    // mt:: paged attention (block-table indirected K/V)
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2421,6 +2422,28 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // mt:: paged attention. Reads K/V from a block-indexed buffer
+    // rather than a contiguous KV cache. See
+    // ggml-cuda/mt_pagedattn.cuh for the layout contract.
+    //   q             [head_dim, n_heads,    sum(q_lens), 1]    f16
+    //   k_cache       [num_blocks, n_kv_heads, head_dim/x, block_size, x]  f16 (interleaved)
+    //   v_cache       [num_blocks, n_kv_heads, head_dim, block_size]       f16 (transposed)
+    //   block_tables  [max_blocks_per_seq, num_seqs]                       i32
+    //   context_lens  [num_seqs]                                            i32
+    //   q_lens        [num_seqs]                                            i32
+    // returns a tensor with q's shape (head_dim, n_heads, sum(q_lens), 1).
+    GGML_API struct ggml_tensor * ggml_paged_attn_mt(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_cache,
+            struct ggml_tensor  * v_cache,
+            struct ggml_tensor  * block_tables,
+            struct ggml_tensor  * context_lens,
+            struct ggml_tensor  * q_lens,
+            int                   block_size,
+            int                   n_kv_heads,
+            float                 scale);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
