@@ -2092,6 +2092,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
+                        // Phase 3.6: when --kv-tier-paged-blocks is set,
+                        // route the attn sub-cache through llama_kv_cache_paged.
+                        // SWA hybrids are still TBD (would need a paged-iswa
+                        // variant); for now they fall back to the regular
+                        // hybrid_iswa path above.
+                        uint32_t paged_n_blocks  = 0;
+                        uint32_t paged_bsize     = 16;
+                        uint32_t paged_max_bps   = 0;
+                        if (params.kv_tier_paged_blocks) {
+                            paged_bsize     = params.kv_tier_paged_block_size > 0
+                                                ? (uint32_t) params.kv_tier_paged_block_size : 16u;
+                            const uint32_t blocks_for_ctx = (cparams.n_ctx_seq + paged_bsize - 1) / paged_bsize;
+                            paged_n_blocks  = (uint32_t)((double) blocks_for_ctx * 1.5);
+                            paged_max_bps   = blocks_for_ctx;
+                            LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged "
+                                           "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
+                                           paged_n_blocks, paged_bsize, cparams.n_ctx_seq, cparams.n_seq_max);
+                        }
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2108,7 +2126,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* paged_n_blocks            */ paged_n_blocks,
+                            /* paged_block_size          */ paged_bsize,
+                            /* paged_max_blocks_per_seq  */ paged_max_bps);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;

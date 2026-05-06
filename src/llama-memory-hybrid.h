@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
@@ -38,7 +39,17 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* Phase 3.6: paged attn (mt::). When n_blocks > 0
+                               the attention sub-cache is constructed as
+                               llama_kv_cache_paged instead of llama_kv_cache.
+                               kv_size / n_pad / n_swa / swa_type are ignored
+                               in the paged path. block_size and n_blocks come
+                               from cparams.kv_tier_paged_blocks; see
+                               llama-model.cpp create_memory for sizing. */
+                 uint32_t   paged_n_blocks = 0,
+                 uint32_t   paged_block_size = 16,
+                 uint32_t   paged_max_blocks_per_seq = 0);
 
     ~llama_memory_hybrid() = default;
 
@@ -87,11 +98,29 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // Phase 3.6: paged-attn variant. When the hybrid is constructed with
+    // paged_n_blocks > 0, mem_attn_paged holds the cache and mem_attn is
+    // null. is_paged_attn() returns true; get_mem_attn_paged() returns
+    // the paged cache for the graph builder to thread tensors from.
+    bool                     is_paged_attn() const { return mem_attn_paged != nullptr; }
+    llama_kv_cache_paged *   get_mem_attn_paged() const { return mem_attn_paged.get(); }
+
 private:
     const llama_hparams & hparams;
 
-    const std::unique_ptr<llama_kv_cache> mem_attn;
-    const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    // Mutually exclusive: either mem_attn (regular kv) is non-null, or
+    // mem_attn_paged (Phase 3.6 paged variant) is non-null. is_paged_attn()
+    // distinguishes; everything that touches the attn sub-cache must
+    // branch on it.
+    const std::unique_ptr<llama_kv_cache>           mem_attn;
+    const std::unique_ptr<llama_kv_cache_paged>     mem_attn_paged;
+    const std::unique_ptr<llama_memory_recurrent>   mem_recr;
+
+    // Internal: returns whichever of mem_attn / mem_attn_paged is live,
+    // upcast to the polymorphic base. Used by methods that only need
+    // llama_memory_i functionality (clear, seq_*, state_*, memory_breakdown)
+    // and don't care which concrete cache is behind it.
+    llama_memory_i * attn_base() const;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -116,6 +145,15 @@ public:
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches);
 
+    // Phase 3.6: init success — paged attn variant. The attn sub-context
+    // is pre-built (returned by mem_attn_paged->init_batch) instead of
+    // being constructed from sinfos. Mutually exclusive with the regular
+    // sinfos-based ctor.
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        llama_memory_context_ptr    ctx_attn_paged,
+        std::vector<llama_ubatch>   ubatches);
+
     ~llama_memory_hybrid_context() = default;
 
     bool next()  override;
@@ -135,6 +173,12 @@ public:
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+
+    // Phase 3.6: when the underlying hybrid was built with paged attn,
+    // ctx_attn is a llama_kv_cache_paged_context — get_attn() above will
+    // return null (it static_casts to the regular type) and callers must
+    // use get_attn_paged() instead. Returns null when attn is regular.
+    const llama_kv_cache_paged_context * get_attn_paged() const;
 
 private:
     // the index of the next ubatch to process

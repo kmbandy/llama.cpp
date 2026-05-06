@@ -610,17 +610,34 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // Phase 3.6: paged attn branch. Mirrors llm_graph_input_attn_kv::set_input
+    // paged path — only the slot_mapping tensor is set per-batch from this
+    // side; block_table / context_lens / q_lens are owned + uploaded by
+    // the cache itself in prepare_batch_tensors.
+    if (inp_attn->is_paged) {
+        GGML_ASSERT(inp_attn->paged_slot_mapping != nullptr);
+        GGML_ASSERT(inp_attn->mctx_paged        != nullptr);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        const auto * paged_parent = inp_attn->mctx_paged->parent();
+        std::vector<int32_t> slots((size_t) ubatch->n_tokens, -1);
+        const bool ok = paged_parent->compute_slot_mapping(ubatch, slots.data());
+        GGML_ASSERT(ok && "paged hybrid set_input: compute_slot_mapping failed");
 
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
+        ggml_backend_tensor_set(inp_attn->paged_slot_mapping, slots.data(), 0,
+                                sizeof(int32_t) * slots.size());
+    } else {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+        if (inp_attn->self_k_rot) {
+            mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+        }
+
+        if (inp_attn->self_v_rot) {
+            mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        }
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -643,10 +660,23 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+    if (inp_attn->is_paged) {
+        // Paged attn: graph reusable when the new batch's n_tokens still
+        // matches the slot_mapping tensor we sized at build time, and the
+        // attn ctx is still paged.
+        const auto * new_paged = mctx->get_attn_paged();
+        if (!new_paged) {
+            return false;
+        }
+        inp_attn->mctx_paged = new_paged;
+        res &= inp_attn->paged_slot_mapping != nullptr
+            && inp_attn->paged_slot_mapping->ne[0] == params.ubatch.n_tokens;
+    } else {
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+      //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2234,36 +2264,44 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
+// Phase 3.4b/3.6: paged-context input builder. Used by both the standalone
+// non-hybrid path (build_attn_inp_kv) and the hybrid attn-sub path
+// (build_inp_mem_hybrid) when the bound attention cache is paged. Returns
+// an input class whose only-populated fields are paged_* + is_paged + mctx_paged.
+static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_paged_impl(
+           ggml_context * ctx0,
+     const llama_ubatch & ubatch,
+    const llama_hparams & hparams,
+    const llama_cparams & cparams,
+    const llama_kv_cache_paged_context * mctx_paged) {
+
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, /*mctx=*/nullptr);
+    inp->is_paged   = true;
+    inp->mctx_paged = mctx_paged;
+
+    auto * paged_parent = mctx_paged->parent();
+    inp->paged_block_table  = paged_parent->block_table_tensor();
+    inp->paged_context_lens = paged_parent->context_lens_tensor();
+    inp->paged_q_lens       = paged_parent->q_lens_tensor();
+
+    // Allocate the per-token slot_mapping in the graph context. Sized
+    // to the current ubatch — same tensor reused across every layer in
+    // this build, populated once per batch by set_input from the paged
+    // context's parent state + ubatch positions.
+    const int64_t n_tokens = (int64_t) ubatch.n_tokens;
+    inp->paged_slot_mapping = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->paged_slot_mapping);
+    ggml_set_name(inp->paged_slot_mapping, "paged_slot_mapping");
+
+    return inp;
+}
+
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     // Phase 3.4b: detect paged context and route to the paged input
-    // builder. The paged path populates only `paged_*` fields on the
-    // returned input; build_attn dispatches on `inp->is_paged`.
+    // builder. Paged input populates only paged_* fields on the returned
+    // class; build_attn dispatches on inp->is_paged.
     if (const auto * mctx_paged = dynamic_cast<const llama_kv_cache_paged_context *>(mctx)) {
-        // The paged input shares the llm_graph_input_attn_kv class as a
-        // tagged union so model code that already calls build_attn_inp_kv
-        // → build_attn doesn't need to fork. mctx is left null on the
-        // regular field; consumers MUST gate on is_paged before reading
-        // self_k_idxs / self_kq_mask / etc.
-        auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, /*mctx=*/nullptr);
-        inp->is_paged = true;
-        inp->mctx_paged = mctx_paged;
-
-        auto * paged_parent = mctx_paged->parent();
-        inp->paged_block_table  = paged_parent->block_table_tensor();
-        inp->paged_context_lens = paged_parent->context_lens_tensor();
-        inp->paged_q_lens       = paged_parent->q_lens_tensor();
-
-        // Allocate the per-token slot_mapping in the graph context.
-        // Sized to the current ubatch — the same tensor is reused across
-        // every layer in this build, populated once per batch by
-        // set_input from the paged context's parent state + ubatch
-        // positions. Allocated with ggml_set_input flag so the backend
-        // scheduler treats it as a graph-time input.
-        const int64_t n_tokens = (int64_t) ubatch.n_tokens;
-        inp->paged_slot_mapping = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        ggml_set_input(inp->paged_slot_mapping);
-        ggml_set_name(inp->paged_slot_mapping, "paged_slot_mapping");
-
+        auto inp = build_attn_inp_kv_paged_impl(ctx0, ubatch, hparams, cparams, mctx_paged);
         return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
     }
 
@@ -2886,8 +2924,18 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_rs   = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
+
+    // Phase 3.6: dispatch attn-side input on paged-vs-regular. When the
+    // hybrid was built with --kv-tier-paged-blocks, get_attn_paged()
+    // returns the paged context and get_attn() returns nullptr; route
+    // to the paged input builder accordingly.
+    std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    if (const auto * mctx_paged = mctx_cur->get_attn_paged()) {
+        inp_attn = build_attn_inp_kv_paged_impl(ctx0, ubatch, hparams, cparams, mctx_paged);
+    } else {
+        inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    }
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
