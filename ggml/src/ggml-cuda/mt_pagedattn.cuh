@@ -81,4 +81,27 @@ __global__ void mt_paged_attention_kernel(
 // Inputs come from the GGML_OP_PAGED_ATTN_MT op's source tensors.
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Phase 3.4b-2: paged K/V scatter. Writes per-batch K_cur/V_cur into
+// the block-indexed K_cache / V_cache at slots given by `slot_mapping`.
+// Layout-matched to the attention kernel's K interleaving (x = 16/sizeof
+// scalar) and transposed-V (block_size as the trailing fast axis), so
+// the same caches feed both ops without conversion.
+//
+// Kernel:
+//   __global__ void mt_reshape_and_cache_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, X>(
+//     const scalar_t * k_cur, const scalar_t * v_cur,
+//     scalar_t * k_cache, scalar_t * v_cache,
+//     const int32_t * slot_mapping, int n_kv_heads, int n_tokens);
+//
+// Grid:   (n_tokens, n_kv_heads)
+// Block:  HEAD_SIZE threads (one thread per head_dim element)
+//
+// Each thread reads K_cur[dim, head, token] + V_cur[dim, head, token]
+// and writes them into the cache at the layout-correct positions for
+// the slot resolved from slot_mapping[token]. A negative slot means
+// "skip this token" (e.g. padding).
+//
+// Implemented in mt_pagedattn.cu; dispatched on (head_size, block_size).
+void ggml_cuda_op_paged_kv_update_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 }  // namespace mt

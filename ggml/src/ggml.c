@@ -1093,6 +1093,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "PAGED_ATTN_MT",
+    "PAGED_KV_UPDATE_MT",
     "SSM_CONV",
     "SSM_SCAN",
     "WIN_PART",
@@ -1122,7 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1206,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "paged_attn_mt(q,k,v,bt,cl,ql)",
+    "paged_kv_update_mt(k_cur,v_cur,k_cache,v_cache,slot_map)",
     "ssm_conv(x)",
     "ssm_scan(x)",
     "win_part(x)",
@@ -1234,7 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5458,6 +5460,48 @@ struct ggml_tensor * ggml_paged_attn_mt(
     result->src[3] = block_tables;
     result->src[4] = context_lens;
     result->src[5] = q_lens;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_paged_kv_update_mt(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * k_cache,
+        struct ggml_tensor  * v_cache,
+        struct ggml_tensor  * slot_mapping,
+        int                   block_size,
+        int                   n_kv_heads) {
+    GGML_ASSERT(k_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
+    GGML_ASSERT(slot_mapping->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
+    GGML_ASSERT(n_kv_heads > 0);
+    // k_cur / v_cur shape: [head_dim, n_kv_heads, n_tokens]
+    GGML_ASSERT(k_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(v_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(k_cur->ne[2] == slot_mapping->ne[0]);
+
+    // The op writes its sources in-place; the returned tensor is a
+    // 0-element graph anchor whose only role is to chain a forward-expand.
+    int64_t ne_anchor[1] = { 0 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne_anchor);
+
+    // op_params:
+    //   [0]: int32_t block_size
+    //   [1]: int32_t n_kv_heads
+    int32_t params_i32[2] = { block_size, n_kv_heads };
+    ggml_set_op_params(result, params_i32, sizeof(params_i32));
+
+    result->op     = GGML_OP_PAGED_KV_UPDATE_MT;
+    result->src[0] = k_cur;
+    result->src[1] = v_cur;
+    result->src[2] = k_cache;
+    result->src[3] = v_cache;
+    result->src[4] = slot_mapping;
 
     return result;
 }
