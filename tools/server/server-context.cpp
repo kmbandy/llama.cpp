@@ -1514,8 +1514,17 @@ private:
                 if (mt_tier) {
                     // Eviction window starts at the cursor — the next
                     // not-yet-backed-up positions. Cursor advances by the
-                    // returned count so subsequent triggers walk forward
-                    // through position space.
+                    // RANGE WIDTH on success, NOT the count of positions
+                    // returned. For the position-keyed path these match;
+                    // for the paged-blocks path they don't (block-aligned
+                    // backups can return fewer positions than the
+                    // requested range when n_evict isn't a multiple of
+                    // block_size). Advancing by range width keeps
+                    // subsequent triggers from re-asking for partial
+                    // ranges that already got a block-rounded sweep.
+                    // (If backup returns 0, we DO NOT advance — that
+                    // means total failure and we want the next trigger
+                    // to retry the same range.)
                     const llama_pos p0 = slot.kv_evict_through;
                     const llama_pos p1 = p0 + (llama_pos)n_evict;
                     const uint32_t backed_up = mt_tier->backup_proactive(
@@ -1547,7 +1556,12 @@ private:
                                 }
                             }
                         }
-                        slot.kv_evict_through += (llama_pos)backed_up;
+                        // Advance to the requested range end, not the count
+                        // of positions actually backed up. See the comment
+                        // above this branch — block-aligned paged backups
+                        // can return fewer positions than requested when
+                        // n_evict isn't a clean multiple of block_size.
+                        slot.kv_evict_through = p1;
                         SLT_DBG(slot, "proactive mt:: backup: %u/%d positions [%d,%d) at %d live / %u hot capacity\\n",
                                 backed_up, n_evict, p0, p1, n_live_hot, cap);
                     }
