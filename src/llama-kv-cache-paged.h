@@ -111,6 +111,15 @@ public:
     // control later).
     bool ensure_blocks_for(llama_seq_id seq_id, uint32_t n_new_tokens);
 
+    // Phase 3.4b-3: per-batch slot resolution. For each token i in
+    // `ubatch`, write into out[i] the physical slot index that token
+    // should land in: `physical_block_idx * block_size + slot_in_block`.
+    // out must have at least ubatch->n_tokens entries. Returns false +
+    // leaves out unspecified if any token resolves to an unallocated
+    // logical block (loader bug — ensure_blocks_for should have run
+    // first). For v1 single-seq, all tokens are assumed seq 0.
+    bool compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const;
+
 private:
     friend class llama_kv_cache_paged_context;
 

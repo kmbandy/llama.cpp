@@ -451,6 +451,25 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    // Paged path: only the slot_mapping tensor is set per-batch from the
+    // graph builder side. block_table / context_lens / q_lens are set by
+    // the cache's prepare_batch_tensors (called from init_batch) — they
+    // live on the cache, not the input. mctx (regular kv ctx) is null
+    // in this branch; everything goes through mctx_paged + its parent.
+    if (is_paged) {
+        GGML_ASSERT(paged_slot_mapping != nullptr);
+        GGML_ASSERT(mctx_paged        != nullptr);
+
+        const auto * paged_parent = mctx_paged->parent();
+        std::vector<int32_t> slots((size_t) ubatch->n_tokens, -1);
+        const bool ok = paged_parent->compute_slot_mapping(ubatch, slots.data());
+        GGML_ASSERT(ok && "paged compute_slot_mapping failed — block_table out of sync with ubatch positions");
+
+        ggml_backend_tensor_set(paged_slot_mapping, slots.data(), 0,
+                                sizeof(int32_t) * slots.size());
+        return;
+    }
+
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -466,6 +485,20 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+    if (is_paged) {
+        // Paged path can reuse the graph as long as the batch shape
+        // matches the slot_mapping tensor we sized at build time. Block
+        // table state changes don't invalidate the graph (it's an input
+        // tensor whose contents update each batch).
+        const auto * new_paged = dynamic_cast<const llama_kv_cache_paged_context *>(params.mctx);
+        if (!new_paged) {
+            return false;
+        }
+        this->mctx_paged = new_paged;
+        return paged_slot_mapping != nullptr
+            && paged_slot_mapping->ne[0] == params.ubatch.n_tokens;
+    }
+
     const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
     this->mctx = mctx;
@@ -2220,6 +2253,17 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
         inp->paged_context_lens = paged_parent->context_lens_tensor();
         inp->paged_q_lens       = paged_parent->q_lens_tensor();
 
+        // Allocate the per-token slot_mapping in the graph context.
+        // Sized to the current ubatch — the same tensor is reused across
+        // every layer in this build, populated once per batch by
+        // set_input from the paged context's parent state + ubatch
+        // positions. Allocated with ggml_set_input flag so the backend
+        // scheduler treats it as a graph-time input.
+        const int64_t n_tokens = (int64_t) ubatch.n_tokens;
+        inp->paged_slot_mapping = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->paged_slot_mapping);
+        ggml_set_name(inp->paged_slot_mapping, "paged_slot_mapping");
+
         return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
     }
 
@@ -2247,20 +2291,63 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // Phase 3.4b: paged dispatch. When the bound memory context was a
     // llama_kv_cache_paged_context, build_attn_inp_kv set is_paged on the
-    // input. Step 1 (this commit) routes to a clear ABORT so the paged
-    // model boots, allocates the cache, and fails fast with a recognizable
-    // error at first attention call. Step 2 implements the scatter +
-    // ggml_paged_attn_mt body.
+    // input and populated the 4 paged tensors (block_table, context_lens,
+    // q_lens, slot_mapping). Wire the scatter + paged_attn call here and
+    // return early so the regular non-paged path below is skipped.
     if (inp->is_paged) {
-        GGML_UNUSED(wo); GGML_UNUSED(wo_b); GGML_UNUSED(wo_s);
-        GGML_UNUSED(q_cur); GGML_UNUSED(k_cur); GGML_UNUSED(v_cur);
-        GGML_UNUSED(kq_b); GGML_UNUSED(sinks);
-        GGML_UNUSED(kq_scale); GGML_UNUSED(il);
-        GGML_ABORT("mt:: paged attention build_attn body not yet implemented "
-                   "(Phase 3.4b-2 work) — kernel + ggml op + cache class are "
-                   "in place; the graph-side scatter + ggml_paged_attn_mt call "
-                   "lands in the next commit. Drop --kv-tier-paged-blocks to "
-                   "use the standard kv cache.");
+        GGML_UNUSED(wo_s);  // wo_s is non-null for some quant paths in the
+                            // regular kv path; paged v1 doesn't carry it.
+        GGML_UNUSED(kq_b);
+        GGML_UNUSED(sinks);
+
+        // The paged kernel reads K/V from the per-layer block-indexed
+        // cache. Look up this layer's storage handles via the parent.
+        auto * paged_parent = inp->mctx_paged->parent();
+        const auto & layer  = paged_parent->layer((uint32_t) il);
+        const int    block_size = (int) paged_parent->block_size();
+        const int    n_kv_heads = (int) layer.n_kv_heads;
+
+        // 1) Forward-expand q/k/v_cur so the scatter sees fully-computed
+        //    sources (mirrors the regular path's barrier).
+        ggml_build_forward_expand(gf, q_cur);
+        ggml_build_forward_expand(gf, k_cur);
+        ggml_build_forward_expand(gf, v_cur);
+
+        // 2) Scatter k_cur / v_cur into this layer's K_cache / V_cache.
+        //    The op writes in-place; the returned tensor is an i32 graph
+        //    anchor. Forward-expand it so the scatter completes before
+        //    paged_attn reads from the same cache buffers.
+        ggml_tensor * scatter_anchor = ggml_paged_kv_update_mt(
+            ctx0,
+            k_cur, v_cur,
+            layer.k, layer.v,
+            inp->paged_slot_mapping,
+            block_size, n_kv_heads);
+        ggml_build_forward_expand(gf, scatter_anchor);
+
+        // 3) Run paged attention. Output is [head_dim, n_heads, n_tokens, 1].
+        ggml_tensor * cur = ggml_paged_attn_mt(
+            ctx0,
+            q_cur, layer.k, layer.v,
+            inp->paged_block_table,
+            inp->paged_context_lens,
+            inp->paged_q_lens,
+            block_size, n_kv_heads, kq_scale);
+        cb(cur, "kqv_paged_out", il);
+
+        // 4) Reshape to (head_dim*n_heads, n_tokens) for the wo projection.
+        const int64_t n_embd_full = q_cur->ne[0] * q_cur->ne[1];
+        const int64_t n_tokens    = q_cur->ne[2];
+        cur = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), n_embd_full, n_tokens);
+
+        // 5) wo / wo_b post-projection (mirrors the regular path's tail).
+        if (wo) {
+            cur = build_lora_mm(wo, cur);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
     }
 
     if (inp->self_k_rot) {

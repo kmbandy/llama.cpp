@@ -188,6 +188,42 @@ bool llama_kv_cache_paged::ensure_blocks_for(llama_seq_id seq_id, uint32_t n_new
     return true;
 }
 
+bool llama_kv_cache_paged::compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const {
+    // For v1 single-seq (n_seq_max == 1), every token belongs to seq 0.
+    // The seq's logical block list is in table_; for token i at position
+    // pos = ubatch->pos[i]:
+    //   logical_block_idx = pos / block_size_
+    //   physical_block    = table_.get_physical(0, logical_block_idx)
+    //   slot_in_block     = pos % block_size_
+    //   slot_mapping[i]   = physical_block * block_size_ + slot_in_block
+    //
+    // Multi-seq (n_seq_max > 1) is a follow-up: walk ubatch->seq_id[i][0]
+    // per token instead of pinning seq 0.
+    GGML_ASSERT(n_seq_max_ == 1 && "compute_slot_mapping: multi-seq not yet implemented");
+
+    const uint32_t n_blk = table_.num_blocks(/*seq_id=*/0);
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_pos pos = ubatch->pos[i];
+        if (pos < 0) {
+            out[i] = -1;  // padding token
+            continue;
+        }
+        const uint32_t logical = (uint32_t) pos / block_size_;
+        const uint32_t slot    = (uint32_t) pos % block_size_;
+        if (logical >= n_blk) {
+            // ensure_blocks_for should have allocated enough — bug.
+            return false;
+        }
+        const uint32_t physical = table_.get_physical(/*seq_id=*/0, logical);
+        if (physical == mt::kInvalidBlockId) {
+            return false;
+        }
+        out[i] = (int32_t)(physical * block_size_ + slot);
+    }
+    return true;
+}
+
 void llama_kv_cache_paged::prepare_batch_tensors() {
     // Write per-seq block table + context lens + q lens into host
     // mirrors, then copy to backend.

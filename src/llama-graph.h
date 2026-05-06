@@ -332,6 +332,13 @@ public:
     ggml_tensor * paged_block_table  = nullptr;  // i32 [max_blocks_per_seq, n_seq_max]
     ggml_tensor * paged_context_lens = nullptr;  // i32 [n_seq_max]
     ggml_tensor * paged_q_lens       = nullptr;  // i32 [n_seq_max]
+    // [n_tokens] i32 — per-token physical slot in the cache. Allocated
+    // fresh by build_attn_inp_kv (one per graph build, reused across all
+    // layers in that build). Filled by set_input each batch from the
+    // paged context's parent state + ubatch positions. A negative entry
+    // marks "skip this token" (padding); the scatter kernel honors the
+    // sentinel and the attention kernel never reads from those slots.
+    ggml_tensor * paged_slot_mapping = nullptr;
     const class llama_kv_cache_paged_context * mctx_paged = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
