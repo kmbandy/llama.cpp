@@ -178,6 +178,11 @@ public:
     const llama_ubatch & get_ubatch() const override;
     llama_memory_status  get_status() const override { return status_; }
 
+    // Phase 3.4b: graph builder needs to reach the parent cache to fetch
+    // the per-batch input tensors (block_table / context_lens / q_lens)
+    // that ggml_paged_attn_mt consumes.
+    llama_kv_cache_paged * parent() const { return parent_; }
+
 private:
     llama_kv_cache_paged *    parent_;
     std::vector<llama_ubatch> ubatches_;

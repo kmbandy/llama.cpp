@@ -313,6 +313,27 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // ─── Phase 3.4b: paged-cache path ──────────────────────────────────────
+    // When the bound memory context is a `llama_kv_cache_paged_context`
+    // (mt:: paged backend, opt-in via --kv-tier-paged-blocks), the input
+    // carries paged tensors instead of the regular k_idxs / v_idxs / kq_mask
+    // fields above. The dispatch happens in build_attn_inp_kv (which
+    // populates either the regular OR the paged fields, never both) and
+    // in build_attn (which routes to the paged kernel via
+    // ggml_paged_attn_mt instead of the regular cpy_k/get_k path).
+    //
+    // The 3 paged tensors are owned by the parent llama_kv_cache_paged;
+    // these are graph-input handles refreshed each batch by set_input.
+    //
+    // Mutual exclusion: when `is_paged == true`, the regular self_k_idxs
+    // / self_v_idxs / self_kq_mask* / self_k_rot / self_v_rot fields are
+    // all nullptr.
+    bool is_paged = false;
+    ggml_tensor * paged_block_table  = nullptr;  // i32 [max_blocks_per_seq, n_seq_max]
+    ggml_tensor * paged_context_lens = nullptr;  // i32 [n_seq_max]
+    ggml_tensor * paged_q_lens       = nullptr;  // i32 [n_seq_max]
+    const class llama_kv_cache_paged_context * mctx_paged = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

@@ -7,6 +7,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2201,6 +2202,27 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+    // Phase 3.4b: detect paged context and route to the paged input
+    // builder. The paged path populates only `paged_*` fields on the
+    // returned input; build_attn dispatches on `inp->is_paged`.
+    if (const auto * mctx_paged = dynamic_cast<const llama_kv_cache_paged_context *>(mctx)) {
+        // The paged input shares the llm_graph_input_attn_kv class as a
+        // tagged union so model code that already calls build_attn_inp_kv
+        // → build_attn doesn't need to fork. mctx is left null on the
+        // regular field; consumers MUST gate on is_paged before reading
+        // self_k_idxs / self_kq_mask / etc.
+        auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, /*mctx=*/nullptr);
+        inp->is_paged = true;
+        inp->mctx_paged = mctx_paged;
+
+        auto * paged_parent = mctx_paged->parent();
+        inp->paged_block_table  = paged_parent->block_table_tensor();
+        inp->paged_context_lens = paged_parent->context_lens_tensor();
+        inp->paged_q_lens       = paged_parent->q_lens_tensor();
+
+        return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+    }
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
@@ -2222,6 +2244,24 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    // Phase 3.4b: paged dispatch. When the bound memory context was a
+    // llama_kv_cache_paged_context, build_attn_inp_kv set is_paged on the
+    // input. Step 1 (this commit) routes to a clear ABORT so the paged
+    // model boots, allocates the cache, and fails fast with a recognizable
+    // error at first attention call. Step 2 implements the scatter +
+    // ggml_paged_attn_mt body.
+    if (inp->is_paged) {
+        GGML_UNUSED(wo); GGML_UNUSED(wo_b); GGML_UNUSED(wo_s);
+        GGML_UNUSED(q_cur); GGML_UNUSED(k_cur); GGML_UNUSED(v_cur);
+        GGML_UNUSED(kq_b); GGML_UNUSED(sinks);
+        GGML_UNUSED(kq_scale); GGML_UNUSED(il);
+        GGML_ABORT("mt:: paged attention build_attn body not yet implemented "
+                   "(Phase 3.4b-2 work) — kernel + ggml op + cache class are "
+                   "in place; the graph-side scatter + ggml_paged_attn_mt call "
+                   "lands in the next commit. Drop --kv-tier-paged-blocks to "
+                   "use the standard kv cache.");
+    }
 
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
