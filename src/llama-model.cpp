@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2159,6 +2160,48 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // Phase 3.4a: when --kv-tier-paged-blocks is set AND the model is a
+    // standard (non-hybrid, non-recurrent, non-SWA) attention model, swap
+    // the standard llama_kv_cache for llama_kv_cache_paged. Hybrid /
+    // recurrent / SWA models stay on their existing memory backends for
+    // now — adding paged variants for those is a follow-up phase.
+    //
+    // Block sizing: pool sized to fit the user's requested ctx in blocks,
+    // with some headroom. n_blocks_total = ceil(n_ctx_seq / block_size) * 1.5
+    // gives ~33% slack for eviction/refill churn. Cap max_blocks_per_seq
+    // to the same number — single seq can use the full pool in v1.
+    if (res && params.kv_tier_paged_blocks
+        && !llm_arch_is_recurrent(arch)
+        && !llm_arch_is_hybrid(arch)
+        && hparams.swa_type == LLAMA_SWA_TYPE_NONE) {
+
+        delete res;  // discard the standard cache we just built
+        const uint32_t bsize = params.kv_tier_paged_block_size > 0
+                             ? (uint32_t) params.kv_tier_paged_block_size : 16u;
+        const uint32_t blocks_for_ctx = (cparams.n_ctx_seq + bsize - 1) / bsize;
+        const uint32_t n_blocks_total = (uint32_t)((double) blocks_for_ctx * 1.5);
+
+        // Pick the GPU buffer type from device 0 (where the model lives).
+        ggml_backend_buffer_type_t buft = nullptr;
+        if (!devices.empty()) {
+            buft = ggml_backend_dev_buffer_type(devices.front().dev);
+        }
+        if (!buft) {
+            throw std::runtime_error("llama_kv_cache_paged: no GPU buffer type available");
+        }
+
+        res = new llama_kv_cache_paged(
+                *this, buft,
+                /*n_blocks_total     =*/ n_blocks_total,
+                /*block_size         =*/ bsize,
+                /*n_seq_max          =*/ cparams.n_seq_max,
+                /*max_blocks_per_seq =*/ blocks_for_ctx);
+
+        LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged "
+                       "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
+                       n_blocks_total, bsize, cparams.n_ctx_seq, cparams.n_seq_max);
     }
 
     // Phase 2 rewrite: tiered KV wrapper. When --kv-tiered is set, wrap the
