@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -342,8 +343,17 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
 
-    // Whole-seq wipe: free all blocks, reset state.
-    if (p0 < 0 || p1 < 0) {
+    // Match the regular kv_cache convention: p0 < 0 → from 0; p1 < 0 →
+    // to max. The server uses p1 = -1 to mean "to end", NOT "wipe
+    // everything" — earlier code treated p1<0 as a whole-seq wipe and
+    // produced position drift between the cache and the slot manager.
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+
+    const llama_pos cur_max = seq_states_[seq_id].pos_max;
+
+    // Whole-seq wipe when the range covers everything.
+    if (p0 == 0 && p1 > cur_max) {
         std::vector<uint32_t> freed = table_.clear_seq(seq_id);
         for (uint32_t bid : freed) {
             if (bid != mt::kInvalidBlockId) pool_.free_block(bid);
@@ -355,11 +365,13 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     }
 
     // Partial wipe: tail truncation only for v1 (carving out middle
-    // ranges requires more bookkeeping; rare in practice). If p1 ==
-    // current pos_max+1, treat as tail truncation: free blocks
-    // entirely past the truncation point.
-    const llama_pos cur_max = seq_states_[seq_id].pos_max;
+    // ranges requires more bookkeeping; rare in practice).
     if (p0 > cur_max) return true;  // nothing to do
+    // Middle wipes (p1 < cur_max+1 with p0 > 0) aren't supported in v1.
+    // The server uses these for partial speculative-decode rollback;
+    // until we add support, treat as tail truncation from p0 (drops
+    // some valid positions but doesn't crash).
+    GGML_UNUSED(p1);
 
     // Compute new pos_max after truncation.
     const llama_pos new_max = p0 - 1;

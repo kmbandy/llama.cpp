@@ -158,51 +158,68 @@ __global__ void mt_paged_attention_kernel(
         const int valid_ctx = q_pos + 1;  // tokens [0, valid_ctx) are visible
 
         // Load Q slice into registers, scale-applied.
+        // Q layout matches ggml's natural [head_dim, n_heads, n_tokens]
+        // (head_dim fastest, n_tokens slowest in memory). For seq 0,
+        // head H, query token Q, dim D:
+        //   offset = (Q * n_heads + H) * HEAD_SIZE + D
+        // (Multi-seq batches concat sequentially in the n_tokens axis;
+        // qi here is the local-to-this-seq index, so we add the seq's
+        // start offset = sum of preceding q_lens. v1 single-seq path
+        // has seq_q_offset == 0.)
         scalar_t q_reg[VEC_PER_THREAD];
+        const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
 #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * NUM_THREADS;
             if (d < HEAD_SIZE) {
-                const size_t q_off = ((size_t) seq_idx * n_heads + head_idx) * (size_t) q_len * HEAD_SIZE
-                                   + (size_t) qi * HEAD_SIZE + d;
+                const size_t q_off = ((seq_q_offset + (size_t) qi) * n_heads + head_idx) * HEAD_SIZE + d;
                 q_reg[v] = q[q_off];
             } else {
                 q_reg[v] = scalar_t(0);
             }
         }
+        GGML_UNUSED(seq_idx);  // multi-seq offset accounting is a follow-up
 
         // ── Pass 1: QK + running max + write to logits[] ──
+        //
+        // ALL threads cooperate on ONE token at a time: each thread
+        // contributes its slice of d to partial_qk, then block_reduce_sum
+        // (which contains __syncthreads) aggregates across the block.
+        // This pattern requires every thread to enter the loop the same
+        // number of iterations as valid_ctx — divergent threads at the
+        // syncthreads is undefined behavior in HIP/CUDA. The previous
+        // strided-by-tid loop was wrong for two reasons: (a) different
+        // threads were aggregating partial_qks for DIFFERENT tokens
+        // (meaningless sum) and (b) when valid_ctx < NUM_THREADS some
+        // threads skipped the syncthreads → garbage output.
         float qk_max = -INFINITY;
 
-        for (int token = tid; token < valid_ctx; token += NUM_THREADS) {
+        for (int token = 0; token < valid_ctx; ++token) {
             const int logical_block = token / BLOCK_SIZE;
             const int tok_in_block  = token % BLOCK_SIZE;
             const int physical      = seq_block_table[logical_block];
-            if (physical == kInvalidBlockTableEntry) {
-                logits[token] = -INFINITY;
-                continue;
-            }
 
-            // Per-thread accumulator: each thread sums its slice of d.
             float partial_qk = 0.0f;
+            if (physical != kInvalidBlockTableEntry) {
 #pragma unroll
-            for (int v = 0; v < VEC_PER_THREAD; ++v) {
-                const int d = tid + v * NUM_THREADS;
-                if (d < HEAD_SIZE) {
-                    const int xi = d / K_X;
-                    const int xj = d % K_X;
-                    const size_t k_off = ((size_t) physical * n_kv_heads + kv_head_idx) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
-                                       + (size_t) xi * BLOCK_SIZE * K_X
-                                       + (size_t) tok_in_block * K_X
-                                       + xj;
-                    const float k_val = (float) k_cache[k_off];
-                    partial_qk += (float) q_reg[v] * k_val;
+                for (int v = 0; v < VEC_PER_THREAD; ++v) {
+                    const int d = tid + v * NUM_THREADS;
+                    if (d < HEAD_SIZE) {
+                        const int xi = d / K_X;
+                        const int xj = d % K_X;
+                        const size_t k_off = ((size_t) physical * n_kv_heads + kv_head_idx) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                                           + (size_t) xi * BLOCK_SIZE * K_X
+                                           + (size_t) tok_in_block * K_X
+                                           + xj;
+                        const float k_val = (float) k_cache[k_off];
+                        partial_qk += (float) q_reg[v] * k_val;
+                    }
                 }
             }
-            // Reduce across threads to get full QK for THIS (token).
-            // Each thread holds the same scalar after; only thread 0
-            // writes to smem to avoid racy writes.
-            const float qk = block_reduce_sum<NUM_WARPS>(partial_qk, red_smem) * scale;
+            // All threads call block_reduce_sum — meets __syncthreads.
+            const float qk = (physical == kInvalidBlockTableEntry)
+                ? -INFINITY
+                : block_reduce_sum<NUM_WARPS>(partial_qk, red_smem) * scale;
 
             if (tid == 0) {
                 logits[token] = qk;
@@ -254,12 +271,13 @@ __global__ void mt_paged_attention_kernel(
         }
 
         // ── Write output slice ──
+        // Output mirrors Q's layout: ggml [head_dim, n_heads, n_tokens]
+        // (same shape as q since the constructor copies q->ne).
 #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * NUM_THREADS;
             if (d < HEAD_SIZE) {
-                const size_t out_off = ((size_t) seq_idx * n_heads + head_idx) * (size_t) q_len * HEAD_SIZE
-                                     + (size_t) qi * HEAD_SIZE + d;
+                const size_t out_off = ((seq_q_offset + (size_t) qi) * n_heads + head_idx) * HEAD_SIZE + d;
                 out[out_off] = (scalar_t) acc[v];
             }
         }
