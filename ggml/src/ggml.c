@@ -5486,9 +5486,12 @@ struct ggml_tensor * ggml_paged_kv_update_mt(
     GGML_ASSERT(k_cur->ne[2] == slot_mapping->ne[0]);
 
     // The op writes its sources in-place; the returned tensor is a
-    // 0-element graph anchor whose only role is to chain a forward-expand.
-    int64_t ne_anchor[1] = { 0 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne_anchor);
+    // tiny F16 anchor whose only role is to chain a forward-expand. Use
+    // F16 (not I32) so the GPU backend's supports_op type-match accepts
+    // it and the scheduler can place the op on the same backend that
+    // owns the K/V cache.
+    int64_t ne_anchor[1] = { 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 1, ne_anchor);
 
     // op_params:
     //   [0]: int32_t block_size

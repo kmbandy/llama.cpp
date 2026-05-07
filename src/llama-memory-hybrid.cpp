@@ -85,27 +85,38 @@ llama_memory_hybrid::llama_memory_hybrid(
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
-    // Phase 3.6: paged attn path. The paged cache owns its own ubatch
-    // split (via mem_attn_paged->init_batch) and produces its own
-    // context; we still need to do the recurrent prepare on the same
-    // ubatch sequence so the recurrent state advances in lockstep.
+    // Phase 3.6: paged attn path. The recurrent half requires equal_seqs
+    // ubatches (asserts in llama-memory-recurrent.cpp), so we do the
+    // split here using the same balloc.split_equal pattern as the
+    // regular hybrid path, then feed the pre-built ubatches to both the
+    // paged cache (block alloc + tensor uploads) and the recurrent
+    // prepare. The paged cache exposes init_batch_with_ubatches for
+    // exactly this composition.
     if (is_paged_attn()) {
-        // Run paged init_batch first — it splits the batch into
-        // ubatches and allocates blocks. We then re-walk those ubatches
-        // for the recurrent prepare (they're carried inside the paged
-        // context).
-        auto paged_ctx_ptr = mem_attn_paged->init_batch(balloc, n_ubatch, embd_all);
-        if (paged_ctx_ptr->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
-            return std::make_unique<llama_memory_hybrid_context>(paged_ctx_ptr->get_status());
+        balloc.split_reset();
+        std::vector<llama_ubatch> ubatches;
+        while (true) {
+            llama_ubatch ub = embd_all
+                ? balloc.split_seq(n_ubatch)
+                : balloc.split_equal(n_ubatch, /*sequential=*/true);
+            if (ub.n_tokens == 0) {
+                break;
+            }
+            ubatches.push_back(std::move(ub));
         }
-        // For v1, paged init_batch produces exactly one ubatch (single-seq,
-        // single split). Snapshot it without advancing the paged context's
-        // iterator — the hybrid context's apply()/next() will drive the
-        // paged context's iteration through the same ubatch sequence.
-        std::vector<llama_ubatch> ubatches{ paged_ctx_ptr->get_ubatch() };
+        if (balloc.get_n_used() < balloc.get_n_tokens() || ubatches.empty()) {
+            return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
         if (!mem_recr->prepare(ubatches)) {
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches (paged hybrid)\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        // ubatches passed by-value to the paged init helper; copy first
+        // so we still own the vector for the hybrid context.
+        std::vector<llama_ubatch> ubatches_copy = ubatches;
+        auto paged_ctx_ptr = mem_attn_paged->init_batch_with_ubatches(std::move(ubatches_copy));
+        if (paged_ctx_ptr->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            return std::make_unique<llama_memory_hybrid_context>(paged_ctx_ptr->get_status());
         }
         return std::make_unique<llama_memory_hybrid_context>(
                 this, std::move(paged_ctx_ptr), std::move(ubatches));
@@ -286,7 +297,9 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
+    ctx_attn(mem->is_paged_attn()
+             ? mem->get_mem_attn_paged()->init_full()
+             : mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -295,7 +308,9 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,
                        bool   optimize) :
-    ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
+    ctx_attn(mem->is_paged_attn()
+             ? mem->get_mem_attn_paged()->init_update(lctx, optimize)
+             : mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }

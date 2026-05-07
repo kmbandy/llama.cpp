@@ -248,6 +248,26 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
                             sizeof(int32_t) * h_q_lens_.size());
 }
 
+llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(
+        std::vector<llama_ubatch> ubatches) {
+    if (ubatches.empty()) {
+        return std::make_unique<llama_kv_cache_paged_context>(
+            this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_NO_UPDATE);
+    }
+    for (const auto & ub : ubatches) {
+        if (!ensure_blocks_for(/*seq_id=*/0, ub.n_tokens)) {
+            return std::make_unique<llama_kv_cache_paged_context>(
+                this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        h_q_lens_[0] = (int32_t) ub.n_tokens;
+        seq_states_[0].pos_max += (llama_pos) ub.n_tokens;
+        if (seq_states_[0].pos_min < 0) seq_states_[0].pos_min = 0;
+    }
+    prepare_batch_tensors();
+    return std::make_unique<llama_kv_cache_paged_context>(
+        this, std::move(ubatches), LLAMA_MEMORY_STATUS_SUCCESS);
+}
+
 llama_memory_context_ptr llama_kv_cache_paged::init_batch(
         llama_batch_allocr & balloc, uint32_t n_ubatch, bool /*embd_all*/) {
     // Split the batch into ubatches (1 per slot for v1, since

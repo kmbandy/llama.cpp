@@ -5457,13 +5457,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_PAGED_ATTN_MT:
-            // F16 only for v1; dispatch checks (head_size, block_size) and aborts on unsupported
             return op->type == GGML_TYPE_F16
                 && op->src[0]->type == GGML_TYPE_F16
                 && op->src[1]->type == GGML_TYPE_F16
                 && op->src[2]->type == GGML_TYPE_F16;
         case GGML_OP_PAGED_KV_UPDATE_MT:
-            // F16 K/V only for v1; slot_mapping is i32.
             return op->src[0]->type == GGML_TYPE_F16   // k_cur
                 && op->src[1]->type == GGML_TYPE_F16   // v_cur
                 && op->src[2]->type == GGML_TYPE_F16   // k_cache

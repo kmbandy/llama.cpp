@@ -2345,40 +2345,54 @@ ggml_tensor * llm_graph_context::build_attn(
         const int    block_size = (int) paged_parent->block_size();
         const int    n_kv_heads = (int) layer.n_kv_heads;
 
-        // 1) Forward-expand q/k/v_cur so the scatter sees fully-computed
-        //    sources (mirrors the regular path's barrier).
-        ggml_build_forward_expand(gf, q_cur);
-        ggml_build_forward_expand(gf, k_cur);
-        ggml_build_forward_expand(gf, v_cur);
+        // 1) The K/V cache is F16; project sources to F16 if they came in
+        //    as F32 (typical post-lora projection path). The kernel
+        //    requires F16 for both source and cache. Q is also F16-cast
+        //    so the attention kernel template instantiates correctly.
+        ggml_tensor * q_cast = q_cur->type == GGML_TYPE_F16 ? q_cur : ggml_cast(ctx0, q_cur, GGML_TYPE_F16);
+        ggml_tensor * k_cast = k_cur->type == GGML_TYPE_F16 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F16);
+        ggml_tensor * v_cast = v_cur->type == GGML_TYPE_F16 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F16);
 
-        // 2) Scatter k_cur / v_cur into this layer's K_cache / V_cache.
+        // 2) Forward-expand the cast/source nodes so the scatter sees
+        //    fully-computed sources (mirrors the regular path's barrier).
+        ggml_build_forward_expand(gf, q_cast);
+        ggml_build_forward_expand(gf, k_cast);
+        ggml_build_forward_expand(gf, v_cast);
+
+        // 3) Scatter k_cur / v_cur into this layer's K_cache / V_cache.
         //    The op writes in-place; the returned tensor is an i32 graph
         //    anchor. Forward-expand it so the scatter completes before
         //    paged_attn reads from the same cache buffers.
         ggml_tensor * scatter_anchor = ggml_paged_kv_update_mt(
             ctx0,
-            k_cur, v_cur,
+            k_cast, v_cast,
             layer.k, layer.v,
             inp->paged_slot_mapping,
             block_size, n_kv_heads);
         ggml_build_forward_expand(gf, scatter_anchor);
 
-        // 3) Run paged attention. Output is [head_dim, n_heads, n_tokens, 1].
+        // 4) Run paged attention. Output is [head_dim, n_heads, n_tokens, 1].
         ggml_tensor * cur = ggml_paged_attn_mt(
             ctx0,
-            q_cur, layer.k, layer.v,
+            q_cast, layer.k, layer.v,
             inp->paged_block_table,
             inp->paged_context_lens,
             inp->paged_q_lens,
             block_size, n_kv_heads, kq_scale);
         cb(cur, "kqv_paged_out", il);
 
-        // 4) Reshape to (head_dim*n_heads, n_tokens) for the wo projection.
+        // 4) Cast back to F32 to match the regular path's contract — the
+        //    regular build_attn_mha returns F32, and downstream wo
+        //    projection (often quantized weight × F32 activation) is
+        //    typically wired only for F32 activations.
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+
+        // 5) Reshape to (head_dim*n_heads, n_tokens) for the wo projection.
         const int64_t n_embd_full = q_cur->ne[0] * q_cur->ne[1];
         const int64_t n_tokens    = q_cur->ne[2];
         cur = ggml_reshape_2d(ctx0, ggml_cont(ctx0, cur), n_embd_full, n_tokens);
 
-        // 5) wo / wo_b post-projection (mirrors the regular path's tail).
+        // 6) wo / wo_b post-projection (mirrors the regular path's tail).
         if (wo) {
             cur = build_lora_mm(wo, cur);
         }

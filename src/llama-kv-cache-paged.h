@@ -120,6 +120,13 @@ public:
     // first). For v1 single-seq, all tokens are assumed seq 0.
     bool compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const;
 
+    // Phase 3.6: for hybrid composition. Takes pre-built ubatches (e.g.
+    // from a `balloc.split_equal()` driven by the recurrent half) and
+    // does only the cache-side bookkeeping (block allocation + per-batch
+    // tensor uploads). Mirrors init_batch's body but skips the splitting
+    // step. Returns a paged context wrapping the same ubatches.
+    llama_memory_context_ptr init_batch_with_ubatches(std::vector<llama_ubatch> ubatches);
+
 private:
     friend class llama_kv_cache_paged_context;
 
