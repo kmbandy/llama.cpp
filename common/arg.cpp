@@ -1477,7 +1477,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-tier-paged-blocks"},
         {"--no-kv-tier-paged-blocks"},
-        "Phase 2a opt-in: instantiate mt::BlockPool + mt::BlockTable alongside the position-keyed tier (no behavior change yet — scaffolding for the paged refactor)",
+        "enable mt:: paged attention KV cache (vLLM-style block-indexed layout). Routes attention through mt_paged_attention_kernel + mt_reshape_and_cache scatter on HIP/CUDA. Works on standard transformer models AND hybrid (DeltaNet/Mamba+attention) models — for hybrid, only the attention layers go through the paged path, recurrent layers keep their own state. SWA + multi-seq are not yet supported (fall back to the regular kv cache).",
         [](common_params & params, bool value) {
             params.kv_tier_paged_blocks = value;
         }
