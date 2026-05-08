@@ -158,10 +158,11 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
 
     // speculative decoding
+    common_speculative * spec;
+
     llama_tokens spec_draft;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
-    common_speculative_ptr spec;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -403,25 +404,16 @@ struct server_slot {
             return 0;
         }
 
-        const int n_draft_min = common_speculative_n_min(spec.get(), task->params.speculative);
-
         // determine the max draft that fits the current slot state
-        int n_draft_max = common_speculative_n_max(spec.get(), task->params.speculative);
-
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
+        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
-
-        if (n_draft_max < n_draft_min) {
-            SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, n_draft_min);
-            n_draft_max = 0;
-        }
 
         return n_draft_max;
     }
@@ -456,7 +448,7 @@ struct server_slot {
                 }
 
                 // generate a new draft
-                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens_text, prompt.n_tokens(), sampled);
+                spec_draft = common_speculative_draft(spec, this->id, params_spec, tokens_text, prompt.n_tokens(), sampled);
                 n_draft_total += spec_draft.size();
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
@@ -620,7 +612,7 @@ struct server_slot {
             );
         }
 
-        common_speculative_print_stats(spec.get());
+        common_speculative_print_stats(spec);
     }
 
     json to_json(bool only_metrics = false) const {
@@ -795,6 +787,8 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    common_speculative_ptr spec;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -833,12 +827,6 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
-
-        for (server_slot & slot : slots) {
-            if (slot.can_speculate()) {
-                slot.spec.reset();
-            }
-        }
 
         llama_batch_free(batch);
     }
@@ -1092,34 +1080,32 @@ private:
             slots.emplace_back();
         }
 
-        bool no_dft = false;
+        // try speculative decoding
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            try {
+                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+            }
+
+            if (spec) {
+                SRV_INF("%s", "speculative decoding context initialized\n");
+            } else {
+                ctx_dft.reset();
+            }
+        }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
-            slot.id       = i;
+            slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
-            slot.n_ctx    = n_ctx_slot;
+            slot.spec    = spec.get();
+            slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
-
-            // try speculative decoding
-            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                try {
-                    slot.spec.reset(common_speculative_init(params_base.speculative, slot.id));
-                } catch (const std::exception & e) {
-                    SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
-
-                    no_dft = true;
-                }
-
-                if (slot.spec) {
-                    SLT_INF(slot, "%s", "speculative decoding context initialized\n");
-                }
-            }
-
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -1128,16 +1114,6 @@ private:
             };
 
             slot.reset();
-        }
-
-        if (no_dft && ctx_dft) {
-            SRV_WRN("%s", "destroying the draft model as it is not going to be used\n");
-
-            ctx_dft.reset();
-
-            for (auto & slot : slots) {
-                slot.ctx_dft = nullptr;
-            }
         }
 
         {
@@ -1540,7 +1516,7 @@ private:
             backend_sampling &= task.params.sampling.backend_sampling;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate() && common_speculative_n_max(slot.spec.get(), task.params.speculative) > 0);
+            backend_sampling &= !(slot.can_speculate());
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
@@ -3569,7 +3545,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
+                        common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -3694,7 +3670,7 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
-                    common_speculative_accept(slot.spec.get(), accepted.size() - 1);
+                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
                 }
