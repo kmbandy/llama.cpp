@@ -333,6 +333,22 @@ static void launch_paged_attn(
     // smem: NUM_WARPS reduction floats + max_ctx_len logits floats.
     const size_t smem_bytes = (NUM_WARPS + max_ctx_len) * sizeof(float);
 
+    // Defensive: catch the LDS-overflow case loudly. AMD GPUs typically
+    // expose 64 KiB shared memory per block (SM/CU); NVIDIA newer SMs
+    // 100+ KiB. The dispatcher's `cudaErrorInvalidArgument` for
+    // oversized smem looks identical to many other failure modes —
+    // surface a clear error here so users know to either (a) reduce
+    // per-slot context, (b) drop --kv-tier-paged-blocks, or (c) wait
+    // on the chunked-attention rewrite (see docs/MAD-NN).
+    if (smem_bytes > 65536) {
+        GGML_LOG_ERROR("mt::paged_attn: requested smem %zu B exceeds 64 KiB LDS limit "
+                       "(max_ctx_len=%d). The current paged kernel doesn't support "
+                       "ctx > ~16k per attention call. Reduce -c/--parallel so "
+                       "n_ctx_seq * 4 bytes fits, or drop --kv-tier-paged-blocks.\n",
+                       smem_bytes, max_ctx_len);
+        GGML_ABORT("mt::paged_attn smem overflow — see docs for chunked-attention plan");
+    }
+
     mt_paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0>
         <<<grid, block, smem_bytes, stream>>>(
             out, q, k_cache, v_cache,
