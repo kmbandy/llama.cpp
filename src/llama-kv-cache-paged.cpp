@@ -190,33 +190,42 @@ bool llama_kv_cache_paged::ensure_blocks_for(llama_seq_id seq_id, uint32_t n_new
 }
 
 bool llama_kv_cache_paged::compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const {
-    // For v1 single-seq (n_seq_max == 1), every token belongs to seq 0.
-    // The seq's logical block list is in table_; for token i at position
-    // pos = ubatch->pos[i]:
+    // For each token i at (seq_id = ubatch->seq_id[i][0], pos = ubatch->pos[i]):
     //   logical_block_idx = pos / block_size_
-    //   physical_block    = table_.get_physical(0, logical_block_idx)
+    //   physical_block    = table_.get_physical(seq_id, logical_block_idx)
     //   slot_in_block     = pos % block_size_
     //   slot_mapping[i]   = physical_block * block_size_ + slot_in_block
     //
-    // Multi-seq (n_seq_max > 1) is a follow-up: walk ubatch->seq_id[i][0]
-    // per token instead of pinning seq 0.
-    GGML_ASSERT(n_seq_max_ == 1 && "compute_slot_mapping: multi-seq not yet implemented");
-
-    const uint32_t n_blk = table_.num_blocks(/*seq_id=*/0);
-
+    // Multi-seq: each seq has its own logical→physical block list in
+    // `table_`; tokens from different seqs in the same ubatch route to
+    // different physical pages. ensure_blocks_for must have already been
+    // called per-seq (init_batch handles that).
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos pos = ubatch->pos[i];
         if (pos < 0) {
             out[i] = -1;  // padding token
             continue;
         }
+        // Resolve seq_id. ubatch->seq_id[i] is a small array; entry [0] is
+        // the primary seq for this token. For tokens shared across seqs
+        // (e.g. CoW), the underlying cache writes only the primary slot
+        // and downstream attention sees both — matches non-paged behavior.
+        llama_seq_id seq_id = 0;
+        if (ubatch->seq_id && ubatch->seq_id[i] && ubatch->n_seq_id && ubatch->n_seq_id[i] > 0) {
+            seq_id = ubatch->seq_id[i][0];
+        }
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) {
+            out[i] = -1;
+            continue;
+        }
         const uint32_t logical = (uint32_t) pos / block_size_;
         const uint32_t slot    = (uint32_t) pos % block_size_;
+        const uint32_t n_blk   = table_.num_blocks(seq_id);
         if (logical >= n_blk) {
-            // ensure_blocks_for should have allocated enough — bug.
+            // ensure_blocks_for should have allocated enough — caller bug.
             return false;
         }
-        const uint32_t physical = table_.get_physical(/*seq_id=*/0, logical);
+        const uint32_t physical = table_.get_physical(seq_id, logical);
         if (physical == mt::kInvalidBlockId) {
             return false;
         }
@@ -249,20 +258,69 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
                             sizeof(int32_t) * h_q_lens_.size());
 }
 
+bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
+    // Per-seq: count tokens, find max position. Sized to n_seq_max_ for
+    // direct indexing — n_seq_max_ is bounded (typical 4–32).
+    std::vector<uint32_t>  tokens_per_seq(n_seq_max_, 0);
+    std::vector<llama_pos> max_pos_per_seq(n_seq_max_, -1);
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        const llama_pos pos = ub.pos[i];
+        if (pos < 0) continue;  // padding
+        llama_seq_id seq_id = 0;
+        if (ub.seq_id && ub.seq_id[i] && ub.n_seq_id && ub.n_seq_id[i] > 0) {
+            seq_id = ub.seq_id[i][0];
+        }
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) continue;
+        tokens_per_seq[seq_id]++;
+        if (pos > max_pos_per_seq[seq_id]) max_pos_per_seq[seq_id] = pos;
+    }
+
+    // Allocate blocks per-seq sized to the max position written. Note: we
+    // don't use ensure_blocks_for's "pos_max + n_new" arithmetic here
+    // because in multi-seq prefill the positions in `pos[]` are absolute
+    // (e.g. seq A might be at positions 0..63 while seq B is at 100..107
+    // in the same ubatch). We instead allocate enough blocks to fit
+    // max_pos_per_seq[s] for each affected seq.
+    for (uint32_t s = 0; s < n_seq_max_; ++s) {
+        if (tokens_per_seq[s] == 0) continue;
+        const llama_pos new_max = max_pos_per_seq[s];
+        const llama_pos cur_max = seq_states_[s].pos_max;
+        if (new_max > cur_max) {
+            const uint32_t n_new = (uint32_t)(new_max - cur_max);
+            if (!ensure_blocks_for((llama_seq_id) s, n_new)) {
+                return false;
+            }
+        }
+    }
+
+    // Commit per-seq state.
+    for (uint32_t s = 0; s < n_seq_max_; ++s) {
+        h_q_lens_[s] = (int32_t) tokens_per_seq[s];
+        if (tokens_per_seq[s] > 0) {
+            if (max_pos_per_seq[s] > seq_states_[s].pos_max) {
+                seq_states_[s].pos_max = max_pos_per_seq[s];
+            }
+            if (seq_states_[s].pos_min < 0) seq_states_[s].pos_min = 0;
+        }
+    }
+    return true;
+}
+
 llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(
         std::vector<llama_ubatch> ubatches) {
     if (ubatches.empty()) {
         return std::make_unique<llama_kv_cache_paged_context>(
             this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_NO_UPDATE);
     }
+    // Reset q_lens between batches; the final state reflects the LAST
+    // ubatch's per-seq query distribution (matches what the graph dispatch
+    // consumes).
+    std::fill(h_q_lens_.begin(), h_q_lens_.end(), 0);
     for (const auto & ub : ubatches) {
-        if (!ensure_blocks_for(/*seq_id=*/0, ub.n_tokens)) {
+        if (!apply_ubatch_to_state(ub)) {
             return std::make_unique<llama_kv_cache_paged_context>(
                 this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
-        h_q_lens_[0] = (int32_t) ub.n_tokens;
-        seq_states_[0].pos_max += (llama_pos) ub.n_tokens;
-        if (seq_states_[0].pos_min < 0) seq_states_[0].pos_min = 0;
     }
     prepare_batch_tensors();
     return std::make_unique<llama_kv_cache_paged_context>(
@@ -271,11 +329,11 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(
 
 llama_memory_context_ptr llama_kv_cache_paged::init_batch(
         llama_batch_allocr & balloc, uint32_t n_ubatch, bool /*embd_all*/) {
-    // Split the batch into ubatches (1 per slot for v1, since
-    // n_seq_max=1 and we don't yet do parallel batching).
+    // Split the batch into ubatches. Each ubatch may contain tokens from
+    // multiple seqs; apply_ubatch_to_state buckets per-seq and routes
+    // block allocation accordingly.
     std::vector<llama_ubatch> ubatches;
 
-    // Pull ubatches from the balloc until exhausted.
     while (true) {
         llama_ubatch ub = balloc.split_simple(n_ubatch);
         if (ub.n_tokens == 0) break;
@@ -287,21 +345,12 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(
             this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_NO_UPDATE);
     }
 
-    // Allocate blocks for each ubatch's tokens.
+    std::fill(h_q_lens_.begin(), h_q_lens_.end(), 0);
     for (const auto & ub : ubatches) {
-        // For v1 single-seq: all tokens belong to seq 0.
-        // (Real multi-seq case requires walking ub.seq_id_unq[] etc.
-        // and bucketing — punted to multi-seq phase.)
-        if (!ensure_blocks_for(/*seq_id=*/0, ub.n_tokens)) {
+        if (!apply_ubatch_to_state(ub)) {
             return std::make_unique<llama_kv_cache_paged_context>(
                 this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
-        // Update q_lens host mirror for this batch's contribution.
-        h_q_lens_[0] = (int32_t) ub.n_tokens;
-        // Bump pos_max optimistically — the graph will write into the
-        // newly allocated blocks at positions [pos_max+1, pos_max+n_tokens].
-        seq_states_[0].pos_max += (llama_pos) ub.n_tokens;
-        if (seq_states_[0].pos_min < 0) seq_states_[0].pos_min = 0;
     }
 
     prepare_batch_tensors();

@@ -26,7 +26,14 @@
 //   - F16 K/V only (no quantized cache yet)
 //   - No prefix caching (no BlockHashToBlockMap)
 //   - No CPU offload tier (warm tier inside paged context not yet wired)
-//   - n_seq_max constrained by the defensive assert in mt::
+//   - State persistence (state_write/state_read) — placeholder warns
+//
+// MULTI-SEQ STATUS:
+//   compute_slot_mapping + init_batch* support n_seq_max > 1 — tokens
+//   are bucketed per seq via ubatch->seq_id[i][0] and routed to the
+//   appropriate logical block list. The earlier defensive assert is
+//   gone; the cache works correctly with --parallel N for any N up to
+//   n_seq_max_.
 
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -142,6 +149,13 @@ private:
     // tensors to the GPU for the current batch. Called by init_batch
     // before the graph runs.
     void prepare_batch_tensors();
+
+    // Multi-seq accounting for one ubatch: bucket tokens per seq, allocate
+    // blocks for each affected seq, update seq_states_ pos tracking and
+    // h_q_lens_. Returns false if any seq's block allocation fails (caller
+    // should surface FAILED_PREPARE). Used by both init_batch and
+    // init_batch_with_ubatches.
+    bool apply_ubatch_to_state(const llama_ubatch & ub);
 
     const llama_model &        model_;
     ggml_backend_buffer_type_t buft_;
