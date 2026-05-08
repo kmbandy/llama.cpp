@@ -2487,12 +2487,52 @@ public:
         for (auto & [buft, mbuf] : mbufs_new) {
             auto & mbuf_cur = mbufs[buft];
 
-            if (!mbuf_cur.buf || mbuf_cur.org.size() != mbuf.org.size() || mbuf_cur.total_size != mbuf.total_size) {
-                mbuf_cur = std::move(mbuf);
+            bool need_alloc = false;
 
-                mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+            need_alloc = need_alloc || (!mbuf_cur.buf);
+            need_alloc = need_alloc || (mbuf_cur.org.size() != mbuf.org.size());
+            need_alloc = need_alloc || (mbuf_cur.total_size != mbuf.total_size);
 
-                LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+            if (!need_alloc) {
+                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                    auto * org0 = mbuf_cur.org[i];
+                    auto * org1 = mbuf.org[i];
+
+                    if (!ggml_are_same_shape(org0, org1)) {
+                        need_alloc = true;
+                        break;
+                    }
+
+                    if (org0->view_src != org1->view_src || org0->view_offs != org1->view_offs) {
+                        need_alloc = true;
+                        break;
+                    }
+                }
+            }
+
+            if (need_alloc) {
+                if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
+                    mbuf_cur = std::move(mbuf);
+
+                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+
+                    LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+                } else {
+                    //LLAMA_LOG_INFO("%s: reallocating tensors in '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
+
+                    auto buf = std::move(mbuf_cur.buf);
+
+                    mbuf_cur = std::move(mbuf);
+
+                    ggml_tallocr talloc = ggml_tallocr_new(buf.get());
+
+                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                        ggml_backend_view_init(mbuf_cur.org[i]);
+                        ggml_tallocr_alloc(&talloc, mbuf_cur.cpy[i]);
+                    }
+
+                    mbuf_cur.buf = std::move(buf);
+                }
             }
 
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
@@ -2549,6 +2589,30 @@ public:
 
             mbufs_new[buft].n_tensors++;
             mbufs_new[buft].total_size += rinfo.size;
+        }
+
+        for (auto & [buft, mbuf] : mbufs_new) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ mbuf.n_tensors*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            mbuf.ctx.reset(ggml_init(params));
+
+            mbuf.org.reserve(mbuf.n_tensors);
+        }
+
+        for (const auto & rinfo : rinfos) {
+            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+
+            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+
+            auto & mbuf = mbufs_new[buft];
+
+            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+
+            ggml_backend_view_init(mbuf.org.back());
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
