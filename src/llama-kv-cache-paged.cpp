@@ -26,13 +26,18 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         uint32_t                   n_blocks_total,
         uint32_t                   block_size,
         uint32_t                   n_seq_max,
-        uint32_t                   max_blocks_per_seq)
+        uint32_t                   max_blocks_per_seq,
+        layer_filter_cb            filter,
+        ggml_type                  type_k,
+        ggml_type                  type_v)
     : model_(model),
       buft_(buft),
       n_blocks_total_(n_blocks_total),
       block_size_(block_size),
       n_seq_max_(n_seq_max),
-      max_blocks_per_seq_(max_blocks_per_seq) {
+      max_blocks_per_seq_(max_blocks_per_seq),
+      type_k_(type_k),
+      type_v_(type_v) {
 
     GGML_ASSERT(block_size_ > 0 && (block_size_ & (block_size_ - 1)) == 0);
     GGML_ASSERT(n_blocks_total_ > 0);
@@ -46,9 +51,11 @@ llama_kv_cache_paged::llama_kv_cache_paged(
 
     // ── Per-layer K/V storage ──
     //
-    // Need per-layer dimensions from the model. For PHASE 3.3, derive
-    // them from hparams; later phases will support per-layer variation
-    // (hybrid models with mixed attention/recurrent layers).
+    // For hybrid models a `filter` is supplied that returns true only for
+    // attention layers — recurrent layers' state lives in mem_recr. We
+    // still keep `layers_` indexed by model layer index so
+    // `cache.layer(il)` works directly from the graph; non-attn entries
+    // stay default-constructed (k/v == nullptr) and never queried.
     const auto & hparams = model.hparams;
     const uint32_t n_layer    = hparams.n_layer;
     const uint32_t head_dim   = hparams.n_embd_head_v(/*il=*/0);
@@ -57,13 +64,23 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     GGML_ASSERT(head_dim > 0 && "head_dim must be > 0");
     GGML_ASSERT(n_kv_heads > 0 && "n_kv_heads must be > 0");
 
-    // Each layer's K and V buffer is a flat 1D byte tensor sized for
-    // the vLLM-style block layout. Kernel reinterprets via raw
-    // pointer math (we don't need ggml's multi-dim metadata here).
-    //
-    // Per-block bytes = block_size * n_kv_heads * head_dim * sizeof(__half)
-    const size_t bytes_per_block = (size_t) block_size_ * n_kv_heads * head_dim * sizeof(uint16_t);
-    const size_t total_layer_bytes = (size_t) n_blocks_total_ * bytes_per_block;
+    // Per-element byte cost: f16 = 2 bytes, q8_0 = 17 bytes per 32-element
+    // block ≈ 0.53 byte/elt, etc. ggml_type_size + ggml_blck_size give the
+    // exact ratio for any quant. n_elements is total values per layer; we
+    // round n_blocks_total slot count up to a multiple of the quant block
+    // size so partial-block edge cases don't underrun the buffer.
+    auto round_to_block = [](size_t n, size_t blk) {
+        return blk > 1 ? ((n + blk - 1) / blk) * blk : n;
+    };
+    const size_t k_blk = (size_t) ggml_blck_size(type_k_);
+    const size_t v_blk = (size_t) ggml_blck_size(type_v_);
+    const size_t per_token_per_layer_elts = (size_t) n_kv_heads * head_dim;
+    const size_t k_n_elts_per_layer = round_to_block(
+        (size_t) n_blocks_total_ * block_size_ * per_token_per_layer_elts, k_blk);
+    const size_t v_n_elts_per_layer = round_to_block(
+        (size_t) n_blocks_total_ * block_size_ * per_token_per_layer_elts, v_blk);
+    const size_t k_bytes_per_layer = ggml_row_size(type_k_, (int64_t) k_n_elts_per_layer);
+    const size_t v_bytes_per_layer = ggml_row_size(type_v_, (int64_t) v_n_elts_per_layer);
 
     // ggml_context for the layer storage tensors.
     {
@@ -79,13 +96,18 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     }
 
     layers_.resize(n_layer);
+    uint32_t n_attn_layers = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
-        // 1D F16 tensor sized for the full block pool's worth of K (or V).
-        // Kernel computes offsets within using vLLM layout.
-        const int64_t n_elements = (int64_t) total_layer_bytes / (int64_t) sizeof(uint16_t);
-
-        ggml_tensor * k = ggml_new_tensor_1d(ctx_storage_, GGML_TYPE_F16, n_elements);
-        ggml_tensor * v = ggml_new_tensor_1d(ctx_storage_, GGML_TYPE_F16, n_elements);
+        if (filter && !filter((int32_t) il)) {
+            // Recurrent (or otherwise filtered-out) layer — leave entry
+            // empty. The graph builder skips these and routes their state
+            // through the recurrent half of the hybrid memory.
+            layers_[il].k = nullptr;
+            layers_[il].v = nullptr;
+            continue;
+        }
+        ggml_tensor * k = ggml_new_tensor_1d(ctx_storage_, type_k_, (int64_t) k_n_elts_per_layer);
+        ggml_tensor * v = ggml_new_tensor_1d(ctx_storage_, type_v_, (int64_t) v_n_elts_per_layer);
         ggml_set_name(k, ("paged_k_l" + std::to_string(il)).c_str());
         ggml_set_name(v, ("paged_v_l" + std::to_string(il)).c_str());
 
@@ -93,6 +115,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         layers_[il].v          = v;
         layers_[il].n_kv_heads = n_kv_heads;
         layers_[il].head_dim   = head_dim;
+        ++n_attn_layers;
     }
 
     // Allocate the backend buffer for layer storage.
@@ -102,12 +125,13 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     }
     ggml_backend_buffer_clear(buf_storage_, 0);
 
-    LLAMA_LOG_INFO("llama_kv_cache_paged: allocated %u layers × %.1f MiB = %.1f MiB total "
-                   "(n_blocks=%u, block_size=%u, n_kv_heads=%u, head_dim=%u)\n",
-                   n_layer,
-                   (double) total_layer_bytes / (1024.0 * 1024.0),
-                   (double)(total_layer_bytes * 2 * n_layer) / (1024.0 * 1024.0),
-                   n_blocks_total_, block_size_, n_kv_heads, head_dim);
+    const double per_layer_mib = (double)(k_bytes_per_layer + v_bytes_per_layer) / (1024.0 * 1024.0);
+    LLAMA_LOG_INFO("llama_kv_cache_paged: allocated %u/%u attn layers × %.1f MiB (K+V) = %.1f MiB total "
+                   "(n_blocks=%u, block_size=%u, n_kv_heads=%u, head_dim=%u, type_k=%s, type_v=%s)\n",
+                   n_attn_layers, n_layer, per_layer_mib,
+                   per_layer_mib * (double) n_attn_layers,
+                   n_blocks_total_, block_size_, n_kv_heads, head_dim,
+                   ggml_type_name(type_k_), ggml_type_name(type_v_));
 
     // ── Input tensors (block_table, context_lens, q_lens) ──
     //

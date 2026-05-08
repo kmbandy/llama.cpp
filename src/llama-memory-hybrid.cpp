@@ -66,7 +66,15 @@ llama_memory_hybrid::llama_memory_hybrid(
         paged_n_blocks,
         paged_block_size,
         n_seq_max,
-        paged_max_blocks_per_seq
+        paged_max_blocks_per_seq,
+        // Filter out recurrent layers — paged cache only carries attention
+        // K/V; recurrent state lives in mem_recr. Without this the cache
+        // pre-allocates K/V for ALL layers (including recurrent ones that
+        // never use it), wasting up to ~7×n_layer worth of VRAM.
+        filter_attn ? filter_attn : llama_kv_cache_paged::layer_filter_cb(
+            [&](int32_t il) { return !hparams.is_recurrent(il); }),
+        type_k,
+        type_v
     ) : nullptr),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -79,7 +87,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return hparams.is_recurrent(il); }
             : filter_recr
     )) {
-    GGML_UNUSED(type_k); GGML_UNUSED(type_v); GGML_UNUSED(v_trans);
+    GGML_UNUSED(v_trans);
     GGML_UNUSED(kv_size); GGML_UNUSED(n_pad); GGML_UNUSED(n_swa);
     GGML_UNUSED(swa_type); GGML_UNUSED(unified);
 }

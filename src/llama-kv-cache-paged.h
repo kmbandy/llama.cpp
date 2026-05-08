@@ -42,6 +42,7 @@
 #include "memory-tier/mt-block-pool.h"
 #include "memory-tier/mt-block-table.h"
 
+#include <functional>
 #include <vector>
 
 struct llama_model;
@@ -63,13 +64,23 @@ public:
         uint32_t head_dim    = 0;
     };
 
+    using layer_filter_cb = std::function<bool(int32_t /*il*/)>;
+
     llama_kv_cache_paged(
             const llama_model & model,
             ggml_backend_buffer_type_t buft,
             uint32_t                   n_blocks_total,   // total physical blocks (GPU pool size)
             uint32_t                   block_size,       // tokens per block
             uint32_t                   n_seq_max,
-            uint32_t                   max_blocks_per_seq);
+            uint32_t                   max_blocks_per_seq,
+            // Optional per-layer filter. Returns true for layers that should
+            // get K/V allocation in the paged pool. Recurrent layers in
+            // hybrid models should be filtered OUT (their state lives in
+            // mem_recr instead). nullptr = include all layers (back-compat).
+            layer_filter_cb            filter = nullptr,
+            // KV element types. Default F16 = current paged behavior.
+            ggml_type                  type_k = GGML_TYPE_F16,
+            ggml_type                  type_v = GGML_TYPE_F16);
 
     ~llama_kv_cache_paged() override;
 
@@ -163,6 +174,8 @@ private:
     uint32_t                   block_size_;
     uint32_t                   n_seq_max_;
     uint32_t                   max_blocks_per_seq_;
+    ggml_type                  type_k_ = GGML_TYPE_F16;
+    ggml_type                  type_v_ = GGML_TYPE_F16;
 
     // Per-layer K/V storage.
     std::vector<layer_storage> layers_;
