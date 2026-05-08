@@ -125,11 +125,11 @@ public:
     uint32_t restore_from_warm(llama_seq_id                  seq_id,
                                 const std::vector<llama_pos> & positions);
 
-    // Release warm-tier copies of the given positions. Used after the
-    // upstream lifecycle determines a chunk will not be needed again
-    // (or to make room when warm is full and 2d-evict-cold isn't yet
-    // wired). After this, has_warm() returns false for those positions.
-    void forget_warm(const std::vector<llama_pos> & positions);
+    // Release warm-tier copies of the given (seq_id, positions). Used
+    // after the upstream lifecycle determines a chunk will not be needed
+    // again (or to make room when warm is full). After this, has_warm()
+    // returns false for those (seq_id, position) pairs.
+    void forget_warm(llama_seq_id seq_id, const std::vector<llama_pos> & positions);
 
     // ---- public semantic-restore API ----
     //
@@ -277,11 +277,12 @@ private:
     // cold_positions_. Returns true on success.
     bool spill_one_to_cold();
 
-    // Pull a position from cold into a free warm slot. Used when restore
-    // is requested for a position that lives in cold. May trigger
-    // spill_one_to_cold internally if warm is full. Returns true if the
-    // position is now in warm and warm_pos_to_slot_ has its slot.
-    bool load_one_from_cold(llama_pos pos);
+    // Pull a (seq_id, position) from cold into a free warm slot. Used
+    // when restore is requested for a position that lives in cold. May
+    // trigger spill_one_to_cold internally if warm is full. Returns true
+    // if the position is now in warm and warm_pos_to_slot_[seq_id] has
+    // its slot.
+    bool load_one_from_cold(llama_seq_id seq_id, llama_pos pos);
 
     // Back up positions [p0, p1) of seq_id from hot to warm before
     // upstream's seq_rm frees them. Refreshes the cell snapshot to map
@@ -354,21 +355,40 @@ private:
     uint32_t              warm_capacity_ = 0;
     bool                  warm_initialized_ = false;
 
-    // pos -> slot index for positions currently in warm
-    std::unordered_map<llama_pos, uint32_t> warm_pos_to_slot_;
-    std::vector<int>                        warm_free_slots_;  // stack
-    std::unordered_set<llama_pos>           evicted_to_warm_;  // = key set of warm_pos_to_slot_, kept for fast O(1) skip in update_tier_state
+    // ─── Per-seq tier metadata ───────────────────────────────────────
+    // All vectors are sized to n_seq_max_ at construction. Index by
+    // seq_id, then by pos (for the maps/sets). With multi-seq enabled
+    // (--parallel > 1), two sequences can independently hold position 5
+    // without their tier state colliding.
+    //
+    // The slot pool (warm_free_slots_) and the global FIFO
+    // (warm_insertion_order_) remain shared across seqs because the
+    // underlying warm_buf_ is a single shared slot space — disambiguation
+    // happens via the per-seq maps that point into it.
 
-    // FIFO queue of warm positions in insertion order, used to pick
-    // spill victims when warm fills. Deque so removal of restored
-    // entries from the front (after load_one_from_cold) is cheap.
-    std::deque<llama_pos>                   warm_insertion_order_;
+    // pos -> slot index for positions currently in warm, scoped per seq.
+    std::vector<std::unordered_map<llama_pos, uint32_t>> warm_pos_to_slot_;
 
-    // Positions currently stored in cold tier (KvtcStore). Disjoint from
-    // warm_pos_to_slot_'s key set — a position is in either warm or
-    // cold, never both. (load_one_from_cold removes from cold and adds
-    // to warm; spill_one_to_cold does the inverse.)
-    std::unordered_set<llama_pos>           cold_positions_;
+    // Free slot stack. Slots are seq-agnostic — any seq can own any slot.
+    std::vector<int>                        warm_free_slots_;
+
+    // Per-seq mirror of warm_pos_to_slot_'s key set, kept for fast O(1)
+    // skip in update_tier_state.
+    std::vector<std::unordered_set<llama_pos>> evicted_to_warm_;
+
+    // GLOBAL FIFO queue of (seq_id, pos) in insertion order, used to pick
+    // spill victims when warm fills. Order is global because eviction
+    // policy is "oldest across all seqs first" — a long-running seq A
+    // shouldn't be sheltered from spill just because seq B has activity.
+    // Deque so removal of restored entries from the front (after
+    // load_one_from_cold) is cheap.
+    std::deque<std::pair<llama_seq_id, llama_pos>> warm_insertion_order_;
+
+    // Positions currently stored in cold tier (KvtcStore), scoped per
+    // seq. Disjoint from warm_pos_to_slot_[seq]'s key set — a (seq, pos)
+    // is in either warm or cold, never both. (load_one_from_cold removes
+    // from cold and adds to warm; spill_one_to_cold does the inverse.)
+    std::vector<std::unordered_set<llama_pos>> cold_positions_;
 
     // Per-seq recurrent state backups. Each entry is a contiguous host
     // buffer holding the full r+s state (layout per RecurrentStateMover:
