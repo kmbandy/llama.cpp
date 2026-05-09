@@ -2097,18 +2097,44 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // SWA hybrids are still TBD (would need a paged-iswa
                         // variant); for now they fall back to the regular
                         // hybrid_iswa path above.
+                        //
+                        // MAD-117 sizing (mirrors the standard-arch path):
+                        //   - non-tiered: hot_tokens = n_ctx_seq * n_seq_max * 1.5
+                        //   - tiered:     hot_tokens = total_ctx * (hot_pct / 100), floored at n_ctx_seq
                         uint32_t paged_n_blocks  = 0;
                         uint32_t paged_bsize     = 16;
                         uint32_t paged_max_bps   = 0;
                         if (params.kv_tier_paged_blocks) {
                             paged_bsize     = params.kv_tier_paged_block_size > 0
                                                 ? (uint32_t) params.kv_tier_paged_block_size : 16u;
-                            const uint32_t blocks_for_ctx = (cparams.n_ctx_seq + paged_bsize - 1) / paged_bsize;
-                            paged_n_blocks  = (uint32_t)((double) blocks_for_ctx * 1.5);
-                            paged_max_bps   = blocks_for_ctx;
-                            LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged "
-                                           "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
-                                           paged_n_blocks, paged_bsize, cparams.n_ctx_seq, cparams.n_seq_max);
+                            const uint32_t blocks_for_ctx      = (cparams.n_ctx_seq + paged_bsize - 1) / paged_bsize;
+                            const uint32_t total_ctx_all_slots = cparams.n_ctx_seq * cparams.n_seq_max;
+
+                            uint32_t hot_tokens;
+                            if (params.kv_tier_enabled) {
+                                const uint32_t total_ctx = params.kv_tier_total_ctx > 0
+                                                              ? (uint32_t) params.kv_tier_total_ctx
+                                                              : total_ctx_all_slots;
+                                hot_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_hot_pct / 100.0));
+                                if (hot_tokens < cparams.n_ctx_seq) hot_tokens = cparams.n_ctx_seq;
+                            } else {
+                                hot_tokens = (uint32_t)((double) total_ctx_all_slots * 1.5);
+                            }
+
+                            paged_n_blocks = (hot_tokens + paged_bsize - 1) / paged_bsize;
+                            paged_max_bps  = blocks_for_ctx;
+
+                            if (params.kv_tier_enabled) {
+                                LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged (tiered) "
+                                               "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u, "
+                                               "hot_pct=%.1f%%, hot_tokens=%u)\n",
+                                               paged_n_blocks, paged_bsize, cparams.n_ctx_seq, cparams.n_seq_max,
+                                               params.kv_tier_hot_pct, hot_tokens);
+                            } else {
+                                LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged "
+                                               "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
+                                               paged_n_blocks, paged_bsize, cparams.n_ctx_seq, cparams.n_seq_max);
+                            }
                         }
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2189,10 +2215,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // recurrent / SWA models stay on their existing memory backends for
     // now — adding paged variants for those is a follow-up phase.
     //
-    // Block sizing: pool sized to fit the user's requested ctx in blocks,
-    // with some headroom. n_blocks_total = ceil(n_ctx_seq / block_size) * 1.5
-    // gives ~33% slack for eviction/refill churn. Cap max_blocks_per_seq
-    // to the same number — single seq can use the full pool in v1.
+    // Block sizing (MAD-117):
+    //   - non-tiered:  hot_tokens = n_ctx_seq * n_seq_max * 1.5     (covers all slots + headroom)
+    //   - tiered:      hot_tokens = total_ctx * (hot_pct / 100)      (only the GPU-resident slice)
+    // Floor at n_ctx_seq so the GPU pool can always hold at least one slot's full
+    // context (otherwise a single seq couldn't fit, which would be unusable).
+    //
+    // total_ctx defaults to n_ctx_seq * n_seq_max (the full request); if the user
+    // sets --kv-tier-total-ctx explicitly, that overrides (e.g., for an "agent army"
+    // where n_ctx_seq is the per-slot active window but total budget is much larger).
+    //
+    // The 25% hot tier with turbo4 KV is what makes 128k-per-slot fit on 8 GB
+    // consumer GPUs (per-token cost ≈ 8.5 KiB at HEAD_SIZE=256 / n_kv_heads=4 /
+    // 16 paged layers / turbo4).
     if (res && params.kv_tier_paged_blocks
         && !llm_arch_is_recurrent(arch)
         && !llm_arch_is_hybrid(arch)
@@ -2201,8 +2236,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         delete res;  // discard the standard cache we just built
         const uint32_t bsize = params.kv_tier_paged_block_size > 0
                              ? (uint32_t) params.kv_tier_paged_block_size : 16u;
-        const uint32_t blocks_for_ctx = (cparams.n_ctx_seq + bsize - 1) / bsize;
-        const uint32_t n_blocks_total = (uint32_t)((double) blocks_for_ctx * 1.5);
+        const uint32_t blocks_for_ctx       = (cparams.n_ctx_seq + bsize - 1) / bsize;
+        const uint32_t total_ctx_all_slots  = cparams.n_ctx_seq * cparams.n_seq_max;
+
+        uint32_t hot_tokens;
+        if (params.kv_tier_enabled) {
+            const uint32_t total_ctx = params.kv_tier_total_ctx > 0
+                                          ? (uint32_t) params.kv_tier_total_ctx
+                                          : total_ctx_all_slots;
+            hot_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_hot_pct / 100.0));
+            if (hot_tokens < cparams.n_ctx_seq) hot_tokens = cparams.n_ctx_seq;
+        } else {
+            hot_tokens = (uint32_t)((double) total_ctx_all_slots * 1.5);
+        }
+
+        const uint32_t n_blocks_total = (hot_tokens + bsize - 1) / bsize;
 
         // Pick the GPU buffer type from device 0 (where the model lives).
         ggml_backend_buffer_type_t buft = nullptr;
@@ -2220,9 +2268,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 /*n_seq_max          =*/ cparams.n_seq_max,
                 /*max_blocks_per_seq =*/ blocks_for_ctx);
 
-        LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged "
-                       "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
-                       n_blocks_total, bsize, cparams.n_ctx_seq, cparams.n_seq_max);
+        if (params.kv_tier_enabled) {
+            LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged (tiered) "
+                           "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u, "
+                           "hot_pct=%.1f%%, hot_tokens=%u)\n",
+                           n_blocks_total, bsize, cparams.n_ctx_seq, cparams.n_seq_max,
+                           params.kv_tier_hot_pct, hot_tokens);
+        } else {
+            LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged "
+                           "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
+                           n_blocks_total, bsize, cparams.n_ctx_seq, cparams.n_seq_max);
+        }
     }
 
     // Phase 2 rewrite: tiered KV wrapper. When --kv-tiered is set, wrap the
