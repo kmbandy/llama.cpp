@@ -6,8 +6,40 @@
 #include "mt_pagedattn.cuh"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace mt {
+
+// ───────────────── env-var: fused vs separate scatter ─────────────────
+//
+// Default (unset or GGML_PAGED_FUSED=0): mt_scatter_kv_kernel runs first
+//   (non-redundant, n_kv_heads blocks per seq), then mt_paged_attention_kernel
+//   runs with DO_SCATTER=false. Two launches per attn layer per token.
+//   Chosen as default because separate kernels keep MAD-116 quant-aware write
+//   paths isolated from the hot attn kernel and tune independently for
+//   bandwidth (scatter) vs compute (attn) on speculative-decode batches.
+//
+// GGML_PAGED_FUSED=1 (toggle): scatter+attn fused in mt_paged_attention_kernel
+//   (Phase 1 inside the attn kernel, intra-block __syncthreads). Redundant
+//   scatter writes per head block (n_heads / n_kv_heads × idempotent), but
+//   only one kernel launch per attn layer per token. Kept as a debug toggle
+//   and a fallback if a future workload tilts the perf trade-off.
+//
+// On Qwen3.6-27B-Q6_K at decode batch=1, fused vs separate is parity within
+// run-to-run noise (<1% delta on prefill or decode tps). See bench logs in
+// the paged-attn-fusion branch commit message.
+//
+// Read once on first dispatch; cached for the process lifetime.
+static int get_paged_fused_mode() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_PAGED_FUSED");
+        mode = (env != nullptr && env[0] == '1') ? 1 : 0;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_FUSED=%d (%s scatter)\n",
+                      mode, mode ? "fused" : "separate");
+    }
+    return mode;
+}
 
 // ───────────────────────── helpers ─────────────────────────
 
@@ -71,6 +103,101 @@ __device__ __forceinline__ float block_reduce_max(float v, float * red_smem) {
     return red_smem[0];
 }
 
+// ──────────────────── separate scatter kernel ────────────────────
+//
+// Used only when GGML_PAGED_FUSED=0. Mirrors the math of Phase 1 in
+// mt_paged_attention_kernel but with non-redundant work: one block per
+// (kv_head, seq), so each (token, kv_head) pair is written exactly once
+// — vs the fused kernel's (n_heads / n_kv_heads)x redundancy. After this
+// kernel, the attn kernel is launched with DO_SCATTER=false.
+//
+// Same-stream submission ordering between this kernel and the subsequent
+// attn kernel is guaranteed by CUDA/HIP within a stream (no fence needed
+// after PATH A — we now own per-graph metadata tensors and the WAR hazard
+// that motivated the host-side stream sync no longer exists).
+
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS>
+__global__ void mt_scatter_kv_kernel(
+    scalar_t       * __restrict__ k_cache,
+    scalar_t       * __restrict__ v_cache,
+    const scalar_t * __restrict__ k_cur,        // [head_dim, n_kv_heads, n_tokens]
+    const scalar_t * __restrict__ v_cur,        // [head_dim, n_kv_heads, n_tokens]
+    const int32_t  * __restrict__ slot_mapping, // [n_tokens]
+    const int32_t  * __restrict__ q_lens,       // [num_seqs]
+    int             n_kv_heads) {
+    const int kv_head_idx = blockIdx.x;
+    const int seq_idx     = blockIdx.y;
+    const int tid         = threadIdx.x;
+
+    constexpr int VEC_PER_THREAD = (HEAD_SIZE + NUM_THREADS - 1) / NUM_THREADS;
+    constexpr int K_X            = 16 / sizeof(scalar_t);
+    static_assert(BLOCK_SIZE > 0 && (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0, "BLOCK_SIZE must be power of 2");
+    static_assert(HEAD_SIZE % K_X == 0, "HEAD_SIZE must be divisible by K_X");
+
+    const int q_len = q_lens[seq_idx];
+    const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
+    GGML_UNUSED(seq_idx);            // multi-seq offset accounting is a follow-up
+
+    for (int t = 0; t < q_len; ++t) {
+        const int global_token_idx = (int)(seq_q_offset + t);
+        const int slot = slot_mapping[global_token_idx];
+        if (slot < 0) continue;  // padding token
+
+        const int block_idx     = slot / BLOCK_SIZE;
+        const int slot_in_block = slot % BLOCK_SIZE;
+
+        const size_t src_base = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                              + (size_t) kv_head_idx * HEAD_SIZE;
+
+        #pragma unroll
+        for (int v = 0; v < VEC_PER_THREAD; ++v) {
+            const int d = tid + v * NUM_THREADS;
+            if (d < HEAD_SIZE) {
+                const scalar_t k_val = k_cur[src_base + (size_t) d];
+                const scalar_t v_val = v_cur[src_base + (size_t) d];
+
+                // K cache: [num_blocks, n_kv_heads, HEAD_SIZE/X, BLOCK_SIZE, X]
+                const int dim_outer = d / K_X;
+                const int dim_inner = d % K_X;
+                const size_t k_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
+                                   + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
+                                   + (size_t) dim_outer * BLOCK_SIZE * K_X
+                                   + (size_t) slot_in_block * K_X
+                                   + (size_t) dim_inner;
+                k_cache[k_idx] = k_val;
+
+                // V cache: [num_blocks, n_kv_heads, HEAD_SIZE, BLOCK_SIZE]
+                const size_t v_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
+                                   + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
+                                   + (size_t) d * BLOCK_SIZE
+                                   + (size_t) slot_in_block;
+                v_cache[v_idx] = v_val;
+            }
+        }
+    }
+}
+
+template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
+static void launch_scatter_kv(
+    scalar_t       * k_cache,
+    scalar_t       * v_cache,
+    const scalar_t * k_cur,
+    const scalar_t * v_cur,
+    const int32_t  * slot_mapping,
+    const int32_t  * q_lens,
+    int             num_seqs,
+    int             n_kv_heads,
+    cudaStream_t    stream) {
+    constexpr int NUM_THREADS = 128;
+
+    dim3 grid(n_kv_heads, num_seqs);
+    dim3 block(NUM_THREADS);
+
+    mt_scatter_kv_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>
+        <<<grid, block, 0, stream>>>(
+            k_cache, v_cache, k_cur, v_cur, slot_mapping, q_lens, n_kv_heads);
+}
+
 // ──────────────────── kernel ────────────────────
 //
 // Threading: each thread block handles one (head, seq) pair, running
@@ -112,7 +239,7 @@ __device__ __forceinline__ float block_reduce_max(float v, float * red_smem) {
 
 template <typename scalar_t, typename cache_t,
           int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE>
+          int PARTITION_SIZE, bool DO_SCATTER = true>
 __global__ void mt_paged_attention_kernel(
     scalar_t       * __restrict__ out,
     const scalar_t * __restrict__ q,
@@ -161,7 +288,10 @@ __global__ void mt_paged_attention_kernel(
     // destination addresses), so the redundancy is correctness-preserving.
     // No cross-block synchronization is needed: each block reads in phase 2
     // only the slots it itself wrote in phase 1.
-    {
+    //
+    // When DO_SCATTER=false, scatter has already been done by a separate
+    // kernel launched on the same stream — Phase 1 here is elided.
+    if constexpr (DO_SCATTER) {
         const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
 
         for (int t = 0; t < q_len; ++t) {
@@ -372,7 +502,7 @@ __global__ void mt_paged_attention_kernel(
 // when all seqs in the batch have the same q_len (typical decode batch).
 
 template <typename scalar_t, typename cache_t,
-          int HEAD_SIZE, int BLOCK_SIZE>
+          int HEAD_SIZE, int BLOCK_SIZE, bool DO_SCATTER>
 static void launch_paged_attn(
     scalar_t       * out,
     const scalar_t * q,
@@ -416,7 +546,7 @@ static void launch_paged_attn(
         GGML_ABORT("mt::paged_attn smem overflow — see docs for chunked-attention plan");
     }
 
-    mt_paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0>
+    mt_paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0, DO_SCATTER>
         <<<grid, block, smem_bytes, stream>>>(
             out, q, k_cache, v_cache,
             block_tables, context_lens, q_lens,
@@ -461,24 +591,54 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int max_ctx_len = max_bps * block_size;
 
     cudaStream_t stream = ctx.stream();
+    const bool do_fused = (get_paged_fused_mode() != 0);
 
     // Dispatch on (head_size, block_size). Add cases as models need.
     auto run = [&](auto head_size_const, auto block_size_const) {
         constexpr int HS = decltype(head_size_const)::value;
         constexpr int BS = decltype(block_size_const)::value;
-        launch_paged_attn<__half, __half, HS, BS>(
-            (__half *) dst->data,
-            (const __half *) q->data,
-            (__half *) k_cache->data,
-            (__half *) v_cache->data,
-            (const int32_t *) block_tables->data,
-            (const int32_t *) context_lens->data,
-            (const int32_t *) q_lens->data,
-            (const __half *) k_cur->data,
-            (const __half *) v_cur->data,
-            (const int32_t *) slot_mapping->data,
-            num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
-            scale, stream);
+
+        if (!do_fused) {
+            // Experiment path: separate scatter kernel + attn-only kernel.
+            // Same-stream submission ordering is sufficient now that PATH A
+            // removed the metadata-tensor WAR hazard (the bug previously
+            // attributed to scatter-coherence).
+            launch_scatter_kv<__half, HS, BS>(
+                (__half *) k_cache->data,
+                (__half *) v_cache->data,
+                (const __half *) k_cur->data,
+                (const __half *) v_cur->data,
+                (const int32_t *) slot_mapping->data,
+                (const int32_t *) q_lens->data,
+                num_seqs, n_kv_heads, stream);
+            launch_paged_attn<__half, __half, HS, BS, /*DO_SCATTER=*/false>(
+                (__half *) dst->data,
+                (const __half *) q->data,
+                (__half *) k_cache->data,
+                (__half *) v_cache->data,
+                (const int32_t *) block_tables->data,
+                (const int32_t *) context_lens->data,
+                (const int32_t *) q_lens->data,
+                (const __half *) k_cur->data,
+                (const __half *) v_cur->data,
+                (const int32_t *) slot_mapping->data,
+                num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
+                scale, stream);
+        } else {
+            launch_paged_attn<__half, __half, HS, BS, /*DO_SCATTER=*/true>(
+                (__half *) dst->data,
+                (const __half *) q->data,
+                (__half *) k_cache->data,
+                (__half *) v_cache->data,
+                (const int32_t *) block_tables->data,
+                (const int32_t *) context_lens->data,
+                (const int32_t *) q_lens->data,
+                (const __half *) k_cur->data,
+                (const __half *) v_cur->data,
+                (const int32_t *) slot_mapping->data,
+                num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
+                scale, stream);
+        }
     };
 
     // Most common cases first; fall through to a runtime error for
