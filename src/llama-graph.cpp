@@ -2362,31 +2362,28 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cast = to_f16_cont(k_cur);
         ggml_tensor * v_cast = to_f16_cont(v_cur);
 
-        // 2) Forward-expand the source nodes so the scatter sees fully-
-        //    computed sources (mirrors the regular path's barrier).
+        // 2) Forward-expand the source nodes so they're fully computed
+        //    before paged_attn reads them (mirrors the regular path's
+        //    barrier).
         ggml_build_forward_expand(gf, q_cast);
         ggml_build_forward_expand(gf, k_cast);
         ggml_build_forward_expand(gf, v_cast);
 
-        // 3) Scatter k_cur / v_cur into this layer's K_cache / V_cache.
-        //    Forward-expand the anchor so the scatter completes before
-        //    paged_attn reads from the same cache buffers.
-        ggml_tensor * scatter_anchor = ggml_paged_kv_update_mt(
-            ctx0,
-            k_cast, v_cast,
-            layer.k, layer.v,
-            inp->paged_slot_mapping,
-            block_size, n_kv_heads);
-        ggml_build_forward_expand(gf, scatter_anchor);
-
-        // 4) Run paged attention. Output shape mirrors Q:
-        //    [head_dim, n_heads, n_tokens, 1] in ggml's standard layout.
+        // 3) Fused scatter+attention. The single op writes K_cur/V_cur
+        //    into layer.k/layer.v at slot_mapping positions, then runs
+        //    attention against the just-written cache — all inside one
+        //    kernel separated by __syncthreads(). Sidesteps the HIP/RDNA
+        //    runtime bug (ROCm/hip#3882, #3887) where same-stream inter-
+        //    kernel ordering isn't enforced for scatter→attn pairs. See
+        //    mt_pagedattn.cu for the kernel-side rationale.
         ggml_tensor * cur = ggml_paged_attn_mt(
             ctx0,
             q_cast, layer.k, layer.v,
             inp->paged_block_table,
             inp->paged_context_lens,
             inp->paged_q_lens,
+            k_cast, v_cast,
+            inp->paged_slot_mapping,
             block_size, n_kv_heads, kq_scale);
         cb(cur, "kqv_paged_out", il);
 

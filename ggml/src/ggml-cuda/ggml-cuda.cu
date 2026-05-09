@@ -675,8 +675,14 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    // MAD-114: use synchronous cudaMemcpy instead of cudaMemcpyAsync+sync.
+    // The previous code copied on cudaStreamPerThread and synced that stream,
+    // but the graph's kernels run on cuda_ctx->stream() — a different stream.
+    // On HIP/RDNA (gfx1201, ROCm 7.2.x) cross-stream visibility isn't reliable
+    // even after host-side sync of the source stream, which led to graph kernels
+    // reading stale input data (see MAD-114 / ROCm/hip#3882, #3887). Synchronous
+    // cudaMemcpy provides device-wide ordering before returning to host.
+    CUDA_CHECK(cudaMemcpy((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3134,9 +3140,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PAGED_ATTN_MT:
             mt::ggml_cuda_op_paged_attn_mt(ctx, dst);
             break;
-        case GGML_OP_PAGED_KV_UPDATE_MT:
-            mt::ggml_cuda_op_paged_kv_update_mt(ctx, dst);
-            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -3321,6 +3324,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
+        }
+
+        // MAD-114: paged_attn uses cudaLaunchCooperativeKernel (for the
+        // intra-kernel grid.sync between scatter and attn phases), which
+        // is not compatible with cudaStreamCapture in ROCm 7.2.x. Opt out
+        // of graph capture for any graph containing this op until cooperative
+        // capture is supported (or until we fold the cooperative path back
+        // into a non-cooperative kernel).
+        if (node->op == GGML_OP_PAGED_ATTN_MT) {
+            use_cuda_graph = false;
+            break;
         }
 
         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
@@ -5458,15 +5472,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_PAGED_ATTN_MT:
             return op->type == GGML_TYPE_F16
-                && op->src[0]->type == GGML_TYPE_F16
-                && op->src[1]->type == GGML_TYPE_F16
-                && op->src[2]->type == GGML_TYPE_F16;
-        case GGML_OP_PAGED_KV_UPDATE_MT:
-            return op->src[0]->type == GGML_TYPE_F16   // k_cur
-                && op->src[1]->type == GGML_TYPE_F16   // v_cur
-                && op->src[2]->type == GGML_TYPE_F16   // k_cache
-                && op->src[3]->type == GGML_TYPE_F16   // v_cache
-                && op->src[4]->type == GGML_TYPE_I32;  // slot_mapping
+                && op->src[0]->type == GGML_TYPE_F16   // q
+                && op->src[1]->type == GGML_TYPE_F16   // k_cache
+                && op->src[2]->type == GGML_TYPE_F16   // v_cache
+                && op->src[6]                          // k_cur (fused scatter)
+                && op->src[6]->type == GGML_TYPE_F16
+                && op->src[7]                          // v_cur (fused scatter)
+                && op->src[7]->type == GGML_TYPE_F16
+                && op->src[8]                          // slot_mapping (fused scatter)
+                && op->src[8]->type == GGML_TYPE_I32;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
