@@ -133,13 +133,14 @@ llama_kv_cache_paged::llama_kv_cache_paged(
                    n_blocks_total_, block_size_, n_kv_heads, head_dim,
                    ggml_type_name(type_k_), ggml_type_name(type_v_));
 
-    // ── Input tensors (block_table, context_lens, q_lens) ──
+    // ── Input tensor (block_table) ──
     //
-    // These live on the GPU but are written from the host each batch.
-    // We keep host mirrors and ggml_backend_tensor_set them on prepare.
+    // Lives on the GPU but written from the host each batch. We keep a
+    // host mirror and ggml_backend_tensor_set it on prepare. context_lens
+    // and q_lens used to live here too but were moved per-graph (MAD-114).
     {
         ggml_init_params iparams = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+            /*.mem_size   =*/ ggml_tensor_overhead() * 4,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -150,11 +151,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     }
 
     block_table_  = ggml_new_tensor_2d(ctx_inputs_, GGML_TYPE_I32, max_blocks_per_seq_, n_seq_max_);
-    context_lens_ = ggml_new_tensor_1d(ctx_inputs_, GGML_TYPE_I32, n_seq_max_);
-    q_lens_       = ggml_new_tensor_1d(ctx_inputs_, GGML_TYPE_I32, n_seq_max_);
     ggml_set_name(block_table_,  "paged_block_table");
-    ggml_set_name(context_lens_, "paged_context_lens");
-    ggml_set_name(q_lens_,       "paged_q_lens");
 
     buf_inputs_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_inputs_, buft_);
     if (!buf_inputs_) {
@@ -276,10 +273,11 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
 
     ggml_backend_tensor_set(block_table_,  h_block_table_.data(),  0,
                             sizeof(int32_t) * h_block_table_.size());
-    ggml_backend_tensor_set(context_lens_, h_context_lens_.data(), 0,
-                            sizeof(int32_t) * h_context_lens_.size());
-    ggml_backend_tensor_set(q_lens_,       h_q_lens_.data(),       0,
-                            sizeof(int32_t) * h_q_lens_.size());
+    // MAD-114: context_lens and q_lens are no longer uploaded here.
+    // They're per-graph now (allocated in build_attn_inp_kv_paged_impl,
+    // populated by the corresponding set_input from these host mirrors).
+    // h_context_lens_ / h_q_lens_ are still populated above so set_input
+    // can read them.
 }
 
 bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {

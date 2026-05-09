@@ -92,11 +92,22 @@ public:
     uint32_t          max_blocks_per_seq()   const { return max_blocks_per_seq_; }
     const layer_storage & layer(uint32_t il) const { return layers_[il]; }
 
-    // The 3 input tensors the graph wires into ggml_paged_attn_mt for
-    // every attention call. Kept resident; updated by prepare_batch.
+    // The block_table tensor is wired into ggml_paged_attn_mt for every
+    // attention call; kept resident, updated by prepare_batch_tensors.
     ggml_tensor * block_table_tensor() const { return block_table_; }
-    ggml_tensor * context_lens_tensor() const { return context_lens_; }
-    ggml_tensor * q_lens_tensor()      const { return q_lens_; }
+
+    // MAD-114: context_lens / q_lens are NOT persistent any more — they
+    // were causing a write-after-read hazard across forward passes (the
+    // hybrid model issues prefill + decode back-to-back; the persistent
+    // tensors got overwritten by pass-B's prepare while pass-A's late
+    // attention layers were still reading them, on HIP/RDNA where
+    // same-stream kernel ordering isn't honored). Now allocated per-graph
+    // by build_attn_inp_kv_paged_impl + populated by set_input from these
+    // host mirrors.
+    const int32_t * h_context_lens_data() const { return h_context_lens_.data(); }
+    size_t          h_context_lens_size() const { return h_context_lens_.size(); }
+    const int32_t * h_q_lens_data()       const { return h_q_lens_.data(); }
+    size_t          h_q_lens_size()       const { return h_q_lens_.size(); }
 
     // ─── llama_memory_i ───
     llama_memory_context_ptr init_batch(llama_batch_allocr & balloc,
@@ -198,8 +209,9 @@ private:
     ggml_context *        ctx_inputs_      = nullptr;
     ggml_backend_buffer_t buf_inputs_      = nullptr;
     ggml_tensor *         block_table_    = nullptr;  // [max_blocks_per_seq, n_seq_max] i32
-    ggml_tensor *         context_lens_   = nullptr;  // [n_seq_max] i32
-    ggml_tensor *         q_lens_         = nullptr;  // [n_seq_max] i32
+    // MAD-114: context_lens / q_lens are no longer persistent — they're
+    // allocated per-graph by the graph builder and populated by set_input
+    // from h_context_lens_ / h_q_lens_ below.
 
     // Host-side mirrors for the input tensors. Updated by
     // prepare_batch_tensors then copied to GPU.

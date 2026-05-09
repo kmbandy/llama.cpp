@@ -6,7 +6,6 @@
 #include "mt_pagedattn.cuh"
 
 #include <cmath>
-#include <cstdio>
 
 namespace mt {
 
@@ -117,11 +116,14 @@ template <typename scalar_t, typename cache_t,
 __global__ void mt_paged_attention_kernel(
     scalar_t       * __restrict__ out,
     const scalar_t * __restrict__ q,
-    const cache_t  * __restrict__ k_cache,
-    const cache_t  * __restrict__ v_cache,
+    cache_t        * __restrict__ k_cache,    // writable: fused scatter writes here
+    cache_t        * __restrict__ v_cache,    // writable: fused scatter writes here
     const int32_t  * __restrict__ block_tables,
     const int32_t  * __restrict__ context_lens,
     const int32_t  * __restrict__ q_lens,
+    const scalar_t * __restrict__ k_cur,        // [head_dim, n_kv_heads, n_tokens]
+    const scalar_t * __restrict__ v_cur,        // [head_dim, n_kv_heads, n_tokens]
+    const int32_t  * __restrict__ slot_mapping, // [n_tokens]
     int             max_blocks_per_seq,
     int             n_kv_heads,
     int             n_heads,
@@ -141,6 +143,68 @@ __global__ void mt_paged_attention_kernel(
     const int q_len             = q_lens[seq_idx];
     const int ctx_len_after_q   = context_lens[seq_idx];   // total tokens in seq's context AFTER this batch's Q is applied
     const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // ── Phase 1: scatter K_cur/V_cur into the K/V cache (fused) ──
+    //
+    // MAD-114: the previous design had scatter and attn as SEPARATE kernels,
+    // relying on same-stream submission ordering to make scatter's writes
+    // visible to attn's reads. On HIP/RDNA (gfx1201, ROCm 7.2.x) that
+    // ordering isn't reliably enforced (cf. ROCm/hip#3882, #3887), so attn
+    // would read stale cache. Fusing the two phases into one kernel,
+    // separated by an intra-block __syncthreads(), eliminates the dependency
+    // on inter-kernel ordering — __syncthreads is a hardware barrier that
+    // always works.
+    //
+    // GQA: with n_heads > n_kv_heads, multiple (head_idx, seq_idx) blocks
+    // share the same kv_head_idx. EACH such block scatters its kv_head's
+    // slots redundantly. Writes are idempotent (same source values to same
+    // destination addresses), so the redundancy is correctness-preserving.
+    // No cross-block synchronization is needed: each block reads in phase 2
+    // only the slots it itself wrote in phase 1.
+    {
+        const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
+
+        for (int t = 0; t < q_len; ++t) {
+            const int global_token_idx = (int)(seq_q_offset + t);
+            const int slot = slot_mapping[global_token_idx];
+            if (slot < 0) continue;  // padding token
+
+            const int block_idx     = slot / BLOCK_SIZE;
+            const int slot_in_block = slot % BLOCK_SIZE;
+
+            // K_cur / V_cur: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens
+            const size_t src_base = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                                  + (size_t) kv_head_idx * HEAD_SIZE;
+
+            #pragma unroll
+            for (int v = 0; v < VEC_PER_THREAD; ++v) {
+                const int d = tid + v * NUM_THREADS;
+                if (d < HEAD_SIZE) {
+                    const scalar_t k_val = k_cur[src_base + (size_t) d];
+                    const scalar_t v_val = v_cur[src_base + (size_t) d];
+
+                    // K cache: [num_blocks, n_kv_heads, HEAD_SIZE/X, BLOCK_SIZE, X]
+                    const int dim_outer = d / K_X;
+                    const int dim_inner = d % K_X;
+                    const size_t k_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
+                                       + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
+                                       + (size_t) dim_outer * BLOCK_SIZE * K_X
+                                       + (size_t) slot_in_block * K_X
+                                       + (size_t) dim_inner;
+                    k_cache[k_idx] = k_val;
+
+                    // V cache: [num_blocks, n_kv_heads, HEAD_SIZE, BLOCK_SIZE]
+                    const size_t v_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
+                                       + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
+                                       + (size_t) d * BLOCK_SIZE
+                                       + (size_t) slot_in_block;
+                    v_cache[v_idx] = v_val;
+                }
+            }
+        }
+        __syncthreads();  // makes this block's scatter writes visible to its own attn reads
+    }
+    // ── Phase 2: attention math (uses the cache slots this block just wrote) ──
 
     // Shared memory layout:
     //   [0 .. NUM_WARPS)        — red_smem (reduction scratch)
@@ -312,11 +376,14 @@ template <typename scalar_t, typename cache_t,
 static void launch_paged_attn(
     scalar_t       * out,
     const scalar_t * q,
-    const cache_t  * k_cache,
-    const cache_t  * v_cache,
+    cache_t        * k_cache,
+    cache_t        * v_cache,
     const int32_t  * block_tables,
     const int32_t  * context_lens,
     const int32_t  * q_lens,
+    const scalar_t * k_cur,
+    const scalar_t * v_cur,
+    const int32_t  * slot_mapping,
     int             num_seqs,
     int             n_heads,
     int             n_kv_heads,
@@ -353,6 +420,7 @@ static void launch_paged_attn(
         <<<grid, block, smem_bytes, stream>>>(
             out, q, k_cache, v_cache,
             block_tables, context_lens, q_lens,
+            k_cur, v_cur, slot_mapping,
             max_blocks_per_seq, n_kv_heads, n_heads, scale);
 }
 
@@ -363,6 +431,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const ggml_tensor * block_tables  = dst->src[3];
     const ggml_tensor * context_lens  = dst->src[4];
     const ggml_tensor * q_lens        = dst->src[5];
+    const ggml_tensor * k_cur         = dst->src[6];
+    const ggml_tensor * v_cur         = dst->src[7];
+    const ggml_tensor * slot_mapping  = dst->src[8];
 
     const float * op_params_f = (const float *)(dst->op_params);
     const float   scale       = op_params_f[0];
@@ -378,6 +449,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(q->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 Q only");
     GGML_ASSERT(k_cache->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 K cache only");
     GGML_ASSERT(v_cache->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 V cache only");
+    GGML_ASSERT(k_cur && k_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_cur && v_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(slot_mapping && slot_mapping->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(v_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(slot_mapping->ne[0] == k_cur->ne[2]);
 
     // For smem sizing we need the longest context in this batch.
     // Cheap upper bound: max_blocks_per_seq * block_size.
@@ -392,11 +469,14 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
         launch_paged_attn<__half, __half, HS, BS>(
             (__half *) dst->data,
             (const __half *) q->data,
-            (const __half *) k_cache->data,
-            (const __half *) v_cache->data,
+            (__half *) k_cache->data,
+            (__half *) v_cache->data,
             (const int32_t *) block_tables->data,
             (const int32_t *) context_lens->data,
             (const int32_t *) q_lens->data,
+            (const __half *) k_cur->data,
+            (const __half *) v_cur->data,
+            (const int32_t *) slot_mapping->data,
             num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
             scale, stream);
     };
@@ -417,147 +497,5 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
 }
 
-// ─── Phase 3.4b-2: paged K/V scatter ──────────────────────────────────────
-//
-// Writes K_cur/V_cur into the block-indexed cache at the positions given by
-// slot_mapping. Layout matches the attention kernel above (interleaved K,
-// transposed V) — see mt_pagedattn.cuh for the layout contract.
-
-template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int X>
-__global__ void mt_reshape_and_cache_kernel(
-    const scalar_t * __restrict__ k_cur,        // [head_dim, n_kv_heads, n_tokens]
-    const scalar_t * __restrict__ v_cur,        // [head_dim, n_kv_heads, n_tokens]
-    scalar_t       * __restrict__ k_cache,      // [num_blocks, n_kv_heads, head_dim/x, block_size, x]
-    scalar_t       * __restrict__ v_cache,      // [num_blocks, n_kv_heads, head_dim, block_size]
-    const int32_t  * __restrict__ slot_mapping, // [n_tokens]
-    int n_kv_heads,
-    int n_tokens) {
-
-    const int token_idx = blockIdx.x;
-    const int head_idx  = blockIdx.y;
-    const int dim_idx   = threadIdx.x;
-
-    if (token_idx >= n_tokens || head_idx >= n_kv_heads || dim_idx >= HEAD_SIZE) {
-        return;
-    }
-
-    const int slot = slot_mapping[token_idx];
-    if (slot < 0) {
-        // Padding token — skip.
-        return;
-    }
-
-    const int block_idx     = slot / BLOCK_SIZE;
-    const int slot_in_block = slot % BLOCK_SIZE;
-
-    // K_cur / V_cur: ne[0]=head_dim (fast), ne[1]=n_kv_heads, ne[2]=n_tokens.
-    // Flat = token_idx * (n_kv_heads * HEAD_SIZE) + head_idx * HEAD_SIZE + dim_idx.
-    const int src_idx = token_idx * (n_kv_heads * HEAD_SIZE) + head_idx * HEAD_SIZE + dim_idx;
-    const scalar_t k_val = k_cur[src_idx];
-    const scalar_t v_val = v_cur[src_idx];
-
-    // K cache layout: [num_blocks, n_kv_heads, HEAD_SIZE/X, BLOCK_SIZE, X]
-    // Index = block * (n_kv_heads * HEAD_SIZE * BLOCK_SIZE)
-    //       + head  * (HEAD_SIZE * BLOCK_SIZE)
-    //       + dim_outer * (BLOCK_SIZE * X)
-    //       + slot_in_block * X
-    //       + dim_inner
-    const int dim_outer = dim_idx / X;
-    const int dim_inner = dim_idx % X;
-    const int k_idx = block_idx * (n_kv_heads * HEAD_SIZE * BLOCK_SIZE)
-                    + head_idx  * (HEAD_SIZE * BLOCK_SIZE)
-                    + dim_outer * (BLOCK_SIZE * X)
-                    + slot_in_block * X
-                    + dim_inner;
-    k_cache[k_idx] = k_val;
-
-    // V cache layout: [num_blocks, n_kv_heads, HEAD_SIZE, BLOCK_SIZE]
-    // Index = block * (n_kv_heads * HEAD_SIZE * BLOCK_SIZE)
-    //       + head  * (HEAD_SIZE * BLOCK_SIZE)
-    //       + dim_idx * BLOCK_SIZE
-    //       + slot_in_block
-    const int v_idx = block_idx * (n_kv_heads * HEAD_SIZE * BLOCK_SIZE)
-                    + head_idx  * (HEAD_SIZE * BLOCK_SIZE)
-                    + dim_idx   * BLOCK_SIZE
-                    + slot_in_block;
-    v_cache[v_idx] = v_val;
-}
-
-template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
-static void launch_paged_kv_update(
-    const scalar_t * k_cur,
-    const scalar_t * v_cur,
-    scalar_t       * k_cache,
-    scalar_t       * v_cache,
-    const int32_t  * slot_mapping,
-    int n_kv_heads,
-    int n_tokens,
-    cudaStream_t stream) {
-    constexpr int X = 16 / sizeof(scalar_t);  // 8 for fp16
-    static_assert(HEAD_SIZE % X == 0, "HEAD_SIZE must divide evenly into vector groups of x");
-
-    dim3 grid(n_tokens, n_kv_heads);
-    dim3 block(HEAD_SIZE);
-
-    mt_reshape_and_cache_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, X>
-        <<<grid, block, 0, stream>>>(
-            k_cur, v_cur, k_cache, v_cache, slot_mapping,
-            n_kv_heads, n_tokens);
-}
-
-void ggml_cuda_op_paged_kv_update_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * k_cur        = dst->src[0];
-    const ggml_tensor * v_cur        = dst->src[1];
-    const ggml_tensor * k_cache      = dst->src[2];
-    const ggml_tensor * v_cache      = dst->src[3];
-    const ggml_tensor * slot_mapping = dst->src[4];
-
-    const int32_t * params_i32 = (const int32_t *)(dst->op_params);
-    const int32_t   block_size = params_i32[0];
-    const int32_t   n_kv_heads = params_i32[1];
-
-    // K_cur shape: [head_dim, n_kv_heads, n_tokens]
-    const int head_size = (int) k_cur->ne[0];
-    const int n_tokens  = (int) k_cur->ne[2];
-
-    GGML_ASSERT(k_cur->type == GGML_TYPE_F16 && "PagedKVUpdate v1: F16 K_cur only");
-    GGML_ASSERT(v_cur->type == GGML_TYPE_F16);
-    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
-    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
-    GGML_ASSERT(slot_mapping->type == GGML_TYPE_I32);
-    GGML_ASSERT(slot_mapping->ne[0] == n_tokens);
-
-    if (n_tokens == 0) {
-        return;  // nothing to scatter
-    }
-
-    cudaStream_t stream = ctx.stream();
-
-    auto run = [&](auto head_size_const, auto block_size_const) {
-        constexpr int HS = decltype(head_size_const)::value;
-        constexpr int BS = decltype(block_size_const)::value;
-        launch_paged_kv_update<__half, HS, BS>(
-            (const __half *) k_cur->data,
-            (const __half *) v_cur->data,
-            (__half *)       k_cache->data,
-            (__half *)       v_cache->data,
-            (const int32_t *) slot_mapping->data,
-            n_kv_heads, n_tokens, stream);
-    };
-
-    // Mirror the attention dispatch's (head_size, block_size) matrix.
-    if (head_size == 128 && block_size == 16) {
-        run(std::integral_constant<int, 128>{}, std::integral_constant<int, 16>{});
-    } else if (head_size == 64 && block_size == 16) {
-        run(std::integral_constant<int, 64>{}, std::integral_constant<int, 16>{});
-    } else if (head_size == 256 && block_size == 16) {
-        run(std::integral_constant<int, 256>{}, std::integral_constant<int, 16>{});
-    } else if (head_size == 128 && block_size == 32) {
-        run(std::integral_constant<int, 128>{}, std::integral_constant<int, 32>{});
-    } else {
-        GGML_ABORT("mt_paged_kv_update: unsupported (head_size=%d, block_size=%d) — add a template instantiation",
-                   head_size, block_size);
-    }
-}
 
 }  // namespace mt

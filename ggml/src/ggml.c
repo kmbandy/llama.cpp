@@ -5424,6 +5424,9 @@ struct ggml_tensor * ggml_paged_attn_mt(
         struct ggml_tensor  * block_tables,
         struct ggml_tensor  * context_lens,
         struct ggml_tensor  * q_lens,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * v_cur,
+        struct ggml_tensor  * slot_mapping,
         int                   block_size,
         int                   n_kv_heads,
         float                 scale) {
@@ -5433,6 +5436,12 @@ struct ggml_tensor * ggml_paged_attn_mt(
     GGML_ASSERT(block_tables->type == GGML_TYPE_I32);
     GGML_ASSERT(context_lens->type == GGML_TYPE_I32);
     GGML_ASSERT(q_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_cur && k_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(v_cur && v_cur->type == GGML_TYPE_F16);
+    GGML_ASSERT(slot_mapping && slot_mapping->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(v_cur->ne[1] == n_kv_heads);
+    GGML_ASSERT(slot_mapping->ne[0] == k_cur->ne[2]);
     GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
     GGML_ASSERT(n_kv_heads > 0);
 
@@ -5455,59 +5464,20 @@ struct ggml_tensor * ggml_paged_attn_mt(
 
     result->op     = GGML_OP_PAGED_ATTN_MT;
     result->src[0] = q;
-    result->src[1] = k_cache;
-    result->src[2] = v_cache;
+    result->src[1] = k_cache;     // mutated in-place by fused scatter
+    result->src[2] = v_cache;     // mutated in-place by fused scatter
     result->src[3] = block_tables;
     result->src[4] = context_lens;
     result->src[5] = q_lens;
+    result->src[6] = k_cur;       // fused scatter source
+    result->src[7] = v_cur;       // fused scatter source
+    result->src[8] = slot_mapping;
 
     return result;
 }
 
-struct ggml_tensor * ggml_paged_kv_update_mt(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * k_cur,
-        struct ggml_tensor  * v_cur,
-        struct ggml_tensor  * k_cache,
-        struct ggml_tensor  * v_cache,
-        struct ggml_tensor  * slot_mapping,
-        int                   block_size,
-        int                   n_kv_heads) {
-    GGML_ASSERT(k_cur->type == GGML_TYPE_F16);
-    GGML_ASSERT(v_cur->type == GGML_TYPE_F16);
-    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
-    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
-    GGML_ASSERT(slot_mapping->type == GGML_TYPE_I32);
-    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
-    GGML_ASSERT(n_kv_heads > 0);
-    // k_cur / v_cur shape: [head_dim, n_kv_heads, n_tokens]
-    GGML_ASSERT(k_cur->ne[1] == n_kv_heads);
-    GGML_ASSERT(v_cur->ne[1] == n_kv_heads);
-    GGML_ASSERT(k_cur->ne[2] == slot_mapping->ne[0]);
-
-    // The op writes its sources in-place; the returned tensor is a
-    // tiny F16 anchor whose only role is to chain a forward-expand. Use
-    // F16 (not I32) so the GPU backend's supports_op type-match accepts
-    // it and the scheduler can place the op on the same backend that
-    // owns the K/V cache.
-    int64_t ne_anchor[1] = { 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F16, 1, ne_anchor);
-
-    // op_params:
-    //   [0]: int32_t block_size
-    //   [1]: int32_t n_kv_heads
-    int32_t params_i32[2] = { block_size, n_kv_heads };
-    ggml_set_op_params(result, params_i32, sizeof(params_i32));
-
-    result->op     = GGML_OP_PAGED_KV_UPDATE_MT;
-    result->src[0] = k_cur;
-    result->src[1] = v_cur;
-    result->src[2] = k_cache;
-    result->src[3] = v_cache;
-    result->src[4] = slot_mapping;
-
-    return result;
-}
+// (Legacy ggml_paged_kv_update_mt removed — scatter is fused into
+// ggml_paged_attn_mt above. See MAD-114.)
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,

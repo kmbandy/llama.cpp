@@ -451,14 +451,15 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    // Paged path: only the slot_mapping tensor is set per-batch from the
-    // graph builder side. block_table / context_lens / q_lens are set by
-    // the cache's prepare_batch_tensors (called from init_batch) — they
-    // live on the cache, not the input. mctx (regular kv ctx) is null
-    // in this branch; everything goes through mctx_paged + its parent.
+    // Paged path: slot_mapping, context_lens, and q_lens are all per-graph
+    // (MAD-114). block_table is still resident on the cache because it's
+    // large and append-only — the WAR-hazard cases there are masked by the
+    // sync inside prepare_batch_tensors' synchronous H2D path.
     if (is_paged) {
         GGML_ASSERT(paged_slot_mapping != nullptr);
-        GGML_ASSERT(mctx_paged        != nullptr);
+        GGML_ASSERT(paged_context_lens != nullptr);
+        GGML_ASSERT(paged_q_lens       != nullptr);
+        GGML_ASSERT(mctx_paged         != nullptr);
 
         const auto * paged_parent = mctx_paged->parent();
         std::vector<int32_t> slots((size_t) ubatch->n_tokens, -1);
@@ -467,6 +468,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
         ggml_backend_tensor_set(paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
+        ggml_backend_tensor_set(paged_context_lens, paged_parent->h_context_lens_data(), 0,
+                                sizeof(int32_t) * paged_parent->h_context_lens_size());
+        ggml_backend_tensor_set(paged_q_lens,       paged_parent->h_q_lens_data(),       0,
+                                sizeof(int32_t) * paged_parent->h_q_lens_size());
         return;
     }
 
@@ -610,13 +615,14 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    // Phase 3.6: paged attn branch. Mirrors llm_graph_input_attn_kv::set_input
-    // paged path — only the slot_mapping tensor is set per-batch from this
-    // side; block_table / context_lens / q_lens are owned + uploaded by
-    // the cache itself in prepare_batch_tensors.
+    // MAD-114: paged path mirrors llm_graph_input_attn_kv::set_input — all
+    // three per-graph tensors (slot_mapping, context_lens, q_lens) are
+    // populated here from the cache's host mirrors.
     if (inp_attn->is_paged) {
         GGML_ASSERT(inp_attn->paged_slot_mapping != nullptr);
-        GGML_ASSERT(inp_attn->mctx_paged        != nullptr);
+        GGML_ASSERT(inp_attn->paged_context_lens != nullptr);
+        GGML_ASSERT(inp_attn->paged_q_lens       != nullptr);
+        GGML_ASSERT(inp_attn->mctx_paged         != nullptr);
 
         const auto * paged_parent = inp_attn->mctx_paged->parent();
         std::vector<int32_t> slots((size_t) ubatch->n_tokens, -1);
@@ -625,6 +631,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
         ggml_backend_tensor_set(inp_attn->paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
+        ggml_backend_tensor_set(inp_attn->paged_context_lens, paged_parent->h_context_lens_data(), 0,
+                                sizeof(int32_t) * paged_parent->h_context_lens_size());
+        ggml_backend_tensor_set(inp_attn->paged_q_lens,       paged_parent->h_q_lens_data(),       0,
+                                sizeof(int32_t) * paged_parent->h_q_lens_size());
     } else {
         mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
         mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
@@ -2280,14 +2290,25 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_paged_impl(
     inp->mctx_paged = mctx_paged;
 
     auto * paged_parent = mctx_paged->parent();
-    inp->paged_block_table  = paged_parent->block_table_tensor();
-    inp->paged_context_lens = paged_parent->context_lens_tensor();
-    inp->paged_q_lens       = paged_parent->q_lens_tensor();
+    inp->paged_block_table = paged_parent->block_table_tensor();
 
-    // Allocate the per-token slot_mapping in the graph context. Sized
-    // to the current ubatch — same tensor reused across every layer in
-    // this build, populated once per batch by set_input from the paged
-    // context's parent state + ubatch positions.
+    // MAD-114: context_lens and q_lens MUST be per-graph, not the persistent
+    // tensors on the cache. Hybrid models issue prefill + decode back-to-back
+    // and the persistent versions get overwritten by pass-B's prepare while
+    // pass-A's late attention layers are still reading them (HIP/RDNA gfx1201
+    // doesn't honor same-stream kernel-to-kernel ordering, so a host write
+    // can land before pass-A's reads complete). Allocating per-graph in ctx0
+    // gives each forward pass its own non-aliasing memory.
+    const int64_t n_seq_max = (int64_t) paged_parent->n_seq_max();
+    inp->paged_context_lens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seq_max);
+    ggml_set_input(inp->paged_context_lens);
+    ggml_set_name(inp->paged_context_lens, "paged_context_lens");
+
+    inp->paged_q_lens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seq_max);
+    ggml_set_input(inp->paged_q_lens);
+    ggml_set_name(inp->paged_q_lens, "paged_q_lens");
+
+    // slot_mapping was already per-graph; that's why it never raced.
     const int64_t n_tokens = (int64_t) ubatch.n_tokens;
     inp->paged_slot_mapping = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->paged_slot_mapping);
@@ -2362,31 +2383,26 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cast = to_f16_cont(k_cur);
         ggml_tensor * v_cast = to_f16_cont(v_cur);
 
-        // 2) Forward-expand the source nodes so the scatter sees fully-
-        //    computed sources (mirrors the regular path's barrier).
+        // 2) Forward-expand the source nodes so they're fully computed
+        //    before paged_attn reads them.
         ggml_build_forward_expand(gf, q_cast);
         ggml_build_forward_expand(gf, k_cast);
         ggml_build_forward_expand(gf, v_cast);
 
-        // 3) Scatter k_cur / v_cur into this layer's K_cache / V_cache.
-        //    Forward-expand the anchor so the scatter completes before
-        //    paged_attn reads from the same cache buffers.
-        ggml_tensor * scatter_anchor = ggml_paged_kv_update_mt(
-            ctx0,
-            k_cast, v_cast,
-            layer.k, layer.v,
-            inp->paged_slot_mapping,
-            block_size, n_kv_heads);
-        ggml_build_forward_expand(gf, scatter_anchor);
-
-        // 4) Run paged attention. Output shape mirrors Q:
-        //    [head_dim, n_heads, n_tokens, 1] in ggml's standard layout.
+        // 3) Fused scatter+attention. The single op writes K_cur/V_cur
+        //    into layer.k/layer.v at slot_mapping positions, then runs
+        //    attention against the just-written cache — all inside one
+        //    kernel separated by intra-block __syncthreads(). Sidesteps
+        //    the HIP/RDNA inter-kernel ordering bug (ROCm/hip#3882, #3887)
+        //    by eliminating the kernel-to-kernel handoff entirely.
         ggml_tensor * cur = ggml_paged_attn_mt(
             ctx0,
             q_cast, layer.k, layer.v,
             inp->paged_block_table,
             inp->paged_context_lens,
             inp->paged_q_lens,
+            k_cast, v_cast,
+            inp->paged_slot_mapping,
             block_size, n_kv_heads, kq_scale);
         cb(cur, "kqv_paged_out", il);
 

@@ -2434,6 +2434,15 @@ extern "C" {
     //   context_lens  [num_seqs]                                            i32
     //   q_lens        [num_seqs]                                            i32
     // returns a tensor with q's shape (head_dim, n_heads, sum(q_lens), 1).
+    //   k_cur, v_cur   [head_dim, n_kv_heads, n_tokens]    f16  ← fused scatter inputs
+    //   slot_mapping   [n_tokens]                          i32  ← fused scatter inputs
+    //
+    // The op fuses the K/V scatter into the attention kernel: phase 1
+    // writes K_cur/V_cur into k_cache/v_cache at slot_mapping positions,
+    // intra-block __syncthreads(), phase 2 runs the attention math against
+    // the just-updated cache. Avoids inter-kernel ordering issues on HIP/RDNA
+    // where same-stream submission ordering isn't reliably enforced
+    // (ROCm/hip#3882, #3887). See MAD-114.
     GGML_API struct ggml_tensor * ggml_paged_attn_mt(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2442,35 +2451,12 @@ extern "C" {
             struct ggml_tensor  * block_tables,
             struct ggml_tensor  * context_lens,
             struct ggml_tensor  * q_lens,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * v_cur,
+            struct ggml_tensor  * slot_mapping,
             int                   block_size,
             int                   n_kv_heads,
             float                 scale);
-
-    // mt:: paged K/V scatter — writes the per-batch K_cur/V_cur into the
-    // block-indexed cache at the slots given by `slot_mapping`.
-    //
-    //   k_cur          [head_dim, n_kv_heads, n_tokens]           f16
-    //   v_cur          [head_dim, n_kv_heads, n_tokens]           f16
-    //   k_cache        [num_blocks, n_kv_heads, head_dim/x, block_size, x]  f16  (interleaved)
-    //   v_cache        [num_blocks, n_kv_heads, head_dim, block_size]       f16  (transposed)
-    //   slot_mapping   [n_tokens]                                  i32
-    //                    For token i: physical slot = slot_mapping[i].
-    //                    block_idx = slot_mapping[i] / block_size;
-    //                    slot_in_block = slot_mapping[i] % block_size.
-    //                    A negative entry means "skip this token" (e.g. padding).
-    //
-    // Writes K_cur and V_cur into the cache in-place. Returns a
-    // 0-element tensor as a graph anchor — callers chain the
-    // attention call after via ggml_build_forward_expand.
-    GGML_API struct ggml_tensor * ggml_paged_kv_update_mt(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * k_cur,
-            struct ggml_tensor  * v_cur,
-            struct ggml_tensor  * k_cache,
-            struct ggml_tensor  * v_cache,
-            struct ggml_tensor  * slot_mapping,
-            int                   block_size,
-            int                   n_kv_heads);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
