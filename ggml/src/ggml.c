@@ -5431,8 +5431,11 @@ struct ggml_tensor * ggml_paged_attn_mt(
         int                   n_kv_heads,
         float                 scale) {
     GGML_ASSERT(q->type == GGML_TYPE_F16);
-    GGML_ASSERT(k_cache->type == GGML_TYPE_F16);
-    GGML_ASSERT(v_cache->type == GGML_TYPE_F16);
+    // K/V cache may be quantized (Q8_0, TURBO4_0, …). Backend dispatch
+    // (mt::ggml_cuda_op_paged_attn_mt) checks for a supported type and
+    // aborts with a clear message if the active build doesn't have a
+    // paged_cache_ops specialization for it.
+    GGML_ASSERT(k_cache->type == v_cache->type && "paged_attn_mt: K and V cache must share type");
     GGML_ASSERT(block_tables->type == GGML_TYPE_I32);
     GGML_ASSERT(context_lens->type == GGML_TYPE_I32);
     GGML_ASSERT(q_lens->type == GGML_TYPE_I32);

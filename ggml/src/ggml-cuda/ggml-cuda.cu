@@ -5461,10 +5461,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_PAGED_ATTN_MT:
+            // K/V cache may be quantized; mt::ggml_cuda_op_paged_attn_mt
+            // dispatch checks for a specialized paged_cache_ops<TYPE> and
+            // aborts with a clear message if unsupported. Currently
+            // F16 + Q8_0 + TURBO4_0 are wired (MAD-116).
             return op->type == GGML_TYPE_F16
                 && op->src[0]->type == GGML_TYPE_F16   // q
-                && op->src[1]->type == GGML_TYPE_F16   // k_cache
-                && op->src[2]->type == GGML_TYPE_F16   // v_cache
+                && op->src[1]->type == op->src[2]->type  // k/v cache same type
+                && (op->src[1]->type == GGML_TYPE_F16
+                    || op->src[1]->type == GGML_TYPE_Q8_0
+                    || op->src[1]->type == GGML_TYPE_TURBO4_0)
                 && op->src[6]                          // k_cur (fused scatter)
                 && op->src[6]->type == GGML_TYPE_F16
                 && op->src[7]                          // v_cur (fused scatter)

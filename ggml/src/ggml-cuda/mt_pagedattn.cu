@@ -4,6 +4,7 @@
 // Design adapted from vLLM (Apache 2.0). Code is independent.
 
 #include "mt_pagedattn.cuh"
+#include "turbo-quant.cuh"   // TURBO_CENTROIDS_4BIT, TURBO_WHT_SIGNS{1,2}, turbo_nearest_centroid_4bit
 
 #include <cmath>
 #include <cstdlib>
@@ -103,6 +104,162 @@ __device__ __forceinline__ float block_reduce_max(float v, float * red_smem) {
     return red_smem[0];
 }
 
+// ──────────────────── paged_cache_ops: per-cache-type layout + dequant ────────────────────
+//
+// Encapsulates offset math, dequant on read, and quantize on write for the
+// paged K/V cache. The kernel and scatter call these statically; actual
+// cache layout is specialization-private. Kernel/scatter math stays
+// cache-type agnostic — adding a new quant type means adding a specialization
+// here, not touching the hot kernel body.
+//
+// Layouts per (paged_block, kv_head):
+//
+//   F16 K:       [HEAD_SIZE/K_X, BLOCK_SIZE, K_X]   K_X = 16 / sizeof(__half) = 8
+//                (X-stride coalesces F16 reads; original mt:: layout)
+//   F16 V:       [HEAD_SIZE, BLOCK_SIZE]
+//                (head_dim-major; 16 contiguous tokens per fixed d)
+//   Q8_0 K/V:    [BLOCK_SIZE, HEAD_SIZE/QK8_0]      of block_q8_0  (added in MAD-116)
+//                (token-first; each token holds HEAD_SIZE/32 q8_0 blocks
+//                 contiguously — natural for per-element dequant)
+//   Turbo4 K/V:  [BLOCK_SIZE, HEAD_SIZE/QK_TURBO4]  of block_turbo4_0  (added in MAD-116)
+//                (same shape as Q8_0; HEAD_SIZE/128 = 2 turbo4 blocks per token)
+//
+// Primary template — instantiations fail to compile if a needed type
+// isn't specialized (lookups force linker error rather than silent fallback).
+template <ggml_type T, int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops;
+
+// F16 specialization: existing layout, identity load/store via __half.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_F16, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int K_X = 16 / sizeof(__half);  // 8 — F16 16-byte coalesce stride
+    static_assert(HEAD_SIZE % K_X == 0, "HEAD_SIZE must be divisible by K_X for F16 layout");
+    static_assert(BLOCK_SIZE > 0 && (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0, "BLOCK_SIZE must be power of 2");
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const __half * k = (const __half *) buf;
+        const int dim_outer = d / K_X;
+        const int dim_inner = d % K_X;
+        const size_t off = ((size_t) paged_block * n_kv_heads + kv_head) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                         + (size_t) dim_outer * BLOCK_SIZE * K_X
+                         + (size_t) token_in_block * K_X
+                         + (size_t) dim_inner;
+        return (float) k[off];
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const __half * v = (const __half *) buf;
+        const size_t off = ((size_t) paged_block * n_kv_heads + kv_head) * HEAD_SIZE * BLOCK_SIZE
+                         + (size_t) d * BLOCK_SIZE
+                         + (size_t) token_in_block;
+        return (float) v[off];
+    }
+
+    // Scatter: store one element of K and one of V. Element-granularity store
+    // is correct for F16 (no per-block scale). Quant specializations override
+    // this to do per-quant-block cooperative quantization.
+    __device__ __forceinline__ static void kv_store(
+            void * k_buf, void * v_buf,
+            int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d,
+            float k_val, float v_val) {
+        __half * k = (__half *) k_buf;
+        __half * v = (__half *) v_buf;
+        const int dim_outer = d / K_X;
+        const int dim_inner = d % K_X;
+        const size_t k_off = ((size_t) paged_block * n_kv_heads + kv_head) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                           + (size_t) dim_outer * BLOCK_SIZE * K_X
+                           + (size_t) token_in_block * K_X
+                           + (size_t) dim_inner;
+        const size_t v_off = ((size_t) paged_block * n_kv_heads + kv_head) * HEAD_SIZE * BLOCK_SIZE
+                           + (size_t) d * BLOCK_SIZE
+                           + (size_t) token_in_block;
+        k[k_off] = (__half) k_val;
+        v[v_off] = (__half) v_val;
+    }
+};
+
+// Q8_0 specialization: 8-bit symmetric quant, 32-element blocks.
+// Layout per (paged_block, kv_head): [BLOCK_SIZE, HEAD_SIZE/QK8_0] of block_q8_0.
+// kv_store intentionally omitted — Q8_0 quantization needs cooperative
+// per-block scale, so scatter for Q8_0 is handled by a dedicated kernel
+// (mt_scatter_kv_q8_0_kernel below) rather than a per-element store. Fused
+// scatter inside the attn kernel is therefore not supported for Q8_0;
+// dispatch forces separate scatter mode.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_Q8_0, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK8_0;  // 32
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK8_0");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        // Index into the buffer of block_q8_0:
+        //   [paged_block, kv_head, token_in_block, qblock_idx]
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_q8_0 * blocks = (const block_q8_0 *) buf;
+        const int64_t ib = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        const float   d_scale = (float) blocks[ib].d;
+        return (float) blocks[ib].qs[iqs] * d_scale;
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        // Same layout as K for Q8_0.
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
+// Turbo4_0 specialization: 4-bit PolarQuant with WHT rotation, 128-element blocks.
+// Layout per (paged_block, kv_head): [BLOCK_SIZE, HEAD_SIZE/QK_TURBO4] of block_turbo4_0.
+// Same shape as Q8_0; just different (smaller, more complex) block type.
+//
+// Like Q8_0, kv_store is omitted because turbo4 quantization needs cooperative
+// per-block work (norm reduction + WHT + centroid + nibble-pack). Scatter is
+// handled by a dedicated kernel (mt_scatter_kv_turbo4_0_kernel).
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO4_0, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO4;  // 128
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo4_0 * blocks = (const block_turbo4_0 *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        const float   norm = __half2float(blocks[ib].norm);
+        return turbo4_dequant_element(&blocks[ib], iqs, norm);
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
 // ──────────────────── separate scatter kernel ────────────────────
 //
 // Used only when GGML_PAGED_FUSED=0. Mirrors the math of Phase 1 in
@@ -116,23 +273,23 @@ __device__ __forceinline__ float block_reduce_max(float v, float * red_smem) {
 // after PATH A — we now own per-graph metadata tensors and the WAR hazard
 // that motivated the host-side stream sync no longer exists).
 
-template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS>
+template <typename scalar_t, ggml_type CACHE_TYPE,
+          int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS>
 __global__ void mt_scatter_kv_kernel(
-    scalar_t       * __restrict__ k_cache,
-    scalar_t       * __restrict__ v_cache,
+    void           * __restrict__ k_cache,      // type-erased; layout owned by paged_cache_ops<CACHE_TYPE>
+    void           * __restrict__ v_cache,
     const scalar_t * __restrict__ k_cur,        // [head_dim, n_kv_heads, n_tokens]
     const scalar_t * __restrict__ v_cur,        // [head_dim, n_kv_heads, n_tokens]
     const int32_t  * __restrict__ slot_mapping, // [n_tokens]
     const int32_t  * __restrict__ q_lens,       // [num_seqs]
     int             n_kv_heads) {
+    using ops = paged_cache_ops<CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE>;
+
     const int kv_head_idx = blockIdx.x;
     const int seq_idx     = blockIdx.y;
     const int tid         = threadIdx.x;
 
     constexpr int VEC_PER_THREAD = (HEAD_SIZE + NUM_THREADS - 1) / NUM_THREADS;
-    constexpr int K_X            = 16 / sizeof(scalar_t);
-    static_assert(BLOCK_SIZE > 0 && (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0, "BLOCK_SIZE must be power of 2");
-    static_assert(HEAD_SIZE % K_X == 0, "HEAD_SIZE must be divisible by K_X");
 
     const int q_len = q_lens[seq_idx];
     const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
@@ -153,49 +310,292 @@ __global__ void mt_scatter_kv_kernel(
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * NUM_THREADS;
             if (d < HEAD_SIZE) {
-                const scalar_t k_val = k_cur[src_base + (size_t) d];
-                const scalar_t v_val = v_cur[src_base + (size_t) d];
-
-                // K cache: [num_blocks, n_kv_heads, HEAD_SIZE/X, BLOCK_SIZE, X]
-                const int dim_outer = d / K_X;
-                const int dim_inner = d % K_X;
-                const size_t k_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
-                                   + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
-                                   + (size_t) dim_outer * BLOCK_SIZE * K_X
-                                   + (size_t) slot_in_block * K_X
-                                   + (size_t) dim_inner;
-                k_cache[k_idx] = k_val;
-
-                // V cache: [num_blocks, n_kv_heads, HEAD_SIZE, BLOCK_SIZE]
-                const size_t v_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
-                                   + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
-                                   + (size_t) d * BLOCK_SIZE
-                                   + (size_t) slot_in_block;
-                v_cache[v_idx] = v_val;
+                const float k_val = (float) k_cur[src_base + (size_t) d];
+                const float v_val = (float) v_cur[src_base + (size_t) d];
+                ops::kv_store(k_cache, v_cache,
+                              block_idx, kv_head_idx, n_kv_heads, slot_in_block, d,
+                              k_val, v_val);
             }
         }
     }
 }
 
-template <typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
+// Q8_0 scatter: per-q8_0-block cooperative quantization.
+//
+// Each warp of 32 threads owns one q8_0 block (32 elements, sharing one
+// scale). Warp-level reduction finds max(abs); lane 0 stores the scale,
+// each lane writes its quantized int8. Iterates over the token's
+// HEAD_SIZE/QK8_0 q8_0 blocks N_WARPS at a time.
+template <int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS>
+__global__ void mt_scatter_kv_q8_0_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    const int32_t  * __restrict__ q_lens,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK8_0;
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = NUM_THREADS / WARP_SIZE;
+    static_assert(NUM_THREADS % WARP_SIZE == 0, "NUM_THREADS must be multiple of WARP_SIZE");
+    static_assert(WARP_SIZE == Q_BLOCK, "this kernel assumes WARP_SIZE == QK8_0 (32)");
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK8_0");
+
+    const int kv_head_idx = blockIdx.x;
+    const int seq_idx     = blockIdx.y;
+    const int tid         = threadIdx.x;
+    const int warp_id     = tid / WARP_SIZE;
+    const int lane_id     = tid % WARP_SIZE;
+
+    block_q8_0 * k_blocks = (block_q8_0 *) k_cache;
+    block_q8_0 * v_blocks = (block_q8_0 *) v_cache;
+
+    const int q_len = q_lens[seq_idx];
+    const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
+    GGML_UNUSED(seq_idx);
+
+    for (int t = 0; t < q_len; ++t) {
+        const int global_token_idx = (int)(seq_q_offset + t);
+        const int slot = slot_mapping[global_token_idx];
+        if (slot < 0) continue;
+
+        const int paged_block   = slot / BLOCK_SIZE;
+        const int slot_in_block = slot % BLOCK_SIZE;
+
+        for (int qb_iter = 0; qb_iter < N_QBLOCKS_PER_TOKEN; qb_iter += N_WARPS) {
+            const int qb_idx = qb_iter + warp_id;
+            if (qb_idx >= N_QBLOCKS_PER_TOKEN) continue;
+
+            const int d = qb_idx * Q_BLOCK + lane_id;
+
+            const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                                 + (size_t) kv_head_idx * HEAD_SIZE
+                                 + (size_t) d;
+            const float k_val = (float) k_cur[src_off];
+            const float v_val = (float) v_cur[src_off];
+
+            // Per-block max(abs) via warp reduction (one warp == one q8_0 block).
+            float k_amax = fabsf(k_val);
+            float v_amax = fabsf(v_val);
+            #pragma unroll
+            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                k_amax = fmaxf(k_amax, __shfl_xor_sync(0xffffffffu, k_amax, mask, WARP_SIZE));
+                v_amax = fmaxf(v_amax, __shfl_xor_sync(0xffffffffu, v_amax, mask, WARP_SIZE));
+            }
+
+            const float k_scale     = k_amax / 127.0f;
+            const float v_scale     = v_amax / 127.0f;
+            const float k_inv_scale = (k_scale > 0.0f) ? (1.0f / k_scale) : 0.0f;
+            const float v_inv_scale = (v_scale > 0.0f) ? (1.0f / v_scale) : 0.0f;
+
+            const int k_q = __float2int_rn(k_val * k_inv_scale);
+            const int v_q = __float2int_rn(v_val * v_inv_scale);
+
+            // Output index (must match paged_cache_ops<GGML_TYPE_Q8_0>::element_block_index).
+            const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                                   + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                                   + (int64_t) qb_idx;
+
+            if (lane_id == 0) {
+                k_blocks[block_ib].d = __float2half(k_scale);
+                v_blocks[block_ib].d = __float2half(v_scale);
+            }
+            k_blocks[block_ib].qs[lane_id] = (int8_t) k_q;
+            v_blocks[block_ib].qs[lane_id] = (int8_t) v_q;
+        }
+    }
+}
+
+// Turbo4_0 scatter: per-128-element-block cooperative quantize.
+//
+// Each CUDA block handles ONE turbo4 block of work (one (token, kv_head, qb_idx,
+// kv_select) tuple). 128 threads, one per element of the turbo4 block. Pattern
+// adapted from set-rows.cu's CUDA-side turbo4 quantization:
+//   1. Load element into smem
+//   2. Block-wide L2 norm (warp reduce + cross-warp accumulator)
+//   3. Normalize, apply Randomized Hadamard Transform (signs1 → 7-stage
+//      butterfly → signs2 / sqrt(128))
+//   4. Nearest-centroid lookup (16 centroids), nibble-pack qs[]
+//   5. Block-wide reconstruction norm; lane 0 writes corrected norm
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO4)
+__global__ void mt_scatter_kv_turbo4_0_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO4;          // 128
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 4
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4");
+    static_assert(Q_BLOCK == 128, "this kernel assumes QK_TURBO4 == 128");
+
+    const int j                = threadIdx.x;  // 0..127, element index within turbo4 block
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    // Output block pointer (matches paged_cache_ops<TURBO4_0>::element_block_index)
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo4_0 * blk = (block_turbo4_0 *) dst_buf + block_ib;
+
+    // ---- Step 1: Load into smem (explicit __half2float for HIP safety) ----
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    // ---- Step 2: Parallel L2 norm ----
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = x[j] * x[j];
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    // ---- Step 3: Normalize ----
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
+    //
+    // Canonical turbo4 (ggml-cuda set-rows + fattn-vec) applies RHT
+    // (signs1 → Hadamard butterfly → signs2/sqrt(d)) during quantization,
+    // then dequant returns centroid*norm — which is RHT(K), not K. For
+    // attention with an unrotated Q, that pair only approximates <K, Q>
+    // via the Johnson-Lindenstrauss random-projection bound (~6% RMS
+    // error at d=256). Acceptable for fattn-vec where it has been
+    // empirically tuned.
+    //
+    // Our paged path stores and reads K end-to-end within mt::, so we can
+    // skip RHT: just centroid-quant K_normalized in place. The dequant
+    // (turbo4_dequant_element) returns centroid*norm ≈ K_norm * ||K|| = K.
+    // Dot with Q gives <K, Q> directly — no JL approximation. Storage
+    // savings are unchanged (same 4-bit + per-block scale, ~3.76× vs F16).
+    //
+    // Quality note: turbo4 centroids were tuned for N(0, 1/d) — the
+    // distribution of unit-norm vectors in high-d space, which matches
+    // K_norm regardless of RHT. So skipping RHT does NOT degrade the
+    // quant fit for Gaussian-like K (verified on Qwen3.6 9/9 math).
+
+    // ---- Step 5: Quantize element j ----
+    const float   rv  = x[j];
+    const uint8_t idx = turbo_nearest_centroid_4bit(rv);
+
+    // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
+    const int      lane            = j % WARP_SIZE;
+    const uint8_t  my_nibble       = idx & 0xF;
+    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1);
+    if ((j & 1) == 0) {
+        blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
+    }
+
+    // ---- Step 7: Reconstruction norm (parallel) ----
+    {
+        const float c = TURBO_CENTROIDS_4BIT[idx];
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    // ---- Step 8: Lane 0 writes per-block scalars ----
+    if (j == 0) {
+        blk->norm  = __float2half(corrected_norm);
+        blk->rnorm = __float2half(0.0f);  // reserved/unused in 4-bit mode
+    }
+}
+
+template <ggml_type CACHE_TYPE, typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
 static void launch_scatter_kv(
-    scalar_t       * k_cache,
-    scalar_t       * v_cache,
+    void           * k_cache,
+    void           * v_cache,
     const scalar_t * k_cur,
     const scalar_t * v_cur,
     const int32_t  * slot_mapping,
     const int32_t  * q_lens,
     int             num_seqs,
+    int             num_tokens_total,    // sum(q_lens); used by per-token-grid kernels (turbo4)
     int             n_kv_heads,
     cudaStream_t    stream) {
-    constexpr int NUM_THREADS = 128;
 
-    dim3 grid(n_kv_heads, num_seqs);
-    dim3 block(NUM_THREADS);
-
-    mt_scatter_kv_kernel<scalar_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>
-        <<<grid, block, 0, stream>>>(
-            k_cache, v_cache, k_cur, v_cur, slot_mapping, q_lens, n_kv_heads);
+    if constexpr (CACHE_TYPE == GGML_TYPE_F16) {
+        constexpr int NUM_THREADS = 128;
+        dim3 grid(n_kv_heads, num_seqs);
+        dim3 block(NUM_THREADS);
+        GGML_UNUSED(num_tokens_total);
+        mt_scatter_kv_kernel<scalar_t, CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, q_lens, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_Q8_0) {
+        constexpr int NUM_THREADS = 128;
+        dim3 grid(n_kv_heads, num_seqs);
+        dim3 block(NUM_THREADS);
+        GGML_UNUSED(num_tokens_total);
+        mt_scatter_kv_q8_0_kernel<HEAD_SIZE, BLOCK_SIZE, NUM_THREADS>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, q_lens, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
+        // 1 CUDA block per (token, (kv_head, qb_idx), K-or-V); 128 threads per block.
+        constexpr int Q_BLOCK             = QK_TURBO4;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo4_0_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    }
+    // Fall-through for unsupported types is intentional — dispatch in
+    // ggml_cuda_op_paged_attn_mt switches only over types that have a
+    // launch path, so this branch is unreachable at runtime.
 }
 
 // ──────────────────── kernel ────────────────────
@@ -239,14 +639,14 @@ static void launch_scatter_kv(
 // GQA: n_heads can be > n_kv_heads. kv_head = head_idx / (n_heads /
 // n_kv_heads). n_heads % n_kv_heads == 0 enforced at dispatch.
 
-template <typename scalar_t, typename cache_t,
+template <typename scalar_t, ggml_type CACHE_TYPE,
           int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
           int PARTITION_SIZE, bool DO_SCATTER = true>
 __global__ void mt_paged_attention_kernel(
     scalar_t       * __restrict__ out,
     const scalar_t * __restrict__ q,
-    cache_t        * __restrict__ k_cache,    // writable: fused scatter writes here
-    cache_t        * __restrict__ v_cache,    // writable: fused scatter writes here
+    void           * __restrict__ k_cache,    // type-erased; layout owned by paged_cache_ops<CACHE_TYPE>
+    void           * __restrict__ v_cache,
     const int32_t  * __restrict__ block_tables,
     const int32_t  * __restrict__ context_lens,
     const int32_t  * __restrict__ q_lens,
@@ -257,15 +657,15 @@ __global__ void mt_paged_attention_kernel(
     int             n_kv_heads,
     int             n_heads,
     float           scale) {
+    using ops = paged_cache_ops<CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE>;
+
     const int head_idx = blockIdx.x;
     const int seq_idx  = blockIdx.y;
     const int tid      = threadIdx.x;
 
     constexpr int NUM_WARPS         = NUM_THREADS / WARP_SIZE;
     constexpr int VEC_PER_THREAD    = (HEAD_SIZE + NUM_THREADS - 1) / NUM_THREADS;
-    constexpr int K_X               = 16 / sizeof(cache_t);  // K interleave width
     static_assert(BLOCK_SIZE > 0 && (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0, "BLOCK_SIZE must be power of 2");
-    static_assert(HEAD_SIZE % K_X == 0, "HEAD_SIZE must be divisible by K_X");
     static_assert(NUM_THREADS % WARP_SIZE == 0, "NUM_THREADS must be multiple of WARP_SIZE");
 
     const int kv_head_idx       = head_idx / (n_heads / n_kv_heads);
@@ -312,25 +712,11 @@ __global__ void mt_paged_attention_kernel(
             for (int v = 0; v < VEC_PER_THREAD; ++v) {
                 const int d = tid + v * NUM_THREADS;
                 if (d < HEAD_SIZE) {
-                    const scalar_t k_val = k_cur[src_base + (size_t) d];
-                    const scalar_t v_val = v_cur[src_base + (size_t) d];
-
-                    // K cache: [num_blocks, n_kv_heads, HEAD_SIZE/X, BLOCK_SIZE, X]
-                    const int dim_outer = d / K_X;
-                    const int dim_inner = d % K_X;
-                    const size_t k_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
-                                       + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
-                                       + (size_t) dim_outer * BLOCK_SIZE * K_X
-                                       + (size_t) slot_in_block * K_X
-                                       + (size_t) dim_inner;
-                    k_cache[k_idx] = k_val;
-
-                    // V cache: [num_blocks, n_kv_heads, HEAD_SIZE, BLOCK_SIZE]
-                    const size_t v_idx = (size_t) block_idx * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
-                                       + (size_t) kv_head_idx * HEAD_SIZE * BLOCK_SIZE
-                                       + (size_t) d * BLOCK_SIZE
-                                       + (size_t) slot_in_block;
-                    v_cache[v_idx] = v_val;
+                    const float k_val = (float) k_cur[src_base + (size_t) d];
+                    const float v_val = (float) v_cur[src_base + (size_t) d];
+                    ops::kv_store(k_cache, v_cache,
+                                  block_idx, kv_head_idx, n_kv_heads, slot_in_block, d,
+                                  k_val, v_val);
                 }
             }
         }
@@ -426,13 +812,7 @@ __global__ void mt_paged_attention_kernel(
                     for (int v = 0; v < VEC_PER_THREAD; ++v) {
                         const int d = tid + v * NUM_THREADS;
                         if (d < HEAD_SIZE) {
-                            const int xi = d / K_X;
-                            const int xj = d % K_X;
-                            const size_t k_off = ((size_t) physical * n_kv_heads + kv_head_idx) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
-                                               + (size_t) xi * BLOCK_SIZE * K_X
-                                               + (size_t) tok_in_block * K_X
-                                               + xj;
-                            const float k_val = (float) k_cache[k_off];
+                            const float k_val = ops::k_load(k_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, d);
                             partial_qk += (float) q_reg[v] * k_val;
                         }
                     }
@@ -480,10 +860,8 @@ __global__ void mt_paged_attention_kernel(
                 for (int v = 0; v < VEC_PER_THREAD; ++v) {
                     const int d = tid + v * NUM_THREADS;
                     if (d < HEAD_SIZE) {
-                        const size_t v_off = ((size_t) physical * n_kv_heads + kv_head_idx) * HEAD_SIZE * BLOCK_SIZE
-                                           + (size_t) d * BLOCK_SIZE
-                                           + tok_in_block;
-                        acc[v] += w * (float) v_cache[v_off];
+                        const float v_val = ops::v_load(v_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, d);
+                        acc[v] += w * v_val;
                     }
                 }
             }
@@ -530,13 +908,13 @@ __global__ void mt_paged_attention_kernel(
 // For the v1 single-batch case sum(q_lens) collapses to q_len * num_seqs
 // when all seqs in the batch have the same q_len (typical decode batch).
 
-template <typename scalar_t, typename cache_t,
+template <typename scalar_t, ggml_type CACHE_TYPE,
           int HEAD_SIZE, int BLOCK_SIZE, bool DO_SCATTER>
 static void launch_paged_attn(
     scalar_t       * out,
     const scalar_t * q,
-    cache_t        * k_cache,
-    cache_t        * v_cache,
+    void           * k_cache,
+    void           * v_cache,
     const int32_t  * block_tables,
     const int32_t  * context_lens,
     const int32_t  * q_lens,
@@ -564,7 +942,7 @@ static void launch_paged_attn(
     const size_t smem_bytes = (NUM_WARPS + CHUNK_SIZE) * sizeof(float);
     GGML_UNUSED(max_ctx_len);  // retained in signature for callers; chunking makes it irrelevant for smem sizing
 
-    mt_paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0, DO_SCATTER>
+    mt_paged_attention_kernel<scalar_t, CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0, DO_SCATTER>
         <<<grid, block, smem_bytes, stream>>>(
             out, q, k_cache, v_cache,
             block_tables, context_lens, q_lens,
@@ -594,9 +972,8 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int num_seqs  = block_tables->ne[1];
 
     GGML_ASSERT(n_heads % n_kv_heads == 0 && "n_heads must be divisible by n_kv_heads");
-    GGML_ASSERT(q->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 Q only");
-    GGML_ASSERT(k_cache->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 K cache only");
-    GGML_ASSERT(v_cache->type == GGML_TYPE_F16 && "PagedAttn v1 supports F16 V cache only");
+    GGML_ASSERT(q->type == GGML_TYPE_F16 && "PagedAttn supports F16 Q only");
+    GGML_ASSERT(k_cache->type == v_cache->type && "PagedAttn requires K and V cache to share type");
     GGML_ASSERT(k_cur && k_cur->type == GGML_TYPE_F16);
     GGML_ASSERT(v_cur && v_cur->type == GGML_TYPE_F16);
     GGML_ASSERT(slot_mapping && slot_mapping->type == GGML_TYPE_I32);
@@ -611,51 +988,86 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     cudaStream_t stream = ctx.stream();
     const bool do_fused = (get_paged_fused_mode() != 0);
 
-    // Dispatch on (head_size, block_size). Add cases as models need.
+    // Dispatch on (head_size, block_size, cache_type). Add quant cases by
+    // adding a paged_cache_ops<TYPE> specialization above and a switch arm
+    // here.
     auto run = [&](auto head_size_const, auto block_size_const) {
         constexpr int HS = decltype(head_size_const)::value;
         constexpr int BS = decltype(block_size_const)::value;
 
-        if (!do_fused) {
-            // Experiment path: separate scatter kernel + attn-only kernel.
-            // Same-stream submission ordering is sufficient now that PATH A
-            // removed the metadata-tensor WAR hazard (the bug previously
-            // attributed to scatter-coherence).
-            launch_scatter_kv<__half, HS, BS>(
-                (__half *) k_cache->data,
-                (__half *) v_cache->data,
-                (const __half *) k_cur->data,
-                (const __half *) v_cur->data,
-                (const int32_t *) slot_mapping->data,
-                (const int32_t *) q_lens->data,
-                num_seqs, n_kv_heads, stream);
-            launch_paged_attn<__half, __half, HS, BS, /*DO_SCATTER=*/false>(
-                (__half *) dst->data,
-                (const __half *) q->data,
-                (__half *) k_cache->data,
-                (__half *) v_cache->data,
-                (const int32_t *) block_tables->data,
-                (const int32_t *) context_lens->data,
-                (const int32_t *) q_lens->data,
-                (const __half *) k_cur->data,
-                (const __half *) v_cur->data,
-                (const int32_t *) slot_mapping->data,
-                num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
-                scale, stream);
-        } else {
-            launch_paged_attn<__half, __half, HS, BS, /*DO_SCATTER=*/true>(
-                (__half *) dst->data,
-                (const __half *) q->data,
-                (__half *) k_cache->data,
-                (__half *) v_cache->data,
-                (const int32_t *) block_tables->data,
-                (const int32_t *) context_lens->data,
-                (const int32_t *) q_lens->data,
-                (const __half *) k_cur->data,
-                (const __half *) v_cur->data,
-                (const int32_t *) slot_mapping->data,
-                num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
-                scale, stream);
+        auto run_typed = [&](auto cache_type_const) {
+            constexpr ggml_type CT = decltype(cache_type_const)::value;
+
+            // Cache-type / head-size compatibility: TURBO4_0 needs
+            // HEAD_SIZE divisible by QK_TURBO4 (128). For smaller heads
+            // (e.g. HS=64), abort at runtime — we don't even instantiate
+            // the kernel templates for invalid combinations.
+            if constexpr (CT == GGML_TYPE_TURBO4_0 && HS % QK_TURBO4 != 0) {
+                GGML_ABORT("mt_paged_attn: HEAD_SIZE=%d too small for TURBO4_0 (requires multiple of QK_TURBO4=%d)",
+                           HS, (int) QK_TURBO4);
+            } else {
+
+            // Fused scatter requires per-element kv_store, which only the F16
+            // path provides. Quant types use a dedicated cooperative scatter
+            // kernel; force separate mode for them.
+            const bool fused = do_fused && (CT == GGML_TYPE_F16);
+
+            if (!fused) {
+                // Experiment path: separate scatter kernel + attn-only kernel.
+                // Same-stream submission ordering is sufficient now that PATH A
+                // removed the metadata-tensor WAR hazard.
+                launch_scatter_kv<CT, __half, HS, BS>(
+                    k_cache->data,
+                    v_cache->data,
+                    (const __half *) k_cur->data,
+                    (const __half *) v_cur->data,
+                    (const int32_t *) slot_mapping->data,
+                    (const int32_t *) q_lens->data,
+                    num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
+                launch_paged_attn<__half, CT, HS, BS, /*DO_SCATTER=*/false>(
+                    (__half *) dst->data,
+                    (const __half *) q->data,
+                    k_cache->data,
+                    v_cache->data,
+                    (const int32_t *) block_tables->data,
+                    (const int32_t *) context_lens->data,
+                    (const int32_t *) q_lens->data,
+                    (const __half *) k_cur->data,
+                    (const __half *) v_cur->data,
+                    (const int32_t *) slot_mapping->data,
+                    num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
+                    scale, stream);
+            } else if constexpr (CT == GGML_TYPE_F16) {
+                launch_paged_attn<__half, CT, HS, BS, /*DO_SCATTER=*/true>(
+                    (__half *) dst->data,
+                    (const __half *) q->data,
+                    k_cache->data,
+                    v_cache->data,
+                    (const int32_t *) block_tables->data,
+                    (const int32_t *) context_lens->data,
+                    (const int32_t *) q_lens->data,
+                    (const __half *) k_cur->data,
+                    (const __half *) v_cur->data,
+                    (const int32_t *) slot_mapping->data,
+                    num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len,
+                    scale, stream);
+            }
+            }  // closes else of (CT == TURBO4_0 && HS % QK_TURBO4 != 0)
+        };
+
+        switch (k_cache->type) {
+            case GGML_TYPE_F16:
+                run_typed(std::integral_constant<ggml_type, GGML_TYPE_F16>{});
+                break;
+            case GGML_TYPE_Q8_0:
+                run_typed(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+                break;
+            case GGML_TYPE_TURBO4_0:
+                run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_0>{});
+                break;
+            default:
+                GGML_ABORT("mt_paged_attn: unsupported cache type %s — add a paged_cache_ops specialization",
+                           ggml_type_name(k_cache->type));
         }
     };
 
