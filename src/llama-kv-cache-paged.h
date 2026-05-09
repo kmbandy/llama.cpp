@@ -73,6 +73,12 @@ public:
             uint32_t                   block_size,       // tokens per block
             uint32_t                   n_seq_max,
             uint32_t                   max_blocks_per_seq,
+            // MAD-120: host-side warm-tier capacity in blocks. 0 = disabled
+            // (legacy single-pool behavior). When > 0, the cache can evict
+            // GPU blocks to host RAM when the GPU pool fills, and auto-fault
+            // them back in when needed for attention. Sized by --kv-tiered
+            // warm_pct in the create_memory caller.
+            uint32_t                   n_warm_blocks = 0,
             // Optional per-layer filter. Returns true for layers that should
             // get K/V allocation in the paged pool. Recurrent layers in
             // hybrid models should be filtered OUT (their state lives in
@@ -156,6 +162,32 @@ public:
     // step. Returns a paged context wrapping the same ubatches.
     llama_memory_context_ptr init_batch_with_ubatches(std::vector<llama_ubatch> ubatches);
 
+    // ─── MAD-120: hot↔warm tier ───
+    //
+    // Move ONE GPU-resident block to host (warm) memory. After the call
+    // the block is no longer on GPU; the seq's logical block list points
+    // at the new CPU physical and reads need restore_block_from_warm to
+    // bring it back. Returns false if the warm pool is full (caller
+    // should escalate to cold or refuse the request).
+    bool evict_block_to_warm(llama_seq_id seq_id, uint32_t logical_block);
+
+    // Move ONE warm-resident block back to GPU. After the call the seq's
+    // logical block list points at the new GPU physical and the kernel
+    // can read it. Returns false if the GPU pool is full (caller should
+    // evict another block first or refuse the request).
+    bool restore_block_from_warm(llama_seq_id seq_id, uint32_t logical_block);
+
+    // Pick an LRU GPU-resident logical block across all seqs and evict it
+    // to warm. Used by ensure_blocks_for as the reactive trigger. Returns
+    // true if a block was evicted, false if no GPU-resident block was
+    // eligible (e.g. all seqs hold only their own most-recent block, or
+    // warm is also full).
+    bool evict_lru_to_warm();
+
+    // Public accessors for tests / dispatch decisions.
+    uint32_t n_warm_blocks() const { return n_warm_blocks_; }
+    bool     warm_enabled()  const { return n_warm_blocks_ > 0; }
+
 private:
     friend class llama_kv_cache_paged_context;
 
@@ -179,17 +211,39 @@ private:
     // init_batch_with_ubatches.
     bool apply_ubatch_to_state(const llama_ubatch & ub);
 
+    // MAD-120: walk the ubatch's seqs and ensure all logical blocks
+    // referenced (positions 0..max_pos for each seq) are GPU-resident.
+    // For any block currently in warm, evict-LRU-non-needed-then-restore.
+    // Returns false if the GPU pool cannot fit all needed blocks (e.g.
+    // multiple seqs whose total active ctx exceeds the hot capacity).
+    // No-op if warm tier is disabled.
+    bool fault_in_warm_blocks_for_batch(const llama_ubatch & ub);
+
     const llama_model &        model_;
     ggml_backend_buffer_type_t buft_;
     uint32_t                   n_blocks_total_;
+    uint32_t                   n_warm_blocks_      = 0;   // MAD-120: host-side warm-tier capacity
     uint32_t                   block_size_;
     uint32_t                   n_seq_max_;
     uint32_t                   max_blocks_per_seq_;
     ggml_type                  type_k_ = GGML_TYPE_F16;
     ggml_type                  type_v_ = GGML_TYPE_F16;
 
-    // Per-layer K/V storage.
+    // Per-layer K/V storage (GPU).
     std::vector<layer_storage> layers_;
+
+    // MAD-120: per-layer host-side warm storage. Indexed [layer][cpu_block_idx].
+    // cpu_block_idx = (cpu_physical - n_blocks_total_), i.e. the CPU pool's
+    // 0-based offset within its half of the block_id space. Each block holds
+    // K and V data laid out identically to the GPU layout (same byte size
+    // per block; one hipMemcpy moves the whole thing).
+    //
+    // Sized at construction: n_warm_blocks_ × k_bytes_per_block_ for K, same
+    // shape for V. Empty if n_warm_blocks_ == 0 (warm tier disabled).
+    std::vector<std::vector<uint8_t>> warm_k_;  // [n_layers][n_warm_blocks * k_bytes_per_block]
+    std::vector<std::vector<uint8_t>> warm_v_;  // [n_layers][n_warm_blocks * v_bytes_per_block]
+    size_t                            k_bytes_per_block_ = 0;
+    size_t                            v_bytes_per_block_ = 0;
 
     // Backing ggml context + buffer for layer storage.
     ggml_context *      ctx_storage_   = nullptr;

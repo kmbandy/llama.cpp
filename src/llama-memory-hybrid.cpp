@@ -41,7 +41,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* paged */
                  uint32_t   paged_n_blocks,
                  uint32_t   paged_block_size,
-                 uint32_t   paged_max_blocks_per_seq) :
+                 uint32_t   paged_max_blocks_per_seq,
+                 uint32_t   paged_n_warm_blocks) :
     hparams(model.hparams),
     mem_attn(paged_n_blocks > 0 ? nullptr : new llama_kv_cache(
         model,
@@ -67,6 +68,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         paged_block_size,
         n_seq_max,
         paged_max_blocks_per_seq,
+        paged_n_warm_blocks,
         // Filter out recurrent layers — paged cache only carries attention
         // K/V; recurrent state lives in mem_recr. Without this the cache
         // pre-allocates K/V for ALL layers (including recurrent ones that

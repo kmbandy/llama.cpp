@@ -49,7 +49,11 @@ public:
                                llama-model.cpp create_memory for sizing. */
                  uint32_t   paged_n_blocks = 0,
                  uint32_t   paged_block_size = 16,
-                 uint32_t   paged_max_blocks_per_seq = 0);
+                 uint32_t   paged_max_blocks_per_seq = 0,
+                 // MAD-120: host-side warm-tier capacity for the paged cache.
+                 // 0 = warm tier disabled (legacy behavior). Sized by
+                 // --kv-tiered warm_pct in create_memory.
+                 uint32_t   paged_n_warm_blocks = 0);
 
     ~llama_memory_hybrid() = default;
 

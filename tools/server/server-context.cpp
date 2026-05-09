@@ -771,9 +771,29 @@ private:
 
         params_base = params;
         if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {
+            // Save the original n_ctx so the cache layer can size pools
+            // based on the full ctx budget, not just the hot slice.
             params_base.kv_tier_total_ctx = params_base.n_ctx;
-            params_base.n_ctx = std::max(512, (int)(params_base.n_ctx * params_base.kv_tier_hot_pct / 100.0f));
-            SRV_INF("tiered KV: total ctx=%d, hot ctx=%d (%.0f%%)\n", params_base.kv_tier_total_ctx, params_base.n_ctx, params_base.kv_tier_hot_pct);
+
+            if (params_base.kv_tier_paged_blocks) {
+                // MAD-120: with paged-blocks the cache itself handles the
+                // hot↔warm tiering — model sees full n_ctx, paged cache
+                // evicts/restores blocks transparently. NO pre-shrink.
+                SRV_INF("tiered KV (paged): total ctx=%d (model sees full); cache hot=%.0f%% warm=%.0f%% cold=%.0f%% — paged cache handles tier movement\n",
+                        params_base.kv_tier_total_ctx,
+                        params_base.kv_tier_hot_pct,
+                        params_base.kv_tier_warm_pct,
+                        params_base.kv_tier_cold_pct);
+            } else {
+                // Legacy non-paged tiered cache: model sees only hot-tier
+                // worth of ctx; cache stores the rest transparently via
+                // migrate_tokens. Pre-shrink keeps the model in-bounds.
+                params_base.n_ctx = std::max(512, (int)(params_base.n_ctx * params_base.kv_tier_hot_pct / 100.0f));
+                SRV_INF("tiered KV: total ctx=%d, hot ctx=%d (%.0f%%)\n",
+                        params_base.kv_tier_total_ctx,
+                        params_base.n_ctx,
+                        params_base.kv_tier_hot_pct);
+            }
         }
 
         llama_init = common_init_from_params(params_base);
