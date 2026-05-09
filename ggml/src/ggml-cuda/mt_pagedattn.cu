@@ -206,20 +206,22 @@ static void launch_scatter_kv(
 // + V@logits accumulation. Designed for HEAD_SIZE divisible by
 // NUM_THREADS for the V-accumulator stride; we assert this in dispatch.
 //
-// Per-query iteration:
+// Per-query iteration (chunked online-softmax, MAD-115):
 //   1. Each thread loads HEAD_SIZE/NUM_THREADS elements of Q into
 //      registers (q_reg).
-//   2. Walk K blocks in logical order: for each block, for each
-//      token-in-block, compute partial Q·K (each thread contributes
-//      its slice), block-reduce-sum to get the full QK score, store
-//      into smem logits[token_idx]. Track running max during this
-//      pass for online-softmax stability.
-//   3. After all blocks: subtract max, exp, block-reduce-sum the
-//      exp_sum, normalize logits.
-//   4. Walk V blocks: for each token-in-block, multiply its logit by
-//      this thread's slice of V row, accumulate. Final accumulator
-//      is this thread's slice of the output.
-//   5. Write output slice to global memory.
+//   2. Outer loop over the seq's valid_ctx in CHUNK_SIZE-token chunks.
+//      Per-chunk maintain running (max, sum, acc[]) state in registers:
+//        A. QK over the chunk → chunk-local smem logits[i], track chunk_max
+//        B. new_max = max(running_max, chunk_max); rescale running state by
+//           exp(running_max - new_max)
+//        C. exp(qk - new_max), accumulate chunk_sum into running_sum,
+//           store back into logits[i]
+//        D. V @ logits accumulation into per-thread acc[VEC_PER_THREAD]
+//   3. Final: out[d] = acc[v] / running_sum, write to global memory.
+//
+// Per-block smem footprint: (NUM_WARPS + CHUNK_SIZE) * sizeof(float),
+// independent of valid_ctx — supports per-attn-call ctx well beyond
+// the previous full-pass kernel's ~16k LDS-overflow ceiling.
 //
 // Memory access pattern:
 //   K cache laid out as [num_blocks, n_kv_heads, HEAD_SIZE/x, BLOCK_SIZE, x]
@@ -374,105 +376,132 @@ __global__ void mt_paged_attention_kernel(
         }
         GGML_UNUSED(seq_idx);  // multi-seq offset accounting is a follow-up
 
-        // ── Pass 1: QK + running max + write to logits[] ──
+        // ── Chunked online-softmax (FlashAttention-style) ──
         //
-        // ALL threads cooperate on ONE token at a time: each thread
-        // contributes its slice of d to partial_qk, then block_reduce_sum
-        // (which contains __syncthreads) aggregates across the block.
-        // This pattern requires every thread to enter the loop the same
-        // number of iterations as valid_ctx — divergent threads at the
-        // syncthreads is undefined behavior in HIP/CUDA. The previous
-        // strided-by-tid loop was wrong for two reasons: (a) different
-        // threads were aggregating partial_qks for DIFFERENT tokens
-        // (meaningless sum) and (b) when valid_ctx < NUM_THREADS some
-        // threads skipped the syncthreads → garbage output.
-        float qk_max = -INFINITY;
+        // Process K/V in chunks of CHUNK_SIZE tokens, maintaining running
+        // (max, sum, acc[]) state across chunks via the standard recurrence:
+        //
+        //   new_max  = max(running_max, chunk_max)
+        //   rescale  = exp(running_max - new_max)   // 1 on first chunk
+        //   acc_new  = acc_old * rescale + Σ(exp(qk - new_max) * v)
+        //   sum_new  = sum_old * rescale + Σ exp(qk - new_max)
+        //   running_max = new_max
+        //
+        // Final: out = acc / sum.
+        //
+        // Per-chunk smem footprint = CHUNK_SIZE * sizeof(float), independent
+        // of valid_ctx — supports per-attn-call ctx > 16k (was the LDS-
+        // overflow limit on the previous full-pass kernel).
+        constexpr int CHUNK_SIZE = 256;
 
-        for (int token = 0; token < valid_ctx; ++token) {
-            const int logical_block = token / BLOCK_SIZE;
-            const int tok_in_block  = token % BLOCK_SIZE;
-            const int physical      = seq_block_table[logical_block];
-
-            float partial_qk = 0.0f;
-            if (physical != kInvalidBlockTableEntry) {
-#pragma unroll
-                for (int v = 0; v < VEC_PER_THREAD; ++v) {
-                    const int d = tid + v * NUM_THREADS;
-                    if (d < HEAD_SIZE) {
-                        const int xi = d / K_X;
-                        const int xj = d % K_X;
-                        const size_t k_off = ((size_t) physical * n_kv_heads + kv_head_idx) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
-                                           + (size_t) xi * BLOCK_SIZE * K_X
-                                           + (size_t) tok_in_block * K_X
-                                           + xj;
-                        const float k_val = (float) k_cache[k_off];
-                        partial_qk += (float) q_reg[v] * k_val;
-                    }
-                }
-            }
-            // All threads call block_reduce_sum — meets __syncthreads.
-            const float qk = (physical == kInvalidBlockTableEntry)
-                ? -INFINITY
-                : block_reduce_sum<NUM_WARPS>(partial_qk, red_smem) * scale;
-
-            if (tid == 0) {
-                logits[token] = qk;
-            }
-            qk_max = max(qk_max, qk);
-        }
-
-        // ── Block-reduce max across all threads' qk_max ──
-        qk_max = block_reduce_max<NUM_WARPS>(qk_max, red_smem);
-
-        // ── Pass 2: exp(qk - max), sum, normalize ──
-        float exp_sum = 0.0f;
-        for (int token = tid; token < valid_ctx; token += NUM_THREADS) {
-            const float e = __expf(logits[token] - qk_max);
-            logits[token] = e;
-            exp_sum += e;
-        }
-        exp_sum = block_reduce_sum<NUM_WARPS>(exp_sum, red_smem);
-        const float inv_sum = 1.0f / (exp_sum + 1e-6f);
-
-        for (int token = tid; token < valid_ctx; token += NUM_THREADS) {
-            logits[token] *= inv_sum;
-        }
-        __syncthreads();
-
-        // ── Pass 3: V @ logits accumulation ──
-        // Each thread accumulates VEC_PER_THREAD output rows.
+        float running_max = -INFINITY;
+        float running_sum = 0.0f;
         float acc[VEC_PER_THREAD];
 #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) acc[v] = 0.0f;
 
-        for (int token = 0; token < valid_ctx; ++token) {
-            const int logical_block = token / BLOCK_SIZE;
-            const int tok_in_block  = token % BLOCK_SIZE;
-            const int physical      = seq_block_table[logical_block];
-            if (physical == kInvalidBlockTableEntry) continue;
-            const float w = logits[token];
+        for (int chunk_start = 0; chunk_start < valid_ctx; chunk_start += CHUNK_SIZE) {
+            const int chunk_end = (chunk_start + CHUNK_SIZE < valid_ctx)
+                                  ? (chunk_start + CHUNK_SIZE)
+                                  : valid_ctx;
+            const int chunk_len = chunk_end - chunk_start;
+
+            // ── Phase A: QK over chunk → logits[i], track chunk_max ──
+            //
+            // Per-token cooperation: every thread contributes its slice of d
+            // to partial_qk, then block_reduce_sum aggregates across the
+            // block. tid==0 stores qk into the chunk-local logits[]. The
+            // block_reduce_max at the end of this phase provides the
+            // visibility barrier before Phase C reads logits[].
+            float chunk_max = -INFINITY;
+            for (int i = 0; i < chunk_len; ++i) {
+                const int token         = chunk_start + i;
+                const int logical_block = token / BLOCK_SIZE;
+                const int tok_in_block  = token % BLOCK_SIZE;
+                const int physical      = seq_block_table[logical_block];
+
+                float partial_qk = 0.0f;
+                if (physical != kInvalidBlockTableEntry) {
+#pragma unroll
+                    for (int v = 0; v < VEC_PER_THREAD; ++v) {
+                        const int d = tid + v * NUM_THREADS;
+                        if (d < HEAD_SIZE) {
+                            const int xi = d / K_X;
+                            const int xj = d % K_X;
+                            const size_t k_off = ((size_t) physical * n_kv_heads + kv_head_idx) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                                               + (size_t) xi * BLOCK_SIZE * K_X
+                                               + (size_t) tok_in_block * K_X
+                                               + xj;
+                            const float k_val = (float) k_cache[k_off];
+                            partial_qk += (float) q_reg[v] * k_val;
+                        }
+                    }
+                }
+                // All threads see the same physical → ternary is uniform;
+                // either all call block_reduce_sum or all skip it.
+                const float qk = (physical == kInvalidBlockTableEntry)
+                    ? -INFINITY
+                    : block_reduce_sum<NUM_WARPS>(partial_qk, red_smem) * scale;
+
+                if (tid == 0) logits[i] = qk;
+                chunk_max = max(chunk_max, qk);
+            }
+            chunk_max = block_reduce_max<NUM_WARPS>(chunk_max, red_smem);
+
+            // ── Phase B: rescale running state to new_max ──
+            const float new_max = max(running_max, chunk_max);
+            if (running_max != -INFINITY) {
+                const float rescale = __expf(running_max - new_max);
+                running_sum *= rescale;
+#pragma unroll
+                for (int v = 0; v < VEC_PER_THREAD; ++v) acc[v] *= rescale;
+            }
+
+            // ── Phase C: exp(qk - new_max), accumulate chunk_sum ──
+            float chunk_sum = 0.0f;
+            for (int i = tid; i < chunk_len; i += NUM_THREADS) {
+                const float e = __expf(logits[i] - new_max);
+                logits[i] = e;
+                chunk_sum += e;
+            }
+            chunk_sum = block_reduce_sum<NUM_WARPS>(chunk_sum, red_smem);
+            running_sum += chunk_sum;
+
+            // ── Phase D: V @ logits accumulation for this chunk ──
+            for (int i = 0; i < chunk_len; ++i) {
+                const int token         = chunk_start + i;
+                const int logical_block = token / BLOCK_SIZE;
+                const int tok_in_block  = token % BLOCK_SIZE;
+                const int physical      = seq_block_table[logical_block];
+                if (physical == kInvalidBlockTableEntry) continue;
+                const float w = logits[i];
 
 #pragma unroll
-            for (int v = 0; v < VEC_PER_THREAD; ++v) {
-                const int d = tid + v * NUM_THREADS;
-                if (d < HEAD_SIZE) {
-                    const size_t v_off = ((size_t) physical * n_kv_heads + kv_head_idx) * HEAD_SIZE * BLOCK_SIZE
-                                       + (size_t) d * BLOCK_SIZE
-                                       + tok_in_block;
-                    acc[v] += w * (float) v_cache[v_off];
+                for (int v = 0; v < VEC_PER_THREAD; ++v) {
+                    const int d = tid + v * NUM_THREADS;
+                    if (d < HEAD_SIZE) {
+                        const size_t v_off = ((size_t) physical * n_kv_heads + kv_head_idx) * HEAD_SIZE * BLOCK_SIZE
+                                           + (size_t) d * BLOCK_SIZE
+                                           + tok_in_block;
+                        acc[v] += w * (float) v_cache[v_off];
+                    }
                 }
             }
+
+            running_max = new_max;
+            __syncthreads();  // logits[] reuse safe for next chunk's Phase A
         }
 
-        // ── Write output slice ──
+        // ── Final: normalize and write output slice ──
         // Output mirrors Q's layout: ggml [head_dim, n_heads, n_tokens]
         // (same shape as q since the constructor copies q->ne).
+        const float inv_sum = 1.0f / (running_sum + 1e-6f);
 #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * NUM_THREADS;
             if (d < HEAD_SIZE) {
                 const size_t out_off = ((seq_q_offset + (size_t) qi) * n_heads + head_idx) * HEAD_SIZE + d;
-                out[out_off] = (scalar_t) acc[v];
+                out[out_off] = (scalar_t) (acc[v] * inv_sum);
             }
         }
 
@@ -523,28 +552,17 @@ static void launch_paged_attn(
     cudaStream_t    stream) {
     constexpr int NUM_THREADS = 128;
     constexpr int NUM_WARPS   = NUM_THREADS / WARP_SIZE;
+    constexpr int CHUNK_SIZE  = 256;  // mirror the kernel's CHUNK_SIZE
 
     dim3 grid(n_heads, num_seqs);
     dim3 block(NUM_THREADS);
 
-    // smem: NUM_WARPS reduction floats + max_ctx_len logits floats.
-    const size_t smem_bytes = (NUM_WARPS + max_ctx_len) * sizeof(float);
-
-    // Defensive: catch the LDS-overflow case loudly. AMD GPUs typically
-    // expose 64 KiB shared memory per block (SM/CU); NVIDIA newer SMs
-    // 100+ KiB. The dispatcher's `cudaErrorInvalidArgument` for
-    // oversized smem looks identical to many other failure modes —
-    // surface a clear error here so users know to either (a) reduce
-    // per-slot context, (b) drop --kv-tier-paged-blocks, or (c) wait
-    // on the chunked-attention rewrite (see docs/MAD-NN).
-    if (smem_bytes > 65536) {
-        GGML_LOG_ERROR("mt::paged_attn: requested smem %zu B exceeds 64 KiB LDS limit "
-                       "(max_ctx_len=%d). The current paged kernel doesn't support "
-                       "ctx > ~16k per attention call. Reduce -c/--parallel so "
-                       "n_ctx_seq * 4 bytes fits, or drop --kv-tier-paged-blocks.\n",
-                       smem_bytes, max_ctx_len);
-        GGML_ABORT("mt::paged_attn smem overflow — see docs for chunked-attention plan");
-    }
+    // smem: NUM_WARPS reduction floats + CHUNK_SIZE chunk-local logits floats.
+    // MAD-115: rewrite to chunked online-softmax — smem is now bounded by
+    // CHUNK_SIZE, not max_ctx_len. Per-block footprint ≈ 1 KiB, fits any
+    // GPU's LDS regardless of context length.
+    const size_t smem_bytes = (NUM_WARPS + CHUNK_SIZE) * sizeof(float);
+    GGML_UNUSED(max_ctx_len);  // retained in signature for callers; chunking makes it irrelevant for smem sizing
 
     mt_paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, /*PARTITION_SIZE=*/0, DO_SCATTER>
         <<<grid, block, smem_bytes, stream>>>(
