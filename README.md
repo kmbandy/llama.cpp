@@ -523,6 +523,7 @@ To learn more about model quantization, [read this documentation](tools/quantize
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
 - [GBNF grammars](grammars/README.md)
+- [Tiered KV cache](docs/memory-tier/) — paged + tiered + semantic prefetch for long-context / multi-agent serving (see [user guide](docs/memory-tier/USER-GUIDE.md), [operator runbook](docs/memory-tier/OPERATOR-RUNBOOK.md), [architecture](docs/memory-tier/ARCHITECTURE.md))
 
 #### Development documentation
 
