@@ -14,6 +14,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -62,6 +63,8 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         uint32_t                   n_cold_blocks,
         std::string                ssd_path,
         bool                       cold_resume,
+        std::string                instance_id,
+        uint32_t                   cold_budget_mb,
         layer_filter_cb            filter,
         ggml_type                  type_k,
         ggml_type                  type_v)
@@ -211,9 +214,77 @@ llama_kv_cache_paged::llama_kv_cache_paged(
             LLAMA_LOG_WARN("llama_kv_cache_paged: cold tier requested with empty ssd_path; disabling cold\n");
             n_cold_blocks_ = 0;
         } else {
-            const std::string subdir = cold_path_ + "/paged";
-            (void) ::mkdir(cold_path_.c_str(), 0700);
-            (void) ::mkdir(subdir.c_str(),    0700);
+            // MAD-131: per-instance subdir + lockfile. Default instance
+            // ID is the process pid as a string; operator override via
+            // --instance-id makes restarts deterministic.
+            instance_id_ = instance_id.empty() ? std::to_string(::getpid()) : instance_id;
+
+            // MAD-131: budget cap on cold pool size. Convert MiB → blocks
+            // (across K+V per attention layer). Cap n_cold_blocks_
+            // BEFORE building the file paths so the truncation/sizing
+            // arithmetic uses the capped count.
+            if (cold_budget_mb > 0) {
+                const size_t bytes_budget = (size_t) cold_budget_mb * 1024ull * 1024ull;
+                const size_t bytes_per_block_per_layer = k_bytes_per_block_ + v_bytes_per_block_;
+                if (bytes_per_block_per_layer == 0 || n_attn_layers == 0) {
+                    LLAMA_LOG_WARN("llama_kv_cache_paged: cold-budget-mb=%u set but layer sizing "
+                                   "is unknown; ignoring cap\n", cold_budget_mb);
+                } else {
+                    const size_t bytes_per_block = bytes_per_block_per_layer * n_attn_layers;
+                    const uint32_t max_blocks_for_budget = (uint32_t) std::min<size_t>(
+                        UINT32_MAX, bytes_budget / bytes_per_block);
+                    if (max_blocks_for_budget < n_cold_blocks_) {
+                        LLAMA_LOG_INFO("llama_kv_cache_paged: cold-budget-mb=%u caps cold pool "
+                                       "to %u blocks (was %u)\n",
+                                       cold_budget_mb, max_blocks_for_budget, n_cold_blocks_);
+                        n_cold_blocks_ = max_blocks_for_budget;
+                    }
+                }
+            }
+            if (n_cold_blocks_ == 0) {
+                // Budget reduced cold to zero; skip file setup.
+                LLAMA_LOG_WARN("llama_kv_cache_paged: cold-budget-mb capped pool to 0 — "
+                               "cold tier effectively disabled\n");
+                goto cold_setup_done;
+            }
+
+            const std::string subdir =
+                cold_path_ + "/paged/instance-" + instance_id_;
+            (void) ::mkdir(cold_path_.c_str(),                         0700);
+            (void) ::mkdir((cold_path_ + "/paged").c_str(),            0700);
+            (void) ::mkdir(subdir.c_str(),                             0700);
+
+            // MAD-131: lockfile + .pid for double-start refusal.
+            // flock(LOCK_EX | LOCK_NB) gives clean OS-level mutual
+            // exclusion. The .pid file is informational — read it on
+            // lock failure to give the operator a useful diagnostic.
+            const std::string lock_path = subdir + "/.lock";
+            const std::string pid_path  = subdir + "/.pid";
+            cold_lock_path_ = lock_path;
+            cold_pid_path_  = pid_path;
+            cold_lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0600);
+            if (cold_lock_fd_ < 0) {
+                throw std::runtime_error("llama_kv_cache_paged: cannot open lockfile " + lock_path);
+            }
+            if (::flock(cold_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+                std::string holder_pid = "(unknown)";
+                std::ifstream pf(pid_path);
+                if (pf) std::getline(pf, holder_pid);
+                ::close(cold_lock_fd_);
+                cold_lock_fd_ = -1;
+                throw std::runtime_error(
+                    "llama_kv_cache_paged: instance " + instance_id_ +
+                    " is already in use by pid " + holder_pid +
+                    " (lockfile " + lock_path + " held). Use a different "
+                    "--instance-id, or stop the holder, or rm the lockfile "
+                    "if it's stale.");
+            }
+            // Write our pid into .pid so future failed-acquires can
+            // diagnose. Best-effort; not fatal if write fails.
+            {
+                std::ofstream pf(pid_path, std::ios::trunc);
+                if (pf) pf << ::getpid() << "\n";
+            }
 
             cold_fd_k_.assign(n_layer, -1);
             cold_fd_v_.assign(n_layer, -1);
@@ -269,26 +340,29 @@ llama_kv_cache_paged::llama_kv_cache_paged(
                 // (the on-disk bytes exist but we don't know what's
                 // in them; first-write of any slot will overwrite).
                 if (cold_resume) {
-                    const std::string sidecar = subdir + "/index.bin";
-                    if (!load_cold_index_sidecar_(sidecar)) {
+                    const std::string sidecar_path = subdir + "/index.bin";
+                    if (!load_cold_index_sidecar_(sidecar_path)) {
                         LLAMA_LOG_WARN("llama_kv_cache_paged: --kv-tier-cold-resume requested but "
                                        "sidecar %s missing or invalid — starting with empty cold "
                                        "index (existing file bytes ignored)\n",
-                                       sidecar.c_str());
+                                       sidecar_path.c_str());
                     }
                 }
 
                 LLAMA_LOG_INFO("llama_kv_cache_paged: cold tier enabled — %u blocks × "
-                               "%.1f KiB/block (K+V) × %u attn layers = %.1f MiB on %s%s\n",
+                               "%.1f KiB/block (K+V) × %u attn layers = %.1f MiB on %s%s "
+                               "(instance=%s)\n",
                                n_cold_blocks_,
                                (double)(k_bytes_per_block_ + v_bytes_per_block_) / 1024.0,
                                n_attn_layers,
                                (double) total_bytes / (1024.0 * 1024.0),
                                subdir.c_str(),
-                               cold_resume ? " (resume mode)" : "");
+                               cold_resume ? " (resume mode)" : "",
+                               instance_id_.c_str());
             }
         }
     }
+cold_setup_done:;
 
     // ── Input tensor (block_table) ──
     //
@@ -332,6 +406,17 @@ llama_kv_cache_paged::~llama_kv_cache_paged() {
     // MAD-121: close cold-tier fds.
     for (int fd : cold_fd_k_) if (fd >= 0) ::close(fd);
     for (int fd : cold_fd_v_) if (fd >= 0) ::close(fd);
+    // MAD-131: release the per-instance lockfile + remove .pid. flock
+    // releases automatically when the fd closes; .pid is informational
+    // and best-effort cleaned (next start with same instance_id will
+    // overwrite anyway).
+    if (cold_lock_fd_ >= 0) {
+        ::close(cold_lock_fd_);
+        cold_lock_fd_ = -1;
+    }
+    if (!cold_pid_path_.empty()) {
+        (void) ::unlink(cold_pid_path_.c_str());
+    }
     if (buf_storage_) ggml_backend_buffer_free(buf_storage_);
     if (buf_inputs_)  ggml_backend_buffer_free(buf_inputs_);
     if (ctx_storage_) ggml_free(ctx_storage_);
@@ -1518,7 +1603,7 @@ constexpr uint32_t kColdIndexVersion = 1;
 bool llama_kv_cache_paged::save_cold_index_sidecar() const {
     if (!cold_enabled() || cold_path_.empty()) return true;  // no-op
 
-    const std::string subdir   = cold_path_ + "/paged";
+    const std::string subdir   = cold_path_ + "/paged/instance-" + instance_id_;
     const std::string sidecar  = subdir + "/index.bin";
     const std::string tmp_path = sidecar + ".tmp";
 

@@ -1550,6 +1550,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_tier_paged_blocks        = params.kv_tier_paged_blocks;
     cparams.kv_tier_paged_block_size    = params.kv_tier_paged_block_size;
     cparams.kv_tier_cold_resume         = params.kv_tier_cold_resume;
+    cparams.kv_tier_instance_id         = params.kv_tier_instance_id.empty()
+                                              ? nullptr
+                                              : params.kv_tier_instance_id.c_str();
+    cparams.kv_tier_cold_budget_mb      = params.kv_tier_cold_budget_mb;
 
     return cparams;
 }

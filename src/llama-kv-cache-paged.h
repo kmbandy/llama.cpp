@@ -92,10 +92,20 @@ public:
             std::string                ssd_path = std::string(),
             // MAD-130: when true, skip the O_TRUNC on cold-tier files
             // and load the in-memory cold index from the sidecar file
-            // at `${ssd_path}/paged/index.bin`. Lets the server resume
-            // cold-tier contents across a clean restart. Default false
-            // (legacy behavior: fresh truncation).
+            // at `${ssd_path}/paged/instance-${INSTANCE_ID}/index.bin`.
+            // Lets the server resume cold-tier contents across a clean
+            // restart. Default false (legacy behavior: fresh truncation).
             bool                       cold_resume = false,
+            // MAD-131: per-instance ID. Cold-tier files live under
+            // `${ssd_path}/paged/instance-${INSTANCE_ID}/`. Empty →
+            // use the process pid as a string. Required to allow
+            // multiple llama-server processes to share one ssd_path
+            // without colliding on cold-tier files.
+            std::string                instance_id = std::string(),
+            // MAD-131: cap cold pool to this many MiB total (K+V across
+            // all attn layers). 0 = no cap (size from cold percentage).
+            // Lets operators bound SSD wear per instance.
+            uint32_t                   cold_budget_mb = 0,
             // Optional per-layer filter. Returns true for layers that should
             // get K/V allocation in the paged pool. Recurrent layers in
             // hybrid models should be filtered OUT (their state lives in
@@ -414,6 +424,17 @@ private:
     uint32_t                  n_cold_blocks_ = 0;
     uint32_t                  cold_in_use_   = 0;
     std::string               cold_path_;
+
+    // MAD-131: per-instance subdir + flock-based double-start protection.
+    // instance_id_ defaults to the process pid as a string; --instance-id
+    // overrides for deterministic restarts. cold_lock_fd_ holds the
+    // OS-level lock on `${cold_path_}/paged/instance-${id}/.lock` for
+    // the lifetime of the cache; the .pid file is informational. Both
+    // get cleaned up by the destructor.
+    std::string               instance_id_;
+    std::string               cold_lock_path_;
+    std::string               cold_pid_path_;
+    int                       cold_lock_fd_  = -1;
     std::vector<int>          cold_fd_k_;            // [n_layers] fd for K cold file (-1 = none)
     std::vector<int>          cold_fd_v_;            // [n_layers] fd for V cold file
     std::vector<uint32_t>     cold_pool_free_;       // free cold_idx stack

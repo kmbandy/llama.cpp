@@ -615,6 +615,8 @@ struct common_params {
     bool  kv_tier_paged_blocks    = false;  // enable mt:: paged-attention KV cache (vLLM-style block-indexed); standard + hybrid models supported
     int   kv_tier_paged_block_size = 16;    // tokens per block when paged_blocks is enabled (must be a power of 2; 16 matches vLLM)
     bool  kv_tier_cold_resume     = false;  // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar from prior run
+    std::string kv_tier_instance_id;        // MAD-131: per-instance ID for cold-tier subdir + lockfile (default: pid)
+    int   kv_tier_cold_budget_mb  = 0;      // MAD-131: cap cold-pool size to N MiB (0 = no limit beyond percent-derived)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
