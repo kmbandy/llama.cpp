@@ -208,6 +208,17 @@ struct server_slot {
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
 
+    // MAD-141: counts how many consecutive update_slots() iterations have
+    // preempted this slot via the MAD-120 admission gate without making
+    // any progress (evict_seq returned 0). Once it crosses
+    // kPagedPreemptDeadlockThreshold, the slot's request is unservable
+    // (the prompt simply doesn't fit alongside the rest of the live
+    // workload) and we fail it with a 503-equivalent rather than spin
+    // until the upstream "n_empty_consecutive > 3" safety abort fires.
+    // Reset on slot.reset() and any iteration where the slot DOES make
+    // progress through the prefill path.
+    int32_t paged_preempt_no_progress_count = 0;
+
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -294,7 +305,8 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        n_prompt_tokens_cache = 0;
+        n_prompt_tokens_cache              = 0;
+        paged_preempt_no_progress_count    = 0;  // MAD-141
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2667,15 +2679,53 @@ private:
                         for (auto sid : paged_evicted_this_iter) {
                             if (sid == slot.id) { already = true; break; }
                         }
+                        int n_evicted = 0;
                         if (!already) {
-                            int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                            n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
                             SLT_INF(slot, "MAD-120 preempt (prefill): hot pool full, "
                                           "evicted %d block(s) to warm; will retry next iter\n",
                                           n_evicted);
                             paged_evicted_this_iter.push_back(slot.id);
                         }
+
+                        // MAD-141: deadlock break. evict_seq returns 0 when
+                        // the slot has no GPU-resident blocks to give back —
+                        // typically because nothing has been prefilled yet
+                        // and the prompt itself is too large for the hot
+                        // budget. Without this guard the slot loops forever
+                        // until the upstream n_empty_consecutive safety
+                        // abort fires and crashes the server. Track
+                        // consecutive no-progress preempt iterations and
+                        // fail the request cleanly once it's clearly stuck.
+                        constexpr int32_t kPagedPreemptDeadlockThreshold = 4;
+                        if (n_evicted <= 0) {
+                            ++slot.paged_preempt_no_progress_count;
+                            if (slot.paged_preempt_no_progress_count >= kPagedPreemptDeadlockThreshold) {
+                                SLT_ERR(slot,
+                                        "MAD-141: paged admission stuck for %d iters with no eviction "
+                                        "progress (n_new_est=%u). Prompt does not fit alongside the "
+                                        "live workload. Failing request.\n",
+                                        slot.paged_preempt_no_progress_count, n_new_est);
+                                send_error(slot,
+                                           string_format(
+                                               "paged KV admission could not fit a %u-token request "
+                                               "alongside the active workload after %d retries. "
+                                               "Reduce the prompt or wait for slots to drain.",
+                                               n_new_est, slot.paged_preempt_no_progress_count),
+                                           ERROR_TYPE_SERVER);
+                                slot.release();
+                                // Releasing a deadlocked slot IS progress — reset
+                                // the empty-batch streak so the upstream safety
+                                // abort doesn't fire on this same iteration just
+                                // because we haven't built a token batch yet.
+                                n_empty_consecutive = 0;
+                                continue;
+                            }
+                        }
                         continue;
                     }
+                    // Slot was admitted — any prior no-progress streak ends here.
+                    slot.paged_preempt_no_progress_count = 0;
                     paged_admitted.push_back(slot.id);
                 }
 
