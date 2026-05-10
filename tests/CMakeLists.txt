@@ -289,6 +289,17 @@ llama_build_and_test(test-mt-tiered-thin.cpp
     ../src/memory-tier/mt-semantic.cpp)
 target_include_directories(test-mt-tiered-thin PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MAD-137: paged-cache integration test. Needs a real model (skips
+# gracefully when LLAMACPP_TEST_MODELFILE / argv[1] are unset). Links
+# the full llama lib because llama_kv_cache_paged is part of it.
+llama_build_and_test(test-paged-lifecycle.cpp)
+target_link_libraries(test-paged-lifecycle PRIVATE llama)
+target_include_directories(test-paged-lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-paged-semantic.cpp)
+target_link_libraries(test-paged-semantic PRIVATE llama)
+target_include_directories(test-paged-semantic PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)

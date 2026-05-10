@@ -1,6 +1,7 @@
 *
 !*.*
 !snapshots/
+!stress/
 *.o
 ggml-common.h
 **/*.swp
