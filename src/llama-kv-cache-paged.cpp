@@ -488,6 +488,106 @@ bool llama_kv_cache_paged::evict_lru_to_warm() {
     return evict_block_to_warm(victim_seq, victim_lblock);
 }
 
+// MAD-120 Phase 2: whole-slot preemption helpers ──────────────────────
+
+uint32_t llama_kv_cache_paged::n_gpu_blocks_for(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
+    const uint32_t n = table_.num_blocks(seq_id);
+    uint32_t cnt = 0;
+    for (uint32_t lb = 0; lb < n; ++lb) {
+        const uint32_t phys = table_.get_physical(seq_id, lb);
+        if (phys != mt::kInvalidBlockId && pool_.is_gpu(phys)) ++cnt;
+    }
+    return cnt;
+}
+
+uint32_t llama_kv_cache_paged::n_warm_blocks_for(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
+    const uint32_t n = table_.num_blocks(seq_id);
+    uint32_t cnt = 0;
+    for (uint32_t lb = 0; lb < n; ++lb) {
+        const uint32_t phys = table_.get_physical(seq_id, lb);
+        if (phys != mt::kInvalidBlockId && !pool_.is_gpu(phys)) ++cnt;
+    }
+    return cnt;
+}
+
+int llama_kv_cache_paged::evict_seq_to_warm(llama_seq_id seq_id) {
+    if (!warm_enabled()) return -1;
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return -1;
+    const uint32_t n = table_.num_blocks(seq_id);
+    int moved = 0;
+    for (uint32_t lb = 0; lb < n; ++lb) {
+        const uint32_t phys = table_.get_physical(seq_id, lb);
+        if (phys == mt::kInvalidBlockId) continue;
+        if (!pool_.is_gpu(phys)) continue;  // already warm
+        if (!evict_block_to_warm(seq_id, lb)) {
+            // Warm pool full or unexpected error; bail. Caller decides
+            // how to proceed (cold tier when wired, or refuse the
+            // candidate that triggered preemption).
+            LLAMA_LOG_WARN("evict_seq_to_warm: stopped at seq=%d lblock=%u after "
+                           "moving %d block(s) (warm pool full?)\n",
+                           seq_id, lb, moved);
+            return moved > 0 ? moved : -1;
+        }
+        ++moved;
+    }
+    LLAMA_LOG_DEBUG("evict_seq_to_warm: seq=%d evicted %d block(s)\n", seq_id, moved);
+    return moved;
+}
+
+int llama_kv_cache_paged::restore_seq_from_warm(llama_seq_id seq_id) {
+    if (!warm_enabled()) return -1;
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return -1;
+    const uint32_t n = table_.num_blocks(seq_id);
+    int moved = 0;
+    for (uint32_t lb = 0; lb < n; ++lb) {
+        const uint32_t phys = table_.get_physical(seq_id, lb);
+        if (phys == mt::kInvalidBlockId) continue;
+        if (pool_.is_gpu(phys)) continue;  // already on GPU
+        if (!restore_block_from_warm(seq_id, lb)) {
+            LLAMA_LOG_WARN("restore_seq_from_warm: stopped at seq=%d lblock=%u after "
+                           "restoring %d block(s) (GPU pool full?)\n",
+                           seq_id, lb, moved);
+            return moved > 0 ? moved : -1;
+        }
+        ++moved;
+    }
+    LLAMA_LOG_DEBUG("restore_seq_from_warm: seq=%d restored %d block(s)\n", seq_id, moved);
+    return moved;
+}
+
+bool llama_kv_cache_paged::can_admit(llama_seq_id           seq_id,
+                                       uint32_t              n_new_tokens,
+                                       const std::vector<llama_seq_id> & accepted) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
+
+    // Candidate seq's hot-block need = ceil((seq_pos_max + n_new + 1) / block).
+    // seq_pos_max is -1 for an unwritten seq, so adjust.
+    const llama_pos cand_pos_max = seq_states_[seq_id].pos_max;
+    const uint64_t  cand_total_tokens =
+        (cand_pos_max < 0 ? 0 : (uint64_t)(cand_pos_max + 1)) + (uint64_t) n_new_tokens;
+    const uint32_t cand_blocks = (uint32_t)
+        ((cand_total_tokens + block_size_ - 1) / block_size_);
+
+    uint32_t total = cand_blocks;
+    for (llama_seq_id sid : accepted) {
+        if (sid < 0 || (uint32_t) sid >= n_seq_max_) continue;
+        if (sid == seq_id) continue;  // candidate isn't double-counted
+        const llama_pos pmax = seq_states_[sid].pos_max;
+        if (pmax < 0) continue;
+        const uint32_t b = (uint32_t)
+            (((uint64_t)(pmax + 1) + block_size_ - 1) / block_size_);
+        total += b;
+    }
+
+    // n_blocks_total_ is the hot pool capacity. Headroom of a couple
+    // blocks for new-block allocation churn during this batch.
+    const uint32_t headroom = 2;
+    const uint32_t budget   = (n_blocks_total_ > headroom) ? (n_blocks_total_ - headroom) : n_blocks_total_;
+    return total <= budget;
+}
+
 bool llama_kv_cache_paged::compute_slot_mapping(const llama_ubatch * ubatch, int32_t * out) const {
     // For each token i at (seq_id = ubatch->seq_id[i][0], pos = ubatch->pos[i]):
     //   logical_block_idx = pos / block_size_

@@ -785,6 +785,29 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // MAD-120 Phase 2: paged-attn admission control. Used by the server's
+    // scheduler to decide whether a slot's tokens can be added to the
+    // current batch alongside the already-accepted set, given the hot
+    // pool's capacity. For non-paged backing memory, always returns true
+    // (no admission control needed). The caller passes:
+    //   seq_id        — candidate slot's seq id
+    //   n_new_tokens  — how many new tokens this slot wants to add
+    //   accepted      — array of seq ids already accepted into this batch
+    //   n_accepted    — length of `accepted`
+    LLAMA_API bool llama_memory_paged_can_admit(
+            llama_memory_t       mem,
+            llama_seq_id         seq_id,
+            uint32_t             n_new_tokens,
+            const llama_seq_id * accepted,
+            size_t               n_accepted);
+
+    // MAD-120 Phase 2: whole-slot eviction to warm tier. Returns blocks
+    // moved (>= 0) on success, negative on error or when paged/warm is
+    // not in use. Idempotent.
+    LLAMA_API int  llama_memory_paged_evict_seq(
+            llama_memory_t mem,
+            llama_seq_id   seq_id);
+
     //
     // State / sessions
     //

@@ -2473,8 +2473,39 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // MAD-120 Phase 2: paged-attn admission control. Track which seq
+        // ids have already been admitted to this iteration's batch. Each
+        // slot we want to add is gated by llama_memory_paged_can_admit;
+        // if hot can't fit it alongside the already-admitted set, the
+        // slot is preempted (whole-slot evict to warm) and skipped this
+        // iteration. A non-paged backend short-circuits can_admit to
+        // true, so this is a no-op there. paged_evicted_this_iter tracks
+        // anyone we sent to warm so we don't try to admit them right
+        // back in the prefill loop below.
+        //
+        // Anti-starvation: rotate which slot is iterated first across
+        // calls. Without this, with 4 slots and hot fitting only 3, slot
+        // 3 always loses the admission race because it's evaluated last
+        // and the first three fill the budget. The rotating offset
+        // ensures every slot is "first" 1/n of the time.
+        llama_memory_t mem_for_admit = llama_get_memory(ctx);
+        std::vector<llama_seq_id> paged_admitted;
+        std::vector<llama_seq_id> paged_evicted_this_iter;
+        paged_admitted.reserve(slots.size());
+
+        static uint64_t paged_admit_rotor = 0;
+        const size_t    n_slots_total     = slots.size();
+        const size_t    rotor_off         = (n_slots_total > 0)
+                                                ? (size_t)(paged_admit_rotor % n_slots_total)
+                                                : 0;
+        ++paged_admit_rotor;
+
+        auto rotated_slot = [&](size_t i) -> server_slot & {
+            return slots[(rotor_off + i) % n_slots_total];
+        };
+
         // first, add sampled tokens from any ongoing sequences
-        for (auto & slot : slots) {
+        for (size_t _i = 0; _i < n_slots_total; ++_i) { auto & slot = rotated_slot(_i);
             if (slot.state != SLOT_STATE_GENERATING) {
                 continue;
             }
@@ -2486,7 +2517,20 @@ private:
                 continue;
             }
 
+            // MAD-120: admission. Decode adds 1 token per slot per iter.
+            if (!llama_memory_paged_can_admit(
+                        mem_for_admit, slot.id, /*n_new_tokens=*/1,
+                        paged_admitted.data(), paged_admitted.size())) {
+                int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                SLT_INF(slot, "MAD-120 preempt (decode): hot pool full, "
+                              "evicted %d block(s) to warm; will retry next iter\n",
+                              n_evicted);
+                paged_evicted_this_iter.push_back(slot.id);
+                continue;
+            }
+
             slot.update_batch(batch);
+            paged_admitted.push_back(slot.id);
         }
 
         // process in chunks of params.n_batch
@@ -2498,7 +2542,7 @@ private:
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.n_tokens == 0) {
-            for (auto & slot : slots) {
+            for (size_t _j = 0; _j < n_slots_total; ++_j) { auto & slot = rotated_slot(_j);
                 if (!slot.is_processing()) {
                     continue;
                 }
@@ -2512,6 +2556,35 @@ private:
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
                     continue;
+                }
+
+                // MAD-120 Phase 2: paged-attn admission control for prefill.
+                // We use the slot's full prompt size as a conservative
+                // estimate of the new tokens this slot wants to add. If
+                // the candidate's working set wouldn't fit alongside the
+                // already-admitted seqs, evict the candidate and skip it
+                // this iteration.
+                if (slot.is_processing() && (slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                                              slot.state == SLOT_STATE_STARTED)) {
+                    const uint32_t n_new_est = slot.task ? (uint32_t) slot.task->n_tokens() : 0;
+                    if (!llama_memory_paged_can_admit(
+                                mem_for_admit, slot.id, n_new_est,
+                                paged_admitted.data(), paged_admitted.size())) {
+                        // Already evicted above? skip the duplicate evict.
+                        bool already = false;
+                        for (auto sid : paged_evicted_this_iter) {
+                            if (sid == slot.id) { already = true; break; }
+                        }
+                        if (!already) {
+                            int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                            SLT_INF(slot, "MAD-120 preempt (prefill): hot pool full, "
+                                          "evicted %d block(s) to warm; will retry next iter\n",
+                                          n_evicted);
+                            paged_evicted_this_iter.push_back(slot.id);
+                        }
+                        continue;
+                    }
+                    paged_admitted.push_back(slot.id);
                 }
 
                 // this slot still has a prompt to be processed

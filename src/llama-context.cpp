@@ -6,6 +6,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache-paged.h"
+#include "memory-tier/mt-tiered.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-weight-pager.h"
@@ -3634,6 +3637,46 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+// MAD-120 Phase 2: paged-attn admission / preemption helpers. The
+// underlying cache is reached through the hybrid wrapper when paged is
+// active; non-paged memory short-circuits to the no-admission-control
+// answer (true) and the no-op evict (-1).
+//
+// When --kv-tiered is enabled, llama_get_memory returns a
+// llama_memory_tiered that WRAPS the hybrid; we unwrap one level.
+static llama_kv_cache_paged * llama_memory_paged_cast(llama_memory_t mem) {
+    if (!mem) return nullptr;
+    // Unwrap llama_memory_tiered if it's the outer layer.
+    if (auto * tiered = dynamic_cast<mt::llama_memory_tiered *>(mem)) {
+        mem = tiered->inner_for_test();
+        if (!mem) return nullptr;
+    }
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (!hybrid) return nullptr;
+    if (!hybrid->is_paged_attn()) return nullptr;
+    return hybrid->get_mem_attn_paged();
+}
+
+bool llama_memory_paged_can_admit(
+        llama_memory_t       mem,
+        llama_seq_id         seq_id,
+        uint32_t             n_new_tokens,
+        const llama_seq_id * accepted,
+        size_t               n_accepted) {
+    auto * paged = llama_memory_paged_cast(mem);
+    if (!paged) return true;
+    std::vector<llama_seq_id> acc;
+    acc.reserve(n_accepted);
+    for (size_t i = 0; i < n_accepted; ++i) acc.push_back(accepted[i]);
+    return paged->can_admit(seq_id, n_new_tokens, acc);
+}
+
+int llama_memory_paged_evict_seq(llama_memory_t mem, llama_seq_id seq_id) {
+    auto * paged = llama_memory_paged_cast(mem);
+    if (!paged) return -1;
+    return paged->evict_seq_to_warm(seq_id);
 }
 
 // llama state API

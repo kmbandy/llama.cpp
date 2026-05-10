@@ -184,6 +184,44 @@ public:
     // warm is also full).
     bool evict_lru_to_warm();
 
+    // ─── MAD-120 Phase 2: whole-slot preemption ───
+    //
+    // Move ALL of seq_id's GPU-resident blocks to warm in one go. Used by
+    // the scheduler's admission control: when the active set wouldn't fit
+    // in hot, the picked victim seq has its entire context paged out so
+    // the remaining seqs can run. Returns the number of blocks moved (0
+    // if the seq had nothing on GPU, negative on error). Idempotent:
+    // calling twice with no intervening restore is a no-op.
+    int  evict_seq_to_warm(llama_seq_id seq_id);
+
+    // Bring ALL of seq_id's warm-resident blocks back to GPU. Caller must
+    // first ensure GPU pool has space (the fault-in pre-pass handles this
+    // by evict_lru_to_warm of OTHER seqs). Returns the number of blocks
+    // restored, or negative on error (e.g. GPU pool ran out mid-restore).
+    int  restore_seq_from_warm(llama_seq_id seq_id);
+
+    // Count how many of seq_id's logical blocks are currently GPU-resident
+    // vs warm-resident. Used by can_admit() to compute the working-set
+    // delta when admitting a slot that's currently fully or partially in
+    // warm.
+    uint32_t n_gpu_blocks_for(llama_seq_id seq_id)  const;
+    uint32_t n_warm_blocks_for(llama_seq_id seq_id) const;
+
+    // Admission predicate. Given a set of seq_ids already accepted into
+    // the upcoming batch (`accepted`) and a candidate `seq_id` that wants
+    // to join (with `n_new_tokens` of fresh tokens it'll add this batch),
+    // return true iff the union's hot-block requirement fits within the
+    // hot pool. Used by the scheduler before adding a slot's tokens.
+    //
+    // The candidate's needed hot-block count is:
+    //     ceil((seq_pos_max + n_new_tokens + 1) / block_size_)
+    // i.e. all blocks the kernel will need to read+write for this seq.
+    //
+    // accepted seqs contribute their already-needed blocks. The total
+    // must be ≤ n_blocks_total_ (hot capacity).
+    bool can_admit(llama_seq_id seq_id, uint32_t n_new_tokens,
+                   const std::vector<llama_seq_id> & accepted) const;
+
     // Public accessors for tests / dispatch decisions.
     uint32_t n_warm_blocks() const { return n_warm_blocks_; }
     bool     warm_enabled()  const { return n_warm_blocks_ > 0; }
