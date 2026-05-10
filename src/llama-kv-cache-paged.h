@@ -308,7 +308,7 @@ public:
 
     // ─── MAD-133: tier-movement counters (monotonic since startup) ───
     //
-    // Read by the /metrics/tier endpoint. All uint64. No locking needed
+    // Read by the /metrics endpoint (paged_* keys). All uint64. No locking needed
     // — single-thread mutator contract (Epic A4 / MAD-132). Reset on
     // clear() + state_read.
     uint64_t evict_h2w_total()          const { return evict_h2w_total_; }
@@ -332,7 +332,7 @@ public:
     }
 
     // Per-instance ID accessor (set in ctor; immutable after). Used by
-    // /metrics/tier to label its output.
+    // /metrics + /slots to label paged_* output.
     const std::string & instance_id() const { return instance_id_; }
 
     // MAD-132: drop the OLDEST cold block from cold_pool_free_ by
