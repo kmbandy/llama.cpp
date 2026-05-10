@@ -319,6 +319,17 @@ private:
     // No-op if warm tier is disabled.
     bool fault_in_warm_blocks_for_batch(const llama_ubatch & ub);
 
+    // MAD-128: CoW any blocks being written this ubatch that are shared
+    // (refcount > 1 from a prior seq_cp). For each (seq, lblock) pair
+    // touched by a write in `ub`: if that physical block is shared,
+    // allocate a fresh GPU block, copy the existing data into it, swap
+    // the seq's table entry to point at the new block, and decrement
+    // the old block's refcount. After this returns, every write target
+    // is uniquely-owned and the kernel can write without corrupting
+    // other sequences sharing the same prefix. Returns false if a CoW
+    // alloc failed and eviction couldn't free a block.
+    bool cow_writes_for_ubatch(const llama_ubatch & ub);
+
     const llama_model &        model_;
     ggml_backend_buffer_type_t buft_;
     uint32_t                   n_blocks_total_;

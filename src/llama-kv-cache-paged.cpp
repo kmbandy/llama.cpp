@@ -501,6 +501,7 @@ bool llama_kv_cache_paged::fault_in_warm_blocks_for_batch(const llama_ubatch & u
                 const uint32_t physical = table_.get_physical(sid, lb);
                 if (physical == mt::kInvalidBlockId) continue;
                 if (!pool_.is_gpu(physical)) continue;
+                if (pool_.refcount(physical) > 1) continue;  // MAD-128: skip shared
                 ++gpu_count;
                 if (lb < oldest_lb) oldest_lb = lb;
             }
@@ -570,6 +571,101 @@ bool llama_kv_cache_paged::fault_in_warm_blocks_for_batch(const llama_ubatch & u
     return true;
 }
 
+// MAD-128: CoW any blocks being written this ubatch that are shared
+// (refcount > 1 from a prior seq_cp). For each unique (seq, lblock)
+// touched by a write in `ub`: if that physical's refcount > 1, allocate
+// a fresh GPU block, copy K/V from the shared block into it, swap the
+// seq's table entry, decrement the old block's refcount.
+//
+// Why this is needed: seq_cp shares physical blocks via refcount. If
+// either sequence then writes to a shared block (e.g. partial last
+// block at the share boundary), the kernel's K/V scatter would corrupt
+// the OTHER sequence's view of that block. CoW preserves the invariant
+// that each (seq, lblock) writable cell is uniquely owned.
+//
+// Called from apply_ubatch_to_state AFTER fault-in (so the block is
+// GPU-resident before we copy) and BEFORE prepare_batch_tensors (so
+// the uploaded block_table reflects the new physicals).
+bool llama_kv_cache_paged::cow_writes_for_ubatch(const llama_ubatch & ub) {
+    if (ub.n_tokens == 0) return true;
+
+    // Collect unique (seq, lblock) pairs touched by writes this ubatch.
+    // Using a set: small N (<= n_tokens), de-dup'd lookups.
+    std::vector<std::pair<llama_seq_id, uint32_t>> touched;
+    touched.reserve(ub.n_tokens);
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        const llama_pos pos = ub.pos[i];
+        if (pos < 0) continue;
+        llama_seq_id sid = 0;
+        if (ub.seq_id && ub.seq_id[i] && ub.n_seq_id && ub.n_seq_id[i] > 0) {
+            sid = ub.seq_id[i][0];
+        }
+        if (sid < 0 || (uint32_t) sid >= n_seq_max_) continue;
+        touched.emplace_back(sid, (uint32_t) pos / block_size_);
+    }
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+
+    uint32_t n_cowed = 0;
+    for (auto [sid, lblock] : touched) {
+        if (lblock >= table_.num_blocks(sid)) continue;  // freshly allocated by ensure_blocks_for; refcount=1
+        const uint32_t physical = table_.get_physical(sid, lblock);
+        if (physical == mt::kInvalidBlockId) continue;
+        if (pool_.refcount(physical) <= 1) continue;       // not shared
+        if (!pool_.is_gpu(physical)) continue;             // CoW only on GPU-resident; warm/cold writes go through fault-in path
+
+        // Allocate a fresh GPU block. If the pool is full, try evicting
+        // an LRU GPU block to warm to make room (only if warm enabled).
+        uint32_t new_phys = pool_.alloc_gpu();
+        while (new_phys == mt::kInvalidBlockId && warm_enabled()) {
+            if (!evict_lru_to_warm()) break;
+            new_phys = pool_.alloc_gpu();
+        }
+        if (new_phys == mt::kInvalidBlockId) {
+            LLAMA_LOG_ERROR("llama_kv_cache_paged::cow_writes_for_ubatch: GPU pool "
+                            "exhausted attempting CoW for seq=%d lblock=%u — "
+                            "write would corrupt shared block. Refusing batch.\n",
+                            sid, lblock);
+            return false;
+        }
+
+        // GPU-to-GPU copy via host bounce buffer (no native ggml D2D
+        // primitive; the get/set pair routes through host memory but the
+        // block is small — k+v_bytes_per_block, ~17 KiB at turbo4).
+        std::vector<uint8_t> kbuf(k_bytes_per_block_);
+        std::vector<uint8_t> vbuf(v_bytes_per_block_);
+        const size_t k_off_old = (size_t) physical * k_bytes_per_block_;
+        const size_t v_off_old = (size_t) physical * v_bytes_per_block_;
+        const size_t k_off_new = (size_t) new_phys * k_bytes_per_block_;
+        const size_t v_off_new = (size_t) new_phys * v_bytes_per_block_;
+        for (uint32_t il = 0; il < layers_.size(); ++il) {
+            const auto & layer = layers_[il];
+            if (!layer.k) continue;
+            ggml_backend_tensor_get(layer.k, kbuf.data(), k_off_old, k_bytes_per_block_);
+            ggml_backend_tensor_get(layer.v, vbuf.data(), v_off_old, v_bytes_per_block_);
+            ggml_backend_tensor_set(layer.k, kbuf.data(), k_off_new, k_bytes_per_block_);
+            ggml_backend_tensor_set(layer.v, vbuf.data(), v_off_new, v_bytes_per_block_);
+        }
+
+        // Swap seq's table entry to the fresh block; decrement old.
+        // The old block's refcount drops by 1 (from N to N-1). If N was
+        // 2, the old block now has refcount 1 (the OTHER seq still owns
+        // it, no one freed). If N was higher, more shares remain.
+        // Fingerprint follows the seq's logical block — same content,
+        // new physical, no fingerprint update needed.
+        table_.swap_block(sid, lblock, new_phys);
+        pool_.free_block(physical);
+        ++n_cowed;
+    }
+
+    if (n_cowed > 0) {
+        LLAMA_LOG_DEBUG("llama_kv_cache_paged::cow_writes_for_ubatch: CoW'd %u "
+                        "shared block(s) for upcoming writes (pool free: gpu=%zu)\n",
+                        n_cowed, pool_.n_free_gpu());
+    }
+    return true;
+}
+
 bool llama_kv_cache_paged::evict_lru_to_warm() {
     if (!warm_enabled()) return false;
 
@@ -595,6 +691,12 @@ bool llama_kv_cache_paged::evict_lru_to_warm() {
             const uint32_t physical = table_.get_physical(sid, lb);
             if (physical == mt::kInvalidBlockId) continue;
             if (!pool_.is_gpu(physical)) continue;
+            // MAD-128: skip shared blocks (refcount > 1) — evicting them
+            // doesn't free GPU space (other seqs still hold the physical),
+            // so the eviction-retry caller would loop. Shared blocks stay
+            // GPU-resident until either the other seq frees its reference
+            // or its own write triggers CoW.
+            if (pool_.refcount(physical) > 1) continue;
             ++gpu_count;
             if (lb < oldest_gpu_lblock) oldest_gpu_lblock = lb;
         }
@@ -1015,6 +1117,15 @@ bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
     if (warm_enabled() && !fault_in_warm_blocks_for_batch(ub)) {
         return false;
     }
+
+    // MAD-128: CoW any blocks being written this ubatch that are shared
+    // (refcount > 1 from a prior seq_cp). Must run AFTER fault-in (so
+    // the block is GPU-resident before we attempt to copy its data) and
+    // BEFORE prepare_batch_tensors (so the table snapshot reflects the
+    // CoW'd physicals). No-op when no shared blocks exist.
+    if (!cow_writes_for_ubatch(ub)) {
+        return false;
+    }
     return true;
 }
 
@@ -1237,10 +1348,87 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     return true;
 }
 
-void llama_kv_cache_paged::seq_cp(llama_seq_id /*src*/, llama_seq_id /*dst*/,
-                                    llama_pos /*p0*/, llama_pos /*p1*/) {
-    // CoW between sequences — not supported in v1.
-    LLAMA_LOG_WARN("llama_kv_cache_paged::seq_cp: not implemented in v1 — no-op\n");
+void llama_kv_cache_paged::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
+                                    llama_pos p0, llama_pos p1) {
+    // MAD-128: block-aligned CoW. Wholly-covered blocks of src in [p0, p1)
+    // are SHARED into dst's table (refcount bumped in BlockPool). Future
+    // writes that target a shared block trigger CoW in
+    // cow_writes_for_ubatch (called from apply_ubatch_to_state).
+    //
+    // Sub-block partials are not shared (would require partial-block CoW
+    // which doesn't exist) — they're skipped with a warning, mirroring
+    // seq_rm's sub-block behavior.
+    if (seq_id_src < 0 || (uint32_t) seq_id_src >= n_seq_max_) return;
+    if (seq_id_dst < 0 || (uint32_t) seq_id_dst >= n_seq_max_) return;
+    if (seq_id_src == seq_id_dst) return;
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+    if (p1 <= p0) return;
+
+    const llama_pos src_max = seq_states_[seq_id_src].pos_max;
+    if (p0 > src_max) return;  // src has nothing in range
+    const llama_pos p1_clamped = std::min(p1, (llama_pos)(src_max + 1));
+
+    // Wipe dst's existing range first so its old blocks are properly
+    // refcount-released (recursive call uses the new partial seq_rm).
+    seq_rm(seq_id_dst, p0, p1_clamped);
+
+    const uint32_t bsize = block_size_;
+    const uint32_t n_blocks_src = table_.num_blocks(seq_id_src);
+
+    uint32_t blocks_shared          = 0;
+    uint32_t blocks_partial_skipped = 0;
+
+    for (uint32_t lblock = 0; lblock < n_blocks_src; ++lblock) {
+        const llama_pos b_start = (llama_pos) lblock * (llama_pos) bsize;
+        const llama_pos b_end   = b_start + (llama_pos) bsize;
+
+        if (b_end <= p0 || b_start >= p1_clamped) continue;
+        const bool wholly_covered = (p0 <= b_start) && (p1_clamped >= b_end);
+        if (!wholly_covered) {
+            ++blocks_partial_skipped;
+            continue;
+        }
+
+        const uint32_t physical = table_.get_physical(seq_id_src, lblock);
+        if (physical == mt::kInvalidBlockId) continue;  // hole in src
+
+        // Bump refcount on src's physical and install in dst's table.
+        pool_.bump_ref(physical);
+
+        // Pad dst's table with kInvalidBlockId for any logical gaps
+        // before this block, then either swap into an existing slot or
+        // append.
+        while (table_.num_blocks(seq_id_dst) < lblock) {
+            table_.append_block(seq_id_dst, mt::kInvalidBlockId);
+        }
+        if (lblock < table_.num_blocks(seq_id_dst)) {
+            table_.swap_block(seq_id_dst, lblock, physical);
+        } else {
+            table_.append_block(seq_id_dst, physical);
+        }
+
+        ++blocks_shared;
+    }
+
+    if (blocks_partial_skipped > 0) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged::seq_cp: range [%d,%d) is not "
+                       "block-aligned (block_size=%u). %u block(s) shared via "
+                       "CoW; %u block(s) partially overlapped — those are NOT "
+                       "shared. Round caller's range to block boundaries.\n",
+                       p0, p1, bsize, blocks_shared, blocks_partial_skipped);
+    }
+
+    // Update dst's pos_max if the copy extended its tail.
+    if (p1_clamped - 1 > seq_states_[seq_id_dst].pos_max) {
+        seq_states_[seq_id_dst].pos_max = p1_clamped - 1;
+        if (seq_states_[seq_id_dst].pos_min < 0) seq_states_[seq_id_dst].pos_min = 0;
+    }
+
+    LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_cp: src=%d dst=%d range=[%d,%d) "
+                    "blocks_shared=%u blocks_partial=%u\n",
+                    seq_id_src, seq_id_dst, p0, p1,
+                    blocks_shared, blocks_partial_skipped);
 }
 
 void llama_kv_cache_paged::seq_keep(llama_seq_id /*seq_id*/) {
