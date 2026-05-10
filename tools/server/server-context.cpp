@@ -40,6 +40,64 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// MAD-122: write fingerprints for the token range [p0, p1). When the
+// paged-blocks path is on we emit one fingerprint per logical block so
+// query-time semantic prefetch can score at block granularity (matching
+// what BlockSemanticIndex stores). Otherwise we keep the legacy chunk-
+// level fingerprint (one embedding for the whole range, position-keyed).
+//
+// Returns the number of fingerprints actually recorded so the caller can
+// log a meaningful "fingerprinted N items" line; an empty return means
+// either p1<=p0, the embedding model wasn't ready, or every per-block
+// embed call returned empty.
+static int mt_record_fingerprints_for_range(
+        mt::llama_memory_tiered * mt_tier,
+        llama_context           * ctx,
+        llama_seq_id              seq_id,
+        const llama_tokens      & toks,
+        int                       p0,
+        int                       p1,
+        bool                      paged,
+        uint32_t                  block_size) {
+    if (!mt_tier || p1 <= p0) return 0;
+    const int hi = std::min<int>(p1, (int) toks.size());
+    if (hi <= p0) return 0;
+
+    if (!paged) {
+        llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
+        const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+        const auto emb = mt_tier->embed_text(text);
+        if (emb.empty()) return 0;
+        std::vector<llama_pos> positions;
+        positions.reserve(hi - p0);
+        for (int i = p0; i < hi; ++i) positions.push_back((llama_pos) i);
+        mt_tier->record_chunk_fingerprint(
+            std::move(positions), emb, mt::SemanticIndex::Tier::Warm);
+        return 1;
+    }
+
+    // Paged path: walk in block_size strides starting from a block-aligned
+    // floor. paged_backup is itself block-aligned so p0 should already be
+    // on a boundary, but rounding down keeps the lblock arithmetic clean
+    // even if a future caller passes an unaligned range.
+    const uint32_t bsize = block_size > 0 ? block_size : 16u;
+    const int aligned_p0 = (int)((uint32_t) p0 / bsize) * (int) bsize;
+    int n_recorded = 0;
+    for (int b = aligned_p0; b < hi; b += (int) bsize) {
+        const int chunk_hi = std::min(b + (int) bsize, hi);
+        if (chunk_hi <= b) continue;
+        llama_tokens chunk(toks.begin() + b, toks.begin() + chunk_hi);
+        const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+        const auto emb = mt_tier->embed_text(text);
+        if (emb.empty()) continue;
+        const uint32_t lblock = (uint32_t) b / bsize;
+        mt_tier->record_paged_block_fingerprint(
+            seq_id, lblock, emb, mt::SemanticIndex::Tier::Warm);
+        ++n_recorded;
+    }
+    return n_recorded;
+}
+
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
@@ -1557,23 +1615,22 @@ private:
                         // attention runs. Mirrors the context-shift-time
                         // fingerprinting; only fires when --kv-tier-semantic-index
                         // is set and the chunk isn't multimodal.
+                        //
+                        // MAD-122: under --kv-tier-paged-blocks the helper
+                        // emits one fingerprint per logical block instead of
+                        // one for the whole chunk, so query-time prefetch can
+                        // score at block granularity.
                         if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                             const auto & toks = slot.prompt.tokens.get_text_tokens();
-                            const int hi = std::min<int>(p1, (int) toks.size());
-                            if (hi > p0) {
-                                llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
-                                const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
-                                const auto emb = mt_tier->embed_text(text);
-                                if (!emb.empty()) {
-                                    std::vector<llama_pos> positions;
-                                    positions.reserve(hi - p0);
-                                    for (int i = p0; i < hi; ++i) positions.push_back((llama_pos) i);
-                                    mt_tier->record_chunk_fingerprint(
-                                        std::move(positions), emb,
-                                        mt::SemanticIndex::Tier::Warm);
-                                    SLT_INF(slot, "tier semantic: fingerprinted %d tokens [%d,%d) (%zu-dim) for proactive backup\n",
-                                            hi - p0, p0, hi, emb.size());
-                                }
+                            const int n_fp = mt_record_fingerprints_for_range(
+                                mt_tier, ctx, slot.id, toks, p0, p1,
+                                params_base.kv_tier_paged_blocks,
+                                (uint32_t) params_base.kv_tier_paged_block_size);
+                            if (n_fp > 0) {
+                                SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for proactive backup\n",
+                                        n_fp,
+                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk",
+                                        p0, p1);
                             }
                         }
                         // Advance to the requested range end, not the count
@@ -2419,20 +2476,16 @@ private:
                 if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
                     if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                         const auto & toks = slot.prompt.tokens.get_text_tokens();
-                        const int hi = std::min<int>(n_keep + n_discard, (int) toks.size());
-                        if (n_keep >= 0 && hi > n_keep) {
-                            llama_tokens chunk(toks.begin() + n_keep, toks.begin() + hi);
-                            const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
-                            const auto emb = mt_tier->embed_text(text);
-                            if (!emb.empty()) {
-                                std::vector<llama_pos> positions;
-                                positions.reserve(hi - n_keep);
-                                for (int i = n_keep; i < hi; ++i) positions.push_back((llama_pos) i);
-                                mt_tier->record_chunk_fingerprint(
-                                    std::move(positions), emb,
-                                    mt::SemanticIndex::Tier::Warm);
-                                SLT_INF(slot, "tier semantic: fingerprinted %d tokens (%zu-dim) for context shift\n",
-                                        hi - n_keep, emb.size());
+                        if (n_keep >= 0) {
+                            const int n_fp = mt_record_fingerprints_for_range(
+                                mt_tier, ctx, slot.id, toks, n_keep, n_keep + n_discard,
+                                params_base.kv_tier_paged_blocks,
+                                (uint32_t) params_base.kv_tier_paged_block_size);
+                            if (n_fp > 0) {
+                                SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for context shift\n",
+                                        n_fp,
+                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk",
+                                        n_keep, n_keep + n_discard);
                             }
                         }
                     }
@@ -2692,13 +2745,21 @@ private:
                                         const std::string qtext = common_detokenize(ctx, q, /*special=*/ false);
                                         const auto qemb = mt_tier->embed_text(qtext);
                                         if (!qemb.empty()) {
-                                            const uint32_t restored = mt_tier->restore_semantic(
-                                                slot.id, qemb,
-                                                params_base.kv_semantic_top_k,
-                                                params_base.kv_semantic_threshold);
+                                            // MAD-122: paged path uses block-keyed
+                                            // fingerprints, dispatch accordingly.
+                                            const uint32_t restored = params_base.kv_tier_paged_blocks
+                                                ? mt_tier->restore_semantic_paged(
+                                                      slot.id, qemb,
+                                                      params_base.kv_semantic_top_k,
+                                                      params_base.kv_semantic_threshold)
+                                                : mt_tier->restore_semantic(
+                                                      slot.id, qemb,
+                                                      params_base.kv_semantic_top_k,
+                                                      params_base.kv_semantic_threshold);
                                             if (restored > 0) {
-                                                SLT_INF(slot, "tier semantic: restored %u positions from warm via cosine search\n",
-                                                        restored);
+                                                SLT_INF(slot, "tier semantic: restored %u positions from warm via cosine search (%s path)\n",
+                                                        restored,
+                                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk");
                                             }
                                         }
                                     }
