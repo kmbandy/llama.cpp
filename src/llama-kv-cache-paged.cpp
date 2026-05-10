@@ -1141,6 +1141,7 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     // produced position drift between the cache and the slot manager.
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+    if (p1 <= p0) return true;  // empty range
 
     const llama_pos cur_max = seq_states_[seq_id].pos_max;
 
@@ -1161,36 +1162,78 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         return true;
     }
 
-    // Partial wipe: tail truncation only for v1 (carving out middle
-    // ranges requires more bookkeeping; rare in practice).
-    if (p0 > cur_max) return true;  // nothing to do
-    // Middle wipes (p1 < cur_max+1 with p0 > 0) aren't supported in v1.
-    // The server uses these for partial speculative-decode rollback;
-    // until we add support, treat as tail truncation from p0 (drops
-    // some valid positions but doesn't crash).
-    GGML_UNUSED(p1);
+    if (p0 > cur_max) return true;  // nothing in range
 
-    // Compute new pos_max after truncation.
-    const llama_pos new_max = p0 - 1;
+    // MAD-128: block-aligned partial wipe. Handles both tail truncate
+    // (p1 > cur_max) and middle wipe (p1 <= cur_max) uniformly.
+    //
+    // For each block whose [b_start, b_end) intersects [p0, p1):
+    //   - Wholly covered (p0 <= b_start AND p1 >= b_end): free the
+    //     physical, mark table entry as kInvalidBlockId, drop fingerprint.
+    //     The mt_paged_attention_kernel handles invalid entries by
+    //     contributing -INFINITY to attention logits → zero weight after
+    //     softmax → no contribution. So freed blocks read as "no
+    //     attention," not as garbage.
+    //   - Partially overlapped (p0 inside the block OR p1 inside the
+    //     block): leave the block alone. The unwiped slots within keep
+    //     stale K/V that the kernel WILL read. Caller should round their
+    //     range to block boundaries for clean wipes; we log a clear
+    //     warning so sub-block partial wipes don't silently corrupt.
+    //
+    // Sub-block per-slot zeroing requires either a per-block valid-bitmask
+    // consulted by the kernel mask, or a layout-aware per-slot zero
+    // primitive. Both are deferred (separate ticket if a real consumer
+    // needs sub-block precision).
+    const llama_pos p1_clamped = std::min(p1, (llama_pos)(cur_max + 1));
+    const uint32_t bsize = block_size_;
+    const uint32_t n_blocks_seq = table_.num_blocks(seq_id);
 
-    // Drop blocks whose entire range is past p0.
-    const uint32_t keep_blocks = (uint32_t)(new_max + 1 + (llama_pos) block_size_ - 1) / block_size_;
-    if (keep_blocks > table_.num_blocks(seq_id)) return true;  // nothing to drop
+    uint32_t blocks_freed           = 0;
+    uint32_t blocks_partial_skipped = 0;
 
-    // Walk blocks past keep_blocks and free.
-    while (table_.num_blocks(seq_id) > keep_blocks) {
-        std::vector<uint32_t> tmp = table_.clear_seq(seq_id);  // CAUTION: clears all
-        // Re-append the kept ones.
-        for (uint32_t i = 0; i < keep_blocks && i < tmp.size(); ++i) {
-            table_.append_block(seq_id, tmp[i]);
+    for (uint32_t lblock = 0; lblock < n_blocks_seq; ++lblock) {
+        const llama_pos b_start = (llama_pos) lblock * (llama_pos) bsize;
+        const llama_pos b_end   = b_start + (llama_pos) bsize;
+
+        if (b_end <= p0 || b_start >= p1_clamped) continue;  // no overlap
+
+        const bool wholly_covered = (p0 <= b_start) && (p1_clamped >= b_end);
+        if (wholly_covered) {
+            const uint32_t physical = table_.get_physical(seq_id, lblock);
+            if (physical != mt::kInvalidBlockId) {
+                pool_.free_block(physical);
+                table_.swap_block(seq_id, lblock, mt::kInvalidBlockId);
+                paged_semantic_.remove_block(seq_id, lblock);
+                ++blocks_freed;
+            }
+        } else {
+            ++blocks_partial_skipped;
         }
-        for (uint32_t i = keep_blocks; i < tmp.size(); ++i) {
-            if (tmp[i] != mt::kInvalidBlockId) pool_.free_block(tmp[i]);
-        }
-        break;
     }
 
-    seq_states_[seq_id].pos_max = new_max;
+    if (blocks_partial_skipped > 0) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged::seq_rm: range [%d,%d) is not "
+                       "block-aligned (block_size=%u). %u block(s) wholly "
+                       "freed; %u block(s) partially overlapped — those keep "
+                       "stale K/V in the unwiped slots and the kernel will "
+                       "attend to them. Round caller's range to block "
+                       "boundaries for clean wipes.\n",
+                       p0, p1, bsize, blocks_freed, blocks_partial_skipped);
+    }
+
+    // Update pos_max iff the wipe touches the tail (p1 covers past cur_max).
+    // For middle wipes (p1_clamped <= cur_max), pos_max stays put — holes
+    // in the block table represent the wiped middle. For tail truncate,
+    // shrink pos_max to the position just before the wipe started.
+    if (p1 > cur_max) {
+        seq_states_[seq_id].pos_max = (llama_pos)(p0 - 1);
+        if (seq_states_[seq_id].pos_max < 0) seq_states_[seq_id].pos_min = -1;
+    }
+
+    LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_rm: seq=%d range=[%d,%d) "
+                    "blocks_freed=%u blocks_partial=%u pos_max=%d\n",
+                    seq_id, p0, p1, blocks_freed, blocks_partial_skipped,
+                    seq_states_[seq_id].pos_max);
     return true;
 }
 
