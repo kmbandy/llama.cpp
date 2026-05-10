@@ -5,7 +5,10 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-hparams.h"
+#include "ggml.h"
 #include "ggml-backend.h"
+
+#include "memory-tier/mt-quant.h"
 
 #include <cassert>
 #include <cstring>
@@ -963,6 +966,27 @@ bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lbl
     std::vector<uint8_t> kbuf(k_bytes_per_block_);
     std::vector<uint8_t> vbuf(v_bytes_per_block_);
 
+    // MAD-135: int4 cold compression for F16 caches. Compressed slot
+    // layout: [4 bytes scale_f32][ceil(n/2) bytes packed int4]. The
+    // cold file slot is sized for raw bytes, so the compressed payload
+    // fits comfortably (4× smaller than F16). For Q8_0 / turbo4 the
+    // bytes are already byte-quantized at the cache layer; raw cold
+    // copy is correct + smaller than int4-on-quant would be.
+    const bool compress_k = (type_k_ == GGML_TYPE_F16);
+    const bool compress_v = (type_v_ == GGML_TYPE_F16);
+    std::vector<float> tmp_k_f32, tmp_v_f32;
+    std::vector<uint8_t> tmp_k_q4, tmp_v_q4;
+    if (compress_k) {
+        const size_t n_k = k_bytes_per_block_ / sizeof(uint16_t);  // F16 element count
+        tmp_k_f32.resize(n_k);
+        tmp_k_q4.resize(sizeof(float) + (n_k + 1) / 2);  // [scale][packed]
+    }
+    if (compress_v) {
+        const size_t n_v = v_bytes_per_block_ / sizeof(uint16_t);
+        tmp_v_f32.resize(n_v);
+        tmp_v_q4.resize(sizeof(float) + (n_v + 1) / 2);
+    }
+
     for (uint32_t il = 0; il < layers_.size(); ++il) {
         const auto & layer = layers_[il];
         if (!layer.k) continue;
@@ -979,9 +1003,41 @@ bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lbl
             std::memcpy(vbuf.data(), warm_v_[il].data() + v_off, v_bytes_per_block_);
         }
 
-        const ssize_t wk = ::pwrite(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
-        const ssize_t wv = ::pwrite(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
-        if (wk != (ssize_t) k_bytes_per_block_ || wv != (ssize_t) v_bytes_per_block_) {
+        // ── K write (compressed or raw) ──
+        ssize_t wk;
+        if (compress_k) {
+            const size_t n_k = tmp_k_f32.size();
+            const ggml_fp16_t * src_f16 = reinterpret_cast<const ggml_fp16_t *>(kbuf.data());
+            for (size_t i = 0; i < n_k; ++i) tmp_k_f32[i] = ggml_fp16_to_fp32(src_f16[i]);
+            float scale = 0.0f;
+            mt::quantize_block_int4_with_scale(tmp_k_f32.data(), n_k, &scale,
+                                               tmp_k_q4.data() + sizeof(float));
+            std::memcpy(tmp_k_q4.data(), &scale, sizeof(float));
+            wk = ::pwrite(cold_fd_k_[il], tmp_k_q4.data(), tmp_k_q4.size(), k_off_cold);
+            if (wk != (ssize_t) tmp_k_q4.size()) wk = -1;
+        } else {
+            wk = ::pwrite(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
+            if (wk != (ssize_t) k_bytes_per_block_) wk = -1;
+        }
+
+        // ── V write (compressed or raw) ──
+        ssize_t wv;
+        if (compress_v) {
+            const size_t n_v = tmp_v_f32.size();
+            const ggml_fp16_t * src_f16 = reinterpret_cast<const ggml_fp16_t *>(vbuf.data());
+            for (size_t i = 0; i < n_v; ++i) tmp_v_f32[i] = ggml_fp16_to_fp32(src_f16[i]);
+            float scale = 0.0f;
+            mt::quantize_block_int4_with_scale(tmp_v_f32.data(), n_v, &scale,
+                                               tmp_v_q4.data() + sizeof(float));
+            std::memcpy(tmp_v_q4.data(), &scale, sizeof(float));
+            wv = ::pwrite(cold_fd_v_[il], tmp_v_q4.data(), tmp_v_q4.size(), v_off_cold);
+            if (wv != (ssize_t) tmp_v_q4.size()) wv = -1;
+        } else {
+            wv = ::pwrite(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
+            if (wv != (ssize_t) v_bytes_per_block_) wv = -1;
+        }
+
+        if (wk < 0 || wv < 0) {
             LLAMA_LOG_WARN("evict_block_to_cold: pwrite failed at layer=%u cold_idx=%u (wk=%zd wv=%zd)\n",
                            il, cold_idx, wk, wv);
             return false;
@@ -1013,17 +1069,77 @@ bool llama_kv_cache_paged::restore_block_from_cold(llama_seq_id seq_id, uint32_t
     std::vector<uint8_t> kbuf(k_bytes_per_block_);
     std::vector<uint8_t> vbuf(v_bytes_per_block_);
 
+    // MAD-135: dispatch on cache type for cold compression. Symmetric
+    // with evict_block_to_cold's compression policy.
+    const bool decompress_k = (type_k_ == GGML_TYPE_F16);
+    const bool decompress_v = (type_v_ == GGML_TYPE_F16);
+    std::vector<float> tmp_k_f32, tmp_v_f32;
+    std::vector<uint8_t> tmp_k_q4, tmp_v_q4;
+    if (decompress_k) {
+        const size_t n_k = k_bytes_per_block_ / sizeof(uint16_t);
+        tmp_k_f32.resize(n_k);
+        tmp_k_q4.resize(sizeof(float) + (n_k + 1) / 2);
+    }
+    if (decompress_v) {
+        const size_t n_v = v_bytes_per_block_ / sizeof(uint16_t);
+        tmp_v_f32.resize(n_v);
+        tmp_v_q4.resize(sizeof(float) + (n_v + 1) / 2);
+    }
+
     for (uint32_t il = 0; il < layers_.size(); ++il) {
         const auto & layer = layers_[il];
         if (!layer.k) continue;
 
-        const ssize_t rk = ::pread(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
-        const ssize_t rv = ::pread(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
-        if (rk != (ssize_t) k_bytes_per_block_ || rv != (ssize_t) v_bytes_per_block_) {
-            LLAMA_LOG_WARN("restore_block_from_cold: pread short at layer=%u cold_idx=%u (rk=%zd rv=%zd)\n",
-                           il, cold_idx, rk, rv);
-            pool_.free_block(gpu_phys);
-            return false;
+        // ── K read + decompress ──
+        if (decompress_k) {
+            const ssize_t rk = ::pread(cold_fd_k_[il], tmp_k_q4.data(), tmp_k_q4.size(), k_off_cold);
+            if (rk != (ssize_t) tmp_k_q4.size()) {
+                LLAMA_LOG_WARN("restore_block_from_cold: pread short K at layer=%u cold_idx=%u (rk=%zd)\n",
+                               il, cold_idx, rk);
+                pool_.free_block(gpu_phys);
+                return false;
+            }
+            float scale = 0.0f;
+            std::memcpy(&scale, tmp_k_q4.data(), sizeof(float));
+            const size_t n_k = tmp_k_f32.size();
+            mt::dequantize_block_int4_with_scale(tmp_k_q4.data() + sizeof(float), scale,
+                                                  tmp_k_f32.data(), n_k);
+            ggml_fp16_t * dst_f16 = reinterpret_cast<ggml_fp16_t *>(kbuf.data());
+            for (size_t i = 0; i < n_k; ++i) dst_f16[i] = ggml_fp32_to_fp16(tmp_k_f32[i]);
+        } else {
+            const ssize_t rk = ::pread(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
+            if (rk != (ssize_t) k_bytes_per_block_) {
+                LLAMA_LOG_WARN("restore_block_from_cold: pread short K at layer=%u cold_idx=%u (rk=%zd)\n",
+                               il, cold_idx, rk);
+                pool_.free_block(gpu_phys);
+                return false;
+            }
+        }
+
+        // ── V read + decompress ──
+        if (decompress_v) {
+            const ssize_t rv = ::pread(cold_fd_v_[il], tmp_v_q4.data(), tmp_v_q4.size(), v_off_cold);
+            if (rv != (ssize_t) tmp_v_q4.size()) {
+                LLAMA_LOG_WARN("restore_block_from_cold: pread short V at layer=%u cold_idx=%u (rv=%zd)\n",
+                               il, cold_idx, rv);
+                pool_.free_block(gpu_phys);
+                return false;
+            }
+            float scale = 0.0f;
+            std::memcpy(&scale, tmp_v_q4.data(), sizeof(float));
+            const size_t n_v = tmp_v_f32.size();
+            mt::dequantize_block_int4_with_scale(tmp_v_q4.data() + sizeof(float), scale,
+                                                  tmp_v_f32.data(), n_v);
+            ggml_fp16_t * dst_f16 = reinterpret_cast<ggml_fp16_t *>(vbuf.data());
+            for (size_t i = 0; i < n_v; ++i) dst_f16[i] = ggml_fp32_to_fp16(tmp_v_f32[i]);
+        } else {
+            const ssize_t rv = ::pread(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
+            if (rv != (ssize_t) v_bytes_per_block_) {
+                LLAMA_LOG_WARN("restore_block_from_cold: pread short V at layer=%u cold_idx=%u (rv=%zd)\n",
+                               il, cold_idx, rv);
+                pool_.free_block(gpu_phys);
+                return false;
+            }
         }
 
         const size_t k_off = (size_t) gpu_phys * k_bytes_per_block_;

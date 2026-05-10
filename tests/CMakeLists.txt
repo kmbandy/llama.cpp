@@ -265,6 +265,9 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
+# MAD-135: mt:: int4 quant round-trip tests
+llama_build_and_test(test-mt-quant.cpp)
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
