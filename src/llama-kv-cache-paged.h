@@ -41,6 +41,7 @@
 
 #include "memory-tier/mt-block-pool.h"
 #include "memory-tier/mt-block-table.h"
+#include "memory-tier/mt-semantic.h"
 
 #include <functional>
 #include <string>
@@ -255,6 +256,38 @@ public:
     uint32_t n_cold_blocks() const { return n_cold_blocks_; }
     bool     cold_enabled()  const { return n_cold_blocks_ > 0; }
 
+    // ─── MAD-125: BGE-small semantic prefetch ───
+    //
+    // The cache holds an optional per-(seq, lblock) fingerprint store.
+    // Server populates it at backup time (one BGE embedding per block);
+    // at prefill arrival the server queries restore_semantic_paged with
+    // a query embedding, and this method scores against the fingerprints,
+    // picks the top-K matches above a cosine threshold, and faults each
+    // matching block back from warm/cold to hot before kernel dispatch.
+    //
+    // Lifecycle: fingerprints follow blocks. Whole-seq wipe (clear,
+    // seq_rm with full range) drops them; per-seq removal happens
+    // automatically. No FIFO cap — memory grows with active context.
+
+    // Record the fingerprint for one paged block. embedding should be
+    // L2-normalized; tier annotates current location (informational).
+    void record_paged_block_fingerprint(llama_seq_id        seq_id,
+                                         uint32_t            lblock,
+                                         std::vector<float>  embedding,
+                                         mt::SemanticIndex::Tier tier);
+
+    // Score the seq's paged-block fingerprints against query_embedding,
+    // restore the top-K above threshold from warm (and cold as fallback)
+    // back to hot. Returns the count of blocks actually restored. Logs
+    // hit-rate (restored / requested) for MAD-122 acceptance criterion.
+    uint32_t restore_semantic_paged(llama_seq_id              seq_id,
+                                     const std::vector<float> & query_embedding,
+                                     int                        top_k     = 5,
+                                     float                      threshold = 0.65f);
+
+    // Diagnostic: how many fingerprints currently held.
+    size_t n_paged_fingerprints() const { return paged_semantic_.size(); }
+
 private:
     friend class llama_kv_cache_paged_context;
 
@@ -344,8 +377,9 @@ private:
 
     // Block-table machinery (independent from mt::, since this owns the
     // cache outright). Single-pool: GPU only for v1.
-    mt::BlockPool   pool_;
-    mt::BlockTable  table_;
+    mt::BlockPool          pool_;
+    mt::BlockTable         table_;
+    mt::BlockSemanticIndex paged_semantic_;  // MAD-125
 
     // Per-seq position tracking.
     std::vector<seq_state> seq_states_;

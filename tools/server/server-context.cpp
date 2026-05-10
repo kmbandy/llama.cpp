@@ -7,6 +7,8 @@
 #include "server-queue.h"
 #include "server-tiered-cache.h"
 #include "../src/llama-model.h"
+#include "../src/llama-kv-cache-paged.h"
+#include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
 
 #include "build-info.h"
@@ -40,30 +42,51 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// MAD-122: write fingerprints for the token range [p0, p1). When the
-// paged-blocks path is on we emit one fingerprint per logical block so
-// query-time semantic prefetch can score at block granularity (matching
-// what BlockSemanticIndex stores). Otherwise we keep the legacy chunk-
-// level fingerprint (one embedding for the whole range, position-keyed).
+// MAD-125: walk the active memory pointer chain and return the
+// llama_kv_cache_paged at the bottom (if any). Three nestings to cover:
+//   - paged is the raw active memory (rare standalone test case)
+//   - paged is the attention member of llama_memory_hybrid (hybrid models)
+//   - llama_memory_hybrid is wrapped by mt::llama_memory_tiered (the
+//     tiered + paged + hybrid stack — Qwen3.x family with --kv-tiered
+//     and --kv-tier-paged-blocks).
+// Returns nullptr when the active memory isn't running paged-blocks.
+static llama_kv_cache_paged * mt_get_paged_cache(llama_memory_i * mem) {
+    if (!mem) return nullptr;
+    if (auto * p = dynamic_cast<llama_kv_cache_paged *>(mem)) return p;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))  return h->get_mem_attn_paged();
+    if (auto * t = dynamic_cast<mt::llama_memory_tiered *>(mem)) {
+        return mt_get_paged_cache(t->inner_for_test());
+    }
+    return nullptr;
+}
+
+// MAD-122/125: write fingerprints for the token range [p0, p1). When a
+// paged_cache is supplied we emit one BGE-small embedding per logical
+// block via llama_kv_cache_paged::record_paged_block_fingerprint so
+// query-time semantic prefetch can score at block granularity. When
+// paged_cache is null we fall back to the legacy chunk-level path
+// (one embedding for the whole range, position-keyed) on the tier
+// wrapper — the dispatch happens at the call site so this function
+// stays a single helper.
 //
-// Returns the number of fingerprints actually recorded so the caller can
-// log a meaningful "fingerprinted N items" line; an empty return means
-// either p1<=p0, the embedding model wasn't ready, or every per-block
-// embed call returned empty.
+// mt_tier is required either way: it owns the embed_text / bge-small
+// model. paged_cache is the destination; null = legacy path.
+//
+// Returns the number of fingerprints actually recorded.
 static int mt_record_fingerprints_for_range(
         mt::llama_memory_tiered * mt_tier,
+        llama_kv_cache_paged    * paged_cache,
         llama_context           * ctx,
         llama_seq_id              seq_id,
         const llama_tokens      & toks,
         int                       p0,
         int                       p1,
-        bool                      paged,
         uint32_t                  block_size) {
     if (!mt_tier || p1 <= p0) return 0;
     const int hi = std::min<int>(p1, (int) toks.size());
     if (hi <= p0) return 0;
 
-    if (!paged) {
+    if (!paged_cache) {
         llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
         const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
         const auto emb = mt_tier->embed_text(text);
@@ -91,7 +114,7 @@ static int mt_record_fingerprints_for_range(
         const auto emb = mt_tier->embed_text(text);
         if (emb.empty()) continue;
         const uint32_t lblock = (uint32_t) b / bsize;
-        mt_tier->record_paged_block_fingerprint(
+        paged_cache->record_paged_block_fingerprint(
             seq_id, lblock, emb, mt::SemanticIndex::Tier::Warm);
         ++n_recorded;
     }
@@ -1622,14 +1645,15 @@ private:
                         // score at block granularity.
                         if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                             const auto & toks = slot.prompt.tokens.get_text_tokens();
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
                             const int n_fp = mt_record_fingerprints_for_range(
-                                mt_tier, ctx, slot.id, toks, p0, p1,
-                                params_base.kv_tier_paged_blocks,
+                                mt_tier, paged_cache, ctx, slot.id, toks, p0, p1,
                                 (uint32_t) params_base.kv_tier_paged_block_size);
                             if (n_fp > 0) {
                                 SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for proactive backup\n",
                                         n_fp,
-                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk",
+                                        paged_cache ? "paged-block" : "chunk",
                                         p0, p1);
                             }
                         }
@@ -2477,14 +2501,15 @@ private:
                     if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                         const auto & toks = slot.prompt.tokens.get_text_tokens();
                         if (n_keep >= 0) {
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
                             const int n_fp = mt_record_fingerprints_for_range(
-                                mt_tier, ctx, slot.id, toks, n_keep, n_keep + n_discard,
-                                params_base.kv_tier_paged_blocks,
+                                mt_tier, paged_cache, ctx, slot.id, toks, n_keep, n_keep + n_discard,
                                 (uint32_t) params_base.kv_tier_paged_block_size);
                             if (n_fp > 0) {
                                 SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for context shift\n",
                                         n_fp,
-                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk",
+                                        paged_cache ? "paged-block" : "chunk",
                                         n_keep, n_keep + n_discard);
                             }
                         }
@@ -2745,10 +2770,14 @@ private:
                                         const std::string qtext = common_detokenize(ctx, q, /*special=*/ false);
                                         const auto qemb = mt_tier->embed_text(qtext);
                                         if (!qemb.empty()) {
-                                            // MAD-122: paged path uses block-keyed
-                                            // fingerprints, dispatch accordingly.
-                                            const uint32_t restored = params_base.kv_tier_paged_blocks
-                                                ? mt_tier->restore_semantic_paged(
+                                            // MAD-122/125: paged-blocks routes through
+                                            // llama_kv_cache_paged (the active tier
+                                            // layer for hybrid+paged). Non-paged falls
+                                            // back to the chunk-level wrapper path.
+                                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                                            const uint32_t restored = paged_cache
+                                                ? paged_cache->restore_semantic_paged(
                                                       slot.id, qemb,
                                                       params_base.kv_semantic_top_k,
                                                       params_base.kv_semantic_threshold)
@@ -2757,9 +2786,9 @@ private:
                                                       params_base.kv_semantic_top_k,
                                                       params_base.kv_semantic_threshold);
                                             if (restored > 0) {
-                                                SLT_INF(slot, "tier semantic: restored %u positions from warm via cosine search (%s path)\n",
+                                                SLT_INF(slot, "tier semantic: restored %u positions/blocks via cosine search (%s path)\n",
                                                         restored,
-                                                        params_base.kv_tier_paged_blocks ? "paged-block" : "chunk");
+                                                        paged_cache ? "paged-block" : "chunk");
                                             }
                                         }
                                     }

@@ -776,6 +776,64 @@ bool llama_kv_cache_paged::restore_block_from_cold(llama_seq_id seq_id, uint32_t
     return true;
 }
 
+// MAD-125: BGE-small semantic prefetch — record + restore.
+
+void llama_kv_cache_paged::record_paged_block_fingerprint(
+        llama_seq_id            seq_id,
+        uint32_t                lblock,
+        std::vector<float>      embedding,
+        mt::SemanticIndex::Tier tier) {
+    paged_semantic_.add_fingerprint(seq_id, lblock, std::move(embedding), tier);
+}
+
+uint32_t llama_kv_cache_paged::restore_semantic_paged(
+        llama_seq_id              seq_id,
+        const std::vector<float> & query_embedding,
+        int                        top_k,
+        float                      threshold) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
+
+    auto hints = paged_semantic_.score(seq_id, query_embedding, top_k, threshold);
+    if (hints.empty()) return 0;
+
+    uint32_t restored      = 0;
+    uint32_t requested     = 0;
+    uint32_t already_hot   = 0;
+    uint32_t unmapped      = 0;
+    uint32_t restore_fail  = 0;
+
+    for (const auto & h : hints) {
+        ++requested;
+        if (h.lblock >= table_.num_blocks(seq_id)) { ++unmapped; continue; }
+        const uint32_t phys = table_.get_physical(seq_id, h.lblock);
+        if (phys == mt::kInvalidBlockId) { ++unmapped; continue; }
+
+        if (pool_.is_gpu(phys)) { ++already_hot; continue; }
+
+        // Try warm first; if warm restore fails (e.g. block is in cold)
+        // fall back to cold restore. Both are no-ops if the tier isn't
+        // configured.
+        bool ok = warm_enabled() && restore_block_from_warm(seq_id, h.lblock);
+        if (!ok && cold_enabled()) {
+            ok = restore_block_from_cold(seq_id, h.lblock);
+        }
+        if (ok) ++restored;
+        else    ++restore_fail;
+    }
+
+    // MAD-122 acceptance criterion #5: hit-rate logging. The
+    // restored/requested ratio is the prefetch-effectiveness signal.
+    LLAMA_LOG_INFO("llama_kv_cache_paged::restore_semantic_paged: seq %d — %zu hints "
+                   "(top_k=%d, threshold=%.2f), restored %u/%u "
+                   "(hit-rate %.0f%%, %u already hot, %u unmapped, %u failed)\n",
+                   seq_id, hints.size(), top_k, threshold,
+                   restored, requested,
+                   requested == 0 ? 0.0f : 100.0f * (float) restored / (float) requested,
+                   already_hot, unmapped, restore_fail);
+
+    return restored;
+}
+
 bool llama_kv_cache_paged::evict_lru_warm_to_cold() {
     if (!cold_enabled() || cold_pool_free_.empty()) return false;
 
@@ -1067,6 +1125,7 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
     }
     pool_.reset();
     table_.reset();
+    paged_semantic_.clear();  // MAD-125: drop all per-seq fingerprints
     std::fill(h_block_table_.begin(), h_block_table_.end(), kInvalidBlockTableEntry);
     std::fill(h_context_lens_.begin(), h_context_lens_.end(), 0);
     std::fill(h_q_lens_.begin(), h_q_lens_.end(), 0);
@@ -1092,8 +1151,13 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
             if (bid != mt::kInvalidBlockId) pool_.free_block(bid);
         }
         seq_states_[seq_id] = seq_state{};
-        LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_rm: whole-seq wipe seq=%d, freed %zu blocks\n",
-                        seq_id, freed.size());
+        // MAD-125: fingerprints from the prior task can't match the new
+        // one's K/V — wipe them so semantic restore doesn't fault in stale
+        // blocks. Mirrors the wrapper's whole-seq-wipe behavior.
+        const size_t n_finger = paged_semantic_.size(seq_id);
+        paged_semantic_.remove_seq(seq_id);
+        LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_rm: whole-seq wipe seq=%d, freed %zu blocks, dropped %zu paged-block fingerprints\n",
+                        seq_id, freed.size(), n_finger);
         return true;
     }
 
