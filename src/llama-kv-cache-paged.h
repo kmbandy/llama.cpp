@@ -282,6 +282,16 @@ public:
                                    std::vector<llama_ubatch>       ubatches,
                                    llama_memory_status              status = LLAMA_MEMORY_STATUS_SUCCESS);
 
+    // MAD-124: success-path ctor that takes per-ubatch q_lens / context_lens
+    // snapshots so apply() can install the right values before each ubatch's
+    // graph runs. The two snapshot vectors must each have ubatches.size()
+    // entries, indexed by ubatch order.
+    llama_kv_cache_paged_context(llama_kv_cache_paged *               parent,
+                                   std::vector<llama_ubatch>           ubatches,
+                                   std::vector<std::vector<int32_t>>   q_lens_per_ubatch,
+                                   std::vector<std::vector<int32_t>>   context_lens_per_ubatch,
+                                   llama_memory_status                 status = LLAMA_MEMORY_STATUS_SUCCESS);
+
     bool                 next() override;
     bool                 apply() override;
     const llama_ubatch & get_ubatch() const override;
@@ -295,6 +305,15 @@ public:
 private:
     llama_kv_cache_paged *    parent_;
     std::vector<llama_ubatch> ubatches_;
+    // MAD-124: per-ubatch q_lens / context_lens snapshots. apply() copies
+    // q_lens_per_ubatch_[i_ubatch_] / context_lens_per_ubatch_[i_ubatch_]
+    // into parent_->h_q_lens_ / h_context_lens_ before each ubatch's graph
+    // runs, so set_input uploads the right per-ubatch values. Without this,
+    // h_q_lens_ ends up holding only the LAST ubatch's counts after
+    // init_batch's eager loop, and earlier ubatches' graphs read stale
+    // q_lens — corrupting multi-seq prefill that splits across ubatches.
+    std::vector<std::vector<int32_t>> q_lens_per_ubatch_;
+    std::vector<std::vector<int32_t>> context_lens_per_ubatch_;
     size_t                    i_ubatch_ = 0;
     llama_memory_status       status_;
 };

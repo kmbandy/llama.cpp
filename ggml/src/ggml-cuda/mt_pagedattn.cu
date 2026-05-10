@@ -292,8 +292,11 @@ __global__ void mt_scatter_kv_kernel(
     constexpr int VEC_PER_THREAD = (HEAD_SIZE + NUM_THREADS - 1) / NUM_THREADS;
 
     const int q_len = q_lens[seq_idx];
-    const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
-    GGML_UNUSED(seq_idx);            // multi-seq offset accounting is a follow-up
+    // Per-seq offset into the packed Q/K_cur/V_cur tensor: ne[2] axis is
+    // sum(q_lens) with seq tokens concatenated in seq_id order. seq_idx s
+    // starts at sum of q_lens[0..s-1].
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) seq_q_offset += (size_t) q_lens[s];
 
     for (int t = 0; t < q_len; ++t) {
         const int global_token_idx = (int)(seq_q_offset + t);
@@ -353,8 +356,9 @@ __global__ void mt_scatter_kv_q8_0_kernel(
     block_q8_0 * v_blocks = (block_q8_0 *) v_cache;
 
     const int q_len = q_lens[seq_idx];
-    const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
-    GGML_UNUSED(seq_idx);
+    // Per-seq offset into the packed K_cur/V_cur tensor (see mt_scatter_kv_kernel).
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) seq_q_offset += (size_t) q_lens[s];
 
     for (int t = 0; t < q_len; ++t) {
         const int global_token_idx = (int)(seq_q_offset + t);
@@ -673,6 +677,13 @@ __global__ void mt_paged_attention_kernel(
     const int ctx_len_after_q   = context_lens[seq_idx];   // total tokens in seq's context AFTER this batch's Q is applied
     const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
 
+    // Per-seq offset into packed Q / K_cur / V_cur / slot_mapping / out:
+    // ne[2] axis (== n_tokens_total) holds tokens for all seqs concatenated
+    // in seq_id order. seq_idx s starts at sum of q_lens[0..s-1]. Used by
+    // both Phase 1 (scatter, when DO_SCATTER) and Phase 2 (Q load, output write).
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) seq_q_offset += (size_t) q_lens[s];
+
     // ── Phase 1: scatter K_cur/V_cur into the K/V cache (fused) ──
     //
     // MAD-114: the previous design had scatter and attn as SEPARATE kernels,
@@ -694,8 +705,6 @@ __global__ void mt_paged_attention_kernel(
     // When DO_SCATTER=false, scatter has already been done by a separate
     // kernel launched on the same stream — Phase 1 here is elided.
     if constexpr (DO_SCATTER) {
-        const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
-
         for (int t = 0; t < q_len; ++t) {
             const int global_token_idx = (int)(seq_q_offset + t);
             const int slot = slot_mapping[global_token_idx];
@@ -741,15 +750,11 @@ __global__ void mt_paged_attention_kernel(
 
         // Load Q slice into registers, scale-applied.
         // Q layout matches ggml's natural [head_dim, n_heads, n_tokens]
-        // (head_dim fastest, n_tokens slowest in memory). For seq 0,
-        // head H, query token Q, dim D:
-        //   offset = (Q * n_heads + H) * HEAD_SIZE + D
-        // (Multi-seq batches concat sequentially in the n_tokens axis;
-        // qi here is the local-to-this-seq index, so we add the seq's
-        // start offset = sum of preceding q_lens. v1 single-seq path
-        // has seq_q_offset == 0.)
+        // (head_dim fastest, n_tokens slowest in memory). Multi-seq
+        // batches concat sequentially in the n_tokens axis; qi is the
+        // local-to-this-seq index, so the global token index is
+        // seq_q_offset + qi (computed once at the top of the kernel).
         scalar_t q_reg[VEC_PER_THREAD];
-        const size_t seq_q_offset = 0;  // v1: single-seq batches start at 0
 #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * NUM_THREADS;
@@ -760,7 +765,6 @@ __global__ void mt_paged_attention_kernel(
                 q_reg[v] = scalar_t(0);
             }
         }
-        GGML_UNUSED(seq_idx);  // multi-seq offset accounting is a follow-up
 
         // ── Chunked online-softmax (FlashAttention-style) ──
         //

@@ -575,6 +575,7 @@ bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
         if (pos > max_pos_per_seq[seq_id]) max_pos_per_seq[seq_id] = pos;
     }
 
+
     // Allocate blocks per-seq sized to the max position written. Note: we
     // don't use ensure_blocks_for's "pos_max + n_new" arithmetic here
     // because in multi-seq prefill the positions in `pos[]` are absolute
@@ -621,19 +622,34 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(
         return std::make_unique<llama_kv_cache_paged_context>(
             this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_NO_UPDATE);
     }
-    // Reset q_lens between batches; the final state reflects the LAST
-    // ubatch's per-seq query distribution (matches what the graph dispatch
-    // consumes).
     std::fill(h_q_lens_.begin(), h_q_lens_.end(), 0);
+
+    // MAD-124: capture per-ubatch snapshots of (q_lens, context_lens) right
+    // after each apply_ubatch_to_state, so the per-graph paged_q_lens /
+    // paged_context_lens tensors can be uploaded with the correct values
+    // for THIS ubatch (instead of the eager loop's final-state leakage).
+    std::vector<std::vector<int32_t>> q_lens_snap;
+    std::vector<std::vector<int32_t>> ctx_lens_snap;
+    q_lens_snap.reserve(ubatches.size());
+    ctx_lens_snap.reserve(ubatches.size());
+
     for (const auto & ub : ubatches) {
         if (!apply_ubatch_to_state(ub)) {
             return std::make_unique<llama_kv_cache_paged_context>(
                 this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
+        q_lens_snap.emplace_back(h_q_lens_.begin(), h_q_lens_.end());
+        std::vector<int32_t> cl(n_seq_max_);
+        for (uint32_t s = 0; s < n_seq_max_; ++s) {
+            cl[s] = (int32_t) std::max<llama_pos>(0, seq_states_[s].pos_max + 1);
+        }
+        ctx_lens_snap.push_back(std::move(cl));
     }
     prepare_batch_tensors();
     return std::make_unique<llama_kv_cache_paged_context>(
-        this, std::move(ubatches), LLAMA_MEMORY_STATUS_SUCCESS);
+        this, std::move(ubatches),
+        std::move(q_lens_snap), std::move(ctx_lens_snap),
+        LLAMA_MEMORY_STATUS_SUCCESS);
 }
 
 llama_memory_context_ptr llama_kv_cache_paged::init_batch(
@@ -655,17 +671,32 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(
     }
 
     std::fill(h_q_lens_.begin(), h_q_lens_.end(), 0);
+
+    // MAD-124: per-ubatch snapshots; see init_batch_with_ubatches.
+    std::vector<std::vector<int32_t>> q_lens_snap;
+    std::vector<std::vector<int32_t>> ctx_lens_snap;
+    q_lens_snap.reserve(ubatches.size());
+    ctx_lens_snap.reserve(ubatches.size());
+
     for (const auto & ub : ubatches) {
         if (!apply_ubatch_to_state(ub)) {
             return std::make_unique<llama_kv_cache_paged_context>(
                 this, std::vector<llama_ubatch>{}, LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
+        q_lens_snap.emplace_back(h_q_lens_.begin(), h_q_lens_.end());
+        std::vector<int32_t> cl(n_seq_max_);
+        for (uint32_t s = 0; s < n_seq_max_; ++s) {
+            cl[s] = (int32_t) std::max<llama_pos>(0, seq_states_[s].pos_max + 1);
+        }
+        ctx_lens_snap.push_back(std::move(cl));
     }
 
     prepare_batch_tensors();
 
     return std::make_unique<llama_kv_cache_paged_context>(
-        this, std::move(ubatches), LLAMA_MEMORY_STATUS_SUCCESS);
+        this, std::move(ubatches),
+        std::move(q_lens_snap), std::move(ctx_lens_snap),
+        LLAMA_MEMORY_STATUS_SUCCESS);
 }
 
 llama_memory_context_ptr llama_kv_cache_paged::init_full() {
@@ -814,15 +845,38 @@ llama_kv_cache_paged_context::llama_kv_cache_paged_context(
       ubatches_(std::move(ubatches)),
       status_(status) {}
 
+llama_kv_cache_paged_context::llama_kv_cache_paged_context(
+        llama_kv_cache_paged *               parent,
+        std::vector<llama_ubatch>           ubatches,
+        std::vector<std::vector<int32_t>>   q_lens_per_ubatch,
+        std::vector<std::vector<int32_t>>   context_lens_per_ubatch,
+        llama_memory_status                 status)
+    : parent_(parent),
+      ubatches_(std::move(ubatches)),
+      q_lens_per_ubatch_(std::move(q_lens_per_ubatch)),
+      context_lens_per_ubatch_(std::move(context_lens_per_ubatch)),
+      status_(status) {}
+
 bool llama_kv_cache_paged_context::next() {
     if (++i_ubatch_ >= ubatches_.size()) return false;
     return true;
 }
 
 bool llama_kv_cache_paged_context::apply() {
-    // For paged cache the per-batch input tensors are populated in
-    // init_batch (host mirrors copied to GPU before the graph runs).
-    // No additional per-step apply needed in v1.
+    // MAD-124: install per-ubatch q_lens / context_lens into the parent's
+    // host mirrors before this ubatch's graph runs. set_input on the per-
+    // graph paged_q_lens / paged_context_lens tensors will then upload the
+    // right values for THIS ubatch (instead of whatever was last written
+    // during init_batch's eager loop).
+    if (i_ubatch_ < q_lens_per_ubatch_.size()) {
+        const auto & qsnap = q_lens_per_ubatch_[i_ubatch_];
+        const auto & csnap = context_lens_per_ubatch_[i_ubatch_];
+        const size_t n = parent_->h_q_lens_.size();
+        for (size_t s = 0; s < n; ++s) {
+            parent_->h_q_lens_[s]       = (s < qsnap.size()) ? qsnap[s] : 0;
+            parent_->h_context_lens_[s] = (s < csnap.size()) ? csnap[s] : 0;
+        }
+    }
     return true;
 }
 
