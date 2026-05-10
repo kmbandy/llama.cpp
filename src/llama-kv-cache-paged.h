@@ -43,6 +43,7 @@
 #include "memory-tier/mt-block-table.h"
 
 #include <functional>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -79,6 +80,15 @@ public:
             // them back in when needed for attention. Sized by --kv-tiered
             // warm_pct in the create_memory caller.
             uint32_t                   n_warm_blocks = 0,
+            // MAD-121: cold-tier (SSD) capacity in blocks. 0 = disabled.
+            // Backed by per-layer files at {ssd_path}/paged/L{il}.{k,v}.bin.
+            // When the warm pool fills, the LRU warm block is spilled to a
+            // free cold slot before further hot evictions proceed.
+            uint32_t                   n_cold_blocks = 0,
+            // Filesystem directory under which the cold-tier files are
+            // created. Ignored when n_cold_blocks == 0. The "/paged"
+            // subdir is created on demand.
+            std::string                ssd_path = std::string(),
             // Optional per-layer filter. Returns true for layers that should
             // get K/V allocation in the paged pool. Recurrent layers in
             // hybrid models should be filtered OUT (their state lives in
@@ -226,6 +236,25 @@ public:
     uint32_t n_warm_blocks() const { return n_warm_blocks_; }
     bool     warm_enabled()  const { return n_warm_blocks_ > 0; }
 
+    // ─── MAD-121: cold (SSD) tier ───
+    //
+    // Same shape as the warm-tier evict/restore but the data lives on
+    // disk. Cold storage is O(1)-addressed by a fixed-size slot index;
+    // see cold_*_ members below. Restoration is cold→hot directly
+    // (saves the warm→hot hop when warm is full).
+    bool evict_block_to_cold(llama_seq_id seq_id, uint32_t logical_block);
+    bool restore_block_from_cold(llama_seq_id seq_id, uint32_t logical_block);
+
+    // Pick an LRU warm-resident block and spill it to cold, freeing one
+    // CPU slot. Used as the escalation when the warm pool is full and
+    // we still need to evict a hot block. Returns true if a warm block
+    // was spilled, false if no warm-resident block exists or cold is
+    // full / disabled.
+    bool evict_lru_warm_to_cold();
+
+    uint32_t n_cold_blocks() const { return n_cold_blocks_; }
+    bool     cold_enabled()  const { return n_cold_blocks_ > 0; }
+
 private:
     friend class llama_kv_cache_paged_context;
 
@@ -282,6 +311,32 @@ private:
     std::vector<std::vector<uint8_t>> warm_v_;  // [n_layers][n_warm_blocks * v_bytes_per_block]
     size_t                            k_bytes_per_block_ = 0;
     size_t                            v_bytes_per_block_ = 0;
+
+    // MAD-121: cold-tier (SSD) storage. One file per (layer, K|V) at
+    // {ssd_path}/paged/L{il}.{k,v}.bin, sized to n_cold_blocks ×
+    // bytes_per_block at startup. A cold "slot" is a fixed offset
+    // `cold_idx * bytes_per_block` into those files; cold_idx is in
+    // [0, n_cold_blocks_) and allocated from cold_pool_free_ (LIFO
+    // stack). Storage is bounded — no churn growth like an append-only
+    // store would have.
+    //
+    // cold_slot_for_[seq_id][lblock] holds the assigned cold_idx when
+    // the (seq, lblock) is cold-resident; kInvalidColdIdx otherwise.
+    // table_'s mapping for cold-resident blocks is kInvalidBlockId
+    // (the GPU/CPU physical was freed back to the pool when we spilled).
+    //
+    // For compression: turbo4 / Q8_0 caches store raw bytes (already
+    // quantized at the cache layer; ~4x / ~2x smaller than F16). F16
+    // cache cold compression is a follow-up (INT4 quantization on
+    // write, dequantize on read) — not yet wired.
+    static constexpr uint32_t kInvalidColdIdx = ~0u;
+    uint32_t                  n_cold_blocks_ = 0;
+    uint32_t                  cold_in_use_   = 0;
+    std::string               cold_path_;
+    std::vector<int>          cold_fd_k_;            // [n_layers] fd for K cold file (-1 = none)
+    std::vector<int>          cold_fd_v_;            // [n_layers] fd for V cold file
+    std::vector<uint32_t>     cold_pool_free_;       // free cold_idx stack
+    std::vector<std::vector<uint32_t>> cold_slot_for_;  // [seq_id][lblock] -> cold_idx
 
     // Backing ggml context + buffer for layer storage.
     ggml_context *      ctx_storage_   = nullptr;

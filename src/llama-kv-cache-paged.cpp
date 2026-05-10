@@ -12,6 +12,35 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+// MAD-121: cold slot-id helpers — file-scope so fault_in_warm_blocks_for_batch
+// can read the cold_slot_for_ vector. kInvalidColdIdx (~0u) means
+// "not cold-resident".
+namespace {
+constexpr uint32_t kInvalidColdIdx = ~0u;
+inline void mark_cold(std::vector<std::vector<uint32_t>> & slot_for,
+                       llama_seq_id seq, uint32_t lblock, uint32_t cold_idx) {
+    if ((size_t) seq >= slot_for.size()) slot_for.resize(seq + 1);
+    auto & row = slot_for[seq];
+    if (lblock >= row.size()) row.resize(lblock + 1, kInvalidColdIdx);
+    row[lblock] = cold_idx;
+}
+inline uint32_t cold_slot(const std::vector<std::vector<uint32_t>> & slot_for,
+                           llama_seq_id seq, uint32_t lblock) {
+    if ((size_t) seq >= slot_for.size()) return kInvalidColdIdx;
+    const auto & row = slot_for[seq];
+    if (lblock >= row.size()) return kInvalidColdIdx;
+    return row[lblock];
+}
+inline bool is_cold(const std::vector<std::vector<uint32_t>> & slot_for,
+                     llama_seq_id seq, uint32_t lblock) {
+    return cold_slot(slot_for, seq, lblock) != kInvalidColdIdx;
+}
+}  // namespace
 
 namespace {
 // Re-declare locally to avoid pulling the cuh header into a non-CUDA
@@ -28,6 +57,8 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         uint32_t                   n_seq_max,
         uint32_t                   max_blocks_per_seq,
         uint32_t                   n_warm_blocks,
+        uint32_t                   n_cold_blocks,
+        std::string                ssd_path,
         layer_filter_cb            filter,
         ggml_type                  type_k,
         ggml_type                  type_v)
@@ -39,7 +70,9 @@ llama_kv_cache_paged::llama_kv_cache_paged(
       n_seq_max_(n_seq_max),
       max_blocks_per_seq_(max_blocks_per_seq),
       type_k_(type_k),
-      type_v_(type_v) {
+      type_v_(type_v),
+      n_cold_blocks_(n_cold_blocks),
+      cold_path_(std::move(ssd_path)) {
 
     GGML_ASSERT(block_size_ > 0 && (block_size_ & (block_size_ - 1)) == 0);
     GGML_ASSERT(n_blocks_total_ > 0);
@@ -163,6 +196,73 @@ llama_kv_cache_paged::llama_kv_cache_paged(
                        (double) warm_bytes_total / (1024.0 * 1024.0));
     }
 
+    // MAD-121: cold tier (SSD) — fixed-slot per-layer files. Each
+    // attention layer gets two files (K and V), sized to
+    // n_cold_blocks × bytes_per_block. Cold slots are O(1)-addressed
+    // by `cold_idx * bytes_per_block`. Storage is bounded — no churn
+    // growth. For turbo4 / Q8_0 caches the bytes are already
+    // quantized at the cache layer; F16 cache stores raw fp16 bytes
+    // (compression for that case is a follow-up).
+    if (n_cold_blocks_ > 0) {
+        if (cold_path_.empty()) {
+            LLAMA_LOG_WARN("llama_kv_cache_paged: cold tier requested with empty ssd_path; disabling cold\n");
+            n_cold_blocks_ = 0;
+        } else {
+            const std::string subdir = cold_path_ + "/paged";
+            (void) ::mkdir(cold_path_.c_str(), 0700);
+            (void) ::mkdir(subdir.c_str(),    0700);
+
+            cold_fd_k_.assign(n_layer, -1);
+            cold_fd_v_.assign(n_layer, -1);
+            const off_t k_file_bytes = (off_t) n_cold_blocks_ * (off_t) k_bytes_per_block_;
+            const off_t v_file_bytes = (off_t) n_cold_blocks_ * (off_t) v_bytes_per_block_;
+            uint64_t total_bytes = 0;
+            bool ok = true;
+            for (uint32_t il = 0; il < n_layer && ok; ++il) {
+                if (!layers_[il].k) continue;
+                const std::string kpath = subdir + "/L" + std::to_string(il) + ".k.bin";
+                const std::string vpath = subdir + "/L" + std::to_string(il) + ".v.bin";
+                const int fk = ::open(kpath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+                const int fv = ::open(vpath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+                if (fk < 0 || fv < 0 ||
+                    ::ftruncate(fk, k_file_bytes) < 0 ||
+                    ::ftruncate(fv, v_file_bytes) < 0) {
+                    LLAMA_LOG_WARN("llama_kv_cache_paged: cold tier file open/truncate failed at %s; disabling\n",
+                                   kpath.c_str());
+                    if (fk >= 0) ::close(fk);
+                    if (fv >= 0) ::close(fv);
+                    ok = false;
+                    break;
+                }
+                cold_fd_k_[il] = fk;
+                cold_fd_v_[il] = fv;
+                total_bytes += (uint64_t)(k_file_bytes + v_file_bytes);
+            }
+
+            if (!ok) {
+                for (int fd : cold_fd_k_) if (fd >= 0) ::close(fd);
+                for (int fd : cold_fd_v_) if (fd >= 0) ::close(fd);
+                cold_fd_k_.clear();
+                cold_fd_v_.clear();
+                n_cold_blocks_ = 0;
+            } else {
+                // Free-stack of cold slot ids.
+                cold_pool_free_.reserve(n_cold_blocks_);
+                for (uint32_t i = n_cold_blocks_; i > 0; --i) {
+                    cold_pool_free_.push_back(i - 1);
+                }
+                cold_slot_for_.assign(n_seq_max_, std::vector<uint32_t>());
+                LLAMA_LOG_INFO("llama_kv_cache_paged: cold tier enabled — %u blocks × "
+                               "%.1f KiB/block (K+V) × %u attn layers = %.1f MiB on %s\n",
+                               n_cold_blocks_,
+                               (double)(k_bytes_per_block_ + v_bytes_per_block_) / 1024.0,
+                               n_attn_layers,
+                               (double) total_bytes / (1024.0 * 1024.0),
+                               subdir.c_str());
+            }
+        }
+    }
+
     // ── Input tensor (block_table) ──
     //
     // Lives on the GPU but written from the host each batch. We keep a
@@ -202,6 +302,9 @@ static_assert((int32_t) mt::kInvalidBlockId == kInvalidBlockTableEntry,
               "mt::kInvalidBlockId must reinterpret to -1 in i32 for kernel compat");
 
 llama_kv_cache_paged::~llama_kv_cache_paged() {
+    // MAD-121: close cold-tier fds.
+    for (int fd : cold_fd_k_) if (fd >= 0) ::close(fd);
+    for (int fd : cold_fd_v_) if (fd >= 0) ::close(fd);
     if (buf_storage_) ggml_backend_buffer_free(buf_storage_);
     if (buf_inputs_)  ggml_backend_buffer_free(buf_inputs_);
     if (ctx_storage_) ggml_free(ctx_storage_);
@@ -271,10 +374,16 @@ bool llama_kv_cache_paged::evict_block_to_warm(llama_seq_id seq_id, uint32_t log
     if (gpu_physical == mt::kInvalidBlockId) return false;
     if (!pool_.is_gpu(gpu_physical)) return false;  // already in warm
 
-    const uint32_t cpu_physical = pool_.alloc_cpu();
+    uint32_t cpu_physical = pool_.alloc_cpu();
     if (cpu_physical == mt::kInvalidBlockId) {
-        // Warm pool full — caller should escalate to cold (not yet wired).
-        return false;
+        // MAD-121: warm pool full → escalate to cold. Pick any
+        // warm-resident block, spill it to SSD, then retry.
+        if (cold_enabled() && evict_lru_warm_to_cold()) {
+            cpu_physical = pool_.alloc_cpu();
+        }
+        if (cpu_physical == mt::kInvalidBlockId) {
+            return false;
+        }
     }
 
     const uint32_t cpu_idx = cpu_physical - n_blocks_total_;
@@ -341,7 +450,7 @@ bool llama_kv_cache_paged::restore_block_from_warm(llama_seq_id seq_id, uint32_t
 }
 
 bool llama_kv_cache_paged::fault_in_warm_blocks_for_batch(const llama_ubatch & ub) {
-    if (!warm_enabled()) return true;
+    if (!warm_enabled() && !cold_enabled()) return true;
 
     // Step 1: identify all (seq, lblock) pairs the kernel will read for
     // this ubatch. Causal attention reads positions 0..max_pos per seq,
@@ -414,8 +523,17 @@ bool llama_kv_cache_paged::fault_in_warm_blocks_for_batch(const llama_ubatch & u
 
         for (uint32_t lb = 0; lb <= cap; ++lb) {
             const uint32_t physical = table_.get_physical(sid, lb);
-            if (physical == mt::kInvalidBlockId) continue;
-            if (pool_.is_gpu(physical)) continue;  // already hot
+            const bool     in_cold  = is_cold(cold_slot_for_, sid, lb);
+
+            if (in_cold) {
+                // Cold-resident: physical is kInvalidBlockId (was freed
+                // when we spilled to cold). Need to allocate GPU + read
+                // from kvtcstore.
+            } else {
+                if (physical == mt::kInvalidBlockId) continue;
+                if (pool_.is_gpu(physical)) continue;  // already hot
+                // Warm-resident: existing path.
+            }
 
             // Make GPU room. Try alloc; if full, evict LRU non-protected,
             // retry until we either get a slot or run out of victims.
@@ -431,9 +549,13 @@ bool llama_kv_cache_paged::fault_in_warm_blocks_for_batch(const llama_ubatch & u
                 free_gpu = (uint32_t) pool_.n_free_gpu();
             }
 
-            if (!restore_block_from_warm(sid, lb)) {
+            const bool ok = in_cold
+                ? restore_block_from_cold(sid, lb)
+                : restore_block_from_warm(sid, lb);
+            if (!ok) {
                 LLAMA_LOG_WARN("fault_in_warm_blocks_for_batch: restore failed for "
-                               "seq %d lblock %u\n", sid, lb);
+                               "seq %d lblock %u (tier=%s)\n",
+                               sid, lb, in_cold ? "cold" : "warm");
                 return false;
             }
             ++restored;
@@ -555,6 +677,128 @@ int llama_kv_cache_paged::restore_seq_from_warm(llama_seq_id seq_id) {
     }
     LLAMA_LOG_DEBUG("restore_seq_from_warm: seq=%d restored %d block(s)\n", seq_id, moved);
     return moved;
+}
+
+bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lblock) {
+    if (!cold_enabled()) return false;
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
+    if (lblock >= table_.num_blocks(seq_id)) return false;
+    if (cold_pool_free_.empty()) {
+        LLAMA_LOG_WARN("evict_block_to_cold: cold pool full (%u in use); refusing\n", cold_in_use_);
+        return false;
+    }
+
+    const uint32_t phys = table_.get_physical(seq_id, lblock);
+    if (phys == mt::kInvalidBlockId) return false;
+
+    const bool from_gpu = pool_.is_gpu(phys);
+    const uint32_t cpu_idx = from_gpu ? UINT32_MAX : (phys - n_blocks_total_);
+
+    const uint32_t cold_idx = cold_pool_free_.back();
+    const off_t k_off_cold = (off_t) cold_idx * (off_t) k_bytes_per_block_;
+    const off_t v_off_cold = (off_t) cold_idx * (off_t) v_bytes_per_block_;
+
+    std::vector<uint8_t> kbuf(k_bytes_per_block_);
+    std::vector<uint8_t> vbuf(v_bytes_per_block_);
+
+    for (uint32_t il = 0; il < layers_.size(); ++il) {
+        const auto & layer = layers_[il];
+        if (!layer.k) continue;
+
+        if (from_gpu) {
+            const size_t k_off = (size_t) phys * k_bytes_per_block_;
+            const size_t v_off = (size_t) phys * v_bytes_per_block_;
+            ggml_backend_tensor_get(layer.k, kbuf.data(), k_off, k_bytes_per_block_);
+            ggml_backend_tensor_get(layer.v, vbuf.data(), v_off, v_bytes_per_block_);
+        } else {
+            const size_t k_off = (size_t) cpu_idx * k_bytes_per_block_;
+            const size_t v_off = (size_t) cpu_idx * v_bytes_per_block_;
+            std::memcpy(kbuf.data(), warm_k_[il].data() + k_off, k_bytes_per_block_);
+            std::memcpy(vbuf.data(), warm_v_[il].data() + v_off, v_bytes_per_block_);
+        }
+
+        const ssize_t wk = ::pwrite(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
+        const ssize_t wv = ::pwrite(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
+        if (wk != (ssize_t) k_bytes_per_block_ || wv != (ssize_t) v_bytes_per_block_) {
+            LLAMA_LOG_WARN("evict_block_to_cold: pwrite failed at layer=%u cold_idx=%u (wk=%zd wv=%zd)\n",
+                           il, cold_idx, wk, wv);
+            return false;
+        }
+    }
+
+    cold_pool_free_.pop_back();
+    table_.swap_block(seq_id, lblock, mt::kInvalidBlockId);
+    pool_.free_block(phys);
+    mark_cold(cold_slot_for_, seq_id, lblock, cold_idx);
+    ++cold_in_use_;
+    return true;
+}
+
+bool llama_kv_cache_paged::restore_block_from_cold(llama_seq_id seq_id, uint32_t lblock) {
+    if (!cold_enabled()) return false;
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
+    if (lblock >= table_.num_blocks(seq_id)) return false;
+    const uint32_t cold_idx = cold_slot(cold_slot_for_, seq_id, lblock);
+    if (cold_idx == kInvalidColdIdx) return false;
+
+    const uint32_t gpu_phys = pool_.alloc_gpu();
+    if (gpu_phys == mt::kInvalidBlockId) return false;
+
+    const off_t k_off_cold = (off_t) cold_idx * (off_t) k_bytes_per_block_;
+    const off_t v_off_cold = (off_t) cold_idx * (off_t) v_bytes_per_block_;
+
+    std::vector<uint8_t> kbuf(k_bytes_per_block_);
+    std::vector<uint8_t> vbuf(v_bytes_per_block_);
+
+    for (uint32_t il = 0; il < layers_.size(); ++il) {
+        const auto & layer = layers_[il];
+        if (!layer.k) continue;
+
+        const ssize_t rk = ::pread(cold_fd_k_[il], kbuf.data(), k_bytes_per_block_, k_off_cold);
+        const ssize_t rv = ::pread(cold_fd_v_[il], vbuf.data(), v_bytes_per_block_, v_off_cold);
+        if (rk != (ssize_t) k_bytes_per_block_ || rv != (ssize_t) v_bytes_per_block_) {
+            LLAMA_LOG_WARN("restore_block_from_cold: pread short at layer=%u cold_idx=%u (rk=%zd rv=%zd)\n",
+                           il, cold_idx, rk, rv);
+            pool_.free_block(gpu_phys);
+            return false;
+        }
+
+        const size_t k_off = (size_t) gpu_phys * k_bytes_per_block_;
+        const size_t v_off = (size_t) gpu_phys * v_bytes_per_block_;
+        ggml_backend_tensor_set(layer.k, kbuf.data(), k_off, k_bytes_per_block_);
+        ggml_backend_tensor_set(layer.v, vbuf.data(), v_off, v_bytes_per_block_);
+    }
+
+    table_.swap_block(seq_id, lblock, gpu_phys);
+    mark_cold(cold_slot_for_, seq_id, lblock, kInvalidColdIdx);
+    cold_pool_free_.push_back(cold_idx);
+    if (cold_in_use_ > 0) --cold_in_use_;
+    return true;
+}
+
+bool llama_kv_cache_paged::evict_lru_warm_to_cold() {
+    if (!cold_enabled() || cold_pool_free_.empty()) return false;
+
+    // Pick any warm-resident (seq, lblock). We don't track warm-LRU
+    // explicitly — first hit is fine for v1 (the warm tier itself is
+    // already a cold-er-than-hot tier; the order within warm matters
+    // less). Skip the seq's tail block to avoid evicting actively-
+    // written data.
+    for (uint32_t s = 0; s < n_seq_max_; ++s) {
+        const uint32_t n = table_.num_blocks((llama_seq_id) s);
+        if (n == 0) continue;
+        const uint32_t tail = n - 1;
+        for (uint32_t lb = 0; lb < n; ++lb) {
+            if (lb == tail) continue;
+            const uint32_t phys = table_.get_physical((llama_seq_id) s, lb);
+            if (phys == mt::kInvalidBlockId) continue;
+            if (pool_.is_gpu(phys)) continue;  // we want a WARM victim
+            if (evict_block_to_cold((llama_seq_id) s, lb)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool llama_kv_cache_paged::can_admit(llama_seq_id           seq_id,

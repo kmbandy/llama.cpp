@@ -53,7 +53,10 @@ public:
                  // MAD-120: host-side warm-tier capacity for the paged cache.
                  // 0 = warm tier disabled (legacy behavior). Sized by
                  // --kv-tiered warm_pct in create_memory.
-                 uint32_t   paged_n_warm_blocks = 0);
+                 uint32_t   paged_n_warm_blocks = 0,
+                 // MAD-121: cold-tier (SSD) capacity + path. 0 = cold disabled.
+                 uint32_t   paged_n_cold_blocks = 0,
+                 std::string paged_ssd_path     = std::string());
 
     ~llama_memory_hybrid() = default;
 

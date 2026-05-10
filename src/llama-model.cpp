@@ -2105,6 +2105,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         uint32_t paged_bsize          = 16;
                         uint32_t paged_max_bps        = 0;
                         uint32_t paged_n_warm_blocks  = 0;
+                        uint32_t paged_n_cold_blocks  = 0;
+                        std::string paged_ssd_path;
                         if (params.kv_tier_paged_blocks) {
                             paged_bsize     = params.kv_tier_paged_block_size > 0
                                                 ? (uint32_t) params.kv_tier_paged_block_size : 16u;
@@ -2113,14 +2115,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             uint32_t hot_tokens;
                             uint32_t warm_tokens = 0;
+                            uint32_t cold_tokens = 0;
                             if (params.kv_tier_enabled) {
                                 const uint32_t total_ctx = params.kv_tier_total_ctx > 0
                                                               ? (uint32_t) params.kv_tier_total_ctx
                                                               : total_ctx_all_slots;
                                 hot_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_hot_pct / 100.0));
                                 if (hot_tokens < cparams.n_ctx_seq) hot_tokens = cparams.n_ctx_seq;
-                                // MAD-120: size warm tier from --kv-tiered warm_pct
                                 warm_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_warm_pct / 100.0));
+                                // MAD-121: cold tier sized from --kv-tiered cold_pct
+                                cold_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_cold_pct / 100.0));
+                                if (params.kv_tier_ssd_path && *params.kv_tier_ssd_path) {
+                                    paged_ssd_path = params.kv_tier_ssd_path;
+                                }
                             } else {
                                 hot_tokens = (uint32_t)((double) total_ctx_all_slots * 1.5);
                             }
@@ -2128,16 +2135,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             paged_n_blocks       = (hot_tokens + paged_bsize - 1) / paged_bsize;
                             paged_max_bps        = blocks_for_ctx;
                             paged_n_warm_blocks  = (warm_tokens + paged_bsize - 1) / paged_bsize;
+                            paged_n_cold_blocks  = (cold_tokens + paged_bsize - 1) / paged_bsize;
 
                             if (params.kv_tier_enabled) {
                                 LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged (tiered) "
-                                               "(n_blocks=%u, n_warm_blocks=%u, block_size=%u, ctx=%u, "
-                                               "n_seq_max=%u, hot_pct=%.1f%%, warm_pct=%.1f%%, "
-                                               "hot_tokens=%u, warm_tokens=%u)\n",
-                                               paged_n_blocks, paged_n_warm_blocks, paged_bsize,
-                                               cparams.n_ctx_seq, cparams.n_seq_max,
+                                               "(n_blocks=%u, n_warm_blocks=%u, n_cold_blocks=%u, "
+                                               "block_size=%u, ctx=%u, n_seq_max=%u, hot_pct=%.1f%%, "
+                                               "warm_pct=%.1f%%, cold_pct=%.1f%%, "
+                                               "hot_tokens=%u, warm_tokens=%u, cold_tokens=%u)\n",
+                                               paged_n_blocks, paged_n_warm_blocks, paged_n_cold_blocks,
+                                               paged_bsize, cparams.n_ctx_seq, cparams.n_seq_max,
                                                params.kv_tier_hot_pct, params.kv_tier_warm_pct,
-                                               hot_tokens, warm_tokens);
+                                               params.kv_tier_cold_pct,
+                                               hot_tokens, warm_tokens, cold_tokens);
                             } else {
                                 LLAMA_LOG_INFO("llama_model: hybrid attn routed to llama_kv_cache_paged "
                                                "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
@@ -2164,7 +2174,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* paged_n_blocks            */ paged_n_blocks,
                             /* paged_block_size          */ paged_bsize,
                             /* paged_max_blocks_per_seq  */ paged_max_bps,
-                            /* paged_n_warm_blocks       */ paged_n_warm_blocks);
+                            /* paged_n_warm_blocks       */ paged_n_warm_blocks,
+                            /* paged_n_cold_blocks       */ paged_n_cold_blocks,
+                            /* paged_ssd_path            */ paged_ssd_path);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -2250,20 +2262,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
         uint32_t hot_tokens;
         uint32_t warm_tokens = 0;
+        uint32_t cold_tokens = 0;
+        std::string ssd_path;
         if (params.kv_tier_enabled) {
             const uint32_t total_ctx = params.kv_tier_total_ctx > 0
                                           ? (uint32_t) params.kv_tier_total_ctx
                                           : total_ctx_all_slots;
             hot_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_hot_pct / 100.0));
             if (hot_tokens < cparams.n_ctx_seq) hot_tokens = cparams.n_ctx_seq;
-            // MAD-120: size warm tier from --kv-tiered warm_pct
             warm_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_warm_pct / 100.0));
+            // MAD-121: cold tier sizing
+            cold_tokens = (uint32_t)((double) total_ctx * (params.kv_tier_cold_pct / 100.0));
+            if (params.kv_tier_ssd_path && *params.kv_tier_ssd_path) {
+                ssd_path = params.kv_tier_ssd_path;
+            }
         } else {
             hot_tokens = (uint32_t)((double) total_ctx_all_slots * 1.5);
         }
 
         const uint32_t n_blocks_total = (hot_tokens + bsize - 1) / bsize;
         const uint32_t n_warm_blocks  = (warm_tokens + bsize - 1) / bsize;
+        const uint32_t n_cold_blocks  = (cold_tokens + bsize - 1) / bsize;
 
         // Pick the GPU buffer type from device 0 (where the model lives).
         ggml_backend_buffer_type_t buft = nullptr;
@@ -2280,16 +2299,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 /*block_size         =*/ bsize,
                 /*n_seq_max          =*/ cparams.n_seq_max,
                 /*max_blocks_per_seq =*/ blocks_for_ctx,
-                /*n_warm_blocks      =*/ n_warm_blocks);
+                /*n_warm_blocks      =*/ n_warm_blocks,
+                /*n_cold_blocks      =*/ n_cold_blocks,
+                /*ssd_path           =*/ ssd_path);
 
         if (params.kv_tier_enabled) {
             LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged (tiered) "
-                           "(n_blocks=%u, n_warm_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u, "
-                           "hot_pct=%.1f%%, warm_pct=%.1f%%, hot_tokens=%u, warm_tokens=%u)\n",
-                           n_blocks_total, n_warm_blocks, bsize,
+                           "(n_blocks=%u, n_warm_blocks=%u, n_cold_blocks=%u, block_size=%u, "
+                           "ctx=%u, n_seq_max=%u, hot_pct=%.1f%%, warm_pct=%.1f%%, cold_pct=%.1f%%, "
+                           "hot_tokens=%u, warm_tokens=%u, cold_tokens=%u)\n",
+                           n_blocks_total, n_warm_blocks, n_cold_blocks, bsize,
                            cparams.n_ctx_seq, cparams.n_seq_max,
-                           params.kv_tier_hot_pct, params.kv_tier_warm_pct,
-                           hot_tokens, warm_tokens);
+                           params.kv_tier_hot_pct, params.kv_tier_warm_pct, params.kv_tier_cold_pct,
+                           hot_tokens, warm_tokens, cold_tokens);
         } else {
             LLAMA_LOG_INFO("llama_model: routed to llama_kv_cache_paged "
                            "(n_blocks=%u, block_size=%u, ctx=%u, n_seq_max=%u)\n",
