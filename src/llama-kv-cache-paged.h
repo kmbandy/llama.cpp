@@ -288,6 +288,13 @@ public:
     // Diagnostic: how many fingerprints currently held.
     size_t n_paged_fingerprints() const { return paged_semantic_.size(); }
 
+    // MAD-129: O(1) check whether (seq_id, lblock) already has a
+    // fingerprint. Used by the server's prefill-time write trigger to
+    // skip blocks already fingerprinted on prior turns.
+    bool has_paged_fingerprint(llama_seq_id seq_id, uint32_t lblock) const {
+        return paged_semantic_.has_fingerprint(seq_id, lblock);
+    }
+
 private:
     friend class llama_kv_cache_paged_context;
 

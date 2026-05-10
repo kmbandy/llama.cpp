@@ -3115,6 +3115,65 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+
+                        // MAD-129: prefill-time semantic fingerprint trigger.
+                        // Walk the seq's COMPLETE blocks (skip the partial last
+                        // block, which fills on the next prefill) and embed any
+                        // that don't already have a fingerprint. Skip-already-
+                        // fingerprinted via has_paged_fingerprint keeps
+                        // multi-turn cost bounded — only NEW blocks (the
+                        // accumulated assistant response from the prior turn)
+                        // get embedded on each turn's prefill.
+                        //
+                        // Why here vs proactive-backup: the existing chunk-
+                        // level trigger at the proactive-backup site (line
+                        // ~1631) doesn't fire for hybrid+paged because the
+                        // server's eviction threshold uses full ctx (cap
+                        // arithmetic returns 0 for hybrid+paged) so the
+                        // trigger never crosses. And eviction in the paged
+                        // cache is internal — the server doesn't see those
+                        // events anyway. Per Epic A2: write at prefill, not
+                        // at eviction.
+                        if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx));
+
+                            if (paged_cache && mt_tier) {
+                                const uint32_t bsize = (uint32_t) std::max(1, params_base.kv_tier_paged_block_size);
+                                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                                const int n_toks = (int) toks.size();
+                                const int n_complete_blocks = n_toks / (int) bsize;
+
+                                int n_new_fp = 0;
+                                int n_skipped_existing = 0;
+                                for (int lb = 0; lb < n_complete_blocks; ++lb) {
+                                    if (paged_cache->has_paged_fingerprint(slot.id, (uint32_t) lb)) {
+                                        ++n_skipped_existing;
+                                        continue;
+                                    }
+                                    const int p0 = lb * (int) bsize;
+                                    const int p1 = p0 + (int) bsize;
+                                    llama_tokens chunk(toks.begin() + p0, toks.begin() + p1);
+                                    const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+                                    const auto emb = mt_tier->embed_text(text);
+                                    if (emb.empty()) continue;
+                                    paged_cache->record_paged_block_fingerprint(
+                                        slot.id, (uint32_t) lb, emb,
+                                        mt::SemanticIndex::Tier::Hot);
+                                    ++n_new_fp;
+                                }
+
+                                if (n_new_fp > 0 || n_skipped_existing > 0) {
+                                    SLT_INF(slot, "tier semantic: prefill fingerprint sweep — "
+                                            "%d new, %d already-fingerprinted, %d total complete blocks "
+                                            "(of %d total tokens, partial tail block of %d slots not "
+                                            "yet embedded)\n",
+                                            n_new_fp, n_skipped_existing, n_complete_blocks,
+                                            n_toks, n_toks % (int) bsize);
+                                }
+                            }
+                        }
                     } else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt

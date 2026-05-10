@@ -129,6 +129,12 @@ public:
     // Drop a single (seq, lblock) entry. No-op if not tracked.
     void remove_block(llama_seq_id seq_id, uint32_t lblock);
 
+    // MAD-129: O(1) check whether a fingerprint already exists for
+    // (seq_id, lblock). Used by the server's prefill-time write trigger
+    // to skip blocks that have already been fingerprinted (typical when
+    // a turn's prompt re-processes a prior turn's accumulated context).
+    bool has_fingerprint(llama_seq_id seq_id, uint32_t lblock) const;
+
     // Drop every fingerprint for `seq_id`. Called on whole-seq wipe.
     void remove_seq(llama_seq_id seq_id);
 

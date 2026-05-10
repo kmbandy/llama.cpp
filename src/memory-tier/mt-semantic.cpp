@@ -248,6 +248,13 @@ void BlockSemanticIndex::remove_block(llama_seq_id seq_id, uint32_t lblock) {
     if (sit->second.empty()) fps_.erase(sit);
 }
 
+bool BlockSemanticIndex::has_fingerprint(llama_seq_id seq_id, uint32_t lblock) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return false;
+    return sit->second.find(lblock) != sit->second.end();
+}
+
 void BlockSemanticIndex::remove_seq(llama_seq_id seq_id) {
     std::lock_guard<std::mutex> lk(mu_);
     fps_.erase(seq_id);
