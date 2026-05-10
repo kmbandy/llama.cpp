@@ -700,6 +700,78 @@ llama_memory_tiered::find_similar_chunks(const std::vector<float> & query_embedd
     return semantic_.score(query_embedding, top_k, threshold);
 }
 
+void llama_memory_tiered::record_paged_block_fingerprint(
+        llama_seq_id        seq_id,
+        uint32_t            lblock,
+        std::vector<float>  embedding,
+        SemanticIndex::Tier tier) {
+    paged_semantic_.add_fingerprint(seq_id, lblock, std::move(embedding), tier);
+}
+
+uint32_t llama_memory_tiered::restore_semantic_paged(
+        llama_seq_id              seq_id,
+        const std::vector<float> & query_embedding,
+        int                        top_k,
+        float                      threshold) {
+    if (!cfg_.paged_blocks) {
+        // Defensive: paged-block fingerprints only get populated when the
+        // paged path is on. Calling this in the non-paged config is a
+        // server-side bug; log once and bail.
+        LLAMA_LOG_DEBUG("mt::restore_semantic_paged: called with "
+                        "paged_blocks=false (no-op)\n");
+        return 0;
+    }
+
+    auto hints = paged_semantic_.score(seq_id, query_embedding, top_k, threshold);
+    if (hints.empty()) return 0;
+
+    const uint32_t bsize = paged_table_.block_size();
+    if (bsize == 0) return 0;
+
+    // Expand each block hint to its position range. Skip blocks that
+    // are already in hot (paged_pool_.is_gpu) — paged_restore_from_warm
+    // would no-op them anyway, but checking up-front keeps the
+    // requested-vs-restored ratio honest in the hit-rate log.
+    std::vector<llama_pos> wanted;
+    wanted.reserve(hints.size() * bsize);
+    uint32_t hot_already = 0;
+    for (const auto & h : hints) {
+        const uint32_t physical = paged_table_.get_physical(seq_id, h.lblock);
+        if (physical == kInvalidBlockId) continue;       // never backed up
+        if (paged_pool_.is_gpu(physical)) { ++hot_already; continue; }
+
+        const llama_pos p0 = (llama_pos) h.lblock * (llama_pos) bsize;
+        for (uint32_t i = 0; i < bsize; ++i) {
+            wanted.push_back(p0 + (llama_pos) i);
+        }
+    }
+
+    if (wanted.empty()) {
+        LLAMA_LOG_INFO("mt::restore_semantic_paged: %zu hints (top_k=%d, "
+                       "threshold=%.2f) for seq %d — all already hot (%u) "
+                       "or unmapped\n",
+                       hints.size(), top_k, threshold, seq_id, hot_already);
+        return 0;
+    }
+
+    const uint32_t restored = paged_restore_from_warm(seq_id, wanted);
+
+    // Hit-rate logging for MAD-122 acceptance criterion #5. The
+    // requested-vs-restored ratio is the prefetch-effectiveness signal:
+    // if it's consistently low under realistic workloads, the threshold
+    // or top_k tuning needs revisiting.
+    LLAMA_LOG_INFO("mt::restore_semantic_paged: seq %d — %zu hints "
+                   "(top_k=%d, threshold=%.2f), %zu positions requested, "
+                   "%u restored (hit-rate %.0f%%, %u already hot)\n",
+                   seq_id, hints.size(), top_k, threshold,
+                   wanted.size(), restored,
+                   wanted.empty() ? 0.0f
+                                  : 100.0f * (float) restored / (float) wanted.size(),
+                   hot_already);
+
+    return restored;
+}
+
 uint32_t llama_memory_tiered::restore_semantic(llama_seq_id              seq_id,
                                                  const std::vector<float> & query_embedding,
                                                  int                        top_k,
@@ -1294,6 +1366,7 @@ void llama_memory_tiered::clear(bool data) {
     capacity_.reset();
     eviction_.clear();
     semantic_.clear();
+    paged_semantic_.clear();
     pressure_announced_ = false;
     for (auto & m : warm_pos_to_slot_) m.clear();
     for (auto & s : evicted_to_warm_)  s.clear();
@@ -1389,15 +1462,21 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
                 }
 
                 semantic_.clear();
+                // Paged-block fingerprints are seq-scoped, unlike the
+                // chunk-keyed semantic_ above. Drop only this seq's
+                // entries — others remain valid for their own queries.
+                const size_t n_paged_finger = paged_semantic_.size(seq_id);
+                paged_semantic_.remove_seq(seq_id);
                 pressure_announced_ = false;
 
-                if (n_blocks_freed + n_finger > 0) {
+                if (n_blocks_freed + n_finger + n_paged_finger > 0) {
                     LLAMA_LOG_INFO("mt::seq_rm: paged whole-seq wipe for seq %d "
                                    "— freed %zu blocks (paged_pool free: gpu=%zu "
-                                   "cpu=%zu), cleared %zu semantic fingerprints\n",
+                                   "cpu=%zu), cleared %zu chunk + %zu paged-block "
+                                   "semantic fingerprints\n",
                                    seq_id, n_blocks_freed,
                                    paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu(),
-                                   n_finger);
+                                   n_finger, n_paged_finger);
                 }
             } else if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max_) {
                 // Per-seq whole-seq wipe: drop only this seq's tier

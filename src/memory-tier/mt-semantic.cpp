@@ -215,4 +215,96 @@ bool SemanticIndex::load_from_disk(const std::string & path) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// BlockSemanticIndex — paged-block-keyed fingerprint store for MAD-122.
+// ---------------------------------------------------------------------------
+
+void BlockSemanticIndex::add_fingerprint(llama_seq_id        seq_id,
+                                          uint32_t            lblock,
+                                          std::vector<float>  embedding,
+                                          SemanticIndex::Tier tier) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto & seq_map = fps_[seq_id];
+    auto & e = seq_map[lblock];
+    e.embedding = std::move(embedding);
+    e.tier      = tier;
+}
+
+void BlockSemanticIndex::update_tier(llama_seq_id seq_id, uint32_t lblock,
+                                      SemanticIndex::Tier tier) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return;
+    auto bit = sit->second.find(lblock);
+    if (bit == sit->second.end()) return;
+    bit->second.tier = tier;
+}
+
+void BlockSemanticIndex::remove_block(llama_seq_id seq_id, uint32_t lblock) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return;
+    sit->second.erase(lblock);
+    if (sit->second.empty()) fps_.erase(sit);
+}
+
+void BlockSemanticIndex::remove_seq(llama_seq_id seq_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    fps_.erase(seq_id);
+}
+
+void BlockSemanticIndex::clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    fps_.clear();
+}
+
+std::vector<BlockSemanticIndex::BlockHint>
+BlockSemanticIndex::score(llama_seq_id              seq_id,
+                          const std::vector<float> & query,
+                          int                        top_k,
+                          float                      threshold) const {
+    std::vector<BlockHint> out;
+    if (query.empty() || top_k <= 0) return out;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end() || sit->second.empty()) return out;
+
+    std::vector<std::pair<float, uint32_t>> scored;
+    scored.reserve(sit->second.size());
+    for (const auto & kv : sit->second) {
+        const float s = dot(query, kv.second.embedding);
+        scored.emplace_back(s, kv.first);
+    }
+
+    std::sort(scored.begin(), scored.end(),
+              [](const auto & a, const auto & b) { return a.first > b.first; });
+
+    out.reserve((size_t) top_k);
+    for (const auto & [s, lblock] : scored) {
+        if (s < threshold) break;
+        BlockHint h;
+        h.seq_id = seq_id;
+        h.lblock = lblock;
+        h.score  = s;
+        h.tier   = sit->second.at(lblock).tier;
+        out.push_back(std::move(h));
+        if ((int) out.size() >= top_k) break;
+    }
+    return out;
+}
+
+size_t BlockSemanticIndex::size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t n = 0;
+    for (const auto & kv : fps_) n += kv.second.size();
+    return n;
+}
+
+size_t BlockSemanticIndex::size(llama_seq_id seq_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = fps_.find(seq_id);
+    return it == fps_.end() ? 0 : it->second.size();
+}
+
 }  // namespace mt

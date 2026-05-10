@@ -99,6 +99,7 @@ public:
     TokenMetadataStore  & eviction()        { return eviction_; }
     KvtcStore           & store()           { return store_; }
     SemanticIndex       & semantic()        { return semantic_; }
+    BlockSemanticIndex  & paged_semantic()  { return paged_semantic_; }
     AttentionMover      & mover_attn()      { return mover_attn_; }
     RecurrentStateMover & mover_recur()     { return mover_recur_; }
 
@@ -163,6 +164,37 @@ public:
                               const std::vector<float> & query_embedding,
                               int                        top_k     = 5,
                               float                      threshold = 0.65f);
+
+    // ---- paged-block semantic API (MAD-122) ----
+    //
+    // These mirror record_chunk_fingerprint / restore_semantic but key
+    // fingerprints by (seq_id, logical_block_idx) instead of arbitrary
+    // position lists. Caller (server-context) computes one BGE-small
+    // embedding per paged block at backup time and passes it in. At
+    // query time, the wrapper scores the new query against this seq's
+    // block fingerprints and prefetches the top-K matches into hot via
+    // paged_restore_from_warm.
+    //
+    // Only meaningful when cfg_.paged_blocks=true. The non-paged
+    // record_chunk_fingerprint / restore_semantic remain unchanged.
+
+    // Record a fingerprint for a single paged block. embedding should
+    // be L2-normalized. tier annotates the block's current location so
+    // future scoring can prefer cheaper-to-fetch hits.
+    void record_paged_block_fingerprint(llama_seq_id        seq_id,
+                                         uint32_t            lblock,
+                                         std::vector<float>  embedding,
+                                         SemanticIndex::Tier tier);
+
+    // Score this seq's paged-block fingerprints against query_embedding,
+    // then prefetch the top-K matches via paged_restore_from_warm.
+    // Returns the count of positions actually restored. Logs the hit
+    // rate (positions restored / positions requested) for the smoke
+    // gating in MAD-122 acceptance criterion #5.
+    uint32_t restore_semantic_paged(llama_seq_id              seq_id,
+                                     const std::vector<float> & query_embedding,
+                                     int                        top_k     = 5,
+                                     float                      threshold = 0.65f);
 
     // Restore the warm-tier recurrent state for seq_id back into the
     // inner cache. Allocates a fresh recurrent slot via the inner
@@ -313,6 +345,7 @@ private:
     RecurrentStateMover   mover_recur_;
     KvtcStore             store_;
     SemanticIndex         semantic_;
+    BlockSemanticIndex    paged_semantic_;
 
     // Phase 2a paged-blocks scaffolding. Allocated only when
     // cfg_.paged_blocks=true; otherwise these stay default-constructed
