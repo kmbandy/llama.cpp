@@ -4002,6 +4002,48 @@ void server_routes::init_routes() {
             }}}
         };
 
+        // MAD-133: Add paged-tier metrics when --kv-tier-paged-blocks
+        // is on. Reads counters directly from the live cache (single-
+        // thread contract — main thread is the only mutator; metrics
+        // endpoint runs on the HTTP thread but only READS volatile
+        // uint64s, which is safe-ish on x86/ARM64 for monotonic counters).
+        if (ctx_server.ctx) {
+            llama_kv_cache_paged * paged_cache = mt_get_paged_cache(llama_get_memory(ctx_server.ctx));
+            if (paged_cache) {
+                auto add_counter = [&](const char * name, const char * help, uint64_t value) {
+                    json m;
+                    m["name"]  = name;
+                    m["help"]  = help;
+                    m["value"] = value;
+                    all_metrics_def["counter"].push_back(m);
+                };
+                auto add_gauge = [&](const char * name, const char * help, uint64_t value) {
+                    json m;
+                    m["name"]  = name;
+                    m["help"]  = help;
+                    m["value"] = value;
+                    all_metrics_def["gauge"].push_back(m);
+                };
+
+                add_counter("paged_evict_hot_to_warm_total",   "Hot→warm evictions",            paged_cache->evict_h2w_total());
+                add_counter("paged_evict_warm_to_cold_total",  "Warm→cold evictions",           paged_cache->evict_w2c_total());
+                add_counter("paged_evict_cold_to_drop_total",  "Cold-block drops (no recovery)", paged_cache->evict_c2drop_total());
+                add_counter("paged_restore_warm_to_hot_total", "Warm→hot restores",             paged_cache->restore_w2h_total());
+                add_counter("paged_restore_cold_to_hot_total", "Cold→hot restores",             paged_cache->restore_c2h_total());
+                add_counter("paged_seq_preempt_total",         "MAD-120 whole-seq preemptions", paged_cache->seq_preempt_total());
+                add_counter("paged_seq_restore_total",         "MAD-120 whole-seq restores",    paged_cache->seq_restore_total());
+
+                add_counter("paged_semantic_attempts_total",        "MAD-129 semantic restore attempts",         paged_cache->semantic_attempts_total());
+                add_counter("paged_semantic_hits_total",            "MAD-129 semantic restore attempts that restored ≥1 block", paged_cache->semantic_hits_total());
+                add_counter("paged_semantic_blocks_restored_total", "MAD-129 total blocks restored via semantic", paged_cache->semantic_blocks_restored_total());
+
+                add_gauge("paged_blocks_capacity_gpu",   "GPU pool size (blocks)",   paged_cache->n_blocks_total());
+                add_gauge("paged_blocks_capacity_warm",  "Warm pool size (blocks)",  paged_cache->n_warm_blocks());
+                add_gauge("paged_blocks_capacity_cold",  "Cold pool size (blocks)",  paged_cache->n_cold_blocks());
+                add_gauge("paged_fingerprints",          "MAD-129 paged-block fingerprints currently held", paged_cache->n_paged_fingerprints());
+            }
+        }
+
         // Add weight pager metrics if enabled
         if (ctx_server.model && ctx_server.model->weight_pager) {
             auto * pager = ctx_server.model->weight_pager.get();
@@ -4079,7 +4121,28 @@ void server_routes::init_routes() {
             }
         }
 
-        res->ok(res_task->slots_data);
+        // MAD-133: enrich each slot's JSON with paged-tier residency
+        // (blocks_hot / blocks_warm / blocks_cold / fingerprints).
+        // Skipped when paged isn't on or the slot's id is missing.
+        json slots_out = res_task->slots_data;
+        if (slots_out.is_array() && ctx_server.ctx) {
+            llama_kv_cache_paged * paged_cache = mt_get_paged_cache(llama_get_memory(ctx_server.ctx));
+            if (paged_cache) {
+                for (auto & slot : slots_out) {
+                    if (!slot.contains("id")) continue;
+                    const llama_seq_id sid = slot["id"].get<llama_seq_id>();
+                    if (sid < 0) continue;
+                    slot["tier"] = {
+                        {"blocks_hot",   paged_cache->n_gpu_blocks_for(sid)},
+                        {"blocks_warm",  paged_cache->n_warm_blocks_for(sid)},
+                        {"blocks_cold",  paged_cache->n_blocks_cold_for(sid)},
+                        {"fingerprints", paged_cache->n_fingerprints_for_seq(sid)},
+                    };
+                }
+            }
+        }
+
+        res->ok(slots_out);
         return res;
     };
 

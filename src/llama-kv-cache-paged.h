@@ -306,6 +306,35 @@ public:
     uint32_t n_cold_blocks() const { return n_cold_blocks_; }
     bool     cold_enabled()  const { return n_cold_blocks_ > 0; }
 
+    // ─── MAD-133: tier-movement counters (monotonic since startup) ───
+    //
+    // Read by the /metrics/tier endpoint. All uint64. No locking needed
+    // — single-thread mutator contract (Epic A4 / MAD-132). Reset on
+    // clear() + state_read.
+    uint64_t evict_h2w_total()          const { return evict_h2w_total_; }
+    uint64_t evict_w2c_total()          const { return evict_w2c_total_; }
+    uint64_t evict_c2drop_total()       const { return evict_c2drop_total_; }
+    uint64_t restore_w2h_total()        const { return restore_w2h_total_; }
+    uint64_t restore_c2h_total()        const { return restore_c2h_total_; }
+    uint64_t seq_preempt_total()        const { return seq_preempt_total_; }
+    uint64_t seq_restore_total()        const { return seq_restore_total_; }
+    uint64_t semantic_attempts_total()  const { return semantic_attempts_total_; }
+    uint64_t semantic_hits_total()      const { return semantic_hits_total_; }
+    uint64_t semantic_blocks_restored_total() const { return semantic_blocks_restored_total_; }
+
+    // ─── MAD-133: per-seq tier-residency accessors ───
+    //
+    // n_blocks_hot_for / n_blocks_warm_for already exist (lines 217-218
+    // — used by can_admit). New: cold + fingerprint counts for /slots.
+    uint32_t n_blocks_cold_for(llama_seq_id seq_id) const;
+    size_t   n_fingerprints_for_seq(llama_seq_id seq_id) const {
+        return paged_semantic_.size(seq_id);
+    }
+
+    // Per-instance ID accessor (set in ctor; immutable after). Used by
+    // /metrics/tier to label its output.
+    const std::string & instance_id() const { return instance_id_; }
+
     // MAD-132: drop the OLDEST cold block from cold_pool_free_ by
     // unmapping the (seq, lblock) it was assigned to and freeing the
     // cold_idx. Used as the final escalation when all three tiers are
@@ -490,6 +519,19 @@ private:
     uint32_t                  n_cold_blocks_ = 0;
     uint32_t                  cold_in_use_   = 0;
     std::string               cold_path_;
+
+    // MAD-133: tier-movement counters (monotonic since startup, single-
+    // threaded so no atomics). Bumped at the relevant tier-move sites.
+    uint64_t evict_h2w_total_                = 0;
+    uint64_t evict_w2c_total_                = 0;
+    uint64_t evict_c2drop_total_             = 0;
+    uint64_t restore_w2h_total_              = 0;
+    uint64_t restore_c2h_total_              = 0;
+    uint64_t seq_preempt_total_              = 0;
+    uint64_t seq_restore_total_              = 0;
+    uint64_t semantic_attempts_total_        = 0;
+    uint64_t semantic_hits_total_            = 0;
+    uint64_t semantic_blocks_restored_total_ = 0;
 
     // MAD-131: per-instance subdir + flock-based double-start protection.
     // instance_id_ defaults to the process pid as a string; --instance-id

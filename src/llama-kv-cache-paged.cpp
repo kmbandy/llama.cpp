@@ -550,6 +550,7 @@ bool llama_kv_cache_paged::evict_block_to_warm(llama_seq_id seq_id, uint32_t log
     // free the GPU physical back to the pool.
     table_.swap_block(seq_id, logical_block, cpu_physical);
     pool_.free_block(gpu_physical);
+    ++evict_h2w_total_;  // MAD-133
     return true;
 }
 
@@ -588,6 +589,7 @@ bool llama_kv_cache_paged::restore_block_from_warm(llama_seq_id seq_id, uint32_t
 
     table_.swap_block(seq_id, logical_block, gpu_physical);
     pool_.free_block(cpu_physical);
+    ++restore_w2h_total_;  // MAD-133
     return true;
 }
 
@@ -898,6 +900,7 @@ int llama_kv_cache_paged::evict_seq_to_warm(llama_seq_id seq_id) {
         }
         ++moved;
     }
+    if (moved > 0) ++seq_preempt_total_;  // MAD-133
     LLAMA_LOG_DEBUG("evict_seq_to_warm: seq=%d evicted %d block(s)\n", seq_id, moved);
     return moved;
 }
@@ -919,6 +922,7 @@ int llama_kv_cache_paged::restore_seq_from_warm(llama_seq_id seq_id) {
         }
         ++moved;
     }
+    if (moved > 0) ++seq_restore_total_;  // MAD-133
     LLAMA_LOG_DEBUG("restore_seq_from_warm: seq=%d restored %d block(s)\n", seq_id, moved);
     return moved;
 }
@@ -989,6 +993,7 @@ bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lbl
     pool_.free_block(phys);
     mark_cold(cold_slot_for_, seq_id, lblock, cold_idx);
     ++cold_in_use_;
+    ++evict_w2c_total_;  // MAD-133
     return true;
 }
 
@@ -1031,6 +1036,7 @@ bool llama_kv_cache_paged::restore_block_from_cold(llama_seq_id seq_id, uint32_t
     mark_cold(cold_slot_for_, seq_id, lblock, kInvalidColdIdx);
     cold_pool_free_.push_back(cold_idx);
     if (cold_in_use_ > 0) --cold_in_use_;
+    ++restore_c2h_total_;  // MAD-133
     return true;
 }
 
@@ -1051,6 +1057,7 @@ uint32_t llama_kv_cache_paged::restore_semantic_paged(
         float                      threshold) {
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
 
+    ++semantic_attempts_total_;  // MAD-133
     auto hints = paged_semantic_.score(seq_id, query_embedding, top_k, threshold);
     if (hints.empty()) return 0;
 
@@ -1089,6 +1096,10 @@ uint32_t llama_kv_cache_paged::restore_semantic_paged(
                    requested == 0 ? 0.0f : 100.0f * (float) restored / (float) requested,
                    already_hot, unmapped, restore_fail);
 
+    if (restored > 0) {
+        ++semantic_hits_total_;                                // MAD-133
+        semantic_blocks_restored_total_ += restored;           // MAD-133
+    }
     return restored;
 }
 
@@ -1118,6 +1129,7 @@ bool llama_kv_cache_paged::drop_oldest_cold_block() {
             row[lb] = kInvalidColdIdx;
             cold_pool_free_.push_back(cold_idx);
             if (cold_in_use_ > 0) --cold_in_use_;
+            ++evict_c2drop_total_;  // MAD-133
             LLAMA_LOG_INFO("llama_kv_cache_paged::drop_oldest_cold_block: dropped "
                            "(seq=%u, lblock=%u, cold_idx=%u) — owning seq sees a "
                            "hole at this block (kernel handles via -INFINITY logit)\n",
@@ -1126,6 +1138,17 @@ bool llama_kv_cache_paged::drop_oldest_cold_block() {
         }
     }
     return false;
+}
+
+// MAD-133: count cold-resident blocks for a seq.
+uint32_t llama_kv_cache_paged::n_blocks_cold_for(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
+    if ((size_t) seq_id >= cold_slot_for_.size()) return 0;
+    uint32_t cnt = 0;
+    for (uint32_t v : cold_slot_for_[seq_id]) {
+        if (v != kInvalidColdIdx) ++cnt;
+    }
+    return cnt;
 }
 
 // MAD-132: idle-priority victim selection for whole-slot preemption.
@@ -1282,6 +1305,15 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
 }
 
 bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
+    // MAD-133: snapshot counters for the per-batch tier_event log emitted
+    // at the end of this method. If any tier movement happened during
+    // this batch we emit one structured INF line; quiet otherwise.
+    const uint64_t pre_evict_h2w   = evict_h2w_total_;
+    const uint64_t pre_evict_w2c   = evict_w2c_total_;
+    const uint64_t pre_evict_drop  = evict_c2drop_total_;
+    const uint64_t pre_restore_w2h = restore_w2h_total_;
+    const uint64_t pre_restore_c2h = restore_c2h_total_;
+    const uint64_t pre_seq_preempt = seq_preempt_total_;
     // Per-seq: count tokens, find max position. Sized to n_seq_max_ for
     // direct indexing — n_seq_max_ is bounded (typical 4–32).
     std::vector<uint32_t>  tokens_per_seq(n_seq_max_, 0);
@@ -1349,6 +1381,31 @@ bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
     if (!cow_writes_for_ubatch(ub)) {
         return false;
     }
+
+    // MAD-133: emit the per-batch tier_event log if any tier movement
+    // happened during this batch. Quiet for normal flow (no eviction =
+    // no log line); informative when something moved.
+    const uint64_t d_h2w   = evict_h2w_total_   - pre_evict_h2w;
+    const uint64_t d_w2c   = evict_w2c_total_   - pre_evict_w2c;
+    const uint64_t d_drop  = evict_c2drop_total_ - pre_evict_drop;
+    const uint64_t d_w2h   = restore_w2h_total_ - pre_restore_w2h;
+    const uint64_t d_c2h   = restore_c2h_total_ - pre_restore_c2h;
+    const uint64_t d_preempt = seq_preempt_total_ - pre_seq_preempt;
+    if (d_h2w || d_w2c || d_drop || d_w2h || d_c2h || d_preempt) {
+        LLAMA_LOG_INFO("[mt::tier_event] instance=%s "
+                       "evict_h2w=%llu evict_w2c=%llu evict_drop=%llu "
+                       "restore_w2h=%llu restore_c2h=%llu preempt=%llu "
+                       "pool_free_gpu=%zu pool_free_cpu=%zu cold_in_use=%u\n",
+                       instance_id_.c_str(),
+                       (unsigned long long) d_h2w,
+                       (unsigned long long) d_w2c,
+                       (unsigned long long) d_drop,
+                       (unsigned long long) d_w2h,
+                       (unsigned long long) d_c2h,
+                       (unsigned long long) d_preempt,
+                       pool_.n_free_gpu(), pool_.n_free_cpu(), cold_in_use_);
+    }
+
     return true;
 }
 
