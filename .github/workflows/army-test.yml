@@ -1,28 +1,16 @@
 name: CI (army — paged + tiered KV)
 
-# MAD-137 CI integration. Two layers:
+# MAD-137 CI integration. Hosted-runner-only:
+#  - Compile for the CPU backend so the mt:: + paged sources catch any
+#    cross-arch breakage immediately.
+#  - Run the mt:: unit tests + the integration tests with no model
+#    (they self-skip when LLAMACPP_TEST_MODELFILE is unset, but the
+#    binaries still have to build cleanly).
 #
-#   1. Hosted-runner jobs (every push / PR):
-#      - Compile for the CPU backend so the mt:: + paged sources catch
-#        any cross-arch breakage immediately.
-#      - Run the mt:: unit tests + the integration tests with no model
-#        (they self-skip when LLAMACPP_TEST_MODELFILE is unset, but the
-#        binaries still have to build cleanly).
-#
-#   2. Self-hosted-runner jobs (scheduled nightly):
-#      - For each army GPU, run scripts/test/run-army-matrix.sh which
-#        builds + runs the full ctest + stress driver against the real
-#        hardware. Each device should have a self-hosted runner labeled
-#        `army-<device>` registered with the repo.
-#
-# Notes:
-#  - Hosted runners on GitHub do NOT have CUDA or HIP GPUs, so compile
-#    for those backends is best done on the same self-hosted boxes that
-#    run the stress tests. We do compile for CPU here as a smoke for the
-#    mt:: source surface.
-#  - Stress jobs are marked continue-on-error so a single device's
-#    transient flake doesn't fail the whole nightly. Per-device pass/fail
-#    is in the artifact JSON; aggregate dashboards consume that.
+# Real-hardware testing on the army GPUs (R9700, 6900XT, 1070, RX 480)
+# is run manually via scripts/test/run-army-matrix.sh on the dev boxes.
+# Self-hosted runners were intentionally not wired up — they expose the
+# dev boxes to inbound CI traffic, which we don't want.
 
 on:
   workflow_dispatch:   # manual trigger
@@ -46,9 +34,6 @@ on:
       - 'tests/test-paged-*'
       - 'tests/stress/**'
       - 'scripts/test/**'
-  schedule:
-    # Nightly at 07:00 UTC (~midnight Pacific).
-    - cron: '0 7 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -62,7 +47,6 @@ env:
   LLAMA_LOG_TIMESTAMPS: 1
 
 jobs:
-  # ─── Hosted: CPU build + mt:: unit tests + paged-* integration (no model) ───
   hosted-cpu-tests:
     name: "hosted (cpu) — unit + integration smoke"
     runs-on: ubuntu-24.04
@@ -99,89 +83,3 @@ jobs:
         working-directory: build
         run: |
           ctest -R 'test-mt-|test-paged-' --output-on-failure
-
-  # ─── Self-hosted: per-device matrix runner ───────────────────────────
-  # Each device job runs on a self-hosted runner with a matching label.
-  # If a runner isn't registered the job is queued/skipped — this is
-  # opt-in infrastructure the operator wires up per box.
-  army-matrix:
-    name: army (${{ matrix.device }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: hosted-cpu-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - device: r9700
-            runner_label: army-r9700
-          - device: 6900xt
-            runner_label: army-6900xt
-          - device: 1070
-            runner_label: army-1070
-          - device: rx480
-            runner_label: army-rx480
-    runs-on: [self-hosted, "${{ matrix.runner_label }}"]
-    continue-on-error: true
-    steps:
-      - name: Clone
-        uses: actions/checkout@v6
-
-      - name: Run device matrix slice
-        env:
-          DEVICES: ${{ matrix.device }}
-          # Per-device decode floors are tunable from the run-time env;
-          # defaults are baked into scripts/test/run-army-matrix.sh.
-          STRESS_DURATION: 120
-        run: |
-          bash scripts/test/run-army-matrix.sh
-
-      - name: Upload result JSON + logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: army-matrix-${{ matrix.device }}
-          path: tests/results/
-          if-no-files-found: warn
-          retention-days: 14
-
-  # ─── Aggregator: collapses matrix results into one summary ──────────
-  army-summary:
-    name: army summary
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: army-matrix
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Download all matrix artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Combine per-device JSON into one summary
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          all_devices = []
-          for entry in sorted(Path("artifacts").glob("army-matrix-*")):
-              for j in entry.glob("army-matrix-*.json"):
-                  with open(j) as f:
-                      doc = json.load(f)
-                  all_devices.extend(doc.get("devices", []))
-          overall = "pass" if all(
-              d["unit"] == "pass" and d["stress"] in ("pass", "skipped")
-              for d in all_devices
-          ) else "fail"
-          summary = {"overall": overall, "devices": all_devices}
-          Path("army-summary.json").write_text(json.dumps(summary, indent=2))
-          print(json.dumps(summary, indent=2))
-          if overall != "pass":
-              raise SystemExit(1)
-          PY
-
-      - name: Upload combined summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: army-summary
-          path: army-summary.json
-          retention-days: 30
