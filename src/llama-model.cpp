@@ -2176,7 +2176,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* paged_max_blocks_per_seq  */ paged_max_bps,
                             /* paged_n_warm_blocks       */ paged_n_warm_blocks,
                             /* paged_n_cold_blocks       */ paged_n_cold_blocks,
-                            /* paged_ssd_path            */ paged_ssd_path);
+                            /* paged_ssd_path            */ paged_ssd_path,
+                            /* paged_cold_resume         */ params.kv_tier_cold_resume);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;

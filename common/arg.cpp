@@ -1493,6 +1493,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-tier-cold-resume"},
+        {"--no-kv-tier-cold-resume"},
+        "MAD-130: when true, skip O_TRUNC on cold-tier files at startup and load the in-memory index from "
+        "${ssd_path}/paged/index.bin (written by the prior server's clean shutdown or /slots/save). Lets the "
+        "server resume cold-tier contents across a clean restart. Sidecar absent or invalid → starts fresh "
+        "with a warning. Default false (legacy behavior: fresh truncation).",
+        [](common_params & params, bool value) {
+            params.kv_tier_cold_resume = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_COLD_RESUME").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

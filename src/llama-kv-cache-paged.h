@@ -90,6 +90,12 @@ public:
             // created. Ignored when n_cold_blocks == 0. The "/paged"
             // subdir is created on demand.
             std::string                ssd_path = std::string(),
+            // MAD-130: when true, skip the O_TRUNC on cold-tier files
+            // and load the in-memory cold index from the sidecar file
+            // at `${ssd_path}/paged/index.bin`. Lets the server resume
+            // cold-tier contents across a clean restart. Default false
+            // (legacy behavior: fresh truncation).
+            bool                       cold_resume = false,
             // Optional per-layer filter. Returns true for layers that should
             // get K/V allocation in the paged pool. Recurrent layers in
             // hybrid models should be filtered OUT (their state lives in
@@ -295,6 +301,23 @@ public:
         return paged_semantic_.has_fingerprint(seq_id, lblock);
     }
 
+    // MAD-130: persist the cold-tier index to a sidecar file at
+    // `${cold_path_}/paged/index.bin`. Called by the server on graceful
+    // shutdown or as part of /slots/save. Returns false on I/O error.
+    // No-op when cold tier is disabled.
+    bool save_cold_index_sidecar() const;
+
+    // MAD-130: persist the BlockSemanticIndex (paged-block fingerprints)
+    // to a sidecar file at the given path. Thin forwarders so the
+    // server can save fingerprints alongside state_write without poking
+    // at private members.
+    bool save_paged_fingerprints(const std::string & path) const {
+        return paged_semantic_.save_to_disk(path);
+    }
+    bool load_paged_fingerprints(const std::string & path) {
+        return paged_semantic_.load_from_disk(path);
+    }
+
 private:
     friend class llama_kv_cache_paged_context;
 
@@ -325,6 +348,13 @@ private:
     // multiple seqs whose total active ctx exceeds the hot capacity).
     // No-op if warm tier is disabled.
     bool fault_in_warm_blocks_for_batch(const llama_ubatch & ub);
+
+    // MAD-130: load the cold-tier sidecar from disk and rebuild
+    // cold_slot_for_ + cold_pool_free_ + cold_in_use_. Called from the
+    // ctor when cold_resume=true and the sidecar exists. Returns false
+    // if the sidecar is missing/corrupt/mismatched-config — caller
+    // should treat as "start fresh."
+    bool load_cold_index_sidecar_(const std::string & path);
 
     // MAD-128: CoW any blocks being written this ubatch that are shared
     // (refcount > 1 from a prior seq_cp). For each (seq, lblock) pair

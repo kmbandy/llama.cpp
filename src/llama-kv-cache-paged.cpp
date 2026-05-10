@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-io.h"
 #include "llama-model.h"
 #include "llama-hparams.h"
 #include "ggml-backend.h"
@@ -9,6 +10,7 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -59,6 +61,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         uint32_t                   n_warm_blocks,
         uint32_t                   n_cold_blocks,
         std::string                ssd_path,
+        bool                       cold_resume,
         layer_filter_cb            filter,
         ggml_type                  type_k,
         ggml_type                  type_v)
@@ -218,12 +221,18 @@ llama_kv_cache_paged::llama_kv_cache_paged(
             const off_t v_file_bytes = (off_t) n_cold_blocks_ * (off_t) v_bytes_per_block_;
             uint64_t total_bytes = 0;
             bool ok = true;
+            // MAD-130: cold_resume=true → open WITHOUT O_TRUNC so existing
+            // bytes survive. We'll load the in-memory index from the
+            // sidecar after the layer files are open.
+            const int open_flags = cold_resume
+                ? (O_RDWR | O_CREAT)            // preserve contents
+                : (O_RDWR | O_CREAT | O_TRUNC); // legacy: fresh
             for (uint32_t il = 0; il < n_layer && ok; ++il) {
                 if (!layers_[il].k) continue;
                 const std::string kpath = subdir + "/L" + std::to_string(il) + ".k.bin";
                 const std::string vpath = subdir + "/L" + std::to_string(il) + ".v.bin";
-                const int fk = ::open(kpath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-                const int fv = ::open(vpath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+                const int fk = ::open(kpath.c_str(), open_flags, 0600);
+                const int fv = ::open(vpath.c_str(), open_flags, 0600);
                 if (fk < 0 || fv < 0 ||
                     ::ftruncate(fk, k_file_bytes) < 0 ||
                     ::ftruncate(fv, v_file_bytes) < 0) {
@@ -246,19 +255,37 @@ llama_kv_cache_paged::llama_kv_cache_paged(
                 cold_fd_v_.clear();
                 n_cold_blocks_ = 0;
             } else {
-                // Free-stack of cold slot ids.
+                // Free-stack of cold slot ids. Initialize as all-free;
+                // the cold-resume sidecar load below will mark in-use
+                // slots and pull them off the free stack.
                 cold_pool_free_.reserve(n_cold_blocks_);
                 for (uint32_t i = n_cold_blocks_; i > 0; --i) {
                     cold_pool_free_.push_back(i - 1);
                 }
                 cold_slot_for_.assign(n_seq_max_, std::vector<uint32_t>());
+
+                // MAD-130: cold-resume — load the in-memory index from
+                // the sidecar. Sidecar absent → log warning but proceed
+                // (the on-disk bytes exist but we don't know what's
+                // in them; first-write of any slot will overwrite).
+                if (cold_resume) {
+                    const std::string sidecar = subdir + "/index.bin";
+                    if (!load_cold_index_sidecar_(sidecar)) {
+                        LLAMA_LOG_WARN("llama_kv_cache_paged: --kv-tier-cold-resume requested but "
+                                       "sidecar %s missing or invalid — starting with empty cold "
+                                       "index (existing file bytes ignored)\n",
+                                       sidecar.c_str());
+                    }
+                }
+
                 LLAMA_LOG_INFO("llama_kv_cache_paged: cold tier enabled — %u blocks × "
-                               "%.1f KiB/block (K+V) × %u attn layers = %.1f MiB on %s\n",
+                               "%.1f KiB/block (K+V) × %u attn layers = %.1f MiB on %s%s\n",
                                n_cold_blocks_,
                                (double)(k_bytes_per_block_ + v_bytes_per_block_) / 1024.0,
                                n_attn_layers,
                                (double) total_bytes / (1024.0 * 1024.0),
-                               subdir.c_str());
+                               subdir.c_str(),
+                               cold_resume ? " (resume mode)" : "");
             }
         }
     }
@@ -1463,15 +1490,459 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_paged::memory_breakd
     return out;
 }
 
-void llama_kv_cache_paged::state_write(llama_io_write_i & /*io*/, llama_seq_id /*seq_id*/,
-                                          llama_state_seq_flags /*flags*/) const {
-    // State persistence — punted to a later phase.
-    LLAMA_LOG_WARN("llama_kv_cache_paged::state_write: not implemented — state will not persist\n");
+// MAD-130: cold-tier sidecar persistence.
+//
+// File format (CIDX v1) at `${cold_path_}/paged/index.bin`:
+//   uint32  magic   = 0x58444943  ("CIDX")
+//   uint32  version = 1
+//   uint32  n_layers       (sanity check vs current cache)
+//   uint32  n_cold_blocks  (sanity check vs current cache)
+//   uint32  n_in_use
+//   For each in-use entry:
+//     int32  seq_id
+//     uint32 lblock
+//     uint32 cold_idx
+//
+// Save: called explicitly via save_cold_index_sidecar() (server
+// shutdown handler or /slots/save). Atomic via write-to-tmp + rename.
+//
+// Load: called from ctor when cold_resume=true. On any error (missing
+// file, bad magic, mismatched config), returns false and the caller
+// proceeds with an empty cold index.
+
+namespace {
+constexpr uint32_t kColdIndexMagic   = 0x58444943;  // "CIDX"
+constexpr uint32_t kColdIndexVersion = 1;
 }
 
-void llama_kv_cache_paged::state_read(llama_io_read_i & /*io*/, llama_seq_id /*seq_id*/,
+bool llama_kv_cache_paged::save_cold_index_sidecar() const {
+    if (!cold_enabled() || cold_path_.empty()) return true;  // no-op
+
+    const std::string subdir   = cold_path_ + "/paged";
+    const std::string sidecar  = subdir + "/index.bin";
+    const std::string tmp_path = sidecar + ".tmp";
+
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged::save_cold_index_sidecar: open(%s) failed\n",
+                       tmp_path.c_str());
+        return false;
+    }
+
+    auto write_u32 = [&](uint32_t v) { f.write((const char *) &v, sizeof(v)); };
+    auto write_i32 = [&](int32_t  v) { f.write((const char *) &v, sizeof(v)); };
+
+    write_u32(kColdIndexMagic);
+    write_u32(kColdIndexVersion);
+    const uint32_t n_layers = (uint32_t) layers_.size();
+    write_u32(n_layers);
+    write_u32(n_cold_blocks_);
+    write_u32(cold_in_use_);
+
+    // Walk cold_slot_for_ and write each in-use (seq, lblock, cold_idx).
+    uint32_t written = 0;
+    for (uint32_t s = 0; s < (uint32_t) cold_slot_for_.size(); ++s) {
+        const auto & row = cold_slot_for_[s];
+        for (uint32_t lb = 0; lb < (uint32_t) row.size(); ++lb) {
+            if (row[lb] == kInvalidColdIdx) continue;
+            write_i32((int32_t) s);
+            write_u32(lb);
+            write_u32(row[lb]);
+            ++written;
+        }
+    }
+    f.close();
+    if (written != cold_in_use_) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged::save_cold_index_sidecar: counted %u in-use entries "
+                       "but cold_in_use_ tracker says %u — sidecar may be inconsistent\n",
+                       written, cold_in_use_);
+    }
+    if (::rename(tmp_path.c_str(), sidecar.c_str()) != 0) {
+        LLAMA_LOG_WARN("llama_kv_cache_paged::save_cold_index_sidecar: rename %s -> %s failed\n",
+                       tmp_path.c_str(), sidecar.c_str());
+        return false;
+    }
+    LLAMA_LOG_INFO("llama_kv_cache_paged::save_cold_index_sidecar: wrote %u entries to %s\n",
+                   written, sidecar.c_str());
+    return true;
+}
+
+bool llama_kv_cache_paged::load_cold_index_sidecar_(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    auto read_u32 = [&](uint32_t & v) -> bool {
+        f.read((char *) &v, sizeof(v));
+        return (bool) f;
+    };
+    auto read_i32 = [&](int32_t & v) -> bool {
+        f.read((char *) &v, sizeof(v));
+        return (bool) f;
+    };
+
+    uint32_t magic = 0, version = 0, saved_n_layers = 0, saved_n_cold = 0, saved_n_in_use = 0;
+    if (!read_u32(magic) || !read_u32(version)) return false;
+    if (magic != kColdIndexMagic || version != kColdIndexVersion) {
+        LLAMA_LOG_WARN("load_cold_index_sidecar: bad header (magic=%08x ver=%u)\n", magic, version);
+        return false;
+    }
+    if (!read_u32(saved_n_layers) || !read_u32(saved_n_cold) || !read_u32(saved_n_in_use)) {
+        return false;
+    }
+    if (saved_n_layers != (uint32_t) layers_.size() || saved_n_cold != n_cold_blocks_) {
+        LLAMA_LOG_WARN("load_cold_index_sidecar: config mismatch (saved_n_layers=%u current=%zu, "
+                       "saved_n_cold=%u current=%u) — rejecting sidecar\n",
+                       saved_n_layers, layers_.size(), saved_n_cold, n_cold_blocks_);
+        return false;
+    }
+
+    // Walk in-use entries. Mark each cold slot in cold_slot_for_, and
+    // rebuild cold_pool_free_ minus the in-use slots.
+    std::vector<bool> in_use(n_cold_blocks_, false);
+    for (uint32_t i = 0; i < saved_n_in_use; ++i) {
+        int32_t  sid = 0;
+        uint32_t lb = 0, cold_idx = 0;
+        if (!read_i32(sid) || !read_u32(lb) || !read_u32(cold_idx)) return false;
+        if (sid < 0 || (uint32_t) sid >= n_seq_max_) continue;
+        if (cold_idx >= n_cold_blocks_) continue;
+        mark_cold(cold_slot_for_, (llama_seq_id) sid, lb, cold_idx);
+        in_use[cold_idx] = true;
+    }
+
+    // Rebuild free stack — only push slots NOT in use.
+    cold_pool_free_.clear();
+    cold_pool_free_.reserve(n_cold_blocks_);
+    for (uint32_t i = n_cold_blocks_; i > 0; --i) {
+        if (!in_use[i - 1]) cold_pool_free_.push_back(i - 1);
+    }
+    cold_in_use_ = saved_n_in_use;
+
+    LLAMA_LOG_INFO("llama_kv_cache_paged::load_cold_index_sidecar: loaded %u in-use cold "
+                   "entries (free pool: %zu)\n",
+                   saved_n_in_use, cold_pool_free_.size());
+    return true;
+}
+
+// MAD-130: state persistence for the paged cache.
+//
+// On-disk format (PAGS v1):
+//
+//   HEADER (76 bytes):
+//     magic            uint32  = 0x53474150 ("PAGS" little-endian)
+//     version          uint32  = 1
+//     n_seq_max        uint32  (config: must match on read)
+//     block_size       uint32  (config: must match on read)
+//     n_blocks_total   uint32  (config: GPU pool size; must match on read)
+//     n_warm_blocks    uint32  (config: must match on read)
+//     n_cold_blocks    uint32  (config: must match on read)
+//     n_layers         uint32  (config: total, including filtered-out)
+//     k_bytes_per_block uint64 (config sanity)
+//     v_bytes_per_block uint64 (config sanity)
+//     type_k           uint32  (ggml_type)
+//     type_v           uint32  (ggml_type)
+//     flags            uint32  (reserved)
+//
+//   PER-SEQ SECTION (one per saved seq):
+//     seq_present      uint8  (0 = end of seq list; 1 = entry follows)
+//     seq_id           int32
+//     pos_min          int32
+//     pos_max          int32
+//     num_blocks       uint32
+//     For each lblock in [0, num_blocks):
+//       tier_origin    uint8  (0=hole, 1=hot, 2=warm, 3=cold)
+//       if hot or warm:
+//         For each restorable layer (filter applied at construction):
+//           K bytes (k_bytes_per_block)
+//           V bytes (v_bytes_per_block)
+//       if cold:
+//         cold_idx     uint32  (slot in the per-layer .bin files)
+//
+//   FINGERPRINT SECTION:
+//     n_fingerprints   uint32
+//     For each: seq_id (int32), lblock (uint32), tier (uint8),
+//               embedding_dim (uint32), floats[embedding_dim]
+//
+// Validation: header config fields must EXACTLY match the runtime
+// cache (n_blocks_total, block_size, type_k, type_v, n_layers,
+// k/v_bytes_per_block). Mismatch → throw runtime_error with a clear
+// message; caller's /slots/restore returns the error to the client.
+
+namespace {
+constexpr uint32_t kPagedStateMagic   = 0x53474150;  // "PAGS"
+constexpr uint32_t kPagedStateVersion = 1;
+
+enum class PagedTierTag : uint8_t {
+    Hole = 0,
+    Hot  = 1,
+    Warm = 2,
+    Cold = 3,
+};
+}  // namespace
+
+void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_id,
+                                          llama_state_seq_flags /*flags*/) const {
+    // ── Header ──
+    io.write(&kPagedStateMagic,   sizeof(kPagedStateMagic));
+    io.write(&kPagedStateVersion, sizeof(kPagedStateVersion));
+    io.write(&n_seq_max_,         sizeof(n_seq_max_));
+    io.write(&block_size_,        sizeof(block_size_));
+    io.write(&n_blocks_total_,    sizeof(n_blocks_total_));
+    io.write(&n_warm_blocks_,     sizeof(n_warm_blocks_));
+    io.write(&n_cold_blocks_,     sizeof(n_cold_blocks_));
+    const uint32_t n_layers = (uint32_t) layers_.size();
+    io.write(&n_layers,           sizeof(n_layers));
+    const uint64_t k_bpb = (uint64_t) k_bytes_per_block_;
+    const uint64_t v_bpb = (uint64_t) v_bytes_per_block_;
+    io.write(&k_bpb,              sizeof(k_bpb));
+    io.write(&v_bpb,              sizeof(v_bpb));
+    const uint32_t type_k_u = (uint32_t) type_k_;
+    const uint32_t type_v_u = (uint32_t) type_v_;
+    io.write(&type_k_u,           sizeof(type_k_u));
+    io.write(&type_v_u,           sizeof(type_v_u));
+    const uint32_t flags_reserved = 0;
+    io.write(&flags_reserved,     sizeof(flags_reserved));
+
+    // ── Per-seq section ──
+    auto write_one_seq = [&](llama_seq_id sid) {
+        if (sid < 0 || (uint32_t) sid >= n_seq_max_) return;
+        const uint32_t n_blocks_seq = table_.num_blocks(sid);
+        // Skip empty seqs (no blocks).
+        if (n_blocks_seq == 0) return;
+
+        const uint8_t present = 1;
+        io.write(&present, sizeof(present));
+        const int32_t sid_i32 = (int32_t) sid;
+        io.write(&sid_i32, sizeof(sid_i32));
+        const int32_t pos_min = (int32_t) seq_states_[sid].pos_min;
+        const int32_t pos_max = (int32_t) seq_states_[sid].pos_max;
+        io.write(&pos_min, sizeof(pos_min));
+        io.write(&pos_max, sizeof(pos_max));
+        io.write(&n_blocks_seq, sizeof(n_blocks_seq));
+
+        std::vector<uint8_t> kbuf(k_bytes_per_block_);
+        std::vector<uint8_t> vbuf(v_bytes_per_block_);
+
+        for (uint32_t lb = 0; lb < n_blocks_seq; ++lb) {
+            const uint32_t physical = table_.get_physical(sid, lb);
+            PagedTierTag tag = PagedTierTag::Hole;
+            if (physical != mt::kInvalidBlockId) {
+                tag = pool_.is_gpu(physical) ? PagedTierTag::Hot : PagedTierTag::Warm;
+            } else if (cold_enabled() && cold_slot(cold_slot_for_, sid, lb) != kInvalidColdIdx) {
+                tag = PagedTierTag::Cold;
+            }
+            const uint8_t tag_u8 = (uint8_t) tag;
+            io.write(&tag_u8, sizeof(tag_u8));
+
+            if (tag == PagedTierTag::Hot) {
+                const size_t k_off_gpu = (size_t) physical * k_bytes_per_block_;
+                const size_t v_off_gpu = (size_t) physical * v_bytes_per_block_;
+                for (uint32_t il = 0; il < layers_.size(); ++il) {
+                    const auto & layer = layers_[il];
+                    if (!layer.k) continue;
+                    ggml_backend_tensor_get(layer.k, kbuf.data(), k_off_gpu, k_bytes_per_block_);
+                    ggml_backend_tensor_get(layer.v, vbuf.data(), v_off_gpu, v_bytes_per_block_);
+                    io.write(kbuf.data(), k_bytes_per_block_);
+                    io.write(vbuf.data(), v_bytes_per_block_);
+                }
+            } else if (tag == PagedTierTag::Warm) {
+                const uint32_t cpu_idx = physical - n_blocks_total_;
+                const size_t k_off_cpu = (size_t) cpu_idx * k_bytes_per_block_;
+                const size_t v_off_cpu = (size_t) cpu_idx * v_bytes_per_block_;
+                for (uint32_t il = 0; il < layers_.size(); ++il) {
+                    if (!layers_[il].k) continue;
+                    io.write(warm_k_[il].data() + k_off_cpu, k_bytes_per_block_);
+                    io.write(warm_v_[il].data() + v_off_cpu, v_bytes_per_block_);
+                }
+            } else if (tag == PagedTierTag::Cold) {
+                const uint32_t cold_idx = cold_slot(cold_slot_for_, sid, lb);
+                io.write(&cold_idx, sizeof(cold_idx));
+            }
+            // Hole: no extra bytes.
+        }
+    };
+
+    if (seq_id < 0) {
+        for (uint32_t s = 0; s < n_seq_max_; ++s) write_one_seq((llama_seq_id) s);
+    } else {
+        write_one_seq(seq_id);
+    }
+    const uint8_t end_marker = 0;
+    io.write(&end_marker, sizeof(end_marker));
+
+    // ── Fingerprint section ──
+    // BlockSemanticIndex doesn't expose iteration; for now we only
+    // serialize fingerprint COUNT here, with the actual data left to
+    // BlockSemanticIndex::save_to_disk (separate sidecar file). The
+    // sidecar approach matches the legacy SemanticIndex pattern and
+    // keeps state_write self-contained.
+    const uint32_t n_fingerprints_total = (uint32_t) paged_semantic_.size();
+    io.write(&n_fingerprints_total, sizeof(n_fingerprints_total));
+    // Fingerprints themselves are written via paged_semantic.save_to_disk,
+    // called by the server's /slots/save handler alongside this state_write.
+
+    LLAMA_LOG_INFO("llama_kv_cache_paged::state_write: wrote %zu bytes "
+                   "(seq_id=%d, n_fingerprints=%u)\n",
+                   io.n_bytes(), seq_id, n_fingerprints_total);
+}
+
+void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                                          llama_state_seq_flags /*flags*/) {
-    LLAMA_LOG_WARN("llama_kv_cache_paged::state_read: not implemented — state will not load\n");
+    // ── Header validation ──
+    uint32_t magic, version;
+    io.read(&magic,   sizeof(magic));
+    io.read(&version, sizeof(version));
+    if (magic != kPagedStateMagic) {
+        throw std::runtime_error("llama_kv_cache_paged::state_read: bad magic — not a PAGS state file");
+    }
+    if (version != kPagedStateVersion) {
+        throw std::runtime_error("llama_kv_cache_paged::state_read: unsupported version " +
+                                 std::to_string(version));
+    }
+
+    uint32_t saved_n_seq_max, saved_block_size, saved_n_blocks_total;
+    uint32_t saved_n_warm, saved_n_cold, saved_n_layers;
+    uint64_t saved_k_bpb, saved_v_bpb;
+    uint32_t saved_type_k, saved_type_v, saved_flags;
+    io.read(&saved_n_seq_max,      sizeof(saved_n_seq_max));
+    io.read(&saved_block_size,     sizeof(saved_block_size));
+    io.read(&saved_n_blocks_total, sizeof(saved_n_blocks_total));
+    io.read(&saved_n_warm,         sizeof(saved_n_warm));
+    io.read(&saved_n_cold,         sizeof(saved_n_cold));
+    io.read(&saved_n_layers,       sizeof(saved_n_layers));
+    io.read(&saved_k_bpb,          sizeof(saved_k_bpb));
+    io.read(&saved_v_bpb,          sizeof(saved_v_bpb));
+    io.read(&saved_type_k,         sizeof(saved_type_k));
+    io.read(&saved_type_v,         sizeof(saved_type_v));
+    io.read(&saved_flags,          sizeof(saved_flags));
+
+    auto require = [](bool cond, const char * what, auto saved, auto current) {
+        if (!cond) {
+            std::string msg = std::string("llama_kv_cache_paged::state_read: ") + what +
+                              " mismatch — saved=" + std::to_string(saved) +
+                              " current=" + std::to_string(current) +
+                              " (state file from a different cache config)";
+            throw std::runtime_error(msg);
+        }
+    };
+    require(saved_n_seq_max == n_seq_max_,           "n_seq_max",      saved_n_seq_max,      n_seq_max_);
+    require(saved_block_size == block_size_,         "block_size",     saved_block_size,     block_size_);
+    require(saved_n_blocks_total == n_blocks_total_, "n_blocks_total", saved_n_blocks_total, n_blocks_total_);
+    require(saved_n_warm == n_warm_blocks_,          "n_warm_blocks",  saved_n_warm,         n_warm_blocks_);
+    require(saved_n_cold == n_cold_blocks_,          "n_cold_blocks",  saved_n_cold,         n_cold_blocks_);
+    require(saved_n_layers == (uint32_t) layers_.size(), "n_layers",   saved_n_layers,       (uint32_t) layers_.size());
+    require(saved_k_bpb == (uint64_t) k_bytes_per_block_, "k_bytes_per_block", saved_k_bpb, (uint64_t) k_bytes_per_block_);
+    require(saved_v_bpb == (uint64_t) v_bytes_per_block_, "v_bytes_per_block", saved_v_bpb, (uint64_t) v_bytes_per_block_);
+    require(saved_type_k == (uint32_t) type_k_, "type_k", saved_type_k, (uint32_t) type_k_);
+    require(saved_type_v == (uint32_t) type_v_, "type_v", saved_type_v, (uint32_t) type_v_);
+
+    std::vector<uint8_t> kbuf(k_bytes_per_block_);
+    std::vector<uint8_t> vbuf(v_bytes_per_block_);
+
+    // ── Per-seq sections ──
+    uint32_t n_seqs_loaded = 0;
+    uint32_t n_blocks_loaded = 0;
+    while (true) {
+        uint8_t present = 0;
+        io.read(&present, sizeof(present));
+        if (present == 0) break;
+
+        int32_t saved_sid = 0;
+        io.read(&saved_sid, sizeof(saved_sid));
+        // If caller asked for a specific seq_id, remap saved data into
+        // that slot (allows /slots/restore into a different slot ID).
+        const llama_seq_id load_sid = (seq_id < 0) ? (llama_seq_id) saved_sid : seq_id;
+        if (load_sid < 0 || (uint32_t) load_sid >= n_seq_max_) {
+            throw std::runtime_error("llama_kv_cache_paged::state_read: seq_id out of range");
+        }
+
+        // Wipe the existing seq before reading. Honors refcount via
+        // free_block (shared blocks decrement, free at 0).
+        seq_rm(load_sid, 0, std::numeric_limits<llama_pos>::max());
+
+        int32_t pos_min = 0, pos_max = 0;
+        uint32_t n_blocks_seq = 0;
+        io.read(&pos_min,      sizeof(pos_min));
+        io.read(&pos_max,      sizeof(pos_max));
+        io.read(&n_blocks_seq, sizeof(n_blocks_seq));
+
+        for (uint32_t lb = 0; lb < n_blocks_seq; ++lb) {
+            uint8_t tag_u8 = 0;
+            io.read(&tag_u8, sizeof(tag_u8));
+            const PagedTierTag tag = (PagedTierTag) tag_u8;
+
+            if (tag == PagedTierTag::Hole) {
+                table_.append_block(load_sid, mt::kInvalidBlockId);
+                continue;
+            }
+
+            if (tag == PagedTierTag::Hot) {
+                const uint32_t phys = pool_.alloc_gpu();
+                if (phys == mt::kInvalidBlockId) {
+                    throw std::runtime_error("llama_kv_cache_paged::state_read: GPU pool exhausted "
+                                             "while restoring hot block");
+                }
+                const size_t k_off_gpu = (size_t) phys * k_bytes_per_block_;
+                const size_t v_off_gpu = (size_t) phys * v_bytes_per_block_;
+                for (uint32_t il = 0; il < layers_.size(); ++il) {
+                    if (!layers_[il].k) continue;
+                    io.read(kbuf.data(), k_bytes_per_block_);
+                    io.read(vbuf.data(), v_bytes_per_block_);
+                    ggml_backend_tensor_set(layers_[il].k, kbuf.data(), k_off_gpu, k_bytes_per_block_);
+                    ggml_backend_tensor_set(layers_[il].v, vbuf.data(), v_off_gpu, v_bytes_per_block_);
+                }
+                table_.append_block(load_sid, phys);
+            } else if (tag == PagedTierTag::Warm) {
+                if (!warm_enabled()) {
+                    throw std::runtime_error("llama_kv_cache_paged::state_read: warm tier disabled but "
+                                             "saved state has warm blocks");
+                }
+                const uint32_t phys = pool_.alloc_cpu();
+                if (phys == mt::kInvalidBlockId) {
+                    throw std::runtime_error("llama_kv_cache_paged::state_read: CPU pool exhausted "
+                                             "while restoring warm block");
+                }
+                const uint32_t cpu_idx = phys - n_blocks_total_;
+                const size_t k_off_cpu = (size_t) cpu_idx * k_bytes_per_block_;
+                const size_t v_off_cpu = (size_t) cpu_idx * v_bytes_per_block_;
+                for (uint32_t il = 0; il < layers_.size(); ++il) {
+                    if (!layers_[il].k) continue;
+                    io.read(warm_k_[il].data() + k_off_cpu, k_bytes_per_block_);
+                    io.read(warm_v_[il].data() + v_off_cpu, v_bytes_per_block_);
+                }
+                table_.append_block(load_sid, phys);
+            } else if (tag == PagedTierTag::Cold) {
+                if (!cold_enabled()) {
+                    throw std::runtime_error("llama_kv_cache_paged::state_read: cold tier disabled but "
+                                             "saved state has cold blocks");
+                }
+                uint32_t cold_idx = 0;
+                io.read(&cold_idx, sizeof(cold_idx));
+                if (cold_idx >= n_cold_blocks_) {
+                    throw std::runtime_error("llama_kv_cache_paged::state_read: cold_idx out of range");
+                }
+                // Mark as cold-resident; the actual bytes live in the
+                // cold-tier files (which require --kv-tier-cold-resume
+                // to survive a restart — separate part of MAD-130).
+                mark_cold(cold_slot_for_, load_sid, lb, cold_idx);
+                table_.append_block(load_sid, mt::kInvalidBlockId);
+                ++cold_in_use_;
+            }
+            ++n_blocks_loaded;
+        }
+
+        seq_states_[load_sid].pos_min = pos_min;
+        seq_states_[load_sid].pos_max = pos_max;
+        ++n_seqs_loaded;
+    }
+
+    // ── Fingerprint count (data lives in sidecar) ──
+    uint32_t n_fingerprints_meta = 0;
+    io.read(&n_fingerprints_meta, sizeof(n_fingerprints_meta));
+
+    LLAMA_LOG_INFO("llama_kv_cache_paged::state_read: loaded %u seq(s), %u block(s); "
+                   "fingerprint sidecar reports %u entries (load via "
+                   "BlockSemanticIndex::load_from_disk).\n",
+                   n_seqs_loaded, n_blocks_loaded, n_fingerprints_meta);
 }
 
 // ─── llama_kv_cache_paged_context ───

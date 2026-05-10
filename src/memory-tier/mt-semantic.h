@@ -155,6 +155,13 @@ public:
     size_t size() const;
     size_t size(llama_seq_id seq_id) const;
 
+    // MAD-130: persistence. Format magic = "PSFI" v1. Saves all
+    // (seq_id, lblock, tier, embedding) tuples to the path. Returns
+    // false on I/O error. load_from_disk replaces the in-memory
+    // state with the file's contents (any prior data is dropped).
+    bool save_to_disk(const std::string & path) const;
+    bool load_from_disk(const std::string & path);
+
 private:
     struct Entry {
         std::vector<float>  embedding;

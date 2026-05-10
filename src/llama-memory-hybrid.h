@@ -56,7 +56,11 @@ public:
                  uint32_t   paged_n_warm_blocks = 0,
                  // MAD-121: cold-tier (SSD) capacity + path. 0 = cold disabled.
                  uint32_t   paged_n_cold_blocks = 0,
-                 std::string paged_ssd_path     = std::string());
+                 std::string paged_ssd_path     = std::string(),
+                 // MAD-130: when true, skip O_TRUNC on cold-tier files
+                 // and load the in-memory index from the sidecar at
+                 // ${paged_ssd_path}/paged/index.bin.
+                 bool       paged_cold_resume   = false);
 
     ~llama_memory_hybrid() = default;
 
