@@ -965,7 +965,25 @@ private:
         if (!llama_memory_can_shift(llama_get_memory(ctx))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+                if (params_base.kv_tier_paged_blocks) {
+                    // MAD-128: paged-blocks deliberately doesn't support
+                    // position-shift in-place (would require re-indexing
+                    // every block_table entry + per-block reindex of the
+                    // GPU K/V layout). Instead: when a slot hits its
+                    // context limit, the server stops it with
+                    // STOP_TYPE_LIMIT and the caller resubmits as a fresh
+                    // request — paged's prompt-cache + semantic prefetch
+                    // recover most of the prefix on the next prefill.
+                    SRV_WRN("%s\n", "ctx_shift disabled: --kv-tier-paged-blocks "
+                            "is set; paged attention manages context via "
+                            "tier movement, not in-place shift. Slots will "
+                            "stop at n_ctx; clients should re-submit fresh "
+                            "requests (prompt cache + semantic prefetch "
+                            "will recover the prefix). Plan capacity "
+                            "accordingly.");
+                } else {
+                    SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+                }
             }
 
             if (params_base.n_cache_reuse) {
@@ -1649,8 +1667,20 @@ private:
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            // MAD-128: clear log when paged hits the limit — the operator
+            // needs to know this is a "resubmit and rely on prompt cache"
+            // situation, not a hard failure. SLT_INF (not DBG) so it lands
+            // in the default log level.
+            if (params_base.kv_tier_paged_blocks) {
+                SLT_INF(slot, "paged: hit n_ctx limit (n_tokens=%d, n_ctx=%d) — "
+                        "stopping slot. Client should re-submit as a fresh "
+                        "request; the prompt cache + semantic prefetch will "
+                        "recover the prefix.\n",
+                        slot.prompt.n_tokens(), slot.n_ctx);
+            } else {
+                SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+                        slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            }
         }
 
         // check the limits
