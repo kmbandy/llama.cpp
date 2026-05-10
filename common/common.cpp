@@ -1547,7 +1547,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
                                               : params.kv_semantic_index.c_str();
     cparams.kv_tier_semantic_threshold  = params.kv_semantic_threshold;
     cparams.kv_tier_semantic_topk       = params.kv_semantic_top_k;
-    cparams.kv_tier_paged_blocks        = params.kv_tier_paged_blocks;
+    // MAD-134: auto-enable paged-blocks when --kv-tiered is set AND
+    // the user didn't explicitly choose either way. The army-goal use
+    // case (hybrid models + multi-agent serving) wants paged-on; the
+    // explicit-pct path stays opt-in via --no-kv-tier-paged-blocks.
+    bool effective_paged = params.kv_tier_paged_blocks;
+    if (!params.kv_tier_paged_blocks_explicit && params.kv_tiered_enabled && !params.kv_tier_paged_blocks) {
+        effective_paged = true;
+        LOG_INF("%s: auto-enabled --kv-tier-paged-blocks (--kv-tiered set; pass "
+                "--no-kv-tier-paged-blocks to opt out)\n", __func__);
+    }
+    cparams.kv_tier_paged_blocks        = effective_paged;
     cparams.kv_tier_paged_block_size    = params.kv_tier_paged_block_size;
     cparams.kv_tier_cold_resume         = params.kv_tier_cold_resume;
     cparams.kv_tier_instance_id         = params.kv_tier_instance_id.empty()

@@ -23,10 +23,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -847,6 +853,36 @@ private:
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
+
+        // MAD-134: validate tier-related config BEFORE model load so
+        // operators get fast clear failure instead of late crashes.
+        if (!params.kv_semantic_index.empty()) {
+            struct stat st;
+            if (::stat(params.kv_semantic_index.c_str(), &st) != 0) {
+                SRV_ERR("--kv-tier-semantic-index '%s' does not exist or is not "
+                        "readable. Either provide a valid bge-small / nomic-embed gguf "
+                        "file, or omit the flag to disable semantic prefetch.\n",
+                        params.kv_semantic_index.c_str());
+                return false;
+            }
+        }
+        if (params.kv_tiered_enabled && params.kv_tier_cold_pct > 0.0f &&
+            !params.kv_tier_ssd_path.empty()) {
+            // Try to mkdir + create a test file to confirm writability.
+            const std::string test_dir = params.kv_tier_ssd_path;
+            (void) ::mkdir(test_dir.c_str(), 0700);  // ok if exists
+            const std::string test_path = test_dir + "/.write_test_" +
+                                          std::to_string(::getpid());
+            int fd = ::open(test_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                SRV_ERR("--kv-tier-ssd-path '%s' is not writable (errno %d: %s). "
+                        "Pick a different path or fix permissions.\n",
+                        test_dir.c_str(), errno, strerror(errno));
+                return false;
+            }
+            ::close(fd);
+            ::unlink(test_path.c_str());
+        }
 
         params_base = params;
         if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {

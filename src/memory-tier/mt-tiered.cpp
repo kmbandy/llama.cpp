@@ -71,6 +71,11 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
     // (hybrid + paged) the active tier layer is llama_kv_cache_paged
     // itself; the wrapper stays a thin shim for bge-small embedding
     // ownership and recurrent-state backup.
+
+    // MAD-134: warm the bge-small embed model at construction so the
+    // first user prompt doesn't pay the lazy-load cost. No-op when
+    // semantic_index isn't configured.
+    warmup_embed_();
 }
 
 llama_memory_tiered::~llama_memory_tiered() {
@@ -348,6 +353,27 @@ std::vector<float> llama_memory_tiered::embed_text(const std::string & text) {
         embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
     }
     return embed_model_->embed(text);
+}
+
+// MAD-134: warm the bge-small model at construction so the first user
+// prompt doesn't pay the lazy-load cost (~200ms on cold start). Called
+// from the ctor right after embed_model_ would lazily come up. Logs
+// the latency so operators can see it happened. Failures are non-fatal
+// (the lazy path keeps working).
+void llama_memory_tiered::warmup_embed_() {
+    if (cfg_.semantic_index.empty()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto v = embed_text("warmup");
+    const auto t1 = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (v.empty()) {
+        LLAMA_LOG_WARN("mt::llama_memory_tiered: bge-small warmup returned empty embedding "
+                       "(model load failed or degenerate input); semantic prefetch will lazy-init "
+                       "on first real call instead\n");
+    } else {
+        LLAMA_LOG_INFO("mt::llama_memory_tiered: bge-small warmup complete in %lldms (n_embd=%d)\n",
+                       (long long) ms, (int) v.size());
+    }
 }
 
 bool llama_memory_tiered::has_warm_recurrent(llama_seq_id seq_id) const {

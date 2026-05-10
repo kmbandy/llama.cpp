@@ -613,6 +613,7 @@ struct common_params {
     float kv_semantic_threshold = 0.65f;  // minimum cosine similarity threshold for prefetch hints
     int   kv_semantic_top_k     = 5;      // number of prefetch hints to return
     bool  kv_tier_paged_blocks    = false;  // enable mt:: paged-attention KV cache (vLLM-style block-indexed); standard + hybrid models supported
+    bool  kv_tier_paged_blocks_explicit = false;  // MAD-134: true when user typed --kv-tier-paged-blocks or --no-...; false → auto-default applies
     int   kv_tier_paged_block_size = 16;    // tokens per block when paged_blocks is enabled (must be a power of 2; 16 matches vLLM)
     bool  kv_tier_cold_resume     = false;  // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar from prior run
     std::string kv_tier_instance_id;        // MAD-131: per-instance ID for cold-tier subdir + lockfile (default: pid)

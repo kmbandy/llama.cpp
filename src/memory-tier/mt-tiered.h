@@ -208,6 +208,12 @@ public:
     // Cached from tier_view_ at init — cheap, no allocation.
     uint32_t physical_attn_cells() const;
 
+    // MAD-134: warm the bge-small embedding model at construction time
+    // so the first user prompt doesn't pay the lazy-load cost
+    // (~200ms cold). Called from the ctor when semantic_index is set.
+    // Failures are non-fatal — lazy path still works.
+    void warmup_embed_();
+
     // Compute an L2-normalized embedding for `text` via the embedding
     // model loaded from cfg_.semantic_index. Lazy-initializes the model
     // on first call. Returns empty vector if the model failed to load

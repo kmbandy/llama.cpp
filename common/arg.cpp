@@ -1477,9 +1477,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-tier-paged-blocks"},
         {"--no-kv-tier-paged-blocks"},
-        "EXPERIMENTAL: enable mt:: paged attention KV cache (vLLM-style block-indexed layout). Routes attention through mt_paged_attention_kernel + mt_reshape_and_cache scatter on HIP/CUDA. Currently validated only on standard non-hybrid transformer models with per-attention-call ctx ≤ ~16k tokens — the kernel's smem footprint scales with ctx and overflows AMD's 64 KiB LDS limit beyond that (clear error logged at dispatch). Hybrid (DeltaNet/Mamba+attention) models compile through the paged path but produce incorrect attention output — needs further debugging. SWA models fall back to the regular kv cache. For multi-agent serving on hybrid models prefer --kv-tiered without this flag (software-only tier eviction; works at --parallel > 1).",
+        "MAD-134: paged-attention KV cache (vLLM-style block-indexed). When --kv-tiered is also set, this is auto-enabled by default (use --no-kv-tier-paged-blocks to opt out). Validated end-to-end on hybrid models (Qwen3.x family); non-hybrid + ctx > 16k may hit kernel LDS limits.",
         [](common_params & params, bool value) {
             params.kv_tier_paged_blocks = value;
+            params.kv_tier_paged_blocks_explicit = true;  // MAD-134: user said something
         }
     ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
