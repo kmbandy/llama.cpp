@@ -5,7 +5,6 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
-#include "server-tiered-cache.h"
 #include "../src/llama-model.h"
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-memory-hybrid.h"
@@ -785,7 +784,6 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-    std::unique_ptr<server_tiered_cache> tiered_cache;
 
     server_metrics metrics;
 
@@ -983,13 +981,6 @@ private:
             }
         }
 
-        // Initialize tiered cache if enabled
-        if (params_base.kv_tiered_enabled) {
-            tiered_cache = std::make_unique<server_tiered_cache>(params_base);
-            SRV_INF("tiered cache initialized, hot=%f%%, warm=%f%%, cold=%f%%\n",
-                    params_base.kv_tier_hot_pct, params_base.kv_tier_warm_pct, params_base.kv_tier_cold_pct);
-        }
-
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
 
         // Necessary similarity of prompt for slot selection
@@ -1045,14 +1036,6 @@ private:
                 }
             }
 
-            // initialize tier manager for slot if enabled
-            if (params_base.kv_tiered_enabled) {
-                if (!tiered_cache->init_slot(i, *model, ctx)) {
-                    SRV_WRN("failed to initialize tier manager for slot %d\n", i);
-                } else {
-                    SLT_INF(slot, "tier manager initialized for slot %s\n", "");
-                }
-            }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -1563,23 +1546,14 @@ private:
         // is the ONLY path that populates mt::'s warm + cold tiers
         // (otherwise the seq_rm-time backup hook never fires).
         //
-        // Dispatch order (precedence: newer mt:: rewrite over the older
-        // per-slot tiered_cache implementation):
-        //  1. If the active memory is mt::llama_memory_tiered, call its
-        //     public backup_proactive — uses the real KV mover + KvtcStore
-        //     pipeline.
-        //  2. Else fall back to the older tiered_cache->evict_from_slot
-        //     (transformer paths that haven't migrated to mt::).
-        //
-        // **Threshold capacity**: for the mt:: path use the physical
-        // attention cache cell count, NOT slot.n_ctx. For hybrid models
-        // (Qwen3.6, DeepSeek V4) the attention KV cache is sized for a
-        // sliding window — much smaller than the user-facing context
-        // (recurrent layers carry the long context). Comparing against
-        // slot.n_ctx makes the trigger fire too late and the inner cache
-        // 500s with "failed to find free space in the KV cache" before
-        // we ever get a chance to evict. The old tiered_cache path keeps
-        // slot.n_ctx since its semantics haven't changed.
+        // **Threshold capacity**: use the physical attention cache cell
+        // count, NOT slot.n_ctx. For hybrid models (Qwen3.6, DeepSeek V4)
+        // the attention KV cache is sized for a sliding window — much
+        // smaller than the user-facing context (recurrent layers carry
+        // the long context). Comparing against slot.n_ctx makes the
+        // trigger fire too late and the inner cache 500s with "failed
+        // to find free space in the KV cache" before we ever get a
+        // chance to evict.
         if (params_base.kv_tiered_enabled) {
             const int n_tokens = slot.prompt.n_tokens();
 
@@ -1611,7 +1585,6 @@ private:
             if (n_live_hot >= evict_threshold) {
                 const int n_evict = std::max(1, (int)(cap * 0.20f));
 
-                bool routed_to_mt = false;
                 if (mt_tier) {
                     // Eviction window starts at the cursor — the next
                     // not-yet-backed-up positions. Cursor advances by the
@@ -1665,17 +1638,6 @@ private:
                         slot.kv_evict_through = p1;
                         SLT_DBG(slot, "proactive mt:: backup: %u/%d positions [%d,%d) at %d live / %u hot capacity\\n",
                                 backed_up, n_evict, p0, p1, n_live_hot, cap);
-                    }
-                    routed_to_mt = true;
-                }
-
-                if (!routed_to_mt && tiered_cache) {
-                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                    if (slot_tier && slot_tier->initialized) {
-                        if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
-                            SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
-                                    n_evict, n_tokens, slot.n_ctx);
-                        }
                     }
                 }
             }
@@ -2474,20 +2436,6 @@ private:
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
-                // Try tiered cache eviction before context shift
-                if (params_base.kv_tiered_enabled) {
-                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                    if (slot_tier && slot_tier->initialized) {
-                        // Evict tokens to tiered cache before context shift
-                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
-                        if (n_evict > 0) {
-                            if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)slot.prompt.n_tokens())) {
-                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
-                            }
-                        }
-                    }
-                }
-
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 // mt:: tier semantic fingerprint: capture an embedding of the
@@ -3137,76 +3085,6 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
-                        
-                        // Get and log prefetch hints if semantic index is enabled
-                        if (params_base.kv_tiered_enabled && tiered_cache->sem_enabled()) {
-                            auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                            if (slot_tier && slot_tier->initialized) {
-                                // Get the input text from the prompt tokens
-                                std::string input_text;
-                                const auto & input_tokens = slot.task->tokens;
-                                for (size_t i = 0; i < input_tokens.size(); ++i) {
-                                    auto piece = common_token_to_piece(ctx, input_tokens[i]);
-                                    input_text += piece;
-                                }
-                                
-                                // Get prefetch hints
-                                auto hints = tiered_cache->get_prefetch_hints(slot.id, input_text, tiered_cache->semantic_top_k);
-                                
-                                // Log the hints
-                                for (const auto& hint : hints) {
-                                    std::string positions_str;
-                                    if (!hint.positions.empty()) {
-                                        std::ostringstream oss;
-                                        oss << hint.positions.front() << ".." << hint.positions.back();
-                                        positions_str = oss.str();
-                                    } else {
-                                        positions_str = "empty";
-                                    }
-                                    const char* tier_name = hint.current_tier == TIER_WARM ? "warm" :
-                                                            hint.current_tier == TIER_COLD ? "cold" : "hot";
-                                    SLT_INF(slot, "semantic prefetch: score=%.2f positions=[%s] tier=%s\n",
-                                            hint.score, positions_str.c_str(), tier_name);
-                                }
-                                
-                                // Apply prefetch migration for WARM tier hints
-                                for (const auto& hint : hints) {
-                                    if (hint.current_tier == TIER_WARM) {
-                                        // Migrate WARM tokens to HOT tier
-                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
-                                            SLT_INF(slot, "semantic prefetch: migrated %zu warm tokens to hot\n", hint.positions.size());
-                                            auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
-                                            if (slot_mgr) {
-                                                slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
-                                            }
-                                        } else {
-                                            SLT_WRN(slot, "semantic prefetch: failed to migrate %zu warm tokens\n", hint.positions.size());
-                                        }
-                                    } else if (hint.current_tier == TIER_COLD) {
-                                        // Stage cold→warm→hot: first bring cold to warm, then warm to hot
-                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_COLD, TIER_WARM)) {
-                                            if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
-                                                SLT_INF(slot, "semantic prefetch: staged %zu cold tokens to hot\n", hint.positions.size());
-                                                auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
-                                                if (slot_mgr) {
-                                                    slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
-                                                }
-                                            } else {
-                                                SLT_WRN(slot, "semantic prefetch: cold->warm ok but warm->hot failed for %zu tokens\n", hint.positions.size());
-                                            }
-                                        } else {
-                                            SLT_WRN(slot, "semantic prefetch: failed to stage %zu cold tokens\n", hint.positions.size());
-                                        }
-                                    }
-                                }
-                                
-                                // Set the current query embedding for semantic eviction weighting
-                                auto embedding = tiered_cache->embed(input_text);
-                                if (!embedding.empty()) {
-                                    slot_tier->tiered_cache->set_current_query_embedding(embedding);
-                                }
-                            }
-                        }
                     } else {
                         if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt

@@ -6,11 +6,10 @@
 // for inputs already in roughly [-1, +1]. Quality is "fine for cold
 // tier" — you would not use these for active inference.
 //
-// IMPORTANT: the legacy llama_ssd_storage_format helpers in
-// src/llama-kv-cache-tiered.cpp had a sign-bias bug — storing -8
-// round-tripped to 0 because the encoder packed `(v & 0x0F)` instead
-// of `(v + 8) & 0x0F`. The new helpers here use the correct +8 bias
-// so the full [-8, +7] range round-trips faithfully.
+// IMPORTANT (history): an earlier int4 implementation had a sign-bias
+// bug — storing -8 round-tripped to 0 because the encoder packed
+// `(v & 0x0F)` instead of `(v + 8) & 0x0F`. These helpers use the
+// correct +8 bias so the full [-8, +7] range round-trips faithfully.
 
 #include <cstddef>
 #include <cstdint>

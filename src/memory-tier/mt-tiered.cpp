@@ -67,30 +67,10 @@ llama_memory_tiered::llama_memory_tiered(llama_memory_ptr     inner,
                    tier_view_.recur_seqs.size(),
                    tier_view_.empty() ? " (not tierable; will run as passthrough)" : "");
 
-    // Phase 2a: paged-blocks scaffolding. When the flag is set, allocate
-    // BlockPool + BlockTable sized to the warm/cold tier capacities so
-    // we can start exercising allocation patterns. NO read/write paths
-    // touch these structures yet — Phase 2b/2c wire them in. This lets
-    // us validate that the structures behave under realistic sizing
-    // (right number of blocks, init logs make sense, no mem blowup)
-    // before changing any behavior.
-    if (cfg_.paged_blocks) {
-        const uint32_t bsize = cfg_.paged_block_size > 0 ? cfg_.paged_block_size : 16u;
-        // Hot tier corresponds to "GPU blocks" in vLLM terminology.
-        // Warm tier (RAM) is "CPU blocks." Cold tier (NVMe) doesn't get
-        // a block ID — it's KvtcStore-keyed and managed separately.
-        const uint32_t n_gpu = capacity_.hot_capacity()  / bsize;
-        const uint32_t n_cpu = capacity_.warm_capacity() / bsize;
-        // Watermark default of 0.05 mirrors vLLM. Scaffolding only —
-        // no admission control consults it yet.
-        paged_pool_.init(n_gpu, n_cpu, /*watermark=*/0.05f);
-        paged_table_.init(n_seq_max_, bsize);
-        LLAMA_LOG_INFO("mt::llama_memory_tiered: paged-blocks scaffolding "
-                       "ON (block_size=%u, n_gpu_blocks=%u, n_cpu_blocks=%u, "
-                       "n_seq_max=%u) — no live wiring yet, Phase 2b will "
-                       "start using them\n",
-                       bsize, n_gpu, n_cpu, n_seq_max_);
-    }
+    // MAD-127: paged-blocks scaffolding removed. For the army-goal config
+    // (hybrid + paged) the active tier layer is llama_kv_cache_paged
+    // itself; the wrapper stays a thin shim for bge-small embedding
+    // ownership and recurrent-state backup.
 }
 
 llama_memory_tiered::~llama_memory_tiered() {
@@ -360,65 +340,6 @@ bool llama_memory_tiered::ensure_warm_staging() {
     return true;
 }
 
-bool llama_memory_tiered::ensure_paged_warm_staging() {
-    if (paged_warm_initialized_) return true;
-    if (!cfg_.paged_blocks)      return false;
-
-    const uint32_t bsize = paged_table_.block_size();
-    if (bsize == 0) {
-        LLAMA_LOG_WARN("mt::ensure_paged_warm_staging: paged_table_.block_size()=0; "
-                       "did paged_table_.init() run?\n");
-        return false;
-    }
-
-    // Restorable layers — same selection criteria as warm_buf_.
-    size_t restorable_layers = 0;
-    for (const auto & c : tier_view_.attn_caches) {
-        if (!c.is_swa) restorable_layers += c.layers.size();
-    }
-    if (restorable_layers == 0) {
-        LLAMA_LOG_WARN("mt::ensure_paged_warm_staging: no restorable attention "
-                       "layers; paged backup is a no-op for this model\n");
-        return false;
-    }
-
-    // Per-block layout: for each restorable layer, allocate a K slab
-    // (block_size * k_row_bytes) followed by a V slab (block_size *
-    // v_row_bytes). Sum across all restorable layers gives the total
-    // bytes per block. Layers in the same order as ensure_warm_staging
-    // so the per-layer mover code can be reused later.
-    paged_layer_off_.resize(restorable_layers);
-    paged_layer_v_off_.resize(restorable_layers);
-    size_t cursor = 0;
-    size_t flat_idx = 0;
-    for (const auto & c : tier_view_.attn_caches) {
-        if (c.is_swa) continue;
-        for (const auto & a : c.layers) {
-            paged_layer_off_[flat_idx]   = cursor;
-            paged_layer_v_off_[flat_idx] = cursor + (size_t) bsize * a.k_row_bytes;
-            cursor                      += (size_t) bsize * (a.k_row_bytes + a.v_row_bytes);
-            ++flat_idx;
-        }
-    }
-    paged_block_bytes_ = cursor;
-
-    // Allocate the host buffer for ALL CPU blocks. n_cpu_blocks is the
-    // CPU-side pool size set in the constructor (warm_capacity / bsize).
-    const uint32_t n_cpu_blocks = paged_pool_.total_cpu_blocks();
-    paged_warm_buf_.assign((size_t) n_cpu_blocks * paged_block_bytes_, 0);
-
-    LLAMA_LOG_INFO("mt::ensure_paged_warm_staging: bsize=%u n_cpu_blocks=%u "
-                   "block_bytes=%.1f KiB total=%.1f MiB across %zu restorable "
-                   "layers\n",
-                   bsize, n_cpu_blocks,
-                   (double) paged_block_bytes_ / 1024.0,
-                   (double) paged_warm_buf_.size() / (1024.0 * 1024.0),
-                   restorable_layers);
-
-    paged_warm_initialized_ = true;
-    return true;
-}
-
 std::vector<float> llama_memory_tiered::embed_text(const std::string & text) {
     if (cfg_.semantic_index.empty()) {
         return {};
@@ -485,11 +406,6 @@ bool llama_memory_tiered::restore_recurrent_from_warm(llama_seq_id seq_id) {
 // ---- public tier-restore API ----
 
 bool llama_memory_tiered::has_warm(llama_seq_id seq_id, llama_pos position) const {
-    // Phase 2b-C: hard-branch to paged variant when flag is set.
-    if (cfg_.paged_blocks) {
-        return paged_has_warm(seq_id, position);
-    }
-
     // "warm" in the API name is historical — this query returns true for
     // anything in warm OR cold for the given seq, since restore_from_warm
     // transparently demand-loads from cold via load_one_from_cold.
@@ -498,26 +414,8 @@ bool llama_memory_tiered::has_warm(llama_seq_id seq_id, llama_pos position) cons
         || cold_positions_[seq_id].find(position)   != cold_positions_[seq_id].end();
 }
 
-bool llama_memory_tiered::paged_has_warm(llama_seq_id seq_id, llama_pos position) const {
-    if (!paged_warm_initialized_) return false;
-    const uint32_t bsize = paged_table_.block_size();
-    if (bsize == 0) return false;
-    const uint32_t lblock = (uint32_t) position / bsize;
-    const uint32_t physical = paged_table_.get_physical(seq_id, lblock);
-    if (physical == kInvalidBlockId) return false;
-    // GPU blocks are still in hot — caller doesn't need to restore.
-    // CPU blocks are in warm — restore-able.
-    // (Cold tier not yet wired into the paged path; comes in a later phase.)
-    return !paged_pool_.is_gpu(physical);
-}
-
 uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   seq_id,
                                                   const std::vector<llama_pos> & positions) {
-    // Phase 2b-C: hard-branch to paged variant when flag is set.
-    if (cfg_.paged_blocks) {
-        return paged_restore_from_warm(seq_id, positions);
-    }
-
     if (!inner_ || !warm_initialized_ || positions.empty()) return 0;
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return 0;
     auto & seq_warm = warm_pos_to_slot_[seq_id];
@@ -601,92 +499,6 @@ uint32_t llama_memory_tiered::restore_from_warm(llama_seq_id                   s
     return restored;
 }
 
-// Phase 2b-C: paged-blocks restore. For each requested position, looks
-// up the physical block via paged_table_, copies K/V from
-// paged_warm_buf_ back into the inner cache via mover_attn_.restore_*.
-// CPU block stays mapped after restore — same chunk may be requested
-// again by a related query (semantic prefetch). Phase 2c will validate
-// parity by toggling cfg_.paged_blocks and confirming identical
-// observable behavior.
-uint32_t llama_memory_tiered::paged_restore_from_warm(
-        llama_seq_id                   seq_id,
-        const std::vector<llama_pos> & positions) {
-    if (!inner_ || !paged_warm_initialized_ || positions.empty()) return 0;
-
-    const uint32_t bsize = paged_table_.block_size();
-    if (bsize == 0) return 0;
-
-    // Group requested positions by their containing logical block. We
-    // restore at block granularity — the inner cache slots get tagged
-    // per position, but the block lookup happens once per block.
-    uint32_t restored = 0;
-
-    for (auto pos : positions) {
-        if (pos < 0) continue;
-        const uint32_t lblock = (uint32_t) pos / bsize;
-        const uint32_t physical = paged_table_.get_physical(seq_id, lblock);
-        if (physical == kInvalidBlockId) continue;       // never backed up
-        if (paged_pool_.is_gpu(physical))   continue;    // still in hot, no-op
-
-        const uint32_t cpu_block_idx = physical - paged_pool_.total_gpu_blocks();
-        const uint8_t * block_base = paged_warm_buf_.data() +
-                                     (size_t) cpu_block_idx * paged_block_bytes_;
-        const uint32_t row_in_block = (uint32_t) pos % bsize;
-
-        // Ask inner cache for a free slot tagged with this position.
-        const int inner_slot = inner_->mt_restore_tag_slot(seq_id, pos);
-        if (inner_slot < 0) {
-            LLAMA_LOG_WARN("mt::paged_restore_from_warm: no free slot in inner "
-                           "cache for pos %d (seq %d, lblock=%u)\n",
-                           pos, seq_id, lblock);
-            break;
-        }
-
-        // Walk restorable layers in the same flat order as
-        // ensure_paged_warm_staging used to lay out paged_layer_off_.
-        bool ok = true;
-        size_t flat_idx = 0;
-        for (const auto & c : tier_view_.attn_caches) {
-            if (c.is_swa) continue;
-            for (const auto & layer : c.layers) {
-                const uint8_t * src_k = block_base
-                                      + paged_layer_off_[flat_idx]
-                                      + (size_t) row_in_block * layer.k_row_bytes;
-                const uint8_t * src_v = block_base
-                                      + paged_layer_v_off_[flat_idx]
-                                      + (size_t) row_in_block * layer.v_row_bytes;
-                if (!mover_attn_.restore_k(layer, src_k, inner_slot) ||
-                    !mover_attn_.restore_v(layer, src_v, inner_slot)) {
-                    ok = false;
-                    break;
-                }
-                ++flat_idx;
-            }
-            if (!ok) break;
-        }
-
-        if (ok) {
-            ++restored;
-        } else {
-            LLAMA_LOG_WARN("mt::paged_restore_from_warm: mover failed restoring "
-                           "pos %d into slot %d (lblock=%u, cpu_block=%u)\n",
-                           pos, inner_slot, lblock, physical);
-        }
-    }
-
-    if (restored > 0) {
-        capacity_.on_migrate(restored,
-                             TierCapacityManager::Tier::Warm,
-                             TierCapacityManager::Tier::Hot);
-        update_tier_state();
-        LLAMA_LOG_INFO("mt::paged_restore_from_warm: restored %u positions "
-                       "for seq %d (paged_pool free: gpu=%zu cpu=%zu)\n",
-                       restored, seq_id,
-                       paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu());
-    }
-    return restored;
-}
-
 void llama_memory_tiered::record_chunk_fingerprint(std::vector<llama_pos> positions,
                                                      std::vector<float>     embedding,
                                                      SemanticIndex::Tier    tier) {
@@ -698,78 +510,6 @@ llama_memory_tiered::find_similar_chunks(const std::vector<float> & query_embedd
                                           int                        top_k,
                                           float                      threshold) const {
     return semantic_.score(query_embedding, top_k, threshold);
-}
-
-void llama_memory_tiered::record_paged_block_fingerprint(
-        llama_seq_id        seq_id,
-        uint32_t            lblock,
-        std::vector<float>  embedding,
-        SemanticIndex::Tier tier) {
-    paged_semantic_.add_fingerprint(seq_id, lblock, std::move(embedding), tier);
-}
-
-uint32_t llama_memory_tiered::restore_semantic_paged(
-        llama_seq_id              seq_id,
-        const std::vector<float> & query_embedding,
-        int                        top_k,
-        float                      threshold) {
-    if (!cfg_.paged_blocks) {
-        // Defensive: paged-block fingerprints only get populated when the
-        // paged path is on. Calling this in the non-paged config is a
-        // server-side bug; log once and bail.
-        LLAMA_LOG_DEBUG("mt::restore_semantic_paged: called with "
-                        "paged_blocks=false (no-op)\n");
-        return 0;
-    }
-
-    auto hints = paged_semantic_.score(seq_id, query_embedding, top_k, threshold);
-    if (hints.empty()) return 0;
-
-    const uint32_t bsize = paged_table_.block_size();
-    if (bsize == 0) return 0;
-
-    // Expand each block hint to its position range. Skip blocks that
-    // are already in hot (paged_pool_.is_gpu) — paged_restore_from_warm
-    // would no-op them anyway, but checking up-front keeps the
-    // requested-vs-restored ratio honest in the hit-rate log.
-    std::vector<llama_pos> wanted;
-    wanted.reserve(hints.size() * bsize);
-    uint32_t hot_already = 0;
-    for (const auto & h : hints) {
-        const uint32_t physical = paged_table_.get_physical(seq_id, h.lblock);
-        if (physical == kInvalidBlockId) continue;       // never backed up
-        if (paged_pool_.is_gpu(physical)) { ++hot_already; continue; }
-
-        const llama_pos p0 = (llama_pos) h.lblock * (llama_pos) bsize;
-        for (uint32_t i = 0; i < bsize; ++i) {
-            wanted.push_back(p0 + (llama_pos) i);
-        }
-    }
-
-    if (wanted.empty()) {
-        LLAMA_LOG_INFO("mt::restore_semantic_paged: %zu hints (top_k=%d, "
-                       "threshold=%.2f) for seq %d — all already hot (%u) "
-                       "or unmapped\n",
-                       hints.size(), top_k, threshold, seq_id, hot_already);
-        return 0;
-    }
-
-    const uint32_t restored = paged_restore_from_warm(seq_id, wanted);
-
-    // Hit-rate logging for MAD-122 acceptance criterion #5. The
-    // requested-vs-restored ratio is the prefetch-effectiveness signal:
-    // if it's consistently low under realistic workloads, the threshold
-    // or top_k tuning needs revisiting.
-    LLAMA_LOG_INFO("mt::restore_semantic_paged: seq %d — %zu hints "
-                   "(top_k=%d, threshold=%.2f), %zu positions requested, "
-                   "%u restored (hit-rate %.0f%%, %u already hot)\n",
-                   seq_id, hints.size(), top_k, threshold,
-                   wanted.size(), restored,
-                   wanted.empty() ? 0.0f
-                                  : 100.0f * (float) restored / (float) wanted.size(),
-                   hot_already);
-
-    return restored;
 }
 
 uint32_t llama_memory_tiered::restore_semantic(llama_seq_id              seq_id,
@@ -944,174 +684,9 @@ bool llama_memory_tiered::backup_seq_rm_recurrent(llama_seq_id seq_id) {
 // SWA caches are skipped: their distance mask hides any restored
 // position older than n_swa back from the head, so backing them up
 // would be wasted work.
-// Phase 2b-C: paged-blocks variant. Block-keyed allocation via
-// paged_pool_, block-keyed mapping via paged_table_, K/V written into
-// paged_warm_buf_. Completely parallel to the position-keyed path —
-// touches NONE of warm_pos_to_slot_ / evicted_to_warm_ /
-// warm_insertion_order_ / warm_buf_. Phase 2c will validate by
-// toggling cfg_.paged_blocks and confirming the same observable
-// behavior (needle test still passes).
-uint32_t llama_memory_tiered::paged_backup_seq_rm_range(llama_seq_id seq_id,
-                                                         llama_pos    p0,
-                                                         llama_pos    p1) {
-    if (!inner_ || p0 < 0 || p1 <= p0) return 0;
-    if (!ensure_paged_warm_staging()) return 0;
-
-    const uint32_t bsize = paged_table_.block_size();
-
-    // Round the request to block boundaries: a backup range that ends
-    // mid-block can't fully evict that final block (some positions in
-    // it are still live). For Phase 2b-C we only back up FULLY-CONTAINED
-    // blocks — partial blocks at the tail are deferred to a later
-    // refinement (vLLM has the same constraint at the scheduler layer).
-    const uint32_t first_block_idx = (uint32_t) p0 / bsize;
-    const uint32_t last_block_idx  = (uint32_t) p1 / bsize;  // exclusive
-    if (last_block_idx <= first_block_idx) {
-        // Range is smaller than one block — nothing to back up at this
-        // granularity. Real eviction triggers always pass at least
-        // n_evict = 0.20 * cap which is many blocks, so this is rare.
-        return 0;
-    }
-
-    // Snapshot inner cells so we can find which positions live in
-    // which physical hot slot for the K/V copy. Same pattern as the
-    // position-keyed path.
-    const auto fresh = inner_->make_tier_view();
-    if (fresh.attn_caches.size() != tier_view_.attn_caches.size()) {
-        LLAMA_LOG_WARN("mt::paged_backup_seq_rm_range: cache topology changed "
-                       "(%zu->%zu); skipping backup\n",
-                       tier_view_.attn_caches.size(), fresh.attn_caches.size());
-        return 0;
-    }
-
-    // For each block in [first_block_idx, last_block_idx):
-    //   - Skip if seq already has this logical block in paged_table_
-    //     (already backed up earlier)
-    //   - Allocate a CPU block from paged_pool_
-    //   - Walk inner cells; for each cell whose pos falls in this
-    //     block's range AND seq matches, copy K/V across all restorable
-    //     layers into the CPU block buffer
-    //   - Append the CPU block ID to paged_table_ for this seq
-    uint32_t backed_up_blocks    = 0;
-    uint32_t backed_up_positions = 0;
-    const uint32_t n_logical_existing = paged_table_.num_blocks(seq_id);
-
-    for (uint32_t lblock = first_block_idx; lblock < last_block_idx; ++lblock) {
-        // Already backed up for this seq?
-        if (lblock < n_logical_existing) {
-            const uint32_t existing = paged_table_.get_physical(seq_id, lblock);
-            if (existing != kInvalidBlockId && !paged_pool_.is_gpu(existing)) {
-                // Already mapped to a CPU block — skip.
-                continue;
-            }
-        }
-
-        // Allocate a CPU block.
-        const uint32_t cpu_block = paged_pool_.alloc_cpu();
-        if (cpu_block == kInvalidBlockId) {
-            LLAMA_LOG_DEBUG("mt::paged_backup_seq_rm_range: CPU pool empty at "
-                            "lblock=%u; remaining blocks not backed up "
-                            "(cold-spill not yet implemented in 2b-C)\n",
-                            lblock);
-            break;
-        }
-
-        // Walk inner cells for this block's position range, copy K/V.
-        const llama_pos block_start = (llama_pos) lblock * bsize;
-        const llama_pos block_end   = block_start + (llama_pos) bsize;
-
-        const uint32_t cpu_block_idx = cpu_block - paged_pool_.total_gpu_blocks();
-        uint8_t * block_base = paged_warm_buf_.data() +
-                               (size_t) cpu_block_idx * paged_block_bytes_;
-
-        bool ok = true;
-        size_t flat_layer_idx = 0;
-
-        for (size_t ci = 0; ci < tier_view_.attn_caches.size() && ok; ++ci) {
-            const auto & cache_view = tier_view_.attn_caches[ci];
-            const auto & cells      = fresh.attn_caches[ci].cells;
-
-            if (cache_view.is_swa) continue;  // not advancing flat_layer_idx
-
-            // Within this block, find each cell whose (pos, seq) is in
-            // range. Slot index in the inner cache != position; we walk
-            // and match. O(kv_size_per_cache) per block — same cost
-            // shape as the position-keyed path.
-            for (uint32_t slot = 0; slot < cells.size() && ok; ++slot) {
-                const auto & cs = cells[slot];
-                if (cs.pos < block_start || cs.pos >= block_end) continue;
-                if (cs.seq_id != seq_id) continue;
-
-                const uint32_t row_in_block = (uint32_t)(cs.pos - block_start);
-
-                // For each layer in this cache, copy K and V.
-                size_t layer_idx_in_block = flat_layer_idx;
-                for (const auto & layer : cache_view.layers) {
-                    uint8_t * k_dst = block_base
-                                    + paged_layer_off_[layer_idx_in_block]
-                                    + (size_t) row_in_block * layer.k_row_bytes;
-                    uint8_t * v_dst = block_base
-                                    + paged_layer_v_off_[layer_idx_in_block]
-                                    + (size_t) row_in_block * layer.v_row_bytes;
-                    if (!mover_attn_.evict_k(layer, slot, k_dst) ||
-                        !mover_attn_.evict_v(layer, slot, v_dst)) {
-                        LLAMA_LOG_WARN("mt::paged_backup_seq_rm_range: mover "
-                                       "failed at slot %u (pos %d, layer %zu); "
-                                       "abandoning this block\n",
-                                       slot, cs.pos, layer_idx_in_block);
-                        ok = false;
-                        break;
-                    }
-                    ++layer_idx_in_block;
-                }
-
-                if (ok) ++backed_up_positions;
-            }
-
-            flat_layer_idx += cache_view.layers.size();
-        }
-
-        if (ok) {
-            // Pad table with kInvalidBlockId for any logical gaps before
-            // this block (rare — only if backup is called non-contiguously).
-            while (paged_table_.num_blocks(seq_id) < lblock) {
-                paged_table_.append_block(seq_id, kInvalidBlockId);
-            }
-            // Either swap into an existing slot or append.
-            if (lblock < paged_table_.num_blocks(seq_id)) {
-                paged_table_.swap_block(seq_id, lblock, cpu_block);
-            } else {
-                paged_table_.append_block(seq_id, cpu_block);
-            }
-            ++backed_up_blocks;
-        } else {
-            paged_pool_.free_block(cpu_block);
-        }
-    }
-
-    if (backed_up_blocks > 0) {
-        capacity_.on_migrate(backed_up_positions,
-                             TierCapacityManager::Tier::Hot,
-                             TierCapacityManager::Tier::Warm);
-        LLAMA_LOG_INFO("mt::paged_backup_seq_rm_range: seq=%d range=[%d,%d) "
-                       "backed up %u blocks (%u positions); paged_pool free: "
-                       "gpu=%zu cpu=%zu\n",
-                       seq_id, p0, p1, backed_up_blocks, backed_up_positions,
-                       paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu());
-    }
-
-    return backed_up_positions;
-}
-
 uint32_t llama_memory_tiered::backup_seq_rm_range(llama_seq_id seq_id,
                                                    llama_pos    p0,
                                                    llama_pos    p1) {
-    // Phase 2b-C: when paged_blocks flag is set, take the parallel
-    // block-keyed path. Both paths return positions-backed-up so the
-    // caller (server proactive trigger) treats them identically.
-    if (cfg_.paged_blocks) {
-        return paged_backup_seq_rm_range(seq_id, p0, p1);
-    }
 
     if (!inner_ || p0 < 0 || p1 <= p0) return 0;
     if (!ensure_warm_staging()) return 0;
@@ -1366,7 +941,6 @@ void llama_memory_tiered::clear(bool data) {
     capacity_.reset();
     eviction_.clear();
     semantic_.clear();
-    paged_semantic_.clear();
     pressure_announced_ = false;
     for (auto & m : warm_pos_to_slot_) m.clear();
     for (auto & s : evicted_to_warm_)  s.clear();
@@ -1444,41 +1018,11 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         // n_seq_max=1 today so "for this seq" === "all of it." When mt::
         // grows multi-seq tracking, scope these wipes by seq_id.
         if (p0 < 0 || p1 < 0) {
-            // Phase 2b-C-3: hard-branch to paged variant when flag is set.
-            // semantic_ / pressure_announced_ wipes are shared (not
-            // paged-specific) but the tier bookkeeping diverges.
-            if (cfg_.paged_blocks) {
-                // Block-keyed wipe. Per-seq scoping is real here (paged_table_
-                // is indexed by seq_id), unlike the position-keyed path which
-                // wipes globally because its maps don't carry seq scope.
-                const size_t n_finger = semantic_.size();
-
-                std::vector<uint32_t> freed = paged_table_.clear_seq(seq_id);
-                const size_t n_blocks_freed = freed.size();
-                for (uint32_t bid : freed) {
-                    if (bid != kInvalidBlockId) {
-                        paged_pool_.free_block(bid);
-                    }
-                }
-
-                semantic_.clear();
-                // Paged-block fingerprints are seq-scoped, unlike the
-                // chunk-keyed semantic_ above. Drop only this seq's
-                // entries — others remain valid for their own queries.
-                const size_t n_paged_finger = paged_semantic_.size(seq_id);
-                paged_semantic_.remove_seq(seq_id);
-                pressure_announced_ = false;
-
-                if (n_blocks_freed + n_finger + n_paged_finger > 0) {
-                    LLAMA_LOG_INFO("mt::seq_rm: paged whole-seq wipe for seq %d "
-                                   "— freed %zu blocks (paged_pool free: gpu=%zu "
-                                   "cpu=%zu), cleared %zu chunk + %zu paged-block "
-                                   "semantic fingerprints\n",
-                                   seq_id, n_blocks_freed,
-                                   paged_pool_.n_free_gpu(), paged_pool_.n_free_cpu(),
-                                   n_finger, n_paged_finger);
-                }
-            } else if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max_) {
+            // MAD-127: paged whole-seq wipe is now handled inside
+            // llama_kv_cache_paged::seq_rm (which the wrapper delegates to
+            // via inner_->seq_rm above). The wrapper only handles the
+            // non-paged tiered path's per-seq metadata cleanup below.
+            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max_) {
                 // Per-seq whole-seq wipe: drop only this seq's tier
                 // metadata, freeing its warm slots back to the pool.
                 // Other seqs' state stays intact.

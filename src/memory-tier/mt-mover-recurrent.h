@@ -11,8 +11,9 @@
 //     of token count). For Qwen3.5-REAP-97B with 36 recurrent layers
 //     this is ~149 MiB per seq.
 //
-// New work in Phase 2 — the legacy llama_kv_cache_tiered did not tier
-// recurrent state at all (B-K5 in the bug catalog).
+// Recurrent state tiering is mt::-only — the paged cache itself only
+// covers attention layers; recurrent state still flows through the
+// wrapper for hybrid models.
 //
 // HIP-only. Stub for non-HIP builds (return false everywhere).
 
