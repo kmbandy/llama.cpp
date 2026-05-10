@@ -34,6 +34,38 @@
 //   appropriate logical block list. The earlier defensive assert is
 //   gone; the cache works correctly with --parallel N for any N up to
 //   n_seq_max_.
+//
+// THREADING CONTRACT (MAD-132 / Epic A4):
+//
+//   This cache is SINGLE-THREADED. All mutator methods MUST be called
+//   from one thread (the server's update_slots main loop). The internal
+//   BlockPool, BlockTable, BlockSemanticIndex, cold_pool_free_, and
+//   per-seq state vectors have NO internal locking.
+//
+//   Why this is safe today: the server's update_slots runs sequentially.
+//   --parallel N (multi-seq) processes N sequences inside one ubatch
+//   inside one main-thread iteration; the GPU runs them in parallel via
+//   the kernel's grid-y dimension over sequences, but the cache mutations
+//   that schedule the kernel all happen on one thread.
+//
+//   What violates this: any future change that adds a worker thread
+//   touching the cache. Examples:
+//     - bge-small embedding on a CPU worker parallel to GPU compute
+//     - Async cold-tier I/O thread
+//     - Multi-threaded HTTP handler that touches the cache directly
+//
+//   Each of these would silently corrupt the cache (BlockPool::alloc_gpu
+//   would race; two threads could pop the same block ID; kernel reads
+//   garbage at attention time). DEBUG builds catch the violation via
+//   captured_thread_id_ + check_thread_id_() — first call captures the
+//   thread, subsequent calls assert match. Release builds skip the check.
+//
+//   To add real async support: either (a) a single-purpose worker queue
+//   where the worker enqueues "fingerprint this text" / "embed this query"
+//   and the main thread drains at safe points, OR (b) a redesign with
+//   fine-grained locking (mutex per pool, per-seq state shards). DO NOT
+//   add casual mutation from a second thread — the existing single-thread
+//   invariant is load-bearing for correctness.
 
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -43,8 +75,10 @@
 #include "memory-tier/mt-block-table.h"
 #include "memory-tier/mt-semantic.h"
 
+#include <chrono>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -272,6 +306,28 @@ public:
     uint32_t n_cold_blocks() const { return n_cold_blocks_; }
     bool     cold_enabled()  const { return n_cold_blocks_ > 0; }
 
+    // MAD-132: drop the OLDEST cold block from cold_pool_free_ by
+    // unmapping the (seq, lblock) it was assigned to and freeing the
+    // cold_idx. Used as the final escalation when all three tiers are
+    // full (hot full, warm full, cold full): rather than refuse the
+    // request, drop the most-stale cold block to make room for the
+    // hot→warm→cold spillage. The dropped block's data is gone — the
+    // owning seq's table entry stays kInvalidBlockId; future reads
+    // contribute -INFINITY logit (= zero attention contribution) per
+    // the same kernel mechanism that handles middle-wipe holes.
+    // Returns true if a block was dropped, false if cold is empty.
+    bool drop_oldest_cold_block();
+
+    // MAD-132: pick a victim seq for whole-slot preemption using
+    // idle-priority fairness — the seq whose last apply_ubatch_to_state
+    // was longest ago is preferred. exclude_seqs lists seqs that must
+    // NOT be picked (e.g. the candidate trying to be admitted right
+    // now, or seqs already in the active batch). Returns the chosen
+    // seq_id (>= 0) on success, -1 if no eligible victim exists.
+    // Use evict_seq_to_warm() to actually carry out the preemption
+    // once the policy chose a target.
+    llama_seq_id pick_preempt_victim(const std::vector<llama_seq_id> & exclude_seqs) const;
+
     // ─── MAD-125: BGE-small semantic prefetch ───
     //
     // The cache holds an optional per-(seq, lblock) fingerprint store.
@@ -333,11 +389,21 @@ private:
 
     // Per-seq tracking. seq_pos_max is the highest position written for
     // the seq (inclusive). seq_pos_min stays 0 unless seq_rm carved off
-    // the head.
+    // the head. last_active_us is the wall-clock microseconds at which
+    // apply_ubatch_to_state last saw tokens for this seq (MAD-132
+    // preempt fairness; older = more eligible for preemption).
     struct seq_state {
-        llama_pos pos_min = -1;
-        llama_pos pos_max = -1;
+        llama_pos pos_min        = -1;
+        llama_pos pos_max        = -1;
+        uint64_t  last_active_us = 0;
     };
+
+    // MAD-132: thread-affinity capture for the single-threading contract.
+    // First mutator call captures std::this_thread::get_id(); subsequent
+    // calls assert match in DEBUG builds. Release builds: zero overhead
+    // (the assert macro compiles away to nothing).
+    mutable std::thread::id captured_thread_id_;
+    void check_thread_id_() const;
 
     // Allocate and upload the block_table / context_lens / q_lens
     // tensors to the GPU for the current batch. Called by init_batch

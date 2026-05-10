@@ -402,6 +402,35 @@ cold_setup_done:;
 static_assert((int32_t) mt::kInvalidBlockId == kInvalidBlockTableEntry,
               "mt::kInvalidBlockId must reinterpret to -1 in i32 for kernel compat");
 
+// MAD-132: enforce the single-threading contract. First mutator call
+// captures std::this_thread::get_id(); subsequent calls assert match.
+// Release builds compile this to a no-op via assert().
+//
+// Method is const to allow calling from const methods that mutate
+// internal caches (none today, but const-correctness for future).
+// The captured_thread_id_ field is mutable for the same reason.
+void llama_kv_cache_paged::check_thread_id_() const {
+#ifndef NDEBUG
+    const std::thread::id self = std::this_thread::get_id();
+    if (captured_thread_id_ == std::thread::id()) {
+        captured_thread_id_ = self;
+    } else {
+        assert(captured_thread_id_ == self &&
+               "llama_kv_cache_paged: cross-thread mutation detected. "
+               "This cache is single-threaded; see header doc block "
+               "(MAD-132 / Epic A4). Add explicit synchronization or "
+               "use a worker queue if async access is required.");
+    }
+#endif
+}
+
+// MAD-132: timestamp helper (microseconds since epoch). Used for
+// preempt-fairness victim selection.
+static uint64_t now_us_() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 llama_kv_cache_paged::~llama_kv_cache_paged() {
     // MAD-121: close cold-tier fds.
     for (int fd : cold_fd_k_) if (fd >= 0) ::close(fd);
@@ -424,6 +453,7 @@ llama_kv_cache_paged::~llama_kv_cache_paged() {
 }
 
 bool llama_kv_cache_paged::ensure_blocks_for(llama_seq_id seq_id, uint32_t n_new_tokens) {
+    check_thread_id_();
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
     if (n_new_tokens == 0) return true;
 
@@ -898,8 +928,22 @@ bool llama_kv_cache_paged::evict_block_to_cold(llama_seq_id seq_id, uint32_t lbl
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
     if (lblock >= table_.num_blocks(seq_id)) return false;
     if (cold_pool_free_.empty()) {
-        LLAMA_LOG_WARN("evict_block_to_cold: cold pool full (%u in use); refusing\n", cold_in_use_);
-        return false;
+        // MAD-132: cold full → escalate by dropping the oldest cold
+        // block to make room. The dropped seq's K/V is gone (its table
+        // entry was already kInvalidBlockId from prior cold spill);
+        // future kernel reads of that block return -INFINITY logit (=
+        // zero attention contribution), same as middle-wipe holes.
+        // This is the last-resort policy before refusing the eviction
+        // and surfacing FAILED_PREPARE up the call chain.
+        if (!drop_oldest_cold_block()) {
+            LLAMA_LOG_WARN("evict_block_to_cold: cold pool full (%u in use) AND drop_oldest "
+                           "failed; refusing eviction. Caller should fall back to keeping "
+                           "the block in warm or returning a 503 to the client.\n",
+                           cold_in_use_);
+            return false;
+        }
+        LLAMA_LOG_INFO("evict_block_to_cold: cold pool was full; dropped oldest cold block "
+                       "to make room for seq=%d lblock=%u\n", seq_id, lblock);
     }
 
     const uint32_t phys = table_.get_physical(seq_id, lblock);
@@ -1046,6 +1090,69 @@ uint32_t llama_kv_cache_paged::restore_semantic_paged(
                    already_hot, unmapped, restore_fail);
 
     return restored;
+}
+
+// MAD-132: drop the oldest cold block — last-resort escalation when
+// cold pool is full but eviction must continue. Walk cold_slot_for_
+// in seq-then-lblock order and pick the first in-use entry. This is
+// "any" not strictly "oldest" — the cold tier doesn't track per-slot
+// age. Acceptable for v1: the cold spillover is itself age-ordered
+// (LRU warm → cold), so the lowest-indexed cold slots are typically
+// the oldest evictions. True LRU tracking is a follow-up.
+//
+// Effect: the dropped block's data is gone. The owning seq's table
+// entry stays kInvalidBlockId (already marked when the block was
+// spilled to cold); future kernel reads contribute -INFINITY logit
+// → 0 attention weight, same as middle-wipe holes. The seq sees a
+// hole at that block position; correctness is preserved (no garbage
+// reads), recall is degraded (the dropped K/V can't be attended to).
+bool llama_kv_cache_paged::drop_oldest_cold_block() {
+    if (!cold_enabled()) return false;
+
+    // Scan for any in-use cold slot.
+    for (uint32_t s = 0; s < (uint32_t) cold_slot_for_.size(); ++s) {
+        auto & row = cold_slot_for_[s];
+        for (uint32_t lb = 0; lb < (uint32_t) row.size(); ++lb) {
+            if (row[lb] == kInvalidColdIdx) continue;
+            const uint32_t cold_idx = row[lb];
+            row[lb] = kInvalidColdIdx;
+            cold_pool_free_.push_back(cold_idx);
+            if (cold_in_use_ > 0) --cold_in_use_;
+            LLAMA_LOG_INFO("llama_kv_cache_paged::drop_oldest_cold_block: dropped "
+                           "(seq=%u, lblock=%u, cold_idx=%u) — owning seq sees a "
+                           "hole at this block (kernel handles via -INFINITY logit)\n",
+                           s, lb, cold_idx);
+            return true;
+        }
+    }
+    return false;
+}
+
+// MAD-132: idle-priority victim selection for whole-slot preemption.
+// Picks the seq with the smallest (oldest) last_active_us, excluding
+// any seq in exclude_seqs and any seq that has zero blocks (nothing
+// to preempt). Returns -1 if no eligible victim exists.
+llama_seq_id llama_kv_cache_paged::pick_preempt_victim(
+        const std::vector<llama_seq_id> & exclude_seqs) const {
+    auto excluded = [&](llama_seq_id sid) {
+        for (auto e : exclude_seqs) if (e == sid) return true;
+        return false;
+    };
+
+    llama_seq_id victim = -1;
+    uint64_t     oldest = UINT64_MAX;
+    for (uint32_t s = 0; s < n_seq_max_; ++s) {
+        const llama_seq_id sid = (llama_seq_id) s;
+        if (excluded(sid)) continue;
+        if (table_.num_blocks(sid) == 0) continue;            // no blocks
+        if (n_gpu_blocks_for(sid) == 0) continue;             // already preempted
+        const uint64_t last = seq_states_[s].last_active_us;
+        if (last < oldest) {
+            oldest = last;
+            victim = sid;
+        }
+    }
+    return victim;
 }
 
 bool llama_kv_cache_paged::evict_lru_warm_to_cold() {
@@ -1211,6 +1318,7 @@ bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
     }
 
     // Commit per-seq state.
+    const uint64_t now = now_us_();
     for (uint32_t s = 0; s < n_seq_max_; ++s) {
         h_q_lens_[s] = (int32_t) tokens_per_seq[s];
         if (tokens_per_seq[s] > 0) {
@@ -1218,6 +1326,9 @@ bool llama_kv_cache_paged::apply_ubatch_to_state(const llama_ubatch & ub) {
                 seq_states_[s].pos_max = max_pos_per_seq[s];
             }
             if (seq_states_[s].pos_min < 0) seq_states_[s].pos_min = 0;
+            // MAD-132: stamp last-active so preempt-fairness picks
+            // genuinely idle seqs over actively-batched ones.
+            seq_states_[s].last_active_us = now;
         }
     }
 
@@ -1338,6 +1449,7 @@ llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lct
 }
 
 void llama_kv_cache_paged::clear(bool /*data*/) {
+    check_thread_id_();
     // Free all blocks back to the pool, reset table + seq states.
     for (uint32_t s = 0; s < n_seq_max_; ++s) {
         std::vector<uint32_t> freed = table_.clear_seq((llama_seq_id) s);
@@ -1356,6 +1468,7 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
 }
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    check_thread_id_();
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_) return false;
 
     // Match the regular kv_cache convention: p0 < 0 → from 0; p1 < 0 →
@@ -1462,6 +1575,7 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
 
 void llama_kv_cache_paged::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
                                     llama_pos p0, llama_pos p1) {
+    check_thread_id_();
     // MAD-128: block-aligned CoW. Wholly-covered blocks of src in [p0, p1)
     // are SHARED into dst's table (refcount bumped in BlockPool). Future
     // writes that target a shared block trigger CoW in
@@ -1872,6 +1986,7 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
 
 void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                                          llama_state_seq_flags /*flags*/) {
+    check_thread_id_();
     // ── Header validation ──
     uint32_t magic, version;
     io.read(&magic,   sizeof(magic));
