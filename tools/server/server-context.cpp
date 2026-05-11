@@ -5,8 +5,9 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
-#include "server-tiered-cache.h"
 #include "../src/llama-model.h"
+#include "../src/llama-kv-cache-paged.h"
+#include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
 
 #include "build-info.h"
@@ -22,10 +23,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -39,6 +46,85 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// MAD-125: walk the active memory pointer chain and return the
+// llama_kv_cache_paged at the bottom (if any). Three nestings to cover:
+//   - paged is the raw active memory (rare standalone test case)
+//   - paged is the attention member of llama_memory_hybrid (hybrid models)
+//   - llama_memory_hybrid is wrapped by mt::llama_memory_tiered (the
+//     tiered + paged + hybrid stack — Qwen3.x family with --kv-tiered
+//     and --kv-tier-paged-blocks).
+// Returns nullptr when the active memory isn't running paged-blocks.
+static llama_kv_cache_paged * mt_get_paged_cache(llama_memory_i * mem) {
+    if (!mem) return nullptr;
+    if (auto * p = dynamic_cast<llama_kv_cache_paged *>(mem)) return p;
+    if (auto * h = dynamic_cast<llama_memory_hybrid *>(mem))  return h->get_mem_attn_paged();
+    if (auto * t = dynamic_cast<mt::llama_memory_tiered *>(mem)) {
+        return mt_get_paged_cache(t->inner_for_test());
+    }
+    return nullptr;
+}
+
+// MAD-122/125: write fingerprints for the token range [p0, p1). When a
+// paged_cache is supplied we emit one BGE-small embedding per logical
+// block via llama_kv_cache_paged::record_paged_block_fingerprint so
+// query-time semantic prefetch can score at block granularity. When
+// paged_cache is null we fall back to the legacy chunk-level path
+// (one embedding for the whole range, position-keyed) on the tier
+// wrapper — the dispatch happens at the call site so this function
+// stays a single helper.
+//
+// mt_tier is required either way: it owns the embed_text / bge-small
+// model. paged_cache is the destination; null = legacy path.
+//
+// Returns the number of fingerprints actually recorded.
+static int mt_record_fingerprints_for_range(
+        mt::llama_memory_tiered * mt_tier,
+        llama_kv_cache_paged    * paged_cache,
+        llama_context           * ctx,
+        llama_seq_id              seq_id,
+        const llama_tokens      & toks,
+        int                       p0,
+        int                       p1,
+        uint32_t                  block_size) {
+    if (!mt_tier || p1 <= p0) return 0;
+    const int hi = std::min<int>(p1, (int) toks.size());
+    if (hi <= p0) return 0;
+
+    if (!paged_cache) {
+        llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
+        const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+        const auto emb = mt_tier->embed_text(text);
+        if (emb.empty()) return 0;
+        std::vector<llama_pos> positions;
+        positions.reserve(hi - p0);
+        for (int i = p0; i < hi; ++i) positions.push_back((llama_pos) i);
+        mt_tier->record_chunk_fingerprint(
+            std::move(positions), emb, mt::SemanticIndex::Tier::Warm);
+        return 1;
+    }
+
+    // Paged path: walk in block_size strides starting from a block-aligned
+    // floor. paged_backup is itself block-aligned so p0 should already be
+    // on a boundary, but rounding down keeps the lblock arithmetic clean
+    // even if a future caller passes an unaligned range.
+    const uint32_t bsize = block_size > 0 ? block_size : 16u;
+    const int aligned_p0 = (int)((uint32_t) p0 / bsize) * (int) bsize;
+    int n_recorded = 0;
+    for (int b = aligned_p0; b < hi; b += (int) bsize) {
+        const int chunk_hi = std::min(b + (int) bsize, hi);
+        if (chunk_hi <= b) continue;
+        llama_tokens chunk(toks.begin() + b, toks.begin() + chunk_hi);
+        const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+        const auto emb = mt_tier->embed_text(text);
+        if (emb.empty()) continue;
+        const uint32_t lblock = (uint32_t) b / bsize;
+        paged_cache->record_paged_block_fingerprint(
+            seq_id, lblock, emb, mt::SemanticIndex::Tier::Warm);
+        ++n_recorded;
+    }
+    return n_recorded;
+}
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
@@ -121,6 +207,17 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+
+    // MAD-141: counts how many consecutive update_slots() iterations have
+    // preempted this slot via the MAD-120 admission gate without making
+    // any progress (evict_seq returned 0). Once it crosses
+    // kPagedPreemptDeadlockThreshold, the slot's request is unservable
+    // (the prompt simply doesn't fit alongside the rest of the live
+    // workload) and we fail it with a 503-equivalent rather than spin
+    // until the upstream "n_empty_consecutive > 3" safety abort fires.
+    // Reset on slot.reset() and any iteration where the slot DOES make
+    // progress through the prefill path.
+    int32_t paged_preempt_no_progress_count = 0;
 
     size_t last_nl_pos = 0;
 
@@ -208,7 +305,8 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        n_prompt_tokens_cache = 0;
+        n_prompt_tokens_cache              = 0;
+        paged_preempt_no_progress_count    = 0;  // MAD-141
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -704,7 +802,6 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-    std::unique_ptr<server_tiered_cache> tiered_cache;
 
     server_metrics metrics;
 
@@ -768,6 +865,36 @@ private:
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
+
+        // MAD-134: validate tier-related config BEFORE model load so
+        // operators get fast clear failure instead of late crashes.
+        if (!params.kv_semantic_index.empty()) {
+            struct stat st;
+            if (::stat(params.kv_semantic_index.c_str(), &st) != 0) {
+                SRV_ERR("--kv-tier-semantic-index '%s' does not exist or is not "
+                        "readable. Either provide a valid bge-small / nomic-embed gguf "
+                        "file, or omit the flag to disable semantic prefetch.\n",
+                        params.kv_semantic_index.c_str());
+                return false;
+            }
+        }
+        if (params.kv_tiered_enabled && params.kv_tier_cold_pct > 0.0f &&
+            !params.kv_tier_ssd_path.empty()) {
+            // Try to mkdir + create a test file to confirm writability.
+            const std::string test_dir = params.kv_tier_ssd_path;
+            (void) ::mkdir(test_dir.c_str(), 0700);  // ok if exists
+            const std::string test_path = test_dir + "/.write_test_" +
+                                          std::to_string(::getpid());
+            int fd = ::open(test_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+            if (fd < 0) {
+                SRV_ERR("--kv-tier-ssd-path '%s' is not writable (errno %d: %s). "
+                        "Pick a different path or fix permissions.\n",
+                        test_dir.c_str(), errno, strerror(errno));
+                return false;
+            }
+            ::close(fd);
+            ::unlink(test_path.c_str());
+        }
 
         params_base = params;
         if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {
@@ -886,7 +1013,25 @@ private:
         if (!llama_memory_can_shift(llama_get_memory(ctx))) {
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+                if (params_base.kv_tier_paged_blocks) {
+                    // MAD-128: paged-blocks deliberately doesn't support
+                    // position-shift in-place (would require re-indexing
+                    // every block_table entry + per-block reindex of the
+                    // GPU K/V layout). Instead: when a slot hits its
+                    // context limit, the server stops it with
+                    // STOP_TYPE_LIMIT and the caller resubmits as a fresh
+                    // request — paged's prompt-cache + semantic prefetch
+                    // recover most of the prefix on the next prefill.
+                    SRV_WRN("%s\n", "ctx_shift disabled: --kv-tier-paged-blocks "
+                            "is set; paged attention manages context via "
+                            "tier movement, not in-place shift. Slots will "
+                            "stop at n_ctx; clients should re-submit fresh "
+                            "requests (prompt cache + semantic prefetch "
+                            "will recover the prefix). Plan capacity "
+                            "accordingly.");
+                } else {
+                    SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+                }
             }
 
             if (params_base.n_cache_reuse) {
@@ -900,13 +1045,6 @@ private:
                 params_base.swa_full = false;
                 SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
             }
-        }
-
-        // Initialize tiered cache if enabled
-        if (params_base.kv_tiered_enabled) {
-            tiered_cache = std::make_unique<server_tiered_cache>(params_base);
-            SRV_INF("tiered cache initialized, hot=%f%%, warm=%f%%, cold=%f%%\n",
-                    params_base.kv_tier_hot_pct, params_base.kv_tier_warm_pct, params_base.kv_tier_cold_pct);
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
@@ -964,14 +1102,6 @@ private:
                 }
             }
 
-            // initialize tier manager for slot if enabled
-            if (params_base.kv_tiered_enabled) {
-                if (!tiered_cache->init_slot(i, *model, ctx)) {
-                    SRV_WRN("failed to initialize tier manager for slot %d\n", i);
-                } else {
-                    SLT_INF(slot, "tier manager initialized for slot %s\n", "");
-                }
-            }
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -1482,23 +1612,14 @@ private:
         // is the ONLY path that populates mt::'s warm + cold tiers
         // (otherwise the seq_rm-time backup hook never fires).
         //
-        // Dispatch order (precedence: newer mt:: rewrite over the older
-        // per-slot tiered_cache implementation):
-        //  1. If the active memory is mt::llama_memory_tiered, call its
-        //     public backup_proactive — uses the real KV mover + KvtcStore
-        //     pipeline.
-        //  2. Else fall back to the older tiered_cache->evict_from_slot
-        //     (transformer paths that haven't migrated to mt::).
-        //
-        // **Threshold capacity**: for the mt:: path use the physical
-        // attention cache cell count, NOT slot.n_ctx. For hybrid models
-        // (Qwen3.6, DeepSeek V4) the attention KV cache is sized for a
-        // sliding window — much smaller than the user-facing context
-        // (recurrent layers carry the long context). Comparing against
-        // slot.n_ctx makes the trigger fire too late and the inner cache
-        // 500s with "failed to find free space in the KV cache" before
-        // we ever get a chance to evict. The old tiered_cache path keeps
-        // slot.n_ctx since its semantics haven't changed.
+        // **Threshold capacity**: use the physical attention cache cell
+        // count, NOT slot.n_ctx. For hybrid models (Qwen3.6, DeepSeek V4)
+        // the attention KV cache is sized for a sliding window — much
+        // smaller than the user-facing context (recurrent layers carry
+        // the long context). Comparing against slot.n_ctx makes the
+        // trigger fire too late and the inner cache 500s with "failed
+        // to find free space in the KV cache" before we ever get a
+        // chance to evict.
         if (params_base.kv_tiered_enabled) {
             const int n_tokens = slot.prompt.n_tokens();
 
@@ -1530,7 +1651,6 @@ private:
             if (n_live_hot >= evict_threshold) {
                 const int n_evict = std::max(1, (int)(cap * 0.20f));
 
-                bool routed_to_mt = false;
                 if (mt_tier) {
                     // Eviction window starts at the cursor — the next
                     // not-yet-backed-up positions. Cursor advances by the
@@ -1557,23 +1677,23 @@ private:
                         // attention runs. Mirrors the context-shift-time
                         // fingerprinting; only fires when --kv-tier-semantic-index
                         // is set and the chunk isn't multimodal.
+                        //
+                        // MAD-122: under --kv-tier-paged-blocks the helper
+                        // emits one fingerprint per logical block instead of
+                        // one for the whole chunk, so query-time prefetch can
+                        // score at block granularity.
                         if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                             const auto & toks = slot.prompt.tokens.get_text_tokens();
-                            const int hi = std::min<int>(p1, (int) toks.size());
-                            if (hi > p0) {
-                                llama_tokens chunk(toks.begin() + p0, toks.begin() + hi);
-                                const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
-                                const auto emb = mt_tier->embed_text(text);
-                                if (!emb.empty()) {
-                                    std::vector<llama_pos> positions;
-                                    positions.reserve(hi - p0);
-                                    for (int i = p0; i < hi; ++i) positions.push_back((llama_pos) i);
-                                    mt_tier->record_chunk_fingerprint(
-                                        std::move(positions), emb,
-                                        mt::SemanticIndex::Tier::Warm);
-                                    SLT_INF(slot, "tier semantic: fingerprinted %d tokens [%d,%d) (%zu-dim) for proactive backup\n",
-                                            hi - p0, p0, hi, emb.size());
-                                }
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                            const int n_fp = mt_record_fingerprints_for_range(
+                                mt_tier, paged_cache, ctx, slot.id, toks, p0, p1,
+                                (uint32_t) params_base.kv_tier_paged_block_size);
+                            if (n_fp > 0) {
+                                SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for proactive backup\n",
+                                        n_fp,
+                                        paged_cache ? "paged-block" : "chunk",
+                                        p0, p1);
                             }
                         }
                         // Advance to the requested range end, not the count
@@ -1585,17 +1705,6 @@ private:
                         SLT_DBG(slot, "proactive mt:: backup: %u/%d positions [%d,%d) at %d live / %u hot capacity\\n",
                                 backed_up, n_evict, p0, p1, n_live_hot, cap);
                     }
-                    routed_to_mt = true;
-                }
-
-                if (!routed_to_mt && tiered_cache) {
-                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                    if (slot_tier && slot_tier->initialized) {
-                        if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)n_tokens)) {
-                            SLT_DBG(slot, "proactive tiered eviction: %d tokens at %d/%d hot capacity\\n",
-                                    n_evict, n_tokens, slot.n_ctx);
-                        }
-                    }
                 }
             }
         }
@@ -1606,8 +1715,20 @@ private:
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            // MAD-128: clear log when paged hits the limit — the operator
+            // needs to know this is a "resubmit and rely on prompt cache"
+            // situation, not a hard failure. SLT_INF (not DBG) so it lands
+            // in the default log level.
+            if (params_base.kv_tier_paged_blocks) {
+                SLT_INF(slot, "paged: hit n_ctx limit (n_tokens=%d, n_ctx=%d) — "
+                        "stopping slot. Client should re-submit as a fresh "
+                        "request; the prompt cache + semantic prefetch will "
+                        "recover the prefix.\n",
+                        slot.prompt.n_tokens(), slot.n_ctx);
+            } else {
+                SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_decoded = %d, n_ctx = %d\n",
+                        slot.prompt.n_tokens(), slot.task->n_tokens(), slot.n_decoded, slot.n_ctx);
+            }
         }
 
         // check the limits
@@ -2393,20 +2514,6 @@ private:
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
-                // Try tiered cache eviction before context shift
-                if (params_base.kv_tiered_enabled) {
-                    auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                    if (slot_tier && slot_tier->initialized) {
-                        // Evict tokens to tiered cache before context shift
-                        int n_evict = std::min(n_discard, int(slot_tier->tiered_cache->get_config().cold_capacity()));
-                        if (n_evict > 0) {
-                            if (tiered_cache->evict_from_slot(slot.id, n_evict, (uint32_t)slot.prompt.n_tokens())) {
-                                SLT_INF(slot, "tiered cache eviction: %d tokens\n", n_evict);
-                            }
-                        }
-                    }
-                }
-
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 // mt:: tier semantic fingerprint: capture an embedding of the
@@ -2419,20 +2526,17 @@ private:
                 if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx))) {
                     if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
                         const auto & toks = slot.prompt.tokens.get_text_tokens();
-                        const int hi = std::min<int>(n_keep + n_discard, (int) toks.size());
-                        if (n_keep >= 0 && hi > n_keep) {
-                            llama_tokens chunk(toks.begin() + n_keep, toks.begin() + hi);
-                            const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
-                            const auto emb = mt_tier->embed_text(text);
-                            if (!emb.empty()) {
-                                std::vector<llama_pos> positions;
-                                positions.reserve(hi - n_keep);
-                                for (int i = n_keep; i < hi; ++i) positions.push_back((llama_pos) i);
-                                mt_tier->record_chunk_fingerprint(
-                                    std::move(positions), emb,
-                                    mt::SemanticIndex::Tier::Warm);
-                                SLT_INF(slot, "tier semantic: fingerprinted %d tokens (%zu-dim) for context shift\n",
-                                        hi - n_keep, emb.size());
+                        if (n_keep >= 0) {
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                            const int n_fp = mt_record_fingerprints_for_range(
+                                mt_tier, paged_cache, ctx, slot.id, toks, n_keep, n_keep + n_discard,
+                                (uint32_t) params_base.kv_tier_paged_block_size);
+                            if (n_fp > 0) {
+                                SLT_INF(slot, "tier semantic: %d %s fingerprint(s) [%d,%d) for context shift\n",
+                                        n_fp,
+                                        paged_cache ? "paged-block" : "chunk",
+                                        n_keep, n_keep + n_discard);
                             }
                         }
                     }
@@ -2575,15 +2679,53 @@ private:
                         for (auto sid : paged_evicted_this_iter) {
                             if (sid == slot.id) { already = true; break; }
                         }
+                        int n_evicted = 0;
                         if (!already) {
-                            int n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
+                            n_evicted = llama_memory_paged_evict_seq(mem_for_admit, slot.id);
                             SLT_INF(slot, "MAD-120 preempt (prefill): hot pool full, "
                                           "evicted %d block(s) to warm; will retry next iter\n",
                                           n_evicted);
                             paged_evicted_this_iter.push_back(slot.id);
                         }
+
+                        // MAD-141: deadlock break. evict_seq returns 0 when
+                        // the slot has no GPU-resident blocks to give back —
+                        // typically because nothing has been prefilled yet
+                        // and the prompt itself is too large for the hot
+                        // budget. Without this guard the slot loops forever
+                        // until the upstream n_empty_consecutive safety
+                        // abort fires and crashes the server. Track
+                        // consecutive no-progress preempt iterations and
+                        // fail the request cleanly once it's clearly stuck.
+                        constexpr int32_t kPagedPreemptDeadlockThreshold = 4;
+                        if (n_evicted <= 0) {
+                            ++slot.paged_preempt_no_progress_count;
+                            if (slot.paged_preempt_no_progress_count >= kPagedPreemptDeadlockThreshold) {
+                                SLT_ERR(slot,
+                                        "MAD-141: paged admission stuck for %d iters with no eviction "
+                                        "progress (n_new_est=%u). Prompt does not fit alongside the "
+                                        "live workload. Failing request.\n",
+                                        slot.paged_preempt_no_progress_count, n_new_est);
+                                send_error(slot,
+                                           string_format(
+                                               "paged KV admission could not fit a %u-token request "
+                                               "alongside the active workload after %d retries. "
+                                               "Reduce the prompt or wait for slots to drain.",
+                                               n_new_est, slot.paged_preempt_no_progress_count),
+                                           ERROR_TYPE_SERVER);
+                                slot.release();
+                                // Releasing a deadlocked slot IS progress — reset
+                                // the empty-batch streak so the upstream safety
+                                // abort doesn't fire on this same iteration just
+                                // because we haven't built a token batch yet.
+                                n_empty_consecutive = 0;
+                                continue;
+                            }
+                        }
                         continue;
                     }
+                    // Slot was admitted — any prior no-progress streak ends here.
+                    slot.paged_preempt_no_progress_count = 0;
                     paged_admitted.push_back(slot.id);
                 }
 
@@ -2692,13 +2834,25 @@ private:
                                         const std::string qtext = common_detokenize(ctx, q, /*special=*/ false);
                                         const auto qemb = mt_tier->embed_text(qtext);
                                         if (!qemb.empty()) {
-                                            const uint32_t restored = mt_tier->restore_semantic(
-                                                slot.id, qemb,
-                                                params_base.kv_semantic_top_k,
-                                                params_base.kv_semantic_threshold);
+                                            // MAD-122/125: paged-blocks routes through
+                                            // llama_kv_cache_paged (the active tier
+                                            // layer for hybrid+paged). Non-paged falls
+                                            // back to the chunk-level wrapper path.
+                                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                                            const uint32_t restored = paged_cache
+                                                ? paged_cache->restore_semantic_paged(
+                                                      slot.id, qemb,
+                                                      params_base.kv_semantic_top_k,
+                                                      params_base.kv_semantic_threshold)
+                                                : mt_tier->restore_semantic(
+                                                      slot.id, qemb,
+                                                      params_base.kv_semantic_top_k,
+                                                      params_base.kv_semantic_threshold);
                                             if (restored > 0) {
-                                                SLT_INF(slot, "tier semantic: restored %u positions from warm via cosine search\n",
-                                                        restored);
+                                                SLT_INF(slot, "tier semantic: restored %u positions/blocks via cosine search (%s path)\n",
+                                                        restored,
+                                                        paged_cache ? "paged-block" : "chunk");
                                             }
                                         }
                                     }
@@ -3047,73 +3201,62 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
-                        
-                        // Get and log prefetch hints if semantic index is enabled
-                        if (params_base.kv_tiered_enabled && tiered_cache->sem_enabled()) {
-                            auto* slot_tier = tiered_cache->get_slot_manager(slot.id);
-                            if (slot_tier && slot_tier->initialized) {
-                                // Get the input text from the prompt tokens
-                                std::string input_text;
-                                const auto & input_tokens = slot.task->tokens;
-                                for (size_t i = 0; i < input_tokens.size(); ++i) {
-                                    auto piece = common_token_to_piece(ctx, input_tokens[i]);
-                                    input_text += piece;
-                                }
-                                
-                                // Get prefetch hints
-                                auto hints = tiered_cache->get_prefetch_hints(slot.id, input_text, tiered_cache->semantic_top_k);
-                                
-                                // Log the hints
-                                for (const auto& hint : hints) {
-                                    std::string positions_str;
-                                    if (!hint.positions.empty()) {
-                                        std::ostringstream oss;
-                                        oss << hint.positions.front() << ".." << hint.positions.back();
-                                        positions_str = oss.str();
-                                    } else {
-                                        positions_str = "empty";
+
+                        // MAD-129: prefill-time semantic fingerprint trigger.
+                        // Walk the seq's COMPLETE blocks (skip the partial last
+                        // block, which fills on the next prefill) and embed any
+                        // that don't already have a fingerprint. Skip-already-
+                        // fingerprinted via has_paged_fingerprint keeps
+                        // multi-turn cost bounded — only NEW blocks (the
+                        // accumulated assistant response from the prior turn)
+                        // get embedded on each turn's prefill.
+                        //
+                        // Why here vs proactive-backup: the existing chunk-
+                        // level trigger at the proactive-backup site (line
+                        // ~1631) doesn't fire for hybrid+paged because the
+                        // server's eviction threshold uses full ctx (cap
+                        // arithmetic returns 0 for hybrid+paged) so the
+                        // trigger never crosses. And eviction in the paged
+                        // cache is internal — the server doesn't see those
+                        // events anyway. Per Epic A2: write at prefill, not
+                        // at eviction.
+                        if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
+                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                ? mt_get_paged_cache(llama_get_memory(ctx)) : nullptr;
+                            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx));
+
+                            if (paged_cache && mt_tier) {
+                                const uint32_t bsize = (uint32_t) std::max(1, params_base.kv_tier_paged_block_size);
+                                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                                const int n_toks = (int) toks.size();
+                                const int n_complete_blocks = n_toks / (int) bsize;
+
+                                int n_new_fp = 0;
+                                int n_skipped_existing = 0;
+                                for (int lb = 0; lb < n_complete_blocks; ++lb) {
+                                    if (paged_cache->has_paged_fingerprint(slot.id, (uint32_t) lb)) {
+                                        ++n_skipped_existing;
+                                        continue;
                                     }
-                                    const char* tier_name = hint.current_tier == TIER_WARM ? "warm" :
-                                                            hint.current_tier == TIER_COLD ? "cold" : "hot";
-                                    SLT_INF(slot, "semantic prefetch: score=%.2f positions=[%s] tier=%s\n",
-                                            hint.score, positions_str.c_str(), tier_name);
+                                    const int p0 = lb * (int) bsize;
+                                    const int p1 = p0 + (int) bsize;
+                                    llama_tokens chunk(toks.begin() + p0, toks.begin() + p1);
+                                    const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
+                                    const auto emb = mt_tier->embed_text(text);
+                                    if (emb.empty()) continue;
+                                    paged_cache->record_paged_block_fingerprint(
+                                        slot.id, (uint32_t) lb, emb,
+                                        mt::SemanticIndex::Tier::Hot);
+                                    ++n_new_fp;
                                 }
-                                
-                                // Apply prefetch migration for WARM tier hints
-                                for (const auto& hint : hints) {
-                                    if (hint.current_tier == TIER_WARM) {
-                                        // Migrate WARM tokens to HOT tier
-                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
-                                            SLT_INF(slot, "semantic prefetch: migrated %zu warm tokens to hot\n", hint.positions.size());
-                                            auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
-                                            if (slot_mgr) {
-                                                slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
-                                            }
-                                        } else {
-                                            SLT_WRN(slot, "semantic prefetch: failed to migrate %zu warm tokens\n", hint.positions.size());
-                                        }
-                                    } else if (hint.current_tier == TIER_COLD) {
-                                        // Stage cold→warm→hot: first bring cold to warm, then warm to hot
-                                        if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_COLD, TIER_WARM)) {
-                                            if (tiered_cache->migrate_in_slot(slot.id, hint.positions, TIER_WARM, TIER_HOT)) {
-                                                SLT_INF(slot, "semantic prefetch: staged %zu cold tokens to hot\n", hint.positions.size());
-                                                auto* slot_mgr = tiered_cache->get_slot_manager(slot.id);
-                                                if (slot_mgr) {
-                                                    slot_mgr->stats.semantic_prefetch_hits += (uint32_t)hint.positions.size();
-                                                }
-                                            } else {
-                                                SLT_WRN(slot, "semantic prefetch: cold->warm ok but warm->hot failed for %zu tokens\n", hint.positions.size());
-                                            }
-                                        } else {
-                                            SLT_WRN(slot, "semantic prefetch: failed to stage %zu cold tokens\n", hint.positions.size());
-                                        }
-                                    }
-                                }
-                                
-                                // Set the current query embedding for semantic eviction weighting
-                                auto embedding = tiered_cache->embed(input_text);
-                                if (!embedding.empty()) {
-                                    slot_tier->tiered_cache->set_current_query_embedding(embedding);
+
+                                if (n_new_fp > 0 || n_skipped_existing > 0) {
+                                    SLT_INF(slot, "tier semantic: prefill fingerprint sweep — "
+                                            "%d new, %d already-fingerprinted, %d total complete blocks "
+                                            "(of %d total tokens, partial tail block of %d slots not "
+                                            "yet embedded)\n",
+                                            n_new_fp, n_skipped_existing, n_complete_blocks,
+                                            n_toks, n_toks % (int) bsize);
                                 }
                             }
                         }
@@ -3945,6 +4088,48 @@ void server_routes::init_routes() {
             }}}
         };
 
+        // MAD-133: Add paged-tier metrics when --kv-tier-paged-blocks
+        // is on. Reads counters directly from the live cache (single-
+        // thread contract — main thread is the only mutator; metrics
+        // endpoint runs on the HTTP thread but only READS volatile
+        // uint64s, which is safe-ish on x86/ARM64 for monotonic counters).
+        if (ctx_server.ctx) {
+            llama_kv_cache_paged * paged_cache = mt_get_paged_cache(llama_get_memory(ctx_server.ctx));
+            if (paged_cache) {
+                auto add_counter = [&](const char * name, const char * help, uint64_t value) {
+                    json m;
+                    m["name"]  = name;
+                    m["help"]  = help;
+                    m["value"] = value;
+                    all_metrics_def["counter"].push_back(m);
+                };
+                auto add_gauge = [&](const char * name, const char * help, uint64_t value) {
+                    json m;
+                    m["name"]  = name;
+                    m["help"]  = help;
+                    m["value"] = value;
+                    all_metrics_def["gauge"].push_back(m);
+                };
+
+                add_counter("paged_evict_hot_to_warm_total",   "Hot→warm evictions",            paged_cache->evict_h2w_total());
+                add_counter("paged_evict_warm_to_cold_total",  "Warm→cold evictions",           paged_cache->evict_w2c_total());
+                add_counter("paged_evict_cold_to_drop_total",  "Cold-block drops (no recovery)", paged_cache->evict_c2drop_total());
+                add_counter("paged_restore_warm_to_hot_total", "Warm→hot restores",             paged_cache->restore_w2h_total());
+                add_counter("paged_restore_cold_to_hot_total", "Cold→hot restores",             paged_cache->restore_c2h_total());
+                add_counter("paged_seq_preempt_total",         "MAD-120 whole-seq preemptions", paged_cache->seq_preempt_total());
+                add_counter("paged_seq_restore_total",         "MAD-120 whole-seq restores",    paged_cache->seq_restore_total());
+
+                add_counter("paged_semantic_attempts_total",        "MAD-129 semantic restore attempts",         paged_cache->semantic_attempts_total());
+                add_counter("paged_semantic_hits_total",            "MAD-129 semantic restore attempts that restored ≥1 block", paged_cache->semantic_hits_total());
+                add_counter("paged_semantic_blocks_restored_total", "MAD-129 total blocks restored via semantic", paged_cache->semantic_blocks_restored_total());
+
+                add_gauge("paged_blocks_capacity_gpu",   "GPU pool size (blocks)",   paged_cache->n_blocks_total());
+                add_gauge("paged_blocks_capacity_warm",  "Warm pool size (blocks)",  paged_cache->n_warm_blocks());
+                add_gauge("paged_blocks_capacity_cold",  "Cold pool size (blocks)",  paged_cache->n_cold_blocks());
+                add_gauge("paged_fingerprints",          "MAD-129 paged-block fingerprints currently held", paged_cache->n_paged_fingerprints());
+            }
+        }
+
         // Add weight pager metrics if enabled
         if (ctx_server.model && ctx_server.model->weight_pager) {
             auto * pager = ctx_server.model->weight_pager.get();
@@ -4022,7 +4207,28 @@ void server_routes::init_routes() {
             }
         }
 
-        res->ok(res_task->slots_data);
+        // MAD-133: enrich each slot's JSON with paged-tier residency
+        // (blocks_hot / blocks_warm / blocks_cold / fingerprints).
+        // Skipped when paged isn't on or the slot's id is missing.
+        json slots_out = res_task->slots_data;
+        if (slots_out.is_array() && ctx_server.ctx) {
+            llama_kv_cache_paged * paged_cache = mt_get_paged_cache(llama_get_memory(ctx_server.ctx));
+            if (paged_cache) {
+                for (auto & slot : slots_out) {
+                    if (!slot.contains("id")) continue;
+                    const llama_seq_id sid = slot["id"].get<llama_seq_id>();
+                    if (sid < 0) continue;
+                    slot["tier"] = {
+                        {"blocks_hot",   paged_cache->n_gpu_blocks_for(sid)},
+                        {"blocks_warm",  paged_cache->n_warm_blocks_for(sid)},
+                        {"blocks_cold",  paged_cache->n_blocks_cold_for(sid)},
+                        {"fingerprints", paged_cache->n_fingerprints_for_seq(sid)},
+                    };
+                }
+            }
+        }
+
+        res->ok(slots_out);
         return res;
     };
 

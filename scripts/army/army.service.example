@@ -1,0 +1,33 @@
+# Example systemd unit template for army instances.
+# Copy to /etc/systemd/system/army.service (or per-instance variants),
+# customize Environment + ExecStart, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable army.service
+#   systemctl start army.service
+#
+# Logs: journalctl -u army.service -f
+
+[Unit]
+Description=llama.cpp army instances
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kmbandy
+Group=kmbandy
+Environment="LLAMA_BIN=/home/kmbandy/GitHub/llama.cpp/build-hip/bin/llama-server"
+Environment="MODELS_DIR=/home/kmbandy/models"
+Environment="SSD_PATH=/var/lib/army/ssd"
+Environment="LOG_DIR=/var/log/army"
+ExecStart=/home/kmbandy/GitHub/llama.cpp/scripts/army/main.sh
+# 30s for graceful shutdown — gives the cache time to release its
+# lockfile + (when wired) flush state via /slots/save.
+TimeoutStopSec=30
+KillMode=mixed
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

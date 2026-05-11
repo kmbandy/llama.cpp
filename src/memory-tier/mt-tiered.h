@@ -31,8 +31,6 @@
 #include "mt-mover-recurrent.h"
 #include "mt-kvtc-store.h"
 #include "mt-semantic.h"
-#include "mt-block-pool.h"
-#include "mt-block-table.h"
 
 #include "llama-memory.h"
 
@@ -210,6 +208,12 @@ public:
     // Cached from tier_view_ at init — cheap, no allocation.
     uint32_t physical_attn_cells() const;
 
+    // MAD-134: warm the bge-small embedding model at construction time
+    // so the first user prompt doesn't pay the lazy-load cost
+    // (~200ms cold). Called from the ctor when semantic_index is set.
+    // Failures are non-fatal — lazy path still works.
+    void warmup_embed_();
+
     // Compute an L2-normalized embedding for `text` via the embedding
     // model loaded from cfg_.semantic_index. Lazy-initializes the model
     // on first call. Returns empty vector if the model failed to load
@@ -236,35 +240,6 @@ private:
     // Returns false if there are no attention layers to back up
     // (recurrent-only models — handled in 2d-recur).
     bool ensure_warm_staging();
-
-    // Phase 2b-C: paged-blocks variant of ensure_warm_staging. Allocates
-    // paged_warm_buf_ + computes paged_layer_off_ / paged_layer_v_off_
-    // for the block-keyed path. Only fires when cfg_.paged_blocks=true.
-    // Independent of warm_buf_ (parallel implementation under flag).
-    bool ensure_paged_warm_staging();
-
-    // Phase 2b-C: paged-blocks variant of backup_seq_rm_range. Allocates
-    // CPU blocks from paged_pool_, copies K/V from inner cache GPU into
-    // paged_warm_buf_, appends physical block IDs to paged_table_ for
-    // the seq. Returns the count of positions successfully backed up
-    // (= n_blocks_evicted * block_size if all rows succeed). Only
-    // called by backup_seq_rm_range when cfg_.paged_blocks=true.
-    uint32_t paged_backup_seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-
-    // Phase 2b-C: paged-blocks variant of restore_from_warm. For each
-    // requested position, looks up the physical block via paged_table_,
-    // copies K/V from paged_warm_buf_ back into the inner cache via
-    // mover_attn_.restore_*. The CPU block stays mapped in paged_table_
-    // after restore (the same chunk may be requested again, e.g. by
-    // semantic prefetch on a related query). Phase 2c will validate
-    // that toggling cfg_.paged_blocks gives identical observable
-    // behavior to the position-keyed path.
-    uint32_t paged_restore_from_warm(llama_seq_id seq_id,
-                                     const std::vector<llama_pos> & positions);
-
-    // Phase 2b-C: paged-blocks variant of has_warm. Checks paged_table_
-    // for a CPU-mapped physical block covering the position.
-    bool paged_has_warm(llama_seq_id seq_id, llama_pos position) const;
 
     // Open KvtcStore on the configured SSD path the first time cold
     // is needed. Returns false if cold_capacity is 0 or KvtcStore::init
@@ -313,29 +288,6 @@ private:
     RecurrentStateMover   mover_recur_;
     KvtcStore             store_;
     SemanticIndex         semantic_;
-
-    // Phase 2a paged-blocks scaffolding. Allocated only when
-    // cfg_.paged_blocks=true; otherwise these stay default-constructed
-    // and the existing position-keyed paths are unaffected. Phase 2b+
-    // wires them into the live read/write paths behind the same flag.
-    BlockPool             paged_pool_;
-    BlockTable            paged_table_;
-
-    // Phase 2b-C paged warm-tier staging. Parallel to warm_buf_ — when
-    // cfg_.paged_blocks=true, the gated paged_backup / paged_restore
-    // paths allocate physical CPU blocks from paged_pool_ and copy
-    // K/V into this buffer. Layout per CPU block:
-    //   block N starts at paged_warm_buf_ + (cpu_block_idx) * paged_block_bytes_
-    //   within block, layer L's K starts at +paged_layer_off_[L]
-    //                 layer L's V starts at +paged_layer_v_off_[L]
-    //   K stride within layer: row_bytes (block_size rows of K)
-    //   V stride within layer: row_bytes (block_size rows of V)
-    // Lazily allocated by ensure_paged_warm_staging() on first use.
-    std::vector<uint8_t>  paged_warm_buf_;
-    std::vector<size_t>   paged_layer_off_;     // byte offset of layer L's K within a block
-    std::vector<size_t>   paged_layer_v_off_;   // byte offset of layer L's V within a block
-    size_t                paged_block_bytes_ = 0;  // total bytes per block (all restorable layers, K+V)
-    bool                  paged_warm_initialized_ = false;
 
     // Cached tier view captured at construction. Pointers stay stable
     // for the lifetime of inner_ — see mt-inner-access.h.

@@ -215,4 +215,214 @@ bool SemanticIndex::load_from_disk(const std::string & path) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// BlockSemanticIndex — paged-block-keyed fingerprint store for MAD-122.
+// ---------------------------------------------------------------------------
+
+void BlockSemanticIndex::add_fingerprint(llama_seq_id        seq_id,
+                                          uint32_t            lblock,
+                                          std::vector<float>  embedding,
+                                          SemanticIndex::Tier tier) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto & seq_map = fps_[seq_id];
+    auto & e = seq_map[lblock];
+    e.embedding = std::move(embedding);
+    e.tier      = tier;
+}
+
+void BlockSemanticIndex::update_tier(llama_seq_id seq_id, uint32_t lblock,
+                                      SemanticIndex::Tier tier) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return;
+    auto bit = sit->second.find(lblock);
+    if (bit == sit->second.end()) return;
+    bit->second.tier = tier;
+}
+
+void BlockSemanticIndex::remove_block(llama_seq_id seq_id, uint32_t lblock) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return;
+    sit->second.erase(lblock);
+    if (sit->second.empty()) fps_.erase(sit);
+}
+
+bool BlockSemanticIndex::has_fingerprint(llama_seq_id seq_id, uint32_t lblock) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end()) return false;
+    return sit->second.find(lblock) != sit->second.end();
+}
+
+void BlockSemanticIndex::remove_seq(llama_seq_id seq_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    fps_.erase(seq_id);
+}
+
+void BlockSemanticIndex::clear() {
+    std::lock_guard<std::mutex> lk(mu_);
+    fps_.clear();
+}
+
+std::vector<BlockSemanticIndex::BlockHint>
+BlockSemanticIndex::score(llama_seq_id              seq_id,
+                          const std::vector<float> & query,
+                          int                        top_k,
+                          float                      threshold) const {
+    std::vector<BlockHint> out;
+    if (query.empty() || top_k <= 0) return out;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    auto sit = fps_.find(seq_id);
+    if (sit == fps_.end() || sit->second.empty()) return out;
+
+    std::vector<std::pair<float, uint32_t>> scored;
+    scored.reserve(sit->second.size());
+    for (const auto & kv : sit->second) {
+        const float s = dot(query, kv.second.embedding);
+        scored.emplace_back(s, kv.first);
+    }
+
+    std::sort(scored.begin(), scored.end(),
+              [](const auto & a, const auto & b) { return a.first > b.first; });
+
+    out.reserve((size_t) top_k);
+    for (const auto & [s, lblock] : scored) {
+        if (s < threshold) break;
+        BlockHint h;
+        h.seq_id = seq_id;
+        h.lblock = lblock;
+        h.score  = s;
+        h.tier   = sit->second.at(lblock).tier;
+        out.push_back(std::move(h));
+        if ((int) out.size() >= top_k) break;
+    }
+    return out;
+}
+
+size_t BlockSemanticIndex::size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t n = 0;
+    for (const auto & kv : fps_) n += kv.second.size();
+    return n;
+}
+
+size_t BlockSemanticIndex::size(llama_seq_id seq_id) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = fps_.find(seq_id);
+    return it == fps_.end() ? 0 : it->second.size();
+}
+
+// ---------------------------------------------------------------------------
+// MAD-130: persistence (PSFI v1 — Paged Semantic Fingerprint Index).
+//
+// File format:
+//   uint32  magic     = 0x49465350  ("PSFI" little-endian)
+//   uint32  version   = 1
+//   uint32  n_seqs
+//   For each seq:
+//     int32   seq_id
+//     uint32  n_entries
+//     For each entry:
+//       uint32 lblock
+//       uint8  tier (0=Hot, 1=Warm, 2=Cold)
+//       uint32 embedding_dim
+//       float[embedding_dim]
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kBlockFingerprintFileMagic   = 0x49465350;  // "PSFI"
+constexpr uint32_t kBlockFingerprintFileVersion = 1;
+}
+
+bool BlockSemanticIndex::save_to_disk(const std::string & path) const {
+    std::lock_guard<std::mutex> lk(mu_);
+
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        LLAMA_LOG_WARN("mt::BlockSemanticIndex::save: open(%s) failed\n", path.c_str());
+        return false;
+    }
+
+    auto write_u32 = [&](uint32_t v) { f.write((const char *) &v, sizeof(v)); };
+    auto write_i32 = [&](int32_t  v) { f.write((const char *) &v, sizeof(v)); };
+    auto write_u8  = [&](uint8_t  v) { f.write((const char *) &v, sizeof(v)); };
+
+    write_u32(kBlockFingerprintFileMagic);
+    write_u32(kBlockFingerprintFileVersion);
+    write_u32((uint32_t) fps_.size());
+
+    for (const auto & [sid, entries] : fps_) {
+        write_i32((int32_t) sid);
+        write_u32((uint32_t) entries.size());
+        for (const auto & [lblock, entry] : entries) {
+            write_u32(lblock);
+            write_u8((uint8_t) entry.tier);
+            write_u32((uint32_t) entry.embedding.size());
+            f.write((const char *) entry.embedding.data(),
+                    (std::streamsize)(entry.embedding.size() * sizeof(float)));
+        }
+    }
+    return f.good();
+}
+
+bool BlockSemanticIndex::load_from_disk(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        // Not an error — file may not exist on first run.
+        return false;
+    }
+
+    auto read_u32 = [&](uint32_t & v) -> bool {
+        f.read((char *) &v, sizeof(v));
+        return (bool) f;
+    };
+    auto read_i32 = [&](int32_t & v) -> bool {
+        f.read((char *) &v, sizeof(v));
+        return (bool) f;
+    };
+    auto read_u8 = [&](uint8_t & v) -> bool {
+        f.read((char *) &v, sizeof(v));
+        return (bool) f;
+    };
+
+    uint32_t magic = 0, version = 0;
+    if (!read_u32(magic) || !read_u32(version)) return false;
+    if (magic != kBlockFingerprintFileMagic || version != kBlockFingerprintFileVersion) {
+        LLAMA_LOG_WARN("mt::BlockSemanticIndex::load: bad header (magic=%08x ver=%u) in %s\n",
+                       magic, version, path.c_str());
+        return false;
+    }
+
+    uint32_t n_seqs = 0;
+    if (!read_u32(n_seqs)) return false;
+
+    decltype(fps_) loaded;
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        int32_t  sid = 0;
+        uint32_t n_entries = 0;
+        if (!read_i32(sid) || !read_u32(n_entries)) return false;
+
+        auto & seq_map = loaded[(llama_seq_id) sid];
+        for (uint32_t e = 0; e < n_entries; ++e) {
+            uint32_t lblock = 0, emb_dim = 0;
+            uint8_t  tier   = 0;
+            if (!read_u32(lblock) || !read_u8(tier) || !read_u32(emb_dim)) return false;
+
+            Entry entry;
+            entry.tier = (SemanticIndex::Tier) tier;
+            entry.embedding.resize(emb_dim);
+            f.read((char *) entry.embedding.data(),
+                   (std::streamsize)(emb_dim * sizeof(float)));
+            if (!f) return false;
+            seq_map[lblock] = std::move(entry);
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(mu_);
+    fps_ = std::move(loaded);
+    return true;
+}
+
 }  // namespace mt

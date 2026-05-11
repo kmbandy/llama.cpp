@@ -12,10 +12,8 @@
 //   Attention — tokens with lowest attention scores evict first
 //   Hybrid    — weighted combination of the above (default)
 //
-// Threadsafe via internal mutex. Replaces the legacy
-// llama_token_metadata_store in src/llama-eviction-policy.h. The
-// numeric eviction-policy mapping (0..3) matches the legacy CLI for
-// backward compat.
+// Threadsafe via internal mutex. The numeric eviction-policy mapping
+// (0..3) matches the long-standing CLI flag values.
 
 #include "mt-config.h"
 #include "llama.h"          // llama_pos

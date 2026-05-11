@@ -94,4 +94,56 @@ bool dequantize_int8(const uint8_t * src, float * dst, size_t n) {
     return true;
 }
 
+// MAD-135: per-block int4 with explicit scale.
+//
+// Algorithm:
+//   1. Compute scale = max(|x[i]|) over the block. If 0, set scale=1
+//      (all output nibbles will encode 0 anyway).
+//   2. For each x[i]: normalized = x[i] / scale; encode to int4.
+//   3. Output: scale (one float), then ceil(n/2) packed bytes.
+//
+// On dequant: multiply each decoded value by scale to recover the
+// original range. Quantization error is bounded by 1/(7 * 2) = 7.1%
+// of the per-block max-abs (int4 has 16 levels, so half-step is ~7%).
+// For cold-tier KV restoration this is acceptable — the original K/V
+// values were going to be re-attended-to with their original-precision
+// neighbors anyway, so per-block error doesn't compound across the
+// attention sum.
+bool quantize_block_int4_with_scale(const float * src, size_t n,
+                                     float * scale_out, uint8_t * dst) {
+    if (n == 0 || src == nullptr || scale_out == nullptr || dst == nullptr) return false;
+
+    float scale = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = std::fabs(src[i]);
+        if (a > scale) scale = a;
+    }
+    if (scale == 0.0f) scale = 1.0f;  // all zero block; encoded nibbles will be zero anyway
+
+    *scale_out = scale;
+    const float inv = 1.0f / scale;
+
+    for (size_t i = 0; i < n; i += 2) {
+        const uint8_t lo = encode_int4(src[i] * inv);
+        const uint8_t hi = (i + 1 < n) ? encode_int4(src[i + 1] * inv) : 0u;
+        dst[i / 2] = (uint8_t)(lo | (hi << 4));
+    }
+    return true;
+}
+
+bool dequantize_block_int4_with_scale(const uint8_t * src, float scale_in,
+                                       float * dst, size_t n) {
+    if (n == 0) return true;
+    if (src == nullptr || dst == nullptr) return false;
+
+    for (size_t i = 0; i < n; i += 2) {
+        const uint8_t byte = src[i / 2];
+        dst[i] = decode_int4((uint8_t)(byte & 0x0F)) * scale_in;
+        if (i + 1 < n) {
+            dst[i + 1] = decode_int4((uint8_t)((byte >> 4) & 0x0F)) * scale_in;
+        }
+    }
+    return true;
+}
+
 }  // namespace mt

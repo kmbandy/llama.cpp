@@ -1477,9 +1477,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-tier-paged-blocks"},
         {"--no-kv-tier-paged-blocks"},
-        "EXPERIMENTAL: enable mt:: paged attention KV cache (vLLM-style block-indexed layout). Routes attention through mt_paged_attention_kernel + mt_reshape_and_cache scatter on HIP/CUDA. Currently validated only on standard non-hybrid transformer models with per-attention-call ctx ≤ ~16k tokens — the kernel's smem footprint scales with ctx and overflows AMD's 64 KiB LDS limit beyond that (clear error logged at dispatch). Hybrid (DeltaNet/Mamba+attention) models compile through the paged path but produce incorrect attention output — needs further debugging. SWA models fall back to the regular kv cache. For multi-agent serving on hybrid models prefer --kv-tiered without this flag (software-only tier eviction; works at --parallel > 1).",
+        "MAD-134: paged-attention KV cache (vLLM-style block-indexed). When --kv-tiered is also set, this is auto-enabled by default (use --no-kv-tier-paged-blocks to opt out). Validated end-to-end on hybrid models (Qwen3.x family); non-hybrid + ctx > 16k may hit kernel LDS limits.",
         [](common_params & params, bool value) {
             params.kv_tier_paged_blocks = value;
+            params.kv_tier_paged_blocks_explicit = true;  // MAD-134: user said something
         }
     ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -1492,6 +1493,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_tier_paged_block_size = value;
         }
     ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-cold-resume"},
+        {"--no-kv-tier-cold-resume"},
+        "MAD-130: when true, skip O_TRUNC on cold-tier files at startup and load the in-memory index from "
+        "${ssd_path}/paged/instance-${INSTANCE_ID}/index.bin (written by the prior server's clean shutdown or "
+        "/slots/save). Lets the server resume cold-tier contents across a clean restart. Sidecar absent or "
+        "invalid → starts fresh with a warning. Default false (legacy behavior: fresh truncation).",
+        [](common_params & params, bool value) {
+            params.kv_tier_cold_resume = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_COLD_RESUME").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--instance-id"}, "ID",
+        "MAD-131: per-instance ID used to scope the cold-tier subdir (${ssd_path}/paged/instance-${ID}/) "
+        "and the per-instance lockfile. Lets multiple llama-server processes share one --kv-tier-ssd-path "
+        "without colliding. Default = process pid as a string. Use a stable ID (e.g. 'main-r9700') for "
+        "deterministic restarts with --kv-tier-cold-resume.",
+        [](common_params & params, const std::string & value) {
+            params.kv_tier_instance_id = value;
+        }
+    ).set_env("LLAMA_ARG_INSTANCE_ID").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-cold-budget-mb"}, "N",
+        "MAD-131: cap the cold-tier pool to N MiB total (across K+V × all attn layers). 0 = no cap "
+        "(size from --kv-tiered cold percentage). Use this to bound SSD wear per instance — e.g. "
+        "10000 (10 GiB) is reasonable for a consumer NVMe with ~600 TBW lifetime serving an army.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-tier-cold-budget-mb must be >= 0");
+            }
+            params.kv_tier_cold_budget_mb = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_COLD_BUDGET_MB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

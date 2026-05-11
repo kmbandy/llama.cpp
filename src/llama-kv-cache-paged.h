@@ -34,6 +34,38 @@
 //   appropriate logical block list. The earlier defensive assert is
 //   gone; the cache works correctly with --parallel N for any N up to
 //   n_seq_max_.
+//
+// THREADING CONTRACT (MAD-132 / Epic A4):
+//
+//   This cache is SINGLE-THREADED. All mutator methods MUST be called
+//   from one thread (the server's update_slots main loop). The internal
+//   BlockPool, BlockTable, BlockSemanticIndex, cold_pool_free_, and
+//   per-seq state vectors have NO internal locking.
+//
+//   Why this is safe today: the server's update_slots runs sequentially.
+//   --parallel N (multi-seq) processes N sequences inside one ubatch
+//   inside one main-thread iteration; the GPU runs them in parallel via
+//   the kernel's grid-y dimension over sequences, but the cache mutations
+//   that schedule the kernel all happen on one thread.
+//
+//   What violates this: any future change that adds a worker thread
+//   touching the cache. Examples:
+//     - bge-small embedding on a CPU worker parallel to GPU compute
+//     - Async cold-tier I/O thread
+//     - Multi-threaded HTTP handler that touches the cache directly
+//
+//   Each of these would silently corrupt the cache (BlockPool::alloc_gpu
+//   would race; two threads could pop the same block ID; kernel reads
+//   garbage at attention time). DEBUG builds catch the violation via
+//   captured_thread_id_ + check_thread_id_() — first call captures the
+//   thread, subsequent calls assert match. Release builds skip the check.
+//
+//   To add real async support: either (a) a single-purpose worker queue
+//   where the worker enqueues "fingerprint this text" / "embed this query"
+//   and the main thread drains at safe points, OR (b) a redesign with
+//   fine-grained locking (mutex per pool, per-seq state shards). DO NOT
+//   add casual mutation from a second thread — the existing single-thread
+//   invariant is load-bearing for correctness.
 
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -41,9 +73,12 @@
 
 #include "memory-tier/mt-block-pool.h"
 #include "memory-tier/mt-block-table.h"
+#include "memory-tier/mt-semantic.h"
 
+#include <chrono>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -89,6 +124,22 @@ public:
             // created. Ignored when n_cold_blocks == 0. The "/paged"
             // subdir is created on demand.
             std::string                ssd_path = std::string(),
+            // MAD-130: when true, skip the O_TRUNC on cold-tier files
+            // and load the in-memory cold index from the sidecar file
+            // at `${ssd_path}/paged/instance-${INSTANCE_ID}/index.bin`.
+            // Lets the server resume cold-tier contents across a clean
+            // restart. Default false (legacy behavior: fresh truncation).
+            bool                       cold_resume = false,
+            // MAD-131: per-instance ID. Cold-tier files live under
+            // `${ssd_path}/paged/instance-${INSTANCE_ID}/`. Empty →
+            // use the process pid as a string. Required to allow
+            // multiple llama-server processes to share one ssd_path
+            // without colliding on cold-tier files.
+            std::string                instance_id = std::string(),
+            // MAD-131: cap cold pool to this many MiB total (K+V across
+            // all attn layers). 0 = no cap (size from cold percentage).
+            // Lets operators bound SSD wear per instance.
+            uint32_t                   cold_budget_mb = 0,
             // Optional per-layer filter. Returns true for layers that should
             // get K/V allocation in the paged pool. Recurrent layers in
             // hybrid models should be filtered OUT (their state lives in
@@ -255,16 +306,133 @@ public:
     uint32_t n_cold_blocks() const { return n_cold_blocks_; }
     bool     cold_enabled()  const { return n_cold_blocks_ > 0; }
 
+    // ─── MAD-133: tier-movement counters (monotonic since startup) ───
+    //
+    // Read by the /metrics endpoint (paged_* keys). All uint64. No locking needed
+    // — single-thread mutator contract (Epic A4 / MAD-132). Reset on
+    // clear() + state_read.
+    uint64_t evict_h2w_total()          const { return evict_h2w_total_; }
+    uint64_t evict_w2c_total()          const { return evict_w2c_total_; }
+    uint64_t evict_c2drop_total()       const { return evict_c2drop_total_; }
+    uint64_t restore_w2h_total()        const { return restore_w2h_total_; }
+    uint64_t restore_c2h_total()        const { return restore_c2h_total_; }
+    uint64_t seq_preempt_total()        const { return seq_preempt_total_; }
+    uint64_t seq_restore_total()        const { return seq_restore_total_; }
+    uint64_t semantic_attempts_total()  const { return semantic_attempts_total_; }
+    uint64_t semantic_hits_total()      const { return semantic_hits_total_; }
+    uint64_t semantic_blocks_restored_total() const { return semantic_blocks_restored_total_; }
+
+    // ─── MAD-133: per-seq tier-residency accessors ───
+    //
+    // n_blocks_hot_for / n_blocks_warm_for already exist (lines 217-218
+    // — used by can_admit). New: cold + fingerprint counts for /slots.
+    uint32_t n_blocks_cold_for(llama_seq_id seq_id) const;
+    size_t   n_fingerprints_for_seq(llama_seq_id seq_id) const {
+        return paged_semantic_.size(seq_id);
+    }
+
+    // Per-instance ID accessor (set in ctor; immutable after). Used by
+    // /metrics + /slots to label paged_* output.
+    const std::string & instance_id() const { return instance_id_; }
+
+    // MAD-132: drop the OLDEST cold block from cold_pool_free_ by
+    // unmapping the (seq, lblock) it was assigned to and freeing the
+    // cold_idx. Used as the final escalation when all three tiers are
+    // full (hot full, warm full, cold full): rather than refuse the
+    // request, drop the most-stale cold block to make room for the
+    // hot→warm→cold spillage. The dropped block's data is gone — the
+    // owning seq's table entry stays kInvalidBlockId; future reads
+    // contribute -INFINITY logit (= zero attention contribution) per
+    // the same kernel mechanism that handles middle-wipe holes.
+    // Returns true if a block was dropped, false if cold is empty.
+    bool drop_oldest_cold_block();
+
+    // MAD-132: pick a victim seq for whole-slot preemption using
+    // idle-priority fairness — the seq whose last apply_ubatch_to_state
+    // was longest ago is preferred. exclude_seqs lists seqs that must
+    // NOT be picked (e.g. the candidate trying to be admitted right
+    // now, or seqs already in the active batch). Returns the chosen
+    // seq_id (>= 0) on success, -1 if no eligible victim exists.
+    // Use evict_seq_to_warm() to actually carry out the preemption
+    // once the policy chose a target.
+    llama_seq_id pick_preempt_victim(const std::vector<llama_seq_id> & exclude_seqs) const;
+
+    // ─── MAD-125: BGE-small semantic prefetch ───
+    //
+    // The cache holds an optional per-(seq, lblock) fingerprint store.
+    // Server populates it at backup time (one BGE embedding per block);
+    // at prefill arrival the server queries restore_semantic_paged with
+    // a query embedding, and this method scores against the fingerprints,
+    // picks the top-K matches above a cosine threshold, and faults each
+    // matching block back from warm/cold to hot before kernel dispatch.
+    //
+    // Lifecycle: fingerprints follow blocks. Whole-seq wipe (clear,
+    // seq_rm with full range) drops them; per-seq removal happens
+    // automatically. No FIFO cap — memory grows with active context.
+
+    // Record the fingerprint for one paged block. embedding should be
+    // L2-normalized; tier annotates current location (informational).
+    void record_paged_block_fingerprint(llama_seq_id        seq_id,
+                                         uint32_t            lblock,
+                                         std::vector<float>  embedding,
+                                         mt::SemanticIndex::Tier tier);
+
+    // Score the seq's paged-block fingerprints against query_embedding,
+    // restore the top-K above threshold from warm (and cold as fallback)
+    // back to hot. Returns the count of blocks actually restored. Logs
+    // hit-rate (restored / requested) for MAD-122 acceptance criterion.
+    uint32_t restore_semantic_paged(llama_seq_id              seq_id,
+                                     const std::vector<float> & query_embedding,
+                                     int                        top_k     = 5,
+                                     float                      threshold = 0.65f);
+
+    // Diagnostic: how many fingerprints currently held.
+    size_t n_paged_fingerprints() const { return paged_semantic_.size(); }
+
+    // MAD-129: O(1) check whether (seq_id, lblock) already has a
+    // fingerprint. Used by the server's prefill-time write trigger to
+    // skip blocks already fingerprinted on prior turns.
+    bool has_paged_fingerprint(llama_seq_id seq_id, uint32_t lblock) const {
+        return paged_semantic_.has_fingerprint(seq_id, lblock);
+    }
+
+    // MAD-130: persist the cold-tier index to a sidecar file at
+    // `${cold_path_}/paged/index.bin`. Called by the server on graceful
+    // shutdown or as part of /slots/save. Returns false on I/O error.
+    // No-op when cold tier is disabled.
+    bool save_cold_index_sidecar() const;
+
+    // MAD-130: persist the BlockSemanticIndex (paged-block fingerprints)
+    // to a sidecar file at the given path. Thin forwarders so the
+    // server can save fingerprints alongside state_write without poking
+    // at private members.
+    bool save_paged_fingerprints(const std::string & path) const {
+        return paged_semantic_.save_to_disk(path);
+    }
+    bool load_paged_fingerprints(const std::string & path) {
+        return paged_semantic_.load_from_disk(path);
+    }
+
 private:
     friend class llama_kv_cache_paged_context;
 
     // Per-seq tracking. seq_pos_max is the highest position written for
     // the seq (inclusive). seq_pos_min stays 0 unless seq_rm carved off
-    // the head.
+    // the head. last_active_us is the wall-clock microseconds at which
+    // apply_ubatch_to_state last saw tokens for this seq (MAD-132
+    // preempt fairness; older = more eligible for preemption).
     struct seq_state {
-        llama_pos pos_min = -1;
-        llama_pos pos_max = -1;
+        llama_pos pos_min        = -1;
+        llama_pos pos_max        = -1;
+        uint64_t  last_active_us = 0;
     };
+
+    // MAD-132: thread-affinity capture for the single-threading contract.
+    // First mutator call captures std::this_thread::get_id(); subsequent
+    // calls assert match in DEBUG builds. Release builds: zero overhead
+    // (the assert macro compiles away to nothing).
+    mutable std::thread::id captured_thread_id_;
+    void check_thread_id_() const;
 
     // Allocate and upload the block_table / context_lens / q_lens
     // tensors to the GPU for the current batch. Called by init_batch
@@ -285,6 +453,24 @@ private:
     // multiple seqs whose total active ctx exceeds the hot capacity).
     // No-op if warm tier is disabled.
     bool fault_in_warm_blocks_for_batch(const llama_ubatch & ub);
+
+    // MAD-130: load the cold-tier sidecar from disk and rebuild
+    // cold_slot_for_ + cold_pool_free_ + cold_in_use_. Called from the
+    // ctor when cold_resume=true and the sidecar exists. Returns false
+    // if the sidecar is missing/corrupt/mismatched-config — caller
+    // should treat as "start fresh."
+    bool load_cold_index_sidecar_(const std::string & path);
+
+    // MAD-128: CoW any blocks being written this ubatch that are shared
+    // (refcount > 1 from a prior seq_cp). For each (seq, lblock) pair
+    // touched by a write in `ub`: if that physical block is shared,
+    // allocate a fresh GPU block, copy the existing data into it, swap
+    // the seq's table entry to point at the new block, and decrement
+    // the old block's refcount. After this returns, every write target
+    // is uniquely-owned and the kernel can write without corrupting
+    // other sequences sharing the same prefix. Returns false if a CoW
+    // alloc failed and eviction couldn't free a block.
+    bool cow_writes_for_ubatch(const llama_ubatch & ub);
 
     const llama_model &        model_;
     ggml_backend_buffer_type_t buft_;
@@ -333,6 +519,30 @@ private:
     uint32_t                  n_cold_blocks_ = 0;
     uint32_t                  cold_in_use_   = 0;
     std::string               cold_path_;
+
+    // MAD-133: tier-movement counters (monotonic since startup, single-
+    // threaded so no atomics). Bumped at the relevant tier-move sites.
+    uint64_t evict_h2w_total_                = 0;
+    uint64_t evict_w2c_total_                = 0;
+    uint64_t evict_c2drop_total_             = 0;
+    uint64_t restore_w2h_total_              = 0;
+    uint64_t restore_c2h_total_              = 0;
+    uint64_t seq_preempt_total_              = 0;
+    uint64_t seq_restore_total_              = 0;
+    uint64_t semantic_attempts_total_        = 0;
+    uint64_t semantic_hits_total_            = 0;
+    uint64_t semantic_blocks_restored_total_ = 0;
+
+    // MAD-131: per-instance subdir + flock-based double-start protection.
+    // instance_id_ defaults to the process pid as a string; --instance-id
+    // overrides for deterministic restarts. cold_lock_fd_ holds the
+    // OS-level lock on `${cold_path_}/paged/instance-${id}/.lock` for
+    // the lifetime of the cache; the .pid file is informational. Both
+    // get cleaned up by the destructor.
+    std::string               instance_id_;
+    std::string               cold_lock_path_;
+    std::string               cold_pid_path_;
+    int                       cold_lock_fd_  = -1;
     std::vector<int>          cold_fd_k_;            // [n_layers] fd for K cold file (-1 = none)
     std::vector<int>          cold_fd_v_;            // [n_layers] fd for V cold file
     std::vector<uint32_t>     cold_pool_free_;       // free cold_idx stack
@@ -344,8 +554,9 @@ private:
 
     // Block-table machinery (independent from mt::, since this owns the
     // cache outright). Single-pool: GPU only for v1.
-    mt::BlockPool   pool_;
-    mt::BlockTable  table_;
+    mt::BlockPool          pool_;
+    mt::BlockTable         table_;
+    mt::BlockSemanticIndex paged_semantic_;  // MAD-125
 
     // Per-seq position tracking.
     std::vector<seq_state> seq_states_;

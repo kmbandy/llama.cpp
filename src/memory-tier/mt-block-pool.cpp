@@ -32,6 +32,9 @@ void BlockPool::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) {
         cpu_free_.push_back(n_gpu + i);
     }
 
+    // MAD-128: per-block refcount, all start at 0 (free).
+    refcount_.assign((size_t) n_gpu + n_cpu, 0);
+
     LLAMA_LOG_INFO("mt::BlockPool: init n_gpu=%u n_cpu=%u watermark=%.2f "
                    "(reserve gpu=%u cpu=%u)\n",
                    n_gpu, n_cpu, (double) watermark,
@@ -42,6 +45,8 @@ uint32_t BlockPool::alloc_gpu() {
     if (gpu_free_.empty()) return kInvalidBlockId;
     const uint32_t id = gpu_free_.back();
     gpu_free_.pop_back();
+    assert(id < refcount_.size() && refcount_[id] == 0 && "alloc'd block had nonzero refcount");
+    refcount_[id] = 1;
     return id;
 }
 
@@ -49,12 +54,41 @@ uint32_t BlockPool::alloc_cpu() {
     if (cpu_free_.empty()) return kInvalidBlockId;
     const uint32_t id = cpu_free_.back();
     cpu_free_.pop_back();
+    assert(id < refcount_.size() && refcount_[id] == 0 && "alloc'd block had nonzero refcount");
+    refcount_[id] = 1;
     return id;
+}
+
+void BlockPool::bump_ref(uint32_t block_id) {
+    if (block_id == kInvalidBlockId) {
+        LLAMA_LOG_WARN("mt::BlockPool::bump_ref: kInvalidBlockId — ignoring\n");
+        return;
+    }
+    assert(block_id < refcount_.size() && "bump_ref: block_id out of range");
+    assert(refcount_[block_id] > 0 && "bump_ref: block is free (refcount==0)");
+    ++refcount_[block_id];
+}
+
+uint32_t BlockPool::refcount(uint32_t block_id) const {
+    if (block_id == kInvalidBlockId) return 0;
+    if (block_id >= refcount_.size()) return 0;
+    return refcount_[block_id];
 }
 
 void BlockPool::free_block(uint32_t block_id) {
     if (block_id == kInvalidBlockId) {
         LLAMA_LOG_WARN("mt::BlockPool::free_block: kInvalidBlockId — ignoring\n");
+        return;
+    }
+
+    assert(block_id < refcount_.size() && "free_block: block_id out of range");
+    if (refcount_[block_id] == 0) {
+        LLAMA_LOG_WARN("mt::BlockPool::free_block: double-free of block %u\n", block_id);
+        return;
+    }
+    --refcount_[block_id];
+    if (refcount_[block_id] > 0) {
+        // Still has other references — don't return to free stack yet.
         return;
     }
 
@@ -102,6 +136,8 @@ void BlockPool::reset() {
     for (uint32_t i = total_cpu_blocks_; i-- > 0; ) {
         cpu_free_.push_back(total_gpu_blocks_ + i);
     }
+    // MAD-128: zero all refcounts on whole-pool reset.
+    std::fill(refcount_.begin(), refcount_.end(), 0u);
 }
 
 }  // namespace mt

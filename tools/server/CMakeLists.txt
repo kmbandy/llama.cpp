@@ -15,8 +15,6 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
-    server-tiered-cache.cpp
-    server-tiered-cache.h
     server-tools.cpp
     server-tools.h
 )

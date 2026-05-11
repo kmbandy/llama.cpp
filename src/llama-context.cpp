@@ -300,6 +300,9 @@ llama_context::llama_context(
             /*.kv_tier_semantic_topk       =*/ params.kv_tier_semantic_topk,
             /*.kv_tier_paged_blocks        =*/ params.kv_tier_paged_blocks,
             /*.kv_tier_paged_block_size    =*/ params.kv_tier_paged_block_size,
+            /*.kv_tier_cold_resume         =*/ params.kv_tier_cold_resume,
+            /*.kv_tier_instance_id         =*/ params.kv_tier_instance_id,
+            /*.kv_tier_cold_budget_mb      =*/ params.kv_tier_cold_budget_mb,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3215,6 +3218,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_tier_semantic_topk       =*/ 5,
         /*.kv_tier_paged_blocks        =*/ false,
         /*.kv_tier_paged_block_size    =*/ 0,
+        /*.kv_tier_cold_resume         =*/ false,
+        /*.kv_tier_instance_id         =*/ nullptr,
+        /*.kv_tier_cold_budget_mb      =*/ 0,
     };
 
     return result;

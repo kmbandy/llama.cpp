@@ -9,10 +9,8 @@
 //   evict_v   VRAM[layer.v @ pos]         -> host buf  (gather if v_trans)
 //   restore_v host buf                     -> VRAM[layer.v @ pos]  (scatter if v_trans)
 //
-// Synchronous via hipMemcpy / hipMemcpy2D — same pattern as the legacy
-// pager and the legacy llama_kv_cache_tiered. Phase 2 follow-up will
-// add async overlap with proper stream-event ordering once correctness
-// is locked.
+// Synchronous via hipMemcpy / hipMemcpy2D. Async overlap with proper
+// stream-event ordering is a follow-up once correctness is locked.
 //
 // Layouts (ggml semantics):
 //   K is always contiguous: token p starts at byte offset p * k_row_bytes.

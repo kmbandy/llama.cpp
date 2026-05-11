@@ -6,11 +6,10 @@
 // for inputs already in roughly [-1, +1]. Quality is "fine for cold
 // tier" — you would not use these for active inference.
 //
-// IMPORTANT: the legacy llama_ssd_storage_format helpers in
-// src/llama-kv-cache-tiered.cpp had a sign-bias bug — storing -8
-// round-tripped to 0 because the encoder packed `(v & 0x0F)` instead
-// of `(v + 8) & 0x0F`. The new helpers here use the correct +8 bias
-// so the full [-8, +7] range round-trips faithfully.
+// IMPORTANT (history): an earlier int4 implementation had a sign-bias
+// bug — storing -8 round-tripped to 0 because the encoder packed
+// `(v & 0x0F)` instead of `(v + 8) & 0x0F`. These helpers use the
+// correct +8 bias so the full [-8, +7] range round-trips faithfully.
 
 #include <cstddef>
 #include <cstdint>
@@ -34,5 +33,23 @@ std::vector<uint8_t> quantize_int8(const float * src, size_t n);
 
 // Decode `n` 8-bit signed values from `src` back to floats.
 bool dequantize_int8(const uint8_t * src, float * dst, size_t n);
+
+// MAD-135: per-block int4 with explicit scale. Reads `n` floats from
+// `src`, computes scale = max(abs(x[i])), normalizes each into
+// [-1, +1], int4-quantizes. Output: `*scale_out` is the per-block
+// scale; `dst` (size at least ceil(n/2)) holds packed int4 nibbles.
+// scale==0 means the entire block is zero — quant bytes are still
+// written (all zero).
+//
+// Cold-tier use case: bound the dynamic range without an external
+// scale assumption. F16 KV values in attention can have magnitudes
+// well outside [-1, +1]; per-block scale recovers a usable range.
+bool quantize_block_int4_with_scale(const float * src, size_t n,
+                                     float * scale_out, uint8_t * dst);
+
+// Inverse: reads `*scale_in` + ceil(n/2) packed int4 bytes,
+// dequantizes into `dst` (size at least n).
+bool dequantize_block_int4_with_scale(const uint8_t * src, float scale_in,
+                                       float * dst, size_t n);
 
 }  // namespace mt

@@ -55,12 +55,30 @@ public:
     // first). Watermark is NOT enforced here — callers that care about
     // admission control should consult has_free_gpu_blocks() up-front.
     // alloc_*() always allocates if anything is free.
+    //
+    // The returned block has refcount=1. Use bump_ref() to share the
+    // block between sequences (CoW); free_block() decrements and only
+    // returns the block to the free stack when refcount drops to 0.
     uint32_t alloc_gpu();
     uint32_t alloc_cpu();
 
-    // Return a block to its pool. Idempotent on already-free blocks
-    // (logs a warning); double-free does NOT corrupt the pool. Asserts
-    // on out-of-range IDs.
+    // MAD-128: increment refcount on `block_id`. Used by seq_cp to share
+    // a physical block across two sequences without copying its bytes.
+    // The next free_block() call on this id decrements; the block goes
+    // back to the free stack only when the last reference is freed.
+    // Asserts on out-of-range or already-free IDs (refcount==0).
+    void bump_ref(uint32_t block_id);
+
+    // MAD-128: query refcount. 0 means the block is free; 1 means
+    // single-owner; >1 means shared. Used by the CoW write trigger in
+    // llama_kv_cache_paged to decide whether a write needs to allocate
+    // a fresh block first.
+    uint32_t refcount(uint32_t block_id) const;
+
+    // Return a block to its pool. Decrements refcount; only actually
+    // returns the block to the free stack when refcount drops to 0.
+    // Idempotent on already-free blocks (logs a warning); double-free
+    // does NOT corrupt the pool. Asserts on out-of-range IDs.
     void free_block(uint32_t block_id);
 
     // True if `block_id` is a GPU block (vs CPU). Inferred from the ID
@@ -91,6 +109,12 @@ private:
     // pure LRU; smarter eviction policies layer above.
     std::vector<uint32_t> gpu_free_;
     std::vector<uint32_t> cpu_free_;
+
+    // MAD-128: per-block refcount (parallel to free stacks). Indexed
+    // by block_id (covers both GPU and CPU id ranges). 0 = free; 1 =
+    // single-owner; >1 = shared via seq_cp. alloc_*() sets to 1;
+    // bump_ref() increments; free_block() decrements (actual free at 0).
+    std::vector<uint32_t> refcount_;
 
     uint32_t total_gpu_blocks_ = 0;
     uint32_t total_cpu_blocks_ = 0;

@@ -1,0 +1,85 @@
+name: CI (army — paged + tiered KV)
+
+# MAD-137 CI integration. Hosted-runner-only:
+#  - Compile for the CPU backend so the mt:: + paged sources catch any
+#    cross-arch breakage immediately.
+#  - Run the mt:: unit tests + the integration tests with no model
+#    (they self-skip when LLAMACPP_TEST_MODELFILE is unset, but the
+#    binaries still have to build cleanly).
+#
+# Real-hardware testing on the army GPUs (R9700, 6900XT, 1070, RX 480)
+# is run manually via scripts/test/run-army-matrix.sh on the dev boxes.
+# Self-hosted runners were intentionally not wired up — they expose the
+# dev boxes to inbound CI traffic, which we don't want.
+
+on:
+  workflow_dispatch:   # manual trigger
+  push:
+    branches: [master, 'feat/MAD-*']
+    paths:
+      - '.github/workflows/army-test.yml'
+      - 'src/llama-kv-cache-paged.{h,cpp}'
+      - 'src/memory-tier/**'
+      - 'tests/test-mt-*'
+      - 'tests/test-paged-*'
+      - 'tests/stress/**'
+      - 'scripts/test/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/army-test.yml'
+      - 'src/llama-kv-cache-paged.{h,cpp}'
+      - 'src/memory-tier/**'
+      - 'tests/test-mt-*'
+      - 'tests/test-paged-*'
+      - 'tests/stress/**'
+      - 'scripts/test/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_LOG_COLORS: 1
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+
+jobs:
+  hosted-cpu-tests:
+    name: "hosted (cpu) — unit + integration smoke"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: army-hosted-cpu
+          evict-old-files: 1d
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_VULKAN=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=ON
+
+      - name: "Build (mt:: tests + paged-* tests)"
+        run: |
+          cmake --build build --target \
+            test-mt-quant \
+            test-mt-block-pool \
+            test-mt-block-table \
+            test-mt-block-semantic-index \
+            test-mt-tiered-thin \
+            test-paged-lifecycle \
+            test-paged-semantic \
+            -j $(nproc)
+
+      - name: "ctest — mt:: + paged-* (skips integration without model)"
+        working-directory: build
+        run: |
+          ctest -R 'test-mt-|test-paged-' --output-on-failure

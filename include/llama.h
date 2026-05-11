@@ -405,6 +405,9 @@ extern "C" {
         int32_t      kv_tier_semantic_topk;
         bool         kv_tier_paged_blocks;       // Phase 2a opt-in (off => current path)
         int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
+        bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar
+        const char * kv_tier_instance_id;        // MAD-131: per-instance ID for cold subdir + lockfile (nullptr => pid)
+        int32_t      kv_tier_cold_budget_mb;     // MAD-131: cap cold pool to N MiB (0 => no limit)
     };
 
     struct llama_model_tensor_override {

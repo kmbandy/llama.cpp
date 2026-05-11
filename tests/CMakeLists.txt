@@ -265,6 +265,41 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-rope.cpp)
 endif()
 
+# MAD-135: mt:: int4 quant round-trip tests
+llama_build_and_test(test-mt-quant.cpp)
+
+# MAD-137: mt:: tier primitive unit tests
+# These compile a small slice of src/memory-tier/ directly into the test
+# binary because the classes aren't exported through the public llama
+# API. src/ is added to the include path so internal headers (llama-impl.h)
+# resolve.
+llama_build_and_test(test-mt-block-pool.cpp ../src/memory-tier/mt-block-pool.cpp)
+target_include_directories(test-mt-block-pool PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-mt-block-table.cpp
+    ../src/memory-tier/mt-block-table.cpp
+    ../src/memory-tier/mt-block-pool.cpp)
+target_include_directories(test-mt-block-table PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-mt-block-semantic-index.cpp
+    ../src/memory-tier/mt-semantic.cpp)
+target_include_directories(test-mt-block-semantic-index PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-mt-tiered-thin.cpp
+    ../src/memory-tier/mt-semantic.cpp)
+target_include_directories(test-mt-tiered-thin PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MAD-137: paged-cache integration test. Needs a real model (skips
+# gracefully when LLAMACPP_TEST_MODELFILE / argv[1] are unset). Links
+# the full llama lib because llama_kv_cache_paged is part of it.
+llama_build_and_test(test-paged-lifecycle.cpp)
+target_link_libraries(test-paged-lifecycle PRIVATE llama)
+target_include_directories(test-paged-lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-paged-semantic.cpp)
+target_link_libraries(test-paged-semantic PRIVATE llama)
+target_include_directories(test-paged-semantic PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)

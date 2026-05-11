@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mt {
@@ -85,6 +86,90 @@ private:
     mutable std::mutex          mu_;
     std::vector<Fingerprint>    fingerprints_;
     uint64_t                     next_turn_ = 0;
+};
+
+// BlockSemanticIndex — paged-block-keyed fingerprint store for MAD-122.
+//
+// Parallel to SemanticIndex but keys fingerprints by (seq_id, logical_block_idx)
+// so a query can find which paged blocks of a given seq are most semantically
+// similar. The paged path stores at most one fingerprint per block (the 16-tok
+// block size is small enough that one embedding per block is reasonable),
+// matched 1:1 with BlockTable's lifecycle: blocks come and go with the seq;
+// fingerprints are dropped on whole-seq wipe (mt::seq_rm with sentinel range).
+//
+// No FIFO cap: lifecycle is tied to BlockTable, so memory grows with the
+// active context size rather than indefinitely. For the army goal (4 seqs ×
+// 8k blocks/seq × 384-dim fp32) the worst-case footprint is ~48 MiB —
+// acceptable for a CPU-side index and well below the warm-tier staging cost.
+class BlockSemanticIndex {
+public:
+    struct BlockHint {
+        llama_seq_id        seq_id = -1;
+        uint32_t            lblock = 0;
+        float               score  = 0.0f;
+        SemanticIndex::Tier tier   = SemanticIndex::Tier::Warm;
+    };
+
+    BlockSemanticIndex() = default;
+
+    // Store the fingerprint for (seq_id, lblock). Overwrites any prior
+    // fingerprint at the same key — useful if a block is re-fingerprinted
+    // after a partial-range edit. embedding SHOULD be L2-normalized
+    // (caller's responsibility); scoring degrades to dot-product if it
+    // isn't.
+    void add_fingerprint(llama_seq_id        seq_id,
+                          uint32_t            lblock,
+                          std::vector<float>  embedding,
+                          SemanticIndex::Tier tier);
+
+    // Update only the tier annotation (e.g. when a block migrates
+    // hot→warm→cold). No-op if the (seq, lblock) isn't tracked.
+    void update_tier(llama_seq_id seq_id, uint32_t lblock, SemanticIndex::Tier tier);
+
+    // Drop a single (seq, lblock) entry. No-op if not tracked.
+    void remove_block(llama_seq_id seq_id, uint32_t lblock);
+
+    // MAD-129: O(1) check whether a fingerprint already exists for
+    // (seq_id, lblock). Used by the server's prefill-time write trigger
+    // to skip blocks that have already been fingerprinted (typical when
+    // a turn's prompt re-processes a prior turn's accumulated context).
+    bool has_fingerprint(llama_seq_id seq_id, uint32_t lblock) const;
+
+    // Drop every fingerprint for `seq_id`. Called on whole-seq wipe.
+    void remove_seq(llama_seq_id seq_id);
+
+    // Drop everything.
+    void clear();
+
+    // Score `seq_id`'s blocks against `query_embedding`. Returns up to
+    // `top_k` blocks with cosine similarity >= `threshold`, sorted by
+    // descending score. Blocks from other seqs are not considered —
+    // semantic prefetch is per-seq because cross-seq attention isn't a
+    // thing in the paged-attention model.
+    std::vector<BlockHint> score(llama_seq_id              seq_id,
+                                  const std::vector<float> & query_embedding,
+                                  int                        top_k,
+                                  float                      threshold) const;
+
+    // Diagnostics.
+    size_t size() const;
+    size_t size(llama_seq_id seq_id) const;
+
+    // MAD-130: persistence. Format magic = "PSFI" v1. Saves all
+    // (seq_id, lblock, tier, embedding) tuples to the path. Returns
+    // false on I/O error. load_from_disk replaces the in-memory
+    // state with the file's contents (any prior data is dropped).
+    bool save_to_disk(const std::string & path) const;
+    bool load_from_disk(const std::string & path);
+
+private:
+    struct Entry {
+        std::vector<float>  embedding;
+        SemanticIndex::Tier tier = SemanticIndex::Tier::Warm;
+    };
+
+    mutable std::mutex                                                          mu_;
+    std::unordered_map<llama_seq_id, std::unordered_map<uint32_t, Entry>>       fps_;
 };
 
 }  // namespace mt
