@@ -960,6 +960,15 @@ private:
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx_tgt);
             cparams_mtp.n_seq_max = 1;
 
+            // The MTP head is a draft context with a single attention layer
+            // that re-evaluates the predicted token each step. It has no use
+            // for tiered/paged KV — and at full ctx_size the paged block pool
+            // would try to allocate ~100 GiB on the MTP-only layer, OOMing
+            // immediately. Tier features stay on for the main ctx_tgt.
+            cparams_mtp.kv_tier_enabled       = false;
+            cparams_mtp.kv_tier_paged_blocks  = false;
+            cparams_mtp.kv_tier_total_ctx     = 0;
+
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams_mtp));
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create MTP context\n");
