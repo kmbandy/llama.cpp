@@ -312,6 +312,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // override architecture from GGUF (e.g. load the MTP head of a Qwen3.5 GGUF as "qwen35_mtp")
+        const char * override_arch;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -908,6 +911,8 @@ extern "C" {
                      llama_token * tokens_out,
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
+
+#define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat
 #define LLAMA_STATE_SEQ_FLAGS_SWA_ONLY 1
