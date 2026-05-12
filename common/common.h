@@ -300,6 +300,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 16; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ctx = 0;  // override context size for the draft/MTP context (0 = inherit from target, capped at target ctx)
 
     float p_split = 0.1f;  // speculative decoding split probability
     float p_min   = 0.75f; // minimum speculative decoding probability (greedy)

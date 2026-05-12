@@ -957,7 +957,13 @@ private:
             }
 
             auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx_tgt);
+            {
+                const uint32_t tgt_n_ctx   = llama_n_ctx_seq(ctx_tgt);
+                const int32_t  draft_n_ctx = params_base.speculative.draft.n_ctx;
+                cparams_mtp.n_ctx = (draft_n_ctx > 0 && (uint32_t) draft_n_ctx < tgt_n_ctx)
+                    ? (uint32_t) draft_n_ctx
+                    : tgt_n_ctx;
+            }
             cparams_mtp.n_seq_max = 1;
 
             // The MTP head is a draft context with a single attention layer
