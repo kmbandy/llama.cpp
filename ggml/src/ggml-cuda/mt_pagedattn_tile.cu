@@ -425,5 +425,15 @@ template void launch_paged_attn_tile<128, 16, GGML_TYPE_TURBO4_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=256 — Qwen3.5/3.6 paged-attn shape (n_embd_head_v=128 doubled
+// per-q-row by the layout). Uses 16 mma ops per (Q tile, K tile) pair.
+template void launch_paged_attn_tile<256, 16, GGML_TYPE_F16>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO4_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 
 } // namespace mt

@@ -875,18 +875,15 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                            HS, (int) QK_TURBO4);
             } else {
 
-            // MAD-180: WMMA tile FA gate. Routes to launch_paged_attn_tile when
-            //   amd_wmma_available (RDNA3/RDNA4 wave32 WMMA) AND
-            //   HEAD_SIZE=128 AND BLOCK_SIZE=16 AND
-            //   max q_len >= 16 (decode batches stay on scalar) AND
-            //   CACHE_TYPE in {F16, TURBO4_0} (instantiated combos).
-            // GGML_PAGED_TILE=0 forces off for bisection / debugging.
-            if constexpr ((HS == 128) && (BS == 16)
+            // MAD-180: WMMA tile FA gate.
+            if constexpr (((HS == 128) || (HS == 256)) && (BS == 16)
                           && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0)) {
                 const int  cc                = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const int  total_q_tokens    = (int) k_cur->ne[2];
                 const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
-                const bool tile_gate_on      = amd_wmma_available(cc) && get_paged_tile_mode() != 0;
+                const bool wmma_ok           = amd_wmma_available(cc);
+                const bool tile_env_on       = get_paged_tile_mode() != 0;
+                const bool tile_gate_on      = wmma_ok && tile_env_on;
                 if (tile_gate_on && avg_q_len >= 16) {
                     // Tile kernel doesn't fuse scatter — always run scatter first.
                     launch_scatter_kv<CT, __half, HS, BS>(
