@@ -480,6 +480,33 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // ZAYA CCA (Compressed Convolutional Attention)
+    struct ggml_tensor * cca_conv_dw    = nullptr;  // depthwise conv (conv_qk.0)
+    struct ggml_tensor * cca_conv_dw_b  = nullptr;  // depthwise conv bias
+    struct ggml_tensor * cca_conv_grp   = nullptr;  // grouped conv   (conv_qk.1)
+    struct ggml_tensor * cca_conv_grp_b = nullptr;  // grouped conv bias
+    struct ggml_tensor * cca_k_scale    = nullptr;  // learned K temperature
+    struct ggml_tensor * cca_val_proj1  = nullptr;  // V projection stream 1
+    struct ggml_tensor * cca_val_proj2  = nullptr;  // V projection stream 2
+
+    // ZAYA residual scaling
+    struct ggml_tensor * res_scale_hs   = nullptr;  // hidden_states_scale
+    struct ggml_tensor * res_scale_hs_b = nullptr;  // hidden_states_bias
+    struct ggml_tensor * res_scale_res  = nullptr;  // residual_scale
+    struct ggml_tensor * res_scale_res_b = nullptr; // residual_bias
+
+    // ZAYA Router (MoE gating)
+    struct ggml_tensor * zaya_router_down     = nullptr;  // router down_proj
+    struct ggml_tensor * zaya_router_down_b   = nullptr;  // router down_proj bias
+    struct ggml_tensor * zaya_router_norm     = nullptr;  // router rmsnorm_eda
+    struct ggml_tensor * zaya_router_mlp0     = nullptr;  // router MLP 0
+    struct ggml_tensor * zaya_router_mlp0_b   = nullptr;  // router MLP 0 bias
+    struct ggml_tensor * zaya_router_mlp2     = nullptr;  // router MLP 2
+    struct ggml_tensor * zaya_router_mlp2_b   = nullptr;  // router MLP 2 bias
+    struct ggml_tensor * zaya_router_mlp4     = nullptr;  // router MLP 4
+    struct ggml_tensor * zaya_router_biases   = nullptr;  // balancing_biases
+    struct ggml_tensor * zaya_router_eda_scale = nullptr; // router_states_scale
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;
@@ -540,6 +567,12 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
+
+    // Zaya final residual scaling
+    struct ggml_tensor * zaya_res_scale_hs    = nullptr;
+    struct ggml_tensor * zaya_res_scale_hs_b  = nullptr;
+    struct ggml_tensor * zaya_res_scale_res   = nullptr;
+    struct ggml_tensor * zaya_res_scale_res_b = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
