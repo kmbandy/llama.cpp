@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-graph.h"
 #include "memory-tier/mt-inner-access.h"  // mt::InnerView (returned by value from make_tier_view)
 
 #include <map>
@@ -21,6 +22,8 @@ struct llama_memory_params {
 
     // use full-size SWA cache
     bool swa_full;
+
+    llama_context_type ctx_type;
 
     // tiered KV cache (Phase 2 rewrite). When kv_tier_enabled is false the
     // rest of these fields are ignored and the inner cache is returned as-is.

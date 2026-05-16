@@ -45,31 +45,6 @@ set(TARGET_SRCS
     server-models.h
 )
 
-option(LLAMA_BUILD_WEBUI "Build the embedded Web UI" ON)
-
-if (LLAMA_BUILD_WEBUI)
-    set(PUBLIC_ASSETS
-        index.html
-        bundle.js
-        bundle.css
-        loading.html
-    )
-
-    foreach(asset ${PUBLIC_ASSETS})
-        set(input "${CMAKE_CURRENT_SOURCE_DIR}/public/${asset}")
-        set(output "${CMAKE_CURRENT_BINARY_DIR}/${asset}.hpp")
-        list(APPEND TARGET_SRCS ${output})
-        add_custom_command(
-            DEPENDS "${input}"
-            OUTPUT "${output}"
-            COMMAND "${CMAKE_COMMAND}" "-DINPUT=${input}" "-DOUTPUT=${output}" -P "${PROJECT_SOURCE_DIR}/scripts/xxd.cmake"
-        )
-        set_source_files_properties(${output} PROPERTIES GENERATED TRUE)
-    endforeach()
-    add_definitions(-DLLAMA_BUILD_WEBUI)
-else()
-endif()
-
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
@@ -78,8 +53,8 @@ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(GGML_HIP)
     target_include_directories(${TARGET} PRIVATE /opt/rocm/include)
-endif()
     target_compile_definitions(${TARGET} PRIVATE __HIP_PLATFORM_AMD__)
-target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+endif()
+target_link_libraries(${TARGET} PRIVATE server-context llama-ui PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

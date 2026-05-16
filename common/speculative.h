@@ -5,8 +5,14 @@
 
 struct common_speculative;
 
+// comma separated list the provided types
+std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
+
 // comma separated list of all types
-std::string common_speculative_type_name_str();
+const char * common_speculative_all_types_str();
+
+// parse user provided types
+std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
 
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
@@ -47,8 +53,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// true if any implementation requires target embeddings to be extracted
+bool common_speculative_need_embd(common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
+
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);

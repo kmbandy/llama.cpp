@@ -20,28 +20,16 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
-const std::vector<enum common_speculative_type> common_speculative_types = {
-    COMMON_SPECULATIVE_TYPE_NONE,
-    COMMON_SPECULATIVE_TYPE_DRAFT,
-    COMMON_SPECULATIVE_TYPE_EAGLE3,
-    COMMON_SPECULATIVE_TYPE_MTP,
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
-    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
-};
-
-const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
+const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
-    {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
-    {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
-    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
-    {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-    {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
-    {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
-    {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+    {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+    {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+    {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
+    {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+    {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
 
 struct common_speculative_config {
@@ -157,17 +145,20 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted) = 0;
+
+    // true if this implementation requires the target context to extract embeddings
+    virtual bool need_embd() const = 0;
 };
 
-struct common_speculative_state_draft : public common_speculative_impl {
+struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
 
     llama_batch batch;
 
     std::vector<common_sampler_ptr> smpls;
 
-    common_speculative_state_draft(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT, n_seq)
+    common_speculative_impl_draft_simple(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, n_seq)
         , params(params.draft)
     {
         auto * ctx_dft = this->params.ctx_dft;
@@ -220,7 +211,7 @@ struct common_speculative_state_draft : public common_speculative_impl {
         }
     }
 
-    ~common_speculative_state_draft() override {
+    ~common_speculative_impl_draft_simple() override {
         llama_batch_free(batch);
     }
 
@@ -352,13 +343,17 @@ struct common_speculative_state_draft : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
         // noop
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
-struct common_speculative_state_eagle3 : public common_speculative_impl {
+struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     //common_params_speculative_eagle3 params;
 
-    common_speculative_state_eagle3(const common_params_speculative & /*params*/, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_EAGLE3, n_seq) {}
+    common_speculative_impl_draft_eagle3(const common_params_speculative & /*params*/, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq) {}
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
         // noop
@@ -376,9 +371,13 @@ struct common_speculative_state_eagle3 : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
         // noop
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
-struct common_speculative_state_mtp : public common_speculative_impl {
+struct common_speculative_state_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -395,8 +394,18 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
-    common_speculative_state_mtp(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_MTP, n_seq)
+    // Hidden rows from the most recent target verification batch, grouped by seq.
+    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
+    std::vector<std::vector<float>> verify_h;
+    std::vector<int32_t> verify_h_rows;
+
+    // Per-seq draft length from the last draft() call, used in accept() to
+    // roll back ctx_dft's recurrent state past the AR draft's redundant
+    // pre-advancement before process() mirrored the verify batch.
+    std::vector<uint16_t> last_n_drafted;
+
+    common_speculative_state_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -415,7 +424,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = 1; // TODO: re-enable top_k == 10 and utilize `p_min` spec param
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -427,9 +436,14 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
+
+        verify_h.assign(n_seq, {});
+        verify_h_rows.assign(n_seq, 0);
+
+        last_n_drafted.assign(n_seq, 0);
     }
 
-    ~common_speculative_state_mtp() override {
+    ~common_speculative_state_draft_mtp() override {
         if (batch.token != nullptr) {
             free(batch.token);
             batch.token = nullptr;
@@ -536,8 +550,17 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const float * h_last = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
-            std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            verify_h_rows[seq_id] = n_rows;
+            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const float * h = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            }
+
+            std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -607,14 +630,6 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
-
                 common_sampler_accept(smpl, id, true);
 
                 auto & dp = dparams.at(seq_id);
@@ -647,7 +662,8 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             ++i;
         }
 
-        for (auto & dp : dparams) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
@@ -655,21 +671,39 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            last_n_drafted[seq_id] = (uint16_t) dp.result->size();
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        const int32_t n_rows = verify_h_rows[seq_id];
+        if (n_rows <= 0) {
+            return;
+        }
+
+        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool need_embd() const override {
+        return true;
     }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
-struct common_speculative_state_ngram_simple : public common_speculative_impl {
+struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
 
     // shared across all sequences
     common_ngram_simple_config config;
 
-    common_speculative_state_ngram_simple(
+    common_speculative_impl_ngram_simple(
             const common_params_speculative & params, uint32_t n_seq,
             common_ngram_simple_config config)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, n_seq)
@@ -701,15 +735,19 @@ struct common_speculative_state_ngram_simple : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
         // noop
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
-struct common_speculative_state_ngram_map_k : public common_speculative_impl {
+struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     common_params_speculative_ngram_map params;
 
     // n_seq configs
     std::vector<common_ngram_map> config;
 
-    common_speculative_state_ngram_map_k(
+    common_speculative_impl_ngram_map_k(
             const common_params_speculative & params,
             const common_ngram_map & config,
             uint32_t n_seq)
@@ -749,9 +787,13 @@ struct common_speculative_state_ngram_map_k : public common_speculative_impl {
 
         common_ngram_map_accept(config[seq_id], n_accepted);
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
-struct common_speculative_state_ngram_mod : public common_speculative_impl {
+struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
     // shared across all sequences
@@ -773,7 +815,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
-    common_speculative_state_ngram_mod(
+    common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
@@ -917,9 +959,13 @@ struct common_speculative_state_ngram_mod : public common_speculative_impl {
             }
         }
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
-struct common_speculative_state_ngram_cache : public common_speculative_impl {
+struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     common_params_speculative_ngram_cache params;
 
     uint16_t n_draft;
@@ -937,7 +983,7 @@ struct common_speculative_state_ngram_cache : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
-    common_speculative_state_ngram_cache(
+    common_speculative_impl_ngram_cache(
             const common_params_speculative & params,
             uint32_t n_seq,
             uint16_t n_draft,
@@ -1050,6 +1096,10 @@ struct common_speculative_state_ngram_cache : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) override {
         // noop
     }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
 struct common_speculative {
@@ -1073,7 +1123,7 @@ static common_ngram_map get_common_ngram_map(
     return common_ngram_map(size_key, size_value, key_only, min_hits);
 }
 
-static common_speculative_state_ngram_cache create_state_ngram_cache(
+static common_speculative_impl_ngram_cache create_state_ngram_cache(
         const common_speculative_config & config,
         uint32_t n_seq,
         const std::string & path_static,
@@ -1084,43 +1134,83 @@ static common_speculative_state_ngram_cache create_state_ngram_cache(
     bool save_static = false;
     bool save_dynamic = false;
 
-    common_speculative_state_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
+    common_speculative_impl_ngram_cache state(config.params, n_seq, n_draft, path_static, path_dynamic, save_static, save_dynamic);
 
     return state;
 }
 
-std::string common_speculative_type_name_str() {
+std::string common_speculative_type_name_str(const std::vector<common_speculative_type> & types) {
     std::string result;
-    for (size_t i = 0; i < common_speculative_types.size(); i++) {
+
+    for (size_t i = 0; i < types.size(); i++) {
         if (i > 0) {
-            result += ", ";
+            result += ",";
         }
-        result += common_speculative_type_to_str(common_speculative_types[i]);
+        result += common_speculative_type_to_str(types[i]);
     }
     return result;
 }
 
-std::string common_speculative_type_to_str(enum common_speculative_type type) {
+const char * common_speculative_all_types_str() {
+    static std::string all_types_str = []() {
+        std::vector<common_speculative_type> types;
+        types.reserve(COMMON_SPECULATIVE_TYPE_COUNT);
+        for (int i = 0; i < COMMON_SPECULATIVE_TYPE_COUNT; i++) {
+            types.push_back((common_speculative_type) i);
+        }
+        return common_speculative_type_name_str(types);
+    }();
+    return all_types_str.c_str();
+}
+
+std::string common_speculative_type_to_str(common_speculative_type type) {
     switch (type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
-        case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
-        case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
-        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
         default:                                    return "unknown";
     }
 }
 
-enum common_speculative_type common_speculative_type_from_name(const std::string & name) {
+std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
+    std::vector<common_speculative_type> types;
+    types.reserve(names.size());
+
+    for (const auto & name : names) {
+        auto type = common_speculative_type_from_name_map.find(name);
+        if (type != common_speculative_type_from_name_map.end()) {
+            if (type->second == COMMON_SPECULATIVE_TYPE_NONE) {
+                return std::vector<common_speculative_type> { COMMON_SPECULATIVE_TYPE_NONE };
+            }
+            types.push_back(type->second);
+            continue;
+        }
+        throw std::invalid_argument("unknown speculative type: " + name);
+    }
+
+    return types;
+}
+
+common_speculative_type common_speculative_type_from_name(const std::string & name) {
     const auto it = common_speculative_type_from_name_map.find(name);
     if (it == common_speculative_type_from_name_map.end()) {
         return COMMON_SPECULATIVE_TYPE_COUNT;
     }
     return it->second;
+}
+
+static uint32_t common_get_enabled_speculative_configs(const std::vector<common_speculative_type> & configs) {
+    uint32_t result = 0;
+    for (size_t i = 0; i < configs.size(); i++) {
+        result |= (1u << configs[i]);
+    }
+    return result;
 }
 
 // initialization of the speculative decoding system
@@ -1129,18 +1219,25 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.draft.mparams.path.empty();
+        uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
+
+        bool has_draft_model_path = !params.draft.mparams.path.empty();
+
+        bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
-        bool has_mtp = (params.type == COMMON_SPECULATIVE_TYPE_MTP) && params.draft.ctx_dft != nullptr;
+        bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
 
-        bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
-        bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
-        bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
-        bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
-        bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
+        bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
+        bool has_ngram_map_k   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K));
+        bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
+        bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
-        // In a more complex implementation we could use the same implementation but with different parameters.
-        // This was initially used in PR-18471 but removed to simplify the code.
+        // when adding a new type - update here the logic above
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+
+        // this list here defines the priority of the speculators
+        // the one with highest priority are listed first
         if (has_ngram_simple) {
             // This implementation can guess a lot of tokens without any draft model.
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, params));
@@ -1158,34 +1255,44 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
-        if (has_draft) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
+        if (has_draft_simple) {
+            if (!has_draft_model_path) {
+                LOG_WRN("%s: draft model is not specified - cannot use 'draft' type\n", __func__);
+                has_draft_simple = false;
+            }
+        } else if (has_draft_model_path && !has_mtp && !has_draft_eagle3) {
+            LOG_WRN("%s: draft model is specified but 'draft' speculative type is not explicitly enabled - enabling it\n", __func__);
+            has_draft_simple = true;
+        }
+
+        if (has_draft_simple) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
         }
         if (has_draft_eagle3) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params));
         }
         if (has_mtp) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
 
     for (const common_speculative_config & config : configs) {
-        LOG_DBG("%s: adding implementation %s\n", __func__, common_speculative_type_to_str(config.type).c_str());
+        LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(config.type).c_str());
         switch (config.type) {
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
-            case COMMON_SPECULATIVE_TYPE_DRAFT: {
-                impls.push_back(std::make_unique<common_speculative_state_draft>(config.params, n_seq));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_simple>(config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_EAGLE3: {
-                impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.params, n_seq));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_eagle3>(config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_MTP: {
-                impls.push_back(std::make_unique<common_speculative_state_mtp>(config.params, n_seq));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                impls.push_back(std::make_unique<common_speculative_state_draft_mtp>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -1198,7 +1305,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     /* .size_ngram = */ ngram_size_key,
                     /* .size_mgram = */ mgram_size_value
                 };
-                auto state = std::make_unique<common_speculative_state_ngram_simple>(
+                auto state = std::make_unique<common_speculative_impl_ngram_simple>(
                     /* .params = */ config.params,
                     /* .n_seq  = */ n_seq,
                     /* .state  = */ config_simple
@@ -1209,13 +1316,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: {
                 impls.push_back(
-                        std::make_unique<common_speculative_state_ngram_map_k>(
+                        std::make_unique<common_speculative_impl_ngram_map_k>(
                             config.params, get_common_ngram_map(config.type, config.params.ngram_map_k), n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_MOD: {
                 impls.push_back(
-                        std::make_unique<common_speculative_state_ngram_mod>(config.params, n_seq));
+                        std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
@@ -1223,7 +1330,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         config, n_seq,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
-                impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
                 break;
             }
             default:
@@ -1232,7 +1339,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     }
 
     if (impls.empty()) {
-        LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+        LOG_WRN("%s: no implementations specified for speculative decoding\n", __func__);
         return nullptr;
     }
 
@@ -1286,6 +1393,20 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     return result;
+}
+
+bool common_speculative_need_embd(common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->need_embd()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 void common_speculative_draft(common_speculative * spec) {
@@ -1370,14 +1491,15 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (n_accepted == 0) {
-        return;
-    }
-
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     GGML_ASSERT(impl);
 
+    // TODO: currently only the implementation that generated the draft is used to accept it
+    //       however, some implementations (such as MTP) need to also "see" the accepted tokens
+    //       extend `common_speculative_impl::accept()` with an extra argument `bool is_other` to
+    //       inform the implementation if the accepted tokens are from another implementation and
+    //       pass the accepted tokens to all remaining implementations using `is_other == true`
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
         if (n_accepted > 0) {
