@@ -280,9 +280,11 @@ bool llama_memory_tiered::load_one_from_cold(llama_seq_id seq_id, llama_pos pos)
 //
 // Sizing: warm capacity tokens × Σ_layers(k_row_bytes + v_row_bytes).
 // For Qwen3.6-27B at ctx=8192 with warm=25%, 16 attn layers and ~2KB per
-// row this is ~16 MB — totally reasonable for host RAM. For 97B at ctx
-// 131072 this could climb into the GBs and we'd want pinned + paged
-// allocation; for now plain new uint8_t[].
+// row this is ~16 MB. For long-context workloads (e.g. ctx=1M with warm=20%)
+// this climbs into the GBs — at that size the buffer MUST be mlock'd or the
+// kernel will page parts of it out to swap under host RAM pressure, turning
+// every warm-tier read into a swap-disk read. Backed by mt::LockedBuffer
+// (mmap + MAP_LOCKED / mlock) with cfg_.warm_mlock toggling the lock attempt.
 //
 // Returns false if the inner cache has no attention layers (recurrent-only
 // models — Phase 2d-recur will own those).
@@ -328,7 +330,12 @@ bool llama_memory_tiered::ensure_warm_staging() {
             ++flat_idx;
         }
     }
-    warm_buf_.assign(cursor, 0);
+    if (!warm_buf_.allocate(cursor, cfg_.warm_mlock)) {
+        LLAMA_LOG_ERROR("mt::llama_memory_tiered: warm-tier allocation failed "
+                        "(%zu MiB requested) — eviction disabled\n",
+                        cursor / (1024 * 1024));
+        return false;
+    }
 
     warm_free_slots_.reserve(warm_capacity_);
     for (uint32_t s = warm_capacity_; s-- > 0; ) {
@@ -336,8 +343,12 @@ bool llama_memory_tiered::ensure_warm_staging() {
     }
 
     LLAMA_LOG_INFO("mt::llama_memory_tiered: warm staging: capacity=%u tokens, "
-                   "buffer=%.1f MiB across %zu restorable layers (skipped %zu SWA layers)\n",
+                   "buffer=%.1f MiB (%s) across %zu restorable layers "
+                   "(skipped %zu SWA layers)\n",
                    warm_capacity_, (double) warm_buf_.size() / (1024.0 * 1024.0),
+                   warm_buf_.is_locked() ? "mlocked"
+                                         : (cfg_.warm_mlock ? "UNLOCKED — see warning above"
+                                                            : "lock disabled by config"),
                    restorable_layers,
                    tier_view_.attn_layer_count() - restorable_layers);
 

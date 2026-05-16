@@ -1541,6 +1541,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_tier_compression         = params.kv_tier_compression;
     cparams.kv_tier_attention_threshold = params.kv_tier_attention_threshold;
     cparams.kv_tier_warm_device         = params.kv_warm_device;
+    cparams.kv_tier_warm_mlock          = params.kv_tier_warm_mlock;
     cparams.kv_tier_total_ctx           = params.kv_tier_total_ctx;
     cparams.kv_tier_semantic_index      = params.kv_semantic_index.empty()
                                               ? nullptr

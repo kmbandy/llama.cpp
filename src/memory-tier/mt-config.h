@@ -74,6 +74,16 @@ struct TieredConfig {
     // implement device-warm; the field is preserved for forward compat.
     int warm_device = -1;
 
+    // Pin the host-RAM warm tier in physical memory via mlock() / VirtualLock()
+    // so the kernel cannot page it out to swap under memory pressure. Default
+    // ON because the failure mode is silent and catastrophic: at long context
+    // on RAM-constrained hosts, warm-tier reads turn into swap-disk reads,
+    // collapsing prefill throughput to ~10% of expected. Disable only if the
+    // host cannot grant the lock (RLIMIT_MEMLOCK / CAP_IPC_LOCK) and the lock
+    // failure is acceptable for the workload. When mlock fails, allocation
+    // still succeeds and a warning is logged with the remediation steps.
+    bool warm_mlock = true;
+
     // Optional semantic-similarity prefetch. Non-empty enables it.
     std::string semantic_index;
     float       semantic_threshold = 0.65f;

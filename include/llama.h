@@ -402,6 +402,7 @@ extern "C" {
         int32_t      kv_tier_compression;        // mt::Compression
         float        kv_tier_attention_threshold;
         int32_t      kv_tier_warm_device;        // -1 = host RAM
+        bool         kv_tier_warm_mlock;         // mlock the host-RAM warm tier (prevents kernel swap-out)
         int32_t      kv_tier_total_ctx;          // 0 = use n_ctx
         const char * kv_tier_semantic_index;     // nullptr => disabled
         float        kv_tier_semantic_threshold;

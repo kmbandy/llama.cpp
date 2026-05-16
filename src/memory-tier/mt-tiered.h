@@ -27,6 +27,7 @@
 #include "mt-capacity.h"
 #include "mt-embed.h"
 #include "mt-eviction.h"
+#include "mt-locked-buffer.h"
 #include "mt-mover-attn.h"
 #include "mt-mover-recurrent.h"
 #include "mt-kvtc-store.h"
@@ -299,9 +300,15 @@ private:
 
     // Warm-tier host staging. Lazily allocated on first eviction.
     // Per-attn-layer base offsets:
-    //   warm_buf_[layer_off_[i]] ... + warm_cap * k_row_bytes_[i]   = K slab
-    //   ... + warm_cap * v_row_bytes_[i]                            = V slab
-    std::vector<uint8_t>  warm_buf_;
+    //   warm_buf_.data()[layer_off_[i]] ... + warm_cap * k_row_bytes_[i] = K slab
+    //   ... + warm_cap * v_row_bytes_[i]                                 = V slab
+    //
+    // Backed by LockedBuffer (not std::vector) so the warm tier can be
+    // mlock'd in physical RAM and is not eligible for kernel swap-out.
+    // Required for predictable performance on RAM-constrained hosts at
+    // long context — see mt-locked-buffer.h for the failure mode being
+    // mitigated and mt-config.h::warm_mlock for the toggle.
+    LockedBuffer          warm_buf_;
     std::vector<size_t>   warm_layer_off_;   // byte offset of layer i's K slab
     std::vector<size_t>   warm_layer_v_off_; // byte offset of layer i's V slab within layer
     uint32_t              warm_capacity_ = 0;

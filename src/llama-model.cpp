@@ -2354,6 +2354,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         tcfg.compression         = (mt::Compression)    params.kv_tier_compression;
         tcfg.attention_threshold = params.kv_tier_attention_threshold;
         tcfg.warm_device         = params.kv_tier_warm_device;
+        tcfg.warm_mlock          = params.kv_tier_warm_mlock;
         if (params.kv_tier_semantic_index && params.kv_tier_semantic_index[0]) {
             tcfg.semantic_index = params.kv_tier_semantic_index;
         }

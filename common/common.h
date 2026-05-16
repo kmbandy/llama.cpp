@@ -602,6 +602,7 @@ struct common_params {
     int kv_tier_compression   = 1;       // 0=none, 1=int4, 2=int8, 3=lz4, 4=quantized
     float kv_tier_attention_threshold = 0.1f;  // attention threshold for eviction
     int   kv_warm_device        = -1;    // HIP device index for warm KV tier (-1 = disabled)
+    bool  kv_tier_warm_mlock    = true;  // mlock the host-RAM warm tier so it's not eligible for kernel swap (see mt-locked-buffer.h)
     int   kv_tier_total_ctx     = 0;     // full ctx budget across all tiers (set at load time)
     std::string kv_semantic_index = "";   // path to embedding model for semantic KV index (empty = disabled)
     float kv_semantic_threshold = 0.65f;  // minimum cosine similarity threshold for prefetch hints

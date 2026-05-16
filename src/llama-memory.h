@@ -33,6 +33,7 @@ struct llama_memory_params {
     int32_t      kv_tier_compression;
     float        kv_tier_attention_threshold;
     int32_t      kv_tier_warm_device;
+    bool         kv_tier_warm_mlock;         // mlock the host-RAM warm tier (prevents kernel swap-out)
     int32_t      kv_tier_total_ctx;
     const char * kv_tier_semantic_index;
     float        kv_tier_semantic_threshold;

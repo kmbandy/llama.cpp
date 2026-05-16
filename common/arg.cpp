@@ -1419,6 +1419,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_WARM_DEVICE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-tier-warm-mlock"}, "0|1",
+        "mlock the host-RAM warm tier to prevent kernel swap-out (default: 1). "
+        "Required for predictable performance at long context on RAM-constrained "
+        "hosts. If the lock fails (e.g. RLIMIT_MEMLOCK too small or no "
+        "CAP_IPC_LOCK), allocation still succeeds and a warning is logged.",
+        [](common_params & params, int value) {
+            params.kv_tier_warm_mlock = (value != 0);
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_WARM_MLOCK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--kv-tier-total-ctx"}, "N",
         "full ctx budget across all tiers (0 = use n_ctx)",
         [](common_params & params, int value) {
