@@ -5,6 +5,7 @@
 
 #include "mt_pagedattn.cuh"
 #include "mt_pagedattn_ops.cuh"  // paged_cache_ops template + specializations (shared with mt_pagedattn_tile.cu)
+#include "mt_pagedattn_tile.cuh" // tile FA kernel dispatch entry (launch_paged_attn_tile)
 #include "turbo-quant.cuh"   // TURBO_CENTROIDS_4BIT, TURBO_WHT_SIGNS{1,2}, turbo_nearest_centroid_4bit
 
 #include <cmath>
@@ -39,6 +40,21 @@ static int get_paged_fused_mode() {
         mode = (env != nullptr && env[0] == '1') ? 1 : 0;
         GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_FUSED=%d (%s scatter)\n",
                       mode, mode ? "fused" : "separate");
+    }
+    return mode;
+}
+
+// MAD-180: WMMA tile kernel toggle. Default ON when the runtime gate
+// (amd_wmma_available + HEAD_SIZE=128 + BLOCK_SIZE=16 + q_len>=16 +
+// CACHE_TYPE in {F16, TURBO4_0}) is satisfied. Set GGML_PAGED_TILE=0 to
+// force the scalar fallback (debugging / regression bisection).
+static int get_paged_tile_mode() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_PAGED_TILE");
+        mode = (env == nullptr || env[0] != '0') ? 1 : 0;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_TILE=%d (tile kernel %s when conditions met)\n",
+                      mode, mode ? "enabled" : "disabled");
     }
     return mode;
 }
@@ -858,6 +874,43 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 GGML_ABORT("mt_paged_attn: HEAD_SIZE=%d too small for TURBO4_0 (requires multiple of QK_TURBO4=%d)",
                            HS, (int) QK_TURBO4);
             } else {
+
+            // MAD-180: WMMA tile FA gate. Routes to launch_paged_attn_tile when
+            //   amd_wmma_available (RDNA3/RDNA4 wave32 WMMA) AND
+            //   HEAD_SIZE=128 AND BLOCK_SIZE=16 AND
+            //   max q_len >= 16 (decode batches stay on scalar) AND
+            //   CACHE_TYPE in {F16, TURBO4_0} (instantiated combos).
+            // GGML_PAGED_TILE=0 forces off for bisection / debugging.
+            if constexpr ((HS == 128) && (BS == 16)
+                          && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0)) {
+                const int  cc                = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                const int  total_q_tokens    = (int) k_cur->ne[2];
+                const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
+                const bool tile_gate_on      = amd_wmma_available(cc) && get_paged_tile_mode() != 0;
+                if (tile_gate_on && avg_q_len >= 16) {
+                    // Tile kernel doesn't fuse scatter — always run scatter first.
+                    launch_scatter_kv<CT, __half, HS, BS>(
+                        k_cache->data,
+                        v_cache->data,
+                        (const __half *) k_cur->data,
+                        (const __half *) v_cur->data,
+                        (const int32_t *) slot_mapping->data,
+                        (const int32_t *) q_lens->data,
+                        num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
+                    launch_paged_attn_tile<HS, BS, CT>(
+                        (__half *) dst->data,
+                        (const __half *) q->data,
+                        k_cache->data,
+                        v_cache->data,
+                        (const int32_t *) block_tables->data,
+                        (const int32_t *) context_lens->data,
+                        (const int32_t *) q_lens->data,
+                        num_seqs, n_heads, n_kv_heads, max_bps,
+                        avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
+                        scale, stream);
+                    return;
+                }
+            }
 
             // Fused scatter requires per-element kv_store, which only the F16
             // path provides. Quant types use a dedicated cooperative scatter
