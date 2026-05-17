@@ -455,6 +455,7 @@ void launch_paged_attn_tile(
 // before QK matmul, V before V matmul, end-of-iter before overwriting smem).
 
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
+__launch_bounds__(TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK * 32, 2)
 __global__ void mt_paged_attention_tile_mw_kernel(
     __half         * __restrict__ out,
     const __half   * __restrict__ q,
@@ -610,12 +611,21 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                 scores.x[e] = 0.0f;
             }
 
+            // K-tile prefetch via ping-pong registers (K[0]/K[1] alternate):
+            // load K[0] up front; in the body, prefetch the next iter's tile
+            // into the unused slot while mma consumes the current. Inserts an
+            // independent VALU op between load_ldmatrix and mma → breaks the
+            // RDNA4 "WMMA reads VALU result as A/B/C may stall" hazard.
+            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_pp[2];
+            load_ldmatrix(K_pp[0], (const half2 *)(smem_k + 0 * K_INNER), HEAD_SIZE / 2);
             #pragma unroll
             for (int n = 0; n < N_INNER; ++n) {
-                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
-                const half2 * src = (const half2 *)(smem_k + n * K_INNER);
-                load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
-                mma(scores, Q_tiles[n], K_tile);
+                if (n + 1 < N_INNER) {
+                    load_ldmatrix(K_pp[(n + 1) & 1],
+                                  (const half2 *)(smem_k + (n + 1) * K_INNER),
+                                  HEAD_SIZE / 2);
+                }
+                mma(scores, Q_tiles[n], K_pp[n & 1]);
             }
 
             // Scale + causal mask
@@ -693,14 +703,18 @@ __global__ void mt_paged_attention_tile_mw_kernel(
         }
         __syncthreads();
 
-        // Per-warp V matmul: acc += scores_h · V
+        // Per-warp V matmul: acc += scores_h · V (with V-tile ping-pong prefetch).
         if (warp_active) {
+            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_pp[2];
+            load_ldmatrix_trans(V_pp[0], (const half2 *)(smem_v + 0 * K_INNER), HEAD_SIZE / 2);
             #pragma unroll
             for (int n = 0; n < N_INNER; ++n) {
-                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
-                const half2 * src = (const half2 *)(smem_v + n * K_INNER);
-                load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
-                mma(acc[n], scores_h, V_tile);
+                if (n + 1 < N_INNER) {
+                    load_ldmatrix_trans(V_pp[(n + 1) & 1],
+                                        (const half2 *)(smem_v + (n + 1) * K_INNER),
+                                        HEAD_SIZE / 2);
+                }
+                mma(acc[n], scores_h, V_pp[n & 1]);
             }
         }
 
