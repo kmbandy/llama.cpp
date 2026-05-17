@@ -697,10 +697,28 @@ __global__ void mt_paged_attention_tile_mw_kernel(
 
         // Per-warp QK matmul + softmax (active warps only)
         if (warp_active) {
-            tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores;
+            // Split the QK accumulator across N_ACC interleaved tiles so
+            // consecutive mma calls write DIFFERENT VGPRs — breaks the RDNA4
+            // "WMMA → WMMA with prev D as Matrix C" hazard (ISA §7.12.1).
+            //
+            // Tuned empirically on gfx1201 at 32K prefill:
+            //   N_ACC=1: 651.6 t/s (baseline, hazard hits every mma)
+            //   N_ACC=2: 657.7 t/s  (+0.9%)  ← chosen
+            //   N_ACC=3: 643.0 t/s  (-1.3%)  (compiler artifact: n%3 hurts)
+            //   N_ACC=4: 653.0 t/s  (+0.2%)  (no further gain → pipeline depth ≤ 2)
+            //
+            // The fact that 4 doesn't beat 2 indicates the V_WMMA_F32_16x16x16_F16
+            // pipeline on gfx1201 has depth ≤ 2, so two accumulators fully cover
+            // the hazard. tile<16,16,float> = 8 VGPRs/lane, so this costs +8
+            // VGPRs/lane register pressure.
+            constexpr int N_ACC = 2;
+            tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores_acc[N_ACC];
             #pragma unroll
-            for (int e = 0; e < scores.ne; ++e) {
-                scores.x[e] = 0.0f;
+            for (int i = 0; i < N_ACC; ++i) {
+                #pragma unroll
+                for (int e = 0; e < scores_acc[i].ne; ++e) {
+                    scores_acc[i].x[e] = 0.0f;
+                }
             }
 
             // K-tile prefetch via ping-pong registers (K[0]/K[1] alternate):
@@ -717,7 +735,19 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                                   (const half2 *)(smem_k + (n + 1) * K_INNER),
                                   HEAD_SIZE / 2);
                 }
-                mma(scores, Q_tiles[n], K_pp[n & 1]);
+                mma(scores_acc[n % N_ACC], Q_tiles[n], K_pp[n & 1]);
+            }
+
+            // Merge accumulators for downstream softmax.
+            tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores;
+            #pragma unroll
+            for (int e = 0; e < scores.ne; ++e) {
+                float s = scores_acc[0].x[e];
+                #pragma unroll
+                for (int i = 1; i < N_ACC; ++i) {
+                    s += scores_acc[i].x[e];
+                }
+                scores.x[e] = s;
             }
 
             // Scale + causal mask
