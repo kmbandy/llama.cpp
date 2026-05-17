@@ -1015,7 +1015,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         return;
     }
 
-    ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
+    if (!ml.get_key(LLM_KV_CONTEXT_LENGTH, hparams.n_ctx_train, false)) {
+        // old BERT GGUFs use max_position_embeddings instead of context_length
+        const std::string fallback = ml.get_arch_name() + ".max_position_embeddings";
+        if (!ml.get_key(fallback, hparams.n_ctx_train, false)) {
+            ml.get_key(LLM_KV_CONTEXT_LENGTH, hparams.n_ctx_train); // throws with proper message
+        }
+    }
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);

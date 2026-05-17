@@ -292,7 +292,13 @@ llama_model_zaya::graph::graph(const llama_model & model, const llm_graph_params
                 conv_dw = ggml_cont(ctx0, ggml_cast(ctx0, conv_dw, GGML_TYPE_F16));
             }
             conv_dw = ggml_reshape_3d(ctx0, conv_dw, conv_dw->ne[0], 1, n_qk);
-            ggml_tensor * QK = ggml_conv_1d_dw(ctx0, conv_dw, conv_input, 1, 0, 1);
+            // ggml_conv_1d_dw requires b->ne[2]==1; merge n_seqs into channel dim
+            ggml_tensor * conv_inp_flat = ggml_reshape_3d(ctx0, ggml_cont(ctx0, conv_input),
+                    conv_input->ne[0], n_qk * n_seqs, 1);
+            ggml_tensor * conv_dw_rep = ggml_repeat(ctx0, conv_dw,
+                    ggml_new_tensor_3d(ctx0, conv_dw->type, conv_dw->ne[0], 1, n_qk * n_seqs));
+            ggml_tensor * QK = ggml_conv_1d_dw(ctx0, conv_dw_rep, conv_inp_flat, 1, 0, 1);
+            QK = ggml_reshape_3d(ctx0, QK, QK->ne[0], n_qk, n_seqs);
             if (layer.cca_conv_dw_b) {
                 QK = ggml_add(ctx0, QK, ggml_reshape_3d(ctx0, layer.cca_conv_dw_b, 1, n_qk, 1));
             }
