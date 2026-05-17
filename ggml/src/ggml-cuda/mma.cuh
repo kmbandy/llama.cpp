@@ -200,24 +200,27 @@ namespace ggml_cuda_mma {
         }
 
         static __device__ __forceinline__ int get_j(const int l) {
+            // Wave-local lane: threadIdx.x can be > 32 in multi-warp blocks;
+            // WMMA lane math must use lane within the wave, not block tid.
+            const int lane = threadIdx.x & 31;
             if constexpr (I == 16 && J == 16) {
 #if defined(RDNA3)
                 if constexpr (std::is_same_v<T, float> || std::is_same_v<T, int>) {
                     // matrix C
-                    return 2 * l + (threadIdx.x / 16);
+                    return 2 * l + (lane / 16);
                 } else {
                     // matrix A&B
                     return l;
                 }
 #else
                 // matrix C is the transposed matrix A&B on RDNA4
-                return ne * (threadIdx.x / 16) + l;
+                return ne * (lane / 16) + l;
 #endif // defined(RDNA3)
             } else if constexpr (I == 16 && J == 8) {
                 // mmq input for RDNA4
-                return ne * (threadIdx.x / 16) + l;
+                return ne * (lane / 16) + l;
             } else if constexpr (I == 16 && J == 4) {
-                return ne * (threadIdx.x / 16) + l;
+                return ne * (lane / 16) + l;
             } else {
                 NO_DEVICE_CODE;
                 return -1;
@@ -333,16 +336,18 @@ namespace ggml_cuda_mma {
         }
 
         static __device__ __forceinline__ int get_j(const int l) {
+            // Wave-local lane (see comment in float specialization above).
+            const int lane = threadIdx.x & 31;
             if constexpr (I == 16 && J == 8) {
-                return (threadIdx.x / 16) * ne + l;
+                return (lane / 16) * ne + l;
             } else if constexpr (I == 16 && J == 16) {
 #ifdef RDNA3
-                return l*2 + (threadIdx.x / 16);
+                return l*2 + (lane / 16);
 #else
-                return (threadIdx.x / 16) * ne + l;
+                return (lane / 16) * ne + l;
 #endif // RDNA3
             } else if constexpr (I == 32 && J == 8) {
-                return (threadIdx.x / 16) * (ne/2) + l % (ne/2);
+                return (lane / 16) * (ne/2) + l % (ne/2);
             } else {
                 NO_DEVICE_CODE;
                 return -1;

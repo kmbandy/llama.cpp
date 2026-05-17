@@ -48,6 +48,32 @@ static constexpr int Q_TILE_M = 16;
 static constexpr int K_TILE_N = 16;
 static constexpr int K_INNER  = 16;
 
+// Multi-warp tile configuration. Q_TILES_PER_BLOCK = number of Q tiles
+// (= number of warps) packed into one CUDA block. K/V tiles are shared
+// across these warps, so K/V HBM traffic shrinks by this factor.
+//
+// Bound by the per-block 64 KiB LDS cap:
+//   LDS = Q_TILES * Q_TILE_M * HEAD_SIZE * 2  +  2 * K_TILE_N * HEAD_SIZE * 2
+// For HS=128:  8 * 16 * 128 * 2 + 2 * 16 * 128 * 2 = 32 KiB + 8 KiB = 40 KiB
+// For HS=256:  6 * 16 * 256 * 2 + 2 * 16 * 256 * 2 = 48 KiB + 16 KiB = 64 KiB
+//                                                              (= cap, no slack)
+//
+// HS=256 sits exactly at the LDS cap; drop Q_TILES_PER_BLOCK to 5 (56 KiB) or
+// 4 (48 KiB) if the compiler complains. Single-warp kernel is the fallback
+// when GGML_PAGED_TILE_MULTIWARP=0.
+template <int HEAD_SIZE>
+struct TileConfig;
+
+template <>
+struct TileConfig<128> {
+    static constexpr int Q_TILES_PER_BLOCK = 8;
+};
+
+template <>
+struct TileConfig<256> {
+    static constexpr int Q_TILES_PER_BLOCK = 6;  // at LDS cap (64 KiB exactly)
+};
+
 // ── helpers ─────────────────────────────────────────────────────────────
 
 // Stage Q[q_tile_actual, HEAD_SIZE] from global into smem as contiguous
@@ -416,6 +442,334 @@ void launch_paged_attn_tile(
             max_blocks_per_seq, n_kv_heads, n_heads, scale);
 }
 
+// ── multi-warp kernel ───────────────────────────────────────────────────
+//
+// Packs Q_TILES_PER_BLOCK<HEAD_SIZE> consecutive Q tiles into one block.
+// One warp per Q tile; warps share smem_k / smem_v, which are loaded
+// cooperatively once per K iteration and reused. This reduces K/V HBM
+// traffic by Q_TILES_PER_BLOCK× at the cost of larger smem_q.
+//
+// Per-warp state (Q_tiles registers, running_max, running_sum, acc[N_INNER])
+// stays local to each warp's lanes; no inter-warp register sharing required.
+// __syncthreads is needed after each cooperative load (Q once at start, K
+// before QK matmul, V before V matmul, end-of-iter before overwriting smem).
+
+template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
+__global__ void mt_paged_attention_tile_mw_kernel(
+    __half         * __restrict__ out,
+    const __half   * __restrict__ q,
+    const void     * __restrict__ k_cache,
+    const void     * __restrict__ v_cache,
+    const int32_t  * __restrict__ block_tables,
+    const int32_t  * __restrict__ context_lens,
+    const int32_t  * __restrict__ q_lens,
+    int             max_blocks_per_seq,
+    int             n_kv_heads,
+    int             n_heads,
+    float           scale) {
+#if defined(AMD_WMMA_AVAILABLE)
+    static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
+    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int N_WARPS   = Q_TILES;
+    constexpr int N_THREADS = N_WARPS * 32;
+    constexpr int N_INNER   = HEAD_SIZE / K_INNER;
+
+    using ops = paged_cache_ops<CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE>;
+
+    const int head_idx       = blockIdx.x;
+    const int seq_idx        = blockIdx.y;
+    const int q_tile_grp_idx = blockIdx.z;
+    const int tid            = threadIdx.x;
+    const int warp_id        = tid >> 5;     // tid / 32
+    const int lane_id        = tid & 31;     // tid % 32
+
+    const int q_len       = q_lens[seq_idx];
+    const int q_tile_base = q_tile_grp_idx * Q_TILES;
+
+    // Early-exit if this entire block is past the end of the sequence
+    // (happens when n_q_tiles is not a multiple of Q_TILES_PER_BLOCK).
+    if (q_tile_base * Q_TILE_M >= q_len) {
+        return;
+    }
+
+    // Per-warp Q tile assignment
+    const int my_q_tile_idx    = q_tile_base + warp_id;
+    const int my_q_tile_start  = my_q_tile_idx * Q_TILE_M;
+    const bool warp_active     = (my_q_tile_start < q_len);
+    const int my_q_tile_actual = warp_active
+        ? ((my_q_tile_start + Q_TILE_M <= q_len) ? Q_TILE_M : (q_len - my_q_tile_start))
+        : 0;
+
+    const int kv_head_idx       = head_idx / (n_heads / n_kv_heads);
+    const int ctx_len_after_q   = context_lens[seq_idx];
+    const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    // Per-seq offset into packed Q / out tensors.
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) {
+        seq_q_offset += (size_t) q_lens[s];
+    }
+
+    const int my_q_pos_base = (ctx_len_after_q - q_len) + my_q_tile_start;
+
+    // Block-level valid_ctx: last active q_row's position + 1. Inactive
+    // warps (whose q_tile_start >= q_len) get my_q_tile_actual = 0 and
+    // their per-warp causal mask zeros out all contributions, but they
+    // still participate in cooperative loads.
+    const int block_last_q_row = min(q_tile_base * Q_TILE_M + Q_TILES * Q_TILE_M, q_len) - 1;
+    const int block_last_q_pos = (ctx_len_after_q - q_len) + block_last_q_row;
+    const int block_valid_ctx  = block_last_q_pos + 1;
+
+    // Shared memory layout:
+    //   smem_q [Q_TILES * Q_TILE_M * HEAD_SIZE]  half
+    //   smem_k [K_TILE_N * HEAD_SIZE]            half
+    //   smem_v [K_TILE_N * HEAD_SIZE]            half
+    extern __shared__ unsigned char smem_raw[];
+    __half * smem_q = (__half *)(smem_raw);
+    __half * smem_k = smem_q + Q_TILES * Q_TILE_M * HEAD_SIZE;
+    __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
+
+    // ── cooperative Q load (all threads, all Q_TILES tiles) ──
+    {
+        constexpr int TOTAL_Q_ELEMS = Q_TILES * Q_TILE_M * HEAD_SIZE;
+        for (int idx = tid; idx < TOTAL_Q_ELEMS; idx += N_THREADS) {
+            const int qt     = idx / (Q_TILE_M * HEAD_SIZE);
+            const int qt_off = idx % (Q_TILE_M * HEAD_SIZE);
+            const int row    = qt_off / HEAD_SIZE;
+            const int col    = qt_off % HEAD_SIZE;
+
+            const int q_tile_idx_local = q_tile_base + qt;
+            const int q_row_global     = q_tile_idx_local * Q_TILE_M + row;
+
+            __half val = __float2half(0.0f);
+            if (q_row_global < q_len) {
+                const size_t base = ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads
+                                     + (size_t) head_idx) * (size_t) HEAD_SIZE;
+                val = q[base + (size_t) col];
+            }
+            smem_q[idx] = val;
+        }
+    }
+    __syncthreads();
+
+    // ── per-warp Q tile load into registers (active warps; inactive warps
+    //    load zeros — doesn't matter, results gated by warp_active later) ──
+    tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> Q_tiles[N_INNER];
+    {
+        const __half * my_smem_q = smem_q + warp_id * Q_TILE_M * HEAD_SIZE;
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            const half2 * src = (const half2 *)(my_smem_q + n * K_INNER);
+            load_ldmatrix(Q_tiles[n], src, HEAD_SIZE / 2);
+        }
+    }
+
+    // Per-warp online softmax state
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+
+    tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
+    #pragma unroll
+    for (int n = 0; n < N_INNER; ++n) {
+        #pragma unroll
+        for (int e = 0; e < acc[n].ne; ++e) {
+            acc[n].x[e] = 0.0f;
+        }
+    }
+
+    // scores_h is reused across K iters by the active path; declared here so
+    // it survives the V-load barrier (registers persist across __syncthreads).
+    tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
+    static_assert(decltype(scores_h)::ne == 4, "expected 4 half2 per thread for tile<16,8,half2>");
+
+    // ── K-tile loop (block-shared K/V) ─────────────────────────────────
+    for (int k_tile_start = 0; k_tile_start < block_valid_ctx; k_tile_start += K_TILE_N) {
+        // Cooperative K load
+        for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+            const int row   = idx / HEAD_SIZE;
+            const int col   = idx % HEAD_SIZE;
+            const int token = k_tile_start + row;
+            float val = 0.0f;
+            if (token < block_valid_ctx) {
+                const int logical_block = token / BLOCK_SIZE;
+                const int tok_in_block  = token % BLOCK_SIZE;
+                const int physical      = seq_block_table[logical_block];
+                if (physical != kInvalidBlockTableEntry) {
+                    val = ops::k_load(k_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+                }
+            }
+            smem_k[idx] = __float2half(val);
+        }
+        __syncthreads();
+
+        // Per-warp QK matmul + softmax (active warps only)
+        if (warp_active) {
+            tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores;
+            #pragma unroll
+            for (int e = 0; e < scores.ne; ++e) {
+                scores.x[e] = 0.0f;
+            }
+
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
+                const half2 * src = (const half2 *)(smem_k + n * K_INNER);
+                load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
+                mma(scores, Q_tiles[n], K_tile);
+            }
+
+            // Scale + causal mask
+            const int row       = lane_id & 15;       // lane_id % 16
+            const int q_pos     = my_q_pos_base + row;
+            const bool row_valid = (row < my_q_tile_actual);
+
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) {
+                const int col   = 8 * (lane_id >> 4) + l;   // 8 * (lane_id / 16) + l
+                const int k_pos = k_tile_start + col;
+                const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < block_valid_ctx);
+                scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
+            }
+
+            // Per-row max via warp-local shfl_xor (mask=16 covers the two
+            // threads that own cols 0-7 vs 8-15 of the same row).
+            float local_max = -INFINITY;
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) {
+                local_max = max(local_max, scores.x[l]);
+            }
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+
+            const float new_max = max(running_max, row_max);
+
+            // Rescale running state
+            float rescale = 1.0f;
+            if (running_max > -INFINITY) {
+                rescale = __expf(running_max - new_max);
+                running_sum *= rescale;
+                #pragma unroll
+                for (int n = 0; n < N_INNER; ++n) {
+                    #pragma unroll
+                    for (int e = 0; e < acc[n].ne; ++e) {
+                        acc[n].x[e] *= rescale;
+                    }
+                }
+            }
+
+            // exp(scores - new_max) + per-row sum
+            float local_sum = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) {
+                const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
+                scores.x[l]   = e;
+                local_sum   += e;
+            }
+            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+            running_sum += row_sum;
+            running_max  = new_max;
+
+            // Pack scores into half2 tile (for V matmul after V load).
+            #pragma unroll
+            for (int l = 0; l < scores_h.ne; ++l) {
+                scores_h.x[l] = __floats2half2_rn(scores.x[2*l], scores.x[2*l+1]);
+            }
+        }
+
+        // Cooperative V load
+        for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+            const int row   = idx / HEAD_SIZE;
+            const int col   = idx % HEAD_SIZE;
+            const int token = k_tile_start + row;
+            float val = 0.0f;
+            if (token < block_valid_ctx) {
+                const int logical_block = token / BLOCK_SIZE;
+                const int tok_in_block  = token % BLOCK_SIZE;
+                const int physical      = seq_block_table[logical_block];
+                if (physical != kInvalidBlockTableEntry) {
+                    val = ops::v_load(v_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+                }
+            }
+            smem_v[idx] = __float2half(val);
+        }
+        __syncthreads();
+
+        // Per-warp V matmul: acc += scores_h · V
+        if (warp_active) {
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
+                const half2 * src = (const half2 *)(smem_v + n * K_INNER);
+                load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
+                mma(acc[n], scores_h, V_tile);
+            }
+        }
+
+        __syncthreads();  // before next iter overwrites smem_k / smem_v
+    }
+
+    // ── per-warp output writeback ───────────────────────────────────────
+    if (warp_active) {
+        const float inv_sum = 1.0f / (running_sum + 1e-6f);
+        const int row_out   = lane_id & 15;
+        if (row_out < my_q_tile_actual) {
+            const int q_row_global = my_q_tile_start + row_out;
+            const size_t out_row_base =
+                ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads + (size_t) head_idx) * (size_t) HEAD_SIZE;
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                #pragma unroll
+                for (int l = 0; l < acc[n].ne; ++l) {
+                    const int d = n * K_INNER + 8 * (lane_id >> 4) + l;
+                    out[out_row_base + (size_t) d] = __float2half(acc[n].x[l] * inv_sum);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED(out); GGML_UNUSED(q); GGML_UNUSED(k_cache); GGML_UNUSED(v_cache);
+    GGML_UNUSED(block_tables); GGML_UNUSED(context_lens); GGML_UNUSED(q_lens);
+    GGML_UNUSED(max_blocks_per_seq); GGML_UNUSED(n_kv_heads); GGML_UNUSED(n_heads);
+    GGML_UNUSED(scale);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
+void launch_paged_attn_tile_mw(
+    __half         * out,
+    const __half   * q,
+    const void     * k_cache,
+    const void     * v_cache,
+    const int32_t  * block_tables,
+    const int32_t  * context_lens,
+    const int32_t  * q_lens,
+    int             num_seqs,
+    int             n_heads,
+    int             n_kv_heads,
+    int             max_blocks_per_seq,
+    int             max_q_len,
+    float           scale,
+    cudaStream_t    stream) {
+
+    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int N_THREADS = Q_TILES * 32;
+
+    const int n_q_tiles       = (max_q_len + Q_TILE_M - 1) / Q_TILE_M;
+    const int n_q_tile_groups = (n_q_tiles + Q_TILES - 1) / Q_TILES;
+
+    dim3 grid(n_heads, num_seqs, n_q_tile_groups);
+    dim3 block(N_THREADS);
+
+    const size_t smem_bytes = (size_t)(Q_TILES * Q_TILE_M + 2 * K_TILE_N)
+                            * (size_t) HEAD_SIZE * sizeof(__half);
+
+    mt_paged_attention_tile_mw_kernel<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>
+        <<<grid, block, smem_bytes, stream>>>(
+            out, q, k_cache, v_cache,
+            block_tables, context_lens, q_lens,
+            max_blocks_per_seq, n_kv_heads, n_heads, scale);
+}
+
 // Explicit instantiations.
 template void launch_paged_attn_tile<128, 16, GGML_TYPE_F16>(
         __half *, const __half *, const void *, const void *,
@@ -432,6 +786,26 @@ template void launch_paged_attn_tile<256, 16, GGML_TYPE_F16>(
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO4_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+
+// Multi-warp launcher instantiations — same (HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE)
+// matrix as the single-warp path. TileConfig picks Q_TILES_PER_BLOCK at
+// compile-time per HEAD_SIZE.
+template void launch_paged_attn_tile_mw<128, 16, GGML_TYPE_F16>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile_mw<128, 16, GGML_TYPE_TURBO4_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_F16>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO4_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);

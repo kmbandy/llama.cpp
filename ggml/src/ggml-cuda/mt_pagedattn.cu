@@ -59,6 +59,21 @@ static int get_paged_tile_mode() {
     return mode;
 }
 
+// MAD-180 follow-up: multi-warp tile kernel toggle. When tile path is
+// enabled, pick between the original single-warp kernel and the multi-warp
+// kernel (Q_TILES_PER_BLOCK warps per block, K/V smem shared across warps).
+// Default ON; set GGML_PAGED_TILE_MULTIWARP=0 to fall back to single-warp.
+static int get_paged_tile_multiwarp_mode() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_PAGED_TILE_MULTIWARP");
+        mode = (env == nullptr || env[0] != '0') ? 1 : 0;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_TILE_MULTIWARP=%d (multi-warp %s when tile path active)\n",
+                      mode, mode ? "enabled" : "disabled");
+    }
+    return mode;
+}
+
 // ───────────────────────── helpers ─────────────────────────
 
 // Warp-level reduce across 32 lanes (HIP wavefront is 64 on some
@@ -894,17 +909,32 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const int32_t *) slot_mapping->data,
                         (const int32_t *) q_lens->data,
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
-                    launch_paged_attn_tile<HS, BS, CT>(
-                        (__half *) dst->data,
-                        (const __half *) q->data,
-                        k_cache->data,
-                        v_cache->data,
-                        (const int32_t *) block_tables->data,
-                        (const int32_t *) context_lens->data,
-                        (const int32_t *) q_lens->data,
-                        num_seqs, n_heads, n_kv_heads, max_bps,
-                        avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
-                        scale, stream);
+                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0;
+                    if (mw_on) {
+                        launch_paged_attn_tile_mw<HS, BS, CT>(
+                            (__half *) dst->data,
+                            (const __half *) q->data,
+                            k_cache->data,
+                            v_cache->data,
+                            (const int32_t *) block_tables->data,
+                            (const int32_t *) context_lens->data,
+                            (const int32_t *) q_lens->data,
+                            num_seqs, n_heads, n_kv_heads, max_bps,
+                            avg_q_len,
+                            scale, stream);
+                    } else {
+                        launch_paged_attn_tile<HS, BS, CT>(
+                            (__half *) dst->data,
+                            (const __half *) q->data,
+                            k_cache->data,
+                            v_cache->data,
+                            (const int32_t *) block_tables->data,
+                            (const int32_t *) context_lens->data,
+                            (const int32_t *) q_lens->data,
+                            num_seqs, n_heads, n_kv_heads, max_bps,
+                            avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
+                            scale, stream);
+                    }
                     return;
                 }
             }

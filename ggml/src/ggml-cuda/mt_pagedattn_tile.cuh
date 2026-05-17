@@ -67,4 +67,29 @@ void launch_paged_attn_tile(
     float           scale,
     cudaStream_t    stream);
 
+// Multi-warp variant: packs Q_TILES_PER_BLOCK<HEAD_SIZE> consecutive Q tiles
+// into one block, each warp owning one Q tile. K/V tiles are loaded once per
+// block and reused across all warps' Q tiles — major HBM traffic reduction
+// for long prefill. See TileConfig in mt_pagedattn_tile.cu for the
+// per-HEAD_SIZE wave count (8 for HS=128, 6 for HS=256, bounded by LDS cap).
+//
+// Same calling contract as launch_paged_attn_tile; dispatch picks between the
+// two via GGML_PAGED_TILE_MULTIWARP env var (defaults to multi-warp).
+template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
+void launch_paged_attn_tile_mw(
+    __half         * out,
+    const __half   * q,
+    const void     * k_cache,
+    const void     * v_cache,
+    const int32_t  * block_tables,
+    const int32_t  * context_lens,
+    const int32_t  * q_lens,
+    int             num_seqs,
+    int             n_heads,
+    int             n_kv_heads,
+    int             max_blocks_per_seq,
+    int             max_q_len,
+    float           scale,
+    cudaStream_t    stream);
+
 } // namespace mt
