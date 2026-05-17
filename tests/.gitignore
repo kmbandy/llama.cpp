@@ -2,6 +2,8 @@
 !*.*
 !snapshots/
 !stress/
+!perf-baseline/
+!perf-baseline/**
 *.o
 ggml-common.h
 **/*.swp
