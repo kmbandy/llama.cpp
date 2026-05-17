@@ -221,7 +221,7 @@ llama_model_zaya::graph::graph(const llama_model & model, const llm_graph_params
             ggml_tensor * cur_state_src = ggml_cont(ctx0, cur);
             ggml_tensor * cur_seq = ggml_reshape_3d(ctx0, cur_state_src, n_embd, n_seq_tokens, n_seqs);
 
-            ggml_tensor * hs_d = ggml_reshape_3d(ctx0, prev_hs, n_embd, 1, n_seqs);
+            ggml_tensor * hs_d = ggml_reshape_3d(ctx0, ggml_cont(ctx0, prev_hs), n_embd, 1, n_seqs);
             if (n_seq_tokens > 1) {
                 ggml_tensor * cur_shift = ggml_view_3d(ctx0, cur_seq, n_embd, n_seq_tokens - 1, n_seqs,
                         cur_seq->nb[1],
@@ -249,7 +249,7 @@ llama_model_zaya::graph::graph(const llama_model & model, const llm_graph_params
 
             ggml_tensor * Kpre_grouped = ggml_reshape_4d(ctx0, Kpre, n_embd_head, 1, n_head_kv, n_tokens);
             Kpre_grouped = ggml_repeat_4d(ctx0, Kpre_grouped, n_embd_head, n_gqa, n_head_kv, n_tokens);
-            ggml_tensor * Kpre_rep = ggml_reshape_3d(ctx0, Kpre_grouped, n_embd_head, n_head, n_tokens);
+            ggml_tensor * Kpre_rep = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Kpre_grouped), n_embd_head, n_head, n_tokens);
             ggml_tensor * qk_mean_q = ggml_scale(ctx0, ggml_add(ctx0, Qpre, Kpre_rep), 0.5f);
             cb(qk_mean_q, "qk_mean_q", il);
 
@@ -257,7 +257,7 @@ llama_model_zaya::graph::graph(const llama_model & model, const llm_graph_params
             Qgroup = ggml_permute(ctx0, Qgroup, 1, 0, 2, 3);
             Qgroup = ggml_cont(ctx0, Qgroup);
             ggml_tensor * Qmean = ggml_mean(ctx0, Qgroup);
-            Qmean = ggml_reshape_3d(ctx0, Qmean, n_embd_head, n_head_kv, n_tokens);
+            Qmean = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Qmean), n_embd_head, n_head_kv, n_tokens);
             ggml_tensor * qk_mean_k = ggml_scale(ctx0, ggml_add(ctx0, Qmean, Kpre), 0.5f);
             cb(qk_mean_k, "qk_mean_k", il);
 

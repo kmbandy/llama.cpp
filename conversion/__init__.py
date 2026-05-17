@@ -224,6 +224,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "XLMRobertaForSequenceClassification": "bert",
     "XLMRobertaModel": "bert",
     "XverseForCausalLM": "xverse",
+    "ZayaForCausalLM": "zaya",
+    "ZayaModel": "zaya",
     "YoutuForCausalLM": "deepseek",
     "YoutuVLForConditionalGeneration": "deepseek",
     "modeling_grove_moe.GroveMoeForCausalLM": "grovemoe",
