@@ -167,6 +167,90 @@ static __device__ __forceinline__ void stage_v_tile(
     }
 }
 
+// ── cooperative TURBO4_0 dequant ────────────────────────────────────────
+//
+// Replaces the per-element scalar dequant path (ops::k_load / ops::v_load)
+// inside the cooperative load loops of the multi-warp kernel. The
+// per-element path re-loads the qblock's norm scale (one __half) for every
+// element — 128× redundant per qblock, since all 128 elements in a qblock
+// share one norm. Cooperative version:
+//
+//   • One lane loads the norm and broadcasts via __shfl_sync. (1× load.)
+//   • 32 lanes coalesced-load 64 bytes of packed nibbles (2 bytes/lane).
+//   • Each lane dequants its 4 elements (4 nibbles → centroid × norm).
+//   • Lanes write 4 contiguous halves to smem in the same row-major
+//     layout the consumer mma expects.
+//
+// Warps round-robin through the qblocks of the tile. For HS=256 the tile
+// has K_TILE_N=16 tokens × 2 qblocks/token = 32 qblocks; 6 warps = 5-6
+// qblocks per warp. Used for both K and V (the paged_cache_ops<TURBO4_0>
+// layout is identical between K and V buffers; only the base pointer
+// differs, which is the `cache` argument).
+template <int HEAD_SIZE, int BLOCK_SIZE, int N_WARPS>
+static __device__ __forceinline__ void coop_stage_turbo4_tile(
+        __half        * __restrict__ smem_dst,
+        const void    * __restrict__ cache,
+        const int     * __restrict__ seq_block_table,
+        int            k_tile_start,
+        int            block_valid_ctx,
+        int            kv_head_idx,
+        int            n_kv_heads,
+        int            warp_id,
+        int            lane_id) {
+    constexpr int Q_BLOCK            = QK_TURBO4;  // 128
+    constexpr int QBLOCKS_PER_TOKEN  = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_QBLOCKS_PER_TILE = K_TILE_N * QBLOCKS_PER_TOKEN;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be multiple of QK_TURBO4=128");
+    static_assert(Q_BLOCK == 128, "cooperative dequant expects QK_TURBO4=128 (32 lanes × 4 elements)");
+
+    const block_turbo4_0 * blocks = (const block_turbo4_0 *) cache;
+
+    #pragma unroll
+    for (int qb = warp_id; qb < N_QBLOCKS_PER_TILE; qb += N_WARPS) {
+        const int row         = qb / QBLOCKS_PER_TOKEN;
+        const int qb_in_token = qb % QBLOCKS_PER_TOKEN;
+        const int token       = k_tile_start + row;
+
+        const block_turbo4_0 * blk = nullptr;
+        float norm_f = 0.0f;
+
+        if (token < block_valid_ctx) {
+            const int logical_block = token / BLOCK_SIZE;
+            const int tok_in_block  = token % BLOCK_SIZE;
+            const int physical      = seq_block_table[logical_block];
+            if (physical != kInvalidBlockTableEntry) {
+                const int64_t ib = ((int64_t) physical * n_kv_heads + kv_head_idx) * BLOCK_SIZE * QBLOCKS_PER_TOKEN
+                                 + (int64_t) tok_in_block * QBLOCKS_PER_TOKEN
+                                 + (int64_t) qb_in_token;
+                blk = &blocks[ib];
+                if (lane_id == 0) {
+                    norm_f = __half2float(blk->norm);
+                }
+            }
+        }
+
+        // Broadcast norm from lane 0 to all 32 lanes of this warp.
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+
+        // Each lane reads 2 bytes (4 nibbles = 4 elements). qs is uint8_t[64],
+        // 2-byte aligned at qs[2*lane_id] for any lane.
+        uint16_t packed = 0;
+        if (blk != nullptr) {
+            packed = *(const uint16_t *)(blk->qs + 2 * lane_id);
+        }
+
+        const int smem_row_base = row * HEAD_SIZE;
+        const int smem_col_base = qb_in_token * Q_BLOCK + lane_id * 4;
+
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t idx_nib = (packed >> (l * 4)) & 0xF;
+            const float val = TURBO_CENTROIDS_4BIT[idx_nib] * norm_f;
+            smem_dst[smem_row_base + smem_col_base + l] = __float2half(val);
+        }
+    }
+}
+
 // ── kernel ──────────────────────────────────────────────────────────────
 
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
@@ -585,21 +669,29 @@ __global__ void mt_paged_attention_tile_mw_kernel(
 
     // ── K-tile loop (block-shared K/V) ─────────────────────────────────
     for (int k_tile_start = 0; k_tile_start < block_valid_ctx; k_tile_start += K_TILE_N) {
-        // Cooperative K load
-        for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
-            const int row   = idx / HEAD_SIZE;
-            const int col   = idx % HEAD_SIZE;
-            const int token = k_tile_start + row;
-            float val = 0.0f;
-            if (token < block_valid_ctx) {
-                const int logical_block = token / BLOCK_SIZE;
-                const int tok_in_block  = token % BLOCK_SIZE;
-                const int physical      = seq_block_table[logical_block];
-                if (physical != kInvalidBlockTableEntry) {
-                    val = ops::k_load(k_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+        // Cooperative K load. TURBO4_0 uses the cooperative dequant path
+        // (norm shared across the 128-element qblock, coalesced qs bytes,
+        // 4 elements/lane); F16 uses the per-element typed load.
+        if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
+            coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else {
+            for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+                const int row   = idx / HEAD_SIZE;
+                const int col   = idx % HEAD_SIZE;
+                const int token = k_tile_start + row;
+                float val = 0.0f;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        val = ops::k_load(k_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+                    }
                 }
+                smem_k[idx] = __float2half(val);
             }
-            smem_k[idx] = __float2half(val);
         }
         __syncthreads();
 
@@ -685,21 +777,28 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             }
         }
 
-        // Cooperative V load
-        for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
-            const int row   = idx / HEAD_SIZE;
-            const int col   = idx % HEAD_SIZE;
-            const int token = k_tile_start + row;
-            float val = 0.0f;
-            if (token < block_valid_ctx) {
-                const int logical_block = token / BLOCK_SIZE;
-                const int tok_in_block  = token % BLOCK_SIZE;
-                const int physical      = seq_block_table[logical_block];
-                if (physical != kInvalidBlockTableEntry) {
-                    val = ops::v_load(v_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+        // Cooperative V load (same dispatch as K above; TURBO4_0's V buffer
+        // shares the K layout per paged_cache_ops<TURBO4_0>).
+        if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
+            coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_v, v_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else {
+            for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+                const int row   = idx / HEAD_SIZE;
+                const int col   = idx % HEAD_SIZE;
+                const int token = k_tile_start + row;
+                float val = 0.0f;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        val = ops::v_load(v_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+                    }
                 }
+                smem_v[idx] = __float2half(val);
             }
-            smem_v[idx] = __float2half(val);
         }
         __syncthreads();
 
