@@ -5,24 +5,33 @@
 // extract device pointers from our backend tensor type, dispatch to the
 // generated C launcher.
 //
-// Status: DRAFT — wrapper structure is illustrative. The actual function
-// names from Triton's tools.compile output have a deterministic
-// specialization-hash suffix (e.g. `add_kernel_0d1d2d3de`) that we don't
-// know offline. MAD-187 milestone 1 will:
-//   1. Run the AOT compile and inspect the produced .h file
-//   2. Update this wrapper with the exact symbol name OR use the
-//      `triton.tools.link` aggregator to produce a stable wrapper symbol
+// Status: DRAFT scaffolding. Verified end-to-end on 2026-05-17 via an
+// out-of-tree POC (see /tmp/triton-aot-test/ and POC-test_vector_add.cpp
+// in this directory). The actual generated function name carries a
+// deterministic specialization-hash suffix that varies by
+// (kernel-source, signature). For vector_add with our current
+// signature the suffix is `b87d3d74_0d1d2d` — but that's only stable
+// against the source frozen in this commit; any kernel edit changes it.
+//
+// At build time, the actual .h path will be globbed via the CMake module
+// (see ../cmake/TritonAOT.cmake `${vector_add_AOT_C_FILES}`). The wrapper
+// here uses a `extern "C"` include because the generated .h does NOT
+// have `__cplusplus` guards (Triton upstream nit — file later).
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
 #include <cstdio>
 
-// Generated header — produced by `triton.tools.compile` into
-// ${CMAKE_BINARY_DIR}/aiter-integration/triton-out/vector_add/<arch>/
-// vector_add.<spec-hash>.h
+// Verified pattern from POC: wrap the generated header in extern "C".
+// At build time CMake's per-arch include dir will resolve this; the
+// glob in TritonAOT.cmake picks up vector_add.<spec-hash>.h.
 //
-// PLACEHOLDER include — actual name will be discovered at MAD-187 m1.
+// PLACEHOLDER include name — production code will use the linker.py
+// merged stable symbol OR a small dispatcher header we generate.
+//
+// extern "C" {
 // #include "vector_add.PLACEHOLDER.h"
+// }
 
 namespace mt::aiter {
 

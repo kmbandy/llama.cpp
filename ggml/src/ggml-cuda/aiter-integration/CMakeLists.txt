@@ -63,7 +63,10 @@ set(_vector_add_specs)
 foreach(arch ${AITER_AOT_ARCHES})
     list(APPEND _vector_add_specs
         SIGNATURE  "*fp32:16, *fp32:16, *fp32:16, i32, 1024"
-        GRID       "n_elements // 1024"
+        # C-syntax grid required: Triton inlines this verbatim into the
+        # generated C launcher (no Python→C translation). `//` would
+        # become a C line comment. Verified 2026-05-17.
+        GRID       "n_elements / 1024, 1, 1"
         NUM_WARPS  4
         NUM_STAGES 1
         ARCH       ${arch}

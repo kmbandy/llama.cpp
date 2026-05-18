@@ -96,20 +96,41 @@ endfunction()
 #       KERNEL_NAME    add_kernel                       # @jit function name inside .py
 #       OUT_DIR        ${CMAKE_BINARY_DIR}/aiter-integration/triton-out
 #       SPECS
-#           SIGNATURE  "*fp32:16, *fp32:16, *fp32:16, i32"
-#           GRID       "n_elements // BLOCK_SIZE"
+#           SIGNATURE  "*fp32:16, *fp32:16, *fp32:16, i32, 1024"
+#           GRID       "n_elements / 1024, 1, 1"   # ← C-SYNTAX, not Python!
 #           NUM_WARPS  4
 #           NUM_STAGES 1
 #           ARCH       gfx1201
 #       # ... more SPECS blocks allowed for additional specializations
 #   )
 #
-# Outputs (per spec block):
-#   ${OUT_DIR}/${NAME}.<suffix>.c
-#   ${OUT_DIR}/${NAME}.<suffix>.h
-# where <suffix> is Triton's deterministic specialization hash.
+# GRID gotcha (verified 2026-05-17 POC, Triton 3.7.0+git4768da5e):
+#   `triton.tools.compile` inlines the GRID expression verbatim into the
+#   generated C launcher (no operator translation). Python `//` would
+#   become a C line comment. ALWAYS use C-syntax: `/` for int division,
+#   `,` to separate the 3 dims, and reference kernel parameters by name.
 #
-# Caller can then `target_sources(<their-target> PRIVATE ${${NAME}_AOT_C_FILES})`.
+# Outputs (per spec block):
+#   ${OUT_DIR}/${NAME}/${arch}/${NAME}.<spec-hash>.c
+#   ${OUT_DIR}/${NAME}/${arch}/${NAME}.<spec-hash>.h
+# where <spec-hash> is Triton's deterministic kernel+signature hash.
+#
+# Symbol collision warning: <spec-hash> is TARGET-ARCH-INDEPENDENT. The
+# same (kernel, signature) produces the same C symbol name across arches,
+# so per-arch output dirs (which we do) AND per-arch static libs are
+# required — never link two arches' generated .c files into one library.
+# See ARCHITECTURE.md §10.2.
+#
+# Caller wires the discovered files into a per-arch lib via:
+#   target_sources(<arch_lib> PRIVATE ${${NAME}_AOT_C_FILES})
+#
+# C++ consumers of the generated .h must wrap the #include in:
+#   extern "C" { #include "<NAME>.<spec-hash>.h" }
+# (Generated header lacks `extern "C"` guards — file upstream Triton nit.)
+#
+# Linking from hipcc also requires `--offload-arch=<arch>` on the link
+# command, not just at AOT compile time. Without it the HSACO and the
+# enclosing object are arch-mismatched and hipModuleLoadData fails.
 # ────────────────────────────────────────────────────────────────────────
 
 function(add_triton_aot_kernel)

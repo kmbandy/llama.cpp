@@ -597,6 +597,81 @@ init time.
 **Build-only dependency:** developers building from source need Triton installed.
 End users running pre-built binaries do not. Document this in `BUILD.md`.
 
+### 7.1.1 Verified behavior (POC 2026-05-17, Triton 3.7.0+git4768da5e)
+
+End-to-end vector_add AOT proof-of-concept landed and ran on the R9700
+(gfx1201) on 2026-05-17. The pipeline is solid; the following details are
+empirically confirmed, not theoretical:
+
+**Verified `triton.tools.compile` CLI:**
+
+```bash
+python -m triton.tools.compile <kernel.py> \
+    --kernel-name add_kernel \
+    --target hip:gfx1201:32 \
+    --signature "*fp32:16, *fp32:16, *fp32:16, i32, 1024" \
+    --grid "n_elements / 1024, 1, 1" \
+    --num-warps 4 \
+    --num-stages 1 \
+    --out-name vector_add \
+    --out-path /tmp/out/vector_add
+```
+
+Produces:
+
+- `vector_add.<spec-hash>.c` — embedded HSACO blob + load/unload helpers + a
+  `hipError_t <kernel>_<spec-hash>(hipStream_t, hipDeviceptr_t..., int32_t...)`
+  launcher. `static hipModule_t _mod = NULL` and `_func = NULL` globals do
+  lazy `hipModuleLoadData` on first call; subsequent calls just dispatch.
+  License header: `SPDX-License-Identifier: MIT`, `Copyright AMD`.
+- `vector_add.<spec-hash>.h` — declaration of the above. **Missing `extern "C"`
+  guards** — C++ consumers must wrap their `#include` in `extern "C" { ... }`.
+
+**Verified compile + link from C++:**
+
+```bash
+hipcc test.cpp vector_add.<spec-hash>.c -o test \
+    -I/opt/rocm/include -I. \
+    --offload-arch=gfx1201
+```
+
+`--offload-arch=gfx1201` is required on the final link, not just at AOT
+compile time. Without it hipcc emits for some default arch and the HSACO
+mismatch breaks at module load.
+
+**Gotchas (worth filing upstream):**
+
+1. **Python-syntax operators in `--grid` produce broken C.** Triton inlines
+   the grid expression as-is into the C launcher (no operator translation).
+   The natural Python integer-division `//` becomes a C line comment.
+   Workaround: use `/` for int division. **File upstream**: either translate
+   or document.
+
+2. **No `extern "C"` guards in the generated `.h`.** C++ consumers hit
+   linker errors unless they wrap the include manually. Trivial nit;
+   worth a small upstream PR adding `#ifdef __cplusplus extern "C" {`.
+
+3. **Spec-hash suffix is target-arch-independent.** Same kernel +
+   signature + grid produces the same `<spec-hash>` for gfx1201 AND gfx1030
+   builds (verified 2026-05-17). The *binary content* differs (different
+   HSACO), but the C symbol names are identical: `vector_add_<spec-hash>`,
+   `_hsaco`, `_mod`, `_func` all collide if you naively link both archs into
+   one library. **Per-arch static libs** (TritonAOT.cmake already plans
+   this) or **`triton.tools.link`** for a unified dispatched wrapper are
+   the two viable workarounds.
+
+**Lazy module load behavior:**
+
+The generated launcher does:
+```c
+if (mod_func == NULL)
+    load_kernel();  // calls hipModuleLoadData on first invocation
+return hipModuleLaunchKernel(mod_func, gX, gY, gZ, ...);
+```
+
+So the per-process state is one `hipModule_t` per launcher per process,
+shared across all callers, freed only via the explicit `unload_*` function.
+
 ### 7.2 KV cache layout convergence
 
 **Migration target:**
@@ -836,18 +911,39 @@ Two options for shipping the AOT artifacts:
 
 Recommendation: embedded for releases, external during development.
 
-### 10.2 Multi-(HEAD_SIZE, KV_TYPE) AOT matrix
+### 10.2 Multi-(HEAD_SIZE, KV_TYPE, ARCH) AOT matrix + symbol collision
 
 Each kernel `@jit` instance must be AOT-compiled for each
-`(HEAD_SIZE, KV_TYPE, MSE_BITS, ...)` combination it's used with. The matrix
-for our target models:
+`(HEAD_SIZE, KV_TYPE, MSE_BITS, ARCH, ...)` combination it's used with.
+The matrix for our target models:
 
-- AITER: HEAD_SIZE ∈ {128, 256}, KV_TYPE ∈ {F16, BF16, FP8}
-- TurboQuant: HEAD_SIZE ∈ {128, 256}, presets ∈ {k8v4, 4bit_nc}
-- Total: ~8-12 AOT compilations per build
+- AITER: HEAD_SIZE ∈ {128, 256}, KV_TYPE ∈ {F16, BF16, FP8}, ARCH ∈ {gfx1201, gfx1030, …}
+- TurboQuant: HEAD_SIZE ∈ {128, 256}, presets ∈ {k8v4, 4bit_nc}, ARCH ∈ {…}
+- Total: ~16-24 AOT compilations per build (8-12 specs × 2-3 arches)
 
-At ~5-15 seconds per compile, total build-time impact is ~1-2 minutes. Cache
+At ~5-15 seconds per compile, total build-time impact is ~2-6 minutes. Cache
 artifacts in a `build/triton-cache/` directory keyed on kernel hash.
+
+**Symbol collision across arches (verified 2026-05-17):** the `<spec-hash>`
+suffix in generated launcher names is target-arch-independent. So gfx1201
+and gfx1030 builds of the same kernel produce launchers with the *same C
+symbol name* and the *same internal `_hsaco`/`_mod`/`_func` globals*.
+Naive link of both into one library = duplicate-symbol error.
+
+Three options (pick at MAD-187 milestone 2):
+
+1. **Per-arch static libs.** Build a separate `aiter_triton_aot_gfx1201.a`
+   and `aiter_triton_aot_gfx1030.a`; runtime dispatcher in ggml-hip selects
+   one based on detected GPU. Two libraries per shipped binary, but each
+   self-contained. **TritonAOT.cmake's current per-arch-subdir design
+   naturally produces this — just need one CMake target per arch.**
+2. **`triton.tools.link`** to merge per-arch specializations into a unified
+   dispatched wrapper. Triton's intended approach; cleaner end product but
+   another tool dependency at build time.
+3. **`objcopy --redefine-sym`** to rename symbols per arch. Hacky;
+   error-prone. Use only as a last resort.
+
+Recommendation: **option 1 now**, evaluate option 2 as a follow-up.
 
 ### 10.3 Continuation prefill threshold
 
