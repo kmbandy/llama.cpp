@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstring>
 // mt_pagedattn — paged attention kernel implementation.
 //
 // See mt_pagedattn.cuh for layout and threading model docs.
@@ -851,11 +853,28 @@ static void launch_paged_attn(
 }
 
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Path-tracking probes — gated on MAD_PAGEDATTN_PROBE env var. Prints a
+    // first-call summary for each path (tile / decode / scalar / aiter), and
+    // per-call detail when MAD_PAGEDATTN_PROBE=verbose. Useful for the
+    // 2026-05-18 decode-regression hunt that showed tile/decode/scalar all
+    // collapse to ~19 t/s with --kv-tiered, while stock-cache gets 77 t/s and
+    // AITER gets 69 t/s on the same paged path.
+    const char * probe_env   = std::getenv("MAD_PAGEDATTN_PROBE");
+    const bool   probe_on    = probe_env != nullptr;
+    const bool   probe_verbose = probe_on && std::strncmp(probe_env, "verbose", 7) == 0;
+    static std::atomic<int> probe_tile{0}, probe_decode{0}, probe_scalar{0}, probe_aiter{0};
+
     // MAD-188: if the AITER backend is enabled and compiled in, route the
     // whole op through it. Scatter and attention both use AITER's KV layout
     // (different from the layout this file's tile/scalar/decode paths
     // expect), so the choice is mutually exclusive per process.
     if (aiter_backend_enabled()) {
+        if (probe_on) {
+            int n = probe_aiter.fetch_add(1, std::memory_order_relaxed);
+            if (probe_verbose || n == 0) {
+                std::fprintf(stderr, "[probe-aiter] dispatching to AITER backend (call #%d)\n", n+1);
+            }
+        }
         ggml_cuda_op_paged_attn_mt_aiter(ctx, dst);
         return;
     }
@@ -926,6 +945,13 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 const bool tile_env_on       = get_paged_tile_mode() != 0;
                 const bool tile_gate_on      = wmma_ok && tile_env_on;
                 if (tile_gate_on && avg_q_len >= 16) {
+                    if (probe_on) {
+                        int n = probe_tile.fetch_add(1, std::memory_order_relaxed);
+                        if (probe_verbose || n == 0) {
+                            std::fprintf(stderr, "[probe-tile] avg_q_len=%d max_ctx=%d wmma=%d total_q=%d (call #%d)\n",
+                                         avg_q_len, max_ctx_len, (int)wmma_ok, total_q_tokens, n+1);
+                        }
+                    }
                     // Tile kernel doesn't fuse scatter — always run scatter first.
                     launch_scatter_kv<CT, __half, HS, BS>(
                         k_cache->data,
@@ -982,6 +1008,13 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                                             && (avg_q_len >= 1) && (avg_q_len <= 8)
                                             && (max_ctx_len >= 8192);
                 if (decode_gate_on) {
+                    if (probe_on) {
+                        int n = probe_decode.fetch_add(1, std::memory_order_relaxed);
+                        if (probe_verbose || n == 0) {
+                            std::fprintf(stderr, "[probe-decode] avg_q_len=%d max_ctx=%d (call #%d)\n",
+                                         avg_q_len, max_ctx_len, n+1);
+                        }
+                    }
                     // Same scatter contract as the tile path — pre-stage
                     // new K/V into the cache before attention reads from it.
                     launch_scatter_kv<CT, __half, HS, BS>(
@@ -1019,6 +1052,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
             // path provides. Quant types use a dedicated cooperative scatter
             // kernel; force separate mode for them.
             const bool fused = do_fused && (CT == GGML_TYPE_F16);
+            if (probe_on) {
+                int n = probe_scalar.fetch_add(1, std::memory_order_relaxed);
+                if (probe_verbose || n == 0) {
+                    std::fprintf(stderr, "[probe-scalar] hitting scalar fallback (call #%d)\n", n+1);
+                }
+            }
 
             if (!fused) {
                 // Experiment path: separate scatter kernel + attn-only kernel.
