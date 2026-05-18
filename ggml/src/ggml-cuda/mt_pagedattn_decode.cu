@@ -74,27 +74,100 @@ static __device__ __forceinline__ void decode_stage_kv_f16(
         int            n_kv_heads,
         bool           is_v,
         int            tid) {
-    // We pre-cast to __half * but the layout helpers still want a void *.
-    // Splitting K vs V here lets us select the right ops::*_load.
-    using ops = paged_cache_ops<GGML_TYPE_F16, HEAD_SIZE, BLOCK_SIZE>;
-    const void * src = (const void *) src_cache_as_half;
-    #pragma unroll
-    for (int idx = tid; idx < DECODE_K_TILE_N * HEAD_SIZE; idx += DECODE_NUM_THREADS) {
-        const int row   = idx / HEAD_SIZE;
-        const int col   = idx % HEAD_SIZE;
-        const int token = tile_start + row;
-        float val = 0.0f;
-        if (token < valid_ctx) {
-            const int logical_block = token / BLOCK_SIZE;
-            const int tok_in_block  = token % BLOCK_SIZE;
-            const int physical      = seq_block_table[logical_block];
-            if (physical != kInvalidBlockTableEntry) {
-                val = is_v
-                    ? ops::v_load(src, physical, kv_head_idx, n_kv_heads, tok_in_block, col)
-                    : ops::k_load(src, physical, kv_head_idx, n_kv_heads, tok_in_block, col);
+    // Coalesced staging for F16 K/V caches.
+    //
+    // K cache layout: [blocks, kv_heads, HEAD_SIZE/K_X, BLOCK_SIZE, K_X], K_X=8.
+    //   Innermost K_X=8 fp16s are contiguous. For a 32-lane warp to coalesce
+    //   into 64 contiguous bytes, adjacent lanes must vary across (token_in_block,
+    //   K_X) — i.e. each warp reads 4 tokens × 8 K_X per d_outer iteration.
+    //
+    // V cache layout: [blocks, kv_heads, HEAD_SIZE, BLOCK_SIZE]
+    //   Innermost is token_in_block (16 fp16s = 32 bytes contiguous per d). For
+    //   32-lane coalescing, each warp packs 2 d values × 16 tokens = 64 bytes.
+    //
+    // Why this matters (MAD-188 perf hunt, 2026-05-18): the prior version had
+    // each thread load 1 element with iteration order (token, d), so within a
+    // warp 32 lanes read 32 elements scattered across 4 cache lines (each line
+    // only ~8 lanes used). That's ~4× the BW transactions vs the data volume,
+    // and matched the observed 4× decode regression on paged-tiered vs stock.
+    static_assert(DECODE_K_TILE_N == BLOCK_SIZE,
+                  "decode_stage_kv_f16 assumes one staged tile == one logical block "
+                  "(chunk_start and sub_start are both block-aligned because "
+                  "CHUNK_KV % BLOCK_SIZE == 0 and DECODE_K_TILE_N == BLOCK_SIZE)");
+    constexpr int K_X = 16 / sizeof(__half);  // 8 fp16 = 16 contiguous bytes
+    static_assert(HEAD_SIZE % K_X == 0, "HEAD_SIZE must be a multiple of K_X");
+    constexpr int NUM_WARPS = DECODE_NUM_THREADS / WARP_SIZE;
+    static_assert(NUM_WARPS * 4 == BLOCK_SIZE,
+                  "K stage assumes 4 tokens per warp × NUM_WARPS warps == BLOCK_SIZE (=16 tokens)");
+
+    const int warp = tid / WARP_SIZE;
+    const int lane = tid % WARP_SIZE;
+
+    // All DECODE_K_TILE_N=16 tokens in this tile are in one logical block
+    // (asserted above). Resolve the physical block once per thread; reuse.
+    const int logical_block = tile_start / BLOCK_SIZE;
+    const int physical      = seq_block_table[logical_block];
+    const bool block_ok     = (physical != kInvalidBlockTableEntry);
+
+    if (!is_v) {
+        // K: 4 tokens × K_X=8 elements per warp per d_outer iter.
+        //   lane 0..7    → token_in_warp=0, d_inner=0..7
+        //   lane 8..15   → token_in_warp=1, d_inner=0..7
+        //   lane 16..23  → token_in_warp=2, d_inner=0..7
+        //   lane 24..31  → token_in_warp=3, d_inner=0..7
+        // These 32 elements are contiguous in memory (only differ in the inner
+        // (token_in_block * K_X + d_inner) range). 64-byte coalesced load.
+        const int t_in_warp    = lane / K_X;
+        const int d_inner      = lane % K_X;
+        const int t            = warp * 4 + t_in_warp;          // 0..15 within tile
+        const int token        = tile_start + t;
+        const int tok_in_block = t;                              // tile is block-aligned
+        const bool token_ok    = block_ok && (token < valid_ctx);
+
+        const size_t kv_head_base = (size_t) physical    * n_kv_heads * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                                  + (size_t) kv_head_idx              * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                                  + (size_t) tok_in_block * K_X
+                                  + (size_t) d_inner;
+
+        #pragma unroll
+        for (int d_outer = 0; d_outer < HEAD_SIZE / K_X; ++d_outer) {
+            __half val = (__half) 0;
+            if (token_ok) {
+                const size_t off = kv_head_base + (size_t) d_outer * BLOCK_SIZE * K_X;
+                val = src_cache_as_half[off];
             }
+            const int d = d_outer * K_X + d_inner;
+            smem_dst[t * HEAD_SIZE + d] = val;
         }
-        smem_dst[idx] = __float2half(val);
+    } else {
+        // V: 2 d values × BLOCK_SIZE=16 tokens per warp per outer iter.
+        //   lane 0..15  → d_in_warp=0, t=0..15
+        //   lane 16..31 → d_in_warp=1, t=0..15
+        // Per warp iter: 32 contiguous fp16 (64 bytes) — coalesced.
+        // 4 warps × 2 d = 8 d per outer iter. Loop HEAD_SIZE/8 outer iters.
+        constexpr int D_PER_WARP   = 2;
+        constexpr int D_PER_OUTER  = NUM_WARPS * D_PER_WARP;   // 8
+        constexpr int OUTER_ITERS  = HEAD_SIZE / D_PER_OUTER;
+        static_assert(HEAD_SIZE % D_PER_OUTER == 0, "HEAD_SIZE must be multiple of NUM_WARPS*2");
+
+        const int d_in_warp = lane / BLOCK_SIZE;   // 0 or 1
+        const int t         = lane % BLOCK_SIZE;   // 0..15
+        const int token     = tile_start + t;
+        const bool token_ok = block_ok && (token < valid_ctx);
+
+        const size_t kv_head_base = (size_t) physical    * n_kv_heads * HEAD_SIZE * BLOCK_SIZE
+                                  + (size_t) kv_head_idx              * HEAD_SIZE * BLOCK_SIZE;
+
+        #pragma unroll
+        for (int outer = 0; outer < OUTER_ITERS; ++outer) {
+            const int d = outer * D_PER_OUTER + warp * D_PER_WARP + d_in_warp;
+            __half val = (__half) 0;
+            if (token_ok) {
+                const size_t off = kv_head_base + (size_t) d * BLOCK_SIZE + (size_t) t;
+                val = src_cache_as_half[off];
+            }
+            smem_dst[t * HEAD_SIZE + d] = val;
+        }
     }
 }
 
@@ -257,11 +330,16 @@ static __device__ __forceinline__ float decode_block_reduce_max(
     return red_smem[0];
 }
 
-// Compile-time max q_len handled per block. q_len > MAX_Q falls to the
-// scalar path (the dispatch gate checks this). 8 covers MTP spec-decode
-// draft-verification batches (MAD-174 / MAD-176); larger q_len batches
+// Compile-time max QUERIES handled per block = num_queries_per_kv * q_len.
+// With GQA fanout (2026-05-18), one block processes all q_heads sharing a
+// kv_head AND all q_tokens in the batch. For Qwen3.5/3.6:
+//   GQA=4 + q_len=4 (MTP spec-decode draft) → 16 queries  ← MUST fit
+//   GQA=8 + q_len=1 (35B-A3B pure decode)    →  8 queries
+//   GQA=8 + q_len=4 (35B + MTP)              → 32 queries ← won't fit, scalar
+// Bumped from 8 → 16 to cover the Qwen3.5/3.6 MTP common case. Beyond 16
+// the dispatch gate sends it to the scalar fallback. Larger q_len batches
 // are prefill territory and go to the tile kernel.
-static constexpr int DECODE_MAX_Q = 8;
+static constexpr int DECODE_MAX_Q = 16;
 
 // ── Pass 1: per-chunk partial kernel ───────────────────────────────────
 //
@@ -290,22 +368,33 @@ __global__ void mt_paged_attention_decode_kernel(
     int             num_chunks,
     int             max_q_len,    // uniform stride for partials inner-dim
     float           scale) {
-    const int head_idx  = blockIdx.x;
-    const int seq_idx   = blockIdx.y;
-    const int chunk_idx = blockIdx.z;
-    const int tid       = threadIdx.x;
-    const int wid       = tid / WARP_SIZE;
-    const int lane      = tid % WARP_SIZE;
+    // GQA fanout (2026-05-18): grid is now (n_kv_heads, n_seqs, num_chunks).
+    // Each block handles ALL `num_queries_per_kv` q-heads that share this
+    // kv_head, so the staged K/V tile is reused across the GQA group instead
+    // of being read GQA× redundantly (one block per q_head, as before). For
+    // Qwen3.5-4B (GQA=4) this is a 4× HBM-traffic reduction on decode.
+    //
+    // Inner query index: qhqi = qh * q_len + qi (qh in 0..nq_per_kv-1,
+    // qi in 0..q_len-1). The total per block is num_queries_per_kv * q_len
+    // and must fit in DECODE_MAX_Q — the dispatch gate enforces this.
+    const int kv_head_idx        = blockIdx.x;
+    const int seq_idx            = blockIdx.y;
+    const int chunk_idx          = blockIdx.z;
+    const int tid                = threadIdx.x;
+    const int wid                = tid / WARP_SIZE;
+    const int lane               = tid % WARP_SIZE;
 
-    const int q_len           = q_lens[seq_idx];      // 1..DECODE_MAX_Q (dispatch-enforced)
-    const int ctx_len_after_q = context_lens[seq_idx];
-    const int kv_head_idx     = head_idx / (n_heads / n_kv_heads);
-    const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    const int q_len              = q_lens[seq_idx];   // 1..DECODE_MAX_Q (dispatch-enforced)
+    const int ctx_len_after_q    = context_lens[seq_idx];
+    const int num_queries_per_kv = n_heads / n_kv_heads;
+    const int head_base          = kv_head_idx * num_queries_per_kv;
+    const int total_q            = num_queries_per_kv * q_len;
+    const int * seq_block_table  = block_tables + seq_idx * max_blocks_per_seq;
 
-    // Per-block check — defensive against host/device q_len skew. Dispatch
-    // promises q_len <= DECODE_MAX_Q; clamp in case a future op_param flow
-    // sneaks something through.
-    if (q_len > DECODE_MAX_Q) return;
+    // Per-block check — defensive. Dispatch gate enforces both q_len and
+    // total_q caps; clamp here in case a future op_param flow sneaks
+    // something through.
+    if (q_len > DECODE_MAX_Q || total_q > DECODE_MAX_Q) return;
 
     // Per-seq Q offset (sum of preceding q_lens).
     size_t seq_q_offset = 0;
@@ -319,23 +408,28 @@ __global__ void mt_paged_attention_decode_kernel(
 
     const int chunk_start = chunk_idx * CHUNK_KV;
 
-    // Partial-output base for this (head, seq, chunk). Inner stride is
-    // max_q_len so the buffer has a single uniform stride across seqs;
-    // unused slots (qi >= q_len for this seq) are simply left untouched
-    // and never read by the reducer (it loops to this seq's q_len).
-    const size_t partial_chunk_base =
-        ((((size_t) head_idx * n_seqs + seq_idx) * num_chunks) + (size_t) chunk_idx)
-        * (size_t) max_q_len * (size_t) (HEAD_SIZE + 2);
+    // Per-head partial base (chunk-relative). Each block writes
+    // num_queries_per_kv slots in this dimension. Layout matches the old
+    // "one head per block" world so the reduce kernel is unchanged.
+    auto partial_chunk_base_for_head = [&](int head_idx) -> size_t {
+        return ((((size_t) head_idx * n_seqs + seq_idx) * num_chunks) + (size_t) chunk_idx)
+             * (size_t) max_q_len * (size_t) (HEAD_SIZE + 2);
+    };
 
     if (chunk_start >= valid_ctx_max) {
         // No visible tokens for any query — write neutral partials so the
         // reducer's pass over all chunks doesn't see uninitialized memory.
-        for (int qi = 0; qi < q_len; ++qi) {
-            const size_t off = partial_chunk_base + (size_t) qi * (HEAD_SIZE + 2);
-            for (int d = tid; d < HEAD_SIZE; d += DECODE_NUM_THREADS) partials[off + d] = 0.0f;
-            if (tid == 0) {
-                partials[off + HEAD_SIZE]     = -INFINITY;
-                partials[off + HEAD_SIZE + 1] = 0.0f;
+        // Loop over (qh, qi) so we cover every head this block owns.
+        for (int qh = 0; qh < num_queries_per_kv; ++qh) {
+            const int head_idx = head_base + qh;
+            const size_t base = partial_chunk_base_for_head(head_idx);
+            for (int qi = 0; qi < q_len; ++qi) {
+                const size_t off = base + (size_t) qi * (HEAD_SIZE + 2);
+                for (int d = tid; d < HEAD_SIZE; d += DECODE_NUM_THREADS) partials[off + d] = 0.0f;
+                if (tid == 0) {
+                    partials[off + HEAD_SIZE]     = -INFINITY;
+                    partials[off + HEAD_SIZE + 1] = 0.0f;
+                }
             }
         }
         return;
@@ -356,29 +450,32 @@ __global__ void mt_paged_attention_decode_kernel(
     float  * smem_logits = (float *)(smem_v + DECODE_K_TILE_N * HEAD_SIZE);
     float  * red_smem    = smem_logits + DECODE_MAX_Q * DECODE_K_TILE_N;
 
-    // ── Stage all q_len query vectors ──
-    for (int idx = tid; idx < q_len * HEAD_SIZE; idx += DECODE_NUM_THREADS) {
-        const int qi = idx / HEAD_SIZE;
-        const int d  = idx % HEAD_SIZE;
+    // ── Stage all (q_head_in_group × q_token) query vectors ──
+    // smem_q[qhqi, d] for qhqi = qh * q_len + qi, qh = head_in_group.
+    for (int idx = tid; idx < total_q * HEAD_SIZE; idx += DECODE_NUM_THREADS) {
+        const int qhqi = idx / HEAD_SIZE;
+        const int qh   = qhqi / q_len;
+        const int qi   = qhqi % q_len;
+        const int d    = idx % HEAD_SIZE;
+        const int head_idx = head_base + qh;
         const size_t q_off = ((seq_q_offset + (size_t) qi) * (size_t) n_heads + (size_t) head_idx)
                              * (size_t) HEAD_SIZE + (size_t) d;
-        smem_q[qi * HEAD_SIZE + d] = q[q_off];
+        smem_q[qhqi * HEAD_SIZE + d] = q[q_off];
     }
     __syncthreads();
 
-    // Per-thread online-softmax state per query. HEAD_SIZE=128 and
-    // DECODE_NUM_THREADS=128 → VEC_PER_THREAD=1; v_acc stays small even at
-    // MAX_Q=8 (8 floats/thread).
+    // Per-thread online-softmax state per (q_head_in_group, q_token) pair.
+    // Indexed by qhqi = qh * q_len + qi, range 0..total_q-1, total_q ≤ DECODE_MAX_Q.
     constexpr int VEC_PER_THREAD = (HEAD_SIZE + DECODE_NUM_THREADS - 1) / DECODE_NUM_THREADS;
     float v_acc[VEC_PER_THREAD][DECODE_MAX_Q];
     float running_max[DECODE_MAX_Q];
     float running_sum[DECODE_MAX_Q];
     #pragma unroll
-    for (int qi = 0; qi < DECODE_MAX_Q; ++qi) {
-        running_max[qi] = -INFINITY;
-        running_sum[qi] = 0.0f;
+    for (int qhqi = 0; qhqi < DECODE_MAX_Q; ++qhqi) {
+        running_max[qhqi] = -INFINITY;
+        running_sum[qhqi] = 0.0f;
         #pragma unroll
-        for (int v = 0; v < VEC_PER_THREAD; ++v) v_acc[v][qi] = 0.0f;
+        for (int v = 0; v < VEC_PER_THREAD; ++v) v_acc[v][qhqi] = 0.0f;
     }
 
     // Sub-chunk loop: stage K, QK (all queries), softmax (per query),
@@ -394,63 +491,63 @@ __global__ void mt_paged_attention_decode_kernel(
             kv_head_idx, n_kv_heads, tid, wid, lane);
         __syncthreads();
 
-        // ── QK: 1 warp per (token, all queries). For each token slot,
-        // one warp computes q_len dot products against the same K row. ──
+        // ── QK: 1 warp per (token, all queries in GQA group). For each
+        // token slot, one warp computes total_q = num_queries_per_kv * q_len
+        // dot products against the same K row. ──
         #pragma unroll
         for (int t_base = 0; t_base < DECODE_K_TILE_N; t_base += DECODE_NUM_WARPS) {
             const int t     = t_base + wid;
             const int token = sub_start + t;
             if (t < DECODE_K_TILE_N) {
-                for (int qi = 0; qi < q_len; ++qi) {
+                for (int qhqi = 0; qhqi < total_q; ++qhqi) {
                     float qk = 0.0f;
                     if (t < sub_len && token < valid_ctx_max) {
                         #pragma unroll
                         for (int d = lane; d < HEAD_SIZE; d += WARP_SIZE) {
-                            const float qv = __half2float(smem_q[qi * HEAD_SIZE + d]);
+                            const float qv = __half2float(smem_q[qhqi * HEAD_SIZE + d]);
                             const float kv = __half2float(smem_k[t * HEAD_SIZE + d]);
                             qk += qv * kv;
                         }
                         qk = decode_warp_reduce_sum(qk);
                     }
                     if (lane == 0) {
+                        const int qi       = qhqi % q_len;   // all q_heads in a group share q_pos
                         const int q_pos_qi = q_pos_first + qi;
                         const bool visible = (t < sub_len) && (token <= q_pos_qi);
-                        smem_logits[qi * DECODE_K_TILE_N + t] = visible ? (qk * scale) : -INFINITY;
+                        smem_logits[qhqi * DECODE_K_TILE_N + t] = visible ? (qk * scale) : -INFINITY;
                     }
                 }
             }
         }
         __syncthreads();
 
-        // ── Per-query softmax update + V matmul prep ──
-        // We need sub_max[qi] and sub_sum[qi] per query. Reduce via the
-        // block primitives — DECODE_K_TILE_N (16) ≤ NUM_THREADS so the
-        // first 16 threads' logit values cover the sub-chunk.
-        for (int qi = 0; qi < q_len; ++qi) {
+        // ── Per-query softmax update — one update per (q_head, q_token) pair.
+        // total_q ≤ DECODE_MAX_Q, so this loop is short and stable.
+        for (int qhqi = 0; qhqi < total_q; ++qhqi) {
             float local_max = (tid < DECODE_K_TILE_N)
-                              ? smem_logits[qi * DECODE_K_TILE_N + tid]
+                              ? smem_logits[qhqi * DECODE_K_TILE_N + tid]
                               : -INFINITY;
             const float sub_max = decode_block_reduce_max(local_max, red_smem);
 
-            const float new_max = max(running_max[qi], sub_max);
+            const float new_max = max(running_max[qhqi], sub_max);
             float rescale = 1.0f;
-            if (running_max[qi] > -INFINITY) {
-                rescale = __expf(running_max[qi] - new_max);
-                running_sum[qi] *= rescale;
+            if (running_max[qhqi] > -INFINITY) {
+                rescale = __expf(running_max[qhqi] - new_max);
+                running_sum[qhqi] *= rescale;
                 #pragma unroll
-                for (int v = 0; v < VEC_PER_THREAD; ++v) v_acc[v][qi] *= rescale;
+                for (int v = 0; v < VEC_PER_THREAD; ++v) v_acc[v][qhqi] *= rescale;
             }
 
             float local_sum = 0.0f;
             if (tid < DECODE_K_TILE_N) {
-                const float lg = smem_logits[qi * DECODE_K_TILE_N + tid];
+                const float lg = smem_logits[qhqi * DECODE_K_TILE_N + tid];
                 const float e  = (lg == -INFINITY) ? 0.0f : __expf(lg - new_max);
-                smem_logits[qi * DECODE_K_TILE_N + tid] = e;
+                smem_logits[qhqi * DECODE_K_TILE_N + tid] = e;
                 local_sum = e;
             }
             const float sub_sum = decode_block_reduce_sum(local_sum, red_smem);
-            running_sum[qi] += sub_sum;
-            running_max[qi]  = new_max;
+            running_sum[qhqi] += sub_sum;
+            running_max[qhqi]  = new_max;
         }
 
         // ── Stage V (shared by all queries) ──
@@ -460,9 +557,9 @@ __global__ void mt_paged_attention_decode_kernel(
             kv_head_idx, n_kv_heads, tid, wid, lane);
         __syncthreads();
 
-        // ── V matmul: v_acc[qi, d] += Σ_t softmax[qi, t] · V[t, d] ──
-        // Pre-load V column for this thread's d into registers so the
-        // q_len inner loop hits registers, not LDS.
+        // ── V matmul: v_acc[qhqi, d] += Σ_t softmax[qhqi, t] · V[t, d] ──
+        // V is shared across all queries in the GQA group; the inner total_q
+        // loop hits registers (smem_logits) and the pre-loaded v_col.
         #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * DECODE_NUM_THREADS;
@@ -472,30 +569,37 @@ __global__ void mt_paged_attention_decode_kernel(
                 for (int t = 0; t < DECODE_K_TILE_N; ++t) {
                     v_col[t] = __half2float(smem_v[t * HEAD_SIZE + d]);
                 }
-                for (int qi = 0; qi < q_len; ++qi) {
+                for (int qhqi = 0; qhqi < total_q; ++qhqi) {
                     float acc = 0.0f;
                     #pragma unroll
                     for (int t = 0; t < DECODE_K_TILE_N; ++t) {
-                        acc += smem_logits[qi * DECODE_K_TILE_N + t] * v_col[t];
+                        acc += smem_logits[qhqi * DECODE_K_TILE_N + t] * v_col[t];
                     }
-                    v_acc[v][qi] += acc;
+                    v_acc[v][qhqi] += acc;
                 }
             }
         }
         __syncthreads();  // before next sub's stage_k reuses smem_k
     }
 
-    // ── Write per-(chunk, query) partials ──
-    for (int qi = 0; qi < q_len; ++qi) {
-        const size_t off = partial_chunk_base + (size_t) qi * (HEAD_SIZE + 2);
+    // ── Write per-(chunk, head, query) partials ──
+    // Each (qh, qi) lands in a different head_idx slot of the partials
+    // buffer — matches the original "one head per block" layout, so the
+    // reduce kernel doesn't need to change.
+    for (int qhqi = 0; qhqi < total_q; ++qhqi) {
+        const int qh = qhqi / q_len;
+        const int qi = qhqi % q_len;
+        const int head_idx = head_base + qh;
+        const size_t off = partial_chunk_base_for_head(head_idx)
+                         + (size_t) qi * (HEAD_SIZE + 2);
         #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) {
             const int d = tid + v * DECODE_NUM_THREADS;
-            if (d < HEAD_SIZE) partials[off + d] = v_acc[v][qi];
+            if (d < HEAD_SIZE) partials[off + d] = v_acc[v][qhqi];
         }
         if (tid == 0) {
-            partials[off + HEAD_SIZE]     = running_max[qi];
-            partials[off + HEAD_SIZE + 1] = running_sum[qi];
+            partials[off + HEAD_SIZE]     = running_max[qhqi];
+            partials[off + HEAD_SIZE + 1] = running_sum[qhqi];
         }
     }
 }
@@ -588,7 +692,12 @@ void launch_paged_attn_decode(
     const int num_chunks = paged_attn_decode_num_chunks(max_ctx_len);
 
     // Pass 1: per-chunk partials.
-    dim3 grid1(n_heads, num_seqs, num_chunks);
+    // Grid is (n_kv_heads, num_seqs, num_chunks): one block per
+    // (kv_head, seq, chunk). The kernel itself iterates over the
+    // num_queries_per_kv q_heads in the group + the q_len query tokens,
+    // sharing the K/V tiles across them. GQA fanout fix — see kernel
+    // comments and MAD-180 follow-up.
+    dim3 grid1(n_kv_heads, num_seqs, num_chunks);
     dim3 block1(DECODE_NUM_THREADS);
 
     // Smem sizing matches the kernel's layout — see the header comment

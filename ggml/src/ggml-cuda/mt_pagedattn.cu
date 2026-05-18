@@ -1004,8 +1004,22 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // the partials buffer's inner stride fits the largest
                 // seq's queries.
                 const bool decode_env_on  = get_paged_decode_mode() != 0;
+                // GQA fanout (2026-05-18): the decode kernel now processes
+                // num_queries_per_kv * q_len queries per block, capped at
+                // DECODE_MAX_Q=16.
+                //
+                // Bound check uses total_q_tokens as the worst-case "max
+                // q_len in any seq" — avg_q_len would underestimate for
+                // batches with idle slots (4-slot server batch with 1
+                // active spec-decode seq has avg=q_len/4 but the active
+                // seq alone has q_len queries that all hit one grid.y
+                // block). DECODE_MAX_Q must hold for the active seq.
+                const int  num_queries_per_kv = n_heads / n_kv_heads;
+                const int  decode_max_q       = 16;  // matches DECODE_MAX_Q
+                const int  worst_q_len        = total_q_tokens;  // worst case: all in one seq
                 const bool decode_gate_on = decode_env_on
                                             && (avg_q_len >= 1) && (avg_q_len <= 8)
+                                            && (num_queries_per_kv * worst_q_len <= decode_max_q)
                                             && (max_ctx_len >= 8192);
                 if (decode_gate_on) {
                     if (probe_on) {
