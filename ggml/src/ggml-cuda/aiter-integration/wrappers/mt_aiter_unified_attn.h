@@ -22,16 +22,26 @@
 #include <stddef.h>
 
 // ─────────────────────────────────────────────────────────────────────────
-// Spec constants — must match the SIGNATURE block in CMakeLists.txt for
-// uattn_3d / uattn_reduce. Changing these here without re-AOT'ing will
-// silently produce wrong output.
+// Tuning constants — picked once for v1, exposed for future flexibility.
+// These are AITER-side knobs, not model shape (those come in via shape_t):
+//   NUM_SEGMENTS_PER_SEQ: split-K factor for the 3D kernel
+//   BLOCK_Q / BLOCK_M:    q-token blocking inside the kernel
+//   TILE_SIZE:            inner KV tile size
 // ─────────────────────────────────────────────────────────────────────────
-#define MT_AITER_UATTN_NUM_Q_HEADS          16
-#define MT_AITER_UATTN_NUM_KV_HEADS         2
-#define MT_AITER_UATTN_HEAD_SIZE            128
-#define MT_AITER_UATTN_BLOCK_SIZE           16
 #define MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ 32
 #define MT_AITER_UATTN_BLOCK_Q              2
+#define MT_AITER_UATTN_BLOCK_M              16
+#define MT_AITER_UATTN_TILE_SIZE            32
+
+// Model-shape parameters — set by the caller per model. The wrapper builds
+// the Triton signature from these at first call, so the runtime registry
+// can compile a kernel matched to the current shape.
+struct mt_aiter_uattn_shape_t {
+    int32_t head_size;       // per-head embed dim (e.g. 128)
+    int32_t num_q_heads;     // attention head count
+    int32_t num_kv_heads;    // GQA group count (head_count / queries_per_kv)
+    int32_t block_size;      // paged-cache block size in tokens (e.g. 16)
+};
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +63,10 @@ extern "C" {
 //   q/k/v_descale fp32  [1]                              (scalar; pass ones for fp16 path)
 //   out_scale    fp32   [1] or NULL                       (NULL → no output rescale)
 struct mt_aiter_uattn_args_t {
+    // Shape — must be the same across all calls in a process (kernel handles
+    // are cached after first call; subsequent calls with a different shape
+    // abort).
+    struct mt_aiter_uattn_shape_t shape;
     // I/O
     const void    *q;
     const void    *k_cache;
@@ -74,6 +88,7 @@ struct mt_aiter_uattn_args_t {
     // Scalars
     float          scale;          // attention softmax scale (typically 1/sqrt(head_size))
     int32_t        num_seqs;
+    int32_t        num_q_tokens;   // total q tokens across all seqs (= sum of q_lens). For pure decode == num_seqs.
     int64_t        block_table_stride;
     // Strides
     int64_t        q_stride_0;     // bytes per row in q = NUM_Q_HEADS * HEAD_SIZE
@@ -95,10 +110,11 @@ struct mt_aiter_uattn_args_t {
 hipError_t mt_aiter_unified_attn(hipStream_t stream,
                                   const struct mt_aiter_uattn_args_t *args);
 
-// Workspace sizing helpers (in bytes). All use fp32 internally.
-size_t mt_aiter_uattn_segm_output_bytes(int num_q_tokens);
-size_t mt_aiter_uattn_segm_max_bytes(int num_q_tokens);
-size_t mt_aiter_uattn_segm_expsum_bytes(int num_q_tokens);
+// Workspace sizing helpers (in bytes). All use fp32 internally. Take the
+// shape because per-token workspace = num_q_heads * NUM_SEGMENTS * head_size.
+size_t mt_aiter_uattn_segm_output_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
+size_t mt_aiter_uattn_segm_max_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
+size_t mt_aiter_uattn_segm_expsum_bytes(const struct mt_aiter_uattn_shape_t *shape, int num_q_tokens);
 
 #ifdef __cplusplus
 }  // extern "C"

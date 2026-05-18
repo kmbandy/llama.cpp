@@ -202,13 +202,25 @@ foreach(arch ${AITER_AOT_ARCHES})
 endforeach()
 
 # Triton's generated .c files use HIP's runtime API (hipModuleLoad,
-# hipModuleLaunchKernel). We need the HIP headers on the include path
-# and to link against amdhip64. Both are PUBLIC so downstream consumers
-# (test executables, the eventual ggml-hip target) inherit them.
-find_path(HIP_INCLUDE hip/hip_runtime.h PATHS /opt/rocm/include REQUIRED)
-find_library(HIP_RUNTIME amdhip64        PATHS /opt/rocm/lib     REQUIRED)
-target_include_directories(aiter_triton_aot PUBLIC ${HIP_INCLUDE})
-target_link_libraries(aiter_triton_aot      PUBLIC ${HIP_RUNTIME})
+# hipModuleLaunchKernel). When this subdir is built as part of ggml-hip,
+# `hip::host` (from find_package(hip)) is already available and carries the
+# right include dirs + libamdhip64 linkage. When built standalone (for the
+# wrapper smoke tests), we fall back to find_library so the tests don't need
+# the full HIP cmake config.
+#
+# Important: don't call find_library for amdhip64 when hip::host is already
+# imported — the parent's find_package may have stitched amdhip64 together
+# with `rocclr` (a transitive that doesn't exist as a standalone .so on
+# some HIP versions), and a redundant find_library here produces a link
+# command that ends up looking for `-lrocclr` and failing.
+if (TARGET hip::host)
+    target_link_libraries(aiter_triton_aot PUBLIC hip::host)
+else()
+    find_path(HIP_INCLUDE hip/hip_runtime.h PATHS /opt/rocm/include REQUIRED)
+    find_library(HIP_RUNTIME amdhip64        PATHS /opt/rocm/lib     REQUIRED)
+    target_include_directories(aiter_triton_aot PUBLIC ${HIP_INCLUDE})
+    target_link_libraries(aiter_triton_aot      PUBLIC ${HIP_RUNTIME})
+endif()
 
 # HIP's API entry points are declared with `__host__ __device__` etc by default
 # (HIP runtime headers assume hipcc). Compiling with plain gcc/clang requires

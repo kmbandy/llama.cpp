@@ -4,7 +4,8 @@
 // Design adapted from vLLM (Apache 2.0). Code is independent.
 
 #include "mt_pagedattn.cuh"
-#include "mt_pagedattn_ops.cuh"  // paged_cache_ops template + specializations (shared with mt_pagedattn_tile.cu)
+#include "mt_pagedattn_ops.cuh"   // paged_cache_ops template + specializations (shared with mt_pagedattn_tile.cu)
+#include "mt_pagedattn_aiter.cuh" // GGML_HIP_AITER-gated AITER backend (no-op stubs otherwise)
 #include "mt_pagedattn_tile.cuh" // tile FA kernel dispatch entry (launch_paged_attn_tile)
 #include "mt_pagedattn_decode.cuh" // flash-decode kernel dispatch entry (launch_paged_attn_decode, MAD-185)
 #include "turbo-quant.cuh"   // TURBO_CENTROIDS_4BIT, TURBO_WHT_SIGNS{1,2}, turbo_nearest_centroid_4bit
@@ -850,6 +851,15 @@ static void launch_paged_attn(
 }
 
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // MAD-188: if the AITER backend is enabled and compiled in, route the
+    // whole op through it. Scatter and attention both use AITER's KV layout
+    // (different from the layout this file's tile/scalar/decode paths
+    // expect), so the choice is mutually exclusive per process.
+    if (aiter_backend_enabled()) {
+        ggml_cuda_op_paged_attn_mt_aiter(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_cache       = dst->src[1];
     const ggml_tensor * v_cache       = dst->src[2];

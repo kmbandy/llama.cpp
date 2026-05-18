@@ -57,40 +57,49 @@ static float fp16_to_float(fp16_t h) {
     float f; std::memcpy(&f, &out, 4); return f;
 }
 
-int main() {
+// Run the long-ctx 2-class-K correctness test for a given model shape. The
+// runtime registry compiles a kernel for whatever shape we pass — `head=128
+// nq=16 nkv=2` is the historical POC shape; the test now also runs with a
+// real-Qwen-like shape (`head=128 nq=28 nkv=4`) to exercise the
+// shape-derivation path end-to-end.
+static int run_long_ctx_test(const mt_aiter_uattn_shape_t & shape) {
     constexpr int    NUM_SEQS        = 1;
-    constexpr int    CTX_LEN         = 1024;       // 64 paged blocks
+    constexpr int    CTX_LEN         = 1024;       // 64 paged blocks at BS=16
     constexpr int    Q_LEN           = 1;
     constexpr int    TOTAL_Q_TOKENS  = Q_LEN * NUM_SEQS;
-    constexpr int    NUM_BLOCKS      = CTX_LEN / MT_AITER_UATTN_BLOCK_SIZE;
-    constexpr int    MAX_BLKS_PER_SQ = NUM_BLOCKS;
-    constexpr float  SCALE           = 0.0883883f;
+    const int        NUM_BLOCKS      = CTX_LEN / shape.block_size;
+    const int        MAX_BLKS_PER_SQ = NUM_BLOCKS;
+    const float      SCALE           = 1.0f / std::sqrt((float)shape.head_size);
 
-    constexpr size_t Q_ELEMS        = (size_t)TOTAL_Q_TOKENS
-                                    * MT_AITER_UATTN_NUM_Q_HEADS
-                                    * MT_AITER_UATTN_HEAD_SIZE;
-    constexpr size_t KV_CACHE_ELEMS = (size_t)NUM_BLOCKS
-                                    * MT_AITER_UATTN_BLOCK_SIZE
-                                    * MT_AITER_UATTN_NUM_KV_HEADS
-                                    * MT_AITER_UATTN_HEAD_SIZE;
+    const size_t Q_ELEMS        = (size_t)TOTAL_Q_TOKENS
+                                * shape.num_q_heads
+                                * shape.head_size;
+    const size_t KV_CACHE_ELEMS = (size_t)NUM_BLOCKS
+                                * shape.block_size
+                                * shape.num_kv_heads
+                                * shape.head_size;
+
+    printf("\n──── shape: head_size=%d num_q_heads=%d num_kv_heads=%d block_size=%d (GQA=%d) ────\n",
+           shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size,
+           shape.num_q_heads / shape.num_kv_heads);
 
     // ── Host inputs ─────────────────────────────────────────────────────────
     std::vector<fp16_t>  q_h(Q_ELEMS, float_to_fp16(1.0f));
     std::vector<fp16_t>  k_h(KV_CACHE_ELEMS);
     std::vector<fp16_t>  v_h(KV_CACHE_ELEMS);
     for (int blk = 0; blk < NUM_BLOCKS; ++blk) {
-        for (int t = 0; t < MT_AITER_UATTN_BLOCK_SIZE; ++t) {
-            int gtok = blk * MT_AITER_UATTN_BLOCK_SIZE + t;
+        for (int t = 0; t < shape.block_size; ++t) {
+            int gtok = blk * shape.block_size + t;
             float kval     = (gtok < CTX_LEN / 2) ? 0.0f : 1.0f;
             float gtok_n   = (float)gtok / (float)CTX_LEN;
-            for (int kvh = 0; kvh < MT_AITER_UATTN_NUM_KV_HEADS; ++kvh) {
-                for (int d = 0; d < MT_AITER_UATTN_HEAD_SIZE; ++d) {
-                    size_t off = ((size_t)blk * MT_AITER_UATTN_BLOCK_SIZE + t)
-                               * MT_AITER_UATTN_NUM_KV_HEADS * MT_AITER_UATTN_HEAD_SIZE
-                               + (size_t)kvh * MT_AITER_UATTN_HEAD_SIZE + d;
+            for (int kvh = 0; kvh < shape.num_kv_heads; ++kvh) {
+                for (int d = 0; d < shape.head_size; ++d) {
+                    size_t off = ((size_t)blk * shape.block_size + t)
+                               * shape.num_kv_heads * shape.head_size
+                               + (size_t)kvh * shape.head_size + d;
                     k_h[off] = float_to_fp16(kval);
                     v_h[off] = float_to_fp16((kvh + 1.0f)
-                              * ((float)d / (float)MT_AITER_UATTN_HEAD_SIZE)
+                              * ((float)d / (float)shape.head_size)
                               * gtok_n);
                 }
             }
@@ -119,9 +128,9 @@ int main() {
     CHECK(hipMalloc(&k_descale_d,  sizeof(float)));
     CHECK(hipMalloc(&v_descale_d,  sizeof(float)));
     CHECK(hipMalloc(&out_scale_d,  sizeof(float)));
-    CHECK(hipMalloc(&segm_out_d,   mt_aiter_uattn_segm_output_bytes(TOTAL_Q_TOKENS)));
-    CHECK(hipMalloc(&segm_max_d,   mt_aiter_uattn_segm_max_bytes(TOTAL_Q_TOKENS)));
-    CHECK(hipMalloc(&segm_expsum_d,mt_aiter_uattn_segm_expsum_bytes(TOTAL_Q_TOKENS)));
+    CHECK(hipMalloc(&segm_out_d,   mt_aiter_uattn_segm_output_bytes(&shape, TOTAL_Q_TOKENS)));
+    CHECK(hipMalloc(&segm_max_d,   mt_aiter_uattn_segm_max_bytes(&shape, TOTAL_Q_TOKENS)));
+    CHECK(hipMalloc(&segm_expsum_d,mt_aiter_uattn_segm_expsum_bytes(&shape, TOTAL_Q_TOKENS)));
 
     CHECK(hipMemcpy(q_d,           q_h.data(),            q_h.size()           * sizeof(fp16_t), hipMemcpyHostToDevice));
     CHECK(hipMemcpy(k_d,           k_h.data(),            k_h.size()           * sizeof(fp16_t), hipMemcpyHostToDevice));
@@ -140,6 +149,7 @@ int main() {
 
     // ── Build wrapper arg bundle ────────────────────────────────────────────
     mt_aiter_uattn_args_t args = {};
+    args.shape         = shape;
     args.q             = q_d;
     args.k_cache       = k_d;
     args.v_cache       = v_d;
@@ -156,23 +166,26 @@ int main() {
     args.out_scale     = (const float*)out_scale_d;
     args.scale              = SCALE;
     args.num_seqs           = NUM_SEQS;
+    args.num_q_tokens       = TOTAL_Q_TOKENS;
     args.block_table_stride = MAX_BLKS_PER_SQ;
-    args.q_stride_0         = (int64_t)MT_AITER_UATTN_NUM_Q_HEADS * MT_AITER_UATTN_HEAD_SIZE;
+    args.q_stride_0         = (int64_t)shape.num_q_heads * shape.head_size;
     args.output_stride_0    = args.q_stride_0;
-    args.k_stride_0         = (int64_t)MT_AITER_UATTN_BLOCK_SIZE
-                            * MT_AITER_UATTN_NUM_KV_HEADS * MT_AITER_UATTN_HEAD_SIZE;
-    args.k_stride_1         = (int64_t)MT_AITER_UATTN_NUM_KV_HEADS * MT_AITER_UATTN_HEAD_SIZE;
-    args.k_stride_2         = MT_AITER_UATTN_HEAD_SIZE;
+    args.k_stride_0         = (int64_t)shape.block_size * shape.num_kv_heads * shape.head_size;
+    args.k_stride_1         = (int64_t)shape.num_kv_heads * shape.head_size;
+    args.k_stride_2         = shape.head_size;
     args.v_stride_0         = args.k_stride_0;
     args.v_stride_1         = args.k_stride_1;
     args.v_stride_2         = args.k_stride_2;
 
-    printf("test_mt_aiter_unified_attn: ctx=%d (%d blocks, %d segments)\n",
-           CTX_LEN, NUM_BLOCKS, MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ);
-    printf("  Q=1.0, K 2-class step, V varying. QK class-B score = %.4f.\n",
-           SCALE * MT_AITER_UATTN_HEAD_SIZE);
+    printf("  ctx=%d (%d blocks, %d segments)  scale=%.4f  QK class-B score=%.4f\n",
+           CTX_LEN, NUM_BLOCKS, MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,
+           SCALE, SCALE * shape.head_size);
 
-    CHECK(mt_aiter_unified_attn(stream, &args));
+    hipError_t rc = mt_aiter_unified_attn(stream, &args);
+    if (rc != hipSuccess) {
+        fprintf(stderr, "mt_aiter_unified_attn failed: %s\n", hipGetErrorString(rc));
+        return 1;
+    }
     CHECK(hipStreamSynchronize(stream));
     printf("  ✓ mt_aiter_unified_attn returned hipSuccess\n");
 
@@ -192,12 +205,12 @@ int main() {
     float max_err = 0.0f, worst_rel = 0.0f;
     int   print_sample = 0;
 
-    for (int h = 0; h < MT_AITER_UATTN_NUM_Q_HEADS; ++h) {
-        int kvh = h / (MT_AITER_UATTN_NUM_Q_HEADS / MT_AITER_UATTN_NUM_KV_HEADS);
-        for (int d = 0; d < MT_AITER_UATTN_HEAD_SIZE; ++d) {
-            size_t idx = (size_t)h * MT_AITER_UATTN_HEAD_SIZE + d;
+    for (int h = 0; h < shape.num_q_heads; ++h) {
+        int kvh = h / (shape.num_q_heads / shape.num_kv_heads);
+        for (int d = 0; d < shape.head_size; ++d) {
+            size_t idx = (size_t)h * shape.head_size + d;
             float actual   = fp16_to_float(out_h[idx]);
-            float expected = (kvh + 1.0f) * ((float)d / (float)MT_AITER_UATTN_HEAD_SIZE)
+            float expected = (kvh + 1.0f) * ((float)d / (float)shape.head_size)
                            * (float)ref_mean;
             if (std::isnan(actual) || std::isinf(actual)) nan_count++;
             if (out_h[idx] == SENTINEL) sentinel_count++;
@@ -217,13 +230,11 @@ int main() {
         }
     }
 
-    printf("\nresult: nan/inf=%d  sentinel-unchanged=%d  mismatch=%d/%zu  max_err=%.5f  worst_rel=%.4f%%\n",
+    printf("  result: nan/inf=%d  sentinel=%d  mismatch=%d/%zu  max_err=%.5f  worst_rel=%.4f%%\n",
            nan_count, sentinel_count, mismatch_count, Q_ELEMS, max_err, worst_rel * 100);
 
     bool pass = (nan_count == 0) && (sentinel_count == 0) && (mismatch_count == 0);
-    printf("%s\n", pass
-        ? "✓ mt_aiter_unified_attn long-ctx test PASSED"
-        : "✗ mt_aiter_unified_attn long-ctx test FAILED");
+    printf("  %s\n", pass ? "✓ PASSED" : "✗ FAILED");
 
     CHECK(hipStreamDestroy(stream));
     CHECK(hipFree(q_d));   CHECK(hipFree(k_d));   CHECK(hipFree(v_d));   CHECK(hipFree(out_d));
@@ -234,4 +245,22 @@ int main() {
     CHECK(hipFree(segm_expsum_d));
 
     return pass ? 0 : 2;
+}
+
+int main() {
+    // Single-process AITER cache supports one shape, so we can only test one
+    // shape per run. Default: POC shape (h=128/nq=16/nkv=2/bs=16). Override
+    // with AITER_TEST_SHAPE="h,nq,nkv,bs" — useful for the Qwen-shape probe.
+    mt_aiter_uattn_shape_t shape = {128, 16, 2, 16};
+    const char * env = std::getenv("AITER_TEST_SHAPE");
+    if (env && *env) {
+        int h, nq, nkv, bs;
+        if (std::sscanf(env, "%d,%d,%d,%d", &h, &nq, &nkv, &bs) == 4) {
+            shape = {h, nq, nkv, bs};
+        } else {
+            fprintf(stderr, "AITER_TEST_SHAPE must be \"head,nq,nkv,bs\" (got %s)\n", env);
+            return 1;
+        }
+    }
+    return run_long_ctx_test(shape);
 }
