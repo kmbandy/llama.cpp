@@ -672,6 +672,65 @@ return hipModuleLaunchKernel(mod_func, gX, gY, gZ, ...);
 So the per-process state is one `hipModule_t` per launcher per process,
 shared across all callers, freed only via the explicit `unload_*` function.
 
+### 7.1.2 Verified `unified_attention` correctness (POC 2026-05-17)
+
+The full AITER attention dispatch path (2D fused + 3D split-K + reduce_segments)
+was AOT-compiled for gfx1201 and validated bit-exact on the R9700 across four
+configurations of growing strictness:
+
+| Test | ctx_len | blocks | K pattern | V pattern | Result |
+|------|---------|--------|-----------|-----------|--------|
+| 2D fused | 16 | 1 | uniform 1.0 | (kvh+1)*(d/128) | 0/2048 mismatch, max_err 0.0 |
+| 3D + reduce | 16 | 1 | uniform 1.0 | (kvh+1)*(d/128) | 0/2048, max_err 0.0 |
+| 3D + reduce multi-block | 64 | 4 | uniform 1.0 | (kvh+1)*(d/128)*(t/ctx) | 0/2048, max_err 3.7e-4 |
+| 3D + reduce long-ctx | 1024 | 64 | 2-class step (0/1) | (kvh+1)*(d/128)*(t/ctx) | 0/2048, max_err 4.8e-4 |
+
+The 1024-token test was the first that exercised softmax on **non-uniform QK
+scores** — i.e., the first test where the value of `scale` actually mattered.
+Uniform-K configs (all earlier tests) produce identical QK scores across tokens,
+which softmax always normalizes to a uniform distribution regardless of `scale`.
+
+**Critical Triton AOT bug surfaced by the long-ctx test:** the generated C
+launcher declares `fp32` kernel-signature scalars as **`double`** in the C
+function prototype. The args-pointer construction then passes `&scalar` (an
+8-byte `double*`) to `hipModuleLaunchKernel`, which copies `sizeof(fp32)` = 4
+bytes — i.e., **the low 4 bytes of the IEEE 754 double representation**. For
+typical positive scalar values that's a denormal float, effectively zero.
+
+Effect: `scale = 0.0883883` becomes `~0` inside the kernel, so
+`qk_scale = scale * RCP_LN2 = ~0`, `S = qk_scale * tl.dot(Q, K) = ~0`, and
+softmax(zeros) = uniform → output ignores K entirely. The previous uniform-K
+tests "passed" because uniform-K already produces uniform softmax — the bug was
+silently invisible until we tested non-uniform K.
+
+**The fix** (applied to vendored AITER kernels in `aiter-integration/kernels/`):
+edit the generated `.c` launcher to convert at the boundary before packing args:
+
+```c
+hipError_t kernel_3d_<spec-hash>(hipStream_t stream, ..., double scale_in, ...) {
+    float scale = (float)scale_in;      // PATCH: AOT signature is fp32 but
+    float softcap = (float)softcap_in;  // C declared `double`; convert at boundary.
+    void *args[N] = { ..., &scale, ..., &softcap, ... };
+    return hipModuleLaunchKernel(...);
+}
+```
+
+This is a Triton AOT toolchain bug (not AITER's fault). The correct upstream fix
+is for `python/triton/tools/compile.py` to emit `float` in the C signature when
+the Triton signature slot is `fp32`. Filed as draft upstream issue
+[03-triton-aot-fp32-scalar-truncation.md](upstream-issues/03-triton-aot-fp32-scalar-truncation.md).
+
+**Practical implication for our integration:** any post-AOT step that wraps the
+generated `.c` files must either (a) apply this `(float)scalar_in` patch, or
+(b) wait for upstream Triton fix. The TritonAOT.cmake function should grow a
+post-process step that does (a) automatically — added as a TODO in the cmake.
+
+**Reproducers** (all in `ggml/src/ggml-cuda/aiter-integration/wrappers/`):
+- `POC-test_uattn_2d.cpp` — 2D fused single-block
+- `POC-test_uattn_3d_reduce.cpp` — 3D + reduce single-block
+- `POC-test_uattn_3d_multiblock.cpp` — 4-block paged walk, uniform K
+- `POC-test_uattn_3d_longctx.cpp` — 64-block + non-uniform K (the one that caught the scale bug)
+
 ### 7.2 KV cache layout convergence
 
 **Migration target:**
