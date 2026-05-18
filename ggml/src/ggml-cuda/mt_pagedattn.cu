@@ -6,6 +6,7 @@
 #include "mt_pagedattn.cuh"
 #include "mt_pagedattn_ops.cuh"  // paged_cache_ops template + specializations (shared with mt_pagedattn_tile.cu)
 #include "mt_pagedattn_tile.cuh" // tile FA kernel dispatch entry (launch_paged_attn_tile)
+#include "mt_pagedattn_decode.cuh" // flash-decode kernel dispatch entry (launch_paged_attn_decode, MAD-185)
 #include "turbo-quant.cuh"   // TURBO_CENTROIDS_4BIT, TURBO_WHT_SIGNS{1,2}, turbo_nearest_centroid_4bit
 
 #include <cmath>
@@ -69,6 +70,21 @@ static int get_paged_tile_multiwarp_mode() {
         const char * env = std::getenv("GGML_PAGED_TILE_MULTIWARP");
         mode = (env == nullptr || env[0] != '0') ? 1 : 0;
         GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_TILE_MULTIWARP=%d (multi-warp %s when tile path active)\n",
+                      mode, mode ? "enabled" : "disabled");
+    }
+    return mode;
+}
+
+// MAD-185: flash-decode kernel toggle. Fires when q_len is small (decode
+// or tiny prefill) AND ctx is long enough that split-K parallelism beats
+// the scalar kernel's per-block fixed cost. Default ON; set
+// GGML_PAGED_DECODE=0 to force the scalar fallback (the prior path).
+static int get_paged_decode_mode() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = std::getenv("GGML_PAGED_DECODE");
+        mode = (env == nullptr || env[0] != '0') ? 1 : 0;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_DECODE=%d (flash-decode %s for small q_len + long ctx)\n",
                       mode, mode ? "enabled" : "disabled");
     }
     return mode;
@@ -935,6 +951,56 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                             avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
                             scale, stream);
                     }
+                    return;
+                }
+
+                // MAD-185: flash-decode gate. Fires when q_len is small
+                // (q_len==1 for pure decode; up to 8 to cover MTP
+                // spec-decode draft-verify batches — this is the *MTP*
+                // qwen36 model, the path that matters) AND ctx is long
+                // enough that split-K parallelism beats the scalar
+                // kernel's per-block fixed cost. 8K threshold is
+                // conservative — tune later via env var if needed.
+                //
+                // avg_q_len = total_q_tokens / num_seqs. For uniform
+                // decode batches it equals each seq's q_len; for the
+                // (rare) heterogeneous case we use it as max_q_len so
+                // the partials buffer's inner stride fits the largest
+                // seq's queries.
+                const bool decode_env_on  = get_paged_decode_mode() != 0;
+                const bool decode_gate_on = decode_env_on
+                                            && (avg_q_len >= 1) && (avg_q_len <= 8)
+                                            && (max_ctx_len >= 8192);
+                if (decode_gate_on) {
+                    // Same scatter contract as the tile path — pre-stage
+                    // new K/V into the cache before attention reads from it.
+                    launch_scatter_kv<CT, __half, HS, BS>(
+                        k_cache->data,
+                        v_cache->data,
+                        (const __half *) k_cur->data,
+                        (const __half *) v_cur->data,
+                        (const int32_t *) slot_mapping->data,
+                        (const int32_t *) q_lens->data,
+                        num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
+
+                    const int num_chunks    = paged_attn_decode_num_chunks(max_ctx_len);
+                    const int max_q_len     = avg_q_len;  // see comment above
+                    const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
+                                            * (size_t) num_chunks * (size_t) max_q_len
+                                            * (size_t) (HS + 2);
+                    ggml_cuda_pool_alloc<float> partials(ctx.pool(), partials_n);
+
+                    launch_paged_attn_decode<HS, BS, CT>(
+                        (__half *) dst->data,
+                        (const __half *) q->data,
+                        k_cache->data,
+                        v_cache->data,
+                        (const int32_t *) block_tables->data,
+                        (const int32_t *) context_lens->data,
+                        (const int32_t *) q_lens->data,
+                        partials.get(),
+                        num_seqs, n_heads, n_kv_heads, max_bps, max_ctx_len, max_q_len,
+                        scale, stream);
                     return;
                 }
             }

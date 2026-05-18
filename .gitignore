@@ -158,6 +158,7 @@ a.out.*x
 .gitnexus
 .claude/
 .agent.md
+.rocprofv3/
 
 # AGENTS
 AGENTS.local.md
