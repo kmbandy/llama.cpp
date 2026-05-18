@@ -23,6 +23,11 @@ if(TARGET TritonAOT::Helpers)
     return()  # already loaded
 endif()
 
+# Capture this module's directory at load time. Used inside
+# add_triton_aot_kernel() to locate patch_triton_aot.py — CMAKE_CURRENT_LIST_DIR
+# would otherwise resolve to the caller's directory at function-invocation time.
+set(_TRITON_AOT_CMAKE_DIR ${CMAKE_CURRENT_LIST_DIR})
+
 # ────────────────────────────────────────────────────────────────────────
 # Prerequisites — find the Python interpreter that has Triton installed.
 # We don't make Triton a hard CMake requirement (development-only dep);
@@ -159,8 +164,17 @@ function(add_triton_aot_kernel)
 
     file(MAKE_DIRECTORY ${ARG_OUT_DIR})
 
-    # Parse SPECS — it's a flat list that we walk in 5-key blocks:
-    #   SIGNATURE "...", GRID "...", NUM_WARPS N, NUM_STAGES N, ARCH arch
+    # Parse SPECS — it's a flat list that we walk in 6-key blocks:
+    #   SIGNATURE "...", GRID "...", NUM_WARPS N, NUM_STAGES N, ARCH arch,
+    #   FP32_SCALARS "comma,sep,names" | NONE
+    #
+    # FP32_SCALARS lists the runtime kernel args declared `fp32` in the Triton
+    # signature. Triton's AOT generator emits these as `double NAME` in the C
+    # launcher (silent fp32-truncation bug surfaced 2026-05-17 / MAD-188). The
+    # post-AOT patch step (patch_triton_aot.py) rewrites them to `float NAME`.
+    # Pass the literal `NONE` for kernels with no runtime fp32 scalars (e.g.
+    # vector_add) — CMake's list(APPEND) drops empty strings, so we use a
+    # sentinel and translate to "" in the parser.
     set(c_files)
     set(h_files)
     set(i 0)
@@ -171,8 +185,9 @@ function(add_triton_aot_kernel)
         set(num_warps 4)
         set(num_stages 1)
         set(arch "")
-        # Read 10 elements: 5 keys + 5 values
-        foreach(_unused RANGE 0 4)
+        set(fp32_scalars "")
+        # Read 12 elements: 6 keys + 6 values
+        foreach(_unused RANGE 0 5)
             list(GET ARG_SPECS ${i} key)
             math(EXPR i_plus "${i} + 1")
             list(GET ARG_SPECS ${i_plus} value)
@@ -186,6 +201,12 @@ function(add_triton_aot_kernel)
                 set(num_stages ${value})
             elseif(key STREQUAL "ARCH")
                 set(arch ${value})
+            elseif(key STREQUAL "FP32_SCALARS")
+                if(value STREQUAL "NONE")
+                    set(fp32_scalars "")
+                else()
+                    set(fp32_scalars "${value}")
+                endif()
             else()
                 message(FATAL_ERROR "add_triton_aot_kernel: unknown SPEC key '${key}'")
             endif()
@@ -197,6 +218,15 @@ function(add_triton_aot_kernel)
         endif()
 
         _triton_aot_target(target_str ${arch})
+
+        # Pass `--strict` to the patch script only when there's something to
+        # patch — empty FP32_SCALARS means "no runtime fp32 scalars in this
+        # spec," and the script's no-op exit is correct.
+        if(fp32_scalars STREQUAL "")
+            set(_strict_arg)
+        else()
+            set(_strict_arg "--strict")
+        endif()
 
         # Suffix is the triton-generated hash (we can't predict it offline
         # for byte-perfect path matching), so we emit into a per-arch
@@ -222,9 +252,20 @@ function(add_triton_aot_kernel)
                 --num-stages ${num_stages}
                 --out-name ${ARG_NAME}
                 --out-path ${out_subdir}/${ARG_NAME}
+            # Post-AOT patch: fix Triton's fp32-scalar truncation bug (MAD-188).
+            # Strict mode — fail-fast if upstream Triton changes the emission
+            # pattern (or if FP32_SCALARS names are wrong). Skips silently when
+            # FP32_SCALARS is empty. (Computed as a plain CMake var rather than
+            # an inline $<BOOL:...> genex because the comma in "scale,softcap"
+            # would break genex parsing.)
+            COMMAND ${Python3_EXECUTABLE} ${_TRITON_AOT_CMAKE_DIR}/patch_triton_aot.py
+                --out-dir ${out_subdir}
+                --kernel-name ${ARG_NAME}
+                --fp32-scalars "${fp32_scalars}"
+                ${_strict_arg}
             COMMAND ${CMAKE_COMMAND} -E touch ${stamp}
-            DEPENDS ${ARG_SOURCE}
-            COMMENT "Triton AOT: ${ARG_NAME} → ${target_str} (warps=${num_warps}, stages=${num_stages})"
+            DEPENDS ${ARG_SOURCE} ${_TRITON_AOT_CMAKE_DIR}/patch_triton_aot.py
+            COMMENT "Triton AOT: ${ARG_NAME} → ${target_str} (warps=${num_warps}, stages=${num_stages}, fp32_scalars=[${fp32_scalars}])"
             VERBATIM
         )
 

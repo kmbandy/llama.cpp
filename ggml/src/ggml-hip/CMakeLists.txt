@@ -172,3 +172,16 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# AITER Triton AOT integration (MAD-188). Off by default; opt in with
+# -DGGML_HIP_AITER=ON. Adds AOT-compiled AITER unified_attention kernels plus
+# the mt_aiter_unified_attn wrapper to ggml-hip. Source code dispatches on the
+# GGML_HIP_AITER compile definition; the runtime call site is further gated by
+# the MAD_USE_AITER env var so we can A/B against the existing tile kernel
+# without a rebuild.
+option(GGML_HIP_AITER "Enable AITER Triton AOT attention kernels (MAD-188)" OFF)
+if (GGML_HIP_AITER)
+    add_subdirectory(../ggml-cuda/aiter-integration aiter-integration)
+    target_link_libraries(ggml-hip PRIVATE aiter_triton_aot)
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_AITER)
+endif()
