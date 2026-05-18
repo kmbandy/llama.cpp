@@ -193,4 +193,8 @@ tests/results/
 tests/cmake_install.cmake
 Makefile
 *.cmake
+# Our aiter-integration sub-tree ships hand-written .cmake source modules.
+# The broad *.cmake ignore above was meant for generated CMake artifacts
+# (cmake_install.cmake etc); negate it for our scaffolding.
+!ggml/src/ggml-cuda/aiter-integration/cmake/*.cmake
 .mneme-code
