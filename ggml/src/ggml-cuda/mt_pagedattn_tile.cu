@@ -251,6 +251,90 @@ static __device__ __forceinline__ void coop_stage_turbo4_tile(
     }
 }
 
+// ── cooperative TURBO3_0 dequant ────────────────────────────────────────
+//
+// Same pipeline as coop_stage_turbo4_tile (see comment above for the
+// per-element vs. cooperative trade), but TURBO3_0's block layout differs:
+//
+//   qs[QK_TURBO3/4 = 32]    : 4 × 2-bit low indices per byte
+//   signs[QK_TURBO3/8 = 16] : 8 × 1-bit high bits per byte
+//
+// 32 lanes × 4 elements each = 128 elements per qblock. Each lane reads
+//   • 1 byte of qs (its 4 elements' low2 bits): qs[lane_id]
+//   • 1 byte of signs (8 elements' high1 bits, this lane covers 4):
+//     signs[lane_id / 2], with this lane's 4 fields starting at bit
+//     (lane_id % 2) * 4.
+template <int HEAD_SIZE, int BLOCK_SIZE, int N_WARPS>
+static __device__ __forceinline__ void coop_stage_turbo3_tile(
+        __half        * __restrict__ smem_dst,
+        const void    * __restrict__ cache,
+        const int     * __restrict__ seq_block_table,
+        int            k_tile_start,
+        int            block_valid_ctx,
+        int            kv_head_idx,
+        int            n_kv_heads,
+        int            warp_id,
+        int            lane_id) {
+    constexpr int Q_BLOCK            = QK_TURBO3;  // 128
+    constexpr int QBLOCKS_PER_TOKEN  = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_QBLOCKS_PER_TILE = K_TILE_N * QBLOCKS_PER_TOKEN;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be multiple of QK_TURBO3=128");
+    static_assert(Q_BLOCK == 128, "cooperative dequant expects QK_TURBO3=128 (32 lanes × 4 elements)");
+
+    const block_turbo3_0 * blocks = (const block_turbo3_0 *) cache;
+
+    #pragma unroll
+    for (int qb = warp_id; qb < N_QBLOCKS_PER_TILE; qb += N_WARPS) {
+        const int row         = qb / QBLOCKS_PER_TOKEN;
+        const int qb_in_token = qb % QBLOCKS_PER_TOKEN;
+        const int token       = k_tile_start + row;
+
+        const block_turbo3_0 * blk = nullptr;
+        float norm_f = 0.0f;
+
+        if (token < block_valid_ctx) {
+            const int logical_block = token / BLOCK_SIZE;
+            const int tok_in_block  = token % BLOCK_SIZE;
+            const int physical      = seq_block_table[logical_block];
+            if (physical != kInvalidBlockTableEntry) {
+                const int64_t ib = ((int64_t) physical * n_kv_heads + kv_head_idx) * BLOCK_SIZE * QBLOCKS_PER_TOKEN
+                                 + (int64_t) tok_in_block * QBLOCKS_PER_TOKEN
+                                 + (int64_t) qb_in_token;
+                blk = &blocks[ib];
+                if (lane_id == 0) {
+                    norm_f = __half2float(blk->norm);
+                }
+            }
+        }
+
+        // Broadcast norm from lane 0 to all 32 lanes of this warp.
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+
+        // Each lane reads 1 byte of qs (its 4 elements' low2 bits) and 1
+        // byte of signs (covers this lane's 4 elements' high1 bits, plus
+        // 4 belonging to the lane-paired neighbor).
+        uint8_t qs_byte    = 0;
+        uint8_t signs_byte = 0;
+        if (blk != nullptr) {
+            qs_byte    = blk->qs[lane_id];
+            signs_byte = blk->signs[lane_id / 2];
+        }
+        const int signs_shift_base = (lane_id % 2) * 4;
+
+        const int smem_row_base = row * HEAD_SIZE;
+        const int smem_col_base = qb_in_token * Q_BLOCK + lane_id * 4;
+
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t low2 = (qs_byte    >> (l * 2)) & 0x3;
+            const uint8_t hi1  = (signs_byte >> (signs_shift_base + l)) & 0x1;
+            const uint8_t idx  = low2 | (hi1 << 2);
+            const float   val  = TURBO_CENTROIDS_3BIT[idx] * norm_f;
+            smem_dst[smem_row_base + smem_col_base + l] = __float2half(val);
+        }
+    }
+}
+
 // ── kernel ──────────────────────────────────────────────────────────────
 
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
@@ -669,11 +753,15 @@ __global__ void mt_paged_attention_tile_mw_kernel(
 
     // ── K-tile loop (block-shared K/V) ─────────────────────────────────
     for (int k_tile_start = 0; k_tile_start < block_valid_ctx; k_tile_start += K_TILE_N) {
-        // Cooperative K load. TURBO4_0 uses the cooperative dequant path
-        // (norm shared across the 128-element qblock, coalesced qs bytes,
+        // Cooperative K load. TURBO4_0 / TURBO3_0 use the cooperative dequant
+        // path (norm shared across the 128-element qblock, coalesced qs bytes,
         // 4 elements/lane); F16 uses the per-element typed load.
         if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
             coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+            coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
                 smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
                 kv_head_idx, n_kv_heads, warp_id, lane_id);
         } else {
@@ -807,10 +895,14 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             }
         }
 
-        // Cooperative V load (same dispatch as K above; TURBO4_0's V buffer
-        // shares the K layout per paged_cache_ops<TURBO4_0>).
+        // Cooperative V load (same dispatch as K above; turbo*'s V buffer
+        // shares the K layout per paged_cache_ops<TURBO*_0>).
         if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
             coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_v, v_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+            coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
                 smem_v, v_cache, seq_block_table, k_tile_start, block_valid_ctx,
                 kv_head_idx, n_kv_heads, warp_id, lane_id);
         } else {
@@ -922,6 +1014,10 @@ template void launch_paged_attn_tile<128, 16, GGML_TYPE_TURBO4_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile<128, 16, GGML_TYPE_TURBO3_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 // HEAD_SIZE=256 — Qwen3.5/3.6 paged-attn shape (n_embd_head_v=128 doubled
 // per-q-row by the layout). Uses 16 mma ops per (Q tile, K tile) pair.
 template void launch_paged_attn_tile<256, 16, GGML_TYPE_F16>(
@@ -929,6 +1025,10 @@ template void launch_paged_attn_tile<256, 16, GGML_TYPE_F16>(
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO4_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO3_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
@@ -944,11 +1044,19 @@ template void launch_paged_attn_tile_mw<128, 16, GGML_TYPE_TURBO4_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile_mw<128, 16, GGML_TYPE_TURBO3_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_F16>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO4_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO3_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);

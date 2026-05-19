@@ -257,6 +257,75 @@ static __device__ __forceinline__ void decode_coop_stage_turbo4(
     }
 }
 
+// TURBO3_0 cooperative dequant for the decode tile. Same threading shape as
+// decode_coop_stage_turbo4 (32 lanes × 4 elements per qblock), but unpacks
+// the 3-bit index as (qs low-2 | signs hi-1).
+template <int HEAD_SIZE, int BLOCK_SIZE>
+static __device__ __forceinline__ void decode_coop_stage_turbo3(
+        __half        * __restrict__ smem_dst,
+        const void    * __restrict__ cache,
+        const int     * __restrict__ seq_block_table,
+        int            tile_start,
+        int            valid_ctx,
+        int            kv_head_idx,
+        int            n_kv_heads,
+        int            warp_id,
+        int            lane_id) {
+    constexpr int Q_BLOCK            = QK_TURBO3;
+    constexpr int QBLOCKS_PER_TOKEN  = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_QBLOCKS_PER_TILE = DECODE_K_TILE_N * QBLOCKS_PER_TOKEN;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be multiple of QK_TURBO3=128");
+    static_assert(Q_BLOCK == 128, "cooperative dequant expects QK_TURBO3=128 (32 lanes × 4 elements)");
+
+    const block_turbo3_0 * blocks = (const block_turbo3_0 *) cache;
+
+    #pragma unroll
+    for (int qb = warp_id; qb < N_QBLOCKS_PER_TILE; qb += DECODE_NUM_WARPS) {
+        const int row         = qb / QBLOCKS_PER_TOKEN;
+        const int qb_in_token = qb % QBLOCKS_PER_TOKEN;
+        const int token       = tile_start + row;
+
+        const block_turbo3_0 * blk = nullptr;
+        float norm_f = 0.0f;
+
+        if (token < valid_ctx) {
+            const int logical_block = token / BLOCK_SIZE;
+            const int tok_in_block  = token % BLOCK_SIZE;
+            const int physical      = seq_block_table[logical_block];
+            if (physical != kInvalidBlockTableEntry) {
+                const int64_t ib = ((int64_t) physical * n_kv_heads + kv_head_idx) * BLOCK_SIZE * QBLOCKS_PER_TOKEN
+                                 + (int64_t) tok_in_block * QBLOCKS_PER_TOKEN
+                                 + (int64_t) qb_in_token;
+                blk = &blocks[ib];
+                if (lane_id == 0) {
+                    norm_f = __half2float(blk->norm);
+                }
+            }
+        }
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+
+        uint8_t qs_byte    = 0;
+        uint8_t signs_byte = 0;
+        if (blk != nullptr) {
+            qs_byte    = blk->qs[lane_id];
+            signs_byte = blk->signs[lane_id / 2];
+        }
+        const int signs_shift_base = (lane_id % 2) * 4;
+
+        const int smem_row_base = row * HEAD_SIZE;
+        const int smem_col_base = qb_in_token * Q_BLOCK + lane_id * 4;
+
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t low2 = (qs_byte    >> (l * 2)) & 0x3;
+            const uint8_t hi1  = (signs_byte >> (signs_shift_base + l)) & 0x1;
+            const uint8_t idx  = low2 | (hi1 << 2);
+            const float   val  = TURBO_CENTROIDS_3BIT[idx] * norm_f;
+            smem_dst[smem_row_base + smem_col_base + l] = __float2half(val);
+        }
+    }
+}
+
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
 static __device__ __forceinline__ void decode_stage_k(
         __half        * __restrict__ smem_dst,
@@ -271,6 +340,10 @@ static __device__ __forceinline__ void decode_stage_k(
         int            lane_id) {
     if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
         decode_coop_stage_turbo4<HEAD_SIZE, BLOCK_SIZE>(
+            smem_dst, cache, seq_block_table, tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, warp_id, lane_id);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+        decode_coop_stage_turbo3<HEAD_SIZE, BLOCK_SIZE>(
             smem_dst, cache, seq_block_table, tile_start, valid_ctx,
             kv_head_idx, n_kv_heads, warp_id, lane_id);
     } else {
@@ -294,6 +367,10 @@ static __device__ __forceinline__ void decode_stage_v(
         int            lane_id) {
     if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
         decode_coop_stage_turbo4<HEAD_SIZE, BLOCK_SIZE>(
+            smem_dst, cache, seq_block_table, tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, warp_id, lane_id);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+        decode_coop_stage_turbo3<HEAD_SIZE, BLOCK_SIZE>(
             smem_dst, cache, seq_block_table, tile_start, valid_ctx,
             kv_head_idx, n_kv_heads, warp_id, lane_id);
     } else {
@@ -1065,12 +1142,22 @@ template void launch_paged_attn_decode<128, 16, GGML_TYPE_TURBO4_0>(
     const int32_t *, const int32_t *, const int32_t *,
     float *, int, int, int, int, int, int, float, cudaStream_t);
 
+template void launch_paged_attn_decode<128, 16, GGML_TYPE_TURBO3_0>(
+    __half *, const __half *, const void *, const void *,
+    const int32_t *, const int32_t *, const int32_t *,
+    float *, int, int, int, int, int, int, float, cudaStream_t);
+
 template void launch_paged_attn_decode<256, 16, GGML_TYPE_F16>(
     __half *, const __half *, const void *, const void *,
     const int32_t *, const int32_t *, const int32_t *,
     float *, int, int, int, int, int, int, float, cudaStream_t);
 
 template void launch_paged_attn_decode<256, 16, GGML_TYPE_TURBO4_0>(
+    __half *, const __half *, const void *, const void *,
+    const int32_t *, const int32_t *, const int32_t *,
+    float *, int, int, int, int, int, int, float, cudaStream_t);
+
+template void launch_paged_attn_decode<256, 16, GGML_TYPE_TURBO3_0>(
     __half *, const __half *, const void *, const void *,
     const int32_t *, const int32_t *, const int32_t *,
     float *, int, int, int, int, int, int, float, cudaStream_t);

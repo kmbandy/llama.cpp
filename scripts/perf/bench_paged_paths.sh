@@ -7,10 +7,13 @@
 # timings off the /v1/completions response.
 #
 # Two axes:
-#   path  ∈ {paged_turbo4, paged_aiter_f16, vanilla_f16}
-#                          — paged_turbo4: production-tier path
+#   path  ∈ {paged_turbo4, paged_turbo3, paged_aiter_f16, vanilla_f16}
+#                          — paged_turbo4: production-tier path with 4-bit KV
 #                            (--kv-tiered 100,0,0 --kv-tier-paged-blocks,
 #                             TURBO4 quantized KV, MAD_USE_AITER unset)
+#                          — paged_turbo3: 3-bit KV variant on the same paged
+#                            stack (3.125 bpv vs turbo4's 4.125 — 24% less
+#                            KV memory and bandwidth)
 #                          — paged_aiter_f16: AITER unified_attention
 #                            (--kv-tiered 100,0,0 --kv-tier-paged-blocks,
 #                             F16 KV per MAD-199, MAD_USE_AITER=1)
@@ -129,6 +132,10 @@ run_cell() {
     case "${path}" in
         paged_turbo4)
             cache_type="turbo4"; aiter_env="0"
+            tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+            ;;
+        paged_turbo3)
+            cache_type="turbo3"; aiter_env="0"
             tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
             ;;
         paged_aiter_f16)
@@ -252,7 +259,7 @@ echo "  out=${OUT_PATH}" >&2
 
 cells=()
 IFS=',' read -r -a CTX_ARR <<< "${CTX_SIZES}"
-for path in paged_turbo4 paged_aiter_f16 vanilla_f16; do
+for path in paged_turbo4 paged_turbo3 paged_aiter_f16 vanilla_f16; do
     for ctx in "${CTX_ARR[@]}"; do
         cell_json="$(run_cell "${path}" "${ctx}")"
         cells+=("${cell_json}")

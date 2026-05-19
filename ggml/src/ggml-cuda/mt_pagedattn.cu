@@ -454,6 +454,153 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     }
 }
 
+// Turbo3_0 scatter: per-128-element-block cooperative quantize.
+//
+// Same threading and pipeline as turbo4 above, but packs 3-bit indices into
+// qs[32] (low 2 bits, 4 per byte) + signs[16] (high 1 bit, 8 per byte).
+// 50 bytes payload per 128 elements → 3.125 bpv (vs turbo4's 4.125 bpv).
+//
+// As with turbo4, RHT is intentionally skipped on the paged path — see the
+// step-4 comment in mt_scatter_kv_turbo4_0_kernel for the JL/dot-product
+// reasoning. Turbo3 centroids (TURBO_CENTROIDS_3BIT) are Lloyd-Max for
+// N(0, 1/d) and remain valid without rotation.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO3)
+__global__ void mt_scatter_kv_turbo3_0_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO3;          // 128
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 4
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO3");
+    static_assert(Q_BLOCK == 128, "this kernel assumes QK_TURBO3 == 128");
+
+    const int j                = threadIdx.x;  // 0..127, element index within turbo3 block
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    // Output block pointer (matches paged_cache_ops<TURBO3_0>::element_block_index)
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo3_0 * blk = (block_turbo3_0 *) dst_buf + block_ib;
+
+    // ---- Step 1: Load into smem (explicit __half2float for HIP safety) ----
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    // ---- Step 2: Parallel L2 norm ----
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = x[j] * x[j];
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    // ---- Step 3: Normalize ----
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
+    // See mt_scatter_kv_turbo4_0_kernel step 4 comment for justification.
+
+    // ---- Step 5: Quantize element j to 3-bit centroid index ----
+    const float   rv  = x[j];
+    const uint8_t idx = turbo_nearest_centroid_3bit(rv);  // 0..7
+
+    // ---- Step 6: Pack qs[] (4 elements per byte, low 2 bits each) ----
+    //
+    // 32 threads in a warp produce 8 bytes of qs. Each byte aggregates 4
+    // adjacent threads' 2-bit values via warp shuffles. Each warp writes
+    // to its own non-overlapping chunk of qs[] — no cross-warp conflicts.
+    {
+        const int     lane    = j % WARP_SIZE;
+        const int     warp_id = j / WARP_SIZE;
+        const uint8_t my2     = idx & 0x3;
+        uint8_t byte_val      = my2 << ((lane & 3) * 2);
+        byte_val |= __shfl_xor_sync(0xffffffffu, byte_val, 1);
+        byte_val |= __shfl_xor_sync(0xffffffffu, byte_val, 2);
+        if ((lane & 3) == 0) {
+            blk->qs[warp_id * (WARP_SIZE / 4) + lane / 4] = byte_val;
+        }
+    }
+
+    // ---- Step 7: Pack signs[] (8 elements per byte, high 1 bit each) ----
+    {
+        const int     lane    = j % WARP_SIZE;
+        const int     warp_id = j / WARP_SIZE;
+        const uint8_t my1     = (idx >> 2) & 0x1;
+        uint8_t bits          = my1 << (lane & 7);
+        bits |= __shfl_xor_sync(0xffffffffu, bits, 1);
+        bits |= __shfl_xor_sync(0xffffffffu, bits, 2);
+        bits |= __shfl_xor_sync(0xffffffffu, bits, 4);
+        if ((lane & 7) == 0) {
+            blk->signs[warp_id * (WARP_SIZE / 8) + lane / 8] = bits;
+        }
+    }
+
+    // ---- Step 8: Reconstruction norm (parallel) ----
+    {
+        const float c = TURBO_CENTROIDS_3BIT[idx];
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    // ---- Step 9: Lane 0 writes per-block scalar ----
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+}
+
 template <ggml_type CACHE_TYPE, typename scalar_t, int HEAD_SIZE, int BLOCK_SIZE>
 static void launch_scatter_kv(
     void           * k_cache,
@@ -492,6 +639,18 @@ static void launch_scatter_kv(
         GGML_UNUSED(q_lens);
         GGML_UNUSED(num_seqs);
         mt_scatter_kv_turbo4_0_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+        // Same grid topology as TURBO4_0 — one CUDA block per
+        // (token, (kv_head, qb_idx), K-or-V); 128 threads per block.
+        constexpr int Q_BLOCK             = QK_TURBO3;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo3_0_kernel<HEAD_SIZE, BLOCK_SIZE>
             <<<grid, block, 0, stream>>>(
                 k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
     }
@@ -926,18 +1085,21 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
         auto run_typed = [&](auto cache_type_const) {
             constexpr ggml_type CT = decltype(cache_type_const)::value;
 
-            // Cache-type / head-size compatibility: TURBO4_0 needs
-            // HEAD_SIZE divisible by QK_TURBO4 (128). For smaller heads
-            // (e.g. HS=64), abort at runtime — we don't even instantiate
-            // the kernel templates for invalid combinations.
+            // Cache-type / head-size compatibility: TURBO4_0 / TURBO3_0 need
+            // HEAD_SIZE divisible by their respective QK (both 128). For
+            // smaller heads (e.g. HS=64), abort at runtime — we don't even
+            // instantiate the kernel templates for invalid combinations.
             if constexpr (CT == GGML_TYPE_TURBO4_0 && HS % QK_TURBO4 != 0) {
                 GGML_ABORT("mt_paged_attn: HEAD_SIZE=%d too small for TURBO4_0 (requires multiple of QK_TURBO4=%d)",
                            HS, (int) QK_TURBO4);
+            } else if constexpr (CT == GGML_TYPE_TURBO3_0 && HS % QK_TURBO3 != 0) {
+                GGML_ABORT("mt_paged_attn: HEAD_SIZE=%d too small for TURBO3_0 (requires multiple of QK_TURBO3=%d)",
+                           HS, (int) QK_TURBO3);
             } else {
 
             // MAD-180: WMMA tile FA gate.
             if constexpr (((HS == 128) || (HS == 256)) && (BS == 16)
-                          && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0)) {
+                          && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0 || CT == GGML_TYPE_TURBO3_0)) {
                 const int  cc                = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const int  total_q_tokens    = (int) k_cur->ne[2];
                 const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
@@ -1130,6 +1292,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 break;
             case GGML_TYPE_TURBO4_0:
                 run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_0>{});
+                break;
+            case GGML_TYPE_TURBO3_0:
+                run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO3_0>{});
                 break;
             default:
                 GGML_ABORT("mt_paged_attn: unsupported cache type %s — add a paged_cache_ops specialization",

@@ -152,4 +152,38 @@ struct paged_cache_ops<GGML_TYPE_TURBO4_0, HEAD_SIZE, BLOCK_SIZE> {
     }
 };
 
+// Turbo3_0 specialization: 3-bit PolarQuant with WHT rotation, 128-element blocks.
+// Same N_QBLOCKS_PER_TOKEN layout as TURBO4_0; differs in block payload size
+// (14 vs 68 bytes) and dequant centroid table (3-bit Lloyd-Max).
+// kv_store omitted — handled by a dedicated cooperative scatter kernel.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO3_0, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO3;  // 128
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO3");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo3_0 * blocks = (const block_turbo3_0 *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        const float   norm = __half2float(blocks[ib].norm);
+        return turbo3_dequant_element(&blocks[ib], iqs, norm);
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
 } // namespace mt
