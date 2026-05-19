@@ -509,10 +509,19 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
 
+    // Streaming-per-batch path replaces the prior "accumulate all logits to
+    // a host vector of size n_ctx*n_vocab and process after the loop"
+    // design. The old design used host RAM = n_ctx*n_vocab*sizeof(float) per
+    // chunk, which is ~10 GB at n_ctx=16K with a 152K-vocab model — fine for
+    // workstations but lethal on RAM-constrained hosts. We now call
+    // process_logits inline once per batch using only the batch's own
+    // logits, keeping host RAM ~ n_batch*n_vocab*sizeof(float) (≈1.2 GB at
+    // batch=2048). Final PPL is identical (nll/nll2 are linear accumulators).
+    //
+    // The buffer is kept around with a comment in case anyone wants to
+    // restore the old behavior via `--ppl-stride` or a logits dump path;
+    // it is intentionally left unallocated under the new path.
     std::vector<float> logits;
-    if (num_batches > 1) {
-        logits.reserve(size_t(n_ctx) * n_vocab);
-    }
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
@@ -541,6 +550,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // process the entire prompt.
     const int first = n_ctx/2;
 
+    // True when we'll stream process_logits inline (multi-batch path). In
+    // that case, the post-batch process_logits call below is skipped — the
+    // work is already done batch-by-batch with O(n_batch) host memory
+    // instead of O(n_ctx).
+    const bool stream_per_batch = (num_batches > 1) && params.logits_file.empty();
+
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -551,6 +566,10 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        // Tracks how many output tokens we've already fed to process_logits
+        // for this chunk (multi-batch streaming path only). Resets per chunk.
+        int n_outputs_streamed_in_chunk = 0;
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -591,7 +610,35 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            if (num_batches > 1 && n_outputs > 0) {
+            // Streaming path: process this batch's logits inline. n_seq=1
+            // is guaranteed when num_batches>1 (n_seq = max(1, n_batch/n_ctx)
+            // and num_batches>1 implies n_batch < n_ctx). So we have a
+            // single seq, contiguous output positions starting after first.
+            if (stream_per_batch && n_outputs > 0) {
+                const float * batch_logits = llama_get_logits(ctx);
+                int n_tokens_for_ppl = n_outputs;
+                // The very last logit in the chunk has no in-window next
+                // token to predict (we drop n_ctx-1's logit). Trim only on
+                // the final batch of this chunk.
+                if (j == num_batches - 1) {
+                    n_tokens_for_ppl -= 1;
+                }
+                if (n_tokens_for_ppl > 0) {
+                    const int tok_base = start + first + n_outputs_streamed_in_chunk;
+                    process_logits(n_vocab, batch_logits,
+                                   tokens.data() + tok_base, n_tokens_for_ppl,
+                                   workers, nll, nll2,
+                                   logit_history.data() + tok_base,
+                                   prob_history.data()  + tok_base);
+                }
+                n_outputs_streamed_in_chunk += n_outputs;
+            } else if (num_batches > 1 && n_outputs > 0) {
+                // Logits-file path: fall back to the old accumulator. The
+                // process_logits(..., logits_stream, ...) call below needs
+                // the full chunk's logits at once.
+                if (logits.capacity() < size_t(n_ctx) * n_vocab) {
+                    logits.reserve(size_t(n_ctx) * n_vocab);
+                }
                 const auto * batch_logits = llama_get_logits(ctx);
                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
             }
@@ -612,19 +659,24 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+            // Streaming path: process_logits already ran per-batch above;
+            // nll/nll2/logit_history/prob_history are fully populated.
+            // We still need to increment count and let the printer run.
+            if (!stream_per_batch) {
+                const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
-            llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
-                process_logits(logits_stream, n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, log_probs, nll, nll2);
-            } else {
-                process_logits(n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, nll, nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
+                llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+                if (!params.logits_file.empty()) {
+                    process_logits(logits_stream, n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, log_probs, nll, nll2);
+                } else {
+                    process_logits(n_vocab, all_logits,
+                            tokens_data, n_ctx - 1 - first,
+                            workers, nll, nll2,
+                            logit_history.data() + start + seq*n_ctx + first,
+                            prob_history.data()  + start + seq*n_ctx + first);
+                }
             }
             count += n_ctx - first - 1;
 
