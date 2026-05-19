@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench_paged_paths.sh — bench AITER on/off × prefill+decode × 8K/64K.
+# bench_paged_paths.sh — bench three attention paths × prefill+decode × 8K/64K.
 #
 # Mechanizes the "test both paged attention paths every commit" rule. Unlike
 # profile_prefill.sh this does NOT use rocprof (which slows the GPU ~2x and
@@ -7,12 +7,18 @@
 # timings off the /v1/completions response.
 #
 # Two axes:
-#   aiter ∈ {0, 1}     — MAD_USE_AITER=1 forces the AITER unified_attention
-#                        path. AITER currently asserts F16 KV (MAD-199), so
-#                        the AITER row uses --cache-type-k f16; the non-AITER
-#                        row uses the production TURBO4 cache type.
-#   ctx   ∈ {8K, 64K}  — short prompt + long prompt, covers the bend in the
-#                        prefill curve where the tile kernel kicks in.
+#   path  ∈ {paged_turbo4, paged_aiter_f16, vanilla_f16}
+#                          — paged_turbo4: production-tier path
+#                            (--kv-tiered 100,0,0 --kv-tier-paged-blocks,
+#                             TURBO4 quantized KV, MAD_USE_AITER unset)
+#                          — paged_aiter_f16: AITER unified_attention
+#                            (--kv-tiered 100,0,0 --kv-tier-paged-blocks,
+#                             F16 KV per MAD-199, MAD_USE_AITER=1)
+#                          — vanilla_f16: stock llama.cpp F16 KV
+#                            (no --kv-tiered, no --kv-tier-paged-blocks)
+#                            tracks upstream / mainline-comparable perf.
+#   ctx   ∈ {8K, 64K}      — short prompt + long prompt, covers the bend in
+#                            the prefill curve where the tile kernel kicks in.
 #
 # Output: tests/perf-baseline/paged-paths/<short_commit>-<UTC_timestamp>.json
 #
@@ -69,9 +75,19 @@ prompt_file_for() {
 import json, sys
 target_tokens, out_path, n_predict = sys.argv[1:4]
 target_tokens = int(target_tokens); n_predict = int(n_predict)
-# ~3.6 chars/token avg on Qwen for English prose. Pad a bit so we land at
-# or just above the target.
-char_target = int(target_tokens * 3.8)
+# Measured: Qwen BPE on our synthetic English corpus = ~4.78 chars/token.
+# Two competing constraints:
+#  - For small targets (8K), the decode-gate at mt_pagedattn.cu:1028 requires
+#    max_ctx_len >= 8192. Below that, decode falls to scalar fallback
+#    (~32 t/s instead of ~50 t/s on Qwen3.6-35B-A3B). Need to overshoot.
+#  - For large targets (64K), admission (MAD-141) needs prompt < ~0.5x ctx.
+#    Overshooting drives the request past the hot pool and stalls.
+# So: aggressive overshoot at small target (clears the gate), undershoot at
+# large target (stays admissible). Both land far above the gate threshold.
+if target_tokens <= 16384:
+    char_target = int(target_tokens * 5.5)
+else:
+    char_target = int(target_tokens * 4.5)
 seed = (
     "The pagedattn benchmark needles its way through tiered KV cache, "
     "stitching tile kernels to flash-decode and watching where the bytes "
@@ -84,6 +100,11 @@ body = {
     "temperature": 0.0,
     "cache_prompt": False,
     "stream": False,
+    # The synthetic prompt sometimes hits an early "stop" finish_reason after
+    # ~2 generated tokens (e.g., \n\n). Force the full decode window so the
+    # bench actually measures n_predict tokens of decode throughput.
+    "ignore_eos": True,
+    "stop": [],
 }
 with open(out_path, "w") as f:
     json.dump(body, f)
@@ -92,38 +113,59 @@ PY
 }
 
 # ----------------------------------------------------------------------------
-# Run one (aiter, ctx) cell. Echoes a single JSON object to stdout.
+# Run one (path, ctx) cell. Echoes a single JSON object to stdout.
 # ----------------------------------------------------------------------------
 run_cell() {
-    local aiter="$1" target_tokens="$2"
+    local path="$1" target_tokens="$2"
     local prompt_path; prompt_path="$(prompt_file_for "${target_tokens}")"
 
-    local label="aiter${aiter}_ctx${target_tokens}"
+    local label="${path}_ctx${target_tokens}"
     local server_log="${WORK_DIR}/${label}.server.log"
     local resp_path="${WORK_DIR}/${label}.resp.json"
     rm -f "${server_log}" "${resp_path}"
 
-    # AITER currently requires F16 KV (MAD-199). Non-AITER uses prod TURBO4.
-    local cache_type
-    if [[ "${aiter}" == "1" ]]; then
-        cache_type="f16"
-    else
-        cache_type="turbo4"
-    fi
-    # ctx-size: must be >= target tokens + n_predict. Round up for headroom.
-    local ctx_size=$(( target_tokens + N_PREDICT + 256 ))
-    if (( ctx_size < 8192 )); then ctx_size=8192; fi
+    # Per-path config: cache type, AITER toggle, KV-mode flags.
+    local cache_type aiter_env tier_flags
+    case "${path}" in
+        paged_turbo4)
+            cache_type="turbo4"; aiter_env="0"
+            tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+            ;;
+        paged_aiter_f16)
+            cache_type="f16";    aiter_env="1"
+            tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+            ;;
+        vanilla_f16)
+            # Stock llama.cpp: no tiered KV, no paged blocks. F16 cache.
+            # This is the upstream-comparable baseline — what mainline
+            # llama.cpp would do on the same hardware/model.
+            cache_type="f16";    aiter_env="0"
+            tier_flags=""
+            ;;
+        *) echo "ERROR: unknown path '${path}'" >&2; return 1 ;;
+    esac
 
-    echo "  [${label}] launching server (cache=${cache_type}, ctx=${ctx_size})..." >&2
+    # ctx-size: with paged + --kv-tiered 100,0,0 the entire KV pool is hot —
+    # no tier to demote to — so MAD-141 admission needs ~2x prompt-size
+    # headroom (a 1.5x ratio failed mid-prefill on the 64K cell). Same 2x
+    # ratio is fine for vanilla_f16 (no admission machinery there, but
+    # consistent ctx makes paths comparable). At 2x, F16 at 64K target ≈
+    # 8GB KV which fits alongside the 35B Q4 weights on R9700. 32K floor
+    # keeps the 8K cell on the same headroom curve.
+    local ctx_size=$(( target_tokens * 2 ))
+    if (( ctx_size < 32768 )); then ctx_size=32768; fi
 
-    MAD_USE_AITER="${aiter}" setsid nohup "${LLAMA_SERVER}" \
+    echo "  [${label}] launching server (cache=${cache_type}, ctx=${ctx_size}, aiter=${aiter_env})..." >&2
+
+    # shellcheck disable=SC2086 # tier_flags is intentionally word-split
+    MAD_USE_AITER="${aiter_env}" setsid nohup "${LLAMA_SERVER}" \
         --model "${MODEL_PATH}" \
         --device ROCm0 --n-gpu-layers 999 \
         --ctx-size "${ctx_size}" --parallel 1 \
-        --kv-tiered 100,0,0 \
+        ${tier_flags} \
         --cache-type-k "${cache_type}" --cache-type-v "${cache_type}" \
         --flash-attn on --no-mmap --no-warmup \
-        --cache-ram 0 --ctx-checkpoints 0 \
+        --cache-ram 0 \
         --host 127.0.0.1 --port "${PORT}" \
         --timeout 3600 --alias bench \
         > "${server_log}" 2>&1 < /dev/null &
@@ -180,12 +222,13 @@ run_cell() {
         return 1
     fi
 
-    python3 - "${aiter}" "${target_tokens}" "${cache_type}" "${ctx_size}" "${resp_path}" <<'PY'
+    python3 - "${path}" "${aiter_env}" "${target_tokens}" "${cache_type}" "${ctx_size}" "${resp_path}" <<'PY'
 import json, sys
-aiter, target_tokens, cache_type, ctx_size, resp_path = sys.argv[1:6]
+path, aiter, target_tokens, cache_type, ctx_size, resp_path = sys.argv[1:7]
 r = json.load(open(resp_path))
 t = r.get("timings", {})
 out = {
+    "path": path,
     "aiter": int(aiter),
     "target_tokens": int(target_tokens),
     "cache_type": cache_type,
@@ -209,9 +252,9 @@ echo "  out=${OUT_PATH}" >&2
 
 cells=()
 IFS=',' read -r -a CTX_ARR <<< "${CTX_SIZES}"
-for aiter in 0 1; do
+for path in paged_turbo4 paged_aiter_f16 vanilla_f16; do
     for ctx in "${CTX_ARR[@]}"; do
-        cell_json="$(run_cell "${aiter}" "${ctx}")"
+        cell_json="$(run_cell "${path}" "${ctx}")"
         cells+=("${cell_json}")
     done
 done

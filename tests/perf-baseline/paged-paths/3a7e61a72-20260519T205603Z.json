@@ -1,0 +1,86 @@
+{
+  "commit": "3a7e61a72e20f88d0ed5ab007b15132d6ceb7ec5",
+  "short_commit": "3a7e61a72",
+  "timestamp_utc": "20260519T205603Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "cells": [
+    {
+      "path": "paged_turbo4",
+      "aiter": 0,
+      "target_tokens": 8192,
+      "cache_type": "turbo4",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 4832.675,
+      "prompt_per_second": 1948.403317003523,
+      "predicted_n": 128,
+      "predicted_ms": 4009.383,
+      "predicted_per_second": 31.92511166930174
+    },
+    {
+      "path": "paged_turbo4",
+      "aiter": 0,
+      "target_tokens": 65536,
+      "cache_type": "turbo4",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 64741.651,
+      "prompt_per_second": 951.860186574482,
+      "predicted_n": 128,
+      "predicted_ms": 4187.654,
+      "predicted_per_second": 30.56604007876486
+    },
+    {
+      "path": "paged_aiter_f16",
+      "aiter": 1,
+      "target_tokens": 8192,
+      "cache_type": "f16",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 5575.539,
+      "prompt_per_second": 1688.8053334395115,
+      "predicted_n": 128,
+      "predicted_ms": 2354.834,
+      "predicted_per_second": 54.35627309610784
+    },
+    {
+      "path": "paged_aiter_f16",
+      "aiter": 1,
+      "target_tokens": 65536,
+      "cache_type": "f16",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 87282.165,
+      "prompt_per_second": 706.0434396878217,
+      "predicted_n": 128,
+      "predicted_ms": 3626.049,
+      "predicted_per_second": 35.30012970039842
+    },
+    {
+      "path": "vanilla_f16",
+      "aiter": 0,
+      "target_tokens": 8192,
+      "cache_type": "f16",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 4185.096,
+      "prompt_per_second": 2249.888652494471,
+      "predicted_n": 128,
+      "predicted_ms": 2160.697,
+      "predicted_per_second": 59.24014334263434
+    },
+    {
+      "path": "vanilla_f16",
+      "aiter": 0,
+      "target_tokens": 65536,
+      "cache_type": "f16",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 36866.17,
+      "prompt_per_second": 1671.5867148662312,
+      "predicted_n": 128,
+      "predicted_ms": 2665.361,
+      "predicted_per_second": 48.02351351280371
+    }
+  ]
+}
