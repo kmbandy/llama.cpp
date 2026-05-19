@@ -169,6 +169,12 @@ add_library(aiter_triton_aot STATIC
     ${uattn_reduce_AOT_C_FILES}
 )
 
+# This static lib gets linked into libggml-hip.so (a SHARED library). Without
+# PIC, ld.lld rejects with `R_X86_64_PC32 cannot be used against symbol …;
+# recompile with -fPIC`. GNU ld + GCC silently let this slide; ld.lld is
+# strict and correct to enforce it.
+set_target_properties(aiter_triton_aot PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Surface the path to the runtime-compile helper as a compile definition so
 # the registry's default doesn't require an env-var dance just to run tests.
 target_compile_definitions(aiter_triton_aot PUBLIC

@@ -43,6 +43,28 @@ else()
     enable_language(HIP)
 endif()
 
+# Guard: HIP host code MUST be compiled with the ROCm-bundled clang++. Building
+# with GCC silently produces a binary that runs ~40% slower on the host hot path
+# (kernel dispatch, batch prep, server loop). See the 2026-05-18 build-config
+# drift incident in mad-lab notes.
+if (NOT CXX_IS_HIPCC)
+    if (NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+        message(FATAL_ERROR
+            "GGML_HIP=ON requires a Clang C++ compiler (got '${CMAKE_CXX_COMPILER_ID}' "
+            "at '${CMAKE_CXX_COMPILER}'). Reconfigure with "
+            "-DCMAKE_CXX_COMPILER=${ROCM_PATH}/llvm/bin/clang++.")
+    endif()
+    get_filename_component(_ggml_hip_cxx_real "${CMAKE_CXX_COMPILER}" REALPATH)
+    string(FIND "${_ggml_hip_cxx_real}" "${ROCM_PATH}" _ggml_hip_cxx_match)
+    if (_ggml_hip_cxx_match EQUAL -1)
+        message(FATAL_ERROR
+            "GGML_HIP=ON requires the ROCm-bundled clang++; got "
+            "'${CMAKE_CXX_COMPILER}' (resolved '${_ggml_hip_cxx_real}') which is "
+            "not under ROCM_PATH '${ROCM_PATH}'. Reconfigure with "
+            "-DCMAKE_CXX_COMPILER=${ROCM_PATH}/llvm/bin/clang++.")
+    endif()
+endif()
+
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
