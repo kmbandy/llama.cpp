@@ -676,7 +676,9 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     const int kv_head_idx = blockIdx.x;
     const int seq_idx     = blockIdx.y;
     const int chunk_idx   = blockIdx.z;
-    const int tid         = threadIdx.x;  // 0..31 (single warp)
+    const int tid         = threadIdx.x;  // 0..127 — 4 warps for staging
+    const int wid         = tid / 32;
+    const int lane        = tid % 32;
 
     const int q_len              = q_lens[seq_idx];
     const int ctx_len_after_q    = context_lens[seq_idx];
@@ -705,7 +707,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
             const size_t base = partial_chunk_base_for_head(head_idx);
             for (int qi = 0; qi < q_len; ++qi) {
                 const size_t off = base + (size_t) qi * (HEAD_SIZE + 2);
-                for (int d = tid; d < HEAD_SIZE; d += 32) partials[off + d] = 0.0f;
+                for (int d = tid; d < HEAD_SIZE; d += 128) partials[off + d] = 0.0f;
                 if (tid == 0) {
                     partials[off + HEAD_SIZE]     = -INFINITY;
                     partials[off + HEAD_SIZE + 1] = 0.0f;
@@ -727,7 +729,8 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
 
     // ── Stage Q: 16 rows × HEAD_SIZE. Rows [total_q..15] are padded with 0. ──
-    for (int idx = tid; idx < 16 * HEAD_SIZE; idx += 32) {
+    // All 4 warps cooperate on staging for max BW.
+    for (int idx = tid; idx < 16 * HEAD_SIZE; idx += 128) {
         const int qhqi = idx / HEAD_SIZE;
         const int d    = idx % HEAD_SIZE;
         __half val = (__half) 0;
@@ -743,13 +746,24 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     }
     __syncwarp();
 
-    // Load Q tiles into registers (each warp owns ALL N_INNER tiles since
-    // we're a single-warp block).
+    __syncthreads();
+
+    // Multi-warp design: warp 0 owns the WMMA compute + softmax state +
+    // partials write. Warps 1-3 only help with staging via decode_stage_k/v
+    // (which use the tid as a flat index 0..127). Wastes warp 1-3 compute
+    // but recovers the per-warp staging BW that single-warp was missing,
+    // which was hurting smaller models where attention is a bigger fraction
+    // of decode time.
+    const bool is_compute_warp = (wid == 0);
+
+    // Load Q tiles into registers — only warp 0.
     tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> Q_tiles[N_INNER];
-    #pragma unroll
-    for (int n = 0; n < N_INNER; ++n) {
-        const half2 * src = (const half2 *)(smem_q + n * K_INNER);
-        load_ldmatrix(Q_tiles[n], src, HEAD_SIZE / 2);
+    if (is_compute_warp) {
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            const half2 * src = (const half2 *)(smem_q + n * K_INNER);
+            load_ldmatrix(Q_tiles[n], src, HEAD_SIZE / 2);
+        }
     }
 
     // Online softmax state. Each lane owns 8 cols of one Q row; the pair lane
@@ -765,94 +779,100 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
         for (int e = 0; e < acc[n].ne; ++e) acc[n].x[e] = 0.0f;
     }
 
-    const int row      = tid % 16;
+    const int row      = lane % 16;
     const int qi_row   = (row < total_q) ? (row % q_len) : 0;
     const int q_pos_qi = q_pos_first + qi_row;
-    const bool row_valid = (row < total_q);
+    const bool row_valid = is_compute_warp && (row < total_q);
 
     // ── Sub-tile loop ──
     for (int sub_start = chunk_start; sub_start < chunk_end; sub_start += K_TILE_N) {
         const int sub_end = min(sub_start + K_TILE_N, chunk_end);
         const int sub_len = sub_end - sub_start;
 
-        // Stage K — reuse the cooperative helper. wid=0 lane=tid for single-warp.
+        // Stage K — all 4 warps cooperate. The helper indexes by tid (0..127).
         decode_stage_k<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
             smem_k, k_cache, seq_block_table, sub_start, valid_ctx_max,
-            kv_head_idx, n_kv_heads, tid, /*wid*/ 0, /*lane*/ tid);
-        __syncwarp();
+            kv_head_idx, n_kv_heads, tid, wid, lane);
+        __syncthreads();
 
-        // scores = Q · K^T (16 × 16, fp32 acc)
+        // scores = Q · K^T (16 × 16, fp32 acc) — warp 0 only.
         tile<16, 16, float, DATA_LAYOUT_I_MAJOR> scores;
-        #pragma unroll
-        for (int e = 0; e < scores.ne; ++e) scores.x[e] = 0.0f;
-        #pragma unroll
-        for (int n = 0; n < N_INNER; ++n) {
-            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
-            const half2 * src = (const half2 *)(smem_k + n * K_INNER);
-            load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
-            mma(scores, Q_tiles[n], K_tile);
-        }
-
-        // Scale + causal + row/sub_len mask
-        #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) {
-            const int col   = 8 * (tid / 16) + l;
-            const int k_pos = sub_start + col;
-            const bool visible = row_valid && (col < sub_len) && (k_pos < valid_ctx_max) && (k_pos <= q_pos_qi);
-            scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
-        }
-
-        // Per-row max
-        float local_max = -INFINITY;
-        #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) local_max = max(local_max, scores.x[l]);
-        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
-
-        const float new_max = max(running_max, row_max);
-        float rescale = 1.0f;
-        if (running_max > -INFINITY) {
-            rescale = __expf(running_max - new_max);
-            running_sum *= rescale;
+        if (is_compute_warp) {
+            #pragma unroll
+            for (int e = 0; e < scores.ne; ++e) scores.x[e] = 0.0f;
             #pragma unroll
             for (int n = 0; n < N_INNER; ++n) {
-                #pragma unroll
-                for (int e = 0; e < acc[n].ne; ++e) acc[n].x[e] *= rescale;
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
+                const half2 * src = (const half2 *)(smem_k + n * K_INNER);
+                load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
+                mma(scores, Q_tiles[n], K_tile);
             }
         }
 
-        float local_sum = 0.0f;
-        #pragma unroll
-        for (int l = 0; l < scores.ne; ++l) {
-            const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
-            scores.x[l] = e;
-            local_sum  += e;
-        }
-        const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
-        running_sum += row_sum;
-        running_max  = new_max;
+        tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
+        if (is_compute_warp) {
+            // Scale + causal + row/sub_len mask
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) {
+                const int col   = 8 * (lane / 16) + l;
+                const int k_pos = sub_start + col;
+                const bool visible = row_valid && (col < sub_len) && (k_pos < valid_ctx_max) && (k_pos <= q_pos_qi);
+                scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
+            }
 
-        // Stage V
+            // Per-row max
+            float local_max = -INFINITY;
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) local_max = max(local_max, scores.x[l]);
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+
+            const float new_max = max(running_max, row_max);
+            float rescale = 1.0f;
+            if (running_max > -INFINITY) {
+                rescale = __expf(running_max - new_max);
+                running_sum *= rescale;
+                #pragma unroll
+                for (int n = 0; n < N_INNER; ++n) {
+                    #pragma unroll
+                    for (int e = 0; e < acc[n].ne; ++e) acc[n].x[e] *= rescale;
+                }
+            }
+
+            float local_sum = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < scores.ne; ++l) {
+                const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
+                scores.x[l] = e;
+                local_sum  += e;
+            }
+            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+            running_sum += row_sum;
+            running_max  = new_max;
+
+            // Pack fp32 scores → half2 for V@logits matmul (precompute before V is staged)
+            #pragma unroll
+            for (int l = 0; l < scores_h.ne; ++l) {
+                scores_h.x[l] = __floats2half2_rn(scores.x[2*l], scores.x[2*l + 1]);
+            }
+        }
+
+        // Stage V — all 4 warps cooperate.
         decode_stage_v<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
             smem_v, v_cache, seq_block_table, sub_start, valid_ctx_max,
-            kv_head_idx, n_kv_heads, tid, /*wid*/ 0, /*lane*/ tid);
-        __syncwarp();
+            kv_head_idx, n_kv_heads, tid, wid, lane);
+        __syncthreads();
 
-        // Pack fp32 scores → half2 for V@logits matmul
-        tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
-        #pragma unroll
-        for (int l = 0; l < scores_h.ne; ++l) {
-            scores_h.x[l] = __floats2half2_rn(scores.x[2*l], scores.x[2*l + 1]);
+        // V@logits — warp 0 only.
+        if (is_compute_warp) {
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
+                const half2 * src = (const half2 *)(smem_v + n * K_INNER);
+                load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
+                mma(acc[n], scores_h, V_tile);
+            }
         }
-
-        // acc[n] += scores_h · V_tile^T (load_ldmatrix_trans transposes V)
-        #pragma unroll
-        for (int n = 0; n < N_INNER; ++n) {
-            tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
-            const half2 * src = (const half2 *)(smem_v + n * K_INNER);
-            load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
-            mma(acc[n], scores_h, V_tile);
-        }
-        __syncwarp();
+        __syncthreads();
     }
 
     // ── Write partials: each lane has 8 floats × N_INNER per row it owns. ──
@@ -1000,11 +1020,10 @@ void launch_paged_attn_decode(
                         && (CACHE_TYPE == GGML_TYPE_F16);
 
     if (wmma_path) {
-        // Single warp per block — WMMA tile<16,16,*> compute. Smem layout
-        // differs from the scalar kernel (no smem_logits/red_smem; smem_q is
-        // 16 rows always to match WMMA padding).
+        // 4-warp block: warp 0 does WMMA compute, warps 1-3 help with K/V
+        // staging (cooperative stage_k/v helpers index by tid 0..127).
         dim3 grid_w(n_kv_heads, num_seqs, num_chunks);
-        dim3 block_w(32);
+        dim3 block_w(128);
         const size_t smem_wmma = sizeof(__half) * 16 * HEAD_SIZE                  // smem_q
                               + sizeof(__half) * DECODE_K_TILE_N * HEAD_SIZE * 2;  // smem_k + smem_v
         mt_paged_attention_decode_kernel_wmma<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>
