@@ -149,36 +149,69 @@ BYTES_PER_TURBO4_BLOCK = tl.constexpr(68)
 
 @triton.jit
 def turbo3_centroid(idx):
-    # 3-bit Lloyd-Max centroids (8 entries). idx is a uint8/int tensor in [0, 8).
-    return tl.where(idx == 0, -0.190685,
-           tl.where(idx == 1, -0.117832,
-           tl.where(idx == 2, -0.065717,
-           tl.where(idx == 3, -0.021460,
-           tl.where(idx == 4,  0.021460,
-           tl.where(idx == 5,  0.065717,
-           tl.where(idx == 6,  0.117832,
-                               0.190685)))))))
+    # 3-bit Lloyd-Max centroids (8 entries). idx in [0, 8).
+    #
+    # The centroids are antisymmetric around the midpoint:
+    #   centroid[i] = -centroid[7-i] for all i.
+    # Exploit that: peel off the sign (bit 2), then 2-level binary-tree
+    # select over the 4 magnitudes (vs 7-deep sequential tl.where chain).
+    # Critical path: 2 levels of select + 1 select for sign + 1 negate.
+    is_pos    = idx >= 4                                # bit 2 == 1
+    mag_idx   = tl.where(is_pos, idx - 4, 3 - idx)      # 0..3, mag in increasing order
+    m01       = tl.where(mag_idx == 0, 0.021460, 0.065717)  # |c| for 0, 1
+    m23       = tl.where(mag_idx == 2, 0.117832, 0.190685)  # |c| for 2, 3
+    mag       = tl.where(mag_idx < 2,  m01, m23)
+    return tl.where(is_pos, mag, -mag)
 
 
 @triton.jit
 def turbo4_centroid(idx):
-    # 4-bit Lloyd-Max centroids (16 entries). idx is a uint8/int tensor in [0, 16).
-    return tl.where(idx ==  0, -0.173926,
-           tl.where(idx ==  1, -0.117195,
-           tl.where(idx ==  2, -0.089527,
-           tl.where(idx ==  3, -0.068756,
-           tl.where(idx ==  4, -0.051262,
-           tl.where(idx ==  5, -0.035597,
-           tl.where(idx ==  6, -0.020989,
-           tl.where(idx ==  7, -0.006938,
-           tl.where(idx ==  8,  0.006938,
-           tl.where(idx ==  9,  0.020989,
-           tl.where(idx == 10,  0.035597,
-           tl.where(idx == 11,  0.051262,
-           tl.where(idx == 12,  0.068756,
-           tl.where(idx == 13,  0.089527,
-           tl.where(idx == 14,  0.117195,
-                                0.173926)))))))))))))))
+    # 4-bit Lloyd-Max centroids (16 entries). idx in [0, 16).
+    #
+    # Antisymmetric: centroid[i] = -centroid[15-i]. Same trick as turbo3:
+    # peel sign (bit 3), 3-level binary tree over 8 magnitudes.
+    # Critical path: 3 levels of select + 1 select for sign + 1 negate
+    # (down from 15 sequential).
+    is_pos    = idx >= 8
+    mag_idx   = tl.where(is_pos, idx - 8, 7 - idx)      # 0..7
+    m01       = tl.where(mag_idx == 0, 0.006938, 0.020989)
+    m23       = tl.where(mag_idx == 2, 0.035597, 0.051262)
+    m45       = tl.where(mag_idx == 4, 0.068756, 0.089527)
+    m67       = tl.where(mag_idx == 6, 0.117195, 0.173926)
+    m0123     = tl.where(mag_idx < 2,  m01, m23)
+    m4567     = tl.where(mag_idx < 6,  m45, m67)
+    mag       = tl.where(mag_idx < 4,  m0123, m4567)
+    return tl.where(is_pos, mag, -mag)
+
+
+@triton.jit
+def _broadcast_norms_by_qb(
+    cache_byte_ptr,          # *i8 — byte pointer to cache
+    block_byte_base,         # (TILE_SIZE,) — per-token byte base for qb_idx=0
+    qb_idx_per_d,            # (HEAD_SIZE_PADDED,) — qb_idx of each head_dim
+    tile_mask,               # (TILE_SIZE,) — valid-token mask
+    QB_PER_TOK: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr,
+):
+    # Returns (HEAD_SIZE_PADDED, TILE_SIZE) fp32: per-(head_dim,token) norm value
+    # obtained by ONE fp16 load per (token, qb_idx) then broadcast.
+    #
+    # The naive version (one tl.load per (head_dim, token)) is correctness-
+    # equivalent but does QB_PER_TOK*128× more loads since each turbo block
+    # holds 128 head_dim elements that all share the block's norm.
+    if QB_PER_TOK == 1:
+        # Single norm per token. Load once, broadcast across head_dim.
+        norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+        norms_t  = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+        return norms_t[None, :] + tl.zeros((1, 1), dtype=tl.float32)  # broadcast hint
+    else:
+        # QB_PER_TOK == 2 (head_size=256). Load both norms per token, pick by qb_idx.
+        ptr0  = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+        ptr1  = (cache_byte_ptr + block_byte_base + BYTES_PER_BLOCK).to(tl.pointer_type(tl.float16))
+        n0    = tl.load(ptr0, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+        n1    = tl.load(ptr1, mask=tile_mask, other=0.0).to(tl.float32)
+        # Select per head_dim
+        return tl.where(qb_idx_per_d[:, None] == 0, n0[None, :], n1[None, :])
 
 
 @triton.jit
@@ -194,13 +227,8 @@ def load_turbo3_kv_tile_K(
     dim_mask,                # tensor of shape (HEAD_SIZE_PADDED,) — valid head_dim mask
     tile_mask,               # tensor of shape (TILE_SIZE,) — valid token mask
 ):
-    # Returns: tensor of shape (HEAD_SIZE_PADDED, TILE_SIZE), dtype fp32 (caller casts).
+    # Returns: tensor of shape (HEAD_SIZE_PADDED, TILE_SIZE), dtype fp32.
     # Matches the f16 K_load shape convention so the matmul site is unchanged.
-    #
-    # For head_size > QK_TURBO (=128) there are N_QBLOCKS_PER_TOKEN = head_size/128
-    # turbo blocks per (token, kv_head). Each block carries its own norm + qs +
-    # signs. We compute per-element byte offsets that include the qb_idx shift
-    # so head_dim 0..127 hits qblock 0, 128..255 hits qblock 1, etc.
     QK_TURBO: tl.constexpr = 128
     QB_PER_TOK: tl.constexpr = HEAD_SIZE // QK_TURBO
 
@@ -217,13 +245,12 @@ def load_turbo3_kv_tile_K(
 
     load_mask = dim_mask[:, None] & tile_mask[None, :]
 
-    # Per-element norm: each (head_dim, token) reads the norm of its own qblock.
-    # Same fp16 value is read multiple times for adjacent head_dims within a
-    # block — cache absorbs this on RDNA4 (single 64-byte cacheline holds all
-    # bytes of one turbo3 block).
-    norm_byte_off = block_byte_base[None, :] + elem_block_off
-    norm_ptr      = (cache_byte_ptr + norm_byte_off).to(tl.pointer_type(tl.float16))
-    norms         = tl.load(norm_ptr, mask=load_mask, other=0.0).to(tl.float32)  # (HEAD_SIZE_PADDED, TILE_SIZE)
+    # Norm: one load per (token, qb_idx) then broadcast across head_dim within
+    # the qblock (MAD-199 chunk D1: fixes a 64-128× redundant-norm-load bug).
+    norms = _broadcast_norms_by_qb(
+        cache_byte_ptr, block_byte_base, qb_idx_per_d, tile_mask,
+        QB_PER_TOK, BYTES_PER_TURBO3_BLOCK,
+    )
 
     # qs starts at byte 2 within the block; signs at byte 34 (= 2 + 32, after qs).
     qs_byte_off    = block_byte_base[None, :] + elem_block_off +  2 + (j_per_d[:, None] // 4)
@@ -266,10 +293,12 @@ def load_turbo4_kv_tile_K(
     j_per_d        = offs_d % QK_TURBO
     elem_block_off = qb_idx_per_d[:, None] * BYTES_PER_TURBO4_BLOCK
 
-    load_mask     = dim_mask[:, None] & tile_mask[None, :]
-    norm_byte_off = block_byte_base[None, :] + elem_block_off
-    norm_ptr      = (cache_byte_ptr + norm_byte_off).to(tl.pointer_type(tl.float16))
-    norms         = tl.load(norm_ptr, mask=load_mask, other=0.0).to(tl.float32)
+    load_mask = dim_mask[:, None] & tile_mask[None, :]
+
+    norms = _broadcast_norms_by_qb(
+        cache_byte_ptr, block_byte_base, qb_idx_per_d, tile_mask,
+        QB_PER_TOK, BYTES_PER_TURBO4_BLOCK,
+    )
 
     # qs starts at byte 4 (skip norm + rnorm), 1 byte holds 2 nibbles.
     qs_byte_off = block_byte_base[None, :] + elem_block_off + 4 + (j_per_d[:, None] // 2)
@@ -277,6 +306,28 @@ def load_turbo4_kv_tile_K(
     idx         = (qs_bytes >> ((j_per_d[:, None] % 2) * 4).to(tl.uint8)) & 0xF
 
     return turbo4_centroid(idx) * norms
+
+
+@triton.jit
+def _broadcast_norms_by_qb_V(
+    cache_byte_ptr,
+    block_byte_base,         # (TILE_SIZE,) per-token byte base for qb_idx=0
+    qb_idx_per_d,            # (HEAD_SIZE_PADDED,)
+    tile_mask,               # (TILE_SIZE,)
+    QB_PER_TOK: tl.constexpr,
+    BYTES_PER_BLOCK: tl.constexpr,
+):
+    # V version: returns (TILE_SIZE, HEAD_SIZE_PADDED) fp32 — transposed shape vs K helper.
+    if QB_PER_TOK == 1:
+        norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+        norms_t  = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)
+        return norms_t[:, None] + tl.zeros((1, 1), dtype=tl.float32)
+    else:
+        ptr0 = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+        ptr1 = (cache_byte_ptr + block_byte_base + BYTES_PER_BLOCK).to(tl.pointer_type(tl.float16))
+        n0   = tl.load(ptr0, mask=tile_mask, other=0.0).to(tl.float32)
+        n1   = tl.load(ptr1, mask=tile_mask, other=0.0).to(tl.float32)
+        return tl.where(qb_idx_per_d[None, :] == 0, n0[:, None], n1[:, None])
 
 
 @triton.jit
@@ -308,9 +359,10 @@ def load_turbo3_kv_tile_V(
 
     load_mask = dim_mask[None, :] & tile_mask[:, None]
 
-    norm_byte_off = block_byte_base[:, None] + elem_block_off
-    norm_ptr      = (cache_byte_ptr + norm_byte_off).to(tl.pointer_type(tl.float16))
-    norms         = tl.load(norm_ptr, mask=load_mask, other=0.0).to(tl.float32)
+    norms = _broadcast_norms_by_qb_V(
+        cache_byte_ptr, block_byte_base, qb_idx_per_d, tile_mask,
+        QB_PER_TOK, BYTES_PER_TURBO3_BLOCK,
+    )
 
     qs_byte_off    = block_byte_base[:, None] + elem_block_off +  2 + (j_per_d[None, :] // 4)
     signs_byte_off = block_byte_base[:, None] + elem_block_off + 34 + (j_per_d[None, :] // 8)
@@ -351,10 +403,12 @@ def load_turbo4_kv_tile_V(
     j_per_d        = offs_d % QK_TURBO
     elem_block_off = qb_idx_per_d[None, :] * BYTES_PER_TURBO4_BLOCK
 
-    load_mask     = dim_mask[None, :] & tile_mask[:, None]
-    norm_byte_off = block_byte_base[:, None] + elem_block_off
-    norm_ptr      = (cache_byte_ptr + norm_byte_off).to(tl.pointer_type(tl.float16))
-    norms         = tl.load(norm_ptr, mask=load_mask, other=0.0).to(tl.float32)
+    load_mask = dim_mask[None, :] & tile_mask[:, None]
+
+    norms = _broadcast_norms_by_qb_V(
+        cache_byte_ptr, block_byte_base, qb_idx_per_d, tile_mask,
+        QB_PER_TOK, BYTES_PER_TURBO4_BLOCK,
+    )
 
     qs_byte_off = block_byte_base[:, None] + elem_block_off + 4 + (j_per_d[None, :] // 2)
     qs_bytes    = tl.load(cache_byte_ptr + qs_byte_off, mask=load_mask, other=0)

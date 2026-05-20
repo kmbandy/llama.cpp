@@ -7,7 +7,8 @@
 # timings off the /v1/completions response.
 #
 # Two axes:
-#   path  ∈ {paged_turbo4, paged_turbo3, paged_aiter_f16, vanilla_f16}
+#   path  ∈ {paged_turbo4, paged_turbo3, paged_aiter_f16,
+#            paged_aiter_turbo3, paged_aiter_turbo4, vanilla_f16}
 #                          — paged_turbo4: production-tier path with 4-bit KV
 #                            (--kv-tiered 100,0,0 --kv-tier-paged-blocks,
 #                             TURBO4 quantized KV, MAD_USE_AITER unset)
@@ -55,9 +56,12 @@ for f in "${LLAMA_SERVER}" "${MODEL_PATH}"; do
     [[ -f "${f}" ]] || { echo "ERROR: missing ${f}" >&2; exit 1; }
 done
 
-if pgrep -f "llama-server" >/dev/null; then
+# Use exact-name match: `pgrep -f` here is over-greedy and matches any shell
+# (including our own caller, in setsid contexts) that has "llama-server" in
+# its cmdline. `pgrep -x` matches only on the process basename.
+if pgrep -x "llama-server" >/dev/null; then
     echo "ERROR: a llama-server is already running. Kill it first." >&2
-    pgrep -af "llama-server" >&2
+    pgrep -ax "llama-server" >&2
     exit 1
 fi
 
@@ -140,6 +144,16 @@ run_cell() {
             ;;
         paged_aiter_f16)
             cache_type="f16";    aiter_env="1"
+            tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+            ;;
+        paged_aiter_turbo3)
+            # MAD-199 chunk B: AITER reads native turbo3 KV (no F16 round-trip).
+            cache_type="turbo3"; aiter_env="1"
+            tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+            ;;
+        paged_aiter_turbo4)
+            # MAD-199 chunk B: AITER reads native turbo4 KV (no F16 round-trip).
+            cache_type="turbo4"; aiter_env="1"
             tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
             ;;
         vanilla_f16)
@@ -259,7 +273,7 @@ echo "  out=${OUT_PATH}" >&2
 
 cells=()
 IFS=',' read -r -a CTX_ARR <<< "${CTX_SIZES}"
-for path in paged_turbo4 paged_turbo3 paged_aiter_f16 vanilla_f16; do
+for path in paged_turbo4 paged_turbo3 paged_aiter_f16 paged_aiter_turbo3 paged_aiter_turbo4 vanilla_f16; do
     for ctx in "${CTX_ARR[@]}"; do
         cell_json="$(run_cell "${path}" "${ctx}")"
         cells+=("${cell_json}")
