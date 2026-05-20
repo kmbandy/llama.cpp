@@ -1,0 +1,57 @@
+{
+  "commit": "ed0db4c94a6fa20ac83d93942fcd310ad188ff0f",
+  "short_commit": "ed0db4c94",
+  "timestamp_utc": "20260520T173254Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "corpus": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "cells": [
+    {
+      "cache_type": "f16",
+      "ctx_size": 4096,
+      "ppl": 5.7507,
+      "ppl_err": 0.03553,
+      "n_chunks": 72,
+      "elapsed_s": 160
+    },
+    {
+      "cache_type": "f16",
+      "ctx_size": 8192,
+      "ppl": 5.7012,
+      "ppl_err": 0.0351,
+      "n_chunks": 36,
+      "elapsed_s": 163
+    },
+    {
+      "cache_type": "turbo4",
+      "ctx_size": 4096,
+      "ppl": 5.7887,
+      "ppl_err": 0.03589,
+      "n_chunks": 72,
+      "elapsed_s": 213
+    },
+    {
+      "cache_type": "turbo4",
+      "ctx_size": 8192,
+      "ppl": 5.727,
+      "ppl_err": 0.03535,
+      "n_chunks": 36,
+      "elapsed_s": 259
+    },
+    {
+      "cache_type": "turbo3",
+      "ctx_size": 4096,
+      "ppl": 5.8226,
+      "ppl_err": 0.03607,
+      "n_chunks": 72,
+      "elapsed_s": 250
+    },
+    {
+      "cache_type": "turbo3",
+      "ctx_size": 8192,
+      "ppl": 5.7633,
+      "ppl_err": 0.03556,
+      "n_chunks": 36,
+      "elapsed_s": 336
+    }
+  ]
+}

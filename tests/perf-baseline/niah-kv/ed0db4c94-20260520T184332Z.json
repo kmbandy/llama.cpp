@@ -1,0 +1,97 @@
+{
+  "commit": "ed0db4c94a6fa20ac83d93942fcd310ad188ff0f",
+  "short_commit": "ed0db4c94",
+  "timestamp_utc": "20260520T184332Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "needle": "The secret passphrase is verdant-quokka-7831.",
+  "cells": [
+    {
+      "cache_type": "turbo4",
+      "target_tokens": 8192,
+      "ctx_size": 32768,
+      "prompt_n": 6915,
+      "prompt_per_second": 1941.6107254408003,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 4
+    },
+    {
+      "cache_type": "turbo4",
+      "target_tokens": 32768,
+      "ctx_size": 65536,
+      "prompt_n": 29227,
+      "prompt_per_second": 1345.003003442742,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 22
+    },
+    {
+      "cache_type": "turbo4",
+      "target_tokens": 131072,
+      "ctx_size": 262144,
+      "prompt_n": 113419,
+      "prompt_per_second": 519.7664187064474,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 219
+    },
+    {
+      "cache_type": "turbo4",
+      "target_tokens": 262144,
+      "ctx_size": 524288,
+      "prompt_n": 228181,
+      "prompt_per_second": 321.0505698876605,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 712
+    },
+    {
+      "cache_type": "turbo3",
+      "target_tokens": 8192,
+      "ctx_size": 32768,
+      "prompt_n": 6915,
+      "prompt_per_second": 1932.1881590815356,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 4
+    },
+    {
+      "cache_type": "turbo3",
+      "target_tokens": 32768,
+      "ctx_size": 65536,
+      "prompt_n": 29227,
+      "prompt_per_second": 1332.2451834370386,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 22
+    },
+    {
+      "cache_type": "turbo3",
+      "target_tokens": 131072,
+      "ctx_size": 262144,
+      "prompt_n": 113419,
+      "prompt_per_second": 509.3033025485018,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 224
+    },
+    {
+      "cache_type": "turbo3",
+      "target_tokens": 262144,
+      "ctx_size": 524288,
+      "prompt_n": 228181,
+      "prompt_per_second": 315.9512972445368,
+      "predicted_n": 10,
+      "response": "verdant-quokka-7831",
+      "needle_hit": true,
+      "elapsed_s": 724
+    }
+  ]
+}

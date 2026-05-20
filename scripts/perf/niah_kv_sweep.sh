@@ -89,16 +89,33 @@ if para_break < 0 or para_break > mid + 4000:
     para_break = mid
 needle_block = f"\n\n{needle}\n\n"
 haystack = raw[:para_break] + needle_block + raw[para_break:]
-# Final prompt: haystack + clear question with a label so we can parse output
-prompt = haystack + "\n\n" + query + " "
+# Chat-format prompt: wrap the haystack + question as a user message so the
+# chat-tuned model actually treats it as a question to answer (instead of
+# continuing the wikipedia-style haystack). Use /v1/chat/completions endpoint
+# in run_cell, which auto-applies the model's chat template (Qwen3 ChatML).
+user_content = (
+    "I am going to give you a long passage of text. Somewhere inside it, "
+    "a sentence reveals a secret passphrase. Read the whole passage, then "
+    "answer my question at the end.\n\n"
+    "=== BEGIN PASSAGE ===\n"
+    + haystack +
+    "\n=== END PASSAGE ===\n\n"
+    + query
+)
 body = {
-    "prompt": prompt,
-    "n_predict": 32,
-    "temperature": 0.0,
-    "cache_prompt": False,
+    "messages": [{"role": "user", "content": user_content}],
+    "max_tokens": 64,
+    # Tiny non-zero temperature to break the degenerate-repetition loops
+    # we observed at temperature=0 on long haystacks. NIAH cares about
+    # retrieval correctness, not bit-exact reproducibility.
+    "temperature": 0.1,
+    "top_p": 0.9,
     "stream": False,
-    "ignore_eos": False,
-    "stop": ["\n", "."],
+    "cache_prompt": False,
+    # Qwen3 ChatML defaults to enabling the <think>...</think> reasoning
+    # block, which gobbles our token budget before any actual answer is
+    # emitted. Disable it so the model goes straight to the response.
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 with open(out_path, "w") as f:
     json.dump(body, f)
@@ -118,20 +135,42 @@ run_cell() {
     local resp_path="${WORK_DIR}/${label}.resp.json"
     rm -f "${server_log}" "${resp_path}"
 
-    # ctx-size with paged-blocks admission headroom (~2x prompt).
-    local ctx_size=$(( target_tokens * 2 ))
-    if (( ctx_size < 32768 )); then ctx_size=32768; fi
+    # Per-cell tier config. Short cells (<=TIER_HOT_MAX) stay all-hot so the
+    # measurement is isolated to the kernel and KV format; long cells engage
+    # the production tiered stack (warm→RAM, cold→SSD, semantic-index) which
+    # is the only way 256K+ prompts fit alongside the 35B-A3B model.
+    local tier_flags ctx_size tier_mode
+    if (( target_tokens <= TIER_HOT_MAX )); then
+        tier_mode="100,0,0"
+        tier_flags="--kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0"
+        ctx_size=$(( target_tokens * 2 ))
+        if (( ctx_size < 32768 )); then ctx_size=32768; fi
+    else
+        tier_mode="65,20,15"
+        # ctx-size scales with target so the hot-pool layer allocation fits in
+        # the R9700's 32GB alongside the 35B model (model ~21GB → ~9GB free).
+        # At ~25KB hot KV per token, hot=65% of (target*2) keeps the hot pool
+        # under that budget for targets up to ~262K. The warm→RAM + cold→SSD
+        # wiring still loads so the tier infrastructure is exercised.
+        tier_flags="--kv-tiered 65,20,15 --kv-tier-paged-blocks --ctx-checkpoints 0 --kv-tier-ssd-path ${KV_TIER_SSD_PATH} --kv-tier-semantic-index ${KV_TIER_SEMANTIC_INDEX}"
+        ctx_size=$(( target_tokens * 2 ))
+    fi
 
-    echo "  [${label}] launching server (cache=${cache_type}, ctx=${ctx_size})..." >&2
+    echo "  [${label}] launching server (cache=${cache_type}, ctx=${ctx_size}, tier=${tier_mode})..." >&2
 
+    # --jinja is REQUIRED for /v1/chat/completions to honor the model's
+    # chat template + chat_template_kwargs in the request body. Without it
+    # the model produces degenerate output (observed: "The leFallrésrates..."
+    # on Qwen3.6 with a 7K-token haystack prompt).
+    # shellcheck disable=SC2086 # tier_flags is intentionally word-split
     setsid nohup "${LLAMA_SERVER}" \
         --model "${MODEL_PATH}" \
         --device ROCm0 --n-gpu-layers 999 \
         --ctx-size "${ctx_size}" --parallel 1 \
-        --kv-tiered 100,0,0 --kv-tier-paged-blocks --ctx-checkpoints 0 \
+        ${tier_flags} \
         --cache-type-k "${cache_type}" --cache-type-v "${cache_type}" \
         --flash-attn on --no-mmap --no-warmup \
-        --cache-ram 0 \
+        --cache-ram 0 --jinja \
         --host 127.0.0.1 --port "${PORT}" \
         --timeout 3600 --alias niah \
         > "${server_log}" 2>&1 < /dev/null &
@@ -165,7 +204,7 @@ run_cell() {
     local timeout=$(( target_tokens / 50 + 240 ))
     local http_rc=0
     local start_ts; start_ts=$(date +%s)
-    curl -fsS -X POST "http://127.0.0.1:${PORT}/v1/completions" \
+    curl -fsS -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" \
         --data-binary @"${prompt_path}" \
         -o "${resp_path}" -m "${timeout}" || http_rc=$?
@@ -185,7 +224,11 @@ import json, sys
 cache_type, target_tokens, ctx_size, resp_path, needle_token, elapsed = sys.argv[1:7]
 r = json.load(open(resp_path))
 t = r.get("timings", {})
-text = r.get("choices", [{}])[0].get("text", "")
+# /v1/chat/completions returns choices[0].message.content (vs /v1/completions
+# which has choices[0].text). Fall back to "text" in case llama-server's chat
+# endpoint shape ever diverges.
+choice = r.get("choices", [{}])[0]
+text = choice.get("message", {}).get("content") or choice.get("text", "") or ""
 hit = needle_token in text
 out = {
     "cache_type": cache_type,
