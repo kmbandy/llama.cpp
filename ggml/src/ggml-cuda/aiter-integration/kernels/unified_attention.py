@@ -28,6 +28,25 @@
 #    `torch.float8_e4m3fnuz` on gfx942/MI300; this vendor hardcodes the
 #    former. If/when we target MI300, branch on arch here.
 #
+# 2. CACHE_TYPE constexpr + turbo3/turbo4 inline dequant (MAD-199):
+#    Adds  CACHE_TYPE: tl.constexpr  to kernel_unified_attention_{2d,3d}
+#    plus turbo3_centroid / turbo4_centroid LUT helpers and
+#    load_{turbo3,turbo4}_kv_tile @triton.jit dequant helpers.
+#    K/V load sites branch on CACHE_TYPE:
+#       0 = F16   (upstream behavior, unchanged)
+#       1 = TURBO3 (3.125 bpv, our local quant scheme)
+#       2 = TURBO4 (4.125 bpv, our local quant scheme)
+#
+#    Why: avoid F16 round-trip scratch buffer when AITER serves a
+#    turbo-quantized KV cache. Keeps the kernel body close to upstream —
+#    branching only at the load sites, decode/softmax/V·scores all share.
+#    Per mt_pagedattn.cu turbo4 scatter step-4: RHT is intentionally
+#    SKIPPED for paged-tile (AITER mirrors this), so dequant is just
+#    `centroid_LUT[idx] * norm` — no rotation math.
+#
+#    AOT spec implications: turbo cache pointers are *i8:16 (byte ptrs),
+#    F16 cache pointers remain *fp16:16. CACHE_TYPE is baked per-spec.
+#
 # Validated: AITER 2D + 3D + reduce_segments AOT-compile cleanly for
 #            gfx1201 (R9700) and gfx1030 (6900XT) from this vendor.
 #            See docs/aiter-integration/ARCHITECTURE.md §7 + MAD-188.
@@ -87,6 +106,219 @@ def find_seq_idx(
     return left - 1
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# LOCAL ADDITION (MAD-199): turbo3 / turbo4 inline KV dequant.
+#
+# CACHE_TYPE constants (kept as plain Python ints so they're cheap to use
+# in `tl.constexpr` comparisons inside @triton.jit functions):
+#   0 = F16    — upstream f16 KV cache, no dequant
+#   1 = TURBO3 — 3.125 bpv (3-bit centroid + 1-bit hi-bit split)
+#   2 = TURBO4 — 4.125 bpv (4-bit nibble-packed centroid)
+#
+# Block-byte layouts (matches ggml-common.h):
+#   block_turbo3_0 = 14 bytes per 128-element block:
+#     [0..2)   norm  (fp16)
+#     [2..10)  qs    (8 bytes, 2 low-bits-of-3-bit-idx × 4 per byte)
+#     [10..14) signs (4 bytes, 1 hi-bit-of-3-bit-idx × 8 per byte)
+#   block_turbo4_0 = 68 bytes per 128-element block:
+#     [0..2)   norm  (fp16)
+#     [2..4)   rnorm (fp16, reserved/unused in 4-bit mode)
+#     [4..68)  qs    (64 bytes, 4-bit nibble packed, 2 indices per byte)
+#
+# Centroid LUT values: Lloyd-Max optimal for N(0, 1/d) — match the C++
+# TURBO_CENTROIDS_{3,4}BIT constants in ggml-cuda/turbo-quant.cuh exactly.
+# Both backends MUST use the same LUTs (cache contents are interchangeable
+# in principle, even though Option-B layouts differ).
+# ─────────────────────────────────────────────────────────────────────────
+
+CACHE_TYPE_F16    = 0
+CACHE_TYPE_TURBO3 = 1
+CACHE_TYPE_TURBO4 = 2
+
+BYTES_PER_TURBO3_BLOCK = 14
+BYTES_PER_TURBO4_BLOCK = 68
+
+
+@triton.jit
+def turbo3_centroid(idx):
+    # 3-bit Lloyd-Max centroids (8 entries). idx is a uint8/int tensor in [0, 8).
+    return tl.where(idx == 0, -0.190685,
+           tl.where(idx == 1, -0.117832,
+           tl.where(idx == 2, -0.065717,
+           tl.where(idx == 3, -0.021460,
+           tl.where(idx == 4,  0.021460,
+           tl.where(idx == 5,  0.065717,
+           tl.where(idx == 6,  0.117832,
+                               0.190685)))))))
+
+
+@triton.jit
+def turbo4_centroid(idx):
+    # 4-bit Lloyd-Max centroids (16 entries). idx is a uint8/int tensor in [0, 16).
+    return tl.where(idx ==  0, -0.173926,
+           tl.where(idx ==  1, -0.117195,
+           tl.where(idx ==  2, -0.089527,
+           tl.where(idx ==  3, -0.068756,
+           tl.where(idx ==  4, -0.051262,
+           tl.where(idx ==  5, -0.035597,
+           tl.where(idx ==  6, -0.020989,
+           tl.where(idx ==  7, -0.006938,
+           tl.where(idx ==  8,  0.006938,
+           tl.where(idx ==  9,  0.020989,
+           tl.where(idx == 10,  0.035597,
+           tl.where(idx == 11,  0.051262,
+           tl.where(idx == 12,  0.068756,
+           tl.where(idx == 13,  0.089527,
+           tl.where(idx == 14,  0.117195,
+                                0.173926)))))))))))))))
+
+
+@triton.jit
+def load_turbo3_kv_tile_K(
+    cache_byte_ptr,          # *i8 — byte pointer to start of K cache
+    physical_block_idx,      # tensor of shape (TILE_SIZE,) — paged block id per token
+    token_in_block,          # tensor of shape (TILE_SIZE,) — slot within paged block
+    offs_d,                  # tensor of shape (HEAD_SIZE_PADDED,) — head_dim offsets
+    kv_head_idx,             # scalar int — kv head index
+    n_kv_heads: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    dim_mask,                # tensor of shape (HEAD_SIZE_PADDED,) — valid head_dim mask
+    tile_mask,               # tensor of shape (TILE_SIZE,) — valid token mask
+):
+    # Returns: tensor of shape (HEAD_SIZE_PADDED, TILE_SIZE), dtype fp32 (caller casts).
+    # Matches the f16 K_load shape convention so the matmul site is unchanged.
+    #
+    # Per-(token, kv_head) block byte base:
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_TURBO3_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_TURBO3_BLOCK)
+        + kv_head_idx      * BYTES_PER_TURBO3_BLOCK
+    )  # shape (TILE_SIZE,) int64
+
+    # Load per-token norm (fp16) from first 2 bytes of each block:
+    norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    norms = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+
+    # Per-element byte offsets within each block:
+    #   qs    starts at byte  2, indexed by  d // 4  (1 byte holds 4 elements)
+    #   signs starts at byte 10, indexed by  d // 8  (1 byte holds 8 elements)
+    qs_byte_off    = block_byte_base[None, :] +  2 + (offs_d[:, None] // 4)
+    signs_byte_off = block_byte_base[None, :] + 10 + (offs_d[:, None] // 8)
+    load_mask      = dim_mask[:, None] & tile_mask[None, :]
+
+    qs_bytes    = tl.load(cache_byte_ptr + qs_byte_off,    mask=load_mask, other=0)  # uint8
+    signs_bytes = tl.load(cache_byte_ptr + signs_byte_off, mask=load_mask, other=0)  # uint8
+
+    # Extract per-element index (3 bits = lo 2 bits in qs + hi 1 bit in signs):
+    lo2 = (qs_bytes    >> ((offs_d[:, None] % 4) * 2).to(tl.uint8)) & 0x3
+    hi1 = (signs_bytes >> ( offs_d[:, None] % 8     ).to(tl.uint8)) & 0x1
+    idx = lo2 | (hi1 << 2)
+
+    # Centroid LUT × norm broadcast:
+    c = turbo3_centroid(idx)                       # (HEAD_SIZE_PADDED, TILE_SIZE) fp32
+    return c * norms[None, :]                      # broadcast norm across head_dim
+
+
+@triton.jit
+def load_turbo4_kv_tile_K(
+    cache_byte_ptr,
+    physical_block_idx,
+    token_in_block,
+    offs_d,
+    kv_head_idx,
+    n_kv_heads: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    dim_mask,
+    tile_mask,
+):
+    # Returns: tensor of shape (HEAD_SIZE_PADDED, TILE_SIZE), dtype fp32.
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_TURBO4_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_TURBO4_BLOCK)
+        + kv_head_idx      * BYTES_PER_TURBO4_BLOCK
+    )
+
+    norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    norms = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)
+
+    # qs starts at byte 4 (skip norm + rnorm), 1 byte holds 2 nibbles.
+    qs_byte_off = block_byte_base[None, :] + 4 + (offs_d[:, None] // 2)
+    load_mask   = dim_mask[:, None] & tile_mask[None, :]
+    qs_bytes    = tl.load(cache_byte_ptr + qs_byte_off, mask=load_mask, other=0)
+
+    # Extract nibble for this element:
+    idx = (qs_bytes >> ((offs_d[:, None] % 2) * 4).to(tl.uint8)) & 0xF
+
+    c = turbo4_centroid(idx)
+    return c * norms[None, :]
+
+
+@triton.jit
+def load_turbo3_kv_tile_V(
+    cache_byte_ptr,
+    physical_block_idx,      # shape (TILE_SIZE,)
+    token_in_block,          # shape (TILE_SIZE,)
+    offs_d,                  # shape (HEAD_SIZE_PADDED,)
+    kv_head_idx,
+    n_kv_heads: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    dim_mask,
+    tile_mask,
+):
+    # V tile is (TILE_SIZE, HEAD_SIZE_PADDED) — token-major, transpose of K.
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_TURBO3_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_TURBO3_BLOCK)
+        + kv_head_idx      * BYTES_PER_TURBO3_BLOCK
+    )
+    norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    norms = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)
+
+    qs_byte_off    = block_byte_base[:, None] +  2 + (offs_d[None, :] // 4)
+    signs_byte_off = block_byte_base[:, None] + 10 + (offs_d[None, :] // 8)
+    load_mask      = dim_mask[None, :] & tile_mask[:, None]
+
+    qs_bytes    = tl.load(cache_byte_ptr + qs_byte_off,    mask=load_mask, other=0)
+    signs_bytes = tl.load(cache_byte_ptr + signs_byte_off, mask=load_mask, other=0)
+
+    lo2 = (qs_bytes    >> ((offs_d[None, :] % 4) * 2).to(tl.uint8)) & 0x3
+    hi1 = (signs_bytes >> ( offs_d[None, :] % 8     ).to(tl.uint8)) & 0x1
+    idx = lo2 | (hi1 << 2)
+
+    c = turbo3_centroid(idx)
+    return c * norms[:, None]
+
+
+@triton.jit
+def load_turbo4_kv_tile_V(
+    cache_byte_ptr,
+    physical_block_idx,
+    token_in_block,
+    offs_d,
+    kv_head_idx,
+    n_kv_heads: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    dim_mask,
+    tile_mask,
+):
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_TURBO4_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_TURBO4_BLOCK)
+        + kv_head_idx      * BYTES_PER_TURBO4_BLOCK
+    )
+    norm_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    norms = tl.load(norm_ptr, mask=tile_mask, other=0.0).to(tl.float32)
+
+    qs_byte_off = block_byte_base[:, None] + 4 + (offs_d[None, :] // 2)
+    load_mask   = dim_mask[None, :] & tile_mask[:, None]
+    qs_bytes    = tl.load(cache_byte_ptr + qs_byte_off, mask=load_mask, other=0)
+
+    idx = (qs_bytes >> ((offs_d[None, :] % 2) * 4).to(tl.uint8)) & 0xF
+
+    c = turbo4_centroid(idx)
+    return c * norms[:, None]
+
+
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -136,6 +368,7 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199)
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -293,39 +526,69 @@ def kernel_unified_attention_2d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        token_in_block = seq_offset % BLOCK_SIZE
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        K = K_load.to(Q.dtype)
-
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        V = V_load.to(Q.dtype)
+        # MAD-199: branch K/V loads on cache type. Branches are tl.constexpr
+        # if/elif so only one path lowers per AOT spec; the f16 branch is
+        # byte-for-byte the upstream code.
+        if CACHE_TYPE == 0:  # F16
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + token_in_block[:, None] * stride_v_cache_1
+            )
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + token_in_block[None, :] * stride_k_cache_1
+            )
+            # K : (HEAD_SIZE, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            # V : (TILE_SIZE, HEAD_SIZE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            K = K_load.to(Q.dtype)
+            V = V_load.to(Q.dtype)
+        elif CACHE_TYPE == 1:  # TURBO3
+            # n_kv_heads is constexpr-derivable from num_query_heads + GQA factor.
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+            K = load_turbo3_kv_tile_K(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+            V = load_turbo3_kv_tile_V(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+        else:  # CACHE_TYPE == 2, TURBO4
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+            K = load_turbo4_kv_tile_K(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+            V = load_turbo4_kv_tile_V(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -466,6 +729,7 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199)
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -611,39 +875,64 @@ def kernel_unified_attention_3d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+        token_in_block = seq_offset % BLOCK_SIZE
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        K = K_load.to(Q.dtype)
-
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-
-        V = V_load.to(Q.dtype)
+        # MAD-199: branch K/V loads on cache type — see 2D kernel for notes.
+        if CACHE_TYPE == 0:  # F16
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + token_in_block[:, None] * stride_v_cache_1
+            )
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + token_in_block[None, :] * stride_k_cache_1
+            )
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            K = K_load.to(Q.dtype)
+            V = V_load.to(Q.dtype)
+        elif CACHE_TYPE == 1:  # TURBO3
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+            K = load_turbo3_kv_tile_K(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+            V = load_turbo3_kv_tile_V(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+        else:  # CACHE_TYPE == 2, TURBO4
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+            K = load_turbo4_kv_tile_K(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
+            V = load_turbo4_kv_tile_V(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                N_KV_HEADS, BLOCK_SIZE,
+                dim_mask, tile_mask,
+            ).to(Q.dtype)
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 

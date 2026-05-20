@@ -57,7 +57,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1)
-        "*i32, %d, i32, %d, %d, 1",         // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE
+        "*i32, %d, i32, %d, %d, 1, 0",      // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199: 0=F16)
         s.num_q_heads,                          // pos 17: num_q_heads
         s.num_q_heads / s.num_kv_heads,         // pos 18: num_queries_per_kv
         s.head_size,                            // pos 21: query_stride_1 = head_size (constexpr)

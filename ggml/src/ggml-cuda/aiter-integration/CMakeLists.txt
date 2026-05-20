@@ -101,7 +101,10 @@ add_triton_aot_kernel(
 # ────────────────────────────────────────────────────────────────────────
 
 set(_uattn_3d_signature
-    "*fp32:16, *fp32, *fp32, *fp16:16, *fp16:16, *fp16:16, *fp32, *i32, *i32, *fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, 16, 8, i64, i64, 128, i64, 16, 32, 128, 128, 0, 0, 0, 0, 0, i64, i64, i64, 1, i64, i64, i64, 1, *i32, 2, i32, 16, 32, 1"
+    "*fp32:16, *fp32, *fp32, *fp16:16, *fp16:16, *fp16:16, *fp32, *i32, *i32, *fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, 16, 8, i64, i64, 128, i64, 16, 32, 128, 128, 0, 0, 0, 0, 0, i64, i64, i64, 1, i64, i64, i64, 1, *i32, 2, i32, 16, 32, 1, 0"
+    # Trailing fields:                                                                                                                                                                                                                                                                                  ^  ^
+    #                                                                                                                                                                                                                                                                                                  |  └─ MAD-199: CACHE_TYPE constexpr (0=F16, 1=TURBO3, 2=TURBO4)
+    #                                                                                                                                                                                                                                                                                                  └─── ALL_DECODE constexpr (1=True for decode shape)
 )
 set(_uattn_3d_grid       "num_seqs / 2 + num_seqs, 2, 32")
 
