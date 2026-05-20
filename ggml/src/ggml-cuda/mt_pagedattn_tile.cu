@@ -450,7 +450,8 @@ __global__ void mt_paged_attention_tile_kernel(
             tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
             const half2 * src = (const half2 *)(smem_k + n * K_INNER);
             load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
-            mma(scores, Q_tiles[n], K_tile);
+            // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
+            mma(scores, K_tile, Q_tiles[n]);
         }
 
         // Apply scale + causal mask. Each thread inspects its 8 elements:
@@ -544,7 +545,8 @@ __global__ void mt_paged_attention_tile_kernel(
             // exactly what we need for B in the matmul.
             const half2 * src = (const half2 *)(smem_v + n * K_INNER);
             load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
-            mma(acc[n], scores_h, V_tile);
+            // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
+            mma(acc[n], V_tile, scores_h);
         }
 
         __syncthreads();  // before next iter overwrites smem_k / smem_v
@@ -823,7 +825,8 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                                   (const half2 *)(smem_k + (n + 1) * K_INNER),
                                   HEAD_SIZE / 2);
                 }
-                mma(scores_acc[n % N_ACC], Q_tiles[n], K_pp[n & 1]);
+                // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
+                mma(scores_acc[n % N_ACC], K_pp[n & 1], Q_tiles[n]);
             }
 
             // Merge accumulators for downstream softmax.
@@ -935,7 +938,8 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                                         (const half2 *)(smem_v + (n + 1) * K_INNER),
                                         HEAD_SIZE / 2);
                 }
-                mma(acc[n], scores_h, V_pp[n & 1]);
+                // RDNA4 WMMA operand order — see mt_pagedattn_decode.cu mma swap.
+                mma(acc[n], V_pp[n & 1], scores_h);
             }
         }
 

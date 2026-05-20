@@ -773,6 +773,21 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     const int valid_ctx_max = ctx_len_after_q;
     const int chunk_start   = chunk_idx * CHUNK_KV;
 
+    // DEBUG: lane-0 trace for WMMA decode bug ([[wmma-decode-kernel-bug-2026-05-19]]).
+    // Gate fires once per kernel call (head=0, seq=0, chunk=0, warp=0, lane=0,
+    // first sub-tile only — see inside the sub-tile loop for the actual dumps).
+    // Set to true to re-enable while debugging.
+    constexpr bool MT_WMMA_DEBUG_DUMP = false;
+    const bool debug_origin =
+        MT_WMMA_DEBUG_DUMP &&
+        (kv_head_idx == 0) && (seq_idx == 0) && (chunk_idx == 0) &&
+        (wid == 0) && (lane == 0);
+    if (debug_origin) {
+        printf("[WMMA] >>> step ctx=%d q_len=%d total_q=%d chunk_start=%d chunk_end=%d\n",
+            ctx_len_after_q, q_len, total_q, chunk_start,
+            min(chunk_start + CHUNK_KV, valid_ctx_max));
+    }
+
     auto partial_chunk_base_for_head = [&](int head_idx) -> size_t {
         return ((((size_t) head_idx * n_seqs + seq_idx) * num_chunks) + (size_t) chunk_idx)
              * (size_t) max_q_len * (size_t) (HEAD_SIZE + 2);
@@ -882,8 +897,30 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
                 tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> K_tile;
                 const half2 * src = (const half2 *)(smem_k + n * K_INNER);
                 load_ldmatrix(K_tile, src, HEAD_SIZE / 2);
-                mma(scores, Q_tiles[n], K_tile);
+                // RDNA4 WMMA: A operand has K-in-lane / M-in-slot layout; the
+                // I-major load + (Q,K) call order computes (Q·K^T)^T, so the
+                // kernel reads scores transposed. Swapping operands to (K,Q)
+                // computes K·Q^T, which the kernel's I-major read decodes as
+                // scores_true[Q-row][K-token]. See probe_v3 for ISA layout.
+                mma(scores, K_tile, Q_tiles[n]);
             }
+        }
+
+        // DEBUG: trace post-Q·K scores. Fires once per kernel call.
+        // Also dump for lane 16 (owns row=0 cols 8..15) to see the half-warp pair.
+        const bool debug_here   = debug_origin && (sub_start == chunk_start);
+        const bool debug_lane16 = MT_WMMA_DEBUG_DUMP &&
+            (kv_head_idx == 0) && (seq_idx == 0) && (chunk_idx == 0) &&
+            (wid == 0) && (lane == 16) && (sub_start == chunk_start);
+        if (debug_here) {
+            printf("[WMMA] scores       lane0  [%g %g %g %g  %g %g %g %g]\n",
+                scores.x[0], scores.x[1], scores.x[2], scores.x[3],
+                scores.x[4], scores.x[5], scores.x[6], scores.x[7]);
+        }
+        if (debug_lane16) {
+            printf("[WMMA] scores       lane16 [%g %g %g %g  %g %g %g %g]\n",
+                scores.x[0], scores.x[1], scores.x[2], scores.x[3],
+                scores.x[4], scores.x[5], scores.x[6], scores.x[7]);
         }
 
         tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> scores_h;
@@ -946,7 +983,33 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
                 tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> V_tile;
                 const half2 * src = (const half2 *)(smem_v + n * K_INNER);
                 load_ldmatrix_trans(V_tile, src, HEAD_SIZE / 2);
-                mma(acc[n], scores_h, V_tile);
+
+                // DEBUG: dump V_tile + scores_h + acc inputs for n=0 only.
+                // For lane 0 (owns row=0, cols 0..7) AND lane 16 (row=0, cols 8..15).
+                if (n == 0 && (debug_here || debug_lane16)) {
+                    const char * tag = debug_here ? "lane0 " : "lane16";
+                    printf("[WMMA] V_tile[0]    %s  half2[0]=(%g,%g) [1]=(%g,%g) [2]=(%g,%g) [3]=(%g,%g)\n",
+                        tag,
+                        __low2float(V_tile.x[0]), __high2float(V_tile.x[0]),
+                        __low2float(V_tile.x[1]), __high2float(V_tile.x[1]),
+                        __low2float(V_tile.x[2]), __high2float(V_tile.x[2]),
+                        __low2float(V_tile.x[3]), __high2float(V_tile.x[3]));
+                    printf("[WMMA] scores_h     %s  half2[0]=(%g,%g) [1]=(%g,%g) [2]=(%g,%g) [3]=(%g,%g)\n",
+                        tag,
+                        __low2float(scores_h.x[0]), __high2float(scores_h.x[0]),
+                        __low2float(scores_h.x[1]), __high2float(scores_h.x[1]),
+                        __low2float(scores_h.x[2]), __high2float(scores_h.x[2]),
+                        __low2float(scores_h.x[3]), __high2float(scores_h.x[3]));
+                }
+                // Same RDNA4 WMMA operand-swap as the Q·K mma above.
+                mma(acc[n], V_tile, scores_h);
+                if (n == 0 && (debug_here || debug_lane16)) {
+                    const char * tag = debug_here ? "lane0 " : "lane16";
+                    printf("[WMMA] acc[0] post  %s  [%g %g %g %g  %g %g %g %g]\n",
+                        tag,
+                        acc[0].x[0], acc[0].x[1], acc[0].x[2], acc[0].x[3],
+                        acc[0].x[4], acc[0].x[5], acc[0].x[6], acc[0].x[7]);
+                }
             }
         }
         __syncthreads();
