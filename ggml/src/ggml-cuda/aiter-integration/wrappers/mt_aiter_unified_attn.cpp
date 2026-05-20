@@ -48,26 +48,54 @@ std::string detect_hip_target() {
 //   pos 25 → head_size (HEAD_SIZE constexpr)
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
 std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
+    // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
+    // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
+    // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
+    // hash to distinct AOT artifacts (or distinct runtime-compile cache keys).
+    const char * kv_ptr_dtype;
+    int          cache_type_val;
+    switch (s.cache_type) {
+        case MT_AITER_CACHE_F16:
+            kv_ptr_dtype   = "*fp16:16";
+            cache_type_val = 0;
+            break;
+        case MT_AITER_CACHE_TURBO3:
+            kv_ptr_dtype   = "*i8:16";
+            cache_type_val = 1;
+            break;
+        case MT_AITER_CACHE_TURBO4:
+            kv_ptr_dtype   = "*i8:16";
+            cache_type_val = 2;
+            break;
+        default:
+            kv_ptr_dtype   = "*fp16:16";
+            cache_type_val = 0;
+            break;
+    }
+
     char buf[1024];
     std::snprintf(buf, sizeof(buf),
-        "*fp32:16, *fp32, *fp32, *fp16:16, *fp16:16, *fp16:16, *fp32, *i32, *i32, "
+        "*fp32:16, *fp32, *fp32, *fp16:16, %s, %s, *fp32, *i32, *i32, "
         "*fp32, *fp16, fp32, *fp32, *fp32, *fp32, fp32, "
         "%d, %d, "                          // num_q_heads, num_queries_per_kv
         "i64, i64, %d, i64, "               // block_table_stride, q_stride_0, query_stride_1=head_size, qq_bias_stride_0
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
-        "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1)
-        "*i32, %d, i32, %d, %d, 1, 0",      // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199: 0=F16)
-        s.num_q_heads,                          // pos 17: num_q_heads
-        s.num_q_heads / s.num_kv_heads,         // pos 18: num_queries_per_kv
-        s.head_size,                            // pos 21: query_stride_1 = head_size (constexpr)
-        s.block_size,                           // pos 23: BLOCK_SIZE
-        MT_AITER_UATTN_TILE_SIZE,               // pos 24: TILE_SIZE
-        s.head_size,                            // pos 25: HEAD_SIZE
-        s.head_size,                            // pos 26: HEAD_SIZE_PADDED (assumes head_size is pow2)
-        MT_AITER_UATTN_BLOCK_Q,                 // pos 41: BLOCK_Q
-        MT_AITER_UATTN_BLOCK_M,                 // pos 43: BLOCK_M
-        MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ);   // pos 44: NUM_SEGMENTS_PER_SEQ
+        "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
+        "*i32, %d, i32, %d, %d, 1, %d",     // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199)
+        kv_ptr_dtype,                           // K cache pointer dtype
+        kv_ptr_dtype,                           // V cache pointer dtype
+        s.num_q_heads,                          // num_q_heads constexpr
+        s.num_q_heads / s.num_kv_heads,         // num_queries_per_kv constexpr
+        s.head_size,                            // query_stride_1 = head_size constexpr
+        s.block_size,                           // BLOCK_SIZE constexpr
+        MT_AITER_UATTN_TILE_SIZE,               // TILE_SIZE constexpr
+        s.head_size,                            // HEAD_SIZE constexpr
+        s.head_size,                            // HEAD_SIZE_PADDED (assumes head_size is pow2)
+        MT_AITER_UATTN_BLOCK_Q,                 // BLOCK_Q constexpr
+        MT_AITER_UATTN_BLOCK_M,                 // BLOCK_M constexpr
+        MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ,    // NUM_SEGMENTS_PER_SEQ constexpr
+        cache_type_val);                        // CACHE_TYPE constexpr (MAD-199)
     return buf;
 }
 

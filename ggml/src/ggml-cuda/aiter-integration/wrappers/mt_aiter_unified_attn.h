@@ -33,6 +33,17 @@
 #define MT_AITER_UATTN_BLOCK_M              16
 #define MT_AITER_UATTN_TILE_SIZE            32
 
+// KV cache element format. Selects which AOT spec / runtime-compile path
+// gets dispatched. F16 keeps the upstream `*fp16:16` pointer signature;
+// turbo3/turbo4 switch the K/V cache pointers to `*i8:16` byte pointers
+// and bake CACHE_TYPE=1/2 as the kernel constexpr (see MAD-199 chunk A in
+// kernels/unified_attention.py).
+enum mt_aiter_cache_type {
+    MT_AITER_CACHE_F16    = 0,
+    MT_AITER_CACHE_TURBO3 = 1,
+    MT_AITER_CACHE_TURBO4 = 2,
+};
+
 // Model-shape parameters — set by the caller per model. The wrapper builds
 // the Triton signature from these at first call, so the runtime registry
 // can compile a kernel matched to the current shape.
@@ -41,6 +52,7 @@ struct mt_aiter_uattn_shape_t {
     int32_t num_q_heads;     // attention head count
     int32_t num_kv_heads;    // GQA group count (head_count / queries_per_kv)
     int32_t block_size;      // paged-cache block size in tokens (e.g. 16)
+    int32_t cache_type;      // mt_aiter_cache_type value; drives kernel selection (MAD-199)
 };
 
 #ifdef __cplusplus
