@@ -52,15 +52,20 @@ int main() {
     // Block sizes for turbo4_fp8_bs256 (from ggml-common.h)
     constexpr int BYTES_PER_FP8_BLOCK = 162;  // 2 scale + 128 idx + 32 sign
 
-    // K/V cache layout: [num_blocks, BLOCK_SIZE, NUM_KV_HEADS, head_size_packed]
-    //   where head_size_packed = head_size / QK_TURBO_FP8 × BYTES_PER_FP8_BLOCK
-    //   With BS=256 and head_size=256, that's 1 × 162 bytes per (token, kv_head).
+    // K/V cache size: allocate enough for the LARGER of F16 and FP8 layouts
+    // so the same buffer works in either mode for A/B testing on the same shape.
+    //   F16 cache: [num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE] fp16
+    //     = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * 2 bytes
+    //   FP8 cache: same layout but head_size bytes packed at BYTES_PER_FP8_BLOCK
+    //     = NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * BYTES_PER_FP8_BLOCK
+    //   F16 is bigger when head_size*2 > BYTES_PER_FP8_BLOCK (256*2=512 > 162).
     constexpr int NUM_BLOCKS    = NUM_KV_TOKENS / BLOCK_SIZE;  // = 1
-    constexpr size_t KV_BLOCK_BYTES = (size_t) BLOCK_SIZE * NUM_KV_HEADS * BYTES_PER_FP8_BLOCK;
-    constexpr size_t KV_TOTAL_BYTES = (size_t) NUM_BLOCKS * KV_BLOCK_BYTES;
+    constexpr size_t KV_TOTAL_BYTES_F16 = (size_t) NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * sizeof(_Float16);
+    constexpr size_t KV_TOTAL_BYTES_FP8 = (size_t) NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * BYTES_PER_FP8_BLOCK;
+    constexpr size_t KV_TOTAL_BYTES     = KV_TOTAL_BYTES_F16 > KV_TOTAL_BYTES_FP8 ? KV_TOTAL_BYTES_F16 : KV_TOTAL_BYTES_FP8;
 
-    fprintf(stderr, "# KV cache: %zu bytes per block × %d blocks = %zu bytes total\n",
-            KV_BLOCK_BYTES, NUM_BLOCKS, KV_TOTAL_BYTES);
+    fprintf(stderr, "# KV cache: F16 needs %zu bytes, FP8 needs %zu bytes → allocating %zu\n",
+            KV_TOTAL_BYTES_F16, KV_TOTAL_BYTES_FP8, KV_TOTAL_BYTES);
 
     // ── Allocate device buffers ────────────────────────────────────────────
     void *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_out = nullptr;
@@ -121,7 +126,11 @@ int main() {
     shape.num_q_heads  = NUM_Q_HEADS;
     shape.num_kv_heads = NUM_KV_HEADS;
     shape.block_size   = BLOCK_SIZE;
-    shape.cache_type   = MT_AITER_CACHE_TURBO4_FP8;  // = 24 (BS=256 production)
+    // Toggle via env to A/B test FP8 path vs F16 baseline on the SAME shape.
+    const char *env_ct = getenv("MT_TEST_CACHE_TYPE");
+    int test_cache_type = env_ct ? atoi(env_ct) : MT_AITER_CACHE_TURBO4_FP8;
+    shape.cache_type   = test_cache_type;
+    fprintf(stderr, "# cache_type = %d (override with MT_TEST_CACHE_TYPE env)\n", test_cache_type);
 
     mt_aiter_uattn_args_t args {};
     args.shape              = shape;
@@ -138,7 +147,7 @@ int main() {
     args.q_descale          = d_q_descale;
     args.k_descale          = d_k_descale;
     args.v_descale          = d_v_descale;
-    args.out_scale          = nullptr;
+    args.out_scale          = d_q_descale;  // reuse the ones-buffer (kernel divides by this)
     args.centroids_k        = d_centroids_k;
     args.centroids_v        = d_centroids_v;
     args.scale              = 1.0f / 16.0f;   // 1/sqrt(head_size)
@@ -147,11 +156,16 @@ int main() {
     args.block_table_stride = (int64_t) h_block_tables.size();
     args.q_stride_0         = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
     args.output_stride_0    = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
-    // K/V strides (for turbo-FP8 these are not used by the loader — it computes
-    // byte offsets internally — but the launch signature requires them.)
-    args.k_stride_0         = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * BYTES_PER_FP8_BLOCK;
-    args.k_stride_1         = (int64_t) NUM_KV_HEADS * BYTES_PER_FP8_BLOCK;
-    args.k_stride_2         = (int64_t) BYTES_PER_FP8_BLOCK;
+    // K/V strides. For F16 path: strides in fp16 ELEMENTS (kernel does
+    // *fp16 pointer arithmetic). For FP8 path: the load helper computes its
+    // own byte offsets from BYTES_PER_BLOCK constexpr — strides are unused,
+    // but still need to be valid i64 values in the kernel args list.
+    // Set them to F16-element strides which work for both:
+    //   - F16: correct
+    //   - FP8: ignored (helper uses its own math)
+    args.k_stride_0         = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE;  // elements per block
+    args.k_stride_1         = (int64_t) NUM_KV_HEADS * HEAD_SIZE;               // elements per token
+    args.k_stride_2         = (int64_t) HEAD_SIZE;                              // elements per kv_head
     args.v_stride_0         = args.k_stride_0;
     args.v_stride_1         = args.k_stride_1;
     args.v_stride_2         = args.k_stride_2;
