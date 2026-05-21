@@ -131,10 +131,16 @@ int main() {
     constexpr int NUM_KV_HEADS  = 4;
     constexpr int Q_HEADS_PER_KV = NUM_Q_HEADS / NUM_KV_HEADS;
     constexpr int BLOCK_SIZE    = 16;
-    constexpr int NUM_KV_TOKENS = 16;
+    // NUM_KV_TOKENS=512 forces multi-segment work in the 3D split-K decode
+    // kernel. With NUM_SEGMENTS_PER_SEQ=32 and TILE_SIZE=32, segments 0..15
+    // each process one tile (32 tokens); 16+ are empty. This exercises both
+    // the per-segment partial softmax AND the reduce_segments cross-segment
+    // max/expsum reduction — a true multi-segment test, not the degenerate
+    // single-segment case where 3D and 2D paths happen to be bit-identical.
+    constexpr int NUM_KV_TOKENS = 512;
     constexpr int NUM_SEQS      = 1;
     constexpr int Q_LEN         = 1;
-    constexpr int NUM_BLOCKS    = NUM_KV_TOKENS / BLOCK_SIZE;  // = 1
+    constexpr int NUM_BLOCKS    = NUM_KV_TOKENS / BLOCK_SIZE;  // = 32
 
     constexpr size_t KV_TOTAL_BYTES_FP8 =
         (size_t) NUM_BLOCKS * BLOCK_SIZE * NUM_KV_HEADS * BYTES_PER_FP8_BLOCK;
@@ -247,7 +253,8 @@ int main() {
     HIP_CHECK(hipMalloc(&d_segm_max,    SEGM_MAX_BYTES));
     HIP_CHECK(hipMalloc(&d_segm_expsum, SEGM_MAX_BYTES));
 
-    std::vector<int32_t> h_block_tables   = {0};
+    std::vector<int32_t> h_block_tables(NUM_BLOCKS);
+    for (int i = 0; i < NUM_BLOCKS; ++i) h_block_tables[i] = i;  // identity mapping
     std::vector<int32_t> h_seq_lens       = {NUM_KV_TOKENS};
     std::vector<int32_t> h_query_start_len = {0, Q_LEN};
     int32_t *d_block_tables = nullptr, *d_seq_lens = nullptr, *d_query_start_len = nullptr;
@@ -298,7 +305,7 @@ int main() {
     args.scale           = scale_attn;
     args.num_seqs        = NUM_SEQS;
     args.num_q_tokens    = NUM_SEQS * Q_LEN;
-    args.block_table_stride = 1;
+    args.block_table_stride = NUM_BLOCKS;  // per-sequence stride into block_tables
     args.q_stride_0      = (int64_t) NUM_Q_HEADS * HEAD_SIZE;
     args.output_stride_0 = args.q_stride_0;
     args.k_stride_0      = (int64_t) BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE;
