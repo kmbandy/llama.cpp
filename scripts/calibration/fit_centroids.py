@@ -282,39 +282,79 @@ def quant_turbo_fp8(
 # Driver
 # ---------------------------------------------------------------------------
 
-def load_kv_samples(input_dir: Path, subsample_tokens: int | None) -> dict:
+def load_kv_samples(
+    input_dir: Path,
+    subsample_tokens: int | None,
+    hadamard_mode: str = "none",
+) -> dict:
     """
-    Load all .npz files. Returns dict keyed by ('k' or 'v', layer_idx) → np array
-    of shape (n_kv_heads, total_seq_len, head_dim) — concatenated across prompts.
+    Stream-load .npz files with per-prompt subsampling AND optional per-prompt
+    Walsh-Hadamard rotation along head_dim. Returns dict keyed by
+    ('k' or 'v', layer_idx) → fp32 np array (n_kv_heads, total_subsampled, head_dim).
+
+    Memory safety: peak memory is roughly one prompt's worth of array data
+    (~tens of MB). All transforms happen per-prompt before discard. The
+    Hadamard matrix is kept in fp32 to avoid fp32×fp64 → fp64 broadcasts that
+    would double peak memory during matmul.
+
+    hadamard_mode: 'none' | 'k_only' | 'k_and_v'. The math is QH @ (KH)^T = QK^T
+    so any rotation here only models what would happen at inference if the same
+    H were applied to Q.
     """
     manifest = json.loads((input_dir / "manifest.json").read_text())
-    samples: dict[tuple[str, int], list[np.ndarray]] = {}
+    rng = np.random.default_rng(0)
+    n_prompts = len(manifest["prompts"])
+    if subsample_tokens:
+        per_prompt_budget = max(1, subsample_tokens // n_prompts)
+    else:
+        per_prompt_budget = None
+
+    # Lazy-init H once we know head_dim (after first array load).
+    H: np.ndarray | None = None
+
+    pieces: dict[tuple[str, int], list[np.ndarray]] = {}
     for prompt_meta in manifest["prompts"]:
         prompt_dir = input_dir / prompt_meta["prompt_id"]
         for layer_meta in prompt_meta["layers"]:
             L = layer_meta["layer"]
-            k_path = prompt_dir / f"layer_{L:03d}_k.npz"
-            v_path = prompt_dir / f"layer_{L:03d}_v.npz"
-            k = np.load(k_path)["k"]
-            v = np.load(v_path)["v"]
-            # k, v shape: (n_kv_heads, seq_len, head_dim)
-            samples.setdefault(("k", L), []).append(k)
-            samples.setdefault(("v", L), []).append(v)
-    # Subsample to limit memory: keep at most subsample_tokens per (kv, layer)
-    if subsample_tokens:
-        rng = np.random.default_rng(0)
-        out = {}
-        for key, arrs in samples.items():
-            cat = np.concatenate(arrs, axis=1)  # along token axis
-            n_kv_heads, seq, head_dim = cat.shape
-            total_tokens = seq
-            if total_tokens > subsample_tokens:
-                idx = rng.choice(total_tokens, size=subsample_tokens, replace=False)
-                cat = cat[:, idx, :]
-            out[key] = cat
-        return out
-    else:
-        return {k: np.concatenate(v, axis=1) for k, v in samples.items()}
+            for kv_label, fname in (("k", f"layer_{L:03d}_k.npz"), ("v", f"layer_{L:03d}_v.npz")):
+                arr = np.load(prompt_dir / fname)[kv_label].astype(np.float32, copy=False)
+                if per_prompt_budget and arr.shape[1] > per_prompt_budget:
+                    idx = rng.choice(arr.shape[1], size=per_prompt_budget, replace=False)
+                    arr = arr[:, idx, :]
+                if hadamard_mode != "none":
+                    do_rotate = (hadamard_mode == "k_and_v") or (hadamard_mode == "k_only" and kv_label == "k")
+                    if do_rotate:
+                        if H is None:
+                            H = hadamard_matrix(arr.shape[-1]).astype(np.float32)
+                        # fp32 @ fp32 → fp32; in-place semantics not possible but no fp64 inflation
+                        arr = arr @ H
+                pieces.setdefault((kv_label, L), []).append(arr)
+    out: dict[tuple[str, int], np.ndarray] = {}
+    for key, arrs in pieces.items():
+        out[key] = np.concatenate(arrs, axis=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Walsh-Hadamard rotation (outlier suppression)
+# ---------------------------------------------------------------------------
+
+def hadamard_matrix(n: int) -> np.ndarray:
+    """
+    Standard Hadamard matrix of size n (n must be a power of 2), normalized so
+    H @ H.T == I. Built via Sylvester recursion.
+    """
+    assert n & (n - 1) == 0 and n > 0, f"n must be power of 2, got {n}"
+    H = np.array([[1.0]])
+    while H.shape[0] < n:
+        H = np.block([[H, H], [H, -H]])
+    return (H / np.sqrt(n)).astype(np.float64)
+
+
+def apply_hadamard(arr: np.ndarray, H: np.ndarray) -> np.ndarray:
+    """Apply Hadamard rotation along the last dimension. arr: (..., head_dim)."""
+    return arr @ H
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +489,19 @@ def main():
         default="both",
         help="Centroid fitting granularity. 'both' (default) runs global + per_kv_layer side-by-side.",
     )
+    p.add_argument(
+        "--hadamard",
+        choices=["none", "k_only", "k_and_v"],
+        default="none",
+        help="Apply Walsh-Hadamard rotation along head_dim before quantization "
+             "(outlier suppression per KVQuant/RotateKV/QuaRot). 'k_only' matches "
+             "common practice since K has worse channel asymmetry than V.",
+    )
     args = p.parse_args()
 
     in_dir = Path(args.input_dir)
-    print(f"[fit_centroids] Loading KV samples from {in_dir}", flush=True)
-    samples = load_kv_samples(in_dir, args.subsample_tokens)
+    print(f"[fit_centroids] Loading KV samples from {in_dir} (hadamard={args.hadamard})", flush=True)
+    samples = load_kv_samples(in_dir, args.subsample_tokens, hadamard_mode=args.hadamard)
     print(f"[fit_centroids] Loaded {len(samples)} (kv, layer) keys", flush=True)
 
     e4m3 = enumerate_e4m3_finite()
@@ -468,6 +516,7 @@ def main():
         "block_size": args.block_size,
         "subsample_tokens": args.subsample_tokens,
         "granularity_mode": args.granularity,
+        "hadamard": args.hadamard,
         "results": {},
     }
     summary: dict[str, dict] = {}

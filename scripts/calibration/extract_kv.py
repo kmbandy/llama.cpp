@@ -87,14 +87,32 @@ def build_niah_prompts(num_prompts: int, ctx_tokens: int, tokenizer) -> list[str
 
 def dump_past_key_values(past_kv, out_dir: Path, prompt_id: str) -> dict:
     """
-    past_kv is a tuple of (K, V) per layer. Each tensor: (batch, n_kv_heads, seq_len, head_dim).
-    Dumps fp32 .npz per layer, returns metadata dict.
+    past_kv is a Cache object (or tuple) with one entry per model layer.
+
+    Hybrid architectures (e.g., Qwen3.5 with linear attention layers) only have
+    K/V tensors on a subset of layers. We iterate via `.layers` if present and
+    skip any layer that lacks usable K/V (linear-attention, conv, etc.). Dumps
+    fp32 .npz per traditional-attention layer; returns metadata dict.
     """
     prompt_dir = out_dir / prompt_id
     prompt_dir.mkdir(parents=True, exist_ok=True)
 
-    meta = {"prompt_id": prompt_id, "n_layers": len(past_kv), "layers": []}
-    for layer_idx, (k, v) in enumerate(past_kv):
+    # Modern transformers Cache exposes .layers; fall back to direct iteration.
+    layers_iter = getattr(past_kv, "layers", None) or list(past_kv)
+    meta = {
+        "prompt_id": prompt_id,
+        "n_layers_total": len(layers_iter),
+        "layers": [],  # populated only for layers we actually dumped
+    }
+    skipped = 0
+    for layer_idx, layer in enumerate(layers_iter):
+        # Resolve K and V tensors across cache-layer variants. Traditional attention
+        # exposes .keys / .values; linear-attention exposes neither (or None).
+        k = getattr(layer, "keys", None)
+        v = getattr(layer, "values", None)
+        if k is None or v is None or not hasattr(k, "detach") or not hasattr(v, "detach"):
+            skipped += 1
+            continue
         # Assume batch=1; squeeze it out
         k_np = k.detach().to(torch.float32).cpu().numpy()[0]  # (n_kv_heads, seq_len, head_dim)
         v_np = v.detach().to(torch.float32).cpu().numpy()[0]
@@ -103,11 +121,14 @@ def dump_past_key_values(past_kv, out_dir: Path, prompt_id: str) -> dict:
         meta["layers"].append(
             {
                 "layer": layer_idx,
+                "layer_type": type(layer).__name__,
                 "n_kv_heads": int(k_np.shape[0]),
                 "seq_len": int(k_np.shape[1]),
                 "head_dim": int(k_np.shape[2]),
             }
         )
+    meta["n_traditional_attention_layers"] = len(meta["layers"])
+    meta["n_skipped_non_attention_layers"] = skipped
     return meta
 
 
@@ -136,7 +157,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         device_map=args.device,
         trust_remote_code=True,
     )
