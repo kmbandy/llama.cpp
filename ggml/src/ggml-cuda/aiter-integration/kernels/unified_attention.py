@@ -997,16 +997,23 @@ def kernel_unified_attention_2d(
                 IDX_BITS, BYTES_PER_FP8_BLOCK,
                 dim_mask, tile_mask,
             )
-            # NOTE (MAD-214 Phase 1F-B, next commit): the dot sites below still
-            # reference K and V (fp16) — for the FP8 path we'll branch the dot
-            # calls to use (K_fp8, K_scales) and (V_fp8, V_scales). Until that
-            # commit lands, this branch produces unused variables. The
-            # tl.static_assert above prevents callers from accidentally hitting
-            # this path until the dot-site wiring is in place.
+            # Dot-site wiring lives below in this same kernel (Phase 1F-C).
+            # K_fp8 / V_fp8 (int8 byte tiles) and K_scales / V_scales (per-token
+            # fp32) are consumed by the IS_TURBO_FP8 branches at the Q·K^T and
+            # P·V dot sites.
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if IS_TURBO_FP8:
+            # FP8 Q·K^T via tl.dot — verified to emit v_wmma_f32_16x16x16_fp8_fp8
+            # on gfx1201 (tests/test_triton_fp8_dot_probe.py). int8 byte tiles
+            # bitcast to tl.float8e4nv at the call site. FP32 accumulator gets
+            # per-Q-row and per-K-token scale multiplied in via broadcast.
+            K_fp8_view = K_fp8.to(tl.float8e4nv, bitcast=True)              # (HEAD, TILE)
+            S_partial_fp8 = tl.dot(Q_fp8_tensor, K_fp8_view, out_dtype=tl.float32)
+            S = qk_scale * S_partial_fp8 * Q_scale_fp8[:, None] * K_scales[None, :]
+        else:
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -1067,7 +1074,21 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        if IS_TURBO_FP8:
+            # FP8 P·V leg. P (fp32 from softmax) gets per-V-token scale folded
+            # in (since V[t, h] = V_fp8[t, h] * V_scale[t] and the matmul sums
+            # over t, we factor scale into P[:, t]). Then per-row max FP8 quant
+            # on P_scaled, dot, accumulate.
+            P_scaled       = P * V_scales[None, :]                  # (BLOCK_M, TILE)
+            P_abs_max      = tl.max(tl.abs(P_scaled), axis=1)       # (BLOCK_M,)
+            P_scale_fp8    = tl.where(P_abs_max > 0, P_abs_max, 1.0)
+            P_normalized   = P_scaled / P_scale_fp8[:, None]
+            P_fp8          = P_normalized.to(tl.float8e4nv)         # (BLOCK_M, TILE)
+            V_fp8_view     = V_fp8.to(tl.float8e4nv, bitcast=True)  # (TILE, HEAD)
+            acc_partial    = tl.dot(P_fp8, V_fp8_view, out_dtype=tl.float32)
+            acc            = acc + acc_partial * P_scale_fp8[:, None]
+        else:
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
