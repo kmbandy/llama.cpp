@@ -148,11 +148,63 @@ CACHE_TYPE_F16    = 0
 CACHE_TYPE_TURBO3 = 1
 CACHE_TYPE_TURBO4 = 2
 
+# MAD-214: turbo-FP8 family — FP8 matrix-core path via centroid LUT decode.
+# Numeric scheme matches mt_aiter_cache_type enum in
+# wrappers/mt_aiter_unified_attn.h:
+#   10..14 = turbo3_fp8 × BS{16,32,64,128,256}
+#   20..24 = turbo4_fp8 × BS{16,32,64,128,256}
+#   30..34 = turbo5_fp8 × BS{16,32,64,128,256}
+# Only BS=256 (production) variants are wired at MAD-214 Phase 1 ship;
+# others reserved for MAD-215 follow-up.
+CACHE_TYPE_TURBO3_FP8_BS16  = 10
+CACHE_TYPE_TURBO3_FP8_BS32  = 11
+CACHE_TYPE_TURBO3_FP8_BS64  = 12
+CACHE_TYPE_TURBO3_FP8_BS128 = 13
+CACHE_TYPE_TURBO3_FP8_BS256 = 14
+
+CACHE_TYPE_TURBO4_FP8_BS16  = 20
+CACHE_TYPE_TURBO4_FP8_BS32  = 21
+CACHE_TYPE_TURBO4_FP8_BS64  = 22
+CACHE_TYPE_TURBO4_FP8_BS128 = 23
+CACHE_TYPE_TURBO4_FP8_BS256 = 24
+
+CACHE_TYPE_TURBO5_FP8_BS16  = 30
+CACHE_TYPE_TURBO5_FP8_BS32  = 31
+CACHE_TYPE_TURBO5_FP8_BS64  = 32
+CACHE_TYPE_TURBO5_FP8_BS128 = 33
+CACHE_TYPE_TURBO5_FP8_BS256 = 34
+
+# Production aliases — unsuffixed names resolve to the BS=256 variant.
+CACHE_TYPE_TURBO3_FP8 = CACHE_TYPE_TURBO3_FP8_BS256
+CACHE_TYPE_TURBO4_FP8 = CACHE_TYPE_TURBO4_FP8_BS256
+CACHE_TYPE_TURBO5_FP8 = CACHE_TYPE_TURBO5_FP8_BS256
+
 # Triton-side constexprs — wrapped in tl.constexpr because Triton rejects plain
 # Python globals inside @triton.jit functions per Triton docs (NameError on use,
 # even though triton.language.constexpr(...) is the canonical workaround).
 BYTES_PER_TURBO3_BLOCK = tl.constexpr(50)
 BYTES_PER_TURBO4_BLOCK = tl.constexpr(68)
+
+# turbo-FP8 block sizes — must match ggml-common.h
+#   block_turbo{3,4,5}_fp8_bs{N} = 2 (FP16 scale) + N*K/8 (idx) + N/8 (sign)
+# where K = 3 / 4 / 5 for turbo3 / turbo4 / turbo5 respectively.
+BYTES_PER_TURBO3_FP8_BS16_BLOCK  = tl.constexpr(10)
+BYTES_PER_TURBO3_FP8_BS32_BLOCK  = tl.constexpr(18)
+BYTES_PER_TURBO3_FP8_BS64_BLOCK  = tl.constexpr(34)
+BYTES_PER_TURBO3_FP8_BS128_BLOCK = tl.constexpr(66)
+BYTES_PER_TURBO3_FP8_BS256_BLOCK = tl.constexpr(130)
+
+BYTES_PER_TURBO4_FP8_BS16_BLOCK  = tl.constexpr(12)
+BYTES_PER_TURBO4_FP8_BS32_BLOCK  = tl.constexpr(22)
+BYTES_PER_TURBO4_FP8_BS64_BLOCK  = tl.constexpr(42)
+BYTES_PER_TURBO4_FP8_BS128_BLOCK = tl.constexpr(82)
+BYTES_PER_TURBO4_FP8_BS256_BLOCK = tl.constexpr(162)
+
+BYTES_PER_TURBO5_FP8_BS16_BLOCK  = tl.constexpr(14)
+BYTES_PER_TURBO5_FP8_BS32_BLOCK  = tl.constexpr(26)
+BYTES_PER_TURBO5_FP8_BS64_BLOCK  = tl.constexpr(50)
+BYTES_PER_TURBO5_FP8_BS128_BLOCK = tl.constexpr(98)
+BYTES_PER_TURBO5_FP8_BS256_BLOCK = tl.constexpr(194)
 
 
 @triton.jit
@@ -190,6 +242,56 @@ def turbo4_centroid(idx):
     m4567     = tl.where(mag_idx < 6,  m45, m67)
     mag       = tl.where(mag_idx < 4,  m0123, m4567)
     return tl.where(is_pos, mag, -mag)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# MAD-214: turbo-FP8 decode helpers (production-shape, output FP8 bytes for
+# direct tl.dot consumption). Parameterized by N_CENTROIDS / IDX_BITS so the
+# same body handles turbo3 (8 cent, 3 bits) / turbo4 (16, 4) / turbo5 (32, 5).
+#
+# Unlike turbo3_centroid / turbo4_centroid above (which return fp32 magnitudes
+# from a hardcoded table), turbo-FP8 uses PER-(kv, layer) centroid LUTs loaded
+# at runtime as positive E4M3 bytes — see scripts/calibration/export_centroids.py
+# generated headers. Sign bit is XOR'd into the byte at decode time, producing
+# a signed FP8 byte that's reinterpreted as tl.float8e4nv for tl.dot.
+#
+# Validated bit-exact against the scalar reference in
+# tests/test-turbo-fp8-reference.cpp (see also tests/test_triton_turbo_fp8_decode.py).
+# ─────────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def turbo_fp8_extract_idx(qs_word, bit_off, IDX_BITS: tl.constexpr):
+    """Extract IDX_BITS index from a 16-bit window at bit_off."""
+    mask = (1 << IDX_BITS) - 1
+    return (qs_word >> bit_off) & mask
+
+
+@triton.jit
+def turbo_fp8_decode_byte(
+    qs_lo,            # uint8 — low byte of the bit window for this element
+    qs_hi,            # uint8 — high byte (next byte; ignored if element is byte-aligned)
+    bit_off,          # int   — bit offset within the low byte
+    sign_byte,        # uint8 — sign-bits byte for this element's group
+    sign_bit_off,     # int   — bit offset within the sign byte
+    lut_ptr,          # *uint8 — N_CENTROIDS E4M3 bytes for this (kv, layer)
+    IDX_BITS: tl.constexpr,
+):
+    """
+    Decode one packed turbo-FP8 element to a signed FP8 byte.
+
+      idx       = ((qs_hi << 8) | qs_lo) >> bit_off  & ((1 << IDX_BITS) - 1)
+      sign      = (sign_byte >> sign_bit_off) & 1
+      cent_byte = lut[idx]
+      out_byte  = cent_byte ^ (sign << 7)   # XOR into the FP8 sign bit
+
+    Returns an int8 holding the signed E4M3 byte. Reinterpret as
+    tl.float8e4nv via .to(tl.float8e4nv, bitcast=True) at the tl.dot site.
+    """
+    word          = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
+    idx           = turbo_fp8_extract_idx(word, bit_off, IDX_BITS)
+    sign_bit      = (sign_byte.to(tl.int32) >> sign_bit_off) & 1
+    centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)
+    return (centroid_byte | (sign_bit << 7)).to(tl.int8)
 
 
 @triton.jit
