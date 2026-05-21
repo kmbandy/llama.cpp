@@ -284,8 +284,8 @@ def quant_turbo_fp8(
 
 def load_kv_samples(input_dir: Path, subsample_tokens: int | None) -> dict:
     """
-    Load all .npz files. Returns dict keyed by ('k' or 'v', layer_idx) → list of
-    np arrays of shape (n_kv_heads, seq_len, head_dim).
+    Load all .npz files. Returns dict keyed by ('k' or 'v', layer_idx) → np array
+    of shape (n_kv_heads, total_seq_len, head_dim) — concatenated across prompts.
     """
     manifest = json.loads((input_dir / "manifest.json").read_text())
     samples: dict[tuple[str, int], list[np.ndarray]] = {}
@@ -317,13 +317,138 @@ def load_kv_samples(input_dir: Path, subsample_tokens: int | None) -> dict:
         return {k: np.concatenate(v, axis=1) for k, v in samples.items()}
 
 
+# ---------------------------------------------------------------------------
+# Granularity dispatch
+# ---------------------------------------------------------------------------
+
+VARIANT_SPECS = [
+    # (display_name, callable(x_blocked, block_size, e4m3, pos_e4m3) -> QuantResult)
+    ("fp8_raw",            lambda x, bs, e, p: quant_fp8_raw(x.astype(np.float32), e)),
+    ("int4_q4_0",          lambda x, bs, e, p: quant_int4_blockwise(x, bs)),
+    ("turbo3_fp16_scale",  lambda x, bs, e, p: quant_turbo_unconstrained(x, 8,  bs, "turbo3_fp16_scale")),
+    ("turbo4_fp16_scale",  lambda x, bs, e, p: quant_turbo_unconstrained(x, 16, bs, "turbo4_fp16_scale")),
+    ("turbo3_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 8,  bs, p, "turbo3_fp8")),
+    ("turbo4_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 16, bs, p, "turbo4_fp8")),
+    ("turbo5_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 32, bs, p, "turbo5_fp8")),
+]
+
+
+def reshape_for_blocks(arr: np.ndarray, block_size: int) -> np.ndarray:
+    """Pad to multiple of block_size and reshape to (n_blocks, block_size)."""
+    flat = arr.ravel()
+    pad = (-flat.size) % block_size
+    if pad:
+        flat = np.concatenate([flat, np.zeros(pad)])
+    return flat.reshape(-1, block_size)
+
+
+def run_variants_global(
+    samples: dict, block_size: int, e4m3: np.ndarray, pos_e4m3: np.ndarray
+) -> list[QuantResult]:
+    """One centroid set fit globally across all (kv, layer) elements."""
+    all_x = np.concatenate([arr.ravel() for arr in samples.values()])
+    print(f"[fit_centroids][global] Total elements: {all_x.size:,}", flush=True)
+    x_blocked = reshape_for_blocks(all_x, block_size)
+    return [spec[1](x_blocked, block_size, e4m3, pos_e4m3) for spec in VARIANT_SPECS]
+
+
+def run_variants_per_kv_layer(
+    samples: dict, block_size: int, e4m3: np.ndarray, pos_e4m3: np.ndarray
+) -> tuple[list[QuantResult], dict]:
+    """
+    Fit centroids per (kv, layer). Returns (aggregated_results, per_key_breakdown).
+    Aggregated MSE = sum(per_key_mse * per_key_count) / total_count.
+    """
+    keys = sorted(samples.keys())  # deterministic order
+    print(f"[fit_centroids][per_kv_layer] Fitting per (kv, layer) across {len(keys)} keys...", flush=True)
+
+    # per_key_results[variant_name] -> list of (key, mse, n_elements)
+    per_key_results: dict[str, list[tuple]] = {name: [] for name, _ in VARIANT_SPECS}
+    # Centroids per (variant, key) — only saved for variants that produce them
+    centroid_log: dict[str, dict] = {name: {} for name, _ in VARIANT_SPECS}
+
+    for kv, L in keys:
+        arr = samples[(kv, L)]
+        x_blocked = reshape_for_blocks(arr, block_size)
+        n_elements = x_blocked.size
+        for vname, vfunc in VARIANT_SPECS:
+            qr = vfunc(x_blocked, block_size, e4m3, pos_e4m3)
+            per_key_results[vname].append((f"{kv}_L{L}", qr.mse, n_elements))
+            # Save constrained centroids for inspection (only fp8 variants)
+            if "centroids_constrained" in qr.extra:
+                centroid_log[vname][f"{kv}_L{L}"] = qr.extra["centroids_constrained"]
+            elif "centroids" in qr.extra:
+                centroid_log[vname][f"{kv}_L{L}"] = qr.extra["centroids"]
+        print(f"[fit_centroids][per_kv_layer]   {kv} L{L} done ({n_elements:,} elements)", flush=True)
+
+    # Aggregate MSE per variant via element-count-weighted mean
+    aggregated: list[QuantResult] = []
+    for vname, vfunc in VARIANT_SPECS:
+        total_se = sum(mse * n for _, mse, n in per_key_results[vname])
+        total_n = sum(n for _, _, n in per_key_results[vname])
+        agg_mse = total_se / max(1, total_n)
+        # BPV stays the same regardless of granularity (centroid tables are negligible)
+        # Re-derive bpv from a fresh call on the first key
+        first_arr = samples[keys[0]]
+        first_blocked = reshape_for_blocks(first_arr, block_size)
+        qr_ref = vfunc(first_blocked, block_size, e4m3, pos_e4m3)
+        aggregated.append(
+            QuantResult(
+                name=vname,
+                mse=agg_mse,
+                bits_per_value=qr_ref.bits_per_value,
+                extra={"per_key_mse": {k: m for k, m, _ in per_key_results[vname]}},
+            )
+        )
+    return aggregated, centroid_log
+
+
+def _print_table(title: str, variants: list[QuantResult], fp8_raw_mse: float) -> None:
+    print(f"\n[fit_centroids] === {title} ===", flush=True)
+    print(f"{'variant':<25} {'bpv':>6}  {'MSE':>14}  {'MSE / fp8_raw':>15}", flush=True)
+    for v in variants:
+        ratio = v.mse / fp8_raw_mse if fp8_raw_mse > 0 else float("nan")
+        print(f"{v.name:<25} {v.bits_per_value:>6.2f}  {v.mse:>14.6e}  {ratio:>15.3f}", flush=True)
+
+
+def _verdict(turbo4_ratio: float) -> str:
+    if turbo4_ratio <= 1.5:
+        return "PROCEED"
+    elif turbo4_ratio <= 3.0:
+        return "MARGINAL"
+    else:
+        return "STOP"
+
+
+def _variant_summary(variants: list[QuantResult], fp8_mse: float, include_per_key: bool) -> list[dict]:
+    out = []
+    for v in variants:
+        entry = {
+            "name": v.name,
+            "bits_per_value": v.bits_per_value,
+            "mse": v.mse,
+            "mse_over_fp8_raw": v.mse / fp8_mse if fp8_mse > 0 else float("nan"),
+        }
+        if include_per_key:
+            entry["per_key_mse"] = v.extra.get("per_key_mse", {})
+        else:
+            entry["extra"] = v.extra
+        out.append(entry)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input-dir", required=True)
     p.add_argument("--output-report", required=True)
     p.add_argument("--block-size", type=int, default=32)
     p.add_argument("--subsample-tokens", type=int, default=4096, help="Per (kv, layer) token cap")
-    p.add_argument("--per-layer", action="store_true", help="Report per-layer MSE in addition to global")
+    p.add_argument(
+        "--granularity",
+        choices=["global", "per_kv_layer", "both"],
+        default="both",
+        help="Centroid fitting granularity. 'both' (default) runs global + per_kv_layer side-by-side.",
+    )
     args = p.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -338,67 +463,65 @@ def main():
         flush=True,
     )
 
-    # Aggregate samples across all (kv, layer) for global fit
-    all_x = np.concatenate([arr.ravel() for arr in samples.values()])
-    print(f"[fit_centroids] Total elements for global fit: {all_x.size:,}", flush=True)
-
-    # Reshape so the last dim is divisible by block_size
-    # all_x is already flat; pad to multiple of block_size
-    pad = (-all_x.size) % args.block_size
-    if pad:
-        all_x = np.concatenate([all_x, np.zeros(pad)])
-    all_x = all_x.reshape(-1, args.block_size)
-
-    variants: list[QuantResult] = []
-    print("[fit_centroids] Running quantization variants...", flush=True)
-    variants.append(quant_fp8_raw(all_x.astype(np.float32), e4m3))
-    variants.append(quant_int4_blockwise(all_x, args.block_size))
-    variants.append(quant_turbo_unconstrained(all_x, 8, args.block_size, "turbo3_fp16_scale"))
-    variants.append(quant_turbo_unconstrained(all_x, 16, args.block_size, "turbo4_fp16_scale"))
-    variants.append(quant_turbo_fp8(all_x, 8, args.block_size, pos_e4m3, "turbo3_fp8"))
-    variants.append(quant_turbo_fp8(all_x, 16, args.block_size, pos_e4m3, "turbo4_fp8"))
-    variants.append(quant_turbo_fp8(all_x, 32, args.block_size, pos_e4m3, "turbo5_fp8"))
-
-    fp8_raw_mse = next(v.mse for v in variants if v.name == "fp8_raw")
-
-    print("\n[fit_centroids] === RESULTS ===", flush=True)
-    print(f"{'variant':<25} {'bpv':>6}  {'MSE':>14}  {'MSE / fp8_raw':>15}", flush=True)
-    for v in variants:
-        ratio = v.mse / fp8_raw_mse if fp8_raw_mse > 0 else float("nan")
-        print(f"{v.name:<25} {v.bits_per_value:>6.2f}  {v.mse:>14.6e}  {ratio:>15.3f}", flush=True)
-
-    # Go/no-go signal
-    turbo4_fp8 = next(v for v in variants if v.name == "turbo4_fp8")
-    ratio = turbo4_fp8.mse / fp8_raw_mse if fp8_raw_mse > 0 else float("inf")
-    print(f"\n[fit_centroids] GO/NO-GO: turbo4_fp8 MSE / fp8_raw MSE = {ratio:.3f}", flush=True)
-    if ratio <= 1.5:
-        print("[fit_centroids] => PROCEED to Phase 1 (kernel implementation)", flush=True)
-        verdict = "PROCEED"
-    elif ratio <= 3.0:
-        print("[fit_centroids] => MARGINAL — revisit design (per-head centroids? K/V split? Hadamard?)", flush=True)
-        verdict = "MARGINAL"
-    else:
-        print("[fit_centroids] => STOP — fundamental codebook fit is bad, redesign needed", flush=True)
-        verdict = "STOP"
-
-    report = {
+    report: dict = {
         "input_dir": str(in_dir),
         "block_size": args.block_size,
         "subsample_tokens": args.subsample_tokens,
-        "fp8_raw_mse": fp8_raw_mse,
-        "verdict": verdict,
-        "turbo4_fp8_ratio": ratio,
-        "variants": [
-            {
-                "name": v.name,
-                "bits_per_value": v.bits_per_value,
-                "mse": v.mse,
-                "mse_over_fp8_raw": v.mse / fp8_raw_mse if fp8_raw_mse > 0 else float("nan"),
-                "extra": v.extra,
-            }
-            for v in variants
-        ],
+        "granularity_mode": args.granularity,
+        "results": {},
     }
+    summary: dict[str, dict] = {}
+
+    if args.granularity in ("global", "both"):
+        variants_g = run_variants_global(samples, args.block_size, e4m3, pos_e4m3)
+        fp8_g = next(v.mse for v in variants_g if v.name == "fp8_raw")
+        t4_g = next(v.mse for v in variants_g if v.name == "turbo4_fp8")
+        ratio_g = t4_g / fp8_g if fp8_g > 0 else float("inf")
+        _print_table("RESULTS — global centroids", variants_g, fp8_g)
+        verdict_g = _verdict(ratio_g)
+        print(f"[fit_centroids] global        turbo4_fp8 MSE / fp8_raw = {ratio_g:.3f}  => {verdict_g}", flush=True)
+        summary["global"] = {"ratio": ratio_g, "verdict": verdict_g}
+        report["results"]["global"] = {
+            "fp8_raw_mse": fp8_g,
+            "turbo4_fp8_ratio": ratio_g,
+            "verdict": verdict_g,
+            "variants": _variant_summary(variants_g, fp8_g, include_per_key=False),
+        }
+
+    if args.granularity in ("per_kv_layer", "both"):
+        variants_p, centroid_log = run_variants_per_kv_layer(samples, args.block_size, e4m3, pos_e4m3)
+        fp8_p = next(v.mse for v in variants_p if v.name == "fp8_raw")
+        t4_p = next(v.mse for v in variants_p if v.name == "turbo4_fp8")
+        ratio_p = t4_p / fp8_p if fp8_p > 0 else float("inf")
+        _print_table("RESULTS — per (kv, layer) centroids", variants_p, fp8_p)
+        verdict_p = _verdict(ratio_p)
+        print(f"[fit_centroids] per_kv_layer  turbo4_fp8 MSE / fp8_raw = {ratio_p:.3f}  => {verdict_p}", flush=True)
+        summary["per_kv_layer"] = {"ratio": ratio_p, "verdict": verdict_p}
+        report["results"]["per_kv_layer"] = {
+            "fp8_raw_mse": fp8_p,
+            "turbo4_fp8_ratio": ratio_p,
+            "verdict": verdict_p,
+            "variants": _variant_summary(variants_p, fp8_p, include_per_key=True),
+            "centroid_log": centroid_log,
+        }
+
+    # Final go/no-go: best ratio across granularities tried
+    best_mode, best_info = min(summary.items(), key=lambda kv: kv[1]["ratio"])
+    final = _verdict(best_info["ratio"])
+    print(
+        f"\n[fit_centroids] FINAL GO/NO-GO (best granularity={best_mode}, ratio={best_info['ratio']:.3f}): {final}",
+        flush=True,
+    )
+    if final == "PROCEED":
+        print("[fit_centroids] => PROCEED to Phase 1 (kernel implementation)", flush=True)
+    elif final == "MARGINAL":
+        print("[fit_centroids] => MARGINAL — revisit design (per-head centroids? K/V split? Hadamard?)", flush=True)
+    else:
+        print("[fit_centroids] => STOP — fundamental codebook fit is bad, redesign needed", flush=True)
+
+    report["final_verdict"] = final
+    report["best_granularity"] = best_mode
+    report["best_ratio"] = best_info["ratio"]
     Path(args.output_report).write_text(json.dumps(report, indent=2))
     print(f"\n[fit_centroids] Report written: {args.output_report}", flush=True)
 
