@@ -935,7 +935,7 @@ def kernel_unified_attention_2d(
                 N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
                 dim_mask, tile_mask,
             ).to(Q.dtype)
-        else:  # CACHE_TYPE == 2, TURBO4
+        elif CACHE_TYPE == 2:  # TURBO4
             N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
             K = load_turbo4_kv_tile_K(
                 key_cache_ptr, physical_block_idx, token_in_block,
@@ -949,6 +949,45 @@ def kernel_unified_attention_2d(
                 N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
                 dim_mask, tile_mask,
             ).to(Q.dtype)
+        else:  # MAD-214: turbo-FP8 family. CACHE_TYPE in {10..14, 20..24, 30..34}.
+            # Derive constexpr metadata from CACHE_TYPE:
+            #   IDX_BITS:        3 for turbo3-FP8 (10..14)
+            #                    4 for turbo4-FP8 (20..24)
+            #                    5 for turbo5-FP8 (30..34)
+            #   BYTES_PER_BLOCK: BS=256 layout = 2 (FP16 scale) + 256*IDX_BITS/8 + 32
+            # Only the BS=256 variants (CACHE_TYPE ∈ {14, 24, 34}) are wired
+            # at MAD-214 Phase 1 ship; BS<256 (MAD-215) requires the per-block
+            # accumulation kernel path not implemented in this kernel.
+            tl.static_assert(
+                (CACHE_TYPE == 14) or (CACHE_TYPE == 24) or (CACHE_TYPE == 34),
+                "turbo-FP8: only BS=256 variants are wired in this kernel (MAD-215 covers BS<256)",
+            )
+            IDX_BITS: tl.constexpr = 3 if CACHE_TYPE < 20 else (4 if CACHE_TYPE < 30 else 5)
+            BYTES_PER_FP8_BLOCK: tl.constexpr = 2 + 256 * IDX_BITS // 8 + 32  # 130 / 162 / 194
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+
+            K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                centroids_k_ptr,
+                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                IDX_BITS, BYTES_PER_FP8_BLOCK,
+                dim_mask, tile_mask,
+            )
+            V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                centroids_v_ptr,
+                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                IDX_BITS, BYTES_PER_FP8_BLOCK,
+                dim_mask, tile_mask,
+            )
+            # NOTE (MAD-214 Phase 1F-B, next commit): the dot sites below still
+            # reference K and V (fp16) — for the FP8 path we'll branch the dot
+            # calls to use (K_fp8, K_scales) and (V_fp8, V_scales). Until that
+            # commit lands, this branch produces unused variables. The
+            # tl.static_assert above prevents callers from accidentally hitting
+            # this path until the dot-site wiring is in place.
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
