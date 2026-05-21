@@ -51,7 +51,19 @@
 //   else if avg_q_len >= MT_AITER_UATTN_BLOCK_Q            → 2D base
 //   else                                                   → 3D split-K
 // ─────────────────────────────────────────────────────────────────────────
-#define MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ      32
+// MAD-203 phase 2: bumped from 32 → 128 to match upstream's
+//   num_segments = ceil(target_num_prgms / num_2d_prgms)
+// where target_num_prgms = cu_count * 4 (= 256 on R9700, 64 CUs) and
+// num_2d_prgms = num_q_blocks * num_kv_heads. For single-seq decode
+// (num_q_blocks=1, num_kv_heads=2) this works out to 128. We're hardcoding
+// to that value because our production config is parallel=1; multi-seq
+// configs would benefit from a dynamic-dispatch approach (multiple AOT
+// specs, phase 3) but single-seq is the common case.
+//
+// Effect: 4× more grid cells per 3D kernel launch — better GPU saturation
+// per call. Reduce workspace scales linearly with NUM_SEGMENTS but at
+// single-seq decode the absolute size stays small (~1 MB).
+#define MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ      128
 #define MT_AITER_UATTN_TILE_SIZE                 32
 
 // 3D + 2D-base spec (decode + short prefill)
