@@ -97,7 +97,8 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
         "%d, %d, %d, %d, "                  // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
-        "*i32, %d, i32, %d, %d, 1, %d",     // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199)
+        "*i32, %d, i32, %d, %d, 1, %d, "    // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199)
+        "*u8:1, *u8:1",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
         s.num_q_heads,                          // num_q_heads constexpr
@@ -151,7 +152,8 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         "0, 0, 0, 0, 0, "                                                // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
         "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
-        "-448.0, 448.0, 0, %d",                                          // FP8_MIN, FP8_MAX, ALL_DECODE=0 (prefill), CACHE_TYPE
+        "-448.0, 448.0, 0, %d, "                                         // FP8_MIN, FP8_MAX, ALL_DECODE=0 (prefill), CACHE_TYPE
+        "*u8:1, *u8:1",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
         kv_ptr_dtype, kv_ptr_dtype,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
         s.head_size, s.head_size,           // query_stride_1, output_stride_1
