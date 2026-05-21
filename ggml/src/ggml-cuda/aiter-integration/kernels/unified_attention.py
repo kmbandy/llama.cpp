@@ -1357,7 +1357,7 @@ def kernel_unified_attention_3d(
                 N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
                 dim_mask, tile_mask,
             ).to(Q.dtype)
-        else:  # CACHE_TYPE == 2, TURBO4
+        elif CACHE_TYPE == 2:  # TURBO4
             N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
             K = load_turbo4_kv_tile_K(
                 key_cache_ptr, physical_block_idx, token_in_block,
@@ -1371,6 +1371,16 @@ def kernel_unified_attention_3d(
                 N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
                 dim_mask, tile_mask,
             ).to(Q.dtype)
+        else:  # MAD-214 placeholder. turbo-FP8 path TBD in next commit (Phase 1F-D).
+            # The 2d kernel handles turbo-FP8 end-to-end today; the 3d split-K
+            # decode kernel needs the analogous Q-quant + K/V load branch +
+            # dot-site wiring. Until that lands, fail loudly rather than feed
+            # callers wrong output via the silently-mis-dispatched TURBO4 path.
+            tl.static_assert(
+                CACHE_TYPE < 10 or CACHE_TYPE > 34,
+                "turbo-FP8 not yet wired in kernel_unified_attention_3d (split-K decode). "
+                "Use kernel_unified_attention_2d for now, or wait for Phase 1F-D.",
+            )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
