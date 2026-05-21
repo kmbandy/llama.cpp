@@ -99,6 +99,46 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
     return buf;
 }
 
+// MAD-199 chunk D3: 2D-kernel signature for prefill dispatch.
+// kernel_unified_attention_2d is single-pass-per-(kv_head, q_block) — no
+// split-K, no reduce phase. Better for prefill (q_len >> 1) where each Q
+// block has plenty of work; the 3D kernel's split-K reduction overhead
+// dominates instead of helping at this size.
+//
+// Same K/V cache pointer dtype switch as build_signature_3d (cache_type
+// drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
+std::string build_signature_2d(const mt_aiter_uattn_shape_t & s) {
+    const char * kv_ptr_dtype;
+    int          cache_type_val;
+    switch (s.cache_type) {
+        case MT_AITER_CACHE_F16:    kv_ptr_dtype = "*fp16:16"; cache_type_val = 0; break;
+        case MT_AITER_CACHE_TURBO3: kv_ptr_dtype = "*i8:16";   cache_type_val = 1; break;
+        case MT_AITER_CACHE_TURBO4: kv_ptr_dtype = "*i8:16";   cache_type_val = 2; break;
+        default:                    kv_ptr_dtype = "*fp16:16"; cache_type_val = 0; break;
+    }
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf),
+        "*fp16:16, *fp16:16, %s, %s, *fp32, *i32, *i32, *fp32, *fp16, "  // out, q, k, v, sink, bt, sl, alibi, qq_bias
+        "fp32, *fp32, *fp32, *fp32, *fp32, fp32, "                       // scale, q/k/v_descale, out_scale, softcap
+        "%d, %d, "                                                       // num_q_heads, num_queries_per_kv
+        "i64, i64, %d, i64, %d, i64, "                                   // bt_stride, q_stride_0, q_stride_1=head_size, out_stride_0, out_stride_1=head_size, qq_bias_stride_0
+        "%d, %d, %d, %d, "                                               // BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED
+        "0, 0, 0, 0, 0, "                                                // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
+        "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
+        "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
+        "-448.0, 448.0, 0, %d",                                          // FP8_MIN, FP8_MAX, ALL_DECODE=0 (prefill), CACHE_TYPE
+        kv_ptr_dtype, kv_ptr_dtype,
+        s.num_q_heads, s.num_q_heads / s.num_kv_heads,
+        s.head_size, s.head_size,           // query_stride_1, output_stride_1
+        s.block_size,                       // BLOCK_SIZE
+        MT_AITER_UATTN_TILE_SIZE,           // TILE_SIZE
+        s.head_size, s.head_size,           // HEAD_SIZE, HEAD_SIZE_PADDED
+        MT_AITER_UATTN_BLOCK_Q,             // BLOCK_Q
+        MT_AITER_UATTN_BLOCK_M,             // BLOCK_M
+        cache_type_val);                    // CACHE_TYPE
+    return buf;
+}
+
 std::string build_signature_reduce(const mt_aiter_uattn_shape_t & s) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
@@ -122,6 +162,7 @@ struct CachedHandles {
     mt_aiter_uattn_shape_t      shape       = {};
     const aiter::KernelHandle * h_3d        = nullptr;
     const aiter::KernelHandle * h_reduce    = nullptr;
+    const aiter::KernelHandle * h_2d        = nullptr;  // MAD-199 D3: prefill path
     bool                        initialized = false;
     hipError_t                  init_err    = hipSuccess;
 };
@@ -174,14 +215,23 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     };
     c.h_reduce = reg.get_or_compile(spec_reduce);
 
+    // MAD-199 D3: also compile the 2D kernel for prefill dispatch.
+    const std::string sig_2d = build_signature_2d(shape);
+    aiter::KernelSpec spec_2d {
+        AITER_KERNEL_SOURCE_DEFAULT,
+        "kernel_unified_attention_2d",
+        target, sig_2d, 4, 1,
+    };
+    c.h_2d = reg.get_or_compile(spec_2d);
+
     c.shape       = shape;
     c.initialized = true;
-    if (!c.h_3d || !c.h_reduce) {
+    if (!c.h_3d || !c.h_reduce || !c.h_2d) {
         std::fprintf(stderr,
             "mt_aiter_unified_attn: registry could not compile/load kernels "
-            "(3d=%p, reduce=%p, target=%s, h=%d nq=%d nkv=%d bs=%d)\n",
-            (const void*)c.h_3d, (const void*)c.h_reduce, target.c_str(),
-            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size);
+            "(3d=%p, reduce=%p, 2d=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
+            (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, target.c_str(),
+            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type);
         c.init_err = hipErrorInvalidImage;
     }
     return c.init_err;
@@ -194,7 +244,14 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
     const CachedHandles & c = get_cached();
-    if (!c.h_3d || !c.h_reduce) return hipErrorInvalidImage;
+    if (!c.h_3d || !c.h_reduce || !c.h_2d) return hipErrorInvalidImage;
+
+    // MAD-199 D3: dispatch on q_len. The 3D kernel's split-K is only a win
+    // when q is small (decode); for prefill the per-segment overhead and the
+    // reduce-segments pass dominate. Switch to the 2D kernel when avg q_len
+    // per seq is >= BLOCK_Q (the natural q-blocking threshold).
+    const int32_t avg_q_len = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
+    const bool    use_2d    = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────
     hipDeviceptr_t p_segm_out    = (hipDeviceptr_t) a->segm_output;
@@ -228,6 +285,37 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     hipDeviceptr_t p_global_scratch  = (hipDeviceptr_t) nullptr;
     hipDeviceptr_t p_profile_scratch = (hipDeviceptr_t) nullptr;
 
+    const int32_t num_q_tokens = a->num_q_tokens > 0 ? a->num_q_tokens : num_seqs;
+
+    // MAD-199 D3: Prefill path — single-pass 2D kernel, no segm bufs, no reduce.
+    if (use_2d) {
+        hipDeviceptr_t p_out = (hipDeviceptr_t) a->out;
+        hipDeviceptr_t p_os  = (hipDeviceptr_t) a->out_scale;
+        int64_t        os0   = a->output_stride_0;
+
+        void *args_2d[] = {
+            &p_out, &p_q, &p_k, &p_v,
+            &p_sink,
+            &p_bt, &p_sl,
+            &p_alibi, &p_qq_bias,
+            &scale_f,
+            &p_qd, &p_kd, &p_vd, &p_os,
+            &softcap_f,
+            &bts, &qs0, &os0, &qqs0,
+            &ks0, &ks1, &ks2,
+            &vs0, &vs1, &vs2,
+            &p_cu, &num_seqs,
+            &p_global_scratch, &p_profile_scratch,
+        };
+
+        // 2D grid: (n_kv_heads, num_q_blocks). num_q_blocks matches 3D's
+        // gX formula so we re-use it.
+        unsigned int g2_x = (unsigned int) a->shape.num_kv_heads;
+        unsigned int g2_y = (unsigned int)(num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs);
+        unsigned int g2_z = 1;
+        return c.h_2d->launch(stream, g2_x, g2_y, g2_z, args_2d);
+    }
+
     void *args_3d[] = {
         &p_segm_out, &p_segm_max, &p_segm_expsum,
         &p_q, &p_k, &p_v,
@@ -250,7 +338,6 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     //   gZ = NUM_SEGMENTS_PER_SEQ
     // For pure decode (q_len=1 each), num_q_tokens == num_seqs so this
     // collapses to num_seqs/BLOCK_Q + num_seqs (the POC formula).
-    const int32_t num_q_tokens = a->num_q_tokens > 0 ? a->num_q_tokens : num_seqs;
     unsigned int g3_x = (unsigned int)(num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs);
     unsigned int g3_y = (unsigned int) a->shape.num_kv_heads;
     unsigned int g3_z = (unsigned int) MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ;
