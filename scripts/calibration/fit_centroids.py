@@ -78,17 +78,25 @@ def positive_e4m3_finite() -> np.ndarray:
 # Per-block scaling
 # ---------------------------------------------------------------------------
 
-def block_normalize(x: np.ndarray, block_size: int) -> tuple[np.ndarray, np.ndarray]:
+def block_normalize(
+    x: np.ndarray, block_size: int, scale_dtype: str = "fp32"
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Reshape x to (..., n_blocks, block_size), compute per-block scale =
-    max(|values|), and return (normalized, scale). Last dimension of x must be
-    divisible by block_size.
+    max(|values|) (optionally rounded to FP16 precision), and return
+    (normalized, scale). Last dimension of x must be divisible by block_size.
+
+    scale_dtype: 'fp32' (default, full precision) or 'fp16' (simulates the
+    lower-precision scale storage option that halves per-block overhead).
     """
     last = x.shape[-1]
     assert last % block_size == 0, f"last dim {last} not divisible by block_size {block_size}"
     n_blocks = last // block_size
     blocked = x.reshape(*x.shape[:-1], n_blocks, block_size)
     scale = np.max(np.abs(blocked), axis=-1, keepdims=True)
+    if scale_dtype == "fp16":
+        # Round-trip through fp16 to simulate the precision loss
+        scale = scale.astype(np.float16).astype(np.float32)
     # Avoid div-by-zero
     safe = np.where(scale > 0, scale, 1.0)
     normalized = blocked / safe
@@ -131,7 +139,7 @@ def quant_fp8_raw(x: np.ndarray, e4m3_lattice: np.ndarray) -> QuantResult:
 
 def quant_int4_blockwise(x: np.ndarray, block_size: int) -> QuantResult:
     """Uniform INT4 with per-block FP16 scale (matches q4_0)."""
-    normalized, scale = block_normalize(x, block_size)
+    normalized, scale = block_normalize(x, block_size, scale_dtype="fp16")
     # 4-bit signed: 16 levels in [-1, 1]. Centers at i/7.5 - 1 + 1/15 for i in 0..15
     # Simpler: levels at (2*i - 15) / 15 for i in 0..15
     levels = (2 * np.arange(16) - 15) / 15.0
@@ -207,13 +215,13 @@ def snap_to_lattice(values: np.ndarray, lattice: np.ndarray) -> np.ndarray:
 
 
 def quant_turbo_unconstrained(
-    x: np.ndarray, n_magnitudes: int, block_size: int, name: str
+    x: np.ndarray, n_magnitudes: int, block_size: int, name: str, scale_dtype: str = "fp16"
 ) -> QuantResult:
     """
     Classical turbo3/turbo4: unsigned magnitudes via Lloyd-Max + sign bit +
     per-block FP16 scale. Centroids in FP32 (no E4M3 constraint).
     """
-    normalized, scale = block_normalize(x, block_size)
+    normalized, scale = block_normalize(x, block_size, scale_dtype=scale_dtype)
     flat = normalized.ravel()
     # Sample for k-means speed
     samp_size = min(200_000, len(flat))
@@ -226,34 +234,34 @@ def quant_turbo_unconstrained(
     deq_flat = signs * snapped_mags
     deq = (deq_flat.reshape(normalized.shape) * scale).reshape(x.shape)
     mse = float(np.mean((x - deq) ** 2))
-    # Bits: log2(n) magnitude index + 1 sign + 16 scale / block_size
-    bpv = float(np.log2(n_magnitudes) + 1 + 16.0 / block_size)
-    return QuantResult(name, mse, bpv, {"centroids": mags_centroids.tolist()})
+    scale_bits = 16 if scale_dtype == "fp16" else 32
+    bpv = float(np.log2(n_magnitudes) + 1 + scale_bits / block_size)
+    return QuantResult(name, mse, bpv, {"centroids": mags_centroids.tolist(), "scale_dtype": scale_dtype})
 
 
 def quant_turbo_fp8(
-    x: np.ndarray, n_magnitudes: int, block_size: int, pos_lattice: np.ndarray, name: str
+    x: np.ndarray, n_magnitudes: int, block_size: int, pos_lattice: np.ndarray, name: str,
+    scale_dtype: str = "fp32",
 ) -> QuantResult:
     """
     turbo3/4/5-FP8: unsigned magnitude centroids constrained to positive E4M3
-    lattice + sign bit + per-block FP32 scale.
+    lattice + sign bit + per-block scale (FP32 default per hipfire safety; FP16
+    optional for tighter memory at risk of saturation on extreme blocks).
 
     Two-step optimization:
       1. Fit unconstrained Lloyd-Max magnitude centroids
       2. Snap each centroid to nearest positive E4M3 representable value
     Then quantize all values via the constrained centroids.
     """
-    normalized, scale = block_normalize(x, block_size)
+    normalized, scale = block_normalize(x, block_size, scale_dtype=scale_dtype)
     flat = normalized.ravel()
     samp_size = min(200_000, len(flat))
     samp = np.random.default_rng(0).choice(flat, size=samp_size, replace=False)
     unconstrained = fit_lloyd_max_unsigned_magnitudes(samp, n_magnitudes)
     # Snap each unconstrained magnitude centroid to nearest positive E4M3 value
-    pos_in_unit = pos_lattice[pos_lattice <= 1.0]  # only values in [0, 1] make sense for normalized
+    pos_in_unit = pos_lattice[pos_lattice <= 1.0]
     constrained = np.array([snap_to_lattice(np.array([c]), pos_in_unit)[0] for c in unconstrained])
-    constrained = np.unique(constrained)  # collapse duplicates
-    # If snapping collapsed centroids (e.g., 16 centroids all map to a few unique E4M3 values),
-    # we lose some quantization resolution. Track this in extra.
+    constrained = np.unique(constrained)
     n_unique_after_snap = len(constrained)
 
     signs = np.sign(flat)
@@ -262,9 +270,8 @@ def quant_turbo_fp8(
     deq_flat = signs * snapped_mags
     deq = (deq_flat.reshape(normalized.shape) * scale).reshape(x.shape)
     mse = float(np.mean((x - deq) ** 2))
-    # Bits: log2(n) magnitude index + 1 sign + 32 scale / block_size
-    # (per-block scale stored as FP32 since it's post-WMMA multiplied, not folded into FP8)
-    bpv = float(np.log2(n_magnitudes) + 1 + 32.0 / block_size)
+    scale_bits = 16 if scale_dtype == "fp16" else 32
+    bpv = float(np.log2(n_magnitudes) + 1 + scale_bits / block_size)
     return QuantResult(
         name,
         mse,
@@ -274,6 +281,7 @@ def quant_turbo_fp8(
             "n_magnitudes_after_e4m3_snap": int(n_unique_after_snap),
             "centroids_unconstrained": unconstrained.tolist(),
             "centroids_constrained": constrained.tolist(),
+            "scale_dtype": scale_dtype,
         },
     )
 
@@ -363,13 +371,18 @@ def apply_hadamard(arr: np.ndarray, H: np.ndarray) -> np.ndarray:
 
 VARIANT_SPECS = [
     # (display_name, callable(x_blocked, block_size, e4m3, pos_e4m3) -> QuantResult)
-    ("fp8_raw",            lambda x, bs, e, p: quant_fp8_raw(x.astype(np.float32), e)),
-    ("int4_q4_0",          lambda x, bs, e, p: quant_int4_blockwise(x, bs)),
-    ("turbo3_fp16_scale",  lambda x, bs, e, p: quant_turbo_unconstrained(x, 8,  bs, "turbo3_fp16_scale")),
-    ("turbo4_fp16_scale",  lambda x, bs, e, p: quant_turbo_unconstrained(x, 16, bs, "turbo4_fp16_scale")),
-    ("turbo3_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 8,  bs, p, "turbo3_fp8")),
-    ("turbo4_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 16, bs, p, "turbo4_fp8")),
-    ("turbo5_fp8",         lambda x, bs, e, p: quant_turbo_fp8(x, 32, bs, p, "turbo5_fp8")),
+    ("fp8_raw",                  lambda x, bs, e, p: quant_fp8_raw(x.astype(np.float32), e)),
+    ("int4_q4_0",                lambda x, bs, e, p: quant_int4_blockwise(x, bs)),
+    ("turbo3_fp16_scale",        lambda x, bs, e, p: quant_turbo_unconstrained(x, 8,  bs, "turbo3_fp16_scale")),
+    ("turbo4_fp16_scale",        lambda x, bs, e, p: quant_turbo_unconstrained(x, 16, bs, "turbo4_fp16_scale")),
+    # FP32-scale FP8 variants (the safe path per hipfire — no E4M3 saturation risk)
+    ("turbo3_fp8",               lambda x, bs, e, p: quant_turbo_fp8(x, 8,  bs, p, "turbo3_fp8",        scale_dtype="fp32")),
+    ("turbo4_fp8",               lambda x, bs, e, p: quant_turbo_fp8(x, 16, bs, p, "turbo4_fp8",        scale_dtype="fp32")),
+    ("turbo5_fp8",               lambda x, bs, e, p: quant_turbo_fp8(x, 32, bs, p, "turbo5_fp8",        scale_dtype="fp32")),
+    # FP16-scale FP8 variants (tighter bpv, risk of saturation on extreme blocks)
+    ("turbo3_fp8_fp16scale",     lambda x, bs, e, p: quant_turbo_fp8(x, 8,  bs, p, "turbo3_fp8_fp16scale", scale_dtype="fp16")),
+    ("turbo4_fp8_fp16scale",     lambda x, bs, e, p: quant_turbo_fp8(x, 16, bs, p, "turbo4_fp8_fp16scale", scale_dtype="fp16")),
+    ("turbo5_fp8_fp16scale",     lambda x, bs, e, p: quant_turbo_fp8(x, 32, bs, p, "turbo5_fp8_fp16scale", scale_dtype="fp16")),
 ]
 
 
@@ -392,44 +405,66 @@ def run_variants_global(
     return [spec[1](x_blocked, block_size, e4m3, pos_e4m3) for spec in VARIANT_SPECS]
 
 
-def run_variants_per_kv_layer(
-    samples: dict, block_size: int, e4m3: np.ndarray, pos_e4m3: np.ndarray
+def run_variants_per_key(
+    samples: dict,
+    block_size: int,
+    e4m3: np.ndarray,
+    pos_e4m3: np.ndarray,
+    per_head: bool = False,
 ) -> tuple[list[QuantResult], dict]:
     """
-    Fit centroids per (kv, layer). Returns (aggregated_results, per_key_breakdown).
-    Aggregated MSE = sum(per_key_mse * per_key_count) / total_count.
-    """
-    keys = sorted(samples.keys())  # deterministic order
-    print(f"[fit_centroids][per_kv_layer] Fitting per (kv, layer) across {len(keys)} keys...", flush=True)
+    Fit centroids per key. With per_head=False, the key is (kv, layer) — one
+    centroid set across all heads in that layer. With per_head=True, each
+    (kv, layer) array is split along axis 0 (n_kv_heads) so we fit per
+    (kv, layer, head).
 
-    # per_key_results[variant_name] -> list of (key, mse, n_elements)
+    Returns (aggregated_results, per_key_breakdown). Aggregation is an
+    element-count-weighted MSE across all keys.
+    """
+    granularity_tag = "per_kv_layer_head" if per_head else "per_kv_layer"
+
+    # Build the working set of keys (and the array each refers to)
+    if per_head:
+        work_items: list[tuple[str, np.ndarray]] = []
+        for (kv, L), arr in sorted(samples.items()):
+            n_kv_heads = arr.shape[0]
+            for h in range(n_kv_heads):
+                # Keep 3D shape so reshape_for_blocks treats correctly
+                work_items.append((f"{kv}_L{L}_H{h}", arr[h:h+1]))
+    else:
+        work_items = [(f"{kv}_L{L}", samples[(kv, L)]) for (kv, L) in sorted(samples.keys())]
+
+    print(
+        f"[fit_centroids][{granularity_tag}] Fitting per key across {len(work_items)} keys...",
+        flush=True,
+    )
+
     per_key_results: dict[str, list[tuple]] = {name: [] for name, _ in VARIANT_SPECS}
-    # Centroids per (variant, key) — only saved for variants that produce them
     centroid_log: dict[str, dict] = {name: {} for name, _ in VARIANT_SPECS}
 
-    for kv, L in keys:
-        arr = samples[(kv, L)]
+    for key_label, arr in work_items:
         x_blocked = reshape_for_blocks(arr, block_size)
         n_elements = x_blocked.size
         for vname, vfunc in VARIANT_SPECS:
             qr = vfunc(x_blocked, block_size, e4m3, pos_e4m3)
-            per_key_results[vname].append((f"{kv}_L{L}", qr.mse, n_elements))
-            # Save constrained centroids for inspection (only fp8 variants)
+            per_key_results[vname].append((key_label, qr.mse, n_elements))
             if "centroids_constrained" in qr.extra:
-                centroid_log[vname][f"{kv}_L{L}"] = qr.extra["centroids_constrained"]
+                centroid_log[vname][key_label] = qr.extra["centroids_constrained"]
             elif "centroids" in qr.extra:
-                centroid_log[vname][f"{kv}_L{L}"] = qr.extra["centroids"]
-        print(f"[fit_centroids][per_kv_layer]   {kv} L{L} done ({n_elements:,} elements)", flush=True)
+                centroid_log[vname][key_label] = qr.extra["centroids"]
+        # Only log progress for per-(kv,layer) to keep per-head output manageable
+        if not per_head or key_label.endswith("_H0"):
+            print(
+                f"[fit_centroids][{granularity_tag}]   {key_label} done ({n_elements:,} elements)",
+                flush=True,
+            )
 
-    # Aggregate MSE per variant via element-count-weighted mean
     aggregated: list[QuantResult] = []
     for vname, vfunc in VARIANT_SPECS:
         total_se = sum(mse * n for _, mse, n in per_key_results[vname])
         total_n = sum(n for _, _, n in per_key_results[vname])
         agg_mse = total_se / max(1, total_n)
-        # BPV stays the same regardless of granularity (centroid tables are negligible)
-        # Re-derive bpv from a fresh call on the first key
-        first_arr = samples[keys[0]]
+        first_arr = work_items[0][1]
         first_blocked = reshape_for_blocks(first_arr, block_size)
         qr_ref = vfunc(first_blocked, block_size, e4m3, pos_e4m3)
         aggregated.append(
@@ -441,6 +476,11 @@ def run_variants_per_kv_layer(
             )
         )
     return aggregated, centroid_log
+
+
+def run_variants_per_kv_layer(samples, block_size, e4m3, pos_e4m3):
+    """Backwards-compatible wrapper — delegates to run_variants_per_key."""
+    return run_variants_per_key(samples, block_size, e4m3, pos_e4m3, per_head=False)
 
 
 def _print_table(title: str, variants: list[QuantResult], fp8_raw_mse: float) -> None:
@@ -485,9 +525,11 @@ def main():
     p.add_argument("--subsample-tokens", type=int, default=4096, help="Per (kv, layer) token cap")
     p.add_argument(
         "--granularity",
-        choices=["global", "per_kv_layer", "both"],
+        choices=["global", "per_kv_layer", "per_kv_layer_head", "both"],
         default="both",
-        help="Centroid fitting granularity. 'both' (default) runs global + per_kv_layer side-by-side.",
+        help="Centroid fitting granularity. 'per_kv_layer_head' splits each layer's "
+             "KV array by head (one centroid set per (kv, layer, head)). 'both' runs "
+             "global + per_kv_layer side-by-side.",
     )
     p.add_argument(
         "--hadamard",
@@ -552,6 +594,24 @@ def main():
             "verdict": verdict_p,
             "variants": _variant_summary(variants_p, fp8_p, include_per_key=True),
             "centroid_log": centroid_log,
+        }
+
+    if args.granularity == "per_kv_layer_head":
+        variants_h, centroid_log_h = run_variants_per_key(
+            samples, args.block_size, e4m3, pos_e4m3, per_head=True
+        )
+        fp8_h = next(v.mse for v in variants_h if v.name == "fp8_raw")
+        t4_h = next(v.mse for v in variants_h if v.name == "turbo4_fp8")
+        ratio_h = t4_h / fp8_h if fp8_h > 0 else float("inf")
+        _print_table("RESULTS — per (kv, layer, head) centroids", variants_h, fp8_h)
+        verdict_h = _verdict(ratio_h)
+        print(f"[fit_centroids] per_kv_layer_head  turbo4_fp8 MSE / fp8_raw = {ratio_h:.3f}  => {verdict_h}", flush=True)
+        summary["per_kv_layer_head"] = {"ratio": ratio_h, "verdict": verdict_h}
+        report["results"]["per_kv_layer_head"] = {
+            "fp8_raw_mse": fp8_h,
+            "turbo4_fp8_ratio": ratio_h,
+            "verdict": verdict_h,
+            "variants": _variant_summary(variants_h, fp8_h, include_per_key=False),
         }
 
     # Final go/no-go: best ratio across granularities tried
