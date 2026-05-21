@@ -49,7 +49,7 @@ std::string detect_hip_target() {
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
 std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
-    // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
+    // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:166` byte
     // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
     // hash to distinct AOT artifacts (or distinct runtime-compile cache keys).
     const char * kv_ptr_dtype;
@@ -60,26 +60,26 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
             cache_type_val = 0;
             break;
         case MT_AITER_CACHE_TURBO3:
-            kv_ptr_dtype   = "*i8:16";
+            kv_ptr_dtype   = "*i8:166";
             cache_type_val = 1;
             break;
         case MT_AITER_CACHE_TURBO4:
-            kv_ptr_dtype   = "*i8:16";
+            kv_ptr_dtype   = "*i8:166";
             cache_type_val = 2;
             break;
         // MAD-214: turbo-FP8 family. Production-wired variants only (BS=256).
         // BS<256 variants throw at compile time via tl.static_assert in
         // unified_attention.py — MAD-215 wires those.
         case MT_AITER_CACHE_TURBO3_FP8_BS256:
-            kv_ptr_dtype   = "*i8:16";
+            kv_ptr_dtype   = "*i8:166";
             cache_type_val = 14;
             break;
         case MT_AITER_CACHE_TURBO4_FP8_BS256:
-            kv_ptr_dtype   = "*i8:16";
+            kv_ptr_dtype   = "*i8:166";
             cache_type_val = 24;
             break;
         case MT_AITER_CACHE_TURBO5_FP8_BS256:
-            kv_ptr_dtype   = "*i8:16";
+            kv_ptr_dtype   = "*i8:166";
             cache_type_val = 34;
             break;
         default:
@@ -98,7 +98,7 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
         "0, 0, 0, 0, 0, "                   // USE_ALIBI / QQ / SOFTCAP / SINKS / SLIDING_WINDOW
         "i64, i64, i64, 1, i64, i64, i64, 1, "  // k/v cache strides (last is constexpr=1; for turbo these args are present but unused — helper computes byte strides internally)
         "*i32, %d, i32, %d, %d, 1, %d, "    // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M, NUM_SEGMENTS, ALL_DECODE, CACHE_TYPE (MAD-199)
-        "*u8:1, *u8:1",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
+        "*i8:16, *i8:16",                     // MAD-214: centroids_k_ptr, centroids_v_ptr (None-safe for non-FP8)
         kv_ptr_dtype,                           // K cache pointer dtype
         kv_ptr_dtype,                           // V cache pointer dtype
         s.num_q_heads,                          // num_q_heads constexpr
@@ -126,20 +126,20 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
 // per the upstream host dispatcher's max_seqlen_q >= 256 rule.
 //
 // Same K/V cache pointer dtype switch as build_signature_3d (cache_type
-// drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
+// drives *fp16:16 vs *i8:166 and the CACHE_TYPE constexpr).
 std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
                                 int block_m, int block_q) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
         case MT_AITER_CACHE_F16:               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
-        case MT_AITER_CACHE_TURBO3:            kv_ptr_dtype = "*i8:16";   cache_type_val =  1; break;
-        case MT_AITER_CACHE_TURBO4:            kv_ptr_dtype = "*i8:16";   cache_type_val =  2; break;
+        case MT_AITER_CACHE_TURBO3:            kv_ptr_dtype = "*i8:166";   cache_type_val =  1; break;
+        case MT_AITER_CACHE_TURBO4:            kv_ptr_dtype = "*i8:166";   cache_type_val =  2; break;
         // MAD-214: turbo-FP8 family (BS=256 production variants only;
         // BS<256 covered by MAD-215). Numeric values match mt_aiter_cache_type.
-        case MT_AITER_CACHE_TURBO3_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 14; break;
-        case MT_AITER_CACHE_TURBO4_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 24; break;
-        case MT_AITER_CACHE_TURBO5_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 34; break;
+        case MT_AITER_CACHE_TURBO3_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 14; break;
+        case MT_AITER_CACHE_TURBO4_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 24; break;
+        case MT_AITER_CACHE_TURBO5_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 34; break;
         default:                               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
     }
     char buf[1024];
@@ -153,7 +153,7 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
         "i64, i64, i64, 1, i64, i64, i64, 1, "                           // k/v cache strides (last is constexpr=1)
         "*i32, %d, i32, %d, "                                            // query_start_len, BLOCK_Q, num_seqs(runtime), BLOCK_M
         "-448.0, 448.0, 0, %d, "                                         // FP8_MIN, FP8_MAX, ALL_DECODE=0 (prefill), CACHE_TYPE
-        "*u8:1, *u8:1",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
+        "*i8:16, *i8:16",                                                  // MAD-214: centroids_k_ptr, centroids_v_ptr
         kv_ptr_dtype, kv_ptr_dtype,
         s.num_q_heads, s.num_q_heads / s.num_kv_heads,
         s.head_size, s.head_size,           // query_stride_1, output_stride_1
