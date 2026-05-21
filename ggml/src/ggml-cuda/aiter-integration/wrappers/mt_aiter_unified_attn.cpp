@@ -229,27 +229,21 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     aiter::Registry & reg = aiter::Registry::instance();
     reg.set_compile_script(AITER_COMPILE_SCRIPT_DEFAULT);
 
-    // MAD-214: for turbo-FP8 cache types, skip 3d + reduce kernel compile —
-    // the 3d kernel has a tl.static_assert that fails for FP8 (Phase 1F-D
-    // will wire that path). FP8 forces use_2d=true at dispatch time (see
-    // mt_aiter_unified_attn body), so 3d + reduce are never actually called.
-    const bool fp8_path = mt_aiter_cache_is_turbo_fp8(shape.cache_type);
+    // MAD-214 Phase 1F-D: 3d + reduce kernels now handle FP8 too (IS_TURBO_FP8
+    // branches mirrored from the 2d kernel). Compile unconditionally.
+    aiter::KernelSpec spec_3d {
+        AITER_KERNEL_SOURCE_DEFAULT,
+        "kernel_unified_attention_3d",
+        target, sig_3d, 4, 1,
+    };
+    c.h_3d = reg.get_or_compile(spec_3d);
 
-    if (!fp8_path) {
-        aiter::KernelSpec spec_3d {
-            AITER_KERNEL_SOURCE_DEFAULT,
-            "kernel_unified_attention_3d",
-            target, sig_3d, 4, 1,
-        };
-        c.h_3d = reg.get_or_compile(spec_3d);
-
-        aiter::KernelSpec spec_reduce {
-            AITER_KERNEL_SOURCE_DEFAULT,
-            "reduce_segments",
-            target, sig_red, 4, 1,
-        };
-        c.h_reduce = reg.get_or_compile(spec_reduce);
-    }
+    aiter::KernelSpec spec_reduce {
+        AITER_KERNEL_SOURCE_DEFAULT,
+        "reduce_segments",
+        target, sig_red, 4, 1,
+    };
+    c.h_reduce = reg.get_or_compile(spec_reduce);
 
     // MAD-199 D3: 2D base prefill spec (BLOCK_M=16, BLOCK_Q=2).
     const std::string sig_2d = build_signature_2d(shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q);
@@ -283,19 +277,14 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
 
     c.shape       = shape;
     c.initialized = true;
-    // MAD-214: for FP8 cache types, only require 2d kernels (h_3d/h_reduce
-    // intentionally skipped above). For F16/turbo3/turbo4 require all four.
-    const bool need_3d_handles = !fp8_path;
-    const bool kernels_ok = (!need_3d_handles || (c.h_3d && c.h_reduce))
-                          && c.h_2d && c.h_2d_large;
+    const bool kernels_ok = c.h_3d && c.h_reduce && c.h_2d && c.h_2d_large;
     if (!kernels_ok) {
         std::fprintf(stderr,
             "mt_aiter_unified_attn: registry could not compile/load kernels "
-            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d, fp8_path=%d)\n",
+            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
             (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, (const void*)c.h_2d_large,
             target.c_str(),
-            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type,
-            (int) fp8_path);
+            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type);
         c.init_err = hipErrorInvalidImage;
     }
     return c.init_err;
@@ -308,10 +297,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
     const CachedHandles & c = get_cached();
-    // MAD-214: FP8 cache types intentionally skip 3d compile; check only 2d.
-    const bool fp8_path = mt_aiter_cache_is_turbo_fp8(a->shape.cache_type);
-    if (!c.h_2d || !c.h_2d_large) return hipErrorInvalidImage;
-    if (!fp8_path && (!c.h_3d || !c.h_reduce)) return hipErrorInvalidImage;
+    if (!c.h_2d || !c.h_2d_large || !c.h_3d || !c.h_reduce) return hipErrorInvalidImage;
 
     // MAD-199 D3 + MAD-203: three-way dispatch.
     //
@@ -322,11 +308,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // pays off when each Q block has ≥256 tokens to chew through (matches
     // upstream's max_seqlen_q >= 256 cutover).
     const int32_t avg_q_len    = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
-    // MAD-214: turbo-FP8 paths force use_2d=true unconditionally — the 3d
-    // kernel doesn't yet have FP8 wiring (Phase 1F-D follow-up). For decode
-    // workloads (avg_q_len < BLOCK_Q) on FP8, this trades the split-K decode
-    // optimization for "works at all"; acceptable until 1F-D lands.
-    const bool    use_2d       = fp8_path || (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
+    const bool    use_2d       = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
     const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────

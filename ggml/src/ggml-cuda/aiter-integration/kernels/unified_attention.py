@@ -1298,6 +1298,17 @@ def kernel_unified_attention_3d(
         k_descale = None
         v_descale = None
 
+    # MAD-214 Phase 1F-D: mirror of 2D kernel's IS_TURBO_FP8 Q FP8 quant. Per-row
+    # max gives the FP8 dynamic range; Q_scale_fp8 is multiplied into the FP32
+    # accumulator after the FP8 tl.dot via broadcast. Constexpr-dead for non-FP8.
+    IS_TURBO_FP8: tl.constexpr = (CACHE_TYPE >= 10) and (CACHE_TYPE <= 34)
+    if IS_TURBO_FP8:
+        Q_fp32        = Q.to(tl.float32)
+        Q_abs_max     = tl.max(tl.abs(Q_fp32), axis=1)          # (BLOCK_M,)
+        Q_scale_fp8   = tl.where(Q_abs_max > 0, Q_abs_max, 1.0) # guard zero rows
+        Q_normalized  = Q_fp32 / Q_scale_fp8[:, None]           # in [-1, 1]
+        Q_fp8_tensor  = Q_normalized.to(tl.float8e4nv)          # (BLOCK_M, HEAD_SIZE_PADDED)
+
     # iterate through tiles within current segment
     for j in range(
         segm_idx * tiles_per_segment,
@@ -1371,22 +1382,46 @@ def kernel_unified_attention_3d(
                 N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
                 dim_mask, tile_mask,
             ).to(Q.dtype)
-        else:  # MAD-214 placeholder. turbo-FP8 path TBD in next commit (Phase 1F-D).
-            # The 2d kernel handles turbo-FP8 end-to-end today; the 3d split-K
-            # decode kernel needs the analogous Q-quant + K/V load branch +
-            # dot-site wiring. Until that lands, fail loudly rather than feed
-            # callers wrong output via the silently-mis-dispatched TURBO4 path.
+        else:  # MAD-214 Phase 1F-D: turbo-FP8 family — mirror of 2D kernel.
+            # Only BS=256 variants (CACHE_TYPE ∈ {14, 24, 34}) are wired at
+            # MAD-214 Phase 1 ship; BS<256 (MAD-215) requires the per-block
+            # accumulation kernel path not implemented here.
             tl.static_assert(
-                CACHE_TYPE < 10 or CACHE_TYPE > 34,
-                "turbo-FP8 not yet wired in kernel_unified_attention_3d (split-K decode). "
-                "Use kernel_unified_attention_2d for now, or wait for Phase 1F-D.",
+                (CACHE_TYPE == 14) or (CACHE_TYPE == 24) or (CACHE_TYPE == 34),
+                "turbo-FP8: only BS=256 variants are wired in this kernel (MAD-215 covers BS<256)",
+            )
+            IDX_BITS: tl.constexpr = 3 if CACHE_TYPE < 20 else (4 if CACHE_TYPE < 30 else 5)
+            BYTES_PER_FP8_BLOCK: tl.constexpr = 2 + 256 * IDX_BITS // 8 + 32  # 130 / 162 / 194
+            N_KV_HEADS: tl.constexpr = num_query_heads // num_queries_per_kv
+
+            K_fp8, K_scales = load_turbo_fp8_kv_tile_K_bs256(
+                key_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                centroids_k_ptr,
+                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                IDX_BITS, BYTES_PER_FP8_BLOCK,
+                dim_mask, tile_mask,
+            )
+            V_fp8, V_scales = load_turbo_fp8_kv_tile_V_bs256(
+                value_cache_ptr, physical_block_idx, token_in_block,
+                offs_d, kv_head_idx,
+                centroids_v_ptr,
+                N_KV_HEADS, BLOCK_SIZE, HEAD_SIZE,
+                IDX_BITS, BYTES_PER_FP8_BLOCK,
+                dim_mask, tile_mask,
             )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
+        if IS_TURBO_FP8:
+            # FP8 Q·K^T via tl.dot — emits v_wmma_f32_16x16x16_fp8_fp8 on gfx1201.
+            K_fp8_view = K_fp8.to(tl.float8e4nv, bitcast=True)              # (HEAD, TILE)
+            S_partial_fp8 = tl.dot(Q_fp8_tensor, K_fp8_view, out_dtype=tl.float32)
+            S = qk_scale * S_partial_fp8 * Q_scale_fp8[:, None] * K_scales[None, :]
+        else:
+            S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
@@ -1446,7 +1481,19 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+        if IS_TURBO_FP8:
+            # FP8 P·V leg — mirror of 2D kernel. Fold per-V-token scale into P
+            # before the FP8 quant, then dot, accumulate with per-row scale.
+            P_scaled       = P * V_scales[None, :]                  # (BLOCK_M, TILE)
+            P_abs_max      = tl.max(tl.abs(P_scaled), axis=1)       # (BLOCK_M,)
+            P_scale_fp8    = tl.where(P_abs_max > 0, P_abs_max, 1.0)
+            P_normalized   = P_scaled / P_scale_fp8[:, None]
+            P_fp8          = P_normalized.to(tl.float8e4nv)         # (BLOCK_M, TILE)
+            V_fp8_view     = V_fp8.to(tl.float8e4nv, bitcast=True)  # (TILE, HEAD)
+            acc_partial    = tl.dot(P_fp8, V_fp8_view, out_dtype=tl.float32)
+            acc            = acc + acc_partial * P_scale_fp8[:, None]
+        else:
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     if v_descale is not None:
         acc = acc * v_descale
