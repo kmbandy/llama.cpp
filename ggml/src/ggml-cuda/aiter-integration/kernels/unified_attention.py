@@ -720,7 +720,15 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
-    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199)
+    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199),
+                                        # 10..14 = TURBO3_FP8_BS{16..256} (MAD-214),
+                                        # 20..24 = TURBO4_FP8_BS{16..256},
+                                        # 30..34 = TURBO5_FP8_BS{16..256}
+    # MAD-214: per-(kv, layer) E4M3 centroid LUTs for turbo-FP8 paths. Caller
+    # passes the LUT slice already indexed to the current layer's K/V head.
+    # Safely None when CACHE_TYPE is not in the turbo-FP8 family.
+    centroids_k_ptr = None,             # *u8 — N_CENTROIDS bytes; None for non-FP8
+    centroids_v_ptr = None,             # *u8 — N_CENTROIDS bytes; None for non-FP8
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -1081,7 +1089,10 @@ def kernel_unified_attention_3d(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
-    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199)
+    CACHE_TYPE: tl.constexpr = 0,       # 0=F16 (default), 1=TURBO3, 2=TURBO4 (MAD-199),
+                                        # 10..14/20..24/30..34 = TURBO{3,4,5}_FP8_BS{16..256} (MAD-214)
+    centroids_k_ptr = None,             # MAD-214: per-(kv, layer) K centroid LUT (*u8)
+    centroids_v_ptr = None,             # MAD-214: per-(kv, layer) V centroid LUT (*u8)
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
