@@ -49,7 +49,7 @@ std::string detect_hip_target() {
 //   pos 26 → head_size (HEAD_SIZE_PADDED constexpr; assumes head_size is pow2)
 std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
     // MAD-199: K/V cache pointer dtype depends on cache_type. F16 stays
-    // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:166` byte
+    // `*fp16:16` (upstream signature); turbo3/turbo4 switch to `*i8:16` byte
     // pointers and bake CACHE_TYPE=1/2 as the kernel constexpr — both branches
     // hash to distinct AOT artifacts (or distinct runtime-compile cache keys).
     const char * kv_ptr_dtype;
@@ -60,26 +60,26 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
             cache_type_val = 0;
             break;
         case MT_AITER_CACHE_TURBO3:
-            kv_ptr_dtype   = "*i8:166";
+            kv_ptr_dtype   = "*i8:16";
             cache_type_val = 1;
             break;
         case MT_AITER_CACHE_TURBO4:
-            kv_ptr_dtype   = "*i8:166";
+            kv_ptr_dtype   = "*i8:16";
             cache_type_val = 2;
             break;
         // MAD-214: turbo-FP8 family. Production-wired variants only (BS=256).
         // BS<256 variants throw at compile time via tl.static_assert in
         // unified_attention.py — MAD-215 wires those.
         case MT_AITER_CACHE_TURBO3_FP8_BS256:
-            kv_ptr_dtype   = "*i8:166";
+            kv_ptr_dtype   = "*i8:16";
             cache_type_val = 14;
             break;
         case MT_AITER_CACHE_TURBO4_FP8_BS256:
-            kv_ptr_dtype   = "*i8:166";
+            kv_ptr_dtype   = "*i8:16";
             cache_type_val = 24;
             break;
         case MT_AITER_CACHE_TURBO5_FP8_BS256:
-            kv_ptr_dtype   = "*i8:166";
+            kv_ptr_dtype   = "*i8:16";
             cache_type_val = 34;
             break;
         default:
@@ -126,20 +126,20 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
 // per the upstream host dispatcher's max_seqlen_q >= 256 rule.
 //
 // Same K/V cache pointer dtype switch as build_signature_3d (cache_type
-// drives *fp16:16 vs *i8:166 and the CACHE_TYPE constexpr).
+// drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
 std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
                                 int block_m, int block_q) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
         case MT_AITER_CACHE_F16:               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
-        case MT_AITER_CACHE_TURBO3:            kv_ptr_dtype = "*i8:166";   cache_type_val =  1; break;
-        case MT_AITER_CACHE_TURBO4:            kv_ptr_dtype = "*i8:166";   cache_type_val =  2; break;
+        case MT_AITER_CACHE_TURBO3:            kv_ptr_dtype = "*i8:16";   cache_type_val =  1; break;
+        case MT_AITER_CACHE_TURBO4:            kv_ptr_dtype = "*i8:16";   cache_type_val =  2; break;
         // MAD-214: turbo-FP8 family (BS=256 production variants only;
         // BS<256 covered by MAD-215). Numeric values match mt_aiter_cache_type.
-        case MT_AITER_CACHE_TURBO3_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 14; break;
-        case MT_AITER_CACHE_TURBO4_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 24; break;
-        case MT_AITER_CACHE_TURBO5_FP8_BS256:  kv_ptr_dtype = "*i8:166";   cache_type_val = 34; break;
+        case MT_AITER_CACHE_TURBO3_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 14; break;
+        case MT_AITER_CACHE_TURBO4_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 24; break;
+        case MT_AITER_CACHE_TURBO5_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 34; break;
         default:                               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
     }
     char buf[1024];
@@ -229,19 +229,27 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     aiter::Registry & reg = aiter::Registry::instance();
     reg.set_compile_script(AITER_COMPILE_SCRIPT_DEFAULT);
 
-    aiter::KernelSpec spec_3d {
-        AITER_KERNEL_SOURCE_DEFAULT,
-        "kernel_unified_attention_3d",
-        target, sig_3d, 4, 1,
-    };
-    c.h_3d = reg.get_or_compile(spec_3d);
+    // MAD-214: for turbo-FP8 cache types, skip 3d + reduce kernel compile —
+    // the 3d kernel has a tl.static_assert that fails for FP8 (Phase 1F-D
+    // will wire that path). FP8 forces use_2d=true at dispatch time (see
+    // mt_aiter_unified_attn body), so 3d + reduce are never actually called.
+    const bool fp8_path = mt_aiter_cache_is_turbo_fp8(shape.cache_type);
 
-    aiter::KernelSpec spec_reduce {
-        AITER_KERNEL_SOURCE_DEFAULT,
-        "reduce_segments",
-        target, sig_red, 4, 1,
-    };
-    c.h_reduce = reg.get_or_compile(spec_reduce);
+    if (!fp8_path) {
+        aiter::KernelSpec spec_3d {
+            AITER_KERNEL_SOURCE_DEFAULT,
+            "kernel_unified_attention_3d",
+            target, sig_3d, 4, 1,
+        };
+        c.h_3d = reg.get_or_compile(spec_3d);
+
+        aiter::KernelSpec spec_reduce {
+            AITER_KERNEL_SOURCE_DEFAULT,
+            "reduce_segments",
+            target, sig_red, 4, 1,
+        };
+        c.h_reduce = reg.get_or_compile(spec_reduce);
+    }
 
     // MAD-199 D3: 2D base prefill spec (BLOCK_M=16, BLOCK_Q=2).
     const std::string sig_2d = build_signature_2d(shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q);
@@ -275,13 +283,19 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
 
     c.shape       = shape;
     c.initialized = true;
-    if (!c.h_3d || !c.h_reduce || !c.h_2d || !c.h_2d_large) {
+    // MAD-214: for FP8 cache types, only require 2d kernels (h_3d/h_reduce
+    // intentionally skipped above). For F16/turbo3/turbo4 require all four.
+    const bool need_3d_handles = !fp8_path;
+    const bool kernels_ok = (!need_3d_handles || (c.h_3d && c.h_reduce))
+                          && c.h_2d && c.h_2d_large;
+    if (!kernels_ok) {
         std::fprintf(stderr,
             "mt_aiter_unified_attn: registry could not compile/load kernels "
-            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
+            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d, fp8_path=%d)\n",
             (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, (const void*)c.h_2d_large,
             target.c_str(),
-            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type);
+            shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type,
+            (int) fp8_path);
         c.init_err = hipErrorInvalidImage;
     }
     return c.init_err;
@@ -294,7 +308,10 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
     const CachedHandles & c = get_cached();
-    if (!c.h_3d || !c.h_reduce || !c.h_2d || !c.h_2d_large) return hipErrorInvalidImage;
+    // MAD-214: FP8 cache types intentionally skip 3d compile; check only 2d.
+    const bool fp8_path = mt_aiter_cache_is_turbo_fp8(a->shape.cache_type);
+    if (!c.h_2d || !c.h_2d_large) return hipErrorInvalidImage;
+    if (!fp8_path && (!c.h_3d || !c.h_reduce)) return hipErrorInvalidImage;
 
     // MAD-199 D3 + MAD-203: three-way dispatch.
     //
@@ -305,7 +322,11 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     // pays off when each Q block has ≥256 tokens to chew through (matches
     // upstream's max_seqlen_q >= 256 cutover).
     const int32_t avg_q_len    = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
-    const bool    use_2d       = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
+    // MAD-214: turbo-FP8 paths force use_2d=true unconditionally — the 3d
+    // kernel doesn't yet have FP8 wiring (Phase 1F-D follow-up). For decode
+    // workloads (avg_q_len < BLOCK_Q) on FP8, this trades the split-K decode
+    // optimization for "works at all"; acceptable until 1F-D lands.
+    const bool    use_2d       = fp8_path || (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
     const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────

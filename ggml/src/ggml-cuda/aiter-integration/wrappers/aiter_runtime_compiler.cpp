@@ -241,6 +241,9 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
     const std::string cmd_str = cmd.str();
     std::fprintf(stderr, "aiter::Registry: compiling %s (%s)\n",
                  spec.kernel_name.c_str(), cache_key.c_str());
+    // MAD-214 debug: dump full signature on failure to help diagnose
+    // Triton-side errors (hint parsing, arg-count mismatch, etc.).
+    std::fprintf(stderr, "aiter::Registry: signature = %s\n", spec.signature.c_str());
     int rc = std::system(cmd_str.c_str());
     if (rc != 0) {
         std::fprintf(stderr, "aiter::Registry: compile script returned %d\n", rc);
