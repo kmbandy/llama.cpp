@@ -22,16 +22,46 @@
 #include <stddef.h>
 
 // ─────────────────────────────────────────────────────────────────────────
-// Tuning constants — picked once for v1, exposed for future flexibility.
-// These are AITER-side knobs, not model shape (those come in via shape_t):
-//   NUM_SEGMENTS_PER_SEQ: split-K factor for the 3D kernel
-//   BLOCK_Q / BLOCK_M:    q-token blocking inside the kernel
-//   TILE_SIZE:            inner KV tile size
+// Tuning constants — ported from AITER upstream host dispatcher
+// (kernels/unified_attention_host_reference.py — select_2d_config /
+//  select_3d_config / use_2d_kernel). These mirror upstream's values for
+// RDNA + num_queries_per_kv<=16 (the Qwen3 family case).
+//
+// We compile THREE kernel variants and dispatch at runtime in
+// mt_aiter_unified_attn():
+//
+//   3D split-K decode       — BLOCK_M=16, BLOCK_Q=2, NUM_SEGMENTS=32
+//                             (matches upstream's base 3D config; NUM_SEGMENTS
+//                             is hardcoded here, upstream computes it from
+//                             cu_count — see MAD-203 phase 2)
+//   2D base prefill         — BLOCK_M=16, BLOCK_Q=2, TILE_SIZE=32
+//                             (used for short prefills where use_2d_kernel
+//                             returns true but max_seqlen_q < 256)
+//   2D large prefill        — BLOCK_M=64, BLOCK_Q=8, TILE_SIZE=32
+//                             (max_seqlen_q >= 256; 4× LDS reuse vs base;
+//                             this is the meat of MAD-203)
+//
+// BLOCK_Q in each spec must equal BLOCK_M / num_queries_per_kv. The values
+// here assume num_queries_per_kv == 8 (Qwen3.5/3.6: 16 q-heads, 2 kv-heads).
+// For other GQA ratios these need to be regenerated — guard added below.
+//
+// Dispatch (mirrors upstream use_2d_kernel; see MAD-203 phase 2 for the
+// full program-count-driven heuristic):
+//   if avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD → 2D large
+//   else if avg_q_len >= MT_AITER_UATTN_BLOCK_Q            → 2D base
+//   else                                                   → 3D split-K
 // ─────────────────────────────────────────────────────────────────────────
-#define MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ 32
-#define MT_AITER_UATTN_BLOCK_Q              2
-#define MT_AITER_UATTN_BLOCK_M              16
-#define MT_AITER_UATTN_TILE_SIZE            32
+#define MT_AITER_UATTN_NUM_SEGMENTS_PER_SEQ      32
+#define MT_AITER_UATTN_TILE_SIZE                 32
+
+// 3D + 2D-base spec (decode + short prefill)
+#define MT_AITER_UATTN_BLOCK_Q                   2
+#define MT_AITER_UATTN_BLOCK_M                   16
+
+// 2D-large spec (max_seqlen_q >= 256). MAD-203.
+#define MT_AITER_UATTN_BLOCK_M_LARGE             64
+#define MT_AITER_UATTN_BLOCK_Q_LARGE             8
+#define MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD   256
 
 // KV cache element format. Selects which AOT spec / runtime-compile path
 // gets dispatched. F16 keeps the upstream `*fp16:16` pointer signature;

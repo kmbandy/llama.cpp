@@ -1,0 +1,86 @@
+{
+  "commit": "573e295697b40d310af7d6bcbe5eba0b5f3f8a94",
+  "short_commit": "573e29569",
+  "timestamp_utc": "20260521T014012Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "cells": [
+    {
+      "path": "paged_aiter_f16",
+      "aiter": 1,
+      "target_tokens": 8192,
+      "cache_type": "f16",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 5230.803,
+      "prompt_per_second": 1800.1060257860984,
+      "predicted_n": 32,
+      "predicted_ms": 578.989,
+      "predicted_per_second": 55.268752946947174
+    },
+    {
+      "path": "paged_aiter_f16",
+      "aiter": 1,
+      "target_tokens": 65536,
+      "cache_type": "f16",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 51218.304,
+      "prompt_per_second": 1203.1831432762788,
+      "predicted_n": 32,
+      "predicted_ms": 891.103,
+      "predicted_per_second": 35.910551305516876
+    },
+    {
+      "path": "paged_aiter_turbo3",
+      "aiter": 1,
+      "target_tokens": 8192,
+      "cache_type": "turbo3",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 5856.502,
+      "prompt_per_second": 1607.7856713785804,
+      "predicted_n": 32,
+      "predicted_ms": 607.857,
+      "predicted_per_second": 52.643960668380885
+    },
+    {
+      "path": "paged_aiter_turbo3",
+      "aiter": 1,
+      "target_tokens": 65536,
+      "cache_type": "turbo3",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 103479.03,
+      "prompt_per_second": 595.5312878367723,
+      "predicted_n": 32,
+      "predicted_ms": 1069.462,
+      "predicted_per_second": 29.921586741744914
+    },
+    {
+      "path": "paged_aiter_turbo4",
+      "aiter": 1,
+      "target_tokens": 8192,
+      "cache_type": "turbo4",
+      "ctx_size": 32768,
+      "prompt_n": 9416,
+      "prompt_ms": 5456.514,
+      "prompt_per_second": 1725.6438817897288,
+      "predicted_n": 32,
+      "predicted_ms": 597.185,
+      "predicted_per_second": 53.58473504860304
+    },
+    {
+      "path": "paged_aiter_turbo4",
+      "aiter": 1,
+      "target_tokens": 65536,
+      "cache_type": "turbo4",
+      "ctx_size": 131072,
+      "prompt_n": 61625,
+      "prompt_ms": 86604.684,
+      "prompt_per_second": 711.5665937883914,
+      "predicted_n": 32,
+      "predicted_ms": 1033.322,
+      "predicted_per_second": 30.96808158541094
+    }
+  ]
+}

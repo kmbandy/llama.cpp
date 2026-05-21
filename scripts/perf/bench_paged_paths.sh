@@ -273,7 +273,10 @@ echo "  out=${OUT_PATH}" >&2
 
 cells=()
 IFS=',' read -r -a CTX_ARR <<< "${CTX_SIZES}"
-for path in paged_turbo4 paged_turbo3 paged_aiter_f16 paged_aiter_turbo3 paged_aiter_turbo4 vanilla_f16; do
+# PATHS env var (space-separated) lets callers run a subset for fast feedback;
+# defaults to the full 6-path matrix.
+PATHS="${PATHS:-paged_turbo4 paged_turbo3 paged_aiter_f16 paged_aiter_turbo3 paged_aiter_turbo4 vanilla_f16}"
+for path in ${PATHS}; do
     for ctx in "${CTX_ARR[@]}"; do
         cell_json="$(run_cell "${path}" "${ctx}")"
         cells+=("${cell_json}")

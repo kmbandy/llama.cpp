@@ -3,8 +3,16 @@
 #
 #   Source:   aiter/ops/triton/_triton_kernels/attention/unified_attention.py
 #   Upstream: https://github.com/ROCm/aiter
-#   Repo HEAD at vendoring time: 32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab (2026-05-18)
-#   Last commit touching this file: 9dd4ae3cfb3f1813f702f49fa079244e81f903cc (2026-03-31)
+#   Repo HEAD at vendoring time: 163e6a02517fa9b86abf2f648c97fe6ae74b6d7c (2026-05-20)
+#   Last commit touching this file: 7f613da837208886c1d9a958550f1ad50bd0ef7e (2026-05-20)
+#
+# Re-vendor 2026-05-20: bumped to AITER HEAD `163e6a02`. Sole upstream change
+# since previous SHA `32e1e6d` (2026-05-18) that touches this kernel is PR #3231
+# (commit 7f613da8): `acc += tl.dot(P.to(V.dtype), V)` →
+# `acc = tl.dot(P.to(V.dtype), V, acc=acc)` at the V·scores accumulate sites
+# in kernel_unified_attention_2d (line 754) and kernel_unified_attention_3d
+# (line 1099). Patch applied. See ../RDNA4_AUDIT_2026-05-20.md for the
+# investigation that motivated the re-vendor (MAD-202).
 #
 # License: MIT (matches upstream aiter LICENSE — see
 #          https://github.com/ROCm/aiter/blob/main/LICENSE).
@@ -751,7 +759,7 @@ def kernel_unified_attention_2d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -1096,7 +1104,7 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
+        acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     if v_descale is not None:
         acc = acc * v_descale

@@ -105,9 +105,14 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
 // block has plenty of work; the 3D kernel's split-K reduction overhead
 // dominates instead of helping at this size.
 //
+// MAD-203: BLOCK_M / BLOCK_Q are now parameters so the caller can request
+// either the "base" prefill spec (16/2) or the "large" prefill spec (64/8)
+// per the upstream host dispatcher's max_seqlen_q >= 256 rule.
+//
 // Same K/V cache pointer dtype switch as build_signature_3d (cache_type
 // drives *fp16:16 vs *i8:16 and the CACHE_TYPE constexpr).
-std::string build_signature_2d(const mt_aiter_uattn_shape_t & s) {
+std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
+                                int block_m, int block_q) {
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
@@ -133,8 +138,8 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s) {
         s.block_size,                       // BLOCK_SIZE
         MT_AITER_UATTN_TILE_SIZE,           // TILE_SIZE
         s.head_size, s.head_size,           // HEAD_SIZE, HEAD_SIZE_PADDED
-        MT_AITER_UATTN_BLOCK_Q,             // BLOCK_Q
-        MT_AITER_UATTN_BLOCK_M,             // BLOCK_M
+        block_q,                            // BLOCK_Q
+        block_m,                            // BLOCK_M
         cache_type_val);                    // CACHE_TYPE
     return buf;
 }
@@ -162,7 +167,8 @@ struct CachedHandles {
     mt_aiter_uattn_shape_t      shape       = {};
     const aiter::KernelHandle * h_3d        = nullptr;
     const aiter::KernelHandle * h_reduce    = nullptr;
-    const aiter::KernelHandle * h_2d        = nullptr;  // MAD-199 D3: prefill path
+    const aiter::KernelHandle * h_2d        = nullptr;  // MAD-199 D3: base prefill (BLOCK_M=16, BLOCK_Q=2)
+    const aiter::KernelHandle * h_2d_large  = nullptr;  // MAD-203:    large prefill (BLOCK_M=64, BLOCK_Q=8)
     bool                        initialized = false;
     hipError_t                  init_err    = hipSuccess;
 };
@@ -215,8 +221,8 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     };
     c.h_reduce = reg.get_or_compile(spec_reduce);
 
-    // MAD-199 D3: also compile the 2D kernel for prefill dispatch.
-    const std::string sig_2d = build_signature_2d(shape);
+    // MAD-199 D3: 2D base prefill spec (BLOCK_M=16, BLOCK_Q=2).
+    const std::string sig_2d = build_signature_2d(shape, MT_AITER_UATTN_BLOCK_M, MT_AITER_UATTN_BLOCK_Q);
     aiter::KernelSpec spec_2d {
         AITER_KERNEL_SOURCE_DEFAULT,
         "kernel_unified_attention_2d",
@@ -224,13 +230,35 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     };
     c.h_2d = reg.get_or_compile(spec_2d);
 
+    // MAD-203: 2D large-prefill spec (BLOCK_M=64, BLOCK_Q=8). Per the
+    // upstream host dispatcher's large-prefill branch (max_seqlen_q >= 256):
+    // 4× LDS reuse vs the base spec. Single best win expected from MAD-203.
+    // Requires num_queries_per_kv == 8 for BLOCK_Q=8 to be valid; assert.
+    if (shape.num_kv_heads > 0 &&
+        (shape.num_q_heads / shape.num_kv_heads) == 8) {
+        const std::string sig_2d_large = build_signature_2d(
+            shape, MT_AITER_UATTN_BLOCK_M_LARGE, MT_AITER_UATTN_BLOCK_Q_LARGE);
+        aiter::KernelSpec spec_2d_large {
+            AITER_KERNEL_SOURCE_DEFAULT,
+            "kernel_unified_attention_2d",
+            target, sig_2d_large, 4, 1,
+        };
+        c.h_2d_large = reg.get_or_compile(spec_2d_large);
+    } else {
+        // For non-8-GQA shapes, fall back to the base spec for large prefill too.
+        // BLOCK_Q must equal BLOCK_M / num_queries_per_kv; with our hardcoded
+        // BLOCK_Q_LARGE=8 this only matches GQA=8. Generalizing is MAD-203 phase 2.
+        c.h_2d_large = c.h_2d;
+    }
+
     c.shape       = shape;
     c.initialized = true;
-    if (!c.h_3d || !c.h_reduce || !c.h_2d) {
+    if (!c.h_3d || !c.h_reduce || !c.h_2d || !c.h_2d_large) {
         std::fprintf(stderr,
             "mt_aiter_unified_attn: registry could not compile/load kernels "
-            "(3d=%p, reduce=%p, 2d=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
-            (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, target.c_str(),
+            "(3d=%p, reduce=%p, 2d=%p, 2d_large=%p, target=%s, h=%d nq=%d nkv=%d bs=%d ct=%d)\n",
+            (const void*)c.h_3d, (const void*)c.h_reduce, (const void*)c.h_2d, (const void*)c.h_2d_large,
+            target.c_str(),
             shape.head_size, shape.num_q_heads, shape.num_kv_heads, shape.block_size, shape.cache_type);
         c.init_err = hipErrorInvalidImage;
     }
@@ -244,14 +272,19 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     hipError_t init_err = ensure_initialized(a->shape);
     if (init_err != hipSuccess) return init_err;
     const CachedHandles & c = get_cached();
-    if (!c.h_3d || !c.h_reduce || !c.h_2d) return hipErrorInvalidImage;
+    if (!c.h_3d || !c.h_reduce || !c.h_2d || !c.h_2d_large) return hipErrorInvalidImage;
 
-    // MAD-199 D3: dispatch on q_len. The 3D kernel's split-K is only a win
-    // when q is small (decode); for prefill the per-segment overhead and the
-    // reduce-segments pass dominate. Switch to the 2D kernel when avg q_len
-    // per seq is >= BLOCK_Q (the natural q-blocking threshold).
-    const int32_t avg_q_len = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
-    const bool    use_2d    = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
+    // MAD-199 D3 + MAD-203: three-way dispatch.
+    //
+    // 3D split-K is only a win for short q (decode); for prefill the
+    // per-segment overhead and reduce-segments pass dominate. Within the
+    // 2D path, switching to BLOCK_M=64 / BLOCK_Q=8 (large-prefill spec)
+    // gives 4× LDS reuse vs the base BLOCK_M=16 spec, but BLOCK_Q=8 only
+    // pays off when each Q block has ≥256 tokens to chew through (matches
+    // upstream's max_seqlen_q >= 256 cutover).
+    const int32_t avg_q_len    = (a->num_seqs > 0) ? (a->num_q_tokens / a->num_seqs) : 1;
+    const bool    use_2d       = (avg_q_len >= MT_AITER_UATTN_BLOCK_Q);
+    const bool    use_2d_large = use_2d && (avg_q_len >= MT_AITER_UATTN_LARGE_PREFILL_THRESHOLD);
 
     // ── 3D split-K phase ───────────────────────────────────────────────────
     hipDeviceptr_t p_segm_out    = (hipDeviceptr_t) a->segm_output;
@@ -288,6 +321,8 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     const int32_t num_q_tokens = a->num_q_tokens > 0 ? a->num_q_tokens : num_seqs;
 
     // MAD-199 D3: Prefill path — single-pass 2D kernel, no segm bufs, no reduce.
+    // MAD-203: select between base (BLOCK_M=16, BLOCK_Q=2) and large (BLOCK_M=64,
+    // BLOCK_Q=8) spec based on avg_q_len.
     if (use_2d) {
         hipDeviceptr_t p_out = (hipDeviceptr_t) a->out;
         hipDeviceptr_t p_os  = (hipDeviceptr_t) a->out_scale;
@@ -308,12 +343,19 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
             &p_global_scratch, &p_profile_scratch,
         };
 
-        // 2D grid: (n_kv_heads, num_q_blocks). num_q_blocks matches 3D's
-        // gX formula so we re-use it.
+        // 2D grid: (n_kv_heads, num_q_blocks). num_q_blocks = num_q_tokens/BLOCK_Q + num_seqs
+        // per upstream's upper-bound formula (see unified_attention_host_reference.py).
+        // BLOCK_Q differs between base (2) and large (8) specs — must match the
+        // selected handle.
+        const int32_t block_q_for_grid = use_2d_large
+            ? MT_AITER_UATTN_BLOCK_Q_LARGE
+            : MT_AITER_UATTN_BLOCK_Q;
+        const aiter::KernelHandle * h_2d_selected = use_2d_large ? c.h_2d_large : c.h_2d;
+
         unsigned int g2_x = (unsigned int) a->shape.num_kv_heads;
-        unsigned int g2_y = (unsigned int)(num_q_tokens / MT_AITER_UATTN_BLOCK_Q + num_seqs);
+        unsigned int g2_y = (unsigned int)(num_q_tokens / block_q_for_grid + num_seqs);
         unsigned int g2_z = 1;
-        return c.h_2d->launch(stream, g2_x, g2_y, g2_z, args_2d);
+        return h_2d_selected->launch(stream, g2_x, g2_y, g2_z, args_2d);
     }
 
     void *args_3d[] = {
