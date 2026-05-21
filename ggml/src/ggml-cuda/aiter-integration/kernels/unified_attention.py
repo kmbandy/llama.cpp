@@ -527,6 +527,150 @@ def load_turbo4_kv_tile_V(
     return turbo4_centroid(idx) * norms
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# MAD-214: turbo-FP8 KV tile loaders.
+#
+# Unlike load_turbo{3,4}_kv_tile_K/V (which return dequant'd FP32 with scale
+# baked in), the turbo-FP8 loaders return:
+#   (fp8_tile_bytes, scales_per_token)
+#
+# fp8_tile_bytes  shape (HEAD_SIZE_PADDED, TILE_SIZE)  dtype tl.int8 (signed
+#                                                     E4M3 bit pattern,
+#                                                     bitcast at tl.dot site)
+# scales          shape (TILE_SIZE,)                  dtype fp32 (per-token
+#                                                     K-row scale; multiplied
+#                                                     into the FP32 accumulator
+#                                                     POST-WMMA)
+#
+# Production assumes BLOCK_SIZE=256 (one block per K-row), so QB_PER_TOK=1 and
+# there's no per-qb broadcast. BS<256 variants (per MAD-215) require a
+# different load function with per-block accumulation in the caller.
+# ─────────────────────────────────────────────────────────────────────────
+
+@triton.jit
+def load_turbo_fp8_kv_tile_K_bs256(
+    cache_byte_ptr,          # *i8 — base of K cache
+    physical_block_idx,      # (TILE_SIZE,) — paged block id per token
+    token_in_block,          # (TILE_SIZE,) — slot within paged block
+    offs_d,                  # (HEAD_SIZE_PADDED,) — head_dim offsets
+    kv_head_idx,             # scalar int — KV head index
+    lut_ptr,                 # *u8 — per-(kv, layer) centroid LUT (N_CENTROIDS bytes)
+    n_kv_heads:        tl.constexpr,
+    BLOCK_SIZE:        tl.constexpr,
+    HEAD_SIZE:         tl.constexpr,
+    IDX_BITS:          tl.constexpr,  # 3 (turbo3) / 4 (turbo4) / 5 (turbo5)
+    BYTES_PER_BLOCK:   tl.constexpr,  # 130 / 162 / 194 for BS=256
+    dim_mask,                # (HEAD_SIZE_PADDED,) — valid head_dim mask
+    tile_mask,               # (TILE_SIZE,) — valid token mask
+):
+    # BS=256 simplification: one block per token row (assuming HEAD_SIZE=256).
+    # If HEAD_SIZE != BLOCK_SIZE=256 we'd need the per-block accumulation path
+    # (MAD-215 — currently flagged as not-implemented at the wrapper layer).
+    tl.static_assert(HEAD_SIZE == 256, "turbo-FP8 BS=256 kernel requires HEAD_SIZE=256 (Qwen3.5 family)")
+
+    # Byte base of each token's block in the paged cache.
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_BLOCK)
+        + kv_head_idx      * BYTES_PER_BLOCK
+    )  # shape (TILE_SIZE,) int64
+
+    # Per-token FP16 scale (load once, no broadcast needed across head_dim
+    # since the block IS the row).
+    scale_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    scales    = tl.load(scale_ptr, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+
+    # Within a block, layout is:
+    #   bytes [0..2)                            : FP16 scale
+    #   bytes [2..2+256*IDX_BITS/8)             : packed indices (IDX_BITS per element)
+    #   bytes [2+256*IDX_BITS/8 .. +32)         : sign bits (1 per element, 32 bytes total)
+    QS_BYTES:     tl.constexpr = 256 * IDX_BITS // 8
+    SIGNS_OFFSET: tl.constexpr = 2 + QS_BYTES
+
+    # Per-element bit position in the packed qs[] stream.
+    bit_pos     = offs_d * IDX_BITS                    # (HEAD_SIZE_PADDED,)
+    byte_lo_off = (bit_pos // 8).to(tl.int64)          # which byte in qs
+    bit_off     = (bit_pos % 8).to(tl.int32)           # bit offset within that byte
+
+    # Broadcast offsets to (HEAD_SIZE_PADDED, TILE_SIZE) and add token-base.
+    qs_lo_addr = block_byte_base[None, :] + 2 + byte_lo_off[:, None]
+    qs_hi_addr = qs_lo_addr + 1
+    sign_addr  = block_byte_base[None, :] + SIGNS_OFFSET + (offs_d[:, None] // 8).to(tl.int64)
+
+    load_mask = dim_mask[:, None] & tile_mask[None, :]
+    qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
+    qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+    sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
+    sign_bit_off = (offs_d % 8).to(tl.int32)            # (HEAD_SIZE_PADDED,)
+
+    # Extract IDX_BITS index, look up centroid byte, XOR sign → signed E4M3 byte.
+    word          = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
+    mask          = (1 << IDX_BITS) - 1
+    idx           = (word >> bit_off[:, None]) & mask
+    centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)
+    sign_bit      = (sign_bytes.to(tl.int32) >> sign_bit_off[:, None]) & 1
+    fp8_bytes     = (centroid_byte | (sign_bit << 7)).to(tl.int8)
+
+    return fp8_bytes, scales
+
+
+@triton.jit
+def load_turbo_fp8_kv_tile_V_bs256(
+    cache_byte_ptr,
+    physical_block_idx,
+    token_in_block,
+    offs_d,
+    kv_head_idx,
+    lut_ptr,
+    n_kv_heads:        tl.constexpr,
+    BLOCK_SIZE:        tl.constexpr,
+    HEAD_SIZE:         tl.constexpr,
+    IDX_BITS:          tl.constexpr,
+    BYTES_PER_BLOCK:   tl.constexpr,
+    dim_mask,
+    tile_mask,
+):
+    """V loader — transposes the result shape vs K (matches existing
+    load_turbo4_kv_tile_V convention)."""
+    tl.static_assert(HEAD_SIZE == 256, "turbo-FP8 BS=256 kernel requires HEAD_SIZE=256")
+
+    block_byte_base = (
+        physical_block_idx * (BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK)
+        + token_in_block   * (n_kv_heads * BYTES_PER_BLOCK)
+        + kv_head_idx      * BYTES_PER_BLOCK
+    )
+
+    scale_ptr = (cache_byte_ptr + block_byte_base).to(tl.pointer_type(tl.float16))
+    scales    = tl.load(scale_ptr, mask=tile_mask, other=0.0).to(tl.float32)  # (TILE_SIZE,)
+
+    QS_BYTES:     tl.constexpr = 256 * IDX_BITS // 8
+    SIGNS_OFFSET: tl.constexpr = 2 + QS_BYTES
+
+    bit_pos     = offs_d * IDX_BITS
+    byte_lo_off = (bit_pos // 8).to(tl.int64)
+    bit_off     = (bit_pos % 8).to(tl.int32)
+
+    # V tile shape is (TILE_SIZE, HEAD_SIZE_PADDED) — token-major.
+    qs_lo_addr = block_byte_base[:, None] + 2 + byte_lo_off[None, :]
+    qs_hi_addr = qs_lo_addr + 1
+    sign_addr  = block_byte_base[:, None] + SIGNS_OFFSET + (offs_d[None, :] // 8).to(tl.int64)
+
+    load_mask = tile_mask[:, None] & dim_mask[None, :]
+    qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
+    qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+    sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
+    sign_bit_off = (offs_d % 8).to(tl.int32)
+
+    word          = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
+    mask          = (1 << IDX_BITS) - 1
+    idx           = (word >> bit_off[None, :]) & mask
+    centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)
+    sign_bit      = (sign_bytes.to(tl.int32) >> sign_bit_off[None, :]) & 1
+    fp8_bytes     = (centroid_byte | (sign_bit << 7)).to(tl.int8)
+
+    return fp8_bytes, scales
+
+
 @triton.jit
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
