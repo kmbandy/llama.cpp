@@ -873,6 +873,21 @@ def kernel_unified_attention_2d(
         k_descale = None
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+
+    # MAD-214: Q → FP8 quantization for the turbo-FP8 path. Computed ONCE per
+    # Q-block (Q is loaded once before the tile loop and reused). Per-row max
+    # gives FP8 dynamic range; the Q_scale_fp8 vector is multiplied into the
+    # FP32 accumulator AFTER the FP8 tl.dot via qk_scale broadcast.
+    #
+    # This branch is constexpr-dead for non-FP8 CACHE_TYPEs.
+    IS_TURBO_FP8: tl.constexpr = (CACHE_TYPE >= 10) and (CACHE_TYPE <= 34)
+    if IS_TURBO_FP8:
+        Q_fp32        = Q.to(tl.float32)
+        Q_abs_max     = tl.max(tl.abs(Q_fp32), axis=1)          # (BLOCK_M,)
+        Q_scale_fp8   = tl.where(Q_abs_max > 0, Q_abs_max, 1.0) # guard zero rows
+        Q_normalized  = Q_fp32 / Q_scale_fp8[:, None]           # in [-1, 1]
+        Q_fp8_tensor  = Q_normalized.to(tl.float8e4nv)          # (BLOCK_M, HEAD_SIZE_PADDED)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
