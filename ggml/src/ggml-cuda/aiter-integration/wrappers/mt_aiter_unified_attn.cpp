@@ -336,6 +336,13 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
     int64_t        vs2           = a->v_stride_2;
     hipDeviceptr_t p_cu          = (hipDeviceptr_t) a->query_start_len;
     int32_t        num_seqs      = a->num_seqs;
+    // MAD-214: turbo-FP8 centroid LUT pointers. NULL'd defensively for non-FP8
+    // cache types — kernel branch dead-eliminates the deref so safe regardless,
+    // but explicit NULL avoids passing struct-uninit garbage to the kernel.
+    hipDeviceptr_t p_centroids_k = (hipDeviceptr_t) (
+        mt_aiter_cache_is_turbo_fp8(a->shape.cache_type) ? a->centroids_k : nullptr);
+    hipDeviceptr_t p_centroids_v = (hipDeviceptr_t) (
+        mt_aiter_cache_is_turbo_fp8(a->shape.cache_type) ? a->centroids_v : nullptr);
     // Triton 3.7+ appends two scratch pointers (null) after the user args.
     hipDeviceptr_t p_global_scratch  = (hipDeviceptr_t) nullptr;
     hipDeviceptr_t p_profile_scratch = (hipDeviceptr_t) nullptr;
@@ -362,6 +369,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
             &ks0, &ks1, &ks2,
             &vs0, &vs1, &vs2,
             &p_cu, &num_seqs,
+            &p_centroids_k, &p_centroids_v,  // MAD-214: turbo-FP8 per-layer LUT pointers
             &p_global_scratch, &p_profile_scratch,
         };
 
@@ -393,6 +401,7 @@ hipError_t mt_aiter_unified_attn(hipStream_t stream,
         &ks0, &ks1, &ks2,
         &vs0, &vs1, &vs2,
         &p_cu, &num_seqs,
+        &p_centroids_k, &p_centroids_v,  // MAD-214: turbo-FP8 per-layer LUT pointers
         &p_global_scratch, &p_profile_scratch,
     };
 
