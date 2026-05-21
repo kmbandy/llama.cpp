@@ -70,9 +70,50 @@
 // kernels/unified_attention.py).
 enum mt_aiter_cache_type {
     MT_AITER_CACHE_F16    = 0,
+
+    // Legacy turbo3/turbo4 (MAD-199 v2). Dequant to FP16, FP16 attention path.
     MT_AITER_CACHE_TURBO3 = 1,
     MT_AITER_CACHE_TURBO4 = 2,
+
+    // MAD-214: turbo-FP8 family — FP8 matrix core path via centroid LUT decode.
+    // Numbering: 10..14 = turbo3_fp8 × BS{16,32,64,128,256}
+    //            20..24 = turbo4_fp8 × BS{16,32,64,128,256}
+    //            30..34 = turbo5_fp8 × BS{16,32,64,128,256}
+    // Only the BS=256 variants are wired at MAD-214 Phase 1 ship; the others
+    // are accepted by the wrapper API but throw "kernel not implemented for
+    // this BLOCK_SIZE yet — calibration data + AOT spec needed" until
+    // MAD-215 wires them.
+    MT_AITER_CACHE_TURBO3_FP8_BS16  = 10,
+    MT_AITER_CACHE_TURBO3_FP8_BS32  = 11,
+    MT_AITER_CACHE_TURBO3_FP8_BS64  = 12,
+    MT_AITER_CACHE_TURBO3_FP8_BS128 = 13,
+    MT_AITER_CACHE_TURBO3_FP8_BS256 = 14,
+
+    MT_AITER_CACHE_TURBO4_FP8_BS16  = 20,
+    MT_AITER_CACHE_TURBO4_FP8_BS32  = 21,
+    MT_AITER_CACHE_TURBO4_FP8_BS64  = 22,
+    MT_AITER_CACHE_TURBO4_FP8_BS128 = 23,
+    MT_AITER_CACHE_TURBO4_FP8_BS256 = 24,
+
+    MT_AITER_CACHE_TURBO5_FP8_BS16  = 30,
+    MT_AITER_CACHE_TURBO5_FP8_BS32  = 31,
+    MT_AITER_CACHE_TURBO5_FP8_BS64  = 32,
+    MT_AITER_CACHE_TURBO5_FP8_BS128 = 33,
+    MT_AITER_CACHE_TURBO5_FP8_BS256 = 34,
+
+    // Production aliases — the unsuffixed name resolves to the production
+    // BS=256 variant (kernel = single tl.dot per Q·K^T, like vanilla FP8 attn).
+    MT_AITER_CACHE_TURBO3_FP8 = MT_AITER_CACHE_TURBO3_FP8_BS256,
+    MT_AITER_CACHE_TURBO4_FP8 = MT_AITER_CACHE_TURBO4_FP8_BS256,
+    MT_AITER_CACHE_TURBO5_FP8 = MT_AITER_CACHE_TURBO5_FP8_BS256,
 };
+
+// Helper: returns nonzero if the cache type is part of the turbo-FP8 family.
+// Cheap to inline at C call sites; the kernel-internal dispatch uses the
+// numeric ranges directly.
+static inline int mt_aiter_cache_is_turbo_fp8(int t) {
+    return (t >= 10 && t <= 14) || (t >= 20 && t <= 24) || (t >= 30 && t <= 34);
+}
 
 // Model-shape parameters — set by the caller per model. The wrapper builds
 // the Triton signature from these at first call, so the runtime registry
