@@ -168,6 +168,12 @@ struct mt_aiter_uattn_args_t {
     const float   *k_descale;
     const float   *v_descale;
     const float   *out_scale;     // may be NULL
+    // MAD-214: per-(kv head, current layer) centroid LUT pointers for
+    // turbo-FP8 cache types. Each LUT is N_CENTROIDS uint8_t bytes
+    // (positive E4M3) — caller indexes by attention-layer position before
+    // each attention call. NULL for non-FP8 cache_type (F16, TURBO3/4).
+    const uint8_t *centroids_k;
+    const uint8_t *centroids_v;
     // Scalars
     float          scale;          // attention softmax scale (typically 1/sqrt(head_size))
     int32_t        num_seqs;
