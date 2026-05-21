@@ -344,6 +344,63 @@ typedef struct {
 } block_turbo2_0;                       // 10 bytes total
 static_assert(sizeof(block_turbo2_0) == sizeof(ggml_half) + QK_TURBO2/4, "wrong turbo2_0 block size/padding");
 
+// MAD-214: turbo-FP8 family — non-uniform centroid LUT feeding FP8 tensor cores.
+//
+// On-disk layout for KV cache. The dequant + attention path is:
+//   1. Walsh-Hadamard rotation applied to K and V along head_dim at quant time
+//      (and to Q at inference). Identity QH·(KH)^T = QK^T preserved.
+//   2. Per-block FP16 scale = max(|values|) within the 32-element block.
+//   3. Each element's magnitude index (N bits, where N = log2(N_CENTROIDS))
+//      packed into qs[]. Sign bit packed into signs[] (1 bit per element).
+//   4. Kernel decode: idx -> LUT[idx] -> FP8 byte; XOR sign -> packed FP8;
+//      feed v_wmma_f32_16x16x16_fp8_fp8; post-mul by scale in FP32.
+//
+// Centroid LUT itself lives in scripts/calibration/-generated turbo_fp8_centroids.h,
+// one uint8_t[N_CENTROIDS] per (kv, layer). LUT entries are positive E4M3 bytes;
+// sign bit is XOR'd at runtime to produce the signed FP8 byte.
+//
+// Block size 32 (matches calibration sweep). Differs from QK_TURBO3/4 = 128
+// (rotation-group sized) — turbo-FP8 carries explicit Hadamard rotation in the
+// wrapper, so block size is independent of rotation group.
+
+#define QK_TURBO_FP8 32
+
+// turbo3-FP8: 8 centroids, 3-bit index per element
+//   2 (scale) + 32*3/8 (idx) + 32/8 (sign) = 2 + 12 + 4 = 18 bytes per 32 values
+//   = 4.5 bpv (matches q4_0 memory exactly; ~1.15x better quality on Qwen3.5-4B
+//     calibration; uses FP8 matrix cores vs q4_0's dp4a)
+typedef struct {
+    ggml_half  d;                              //  2 bytes: per-block FP16 scale
+    uint8_t    qs[QK_TURBO_FP8 * 3 / 8];      // 12 bytes: 3-bit magnitude indices (packed)
+    uint8_t    signs[QK_TURBO_FP8 / 8];       //  4 bytes: 1 sign bit per element
+} block_turbo3_fp8;                            // 18 bytes total
+static_assert(sizeof(block_turbo3_fp8) == sizeof(ggml_half) + QK_TURBO_FP8*3/8 + QK_TURBO_FP8/8,
+              "wrong block_turbo3_fp8 size/padding");
+
+// turbo4-FP8: 16 centroids, 4-bit index per element (sweet spot variant)
+//   2 + 32/2 + 32/8 = 2 + 16 + 4 = 22 bytes per 32 values
+//   = 5.5 bpv (~4.3x better quality than q4_0 at +1 bpv; FP8 matrix cores)
+typedef struct {
+    ggml_half  d;                              //  2 bytes: per-block FP16 scale
+    uint8_t    qs[QK_TURBO_FP8 / 2];          // 16 bytes: 4-bit magnitude indices (nibble packed)
+    uint8_t    signs[QK_TURBO_FP8 / 8];       //  4 bytes: 1 sign bit per element
+} block_turbo4_fp8;                            // 22 bytes total
+static_assert(sizeof(block_turbo4_fp8) == sizeof(ggml_half) + QK_TURBO_FP8/2 + QK_TURBO_FP8/8,
+              "wrong block_turbo4_fp8 size/padding");
+
+// turbo5-FP8: 32 centroids, 5-bit index per element (near-lossless variant)
+//   2 + 32*5/8 + 32/8 = 2 + 20 + 4 = 26 bytes per 32 values
+//   = 6.5 bpv (~10x better quality than q4_0 at +2 bpv; approaches fp8_raw quality)
+typedef struct {
+    ggml_half  d;                              //  2 bytes: per-block FP16 scale
+    uint8_t    qs[QK_TURBO_FP8 * 5 / 8];      // 20 bytes: 5-bit magnitude indices (packed)
+    uint8_t    signs[QK_TURBO_FP8 / 8];       //  4 bytes: 1 sign bit per element
+} block_turbo5_fp8;                            // 26 bytes total
+static_assert(sizeof(block_turbo5_fp8) == sizeof(ggml_half) + QK_TURBO_FP8*5/8 + QK_TURBO_FP8/8,
+              "wrong block_turbo5_fp8 size/padding");
+
+static_assert(QK_TURBO_FP8 == 32, "turbo-FP8 kernels assume QK_TURBO_FP8 == 32 (calibrated block size)");
+
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
 // Block size 32, dual half-block scales (d0 for [0..15], d1 for [16..31])
 // Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values
