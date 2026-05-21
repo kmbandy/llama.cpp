@@ -67,6 +67,21 @@ std::string build_signature_3d(const mt_aiter_uattn_shape_t & s) {
             kv_ptr_dtype   = "*i8:16";
             cache_type_val = 2;
             break;
+        // MAD-214: turbo-FP8 family. Production-wired variants only (BS=256).
+        // BS<256 variants throw at compile time via tl.static_assert in
+        // unified_attention.py — MAD-215 wires those.
+        case MT_AITER_CACHE_TURBO3_FP8_BS256:
+            kv_ptr_dtype   = "*i8:16";
+            cache_type_val = 14;
+            break;
+        case MT_AITER_CACHE_TURBO4_FP8_BS256:
+            kv_ptr_dtype   = "*i8:16";
+            cache_type_val = 24;
+            break;
+        case MT_AITER_CACHE_TURBO5_FP8_BS256:
+            kv_ptr_dtype   = "*i8:16";
+            cache_type_val = 34;
+            break;
         default:
             kv_ptr_dtype   = "*fp16:16";
             cache_type_val = 0;
@@ -116,10 +131,15 @@ std::string build_signature_2d(const mt_aiter_uattn_shape_t & s,
     const char * kv_ptr_dtype;
     int          cache_type_val;
     switch (s.cache_type) {
-        case MT_AITER_CACHE_F16:    kv_ptr_dtype = "*fp16:16"; cache_type_val = 0; break;
-        case MT_AITER_CACHE_TURBO3: kv_ptr_dtype = "*i8:16";   cache_type_val = 1; break;
-        case MT_AITER_CACHE_TURBO4: kv_ptr_dtype = "*i8:16";   cache_type_val = 2; break;
-        default:                    kv_ptr_dtype = "*fp16:16"; cache_type_val = 0; break;
+        case MT_AITER_CACHE_F16:               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
+        case MT_AITER_CACHE_TURBO3:            kv_ptr_dtype = "*i8:16";   cache_type_val =  1; break;
+        case MT_AITER_CACHE_TURBO4:            kv_ptr_dtype = "*i8:16";   cache_type_val =  2; break;
+        // MAD-214: turbo-FP8 family (BS=256 production variants only;
+        // BS<256 covered by MAD-215). Numeric values match mt_aiter_cache_type.
+        case MT_AITER_CACHE_TURBO3_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 14; break;
+        case MT_AITER_CACHE_TURBO4_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 24; break;
+        case MT_AITER_CACHE_TURBO5_FP8_BS256:  kv_ptr_dtype = "*i8:16";   cache_type_val = 34; break;
+        default:                               kv_ptr_dtype = "*fp16:16"; cache_type_val =  0; break;
     }
     char buf[1024];
     std::snprintf(buf, sizeof(buf),
