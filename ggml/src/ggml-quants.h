@@ -123,6 +123,14 @@ GGML_API void quantize_row_tq4_1s_ref(const float * GGML_RESTRICT x, block_tq4_1
 GGML_API void dequantize_row_tq4_1s(const block_tq4_1s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
+// MAD-214: turbo-FP8 BS=256 KV cache. Decode requires a per-(kv, layer)
+// runtime centroid LUT (16 E4M3 bytes) that the standard quantize/dequantize
+// signatures do not carry. These stubs exist only to satisfy the ggml_type
+// type-trait table; KV cache fill/drain goes through a custom CUDA path
+// (mt_pagedattn_turbo_fp8.cuh) that has access to the per-layer LUT.
+GGML_API void quantize_row_turbo4_fp8_bs256_ref(const float * GGML_RESTRICT x, block_turbo4_fp8_bs256 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4_fp8_bs256(const block_turbo4_fp8_bs256 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

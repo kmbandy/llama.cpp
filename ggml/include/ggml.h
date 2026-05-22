@@ -434,7 +434,8 @@ extern "C" {
         GGML_TYPE_TURBO2_0 = 44, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_TURBO4_FP8_BS256 = 47, // MAD-214: turbo-FP8 KV cache, 4-bit centroid idx + sign + fp16 scale, BS=256, decoded via E4M3 LUT (per-(kv,layer) runtime LUT)
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision

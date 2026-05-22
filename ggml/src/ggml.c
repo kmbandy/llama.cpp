@@ -789,6 +789,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tq4_1s,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq4_1s_ref,
     },
+    [GGML_TYPE_TURBO4_FP8_BS256] = {
+        .type_name                = "turbo4_fp8_bs256",
+        .blck_size                = 256,  // one block covers a full HEAD_SIZE=256 row
+        .type_size                = sizeof(block_turbo4_fp8_bs256),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_fp8_bs256,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_fp8_bs256_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,

@@ -993,3 +993,17 @@ size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     }
     return nrows * row_size;
 }
+
+// MAD-214: turbo-FP8 BS=256 KV cache stubs. Decode requires a per-(kv, layer)
+// runtime centroid LUT that this generic API cannot carry; the production
+// fill/drain path is custom CUDA (mt_pagedattn_turbo_fp8.cuh + paged-tile
+// scatter). These stubs abort if invoked so misuse is loud.
+void quantize_row_turbo4_fp8_bs256_ref(const float * GGML_RESTRICT x, block_turbo4_fp8_bs256 * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("turbo4_fp8_bs256: generic quantize_row not supported (needs per-(kv,layer) runtime LUT); use the custom KV cache scatter path");
+}
+
+void dequantize_row_turbo4_fp8_bs256(const block_turbo4_fp8_bs256 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("turbo4_fp8_bs256: generic dequantize_row not supported (needs per-(kv,layer) runtime LUT); use the custom KV cache decode path");
+}
