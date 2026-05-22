@@ -23,6 +23,8 @@
 #include "mt_turbo_fp8_lut_registry.h"  // MAD-214: per-(layer, kv-dir) centroid LUT lookup
 
 #include <cstring>
+#include <sys/stat.h>  // MAD-214 Option F: mkdir for dump dir
+#include <vector>
 
 namespace mt {
 
@@ -596,6 +598,42 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     shape.cache_type   = cache_type;
 
     cudaStream_t stream = ctx.stream();
+
+    // ── MAD-214 Option F: calibration dump hook ──
+    // When MT_TURBO_FP8_DUMP_DIR is set and the cache type is turbo-FP8,
+    // copy the fp16 K_cur and V_cur tensors to disk for offline Lloyd-Max
+    // fitting (scripts/calibration/fit_centroids_from_dump.py). Layer index
+    // is parsed from the k_cache tensor name. The actual scatter still runs
+    // (using the fallback LUT), but only the dumps are consumed for fitting.
+    if (cache_type == MT_AITER_CACHE_TURBO4_FP8) {
+        const char * dump_dir = std::getenv("MT_TURBO_FP8_DUMP_DIR");
+        if (dump_dir && *dump_dir) {
+            const int il = parse_layer_from_kv_cache_name(k_cache->name);
+            if (il >= 0) {
+                const size_t bytes_per_tensor = (size_t) num_q_tokens * n_kv_heads * head_size * sizeof(__half);
+                std::vector<__half> host_buf(num_q_tokens * n_kv_heads * head_size);
+                static std::mutex dump_mu;
+                std::lock_guard<std::mutex> g(dump_mu);
+                // Ensure dump dir exists.
+                ::mkdir(dump_dir, 0755);
+                // K_cur dump
+                hipMemcpy(host_buf.data(), k_cur->data, bytes_per_tensor, hipMemcpyDeviceToHost);
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/l%d_k.fp16", dump_dir, il);
+                if (FILE *f = std::fopen(path, "ab")) {
+                    std::fwrite(host_buf.data(), 1, bytes_per_tensor, f);
+                    std::fclose(f);
+                }
+                // V_cur dump
+                hipMemcpy(host_buf.data(), v_cur->data, bytes_per_tensor, hipMemcpyDeviceToHost);
+                std::snprintf(path, sizeof(path), "%s/l%d_v.fp16", dump_dir, il);
+                if (FILE *f = std::fopen(path, "ab")) {
+                    std::fwrite(host_buf.data(), 1, bytes_per_tensor, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
 
     // ── 1. Scatter K_cur/V_cur into AITER-layout cache ──
     // Dispatch on (cache_type, head_size, block_size) at compile time so the
