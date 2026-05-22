@@ -13,6 +13,11 @@
 #include <map>
 #include <stdexcept>
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+// MAD-214 Phase 1G-B: turbo-FP8 LUT registry init at KV cache construction.
+#include "../ggml/src/ggml-cuda/mt_turbo_fp8_lut_registry.h"
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -360,6 +365,26 @@ llama_kv_cache::llama_kv_cache(
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
     }
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    // MAD-214 Phase 1G-B: initialize the turbo-FP8 LUT registry once per
+    // model, but only if at least one cache slot is FP8. The registry is
+    // process-wide and idempotent — repeated init() for the same
+    // fingerprint is a no-op. Until Phase 1G-E auto-calibration lands, the
+    // registry falls back to embedded canonical LUTs and logs a WARN.
+    if (type_k == GGML_TYPE_TURBO4_FP8_BS256 || type_v == GGML_TYPE_TURBO4_FP8_BS256) {
+        mt_turbo_fp8::model_fingerprint fp {
+            .arch       = model.arch_name(),
+            .n_layer    = (int) hparams.n_layer,
+            .n_embd     = (int) hparams.n_embd,
+            .head_dim   = (int) hparams.n_embd_head_k(),
+            .n_kv_heads = (int) hparams.n_head_kv(),
+        };
+        // auto_calibrate=false for now — Phase 1G-E will flip this true once
+        // the capture + fitter pipeline can actually run a warmup pass.
+        mt_turbo_fp8::init(fp, /*auto_calibrate_if_missing=*/false);
+    }
+#endif
 
     if (reuse) {
         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);

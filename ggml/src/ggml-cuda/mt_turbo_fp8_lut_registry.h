@@ -18,11 +18,8 @@
 
 #pragma once
 
-#include <hip/hip_runtime.h>
-
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace mt_turbo_fp8 {
 
