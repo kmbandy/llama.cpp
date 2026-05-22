@@ -411,6 +411,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO2_0,
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO4_FP8_BS256,  // MAD-214: turbo-FP8 KV cache (centroid LUT + FP8 WMMA)
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -1367,7 +1368,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_tier_warm_pct  = w;
             params.kv_tier_cold_pct  = c;
         }
-    ).set_env("LLAMA_ARG_KV_TIERED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_TIERED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--kv-tier-ssd-path"}, "PATH",
         "directory for the cold tier KVTC store (default: $TMPDIR or /tmp)",
@@ -1513,7 +1514,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_tier_paged_blocks = value;
             params.kv_tier_paged_blocks_explicit = true;  // MAD-134: user said something
         }
-    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--kv-tier-paged-block-size"}, "N",
         "tokens per block when --kv-tier-paged-blocks is enabled (default: 16, matches vLLM)",

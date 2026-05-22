@@ -20,8 +20,25 @@
 // (libaiter_triton_aot.a), linked into ggml-hip when GGML_HIP_AITER=ON.
 // Header propagated via aiter_triton_aot's PUBLIC target_include_directories.
 #include "mt_aiter_unified_attn.h"
+#include "mt_turbo_fp8_lut_registry.h"  // MAD-214: per-(layer, kv-dir) centroid LUT lookup
+
+#include <cstring>
 
 namespace mt {
+
+// Helper: parse layer index from a tensor name like "cache_k_l<N>" or
+// "cache_v_l<N>". Returns -1 if the pattern doesn't match. Used to bind
+// the right per-layer LUT to each AITER paged-attn invocation.
+static int parse_layer_from_kv_cache_name(const char * name) {
+    if (!name) return -1;
+    const char * p = std::strstr(name, "_l");
+    if (!p) return -1;
+    p += 2;
+    int n = 0;
+    bool any = false;
+    while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); ++p; any = true; }
+    return any ? n : -1;
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // AITER-format scatter kernel (F16 cache only for v1)
@@ -334,6 +351,134 @@ __global__ void mt_scatter_kv_turbo4_aiter_kernel(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// MAD-214 Phase 1G-G: AITER-layout turbo-FP8 BS=256 scatter.
+//
+// Same paged-cache layout as turbo4 above, but the block is 162 bytes
+// (2-byte fp16 scale | 128-byte 4-bit indices | 32-byte sign bits) and
+// the centroid LUT comes in as a runtime device pointer (one for K, one
+// for V) instead of the compile-time TURBO_CENTROIDS_4BIT table.
+//
+// Grid: (num_tokens, n_kv_heads, 2_for_K_and_V). One (token, kv_head)
+// row = one 162-byte block (HEAD_SIZE=256 = Q_BLOCK=256). 256 threads
+// per block, one element per thread.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Device-side E4M3 → fp32 (same mapping as set-rows.cu and the CPU packer).
+static __device__ __forceinline__ float fp8_e4m3_to_fp32_aiter(uint8_t b) {
+    int sign = (b >> 7) & 1;
+    int e    = (b >> 3) & 0xF;
+    int m    = b & 0x7;
+    float v  = (e == 0) ? (1.0f / 64.0f) * (m / 8.0f)
+                        : __builtin_amdgcn_ldexp(1.0f + m / 8.0f, e - 7);
+    return sign ? -v : v;
+}
+
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(256)
+__global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    const uint8_t  * __restrict__ centroids_k,
+    const uint8_t  * __restrict__ centroids_v,
+    int             n_kv_heads) {
+
+    static_assert(HEAD_SIZE == 256, "turbo4_fp8 AITER scatter requires HEAD_SIZE=256");
+    constexpr int N_CENT = 16;
+    constexpr int BYTES_PER_BLOCK = 162;
+
+    const int j                = threadIdx.x;     // 0..255 element idx
+    const int global_token_idx = blockIdx.x;
+    const int kv_head_idx      = blockIdx.y;
+    const int kv_select        = blockIdx.z;      // 0 = K, 1 = V
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx     * HEAD_SIZE
+                         + (size_t) j;
+
+    uint8_t * dst_buf = (uint8_t *) ((kv_select == 0) ? k_cache : v_cache);
+    const int64_t block_byte_off =
+          (int64_t) paged_block * BLOCK_SIZE * n_kv_heads * BYTES_PER_BLOCK
+        + (int64_t) slot_in_block * n_kv_heads * BYTES_PER_BLOCK
+        + (int64_t) kv_head_idx * BYTES_PER_BLOCK;
+    uint8_t * blk = dst_buf + block_byte_off;
+
+    const uint8_t * lut_bytes = (kv_select == 0) ? centroids_k : centroids_v;
+
+    // ── Stage 1: load element + decode LUT into shared mem ──
+    __shared__ float x[256];
+    __shared__ float lut_f[N_CENT];
+
+    x[j] = __half2float(src[src_off]);
+    if (j < N_CENT) lut_f[j] = fp8_e4m3_to_fp32_aiter(lut_bytes[j]);
+    __syncthreads();
+
+    // ── Stage 2: per-block max-abs scale ──
+    float v_abs = fabsf(x[j]);
+    for (int off = 16; off > 0; off >>= 1) {
+        v_abs = fmaxf(v_abs, __shfl_xor_sync(0xffffffffffffffffull, v_abs, off));
+    }
+    __shared__ float warp_max[8];
+    if ((j % 32) == 0) warp_max[j / 32] = v_abs;
+    __syncthreads();
+    __shared__ float blk_max;
+    if (j == 0) {
+        float m = warp_max[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) m = fmaxf(m, warp_max[w]);
+        blk_max = m;
+    }
+    __syncthreads();
+
+    // ── Stage 3: cast scale → fp16, broadcast ──
+    const float scale_f = blk_max;
+    const __half scale_h = __float2half(scale_f);
+    const float scale_eff = __half2float(scale_h);
+    const float inv_scale = (scale_eff > 0.0f) ? (1.0f / scale_eff) : 0.0f;
+
+    // ── Stage 4: quantize ──
+    const float v   = x[j];
+    const int   sgn = (v < 0.0f) ? 1 : 0;
+    const float mag = fabsf(v) * inv_scale;
+
+    int   best_idx = 0;
+    float best_err = fabsf(mag - lut_f[0]);
+    #pragma unroll
+    for (int k = 1; k < N_CENT; ++k) {
+        float e = fabsf(mag - lut_f[k]);
+        if (e < best_err) { best_idx = k; best_err = e; }
+    }
+
+    // ── Stage 5: cooperative pack ──
+    if (j == 0) {
+        blk[0] = ((const uint8_t *) &scale_h)[0];
+        blk[1] = ((const uint8_t *) &scale_h)[1];
+    }
+
+    const uint8_t my_nib      = (uint8_t)(best_idx & 0xF);
+    const uint8_t partner_nib = (uint8_t) __shfl_xor_sync(0xffffffffffffffffull, (int) my_nib, 1);
+    if ((j & 1) == 0) {
+        blk[2 + j / 2] = my_nib | (uint8_t)(partner_nib << 4);
+    }
+
+    const uint64_t sign_mask = __ballot_sync(0xffffffffffffffffull, sgn);
+    if ((j & 7) == 0) {
+        const int byte_idx = j / 8;
+        const int warp_off = (j % 32) / 8;
+        blk[130 + byte_idx] = (uint8_t)((sign_mask >> (warp_off * 8)) & 0xFF);
+    }
+}
+
 // Build the AITER `query_start_len` cu-seqlens tensor [num_seqs+1] on device
 // from q_lens [num_seqs]. Tiny — one thread block.
 __global__ void mt_build_cu_seqlens_kernel(
@@ -422,11 +567,25 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     // dequant path inside kernel_unified_attention_3d.
     int cache_type;
     switch (k_cache->type) {
-        case GGML_TYPE_F16:      cache_type = MT_AITER_CACHE_F16;    break;
-        case GGML_TYPE_TURBO3_0: cache_type = MT_AITER_CACHE_TURBO3; break;
-        case GGML_TYPE_TURBO4_0: cache_type = MT_AITER_CACHE_TURBO4; break;
+        case GGML_TYPE_F16:               cache_type = MT_AITER_CACHE_F16;            break;
+        case GGML_TYPE_TURBO3_0:          cache_type = MT_AITER_CACHE_TURBO3;         break;
+        case GGML_TYPE_TURBO4_0:          cache_type = MT_AITER_CACHE_TURBO4;         break;
+        case GGML_TYPE_TURBO4_FP8_BS256:  cache_type = MT_AITER_CACHE_TURBO4_FP8;     break;
         default:
-            GGML_ABORT("AITER backend: unsupported KV cache type %d (only F16, TURBO3_0, TURBO4_0)", (int) k_cache->type);
+            GGML_ABORT("AITER backend: unsupported KV cache type %d", (int) k_cache->type);
+    }
+
+    // MAD-214 Phase 1G-G: for turbo-FP8, look up per-(layer, kv-dir) centroid
+    // LUTs from the runtime registry. Layer index is parsed from the cache
+    // tensor name (set by llama_kv_cache as "cache_k_l<N>" / "cache_v_l<N>").
+    const uint8_t * d_centroids_k = nullptr;
+    const uint8_t * d_centroids_v = nullptr;
+    if (cache_type == MT_AITER_CACHE_TURBO4_FP8) {
+        const int il = parse_layer_from_kv_cache_name(k_cache->name);
+        GGML_ASSERT(il >= 0 && "turbo4_fp8: failed to parse layer index from k_cache tensor name");
+        d_centroids_k = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_K);
+        d_centroids_v = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_V);
+        GGML_ASSERT(d_centroids_k && d_centroids_v && "turbo4_fp8: centroid LUT lookup returned null");
     }
 
     mt_aiter_uattn_shape_t shape {};
@@ -490,7 +649,7 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
             } else {
                 GGML_ABORT("AITER TURBO3 scatter: add a (head_size=%d, block_size=%d) instantiation", head_size, block_size);
             }
-        } else {  // MT_AITER_CACHE_TURBO4
+        } else if (cache_type == MT_AITER_CACHE_TURBO4) {
             if (head_size == 128 && block_size == 16) {
                 mt_scatter_kv_turbo4_aiter_kernel<128, 16><<<grid, block, 0, stream>>>(
                     k_cache->data, v_cache->data,
@@ -503,6 +662,23 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
                     (const int32_t*) slot_mapping->data, n_kv_heads);
             } else {
                 GGML_ABORT("AITER TURBO4 scatter: add a (head_size=%d, block_size=%d) instantiation", head_size, block_size);
+            }
+        } else {  // MT_AITER_CACHE_TURBO4_FP8 — MAD-214 Phase 1G-G
+            // Grid: (num_tokens, n_kv_heads, 2_for_K_and_V), 256 threads.
+            // Block topology differs from turbo3/4 (one (token, kv_head) row
+            // is one 162-byte BS=256 block) so it uses its own grid shape.
+            dim3 fp8_grid(num_q_tokens, n_kv_heads, 2);
+            dim3 fp8_block(256);
+            if (head_size == 256 && block_size == 16) {
+                mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16><<<fp8_grid, fp8_block, 0, stream>>>(
+                    k_cache->data, v_cache->data,
+                    (const __half*) k_cur->data, (const __half*) v_cur->data,
+                    (const int32_t*) slot_mapping->data,
+                    d_centroids_k, d_centroids_v,
+                    n_kv_heads);
+            } else {
+                GGML_ABORT("AITER TURBO4_FP8 scatter: only (head_size=256, block_size=16) wired (got %d, %d)",
+                           head_size, block_size);
             }
         }
     }
@@ -537,6 +713,11 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     args.k_descale   = ones;
     args.v_descale   = ones;
     args.out_scale   = ones;
+
+    // MAD-214: pass per-(layer, kv-dir) centroid LUTs for the Triton FP8 path.
+    // null for non-FP8 cache types (the kernel ignores them under constexpr).
+    args.centroids_k = d_centroids_k;
+    args.centroids_v = d_centroids_v;
 
     args.scale              = scale;
     args.num_seqs           = num_seqs;

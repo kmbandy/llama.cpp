@@ -10,6 +10,11 @@
 
 #include "memory-tier/mt-quant.h"
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+// MAD-214 Phase 1G-B: turbo-FP8 LUT registry init for the paged-cache path.
+#include "../ggml/src/ggml-cuda/mt_turbo_fp8_lut_registry.h"
+#endif
+
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -177,6 +182,23 @@ llama_kv_cache_paged::llama_kv_cache_paged(
                    per_layer_mib * (double) n_attn_layers,
                    n_blocks_total_, block_size_, n_kv_heads, head_dim,
                    ggml_type_name(type_k_), ggml_type_name(type_v_));
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    // MAD-214 Phase 1G-B: initialize the turbo-FP8 LUT registry if either
+    // cache type is FP8. Same fingerprint scheme used in the non-paged
+    // llama_kv_cache path so models migrating between paths reuse cached
+    // LUTs from disk.
+    if (type_k_ == GGML_TYPE_TURBO4_FP8_BS256 || type_v_ == GGML_TYPE_TURBO4_FP8_BS256) {
+        mt_turbo_fp8::model_fingerprint fp {
+            .arch       = model.arch_name(),
+            .n_layer    = (int) hparams.n_layer,
+            .n_embd     = (int) hparams.n_embd,
+            .head_dim   = (int) head_dim,
+            .n_kv_heads = (int) n_kv_heads,
+        };
+        mt_turbo_fp8::init(fp, /*auto_calibrate_if_missing=*/false);
+    }
+#endif
 
     // ── MAD-120: per-layer host-side warm storage ──
     //
