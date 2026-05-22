@@ -1,0 +1,20 @@
+{
+  "commit": "935cd974c",
+  "short_commit": "935cd974c",
+  "timestamp_utc": "20260522T013700Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "corpus": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "notes": "MAD-214 first-ever turbo4-FP8 PPL on real model. Path: paged AITER + FP8 WMMA (MAD_USE_AITER=1, --kv-tiered 100,0,0). Centroid LUT: embedded canonical Qwen3.5-4B fallback (Phase 1G-E auto-calibration on this model not yet wired). Even with the WRONG LUT, PPL lands between f16 (5.7507) and turbo4 (5.7888) — recipe is robust. Speed: 184s vs stock turbo4 218s (15% faster) because fused scatter inside AITER kernel avoids the per-tile sync the stock FATTN_VEC + set_rows_turbo4 path eats.",
+  "cells": [
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 4096,
+      "ppl": 5.7796,
+      "ppl_err": 0.03578,
+      "n_chunks": 72,
+      "elapsed_s": 184,
+      "path": "paged_aiter_fp8_wmma",
+      "lut_source": "embedded_qwen35_4b_fallback"
+    }
+  ]
+}
