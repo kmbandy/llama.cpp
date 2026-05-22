@@ -100,12 +100,37 @@ def lloyd_max_unsigned(samples: np.ndarray, n_levels: int, n_iter: int = 30) -> 
 
 
 def snap_to_e4m3(centroids: np.ndarray, e4m3_mags: np.ndarray, e4m3_bytes: np.ndarray) -> np.ndarray:
-    """For each centroid, find the nearest E4M3 magnitude byte. Returns 16 bytes."""
-    out = np.zeros(len(centroids), dtype=np.uint8)
-    for i, c in enumerate(centroids):
-        j = int(np.argmin(np.abs(e4m3_mags - c)))
-        out[i] = e4m3_bytes[j]
-    return out
+    """For each centroid, find the nearest E4M3 magnitude byte, enforcing
+    distinct bytes (no duplicates). For peaked distributions, Lloyd-Max
+    will pile centroids near zero; without distinctness, ~6/16 collapse
+    to 0x00 (=0.0) and we lose encoding capacity. With distinctness, the
+    excess "zero-prone" centroids get pushed to the next-available
+    non-zero E4M3 bytes (0x01, 0x02, …) so each index encodes a unique
+    magnitude.
+
+    Algorithm: assign in nearest-first order, marking used bytes; when
+    a centroid's first choice is taken, walk outward to the next unused
+    E4M3 byte.
+    """
+    n_lvls = len(centroids)
+    used = np.zeros(len(e4m3_mags), dtype=bool)
+    out = np.zeros(n_lvls, dtype=np.uint8)
+    # Sort indices by how decisive the centroid's "nearest" choice is
+    # (centroids far from anything get first pick to minimize displacement).
+    centroid_distances = np.abs(centroids[:, None] - e4m3_mags[None, :])
+    nearest_dist = np.min(centroid_distances, axis=1)
+    order = np.argsort(-nearest_dist)  # most decisive first
+    for i in order:
+        # Walk the E4M3 magnitudes ordered by proximity, take the first unused.
+        proximity_order = np.argsort(centroid_distances[i])
+        for j in proximity_order:
+            if not used[j]:
+                out[i] = e4m3_bytes[j]
+                used[j] = True
+                break
+    # Sort the final LUT ascending so the kernel decode pattern is consistent.
+    out_mags = np.array([float(e4m3_mags[np.where(e4m3_bytes == b)[0][0]]) for b in out])
+    return out[np.argsort(out_mags)]
 
 
 def fit_one(samples: np.ndarray, head_size: int, n_kv_heads: int,

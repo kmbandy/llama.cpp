@@ -35,6 +35,30 @@
       "elapsed_s": 306,
       "path": "paged_aiter_fp8_wmma",
       "lut_source": "embedded_qwen35_4b_fallback"
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 4096,
+      "ppl": 5.8022,
+      "ppl_err": 0.03588,
+      "n_chunks": 72,
+      "elapsed_s": 184,
+      "path": "paged_aiter_fp8_wmma",
+      "lut_source": "manual_calibration_no_hadamard",
+      "fitter": "lloyd_max_first_fit_e4m3_snap",
+      "notes": "First-fit E4M3 snap collapses 6/16 centroids onto 0x00. SLIGHTLY WORSE than fallback (5.7796) on this model — fitter quality is the bottleneck without Hadamard."
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 4096,
+      "ppl": 5.7984,
+      "ppl_err": 0.03584,
+      "n_chunks": 72,
+      "elapsed_s": 207,
+      "path": "paged_aiter_fp8_wmma",
+      "lut_source": "manual_calibration_no_hadamard",
+      "fitter": "lloyd_max_distinct_e4m3_snap",
+      "notes": "Distinct-snap fixes the collapse (8 unique near-zero bytes), marginally better than first-fit (5.8022 → 5.7984) but still worse than fallback (5.7796). Root cause: without Hadamard rotation, K_cur is heavily peaked near zero, so MSE-optimal centroid placement misallocates encoding capacity away from the attention-relevant magnitude tail. Hadamard wiring at scatter time is needed to fix this — see MAD-224 acceptance criteria."
     }
   ]
 }
