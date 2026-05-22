@@ -1,0 +1,100 @@
+{
+  "commit": "a47b2528757e1b923125ec1f51df08fd7a8fe222",
+  "short_commit": "a47b25287",
+  "timestamp_utc": "20260522T165950Z",
+  "phase": "validate-recipe",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "model_fingerprint": "1d25d29f9a7093e3",
+  "corpus_ppl": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "recipe": {
+    "fit_loss": "mag_weighted",
+    "mag_weight_p": 3.0,
+    "granularity": "per_layer_dir",
+    "snap_strategy": "distinct",
+    "forced_anchors": "0x00,0x38",
+    "capture_corpus": "bigger",
+    "sample_k_lut_hex": "0103060a11171b2124292c2f31343638"
+  },
+  "comparison": [
+    {
+      "ctx_size": 4096,
+      "recipe_ppl": 5.7655,
+      "recipe_ppl_err": 0.03562,
+      "fallback_ppl": 5.7797,
+      "fallback_ppl_err": 0.03578,
+      "recipe_minus_fallback": -0.0142,
+      "recipe_elapsed_s": 194,
+      "fallback_elapsed_s": 189
+    },
+    {
+      "ctx_size": 8192,
+      "recipe_ppl": 5.7109,
+      "recipe_ppl_err": 0.03515,
+      "fallback_ppl": 5.7195,
+      "fallback_ppl_err": 0.03525,
+      "recipe_minus_fallback": -0.0086,
+      "recipe_elapsed_s": 216,
+      "fallback_elapsed_s": 213
+    },
+    {
+      "ctx_size": 16384,
+      "recipe_ppl": 5.3746,
+      "recipe_ppl_err": 0.03229,
+      "fallback_ppl": 5.3788,
+      "fallback_ppl_err": 0.03237,
+      "recipe_minus_fallback": -0.0042,
+      "recipe_elapsed_s": 270,
+      "fallback_elapsed_s": 275
+    }
+  ],
+  "raw_cells": [
+    {
+      "phase": "recipe",
+      "ctx_size": 4096,
+      "ppl": 5.7655,
+      "ppl_err": 0.03562,
+      "n_chunks": 72,
+      "elapsed_s": 194
+    },
+    {
+      "phase": "recipe",
+      "ctx_size": 8192,
+      "ppl": 5.7109,
+      "ppl_err": 0.03515,
+      "n_chunks": 36,
+      "elapsed_s": 216
+    },
+    {
+      "phase": "recipe",
+      "ctx_size": 16384,
+      "ppl": 5.3746,
+      "ppl_err": 0.03229,
+      "n_chunks": 18,
+      "elapsed_s": 270
+    },
+    {
+      "phase": "fallback",
+      "ctx_size": 4096,
+      "ppl": 5.7797,
+      "ppl_err": 0.03578,
+      "n_chunks": 72,
+      "elapsed_s": 189
+    },
+    {
+      "phase": "fallback",
+      "ctx_size": 8192,
+      "ppl": 5.7195,
+      "ppl_err": 0.03525,
+      "n_chunks": 36,
+      "elapsed_s": 213
+    },
+    {
+      "phase": "fallback",
+      "ctx_size": 16384,
+      "ppl": 5.3788,
+      "ppl_err": 0.03237,
+      "n_chunks": 18,
+      "elapsed_s": 275
+    }
+  ]
+}

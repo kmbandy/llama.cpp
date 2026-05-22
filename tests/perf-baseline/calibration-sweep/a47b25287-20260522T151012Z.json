@@ -1,0 +1,201 @@
+{
+  "commit": "a47b2528757e1b923125ec1f51df08fd7a8fe222",
+  "short_commit": "a47b25287",
+  "timestamp_utc": "20260522T151012Z",
+  "tier": 2,
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "model_fingerprint": "1d25d29f9a7093e3",
+  "corpus_ppl": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "ctx_size": 4096,
+  "notes": "MAD-214 calibration matrix sweep \u2014 Tier 2 of 3. All cells run on AITER FP8 WMMA path with --kv-tiered 100,0,0 except f16 control. PPL measured at single ctx (4096) to keep cell cost ~3 min. Tier 2+ cells annotate `interaction_term` = combo_delta - \u03a3(single deltas) where positive = combo beat the sum-of-singles prediction.",
+  "cells": [
+    {
+      "label": "T2_mag_x_per_dir",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_dir",
+      "snap_strategy": "distinct",
+      "corpus": "dump_default",
+      "fitter_extra": "--mag-weight-p 1.0",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "0001020304050a11191f24292d313438",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "0001020304050911181f24292d313438",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 1,
+      "uniq_v_luts": 1,
+      "ppl": 5.776,
+      "ppl_err": 0.0357,
+      "n_chunks": 72,
+      "elapsed_s": 184,
+      "notes": "combo: mag_weighted (p=1) + per_dir",
+      "levers": [
+        "mag_weighted_p1",
+        "per_dir"
+      ],
+      "combo_delta_vs_baseline": 0.0254,
+      "sum_single_deltas": 0.0221,
+      "interaction_term": 0.0033,
+      "single_lever_ppls": {
+        "mag_weighted_p1": 5.7834,
+        "per_dir": 5.7973
+      }
+    },
+    {
+      "label": "T2_mag_x_anchors",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_layer_dir",
+      "snap_strategy": "forced_anchors",
+      "corpus": "dump_default",
+      "fitter_extra": "--mag-weight-p 1.0 --forced-anchors 0x00,0x38",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "00010203050a11191f24292e31343738",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "00010203050a11181f24292d31343738",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 3,
+      "uniq_v_luts": 2,
+      "ppl": 5.7726,
+      "ppl_err": 0.03568,
+      "n_chunks": 72,
+      "elapsed_s": 186,
+      "notes": "combo: mag_weighted (p=1) + forced_anchors",
+      "levers": [
+        "mag_weighted_p1",
+        "forced_anchors"
+      ],
+      "combo_delta_vs_baseline": 0.0288,
+      "sum_single_deltas": 0.0207,
+      "interaction_term": 0.0081,
+      "single_lever_ppls": {
+        "mag_weighted_p1": 5.7834,
+        "forced_anchors": 5.7987
+      }
+    },
+    {
+      "label": "T2_mag_x_bigger_x_per_dir",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_dir",
+      "snap_strategy": "distinct",
+      "corpus": "dump_bigger",
+      "fitter_extra": "--mag-weight-p 1.0",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "0001020304050a11191f24292d313438",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "0001020304050911181f24292d313438",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 1,
+      "uniq_v_luts": 1,
+      "ppl": 5.776,
+      "ppl_err": 0.0357,
+      "n_chunks": 72,
+      "elapsed_s": 196,
+      "notes": "triple: mag (p=1) + bigger + per_dir",
+      "levers": [
+        "mag_weighted_p1",
+        "bigger",
+        "per_dir"
+      ],
+      "combo_delta_vs_baseline": 0.0254,
+      "sum_single_deltas": 0.0229,
+      "interaction_term": 0.0025,
+      "single_lever_ppls": {
+        "mag_weighted_p1": 5.7834,
+        "bigger": 5.8006,
+        "per_dir": 5.7973
+      }
+    },
+    {
+      "label": "T2_mag_x_bigger_x_anchors",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_layer_dir",
+      "snap_strategy": "forced_anchors",
+      "corpus": "dump_bigger",
+      "fitter_extra": "--mag-weight-p 1.0 --forced-anchors 0x00,0x38",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "00010203050a11191f24292d31343738",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "00010203050911181f24292d31343738",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 3,
+      "uniq_v_luts": 1,
+      "ppl": 5.7772,
+      "ppl_err": 0.03573,
+      "n_chunks": 72,
+      "elapsed_s": 184,
+      "notes": "triple: mag (p=1) + bigger + forced_anchors",
+      "levers": [
+        "mag_weighted_p1",
+        "bigger",
+        "forced_anchors"
+      ],
+      "combo_delta_vs_baseline": 0.0242,
+      "sum_single_deltas": 0.0215,
+      "interaction_term": 0.0027,
+      "single_lever_ppls": {
+        "mag_weighted_p1": 5.7834,
+        "bigger": 5.8006,
+        "forced_anchors": 5.7987
+      }
+    },
+    {
+      "label": "T2_mag_p2",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_layer_dir",
+      "snap_strategy": "distinct",
+      "corpus": "dump_default",
+      "fitter_extra": "--mag-weight-p 2.0",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "00010204080f151b2025292d30333538",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "00010204080f151a2025292d30333538",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 2,
+      "uniq_v_luts": 1,
+      "ppl": 5.7709,
+      "ppl_err": 0.0357,
+      "n_chunks": 72,
+      "elapsed_s": 189,
+      "notes": "fine-tune: isolate p=2.0 effect",
+      "levers": [
+        "mag_weighted_p2"
+      ]
+    },
+    {
+      "label": "T2_mag_p2_x_bigger",
+      "fit_loss": "mag_weighted",
+      "granularity": "per_layer_dir",
+      "snap_strategy": "distinct",
+      "corpus": "dump_bigger",
+      "fitter_extra": "--mag-weight-p 2.0",
+      "sample_k_layer": "l3_k",
+      "sample_k_lut_hex": "00010204080f151b2025292d30333538",
+      "sample_v_layer": "l3_v",
+      "sample_v_lut_hex": "00010204080f151a2025292d30333538",
+      "n_k_luts": 10,
+      "n_v_luts": 10,
+      "uniq_k_luts": 2,
+      "uniq_v_luts": 1,
+      "ppl": 5.7703,
+      "ppl_err": 0.03569,
+      "n_chunks": 72,
+      "elapsed_s": 188,
+      "notes": "combo: mag p=2 + bigger",
+      "levers": [
+        "mag_weighted_p2",
+        "bigger"
+      ],
+      "combo_delta_vs_baseline": 0.0311,
+      "sum_single_deltas": 0.0313,
+      "interaction_term": -0.0002,
+      "single_lever_ppls": {
+        "mag_weighted_p2": 5.7709,
+        "bigger": 5.8006
+      }
+    }
+  ]
+}

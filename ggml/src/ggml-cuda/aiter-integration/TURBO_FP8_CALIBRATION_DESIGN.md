@@ -220,18 +220,57 @@ dominant error source. Focus elsewhere.
 - E4M3 snap loss is small, ~4-5% (Phase 0)
 - Per-(layer, kv-dir) granularity is the sweet spot for Qwen3.5-4B (Phase 0)
 - turbo5-FP8 is near-lossless vs fp8_raw (Phase 0)
-- Our Option F fitter loses to the fallback by 0.04 PPL on Qwen3.6 ctx=4096 (Option F empirical 2026-05-21)
+- Magnitude-weighted Lloyd-Max loss with p=5 is the production-best fitter recipe — see "Matrix sweep results" below (2026-05-22 empirical)
+- The remaining ~0.012 PPL gap to f16 at ctx=4096 is Hadamard-shaped, not fitter-shaped (matrix sweep saturation)
 
 **Hypothesized but unmeasured:**
-- Magnitude-weighted loss would help (theory)
-- Bigger / more diverse corpus would help (theory)
-- Per-head granularity might matter on Qwen3.6 because of architectural differences (worth re-checking)
+- Hadamard wiring closes the residual fitter gap (theory + Phase 0 MSE proxy)
 - Attention-aware loss would be the best (intuitive, expensive to test)
+- Hadamard's benefit may also shrink at long ctx where the calibration-vs-fallback delta already does
+
+## Matrix sweep results (2026-05-22 empirical, Qwen3.6-35B-A3B, ctx=4096 unless noted)
+
+Four-tier sweep across the calibration lever space (`tests/perf-baseline/calibration-sweep/`).
+All cells on the paged AITER FP8 WMMA path.
+
+| Stage | Best recipe | PPL | Δ vs f16 (5.7486) |
+|---|---|---|---|
+| Baseline (mse, distinct, default corpus) | T1_baseline | 5.8014 | +0.053 |
+| Fallback (Qwen3.5-4B canonical + Hadamard) | T1_ctrl_fallback | 5.7796 | +0.031 |
+| Tier 1 winner | mag_weighted p=1 × bigger | 5.7763 | +0.028 |
+| Tier 2 winner | mag_weighted p=2 × bigger | 5.7703 | +0.022 |
+| Tier 3 winner | mag_weighted p=3 × bigger | 5.7655 | +0.017 |
+| **Tier 4 winner** | **mag_weighted p=5 × bigger** | **5.7601** | **+0.012** |
+
+**Headline:** fitter tuning alone closes ~78% of the original 0.053-PPL gap to f16.
+
+**Per-lever findings:**
+- **mag_weighted is the dominant lever** — went from p=1 to p=5; deltas grow with p across this range, plateauing into noise past p≈4.
+- **bigger corpus** consistently adds ~0.001-0.005 PPL — tiny but free.
+- **forced_anchors** synergizes with mag_p1 (+0.008 interaction term) but the absolute synergy is dominated by the higher-p effect.
+- **per_dir granularity** is noise-level on quality, but collapses to a single LUT per dir — useful for the storage-conscious user (single 16-byte LUT per kv-dir vs n_attention_layers × 16 bytes).
+- **log_space loss** is catastrophic (+0.79 PPL) — geometric spacing on normalized [0,1] dumps too many centroids near zero.
+- **Mixed corpus (prose+C+++Python)** is meaningfully worse than pure prose (+0.035) — calibration-domain matching matters.
+- **Triple combos** added nothing over the best pair.
+
+**Recipe validation at production contexts** (`*-validate.json`):
+| ctx | recipe (p=3×bigger) | fallback | Δ |
+|---|---|---|---|
+| 4096 | 5.7655 | 5.7797 | **-0.014** |
+| 8192 | 5.7109 | 5.7195 | -0.009 |
+| 16384 | 5.3746 | 5.3788 | -0.004 (within noise) |
+
+The win **narrows at long ctx** — calibration matters most when the LUT is the dominant approximation source (short ctx); at long ctx other error sources dominate. Hadamard's expected benefit may have similar ctx-shape; worth specifically validating as part of the Hadamard wiring ticket.
+
+**Production recipe:** `--fit-loss mag_weighted --mag-weight-p 5.0 --granularity per_layer_dir --snap-strategy distinct` on a ~16k-token capture from in-domain prose.
 
 ## Related files / tickets
 
 - `scripts/calibration/fit_centroids.py` — original Phase 0 fitter (Hadamard-aware, fits offline from HF transformers KV dumps)
-- `scripts/calibration/fit_centroids_from_dump.py` — Option F fitter (reads device dumps from MT_TURBO_FP8_DUMP_DIR)
+- `scripts/calibration/fit_centroids_from_dump.py` — Option F fitter (reads device dumps from MT_TURBO_FP8_DUMP_DIR). Now supports `--fit-loss`, `--granularity`, `--snap-strategy`, `--forced-anchors` for the matrix sweep.
+- `scripts/perf/turbo_fp8_calibration_sweep.sh` — matrix sweep driver (`TIER=1..4`)
+- `scripts/perf/turbo_fp8_validate_recipe.sh` — recipe validation across multi-ctx
+- `tests/perf-baseline/calibration-sweep/` — per-tier results JSONs
 - `ggml/src/ggml-cuda/turbo_fp8_hadamard.cuh` — rotation kernel (built, not yet wired into scatter)
 - `ggml/src/ggml-cuda/mt_turbo_fp8_lut_registry.{h,cu}` — LUT registry (load path only)
 - MAD-214 — parent epic
