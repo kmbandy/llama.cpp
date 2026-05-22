@@ -17,8 +17,14 @@ Inputs:
   --out-dir DIR          where to write l<N>_<k|v>.bin files (16 E4M3 bytes
                          each). Typically ~/.cache/llama.cpp/turbo-fp8/<fp>/
   --block-size N         BS=256 (one block per (token, kv_head) row)
-  --hadamard             apply Walsh-Hadamard rotation along head_dim before
-                         fitting (matches Phase 0; helps ~12% MSE on Qwen K)
+  --hadamard             apply Walsh-Hadamard rotation along head_dim to K
+                         dumps before fitting (V dumps left untouched). Must
+                         pair with the kernel's MT_TURBO_FP8_HADAMARD=1 mode
+                         (turbo_fp8_hadamard.cuh notes "K-only = 12% MSE gain;
+                         K+V only adds 3% extra; not worth inverse-rotation
+                         kernel complexity"). Applying to V here while the
+                         kernel doesn't rotate V at scatter time SILENTLY
+                         corrupts attention — fitter and kernel must agree.
   --n-iter N             Lloyd-Max iterations (default 30)
   --fit-loss MODE        mse (default) | mag_weighted | log_space
   --mag-weight-p P       exponent for mag_weighted loss (default 1.0)
@@ -325,6 +331,9 @@ def main():
         return 1
 
     # Pass 1: preprocess each dump into normalized magnitudes, keyed by (layer, dir).
+    # MAD-227: hadamard is K-only by kernel convention (turbo_fp8_hadamard.cuh).
+    # V dumps must skip rotation — fitting V on rotated data while the kernel
+    # decodes against un-rotated V silently corrupts attention.
     per_pair_mags: dict[tuple[int, str], np.ndarray] = {}
     for path in dumps:
         layer_part, dir_letter = path.stem.split("_")
@@ -333,11 +342,13 @@ def main():
         if raw.size == 0:
             print(f"  l{layer:2d}_{dir_letter}: SKIP (empty dump)", file=sys.stderr)
             continue
+        rotate_this = args.hadamard and dir_letter == "k"
         mags, n_tokens = preprocess_samples(
-            raw, args.head_size, args.n_kv_heads, args.hadamard, H
+            raw, args.head_size, args.n_kv_heads, rotate_this, H
         )
         per_pair_mags[(layer, dir_letter)] = mags
-        print(f"  l{layer:2d}_{dir_letter}: {n_tokens:5d} tokens", file=sys.stderr)
+        rot_tag = " [H]" if rotate_this else ""
+        print(f"  l{layer:2d}_{dir_letter}: {n_tokens:5d} tokens{rot_tag}", file=sys.stderr)
 
     # Pool according to granularity.
     if args.granularity == "per_layer_dir":

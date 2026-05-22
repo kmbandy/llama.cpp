@@ -135,6 +135,72 @@ static inline hipError_t mt_turbo_fp8_fwht(
 
 
 // ─────────────────────────────────────────────────────────────────────────
+// MAD-227: __half overload. Same FWHT butterfly as the float kernel above,
+// but loads __half from global, casts to float in shared memory for the
+// math, then casts back to __half on write. Used to pre-rotate Q at
+// attention time when MT_TURBO_FP8_HADAMARD=1 (the matching K-side
+// rotation is inlined into the FP8 scatter kernel).
+// ─────────────────────────────────────────────────────────────────────────
+template <int D>
+__global__ void mt_turbo_fp8_fwht_half_kernel(__half * __restrict__ data, int n_rows, int row_stride) {
+    static_assert((D & (D - 1)) == 0, "D must be a power of 2");
+    static_assert(D >= 2 && D <= 1024, "D must be in [2, 1024]");
+
+    const int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    __shared__ float smem[D];
+
+    const int tid = threadIdx.x;
+    __half * row_ptr = data + row * row_stride;
+
+    smem[tid] = __half2float(row_ptr[tid]);
+    __syncthreads();
+
+    #pragma unroll
+    for (int stage = 0; (1 << stage) < D; ++stage) {
+        const int stride  = 1 << stage;
+        const int partner = tid ^ stride;
+        const float a = smem[tid];
+        const float b = smem[partner];
+        __syncthreads();
+        if ((tid & stride) == 0) {
+            smem[tid] = a + b;       // lower partner: a + b
+        } else {
+            smem[tid] = b - a;       // upper partner: lower - upper = b - a
+        }
+        __syncthreads();
+    }
+
+    const float scale = rsqrtf((float) D);
+    row_ptr[tid] = __float2half(smem[tid] * scale);
+}
+
+static inline hipError_t mt_turbo_fp8_fwht_half(
+    hipStream_t stream,
+    __half *    data_device,
+    int         n_rows,
+    int         head_dim,
+    int         row_stride
+) {
+    if (n_rows <= 0) return hipSuccess;
+    dim3 grid(n_rows, 1, 1);
+
+    switch (head_dim) {
+        case 16:   mt_turbo_fp8_fwht_half_kernel<16>  <<<grid, dim3(16),  0, stream>>>(data_device, n_rows, row_stride); break;
+        case 32:   mt_turbo_fp8_fwht_half_kernel<32>  <<<grid, dim3(32),  0, stream>>>(data_device, n_rows, row_stride); break;
+        case 64:   mt_turbo_fp8_fwht_half_kernel<64>  <<<grid, dim3(64),  0, stream>>>(data_device, n_rows, row_stride); break;
+        case 128:  mt_turbo_fp8_fwht_half_kernel<128> <<<grid, dim3(128), 0, stream>>>(data_device, n_rows, row_stride); break;
+        case 256:  mt_turbo_fp8_fwht_half_kernel<256> <<<grid, dim3(256), 0, stream>>>(data_device, n_rows, row_stride); break;
+        case 512:  mt_turbo_fp8_fwht_half_kernel<512> <<<grid, dim3(512), 0, stream>>>(data_device, n_rows, row_stride); break;
+        case 1024: mt_turbo_fp8_fwht_half_kernel<1024><<<grid, dim3(1024),0, stream>>>(data_device, n_rows, row_stride); break;
+        default: return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
 // Scalar reference (CPU-side, fp32). Used by tests/test_turbo_fp8_hadamard.cu
 // to validate the GPU kernel.
 // ─────────────────────────────────────────────────────────────────────────

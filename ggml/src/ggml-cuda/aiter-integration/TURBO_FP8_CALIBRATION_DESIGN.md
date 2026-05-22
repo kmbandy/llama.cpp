@@ -262,7 +262,52 @@ All cells on the paged AITER FP8 WMMA path.
 
 The win **narrows at long ctx** — calibration matters most when the LUT is the dominant approximation source (short ctx); at long ctx other error sources dominate. Hadamard's expected benefit may have similar ctx-shape; worth specifically validating as part of the Hadamard wiring ticket.
 
-**Production recipe:** `--fit-loss mag_weighted --mag-weight-p 5.0 --granularity per_layer_dir --snap-strategy distinct` on a ~16k-token capture from in-domain prose.
+**Production recipe (max quality):** `--fit-loss mag_weighted --mag-weight-p 5.0 --granularity per_layer_dir --snap-strategy distinct` on a ~16k-token capture from in-domain prose.
+
+## Hadamard wiring + the substitutability finding (MAD-227, 2026-05-22)
+
+After the four-tier matrix sweep saturated at PPL 5.7601 (0.012 above f16), MAD-227
+wired Walsh-Hadamard rotation through the FP8 scatter path: registry env-gated
+(`MT_TURBO_FP8_HADAMARD=1`), K rotated inline inside the scatter kernel
+(`mt_pagedattn_aiter.cu` template `APPLY_HADAMARD=true`), Q pre-rotated into a pool
+scratch before the AITER attention call (fp16 FWHT in `turbo_fp8_hadamard.cuh`),
+V left un-rotated per Phase 0's K-only convention. The fitter's `--hadamard` flag
+was fixed to only rotate K dumps (V dumps must skip rotation to match the kernel
+convention — otherwise V LUTs are fit on rotated data while the kernel decodes
+against un-rotated V, silently corrupting attention).
+
+A 4-cell p-sweep was run under hadamard mode at ctx=4096
+(`tests/perf-baseline/calibration-sweep/45435dd5f-20260522T204532Z-T5-hadamard-p-sweep.json`):
+
+| p | hadamard PPL | no-hadamard PPL (prior tiers) | Δ (had − no-had) |
+|---|---|---|---|
+| mse (p=0) | 5.7737 | 5.8014 (T1 baseline) | **-0.028** ✓ |
+| 1.0 | 5.7696 | 5.7763 (T1 mag×bigger)  | -0.007 |
+| 2.0 | 5.7645 | 5.7703 (T2 mag_p2×bigger) | -0.006 |
+| 5.0 | 5.7636 | 5.7601 (T4 mag_p5×bigger) | +0.004 (noise) |
+
+**Hadamard alone:** -0.028 PPL (matches Phase 0's ~12% MSE proxy).
+**mag_weighted p=5 alone:** -0.041 PPL.
+**Both stacked:** -0.038 PPL.
+**Interaction term:** +0.031 — the largest *negative* interaction in the whole matrix.
+
+**Finding: Hadamard and mag_weighted are substitutes, not complements.** Both push
+centroids away from the dense-but-attention-irrelevant near-zero region. Stacking
+them is redundant. Either gets you ~95% of the way to f16 quality individually.
+
+**Two recommended production recipes (each shippable, each measured):**
+
+| Recipe | PPL | Use when |
+|---|---|---|
+| no-hadamard + `mag_weighted p=5` + bigger corpus | **5.7601** | Best measured. Use if you've already tuned p for your model. |
+| hadamard + `mse` + bigger corpus | **5.7737** | Robust default. No hyperparameter tuning. Recommended for the `llama-calibrate-fp8 --quick` mode. |
+
+The hadamard mode's quality range across fitter choices is `[5.7636, 5.7737]` —
+a ~0.01 PPL spread regardless of `--fit-loss` and `p`. No-hadamard ranges from
+5.7601 to 5.8014 — a ~0.04 spread. **Hadamard's value isn't a quality win on top of
+the best no-hadamard recipe; its value is making the recipe choice nearly
+irrelevant.** Important property for a CLI `--quick` mode that needs to work
+without per-model tuning.
 
 ## Related files / tickets
 

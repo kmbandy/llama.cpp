@@ -1,6 +1,7 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 #include "turbo-quant.cuh"
+#include "mt_turbo_fp8_lut_registry.h"  // MAD-227: hadamard_required() runtime guard
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -1298,6 +1299,19 @@ static void set_rows_cuda_turbo4_fp8_bs256(
     GGML_ASSERT(ne00 % 256 == 0);  // turbo-FP8 BS=256 requires 256-aligned row
 
     cudaStream_t stream = ctx.stream();
+
+    // MAD-227: Hadamard mode is wired only for the AITER FP8 scatter path
+    // (mt_pagedattn_aiter.cu). The set-rows path's matching Q-rotation site
+    // in the paged-tile attention kernel is not yet implemented, so running
+    // turbo-FP8 here with hadamard_required would silently produce wrong
+    // attention scores (rotated K stored, unrotated Q at attention time).
+    // Fail loud-and-early instead.
+    if (mt_turbo_fp8::hadamard_required()) {
+        GGML_ABORT("turbo4_fp8 set_rows scatter does not yet support "
+                   "MT_TURBO_FP8_HADAMARD=1 (see MAD-227 follow-up). "
+                   "Run with MAD_USE_AITER=1 for the AITER path which does "
+                   "support Hadamard mode, or unset MT_TURBO_FP8_HADAMARD.");
+    }
 
     // Pull the per-(layer, kv-dir) centroid LUT pointer from dst->op_params.
     // llama_kv_cache::cpy_k/cpy_v writes it there during graph build.

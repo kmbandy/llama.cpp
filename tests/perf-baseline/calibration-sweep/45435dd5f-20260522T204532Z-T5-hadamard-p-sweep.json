@@ -1,0 +1,43 @@
+{
+  "commit": "45435dd5f2516aff11bca9f5ba5331ff97734284",
+  "short_commit": "45435dd5f",
+  "timestamp_utc": "20260522T211018Z",
+  "phase": "T5-hadamard-p-sweep",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "ctx_size": 4096,
+  "notes": "MAD-227 supplement: find optimal mag_weighted p under hadamard mode. No-hadamard winner was p=5 (5.7601 ctx=4k). Under hadamard, the rotated distribution is more uniform \u2014 optimal p may be lower.",
+  "cells": [
+    {
+      "label": "T5_had_mse",
+      "fit_loss": "mse",
+      "mag_weight_p": "n/a",
+      "ppl": 5.7737,
+      "ppl_err": 0.03564,
+      "elapsed_s": 185
+    },
+    {
+      "label": "T5_had_mag_p1",
+      "fit_loss": "mag_weighted",
+      "mag_weight_p": "1.0",
+      "ppl": 5.7696,
+      "ppl_err": 0.03567,
+      "elapsed_s": 183
+    },
+    {
+      "label": "T5_had_mag_p2",
+      "fit_loss": "mag_weighted",
+      "mag_weight_p": "2.0",
+      "ppl": 5.7645,
+      "ppl_err": 0.03566,
+      "elapsed_s": 185
+    },
+    {
+      "label": "T5_had_mag_p5",
+      "fit_loss": "mag_weighted",
+      "mag_weight_p": "5.0",
+      "ppl": 5.7636,
+      "ppl_err": 0.0356,
+      "elapsed_s": 183
+    }
+  ]
+}

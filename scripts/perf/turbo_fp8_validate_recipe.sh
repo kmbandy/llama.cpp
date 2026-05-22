@@ -28,7 +28,6 @@ MODEL_PATH="${MODEL_PATH:-/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}"
 WIKI_TEST="${WIKI_TEST:-${REPO_ROOT}/wikitext-2-raw/wiki.test.raw}"
 
 MODEL_FINGERPRINT="${MODEL_FINGERPRINT:-1d25d29f9a7093e3}"
-LUT_CACHE_DIR="${LUT_CACHE_DIR:-${HOME}/.cache/llama.cpp/turbo-fp8/${MODEL_FINGERPRINT}}"
 HEAD_SIZE="${HEAD_SIZE:-256}"
 N_KV_HEADS="${N_KV_HEADS:-2}"
 
@@ -40,6 +39,17 @@ SNAP_STRATEGY="${SNAP_STRATEGY:-distinct}"
 FORCED_ANCHORS="${FORCED_ANCHORS:-0x00,0x38}"
 CORPUS_LABEL="${CORPUS_LABEL:-bigger}"
 N_CAPTURE_CHUNKS="${N_CAPTURE_CHUNKS:-4}"
+
+# MAD-227: when HADAMARD=1, the fitter applies FWHT-along-head_dim and the
+# LUTs land in the hadamard/ subdir; llama-perplexity sees the matching
+# MT_TURBO_FP8_HADAMARD=1 env var so the AITER scatter rotates K + Q
+# rotation is pre-applied on the fly.
+HADAMARD="${HADAMARD:-0}"
+if [[ "${HADAMARD}" == "1" || "${HADAMARD}" == "true" ]]; then
+    LUT_CACHE_DIR="${LUT_CACHE_DIR:-${HOME}/.cache/llama.cpp/turbo-fp8/${MODEL_FINGERPRINT}/hadamard}"
+else
+    LUT_CACHE_DIR="${LUT_CACHE_DIR:-${HOME}/.cache/llama.cpp/turbo-fp8/${MODEL_FINGERPRINT}}"
+fi
 
 # Contexts to validate at. Default covers the practical production range.
 CTXS="${CTXS:-4096,8192,16384}"
@@ -94,6 +104,8 @@ fit_recipe() {
                  --snap-strategy "${SNAP_STRATEGY}" )
     [[ "${FIT_LOSS}" == "mag_weighted" ]] && args+=( --mag-weight-p "${MAG_WEIGHT_P}" )
     [[ "${SNAP_STRATEGY}" == "forced_anchors" ]] && args+=( --forced-anchors "${FORCED_ANCHORS}" )
+    # MAD-227: pair the fitter's --hadamard with runtime HADAMARD=1.
+    [[ "${HADAMARD}" == "1" || "${HADAMARD}" == "true" ]] && args+=( --hadamard )
     python3 "${REPO_ROOT}/scripts/calibration/fit_centroids_from_dump.py" "${args[@]}" >&2
 }
 
@@ -104,7 +116,9 @@ run_ppl_at_ctx() {
     local log="${WORK_DIR}/validate_${label}_ctx${ctx}.log"
     echo "[ppl ${label} ctx=${ctx}] running..." >&2
     local start; start=$(date +%s)
-    MAD_USE_AITER=1 \
+    local hadamard_env=""
+    [[ "${HADAMARD}" == "1" || "${HADAMARD}" == "true" ]] && hadamard_env="MT_TURBO_FP8_HADAMARD=1"
+    env MAD_USE_AITER=1 ${hadamard_env} \
         "${LLAMA_PERPLEXITY}" \
             --model "${MODEL_PATH}" \
             --device ROCm0 --n-gpu-layers 999 \

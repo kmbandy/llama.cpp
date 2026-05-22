@@ -65,6 +65,18 @@ const uint8_t * get_lut_device_ptr(int layer, kv_dir dir);
 // calibration warmup.
 bool all_luts_cached();
 
+// MAD-227: returns true iff the active LUT set was fit with Walsh-Hadamard
+// rotation applied along head_dim. When true, the scatter kernels MUST
+// rotate K (and not V — see turbo_fp8_hadamard.cuh) by the same FWHT before
+// quantizing. When false, no rotation is applied at scatter time.
+//
+// Sourced from env var MT_TURBO_FP8_HADAMARD at registry init time.
+// Hadamard-mode LUTs live in <cache_root>/<fingerprint>/hadamard/; the
+// legacy no-Hadamard layout (`<cache_root>/<fingerprint>/`) is preserved
+// untouched for backward compat. Mismatching the flag against the LUT
+// set silently corrupts attention — DO NOT call without honoring it.
+bool hadamard_required();
+
 // Frees device buffers and clears the in-memory cache. Called at process
 // shutdown — usually unnecessary since the process is about to exit.
 void shutdown();

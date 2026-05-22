@@ -21,6 +21,7 @@
 // Header propagated via aiter_triton_aot's PUBLIC target_include_directories.
 #include "mt_aiter_unified_attn.h"
 #include "mt_turbo_fp8_lut_registry.h"  // MAD-214: per-(layer, kv-dir) centroid LUT lookup
+#include "turbo_fp8_hadamard.cuh"      // MAD-227: fp16 FWHT for Q pre-rotation
 
 #include <cstring>
 #include <sys/stat.h>  // MAD-214 Option F: mkdir for dump dir
@@ -376,7 +377,7 @@ static __device__ __forceinline__ float fp8_e4m3_to_fp32_aiter(uint8_t b) {
     return sign ? -v : v;
 }
 
-template <int HEAD_SIZE, int BLOCK_SIZE>
+template <int HEAD_SIZE, int BLOCK_SIZE, bool APPLY_HADAMARD>
 __launch_bounds__(256)
 __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     void           * __restrict__ k_cache,
@@ -424,6 +425,33 @@ __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     x[j] = __half2float(src[src_off]);
     if (j < N_CENT) lut_f[j] = fp8_e4m3_to_fp32_aiter(lut_bytes[j]);
     __syncthreads();
+
+    // ── MAD-227 Stage 1.5: optional in-place FWHT on K only ──
+    // Identity QK^T = (QH)·(KH)^T holds → rotating K at scatter requires
+    // rotating Q at attention. V is NOT rotated (see turbo_fp8_hadamard.cuh
+    // for the K-only-vs-K+V tradeoff rationale). At HEAD_SIZE=256 the
+    // butterfly is 8 stages; one __syncthreads pair per stage.
+    if constexpr (APPLY_HADAMARD) {
+        if (kv_select == 0) {  // K only
+            constexpr int D = HEAD_SIZE;  // 256
+            #pragma unroll
+            for (int stage = 0; (1 << stage) < D; ++stage) {
+                const int stride  = 1 << stage;
+                const int partner = j ^ stride;
+                const float a = x[j];        // our value
+                const float b = x[partner];  // partner's value
+                __syncthreads();
+                if ((j & stride) == 0) {
+                    x[j] = a + b;            // lower partner: a + b
+                } else {
+                    x[j] = b - a;            // upper partner: lower - upper = b - a
+                }
+                __syncthreads();
+            }
+            x[j] *= (1.0f / 16.0f);          // 1/sqrt(256)
+            __syncthreads();
+        }
+    }
 
     // ── Stage 2: per-block max-abs scale ──
     float v_abs = fabsf(x[j]);
@@ -705,15 +733,27 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
             // Grid: (num_tokens, n_kv_heads, 2_for_K_and_V), 256 threads.
             // Block topology differs from turbo3/4 (one (token, kv_head) row
             // is one 162-byte BS=256 block) so it uses its own grid shape.
+            // MAD-227: registry-served hadamard flag picks the kernel
+            // template — runtime branch outside the kernel, no perf cost.
+            const bool apply_h = mt_turbo_fp8::hadamard_required();
             dim3 fp8_grid(num_q_tokens, n_kv_heads, 2);
             dim3 fp8_block(256);
             if (head_size == 256 && block_size == 16) {
-                mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16><<<fp8_grid, fp8_block, 0, stream>>>(
-                    k_cache->data, v_cache->data,
-                    (const __half*) k_cur->data, (const __half*) v_cur->data,
-                    (const int32_t*) slot_mapping->data,
-                    d_centroids_k, d_centroids_v,
-                    n_kv_heads);
+                if (apply_h) {
+                    mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16, true><<<fp8_grid, fp8_block, 0, stream>>>(
+                        k_cache->data, v_cache->data,
+                        (const __half*) k_cur->data, (const __half*) v_cur->data,
+                        (const int32_t*) slot_mapping->data,
+                        d_centroids_k, d_centroids_v,
+                        n_kv_heads);
+                } else {
+                    mt_scatter_kv_turbo4_fp8_aiter_kernel<256, 16, false><<<fp8_grid, fp8_block, 0, stream>>>(
+                        k_cache->data, v_cache->data,
+                        (const __half*) k_cur->data, (const __half*) v_cur->data,
+                        (const int32_t*) slot_mapping->data,
+                        d_centroids_k, d_centroids_v,
+                        n_kv_heads);
+                }
             } else {
                 GGML_ABORT("AITER TURBO4_FP8 scatter: only (head_size=256, block_size=16) wired (got %d, %d)",
                            head_size, block_size);
@@ -732,10 +772,32 @@ void ggml_cuda_op_paged_attn_mt_aiter(ggml_backend_cuda_context & ctx, ggml_tens
     mt_build_cu_seqlens_kernel<<<1, 1, 0, stream>>>(
         cu_seqlens_buf.get(), (const int32_t*) q_lens->data, num_seqs);
 
+    // ── MAD-227: optional Q pre-rotation for Hadamard-mode FP8 ──
+    // Identity (QH)·(HK)^T = QK^T requires rotating BOTH Q and K. K is
+    // rotated in the FP8 scatter kernel above (APPLY_HADAMARD=true variant);
+    // Q is rotated here into a pool-allocated scratch. q->data is untouched.
+    // Allocation only happens when both (a) registry says hadamard mode AND
+    // (b) cache is turbo-FP8 — non-FP8 paths bypass entirely.
+    const __half * q_ptr = (const __half *) q->data;
+    ggml_cuda_pool_alloc<__half> q_rot_scratch(ctx.pool());
+    if (cache_type == MT_AITER_CACHE_TURBO4_FP8 && mt_turbo_fp8::hadamard_required()) {
+        const size_t q_elts = (size_t) num_q_tokens * n_heads * head_size;
+        q_rot_scratch.alloc(q_elts);
+        hipMemcpyAsync(q_rot_scratch.get(), q->data,
+                       q_elts * sizeof(__half), hipMemcpyDeviceToDevice, stream);
+        const hipError_t herr = mt_turbo_fp8_fwht_half(
+            stream, q_rot_scratch.get(),
+            (int)(num_q_tokens * n_heads), head_size, head_size);
+        if (herr != hipSuccess) {
+            GGML_ABORT("mt_turbo_fp8_fwht_half(Q) launch failed: %s", hipGetErrorString(herr));
+        }
+        q_ptr = q_rot_scratch.get();
+    }
+
     // ── 3. Launch AITER attention via the runtime wrapper ──
     mt_aiter_uattn_args_t args = {};
     args.shape        = shape;
-    args.q            = q->data;
+    args.q            = (void *) q_ptr;
     args.k_cache      = k_cache->data;
     args.v_cache      = v_cache->data;
     args.out          = dst->data;

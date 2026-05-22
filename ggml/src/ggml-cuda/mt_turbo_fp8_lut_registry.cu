@@ -82,6 +82,7 @@ struct registry_state {
     std::mutex                              mu;
     bool                                    initialized = false;
     bool                                    auto_calibrate = false;
+    bool                                    hadamard = false;   // MAD-227
     model_fingerprint                       fp {};
     std::string                             cache_dir;
     int                                     n_attn_layers = 0;
@@ -161,7 +162,15 @@ bool init(const model_fingerprint & fp, bool auto_calibrate_if_missing) {
     }
     s.fp             = fp;
     s.auto_calibrate = auto_calibrate_if_missing;
+    // MAD-227: Hadamard mode is a startup-time env-var decision. When on,
+    // LUTs live in a `hadamard/` subdir so they can't be accidentally paired
+    // with the no-Hadamard kernel path (and vice versa).
+    {
+        const char * env = std::getenv("MT_TURBO_FP8_HADAMARD");
+        s.hadamard = (env && *env && env[0] != '0');
+    }
     s.cache_dir      = cache_root() + "/" + fp.digest();
+    if (s.hadamard) s.cache_dir += "/hadamard";
     s.n_attn_layers  = fp.n_layer;
     s.dev_luts.assign(s.n_attn_layers, { nullptr, nullptr });
     mkdir_p(s.cache_dir);
@@ -182,10 +191,16 @@ bool init(const model_fingerprint & fp, bool auto_calibrate_if_missing) {
     s.initialized = true;
     std::fprintf(stderr,
         "mt_turbo_fp8: registry init — arch=%s n_layer=%d head_dim=%d n_kv_heads=%d "
-        "cache=%s auto_calibrate=%d\n",
+        "cache=%s auto_calibrate=%d hadamard=%d\n",
         fp.arch.c_str(), fp.n_layer, fp.head_dim, fp.n_kv_heads,
-        s.cache_dir.c_str(), (int) auto_calibrate_if_missing);
+        s.cache_dir.c_str(), (int) auto_calibrate_if_missing, (int) s.hadamard);
     return true;
+}
+
+bool hadamard_required() {
+    auto & s = state();
+    std::lock_guard<std::mutex> g(s.mu);
+    return s.hadamard;
 }
 
 const uint8_t * get_lut_device_ptr(int layer, kv_dir dir) {
