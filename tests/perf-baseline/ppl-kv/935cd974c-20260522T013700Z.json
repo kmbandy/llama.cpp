@@ -15,6 +15,26 @@
       "elapsed_s": 184,
       "path": "paged_aiter_fp8_wmma",
       "lut_source": "embedded_qwen35_4b_fallback"
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 8192,
+      "ppl": 5.7199,
+      "ppl_err": 0.03525,
+      "n_chunks": 36,
+      "elapsed_s": 250,
+      "path": "paged_aiter_fp8_wmma",
+      "lut_source": "embedded_qwen35_4b_fallback"
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 16384,
+      "ppl": 5.3788,
+      "ppl_err": 0.03237,
+      "n_chunks": 18,
+      "elapsed_s": 306,
+      "path": "paged_aiter_fp8_wmma",
+      "lut_source": "embedded_qwen35_4b_fallback"
     }
   ]
 }
