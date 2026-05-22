@@ -1542,6 +1542,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         memcpy(result->op_params, &wht_group, sizeof(int32_t));
     }
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    // MAD-214 Phase 1G-F: for turbo-FP8 cache types, pass the per-(layer,
+    // KV_K) centroid LUT device pointer to the scatter kernel via op_params.
+    // The scatter kernel reads it back via memcpy(&ptr, dst->op_params, ...).
+    if (k->type == GGML_TYPE_TURBO4_FP8_BS256) {
+        const uint8_t * lut = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_K);
+        memcpy(result->op_params, &lut, sizeof(lut));
+    }
+#endif
+
     return result;
 }
 
@@ -1592,6 +1602,13 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             int32_t wht_group = 128;  // always 128 with padding
             memcpy(result->op_params, &wht_group, sizeof(int32_t));
         }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        // MAD-214 Phase 1G-F: turbo-FP8 V LUT pointer for the scatter kernel.
+        if (v->type == GGML_TYPE_TURBO4_FP8_BS256) {
+            const uint8_t * lut = mt_turbo_fp8::get_lut_device_ptr(il, mt_turbo_fp8::KV_V);
+            memcpy(result->op_params, &lut, sizeof(lut));
+        }
+#endif
         return result;
     }
 

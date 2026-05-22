@@ -1132,6 +1132,198 @@ static void set_rows_cuda_turbo4(
     }
 }
 
+// ── MAD-214 Phase 1G-F: turbo-FP8 BS=256 scatter kernel ─────────────────
+//
+// Each CUDA block packs one (token, kv_head) row of 256 fp32 values into
+// one 162-byte block_turbo4_fp8_bs256 (2-byte fp16 scale | 128-byte 4-bit
+// indices | 32-byte sign bits) using the per-(layer, kv-dir) centroid LUT.
+//
+// 256 threads/block, one thread per element. The 16-byte E4M3 centroid
+// LUT is loaded into 64 bytes of shared mem (decoded to fp32 once per
+// block, shared by all threads' 16-element linear searches).
+//
+// LUT pointer flows from the registry into the kernel via dst->op_params,
+// set by llama_kv_cache::cpy_k/cpy_v at graph-build time.
+//
+// NOTE Phase 1G-F: this kernel does NOT apply Hadamard rotation to K.
+// Phase 0 calibration measured Hadamard-on-K helps ~12% MSE; without it
+// quality is worse but the kernel still produces structurally valid
+// turbo-FP8 cache blocks. Hadamard wiring is a follow-up (turbo_fp8
+// has its own 256-wide Hadamard in ggml-cuda/turbo_fp8_hadamard.cuh).
+
+// Device-side E4M3 byte → fp32 decode, matches CPU packer in
+// tests/test_aiter_turbo_fp8_smoke.cpp and the Triton kernel.
+static __device__ __forceinline__ float fp8_e4m3_byte_to_fp32_dev(uint8_t b) {
+    int sign = (b >> 7) & 1;
+    int e    = (b >> 3) & 0xF;
+    int m    = b & 0x7;
+    float v  = (e == 0) ? (1.0f / 64.0f) * (m / 8.0f)
+                        : __builtin_amdgcn_ldexp(1.0f + m / 8.0f, e - 7);
+    return sign ? -v : v;
+}
+
+template <typename idx_t>
+__launch_bounds__(256)
+static __global__ void k_set_rows_turbo4_fp8_bs256(
+        const float   * __restrict__ src0,
+        const idx_t   * __restrict__ src1,
+        uint8_t       * __restrict__ dst,           // raw bytes; each block is 162 bytes
+        const uint8_t * __restrict__ centroids_lut, // 16 E4M3 bytes
+        const int64_t ne00,
+        const int64_t ne01,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t s10,
+        const int64_t s11,
+        const int64_t s12,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3) {
+
+    constexpr int BS = 256;
+    constexpr int N_CENT = 16;
+    constexpr int BYTES_PER_BLOCK = 162;
+
+    const int j = threadIdx.x;  // element within block (0..255)
+
+    // Decode blockIdx.x → (i_blk, i01, i02, i03). For turbo-FP8 BS=256, one
+    // (token, kv_head) row IS one block (HEAD_SIZE=256).
+    const int64_t n_blocks_per_row = ne00 / BS;
+    const int64_t g     = blockIdx.x;
+    const int64_t i_blk = g % n_blocks_per_row;
+    int64_t       tmp   = g / n_blocks_per_row;
+    const int64_t i01   = tmp % ne01;
+    tmp                 = tmp / ne01;
+    const int64_t i02   = tmp % ne12;
+    const int64_t i03   = tmp / ne12;
+
+    const int64_t i12 = i02;
+    const int64_t i11 = i01 % ne11;
+    const int64_t i10 = i01;
+
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+    const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    uint8_t * blk = dst + dst_row*s1 + i02*s2 + i03*s3 + i_blk * BYTES_PER_BLOCK;
+
+    // ── Stage 1: load element + decode LUT into shared mem ──
+    __shared__ float x[BS];
+    __shared__ float lut_f[N_CENT];
+
+    x[j] = src_row[i_blk * BS + j];
+    if (j < N_CENT) {
+        lut_f[j] = fp8_e4m3_byte_to_fp32_dev(centroids_lut[j]);
+    }
+    __syncthreads();
+
+    // ── Stage 2: per-block max-abs scale ──
+    float v_abs = fabsf(x[j]);
+    // Warp-level max reduction
+    for (int off = 16; off > 0; off >>= 1) {
+        v_abs = fmaxf(v_abs, __shfl_xor_sync(0xffffffffffffffffull, v_abs, off));
+    }
+    // Inter-warp via shared mem (8 warps for 256 threads on wave32 → 8 lanes write)
+    __shared__ float warp_max[8];
+    const int warp_id = j / 32;
+    const int lane    = j % 32;
+    if (lane == 0) warp_max[warp_id] = v_abs;
+    __syncthreads();
+    __shared__ float blk_max;
+    if (j == 0) {
+        float m = warp_max[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) m = fmaxf(m, warp_max[w]);
+        blk_max = m;
+    }
+    __syncthreads();
+
+    // ── Stage 3: cast scale → fp16, broadcast ──
+    const float scale_f = blk_max;
+    const __half scale_h = __float2half(scale_f);
+    const float scale_eff = __half2float(scale_h);
+    const float inv_scale = (scale_eff > 0.0f) ? (1.0f / scale_eff) : 0.0f;
+
+    // ── Stage 4: quantize this lane's element ──
+    const float v   = x[j];
+    const int   sgn = (v < 0.0f) ? 1 : 0;
+    const float mag = fabsf(v) * inv_scale;
+
+    int   best_idx = 0;
+    float best_err = fabsf(mag - lut_f[0]);
+    #pragma unroll
+    for (int k = 1; k < N_CENT; ++k) {
+        float e = fabsf(mag - lut_f[k]);
+        if (e < best_err) { best_idx = k; best_err = e; }
+    }
+
+    // ── Stage 5: cooperative pack into the 162-byte block ──
+    // Byte 0..1: scale (thread 0 writes)
+    if (j == 0) {
+        blk[0] = ((const uint8_t *) &scale_h)[0];
+        blk[1] = ((const uint8_t *) &scale_h)[1];
+    }
+
+    // Bytes 2..129: 4-bit qs. Two adjacent threads (j, j+1) share byte 2+j/2.
+    // Use shfl_xor to gather partner's nibble within the warp; pairs always
+    // sit in the same warp because warp_size=32 ≥ 2.
+    const uint8_t my_nib      = (uint8_t)(best_idx & 0xF);
+    const uint8_t partner_nib = (uint8_t) __shfl_xor_sync(0xffffffffffffffffull, (int) my_nib, 1);
+    if ((j & 1) == 0) {
+        blk[2 + j / 2] = my_nib | (uint8_t)(partner_nib << 4);
+    }
+
+    // Bytes 130..161: signs. 8 elements per byte; one thread out of 8 writes.
+    // ballot_sync collects sign bits across the warp; each warp covers 4 bytes.
+    const uint64_t sign_mask = __ballot_sync(0xffffffffffffffffull, sgn);
+    if ((j & 7) == 0) {
+        const int byte_idx = j / 8;          // 0..31
+        const int warp_off = (j % 32) / 8;   // 0..3 within warp
+        blk[130 + byte_idx] = (uint8_t)((sign_mask >> (warp_off * 8)) & 0xFF);
+    }
+}
+
+template<typename idx_t>
+static void set_rows_cuda_turbo4_fp8_bs256(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+
+    const float * src0_d = (const float *) src0->data;
+    const idx_t * src1_d = (const idx_t *) src1->data;
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_ASSERT(ne00 % 256 == 0);  // turbo-FP8 BS=256 requires 256-aligned row
+
+    cudaStream_t stream = ctx.stream();
+
+    // Pull the per-(layer, kv-dir) centroid LUT pointer from dst->op_params.
+    // llama_kv_cache::cpy_k/cpy_v writes it there during graph build.
+    const uint8_t * d_centroids = nullptr;
+    memcpy(&d_centroids, dst->op_params, sizeof(d_centroids));
+    GGML_ASSERT(d_centroids != nullptr && "turbo4_fp8 scatter: centroid LUT pointer missing in op_params");
+
+    const int64_t n_blocks_per_row = ne00 / 256;
+    const int64_t s01 = nb01 / sizeof(float);
+    const int64_t s02 = nb02 / sizeof(float);
+    const int64_t s03 = nb03 / sizeof(float);
+    const int64_t s10 = nb10 / sizeof(idx_t);
+    const int64_t s11 = nb11 / sizeof(idx_t);
+    const int64_t s12 = nb12 / sizeof(idx_t);
+
+    if (n_blocks_per_row > 0) {
+        const int64_t ne_total = n_blocks_per_row * ne01 * ne02 * ne03;
+        k_set_rows_turbo4_fp8_bs256<idx_t><<<(int) ne_total, 256, 0, stream>>>(
+            src0_d, src1_d, (uint8_t *) dst->data,
+            d_centroids,
+            ne00, ne01, ne11, ne12,
+            s01, s02, s03, s10, s11, s12,
+            nb1, nb2, nb3);
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -1238,6 +1430,8 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         set_rows_cuda_turbo2<idx_t>(ctx, src0, src1, dst);
     } else if (dst->type == GGML_TYPE_TURBO4_0) {
         set_rows_cuda_turbo4<idx_t>(ctx, src0, src1, dst);
+    } else if (dst->type == GGML_TYPE_TURBO4_FP8_BS256) {
+        set_rows_cuda_turbo4_fp8_bs256<idx_t>(ctx, src0, src1, dst);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
