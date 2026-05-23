@@ -32,7 +32,8 @@ struct DebugState {
     int  ensures_failed    = 0;  // ensure() returned null
     int  mmid_ops_seen     = 0;  // GGML_OP_MUL_MAT_ID ops total (ask=true)
     int  mmid_consolidated = 0;  // of those, src[0] resolved to a consolidated parent
-    static constexpr int kVerboseLimit = 8;  // log details for first N ops only
+    static constexpr int kVerboseLimit = 200;  // log details for first N ops only
+    int  ops_no_paged_with_weight_src = 0;  // ops where eval_cb saw a src whose name has "weight" but find_page missed
 };
 DebugState g_debug;
 }  // namespace
@@ -291,7 +292,45 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     ++g_debug.ops_seen;
-    if (n_page_indices == 0) return true;
+    if (n_page_indices == 0) {
+        // Diagnostic: did any src LOOK LIKE a weight tensor that we should have found?
+        // Helps surface name-mismatch / catalog-miss bugs.
+        bool had_weight_looking_src = false;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            struct ggml_tensor * s = t->src[i];
+            if (s == nullptr) break;
+            const char * nm = ggml_get_name(s);
+            if (nm && std::strstr(nm, "weight") != nullptr) {
+                had_weight_looking_src = true;
+                break;
+            }
+        }
+        if (had_weight_looking_src) {
+            if (g_debug.ops_no_paged_with_weight_src < 16) {
+                std::string srcs;
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (t->src[i] == nullptr) break;
+                    if (i > 0) srcs += ", ";
+                    char buf[128];
+                    std::snprintf(buf, sizeof(buf), "%s@%p(buf=%p)",
+                                  ggml_get_name(t->src[i]), t->src[i]->data,
+                                  (void*)t->src[i]->buffer);
+                    srcs += buf;
+                }
+                LLAMA_LOG_WARN("[wp::eval_cb][MISS] op=%s name=\"%s\" srcs=[%s]\n",
+                               ggml_op_name(t->op), ggml_get_name(t), srcs.c_str());
+            }
+            ++g_debug.ops_no_paged_with_weight_src;
+        }
+        // Periodic summary so we know eval_cb is alive even when no patches happen
+        if ((g_debug.ops_seen % 500) == 0) {
+            LLAMA_LOG_WARN("[wp::eval_cb][SUM] ops_seen=%d ops_with_pages=%d patches=%d miss_w=%d fails=%d\n",
+                           g_debug.ops_seen, g_debug.ops_with_pages,
+                           g_debug.patches_total, g_debug.ops_no_paged_with_weight_src,
+                           g_debug.ensures_failed);
+        }
+        return true;
+    }
     ++g_debug.ops_with_pages;
 
     // Step 2: page each one in (waiting on prefetch if in flight, sync
@@ -345,13 +384,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // the eval cb is doing without relying on env var. Use WARN level so
     // llama-cli's default log filter doesn't suppress it.
     if (g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
-        LLAMA_LOG_INFO("[wp::eval_cb][%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d)\n",
+        LLAMA_LOG_WARN("[wp::eval_cb][%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d miss_w=%d)\n",
                         g_debug.ops_with_pages, ggml_op_name(t->op),
                         ggml_get_name(t),
                         n_page_indices, patches_this_op, views_this_op,
-                        g_debug.patches_total, g_debug.views_patched, g_debug.ensures_failed);
+                        g_debug.patches_total, g_debug.views_patched, g_debug.ensures_failed,
+                        g_debug.ops_no_paged_with_weight_src);
     } else if (g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
-        LLAMA_LOG_INFO("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
+        LLAMA_LOG_WARN("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
                        DebugState::kVerboseLimit);
     }
 

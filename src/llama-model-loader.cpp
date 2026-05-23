@@ -1529,6 +1529,25 @@ bool llama_model_loader::load_all_data(
             // this can happen with split experts models
             continue;
         }
+        // Skip tensors with no backing buffer. With weight paging enabled
+        // the per-layer paged weights are left with buffer==NULL on purpose
+        // — the pager owns their VRAM and patches src->data per op via
+        // the eval callback. The ctx loop here covers ALL tensors in the
+        // ctx, so we have to filter them out here.
+        if (cur->buffer == nullptr) {
+            continue;
+        }
+        // Diagnostic: log resident weight loads so we can verify the
+        // weight-paging "resident" tensors (token_embd, output_norm,
+        // output.weight) actually get populated.
+        {
+            const char * nm = ggml_get_name(cur);
+            if (nm && std::strstr(nm, "token_embd") != nullptr) {
+                LLAMA_LOG_WARN("[load_all_data] VISIT name=%s data=%p buf=%p host=%d size=%zu\n",
+                               nm, cur->data, (void*)cur->buffer,
+                               (int)ggml_backend_buffer_is_host(cur->buffer), ggml_nbytes(cur));
+            }
+        }
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {

@@ -1498,23 +1498,66 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc || params.weight_paging_enabled) {
+            // Lambda: is this tensor PAGED (handled by the pager pool)?
+            // Per-layer FFN/attn weights are paged. Resident weights
+            // (token_embd, output_norm, output.weight) and non-weight tensors
+            // (RoPE freqs, positional embeddings, etc.) are NOT paged — they
+            // get real allocation + load_all_data via the normal path.
+            auto is_paged_weight = [&](ggml_tensor * t) -> bool {
+                const char * n = ggml_get_name(t);
+                if (ml.get_weight(n) == nullptr) return false;  // not a weight at all
+                if (std::strncmp(n, "token_embd", 10) == 0) return false;
+                if (std::strncmp(n, "output_norm", 11) == 0) return false;
+                if (std::strcmp (n, "output.weight") == 0)  return false;
+                return true;  // it's a paged per-layer weight
+            };
+            const bool paging_on_device_buft =
+                params.weight_paging_enabled && !ggml_backend_buft_is_host(buft);
+            if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-                // Only set the dummy buffer on non-weight tensors.
-                // Weight tensors must have buffer == NULL and data == NULL so that
-                // ggml_gallocr_alloc_graph skips allocation for them.
-                // The weight pager callback will set the correct VRAM slot before each op.
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    if (params.weight_paging_enabled && ml.get_weight(ggml_get_name(t))) {
-                        // Skip weight tensors - they will be handled by the weight pager
-                        // Leave buffer == NULL and data == NULL
-                        continue;
-                    }
-                    // Set dummy buffer on non-weight tensors (RoPE freqs, positional embeddings, etc.)
                     t->buffer = buf;
                 }
+            } else if (paging_on_device_buft) {
+                // Manual per-tensor allocation: real buffer sized for non-paged
+                // tensors only. Paged tensors are left with buffer == NULL / data
+                // == NULL so ggml_gallocr_alloc_graph skips them; the weight
+                // pager's eval_cb will patch src->data per op.
+                const size_t alignment = ggml_backend_buft_get_alignment(buft);
+                size_t total = 0;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (is_paged_weight(t)) continue;
+                    size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
+                    // Per-tensor align-up.
+                    sz = (sz + alignment - 1) & ~(alignment - 1);
+                    total += sz;
+                }
+                if (total == 0) {
+                    // Pure-paged ctx (no resident tensors at all). Dummy buf is fine.
+                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                } else {
+                    buf = ggml_backend_buft_alloc_buffer(buft, total);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format(
+                            "weight-paging: unable to allocate %zu B resident buffer on %s",
+                            total, ggml_backend_buft_name(buft)));
+                    }
+                    char * base = (char *) ggml_backend_buffer_get_base(buf);
+                    size_t offset = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (is_paged_weight(t)) continue;
+                        if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS) {
+                            throw std::runtime_error(format(
+                                "weight-paging: ggml_backend_tensor_alloc failed for %s",
+                                ggml_get_name(t)));
+                        }
+                        size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
+                        sz = (sz + alignment - 1) & ~(alignment - 1);
+                        offset += sz;
+                    }
+                }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer, normal path
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1595,6 +1638,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // logits), so paging them just adds SSD churn for no win.
                 // Keeping them resident also lets the pool's slot stride
                 // shrink to per-block-weight size, fitting many more slots.
+                // These tensors are allocated and loaded via the normal-resident
+                // path in the alloc loop below (see "resident weight" handling).
                 {
                     const char * n = ggml_get_name(t);
                     if (std::strncmp(n, "token_embd", 10) == 0 ||
@@ -1662,9 +1707,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // load tensor data (skip when weight paging is enabled — weights are paged in on-demand)
-    if (!params.weight_paging_enabled) {
+    // load tensor data. With weight-paging enabled, ALL weights are paged
+    // (we removed the token_embd/output_norm/output exclusion to fix the
+    // never-allocated-never-loaded bug), so the GPU-paged ctxs have all
+    // weight tensors with buffer == NULL and the pager handles their data.
+    // Host bufts (when paging is on, these only carry non-weight tensors
+    // like RoPE freqs) still need load_all_data; the host buft path above
+    // allocates them normally.
+    // Iterate every ctx. load_all_data internally skips tensors with
+    // buffer==NULL (the per-layer paged ones, which the pager owns), so
+    // it's safe to call on the GPU-paged ctxs too — it will populate the
+    // resident weights (token_embd, output_norm, output.weight) that we
+    // allocated above and skip the paged ones.
+    {
+        int ctx_i = 0;
         for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            ggml_backend_buffer_t any_buf = buf_map.empty() ? nullptr : buf_map.begin()->second;
+            int n_t = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) ++n_t;
+            LLAMA_LOG_WARN("[load_loop] ctx[%d] tensors=%d any_buf=%p host=%d buft=%s\n",
+                           ctx_i, n_t,
+                           (void*)any_buf,
+                           any_buf ? (int)ggml_backend_buffer_is_host(any_buf) : -1,
+                           any_buf ? ggml_backend_buffer_name(any_buf) : "(none)");
+            ++ctx_i;
+            if (ml.no_alloc && !params.weight_paging_enabled) continue;
             if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
                 return false;
             }

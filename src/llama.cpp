@@ -228,16 +228,28 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         if (placeholder == nullptr) {
             throw std::runtime_error("weight pager: pool_buf has null base — pool init bug");
         }
-        size_t n_placed = 0;
+        size_t n_placed  = 0;
+        size_t n_skipped_not_in_catalog = 0;
         for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
-            if (t && t->data == nullptr) {
-                t->data   = placeholder;
-                t->buffer = nullptr;
-                ++n_placed;
+            if (!t || t->data != nullptr) continue;
+            // Only assign the placeholder to tensors that actually live in the
+            // pager catalog — i.e., ones eval_cb will subsequently patch with a
+            // real slot pointer. Tensors NOT in the catalog (token embed, lm head,
+            // anything classified as host-resident) must keep data == nullptr so
+            // the proper buffer allocator can assign their real data later;
+            // otherwise they end up reading the placeholder forever (= slot 0
+            // base = whatever page lands in slot 0). That produces uniform
+            // garbage output (PPL == vocab_size).
+            if (model.wp_pager->find_page(ggml_get_name(t)) < 0) {
+                ++n_skipped_not_in_catalog;
+                continue;
             }
+            t->data   = placeholder;
+            t->buffer = nullptr;
+            ++n_placed;
         }
-        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p)\n",
-                       __func__, n_placed, placeholder);
+        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p, skipped %zu not in catalog)\n",
+                       __func__, n_placed, placeholder, n_skipped_not_in_catalog);
     }
 
     LLAMA_LOG_INFO("%s: weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",

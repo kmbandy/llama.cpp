@@ -2582,21 +2582,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.weight_paging_enabled = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
     add_opt(common_arg(
         {"--weight-paging-slots"}, "N",
         "number of VRAM slots for weight paging (-1 = auto = layer count, capped to free VRAM)",
         [](common_params & params, const std::string & value) {
             params.weight_paging_slots = std::stoi(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
     add_opt(common_arg(
         {"--weight-paging-prefetch"},
         "enable async io_uring prefetch of next layer (default: disabled)",
         [](common_params & params) {
             params.weight_paging_prefetch = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
