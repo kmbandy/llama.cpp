@@ -1142,7 +1142,17 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    //
+    // MAD-230: SKIP when routing-aware paging is active for this op. The
+    // consolidated MoE parent's src0->data is a placeholder pointer (pool
+    // base, not real tensor storage); writing past it with size_data bytes
+    // either spills into other pool slots or hits unmapped VRAM and faults.
+    // The kernel will read per-expert pointers from the expert_ptrs side
+    // channel instead. Same gate we applied in mmq.cu. Decode dispatches
+    // here (MMVQ for ne2<=batch); the analogous prefill path (MMQ) was
+    // already gated.
+    if (!ggml_cuda_has_routed_expert_ptrs() &&
+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
