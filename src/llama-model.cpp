@@ -1530,24 +1530,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf;
                 }
             } else if (paging_on_device_buft) {
-                // Allocate the FULL ctx normally via the proven path. This
-                // ensures ggml-sched, gallocr, and cross-backend copy machinery
-                // see the buffer state they expect. Then "orphan" the paged
-                // tensors by clearing their data/buffer fields so the pager
-                // takes over from there. Paged tensors' allocated VRAM is
-                // wasted (orphaned within the buffer until shutdown frees it)
-                // — acceptable for correctness; a future optimization can
-                // shrink the resident buffer to exclude paged regions.
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format(
-                        "weight-paging: unable to allocate %s buffer for resident weights",
-                        ggml_backend_buft_name(buft)));
-                }
+                // Manual per-tensor allocation: allocate a real buffer sized
+                // ONLY for the non-paged (resident) tensors in this ctx. Paged
+                // tensors are left with buffer == NULL / data == NULL so
+                // gallocr skips them and the pager's eval_cb patches src->data
+                // per op with the slot pointer.
+                //
+                // Doing alloc-the-whole-ctx-then-orphan would waste VRAM
+                // proportional to the full paged-weight size — fine for small
+                // models, fatal at 35B+ (22+GB orphaned, doesn't fit alongside
+                // the pager pool on a 32GB card).
+                const size_t alignment = ggml_backend_buft_get_alignment(buft);
+                auto align_up = [&](size_t s) { return (s + alignment - 1) & ~(alignment - 1); };
+                size_t total = 0;
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    if (is_paged_weight(t)) {
-                        t->data   = nullptr;
-                        t->buffer = nullptr;
+                    if (is_paged_weight(t)) continue;
+                    total += align_up(ggml_backend_buft_get_alloc_size(buft, t));
+                }
+                if (total == 0) {
+                    // Pure-paged ctx (no resident tensors). Dummy size-0 buf.
+                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                } else {
+                    buf = ggml_backend_buft_alloc_buffer(buft, total);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format(
+                            "weight-paging: unable to allocate %zu B resident buffer on %s",
+                            total, ggml_backend_buft_name(buft)));
+                    }
+                    char * base = (char *) ggml_backend_buffer_get_base(buf);
+                    size_t offset = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        if (is_paged_weight(t)) continue;
+                        if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS) {
+                            throw std::runtime_error(format(
+                                "weight-paging: ggml_backend_tensor_alloc failed for %s",
+                                ggml_get_name(t)));
+                        }
+                        offset += align_up(ggml_backend_buft_get_alloc_size(buft, t));
                     }
                 }
             } else {

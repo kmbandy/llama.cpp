@@ -166,18 +166,44 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // the async completion; for unloaded
                                     // pages it falls back to sync.
                                     int n_ensures = 0;
+                                    void * first_active_slot = nullptr;
                                     for (int e : active) {
                                         const int sub_page_idx = weight_page + 1 + e;
                                         void * slot = pager->ensure(sub_page_idx);
                                         if (slot != nullptr) {
                                             host_ptrs[(size_t) e] = slot;
+                                            if (first_active_slot == nullptr) {
+                                                first_active_slot = slot;
+                                            }
                                             ++n_ensures;
                                         }
                                     }
+                                    // Safety: fill INACTIVE expert slots with a non-null
+                                    // sentinel (first active slot) so a kernel that reads
+                                    // expert_ptrs[inactive_idx] gets a valid (wrong) pointer
+                                    // instead of NULL-faulting. If the kernel correctly only
+                                    // reads active indices this is dead memory; if it doesn't
+                                    // we'll see wrong logits but no fault, which is recoverable.
+                                    if (first_active_slot != nullptr) {
+                                        for (size_t i = 0; i < host_ptrs.size(); ++i) {
+                                            if (host_ptrs[i] == nullptr) {
+                                                host_ptrs[i] = first_active_slot;
+                                            }
+                                        }
+                                    }
 
-                                    // Async copy host pointer table to
-                                    // device. The kernel will read after
-                                    // this completes (same stream order).
+                                    // Synchronize compute before we overwrite
+                                    // s_dev_expert_ptrs — it's a STATIC buffer
+                                    // shared by every MoE op in this forward
+                                    // pass. The previous op's kernel may still
+                                    // be running on the compute stream and
+                                    // reading from this same array. Without
+                                    // the sync, the new op's hipMemcpy can
+                                    // race and corrupt the old kernel's read,
+                                    // producing near-null pointer faults.
+                                    // This is the trade-off for the perf win
+                                    // of pre-allocating one device buffer once.
+                                    hipDeviceSynchronize();
                                     hipMemcpy(s_dev_expert_ptrs,
                                               host_ptrs.data(),
                                               (size_t) n_subs * sizeof(const void *),

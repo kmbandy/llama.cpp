@@ -1529,17 +1529,21 @@ bool llama_model_loader::load_all_data(
             // this can happen with split experts models
             continue;
         }
-        // Skip paged weight tensors (buffer==NULL AND data==NULL AND no buf_mmap available).
-        // With weight paging the per-layer paged weights are left with buffer==NULL on
-        // purpose — pager patches src->data per op via eval cb. BUT we must not skip
-        // mmap-eligible tensors (buffer==NULL at entry, lazily allocated below via
-        // ggml_backend_tensor_alloc(buf_mmap, ...)). The skip applies only when there's
-        // no buf_mmap to land in either.
-        if (cur->buffer == nullptr && cur->data == nullptr) {
-            ggml_backend_buffer_t any_mmap = use_mmap && bufs.count(weight->idx) ? bufs.at(weight->idx) : nullptr;
-            if (any_mmap == nullptr) {
-                continue;
-            }
+        // Skip paged weight tensors. With weight paging the per-layer paged weights
+        // are left with buffer==NULL / data==NULL on purpose — the pager owns their
+        // VRAM and patches src->data per op via the eval callback. The ctx loop here
+        // covers ALL tensors in the ctx (including the paged ones), so we filter them
+        // out here.
+        //
+        // Carve-out: when use_mmap is true, host tensors with buffer==NULL get lazily
+        // allocated to the mmap region inside this loop (see ggml_backend_tensor_alloc
+        // below). Don't skip those — only skip when there's no mmap path to lift them.
+        if (cur->data == nullptr && !use_mmap) {
+            // unconditional skip when data hasn't been assigned and there's no mmap
+            // to lift it. Covers paged tensors regardless of buffer state.
+            LLAMA_LOG_WARN("[load_all_data] SKIP paged tensor: %s (buf=%p)\n",
+                           ggml_get_name(cur), (void*)cur->buffer);
+            continue;
         }
         // Diagnostic: log EVERY visit of token_embd or output tensor to surface
         // any duplicates and verify all instances get loaded.

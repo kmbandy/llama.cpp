@@ -135,13 +135,28 @@ void ggml_cuda_mul_mat_q(
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    //
+    // SKIP when routing-aware paging is active for this op: the consolidated
+    // MoE parent's src0->data is a placeholder pointer (pool base, not real
+    // tensor storage), and the kernel will read per-expert pointers from the
+    // expert_ptrs side channel instead. Writing past placeholder with size_data
+    // bytes faults the GPU (near-null offset since placeholder may be 0-based
+    // within the pool view).
+    if (!ggml_cuda_has_routed_expert_ptrs() &&
+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {
             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    } else if (ggml_cuda_has_routed_expert_ptrs()) {
+        static int s_dump = 0;
+        if (s_dump < 4) {
+            fprintf(stderr, "[mmq DIAG] routing active: src0=%s data=%p buf=%p nbytes=%zu\n",
+                    src0->name, src0->data, (void*)src0->buffer, ggml_nbytes(src0));
+            ++s_dump;
         }
     }
 
