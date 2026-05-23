@@ -1185,6 +1185,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
+    // Weight paging and mmap are two different ways to avoid loading the
+    // entire model into VRAM/RAM upfront. They step on each other (mmap
+    // pre-resolves tensor data pointers; the pager rewrites them per-op,
+    // and the mmap-path bounds checks fire on duplicated tensors in
+    // separate ctxs). Force-disable mmap whenever weight paging is on so
+    // there's one canonical residency manager.
+    if (params.weight_paging_enabled && ml.use_mmap) {
+        LLAMA_LOG_INFO("%s: weight paging is enabled — disabling mmap (they manage the same memory differently)\n", __func__);
+        ml.use_mmap = false;
+    }
+
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
