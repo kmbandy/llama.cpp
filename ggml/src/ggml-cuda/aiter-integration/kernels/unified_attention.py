@@ -55,6 +55,25 @@
 #    AOT spec implications: turbo cache pointers are *i8:16 (byte ptrs),
 #    F16 cache pointers remain *fp16:16. CACHE_TYPE is baked per-spec.
 #
+# 3. turbo-FP8 family inline FP8 WMMA dequant (MAD-214):
+#    Adds CACHE_TYPE = 10..14 (turbo3_fp8 × BS), 20..24 (turbo4_fp8 × BS),
+#    30..34 (turbo5_fp8 × BS). Loaders return (fp8_bytes, per-row-scales)
+#    instead of dequant'd fp32; tl.dot site bitcasts to tl.float8e4nv so
+#    the AMDGCN backend emits v_wmma_f32_16x16x16_fp8_fp8 directly. Per-row
+#    scale folded into FP32 accumulator post-WMMA. Centroid LUT is *per-
+#    (model, layer, kv-dir)* runtime pointer (vs turbo3/4's compile-time
+#    constant table) so the loader does an extra tl.load(lut_ptr + idx)
+#    per element.
+#
+# 4. IDX_BITS=4 skips qs_hi load (MAD-229, 2026-05-22):
+#    For turbo4_fp8 (IDX_BITS=4), bit_pos = offs_d * 4 → bit_off ∈ {0, 4}.
+#    The 4-bit index always sits in a single byte (qs_lo), so the qs_hi
+#    load in load_turbo_fp8_kv_tile_{K,V}_bs256 was reading a byte whose
+#    contents were never consumed. Constexpr-gated branch removes the
+#    redundant load on the IDX_BITS=4 path while preserving the cross-
+#    byte read for IDX_BITS=3 (turbo3_fp8) and IDX_BITS=5 (turbo5_fp8)
+#    where indices genuinely straddle bytes.
+#
 # Validated: AITER 2D + 3D + reduce_segments AOT-compile cleanly for
 #            gfx1201 (R9700) and gfx1030 (6900XT) from this vendor.
 #            See docs/aiter-integration/ARCHITECTURE.md §7 + MAD-188.
@@ -594,17 +613,25 @@ def load_turbo_fp8_kv_tile_K_bs256(
 
     # Broadcast offsets to (HEAD_SIZE_PADDED, TILE_SIZE) and add token-base.
     qs_lo_addr = block_byte_base[None, :] + 2 + byte_lo_off[:, None]
-    qs_hi_addr = qs_lo_addr + 1
     sign_addr  = block_byte_base[None, :] + SIGNS_OFFSET + (offs_d[:, None] // 8).to(tl.int64)
 
     load_mask = dim_mask[:, None] & tile_mask[None, :]
     qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
-    qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+    # MAD-229 perf opt: for IDX_BITS=4 (turbo4_fp8), bit_pos = offs_d * 4 so
+    # bit_off ∈ {0, 4} — the index always fits in qs_lo's byte. Skip the
+    # qs_hi load entirely (halves cache-byte read volume on the K hot path).
+    # IDX_BITS=3 (turbo3_fp8) / IDX_BITS=5 (turbo5_fp8) straddle bytes, so
+    # they still need the word-spanning read.
+    if IDX_BITS == 4:
+        word = qs_lo.to(tl.int32)
+    else:
+        qs_hi_addr = qs_lo_addr + 1
+        qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+        word       = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
     sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
     sign_bit_off = (offs_d % 8).to(tl.int32)            # (HEAD_SIZE_PADDED,)
 
     # Extract IDX_BITS index, look up centroid byte, XOR sign → signed E4M3 byte.
-    word          = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
     mask          = (1 << IDX_BITS) - 1
     idx           = (word >> bit_off[:, None]) & mask
     centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)
@@ -652,16 +679,20 @@ def load_turbo_fp8_kv_tile_V_bs256(
 
     # V tile shape is (TILE_SIZE, HEAD_SIZE_PADDED) — token-major.
     qs_lo_addr = block_byte_base[:, None] + 2 + byte_lo_off[None, :]
-    qs_hi_addr = qs_lo_addr + 1
     sign_addr  = block_byte_base[:, None] + SIGNS_OFFSET + (offs_d[None, :] // 8).to(tl.int64)
 
     load_mask = tile_mask[:, None] & dim_mask[None, :]
     qs_lo      = tl.load(cache_byte_ptr + qs_lo_addr, mask=load_mask, other=0)
-    qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+    # MAD-229 perf opt: see K loader for full rationale. IDX_BITS=4 skips qs_hi.
+    if IDX_BITS == 4:
+        word = qs_lo.to(tl.int32)
+    else:
+        qs_hi_addr = qs_lo_addr + 1
+        qs_hi      = tl.load(cache_byte_ptr + qs_hi_addr, mask=load_mask, other=0)
+        word       = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
     sign_bytes = tl.load(cache_byte_ptr + sign_addr,  mask=load_mask, other=0)
     sign_bit_off = (offs_d % 8).to(tl.int32)
 
-    word          = qs_lo.to(tl.int32) | (qs_hi.to(tl.int32) << 8)
     mask          = (1 << IDX_BITS) - 1
     idx           = (word >> bit_off[None, :]) & mask
     centroid_byte = tl.load(lut_ptr + idx).to(tl.int32)
