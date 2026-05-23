@@ -1661,7 +1661,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    bool dbg = input && input->name[0] && strstr(input->name, "token_embd") != nullptr;
+                    if (dbg) {
+                        fprintf(stderr, "[sched_copy] %s ENTER: src data=%p buf=%p host=%d -> dst data=%p buf=%p host=%d size=%zu\n",
+                                input->name, input->data, (void*)input->buffer,
+                                input->buffer ? (int)ggml_backend_buffer_is_host(input->buffer) : -1,
+                                input_cpy->data, (void*)input_cpy->buffer,
+                                input_cpy->buffer ? (int)ggml_backend_buffer_is_host(input_cpy->buffer) : -1,
+                                ggml_nbytes(input));
+                    }
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (dbg) fprintf(stderr, "[sched_copy] %s: SYNC path\n", input->name);
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1669,6 +1679,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    } else if (dbg) {
+                        fprintf(stderr, "[sched_copy] %s: ASYNC submitted\n", input->name);
+                    }
+                    if (dbg) {
+                        ggml_backend_synchronize(split_backend);
+                        unsigned char sb[16] = {0}, db[16] = {0};
+                        ggml_backend_tensor_get(input,     sb, 0, 16);
+                        ggml_backend_tensor_get(input_cpy, db, 0, 16);
+                        fprintf(stderr, "[sched_copy] %s SRC:", input->name);
+                        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", sb[i]);
+                        fprintf(stderr, "\n[sched_copy] %s DST:", input->name);
+                        for (int i = 0; i < 16; ++i) fprintf(stderr, " %02x", db[i]);
+                        fprintf(stderr, "\n");
                     }
                 }
             }

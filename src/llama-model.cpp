@@ -1519,41 +1519,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf;
                 }
             } else if (paging_on_device_buft) {
-                // Manual per-tensor allocation: real buffer sized for non-paged
-                // tensors only. Paged tensors are left with buffer == NULL / data
-                // == NULL so ggml_gallocr_alloc_graph skips them; the weight
-                // pager's eval_cb will patch src->data per op.
-                const size_t alignment = ggml_backend_buft_get_alignment(buft);
-                size_t total = 0;
-                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    if (is_paged_weight(t)) continue;
-                    size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
-                    // Per-tensor align-up.
-                    sz = (sz + alignment - 1) & ~(alignment - 1);
-                    total += sz;
+                // Allocate the FULL ctx normally via the proven path. This
+                // ensures ggml-sched, gallocr, and cross-backend copy machinery
+                // see the buffer state they expect. Then "orphan" the paged
+                // tensors by clearing their data/buffer fields so the pager
+                // takes over from there. Paged tensors' allocated VRAM is
+                // wasted (orphaned within the buffer until shutdown frees it)
+                // — acceptable for correctness; a future optimization can
+                // shrink the resident buffer to exclude paged regions.
+                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format(
+                        "weight-paging: unable to allocate %s buffer for resident weights",
+                        ggml_backend_buft_name(buft)));
                 }
-                if (total == 0) {
-                    // Pure-paged ctx (no resident tensors at all). Dummy buf is fine.
-                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
-                } else {
-                    buf = ggml_backend_buft_alloc_buffer(buft, total);
-                    if (buf == nullptr) {
-                        throw std::runtime_error(format(
-                            "weight-paging: unable to allocate %zu B resident buffer on %s",
-                            total, ggml_backend_buft_name(buft)));
-                    }
-                    char * base = (char *) ggml_backend_buffer_get_base(buf);
-                    size_t offset = 0;
-                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                        if (is_paged_weight(t)) continue;
-                        if (ggml_backend_tensor_alloc(buf, t, base + offset) != GGML_STATUS_SUCCESS) {
-                            throw std::runtime_error(format(
-                                "weight-paging: ggml_backend_tensor_alloc failed for %s",
-                                ggml_get_name(t)));
-                        }
-                        size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
-                        sz = (sz + alignment - 1) & ~(alignment - 1);
-                        offset += sz;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (is_paged_weight(t)) {
+                        t->data   = nullptr;
+                        t->buffer = nullptr;
                     }
                 }
             } else {
@@ -1730,6 +1713,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                            (void*)any_buf,
                            any_buf ? (int)ggml_backend_buffer_is_host(any_buf) : -1,
                            any_buf ? ggml_backend_buffer_name(any_buf) : "(none)");
+            // list tensors in this ctx (limit to first 10 for sanity + any matching token_embd/output)
+            int shown = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const char * nm = ggml_get_name(t);
+                bool is_interesting = nm && (std::strstr(nm, "token_embd") != nullptr || std::strncmp(nm, "output", 6) == 0);
+                if (shown < 5 || is_interesting) {
+                    LLAMA_LOG_WARN("[load_loop]   ctx[%d] tensor=%p name=%s data=%p buf=%p\n",
+                                   ctx_i, (void*)t, nm, t->data, (void*)t->buffer);
+                    ++shown;
+                }
+            }
             ++ctx_i;
             if (ml.no_alloc && !params.weight_paging_enabled) continue;
             if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
