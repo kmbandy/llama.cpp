@@ -229,19 +229,28 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     aiter::Registry & reg = aiter::Registry::instance();
     reg.set_compile_script(AITER_COMPILE_SCRIPT_DEFAULT);
 
+    // MAD-232 perf-sweep env overrides for num_warps / num_stages. Defaults
+    // are 4/1 (matching RDNA generic Triton heuristic; gfx1201 has no
+    // arch-specific defaults per third_party/amd/backend/compiler.py). The
+    // FP8 path may benefit from different values; sweepable via env without
+    // recompile. Each (nw, ns) pair gets its own JIT cache slot.
+    int env_nw = 4, env_ns = 1;
+    if (const char * s = std::getenv("MT_AITER_NUM_WARPS"))  { int v = std::atoi(s); if (v > 0 && v <= 32) env_nw = v; }
+    if (const char * s = std::getenv("MT_AITER_NUM_STAGES")) { int v = std::atoi(s); if (v > 0 && v <= 8 ) env_ns = v; }
+
     // MAD-214 Phase 1F-D: 3d + reduce kernels now handle FP8 too (IS_TURBO_FP8
     // branches mirrored from the 2d kernel). Compile unconditionally.
     aiter::KernelSpec spec_3d {
         AITER_KERNEL_SOURCE_DEFAULT,
         "kernel_unified_attention_3d",
-        target, sig_3d, 4, 1,
+        target, sig_3d, env_nw, env_ns,
     };
     c.h_3d = reg.get_or_compile(spec_3d);
 
     aiter::KernelSpec spec_reduce {
         AITER_KERNEL_SOURCE_DEFAULT,
         "reduce_segments",
-        target, sig_red, 4, 1,
+        target, sig_red, env_nw, env_ns,
     };
     c.h_reduce = reg.get_or_compile(spec_reduce);
 
@@ -250,7 +259,7 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
     aiter::KernelSpec spec_2d {
         AITER_KERNEL_SOURCE_DEFAULT,
         "kernel_unified_attention_2d",
-        target, sig_2d, 4, 1,
+        target, sig_2d, env_nw, env_ns,
     };
     c.h_2d = reg.get_or_compile(spec_2d);
 
@@ -265,7 +274,7 @@ hipError_t ensure_initialized(const mt_aiter_uattn_shape_t & shape) {
         aiter::KernelSpec spec_2d_large {
             AITER_KERNEL_SOURCE_DEFAULT,
             "kernel_unified_attention_2d",
-            target, sig_2d_large, 4, 1,
+            target, sig_2d_large, env_nw, env_ns,
         };
         c.h_2d_large = reg.get_or_compile(spec_2d_large);
     } else {
