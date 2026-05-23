@@ -1,0 +1,120 @@
+{
+  "commit": "fb9ee6de92cd2d36f27090ebdd285845bae0a464",
+  "short_commit": "fb9ee6de9",
+  "timestamp_utc": "20260522T213717Z",
+  "phase": "full-aiter-ppl",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "corpus": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "path": "paged_aiter_kv_tiered",
+  "notes": "PPL bench across {f16, turbo3, turbo4, turbo4_fp8_bs256} \u00d7 ctx {4k,8k,16k} all on AITER FP8/F16/turbo path (MAD_USE_AITER=1, --kv-tiered 100,0,0). turbo4_fp8_bs256 uses the production recipe (no-hadamard mag_p=5 + bigger corpus) pre-fit into the registry cache dir before the run.",
+  "cells": [
+    {
+      "label": "ppl_f16_ctx4096",
+      "cache_type": "f16",
+      "ctx_size": 4096,
+      "ppl": 5.7486,
+      "ppl_err": 0.03551,
+      "n_chunks": 72,
+      "elapsed_s": 165
+    },
+    {
+      "label": "ppl_f16_ctx8192",
+      "cache_type": "f16",
+      "ctx_size": 8192,
+      "ppl": 5.6975,
+      "ppl_err": 0.03507,
+      "n_chunks": 36,
+      "elapsed_s": 173
+    },
+    {
+      "label": "ppl_f16_ctx16384",
+      "cache_type": "f16",
+      "ctx_size": 16384,
+      "ppl": 5.3634,
+      "ppl_err": 0.03224,
+      "n_chunks": 18,
+      "elapsed_s": 190
+    },
+    {
+      "label": "ppl_turbo3_ctx4096",
+      "cache_type": "turbo3",
+      "ctx_size": 4096,
+      "ppl": 5.9782,
+      "ppl_err": 0.0366,
+      "n_chunks": 72,
+      "elapsed_s": 200
+    },
+    {
+      "label": "ppl_turbo3_ctx8192",
+      "cache_type": "turbo3",
+      "ctx_size": 8192,
+      "ppl": 5.9095,
+      "ppl_err": 0.03593,
+      "n_chunks": 36,
+      "elapsed_s": 206
+    },
+    {
+      "label": "ppl_turbo3_ctx16384",
+      "cache_type": "turbo3",
+      "ctx_size": 16384,
+      "ppl": 5.5664,
+      "ppl_err": 0.03309,
+      "n_chunks": 18,
+      "elapsed_s": 261
+    },
+    {
+      "label": "ppl_turbo4_ctx4096",
+      "cache_type": "turbo4",
+      "ctx_size": 4096,
+      "ppl": 5.982,
+      "ppl_err": 0.03648,
+      "n_chunks": 72,
+      "elapsed_s": 193
+    },
+    {
+      "label": "ppl_turbo4_ctx8192",
+      "cache_type": "turbo4",
+      "ctx_size": 8192,
+      "ppl": 5.9035,
+      "ppl_err": 0.03573,
+      "n_chunks": 36,
+      "elapsed_s": 196
+    },
+    {
+      "label": "ppl_turbo4_ctx16384",
+      "cache_type": "turbo4",
+      "ctx_size": 16384,
+      "ppl": 5.5588,
+      "ppl_err": 0.03284,
+      "n_chunks": 18,
+      "elapsed_s": 236
+    },
+    {
+      "label": "ppl_turbo4_fp8_bs256_ctx4096",
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 4096,
+      "ppl": 5.7601,
+      "ppl_err": 0.03559,
+      "n_chunks": 72,
+      "elapsed_s": 183
+    },
+    {
+      "label": "ppl_turbo4_fp8_bs256_ctx8192",
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 8192,
+      "ppl": 5.7052,
+      "ppl_err": 0.0351,
+      "n_chunks": 36,
+      "elapsed_s": 208
+    },
+    {
+      "label": "ppl_turbo4_fp8_bs256_ctx16384",
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 16384,
+      "ppl": 5.3698,
+      "ppl_err": 0.03226,
+      "n_chunks": 18,
+      "elapsed_s": 258
+    }
+  ]
+}
