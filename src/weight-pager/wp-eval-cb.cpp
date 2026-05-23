@@ -9,7 +9,8 @@
 // Forward decl of the ggml-cuda side channel — the actual symbol lives in
 // libggml-hip.so and we link against it. Avoids dragging the full
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
-extern "C++" void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+extern "C++" void   ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+extern "C++" void * ggml_cuda_get_wp_compute_stream();
 #endif
 
 #include <cstdlib>       // getenv
@@ -117,22 +118,76 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                             }
 
                             if (s_dev_expert_ptrs != nullptr) {
-                                // Read indices to host. hipMemcpy is
-                                // synchronous-w.r.t.-host and serialises
-                                // against any prior async work on the
-                                // source memory's stream — the explicit
-                                // hipDeviceSynchronize that used to live
-                                // here forced a device-wide stall between
-                                // every MoE op (240/token), preventing
-                                // any cross-op GPU pipelining. Drop it;
-                                // hipMemcpy waits as needed. Phase 9b.
+                                // Pick up the GGML CUDA compute stream so all
+                                // host↔device transfers below are stream-ordered
+                                // with the kernels that produce / consume them.
+                                // GGML creates compute streams with
+                                // cudaStreamNonBlocking (common.cuh:1439), so a
+                                // synchronous hipMemcpy on the default stream
+                                // does NOT serialize with them — that race window
+                                // produced near-null GPU faults during MoE
+                                // prefill (MAD-230). nullptr falls back to
+                                // legacy sync behaviour for safety, but a
+                                // properly-initialised cuda backend always
+                                // provides the stream.
+                                hipStream_t wp_stream =
+                                    (hipStream_t) ggml_cuda_get_wp_compute_stream();
+
+                                // MAD-230 follow-up: periodic compute-stream
+                                // drain so the GPU's command processor can
+                                // schedule graphics-ring frames between MoE
+                                // bursts. Without this, decode on a fast MoE
+                                // model (gpt-oss-20b at 70-80 t/s → ~5500 MoE
+                                // ops/sec) saturates the compute ring densely
+                                // enough that the graphics ring times out on
+                                // a display-attached GPU (MODE1 reset → system
+                                // restart). Yielding every N MoE ops creates
+                                // frame-rate-equivalent windows for the
+                                // compositor without significantly impacting
+                                // throughput (stream sync is bounded to this
+                                // stream, not device-wide). Tunable via
+                                // WP_YIELD_EVERY_N_OPS; 0 disables.
+                                static const int s_yield_every = []() {
+                                    const char * env = std::getenv("WP_YIELD_EVERY_N_OPS");
+                                    if (env == nullptr) return 32;
+                                    char * end = nullptr;
+                                    long v = std::strtol(env, &end, 10);
+                                    return (end != env && v >= 0) ? (int) v : 32;
+                                }();
+                                static thread_local int s_yield_ctr = 0;
+                                if (wp_stream != nullptr && s_yield_every > 0) {
+                                    if (++s_yield_ctr >= s_yield_every) {
+                                        s_yield_ctr = 0;
+                                        hipStreamSynchronize(wp_stream);
+                                    }
+                                }
+
+                                // Read indices to host. Stream-ordered async
+                                // D2H + stream sync waits for the router-output
+                                // kernel that produced idx_tensor->data without
+                                // a device-wide stall. (sync hipMemcpy on the
+                                // default stream is NOT a sufficient barrier
+                                // against a non-blocking compute stream — see
+                                // above.)
                                 const int64_t n_indices = ggml_nelements(idx_tensor);
                                 std::vector<int32_t> host_indices((size_t) n_indices, 0);
 
-                                hipError_t mc_err = hipMemcpy(host_indices.data(),
-                                                              idx_tensor->data,
-                                                              (size_t) n_indices * sizeof(int32_t),
-                                                              hipMemcpyDeviceToHost);
+                                hipError_t mc_err;
+                                if (wp_stream != nullptr) {
+                                    mc_err = hipMemcpyAsync(host_indices.data(),
+                                                            idx_tensor->data,
+                                                            (size_t) n_indices * sizeof(int32_t),
+                                                            hipMemcpyDeviceToHost,
+                                                            wp_stream);
+                                    if (mc_err == hipSuccess) {
+                                        mc_err = hipStreamSynchronize(wp_stream);
+                                    }
+                                } else {
+                                    mc_err = hipMemcpy(host_indices.data(),
+                                                       idx_tensor->data,
+                                                       (size_t) n_indices * sizeof(int32_t),
+                                                       hipMemcpyDeviceToHost);
+                                }
                                 if (mc_err == hipSuccess) {
                                     // Build active expert set first so we can
                                     // pipeline the page-ins. (MAD-88 Phase 9c.)
@@ -192,22 +247,40 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                     }
 
-                                    // Synchronize compute before we overwrite
-                                    // s_dev_expert_ptrs — it's a STATIC buffer
-                                    // shared by every MoE op in this forward
-                                    // pass. The previous op's kernel may still
-                                    // be running on the compute stream and
-                                    // reading from this same array. Without
-                                    // the sync, the new op's hipMemcpy can
-                                    // race and corrupt the old kernel's read,
-                                    // producing near-null pointer faults.
-                                    // This is the trade-off for the perf win
-                                    // of pre-allocating one device buffer once.
-                                    hipDeviceSynchronize();
-                                    hipMemcpy(s_dev_expert_ptrs,
-                                              host_ptrs.data(),
-                                              (size_t) n_subs * sizeof(const void *),
-                                              hipMemcpyHostToDevice);
+                                    // Write the per-expert pointer array via
+                                    // stream-ordered async H2D. s_dev_expert_ptrs
+                                    // is a STATIC buffer shared by every MoE op
+                                    // in this forward pass, but stream ordering
+                                    // makes that safe: on this same compute
+                                    // stream, the previous MMQ kernel's read
+                                    // completes before this memcpy executes,
+                                    // and the next MMQ kernel's read happens
+                                    // after this memcpy completes. No device-
+                                    // wide sync (previously hipDeviceSynchronize)
+                                    // and no torn-pointer race (the previous
+                                    // sync-on-default-stream design had one;
+                                    // MAD-230). For pageable host memory,
+                                    // hipMemcpyAsync H2D does an internal
+                                    // staging copy before returning, so
+                                    // host_ptrs going out of scope at end of
+                                    // eval_cb is safe.
+                                    if (wp_stream != nullptr) {
+                                        hipMemcpyAsync(s_dev_expert_ptrs,
+                                                       host_ptrs.data(),
+                                                       (size_t) n_subs * sizeof(const void *),
+                                                       hipMemcpyHostToDevice,
+                                                       wp_stream);
+                                    } else {
+                                        // Legacy fallback if the cuda backend
+                                        // didn't publish a stream (shouldn't
+                                        // happen with a properly initialised
+                                        // GGML CUDA backend).
+                                        hipDeviceSynchronize();
+                                        hipMemcpy(s_dev_expert_ptrs,
+                                                  host_ptrs.data(),
+                                                  (size_t) n_subs * sizeof(const void *),
+                                                  hipMemcpyHostToDevice);
+                                    }
                                     ggml_cuda_set_routed_expert_ptrs(s_dev_expert_ptrs);
 
                                     if (g_debug.mmid_consolidated <= 4) {
@@ -281,6 +354,31 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     int  page_indices[GGML_MAX_SRC];
     int  n_page_indices = 0;
     int  highest_page   = -1;
+
+    // DIAGNOSTIC (MAD-230 MoE near-null fault hunt): catch any src with
+    // a sentinel-shaped data pointer (gallocr's (char*)1 + view_offs).
+    // If a view of a paged consolidated parent reaches this op without
+    // being patched, its data lives at 0x1 + view_offs → near-null fault
+    // on kernel read. Log it BEFORE the standard skip path so we see it.
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        struct ggml_tensor * src = t->src[i];
+        if (src == nullptr) break;
+        const uintptr_t data_addr = (uintptr_t) src->data;
+        if (data_addr != 0 && data_addr < 0x10000000ULL) {
+            const char * vsrc_name = src->view_src ? ggml_get_name(src->view_src) : "(none)";
+            int psrc_page  = pager->find_page(ggml_get_name(src));
+            int psrc_vpage = src->view_src ? pager->find_page(vsrc_name) : -1;
+            LLAMA_LOG_WARN("[wp::eval_cb][LOW_ADDR_DATA] op=%s op_name=\"%s\" src[%d]=\"%s\" "
+                           "data=0x%lx view_offs=%zu view_src=\"%s\" "
+                           "src_page=%d view_src_page=%d (consolidated? src=%d vsrc=%d)\n",
+                           ggml_op_name(t->op), ggml_get_name(t), i, ggml_get_name(src),
+                           (unsigned long) data_addr, src->view_offs, vsrc_name,
+                           psrc_page, psrc_vpage,
+                           (psrc_page  >= 0 ? (int) pager->page_meta(psrc_page).is_consolidated  : -1),
+                           (psrc_vpage >= 0 ? (int) pager->page_meta(psrc_vpage).is_consolidated : -1));
+            std::fflush(stderr);
+        }
+    }
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         struct ggml_tensor * src = t->src[i];

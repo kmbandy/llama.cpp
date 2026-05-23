@@ -5,6 +5,8 @@
 #include "ggml-cuda.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 #if defined(GGML_USE_HIP)
@@ -1436,7 +1438,30 @@ struct ggml_backend_cuda_context {
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            // MAD-230 follow-up: opt-in stream priority. On display-attached
+            // GPUs under heavy compute (e.g. MoE decode via weight paging),
+            // high-priority compute streams can starve the graphics ring and
+            // wedge the compositor. Setting LOW priority lets AMD's HSA
+            // scheduler interleave graphics frames more readily. Default
+            // unchanged (regular non-priority stream) so non-display compute
+            // setups see no behaviour change. Set GGML_CUDA_STREAM_PRIORITY=low
+            // on display-attached GPU rigs to opt in; =high for the opposite.
+            static const int s_priority_pref = []() {
+                const char * env = std::getenv("GGML_CUDA_STREAM_PRIORITY");
+                if (env == nullptr) return 0;
+                if (std::strcmp(env, "low")  == 0) return -1;
+                if (std::strcmp(env, "high") == 0) return  1;
+                return 0;
+            }();
+            if (s_priority_pref != 0) {
+                int least = 0, greatest = 0;
+                cudaDeviceGetStreamPriorityRange(&least, &greatest);
+                // CUDA/HIP convention: lower numeric value = higher priority.
+                const int prio = (s_priority_pref < 0) ? least : greatest;
+                CUDA_CHECK(cudaStreamCreateWithPriority(&streams[device][stream], cudaStreamNonBlocking, prio));
+            } else {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
+            }
         }
         return streams[device][stream];
     }

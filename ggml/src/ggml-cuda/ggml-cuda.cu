@@ -4697,6 +4697,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // MAD-230: publish the compute stream to the weight-pager eval_cb
+    // side channel so its hipMemcpyAsync(stream) for the expert-pointer
+    // array is correctly stream-ordered with the MMQ kernels that read
+    // it. The eval_cb fires before each op compute, so the stream must
+    // be set before we enter the per-op loop below.
+    ggml_cuda_set_wp_compute_stream((void *) cuda_ctx->stream());
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;

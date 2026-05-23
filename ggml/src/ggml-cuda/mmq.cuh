@@ -4225,3 +4225,14 @@ void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr)
 const void * const *  ggml_cuda_take_routed_expert_ptrs();
 bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
 
+// MAD-230: expose the CUDA backend's compute stream to libllama (weight
+// pager eval_cb) so it can use hipMemcpyAsync(stream) instead of a
+// synchronous default-stream hipMemcpy. The non-blocking compute stream
+// doesn't auto-serialize with the default stream, which produced
+// torn-pointer races on the expert_ptrs array. Stream is set by
+// ggml_backend_cuda_graph_compute at the top of each graph compute.
+// void * carries cudaStream_t (opaque) without polluting the header
+// with cuda types.
+void   ggml_cuda_set_wp_compute_stream(void * stream);
+void * ggml_cuda_get_wp_compute_stream();
+

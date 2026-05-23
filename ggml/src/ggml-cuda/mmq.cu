@@ -20,6 +20,19 @@ namespace {
 // MUL_MAT (no MoE) op uses the default nullptr (legacy path,
 // bit-identical to pre-MAD-88).
 thread_local const void * const * tls_routed_expert_ptrs = nullptr;
+
+// MAD-230 follow-up: GGML's CUDA streams are created with
+// cudaStreamNonBlocking (common.cuh:1439), so they do NOT implicitly
+// serialize with the default (NULL) stream that a synchronous hipMemcpy
+// uses. Without this side channel, the weight pager's eval_cb has to
+// hipDeviceSynchronize() to flush the compute stream before each
+// host→device write of the expert-pointer array — a heavy per-MoE-op
+// stall — and even then there's a torn-pointer race window that produced
+// the near-null GPU faults during MoE prefill. Exposing the compute
+// stream to the eval_cb lets it use hipMemcpyAsync(stream), which is
+// stream-ordered with the MMQ kernels and removes both the race and
+// the device-wide sync.
+thread_local void * tls_wp_compute_stream = nullptr;
 }  // namespace
 
 void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr) {
@@ -37,6 +50,14 @@ bool ggml_cuda_has_routed_expert_ptrs() {
     // whether to bypass kernel paths (mmvq, mmvf, mmf) that don't support
     // routing-aware paging and force the MMQ path which does.
     return tls_routed_expert_ptrs != nullptr;
+}
+
+void ggml_cuda_set_wp_compute_stream(void * stream) {
+    tls_wp_compute_stream = stream;
+}
+
+void * ggml_cuda_get_wp_compute_stream() {
+    return tls_wp_compute_stream;
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {

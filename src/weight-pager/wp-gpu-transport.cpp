@@ -117,43 +117,63 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     hipStream_t s  = (hipStream_t) stream_;
     hipError_t  err;
 
-    // Synchronous hipMemcpy: blocks until done, runs on device's default
-    // stream which synchronises with all other streams on that device.
-    // This sidesteps the stream-ordering trap where an async H2D on a
-    // separate stream could race ggml-cuda's compute kernels reading
-    // from the same VRAM slot. Phase 1e may revisit with proper
-    // hipStreamWaitEvent ordering once correctness is locked.
-    (void) s;  // unused for sync path
-    err = hipMemcpy(dst, src_pinned, payload_size, hipMemcpyHostToDevice);
+    // MAD-230 follow-up: use async memcpy + memset on this transport's own
+    // stream, then synchronize that stream at the end to preserve the
+    // "data is in VRAM on return" contract page_in_sync_ relies on. The
+    // previous implementation used synchronous hipMemcpy on the default
+    // stream, which on AMD HIP does NOT auto-serialize with GGML's
+    // non-blocking compute stream (common.cuh:1439). That created a
+    // torn-write race against MMQ kernels reading the same slot AND
+    // contributed to compute/graphics ring scheduling pressure that
+    // wedged the display GPU under MoE-decode load. Stream-scoped sync
+    // is bounded to this stream's work, doesn't stall the device, and
+    // keeps the host blocked only as long as the actual transfer takes.
+    err = hipMemcpyAsync(dst, src_pinned, payload_size, hipMemcpyHostToDevice, s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemcpy failed: %s\n",
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemcpyAsync failed: %s\n",
                        hipGetErrorString(err));
         hipSetDevice(prev_device);
         return -1;
     }
 
     if (slot_size > payload_size) {
-        err = hipMemset((char *) dst + payload_size, 0,
-                        slot_size - payload_size);
+        err = hipMemsetAsync((char *) dst + payload_size, 0,
+                             slot_size - payload_size, s);
         if (err != hipSuccess) {
-            LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemset (padding) failed: %s\n",
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemsetAsync (padding) failed: %s\n",
                            hipGetErrorString(err));
             // Best-effort: don't fail the whole call.
         }
     }
 
-    // The copy is already complete (sync). We still hand back a recyclable
-    // event for API consistency with the (future) async path. The event is
-    // recorded on the per-thread stream so query() / synchronize() against
-    // it always returns true immediately, since nothing is queued before it.
+    // Record the completion event on the transport stream BEFORE we
+    // synchronize so a future async-aware caller can hipStreamWaitEvent
+    // on it from another stream (e.g., have the GGML compute stream wait
+    // on the transport event instead of blocking the CPU). For now
+    // page_in_sync_ uses the simpler model: we sync here and the caller
+    // immediately release_event()s the handle. Phase 1e can flip this
+    // to truly pipelined behaviour without changing this function's
+    // signature.
     int evt_idx = free_events_.back();
     free_events_.pop_back();
     hipEvent_t ev = (hipEvent_t) events_[evt_idx];
-    err = hipEventRecord(ev, hipStreamPerThread);
+    err = hipEventRecord(ev, s);
     if (err != hipSuccess) {
-        // Non-fatal — the data is already on VRAM; just log.
         LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipEventRecord failed: %s\n",
                        hipGetErrorString(err));
+        // Continue — we still need to sync to preserve the in-VRAM-on-return
+        // contract; the event is just a handle for future async wiring.
+    }
+
+    // Preserve the "data is in VRAM when this returns" contract that
+    // page_in_sync_ relies on. Stream-scoped — does NOT stall other
+    // streams (compute, graphics) on the device.
+    err = hipStreamSynchronize(s);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipStreamSynchronize failed: %s\n",
+                       hipGetErrorString(err));
+        hipSetDevice(prev_device);
+        return -1;
     }
 
     hipSetDevice(prev_device);
