@@ -157,6 +157,10 @@ def gptq_quantize_linear(layer: nn.Linear, H: torch.Tensor,
     W = layer.weight.data.float().to(dev).clone()  # [rows, in_features]
     out_rows, in_features = W.shape
 
+    # Save undamped H for the post-quant Y_SNR metric (the damping is for
+    # numerical stability; it's not part of the actual reconstruction loss).
+    H_orig = H.clone()
+
     # Damping — needed for numerical stability in Cholesky
     damp = percdamp * torch.mean(torch.diag(H))
     diag_idx = torch.arange(in_features, device=dev)
@@ -192,22 +196,34 @@ def gptq_quantize_linear(layer: nn.Linear, H: torch.Tensor,
             # Vectorized: err [rows, 1] * Hinv_chol[col, col+1:] [in_features - col - 1]
             W[:, col+1:] -= err * Hinv_chol[col, col+1:].unsqueeze(0)
 
-    # Reconstruction quality (before in-place replacement).
-    # SNR_dB = 10 * log10(signal_power / noise_power). Higher is better.
-    # 4-bit centroid quant typically targets >20 dB for good preservation.
+    # Reconstruction quality. TWO metrics:
+    #   - W_SNR: element-wise weight reconstruction. What naive snap optimizes.
+    #   - Y_SNR: output-space reconstruction weighted by H. What GPTQ optimizes.
+    # Y_SNR is the one that matters for inference quality (it measures how
+    # close the layer's OUTPUT activations are to the original layer's).
+    # Per the diagnose_calibration.py findings, MSE+GPTQ should give Y_SNR
+    # >25 dB on Qwen-class MLP linears.
     import math
     orig = layer.weight.data.float().to(dev)
-    mse = (orig - Q).pow(2).mean().item()
-    signal_power = orig.pow(2).mean().clamp_min(1e-30).item()
-    snr_db = 10.0 * math.log10(signal_power / max(mse, 1e-30))
-    rel_err = (mse / signal_power) ** 0.5  # normalized RMSE (signal-rms-relative)
+    diff = orig - Q
+    # Element-wise
+    mse = diff.pow(2).mean().item()
+    sig_w = orig.pow(2).mean().clamp_min(1e-30).item()
+    w_snr_db = 10.0 * math.log10(sig_w / max(mse, 1e-30))
+    # Output-space (use H_orig — undamped — so we measure actual reconstruction
+    # loss, not the regularized one we used during Cholesky).
+    err_y = (diff @ H_orig @ diff.t()).diagonal().sum().item()
+    sig_y = (orig @ H_orig @ orig.t()).diagonal().sum().clamp_min(1e-30).item()
+    y_snr_db = 10.0 * math.log10(sig_y / max(err_y, 1e-30))
+    rel_err = (mse / sig_w) ** 0.5
 
     # Replace weights so the next layer's calibration sees quantized output
     layer.weight.data.copy_(Q.to(layer.weight.dtype))
 
     export = quantizer.export()
     export["mse"] = mse
-    export["snr_db"] = snr_db
+    export["w_snr_db"] = w_snr_db
+    export["y_snr_db"] = y_snr_db
     export["rel_err"] = rel_err
     return export
 
@@ -224,7 +240,14 @@ def main():
     p.add_argument("--percdamp", type=float, default=0.01)
     p.add_argument("--n-centroids", type=int, default=16)
     p.add_argument("--n-iter", type=int, default=25)
-    p.add_argument("--fit-loss", choices=("mse", "mag_weighted"), default="mag_weighted")
+    # DEFAULT FIT_LOSS: MSE for weights (not mag_weighted).
+    # The MAD-214 winner `mag_weighted p=5` was fit on KV-CACHE ACTIVATIONS,
+    # which have heavy outliers. Weights are roughly Gaussian centered at zero
+    # — mag_weighted p=5 pushes centroids to empty tails and starves the
+    # dense center. Diagnosed via scripts/calibration/diagnose_calibration.py:
+    # for Qwen3.5-4B layer 0 mlp.gate_proj, MSE gave 27.67 dB output-SNR vs
+    # mag_p5's 17.01 dB. 10 dB difference.
+    p.add_argument("--fit-loss", choices=("mse", "mag_weighted"), default="mse")
     p.add_argument("--mag-weight-p", type=float, default=5.0)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
@@ -289,14 +312,15 @@ def main():
             "indices": export["indices"].cpu(),
             "centroids_per_group": export["centroids_per_group"].cpu(),
             "mse": export["mse"],
-            "snr_db": export["snr_db"],
+            "w_snr_db": export["w_snr_db"],
+            "y_snr_db": export["y_snr_db"],
             "rel_err": export["rel_err"],
         }, out_path)
 
         print(f"  saved: {out_path.name}  "
               f"groups={export['centroids_per_group'].shape[0]}  "
-              f"SNR={export['snr_db']:.1f}dB  "
-              f"rel_err={export['rel_err']:.3%}  "
+              f"Y_SNR={export['y_snr_db']:.1f}dB  "
+              f"W_SNR={export['w_snr_db']:.1f}dB  "
               f"t_quant={t_quant:.1f}s")
 
         manifest["results"].append({
@@ -304,7 +328,8 @@ def main():
             "shape": [rows, in_feat],
             "n_groups": int(export["centroids_per_group"].shape[0]),
             "mse": float(export["mse"]),
-            "snr_db": float(export["snr_db"]),
+            "w_snr_db": float(export["w_snr_db"]),
+            "y_snr_db": float(export["y_snr_db"]),
             "rel_err": float(export["rel_err"]),
             "t_hess_s": float(t_hess),
             "t_quant_s": float(t_quant),
