@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -228,6 +229,55 @@ def gptq_quantize_linear(layer: nn.Linear, H: torch.Tensor,
     return export
 
 
+# ───────────────────────────── PPL eval ─────────────────────────────────────
+
+@torch.no_grad()
+def eval_ppl_wikitext(model, tokenizer, dev: str, seq_len: int = 2048,
+                     stride: int = 1024, max_tokens: int | None = None) -> dict:
+    """Compute wikitext-2 test-split PPL via sliding-window evaluation.
+
+    Standard pattern (matches HF eval + llama.cpp --perplexity):
+      1. Concatenate all test text, tokenize once
+      2. Slide a window of seq_len with overlap (stride)
+      3. Compute next-token CE loss on the non-overlapping tail
+      4. PPL = exp(mean(loss))
+    """
+    from datasets import load_dataset
+    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    text = "\n\n".join(r["text"] for r in ds if r["text"].strip())
+    enc = tokenizer(text, return_tensors="pt")
+    ids = enc.input_ids.to(dev)
+    n_tokens = ids.shape[1]
+    if max_tokens is not None:
+        n_tokens = min(n_tokens, max_tokens)
+        ids = ids[:, :n_tokens]
+    print(f"  [ppl] {n_tokens} tokens, window={seq_len} stride={stride}")
+
+    nll_sum = 0.0
+    n_pred = 0
+    prev_end = 0
+    for begin in range(0, n_tokens, stride):
+        end = min(begin + seq_len, n_tokens)
+        target_len = end - prev_end
+        input_ids = ids[:, begin:end]
+        target_ids = input_ids.clone()
+        # Mask out the overlap tokens (already scored)
+        target_ids[:, :-target_len] = -100
+        outputs = model(input_ids, labels=target_ids)
+        # outputs.loss is mean over unmasked tokens
+        # Re-compute: nll_sum gets total CE, normalize at end
+        n_unmasked = (target_ids != -100).sum().item()
+        nll_sum += outputs.loss.item() * n_unmasked
+        n_pred += n_unmasked
+        prev_end = end
+        if end >= n_tokens:
+            break
+
+    avg_nll = nll_sum / max(n_pred, 1)
+    ppl = math.exp(avg_nll)
+    return {"ppl": ppl, "avg_nll": avg_nll, "n_tokens_scored": n_pred}
+
+
 # ───────────────────────────── Driver ───────────────────────────────────────
 
 def main():
@@ -253,6 +303,11 @@ def main():
     p.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     p.add_argument("--max-layers", type=int, default=None,
                    help="Limit to first N transformer layers (fast iteration)")
+    p.add_argument("--eval-ppl", action="store_true",
+                   help="Compute wikitext-2 test-split PPL before and after "
+                        "quantization. Reports Δ_PPL vs f16 baseline.")
+    p.add_argument("--ppl-max-tokens", type=int, default=None,
+                   help="Cap PPL eval tokens (default: full test split ~280k).")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -275,6 +330,15 @@ def main():
     print(f"[targets] {len(targets)} linears to quantize")
 
     manifest = {"model": args.model, "args": vars(args), "results": []}
+
+    # Baseline PPL on the f16 model BEFORE any quantization
+    if args.eval_ppl:
+        print(f"\n[ppl-baseline] computing f16 baseline PPL...")
+        baseline = eval_ppl_wikitext(model, tokenizer, args.device,
+                                      max_tokens=args.ppl_max_tokens)
+        print(f"  baseline PPL = {baseline['ppl']:.4f}  "
+              f"(n_tokens={baseline['n_tokens_scored']})")
+        manifest["ppl_baseline"] = baseline
 
     for i, (name, layer) in enumerate(targets):
         t0 = time.time()
@@ -338,6 +402,23 @@ def main():
         del H, q
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
+
+    # Post-quantization PPL on the in-place modified model
+    if args.eval_ppl:
+        print(f"\n[ppl-quant] computing quantized PPL...")
+        quantized = eval_ppl_wikitext(model, tokenizer, args.device,
+                                       max_tokens=args.ppl_max_tokens)
+        print(f"  quantized PPL = {quantized['ppl']:.4f}")
+        manifest["ppl_quantized"] = quantized
+        delta = quantized["ppl"] - manifest["ppl_baseline"]["ppl"]
+        manifest["ppl_delta"] = delta
+        print(f"\n  Δ_PPL = {delta:+.4f}  "
+              f"({delta / manifest['ppl_baseline']['ppl'] * 100:+.2f}%)")
+        # MAD-223 gate: <0.08 PPL → proceed without AWQ phase B.5
+        if delta < 0.08:
+            print(f"  ✓ Δ_PPL < 0.08 — MAD-223 gate PASSED (AWQ phase B.5 not needed)")
+        else:
+            print(f"  ⚠ Δ_PPL ≥ 0.08 — MAD-223 gate triggers AWQ phase B.5 consideration")
 
     manifest_path = Path(args.output_dir) / "manifest.json"
     with open(manifest_path, "w") as f:
