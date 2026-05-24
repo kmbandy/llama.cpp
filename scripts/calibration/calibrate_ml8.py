@@ -373,8 +373,12 @@ def main():
             "shape": [rows, in_feat],
             "group_size": args.group_size,
             "n_centroids": args.n_centroids,
-            "indices": export["indices"].cpu(),
-            "centroids_per_group": export["centroids_per_group"].cpu(),
+            # Reconstruction:
+            #   W[r, c] = centroids_per_group[c // group_size][indices[r, c]]
+            #          * scale_per_group[r, c // group_size]
+            "indices": export["indices"].cpu(),                    # [rows, in_features] int8 (values 0..15)
+            "centroids_per_group": export["centroids_per_group"].cpu(),  # [n_groups, n_centroids] fp32
+            "scale_per_group": export["scale_per_group"].cpu(),    # [rows, n_groups] fp32
             "mse": export["mse"],
             "w_snr_db": export["w_snr_db"],
             "y_snr_db": export["y_snr_db"],

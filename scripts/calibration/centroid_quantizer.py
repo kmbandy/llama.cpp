@@ -60,6 +60,10 @@ class CentroidQuantizer(nn.Module):
         self.per_column_indices: list[torch.Tensor] = []
         # Per-group centroid LUTs (one per find_params() call):
         self.collected_centroids: list[torch.Tensor] = []
+        # Per-group per-row scales (one [rows, 1] per find_params() call).
+        # Required to reconstruct the quantized weight from saved indices+centroids:
+        #   W_reconstructed[r, c] = centroids[group_of(c)][indices[r, c]] * scales[r, group_of(c)]
+        self.collected_scales: list[torch.Tensor] = []
         # For auto-gptq compatibility — it checks .maxq > 0 in enabled() and
         # all(scale != 0) in ready().
         self.register_buffer("maxq", torch.tensor(self.n_centroids - 1))
@@ -125,8 +129,9 @@ class CentroidQuantizer(nn.Module):
         # group. Centroid quant has no zero-point offset; expose a zero-filled
         # tensor of matching shape so the collection logic doesn't choke.
         self.zero = torch.zeros_like(self.scale)
-        # Stash this group's LUT for export.
+        # Stash this group's LUT and per-row scale for export.
         self.collected_centroids.append(self.centroids.detach().clone())
+        self.collected_scales.append(self.scale.detach().clone())  # [rows, 1]
 
     def quantize(self, x: torch.Tensor) -> torch.Tensor:
         """Snap each value in x to nearest centroid*scale. Stores indices.
@@ -172,9 +177,12 @@ class CentroidQuantizer(nn.Module):
             raise RuntimeError("no quantize() calls captured; did fasterquant run?")
         indices = torch.cat(self.per_column_indices, dim=1)  # [rows, in_features]
         centroids = torch.stack(self.collected_centroids, dim=0)  # [n_groups, n_centroids]
+        # scales: [rows, n_groups]. Cat list of [rows, 1] tensors along dim=1.
+        scales = torch.cat(self.collected_scales, dim=1)
         return {
             "indices": indices,
             "centroids_per_group": centroids,
+            "scale_per_group": scales,
         }
 
     def reset_capture(self):
@@ -182,6 +190,7 @@ class CentroidQuantizer(nn.Module):
         the next layer."""
         self.per_column_indices.clear()
         self.collected_centroids.clear()
+        self.collected_scales.clear()
         self.last_indices = None
         self.centroids = None
         self.scale = None
