@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""calibrate_ml8.py — drive CentroidQuantizer through a HF model via a minimal GPTQ loop.
+
+MAD-223 Phase B.2.
+
+Replaces auto-gptq (which doesn't install on Python 3.14) with a self-contained
+GPTQ implementation. The hard part — Lloyd-Max centroid fitting — is in
+CentroidQuantizer; this driver provides:
+
+  1. Calibration data collection (wikitext-2 via HF datasets)
+  2. Per-layer Hessian accumulation via forward hooks
+  3. Per-column GPTQ snap + error propagation loop
+  4. In-place weight replacement so subsequent layers calibrate against
+     the QUANTIZED activations from prior layers (matches auto-gptq pattern)
+  5. Per-linear save (indices + centroids per group) + manifest
+
+Usage:
+    python3 scripts/calibration/calibrate_ml8.py \\
+        --model Qwen/Qwen3.5-4B \\
+        --output-dir /tmp/ml8-qwen3-4b \\
+        --n-samples 64 \\
+        --seq-len 2048 \\
+        --group-size 128 \\
+        --max-layers 1   # MVP: validate pipeline on first layer
+
+Algorithm sketch (per linear with weight W [rows, in_features] and Hessian H):
+    H = (1/N) sum_i x_i x_i^T     # in_features x in_features
+    H += damp * mean(diag(H)) * I
+    L_inv = cholesky(H^-1, upper=True)
+    for col in range(in_features):
+        if col % group_size == 0:
+            quantizer.find_params(W[:, col:col+group_size])
+        q = quantizer.quantize(W[:, col:col+1])
+        err = (W[:, col:col+1] - q) / L_inv[col, col]
+        W[:, col+1:] -= err * L_inv[col, col+1:]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import torch
+from torch import nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Make centroid_quantizer importable
+sys.path.insert(0, str(Path(__file__).parent))
+from centroid_quantizer import CentroidQuantizer  # noqa: E402
+
+
+# ───────────────────────────── Calibration data ─────────────────────────────
+
+def collect_wikitext_calibration(tokenizer, n_samples: int = 64, seq_len: int = 2048,
+                                  dataset_name: str = "Salesforce/wikitext",
+                                  config: str = "wikitext-2-raw-v1") -> list[torch.Tensor]:
+    """Return list of input_ids tensors, each [1, seq_len]."""
+    from datasets import load_dataset
+    ds = load_dataset(dataset_name, config, split="train")
+    samples = []
+    for row in ds:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        ids = tokenizer(text, return_tensors="pt", truncation=True,
+                       max_length=seq_len).input_ids
+        # Skip very short samples — calibration quality hurts
+        if ids.shape[1] < seq_len // 4:
+            continue
+        samples.append(ids)
+        if len(samples) >= n_samples:
+            break
+    return samples
+
+
+# ───────────────────────────── Target selection ─────────────────────────────
+
+def find_target_linears(model):
+    """Yield (name, module) for each Linear we want to quantize.
+
+    For Qwen-class dense models, this is the MLP linears per transformer layer:
+    mlp.gate_proj, mlp.up_proj, mlp.down_proj. Attention projections are
+    skipped for tonight's MVP (they're a smaller fraction of weights and have
+    different sensitivity).
+    """
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        if any(k in name for k in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
+            yield name, mod
+
+
+def filter_by_layer_limit(targets, max_layers: int | None):
+    if max_layers is None:
+        return targets
+    keep = []
+    for name, mod in targets:
+        for i in range(max_layers):
+            # Match ".layers.<i>." with bounded digits
+            tag = f".layers.{i}."
+            if tag in name:
+                keep.append((name, mod))
+                break
+    return keep
+
+
+# ───────────────────────────── Hessian collection ───────────────────────────
+
+@torch.no_grad()
+def compute_hessian(layer: nn.Linear, calibration_ids: list[torch.Tensor],
+                    model, dev: str) -> tuple[torch.Tensor, int]:
+    """Collect H = (1/N) sum X X^T (in_features x in_features) for `layer`."""
+    H_acc = None
+    n_total = 0
+
+    def hook(module, inputs, output):
+        nonlocal H_acc, n_total
+        x = inputs[0].detach()
+        x = x.reshape(-1, x.shape[-1]).float()  # [N, in_features]
+        XtX = x.t() @ x
+        if H_acc is None:
+            H_acc = XtX
+        else:
+            H_acc += XtX
+        n_total += x.shape[0]
+
+    h = layer.register_forward_hook(hook)
+    try:
+        for ids in calibration_ids:
+            model(ids.to(dev))
+    finally:
+        h.remove()
+
+    if H_acc is None:
+        raise RuntimeError(f"No activations collected for {layer}")
+    return H_acc / max(n_total, 1), n_total
+
+
+# ───────────────────────────── GPTQ loop ────────────────────────────────────
+
+@torch.no_grad()
+def gptq_quantize_linear(layer: nn.Linear, H: torch.Tensor,
+                         quantizer: CentroidQuantizer,
+                         group_size: int = 128,
+                         percdamp: float = 0.01) -> dict:
+    """Quantize `layer.weight` in-place using the GPTQ algorithm.
+
+    Returns the quantizer's export dict (indices + centroids_per_group).
+    `layer.weight.data` is replaced with the dequantized values so subsequent
+    layers see the post-quantization output.
+    """
+    dev = H.device
+    W = layer.weight.data.float().to(dev).clone()  # [rows, in_features]
+    out_rows, in_features = W.shape
+
+    # Damping — needed for numerical stability in Cholesky
+    damp = percdamp * torch.mean(torch.diag(H))
+    diag_idx = torch.arange(in_features, device=dev)
+    H[diag_idx, diag_idx] += damp
+
+    # Cholesky of H^-1 (upper triangular). This is the standard GPTQ
+    # decomposition for triangular error propagation.
+    try:
+        L_lower = torch.linalg.cholesky(H)
+        H_inv = torch.cholesky_inverse(L_lower)
+        Hinv_chol = torch.linalg.cholesky(H_inv, upper=True)  # upper triangular
+    except RuntimeError as e:
+        raise RuntimeError(f"Cholesky failed (try higher percdamp): {e}") from e
+
+    quantizer.reset_capture()
+    Q = torch.zeros_like(W)
+
+    for col in range(in_features):
+        # Fit centroids at each group boundary
+        if col % group_size == 0:
+            g_end = min(col + group_size, in_features)
+            quantizer.set_group_offset(col)
+            quantizer.find_params(W[:, col:g_end])
+
+        w = W[:, col:col+1]                   # [rows, 1]
+        d = Hinv_chol[col, col]
+        q = quantizer.quantize(w)             # [rows, 1] dequantized
+        Q[:, col:col+1] = q
+
+        # GPTQ error propagation
+        err = (w - q) / d
+        if col + 1 < in_features:
+            # Vectorized: err [rows, 1] * Hinv_chol[col, col+1:] [in_features - col - 1]
+            W[:, col+1:] -= err * Hinv_chol[col, col+1:].unsqueeze(0)
+
+    # Reconstruction quality (before in-place replacement).
+    # SNR_dB = 10 * log10(signal_power / noise_power). Higher is better.
+    # 4-bit centroid quant typically targets >20 dB for good preservation.
+    import math
+    orig = layer.weight.data.float().to(dev)
+    mse = (orig - Q).pow(2).mean().item()
+    signal_power = orig.pow(2).mean().clamp_min(1e-30).item()
+    snr_db = 10.0 * math.log10(signal_power / max(mse, 1e-30))
+    rel_err = (mse / signal_power) ** 0.5  # normalized RMSE (signal-rms-relative)
+
+    # Replace weights so the next layer's calibration sees quantized output
+    layer.weight.data.copy_(Q.to(layer.weight.dtype))
+
+    export = quantizer.export()
+    export["mse"] = mse
+    export["snr_db"] = snr_db
+    export["rel_err"] = rel_err
+    return export
+
+
+# ───────────────────────────── Driver ───────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--n-samples", type=int, default=64)
+    p.add_argument("--seq-len", type=int, default=2048)
+    p.add_argument("--group-size", type=int, default=128)
+    p.add_argument("--percdamp", type=float, default=0.01)
+    p.add_argument("--n-centroids", type=int, default=16)
+    p.add_argument("--n-iter", type=int, default=25)
+    p.add_argument("--fit-loss", choices=("mse", "mag_weighted"), default="mag_weighted")
+    p.add_argument("--mag-weight-p", type=float, default=5.0)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    p.add_argument("--max-layers", type=int, default=None,
+                   help="Limit to first N transformer layers (fast iteration)")
+    args = p.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
+
+    print(f"[load] {args.model}  dtype={dtype}  device={args.device}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    model = model.to(args.device).eval()
+
+    print(f"[calib] loading {args.n_samples} samples seq_len={args.seq_len}")
+    calib = collect_wikitext_calibration(tokenizer, n_samples=args.n_samples,
+                                          seq_len=args.seq_len)
+    print(f"[calib] got {len(calib)} samples "
+          f"(tokens total ≈ {sum(c.numel() for c in calib)})")
+
+    targets = list(find_target_linears(model))
+    targets = filter_by_layer_limit(targets, args.max_layers)
+    print(f"[targets] {len(targets)} linears to quantize")
+
+    manifest = {"model": args.model, "args": vars(args), "results": []}
+
+    for i, (name, layer) in enumerate(targets):
+        t0 = time.time()
+        rows, in_feat = layer.weight.shape
+        print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
+
+        H, n_tok = compute_hessian(layer, calib, model, args.device)
+        t_hess = time.time() - t0
+        print(f"  hessian: {H.shape}, "
+              f"diag_mean={H.diag().mean().item():.4g}, "
+              f"n_tok={n_tok}, t={t_hess:.1f}s")
+
+        q = CentroidQuantizer(n_centroids=args.n_centroids,
+                              n_iter=args.n_iter).to(args.device)
+        q.configure(bits=4, sym=True,
+                   fit_loss=args.fit_loss,
+                   mag_weight_p=args.mag_weight_p)
+        q.hessian_diag = torch.diag(H).clone()
+
+        try:
+            export = gptq_quantize_linear(layer, H, q,
+                                          group_size=args.group_size,
+                                          percdamp=args.percdamp)
+        except RuntimeError as e:
+            print(f"  FAILED: {e}")
+            continue
+        t_quant = time.time() - t0 - t_hess
+
+        out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
+        torch.save({
+            "name": name,
+            "shape": [rows, in_feat],
+            "group_size": args.group_size,
+            "n_centroids": args.n_centroids,
+            "indices": export["indices"].cpu(),
+            "centroids_per_group": export["centroids_per_group"].cpu(),
+            "mse": export["mse"],
+            "snr_db": export["snr_db"],
+            "rel_err": export["rel_err"],
+        }, out_path)
+
+        print(f"  saved: {out_path.name}  "
+              f"groups={export['centroids_per_group'].shape[0]}  "
+              f"SNR={export['snr_db']:.1f}dB  "
+              f"rel_err={export['rel_err']:.3%}  "
+              f"t_quant={t_quant:.1f}s")
+
+        manifest["results"].append({
+            "name": name,
+            "shape": [rows, in_feat],
+            "n_groups": int(export["centroids_per_group"].shape[0]),
+            "mse": float(export["mse"]),
+            "snr_db": float(export["snr_db"]),
+            "rel_err": float(export["rel_err"]),
+            "t_hess_s": float(t_hess),
+            "t_quant_s": float(t_quant),
+        })
+
+        del H, q
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    manifest_path = Path(args.output_dir) / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"\n[done] manifest: {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
