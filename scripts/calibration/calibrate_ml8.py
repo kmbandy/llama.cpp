@@ -38,12 +38,16 @@ Algorithm sketch (per linear with weight W [rows, in_features] and Hessian H):
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import os
 import sys
 import time
 from pathlib import Path
+
+# Force unbuffered prints so live `tail -f` works on long runs piped to file.
+print = functools.partial(print, flush=True)  # noqa: A001 (deliberate shadow)
 
 import torch
 from torch import nn
