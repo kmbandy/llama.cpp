@@ -2994,6 +2994,35 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // MAD-230 DIAG: host-side log of every op being dispatched, including
+    // src data pointers. Gated by env GGML_CUDA_OP_TRACE=1. Purely passive
+    // (CPU fprintf only — no sync, no DMA, no GPU scheduling impact). When
+    // the GPU faults, the LAST printed op identifies the kernel-in-flight
+    // (or the one launched immediately before). Src data ptrs in low
+    // address range (< 0x100000) flag a tensor whose data wasn't patched
+    // by the weight pager (would manifest as a near-null GPU fault).
+    static const bool s_op_trace = []() {
+        const char * env = std::getenv("GGML_CUDA_OP_TRACE");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (s_op_trace) {
+        static int s_op_idx = 0;
+        ++s_op_idx;
+        const bool routing_set = ggml_cuda_has_routed_expert_ptrs();
+        const char * route_tag = routing_set ? " ROUTING_SET" : "";
+        fprintf(stderr, "[op #%d] %s name=%s%s",
+                s_op_idx, ggml_op_name(dst->op), dst->name, route_tag);
+        for (int i = 0; i < 3; ++i) {
+            struct ggml_tensor * s = dst->src[i];
+            if (s == nullptr) break;
+            const uintptr_t a = (uintptr_t) s->data;
+            const char * warn = (a != 0 && a < 0x100000ULL) ? " <-- LOW_ADDR" : "";
+            fprintf(stderr, "  src[%d]=%s data=0x%lx%s",
+                    i, s->name, (unsigned long) a, warn);
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);

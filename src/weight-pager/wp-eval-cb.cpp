@@ -9,8 +9,9 @@
 // Forward decl of the ggml-cuda side channel — the actual symbol lives in
 // libggml-hip.so and we link against it. Avoids dragging the full
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
-extern "C++" void   ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
-extern "C++" void * ggml_cuda_get_wp_compute_stream();
+extern "C++" void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
+extern "C++" const void * const *  ggml_cuda_take_routed_expert_ptrs();
+extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 #endif
 
 #include <cstdlib>       // getenv
@@ -46,6 +47,24 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
+
+#if defined(GGML_USE_HIP)
+    // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
+    // consumed by a CUDA kernel on the previous op. eval_cb fires
+    // for EVERY op the scheduler dispatches, including ops that
+    // land on non-CUDA backends (CPU fallback for unusual shapes,
+    // multi-backend split graphs, etc). If a MoE MUL_MAT_ID op gets
+    // assigned to a non-CUDA backend, eval_cb's routing block below
+    // sets the TLS but no CUDA kernel consumes it. The next CUDA op
+    // — which may be a totally unrelated non-MoE op — then sees a
+    // stale TLS, and any kernel that peeks via
+    // ggml_cuda_has_routed_expert_ptrs() (or any path that calls
+    // take_) gets a pointer to expert_ptrs that have nothing to do
+    // with the current op, leading to near-null GPU faults during
+    // decode. Defensively consume here so the slate is clean before
+    // we (maybe) set it again for this op.
+    ggml_cuda_take_routed_expert_ptrs();
+#endif
 
     // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
     // source is a consolidated MoE parent. This is the entry point for
