@@ -1,0 +1,56 @@
+{
+  "commit": "3a7e61a72e20f88d0ed5ab007b15132d6ceb7ec5",
+  "short_commit": "3a7e61a72",
+  "timestamp_utc": "20260519T192023Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "cells": [
+    {
+      "aiter": 0,
+      "target_tokens": 8192,
+      "cache_type": "turbo4",
+      "ctx_size": 32768,
+      "prompt_n": 6505,
+      "prompt_ms": 3137.689,
+      "prompt_per_second": 2073.1818864138545,
+      "predicted_n": 32,
+      "predicted_ms": 984.471,
+      "predicted_per_second": 32.504766519277865
+    },
+    {
+      "aiter": 0,
+      "target_tokens": 65536,
+      "cache_type": "turbo4",
+      "ctx_size": 131072,
+      "prompt_n": 52038,
+      "prompt_ms": 50891.296,
+      "prompt_per_second": 1022.5324189032247,
+      "predicted_n": 32,
+      "predicted_ms": 1020.97,
+      "predicted_per_second": 31.342742685877155
+    },
+    {
+      "aiter": 1,
+      "target_tokens": 8192,
+      "cache_type": "f16",
+      "ctx_size": 32768,
+      "prompt_n": 6505,
+      "prompt_ms": 3548.269,
+      "prompt_per_second": 1833.2882878947453,
+      "predicted_n": 32,
+      "predicted_ms": 562.944,
+      "predicted_per_second": 56.84402000909505
+    },
+    {
+      "aiter": 1,
+      "target_tokens": 65536,
+      "cache_type": "f16",
+      "ctx_size": 131072,
+      "prompt_n": 52038,
+      "prompt_ms": 65716.663,
+      "prompt_per_second": 791.8539625178473,
+      "predicted_n": 32,
+      "predicted_ms": 818.39,
+      "predicted_per_second": 39.10116203765931
+    }
+  ]
+}

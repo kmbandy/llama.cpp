@@ -35,7 +35,9 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ml8_io import load_ml8_layer, reconstruct_weight, bits_per_value  # noqa: E402
+from ml8_io import (  # noqa: E402
+    load_ml8_layer, reconstruct_weight, reconstruct_inference_weight, bits_per_value,
+)
 
 
 def get_module(model, name: str):
@@ -83,8 +85,11 @@ def overlay_ml8_weights(model, calibration_dir: Path, device: str,
             n_skipped += 1
             continue
 
-        # Reconstruct on the target device for fewest transfers
-        W_recon = reconstruct_weight(blob).to(device)
+        # Reconstruct on the target device for fewest transfers. The "inference"
+        # variant absorbs any per-layer Kronecker rotation into the dequantized
+        # weight so the model's standard forward is mathematically equivalent to
+        # the rotated calibration's input-rotated form. No-op for legacy blobs.
+        W_recon = reconstruct_inference_weight(blob).to(device)
         if tuple(W_recon.shape) != tuple(target.weight.shape):
             print(f"  [skip] {name}: shape mismatch "
                   f"{tuple(W_recon.shape)} vs {tuple(target.weight.shape)}")

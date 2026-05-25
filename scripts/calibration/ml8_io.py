@@ -15,6 +15,17 @@ the driver contains:
         "w_snr_db": float,
         "y_snr_db": float,
         "rel_err": float,
+        # Optional (added MAD-223 Phase B.3 for the calibration sweep). Missing key,
+        # None, or {"kind": "identity"} all mean no input rotation is applied — fully
+        # backward-compatible with Saturday's blobs. When present and non-identity,
+        # reconstruct_model.py wraps the target Linear so input is rotated before matmul.
+        "rotation": {
+            "kind": "kronecker_orth_sylvester",
+            "h_a": fp32 [a, a],       # only h_a stored; H_b regenerated from b_dim
+            "a_dim": int,
+            "b_dim": int,             # power of 2; H_b is sylvester(b_dim)
+            "in_features": int,       # == a_dim * b_dim, must match shape[1]
+        },
     }
 
 Reconstruction formula:
@@ -34,6 +45,68 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+
+def get_awq(blob: dict[str, Any]):
+    """Reconstruct the layer's AWQ per-input-channel scale, if any.
+
+    Returns None for legacy blobs, blob['awq'] is None, or kind=='none'.
+    Otherwise returns the s tensor (shape (in_features,)).
+    """
+    spec = blob.get("awq")
+    if spec is None:
+        return None
+    kind = spec.get("kind")
+    if kind in (None, "none"):
+        return None
+    s = spec.get("s")
+    if s is None:
+        raise ValueError(f"awq spec missing 's' tensor: {spec}")
+    return s
+
+
+def reconstruct_inference_weight(blob: dict[str, Any]) -> torch.Tensor:
+    """Dequantize and absorb both rotation and AWQ scale into the weight.
+
+    Pipeline (matches calibrate_ml8.py order: AWQ → rotation → quant):
+      1. dequant gives W in rotated, AWQ-rescaled basis
+      2. rotation.inverse undoes the rotation (W @ Q.T)
+      3. absorb_awq_in_reconstruction multiplies each col by s (W * diag(s))
+
+    No-rotation, no-awq blob: returns plain `reconstruct_weight(blob)` unchanged.
+    Backward-compatible with all earlier blob formats.
+    """
+    W = reconstruct_weight(blob)
+    rotation = get_rotation(blob)
+    if rotation is not None:
+        W = rotation.inverse(W)
+    awq_s = get_awq(blob)
+    if awq_s is not None:
+        # Lazy import to keep ml8_io a leaf in dependency order for legacy callers.
+        from awq import absorb_awq_in_reconstruction
+        W = absorb_awq_in_reconstruction(W, awq_s.to(device=W.device, dtype=W.dtype))
+    return W
+
+
+def get_rotation(blob: dict[str, Any]):
+    """Reconstruct the layer's input rotation, if any. Returns None for legacy blobs.
+
+    Blob schema (backward-compatible):
+      - missing "rotation" key                       → None (Saturday's blobs)
+      - blob["rotation"] is None                     → None
+      - blob["rotation"]["kind"] == "identity"       → None
+      - blob["rotation"]["kind"] == "kronecker_orth_sylvester"
+                                                     → KroneckerRotation.from_dict(...)
+    """
+    spec = blob.get("rotation")
+    if spec is None:
+        return None
+    kind = spec.get("kind")
+    if kind in (None, "identity"):
+        return None
+    # Import lazily so legacy callers that never touch rotation don't pay the import.
+    from kronecker_rotation import KroneckerRotation
+    return KroneckerRotation.from_dict(spec)
 
 
 def load_ml8_layer(path: str | Path) -> dict[str, Any]:

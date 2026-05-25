@@ -1,0 +1,17 @@
+{
+  "commit": "846f0e627acdf11d9e0849597c69f190a7f751da",
+  "short_commit": "846f0e627",
+  "timestamp_utc": "20260519T234130Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "corpus": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "cells": [
+    {
+      "cache_type": "f16",
+      "ctx_size": 16384,
+      "ppl": 5.3613,
+      "ppl_err": 0.03221,
+      "n_chunks": 18,
+      "elapsed_s": 172
+    }
+  ]
+}

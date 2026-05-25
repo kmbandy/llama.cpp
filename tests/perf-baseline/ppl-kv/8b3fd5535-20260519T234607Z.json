@@ -1,0 +1,81 @@
+{
+  "commit": "8b3fd553598215d7695e550b75dd47b9a9889890",
+  "short_commit": "8b3fd5535",
+  "timestamp_utc": "20260519T234607Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "corpus": "/home/kmbandy/GitHub/llama.cpp/wikitext-2-raw/wiki.test.raw",
+  "cells": [
+    {
+      "cache_type": "f16",
+      "ctx_size": 4096,
+      "ppl": 5.7507,
+      "ppl_err": 0.03553,
+      "n_chunks": 72,
+      "elapsed_s": 160
+    },
+    {
+      "cache_type": "f16",
+      "ctx_size": 8192,
+      "ppl": 5.7012,
+      "ppl_err": 0.0351,
+      "n_chunks": 36,
+      "elapsed_s": 166
+    },
+    {
+      "cache_type": "f16",
+      "ctx_size": 16384,
+      "ppl": 5.3613,
+      "ppl_err": 0.03221,
+      "n_chunks": 18,
+      "elapsed_s": 178
+    },
+    {
+      "cache_type": "turbo4",
+      "ctx_size": 4096,
+      "ppl": 5.7888,
+      "ppl_err": 0.03589,
+      "n_chunks": 72,
+      "elapsed_s": 218
+    },
+    {
+      "cache_type": "turbo4",
+      "ctx_size": 8192,
+      "ppl": 5.727,
+      "ppl_err": 0.03535,
+      "n_chunks": 36,
+      "elapsed_s": 263
+    },
+    {
+      "cache_type": "turbo4",
+      "ctx_size": 16384,
+      "ppl": 5.3903,
+      "ppl_err": 0.03248,
+      "n_chunks": 18,
+      "elapsed_s": 354
+    },
+    {
+      "cache_type": "turbo3",
+      "ctx_size": 4096,
+      "ppl": 5.8226,
+      "ppl_err": 0.03607,
+      "n_chunks": 72,
+      "elapsed_s": 253
+    },
+    {
+      "cache_type": "turbo3",
+      "ctx_size": 8192,
+      "ppl": 5.7633,
+      "ppl_err": 0.03556,
+      "n_chunks": 36,
+      "elapsed_s": 341
+    },
+    {
+      "cache_type": "turbo3",
+      "ctx_size": 16384,
+      "ppl": 5.4178,
+      "ppl_err": 0.03262,
+      "n_chunks": 18,
+      "elapsed_s": 496
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "short_commit": "42147da28",
+  "phase": "fp8-qshiskip-perf-check",
+  "baseline_elapsed": {
+    "ctx4096": 183,
+    "ctx8192": 208,
+    "ctx16384": 258
+  },
+  "cells": [
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 4096,
+      "ppl": 5.761,
+      "ppl_err": 0.03559,
+      "elapsed_s": 187
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 8192,
+      "ppl": 5.7099,
+      "ppl_err": 0.03514,
+      "elapsed_s": 209
+    },
+    {
+      "cache_type": "turbo4_fp8_bs256",
+      "ctx_size": 16384,
+      "ppl": 5.3705,
+      "ppl_err": 0.03227,
+      "elapsed_s": 256
+    }
+  ]
+}

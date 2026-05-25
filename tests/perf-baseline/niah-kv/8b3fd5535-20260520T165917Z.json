@@ -1,0 +1,20 @@
+{
+  "commit": "8b3fd553598215d7695e550b75dd47b9a9889890",
+  "short_commit": "8b3fd5535",
+  "timestamp_utc": "20260520T165917Z",
+  "model": "/home/kmbandy/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "needle": "The secret passphrase is verdant-quokka-7831.",
+  "cells": [
+    {
+      "cache_type": "f16",
+      "target_tokens": 8192,
+      "ctx_size": 32768,
+      "prompt_n": 6854,
+      "prompt_per_second": 1924.8180774510397,
+      "predicted_n": 1,
+      "response": "",
+      "needle_hit": false,
+      "elapsed_s": 3
+    }
+  ]
+}

@@ -34,6 +34,19 @@ import torch
 import torch.nn as nn
 
 
+def snap_to_e4m3(x: torch.Tensor) -> torch.Tensor:
+    """Snap each element of x to the nearest E4M3 representable value.
+
+    E4M3 (1 sign + 4 exp + 3 mantissa, "fn" = finite-nan-only) is the FP8
+    format consumed by RDNA4's v_wmma_f32_16x16x16_fp8_fp8 and Hopper/Blackwell
+    mma.sync FP8 instructions. Snapping ml8 centroids to this lattice is the
+    bridge that lets the LUT lookup feed the FP8 WMMA path directly at inference.
+
+    Returns same dtype as input.
+    """
+    return x.to(torch.float8_e4m3fn).to(x.dtype)
+
+
 class CentroidQuantizer(nn.Module):
     """auto-gptq Quantizer drop-in using a signed-N centroid LUT (default N=16)."""
 
@@ -46,6 +59,10 @@ class CentroidQuantizer(nn.Module):
         self.fit_loss = "mag_weighted"
         self.mag_weight_p = 5.0
         self.sym = True
+        # MAD-223 Phase B.3: snap centroids to E4M3 lattice so the LUT lookup
+        # is FP8-WMMA-compatible at inference. 'none' = backward-compat float
+        # centroids (FP16 WMMA inference path); 'e4m3' = ml8-as-pitched.
+        self.snap_centroids = "none"
         # Filled by find_params():
         self.centroids: torch.Tensor | None = None  # [n_centroids], normalized signed
         self.scale: torch.Tensor | None = None      # [rows, 1], per-row
@@ -72,13 +89,21 @@ class CentroidQuantizer(nn.Module):
 
     def configure(self, bits: int = 4, perchannel: bool = True, sym: bool = True,
                   mse: bool = False, fit_loss: str = "mag_weighted",
-                  mag_weight_p: float = 5.0, **_ignored):
-        """Called by auto-gptq pipelines. bits/perchannel/sym kept for parity."""
+                  mag_weight_p: float = 5.0, snap_centroids: str = "none",
+                  **_ignored):
+        """Called by auto-gptq pipelines. bits/perchannel/sym kept for parity.
+
+        snap_centroids: 'none' (default, float centroids, FP16 WMMA inference) or
+        'e4m3' (snap to E4M3 lattice, FP8 WMMA inference path).
+        """
         assert (1 << bits) == self.n_centroids, (
             f"bits={bits} doesn't match n_centroids={self.n_centroids}")
+        if snap_centroids not in ("none", "e4m3"):
+            raise ValueError(f"snap_centroids must be 'none' or 'e4m3', got {snap_centroids!r}")
         self.sym = sym
         self.fit_loss = fit_loss
         self.mag_weight_p = mag_weight_p
+        self.snap_centroids = snap_centroids
         # auto-gptq's gptq.py reads self.maxq to know group_size compatibility;
         # we expose it as N-1 so its sanity checks pass.
         self.maxq = torch.tensor(self.n_centroids - 1)
@@ -123,7 +148,13 @@ class CentroidQuantizer(nn.Module):
             mag_weight_p=self.mag_weight_p,
         )
 
-        self.centroids = centroids.to(dev)  # [n_centroids]
+        centroids = centroids.to(dev)  # [n_centroids]
+        if self.snap_centroids == "e4m3":
+            # Snap each Lloyd-Max centroid to nearest E4M3 representable value.
+            # MAD-214 measurement: this costs ~4-5% MSE on LUT fit — small price
+            # for the FP8 WMMA inference path the storage format unlocks.
+            centroids = snap_to_e4m3(centroids)
+        self.centroids = centroids
         self.scale = scale.to(dev)          # [rows, 1]
         # auto-gptq's fasterquant appends self.zero alongside self.scale per
         # group. Centroid quant has no zero-point offset; expose a zero-filled

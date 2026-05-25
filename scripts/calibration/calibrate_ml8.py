@@ -56,6 +56,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Make centroid_quantizer importable
 sys.path.insert(0, str(Path(__file__).parent))
 from centroid_quantizer import CentroidQuantizer  # noqa: E402
+from kronecker_rotation import (  # noqa: E402
+    KroneckerRotation, random_orthogonal, factor_for_dim, rotate_hessian,
+)
+from awq import compute_awq_scale, apply_awq_to_weight  # noqa: E402
 
 
 # ───────────────────────────── Calibration data ─────────────────────────────
@@ -117,13 +121,20 @@ def filter_by_layer_limit(targets, max_layers: int | None):
 
 @torch.no_grad()
 def compute_hessian(layer: nn.Linear, calibration_ids: list[torch.Tensor],
-                    model, dev: str) -> tuple[torch.Tensor, int]:
-    """Collect H = (1/N) sum X X^T (in_features x in_features) for `layer`."""
+                    model, dev: str, collect_awq: bool = False
+                    ) -> tuple[torch.Tensor, int, torch.Tensor | None]:
+    """Collect H = (1/N) sum X X^T (in_features x in_features) for `layer`.
+
+    If collect_awq=True, also accumulate per-channel sum(|x|) so AWQ scales
+    can be computed from the same forward pass without doubling calibration time.
+    Returns (H, n_tokens, sum_abs_per_channel_or_None).
+    """
     H_acc = None
+    sum_abs = None  # only filled when collect_awq=True
     n_total = 0
 
     def hook(module, inputs, output):
-        nonlocal H_acc, n_total
+        nonlocal H_acc, sum_abs, n_total
         x = inputs[0].detach()
         x = x.reshape(-1, x.shape[-1]).float()  # [N, in_features]
         XtX = x.t() @ x
@@ -131,6 +142,12 @@ def compute_hessian(layer: nn.Linear, calibration_ids: list[torch.Tensor],
             H_acc = XtX
         else:
             H_acc += XtX
+        if collect_awq:
+            sa = x.abs().sum(dim=0)
+            if sum_abs is None:
+                sum_abs = sa
+            else:
+                sum_abs += sa
         n_total += x.shape[0]
 
     h = layer.register_forward_hook(hook)
@@ -142,7 +159,7 @@ def compute_hessian(layer: nn.Linear, calibration_ids: list[torch.Tensor],
 
     if H_acc is None:
         raise RuntimeError(f"No activations collected for {layer}")
-    return H_acc / max(n_total, 1), n_total
+    return H_acc / max(n_total, 1), n_total, sum_abs
 
 
 # ───────────────────────────── GPTQ loop ────────────────────────────────────
@@ -312,6 +329,37 @@ def main():
                         "quantization. Reports Δ_PPL vs f16 baseline.")
     p.add_argument("--ppl-max-tokens", type=int, default=None,
                    help="Cap PPL eval tokens (default: full test split ~280k).")
+    # MAD-223 Phase B.3 (calibration sweep): optional Kronecker rotation on weights.
+    # Saturday's Hadamard finding ([[turbo-fp8-calibration-hadamard-vs-fit]]) was on
+    # KV cache; this lever ports the same idea to weight quantization. Q = H_a ⊗ H_b
+    # where H_b is Sylvester (power of 2 ≤ 1024) and H_a is small random orthogonal.
+    # Stored factored in the per-layer blob; reconstruct_model.py absorbs it on overlay.
+    p.add_argument("--rotation", choices=("none", "kronecker"), default="none",
+                   help="Per-layer input rotation applied before GPTQ quantization. "
+                        "'kronecker' picks (a, b) for each layer via factor_for_dim().")
+    p.add_argument("--rotation-seed", type=int, default=42,
+                   help="Seed for the H_a random orthogonal factor of each layer's "
+                        "rotation. Per-layer seeds are derived as base_seed + layer_idx "
+                        "so multi-layer runs are reproducible.")
+    p.add_argument("--rotation-max-b", type=int, default=1024,
+                   help="Largest H_b Sylvester dim allowed. Defaults to the existing "
+                        "FWHT kernel's upper bound so the factorization stays runtime-compatible.")
+    # MAD-223 Phase B.3 (true ml8): snap Lloyd-Max centroids to the E4M3 lattice
+    # so the LUT lookup feeds FP8 WMMA directly at inference. 'none' is the
+    # back-compat path (float centroids → FP16 WMMA); 'e4m3' is the production
+    # ml8 path.
+    p.add_argument("--snap-centroids", choices=("none", "e4m3"), default="none",
+                   help="Snap fitted centroids to E4M3 lattice. 'e4m3' unlocks the "
+                        "FP8 WMMA inference path the ml8 storage format is designed for.")
+    # AWQ rescaling: protects salient input channels from group-shared quant scale waste.
+    # Applied BEFORE rotation in the pipeline; both transforms compose into the
+    # reconstructed weight at HF eval time via reconstruct_inference_weight.
+    p.add_argument("--awq", choices=("none", "mean"), default="none",
+                   help="Per-input-channel AWQ rescaling. 'mean' computes "
+                        "s_i = mean(|x_i|)^alpha from calibration activations.")
+    p.add_argument("--awq-alpha", type=float, default=0.5,
+                   help="AWQ scaling exponent. 0.5 is the AWQ paper default; "
+                        "0.0 disables (s=1 everywhere); 1.0 maximally aggressive.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -349,37 +397,124 @@ def main():
         rows, in_feat = layer.weight.shape
         print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
 
-        H, n_tok = compute_hessian(layer, calib, model, args.device)
+        # Snapshot the original layer weight BEFORE any AWQ/rotation/GPTQ mutation.
+        # If anything in the pipeline below throws, we restore from this snapshot
+        # so subsequent layers' Hessian collection sees correct activations.
+        # (Cell D 2026-05-24 PPL explosion bug: a Cholesky failure on layer 25
+        # down_proj left the weight in AWQ-rescaled + rotated state, corrupting
+        # all downstream layer calibrations.)
+        W_orig_snapshot = layer.weight.data.clone()
+
+        collect_awq = args.awq != "none"
+        H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
+                                            collect_awq=collect_awq)
         t_hess = time.time() - t0
         print(f"  hessian: {H.shape}, "
               f"diag_mean={H.diag().mean().item():.4g}, "
               f"n_tok={n_tok}, t={t_hess:.1f}s")
 
+        # Optional AWQ rescaling: applied BEFORE rotation. s_i = (sum_abs/N)^alpha.
+        # Rescale W column-wise (divide salient columns), and rescale H accordingly:
+        # H_awq = diag(s) @ H @ diag(s)  (because x_awq = x * s → H_awq = E[x_awq^T x_awq]).
+        awq_s = None
+        awq_blob = None
+        if collect_awq and sum_abs is not None:
+            mean_abs = (sum_abs / max(n_tok, 1)).clamp_min(1e-8)
+            awq_s = mean_abs.pow(args.awq_alpha).to(H.device)
+            print(f"  awq: kind={args.awq} alpha={args.awq_alpha} "
+                  f"s_max={awq_s.max().item():.3f} s_min={awq_s.min().item():.3f}")
+            awq_blob = {"kind": args.awq, "alpha": args.awq_alpha, "s": awq_s.detach().cpu()}
+            # Rescale H: diag(s) @ H @ diag(s)
+            H = H * awq_s.unsqueeze(0) * awq_s.unsqueeze(1)
+            # Rescale W in place
+            W_dtype = layer.weight.dtype
+            W_new = apply_awq_to_weight(layer.weight.data.float().to(awq_s.device), awq_s)
+            layer.weight.data.copy_(W_new.to(W_dtype))
+
+        # Optional rotation: rotate W and H into the rotated basis. GPTQ then runs
+        # exactly as before on the rotated tensors; we restore the layer's weight
+        # to the inference-equivalent (un-rotated) form after quantization so the
+        # next layer's Hessian collection sees the right activation distribution.
+        rotation = None
+        rotation_blob = None
+        if args.rotation == "kronecker":
+            a, b = factor_for_dim(in_feat, max_b=args.rotation_max_b)
+            h_a = random_orthogonal(a, seed=args.rotation_seed + i)
+            rotation = KroneckerRotation(h_a=h_a, b_dim=b)
+            rotation_blob = rotation.to_dict()
+            rotation_blob["seed"] = args.rotation_seed + i
+            print(f"  rotation: kronecker a={a} b={b} (d={in_feat})")
+
+            # Rotate H: H_rot = Q.T @ H @ Q
+            H = rotate_hessian(H, rotation)
+            # Rotate W in-place so GPTQ operates on the rotated weight
+            W_dtype = layer.weight.dtype
+            layer.weight.data.copy_(
+                rotation.forward(layer.weight.data.float().to(H.device)).to(W_dtype)
+            )
+
         q = CentroidQuantizer(n_centroids=args.n_centroids,
                               n_iter=args.n_iter).to(args.device)
         q.configure(bits=4, sym=True,
                    fit_loss=args.fit_loss,
-                   mag_weight_p=args.mag_weight_p)
+                   mag_weight_p=args.mag_weight_p,
+                   snap_centroids=args.snap_centroids)
         q.hessian_diag = torch.diag(H).clone()
+
+        # AWQ-rescaled Hessian needs more damping for Cholesky stability —
+        # diag(s) @ H @ diag(s) widens the eigenvalue spread proportionally to
+        # min(s)². Default percdamp=0.01 of the rescaled mean diagonal is too
+        # weak to lift the smallest eigenvalue above zero on down_proj layers
+        # whose activations have wide channel-magnitude spread.
+        # Measured 2026-05-24: layer 25 down_proj with s_min=0.236 → Cholesky failed.
+        effective_percdamp = args.percdamp
+        if awq_s is not None:
+            effective_percdamp = max(args.percdamp, 0.05)
+            if effective_percdamp != args.percdamp:
+                print(f"  percdamp: bumped {args.percdamp:.3g} → {effective_percdamp:.3g} for AWQ stability")
 
         try:
             export = gptq_quantize_linear(layer, H, q,
                                           group_size=args.group_size,
-                                          percdamp=args.percdamp)
+                                          percdamp=effective_percdamp)
         except RuntimeError as e:
             print(f"  FAILED: {e}")
+            # Restore the original weight so subsequent layers see uncorrupted
+            # forward activations during their Hessian collection.
+            layer.weight.data.copy_(W_orig_snapshot)
             continue
         t_quant = time.time() - t0 - t_hess
 
+        # Inverse-rotate the dequantized layer weight back to inference-equivalent
+        # form (so subsequent layers' Hessian collection sees the correct activations).
+        # The blob still stores the rotated quantized form; reconstruct_model.py
+        # applies the inverse rotation again when overlaying.
+        if rotation is not None:
+            W_dtype = layer.weight.dtype
+            layer.weight.data.copy_(
+                rotation.inverse(layer.weight.data.float().to(rotation.h_a.device)).to(W_dtype)
+            )
+
+        # Absorb AWQ scale back into the layer's weight so subsequent layers see
+        # the inference-equivalent activations (W_inference = W_rescaled * s per col).
+        if awq_s is not None:
+            W_dtype = layer.weight.dtype
+            from awq import absorb_awq_in_reconstruction
+            W_back = absorb_awq_in_reconstruction(
+                layer.weight.data.float().to(awq_s.device), awq_s
+            )
+            layer.weight.data.copy_(W_back.to(W_dtype))
+
         out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
-        torch.save({
+        blob = {
             "name": name,
             "shape": [rows, in_feat],
             "group_size": args.group_size,
             "n_centroids": args.n_centroids,
             # Reconstruction:
-            #   W[r, c] = centroids_per_group[c // group_size][indices[r, c]]
-            #          * scale_per_group[r, c // group_size]
+            #   W_rot[r, c] = centroids_per_group[c // group_size][indices[r, c]]
+            #              * scale_per_group[r, c // group_size]
+            #   W_inference = W_rot @ Q.T   (rotation.inverse, applied in reconstruct_model.py)
             "indices": export["indices"].cpu(),                    # [rows, in_features] int8 (values 0..15)
             "centroids_per_group": export["centroids_per_group"].cpu(),  # [n_groups, n_centroids] fp32
             "scale_per_group": export["scale_per_group"].cpu(),    # [rows, n_groups] fp32
@@ -387,7 +522,12 @@ def main():
             "w_snr_db": export["w_snr_db"],
             "y_snr_db": export["y_snr_db"],
             "rel_err": export["rel_err"],
-        }, out_path)
+        }
+        if rotation_blob is not None:
+            blob["rotation"] = rotation_blob
+        if awq_blob is not None:
+            blob["awq"] = awq_blob
+        torch.save(blob, out_path)
 
         print(f"  saved: {out_path.name}  "
               f"groups={export['centroids_per_group'].shape[0]}  "
