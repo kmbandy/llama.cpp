@@ -37,6 +37,17 @@ struct IoResult {
     int      bytes_read = 0;   // negative on ErrorIo (== -errno)
 };
 
+// MAD-235 — one request descriptor in a batch submission. Same fields as
+// the single-shot submit() call. Caller fills a vector of these and the
+// FileIOLayer prepares all SQEs in one pass before flushing.
+struct FileIOBatchRequest {
+    uint64_t req_id;
+    int      fd_idx;
+    uint64_t offset;
+    size_t   size;
+    void *   dst;
+};
+
 class FileIOLayer {
 public:
     virtual ~FileIOLayer() = default;
@@ -71,6 +82,36 @@ public:
     // Exposed for callers that need direct pread fallback (e.g. tests or
     // failure recovery). The layer retains ownership.
     virtual int fd(int fd_idx) const = 0;
+
+    // Hint to the kernel that we will need [offset, offset+size) from
+    // `fd_idx` soon (POSIX_FADV_WILLNEED on Linux). Cheap, idempotent at
+    // the kernel level, no completion is produced. Use to warm page cache
+    // ahead of the next K layers' tensor reads — subsequent submit()s
+    // against advised ranges hit warm page cache (~10 GB/s memcpy) instead
+    // of cold NVMe (~500 MB/s QD=1 ceiling).
+    //
+    // RAM cost: each advised range becomes page cache pressure of `size`
+    // bytes. Operators on RAM-tight systems should keep WP_FADVISE_LOOKAHEAD
+    // low (1) or 0 to disable.
+    //
+    // Default no-op so non-file-backed FileIOLayer impls (future: in-memory,
+    // network) are forward-compatible without forcing a stub.
+    virtual void advise_prefetch(int /*fd_idx*/, uint64_t /*offset*/, size_t /*size*/) {}
+
+    // MAD-235 — batch-submit a vector of reads in one shot. Returns the
+    // number successfully queued (0..reqs.size()). On partial success the
+    // SUCCEEDED prefix [0, returned) will produce completions normally;
+    // the remainder [returned, N) was rejected and the caller MUST treat
+    // them as terminal failures (no completion will arrive).
+    //
+    // The io_uring override prepares all SQEs first then calls
+    // io_uring_submit once — collapses N syscalls to 1 for a single
+    // MoE layer's expert-set fetch.
+    //
+    // Default impl loops calling submit() — semantically equivalent for
+    // non-io_uring backends; the SQE-batching syscall savings only apply
+    // when the underlying transport is async with a submission queue.
+    virtual int submit_batch(const std::vector<FileIOBatchRequest> & reqs);
 };
 
 // Factory. `fds` is a list of pre-prepared file descriptors (typically dup'd

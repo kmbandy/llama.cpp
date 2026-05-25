@@ -18,6 +18,61 @@ namespace wp {
 // Helpers
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Issue POSIX_FADV_WILLNEED on a (fd, offset, size) range. Returns true on
+// success. Failure is non-fatal — the read still works, just without the
+// page-cache warm-up. Logged at most a handful of times to avoid spam.
+//
+// On non-Linux builds posix_fadvise isn't available; we no-op. The pager is
+// Linux-only in practice (io_uring + HIP), but the guard keeps the file
+// portable to test/CI on macOS dev machines.
+bool fadvise_willneed(int fd, uint64_t offset, size_t size) {
+#if defined(__linux__) && defined(POSIX_FADV_WILLNEED)
+    if (fd < 0 || size == 0) return false;
+    const int ret = posix_fadvise(fd, (off_t) offset, (off_t) size, POSIX_FADV_WILLNEED);
+    if (ret != 0) {
+        static int s_warn_count = 0;
+        if (s_warn_count < 3) {
+            LLAMA_LOG_WARN("wp::fadvise_willneed: posix_fadvise(WILLNEED) failed on fd %d "
+                           "off=%llu size=%zu: %s\n",
+                           fd, (unsigned long long) offset, size, strerror(ret));
+            ++s_warn_count;
+        }
+        return false;
+    }
+    return true;
+#else
+    (void) fd; (void) offset; (void) size;
+    return false;
+#endif
+}
+
+// Tell the kernel that subsequent accesses to this fd will be random (i.e.
+// disable the default sequential-readahead heuristic). Without this, the
+// kernel speculatively reads ahead from any pread() call — useless for the
+// tensor-strided MoE access pattern, and it pollutes the page cache with
+// unrelated bytes that crowd out the ranges we ACTUALLY want via
+// POSIX_FADV_WILLNEED. Best-effort; failure is logged once and ignored.
+void fadvise_random_once(int fd) {
+#if defined(__linux__) && defined(POSIX_FADV_RANDOM)
+    if (fd < 0) return;
+    const int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    if (ret != 0) {
+        static int s_warn_count = 0;
+        if (s_warn_count < 3) {
+            LLAMA_LOG_WARN("wp::fadvise_random_once: posix_fadvise(RANDOM) failed on fd %d: %s\n",
+                           fd, strerror(ret));
+            ++s_warn_count;
+        }
+    }
+#else
+    (void) fd;
+#endif
+}
+
+}  // anonymous namespace
+
 int dup_clear_o_direct(int src_fd) {
     if (src_fd < 0) {
         return -1;
@@ -120,6 +175,11 @@ public:
     int fd(int fd_idx) const override {
         if (fd_idx < 0 || (size_t) fd_idx >= fds_.size()) return -1;
         return fds_[fd_idx];
+    }
+
+    void advise_prefetch(int fd_idx, uint64_t offset, size_t size) override {
+        if (fd_idx < 0 || (size_t) fd_idx >= fds_.size()) return;
+        fadvise_willneed(fds_[fd_idx], offset, size);
     }
 
 private:
@@ -249,6 +309,45 @@ public:
         return fds_[fd_idx];
     }
 
+    void advise_prefetch(int fd_idx, uint64_t offset, size_t size) override {
+        if (fd_idx < 0 || (size_t) fd_idx >= fds_.size()) return;
+        fadvise_willneed(fds_[fd_idx], offset, size);
+    }
+
+    int submit_batch(const std::vector<FileIOBatchRequest> & reqs) override {
+        if (!ring_ok_) return 0;
+        int n_queued = 0;
+        // Pass 1: prep all SQEs. If the ring runs out of free SQEs midway
+        // (rare but possible if a prior tick didn't fully drain), flush
+        // what we have and continue. Worst case we end up doing one more
+        // io_uring_submit than a single-syscall batch — still strictly
+        // fewer than N syscalls.
+        for (const auto & r : reqs) {
+            if (r.fd_idx < 0 || (size_t) r.fd_idx >= fds_.size() || r.dst == nullptr) {
+                break;
+            }
+            struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
+            if (sqe == nullptr) {
+                // SQ ring full mid-batch — flush what we've prepped, then retry once.
+                io_uring_submit(&ring_);
+                sqe = io_uring_get_sqe(&ring_);
+                if (sqe == nullptr) break;
+            }
+            io_uring_prep_read(sqe, r.fd_idx, r.dst, (unsigned) r.size, (off_t) r.offset);
+            sqe->flags     |= IOSQE_FIXED_FILE;
+            sqe->user_data  = r.req_id;
+            ++pending_;
+            ++n_queued;
+        }
+        // Pass 2: single io_uring_submit for the batch. This is the MAD-235
+        // win — one syscall covers N expert-prefetches for the MoE layer
+        // instead of N separate submits.
+        if (n_queued > 0) {
+            io_uring_submit(&ring_);
+        }
+        return n_queued;
+    }
+
 private:
     explicit IoUringAsyncFileIO(std::vector<int> fds) : fds_(std::move(fds)) {}
 
@@ -291,6 +390,27 @@ private:
 #endif  // LLAMA_HAVE_IO_URING
 
 // ---------------------------------------------------------------------------
+// FileIOLayer default submit_batch — loops singles. Subclasses with a real
+// submission queue (io_uring) override this to push all SQEs first then
+// submit once.
+// ---------------------------------------------------------------------------
+
+int FileIOLayer::submit_batch(const std::vector<FileIOBatchRequest> & reqs) {
+    int n_queued = 0;
+    for (const auto & r : reqs) {
+        if (!submit(r.req_id, r.fd_idx, r.offset, r.size, r.dst)) {
+            // Stop on first rejection — caller treats [n_queued, N) as failed.
+            // SyncPread can't really fail at submit (it runs the read inline
+            // and queues the result), so this loop almost always succeeds
+            // fully here. The io_uring override gets the real batching win.
+            break;
+        }
+        ++n_queued;
+    }
+    return n_queued;
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -298,6 +418,18 @@ std::unique_ptr<FileIOLayer> create_file_io(std::vector<int> fds,
                                             bool             prefer_async,
                                             int              queue_depth) {
     const size_t n_fds = fds.size();
+
+    // Disable kernel auto-sequential-readahead on every fd before either
+    // transport sees it. Without this, the kernel speculatively reads ahead
+    // from each pread() (the SyncPread path is most affected, but io_uring
+    // is also affected when fixed_file reads land on the same fd). That
+    // speculative readahead pollutes the page cache with unrelated tensor
+    // bytes and crowds out the ranges we deliberately advise via
+    // POSIX_FADV_WILLNEED for the next K layers (MAD-232 / advise_prefetch).
+    for (int fd : fds) {
+        fadvise_random_once(fd);
+    }
+
 #ifdef LLAMA_HAVE_IO_URING
     if (prefer_async) {
         // Copy fds for the attempt; on success the layer owns them and we

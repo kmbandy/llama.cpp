@@ -27,6 +27,16 @@ namespace wp {
 
 class GpuTransport;
 
+// MAD-235 — one prefetch request in a batch. Mirror of submit()'s args.
+struct PrefetchBatchRequest {
+    int      page_idx;
+    int      fd_idx;
+    uint64_t file_offset;
+    size_t   payload_size;
+    void *   dst_vram;
+    size_t   slot_size;
+};
+
 class PrefetchScheduler {
 public:
     PrefetchScheduler() = default;
@@ -60,6 +70,24 @@ public:
                 size_t payload_size,
                 void * dst_vram,
                 size_t slot_size);
+
+    // MAD-235 — batch-submit a vector of prefetches. Atomic semantics:
+    // either all reqs are queued (and one io_uring_submit covers them all
+    // via FileIOLayer::submit_batch) or none are (and the function returns
+    // false leaving scheduler state unchanged). The all-or-nothing contract
+    // lets the caller fall back to per-page submit cleanly when the
+    // queue can't fit the whole batch — no half-queued mess to unwind.
+    //
+    // Returns true iff every request was queued.
+    //
+    // Reasons for failure (returns false, no state change):
+    //   - scheduler not initialized
+    //   - any req has invalid args (dst null, payload 0 or > max_page_size,
+    //     slot_size < payload_size, page_idx negative)
+    //   - any page_idx is already in flight
+    //   - reqs.size() > free queue slots
+    //   - FileIOLayer::submit_batch returns less than reqs.size()
+    bool submit_batch(const std::vector<PrefetchBatchRequest> & reqs);
 
     // Non-blocking: drive the pipeline forward by reaping any completed
     // file reads and any signalled GPU events. Idempotent — safe to call

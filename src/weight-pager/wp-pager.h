@@ -50,6 +50,16 @@ public:
     WeightPager(const WeightPager &)             = delete;
     WeightPager & operator=(const WeightPager &) = delete;
 
+    // MAD-236 — register a tensor whose bytes already live in caller-owned
+    // VRAM (e.g. token_embd from the regular model loader buffer). The
+    // pager doesn't allocate a pool slot or read from disk for these —
+    // ensure(page_idx) returns `device_ptr` directly. Useful for unified
+    // VRAM telemetry (paged + resident in one view) and for mixed-mode
+    // workloads where some weights stay pinned and others page.
+    //
+    // Must be called BEFORE init(), like add_page(). Returns the page index.
+    int register_pinned(const std::string & name, void * device_ptr, size_t bytes);
+
     // Catalog population. Must be called before init().
     //
     // n_experts > 1 marks a consolidated MoE expert tensor (Qwen3-MoE
@@ -107,8 +117,47 @@ public:
     // the eval callback's ensure() will fall back to sync on miss.
     void prefetch_page(int page_idx);
 
+    // MAD-235 — batch-prefetch N pages atomically. Reserves N pool slots
+    // up-front, builds the file-IO batch, issues one batched submit. If
+    // any step fails (pool can't supply N slots, scheduler rejects the
+    // batch), returns false and leaves no partial state. Caller falls
+    // back to per-page prefetch_page() on false.
+    //
+    // Skips page indices that are already resident or already in flight
+    // — those are no-ops, not failures. Returns true iff every NEEDED
+    // request was queued (or no requests were needed).
+    bool prefetch_pages_batch(const std::vector<int> & page_indices);
+
+    // Hint the kernel (via POSIX_FADV_WILLNEED on the file_io layer) that
+    // we will soon need every paged tensor in layers [block_idx+1,
+    // block_idx+k]. Cheap (one syscall per range), idempotent at kernel
+    // level. Subsequent reads against these ranges hit warm page cache
+    // instead of cold NVMe.
+    //
+    // No-op when not initialized, when k <= 0, or when block_idx < 0.
+    //
+    // The eval callback invokes this once per layer boundary in the forward
+    // pass. RAM cost: each advised range is `size` bytes of page cache
+    // pressure; on RAM-tight systems keep k low or disable via
+    // WP_FADVISE_LOOKAHEAD=0.
+    void advise_layer_lookahead(int block_idx, int k);
+
     // Drive the prefetch pipeline forward. Idempotent and non-blocking.
     void tick();
+
+    // Pin / unpin the slot currently backing `page_idx` so eviction can't
+    // reclaim it while an in-flight op references the VRAM. Refcounted via
+    // PoolAllocator::pin_slot — safe under overlapping ops that touch the
+    // same page. No-op if page_idx is out of range or the page is not
+    // currently resident (no slot to pin).
+    //
+    // Lifecycle in the eval-callback (MAD-231): call pin_page on each page
+    // the op references after ensure() succeeds; call unpin_page in the
+    // NEXT eval-callback before submitting any new prefetches. This window
+    // is a superset of the actual GPU-side read but stream ordering on the
+    // compute stream guarantees correctness for the conservative bound.
+    void pin_page(int page_idx);
+    void unpin_page(int page_idx);
 
     // Backing buffer for the pool — used by the eval-cb adapter when
     // patching tensor->buffer (B-P4 requires a valid ggml backend buffer).
@@ -169,5 +218,24 @@ private:
     size_t sync_staging_size_  = 0;
     bool   sync_staging_pinned_ = false;  // true if hipHostMalloc, false if malloc fallback
 };
+
+// File-range descriptor for advise_prefetch — one per paged tensor in the
+// catalog walk. Exposed at namespace scope so unit tests can validate the
+// catalog-walk logic (compute_advise_ranges) without standing up a real
+// WeightPager.
+struct AdviseRange {
+    uint16_t fd_idx;
+    uint64_t offset;
+    size_t   size;
+};
+
+// Walk `catalog` for every page whose block_idx is in [block_idx+1,
+// block_idx+k] AND whose size > 0 (i.e. excludes consolidated parents,
+// which have no own bytes). Skips negative inputs. Caller owns the
+// returned vector. Pure function — no I/O, no global state. Unit-tested
+// directly without a real pager.
+std::vector<AdviseRange> compute_advise_ranges(const PageCatalog & catalog,
+                                                int                 block_idx,
+                                                int                 k);
 
 }  // namespace wp

@@ -16,6 +16,7 @@ extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 
 #include <cstdlib>       // getenv
 #include <cstring>
+#include <limits>        // numeric_limits — MAD-232 advise sentinel
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -65,6 +66,22 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // we (maybe) set it again for this op.
     ggml_cuda_take_routed_expert_ptrs();
 #endif
+
+    // MAD-231: drain pins from the PREVIOUS op's pages now that the GPU
+    // has had a full eval-cb-cycle of latency to finish reading them.
+    // Conservative: this window is a superset of the actual GPU read
+    // (the previous op was dispatched on the compute stream and any
+    // subsequent prefetch H2D is enqueued on the same stream → ordered),
+    // but the pin set is small (handful of pages per op) so the over-
+    // protection is free.
+    //
+    // Single-threaded: ggml's scheduler dispatches eval_cb on one thread,
+    // so no synchronization is needed for s_pinned_pages_prev_op.
+    static std::vector<int> s_pinned_pages_prev_op;
+    for (int prev_page : s_pinned_pages_prev_op) {
+        pager->unpin_page(prev_page);
+    }
+    s_pinned_pages_prev_op.clear();
 
     // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
     // source is a consolidated MoE parent. This is the entry point for
@@ -224,9 +241,35 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // already reserved + in-flight, and
                                     // wait_for completion instead of doing
                                     // a fresh sync pread.
-                                    for (int e : active) {
-                                        const int sub_page_idx = weight_page + 1 + e;
-                                        pager->prefetch_page(sub_page_idx);
+                                    //
+                                    // MAD-235: prefer the atomic batch path
+                                    // (one io_uring_submit syscall for the
+                                    // whole expert set). WP_BATCH_PREFETCH=0
+                                    // reverts to per-expert loop for A/B
+                                    // measurement / regression rollback.
+                                    static int s_batch_prefetch_env = -1;
+                                    if (s_batch_prefetch_env < 0) {
+                                        const char * env = std::getenv("WP_BATCH_PREFETCH");
+                                        s_batch_prefetch_env = (env != nullptr && env[0] == '0') ? 0 : 1;
+                                    }
+                                    bool batch_ok = false;
+                                    if (s_batch_prefetch_env != 0) {
+                                        std::vector<int> active_pages;
+                                        active_pages.reserve(active.size());
+                                        for (int e : active) {
+                                            active_pages.push_back(weight_page + 1 + e);
+                                        }
+                                        batch_ok = pager->prefetch_pages_batch(active_pages);
+                                    }
+                                    if (!batch_ok) {
+                                        // Either batch was disabled OR scheduler
+                                        // refused (queue full / capacity tight).
+                                        // Fall back to per-expert prefetch — best-
+                                        // effort, ignores individual failures.
+                                        for (int e : active) {
+                                            const int sub_page_idx = weight_page + 1 + e;
+                                            pager->prefetch_page(sub_page_idx);
+                                        }
                                     }
                                     // Drive the prefetch state machine forward
                                     // so submitted reads get out the door
@@ -250,6 +293,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 first_active_slot = slot;
                                             }
                                             ++n_ensures;
+                                            // MAD-231: pin the slot so a later prefetch
+                                            // alloc_slot in this same eval_cb can't evict
+                                            // it. Unpinned in the NEXT eval_cb (above).
+                                            pager->pin_page(sub_page_idx);
+                                            s_pinned_pages_prev_op.push_back(sub_page_idx);
                                         }
                                     }
                                     // Safety: fill INACTIVE expert slots with a non-null
@@ -352,6 +400,91 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             if (e < 0 || e >= n_subs) continue;
                                             const int sister_sub = sister_parent + 1 + e;
                                             pager->prefetch_page(sister_sub);
+                                        }
+                                    }
+
+                                    // MAD-233 — cross-layer N+K MoE expert prefetch.
+                                    //
+                                    // Project the CURRENT layer's active expert set forward to
+                                    // layers [block+1, block+K]. We can't know the true active
+                                    // set for future layers (the router decides per layer), but
+                                    // empirical Qwen3-MoE has 40-50% expert reuse across
+                                    // consecutive tokens — locality enough that prefetching
+                                    // the same indices means most ensure()s for the next layer
+                                    // are cache hits, and the rest at least overlap NVMe I/O
+                                    // with this layer's compute (5 ms per MoE layer).
+                                    //
+                                    // Safety: MAD-231 slot pinning protects this layer's
+                                    // in-flight slots from eviction by the prefetch alloc_slot.
+                                    // Without that, the prefetch could evict a slot the current
+                                    // op is still reading. With MAD-231 the worst case is
+                                    // "prefetch couldn't find an unpinned slot, batch refused,
+                                    // we don't get the win" — never corruption.
+                                    //
+                                    // WP_NEXT_LAYER_PREFETCH_K env tunes lookahead (default 1,
+                                    // 0 disables). Cache the parent list per source-parent for
+                                    // O(1) reuse across all 3 MUL_MAT_IDs of a layer.
+                                    static int s_next_k = -1;
+                                    if (s_next_k < 0) {
+                                        const char * env = std::getenv("WP_NEXT_LAYER_PREFETCH_K");
+                                        s_next_k = env ? std::atoi(env) : 1;
+                                        if (s_next_k < 0) s_next_k = 0;
+                                        LLAMA_LOG_INFO("[wp::eval_cb] WP_NEXT_LAYER_PREFETCH_K=%d "
+                                                       "(0=disabled, requires MAD-231 pinning)\n",
+                                                       s_next_k);
+                                    }
+                                    if (s_next_k > 0) {
+                                        // Cache: weight_page -> vector of consolidated parent
+                                        // indices for blocks [my_block+1, my_block+s_next_k].
+                                        static std::unordered_map<int, std::vector<int>> s_next_layer_parents_cache;
+                                        auto next_it = s_next_layer_parents_cache.find(weight_page);
+                                        if (next_it == s_next_layer_parents_cache.end()) {
+                                            std::vector<int> next_parents;
+                                            const int my_block = meta.block_idx;
+                                            for (int i = 0; i < pager->n_pages(); ++i) {
+                                                const auto & p = pager->page_meta(i);
+                                                if (!p.is_consolidated) continue;
+                                                if (p.block_idx <= my_block) continue;
+                                                if (p.block_idx >  my_block + s_next_k) continue;
+                                                next_parents.push_back(i);
+                                            }
+                                            next_it = s_next_layer_parents_cache.emplace(
+                                                weight_page, std::move(next_parents)).first;
+                                        }
+
+                                        // Build a single batched prefetch covering every
+                                        // (future_parent, active_expert) pair. The batch path
+                                        // (MAD-235) collapses to one io_uring_submit syscall
+                                        // and either queues the whole set atomically or refuses
+                                        // — refusal falls back to per-page prefetch which is
+                                        // best-effort.
+                                        if (!next_it->second.empty()) {
+                                            std::vector<int> future_pages;
+                                            future_pages.reserve(next_it->second.size() * active.size());
+                                            for (int future_parent : next_it->second) {
+                                                for (int e : active) {
+                                                    if (e < 0 || e >= n_subs) continue;
+                                                    future_pages.push_back(future_parent + 1 + e);
+                                                }
+                                            }
+                                            if (!future_pages.empty()) {
+                                                const bool batch_ok = pager->prefetch_pages_batch(future_pages);
+                                                if (!batch_ok) {
+                                                    // Per-page fallback (best-effort, ignores
+                                                    // individual failures — eviction will sort
+                                                    // it out and ensure() on the next layer
+                                                    // falls back to sync if nothing landed).
+                                                    for (int fp : future_pages) {
+                                                        pager->prefetch_page(fp);
+                                                    }
+                                                }
+                                                if (g_debug.mmid_consolidated <= 4) {
+                                                    LLAMA_LOG_INFO("[wp::eval_cb] cross-layer prefetch: %zu pages "
+                                                                   "(parents=%zu, K=%d, batch=%d)\n",
+                                                                   future_pages.size(), next_it->second.size(),
+                                                                   s_next_k, (int) batch_ok);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -476,6 +609,49 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     ++g_debug.ops_with_pages;
 
+    // MAD-232: posix_fadvise(WILLNEED) for the next K layers' paged tensors.
+    // Warms NVMe→page-cache while THIS layer's compute runs, so by the time
+    // the eval-cb reaches layer N+1's ensure() the bytes are already in
+    // page cache (memcpy at ~10 GB/s vs cold pread at ~500 MB/s QD=1).
+    //
+    // Idempotent: the kernel deduplicates overlapping advise hints, and our
+    // sentinel `s_last_advised_block` skips re-issuing for the same boundary.
+    //
+    // Wrap detection: when block_idx drops below `s_last_advised_block` we
+    // assume a new forward pass began (the scheduler revisits block 0). Reset
+    // the sentinel so we re-advise from the current block. This handles both
+    // decode steps and any future op-reordering the scheduler does.
+    //
+    // RAM cost: each advised range is `size` bytes of page-cache pressure.
+    // Tune via WP_FADVISE_LOOKAHEAD (default 2, 0 disables).
+    {
+        static int s_advise_k          = -2;  // -2 = unread env
+        static int s_last_advised_block = -1;
+        if (s_advise_k == -2) {
+            const char * env = std::getenv("WP_FADVISE_LOOKAHEAD");
+            s_advise_k = env ? std::atoi(env) : 2;
+            if (s_advise_k < 0) s_advise_k = 0;
+            LLAMA_LOG_INFO("[wp::eval_cb] WP_FADVISE_LOOKAHEAD=%d (0=disabled)\n", s_advise_k);
+        }
+        if (s_advise_k > 0) {
+            int min_block = std::numeric_limits<int>::max();
+            for (int j = 0; j < n_page_indices; ++j) {
+                const int b = pager->page_meta(page_indices[j]).block_idx;
+                if (b >= 0 && b < min_block) min_block = b;
+            }
+            if (min_block != std::numeric_limits<int>::max()) {
+                if (min_block < s_last_advised_block) {
+                    // New forward pass — sentinel wraps. Re-advise from current.
+                    s_last_advised_block = -1;
+                }
+                if (min_block > s_last_advised_block) {
+                    pager->advise_layer_lookahead(min_block, s_advise_k);
+                    s_last_advised_block = min_block;
+                }
+            }
+        }
+    }
+
     // Step 2: page each one in (waiting on prefetch if in flight, sync
     // fallback otherwise) and patch the matching src tensors.
     ggml_backend_buffer_t pool_buf = pager->pool_buf();
@@ -494,6 +670,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             // keeps debugging signal local to the failing op.
             continue;
         }
+        // MAD-231: pin the slot so a subsequent prefetch alloc_slot in
+        // tick() (or in a later op's pre-cb) cannot evict it while the
+        // GPU is still reading from it. Unpinned at the top of the NEXT
+        // eval_cb invocation.
+        pager->pin_page(page_idx);
+        s_pinned_pages_prev_op.push_back(page_idx);
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
 

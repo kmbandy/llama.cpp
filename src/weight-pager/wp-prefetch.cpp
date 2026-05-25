@@ -195,6 +195,85 @@ bool PrefetchScheduler::submit(int page_idx, int fd_idx, uint64_t file_offset,
     return true;
 }
 
+bool PrefetchScheduler::submit_batch(const std::vector<PrefetchBatchRequest> & reqs) {
+    if (!initialized_) return false;
+    if (reqs.empty())  return true;
+
+    // Pre-flight every request — atomic: if any single one is invalid or
+    // would conflict, reject the whole batch BEFORE touching scheduler state.
+    if ((int) reqs.size() > (int) free_slots_.size()) return false;
+    for (const auto & r : reqs) {
+        if (r.page_idx < 0 || r.dst_vram == nullptr)              return false;
+        if (r.payload_size == 0 || r.payload_size > max_page_size_) return false;
+        if (r.slot_size < r.payload_size)                         return false;
+        if (page_to_slot_.find(r.page_idx) != page_to_slot_.end()) return false;
+    }
+    // Pre-flight also: detect duplicate page_idx within the batch itself.
+    // O(N^2) is fine — N here is the active-expert set (~8-16).
+    for (size_t i = 1; i < reqs.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (reqs[i].page_idx == reqs[j].page_idx) return false;
+        }
+    }
+
+    // Reserve handles + populate slot state.
+    std::vector<int>                handles;
+    std::vector<FileIOBatchRequest> file_reqs;
+    handles.reserve(reqs.size());
+    file_reqs.reserve(reqs.size());
+    for (const auto & r : reqs) {
+        int h = alloc_slot_();
+        if (h < 0) {
+            // Should have been caught by pre-flight; defensive rollback.
+            for (int hh : handles) {
+                slots_[hh] = Slot{};
+                free_slots_.push_back(hh);
+            }
+            return false;
+        }
+        Slot & s       = slots_[h];
+        s.state        = State::Submitted;
+        s.page_idx     = r.page_idx;
+        s.req_id       = next_req_id_++;
+        s.payload_size = r.payload_size;
+        s.slot_size    = r.slot_size;
+        s.dst_vram     = r.dst_vram;
+        s.gpu_event    = -1;
+        handles.push_back(h);
+        file_reqs.push_back(FileIOBatchRequest{
+            s.req_id, r.fd_idx, r.file_offset, r.payload_size, staging_[h]
+        });
+    }
+
+    // Single batched submit — io_uring override collapses to ONE
+    // io_uring_submit syscall covering the whole expert set.
+    const int n_ok = file_io_->submit_batch(file_reqs);
+    if (n_ok != (int) reqs.size()) {
+        // Partial-or-zero queue success. Per the all-or-nothing contract,
+        // undo every slot reservation in this batch — including the ones
+        // that DID succeed (we'd otherwise have orphan slot/page maps with
+        // no completion arriving for the rejected tail).
+        //
+        // Note: for the SUCCESSFUL prefix [0, n_ok) the file_io will still
+        // produce completions later. process_io_ tolerates unknown req_ids
+        // (see comment at its top) so the stray completions are harmless.
+        for (int h : handles) {
+            slots_[h] = Slot{};
+            free_slots_.push_back(h);
+        }
+        return false;
+    }
+
+    // All queued successfully — wire up the lookup maps.
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        const int h = handles[i];
+        const Slot & s = slots_[h];
+        page_to_slot_[s.page_idx] = h;
+        req_to_slot_[s.req_id]    = h;
+    }
+    return true;
+}
+
 void PrefetchScheduler::process_io_(const IoResult & r) {
     auto it = req_to_slot_.find(r.req_id);
     if (it == req_to_slot_.end()) return;  // unknown req — stale or already reaped

@@ -200,6 +200,37 @@ int PageCatalog::add_consolidated_experts(const std::string & name, uint16_t fil
     return first_sub_idx;
 }
 
+int PageCatalog::add_pinned(const std::string & name, void * device_ptr, size_t bytes) {
+    const int idx = static_cast<int>(pages_.size());
+    PageMeta m;
+    m.tensor_name  = name;
+    m.file_idx     = 0;        // unused for pinned
+    m.file_offset  = 0;        // unused for pinned
+    m.size         = bytes;
+    m.is_pinned    = true;
+    m.resident_ptr = device_ptr;
+
+    // Still parse block_idx + classify role from the name — useful for
+    // telemetry filters (e.g. "show pinned ROLE_GATE per layer"). Pinned
+    // tensors don't get counted as expert pages even if their name matches
+    // a role pattern, because they live outside the slot pool.
+    std::string rest;
+    if (parse_block_prefix(name, m.block_idx, rest)) {
+        classify_expert(rest, m);
+        // Don't count toward n_expert_pages_ — pinned tensors aren't paged.
+        m.is_expert       = false;
+        m.is_consolidated = false;
+    }
+
+    pages_.push_back(std::move(m));
+    name_to_idx_.emplace(name, idx);
+    ++n_pinned_pages_;
+    pinned_bytes_ += bytes;
+    // Deliberately do NOT update max_size_ — pinned tensors don't allocate
+    // pool slots, so they must not inflate the slot stride.
+    return idx;
+}
+
 int PageCatalog::find(const std::string & name) const {
     const auto it = name_to_idx_.find(name);
     return it == name_to_idx_.end() ? -1 : it->second;
@@ -236,6 +267,8 @@ void PageCatalog::clear() {
     name_to_idx_.clear();
     max_size_       = 0;
     n_expert_pages_ = 0;
+    n_pinned_pages_ = 0;
+    pinned_bytes_   = 0;
 }
 
 }  // namespace wp

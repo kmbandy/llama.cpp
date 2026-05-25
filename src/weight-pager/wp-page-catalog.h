@@ -42,6 +42,21 @@ struct PageMeta {
     bool     is_sub_expert    = false;  // true if this entry is a synthesized sub-page
                                         // (one expert of a consolidated parent)
     int      parent_page_idx  = -1;     // for sub-experts: index of consolidated parent
+
+    // MAD-236 — always-resident pin. When true, this entry represents a
+    // tensor whose bytes live in caller-owned VRAM (regular ggml-allocated
+    // buffer for e.g. token_embd, output_norm, router weights). The pager
+    // does NOT allocate a pool slot for it, does NOT read from the file —
+    // ensure(page_idx) just returns `resident_ptr`. Useful for tracking
+    // total VRAM (paged + resident) in one telemetry view and for letting
+    // future mixed-mode workloads (attn-pinned + FFN-paged) be expressed
+    // through the same lookup API.
+    //
+    // NOT to be confused with PoolAllocator's slot pin_count (MAD-231).
+    // That's a refcount on slot-level eviction protection; this is a
+    // catalog-level flag that the page has no slot at all.
+    bool     is_pinned        = false;
+    void *   resident_ptr     = nullptr;  // device ptr; ignored unless is_pinned
 };
 
 // Insertion-ordered, read-mostly map: name -> PageMeta.
@@ -72,6 +87,19 @@ public:
                                  uint64_t file_offset, size_t total_size,
                                  int n_experts);
 
+    // MAD-236 — register a tensor whose bytes already live in caller-owned
+    // VRAM (e.g. token_embd from the model loader's regular ggml buffer).
+    // The pager does NOT allocate a pool slot or read from disk for these
+    // entries — ensure(page_idx) just returns `device_ptr`. Useful for
+    // mixed paged/resident workloads and for unified telemetry.
+    //
+    // file_idx / file_offset are unused for pinned entries; defaults of
+    // (0, 0) are stored so the PageMeta layout stays uniform. `size` is
+    // tracked for the telemetry counters.
+    //
+    // Returns the assigned page index.
+    int add_pinned(const std::string & name, void * device_ptr, size_t bytes);
+
     // Number of registered pages.
     int size() const { return (int) pages_.size(); }
 
@@ -92,6 +120,11 @@ public:
     // Number of expert pages registered.
     int  n_expert_pages() const { return n_expert_pages_; }
 
+    // MAD-236 — pinned (always-resident) page telemetry.
+    bool   has_pinned()    const { return n_pinned_pages_ > 0; }
+    int    n_pinned_pages() const { return n_pinned_pages_; }
+    size_t pinned_bytes()  const { return pinned_bytes_; }
+
     // All page indices for a given layer block (0..n_layer-1). Empty if no
     // pages match. Intended for layer-level prefetch heuristics.
     std::vector<int> pages_for_block(int block_idx) const;
@@ -109,6 +142,9 @@ private:
     std::unordered_map<std::string, int>  name_to_idx_;
     size_t                                max_size_ = 0;
     int                                   n_expert_pages_ = 0;
+    // MAD-236 — pinned (always-resident) tracking.
+    int                                   n_pinned_pages_ = 0;
+    size_t                                pinned_bytes_   = 0;
 };
 
 }  // namespace wp

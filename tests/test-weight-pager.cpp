@@ -7,6 +7,7 @@
 
 #include "weight-pager/wp-page-catalog.h"
 #include "weight-pager/wp-file-io.h"
+#include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
 
 #include "ggml-backend.h"
@@ -535,6 +536,753 @@ static int test_pool_allocator() {
 }
 
 // ---------------------------------------------------------------------------
+// PoolAllocator — popularity counter + hot-slot protection (MAD-237)
+// ---------------------------------------------------------------------------
+//
+// Tests cover:
+//   - mark_used increments hit_count_ alongside LRU bump
+//   - Default threshold 0 ⇒ identical behavior to MAD-231 pure LRU
+//     (re-check existing pool_allocator test still passes — covered by
+//      that test's continued existence)
+//   - With threshold > 0, alloc_slot Pass A skips hot slots and picks the
+//     LRU among cold; Pass B falls back to LRU-among-unpinned when all are
+//     hot (so the pool always makes forward progress)
+//   - Evicted slot's hit_count resets to 0 (new owner has no history)
+//   - lru_walk_hot_skips_ counter increments correctly
+//   - Periodic decay halves all counters every kDecayEvery evictions
+
+static int test_pool_hit_count_basic() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buft unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    // alloc, mark_used 3 times → hit_count should be 3.
+    int s = pool.alloc_slot();
+    EXPECT_EQ_INT(pool.hit_count(s), 0u, "fresh alloc has hit_count 0");
+    pool.mark_used(s);
+    pool.mark_used(s);
+    pool.mark_used(s);
+    EXPECT_EQ_INT(pool.hit_count(s), 3u, "hit_count == 3 after 3 mark_used");
+
+    // OOB hit_count returns 0 safely.
+    EXPECT_EQ_INT(pool.hit_count(-1), 0u, "OOB negative hit_count returns 0");
+    EXPECT_EQ_INT(pool.hit_count(99), 0u, "OOB past-end hit_count returns 0");
+    return fails;
+}
+
+static int test_pool_hot_threshold_protects_in_eviction() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buft unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    // Set threshold = 2: hit_count > 2 is "hot".
+    pool.set_hot_hit_threshold(2);
+    EXPECT_EQ_INT(pool.hot_hit_threshold(), 2u, "threshold set");
+
+    // Allocate all 4 slots in order; LRU order is 0,1,2,3.
+    int s0 = pool.alloc_slot();
+    int s1 = pool.alloc_slot();
+    int s2 = pool.alloc_slot();
+    int s3 = pool.alloc_slot();
+    EXPECT_EQ_INT(s0, 0, "alloc 0");
+    EXPECT_EQ_INT(s3, 3, "alloc 3");
+
+    // Slot 0 is LRU. Bump its hit_count above the threshold to make it hot.
+    pool.mark_used(0);  // 1
+    pool.mark_used(0);  // 2
+    pool.mark_used(0);  // 3 (now > threshold of 2 → HOT)
+    EXPECT_EQ_INT(pool.hit_count(0), 3u, "slot 0 hot with count 3");
+
+    // BUT mark_used also bumps LRU tick. Re-LRU is now slot 1.
+    // We want slot 0 to BE THE LRU FRONT but skipped because hot.
+    // Force the LRU back to 0 by bumping the others harder.
+    pool.mark_used(1); pool.mark_used(1);  // s1 hit_count=2 (NOT hot at threshold=2)
+    pool.mark_used(2);                     // s2 hit_count=1
+    pool.mark_used(3); pool.mark_used(3); pool.mark_used(3);  // s3 hit_count=3 HOT too
+    // Now LRU tick order (oldest first): 0 has the oldest tick because
+    // we bumped 1,2,3 after 0's last bump.
+    // hit_counts: s0=3 (hot), s1=2 (cold), s2=1 (cold), s3=3 (hot).
+    // Pass A should skip 0 and 3, pick LRU among {1, 2}. Tick ordering
+    // had 1 first then 2 → s1 is LRU.
+
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+    int s4 = pool.alloc_slot();
+    EXPECT_EQ_INT(s4, 1, "Pass A picked LRU among cold (s1), not the hot s0");
+    EXPECT_EQ_INT(evicted, 1, "eviction CB fired on slot 1");
+    EXPECT_EQ_INT(pool.hit_count(1), 0u, "evicted slot's hit_count reset");
+    EXPECT(pool.lru_walk_hot_skips() >= 2, "telemetry: skipped >= 2 hot slots");
+    return fails;
+}
+
+static int test_pool_hot_fallback_when_all_hot() {
+    // If every unpinned slot is hot, Pass B picks pure-LRU regardless.
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buft unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/3, /*slot_size=*/64), "pool init");
+    pool.set_hot_hit_threshold(1);
+
+    int s0 = pool.alloc_slot();
+    int s1 = pool.alloc_slot();
+    int s2 = pool.alloc_slot();
+    (void) s2;
+
+    // Make all 3 slots hot.
+    pool.mark_used(0); pool.mark_used(0);
+    pool.mark_used(1); pool.mark_used(1);
+    pool.mark_used(2); pool.mark_used(2);
+    // hit_counts all = 2 (> threshold 1) → all hot. Bumped most recently was s2.
+    // LRU now is s0 (oldest tick).
+
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+    int s3 = pool.alloc_slot();
+    EXPECT_EQ_INT(s3, s0, "Pass B fallback: evicted LRU even though all hot (slot 0)");
+    EXPECT_EQ_INT(evicted, s0, "eviction CB fired on the LRU");
+    return fails;
+}
+
+static int test_pool_default_threshold_zero_is_pure_lru() {
+    // Threshold = 0 (the default) means hot protection is disabled.
+    // Behavior must be identical to MAD-231-only.
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buft unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+    EXPECT_EQ_INT(pool.hot_hit_threshold(), 0u, "default threshold == 0");
+
+    // Fill, make slot 0 very hot, then alloc. With threshold=0, hot
+    // protection is OFF — slot 0 should still be evicted as the LRU.
+    int s0 = pool.alloc_slot();
+    int s1 = pool.alloc_slot();
+    int s2 = pool.alloc_slot();
+    int s3 = pool.alloc_slot();
+    (void) s1; (void) s2; (void) s3;
+    pool.mark_used(0); pool.mark_used(0); pool.mark_used(0);  // very hot
+    // mark_used also bumps LRU tick → s0 is now MRU, not LRU. Bump others
+    // to push s0 back to LRU.
+    pool.mark_used(1); pool.mark_used(2); pool.mark_used(3);
+
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+    int s4 = pool.alloc_slot();
+    EXPECT_EQ_INT(s4, 0, "threshold=0: pure LRU evicts slot 0 despite hit_count");
+    EXPECT_EQ_INT(evicted, 0, "eviction CB on slot 0");
+    EXPECT_EQ_INT(pool.lru_walk_hot_skips(), 0u, "no hot skips when disabled");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// PageCatalog — always-resident pinning (MAD-236)
+// ---------------------------------------------------------------------------
+//
+// Tests cover:
+//   - add_pinned registers correctly: is_pinned=true, resident_ptr matches,
+//     size tracked, file_idx/file_offset zeroed
+//   - Name-based lookup works for pinned entries (find returns the index)
+//   - n_pinned_pages + pinned_bytes telemetry increments correctly
+//   - Pinned entries do NOT inflate max_page_size (must not break slot stride)
+//   - Pinned entries do NOT count toward n_expert_pages even if name pattern
+//     looks expert-shaped (they live outside the slot pool)
+//   - block_idx is still parsed from the name (useful for per-layer telemetry)
+//   - clear() resets the pinned counters
+
+static int test_catalog_add_pinned_basic() {
+    int fails = 0;
+    wp::PageCatalog cat;
+
+    // Sentinel pointers — we don't dereference, just check round-trip.
+    void * fake_embed_ptr  = reinterpret_cast<void *>(0x1000);
+    void * fake_norm_ptr   = reinterpret_cast<void *>(0x2000);
+    void * fake_router_ptr = reinterpret_cast<void *>(0x3000);
+
+    int i_embed  = cat.add_pinned("token_embd.weight",   fake_embed_ptr,  1024 * 1024);
+    int i_norm   = cat.add_pinned("output_norm.weight",  fake_norm_ptr,   8 * 1024);
+    int i_router = cat.add_pinned("blk.0.ffn_gate_inp.weight", fake_router_ptr, 32 * 1024);
+
+    EXPECT_EQ_INT(cat.size(), 3, "3 pinned pages");
+    EXPECT_EQ_INT(cat.n_pinned_pages(), 3, "n_pinned_pages == 3");
+    EXPECT(cat.has_pinned(), "has_pinned == true");
+    EXPECT_EQ_INT(cat.pinned_bytes(),
+                  (size_t) (1024 * 1024 + 8 * 1024 + 32 * 1024),
+                  "pinned_bytes sums correctly");
+
+    // Per-entry round-trip.
+    const auto & e = cat.at(i_embed);
+    EXPECT(e.is_pinned, "embed is_pinned");
+    EXPECT(e.resident_ptr == fake_embed_ptr, "embed resident_ptr matches");
+    EXPECT_EQ_INT(e.size, (size_t) (1024 * 1024), "embed size");
+    EXPECT_EQ_INT(e.file_idx, 0, "pinned file_idx zeroed");
+    EXPECT_EQ_INT(e.file_offset, 0u, "pinned file_offset zeroed");
+
+    // Name lookup.
+    EXPECT_EQ_INT(cat.find("token_embd.weight"), i_embed, "find embed");
+    EXPECT_EQ_INT(cat.find("output_norm.weight"), i_norm, "find norm");
+    EXPECT_EQ_INT(cat.find("blk.0.ffn_gate_inp.weight"), i_router, "find router");
+
+    // block_idx still parsed from name for the router (telemetry useful).
+    EXPECT_EQ_INT(cat.at(i_router).block_idx, 0, "router block_idx parsed");
+
+    // Pinned entries MUST NOT inflate max_page_size — it dictates slot
+    // stride for the pool, and pinned tensors don't use slots.
+    EXPECT_EQ_INT(cat.max_page_size(), 0u, "pinned does not inflate max_page_size");
+
+    // Pinned entries MUST NOT count as expert pages even if the name pattern
+    // matches (router weight has "ffn_" prefix but is single-tensor pinned).
+    EXPECT_EQ_INT(cat.n_expert_pages(), 0, "pinned not counted as expert");
+    EXPECT(!cat.at(i_router).is_expert, "pinned router not classified as expert");
+    return fails;
+}
+
+static int test_catalog_add_pinned_mixed_with_paged() {
+    int fails = 0;
+    wp::PageCatalog cat;
+
+    // Mix: 2 paged + 2 pinned + 1 paged.
+    int p0 = cat.add("blk.0.ffn_gate.weight", 0, 1024, 65536);
+    int p1 = cat.add("blk.0.ffn_up.weight",   0, 66560, 65536);
+    int n0 = cat.add_pinned("token_embd.weight", reinterpret_cast<void *>(0x1000), 1024);
+    int n1 = cat.add_pinned("output_norm.weight", reinterpret_cast<void *>(0x2000), 512);
+    int p2 = cat.add("blk.0.ffn_down.weight", 0, 132096, 65536);
+    (void) p0; (void) p1; (void) n0; (void) n1; (void) p2;
+
+    EXPECT_EQ_INT(cat.size(), 5, "5 total");
+    EXPECT_EQ_INT(cat.n_pinned_pages(), 2, "2 pinned");
+    EXPECT_EQ_INT(cat.pinned_bytes(), 1536u, "pinned bytes 1024+512");
+
+    // max_page_size only reflects PAGED entries (65536), not pinned.
+    EXPECT_EQ_INT(cat.max_page_size(), 65536u, "max_page_size from paged only");
+
+    // is_pinned flag distinguishes correctly.
+    EXPECT(!cat.at(p0).is_pinned, "p0 not pinned");
+    EXPECT(cat.at(n0).is_pinned,  "n0 pinned");
+    EXPECT(cat.at(n1).is_pinned,  "n1 pinned");
+    EXPECT(!cat.at(p2).is_pinned, "p2 not pinned");
+    return fails;
+}
+
+static int test_catalog_clear_resets_pinned_counters() {
+    int fails = 0;
+    wp::PageCatalog cat;
+    cat.add_pinned("a", reinterpret_cast<void *>(0x100), 256);
+    cat.add_pinned("b", reinterpret_cast<void *>(0x200), 512);
+    EXPECT_EQ_INT(cat.n_pinned_pages(), 2, "before clear: 2 pinned");
+    EXPECT_EQ_INT(cat.pinned_bytes(), 768u, "before clear: bytes");
+
+    cat.clear();
+    EXPECT_EQ_INT(cat.n_pinned_pages(), 0, "after clear: 0 pinned");
+    EXPECT_EQ_INT(cat.pinned_bytes(), 0u, "after clear: bytes 0");
+    EXPECT(!cat.has_pinned(), "after clear: has_pinned false");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// PoolAllocator — slot pin / refcount (MAD-231)
+// ---------------------------------------------------------------------------
+//
+// Tests cover:
+//   - Basic pin/unpin lifecycle + is_pinned + pin_count + n_pinned accessors
+//   - Refcount semantics: pin twice, unpin once → still pinned; second unpin clears
+//   - alloc_slot skips pinned slots in the eviction LRU walk
+//   - alloc_slot returns -1 (no crash, no eviction of pinned) when all are pinned
+//   - lru_walk_pinned_skips_ telemetry counter increments correctly
+//   - OOB pin/unpin is a logged no-op (does not corrupt state)
+//   - Underflow unpin is a logged no-op (does not wrap pin_count to 65535)
+
+static int test_pool_pin_basic() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    EXPECT_EQ_INT(pool.n_pinned(), 0, "initially no pins");
+    EXPECT(!pool.is_pinned(0), "slot 0 starts unpinned");
+    EXPECT_EQ_INT(pool.pin_count(0), 0, "slot 0 count 0");
+
+    pool.pin_slot(0);
+    EXPECT(pool.is_pinned(0), "slot 0 pinned after pin_slot");
+    EXPECT_EQ_INT(pool.pin_count(0), 1, "slot 0 refcount 1");
+    EXPECT_EQ_INT(pool.n_pinned(), 1, "n_pinned == 1");
+    EXPECT(!pool.is_pinned(1), "other slots unaffected");
+
+    pool.unpin_slot(0);
+    EXPECT(!pool.is_pinned(0), "slot 0 unpinned");
+    EXPECT_EQ_INT(pool.pin_count(0), 0, "slot 0 refcount back to 0");
+    EXPECT_EQ_INT(pool.n_pinned(), 0, "n_pinned back to 0");
+    return fails;
+}
+
+static int test_pool_pin_refcount() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    pool.pin_slot(2);
+    pool.pin_slot(2);
+    pool.pin_slot(2);
+    EXPECT_EQ_INT(pool.pin_count(2), 3, "triple-pinned refcount 3");
+    EXPECT(pool.is_pinned(2), "still pinned");
+
+    pool.unpin_slot(2);
+    EXPECT_EQ_INT(pool.pin_count(2), 2, "refcount 2 after one unpin");
+    EXPECT(pool.is_pinned(2), "still pinned after one unpin");
+    pool.unpin_slot(2);
+    EXPECT(pool.is_pinned(2), "still pinned after two unpins");
+    pool.unpin_slot(2);
+    EXPECT(!pool.is_pinned(2), "fully unpinned after three unpins");
+
+    // Underflow: extra unpin is a no-op (logged WARN), does NOT wrap.
+    pool.unpin_slot(2);
+    EXPECT_EQ_INT(pool.pin_count(2), 0, "underflow unpin stays at 0 (no wrap)");
+    return fails;
+}
+
+static int test_pool_pin_oob_safe() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    // Out-of-range pin/unpin should not crash and should not affect state.
+    pool.pin_slot(-1);
+    pool.pin_slot(4);
+    pool.pin_slot(999);
+    pool.unpin_slot(-1);
+    pool.unpin_slot(4);
+    EXPECT_EQ_INT(pool.n_pinned(), 0, "OOB pin/unpin leaves state unchanged");
+    EXPECT(!pool.is_pinned(-1), "is_pinned OOB returns false");
+    EXPECT(!pool.is_pinned(4),  "is_pinned past end returns false");
+    EXPECT_EQ_INT(pool.pin_count(-1), 0, "pin_count OOB returns 0");
+    return fails;
+}
+
+static int test_pool_alloc_skips_pinned_in_eviction() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/4, /*slot_size=*/64), "pool init");
+
+    // Fill the pool: slots 0..3 alloc'd in order, so LRU order is 0,1,2,3.
+    int s0 = pool.alloc_slot();
+    int s1 = pool.alloc_slot();
+    int s2 = pool.alloc_slot();
+    int s3 = pool.alloc_slot();
+    EXPECT_EQ_INT(s0, 0, "alloc 0");
+    EXPECT_EQ_INT(s1, 1, "alloc 1");
+    EXPECT_EQ_INT(s2, 2, "alloc 2");
+    EXPECT_EQ_INT(s3, 3, "alloc 3");
+
+    // Pin slot 0 (the LRU front). Next eviction must skip it and pick slot 1.
+    pool.pin_slot(0);
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+    EXPECT_EQ_INT(pool.lru_walk_pinned_skips(), 0u, "skip counter starts at 0");
+
+    int s4 = pool.alloc_slot();
+    EXPECT_EQ_INT(s4, 1, "evicted slot is the LRU among UNPINNED (slot 1, not 0)");
+    EXPECT_EQ_INT(evicted, 1, "eviction callback fired on slot 1, not 0");
+    EXPECT(pool.is_pinned(0), "pinned slot 0 unchanged");
+    EXPECT_EQ_INT(pool.lru_walk_pinned_skips(), 1u, "telemetry: skipped slot 0 once");
+
+    // Pin slot 2 too. Next eviction now skips 0 and 2; picks 3 (slot 1 was
+    // just re-used so it's MRU, leaving 3 as next-LRU among unpinned).
+    pool.pin_slot(2);
+    evicted = -1;
+    int s5 = pool.alloc_slot();
+    EXPECT_EQ_INT(s5, 3, "skips pinned 0 and 2; picks LRU-unpinned (slot 3)");
+    EXPECT_EQ_INT(evicted, 3, "eviction callback fired on slot 3");
+    // Skip counter: this walk skipped both 0 and 2 = +2 → cumulative 3.
+    EXPECT_EQ_INT(pool.lru_walk_pinned_skips(), 3u, "telemetry: cumulative skips = 3");
+
+    pool.unpin_slot(0);
+    pool.unpin_slot(2);
+    return fails;
+}
+
+static int test_pool_alloc_returns_neg1_when_all_pinned() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/3, /*slot_size=*/64), "pool init");
+
+    // Fill and pin every slot.
+    int s0 = pool.alloc_slot();
+    int s1 = pool.alloc_slot();
+    int s2 = pool.alloc_slot();
+    EXPECT_EQ_INT(s0, 0, "alloc 0");
+    EXPECT_EQ_INT(s1, 1, "alloc 1");
+    EXPECT_EQ_INT(s2, 2, "alloc 2");
+    pool.pin_slot(0);
+    pool.pin_slot(1);
+    pool.pin_slot(2);
+    EXPECT_EQ_INT(pool.n_pinned(), 3, "all pinned");
+
+    // alloc_slot should refuse cleanly with -1 — NEVER evict a pinned slot.
+    int evicted = -42;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+    int s3 = pool.alloc_slot();
+    EXPECT_EQ_INT(s3, -1, "alloc_slot returns -1 when all pinned");
+    EXPECT_EQ_INT(evicted, -42, "eviction callback NOT fired");
+    EXPECT(pool.is_pinned(0) && pool.is_pinned(1) && pool.is_pinned(2),
+           "pinned state unchanged after refused alloc");
+
+    // After unpinning one, allocation succeeds and reuses that slot.
+    pool.unpin_slot(1);
+    int s4 = pool.alloc_slot();
+    EXPECT_EQ_INT(s4, 1, "after one unpin, alloc reuses that slot");
+    EXPECT_EQ_INT(evicted, 1, "eviction callback fired on the newly-unpinned slot");
+
+    pool.unpin_slot(0);
+    pool.unpin_slot(2);
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// compute_advise_ranges — MAD-232 posix_fadvise lookahead
+// ---------------------------------------------------------------------------
+//
+// Pure-function test: catalog walk produces the right (fd, offset, size) set
+// for [block_idx+1, block_idx+k]. No I/O, no GPU. Validates:
+//   - Returns empty for k <= 0 or block_idx < 0
+//   - Walks the requested window only (no off-by-one)
+//   - Skips consolidated parents (they have size 0 by construction)
+//   - Includes consolidated sub-experts (which DO have size)
+//   - Preserves (fd_idx, offset, size) fidelity from catalog
+
+static int test_compute_advise_ranges() {
+    int fails = 0;
+    wp::PageCatalog cat;
+
+    // Build a representative catalog:
+    //   blk.0: dense (3 MLP linears)
+    //   blk.1: MoE consolidated (1 parent + 4 sub-experts each gate/up/down)
+    //   blk.2: dense (3 MLP linears)
+    cat.add("blk.0.ffn_gate.weight", /*file_idx=*/0,   1000,  4096);
+    cat.add("blk.0.ffn_up.weight",   /*file_idx=*/0,   5096,  4096);
+    cat.add("blk.0.ffn_down.weight", /*file_idx=*/0,   9192,  4096);
+    cat.add_consolidated_experts("blk.1.ffn_gate_exps.weight", /*file_idx=*/0, 100000, 16384, /*n_experts=*/4);
+    cat.add_consolidated_experts("blk.1.ffn_up_exps.weight",   /*file_idx=*/0, 120000, 16384, /*n_experts=*/4);
+    cat.add_consolidated_experts("blk.1.ffn_down_exps.weight", /*file_idx=*/0, 140000, 16384, /*n_experts=*/4);
+    cat.add("blk.2.ffn_gate.weight", /*file_idx=*/0, 200000,  4096);
+    cat.add("blk.2.ffn_up.weight",   /*file_idx=*/0, 204096,  4096);
+    cat.add("blk.2.ffn_down.weight", /*file_idx=*/0, 208192,  4096);
+
+    // k=0 → empty
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/0, /*k=*/0);
+        EXPECT_EQ_INT(r.size(), 0u, "k=0 returns empty");
+    }
+    // negative block_idx → empty
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/-1, /*k=*/2);
+        EXPECT_EQ_INT(r.size(), 0u, "block_idx<0 returns empty");
+    }
+    // Block 0 → advise block 1 (k=1). Block 1 has 3 parents + 12 sub-experts.
+    // Parents have size 0 (per add_consolidated_experts contract), so only the
+    // 12 sub-experts make it through the size>0 filter.
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/0, /*k=*/1);
+        EXPECT_EQ_INT(r.size(), 12u, "block 0, k=1: 12 sub-experts from block 1");
+        // Each sub-expert size = consolidated/n_experts = 16384/4 = 4096
+        for (const auto & rr : r) {
+            EXPECT_EQ_INT(rr.size, 4096u, "sub-expert size correct");
+            EXPECT_EQ_INT(rr.fd_idx, 0, "sub-expert fd_idx correct");
+        }
+    }
+    // Block 0 → advise blocks 1+2 (k=2). 12 sub-experts + 3 dense linears = 15.
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/0, /*k=*/2);
+        EXPECT_EQ_INT(r.size(), 15u, "block 0, k=2: 12+3");
+    }
+    // Block 1 → advise block 2 only (k=1). 3 dense.
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/1, /*k=*/1);
+        EXPECT_EQ_INT(r.size(), 3u, "block 1, k=1: 3 dense from block 2");
+        // Verify exact (offset, size) from catalog
+        bool found_gate = false, found_up = false, found_down = false;
+        for (const auto & rr : r) {
+            EXPECT_EQ_INT(rr.size, 4096u, "dense linear size");
+            if (rr.offset == 200000) found_gate = true;
+            if (rr.offset == 204096) found_up   = true;
+            if (rr.offset == 208192) found_down = true;
+        }
+        EXPECT(found_gate, "block 2 gate offset");
+        EXPECT(found_up,   "block 2 up offset");
+        EXPECT(found_down, "block 2 down offset");
+    }
+    // Block 2 → advise blocks 3+4 (k=2). Catalog has no blocks > 2, so empty.
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/2, /*k=*/2);
+        EXPECT_EQ_INT(r.size(), 0u, "past end of catalog returns empty");
+    }
+    // Large k overshooting end is harmless — only available blocks are walked.
+    {
+        auto r = wp::compute_advise_ranges(cat, /*block_idx=*/0, /*k=*/100);
+        EXPECT_EQ_INT(r.size(), 15u, "k=100 caps at available blocks");
+    }
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FileIOLayer::submit_batch — MAD-235 batched io_uring submission
+// ---------------------------------------------------------------------------
+//
+// Verifies the batch API delivers the same results as a sequence of singles:
+//   - returns reqs.size() on full success
+//   - completions arrive with the right req_ids and bytes
+//   - bytes match the source file
+//   - out-of-range fd_idx mid-batch aborts cleanly (returns the prefix count)
+//
+// We can't directly assert "one io_uring_submit syscall" from inside the
+// process without strace; the semantic guarantees + the obvious single
+// io_uring_submit call site in the override are enough for a unit test.
+
+static int test_file_io_submit_batch() {
+    int fails = 0;
+
+    char path[] = "/tmp/wp-test-batch-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+    constexpr size_t N = 8192;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 13 + 5) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/false, 8);
+    EXPECT(layer != nullptr, "create_file_io non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    // Batch of 4 reads at distinct offsets.
+    std::vector<uint8_t> dst[4] = {
+        std::vector<uint8_t>(1024),
+        std::vector<uint8_t>(1024),
+        std::vector<uint8_t>(1024),
+        std::vector<uint8_t>(1024),
+    };
+    std::vector<wp::FileIOBatchRequest> reqs = {
+        { /*req_id=*/10, /*fd_idx=*/0, /*offset=*/   0, /*size=*/1024, dst[0].data() },
+        { /*req_id=*/20, /*fd_idx=*/0, /*offset=*/2048, /*size=*/1024, dst[1].data() },
+        { /*req_id=*/30, /*fd_idx=*/0, /*offset=*/4096, /*size=*/1024, dst[2].data() },
+        { /*req_id=*/40, /*fd_idx=*/0, /*offset=*/6144, /*size=*/1024, dst[3].data() },
+    };
+    int n_ok = layer->submit_batch(reqs);
+    EXPECT_EQ_INT(n_ok, 4, "all 4 queued");
+    layer->flush();
+
+    // Drain completions, dedup by req_id.
+    std::vector<bool> seen(50, false);
+    for (int i = 0; i < 20; ++i) {
+        if (layer->pending() == 0) break;
+        wp::IoResult r = layer->wait_any(/*timeout_ms=*/0);
+        if (r.status == wp::IoStatus::Timeout) break;
+        EXPECT(r.status == wp::IoStatus::Ok, "completion OK");
+        EXPECT(r.req_id >= 10 && r.req_id <= 40, "req_id in expected set");
+        if (r.req_id < seen.size()) seen[r.req_id] = true;
+    }
+    EXPECT(seen[10] && seen[20] && seen[30] && seen[40], "all 4 req_ids seen");
+
+    // Verify content for each batch req.
+    EXPECT(std::memcmp(dst[0].data(), pattern.data() +    0, 1024) == 0, "req 10 bytes");
+    EXPECT(std::memcmp(dst[1].data(), pattern.data() + 2048, 1024) == 0, "req 20 bytes");
+    EXPECT(std::memcmp(dst[2].data(), pattern.data() + 4096, 1024) == 0, "req 30 bytes");
+    EXPECT(std::memcmp(dst[3].data(), pattern.data() + 6144, 1024) == 0, "req 40 bytes");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
+static int test_file_io_submit_batch_partial_failure() {
+    // Mid-batch invalid fd_idx aborts cleanly at the prefix that succeeded.
+    int fails = 0;
+    char path[] = "/tmp/wp-test-batchp-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 1;
+    constexpr size_t N = 4096;
+    std::vector<uint8_t> pattern(N, 0xAB);
+    write(fd, pattern.data(), N);
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/false, 4);
+    if (!layer) { unlink(path); return fails; }
+
+    std::vector<uint8_t> d0(512), d1(512), d2(512);
+    std::vector<wp::FileIOBatchRequest> reqs = {
+        { /*req_id=*/1, /*fd_idx=*/0,    0,  512, d0.data() },
+        { /*req_id=*/2, /*fd_idx=*/99,  // BAD fd — batch stops here
+                                          512,  512, d1.data() },
+        { /*req_id=*/3, /*fd_idx=*/0, 1024,  512, d2.data() },  // never queued
+    };
+    int n_ok = layer->submit_batch(reqs);
+    EXPECT_EQ_INT(n_ok, 1, "batch stopped at bad fd; only first queued");
+
+    // Drain the single queued completion.
+    layer->flush();
+    int n_completed = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (layer->pending() == 0) break;
+        wp::IoResult r = layer->wait_any(/*timeout_ms=*/0);
+        if (r.status == wp::IoStatus::Timeout) break;
+        ++n_completed;
+        EXPECT_EQ_INT(r.req_id, 1, "only req 1 completes");
+    }
+    EXPECT_EQ_INT(n_completed, 1, "exactly one completion");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// FileIOLayer::advise_prefetch — MAD-232 integration with a real fd
+// ---------------------------------------------------------------------------
+//
+// Verifies posix_fadvise(WILLNEED) doesn't trash the fd: bytes remain
+// readable after advise (which would catch a bad off/size getting clamped
+// into an unreadable state). Out-of-range fd_idx is a silent no-op (matches
+// the safe default for all "hint" APIs — never break correctness on bad
+// inputs). On non-Linux builds the impl is a no-op and we just verify
+// reads still work afterward.
+
+static int test_file_io_advise_prefetch() {
+    int fails = 0;
+
+    char path[] = "/tmp/wp-test-advise-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+    constexpr size_t N = 8192;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 31 + 7) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/false, 4);
+    EXPECT(layer != nullptr, "create_file_io returns non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    // Valid advise — should not crash, should not affect subsequent reads.
+    layer->advise_prefetch(/*fd_idx=*/0, /*offset=*/0,    /*size=*/4096);
+    layer->advise_prefetch(/*fd_idx=*/0, /*offset=*/4096, /*size=*/4096);
+
+    // Out-of-range fd_idx is a silent no-op.
+    layer->advise_prefetch(/*fd_idx=*/99, /*offset=*/0,   /*size=*/4096);
+    layer->advise_prefetch(/*fd_idx=*/-1, /*offset=*/0,   /*size=*/4096);
+
+    // size=0 is a no-op (advising an empty range is meaningless; some kernels
+    // treat it as "whole file" via the same syscall, which we don't want).
+    layer->advise_prefetch(/*fd_idx=*/0, /*offset=*/0, /*size=*/0);
+
+    // Bytes remain readable after advise.
+    std::vector<uint8_t> dst(N);
+    bool ok = layer->submit(/*req=*/1, /*fd_idx=*/0, 0, N, dst.data());
+    EXPECT(ok, "submit after advise");
+    wp::IoResult r = layer->wait_any(/*timeout_ms=*/0);
+    EXPECT(r.status == wp::IoStatus::Ok, "read OK after advise");
+    EXPECT_EQ_INT(r.bytes_read, (int) N, "full bytes after advise");
+    EXPECT(std::memcmp(dst.data(), pattern.data(), N) == 0, "content matches after advise");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// MAD-234 — UMA detection + MemAvailable parse
+// ---------------------------------------------------------------------------
+//
+// Pure-function tests for is_uma_archname() (no HIP needed) and a runtime
+// sanity check on read_mem_available_bytes(). is_uma_device() needs a real
+// HIP device so it's only smoke-tested under GGML_USE_HIP — and even then
+// it can't fail-fast because the actual UMA-vs-discrete state depends on
+// the host machine. We log what it sees and move on.
+
+static int test_is_uma_archname() {
+    int fails = 0;
+
+    // Known UMA prefixes — match by prefix (HIP appends sram/xnack suffixes).
+    EXPECT(wp::is_uma_archname("gfx1151"),                    "gfx1151 (Strix Halo)");
+    EXPECT(wp::is_uma_archname("gfx1150:sramecc+:xnack-"),    "gfx1150 with suffix");
+    EXPECT(wp::is_uma_archname("gfx1152"),                    "gfx1152");
+    EXPECT(wp::is_uma_archname("gfx1103"),                    "gfx1103 (Phoenix)");
+    EXPECT(wp::is_uma_archname("gfx1103:sramecc-:xnack-"),    "gfx1103 with suffix");
+    EXPECT(wp::is_uma_archname("gfx90c"),                     "gfx90c (Renoir/Cezanne)");
+    EXPECT(wp::is_uma_archname("gfx940"),                     "gfx940 (MI300A)");
+
+    // Discrete GPUs (RDNA2/3/4 desktop) — must be reported as non-UMA.
+    EXPECT(!wp::is_uma_archname("gfx1030"),                   "gfx1030 (6900 XT) NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx1031"),                   "gfx1031 (6800)    NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx1101"),                   "gfx1101 (7800)    NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx1200"),                   "gfx1200 (9070)    NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx1201"),                   "gfx1201 (R9700)   NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx906"),                    "gfx906 (MI50)     NOT UMA");
+    EXPECT(!wp::is_uma_archname("gfx908"),                    "gfx908 (MI100)    NOT UMA");
+
+    // Edge cases.
+    EXPECT(!wp::is_uma_archname(nullptr),                     "nullptr returns false");
+    EXPECT(!wp::is_uma_archname(""),                          "empty string returns false");
+    EXPECT(!wp::is_uma_archname("gfx"),                       "too-short prefix returns false");
+    EXPECT(!wp::is_uma_archname("not-a-gfx-string"),          "non-gfx prefix returns false");
+
+    return fails;
+}
+
+static int test_read_mem_available_bytes() {
+    int fails = 0;
+    const size_t mem = wp::read_mem_available_bytes();
+#if defined(__linux__)
+    // On Linux /proc/meminfo always reports MemAvailable. Anything > 16 MiB
+    // is plausible on any machine that can run this test binary.
+    EXPECT(mem > 16ULL * 1024 * 1024, "Linux: MemAvailable > 16 MiB");
+    std::fprintf(stderr, "  INFO: MemAvailable = %.2f GiB\n",
+                 (double) mem / (1024.0 * 1024.0 * 1024.0));
+#else
+    // Non-Linux: helper returns 0 by contract.
+    EXPECT_EQ_INT(mem, 0u, "non-Linux: MemAvailable returns 0");
+#endif
+    return fails;
+}
+
+static int test_is_uma_device_smoke() {
+    // Cannot assert true/false without knowing the host's GPU topology.
+    // The point of this smoke test is to make sure is_uma_device(0) doesn't
+    // crash and returns SOMETHING when HIP is available. On non-HIP builds
+    // it must return false.
+    int fails = 0;
+    const bool result = wp::is_uma_device(0);
+    std::fprintf(stderr, "  INFO: is_uma_device(0) = %s (informational; "
+                          "expected true on Strix Halo / Phoenix, false on dGPU)\n",
+                 result ? "true" : "false");
+
+    // Negative device_idx is always false (sentinel for "skip the check").
+    EXPECT(!wp::is_uma_device(-1), "is_uma_device(-1) returns false");
+    EXPECT(!wp::is_uma_device(-99), "is_uma_device(very negative) returns false");
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -551,7 +1299,26 @@ int main() {
         { "page_catalog_consolidated",   test_page_catalog_consolidated_split },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
+        { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
+        { "file_io_submit_batch",            test_file_io_submit_batch            },
+        { "file_io_submit_batch_partial",    test_file_io_submit_batch_partial_failure },
+        { "compute_advise_ranges",    test_compute_advise_ranges    },
+        { "is_uma_archname",          test_is_uma_archname          },
+        { "read_mem_available_bytes", test_read_mem_available_bytes },
+        { "is_uma_device_smoke",      test_is_uma_device_smoke      },
         { "pool_allocator",     test_pool_allocator     },
+        { "pool_pin_basic",                       test_pool_pin_basic                       },
+        { "pool_pin_refcount",                    test_pool_pin_refcount                    },
+        { "pool_pin_oob_safe",                    test_pool_pin_oob_safe                    },
+        { "pool_alloc_skips_pinned_in_eviction",  test_pool_alloc_skips_pinned_in_eviction  },
+        { "pool_alloc_returns_neg1_when_all_pinned", test_pool_alloc_returns_neg1_when_all_pinned },
+        { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
+        { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
+        { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },
+        { "pool_hit_count_basic",                test_pool_hit_count_basic                },
+        { "pool_hot_threshold_protects",         test_pool_hot_threshold_protects_in_eviction },
+        { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
+        { "pool_default_threshold_zero_lru",     test_pool_default_threshold_zero_is_pure_lru },
     };
 
     for (const auto & t : tests) {

@@ -60,6 +60,10 @@ WeightPager::~WeightPager() {
     shutdown();
 }
 
+int WeightPager::register_pinned(const std::string & name, void * device_ptr, size_t bytes) {
+    return catalog_.add_pinned(name, device_ptr, bytes);
+}
+
 int WeightPager::add_page(const std::string & name, uint16_t file_idx,
                           uint64_t file_offset, size_t size, int n_experts) {
     // Non-MoE / per-expert tensor: add as-is.
@@ -121,13 +125,31 @@ bool WeightPager::init(const Config &             cfg,
         return false;
     }
 
-    // 1. VRAM pool.
-    if (!pool_.init(device_buft, cfg_.n_slots, slot_size)) {
+    // 1. VRAM pool. Pass device_idx so the pool can detect UMA / APU devices
+    //    (Strix Halo etc.) and refuse oversized requests up front rather than
+    //    silently allocating from system RAM and triggering a swap storm.
+    //    MAD-234.
+    if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: pool allocation failed\n");
         env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
         return false;
     }
     pool_.set_eviction_callback([this](int slot_idx) { on_pool_evict_(slot_idx); });
+
+    // MAD-237: opt-in hot-slot protection. Off by default (threshold=0 ⇒
+    // pure LRU = MAD-231 behaviour). Operators enable via env when their
+    // workload has measurable expert reuse (typically MoE with skewed
+    // routing distribution). Cheap to leave off; nothing else changes.
+    if (const char * env = std::getenv("WP_HOT_HIT_THRESHOLD")) {
+        long t = std::strtol(env, nullptr, 10);
+        if (t < 0) t = 0;
+        pool_.set_hot_hit_threshold((uint32_t) t);
+        if (t > 0) {
+            LLAMA_LOG_INFO("wp::WeightPager: WP_HOT_HIT_THRESHOLD=%ld "
+                           "(slots with hit_count > %ld are skipped in LRU "
+                           "eviction Pass A)\n", t, t);
+        }
+    }
 
     // 2. Per-device transfer stream + event pool. Size events generously
     //    so prefetch never blocks waiting for an event.
@@ -270,6 +292,14 @@ void * WeightPager::ensure(int page_idx) {
     if (!initialized_)                                         return nullptr;
     if (page_idx < 0 || page_idx >= catalog_.size())           return nullptr;
 
+    // MAD-236 — pinned (always-resident) pages live in caller-owned VRAM,
+    // not the pool. No slot lookup, no LRU update, no IO. Just return the
+    // registered device pointer. Cheap and short-circuits the whole pipeline.
+    const PageMeta & m_check = catalog_.at(page_idx);
+    if (m_check.is_pinned) {
+        return m_check.resident_ptr;
+    }
+
     // Already committed? Bump LRU and return.
     if (page_loaded_[page_idx]) {
         const int slot = page_to_slot_[page_idx];
@@ -305,6 +335,7 @@ void * WeightPager::ensure(int page_idx) {
 void WeightPager::prefetch_page(int page_idx) {
     if (!initialized_)                                          return;
     if (page_idx < 0 || page_idx >= catalog_.size())            return;
+    if (catalog_.at(page_idx).is_pinned)                        return;  // MAD-236: already resident, no slot needed
     if (page_to_slot_[page_idx] >= 0)                            return;  // loaded or in flight
 
     // Allocate (or evict) a slot now so the prefetch knows where to land.
@@ -331,6 +362,131 @@ void WeightPager::prefetch_page(int page_idx) {
 void WeightPager::tick() {
     if (!initialized_) return;
     prefetch_.tick();
+}
+
+bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices) {
+    if (!initialized_) return false;
+    if (page_indices.empty()) return true;
+
+    // Filter to pages that actually need prefetching (skip already-resident
+    // and already-in-flight). Skipping is not a failure — common case is the
+    // MoE re-uses some experts from the previous layer.
+    std::vector<int> needed;
+    needed.reserve(page_indices.size());
+    for (int p : page_indices) {
+        if (p < 0 || p >= catalog_.size()) continue;
+        if (catalog_.at(p).is_pinned)   continue;  // MAD-236: pinned needs no prefetch
+        if (page_to_slot_[p] >= 0)      continue;  // resident or in flight
+        // Dedupe within input.
+        bool dup = false;
+        for (int q : needed) {
+            if (q == p) { dup = true; break; }
+        }
+        if (!dup) needed.push_back(p);
+    }
+    if (needed.empty()) return true;
+
+    // Reserve N slots up-front. On failure (any unable to alloc, e.g. all
+    // currently pinned per MAD-231), release the prefix and report.
+    std::vector<int> slots;
+    slots.reserve(needed.size());
+    for (size_t i = 0; i < needed.size(); ++i) {
+        const int s = pool_.alloc_slot();
+        if (s < 0) {
+            for (int prev : slots) {
+                pool_.release_slot(prev);
+            }
+            return false;
+        }
+        slots.push_back(s);
+    }
+
+    // Wire the provisional page→slot bookkeeping (matches what prefetch_page
+    // does pre-submit). The scheduler's submit_batch will see clean state —
+    // it checks ITS OWN page_to_slot_ map, not ours — but populating ours
+    // here prevents a concurrent caller (none today, but defensive) from
+    // double-prefetching the same page.
+    std::vector<PrefetchBatchRequest> reqs;
+    reqs.reserve(needed.size());
+    for (size_t i = 0; i < needed.size(); ++i) {
+        const int page_idx = needed[i];
+        const int slot     = slots[i];
+        page_to_slot_[page_idx] = slot;
+        page_loaded_[page_idx]  = false;
+        slot_to_page_[slot]     = page_idx;
+
+        const PageMeta & m = catalog_.at(page_idx);
+        reqs.push_back(PrefetchBatchRequest{
+            page_idx, (int) m.file_idx, m.file_offset, m.size,
+            slot_ptr_(slot), pool_.slot_size()
+        });
+    }
+
+    if (!prefetch_.submit_batch(reqs)) {
+        // Roll back EVERYTHING — page maps, slot_to_page maps, pool slots.
+        // The all-or-nothing contract makes this clean: scheduler made no
+        // promises about half-completed state, so we don't need to chase
+        // partial scheduler progress.
+        for (size_t i = 0; i < needed.size(); ++i) {
+            page_to_slot_[needed[i]] = -1;
+            slot_to_page_[slots[i]]  = -1;
+            pool_.release_slot(slots[i]);
+        }
+        return false;
+    }
+    return true;
+}
+
+void WeightPager::pin_page(int page_idx) {
+    if (!initialized_) return;
+    if (page_idx < 0 || page_idx >= (int) page_to_slot_.size()) return;
+    const int slot = page_to_slot_[page_idx];
+    if (slot < 0) return;  // page not resident; nothing to pin
+    pool_.pin_slot(slot);
+}
+
+void WeightPager::unpin_page(int page_idx) {
+    if (!initialized_) return;
+    if (page_idx < 0 || page_idx >= (int) page_to_slot_.size()) return;
+    const int slot = page_to_slot_[page_idx];
+    if (slot < 0) return;  // page evicted between pin and unpin — refcount was on a
+                            // slot that's been reassigned; not our problem (and the
+                            // refcount on the new owner would be wrong if we touched it).
+    pool_.unpin_slot(slot);
+}
+
+std::vector<AdviseRange> compute_advise_ranges(const PageCatalog & catalog,
+                                                int                 block_idx,
+                                                int                 k) {
+    std::vector<AdviseRange> out;
+    if (k <= 0 || block_idx < 0) return out;
+
+    // Walk forward k layers. pages_for_block already filters by block_idx;
+    // we additionally drop consolidated parents — they carry the full
+    // consolidated size for other consumers (eval-cb lookup), but the disk
+    // bytes are already covered by the per-expert sub-pages, so advising
+    // them again would double-count the file range.
+    out.reserve((size_t) k * 8);  // ~3 dense / ~16 MoE per block, headroom
+    for (int b = block_idx + 1; b <= block_idx + k; ++b) {
+        const std::vector<int> pages = catalog.pages_for_block(b);
+        for (int page_idx : pages) {
+            const PageMeta & m = catalog.at(page_idx);
+            if (m.is_consolidated) continue;    // parents — children cover the bytes
+            if (m.size == 0)       continue;    // defence-in-depth for malformed entries
+            out.push_back(AdviseRange{m.file_idx, m.file_offset, m.size});
+        }
+    }
+    return out;
+}
+
+void WeightPager::advise_layer_lookahead(int block_idx, int k) {
+    if (!initialized_ || file_io_ == nullptr) return;
+    if (k <= 0 || block_idx < 0)              return;
+
+    const std::vector<AdviseRange> ranges = compute_advise_ranges(catalog_, block_idx, k);
+    for (const auto & r : ranges) {
+        file_io_->advise_prefetch((int) r.fd_idx, r.offset, r.size);
+    }
 }
 
 int WeightPager::page_in_sync_(int page_idx) {
