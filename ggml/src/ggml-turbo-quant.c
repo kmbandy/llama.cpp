@@ -1007,3 +1007,188 @@ void dequantize_row_turbo4_fp8_bs256(const block_turbo4_fp8_bs256 * GGML_RESTRIC
     (void) x; (void) y; (void) k;
     GGML_ABORT("turbo4_fp8_bs256: generic dequantize_row not supported (needs per-(kv,layer) runtime LUT); use the custom KV cache decode path");
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// MAD-223 Phase G.2: ml8-4 weight quant + fp8 e4m3 centroid storage.
+//
+// The standard ggml dequant signature `(const block*, float*, n)` has no
+// slot for the per-K-group centroid LUT that ml8 requires. We keep the
+// standard `dequantize_row_ml8_4` as an abort stub (so misuse is loud) and
+// provide `dequantize_row_ml8_4_with_lut` as the actually-useful entry
+// point. The matmul graph node (G.3) obtains the LUT from the sidecar
+// tensor `<weight>.centroids` via op_params and calls the `_with_lut`
+// variant.
+//
+// fp8 e4m3 conversions follow the PyTorch `float8_e4m3fn` (OCP-style)
+// encoding — sign bit + 4-bit exponent (bias 7) + 3-bit mantissa, only
+// S.1111.111 = NaN (no inf, no other NaNs), max normal magnitude = 448.
+//
+// See aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md §2.
+// ──────────────────────────────────────────────────────────────────────────
+
+// e4m3 → fp32 lookup table — precomputed, 256 entries, 1 KB total. Cheaper
+// than the bit-twiddling for hot paths and avoids subnormal-shift logic at
+// call sites. Initialized lazily on first use; deterministic content.
+static float       g_fp8_e4m3_lut[256];
+static int         g_fp8_e4m3_lut_init = 0;
+static inline void ml8_init_fp8_e4m3_lut(void) {
+    if (g_fp8_e4m3_lut_init) return;
+    for (int i = 0; i < 256; i++) {
+        uint32_t x = (uint32_t) i;
+        uint32_t s = (x >> 7) & 1u;
+        uint32_t e = (x >> 3) & 0xFu;
+        uint32_t m = x & 0x7u;
+        float    f;
+        if (e == 0 && m == 0) {
+            // ±0
+            uint32_t bits = s << 31;
+            memcpy(&f, &bits, 4);
+        } else if (e == 15 && m == 7) {
+            // NaN (e4m3fn convention: only S.1111.111 is NaN; no infinities)
+            uint32_t bits = (s << 31) | (0xFFu << 23) | (1u << 22);
+            memcpy(&f, &bits, 4);
+        } else if (e == 0) {
+            // Subnormal: value = (-1)^s * 2^(-6) * (m/8)
+            // Renormalize for fp32: find leading bit position in m (3 bits)
+            int       lead = (m >= 4) ? 2 : (m >= 2) ? 1 : 0;
+            uint32_t  mant_norm = ((m << (3 - lead)) & 0x7u);  // strip leading 1
+            int       exp_un    = -6 - (2 - lead);
+            uint32_t  exp_fp32  = (uint32_t)(exp_un + 127);
+            uint32_t  bits      = (s << 31) | (exp_fp32 << 23) | (mant_norm << 20);
+            memcpy(&f, &bits, 4);
+        } else {
+            // Normal: value = (-1)^s * 2^(e-7) * (1 + m/8)
+            // fp32 exp = (e-7) + 127 = e + 120
+            uint32_t exp_fp32 = e + 120u;
+            uint32_t mant     = m << 20;  // 3 bits → top of 23-bit fp32 mantissa
+            uint32_t bits     = (s << 31) | (exp_fp32 << 23) | mant;
+            memcpy(&f, &bits, 4);
+        }
+        g_fp8_e4m3_lut[i] = f;
+    }
+    g_fp8_e4m3_lut_init = 1;
+}
+
+// ── ml8_4 ─────────────────────────────────────────────────────────────────
+
+void quantize_row_ml8_4_ref(const float * GGML_RESTRICT x, block_ml8_4 * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("ml8_4: quantize_row_ref not supported — calibration is offline (scripts/calibration/calibrate_ml8.py)");
+}
+
+void dequantize_row_ml8_4(const block_ml8_4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    (void) x; (void) y; (void) k;
+    GGML_ABORT("ml8_4: generic dequantize_row not supported — use dequantize_row_ml8_4_with_lut (requires per-K-group centroid LUT sidecar)");
+}
+
+void dequantize_row_ml8_4_with_lut(const block_ml8_4 * GGML_RESTRICT x,
+                                   const uint8_t * GGML_RESTRICT lut_fp8,
+                                   float * GGML_RESTRICT y,
+                                   int64_t k) {
+    GGML_ASSERT(k % QK_ML8 == 0);
+    ml8_init_fp8_e4m3_lut();
+    const int64_t n_groups = k / QK_ML8;
+    for (int64_t g = 0; g < n_groups; g++) {
+        const block_ml8_4 *blk    = &x[g];
+        const uint8_t     *lut_g  = &lut_fp8[g * 16];
+        const float        scale  = blk->scale;
+        float             *out    = &y[g * QK_ML8];
+        // Per-block: 32 packed bytes → 64 indices → 64 fp32 outputs.
+        for (int i = 0; i < QK_ML8 / 2; i++) {
+            const uint8_t packed = blk->qs[i];
+            const uint8_t lo_idx = packed & 0x0Fu;          // K-position 2i   (lo-nibble first)
+            const uint8_t hi_idx = (packed >> 4) & 0x0Fu;   // K-position 2i+1
+            out[2 * i]     = g_fp8_e4m3_lut[lut_g[lo_idx]] * scale;
+            out[2 * i + 1] = g_fp8_e4m3_lut[lut_g[hi_idx]] * scale;
+        }
+    }
+}
+
+// ── f8_e4m3 ───────────────────────────────────────────────────────────────
+
+void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    ml8_init_fp8_e4m3_lut();
+    for (int64_t i = 0; i < k; i++) {
+        y[i] = g_fp8_e4m3_lut[x[i]];
+    }
+}
+
+void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
+    // Round-to-nearest-even fp32 → fp8 e4m3fn. Saturates at ±448 (no inf in
+    // this variant). NaN inputs map to S.1111.111. Used at calibration-time
+    // export; not on the hot path.
+    for (int64_t i = 0; i < k; i++) {
+        const float    xv = x[i];
+        uint32_t       bits;
+        memcpy(&bits, &xv, 4);
+        const uint32_t sign  = (bits >> 31) & 1u;
+        const uint32_t exp_b = (bits >> 23) & 0xFFu;
+        const uint32_t mant  = bits & 0x7FFFFFu;
+
+        // NaN or Inf input → e4m3 NaN (S.1111.111)
+        if (exp_b == 0xFFu) {
+            y[i] = (uint8_t)((sign << 7) | 0x7Fu);
+            continue;
+        }
+        // Zero (handles both fp32 zero and fp32 subnormal which maps to e4m3 zero)
+        if (exp_b == 0) {
+            y[i] = (uint8_t)(sign << 7);
+            continue;
+        }
+
+        const int32_t e_un = (int32_t) exp_b - 127;
+
+        // Saturate: e4m3 max = S.1111.110 = ±448 = 2^8 * 1.75
+        if (e_un >= 9 || (e_un == 8 && mant >= 0x600000u)) {
+            y[i] = (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
+            continue;
+        }
+
+        if (e_un >= -6) {
+            // Normal e4m3: e ∈ {1..14}, m ∈ {0..7}
+            const uint32_t e_e4m3 = (uint32_t)(e_un + 7);
+            // RNE on bottom 20 bits of fp32 mantissa (keep top 3 of 23)
+            const uint32_t guard  = (mant >> 19) & 1u;
+            const uint32_t sticky = (mant & ((1u << 19) - 1)) != 0 ? 1u : 0u;
+            const uint32_t lsb    = (mant >> 20) & 1u;
+            uint32_t       m_e4m3 = (mant >> 20) & 0x7u;
+            if (guard && (sticky || lsb)) m_e4m3 += 1;
+            uint32_t e_out = e_e4m3;
+            if (m_e4m3 == 8) {
+                m_e4m3 = 0;
+                e_out += 1;
+                if (e_out >= 15) {
+                    y[i] = (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
+                    continue;
+                }
+            }
+            // Defensive: don't accidentally synthesize NaN (e=15, m=7)
+            if (e_out == 15 && m_e4m3 == 7) m_e4m3 = 6;
+            y[i] = (uint8_t)((sign << 7) | (e_out << 3) | m_e4m3);
+            continue;
+        }
+
+        // Subnormal e4m3: |x| < 2^-6
+        // Express target |x| ≈ 2^-6 * (m/8) where m ∈ {0..7}; m = round(|x| * 2^9).
+        // |x| * 2^9 = (2^23 + mant) >> (23 - (e_un + 9))   (with RNE on the dropped bits)
+        const int32_t shift = 23 - (e_un + 9);  // shift ≥ 21
+        if (shift > 31) {
+            y[i] = (uint8_t)(sign << 7);
+            continue;
+        }
+        const uint32_t implicit = (1u << 23) | mant;
+        const uint32_t guard    = (implicit >> (shift - 1)) & 1u;
+        const uint32_t sticky   = (implicit & ((1u << (shift - 1)) - 1)) != 0 ? 1u : 0u;
+        uint32_t       m_e4m3   = implicit >> shift;
+        const uint32_t lsb      = m_e4m3 & 1u;
+        if (guard && (sticky || lsb)) m_e4m3 += 1;
+
+        if (m_e4m3 >= 8) {
+            // Rounded into smallest normal e4m3 (e=1, m=0)
+            y[i] = (uint8_t)((sign << 7) | (1u << 3));
+        } else {
+            // e=0 subnormal (m=0 means ±0)
+            y[i] = (uint8_t)((sign << 7) | m_e4m3);
+        }
+    }
+}

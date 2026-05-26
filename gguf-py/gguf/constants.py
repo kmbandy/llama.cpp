@@ -4142,6 +4142,10 @@ class GGMLQuantizationType(IntEnum):
     MXFP4   = 39
     NVFP4   = 40
     Q1_0    = 41
+    # MAD-223 Phase G: ml8-4 weight quantization + fp8 e4m3 centroid storage.
+    # See ggml/src/ggml-cuda/aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md.
+    ML8_4    = 48
+    F8_E4M3  = 49
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4317,6 +4321,10 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+    # MAD-223 Phase G: 4-byte fp32 scale + 32 packed 4-bit indices per 64 elements
+    GGMLQuantizationType.ML8_4:   (64, 4 + 32),
+    # Non-block 1-byte fp8 e4m3 storage; used as sidecar dtype for ml8 centroids
+    GGMLQuantizationType.F8_E4M3: (1, 1),
 }
 
 

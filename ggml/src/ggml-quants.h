@@ -131,6 +131,34 @@ GGML_API size_t quantize_tq4_1s(const float * GGML_RESTRICT src, void * GGML_RES
 GGML_API void quantize_row_turbo4_fp8_bs256_ref(const float * GGML_RESTRICT x, block_turbo4_fp8_bs256 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo4_fp8_bs256(const block_turbo4_fp8_bs256 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// MAD-223 Phase G: ml8-4 weight quantization + fp8 e4m3 centroid storage.
+// Phase G.1 ships stubs only — real implementations land in G.2 alongside the
+// CPU dequant + vec_dot fallback. ml8_4 specifically cannot be implemented
+// via the standard `(block*, float*, n)` signature because dequant requires
+// the per-K-group centroid LUT sidecar; the matmul graph node carries it via
+// op_params. These stubs exist solely to satisfy the ggml_type type-trait
+// table and abort if anything else tries the standard API.
+// See aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md §2.1.
+GGML_API void quantize_row_ml8_4_ref(const float * GGML_RESTRICT x, block_ml8_4 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_ml8_4(const block_ml8_4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// G.2: extended-signature ml8 dequant that takes the per-K-group centroid LUT.
+// The standard `dequantize_row_ml8_4` continues to abort since the standard
+// signature has no slot for the LUT. The matmul graph node calls this one
+// with the sidecar LUT pointer obtained via op_params (G.3).
+//
+//   x        : [n_groups_k] block_ml8_4 — one row's worth of indices + scales
+//   lut_fp8  : [n_groups_k * 16] uint8 fp8 e4m3 — per-K-group centroid table
+//   y        : [k] float output
+//   k        : row length, must equal n_groups_k * QK_ML8
+GGML_API void dequantize_row_ml8_4_with_lut(const block_ml8_4 * GGML_RESTRICT x,
+                                            const uint8_t * GGML_RESTRICT lut_fp8,
+                                            float * GGML_RESTRICT y,
+                                            int64_t k);
+
+GGML_API void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

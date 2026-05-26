@@ -206,4 +206,12 @@ if (GGML_HIP_AITER)
     add_subdirectory(../ggml-cuda/aiter-integration aiter-integration)
     target_link_libraries(ggml-hip PRIVATE aiter_triton_aot)
     target_compile_definitions(ggml-hip PRIVATE GGML_HIP_AITER)
+    # The aiter_triton_aot target exposes wrappers/ as PUBLIC includes, but
+    # under multi-arch HIP cross-compilation the propagation through PRIVATE
+    # linkage does not always reach every per-arch compile pass (gfx1030
+    # specifically). Add the include path explicitly so mt_pagedattn_aiter.cu
+    # — and any other .cu in ggml-cuda/ that consumes wrappers/ headers —
+    # builds for every requested AMDGPU_TARGETS arch.
+    target_include_directories(ggml-hip PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/aiter-integration/wrappers)
 endif()

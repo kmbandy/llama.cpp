@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-ml8.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -901,6 +902,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         return true;
     }
 
+    // ml8-4 weights (MAD-223) are matmul'd via GGML_OP_ML8_MUL_MAT, not the
+    // generic MUL_MAT. The LLM_TENSOR_INFOS table tags FFN_GATE/UP/DOWN with
+    // MUL_MAT (right for every other weight type), so without this swap the
+    // backend probe asks the wrong question and ml8_4 weights get kicked off
+    // GPU buffers despite the HIP backend supporting ML8_MUL_MAT.
+    if (op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_ML8_4) {
+        op = GGML_OP_ML8_MUL_MAT;
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
         /*.mem_buffer =*/ NULL,
@@ -924,6 +934,17 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
+            } break;
+        case GGML_OP_ML8_MUL_MAT:
+            {
+                // MAD-223 G.4.f: ml8-4 dense GEMM. Construct a synthetic
+                // probe with dummy centroids (F8_E4M3 [16, K/QK_ML8]) and
+                // activation (F32 [K, 512]) so backends can answer
+                // "can I host this ml8_4 weight?" via supports_op.
+                const int64_t K = w->ne[0];
+                ggml_tensor * centroids = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, K / 64);
+                ggml_tensor * b         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 512);
+                op_tensor = ggml_ml8_mul_mat(ctx, w, centroids, b);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

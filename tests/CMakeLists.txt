@@ -272,6 +272,16 @@ endif()
 # MAD-135: mt:: int4 quant round-trip tests
 llama_build_and_test(test-mt-quant.cpp)
 
+# MAD-223 Phase G.2: ml8-4 + f8_e4m3 CPU dequant round-trip tests.
+# Needs ggml/src on the include path since ggml-quants.h + ggml-common.h are
+# internal (not in the public ggml/include surface).
+llama_build_and_test(test-ml8-dequant.cpp)
+target_include_directories(test-ml8-dequant PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+
+# MAD-223 Phase G.3: ml8 graph-level matmul test (via ggml_ml8_mul_mat helper)
+llama_build_and_test(test-ml8-mul-mat.cpp)
+target_include_directories(test-ml8-mul-mat PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+
 # MAD-137: mt:: tier primitive unit tests
 # These compile a small slice of src/memory-tier/ directly into the test
 # binary because the classes aren't exported through the public llama

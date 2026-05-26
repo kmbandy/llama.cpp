@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-ml8.h"
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -55,6 +57,36 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
+    // ml8-4 sidecar loader (MAD-223). Reads the GGUF metadata for the rotation
+    // factor h_a so we can declare its (a, a) shape without baking the python
+    // factor_for_dim heuristic into C++. All sidecars are TENSOR_NOT_REQUIRED:
+    // an ml8 weight without rotation/awq still loads cleanly.
+    auto load_ml8_sidecars = [&](
+            struct ggml_tensor * weight,
+            llm_tensor tensor_id,
+            int il_,
+            int64_t k_dim,
+            struct ggml_tensor ** out_centroids,
+            struct ggml_tensor ** out_rotation_h_a,
+            struct ggml_tensor ** out_rotation_meta,
+            struct ggml_tensor ** out_awq_scale) {
+        if (!weight || weight->type != GGML_TYPE_ML8_4) {
+            return;
+        }
+        *out_centroids = create_tensor(tn(tensor_id, "centroids", il_),
+                                       { 16, k_dim / 64 }, TENSOR_NOT_REQUIRED);
+        *out_awq_scale = create_tensor(tn(tensor_id, "awq_scale", il_),
+                                       { k_dim }, TENSOR_NOT_REQUIRED);
+        const auto * h_a_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_h_a", il_).str().c_str());
+        if (h_a_meta != nullptr) {
+            const int64_t a = h_a_meta->ne[0];
+            *out_rotation_h_a  = create_tensor(tn(tensor_id, "rotation_h_a",  il_),
+                                               { a, a }, TENSOR_NOT_REQUIRED);
+            *out_rotation_meta = create_tensor(tn(tensor_id, "rotation_meta", il_),
+                                               { 4 }, TENSOR_NOT_REQUIRED);
+        }
+    };
+
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
 
@@ -95,6 +127,17 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+
+        // ml8-4 sidecars (MAD-223). No-op when the FFN weights are not ml8-typed.
+        load_ml8_sidecars(layer.ffn_gate, LLM_TENSOR_FFN_GATE, il, n_embd,
+                          &layer.ffn_gate_centroids, &layer.ffn_gate_rotation_h_a,
+                          &layer.ffn_gate_rotation_meta, &layer.ffn_gate_awq_scale);
+        load_ml8_sidecars(layer.ffn_up,   LLM_TENSOR_FFN_UP,   il, n_embd,
+                          &layer.ffn_up_centroids,   &layer.ffn_up_rotation_h_a,
+                          &layer.ffn_up_rotation_meta,   &layer.ffn_up_awq_scale);
+        load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
+                          &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
+                          &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
     };
 
     auto load_block_mtp = [&](int il) {
@@ -112,6 +155,17 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, 0);
+
+        // ml8-4 sidecars (MAD-223) — same wiring as the trunk block. No-op if not ml8-typed.
+        load_ml8_sidecars(layer.ffn_gate, LLM_TENSOR_FFN_GATE, il, n_embd,
+                          &layer.ffn_gate_centroids, &layer.ffn_gate_rotation_h_a,
+                          &layer.ffn_gate_rotation_meta, &layer.ffn_gate_awq_scale);
+        load_ml8_sidecars(layer.ffn_up,   LLM_TENSOR_FFN_UP,   il, n_embd,
+                          &layer.ffn_up_centroids,   &layer.ffn_up_rotation_h_a,
+                          &layer.ffn_up_rotation_meta,   &layer.ffn_up_awq_scale);
+        load_ml8_sidecars(layer.ffn_down, LLM_TENSOR_FFN_DOWN, il, n_ff,
+                          &layer.ffn_down_centroids, &layer.ffn_down_rotation_h_a,
+                          &layer.ffn_down_rotation_meta, &layer.ffn_down_awq_scale);
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, 0);
@@ -472,6 +526,62 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    const auto & layer = model.layers[il];
+
+    // ml8-4 FFN path (MAD-223). Triggered when the gate weight is ml8-typed.
+    // Up and down must also be ml8 in this case — the calibrator writes all
+    // three together. We assert that for safety (mixed FFNs aren't supported).
+    if (layer.ffn_gate && layer.ffn_gate->type == GGML_TYPE_ML8_4) {
+        GGML_ASSERT(layer.ffn_up   && layer.ffn_up->type   == GGML_TYPE_ML8_4 && "ml8 ffn requires ml8 up");
+        GGML_ASSERT(layer.ffn_down && layer.ffn_down->type == GGML_TYPE_ML8_4 && "ml8 ffn requires ml8 down");
+        GGML_ASSERT(layer.ffn_gate_centroids && "ml8 ffn_gate missing centroids sidecar");
+        GGML_ASSERT(layer.ffn_up_centroids   && "ml8 ffn_up missing centroids sidecar");
+        GGML_ASSERT(layer.ffn_down_centroids && "ml8 ffn_down missing centroids sidecar");
+
+        auto apply_input_xform = [&](ggml_tensor * x,
+                                     ggml_tensor * awq,
+                                     ggml_tensor * h_a) {
+            if (awq) {
+                x = ggml_mul(ctx0, x, awq);
+            }
+            if (h_a) {
+                const int64_t a = h_a->ne[0];
+                const int64_t b = x->ne[0] / a;
+                x = ggml_ml8_apply_rotation(ctx0, x, h_a, a, b);
+            }
+            return x;
+        };
+
+        // Gate + Up share the same activation `cur`. Each weight has its own
+        // optional AWQ scale and rotation factor (calibrated independently),
+        // so we pre-transform the input separately for each branch.
+        ggml_tensor * gate_in = apply_input_xform(cur,
+                                                  layer.ffn_gate_awq_scale,
+                                                  layer.ffn_gate_rotation_h_a);
+        ggml_tensor * gate    = ggml_ml8_mul_mat(ctx0, layer.ffn_gate,
+                                                  layer.ffn_gate_centroids, gate_in);
+        cb(gate, "ffn_gate", il);
+
+        ggml_tensor * up_in   = apply_input_xform(cur,
+                                                  layer.ffn_up_awq_scale,
+                                                  layer.ffn_up_rotation_h_a);
+        ggml_tensor * up      = ggml_ml8_mul_mat(ctx0, layer.ffn_up,
+                                                  layer.ffn_up_centroids, up_in);
+        cb(up, "ffn_up", il);
+
+        ggml_tensor * gated   = ggml_silu(ctx0, gate);
+        ggml_tensor * inter   = ggml_mul(ctx0, gated, up);
+        cb(inter, "ffn_inter", il);
+
+        ggml_tensor * down_in = apply_input_xform(inter,
+                                                  layer.ffn_down_awq_scale,
+                                                  layer.ffn_down_rotation_h_a);
+        cur                   = ggml_ml8_mul_mat(ctx0, layer.ffn_down,
+                                                  layer.ffn_down_centroids, down_in);
+        cb(cur, "ffn_out", il);
+        return cur;
+    }
 
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,

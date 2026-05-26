@@ -2139,6 +2139,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_ML8_MUL_MAT:
+            {
+                ggml_compute_forward_ml8_mul_mat(params, tensor);
+            }
+            break;
+        case GGML_OP_ML8_APPLY_ROTATION:
+            {
+                ggml_compute_forward_ml8_apply_rotation(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2479,6 +2489,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_ML8_MUL_MAT:
+        case GGML_OP_ML8_APPLY_ROTATION:
             {
                 n_tasks = n_threads;
             } break;

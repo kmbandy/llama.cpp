@@ -167,6 +167,8 @@ add_library(aiter_triton_aot STATIC
     wrappers/vector_add_wrapper.cpp
     wrappers/mt_aiter_unified_attn.cpp
     wrappers/aiter_runtime_compiler.cpp
+    wrappers/mt_ml8_gemm.cpp                  # MAD-223 Phase C.2 — ml8 dense GEMM wrapper
+    wrappers/mt_ml8_moe_gemm.cpp              # MAD-223 Phase C.3 — ml8 MoE GEMM wrapper (MAD-244)
     # Generated sources added at build time via the AOT_C_FILES vars:
     ${vector_add_AOT_C_FILES}
     ${uattn_3d_AOT_C_FILES}
@@ -184,6 +186,10 @@ set_target_properties(aiter_triton_aot PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(aiter_triton_aot PUBLIC
     AITER_COMPILE_SCRIPT_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/compile_aiter_kernel.py\"
     AITER_KERNEL_SOURCE_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/unified_attention.py\"
+    # MAD-223 Phase C.2 — ml8 dense GEMM kernel source path (consumed by mt_ml8_gemm.cpp)
+    MT_ML8_KERNEL_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/gemm_ml8.py\"
+    # MAD-223 Phase C.3 — ml8 MoE GEMM kernel source path (consumed by mt_ml8_moe_gemm.cpp)
+    MT_ML8_MOE_KERNEL_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe_op_gemm_ml8.py\"
 )
 
 # Ensure the AOT custom_targets run before the library/wrapper compiles —
@@ -258,4 +264,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         wrappers/test_aiter_registry.cpp
     )
     target_link_libraries(test_aiter_registry PRIVATE aiter_triton_aot)
+
+    # MAD-223 Phase C.2 — ml8 dense GEMM wrapper smoke test
+    add_executable(test_mt_ml8_gemm
+        wrappers/test_mt_ml8_gemm.cpp
+    )
+    target_link_libraries(test_mt_ml8_gemm PRIVATE aiter_triton_aot)
+
+    # MAD-223 Phase C.3 — ml8 MoE GEMM wrapper smoke test (MAD-244)
+    add_executable(test_mt_ml8_moe_gemm
+        wrappers/test_mt_ml8_moe_gemm.cpp
+    )
+    target_link_libraries(test_mt_ml8_moe_gemm PRIVATE aiter_triton_aot)
 endif()

@@ -490,6 +490,23 @@ struct llama_layer {
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // ml8-4 sidecars (MAD-223) — per FFN weight: 4-bit centroid LUT (F8_E4M3),
+    // optional Kronecker rotation factor h_a (F32), rotation metadata (I32×4),
+    // and optional AWQ per-input-channel scale (F32). All optional: weight type
+    // determines whether the ml8 graph path is taken.
+    struct ggml_tensor * ffn_gate_centroids     = nullptr;
+    struct ggml_tensor * ffn_gate_rotation_h_a  = nullptr;
+    struct ggml_tensor * ffn_gate_rotation_meta = nullptr;
+    struct ggml_tensor * ffn_gate_awq_scale     = nullptr;
+    struct ggml_tensor * ffn_up_centroids       = nullptr;
+    struct ggml_tensor * ffn_up_rotation_h_a    = nullptr;
+    struct ggml_tensor * ffn_up_rotation_meta   = nullptr;
+    struct ggml_tensor * ffn_up_awq_scale       = nullptr;
+    struct ggml_tensor * ffn_down_centroids     = nullptr;
+    struct ggml_tensor * ffn_down_rotation_h_a  = nullptr;
+    struct ggml_tensor * ffn_down_rotation_meta = nullptr;
+    struct ggml_tensor * ffn_down_awq_scale     = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;

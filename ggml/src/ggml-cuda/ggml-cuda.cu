@@ -27,6 +27,7 @@
 #include "ggml-cuda/mt_pagedattn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/ml8.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2721,6 +2722,16 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // ml8-4 sidecar guard (MAD-223): F8_E4M3 is claimed in supports_op so the
+    // centroid sidecars stay on the HIP buffer alongside their ml8_4 weights,
+    // but the centroids are consumed via GGML_OP_ML8_MUL_MAT, never as a real
+    // MUL_MAT weight. Hitting this path means someone built a graph that
+    // matmuls F8_E4M3 directly — none of the CUDA mul_mat kernels know that
+    // type, so fail loudly rather than silently corrupting outputs.
+    GGML_ASSERT(src0->type != GGML_TYPE_F8_E4M3 &&
+        "GGML_TYPE_F8_E4M3 is not a real MUL_MAT weight type on the HIP backend "
+        "(use GGML_OP_ML8_MUL_MAT for ml8 dispatch)");
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -3219,6 +3230,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_ML8_MUL_MAT:
+            ggml_cuda_op_ml8_mul_mat(ctx, dst);
+            break;
+        case GGML_OP_ML8_APPLY_ROTATION:
+            ggml_cuda_op_ml8_apply_rotation(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -5440,9 +5457,57 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ4_1S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
+                    // ml8-4 sidecar (MAD-223): F8_E4M3 centroids ride along with
+                    // ml8_4 weight tensors but are consumed as src[1] of
+                    // GGML_OP_ML8_MUL_MAT, never as a real MUL_MAT weight.
+                    // Claiming support here keeps the centroid sidecar on the
+                    // same HIP buffer as the ml8_4 weight (the loader probes
+                    // every "blk.X.ffn_gate.*" tensor with MUL_MAT via the
+                    // LLM_TENSOR_INFOS table). ggml_cuda_mul_mat aborts
+                    // defensively if anyone actually tries to MUL_MAT an
+                    // F8_E4M3 tensor.
+                    case GGML_TYPE_F8_E4M3:
+                        return true;
                     default:
                         return false;
                 }
+            } break;
+        case GGML_OP_ML8_MUL_MAT:
+            {
+                // MAD-223 G.4.f: ml8-4 dense GEMM via mt_ml8_gemm. Requires
+                // ml8_4 weights + f8_e4m3 centroid LUT + fp32 activations +
+                // fp32 output. mt_ml8_gemm wraps the kernel for any shape
+                // where N is a multiple of MT_ML8_BLOCK_SIZE_N (16) and K
+                // is a multiple of QK_ML8 (64). M is padded internally.
+                const ggml_tensor * w    = op->src[0];
+                const ggml_tensor * cent = op->src[1];
+                const ggml_tensor * x    = op->src[2];
+                if (!w || !cent || !x) return false;
+                if (w->type    != GGML_TYPE_ML8_4)    return false;
+                if (cent->type != GGML_TYPE_F8_E4M3)  return false;
+                if (x->type    != GGML_TYPE_F32)      return false;
+                if (op->type   != GGML_TYPE_F32)      return false;
+                if (w->ne[0] % 64 != 0)               return false;
+                if (w->ne[1] % 16 != 0)               return false;
+                return true;
+            } break;
+        case GGML_OP_ML8_APPLY_ROTATION:
+            {
+                // MAD-223 G.4.g: per-token Kronecker rotation H_a^T @ X @ H_b.
+                // One CUDA block per token; blockDim.x = b_dim, so b_dim must
+                // fit the device block-size limit. Shared memory holds the
+                // intermediate buffer (a_dim*b_dim fp32) — also bounded.
+                const ggml_tensor * x   = op->src[0];
+                const ggml_tensor * h_a = op->src[1];
+                if (!x || !h_a) return false;
+                if (x->type   != GGML_TYPE_F32) return false;
+                if (h_a->type != GGML_TYPE_F32) return false;
+                if (op->type  != GGML_TYPE_F32) return false;
+                const int32_t * pp    = (const int32_t *) op->op_params;
+                const int32_t   b_dim = pp[1];
+                if (b_dim <= 0 || (b_dim & (b_dim - 1)) != 0) return false;
+                if (b_dim > 1024) return false;
+                return true;
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

@@ -207,6 +207,8 @@ add_library(ggml-base
             ggml-quants.c
             ggml-turbo-quant.c
             ggml-quants.h
+            ggml-ml8.c
+            ../include/ggml-ml8.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES

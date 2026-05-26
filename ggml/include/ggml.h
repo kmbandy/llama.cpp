@@ -435,7 +435,9 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_TURBO4_FP8_BS256 = 47, // MAD-214: turbo-FP8 KV cache, 4-bit centroid idx + sign + fp16 scale, BS=256, decoded via E4M3 LUT (per-(kv,layer) runtime LUT)
-        GGML_TYPE_COUNT   = 48,
+        GGML_TYPE_ML8_4   = 48, // MAD-223 Phase G: ml8-4 weight quant, 4-bit centroid idx + fp32 scale per 64-element block, centroid LUT in per-K-group sidecar tensor
+        GGML_TYPE_F8_E4M3 = 49, // MAD-223 Phase G: fp8 e4m3 1-byte storage, used as sidecar dtype for ml8 centroids
+        GGML_TYPE_COUNT   = 50,
     };
 
     // precision
@@ -591,6 +593,25 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        // MAD-223 G.4.b — ml8-4 quantized matmul with separate fp8 centroid LUT.
+        //   src[0] = w (GGML_TYPE_ML8_4, [K, N])
+        //   src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
+        //   src[2] = x (GGML_TYPE_F32, [K, M])
+        //   dst    = y (GGML_TYPE_F32, [N, M])
+        // CPU backend dequantizes block-by-block; HIP backend (G.4.f) dispatches
+        // to mt_ml8_gemm on the native fp8 WMMA path.
+        GGML_OP_ML8_MUL_MAT,
+        // ml8-4 Kronecker rotation (MAD-223 Phase G.4.g). Applies the
+        // Hadamard rotation Q = H_a ⊗ H_b to the leading dim of an
+        // activation. H_b is the Sylvester Hadamard of size b_dim,
+        // built deterministically — only H_a needs to be supplied.
+        //   op_params[0] = a_dim (int32)
+        //   op_params[1] = b_dim (int32, power of 2)
+        //   src[0]  = x (GGML_TYPE_F32, [d=a*b, n_tokens])
+        //   src[1]  = h_a (GGML_TYPE_F32, [a, a])
+        //   dst     = y (GGML_TYPE_F32, [d, n_tokens])
+        GGML_OP_ML8_APPLY_ROTATION,
 
         GGML_OP_COUNT,
     };

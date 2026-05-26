@@ -8,6 +8,11 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+// MAD-223 G.4.c — ml8 dequant + block layout for GGML_OP_ML8_MUL_MAT.
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+#include "ggml-quants.h"
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -11403,6 +11408,172 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
     }
+}
+
+// ─── ggml_compute_forward_ml8_mul_mat (MAD-223 G.4.c) ─────────────────────
+//
+// CPU dispatch for GGML_OP_ML8_MUL_MAT. Same math as the previous custom_4d
+// callback in ggml-ml8.c — dequantize w block-by-block via
+// dequantize_row_ml8_4_with_lut into a per-thread fp32 scratch row, then dot
+// against x. Tiled across N-rows by (ith, nth).
+//
+// Tensor layouts (set by ggml_ml8_mul_mat):
+//   dst->src[0] = w         (GGML_TYPE_ML8_4 ,  [K, N])
+//   dst->src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
+//   dst->src[2] = x         (GGML_TYPE_F32   ,  [K, M])
+//   dst         = y         (GGML_TYPE_F32   ,  [N, M])
+void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w   = dst->src[0];
+    const ggml_tensor * lut = dst->src[1];
+    const ggml_tensor * x   = dst->src[2];
+    GGML_ASSERT(w   && lut && x);
+    GGML_ASSERT(w->type   == GGML_TYPE_ML8_4);
+    GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    const int64_t M = x->ne[1];
+    GGML_ASSERT(x->ne[0] == K);
+    GGML_ASSERT(K % QK_ML8 == 0);
+    const int64_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(lut->ne[0] == 16 && lut->ne[1] == n_groups_k);
+
+    const block_ml8_4 * w_blocks = (const block_ml8_4 *) w->data;
+    const uint8_t     * lut_fp8  = (const uint8_t     *) lut->data;
+    const float       * x_data   = (const float       *) x->data;
+    float             * y_data   = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t n_per_thread = (N + nth - 1) / nth;
+    const int64_t n_start      = (int64_t) ith * n_per_thread;
+    const int64_t n_end        = (n_start + n_per_thread < N) ? (n_start + n_per_thread) : N;
+
+    // Per-thread fp32 scratch for one row of dequantized W (K floats).
+    // Allocated via plain malloc/free (matches the prior ml8-ml8.c behaviour
+    // which ran cleanly under ggml-cpu's threadpool — replacing this with
+    // std::vector triggered libgomp "Thread identifier invalid" errors on the
+    // second forward pass in llama-cli, likely an interaction with libstdc++
+    // allocator thread-local state and ggml-cpu's threadpool fork model).
+    float * w_row_fp32 = (float *) malloc((size_t) K * sizeof(float));
+    if (!w_row_fp32) {
+        GGML_ABORT("ggml_compute_forward_ml8_mul_mat: malloc(%zu) failed",
+                   (size_t) K * sizeof(float));
+    }
+
+    for (int64_t n = n_start; n < n_end; n++) {
+        const block_ml8_4 * w_row = &w_blocks[n * n_groups_k];
+        dequantize_row_ml8_4_with_lut(w_row, lut_fp8, w_row_fp32, K);
+        for (int64_t m = 0; m < M; m++) {
+            const float * x_col = &x_data[m * K];
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; k++) {
+                sum += w_row_fp32[k] * x_col[k];
+            }
+            y_data[m * N + n] = sum;
+        }
+    }
+
+    free(w_row_fp32);
+}
+
+// ─── ggml_compute_forward_ml8_apply_rotation (MAD-223 G.4.g) ──────────────
+//
+// Y[:, t] = unflatten(H_a^T @ flatten(X[:, t]) @ H_b, d=a*b)
+// where H_b is the Sylvester Hadamard of size b_dim, built deterministically.
+//
+// op_params: int32_t[0]=a_dim, int32_t[1]=b_dim.
+// src[0]=x F32 [d=a*b, n_tokens]; src[1]=h_a F32 [a, a]; dst=y F32 [d, n_tokens].
+//
+// Ported from the original ggml_custom_4d implementation in ggml-ml8.c.
+// Uses malloc/free (NOT std::vector) for scratch; std::vector inside a
+// compute callback triggers libstdc++ allocator thread-local state issues
+// with ggml-cpu's OpenMP threadpool (see ggml_compute_forward_ml8_mul_mat
+// above for the same constraint).
+
+static void ml8_build_sylvester_cpu(float * H, int64_t b) {
+    H[0] = 1.0f;
+    for (int64_t n = 1; n < b; n *= 2) {
+        const float inv_sqrt2 = 0.70710678118654752440f;
+        for (int64_t i = n - 1; i >= 0; i--) {
+            for (int64_t j = n - 1; j >= 0; j--) {
+                const float v = H[i * b + j] * inv_sqrt2;
+                H[(i    ) * b + (j    )] =  v;
+                H[(i    ) * b + (j + n)] =  v;
+                H[(i + n) * b + (j    )] =  v;
+                H[(i + n) * b + (j + n)] = -v;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * h_a = dst->src[1];
+
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(h_a->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int32_t * pp    = (const int32_t *) dst->op_params;
+    const int64_t   a_dim = (int64_t) pp[0];
+    const int64_t   b_dim = (int64_t) pp[1];
+    const int64_t   d_dim = a_dim * b_dim;
+    GGML_ASSERT(x->ne[0] == d_dim);
+    GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+
+    const int64_t n_tokens = x->ne[1];
+    const float * x_data   = (const float *) x->data;
+    const float * h_a_data = (const float *) h_a->data;
+    float       * y_data   = (float *) dst->data;
+
+    float * h_b = (float *) malloc((size_t) b_dim * (size_t) b_dim * sizeof(float));
+    if (!h_b) {
+        GGML_ABORT("ml8_apply_rotation: malloc h_b(%zu) failed",
+                   (size_t) b_dim * (size_t) b_dim * sizeof(float));
+    }
+    ml8_build_sylvester_cpu(h_b, b_dim);
+
+    float * xp = (float *) malloc((size_t) d_dim * sizeof(float));
+    if (!xp) {
+        free(h_b);
+        GGML_ABORT("ml8_apply_rotation: malloc xp(%zu) failed", (size_t) d_dim * sizeof(float));
+    }
+
+    const int64_t per_thread = (n_tokens + params->nth - 1) / params->nth;
+    const int64_t t_start    = (int64_t) params->ith * per_thread;
+    const int64_t t_end      = (t_start + per_thread < n_tokens) ? (t_start + per_thread) : n_tokens;
+
+    for (int64_t t = t_start; t < t_end; t++) {
+        const float * xt = x_data + t * d_dim;
+        float       * yt = y_data + t * d_dim;
+
+        // Step 1: xp[k, l] = sum_i H_a[i, k] * X[i, l]
+        for (int64_t k = 0; k < a_dim; k++) {
+            for (int64_t l = 0; l < b_dim; l++) {
+                float s = 0.0f;
+                for (int64_t i = 0; i < a_dim; i++) {
+                    s += h_a_data[i * a_dim + k] * xt[i * b_dim + l];
+                }
+                xp[k * b_dim + l] = s;
+            }
+        }
+        // Step 2: yt[k, l] = sum_j xp[k, j] * H_b[j, l]
+        for (int64_t k = 0; k < a_dim; k++) {
+            for (int64_t l = 0; l < b_dim; l++) {
+                float s = 0.0f;
+                for (int64_t j = 0; j < b_dim; j++) {
+                    s += xp[k * b_dim + j] * h_b[j * b_dim + l];
+                }
+                yt[k * b_dim + l] = s;
+            }
+        }
+    }
+
+    free(xp);
+    free(h_b);
 }
 
 static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, ggml_tensor * dst) {

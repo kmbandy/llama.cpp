@@ -156,6 +156,102 @@ def eval_ppl_wikitext(model, tokenizer, dev: str, seq_len: int = 2048,
             "n_tokens_scored": n_pred}
 
 
+def overlay_ml8_kernels(model, calibration_dir: Path, device: str,
+                        verbose: bool = True) -> dict:
+    """Phase D.1+D.2: kernel-path overlay — swap each Linear with an Ml8Linear
+    that invokes the ml8 Triton kernel at forward time.
+
+    Parallel to `overlay_ml8_weights` (the dequant-and-replace path).
+    Use --use-ml8-kernel flag to select this path.
+
+    Returns a summary dict in the same shape as overlay_ml8_weights.
+
+    Handles all blob variants (MAD-245 / Phase D.2):
+      - Plain blob → kernel-only Ml8Linear
+      - Rotated blob → Ml8Linear applies Q to activations at forward time
+      - AWQ'd blob → Ml8Linear applies per-channel scale to activations
+      - Rotated + AWQ'd → both, in calibration-mirrored order
+    """
+    # Import here so the dequant-only path doesn't pay the cost
+    import sys
+    _THIS = Path(__file__).resolve().parent
+    if str(_THIS) not in sys.path:
+        sys.path.insert(0, str(_THIS))
+    from ml8_runtime import ml8_linear_from_blob
+
+    blobs = sorted(calibration_dir.glob("*.pt"))
+    if not blobs:
+        raise RuntimeError(f"no .pt files found in {calibration_dir}")
+
+    n_loaded = 0
+    n_skipped = 0
+    total_quant_bits = 0
+    total_orig_bits_fp16 = 0
+    per_layer = []
+
+    for path in blobs:
+        blob = load_ml8_layer(path)
+        name = blob["name"]
+        target = None
+        try:
+            target = get_module(model, name)
+        except (AttributeError, IndexError):
+            if verbose:
+                print(f"  [skip] {name}: not found in model")
+            n_skipped += 1
+            continue
+        if not isinstance(target, nn.Linear):
+            if verbose:
+                print(f"  [skip] {name}: not a Linear ({type(target).__name__})")
+            n_skipped += 1
+            continue
+
+        # Build a ready-to-use Ml8Linear (with rotation + AWQ wired in if
+        # the blob carries them) via the unified factory (MAD-245).
+        ml8_linear = ml8_linear_from_blob(
+            blob,
+            bias=target.bias.detach().clone() if target.bias is not None else None,
+            out_dtype=target.weight.dtype,
+            device=device,
+        )
+        # In-place swap on the parent
+        parent_path, _, leaf = name.rpartition(".")
+        if parent_path:
+            parent = get_module(model, parent_path)
+        else:
+            parent = model
+        setattr(parent, leaf, ml8_linear.to(device))
+
+        bpv = bits_per_value(blob)
+        numel = target.weight.numel()
+        total_quant_bits += numel * bpv
+        total_orig_bits_fp16 += numel * 16
+        per_layer.append({"name": name, "numel": numel, "bpv": bpv})
+        n_loaded += 1
+        if verbose:
+            extras = []
+            if ml8_linear.rotation is not None:
+                extras.append("rot")
+            if ml8_linear.awq_scale is not None:
+                extras.append("awq")
+            tag = ("+".join(extras)) if extras else "plain"
+            print(
+                f"  [kern] {name}  N={ml8_linear.out_features} "
+                f"K={ml8_linear.in_features} bpv={bpv:.3f} ({tag})"
+            )
+
+    summary = {
+        "n_loaded": n_loaded,
+        "n_skipped": n_skipped,
+        "total_quant_bits": total_quant_bits,
+        "total_orig_bits_fp16": total_orig_bits_fp16,
+        "size_ratio_vs_fp16": total_quant_bits / max(total_orig_bits_fp16, 1),
+        "per_layer": per_layer,
+        "overlay_mode": "kernel",
+    }
+    return summary
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
@@ -167,6 +263,10 @@ def main():
     p.add_argument("--also-eval-baseline", action="store_true",
                    help="Eval PPL on the original f16 model FIRST, before overlay, "
                         "for delta computation.")
+    p.add_argument("--use-ml8-kernel", action="store_true",
+                   help="Phase D.1: swap target Linears with Ml8Linear that calls "
+                        "the ml8 Triton kernel at forward time, instead of dequant+copy. "
+                        "Currently rejects blobs with rotation/awq (Phase D.2 work).")
     args = p.parse_args()
 
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
@@ -183,8 +283,12 @@ def main():
                                           max_tokens=args.ppl_max_tokens)
         print(f"  baseline PPL = {baseline_ppl['ppl']:.4f}")
 
-    print(f"\n[overlay] loading {args.calibration_dir}/*.pt ...")
-    summary = overlay_ml8_weights(model, args.calibration_dir, args.device)
+    if args.use_ml8_kernel:
+        print(f"\n[overlay-kernel] loading {args.calibration_dir}/*.pt → Ml8Linear swap ...")
+        summary = overlay_ml8_kernels(model, args.calibration_dir, args.device)
+    else:
+        print(f"\n[overlay] loading {args.calibration_dir}/*.pt ...")
+        summary = overlay_ml8_weights(model, args.calibration_dir, args.device)
     print(f"\n[overlay summary] {summary['n_loaded']} layers loaded, "
           f"{summary['n_skipped']} skipped")
     print(f"  size: {summary['total_quant_bits']/8/1e9:.2f} GB quantized vs "

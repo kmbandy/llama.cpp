@@ -797,6 +797,27 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_fp8_bs256,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_fp8_bs256_ref,
     },
+    // MAD-223 Phase G.1: ml8-4 weight quantization. Standard to_float/from_float
+    // are stubs that abort; real dequant lives at the matmul graph node so it
+    // has access to the per-K-group centroid LUT sidecar (see ML8_GGUF_INTEGRATION_DESIGN.md).
+    [GGML_TYPE_ML8_4] = {
+        .type_name                = "ml8_4",
+        .blck_size                = QK_ML8,
+        .type_size                = sizeof(block_ml8_4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ml8_4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ml8_4_ref,
+    },
+    // MAD-223 Phase G.1: fp8 e4m3 sidecar storage for ml8 centroid LUTs.
+    // Treated as a non-quantized 1-byte-per-element type (no block structure).
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1129,9 +1150,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ML8_MUL_MAT",
+    "ML8_APPLY_ROTATION",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1242,9 +1266,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "ml8_mul_mat(w,centroids,x)",
+    "ml8_apply_rotation(x,h_a)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

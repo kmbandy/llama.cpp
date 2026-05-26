@@ -418,6 +418,30 @@ typedef block_turbo5_fp8_bs256 block_turbo5_fp8;
 // scripts/callers that read this constant get the production value by default.
 #define QK_TURBO_FP8 256
 
+// ──────────────────────────────────────────────────────────────────────────
+// MAD-223 Phase G: ml8-4 weight quantization block.
+//
+// 64 elements per block (matches calibration's group_size=64, see
+// scripts/calibration/calibrate_ml8.py). Each block carries:
+//   - fp32 scale (= row's b_scale[k_group] post-multiplied by the kernel)
+//   - 32 bytes of 4-bit centroid indices (lo-nibble first per the on-disk
+//     .ml8 format produced by ml8_to_packed.py)
+//
+// The centroid LUT itself is per-K-group, stored as a sidecar tensor of
+// dtype GGML_TYPE_F8_E4M3 with shape [n_groups_k, 16]. The sidecar is loaded
+// + bound to the matmul graph node at model load time (see design doc
+// aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md §1.2).
+//
+// Rotation (Kronecker) + AWQ scale are additional sidecars per-Linear; see
+// design doc §1.2 / Ml8Linear forward-time math (MAD-245).
+// ──────────────────────────────────────────────────────────────────────────
+#define QK_ML8 64
+typedef struct {
+    float   scale;                  // per-block fp32 scale (post-multiply on kernel output)
+    uint8_t qs[QK_ML8 / 2];         // 64 × 4-bit centroid indices, lo-nibble first
+} block_ml8_4;
+static_assert(sizeof(block_ml8_4) == 4 + 32, "wrong block_ml8_4 size/padding");
+
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
 // Block size 32, dual half-block scales (d0 for [0..15], d1 for [16..31])
 // Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values
