@@ -343,6 +343,252 @@ static constexpr float ML8_ACT_SCALE_EPS = 1e-12f;
 //   3. Thread 0 writes a_scale[m] = absmax / 448 (with epsilon).
 //   4. All threads quantize their slice: a_fp8[m, k] = e4m3(x / scale).
 //
+// ─────────────────────────────────────────────────────────────────────
+// G.6.h: ml8 GEMV kernel for M=1 (decode hot path).
+//
+// At M=1 the standard ml8 mul_mat path pads M up to 16 and feeds the
+// Triton blockscale gemm, which spends 15/16 of its compute on
+// zero-padded rows. rocprofv3 (2026-05-26) showed the ml8 gemm at 70.6%
+// of decode GPU time, 4× off memory-bandwidth ceiling.
+//
+// This naïve GEMV is the first-pass correctness target:
+//   - 1 block per N-tile of size BN=64 output columns
+//   - 1 thread per output column (no K-cooperative reduction yet)
+//   - Each thread does the full K reduction, reading the same a[K]
+//     and the per-K-group centroid LUT + scale.
+//   - a[K] cached in LDS (loaded once per block, shared by all 64
+//     threads = 64 output cols).
+//
+// Inputs:
+//   a       : [K]                fp32 post-rotation activation
+//   b_pack  : [K/2, N]           uint8 packed nibbles (lo at k=even, hi at k=odd)
+//   b_scale : [n_groups_k, N]    fp32 per-(group, col) scale
+//   lut     : [n_groups_k, 16]   fp8 e4m3 centroid LUT per K-group
+//   c       : [N]                fp32 output
+//
+// Per-thread inner loop unrolls the 32-byte K-group as 32 nibble pairs.
+// ─────────────────────────────────────────────────────────────────────
+
+// GEMV tile: BN output columns × K_COOP threads per column.
+// Block size = BN * K_COOP = 256 threads. 4-way K-cooperative reduction
+// per output column splits the K loop across 4 threads, then merges via
+// shared memory. The K-split must align to group boundaries (K_COOP must
+// divide n_groups_k cleanly; for QK_ML8=64 and our K values 2560/9216,
+// n_groups_k = 40/144 — both divisible by 4).
+// G.6.h sweep: kernel is templated on <BN, K_COOP, USE_LDS_A, LAYOUT>.
+// Dispatch reads env vars ML8_GEMV_BN / ML8_GEMV_K_COOP / ML8_GEMV_LDS_A /
+// ML8_GEMV_LAYOUT and routes to the matching instantiation. After the
+// sweep picks a winner, collapse to a single non-templated kernel.
+//
+// LAYOUT semantics:
+//   LAYOUT=0 (cross_warp): tid = n_local + k_part * BN. K_COOP threads
+//     reducing one col span multiple waves → must use LDS reduction.
+//   LAYOUT=1 (within_warp): tid = k_part + n_local * K_COOP. K_COOP
+//     threads for one col are consecutive lane IDs within a wave → can
+//     use __shfl_xor for in-register reduction.
+
+static __device__ __forceinline__ float ml8_fp8_e4m3_to_fp32(uint8_t b) {
+    // Standard E4M3: bias=7, m=3 bits. NaN at S.1111.111.
+    const uint32_t sign = (b >> 7) & 1u;
+    const uint32_t exp_b = (b >> 3) & 0xFu;
+    const uint32_t mant = b & 0x7u;
+    if (exp_b == 0) {
+        // Zero or subnormal (e_real = -6, no implicit leading 1).
+        const float v = (float) mant * (1.0f / 64.0f) * (1.0f / 64.0f); // mant * 2^-6 * 2^-3 = mant/4096
+        return sign ? -v : v;
+    }
+    if (exp_b == 15 && mant == 7) {
+        return __builtin_nanf("");
+    }
+    const int e_real = (int) exp_b - 7;
+    const float frac = 1.0f + (float) mant * (1.0f / 8.0f);
+    float v;
+    // scalbnf is fp32-clean for our exponent range (e_real ∈ [-6, 8]).
+    v = frac * exp2f((float) e_real);
+    return sign ? -v : v;
+}
+
+// Templated GEMV kernel — sweepable on (BN, K_COOP, USE_LDS_A, LAYOUT).
+//   LAYOUT=0: cross_warp index, LDS reduce.
+//   LAYOUT=1: within_warp index, __shfl_xor reduce.
+template <int BN, int K_COOP, bool USE_LDS_A, int LAYOUT>
+static __global__ void ml8_gemv_tpl(
+    const float   * __restrict__ a,        // [K]
+    const uint8_t * __restrict__ b_pack,   // [K/2, N]
+    const float   * __restrict__ b_scale,  // [n_groups_k, N]
+    const uint8_t * __restrict__ lut,      // [n_groups_k, 16] fp8 e4m3
+    float         * __restrict__ c,        // [N]
+    int K, int N, int n_groups_k) {
+
+    constexpr int TPB = BN * K_COOP;
+    const int tid = threadIdx.x;
+
+    int n_local, k_part;
+    if (LAYOUT == 0) {
+        n_local = tid % BN;
+        k_part  = tid / BN;
+    } else {
+        n_local = tid / K_COOP;
+        k_part  = tid % K_COOP;
+    }
+    const int n_base = blockIdx.x * BN;
+    const int n      = n_base + n_local;
+
+    const int groups_per_thread = n_groups_k / K_COOP;
+    const int g_start = k_part * groups_per_thread;
+    const int g_end   = g_start + groups_per_thread;
+
+    // Optional LDS cache for activations.
+    extern __shared__ float s_mem[];
+    float * s_a = USE_LDS_A ? s_mem : nullptr;
+    if (USE_LDS_A) {
+        for (int kk = tid; kk < K; kk += TPB) {
+            s_a[kk] = a[kk];
+        }
+        __syncthreads();
+    }
+
+    float acc = 0.0f;
+    if (n < N) {
+        for (int g = g_start; g < g_end; g++) {
+            const float scale_gn = b_scale[g * N + n];
+            const uint8_t * lut_g = lut + g * 16;
+            const int k_base = g * 64;
+            float group_acc = 0.0f;
+            #pragma unroll
+            for (int p = 0; p < 32; p++) {
+                const int k = k_base + p * 2;
+                const uint8_t byte = b_pack[(k / 2) * N + n];
+                const uint8_t lo_idx = byte & 0x0F;
+                const uint8_t hi_idx = (byte >> 4) & 0x0F;
+                const float c_lo = ml8_fp8_e4m3_to_fp32(lut_g[lo_idx]);
+                const float c_hi = ml8_fp8_e4m3_to_fp32(lut_g[hi_idx]);
+                const float a_lo = USE_LDS_A ? s_a[k]     : a[k];
+                const float a_hi = USE_LDS_A ? s_a[k + 1] : a[k + 1];
+                group_acc += a_lo * c_lo;
+                group_acc += a_hi * c_hi;
+            }
+            acc += group_acc * scale_gn;
+        }
+    }
+
+    if (K_COOP == 1) {
+        if (n < N) c[n] = acc;
+        return;
+    }
+
+    if (LAYOUT == 1) {
+        // Within-warp reduce via __shfl_xor across K_COOP lanes (lane stride 1).
+        #pragma unroll
+        for (int off = K_COOP / 2; off > 0; off >>= 1) {
+            acc += __shfl_xor(acc, off, K_COOP);
+        }
+        if (k_part == 0 && n < N) c[n] = acc;
+    } else {
+        // Cross-warp reduce via LDS.
+        // Reuse s_mem when USE_LDS_A is false; otherwise allocate after s_a.
+        extern __shared__ float s_mem2[];
+        float * s_partial = USE_LDS_A ? (s_mem2 + K) : s_mem2;
+        s_partial[n_local * K_COOP + k_part] = acc;
+        __syncthreads();
+        if (k_part == 0 && n < N) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < K_COOP; i++) {
+                sum += s_partial[n_local * K_COOP + i];
+            }
+            c[n] = sum;
+        }
+    }
+}
+
+// Dispatch helper: returns true if a matching template was launched.
+// We enumerate a curated set of (BN, K_COOP, USE_LDS_A, LAYOUT) tuples;
+// the sweep harness sets these via env vars and we route accordingly.
+#define ML8_GEMV_DISPATCH(BN, KC, LDS, LAYOUT)                                          \
+    if (bn_v == (BN) && kc_v == (KC) && lds_v == (LDS) && layout_v == (LAYOUT)) {       \
+        constexpr int TPB = (BN) * (KC);                                                \
+        const size_t shmem = (size_t) ((LDS) ? K : 0) * sizeof(float)                   \
+                           + (size_t) ((KC) > 1 && (LAYOUT) == 0 ? (BN) * (KC) : 0)     \
+                             * sizeof(float);                                           \
+        ml8_gemv_tpl<(BN),(KC),(LDS),(LAYOUT)><<<                                       \
+            dim3((N + (BN) - 1) / (BN)), dim3(TPB), shmem, stream>>>(                   \
+                a, b_pack, b_scale, lut, c, K, N, n_groups_k);                          \
+        return true;                                                                    \
+    }
+
+static bool ml8_gemv_dispatch_env(
+    cudaStream_t stream, const float * a, const uint8_t * b_pack,
+    const float * b_scale, const uint8_t * lut, float * c,
+    int K, int N, int n_groups_k) {
+
+    auto env_int = [](const char * name, int def) {
+        const char * s = std::getenv(name);
+        if (!s) return def;
+        return std::atoi(s);
+    };
+    // G.6.h M1 sweep winner (2026-05-26): BN=16, K_COOP=8, LDS=0, LAYOUT=0
+    // → 30.66 t/s decode on Qwen3.5-4B Cell E. Env vars override for
+    // continued M2/M3 experimentation (vector loads, fp8 intrinsics, etc.).
+    const int bn_v     = env_int("ML8_GEMV_BN", 16);
+    const int kc_v     = env_int("ML8_GEMV_K_COOP", 8);
+    const int lds_v    = env_int("ML8_GEMV_LDS_A", 0);
+    const int layout_v = env_int("ML8_GEMV_LAYOUT", 0);
+
+    // BN ∈ {8,16,32,64,128} × K_COOP ∈ {1,2,4,8} × LDS_A ∈ {0,1} × LAYOUT ∈ {0,1}
+    // Pruned: K_COOP=1 ignores LAYOUT (use LAYOUT=0); BN*K_COOP must be ≤ 1024.
+
+    // K_COOP=1 family (no reduction; LAYOUT irrelevant — pass 0).
+    ML8_GEMV_DISPATCH(  8, 1, 0, 0); ML8_GEMV_DISPATCH(  8, 1, 1, 0);
+    ML8_GEMV_DISPATCH( 16, 1, 0, 0); ML8_GEMV_DISPATCH( 16, 1, 1, 0);
+    ML8_GEMV_DISPATCH( 32, 1, 0, 0); ML8_GEMV_DISPATCH( 32, 1, 1, 0);
+    ML8_GEMV_DISPATCH( 64, 1, 0, 0); ML8_GEMV_DISPATCH( 64, 1, 1, 0);
+    ML8_GEMV_DISPATCH(128, 1, 0, 0); ML8_GEMV_DISPATCH(128, 1, 1, 0);
+
+    // K_COOP=2
+    ML8_GEMV_DISPATCH(  8, 2, 0, 0); ML8_GEMV_DISPATCH(  8, 2, 0, 1);
+    ML8_GEMV_DISPATCH(  8, 2, 1, 0); ML8_GEMV_DISPATCH(  8, 2, 1, 1);
+    ML8_GEMV_DISPATCH( 16, 2, 0, 0); ML8_GEMV_DISPATCH( 16, 2, 0, 1);
+    ML8_GEMV_DISPATCH( 16, 2, 1, 0); ML8_GEMV_DISPATCH( 16, 2, 1, 1);
+    ML8_GEMV_DISPATCH( 32, 2, 0, 0); ML8_GEMV_DISPATCH( 32, 2, 0, 1);
+    ML8_GEMV_DISPATCH( 32, 2, 1, 0); ML8_GEMV_DISPATCH( 32, 2, 1, 1);
+    ML8_GEMV_DISPATCH( 64, 2, 0, 0); ML8_GEMV_DISPATCH( 64, 2, 0, 1);
+    ML8_GEMV_DISPATCH( 64, 2, 1, 0); ML8_GEMV_DISPATCH( 64, 2, 1, 1);
+    ML8_GEMV_DISPATCH(128, 2, 0, 0); ML8_GEMV_DISPATCH(128, 2, 0, 1);
+    ML8_GEMV_DISPATCH(128, 2, 1, 0); ML8_GEMV_DISPATCH(128, 2, 1, 1);
+
+    // K_COOP=4
+    ML8_GEMV_DISPATCH(  8, 4, 0, 0); ML8_GEMV_DISPATCH(  8, 4, 0, 1);
+    ML8_GEMV_DISPATCH(  8, 4, 1, 0); ML8_GEMV_DISPATCH(  8, 4, 1, 1);
+    ML8_GEMV_DISPATCH( 16, 4, 0, 0); ML8_GEMV_DISPATCH( 16, 4, 0, 1);
+    ML8_GEMV_DISPATCH( 16, 4, 1, 0); ML8_GEMV_DISPATCH( 16, 4, 1, 1);
+    ML8_GEMV_DISPATCH( 32, 4, 0, 0); ML8_GEMV_DISPATCH( 32, 4, 0, 1);
+    ML8_GEMV_DISPATCH( 32, 4, 1, 0); ML8_GEMV_DISPATCH( 32, 4, 1, 1);
+    ML8_GEMV_DISPATCH( 64, 4, 0, 0); ML8_GEMV_DISPATCH( 64, 4, 0, 1);
+    ML8_GEMV_DISPATCH( 64, 4, 1, 0); ML8_GEMV_DISPATCH( 64, 4, 1, 1);
+    ML8_GEMV_DISPATCH(128, 4, 0, 0); ML8_GEMV_DISPATCH(128, 4, 0, 1);
+    ML8_GEMV_DISPATCH(128, 4, 1, 0); ML8_GEMV_DISPATCH(128, 4, 1, 1);
+
+    // K_COOP=8
+    ML8_GEMV_DISPATCH(  8, 8, 0, 0); ML8_GEMV_DISPATCH(  8, 8, 0, 1);
+    ML8_GEMV_DISPATCH(  8, 8, 1, 0); ML8_GEMV_DISPATCH(  8, 8, 1, 1);
+    ML8_GEMV_DISPATCH( 16, 8, 0, 0); ML8_GEMV_DISPATCH( 16, 8, 0, 1);
+    ML8_GEMV_DISPATCH( 16, 8, 1, 0); ML8_GEMV_DISPATCH( 16, 8, 1, 1);
+    ML8_GEMV_DISPATCH( 32, 8, 0, 0); ML8_GEMV_DISPATCH( 32, 8, 0, 1);
+    ML8_GEMV_DISPATCH( 32, 8, 1, 0); ML8_GEMV_DISPATCH( 32, 8, 1, 1);
+    ML8_GEMV_DISPATCH( 64, 8, 0, 0); ML8_GEMV_DISPATCH( 64, 8, 0, 1);
+    ML8_GEMV_DISPATCH( 64, 8, 1, 0); ML8_GEMV_DISPATCH( 64, 8, 1, 1);
+    // BN=128, K_COOP=8 = 1024 threads — at block max but legal.
+    ML8_GEMV_DISPATCH(128, 8, 0, 0); ML8_GEMV_DISPATCH(128, 8, 0, 1);
+    ML8_GEMV_DISPATCH(128, 8, 1, 0); ML8_GEMV_DISPATCH(128, 8, 1, 1);
+
+    std::fprintf(stderr, "[ml8-gemv] no template matches BN=%d K_COOP=%d LDS_A=%d LAYOUT=%d\n",
+                 bn_v, kc_v, lds_v, layout_v);
+    return false;
+}
+
+// (dispatch lives in ml8_gemv_dispatch_env above)
+
 // blockDim.x is fixed at ML8_ACT_QUANT_TPB. We assume K ≥ 1 (caller
 // asserts K > 0) but allow K not divisible by TPB — guarded by stride
 // loop.
@@ -461,6 +707,24 @@ void ggml_cuda_op_ml8_mul_mat(
     // ── 1. Repack weights (cached after first call for this w).
     const ml8_weight_repack_t * repack = ggml_cuda_ml8_get_or_repack(stream, w);
     GGML_ASSERT(repack != nullptr);
+
+    // ── 1b. M=1 GEMV path (G.6.h). Default ON after sweep landed winner
+    // BN=16, K_COOP=8, LDS=0, LAYOUT=0 → 30.66 t/s decode (1.51× Triton M=16
+    // path at 20.30 t/s, 60% of f16 reference 50.89 t/s). Set ML8_NO_GEMV=1
+    // to disable and fall back to the Triton blockscale path (kept for A/B).
+    static const bool ml8_no_gemv = (std::getenv("ML8_NO_GEMV") != nullptr);
+    if (M == 1 && !ml8_no_gemv) {
+        const bool ok = ml8_gemv_dispatch_env(
+            stream,
+            (const float *)   x->data,
+            (const uint8_t *) repack->b_packed,
+            (const float *)   repack->b_scale,
+            (const uint8_t *) cent->data,
+            (float *)         dst->data,
+            K, N, n_groups_k);
+        if (ok) return;
+        // fall through to Triton path if dispatch missed
+    }
 
     // ── 2. Pad M to a multiple of the tuned tier's BLOCK_SIZE_M.
     // Pick the same config the dispatch will pick (decode for M<=16, prefill
