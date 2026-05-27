@@ -91,15 +91,18 @@ def collect_wikitext_calibration(tokenizer, n_samples: int = 64, seq_len: int = 
 def find_target_linears(model):
     """Yield (name, module) for each Linear we want to quantize.
 
-    For Qwen-class dense models, this is the MLP linears per transformer layer:
-    mlp.gate_proj, mlp.up_proj, mlp.down_proj. Attention projections are
-    skipped for tonight's MVP (they're a smaller fraction of weights and have
-    different sensitivity).
+    Dense Qwen: mlp.gate_proj, mlp.up_proj, mlp.down_proj.
+    MoE Qwen:   mlp.experts.{E}.{gate,up,down}_proj (every expert).
+
+    Attention (q/k/v/o_proj) and the MoE router gate (mlp.gate) are skipped —
+    different sensitivity, left un-quantized. Suffix-matching handles both
+    shapes because attention uses distinct *_proj suffixes.
     """
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        if any(k in name for k in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
+        suffix = name.rsplit(".", 1)[-1]
+        if suffix in ("gate_proj", "up_proj", "down_proj"):
             yield name, mod
 
 
