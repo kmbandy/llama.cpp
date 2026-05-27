@@ -11576,6 +11576,96 @@ void ggml_compute_forward_ml8_apply_rotation(const ggml_compute_params * params,
     free(h_b);
 }
 
+// ─── ggml_compute_forward_ml8_mul_mat_id (MAD-223 G.7) ────────────────────
+//
+// CPU fallback for GGML_OP_ML8_MUL_MAT_ID — MoE counterpart of
+// ggml_compute_forward_ml8_mul_mat. For each (token, slot) we look up the
+// expert id, then dequantize-and-dot that expert's full weight matrix
+// against the slot's activation vector. Partitioned across (slot, token)
+// pairs by (ith, nth).
+//
+// Tensor layouts (set by ggml_ml8_mul_mat_id, all contiguous):
+//   dst->src[0] = w   (ML8_4,    [K, N, n_experts])
+//   dst->src[1] = lut (F8_E4M3,  [16, n_groups_k, n_experts])
+//   dst->src[2] = x   (F32,      [K, n_used, n_tokens])
+//   dst->src[3] = ids (I32,      [n_used, n_tokens])
+//   dst         = y   (F32,      [N, n_used, n_tokens])
+void ggml_compute_forward_ml8_mul_mat_id(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w   = dst->src[0];
+    const ggml_tensor * lut = dst->src[1];
+    const ggml_tensor * x   = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+    GGML_ASSERT(w && lut && x && ids);
+    GGML_ASSERT(w->type   == GGML_TYPE_ML8_4);
+    GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(lut));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t K          = w->ne[0];
+    const int64_t N          = w->ne[1];
+    const int64_t n_experts  = w->ne[2];
+    const int64_t n_used     = x->ne[1];
+    const int64_t n_tokens   = x->ne[2];
+    GGML_ASSERT(K % QK_ML8 == 0);
+    const int64_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(lut->ne[0] == 16 && lut->ne[1] == n_groups_k && lut->ne[2] == n_experts);
+    GGML_ASSERT(x->ne[0] == K);
+    GGML_ASSERT(ids->ne[0] == n_used && ids->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[0] == N && dst->ne[1] == n_used && dst->ne[2] == n_tokens);
+
+    const size_t blocks_per_expert = (size_t) N * (size_t) n_groups_k;
+    const size_t lut_bytes_per_expert = (size_t) 16 * (size_t) n_groups_k;
+
+    const block_ml8_4 * w_blocks_base = (const block_ml8_4 *) w->data;
+    const uint8_t     * lut_base      = (const uint8_t     *) lut->data;
+    const float       * x_data        = (const float       *) x->data;
+    const int32_t     * ids_data      = (const int32_t     *) ids->data;
+    float             * y_data        = (float             *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t total_slots = n_used * n_tokens;
+    const int64_t per_thread  = (total_slots + nth - 1) / nth;
+    const int64_t flat_start  = (int64_t) ith * per_thread;
+    const int64_t flat_end    = (flat_start + per_thread < total_slots) ? (flat_start + per_thread) : total_slots;
+
+    float * w_row_fp32 = (float *) malloc((size_t) K * sizeof(float));
+    if (!w_row_fp32) {
+        GGML_ABORT("ggml_compute_forward_ml8_mul_mat_id: malloc(%zu) failed",
+                   (size_t) K * sizeof(float));
+    }
+
+    for (int64_t flat = flat_start; flat < flat_end; flat++) {
+        const int64_t t = flat / n_used;
+        const int64_t s = flat % n_used;
+        const int32_t e = ids_data[t * n_used + s];
+        GGML_ASSERT(e >= 0 && (int64_t) e < n_experts);
+
+        const block_ml8_4 * w_blocks_e = w_blocks_base + (size_t) e * blocks_per_expert;
+        const uint8_t     * lut_e      = lut_base + (size_t) e * lut_bytes_per_expert;
+        const float       * x_slot     = x_data + (size_t) t * (size_t) (n_used * K) + (size_t) s * (size_t) K;
+        float             * y_slot     = y_data + (size_t) t * (size_t) (n_used * N) + (size_t) s * (size_t) N;
+
+        for (int64_t n = 0; n < N; n++) {
+            const block_ml8_4 * w_row = w_blocks_e + (size_t) n * (size_t) n_groups_k;
+            dequantize_row_ml8_4_with_lut(w_row, lut_e, w_row_fp32, K);
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; k++) {
+                sum += w_row_fp32[k] * x_slot[k];
+            }
+            y_slot[n] = sum;
+        }
+    }
+
+    free(w_row_fp32);
+}
+
 static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];

@@ -10,6 +10,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "mt_ml8_gemm.h"
+#include "mt_ml8_moe_gemm.h"       // G.7: ml8 MoE GEMM Triton wrapper
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
 #include <cstdio>
@@ -933,4 +934,335 @@ void ggml_cuda_op_ml8_apply_rotation(
         ml8_dump_fp32("/tmp/ml8_hip_x_rotated.bin", (const float *) dst->data,
                       total_elems, stream, 2, shape);
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// MAD-223 G.7 — MoE path.
+// ═════════════════════════════════════════════════════════════════════════
+
+// ─── Per-expert weight repack ──────────────────────────────────────────
+
+void ggml_cuda_ml8_repack_blocks_moe(
+    cudaStream_t stream,
+    const void * src_blocks,
+    void *       dst_b_packed,
+    float *      dst_b_scale,
+    int32_t      N,
+    int32_t      K,
+    int32_t      group_size,
+    int32_t      n_experts) {
+
+    GGML_ASSERT(group_size == QK_ML8);
+    GGML_ASSERT(N > 0 && K > 0 && n_experts > 0);
+    GGML_ASSERT(K % group_size == 0);
+
+    const int32_t n_groups_k = K / group_size;
+    const size_t src_bytes_per_expert      = (size_t) N * (size_t) n_groups_k * (size_t) ML8_BLOCK_BYTES;
+    const size_t b_packed_bytes_per_expert = (size_t) (K / 2) * (size_t) N;
+    const size_t b_scale_elems_per_expert  = (size_t) n_groups_k * (size_t) N;
+
+    for (int32_t e = 0; e < n_experts; ++e) {
+        const uint8_t * src_e = (const uint8_t *) src_blocks + (size_t) e * src_bytes_per_expert;
+        uint8_t       * pkd_e = (uint8_t *)       dst_b_packed + (size_t) e * b_packed_bytes_per_expert;
+        float         * scl_e = dst_b_scale + (size_t) e * b_scale_elems_per_expert;
+        ggml_cuda_ml8_repack_blocks(stream, src_e, pkd_e, scl_e, N, K, group_size);
+    }
+}
+
+namespace {
+
+struct moe_cache_entry_t {
+    ml8_weight_repack_moe_t info;
+};
+
+std::mutex                                              g_ml8_moe_cache_mu;
+std::unordered_map<const void *, moe_cache_entry_t>     g_ml8_moe_cache;
+
+} // namespace
+
+const ml8_weight_repack_moe_t * ggml_cuda_ml8_get_or_repack_moe(
+    cudaStream_t        stream,
+    const ggml_tensor * w) {
+
+    if (w == nullptr || w->data == nullptr || w->type != GGML_TYPE_ML8_4) {
+        return nullptr;
+    }
+    const int32_t K         = (int32_t) w->ne[0];
+    const int32_t N         = (int32_t) w->ne[1];
+    const int32_t n_experts = (int32_t) w->ne[2];
+    if (K <= 0 || N <= 0 || n_experts <= 0 || K % QK_ML8 != 0) {
+        return nullptr;
+    }
+    const int32_t group_size = QK_ML8;
+    const int32_t n_groups_k = K / group_size;
+    const void *  key        = w->data;
+
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_moe_cache_mu);
+        auto it = g_ml8_moe_cache.find(key);
+        if (it != g_ml8_moe_cache.end()) {
+            return &it->second.info;
+        }
+    }
+
+    const size_t b_packed_bytes = (size_t) n_experts * (size_t) (K / 2) * (size_t) N;
+    const size_t b_scale_bytes  = (size_t) n_experts * (size_t) n_groups_k * (size_t) N * sizeof(float);
+
+    void *  d_b_packed = nullptr;
+    float * d_b_scale  = nullptr;
+    cudaError_t err = cudaMalloc(&d_b_packed, b_packed_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-moe] cudaMalloc(b_packed=%zu) failed: %s\n",
+                b_packed_bytes, cudaGetErrorString(err));
+        return nullptr;
+    }
+    err = cudaMalloc((void **) &d_b_scale, b_scale_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-moe] cudaMalloc(b_scale=%zu) failed: %s\n",
+                b_scale_bytes, cudaGetErrorString(err));
+        cudaFree(d_b_packed);
+        return nullptr;
+    }
+
+    ggml_cuda_ml8_repack_blocks_moe(
+        stream, w->data, d_b_packed, d_b_scale, N, K, group_size, n_experts);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-moe] repack kernel launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_b_packed); cudaFree(d_b_scale);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_ml8_moe_cache_mu);
+    auto it = g_ml8_moe_cache.find(key);
+    if (it != g_ml8_moe_cache.end()) {
+        cudaFree(d_b_packed); cudaFree(d_b_scale);
+        return &it->second.info;
+    }
+    moe_cache_entry_t entry{};
+    entry.info.b_packed   = d_b_packed;
+    entry.info.b_scale    = d_b_scale;
+    entry.info.N          = N;
+    entry.info.K          = K;
+    entry.info.n_groups_k = n_groups_k;
+    entry.info.group_size = group_size;
+    entry.info.n_experts  = n_experts;
+    auto [ins_it, _ok] = g_ml8_moe_cache.emplace(key, entry);
+    return &ins_it->second.info;
+}
+
+// ─── Output scatter kernel (sorted bf16 → dst fp32 via InvGather) ──────
+//
+// Y_sorted [n_total, N] bf16, dst [N, n_used, n_tokens] fp32.
+// One thread per (n, pair) pair; pair = t*n_used + s.
+static __global__ void ml8_moe_scatter_kernel(
+    const nv_bfloat16 * __restrict__ y_sorted,
+    const int32_t     * __restrict__ inv_gather,   // [n_pairs] sorted_pos
+    float             * __restrict__ dst,
+    int32_t N,
+    int32_t n_pairs) {
+
+    const int32_t n    = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t pair = blockIdx.y;
+    if (n >= N || pair >= n_pairs) return;
+
+    const int32_t sorted_pos = inv_gather[pair];
+    const nv_bfloat16 v = y_sorted[(size_t) sorted_pos * (size_t) N + (size_t) n];
+    dst[(size_t) pair * (size_t) N + (size_t) n] = (float) v;
+}
+
+// ─── GGML_OP_ML8_MUL_MAT_ID dispatch ────────────────────────────────────
+
+void ggml_cuda_op_ml8_mul_mat_id(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+
+    const ggml_tensor * w    = dst->src[0];
+    const ggml_tensor * cent = dst->src[1];
+    const ggml_tensor * x    = dst->src[2];
+    const ggml_tensor * ids  = dst->src[3];
+
+    GGML_ASSERT(w && cent && x && ids);
+    GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
+    GGML_ASSERT(cent->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(x->type    == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t K         = (int32_t) w->ne[0];
+    const int32_t N         = (int32_t) w->ne[1];
+    const int32_t n_experts = (int32_t) w->ne[2];
+    const int32_t n_used    = (int32_t) x->ne[1];
+    const int32_t n_tokens  = (int32_t) x->ne[2];
+    const int32_t n_pairs   = n_used * n_tokens;
+
+    GGML_ASSERT(K % QK_ML8 == 0);
+    const int32_t group_size  = QK_ML8;
+    const int32_t n_groups_k  = K / group_size;
+    const int32_t n_centroids = 16;
+    GGML_ASSERT(cent->ne[0] == n_centroids);
+    GGML_ASSERT(cent->ne[1] == n_groups_k);
+    GGML_ASSERT(cent->ne[2] == n_experts);
+    GGML_ASSERT(ids->ne[0] == n_used);
+    GGML_ASSERT(ids->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[0] == N);
+    GGML_ASSERT(dst->ne[1] == n_used);
+    GGML_ASSERT(dst->ne[2] == n_tokens);
+    GGML_ASSERT(N % MT_ML8_MOE_BLOCK_N == 0);
+
+    cudaStream_t stream = ctx.stream();
+
+    // ── 1. Per-expert weight repack (cached).
+    const ml8_weight_repack_moe_t * repack = ggml_cuda_ml8_get_or_repack_moe(stream, w);
+    GGML_ASSERT(repack != nullptr);
+
+    // ── 2. Build routing tensors host-side from ids.
+    // Mirrors the ggml-cuda mmq.cu pattern: download ids, bin by expert,
+    // upload routing tensors. Cheap because n_pairs is small (≤ ctx × top_k).
+    constexpr int32_t BM = MT_ML8_MOE_BLOCK_M;
+    std::vector<int32_t> h_ids(n_pairs);
+    CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data,
+        (size_t) n_pairs * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int32_t> h_hist(n_experts, 0);
+    for (int32_t i = 0; i < n_pairs; ++i) {
+        const int32_t e = h_ids[i];
+        GGML_ASSERT(e >= 0 && e < n_experts);
+        h_hist[e] += 1;
+    }
+    // Pad each expert's chunk to BM, build offsets (chunk starts).
+    std::vector<int32_t> h_hist_padded(n_experts, 0);
+    std::vector<int32_t> h_offs(n_experts, 0);
+    int32_t cumulative = 0;
+    for (int32_t e = 0; e < n_experts; ++e) {
+        h_offs[e] = cumulative;
+        h_hist_padded[e] = ((h_hist[e] + BM - 1) / BM) * BM;
+        cumulative += h_hist_padded[e];
+    }
+    const int32_t n_total = cumulative;
+    const int32_t grid_m  = n_total / BM;
+    const int32_t grid_n  = N / MT_ML8_MOE_BLOCK_N;
+
+    // Bin-sort (s, t) flat indices by expert.
+    std::vector<int32_t> h_gather(n_total, 0);   // padding slots get safe value (kernel masks via hist)
+    std::vector<int32_t> h_inv   (n_pairs, 0);
+    std::vector<int32_t> counter (n_experts, 0);
+    for (int32_t i = 0; i < n_pairs; ++i) {
+        const int32_t e = h_ids[i];
+        const int32_t pos = h_offs[e] + counter[e];
+        h_gather[pos] = i;
+        h_inv[i]      = pos;
+        counter[e]    += 1;
+    }
+    // ExptData entries: one per grid_m block. (block_within_expert << 16) | expt_id
+    std::vector<int32_t> h_edata(grid_m, 0);
+    int32_t block_cursor = 0;
+    for (int32_t e = 0; e < n_experts; ++e) {
+        const int32_t n_blocks_e = h_hist_padded[e] / BM;
+        for (int32_t b = 0; b < n_blocks_e; ++b) {
+            h_edata[block_cursor++] = (b << 16) | e;
+        }
+    }
+    GGML_ASSERT(block_cursor == grid_m);
+
+    // Upload routing buffers via pool.
+    ggml_cuda_pool_alloc<int32_t> d_hist  (ctx.pool(), (size_t) n_experts);
+    ggml_cuda_pool_alloc<int32_t> d_offs  (ctx.pool(), (size_t) n_experts);
+    ggml_cuda_pool_alloc<int32_t> d_edata (ctx.pool(), (size_t) grid_m);
+    ggml_cuda_pool_alloc<int32_t> d_gather(ctx.pool(), (size_t) n_total);
+    ggml_cuda_pool_alloc<int32_t> d_inv   (ctx.pool(), (size_t) n_pairs);
+    CUDA_CHECK(cudaMemcpyAsync(d_hist.get(),   h_hist.data(),
+        n_experts * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_offs.get(),   h_offs.data(),
+        n_experts * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_edata.get(),  h_edata.data(),
+        grid_m * sizeof(int32_t),    cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_gather.get(), h_gather.data(),
+        n_total * sizeof(int32_t),   cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_inv.get(),    h_inv.data(),
+        n_pairs * sizeof(int32_t),   cudaMemcpyHostToDevice, stream));
+
+    // ── 3. Quantize x [n_pairs, K] → fp8 + per-row scale.
+    ggml_cuda_pool_alloc<uint8_t> a_fp8  (ctx.pool(), (size_t) n_pairs * (size_t) K);
+    ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) n_pairs);
+    ggml_cuda_ml8_quantize_activations(
+        stream, (const float *) x->data, a_fp8.get(), a_scale.get(), n_pairs, K);
+
+    // ── 4. Allocate sorted bf16 output [n_total, N] and launch wrapper.
+    ggml_cuda_pool_alloc<nv_bfloat16> y_sorted(ctx.pool(), (size_t) n_total * (size_t) N);
+
+    mt_ml8_moe_gemm_args_t args{};
+    args.shape.N                      = N;
+    args.shape.K                      = K;
+    args.shape.group_size             = group_size;
+    args.shape.n_centroids            = n_centroids;
+    args.shape.n_experts              = n_experts;
+    args.shape.n_expts_act            = n_used;
+    args.shape.apply_swiglu           = 0;
+    args.shape.activation_reduction_n = 1;
+    args.shape.add_residual           = 0;
+    args.shape.per_row_x_scale        = 1;
+    args.shape.even_k                 = 1;
+    args.shape.mask_k_limit           = K;
+    args.shape.upcast_indices         = 0;
+    args.shape.has_bias               = 0;
+    args.shape.has_gammas             = 0;
+    args.shape.has_x_static_scale     = 0;
+    args.shape.has_w_static_scale     = 0;
+    args.shape.has_quant_static_scale = 0;
+
+    args.y                  = y_sorted.get();
+    args.x_fp8              = a_fp8.get();
+    args.w_packed           = repack->b_packed;
+    args.x_scale_fp32       = a_scale.get();
+    args.w_scale_fp32       = repack->b_scale;
+    args.centroid_lut_fp8   = cent->data;
+    args.bias               = nullptr;
+    args.gammas             = nullptr;
+    args.x_static_scale     = nullptr;
+    args.w_static_scale     = nullptr;
+    args.quant_static_scale = nullptr;
+    args.alpha              = 0.0f;
+    args.limit              = 0.0f;
+    args.gather_indx        = d_gather.get();
+    args.expt_hist          = d_hist.get();
+    args.expt_offs          = d_offs.get();
+    args.expt_offs_sum      = nullptr;
+    args.expt_data          = d_edata.get();
+    args.M                  = n_total;
+    args.grid_m             = grid_m;
+    args.grid_n             = grid_n;
+
+    // Strides (mirrors the test's layout):
+    args.stride_y_k        = 0;
+    args.stride_y_m        = N;
+    args.stride_y_n        = 1;
+    args.stride_x_m        = K;
+    args.stride_x_k        = 1;
+    args.stride_x_bs_m     = 1;
+    args.stride_x_bs_k     = 0;
+    args.stride_w_e        = (K / 2) * N;
+    args.stride_w_k        = N;
+    args.stride_w_n        = 1;
+    args.stride_w_bs_e     = n_groups_k * N;
+    args.stride_w_bs_k     = N;
+    args.stride_w_bs_n     = 1;
+    args.stride_b_e        = 0;
+    args.stride_lut_expert = n_groups_k * n_centroids;
+    args.stride_lut_k      = n_centroids;
+
+    const hipError_t rc = mt_ml8_moe_gemm(stream, &args);
+    GGML_ASSERT(rc == hipSuccess && "mt_ml8_moe_gemm dispatch failed");
+
+    // ── 5. Scatter sorted bf16 output → dst fp32 [N, n_used, n_tokens].
+    constexpr int BLOCK_NX = 64;
+    const dim3 sgrid((N + BLOCK_NX - 1) / BLOCK_NX, (unsigned) n_pairs, 1);
+    const dim3 sblock(BLOCK_NX, 1, 1);
+    ml8_moe_scatter_kernel<<<sgrid, sblock, 0, stream>>>(
+        y_sorted.get(), d_inv.get(), (float *) dst->data, N, n_pairs);
+    CUDA_CHECK(cudaGetLastError());
 }

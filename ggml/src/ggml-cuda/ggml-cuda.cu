@@ -3237,6 +3237,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ML8_APPLY_ROTATION:
             ggml_cuda_op_ml8_apply_rotation(ctx, dst);
             break;
+        case GGML_OP_ML8_MUL_MAT_ID:
+            ggml_cuda_op_ml8_mul_mat_id(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -5507,6 +5510,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int32_t   b_dim = pp[1];
                 if (b_dim <= 0 || (b_dim & (b_dim - 1)) != 0) return false;
                 if (b_dim > 1024) return false;
+                return true;
+            } break;
+        case GGML_OP_ML8_MUL_MAT_ID:
+            {
+                // MAD-223 G.7: ml8-4 MoE GEMM via mt_ml8_moe_gemm. Same type
+                // contract as the dense ML8_MUL_MAT (ml8_4 weights, f8_e4m3
+                // centroid LUT, fp32 activation, fp32 output) plus i32 ids,
+                // with an extra n_experts dim on w/centroids.
+                const ggml_tensor * w    = op->src[0];
+                const ggml_tensor * cent = op->src[1];
+                const ggml_tensor * x    = op->src[2];
+                const ggml_tensor * ids  = op->src[3];
+                if (!w || !cent || !x || !ids) return false;
+                if (w->type    != GGML_TYPE_ML8_4)    return false;
+                if (cent->type != GGML_TYPE_F8_E4M3)  return false;
+                if (x->type    != GGML_TYPE_F32)      return false;
+                if (ids->type  != GGML_TYPE_I32)      return false;
+                if (op->type   != GGML_TYPE_F32)      return false;
+                if (w->ne[0] % 64 != 0)               return false;
+                if (w->ne[1] % 16 != 0)               return false;
+                if (w->ne[2] <= 0)                    return false;
                 return true;
             } break;
         case GGML_OP_OUT_PROD:

@@ -282,3 +282,48 @@ struct ggml_tensor * ggml_ml8_mul_mat(
     y->src[2] = x;
     return y;
 }
+
+struct ggml_tensor * ggml_ml8_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(w         != NULL);
+    GGML_ASSERT(centroids != NULL);
+    GGML_ASSERT(x         != NULL);
+    GGML_ASSERT(ids       != NULL);
+    GGML_ASSERT(w->type         == GGML_TYPE_ML8_4);
+    GGML_ASSERT(centroids->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(x->type         == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type       == GGML_TYPE_I32);
+
+    // Shape contract mirrors ggml_mul_mat_id:
+    //   w         [K, N, n_experts]
+    //   centroids [16, n_groups_k, n_experts]
+    //   x         [K, n_expert_used, n_tokens]
+    //   ids       [n_expert_used, n_tokens]
+    //   y         [N, n_expert_used, n_tokens]
+    const int64_t K         = w->ne[0];
+    const int64_t N         = w->ne[1];
+    const int64_t n_experts = w->ne[2];
+    GGML_ASSERT(K % QK_ML8 == 0 && "K must be a multiple of QK_ML8=64");
+
+    const int64_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(centroids->ne[0] == 16);
+    GGML_ASSERT(centroids->ne[1] == n_groups_k);
+    GGML_ASSERT(centroids->ne[2] == n_experts);
+
+    GGML_ASSERT(x->ne[0] == K);
+    GGML_ASSERT(ids->ne[0] == x->ne[1] && "ids and x must agree on n_expert_used");
+    GGML_ASSERT(ids->ne[1] == x->ne[2] && "ids and x must agree on n_tokens");
+
+    const int64_t ne[4] = { N, x->ne[1], x->ne[2], 1 };
+    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    y->op     = GGML_OP_ML8_MUL_MAT_ID;
+    y->src[0] = w;
+    y->src[1] = centroids;
+    y->src[2] = x;
+    y->src[3] = ids;
+    return y;
+}

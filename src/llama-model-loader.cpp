@@ -910,6 +910,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     if (op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_ML8_4) {
         op = GGML_OP_ML8_MUL_MAT;
     }
+    // MAD-223 G.7: same trick for the MoE path. LLM_TENSOR_INFOS tags
+    // FFN_GATE_EXPS/UP_EXPS/DOWN_EXPS with MUL_MAT_ID; swap to ML8_MUL_MAT_ID
+    // when the underlying weight is ml8_4 so the backend probe asks the
+    // right question.
+    if (op == GGML_OP_MUL_MAT_ID && w->type == GGML_TYPE_ML8_4) {
+        op = GGML_OP_ML8_MUL_MAT_ID;
+    }
 
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
@@ -945,6 +952,19 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * centroids = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, K / 64);
                 ggml_tensor * b         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 512);
                 op_tensor = ggml_ml8_mul_mat(ctx, w, centroids, b);
+            } break;
+        case GGML_OP_ML8_MUL_MAT_ID:
+            {
+                // MAD-223 G.7: ml8-4 MoE GEMM. Per-expert centroids stack
+                // [16, K/QK_ML8, n_experts]; per-token n_expert_used routing.
+                const int64_t K = w->ne[0];
+                const int64_t n_experts = w->ne[2];
+                const int n_expert_used = hparams.n_expert_used;
+                GGML_ASSERT(n_expert_used > 0);
+                ggml_tensor * centroids = ggml_new_tensor_3d(ctx, GGML_TYPE_F8_E4M3, 16, K / 64, n_experts);
+                ggml_tensor * b         = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_expert_used, 512);
+                ggml_tensor * ids       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+                op_tensor = ggml_ml8_mul_mat_id(ctx, w, centroids, b, ids);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

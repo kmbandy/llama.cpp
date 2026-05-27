@@ -612,6 +612,17 @@ extern "C" {
         //   src[1]  = h_a (GGML_TYPE_F32, [a, a])
         //   dst     = y (GGML_TYPE_F32, [d, n_tokens])
         GGML_OP_ML8_APPLY_ROTATION,
+        // MAD-223 G.7 — ml8-4 quantized MoE matmul, sibling of ML8_MUL_MAT
+        // but with per-expert weights/centroids and a token→expert routing
+        // tensor. Mirrors GGML_OP_MUL_MAT_ID's shape contract.
+        //   src[0] = w (GGML_TYPE_ML8_4, [K, N, n_experts])
+        //   src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8, n_experts])
+        //   src[2] = x (GGML_TYPE_F32, [K, n_expert_used, n_tokens])
+        //   src[3] = ids (GGML_TYPE_I32, [n_expert_used, n_tokens])
+        //   dst    = y (GGML_TYPE_F32, [N, n_expert_used, n_tokens])
+        // HIP backend dispatches to mt_ml8_moe_gemm; CPU fallback dequantizes
+        // each routed expert block-by-block.
+        GGML_OP_ML8_MUL_MAT_ID,
 
         GGML_OP_COUNT,
     };

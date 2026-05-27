@@ -122,6 +122,59 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
 
+// MAD-223 G.7 — per-expert MoE repack. Sibling of ml8_weight_repack_t.
+//   b_packed [n_experts, K/2, N]    uint8
+//   b_scale  [n_experts, n_groups_k, N] fp32
+struct ml8_weight_repack_moe_t {
+    void *  b_packed;
+    float * b_scale;
+    int32_t N;
+    int32_t K;
+    int32_t n_groups_k;
+    int32_t group_size;   // currently QK_ML8 = 64
+    int32_t n_experts;
+};
+
+// Pure per-expert repack helper. src_blocks layout matches the on-device
+// stack-of-experts ML8_4 tensor (n_experts × N × n_groups_k × 36 bytes).
+// Calls the dense repack kernel n_experts times under the hood.
+void ggml_cuda_ml8_repack_blocks_moe(
+    cudaStream_t stream,
+    const void * src_blocks,
+    void *       dst_b_packed,
+    float *      dst_b_scale,
+    int32_t      N,
+    int32_t      K,
+    int32_t      group_size,
+    int32_t      n_experts);
+
+// Cache-keyed MoE repack. Key is `w->data` (the per-tensor device pointer);
+// `w` must be a GGML_TYPE_ML8_4 tensor with ne[0]=K, ne[1]=N, ne[2]=n_experts.
+const ml8_weight_repack_moe_t * ggml_cuda_ml8_get_or_repack_moe(
+    cudaStream_t        stream,
+    const ggml_tensor * w);
+
+// Execute GGML_OP_ML8_MUL_MAT_ID on the HIP backend.
+//   dst:        fp32 [N, n_used, n_tokens]
+//   src[0]: w         GGML_TYPE_ML8_4    [K, N, n_experts]
+//   src[1]: centroids GGML_TYPE_F8_E4M3  [16, n_groups_k, n_experts]
+//   src[2]: x         GGML_TYPE_F32      [K, n_used, n_tokens]
+//   src[3]: ids       GGML_TYPE_I32      [n_used, n_tokens]
+//
+// Pipeline (all on ctx.stream()):
+//   1. Cache-lookup or build per-expert repacked weights stack.
+//   2. Read `ids` to host; bin (s, t) pairs by expert; build routing
+//      tensors (ExptHist, ExptOffs, GatherIndx, ExptData, InvGather) and
+//      upload to device. Pad each expert's chunk to MT_ML8_MOE_BLOCK_M.
+//   3. Quantize x[K, n_used*n_tokens] → fp8 + per-row scale (same kernel
+//      as the dense path; GatherIndx routes inside the gemm).
+//   4. Launch mt_ml8_moe_gemm → bf16 [M_padded, N] in sorted order.
+//   5. Scatter sorted bf16 output back to dst[N, n_used, n_tokens] fp32
+//      via InvGather.
+void ggml_cuda_op_ml8_mul_mat_id(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
 // Execute GGML_OP_ML8_APPLY_ROTATION on the HIP backend.
 //   dst:       fp32 [d, n_tokens]
 //   src[0]: x  fp32 [d, n_tokens]   (d = a_dim * b_dim)

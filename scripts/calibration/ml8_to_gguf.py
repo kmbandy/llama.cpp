@@ -55,22 +55,46 @@ _SKIP_FIELDS = {
     "general.architecture",
 }
 
-# Map HF Linear → GGUF MLP tensor name. Same as the prior patcher.
-_HF_MLP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)$")
+# Map HF Linear → GGUF MLP tensor name. Two patterns:
+#   Dense:  model.layers.{L}.mlp.{gate,up,down}_proj         → blk.{L}.ffn_{gate,up,down}.weight
+#   MoE:    model.layers.{L}.mlp.experts.{e}.{gate,up,down}_proj
+#                                                            → blk.{L}.ffn_{gate,up,down}_exps.weight
+# (MAD-223 G.7: MoE pattern, n_experts blobs stacked into one ggml tensor.)
+_HF_MLP_PATTERN     = re.compile(r"^model\.layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)$")
+_HF_MOE_PATTERN     = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
 _MLP_SUFFIX_MAP = {
     "gate_proj": "ffn_gate",
     "up_proj":   "ffn_up",
     "down_proj": "ffn_down",
 }
+_MOE_SUFFIX_MAP = {
+    "gate_proj": "ffn_gate_exps",
+    "up_proj":   "ffn_up_exps",
+    "down_proj": "ffn_down_exps",
+}
+
+
+def parse_hf_name(hf_name: str) -> tuple[str, int | None]:
+    """Return (gguf_tensor_name, expert_id_or_None). Raises ValueError if
+    the HF name isn't a recognized MLP / MoE-expert weight."""
+    m = _HF_MOE_PATTERN.match(hf_name)
+    if m:
+        layer  = m.group(1)
+        expert = int(m.group(2))
+        suffix = _MOE_SUFFIX_MAP[m.group(3)]
+        return f"blk.{layer}.{suffix}.weight", expert
+    m = _HF_MLP_PATTERN.match(hf_name)
+    if m:
+        layer  = m.group(1)
+        suffix = _MLP_SUFFIX_MAP[m.group(2)]
+        return f"blk.{layer}.{suffix}.weight", None
+    raise ValueError(f"not an MLP/MoE HF name: {hf_name!r}")
 
 
 def hf_to_gguf_name(hf_name: str) -> str:
-    m = _HF_MLP_PATTERN.match(hf_name)
-    if not m:
-        raise ValueError(f"not an MLP HF name: {hf_name!r}")
-    layer = m.group(1)
-    suffix = _MLP_SUFFIX_MAP[m.group(2)]
-    return f"blk.{layer}.{suffix}.weight"
+    """Back-compat shim — returns just the GGUF name. New code should use
+    parse_hf_name() which also tells you the expert id (or None for dense)."""
+    return parse_hf_name(hf_name)[0]
 
 
 # ─── Block packing ─────────────────────────────────────────────────────────
@@ -165,20 +189,38 @@ def _rotation_meta_bytes(blob_rotation: dict, in_features: int) -> np.ndarray | 
 # ─── Main conversion ──────────────────────────────────────────────────────
 
 
-def _build_blob_map(calib_dir: Path) -> dict[str, Path]:
-    """Map GGUF tensor name → blob path for every .pt file in calib_dir."""
-    out: dict[str, Path] = {}
+def _build_blob_map(calib_dir: Path) -> dict[str, list[tuple[int | None, Path]]]:
+    """Map GGUF tensor name → list of (expert_id, blob path).
+
+    Dense entries have a single-element list with expert_id=None. MoE
+    entries have one list element per expert (already sorted by expert id
+    at the end so the stack ordering is deterministic)."""
+    out: dict[str, list[tuple[int | None, Path]]] = {}
     for p in calib_dir.glob("*.pt"):
         blob = torch.load(p, map_location="cpu", weights_only=False)
         hf_name = blob.get("name", p.stem.replace("_", "."))
         try:
-            gguf_name = hf_to_gguf_name(hf_name)
+            gguf_name, expert_id = parse_hf_name(hf_name)
         except ValueError:
-            print(f"[skip] {p.name}: HF name {hf_name!r} doesn't match MLP pattern")
+            print(f"[skip] {p.name}: HF name {hf_name!r} doesn't match MLP/MoE pattern")
             continue
-        if gguf_name in out:
-            raise RuntimeError(f"duplicate blob mapping for {gguf_name}: {out[gguf_name]} vs {p}")
-        out[gguf_name] = p
+        out.setdefault(gguf_name, []).append((expert_id, p))
+    # Validate + sort.
+    for gguf_name, entries in out.items():
+        kinds = {e[0] is None for e in entries}
+        if len(kinds) != 1:
+            raise RuntimeError(
+                f"{gguf_name}: mixed dense/MoE blobs for the same tensor")
+        if entries[0][0] is None:
+            if len(entries) != 1:
+                raise RuntimeError(
+                    f"{gguf_name}: dense pattern but {len(entries)} blobs")
+        else:
+            entries.sort(key=lambda x: x[0])
+            seen = [e[0] for e in entries]
+            if seen != list(range(len(entries))):
+                raise RuntimeError(
+                    f"{gguf_name}: expert ids not 0..N-1 contiguous; got {seen}")
     return out
 
 
@@ -218,83 +260,132 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
     print(f"[fields] copied {n_fields_copied} + 1 ml8 marker")
 
     n_ml8 = 0
+    n_moe = 0
     n_centroids = 0
     n_rot = 0
     n_awq = 0
     n_copied = 0
     for tensor in reader.tensors:
         if tensor.name in blob_map:
-            blob = load_ml8_layer(blob_map[tensor.name])
+            entries = blob_map[tensor.name]
+            is_moe = entries[0][0] is not None
 
-            indices  = blob["indices"]               # [N, K] int8
-            cent     = blob["centroids_per_group"]   # [n_groups_k, 16] fp32
-            scales   = blob["scale_per_group"]       # [N, n_groups_k] fp32
-            N, K = indices.shape
+            # Load all blobs for this tensor (1 for dense, n_experts for MoE).
+            blobs = [load_ml8_layer(path) for _, path in entries]
+            n_experts = len(blobs)
+
+            # Shape derivation from blob 0; assert the rest match.
+            b0 = blobs[0]
+            indices0 = b0["indices"]
+            cent0    = b0["centroids_per_group"]
+            scales0  = b0["scale_per_group"]
+            N, K = indices0.shape
             n_groups_k = K // QK_ML8
-            if cent.shape != (n_groups_k, N_CENTROIDS):
+            if cent0.shape != (n_groups_k, N_CENTROIDS):
                 raise ValueError(
-                    f"{tensor.name}: centroids shape {tuple(cent.shape)} "
-                    f"!= expected ({n_groups_k}, {N_CENTROIDS})"
-                )
-            if scales.shape != (N, n_groups_k):
+                    f"{tensor.name}: centroids shape {tuple(cent0.shape)} "
+                    f"!= expected ({n_groups_k}, {N_CENTROIDS})")
+            if scales0.shape != (N, n_groups_k):
                 raise ValueError(
-                    f"{tensor.name}: scales shape {tuple(scales.shape)} "
-                    f"!= expected ({N}, {n_groups_k})"
-                )
+                    f"{tensor.name}: scales shape {tuple(scales0.shape)} "
+                    f"!= expected ({N}, {n_groups_k})")
+            for ei, b in enumerate(blobs[1:], 1):
+                if b["indices"].shape != indices0.shape:
+                    raise ValueError(
+                        f"{tensor.name}: expert {ei} indices shape mismatch")
+                if b["centroids_per_group"].shape != cent0.shape:
+                    raise ValueError(
+                        f"{tensor.name}: expert {ei} centroids shape mismatch")
+                if b["scale_per_group"].shape != scales0.shape:
+                    raise ValueError(
+                        f"{tensor.name}: expert {ei} scales shape mismatch")
 
             # ── Main ML8_4 tensor ──────────────────────────────────────────
-            packed = pack_ml8_blocks(indices, scales)
-            # ggml ne ordering is inner-first. For weight matrix viewed as [N, K]
-            # numpy (out_features, in_features), ne = (K, N). The packed bytes
-            # have shape (N, n_groups_k*36); ne_byte_shape = (n_groups_k*36, N).
-            # Writer's quant_shape_from_byte_shape then converts inner byte-dim
-            # back to element count: ne = (K, N). Match the patcher's transpose-
-            # avoiding approach: pass packed in (N, n_groups_k*36) — the writer
-            # treats shape[-1] as the inner byte-dim and converts it back.
-            writer.add_tensor(tensor.name, packed, raw_dtype=GGMLQuantizationType.ML8_4)
-            n_ml8 += 1
+            # Dense: packed bytes shape (N, n_groups_k*36).
+            # MoE:   packed bytes shape (n_experts, N, n_groups_k*36).
+            if is_moe:
+                stacked = np.stack(
+                    [pack_ml8_blocks(b["indices"], b["scale_per_group"]) for b in blobs],
+                    axis=0)
+                writer.add_tensor(tensor.name, stacked,
+                                  raw_dtype=GGMLQuantizationType.ML8_4)
+                n_moe += 1
+            else:
+                packed = pack_ml8_blocks(indices0, scales0)
+                writer.add_tensor(tensor.name, packed,
+                                  raw_dtype=GGMLQuantizationType.ML8_4)
+                n_ml8 += 1
 
             # Sidecar names follow the llama.cpp convention used for `_s` scale
-            # tensors: same root as the main weight, different suffix. Drop the
-            # `.weight` middle name so the per-arch tn() builder can address
-            # them as `tn(LLM_TENSOR_FFN_*, "centroids", il)` etc.
+            # tensors: same root as the main weight, different suffix.
             base = tensor.name[:-len(".weight")] if tensor.name.endswith(".weight") else tensor.name
 
             # ── Sidecar: centroids (F8_E4M3) ───────────────────────────────
-            cent_fp8 = cast_centroids_to_fp8(cent)  # [n_groups_k, 16] uint8
-            writer.add_tensor(
-                base + ".centroids",
-                cent_fp8,
-                raw_dtype=GGMLQuantizationType.F8_E4M3,
-            )
+            # Dense: [n_groups_k, 16].  MoE: [n_experts, n_groups_k, 16].
+            if is_moe:
+                cent_stack = np.stack(
+                    [cast_centroids_to_fp8(b["centroids_per_group"]) for b in blobs],
+                    axis=0)
+                writer.add_tensor(base + ".centroids", cent_stack,
+                                  raw_dtype=GGMLQuantizationType.F8_E4M3)
+            else:
+                cent_fp8 = cast_centroids_to_fp8(cent0)
+                writer.add_tensor(base + ".centroids", cent_fp8,
+                                  raw_dtype=GGMLQuantizationType.F8_E4M3)
             n_centroids += 1
 
-            # ── Sidecar: rotation_h_a + rotation_meta (optional) ──────────
-            rotation_dict = blob.get("rotation")
+            # ── Sidecar: rotation_h_a + rotation_meta (optional) ───────────
+            # Rotation is applied OUTSIDE the matmul kernel (on x), so MoE
+            # layers must use the same rotation across experts. Validate
+            # this contract and write a single rotation_h_a per layer/kind.
+            rotation_dict = b0.get("rotation")
             meta = _rotation_meta_bytes(rotation_dict, in_features=K)
             if meta is not None:
-                h_a = rotation_dict["h_a"].detach().cpu().to(torch.float32).contiguous().numpy()
-                writer.add_tensor(base + ".rotation_h_a", h_a)
+                h_a_ref = rotation_dict["h_a"].detach().cpu().to(torch.float32).contiguous()
+                if is_moe:
+                    for ei, b in enumerate(blobs[1:], 1):
+                        r_e = b.get("rotation")
+                        if r_e is None:
+                            raise ValueError(
+                                f"{tensor.name}: expert 0 has rotation but expert {ei} does not")
+                        h_a_e = r_e["h_a"].detach().cpu().to(torch.float32).contiguous()
+                        if not torch.allclose(h_a_e, h_a_ref, atol=0.0, rtol=0.0):
+                            raise ValueError(
+                                f"{tensor.name}: expert {ei} rotation_h_a differs from expert 0 "
+                                f"— MoE inference requires identical rotation across experts.")
+                writer.add_tensor(base + ".rotation_h_a", h_a_ref.numpy())
                 writer.add_tensor(base + ".rotation_meta", meta)
                 n_rot += 1
 
             # ── Sidecar: AWQ scale (optional) ──────────────────────────────
-            awq_s = get_awq(blob)
-            if awq_s is not None:
-                awq_np = awq_s.detach().cpu().to(torch.float32).contiguous().numpy()
-                if awq_np.shape != (K,):
+            # Same rationale as rotation — applied on x upstream, must be
+            # identical across experts in an MoE layer.
+            awq_ref = get_awq(b0)
+            if awq_ref is not None:
+                awq_np_ref = awq_ref.detach().cpu().to(torch.float32).contiguous()
+                if awq_np_ref.shape != (K,):
                     raise ValueError(
-                        f"{tensor.name}: awq_scale shape {awq_np.shape} != ({K},)"
-                    )
-                writer.add_tensor(base + ".awq_scale", awq_np)
+                        f"{tensor.name}: awq_scale shape {awq_np_ref.shape} != ({K},)")
+                if is_moe:
+                    for ei, b in enumerate(blobs[1:], 1):
+                        awq_e = get_awq(b)
+                        if awq_e is None:
+                            raise ValueError(
+                                f"{tensor.name}: expert 0 has awq but expert {ei} does not")
+                        awq_e_t = awq_e.detach().cpu().to(torch.float32).contiguous()
+                        if not torch.allclose(awq_e_t, awq_np_ref, atol=0.0, rtol=0.0):
+                            raise ValueError(
+                                f"{tensor.name}: expert {ei} awq_scale differs from expert 0 "
+                                f"— MoE inference requires identical AWQ scale across experts.")
+                writer.add_tensor(base + ".awq_scale", awq_np_ref.numpy())
                 n_awq += 1
         else:
             writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
             n_copied += 1
 
     print(
-        f"[tensors] main ml8={n_ml8}, centroids={n_centroids}, rotation={n_rot}, "
-        f"awq={n_awq}, copied unchanged={n_copied}"
+        f"[tensors] dense_ml8={n_ml8}, moe_ml8={n_moe}, centroids={n_centroids}, "
+        f"rotation={n_rot}, awq={n_awq}, copied unchanged={n_copied}"
     )
 
     writer.write_header_to_file()
@@ -305,6 +396,7 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
     return {
         "out_path":         str(out_gguf),
         "n_ml8":            n_ml8,
+        "n_moe":            n_moe,
         "n_centroids":      n_centroids,
         "n_rotation":       n_rot,
         "n_awq":            n_awq,

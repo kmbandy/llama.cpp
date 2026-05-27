@@ -75,6 +75,33 @@ GGML_API struct ggml_tensor * ggml_ml8_apply_rotation(
         int64_t a_dim,
         int64_t b_dim);
 
+// MAD-223 G.7 — ml8-4 MoE matmul. Mirrors ggml_mul_mat_id's shape contract
+// but with per-expert ml8-4 weight stacks and per-expert centroid LUTs.
+//
+// Tensor shapes (ggml row-major):
+//   w         : [K, N, n_experts]            GGML_TYPE_ML8_4   per-expert weights
+//   centroids : [16, n_groups_k, n_experts]  GGML_TYPE_F8_E4M3 per-expert LUT stack
+//   x         : [K, n_expert_used, n_tokens] GGML_TYPE_F32     gathered activations
+//   ids       : [n_expert_used, n_tokens]    GGML_TYPE_I32     expert routing
+//
+// Output:
+//   y         : [N, n_expert_used, n_tokens] GGML_TYPE_F32
+//
+// Constraints:
+//   - K % QK_ML8 == 0
+//   - n_groups_k (centroids ne0=16, ne1=n_groups_k) must equal K / QK_ML8
+//   - ids ne0 == x ne1, ids ne1 == x ne2
+//   - w->ne[2] == centroids->ne[2] (same n_experts)
+//
+// Rotation + AWQ are NOT part of this op — the graph builder is expected to
+// apply them on `x` upstream (same pattern as the dense path).
+GGML_API struct ggml_tensor * ggml_ml8_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

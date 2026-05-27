@@ -1153,9 +1153,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "ML8_MUL_MAT",
     "ML8_APPLY_ROTATION",
+    "ML8_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1269,9 +1270,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "ml8_mul_mat(w,centroids,x)",
     "ml8_apply_rotation(x,h_a)",
+    "ml8_mul_mat_id(w,centroids,x,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

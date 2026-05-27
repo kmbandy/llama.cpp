@@ -117,6 +117,7 @@ void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ml8_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ml8_apply_rotation(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_ml8_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
 #endif
