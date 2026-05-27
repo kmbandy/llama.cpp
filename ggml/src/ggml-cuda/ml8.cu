@@ -14,9 +14,55 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+// G.6.g.C: debug hooks to dump rotation input + ml8_mul_mat output to /tmp
+// for Python-side bit-equivalence comparison. Set env var ML8_DUMP=1 to
+// enable. First-call-only; the static atomics track which dumps have fired.
+namespace {
+std::atomic<bool> g_ml8_dump_rot_done    {false};
+std::atomic<bool> g_ml8_dump_rotdst_done {false};
+std::atomic<bool> g_ml8_dump_mm_done     {false};
+std::atomic<bool> g_ml8_dump_quant_done  {false};
+
+void ml8_dump_u8(const char * path, const uint8_t * d_ptr, size_t n_elems,
+                cudaStream_t stream, int ndim, const int64_t * shape) {
+    std::vector<uint8_t> host(n_elems);
+    cudaMemcpyAsync(host.data(), d_ptr, n_elems, cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    FILE * f = std::fopen(path, "wb");
+    if (!f) { std::fprintf(stderr, "[ml8-dump] open %s failed\n", path); return; }
+    std::fwrite(&ndim, sizeof(int32_t), 1, f);
+    std::fwrite(shape, sizeof(int64_t), (size_t) ndim, f);
+    std::fwrite(host.data(), 1, n_elems, f);
+    std::fclose(f);
+    std::fprintf(stderr, "[ml8-dump] wrote %s  ndim=%d  n=%zu\n", path, ndim, n_elems);
+}
+
+bool ml8_dump_enabled() {
+    static const bool e = (std::getenv("ML8_DUMP") != nullptr);
+    return e;
+}
+
+void ml8_dump_fp32(const char * path, const float * d_ptr, size_t n_elems,
+                  cudaStream_t stream, int ndim, const int64_t * shape) {
+    std::vector<float> host(n_elems);
+    cudaMemcpyAsync(host.data(), d_ptr, n_elems * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    FILE * f = std::fopen(path, "wb");
+    if (!f) { std::fprintf(stderr, "[ml8-dump] open %s failed\n", path); return; }
+    // Header: int32 ndim, int64 * shape, then fp32 data
+    std::fwrite(&ndim, sizeof(int32_t), 1, f);
+    std::fwrite(shape, sizeof(int64_t), (size_t) ndim, f);
+    std::fwrite(host.data(), sizeof(float), n_elems, f);
+    std::fclose(f);
+    std::fprintf(stderr, "[ml8-dump] wrote %s  ndim=%d  n=%zu\n", path, ndim, n_elems);
+}
+} // namespace
 
 // On-disk per-block layout: 4-byte fp32 scale, then QK_ML8/2 = 32 packed
 // nibble bytes covering 64 K-elements. sizeof(block_ml8_4) == 36.
@@ -251,7 +297,12 @@ static __device__ __forceinline__ uint8_t ml8_fp32_to_e4m3(float xv) {
         if (m_e4m3 == 8) {
             m_e4m3 = 0;
             e_out += 1;
-            if (e_out >= 15) {
+            // G.6.g.C BUGFIX (2026-05-26): was `e_out >= 15`, which prematurely
+            // saturated valid e=15, m=0..6 values (256, 288, ..., 448) to ±448.
+            // Only e>15 (= e_real > 8) overflows the E4M3 finite range. The
+            // m=7 NaN slot is handled by the `m_e4m3 == 7` guard below. This
+            // bug cost ~+0.33 PPL on Cell E vs the Python kernel reference.
+            if (e_out > 15) {
                 return (uint8_t)((sign << 7) | (0xFu << 3) | 0x6u);
             }
         }
@@ -438,6 +489,13 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_cuda_pool_alloc<uint8_t> a_fp8(ctx.pool(),    (size_t) M_pad * (size_t) K);
     ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) M_pad);
 
+    // G.6.g.C: dump pre-quant fp32 activation that the kernel will see.
+    if (ml8_dump_enabled() && !g_ml8_dump_quant_done.load()) {
+        const int64_t shp[2] = { (int64_t) K, (int64_t) M_pad };
+        ml8_dump_fp32("/tmp/ml8_hip_x_prequant.bin", x_src,
+                      (size_t) M_pad * (size_t) K, stream, 2, shp);
+    }
+
     ggml_cuda_ml8_quantize_activations(
         stream,
         x_src,
@@ -445,6 +503,16 @@ void ggml_cuda_op_ml8_mul_mat(
         a_scale.get(),
         M_pad,
         K);
+
+    // G.6.g.C: dump fp8 quantized activations + per-row scale on first call.
+    if (ml8_dump_enabled() && !g_ml8_dump_quant_done.exchange(true)) {
+        const int64_t shp_fp8[2]   = { (int64_t) K,     (int64_t) M_pad };
+        const int64_t shp_scale[1] = { (int64_t) M_pad };
+        ml8_dump_u8("/tmp/ml8_hip_a_fp8.bin", a_fp8.get(),
+                    (size_t) M_pad * (size_t) K, stream, 2, shp_fp8);
+        ml8_dump_fp32("/tmp/ml8_hip_a_scale.bin", a_scale.get(),
+                      (size_t) M_pad, stream, 1, shp_scale);
+    }
 
     // ── 4. Allocate bf16 output (M_pad × N) and launch mt_ml8_gemm.
     ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
@@ -483,6 +551,13 @@ void ggml_cuda_op_ml8_mul_mat(
     GGML_ASSERT(bf16_to_fp32 != nullptr);
     bf16_to_fp32(c_bf16.get(), (float *) dst->data,
                  (size_t) M * (size_t) N, stream);
+
+    // G.6.g.C: dump final mul_mat output on first call.
+    if (ml8_dump_enabled() && !g_ml8_dump_mm_done.exchange(true)) {
+        const int64_t shape[2] = { (int64_t) N, (int64_t) M };
+        ml8_dump_fp32("/tmp/ml8_hip_y_out.bin", (const float *) dst->data,
+                      (size_t) M * (size_t) N, stream, 2, shape);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -559,6 +634,15 @@ void ggml_cuda_op_ml8_apply_rotation(
     const int n_tokens = (int) x->ne[1];
     const size_t total_elems = (size_t) n_tokens * (size_t) d_dim;
 
+    // G.6.g.C: dump rotation input (pre-rotation activations) on first call.
+    if (ml8_dump_enabled() && !g_ml8_dump_rot_done.exchange(true)) {
+        const int64_t shape[2] = { (int64_t) d_dim, (int64_t) n_tokens };
+        ml8_dump_fp32("/tmp/ml8_hip_x_in.bin", (const float *) x->data,
+                      total_elems, stream, 2, shape);
+    }
+
+    // (rotation kernel runs below; output dump happens after the kernel returns)
+
     // Step 1: copy X into a scratch Z buffer (FWHT is in-place).
     ggml_cuda_pool_alloc<float> z_buf(ctx.pool(), total_elems);
     CUDA_CHECK(cudaMemcpyAsync(z_buf.get(), x->data,
@@ -578,4 +662,11 @@ void ggml_cuda_op_ml8_apply_rotation(
         (float *) dst->data,
         a_dim,
         b_dim);
+
+    // G.6.g.C: dump rotation output (post-FWHT + H_a^T) on first call.
+    if (ml8_dump_enabled() && !g_ml8_dump_rotdst_done.exchange(true)) {
+        const int64_t shape[2] = { (int64_t) d_dim, (int64_t) n_tokens };
+        ml8_dump_fp32("/tmp/ml8_hip_x_rotated.bin", (const float *) dst->data,
+                      total_elems, stream, 2, shape);
+    }
 }
