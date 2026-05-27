@@ -68,6 +68,7 @@ from kronecker_rotation import (  # noqa: E402
     KroneckerRotation, random_orthogonal, factor_for_dim, rotate_hessian,
 )
 from awq import compute_awq_scale, apply_awq_to_weight, absorb_awq_in_reconstruction  # noqa: E402
+from batched_gptq import batched_gptq_quantize  # noqa: E402  (G.7.h.2)
 
 # Pybind11 weight pager (in repo's python_bindings/wp/)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python_bindings" / "wp"))
@@ -402,6 +403,94 @@ def _detect_moe_n_experts(config) -> int | None:
     return None
 
 
+def _group_moe_targets_by_layer_and_kind(targets):
+    """Bucket `targets` (yielded by find_target_linears) by (layer_idx, kind).
+
+    Returns dict[(layer_idx, kind)] → list[(name, module)] sorted by expert id.
+    `kind` is one of "gate_proj", "up_proj", "down_proj".
+    Layers/linears that don't match the MoE expert pattern are dropped.
+    """
+    out: dict[tuple[int, str], list[tuple[str, nn.Module]]] = {}
+    for name, mod in targets:
+        parts = name.split(".")
+        if (len(parts) < 7 or parts[-3] != "experts" or parts[-4] != "mlp"):
+            continue
+        if parts[-1] not in ("gate_proj", "up_proj", "down_proj"):
+            continue
+        try:
+            L = int(parts[parts.index("layers") + 1])
+            E = int(parts[-2])
+        except (ValueError, IndexError):
+            continue
+        out.setdefault((L, parts[-1]), []).append((E, name, mod))
+    # Sort each bucket by expert id; strip the expert id from the result tuple.
+    out2: dict[tuple[int, str], list[tuple[str, nn.Module]]] = {}
+    for k, v in out.items():
+        v.sort(key=lambda x: x[0])
+        seen_eids = [t[0] for t in v]
+        if seen_eids != list(range(len(v))):
+            raise RuntimeError(
+                f"layer {k[0]} kind {k[1]}: expert ids not contiguous 0..N-1; got {seen_eids}")
+        out2[k] = [(n, m) for _, n, m in v]
+    return out2
+
+
+def _collect_hessians_layer_moe(experts, calib_ids, model, dev, collect_awq=False):
+    """Single forward pass over `calib_ids`, hooks on every expert linear in
+    `experts`, accumulates H_e and (optionally) sum_abs_e per expert.
+
+    Returns:
+        H_list:       [len(experts)] of torch.Tensor [K, K]  (per-expert H = E[x x^T])
+        n_tok_list:   [len(experts)] of int                  (tokens routed to that expert)
+        sum_abs_list: [len(experts)] of torch.Tensor [K] OR None
+    """
+    H_acc = [None] * len(experts)
+    sum_abs = [None] * len(experts) if collect_awq else None
+    n_tot = [0] * len(experts)
+
+    def make_hook(e_idx):
+        def hook(module, inputs, output):
+            x = inputs[0].detach()
+            x = x.reshape(-1, x.shape[-1]).float()  # [N_tok_e, K]
+            XtX = x.t() @ x
+            if H_acc[e_idx] is None:
+                H_acc[e_idx] = XtX
+            else:
+                H_acc[e_idx] += XtX
+            if collect_awq:
+                sa = x.abs().sum(dim=0)
+                if sum_abs[e_idx] is None:
+                    sum_abs[e_idx] = sa
+                else:
+                    sum_abs[e_idx] += sa
+            n_tot[e_idx] += x.shape[0]
+        return hook
+
+    handles = []
+    for e_idx, (_, mod) in enumerate(experts):
+        handles.append(mod.register_forward_hook(make_hook(e_idx)))
+    try:
+        with torch.no_grad():
+            for ids in calib_ids:
+                model(ids.to(dev))
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Normalize per-expert H to E[x x^T] by dividing by per-expert n_tok (matches
+    # the scalar `compute_hessian` semantics).
+    H_list = []
+    for e_idx in range(len(experts)):
+        if H_acc[e_idx] is None:
+            # Cold expert — no tokens routed. Use identity-scaled H as a
+            # placeholder; downstream code can detect via n_tok==0 and skip.
+            K_dim = experts[e_idx][1].in_features
+            H_list.append(torch.eye(K_dim, device=dev) * 1e-6)
+        else:
+            H_list.append(H_acc[e_idx] / max(n_tot[e_idx], 1))
+    return H_list, n_tot, sum_abs
+
+
 def _build_model_meta(model_name: str, dtype: torch.dtype):
     """Instantiate `model_name` on the meta device — no host RAM allocated
     for parameters. Returns (model, config, n_blocks).
@@ -566,6 +655,192 @@ def main():
                                       max_tokens=args.ppl_max_tokens)
         print(f"  baseline PPL = {baseline['ppl']:.4f}")
         manifest["ppl_baseline"] = baseline
+
+    # ═══════════════════════════════════════════════════════════════════
+    # MoE layer-major calibration path (G.7.h.1). One forward pass per
+    # layer per "stage" (gate+up share a stage, down is its own), captures
+    # Hessians for all 128 experts × 3 kinds via per-linear hooks. Then
+    # rotates, AWQs, stacks, runs batched_gptq_quantize over the [E, N, K]
+    # tensor. Save per-expert .pt blobs identical to scalar output so
+    # ml8_to_gguf.py just works.
+    # ═══════════════════════════════════════════════════════════════════
+    if args.strategy == "moe":
+        groups = _group_moe_targets_by_layer_and_kind(targets)
+        layer_ids = sorted({L for (L, _) in groups})
+        if args.max_layers is not None:
+            layer_ids = layer_ids[: args.max_layers]
+        print(f"[moe-loop] {len(layer_ids)} layers x 3 kinds; groups={len(groups)}")
+
+        for layer_idx in layer_ids:
+            t_layer = time.time()
+            print(f"\n=== Layer {layer_idx} ===")
+
+            # Two stages per layer:
+            #   stage 1: gate_proj + up_proj experts (same input X)
+            #   stage 2: down_proj experts (uses quantized gate/up outputs)
+            for stage, kinds in (("gate_up", ("gate_proj", "up_proj")),
+                                  ("down",    ("down_proj",))):
+                experts_flat: list[tuple[str, nn.Module, int, str]] = []
+                for kind in kinds:
+                    grp = groups.get((layer_idx, kind))
+                    if not grp:
+                        continue
+                    for e_id, (nm, mod) in enumerate(grp):
+                        experts_flat.append((nm, mod, e_id, kind))
+                if not experts_flat:
+                    continue
+
+                t_h = time.time()
+                H_list, n_tok_list, sum_abs_list = _collect_hessians_layer_moe(
+                    [(n, m) for n, m, _, _ in experts_flat], calib, model, args.device,
+                    collect_awq=(args.awq != "none"))
+                t_h_done = time.time() - t_h
+                tot_tok = sum(n_tok_list)
+                print(f"  [{stage}] {len(experts_flat)} linears  n_tok_total={tot_tok}  "
+                      f"t_hessian={t_h_done:.1f}s")
+
+                # Process per-kind so each kind's experts form a clean [E, N, K] stack.
+                for kind in kinds:
+                    kind_entries = [(idx, e) for idx, e in enumerate(experts_flat) if e[3] == kind]
+                    if not kind_entries:
+                        continue
+                    flat_indices = [idx for idx, _ in kind_entries]
+                    E_cnt = len(flat_indices)
+                    # Reference dimensions from expert 0.
+                    ref_layer = experts_flat[flat_indices[0]][1]
+                    rows, K = ref_layer.weight.shape   # PagedLinear.weight page-faults here
+
+                    # ── Per-(layer, kind) rotation + per-expert AWQ.
+                    rotation = None
+                    rotation_blob = None
+                    h_a_to_save = None
+                    if args.rotation == "kronecker":
+                        a, b = factor_for_dim(K, max_b=args.rotation_max_b)
+                        # Deterministic seed per (layer, kind) — shared across experts.
+                        seed = args.rotation_seed + layer_idx * 7 + {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[kind]
+                        h_a = random_orthogonal(a, seed=seed)
+                        rotation = KroneckerRotation(h_a=h_a, b_dim=b)
+                        rotation_blob = rotation.to_dict()
+                        rotation_blob["seed"] = seed
+                        h_a_to_save = rotation_blob["h_a"]
+                        print(f"  [{stage}/{kind}] rotation kronecker a={a} b={b}")
+
+                    # Build stacked W and H. Also build per-expert weight snapshot
+                    # for fallback in case GPTQ fails for an expert.
+                    W_stack = torch.empty((E_cnt, rows, K), device=args.device, dtype=dtype)
+                    H_stack = torch.empty((E_cnt, K, K), device=args.device, dtype=torch.float32)
+                    awq_s_stack: list[torch.Tensor | None] = [None] * E_cnt
+                    n_tok_kind = torch.zeros((E_cnt,), dtype=torch.long, device=args.device)
+                    cold_eids: list[int] = []
+                    for j, (flat_idx, (nm, mod, e_id, _kd)) in enumerate(zip(flat_indices, [experts_flat[fi] for fi in flat_indices])):
+                        W_orig = mod.weight.detach().float()
+                        H_e = H_list[flat_idx].to(args.device).float()
+                        if n_tok_list[flat_idx] == 0:
+                            cold_eids.append(e_id)
+                        # Per-expert AWQ
+                        if args.awq != "none" and sum_abs_list is not None and sum_abs_list[flat_idx] is not None:
+                            mean_abs = (sum_abs_list[flat_idx] / max(n_tok_list[flat_idx], 1)).clamp_min(1e-8)
+                            awq_e = mean_abs.pow(args.awq_alpha).to(args.device)
+                            awq_s_stack[j] = awq_e
+                            H_e = H_e * awq_e.unsqueeze(0) * awq_e.unsqueeze(1)
+                            W_orig = apply_awq_to_weight(W_orig, awq_e)
+                        if rotation is not None:
+                            H_e = rotate_hessian(H_e, rotation)
+                            W_orig = rotation.forward(W_orig.to(rotation.h_a.device)).to(args.device)
+                        W_stack[j] = W_orig.to(dtype)
+                        H_stack[j] = H_e
+                        n_tok_kind[j] = n_tok_list[flat_idx]
+                    if cold_eids:
+                        print(f"  [{stage}/{kind}] WARNING {len(cold_eids)} cold experts (n_tok=0): {cold_eids[:8]}...")
+
+                    # ── Batched GPTQ over all experts of this (layer, kind).
+                    t_q = time.time()
+                    effective_percdamp = args.percdamp
+                    if any(s is not None for s in awq_s_stack):
+                        effective_percdamp = max(args.percdamp, 0.05)
+                    out = batched_gptq_quantize(
+                        W_stack=W_stack.float(),
+                        H_stack=H_stack,
+                        n_centroids=args.n_centroids,
+                        group_size=args.group_size,
+                        n_iter=args.n_iter,
+                        fit_loss=args.fit_loss,
+                        mag_weight_p=args.mag_weight_p,
+                        snap_centroids=args.snap_centroids,
+                        percdamp=effective_percdamp,
+                        n_tokens_per_expert=n_tok_kind,
+                    )
+                    t_q_done = time.time() - t_q
+                    indices = out["indices"]                  # [E, N, K] int8
+                    centroids = out["centroids_per_group"]    # [E, n_groups, n_centroids]
+                    scales = out["scale_per_group"]           # [E, N, n_groups]
+                    Q_all = out["Q"]                          # [E, N, K] fp32 dequantized
+                    mse_all = out["mse"]; w_snr = out["w_snr_db"]; y_snr = out["y_snr_db"]; rel = out["rel_err"]
+
+                    # Inverse rotation + AWQ absorb (per expert) so subsequent
+                    # layers' forward pass sees inference-equivalent weights.
+                    for j, (flat_idx, exp) in enumerate(zip(flat_indices, [experts_flat[fi] for fi in flat_indices])):
+                        nm, mod, e_id, _kd = exp
+                        W_q = Q_all[j].float().to(args.device)
+                        if rotation is not None:
+                            W_q = rotation.inverse(W_q.to(rotation.h_a.device)).to(args.device)
+                        if awq_s_stack[j] is not None:
+                            W_q = absorb_awq_in_reconstruction(W_q.float(), awq_s_stack[j].to(W_q.device))
+                        mod.weight_override = W_q.to(dtype).to(args.device)
+
+                        # Per-expert .pt blob (same schema as scalar path).
+                        out_path = Path(args.output_dir) / f"{nm.replace('.', '_').replace('/', '_')}.pt"
+                        blob = {
+                            "name": nm,
+                            "shape": [rows, K],
+                            "group_size": args.group_size,
+                            "n_centroids": args.n_centroids,
+                            "indices": indices[j].cpu(),
+                            "centroids_per_group": centroids[j].cpu(),
+                            "scale_per_group": scales[j].cpu(),
+                            "mse": float(mse_all[j].item()),
+                            "w_snr_db": float(w_snr[j].item()),
+                            "y_snr_db": float(y_snr[j].item()),
+                            "rel_err": float(rel[j].item()),
+                        }
+                        if rotation_blob is not None:
+                            blob["rotation"] = dict(rotation_blob)
+                        if awq_s_stack[j] is not None:
+                            blob["awq"] = {"kind": args.awq, "alpha": args.awq_alpha,
+                                            "s": awq_s_stack[j].detach().cpu()}
+                        torch.save(blob, out_path)
+                        manifest["results"].append({
+                            "name": nm, "shape": [rows, K],
+                            "mse": float(mse_all[j].item()),
+                            "y_snr_db": float(y_snr[j].item()),
+                            "w_snr_db": float(w_snr[j].item()),
+                        })
+
+                    print(f"  [{stage}/{kind}] batched_gptq E={E_cnt} K={K} N={rows}  "
+                          f"t_quant={t_q_done:.1f}s  median Y_SNR={float(y_snr.median().item()):.2f}dB")
+                    del W_stack, H_stack, indices, centroids, scales, Q_all
+                    if args.device.startswith("cuda"):
+                        torch.cuda.empty_cache()
+
+            print(f"  layer {layer_idx} total t={time.time()-t_layer:.1f}s")
+
+        # Done with the MoE path — skip the dense per-linear loop.
+        if args.eval_ppl:
+            print(f"\n[ppl-quant] computing quantized PPL...")
+            quantized = eval_ppl_wikitext(model, tokenizer, args.device,
+                                           max_tokens=args.ppl_max_tokens)
+            print(f"  quantized PPL = {quantized['ppl']:.4f}")
+            manifest["ppl_quantized"] = quantized
+            delta = quantized["ppl"] - manifest["ppl_baseline"]["ppl"]
+            manifest["ppl_delta"] = delta
+            print(f"\n  Δ_PPL = {delta:+.4f}")
+
+        manifest_path = Path(args.output_dir) / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"\n[done] manifest: {manifest_path}")
+        pager.shutdown()
+        return
 
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
     for i, (name, layer) in enumerate(targets):
