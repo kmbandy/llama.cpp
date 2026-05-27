@@ -814,180 +814,185 @@ def main():
     # ml8_to_gguf.py just works.
     # ═══════════════════════════════════════════════════════════════════
     if args.strategy == "moe":
-        groups = _group_moe_targets_by_layer_and_kind(targets)
-        layer_ids = sorted({L for (L, _) in groups})
+        # Consolidated-MoE layer-major loop. Finds every PagedMoeExperts in the
+        # model, processes one layer at a time:
+        #   1. Hook the block to accumulate H_gate_up (from each expert's input)
+        #      and H_down (from the silu(gate)*up output entering down_proj).
+        #      Both are SHARED across experts in this (layer, kind).
+        #   2. One forward pass over the calibration corpus populates both H.
+        #   3. Read consolidated gate_proj / up_proj / down_proj from the
+        #      PagedMoeExperts (page-faults via wp_native), get [E, N, K]
+        #      stacks, rotate/AWQ, run batched_gptq_quantize.
+        #   4. Save per-expert .pt blobs so ml8_to_gguf.py can stack them
+        #      into ffn_*_exps tensors with sidecars.
+        moe_blocks_by_layer = {}
+        for nm, mod in model.named_modules():
+            if isinstance(mod, PagedMoeExperts):
+                parts = nm.split(".")
+                try:
+                    L = int(parts[parts.index("layers") + 1])
+                except (ValueError, IndexError):
+                    continue
+                moe_blocks_by_layer[L] = (nm, mod)
+        layer_ids = sorted(moe_blocks_by_layer)
         if args.max_layers is not None:
             layer_ids = layer_ids[: args.max_layers]
-        print(f"[moe-loop] {len(layer_ids)} layers x 3 kinds; groups={len(groups)}")
+        print(f"[moe-loop] {len(layer_ids)} PagedMoeExperts blocks queued")
+
+        kinds_specs = (
+            ("gate_proj", "gate_proj", "ffn_gate_exps", "hidden"),
+            ("up_proj",   "up_proj",   "ffn_up_exps",   "hidden"),
+            ("down_proj", "down_proj", "ffn_down_exps", "intermediate"),
+        )
+
+        # ── Collect Hessians for ALL layers in ONE forward pass over the
+        # calibration corpus. Each forward through the 35B-A3B model takes
+        # ~58s due to expert paging from NVMe; doing one-forward-per-layer
+        # would take 40 hours. Setting collect flags on every PagedMoeExperts
+        # at once lets a single full forward populate all per-layer accs.
+        # VRAM cost: per layer H = 2048² + 512² fp32 = 17 MB; × 40 = 680 MB.
+        print(f"\n[hessian-pass] collecting H_gate_up + H_down on all "
+              f"{len(layer_ids)} layers in one forward pass...")
+        for L in layer_ids:
+            _, mb = moe_blocks_by_layer[L]
+            mb.reset_calibration_acc()
+            mb.collect_pre_gate_up = True
+            mb.collect_pre_down    = True
+        t_h = time.time()
+        with torch.no_grad():
+            for s_i, ids in enumerate(calib):
+                model(ids.to(args.device))
+                if (s_i + 1) % 4 == 0 or s_i == len(calib) - 1:
+                    print(f"  [hessian-pass] {s_i+1}/{len(calib)} samples  "
+                          f"elapsed={time.time()-t_h:.1f}s")
+        for L in layer_ids:
+            _, mb = moe_blocks_by_layer[L]
+            mb.collect_pre_gate_up = False
+            mb.collect_pre_down    = False
+        t_h_done = time.time() - t_h
+        print(f"[hessian-pass] done in {t_h_done:.1f}s ({t_h_done/len(calib):.1f}s/sample)")
 
         for layer_idx in layer_ids:
             t_layer = time.time()
-            print(f"\n=== Layer {layer_idx} ===")
+            block_name, moe_block = moe_blocks_by_layer[layer_idx]
+            print(f"\n=== Layer {layer_idx} ({block_name}) ===")
+            n_experts = moe_block.num_experts
+            interm    = moe_block.intermediate_dim
+            hidden    = moe_block.hidden_dim
 
-            # Two stages per layer:
-            #   stage 1: gate_proj + up_proj experts (same input X)
-            #   stage 2: down_proj experts (uses quantized gate/up outputs)
-            for stage, kinds in (("gate_up", ("gate_proj", "up_proj")),
-                                  ("down",    ("down_proj",))):
-                experts_flat: list[tuple[str, nn.Module, int, str]] = []
-                for kind in kinds:
-                    grp = groups.get((layer_idx, kind))
-                    if not grp:
-                        continue
-                    for e_id, (nm, mod) in enumerate(grp):
-                        experts_flat.append((nm, mod, e_id, kind))
-                if not experts_flat:
-                    continue
+            n_tok_gu = moe_block.pre_gate_up_n_tok
+            n_tok_dn = moe_block.pre_down_n_tok
+            if moe_block.pre_gate_up_acc is None or n_tok_gu == 0:
+                print(f"  WARN: layer {layer_idx} zero pre_gate_up tokens; using identity Hessian")
+                H_gate_up = torch.eye(hidden, device=args.device, dtype=torch.float32)
+            else:
+                H_gate_up = (moe_block.pre_gate_up_acc / max(n_tok_gu, 1)).to(args.device)
+            if moe_block.pre_down_acc is None or n_tok_dn == 0:
+                print(f"  WARN: layer {layer_idx} zero pre_down tokens; using identity Hessian")
+                H_down = torch.eye(interm, device=args.device, dtype=torch.float32)
+            else:
+                H_down = (moe_block.pre_down_acc / max(n_tok_dn, 1)).to(args.device)
+            # Free the per-layer accumulator NOW that we've snapshot it; saves VRAM.
+            moe_block.reset_calibration_acc()
+            print(f"  hessians: gate_up n_tok={n_tok_gu}  down n_tok={n_tok_dn}")
 
-                t_h = time.time()
-                H_list, n_tok_list, sum_abs_list = _collect_hessians_layer_moe(
-                    [(n, m) for n, m, _, _ in experts_flat], calib, model, args.device,
-                    collect_awq=(args.awq != "none"))
-                t_h_done = time.time() - t_h
-                tot_tok = sum(n_tok_list)
-                print(f"  [{stage}] {len(experts_flat)} linears  n_tok_total={tot_tok}  "
-                      f"t_hessian={t_h_done:.1f}s")
+            for kind, prop_name, gguf_suffix, dim_kind in kinds_specs:
+                t_q = time.time()
+                consolidated = getattr(moe_block, prop_name)  # [E, N, K]
+                W_stack = consolidated.contiguous().float()
+                moe_block.release_cached()
+                E, N, K = W_stack.shape
+                H_src = H_gate_up if dim_kind == "hidden" else H_down
+                if H_src.shape[0] != K:
+                    print(f"  [{kind}] WARN H dim {H_src.shape[0]} != K={K}; identity-scaled fallback")
+                    H_src = torch.eye(K, device=args.device, dtype=torch.float32) * \
+                            float(H_src.diag().abs().mean().clamp_min(1e-6))
 
-                # Process per-kind so each kind's experts form a clean [E, N, K] stack.
-                for kind in kinds:
-                    kind_entries = [(idx, e) for idx, e in enumerate(experts_flat) if e[3] == kind]
-                    if not kind_entries:
-                        continue
-                    flat_indices = [idx for idx, _ in kind_entries]
-                    E_cnt = len(flat_indices)
-                    # Reference dimensions from expert 0.
-                    ref_layer = experts_flat[flat_indices[0]][1]
-                    rows, K = ref_layer.weight.shape   # PagedLinear.weight page-faults here
+                rotation = None
+                rotation_blob = None
+                if args.rotation == "kronecker":
+                    a, b = factor_for_dim(K, max_b=args.rotation_max_b)
+                    seed = args.rotation_seed + layer_idx * 7 + {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[kind]
+                    h_a = random_orthogonal(a, seed=seed)
+                    rotation = KroneckerRotation(h_a=h_a, b_dim=b)
+                    rotation_blob = rotation.to_dict()
+                    rotation_blob["seed"] = seed
+                    H_src = rotate_hessian(H_src, rotation)
+                    # Apply rotation to W_stack along K axis. KroneckerRotation.forward
+                    # expects last dim = d (= K), so reshape [E, N, K] → [E*N, K]
+                    # and pass directly.
+                    W_flat = W_stack.reshape(E * N, K).to(rotation.h_a.device)
+                    W_rot = rotation.forward(W_flat).to(args.device)
+                    W_stack = W_rot.reshape(E, N, K)
 
-                    # ── Per-(layer, kind) rotation + per-expert AWQ.
-                    rotation = None
-                    rotation_blob = None
-                    h_a_to_save = None
-                    if args.rotation == "kronecker":
-                        a, b = factor_for_dim(K, max_b=args.rotation_max_b)
-                        # Deterministic seed per (layer, kind) — shared across experts.
-                        seed = args.rotation_seed + layer_idx * 7 + {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[kind]
-                        h_a = random_orthogonal(a, seed=seed)
-                        rotation = KroneckerRotation(h_a=h_a, b_dim=b)
-                        rotation_blob = rotation.to_dict()
-                        rotation_blob["seed"] = seed
-                        h_a_to_save = rotation_blob["h_a"]
-                        print(f"  [{stage}/{kind}] rotation kronecker a={a} b={b}")
+                H_stack = H_src.unsqueeze(0).expand(E, K, K).contiguous()
 
-                    # Build stacked W and H. Also build per-expert weight snapshot
-                    # for fallback in case GPTQ fails for an expert.
-                    W_stack = torch.empty((E_cnt, rows, K), device=args.device, dtype=dtype)
-                    H_stack = torch.empty((E_cnt, K, K), device=args.device, dtype=torch.float32)
-                    awq_s_stack: list[torch.Tensor | None] = [None] * E_cnt
-                    n_tok_kind = torch.zeros((E_cnt,), dtype=torch.long, device=args.device)
-                    cold_eids: list[int] = []
-                    for j, (flat_idx, (nm, mod, e_id, _kd)) in enumerate(zip(flat_indices, [experts_flat[fi] for fi in flat_indices])):
-                        W_orig = mod.weight.detach().float()
-                        H_e = H_list[flat_idx].to(args.device).float()
-                        if n_tok_list[flat_idx] == 0:
-                            cold_eids.append(e_id)
-                        # Per-expert AWQ
-                        if args.awq != "none" and sum_abs_list is not None and sum_abs_list[flat_idx] is not None:
-                            mean_abs = (sum_abs_list[flat_idx] / max(n_tok_list[flat_idx], 1)).clamp_min(1e-8)
-                            awq_e = mean_abs.pow(args.awq_alpha).to(args.device)
-                            awq_s_stack[j] = awq_e
-                            H_e = H_e * awq_e.unsqueeze(0) * awq_e.unsqueeze(1)
-                            W_orig = apply_awq_to_weight(W_orig, awq_e)
-                        if rotation is not None:
-                            H_e = rotate_hessian(H_e, rotation)
-                            W_orig = rotation.forward(W_orig.to(rotation.h_a.device)).to(args.device)
-                        W_stack[j] = W_orig.to(dtype)
-                        H_stack[j] = H_e
-                        n_tok_kind[j] = n_tok_list[flat_idx]
-                    if cold_eids:
-                        print(f"  [{stage}/{kind}] WARNING {len(cold_eids)} cold experts (n_tok=0): {cold_eids[:8]}...")
+                if args.secondary_device:
+                    out = batched_gptq_quantize_multigpu(
+                        W_stack=W_stack, H_stack=H_stack,
+                        primary_device=args.device,
+                        secondary_device=args.secondary_device,
+                        primary_share=args.primary_share,
+                        n_centroids=args.n_centroids, group_size=args.group_size,
+                        n_iter=args.n_iter, fit_loss=args.fit_loss,
+                        mag_weight_p=args.mag_weight_p,
+                        snap_centroids=args.snap_centroids,
+                        percdamp=args.percdamp)
+                else:
+                    out = batched_gptq_quantize(
+                        W_stack=W_stack, H_stack=H_stack,
+                        n_centroids=args.n_centroids, group_size=args.group_size,
+                        n_iter=args.n_iter, fit_loss=args.fit_loss,
+                        mag_weight_p=args.mag_weight_p,
+                        snap_centroids=args.snap_centroids,
+                        percdamp=args.percdamp)
 
-                    # ── Batched GPTQ over all experts of this (layer, kind).
-                    t_q = time.time()
-                    effective_percdamp = args.percdamp
-                    if any(s is not None for s in awq_s_stack):
-                        effective_percdamp = max(args.percdamp, 0.05)
-                    if args.secondary_device:
-                        out = batched_gptq_quantize_multigpu(
-                            W_stack=W_stack.float(),
-                            H_stack=H_stack,
-                            primary_device=args.device,
-                            secondary_device=args.secondary_device,
-                            primary_share=args.primary_share,
-                            n_centroids=args.n_centroids,
-                            group_size=args.group_size,
-                            n_iter=args.n_iter,
-                            fit_loss=args.fit_loss,
-                            mag_weight_p=args.mag_weight_p,
-                            snap_centroids=args.snap_centroids,
-                            percdamp=effective_percdamp,
-                            n_tokens_per_expert=n_tok_kind,
-                        )
-                    else:
-                        out = batched_gptq_quantize(
-                            W_stack=W_stack.float(),
-                            H_stack=H_stack,
-                            n_centroids=args.n_centroids,
-                            group_size=args.group_size,
-                            n_iter=args.n_iter,
-                            fit_loss=args.fit_loss,
-                            mag_weight_p=args.mag_weight_p,
-                            snap_centroids=args.snap_centroids,
-                            percdamp=effective_percdamp,
-                            n_tokens_per_expert=n_tok_kind,
-                        )
-                    t_q_done = time.time() - t_q
-                    indices = out["indices"]                  # [E, N, K] int8
-                    centroids = out["centroids_per_group"]    # [E, n_groups, n_centroids]
-                    scales = out["scale_per_group"]           # [E, N, n_groups]
-                    Q_all = out["Q"]                          # [E, N, K] fp32 dequantized
-                    mse_all = out["mse"]; w_snr = out["w_snr_db"]; y_snr = out["y_snr_db"]; rel = out["rel_err"]
+                indices = out["indices"]
+                centroids = out["centroids_per_group"]
+                scales = out["scale_per_group"]
+                mse_all = out["mse"]; w_snr = out["w_snr_db"]
+                y_snr = out["y_snr_db"]; rel = out["rel_err"]
 
-                    # Inverse rotation + AWQ absorb (per expert) so subsequent
-                    # layers' forward pass sees inference-equivalent weights.
-                    for j, (flat_idx, exp) in enumerate(zip(flat_indices, [experts_flat[fi] for fi in flat_indices])):
-                        nm, mod, e_id, _kd = exp
-                        W_q = Q_all[j].float().to(args.device)
-                        if rotation is not None:
-                            W_q = rotation.inverse(W_q.to(rotation.h_a.device)).to(args.device)
-                        if awq_s_stack[j] is not None:
-                            W_q = absorb_awq_in_reconstruction(W_q.float(), awq_s_stack[j].to(W_q.device))
-                        mod.weight_override = W_q.to(dtype).to(args.device)
+                hf_name_template = f"model.layers.{layer_idx}.mlp.experts.{{E}}.{kind}"
+                for e in range(E):
+                    nm = hf_name_template.format(E=e)
+                    out_path = Path(args.output_dir) / f"{nm.replace('.', '_').replace('/', '_')}.pt"
+                    blob = {
+                        "name": nm,
+                        "shape": [N, K],
+                        "group_size": args.group_size,
+                        "n_centroids": args.n_centroids,
+                        "indices": indices[e].cpu(),
+                        "centroids_per_group": centroids[e].cpu(),
+                        "scale_per_group": scales[e].cpu(),
+                        "mse": float(mse_all[e].item()),
+                        "w_snr_db": float(w_snr[e].item()),
+                        "y_snr_db": float(y_snr[e].item()),
+                        "rel_err": float(rel[e].item()),
+                    }
+                    if rotation_blob is not None:
+                        blob["rotation"] = dict(rotation_blob)
+                    torch.save(blob, out_path)
+                    manifest["results"].append({
+                        "name": nm, "shape": [N, K],
+                        "mse": float(mse_all[e].item()),
+                        "y_snr_db": float(y_snr[e].item()),
+                        "w_snr_db": float(w_snr[e].item()),
+                    })
 
-                        # Per-expert .pt blob (same schema as scalar path).
-                        out_path = Path(args.output_dir) / f"{nm.replace('.', '_').replace('/', '_')}.pt"
-                        blob = {
-                            "name": nm,
-                            "shape": [rows, K],
-                            "group_size": args.group_size,
-                            "n_centroids": args.n_centroids,
-                            "indices": indices[j].cpu(),
-                            "centroids_per_group": centroids[j].cpu(),
-                            "scale_per_group": scales[j].cpu(),
-                            "mse": float(mse_all[j].item()),
-                            "w_snr_db": float(w_snr[j].item()),
-                            "y_snr_db": float(y_snr[j].item()),
-                            "rel_err": float(rel[j].item()),
-                        }
-                        if rotation_blob is not None:
-                            blob["rotation"] = dict(rotation_blob)
-                        if awq_s_stack[j] is not None:
-                            blob["awq"] = {"kind": args.awq, "alpha": args.awq_alpha,
-                                            "s": awq_s_stack[j].detach().cpu()}
-                        torch.save(blob, out_path)
-                        manifest["results"].append({
-                            "name": nm, "shape": [rows, K],
-                            "mse": float(mse_all[j].item()),
-                            "y_snr_db": float(y_snr[j].item()),
-                            "w_snr_db": float(w_snr[j].item()),
-                        })
+                t_q_done = time.time() - t_q
+                print(f"  [{kind}] batched_gptq E={E} K={K} N={N}  "
+                      f"t_quant={t_q_done:.1f}s  "
+                      f"median Y_SNR={float(y_snr.median().item()):.2f}dB  "
+                      f"median W_SNR={float(w_snr.median().item()):.2f}dB")
+                del W_stack, H_stack, indices, centroids, scales, consolidated
+                if args.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                moe_block.release_cached()
 
-                    print(f"  [{stage}/{kind}] batched_gptq E={E_cnt} K={K} N={rows}  "
-                          f"t_quant={t_q_done:.1f}s  median Y_SNR={float(y_snr.median().item()):.2f}dB")
-                    del W_stack, H_stack, indices, centroids, scales, Q_all
-                    if args.device.startswith("cuda"):
-                        torch.cuda.empty_cache()
-
+            del H_gate_up, H_down
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
             print(f"  layer {layer_idx} total t={time.time()-t_layer:.1f}s")
 
         # Done with the MoE path — skip the dense per-linear loop.

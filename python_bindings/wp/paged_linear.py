@@ -233,6 +233,16 @@ class PagedMoeExperts(nn.Module):
         self.gate_override: Optional[torch.Tensor] = None
         self.up_override:   Optional[torch.Tensor] = None
         self.down_override: Optional[torch.Tensor] = None
+        # Calibration hooks. Set `collect_pre_down` / `collect_pre_gate_up` to True
+        # to accumulate the activations seen by down_proj / gate+up_proj respectively
+        # into `pre_down_acc` / `pre_gate_up_acc` (Hessian = sum X^T X, n_tokens
+        # counters). Calibration clears these between layers; reset_calibration_acc().
+        self.collect_pre_gate_up: bool = False
+        self.collect_pre_down: bool = False
+        self.pre_gate_up_acc: Optional[torch.Tensor] = None
+        self.pre_gate_up_n_tok: int = 0
+        self.pre_down_acc: Optional[torch.Tensor] = None
+        self.pre_down_n_tok: int = 0
         # Materialization cache, keyed by pager src_ptr (same trick as PagedLinear).
         self._cached_gate = None;  self._cached_gate_ptr = 0
         self._cached_up   = None;  self._cached_up_ptr   = 0
@@ -305,9 +315,25 @@ class PagedMoeExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[e])
             current_state = hidden_states[token_idx]
+            if self.collect_pre_gate_up and current_state.numel() > 0:
+                xf = current_state.detach().float()
+                xtx = xf.t() @ xf
+                if self.pre_gate_up_acc is None:
+                    self.pre_gate_up_acc = xtx
+                else:
+                    self.pre_gate_up_acc = self.pre_gate_up_acc + xtx
+                self.pre_gate_up_n_tok += xf.shape[0]
             gate = F.linear(current_state, gate_w[e])
             up   = F.linear(current_state, up_w[e])
             current_hidden_states = self.act_fn(gate) * up
+            if self.collect_pre_down and current_hidden_states.numel() > 0:
+                yf = current_hidden_states.detach().float()
+                yty = yf.t() @ yf
+                if self.pre_down_acc is None:
+                    self.pre_down_acc = yty
+                else:
+                    self.pre_down_acc = self.pre_down_acc + yty
+                self.pre_down_n_tok += yf.shape[0]
             current_hidden_states = F.linear(current_hidden_states, down_w[e])
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
@@ -322,6 +348,15 @@ class PagedMoeExperts(nn.Module):
         self._cached_gate = None; self._cached_gate_ptr = 0
         self._cached_up   = None; self._cached_up_ptr   = 0
         self._cached_down = None; self._cached_down_ptr = 0
+
+    def reset_calibration_acc(self):
+        """Clear Hessian accumulators (call between layers in calibration)."""
+        self.collect_pre_gate_up = False
+        self.collect_pre_down = False
+        self.pre_gate_up_acc = None
+        self.pre_gate_up_n_tok = 0
+        self.pre_down_acc = None
+        self.pre_down_n_tok = 0
 
 
 __all__ = ["PagedLinear", "swap_linears_with_paged", "PagedMoeExperts"]
