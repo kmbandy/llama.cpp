@@ -188,4 +188,140 @@ def swap_linears_with_paged(
     return n_swapped
 
 
-__all__ = ["PagedLinear", "swap_linears_with_paged"]
+class PagedMoeExperts(nn.Module):
+    """Paged replacement for Qwen3_5MoeExperts (and similar consolidated MoE blocks).
+
+    Stock HF stores all experts in a single 3D Parameter:
+      gate_up_proj [n_experts, 2*intermediate, hidden]   (gate stacked over up)
+      down_proj    [n_experts, hidden, intermediate]
+
+    For 35B-A3B that's ~1.5 GB per layer × 41 layers = 60 GB — too large to keep
+    resident. Iter 5b pages at LAYER granularity: three pages per layer (gate,
+    up, down), each one consolidated `[n_experts, ...]` slab. The standard MoE
+    forward is identical to Qwen3_5MoeExperts.forward except gate/up are read
+    from two separate paged tensors (matches GGUF tensor layout where
+    `ffn_gate_exps` and `ffn_up_exps` are distinct tensors).
+
+    Hessian-collection hook: when `experts_hessian_callback` is set, the
+    forward calls it with the pre-MoE hidden_states subset routed to each
+    expert. Calibration can use this OR (simpler) register a forward_hook on
+    PagedMoeExperts to capture inputs[0] (all hidden_states entering the
+    block) for a shared per-(layer, kind) Hessian.
+    """
+
+    def __init__(self, pager,
+                 gate_page_idx: int, up_page_idx: int, down_page_idx: int,
+                 n_experts: int, intermediate_dim: int, hidden_dim: int,
+                 weight_dtype: torch.dtype, device_idx: int = 0,
+                 act_fn=None):
+        super().__init__()
+        self.pager = pager
+        self.gate_page_idx = gate_page_idx
+        self.up_page_idx   = up_page_idx
+        self.down_page_idx = down_page_idx
+        self.num_experts = n_experts
+        self.intermediate_dim = intermediate_dim
+        self.hidden_dim = hidden_dim
+        self.weight_dtype = weight_dtype
+        self.device_idx = device_idx
+        if act_fn is None:
+            import torch.nn.functional as F
+            self.act_fn = F.silu
+        else:
+            self.act_fn = act_fn
+        # Override slots (post-quant) — same lifecycle pattern as PagedLinear.
+        self.gate_override: Optional[torch.Tensor] = None
+        self.up_override:   Optional[torch.Tensor] = None
+        self.down_override: Optional[torch.Tensor] = None
+        # Materialization cache, keyed by pager src_ptr (same trick as PagedLinear).
+        self._cached_gate = None;  self._cached_gate_ptr = 0
+        self._cached_up   = None;  self._cached_up_ptr   = 0
+        self._cached_down = None;  self._cached_down_ptr = 0
+
+    def _materialize(self, page_idx: int, shape, cached_attr_t: str, cached_attr_p: str):
+        """Copy the pager slot's bytes into a fresh torch tensor.
+
+        Does NOT cache the torch tensor — calibration forward touches all 40
+        layers in sequence and caching every layer's 1.5 GB of experts would
+        OOM a 32 GB GPU. The pager slot stays resident (managed by wp_native
+        LRU), so re-materializing is just a fast device→device memcpy. The
+        returned tensor lives only as long as the caller's local scope.
+        """
+        import wp_native
+        src_ptr = self.pager.ensure(page_idx)
+        if src_ptr == 0:
+            raise RuntimeError(f"PagedMoeExperts: pager.ensure(page_idx={page_idx}) returned null")
+        out = torch.empty(shape, dtype=self.weight_dtype,
+                          device=f"cuda:{self.device_idx}")
+        nbytes = out.element_size() * out.numel()
+        wp_native.device_memcpy(out.data_ptr(), src_ptr, nbytes)
+        return out
+
+    @property
+    def gate_proj(self) -> torch.Tensor:
+        if self.gate_override is not None: return self.gate_override
+        return self._materialize(self.gate_page_idx,
+                                  (self.num_experts, self.intermediate_dim, self.hidden_dim),
+                                  "_cached_gate", "_cached_gate_ptr")
+
+    @property
+    def up_proj(self) -> torch.Tensor:
+        if self.up_override is not None: return self.up_override
+        return self._materialize(self.up_page_idx,
+                                  (self.num_experts, self.intermediate_dim, self.hidden_dim),
+                                  "_cached_up", "_cached_up_ptr")
+
+    @property
+    def down_proj(self) -> torch.Tensor:
+        if self.down_override is not None: return self.down_override
+        return self._materialize(self.down_page_idx,
+                                  (self.num_experts, self.hidden_dim, self.intermediate_dim),
+                                  "_cached_down", "_cached_down_ptr")
+
+    def forward(self, hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor, top_k_weights: torch.Tensor) -> torch.Tensor:
+        """Mirrors Qwen3_5MoeExperts.forward, but reads weights from paged
+        tensors and treats gate/up as two distinct projections (matching the
+        GGUF storage convention).
+        """
+        import torch.nn.functional as F
+        gate_w = self.gate_proj
+        up_w   = self.up_proj
+        down_w = self.down_proj
+
+        in_dtype = hidden_states.dtype
+        if in_dtype != gate_w.dtype:
+            hidden_states = hidden_states.to(gate_w.dtype)
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            e = expert_idx[0]
+            if e == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[e])
+            current_state = hidden_states[token_idx]
+            gate = F.linear(current_state, gate_w[e])
+            up   = F.linear(current_state, up_w[e])
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(current_hidden_states, down_w[e])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        if final_hidden_states.dtype != in_dtype:
+            final_hidden_states = final_hidden_states.to(in_dtype)
+        return final_hidden_states
+
+    def release_cached(self):
+        """Evict cached materialized tensors. Useful between layers in the
+        calibration loop to keep the working set bounded."""
+        self._cached_gate = None; self._cached_gate_ptr = 0
+        self._cached_up   = None; self._cached_up_ptr   = 0
+        self._cached_down = None; self._cached_down_ptr = 0
+
+
+__all__ = ["PagedLinear", "swap_linears_with_paged", "PagedMoeExperts"]

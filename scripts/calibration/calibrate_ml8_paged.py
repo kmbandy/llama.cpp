@@ -73,7 +73,7 @@ from batched_gptq import batched_gptq_quantize, batched_gptq_quantize_multigpu  
 # Pybind11 weight pager (in repo's python_bindings/wp/)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python_bindings" / "wp"))
 import wp_native  # noqa: E402
-from paged_linear import PagedLinear, swap_linears_with_paged  # noqa: E402
+from paged_linear import PagedLinear, swap_linears_with_paged, PagedMoeExperts  # noqa: E402
 
 
 # ─── HF naming → GGUF naming map for Qwen MLP linears ──────────────────────
@@ -207,30 +207,44 @@ def _moe_aware_name_map(model: nn.Module) -> dict[str, str]:
 
 def build_pager_iter5b(gguf_path: str, device_idx: int,
                        n_slots: int, n_experts: int,
-                       prefetch_depth: int = 4) -> wp_native.WeightPager:
+                       prefetch_depth: int = 4,
+                       consolidated_mode: bool = True) -> wp_native.WeightPager:
     """Build a pager catalog for the bf16 GGUF backing iter 5b.
 
-    Strategy:
-      - `blk.L.ffn_*_exps.weight`  → add_page(..., n_experts=N)   (sub-pages)
+    Strategy (consolidated_mode=True — the right mode for HF MoE classes
+    that store experts as one Parameter):
+      - `blk.L.ffn_*_exps.weight` → add_page (one page per kind per layer,
+        slot size = the full consolidated tensor: n_experts × N × K × 2 bytes).
+        Matches what PagedMoeExperts.materialize() expects to copy into VRAM.
+      - `blk.L.ffn_*_shexp.weight` → add_page (shared expert MLP — one page)
       - `blk.L.ffn_{gate,up,down}.weight` (dense fallback) → add_page (one page)
-      - all other tensors are skipped — they're loaded resident on GPU
-        via load_resident_to_model() and never touched by the pager.
+      - all other tensors → skipped, loaded resident.
 
-    Pool sizing: slots × per_expert_size (sub-page) — the per-expert slice
-    is the slottable unit, so `max_page_size` after add reflects that, not
-    the full consolidated tensor.
+    consolidated_mode=False keeps the older sub-expert split (still usable
+    for per-expert PagedLinear architectures).
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
     import gguf as gguf_lib
 
     pager = wp_native.WeightPager()
     reader = gguf_lib.GGUFReader(gguf_path)
-    n_moe_consolidated = n_dense = n_skipped = 0
+    n_moe = n_shexp = n_dense = n_skipped = 0
     for t in reader.tensors:
         if _MOE_EXPS_PATTERN.match(t.name):
-            pager.add_page(t.name, 0, int(t.data_offset), int(t.n_bytes),
-                           n_experts=n_experts)
-            n_moe_consolidated += 1
+            if consolidated_mode:
+                pager.add_page(t.name, 0, int(t.data_offset), int(t.n_bytes))
+            else:
+                pager.add_page(t.name, 0, int(t.data_offset), int(t.n_bytes),
+                               n_experts=n_experts)
+            n_moe += 1
+        elif t.name.startswith("blk.") and any(
+                t.name.endswith(f".{suffix}.weight")
+                for suffix in ("ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp")):
+            # Shared experts are SMALL (~6 MB per layer, ~250 MB total for
+            # 35B-A3B). Keep them resident — paging would inflate the slot
+            # size if mixed with routed-expert pages and waste VRAM.
+            n_shexp += 1
+            n_skipped += 1
         elif t.name.startswith("blk.") and any(
                 t.name.endswith(f".{suffix}.weight")
                 for suffix in ("ffn_gate", "ffn_up", "ffn_down")):
@@ -240,9 +254,9 @@ def build_pager_iter5b(gguf_path: str, device_idx: int,
             n_skipped += 1
 
     max_sz = pager.max_page_size()
-    print(f"[pager-5b] moe_consolidated={n_moe_consolidated} dense_mlp={n_dense} "
-          f"skipped(resident-bound)={n_skipped}  max_slot={max_sz/1e6:.1f} MB  "
-          f"pool={n_slots * max_sz / 1e9:.2f} GB")
+    print(f"[pager-5b] moe_consolidated={n_moe} shared_expert={n_shexp} "
+          f"dense_mlp={n_dense} skipped(resident-bound)={n_skipped}  "
+          f"max_slot={max_sz/1e6:.1f} MB  pool={n_slots * max_sz / 1e9:.2f} GB")
 
     cfg = wp_native.Config()
     cfg.n_slots = n_slots
@@ -252,6 +266,65 @@ def build_pager_iter5b(gguf_path: str, device_idx: int,
     if not ok:
         raise RuntimeError("wp_native.WeightPager.init_for_device returned False")
     return pager
+
+
+_MOE_GATE_EXPS_RE = re.compile(r"^blk\.(\d+)\.ffn_gate_exps\.weight$")
+
+
+def swap_moe_experts_with_paged(model: nn.Module, pager: wp_native.WeightPager,
+                                 dtype: torch.dtype, device_idx: int) -> int:
+    """Walk `model`, replace every Qwen3_5MoeExperts (consolidated MoE block)
+    with PagedMoeExperts using the pager. Returns the number of replacements.
+
+    Looks up three page indices per layer:
+        blk.{L}.ffn_gate_exps.weight
+        blk.{L}.ffn_up_exps.weight
+        blk.{L}.ffn_down_exps.weight
+    """
+    import re as _re
+    HF_LAYER_RE = _re.compile(r"^model\.layers\.(\d+)\.mlp\.experts$")
+    n_swapped = 0
+    to_swap = []
+    for name, mod in model.named_modules():
+        m = HF_LAYER_RE.match(name)
+        if m is None:
+            continue
+        # Must be the HF consolidated MoE block (has gate_up_proj + down_proj
+        # Parameters or stub'd-as-Parameter on meta).
+        if not (hasattr(mod, "gate_up_proj") and hasattr(mod, "down_proj")):
+            continue
+        L = int(m.group(1))
+        n_experts = int(getattr(mod, "num_experts", 0))
+        intermediate = int(getattr(mod, "intermediate_dim", 0))
+        hidden = int(getattr(mod, "hidden_dim", 0))
+        if n_experts == 0 or intermediate == 0 or hidden == 0:
+            continue
+        gate_idx = pager.find_page(f"blk.{L}.ffn_gate_exps.weight")
+        up_idx   = pager.find_page(f"blk.{L}.ffn_up_exps.weight")
+        down_idx = pager.find_page(f"blk.{L}.ffn_down_exps.weight")
+        if min(gate_idx, up_idx, down_idx) < 0:
+            print(f"  WARNING: layer {L} missing pages "
+                  f"(gate={gate_idx} up={up_idx} down={down_idx}); skipping")
+            continue
+        to_swap.append((name, mod, L, gate_idx, up_idx, down_idx,
+                        n_experts, intermediate, hidden,
+                        getattr(mod, "act_fn", None)))
+
+    for (name, old, L, gate_idx, up_idx, down_idx, n_experts, intermediate, hidden, act_fn) in to_swap:
+        parent_path, _, child_name = name.rpartition(".")
+        parent = model
+        for part in parent_path.split("."):
+            parent = getattr(parent, part) if not part.isdigit() else parent[int(part)]
+        new_mod = PagedMoeExperts(pager, gate_idx, up_idx, down_idx,
+                                    n_experts=n_experts,
+                                    intermediate_dim=intermediate,
+                                    hidden_dim=hidden,
+                                    weight_dtype=dtype,
+                                    device_idx=device_idx,
+                                    act_fn=act_fn)
+        setattr(parent, child_name, new_mod)
+        n_swapped += 1
+    return n_swapped
 
 
 # ─── Resident weight loader (iter 5b) ───────────────────────────────────────
@@ -352,15 +425,34 @@ def load_resident_to_model(model: nn.Module, gguf_path: str,
                 missing_examples.append(f"MISSING {param_path} -> {gguf_name}")
             continue
 
-        # Decode GGUF bytes to torch tensor.
+        # Decode GGUF bytes to torch tensor. GGUFReader returns t.data as a
+        # numpy view that may be uint8 (raw bytes) regardless of stored dtype.
+        # Use t.tensor_type + the expected element count to reinterpret safely.
         td, npd = _gguf_dtype_to_torch(t.tensor_type)
+        expected_numel = int(np.prod(t.shape))
+        raw = np.asarray(t.data)
         if npd is not None:
-            arr = np.asarray(t.data, dtype=npd)
+            # F32 / F16 — view (no copy) when dtypes already match, otherwise
+            # reinterpret bytes.
+            if raw.dtype == npd:
+                arr = raw
+            elif raw.dtype == np.uint8 and raw.size == expected_numel * np.dtype(npd).itemsize:
+                arr = raw.view(npd)
+            else:
+                arr = raw.astype(npd)
             tensor = torch.from_numpy(arr.copy())
         else:
-            # BF16: bytes-as-uint16 → view as bfloat16.
-            arr = np.asarray(t.data, dtype=np.uint16)
-            tensor = torch.from_numpy(arr.copy()).view(torch.bfloat16)
+            # BF16: numpy has no native dtype. Reinterpret raw bytes as uint16
+            # (each pair of bytes = one bf16 element), then torch.view as bfloat16.
+            if raw.dtype == np.uint16 and raw.size == expected_numel:
+                arr16 = raw
+            elif raw.dtype == np.uint8 and raw.size == expected_numel * 2:
+                arr16 = raw.view(np.uint16)
+            else:
+                raise ValueError(
+                    f"{t.name}: unexpected BF16 raw layout "
+                    f"(dtype={raw.dtype}, size={raw.size}, expected_numel={expected_numel})")
+            tensor = torch.from_numpy(arr16.copy()).view(torch.bfloat16)
         # GGUF stores ne[0] as the contiguous dim (column-major-ish to HF
         # eyes for 2D weights). The shape from t.shape is reversed from
         # HF's (out_features, in_features) for Linear. Normalize:
@@ -493,22 +585,47 @@ def _collect_hessians_layer_moe(experts, calib_ids, model, dev, collect_awq=Fals
 
 def _build_model_meta(model_name: str, dtype: torch.dtype):
     """Instantiate `model_name` on the meta device — no host RAM allocated
-    for parameters. Returns (model, config, n_blocks).
+    for parameters. Returns (model, text_cfg, n_blocks).
+
+    For multimodal vision-language MoE configs (e.g. Qwen3_5MoeForConditionalGeneration
+    on Qwen3.6 35B-A3B), the top-level config doesn't carry vocab_size /
+    num_hidden_layers — those live under `text_config`. AutoModelForCausalLM
+    on the full config errors out. Detect that and route to the text-only
+    CausalLM class directly using the text_config.
 
     PyTorch's `with torch.device("meta"):` context routes all newly-created
-    tensors to the meta device. HF's from_config respects the active device,
-    so model parameters live as zero-storage placeholders. The model is
-    fully usable for `.named_parameters()` walking (for resident loading)
-    and `.named_modules()` (for the Linear → PagedLinear swap).
+    tensors to the meta device. The model is fully usable for
+    `.named_parameters()` (resident loading) and `.named_modules()`
+    (PagedLinear swap).
     """
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+    # Multimodal carrier with a text sub-config? Extract the text decoder.
+    text_cfg = config
+    if hasattr(config, "text_config") and config.text_config is not None:
+        text_cfg = config.text_config
+
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-    n_blocks = int(getattr(config, "num_hidden_layers",
-                           getattr(config, "n_layer", 0)))
+        # Try the generic AutoModel path first. Falls back to importing the
+        # text-only class by name when AutoModel can't infer it.
+        try:
+            model = AutoModelForCausalLM.from_config(text_cfg, trust_remote_code=True)
+        except (AttributeError, ValueError, KeyError):
+            text_arch = type(text_cfg).__name__.replace("Config", "ForCausalLM")
+            import transformers as _tf
+            model_cls = getattr(_tf, text_arch, None)
+            if model_cls is None:
+                raise RuntimeError(
+                    f"could not resolve text-only CausalLM class for text_config "
+                    f"type {type(text_cfg).__name__!r}; tried '{text_arch}'.")
+            model = model_cls(text_cfg)
+
+    n_blocks = int(getattr(text_cfg, "num_hidden_layers",
+                           getattr(text_cfg, "n_layer", 0)))
     if n_blocks <= 0:
-        raise RuntimeError(f"could not determine n_blocks from config {type(config).__name__}")
-    return model, config, n_blocks
+        raise RuntimeError(f"could not determine n_blocks from text_config "
+                           f"{type(text_cfg).__name__}")
+    return model, text_cfg, n_blocks
 
 
 # ─── Main driver ───────────────────────────────────────────────────────────
@@ -612,13 +729,40 @@ def main():
         arch_name = args.arch or type(config).__name__.replace("Config", "").lower()
         print(f"[meta-init] arch={arch_name}  n_blocks={n_blocks}  n_experts={n_experts}")
 
-        # Materialize meta params on the target device (empty storage, no init).
-        # to_empty() walks every Parameter and gives it real storage with the
-        # parameter's existing dtype on the target device. We then overwrite the
-        # storage with GGUF bytes via the resident loader.
-        model = model.to_empty(device=args.device)
-        # Force eval mode + the chosen dtype across the model.
-        model = model.to(dtype).eval()
+        # ORDER MATTERS — for a 35B-A3B MoE the experts alone would OOM the
+        # GPU if to_empty() materializes them. Sequence:
+        #   1. Build pager catalog (catalog only — VRAM pool allocated by init).
+        #   2. Swap PagedLinear for every expert UNDER torch.device("meta")
+        #      so PagedLinear's super().__init__() Linear weight stays on
+        #      meta (then gets del'd from _parameters). After this the
+        #      expert weights are no longer reachable via named_parameters.
+        #   3. to_empty(device) — only materializes the REMAINING resident
+        #      parameters (token_embd, attention, ssm_*, norms, MTP, etc.).
+        #   4. Resident loader fills those params from GGUF bytes.
+        print(f"[pager] iter 5b — building catalog from {args.gguf}  "
+              f"slots={args.pager_slots}  n_experts={n_experts}")
+        pager = build_pager_iter5b(args.gguf, device_idx, args.pager_slots,
+                                    n_experts=n_experts)
+        print(f"[pager] catalog: {pager.n_pages()} entries  "
+              f"max_page={pager.max_page_size()/1e6:.1f} MB")
+
+        # ── Swap consolidated MoE expert blocks with PagedMoeExperts.
+        #    HF stores routed experts as one Parameter per kind per layer
+        #    (gate_up_proj [E, 2*I, H], down_proj [E, H, I]). PagedMoeExperts
+        #    replaces the whole block with paged read-on-demand tensors.
+        n_swapped_moe = swap_moe_experts_with_paged(model, pager, dtype, device_idx)
+        print(f"[swap] replaced {n_swapped_moe} consolidated MoE expert blocks → PagedMoeExperts")
+        if n_swapped_moe == 0:
+            raise RuntimeError("swap_moe_experts_with_paged found 0 expert blocks")
+
+        # Shared experts (mlp.shared_expert.*) are kept RESIDENT — they're small
+        # (~250 MB total for 35B-A3B) and live in the model as ordinary
+        # nn.Linear modules. to_empty + resident loader handle them.
+
+        # Now materialize the remaining resident params.
+        n_resident_params = sum(p.numel() for p in model.parameters())
+        print(f"[meta-empty] materializing {n_resident_params/1e9:.2f}B resident params on {args.device}")
+        model = model.to_empty(device=args.device).to(dtype).eval()
 
         # Load every non-expert tensor from the bf16 GGUF into the model.
         n_loaded = load_resident_to_model(
@@ -629,23 +773,18 @@ def main():
                 "[resident-load] loaded 0 tensors from GGUF — arch_name mismatch? "
                 f"Tried arch={arch_name!r}. Use --arch to override.")
 
-        print(f"[pager] iter 5b — building catalog from {args.gguf}  "
-              f"slots={args.pager_slots}  n_experts={n_experts}")
-        pager = build_pager_iter5b(args.gguf, device_idx, args.pager_slots,
-                                    n_experts=n_experts)
-        print(f"[pager] catalog: {pager.n_pages()} entries  "
-              f"max_page={pager.max_page_size()/1e6:.1f} MB")
-
-        name_map = _moe_aware_name_map(model)
-        n_moe = sum(1 for v in name_map.values() if "#expert." in v)
-        n_dense_mlp = len(name_map) - n_moe
-        print(f"[swap] HF↔GGUF mapping: {len(name_map)} linears  "
-              f"(moe_experts={n_moe} dense_mlp={n_dense_mlp})")
-        n_swapped = swap_linears_with_paged(model, pager, name_map,
-                                             dtype=dtype, device_idx=device_idx)
-        print(f"[swap] replaced {n_swapped} nn.Linear → PagedLinear")
-        if n_swapped == 0:
-            raise RuntimeError("swap_linears_with_paged found nothing to swap — check name_map")
+        # G.7.i smoke: short-circuit BEFORE calibration so we verify the model
+        # loads (swap + to_empty + resident load) without OOM. Run a single
+        # tiny forward pass to prove the PagedMoeExperts path works end-to-end.
+        # Remove this block once the consolidated layer-major loop is in.
+        if os.environ.get("ML8_MOE_LOAD_SMOKE") == "1":
+            print("[smoke] running single dummy forward to verify model + pager...")
+            with torch.no_grad():
+                dummy = torch.zeros((1, 16), dtype=torch.long, device=args.device)
+                out = model(dummy)
+            print(f"[smoke] forward OK — output logits shape={tuple(out.logits.shape)}")
+            pager.shutdown()
+            return
 
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
     print(f"[calib] loading {args.n_samples} samples seq_len={args.seq_len}")
