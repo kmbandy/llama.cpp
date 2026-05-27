@@ -68,7 +68,7 @@ from kronecker_rotation import (  # noqa: E402
     KroneckerRotation, random_orthogonal, factor_for_dim, rotate_hessian,
 )
 from awq import compute_awq_scale, apply_awq_to_weight, absorb_awq_in_reconstruction  # noqa: E402
-from batched_gptq import batched_gptq_quantize  # noqa: E402  (G.7.h.2)
+from batched_gptq import batched_gptq_quantize, batched_gptq_quantize_multigpu  # noqa: E402  (G.7.h.2/3)
 
 # Pybind11 weight pager (in repo's python_bindings/wp/)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python_bindings" / "wp"))
@@ -555,6 +555,16 @@ def main():
                    help="(--strategy moe only) MODEL_ARCH name for TensorNameMap "
                         "(e.g. 'qwen3moe'). If omitted, derived from the config "
                         "class name lowercased.")
+    p.add_argument("--secondary-device", default=None,
+                   help="(--strategy moe only) Second GPU to split MoE batched-GPTQ "
+                        "across (e.g. 'cuda:1'). When set, the layer-major loop "
+                        "dispatches half the experts to the primary device and the "
+                        "rest to this one in parallel via Python threads. "
+                        "Output is bit-identical to single-GPU.")
+    p.add_argument("--primary-share", type=float, default=0.7,
+                   help="(--secondary-device only) Fraction of experts to keep on "
+                        "the primary device. Default 0.7 matches R9700(32GB)/6900XT(16GB) "
+                        "VRAM ratio + the gfx1030 secondary being slower per FLOP.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -758,18 +768,35 @@ def main():
                     effective_percdamp = args.percdamp
                     if any(s is not None for s in awq_s_stack):
                         effective_percdamp = max(args.percdamp, 0.05)
-                    out = batched_gptq_quantize(
-                        W_stack=W_stack.float(),
-                        H_stack=H_stack,
-                        n_centroids=args.n_centroids,
-                        group_size=args.group_size,
-                        n_iter=args.n_iter,
-                        fit_loss=args.fit_loss,
-                        mag_weight_p=args.mag_weight_p,
-                        snap_centroids=args.snap_centroids,
-                        percdamp=effective_percdamp,
-                        n_tokens_per_expert=n_tok_kind,
-                    )
+                    if args.secondary_device:
+                        out = batched_gptq_quantize_multigpu(
+                            W_stack=W_stack.float(),
+                            H_stack=H_stack,
+                            primary_device=args.device,
+                            secondary_device=args.secondary_device,
+                            primary_share=args.primary_share,
+                            n_centroids=args.n_centroids,
+                            group_size=args.group_size,
+                            n_iter=args.n_iter,
+                            fit_loss=args.fit_loss,
+                            mag_weight_p=args.mag_weight_p,
+                            snap_centroids=args.snap_centroids,
+                            percdamp=effective_percdamp,
+                            n_tokens_per_expert=n_tok_kind,
+                        )
+                    else:
+                        out = batched_gptq_quantize(
+                            W_stack=W_stack.float(),
+                            H_stack=H_stack,
+                            n_centroids=args.n_centroids,
+                            group_size=args.group_size,
+                            n_iter=args.n_iter,
+                            fit_loss=args.fit_loss,
+                            mag_weight_p=args.mag_weight_p,
+                            snap_centroids=args.snap_centroids,
+                            percdamp=effective_percdamp,
+                            n_tokens_per_expert=n_tok_kind,
+                        )
                     t_q_done = time.time() - t_q
                     indices = out["indices"]                  # [E, N, K] int8
                     centroids = out["centroids_per_group"]    # [E, n_groups, n_centroids]

@@ -1,4 +1,4 @@
-"""batched_gptq.py — vectorized GPTQ over the expert axis.
+"""batched_gptq.py — vectorized GPTQ over the expert axis, single + multi-GPU.
 
 Mirrors the scalar `gptq_quantize_linear` in calibrate_ml8.py, but operates
 on stacked weights [E, N, K] and stacked Hessians [E, K, K] so all E experts
@@ -218,4 +218,120 @@ def batched_gptq_quantize(
         "y_snr_db": y_snr_db,                # [E]
         "rel_err": rel_err,                  # [E]
         "n_cold_experts": n_cold,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# G.7.h.3 — Multi-GPU expert split.
+# ═══════════════════════════════════════════════════════════════════════════
+# Split the [E, N, K] stack between two GPUs (e.g. R9700 + 6900 XT), run
+# batched_gptq_quantize on each device in parallel via Python threads, and
+# concat the results on the primary device. PyTorch releases the GIL during
+# HIP/CUDA ops, so threading.Thread gives real parallelism across devices.
+#
+# Memory cost per device: ~half the E. The 6900 XT has 16 GB VRAM vs the
+# R9700's 32 GB, so the default split is biased: 70% R9700, 30% 6900 XT.
+
+import threading
+
+
+@torch.no_grad()
+def batched_gptq_quantize_multigpu(
+    W_stack: torch.Tensor,
+    H_stack: torch.Tensor,
+    *,
+    primary_device: str,
+    secondary_device: str,
+    primary_share: float = 0.7,
+    n_centroids: int = 16,
+    group_size: int = 64,
+    n_iter: int = 25,
+    fit_loss: str = "mse",
+    mag_weight_p: float = 5.0,
+    snap_centroids: str = "none",
+    percdamp: float = 0.05,
+    chunk_E: int = 8,
+    n_tokens_per_expert: torch.Tensor | None = None,
+) -> dict:
+    """Split E experts between primary_device and secondary_device, run
+    batched_gptq_quantize in parallel, concat back to primary_device.
+
+    `primary_share` ∈ (0, 1] — fraction of experts that stay on
+    primary_device. Default 0.7 gives R9700 70%, 6900 XT 30% to match the
+    32 GB / 16 GB VRAM ratio (and the fact the 6900 XT is gfx1030, no WMMA,
+    so per-FLOP slower).
+
+    Returns the same dict shape as batched_gptq_quantize, with all tensors
+    on primary_device.
+    """
+    E, N, K = W_stack.shape
+    if not 0.0 < primary_share <= 1.0:
+        raise ValueError(f"primary_share must be in (0, 1], got {primary_share}")
+    if primary_device == secondary_device or E == 1 or primary_share >= 1.0:
+        # Degenerate: no split. Fall through to single-GPU path.
+        return batched_gptq_quantize(
+            W_stack=W_stack, H_stack=H_stack,
+            n_centroids=n_centroids, group_size=group_size, n_iter=n_iter,
+            fit_loss=fit_loss, mag_weight_p=mag_weight_p,
+            snap_centroids=snap_centroids, percdamp=percdamp,
+            chunk_E=chunk_E, n_tokens_per_expert=n_tokens_per_expert)
+
+    E_prim = max(1, min(E - 1, int(round(E * primary_share))))
+    E_sec  = E - E_prim
+    if n_tokens_per_expert is None:
+        ntk_prim = ntk_sec = None
+    else:
+        ntk_prim = n_tokens_per_expert[:E_prim].to(primary_device)
+        ntk_sec  = n_tokens_per_expert[E_prim:].to(secondary_device)
+
+    # Move secondary half to the secondary device (non-blocking copies).
+    W_prim = W_stack[:E_prim].to(primary_device, non_blocking=True)
+    H_prim = H_stack[:E_prim].to(primary_device, non_blocking=True)
+    W_sec  = W_stack[E_prim:].to(secondary_device, non_blocking=True)
+    H_sec  = H_stack[E_prim:].to(secondary_device, non_blocking=True)
+
+    results: dict[str, dict] = {}
+    errors: dict[str, BaseException] = {}
+
+    def run_on(tag, W, H, ntk):
+        try:
+            results[tag] = batched_gptq_quantize(
+                W_stack=W, H_stack=H,
+                n_centroids=n_centroids, group_size=group_size, n_iter=n_iter,
+                fit_loss=fit_loss, mag_weight_p=mag_weight_p,
+                snap_centroids=snap_centroids, percdamp=percdamp,
+                chunk_E=chunk_E, n_tokens_per_expert=ntk)
+        except BaseException as exc:
+            errors[tag] = exc
+
+    t_prim = threading.Thread(target=run_on, args=("prim", W_prim, H_prim, ntk_prim))
+    t_sec  = threading.Thread(target=run_on, args=("sec",  W_sec,  H_sec,  ntk_sec))
+    t_prim.start()
+    t_sec.start()
+    t_prim.join()
+    t_sec.join()
+
+    if errors:
+        # Re-raise the first error so the calling layer-major loop sees a
+        # real exception, not a half-finished result dict.
+        raise list(errors.values())[0]
+
+    # Concat. Move secondary results back to primary device.
+    def cat(key):
+        a = results["prim"][key]
+        b = results["sec"][key]
+        if isinstance(a, torch.Tensor):
+            return torch.cat([a, b.to(primary_device)], dim=0)
+        return a  # scalar-like (e.g. n_cold_experts)
+
+    return {
+        "indices":             cat("indices"),
+        "centroids_per_group": cat("centroids_per_group"),
+        "scale_per_group":     cat("scale_per_group"),
+        "Q":                   cat("Q"),
+        "mse":                 cat("mse"),
+        "w_snr_db":            cat("w_snr_db"),
+        "y_snr_db":            cat("y_snr_db"),
+        "rel_err":             cat("rel_err"),
+        "n_cold_experts":      int(results["prim"]["n_cold_experts"]) + int(results["sec"]["n_cold_experts"]),
     }

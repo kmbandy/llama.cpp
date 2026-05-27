@@ -177,5 +177,52 @@ def main():
     return 1
 
 
+def test_multigpu():
+    """Verify multi-GPU split produces identical output to single-GPU."""
+    from batched_gptq import batched_gptq_quantize_multigpu
+    if torch.cuda.device_count() < 2:
+        print("[multigpu] SKIP — only one GPU available")
+        return True
+
+    seed = int(os.environ.get("BATCHED_GPTQ_SEED", "12345"))
+    E, N, K = 8, 64, 128
+    print(f"\n=== multi-GPU split test ===")
+    print(f"  E={E} N={N} K={K}  primary=cuda:0  secondary=cuda:1")
+
+    W, H = _build_random_problem(E, N, K, n_tokens=256, dtype=torch.float32,
+                                  device="cuda:0", seed=seed)
+    single = batched_gptq_quantize(
+        W, H, n_centroids=16, group_size=64, n_iter=25,
+        fit_loss="mse", snap_centroids="e4m3", percdamp=0.05)
+    multi = batched_gptq_quantize_multigpu(
+        W, H, primary_device="cuda:0", secondary_device="cuda:1",
+        primary_share=0.5,
+        n_centroids=16, group_size=64, n_iter=25,
+        fit_loss="mse", snap_centroids="e4m3", percdamp=0.05)
+
+    all_ok = True
+    for name in ("indices", "centroids_per_group", "scale_per_group", "Q",
+                 "mse", "w_snr_db", "y_snr_db", "rel_err"):
+        a, b = single[name], multi[name]
+        if a.dtype == torch.int8:
+            ok = (a == b).all().item()
+        else:
+            ok = torch.allclose(a.float(), b.float(), atol=1e-4, rtol=1e-3)
+        all_ok = all_ok and ok
+        diff = (a.float() - b.float()).abs().max().item() if a.dtype != torch.int8 else int((a.long() - b.long()).abs().max().item())
+        print(f"  {'OK   ' if ok else 'FAIL '}  {name}: max_diff={diff}")
+
+    if all_ok:
+        print("=== multi-GPU PASS ===")
+    else:
+        print("=== multi-GPU FAIL ===")
+    return all_ok
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    if rc == 0:
+        ok = test_multigpu()
+        if not ok:
+            rc = 1
+    sys.exit(rc)
