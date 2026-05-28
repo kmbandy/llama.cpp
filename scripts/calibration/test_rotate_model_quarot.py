@@ -53,7 +53,49 @@ def test_classify_unknown_raises():
     raise AssertionError("expected ValueError, got none")
 
 
+from rotate_model_quarot import build_R_resid
+
+
+def _assert_close(actual: torch.Tensor, expected: torch.Tensor, tol: float, label: str):
+    diff = (actual - expected).abs().max().item()
+    assert diff <= tol, f"{label}: max abs diff {diff:.3e} > tol {tol:.3e}"
+
+
+def test_R_resid_orthogonal_pow2():
+    """R @ R.T == I for power-of-2 d_model (pure Sylvester)."""
+    R = build_R_resid(d_model=2048, seed=42, device=torch.device("cpu"))
+    assert R.shape == (2048, 2048), f"shape {R.shape}"
+    assert R.dtype == torch.float32, f"dtype {R.dtype}"
+    I = torch.eye(2048, dtype=torch.float32)
+    _assert_close(R @ R.T, I, tol=1e-5, label="R @ R.T")
+    _assert_close(R.T @ R, I, tol=1e-5, label="R.T @ R")
+    print(f"  PASS test_R_resid_orthogonal_pow2")
+
+
+def test_R_resid_orthogonal_kronecker():
+    """R @ R.T == I for non-power-of-2 d_model via Kronecker H_a ⊗ H_b."""
+    R = build_R_resid(d_model=2560, seed=42, device=torch.device("cpu"))
+    assert R.shape == (2560, 2560), f"shape {R.shape}"
+    I = torch.eye(2560, dtype=torch.float32)
+    _assert_close(R @ R.T, I, tol=1e-4, label="R @ R.T (kronecker)")
+    print(f"  PASS test_R_resid_orthogonal_kronecker")
+
+
+def test_R_resid_seed_determinism():
+    """Same seed → same R; different seed → different R."""
+    R1 = build_R_resid(d_model=64, seed=42, device=torch.device("cpu"))
+    R2 = build_R_resid(d_model=64, seed=42, device=torch.device("cpu"))
+    R3 = build_R_resid(d_model=64, seed=43, device=torch.device("cpu"))
+    _assert_close(R1, R2, tol=0.0, label="same-seed determinism")
+    diff = (R1 - R3).abs().max().item()
+    assert diff > 1e-3, f"different-seed difference too small: {diff:.3e}"
+    print(f"  PASS test_R_resid_seed_determinism")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
+    test_R_resid_orthogonal_pow2()
+    test_R_resid_orthogonal_kronecker()
+    test_R_resid_seed_determinism()
     print("\nALL TESTS PASSED")

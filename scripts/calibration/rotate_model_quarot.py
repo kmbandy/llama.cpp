@@ -7,7 +7,14 @@ from __future__ import annotations
 
 import enum
 import re
+import sys
+from pathlib import Path
 from typing import Optional
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kronecker_rotation import sylvester, factor_for_dim
 
 
 class Role(enum.Enum):
@@ -74,3 +81,35 @@ def classify_tensor(name: str, arch: str) -> Role:
         f"tensor {name!r} matched no pattern under arch={arch!r}; "
         f"the catch-all should have fired — check the pattern table."
     )
+
+
+def build_R_resid(d_model: int, seed: int, device: torch.device) -> torch.Tensor:
+    """Construct a random Hadamard rotation of size d_model.
+
+    R_resid = D ⊙ H, where:
+      - H is Sylvester(d_model) for pure-power-of-2 d_model,
+        or H_a_random ⊗ H_b_sylvester via factor_for_dim() otherwise.
+      - D = diag(±1) sampled from Bernoulli(0.5) seeded by `seed`.
+
+    Returned tensor is fp32 on the requested device. Deterministic in `seed`.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    # Sign-flip diagonal — independent of H form, applied as elementwise row scale.
+    signs = (torch.randint(0, 2, (d_model,), generator=gen, dtype=torch.float32) * 2.0 - 1.0)
+
+    # Hadamard core
+    if (d_model & (d_model - 1)) == 0:
+        H = sylvester(d_model).to(dtype=torch.float32)
+    else:
+        a, b = factor_for_dim(d_model, max_b=1024)
+        # Random-orthogonal H_a; deterministic Sylvester H_b.
+        # Use a separate sub-seed so changing d_model factoring doesn't perturb
+        # the sign-flip stream.
+        from kronecker_rotation import random_orthogonal
+        H_a = random_orthogonal(a, seed=int(seed) + 1_000_003)
+        H_b = sylvester(b).to(dtype=torch.float32)
+        H = torch.kron(H_a.contiguous(), H_b.contiguous())
+
+    R = (signs.unsqueeze(1) * H).to(device=device, dtype=torch.float32)
+    return R
