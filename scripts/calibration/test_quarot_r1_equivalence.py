@@ -17,8 +17,9 @@ import sys
 from pathlib import Path
 
 
-LLAMA_PERPLEXITY = "/home/kmbandy/GitHub/llama.cpp/build/bin/llama-perplexity"
-DEFAULT_WIKITEXT = "/home/kmbandy/wikitext-2-raw/wiki.test.raw"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+LLAMA_PERPLEXITY = str(_REPO_ROOT / "build-hip" / "bin" / "llama-perplexity")
+DEFAULT_WIKITEXT = str(_REPO_ROOT / "wikitext-2-raw" / "wiki.test.raw")
 
 
 def run_ppl(gguf_path: str, wikitext_path: str, max_tokens: int) -> float:
