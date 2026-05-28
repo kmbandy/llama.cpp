@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for rotate_model_quarot.py."""
+"""Tests for rotate_model_quarot.py — Role enum, classify_tensor."""
 
 import sys
 from pathlib import Path
