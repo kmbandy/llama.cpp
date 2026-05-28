@@ -200,7 +200,7 @@ from pathlib import Path as _Path
 
 def _make_tiny_qwen36_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, d_ffn: int = 48, n_exp: int = 4):
     """Write a tiny qwen36moe-shaped bf16 GGUF for unit tests."""
-    sys.path.insert(0, "/home/kmbandy/GitHub/llama.cpp/gguf-py")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
     import gguf as _gguf
     import numpy as _np
 

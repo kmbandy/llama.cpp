@@ -11,10 +11,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kronecker_rotation import sylvester, factor_for_dim
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
+import gguf  # noqa: E402
 
 
 class Role(enum.Enum):
@@ -168,12 +172,6 @@ def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tens
     W_flat  = W.reshape(d_model, d_ffn * n_exp)
     W_rot   = R_resid @ W_flat
     return W_rot.view(d_model, d_ffn, n_exp).contiguous()
-
-
-import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
-import gguf  # noqa: E402
 
 
 _NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_PRE_FFN, Role.NORM_PRE_SSM, Role.NORM_OUT}
