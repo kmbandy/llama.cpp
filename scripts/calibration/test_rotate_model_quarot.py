@@ -195,6 +195,67 @@ def test_moe_output_side_matches_per_expert_loop():
     print(f"  PASS test_moe_output_side_matches_per_expert_loop")
 
 
+import tempfile
+from pathlib import Path as _Path
+
+def _make_tiny_qwen36_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, d_ffn: int = 48, n_exp: int = 4):
+    """Write a tiny qwen36moe-shaped bf16 GGUF for unit tests."""
+    sys.path.insert(0, "/home/kmbandy/GitHub/llama.cpp/gguf-py")
+    import gguf as _gguf
+    import numpy as _np
+
+    w = _gguf.GGUFWriter(out_path, arch="qwen36moe")
+    w.add_uint32("qwen36moe.embedding_length", d_model)
+    w.add_uint32("qwen36moe.block_count", n_layers)
+    w.add_uint32("qwen36moe.feed_forward_length", d_ffn)
+    w.add_uint32("qwen36moe.expert_count", n_exp)
+
+    def _add_bf16(name, t):
+        data = _np.ascontiguousarray(t.to(torch.bfloat16).view(torch.uint8).numpy())
+        w.add_tensor(name, data, raw_dtype=_gguf.GGMLQuantizationType.BF16)
+
+    vocab = 64
+    _add_bf16("token_embd.weight",        torch.randn(vocab, d_model))
+    for L in range(n_layers):
+        _add_bf16(f"blk.{L}.attn_norm.weight",    torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        _add_bf16(f"blk.{L}.attn_q.weight",       torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_k.weight",       torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_v.weight",       torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_output.weight",  torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.ffn_norm.weight",     torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        _add_bf16(f"blk.{L}.ffn_gate_inp.weight", torch.randn(n_exp, d_model))
+        _add_bf16(f"blk.{L}.ffn_gate_exps.weight", torch.randn(d_ffn, d_model, n_exp))
+        _add_bf16(f"blk.{L}.ffn_up_exps.weight",   torch.randn(d_ffn, d_model, n_exp))
+        _add_bf16(f"blk.{L}.ffn_down_exps.weight", torch.randn(d_model, d_ffn, n_exp))
+    _add_bf16("output_norm.weight", torch.ones(d_model) + 0.1 * torch.randn(d_model))
+    _add_bf16("output.weight",      torch.randn(vocab, d_model))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+from rotate_model_quarot import index_pass
+
+
+def test_index_pass_on_tiny_gguf():
+    """Pass 1 builds a roster mapping every tensor name to a Role, and a γ map."""
+    with tempfile.TemporaryDirectory() as td:
+        path = str(_Path(td) / "tiny.gguf")
+        _make_tiny_qwen36_gguf(path, n_layers=2)
+        roster, gammas, d_model = index_pass(path, arch="qwen36moe")
+
+    assert d_model == 32, f"d_model {d_model}"
+    assert roster["token_embd.weight"] == Role.EMBED
+    assert roster["blk.0.attn_q.weight"] == Role.ATTN_Q
+    assert roster["blk.1.ffn_down_exps.weight"] == Role.FFN_DOWN_EXPS
+    # γ map: keyed by tensor name, value is a torch.Tensor of size d_model.
+    assert "blk.0.attn_norm.weight" in gammas
+    assert gammas["blk.0.attn_norm.weight"].shape == (32,)
+    assert "output_norm.weight" in gammas
+    print(f"  PASS test_index_pass_on_tiny_gguf")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
@@ -206,4 +267,5 @@ if __name__ == "__main__":
     test_input_output_cancel_through_residual()
     test_moe_input_side_matches_per_expert_loop()
     test_moe_output_side_matches_per_expert_loop()
+    test_index_pass_on_tiny_gguf()
     print("\nALL TESTS PASSED")

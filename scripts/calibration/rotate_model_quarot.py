@@ -168,3 +168,54 @@ def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tens
     W_flat  = W.reshape(d_model, d_ffn * n_exp)
     W_rot   = R_resid @ W_flat
     return W_rot.view(d_model, d_ffn, n_exp).contiguous()
+
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
+import gguf  # noqa: E402
+
+
+_NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_PRE_FFN, Role.NORM_PRE_SSM, Role.NORM_OUT}
+
+
+def _gguf_tensor_to_torch(t) -> torch.Tensor:
+    """Materialize a GGUFReader tensor as a torch float32 tensor.
+
+    Assumes bf16 storage — the source GGUF is the bf16 conversion produced by
+    gguf_f16_to_bf16.py and used by calibrate_ml8_paged.py.
+    """
+    if t.tensor_type.name != "BF16":
+        raise ValueError(f"{t.name}: expected BF16, got {t.tensor_type.name}")
+    arr = np.asarray(t.data, dtype=np.uint8).copy()  # detach from mmap
+    return torch.from_numpy(arr).view(torch.bfloat16).view(*t.shape).to(torch.float32)
+
+
+def index_pass(source_path: str, arch: str) -> tuple[dict[str, Role], dict[str, torch.Tensor], int]:
+    """Pass 1 — walk source GGUF, classify each tensor, pull only γ vectors into RAM.
+
+    Returns (roster, gammas, d_model). Roster covers every tensor in the file.
+    Gammas only contains the RMSNorm tensors (kept resident — ~200 KB total even
+    for 35B-A3B). d_model is read from the arch's embedding_length KV.
+    """
+    r = gguf.GGUFReader(source_path)
+    roster: dict[str, Role] = {}
+    gammas: dict[str, torch.Tensor] = {}
+    for t in r.tensors:
+        role = classify_tensor(t.name, arch=arch)
+        roster[t.name] = role
+        if role in _NORM_ROLES:
+            gammas[t.name] = _gguf_tensor_to_torch(t)
+
+    # d_model from arch KV (e.g. "qwen36moe.embedding_length"). Fall back to
+    # token_embd.weight's last dim if the KV isn't present.
+    d_model: Optional[int] = None
+    for f in r.fields.values():
+        if f.name == f"{arch}.embedding_length":
+            d_model = int(f.parts[f.data[0]][0])
+            break
+    if d_model is None:
+        embed_t = next(t for t in r.tensors if t.name == "token_embd.weight")
+        d_model = int(embed_t.shape[-1])
+
+    return roster, gammas, d_model
