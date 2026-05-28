@@ -1203,7 +1203,7 @@ python3 scripts/calibration/rotate_model_quarot.py \
   --output  /home/kmbandy/models/Qwen3.5-4B-bf16-rotR1.gguf \
   --arch    qwen35 \
   --seed    42 \
-  --device  cuda:1
+  --device  cuda:0
 ```
 
 Note: `qwen35` (not `qwen36moe`) — Qwen3.5-4B is dense, not MoE. **If the `qwen35` arch is missing from `_ROLE_PATTERNS`, add it before running.** Pattern table for dense Qwen3.5:
@@ -1256,7 +1256,7 @@ written successfully.
 
 - [ ] **Step 3: Run the equivalence gate**
 
-Expect the rotation to take ~2 min on cuda:1 for a 4B model. Then:
+Expect the rotation to take ~2 min on cuda:0 for a 4B model. Then:
 
 ```bash
 python3 scripts/calibration/test_quarot_r1_equivalence.py \
@@ -1307,7 +1307,7 @@ python3 scripts/calibration/calibrate_ml8_paged.py \
   --seq-len    1024 \
   --eval-ppl \
   --ppl-max-tokens 100000 \
-  --device     cuda:1 \
+  --device     cuda:0 \
   2>&1 | tee /tmp/4B-rotR1-cal.log
 ```
 
@@ -1387,10 +1387,10 @@ python3 scripts/calibration/rotate_model_quarot.py \
   --output  /home/kmbandy/models/Qwen3.6-35B-A3B-bf16-rotR1.gguf \
   --arch    qwen36moe \
   --seed    42 \
-  --device  cuda:1
+  --device  cuda:0
 ```
 
-Expected wall time: ~5 min. Memory peak: ~200 MB host + ~16 MB on cuda:1.
+Expected wall time: ~5 min. Memory peak: ~200 MB host + ~16 MB on cuda:0.
 
 - [ ] **Step 2: Run the equivalence gate**
 
@@ -1422,7 +1422,7 @@ python3 scripts/calibration/calibrate_ml8_paged.py \
   --seq-len    1024 \
   --eval-ppl \
   --ppl-max-tokens 100000 \
-  --device     cuda:1 \
+  --device     cuda:0 \
   2>&1 | tee /tmp/35B-rotR1-cal.log
 ```
 
