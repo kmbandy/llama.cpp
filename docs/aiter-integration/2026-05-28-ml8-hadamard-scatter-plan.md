@@ -451,10 +451,10 @@ def rotate_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.Tenso
 
     Math: original forward is y = (γ ⊙ x) @ W.T. In the rotated stream the input
     is x' = x @ R.T (γ already absorbed at construction time). The rotated weight
-    must satisfy y = x' @ W_new.T, giving W_new = (W ⊙ γ_row) @ R.
+    must satisfy y = x' @ W_new.T, giving W_new = (W ⊙ γ_row) @ R.T.
     """
     Wg = W * gamma.unsqueeze(0)            # [N, d_model], column-wise γ
-    return Wg @ R_resid                    # [N, d_model]
+    return Wg @ R_resid.T                  # [N, d_model]
 
 
 def rotate_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
@@ -560,7 +560,7 @@ def rotate_moe_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.T
     # Reshape so the d_model axis stays adjacent for the matmul.
     # [d_ffn, d_model, n_exp] → permute → [d_ffn, n_exp, d_model] → flatten outer → [d_ffn*n_exp, d_model]
     W_p     = W.permute(0, 2, 1).contiguous().view(d_ffn * n_exp, d_model)
-    W_rot   = (W_p * gamma.unsqueeze(0)) @ R_resid
+    W_rot   = (W_p * gamma.unsqueeze(0)) @ R_resid.T
     # Reshape back to [d_ffn, n_exp, d_model] → permute → [d_ffn, d_model, n_exp]
     return W_rot.view(d_ffn, n_exp, d_model).permute(0, 2, 1).contiguous()
 

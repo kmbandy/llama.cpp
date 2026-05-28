@@ -124,10 +124,10 @@ def rotate_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.Tenso
 
     Math: original forward is y = (γ ⊙ x) @ W.T. In the rotated stream the input
     is x' = x @ R.T (γ already absorbed at construction time). The rotated weight
-    must satisfy y = x' @ W_new.T, giving W_new = (W ⊙ γ_row) @ R.
+    must satisfy y = x' @ W_new.T, giving W_new = (W ⊙ γ_row) @ R.T.
     """
     Wg = W * gamma.unsqueeze(0)            # [N, d_model], column-wise γ
-    return Wg @ R_resid.T                    # [N, d_model]
+    return Wg @ R_resid.T                  # [N, d_model]
 
 
 def rotate_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
