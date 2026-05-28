@@ -260,25 +260,41 @@ def _rotation_plan(role: Role, name: str) -> tuple[str, Optional[str]]:
     raise ValueError(f"no rotation plan for role {role}")
 
 
-def _bf16_bytes_from_fp32(t: torch.Tensor) -> np.ndarray:
-    """Cast a float32 torch tensor to bf16 raw bytes as a uint8 numpy array."""
-    return np.ascontiguousarray(t.contiguous().to(torch.bfloat16).view(torch.uint8).numpy())
+_GGUF_DTYPE_TO_TORCH = {
+    "BF16": torch.bfloat16,
+    "F16":  torch.float16,
+    "F32":  torch.float32,
+}
+
+
+def _bytes_from_fp32(t: torch.Tensor, gguf_dtype) -> np.ndarray:
+    """Cast a fp32 tensor to raw bytes matching the given GGUF dtype.
+
+    Real GGUFs from gguf_f16_to_bf16.py keep RMSNorm γ as F32 even when the
+    large weights are BF16 — round-tripping in source dtype preserves the
+    file's dtype mix.
+    """
+    target = _GGUF_DTYPE_TO_TORCH.get(gguf_dtype.name)
+    if target is None:
+        raise ValueError(f"unsupported write dtype {gguf_dtype.name!r}")
+    return np.ascontiguousarray(t.contiguous().to(target).view(torch.uint8).numpy())
 
 
 def _gguf_tensor_to_torch(t) -> torch.Tensor:
-    """Materialize a GGUFReader BF16 tensor as a fp32 torch tensor in PyTorch
-    (row-major / C) axis order.
+    """Materialize a GGUFReader BF16/F16/F32 tensor as a fp32 torch tensor in
+    PyTorch (row-major / C) axis order.
 
     GGUFReader stores shape in GGUF file order, which is the reverse of C order.
     Reversing t.shape recovers the [out, in, ...] PyTorch convention. For 1D γ
     vectors the reverse is a no-op, so this function handles both linears and
     norm weights.
     """
-    if t.tensor_type.name != "BF16":
-        raise ValueError(f"{t.name}: expected BF16, got {t.tensor_type.name}")
+    target = _GGUF_DTYPE_TO_TORCH.get(t.tensor_type.name)
+    if target is None:
+        raise ValueError(f"{t.name}: unsupported dtype {t.tensor_type.name}")
     arr = np.asarray(t.data, dtype=np.uint8).copy()  # detach from mmap
     torch_shape = [int(s) for s in reversed(list(t.shape))]
-    return torch.from_numpy(arr).view(torch.bfloat16).reshape(*torch_shape).to(torch.float32)
+    return torch.from_numpy(arr).view(target).reshape(*torch_shape).to(torch.float32)
 
 
 # Internal GGUF metadata fields and auto-added fields to skip during KV copy.
@@ -348,7 +364,7 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             # t.shape is GGUF-order; reversed gives PyTorch shape.
             torch_shape = [int(s) for s in reversed(list(t.shape))]
             ones = torch.ones(*torch_shape, dtype=torch.float32)
-            w.add_tensor(t.name, _bf16_bytes_from_fp32(ones), raw_dtype=t.tensor_type)
+            w.add_tensor(t.name, _bytes_from_fp32(ones, t.tensor_type), raw_dtype=t.tensor_type)
             absorbed.append(t.name)
             continue
 
@@ -376,7 +392,7 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
         # Write back without raw_shape: gguf-py infers shape from the uint8 array,
         # which encodes the PyTorch-convention shape. The writer reverses it to
         # GGUF file order, so read-back shapes match the source.
-        w.add_tensor(t.name, _bf16_bytes_from_fp32(W_new.cpu()), raw_dtype=t.tensor_type)
+        w.add_tensor(t.name, _bytes_from_fp32(W_new.cpu(), t.tensor_type), raw_dtype=t.tensor_type)
         rotated.append(t.name)
 
         # Free memory before moving to the next tensor.
