@@ -5,7 +5,9 @@ See docs/aiter-integration/2026-05-28-ml8-hadamard-scatter-design.md.
 """
 from __future__ import annotations
 
+import argparse
 import enum
+import json
 import re
 import sys
 from pathlib import Path
@@ -368,3 +370,33 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
         "rotated_tensors": rotated,
         "absorbed_norms": absorbed,
     }
+
+
+def _save_sidecar(output_path: str, manifest: dict) -> None:
+    sidecar_path = output_path + ".quarot_r1.json"
+    with open(sidecar_path, "w") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Apply QuaRot-R1 rotation to a bf16 GGUF.")
+    p.add_argument("--source", required=True, help="path to source bf16 GGUF")
+    p.add_argument("--output", required=True, help="path to write rotated bf16 GGUF")
+    p.add_argument("--arch", default="qwen36moe", choices=sorted(_ROLE_PATTERNS.keys()),
+                   help="GGUF architecture for tensor-name classification")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", default="cpu",
+                   help="torch device string for the rotation matmul (e.g. cuda:0)")
+    args = p.parse_args(argv)
+
+    device = torch.device(args.device)
+    manifest = rotate_gguf(source_path=args.source, output_path=args.output,
+                           arch=args.arch, seed=args.seed, device=device)
+    _save_sidecar(args.output, manifest)
+    print(f"wrote {args.output} ({len(manifest['rotated_tensors'])} rotated, "
+          f"{len(manifest['absorbed_norms'])} absorbed)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

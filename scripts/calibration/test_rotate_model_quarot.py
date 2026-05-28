@@ -195,6 +195,8 @@ def test_moe_output_side_matches_per_expert_loop():
     print(f"  PASS test_moe_output_side_matches_per_expert_loop")
 
 
+import json as _json
+import subprocess
 import tempfile
 from pathlib import Path as _Path
 
@@ -287,6 +289,31 @@ def test_rotate_gguf_end_to_end_on_tiny():
     print(f"  PASS test_rotate_gguf_end_to_end_on_tiny")
 
 
+def test_cli_produces_gguf_and_sidecar():
+    """CLI invocation writes both the rotated GGUF and the sidecar JSON next to it."""
+    with tempfile.TemporaryDirectory() as td:
+        src = str(_Path(td) / "src.gguf")
+        dst = str(_Path(td) / "dst.gguf")
+        _make_tiny_qwen36_gguf(src, n_layers=2)
+        result = subprocess.run(
+            [sys.executable, str(_Path(__file__).resolve().parent / "rotate_model_quarot.py"),
+             "--source", src, "--output", dst,
+             "--arch", "qwen36moe", "--seed", "42"],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        assert _Path(dst).exists(), "output GGUF missing"
+        sidecar = _Path(dst + ".quarot_r1.json")
+        assert sidecar.exists(), "sidecar JSON missing"
+        payload = _json.loads(sidecar.read_text())
+        assert payload["seed"] == 42
+        assert payload["arch"] == "qwen36moe"
+        assert payload["d_model"] == 32
+        assert any("attn_q" in n for n in payload["rotated_tensors"])
+        assert any("attn_norm" in n for n in payload["absorbed_norms"])
+    print(f"  PASS test_cli_produces_gguf_and_sidecar")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
@@ -300,4 +327,5 @@ if __name__ == "__main__":
     test_moe_output_side_matches_per_expert_loop()
     test_index_pass_on_tiny_gguf()
     test_rotate_gguf_end_to_end_on_tiny()
+    test_cli_produces_gguf_and_sidecar()
     print("\nALL TESTS PASSED")
