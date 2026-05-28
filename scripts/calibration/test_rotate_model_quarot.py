@@ -157,6 +157,44 @@ def test_input_output_cancel_through_residual():
     print(f"  PASS test_input_output_cancel_through_residual")
 
 
+from rotate_model_quarot import rotate_moe_input_side, rotate_moe_output_side
+
+
+def test_moe_input_side_matches_per_expert_loop():
+    """Batched MoE input rotation == per-expert rotate_input_side over n_experts."""
+    torch.manual_seed(20)
+    d_model, d_ffn, n_exp = 32, 48, 4
+    # PyTorch shape for gate/up_exps: [d_ffn, d_model, n_exp]
+    W      = torch.randn(d_ffn, d_model, n_exp, dtype=torch.float32)
+    gamma  = torch.randn(d_model, dtype=torch.float32) * 0.3 + 1.0
+    R      = build_R_resid(d_model=d_model, seed=21, device=torch.device("cpu"))
+
+    expected = torch.empty_like(W)
+    for e in range(n_exp):
+        expected[..., e] = rotate_input_side(W[..., e], gamma, R)
+
+    actual = rotate_moe_input_side(W, gamma, R)
+    _assert_close(actual, expected, tol=1e-5, label="MoE input batched vs loop")
+    print(f"  PASS test_moe_input_side_matches_per_expert_loop")
+
+
+def test_moe_output_side_matches_per_expert_loop():
+    """Batched MoE output rotation == per-expert rotate_output_side over n_experts."""
+    torch.manual_seed(22)
+    d_model, d_ffn, n_exp = 32, 48, 4
+    # PyTorch shape for down_exps: [d_model, d_ffn, n_exp]
+    W      = torch.randn(d_model, d_ffn, n_exp, dtype=torch.float32)
+    R      = build_R_resid(d_model=d_model, seed=23, device=torch.device("cpu"))
+
+    expected = torch.empty_like(W)
+    for e in range(n_exp):
+        expected[..., e] = rotate_output_side(W[..., e], R)
+
+    actual = rotate_moe_output_side(W, R)
+    _assert_close(actual, expected, tol=1e-5, label="MoE output batched vs loop")
+    print(f"  PASS test_moe_output_side_matches_per_expert_loop")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
@@ -166,4 +204,6 @@ if __name__ == "__main__":
     test_rotate_input_side_round_trip()
     test_rotate_output_side_round_trip()
     test_input_output_cancel_through_residual()
+    test_moe_input_side_matches_per_expert_loop()
+    test_moe_output_side_matches_per_expert_loop()
     print("\nALL TESTS PASSED")

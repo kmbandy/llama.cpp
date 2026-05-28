@@ -140,3 +140,31 @@ def rotate_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
     y_new = y @ R.T directly, we need W_new = R @ W.
     """
     return R_resid @ W                     # [d_model, K]
+
+
+def rotate_moe_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
+    """MoE input-side rotation, batched along the expert axis.
+
+    W shape: [d_ffn, d_model, n_experts]. Applies rotate_input_side to each
+    expert in one batched matmul instead of a Python loop.
+    """
+    d_ffn, d_model, n_exp = W.shape
+    # Reshape so the d_model axis stays adjacent for the matmul.
+    # [d_ffn, d_model, n_exp] → permute → [d_ffn, n_exp, d_model] → flatten outer → [d_ffn*n_exp, d_model]
+    W_p     = W.permute(0, 2, 1).contiguous().view(d_ffn * n_exp, d_model)
+    W_rot   = (W_p * gamma.unsqueeze(0)) @ R_resid.T
+    # Reshape back to [d_ffn, n_exp, d_model] → permute → [d_ffn, d_model, n_exp]
+    return W_rot.view(d_ffn, n_exp, d_model).permute(0, 2, 1).contiguous()
+
+
+def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
+    """MoE output-side rotation, batched along the expert axis.
+
+    W shape: [d_model, d_ffn, n_experts]. Applies rotate_output_side
+    (R @ W on the d_model axis) to each expert in one batched matmul.
+    """
+    d_model, d_ffn, n_exp = W.shape
+    # Flatten the trailing dims so the d_model axis is the matmul axis.
+    W_flat  = W.reshape(d_model, d_ffn * n_exp)
+    W_rot   = R_resid @ W_flat
+    return W_rot.view(d_model, d_ffn, n_exp).contiguous()
