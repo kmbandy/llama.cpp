@@ -1224,7 +1224,8 @@ Note: `qwen35` (not `qwen36moe`) — Qwen3.5-4B is dense, not MoE. **If the `qwe
     (r"blk\.\d+\.ffn_gate\.weight",        Role.FFN_GATE_EXPS),
     (r"blk\.\d+\.ffn_up\.weight",          Role.FFN_UP_EXPS),
     (r"blk\.\d+\.ffn_down\.weight",        Role.FFN_DOWN_EXPS),
-    (r".*",                                Role.PASSTHROUGH),
+    (r"rope_freqs\.weight",                Role.PASSTHROUGH),
+    # Intentionally no `.*` catch-all — unknown names raise (matches qwen36moe).
 ],
 ```
 
