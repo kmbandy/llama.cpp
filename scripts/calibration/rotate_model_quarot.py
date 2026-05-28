@@ -217,3 +217,174 @@ def index_pass(source_path: str, arch: str) -> tuple[dict[str, Role], dict[str, 
         d_model = int(embed_t.shape[-1])
 
     return roster, gammas, d_model
+
+
+# ---------------------------------------------------------------------------
+# Task 6: Pass-2 streaming rotate + write
+# ---------------------------------------------------------------------------
+
+# Map roles to (rotation_kind, gamma_source) where rotation_kind is one of
+# {"input_2d", "output_2d", "input_moe", "output_moe", "embed", "norm_to_ones", "passthrough"}.
+# The γ source is the tensor name of the RMSNorm that precedes this linear in
+# the graph, or None if no γ absorption applies.
+def _rotation_plan(role: Role, name: str) -> tuple[str, Optional[str]]:
+    """Decide (rotation_kind, gamma_tensor_name) for a given tensor."""
+    if role == Role.PASSTHROUGH:
+        return ("passthrough", None)
+    if role in _NORM_ROLES:
+        return ("norm_to_ones", None)
+    if role == Role.EMBED:
+        return ("embed", None)
+    if role == Role.LM_HEAD:
+        return ("input_2d", "output_norm.weight")
+    # Per-block roles: pull the layer index from the name.
+    m = re.match(r"blk\.(\d+)\.", name)
+    if not m:
+        raise ValueError(f"expected blk.N. prefix on {name!r} for role {role}")
+    L = int(m.group(1))
+    if role in (Role.ATTN_Q, Role.ATTN_K, Role.ATTN_V):
+        return ("input_2d", f"blk.{L}.attn_norm.weight")
+    if role == Role.ATTN_O:
+        return ("output_2d", None)
+    if role in (Role.FFN_GATE_INP,):
+        return ("input_2d", f"blk.{L}.ffn_norm.weight")
+    if role in (Role.FFN_GATE_EXPS, Role.FFN_UP_EXPS):
+        return ("input_moe", f"blk.{L}.ffn_norm.weight")
+    if role == Role.FFN_DOWN_EXPS:
+        return ("output_moe", None)
+    if role == Role.MAMBA_IN:
+        return ("input_2d", f"blk.{L}.ssm_norm.weight")
+    if role == Role.MAMBA_OUT:
+        return ("output_2d", None)
+    raise ValueError(f"no rotation plan for role {role}")
+
+
+def _bf16_bytes_from_fp32(t: torch.Tensor) -> np.ndarray:
+    """Cast a float32 torch tensor to bf16 raw bytes as a uint8 numpy array."""
+    return np.ascontiguousarray(t.contiguous().to(torch.bfloat16).view(torch.uint8).numpy())
+
+
+def _gguf_tensor_to_torch_pyt(t) -> torch.Tensor:
+    """Materialize a GGUFReader BF16 tensor as a fp32 torch tensor in PyTorch
+    (row-major / C) axis order.
+
+    GGUFReader stores shape in GGUF file order (reversed from C/PyTorch order).
+    t.data is a mmap'd uint8 array already in C memory order with shape
+    quant_shape_to_byte_shape(reversed(t.shape), BF16). Reversing t.shape gives
+    the correct PyTorch-convention shape.
+    """
+    if t.tensor_type.name != "BF16":
+        raise ValueError(f"{t.name}: expected BF16, got {t.tensor_type.name}")
+    arr = np.asarray(t.data, dtype=np.uint8).copy()  # detach from mmap
+    torch_shape = [int(s) for s in reversed(list(t.shape))]
+    return torch.from_numpy(arr).view(torch.bfloat16).reshape(*torch_shape).to(torch.float32)
+
+
+# Internal GGUF metadata fields and auto-added fields to skip during KV copy.
+_GGUF_INTERNAL_FIELDS = frozenset({"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count",
+                                    "general.architecture"})
+
+
+def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
+                device: torch.device) -> dict:
+    """Pass 2 — stream source GGUF, rotate every tensor according to its role,
+    write to a new GGUF.
+
+    Returns a manifest dict suitable for the sidecar JSON.
+    """
+    # Pass 1
+    roster, gammas, d_model = index_pass(source_path, arch=arch)
+    R_resid = build_R_resid(d_model=d_model, seed=seed, device=device)
+
+    # Re-open source for streaming. Open writer.
+    r = gguf.GGUFReader(source_path)
+    w = gguf.GGUFWriter(output_path, arch=arch)
+
+    # Copy KV fields verbatim, skipping internal/auto fields.
+    for f in r.fields.values():
+        if f.name in _GGUF_INTERNAL_FIELDS:
+            continue
+        vtype = f.types[0]
+        val = f.parts[f.data[0]]
+        if vtype == gguf.GGUFValueType.UINT32:
+            w.add_key_value(f.name, int(val[0]), gguf.GGUFValueType.UINT32)
+        elif vtype == gguf.GGUFValueType.UINT64:
+            w.add_key_value(f.name, int(val[0]), gguf.GGUFValueType.UINT64)
+        elif vtype == gguf.GGUFValueType.FLOAT32:
+            w.add_key_value(f.name, float(val[0]), gguf.GGUFValueType.FLOAT32)
+        elif vtype == gguf.GGUFValueType.FLOAT64:
+            w.add_key_value(f.name, float(val[0]), gguf.GGUFValueType.FLOAT64)
+        elif vtype == gguf.GGUFValueType.INT32:
+            w.add_key_value(f.name, int(val[0]), gguf.GGUFValueType.INT32)
+        elif vtype == gguf.GGUFValueType.STRING:
+            w.add_key_value(f.name, bytes(val).decode("utf-8"), gguf.GGUFValueType.STRING)
+        else:
+            # Skip exotic types (ARRAY, BOOL, etc.) not needed for arch metadata.
+            pass
+
+    rotated: list[str] = []
+    absorbed: list[str] = []
+
+    for t in r.tensors:
+        role = roster[t.name]
+        kind, gamma_name = _rotation_plan(role, t.name)
+
+        if kind == "passthrough":
+            # Copy raw bytes unchanged; let gguf-py derive shape from the uint8 array.
+            arr = np.asarray(t.data, dtype=np.uint8).copy()
+            w.add_tensor(t.name, arr, raw_dtype=t.tensor_type)
+            continue
+
+        if kind == "norm_to_ones":
+            # Write ones in bf16 with the same element shape.
+            # t.shape is GGUF-order; reversed gives PyTorch shape.
+            torch_shape = [int(s) for s in reversed(list(t.shape))]
+            ones = torch.ones(*torch_shape, dtype=torch.float32)
+            w.add_tensor(t.name, _bf16_bytes_from_fp32(ones), raw_dtype=t.tensor_type)
+            absorbed.append(t.name)
+            continue
+
+        # Otherwise materialise the tensor in PyTorch-convention fp32 order.
+        W_fp32 = _gguf_tensor_to_torch_pyt(t).to(device)
+
+        if kind == "embed":
+            # token_embd shape (PyTorch): [vocab, d_model].
+            # Output-side rotation: embed @ R_resid makes emb vectors live in the
+            # rotated space that downstream input-side linears expect.
+            W_new = W_fp32 @ R_resid
+        elif kind == "input_2d":
+            gamma = gammas[gamma_name].to(device) if gamma_name else torch.ones(d_model, device=device)
+            W_new = rotate_input_side(W_fp32, gamma, R_resid)
+        elif kind == "output_2d":
+            W_new = rotate_output_side(W_fp32, R_resid)
+        elif kind == "input_moe":
+            gamma = gammas[gamma_name].to(device) if gamma_name else torch.ones(d_model, device=device)
+            W_new = rotate_moe_input_side(W_fp32, gamma, R_resid)
+        elif kind == "output_moe":
+            W_new = rotate_moe_output_side(W_fp32, R_resid)
+        else:
+            raise ValueError(f"unknown rotation kind {kind!r}")
+
+        # Write back without raw_shape: gguf-py infers shape from the uint8 array,
+        # which encodes the PyTorch-convention shape. The writer reverses it to
+        # GGUF file order, so read-back shapes match the source.
+        w.add_tensor(t.name, _bf16_bytes_from_fp32(W_new.cpu()), raw_dtype=t.tensor_type)
+        rotated.append(t.name)
+
+        # Free memory before moving to the next tensor.
+        del W_fp32, W_new
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    return {
+        "seed": int(seed),
+        "d_model": int(d_model),
+        "arch": arch,
+        "rotated_tensors": rotated,
+        "absorbed_norms": absorbed,
+    }

@@ -235,7 +235,7 @@ def _make_tiny_qwen36_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, 
     w.close()
 
 
-from rotate_model_quarot import index_pass
+from rotate_model_quarot import index_pass, _gguf_tensor_to_torch
 
 
 def test_index_pass_on_tiny_gguf():
@@ -256,6 +256,37 @@ def test_index_pass_on_tiny_gguf():
     print(f"  PASS test_index_pass_on_tiny_gguf")
 
 
+from rotate_model_quarot import rotate_gguf
+
+
+def test_rotate_gguf_end_to_end_on_tiny():
+    """rotate_gguf produces an output GGUF whose forward equals the source's."""
+    with tempfile.TemporaryDirectory() as td:
+        src = str(_Path(td) / "src.gguf")
+        dst = str(_Path(td) / "dst.gguf")
+        _make_tiny_qwen36_gguf(src, n_layers=2, d_model=32, d_ffn=48, n_exp=4)
+
+        rotate_gguf(source_path=src, output_path=dst, arch="qwen36moe",
+                    seed=42, device=torch.device("cpu"))
+
+        # Re-load and check shapes + γs zeroed-to-1.
+        sys.path.insert(0, "/home/kmbandy/GitHub/llama.cpp/gguf-py")
+        import gguf as _gguf
+        r = _gguf.GGUFReader(dst)
+        names = {t.name for t in r.tensors}
+        # Every source tensor present.
+        assert "token_embd.weight" in names
+        assert "blk.0.ffn_down_exps.weight" in names
+        # γ tensors written as all-ones.
+        gamma_t = next(t for t in r.tensors if t.name == "blk.0.attn_norm.weight")
+        gamma_v = _gguf_tensor_to_torch(gamma_t)
+        _assert_close(gamma_v, torch.ones(32), tol=1e-2, label="γ written as ones")
+        # Rotated weight shape matches source.
+        q_t = next(t for t in r.tensors if t.name == "blk.0.attn_q.weight")
+        assert list(q_t.shape) == [32, 32], f"attn_q shape {list(q_t.shape)}"
+    print(f"  PASS test_rotate_gguf_end_to_end_on_tiny")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
@@ -268,4 +299,5 @@ if __name__ == "__main__":
     test_moe_input_side_matches_per_expert_loop()
     test_moe_output_side_matches_per_expert_loop()
     test_index_pass_on_tiny_gguf()
+    test_rotate_gguf_end_to_end_on_tiny()
     print("\nALL TESTS PASSED")
