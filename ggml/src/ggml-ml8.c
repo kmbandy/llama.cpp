@@ -293,7 +293,7 @@ struct ggml_tensor * ggml_ml8_mul_mat_id(
     GGML_ASSERT(centroids != NULL);
     GGML_ASSERT(x         != NULL);
     GGML_ASSERT(ids       != NULL);
-    GGML_ASSERT(w->type         == GGML_TYPE_ML8_4);
+    GGML_ASSERT(w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_4_SOA);
     GGML_ASSERT(centroids->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type         == GGML_TYPE_F32);
     GGML_ASSERT(ids->type       == GGML_TYPE_I32);

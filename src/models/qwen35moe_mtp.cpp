@@ -188,8 +188,25 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
     cb(cur, "mtp_attn_post_norm", il);
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+    const bool is_ml8_moe = layer.ffn_gate_exps &&
+                            (layer.ffn_gate_exps->type == GGML_TYPE_ML8_4 ||
+                             layer.ffn_gate_exps->type == GGML_TYPE_ML8_4_SOA) &&
+                            layer.ffn_gate_exps_centroids != nullptr;
+    ggml_tensor * moe_out;
+    if (is_ml8_moe) {
+        moe_out = build_moe_ffn_ml8(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,   layer.ffn_up_exps_centroids,
+            layer.ffn_up_exps_rotation_h_a,   layer.ffn_up_exps_awq_scale,
+            layer.ffn_gate_exps, layer.ffn_gate_exps_centroids,
+            layer.ffn_gate_exps_rotation_h_a, layer.ffn_gate_exps_awq_scale,
+            layer.ffn_down_exps, layer.ffn_down_exps_centroids,
+            layer.ffn_down_exps_rotation_h_a, layer.ffn_down_exps_awq_scale,
+            n_expert, n_expert_used,
+            /* norm_w */ true, hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+    } else {
+        moe_out = build_moe_ffn(cur,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
             layer.ffn_gate_exps,
@@ -203,6 +220,7 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
             layer.ffn_up_exps_s,
             layer.ffn_gate_exps_s,
             layer.ffn_down_exps_s);
+    }
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     if (layer.ffn_up_shexp != nullptr) {

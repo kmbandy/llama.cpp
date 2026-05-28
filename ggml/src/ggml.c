@@ -808,6 +808,19 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_ml8_4,
         .from_float_ref           = (ggml_from_float_t) quantize_row_ml8_4_ref,
     },
+    // MAD-223 Phase G.7 / MAD-244: same per-element math as ML8_4, but stored
+    // in stored-as-repacked SOA layout (b_packed[K/2,N,n_experts] followed by
+    // b_scale[n_groups_k,N,n_experts]) so the MoE GEMM kernel can read it
+    // directly without a runtime layout transform. to_float/from_float are
+    // stubs (real dequant lives in the matmul graph node, identical to ML8_4).
+    [GGML_TYPE_ML8_4_SOA] = {
+        .type_name                = "ml8_4_soa",
+        .blck_size                = QK_ML8,
+        .type_size                = sizeof(block_ml8_4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ml8_4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ml8_4_ref,
+    },
     // MAD-223 Phase G.1: fp8 e4m3 sidecar storage for ml8 centroid LUTs.
     // Treated as a non-quantized 1-byte-per-element type (no block structure).
     [GGML_TYPE_F8_E4M3] = {

@@ -4159,8 +4159,12 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     # MAD-223 Phase G: ml8-4 weight quantization + fp8 e4m3 centroid storage.
     # See ggml/src/ggml-cuda/aiter-integration/ML8_GGUF_INTEGRATION_DESIGN.md.
-    ML8_4    = 48
-    F8_E4M3  = 49
+    ML8_4     = 48
+    F8_E4M3   = 49
+    # MAD-244: ml8-4 stored-as-repacked (SOA) layout for MoE expert weights.
+    # Same numerics as ML8_4 (4-bit centroid indices + fp32 group scales);
+    # different byte layout per tensor: b_packed then b_scale per expert row.
+    ML8_4_SOA = 50
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4339,6 +4343,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.ML8_4:   (64, 4 + 32),
     # Non-block 1-byte fp8 e4m3 storage; used as sidecar dtype for ml8 centroids
     GGMLQuantizationType.F8_E4M3: (1, 1),
+    # MAD-244: ML8_4 stored-as-repacked SOA. Same byte-count-per-element as ML8_4.
+    GGMLQuantizationType.ML8_4_SOA: (64, 4 + 32),
 }
 
 

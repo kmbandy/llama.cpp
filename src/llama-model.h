@@ -511,6 +511,23 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_rotation_meta = nullptr;
     struct ggml_tensor * ffn_down_awq_scale     = nullptr;
 
+    // ml8-4 sidecars for MoE routed experts (MAD-223 G.7). Per-(layer, kind)
+    // 3D centroid stack [16, K/64, n_experts] in F8_E4M3; one rotation_h_a
+    // and one AWQ scale shared across experts (the calibrator validates
+    // identical rotation+awq per expert chunk, see ml8_to_gguf.py).
+    struct ggml_tensor * ffn_gate_exps_centroids     = nullptr;
+    struct ggml_tensor * ffn_gate_exps_rotation_h_a  = nullptr;
+    struct ggml_tensor * ffn_gate_exps_rotation_meta = nullptr;
+    struct ggml_tensor * ffn_gate_exps_awq_scale     = nullptr;
+    struct ggml_tensor * ffn_up_exps_centroids       = nullptr;
+    struct ggml_tensor * ffn_up_exps_rotation_h_a    = nullptr;
+    struct ggml_tensor * ffn_up_exps_rotation_meta   = nullptr;
+    struct ggml_tensor * ffn_up_exps_awq_scale       = nullptr;
+    struct ggml_tensor * ffn_down_exps_centroids     = nullptr;
+    struct ggml_tensor * ffn_down_exps_rotation_h_a  = nullptr;
+    struct ggml_tensor * ffn_down_exps_rotation_meta = nullptr;
+    struct ggml_tensor * ffn_down_exps_awq_scale     = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;

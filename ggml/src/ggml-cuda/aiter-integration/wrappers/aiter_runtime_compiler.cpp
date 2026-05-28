@@ -197,7 +197,21 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
     const fs::path meta_path    = artifact_dir / "meta.json";
 
     if (fs::exists(hsaco_path) && fs::exists(meta_path)) {
-        return true;
+        // Trust the cache only if both artifacts are non-empty. Prior versions
+        // of this code returned true on existence alone, which trapped the
+        // caller when a previous compile left zero-byte stubs.
+        std::error_code ec_h, ec_m;
+        const auto hsaco_sz = fs::file_size(hsaco_path, ec_h);
+        const auto meta_sz  = fs::file_size(meta_path,  ec_m);
+        if (!ec_h && !ec_m && hsaco_sz > 0 && meta_sz > 0) {
+            return true;
+        }
+        std::fprintf(stderr, "aiter::Registry: cached artifacts at %s are empty/unreadable — recompiling\n",
+                     artifact_dir.c_str());
+        std::error_code rm_ec;
+        fs::remove(hsaco_path, rm_ec);
+        fs::remove(meta_path,  rm_ec);
+        // fall through to recompile
     }
 
     if (compile_script_.empty()) {
@@ -236,7 +250,11 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
         << " --num-warps "   << spec.num_warps
         << " --num-stages "  << spec.num_stages
         << " --out-dir "     << shellq(artifact_dir.string())
-        << " >&2";  // route stdout to stderr (the helper logs progress on stderr)
+        // Capture script stdout+stderr to a per-artifact log file. The C++
+        // side reads this back on failure so we can diagnose without losing
+        // the script's diagnostics when the parent aborts.
+        << " > "             << shellq((artifact_dir / "compile.log").string())
+        << " 2>&1";
 
     const std::string cmd_str = cmd.str();
     std::fprintf(stderr, "aiter::Registry: compiling %s (%s)\n",
@@ -244,15 +262,32 @@ bool Registry::ensure_on_disk(const std::string & cache_key, const KernelSpec & 
     // MAD-214 debug: dump full signature on failure to help diagnose
     // Triton-side errors (hint parsing, arg-count mismatch, etc.).
     std::fprintf(stderr, "aiter::Registry: signature = %s\n", spec.signature.c_str());
+    std::fflush(stderr);  // ensure visible if compile aborts
     int rc = std::system(cmd_str.c_str());
+    std::fprintf(stderr, "aiter::Registry: compile script rc=%d for %s\n", rc, cache_key.c_str());
+    std::fflush(stderr);
     if (rc != 0) {
-        std::fprintf(stderr, "aiter::Registry: compile script returned %d\n", rc);
         return false;
     }
 
     if (!fs::exists(hsaco_path) || !fs::exists(meta_path)) {
         std::fprintf(stderr, "aiter::Registry: compile reported success but artifacts missing in %s\n",
                      artifact_dir.c_str());
+        return false;
+    }
+    // Defense against corrupt-artifact trap: treat zero-byte files as missing,
+    // so a future run won't read empty files as "already cached".
+    std::error_code ec_h, ec_m;
+    auto hsaco_sz = fs::file_size(hsaco_path, ec_h);
+    auto meta_sz  = fs::file_size(meta_path,  ec_m);
+    if (ec_h || ec_m || hsaco_sz == 0 || meta_sz == 0) {
+        std::fprintf(stderr, "aiter::Registry: compile produced zero-byte artifact (hsaco=%lld, meta=%lld) in %s — removing\n",
+                     (long long)(ec_h ? -1 : (long long)hsaco_sz),
+                     (long long)(ec_m ? -1 : (long long)meta_sz),
+                     artifact_dir.c_str());
+        std::error_code rm_ec;
+        fs::remove(hsaco_path, rm_ec);
+        fs::remove(meta_path,  rm_ec);
         return false;
     }
     return true;

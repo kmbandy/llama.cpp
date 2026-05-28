@@ -58,6 +58,40 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
+    // ml8-4 MoE sidecar loader (MAD-223 G.7). Mirrors the dense load_ml8_sidecars
+    // in qwen35.cpp but stacks centroids 3D across the n_expert axis. Rotation
+    // and AWQ are shared across experts in a (layer, kind) — the calibrator
+    // (ml8_to_gguf.py) enforces identical rotation_h_a / awq_scale per expert
+    // chunk, so the loader stores only one of each per tensor. All sidecars
+    // are TENSOR_NOT_REQUIRED — a non-ml8 weight returns early.
+    auto load_ml8_moe_sidecars = [&](
+            struct ggml_tensor * weight,
+            llm_tensor tensor_id,
+            int il_,
+            int64_t k_dim,
+            int64_t n_expert_,
+            struct ggml_tensor ** out_centroids,
+            struct ggml_tensor ** out_rotation_h_a,
+            struct ggml_tensor ** out_rotation_meta,
+            struct ggml_tensor ** out_awq_scale) {
+        if (!weight ||
+            (weight->type != GGML_TYPE_ML8_4 && weight->type != GGML_TYPE_ML8_4_SOA)) {
+            return;
+        }
+        *out_centroids = create_tensor(tn(tensor_id, "centroids", il_),
+                                       { 16, k_dim / 64, n_expert_ }, TENSOR_NOT_REQUIRED);
+        *out_awq_scale = create_tensor(tn(tensor_id, "awq_scale", il_),
+                                       { k_dim }, TENSOR_NOT_REQUIRED);
+        const auto * h_a_meta = ml.get_tensor_meta(tn(tensor_id, "rotation_h_a", il_).str().c_str());
+        if (h_a_meta != nullptr) {
+            const int64_t a = h_a_meta->ne[0];
+            *out_rotation_h_a  = create_tensor(tn(tensor_id, "rotation_h_a",  il_),
+                                               { a, a }, TENSOR_NOT_REQUIRED);
+            *out_rotation_meta = create_tensor(tn(tensor_id, "rotation_meta", il_),
+                                               { 4 }, TENSOR_NOT_REQUIRED);
+        }
+    };
+
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
 
@@ -103,6 +137,18 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
+        // ml8-4 sidecars for the three routed-expert weight tensors. No-op if
+        // the expert tensors aren't ml8-typed.
+        load_ml8_moe_sidecars(layer.ffn_gate_exps, LLM_TENSOR_FFN_GATE_EXPS, il, n_embd, n_expert,
+                              &layer.ffn_gate_exps_centroids, &layer.ffn_gate_exps_rotation_h_a,
+                              &layer.ffn_gate_exps_rotation_meta, &layer.ffn_gate_exps_awq_scale);
+        load_ml8_moe_sidecars(layer.ffn_up_exps,   LLM_TENSOR_FFN_UP_EXPS,   il, n_embd, n_expert,
+                              &layer.ffn_up_exps_centroids,   &layer.ffn_up_exps_rotation_h_a,
+                              &layer.ffn_up_exps_rotation_meta,   &layer.ffn_up_exps_awq_scale);
+        load_ml8_moe_sidecars(layer.ffn_down_exps, LLM_TENSOR_FFN_DOWN_EXPS, il, n_ff_exp, n_expert,
+                              &layer.ffn_down_exps_centroids, &layer.ffn_down_exps_rotation_h_a,
+                              &layer.ffn_down_exps_rotation_meta, &layer.ffn_down_exps_awq_scale);
+
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -129,6 +175,17 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+
+        // ml8-4 sidecars for the MTP block's routed experts. No-op if not ml8-typed.
+        load_ml8_moe_sidecars(layer.ffn_gate_exps, LLM_TENSOR_FFN_GATE_EXPS, il, n_embd, n_expert,
+                              &layer.ffn_gate_exps_centroids, &layer.ffn_gate_exps_rotation_h_a,
+                              &layer.ffn_gate_exps_rotation_meta, &layer.ffn_gate_exps_awq_scale);
+        load_ml8_moe_sidecars(layer.ffn_up_exps,   LLM_TENSOR_FFN_UP_EXPS,   il, n_embd, n_expert,
+                              &layer.ffn_up_exps_centroids,   &layer.ffn_up_exps_rotation_h_a,
+                              &layer.ffn_up_exps_rotation_meta,   &layer.ffn_up_exps_awq_scale);
+        load_ml8_moe_sidecars(layer.ffn_down_exps, LLM_TENSOR_FFN_DOWN_EXPS, il, n_ff_exp, n_expert,
+                              &layer.ffn_down_exps_centroids, &layer.ffn_down_exps_rotation_h_a,
+                              &layer.ffn_down_exps_rotation_meta, &layer.ffn_down_exps_awq_scale);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
@@ -500,21 +557,41 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+    const auto & layer = model.layers[il];
+    const bool is_ml8_moe = layer.ffn_gate_exps &&
+                            (layer.ffn_gate_exps->type == GGML_TYPE_ML8_4 ||
+                             layer.ffn_gate_exps->type == GGML_TYPE_ML8_4_SOA) &&
+                            layer.ffn_gate_exps_centroids != nullptr;
+
+    ggml_tensor * moe_out;
+    if (is_ml8_moe) {
+        moe_out = build_moe_ffn_ml8(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,   layer.ffn_up_exps_centroids,
+            layer.ffn_up_exps_rotation_h_a,   layer.ffn_up_exps_awq_scale,
+            layer.ffn_gate_exps, layer.ffn_gate_exps_centroids,
+            layer.ffn_gate_exps_rotation_h_a, layer.ffn_gate_exps_awq_scale,
+            layer.ffn_down_exps, layer.ffn_down_exps_centroids,
+            layer.ffn_down_exps_rotation_h_a, layer.ffn_down_exps_awq_scale,
+            n_expert, n_expert_used,
+            /* norm_w */ true, hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il);
+    } else {
+        moe_out = build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            nullptr, layer.ffn_gate_up_exps,
+            layer.ffn_up_exps_s,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation

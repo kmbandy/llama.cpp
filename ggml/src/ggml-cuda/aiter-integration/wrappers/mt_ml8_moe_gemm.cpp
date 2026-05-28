@@ -23,6 +23,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -171,24 +172,33 @@ struct CachedHandle {
     hipError_t                  init_err    = hipSuccess;
 };
 
-CachedHandle & get_cached() {
-    static CachedHandle c;
-    return c;
+// Multi-shape cache (MAD-223 G.7 Phase E). MoE forward has at least two
+// distinct (M, N, K, group_size, ...) shapes per layer: gate/up vs down.
+// Each unique shape gets its own compiled handle, looked up by memcmp on
+// the shape struct (matches the previous single-shape check).
+std::vector<CachedHandle> & get_cache() {
+    static std::vector<CachedHandle> cache;
+    return cache;
+}
+
+CachedHandle * find_or_alloc(const mt_ml8_moe_gemm_shape_t & shape) {
+    auto & cache = get_cache();
+    for (auto & c : cache) {
+        if (std::memcmp(&c.shape, &shape, sizeof(shape)) == 0) {
+            return &c;
+        }
+    }
+    cache.emplace_back();
+    return &cache.back();
 }
 
 hipError_t ensure_initialized(const mt_ml8_moe_gemm_shape_t & shape) {
-    CachedHandle & c = get_cached();
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
-    if (c.initialized) {
-        if (std::memcmp(&c.shape, &shape, sizeof(shape)) != 0) {
-            std::fprintf(stderr,
-                "mt_ml8_moe_gemm: shape changed across calls. "
-                "Single-process MoE cache supports one shape only. "
-                "Call mt_ml8_moe_gemm_reset_cache() between shapes.\n");
-            return hipErrorInvalidValue;
-        }
-        return c.init_err;
+
+    CachedHandle * cp = find_or_alloc(shape);
+    if (cp->initialized) {
+        return cp->init_err;
     }
 
     const std::string target = detect_hip_target();
@@ -209,16 +219,17 @@ hipError_t ensure_initialized(const mt_ml8_moe_gemm_shape_t & shape) {
     spec.num_warps  = env_nw;
     spec.num_stages = env_ns;
 
-    c.handle = reg.get_or_compile(spec);
-    if (!c.handle) {
-        std::fprintf(stderr, "mt_ml8_moe_gemm: kernel compile failed\n");
-        c.init_err = hipErrorInvalidValue;
+    cp->handle = reg.get_or_compile(spec);
+    if (!cp->handle) {
+        std::fprintf(stderr, "mt_ml8_moe_gemm: kernel compile failed (shape #%zu)\n",
+                     get_cache().size() - 1);
+        cp->init_err = hipErrorInvalidValue;
     } else {
-        c.init_err = hipSuccess;
+        cp->init_err = hipSuccess;
     }
-    c.shape       = shape;
-    c.initialized = true;
-    return c.init_err;
+    cp->shape       = shape;
+    cp->initialized = true;
+    return cp->init_err;
 }
 
 }  // namespace
@@ -249,8 +260,8 @@ extern "C" hipError_t mt_ml8_moe_gemm(hipStream_t stream, const mt_ml8_moe_gemm_
     hipError_t init_rc = ensure_initialized(args->shape);
     if (init_rc != hipSuccess) return init_rc;
 
-    CachedHandle & c = get_cached();
-    if (!c.handle) return hipErrorInvalidValue;
+    CachedHandle * cp = find_or_alloc(args->shape);
+    if (!cp || !cp->handle) return hipErrorInvalidValue;
 
     // Grid: total_tiles * SPLIT_K (1D dispatch; matches Phase B.5 test)
     const unsigned int grid_x =
@@ -330,15 +341,11 @@ extern "C" hipError_t mt_ml8_moe_gemm(hipStream_t stream, const mt_ml8_moe_gemm_
         &p_global_scratch, &p_profile_scratch,
     };
 
-    return c.handle->launch(stream, grid_x, 1, 1, kernel_args);
+    return cp->handle->launch(stream, grid_x, 1, 1, kernel_args);
 }
 
 extern "C" void mt_ml8_moe_gemm_reset_cache(void) {
-    CachedHandle & c = get_cached();
     static std::mutex mu;
     std::lock_guard<std::mutex> g(mu);
-    c.shape       = {};
-    c.handle      = nullptr;
-    c.initialized = false;
-    c.init_err    = hipSuccess;
+    get_cache().clear();
 }

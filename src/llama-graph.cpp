@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-ml8.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1792,6 +1794,156 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cb(moe_out, "ffn_moe_out", il);
 
+    return moe_out;
+}
+
+// ml8-4 MoE FFN — same routing/aggregation as build_moe_ffn but each routed
+// expert matmul is the ml8 path: apply input transform (AWQ * Kronecker
+// rotation) then ggml_ml8_mul_mat_id with per-expert centroid LUT sidecar.
+// Only the SILU/SWIGLU op-type is implemented (covers Qwen3.5/3.6 MoE).
+ggml_tensor * llm_graph_context::build_moe_ffn_ml8(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * up_exps,
+         ggml_tensor * up_exps_centroids,
+         ggml_tensor * up_exps_rotation_h_a,
+         ggml_tensor * up_exps_awq_scale,
+         ggml_tensor * gate_exps,
+         ggml_tensor * gate_exps_centroids,
+         ggml_tensor * gate_exps_rotation_h_a,
+         ggml_tensor * gate_exps_awq_scale,
+         ggml_tensor * down_exps,
+         ggml_tensor * down_exps_centroids,
+         ggml_tensor * down_exps_rotation_h_a,
+         ggml_tensor * down_exps_awq_scale,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+                bool   norm_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il) const {
+    auto is_ml8 = [](const ggml_tensor * t) {
+        return t && (t->type == GGML_TYPE_ML8_4 || t->type == GGML_TYPE_ML8_4_SOA);
+    };
+    GGML_ASSERT(is_ml8(up_exps)   && "ml8 moe: up_exps must be ml8 (AOS or SOA)");
+    GGML_ASSERT(is_ml8(gate_exps) && "ml8 moe: gate_exps must be ml8 (AOS or SOA)");
+    GGML_ASSERT(is_ml8(down_exps) && "ml8 moe: down_exps must be ml8 (AOS or SOA)");
+    GGML_ASSERT(up_exps_centroids   && "ml8 moe: up_exps centroids sidecar missing");
+    GGML_ASSERT(gate_exps_centroids && "ml8 moe: gate_exps centroids sidecar missing");
+    GGML_ASSERT(down_exps_centroids && "ml8 moe: down_exps centroids sidecar missing");
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+
+    // ── Routing: identical to build_moe_ffn (softmax / sigmoid gate → top-k).
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur);
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            probs = ggml_soft_max(ctx0, logits); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            probs = ggml_sigmoid(ctx0, logits); break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+            probs = logits; break;
+        default:
+            GGML_ABORT("ml8 moe: unsupported gating_op");
+    }
+    cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * selected_experts = ggml_top_k(ctx0, probs, n_expert_used);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts);
+    cb(weights, "ffn_moe_weights", il);
+
+    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        weights = ggml_soft_max(ctx0, weights);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        weights = ggml_div(ctx0, weights, weights_sum);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+    }
+    if (w_scale != 0.0f && w_scale != 1.0f) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+    }
+
+    ggml_build_forward_expand(gf, weights);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // ── Input transform helper: AWQ multiply (per-channel) then Kronecker
+    // rotation. Matches the dense ml8 apply_input_xform in qwen35.cpp:540+.
+    auto apply_xform = [&](ggml_tensor * x, ggml_tensor * awq, ggml_tensor * h_a) {
+        if (awq) {
+            x = ggml_mul(ctx0, x, awq);
+        }
+        if (h_a) {
+            const int64_t a = h_a->ne[0];
+            const int64_t b = x->ne[0] / a;
+            x = ggml_ml8_apply_rotation(ctx0, x, h_a, a, b);
+        }
+        return x;
+    };
+
+    // ── Up + Gate matmuls (split path — no merged gate_up_exps in ml8 yet).
+    // ggml_ml8_mul_mat_id requires x of shape [K, n_expert_used, n_tokens] — no
+    // auto-broadcast like standard mul_mat_id. cur is [n_embd, 1, n_tokens]
+    // so we repeat it explicitly. Apply the AWQ+rotation BEFORE repeat (cheap:
+    // transform once instead of n_expert_used times; result is identical since
+    // both ops are per-input-channel / per-token, not per-expert).
+    ggml_tensor * up_in_xf = apply_xform(cur, up_exps_awq_scale, up_exps_rotation_h_a);
+    ggml_tensor * up_in = ggml_repeat_4d(ctx0, up_in_xf, n_embd, n_expert_used, n_tokens, 1);
+    ggml_tensor * up = ggml_ml8_mul_mat_id(ctx0, up_exps, up_exps_centroids, up_in, selected_experts);
+    cb(up, "ffn_moe_up", il);
+
+    ggml_tensor * gate_in_xf = apply_xform(cur, gate_exps_awq_scale, gate_exps_rotation_h_a);
+    ggml_tensor * gate_in = ggml_repeat_4d(ctx0, gate_in_xf, n_embd, n_expert_used, n_tokens, 1);
+    ggml_tensor * gate = ggml_ml8_mul_mat_id(ctx0, gate_exps, gate_exps_centroids, gate_in, selected_experts);
+    cb(gate, "ffn_moe_gate", il);
+
+    // ── SwiGLU (Qwen3.5/3.6 always uses LLM_FFN_SILU with gate present).
+    cur = ggml_swiglu_split(ctx0, gate, up);
+    cb(cur, "ffn_moe_swiglu", il);
+
+    // ── Down matmul.
+    ggml_tensor * down_in = apply_xform(cur, down_exps_awq_scale, down_exps_rotation_h_a);
+    ggml_tensor * experts = ggml_ml8_mul_mat_id(ctx0, down_exps, down_exps_centroids, down_in, selected_experts);
+    cb(experts, "ffn_moe_down", il);
+
+    // ── Weight by router probs, then aggregate per expert.
+    experts = ggml_mul(ctx0, experts, weights);
+    cb(experts, "ffn_moe_weighted", il);
+
+    ggml_build_forward_expand(gf, experts);
+
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+    assert(n_expert_used > 0);
+
+    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    ggml_tensor * moe_out = cur_experts[0];
+    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        ggml_build_forward_expand(gf, moe_out);
+    }
+
+    if (hparams.n_expert_used == 1) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    cb(moe_out, "ffn_moe_out", il);
     return moe_out;
 }
 

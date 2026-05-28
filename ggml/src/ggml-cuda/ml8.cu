@@ -896,7 +896,13 @@ void ggml_cuda_op_ml8_apply_rotation(
     GGML_ASSERT(dst->ne[0] == d_dim && dst->ne[1] == x->ne[1]);
 
     cudaStream_t stream = ctx.stream();
-    const int n_tokens = (int) x->ne[1];
+    // MAD-244: rotation is per-row; the "n_tokens" the kernel needs is the
+    // total number of rows = product of all dims except ne[0]. For dense
+    // input [d_dim, n_tokens] this equals ne[1]; for MoE input
+    // [d_dim, n_used, n_tokens] it equals ne[1] * ne[2]. Without this
+    // generalization the kernel only rotates the first ne[1] rows and leaves
+    // the rest unrotated — silently corrupting MoE inference.
+    const int n_tokens = (int) (x->ne[1] * x->ne[2] * x->ne[3]);
     const size_t total_elems = (size_t) n_tokens * (size_t) d_dim;
 
     // G.6.g.C: dump rotation input (pre-rotation activations) on first call.
@@ -995,60 +1001,68 @@ const ml8_weight_repack_moe_t * ggml_cuda_ml8_get_or_repack_moe(
     }
     const int32_t group_size = QK_ML8;
     const int32_t n_groups_k = K / group_size;
-    const void *  key        = w->data;
 
-    {
-        std::lock_guard<std::mutex> lock(g_ml8_moe_cache_mu);
-        auto it = g_ml8_moe_cache.find(key);
-        if (it != g_ml8_moe_cache.end()) {
-            return &it->second.info;
-        }
-    }
+    // MAD-244: streaming (no per-weight cache) repack. The unbounded cache
+    // version eats ~150 MB per MoE-expert tensor and OOMs at 35B+ scale
+    // (40 layers × 3 = ~18 GB total). For the AOS legacy path we use ONE
+    // shared b_packed/b_scale buffer pair sized to the largest weight seen
+    // so far and re-repack on every call. This makes the path A/B-comparable
+    // with ML8_4_SOA without exhausting VRAM. Slower than caching for
+    // inference, fine for PPL validation.
+    static std::mutex g_buf_mu;
+    static void *      g_buf_packed         = nullptr;
+    static float *     g_buf_scale          = nullptr;
+    static size_t      g_buf_packed_cap     = 0;
+    static size_t      g_buf_scale_cap      = 0;
+    static ml8_weight_repack_moe_t g_buf_info{};
 
     const size_t b_packed_bytes = (size_t) n_experts * (size_t) (K / 2) * (size_t) N;
     const size_t b_scale_bytes  = (size_t) n_experts * (size_t) n_groups_k * (size_t) N * sizeof(float);
 
-    void *  d_b_packed = nullptr;
-    float * d_b_scale  = nullptr;
-    cudaError_t err = cudaMalloc(&d_b_packed, b_packed_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[ml8-moe] cudaMalloc(b_packed=%zu) failed: %s\n",
-                b_packed_bytes, cudaGetErrorString(err));
-        return nullptr;
+    std::lock_guard<std::mutex> lock(g_buf_mu);
+    if (b_packed_bytes > g_buf_packed_cap) {
+        if (g_buf_packed) cudaFree(g_buf_packed);
+        g_buf_packed = nullptr;
+        cudaError_t err = cudaMalloc(&g_buf_packed, b_packed_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[ml8-moe] cudaMalloc(b_packed=%zu) failed: %s\n",
+                    b_packed_bytes, cudaGetErrorString(err));
+            g_buf_packed_cap = 0;
+            return nullptr;
+        }
+        g_buf_packed_cap = b_packed_bytes;
     }
-    err = cudaMalloc((void **) &d_b_scale, b_scale_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[ml8-moe] cudaMalloc(b_scale=%zu) failed: %s\n",
-                b_scale_bytes, cudaGetErrorString(err));
-        cudaFree(d_b_packed);
-        return nullptr;
+    if (b_scale_bytes > g_buf_scale_cap) {
+        if (g_buf_scale) cudaFree(g_buf_scale);
+        g_buf_scale = nullptr;
+        cudaError_t err = cudaMalloc((void **) &g_buf_scale, b_scale_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[ml8-moe] cudaMalloc(b_scale=%zu) failed: %s\n",
+                    b_scale_bytes, cudaGetErrorString(err));
+            g_buf_scale_cap = 0;
+            return nullptr;
+        }
+        g_buf_scale_cap = b_scale_bytes;
     }
 
     ggml_cuda_ml8_repack_blocks_moe(
-        stream, w->data, d_b_packed, d_b_scale, N, K, group_size, n_experts);
-    err = cudaGetLastError();
+        stream, w->data, g_buf_packed, g_buf_scale, N, K, group_size, n_experts);
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[ml8-moe] repack kernel launch failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_b_packed); cudaFree(d_b_scale);
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(g_ml8_moe_cache_mu);
-    auto it = g_ml8_moe_cache.find(key);
-    if (it != g_ml8_moe_cache.end()) {
-        cudaFree(d_b_packed); cudaFree(d_b_scale);
-        return &it->second.info;
-    }
-    moe_cache_entry_t entry{};
-    entry.info.b_packed   = d_b_packed;
-    entry.info.b_scale    = d_b_scale;
-    entry.info.N          = N;
-    entry.info.K          = K;
-    entry.info.n_groups_k = n_groups_k;
-    entry.info.group_size = group_size;
-    entry.info.n_experts  = n_experts;
-    auto [ins_it, _ok] = g_ml8_moe_cache.emplace(key, entry);
-    return &ins_it->second.info;
+    g_buf_info.b_packed   = g_buf_packed;
+    g_buf_info.b_scale    = g_buf_scale;
+    g_buf_info.N          = N;
+    g_buf_info.K          = K;
+    g_buf_info.n_groups_k = n_groups_k;
+    g_buf_info.group_size = group_size;
+    g_buf_info.n_experts  = n_experts;
+    (void) g_ml8_moe_cache_mu;
+    (void) g_ml8_moe_cache;
+    return &g_buf_info;
 }
 
 // ─── Output scatter kernel (sorted bf16 → dst fp32 via InvGather) ──────
@@ -1083,7 +1097,7 @@ void ggml_cuda_op_ml8_mul_mat_id(
     const ggml_tensor * ids  = dst->src[3];
 
     GGML_ASSERT(w && cent && x && ids);
-    GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
+    GGML_ASSERT(w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_4_SOA);
     GGML_ASSERT(cent->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(x->type    == GGML_TYPE_F32);
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
@@ -1115,9 +1129,45 @@ void ggml_cuda_op_ml8_mul_mat_id(
 
     cudaStream_t stream = ctx.stream();
 
-    // ── 1. Per-expert weight repack (cached).
-    const ml8_weight_repack_moe_t * repack = ggml_cuda_ml8_get_or_repack_moe(stream, w);
-    GGML_ASSERT(repack != nullptr);
+    // ── 1. Per-expert weight access. Two paths:
+    //
+    //   * GGML_TYPE_ML8_4_SOA — the GGUF stores the kernel-native SOA layout
+    //     directly (per expert: K/2 × N bytes of b_packed followed by
+    //     n_groups_k × N × 4 bytes of b_scale). We just compute the two
+    //     pointers and the per-expert byte stride, no runtime repack, no
+    //     cache, no extra VRAM. This is the only path used by GGUFs written
+    //     after MAD-244.
+    //
+    //   * GGML_TYPE_ML8_4 (legacy AOS blocks) — fall back to the
+    //     runtime repack cache. Kept for compatibility with pre-MAD-244
+    //     MoE GGUFs; preferred for tests/dense models that already use the
+    //     block layout. Note: at full 35B+ MoE scale this path can exhaust
+    //     VRAM (cache grows to 18+ GB) — see the SOA design doc.
+    const void *  w_packed_ptr     = nullptr;
+    const float * w_scale_ptr      = nullptr;
+    int32_t       stride_w_e_runtime    = 0;
+    int32_t       stride_w_bs_e_runtime = 0;
+
+    if (w->type == GGML_TYPE_ML8_4_SOA) {
+        const size_t b_packed_bytes_e = (size_t)(K / 2) * (size_t) N;
+        const size_t b_scale_bytes_e  = (size_t) n_groups_k * (size_t) N * sizeof(float);
+        const size_t per_expert_bytes = b_packed_bytes_e + b_scale_bytes_e;
+        GGML_ASSERT(per_expert_bytes % sizeof(float) == 0
+                    && "ML8_4_SOA per-expert payload must be float-aligned");
+
+        const uint8_t * base = (const uint8_t *) w->data;
+        w_packed_ptr           = base;                                       // expert 0's b_packed
+        w_scale_ptr            = (const float *)(base + b_packed_bytes_e);   // expert 0's b_scale
+        stride_w_e_runtime     = (int32_t) per_expert_bytes;                 // bytes between experts in b_packed
+        stride_w_bs_e_runtime  = (int32_t)(per_expert_bytes / sizeof(float)); // fp32 elements between experts in b_scale
+    } else {
+        const ml8_weight_repack_moe_t * repack = ggml_cuda_ml8_get_or_repack_moe(stream, w);
+        GGML_ASSERT(repack != nullptr);
+        w_packed_ptr          = repack->b_packed;
+        w_scale_ptr           = repack->b_scale;
+        stride_w_e_runtime    = (K / 2) * N;
+        stride_w_bs_e_runtime = n_groups_k * N;
+    }
 
     // ── 2. Build routing tensors host-side from ids.
     // Mirrors the ggml-cuda mmq.cu pattern: download ids, bin by expert,
@@ -1147,14 +1197,21 @@ void ggml_cuda_op_ml8_mul_mat_id(
     const int32_t grid_m  = n_total / BM;
     const int32_t grid_n  = N / MT_ML8_MOE_BLOCK_N;
 
-    // Bin-sort (s, t) flat indices by expert.
+    // Bin-sort (s, t) flat indices by expert. The kernel does
+    //   X_row = GatherIndx[sorted_pos] / N_EXPTS_ACT
+    // (see kernels/moe_op_gemm_ml8.py line ~375) — designed for the case
+    // where X stores ONE row per token and pair_idx = token * N_EXPTS_ACT + s.
+    // Our X is quantized per-pair (because the post-swiglu down input is
+    // genuinely per-pair, not per-token replicated), so we want the kernel
+    // to recover the literal pair index. Multiplying the stored gather value
+    // by n_used makes the kernel's division a no-op and gives pair_idx back.
     std::vector<int32_t> h_gather(n_total, 0);   // padding slots get safe value (kernel masks via hist)
     std::vector<int32_t> h_inv   (n_pairs, 0);
     std::vector<int32_t> counter (n_experts, 0);
     for (int32_t i = 0; i < n_pairs; ++i) {
         const int32_t e = h_ids[i];
         const int32_t pos = h_offs[e] + counter[e];
-        h_gather[pos] = i;
+        h_gather[pos] = i * n_used;   // see N_EXPTS_ACT division above
         h_inv[i]      = pos;
         counter[e]    += 1;
     }
@@ -1217,9 +1274,9 @@ void ggml_cuda_op_ml8_mul_mat_id(
 
     args.y                  = y_sorted.get();
     args.x_fp8              = a_fp8.get();
-    args.w_packed           = repack->b_packed;
+    args.w_packed           = const_cast<void *>(w_packed_ptr);
     args.x_scale_fp32       = a_scale.get();
-    args.w_scale_fp32       = repack->b_scale;
+    args.w_scale_fp32       = const_cast<float *>(w_scale_ptr);
     args.centroid_lut_fp8   = cent->data;
     args.bias               = nullptr;
     args.gammas             = nullptr;
@@ -1245,10 +1302,10 @@ void ggml_cuda_op_ml8_mul_mat_id(
     args.stride_x_k        = 1;
     args.stride_x_bs_m     = 1;
     args.stride_x_bs_k     = 0;
-    args.stride_w_e        = (K / 2) * N;
+    args.stride_w_e        = stride_w_e_runtime;
     args.stride_w_k        = N;
     args.stride_w_n        = 1;
-    args.stride_w_bs_e     = n_groups_k * N;
+    args.stride_w_bs_e     = stride_w_bs_e_runtime;
     args.stride_w_bs_k     = N;
     args.stride_w_bs_n     = 1;
     args.stride_b_e        = 0;

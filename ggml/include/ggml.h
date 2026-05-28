@@ -437,7 +437,8 @@ extern "C" {
         GGML_TYPE_TURBO4_FP8_BS256 = 47, // MAD-214: turbo-FP8 KV cache, 4-bit centroid idx + sign + fp16 scale, BS=256, decoded via E4M3 LUT (per-(kv,layer) runtime LUT)
         GGML_TYPE_ML8_4   = 48, // MAD-223 Phase G: ml8-4 weight quant, 4-bit centroid idx + fp32 scale per 64-element block, centroid LUT in per-K-group sidecar tensor
         GGML_TYPE_F8_E4M3 = 49, // MAD-223 Phase G: fp8 e4m3 1-byte storage, used as sidecar dtype for ml8 centroids
-        GGML_TYPE_COUNT   = 50,
+        GGML_TYPE_ML8_4_SOA = 50, // MAD-223 Phase G.7 / MAD-244: ml8-4 with stored-as-repacked SOA layout (b_packed bytes followed by b_scale fp32 per expert row). Same numerics as ML8_4; eliminates the runtime MoE repack cache.
+        GGML_TYPE_COUNT   = 51,
     };
 
     // precision

@@ -3556,6 +3556,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
             }
         }
+        // MAD-244: ml8 MoE dispatch downloads ids host-side to bin by expert
+        // (see ggml_cuda_op_ml8_mul_mat_id in ml8.cu) — incompatible with
+        // graph capture, which forbids hipStreamSynchronize. Always disable
+        // capture when an ml8 MoE op is present.
+        if (node->op == GGML_OP_ML8_MUL_MAT_ID) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to ml8 MoE host-side routing\n", __func__);
+#endif
+        }
 
         if (!use_cuda_graph) {
             break;
@@ -5529,7 +5539,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const ggml_tensor * x    = op->src[2];
                 const ggml_tensor * ids  = op->src[3];
                 if (!w || !cent || !x || !ids) return false;
-                if (w->type    != GGML_TYPE_ML8_4)    return false;
+                if (w->type != GGML_TYPE_ML8_4 && w->type != GGML_TYPE_ML8_4_SOA) return false;
                 if (cent->type != GGML_TYPE_F8_E4M3)  return false;
                 if (x->type    != GGML_TYPE_F32)      return false;
                 if (ids->type  != GGML_TYPE_I32)      return false;

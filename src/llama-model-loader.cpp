@@ -912,9 +912,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     }
     // MAD-223 G.7: same trick for the MoE path. LLM_TENSOR_INFOS tags
     // FFN_GATE_EXPS/UP_EXPS/DOWN_EXPS with MUL_MAT_ID; swap to ML8_MUL_MAT_ID
-    // when the underlying weight is ml8_4 so the backend probe asks the
-    // right question.
-    if (op == GGML_OP_MUL_MAT_ID && w->type == GGML_TYPE_ML8_4) {
+    // when the underlying weight is ml8_4 (AOS or SOA) so the backend probe
+    // asks the right question and the tensor lands on a GPU buffer.
+    if (op == GGML_OP_MUL_MAT_ID &&
+        (w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_4_SOA)) {
         op = GGML_OP_ML8_MUL_MAT_ID;
     }
 

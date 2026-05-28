@@ -26,13 +26,32 @@ and the rationale for the sidecar approach.
 from __future__ import annotations
 
 import argparse
+import mmap as _mmap_mod
+import os
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+
+
+def _advise_dontneed(fd: int, offset: int, length: int) -> None:
+    """Tell the kernel we won't re-read this byte range — drop its page cache.
+
+    Critical for converting large base GGUFs (35B+ class) on RAM-constrained
+    boxes. Without this, sequentially reading every tensor in a 71 GB GGUF
+    keeps all those pages hot in the page cache, pushing other processes
+    (e.g. a running inference server) into swap and risking an OOM kill.
+    """
+    if not hasattr(os, "posix_fadvise") or fd < 0:
+        return
+    try:
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"))
@@ -148,6 +167,59 @@ def pack_ml8_blocks(indices: torch.Tensor, scales: torch.Tensor) -> np.ndarray:
     return out
 
 
+def pack_ml8_blocks_soa(indices: torch.Tensor, scales: torch.Tensor) -> bytes:
+    """Pack one expert's ml8 indices + per-group scales into the stored-as-repacked
+    SOA byte layout consumed directly by the AITER MoE GEMM kernel — no runtime
+    repack needed.
+
+    Layout (per expert):
+        bytes [0                .. K/2 × N - 1]                = b_packed
+        bytes [K/2 × N          .. K/2 × N + n_groups_k × N × 4 - 1] = b_scale
+
+    b_packed is uint8 in (K/2, N) row-major. b_scale is fp32 in
+    (n_groups_k, N) row-major. These are the exact arrays that
+    `ggml_cuda_ml8_repack_blocks_moe` would produce at runtime from the AOS
+    block layout — pre-computing them in the GGUF eliminates the runtime
+    transform + cache.
+
+    Args:
+        indices: [N, K] int (values 0..15)
+        scales : [N, n_groups_k] fp32. K must be divisible by QK_ML8 = 64.
+
+    Returns:
+        Raw bytes of length N × K × 9 / 16 = same total as pack_ml8_blocks for
+        the corresponding AOS form.
+    """
+    if indices.dim() != 2:
+        raise ValueError(f"indices must be 2D, got {tuple(indices.shape)}")
+    N, K = indices.shape
+    if K % QK_ML8 != 0:
+        raise ValueError(f"K={K} not divisible by QK_ML8={QK_ML8}")
+    n_groups_k = K // QK_ML8
+    if scales.shape != (N, n_groups_k):
+        raise ValueError(
+            f"scales shape {tuple(scales.shape)} != expected ({N}, {n_groups_k})"
+        )
+
+    idx_np = indices.detach().cpu().contiguous().numpy().astype(np.uint8)
+    if (idx_np > 15).any() or (idx_np < 0).any():
+        raise ValueError(f"indices out of [0,15] range; min={idx_np.min()}, max={idx_np.max()}")
+    scales_np = scales.detach().cpu().contiguous().numpy().astype(np.float32)
+
+    # b_packed [K/2, N] uint8 — nibbles only.
+    # Pack each adjacent K-pair into one byte: lo nibble = idx at 2i,
+    # hi nibble = idx at 2i+1. Result has shape [N, K/2] in source order.
+    lo = idx_np[:, 0::2]                                       # [N, K/2]
+    hi = idx_np[:, 1::2]                                       # [N, K/2]
+    packed_NK2 = ((lo & 0x0F) | ((hi & 0x0F) << 4)).astype(np.uint8)  # [N, K/2]
+    b_packed = np.ascontiguousarray(packed_NK2.T)              # [K/2, N] row-major
+
+    # b_scale [n_groups_k, N] fp32 — scales only.
+    b_scale = np.ascontiguousarray(scales_np.T)                # [n_groups_k, N] row-major
+
+    return b_packed.tobytes() + b_scale.tobytes()
+
+
 def cast_centroids_to_fp8(centroids: torch.Tensor) -> np.ndarray:
     """Cast fp32 centroids [n_groups_k, N_CENTROIDS] → fp8 e4m3 byte array
     of the same shape. Uses PyTorch's `float8_e4m3fn` conversion (round-to-
@@ -244,10 +316,44 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
     print(f"[base] {base_gguf}  arch={arch!r}  "
           f"fields={len(reader.fields)}  tensors={len(reader.tensors)}")
 
+    # ── Memory-pressure mitigation for large bases (e.g. 35B-A3B = 71 GB GGUF):
+    # 1. Tell kernel sequential access pattern on the reader's mmap so it
+    #    doesn't aggressively keep pages hot once we've moved past them.
+    # 2. Pull the underlying file descriptor so we can issue per-tensor
+    #    POSIX_FADV_DONTNEED after each pass-through, which immediately
+    #    releases that tensor's page cache.
+    base_fd = -1
+    try:
+        underlying = reader.data._mmap  # numpy memmap → mmap.mmap
+        if hasattr(underlying, "madvise"):
+            try:
+                underlying.madvise(_mmap_mod.MADV_SEQUENTIAL)
+            except (OSError, ValueError):
+                pass
+        # Try to get fd via the file the memmap was opened from. numpy
+        # doesn't expose it cleanly; fall back to reopening the path RO.
+        try:
+            base_fd = os.open(str(base_gguf), os.O_RDONLY)
+            if hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(base_fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        except OSError:
+            base_fd = -1
+    except AttributeError:
+        pass
+
     blob_map = _build_blob_map(calib_dir)
     print(f"[blobs] {len(blob_map)} calibrated layers → ml8 tensors + sidecars")
 
-    writer = gguf.GGUFWriter(str(out_gguf), arch=arch)
+    # Spool tensor bytes to a temp file on the same disk as the output
+    # (NVMe) — keeps process heap bounded regardless of total output size.
+    # CRITICAL: do NOT let SpooledTemporaryFile default to /tmp if /tmp is
+    # tmpfs (CachyOS / many Linux distros) — that just moves the RAM cost.
+    out_dir = out_gguf.parent if out_gguf.parent != Path("") else Path(".")
+    tempfile.tempdir = str(out_dir)
+    print(f"[tempdir] tensor spool → {tempfile.tempdir} "
+          f"(use_temp_file=True keeps heap bounded)")
+
+    writer = gguf.GGUFWriter(str(out_gguf), arch=arch, use_temp_file=True)
 
     n_fields_copied = 0
     for name, field in reader.fields.items():
@@ -300,15 +406,37 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
                     raise ValueError(
                         f"{tensor.name}: expert {ei} scales shape mismatch")
 
-            # ── Main ML8_4 tensor ──────────────────────────────────────────
-            # Dense: packed bytes shape (N, n_groups_k*36).
-            # MoE:   packed bytes shape (n_experts, N, n_groups_k*36).
+            # ── Main ML8 tensor ────────────────────────────────────────────
+            # Dense (ML8_4 AOS): packed bytes shape (N, n_groups_k*36). The
+            # runtime layout transform is small (one tensor) so we keep this
+            # layout for the dense path.
+            # MoE (ML8_4_SOA): bytes per expert = K/2 × N nibbles + n_groups_k
+            # × N × 4 scales, in the AITER kernel's expected SOA layout. Stored
+            # this way to eliminate the runtime repack cache that doesn't fit
+            # in VRAM at 35B+ scale (MAD-244).
             if is_moe:
-                stacked = np.stack(
-                    [pack_ml8_blocks(b["indices"], b["scale_per_group"]) for b in blobs],
-                    axis=0)
-                writer.add_tensor(tensor.name, stacked,
-                                  raw_dtype=GGMLQuantizationType.ML8_4)
+                # K = indices.shape[1], N = indices.shape[0] (per expert).
+                K_logical = int(blobs[0]["indices"].shape[1])
+                N_per     = int(blobs[0]["indices"].shape[0])
+                K_bytes   = (K_logical * 9) // 16  # K * 0.5625 exactly
+                expert_payloads = [
+                    pack_ml8_blocks_soa(b["indices"], b["scale_per_group"])
+                    for b in blobs]
+                all_bytes = b"".join(expert_payloads)
+                # Sanity: total bytes match the (K, N, n_experts) tensor size.
+                expected = n_experts * N_per * K_bytes
+                if len(all_bytes) != expected:
+                    raise RuntimeError(
+                        f"{tensor.name}: SOA byte count {len(all_bytes)} != "
+                        f"expected {expected}")
+                # Shape order for gguf-py: (n_experts, N, K_bytes) gives GGUF
+                # shape (K, N, n_experts) after reversal. The ML8_4_SOA dtype
+                # tells the loader to treat the bytes as kernel-native SOA
+                # (b_packed then b_scale per expert), not as AOS blocks.
+                arr = np.frombuffer(all_bytes, dtype=np.uint8).reshape(
+                    n_experts, N_per, K_bytes)
+                writer.add_tensor(tensor.name, arr,
+                                  raw_dtype=GGMLQuantizationType.ML8_4_SOA)
                 n_moe += 1
             else:
                 packed = pack_ml8_blocks(indices0, scales0)
@@ -380,7 +508,16 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
                 writer.add_tensor(base + ".awq_scale", awq_np_ref.numpy())
                 n_awq += 1
         else:
-            writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
+            # Pass-through non-MLP tensor. Copy bytes from the mmap into a
+            # fresh allocation before handing to the writer (use_temp_file
+            # mode spools to disk on add_tensor, so this clone is consumed
+            # immediately, not held), then advise the kernel to drop the
+            # source pages from cache so the next tensor doesn't pile on.
+            cloned = np.ascontiguousarray(tensor.data)
+            writer.add_tensor(tensor.name, cloned, raw_dtype=tensor.tensor_type)
+            del cloned
+            if base_fd >= 0:
+                _advise_dontneed(base_fd, tensor.data_offset, tensor.n_bytes)
             n_copied += 1
 
     print(

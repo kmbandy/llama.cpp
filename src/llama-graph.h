@@ -905,6 +905,35 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr) const;
 
+    // ml8-4 MoE FFN (MAD-223 G.7). Same routing/aggregation as build_moe_ffn,
+    // but each expert mul_mat_id is replaced with apply_input_xform + ml8_mul_mat_id
+    // so the routed-expert weights are the ml8 packed format with centroid LUT
+    // and (optional) Kronecker rotation / AWQ scale applied to the input. Only
+    // the SILU/SWIGLU path is implemented (what Qwen3.5/3.6 MoE uses); other
+    // type_op values trip an assert. No biases, no per-expert scale, no merged
+    // gate_up — all features irrelevant to the current ml8 calibrator output.
+    ggml_tensor * build_moe_ffn_ml8(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * up_exps,
+             ggml_tensor * up_exps_centroids,
+             ggml_tensor * up_exps_rotation_h_a,
+             ggml_tensor * up_exps_awq_scale,
+             ggml_tensor * gate_exps,
+             ggml_tensor * gate_exps_centroids,
+             ggml_tensor * gate_exps_rotation_h_a,
+             ggml_tensor * gate_exps_awq_scale,
+             ggml_tensor * down_exps,
+             ggml_tensor * down_exps_centroids,
+             ggml_tensor * down_exps_rotation_h_a,
+             ggml_tensor * down_exps_awq_scale,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il) const;
+
     //
     // inputs
     //
