@@ -41,8 +41,10 @@ import functools
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -368,9 +370,16 @@ def _hf_param_to_gguf_name(arch_name: str, n_blocks: int) -> "callable":
         raise ValueError(f"resident loader: no MODEL_ARCH match for arch_name={arch_name!r}")
     name_map = get_tensor_name_map(arch_enum, n_blocks)
 
+    # Hand-rolled fallbacks for param paths the TensorNameMap doesn't carry
+    # in this transformers/gguf-py version. Qwen3.5 linear_attn has a 1-D
+    # `dt_bias` Parameter (Mamba-3 SSM time-step bias) whose HF stem doesn't
+    # match the SSM_DT key out of the box; map it manually.
+    _LINEAR_ATTN_DT_BIAS = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.dt_bias$")
+
     def lookup(param_path: str) -> str | None:
-        # TensorNameMap.get_name accepts the bare param path with optional
-        # suffix stripping; mirror convert_hf_to_gguf.py's call style.
+        m = _LINEAR_ATTN_DT_BIAS.match(param_path)
+        if m:
+            return f"blk.{m.group(1)}.ssm_dt.bias"
         for suffix in (".weight", ".bias", ""):
             if param_path.endswith(suffix) and suffix != "":
                 stem = param_path[: -len(suffix)]
@@ -682,6 +691,23 @@ def main():
                    help="(--secondary-device only) Fraction of experts to keep on "
                         "the primary device. Default 0.7 matches R9700(32GB)/6900XT(16GB) "
                         "VRAM ratio + the gfx1030 secondary being slower per FLOP.")
+    p.add_argument("--task-e", type=int, default=128,
+                   help="Expert-axis chunk size for task-queue MoE calibration. "
+                        "Smaller = more tasks, more parallelism, less VRAM per task.")
+    p.add_argument("--workers-primary", type=int, default=2,
+                   help="Number of concurrent workers on --device.")
+    p.add_argument("--workers-secondary", type=int, default=1,
+                   help="Number of concurrent workers on --secondary-device.")
+    p.add_argument("--group-size-down", type=int, default=None,
+                   help="Override --group-size for down_proj kind only (post-SwiGLU "
+                        "activations have heavier dynamic range, may need finer "
+                        "grouping). If unset, uses --group-size for all kinds.")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Disable checkpoint resume. By default the script will: "
+                        "(a) load cached Hessians from {output_dir}/hessians.pt if "
+                        "params match, (b) skip per-expert blobs that already exist "
+                        "on disk, (c) reuse prior manifest results. --no-resume "
+                        "forces a clean run from scratch.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -797,13 +823,34 @@ def main():
     print(f"[targets] {len(targets)} linears to quantize")
 
     manifest = {"model": args.model, "gguf": args.gguf, "args": vars(args), "results": []}
+    manifest_path = Path(args.output_dir) / "manifest.json"
+    hessian_cache_path = Path(args.output_dir) / "hessians.pt"
 
-    if args.eval_ppl:
+    # ─── Resume: load prior manifest results + ppl_baseline if available ───
+    if not args.no_resume and manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                prior = json.load(f)
+            if prior.get("model") == args.model and prior.get("gguf") == args.gguf:
+                manifest["results"] = prior.get("results", [])
+                if "ppl_baseline" in prior:
+                    manifest["ppl_baseline"] = prior["ppl_baseline"]
+                print(f"[resume] loaded {len(manifest['results'])} prior results "
+                      f"from {manifest_path}")
+            else:
+                print(f"[resume] prior manifest model/gguf mismatch — ignoring")
+        except Exception as e:
+            print(f"[resume] failed to load prior manifest ({e}) — starting fresh")
+
+    if args.eval_ppl and "ppl_baseline" not in manifest:
         print(f"\n[ppl-baseline] computing f16 baseline PPL (paged forward path)...")
         baseline = eval_ppl_wikitext(model, tokenizer, args.device,
                                       max_tokens=args.ppl_max_tokens)
         print(f"  baseline PPL = {baseline['ppl']:.4f}")
         manifest["ppl_baseline"] = baseline
+    elif args.eval_ppl:
+        print(f"[ppl-baseline] reusing cached baseline PPL = "
+              f"{manifest['ppl_baseline']['ppl']:.4f}")
 
     # ═══════════════════════════════════════════════════════════════════
     # MoE layer-major calibration path (G.7.h.1). One forward pass per
@@ -845,155 +892,306 @@ def main():
             ("down_proj", "down_proj", "ffn_down_exps", "intermediate"),
         )
 
-        # ── Collect Hessians for ALL layers in ONE forward pass over the
-        # calibration corpus. Each forward through the 35B-A3B model takes
-        # ~58s due to expert paging from NVMe; doing one-forward-per-layer
-        # would take 40 hours. Setting collect flags on every PagedMoeExperts
-        # at once lets a single full forward populate all per-layer accs.
-        # VRAM cost: per layer H = 2048² + 512² fp32 = 17 MB; × 40 = 680 MB.
-        print(f"\n[hessian-pass] collecting H_gate_up + H_down on all "
-              f"{len(layer_ids)} layers in one forward pass...")
-        for L in layer_ids:
-            _, mb = moe_blocks_by_layer[L]
-            mb.reset_calibration_acc()
-            mb.collect_pre_gate_up = True
-            mb.collect_pre_down    = True
-        t_h = time.time()
-        with torch.no_grad():
-            for s_i, ids in enumerate(calib):
-                model(ids.to(args.device))
-                if (s_i + 1) % 4 == 0 or s_i == len(calib) - 1:
-                    print(f"  [hessian-pass] {s_i+1}/{len(calib)} samples  "
-                          f"elapsed={time.time()-t_h:.1f}s")
-        for L in layer_ids:
-            _, mb = moe_blocks_by_layer[L]
-            mb.collect_pre_gate_up = False
-            mb.collect_pre_down    = False
-        t_h_done = time.time() - t_h
-        print(f"[hessian-pass] done in {t_h_done:.1f}s ({t_h_done/len(calib):.1f}s/sample)")
+        # ── Try loading cached Hessians first; on a 35B-A3B restart this
+        # saves ~30 min by skipping the full calibration forward pass. The
+        # cache is invalidated if any input that affects the Hessian content
+        # has changed: model, gguf, n_samples, seq_len, max_layers, strategy.
+        H_gate_up_per_layer: dict[int, torch.Tensor] = {}
+        H_down_per_layer: dict[int, torch.Tensor] = {}
+        cached_hessians_loaded = False
+        if not args.no_resume and hessian_cache_path.exists():
+            try:
+                cached = torch.load(hessian_cache_path, map_location="cpu",
+                                    weights_only=False)
+                cache_keys_match = (
+                    cached.get("model") == args.model
+                    and cached.get("gguf") == args.gguf
+                    and cached.get("n_samples") == args.n_samples
+                    and cached.get("seq_len") == args.seq_len
+                    and cached.get("max_layers") == args.max_layers
+                    and cached.get("strategy") == args.strategy
+                    and set(cached.get("H_gate_up_per_layer", {}).keys()) == set(layer_ids)
+                    and set(cached.get("H_down_per_layer", {}).keys()) == set(layer_ids))
+                if cache_keys_match:
+                    H_gate_up_per_layer = {L: H.to(args.device)
+                                            for L, H in cached["H_gate_up_per_layer"].items()}
+                    H_down_per_layer = {L: H.to(args.device)
+                                         for L, H in cached["H_down_per_layer"].items()}
+                    cached_hessians_loaded = True
+                    print(f"[hessian-cache] loaded Hessians for {len(layer_ids)} "
+                          f"layers from {hessian_cache_path} — skipping forward pass")
+                else:
+                    print(f"[hessian-cache] cache present but params mismatch — recomputing")
+            except Exception as e:
+                print(f"[hessian-cache] load failed ({e}) — recomputing")
 
+        if not cached_hessians_loaded:
+            # ── Collect Hessians for ALL layers in ONE forward pass over the
+            # calibration corpus. Each forward through the 35B-A3B model takes
+            # ~58s due to expert paging from NVMe; doing one-forward-per-layer
+            # would take 40 hours. Setting collect flags on every PagedMoeExperts
+            # at once lets a single full forward populate all per-layer accs.
+            # VRAM cost: per layer H = 2048² + 512² fp32 = 17 MB; × 40 = 680 MB.
+            print(f"\n[hessian-pass] collecting H_gate_up + H_down on all "
+                  f"{len(layer_ids)} layers in one forward pass...")
+            for L in layer_ids:
+                _, mb = moe_blocks_by_layer[L]
+                mb.reset_calibration_acc()
+                mb.collect_pre_gate_up = True
+                mb.collect_pre_down    = True
+            t_h = time.time()
+            with torch.no_grad():
+                for s_i, ids in enumerate(calib):
+                    model(ids.to(args.device))
+                    if (s_i + 1) % 4 == 0 or s_i == len(calib) - 1:
+                        print(f"  [hessian-pass] {s_i+1}/{len(calib)} samples  "
+                              f"elapsed={time.time()-t_h:.1f}s")
+            for L in layer_ids:
+                _, mb = moe_blocks_by_layer[L]
+                mb.collect_pre_gate_up = False
+                mb.collect_pre_down    = False
+            t_h_done = time.time() - t_h
+            print(f"[hessian-pass] done in {t_h_done:.1f}s ({t_h_done/len(calib):.1f}s/sample)")
+
+            # ── Snapshot Hessians per layer; free accumulators after capture.
+            for layer_idx in layer_ids:
+                _, mb = moe_blocks_by_layer[layer_idx]
+                hidden = mb.hidden_dim; interm = mb.intermediate_dim
+                n_tok_gu = mb.pre_gate_up_n_tok; n_tok_dn = mb.pre_down_n_tok
+                if mb.pre_gate_up_acc is None or n_tok_gu == 0:
+                    print(f"  WARN L{layer_idx} zero pre_gate_up tokens; identity Hessian fallback")
+                    H_gate_up_per_layer[layer_idx] = torch.eye(hidden, device=args.device, dtype=torch.float32)
+                else:
+                    H_gate_up_per_layer[layer_idx] = (mb.pre_gate_up_acc / max(n_tok_gu, 1)).to(args.device)
+                if mb.pre_down_acc is None or n_tok_dn == 0:
+                    print(f"  WARN L{layer_idx} zero pre_down tokens; identity Hessian fallback")
+                    H_down_per_layer[layer_idx] = torch.eye(interm, device=args.device, dtype=torch.float32)
+                else:
+                    H_down_per_layer[layer_idx] = (mb.pre_down_acc / max(n_tok_dn, 1)).to(args.device)
+                mb.reset_calibration_acc()
+                print(f"  L{layer_idx} hessians: gate_up n_tok={n_tok_gu}  down n_tok={n_tok_dn}")
+
+            # ── Persist Hessians to disk for resume. Atomic write via .tmp +
+            # replace so a crash mid-save doesn't leave a corrupted cache.
+            tmp_cache = hessian_cache_path.with_suffix(".pt.tmp")
+            cache_blob = {
+                "model": args.model, "gguf": args.gguf,
+                "n_samples": args.n_samples, "seq_len": args.seq_len,
+                "max_layers": args.max_layers, "strategy": args.strategy,
+                "H_gate_up_per_layer": {L: H.cpu() for L, H in H_gate_up_per_layer.items()},
+                "H_down_per_layer": {L: H.cpu() for L, H in H_down_per_layer.items()},
+            }
+            torch.save(cache_blob, tmp_cache)
+            os.replace(tmp_cache, hessian_cache_path)
+            cache_mb = hessian_cache_path.stat().st_size / 1e6
+            print(f"[hessian-cache] saved {cache_mb:.1f} MB → {hessian_cache_path}")
+
+        # ── Pre-compute per-(layer, kind) rotation + rotated Hessian. All workers
+        # share these read-only tensors. Rotation must be deterministic per
+        # (layer, kind) since all expert chunks of the same key need identical
+        # rotation for the inference-time kernel.
+        state_per_key = {}  # (layer_idx, kind_name) -> dict
+        kind_seed_offset = {"gate_proj": 0, "up_proj": 1, "down_proj": 2}
         for layer_idx in layer_ids:
-            t_layer = time.time()
-            block_name, moe_block = moe_blocks_by_layer[layer_idx]
-            print(f"\n=== Layer {layer_idx} ({block_name}) ===")
-            n_experts = moe_block.num_experts
-            interm    = moe_block.intermediate_dim
-            hidden    = moe_block.hidden_dim
-
-            n_tok_gu = moe_block.pre_gate_up_n_tok
-            n_tok_dn = moe_block.pre_down_n_tok
-            if moe_block.pre_gate_up_acc is None or n_tok_gu == 0:
-                print(f"  WARN: layer {layer_idx} zero pre_gate_up tokens; using identity Hessian")
-                H_gate_up = torch.eye(hidden, device=args.device, dtype=torch.float32)
-            else:
-                H_gate_up = (moe_block.pre_gate_up_acc / max(n_tok_gu, 1)).to(args.device)
-            if moe_block.pre_down_acc is None or n_tok_dn == 0:
-                print(f"  WARN: layer {layer_idx} zero pre_down tokens; using identity Hessian")
-                H_down = torch.eye(interm, device=args.device, dtype=torch.float32)
-            else:
-                H_down = (moe_block.pre_down_acc / max(n_tok_dn, 1)).to(args.device)
-            # Free the per-layer accumulator NOW that we've snapshot it; saves VRAM.
-            moe_block.reset_calibration_acc()
-            print(f"  hessians: gate_up n_tok={n_tok_gu}  down n_tok={n_tok_dn}")
-
+            mb = moe_blocks_by_layer[layer_idx][1]
             for kind, prop_name, gguf_suffix, dim_kind in kinds_specs:
-                t_q = time.time()
-                consolidated = getattr(moe_block, prop_name)  # [E, N, K]
-                W_stack = consolidated.contiguous().float()
-                moe_block.release_cached()
-                E, N, K = W_stack.shape
-                H_src = H_gate_up if dim_kind == "hidden" else H_down
-                if H_src.shape[0] != K:
-                    print(f"  [{kind}] WARN H dim {H_src.shape[0]} != K={K}; identity-scaled fallback")
-                    H_src = torch.eye(K, device=args.device, dtype=torch.float32) * \
-                            float(H_src.diag().abs().mean().clamp_min(1e-6))
-
+                H = H_gate_up_per_layer[layer_idx] if dim_kind == "hidden" else H_down_per_layer[layer_idx]
+                K = H.shape[0]
                 rotation = None
                 rotation_blob = None
                 if args.rotation == "kronecker":
                     a, b = factor_for_dim(K, max_b=args.rotation_max_b)
-                    seed = args.rotation_seed + layer_idx * 7 + {"gate_proj": 0, "up_proj": 1, "down_proj": 2}[kind]
+                    seed = args.rotation_seed + layer_idx * 7 + kind_seed_offset[kind]
                     h_a = random_orthogonal(a, seed=seed)
                     rotation = KroneckerRotation(h_a=h_a, b_dim=b)
                     rotation_blob = rotation.to_dict()
                     rotation_blob["seed"] = seed
-                    H_src = rotate_hessian(H_src, rotation)
-                    # Apply rotation to W_stack along K axis. KroneckerRotation.forward
-                    # expects last dim = d (= K), so reshape [E, N, K] → [E*N, K]
-                    # and pass directly.
-                    W_flat = W_stack.reshape(E * N, K).to(rotation.h_a.device)
-                    W_rot = rotation.forward(W_flat).to(args.device)
-                    W_stack = W_rot.reshape(E, N, K)
+                    H = rotate_hessian(H, rotation)
+                state_per_key[(layer_idx, kind)] = {
+                    "H": H, "rotation": rotation, "rotation_blob": rotation_blob,
+                    "K": K, "prop_name": prop_name, "moe_block": mb,
+                }
 
-                H_stack = H_src.unsqueeze(0).expand(E, K, K).contiguous()
+        # ── Build task queue: each task = (layer, kind, expert_start, expert_count).
+        TASK_E = args.task_e
+        work = queue.Queue()
+        for layer_idx in layer_ids:
+            E_total = moe_blocks_by_layer[layer_idx][1].num_experts
+            for kind, _, _, _ in kinds_specs:
+                for e_start in range(0, E_total, TASK_E):
+                    e_count = min(TASK_E, E_total - e_start)
+                    work.put((layer_idx, kind, e_start, e_count))
+        total_tasks = work.qsize()
 
-                if args.secondary_device:
-                    out = batched_gptq_quantize_multigpu(
-                        W_stack=W_stack, H_stack=H_stack,
-                        primary_device=args.device,
-                        secondary_device=args.secondary_device,
-                        primary_share=args.primary_share,
-                        n_centroids=args.n_centroids, group_size=args.group_size,
-                        n_iter=args.n_iter, fit_loss=args.fit_loss,
-                        mag_weight_p=args.mag_weight_p,
-                        snap_centroids=args.snap_centroids,
-                        percdamp=args.percdamp)
-                else:
+        worker_config = [(args.device, args.workers_primary)]
+        if args.secondary_device:
+            worker_config.append((args.secondary_device, args.workers_secondary))
+        print(f"\n[task-queue] {total_tasks} tasks (E={TASK_E}-chunks); workers: {worker_config}")
+        if args.group_size_down is not None and args.group_size_down != args.group_size:
+            print(f"[task-queue] down_proj kind uses group_size={args.group_size_down} "
+                  f"(other kinds use {args.group_size})")
+
+        manifest_lock = threading.Lock()
+        moe_block_locks = {L: threading.Lock() for L in layer_ids}
+        done_state = {"n": 0}
+        done_lock = threading.Lock()
+        t_dispatch_start = time.time()
+        worker_errors = []
+
+        def worker(device):
+            try:
+                while True:
+                    try:
+                        task = work.get_nowait()
+                    except queue.Empty:
+                        return
+                    layer_idx, kind, e_start, e_count = task
+                    st = state_per_key[(layer_idx, kind)]
+                    K = st["K"]; H = st["H"]
+                    rotation = st["rotation"]; rotation_blob = st["rotation_blob"]
+                    moe_block = st["moe_block"]
+                    prop_name = st["prop_name"]
+                    t_task = time.time()
+
+                    # ── Skip-if-exists: if every per-expert output blob in this
+                    # chunk already exists on disk (from a prior partial run),
+                    # skip all compute + pager activity for this task. Workers
+                    # check independently, no lock needed — Path.exists is racy
+                    # but the worst case is a single redundant recompute.
+                    expected_paths = []
+                    for j in range(e_count):
+                        e_global = e_start + j
+                        nm_pre = f"model.layers.{layer_idx}.mlp.experts.{e_global}.{kind}"
+                        expected_paths.append(
+                            Path(args.output_dir) /
+                            f"{nm_pre.replace('.', '_').replace('/', '_')}.pt")
+                    if not args.no_resume and all(p.exists() for p in expected_paths):
+                        with done_lock:
+                            done_state["n"] += 1
+                            n_done = done_state["n"]
+                        elapsed = time.time() - t_dispatch_start
+                        print(f"  [{device}] {n_done}/{total_tasks}  L{layer_idx} "
+                              f"{kind} E[{e_start}:{e_start+e_count}]  "
+                              f"(skipped — all {e_count} blobs already present)  "
+                              f"elapsed={elapsed/60:.1f}m")
+                        continue
+
+                    # Materialize consolidated weights on primary device, slice, move to worker device.
+                    # Lock per-layer so concurrent workers on the same layer don't race the pager.
+                    with moe_block_locks[layer_idx]:
+                        consolidated = getattr(moe_block, prop_name)
+                        W_slice_src = consolidated[e_start:e_start + e_count].clone()
+                        moe_block.release_cached()
+                    W_slice = W_slice_src.to(device).float()
+                    del W_slice_src
+                    H_dev = H.to(device)
+
+                    if rotation is not None:
+                        E_c, N_c, _ = W_slice.shape
+                        W_flat = W_slice.reshape(E_c * N_c, K).to(rotation.h_a.device)
+                        W_rot = rotation.forward(W_flat).to(device)
+                        W_slice = W_rot.reshape(E_c, N_c, K)
+                        del W_flat, W_rot
+
+                    # Shared H across experts in this (layer, kind): pass as a
+                    # zero-stride expand view, NOT materialized contiguous. The
+                    # chunked Cholesky inside batched_gptq materializes only
+                    # chunk_E × K × K at a time via the `+ damp * eye` add, so
+                    # the upfront E-copy is wasted ~1 GB per gate/up worker.
+                    H_stack = H_dev.unsqueeze(0).expand(e_count, K, K)
+                    gs_for_kind = args.group_size
+                    if kind == "down_proj" and args.group_size_down is not None:
+                        gs_for_kind = args.group_size_down
                     out = batched_gptq_quantize(
-                        W_stack=W_stack, H_stack=H_stack,
-                        n_centroids=args.n_centroids, group_size=args.group_size,
+                        W_stack=W_slice, H_stack=H_stack,
+                        n_centroids=args.n_centroids, group_size=gs_for_kind,
                         n_iter=args.n_iter, fit_loss=args.fit_loss,
                         mag_weight_p=args.mag_weight_p,
                         snap_centroids=args.snap_centroids,
                         percdamp=args.percdamp)
 
-                indices = out["indices"]
-                centroids = out["centroids_per_group"]
-                scales = out["scale_per_group"]
-                mse_all = out["mse"]; w_snr = out["w_snr_db"]
-                y_snr = out["y_snr_db"]; rel = out["rel_err"]
+                    # Move full stack to CPU once, but DO NOT save slices directly —
+                    # `indices[j]` is a strided view into the [E, N, K] storage and
+                    # torch.save serializes underlying storage (not the view), which
+                    # would balloon every per-expert blob by E× (~140 MB instead of
+                    # ~1 MB at E=128). Each slice MUST be .clone()'d when packed into
+                    # its blob dict so it owns standalone storage.
+                    indices = out["indices"].cpu()
+                    centroids = out["centroids_per_group"].cpu()
+                    scales = out["scale_per_group"].cpu()
+                    mse_all = out["mse"]; w_snr = out["w_snr_db"]
+                    y_snr = out["y_snr_db"]; rel = out["rel_err"]
+                    N_c = W_slice.shape[1]
 
-                hf_name_template = f"model.layers.{layer_idx}.mlp.experts.{{E}}.{kind}"
-                for e in range(E):
-                    nm = hf_name_template.format(E=e)
-                    out_path = Path(args.output_dir) / f"{nm.replace('.', '_').replace('/', '_')}.pt"
-                    blob = {
-                        "name": nm,
-                        "shape": [N, K],
-                        "group_size": args.group_size,
-                        "n_centroids": args.n_centroids,
-                        "indices": indices[e].cpu(),
-                        "centroids_per_group": centroids[e].cpu(),
-                        "scale_per_group": scales[e].cpu(),
-                        "mse": float(mse_all[e].item()),
-                        "w_snr_db": float(w_snr[e].item()),
-                        "y_snr_db": float(y_snr[e].item()),
-                        "rel_err": float(rel[e].item()),
-                    }
-                    if rotation_blob is not None:
-                        blob["rotation"] = dict(rotation_blob)
-                    torch.save(blob, out_path)
-                    manifest["results"].append({
-                        "name": nm, "shape": [N, K],
-                        "mse": float(mse_all[e].item()),
-                        "y_snr_db": float(y_snr[e].item()),
-                        "w_snr_db": float(w_snr[e].item()),
-                    })
+                    new_results = []
+                    for j in range(e_count):
+                        e_global = e_start + j
+                        nm = f"model.layers.{layer_idx}.mlp.experts.{e_global}.{kind}"
+                        out_path = Path(args.output_dir) / f"{nm.replace('.', '_').replace('/', '_')}.pt"
+                        blob = {
+                            "name": nm, "shape": [N_c, K],
+                            "group_size": gs_for_kind, "n_centroids": args.n_centroids,
+                            "indices":             indices[j].clone().contiguous(),
+                            "centroids_per_group": centroids[j].clone().contiguous(),
+                            "scale_per_group":     scales[j].clone().contiguous(),
+                            "mse": float(mse_all[j].item()),
+                            "w_snr_db": float(w_snr[j].item()),
+                            "y_snr_db": float(y_snr[j].item()),
+                            "rel_err": float(rel[j].item()),
+                        }
+                        if rotation_blob is not None:
+                            blob["rotation"] = dict(rotation_blob)
+                        torch.save(blob, out_path)
+                        new_results.append({
+                            "name": nm, "shape": [N_c, K],
+                            "mse": float(mse_all[j].item()),
+                            "y_snr_db": float(y_snr[j].item()),
+                            "w_snr_db": float(w_snr[j].item()),
+                        })
+                    # Single lock acquisition: extend manifest + write to disk
+                    # atomically (.tmp → replace). Cheap — manifest is JSON,
+                    # 35B-A3B run = ~15 K entries × ~100 B = ~1.5 MB final size.
+                    with manifest_lock:
+                        manifest["results"].extend(new_results)
+                        tmp_manifest = manifest_path.with_suffix(".json.tmp")
+                        with open(tmp_manifest, "w") as f:
+                            json.dump(manifest, f, indent=2)
+                        os.replace(tmp_manifest, manifest_path)
 
-                t_q_done = time.time() - t_q
-                print(f"  [{kind}] batched_gptq E={E} K={K} N={N}  "
-                      f"t_quant={t_q_done:.1f}s  "
-                      f"median Y_SNR={float(y_snr.median().item()):.2f}dB  "
-                      f"median W_SNR={float(w_snr.median().item()):.2f}dB")
-                del W_stack, H_stack, indices, centroids, scales, consolidated
-                if args.device.startswith("cuda"):
-                    torch.cuda.empty_cache()
-                moe_block.release_cached()
+                    t_task_done = time.time() - t_task
+                    with done_lock:
+                        done_state["n"] += 1
+                        n_done = done_state["n"]
+                    elapsed = time.time() - t_dispatch_start
+                    eta_min = (elapsed / n_done) * (total_tasks - n_done) / 60 if n_done else 0
+                    print(f"  [{device}] {n_done}/{total_tasks}  L{layer_idx} {kind} "
+                          f"E[{e_start}:{e_start+e_count}]  t={t_task_done:.1f}s  "
+                          f"Y_SNR_med={float(y_snr.median().item()):.2f}dB  "
+                          f"elapsed={elapsed/60:.1f}m  ETA={eta_min:.1f}m")
+                    del W_slice, H_stack, H_dev, consolidated, out, indices, centroids, scales
+            except Exception as e:
+                import traceback
+                worker_errors.append(f"[{device}] {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                raise
 
-            del H_gate_up, H_down
-            if args.device.startswith("cuda"):
-                torch.cuda.empty_cache()
-            print(f"  layer {layer_idx} total t={time.time()-t_layer:.1f}s")
+        threads = []
+        for device, n_workers in worker_config:
+            for _ in range(n_workers):
+                t = threading.Thread(target=worker, args=(device,), daemon=False)
+                threads.append(t)
+                t.start()
+        for t in threads:
+            t.join()
+
+        if worker_errors:
+            print(f"\n[task-queue] {len(worker_errors)} worker error(s):")
+            for err in worker_errors[:3]:
+                print(err)
+            raise RuntimeError("task-queue workers failed; see above")
+
+        t_dispatch_done = time.time() - t_dispatch_start
+        print(f"\n[task-queue] {total_tasks} tasks completed in {t_dispatch_done/60:.1f}min "
+              f"({t_dispatch_done/total_tasks:.1f}s/task average)")
 
         # Done with the MoE path — skip the dense per-linear loop.
         if args.eval_ppl:
@@ -1006,9 +1204,10 @@ def main():
             manifest["ppl_delta"] = delta
             print(f"\n  Δ_PPL = {delta:+.4f}")
 
-        manifest_path = Path(args.output_dir) / "manifest.json"
-        with open(manifest_path, "w") as f:
+        tmp_manifest = manifest_path.with_suffix(".json.tmp")
+        with open(tmp_manifest, "w") as f:
             json.dump(manifest, f, indent=2)
+        os.replace(tmp_manifest, manifest_path)
         print(f"\n[done] manifest: {manifest_path}")
         pager.shutdown()
         return
@@ -1148,9 +1347,10 @@ def main():
         manifest["ppl_delta"] = delta
         print(f"\n  Δ_PPL = {delta:+.4f}")
 
-    manifest_path = Path(args.output_dir) / "manifest.json"
-    with open(manifest_path, "w") as f:
+    tmp_manifest = manifest_path.with_suffix(".json.tmp")
+    with open(tmp_manifest, "w") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp_manifest, manifest_path)
     print(f"\n[done] manifest: {manifest_path}")
 
     pager.shutdown()

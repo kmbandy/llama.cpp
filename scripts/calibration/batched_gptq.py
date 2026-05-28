@@ -6,9 +6,12 @@ of one (layer, kind) tuple are quantized in one pass. The hot path — the
 per-column error-propagation update — becomes a single batched outer-product
 add instead of E independent ones, which is the win at large E.
 
-Lloyd-Max (per-group centroid fitting) stays sequential over E. It runs
-only `n_groups` times per linear (=K/group_size, typically 32), and each
-call is a small 1-D k-means that wouldn't gain much from batching.
+Lloyd-Max (per-group centroid fitting) is also batched over the expert axis
+via `_batched_lloyd_max_signed`. Profiling on 35B-A3B shapes showed the
+sequential per-expert + per-level loops were 97% of task time (~1.6M HIP
+dispatches per task, each ~250µs); the batched kernel collapses both loops
+into `torch.searchsorted` + two `scatter_add_` calls and brings Lloyd-Max
+under 1% of task time.
 
 This module is import-clean: no side effects, no global state. Each call
 returns the indices / centroids / scales the .pt blob writer expects.
@@ -16,12 +19,124 @@ returns the indices / centroids / scales the .pt blob writer expects.
 from __future__ import annotations
 
 import math
+import os
+import time
 from typing import Sequence
 
 import torch
 
 # Reuse the existing helpers — same Lloyd-Max + E4M3 snap as the scalar path.
 from centroid_quantizer import _lloyd_max_signed, snap_to_e4m3
+
+
+# ─── Compositor yield (graphics ring starvation prevention) ─────────────────
+#
+# Sustained GPU compute on a card that also drives the desktop will eventually
+# starve the OS compositor's graphics ring. Linux + amdgpu shows this as
+# `ring gfx_0.0.0 timeout` followed by an SQC permission fault and a device
+# wedge. Windows DWM and Apple WindowServer have the same failure mode under
+# enough pressure — the calibration kernel just hits it first on amdgpu/Linux.
+#
+# Mitigation: every ML8_YIELD_EVERY_COLS columns of the GPTQ propagation loop,
+# call cuda.synchronize() to drain pending kernels, then sleep ML8_YIELD_MS
+# milliseconds. The sync + sleep gives the compositor a guaranteed render
+# window. Overhead at default settings: ~0.5% wall time per task.
+#
+# Configurable via env vars so users can tune (or disable on a headless box):
+#   ML8_YIELD_EVERY_COLS  — yield every N columns (default 64 for K>=1024, else 32)
+#   ML8_YIELD_MS          — sleep duration in ms each yield  (default 5)
+#   ML8_YIELD_DISABLE     — set to "1" to disable yielding entirely
+#
+# This is the OSS-shippable fix: works on single-GPU systems with no special
+# setup, no TTY required, no second display GPU. Just respects the desktop.
+
+def _resolve_yield_params(K: int) -> tuple[int, float]:
+    """Return (yield_every_cols, yield_seconds). Yield disabled → (0, 0.0)."""
+    if os.environ.get("ML8_YIELD_DISABLE", "") == "1":
+        return 0, 0.0
+    default_every = 64 if K >= 1024 else 32
+    every = int(os.environ.get("ML8_YIELD_EVERY_COLS", default_every))
+    ms = float(os.environ.get("ML8_YIELD_MS", "5"))
+    return max(1, every), max(0.0, ms) / 1000.0
+
+
+@torch.no_grad()
+def _batched_lloyd_max_signed(
+    samples_E: torch.Tensor,           # [E, M] fp32 — per-expert flattened normalized samples
+    *,
+    col_weights_E: torch.Tensor | None,  # [E, gs] fp32 — per-expert Hessian-diag weight per column
+    col_idx: torch.Tensor | None,        # [M] long — column index of each sample, in [0, gs)
+    n_levels: int,
+    n_iter: int,
+    fit_loss: str,
+    mag_weight_p: float,
+) -> torch.Tensor:
+    """Vectorized signed Lloyd-Max fit over a batch of E experts.
+
+    Identical math to the scalar `_lloyd_max_signed` in centroid_quantizer.py,
+    but the per-expert Python loop and the per-level inner Python loop are
+    collapsed into per-iter `searchsorted` + two `scatter_add_` calls. On 35B
+    shapes (E=128, M ≈ 49 K-131 K) this cuts ~1.6M HIP dispatches per task
+    down to a few hundred — Lloyd-Max drops from 97% to <1% of task time.
+
+    NaN handling: the scalar path filters samples via `s = s[isfinite(s)]`
+    per-expert, which can't be vectorized across E (variable row sizes).
+    We assume no NaNs (matches the existing scalar comment: "Linear weights
+    from a healthy model: no NaNs in practice"). Any NaN sample contaminates
+    that expert's centroids only.
+
+    Returns: [E, n_levels] fp32, ascending-sorted.
+    """
+    E, M = samples_E.shape
+    dev = samples_E.device
+    s_E = samples_E.float()
+
+    # Per-expert quantile init. torch.quantile(input, q, dim=1) returns
+    # [n_levels, E]; transpose + contiguous for [E, n_levels].
+    q = torch.linspace(0.0, 1.0, n_levels, device=dev)
+    centroids_E = torch.quantile(s_E, q, dim=1).t().contiguous()  # [E, n_levels]
+
+    # Per-sample weight (fit_loss + optional Hessian-diag column weighting).
+    if fit_loss == "mag_weighted":
+        w_mag_E = s_E.abs().pow(mag_weight_p)
+    else:  # "mse"
+        w_mag_E = torch.ones_like(s_E)
+    if (col_weights_E is not None and col_idx is not None
+            and col_idx.numel() == M):
+        # col_weights_E[e, col_idx[i]] for each i → [E, M] via index_select.
+        col_w_expanded = col_weights_E.index_select(1, col_idx)  # [E, M]
+        w_mag_E = w_mag_E * col_w_expanded
+    weights_E = w_mag_E
+
+    w_sum  = torch.empty((E, n_levels), device=dev, dtype=s_E.dtype)
+    ws_sum = torch.empty((E, n_levels), device=dev, dtype=s_E.dtype)
+    ws_E   = weights_E * s_E  # [E, M] — reused each iter; samples don't change
+
+    for _ in range(n_iter):
+        # Midpoints between adjacent (sorted) centroids → per-expert bin edges.
+        edges_E = (centroids_E[:, :-1] + centroids_E[:, 1:]) * 0.5  # [E, n_levels-1]
+        # searchsorted with N-D sorted_sequence: per-row independent search.
+        # Output bins in [0, n_levels-1]. Each sample's bin index = which
+        # centroid it's nearest to (left-tie convention same as bucketize).
+        bins_E = torch.searchsorted(edges_E, s_E)               # [E, M] int64
+
+        # Per-(e, k) weighted sums via scatter_add.
+        w_sum.zero_()
+        ws_sum.zero_()
+        w_sum.scatter_add_(1, bins_E, weights_E)
+        ws_sum.scatter_add_(1, bins_E, ws_E)
+
+        new_E = torch.where(
+            w_sum > 1e-30,
+            ws_sum / w_sum.clamp_min(1e-30),
+            centroids_E,  # empty-bin: keep old centroid
+        )
+        if torch.allclose(new_E, centroids_E, rtol=1e-6):
+            centroids_E = new_E
+            break
+        centroids_E = new_E
+
+    return torch.sort(centroids_E, dim=1).values
 
 
 @torch.no_grad()
@@ -133,6 +248,9 @@ def batched_gptq_quantize(
     centroids_all = torch.zeros((E, n_groups, n_centroids), device=dev, dtype=torch.float32)
     scales_all = torch.zeros((E, N, n_groups), device=dev, dtype=torch.float32)
 
+    yield_every, yield_secs = _resolve_yield_params(K)
+    is_cuda_dev = dev.type == "cuda"
+
     for col in range(K):
         if col % group_size == 0:
             g_idx = col // group_size
@@ -145,28 +263,27 @@ def batched_gptq_quantize(
             x_norm = group_slice / scale                                # [E, N, gs]
             scales_all[:, :, g_idx:g_idx + 1] = scale
 
-            # Lloyd-Max per expert (sequential — not the bottleneck).
-            # Each expert gets its own Hessian-diagonal weighting over the
-            # group's columns, identical to scalar `find_params` when
-            # `quantizer.hessian_diag` is set. Drop this and the centroids
-            # land at slightly different optima → measurable PPL drift.
+            # Lloyd-Max per expert — batched across E. Profiling 35B-A3B
+            # showed sequential per-expert + per-level Python loops were
+            # 97% of task time (~1.6M HIP dispatches per task at ~250µs
+            # each). _batched_lloyd_max_signed collapses both loops into
+            # searchsorted + scatter_add over [E, M] — same math, ~700x
+            # fewer dispatches, Lloyd-Max drops to <1% of task time.
             col_hw = H_orig.diagonal(dim1=-2, dim2=-1)[:, col:g_end].float()  # [E, gs]
             col_idx_template = torch.arange(gs, device=dev).repeat(N)         # [N*gs]
-            for e in range(E):
-                samples = x_norm[e].flatten()                           # [N*gs]
-                centroids_e = _lloyd_max_signed(
-                    samples,
-                    sample_col_idx=col_idx_template,
-                    col_weights=col_hw[e],
-                    n_levels=n_centroids,
-                    n_iter=n_iter,
-                    fit_loss=fit_loss,
-                    mag_weight_p=mag_weight_p,
-                )                                                       # [n_centroids]
-                centroids_e = centroids_e.to(dev)
-                if snap_centroids == "e4m3":
-                    centroids_e = snap_to_e4m3(centroids_e)
-                centroids_all[e, g_idx] = centroids_e
+            samples_E = x_norm.reshape(E, N * gs)                              # [E, M]
+            centroids_batch = _batched_lloyd_max_signed(
+                samples_E,
+                col_weights_E=col_hw,
+                col_idx=col_idx_template,
+                n_levels=n_centroids,
+                n_iter=n_iter,
+                fit_loss=fit_loss,
+                mag_weight_p=mag_weight_p,
+            )                                                                  # [E, n_centroids]
+            if snap_centroids == "e4m3":
+                centroids_batch = snap_to_e4m3(centroids_batch)
+            centroids_all[:, g_idx] = centroids_batch
 
         # ── Per-column quantize + GPTQ propagate (batched over E).
         g_idx = col // group_size
@@ -192,6 +309,17 @@ def batched_gptq_quantize(
             # Batched outer product subtract: [E, N, 1] @ [E, 1, K-col-1] → [E, N, K-col-1]
             update = err.unsqueeze(2) * tail
             W[:, :, col + 1:].sub_(update)
+
+        # Compositor yield — drain pending kernels and sleep briefly so the
+        # OS display compositor's gfx ring gets render slots. Without this,
+        # sustained calibration compute starves the gfx ring after ~5-6 min
+        # → SQC permission fault → device wedge → desktop dies. See module
+        # docstring near _resolve_yield_params for tunables. Default cost
+        # ~0.5% wall time; mandatory for unattended runs on the display GPU.
+        if yield_every > 0 and is_cuda_dev and (col + 1) % yield_every == 0 and col + 1 < K:
+            torch.cuda.synchronize(dev)
+            if yield_secs > 0.0:
+                time.sleep(yield_secs)
 
     # ── Reconstruction metrics (per expert).
     orig = W_stack.float()
