@@ -177,18 +177,6 @@ def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tens
 _NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_PRE_FFN, Role.NORM_PRE_SSM, Role.NORM_OUT}
 
 
-def _gguf_tensor_to_torch(t) -> torch.Tensor:
-    """Materialize a GGUFReader tensor as a torch float32 tensor.
-
-    Assumes bf16 storage — the source GGUF is the bf16 conversion produced by
-    gguf_f16_to_bf16.py and used by calibrate_ml8_paged.py.
-    """
-    if t.tensor_type.name != "BF16":
-        raise ValueError(f"{t.name}: expected BF16, got {t.tensor_type.name}")
-    arr = np.asarray(t.data, dtype=np.uint8).copy()  # detach from mmap
-    return torch.from_numpy(arr).view(torch.bfloat16).view(*t.shape).to(torch.float32)
-
-
 def index_pass(source_path: str, arch: str) -> tuple[dict[str, Role], dict[str, torch.Tensor], int]:
     """Pass 1 — walk source GGUF, classify each tensor, pull only γ vectors into RAM.
 
@@ -219,14 +207,6 @@ def index_pass(source_path: str, arch: str) -> tuple[dict[str, Role], dict[str, 
     return roster, gammas, d_model
 
 
-# ---------------------------------------------------------------------------
-# Task 6: Pass-2 streaming rotate + write
-# ---------------------------------------------------------------------------
-
-# Map roles to (rotation_kind, gamma_source) where rotation_kind is one of
-# {"input_2d", "output_2d", "input_moe", "output_moe", "embed", "norm_to_ones", "passthrough"}.
-# The γ source is the tensor name of the RMSNorm that precedes this linear in
-# the graph, or None if no γ absorption applies.
 def _rotation_plan(role: Role, name: str) -> tuple[str, Optional[str]]:
     """Decide (rotation_kind, gamma_tensor_name) for a given tensor."""
     if role == Role.PASSTHROUGH:
@@ -264,14 +244,14 @@ def _bf16_bytes_from_fp32(t: torch.Tensor) -> np.ndarray:
     return np.ascontiguousarray(t.contiguous().to(torch.bfloat16).view(torch.uint8).numpy())
 
 
-def _gguf_tensor_to_torch_pyt(t) -> torch.Tensor:
+def _gguf_tensor_to_torch(t) -> torch.Tensor:
     """Materialize a GGUFReader BF16 tensor as a fp32 torch tensor in PyTorch
     (row-major / C) axis order.
 
-    GGUFReader stores shape in GGUF file order (reversed from C/PyTorch order).
-    t.data is a mmap'd uint8 array already in C memory order with shape
-    quant_shape_to_byte_shape(reversed(t.shape), BF16). Reversing t.shape gives
-    the correct PyTorch-convention shape.
+    GGUFReader stores shape in GGUF file order, which is the reverse of C order.
+    Reversing t.shape recovers the [out, in, ...] PyTorch convention. For 1D γ
+    vectors the reverse is a no-op, so this function handles both linears and
+    norm weights.
     """
     if t.tensor_type.name != "BF16":
         raise ValueError(f"{t.name}: expected BF16, got {t.tensor_type.name}")
@@ -345,7 +325,7 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             continue
 
         # Otherwise materialise the tensor in PyTorch-convention fp32 order.
-        W_fp32 = _gguf_tensor_to_torch_pyt(t).to(device)
+        W_fp32 = _gguf_tensor_to_torch(t).to(device)
 
         if kind == "embed":
             # token_embd shape (PyTorch): [vocab, d_model].
