@@ -113,3 +113,30 @@ def build_R_resid(d_model: int, seed: int, device: torch.device) -> torch.Tensor
 
     R = (signs.unsqueeze(1) * H).to(device=device, dtype=torch.float32)
     return R
+
+
+def rotate_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
+    """Apply γ absorption + R_resid input rotation to a residual-reading linear.
+
+    W shape: [N, d_model] (PyTorch [out, in]).
+    gamma shape: [d_model] — RMSNorm γ that precedes this linear in the original graph.
+    R_resid shape: [d_model, d_model] — orthogonal.
+
+    Math: original forward is y = (γ ⊙ x) @ W.T. In the rotated stream the input
+    is x' = x @ R.T (γ already absorbed at construction time). The rotated weight
+    must satisfy y = x' @ W_new.T, giving W_new = (W ⊙ γ_row) @ R.
+    """
+    Wg = W * gamma.unsqueeze(0)            # [N, d_model], column-wise γ
+    return Wg @ R_resid.T                    # [N, d_model]
+
+
+def rotate_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
+    """Apply R_resid output rotation to a residual-writing linear.
+
+    W shape: [d_model, K] (PyTorch [out, in]). K is whatever feeds this linear.
+    R_resid shape: [d_model, d_model] — orthogonal.
+
+    Math: original forward y = x @ W.T contributes to the residual. To produce
+    y_new = y @ R.T directly, we need W_new = R @ W.
+    """
+    return R_resid @ W                     # [d_model, K]

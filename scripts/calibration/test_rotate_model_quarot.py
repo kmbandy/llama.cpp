@@ -92,10 +92,78 @@ def test_R_resid_seed_determinism():
     print(f"  PASS test_R_resid_seed_determinism")
 
 
+from rotate_model_quarot import rotate_input_side, rotate_output_side
+
+
+def test_rotate_input_side_round_trip():
+    """Original forward equals rotated-input forward on rotated input."""
+    torch.manual_seed(7)
+    d_model, N = 64, 96
+    W      = torch.randn(N, d_model, dtype=torch.float32)
+    gamma  = torch.randn(d_model, dtype=torch.float32) * 0.3 + 1.0  # near-1 like real RMSNorm γ
+    x      = torch.randn(4, d_model, dtype=torch.float32)
+    R      = build_R_resid(d_model=d_model, seed=11, device=torch.device("cpu"))
+
+    # Original forward: y = (γ ⊙ x) @ W.T
+    y_orig = (gamma * x) @ W.T
+
+    # Rotated forward: residual stream rotated as x' = x @ R.T; absorbed γ
+    # makes the next linear see norm-output directly; W_new produces y from x'.
+    W_new  = rotate_input_side(W, gamma, R)
+    x_rot  = x @ R.T
+    y_new  = x_rot @ W_new.T
+
+    _assert_close(y_new, y_orig, tol=1e-4, label="input-side round trip")
+    print(f"  PASS test_rotate_input_side_round_trip")
+
+
+def test_rotate_output_side_round_trip():
+    """Output-side rotation gives y_new = y @ R.T (residual ends up rotated)."""
+    torch.manual_seed(8)
+    d_model, K = 64, 80
+    W      = torch.randn(d_model, K, dtype=torch.float32)  # writes residual
+    x      = torch.randn(4, K, dtype=torch.float32)
+    R      = build_R_resid(d_model=d_model, seed=12, device=torch.device("cpu"))
+
+    y_orig    = x @ W.T            # original residual contribution
+    W_new     = rotate_output_side(W, R)
+    y_rotated = x @ W_new.T        # should equal y_orig @ R.T
+
+    _assert_close(y_rotated, y_orig @ R.T, tol=1e-4, label="output-side R.T projection")
+    print(f"  PASS test_rotate_output_side_round_trip")
+
+
+def test_input_output_cancel_through_residual():
+    """A linear writing then a linear reading the residual recovers the original."""
+    torch.manual_seed(9)
+    d_model, K, N = 64, 80, 96
+    W_out     = torch.randn(d_model, K, dtype=torch.float32)    # writes residual
+    gamma     = torch.randn(d_model, dtype=torch.float32) * 0.3 + 1.0
+    W_in      = torch.randn(N, d_model, dtype=torch.float32)    # reads residual
+    x         = torch.randn(4, K, dtype=torch.float32)
+    R         = build_R_resid(d_model=d_model, seed=13, device=torch.device("cpu"))
+
+    # Original
+    residual_orig = x @ W_out.T
+    y_orig        = (gamma * residual_orig) @ W_in.T
+
+    # Rotated stack
+    W_out_new = rotate_output_side(W_out, R)
+    W_in_new  = rotate_input_side(W_in, gamma, R)
+    residual_rot = x @ W_out_new.T     # = residual_orig @ R.T
+    y_rot       = residual_rot @ W_in_new.T
+
+    _assert_close(y_rot, y_orig, tol=1e-4, label="residual cancellation")
+    print(f"  PASS test_input_output_cancel_through_residual")
+
+
 if __name__ == "__main__":
     test_classify_qwen36_tensors()
     test_classify_unknown_raises()
     test_R_resid_orthogonal_pow2()
     test_R_resid_orthogonal_kronecker()
     test_R_resid_seed_determinism()
+    test_rotate_input_side_round_trip()
+    test_rotate_output_side_round_trip()
+    test_input_output_cancel_through_residual()
     print("\nALL TESTS PASSED")
