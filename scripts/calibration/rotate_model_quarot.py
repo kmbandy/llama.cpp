@@ -389,9 +389,15 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             w.add_key_value(f.name, int(val[0]), gguf.GGUFValueType.INT32)
         elif vtype == gguf.GGUFValueType.STRING:
             w.add_key_value(f.name, bytes(val).decode("utf-8"), gguf.GGUFValueType.STRING)
+        elif vtype == gguf.GGUFValueType.BOOL:
+            w.add_key_value(f.name, bool(val[0]), gguf.GGUFValueType.BOOL)
+        elif vtype == gguf.GGUFValueType.ARRAY:
+            # tokenizer.ggml.tokens / .merges / .token_type, rope.dimension_sections,
+            # general.tags — load-blocking for tokenizer and rope configuration.
+            elements = [f.contents(i) for i in range(len(f.data))]
+            w.add_array(f.name, elements)
         else:
-            # Skip exotic types (ARRAY, BOOL, etc.) not needed for arch metadata.
-            pass
+            print(f"  warning: skipping KV {f.name!r} with type {vtype.name}", file=sys.stderr)
 
     rotated: list[str] = []
     absorbed: list[str] = []
@@ -408,14 +414,17 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             kind = "output_2d"
 
         if kind == "passthrough":
-            # Copy raw bytes unchanged; let gguf-py derive shape from the uint8 array.
-            arr = np.asarray(t.data, dtype=np.uint8).copy()
+            # For typed (F32/F16) source, pass the typed numpy array as-is so
+            # its element shape round-trips. For BF16, t.data is already a uint8
+            # byte buffer in the PyTorch-order byte shape gguf-py expects.
+            if t.tensor_type.name == "BF16":
+                arr = np.asarray(t.data, dtype=np.uint8).copy()
+            else:
+                arr = np.ascontiguousarray(t.data).copy()
             w.add_tensor(t.name, arr, raw_dtype=t.tensor_type)
             continue
 
         if kind == "norm_to_ones":
-            # Write ones in bf16 with the same element shape.
-            # t.shape is GGUF-order; reversed gives PyTorch shape.
             torch_shape = [int(s) for s in reversed(list(t.shape))]
             ones = torch.ones(*torch_shape, dtype=torch.float32)
             w.add_tensor(t.name, _bytes_from_fp32(ones, t.tensor_type), raw_dtype=t.tensor_type)
@@ -426,10 +435,10 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
         W_fp32 = _gguf_tensor_to_torch(t).to(device)
 
         if kind == "embed":
-            # token_embd shape (PyTorch): [vocab, d_model].
-            # Output-side rotation: embed @ R_resid makes emb vectors live in the
-            # rotated space that downstream input-side linears expect.
-            W_new = W_fp32 @ R_resid
+            # token_embd shape (PyTorch): [vocab, d_model]. Each row IS a
+            # residual vector — right-multiply by R.T so emb_new[tok] lives in
+            # the same basis that input-side linears expect (residual at x @ R.T).
+            W_new = W_fp32 @ R_resid.T
         elif kind == "input_2d":
             gamma = gammas[gamma_name].to(device) if gamma_name else torch.ones(d_model, device=device)
             W_new = rotate_input_side(W_fp32, gamma, R_resid)
