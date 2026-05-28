@@ -320,6 +320,13 @@ _GGUF_DTYPE_TO_TORCH = {
 def _bytes_from_fp32(t: torch.Tensor, gguf_dtype) -> np.ndarray:
     """Cast a fp32 tensor to raw bytes matching the given GGUF dtype.
 
+    torch's `.view(torch.uint8)` of a non-byte tensor introduces a trailing
+    per-element byte dim. gguf-py's add_tensor passes the numpy shape through
+    `quant_shape_from_byte_shape` (line 360 of gguf_writer.py), which divides
+    the last byte-dim by type_size. The trailing per-element dim would leave a
+    bogus extra "1" axis in the element shape, so we reshape the bytes so the
+    last byte-dim equals last-element-dim * type_size.
+
     Real GGUFs from gguf_f16_to_bf16.py keep RMSNorm γ as F32 even when the
     large weights are BF16 — round-tripping in source dtype preserves the
     file's dtype mix.
@@ -327,7 +334,17 @@ def _bytes_from_fp32(t: torch.Tensor, gguf_dtype) -> np.ndarray:
     target = _GGUF_DTYPE_TO_TORCH.get(gguf_dtype.name)
     if target is None:
         raise ValueError(f"unsupported write dtype {gguf_dtype.name!r}")
-    return np.ascontiguousarray(t.contiguous().to(target).view(torch.uint8).numpy())
+    casted = t.contiguous().to(target)
+    type_size = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8}.get(gguf_dtype.name)
+    if type_size is None:
+        raise ValueError(f"unsupported write dtype {gguf_dtype.name!r}")
+    byte_view = casted.view(torch.uint8).numpy()
+    element_shape = list(casted.shape)
+    if len(element_shape) == 0:
+        new_byte_shape = (type_size,)
+    else:
+        new_byte_shape = tuple(element_shape[:-1]) + (element_shape[-1] * type_size,)
+    return np.ascontiguousarray(byte_view.reshape(new_byte_shape))
 
 
 def _gguf_tensor_to_torch(t) -> torch.Tensor:
@@ -366,6 +383,11 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
     # Pass 1
     roster, gammas, d_model = index_pass(source_path, arch=arch)
     R_resid = build_R_resid(d_model=d_model, seed=seed, device=device)
+    import os as _os
+    if _os.environ.get("QUAROT_DEBUG_IDENTITY") == "1":
+        R_resid = torch.eye(d_model, dtype=torch.float32, device=device)
+    _debug_no_absorb = _os.environ.get("QUAROT_DEBUG_NO_ABSORB") == "1"
+    _debug_skip_norm_ones = _os.environ.get("QUAROT_DEBUG_KEEP_NORMS") == "1"
 
     # Re-open source for streaming. Open writer.
     r = gguf.GGUFReader(source_path)
@@ -425,6 +447,10 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             continue
 
         if kind == "norm_to_ones":
+            if _debug_skip_norm_ones:
+                arr_keep = np.ascontiguousarray(t.data).copy() if t.tensor_type.name != "BF16" else np.asarray(t.data, dtype=np.uint8).copy()
+                w.add_tensor(t.name, arr_keep, raw_dtype=t.tensor_type)
+                continue
             torch_shape = [int(s) for s in reversed(list(t.shape))]
             ones = torch.ones(*torch_shape, dtype=torch.float32)
             w.add_tensor(t.name, _bytes_from_fp32(ones, t.tensor_type), raw_dtype=t.tensor_type)
@@ -440,12 +466,12 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             # the same basis that input-side linears expect (residual at x @ R.T).
             W_new = W_fp32 @ R_resid.T
         elif kind == "input_2d":
-            gamma = gammas[gamma_name].to(device) if gamma_name else torch.ones(d_model, device=device)
+            gamma = gammas[gamma_name].to(device) if (gamma_name and not _debug_no_absorb) else torch.ones(d_model, device=device)
             W_new = rotate_input_side(W_fp32, gamma, R_resid)
         elif kind == "output_2d":
             W_new = rotate_output_side(W_fp32, R_resid)
         elif kind == "input_moe":
-            gamma = gammas[gamma_name].to(device) if gamma_name else torch.ones(d_model, device=device)
+            gamma = gammas[gamma_name].to(device) if (gamma_name and not _debug_no_absorb) else torch.ones(d_model, device=device)
             W_new = rotate_moe_input_side(W_fp32, gamma, R_resid)
         elif kind == "output_moe":
             W_new = rotate_moe_output_side(W_fp32, R_resid)
