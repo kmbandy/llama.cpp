@@ -24,66 +24,111 @@ import gguf  # noqa: E402
 
 
 class Role(enum.Enum):
-    PASSTHROUGH      = "passthrough"
-    EMBED            = "embed"
-    NORM_PRE_ATTN    = "norm_pre_attn"
-    NORM_PRE_FFN     = "norm_pre_ffn"
-    NORM_PRE_SSM     = "norm_pre_ssm"
-    NORM_OUT         = "norm_out"
-    ATTN_Q           = "attn_q"
-    ATTN_K           = "attn_k"
-    ATTN_V           = "attn_v"
-    ATTN_O           = "attn_o"
-    FFN_GATE_INP     = "ffn_gate_inp"
-    FFN_GATE_EXPS    = "ffn_gate_exps"
-    FFN_UP_EXPS      = "ffn_up_exps"
-    FFN_DOWN_EXPS    = "ffn_down_exps"
-    MAMBA_IN         = "mamba_in"
-    MAMBA_OUT        = "mamba_out"
-    LM_HEAD          = "lm_head"
+    PASSTHROUGH        = "passthrough"
+    EMBED              = "embed"
+    NORM_PRE_ATTN      = "norm_pre_attn"
+    NORM_POST_ATTN     = "norm_post_attn"   # this arch's FFN-input norm
+    NORM_OUT           = "norm_out"
+    ATTN_Q             = "attn_q"           # full-attention layers
+    ATTN_K             = "attn_k"
+    ATTN_V             = "attn_v"
+    ATTN_O             = "attn_o"
+    ATTN_QKV           = "attn_qkv"         # recurrent (delta-net) fused qkv
+    ATTN_GATE_FUSED    = "attn_gate_fused"  # recurrent gating linear next to qkv
+    ATTN_QK_INTERNAL   = "attn_qk_internal" # per-head q/k norms (head-dim, not residual)
+    FFN_GATE_INP       = "ffn_gate_inp"     # MoE router
+    FFN_GATE_EXPS      = "ffn_gate_exps"    # also reused for dense ffn_gate via rank dispatch
+    FFN_UP_EXPS        = "ffn_up_exps"
+    FFN_DOWN_EXPS      = "ffn_down_exps"
+    SSM_ALPHA          = "ssm_alpha"        # residual → SSM input projection
+    SSM_BETA           = "ssm_beta"
+    SSM_OUT            = "ssm_out"          # SSM → residual write
+    SSM_INTERNAL       = "ssm_internal"     # ssm_a, ssm_dt.bias, ssm_conv1d, ssm_norm
+    LM_HEAD            = "lm_head"
 
 
 # Per-arch regex pattern table. Patterns are ordered most-specific-first
 # because re.fullmatch is tried in declaration order.
+#
+# Architecture-name strings ("qwen35", "qwen35moe") come from
+# general.architecture in the GGUF metadata of the bf16 conversions produced by
+# gguf_f16_to_bf16.py. Both archs are hybrid Mamba+attention; qwen35moe adds
+# MoE FFN + shared experts on top.
 _ROLE_PATTERNS: dict[str, list[tuple[str, Role]]] = {
-    "qwen36moe": [
-        (r"token_embd\.weight",                   Role.EMBED),
-        (r"output_norm\.weight",                  Role.NORM_OUT),
-        (r"output\.weight",                       Role.LM_HEAD),
-        (r"blk\.\d+\.attn_norm\.weight",          Role.NORM_PRE_ATTN),
-        (r"blk\.\d+\.ffn_norm\.weight",           Role.NORM_PRE_FFN),
-        (r"blk\.\d+\.ssm_norm\.weight",           Role.NORM_PRE_SSM),
-        (r"blk\.\d+\.attn_q\.weight",             Role.ATTN_Q),
-        (r"blk\.\d+\.attn_k\.weight",             Role.ATTN_K),
-        (r"blk\.\d+\.attn_v\.weight",             Role.ATTN_V),
-        (r"blk\.\d+\.attn_output\.weight",        Role.ATTN_O),
-        (r"blk\.\d+\.ffn_gate_inp\.weight",       Role.FFN_GATE_INP),
-        (r"blk\.\d+\.ffn_gate_exps\.weight",      Role.FFN_GATE_EXPS),
-        (r"blk\.\d+\.ffn_up_exps\.weight",        Role.FFN_UP_EXPS),
-        (r"blk\.\d+\.ffn_down_exps\.weight",      Role.FFN_DOWN_EXPS),
-        (r"blk\.\d+\.ssm_in\.weight",             Role.MAMBA_IN),
-        (r"blk\.\d+\.ssm_out\.weight",            Role.MAMBA_OUT),
-        # Known passthroughs (rope_freqs, biases, ssm internals, etc.)
-        (r"rope_freqs\.weight",                   Role.PASSTHROUGH),
-    ],
     "qwen35": [
-        (r"token_embd\.weight",                Role.EMBED),
-        (r"output_norm\.weight",               Role.NORM_OUT),
-        (r"output\.weight",                    Role.LM_HEAD),
-        (r"blk\.\d+\.attn_norm\.weight",       Role.NORM_PRE_ATTN),
-        (r"blk\.\d+\.ffn_norm\.weight",        Role.NORM_PRE_FFN),
-        (r"blk\.\d+\.attn_q\.weight",          Role.ATTN_Q),
-        (r"blk\.\d+\.attn_k\.weight",          Role.ATTN_K),
-        (r"blk\.\d+\.attn_v\.weight",          Role.ATTN_V),
-        (r"blk\.\d+\.attn_output\.weight",     Role.ATTN_O),
-        # Dense FFN: gate/up are input-residual linears, down is output-residual.
-        # Reuse FFN_GATE_EXPS/UP_EXPS/DOWN_EXPS roles; rank-based dispatch in
-        # rotate_gguf selects input_2d/output_2d for 2D tensors vs MoE for 3D.
-        (r"blk\.\d+\.ffn_gate\.weight",        Role.FFN_GATE_EXPS),
-        (r"blk\.\d+\.ffn_up\.weight",          Role.FFN_UP_EXPS),
-        (r"blk\.\d+\.ffn_down\.weight",        Role.FFN_DOWN_EXPS),
-        (r"rope_freqs\.weight",                Role.PASSTHROUGH),
-        # Intentionally no `.*` catch-all — unknown names raise (matches qwen36moe).
+        (r"token_embd\.weight",                       Role.EMBED),
+        (r"output_norm\.weight",                      Role.NORM_OUT),
+        (r"output\.weight",                           Role.LM_HEAD),
+        (r"blk\.\d+\.attn_norm\.weight",              Role.NORM_PRE_ATTN),
+        (r"blk\.\d+\.post_attention_norm\.weight",    Role.NORM_POST_ATTN),
+        # Full-attention layers (MTP and any non-recurrent trunk layers)
+        (r"blk\.\d+\.attn_q\.weight",                 Role.ATTN_Q),
+        (r"blk\.\d+\.attn_k\.weight",                 Role.ATTN_K),
+        (r"blk\.\d+\.attn_v\.weight",                 Role.ATTN_V),
+        (r"blk\.\d+\.attn_output\.weight",            Role.ATTN_O),
+        (r"blk\.\d+\.attn_q_norm\.weight",            Role.ATTN_QK_INTERNAL),
+        (r"blk\.\d+\.attn_k_norm\.weight",            Role.ATTN_QK_INTERNAL),
+        (r"blk\.\d+\.attn_[qkv]\.bias",               Role.PASSTHROUGH),
+        # Recurrent (delta-net) layers
+        (r"blk\.\d+\.attn_qkv\.weight",               Role.ATTN_QKV),
+        (r"blk\.\d+\.attn_qkv\.bias",                 Role.PASSTHROUGH),
+        (r"blk\.\d+\.attn_gate\.weight",              Role.ATTN_GATE_FUSED),
+        (r"blk\.\d+\.ssm_alpha\.weight",              Role.SSM_ALPHA),
+        (r"blk\.\d+\.ssm_beta\.weight",               Role.SSM_BETA),
+        (r"blk\.\d+\.ssm_out\.weight",                Role.SSM_OUT),
+        (r"blk\.\d+\.ssm_a",                          Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_dt\.bias",                   Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_conv1d\.(weight|bias)",      Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_norm\.weight",               Role.SSM_INTERNAL),
+        # Dense FFN
+        (r"blk\.\d+\.ffn_gate\.weight",               Role.FFN_GATE_EXPS),
+        (r"blk\.\d+\.ffn_up\.weight",                 Role.FFN_UP_EXPS),
+        (r"blk\.\d+\.ffn_down\.weight",               Role.FFN_DOWN_EXPS),
+        # MTP / NextN — passthrough (those layers are not executed in the main pass)
+        (r"blk\.\d+\.nextn\..*",                      Role.PASSTHROUGH),
+        (r"rope_freqs\.weight",                       Role.PASSTHROUGH),
+    ],
+    "qwen35moe": [
+        (r"token_embd\.weight",                       Role.EMBED),
+        (r"output_norm\.weight",                      Role.NORM_OUT),
+        (r"output\.weight",                           Role.LM_HEAD),
+        (r"blk\.\d+\.attn_norm\.weight",              Role.NORM_PRE_ATTN),
+        (r"blk\.\d+\.post_attention_norm\.weight",    Role.NORM_POST_ATTN),
+        # Full-attention layers
+        (r"blk\.\d+\.attn_q\.weight",                 Role.ATTN_Q),
+        (r"blk\.\d+\.attn_k\.weight",                 Role.ATTN_K),
+        (r"blk\.\d+\.attn_v\.weight",                 Role.ATTN_V),
+        (r"blk\.\d+\.attn_output\.weight",            Role.ATTN_O),
+        (r"blk\.\d+\.attn_q_norm\.weight",            Role.ATTN_QK_INTERNAL),
+        (r"blk\.\d+\.attn_k_norm\.weight",            Role.ATTN_QK_INTERNAL),
+        (r"blk\.\d+\.attn_[qkv]\.bias",               Role.PASSTHROUGH),
+        # Recurrent (delta-net) layers
+        (r"blk\.\d+\.attn_qkv\.weight",               Role.ATTN_QKV),
+        (r"blk\.\d+\.attn_qkv\.bias",                 Role.PASSTHROUGH),
+        (r"blk\.\d+\.attn_gate\.weight",              Role.ATTN_GATE_FUSED),
+        (r"blk\.\d+\.ssm_alpha\.weight",              Role.SSM_ALPHA),
+        (r"blk\.\d+\.ssm_beta\.weight",               Role.SSM_BETA),
+        (r"blk\.\d+\.ssm_out\.weight",                Role.SSM_OUT),
+        (r"blk\.\d+\.ssm_a",                          Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_dt\.bias",                   Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_conv1d\.(weight|bias)",      Role.SSM_INTERNAL),
+        (r"blk\.\d+\.ssm_norm\.weight",               Role.SSM_INTERNAL),
+        # MoE FFN
+        (r"blk\.\d+\.ffn_gate_inp\.weight",           Role.FFN_GATE_INP),
+        (r"blk\.\d+\.ffn_gate_exps\.weight",          Role.FFN_GATE_EXPS),
+        (r"blk\.\d+\.ffn_up_exps\.weight",            Role.FFN_UP_EXPS),
+        (r"blk\.\d+\.ffn_down_exps\.weight",          Role.FFN_DOWN_EXPS),
+        # Shared experts (dense; reuse MoE roles → rank dispatch picks 2D primitive)
+        # ffn_gate_inp_shexp.weight is a 1D [n_embd] residual-reading vector;
+        # leaving as passthrough breaks rotation equivalence by one scalar gate
+        # per layer (small effect; refine later if PPL gap warrants it).
+        (r"blk\.\d+\.ffn_gate_inp_shexp\.weight",     Role.PASSTHROUGH),
+        (r"blk\.\d+\.ffn_gate_shexp\.weight",         Role.FFN_GATE_EXPS),
+        (r"blk\.\d+\.ffn_up_shexp\.weight",           Role.FFN_UP_EXPS),
+        (r"blk\.\d+\.ffn_down_shexp\.weight",         Role.FFN_DOWN_EXPS),
+        # MTP / NextN — passthrough
+        (r"blk\.\d+\.nextn\..*",                      Role.PASSTHROUGH),
+        (r"rope_freqs\.weight",                       Role.PASSTHROUGH),
     ],
 }
 
@@ -195,7 +240,7 @@ def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tens
     return W_rot.view(d_model, d_ffn, n_exp).contiguous()
 
 
-_NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_PRE_FFN, Role.NORM_PRE_SSM, Role.NORM_OUT}
+_NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_POST_ATTN, Role.NORM_OUT}
 
 
 def index_pass(source_path: str, arch: str) -> tuple[dict[str, Role], dict[str, torch.Tensor], int]:
@@ -243,20 +288,25 @@ def _rotation_plan(role: Role, name: str) -> tuple[str, Optional[str]]:
     if not m:
         raise ValueError(f"expected blk.N. prefix on {name!r} for role {role}")
     L = int(m.group(1))
-    if role in (Role.ATTN_Q, Role.ATTN_K, Role.ATTN_V):
+    # Residual-input linears under the pre-attention norm.
+    if role in (Role.ATTN_Q, Role.ATTN_K, Role.ATTN_V,
+                Role.ATTN_QKV, Role.ATTN_GATE_FUSED,
+                Role.SSM_ALPHA, Role.SSM_BETA):
         return ("input_2d", f"blk.{L}.attn_norm.weight")
-    if role == Role.ATTN_O:
+    # Residual-output linears (write back into the residual stream).
+    if role in (Role.ATTN_O, Role.SSM_OUT):
         return ("output_2d", None)
-    if role in (Role.FFN_GATE_INP,):
-        return ("input_2d", f"blk.{L}.ffn_norm.weight")
+    # Internal-only roles operate in a basis orthogonal to the residual.
+    if role in (Role.ATTN_QK_INTERNAL, Role.SSM_INTERNAL):
+        return ("passthrough", None)
+    # FFN sub-block reads the residual through post_attention_norm
+    # (this arch puts the FFN's input norm under the "post_attention" name).
+    if role == Role.FFN_GATE_INP:
+        return ("input_2d", f"blk.{L}.post_attention_norm.weight")
     if role in (Role.FFN_GATE_EXPS, Role.FFN_UP_EXPS):
-        return ("input_moe", f"blk.{L}.ffn_norm.weight")
+        return ("input_moe", f"blk.{L}.post_attention_norm.weight")
     if role == Role.FFN_DOWN_EXPS:
         return ("output_moe", None)
-    if role == Role.MAMBA_IN:
-        return ("input_2d", f"blk.{L}.ssm_norm.weight")
-    if role == Role.MAMBA_OUT:
-        return ("output_2d", None)
     raise ValueError(f"no rotation plan for role {role}")
 
 
@@ -281,20 +331,24 @@ def _bytes_from_fp32(t: torch.Tensor, gguf_dtype) -> np.ndarray:
 
 
 def _gguf_tensor_to_torch(t) -> torch.Tensor:
-    """Materialize a GGUFReader BF16/F16/F32 tensor as a fp32 torch tensor in
-    PyTorch (row-major / C) axis order.
+    """Materialize a GGUFReader tensor as a fp32 torch tensor in PyTorch
+    (row-major / C) axis order.
 
-    GGUFReader stores shape in GGUF file order, which is the reverse of C order.
-    Reversing t.shape recovers the [out, in, ...] PyTorch convention. For 1D γ
-    vectors the reverse is a no-op, so this function handles both linears and
-    norm weights.
+    GGUFReader's t.data layout differs by source dtype:
+      - BF16: uint8 byte buffer shape (n_out, n_in*2); view as bf16 then reshape.
+      - F16/F32: already a typed numpy array of element shape (matches t.shape).
+
+    Reversing t.shape recovers the [out, in, ...] PyTorch convention for the
+    BF16 byte-view path. For 1D γ vectors the reverse is a no-op.
     """
     target = _GGUF_DTYPE_TO_TORCH.get(t.tensor_type.name)
     if target is None:
         raise ValueError(f"{t.name}: unsupported dtype {t.tensor_type.name}")
-    arr = np.asarray(t.data, dtype=np.uint8).copy()  # detach from mmap
-    torch_shape = [int(s) for s in reversed(list(t.shape))]
-    return torch.from_numpy(arr).view(target).reshape(*torch_shape).to(torch.float32)
+    if t.tensor_type.name == "BF16":
+        arr = np.asarray(t.data, dtype=np.uint8).copy()
+        torch_shape = [int(s) for s in reversed(list(t.shape))]
+        return torch.from_numpy(arr).view(target).reshape(*torch_shape).to(torch.float32)
+    return torch.from_numpy(t.data.copy()).to(torch.float32)
 
 
 # Internal GGUF metadata fields and auto-added fields to skip during KV copy.

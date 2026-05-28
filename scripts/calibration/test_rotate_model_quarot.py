@@ -14,37 +14,56 @@ def _assert_eq(actual, expected, label):
     assert actual == expected, f"{label}: got {actual!r}, expected {expected!r}"
 
 
-def test_classify_qwen36_tensors():
-    """Known Qwen3.6 MoE tensor names map to expected roles."""
+def test_classify_qwen35moe_tensors():
+    """Known Qwen3.5-MoE (hybrid Mamba + attn + MoE + shared experts) tensor names map to expected roles."""
     cases = [
-        ("token_embd.weight",                 Role.EMBED),
-        ("blk.0.attn_norm.weight",            Role.NORM_PRE_ATTN),
-        ("blk.0.attn_q.weight",               Role.ATTN_Q),
-        ("blk.0.attn_k.weight",               Role.ATTN_K),
-        ("blk.0.attn_v.weight",               Role.ATTN_V),
-        ("blk.0.attn_output.weight",          Role.ATTN_O),
-        ("blk.0.ffn_norm.weight",             Role.NORM_PRE_FFN),
-        ("blk.0.ffn_gate_inp.weight",         Role.FFN_GATE_INP),
-        ("blk.0.ffn_gate_exps.weight",        Role.FFN_GATE_EXPS),
-        ("blk.0.ffn_up_exps.weight",          Role.FFN_UP_EXPS),
-        ("blk.0.ffn_down_exps.weight",        Role.FFN_DOWN_EXPS),
-        ("blk.0.ssm_norm.weight",             Role.NORM_PRE_SSM),
-        ("blk.0.ssm_in.weight",               Role.MAMBA_IN),
-        ("blk.0.ssm_out.weight",              Role.MAMBA_OUT),
-        ("output_norm.weight",                Role.NORM_OUT),
-        ("output.weight",                     Role.LM_HEAD),
-        ("rope_freqs.weight",                 Role.PASSTHROUGH),
+        ("token_embd.weight",                       Role.EMBED),
+        ("blk.0.attn_norm.weight",                  Role.NORM_PRE_ATTN),
+        ("blk.0.post_attention_norm.weight",        Role.NORM_POST_ATTN),
+        # Full-attention layer tensors
+        ("blk.0.attn_q.weight",                     Role.ATTN_Q),
+        ("blk.0.attn_k.weight",                     Role.ATTN_K),
+        ("blk.0.attn_v.weight",                     Role.ATTN_V),
+        ("blk.0.attn_output.weight",                Role.ATTN_O),
+        ("blk.0.attn_q_norm.weight",                Role.ATTN_QK_INTERNAL),
+        ("blk.0.attn_k_norm.weight",                Role.ATTN_QK_INTERNAL),
+        # Recurrent (delta-net) tensors
+        ("blk.0.attn_qkv.weight",                   Role.ATTN_QKV),
+        ("blk.0.attn_qkv.bias",                     Role.PASSTHROUGH),
+        ("blk.0.attn_gate.weight",                  Role.ATTN_GATE_FUSED),
+        ("blk.0.ssm_alpha.weight",                  Role.SSM_ALPHA),
+        ("blk.0.ssm_beta.weight",                   Role.SSM_BETA),
+        ("blk.0.ssm_out.weight",                    Role.SSM_OUT),
+        ("blk.0.ssm_a",                             Role.SSM_INTERNAL),
+        ("blk.0.ssm_dt.bias",                       Role.SSM_INTERNAL),
+        ("blk.0.ssm_conv1d.weight",                 Role.SSM_INTERNAL),
+        ("blk.0.ssm_norm.weight",                   Role.SSM_INTERNAL),
+        # MoE FFN
+        ("blk.0.ffn_gate_inp.weight",               Role.FFN_GATE_INP),
+        ("blk.0.ffn_gate_exps.weight",              Role.FFN_GATE_EXPS),
+        ("blk.0.ffn_up_exps.weight",                Role.FFN_UP_EXPS),
+        ("blk.0.ffn_down_exps.weight",              Role.FFN_DOWN_EXPS),
+        # Shared experts (dense FFN alongside MoE)
+        ("blk.0.ffn_gate_inp_shexp.weight",         Role.PASSTHROUGH),
+        ("blk.0.ffn_gate_shexp.weight",             Role.FFN_GATE_EXPS),
+        ("blk.0.ffn_up_shexp.weight",               Role.FFN_UP_EXPS),
+        ("blk.0.ffn_down_shexp.weight",             Role.FFN_DOWN_EXPS),
+        # NextN/MTP — load but not executed in the main pass
+        ("blk.0.nextn.eh_proj.weight",              Role.PASSTHROUGH),
+        ("output_norm.weight",                      Role.NORM_OUT),
+        ("output.weight",                           Role.LM_HEAD),
+        ("rope_freqs.weight",                       Role.PASSTHROUGH),
     ]
     for name, expected in cases:
-        actual = classify_tensor(name, arch="qwen36moe")
-        _assert_eq(actual, expected, f"qwen36moe / {name}")
-    print(f"  PASS test_classify_qwen36_tensors")
+        actual = classify_tensor(name, arch="qwen35moe")
+        _assert_eq(actual, expected, f"qwen35moe / {name}")
+    print(f"  PASS test_classify_qwen35moe_tensors")
 
 
 def test_classify_unknown_raises():
     """Unknown tensor name on a known arch raises with the name in the message."""
     try:
-        classify_tensor("blk.0.fictional.weight", arch="qwen36moe")
+        classify_tensor("blk.0.fictional.weight", arch="qwen35moe")
     except ValueError as e:
         msg = str(e)
         assert "blk.0.fictional.weight" in msg, f"name missing from error: {msg}"
@@ -200,17 +219,17 @@ import subprocess
 import tempfile
 from pathlib import Path as _Path
 
-def _make_tiny_qwen36_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, d_ffn: int = 48, n_exp: int = 4):
-    """Write a tiny qwen36moe-shaped bf16 GGUF for unit tests."""
+def _make_tiny_qwen35moe_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, d_ffn: int = 48, n_exp: int = 4):
+    """Write a tiny qwen35moe-shaped bf16 GGUF for unit tests."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
     import gguf as _gguf
     import numpy as _np
 
-    w = _gguf.GGUFWriter(out_path, arch="qwen36moe")
-    w.add_uint32("qwen36moe.embedding_length", d_model)
-    w.add_uint32("qwen36moe.block_count", n_layers)
-    w.add_uint32("qwen36moe.feed_forward_length", d_ffn)
-    w.add_uint32("qwen36moe.expert_count", n_exp)
+    w = _gguf.GGUFWriter(out_path, arch="qwen35moe")
+    w.add_uint32("qwen35moe.embedding_length", d_model)
+    w.add_uint32("qwen35moe.block_count", n_layers)
+    w.add_uint32("qwen35moe.feed_forward_length", d_ffn)
+    w.add_uint32("qwen35moe.expert_count", n_exp)
 
     def _add_bf16(name, t):
         data = _np.ascontiguousarray(t.to(torch.bfloat16).view(torch.uint8).numpy())
@@ -224,7 +243,7 @@ def _make_tiny_qwen36_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, 
         _add_bf16(f"blk.{L}.attn_k.weight",       torch.randn(d_model, d_model))
         _add_bf16(f"blk.{L}.attn_v.weight",       torch.randn(d_model, d_model))
         _add_bf16(f"blk.{L}.attn_output.weight",  torch.randn(d_model, d_model))
-        _add_bf16(f"blk.{L}.ffn_norm.weight",     torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        _add_bf16(f"blk.{L}.post_attention_norm.weight", torch.ones(d_model) + 0.1 * torch.randn(d_model))
         _add_bf16(f"blk.{L}.ffn_gate_inp.weight", torch.randn(n_exp, d_model))
         _add_bf16(f"blk.{L}.ffn_gate_exps.weight", torch.randn(d_ffn, d_model, n_exp))
         _add_bf16(f"blk.{L}.ffn_up_exps.weight",   torch.randn(d_ffn, d_model, n_exp))
@@ -244,8 +263,8 @@ def test_index_pass_on_tiny_gguf():
     """Pass 1 builds a roster mapping every tensor name to a Role, and a γ map."""
     with tempfile.TemporaryDirectory() as td:
         path = str(_Path(td) / "tiny.gguf")
-        _make_tiny_qwen36_gguf(path, n_layers=2)
-        roster, gammas, d_model = index_pass(path, arch="qwen36moe")
+        _make_tiny_qwen35moe_gguf(path, n_layers=2)
+        roster, gammas, d_model = index_pass(path, arch="qwen35moe")
 
     assert d_model == 32, f"d_model {d_model}"
     assert roster["token_embd.weight"] == Role.EMBED
@@ -266,9 +285,9 @@ def test_rotate_gguf_end_to_end_on_tiny():
     with tempfile.TemporaryDirectory() as td:
         src = str(_Path(td) / "src.gguf")
         dst = str(_Path(td) / "dst.gguf")
-        _make_tiny_qwen36_gguf(src, n_layers=2, d_model=32, d_ffn=48, n_exp=4)
+        _make_tiny_qwen35moe_gguf(src, n_layers=2, d_model=32, d_ffn=48, n_exp=4)
 
-        rotate_gguf(source_path=src, output_path=dst, arch="qwen36moe",
+        rotate_gguf(source_path=src, output_path=dst, arch="qwen35moe",
                     seed=42, device=torch.device("cpu"))
 
         # Re-load and check shapes + γs zeroed-to-1.
@@ -313,7 +332,7 @@ def _make_tiny_qwen35_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, 
         _add_bf16(f"blk.{L}.attn_k.weight",      torch.randn(d_model, d_model))
         _add_bf16(f"blk.{L}.attn_v.weight",      torch.randn(d_model, d_model))
         _add_bf16(f"blk.{L}.attn_output.weight", torch.randn(d_model, d_model))
-        _add_bf16(f"blk.{L}.ffn_norm.weight",    torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        _add_bf16(f"blk.{L}.post_attention_norm.weight", torch.ones(d_model) + 0.1 * torch.randn(d_model))
         # Dense FFN: gate/up [d_ffn, d_model], down [d_model, d_ffn] (PyTorch convention)
         _add_bf16(f"blk.{L}.ffn_gate.weight",    torch.randn(d_ffn, d_model))
         _add_bf16(f"blk.{L}.ffn_up.weight",      torch.randn(d_ffn, d_model))
@@ -372,11 +391,11 @@ def test_cli_produces_gguf_and_sidecar():
     with tempfile.TemporaryDirectory() as td:
         src = str(_Path(td) / "src.gguf")
         dst = str(_Path(td) / "dst.gguf")
-        _make_tiny_qwen36_gguf(src, n_layers=2)
+        _make_tiny_qwen35moe_gguf(src, n_layers=2)
         result = subprocess.run(
             [sys.executable, str(_Path(__file__).resolve().parent / "rotate_model_quarot.py"),
              "--source", src, "--output", dst,
-             "--arch", "qwen36moe", "--seed", "42"],
+             "--arch", "qwen35moe", "--seed", "42"],
             capture_output=True, text=True, check=False,
         )
         assert result.returncode == 0, f"CLI failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -385,7 +404,7 @@ def test_cli_produces_gguf_and_sidecar():
         assert sidecar.exists(), "sidecar JSON missing"
         payload = _json.loads(sidecar.read_text())
         assert payload["seed"] == 42
-        assert payload["arch"] == "qwen36moe"
+        assert payload["arch"] == "qwen35moe"
         assert payload["d_model"] == 32
         assert any("attn_q" in n for n in payload["rotated_tensors"])
         assert any("attn_norm" in n for n in payload["absorbed_norms"])
@@ -393,7 +412,7 @@ def test_cli_produces_gguf_and_sidecar():
 
 
 if __name__ == "__main__":
-    test_classify_qwen36_tensors()
+    test_classify_qwen35moe_tensors()
     test_classify_unknown_raises()
     test_R_resid_orthogonal_pow2()
     test_R_resid_orthogonal_kronecker()
