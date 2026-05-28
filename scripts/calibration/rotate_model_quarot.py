@@ -66,6 +66,25 @@ _ROLE_PATTERNS: dict[str, list[tuple[str, Role]]] = {
         # Known passthroughs (rope_freqs, biases, ssm internals, etc.)
         (r"rope_freqs\.weight",                   Role.PASSTHROUGH),
     ],
+    "qwen35": [
+        (r"token_embd\.weight",                Role.EMBED),
+        (r"output_norm\.weight",               Role.NORM_OUT),
+        (r"output\.weight",                    Role.LM_HEAD),
+        (r"blk\.\d+\.attn_norm\.weight",       Role.NORM_PRE_ATTN),
+        (r"blk\.\d+\.ffn_norm\.weight",        Role.NORM_PRE_FFN),
+        (r"blk\.\d+\.attn_q\.weight",          Role.ATTN_Q),
+        (r"blk\.\d+\.attn_k\.weight",          Role.ATTN_K),
+        (r"blk\.\d+\.attn_v\.weight",          Role.ATTN_V),
+        (r"blk\.\d+\.attn_output\.weight",     Role.ATTN_O),
+        # Dense FFN: gate/up are input-residual linears, down is output-residual.
+        # Reuse FFN_GATE_EXPS/UP_EXPS/DOWN_EXPS roles; rank-based dispatch in
+        # rotate_gguf selects input_2d/output_2d for 2D tensors vs MoE for 3D.
+        (r"blk\.\d+\.ffn_gate\.weight",        Role.FFN_GATE_EXPS),
+        (r"blk\.\d+\.ffn_up\.weight",          Role.FFN_UP_EXPS),
+        (r"blk\.\d+\.ffn_down\.weight",        Role.FFN_DOWN_EXPS),
+        (r"rope_freqs\.weight",                Role.PASSTHROUGH),
+        # Intentionally no `.*` catch-all — unknown names raise (matches qwen36moe).
+    ],
 }
 
 
@@ -310,6 +329,13 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
     for t in r.tensors:
         role = roster[t.name]
         kind, gamma_name = _rotation_plan(role, t.name)
+        # Rank-based dispatch: FFN_GATE_EXPS/UP_EXPS/DOWN_EXPS roles map to MoE
+        # primitives by default, but dense 2D tensors (e.g. Qwen3.5-4B ffn_gate/
+        # ffn_up/ffn_down) use the 2D primitives instead.
+        if kind == "input_moe" and len(t.shape) == 2:
+            kind = "input_2d"
+        if kind == "output_moe" and len(t.shape) == 2:
+            kind = "output_2d"
 
         if kind == "passthrough":
             # Copy raw bytes unchanged; let gguf-py derive shape from the uint8 array.

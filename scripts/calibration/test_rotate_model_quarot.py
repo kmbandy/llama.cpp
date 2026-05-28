@@ -289,6 +289,84 @@ def test_rotate_gguf_end_to_end_on_tiny():
     print(f"  PASS test_rotate_gguf_end_to_end_on_tiny")
 
 
+def _make_tiny_qwen35_gguf(out_path: str, n_layers: int = 2, d_model: int = 32, d_ffn: int = 48):
+    """Write a tiny qwen35-shaped (dense, no MoE) bf16 GGUF for unit tests."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
+    import gguf as _gguf
+    import numpy as _np
+
+    w = _gguf.GGUFWriter(out_path, arch="qwen35")
+    w.add_uint32("qwen35.embedding_length", d_model)
+    w.add_uint32("qwen35.block_count", n_layers)
+    w.add_uint32("qwen35.feed_forward_length", d_ffn)
+
+    def _add_bf16(name, t):
+        data = _np.ascontiguousarray(t.to(torch.bfloat16).view(torch.uint8).numpy())
+        w.add_tensor(name, data, raw_dtype=_gguf.GGMLQuantizationType.BF16)
+
+    vocab = 64
+    _add_bf16("token_embd.weight",   torch.randn(vocab, d_model))
+    for L in range(n_layers):
+        _add_bf16(f"blk.{L}.attn_norm.weight",   torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        # Attention: q/k/v/output shapes [d_model, d_model]
+        _add_bf16(f"blk.{L}.attn_q.weight",      torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_k.weight",      torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_v.weight",      torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.attn_output.weight", torch.randn(d_model, d_model))
+        _add_bf16(f"blk.{L}.ffn_norm.weight",    torch.ones(d_model) + 0.1 * torch.randn(d_model))
+        # Dense FFN: gate/up [d_ffn, d_model], down [d_model, d_ffn] (PyTorch convention)
+        _add_bf16(f"blk.{L}.ffn_gate.weight",    torch.randn(d_ffn, d_model))
+        _add_bf16(f"blk.{L}.ffn_up.weight",      torch.randn(d_ffn, d_model))
+        _add_bf16(f"blk.{L}.ffn_down.weight",    torch.randn(d_model, d_ffn))
+    _add_bf16("output_norm.weight",  torch.ones(d_model) + 0.1 * torch.randn(d_model))
+    _add_bf16("output.weight",       torch.randn(vocab, d_model))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def test_rotate_gguf_end_to_end_on_tiny_dense():
+    """rotate_gguf works on a dense (non-MoE) qwen35-arch GGUF using rank-based dispatch."""
+    with tempfile.TemporaryDirectory() as td:
+        src = str(_Path(td) / "src_dense.gguf")
+        dst = str(_Path(td) / "dst_dense.gguf")
+        _make_tiny_qwen35_gguf(src, n_layers=2, d_model=32, d_ffn=48)
+
+        rotate_gguf(source_path=src, output_path=dst, arch="qwen35",
+                    seed=42, device=torch.device("cpu"))
+
+        # Verify output is a valid GGUF with matching shapes.
+        sys.path.insert(0, "/home/kmbandy/GitHub/llama.cpp/gguf-py")
+        import gguf as _gguf
+        r = _gguf.GGUFReader(dst)
+        names = {t.name for t in r.tensors}
+
+        # Every source tensor must be present.
+        assert "token_embd.weight" in names, "token_embd.weight missing"
+        assert "blk.0.ffn_gate.weight" in names, "blk.0.ffn_gate.weight missing"
+        assert "blk.0.ffn_up.weight" in names, "blk.0.ffn_up.weight missing"
+        assert "blk.0.ffn_down.weight" in names, "blk.0.ffn_down.weight missing"
+        assert "blk.1.ffn_gate.weight" in names, "blk.1.ffn_gate.weight missing"
+
+        # γ tensors written as all-ones (absorbed).
+        gamma_t = next(t for t in r.tensors if t.name == "blk.0.attn_norm.weight")
+        gamma_v = _gguf_tensor_to_torch(gamma_t)
+        _assert_close(gamma_v, torch.ones(32), tol=1e-2, label="dense γ written as ones")
+
+        # Rotated weight shapes match source (GGUF file-order shape).
+        gate_t = next(t for t in r.tensors if t.name == "blk.0.ffn_gate.weight")
+        # GGUF stores shape reversed vs PyTorch: [d_model, d_ffn] in file order.
+        assert list(gate_t.shape) == [32, 48], f"ffn_gate shape {list(gate_t.shape)}"
+        down_t = next(t for t in r.tensors if t.name == "blk.0.ffn_down.weight")
+        assert list(down_t.shape) == [48, 32], f"ffn_down shape {list(down_t.shape)}"
+
+        q_t = next(t for t in r.tensors if t.name == "blk.0.attn_q.weight")
+        assert list(q_t.shape) == [32, 32], f"attn_q shape {list(q_t.shape)}"
+
+    print(f"  PASS test_rotate_gguf_end_to_end_on_tiny_dense")
+
+
 def test_cli_produces_gguf_and_sidecar():
     """CLI invocation writes both the rotated GGUF and the sidecar JSON next to it."""
     with tempfile.TemporaryDirectory() as td:
@@ -327,5 +405,6 @@ if __name__ == "__main__":
     test_moe_output_side_matches_per_expert_loop()
     test_index_pass_on_tiny_gguf()
     test_rotate_gguf_end_to_end_on_tiny()
+    test_rotate_gguf_end_to_end_on_tiny_dense()
     test_cli_produces_gguf_and_sidecar()
     print("\nALL TESTS PASSED")
