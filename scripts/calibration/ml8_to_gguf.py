@@ -8,6 +8,10 @@ Input:
     --calib-dir DIR/            # directory of .pt ml8 calibration blobs
                                 # (one per Linear, matching naming convention
                                 #  model.layers.{L}.mlp.{gate,up,down}_proj)
+                                # Also accepts full-model blobs from
+                                # calibrate_ml8_paged --dense-coverage full:
+                                #   {name}.pt      — new ML8-tier roles
+                                #   {name}.fp8.pt  — FP8-tier (token_embd, ssm_*)
 Output:
     --out-gguf OUT.gguf         # GGUF with the matching MLP weights replaced
                                 # by GGML_TYPE_ML8_4 tensors + sidecars:
@@ -16,6 +20,10 @@ Output:
                                 #   blk.{L}.ffn_{gate,up,down}.weight.rotation_h_a F32  (opt)
                                 #   blk.{L}.ffn_{gate,up,down}.weight.rotation_meta I32 (opt)
                                 #   blk.{L}.ffn_{gate,up,down}.weight.awq_scale    F32  (opt)
+                                # New ML8-tier roles (attn/ssm/lm_head/eh_proj):
+                                #   Same sidecar structure as FFN.
+                                # FP8-tier (token_embd, ssm_alpha, ssm_beta):
+                                #   <name>.weight                                  ML8_FP8
 
 Non-MLP tensors pass through unchanged from the base GGUF. RAM peak ~one
 tensor at a time (~100 MB on Qwen3.5-4B; the base GGUF is mmapped).
@@ -58,7 +66,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"
 
 import gguf  # noqa: E402
 from gguf import GGMLQuantizationType  # noqa: E402
+from gguf.constants import GGML_QUANT_SIZES  # noqa: E402
 from ml8_io import load_ml8_layer, get_rotation, get_awq  # noqa: E402
+from role_targets import classify_role, Tier  # noqa: E402
 
 
 # Block constants — must match ggml/src/ggml-common.h::block_ml8_4 + QK_ML8
@@ -233,6 +243,70 @@ def cast_centroids_to_fp8(centroids: torch.Tensor) -> np.ndarray:
     return fp8.view(torch.uint8).contiguous().numpy()
 
 
+# FP8 block constants — must match ML8_FP8 ggml block layout.
+_FP8_GROUP_SIZE = 32   # FIXED — matches GGML_QUANT_SIZES[ML8_FP8] block_size
+_FP8_BLOCK_BYTES = 34  # 2 bytes fp16 scale + 32 bytes e4m3 = 34
+
+
+def pack_scaled_fp8_blocks(e4m3_f32: torch.Tensor,
+                           scale_fp16: torch.Tensor) -> np.ndarray:
+    """Pack a scaled-FP8 weight into the ML8_FP8 on-disk block layout.
+
+    On-disk layout: for weight [N rows, K cols], K divisible by 32, stored as
+    N × (K/32) blocks row-major.  Each block is 34 bytes:
+        [scale : 1×float16 little-endian (2 bytes)][qs : 32×uint8 e4m3]
+
+    Args:
+        e4m3_f32  : [N, K] float32 tensor whose values lie on the e4m3 lattice
+                    (i.e. already cast to fp8 then back; or just in-range fp32).
+        scale_fp16: [N, K//32] float16 (or float32) per-block scales.
+
+    Returns:
+        uint8 ndarray of shape (N, (K//32) * 34) — ready to hand to
+        writer.add_tensor(..., raw_dtype=GGMLQuantizationType.ML8_FP8).
+    """
+    # Sanity-check GGML_QUANT_SIZES so the assert is caught early if the
+    # constant file is inconsistent with this packer.
+    _bs, _ts = GGML_QUANT_SIZES[GGMLQuantizationType.ML8_FP8]
+    assert _bs == _FP8_GROUP_SIZE and _ts == _FP8_BLOCK_BYTES, (
+        f"ML8_FP8 GGML_QUANT_SIZES mismatch: expected ({_FP8_GROUP_SIZE}, "
+        f"{_FP8_BLOCK_BYTES}), got ({_bs}, {_ts})"
+    )
+
+    if e4m3_f32.dim() != 2:
+        raise ValueError(f"e4m3_f32 must be 2D, got {tuple(e4m3_f32.shape)}")
+    N, K = e4m3_f32.shape
+    if K % _FP8_GROUP_SIZE != 0:
+        raise ValueError(f"K={K} not divisible by FP8 group size {_FP8_GROUP_SIZE}")
+    n_blocks = K // _FP8_GROUP_SIZE
+    if scale_fp16.shape != (N, n_blocks):
+        raise ValueError(
+            f"scale shape {tuple(scale_fp16.shape)} != expected ({N}, {n_blocks})"
+        )
+
+    # Encode e4m3 bytes: canonical encoding identical to cast_centroids_to_fp8.
+    qs_bytes = (e4m3_f32.detach().cpu()
+                .to(torch.float32)
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                .contiguous()
+                .numpy())  # [N, K] uint8
+
+    out = np.empty((N, n_blocks * _FP8_BLOCK_BYTES), dtype=np.uint8)
+    for b in range(n_blocks):
+        block_off = b * _FP8_BLOCK_BYTES
+        # Scale: 2-byte fp16 little-endian at block start.
+        scale_row = scale_fp16[:, b].detach().cpu().to(torch.float16).contiguous()
+        scale_u8 = scale_row.view(torch.uint8).numpy()  # [N, 2]
+        out[:, block_off : block_off + 2] = scale_u8.reshape(N, 2)
+        # e4m3 bytes: 32 bytes per block.
+        col_start = b * _FP8_GROUP_SIZE
+        out[:, block_off + 2 : block_off + _FP8_BLOCK_BYTES] = (
+            qs_bytes[:, col_start : col_start + _FP8_GROUP_SIZE]
+        )
+    return out
+
+
 # ─── Sidecar tensor helpers ────────────────────────────────────────────────
 
 
@@ -266,15 +340,33 @@ def _build_blob_map(calib_dir: Path) -> dict[str, list[tuple[int | None, Path]]]
 
     Dense entries have a single-element list with expert_id=None. MoE
     entries have one list element per expert (already sorted by expert id
-    at the end so the stack ordering is deterministic)."""
+    at the end so the stack ordering is deterministic).
+
+    Discovers both legacy MLP/MoE blobs (via parse_hf_name) and new full-model
+    ML8-tier blobs for attn/ssm/lm_head/eh_proj roles (via classify_role).
+    FP8-tier blobs (*.fp8.pt) are excluded here — they are handled by
+    _build_fp8_blob_map.
+    """
     out: dict[str, list[tuple[int | None, Path]]] = {}
     for p in calib_dir.glob("*.pt"):
+        # FP8-tier blobs share the *.pt suffix pattern — exclude them here.
+        if p.name.endswith(".fp8.pt"):
+            continue
         blob = torch.load(p, map_location="cpu", weights_only=False)
         hf_name = blob.get("name", p.stem.replace("_", "."))
         try:
             gguf_name, expert_id = parse_hf_name(hf_name)
         except ValueError:
-            print(f"[skip] {p.name}: HF name {hf_name!r} doesn't match MLP/MoE pattern")
+            # Not an MLP/MoE pattern — try the full-model role classifier.
+            gguf_name_r, _role, tier = classify_role(hf_name)
+            if tier is Tier.ML8:
+                # Dense new-role blob (attn/ssm/lm_head/eh_proj/etc.).
+                out.setdefault(gguf_name_r, []).append((None, p))
+            else:
+                print(
+                    f"[skip] {p.name}: HF name {hf_name!r} doesn't match "
+                    f"MLP/MoE pattern and role is {tier.value} (not ML8)"
+                )
             continue
         out.setdefault(gguf_name, []).append((expert_id, p))
     # Validate + sort.
@@ -296,6 +388,34 @@ def _build_blob_map(calib_dir: Path) -> dict[str, list[tuple[int | None, Path]]]
     return out
 
 
+def _build_fp8_blob_map(calib_dir: Path) -> dict[str, Path]:
+    """Map GGUF tensor name → FP8 blob path for scaled-FP8 tier weights.
+
+    Globs *.fp8.pt blobs and maps each blob's 'name' field via classify_role.
+    Only Tier.FP8 blobs are included (others would be unexpected and are warned).
+    """
+    out: dict[str, Path] = {}
+    for p in calib_dir.glob("*.fp8.pt"):
+        blob = torch.load(p, map_location="cpu", weights_only=False)
+        hf_name = blob.get("name", "")
+        if not hf_name:
+            print(f"[skip-fp8] {p.name}: blob has no 'name' field")
+            continue
+        gguf_name, _role, tier = classify_role(hf_name)
+        if tier is not Tier.FP8:
+            print(
+                f"[skip-fp8] {p.name}: HF name {hf_name!r} has tier "
+                f"{tier.value} (expected FP8)"
+            )
+            continue
+        if gguf_name in out:
+            raise RuntimeError(
+                f"Duplicate FP8 blob for {gguf_name!r}: {out[gguf_name]} and {p}"
+            )
+        out[gguf_name] = p
+    return out
+
+
 def _copy_field(writer: gguf.GGUFWriter, name: str, field) -> None:
     """Replicate a base-GGUF metadata field into the new writer."""
     types = field.types
@@ -310,7 +430,33 @@ def _copy_field(writer: gguf.GGUFWriter, name: str, field) -> None:
         writer.add_key_value(name, value, primary)
 
 
-def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dict:
+def evaluate_coverage(params_ml8: int, params_fp8: int,
+                      params_passthrough_weight: int,
+                      min_coverage: float) -> tuple[float, bool, dict]:
+    """Matmul-weight quantization coverage and whether it's below the refuse
+    threshold. Pure arithmetic — factored out of convert_to_ml8_gguf so the
+    guardrail decision is unit-testable without building a GGUF.
+
+    coverage = (ml8_params + fp8_params) / total_weight_params.
+    The FP8 tier (8-bit scaled-FP8 for embed/ssm) is credited as quantized
+    since it represents a genuine compression from bf16.
+
+    Returns (coverage_fraction, below_threshold, breakdown_dict) where
+    breakdown_dict has keys "ml8", "fp8", "bf16" (each as a fraction of total).
+    """
+    total = params_ml8 + params_fp8 + params_passthrough_weight
+    coverage = (params_ml8 + params_fp8) / total if total else 0.0
+    breakdown = {
+        "ml8": params_ml8 / total if total else 0.0,
+        "fp8": params_fp8 / total if total else 0.0,
+        "bf16": params_passthrough_weight / total if total else 0.0,
+    }
+    return coverage, coverage < min_coverage, breakdown
+
+
+def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path,
+                        min_coverage: float = 0.85,
+                        allow_partial: bool = False) -> dict:
     reader = gguf.GGUFReader(base_gguf)
     arch = reader.fields["general.architecture"].contents()
     print(f"[base] {base_gguf}  arch={arch!r}  "
@@ -342,7 +488,9 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
         pass
 
     blob_map = _build_blob_map(calib_dir)
-    print(f"[blobs] {len(blob_map)} calibrated layers → ml8 tensors + sidecars")
+    fp8_blob_map = _build_fp8_blob_map(calib_dir)
+    print(f"[blobs] {len(blob_map)} ml8 calibrated layers → ml8 tensors + sidecars; "
+          f"{len(fp8_blob_map)} fp8 blob(s) → ML8_FP8 tensors")
 
     # Spool tensor bytes to a temp file on the same disk as the output
     # (NVMe) — keeps process heap bounded regardless of total output size.
@@ -367,10 +515,25 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
 
     n_ml8 = 0
     n_moe = 0
+    n_fp8 = 0
     n_centroids = 0
     n_rot = 0
     n_awq = 0
     n_copied = 0
+    # ── Quantization-coverage accounting (the guardrail) ───────────────────
+    # The failure this prevents: silently emitting a GGUF where most of the
+    # model's matmul weight stayed bf16 (e.g. FFN-only calibration on a dense
+    # hybrid model → 76% un-quantized) and calling it a "4-bit" artifact.
+    # We count *original parameters* (not packed bytes) so a quantized tensor
+    # is credited its full original weight share — apples-to-apples with the
+    # bf16 tensors it's compared against. "Weight" = any 2-D+ `.weight` tensor
+    # (norms/biases are 1-D and legitimately stay high-precision in every
+    # scheme, so they're excluded from the coverage denominator).
+    # params_ml8 = 4-bit ml8 quantized params; params_fp8 = 8-bit FP8 params.
+    params_ml8 = 0
+    params_fp8 = 0
+    params_passthrough_weight = 0
+    passthrough_weights: list[tuple[str, int, str]] = []   # (name, params, dtype)
     for tensor in reader.tensors:
         if tensor.name in blob_map:
             entries = blob_map[tensor.name]
@@ -438,11 +601,13 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
                 writer.add_tensor(tensor.name, arr,
                                   raw_dtype=GGMLQuantizationType.ML8_4_SOA)
                 n_moe += 1
+                params_ml8 += n_experts * N_per * K_logical
             else:
                 packed = pack_ml8_blocks(indices0, scales0)
                 writer.add_tensor(tensor.name, packed,
                                   raw_dtype=GGMLQuantizationType.ML8_4)
                 n_ml8 += 1
+                params_ml8 += N * K
 
             # Sidecar names follow the llama.cpp convention used for `_s` scale
             # tensors: same root as the main weight, different suffix.
@@ -507,6 +672,20 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
                                 f"— MoE inference requires identical AWQ scale across experts.")
                 writer.add_tensor(base + ".awq_scale", awq_np_ref.numpy())
                 n_awq += 1
+        elif tensor.name in fp8_blob_map:
+            # FP8-tier blob: write as ML8_FP8 instead of copying bf16.
+            fp8_path = fp8_blob_map[tensor.name]
+            fp8_blob = torch.load(fp8_path, map_location="cpu", weights_only=False)
+            e4m3_f32 = fp8_blob["e4m3"]          # float32 on e4m3 lattice [N, K]
+            scale_fp16 = fp8_blob["scale"]        # fp16 [N, K//32]
+            N_fp8, K_fp8 = e4m3_f32.shape
+            packed_fp8 = pack_scaled_fp8_blocks(e4m3_f32, scale_fp16)
+            writer.add_tensor(tensor.name, packed_fp8,
+                              raw_dtype=GGMLQuantizationType.ML8_FP8)
+            if base_fd >= 0:
+                _advise_dontneed(base_fd, tensor.data_offset, tensor.n_bytes)
+            n_fp8 += 1
+            params_fp8 += N_fp8 * K_fp8
         else:
             # Pass-through non-MLP tensor. Copy bytes from the mmap into a
             # fresh allocation before handing to the writer (use_temp_file
@@ -519,11 +698,67 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
             if base_fd >= 0:
                 _advise_dontneed(base_fd, tensor.data_offset, tensor.n_bytes)
             n_copied += 1
+            # Count un-quantized matmul weights against coverage. A 2-D+ tensor
+            # named `.weight` is a linear/embedding weight that a real 4-bit
+            # artifact would quantize; leaving it bf16 is exactly the gap we
+            # refuse to ship silently. 1-D norms/biases are excluded.
+            if tensor.name.endswith(".weight") and len(tensor.shape) >= 2:
+                p = int(np.prod(tensor.shape))
+                params_passthrough_weight += p
+                passthrough_weights.append(
+                    (tensor.name, p, tensor.tensor_type.name))
 
     print(
-        f"[tensors] dense_ml8={n_ml8}, moe_ml8={n_moe}, centroids={n_centroids}, "
-        f"rotation={n_rot}, awq={n_awq}, copied unchanged={n_copied}"
+        f"[tensors] dense_ml8={n_ml8}, moe_ml8={n_moe}, fp8={n_fp8}, "
+        f"centroids={n_centroids}, rotation={n_rot}, awq={n_awq}, "
+        f"copied unchanged={n_copied}"
     )
+
+    # ── Coverage report + guardrail ────────────────────────────────────────
+    total_weight_params = params_ml8 + params_fp8 + params_passthrough_weight
+    coverage, below_threshold, breakdown = evaluate_coverage(
+        params_ml8, params_fp8, params_passthrough_weight, min_coverage)
+    print(
+        f"[coverage] quantized matmul weight: {coverage*100:.1f}% total "
+        f"({total_weight_params:,} params) — "
+        f"4-bit ml8: {breakdown['ml8']*100:.1f}% ({params_ml8:,}), "
+        f"8-bit fp8: {breakdown['fp8']*100:.1f}% ({params_fp8:,}), "
+        f"bf16: {breakdown['bf16']*100:.1f}% ({params_passthrough_weight:,})"
+    )
+    if passthrough_weights:
+        passthrough_weights.sort(key=lambda t: t[1], reverse=True)
+        print("[coverage] largest UN-quantized weight tensors:")
+        for nm, p, dt in passthrough_weights[:10]:
+            print(f"             {p/total_weight_params*100:5.1f}%  {nm}  "
+                  f"({p:,} params, {dt})")
+    # Record coverage in the artifact so downstream consumers (and the gauntlet)
+    # can read it without re-deriving — and so "is this actually 4-bit?" is a
+    # metadata lookup, not a surprise.
+    writer.add_key_value("ml8.weight_coverage", float(coverage),
+                         gguf.GGUFValueType.FLOAT32)
+    writer.add_key_value("ml8.ml8_fraction", float(breakdown["ml8"]),
+                         gguf.GGUFValueType.FLOAT32)
+    writer.add_key_value("ml8.fp8_fraction", float(breakdown["fp8"]),
+                         gguf.GGUFValueType.FLOAT32)
+
+    if below_threshold:
+        msg = (f"REFUSING to emit: only {coverage*100:.1f}% of matmul weight is "
+               f"ml8-quantized (threshold {min_coverage*100:.0f}%). "
+               f"{params_passthrough_weight:,} params would ship as bf16 — this "
+               f"is NOT a 4-bit artifact. The top un-quantized tensors are listed "
+               f"above (typically attn/SSM/lm_head/embed on a dense model whose "
+               f"calibration only covered the FFN). Either extend calibration to "
+               f"those tensors, or pass --allow-partial to ship this intentionally "
+               f"(it will be clearly labelled partial).")
+        if not allow_partial:
+            writer.close()
+            try:
+                out_gguf.unlink()   # don't leave a half-written, mis-labellable file
+            except OSError:
+                pass
+            raise SystemExit(f"[coverage] {msg}")
+        print(f"[coverage] WARNING — proceeding under --allow-partial: {msg}")
+        writer.add_key_value("ml8.partial", True, gguf.GGUFValueType.BOOL)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -534,11 +769,16 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path) -> dic
         "out_path":         str(out_gguf),
         "n_ml8":            n_ml8,
         "n_moe":            n_moe,
+        "n_fp8":            n_fp8,
         "n_centroids":      n_centroids,
         "n_rotation":       n_rot,
         "n_awq":            n_awq,
         "n_copied":         n_copied,
         "n_fields_copied":  n_fields_copied,
+        "weight_coverage":  coverage,
+        "params_ml8":       params_ml8,
+        "params_fp8":       params_fp8,
+        "params_bf16":      params_passthrough_weight,
     }
 
 
@@ -550,8 +790,19 @@ def main() -> None:
                    help="Directory of ml8-4 per-layer .pt blobs")
     p.add_argument("--out-gguf", type=Path, required=True,
                    help="Output GGUF path")
+    p.add_argument("--min-coverage", type=float, default=0.85,
+                   help="Minimum fraction of matmul-weight params that must be "
+                        "ml8-quantized, else refuse to emit (default 0.85). "
+                        "Guards against silently shipping a mostly-bf16 '4-bit' "
+                        "artifact (e.g. FFN-only calibration on a dense model).")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="Emit even if coverage is below --min-coverage. The "
+                        "artifact is tagged ml8.partial=true and a warning is "
+                        "printed. Use only when a partial quant is intentional.")
     args = p.parse_args()
-    summary = convert_to_ml8_gguf(args.base_gguf, args.calib_dir, args.out_gguf)
+    summary = convert_to_ml8_gguf(args.base_gguf, args.calib_dir, args.out_gguf,
+                                  min_coverage=args.min_coverage,
+                                  allow_partial=args.allow_partial)
     print(f"[done] {summary}")
 
 
