@@ -1113,6 +1113,31 @@ void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// ── ml8_fp8 ───────────────────────────────────────────────────────────────
+//
+// MAD Task 9: dequantize a row of ml8-fp8 blocks.
+//
+// Block layout (34 bytes, tightly packed, matching Python writer commit 45925db35):
+//   [scale : fp16 LE (2 bytes)] [qs : 32 × uint8 OCP e4m3fn]
+//
+// output[b*32 + i] = e4m3_decode(qs[i]) * fp16_to_fp32(scale)
+//
+// Reuses g_fp8_e4m3_lut / ml8_init_fp8_e4m3_lut which are the canonical
+// OCP e4m3fn decode shared by all ml8 types.  k must be divisible by 32.
+
+void dequantize_row_ml8_fp8(const block_ml8_fp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_ML8_FP8 == 0);
+    ml8_init_fp8_e4m3_lut();
+    const int64_t n_blocks = k / QK_ML8_FP8;
+    for (int64_t b = 0; b < n_blocks; b++) {
+        const float   scale = GGML_FP16_TO_FP32(x[b].scale);
+        float       * out   = &y[b * QK_ML8_FP8];
+        for (int i = 0; i < QK_ML8_FP8; i++) {
+            out[i] = g_fp8_e4m3_lut[x[b].qs[i]] * scale;
+        }
+    }
+}
+
 void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
     // Round-to-nearest-even fp32 → fp8 e4m3fn. Saturates at ±448 (no inf in
     // this variant). NaN inputs map to S.1111.111. Used at calibration-time

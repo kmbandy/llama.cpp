@@ -159,6 +159,10 @@ GGML_API void dequantize_row_ml8_4_with_lut(const block_ml8_4 * GGML_RESTRICT x,
 GGML_API void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// MAD Task 9: ml8-fp8 dequant. Each block: fp16 scale + 32 e4m3 bytes → 32 fp32 outputs.
+// k must be divisible by QK_ML8_FP8 (32).
+GGML_API void dequantize_row_ml8_fp8(const block_ml8_fp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

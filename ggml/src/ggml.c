@@ -831,6 +831,18 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
         .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
     },
+    // MAD Task 9: ml8-fp8 weight quantization. 32-element blocks, 34 bytes each:
+    // fp16 per-block scale (2 bytes) + 32 OCP e4m3fn weight bytes.
+    // to_float is the standard CPU dequant path; from_float_ref is NULL because
+    // quantization is done offline by the Python calibration writer.
+    [GGML_TYPE_ML8_FP8] = {
+        .type_name                = "ml8_fp8",
+        .blck_size                = QK_ML8_FP8,
+        .type_size                = sizeof(block_ml8_fp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ml8_fp8,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,

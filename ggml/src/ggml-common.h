@@ -442,6 +442,18 @@ typedef struct {
 } block_ml8_4;
 static_assert(sizeof(block_ml8_4) == 4 + 32, "wrong block_ml8_4 size/padding");
 
+// MAD Task 9: ml8-fp8 weight quantization block.
+// 32 elements per block, matching gguf-py ML8_FP8 registration (id=51, block_size=32, type_size=34).
+// Each block: fp16 per-block scale (2 bytes) + 32 × uint8 e4m3 weights = 34 bytes, tightly packed.
+// On-disk format from Python writer: little-endian fp16 scale followed by 32 OCP e4m3fn bytes.
+// Dequant: output[i] = e4m3_decode(qs[i]) * fp16_to_fp32(scale)
+#define QK_ML8_FP8 32
+typedef struct {
+    ggml_half scale;            // fp16 per-block scale (2 bytes, little-endian)
+    uint8_t   qs[QK_ML8_FP8];  // 32 × uint8 OCP e4m3fn weights
+} block_ml8_fp8;
+static_assert(sizeof(block_ml8_fp8) == 34, "ml8_fp8 block must be 34 bytes");
+
 // TQ3_1S: WHT-rotated 3-bit weight quantization (8-level Lloyd-Max for N(0,1))
 // Block size 32, dual half-block scales (d0 for [0..15], d1 for [16..31])
 // Per block: d0(fp16) + d1(fp16) + 3-bit indices packed (12 bytes) = 16 bytes per 32 values
