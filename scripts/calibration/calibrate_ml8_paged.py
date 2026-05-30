@@ -71,11 +71,25 @@ from kronecker_rotation import (  # noqa: E402
 )
 from awq import compute_awq_scale, apply_awq_to_weight, absorb_awq_in_reconstruction  # noqa: E402
 from batched_gptq import batched_gptq_quantize, batched_gptq_quantize_multigpu  # noqa: E402  (G.7.h.2/3)
+from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (dense resume)
+from role_targets import classify_role, Tier  # noqa: E402  (--dense-coverage full tier routing)
+from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (FP8 tier, fixed group_size=32)
 
-# Pybind11 weight pager (in repo's python_bindings/wp/)
+# Pybind11 weight pager (in repo's python_bindings/wp/). The .so is compiled for
+# a specific GPU arch (gfx1201/gfx1030 locally) and links libllama/ggml-hip, so
+# it will NOT load on a different arch (e.g. the MI300X's gfx942). The pager is
+# only needed for the PAGED path; --resident runs pure torch and must import
+# cleanly even where wp_native is absent. Guard the import and fail loudly only
+# if someone actually asks for the paged path on a host that can't provide it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python_bindings" / "wp"))
-import wp_native  # noqa: E402
-from paged_linear import PagedLinear, swap_linears_with_paged, PagedMoeExperts  # noqa: E402
+try:
+    import wp_native  # noqa: E402
+    from paged_linear import PagedLinear, swap_linears_with_paged, PagedMoeExperts  # noqa: E402
+    _WP_IMPORT_ERROR: Exception | None = None
+except Exception as _e:  # ImportError, or HIP/arch load failure
+    wp_native = None  # type: ignore[assignment]
+    PagedLinear = swap_linears_with_paged = PagedMoeExperts = None  # type: ignore[assignment]
+    _WP_IMPORT_ERROR = _e
 
 
 # ─── HF naming → GGUF naming map for Qwen MLP linears ──────────────────────
@@ -109,6 +123,108 @@ def _qwen_mlp_name_map(model: nn.Module) -> dict[str, str]:
         gguf_name = f"blk.{layer_idx}.{hf_to_gguf_suffix[parts[-1]]}.weight"
         name_map[name] = gguf_name
     return name_map
+
+
+# ─── Dense coverage target enumeration (--dense-coverage ffn|full) ──────────
+
+# Deterministic append order for the NEW ML8 roles added by `full` coverage,
+# AFTER the FFN linears. Documented + fixed so resume blobs stay valid and the
+# converter can rely on a stable ordering. Per-layer roles are emitted layer by
+# layer (ascending layer index); within a layer the suffixes follow this list.
+_FULL_ML8_PER_LAYER_ORDER = (
+    "q_proj", "k_proj", "v_proj", "o_proj",   # self-attention
+    "qkv_proj", "gate_proj_attn",             # fused attn variants (if present)
+    "out_proj",                               # linear_attn (SSM) output
+)
+# Model-global ML8 roles (no layer index), appended after all per-layer ML8.
+_FULL_ML8_GLOBAL_ORDER = ("lm_head", "eh_proj")
+# FP8-tier roles, appended last. Per-layer SSM gates first, then the embedding.
+_FULL_FP8_PER_LAYER_ORDER = ("alpha_proj", "beta_proj")
+
+
+def _dense_layer_idx(name: str):
+    parts = name.split(".")
+    try:
+        return int(parts[parts.index("layers") + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def find_dense_full_targets(model, coverage: str = "ffn"):
+    """Enumerate quantization targets for the dense path, tier-tagged.
+
+    Yields (name, module, tier) where tier is a role_targets.Tier.
+
+    coverage="ffn"  : EXACTLY the FFN linears yielded by find_target_linears,
+                      in the same order, all tagged Tier.ML8. Provably identical
+                      to today's behavior (assert in test_dense_coverage.py).
+    coverage="full" : the FFN linears FIRST (same order), then the appended ML8
+                      attention/SSM roles in _FULL_ML8_PER_LAYER_ORDER (layer-major),
+                      then global ML8 roles, then the FP8-tier tensors
+                      (alpha/beta per layer, then embed_tokens) last.
+
+    Append order is deterministic and documented so existing resume blobs (which
+    are a contiguous prefix = the FFN linears) remain valid when `full` is added.
+    """
+    # FFN linears first — identical to find_target_linears (order preserved).
+    for name, mod in find_target_linears(model):
+        yield name, mod, Tier.ML8
+
+    if coverage == "ffn":
+        return
+    if coverage != "full":
+        raise ValueError(f"unknown dense coverage {coverage!r} (expected 'ffn' or 'full')")
+
+    # Index every module once for deterministic lookups.
+    by_name = dict(model.named_modules())
+
+    # Per-layer ML8 roles (attention + SSM out), layer-major then role order.
+    n_layers = max((_dense_layer_idx(n) for n in by_name if _dense_layer_idx(n) is not None),
+                   default=-1) + 1
+    for L in range(n_layers):
+        for suffix in _FULL_ML8_PER_LAYER_ORDER:
+            for name, mod in by_name.items():
+                if _dense_layer_idx(name) != L:
+                    continue
+                if name.rsplit(".", 1)[-1] != suffix:
+                    continue
+                if not isinstance(mod, nn.Linear):
+                    continue
+                _, _, tier = classify_role(name)
+                if tier is Tier.ML8:
+                    yield name, mod, Tier.ML8
+
+    # Global ML8 roles (lm_head / eh_proj), if present as nn.Linear.
+    for role in _FULL_ML8_GLOBAL_ORDER:
+        for name, mod in by_name.items():
+            if name.rsplit(".", 1)[-1] != role:
+                continue
+            if not isinstance(mod, nn.Linear):
+                continue
+            _, _, tier = classify_role(name)
+            if tier is Tier.ML8:
+                yield name, mod, Tier.ML8
+
+    # FP8-tier per-layer SSM gates (alpha/beta), layer-major then role order.
+    for L in range(n_layers):
+        for suffix in _FULL_FP8_PER_LAYER_ORDER:
+            for name, mod in by_name.items():
+                if _dense_layer_idx(name) != L:
+                    continue
+                if name.rsplit(".", 1)[-1] != suffix:
+                    continue
+                if not isinstance(mod, nn.Linear):
+                    continue
+                _, _, tier = classify_role(name)
+                if tier is Tier.FP8:
+                    yield name, mod, Tier.FP8
+
+    # FP8-tier embedding (nn.Embedding, special-cased — read .weight directly).
+    for name, mod in by_name.items():
+        if name not in ("model.embed_tokens",):
+            continue
+        if isinstance(mod, nn.Embedding):
+            yield name, mod, Tier.FP8
 
 
 # ─── Pager bootstrap ───────────────────────────────────────────────────────
@@ -639,6 +755,68 @@ def _build_model_meta(model_name: str, dtype: torch.dtype):
 
 # ─── Main driver ───────────────────────────────────────────────────────────
 
+def dense_completed_prefix(names: "list[str]", output_dir) -> int:
+    """Count the leading dense linears (in quantization order) whose blob .pt
+    already exists, STOPPING AT THE FIRST GAP.
+
+    Dense calibration propagates quantization error across layers, so a blob that
+    exists *after* a gap was computed against a different (un-resumed) upstream
+    state and is stale. Only a contiguous completed prefix is safe to resume from.
+    Returns the count of leading names with a blob present (0 if the first is
+    missing); blobs after the first gap are ignored.
+    """
+    out = Path(output_dir)
+    n = 0
+    for name in names:
+        blob_path = out / f"{name.replace('.', '_').replace('/', '_')}.pt"
+        if not blob_path.exists():
+            break
+        n += 1
+    return n
+
+
+def _get_module_by_name(model, name: str):
+    """Resolve a dotted module path (e.g. 'model.layers.0.mlp.gate_proj') to the
+    module object. Also handles flat names ('linear0')."""
+    mod = model
+    for part in name.split("."):
+        mod = getattr(mod, part)
+    return mod
+
+
+def load_dense_prefix_into_model(prefix_count: int, target_names: "list[str]",
+                                 model, output_dir, resident: bool,
+                                 dtype=None) -> "list[dict]":
+    """Reload the first `prefix_count` completed dense linears' quantized weights
+    back into the model (the dense-resume reload). For each, dequant the blob to its
+    inference-equivalent weight and place it where the forward path reads it:
+    resident → layer.weight.data; paged → layer.weight_override. This restores the
+    exact upstream state later layers' Hessians depend on. Returns the per-linear
+    metric dicts (for the manifest), in order. prefix_count=0 is a no-op.
+    """
+    results: "list[dict]" = []
+    for name in target_names[:prefix_count]:
+        layer = _get_module_by_name(model, name)
+        blob_path = Path(output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
+        blob = load_ml8_layer(blob_path)
+        W = reconstruct_weight_from_blob(blob)          # dequant → inv-rotation → absorb-AWQ
+        if resident:
+            with torch.no_grad():
+                layer.weight.data.copy_(
+                    W.to(dtype=layer.weight.dtype, device=layer.weight.device))
+        else:
+            layer.weight_override = W.to(dtype) if dtype is not None else W
+        results.append({
+            "name": name, "shape": list(blob["shape"]),
+            "mse": float(blob.get("mse", 0.0)),
+            "y_snr_db": float(blob.get("y_snr_db", 0.0)),
+            "w_snr_db": float(blob.get("w_snr_db", 0.0)),
+            "t_hess_s": 0.0, "t_quant_s": 0.0,
+        })
+        del blob, W
+    return results
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3.5-4B",
@@ -652,12 +830,32 @@ def main():
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--percdamp", type=float, default=0.01)
+    p.add_argument("--act-order", action="store_true",
+                   help="GPTQ act_order: extra Hessian-importance-ordered reassignment "
+                        "pass after the straight sweep (MAD-256: +~1dB gate/up, bit-free)")
+    p.add_argument("--heavy-rounds", type=int, default=0,
+                   help="MAD-256 heavy codebook: alternating gradient-tune↔act_order-reassign "
+                        "rounds (AQLM/PV-tuning). 0=off. Implies act_order. Bit-free.")
+    p.add_argument("--heavy-steps", type=int, default=60,
+                   help="Adam steps per heavy round")
+    p.add_argument("--heavy-dtype", choices=("fp32", "bf16"), default="fp32",
+                   help="heavy tune-loop matmul precision. bf16 ~2x faster on WMMA "
+                        "(fp32 accumulate; params/Adam stay fp32). Validate Y_SNR "
+                        "matches fp32 within noise before trusting.")
     p.add_argument("--n-centroids", type=int, default=16)
     p.add_argument("--n-iter", type=int, default=25)
     p.add_argument("--fit-loss", choices=("mse", "mag_weighted"), default="mse")
     p.add_argument("--mag-weight-p", type=float, default=5.0)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
+    p.add_argument("--capture-router", default=None,
+                   help="DIAGNOSTIC: comma-separated layer indices. Hook each layer's "
+                        "router (.mlp.gate) Linear, capture its input x (MoE hidden) + "
+                        "output logits over the calib corpus, save to --capture-out, then "
+                        "exit before any Hessian/GPTQ work. For shared-vs-per-expert "
+                        "Hessian analysis (MoE quant-gap investigation).")
+    p.add_argument("--capture-out", default=None,
+                   help="output .pt path for --capture-router")
     p.add_argument("--max-layers", type=int, default=None)
     p.add_argument("--eval-ppl", action="store_true")
     p.add_argument("--ppl-max-tokens", type=int, default=None)
@@ -671,6 +869,18 @@ def main():
                    help="WeightPager VRAM ring size. Pool = slots × max_page_size. "
                         "For Qwen3.5-4B, max_page_size ≈ 1.27 GB (token_embd) → "
                         "8 slots = ~10 GB pool. Don't exceed available headroom.")
+    p.add_argument("--resident", action="store_true",
+                   help="dense strategy only: load ALL weights resident (no pager, "
+                        "no PagedLinear) and quantize in-place. Use when the model "
+                        "fits in VRAM (9B/4B on 32GB; anything on the 192GB MI300X). "
+                        "Eliminates the per-linear paged Hessian thrash AND the "
+                        "pager-pool VRAM. REQUIRED on non-RDNA GPUs (the HIP pager "
+                        "won't load on gfx942).")
+    p.add_argument("--dense-coverage", choices=("ffn", "full"), default="ffn",
+                   help="ffn (default) = quantize only FFN linears (today's behavior, "
+                        "bit-identical). full = also quantize attention/SSM ML8 linears "
+                        "and emit FP8-tier blobs (alpha/beta proj + embed_tokens). The "
+                        "FP8 tensors await converter support — see manifest dense_coverage marker.")
     p.add_argument("--strategy", choices=("dense", "moe"), default="dense",
                    help="dense (iter 5a) = from_pretrained, all weights on GPU, "
                         "paged dense MLPs. moe (iter 5b) = torch.device('meta') "
@@ -703,45 +913,84 @@ def main():
                         "activations have heavier dynamic range, may need finer "
                         "grouping). If unset, uses --group-size for all kinds.")
     p.add_argument("--no-resume", action="store_true",
-                   help="Disable checkpoint resume. By default the script will: "
-                        "(a) load cached Hessians from {output_dir}/hessians.pt if "
-                        "params match, (b) skip per-expert blobs that already exist "
-                        "on disk, (c) reuse prior manifest results. --no-resume "
-                        "forces a clean run from scratch.")
+                   help="Disable checkpoint resume (covers BOTH dense and MoE "
+                        "strategies). By default the script will: (a) load cached "
+                        "Hessians from {output_dir}/hessians.pt if params match, "
+                        "(b) for MoE, skip per-expert blobs that already exist on "
+                        "disk, (c) for dense, reload the contiguous completed-prefix "
+                        "blobs back into the model (so cross-layer error propagation "
+                        "stays correct) and resume at the first gap, (d) reuse prior "
+                        "manifest results. --no-resume forces a clean run from scratch.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
     device_idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
 
+    # Hard VRAM guard: cap torch to a fraction of the device so an over-budget
+    # allocation raises a *catchable* RuntimeError (the per-layer loop falls the
+    # layer back and continues) instead of a driver-level OOM. Critical when the
+    # device also drives the display — a real OOM on the R9700 takes down the
+    # Wayland compositor (Hyprland) and the whole session, which resume can't undo.
+    _mem_frac = os.environ.get("ML8_MEM_FRACTION")
+    if _mem_frac and args.device.startswith("cuda"):
+        torch.cuda.set_per_process_memory_fraction(float(_mem_frac), device_idx)
+        print(f"[mem-guard] torch capped to {float(_mem_frac):.0%} of cuda:{device_idx} "
+              f"VRAM — OOM becomes a caught fallback, protecting the display compositor")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     if args.strategy == "dense":
-        # ── Iter 5a: from_pretrained (all weights resident on GPU), paged dense MLPs.
-        print(f"[load-hf] strategy=dense  {args.model}  dtype={dtype}  device={args.device}")
-        # NOTE: `torch_dtype` is deprecated and silently ignored in newer
-        # transformers; use `dtype=` AND explicit `.to(dtype)` so the dtype
-        # is actually honored.
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
-        model = model.to(args.device).to(dtype).eval()
-        actual_dtypes = {p.dtype for p in model.parameters()}
-        print(f"[load-hf] post-load dtypes={actual_dtypes}")
-        if actual_dtypes != {dtype}:
+        # ── Iter 5a (PAGED): meta-init + paged dense MLPs, mirroring the MoE path.
+        # The old from_pretrained→.to(device) path materialized the FULL model on
+        # the GPU before swapping — fine for 4B (8 GB) but impossible for a >VRAM
+        # dense model (27B = 54 GB on a 32 GB card). Now: build on meta, page the
+        # ffn_{gate,up,down} linears, to_empty only the resident params
+        # (attn/ssm/embed/norms), resident-load those from the GGUF.
+        print(f"[load-hf] strategy=dense ({'resident' if args.resident else 'paged'})  {args.model}  dtype={dtype}  device={args.device}")
+        model, config, n_blocks = _build_model_meta(args.model, dtype)
+        arch_name = args.arch or type(config).__name__.replace("Config", "").lower()
+        print(f"[meta-init] arch={arch_name}  n_blocks={n_blocks}")
+
+        if args.resident:
+            # ── RESIDENT (no pager): leave MLP linears as nn.Linear so the GGUF
+            # loader fills them too (load_resident_to_model skips only MoE `_exps`
+            # stacks). to_empty below materializes ALL params; the GGUF load fills
+            # MLP + the rest. For models that FIT in VRAM (9B/4B @ 32GB; anything
+            # on the 192GB MI300X). Pager path remains for >VRAM dense (27B/35B).
+            pager = None
+        else:
+            if wp_native is None:
+                raise RuntimeError(
+                    "paged dense path requires the wp_native pager, which failed to "
+                    f"import ({_WP_IMPORT_ERROR}). On a host whose GPU arch the .so "
+                    "wasn't built for (e.g. MI300X/gfx942), use --resident instead.")
+            print(f"[pager] building dense MLP pager from {args.gguf}  slots={args.pager_slots}")
+            pager = build_pager_from_gguf(args.gguf, device_idx, args.pager_slots,
+                                           name_filter=_mlp_only_name_filter)
+            print(f"[pager] catalog: {pager.n_pages()} tensors  max_page={pager.max_page_size()/1e6:.1f} MB")
+
+            name_map = _qwen_mlp_name_map(model)
+            print(f"[swap] HF↔GGUF MLP mapping: {len(name_map)} linears")
+            # Swap UNDER meta so PagedLinear's weight allocates on meta (zero real
+            # memory) and is immediately del'd — same trick the MoE expert swap relies on.
+            with torch.device("meta"):
+                n_swapped = swap_linears_with_paged(model, pager, name_map, dtype=dtype,
+                                                    device_idx=device_idx)
+            print(f"[swap] replaced {n_swapped} nn.Linear → PagedLinear")
+            if n_swapped == 0:
+                raise RuntimeError("swap_linears_with_paged found nothing to swap — check name_map")
+
+        n_resident = sum(p.numel() for p in model.parameters())
+        print(f"[meta-empty] materializing {n_resident/1e9:.2f}B resident params on {args.device}")
+        model = model.to_empty(device=args.device).to(dtype).eval()
+        n_loaded = load_resident_to_model(
+            model, args.gguf, arch_name=arch_name, n_blocks=n_blocks,
+            dtype=dtype, device=args.device)
+        if n_loaded == 0:
             raise RuntimeError(
-                f"Model load did not honor dtype={dtype}; got {actual_dtypes}. "
-                f"Paged calibration requires uniform model dtype matching the GGUF.")
-
-        print(f"[pager] building from {args.gguf}  slots={args.pager_slots}")
-        pager = build_pager_from_gguf(args.gguf, device_idx, args.pager_slots,
-                                       name_filter=_mlp_only_name_filter)
-        print(f"[pager] catalog: {pager.n_pages()} tensors  max_page={pager.max_page_size()/1e6:.1f} MB")
-
-        name_map = _qwen_mlp_name_map(model)
-        print(f"[swap] HF↔GGUF MLP mapping: {len(name_map)} linears")
-        n_swapped = swap_linears_with_paged(model, pager, name_map, dtype=dtype, device_idx=device_idx)
-        print(f"[swap] replaced {n_swapped} nn.Linear → PagedLinear")
-        if n_swapped == 0:
-            raise RuntimeError("swap_linears_with_paged found nothing to swap — check name_map")
+                f"[resident-load] loaded 0 tensors from GGUF — arch_name mismatch? "
+                f"Tried arch={arch_name!r}. Use --arch to override.")
     else:
         # ── Iter 5b: meta-device instantiate, resident load from GGUF, paged MoE experts.
         print(f"[load-hf] strategy=moe  {args.model}  dtype={dtype}  device={args.device}")
@@ -765,21 +1014,38 @@ def main():
         #   3. to_empty(device) — only materializes the REMAINING resident
         #      parameters (token_embd, attention, ssm_*, norms, MTP, etc.).
         #   4. Resident loader fills those params from GGUF bytes.
-        print(f"[pager] iter 5b — building catalog from {args.gguf}  "
-              f"slots={args.pager_slots}  n_experts={n_experts}")
-        pager = build_pager_iter5b(args.gguf, device_idx, args.pager_slots,
-                                    n_experts=n_experts)
-        print(f"[pager] catalog: {pager.n_pages()} entries  "
-              f"max_page={pager.max_page_size()/1e6:.1f} MB")
+        if args.resident:
+            # ── RESIDENT MoE (no pager): load the consolidated expert stacks
+            # straight into VRAM. The 35B-A3B's ~67 GB of experts fit the MI300X's
+            # 192 GB. Pure torch + gguf (no wp_native) → runs on gfx942. Loaded
+            # BEFORE to_empty; ResidentMoeExperts holds them as plain attributes
+            # that to_empty leaves untouched.
+            from resident_moe import swap_moe_experts_resident
+            pager = None
+            print(f"[resident-moe] loading expert stacks from {args.gguf}  n_experts={n_experts}")
+            n_swapped_moe = swap_moe_experts_resident(model, args.gguf, dtype, args.device)
+            print(f"[swap] replaced {n_swapped_moe} consolidated MoE blocks → ResidentMoeExperts")
+        else:
+            if wp_native is None:
+                raise RuntimeError(
+                    "paged MoE path requires the wp_native pager, which failed to import "
+                    f"({_WP_IMPORT_ERROR}). On a host whose GPU arch the .so wasn't built "
+                    "for (e.g. MI300X/gfx942), use --resident instead.")
+            print(f"[pager] iter 5b — building catalog from {args.gguf}  "
+                  f"slots={args.pager_slots}  n_experts={n_experts}")
+            pager = build_pager_iter5b(args.gguf, device_idx, args.pager_slots,
+                                        n_experts=n_experts)
+            print(f"[pager] catalog: {pager.n_pages()} entries  "
+                  f"max_page={pager.max_page_size()/1e6:.1f} MB")
 
-        # ── Swap consolidated MoE expert blocks with PagedMoeExperts.
-        #    HF stores routed experts as one Parameter per kind per layer
-        #    (gate_up_proj [E, 2*I, H], down_proj [E, H, I]). PagedMoeExperts
-        #    replaces the whole block with paged read-on-demand tensors.
-        n_swapped_moe = swap_moe_experts_with_paged(model, pager, dtype, device_idx)
-        print(f"[swap] replaced {n_swapped_moe} consolidated MoE expert blocks → PagedMoeExperts")
+            # ── Swap consolidated MoE expert blocks with PagedMoeExperts.
+            #    HF stores routed experts as one Parameter per kind per layer
+            #    (gate_up_proj [E, 2*I, H], down_proj [E, H, I]). PagedMoeExperts
+            #    replaces the whole block with paged read-on-demand tensors.
+            n_swapped_moe = swap_moe_experts_with_paged(model, pager, dtype, device_idx)
+            print(f"[swap] replaced {n_swapped_moe} consolidated MoE expert blocks → PagedMoeExperts")
         if n_swapped_moe == 0:
-            raise RuntimeError("swap_moe_experts_with_paged found 0 expert blocks")
+            raise RuntimeError("found 0 MoE expert blocks to swap")
 
         # Shared experts (mlp.shared_expert.*) are kept RESIDENT — they're small
         # (~250 MB total for 35B-A3B) and live in the model as ordinary
@@ -809,7 +1075,7 @@ def main():
                 dummy = torch.zeros((1, 16), dtype=torch.long, device=args.device)
                 out = model(dummy)
             print(f"[smoke] forward OK — output logits shape={tuple(out.logits.shape)}")
-            pager.shutdown()
+            if pager is not None: pager.shutdown()
             return
 
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
@@ -818,9 +1084,19 @@ def main():
                                           seq_len=args.seq_len)
     print(f"[calib] got {len(calib)} samples (tokens ≈ {sum(c.numel() for c in calib)})")
 
-    targets = list(find_target_linears(model))   # finds MLP linears (now PagedLinear)
-    targets = filter_by_layer_limit(targets, args.max_layers)
-    print(f"[targets] {len(targets)} linears to quantize")
+    # Tier-tagged enumeration. For the DENSE strategy with --dense-coverage full
+    # this appends attention/SSM ML8 linears + FP8-tier tensors after the FFN
+    # linears (which always come first, in find_target_linears order). For
+    # coverage=ffn (default) OR the MoE strategy, this is exactly today's FFN set.
+    _coverage = args.dense_coverage if args.strategy == "dense" else "ffn"
+    full_targets = list(find_dense_full_targets(model, coverage=_coverage))
+    ml8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.ML8]
+    fp8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.FP8]
+    targets = filter_by_layer_limit(ml8_full, args.max_layers)
+    fp8_targets = filter_by_layer_limit(fp8_full, args.max_layers)
+    print(f"[targets] {len(targets)} ML8 linears to quantize "
+          f"(coverage={_coverage})"
+          + (f" + {len(fp8_targets)} FP8 tensors" if fp8_targets else ""))
 
     manifest = {"model": args.model, "gguf": args.gguf, "args": vars(args), "results": []}
     manifest_path = Path(args.output_dir) / "manifest.json"
@@ -872,9 +1148,14 @@ def main():
         #      stacks, rotate/AWQ, run batched_gptq_quantize.
         #   4. Save per-expert .pt blobs so ml8_to_gguf.py can stack them
         #      into ffn_*_exps tensors with sidecars.
+        from resident_moe import ResidentMoeExperts
+        # Both block types expose the same interface (gate_proj/up_proj/down_proj,
+        # release_cached, the collect_* Hessian accumulators). PagedMoeExperts is
+        # None when wp_native didn't import (e.g. gfx942), so filter it out.
+        _moe_cls = tuple(c for c in (PagedMoeExperts, ResidentMoeExperts) if c is not None)
         moe_blocks_by_layer = {}
         for nm, mod in model.named_modules():
-            if isinstance(mod, PagedMoeExperts):
+            if isinstance(mod, _moe_cls):
                 parts = nm.split(".")
                 try:
                     L = int(parts[parts.index("layers") + 1])
@@ -885,6 +1166,61 @@ def main():
         if args.max_layers is not None:
             layer_ids = layer_ids[: args.max_layers]
         print(f"[moe-loop] {len(layer_ids)} PagedMoeExperts blocks queued")
+
+        # ── DIAGNOSTIC: capture router I/O for shared-vs-per-expert Hessian
+        # analysis, then exit before Hessian/GPTQ. The router's INPUT is the MoE
+        # hidden state = the gate/up experts' input, so bucketing it by the
+        # router's top-k selection yields per-expert input sets offline.
+        if getattr(args, "capture_router", None):
+            import re as _re_cap
+            cap_layers = [int(s) for s in args.capture_router.split(",") if s.strip() != ""]
+            router_by_layer = {}
+            for nm, m in model.named_modules():
+                mt = _re_cap.search(r"layers\.(\d+)\.mlp\.gate$", nm)
+                if mt:  # hook by name — gate may not be a plain nn.Linear in this arch
+                    Lr = int(mt.group(1))
+                    if Lr in cap_layers:
+                        router_by_layer[Lr] = m
+            missing = [L for L in cap_layers if L not in router_by_layer]
+            if missing:
+                gates = [nm for nm, _ in model.named_modules() if nm.endswith(".mlp.gate")]
+                raise RuntimeError(f"[capture] router (.mlp.gate Linear) not found for "
+                                   f"layers {missing}; sample gate modules: {gates[:5]}")
+            cap = {L: {"x": [], "logits": []} for L in cap_layers}
+            handles = []
+            def _mk_cap(L):
+                def _hook(mod, inp, out):
+                    xt = inp[0]
+                    ot = out[0] if isinstance(out, (tuple, list)) else out
+                    xin = xt.detach().reshape(-1, xt.shape[-1]).to(torch.float16).cpu()
+                    lo = ot.detach().reshape(-1, ot.shape[-1]).to(torch.float16).cpu()
+                    cap[L]["x"].append(xin)
+                    cap[L]["logits"].append(lo)
+                return _hook
+            for L in cap_layers:
+                handles.append(router_by_layer[L].register_forward_hook(_mk_cap(L)))
+            print(f"[capture] hooked routers on layers {cap_layers}; "
+                  f"forward over {len(calib)} samples...")
+            t_cap = time.time()
+            with torch.no_grad():
+                for s_i, ids in enumerate(calib):
+                    model(ids.to(args.device))
+                    if (s_i + 1) % 4 == 0 or s_i == len(calib) - 1:
+                        print(f"  [capture] {s_i+1}/{len(calib)}  elapsed={time.time()-t_cap:.1f}s")
+            for h in handles:
+                h.remove()
+            blob = {}
+            for L in cap_layers:
+                blob[L] = {
+                    "x": torch.cat(cap[L]["x"], dim=0),
+                    "logits": torch.cat(cap[L]["logits"], dim=0),
+                    "num_experts": int(moe_blocks_by_layer[L][1].num_experts),
+                }
+                print(f"  [capture] L{L}: x={tuple(blob[L]['x'].shape)} "
+                      f"logits={tuple(blob[L]['logits'].shape)}")
+            torch.save(blob, args.capture_out)
+            print(f"[capture] saved → {args.capture_out}")
+            return
 
         kinds_specs = (
             ("gate_proj", "gate_proj", "ffn_gate_exps", "hidden"),
@@ -1108,7 +1444,10 @@ def main():
                         n_iter=args.n_iter, fit_loss=args.fit_loss,
                         mag_weight_p=args.mag_weight_p,
                         snap_centroids=args.snap_centroids,
-                        percdamp=args.percdamp)
+                        percdamp=args.percdamp,
+                        act_order=args.act_order or args.heavy_rounds > 0,
+                        heavy_rounds=args.heavy_rounds,
+                        heavy_steps=args.heavy_steps, heavy_dtype=args.heavy_dtype)
 
                     # Move full stack to CPU once, but DO NOT save slices directly —
                     # `indices[j]` is a strided view into the [E, N, K] storage and
@@ -1209,11 +1548,36 @@ def main():
             json.dump(manifest, f, indent=2)
         os.replace(tmp_manifest, manifest_path)
         print(f"\n[done] manifest: {manifest_path}")
-        pager.shutdown()
+        if pager is not None: pager.shutdown()
         return
+
+    # ─── Dense resume: reload the completed contiguous prefix into the model ───
+    # The dense path computes each layer's Hessian against the running, partially
+    # QUANTIZED model (resident mode copies quantized weights back precisely so the
+    # next layer's Hessian sees quantized upstream — GPTQ cross-layer error
+    # propagation). So resuming correctly requires reloading every completed layer's
+    # quantized weight BEFORE continuing, and trusting ONLY a contiguous prefix: the
+    # blob for unit k+1 was computed against unit k being done, so the first gap
+    # invalidates everything after it (those blobs are stale — ignore them).
+    resume_start = 0
+    if not args.no_resume:
+        resume_start = dense_completed_prefix([n for n, _ in targets], args.output_dir)
+        if resume_start > 0:
+            # Blobs are authoritative for the prefix — rebuild results from them so a
+            # stale/short manifest.json can't desync from what's actually on disk.
+            manifest["results"] = load_dense_prefix_into_model(
+                resume_start, [n for n, _ in targets], model, args.output_dir,
+                resident=args.resident, dtype=dtype)
+            nxt = targets[resume_start][0] if resume_start < len(targets) else "(all done)"
+            print(f"[resume] dense: restored {resume_start}/{len(targets)} completed "
+                  f"linears from blobs, resuming at {nxt}")
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
 
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
     for i, (name, layer) in enumerate(targets):
+        if i < resume_start:
+            continue   # already quantized + reloaded above
         t0 = time.time()
         rows, in_feat = layer.weight.shape   # PagedLinear.weight page-faults here
         print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
@@ -1257,31 +1621,50 @@ def main():
             layer.weight_override = rotation.forward(
                 layer.weight_override.float().to(H.device)).to(dtype)
 
-        q = CentroidQuantizer(n_centroids=args.n_centroids, n_iter=args.n_iter).to(args.device)
-        q.configure(bits=4, sym=True, fit_loss=args.fit_loss,
-                    mag_weight_p=args.mag_weight_p,
-                    snap_centroids=args.snap_centroids)
-        q.hessian_diag = torch.diag(H).clone()
-
         effective_percdamp = args.percdamp
         if awq_s is not None:
             effective_percdamp = max(args.percdamp, 0.05)
 
+        # Per-kind group size (down_proj may use a finer grid via --group-size-down).
+        kind = name.rsplit(".", 1)[-1]   # gate_proj / up_proj / down_proj
+        gs_for_kind = args.group_size
+        if kind == "down_proj" and args.group_size_down is not None:
+            gs_for_kind = args.group_size_down
+
         try:
-            # gptq_quantize_linear modifies layer.weight in place — but layer is a
-            # PagedLinear and .weight is a @property. Use a temporary nn.Linear shim
-            # wrapping weight_override so gptq's `layer.weight.data.copy_(Q...)` works.
-            shim = nn.Linear(in_feat, rows, bias=False).to(args.device)
-            shim.weight = nn.Parameter(layer.weight_override.to(dtype))
-            export = gptq_quantize_linear(shim, H, q,
-                                          group_size=args.group_size,
-                                          percdamp=effective_percdamp)
-            # After GPTQ: shim.weight holds the dequantized rotated/AWQ'd weight.
-            layer.weight_override = shim.weight.data.detach().clone()
-            del shim
+            # Unified quantizer: route the single dense linear through
+            # batched_gptq_quantize as a [1, N, K] stack so it gets the SAME
+            # levers as the MoE path — including act_order + the heavy tune loop
+            # (bit-free). weight_override is already rotated/AWQ'd; H matches it.
+            Wr = layer.weight_override.float().to(args.device).unsqueeze(0)   # [1, N, K]
+            Hr = H.to(args.device).unsqueeze(0)                              # [1, K, K]
+            out = batched_gptq_quantize(
+                W_stack=Wr, H_stack=Hr,
+                n_centroids=args.n_centroids, group_size=gs_for_kind,
+                n_iter=args.n_iter, fit_loss=args.fit_loss,
+                mag_weight_p=args.mag_weight_p,
+                snap_centroids=args.snap_centroids,
+                percdamp=effective_percdamp,
+                act_order=args.act_order or args.heavy_rounds > 0,
+                heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
+                heavy_dtype=args.heavy_dtype)
+            layer.weight_override = out["Q"][0].to(dtype)   # dequantized rotated/AWQ'd weight
+            export = {
+                "indices":             out["indices"][0].clone().contiguous(),
+                "centroids_per_group": out["centroids_per_group"][0].clone().contiguous(),
+                "scale_per_group":     out["scale_per_group"][0].clone().contiguous(),
+                "mse":      float(out["mse"][0].item()),
+                "w_snr_db": float(out["w_snr_db"][0].item()),
+                "y_snr_db": float(out["y_snr_db"][0].item()),
+                "rel_err":  float(out["rel_err"][0].item()),
+            }
+            del Wr, Hr, out
         except RuntimeError as e:
             print(f"  FAILED: {e}")
             layer.weight_override = W_orig_snapshot
+            if args.resident:
+                layer.weight.data.copy_(W_orig_snapshot.to(layer.weight.dtype))
+                layer.weight_override = None   # same resident-leak fix as success path
             continue
         t_quant = time.time() - t0 - t_hess
 
@@ -1298,6 +1681,20 @@ def main():
         # math may have moved it to CPU (rotation.h_a is on CPU by design — see
         # KroneckerRotation.to_dict) — pull it back to args.device.
         layer.weight_override = layer.weight_override.to(args.device)
+
+        # Resident path: the model forward reads layer.weight (a real Parameter),
+        # NOT weight_override — so copy the calibrated weight back so the NEXT
+        # layer's Hessian sees the quantized upstream (GPTQ cross-layer error
+        # propagation). PagedLinear's forward reads weight_override directly, so
+        # this branch is a no-op there.
+        if args.resident:
+            with torch.no_grad():
+                layer.weight.data.copy_(layer.weight_override.to(layer.weight.dtype))
+            # Resident forward reads layer.weight, NOT weight_override — so the
+            # override is a full-size GPU duplicate of this layer's weights once
+            # it's been copied back. Drop it or it accumulates ~one MLP-worth of
+            # VRAM per layer (the resident-mode leak fixed 2026-05-30).
+            layer.weight_override = None
 
         # Save the blob (identical schema to calibrate_ml8.py output)
         out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
@@ -1333,9 +1730,55 @@ def main():
             "t_quant_s": float(t_quant),
         })
 
-        del H, q
+        del H
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
+
+    # ─── FP8 pass (--dense-coverage full only) ─────────────────────────────
+    # Separate, simpler pass: NO Hessian / rotation / AWQ / GPTQ. Read the
+    # weight directly and per-group (group_size FIXED at 32, matching the
+    # on-disk ML8_FP8 ggml block of 32 e4m3 + 1 fp16 scale) cast to e4m3.
+    # alpha/beta_proj are nn.Linear ([N,K]); embed_tokens is nn.Embedding
+    # ([vocab, hidden]) — quantize_scaled_fp8 groups along K=hidden either way.
+    fp8_blob_names: list[str] = []
+    FP8_GROUP_SIZE = 32   # FIXED — must match ML8_FP8 ggml block; NOT args.group_size
+    for fi, (name, module) in enumerate(fp8_targets):
+        # Read the weight directly. Resident nn.Linear / nn.Embedding expose a
+        # real Parameter; this does NOT touch weight_override (so the resident
+        # weight_override-assignment concern does not apply to this pass).
+        w = module.weight.detach()
+        N, K = w.shape
+        if K % FP8_GROUP_SIZE != 0:
+            print(f"[fp8] SKIP {name}: K={K} not divisible by {FP8_GROUP_SIZE}")
+            continue
+        # Honor memory guards: a ~1B-param embedding ([vocab, hidden]) may not
+        # fit alongside everything else. Do FP8 on CPU when the tensor is large
+        # or the device is CUDA-tight; the math is a cheap per-group amax+cast.
+        fp8_dev = "cpu" if (N * K > 64_000_000) else (args.device if args.device.startswith("cuda") else "cpu")
+        packed = quantize_scaled_fp8(w.float().to(fp8_dev), group_size=FP8_GROUP_SIZE)
+        out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.fp8.pt"
+        blob = {
+            "name": name,
+            "tier": "fp8",
+            "shape": [N, K],
+            "group_size": FP8_GROUP_SIZE,
+            "e4m3": packed["e4m3"].to(torch.float32).cpu(),   # [N, K]
+            "scale": packed["scale"].to(torch.float16).cpu(), # [N, K/32]
+        }
+        torch.save(blob, out_path)
+        fp8_blob_names.append(name)
+        print(f"[{fi+1}/{len(fp8_targets)}] [fp8] {name}  shape=({N}, {K})  "
+              f"dev={fp8_dev}  saved: {out_path.name}")
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    # ─── Record dense-coverage scope in the manifest (D — explicit, not silent).
+    # These FP8-tier blobs exist on disk and await converter (ml8_to_gguf.py)
+    # support; the marker records that fact for downstream tooling.
+    manifest["dense_coverage"] = _coverage
+    if _coverage == "full":
+        manifest["fp8_tensors"] = fp8_blob_names
+        # NOTE: FP8-tier blobs (*.fp8.pt) await converter ingestion — separate task.
 
     if args.eval_ppl:
         print(f"\n[ppl-quant] computing quantized PPL...")
@@ -1353,7 +1796,7 @@ def main():
     os.replace(tmp_manifest, manifest_path)
     print(f"\n[done] manifest: {manifest_path}")
 
-    pager.shutdown()
+    if pager is not None: pager.shutdown()
 
 
 if __name__ == "__main__":
