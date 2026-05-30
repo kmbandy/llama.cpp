@@ -4165,6 +4165,7 @@ class GGMLQuantizationType(IntEnum):
     # Same numerics as ML8_4 (4-bit centroid indices + fp32 group scales);
     # different byte layout per tensor: b_packed then b_scale per expert row.
     ML8_4_SOA = 50
+    ML8_FP8   = 51   # scaled-fp8 weight: 32 e4m3 bytes + one fp16 group scale (8 bpv)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4345,6 +4346,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F8_E4M3: (1, 1),
     # MAD-244: ML8_4 stored-as-repacked SOA. Same byte-count-per-element as ML8_4.
     GGMLQuantizationType.ML8_4_SOA: (64, 4 + 32),
+    GGMLQuantizationType.ML8_FP8: (32, 32 + 2),
 }
 
 
