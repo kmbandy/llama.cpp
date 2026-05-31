@@ -46,6 +46,7 @@ that takes the winning cell IDs and emits the cross. Code it while tier-1 runs.
 | **heavy++** | `--heavy-rounds` / `--heavy-steps` | 4 / 60 | bump (e.g. 8 / 120) |
 | **corpus-scale** | `--n-samples` × `--seq-len` | 32 × 1024 | ~16k tokens total (e.g. 64 × 2048) |
 | **rotation** | see the rotation menu below | `kronecker` | sweep the menu |
+| **AWQ rescaling** | `--awq none\|mean` + `--awq-alpha` | `none` (off) | `mean` × α ∈ {0.25, 0.5} — **but see the per-token caveat** |
 
 ### The rotation menu (the lever's sub-options)
 
@@ -78,6 +79,41 @@ any one-shot/light lever). So tier-2's value is primarily:
 Don't assume tier-2 will move the needle — it's a confirmation/expansion sweep,
 and the rotation lever specifically needs the quarot-R1 γ-absorption bug fixed
 (and `hadamard_full` wired) before two of its four options are even runnable.
+
+### Why AWQ is dead here — and why it predicts the rotation lever too (MAD-256 #1, 2026-05-29)
+
+AWQ was the *top untried bpv-neutral lever* in the strategy, then the offline rig
+(`awq_sweep.py` / `down_proj_rig.py`, Qwen3.6-35B-A3B, L0/L20, 64 busiest experts,
+gs64/nc16/e4m3) killed it: gate +0.27/+0.07 dB, up +0.23/+0.05, down +0.09/+0.09
+(L0/L20) peaking at **α≈0.25**, all going **negative past α~0.25–0.5**.
+
+**Root cause (well-grounded, the load-bearing insight):** the SwiGLU down_proj
+intermediate `silu(gate·x)·(up·x)` is fat-tailed with **median** per-channel
+kurtosis 121–183 (max ~6000–8200; gaussian = 3). The *median* being huge (not just
+the max) means **nearly all** channels are fat → the signature of **per-token**
+outliers (a few outlier tokens spike across many channels), NOT per-channel
+outliers. AWQ scales **per-channel**, so when every channel is ~equally fat its
+scale vector is ~uniform → near no-op. Independently confirmed by MAD-214 KV work
+("Qwen K outliers more per-token than per-channel; Hadamard helped only ~12%"). So
+**per-token-dominant outliers are a consistent Qwen-family property across KV and
+FFN.**
+
+**The unifying implication for tier-2:** *per-channel* methods have little headroom
+on this model — that's **AWQ AND the residual-stream-Hadamard / QuaRot-R1 rotation
+option** (both per-channel). The levers that *match* per-token structure, and thus
+carry the real expected value, are:
+
+- **`mag_weighted` fit-loss** — up-weights high-|sample| outlier-token contributions
+  in Lloyd-Max (per-sample/token aware), and
+- **finer `group_size` on down** — per-group scale adapts to local magnitude
+  regardless of channel/token alignment (small bpv cost; down_proj is the
+  worst-quantizing matrix, baseline Y_SNR 20.6/22.5 vs gate/up 32/24, so most
+  headroom IF the lever matches the structure).
+
+So in tier-2, treat **AWQ and quarot-R1 as low-prior confirmation cells** (cheap to
+include for the 27B-dense / full-coverage regime, but don't bank on them), and put
+the search budget on **mag_weighted-down + group_size-down**. Keep `kronecker`
+(per-linear, already the near-optimal baseline) as the rotation default.
 
 ---
 
