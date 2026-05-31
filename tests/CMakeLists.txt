@@ -286,6 +286,10 @@ target_include_directories(test-ml8-dequant PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src
 llama_build_and_test(test-ml8-mul-mat.cpp)
 target_include_directories(test-ml8-mul-mat PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 
+# MAD-223 Phase G.12: ml8 sidecar registry + build_ml8_or_mul_mat dispatch contract.
+llama_build_and_test(test-ml8-registry.cpp)
+target_include_directories(test-ml8-registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # MAD-137: mt:: tier primitive unit tests
 # These compile a small slice of src/memory-tier/ directly into the test
 # binary because the classes aren't exported through the public llama
