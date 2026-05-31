@@ -427,6 +427,42 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+// MAD Task 11: CPU vec_dot for scaled-fp8 (ML8_FP8) weights × fp32 activations.
+// vec_dot_type is GGML_TYPE_F32 (no src1 requantization), so y is raw fp32.
+// Each ML8_FP8 block is { fp16 scale, 32 × e4m3 byte }; the weight value is
+// e4m3_decode(qs[i]) * fp16_to_fp32(scale). This is the CPU reference the HIP
+// no-LUT FP8-WMMA path (ggml_cuda_op_ml8_fp8_mul_mat) is validated against.
+void ggml_vec_dot_ml8_fp8_f32(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_ML8_FP8 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const int nb = n / QK_ML8_FP8;
+
+    const block_ml8_fp8 * GGML_RESTRICT x = vx;
+    const float         * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    float wdec[QK_ML8_FP8];
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float scale = GGML_CPU_FP16_TO_FP32(x[ib].scale);
+        // Decode the 32 raw e4m3 bytes to fp32, then apply the block scale.
+        dequantize_row_f8_e4m3(x[ib].qs, wdec, QK_ML8_FP8);
+        const float * yb = y + (size_t) ib * QK_ML8_FP8;
+        float blk = 0.0f;
+        for (int j = 0; j < QK_ML8_FP8; ++j) {
+            blk += wdec[j] * yb[j];
+        }
+        sumf += blk * scale;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

@@ -88,8 +88,18 @@ static inline mt_ml8_tuned_cfg ml8_pick_config(int32_t M, int32_t K, int32_t N) 
 struct mt_ml8_gemm_shape_t {
     int32_t N;             // out_features (calibration's "rows")
     int32_t K;             // in_features  (calibration's "in_features")
-    int32_t group_size;    // typically 64 for ml8-4 (Cell C recipe)
-    int32_t n_centroids;   // 16 for ml8-4
+    int32_t group_size;    // typically 64 for ml8-4 (Cell C recipe), 32 for ml8-fp8
+    int32_t n_centroids;   // 16 for ml8-4 (ignored when weight_format == 0)
+    // WEIGHT_FORMAT switch into _gemm_a8w8_blockscale_kernel:
+    //   1 = ml8-4 LUT path: B is packed 4-bit nibbles [K/2, N] indexing a
+    //       per-K-group fp8 centroid LUT (b_packed + centroid_lut_fp8).
+    //   0 = scaled-fp8 (ml8-fp8) baseline: B is raw e4m3 bytes [K, N] fed
+    //       straight to tl.dot; the centroid LUT branch is dead-code-eliminated.
+    //       centroid_lut_fp8 must still point at a non-null device buffer (it is
+    //       never dereferenced) and stride_lut_k must be 0.
+    // Callers MUST set this explicitly (it is part of the kernel cache key):
+    // 1 for ml8-4 weights, 0 for ml8-fp8 weights.
+    int32_t weight_format;
 };
 
 #ifdef __cplusplus

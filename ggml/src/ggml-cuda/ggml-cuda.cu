@@ -2723,6 +2723,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // MAD Task 11: scaled-fp8 (ml8-fp8) weights stay a plain GGML_OP_MUL_MAT
+    // (no centroid sidecar, no load-time op-swap). Route them to the no-LUT
+    // FP8-WMMA path (WEIGHT_FORMAT=0) before any of the generic mul_mat
+    // kernels — none of which understand the ML8_FP8 block layout.
+    if (src0->type == GGML_TYPE_ML8_FP8) {
+        ggml_cuda_op_ml8_fp8_mul_mat(ctx, dst);
+        return;
+    }
+
     // ml8-4 sidecar guard (MAD-223): F8_E4M3 is claimed in supports_op so the
     // centroid sidecars stay on the HIP buffer alongside their ml8_4 weights,
     // but the centroids are consumed via GGML_OP_ML8_MUL_MAT, never as a real
@@ -5476,6 +5485,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TQ4_1S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
+                    // MAD Task 11: scaled-fp8 (ml8-fp8) weights are a real
+                    // MUL_MAT weight type — routed to the no-LUT FP8-WMMA path
+                    // (WEIGHT_FORMAT=0) in ggml_cuda_mul_mat. Requires fp32
+                    // activations + fp32 output, K a multiple of QK_ML8_FP8 (32)
+                    // and N a multiple of MT_ML8_BLOCK_SIZE_N (16). The dispatch
+                    // aborts loudly if ggml-hip was built without AITER.
+                    case GGML_TYPE_ML8_FP8: {
+                        // The no-LUT FP8-WMMA GEMM runs on the AITER Triton
+                        // kernel, which targets RDNA4 (gfx1201). On a mixed-arch
+                        // build (e.g. gfx1201 + gfx1030) only the RDNA4 device
+                        // can serve it — gate here so non-RDNA4 devices report
+                        // "not supported" instead of aborting at dispatch.
+                        const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                        return GGML_CUDA_CC_IS_RDNA4(cc)
+                            && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
+                            && a->ne[0] % 32 == 0   // QK_ML8_FP8
+                            && a->ne[1] % 16 == 0;  // MT_ML8_BLOCK_SIZE_N
+                    }
                     // ml8-4 sidecar (MAD-223): F8_E4M3 centroids ride along with
                     // ml8_4 weight tensors but are consumed as src[1] of
                     // GGML_OP_ML8_MUL_MAT, never as a real MUL_MAT weight.

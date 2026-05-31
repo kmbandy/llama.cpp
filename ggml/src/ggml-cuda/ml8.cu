@@ -9,8 +9,15 @@
 #include "ggml.h"
 #include "common.cuh"
 #include "convert.cuh"
+#ifdef GGML_HIP_AITER
+// The ml8 GEMM dispatch goes through the AITER Triton-AOT kernels. Their headers
+// only live on the include path when ggml-hip is configured with -DGGML_HIP_AITER=ON
+// (see ggml-hip/CMakeLists.txt). Gate the includes so ml8.cu compiles on any build
+// WITHOUT that toolchain — ml8 inference is then unavailable (calibration-only /
+// cross-arch builds), but the rest of ggml-hip (repack, rotation, the pager) builds.
 #include "mt_ml8_gemm.h"
 #include "mt_ml8_moe_gemm.h"       // G.7: ml8 MoE GEMM Triton wrapper
+#endif // GGML_HIP_AITER
 #include "turbo_fp8_hadamard.cuh"  // G.6.f: FWHT for rotation H_b leg
 
 #include <cstdio>
@@ -19,6 +26,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 // G.6.g.C: debug hooks to dump rotation input + ml8_mul_mat output to /tmp
 // for Python-side bit-equivalence comparison. Set env var ML8_DUMP=1 to
@@ -153,7 +161,42 @@ struct cache_entry_t {
 std::mutex                                            g_ml8_cache_mu;
 std::unordered_map<const void *, cache_entry_t>       g_ml8_cache;
 
+// ML8_FP8 (scaled-fp8) repack cache. Here info.b_packed holds raw e4m3 bytes
+// [K, N] (no nibbles). Unlike the ml8-4 cache, this path is exercised by
+// test-backend-ops, which recycles tensor device buffers across cases — so a
+// device pointer can be reused for a DIFFERENT weight. Caching purely by
+// pointer would then return a stale repack. We therefore also stash a cheap
+// content checksum (strided FNV over the on-disk blocks) and re-repack if the
+// pointer's contents changed. In production (persistent weights) the checksum
+// always matches, so the cache still hits on first lookup.
+struct fp8_cache_entry_t {
+    cache_entry_t base;
+    uint64_t      checksum;
+};
+std::mutex                                            g_ml8_fp8_cache_mu;
+std::unordered_map<const void *, fp8_cache_entry_t>   g_ml8_fp8_cache;
+
 } // namespace
+
+// Cheap strided FNV-1a checksum over a weight's on-disk bytes. Samples up to
+// 256 evenly-spaced bytes so the cost is constant regardless of weight size,
+// while still detecting an in-place content swap with overwhelming probability.
+static uint64_t ml8_fp8_weight_checksum(cudaStream_t stream, const ggml_tensor * w,
+                                        size_t total_bytes) {
+    const int n_samples = (int) std::min<size_t>(256, total_bytes);
+    const size_t stride = total_bytes / (size_t) (n_samples > 0 ? n_samples : 1);
+    std::vector<uint8_t> sample(n_samples);
+    for (int i = 0; i < n_samples; ++i) {
+        const size_t off = (size_t) i * stride;
+        cudaMemcpyAsync(&sample[i], (const uint8_t *) w->data + off, 1,
+                        cudaMemcpyDeviceToHost, stream);
+    }
+    cudaStreamSynchronize(stream);
+    uint64_t h = 1469598103934665603ULL;
+    for (uint8_t b : sample) { h ^= b; h *= 1099511628211ULL; }
+    h ^= (uint64_t) total_bytes; h *= 1099511628211ULL;
+    return h;
+}
 
 const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     cudaStream_t        stream,
@@ -245,12 +288,178 @@ const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
 }
 
 void ggml_cuda_ml8_clear_cache(void) {
-    std::lock_guard<std::mutex> lock(g_ml8_cache_mu);
-    for (auto & kv : g_ml8_cache) {
-        cudaFree(kv.second.info.b_packed);
-        cudaFree(kv.second.info.b_scale);
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_cache_mu);
+        for (auto & kv : g_ml8_cache) {
+            cudaFree(kv.second.info.b_packed);
+            cudaFree(kv.second.info.b_scale);
+        }
+        g_ml8_cache.clear();
     }
-    g_ml8_cache.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
+        for (auto & kv : g_ml8_fp8_cache) {
+            cudaFree(kv.second.base.info.b_packed);
+            cudaFree(kv.second.base.info.b_scale);
+        }
+        g_ml8_fp8_cache.clear();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ML8_FP8 (scaled-fp8) repack — no LUT.
+//
+// On-disk per-block layout: 2-byte fp16 scale, then QK_ML8_FP8 = 32 raw
+// OCP e4m3fn weight bytes covering 32 K-elements. sizeof(block_ml8_fp8)==34.
+// Rows are [N, K] laid out as per-row sequences of n_groups_k blocks.
+//
+// The WF=0 Triton path wants B as raw e4m3 [K, N] (transposed, same dtype
+// as A) plus a fp32 per-(K-group, N) scale [n_groups_k, N]. So this repack
+// is the FP8 sibling of ml8_repack_kernel: copy the e4m3 byte straight
+// through (no 4-bit unpack, no centroid), and widen the fp16 group scale to
+// fp32. group_size is QK_ML8_FP8 = 32.
+// ─────────────────────────────────────────────────────────────────────
+static constexpr int ML8_FP8_BLOCK_BYTES = (int) sizeof(block_ml8_fp8);  // 34
+
+// One thread per (n, g) pair. Reads the (2-byte fp16 scale + 32 e4m3 bytes)
+// block from the on-disk row-major (N, n_groups_k * 34) layout and scatters
+// into the separated (b_fp8[K, N], b_scale[n_groups_k, N]) layout.
+static __global__ void ml8_fp8_repack_kernel(
+    const uint8_t * __restrict__ src,        // (N, n_groups_k * 34) bytes
+    uint8_t       * __restrict__ b_fp8,      // (K, N) row-major raw e4m3
+    float         * __restrict__ b_scale,    // (n_groups_k, N) row-major
+    int N,
+    int n_groups_k) {
+
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int g = blockIdx.y;
+    if (n >= N || g >= n_groups_k) {
+        return;
+    }
+
+    const uint8_t * blk = src
+        + (size_t) n * (size_t) n_groups_k * (size_t) ML8_FP8_BLOCK_BYTES
+        + (size_t) g * (size_t) ML8_FP8_BLOCK_BYTES;
+
+    // Scale: 2-byte fp16 at the start of the block → widen to fp32.
+    uint16_t scale_h;
+    memcpy(&scale_h, blk, sizeof(uint16_t));
+    const float scale = __half2float(reinterpret_cast<const __half &>(scale_h));
+    b_scale[(size_t) g * (size_t) N + (size_t) n] = scale;
+
+    // Weights: 32 raw e4m3 bytes after the scale, covering K-rows
+    // [g * QK_ML8_FP8, (g + 1) * QK_ML8_FP8). Copied straight through.
+    const uint8_t * qs     = blk + sizeof(uint16_t);
+    const int       k_base = g * QK_ML8_FP8;
+    #pragma unroll
+    for (int j = 0; j < QK_ML8_FP8; ++j) {
+        b_fp8[((size_t) (k_base + j)) * (size_t) N + (size_t) n] = qs[j];
+    }
+}
+
+// Cache-keyed ML8_FP8 repack. Mirrors ggml_cuda_ml8_get_or_repack but for
+// the scaled-fp8 weight: b_packed holds raw e4m3 bytes [K, N], b_scale holds
+// fp32 [n_groups_k, N]. group_size is QK_ML8_FP8 (32).
+static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
+    cudaStream_t        stream,
+    const ggml_tensor * w) {
+
+    if (w == nullptr || w->data == nullptr) {
+        return nullptr;
+    }
+    if (w->type != GGML_TYPE_ML8_FP8) {
+        return nullptr;
+    }
+
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    if (K <= 0 || N <= 0 || K % QK_ML8_FP8 != 0) {
+        return nullptr;
+    }
+    const int32_t group_size = QK_ML8_FP8;
+    const int32_t n_groups_k = K / group_size;
+
+    const void * key = w->data;
+    const size_t src_bytes = ggml_nbytes(w);
+    const uint64_t checksum = ml8_fp8_weight_checksum(stream, w, src_bytes);
+
+    {
+        std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
+        auto it = g_ml8_fp8_cache.find(key);
+        if (it != g_ml8_fp8_cache.end()) {
+            if (it->second.checksum == checksum) {
+                return &it->second.base.info;   // pointer + content both match
+            }
+            // Pointer reused for a different weight (test harness recycles
+            // buffers). Drop the stale repack and rebuild below.
+            cudaFree(it->second.base.info.b_packed);
+            cudaFree(it->second.base.info.b_scale);
+            g_ml8_fp8_cache.erase(it);
+        }
+    }
+
+    void *  d_b_fp8   = nullptr;
+    float * d_b_scale = nullptr;
+
+    const size_t b_fp8_bytes   = (size_t) K * (size_t) N;            // [K, N] raw e4m3
+    const size_t b_scale_bytes = (size_t) n_groups_k * (size_t) N * sizeof(float);
+
+    cudaError_t err = cudaMalloc(&d_b_fp8, b_fp8_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-fp8] cudaMalloc(b_fp8=%zu) failed: %s\n",
+                b_fp8_bytes, cudaGetErrorString(err));
+        return nullptr;
+    }
+    err = cudaMalloc((void **) &d_b_scale, b_scale_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-fp8] cudaMalloc(b_scale=%zu) failed: %s\n",
+                b_scale_bytes, cudaGetErrorString(err));
+        cudaFree(d_b_fp8);
+        return nullptr;
+    }
+
+    constexpr int BLOCK_N = 64;
+    const dim3 grid((N + BLOCK_N - 1) / BLOCK_N, n_groups_k, 1);
+    const dim3 block(BLOCK_N, 1, 1);
+    ml8_fp8_repack_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t *) w->data,
+        (uint8_t *)       d_b_fp8,
+        d_b_scale,
+        N,
+        n_groups_k);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ml8-fp8] repack kernel launch failed: %s\n",
+                cudaGetErrorString(err));
+        cudaFree(d_b_fp8);
+        cudaFree(d_b_scale);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
+    auto it = g_ml8_fp8_cache.find(key);
+    if (it != g_ml8_fp8_cache.end() && it->second.checksum == checksum) {
+        cudaFree(d_b_fp8);
+        cudaFree(d_b_scale);
+        return &it->second.base.info;
+    }
+    if (it != g_ml8_fp8_cache.end()) {
+        // Raced or stale; replace.
+        cudaFree(it->second.base.info.b_packed);
+        cudaFree(it->second.base.info.b_scale);
+        g_ml8_fp8_cache.erase(it);
+    }
+    fp8_cache_entry_t entry{};
+    entry.base.info.b_packed   = d_b_fp8;     // raw e4m3 [K, N] (no nibbles for fp8)
+    entry.base.info.b_scale    = d_b_scale;
+    entry.base.info.N          = N;
+    entry.base.info.K          = K;
+    entry.base.info.n_groups_k = n_groups_k;
+    entry.base.info.group_size = group_size;
+    entry.checksum             = checksum;
+    auto [ins_it, _ins_ok] = g_ml8_fp8_cache.emplace(key, entry);
+    return &ins_it->second.base.info;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -672,7 +881,13 @@ void ggml_cuda_ml8_quantize_activations(
 void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst) {
-
+#ifndef GGML_HIP_AITER
+    // ml8 inference dispatches through the AITER Triton-AOT GEMM, only built with
+    // -DGGML_HIP_AITER=ON. Without it ml8 inference is unavailable (the box that
+    // calibrates ml8 weights and the box that runs them can differ — gfx1201 runs).
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
     const ggml_tensor * w    = dst->src[0];
     const ggml_tensor * cent = dst->src[1];
     const ggml_tensor * x    = dst->src[2];
@@ -783,10 +998,11 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
 
     mt_ml8_gemm_args_t args{};
-    args.shape.N           = N;
-    args.shape.K           = K;
-    args.shape.group_size  = group_size;
-    args.shape.n_centroids = n_centroids;
+    args.shape.N             = N;
+    args.shape.K             = K;
+    args.shape.group_size    = group_size;
+    args.shape.n_centroids   = n_centroids;
+    args.shape.weight_format = 1;  // ml8-4 LUT path
 
     args.a_fp8             = a_fp8.get();
     args.b_packed          = repack->b_packed;
@@ -823,6 +1039,123 @@ void ggml_cuda_op_ml8_mul_mat(
         ml8_dump_fp32("/tmp/ml8_hip_y_out.bin", (const float *) dst->data,
                       (size_t) M * (size_t) N, stream, 2, shape);
     }
+#endif // GGML_HIP_AITER
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// No-LUT FP8-WMMA mul_mat for scaled-fp8 weights (GGML_TYPE_ML8_FP8).
+//
+// ML8_FP8 weights are a single self-contained tensor: per-32-element fp16
+// scale + raw OCP e4m3fn bytes. Unlike ML8_4 there is NO centroid sidecar,
+// so this op has just src[0]=w, src[1]=x. It routes through the SAME Triton
+// kernel as ML8_4 but with WEIGHT_FORMAT=0: B is the raw e4m3 weight fragment
+// fed straight into tl.dot, and the per-group fp32 scale is applied in the
+// fp32 epilogue (accumulator += tl.dot(a, b) * a_scale * b_scale). The M=1
+// GEMV fast-path is ml8-LUT-specific and NOT used here.
+// MAD Task 11.
+// ─────────────────────────────────────────────────────────────────────
+void ggml_cuda_op_ml8_fp8_mul_mat(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+
+    GGML_ASSERT(w != nullptr && x != nullptr);
+    GGML_ASSERT(w->type   == GGML_TYPE_ML8_FP8);
+    GGML_ASSERT(x->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    const int32_t M = (int32_t) x->ne[1];
+
+    GGML_ASSERT(x->ne[0]   == K);
+    GGML_ASSERT(dst->ne[0] == N);
+    GGML_ASSERT(dst->ne[1] == M);
+    GGML_ASSERT(K % QK_ML8_FP8       == 0);
+    GGML_ASSERT(N % MT_ML8_BLOCK_SIZE_N == 0);
+
+    const int32_t group_size = QK_ML8_FP8;          // 32
+    const int32_t n_groups_k = K / group_size;
+
+    cudaStream_t stream = ctx.stream();
+
+    // ── 1. Repack weights (cached after first call for this w).
+    //   b_packed = raw e4m3 [K, N]; b_scale = fp32 [n_groups_k, N].
+    const ml8_weight_repack_t * repack = ggml_cuda_ml8_fp8_get_or_repack(stream, w);
+    GGML_ASSERT(repack != nullptr);
+
+    // ── 2. Pad M to a multiple of the tuned tier's BLOCK_SIZE_M (same as ML8_4).
+    const mt_ml8_tuned_cfg pad_cfg = ml8_pick_config(M, K, N);
+    const int32_t M_pad = ((M + pad_cfg.bm - 1) / pad_cfg.bm) * pad_cfg.bm;
+
+    ggml_cuda_pool_alloc<float> x_padded(ctx.pool());
+    const float * x_src;
+    if (M_pad == M) {
+        x_src = (const float *) x->data;
+    } else {
+        x_padded.alloc((size_t) M_pad * (size_t) K);
+        CUDA_CHECK(cudaMemsetAsync(x_padded.get(), 0,
+            (size_t) M_pad * (size_t) K * sizeof(float), stream));
+        CUDA_CHECK(cudaMemcpyAsync(x_padded.get(), x->data,
+            (size_t) M * (size_t) K * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));
+        x_src = x_padded.get();
+    }
+
+    // ── 3. Quantize fp32 → fp8 + per-row scale (identical to ML8_4 path).
+    ggml_cuda_pool_alloc<uint8_t> a_fp8(ctx.pool(),    (size_t) M_pad * (size_t) K);
+    ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) M_pad);
+    ggml_cuda_ml8_quantize_activations(
+        stream, x_src, a_fp8.get(), a_scale.get(), M_pad, K);
+
+    // ── 4. bf16 output (M_pad × N) and launch mt_ml8_gemm with WEIGHT_FORMAT=0.
+    ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
+
+    mt_ml8_gemm_args_t args{};
+    args.shape.N             = N;
+    args.shape.K             = K;
+    args.shape.group_size    = group_size;
+    args.shape.n_centroids   = 16;   // ignored under WF=0, but kept in the cache key
+    args.shape.weight_format = 0;    // scaled-fp8 baseline (no LUT)
+
+    args.a_fp8             = a_fp8.get();
+    args.b_packed          = repack->b_packed;   // raw e4m3 [K, N]
+    args.c                 = c_bf16.get();
+
+    args.a_scale_fp32      = a_scale.get();
+    args.b_scale_fp32      = repack->b_scale;
+    // WF=0 contract: centroid_lut_ptr is never dereferenced (the LUT branch is
+    // DCE'd), but the kernel param list still binds it — pass a non-null dummy
+    // (reuse b_scale) so the launcher arg-slot is valid, and stride_lut_k = 0.
+    args.centroid_lut_fp8  = repack->b_scale;
+
+    args.M                 = M_pad;
+
+    args.stride_am         = K;  args.stride_ak       = 1;
+    // WF=0 B is [K, N] (NOT [K/2, N]): stride_bk = N over full K rows.
+    args.stride_bk         = N;  args.stride_bn       = 1;
+    args.stride_cm         = N;  args.stride_cn       = 1;
+    args.stride_ascale_m   = 1;
+    args.stride_bscale_k   = N;  args.stride_bscale_n = 1;
+    args.stride_lut_k      = 0;
+
+    const hipError_t gemm_rc = mt_ml8_gemm(stream, &args);
+    GGML_ASSERT(gemm_rc == hipSuccess && "mt_ml8_gemm (fp8 WF=0) dispatch failed");
+
+    // ── 5. Convert first M rows of bf16 [M_pad, N] → fp32 [M, N] into dst.
+    const to_fp32_cuda_t bf16_to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+    GGML_ASSERT(bf16_to_fp32 != nullptr);
+    bf16_to_fp32(c_bf16.get(), (float *) dst->data,
+                 (size_t) M * (size_t) N, stream);
+#endif // GGML_HIP_AITER
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1090,7 +1423,12 @@ static __global__ void ml8_moe_scatter_kernel(
 void ggml_cuda_op_ml8_mul_mat_id(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst) {
-
+#ifndef GGML_HIP_AITER
+    // ml8 MoE inference dispatches through the AITER Triton-AOT MoE GEMM, only built
+    // with -DGGML_HIP_AITER=ON. Unavailable on builds without that toolchain.
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("ml8 mul_mat_id (MoE) inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
     const ggml_tensor * w    = dst->src[0];
     const ggml_tensor * cent = dst->src[1];
     const ggml_tensor * x    = dst->src[2];
@@ -1322,4 +1660,5 @@ void ggml_cuda_op_ml8_mul_mat_id(
     ml8_moe_scatter_kernel<<<sgrid, sblock, 0, stream>>>(
         y_sorted.get(), d_inv.get(), (float *) dst->data, N, n_pairs);
     CUDA_CHECK(cudaGetLastError());
+#endif // GGML_HIP_AITER
 }

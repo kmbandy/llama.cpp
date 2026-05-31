@@ -122,6 +122,17 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
 
+// Execute a plain GGML_OP_MUL_MAT whose src[0] is a GGML_TYPE_ML8_FP8
+// (scaled-fp8) weight, via the no-LUT FP8-WMMA path (WEIGHT_FORMAT=0).
+// Unlike GGML_OP_ML8_MUL_MAT there is no centroid sidecar:
+//   dst:        fp32 [N, M]
+//   dst->src[0]: w  — GGML_TYPE_ML8_FP8, ne[0]=K (mult. of QK_ML8_FP8=32), ne[1]=N
+//   dst->src[1]: x  — GGML_TYPE_F32,     ne[0]=K, ne[1]=M
+// Routed from ggml_cuda_mul_mat (NOT op-swapped at load time).
+void ggml_cuda_op_ml8_fp8_mul_mat(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
 // MAD-223 G.7 — per-expert MoE repack. Sibling of ml8_weight_repack_t.
 //   b_packed [n_experts, K/2, N]    uint8
 //   b_scale  [n_experts, n_groups_k, N] fp32

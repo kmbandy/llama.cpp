@@ -78,16 +78,29 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
     // EVEN_K: K must be a multiple of BLOCK_SIZE_K.
     const int even_k = (s.K % block_size_k == 0) ? 1 : 0;
 
+    // WEIGHT_FORMAT switch (see mt_ml8_gemm_shape_t::weight_format):
+    //   WF=1 (ml8-4 LUT): arg #2 (b_ptr) is *i8:16 (packed uint8 nibbles).
+    //   WF=0 (ml8-fp8):   arg #2 (b_ptr) is *fp8e4nv:16 (raw e4m3, same dtype
+    //                     as A, fed straight to tl.dot). The trailing
+    //                     centroid_lut_ptr/stride_lut_k args remain in the
+    //                     signature (the kernel param list still lists them;
+    //                     the body branch that reads them is DCE'd), so the
+    //                     launcher still binds those positional slots — ml8.cu
+    //                     passes a non-null dummy lut pointer + stride_lut_k=0.
+    const char * b_dtype       = (s.weight_format == 0) ? "*fp8e4nv:16" : "*i8:16";
+    const int32_t weight_format = s.weight_format;
+
     char buf[2048];
     std::snprintf(buf, sizeof(buf),
-        "*fp8e4nv:16, *i8:16, *bf16:16, *fp32:16, *fp32:16, "
+        "*fp8e4nv:16, %s, *bf16:16, *fp32:16, *fp32:16, "
         "i32, i32, i32, "
         "i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, "
         // GROUP_K, GROUP_N, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M,
         // NUM_KSPLIT, SPLITK_BLOCK_SIZE, EVEN_K, GRID_MN, num_stages
         "%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, "
-        // ml8 additions: WEIGHT_FORMAT=1, N_CENTROIDS, centroid_lut_ptr, stride_lut_k
-        "1, %d, *fp8e4nv:16, i32",
+        // ml8 additions: WEIGHT_FORMAT, N_CENTROIDS, centroid_lut_ptr, stride_lut_k
+        "%d, %d, *fp8e4nv:16, i32",
+        b_dtype,                     // arg #2 b_ptr dtype (WF-dependent)
         group_size,                  // GROUP_K
         MT_ML8_GROUP_N,              // GROUP_N (= 1)
         cfg.bm,                      // BLOCK_SIZE_M  (G.6.a tuned)
@@ -99,6 +112,7 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
         even_k,                      // EVEN_K
         grid_mn,                     // GRID_MN
         MT_ML8_NUM_STAGES,           // num_stages
+        weight_format,               // WEIGHT_FORMAT (0 = fp8 baseline, 1 = LUT)
         s.n_centroids);              // N_CENTROIDS
     return buf;
 }
@@ -115,7 +129,8 @@ struct CachedHandle {
 // regime — M is a runtime arg, not a constexpr in the signature).
 struct ShapeKey {
     int32_t N, K, group_size, n_centroids;
-    int32_t prefill;  // 0=decode (M<=16), 1=prefill (M>16) — tuned configs differ
+    int32_t weight_format;  // 0=fp8 baseline, 1=ml8-4 LUT — different b_ptr dtype
+    int32_t prefill;        // 0=decode (M<=16), 1=prefill (M>16) — tuned configs differ
 };
 struct ShapeKeyHash {
     size_t operator()(const ShapeKey & k) const noexcept {
@@ -125,6 +140,7 @@ struct ShapeKeyHash {
         mix((uint64_t) k.K);
         mix((uint64_t) k.group_size);
         mix((uint64_t) k.n_centroids);
+        mix((uint64_t) k.weight_format);
         mix((uint64_t) k.prefill);
         return (size_t) h;
     }
@@ -132,7 +148,8 @@ struct ShapeKeyHash {
 struct ShapeKeyEq {
     bool operator()(const ShapeKey & a, const ShapeKey & b) const noexcept {
         return a.N == b.N && a.K == b.K && a.group_size == b.group_size
-            && a.n_centroids == b.n_centroids && a.prefill == b.prefill;
+            && a.n_centroids == b.n_centroids && a.weight_format == b.weight_format
+            && a.prefill == b.prefill;
     }
 };
 
@@ -148,7 +165,8 @@ std::mutex & get_cache_mutex() {
 }
 
 static ShapeKey shape_to_key(const mt_ml8_gemm_shape_t & s, int32_t M) {
-    return ShapeKey { s.N, s.K, s.group_size, s.n_centroids, (M > 16) ? 1 : 0 };
+    return ShapeKey { s.N, s.K, s.group_size, s.n_centroids,
+                      s.weight_format, (M > 16) ? 1 : 0 };
 }
 
 // Returns the cached handle for (shape, M-tier), JIT-compiling on first sight.
