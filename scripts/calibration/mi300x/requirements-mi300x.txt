@@ -1,0 +1,13 @@
+# MI300X calibration python deps.
+#
+# torch / numpy are provided by the base rocm/pytorch image — do NOT pin or
+# reinstall them here (reinstalling torch would clobber the ROCm-gfx942 build).
+# gguf is installed separately from the repo's ./gguf-py (matches our GGUF writer).
+#
+# The one hard pin: transformers must be the version carrying the Qwen3.5 VL arch
+# (Qwen3_5ForConditionalGeneration). That arch is why the local env is on 5.6.1.
+transformers==5.6.1
+
+# transformers pulls compatible tokenizers / safetensors / huggingface_hub itself.
+sentencepiece
+scipy
