@@ -163,6 +163,12 @@ GGML_API void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GG
 // k must be divisible by QK_ML8_FP8 (32).
 GGML_API void dequantize_row_ml8_fp8(const block_ml8_fp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// MAD Task 10: ml8-fp8 quantize (inverse of dequantize_row_ml8_fp8).
+// scale = amax(|x|) / 448.0f; qs[i] = f32_to_e4m3fn(x[i]/scale).
+// k must be divisible by QK_ML8_FP8 (32).
+GGML_API void quantize_row_ml8_fp8_ref(const float * GGML_RESTRICT x, block_ml8_fp8 * GGML_RESTRICT y, int64_t k);
+GGML_API size_t quantize_ml8_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

@@ -4915,6 +4915,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TQ3_1S:
         case GGML_TYPE_TQ4_1S:
+        case GGML_TYPE_ML8_FP8:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

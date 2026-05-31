@@ -156,6 +156,55 @@ static __device__ __forceinline__ void dequantize_tq4_1s(const void * vx, const 
     v.y = buf[iqs + 1];
 }
 
+// Decode one OCP e4m3fn byte to fp32.
+// Encoding: sign(1) | exponent(4, bias=7) | mantissa(3).
+// NaN = S.1111.111 (0x7F / 0xFF). No infinities. Max normal = 448.
+// Matches the CPU g_fp8_e4m3_lut table in ggml-turbo-quant.c exactly.
+static __device__ __forceinline__ float ggml_cuda_e4m3fn_to_fp32(uint8_t b) {
+    const uint32_t s = (b >> 7) & 1u;
+    const uint32_t e = (b >> 3) & 0xFu;
+    const uint32_t m = b & 0x7u;
+
+    if (e == 0u && m == 0u) {
+        // ±0
+        const uint32_t bits = s << 31;
+        float f; __builtin_memcpy(&f, &bits, 4); return f;
+    }
+    if (e == 15u && m == 7u) {
+        // NaN (only S.1111.111 is NaN in e4m3fn)
+        const uint32_t bits = (s << 31) | (0xFFu << 23) | (1u << 22);
+        float f; __builtin_memcpy(&f, &bits, 4); return f;
+    }
+    if (e == 0u) {
+        // Subnormal: (-1)^s * 2^(-6) * (m/8)  →  normalise for fp32
+        // Leading bit position in m (0-indexed from bit 2)
+        const int lead = (m >= 4) ? 2 : (m >= 2) ? 1 : 0;
+        const uint32_t mant_norm = (m << (3 - lead)) & 0x7u;
+        const int exp_un  = -6 - (2 - lead);
+        const uint32_t exp_fp32 = (uint32_t)(exp_un + 127);
+        const uint32_t bits = (s << 31) | (exp_fp32 << 23) | (mant_norm << 20);
+        float f; __builtin_memcpy(&f, &bits, 4); return f;
+    }
+    // Normal: (-1)^s * 2^(e-7) * (1 + m/8)
+    const uint32_t exp_fp32 = e + 120u;           // (e-7)+127 = e+120
+    const uint32_t bits = (s << 31) | (exp_fp32 << 23) | (m << 20);
+    float f; __builtin_memcpy(&f, &bits, 4); return f;
+}
+
+// ML8_FP8: fp16 per-block scale + 32 × OCP e4m3fn bytes, block size 32, QR=1.
+// iqs is the element index within the block (even, 0..30); produces elements iqs and iqs+1.
+// Dequant: v.x = e4m3fn_decode(qs[iqs])   * fp16_to_fp32(scale)
+//          v.y = e4m3fn_decode(qs[iqs+1]) * fp16_to_fp32(scale)
+// Matches CPU dequantize_row_ml8_fp8 (ggml-turbo-quant.c) exactly.
+static __device__ __forceinline__ void dequantize_ml8_fp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_ml8_fp8 * x = (const block_ml8_fp8 *) vx;
+
+    const float scale = __half2float(x[ib].scale);
+
+    v.x = ggml_cuda_e4m3fn_to_fp32(x[ib].qs[iqs + 0]) * scale;
+    v.y = ggml_cuda_e4m3fn_to_fp32(x[ib].qs[iqs + 1]) * scale;
+}
+
 // TQ3_1S: 3-bit weight type with inverse WHT, block size 32, dual half-block scales
 // 3-bit packing: 4 groups of 8 indices in 3 bytes each (24 bits = 8 * 3-bit)
 static __device__ __forceinline__ void dequantize_tq3_1s(const void * vx, const int64_t ib, const int iqs, float2 & v) {

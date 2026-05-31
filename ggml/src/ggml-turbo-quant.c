@@ -1138,6 +1138,63 @@ void dequantize_row_ml8_fp8(const block_ml8_fp8 * GGML_RESTRICT x, float * GGML_
     }
 }
 
+// ── ml8_fp8 quantize ─────────────────────────────────────────────────────────
+//
+// MAD Task 10: quantize a row of fp32 → ml8_fp8 blocks.
+//
+// Block layout (34 bytes): [scale : fp16 LE] [qs : 32 × uint8 OCP e4m3fn]
+// scale = amax(|x[i]|) / 448.0  (E4M3_MAX; guard scale==0 → 1.0f)
+// qs[i] = f32_to_e4m3(x[i] / scale)
+//
+// This is the exact inverse of dequantize_row_ml8_fp8.  k must be divisible
+// by QK_ML8_FP8 (32).
+
+void quantize_row_ml8_fp8_ref(const float * GGML_RESTRICT x, block_ml8_fp8 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK_ML8_FP8 == 0);
+    const int64_t n_blocks = k / QK_ML8_FP8;
+
+    // Temp buffer for scaled values (one block at a time)
+    float scaled[QK_ML8_FP8];
+
+    for (int64_t b = 0; b < n_blocks; b++) {
+        const float * blk = &x[b * QK_ML8_FP8];
+
+        // Compute amax
+        float amax = 0.0f;
+        for (int i = 0; i < QK_ML8_FP8; i++) {
+            float av = blk[i] < 0.0f ? -blk[i] : blk[i];
+            if (av > amax) amax = av;
+        }
+
+        // scale = amax / E4M3_MAX (448.0f); guard zero
+        float scale = (amax > 0.0f) ? (amax / 448.0f) : 1.0f;
+        y[b].scale = GGML_FP32_TO_FP16(scale);
+
+        // Divide by scale, then encode each element as e4m3fn byte
+        float inv_scale = 1.0f / scale;
+        for (int i = 0; i < QK_ML8_FP8; i++) {
+            scaled[i] = blk[i] * inv_scale;
+        }
+        quantize_row_f8_e4m3_ref(scaled, y[b].qs, QK_ML8_FP8);
+    }
+}
+
+size_t quantize_ml8_fp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                         int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    GGML_ASSERT(n_per_row % QK_ML8_FP8 == 0);
+
+    const size_t row_size = (n_per_row / QK_ML8_FP8) * sizeof(block_ml8_fp8);
+    for (int64_t row = 0; row < nrows; row++) {
+        quantize_row_ml8_fp8_ref(
+            src + row * n_per_row,
+            (block_ml8_fp8 *)((char *)dst + row * row_size),
+            n_per_row
+        );
+    }
+    return nrows * row_size;
+}
+
 void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
     // Round-to-nearest-even fp32 → fp8 e4m3fn. Saturates at ±448 (no inf in
     // this variant). NaN inputs map to S.1111.111. Used at calibration-time
