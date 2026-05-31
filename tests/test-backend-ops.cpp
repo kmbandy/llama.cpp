@@ -8355,8 +8355,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // (WEIGHT_FORMAT=0 Triton path). Constraints: K % QK_ML8_FP8 (32) == 0,
     // N % MT_ML8_BLOCK_SIZE_N (16) == 0. Single-batch only (bs={1,1}, nr={1,1}).
     // Reference is the CPU backend dequant of the ML8_FP8 weight; tolerance is
-    // the test_mul_mat NMSE bound (5e-4) — activations are fp8-quantized but the
-    // accumulation is fp32, so the SNR comfortably clears it.
+    // the ML8_FP8 NMSE bound (5e-3, set in max_nmse_err) — activations are
+    // fp8-quantized and the output is bf16, so clean cases land ~5e-4..1e-3.
     // m = N (out_features), n = M (tokens), k = K (in_features).
     for (int M : { 1, 8, 16, 32 }) {                 // decode + prefill tiers
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_ML8_FP8, GGML_TYPE_F32,

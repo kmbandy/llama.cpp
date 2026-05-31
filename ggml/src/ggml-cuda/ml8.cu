@@ -162,41 +162,19 @@ std::mutex                                            g_ml8_cache_mu;
 std::unordered_map<const void *, cache_entry_t>       g_ml8_cache;
 
 // ML8_FP8 (scaled-fp8) repack cache. Here info.b_packed holds raw e4m3 bytes
-// [K, N] (no nibbles). Unlike the ml8-4 cache, this path is exercised by
-// test-backend-ops, which recycles tensor device buffers across cases — so a
-// device pointer can be reused for a DIFFERENT weight. Caching purely by
-// pointer would then return a stale repack. We therefore also stash a cheap
-// content checksum (strided FNV over the on-disk blocks) and re-repack if the
-// pointer's contents changed. In production (persistent weights) the checksum
-// always matches, so the cache still hits on first lookup.
-struct fp8_cache_entry_t {
-    cache_entry_t base;
-    uint64_t      checksum;
-};
-std::mutex                                            g_ml8_fp8_cache_mu;
-std::unordered_map<const void *, fp8_cache_entry_t>   g_ml8_fp8_cache;
+// [K, N] (no nibbles). Keyed purely by device pointer, exactly like the ml8-4
+// cache above: in production a weight's w->data is stable for the model's
+// lifetime, so the pointer is a valid key and lookups are a free hash hit on
+// the hot path (α/β run every token). Stale-pointer aliasing — a freed buffer's
+// address reused for a different weight — is handled by the invariant that
+// ggml_cuda_ml8_clear_cache() runs whenever a CUDA device buffer is freed
+// (wired into ggml_backend_cuda_buffer_free_buffer), so no entry outlives the
+// buffer its key points into. That also covers test-backend-ops, which frees
+// and recycles device buffers across cases.
+std::mutex                                       g_ml8_fp8_cache_mu;
+std::unordered_map<const void *, cache_entry_t>  g_ml8_fp8_cache;
 
 } // namespace
-
-// Cheap strided FNV-1a checksum over a weight's on-disk bytes. Samples up to
-// 256 evenly-spaced bytes so the cost is constant regardless of weight size,
-// while still detecting an in-place content swap with overwhelming probability.
-static uint64_t ml8_fp8_weight_checksum(cudaStream_t stream, const ggml_tensor * w,
-                                        size_t total_bytes) {
-    const int n_samples = (int) std::min<size_t>(256, total_bytes);
-    const size_t stride = total_bytes / (size_t) (n_samples > 0 ? n_samples : 1);
-    std::vector<uint8_t> sample(n_samples);
-    for (int i = 0; i < n_samples; ++i) {
-        const size_t off = (size_t) i * stride;
-        cudaMemcpyAsync(&sample[i], (const uint8_t *) w->data + off, 1,
-                        cudaMemcpyDeviceToHost, stream);
-    }
-    cudaStreamSynchronize(stream);
-    uint64_t h = 1469598103934665603ULL;
-    for (uint8_t b : sample) { h ^= b; h *= 1099511628211ULL; }
-    h ^= (uint64_t) total_bytes; h *= 1099511628211ULL;
-    return h;
-}
 
 const ml8_weight_repack_t * ggml_cuda_ml8_get_or_repack(
     cudaStream_t        stream,
@@ -299,8 +277,8 @@ void ggml_cuda_ml8_clear_cache(void) {
     {
         std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
         for (auto & kv : g_ml8_fp8_cache) {
-            cudaFree(kv.second.base.info.b_packed);
-            cudaFree(kv.second.base.info.b_scale);
+            cudaFree(kv.second.info.b_packed);
+            cudaFree(kv.second.info.b_scale);
         }
         g_ml8_fp8_cache.clear();
     }
@@ -380,21 +358,12 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
     const int32_t n_groups_k = K / group_size;
 
     const void * key = w->data;
-    const size_t src_bytes = ggml_nbytes(w);
-    const uint64_t checksum = ml8_fp8_weight_checksum(stream, w, src_bytes);
 
     {
         std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
         auto it = g_ml8_fp8_cache.find(key);
         if (it != g_ml8_fp8_cache.end()) {
-            if (it->second.checksum == checksum) {
-                return &it->second.base.info;   // pointer + content both match
-            }
-            // Pointer reused for a different weight (test harness recycles
-            // buffers). Drop the stale repack and rebuild below.
-            cudaFree(it->second.base.info.b_packed);
-            cudaFree(it->second.base.info.b_scale);
-            g_ml8_fp8_cache.erase(it);
+            return &it->second.info;
         }
     }
 
@@ -438,28 +407,23 @@ static const ml8_weight_repack_t * ggml_cuda_ml8_fp8_get_or_repack(
     }
 
     std::lock_guard<std::mutex> lock(g_ml8_fp8_cache_mu);
+    // Re-check in case another thread raced us. If so, free ours and
+    // return the winner's.
     auto it = g_ml8_fp8_cache.find(key);
-    if (it != g_ml8_fp8_cache.end() && it->second.checksum == checksum) {
+    if (it != g_ml8_fp8_cache.end()) {
         cudaFree(d_b_fp8);
         cudaFree(d_b_scale);
-        return &it->second.base.info;
+        return &it->second.info;
     }
-    if (it != g_ml8_fp8_cache.end()) {
-        // Raced or stale; replace.
-        cudaFree(it->second.base.info.b_packed);
-        cudaFree(it->second.base.info.b_scale);
-        g_ml8_fp8_cache.erase(it);
-    }
-    fp8_cache_entry_t entry{};
-    entry.base.info.b_packed   = d_b_fp8;     // raw e4m3 [K, N] (no nibbles for fp8)
-    entry.base.info.b_scale    = d_b_scale;
-    entry.base.info.N          = N;
-    entry.base.info.K          = K;
-    entry.base.info.n_groups_k = n_groups_k;
-    entry.base.info.group_size = group_size;
-    entry.checksum             = checksum;
+    cache_entry_t entry{};
+    entry.info.b_packed   = d_b_fp8;     // raw e4m3 [K, N] (no nibbles for fp8)
+    entry.info.b_scale    = d_b_scale;
+    entry.info.N          = N;
+    entry.info.K          = K;
+    entry.info.n_groups_k = n_groups_k;
+    entry.info.group_size = group_size;
     auto [ins_it, _ins_ok] = g_ml8_fp8_cache.emplace(key, entry);
-    return &ins_it->second.base.info;
+    return &ins_it->second.info;
 }
 
 // ─────────────────────────────────────────────────────────────────────

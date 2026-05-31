@@ -636,6 +636,12 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // The ml8 / ml8-fp8 weight-repack caches key on a weight's device pointer.
+    // Freeing this buffer invalidates any pointers into it, so drop the repack
+    // entries (and their separately-allocated repack buffers) to avoid serving
+    // a stale repack if the allocator later hands the same address to a
+    // different weight. Cheap no-op when no ml8 weights are in use.
+    ggml_cuda_ml8_clear_cache();
     delete ctx;
 }
 
