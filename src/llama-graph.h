@@ -19,6 +19,8 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 
+struct ml8_registry;
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -571,6 +573,7 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const ml8_registry           * ml8_reg = nullptr;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -658,9 +661,10 @@ struct llm_graph_params {
             cparams.causal_attn == other.cparams.causal_attn &&
             arch  == other.arch  &&
             gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            cvec    == other.cvec    &&
+            loras   == other.loras   &&
+            ml8_reg == other.ml8_reg &&
+            cross   == other.cross;
     }
 };
 
@@ -788,6 +792,7 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const ml8_registry           * ml8_reg = nullptr;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 

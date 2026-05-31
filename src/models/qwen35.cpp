@@ -87,6 +87,34 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         }
     };
 
+    // ml8-4 registry registration (MAD-223 T13). For a target weight that is
+    // ML8_4, create its centroids/rotation/awq sidecars via load_ml8_sidecars
+    // and register the (weight → sidecars) mapping so build_lora_mm routes the
+    // base matmul through the ml8 helper. Sidecar tensors are owned by the
+    // model's context (create_tensor tracks them for loading); the registry
+    // only holds their pointers. Guarded on ML8_4: a bf16/FFN-only GGUF
+    // registers nothing for these roles → registry miss → plain mul_mat.
+    //
+    // k_dim is the weight's input feature count (ne[0] / K) — the same value
+    // the weight's create_tensor used for its leading dim.
+    auto register_ml8_weight = [&](struct ggml_tensor * weight,
+                                   llm_tensor tensor_id, int il_, int64_t k_dim) {
+        if (!weight || weight->type != GGML_TYPE_ML8_4) {
+            return;
+        }
+        struct ggml_tensor * centroids    = nullptr;
+        struct ggml_tensor * rotation_h_a = nullptr;
+        struct ggml_tensor * rotation_meta = nullptr;
+        struct ggml_tensor * awq_scale    = nullptr;
+        load_ml8_sidecars(weight, tensor_id, il_, k_dim,
+                          &centroids, &rotation_h_a, &rotation_meta, &awq_scale);
+        ml8_reg.register_weight(weight, { centroids, rotation_h_a, awq_scale });
+    };
+
+    // lm_head (output) sidecars are model-scope (no il). Register here so the
+    // ml8 path covers the final logits projection when output is ML8_4.
+    register_ml8_weight(output, LLM_TENSOR_OUTPUT, -1, n_embd);
+
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
 
@@ -110,6 +138,15 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             // Q/K normalization for attention layers
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+
+            // ml8-4 registry (MAD-223 T13). create_tensor_qkv populates either
+            // a fused wqkv or split wq/wk/wv; register whichever exist. All have
+            // input dim n_embd; wo input is n_embd_head_k * n_head.
+            register_ml8_weight(layer.wqkv, LLM_TENSOR_ATTN_QKV, il, n_embd);
+            register_ml8_weight(layer.wq,   LLM_TENSOR_ATTN_Q,   il, n_embd);
+            register_ml8_weight(layer.wk,   LLM_TENSOR_ATTN_K,   il, n_embd);
+            register_ml8_weight(layer.wv,   LLM_TENSOR_ATTN_V,   il, n_embd);
+            register_ml8_weight(layer.wo,   LLM_TENSOR_ATTN_OUT, il, n_embd_head_k * n_head);
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
@@ -122,6 +159,12 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
+
+            // ml8-4 registry (MAD-223 T13). wqkv/wqkv_gate input dim is n_embd;
+            // ssm_out input dim is value_dim.
+            register_ml8_weight(layer.wqkv,      LLM_TENSOR_ATTN_QKV,  il, n_embd);
+            register_ml8_weight(layer.wqkv_gate, LLM_TENSOR_ATTN_GATE, il, n_embd);
+            register_ml8_weight(layer.ssm_out,   LLM_TENSOR_SSM_OUT,   il, value_dim);
         }
 
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
@@ -152,6 +195,15 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, 0);
 
+        // ml8-4 registry (MAD-223 T13). MTP attention mirrors the trunk dense
+        // attention: fused wqkv or split wq/wk/wv (input n_embd), wo input
+        // n_embd_head_k * n_head.
+        register_ml8_weight(layer.wqkv, LLM_TENSOR_ATTN_QKV, il, n_embd);
+        register_ml8_weight(layer.wq,   LLM_TENSOR_ATTN_Q,   il, n_embd);
+        register_ml8_weight(layer.wk,   LLM_TENSOR_ATTN_K,   il, n_embd);
+        register_ml8_weight(layer.wv,   LLM_TENSOR_ATTN_V,   il, n_embd);
+        register_ml8_weight(layer.wo,   LLM_TENSOR_ATTN_OUT, il, n_embd_head_k * n_head);
+
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, 0);
@@ -169,6 +221,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, 0);
+        // ml8-4 registry (MAD-223 T13). eh_proj input dim is 2 * n_embd.
+        register_ml8_weight(layer.nextn.eh_proj, LLM_TENSOR_NEXTN_EH_PROJ, il, 2 * n_embd);
         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              0);
         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              0);
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     TENSOR_NOT_REQUIRED);

@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "ggml-ml8.h"
+#include "llama-ml8-registry.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1041,6 +1042,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    ml8_reg          (params.ml8_reg),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1067,7 +1069,15 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // Route the base matmul through the ml8 helper when a registry is present.
+    // For non-ml8 weights and registry misses build_ml8_or_mul_mat is a pure
+    // pass-through to ggml_mul_mat(ctx0, w, cur), so this is byte-identical for
+    // every bf16/quantized weight and every non-ml8 model. LoRA and the w_s
+    // output-channel scale below are unchanged and compose with the ml8 path
+    // (AWQ acts input-side, w_s output-side).
+    ggml_tensor * res = ml8_reg
+        ? build_ml8_or_mul_mat(ctx0, *ml8_reg, w, cur)
+        : ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

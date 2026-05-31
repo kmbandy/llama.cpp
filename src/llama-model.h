@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 #include "llama-weight-pager.h"
+#include "llama-ml8-registry.h"
 
 namespace wp { class WeightPager; }
 
@@ -616,6 +617,12 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // ml8-4 sidecar registry (MAD-223 T13). Maps a base weight tensor pointer
+    // to its calibration sidecars so build_lora_mm can route the base matmul
+    // through the ml8 helper. Empty for non-ml8 models → every find() misses →
+    // build_ml8_or_mul_mat falls back to a plain ggml_mul_mat (zero impact).
+    ml8_registry ml8_reg;
 
     // weight paging for NVMe→VRAM demand paging.
     //
