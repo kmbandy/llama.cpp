@@ -204,14 +204,39 @@ target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hip
 option(GGML_HIP_AITER "Enable AITER Triton AOT attention kernels (MAD-188)" OFF)
 if (GGML_HIP_AITER)
     add_subdirectory(../ggml-cuda/aiter-integration aiter-integration)
-    target_link_libraries(ggml-hip PRIVATE aiter_triton_aot)
-    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_AITER)
-    # The aiter_triton_aot target exposes wrappers/ as PUBLIC includes, but
-    # under multi-arch HIP cross-compilation the propagation through PRIVATE
-    # linkage does not always reach every per-arch compile pass (gfx1030
-    # specifically). Add the include path explicitly so mt_pagedattn_aiter.cu
-    # — and any other .cu in ggml-cuda/ that consumes wrappers/ headers —
-    # builds for every requested AMDGPU_TARGETS arch.
-    target_include_directories(ggml-hip PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/aiter-integration/wrappers)
+    # The aiter-integration subdir only creates the aiter_triton_aot target when
+    # Triton AOT is actually available (Python can import triton). If Triton is
+    # unavailable it silently skips, leaving no target — and an unconditional
+    # `target_link_libraries(ggml-hip PRIVATE aiter_triton_aot)` then degrades to
+    # a bare `-laiter_triton_aot` with no search path, which only links if the
+    # build dir happens to be on LIBRARY_PATH (the old env-var workaround) and
+    # otherwise fails at link time with a confusing error. Guard on the target
+    # actually existing, and fail loud at configure with an actionable message
+    # otherwise — ml8 GPU inference REQUIRES these kernels (the ml8 ops are
+    # #ifdef GGML_HIP_AITER), so a silent AITER-less build would abort at runtime.
+    if (TARGET aiter_triton_aot)
+        target_link_libraries(ggml-hip PRIVATE aiter_triton_aot)
+        # Out-of-tree STATIC target: pin the link search path to the target's own
+        # output dir so it resolves with no LIBRARY_PATH env dance, any generator/arch.
+        target_link_directories(ggml-hip PRIVATE $<TARGET_FILE_DIR:aiter_triton_aot>)
+        target_compile_definitions(ggml-hip PRIVATE GGML_HIP_AITER)
+        # The aiter_triton_aot target exposes wrappers/ as PUBLIC includes, but
+        # under multi-arch HIP cross-compilation the propagation through PRIVATE
+        # linkage does not always reach every per-arch compile pass (gfx1030
+        # specifically). Add the include path explicitly so mt_pagedattn_aiter.cu
+        # — and any other .cu in ggml-cuda/ that consumes wrappers/ headers —
+        # builds for every requested AMDGPU_TARGETS arch.
+        target_include_directories(ggml-hip PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/aiter-integration/wrappers)
+    else()
+        message(FATAL_ERROR
+            "GGML_HIP_AITER=ON but the aiter_triton_aot target was not created. "
+            "The configure log above shows Triton AOT is unavailable (\"cannot "
+            "import triton\"). ml8 GPU inference REQUIRES the AITER kernels (the "
+            "ml8 ops are #ifdef GGML_HIP_AITER and abort otherwise), so this would "
+            "build a broken library. Fix Triton availability — point the build at a "
+            "Python that has triton, e.g. -DPython3_EXECUTABLE=/path/to/venv/bin/python "
+            "— or, to build an ml8-less HIP backend on purpose, reconfigure with "
+            "-DGGML_HIP_AITER=OFF.")
+    endif()
 endif()
