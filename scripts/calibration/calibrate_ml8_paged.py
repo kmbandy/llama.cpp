@@ -854,6 +854,11 @@ def main():
                         "The content lever — defines the Hessian everything descends.")
     p.add_argument("--corpus-seed", type=int, default=0,
                    help="RNG seed for byte-offset sampling + shuffle of mixed corpora")
+    p.add_argument("--token-budget", type=int, default=None,
+                   help="if set, draw every corpus to this many total tokens (wiki trimmed, "
+                        "mixes drawn by token-share) instead of using --n-samples. The "
+                        "token-matched control for the content sweep — equalizes the Hessian "
+                        "sample size across corpora regardless of per-doc length.")
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--percdamp", type=float, default=0.01)
     p.add_argument("--act-order", action="store_true",
@@ -1126,11 +1131,11 @@ def main():
     apply_fla_arch_shim(model, args.device)
 
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
-    print(f"[calib] loading {args.n_samples} samples seq_len={args.seq_len} "
-          f"corpus={args.corpus}")
+    print(f"[calib] loading {'budget ' + str(args.token_budget) + ' tok' if args.token_budget else str(args.n_samples) + ' samples'} "
+          f"seq_len={args.seq_len} corpus={args.corpus}")
     calib = collect_calibration(tokenizer, n_samples=args.n_samples,
                                  seq_len=args.seq_len, composition=args.corpus,
-                                 seed=args.corpus_seed)
+                                 seed=args.corpus_seed, token_budget=args.token_budget)
     print(f"[calib] got {len(calib)} samples (tokens ≈ {sum(c.numel() for c in calib)})")
 
     # Tier-tagged enumeration. For the DENSE strategy with --dense-coverage full

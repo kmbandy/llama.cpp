@@ -1,0 +1,23 @@
+# Build context trim for the MI300X calibration image.
+# We rebuild build-hip fresh for gfx942 inside the image, so every local
+# build tree, model blob, and dataset is dead weight in the context.
+
+.git
+# all local build trees (gfx1201/gfx1030 + stale variants) — rebuilt in-image
+build
+build-*
+# model weights / datasets / calibration dumps — pulled from S3 at runtime
+models
+wikitext-2-raw
+bin
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.npz
+# python / editor cruft
+**/__pycache__
+**/*.pyc
+.venv
+venv
+*.egg-info

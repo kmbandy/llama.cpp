@@ -183,14 +183,14 @@ def test_moe_input_side_matches_per_expert_loop():
     """Batched MoE input rotation == per-expert rotate_input_side over n_experts."""
     torch.manual_seed(20)
     d_model, d_ffn, n_exp = 32, 48, 4
-    # PyTorch shape for gate/up_exps: [d_ffn, d_model, n_exp]
-    W      = torch.randn(d_ffn, d_model, n_exp, dtype=torch.float32)
+    # Real GGUF→torch layout for gate/up_exps: [n_exp, d_ffn, d_model]
+    W      = torch.randn(n_exp, d_ffn, d_model, dtype=torch.float32)
     gamma  = torch.randn(d_model, dtype=torch.float32) * 0.3 + 1.0
     R      = build_R_resid(d_model=d_model, seed=21, device=torch.device("cpu"))
 
     expected = torch.empty_like(W)
     for e in range(n_exp):
-        expected[..., e] = rotate_input_side(W[..., e], gamma, R)
+        expected[e] = rotate_input_side(W[e], gamma, R)
 
     actual = rotate_moe_input_side(W, gamma, R)
     _assert_close(actual, expected, tol=1e-5, label="MoE input batched vs loop")
@@ -201,13 +201,13 @@ def test_moe_output_side_matches_per_expert_loop():
     """Batched MoE output rotation == per-expert rotate_output_side over n_experts."""
     torch.manual_seed(22)
     d_model, d_ffn, n_exp = 32, 48, 4
-    # PyTorch shape for down_exps: [d_model, d_ffn, n_exp]
-    W      = torch.randn(d_model, d_ffn, n_exp, dtype=torch.float32)
+    # Real GGUF→torch layout for down_exps: [n_exp, d_model, d_ffn]
+    W      = torch.randn(n_exp, d_model, d_ffn, dtype=torch.float32)
     R      = build_R_resid(d_model=d_model, seed=23, device=torch.device("cpu"))
 
     expected = torch.empty_like(W)
     for e in range(n_exp):
-        expected[..., e] = rotate_output_side(W[..., e], R)
+        expected[e] = rotate_output_side(W[e], R)
 
     actual = rotate_moe_output_side(W, R)
     _assert_close(actual, expected, tol=1e-5, label="MoE output batched vs loop")
@@ -245,9 +245,12 @@ def _make_tiny_qwen35moe_gguf(out_path: str, n_layers: int = 2, d_model: int = 3
         _add_bf16(f"blk.{L}.attn_output.weight",  torch.randn(d_model, d_model))
         _add_bf16(f"blk.{L}.post_attention_norm.weight", torch.ones(d_model) + 0.1 * torch.randn(d_model))
         _add_bf16(f"blk.{L}.ffn_gate_inp.weight", torch.randn(n_exp, d_model))
-        _add_bf16(f"blk.{L}.ffn_gate_exps.weight", torch.randn(d_ffn, d_model, n_exp))
-        _add_bf16(f"blk.{L}.ffn_up_exps.weight",   torch.randn(d_ffn, d_model, n_exp))
-        _add_bf16(f"blk.{L}.ffn_down_exps.weight", torch.randn(d_model, d_ffn, n_exp))
+        # Real GGUF→torch layout (element shape = reversed GGUF ne):
+        #   gate/up_exps GGUF ne [d_model, d_ffn, n_exp] → torch [n_exp, d_ffn, d_model]
+        #   down_exps    GGUF ne [d_ffn, d_model, n_exp] → torch [n_exp, d_model, d_ffn]
+        _add_bf16(f"blk.{L}.ffn_gate_exps.weight", torch.randn(n_exp, d_ffn, d_model))
+        _add_bf16(f"blk.{L}.ffn_up_exps.weight",   torch.randn(n_exp, d_ffn, d_model))
+        _add_bf16(f"blk.{L}.ffn_down_exps.weight", torch.randn(n_exp, d_model, d_ffn))
     _add_bf16("output_norm.weight", torch.ones(d_model) + 0.1 * torch.randn(d_model))
     _add_bf16("output.weight",      torch.randn(vocab, d_model))
     w.write_header_to_file()

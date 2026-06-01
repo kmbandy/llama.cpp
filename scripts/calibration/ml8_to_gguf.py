@@ -68,7 +68,8 @@ import gguf  # noqa: E402
 from gguf import GGMLQuantizationType  # noqa: E402
 from gguf.constants import GGML_QUANT_SIZES  # noqa: E402
 from ml8_io import load_ml8_layer, get_rotation, get_awq  # noqa: E402
-from role_targets import classify_role, Tier  # noqa: E402
+from role_targets import classify_role, Tier, configure as configure_roles  # noqa: E402
+from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (MTP draft-head convert-time FP8 cast)
 
 
 # Block constants — must match ggml/src/ggml-common.h::block_ml8_4 + QK_ML8
@@ -456,11 +457,43 @@ def evaluate_coverage(params_ml8: int, params_fp8: int,
 
 def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path,
                         min_coverage: float = 0.85,
-                        allow_partial: bool = False) -> dict:
+                        allow_partial: bool = False,
+                        mtp_fp8: bool = True) -> dict:
     reader = gguf.GGUFReader(base_gguf)
     arch = reader.fields["general.architecture"].contents()
     print(f"[base] {base_gguf}  arch={arch!r}  "
           f"fields={len(reader.fields)}  tensors={len(reader.tensors)}")
+
+    # Configure the role classifier with this base's arch + block count so tier
+    # classification resolves HF names through the authoritative TensorNameMap
+    # (identical to the calibrator's classification — no parallel hand table).
+    _bc = reader.fields.get(f"{arch}.block_count")
+    n_blocks = int(_bc.contents()) if _bc is not None else \
+        (1 + max((int(t.name.split(".")[1]) for t in reader.tensors
+                  if t.name.startswith("blk.")), default=-1))
+    configure_roles(arch, n_blocks)
+
+    # MTP / NextN draft-head block(s) — the last `nextn_predict_layers` blocks. The
+    # calibrator does not run GPTQ through the draft graph, so these GEMMs have no
+    # ml8 blobs. Per the 2026-05-31 decision we cast the WHOLE MTP block to scaled
+    # FP8 at convert time (near-lossless 8-bit; preserves speculative-acceptance rate;
+    # completes the all-FP8 coverage). Deliberate exception to "rotatable GEMM -> 4-bit".
+    _npl = reader.fields.get(f"{arch}.nextn_predict_layers")
+    nextn_predict = int(_npl.contents()) if _npl is not None else 0
+    mtp_first_idx = (n_blocks - nextn_predict) if (mtp_fp8 and nextn_predict > 0) else None
+    if mtp_first_idx is not None:
+        print(f"[mtp] casting MTP block(s) blk.{mtp_first_idx}..{n_blocks-1} GEMMs -> ML8_FP8")
+
+    def _is_mtp_fp8_tensor(name: str, shape) -> bool:
+        # 2D '.weight' under an MTP block index = a draft-head GEMM (attn_*/ffn_*/eh_proj).
+        # 1D norms are excluded by the rank check.
+        if mtp_first_idx is None or not name.startswith("blk.") or not name.endswith(".weight"):
+            return False
+        try:
+            bi = int(name.split(".")[1])
+        except (ValueError, IndexError):
+            return False
+        return bi >= mtp_first_idx and len(shape) == 2
 
     # ── Memory-pressure mitigation for large bases (e.g. 35B-A3B = 71 GB GGUF):
     # 1. Tell kernel sequential access pattern on the reader's mmap so it
@@ -516,6 +549,7 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path,
     n_ml8 = 0
     n_moe = 0
     n_fp8 = 0
+    n_mtp_fp8 = 0
     n_centroids = 0
     n_rot = 0
     n_awq = 0
@@ -672,6 +706,31 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path,
                                 f"— MoE inference requires identical AWQ scale across experts.")
                 writer.add_tensor(base + ".awq_scale", awq_np_ref.numpy())
                 n_awq += 1
+        elif _is_mtp_fp8_tensor(tensor.name, tensor.shape):
+            # MTP draft-head GEMM: convert-time scaled-FP8 cast (no calib blob).
+            if tensor.tensor_type != GGMLQuantizationType.BF16:
+                raise ValueError(
+                    f"{tensor.name}: MTP FP8 cast expects a BF16 source, got "
+                    f"{tensor.tensor_type.name}")
+            # tensor.data is raw bf16 bytes shaped [N, K*2]; widen each bf16 value
+            # into the high half of an fp32 to recover w=[N=out, K=in].
+            u16 = np.ascontiguousarray(tensor.data).view(np.uint16)        # [N, K]
+            f32 = (u16.astype(np.uint32) << 16).view(np.float32)           # [N, K]
+            w = torch.from_numpy(np.ascontiguousarray(f32))
+            N_w, K_w = int(w.shape[0]), int(w.shape[1])
+            if K_w % _FP8_GROUP_SIZE != 0:
+                raise ValueError(
+                    f"{tensor.name}: in_features {K_w} not divisible by FP8 group "
+                    f"size {_FP8_GROUP_SIZE} — cannot scaled-FP8 cast")
+            q = quantize_scaled_fp8(w, group_size=_FP8_GROUP_SIZE)
+            packed_fp8 = pack_scaled_fp8_blocks(q["e4m3"], q["scale"])
+            writer.add_tensor(tensor.name, packed_fp8,
+                              raw_dtype=GGMLQuantizationType.ML8_FP8)
+            if base_fd >= 0:
+                _advise_dontneed(base_fd, tensor.data_offset, tensor.n_bytes)
+            n_fp8 += 1
+            n_mtp_fp8 += 1
+            params_fp8 += N_w * K_w
         elif tensor.name in fp8_blob_map:
             # FP8-tier blob: write as ML8_FP8 instead of copying bf16.
             fp8_path = fp8_blob_map[tensor.name]
@@ -709,9 +768,9 @@ def convert_to_ml8_gguf(base_gguf: Path, calib_dir: Path, out_gguf: Path,
                     (tensor.name, p, tensor.tensor_type.name))
 
     print(
-        f"[tensors] dense_ml8={n_ml8}, moe_ml8={n_moe}, fp8={n_fp8}, "
-        f"centroids={n_centroids}, rotation={n_rot}, awq={n_awq}, "
-        f"copied unchanged={n_copied}"
+        f"[tensors] dense_ml8={n_ml8}, moe_ml8={n_moe}, fp8={n_fp8} "
+        f"(mtp_fp8={n_mtp_fp8}), centroids={n_centroids}, rotation={n_rot}, "
+        f"awq={n_awq}, copied unchanged={n_copied}"
     )
 
     # ── Coverage report + guardrail ────────────────────────────────────────
@@ -799,10 +858,14 @@ def main() -> None:
                    help="Emit even if coverage is below --min-coverage. The "
                         "artifact is tagged ml8.partial=true and a warning is "
                         "printed. Use only when a partial quant is intentional.")
+    p.add_argument("--mtp-fp8", action=argparse.BooleanOptionalAction, default=True,
+                   help="Convert-time scaled-FP8 cast of the MTP/NextN draft-head "
+                        "GEMMs (default on). --no-mtp-fp8 leaves them bf16.")
     args = p.parse_args()
     summary = convert_to_ml8_gguf(args.base_gguf, args.calib_dir, args.out_gguf,
                                   min_coverage=args.min_coverage,
-                                  allow_partial=args.allow_partial)
+                                  allow_partial=args.allow_partial,
+                                  mtp_fp8=args.mtp_fp8)
     print(f"[done] {summary}")
 
 

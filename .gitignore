@@ -198,3 +198,8 @@ Makefile
 # (cmake_install.cmake etc); negate it for our scaffolding.
 !ggml/src/ggml-cuda/aiter-integration/cmake/*.cmake
 .mneme-code
+
+# perf-baseline run artifacts — keep source/results, drop the noisy logs + profiler dumps
+tests/perf-baseline/**/*.log
+tests/perf-baseline/**/rocprof-*/
+tests/perf-baseline/calibration-logs/

@@ -5,6 +5,37 @@ Spec: `docs/superpowers/specs/2026-05-30-ml8-full-model-coverage-design.md`.
 Branch: `feat/ml8-full-model-coverage` (off `feat/upstream-merge-2026-05-27`).
 Execution: subagent-driven-development, inline controller. Tracking tasks #133–150.
 
+---
+## ⭐ CURRENT STATE + NEXT ACTION (2026-05-31 — read this first)
+
+**Full-coverage path WORKS end-to-end.** Fixed the explosion: ml8 dense mul_mat ops used
+`M = x->ne[1]`, dropping `ne[2]` (n_seqs) — `ssm_out`'s 3D input `[2048,n_tokens,n_seqs]`
+only computed seq 0 → chunk-1-fine/rest-explode. Fixed `ml8.cu:871` + `:1041` →
+`M = ne[1]*ne[2]*ne[3]`, rebuilt ggml-hip. (NOT yet committed.)
+
+**0.8B head-to-head (8 chunks, c512):** bf16 18.37/1485MB | ml8 full-cov **19.40/558MB** |
+UD-Q4_K_XL **18.50/546MB**. UD wins both axes on this tiny model. Breakdown proved the gap
+is NOT the tier map (ssm_out 4-bit +0.14, embed 8-bit +0.02) — it's the bulk 4-bit attn+FFN
+(uniform 4.25 vs UD mixed Q4/Q5/Q6). The 4B "+0.08" precedent is FFN-only (75% unquantized) → useless.
+
+**DIRECTION (kmbandy):** dense small models ARE the target. Tier scheme is right; rotation
+spent. Lean into **heavy per-layer fine-tune + corpus (size/seq_len/contents)** — the only
+lever that ever beat one-shot PTQ. Use the cheap **0.8B test bed** before the $16/hr pod;
+then scale 0.8B→2B→4B locally.
+
+**NEXT ACTION:** run the method gauntlet on the 0.8B.
+- Plan + levers: `docs/superpowers/2026-05-31-ml8-method-gauntlet.md`
+- Harness: `scripts/calibration/method_gauntlet.py` (`--stage 1` … `--all`; results → `/home/kmbandy/models/gauntlet-0p8b/results.md`). Smoke-tested (`--list` OK).
+- Start: `PYTHONPATH=gguf-py python3 scripts/calibration/method_gauntlet.py --stage 1`
+- Scale prereqs (flag): 2B HF+UD MISSING; 4B HF MISSING (have bf16) + 4B UD MISSING.
+
+**Also done this session (uncommitted):** role_targets refactored to derive GGUF names from
+llama.cpp TensorNameMap (no hand table) + `assert_main_stack_covered` fail-loud guard +
+`preflight_coverage.py` + de-circularized `test_role_targets.py`; `ml8_to_gguf.py --mtp-fp8`
+casts the MTP draft-head block to scaled FP8 (convert-time). The mt_ml8_gemm "dispatch
+failed" blocker was a poisoned aiter cache, auto-healed by the f27502ae8 guard.
+
+---
 ## DONE + committed (9 commits, T1–T10 + build fix) — all tested/device-verified
 
 | commit | task | what |
@@ -44,21 +75,17 @@ Execution: subagent-driven-development, inline controller. Tracking tasks #133�
 | 2cc59047e | T13 | Routed ALL qwen35 attn/ssm/lm_head GEMMs by making `build_lora_mm` ml8-aware (they all funnel through it — call sites unchanged; LoRA + `w_s` output-scale preserved; AWQ is input-side, composes correctly). `ml8_registry ml8_reg` member on `llama_model`, plumbed via `llm_graph_params.ml8_reg`→ctor→`build_lora_mm` exactly like `loras` (set at `llama-context.cpp:2335`). qwen35 load registers sidecars (guarded on `GGML_TYPE_ML8_4`) for wqkv/wq/wk/wv/wo/wqkv_gate/ssm_out/eh_proj/output — NO new layer fields (registry holds the pointers). **Regression guard (Case D): empty-registry fallback byte-identical op/src/shape to `ggml_mul_mat` — PASSES.** Also caught: test-ml8-registry built `-DNDEBUG` so original `assert()`s were vacuous → converted to always-on `CHECK()` (proved it fires). |
 | — | T14 | **CODE COMPLETE BY CONSTRUCTION, no commit.** token_embd + α/β accept ML8_FP8 with zero new code: `create_tensor` reads GGUF type ungated; `build_inp_embd`→`ggml_get_rows` (T10 ML8_FP8 case); α/β→`build_lora_mm`→`ggml_mul_mat`→CUDA no-LUT FP8 (T11/T13). Synthetic-GGUF TEST folded into T15 (kmbandy approved 2026-05-31). |
 
-## ⚠️ BLOCKER — DEBUG IN PROGRESS (2026-05-31 morning, Phase 1 partial)
+## ✅ BLOCKER RESOLVED (2026-05-31, systematic-debugging Phase 1–4 complete)
 
-**Symptom (last night):** `mt_ml8_gemm dispatch failed` — `llama-cli -ngl 99` on the FFN-only 9B `/home/kmbandy/models/Qwen3.5-9B-ml8.gguf` loaded + built graph + passed bf16 attn, then aborted in the pre-existing FFN ml8 CUDA path (`ggml_cuda_op_ml8_mul_mat` → `mt_ml8_gemm`, **ml8.cu:989** `GGML_ASSERT(gemm_rc==hipSuccess)`). MAD-223 code, NOT T11–T14. bf16 9B runs clean.
+**Symptom (05-30 evening):** `mt_ml8_gemm dispatch failed` — `llama-cli -ngl 99` on the FFN-only 9B `/home/kmbandy/models/Qwen3.5-9B-ml8.gguf` aborted in the pre-existing FFN ml8 CUDA path (`ggml_cuda_op_ml8_mul_mat` → `mt_ml8_gemm`, **ml8.cu:989** `GGML_ASSERT(gemm_rc==hipSuccess)`). MAD-223 code, NOT T11–T14.
 
-**Phase-1 findings so far (do NOT re-derive):**
-- `mt_ml8_gemm` returns non-success from 3 places, each with an existing `fprintf` diagnostic: **compile fail** (mt_ml8_gemm.cpp:209 "kernel compile failed for shape"), **validation fail** (232/239/245: M%BLOCK / N%BLOCK / K%group_size), **launch fail** (349). → a clean repro with full stderr will say WHICH.
-- **Runtime JIT CAN compile**, hypothesis "python3 lacks Triton" RULED OUT: `python3` = `/usr/bin/python3` = Python **3.14.4**, `import triton` = **3.7.0 OK** there. `AITER_PYTHON` default `python3`; no `AITER_*`/`TRITON_*` env set.
-- aiter cache `~/.cache/llama.cpp/aiter/` = **139 entries**, mostly `_gemm_a8w8_blockscale_kernel__hip-gfx1201-32__W4S1__<hash>` (May 26 bulk + a few May 30 from last night's test-backend-ops). W4S1 = the WF=1 LUT path.
-- **Device naming on this build:** `--device cuda:0` is REJECTED. Use **`--device ROCm0`** (= R9700 gfx1201 32GB, the ml8 target) or `ROCm1` (= RX 6900 XT gfx1030 16GB). `--list-devices` to confirm.
-- **The abort did NOT reproduce this morning.** With `--device ROCm0 -p Hello -n 4 -no-cnv`, the 9B ml8 GGUF loaded and went **INTERACTIVE** (`> ` prompts) until my 300s timeout (exit 124). `-no-cnv` did NOT suppress interactive mode → I got neither a clean abort NOR a clean token. So the blocker may have been transient (e.g. last night's rebuild JIT-compiled the needed kernels into cache), or it's intermittent.
+**ROOT CAUSE (well-grounded):** a **poisoned aiter JIT-cache entry** — an empty / zero-byte artifact dir left by an earlier killed compile (timeout/OOM/Ctrl-C during the kernel-builder iterations). A binary whose cache-validation trusted dir *existence alone* loaded a non-functional kernel handle → `mt_ml8_gemm` dispatch returned non-success → the ml8.cu:989 assert aborted. Evidence: 4 empty cache dirs still present in `~/.cache/llama.cpp/aiter/` (1 `_gemm…_aot`, 3 `kernel_unified_attention`); the JIT-GEMM poisoned entry that caused the abort is **gone** because the current guard removed+recompiled it on encounter.
 
-**NEXT STEP (clean repro, deterministic, non-interactive):** use **`llama-perplexity`** instead of llama-cli — it runs a fixed forward pass through the FFN ml8 path and exits (no interactivity), so it either prints a PPL (blocker gone) or emits the real `fprintf` error. Command shape:
-`./build-hip/bin/llama-perplexity --no-mmap -m /home/kmbandy/models/Qwen3.5-9B-ml8.gguf -ngl 99 --device ROCm0 -f <small.txt> 2>&1 | tee /tmp/ml8_repro.log` (need a small wikitext/calibration .txt; --chunks 1-2 is enough). If it ABORTS → read the fprintf (compile/validation/launch). If it PPLs → blocker was transient, unblock T15.
+**FIX (already in tree, NOT new code):** `aiter_runtime_compiler.cpp:199-215` (`Registry::ensure_on_disk`), commit **f27502ae8 (2026-05-28)**. The guard trusts the cache only if both `kernel.hsaco` AND `meta.json` exist AND are non-zero-byte; otherwise it `fs::remove`s them and recompiles. Its own comment documents the exact bug: *"Prior versions … returned true on existence alone, which trapped the caller when a previous compile left zero-byte stubs."* The matching post-compile guard at :273-292 prevents re-poisoning. The 05-30 evening failure was a binary predating this guard being compiled in; the current build (libs 05-30 23:22) is robust.
 
-**T15 + T16 9B gate cannot produce a token until this is confirmed clear.** Use systematic-debugging — get the actual error/return path before any fix (no Microsoft-pattern workarounds).
+**VERIFICATION:** `llama-perplexity --no-mmap -m Qwen3.5-9B-ml8.gguf -ngl 99 --device ROCm0 -f wikitext-2-raw/wiki.test.raw -c 512 --chunks 2` → **PPL = 7.5353, exit 0**, both `mt_ml8_gemm` shapes JIT-compiled `rc=0`, no abort. Log: `/tmp/ml8_repro.log`. (Device naming: use `--device ROCm0`, NOT `cuda:0`.)
+
+**SCOPE NOTE — what this did and did NOT cover:** the 9B GGUF is **FFN-only ml8_4** (96 ML8_4 + 96 F8_E4M3 centroids + 96 I32 rotation_meta; attention/embed/output BF16; **zero ML8_FP8**). So this verified the **ml8_4 WF=1 LUT path** is healthy. The **T11 ML8_FP8 WF=0 (no-LUT α/β) path has no GGUF to exercise yet** — it is first produced by T16's full-coverage calibration. T15's ml8_4 equivalence can run now; the FP8-path leg waits on T16.
 
 ## REMAINING
 

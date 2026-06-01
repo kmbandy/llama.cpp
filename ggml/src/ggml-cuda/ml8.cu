@@ -868,11 +868,17 @@ void ggml_cuda_op_ml8_mul_mat(
 
     const int32_t K = (int32_t) w->ne[0];
     const int32_t N = (int32_t) w->ne[1];
-    const int32_t M = (int32_t) x->ne[1];
+    // M = total columns across ALL batch dims, not just ne[1]. qwen35's ssm_out
+    // feeds a 3D input [K, n_seq_tokens, n_seqs] (reshape_3d in the delta-net); with
+    // M=ne[1] only the first sequence is computed and the rest are garbage — the
+    // chunk-1-good / rest-explode signature. 2D inputs have ne[2]=ne[3]=1 so this is
+    // unchanged. Mirrors the ml8_apply_rotation fix (n_tokens = ne[1]*ne[2]*ne[3]).
+    const int32_t M = (int32_t) (x->ne[1] * x->ne[2] * x->ne[3]);
 
     GGML_ASSERT(x->ne[0]   == K);
     GGML_ASSERT(dst->ne[0] == N);
-    GGML_ASSERT(dst->ne[1] == M);
+    GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
     GGML_ASSERT(K % QK_ML8         == 0);
     GGML_ASSERT(N % MT_ML8_BLOCK_SIZE_N == 0);
 
@@ -1038,11 +1044,13 @@ void ggml_cuda_op_ml8_fp8_mul_mat(
 
     const int32_t K = (int32_t) w->ne[0];
     const int32_t N = (int32_t) w->ne[1];
-    const int32_t M = (int32_t) x->ne[1];
+    // M folds in all batch dims (see the ML8_4 mul_mat above) so a 3D activation
+    // [K, n_tokens, n_seqs] computes every sequence, not just the first.
+    const int32_t M = (int32_t) (x->ne[1] * x->ne[2] * x->ne[3]);
 
     GGML_ASSERT(x->ne[0]   == K);
     GGML_ASSERT(dst->ne[0] == N);
-    GGML_ASSERT(dst->ne[1] == M);
+    GGML_ASSERT((int64_t) dst->ne[1] * dst->ne[2] * dst->ne[3] == (int64_t) M);
     GGML_ASSERT(K % QK_ML8_FP8       == 0);
     GGML_ASSERT(N % MT_ML8_BLOCK_SIZE_N == 0);
 

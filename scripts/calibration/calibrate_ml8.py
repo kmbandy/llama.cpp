@@ -155,8 +155,9 @@ def compute_hessian(layer: nn.Linear, calibration_ids: list[torch.Tensor],
 
     h = layer.register_forward_hook(hook)
     try:
-        for ids in calibration_ids:
-            model(ids.to(dev))
+        with torch.no_grad():            # Hessian is forward-only statistics — never
+            for ids in calibration_ids:  # build/retain a backward graph. (Missing this
+                model(ids.to(dev))       # retained the full-model graph → ~11GB → OOM.)
     finally:
         h.remove()
 

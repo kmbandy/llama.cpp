@@ -155,6 +155,14 @@ def batched_gptq_quantize(
     min_tokens_per_expert: int = 0,
     n_tokens_per_expert: torch.Tensor | None = None,
     chunk_E: int = 8,
+    act_order: bool = False,
+    heavy_rounds: int = 0,
+    heavy_steps: int = 60,
+    heavy_lr_cent: float = 1e-2,
+    heavy_lr_scale: float = 1e-3,
+    heavy_dtype: str = "fp32",     # "fp32" (default) or "bf16": bf16 runs the heavy
+                                   # tune-loss matmul on bf16 WMMA (fp32 accumulate),
+                                   # ~2x faster. Params + Adam state stay fp32.
 ) -> dict:
     """Quantize E experts simultaneously via GPTQ-with-centroids.
 
@@ -320,6 +328,106 @@ def batched_gptq_quantize(
             torch.cuda.synchronize(dev)
             if yield_secs > 0.0:
                 time.sleep(yield_secs)
+
+    # ── act_order reassignment pass (MAD-256, validated in codebook_finetune_rig
+    # "round 0"): re-quantize column indices in Hessian-descending importance
+    # order using the FITTED centroids. Bit-free; +~1.0 dB gate/up, +0.4 down at
+    # L0 on 35B held-out eval. The straight 0→K sweep above fits the centroids
+    # (with error-prop); this pass redoes ONLY the assignment in importance order
+    # — the standard GPTQ act_order trick the ml8 recipe never had. Groups stay
+    # in ORIGINAL space (gidx_orig); only the sweep/error-prop order is permuted.
+    # ── act_order reassignment (+ optional heavy tune↔reassign loop). MAD-256,
+    # validated in codebook_finetune_rig. act_order alone: +~1.0 dB gate/up,
+    # +0.4 down (L0). heavy_rounds>0 alternates a gradient tune of centroids+
+    # scales (AQLM/PV-tuning) with the act_order reassign — adds ~+0.3 on down.
+    # All bit-free (indices stay 4-bit, true 4 bpv). Groups stay ORIGINAL space;
+    # only the sweep/error-prop ORDER is Hessian-importance-permuted.
+    if act_order or heavy_rounds > 0:
+        del Hinv_chol                                                  # free [E,K,K] — sweep done
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        importance = H_orig.diagonal(dim1=-2, dim2=-1).mean(0)          # [K] (shared H ⇒ same per e)
+        perm = torch.argsort(importance, descending=True)
+        gidx_orig = torch.arange(K, device=dev) // group_size
+        Hp = H_orig[:, perm][:, :, perm]                               # [E,K,K] permuted
+        Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
+        for cs in range(0, E, chunk_E):
+            ce = min(cs + chunk_E, E)
+            Hc = Hp[cs:ce] + damp[cs:ce] * eye_K.unsqueeze(0)
+            try:
+                Lc = torch.linalg.cholesky(Hc)
+                Hinv_p[cs:ce] = torch.linalg.cholesky(torch.cholesky_inverse(Lc), upper=True)
+            except RuntimeError:
+                Hc = Hp[cs:ce] + (2.0 * damp[cs:ce]) * eye_K.unsqueeze(0)
+                Lc = torch.linalg.cholesky(Hc)
+                Hinv_p[cs:ce] = torch.linalg.cholesky(torch.cholesky_inverse(Lc), upper=True)
+            del Lc, Hc
+        del Hp
+
+        @torch.no_grad()
+        def _reassign(cents, scls):
+            """act_order GPTQ assignment vs FIXED (cents, scls). Returns (idx int8, Q) [E,N,K]."""
+            Wp = W_stack.float()[:, :, perm].clone()
+            idx_p = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
+            Qp = torch.zeros_like(Wp)
+            for c in range(K):
+                g = int(gidx_orig[perm[c]])                            # ORIGINAL group of this column
+                sc = scls[:, :, g]; cg = cents[:, g, :]
+                di = (Wp[:, :, c].div(sc).unsqueeze(-1) - cg.unsqueeze(1)).abs().argmin(-1)
+                q = cg.gather(1, di) * sc
+                idx_p[:, :, c] = di.to(torch.int8)
+                Qp[:, :, c] = q
+                err = (Wp[:, :, c] - q) / Hinv_p[:, c, c].clamp_min(1e-30).unsqueeze(1)
+                if c + 1 < K:
+                    Wp[:, :, c + 1:].sub_(err.unsqueeze(2) * Hinv_p[:, c, c + 1:].unsqueeze(1))
+                if yield_every > 0 and is_cuda_dev and (c + 1) % yield_every == 0 and c + 1 < K:
+                    torch.cuda.synchronize(dev)
+                    if yield_secs > 0.0:
+                        time.sleep(yield_secs)
+            idx_full = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
+            Q_full = torch.zeros((E, N, K), dtype=torch.float32, device=dev)
+            idx_full.index_copy_(2, perm, idx_p)
+            Q_full.index_copy_(2, perm, Qp)
+            del Wp, Qp, idx_p
+            return idx_full, Q_full
+
+        if heavy_rounds > 0:
+            # Alternate: gradient-tune centroids+scales (frozen indices) ↔ act_order reassign.
+            orig_f = W_stack.float()                                    # ORIGINAL weights = tune target
+            gidx_f = torch.arange(K, device=dev) // group_size
+            cent = centroids_all.clone(); scl = scales_all.clone()
+            for _r in range(heavy_rounds):
+                with torch.enable_grad():
+                    cp = cent.detach().requires_grad_(True)
+                    sp = scl.detach().requires_grad_(True)
+                    opt = torch.optim.Adam([{"params": [cp], "lr": heavy_lr_cent},
+                                            {"params": [sp], "lr": heavy_lr_scale}])
+                    idx_long = indices.long()
+                    for _s in range(heavy_steps):
+                        cent_pc = cp[:, gidx_f, :]                      # [E,K,nc]
+                        Wq = cent_pc.unsqueeze(1).expand(E, N, K, -1).gather(
+                            3, idx_long.unsqueeze(-1)).squeeze(-1) * sp[:, :, gidx_f]
+                        d = orig_f - Wq
+                        if heavy_dtype == "bf16":
+                            # bf16 WMMA matmul (tensor cores accumulate in fp32),
+                            # then fp32 elementwise + reduction. Mathematically the
+                            # same quadratic form as the einsum; ~2x faster.
+                            tmp = torch.bmm(d.to(torch.bfloat16),
+                                            H_orig.to(torch.bfloat16)).float()
+                            loss = (tmp * d).sum()
+                        else:
+                            loss = torch.einsum("eij,ejk,eik->e", d, H_orig, d).sum()
+                        opt.zero_grad(); loss.backward(); opt.step()
+                cent = cp.detach(); scl = sp.detach()
+                cent_use = snap_to_e4m3(cent) if snap_centroids == "e4m3" else cent
+                indices, Q = _reassign(cent_use, scl)                  # frozen-index tune → reassign
+                if dev.type == "cuda":
+                    torch.cuda.empty_cache()
+            centroids_all = snap_to_e4m3(cent) if snap_centroids == "e4m3" else cent
+            scales_all = scl
+        else:
+            indices, Q = _reassign(centroids_all, scales_all)
+        del Hinv_p
 
     # ── Reconstruction metrics (per expert).
     orig = W_stack.float()

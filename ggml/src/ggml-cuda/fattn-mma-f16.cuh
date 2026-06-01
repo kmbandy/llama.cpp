@@ -244,24 +244,50 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 256, 1,  64, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  64, 160, 128, 128, 1, true);
 
+    // DeepSeek-V3 MLA head (DKQ=640, DV=512). The _ampere table has this case; the
+    // CDNA table was missing it, so on gfx942 the 640/512 instance fell through to
+    // the nbatch_combine=0 fallback → div-by-zero in a constexpr → the whole gfx942
+    // ggml-hip build failed. Mirror the 576/512 CDNA config (identical DV=512 V/
+    // combine side). Not MLA-perf-tuned for CDNA, but correct, and never dispatched
+    // for non-MLA models (e.g. Qwen, head-dim 128, which uses the 128/128 case).
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(640, 512,  8, 256, 1,  64, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(640, 512, 16, 256, 1,  64, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(640, 512, 32, 256, 1,  64, 160, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(640, 512, 64, 256, 1,  64, 160, 128, 128, 1, true);
+
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
-    if (ampere_mma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+    fattn_mma_config cfg = [&]() -> fattn_mma_config {
+        if (ampere_mma_available(cc)) {
+            return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+        }
+        if (turing_mma_available(cc)) {
+            return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
+        }
+        if (amd_mfma_available(cc)) {
+            return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
+        }
+        if (amd_wmma_available(cc)) {
+            return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        }
+        GGML_ASSERT(volta_mma_available(cc));
+        return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+    }();
+    // Each per-arch table returns the degenerate sentinel fattn_mma_config(32,
+    // 1, 0, 0, 0, 0, 0, false) for any (DKQ, DV, ncols) it doesn't list. That
+    // zero nbatch_combine feeds a div-by-zero downstream (exactly the gfx942
+    // 640/512 break). MMA is already committed by the time we get here, so an
+    // unlisted shape is a missing config-table entry, not a fall-through to
+    // some other kernel — fail loud with the shape instead of silently
+    // configuring a broken launch.
+    if (cfg.nbatch_combine == 0) {
+        GGML_ABORT("flash-attn MMA: no config for DKQ=%d DV=%d ncols=%d on cc=%d "
+                   "(missing entry in the per-arch fattn_mma config table)",
+                   DKQ, DV, ncols, cc);
     }
-    if (turing_mma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
-    }
-    if (amd_mfma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
-    }
-    if (amd_wmma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
-    }
-    GGML_ASSERT(volta_mma_available(cc));
-    return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
+    return cfg;
 }
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {

@@ -88,6 +88,12 @@ def reconstruct_inference_weight(blob: dict[str, Any]) -> torch.Tensor:
     return W
 
 
+# Public name used by the dense resume path: reconstruct the inference-equivalent
+# weight (dequant → inverse rotation → absorb AWQ) — exactly what the live dense
+# loop copies into layer.weight.data. Alias kept so call sites read intuitively.
+reconstruct_weight_from_blob = reconstruct_inference_weight
+
+
 def get_rotation(blob: dict[str, Any]):
     """Reconstruct the layer's input rotation, if any. Returns None for legacy blobs.
 

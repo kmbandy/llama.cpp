@@ -98,6 +98,30 @@ STAGES = {
         ("q4_heavy",  {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
                        "--faithful-acts": True, "--faithful-weights": True,
                        "--heavy-rounds": "4", "--act-order": True}),
+        # q5: the q3 winner recipe (faithful acts+weights, heavy OFF) on the diverse
+        # StackExchange-rich mix instead of wiki-only. Tests whether a representative
+        # calibration sample improves the bpv-neutral winner. Read on BOTH axes:
+        # wiki.test PPL (vs q3 19.139) AND the never-train held-out (--holdout-eval),
+        # since calibrating off-wiki makes wiki.test alone an unfair judge.
+        ("q5_actswt_mix", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "mix",
+                           "--faithful-acts": True, "--faithful-weights": True}),
+    ],
+    7: [  # CONTENT sweep, TOKEN-MATCHED to wiki's natural cap (~20966 tok = the 35 wikitext-2
+          # rows that clear the ≥512-tok bar at sl2048). q3 winner recipe (faithful acts+weights,
+          # heavy OFF). --token-budget equalizes Hessian sample SIZE so this isolates CONTENT from
+          # SIZE — the two levers q5 confounded. ct_wiki re-uses q3's exact 35 samples, so it MUST
+          # reproduce q3_actswt 19.139 (neutrality anchor). Read = best AVERAGE of wiki.test +
+          # never-train held-out (--holdout-eval); off-wiki calibration makes wiki.test alone unfair.
+        ("ct_wiki", {"--corpus": "wiki", "--token-budget": "20966", "--seq-len": "2048",
+                     "--faithful-acts": True, "--faithful-weights": True}),
+        ("ct_mix",  {"--corpus": "mix",  "--token-budget": "20966", "--seq-len": "2048",
+                     "--faithful-acts": True, "--faithful-weights": True}),
+        ("ct_code", {"--corpus": "code", "--token-budget": "20966", "--seq-len": "2048",
+                     "--faithful-acts": True, "--faithful-weights": True}),
+        ("ct_math", {"--corpus": "math", "--token-budget": "20966", "--seq-len": "2048",
+                     "--faithful-acts": True, "--faithful-weights": True}),
+        ("ct_chat", {"--corpus": "chat", "--token-budget": "20966", "--seq-len": "2048",
+                     "--faithful-acts": True, "--faithful-weights": True}),
     ],
 }
 

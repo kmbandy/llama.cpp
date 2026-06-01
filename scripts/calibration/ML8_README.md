@@ -92,6 +92,26 @@ Reconstruction: `W[r, c] = centroids_per_group[c // group_size][indices[r, c]] *
 Phase C will define the native `.ml8` binary format + GGUF-wrapped variant (per the
 decision to ship both formats — see saved KG decision 2026-05-22).
 
+## Checkpoint / resume
+
+`calibrate_ml8_paged.py` resumes a killed or crashed calibration from the per-linear
+`.pt` blobs on disk. Resume is **on by default**; pass `--no-resume` for a clean run.
+It works for both strategies, but the two are not symmetric:
+
+- **MoE** precomputes every Hessian upfront from the original model, then quantizes
+  experts independently — so resume simply skips per-expert blobs that already exist.
+- **Dense** is interleaved: each layer's Hessian is computed against the running,
+  partially **quantized** model (GPTQ cross-layer error propagation). So on resume the
+  dense path reloads the **contiguous completed prefix** of blobs back into the model
+  (dequant → inverse rotation → absorb AWQ, via `reconstruct_weight_from_blob`) before
+  continuing. Only a contiguous prefix is trusted: a blob that exists *after* a gap was
+  computed against a different upstream state and is stale, so the scan stops at the
+  first missing blob and resumes there. See `dense_completed_prefix` and
+  `load_dense_prefix_into_model`.
+
+Because each layer's quantization is deterministic, a resumed run reproduces the same
+blobs it would have produced uninterrupted.
+
 ## Acceptance gate (MAD-223)
 
 `Δ_PPL = quantized − baseline` measured on wikitext-2 test split.

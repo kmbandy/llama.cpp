@@ -215,29 +215,30 @@ def rotate_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
 def rotate_moe_input_side(W: torch.Tensor, gamma: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
     """MoE input-side rotation, batched along the expert axis.
 
-    W shape: [d_ffn, d_model, n_experts]. Applies rotate_input_side to each
-    expert in one batched matmul instead of a Python loop.
+    W shape: [n_experts, d_ffn, d_model] — the GGUF→torch layout for
+    ffn_gate_exps/ffn_up_exps (= reversed GGUF ne [d_model, d_ffn, n_exp]).
+    gamma: [d_model]. R_resid: [d_model, d_model].
+
+    The residual (d_model) is the trailing axis, so this is exactly
+    rotate_input_side applied to each expert's [d_ffn, d_model] slice, done as
+    one batched matmul: gamma broadcasts over the last axis and `@ R_resid.T`
+    batches over the leading expert dim. Output keeps the input layout.
     """
-    d_ffn, d_model, n_exp = W.shape
-    # Reshape so the d_model axis stays adjacent for the matmul.
-    # [d_ffn, d_model, n_exp] → permute → [d_ffn, n_exp, d_model] → flatten outer → [d_ffn*n_exp, d_model]
-    W_p     = W.permute(0, 2, 1).contiguous().view(d_ffn * n_exp, d_model)
-    W_rot   = (W_p * gamma.unsqueeze(0)) @ R_resid.T
-    # Reshape back to [d_ffn, n_exp, d_model] → permute → [d_ffn, d_model, n_exp]
-    return W_rot.view(d_ffn, n_exp, d_model).permute(0, 2, 1).contiguous()
+    return (W * gamma) @ R_resid.T
 
 
 def rotate_moe_output_side(W: torch.Tensor, R_resid: torch.Tensor) -> torch.Tensor:
     """MoE output-side rotation, batched along the expert axis.
 
-    W shape: [d_model, d_ffn, n_experts]. Applies rotate_output_side
-    (R @ W on the d_model axis) to each expert in one batched matmul.
+    W shape: [n_experts, d_model, d_ffn] — the GGUF→torch layout for
+    ffn_down_exps (= reversed GGUF ne [d_ffn, d_model, n_exp]).
+    R_resid: [d_model, d_model].
+
+    The residual (d_model) is axis 1, so this is rotate_output_side (R @ W on the
+    d_model axis) per expert. `R_resid @ W` broadcasts the 2D rotation across the
+    leading expert batch. Output keeps the input layout.
     """
-    d_model, d_ffn, n_exp = W.shape
-    # Flatten the trailing dims so the d_model axis is the matmul axis.
-    W_flat  = W.reshape(d_model, d_ffn * n_exp)
-    W_rot   = R_resid @ W_flat
-    return W_rot.view(d_model, d_ffn, n_exp).contiguous()
+    return R_resid @ W
 
 
 _NORM_ROLES = {Role.NORM_PRE_ATTN, Role.NORM_POST_ATTN, Role.NORM_OUT}
@@ -383,15 +384,36 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
     # Pass 1
     roster, gammas, d_model = index_pass(source_path, arch=arch)
     R_resid = build_R_resid(d_model=d_model, seed=seed, device=device)
+    # Tied-embedding detection. When `output.weight` is absent the model loader
+    # falls back to `token_embd.weight` as the LM head. That breaks γ_out
+    # absorption — there is no separate output linear to absorb into, and one
+    # tensor can't simultaneously serve as the rotated input embedding AND the
+    # γ-absorbed output projection (R does not commute with diag(γ_out)).
+    # Fix: emit a synthetic `output.weight = (E * γ_out) @ R.T` after the main
+    # streaming loop, which untiess the embedding for the output path.
+    is_tied = ("output.weight" not in roster) and ("token_embd.weight" in roster)
     import os as _os
     if _os.environ.get("QUAROT_DEBUG_IDENTITY") == "1":
         R_resid = torch.eye(d_model, dtype=torch.float32, device=device)
     _debug_no_absorb = _os.environ.get("QUAROT_DEBUG_NO_ABSORB") == "1"
     _debug_skip_norm_ones = _os.environ.get("QUAROT_DEBUG_KEEP_NORMS") == "1"
+    # Per-norm bisect: only absorb γ for norms whose tensor name ENDS with this suffix
+    # (e.g. "attn_norm.weight", "post_attention_norm.weight", "output_norm.weight").
+    # Other norms pass through unchanged; linears that would otherwise absorb from a
+    # non-matching norm use γ=1 (so their weights are unchanged when R=I).
+    _absorb_only = _os.environ.get("QUAROT_DEBUG_ABSORB_ONLY")
+    def _norm_in_scope(gname: str) -> bool:
+        if _absorb_only is None:
+            return True
+        return gname.endswith(_absorb_only)
 
     # Re-open source for streaming. Open writer.
+    # use_temp_file=True spills tensor bytes to a temp file (TMPDIR) instead of
+    # buffering the whole model in host RAM — required for large models (e.g. the
+    # 66 GB 35B-A3B) on RAM-limited hosts. NOTE: point TMPDIR at real disk, not a
+    # tmpfs /tmp, or the spill just OOMs RAM a different way.
     r = gguf.GGUFReader(source_path)
-    w = gguf.GGUFWriter(output_path, arch=arch)
+    w = gguf.GGUFWriter(output_path, arch=arch, use_temp_file=True)
 
     # Copy KV fields verbatim, skipping internal/auto fields.
     for f in r.fields.values():
@@ -447,7 +469,8 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             continue
 
         if kind == "norm_to_ones":
-            if _debug_skip_norm_ones:
+            # Either flag (or a no-match for ABSORB_ONLY) → write the original γ unchanged.
+            if _debug_skip_norm_ones or not _norm_in_scope(t.name):
                 arr_keep = np.ascontiguousarray(t.data).copy() if t.tensor_type.name != "BF16" else np.asarray(t.data, dtype=np.uint8).copy()
                 w.add_tensor(t.name, arr_keep, raw_dtype=t.tensor_type)
                 continue
@@ -466,12 +489,14 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
             # the same basis that input-side linears expect (residual at x @ R.T).
             W_new = W_fp32 @ R_resid.T
         elif kind == "input_2d":
-            gamma = gammas[gamma_name].to(device) if (gamma_name and not _debug_no_absorb) else torch.ones(d_model, device=device)
+            absorb = (gamma_name is not None) and (not _debug_no_absorb) and _norm_in_scope(gamma_name)
+            gamma = gammas[gamma_name].to(device) if absorb else torch.ones(d_model, device=device)
             W_new = rotate_input_side(W_fp32, gamma, R_resid)
         elif kind == "output_2d":
             W_new = rotate_output_side(W_fp32, R_resid)
         elif kind == "input_moe":
-            gamma = gammas[gamma_name].to(device) if (gamma_name and not _debug_no_absorb) else torch.ones(d_model, device=device)
+            absorb = (gamma_name is not None) and (not _debug_no_absorb) and _norm_in_scope(gamma_name)
+            gamma = gammas[gamma_name].to(device) if absorb else torch.ones(d_model, device=device)
             W_new = rotate_moe_input_side(W_fp32, gamma, R_resid)
         elif kind == "output_moe":
             W_new = rotate_moe_output_side(W_fp32, R_resid)
@@ -489,6 +514,27 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    # Tied-embedding fixup: emit synthetic output.weight if the source had
+    # tied embeddings AND we are zeroing output_norm in this run.
+    zero_out_norm = (not _debug_skip_norm_ones) and _norm_in_scope("output_norm.weight")
+    untied_output = False
+    if is_tied and zero_out_norm:
+        embed_src = next(t for t in r.tensors if t.name == "token_embd.weight")
+        E = _gguf_tensor_to_torch(embed_src).to(device)
+        if _debug_no_absorb:
+            gamma_out = torch.ones(d_model, dtype=torch.float32, device=device)
+        else:
+            gamma_out = gammas["output_norm.weight"].to(device)
+        output_synth = (E * gamma_out.unsqueeze(0)) @ R_resid.T
+        w.add_tensor("output.weight",
+                     _bytes_from_fp32(output_synth.cpu(), embed_src.tensor_type),
+                     raw_dtype=embed_src.tensor_type)
+        rotated.append("output.weight")
+        untied_output = True
+        del E, output_synth
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -500,6 +546,7 @@ def rotate_gguf(source_path: str, output_path: str, arch: str, seed: int,
         "arch": arch,
         "rotated_tensors": rotated,
         "absorbed_norms": absorbed,
+        "untied_output": untied_output,
     }
 
 
