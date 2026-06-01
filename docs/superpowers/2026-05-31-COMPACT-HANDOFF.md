@@ -34,11 +34,23 @@ Design + plan are DONE and the implementation is mostly built:
   19.2678, +0.003 vs banked no-fla 19.2347 — within the documented ±0.05 floor; fla active
   (1448s « 2122s no-fla path); legacy path byte-identical by inspection. Refactor-neutral.
   (Plan's ±0.01 gate was over-tight vs the project's own ±0.05 floor — corrected.)
-- **Task 10 RUNNING:** `q2_acts` (faithful-acts ON, weights/heavy OFF) — first end-to-end run
-  of the faithful path; first blob written = integration works. Δ vs q1_off=19.2378 = the
-  pure activation-e4m3 effect. Workdir `/home/kmbandy/models/gauntlet-0p8b-qat`.
-  ALL stage-6 cells share `--corpus-seed 0` (default) → paired Δ resolves « ±0.05 (the floor
-  is from VARYING seed; fixed here). Then q3_actswt, q4_heavy (--heavy-rounds 4 --act-order).
+- **Task 10 — q2 DONE, ★ THE RESULT ★:** `q2_acts` (faithful-acts ON, weights/heavy OFF) =
+  **19.1855** → **Δ −0.0523 vs q1_off 19.2378**. Activation-e4m3-faithful calibration ALONE,
+  bit-free. CLEAN signal (shared `--corpus-seed 0` → deterministic pairing; Δ ≈ pure effect,
+  not noise). kmbandy: braced for +0.02-0.03 sign, got −0.052 = "the show." KG c61814f4.
+  Honest: 0.8B dense = UD's strongest regime, still +0.686 over UD — MECHANISM validation,
+  not a beat-UD claim. q2 cost 3838s (~2.6× q1_off — faithful fwd overhead; budget for scale).
+- **NEXT (deferred to 2026-06-01 eve — getting late):** run `q3_actswt` (+fp8 weight tiers)
+  and `q4_heavy` (+heavy-FT on the faithful FP8 lattice — the lever the reframe unlocks).
+  Resume command (box idle, GPU free):
+  ```
+  PYTHONPATH=$PWD/scripts/calibration:$PWD/gguf-py /usr/bin/python3 \
+    scripts/calibration/method_gauntlet.py --stage 6 --cell q3_actswt,q4_heavy \
+    --workdir /home/kmbandy/models/gauntlet-0p8b-qat --cal-device cuda:0 --ppl-device ROCm0
+  ```
+  Success bar: q3 must not regress >+0.05 vs q1_off; q4 should clear a real gain. Then 3-seed
+  finalize on the winner (q4 has heavy-FT RNG → most worth averaging). Banked: q1_off 19.2378,
+  q2_acts 19.1855 in `/home/kmbandy/models/gauntlet-0p8b-qat/*/results.md`.
 - **pytest now in /usr/bin/python3** (KG ac0fb4e3) — use it for BOTH calibration AND tests;
   the mlambaformer venv is retired for this work. Custom torch (editable @ ~/GitHub/pytorch)
   verified untouched.
