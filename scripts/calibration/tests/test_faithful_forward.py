@@ -66,3 +66,15 @@ def test_hessian_accumulates_in_rotated_quant_space():
     aq = quantize_act_per_row(rot.forward(x))
     assert torch.allclose(hook.H, aq.t() @ aq, atol=1e-3)
     assert hook.n_tokens == T
+
+# append to tests/test_faithful_forward.py
+from faithful_forward import fp8_weight_override
+
+def test_fp8_weight_override_roundtrips_through_scaled_fp8():
+    import torch
+    from scaled_fp8 import quantize_scaled_fp8, dequantize_scaled_fp8
+    w = torch.randn(16, 64)
+    got = fp8_weight_override(w, group_size=32)
+    want = dequantize_scaled_fp8(quantize_scaled_fp8(w, group_size=32))
+    assert torch.allclose(got, want, atol=1e-6)
+    assert not torch.allclose(got, w)        # it actually changed the weights

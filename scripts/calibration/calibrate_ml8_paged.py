@@ -75,7 +75,7 @@ from calib_corpus import collect_calibration  # noqa: E402  (content sweep: name
 from fla_compat import apply_fla_arch_shim  # noqa: E402  (RDNA fla bf16 fdot2 fp32 workaround)
 from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (dense resume)
 from role_targets import classify_role, Tier, assert_main_stack_covered, configure as configure_roles  # noqa: E402  (--dense-coverage full tier routing)
-from faithful_forward import FaithfulActHook, assert_not_double_rotated  # noqa: E402  (W4A8 --faithful-acts)
+from faithful_forward import FaithfulActHook, assert_not_double_rotated, fp8_weight_override  # noqa: E402  (W4A8 faithful tiers)
 from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (FP8 tier, fixed group_size=32)
 
 # Pybind11 weight pager (in repo's python_bindings/wp/). The .so is compiled for
@@ -897,6 +897,10 @@ def main():
                    help="W4A8: collect Hessians on rotated, per-row e4m3-quantized "
                         "activations and propagate them (drops algebraic rotate_hessian). "
                         "Requires --rotation kronecker.")
+    p.add_argument("--faithful-weights", action="store_true",
+                   help="W4A8: simulate the fp8 weight tiers (token_embd, ssm alpha/beta) "
+                        "via scaled-FP8 quant->dequant overrides during the calib forward. "
+                        "No-op unless --dense-coverage full populates the FP8 tier.")
     p.add_argument("--rotation-seed", type=int, default=42)
     p.add_argument("--rotation-max-b", type=int, default=1024)
     p.add_argument("--snap-centroids", choices=("none", "e4m3"), default="none")
@@ -1151,6 +1155,19 @@ def main():
     print(f"[targets] {len(targets)} ML8 linears to quantize "
           f"(coverage={_coverage})"
           + (f" + {len(fp8_targets)} FP8 tensors" if fp8_targets else ""))
+
+    # ── W4A8 faithful weight tiers (--faithful-weights): quant->dequant the
+    # FP8-tier weights (token_embd, ssm alpha/beta) in place so the calibration
+    # forward propagates fp8 embed/α/β, matching deployment. No-op when the FP8
+    # tier is empty (e.g. --dense-coverage ffn). The later FP8 pass re-quantizes
+    # these for the blobs (e4m3->e4m3 is ~idempotent, sub-noise).
+    if args.faithful_weights:
+        n_fw = 0
+        for _fwn, _fwm in fp8_targets:
+            with torch.no_grad():
+                _fwm.weight.data.copy_(fp8_weight_override(_fwm.weight.data))
+            n_fw += 1
+        print(f"[faithful-weights] overrode {n_fw} fp8-tier tensors (embed, ssm a/b)")
 
     manifest = {"model": args.model, "gguf": args.gguf, "args": vars(args), "results": []}
     manifest_path = Path(args.output_dir) / "manifest.json"

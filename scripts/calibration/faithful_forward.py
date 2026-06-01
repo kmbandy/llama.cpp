@@ -60,3 +60,9 @@ def assert_not_double_rotated(faithful_acts: bool, rotate_hessian_called: bool):
         raise RuntimeError(
             "double-rotation: faithful-acts builds H in rotated space; "
             "rotate_hessian must be skipped.")
+
+def fp8_weight_override(w, group_size: int = 32):
+    """Quant->dequant a weight through the scaled-FP8 tier (Exec T2). Returns the
+    dequantized fp32 weight to install as a forward-time override."""
+    from scaled_fp8 import quantize_scaled_fp8, dequantize_scaled_fp8
+    return dequantize_scaled_fp8(quantize_scaled_fp8(w.float(), group_size=group_size)).to(w.dtype)
