@@ -52,3 +52,11 @@ class FaithfulActHook:
         x_eff = self.rotation.inverse(a_q)             # a_q @ Q^T  (= inverse since Q orthogonal)
         x_eff = x_eff.reshape(x.shape).to(orig_dtype)
         return (x_eff,) + tuple(args[1:])
+
+def assert_not_double_rotated(faithful_acts: bool, rotate_hessian_called: bool):
+    """Guard: with faithful-acts the rotation is already baked into H by the
+    forward; calling rotate_hessian again double-rotates."""
+    if faithful_acts and rotate_hessian_called:
+        raise RuntimeError(
+            "double-rotation: faithful-acts builds H in rotated space; "
+            "rotate_hessian must be skipped.")

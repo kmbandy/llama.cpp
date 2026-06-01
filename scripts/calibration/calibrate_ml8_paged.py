@@ -71,8 +71,11 @@ from kronecker_rotation import (  # noqa: E402
 )
 from awq import compute_awq_scale, apply_awq_to_weight, absorb_awq_in_reconstruction  # noqa: E402
 from batched_gptq import batched_gptq_quantize, batched_gptq_quantize_multigpu  # noqa: E402  (G.7.h.2/3)
+from calib_corpus import collect_calibration  # noqa: E402  (content sweep: named compositions)
+from fla_compat import apply_fla_arch_shim  # noqa: E402  (RDNA fla bf16 fdot2 fp32 workaround)
 from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (dense resume)
-from role_targets import classify_role, Tier  # noqa: E402  (--dense-coverage full tier routing)
+from role_targets import classify_role, Tier, assert_main_stack_covered, configure as configure_roles  # noqa: E402  (--dense-coverage full tier routing)
+from faithful_forward import FaithfulActHook, assert_not_double_rotated  # noqa: E402  (W4A8 --faithful-acts)
 from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (FP8 tier, fixed group_size=32)
 
 # Pybind11 weight pager (in repo's python_bindings/wp/). The .so is compiled for
@@ -131,15 +134,21 @@ def _qwen_mlp_name_map(model: nn.Module) -> dict[str, str]:
 # AFTER the FFN linears. Documented + fixed so resume blobs stay valid and the
 # converter can rely on a stable ordering. Per-layer roles are emitted layer by
 # layer (ascending layer index); within a layer the suffixes follow this list.
+# Per-layer ML8 suffixes — VERIFIED against Qwen3.5-9B/0.8B named_modules()
+# (2026-05-31). Full-attention blocks: self_attn.{q,k,v,o}_proj. Gated delta-net
+# blocks: linear_attn.{in_proj_qkv (fused qkv), in_proj_z (output gate), out_proj}.
+# (Earlier values "qkv_proj"/"gate_proj_attn" never matched a real checkpoint and
+# silently dropped the SSM input projections to bf16 — see assert_main_stack_covered.)
 _FULL_ML8_PER_LAYER_ORDER = (
     "q_proj", "k_proj", "v_proj", "o_proj",   # self-attention
-    "qkv_proj", "gate_proj_attn",             # fused attn variants (if present)
+    "in_proj_qkv", "in_proj_z",               # linear_attn fused qkv + output gate
     "out_proj",                               # linear_attn (SSM) output
 )
 # Model-global ML8 roles (no layer index), appended after all per-layer ML8.
 _FULL_ML8_GLOBAL_ORDER = ("lm_head", "eh_proj")
-# FP8-tier roles, appended last. Per-layer SSM gates first, then the embedding.
-_FULL_FP8_PER_LAYER_ORDER = ("alpha_proj", "beta_proj")
+# FP8-tier roles, appended last. Per-layer SSM gates (alpha=in_proj_a, beta=in_proj_b)
+# first, then the embedding.
+_FULL_FP8_PER_LAYER_ORDER = ("in_proj_a", "in_proj_b")
 
 
 def _dense_layer_idx(name: str):
@@ -786,13 +795,20 @@ def _get_module_by_name(model, name: str):
 
 def load_dense_prefix_into_model(prefix_count: int, target_names: "list[str]",
                                  model, output_dir, resident: bool,
-                                 dtype=None) -> "list[dict]":
+                                 dtype=None, device=None) -> "list[dict]":
     """Reload the first `prefix_count` completed dense linears' quantized weights
     back into the model (the dense-resume reload). For each, dequant the blob to its
     inference-equivalent weight and place it where the forward path reads it:
     resident → layer.weight.data; paged → layer.weight_override. This restores the
     exact upstream state later layers' Hessians depend on. Returns the per-linear
     metric dicts (for the manifest), in order. prefix_count=0 is a no-op.
+
+    `device` (paged path only): blobs load via torch.load(map_location="cpu"), so the
+    reconstructed weight is on CPU. The paged forward runs on the calibration device,
+    so the override MUST be moved there — otherwise the NEXT layer's Hessian forward
+    pushes device activations through a CPU weight_override and F.linear raises
+    "mat2 is on cpu, different from cuda:0". Pass the calib device (args.device).
+    The resident path already moves to layer.weight.device, so it ignores `device`.
     """
     results: "list[dict]" = []
     for name in target_names[:prefix_count]:
@@ -805,7 +821,11 @@ def load_dense_prefix_into_model(prefix_count: int, target_names: "list[str]",
                 layer.weight.data.copy_(
                     W.to(dtype=layer.weight.dtype, device=layer.weight.device))
         else:
-            layer.weight_override = W.to(dtype) if dtype is not None else W
+            # Move to the calib device: W is on CPU (blob loaded map_location="cpu"),
+            # but the paged forward runs on `device`. .to(dtype=None, ...) keeps dtype;
+            # .to(device=None) keeps device — so this is a no-op when both are None,
+            # preserving the prior signature's behavior for callers that omit them.
+            layer.weight_override = W.to(dtype=dtype, device=device)
         results.append({
             "name": name, "shape": list(blob["shape"]),
             "mse": float(blob.get("mse", 0.0)),
@@ -828,6 +848,12 @@ def main():
     p.add_argument("--output-dir", required=True)
     p.add_argument("--n-samples", type=int, default=32)
     p.add_argument("--seq-len", type=int, default=1024)
+    p.add_argument("--corpus", default="wiki",
+                   help="calibration corpus composition: 'wiki' (wikitext-2 control) or a "
+                        "named mix from calib_corpus.COMPOSITIONS (mix|code|math|chat). "
+                        "The content lever — defines the Hessian everything descends.")
+    p.add_argument("--corpus-seed", type=int, default=0,
+                   help="RNG seed for byte-offset sampling + shuffle of mixed corpora")
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--percdamp", type=float, default=0.01)
     p.add_argument("--act-order", action="store_true",
@@ -842,6 +868,13 @@ def main():
                    help="heavy tune-loop matmul precision. bf16 ~2x faster on WMMA "
                         "(fp32 accumulate; params/Adam stay fp32). Validate Y_SNR "
                         "matches fp32 within noise before trusting.")
+    p.add_argument("--heavy-lr-cent", type=float, default=1e-2,
+                   help="Adam LR for the continuous centroids in the heavy tune loop "
+                        "(was hardcoded 1e-2; exposed so it can be swept — LR is the "
+                        "dominant un-tuned knob of the heavy method).")
+    p.add_argument("--heavy-lr-scale", type=float, default=1e-3,
+                   help="Adam LR for the per-group scales in the heavy tune loop "
+                        "(was hardcoded 1e-3; exposed for sweeping).")
     p.add_argument("--n-centroids", type=int, default=16)
     p.add_argument("--n-iter", type=int, default=25)
     p.add_argument("--fit-loss", choices=("mse", "mag_weighted"), default="mse")
@@ -860,6 +893,10 @@ def main():
     p.add_argument("--eval-ppl", action="store_true")
     p.add_argument("--ppl-max-tokens", type=int, default=None)
     p.add_argument("--rotation", choices=("none", "kronecker"), default="none")
+    p.add_argument("--faithful-acts", action="store_true",
+                   help="W4A8: collect Hessians on rotated, per-row e4m3-quantized "
+                        "activations and propagate them (drops algebraic rotate_hessian). "
+                        "Requires --rotation kronecker.")
     p.add_argument("--rotation-seed", type=int, default=42)
     p.add_argument("--rotation-max-b", type=int, default=1024)
     p.add_argument("--snap-centroids", choices=("none", "e4m3"), default="none")
@@ -1078,10 +1115,18 @@ def main():
             if pager is not None: pager.shutdown()
             return
 
+    # ─── fla arch shim: on RDNA the gated-delta-rule Triton kernel can only run
+    # in fp32 (bf16 fdot2 doesn't lower → core dump); fp32 also matches the
+    # deployed f32 recurrence core. No-op on CDNA3/NVIDIA/CPU or if fla isn't
+    # installed. MUST run before the first forward. ───
+    apply_fla_arch_shim(model, args.device)
+
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
-    print(f"[calib] loading {args.n_samples} samples seq_len={args.seq_len}")
-    calib = collect_wikitext_calibration(tokenizer, n_samples=args.n_samples,
-                                          seq_len=args.seq_len)
+    print(f"[calib] loading {args.n_samples} samples seq_len={args.seq_len} "
+          f"corpus={args.corpus}")
+    calib = collect_calibration(tokenizer, n_samples=args.n_samples,
+                                 seq_len=args.seq_len, composition=args.corpus,
+                                 seed=args.corpus_seed)
     print(f"[calib] got {len(calib)} samples (tokens ≈ {sum(c.numel() for c in calib)})")
 
     # Tier-tagged enumeration. For the DENSE strategy with --dense-coverage full
@@ -1089,6 +1134,15 @@ def main():
     # linears (which always come first, in find_target_linears order). For
     # coverage=ffn (default) OR the MoE strategy, this is exactly today's FFN set.
     _coverage = args.dense_coverage if args.strategy == "dense" else "ffn"
+    # Build the authoritative HF->GGUF name map for tier classification (delegates
+    # name resolution to llama.cpp's TensorNameMap instead of a hand-written table).
+    configure_roles(arch_name, n_blocks)
+    if _coverage == "full":
+        # Source-of-truth guard: refuse to calibrate if any main-stack nn.Linear
+        # (attention / SSM / MLP) would be silently left NATIVE/bf16 because the
+        # checkpoint's module names aren't resolved by the arch's TensorNameMap.
+        n_cov = assert_main_stack_covered(model)
+        print(f"[role-guard] {n_cov} main-stack linears covered (ML8|FP8); none left NATIVE")
     full_targets = list(find_dense_full_targets(model, coverage=_coverage))
     ml8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.ML8]
     fp8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.FP8]
@@ -1244,6 +1298,8 @@ def main():
                     and cached.get("gguf") == args.gguf
                     and cached.get("n_samples") == args.n_samples
                     and cached.get("seq_len") == args.seq_len
+                    and cached.get("corpus", "wiki") == args.corpus
+                    and cached.get("corpus_seed", 0) == args.corpus_seed
                     and cached.get("max_layers") == args.max_layers
                     and cached.get("strategy") == args.strategy
                     and set(cached.get("H_gate_up_per_layer", {}).keys()) == set(layer_ids)
@@ -1313,6 +1369,7 @@ def main():
             cache_blob = {
                 "model": args.model, "gguf": args.gguf,
                 "n_samples": args.n_samples, "seq_len": args.seq_len,
+                "corpus": args.corpus, "corpus_seed": args.corpus_seed,
                 "max_layers": args.max_layers, "strategy": args.strategy,
                 "H_gate_up_per_layer": {L: H.cpu() for L, H in H_gate_up_per_layer.items()},
                 "H_down_per_layer": {L: H.cpu() for L, H in H_down_per_layer.items()},
@@ -1447,7 +1504,9 @@ def main():
                         percdamp=args.percdamp,
                         act_order=args.act_order or args.heavy_rounds > 0,
                         heavy_rounds=args.heavy_rounds,
-                        heavy_steps=args.heavy_steps, heavy_dtype=args.heavy_dtype)
+                        heavy_steps=args.heavy_steps, heavy_dtype=args.heavy_dtype,
+                        heavy_lr_cent=args.heavy_lr_cent,
+                        heavy_lr_scale=args.heavy_lr_scale)
 
                     # Move full stack to CPU once, but DO NOT save slices directly —
                     # `indices[j]` is a strided view into the [E, N, K] storage and
@@ -1567,12 +1626,30 @@ def main():
             # stale/short manifest.json can't desync from what's actually on disk.
             manifest["results"] = load_dense_prefix_into_model(
                 resume_start, [n for n, _ in targets], model, args.output_dir,
-                resident=args.resident, dtype=dtype)
+                resident=args.resident, dtype=dtype, device=args.device)
             nxt = targets[resume_start][0] if resume_start < len(targets) else "(all done)"
             print(f"[resume] dense: restored {resume_start}/{len(targets)} completed "
                   f"linears from blobs, resuming at {nxt}")
             if args.device.startswith("cuda"):
                 torch.cuda.empty_cache()
+
+    # ── W4A8 deployment-faithful activation path (--faithful-acts) ──
+    # Install a persistent pre-hook on every target so activations propagate as
+    # x_eff = e4m3(x@Q)@Qᵀ; the per-layer Hessian is read from the hook (already
+    # in rotated+quant space) instead of rotate_hessian(compute_hessian(...)).
+    faithful_hooks = {}
+    if args.faithful_acts:
+        if args.rotation != "kronecker":
+            raise ValueError("--faithful-acts requires --rotation kronecker")
+        for j, (fname, flayer) in enumerate(targets):
+            _frows, fin = flayer.weight.shape
+            fa, fb = factor_for_dim(fin, max_b=args.rotation_max_b)
+            frot = KroneckerRotation(
+                h_a=random_orthogonal(fa, seed=args.rotation_seed + j), b_dim=fb)
+            hk = FaithfulActHook(frot, enabled=True)
+            flayer.register_forward_pre_hook(hk)
+            faithful_hooks[j] = (hk, frot)
+        print(f"[faithful-acts] installed {len(faithful_hooks)} activation-e4m3 pre-hooks")
 
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
     for i, (name, layer) in enumerate(targets):
@@ -1585,8 +1662,20 @@ def main():
         W_orig_snapshot = layer.weight.detach().clone()
 
         collect_awq = args.awq != "none"
-        H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
-                                            collect_awq=collect_awq)
+        if args.faithful_acts:
+            # compute_hessian still drives the forward over calib (with the
+            # persistent FaithfulActHooks active); the target hook accumulates H
+            # in rotated+quant space. compute_hessian's own returned H (built on
+            # x_eff) is discarded — we use the hook's H instead.
+            hk_i, _frot_i = faithful_hooks[i]
+            hk_i.reset_hessian(); hk_i.set_hessian_target(True)
+            _H_discard, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
+                                                         collect_awq=collect_awq)
+            hk_i.set_hessian_target(False)
+            H = hk_i.H
+        else:
+            H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
+                                                collect_awq=collect_awq)
         t_hess = time.time() - t0
         print(f"  hessian: {H.shape}  n_tok={n_tok}  t={t_hess:.1f}s")
 
@@ -1611,13 +1700,19 @@ def main():
         rotation = None
         rotation_blob = None
         if args.rotation == "kronecker":
-            a, b = factor_for_dim(in_feat, max_b=args.rotation_max_b)
-            h_a = random_orthogonal(a, seed=args.rotation_seed + i)
-            rotation = KroneckerRotation(h_a=h_a, b_dim=b)
+            if args.faithful_acts:
+                # SAME Q the activation hook used (rotation already baked into H).
+                rotation = faithful_hooks[i][1]
+            else:
+                a, b = factor_for_dim(in_feat, max_b=args.rotation_max_b)
+                h_a = random_orthogonal(a, seed=args.rotation_seed + i)
+                rotation = KroneckerRotation(h_a=h_a, b_dim=b)
             rotation_blob = rotation.to_dict()
             rotation_blob["seed"] = args.rotation_seed + i
-            print(f"  rotation: kronecker a={a} b={b}")
-            H = rotate_hessian(H, rotation)
+            print(f"  rotation: kronecker (faithful={args.faithful_acts})")
+            if not args.faithful_acts:
+                H = rotate_hessian(H, rotation)
+            assert_not_double_rotated(args.faithful_acts, rotate_hessian_called=False)
             layer.weight_override = rotation.forward(
                 layer.weight_override.float().to(H.device)).to(dtype)
 
@@ -1647,7 +1742,9 @@ def main():
                 percdamp=effective_percdamp,
                 act_order=args.act_order or args.heavy_rounds > 0,
                 heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
-                heavy_dtype=args.heavy_dtype)
+                heavy_dtype=args.heavy_dtype,
+                heavy_lr_cent=args.heavy_lr_cent,
+                heavy_lr_scale=args.heavy_lr_scale)
             layer.weight_override = out["Q"][0].to(dtype)   # dequantized rotated/AWQ'd weight
             export = {
                 "indices":             out["indices"][0].clone().contiguous(),
