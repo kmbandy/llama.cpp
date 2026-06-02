@@ -123,6 +123,29 @@ STAGES = {
         ("ct_chat", {"--corpus": "chat", "--token-budget": "20966", "--seq-len": "2048",
                      "--faithful-acts": True, "--faithful-weights": True}),
     ],
+    8: [  # DETERMINISTIC re-measurement + best-of-N seed search. Calibration is now
+          # bit-reproducible (calibrate_ml8_paged determinism, default-on), so the run-to-run
+          # noise floor is ZERO — the faithful ladder deltas below are now trustworthy signal,
+          # and --rotation-seed is a real reproducible lever. Run with --holdout-eval: SELECT the
+          # best seed on the never-train held-out (quant_so), REPORT on wiki.test (independent).
+          # Clean faithful ladder (same recipe as the historical q1/q2/q3, now deterministic):
+        ("d_q1_off",  {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki"}),
+        ("d_q2_acts", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                       "--faithful-acts": True}),
+        ("d_q3_s42",  {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                       "--faithful-acts": True, "--faithful-weights": True}),  # rotation-seed 42 (default)
+          # best-of-N: the q3 recipe, varying ONLY the rotation seed → the calibration search surface.
+        ("d_q3_s0", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                     "--faithful-acts": True, "--faithful-weights": True, "--rotation-seed": "0"}),
+        ("d_q3_s1", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                     "--faithful-acts": True, "--faithful-weights": True, "--rotation-seed": "1"}),
+        ("d_q3_s2", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                     "--faithful-acts": True, "--faithful-weights": True, "--rotation-seed": "2"}),
+        ("d_q3_s3", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                     "--faithful-acts": True, "--faithful-weights": True, "--rotation-seed": "3"}),
+        ("d_q3_s4", {"--n-samples": "128", "--seq-len": "2048", "--corpus": "wiki",
+                     "--faithful-acts": True, "--faithful-weights": True, "--rotation-seed": "4"}),
+    ],
 }
 
 
