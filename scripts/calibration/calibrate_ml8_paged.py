@@ -50,13 +50,16 @@ from pathlib import Path
 
 print = functools.partial(print, flush=True)
 
-# ── Deterministic calibration — env half (default-on; MUST precede `import torch`) ───
-# ml8 GPTQ calibration was nondeterministic: the GPU Hessian forward used unforced reduction
-# order and GPTQ's sequential error-feedback amplified the low-bit noise into DIFFERENT weight
-# assignments run-to-run (~0.6 PPL spread — swamps the ±0.05 levers). The fix is pinning the GEMM
-# workspace (here) + enabling deterministic algorithms (after the torch import). Verified
-# bit-identical across back-to-back runs on gfx1201. Opt out with ML8_NONDETERMINISTIC=1.
-_DETERMINISTIC = os.environ.get("ML8_NONDETERMINISTIC") != "1"
+# ── Deterministic calibration — env half (OPT-IN via ML8_DETERMINISTIC=1; MUST precede `import torch`) ───
+# ml8 GPTQ calibration was nondeterministic: the GPU Hessian forward used unforced reduction order
+# and GPTQ's sequential error-feedback amplified the low-bit noise into DIFFERENT weight assignments
+# run-to-run (~0.6 PPL spread — swamps the ±0.05 levers). These flags pin it bit-identically on the
+# linear-attn/MLP path (verified). BUT torch.use_deterministic_algorithms(True) currently breaks
+# full-model calibration: from the FIRST full-self-attention layer onward, the SDPA forward under
+# the hammer yields a degenerate (NaN-suspected) Hessian → GPTQ Cholesky fails → tensors silently
+# skipped → partial-coverage model. Root-cause + fix is deferred (see KG / handoff), so determinism
+# is OPT-IN until then; the default path is the known-good nondeterministic calibrator.
+_DETERMINISTIC = os.environ.get("ML8_DETERMINISTIC") == "1"
 if _DETERMINISTIC:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # required for deterministic cuBLAS/hipBLAS GEMM
     os.environ.setdefault("HIPBLASLT_DETERMINISTIC", "1")
@@ -82,8 +85,8 @@ if _DETERMINISTIC:
                         ("allow_bf16_reduced_precision_reduction", False)):
         try: setattr(torch.backends.cuda.matmul, _attr, _val)
         except AttributeError: pass
-    print("[determinism] use_deterministic_algorithms(True) + seeded + pinned GEMM "
-          "(set ML8_NONDETERMINISTIC=1 to disable)")
+    print("[determinism] OPT-IN ENABLED: use_deterministic_algorithms(True) + seeded + pinned GEMM "
+          "— WARNING: breaks full-model coverage at the first self-attn layer (Cholesky/SDPA bug, WIP)")
 
 # Re-use existing calibration helpers (compute_hessian / gptq_quantize_linear / eval_ppl_wikitext / etc.)
 sys.path.insert(0, str(Path(__file__).parent))
