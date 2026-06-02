@@ -139,6 +139,69 @@ def _batched_lloyd_max_signed(
     return torch.sort(centroids_E, dim=1).values
 
 
+def _cholesky_inv_upper(
+    H: torch.Tensor,
+    damp: torch.Tensor | float,
+    eye: torch.Tensor,
+    *,
+    max_escalations: int = 8,
+    escalation: float = 10.0,
+):
+    """Robust upper-Cholesky factor of (H + damp·I)⁻¹ for GPTQ error propagation.
+
+    Returns ``(Hinv_chol, n_escalations)`` where ``Hinv_chol`` is upper-triangular
+    with ``Hinv_chol.T @ Hinv_chol == (H + damp_eff·I)⁻¹``. ``H``/``eye`` may carry a
+    leading batch dim (chunk over experts); ``damp`` broadcasts against it.
+
+    Why this exists (MAD-256, faithful-acts path): the e4m3-activation Hessians
+    XᵀX are severely ill-conditioned. The shipped path
+
+        L = cholesky(H+damp); H_inv = cholesky_inverse(L); cholesky(H_inv, upper=True)
+
+    has its FIRST factorization succeed (H+damp is PD) but the SECOND one fail —
+    cholesky_inverse returns an H_inv that is only approximately symmetric /
+    marginally indefinite in fp32 ("leading minor of order N"). In the paged
+    driver that RuntimeError bubbles up and the entire tensor is bf16-backfilled
+    (calibrate_ml8_paged.py), wrecking both size and coverage.
+
+    The schedule is chosen so currently-succeeding tensors are BYTE-IDENTICAL to
+    the shipped path (the q1 anchor must not move):
+
+      • attempt 0  — exact shipped path, no symmetrization. Succeeds for every
+                     well-conditioned tensor ⇒ bit-for-bit unchanged.
+      • attempt 1  — same damping + symmetrize H_inv. The free fix when the only
+                     problem was fp32 asymmetry from cholesky_inverse.
+      • attempt ≥2 — symmetrize + geometrically escalate the Tikhonov damping
+                     until (H+damp·I)⁻¹ is numerically PD. Stronger regularization
+                     biases error-prop toward the diagonal slightly, but a finite
+                     4-bit factor beats throwing the tensor away to bf16.
+    """
+    diag_mean = H.diagonal(dim1=-2, dim2=-1).mean()
+    base = float(damp) if not torch.is_tensor(damp) else damp
+    last_err: Exception | None = None
+    for k in range(max_escalations + 1):
+        if k == 0:
+            damp_k, symmetrize = damp, False
+        elif k == 1:
+            damp_k, symmetrize = damp, True
+        else:
+            # escalate from the base damp (floor it if base was zero)
+            floor = base if (float(base.max()) if torch.is_tensor(base) else base) > 0 else (1e-8 * diag_mean)
+            damp_k, symmetrize = floor * (escalation ** (k - 1)), True
+        try:
+            Hd = H + damp_k * eye
+            L = torch.linalg.cholesky(Hd)
+            H_inv = torch.cholesky_inverse(L)
+            if symmetrize:
+                H_inv = 0.5 * (H_inv + H_inv.transpose(-2, -1))
+            return torch.linalg.cholesky(H_inv, upper=True), k
+        except (RuntimeError, torch._C._LinAlgError) as e:  # noqa: PERF203
+            last_err = e
+    raise RuntimeError(
+        f"cholesky_inv_upper: not PD after {max_escalations} damp escalations "
+        f"(base damp≈{float(base.max()) if torch.is_tensor(base) else base:.3e}): {last_err}")
+
+
 @torch.no_grad()
 def batched_gptq_quantize(
     W_stack: torch.Tensor,        # [E, N, K] fp32 (or bf16 — cast to fp32 inside)
@@ -228,28 +291,29 @@ def batched_gptq_quantize(
 
     H_orig = H_stack       # alias for SNR (undamped)
 
-    # Use the SAME numerical path as scalar `gptq_quantize_linear`:
-    #   L = cholesky(H), H_inv = cholesky_inverse(L), Hinv_chol = cholesky(H_inv, upper=True).
-    # Although Hinv_chol == L^-T algebraically, the two compute paths produce
-    # slightly different fp32 values via PyTorch's lapack/hipBLAS calls. To stay
-    # bit-equivalent with the scalar reference (so the verification harness
-    # passes), we follow the scalar path exactly. Chunked over E to bound the
-    # workspace that batched hipBLAS triangular-solve uses.
+    # Upper-Cholesky factor of (H+damp)^-1 for GPTQ error propagation, via the
+    # robust `_cholesky_inv_upper` helper (symmetrize + damp escalation). Attempt
+    # 0 reproduces the scalar `gptq_quantize_linear` path BIT-FOR-BIT, so any
+    # tensor that already succeeds is unchanged (the verification harness and the
+    # q1 anchor stay put); only ill-conditioned faithful-acts Hessians escalate —
+    # recovering full ml8 coverage instead of bf16-backfilling the tensor. Chunked
+    # over E to bound the hipBLAS triangular-solve workspace; same granularity as
+    # the prior per-chunk try/except, so no new cross-expert coupling.
     Hinv_chol = torch.empty((E, K, K), device=dev, dtype=torch.float32)
+    _max_chol_esc = 0
     for chunk_start in range(0, E, chunk_E):
         chunk_end = min(chunk_start + chunk_E, E)
-        H_chunk = H_stack[chunk_start:chunk_end] + damp[chunk_start:chunk_end] * eye_K.unsqueeze(0)
-        try:
-            L_chunk = torch.linalg.cholesky(H_chunk)
-            H_inv_chunk = torch.cholesky_inverse(L_chunk)
-            Hinv_chol[chunk_start:chunk_end] = torch.linalg.cholesky(H_inv_chunk, upper=True)
-        except RuntimeError:
-            # Cholesky failure → bump damping for this chunk and retry once.
-            H_chunk = H_stack[chunk_start:chunk_end] + (2.0 * damp[chunk_start:chunk_end]) * eye_K.unsqueeze(0)
-            L_chunk = torch.linalg.cholesky(H_chunk)
-            H_inv_chunk = torch.cholesky_inverse(L_chunk)
-            Hinv_chol[chunk_start:chunk_end] = torch.linalg.cholesky(H_inv_chunk, upper=True)
-        del L_chunk, H_inv_chunk, H_chunk
+        chol_chunk, n_esc = _cholesky_inv_upper(
+            H_stack[chunk_start:chunk_end],
+            damp[chunk_start:chunk_end],
+            eye_K.unsqueeze(0),
+        )
+        Hinv_chol[chunk_start:chunk_end] = chol_chunk
+        _max_chol_esc = max(_max_chol_esc, n_esc)
+        del chol_chunk
+    if _max_chol_esc >= 1:
+        print(f"[gptq] ill-conditioned Hessian recovered via {_max_chol_esc} damp "
+              f"escalation(s) — full ml8 coverage held (no bf16 backfill)")
 
     Q = torch.zeros_like(W)                                            # [E, N, K]
     indices = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
@@ -353,15 +417,10 @@ def batched_gptq_quantize(
         Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
         for cs in range(0, E, chunk_E):
             ce = min(cs + chunk_E, E)
-            Hc = Hp[cs:ce] + damp[cs:ce] * eye_K.unsqueeze(0)
-            try:
-                Lc = torch.linalg.cholesky(Hc)
-                Hinv_p[cs:ce] = torch.linalg.cholesky(torch.cholesky_inverse(Lc), upper=True)
-            except RuntimeError:
-                Hc = Hp[cs:ce] + (2.0 * damp[cs:ce]) * eye_K.unsqueeze(0)
-                Lc = torch.linalg.cholesky(Hc)
-                Hinv_p[cs:ce] = torch.linalg.cholesky(torch.cholesky_inverse(Lc), upper=True)
-            del Lc, Hc
+            chol_chunk, _ = _cholesky_inv_upper(
+                Hp[cs:ce], damp[cs:ce], eye_K.unsqueeze(0))
+            Hinv_p[cs:ce] = chol_chunk
+            del chol_chunk
         del Hp
 
         @torch.no_grad()

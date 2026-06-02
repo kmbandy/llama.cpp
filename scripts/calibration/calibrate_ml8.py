@@ -60,6 +60,7 @@ from kronecker_rotation import (  # noqa: E402
     KroneckerRotation, random_orthogonal, factor_for_dim, rotate_hessian,
 )
 from awq import compute_awq_scale, apply_awq_to_weight  # noqa: E402
+from batched_gptq import _cholesky_inv_upper  # noqa: E402
 
 
 # ───────────────────────────── Calibration data ─────────────────────────────
@@ -187,17 +188,19 @@ def gptq_quantize_linear(layer: nn.Linear, H: torch.Tensor,
     # numerical stability; it's not part of the actual reconstruction loss).
     H_orig = H.clone()
 
-    # Damping — needed for numerical stability in Cholesky
+    # Damping — needed for numerical stability in Cholesky.
     damp = percdamp * torch.mean(torch.diag(H))
-    diag_idx = torch.arange(in_features, device=dev)
-    H[diag_idx, diag_idx] += damp
 
-    # Cholesky of H^-1 (upper triangular). This is the standard GPTQ
-    # decomposition for triangular error propagation.
+    # Upper-Cholesky factor of (H+damp)^-1 for triangular GPTQ error propagation.
+    # `_cholesky_inv_upper` reproduces the classic
+    #   L = cholesky(H+damp); H_inv = cholesky_inverse(L); cholesky(H_inv, upper=True)
+    # bit-for-bit on well-conditioned H (attempt 0), and on an ill-conditioned
+    # faithful-acts Hessian it symmetrizes + escalates the damping until PD rather
+    # than raising (which upstream would turn into a bf16 backfill). The batched
+    # path uses the same helper, so scalar and batched stay consistent.
+    eye = torch.eye(in_features, device=dev, dtype=H.dtype)
     try:
-        L_lower = torch.linalg.cholesky(H)
-        H_inv = torch.cholesky_inverse(L_lower)
-        Hinv_chol = torch.linalg.cholesky(H_inv, upper=True)  # upper triangular
+        Hinv_chol, _ = _cholesky_inv_upper(H, damp, eye)  # upper triangular
     except RuntimeError as e:
         raise RuntimeError(f"Cholesky failed (try higher percdamp): {e}") from e
 
