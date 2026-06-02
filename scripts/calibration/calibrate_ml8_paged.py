@@ -53,12 +53,13 @@ print = functools.partial(print, flush=True)
 # ── Deterministic calibration — env half (OPT-IN via ML8_DETERMINISTIC=1; MUST precede `import torch`) ───
 # ml8 GPTQ calibration was nondeterministic: the GPU Hessian forward used unforced reduction order
 # and GPTQ's sequential error-feedback amplified the low-bit noise into DIFFERENT weight assignments
-# run-to-run (~0.6 PPL spread — swamps the ±0.05 levers). These flags pin it bit-identically on the
-# linear-attn/MLP path (verified). BUT torch.use_deterministic_algorithms(True) currently breaks
-# full-model calibration: from the FIRST full-self-attention layer onward, the SDPA forward under
-# the hammer yields a degenerate (NaN-suspected) Hessian → GPTQ Cholesky fails → tensors silently
-# skipped → partial-coverage model. Root-cause + fix is deferred (see KG / handoff), so determinism
-# is OPT-IN until then; the default path is the known-good nondeterministic calibrator.
+# run-to-run (~0.6 PPL spread — swamps the ±0.05 levers). These flags pin it bit-identically.
+# VERIFIED 2026-06-02: full-model deterministic calibration is bit-reproducible (187/188 tensors
+# byte-identical across two independent runs; the rest are FP8). The earlier "breaks at the first
+# self-attn layer" failure was NOT a determinism bug — use_deterministic_algorithms(True) enables
+# fill_uninitialized_memory, which surfaced a latent bug: the rotary inv_freq buffer (no GGUF
+# counterpart) was left uninitialized by meta+to_empty → NaN-filled → garbage RoPE. Fixed by
+# reinit_rotary_buffers() (runs every calibration; also repairs the silent non-deterministic case).
 _DETERMINISTIC = os.environ.get("ML8_DETERMINISTIC") == "1"
 if _DETERMINISTIC:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # required for deterministic cuBLAS/hipBLAS GEMM
@@ -86,7 +87,7 @@ if _DETERMINISTIC:
         try: setattr(torch.backends.cuda.matmul, _attr, _val)
         except AttributeError: pass
     print("[determinism] OPT-IN ENABLED: use_deterministic_algorithms(True) + seeded + pinned GEMM "
-          "— WARNING: breaks full-model coverage at the first self-attn layer (Cholesky/SDPA bug, WIP)")
+          "— full-model calibration is bit-reproducible (rotary inv_freq reinit applied post-load)")
 
 # Re-use existing calibration helpers (compute_hessian / gptq_quantize_linear / eval_ppl_wikitext / etc.)
 sys.path.insert(0, str(Path(__file__).parent))
@@ -237,7 +238,19 @@ def find_dense_full_targets(model, coverage: str = "ffn"):
                     yield name, mod, Tier.ML8
 
     # Global ML8 roles (lm_head / eh_proj), if present as nn.Linear.
+    # Skip lm_head when the model TIES embeddings: a tied lm_head IS token_embd
+    # (already covered by the FP8 embedding tier), has no independent GGUF tensor
+    # (the converter correctly emits no output.weight), and meta+to_empty leaves
+    # its weight UNINITIALIZED — so quantizing it wastes time on silent garbage
+    # (NaN under determinism) and produces a blob the converter discards anyway.
+    _cfg = getattr(model, "config", None)
+    _tied = bool(getattr(getattr(_cfg, "text_config", _cfg), "tie_word_embeddings", False)
+                 or getattr(_cfg, "tie_word_embeddings", False))
     for role in _FULL_ML8_GLOBAL_ORDER:
+        if role == "lm_head" and _tied:
+            print("[targets] skipping lm_head ML8 target: tie_word_embeddings=True "
+                  "(served by the FP8-tier tied token_embd at inference)")
+            continue
         for name, mod in by_name.items():
             if name.rsplit(".", 1)[-1] != role:
                 continue
@@ -647,6 +660,46 @@ def load_resident_to_model(model: nn.Module, gguf_path: str,
         for ex in missing_examples:
             print(f"    {ex}")
     return n_loaded
+
+
+def reinit_rotary_buffers(model: nn.Module, device: str) -> int:
+    """Recompute every text rotary-embedding ``inv_freq`` buffer from config.
+
+    inv_freq is a NON-PERSISTENT buffer derived from rope_theta — it has no GGUF
+    counterpart, so the resident loader (which walks ``named_parameters``) never
+    fills it, and ``model.to_empty()`` leaves it UNINITIALIZED. The damage is
+    silent without determinism: uninitialized memory is finite garbage, and since
+    cos()/sin() clamp to [-1, 1] the forward never NaNs — it just applies WRONG
+    positional encoding to every full-attention layer (linear-attn layers don't
+    use RoPE). With ``use_deterministic_algorithms(True)`` that same uninitialized
+    memory is NaN-filled, so the first RoPE turns q/k into NaN and the whole
+    forward (and every downstream Hessian) blows up. Both are the SAME bug; the
+    fix is to rebuild inv_freq the way the module's __init__ does and keep it in
+    fp32 (HF never downcasts it; our blanket .to(dtype) did). Idempotent — safe to
+    run on every calibration. Returns the number of rotary modules repaired.
+    """
+    n = 0
+    for mod in model.modules():
+        cls = mod.__class__.__name__
+        if "RotaryEmbedding" not in cls or "Vision" in cls:
+            continue   # text rotary only; vision rotary has a different __init__
+        if not hasattr(mod, "inv_freq") or getattr(mod, "config", None) is None:
+            continue
+        try:
+            fresh = type(mod)(mod.config, device=torch.device(device))
+        except Exception as e:   # noqa: BLE001 — never let a probe-fix abort calibration
+            print(f"[rotary-fix] WARN: could not rebuild {cls} inv_freq: {e}")
+            continue
+        with torch.no_grad():
+            # assign (not copy_) so the buffer keeps fresh's fp32 dtype, not the
+            # bf16 the model-wide .to(dtype) left it as.
+            mod.inv_freq = fresh.inv_freq.to(device=torch.device(device))
+            if hasattr(mod, "original_inv_freq") and hasattr(fresh, "original_inv_freq"):
+                mod.original_inv_freq = fresh.original_inv_freq.to(device=torch.device(device))
+        if hasattr(fresh, "attention_scaling"):
+            mod.attention_scaling = fresh.attention_scaling
+        n += 1
+    return n
 
 
 def _detect_moe_n_experts(config) -> int | None:
@@ -1162,6 +1215,73 @@ def main():
     # deployed f32 recurrence core. No-op on CDNA3/NVIDIA/CPU or if fla isn't
     # installed. MUST run before the first forward. ───
     apply_fla_arch_shim(model, args.device)
+
+    # ─── Repair rotary inv_freq: meta-build + to_empty leaves this non-persistent,
+    # non-GGUF buffer uninitialized → silently-wrong RoPE (and a hard NaN under
+    # determinism). MUST run before the first forward, on every calibration. ───
+    _n_rotary = reinit_rotary_buffers(model, args.device)
+    print(f"[rotary-fix] reinitialized inv_freq on {_n_rotary} text rotary module(s)")
+
+    # ─── NaN probe (opt-in ML8_NAN_PROBE=1): hook every decoder layer + the submodules
+    # of the first full_attention layer; on the FIRST forward, print per-module
+    # in-nan/out-nan/out-inf/finite-absmax in completion order, then self-remove. Used to
+    # pinpoint the determinism-induced NaN in the first full-attn layer (deferred bug). ───
+    if os.environ.get("ML8_NAN_PROBE") == "1":
+        _dec = [m for _n, m in model.named_modules()
+                if m.__class__.__name__.endswith("DecoderLayer")]
+        _lt = list(getattr(getattr(model.config, "text_config", model.config),
+                           "layer_types", ["?"] * len(_dec)))
+        _first_full = next((i for i, t in enumerate(_lt) if "full" in str(t)), 3)
+        _pb = {"ev": [], "done": False, "h": []}
+
+        def _pstat(t):
+            if isinstance(t, (tuple, list)) and t and torch.is_tensor(t[0]):
+                t = t[0]
+            if not torch.is_tensor(t):
+                return (None, None, float("nan"))
+            tf = t.float()
+            fin = tf[torch.isfinite(tf)]
+            return (int(torch.isnan(tf).sum()), int(torch.isinf(tf).sum()),
+                    float(fin.abs().max()) if fin.numel() else float("nan"))
+
+        def _mk(label):
+            def _h(mod, inp, out):
+                if _pb["done"]:
+                    return
+                it = inp[0] if isinstance(inp, (tuple, list)) and inp else inp
+                inn = int(torch.isnan(it.float()).sum()) if torch.is_tensor(it) else -1
+                nan, inf, amax = _pstat(out)
+                _pb["ev"].append((label, inn, nan, inf, amax))
+            return _h
+
+        for i, m in enumerate(_dec):
+            _pb["h"].append(m.register_forward_hook(
+                _mk(f"LAYER[{i:02d}] ({_lt[i] if i < len(_lt) else '?'})")))
+            if i == _first_full:
+                for sn, sm in m.named_modules():
+                    if sn:
+                        _pb["h"].append(sm.register_forward_hook(
+                            _mk(f"  L{i}.{sn} <{sm.__class__.__name__}>")))
+
+        def _dump(mod, inp, out):
+            if _pb["done"]:
+                return
+            _pb["done"] = True
+            print("\n=== [NAN-PROBE] first forward, completion order ===")
+            fb = None
+            for label, inn, nan, inf, amax in _pb["ev"]:
+                bad = (nan and nan > 0) or (inf and inf > 0)
+                mark = "  <<< FIRST NaN/Inf" if bad and fb is None else ""
+                if bad and fb is None:
+                    fb = label
+                print(f"{label:<50} in_nan={inn} out_nan={nan} out_inf={inf} "
+                      f"absmax={amax:.4g}{mark}")
+            print(f"[NAN-PROBE] first NaN/Inf at: {fb}\n", flush=True)
+            for h in _pb["h"]:
+                h.remove()
+        _dec[-1].register_forward_hook(_dump)
+        print(f"[NAN-PROBE] installed: {len(_dec)} decoder layers + submodules of "
+              f"layer {_first_full} (first full_attention)")
 
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
     print(f"[calib] loading {'budget ' + str(args.token_budget) + ' tok' if args.token_budget else str(args.n_samples) + ' samples'} "
