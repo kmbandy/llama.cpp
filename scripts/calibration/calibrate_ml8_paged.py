@@ -50,10 +50,40 @@ from pathlib import Path
 
 print = functools.partial(print, flush=True)
 
+# ── Deterministic calibration — env half (default-on; MUST precede `import torch`) ───
+# ml8 GPTQ calibration was nondeterministic: the GPU Hessian forward used unforced reduction
+# order and GPTQ's sequential error-feedback amplified the low-bit noise into DIFFERENT weight
+# assignments run-to-run (~0.6 PPL spread — swamps the ±0.05 levers). The fix is pinning the GEMM
+# workspace (here) + enabling deterministic algorithms (after the torch import). Verified
+# bit-identical across back-to-back runs on gfx1201. Opt out with ML8_NONDETERMINISTIC=1.
+_DETERMINISTIC = os.environ.get("ML8_NONDETERMINISTIC") != "1"
+if _DETERMINISTIC:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # required for deterministic cuBLAS/hipBLAS GEMM
+    os.environ.setdefault("HIPBLASLT_DETERMINISTIC", "1")
+
 import numpy as np
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+# ── Deterministic calibration — torch half (see env half above) ───
+if _DETERMINISTIC:
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    for _attr in ("allow_tf32",):
+        try: setattr(torch.backends.cudnn, _attr, False)
+        except AttributeError: pass
+    for _attr, _val in (("allow_tf32", False),
+                        ("allow_fp16_reduced_precision_reduction", False),
+                        ("allow_bf16_reduced_precision_reduction", False)):
+        try: setattr(torch.backends.cuda.matmul, _attr, _val)
+        except AttributeError: pass
+    print("[determinism] use_deterministic_algorithms(True) + seeded + pinned GEMM "
+          "(set ML8_NONDETERMINISTIC=1 to disable)")
 
 # Re-use existing calibration helpers (compute_hessian / gptq_quantize_linear / eval_ppl_wikitext / etc.)
 sys.path.insert(0, str(Path(__file__).parent))
