@@ -11480,6 +11480,67 @@ void ggml_compute_forward_ml8_mul_mat(const ggml_compute_params * params, ggml_t
     free(w_row_fp32);
 }
 
+// ─── ggml_compute_forward_ml8_get_rows (MAD-256 ml8-4 native embed) ───────
+//
+// CPU dispatch for GGML_OP_ML8_GET_ROWS — native 4-bit token-embedding gather.
+// For each requested row id, dequantize that ml8-4 weight row directly into the
+// output via dequantize_row_ml8_4_with_lut (the per-K-group centroid LUT
+// sidecar). The table stays native 4-bit — no inline bf16 dequant of W. Same
+// addressing as ggml_compute_forward_get_rows_q, tiled across gathered rows.
+//
+// Tensor layouts (set by ggml_ml8_get_rows):
+//   dst->src[0] = w         (GGML_TYPE_ML8_4 ,  [K, N]  N = vocab rows)
+//   dst->src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8] shared LUT)
+//   dst->src[2] = ids       (GGML_TYPE_I32)
+//   dst         = y         (GGML_TYPE_F32   ,  [K, ids->ne0, ids->ne1, ids->ne2])
+void ggml_compute_forward_ml8_get_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * w   = dst->src[0];
+    const ggml_tensor * lut = dst->src[1];
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(w && lut && ids);
+    GGML_ASSERT(w->type   == GGML_TYPE_ML8_4);
+    GGML_ASSERT(lut->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    GGML_ASSERT(dst->ne[0] == K);
+    GGML_ASSERT(K % QK_ML8 == 0);
+    const int64_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(lut->ne[0] == 16 && lut->ne[1] == n_groups_k);
+
+    const uint8_t * lut_fp8 = (const uint8_t *) lut->data;
+
+    // gathered rows: flatten over all ids elements (mirrors get_rows_q)
+    const int64_t nr = ggml_nelements(ids);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+
+    const int64_t ne10 = ids->ne[0];
+    const int64_t ne11 = ids->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const int64_t i12 = i / (ne11 * ne10);
+        const int64_t i11 = (i - i12 * ne11 * ne10) / ne10;
+        const int64_t i10 = (i - i12 * ne11 * ne10 - i11 * ne10);
+        const int64_t row = *(const int32_t *) ((const char *) ids->data
+                              + i10 * ids->nb[0] + i11 * ids->nb[1] + i12 * ids->nb[2]);
+        GGML_ASSERT(row >= 0 && row < N);
+
+        const block_ml8_4 * w_row =
+            (const block_ml8_4 *) ((const char *) w->data + row * w->nb[1]);
+        float * y_row = (float *) ((char *) dst->data
+                          + i10 * dst->nb[1] + i11 * dst->nb[2] + i12 * dst->nb[3]);
+        dequantize_row_ml8_4_with_lut(w_row, lut_fp8, y_row, K);
+    }
+}
+
 // ─── ggml_compute_forward_ml8_apply_rotation (MAD-223 G.4.g) ──────────────
 //
 // Y[:, t] = unflatten(H_a^T @ flatten(X[:, t]) @ H_b, d=a*b)

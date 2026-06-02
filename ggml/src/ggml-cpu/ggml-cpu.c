@@ -2164,6 +2164,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ml8_mul_mat_id(params, tensor);
             }
             break;
+        case GGML_OP_ML8_GET_ROWS:
+            {
+                ggml_compute_forward_ml8_get_rows(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2507,6 +2512,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ML8_MUL_MAT:
         case GGML_OP_ML8_APPLY_ROTATION:
         case GGML_OP_ML8_MUL_MAT_ID:
+        case GGML_OP_ML8_GET_ROWS:
             {
                 n_tasks = n_threads;
             } break;

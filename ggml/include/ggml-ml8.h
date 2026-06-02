@@ -102,6 +102,27 @@ GGML_API struct ggml_tensor * ggml_ml8_mul_mat_id(
         struct ggml_tensor  * x,
         struct ggml_tensor  * ids);
 
+// Native ml8-4 row gather (token-embedding lookup). Gathers row `ids[i]` from the
+// ml8-4 weight `w` [K, N] and dequantizes it via the per-K-group centroid LUT to
+// K fp32 values — kept native 4-bit (no inline bf16 dequant of the table).
+//
+// Tensor shapes (ggml row-major):
+//   w         : [K, N]            GGML_TYPE_ML8_4   (N = vocab rows)
+//   centroids : [16, n_groups_k]  GGML_TYPE_F8_E4M3 per-K-group LUT
+//   ids       : [n_rows, ...]     GGML_TYPE_I32
+//
+// Output:
+//   y         : [K, n_rows, ...]  GGML_TYPE_F32     (matches ggml_get_rows layout)
+//
+// Constraints:
+//   - K % QK_ML8 == 0
+//   - centroids ne0 == 16, ne1 == K / QK_ML8
+GGML_API struct ggml_tensor * ggml_ml8_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * ids);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

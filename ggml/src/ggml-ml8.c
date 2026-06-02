@@ -327,3 +327,33 @@ struct ggml_tensor * ggml_ml8_mul_mat_id(
     y->src[3] = ids;
     return y;
 }
+
+struct ggml_tensor * ggml_ml8_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * centroids,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(w         != NULL);
+    GGML_ASSERT(centroids != NULL);
+    GGML_ASSERT(ids       != NULL);
+    GGML_ASSERT(w->type         == GGML_TYPE_ML8_4);
+    GGML_ASSERT(centroids->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(ids->type       == GGML_TYPE_I32);
+
+    // w [K, N] (N = vocab rows), gather row ids[i] → K fp32 (one embedding vector).
+    const int64_t K = w->ne[0];
+    GGML_ASSERT(K % QK_ML8 == 0 && "K must be a multiple of QK_ML8=64");
+
+    const int64_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(centroids->ne[0] == 16);
+    GGML_ASSERT(centroids->ne[1] == n_groups_k);
+
+    // Output mirrors ggml_get_rows: [K, ids->ne[0], ids->ne[1], ids->ne[2]].
+    const int64_t ne[4] = { K, ids->ne[0], ids->ne[1], ids->ne[2] };
+    struct ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    y->op     = GGML_OP_ML8_GET_ROWS;
+    y->src[0] = w;
+    y->src[1] = centroids;
+    y->src[2] = ids;
+    return y;
+}

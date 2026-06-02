@@ -1013,6 +1013,94 @@ void ggml_cuda_op_ml8_mul_mat(
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// GGML_OP_ML8_GET_ROWS — native 4-bit token-embedding gather.
+//
+// One CUDA block per gathered row; threads stride over the row's K-groups.
+// For each group: read the per-block fp32 scale + 32 packed nibbles from the
+// native block_ml8_4 layout, index the shared per-group centroid LUT (16 fp8
+// e4m3 each), dequant = centroid * scale, write K fp32. No AITER GEMM, no
+// repack — this is a pure gather so it works on any CUDA/HIP build. Mirrors
+// the CPU ggml_compute_forward_ml8_get_rows math exactly (same LUT, same
+// lo-nibble-first ordering, same e4m3→fp32 helper).
+// ─────────────────────────────────────────────────────────────────────
+static __global__ void ml8_get_rows_kernel(
+    const block_ml8_4 * __restrict__ w,    // [N rows][n_groups_k blocks] native layout
+    const uint8_t     * __restrict__ lut,  // [n_groups_k, 16] fp8 e4m3 (flat g*16+i)
+    const int32_t     * __restrict__ ids,  // [nr] contiguous
+    float             * __restrict__ y,    // [nr, K] row-major (K contiguous per row)
+    int K, int N, int n_groups_k, int64_t nr) {
+
+    const int64_t i = blockIdx.x;          // gathered-row index
+    if (i >= nr) return;
+
+    const int32_t row = ids[i];
+    // out-of-range ids would read garbage rows; clamp defensively to 0.
+    const int32_t row_safe = (row >= 0 && row < N) ? row : 0;
+
+    const block_ml8_4 * w_row = w + (int64_t) row_safe * n_groups_k;
+    float             * y_row = y + i * (int64_t) K;
+
+    for (int g = threadIdx.x; g < n_groups_k; g += blockDim.x) {
+        const block_ml8_4 * blk   = &w_row[g];
+        const float         scale = blk->scale;
+        const uint8_t     * lut_g = lut + (int64_t) g * 16;
+        const int           k_base = g * QK_ML8;
+        #pragma unroll
+        for (int p = 0; p < QK_ML8 / 2; p++) {
+            const uint8_t byte = blk->qs[p];
+            const uint8_t lo   = byte & 0x0F;
+            const uint8_t hi   = (byte >> 4) & 0x0F;
+            y_row[k_base + p * 2]     = ml8_fp8_e4m3_to_fp32(lut_g[lo]) * scale;
+            y_row[k_base + p * 2 + 1] = ml8_fp8_e4m3_to_fp32(lut_g[hi]) * scale;
+        }
+    }
+}
+
+void ggml_cuda_op_ml8_get_rows(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+    const ggml_tensor * w    = dst->src[0];
+    const ggml_tensor * cent = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    GGML_ASSERT(w != nullptr && cent != nullptr && ids != nullptr);
+    GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
+    GGML_ASSERT(cent->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(cent));
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t K = (int32_t) w->ne[0];
+    const int32_t N = (int32_t) w->ne[1];
+    GGML_ASSERT(K % QK_ML8 == 0);
+    const int32_t n_groups_k = K / QK_ML8;
+    GGML_ASSERT(cent->ne[0] == 16);
+    GGML_ASSERT(cent->ne[1] == n_groups_k);
+    GGML_ASSERT(dst->ne[0] == K);
+
+    const int64_t nr = ggml_nelements(ids);
+    GGML_ASSERT(ggml_nrows(dst) == nr);
+    if (nr == 0) {
+        return;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    const block_ml8_4 * w_d   = (const block_ml8_4 *) w->data;
+    const uint8_t     * lut_d = (const uint8_t     *) cent->data;
+    const int32_t     * ids_d = (const int32_t     *) ids->data;
+    float             * y_d   = (float             *) dst->data;
+
+    const int threads = (n_groups_k < 256) ? ((n_groups_k + 31) / 32) * 32 : 256;
+    const dim3 grid((unsigned) nr);
+    ml8_get_rows_kernel<<<grid, dim3(threads > 0 ? threads : 32), 0, stream>>>(
+        w_d, lut_d, ids_d, y_d, K, N, n_groups_k, nr);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // No-LUT FP8-WMMA mul_mat for scaled-fp8 weights (GGML_TYPE_ML8_FP8).
 //
 // ML8_FP8 weights are a single self-contained tensor: per-32-element fp16

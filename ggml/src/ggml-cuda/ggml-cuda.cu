@@ -3261,6 +3261,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ML8_MUL_MAT_ID:
             ggml_cuda_op_ml8_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_ML8_GET_ROWS:
+            ggml_cuda_op_ml8_get_rows(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -5580,6 +5583,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (w->ne[0] % 64 != 0)               return false;
                 if (w->ne[1] % 16 != 0)               return false;
                 if (w->ne[2] <= 0)                    return false;
+                return true;
+            } break;
+        case GGML_OP_ML8_GET_ROWS:
+            {
+                // MAD-256 ml8-4 native token-embedding gather. Pure dequant
+                // gather (no AITER GEMM) — ml8_4 weight, f8_e4m3 centroid LUT,
+                // i32 ids, fp32 output. K must be a multiple of QK_ML8=64.
+                const ggml_tensor * w    = op->src[0];
+                const ggml_tensor * cent = op->src[1];
+                const ggml_tensor * ids  = op->src[2];
+                if (!w || !cent || !ids) return false;
+                if (w->type    != GGML_TYPE_ML8_4)   return false;
+                if (cent->type != GGML_TYPE_F8_E4M3) return false;
+                if (ids->type  != GGML_TYPE_I32)     return false;
+                if (op->type   != GGML_TYPE_F32)     return false;
+                if (w->ne[0] % 64 != 0)              return false;
+                if (cent->ne[0] != 16)               return false;
+                if (cent->ne[1] != w->ne[0] / 64)    return false;
                 return true;
             } break;
         case GGML_OP_OUT_PROD:

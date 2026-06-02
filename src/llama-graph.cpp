@@ -1983,7 +1983,19 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        // MAD-256: a native 4-bit (ML8_4) token_embd cannot use the standard
+        // get_rows (its to_float aborts — it needs the per-K-group centroid
+        // LUT). Route through ggml_ml8_get_rows, which dequantizes natively via
+        // the registered centroid sidecar. Stays 4-bit; no inline bf16 dequant.
+        const ml8_sidecars * tok_sc =
+            (ml8_reg && tok_embd->type == GGML_TYPE_ML8_4) ? ml8_reg->find(tok_embd) : nullptr;
+        if (tok_embd->type == GGML_TYPE_ML8_4) {
+            GGML_ASSERT(tok_sc && tok_sc->centroids &&
+                        "ML8_4 token_embd requires registered centroids for ggml_ml8_get_rows");
+            cur = ggml_ml8_get_rows(ctx0, tok_embd, tok_sc->centroids, inp->tokens);
+        } else {
+            cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

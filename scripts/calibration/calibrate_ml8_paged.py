@@ -173,16 +173,21 @@ def _qwen_mlp_name_map(model: nn.Module) -> dict[str, str]:
 # blocks: linear_attn.{in_proj_qkv (fused qkv), in_proj_z (output gate), out_proj}.
 # (Earlier values "qkv_proj"/"gate_proj_attn" never matched a real checkpoint and
 # silently dropped the SSM input projections to bf16 — see assert_main_stack_covered.)
-_FULL_ML8_PER_LAYER_ORDER = (
+# Per-layer linear suffixes enumerated in `full` coverage, layer-major. This list
+# fixes ENUMERATION ORDER only — the TIER of each role comes from
+# role_targets.classify_role (overridable via ML8_TIER_OVERRIDE), NOT from which
+# list a suffix sits in. So moving a role between tiers is a pure classify_role
+# change and never silently drops a tensor. Self-attn q/k/v/o; gated delta-net
+# in_proj_qkv (fused qkv) + in_proj_z (output gate) + out_proj (SSM out); ssm gates
+# in_proj_a/in_proj_b. VERIFIED against Qwen3.5-9B/0.8B named_modules() (2026-05-31).
+_FULL_PER_LAYER_ORDER = (
     "q_proj", "k_proj", "v_proj", "o_proj",   # self-attention
     "in_proj_qkv", "in_proj_z",               # linear_attn fused qkv + output gate
     "out_proj",                               # linear_attn (SSM) output
+    "in_proj_a", "in_proj_b",                 # linear_attn (SSM) gates alpha/beta
 )
-# Model-global ML8 roles (no layer index), appended after all per-layer ML8.
-_FULL_ML8_GLOBAL_ORDER = ("lm_head", "eh_proj")
-# FP8-tier roles, appended last. Per-layer SSM gates (alpha=in_proj_a, beta=in_proj_b)
-# first, then the embedding.
-_FULL_FP8_PER_LAYER_ORDER = ("in_proj_a", "in_proj_b")
+# Model-global roles (no layer index), enumerated after all per-layer linears.
+_FULL_GLOBAL_ORDER = ("lm_head", "eh_proj")
 
 
 def _dense_layer_idx(name: str):
@@ -201,85 +206,85 @@ def find_dense_full_targets(model, coverage: str = "ffn"):
     coverage="ffn"  : EXACTLY the FFN linears yielded by find_target_linears,
                       in the same order, all tagged Tier.ML8. Provably identical
                       to today's behavior (assert in test_dense_coverage.py).
-    coverage="full" : the FFN linears FIRST (same order), then the appended ML8
-                      attention/SSM roles in _FULL_ML8_PER_LAYER_ORDER (layer-major),
-                      then global ML8 roles, then the FP8-tier tensors
-                      (alpha/beta per layer, then embed_tokens) last.
+    coverage="full" : the FFN linears FIRST (same order), then per-layer
+                      attention/SSM linears (layer-major, _FULL_PER_LAYER_ORDER),
+                      then global roles (lm_head/eh_proj), then the embedding —
+                      EACH routed to ML8/FP8/NATIVE by role_targets.classify_role
+                      (overridable via ML8_TIER_OVERRIDE). All ML8 targets are
+                      emitted before all FP8 targets, embedding always last.
 
-    Append order is deterministic and documented so existing resume blobs (which
-    are a contiguous prefix = the FFN linears) remain valid when `full` is added.
+    Tier comes from classify_role, never from which enumeration list a suffix sits
+    in — so moving a role between tiers (ML8_TIER_OVERRIDE) re-buckets it cleanly
+    and can never silently drop a tensor. With the default tier map this yields the
+    exact historical order, so existing resume-blob prefixes remain valid.
     """
     # FFN linears first — identical to find_target_linears (order preserved).
-    for name, mod in find_target_linears(model):
-        yield name, mod, Tier.ML8
+    ffn = list(find_target_linears(model))
 
     if coverage == "ffn":
+        for name, mod in ffn:
+            yield name, mod, Tier.ML8
         return
     if coverage != "full":
         raise ValueError(f"unknown dense coverage {coverage!r} (expected 'ffn' or 'full')")
 
     # Index every module once for deterministic lookups.
     by_name = dict(model.named_modules())
-
-    # Per-layer ML8 roles (attention + SSM out), layer-major then role order.
     n_layers = max((_dense_layer_idx(n) for n in by_name if _dense_layer_idx(n) is not None),
                    default=-1) + 1
-    for L in range(n_layers):
-        for suffix in _FULL_ML8_PER_LAYER_ORDER:
-            for name, mod in by_name.items():
-                if _dense_layer_idx(name) != L:
-                    continue
-                if name.rsplit(".", 1)[-1] != suffix:
-                    continue
-                if not isinstance(mod, nn.Linear):
-                    continue
-                _, _, tier = classify_role(name)
-                if tier is Tier.ML8:
-                    yield name, mod, Tier.ML8
 
-    # Global ML8 roles (lm_head / eh_proj), if present as nn.Linear.
     # Skip lm_head when the model TIES embeddings: a tied lm_head IS token_embd
-    # (already covered by the FP8 embedding tier), has no independent GGUF tensor
-    # (the converter correctly emits no output.weight), and meta+to_empty leaves
-    # its weight UNINITIALIZED — so quantizing it wastes time on silent garbage
-    # (NaN under determinism) and produces a blob the converter discards anyway.
+    # (served at inference by the tied token_embd tier), has no independent GGUF
+    # tensor (the converter emits no output.weight), and meta+to_empty leaves its
+    # weight UNINITIALIZED — quantizing it wastes time on silent garbage.
     _cfg = getattr(model, "config", None)
     _tied = bool(getattr(getattr(_cfg, "text_config", _cfg), "tie_word_embeddings", False)
                  or getattr(_cfg, "tie_word_embeddings", False))
-    for role in _FULL_ML8_GLOBAL_ORDER:
+
+    # Build the ordered candidate list (name, mod): FFN, then per-layer linears
+    # (layer-major), then global roles. The embedding is collected separately so it
+    # can always be emitted last.
+    candidates = list(ffn)
+    for L in range(n_layers):
+        for suffix in _FULL_PER_LAYER_ORDER:
+            for name, mod in by_name.items():
+                if (_dense_layer_idx(name) == L
+                        and name.rsplit(".", 1)[-1] == suffix
+                        and isinstance(mod, nn.Linear)):
+                    candidates.append((name, mod))
+    for role in _FULL_GLOBAL_ORDER:
         if role == "lm_head" and _tied:
-            print("[targets] skipping lm_head ML8 target: tie_word_embeddings=True "
-                  "(served by the FP8-tier tied token_embd at inference)")
+            print("[targets] skipping lm_head target: tie_word_embeddings=True "
+                  "(served by the tied token_embd at inference)")
             continue
         for name, mod in by_name.items():
-            if name.rsplit(".", 1)[-1] != role:
-                continue
-            if not isinstance(mod, nn.Linear):
-                continue
-            _, _, tier = classify_role(name)
-            if tier is Tier.ML8:
-                yield name, mod, Tier.ML8
+            if name.rsplit(".", 1)[-1] == role and isinstance(mod, nn.Linear):
+                candidates.append((name, mod))
 
-    # FP8-tier per-layer SSM gates (alpha/beta), layer-major then role order.
-    for L in range(n_layers):
-        for suffix in _FULL_FP8_PER_LAYER_ORDER:
-            for name, mod in by_name.items():
-                if _dense_layer_idx(name) != L:
-                    continue
-                if name.rsplit(".", 1)[-1] != suffix:
-                    continue
-                if not isinstance(mod, nn.Linear):
-                    continue
-                _, _, tier = classify_role(name)
-                if tier is Tier.FP8:
-                    yield name, mod, Tier.FP8
-
-    # FP8-tier embedding (nn.Embedding, special-cased — read .weight directly).
-    for name, mod in by_name.items():
-        if name not in ("model.embed_tokens",):
+    # Route each candidate by its classify_role tier, ML8 bucket then FP8 bucket.
+    # De-dup by name (FFN linears are also reachable by suffix) preserving order.
+    seen, ml8, fp8 = set(), [], []
+    for name, mod in candidates:
+        if name in seen:
             continue
-        if isinstance(mod, nn.Embedding):
-            yield name, mod, Tier.FP8
+        seen.add(name)
+        _, _, tier = classify_role(name)
+        if tier is Tier.ML8:
+            ml8.append((name, mod))
+        elif tier is Tier.FP8:
+            fp8.append((name, mod))
+        # NATIVE: not a quant target (shouldn't occur for these Linears).
+    for name, mod in ml8:
+        yield name, mod, Tier.ML8
+    for name, mod in fp8:
+        yield name, mod, Tier.FP8
+
+    # Embedding (nn.Embedding) — emitted LAST, routed by token_embd's tier.
+    for name, mod in by_name.items():
+        if name == "model.embed_tokens" and isinstance(mod, nn.Embedding):
+            _, _, tier = classify_role(name)
+            if tier is not Tier.NATIVE:
+                yield name, mod, tier
 
 
 # ─── Pager bootstrap ───────────────────────────────────────────────────────
@@ -1308,11 +1313,20 @@ def main():
     full_targets = list(find_dense_full_targets(model, coverage=_coverage))
     ml8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.ML8]
     fp8_full = [(n, m) for (n, m, t) in full_targets if t is Tier.FP8]
+    # nn.Embedding ML8 targets (e.g. token_embd at ml8-4 via ML8_TIER_OVERRIDE) have
+    # NO activation Hessian — a gather, not a GEMM forward. They cannot go through
+    # the GPTQ main loop; route them to the data-free ml8-4 embed pass below
+    # (identity Hessian = per-group Lloyd-Max + scale, NO rotation/AWQ — an embed
+    # gather has no downstream matmul to cancel a rotation against; see Design A).
+    ml8_embed_full = [(n, m) for (n, m) in ml8_full if isinstance(m, nn.Embedding)]
+    ml8_full = [(n, m) for (n, m) in ml8_full if not isinstance(m, nn.Embedding)]
     targets = filter_by_layer_limit(ml8_full, args.max_layers)
     fp8_targets = filter_by_layer_limit(fp8_full, args.max_layers)
+    ml8_embed_targets = ml8_embed_full   # global tensors: no per-layer limit
     print(f"[targets] {len(targets)} ML8 linears to quantize "
           f"(coverage={_coverage})"
-          + (f" + {len(fp8_targets)} FP8 tensors" if fp8_targets else ""))
+          + (f" + {len(fp8_targets)} FP8 tensors" if fp8_targets else "")
+          + (f" + {len(ml8_embed_targets)} ML8 embedding(s)" if ml8_embed_targets else ""))
 
     # ── W4A8 faithful weight tiers (--faithful-weights): quant->dequant the
     # FP8-tier weights (token_embd, ssm alpha/beta) in place so the calibration
@@ -2003,6 +2017,55 @@ def main():
         })
 
         del H
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    # ─── ML8-4 embedding pass (data-free) ──────────────────────────────────
+    # token_embd at ml8-4 (via ML8_TIER_OVERRIDE=token_embd=ml8): an embedding is a
+    # gather with no activation Hessian and (per Design A) no rotation/AWQ — so
+    # quantize its [vocab, hidden] weight DATA-FREE with an identity Hessian. With
+    # H=I, batched_gptq reduces to per-K-group Lloyd-Max + per-row scale and the
+    # GPTQ error-propagation tail is zero, i.e. plain ml8-4 codebook quant. The
+    # blob carries the same schema as the GPTQ loop MINUS rotation/awq sidecars, so
+    # the converter writes a rotation-free ml8_4 tensor and inference applies no
+    # rotation for the embed (a gather has no downstream matmul to undo it against).
+    for ei, (name, module) in enumerate(ml8_embed_targets):
+        w = module.weight.detach().float()                       # [vocab, hidden] = [N, K]
+        N, K = w.shape
+        if K % args.group_size != 0:
+            print(f"[ml8-embed] SKIP {name}: K={K} not divisible by group_size={args.group_size}")
+            continue
+        # Large embedding → quantize on CPU to respect the VRAM guard (per-group
+        # Lloyd-Max + nearest-centroid is CPU-friendly and runs once).
+        emb_dev = "cpu" if (N * K > 64_000_000) else (args.device if args.device.startswith("cuda") else "cpu")
+        Wr = w.to(emb_dev).unsqueeze(0)                                       # [1, N, K]
+        Hr = torch.eye(K, device=emb_dev, dtype=torch.float32).unsqueeze(0)   # identity → data-free
+        out = batched_gptq_quantize(
+            W_stack=Wr, H_stack=Hr,
+            n_centroids=args.n_centroids, group_size=args.group_size,
+            n_iter=args.n_iter, fit_loss=args.fit_loss,
+            mag_weight_p=args.mag_weight_p,
+            snap_centroids=args.snap_centroids,
+            percdamp=args.percdamp,
+            act_order=False, heavy_rounds=0)
+        out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
+        blob = {
+            "name": name,
+            "shape": [N, K],
+            "group_size": args.group_size,
+            "n_centroids": args.n_centroids,
+            "indices": out["indices"][0].cpu(),
+            "centroids_per_group": out["centroids_per_group"][0].cpu(),
+            "scale_per_group": out["scale_per_group"][0].cpu(),
+            "mse": float(out["mse"][0].item()),
+            "w_snr_db": float(out["w_snr_db"][0].item()),
+            "y_snr_db": float(out["y_snr_db"][0].item()),
+            "rel_err": float(out["rel_err"][0].item()),
+        }
+        torch.save(blob, out_path)
+        print(f"[ml8-embed {ei+1}/{len(ml8_embed_targets)}] {name}  shape=({N},{K})  "
+              f"dev={emb_dev}  W_SNR={blob['w_snr_db']:.1f}dB  saved: {out_path.name}")
+        del Wr, Hr, out
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 

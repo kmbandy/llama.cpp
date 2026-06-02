@@ -918,6 +918,13 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         (w->type == GGML_TYPE_ML8_4 || w->type == GGML_TYPE_ML8_4_SOA)) {
         op = GGML_OP_ML8_MUL_MAT_ID;
     }
+    // MAD-256: a native-4-bit (ML8_4) token_embd is gathered via
+    // GGML_OP_ML8_GET_ROWS — the generic get_rows aborts on ML8_4 (it needs the
+    // centroid LUT). LLM_TENSOR_INFOS tags TOKEN_EMBD with GET_ROWS; swap so the
+    // backend probe asks the right question and token_embd stays on a GPU buffer.
+    if (op == GGML_OP_GET_ROWS && w->type == GGML_TYPE_ML8_4) {
+        op = GGML_OP_ML8_GET_ROWS;
+    }
 
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
@@ -966,6 +973,16 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b         = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_expert_used, 512);
                 ggml_tensor * ids       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
                 op_tensor = ggml_ml8_mul_mat_id(ctx, w, centroids, b, ids);
+            } break;
+        case GGML_OP_ML8_GET_ROWS:
+            {
+                // MAD-256: ml8-4 native token-embedding gather. Synthetic probe
+                // with dummy centroids (F8_E4M3 [16, K/QK_ML8]) + i32 ids so the
+                // backend can answer "can I host this ml8_4 embed weight?".
+                const int64_t K = w->ne[0];
+                ggml_tensor * centroids = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 16, K / 64);
+                ggml_tensor * ids       = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                op_tensor = ggml_ml8_get_rows(ctx, w, centroids, ids);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

@@ -625,6 +625,15 @@ extern "C" {
         // HIP backend dispatches to mt_ml8_moe_gemm; CPU fallback dequantizes
         // each routed expert block-by-block.
         GGML_OP_ML8_MUL_MAT_ID,
+        // ml8-4 native row gather (token-embedding lookup for an ml8-4
+        // token_embd). Unlike GGML_OP_GET_ROWS, the row data is ML8_4 and is
+        // dequantized via the per-K-group centroid LUT sidecar — kept native
+        // 4-bit (no inline bf16 dequant of the whole table).
+        //   src[0] = w (GGML_TYPE_ML8_4, [K, N])  — embedding rows (N = vocab)
+        //   src[1] = centroids (GGML_TYPE_F8_E4M3, [16, K/QK_ML8])
+        //   src[2] = ids (GGML_TYPE_I32, [n_rows, ...])
+        //   dst    = y (GGML_TYPE_F32, [K, n_rows, ...])
+        GGML_OP_ML8_GET_ROWS,
 
         GGML_OP_COUNT,
     };

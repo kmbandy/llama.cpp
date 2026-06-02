@@ -52,7 +52,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
-    // if output is NULL, init from the input tok embed
+    // if output is NULL, init from the input tok embed (tied LM head)
+    const bool output_tied = (output == NULL);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
@@ -111,9 +112,32 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         ml8_reg.register_weight(weight, { centroids, rotation_h_a, awq_scale });
     };
 
-    // lm_head (output) sidecars are model-scope (no il). Register here so the
-    // ml8 path covers the final logits projection when output is ML8_4.
-    register_ml8_weight(output, LLM_TENSOR_OUTPUT, -1, n_embd);
+    // token_embd ml8-4 sidecars (MAD-256). A native-4-bit token_embd needs its
+    // centroid LUT for BOTH the input embedding gather (ggml_ml8_get_rows, via
+    // build_inp_embd) and, when the LM head is tied, the output logits
+    // projection. Register it under the tok_embd pointer so build_inp_embd
+    // finds it; capture the centroids so a tied output head can share the LUT.
+    struct ggml_tensor * tok_embd_centroids = nullptr;
+    {
+        struct ggml_tensor * te_rot = nullptr, * te_rmeta = nullptr, * te_awq = nullptr;
+        load_ml8_sidecars(tok_embd, LLM_TENSOR_TOKEN_EMBD, -1, n_embd,
+                          &tok_embd_centroids, &te_rot, &te_rmeta, &te_awq);
+        if (tok_embd && tok_embd->type == GGML_TYPE_ML8_4) {
+            ml8_reg.register_weight(tok_embd, { tok_embd_centroids, te_rot, te_awq });
+        }
+    }
+
+    // lm_head (output) sidecars are model-scope (no il). When the head is tied
+    // (duplicated from token_embd) it shares token_embd's weights AND centroid
+    // LUT — there is no separate output.centroids in the GGUF, so reuse the
+    // token_embd LUT. When untied, load the output's own sidecars.
+    if (output_tied) {
+        if (output && output->type == GGML_TYPE_ML8_4) {
+            ml8_reg.register_weight(output, { tok_embd_centroids, nullptr, nullptr });
+        }
+    } else {
+        register_ml8_weight(output, LLM_TENSOR_OUTPUT, -1, n_embd);
+    }
 
     auto load_block_trunk = [&](int il, int flags) {
         auto & layer = layers[il];
@@ -588,14 +612,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     const auto & layer = model.layers[il];
 
     // ml8-4 FFN path (MAD-223). Triggered when the gate weight is ml8-typed.
-    // Up and down must also be ml8 in this case — the calibrator writes all
-    // three together. We assert that for safety (mixed FFNs aren't supported).
+    // Gate runs on the inline ml8 path. Up and down are dispatched per-tensor:
+    // an ml8_4 weight stays inline; a role-uniform fp8 tier (MAD-256
+    // ML8_TIER_OVERRIDE, e.g. ffn_down=fp8) routes through build_lora_mm, which
+    // dispatches fp8 to its own backend op via the registry. Mixed-tier FFNs
+    // (gate/up ml8 + down fp8) are therefore supported — the "tread shaping".
     if (layer.ffn_gate && layer.ffn_gate->type == GGML_TYPE_ML8_4) {
-        GGML_ASSERT(layer.ffn_up   && layer.ffn_up->type   == GGML_TYPE_ML8_4 && "ml8 ffn requires ml8 up");
-        GGML_ASSERT(layer.ffn_down && layer.ffn_down->type == GGML_TYPE_ML8_4 && "ml8 ffn requires ml8 down");
         GGML_ASSERT(layer.ffn_gate_centroids && "ml8 ffn_gate missing centroids sidecar");
-        GGML_ASSERT(layer.ffn_up_centroids   && "ml8 ffn_up missing centroids sidecar");
-        GGML_ASSERT(layer.ffn_down_centroids && "ml8 ffn_down missing centroids sidecar");
 
         auto apply_input_xform = [&](ggml_tensor * x,
                                      ggml_tensor * awq,
@@ -621,22 +644,33 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
                                                   layer.ffn_gate_centroids, gate_in);
         cb(gate, "ffn_gate", il);
 
-        ggml_tensor * up_in   = apply_input_xform(cur,
-                                                  layer.ffn_up_awq_scale,
-                                                  layer.ffn_up_rotation_h_a);
-        ggml_tensor * up      = ggml_ml8_mul_mat(ctx0, layer.ffn_up,
-                                                  layer.ffn_up_centroids, up_in);
+        ggml_tensor * up;
+        if (layer.ffn_up->type == GGML_TYPE_ML8_4) {
+            GGML_ASSERT(layer.ffn_up_centroids && "ml8 ffn_up missing centroids sidecar");
+            ggml_tensor * up_in = apply_input_xform(cur,
+                                                    layer.ffn_up_awq_scale,
+                                                    layer.ffn_up_rotation_h_a);
+            up = ggml_ml8_mul_mat(ctx0, layer.ffn_up, layer.ffn_up_centroids, up_in);
+        } else {
+            // role-uniform fp8 (or other) up — registry helper dispatches by type.
+            up = build_lora_mm(layer.ffn_up, cur, layer.ffn_up_s);
+        }
         cb(up, "ffn_up", il);
 
         ggml_tensor * gated   = ggml_silu(ctx0, gate);
         ggml_tensor * inter   = ggml_mul(ctx0, gated, up);
         cb(inter, "ffn_inter", il);
 
-        ggml_tensor * down_in = apply_input_xform(inter,
-                                                  layer.ffn_down_awq_scale,
-                                                  layer.ffn_down_rotation_h_a);
-        cur                   = ggml_ml8_mul_mat(ctx0, layer.ffn_down,
-                                                  layer.ffn_down_centroids, down_in);
+        if (layer.ffn_down->type == GGML_TYPE_ML8_4) {
+            GGML_ASSERT(layer.ffn_down_centroids && "ml8 ffn_down missing centroids sidecar");
+            ggml_tensor * down_in = apply_input_xform(inter,
+                                                      layer.ffn_down_awq_scale,
+                                                      layer.ffn_down_rotation_h_a);
+            cur = ggml_ml8_mul_mat(ctx0, layer.ffn_down, layer.ffn_down_centroids, down_in);
+        } else {
+            // role-uniform fp8 (or other) down — registry helper dispatches by type.
+            cur = build_lora_mm(layer.ffn_down, inter, layer.ffn_down_s);
+        }
         cb(cur, "ffn_out", il);
         return cur;
     }

@@ -12,7 +12,11 @@ class Tier(enum.Enum):
 # transformers rename the converter already supports is handled here for free. This is
 # the 2026-05-31 fix for "role table written from assumption, never probed against a real
 # checkpoint" — we no longer maintain a parallel (and previously wrong) HF-name table.
-_GGUF_ROLE_TIER = {
+# BASE (default) role->tier map. The live map `_GGUF_ROLE_TIER` is rebuilt from
+# this each configure() call, optionally patched by ML8_TIER_OVERRIDE so a whole
+# ROLE can be moved between tiers uniformly ("tread shaping" — every tensor of a
+# role shares one tier; never per-tensor). Edit the BASE only to change defaults.
+_GGUF_ROLE_TIER_BASE = {
     # ML8 (4-bit) GEMMs
     "attn_q": ("attn_q", Tier.ML8), "attn_k": ("attn_k", Tier.ML8),
     "attn_v": ("attn_v", Tier.ML8), "attn_output": ("attn_out", Tier.ML8),
@@ -25,6 +29,44 @@ _GGUF_ROLE_TIER = {
     "ssm_alpha": ("ssm_alpha", Tier.FP8), "ssm_beta": ("ssm_beta", Tier.FP8),
     "token_embd": ("token_embd", Tier.FP8),
 }
+# Live map, set by configure(); starts as a copy of the base.
+_GGUF_ROLE_TIER = dict(_GGUF_ROLE_TIER_BASE)
+
+_TIER_BY_NAME = {"ml8": Tier.ML8, "fp8": Tier.FP8, "native": Tier.NATIVE}
+
+
+def _apply_tier_overrides(spec):
+    """Rebuild the live _GGUF_ROLE_TIER from the base, then apply `spec`.
+
+    spec: 'leaf=tier,leaf=tier' (e.g. 'token_embd=ml8,ssm_out=fp8'). Keys are
+    GGUF role leaves from _GGUF_ROLE_TIER_BASE; values are ml8|fp8|native. Only the
+    Tier changes — the role name is preserved. Fails loud on an unknown leaf or
+    tier (a typo silently mis-tiering the whole model would be a quiet quality bug).
+    Returns the list of applied 'leaf->tier' strings (for logging).
+    """
+    global _GGUF_ROLE_TIER
+    _GGUF_ROLE_TIER = dict(_GGUF_ROLE_TIER_BASE)
+    if not spec:
+        return []
+    applied = []
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        leaf, sep, tname = pair.partition("=")
+        leaf, tname = leaf.strip(), tname.strip().lower()
+        if not sep:
+            raise ValueError(f"ML8_TIER_OVERRIDE: malformed entry {pair!r} (want 'leaf=tier')")
+        if tname not in _TIER_BY_NAME:
+            raise ValueError(f"ML8_TIER_OVERRIDE: unknown tier {tname!r} in {pair!r} "
+                             f"(use ml8|fp8|native)")
+        if leaf not in _GGUF_ROLE_TIER_BASE:
+            raise ValueError(f"ML8_TIER_OVERRIDE: unknown role leaf {leaf!r} "
+                             f"(known: {sorted(_GGUF_ROLE_TIER_BASE)})")
+        role_name = _GGUF_ROLE_TIER_BASE[leaf][0]
+        _GGUF_ROLE_TIER[leaf] = (role_name, _TIER_BY_NAME[tname])
+        applied.append(f"{leaf}->{tname}")
+    return applied
 
 # Parents whose nn.Linear children MUST be quantized (ML8 or FP8) in the main
 # language-model stack. Any nn.Linear here that resolves to NATIVE means the
@@ -38,13 +80,19 @@ _TNM = None
 _ARCH = None
 
 
-def configure(arch_name: str, n_blocks: int) -> None:
+def configure(arch_name: str, n_blocks: int, tier_override=None) -> None:
     """Build the authoritative HF->GGUF TensorNameMap for `arch_name`.
 
     MUST be called once before classify_role(). Fails loudly on an unknown arch
     rather than silently mis-tiering.
+
+    Role->tier overrides come from `tier_override` (a 'leaf=tier,...' string) or, if
+    None, the ML8_TIER_OVERRIDE env var. Both calibrate_ml8_paged and ml8_to_gguf
+    call configure() with the same env, so calibration and conversion stay tier-
+    consistent across the two processes.
     """
     global _TNM, _ARCH
+    import os
     from gguf import MODEL_ARCH                       # local: keep import-light for callers
     from gguf.tensor_mapping import get_tensor_name_map
     arch_enum = next((ma for ma in MODEL_ARCH if ma.name.lower() == arch_name.lower()), None)
@@ -52,6 +100,11 @@ def configure(arch_name: str, n_blocks: int) -> None:
         raise ValueError(f"role_targets.configure: no MODEL_ARCH match for arch_name={arch_name!r}")
     _TNM = get_tensor_name_map(arch_enum, n_blocks)
     _ARCH = arch_name
+
+    spec = tier_override if tier_override is not None else os.environ.get("ML8_TIER_OVERRIDE")
+    applied = _apply_tier_overrides(spec)
+    if applied:
+        print(f"[role-tier] ML8_TIER_OVERRIDE applied (role-uniform): {', '.join(applied)}")
 
 
 def _layer_idx(name):

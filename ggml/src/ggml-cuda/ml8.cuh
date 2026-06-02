@@ -122,6 +122,18 @@ void ggml_cuda_op_ml8_mul_mat(
     ggml_backend_cuda_context & ctx,
     ggml_tensor *               dst);
 
+// GGML_OP_ML8_GET_ROWS dispatch — native 4-bit token-embedding gather.
+// Unlike ggml_cuda_op_ml8_mul_mat this needs NO AITER GEMM: it gathers row
+// ids[i] from the ml8-4 weight and dequantizes via the per-K-group centroid
+// LUT directly on device. Available on any CUDA/HIP build.
+//   dst:        fp32  [K, ids->ne0, ids->ne1, ids->ne2]
+//   dst->src[0]: w    — GGML_TYPE_ML8_4,   ne[0]=K (mult. of QK_ML8=64), ne[1]=N(vocab)
+//   dst->src[1]: cent — GGML_TYPE_F8_E4M3, ne[0]=16, ne[1]=K/QK_ML8 (shared LUT)
+//   dst->src[2]: ids  — GGML_TYPE_I32
+void ggml_cuda_op_ml8_get_rows(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
 // Execute a plain GGML_OP_MUL_MAT whose src[0] is a GGML_TYPE_ML8_FP8
 // (scaled-fp8) weight, via the no-LUT FP8-WMMA path (WEIGHT_FORMAT=0).
 // Unlike GGML_OP_ML8_MUL_MAT there is no centroid sidecar:
