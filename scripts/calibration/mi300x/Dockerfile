@@ -50,6 +50,25 @@ WORKDIR /opt/mad-lab/llama.cpp
 # local build trees, model blobs, and datasets so the context stays ~800 MB.
 COPY . .
 
+# --- Make Triton's AOT compiler DRIVERLESS, then PROVE it with no GPU ---
+# Triton 3.7.0's tools/compile.py touches driver.active in two spots that need a
+# live GPU even with an explicit --target; a rootless `podman build` has none, so
+# the AITER AOT step below would die with "0 active drivers". The patcher removes
+# that gratuitous coupling (cross-compilation must not need the target GPU). The
+# gate then AOT-compiles a kernel for gfx942 with NO GPU and fails the build if it
+# ever stops emitting artifacts — the `--help | grep --target` check only proved
+# the flag EXISTS, which is how the original regression shipped. (The Triton install
+# above stays cached; this runs post-COPY so the patcher is in the context.) #170.
+RUN python3 ggml/src/ggml-cuda/aiter-integration/cmake/patch_triton_driverless_aot.py /opt/triton && \
+    python3 -m triton.tools.compile ggml/src/ggml-cuda/aiter-integration/kernels/vector_add.py \
+        --kernel-name add_kernel --target hip:gfx942:64 \
+        --signature "*fp32:16, *fp32:16, *fp32:16, i32, 1024" \
+        --grid "n_elements / 1024, 1, 1" --num-warps 4 --num-stages 1 \
+        --out-name _aotgate --out-path /tmp/_aotgate && \
+    ls /tmp/_aotgate*.c >/dev/null 2>&1 && \
+    echo "[gate] driverless Triton AOT OK (gfx942 artifacts emitted, no GPU)" && \
+    rm -f /tmp/_aotgate*
+
 # --- build llama.cpp HIP libs + the perplexity binary for gfx942 ---
 # GGML_NATIVE=OFF: the local build bakes -march=native for THIS host CPU; off here
 # so the image runs on whatever CPU the MI300X host has.
@@ -72,7 +91,8 @@ RUN cmake -S . -B build-hip -G Ninja \
         -DGGML_NATIVE=OFF -DGGML_RPC=OFF -DLLAMA_CURL=OFF \
         -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
         -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
-        -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ && \
+        -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/opt/rocm/lib -lamdhip64" && \
     cmake --build build-hip --target llama llama-perplexity -j"${JOBS:-$(nproc)}" && \
     test -e build-hip/bin/libllama.so && test -e build-hip/bin/llama-perplexity
 
