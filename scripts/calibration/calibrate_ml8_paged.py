@@ -929,6 +929,171 @@ def load_dense_prefix_into_model(prefix_count: int, target_names: "list[str]",
     return results
 
 
+def quantize_one_target(name, layer, target_index, H, n_tok, sum_abs,
+                        rotation_hook, args, dtype, manifest, out_dir, timer, recipe=None):
+    """Quantize ONE dense ml8 target end-to-end: AWQ -> rotation -> batched_gptq ->
+    inverse/absorb -> writeback (resident propagation) -> save blob + manifest.
+    H/n_tok/sum_abs are INPUTS. recipe overrides group_size/n_centroids per-role;
+    None = global args. Bit-identical to the inline per-target loop body it replaces."""
+    import time
+    t0 = time.time()
+    W_orig_snapshot = layer.weight.detach().clone()
+    rows, in_feat = layer.weight.shape
+    collect_awq = args.awq != "none"
+    gs = (recipe or {}).get("group_size", None)
+    nc = (recipe or {}).get("n_centroids", None) or args.n_centroids
+
+    # Per-kind group size (down_proj may use a finer grid via --group-size-down).
+    kind = name.rsplit(".", 1)[-1]   # gate_proj / up_proj / down_proj
+    gs_for_kind = gs if gs is not None else args.group_size
+    if kind == "down_proj" and args.group_size_down is not None and gs is None:
+        gs_for_kind = args.group_size_down
+
+    # AWQ rescale
+    awq_s = None
+    awq_blob = None
+    if collect_awq and sum_abs is not None:
+        mean_abs = (sum_abs / max(n_tok, 1)).clamp_min(1e-8)
+        awq_s = mean_abs.pow(args.awq_alpha).to(H.device)
+        print(f"  awq: kind={args.awq} alpha={args.awq_alpha} "
+              f"s_max={awq_s.max().item():.3f} s_min={awq_s.min().item():.3f}")
+        awq_blob = {"kind": args.awq, "alpha": args.awq_alpha, "s": awq_s.detach().cpu()}
+        H = H * awq_s.unsqueeze(0) * awq_s.unsqueeze(1)
+        W_new = apply_awq_to_weight(layer.weight.float().to(awq_s.device), awq_s)
+        layer.weight_override = W_new.to(dtype)
+    else:
+        # No AWQ: still need to seed weight_override with original so subsequent
+        # math operates on a Tensor (not a property page-fault each access).
+        layer.weight_override = layer.weight.detach().clone()
+
+    # Rotation
+    rotation = None
+    rotation_blob = None
+    if args.rotation == "kronecker":
+        if args.faithful_acts:
+            # SAME Q the activation hook used (rotation already baked into H).
+            rotation = rotation_hook
+        else:
+            a, b = factor_for_dim(in_feat, max_b=args.rotation_max_b)
+            h_a = random_orthogonal(a, seed=args.rotation_seed + target_index)
+            rotation = KroneckerRotation(h_a=h_a, b_dim=b)
+        rotation_blob = rotation.to_dict()
+        rotation_blob["seed"] = args.rotation_seed + target_index
+        print(f"  rotation: kronecker (faithful={args.faithful_acts})")
+        if not args.faithful_acts:
+            H = rotate_hessian(H, rotation)
+        assert_not_double_rotated(args.faithful_acts, rotate_hessian_called=False)
+        layer.weight_override = rotation.forward(
+            layer.weight_override.float().to(H.device)).to(dtype)
+
+    effective_percdamp = args.percdamp
+    if awq_s is not None:
+        effective_percdamp = max(args.percdamp, 0.05)
+
+    try:
+        # Unified quantizer: route the single dense linear through
+        # batched_gptq_quantize as a [1, N, K] stack so it gets the SAME
+        # levers as the MoE path — including act_order + the heavy tune loop
+        # (bit-free). weight_override is already rotated/AWQ'd; H matches it.
+        Wr = layer.weight_override.float().to(args.device).unsqueeze(0)   # [1, N, K]
+        Hr = H.to(args.device).unsqueeze(0)                              # [1, K, K]
+        with timer.phase("gptq_quantize", target=name):
+            out = batched_gptq_quantize(
+                W_stack=Wr, H_stack=Hr,
+                n_centroids=nc, group_size=gs_for_kind,
+                n_iter=args.n_iter, fit_loss=args.fit_loss,
+                mag_weight_p=args.mag_weight_p,
+                snap_centroids=args.snap_centroids,
+                percdamp=effective_percdamp,
+                act_order=args.act_order or args.heavy_rounds > 0,
+                heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
+                heavy_dtype=args.heavy_dtype,
+                heavy_lr_cent=args.heavy_lr_cent,
+                heavy_lr_scale=args.heavy_lr_scale)
+        layer.weight_override = out["Q"][0].to(dtype)   # dequantized rotated/AWQ'd weight
+        export = {
+            "indices":             out["indices"][0].clone().contiguous(),
+            "centroids_per_group": out["centroids_per_group"][0].clone().contiguous(),
+            "scale_per_group":     out["scale_per_group"][0].clone().contiguous(),
+            "mse":      float(out["mse"][0].item()),
+            "w_snr_db": float(out["w_snr_db"][0].item()),
+            "y_snr_db": float(out["y_snr_db"][0].item()),
+            "rel_err":  float(out["rel_err"][0].item()),
+        }
+        del Wr, Hr, out
+    except RuntimeError as e:
+        print(f"  FAILED: {e}")
+        layer.weight_override = W_orig_snapshot
+        if args.resident:
+            layer.weight.data.copy_(W_orig_snapshot.to(layer.weight.dtype))
+            layer.weight_override = None   # same resident-leak fix as success path
+        return
+    t_quant = time.time() - t0
+
+    # Inverse rotation, then absorb AWQ — leave weight_override at inference-equivalent.
+    if rotation is not None:
+        layer.weight_override = rotation.inverse(
+            layer.weight_override.float().to(rotation.h_a.device)).to(dtype)
+    if awq_s is not None:
+        layer.weight_override = absorb_awq_in_reconstruction(
+            layer.weight_override.float().to(awq_s.device), awq_s).to(dtype)
+
+    # CRITICAL: weight_override must live on the model's device so the next
+    # layer's forward pass (during compute_hessian) finds it on cuda. Rotation
+    # math may have moved it to CPU (rotation.h_a is on CPU by design — see
+    # KroneckerRotation.to_dict) — pull it back to args.device.
+    layer.weight_override = layer.weight_override.to(args.device)
+
+    # Resident path: the model forward reads layer.weight (a real Parameter),
+    # NOT weight_override — so copy the calibrated weight back so the NEXT
+    # layer's Hessian sees the quantized upstream (GPTQ cross-layer error
+    # propagation). PagedLinear's forward reads weight_override directly, so
+    # this branch is a no-op there.
+    if args.resident:
+        with torch.no_grad():
+            layer.weight.data.copy_(layer.weight_override.to(layer.weight.dtype))
+        # Resident forward reads layer.weight, NOT weight_override — so the
+        # override is a full-size GPU duplicate of this layer's weights once
+        # it's been copied back. Drop it or it accumulates ~one MLP-worth of
+        # VRAM per layer (the resident-mode leak fixed 2026-05-30).
+        layer.weight_override = None
+
+    # Save the blob (identical schema to calibrate_ml8.py output)
+    out_path = out_dir / f"{name.replace('.', '_').replace('/', '_')}.pt"
+    blob = {
+        "name": name,
+        "shape": [rows, in_feat],
+        "group_size": gs_for_kind,
+        "n_centroids": nc,
+        "indices": export["indices"].cpu(),
+        "centroids_per_group": export["centroids_per_group"].cpu(),
+        "scale_per_group": export["scale_per_group"].cpu(),
+        "mse": export["mse"],
+        "w_snr_db": export["w_snr_db"],
+        "y_snr_db": export["y_snr_db"],
+        "rel_err": export["rel_err"],
+    }
+    if rotation_blob is not None:
+        blob["rotation"] = rotation_blob
+    if awq_blob is not None:
+        blob["awq"] = awq_blob
+    torch.save(blob, out_path)
+
+    print(f"  saved: {out_path.name}  "
+          f"Y_SNR={export['y_snr_db']:.1f}dB  W_SNR={export['w_snr_db']:.1f}dB  "
+          f"t_quant={t_quant:.1f}s")
+
+    manifest["results"].append({
+        "name": name, "shape": [rows, in_feat],
+        "mse": float(export["mse"]),
+        "y_snr_db": float(export["y_snr_db"]),
+        "w_snr_db": float(export["w_snr_db"]),
+        "t_hess_s": 0.0,
+        "t_quant_s": float(t_quant),
+    })
+    return  # side effects only: weight writeback + saved .pt + manifest append
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3.5-4B",
@@ -1934,26 +2099,20 @@ def main():
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
     for i, (name, layer) in enumerate(targets):
         if i < resume_start:
-            continue   # already quantized + reloaded above
-        t0 = time.time()
-        rows, in_feat = layer.weight.shape   # PagedLinear.weight page-faults here
+            continue
+        rows, in_feat = layer.weight.shape
         print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
-
-        W_orig_snapshot = layer.weight.detach().clone()
-
         collect_awq = args.awq != "none"
         _t_hess0 = time.time()
         if args.hessian_mode == "single":
-            H, n_tok = _precollected_H[i]
-            sum_abs = None
+            H, n_tok = _precollected_H[i]; sum_abs = None
         elif args.faithful_acts:
             hk_i, _frot_i = faithful_hooks[i]
             hk_i.reset_hessian(); hk_i.set_hessian_target(True)
             with TIMER.phase("hessian_forward"):
                 _H_discard, n_tok, sum_abs = compute_hessian(
                     layer, calib, model, args.device, collect_awq=collect_awq)
-            hk_i.set_hessian_target(False)
-            H = hk_i.H
+            hk_i.set_hessian_target(False); H = hk_i.H
         else:
             with TIMER.phase("hessian_forward"):
                 H, n_tok, sum_abs = compute_hessian(
@@ -1963,158 +2122,9 @@ def main():
                 "label": "hessian_forward_target", "target": name,
                 "n_tok": int(n_tok), "seconds": time.time() - _t_hess0,
                 "shape": [int(rows), int(in_feat)]})
-        t_hess = time.time() - t0
-        print(f"  hessian: {H.shape}  n_tok={n_tok}  t={t_hess:.1f}s")
-
-        # AWQ rescale
-        awq_s = None
-        awq_blob = None
-        if collect_awq and sum_abs is not None:
-            mean_abs = (sum_abs / max(n_tok, 1)).clamp_min(1e-8)
-            awq_s = mean_abs.pow(args.awq_alpha).to(H.device)
-            print(f"  awq: kind={args.awq} alpha={args.awq_alpha} "
-                  f"s_max={awq_s.max().item():.3f} s_min={awq_s.min().item():.3f}")
-            awq_blob = {"kind": args.awq, "alpha": args.awq_alpha, "s": awq_s.detach().cpu()}
-            H = H * awq_s.unsqueeze(0) * awq_s.unsqueeze(1)
-            W_new = apply_awq_to_weight(layer.weight.float().to(awq_s.device), awq_s)
-            layer.weight_override = W_new.to(dtype)
-        else:
-            # No AWQ: still need to seed weight_override with original so subsequent
-            # math operates on a Tensor (not a property page-fault each access).
-            layer.weight_override = layer.weight.detach().clone()
-
-        # Rotation
-        rotation = None
-        rotation_blob = None
-        if args.rotation == "kronecker":
-            if args.faithful_acts:
-                # SAME Q the activation hook used (rotation already baked into H).
-                rotation = faithful_hooks[i][1]
-            else:
-                a, b = factor_for_dim(in_feat, max_b=args.rotation_max_b)
-                h_a = random_orthogonal(a, seed=args.rotation_seed + i)
-                rotation = KroneckerRotation(h_a=h_a, b_dim=b)
-            rotation_blob = rotation.to_dict()
-            rotation_blob["seed"] = args.rotation_seed + i
-            print(f"  rotation: kronecker (faithful={args.faithful_acts})")
-            if not args.faithful_acts:
-                H = rotate_hessian(H, rotation)
-            assert_not_double_rotated(args.faithful_acts, rotate_hessian_called=False)
-            layer.weight_override = rotation.forward(
-                layer.weight_override.float().to(H.device)).to(dtype)
-
-        effective_percdamp = args.percdamp
-        if awq_s is not None:
-            effective_percdamp = max(args.percdamp, 0.05)
-
-        # Per-kind group size (down_proj may use a finer grid via --group-size-down).
-        kind = name.rsplit(".", 1)[-1]   # gate_proj / up_proj / down_proj
-        gs_for_kind = args.group_size
-        if kind == "down_proj" and args.group_size_down is not None:
-            gs_for_kind = args.group_size_down
-
-        try:
-            # Unified quantizer: route the single dense linear through
-            # batched_gptq_quantize as a [1, N, K] stack so it gets the SAME
-            # levers as the MoE path — including act_order + the heavy tune loop
-            # (bit-free). weight_override is already rotated/AWQ'd; H matches it.
-            Wr = layer.weight_override.float().to(args.device).unsqueeze(0)   # [1, N, K]
-            Hr = H.to(args.device).unsqueeze(0)                              # [1, K, K]
-            with TIMER.phase("gptq_quantize", target=name):
-                out = batched_gptq_quantize(
-                    W_stack=Wr, H_stack=Hr,
-                    n_centroids=args.n_centroids, group_size=gs_for_kind,
-                    n_iter=args.n_iter, fit_loss=args.fit_loss,
-                    mag_weight_p=args.mag_weight_p,
-                    snap_centroids=args.snap_centroids,
-                    percdamp=effective_percdamp,
-                    act_order=args.act_order or args.heavy_rounds > 0,
-                    heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
-                    heavy_dtype=args.heavy_dtype,
-                    heavy_lr_cent=args.heavy_lr_cent,
-                    heavy_lr_scale=args.heavy_lr_scale)
-            layer.weight_override = out["Q"][0].to(dtype)   # dequantized rotated/AWQ'd weight
-            export = {
-                "indices":             out["indices"][0].clone().contiguous(),
-                "centroids_per_group": out["centroids_per_group"][0].clone().contiguous(),
-                "scale_per_group":     out["scale_per_group"][0].clone().contiguous(),
-                "mse":      float(out["mse"][0].item()),
-                "w_snr_db": float(out["w_snr_db"][0].item()),
-                "y_snr_db": float(out["y_snr_db"][0].item()),
-                "rel_err":  float(out["rel_err"][0].item()),
-            }
-            del Wr, Hr, out
-        except RuntimeError as e:
-            print(f"  FAILED: {e}")
-            layer.weight_override = W_orig_snapshot
-            if args.resident:
-                layer.weight.data.copy_(W_orig_snapshot.to(layer.weight.dtype))
-                layer.weight_override = None   # same resident-leak fix as success path
-            continue
-        t_quant = time.time() - t0 - t_hess
-
-        # Inverse rotation, then absorb AWQ — leave weight_override at inference-equivalent.
-        if rotation is not None:
-            layer.weight_override = rotation.inverse(
-                layer.weight_override.float().to(rotation.h_a.device)).to(dtype)
-        if awq_s is not None:
-            layer.weight_override = absorb_awq_in_reconstruction(
-                layer.weight_override.float().to(awq_s.device), awq_s).to(dtype)
-
-        # CRITICAL: weight_override must live on the model's device so the next
-        # layer's forward pass (during compute_hessian) finds it on cuda. Rotation
-        # math may have moved it to CPU (rotation.h_a is on CPU by design — see
-        # KroneckerRotation.to_dict) — pull it back to args.device.
-        layer.weight_override = layer.weight_override.to(args.device)
-
-        # Resident path: the model forward reads layer.weight (a real Parameter),
-        # NOT weight_override — so copy the calibrated weight back so the NEXT
-        # layer's Hessian sees the quantized upstream (GPTQ cross-layer error
-        # propagation). PagedLinear's forward reads weight_override directly, so
-        # this branch is a no-op there.
-        if args.resident:
-            with torch.no_grad():
-                layer.weight.data.copy_(layer.weight_override.to(layer.weight.dtype))
-            # Resident forward reads layer.weight, NOT weight_override — so the
-            # override is a full-size GPU duplicate of this layer's weights once
-            # it's been copied back. Drop it or it accumulates ~one MLP-worth of
-            # VRAM per layer (the resident-mode leak fixed 2026-05-30).
-            layer.weight_override = None
-
-        # Save the blob (identical schema to calibrate_ml8.py output)
-        out_path = Path(args.output_dir) / f"{name.replace('.', '_').replace('/', '_')}.pt"
-        blob = {
-            "name": name,
-            "shape": [rows, in_feat],
-            "group_size": args.group_size,
-            "n_centroids": args.n_centroids,
-            "indices": export["indices"].cpu(),
-            "centroids_per_group": export["centroids_per_group"].cpu(),
-            "scale_per_group": export["scale_per_group"].cpu(),
-            "mse": export["mse"],
-            "w_snr_db": export["w_snr_db"],
-            "y_snr_db": export["y_snr_db"],
-            "rel_err": export["rel_err"],
-        }
-        if rotation_blob is not None:
-            blob["rotation"] = rotation_blob
-        if awq_blob is not None:
-            blob["awq"] = awq_blob
-        torch.save(blob, out_path)
-
-        print(f"  saved: {out_path.name}  "
-              f"Y_SNR={export['y_snr_db']:.1f}dB  W_SNR={export['w_snr_db']:.1f}dB  "
-              f"t_quant={t_quant:.1f}s")
-
-        manifest["results"].append({
-            "name": name, "shape": [rows, in_feat],
-            "mse": float(export["mse"]),
-            "y_snr_db": float(export["y_snr_db"]),
-            "w_snr_db": float(export["w_snr_db"]),
-            "t_hess_s": float(t_hess),
-            "t_quant_s": float(t_quant),
-        })
-
+        rotation_hook = faithful_hooks[i][1] if args.faithful_acts else None
+        quantize_one_target(name, layer, i, H, n_tok, sum_abs, rotation_hook,
+                            args, dtype, manifest, Path(args.output_dir), TIMER)
         del H
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
