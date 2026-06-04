@@ -106,7 +106,7 @@ from kronecker_rotation import (  # noqa: E402
 from awq import compute_awq_scale, apply_awq_to_weight, absorb_awq_in_reconstruction  # noqa: E402
 from batched_gptq import batched_gptq_quantize, batched_gptq_quantize_multigpu  # noqa: E402  (G.7.h.2/3)
 from calib_corpus import collect_calibration  # noqa: E402  (content sweep: named compositions)
-from fla_compat import apply_fla_arch_shim  # noqa: E402  (RDNA fla bf16 fdot2 fp32 workaround)
+from fla_compat import apply_fla_arch_shim, apply_fla_cpu_fallback  # noqa: E402  (RDNA fla bf16 fdot2 fp32 workaround; CPU torch-ref fallback)
 from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (dense resume)
 from role_targets import classify_role, Tier, assert_main_stack_covered, configure as configure_roles  # noqa: E402  (--dense-coverage full tier routing)
 from faithful_forward import FaithfulActHook, assert_not_double_rotated, fp8_weight_override, collect_hessians_single_pass  # noqa: E402  (W4A8 faithful tiers)
@@ -1239,6 +1239,12 @@ def main():
     # deployed f32 recurrence core. No-op on CDNA3/NVIDIA/CPU or if fla isn't
     # installed. MUST run before the first forward. ───
     apply_fla_arch_shim(model, args.device)
+    # ─── fla CPU fallback: when fla IS installed and device=cpu, the Triton
+    # kernel is still bound (chunk_gated_delta_rule or torch_… → fla wins when
+    # fla is present). Triton cannot dispatch CPU tensors → ValueError. Swap the
+    # Triton binding back to the HF torch reference so CPU calibration works.
+    # No-op on GPU paths. MUST run before the first forward. ───
+    apply_fla_cpu_fallback(model, args.device)
 
     # ─── Repair rotary inv_freq: meta-build + to_empty leaves this non-persistent,
     # non-GGUF buffer uninitialized → silently-wrong RoPE (and a hard NaN under

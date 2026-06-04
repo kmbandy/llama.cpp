@@ -19,6 +19,19 @@ WITHOUT fla installed, HF qwen3.5 binds these attributes to the slow
 that by name, so it is a safe no-op in every configuration except the one that
 needs it: RDNA + fla installed.
 
+CPU FALLBACK (apply_fla_cpu_fallback)
+--------------------------------------
+When fla IS installed and the calibration device is CPU, the ``__init__`` of
+``Qwen3_5GatedDeltaNet`` binds ``self.chunk_gated_delta_rule`` to the fla Triton
+kernel (``chunk_gated_delta_rule or torch_chunk_gated_delta_rule`` — the "or"
+only fires when fla is absent). Triton cannot run on CPU tensors:
+
+    ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+
+``apply_fla_cpu_fallback`` swaps those attributes back to the torch reference
+implementations so CPU calibration (used in unit tests) works even with fla
+installed. GPU paths are unaffected (they short-circuit immediately).
+
 See docs/superpowers/2026-05-31-calibration-fidelity-fla-rdna.md.
 """
 from __future__ import annotations
@@ -93,4 +106,102 @@ def apply_fla_arch_shim(model, device, scan_dtype=torch.float32, verbose=True) -
         print(f"[fla-shim] RDNA detected: wrapped {n} fla kernel binding(s) to "
               f"{scan_dtype} scan (bf16 fdot2 workaround; matches deployed f32 "
               f"recurrence).")
+    return n
+
+
+# Map from fla Triton attr name → the torch reference attr name that HF qwen3.5
+# would have used if fla were absent. Both live as module-level callables in
+# transformers.models.qwen3_5.modeling_qwen3_5 and are CPU-compatible.
+_FLA_TO_TORCH_REF = {
+    "chunk_gated_delta_rule":      "torch_chunk_gated_delta_rule",
+    "recurrent_gated_delta_rule":  "torch_recurrent_gated_delta_rule",
+}
+
+
+def apply_fla_cpu_fallback(model, device, verbose=True) -> int:
+    """Replace fla Triton kernels with their torch reference equivalents on CPU.
+
+    When fla is installed, ``Qwen3_5GatedDeltaNet.__init__`` binds several
+    attributes to fla Triton kernels regardless of the runtime device:
+
+      * ``self.chunk_gated_delta_rule``     → fla Triton chunk scan
+      * ``self.recurrent_gated_delta_rule`` → fla Triton recurrent scan
+      * ``self.norm``                       → ``FusedRMSNormGated`` (Triton layernorm)
+
+    Triton cannot dispatch to CPU tensors and raises:
+
+        ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+
+    This function swaps each of these back to CPU-compatible equivalents so that
+    CPU calibration (unit tests, CI) works even when fla is installed:
+
+      * Callable attrs → HF torch reference implementations (``torch_*`` names)
+      * ``FusedRMSNormGated`` norm modules → ``Qwen3_5RMSNormGated`` with weights
+        copied from the fla instance (both have ``self.weight`` of shape
+        ``[hidden_size]``; the computation is numerically equivalent).
+
+    GPU paths are untouched — this function is a no-op for non-CPU devices.
+
+    Returns the total number of replacements made (callables + norm modules);
+    0 means no-op."""
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cpu":
+        return 0
+
+    # Lazily import HF qwen3.5 references.  Guarded so this is safe for any
+    # architecture that doesn't have these classes (non-qwen3.5 models).
+    try:
+        import transformers.models.qwen3_5.modeling_qwen3_5 as _q35
+        torch_refs = {
+            attr: getattr(_q35, torch_name, None)
+            for attr, torch_name in _FLA_TO_TORCH_REF.items()
+        }
+        FusedRMSNormGated = getattr(_q35, "FusedRMSNormGated", None)
+        Qwen3_5RMSNormGated = getattr(_q35, "Qwen3_5RMSNormGated", None)
+    except (ImportError, AttributeError):
+        return 0  # not a qwen3.5 model or transformers too old — safe no-op
+
+    n = 0
+
+    # 1. Replace callable fla Triton kernel attributes with torch references.
+    for mod in model.modules():
+        for attr, ref_fn in torch_refs.items():
+            if ref_fn is None:
+                continue
+            fn = getattr(mod, attr, None)
+            if fn is None:
+                continue
+            # Skip if already the torch reference (name starts with "torch_").
+            if getattr(fn, "__name__", "").startswith("torch_"):
+                continue
+            # Skip if already wrapped by apply_fla_arch_shim (shouldn't happen
+            # on CPU, but be defensive).
+            if getattr(fn, "_fla_dtype_wrapped", False):
+                continue
+            setattr(mod, attr, ref_fn)
+            n += 1
+
+    # 2. Replace FusedRMSNormGated norm sub-modules with Qwen3_5RMSNormGated.
+    #    Both have a single `weight` Parameter of shape [hidden_size]; we copy
+    #    the weight from the fla instance into the new pure-torch module.
+    if FusedRMSNormGated is not None and Qwen3_5RMSNormGated is not None:
+        for parent in list(model.modules()):
+            for child_name, child in list(parent.named_children()):
+                if not isinstance(child, FusedRMSNormGated):
+                    continue
+                hidden_size = child.hidden_size
+                eps = child.eps
+                replacement = Qwen3_5RMSNormGated(hidden_size, eps=eps)
+                # Copy trained weight (both have self.weight of shape [hidden_size]).
+                if child.weight is not None and replacement.weight is not None:
+                    with torch.no_grad():
+                        replacement.weight.copy_(child.weight.to(replacement.weight.dtype))
+                replacement = replacement.to(next(child.parameters(), torch.empty(0)).device
+                                             if any(True for _ in child.parameters()) else "cpu")
+                setattr(parent, child_name, replacement)
+                n += 1
+
+    if verbose and n:
+        print(f"[fla-cpu] CPU device: replaced {n} fla Triton component(s) with "
+              f"torch reference (Triton cannot dispatch to CPU tensors).")
     return n
