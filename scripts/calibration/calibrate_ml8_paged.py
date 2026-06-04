@@ -1035,9 +1035,13 @@ def main():
                         "to isolate the fp32-vs-WMMA matmul tax. 0 = off.")
     p.add_argument("--hessian-mode", choices=("single", "per-target"), default="single",
                    help="Dense Hessian collection. 'single' (default): ONE forward "
-                        "populates all target Hessians (requires --faithful-acts and "
-                        "--awq none); ~Nx faster, bit-identical. 'per-target': legacy "
-                        "one-forward-per-target reference path.")
+                        "populates all target Hessians from the ORIGINAL model "
+                        "(static-Hessian GPTQ; requires --faithful-acts and --awq "
+                        "none); ~Nx faster. NOT bit-identical to 'per-target', which "
+                        "is true-sequential (each target's H sees quantized upstream "
+                        "via weight_override write-back = GPTQ cross-layer error "
+                        "propagation); validate 'single' by PPL, not byte-diff. "
+                        "'per-target': the exact true-sequential reference path.")
     p.add_argument("--arch", default=None,
                    help="(--strategy moe only) MODEL_ARCH name for TensorNameMap "
                         "(e.g. 'qwen3moe'). If omitted, derived from the config "

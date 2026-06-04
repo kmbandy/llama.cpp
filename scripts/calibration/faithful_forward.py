@@ -76,9 +76,13 @@ def collect_hessians_single_pass(hooks_by_index, calib, model, device):
     every forward regardless of target state). We reset + target ALL of them,
     run one forward over `calib`, then untarget and return each hook's H.
 
-    Bit-identical to the per-target sequential path: in both, each hook
-    accumulates a_qᵀa_q over the same deterministic all-transforms-active forward,
-    over `calib` in the same order. Returns {index: (H, n_tokens)}.
+    This is STATIC-Hessian GPTQ: every target's H is built against the ORIGINAL
+    (unquantized) model in a single pass. It is NOT bit-identical to the dense
+    per-target loop, which is TRUE-SEQUENTIAL — that path writes each quantized
+    weight back (weight_override / weight.data) so the next target's H sees the
+    quantized upstream (GPTQ cross-layer error propagation). The two agree only
+    when cross-layer propagation is negligible; validate by PPL, not byte-diff.
+    Returns {index: (H, n_tokens)}.
     """
     for hk in hooks_by_index.values():
         hk.reset_hessian()

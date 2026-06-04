@@ -10,6 +10,22 @@ This is the **Step 1 gate** of the spec
 (`docs/superpowers/specs/2026-06-03-calibration-pipeline-speedup-design.md`).
 No Phase-2 lever was committed until these numbers returned.
 
+> **CORRECTION (2026-06-04, post code-review).** The phase split, per-target
+> seconds, and dtype ratio below are all MEASURED and stand. But the *interpretation*
+> "102× redundant re-forward → collapse to 1, bit-identical" was WRONG. The dense
+> per-target loop is **true-sequential GPTQ**: after quantizing target *k* it writes
+> the quantized weight back (`weight_override` on the PagedLinear / `weight.data`
+> resident) so target *k+1*'s Hessian sees the **quantized upstream** — GPTQ
+> cross-layer error propagation (`calibrate_ml8_paged.py:1860`, `:2050`; the resume
+> logic trusts only a contiguous prefix *because* of this). So the 102 forwards are
+> NOT redundant (each sees a more-quantized model), and the wasted work is only the
+> *downstream-of-target* portion of each forward. Collapsing to one static pass
+> (`--hessian-mode single`) is **static-Hessian GPTQ**, a DIFFERENT algorithm —
+> equivalence is an empirical PPL question, not bit-identity. If PPL holds within
+> noise, we keep the ~100× win; if not, the exact fix is **block-sequential GPTQ**
+> (forward each layer once, propagate its quantized output forward — ~N× faster AND
+> bit-identical). The fp32 (1.07×) and NVMe (0.0 s) findings are unaffected.
+
 ---
 
 ## 1. Phase split (measured)

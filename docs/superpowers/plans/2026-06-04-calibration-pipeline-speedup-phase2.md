@@ -4,7 +4,20 @@
 
 **Goal:** Collapse the dense calibration's N redundant full-corpus forwards (one per target linear) into a SINGLE forward that populates all target Hessians at once — taking a real 256k dense calibration from ~4h50m to the 1–2 h band (measured projection: ~10 min), with a bit-identical equivalence gate.
 
-**Architecture:** The faithful-acts path already installs a persistent `FaithfulActHook` pre-hook on every target (`calibrate_ml8_paged.py:1833–1841`); each hook ALWAYS transforms activations when `enabled`, and its `_is_target` flag only gates whether it also accumulates `H += a_qᵀa_q`. Today the per-target loop calls `compute_hessian` once per target (N full forwards). We add a single-pass collector that resets + targets ALL hooks, runs ONE forward over the corpus, then reads each hook's `.H`. Because every hook sees the identical all-transforms-active deterministic forward in both paths, the Hessians are bit-identical (not merely noise-equivalent). The old per-target path stays behind `--hessian-mode per-target` as the equivalence reference.
+**Architecture:** The faithful-acts path already installs a persistent `FaithfulActHook` pre-hook on every target (`calibrate_ml8_paged.py:1833–1841`); each hook ALWAYS transforms activations when `enabled`, and its `_is_target` flag only gates whether it also accumulates `H += a_qᵀa_q`. Today the per-target loop calls `compute_hessian` once per target (N full forwards). We add a single-pass collector that resets + targets ALL hooks, runs ONE forward over the corpus, then reads each hook's `.H`. The old per-target path stays behind `--hessian-mode per-target` as the reference.
+
+> **CORRECTION (2026-06-04, post code-review) — read before implementing.** The
+> per-target path is **true-sequential GPTQ**: after quantizing target *k* it writes
+> the quantized weight back (`weight_override` / `weight.data`) so target *k+1*'s H
+> sees the **quantized upstream** (cross-layer error propagation; `:1860`, `:2050`).
+> The single-pass collector builds every H against the **original** model — that's
+> **static-Hessian GPTQ**, a DIFFERENT algorithm, **NOT bit-identical**. So the
+> equivalence gate is **PPL-within-noise (empirical), not byte-diff.** Task 1's toy
+> test proves only the collector's mechanics on independent layers (no propagation),
+> not production equivalence. If Task 4's PPL holds within noise of 19.5470/12.2391,
+> static single-pass wins (~100×). If it degrades, the exact fallback is
+> **block-sequential GPTQ** (forward each layer once, propagate its quantized output
+> forward — ~N× faster AND bit-identical), planned separately.
 
 **Tech Stack:** Python 3, PyTorch (ROCm), pytest, the `calibrate_ml8_paged.py --strategy dense --faithful-acts` pipeline on the R9700 (gfx1201).
 

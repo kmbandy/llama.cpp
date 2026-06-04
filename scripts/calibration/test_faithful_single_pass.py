@@ -1,7 +1,12 @@
 # scripts/calibration/test_faithful_single_pass.py
-"""Single-pass dense Hessian collection must be BIT-IDENTICAL to the per-target
-sequential approach, because every FaithfulActHook sees the same all-transforms-
-active deterministic forward in both. Toy-model proof (CPU, fast)."""
+"""Single-pass dense Hessian collection on INDEPENDENT layers is bit-identical to
+collecting one target at a time — this proves the collector's mechanics (reset +
+target-all + one forward + read each .H), nothing more.
+
+CAVEAT: this toy has NO cross-layer weight write-back, so it does NOT model the
+real dense pipeline, which is true-sequential (each target's H sees quantized
+upstream via weight_override). Single-pass is STATIC-Hessian GPTQ; its equivalence
+to the production path is an empirical PPL question, NOT proven here."""
 import sys
 from pathlib import Path
 
