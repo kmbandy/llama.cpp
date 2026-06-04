@@ -111,6 +111,7 @@ from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (
 from role_targets import classify_role, Tier, assert_main_stack_covered, configure as configure_roles  # noqa: E402  (--dense-coverage full tier routing)
 from faithful_forward import FaithfulActHook, assert_not_double_rotated, fp8_weight_override  # noqa: E402  (W4A8 faithful tiers)
 from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (FP8 tier, fixed group_size=32)
+from calib_timing import PhaseTimer  # noqa: E402  (MAD-256 Phase-1 instrumentation)
 
 # Pybind11 weight pager (in repo's python_bindings/wp/). The .so is compiled for
 # a specific GPU arch (gfx1201/gfx1030 locally) and links libllama/ggml-hip, so
@@ -1024,6 +1025,14 @@ def main():
                         "instantiate, load resident from GGUF directly, page "
                         "consolidated MoE experts. Use 'moe' for any model that "
                         "doesn't fit in host RAM (e.g. Qwen3.6 35B-A3B).")
+    p.add_argument("--phase-timing", action="store_true",
+                   help="Phase-1 instrumentation: accumulate wall time per phase "
+                        "(corpus/hessian_forward/gptq_quantize) and write "
+                        "phase_timing.json into --output-dir. No effect on results.")
+    p.add_argument("--forward-dtype-probe", type=int, default=0, metavar="K",
+                   help="Phase-1: before the main loop, time K calib samples through "
+                        "model() with allow_tf32 False (current/deterministic) vs True, "
+                        "to isolate the fp32-vs-WMMA matmul tax. 0 = off.")
     p.add_argument("--arch", default=None,
                    help="(--strategy moe only) MODEL_ARCH name for TensorNameMap "
                         "(e.g. 'qwen3moe'). If omitted, derived from the config "
@@ -1059,6 +1068,7 @@ def main():
                         "stays correct) and resume at the first gap, (d) reuse prior "
                         "manifest results. --no-resume forces a clean run from scratch.")
     args = p.parse_args()
+    TIMER = PhaseTimer()  # accumulates only when --phase-timing; cheap regardless
 
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
@@ -1291,9 +1301,10 @@ def main():
     # ─── Calibration corpus + baseline PPL (paged forward proves the swap works) ───
     print(f"[calib] loading {'budget ' + str(args.token_budget) + ' tok' if args.token_budget else str(args.n_samples) + ' samples'} "
           f"seq_len={args.seq_len} corpus={args.corpus}")
-    calib = collect_calibration(tokenizer, n_samples=args.n_samples,
-                                 seq_len=args.seq_len, composition=args.corpus,
-                                 seed=args.corpus_seed, token_budget=args.token_budget)
+    with TIMER.phase("corpus_load"):
+        calib = collect_calibration(tokenizer, n_samples=args.n_samples,
+                                     seq_len=args.seq_len, composition=args.corpus,
+                                     seed=args.corpus_seed, token_budget=args.token_budget)
     print(f"[calib] got {len(calib)} samples (tokens ≈ {sum(c.numel() for c in calib)})")
 
     # Tier-tagged enumeration. For the DENSE strategy with --dense-coverage full
@@ -1851,6 +1862,7 @@ def main():
         W_orig_snapshot = layer.weight.detach().clone()
 
         collect_awq = args.awq != "none"
+        _t_hess0 = time.time()
         if args.faithful_acts:
             # compute_hessian still drives the forward over calib (with the
             # persistent FaithfulActHooks active); the target hook accumulates H
@@ -1858,13 +1870,20 @@ def main():
             # x_eff) is discarded — we use the hook's H instead.
             hk_i, _frot_i = faithful_hooks[i]
             hk_i.reset_hessian(); hk_i.set_hessian_target(True)
-            _H_discard, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
-                                                         collect_awq=collect_awq)
+            with TIMER.phase("hessian_forward"):
+                _H_discard, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
+                                                             collect_awq=collect_awq)
             hk_i.set_hessian_target(False)
             H = hk_i.H
         else:
-            H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
-                                                collect_awq=collect_awq)
+            with TIMER.phase("hessian_forward"):
+                H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
+                                                    collect_awq=collect_awq)
+        if args.phase_timing:
+            TIMER._events.append({
+                "label": "hessian_forward_target", "target": name,
+                "n_tok": int(n_tok), "seconds": time.time() - _t_hess0,
+                "shape": [int(rows), int(in_feat)]})
         t_hess = time.time() - t0
         print(f"  hessian: {H.shape}  n_tok={n_tok}  t={t_hess:.1f}s")
 
@@ -1922,18 +1941,19 @@ def main():
             # (bit-free). weight_override is already rotated/AWQ'd; H matches it.
             Wr = layer.weight_override.float().to(args.device).unsqueeze(0)   # [1, N, K]
             Hr = H.to(args.device).unsqueeze(0)                              # [1, K, K]
-            out = batched_gptq_quantize(
-                W_stack=Wr, H_stack=Hr,
-                n_centroids=args.n_centroids, group_size=gs_for_kind,
-                n_iter=args.n_iter, fit_loss=args.fit_loss,
-                mag_weight_p=args.mag_weight_p,
-                snap_centroids=args.snap_centroids,
-                percdamp=effective_percdamp,
-                act_order=args.act_order or args.heavy_rounds > 0,
-                heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
-                heavy_dtype=args.heavy_dtype,
-                heavy_lr_cent=args.heavy_lr_cent,
-                heavy_lr_scale=args.heavy_lr_scale)
+            with TIMER.phase("gptq_quantize", target=name):
+                out = batched_gptq_quantize(
+                    W_stack=Wr, H_stack=Hr,
+                    n_centroids=args.n_centroids, group_size=gs_for_kind,
+                    n_iter=args.n_iter, fit_loss=args.fit_loss,
+                    mag_weight_p=args.mag_weight_p,
+                    snap_centroids=args.snap_centroids,
+                    percdamp=effective_percdamp,
+                    act_order=args.act_order or args.heavy_rounds > 0,
+                    heavy_rounds=args.heavy_rounds, heavy_steps=args.heavy_steps,
+                    heavy_dtype=args.heavy_dtype,
+                    heavy_lr_cent=args.heavy_lr_cent,
+                    heavy_lr_scale=args.heavy_lr_scale)
             layer.weight_override = out["Q"][0].to(dtype)   # dequantized rotated/AWQ'd weight
             export = {
                 "indices":             out["indices"][0].clone().contiguous(),
@@ -2019,6 +2039,19 @@ def main():
         del H
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
+
+    if args.phase_timing:
+        _pt_path = Path(args.output_dir) / "phase_timing.json"
+        TIMER.dump_json(_pt_path)
+        _s = TIMER.summary()
+        print("\n=== [phase-timing] aggregate ===")
+        for _lbl, _d in sorted(_s["phases"].items(),
+                               key=lambda kv: -kv[1]["seconds"]):
+            print(f"  {_lbl:18s} {_d['seconds']:9.1f}s  "
+                  f"({100*_d['seconds']/max(_s['total_seconds'],1e-9):5.1f}%)  "
+                  f"calls={_d['calls']}")
+        print(f"  {'TOTAL':18s} {_s['total_seconds']:9.1f}s")
+        print(f"[phase-timing] wrote {_pt_path}")
 
     # ─── ML8-4 embedding pass (data-free) ──────────────────────────────────
     # token_embd at ml8-4 (via ML8_TIER_OVERRIDE=token_embd=ml8): an embedding is a
