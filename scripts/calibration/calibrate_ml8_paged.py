@@ -1906,6 +1906,15 @@ def main():
         if not args.faithful_acts or args.awq != "none":
             raise SystemExit("[hessian-mode] 'single' requires --faithful-acts and "
                              "--awq none; use --hessian-mode per-target otherwise.")
+        if resume_start > 0:
+            # Single-pass precollects ALL Hessians against the original model in one
+            # forward; a resumed prefix would be loaded as quantized, so the single
+            # forward would see a quantized-prefix/original-suffix mix that matches
+            # neither a fresh run nor the per-target path. Disallow rather than
+            # silently produce incoherent Hessians.
+            raise SystemExit(f"[hessian-mode] 'single' is incompatible with resume "
+                             f"(found {resume_start} completed targets); rerun with "
+                             f"--no-resume, or use --hessian-mode per-target.")
         print(f"\n[hessian-single] collecting H for all {len(targets)} targets in ONE "
               f"forward pass over {len(calib)} samples...")
         _t_sp = time.time()
