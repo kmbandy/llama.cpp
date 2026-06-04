@@ -92,3 +92,21 @@ def collect_hessians_single_pass(hooks_by_index, calib, model, device):
     for hk in hooks_by_index.values():
         hk.set_hessian_target(False)
     return {i: (hk.H, hk.n_tokens) for i, hk in hooks_by_index.items()}
+
+@torch.no_grad()
+def collect_block_hessians(block, hooks_by_name, inps, run_block):
+    """Accumulate each target linear's Hessian over one block's cached inputs.
+
+    hooks_by_name: {target_name: FaithfulActHook} for THIS block's ML8 targets.
+    inps:          list of (args_tuple, kwargs_dict) cached for this block.
+    run_block:     adapter callable (block, args, kwargs) -> (output, next_kwargs);
+                   the installed FaithfulActHook pre-hooks fire during it.
+    Returns {target_name: (H, n_tokens)}.
+    """
+    for hk in hooks_by_name.values():
+        hk.reset_hessian(); hk.set_hessian_target(True)
+    for args, kwargs in inps:
+        run_block(block, args, kwargs)
+    for hk in hooks_by_name.values():
+        hk.set_hessian_target(False)
+    return {nm: (hk.H, hk.n_tokens) for nm, hk in hooks_by_name.items()}
