@@ -28,3 +28,19 @@ def test_collect_block_hessians_accumulates_per_target():
     H, n = Hs["lin"]
     assert n == 12 and H.shape == (k, k)
     assert torch.allclose(H, H.t())  # XtX symmetric
+
+from block_arch_adapter import DefaultBlockAdapter, get_adapter
+
+def test_default_adapter_run_block_tuple_and_dict():
+    import torch
+    blk = torch.nn.TransformerEncoderLayer(d_model=16, nhead=2, batch_first=True)
+    ad = DefaultBlockAdapter()
+    x = torch.randn(2, 4, 16)
+    out, nkw = ad.run_block(blk, (x,), {})
+    assert isinstance(out, torch.Tensor) and out.shape == x.shape
+    assert isinstance(nkw, dict)
+
+def test_get_adapter_returns_qwen35_for_qwen35():
+    from block_arch_adapter import Qwen35BlockAdapter
+    assert isinstance(get_adapter("qwen35"), Qwen35BlockAdapter)
+    assert isinstance(get_adapter("some-unknown-arch"), DefaultBlockAdapter)
