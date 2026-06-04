@@ -109,7 +109,7 @@ from calib_corpus import collect_calibration  # noqa: E402  (content sweep: name
 from fla_compat import apply_fla_arch_shim  # noqa: E402  (RDNA fla bf16 fdot2 fp32 workaround)
 from ml8_io import load_ml8_layer, reconstruct_weight_from_blob  # noqa: E402  (dense resume)
 from role_targets import classify_role, Tier, assert_main_stack_covered, configure as configure_roles  # noqa: E402  (--dense-coverage full tier routing)
-from faithful_forward import FaithfulActHook, assert_not_double_rotated, fp8_weight_override  # noqa: E402  (W4A8 faithful tiers)
+from faithful_forward import FaithfulActHook, assert_not_double_rotated, fp8_weight_override, collect_hessians_single_pass  # noqa: E402  (W4A8 faithful tiers)
 from scaled_fp8 import quantize_scaled_fp8  # noqa: E402  (FP8 tier, fixed group_size=32)
 from calib_timing import PhaseTimer  # noqa: E402  (MAD-256 Phase-1 instrumentation)
 
@@ -1033,6 +1033,11 @@ def main():
                    help="Phase-1: before the main loop, time K calib samples through "
                         "model() with allow_tf32 False (current/deterministic) vs True, "
                         "to isolate the fp32-vs-WMMA matmul tax. 0 = off.")
+    p.add_argument("--hessian-mode", choices=("single", "per-target"), default="single",
+                   help="Dense Hessian collection. 'single' (default): ONE forward "
+                        "populates all target Hessians (requires --faithful-acts and "
+                        "--awq none); ~Nx faster, bit-identical. 'per-target': legacy "
+                        "one-forward-per-target reference path.")
     p.add_argument("--arch", default=None,
                    help="(--strategy moe only) MODEL_ARCH name for TensorNameMap "
                         "(e.g. 'qwen3moe'). If omitted, derived from the config "
@@ -1892,6 +1897,21 @@ def main():
             faithful_hooks[j] = (hk, frot)
         print(f"[faithful-acts] installed {len(faithful_hooks)} activation-e4m3 pre-hooks")
 
+    _precollected_H = None
+    if args.hessian_mode == "single":
+        if not args.faithful_acts or args.awq != "none":
+            raise SystemExit("[hessian-mode] 'single' requires --faithful-acts and "
+                             "--awq none; use --hessian-mode per-target otherwise.")
+        print(f"\n[hessian-single] collecting H for all {len(targets)} targets in ONE "
+              f"forward pass over {len(calib)} samples...")
+        _t_sp = time.time()
+        with TIMER.phase("hessian_forward"):
+            _precollected_H = collect_hessians_single_pass(
+                {i: faithful_hooks[i][0] for i in range(len(targets))},
+                calib, model, args.device)
+        print(f"[hessian-single] done in {time.time()-_t_sp:.1f}s "
+              f"({len(_precollected_H)} Hessians, 1 forward)")
+
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
     for i, (name, layer) in enumerate(targets):
         if i < resume_start:
@@ -1904,22 +1924,21 @@ def main():
 
         collect_awq = args.awq != "none"
         _t_hess0 = time.time()
-        if args.faithful_acts:
-            # compute_hessian still drives the forward over calib (with the
-            # persistent FaithfulActHooks active); the target hook accumulates H
-            # in rotated+quant space. compute_hessian's own returned H (built on
-            # x_eff) is discarded — we use the hook's H instead.
+        if args.hessian_mode == "single":
+            H, n_tok = _precollected_H[i]
+            sum_abs = None
+        elif args.faithful_acts:
             hk_i, _frot_i = faithful_hooks[i]
             hk_i.reset_hessian(); hk_i.set_hessian_target(True)
             with TIMER.phase("hessian_forward"):
-                _H_discard, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
-                                                             collect_awq=collect_awq)
+                _H_discard, n_tok, sum_abs = compute_hessian(
+                    layer, calib, model, args.device, collect_awq=collect_awq)
             hk_i.set_hessian_target(False)
             H = hk_i.H
         else:
             with TIMER.phase("hessian_forward"):
-                H, n_tok, sum_abs = compute_hessian(layer, calib, model, args.device,
-                                                    collect_awq=collect_awq)
+                H, n_tok, sum_abs = compute_hessian(
+                    layer, calib, model, args.device, collect_awq=collect_awq)
         if args.phase_timing:
             TIMER._events.append({
                 "label": "hessian_forward_target", "target": name,
