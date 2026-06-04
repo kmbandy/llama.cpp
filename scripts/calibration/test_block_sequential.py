@@ -44,3 +44,24 @@ def test_get_adapter_returns_qwen35_for_qwen35():
     from block_arch_adapter import Qwen35BlockAdapter
     assert isinstance(get_adapter("qwen35"), Qwen35BlockAdapter)
     assert isinstance(get_adapter("some-unknown-arch"), DefaultBlockAdapter)
+
+def test_capture_block_inputs_grabs_args_and_aborts():
+    import torch
+    from block_sequential import capture_block_inputs
+    captured = {"n_downstream": 0}
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.b0 = torch.nn.Linear(4, 4)
+            self.b1 = torch.nn.Linear(4, 4)
+        def forward(self, x):
+            h = self.b0(x)
+            captured["n_downstream"] += 1   # must NOT run after capture
+            return self.b1(h)
+    m = Tiny()
+    calib = [torch.randn(1, 4) for _ in range(3)]
+    inps = capture_block_inputs(m, m.b0, calib, device="cpu")
+    assert len(inps) == 3
+    args, kwargs = inps[0]
+    assert args[0].shape == (1, 4)
+    assert captured["n_downstream"] == 0   # sentinel aborted before downstream
