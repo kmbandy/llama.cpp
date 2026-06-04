@@ -111,6 +111,31 @@ subset; then full 256k reproduces **wiki 19.5470 / held-out 12.2391** in the
 
 ---
 
+## 6b. EMPIRICAL VERDICT (2026-06-04) — static single-pass: 62× faster, ~+0.1 PPL
+
+Ran the real 256k `--hessian-mode single` calibration + apples-to-apples PPL
+(498 MB artifact, same A3 tier, embed quantized — first attempt shipped embed at
+bf16 because `ML8_TIER_OVERRIDE` wasn't exported to the converter; that confounded
+run was discarded).
+
+| | static single-pass | baseline true-sequential | Δ |
+|---|---|---|---|
+| wiki PPL | 19.6793 ± 0.159 | 19.5470 | **+0.132 (~0.83σ)** |
+| held-out PPL | 12.3032 ± 0.081 | 12.2391 | **+0.064 (~0.79σ)** |
+| calib time | **279.6 s (4.7 min)** | 17,430 s (4h50m) | **62× faster** |
+| forward | 184.9 s, **1 pass** | (102 passes) | — |
+
+Each Δ is <1σ but BOTH worse → a small, probably-real regression. Cross-layer
+error propagation (true-sequential) was worth ~+0.1 wiki PPL. Static single-pass
+is **62× faster at a ~0.1 PPL cost** — a cheap lunch, not a free one.
+
+**Strategic wrinkle:** the **MoE path is ALREADY static** (`:1509–1553` collects
+all H in one forward, no cross-layer propagation). So the 35B-A3B *product* never
+had this dense-only edge — static single-pass is actually the more
+product-representative method for the dense bed. The exact-and-fast option is
+**block-sequential GPTQ** (forward each layer once, propagate its quantized output
+forward — recovers the ~0.1 PPL AND keeps ~N× speed).
+
 ## 7. Next action
 
 Re-enter `superpowers:writing-plans` for the **Phase-2 plan**: the single-pass
