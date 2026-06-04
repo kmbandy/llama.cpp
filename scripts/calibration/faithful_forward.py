@@ -66,3 +66,25 @@ def fp8_weight_override(w, group_size: int = 32):
     dequantized fp32 weight to install as a forward-time override."""
     from scaled_fp8 import quantize_scaled_fp8, dequantize_scaled_fp8
     return dequantize_scaled_fp8(quantize_scaled_fp8(w.float(), group_size=group_size)).to(w.dtype)
+
+@torch.no_grad()
+def collect_hessians_single_pass(hooks_by_index, calib, model, device):
+    """Collect every target's faithful Hessian in ONE forward pass.
+
+    `hooks_by_index`: {target_index: FaithfulActHook}. All hooks are already
+    installed as forward pre-hooks and `enabled` (they transform activations on
+    every forward regardless of target state). We reset + target ALL of them,
+    run one forward over `calib`, then untarget and return each hook's H.
+
+    Bit-identical to the per-target sequential path: in both, each hook
+    accumulates a_qᵀa_q over the same deterministic all-transforms-active forward,
+    over `calib` in the same order. Returns {index: (H, n_tokens)}.
+    """
+    for hk in hooks_by_index.values():
+        hk.reset_hessian()
+        hk.set_hessian_target(True)
+    for ids in calib:
+        model(ids.to(device))
+    for hk in hooks_by_index.values():
+        hk.set_hessian_target(False)
+    return {i: (hk.H, hk.n_tokens) for i, hk in hooks_by_index.items()}
