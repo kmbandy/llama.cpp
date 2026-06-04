@@ -1327,6 +1327,12 @@ def main():
                   f"({dt/K*1000:7.1f} ms/sample)")
             return dt
 
+        # Untimed warmup: absorb lazy CUDA init / cuBLAS handles / kernel
+        # autotune so the FIRST timed leg (fp32) isn't biased slow → clean ratio.
+        with torch.no_grad():
+            model(probe[0].to(args.device))
+        if args.device.startswith("cuda"):
+            torch.cuda.synchronize()
         _saved = (_bcuda.matmul.allow_tf32, _bcudnn.allow_tf32)
         _bcuda.matmul.allow_tf32 = False
         _bcudnn.allow_tf32 = False
