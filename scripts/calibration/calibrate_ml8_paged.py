@@ -1307,6 +1307,41 @@ def main():
                                      seed=args.corpus_seed, token_budget=args.token_budget)
     print(f"[calib] got {len(calib)} samples (tokens ≈ {sum(c.numel() for c in calib)})")
 
+    if args.forward_dtype_probe > 0:
+        import torch.backends.cuda as _bcuda
+        import torch.backends.cudnn as _bcudnn
+        K = min(args.forward_dtype_probe, len(calib))
+        probe = calib[:K]
+
+        def _time_forward(tag):
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            t0 = time.time()
+            with torch.no_grad():
+                for ids in probe:
+                    model(ids.to(args.device))
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            dt = time.time() - t0
+            print(f"[dtype-probe] {tag:18s} {dt:7.2f}s for {K} samples "
+                  f"({dt/K*1000:7.1f} ms/sample)")
+            return dt
+
+        _saved = (_bcuda.matmul.allow_tf32, _bcudnn.allow_tf32)
+        _bcuda.matmul.allow_tf32 = False
+        _bcudnn.allow_tf32 = False
+        dt_fp32 = _time_forward("allow_tf32=False")
+        _bcuda.matmul.allow_tf32 = True
+        _bcudnn.allow_tf32 = True
+        dt_tf32 = _time_forward("allow_tf32=True")
+        _bcuda.matmul.allow_tf32, _bcudnn.allow_tf32 = _saved
+        print(f"[dtype-probe] fp32/tf32 forward ratio = {dt_fp32/max(dt_tf32,1e-9):.2f}x "
+              f"(matmul-precision tax on this card)")
+        _pp = Path(args.output_dir); _pp.mkdir(parents=True, exist_ok=True)
+        (_pp / "dtype_probe.json").write_text(json.dumps(
+            {"k_samples": K, "fp32_s": dt_fp32, "tf32_s": dt_tf32,
+             "ratio": dt_fp32 / max(dt_tf32, 1e-9)}, indent=2))
+
     # Tier-tagged enumeration. For the DENSE strategy with --dense-coverage full
     # this appends attention/SSM ML8 linears + FP8-tier tensors after the FFN
     # linears (which always come first, in find_target_linears order). For
