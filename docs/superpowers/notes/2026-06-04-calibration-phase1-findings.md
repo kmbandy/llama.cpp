@@ -136,6 +136,48 @@ product-representative method for the dense bed. The exact-and-fast option is
 **block-sequential GPTQ** (forward each layer once, propagate its quantized output
 forward — recovers the ~0.1 PPL AND keeps ~N× speed).
 
+## 6c. BLOCK-SEQUENTIAL VERDICT (2026-06-04) — near-gold quality at ~18× speed
+
+Built `--hessian-mode block-sequential` (MAD-264): causal block-by-block true-sequential
+GPTQ via an AutoGPTQ-style catcher/replay walk, reusing the existing faithful e4m3+Kronecker
+hooks + `batched_gptq_quantize`, with a thin per-arch adapter (HF `run_block` reuse). Tasks 1–7
+committed on `calib-pipeline-speedup` (`b817cf8be..a7f9e3f31`). New files:
+`block_sequential.py` (catcher + `run_walk`), `block_arch_adapter.py` (default HF + qwen35),
+`collect_block_hessians` (in `faithful_forward.py`), `quantize_one_target` extraction +
+`--hessian-mode block-sequential` branch (in `calibrate_ml8_paged.py`), `apply_fla_cpu_fallback`
+(in `fla_compat.py`). Validated: refactor **bit-identity** gate (4/4 blobs), cross-block
+**propagation** unit test, **SSM-state `run_block` equivalence (rel=0.0**, both delta-net AND
+full-attention block kinds), CPU smoke, 256k GPU acceptance.
+
+256k acceptance (Qwen3.5-0.8B, mix corpus, 498MB, full wiki.test + held-out, single draw):
+
+| 256k | wiki | held-out | calib |
+|---|---|---|---|
+| block-seq pd0.01 | 19.6608 | 12.2349 | 940s (16m) |
+| block-seq pd0.05 | 19.6479 | 12.2699 | 923s |
+| per-target *gold*¹ | 19.5470 | 12.2391 | ~17430s (4h50m) |
+| static-single¹ | 19.6793 | 12.3032 | — |
+
+¹ prior runs, measurement caveat — clean matched static 256k mix was **deferred** (machine closing).
+
+**VERDICT:** block-seq 256k pd0.01 **matches/edges the per-target gold on held-out** (12.2349 vs
+12.2391) at **~18.5× the speed**, **beats static-single on both** metrics, trails the gold by
+~0.11 on wiki (within ~1σ). At 256k block-seq is **flat across percdamp** — the noisy 80k spread
+(pd0.05 = 19.94) was draw noise, normalizing to 19.65 at 256k. The **size-curve re-acceleration**
+is real (80k→256k dropped pd0.05 by 0.29) and the **speed multiple climbs** with budget
+(10× @ 80k → 18.5× @ 256k, as the forward outgrows the fixed embed/load cost — projects well for 1M).
+
+**CPU-calibration prerequisites discovered** (both now in the driver): (1) `apply_fla_cpu_fallback`
+— fla's Triton delta-net kernels can't dispatch to CPU tensors; (2) `--device cpu --resident`
+together — the paged loader hardcodes weights to `cuda:0`.
+
+**DEFERRED:** clean matched static 256k mix ×{0.01,0.05,0.10} + block-seq 256k pd0.10; the
+big-Hessian sweep (256k/512k/1M, now cheap — #168); the **#169 H-dependent lever re-test battery**
+(heavy-FT / percdamp / mag_weighted / act_order — all reopened by cheap big Hessians, since they
+were eliminated on the inadequate 21k Hessian); the **per-role mixed-precision seam** (block-seq's
+reason to exist beyond speed — the real UD-on-dense play). Still above UD on the 0.8B (UD ~18.50
+was 8-chunk vs our full-wiki — not a clean head-to-head; the 0.8B is UD's strongest regime).
+
 ## 7. Next action
 
 Re-enter `superpowers:writing-plans` for the **Phase-2 plan**: the single-pass
