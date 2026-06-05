@@ -65,3 +65,67 @@ def test_capture_block_inputs_grabs_args_and_aborts():
     args, kwargs = inps[0]
     assert args[0].shape == (1, 4)
     assert captured["n_downstream"] == 0   # sentinel aborted before downstream
+
+def _make_hook_factory():
+    """Returns a hook CLASS; run_walk calls hook_factory() to get a fresh instance.
+    Mimics the real FaithfulActHook contract used by collect_block_hessians +
+    run_walk (set_hessian_target/reset_hessian/.H/.n_tokens/install/remove/.rotation)."""
+    import torch
+    class _H:
+        def __init__(self):
+            self.H = None; self.n_tokens = 0; self._on = False
+            self._handle = None; self.rotation = None
+        def set_hessian_target(self, on): self._on = on
+        def reset_hessian(self): self.H = None; self.n_tokens = 0
+        def install(self, block, leaf):
+            mod = dict(block.named_modules())[leaf]
+            def pre(m, inp):
+                if self._on:
+                    x = inp[0].reshape(-1, inp[0].shape[-1]).float()
+                    XtX = x.t() @ x
+                    self.H = XtX if self.H is None else self.H + XtX
+                    self.n_tokens += x.shape[0]
+            self._handle = mod.register_forward_pre_hook(pre)
+        def remove(self):
+            if self._handle is not None:
+                self._handle.remove(); self._handle = None
+    return _H
+
+def test_walk_propagates_quantized_output_to_next_block():
+    import torch
+    from block_sequential import run_walk
+    from block_arch_adapter import SubGroup
+    k = 4
+    class Blk(torch.nn.Module):
+        def __init__(s): super().__init__(); s.lin = torch.nn.Linear(k, k, bias=False)
+        def forward(s, x, **kw): return s.lin(x)   # no residual: zeroing is observable
+    class M(torch.nn.Module):
+        def __init__(s):
+            super().__init__()
+            class Inner(torch.nn.Module):
+                def __init__(ss): super().__init__(); ss.layers = torch.nn.ModuleList([Blk(), Blk()])
+            s.model = Inner()
+        def forward(s, x):
+            h = x
+            for b in s.model.layers: h = b(h)
+            return h
+    torch.manual_seed(0)
+    m = M()
+    seen = {}
+    def fake_quantize(name, layer, idx, H, n_tok, sum_abs, rotation_hook):
+        seen[name] = H.clone()
+        with torch.no_grad(): layer.weight.zero_()   # "quantized" => zero weight
+    class Adapter:
+        def iter_blocks(s, model): return list(model.model.layers)
+        def run_block(s, b, args, kwargs): return b(*args, **kwargs), kwargs
+        def ml8_targets(s, b, i, is_ml8): return [SubGroup(names=["lin"])]
+    calib = [torch.randn(2, k) for _ in range(2)]
+    run_walk(m, Adapter(), calib, "cpu",
+             is_ml8=lambda n: True, quantize_fn=fake_quantize,
+             hook_factory=_make_hook_factory())
+    names = sorted(seen)   # ["model.layers.0.lin", "model.layers.1.lin"]
+    assert len(names) == 2
+    # Block 1's weight was zeroed during quantization, so block 2 received an
+    # all-zero input; its target Hessian must be all-zero. If propagation were
+    # missing (block 2 saw the ORIGINAL block-1 output) H would be nonzero.
+    assert torch.count_nonzero(seen[names[1]]) == 0, "block 2 did NOT see quantized upstream"
