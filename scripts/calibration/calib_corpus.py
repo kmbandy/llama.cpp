@@ -22,6 +22,8 @@ from pathlib import Path
 
 import torch
 
+import chat_format
+
 _RAW = "/mnt/hdd/corpus/raw"
 _EXISTING = f"{_RAW}/existing"
 
@@ -67,7 +69,16 @@ COMPOSITIONS: dict[str, dict[str, float]] = {
 _HOLDOUT = (f"{_EXISTING}/quant_so_eval_raw.jsonl", "text")
 
 
-def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100, token_target=None):
+def _chat_template_on(explicit=None):
+    """Chat-template rendering of calibration text. Default ON (the chat/agentic
+    target regime); set ML8_CHAT_TEMPLATE=0 for a raw-text comparison run."""
+    if explicit is not None:
+        return explicit
+    return os.environ.get("ML8_CHAT_TEMPLATE", "1") == "1"
+
+
+def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100,
+                  token_target=None, source=None, chat_fmt=False):
     """Draw tokenized [1, ≤seq_len] samples from a (possibly multi-GB) JSONL via random
     byte-offset seeking — seek to a random offset, skip the partial line, take the next full
     line. Memory-light. Stops at n samples; OR, when token_target is set, once the cumulative
@@ -95,8 +106,16 @@ def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100, t
                 continue
             if len(text) < min_chars:
                 continue
-            ids = tokenizer(text, return_tensors="pt", truncation=True,
-                            max_length=seq_len).input_ids
+            if chat_fmt:
+                # raw record → canonical messages → model chat template → ids
+                id_list = chat_format.render_ids(
+                    chat_format.parse_to_messages(text, source), tokenizer, seq_len)
+                if not id_list:
+                    continue
+                ids = torch.tensor([id_list], dtype=torch.long)
+            else:
+                ids = tokenizer(text, return_tensors="pt", truncation=True,
+                                max_length=seq_len).input_ids
             if ids.shape[1] < seq_len // 4:
                 continue
             out.append(ids); tok_total += ids.shape[1]
@@ -107,7 +126,8 @@ def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100, t
     return out
 
 
-def collect_mixed_calibration(tokenizer, n_samples, seq_len, composition, seed=0, token_budget=None):
+def collect_mixed_calibration(tokenizer, n_samples, seq_len, composition, seed=0,
+                              token_budget=None, chat_fmt=False):
     """Return list of [1, ≤seq_len] input_ids drawn from a named COMPOSITION by weight,
     shuffled. Mirrors collect_wikitext_calibration's return shape. When token_budget is set,
     allocation is by TOKEN share (each source drawn to weight·budget tokens) so the blend holds
@@ -125,7 +145,8 @@ def collect_mixed_calibration(tokenizer, n_samples, seq_len, composition, seed=0
         for src, w in spec.items():
             tgt = token_budget * w / total_w
             path, field = _SRC[src]
-            got = _sample_jsonl(path, n_samples, field, seq_len, tokenizer, rng, token_target=tgt)
+            got = _sample_jsonl(path, n_samples, field, seq_len, tokenizer, rng,
+                                token_target=tgt, source=src, chat_fmt=chat_fmt)
             ntok = sum(t.shape[1] for t in got)
             print(f"[calib-corpus] {composition}: {src} {len(got)} samples / {ntok} tok (tgt {tgt:.0f})")
             samples.extend(got)
@@ -140,7 +161,8 @@ def collect_mixed_calibration(tokenizer, n_samples, seq_len, composition, seed=0
             if cnt <= 0:
                 continue
             path, field = _SRC[src]
-            got = _sample_jsonl(path, cnt, field, seq_len, tokenizer, rng)
+            got = _sample_jsonl(path, cnt, field, seq_len, tokenizer, rng,
+                                source=src, chat_fmt=chat_fmt)
             print(f"[calib-corpus] {composition}: {src} {len(got)}/{cnt}")
             samples.extend(got)
 
@@ -157,14 +179,18 @@ def collect_mixed_calibration(tokenizer, n_samples, seq_len, composition, seed=0
     return samples
 
 
-def _cache_path(tokenizer, composition, n_samples, seq_len, seed, token_budget=None):
+def _cache_path(tokenizer, composition, n_samples, seq_len, seed, token_budget=None,
+                chat_fmt=False):
     """NVMe path for a (tokenizer, corpus, size, seq_len, seed) draw. The size key is the token
     budget when set (else the sample count), and the tokenizer identity is in the key so a
-    tokenizer swap can't silently reuse stale token ids."""
+    tokenizer swap can't silently reuse stale token ids. The chat-template flag is folded in
+    only when ON, so raw-text cache keys are unchanged and chat draws can't collide with them."""
     tok_id = str(getattr(tokenizer, "name_or_path", "tok"))
     size_key = f"b{token_budget}" if token_budget is not None else f"n{n_samples}"
-    h = hashlib.sha1(f"{tok_id}|{composition}|{size_key}|s{seq_len}|seed{seed}".encode()).hexdigest()[:12]
-    return os.path.join(_CACHE_DIR, f"{composition}_{size_key}_s{seq_len}_seed{seed}_{h}.pt")
+    fmt = "|fmtchat1" if chat_fmt else ""
+    h = hashlib.sha1(f"{tok_id}|{composition}|{size_key}|s{seq_len}|seed{seed}{fmt}".encode()).hexdigest()[:12]
+    tag = "_chat" if chat_fmt else ""
+    return os.path.join(_CACHE_DIR, f"{composition}_{size_key}_s{seq_len}_seed{seed}{tag}_{h}.pt")
 
 
 def _trim_to_budget(samples, token_budget):
@@ -208,14 +234,22 @@ def _cache_save(path, samples):
 
 
 def collect_calibration(tokenizer, n_samples, seq_len, composition="wiki", seed=0,
-                        use_cache=True, token_budget=None):
+                        use_cache=True, token_budget=None, chat_fmt=None):
     """Dispatch: 'wiki' → original wikitext-2 loader (control); else a mixed composition.
 
     When token_budget is set, every corpus is drawn to that many tokens (wiki trimmed, mixes
     drawn by token-share) — the token-matched control for the content sweep. Tokenized draws
-    are cached to NVMe (keyed by tokenizer/corpus/budget-or-n/seq_len/seed) so the HDD-bound
-    sampling runs once; set use_cache=False or ML8_CALIB_CACHE="" to bypass."""
-    cache_path = (_cache_path(tokenizer, composition, n_samples, seq_len, seed, token_budget)
+    are cached to NVMe (keyed by tokenizer/corpus/budget-or-n/seq_len/seed/format) so the
+    HDD-bound sampling runs once; set use_cache=False or ML8_CALIB_CACHE="" to bypass.
+
+    chat_fmt (default from ML8_CHAT_TEMPLATE, ON) renders each record through the model's chat
+    template instead of tokenizing raw — the chat/agentic deployment regime."""
+    chat_fmt = _chat_template_on(chat_fmt)
+    if chat_fmt and composition == "wiki":
+        print("[calib-corpus] WARN chat_fmt requested but composition='wiki' uses the raw "
+              "wikitext-2 loader (not templated); use a jsonl composition for chat format.")
+    cache_path = (_cache_path(tokenizer, composition, n_samples, seq_len, seed, token_budget,
+                              chat_fmt=chat_fmt)
                   if (use_cache and _CACHE_DIR) else None)
     if cache_path is not None:
         cached = _cache_load(cache_path)
@@ -234,7 +268,8 @@ def collect_calibration(tokenizer, n_samples, seq_len, composition="wiki", seed=
             samples = _trim_to_budget(samples, token_budget)
     else:
         samples = collect_mixed_calibration(tokenizer, n_samples, seq_len, composition,
-                                            seed=seed, token_budget=token_budget)
+                                            seed=seed, token_budget=token_budget,
+                                            chat_fmt=chat_fmt)
 
     if cache_path is not None and samples:
         _cache_save(cache_path, samples)
