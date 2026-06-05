@@ -1094,6 +1094,33 @@ def quantize_one_target(name, layer, target_index, H, n_tok, sum_abs,
     return  # side effects only: weight writeback + saved .pt + manifest append
 
 
+class _BlockHessianHook:
+    """Adapter that lets run_walk drive the ALREADY-INSTALLED, always-on
+    FaithfulActHook on an ml8 leaf. install() locates that hook (does NOT register
+    a new one — that would double-transform); remove() is a no-op (the shared hook
+    stays active so the faithful e4m3 transform applies during propagation too)."""
+    def __init__(self):
+        self._fa = None
+        self.rotation = None
+    def install(self, block, leaf):
+        mod = dict(block.named_modules())[leaf]
+        fa = next((h for h in mod._forward_pre_hooks.values()
+                   if isinstance(h, FaithfulActHook)), None)
+        if fa is None:
+            raise RuntimeError(f"block-sequential: no FaithfulActHook installed on '{leaf}' "
+                               f"(faithful-acts hooks must be installed before the walk)")
+        self._fa = fa
+        self.rotation = fa.rotation
+    def set_hessian_target(self, on): self._fa.set_hessian_target(on)
+    def reset_hessian(self): self._fa.reset_hessian()
+    @property
+    def H(self): return self._fa.H
+    @property
+    def n_tokens(self): return self._fa.n_tokens
+    def remove(self):
+        pass   # shared always-on hook; do not deregister
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen3.5-4B",
@@ -1198,7 +1225,7 @@ def main():
                    help="Phase-1: before the main loop, time K calib samples through "
                         "model() with allow_tf32 False (current/deterministic) vs True, "
                         "to isolate the fp32-vs-WMMA matmul tax. 0 = off.")
-    p.add_argument("--hessian-mode", choices=("single", "per-target"), default="single",
+    p.add_argument("--hessian-mode", choices=("single", "per-target", "block-sequential"), default="single",
                    help="Dense Hessian collection. 'single' (default): ONE forward "
                         "populates all target Hessians from the ORIGINAL model "
                         "(static-Hessian GPTQ; requires --faithful-acts and --awq "
@@ -2086,6 +2113,14 @@ def main():
             raise SystemExit(f"[hessian-mode] 'single' is incompatible with resume "
                              f"(found {resume_start} completed targets); rerun with "
                              f"--no-resume, or use --hessian-mode per-target.")
+
+    if args.hessian_mode == "block-sequential":
+        if not args.faithful_acts or args.awq != "none":
+            raise SystemExit("[hessian-mode] 'block-sequential' requires --faithful-acts and --awq none.")
+        if resume_start > 0:
+            raise SystemExit("[hessian-mode] 'block-sequential' is incompatible with resume; rerun with --no-resume.")
+
+    if args.hessian_mode == "single":
         print(f"\n[hessian-single] collecting H for all {len(targets)} targets in ONE "
               f"forward pass over {len(calib)} samples...")
         _t_sp = time.time()
@@ -2097,37 +2132,69 @@ def main():
               f"({len(_precollected_H)} Hessians, 1 forward)")
 
     # ─── Per-layer calibration loop (same math as calibrate_ml8.py) ───
-    for i, (name, layer) in enumerate(targets):
-        if i < resume_start:
-            continue
-        rows, in_feat = layer.weight.shape
-        print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
-        collect_awq = args.awq != "none"
-        _t_hess0 = time.time()
-        if args.hessian_mode == "single":
-            H, n_tok = _precollected_H[i]; sum_abs = None
-        elif args.faithful_acts:
-            hk_i, _frot_i = faithful_hooks[i]
-            hk_i.reset_hessian(); hk_i.set_hessian_target(True)
-            with TIMER.phase("hessian_forward"):
-                _H_discard, n_tok, sum_abs = compute_hessian(
-                    layer, calib, model, args.device, collect_awq=collect_awq)
-            hk_i.set_hessian_target(False); H = hk_i.H
-        else:
-            with TIMER.phase("hessian_forward"):
-                H, n_tok, sum_abs = compute_hessian(
-                    layer, calib, model, args.device, collect_awq=collect_awq)
-        if args.phase_timing:
-            TIMER._events.append({
-                "label": "hessian_forward_target", "target": name,
-                "n_tok": int(n_tok), "seconds": time.time() - _t_hess0,
-                "shape": [int(rows), int(in_feat)]})
-        rotation_hook = faithful_hooks[i][1] if args.faithful_acts else None
-        quantize_one_target(name, layer, i, H, n_tok, sum_abs, rotation_hook,
-                            args, dtype, manifest, Path(args.output_dir), TIMER)
-        del H
-        if args.device.startswith("cuda"):
-            torch.cuda.empty_cache()
+    if args.hessian_mode == "block-sequential":
+        from block_arch_adapter import get_adapter
+        from block_sequential import run_walk
+        adapter = get_adapter(args.arch)
+        ml8_full_names = {n for n, _ in targets}
+        # is_ml8 is called from adapter.ml8_targets(block, b_idx, is_ml8) with a
+        # leaf name (e.g. "linear_attn.in_proj_qkv"). We need the full name check
+        # ("model.layers.{b_idx}.{leaf}") so that blocks beyond --max-layers are
+        # excluded (they have no FaithfulActHook installed). Wrap the adapter so
+        # that ml8_targets injects a b_idx-aware is_ml8 before dispatching.
+        _base_adapter = adapter
+        class _ScopedAdapter:
+            def iter_blocks(self, model):
+                return _base_adapter.iter_blocks(model)
+            def run_block(self, block, args, kwargs):
+                return _base_adapter.run_block(block, args, kwargs)
+            def ml8_targets(self, block, b_idx, is_ml8_ignored):
+                prefix = f"model.layers.{b_idx}."
+                def _is_ml8_full(leaf):
+                    return (prefix + leaf) in ml8_full_names
+                return _base_adapter.ml8_targets(block, b_idx, _is_ml8_full)
+        adapter = _ScopedAdapter()
+        def quantize_fn(full_name, layer, idx, H, n_tok, sum_abs, rotation_hook):
+            quantize_one_target(full_name, layer, idx, H, n_tok, sum_abs, rotation_hook,
+                                args, dtype, manifest, Path(args.output_dir), TIMER)
+        with TIMER.phase("hessian_forward"):
+            n_done = run_walk(model, adapter, calib, args.device,
+                              is_ml8=lambda n: n in ml8_full_names,  # fallback; _ScopedAdapter overrides
+                              quantize_fn=quantize_fn,
+                              hook_factory=_BlockHessianHook)
+        print(f"[block-sequential] quantized {n_done} ml8 targets via causal walk")
+    else:
+        for i, (name, layer) in enumerate(targets):
+            if i < resume_start:
+                continue
+            rows, in_feat = layer.weight.shape
+            print(f"\n[{i+1}/{len(targets)}] {name}  shape=({rows}, {in_feat})")
+            collect_awq = args.awq != "none"
+            _t_hess0 = time.time()
+            if args.hessian_mode == "single":
+                H, n_tok = _precollected_H[i]; sum_abs = None
+            elif args.faithful_acts:
+                hk_i, _frot_i = faithful_hooks[i]
+                hk_i.reset_hessian(); hk_i.set_hessian_target(True)
+                with TIMER.phase("hessian_forward"):
+                    _H_discard, n_tok, sum_abs = compute_hessian(
+                        layer, calib, model, args.device, collect_awq=collect_awq)
+                hk_i.set_hessian_target(False); H = hk_i.H
+            else:
+                with TIMER.phase("hessian_forward"):
+                    H, n_tok, sum_abs = compute_hessian(
+                        layer, calib, model, args.device, collect_awq=collect_awq)
+            if args.phase_timing:
+                TIMER._events.append({
+                    "label": "hessian_forward_target", "target": name,
+                    "n_tok": int(n_tok), "seconds": time.time() - _t_hess0,
+                    "shape": [int(rows), int(in_feat)]})
+            rotation_hook = faithful_hooks[i][1] if args.faithful_acts else None
+            quantize_one_target(name, layer, i, H, n_tok, sum_abs, rotation_hook,
+                                args, dtype, manifest, Path(args.output_dir), TIMER)
+            del H
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
 
     if args.phase_timing:
         _pt_path = Path(args.output_dir) / "phase_timing.json"
