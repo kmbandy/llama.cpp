@@ -1,14 +1,19 @@
 """Render an eval corpus through the model's chat template for in-regime PPL (Set C).
 
-Two modes, mirroring how calibration treats the same content:
-  --mode chat : a [HUMAN]/[GPT] eval .txt → split into records → real role turns.
-  --mode doc  : a raw prose .txt (e.g. wiki.test.raw) → ~chunk-char user-turn docs.
+Three modes, mirroring how calibration treats the same content:
+  --mode chat     : a [HUMAN]/[GPT] eval .txt → split into records → real role turns.
+  --mode doc      : a raw prose .txt (e.g. wiki.test.raw) → ~chunk-char user-turn docs.
+  --mode messages : a messages-jsonl (one {"messages":[…]} per line, tool turns and
+                    all) → each record rendered through the template verbatim. This is
+                    the agentic held-out path: evaluate the deployment regime in the
+                    same envelope the agentic calibration draws were rendered in.
 
 Uses the SAME source content as the raw (Set A/B) evals, so the only difference vs
 those baselines is the chat-template envelope — keeping gap-to-UD apples-to-apples
 within a regime. Output is a plain .txt for `llama-perplexity -f`.
 """
 import argparse
+import json
 import re
 
 from transformers import AutoTokenizer
@@ -44,11 +49,30 @@ def render_doc(in_path, tokenizer, chunk_chars):
     return out
 
 
+def render_messages(in_path, tokenizer):
+    """Render a messages-jsonl (one {"messages":[…]} per line) through the template.
+
+    Each record's pre-built messages — tool_calls, role:"tool" results and all — go
+    straight to chat_format.render_text, the exact path the agentic calibration draws
+    take, so eval and calibration share one rendering. Records with no messages skip.
+    """
+    out = []
+    with open(in_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            msgs = json.loads(line).get("messages") or []
+            if msgs:
+                out.append(cf.render_text(msgs, tokenizer))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="in_path", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--mode", choices=["chat", "doc"], required=True)
+    ap.add_argument("--mode", choices=["chat", "doc", "messages"], required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--source", default="math_se",
                     help="conversational source name for chat mode (role mapping is identical)")
@@ -58,8 +82,12 @@ def main():
     a = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(a.tokenizer, trust_remote_code=True)
-    pieces = (render_chat(a.in_path, tok, a.source) if a.mode == "chat"
-              else render_doc(a.in_path, tok, a.chunk_chars))
+    if a.mode == "chat":
+        pieces = render_chat(a.in_path, tok, a.source)
+    elif a.mode == "messages":
+        pieces = render_messages(a.in_path, tok)
+    else:
+        pieces = render_doc(a.in_path, tok, a.chunk_chars)
 
     written = 0
     with open(a.out, "w", encoding="utf-8") as f:

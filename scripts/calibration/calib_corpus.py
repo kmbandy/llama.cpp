@@ -26,6 +26,10 @@ import chat_format
 
 _RAW = "/mnt/hdd/corpus/raw"
 _EXISTING = f"{_RAW}/existing"
+# Messages-jsonl sources (one {"messages":[…]} per line — tool turns and all), built
+# from real agentic transcripts by shared/build_claude_calibration.py + split disjoint
+# by split_messages_corpus.py. These carry pre-structured conversations, NOT raw text.
+_CALIB_SOURCES = "/home/kmbandy/models/calib_sources"
 
 # Pre-sample cache: tokenized draws are written here so the slow random-seek sampling over the
 # multi-GB corpus on the SPINNING HDD (/mnt/hdd = /dev/sda1, rotational) happens ONCE. Repeat
@@ -47,7 +51,15 @@ _SRC = {
     "arxiv":          (f"{_RAW}/arxiv/arxiv.jsonl", "text"),
     "wikipedia":      (f"{_RAW}/wikipedia/wikipedia.jsonl", "text"),
     "fineweb":        (f"{_RAW}/fineweb/fineweb.jsonl", "text"),
+    # real agentic transcripts — the deployment distribution. CALIB pool only (the
+    # held-out 60 live in claude_traces.heldout.jsonl, never sampled here → no leakage).
+    "claude_traces":  (f"{_CALIB_SOURCES}/claude_traces.calib.jsonl", "messages"),
 }
+
+# Sources whose jsonl records carry a pre-built `messages` list (rendered straight
+# through the model's chat template) rather than a raw `text` field. These ALWAYS
+# render via the template — there is no raw-text form of a tool-interleaved turn.
+MESSAGE_SOURCES = frozenset({"claude_traces"})
 
 # Named compositions → {source: relative weight}. "wiki" is special-cased to the
 # original wikitext-2 loader (the control). Weights are relative; per-source sample
@@ -62,6 +74,21 @@ COMPOSITIONS: dict[str, dict[str, float]] = {
     "code": {"stackoverflow": 0.7, "softwareeng_se": 0.3},
     "math": {"math_se": 0.5, "stats_se": 0.3, "quant_so": 0.2},
     "chat": {"rpg_se": 0.5, "softwareeng_se": 0.25, "tool_calls": 0.25},
+    # Agentic dose-response sweep (MAD-264): keep `mix`'s doc/code/math breadth, but
+    # REPLACE its weak synthetic 1% tool_calls slice with REAL agentic transcripts
+    # (claude_traces) at a rising token share. The non-trace weights are mix's, so the
+    # only moving variable is the agentic dose. claude_traces weight w solves
+    # w/(0.94+w)=share: 0.166→15%, 0.506→35% (the rest of mix sums to 0.94).
+    "agentic15": {
+        "wikipedia": 0.27, "fineweb": 0.03, "stackoverflow": 0.24, "softwareeng_se": 0.04,
+        "arxiv": 0.18, "math_se": 0.07, "stats_se": 0.03, "quant_so": 0.02,
+        "rpg_se": 0.06, "claude_traces": 0.166,
+    },
+    "agentic35": {
+        "wikipedia": 0.27, "fineweb": 0.03, "stackoverflow": 0.24, "softwareeng_se": 0.04,
+        "arxiv": 0.18, "math_se": 0.07, "stats_se": 0.03, "quant_so": 0.02,
+        "rpg_se": 0.06, "claude_traces": 0.506,
+    },
 }
 
 # Held-out eval (mad160 marks it never-train) — used to detect calibration over-fit /
@@ -85,6 +112,7 @@ def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100,
     token count reaches token_target (n then only bounds the attempt budget)."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"calibration source missing: {path}")
+    is_msgs = source in MESSAGE_SOURCES
     size = os.path.getsize(path)
     out, tok_total, attempts = [], 0, 0
     cap = max((10000 if token_target is not None else n) * 60, 200)
@@ -101,21 +129,33 @@ def _sample_jsonl(path, n, text_field, seq_len, tokenizer, rng, min_chars=100,
             if not line:                      # landed near EOF — wrap to start
                 f.seek(0); line = f.readline()
             try:
-                text = json.loads(line).get(text_field) or ""
+                rec = json.loads(line)
             except Exception:
                 continue
-            if len(text) < min_chars:
-                continue
-            if chat_fmt:
-                # raw record → canonical messages → model chat template → ids
-                id_list = chat_format.render_ids(
-                    chat_format.parse_to_messages(text, source), tokenizer, seq_len)
+            if is_msgs:
+                # pre-built conversation → straight through the chat template (no
+                # text re-parse). min_chars floors on total message content length.
+                msgs = rec.get(text_field) or []
+                if sum(len(str(m.get("content", ""))) for m in msgs) < min_chars:
+                    continue
+                id_list = chat_format.render_ids(msgs, tokenizer, seq_len)
                 if not id_list:
                     continue
                 ids = torch.tensor([id_list], dtype=torch.long)
             else:
-                ids = tokenizer(text, return_tensors="pt", truncation=True,
-                                max_length=seq_len).input_ids
+                text = rec.get(text_field) or ""
+                if len(text) < min_chars:
+                    continue
+                if chat_fmt:
+                    # raw record → canonical messages → model chat template → ids
+                    id_list = chat_format.render_ids(
+                        chat_format.parse_to_messages(text, source), tokenizer, seq_len)
+                    if not id_list:
+                        continue
+                    ids = torch.tensor([id_list], dtype=torch.long)
+                else:
+                    ids = tokenizer(text, return_tensors="pt", truncation=True,
+                                    max_length=seq_len).input_ids
             if ids.shape[1] < seq_len // 4:
                 continue
             out.append(ids); tok_total += ids.shape[1]
