@@ -1,0 +1,68 @@
+[load-hf] strategy=moe  Qwen/Qwen3.6-35B-A3B  dtype=torch.bfloat16  device=cuda:0
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+[meta-init] arch=qwen35moe  n_blocks=40  n_experts=256
+[pager] iter 5b — building catalog from /home/kmbandy/models/Qwen3.6-35B-A3B-bf16.gguf  slots=8  n_experts=256
+[pager-5b] moe_consolidated=123 shared_expert=123 dense_mlp=0 skipped(resident-bound)=630  max_slot=536.9 MB  pool=4.29 GB
+ggml_cuda_init: found 2 ROCm devices (Total VRAM: 48992 MiB):
+  Device 0: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 1: AMD Radeon RX 6900 XT, gfx1030 (0x1030), VMM: no, Wave Size: 32, VRAM: 16368 MiB
+wp::PoolAllocator: allocated 8 slots x 536870912 B (4096.0 MiB)
+wp::GpuTransport: device 0, stream + 6 events ready
+wp::create_file_io: SyncPread (fds=1)
+wp::PrefetchScheduler: queue_depth=4, max_page_size=536870912 (512.0 MiB pinned per slot)
+wp::WeightPager: 123 pages, 8 slots x 536870912 B (4096.0 MiB), prefetch_depth=4, sync_staging_pinned=1
+[pager] catalog: 123 entries  max_page=536.9 MB
+[swap] replaced 40 consolidated MoE expert blocks → PagedMoeExperts
+[meta-empty] materializing 2.45B resident params on cuda:0
+[resident-load] loaded=613  skipped_expert=0  no_mapping=0  missing_in_gguf=0
+[calib] loading 32 samples seq_len=1024
+[calib] got 32 samples (tokens ≈ 10326)
+[targets] 120 linears to quantize
+[moe-loop] 40 PagedMoeExperts blocks queued
+[capture] hooked routers on layers [0, 20]; forward over 32 samples...
+[DIAG] page_in_sync_[0]: ENTER page=0 name=blk.0.ffn_gate_exps.weight file_idx=0 offset=1095218400 size=536870912
+[DIAG] page_in_sync_[0]: alloc_slot ok, slot=0 dst=0x7f0603600000
+[DIAG] page_in_sync_[0]: submit returned ok=1
+[DIAG] page_in_sync_[0]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[0]: stage1 done ok=1
+[DIAG] page_in_sync_[0]: stage_in returned evt=5
+[DIAG] page_in_sync_[0]: EXIT slot=0
+[DIAG] page_in_sync_[1]: ENTER page=1 name=blk.0.ffn_up_exps.weight file_idx=0 offset=1632089312 size=536870912
+[DIAG] page_in_sync_[1]: alloc_slot ok, slot=1 dst=0x7f0623600000
+[DIAG] page_in_sync_[1]: submit returned ok=1
+[DIAG] page_in_sync_[1]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[1]: stage1 done ok=1
+[DIAG] page_in_sync_[1]: stage_in returned evt=5
+[DIAG] page_in_sync_[1]: EXIT slot=1
+[DIAG] page_in_sync_[2]: ENTER page=5 name=blk.0.ffn_down_exps.weight file_idx=0 offset=3847084000 size=536870912
+[DIAG] page_in_sync_[2]: alloc_slot ok, slot=2 dst=0x7f0643600000
+[DIAG] page_in_sync_[2]: submit returned ok=1
+[DIAG] page_in_sync_[2]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[2]: stage1 done ok=1
+[DIAG] page_in_sync_[2]: stage_in returned evt=5
+[DIAG] page_in_sync_[2]: EXIT slot=2
+[DIAG] page_in_sync_[3]: ENTER page=3 name=blk.1.ffn_gate_exps.weight file_idx=0 offset=2772940000 size=536870912
+[DIAG] page_in_sync_[3]: alloc_slot ok, slot=3 dst=0x7f0663600000
+[DIAG] page_in_sync_[3]: submit returned ok=1
+[DIAG] page_in_sync_[3]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[3]: stage1 done ok=1
+[DIAG] page_in_sync_[3]: stage_in returned evt=5
+[DIAG] page_in_sync_[3]: EXIT slot=3
+[DIAG] page_in_sync_[4]: ENTER page=4 name=blk.1.ffn_up_exps.weight file_idx=0 offset=3309810912 size=536870912
+[DIAG] page_in_sync_[4]: alloc_slot ok, slot=4 dst=0x7f0683600000
+[DIAG] page_in_sync_[4]: submit returned ok=1
+[DIAG] page_in_sync_[4]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[4]: stage1 done ok=1
+[DIAG] page_in_sync_[4]: stage_in returned evt=5
+[DIAG] page_in_sync_[4]: EXIT slot=4
+  [capture] 4/32  elapsed=245.0s
+  [capture] 8/32  elapsed=494.8s
+  [capture] 12/32  elapsed=740.4s
+  [capture] 16/32  elapsed=973.8s
+  [capture] 20/32  elapsed=1215.3s
+  [capture] 24/32  elapsed=1457.4s
+  [capture] 28/32  elapsed=1700.8s
+  [capture] 32/32  elapsed=1938.2s
+  [capture] L0: x=(10326, 2048) logits=(10326, 256)
+  [capture] L20: x=(10326, 2048) logits=(10326, 256)
+[capture] saved → /home/kmbandy/models/route-capture-L0-L20.pt

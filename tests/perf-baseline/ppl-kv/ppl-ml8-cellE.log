@@ -1,0 +1,33 @@
+0.00.052.161 I common_init_result: fitting params to device memory ...
+0.00.052.163 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.374.442 W [load_loop] ctx[0] tensors=96 any_buf=0x55858add10b0 host=1 buft=CPU
+0.01.374.447 W [load_loop]   ctx[0] tensor=0x55858aebf9a0 name=blk.0.ffn_gate.rotation_meta data=0x55858af0dfc0 buf=0x55858add10b0
+0.01.374.447 W [load_loop]   ctx[0] tensor=0x55858aebfb10 name=blk.0.ffn_up.rotation_meta data=0x55858af0dfe0 buf=0x55858add10b0
+0.01.374.447 W [load_loop]   ctx[0] tensor=0x55858aebfc80 name=blk.0.ffn_down.rotation_meta data=0x55858af0e000 buf=0x55858add10b0
+0.01.374.448 W [load_loop]   ctx[0] tensor=0x55858aebfdf0 name=blk.1.ffn_gate.rotation_meta data=0x55858af0e020 buf=0x55858add10b0
+0.01.374.448 W [load_loop]   ctx[0] tensor=0x55858aebff60 name=blk.1.ffn_up.rotation_meta data=0x55858af0e040 buf=0x55858add10b0
+0.01.381.581 W [load_loop] ctx[1] tensors=633 any_buf=0x55858af0ee50 host=0 buft=ROCm0
+0.01.381.584 W [load_loop]   ctx[1] tensor=0x55858ae780e0 name=output_norm.weight data=0x7f2575600000 buf=0x55858af0ee50
+0.01.381.584 W [load_loop]   ctx[1] tensor=0x55858ae78250 name=token_embd.weight data=0x7f2575602800 buf=0x55858af0ee50
+0.01.381.585 W [load_loop]   ctx[1] tensor=0x55858ae783c0 name=blk.0.attn_norm.weight data=0x7f25c1282800 buf=0x55858af0ee50
+0.01.381.585 W [load_loop]   ctx[1] tensor=0x55858ae78530 name=blk.0.post_attention_norm.weight data=0x7f25c1285000 buf=0x55858af0ee50
+0.01.381.586 W [load_loop]   ctx[1] tensor=0x55858ae786a0 name=blk.0.attn_qkv.weight data=0x7f25c1287800 buf=0x55858af0ee50
+0.02.205.885 W [load_all_data] VISIT tensor=0x55858ae780e0 name=output_norm.weight data=0x7f2575600000 buf=0x55858af0ee50 size=10240 file_offs=5310269152
+0.02.212.218 W [load_all_data] VISIT tensor=0x55858ae78250 name=token_embd.weight data=0x7f2575602800 buf=0x55858af0ee50 size=1271398400 file_offs=10987232
+0.06.474.451 W [load_loop] ctx[2] tensors=1 any_buf=0x55858af0f1f0 host=1 buft=ROCm_Host
+0.06.474.454 W [load_loop]   ctx[2] tensor=0x55858ae30860 name=token_embd.weight data=0x7f2529800000 buf=0x55858af0f1f0
+0.06.474.460 W [load_all_data] VISIT tensor=0x55858ae30860 name=token_embd.weight data=0x7f2529800000 buf=0x55858af0f1f0 size=1271398400 file_offs=10987232
+0.07.119.505 W llama_context: n_ctx_seq (512) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.07.468.003 I 
+0.07.468.081 I system_info: n_threads = 12 (n_threads_batch = 12) / 24 | ROCm : NO_VMM = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.07.468.090 I perplexity: tokenizing the input ..
+0.08.080.379 I perplexity: tokenization took 612.281 ms
+0.08.080.549 I perplexity: calculating perplexity over 580 chunks, n_ctx=512, batch_size=512, n_seq=1
+aiter::Registry: compiling _gemm_a8w8_blockscale_kernel (_gemm_a8w8_blockscale_kernel__hip-gfx1201-32__W4S1__76e94069f9b8612b)
+aiter::Registry: signature = *fp8e4nv:16, *i8:16, *bf16:16, *fp32:16, *fp32:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, 64, 1, 16, 16, 64, 1, 1, 2560, 1, 18432, 1, 1, 16, *fp8e4nv:16, i32
+compile_aiter_kernel: _gemm_a8w8_blockscale_kernel → /home/kmbandy/.cache/llama.cpp/aiter/_gemm_a8w8_blockscale_kernel__hip-gfx1201-32__W4S1__76e94069f9b8612b (_gemm_a8w8_blockscale_kernel, 13,808 bytes, 3.40s)
+aiter::Registry: compiling _gemm_a8w8_blockscale_kernel (_gemm_a8w8_blockscale_kernel__hip-gfx1201-32__W4S1__43ebaf76ad73d834)
+aiter::Registry: signature = *fp8e4nv:16, *i8:16, *bf16:16, *fp32:16, *fp32:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, 64, 1, 16, 16, 64, 1, 1, 9216, 1, 5120, 1, 1, 16, *fp8e4nv:16, i32
+compile_aiter_kernel: _gemm_a8w8_blockscale_kernel → /home/kmbandy/.cache/llama.cpp/aiter/_gemm_a8w8_blockscale_kernel__hip-gfx1201-32__W4S1__43ebaf76ad73d834 (_gemm_a8w8_blockscale_kernel, 13,808 bytes, 2.84s)
+0.22.095.390 I perplexity: 14.01 seconds per pass - ETA 2 hours 15.47 minutes
+[1]6.3143,[2]8.9065,[3]9.1430,[4]8.9851,[5]8.9957,[6]9.3407,[7]9.6143,[8]10.4058,[9]10.9786,[10]11.4101,[11]11.2698,[12]11.4274,[13]11.9904,[14]11.4098,

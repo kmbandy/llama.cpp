@@ -1,0 +1,15 @@
+[base] /home/kmbandy/models/Qwen3.6-35B-A3B-bf16.gguf  arch='qwen35moe'  fields=48  tensors=753
+[blobs] 3 calibrated layers → ml8 tensors + sidecars
+[fields] copied 44 + 1 ml8 marker
+Traceback (most recent call last):
+  File "/home/kmbandy/GitHub/llama.cpp/scripts/calibration/ml8_to_gguf.py", line 422, in <module>
+    main()
+    ~~~~^^
+  File "/home/kmbandy/GitHub/llama.cpp/scripts/calibration/ml8_to_gguf.py", line 417, in main
+    summary = convert_to_ml8_gguf(args.base_gguf, args.calib_dir, args.out_gguf)
+  File "/home/kmbandy/GitHub/llama.cpp/scripts/calibration/ml8_to_gguf.py", line 308, in convert_to_ml8_gguf
+    [pack_ml8_blocks(b["indices"], b["scale_per_group"]) for b in blobs],
+     ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/kmbandy/GitHub/llama.cpp/scripts/calibration/ml8_to_gguf.py", line 129, in pack_ml8_blocks
+    raise ValueError(f"indices out of [0,15] range; min={idx_np.min()}, max={idx_np.max()}")
+ValueError: indices out of [0,15] range; min=0, max=255

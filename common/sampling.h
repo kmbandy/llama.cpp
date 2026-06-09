@@ -90,6 +90,9 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 // Returns the internal reasoning-budget llama_sampler (nullptr if not active).
 const struct llama_sampler * common_sampler_get_rbudget(const struct common_sampler * gsmpl);
 
+// force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens

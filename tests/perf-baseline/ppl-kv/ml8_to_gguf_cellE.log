@@ -1,0 +1,5 @@
+[base] /home/kmbandy/models/Qwen3.5-4B-f16.gguf  arch='qwen35'  fields=45  tensors=441
+[blobs] 96 calibrated layers → ml8 tensors + sidecars
+[fields] copied 41 + 1 ml8 marker
+[tensors] main ml8=96, centroids=96, rotation=96, awq=0, copied unchanged=345
+[done] {'out_path': '/home/kmbandy/models/Qwen3.5-4B-ml8_4-cellE.gguf', 'n_ml8': 96, 'n_centroids': 96, 'n_rotation': 96, 'n_awq': 0, 'n_copied': 345, 'n_fields_copied': 41}

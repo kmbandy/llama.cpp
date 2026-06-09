@@ -1,0 +1,94 @@
+=== ml8 GEMV M1 sweep: 68 configs ===
+  baseline (Triton M=16 path, no GEMV): ~20.30 t/s decode
+  f16 reference: ~50.89 t/s decode
+
+  [ 1/68]  BN=  8  KC=2  LDS=0  LAY=0  ->       14.31  t/s   (18s elapsed)
+  [ 2/68]  BN=  8  KC=2  LDS=0  LAY=1  ->       14.39  t/s   (30s elapsed)
+  [ 3/68]  BN=  8  KC=2  LDS=1  LAY=0  ->        4.06  t/s   (52s elapsed)
+  [ 4/68]  BN=  8  KC=2  LDS=1  LAY=1  ->        4.43  t/s   (74s elapsed)
+  [ 5/68]  BN=  8  KC=4  LDS=0  LAY=0  ->       23.13  t/s   (84s elapsed)
+  [ 6/68]  BN=  8  KC=4  LDS=0  LAY=1  ->       23.16  t/s   (94s elapsed)
+  [ 7/68]  BN=  8  KC=4  LDS=1  LAY=0  ->        7.26  t/s   (110s elapsed)
+  [ 8/68]  BN=  8  KC=4  LDS=1  LAY=1  ->        7.88  t/s   (126s elapsed)
+  [ 9/68]  BN=  8  KC=8  LDS=0  LAY=0  ->       30.03  t/s   (135s elapsed)
+  [10/68]  BN=  8  KC=8  LDS=0  LAY=1  ->       29.08  t/s   (146s elapsed)
+  [11/68]  BN=  8  KC=8  LDS=1  LAY=0  ->       13.53  t/s   (158s elapsed)
+  [12/68]  BN=  8  KC=8  LDS=1  LAY=1  ->       13.99  t/s   (170s elapsed)
+  [13/68]  BN= 16  KC=1  LDS=0  LAY=0  ->        8.23  t/s   (185s elapsed)
+  [14/68]  BN= 16  KC=1  LDS=1  LAY=0  ->        4.25  t/s   (207s elapsed)
+  [15/68]  BN= 16  KC=2  LDS=0  LAY=0  ->       14.52  t/s   (220s elapsed)
+  [16/68]  BN= 16  KC=2  LDS=0  LAY=1  ->       14.49  t/s   (232s elapsed)
+  [17/68]  BN= 16  KC=2  LDS=1  LAY=0  ->        7.84  t/s   (247s elapsed)
+  [18/68]  BN= 16  KC=2  LDS=1  LAY=1  ->        7.83  t/s   (263s elapsed)
+  [19/68]  BN= 16  KC=4  LDS=0  LAY=0  ->       23.95  t/s   (273s elapsed)
+  [20/68]  BN= 16  KC=4  LDS=0  LAY=1  ->       23.08  t/s   (284s elapsed)
+  [21/68]  BN= 16  KC=4  LDS=1  LAY=0  ->       14.01  t/s   (296s elapsed)
+  [22/68]  BN= 16  KC=4  LDS=1  LAY=1  ->       13.45  t/s   (309s elapsed)
+  [23/68]  BN= 16  KC=8  LDS=0  LAY=0  ->       30.66  t/s   (319s elapsed)
+  [24/68]  BN= 16  KC=8  LDS=0  LAY=1  ->       29.23  t/s   (329s elapsed)
+  [25/68]  BN= 16  KC=8  LDS=1  LAY=0  ->       23.67  t/s   (339s elapsed)
+  [26/68]  BN= 16  KC=8  LDS=1  LAY=1  ->       22.37  t/s   (349s elapsed)
+  [27/68]  BN= 32  KC=1  LDS=0  LAY=0  ->        8.22  t/s   (364s elapsed)
+  [28/68]  BN= 32  KC=1  LDS=1  LAY=0  ->        8.07  t/s   (380s elapsed)
+  [29/68]  BN= 32  KC=2  LDS=0  LAY=0  ->       14.77  t/s   (392s elapsed)
+  [30/68]  BN= 32  KC=2  LDS=0  LAY=1  ->       14.47  t/s   (404s elapsed)
+  [31/68]  BN= 32  KC=2  LDS=1  LAY=0  ->       14.49  t/s   (417s elapsed)
+  [32/68]  BN= 32  KC=2  LDS=1  LAY=1  ->       14.23  t/s   (429s elapsed)
+  [33/68]  BN= 32  KC=4  LDS=0  LAY=0  ->       24.28  t/s   (439s elapsed)
+  [34/68]  BN= 32  KC=4  LDS=0  LAY=1  ->       23.21  t/s   (449s elapsed)
+  [35/68]  BN= 32  KC=4  LDS=1  LAY=0  ->       23.98  t/s   (459s elapsed)
+  [36/68]  BN= 32  KC=4  LDS=1  LAY=1  ->       22.88  t/s   (470s elapsed)
+  [37/68]  BN= 32  KC=8  LDS=0  LAY=0  ->       27.14  t/s   (480s elapsed)
+  [38/68]  BN= 32  KC=8  LDS=0  LAY=1  ->       29.22  t/s   (489s elapsed)
+  [39/68]  BN= 32  KC=8  LDS=1  LAY=0  ->       30.50  t/s   (499s elapsed)
+  [40/68]  BN= 32  KC=8  LDS=1  LAY=1  ->       28.86  t/s   (509s elapsed)
+  [41/68]  BN= 64  KC=1  LDS=0  LAY=0  ->        8.19  t/s   (524s elapsed)
+  [42/68]  BN= 64  KC=1  LDS=1  LAY=0  ->        8.09  t/s   (539s elapsed)
+  [43/68]  BN= 64  KC=2  LDS=0  LAY=0  ->       14.73  t/s   (551s elapsed)
+  [44/68]  BN= 64  KC=2  LDS=0  LAY=1  ->       14.42  t/s   (563s elapsed)
+  [45/68]  BN= 64  KC=2  LDS=1  LAY=0  ->       14.58  t/s   (575s elapsed)
+  [46/68]  BN= 64  KC=2  LDS=1  LAY=1  ->       14.29  t/s   (587s elapsed)
+  [47/68]  BN= 64  KC=4  LDS=0  LAY=0  ->       19.77  t/s   (597s elapsed)
+  [48/68]  BN= 64  KC=4  LDS=0  LAY=1  ->       22.87  t/s   (608s elapsed)
+  [49/68]  BN= 64  KC=4  LDS=1  LAY=0  ->       24.02  t/s   (619s elapsed)
+  [50/68]  BN= 64  KC=4  LDS=1  LAY=1  ->       22.85  t/s   (629s elapsed)
+  [51/68]  BN= 64  KC=8  LDS=0  LAY=0  ->       26.89  t/s   (639s elapsed)
+  [52/68]  BN= 64  KC=8  LDS=0  LAY=1  ->       25.21  t/s   (649s elapsed)
+  [53/68]  BN= 64  KC=8  LDS=1  LAY=0  ->       26.72  t/s   (659s elapsed)
+  [54/68]  BN= 64  KC=8  LDS=1  LAY=1  ->       24.99  t/s   (669s elapsed)
+  [55/68]  BN=128  KC=1  LDS=0  LAY=0  ->        8.16  t/s   (684s elapsed)
+  [56/68]  BN=128  KC=1  LDS=1  LAY=0  ->        8.12  t/s   (700s elapsed)
+  [57/68]  BN=128  KC=2  LDS=0  LAY=0  ->       14.67  t/s   (712s elapsed)
+  [58/68]  BN=128  KC=2  LDS=0  LAY=1  ->       14.34  t/s   (724s elapsed)
+  [59/68]  BN=128  KC=2  LDS=1  LAY=0  ->       14.60  t/s   (736s elapsed)
+  [60/68]  BN=128  KC=2  LDS=1  LAY=1  ->       14.28  t/s   (748s elapsed)
+  [61/68]  BN=128  KC=4  LDS=0  LAY=0  ->       19.80  t/s   (759s elapsed)
+  [62/68]  BN=128  KC=4  LDS=0  LAY=1  ->       18.57  t/s   (770s elapsed)
+  [63/68]  BN=128  KC=4  LDS=1  LAY=0  ->       19.71  t/s   (781s elapsed)
+  [64/68]  BN=128  KC=4  LDS=1  LAY=1  ->       18.48  t/s   (792s elapsed)
+  [65/68]  BN=128  KC=8  LDS=0  LAY=0  ->       26.75  t/s   (802s elapsed)
+  [66/68]  BN=128  KC=8  LDS=0  LAY=1  ->       25.14  t/s   (813s elapsed)
+  [67/68]  BN=128  KC=8  LDS=1  LAY=0  ->       26.78  t/s   (822s elapsed)
+  [68/68]  BN=128  KC=8  LDS=1  LAY=1  ->       25.06  t/s   (836s elapsed)
+
+=== TOP 15 ===
+rank   BN  KC  LDS  LAY       t/s
+   1   16   8    0    0     30.66
+   2   32   8    1    0     30.50
+   3    8   8    0    0     30.03
+   4   16   8    0    1     29.23
+   5   32   8    0    1     29.22
+   6    8   8    0    1     29.08
+   7   32   8    1    1     28.86
+   8   32   8    0    0     27.14
+   9   64   8    0    0     26.89
+  10  128   8    1    0     26.78
+  11  128   8    0    0     26.75
+  12   64   8    1    0     26.72
+  13   64   8    0    1     25.21
+  14  128   8    0    1     25.14
+  15  128   8    1    1     25.06
+
+  WINNER: BN=16, KC=8, LDS=0, LAYOUT=0  -> 30.66 t/s
+  vs baseline 20.30: 1.51x
+  vs f16 50.89:      0.60x (target 1.0+)

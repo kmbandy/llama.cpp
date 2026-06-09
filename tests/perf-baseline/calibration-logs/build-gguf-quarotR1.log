@@ -1,0 +1,7 @@
+[base] /home/kmbandy/models/Qwen3.6-35B-A3B-bf16-quarotR1.gguf  arch='qwen35moe'  fields=48  tensors=753
+[skip] hessians.pt: HF name 'hessians' doesn't match MLP/MoE pattern
+[blobs] 120 calibrated layers → ml8 tensors + sidecars
+[tempdir] tensor spool → /home/kmbandy/models (use_temp_file=True keeps heap bounded)
+[fields] copied 44 + 1 ml8 marker
+[tensors] dense_ml8=0, moe_ml8=120, centroids=120, rotation=0, awq=0, copied unchanged=633
+[done] {'out_path': '/home/kmbandy/models/Qwen3.6-35B-A3B-ml8_4-quarotR1.gguf', 'n_ml8': 0, 'n_moe': 120, 'n_centroids': 120, 'n_rotation': 0, 'n_awq': 0, 'n_copied': 633, 'n_fields_copied': 44}

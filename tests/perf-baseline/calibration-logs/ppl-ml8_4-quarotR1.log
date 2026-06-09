@@ -1,0 +1,21 @@
+0.00.051.948 I common_init_result: fitting params to device memory ...
+0.00.051.952 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.01.871.770 W [load_loop] ctx[0] tensors=872 any_buf=0x55cb81f41080 host=0 buft=ROCm0
+0.01.871.774 W [load_loop]   ctx[0] tensor=0x55cb81ffbd60 name=output_norm.weight data=0x7fd8c1000000 buf=0x55cb81f41080
+0.01.871.774 W [load_loop]   ctx[0] tensor=0x55cb81ffbed0 name=output.weight data=0x7fd8c1002000 buf=0x55cb81f41080
+0.01.871.775 W [load_loop]   ctx[0] tensor=0x55cb81ffc040 name=blk.0.attn_norm.weight data=0x7fd8fda02000 buf=0x55cb81f41080
+0.01.871.775 W [load_loop]   ctx[0] tensor=0x55cb81ffc1b0 name=blk.0.post_attention_norm.weight data=0x7fd8fda04000 buf=0x55cb81f41080
+0.01.871.776 W [load_loop]   ctx[0] tensor=0x55cb81ffc320 name=blk.0.attn_qkv.weight data=0x7fd8fda06000 buf=0x55cb81f41080
+0.01.877.678 W [load_all_data] VISIT tensor=0x55cb81ffbd60 name=output_norm.weight data=0x7fd8c1000000 buf=0x55cb81f41080 size=8192 file_offs=24157061920
+0.01.891.318 W [load_all_data] VISIT tensor=0x55cb81ffbed0 name=output.weight data=0x7fd8c1002000 buf=0x55cb81f41080 size=1017118720 file_offs=22925974304
+0.13.556.344 W [load_loop] ctx[1] tensors=1 any_buf=0x55cb8205ab10 host=1 buft=ROCm_Host
+0.13.556.348 W [load_loop]   ctx[1] tensor=0x55cb81fa5ee0 name=token_embd.weight data=0x7fd884400000 buf=0x55cb8205ab10
+0.13.556.356 W [load_all_data] VISIT tensor=0x55cb81fa5ee0 name=token_embd.weight data=0x7fd884400000 buf=0x55cb8205ab10 size=1017118720 file_offs=11000096
+0.14.100.642 W llama_context: n_ctx_seq (4096) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+0.14.152.009 I 
+0.14.152.091 I system_info: n_threads = 12 (n_threads_batch = 12) / 24 | ROCm : NO_VMM = 1 | PEER_MAX_BATCH_SIZE = 128 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.14.152.100 I perplexity: tokenizing the input ..
+0.14.781.943 I perplexity: tokenization took 629.835 ms
+0.14.782.150 I perplexity: calculating perplexity over 72 chunks, n_ctx=4096, batch_size=2048, n_seq=1
+0.22.149.047 I perplexity: 7.37 seconds per pass - ETA 8.83 minutes
+[1]5120.5687,[2]6990.4742,[3]4557.7767,[4]4024.0433,[5]4142.8919,[6]4447.1958,[7]4408.6232,[8]4493.1460,[9]4526.1447,[10]4318.4764,[11]4527.7448,[12]4699.0036,[13]4776.9130,[14]4920.1924,[15]5082.9117,[16]5106.9591,[17]5211.3102,[18]5059.7771,[19]4928.3120,[20]4776.9281,[21]4834.3043,[22]4931.1515,[23]5059.3660,[24]5077.1624,[25]5053.5727,[26]5011.0013,[27]5013.5349,[28]4878.7988,[29]4789.5905,[30]4781.0256,[31]4828.0143,[32]4914.2688,[33]4979.4666,

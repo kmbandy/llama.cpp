@@ -1,0 +1,354 @@
+[load-hf] strategy=moe  Qwen/Qwen3.6-35B-A3B  dtype=torch.bfloat16  device=cuda:0
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+[meta-init] arch=qwen35moe  n_blocks=40  n_experts=256
+[pager] iter 5b — building catalog from /home/kmbandy/models/Qwen3.6-35B-A3B-bf16-quarotR1.gguf  slots=8  n_experts=256
+[pager-5b] moe_consolidated=123 shared_expert=123 dense_mlp=0 skipped(resident-bound)=630  max_slot=536.9 MB  pool=4.29 GB
+ggml_cuda_init: found 2 ROCm devices (Total VRAM: 48992 MiB):
+  Device 0: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 1: AMD Radeon RX 6900 XT, gfx1030 (0x1030), VMM: no, Wave Size: 32, VRAM: 16368 MiB
+wp::PoolAllocator: allocated 8 slots x 536870912 B (4096.0 MiB)
+wp::GpuTransport: device 0, stream + 6 events ready
+wp::create_file_io: SyncPread (fds=1)
+wp::PrefetchScheduler: queue_depth=4, max_page_size=536870912 (512.0 MiB pinned per slot)
+wp::WeightPager: 123 pages, 8 slots x 536870912 B (4096.0 MiB), prefetch_depth=4, sync_staging_pinned=1
+[pager] catalog: 123 entries  max_page=536.9 MB
+[swap] replaced 40 consolidated MoE expert blocks → PagedMoeExperts
+[meta-empty] materializing 2.45B resident params on cuda:0
+[resident-load] loaded=613  skipped_expert=0  no_mapping=0  missing_in_gguf=0
+[calib] loading 32 samples seq_len=1024
+[calib] got 32 samples (tokens ≈ 10326)
+[targets] 120 linears to quantize
+[moe-loop] 40 PagedMoeExperts blocks queued
+
+[hessian-pass] collecting H_gate_up + H_down on all 40 layers in one forward pass...
+[DIAG] page_in_sync_[0]: ENTER page=0 name=blk.0.ffn_gate_exps.weight file_idx=0 offset=1095218400 size=536870912
+[DIAG] page_in_sync_[0]: alloc_slot ok, slot=0 dst=0x7f87aa000000
+[DIAG] page_in_sync_[0]: submit returned ok=1
+[DIAG] page_in_sync_[0]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[0]: stage1 done ok=1
+[DIAG] page_in_sync_[0]: stage_in returned evt=5
+[DIAG] page_in_sync_[0]: EXIT slot=0
+[DIAG] page_in_sync_[1]: ENTER page=1 name=blk.0.ffn_up_exps.weight file_idx=0 offset=1632089312 size=536870912
+[DIAG] page_in_sync_[1]: alloc_slot ok, slot=1 dst=0x7f87ca000000
+[DIAG] page_in_sync_[1]: submit returned ok=1
+[DIAG] page_in_sync_[1]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[1]: stage1 done ok=1
+[DIAG] page_in_sync_[1]: stage_in returned evt=5
+[DIAG] page_in_sync_[1]: EXIT slot=1
+[DIAG] page_in_sync_[2]: ENTER page=5 name=blk.0.ffn_down_exps.weight file_idx=0 offset=3847084000 size=536870912
+[DIAG] page_in_sync_[2]: alloc_slot ok, slot=2 dst=0x7f87ea000000
+[DIAG] page_in_sync_[2]: submit returned ok=1
+[DIAG] page_in_sync_[2]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[2]: stage1 done ok=1
+[DIAG] page_in_sync_[2]: stage_in returned evt=5
+[DIAG] page_in_sync_[2]: EXIT slot=2
+[DIAG] page_in_sync_[3]: ENTER page=3 name=blk.1.ffn_gate_exps.weight file_idx=0 offset=2772940000 size=536870912
+[DIAG] page_in_sync_[3]: alloc_slot ok, slot=3 dst=0x7f880a000000
+[DIAG] page_in_sync_[3]: submit returned ok=1
+[DIAG] page_in_sync_[3]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[3]: stage1 done ok=1
+[DIAG] page_in_sync_[3]: stage_in returned evt=5
+[DIAG] page_in_sync_[3]: EXIT slot=3
+[DIAG] page_in_sync_[4]: ENTER page=4 name=blk.1.ffn_up_exps.weight file_idx=0 offset=3309810912 size=536870912
+[DIAG] page_in_sync_[4]: alloc_slot ok, slot=4 dst=0x7f882a000000
+[DIAG] page_in_sync_[4]: submit returned ok=1
+[DIAG] page_in_sync_[4]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[4]: stage1 done ok=1
+[DIAG] page_in_sync_[4]: stage_in returned evt=5
+[DIAG] page_in_sync_[4]: EXIT slot=4
+  [hessian-pass] 4/32 samples  elapsed=267.4s
+  [hessian-pass] 8/32 samples  elapsed=510.3s
+  [hessian-pass] 12/32 samples  elapsed=750.3s
+  [hessian-pass] 16/32 samples  elapsed=990.4s
+  [hessian-pass] 20/32 samples  elapsed=1230.2s
+  [hessian-pass] 24/32 samples  elapsed=1472.3s
+  [hessian-pass] 28/32 samples  elapsed=1712.5s
+  [hessian-pass] 32/32 samples  elapsed=1949.4s
+[hessian-pass] done in 1949.4s (60.9s/sample)
+  L0 hessians: gate_up n_tok=82608  down n_tok=82608
+  L1 hessians: gate_up n_tok=82608  down n_tok=82608
+  L2 hessians: gate_up n_tok=82608  down n_tok=82608
+  L3 hessians: gate_up n_tok=82608  down n_tok=82608
+  L4 hessians: gate_up n_tok=82608  down n_tok=82608
+  L5 hessians: gate_up n_tok=82608  down n_tok=82608
+  L6 hessians: gate_up n_tok=82608  down n_tok=82608
+  L7 hessians: gate_up n_tok=82608  down n_tok=82608
+  L8 hessians: gate_up n_tok=82608  down n_tok=82608
+  L9 hessians: gate_up n_tok=82608  down n_tok=82608
+  L10 hessians: gate_up n_tok=82608  down n_tok=82608
+  L11 hessians: gate_up n_tok=82608  down n_tok=82608
+  L12 hessians: gate_up n_tok=82608  down n_tok=82608
+  L13 hessians: gate_up n_tok=82608  down n_tok=82608
+  L14 hessians: gate_up n_tok=82608  down n_tok=82608
+  L15 hessians: gate_up n_tok=82608  down n_tok=82608
+  L16 hessians: gate_up n_tok=82608  down n_tok=82608
+  L17 hessians: gate_up n_tok=82608  down n_tok=82608
+  L18 hessians: gate_up n_tok=82608  down n_tok=82608
+  L19 hessians: gate_up n_tok=82608  down n_tok=82608
+  L20 hessians: gate_up n_tok=82608  down n_tok=82608
+  L21 hessians: gate_up n_tok=82608  down n_tok=82608
+  L22 hessians: gate_up n_tok=82608  down n_tok=82608
+  L23 hessians: gate_up n_tok=82608  down n_tok=82608
+  L24 hessians: gate_up n_tok=82608  down n_tok=82608
+  L25 hessians: gate_up n_tok=82608  down n_tok=82608
+  L26 hessians: gate_up n_tok=82608  down n_tok=82608
+  L27 hessians: gate_up n_tok=82608  down n_tok=82608
+  L28 hessians: gate_up n_tok=82608  down n_tok=82608
+  L29 hessians: gate_up n_tok=82608  down n_tok=82608
+  L30 hessians: gate_up n_tok=82608  down n_tok=82608
+  L31 hessians: gate_up n_tok=82608  down n_tok=82608
+  L32 hessians: gate_up n_tok=82608  down n_tok=82608
+  L33 hessians: gate_up n_tok=82608  down n_tok=82608
+  L34 hessians: gate_up n_tok=82608  down n_tok=82608
+  L35 hessians: gate_up n_tok=82608  down n_tok=82608
+  L36 hessians: gate_up n_tok=82608  down n_tok=82608
+  L37 hessians: gate_up n_tok=82608  down n_tok=82608
+  L38 hessians: gate_up n_tok=82608  down n_tok=82608
+  L39 hessians: gate_up n_tok=82608  down n_tok=82608
+[hessian-cache] saved 713.1 MB → /home/kmbandy/models/qwen36-35b-ml8-quarotR1/hessians.pt
+
+[task-queue] 240 tasks (E=128-chunks); workers: [('cuda:0', 1), ('cuda:1', 1)]
+  [cuda:0] 1/240  L0 gate_proj E[0:128]  t=39.4s  Y_SNR_med=31.62dB  elapsed=0.7m  ETA=156.8m
+  [cuda:0] 2/240  L0 up_proj E[0:128]  t=39.6s  Y_SNR_med=31.17dB  elapsed=1.3m  ETA=156.6m
+  [cuda:0] 3/240  L0 up_proj E[128:256]  t=39.0s  Y_SNR_med=31.38dB  elapsed=2.0m  ETA=155.4m
+  [cuda:0] 4/240  L0 down_proj E[0:128]  t=57.3s  Y_SNR_med=20.70dB  elapsed=2.9m  ETA=172.4m
+  [cuda:1] 5/240  L0 gate_proj E[128:256]  t=214.1s  Y_SNR_med=31.86dB  elapsed=3.6m  ETA=167.9m
+  [cuda:0] 6/240  L0 down_proj E[128:256]  t=56.9s  Y_SNR_med=20.73dB  elapsed=3.9m  ETA=150.9m
+  [cuda:0] 7/240  L1 gate_proj E[128:256]  t=20.7s  Y_SNR_med=30.34dB  elapsed=4.2m  ETA=140.3m
+  [cuda:1] 8/240  L1 gate_proj E[0:128]  t=49.8s  Y_SNR_med=30.38dB  elapsed=4.4m  ETA=127.7m
+  [cuda:0] 9/240  L1 up_proj E[0:128]  t=20.6s  Y_SNR_med=30.24dB  elapsed=4.6m  ETA=117.0m
+  [cuda:0] 10/240  L1 down_proj E[0:128]  t=40.8s  Y_SNR_med=21.53dB  elapsed=5.2m  ETA=120.5m
+  [cuda:1] 11/240  L1 up_proj E[128:256]  t=53.8s  Y_SNR_med=30.20dB  elapsed=5.3m  ETA=110.4m
+  [cuda:0] 12/240  L1 down_proj E[128:256]  t=41.2s  Y_SNR_med=21.54dB  elapsed=5.9m  ETA=112.6m
+  [cuda:1] 13/240  L2 gate_proj E[0:128]  t=48.3s  Y_SNR_med=30.04dB  elapsed=6.1m  ETA=106.6m
+  [cuda:0] 14/240  L2 gate_proj E[128:256]  t=20.0s  Y_SNR_med=30.07dB  elapsed=6.3m  ETA=101.0m
+  [cuda:0] 15/240  L2 up_proj E[128:256]  t=19.5s  Y_SNR_med=29.98dB  elapsed=6.6m  ETA=98.8m
+  [cuda:1] 16/240  L2 up_proj E[0:128]  t=49.2s  Y_SNR_med=29.98dB  elapsed=6.9m  ETA=97.0m
+  [cuda:0] 17/240  L2 down_proj E[0:128]  t=40.9s  Y_SNR_med=21.72dB  elapsed=7.3m  ETA=95.3m
+  [cuda:0] 18/240  L3 gate_proj E[0:128]  t=20.7s  Y_SNR_med=29.43dB  elapsed=7.6m  ETA=93.9m
+  [cuda:0] 19/240  L3 gate_proj E[128:256]  t=19.5s  Y_SNR_med=29.43dB  elapsed=7.9m  ETA=92.3m
+  [cuda:0] 20/240  L3 up_proj E[0:128]  t=19.8s  Y_SNR_med=29.30dB  elapsed=8.3m  ETA=90.9m
+  [cuda:0] 21/240  L3 up_proj E[128:256]  t=19.5s  Y_SNR_med=29.26dB  elapsed=8.6m  ETA=89.6m
+  [cuda:1] 22/240  L2 down_proj E[128:256]  t=130.7s  Y_SNR_med=21.72dB  elapsed=9.1m  ETA=90.2m
+  [cuda:0] 23/240  L3 down_proj E[0:128]  t=40.8s  Y_SNR_med=23.03dB  elapsed=9.3m  ETA=87.5m
+  [cuda:0] 24/240  L4 gate_proj E[0:128]  t=19.8s  Y_SNR_med=29.69dB  elapsed=9.6m  ETA=86.4m
+  [cuda:0] 25/240  L4 gate_proj E[128:256]  t=19.4s  Y_SNR_med=29.75dB  elapsed=9.9m  ETA=85.4m
+  [cuda:0] 26/240  L4 up_proj E[0:128]  t=19.8s  Y_SNR_med=29.31dB  elapsed=10.3m  ETA=84.4m
+  [cuda:0] 27/240  L4 up_proj E[128:256]  t=19.4s  Y_SNR_med=29.35dB  elapsed=10.6m  ETA=83.5m
+  [cuda:0] 28/240  L4 down_proj E[0:128]  t=40.6s  Y_SNR_med=23.59dB  elapsed=11.3m  ETA=85.2m
+  [cuda:1] 29/240  L3 down_proj E[128:256]  t=129.5s  Y_SNR_med=23.03dB  elapsed=11.3m  ETA=81.9m
+  [cuda:0] 30/240  L4 down_proj E[128:256]  t=40.7s  Y_SNR_med=23.58dB  elapsed=11.9m  ETA=83.5m
+  [cuda:1] 31/240  L5 gate_proj E[0:128]  t=45.4s  Y_SNR_med=29.51dB  elapsed=12.0m  ETA=81.0m
+  [cuda:0] 32/240  L5 gate_proj E[128:256]  t=19.8s  Y_SNR_med=29.56dB  elapsed=12.3m  ETA=79.7m
+  [cuda:0] 33/240  L5 up_proj E[128:256]  t=19.4s  Y_SNR_med=29.03dB  elapsed=12.6m  ETA=79.0m
+  [cuda:1] 34/240  L5 up_proj E[0:128]  t=45.6s  Y_SNR_med=29.05dB  elapsed=12.8m  ETA=77.4m
+  [cuda:0] 35/240  L5 down_proj E[0:128]  t=40.8s  Y_SNR_med=22.83dB  elapsed=13.3m  ETA=77.7m
+  [cuda:0] 36/240  L6 gate_proj E[0:128]  t=19.7s  Y_SNR_med=29.21dB  elapsed=13.6m  ETA=77.0m
+  [cuda:0] 37/240  L6 gate_proj E[128:256]  t=19.3s  Y_SNR_med=29.20dB  elapsed=13.9m  ETA=76.4m
+  [cuda:0] 38/240  L6 up_proj E[0:128]  t=19.7s  Y_SNR_med=28.81dB  elapsed=14.2m  ETA=75.7m
+  [cuda:0] 39/240  L6 up_proj E[128:256]  t=19.3s  Y_SNR_med=28.83dB  elapsed=14.6m  ETA=75.1m
+  [cuda:1] 40/240  L5 down_proj E[128:256]  t=130.6s  Y_SNR_med=22.82dB  elapsed=15.0m  ETA=74.8m
+  [cuda:0] 41/240  L6 down_proj E[0:128]  t=40.8s  Y_SNR_med=22.74dB  elapsed=15.2m  ETA=74.0m
+  [cuda:0] 42/240  L7 gate_proj E[0:128]  t=19.7s  Y_SNR_med=29.12dB  elapsed=15.6m  ETA=73.4m
+  [cuda:0] 43/240  L7 gate_proj E[128:256]  t=19.3s  Y_SNR_med=29.06dB  elapsed=15.9m  ETA=72.8m
+  [cuda:0] 44/240  L7 up_proj E[0:128]  t=20.2s  Y_SNR_med=28.53dB  elapsed=16.2m  ETA=72.3m
+  [cuda:0] 45/240  L7 up_proj E[128:256]  t=19.3s  Y_SNR_med=28.46dB  elapsed=16.6m  ETA=71.7m
+  [cuda:1] 46/240  L6 down_proj E[128:256]  t=131.9s  Y_SNR_med=22.75dB  elapsed=17.2m  ETA=72.3m
+  [cuda:0] 47/240  L7 down_proj E[0:128]  t=40.8s  Y_SNR_med=23.72dB  elapsed=17.2m  ETA=70.8m
+  [cuda:0] 48/240  L8 gate_proj E[0:128]  t=19.7s  Y_SNR_med=28.53dB  elapsed=17.6m  ETA=70.3m
+  [cuda:0] 49/240  L8 gate_proj E[128:256]  t=19.3s  Y_SNR_med=28.49dB  elapsed=17.9m  ETA=69.7m
+  [cuda:0] 50/240  L8 up_proj E[0:128]  t=19.7s  Y_SNR_med=28.06dB  elapsed=18.2m  ETA=69.2m
+  [cuda:0] 51/240  L8 up_proj E[128:256]  t=19.3s  Y_SNR_med=27.99dB  elapsed=18.5m  ETA=68.7m
+  [cuda:0] 52/240  L8 down_proj E[0:128]  t=40.6s  Y_SNR_med=23.59dB  elapsed=19.2m  ETA=69.5m
+  [cuda:1] 53/240  L7 down_proj E[128:256]  t=130.4s  Y_SNR_med=23.72dB  elapsed=19.3m  ETA=68.2m
+  [cuda:0] 54/240  L8 down_proj E[128:256]  t=40.7s  Y_SNR_med=23.59dB  elapsed=19.9m  ETA=68.5m
+  [cuda:1] 55/240  L9 gate_proj E[0:128]  t=45.2s  Y_SNR_med=28.39dB  elapsed=20.1m  ETA=67.6m
+  [cuda:0] 56/240  L9 gate_proj E[128:256]  t=19.8s  Y_SNR_med=28.37dB  elapsed=20.2m  ETA=66.5m
+  [cuda:0] 57/240  L9 up_proj E[128:256]  t=19.4s  Y_SNR_med=27.97dB  elapsed=20.5m  ETA=66.0m
+  [cuda:1] 58/240  L9 up_proj E[0:128]  t=45.6s  Y_SNR_med=28.03dB  elapsed=20.8m  ETA=65.4m
+  [cuda:0] 59/240  L9 down_proj E[0:128]  t=40.8s  Y_SNR_med=22.08dB  elapsed=21.2m  ETA=65.1m
+  [cuda:0] 60/240  L10 gate_proj E[0:128]  t=19.8s  Y_SNR_med=28.31dB  elapsed=21.6m  ETA=64.7m
+  [cuda:0] 61/240  L10 gate_proj E[128:256]  t=19.4s  Y_SNR_med=28.28dB  elapsed=21.9m  ETA=64.2m
+  [cuda:0] 62/240  L10 up_proj E[0:128]  t=19.8s  Y_SNR_med=28.01dB  elapsed=22.2m  ETA=63.8m
+  [cuda:0] 63/240  L10 up_proj E[128:256]  t=19.4s  Y_SNR_med=28.01dB  elapsed=22.5m  ETA=63.3m
+  [cuda:1] 64/240  L9 down_proj E[128:256]  t=131.3s  Y_SNR_med=22.08dB  elapsed=23.0m  ETA=63.3m
+  [cuda:0] 65/240  L10 down_proj E[0:128]  t=40.8s  Y_SNR_med=21.23dB  elapsed=23.2m  ETA=62.5m
+  [cuda:0] 66/240  L11 gate_proj E[0:128]  t=20.7s  Y_SNR_med=28.16dB  elapsed=23.6m  ETA=62.1m
+  [cuda:0] 67/240  L11 gate_proj E[128:256]  t=19.7s  Y_SNR_med=28.19dB  elapsed=23.9m  ETA=61.7m
+  [cuda:0] 68/240  L11 up_proj E[0:128]  t=19.8s  Y_SNR_med=27.94dB  elapsed=24.2m  ETA=61.3m
+  [cuda:0] 69/240  L11 up_proj E[128:256]  t=19.7s  Y_SNR_med=27.93dB  elapsed=24.6m  ETA=60.8m
+  [cuda:0] 70/240  L11 down_proj E[0:128]  t=41.2s  Y_SNR_med=21.84dB  elapsed=25.2m  ETA=61.3m
+  [cuda:1] 71/240  L10 down_proj E[128:256]  t=133.2s  Y_SNR_med=21.23dB  elapsed=25.3m  ETA=60.1m
+  [cuda:0] 72/240  L11 down_proj E[128:256]  t=40.8s  Y_SNR_med=21.84dB  elapsed=25.9m  ETA=60.5m
+  [cuda:1] 73/240  L12 gate_proj E[0:128]  t=45.4s  Y_SNR_med=27.81dB  elapsed=26.0m  ETA=59.5m
+  [cuda:0] 74/240  L12 gate_proj E[128:256]  t=19.8s  Y_SNR_med=27.83dB  elapsed=26.2m  ETA=58.9m
+  [cuda:0] 75/240  L12 up_proj E[128:256]  t=19.3s  Y_SNR_med=27.49dB  elapsed=26.6m  ETA=58.5m
+  [cuda:1] 76/240  L12 up_proj E[0:128]  t=45.7s  Y_SNR_med=27.53dB  elapsed=26.8m  ETA=57.8m
+  [cuda:0] 77/240  L12 down_proj E[0:128]  t=40.8s  Y_SNR_med=22.39dB  elapsed=27.2m  ETA=57.7m
+  [cuda:0] 78/240  L13 gate_proj E[0:128]  t=20.4s  Y_SNR_med=27.91dB  elapsed=27.6m  ETA=57.3m
+  [cuda:0] 79/240  L13 gate_proj E[128:256]  t=19.5s  Y_SNR_med=27.73dB  elapsed=27.9m  ETA=56.9m
+  [cuda:0] 80/240  L13 up_proj E[0:128]  t=19.8s  Y_SNR_med=27.48dB  elapsed=28.2m  ETA=56.5m
+  [cuda:0] 81/240  L13 up_proj E[128:256]  t=19.4s  Y_SNR_med=27.40dB  elapsed=28.6m  ETA=56.1m
+  [cuda:1] 82/240  L12 down_proj E[128:256]  t=131.9s  Y_SNR_med=22.39dB  elapsed=29.0m  ETA=55.8m
+  [cuda:0] 83/240  L13 down_proj E[0:128]  t=40.9s  Y_SNR_med=22.27dB  elapsed=29.3m  ETA=55.3m
+  [cuda:0] 84/240  L14 gate_proj E[0:128]  t=19.9s  Y_SNR_med=27.37dB  elapsed=29.6m  ETA=54.9m
+  [cuda:0] 85/240  L14 gate_proj E[128:256]  t=19.4s  Y_SNR_med=27.35dB  elapsed=29.9m  ETA=54.5m
+  [cuda:0] 86/240  L14 up_proj E[0:128]  t=19.9s  Y_SNR_med=27.10dB  elapsed=30.2m  ETA=54.1m
+  [cuda:0] 87/240  L14 up_proj E[128:256]  t=19.4s  Y_SNR_med=27.14dB  elapsed=30.6m  ETA=53.7m
+  [cuda:1] 88/240  L13 down_proj E[128:256]  t=131.2s  Y_SNR_med=22.27dB  elapsed=31.2m  ETA=53.8m
+  [cuda:0] 89/240  L14 down_proj E[0:128]  t=40.8s  Y_SNR_med=22.13dB  elapsed=31.2m  ETA=53.0m
+  [cuda:0] 90/240  L15 gate_proj E[0:128]  t=19.8s  Y_SNR_med=27.29dB  elapsed=31.6m  ETA=52.6m
+  [cuda:0] 91/240  L15 gate_proj E[128:256]  t=19.4s  Y_SNR_med=27.27dB  elapsed=31.9m  ETA=52.2m
+  [cuda:0] 92/240  L15 up_proj E[0:128]  t=19.8s  Y_SNR_med=27.04dB  elapsed=32.2m  ETA=51.8m
+  [cuda:0] 93/240  L15 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.95dB  elapsed=32.6m  ETA=51.5m
+  [cuda:0] 94/240  L15 down_proj E[0:128]  t=41.5s  Y_SNR_med=23.14dB  elapsed=33.2m  ETA=51.6m
+  [cuda:1] 95/240  L14 down_proj E[128:256]  t=131.7s  Y_SNR_med=22.13dB  elapsed=33.4m  ETA=50.9m
+  [cuda:0] 96/240  L15 down_proj E[128:256]  t=41.9s  Y_SNR_med=23.14dB  elapsed=33.9m  ETA=50.9m
+  [cuda:1] 97/240  L16 gate_proj E[0:128]  t=46.5s  Y_SNR_med=27.40dB  elapsed=34.1m  ETA=50.3m
+  [cuda:0] 98/240  L16 gate_proj E[128:256]  t=20.0s  Y_SNR_med=27.39dB  elapsed=34.3m  ETA=49.7m
+  [cuda:0] 99/240  L16 up_proj E[128:256]  t=19.4s  Y_SNR_med=27.11dB  elapsed=34.6m  ETA=49.3m
+  [cuda:1] 100/240  L16 up_proj E[0:128]  t=47.3s  Y_SNR_med=27.17dB  elapsed=34.9m  ETA=48.9m
+  [cuda:0] 101/240  L16 down_proj E[0:128]  t=42.5s  Y_SNR_med=22.40dB  elapsed=35.3m  ETA=48.6m
+  [cuda:0] 102/240  L17 gate_proj E[0:128]  t=22.2s  Y_SNR_med=27.19dB  elapsed=35.7m  ETA=48.3m
+  [cuda:0] 103/240  L17 gate_proj E[128:256]  t=19.4s  Y_SNR_med=27.08dB  elapsed=36.0m  ETA=47.9m
+  [cuda:0] 104/240  L17 up_proj E[0:128]  t=22.2s  Y_SNR_med=26.94dB  elapsed=36.4m  ETA=47.7m
+  [cuda:0] 105/240  L17 up_proj E[128:256]  t=19.4s  Y_SNR_med=26.91dB  elapsed=36.8m  ETA=47.3m
+  [cuda:1] 106/240  L16 down_proj E[128:256]  t=142.2s  Y_SNR_med=22.39dB  elapsed=37.3m  ETA=47.1m
+  [cuda:0] 107/240  L17 down_proj E[0:128]  t=40.8s  Y_SNR_med=23.34dB  elapsed=37.5m  ETA=46.6m
+  [cuda:0] 108/240  L18 gate_proj E[0:128]  t=19.8s  Y_SNR_med=26.97dB  elapsed=37.8m  ETA=46.2m
+  [cuda:0] 109/240  L18 gate_proj E[128:256]  t=19.6s  Y_SNR_med=27.01dB  elapsed=38.1m  ETA=45.8m
+  [cuda:0] 110/240  L18 up_proj E[0:128]  t=19.7s  Y_SNR_med=26.68dB  elapsed=38.4m  ETA=45.4m
+  [cuda:0] 111/240  L18 up_proj E[128:256]  t=20.4s  Y_SNR_med=26.81dB  elapsed=38.8m  ETA=45.1m
+  [cuda:0] 112/240  L18 down_proj E[0:128]  t=40.7s  Y_SNR_med=23.49dB  elapsed=39.5m  ETA=45.1m
+  [cuda:1] 113/240  L17 down_proj E[128:256]  t=131.9s  Y_SNR_med=23.34dB  elapsed=39.5m  ETA=44.4m
+  [cuda:0] 114/240  L18 down_proj E[128:256]  t=40.7s  Y_SNR_med=23.51dB  elapsed=40.1m  ETA=44.4m
+  [cuda:1] 115/240  L19 gate_proj E[0:128]  t=45.4s  Y_SNR_med=26.89dB  elapsed=40.2m  ETA=43.7m
+  [cuda:0] 116/240  L19 gate_proj E[128:256]  t=19.9s  Y_SNR_med=26.86dB  elapsed=40.5m  ETA=43.3m
+  [cuda:0] 117/240  L19 up_proj E[128:256]  t=19.4s  Y_SNR_med=26.56dB  elapsed=40.8m  ETA=42.9m
+  [cuda:1] 118/240  L19 up_proj E[0:128]  t=46.4s  Y_SNR_med=26.52dB  elapsed=41.0m  ETA=42.4m
+  [cuda:0] 119/240  L19 down_proj E[0:128]  t=41.7s  Y_SNR_med=22.40dB  elapsed=41.5m  ETA=42.2m
+  [cuda:0] 120/240  L20 gate_proj E[0:128]  t=19.8s  Y_SNR_med=27.13dB  elapsed=41.8m  ETA=41.8m
+  [cuda:0] 121/240  L20 gate_proj E[128:256]  t=19.4s  Y_SNR_med=27.11dB  elapsed=42.2m  ETA=41.5m
+  [cuda:0] 122/240  L20 up_proj E[0:128]  t=19.8s  Y_SNR_med=26.31dB  elapsed=42.5m  ETA=41.1m
+  [cuda:0] 123/240  L20 up_proj E[128:256]  t=19.4s  Y_SNR_med=26.17dB  elapsed=42.8m  ETA=40.7m
+  [cuda:1] 124/240  L19 down_proj E[128:256]  t=132.4s  Y_SNR_med=22.40dB  elapsed=43.2m  ETA=40.4m
+  [cuda:0] 125/240  L20 down_proj E[0:128]  t=41.7s  Y_SNR_med=23.55dB  elapsed=43.5m  ETA=40.0m
+  [cuda:0] 126/240  L21 gate_proj E[0:128]  t=19.8s  Y_SNR_med=26.95dB  elapsed=43.8m  ETA=39.7m
+  [cuda:0] 127/240  L21 gate_proj E[128:256]  t=19.4s  Y_SNR_med=26.86dB  elapsed=44.2m  ETA=39.3m
+  [cuda:0] 128/240  L21 up_proj E[0:128]  t=19.8s  Y_SNR_med=26.37dB  elapsed=44.5m  ETA=38.9m
+  [cuda:0] 129/240  L21 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.31dB  elapsed=44.8m  ETA=38.6m
+  [cuda:1] 130/240  L20 down_proj E[128:256]  t=131.4s  Y_SNR_med=23.55dB  elapsed=45.4m  ETA=38.4m
+  [cuda:0] 131/240  L21 down_proj E[0:128]  t=41.1s  Y_SNR_med=21.78dB  elapsed=45.5m  ETA=37.9m
+  [cuda:0] 132/240  L22 gate_proj E[0:128]  t=19.6s  Y_SNR_med=26.96dB  elapsed=45.8m  ETA=37.5m
+  [cuda:0] 133/240  L22 gate_proj E[128:256]  t=23.1s  Y_SNR_med=26.90dB  elapsed=46.2m  ETA=37.2m
+  [cuda:0] 134/240  L22 up_proj E[0:128]  t=21.0s  Y_SNR_med=26.57dB  elapsed=46.6m  ETA=36.8m
+  [cuda:0] 135/240  L22 up_proj E[128:256]  t=20.7s  Y_SNR_med=26.54dB  elapsed=46.9m  ETA=36.5m
+  [cuda:0] 136/240  L22 down_proj E[0:128]  t=41.6s  Y_SNR_med=21.66dB  elapsed=47.6m  ETA=36.4m
+  [cuda:1] 137/240  L21 down_proj E[128:256]  t=139.4s  Y_SNR_med=21.78dB  elapsed=47.7m  ETA=35.9m
+  [cuda:0] 138/240  L22 down_proj E[128:256]  t=43.3s  Y_SNR_med=21.66dB  elapsed=48.3m  ETA=35.7m
+  [cuda:1] 139/240  L23 gate_proj E[0:128]  t=48.1s  Y_SNR_med=27.09dB  elapsed=48.5m  ETA=35.3m
+  [cuda:0] 140/240  L23 gate_proj E[128:256]  t=20.4s  Y_SNR_med=27.08dB  elapsed=48.7m  ETA=34.8m
+  [cuda:0] 141/240  L23 up_proj E[128:256]  t=21.1s  Y_SNR_med=26.65dB  elapsed=49.0m  ETA=34.4m
+  [cuda:1] 142/240  L23 up_proj E[0:128]  t=47.2s  Y_SNR_med=26.69dB  elapsed=49.3m  ETA=34.0m
+  [cuda:0] 143/240  L23 down_proj E[0:128]  t=40.9s  Y_SNR_med=21.61dB  elapsed=49.7m  ETA=33.7m
+  [cuda:0] 144/240  L24 gate_proj E[0:128]  t=23.2s  Y_SNR_med=26.78dB  elapsed=50.1m  ETA=33.4m
+  [cuda:0] 145/240  L24 gate_proj E[128:256]  t=19.4s  Y_SNR_med=26.86dB  elapsed=50.4m  ETA=33.0m
+  [cuda:0] 146/240  L24 up_proj E[0:128]  t=19.8s  Y_SNR_med=26.33dB  elapsed=50.7m  ETA=32.7m
+  [cuda:0] 147/240  L24 up_proj E[128:256]  t=20.5s  Y_SNR_med=26.35dB  elapsed=51.1m  ETA=32.3m
+  [cuda:1] 148/240  L23 down_proj E[128:256]  t=136.8s  Y_SNR_med=21.61dB  elapsed=51.6m  ETA=32.1m
+  [cuda:0] 149/240  L24 down_proj E[0:128]  t=40.9s  Y_SNR_med=22.61dB  elapsed=51.8m  ETA=31.6m
+  [cuda:0] 150/240  L25 gate_proj E[0:128]  t=19.9s  Y_SNR_med=26.92dB  elapsed=52.1m  ETA=31.3m
+  [cuda:0] 151/240  L25 gate_proj E[128:256]  t=19.5s  Y_SNR_med=26.70dB  elapsed=52.4m  ETA=30.9m
+  [cuda:0] 152/240  L25 up_proj E[0:128]  t=20.2s  Y_SNR_med=26.40dB  elapsed=52.8m  ETA=30.5m
+  [cuda:0] 153/240  L25 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.27dB  elapsed=53.1m  ETA=30.2m
+  [cuda:0] 154/240  L25 down_proj E[0:128]  t=40.9s  Y_SNR_med=22.88dB  elapsed=53.8m  ETA=30.0m
+  [cuda:1] 155/240  L24 down_proj E[128:256]  t=132.4s  Y_SNR_med=22.61dB  elapsed=53.8m  ETA=29.5m
+  [cuda:0] 156/240  L25 down_proj E[128:256]  t=40.9s  Y_SNR_med=22.89dB  elapsed=54.5m  ETA=29.3m
+  [cuda:1] 157/240  L26 gate_proj E[0:128]  t=45.7s  Y_SNR_med=26.45dB  elapsed=54.6m  ETA=28.9m
+  [cuda:0] 158/240  L26 gate_proj E[128:256]  t=20.1s  Y_SNR_med=26.39dB  elapsed=54.8m  ETA=28.4m
+  [cuda:0] 159/240  L26 up_proj E[128:256]  t=20.0s  Y_SNR_med=26.08dB  elapsed=55.1m  ETA=28.1m
+  [cuda:1] 160/240  L26 up_proj E[0:128]  t=46.4s  Y_SNR_med=26.05dB  elapsed=55.3m  ETA=27.7m
+  [cuda:0] 161/240  L26 down_proj E[0:128]  t=40.9s  Y_SNR_med=22.46dB  elapsed=55.8m  ETA=27.4m
+  [cuda:0] 162/240  L27 gate_proj E[0:128]  t=19.9s  Y_SNR_med=26.33dB  elapsed=56.1m  ETA=27.0m
+  [cuda:0] 163/240  L27 gate_proj E[128:256]  t=19.5s  Y_SNR_med=26.25dB  elapsed=56.5m  ETA=26.7m
+  [cuda:0] 164/240  L27 up_proj E[0:128]  t=19.9s  Y_SNR_med=26.01dB  elapsed=56.8m  ETA=26.3m
+  [cuda:0] 165/240  L27 up_proj E[128:256]  t=20.4s  Y_SNR_med=25.96dB  elapsed=57.1m  ETA=26.0m
+  [cuda:1] 166/240  L26 down_proj E[128:256]  t=131.9s  Y_SNR_med=22.45dB  elapsed=57.5m  ETA=25.7m
+  [cuda:0] 167/240  L27 down_proj E[0:128]  t=40.9s  Y_SNR_med=22.79dB  elapsed=57.8m  ETA=25.3m
+  [cuda:0] 168/240  L28 gate_proj E[0:128]  t=22.4s  Y_SNR_med=26.38dB  elapsed=58.2m  ETA=24.9m
+  [cuda:0] 169/240  L28 gate_proj E[128:256]  t=19.5s  Y_SNR_med=26.30dB  elapsed=58.5m  ETA=24.6m
+  [cuda:0] 170/240  L28 up_proj E[0:128]  t=20.7s  Y_SNR_med=26.30dB  elapsed=58.9m  ETA=24.2m
+  [cuda:0] 171/240  L28 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.20dB  elapsed=59.2m  ETA=23.9m
+  [cuda:1] 172/240  L27 down_proj E[128:256]  t=134.9s  Y_SNR_med=22.80dB  elapsed=59.8m  ETA=23.6m
+  [cuda:0] 173/240  L28 down_proj E[0:128]  t=40.9s  Y_SNR_med=21.55dB  elapsed=59.9m  ETA=23.2m
+  [cuda:0] 174/240  L29 gate_proj E[0:128]  t=19.8s  Y_SNR_med=26.12dB  elapsed=60.2m  ETA=22.8m
+  [cuda:0] 175/240  L29 gate_proj E[128:256]  t=19.5s  Y_SNR_med=26.15dB  elapsed=60.5m  ETA=22.5m
+  [cuda:0] 176/240  L29 up_proj E[0:128]  t=20.0s  Y_SNR_med=26.12dB  elapsed=60.9m  ETA=22.1m
+  [cuda:0] 177/240  L29 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.05dB  elapsed=61.2m  ETA=21.8m
+  [cuda:0] 178/240  L29 down_proj E[0:128]  t=40.8s  Y_SNR_med=21.93dB  elapsed=61.9m  ETA=21.5m
+  [cuda:1] 179/240  L28 down_proj E[128:256]  t=131.3s  Y_SNR_med=21.56dB  elapsed=62.0m  ETA=21.1m
+  [cuda:0] 180/240  L29 down_proj E[128:256]  t=40.8s  Y_SNR_med=21.93dB  elapsed=62.5m  ETA=20.8m
+  [cuda:1] 181/240  L30 gate_proj E[0:128]  t=45.5s  Y_SNR_med=26.11dB  elapsed=62.7m  ETA=20.5m
+  [cuda:0] 182/240  L30 gate_proj E[128:256]  t=20.1s  Y_SNR_med=26.20dB  elapsed=62.9m  ETA=20.0m
+  [cuda:0] 183/240  L30 up_proj E[128:256]  t=19.6s  Y_SNR_med=25.95dB  elapsed=63.2m  ETA=19.7m
+  [cuda:1] 184/240  L30 up_proj E[0:128]  t=45.9s  Y_SNR_med=25.87dB  elapsed=63.5m  ETA=19.3m
+  [cuda:0] 185/240  L30 down_proj E[0:128]  t=40.9s  Y_SNR_med=21.54dB  elapsed=63.9m  ETA=19.0m
+  [cuda:0] 186/240  L31 gate_proj E[0:128]  t=19.9s  Y_SNR_med=26.14dB  elapsed=64.2m  ETA=18.6m
+  [cuda:0] 187/240  L31 gate_proj E[128:256]  t=19.6s  Y_SNR_med=26.09dB  elapsed=64.5m  ETA=18.3m
+  [cuda:0] 188/240  L31 up_proj E[0:128]  t=20.2s  Y_SNR_med=25.91dB  elapsed=64.9m  ETA=17.9m
+  [cuda:0] 189/240  L31 up_proj E[128:256]  t=19.6s  Y_SNR_med=25.87dB  elapsed=65.2m  ETA=17.6m
+  [cuda:1] 190/240  L30 down_proj E[128:256]  t=132.3s  Y_SNR_med=21.54dB  elapsed=65.7m  ETA=17.3m
+  [cuda:0] 191/240  L31 down_proj E[0:128]  t=41.1s  Y_SNR_med=21.70dB  elapsed=65.9m  ETA=16.9m
+  [cuda:0] 192/240  L32 gate_proj E[0:128]  t=20.0s  Y_SNR_med=26.14dB  elapsed=66.2m  ETA=16.6m
+  [cuda:0] 193/240  L32 gate_proj E[128:256]  t=19.6s  Y_SNR_med=26.15dB  elapsed=66.6m  ETA=16.2m
+  [cuda:0] 194/240  L32 up_proj E[0:128]  t=19.9s  Y_SNR_med=25.94dB  elapsed=66.9m  ETA=15.9m
+  [cuda:0] 195/240  L32 up_proj E[128:256]  t=19.5s  Y_SNR_med=26.00dB  elapsed=67.2m  ETA=15.5m
+  [cuda:0] 196/240  L32 down_proj E[0:128]  t=40.8s  Y_SNR_med=21.27dB  elapsed=67.9m  ETA=15.2m
+  [cuda:1] 197/240  L31 down_proj E[128:256]  t=131.9s  Y_SNR_med=21.70dB  elapsed=67.9m  ETA=14.8m
+  [cuda:0] 198/240  L32 down_proj E[128:256]  t=40.9s  Y_SNR_med=21.27dB  elapsed=68.6m  ETA=14.5m
+  [cuda:1] 199/240  L33 gate_proj E[0:128]  t=45.7s  Y_SNR_med=26.07dB  elapsed=68.7m  ETA=14.1m
+  [cuda:0] 200/240  L33 gate_proj E[128:256]  t=20.1s  Y_SNR_med=26.13dB  elapsed=68.9m  ETA=13.8m
+  [cuda:0] 201/240  L33 up_proj E[128:256]  t=19.5s  Y_SNR_med=25.95dB  elapsed=69.2m  ETA=13.4m
+  [cuda:1] 202/240  L33 up_proj E[0:128]  t=45.9s  Y_SNR_med=25.97dB  elapsed=69.4m  ETA=13.1m
+  [cuda:0] 203/240  L33 down_proj E[0:128]  t=41.0s  Y_SNR_med=21.55dB  elapsed=69.9m  ETA=12.7m
+  [cuda:0] 204/240  L34 gate_proj E[0:128]  t=19.9s  Y_SNR_med=25.96dB  elapsed=70.3m  ETA=12.4m
+  [cuda:0] 205/240  L34 gate_proj E[128:256]  t=19.5s  Y_SNR_med=25.97dB  elapsed=70.6m  ETA=12.0m
+  [cuda:0] 206/240  L34 up_proj E[0:128]  t=19.9s  Y_SNR_med=25.79dB  elapsed=70.9m  ETA=11.7m
+  [cuda:0] 207/240  L34 up_proj E[128:256]  t=19.5s  Y_SNR_med=25.76dB  elapsed=71.2m  ETA=11.4m
+  [cuda:1] 208/240  L33 down_proj E[128:256]  t=132.8s  Y_SNR_med=21.54dB  elapsed=71.7m  ETA=11.0m
+  [cuda:0] 209/240  L34 down_proj E[0:128]  t=41.0s  Y_SNR_med=21.13dB  elapsed=71.9m  ETA=10.7m
+  [cuda:0] 210/240  L35 gate_proj E[0:128]  t=19.9s  Y_SNR_med=25.72dB  elapsed=72.2m  ETA=10.3m
+  [cuda:0] 211/240  L35 gate_proj E[128:256]  t=19.6s  Y_SNR_med=25.56dB  elapsed=72.6m  ETA=10.0m
+  [cuda:0] 212/240  L35 up_proj E[0:128]  t=20.0s  Y_SNR_med=25.29dB  elapsed=72.9m  ETA=9.6m
+  [cuda:0] 213/240  L35 up_proj E[128:256]  t=19.5s  Y_SNR_med=25.23dB  elapsed=73.2m  ETA=9.3m
+  [cuda:1] 214/240  L34 down_proj E[128:256]  t=132.5s  Y_SNR_med=21.13dB  elapsed=73.9m  ETA=9.0m
+  [cuda:0] 215/240  L35 down_proj E[0:128]  t=41.0s  Y_SNR_med=21.14dB  elapsed=73.9m  ETA=8.6m
+  [cuda:0] 216/240  L36 gate_proj E[0:128]  t=20.0s  Y_SNR_med=25.43dB  elapsed=74.3m  ETA=8.3m
+  [cuda:0] 217/240  L36 gate_proj E[128:256]  t=19.5s  Y_SNR_med=25.48dB  elapsed=74.6m  ETA=7.9m
+  [cuda:0] 218/240  L36 up_proj E[0:128]  t=19.9s  Y_SNR_med=25.26dB  elapsed=74.9m  ETA=7.6m
+  [cuda:0] 219/240  L36 up_proj E[128:256]  t=19.6s  Y_SNR_med=25.31dB  elapsed=75.2m  ETA=7.2m
+  [cuda:0] 220/240  L36 down_proj E[0:128]  t=40.8s  Y_SNR_med=21.13dB  elapsed=75.9m  ETA=6.9m
+  [cuda:1] 221/240  L35 down_proj E[128:256]  t=131.6s  Y_SNR_med=21.15dB  elapsed=76.1m  ETA=6.5m
+  [cuda:0] 222/240  L36 down_proj E[128:256]  t=41.0s  Y_SNR_med=21.13dB  elapsed=76.6m  ETA=6.2m
+  [cuda:1] 223/240  L37 gate_proj E[0:128]  t=46.3s  Y_SNR_med=25.46dB  elapsed=76.8m  ETA=5.9m
+  [cuda:0] 224/240  L37 gate_proj E[128:256]  t=20.1s  Y_SNR_med=25.46dB  elapsed=76.9m  ETA=5.5m
+  [cuda:0] 225/240  L37 up_proj E[128:256]  t=19.5s  Y_SNR_med=25.33dB  elapsed=77.3m  ETA=5.2m
+  [cuda:1] 226/240  L37 up_proj E[0:128]  t=46.6s  Y_SNR_med=25.34dB  elapsed=77.6m  ETA=4.8m
+  [cuda:0] 227/240  L37 down_proj E[0:128]  t=41.8s  Y_SNR_med=21.26dB  elapsed=78.0m  ETA=4.5m
+  [cuda:0] 228/240  L38 gate_proj E[0:128]  t=20.7s  Y_SNR_med=25.81dB  elapsed=78.3m  ETA=4.1m
+  [cuda:0] 229/240  L38 gate_proj E[128:256]  t=19.5s  Y_SNR_med=25.73dB  elapsed=78.6m  ETA=3.8m
+  [cuda:0] 230/240  L38 up_proj E[0:128]  t=20.0s  Y_SNR_med=25.45dB  elapsed=79.0m  ETA=3.4m
+  [cuda:0] 231/240  L38 up_proj E[128:256]  t=19.5s  Y_SNR_med=25.46dB  elapsed=79.3m  ETA=3.1m
+  [cuda:1] 232/240  L37 down_proj E[128:256]  t=135.2s  Y_SNR_med=21.26dB  elapsed=79.9m  ETA=2.8m
+  [cuda:0] 233/240  L38 down_proj E[0:128]  t=42.7s  Y_SNR_med=21.25dB  elapsed=80.0m  ETA=2.4m
+  [cuda:0] 234/240  L39 gate_proj E[0:128]  t=20.0s  Y_SNR_med=26.16dB  elapsed=80.3m  ETA=2.1m
+  [cuda:0] 235/240  L39 gate_proj E[128:256]  t=19.9s  Y_SNR_med=26.12dB  elapsed=80.7m  ETA=1.7m
+  [cuda:0] 236/240  L39 up_proj E[0:128]  t=20.0s  Y_SNR_med=26.00dB  elapsed=81.0m  ETA=1.4m
+  [cuda:0] 237/240  L39 up_proj E[128:256]  t=19.8s  Y_SNR_med=25.97dB  elapsed=81.3m  ETA=1.0m
+  [cuda:0] 238/240  L39 down_proj E[0:128]  t=40.9s  Y_SNR_med=21.60dB  elapsed=82.0m  ETA=0.7m
+  [cuda:1] 239/240  L38 down_proj E[128:256]  t=132.1s  Y_SNR_med=21.26dB  elapsed=82.1m  ETA=0.3m
+  [cuda:0] 240/240  L39 down_proj E[128:256]  t=40.6s  Y_SNR_med=21.60dB  elapsed=82.7m  ETA=0.0m
+
+[task-queue] 240 tasks completed in 82.7min (20.7s/task average)
+
+[done] manifest: /home/kmbandy/models/qwen36-35b-ml8-quarotR1/manifest.json

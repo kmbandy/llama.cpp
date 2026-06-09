@@ -41,3 +41,7 @@ struct llama_sampler * common_reasoning_budget_init(
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 int32_t                       common_reasoning_budget_get_n_thinking(const struct llama_sampler * smpl);
+
+// Manually transition the reasoning budget sampler into the FORCING state.
+// Returns true if the transition occurred.
+bool common_reasoning_budget_force(struct llama_sampler * smpl);

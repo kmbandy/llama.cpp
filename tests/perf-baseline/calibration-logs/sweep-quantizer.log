@@ -1,0 +1,21 @@
+loaded /home/kmbandy/models/route-capture-L0-L20.pt: layers [0, 20]  device=cuda:0
+
+========================================================================
+LAYER 0 ffn_gate_exps:  E_sample=64  W_e=(512, 2048)  K=2048
+   config                     med Y_SNR   bpv note
+   baseline gs64 nc16 e4m3       32.06   ~4.25 (shipped)   (Δvs base +0.00)
+   gs32   nc16 e4m3              32.81   higher (2x group meta)   (Δvs base +0.75)
+   gs128  nc16 e4m3              31.52   lower (~4.1)   (Δvs base -0.54)
+   gs64   nc32 e4m3              34.78   higher (5-bit idx)   (Δvs base +2.72)
+   gs64   nc16 NONE              32.11   ~4.25, fp16 centroids (e4m3-cost isolation)   (Δvs base +0.05)
+   gs32   nc32 e4m3              35.46   highest (rich)   (Δvs base +3.40)
+
+========================================================================
+LAYER 20 ffn_gate_exps:  E_sample=64  W_e=(512, 2048)  K=2048
+   config                     med Y_SNR   bpv note
+   baseline gs64 nc16 e4m3       24.20   ~4.25 (shipped)   (Δvs base +0.00)
+   gs32   nc16 e4m3              24.87   higher (2x group meta)   (Δvs base +0.67)
+   gs128  nc16 e4m3              23.78   lower (~4.1)   (Δvs base -0.41)
+   gs64   nc32 e4m3              29.25   higher (5-bit idx)   (Δvs base +5.05)
+   gs64   nc16 NONE              24.46   ~4.25, fp16 centroids (e4m3-cost isolation)   (Δvs base +0.26)
+   gs32   nc32 e4m3              30.08   highest (rich)   (Δvs base +5.89)

@@ -1,0 +1,5 @@
+[base] /home/kmbandy/models/Qwen3.6-35B-A3B-bf16.gguf  arch='qwen35moe'  fields=48  tensors=753
+[blobs] 3 calibrated layers → ml8 tensors + sidecars
+[fields] copied 44 + 1 ml8 marker
+[tensors] dense_ml8=0, moe_ml8=3, centroids=3, rotation=3, awq=0, copied unchanged=750
+[done] {'out_path': '/home/kmbandy/models/synth-l0-test.gguf', 'n_ml8': 0, 'n_moe': 3, 'n_centroids': 3, 'n_rotation': 3, 'n_awq': 0, 'n_copied': 750, 'n_fields_copied': 44}

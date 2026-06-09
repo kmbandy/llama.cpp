@@ -1,0 +1,83 @@
+[load-hf] strategy=moe  Qwen/Qwen3.6-35B-A3B  dtype=torch.bfloat16  device=cuda:0
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+[meta-init] arch=qwen35moe  n_blocks=40  n_experts=256
+[pager] iter 5b — building catalog from /home/kmbandy/models/Qwen3.6-35B-A3B-bf16.gguf  slots=12  n_experts=256
+[pager-5b] moe_consolidated=123 shared_expert=123 dense_mlp=0 skipped(resident-bound)=630  max_slot=536.9 MB  pool=6.44 GB
+ggml_cuda_init: found 2 ROCm devices (Total VRAM: 48992 MiB):
+  Device 0: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+  Device 1: AMD Radeon RX 6900 XT, gfx1030 (0x1030), VMM: no, Wave Size: 32, VRAM: 16368 MiB
+wp::PoolAllocator: allocated 12 slots x 536870912 B (6144.0 MiB)
+wp::GpuTransport: device 0, stream + 6 events ready
+wp::create_file_io: SyncPread (fds=1)
+wp::PrefetchScheduler: queue_depth=4, max_page_size=536870912 (512.0 MiB pinned per slot)
+wp::WeightPager: 123 pages, 12 slots x 536870912 B (6144.0 MiB), prefetch_depth=4, sync_staging_pinned=1
+[pager] catalog: 123 entries  max_page=536.9 MB
+[swap] replaced 40 consolidated MoE expert blocks → PagedMoeExperts
+[meta-empty] materializing 2.45B resident params on cuda:0
+[resident-load] loaded=613  skipped_expert=0  no_mapping=0  missing_in_gguf=0
+[calib] loading 8 samples seq_len=1024
+[calib] got 8 samples (tokens ≈ 2352)
+[targets] 6 linears to quantize
+[moe-loop] 2 PagedMoeExperts blocks queued
+
+[hessian-pass] collecting H_gate_up + H_down on all 2 layers in one forward pass...
+[DIAG] page_in_sync_[0]: ENTER page=0 name=blk.0.ffn_gate_exps.weight file_idx=0 offset=1095218400 size=536870912
+[DIAG] page_in_sync_[0]: alloc_slot ok, slot=0 dst=0x7f14da200000
+[DIAG] page_in_sync_[0]: submit returned ok=1
+[DIAG] page_in_sync_[0]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[0]: stage1 done ok=1
+[DIAG] page_in_sync_[0]: stage_in returned evt=5
+[DIAG] page_in_sync_[0]: EXIT slot=0
+[DIAG] page_in_sync_[1]: ENTER page=1 name=blk.0.ffn_up_exps.weight file_idx=0 offset=1632089312 size=536870912
+[DIAG] page_in_sync_[1]: alloc_slot ok, slot=1 dst=0x7f14fa200000
+[DIAG] page_in_sync_[1]: submit returned ok=1
+[DIAG] page_in_sync_[1]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[1]: stage1 done ok=1
+[DIAG] page_in_sync_[1]: stage_in returned evt=5
+[DIAG] page_in_sync_[1]: EXIT slot=1
+[DIAG] page_in_sync_[2]: ENTER page=5 name=blk.0.ffn_down_exps.weight file_idx=0 offset=3847084000 size=536870912
+[DIAG] page_in_sync_[2]: alloc_slot ok, slot=2 dst=0x7f151a200000
+[DIAG] page_in_sync_[2]: submit returned ok=1
+[DIAG] page_in_sync_[2]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[2]: stage1 done ok=1
+[DIAG] page_in_sync_[2]: stage_in returned evt=5
+[DIAG] page_in_sync_[2]: EXIT slot=2
+[DIAG] page_in_sync_[3]: ENTER page=3 name=blk.1.ffn_gate_exps.weight file_idx=0 offset=2772940000 size=536870912
+[DIAG] page_in_sync_[3]: alloc_slot ok, slot=3 dst=0x7f153a200000
+[DIAG] page_in_sync_[3]: submit returned ok=1
+[DIAG] page_in_sync_[3]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[3]: stage1 done ok=1
+[DIAG] page_in_sync_[3]: stage_in returned evt=5
+[DIAG] page_in_sync_[3]: EXIT slot=3
+[DIAG] page_in_sync_[4]: ENTER page=4 name=blk.1.ffn_up_exps.weight file_idx=0 offset=3309810912 size=536870912
+[DIAG] page_in_sync_[4]: alloc_slot ok, slot=4 dst=0x7f155a200000
+[DIAG] page_in_sync_[4]: submit returned ok=1
+[DIAG] page_in_sync_[4]: wait_any returned req_id=18446744073709551615 status=0 bytes=536870912
+[DIAG] page_in_sync_[4]: stage1 done ok=1
+[DIAG] page_in_sync_[4]: stage_in returned evt=5
+[DIAG] page_in_sync_[4]: EXIT slot=4
+  [hessian-pass] 4/8 samples  elapsed=250.9s
+  [hessian-pass] 8/8 samples  elapsed=524.9s
+[hessian-pass] done in 524.9s (65.6s/sample)
+  L0 hessians: gate_up n_tok=18816  down n_tok=18816
+  L1 hessians: gate_up n_tok=18816  down n_tok=18816
+
+[task-queue] 24 tasks (E=64-chunks); workers: [('cuda:0', 4), ('cuda:1', 3)]
+[task-queue] down_proj kind uses group_size=32 (other kinds use 64)
+  [cuda:0] 1/24  L0 gate_proj E[64:128]  t=790.9s  Y_SNR_med=32.44dB  elapsed=13.2m  ETA=303.3m
+  [cuda:0] 2/24  L0 gate_proj E[128:192]  t=791.9s  Y_SNR_med=32.66dB  elapsed=13.2m  ETA=145.3m
+  [cuda:0] 3/24  L0 gate_proj E[192:256]  t=792.8s  Y_SNR_med=32.91dB  elapsed=13.2m  ETA=92.5m
+  [cuda:0] 4/24  L0 gate_proj E[0:64]  t=793.4s  Y_SNR_med=32.64dB  elapsed=13.2m  ETA=66.1m
+  [cuda:1] 5/24  L0 up_proj E[64:128]  t=1119.2s  Y_SNR_med=32.06dB  elapsed=18.7m  ETA=70.9m
+  [cuda:1] 6/24  L0 up_proj E[128:192]  t=1119.4s  Y_SNR_med=32.13dB  elapsed=18.7m  ETA=56.0m
+  [cuda:1] 7/24  L0 up_proj E[0:64]  t=1121.0s  Y_SNR_med=31.93dB  elapsed=18.7m  ETA=45.4m
+  [cuda:0] 8/24  L0 down_proj E[0:64]  t=405.4s  Y_SNR_med=22.42dB  elapsed=20.0m  ETA=39.9m
+  [cuda:0] 9/24  L0 down_proj E[64:128]  t=405.8s  Y_SNR_med=22.41dB  elapsed=20.0m  ETA=33.3m
+  [cuda:0] 10/24  L0 down_proj E[128:192]  t=405.6s  Y_SNR_med=22.40dB  elapsed=20.0m  ETA=28.0m
+  [cuda:1] 11/24  L0 down_proj E[192:256]  t=456.6s  Y_SNR_med=22.41dB  elapsed=26.3m  ETA=31.0m
+  [cuda:0] 12/24  L0 up_proj E[192:256]  t=807.2s  Y_SNR_med=32.35dB  elapsed=26.6m  ETA=26.6m
+  [cuda:0] 13/24  L1 gate_proj E[128:192]  t=842.2s  Y_SNR_med=28.69dB  elapsed=34.0m  ETA=28.8m
+  [cuda:0] 14/24  L1 up_proj E[0:64]  t=840.9s  Y_SNR_med=28.46dB  elapsed=34.0m  ETA=24.3m
+  [cuda:0] 15/24  L1 gate_proj E[192:256]  t=841.7s  Y_SNR_med=28.75dB  elapsed=34.0m  ETA=20.4m
+/usr/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-kbjv4huf'}
+  warnings.warn(

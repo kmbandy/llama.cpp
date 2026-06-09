@@ -1,0 +1,172 @@
+[  0%] Built target triton_aot_vector_add
+[  0%] Built target triton_aot_uattn_reduce
+[  0%] Built target llama-common-base
+[  0%] Built target triton_aot_uattn_3d
+[  0%] Built target cpp-httplib
+[  1%] Built target ggml-base
+[  5%] Built target aiter_triton_aot
+[  8%] Built target ggml-cpu
+[  8%] Building HIP object ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/ml8.cu.o
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:4:
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cuh:29:
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/common.cuh:1458:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+ 1458 |                 cudaDeviceGetStreamPriorityRange(&least, &greatest);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:141:42: note: expanded from macro 'cudaDeviceGetStreamPriorityRange'
+  141 | #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+      |                                          ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:158:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  158 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:175:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  175 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:176:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  176 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:185:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  185 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:186:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  186 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:203:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  203 |         cudaFree(kv.second.info.b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:204:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  204 |         cudaFree(kv.second.info.b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+8 warnings generated when compiling for gfx1030.
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:4:
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cuh:29:
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/common.cuh:1458:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+ 1458 |                 cudaDeviceGetStreamPriorityRange(&least, &greatest);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:141:42: note: expanded from macro 'cudaDeviceGetStreamPriorityRange'
+  141 | #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+      |                                          ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:158:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  158 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:175:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  175 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:176:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  176 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:185:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  185 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:186:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  186 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:203:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  203 |         cudaFree(kv.second.info.b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:204:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  204 |         cudaFree(kv.second.info.b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+8 warnings generated when compiling for gfx1201.
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:4:
+In file included from /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cuh:29:
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/common.cuh:1458:17: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+ 1458 |                 cudaDeviceGetStreamPriorityRange(&least, &greatest);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:141:42: note: expanded from macro 'cudaDeviceGetStreamPriorityRange'
+  141 | #define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+      |                                          ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:158:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  158 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:175:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  175 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:176:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  176 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:185:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  185 |         cudaFree(d_b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:186:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  186 |         cudaFree(d_b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:203:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  203 |         cudaFree(kv.second.info.b_packed);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/ml8.cu:204:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  204 |         cudaFree(kv.second.info.b_scale);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/vendors/hip.h:94:18: note: expanded from macro 'cudaFree'
+   94 | #define cudaFree hipFree
+      |                  ^
+8 warnings generated when compiling for host.
+[  8%] Linking HIP shared library ../../../bin/libggml-hip.so
+[ 46%] Built target ggml-hip
+[ 48%] Linking CXX shared library ../../bin/libggml.so
+[ 48%] Built target ggml
+[ 48%] Linking CXX shared library ../bin/libllama.so
+[ 89%] Built target llama
+[ 89%] Linking CXX shared library ../bin/libllama-common.so
+[ 98%] Built target llama-common
+[100%] Linking CXX executable ../../bin/llama-completion
+[100%] Built target llama-completion

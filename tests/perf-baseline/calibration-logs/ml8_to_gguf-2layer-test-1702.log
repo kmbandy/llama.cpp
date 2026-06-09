@@ -1,0 +1,3 @@
+[base] /home/kmbandy/models/Qwen3.6-35B-A3B-bf16.gguf  arch='qwen35moe'  fields=48  tensors=753
+[blobs] 6 calibrated layers → ml8 tensors + sidecars
+[fields] copied 44 + 1 ml8 marker
