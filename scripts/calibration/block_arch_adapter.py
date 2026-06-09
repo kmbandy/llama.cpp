@@ -36,14 +36,23 @@ class Qwen35BlockAdapter(DefaultBlockAdapter):
     #   LINEARS ['linear_attn.out_proj', 'linear_attn.in_proj_qkv', 'linear_attn.in_proj_z',
     #            'linear_attn.in_proj_b', 'linear_attn.in_proj_a',
     #            'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']
-    # FP8-tier (not ML8 targets, excluded from groups):
-    #   linear_attn.out_proj, linear_attn.in_proj_a, linear_attn.in_proj_b, mlp.down_proj
-    # ML8-tier targets (confirmed by probe):
-    #   linear_attn.in_proj_qkv, linear_attn.in_proj_z  -- read block input together
-    #   mlp.gate_proj, mlp.up_proj                        -- read FFN input together
+    # Which leaves are ML8 targets is decided PER-RUN by the tier map (is_ml8),
+    # NOT hardcoded here — ml8_targets filters every sub-group by is_ml8(), so a leaf
+    # tiered fp8/native (linear_attn.out_proj / in_proj_a / in_proj_b by default, or
+    # mlp.down_proj under ML8_TIER_OVERRIDE=ffn_down=fp8) drops out cleanly, and a leaf
+    # tiered ml8 (mlp.down_proj by default) is included. The sub-group SHAPE below only
+    # encodes causal DEPENDENCY ORDER (which leaves share an input / must be quantized
+    # before which), so it is safe to list every quantizable leaf — the tier map gates
+    # membership. (Bugfix: down_proj was previously omitted here, so under default
+    # tiering it was silently dropped — neither ml8 nor fp8 — leaving the highest-slack
+    # FFN tensor unquantized unless an override forced it to fp8.)
+    #   in_proj_qkv, in_proj_z   -- read block input together
+    #   gate_proj, up_proj       -- read FFN input together
+    #   down_proj                -- reads the (quantized) FFN intermediate -> own sub-group, LAST
     _SSM_GROUPS = [
         ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"],
         ["mlp.gate_proj", "mlp.up_proj"],
+        ["mlp.down_proj"],
     ]
     # Full-attention block kind (best-effort; 0.8B is all delta-net, validated
     # later by the run_block equivalence gate):
@@ -51,6 +60,7 @@ class Qwen35BlockAdapter(DefaultBlockAdapter):
         ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
         ["self_attn.o_proj"],
         ["mlp.gate_proj", "mlp.up_proj"],
+        ["mlp.down_proj"],
     ]
 
     def ml8_targets(self, block, block_idx, is_ml8):
