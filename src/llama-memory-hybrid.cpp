@@ -88,7 +88,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         // pre-allocates K/V for ALL layers (including recurrent ones that
         // never use it), wasting up to ~7×n_layer worth of VRAM.
         filter_attn ? filter_attn : llama_kv_cache_paged::layer_filter_cb(
-            [&](int32_t il) { return !hparams.is_recurrent(il); }),
+            [&](int32_t il) { return !hparams.is_recr(il); }),
         type_k,
         type_v
     ) : nullptr),
