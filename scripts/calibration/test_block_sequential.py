@@ -129,3 +129,95 @@ def test_walk_propagates_quantized_output_to_next_block():
     # all-zero input; its target Hessian must be all-zero. If propagation were
     # missing (block 2 saw the ORIGINAL block-1 output) H would be nonzero.
     assert torch.count_nonzero(seen[names[1]]) == 0, "block 2 did NOT see quantized upstream"
+
+
+def test_walk_evicts_paged_weight_override_after_each_block():
+    """Regression for the dense-PAGED VRAM leak: quantize_one_target leaves a full-size
+    weight_override on the (PagedLinear) layer; the resident-path eviction is gated on
+    args.resident so it never runs in the paged walk → overrides accumulate ∝ block index
+    → OOM mid-walk on 4B+. run_walk must evict each block's overrides AFTER propagate."""
+    import torch
+    from block_sequential import run_walk
+    from block_arch_adapter import SubGroup
+    k = 4
+    class PagedLike(torch.nn.Linear):
+        """nn.Linear whose forward reads weight_override when set (mimics PagedLinear)."""
+        def __init__(s): super().__init__(k, k, bias=False); s.weight_override = None
+        def forward(s, x):
+            w = s.weight_override if s.weight_override is not None else s.weight
+            return torch.nn.functional.linear(x, w)
+    class Blk(torch.nn.Module):
+        def __init__(s): super().__init__(); s.lin = PagedLike()
+        def forward(s, x, **kw): return s.lin(x)
+    class M(torch.nn.Module):
+        def __init__(s):
+            super().__init__()
+            class Inner(torch.nn.Module):
+                def __init__(ss): super().__init__(); ss.layers = torch.nn.ModuleList([Blk(), Blk()])
+            s.model = Inner()
+        def forward(s, x):
+            h = x
+            for b in s.model.layers: h = b(h)
+            return h
+    torch.manual_seed(0)
+    m = M()
+    # Mimic the paged quantize_one_target: SET a full-size weight_override (do not null it).
+    def fake_quantize(name, layer, idx, H, n_tok, sum_abs, rotation_hook):
+        layer.weight_override = layer.weight.detach().clone()
+    class Adapter:
+        def iter_blocks(s, model): return list(model.model.layers)
+        def run_block(s, b, args, kwargs): return b(*args, **kwargs), kwargs
+        def ml8_targets(s, b, i, is_ml8): return [SubGroup(names=["lin"])]
+    calib = [torch.randn(2, k) for _ in range(2)]
+    run_walk(m, Adapter(), calib, "cpu",
+             is_ml8=lambda n: True, quantize_fn=fake_quantize,
+             hook_factory=_make_hook_factory())
+    # After the walk every block's override must be evicted (else it's the VRAM leak).
+    leaked = [n for n, mod in m.named_modules()
+              if getattr(mod, "weight_override", None) is not None]
+    assert leaked == [], f"weight_override not evicted (VRAM leak) on: {leaked}"
+
+
+def test_walk_frees_hessian_on_hook_after_quantize():
+    """Regression for the DOMINANT dense-PAGED VRAM leak: collect_block_hessians returns
+    the FaithfulActHook's H by reference, and the always-on hook keeps it alive after the
+    leaf is quantized (remove() is a no-op) → one [in_feat,in_feat] Hessian accumulates per
+    target ∝ block index → OOM. run_walk must reset_hessian() after each quantize so H frees."""
+    import torch
+    from block_sequential import run_walk
+    from block_arch_adapter import SubGroup
+    k = 4
+    made = []   # every hook instance the walk creates (mimics always-on persistent hooks)
+    def recording_factory():
+        base = _make_hook_factory()
+        class _Rec(base):
+            def __init__(s): super().__init__(); made.append(s)
+        return _Rec
+    class Blk(torch.nn.Module):
+        def __init__(s): super().__init__(); s.lin = torch.nn.Linear(k, k, bias=False)
+        def forward(s, x, **kw): return s.lin(x)
+    class M(torch.nn.Module):
+        def __init__(s):
+            super().__init__()
+            class Inner(torch.nn.Module):
+                def __init__(ss): super().__init__(); ss.layers = torch.nn.ModuleList([Blk(), Blk()])
+            s.model = Inner()
+        def forward(s, x):
+            h = x
+            for b in s.model.layers: h = b(h)
+            return h
+    torch.manual_seed(0)
+    m = M()
+    def fake_quantize(name, layer, idx, H, n_tok, sum_abs, rotation_hook):
+        assert H is not None   # H must be live at quantize time
+    class Adapter:
+        def iter_blocks(s, model): return list(model.model.layers)
+        def run_block(s, b, args, kwargs): return b(*args, **kwargs), kwargs
+        def ml8_targets(s, b, i, is_ml8): return [SubGroup(names=["lin"])]
+    calib = [torch.randn(2, k) for _ in range(2)]
+    run_walk(m, Adapter(), calib, "cpu",
+             is_ml8=lambda n: True, quantize_fn=fake_quantize,
+             hook_factory=recording_factory())
+    assert made, "no hooks were created"
+    held = [i for i, hk in enumerate(made) if getattr(hk, "H", None) is not None]
+    assert held == [], f"Hessian not freed on {len(held)} hook(s) after quantize (VRAM leak)"

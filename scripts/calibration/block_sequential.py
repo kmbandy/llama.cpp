@@ -89,6 +89,7 @@ def run_walk(model, adapter, calib, device, is_ml8, quantize_fn, hook_factory):
         groups = adapter.ml8_targets(block, b_idx, is_ml8)
         leaf_to_mod = dict(block.named_modules())
         prefix = _block_prefix(model, b_idx)   # e.g. "model.layers.3."
+        quantized_mods = []   # this block's quantized leaves (for post-propagate eviction)
         for grp in groups:
             # (a) collect H for this sub-group against the CURRENT (quantized-upstream
             #     + quantized-earlier-subgroup) block state. Reuse Task 2's collector.
@@ -100,11 +101,24 @@ def run_walk(model, adapter, calib, device, is_ml8, quantize_fn, hook_factory):
             # (b) quantize each target in the sub-group (writeback => intra-block causal)
             for leaf in grp.names:
                 H, n_tok = Hs[leaf]
-                quantize_fn(prefix + leaf, leaf_to_mod[leaf], global_idx,
+                mod = leaf_to_mod[leaf]
+                quantize_fn(prefix + leaf, mod, global_idx,
                             H, n_tok, None, hooks[leaf].rotation)
+                quantized_mods.append(mod)
                 global_idx += 1
+                # VRAM-leak fix (dominant): collect_block_hessians returns hk.H BY
+                # REFERENCE, and the always-on FaithfulActHook keeps fa.H alive after
+                # the walk moves on (remove() is a deliberate no-op so the faithful
+                # transform stays active). H is dead once this leaf is quantized — null
+                # it on the persistent hook so the [in_feat,in_feat] fp32 Hessian is
+                # freed now instead of accumulating one-per-target ∝ block index (the
+                # bigger half of the OOM; weight_override eviction below is the rest).
+                hooks[leaf].reset_hessian()
                 hooks[leaf].remove()
-        # (c) propagate: re-forward the fully-quantized block to build next inputs
+            del Hs   # drop this sub-group's GPU Hessians (the dict's last reference)
+        # (c) propagate: re-forward the fully-quantized block to build next inputs.
+        #     PagedLinear.forward reads weight_override, so the just-quantized leaves'
+        #     overrides MUST still be live here — evict only AFTER propagate.
         nxt = []
         for args, kwargs in inps:
             out, nkw = adapter.run_block(block, args, kwargs)
@@ -112,6 +126,19 @@ def run_walk(model, adapter, calib, device, is_ml8, quantize_fn, hook_factory):
                 raise RuntimeError(f"block-sequential: non-finite activations after block {b_idx}")
             nxt.append(((out.detach(),), nkw))
         inps = nxt
+        # (d) VRAM-leak fix: in the dense PAGED path (args.resident=False) the FFN linears
+        #     are PagedLinear and quantize_one_target leaves a full-size weight_override on
+        #     the GPU (the resident-path eviction at calibrate_ml8_paged.py:1052-1059 is
+        #     gated on args.resident, so it never runs here). The walk is forward-only —
+        #     once block b is propagated its overrides are never read again and the
+        #     quantized blob is already on disk — so drop them now. Without this, peak VRAM
+        #     grows ~one FFN-linear per quantized layer (∝ block index) → OOM mid-walk on
+        #     4B+. Resident path already nulled these, so this is a harmless no-op there.
+        for mod in quantized_mods:
+            if getattr(mod, "weight_override", None) is not None:
+                mod.weight_override = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()   # return the freed overrides to the driver (rocm-smi-visible)
         _memlog(f"block {b_idx} after propagate")
     return global_idx
 
