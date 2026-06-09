@@ -763,6 +763,7 @@ public:
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
+    ggml_tensor * t_h_pre_norm  = nullptr;  // MTP draft-loop pre-norm hidden state (our custom slot)
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
