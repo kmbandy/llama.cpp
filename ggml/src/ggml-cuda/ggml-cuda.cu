@@ -4262,6 +4262,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // ml8: rotation → mul_mat (G.6.d). The FWHT + H_a^T fold into the GEMM's
+    // activation-quantize prologue, eliding the rotation node entirely.
+    if (node->op == GGML_OP_ML8_APPLY_ROTATION &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ML8_APPLY_ROTATION, GGML_OP_ML8_MUL_MAT }, { i + 1 }) &&
+        ggml_cuda_ml8_can_fuse_rot_mm(cgraph->nodes[i], cgraph->nodes[i + 1])) {
+        ggml_cuda_op_ml8_mul_mat_fused(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];

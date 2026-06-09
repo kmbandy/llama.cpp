@@ -769,16 +769,31 @@ static bool ml8_gemv_dispatch_env(
 static constexpr int ML8_ACT_QUANT_TPB = 256;
 
 static __global__ void ml8_quantize_activations_kernel(
-    const float * __restrict__ src,        // [M, K] row-major
+    const float * __restrict__ src,        // [M_valid, K] row-major
     uint8_t     * __restrict__ a_fp8,      // [M, K] row-major
     float       * __restrict__ a_scale,    // [M]
-    int K) {
+    int K,
+    int M_valid) {
 
     const int m = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const float   * row_in  = src   + (size_t) m * (size_t) K;
     uint8_t       * row_out = a_fp8 + (size_t) m * (size_t) K;
+
+    // GEMM M-padding row: emit zero fp8 + epsilon scale without touching
+    // src (which only has M_valid rows). Identical output to the old
+    // zero-padded-staging path: quantize(0) = 0x00, absmax 0 → eps scale.
+    if (m >= M_valid) {
+        for (int k = tid; k < K; k += ML8_ACT_QUANT_TPB) {
+            row_out[k] = 0;
+        }
+        if (tid == 0) {
+            a_scale[m] = ML8_ACT_SCALE_EPS;
+        }
+        return;
+    }
+
+    const float   * row_in  = src   + (size_t) m * (size_t) K;
 
     // Stage 1: per-thread local absmax across the row.
     float local_max = 0.0f;
@@ -820,10 +835,12 @@ void ggml_cuda_ml8_quantize_activations(
     void *        dst_a_fp8,
     float *       dst_a_scale,
     int32_t       M,
-    int32_t       K) {
+    int32_t       K,
+    int32_t       M_valid) {
 
     GGML_ASSERT(M > 0);
     GGML_ASSERT(K > 0);
+    GGML_ASSERT(M_valid > 0 && M_valid <= M);
     GGML_ASSERT(src_fp32   != nullptr);
     GGML_ASSERT(dst_a_fp8  != nullptr);
     GGML_ASSERT(dst_a_scale != nullptr);
@@ -835,26 +852,140 @@ void ggml_cuda_ml8_quantize_activations(
         src_fp32,
         (uint8_t *) dst_a_fp8,
         dst_a_scale,
-        K);
+        K,
+        M_valid);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// G.6.d — fused rotation+quantize GEMM prologue.
+//
+// One block per output row m: load x[m] into LDS, run the H_b FWHT on each
+// of the a_dim slices of length b_dim, apply the small H_a^T left-multiply
+// in registers, then absmax-reduce / e4m3-quantize the rotated row straight
+// into (a_fp8, a_scale). Replaces the per-GEMM chain
+//   memcpy(z) → mt_turbo_fp8_fwht → ml8_h_a_left_multiply →
+//   [pad memset+memcpy] → ml8_quantize_activations
+// with a single launch.
+//
+// Bit-equivalence to the unfused chain, piece by piece:
+//   * butterfly: same pairing (partner = tid ^ stride) and same lower/upper
+//     (a+b) / (partner−self) assignment as mt_turbo_fp8_fwht_kernel, same
+//     stage order, same final ×rsqrtf(b_dim) normalize;
+//   * H_a^T: same sequential-i accumulation as ml8_h_a_left_multiply_kernel;
+//   * quantize: fmaxf absmax is exact regardless of reduction shape, then
+//     the same scale/eps/e4m3 math as ml8_quantize_activations_kernel.
+//
+// blockDim.x = b_dim (pow2, 16..1024); dynamic LDS = K fp32 (gated by
+// ggml_cuda_ml8_can_fuse_rot_mm to fit with the static reduce array).
+// Rows m ≥ M_valid are GEMM padding: zero fp8 + eps scale, src not read.
+static __global__ void ml8_fused_rot_quant_kernel(
+    const float * __restrict__ x,        // [M_valid, K] row-major, pre-rotation
+    const float * __restrict__ h_a,      // [a_dim, a_dim] row-major
+    uint8_t     * __restrict__ a_fp8,    // [M, K] row-major
+    float       * __restrict__ a_scale,  // [M]
+    int K,
+    int a_dim,
+    int b_dim,
+    int M_valid) {
+
+    extern __shared__ float s_z[];       // K floats: slice a at s_z[a*b_dim ..]
+    __shared__ float s_red[1024];        // absmax reduce, blockDim ≤ 1024
+
+    const int m   = blockIdx.x;
+    const int tid = threadIdx.x;         // lane l in [0, b_dim)
+
+    uint8_t * row_out = a_fp8 + (size_t) m * (size_t) K;
+
+    if (m >= M_valid) {
+        for (int k = tid; k < K; k += b_dim) {
+            row_out[k] = 0;
+        }
+        if (tid == 0) {
+            a_scale[m] = ML8_ACT_SCALE_EPS;
+        }
+        return;
+    }
+
+    const float * row_in = x + (size_t) m * (size_t) K;
+    for (int k = tid; k < K; k += b_dim) {
+        s_z[k] = row_in[k];
+    }
+    __syncthreads();
+
+    // FWHT per a-slice. Read both pair elements for every slice into
+    // registers before any write (the read/sync/write/sync schedule of
+    // mt_turbo_fp8_fwht_kernel, with the slice loop hoisted inside).
+    float r_new[16];                     // a_dim ≤ 16, gated by can_fuse
+    for (int stride = 1; stride < b_dim; stride <<= 1) {
+        const int partner = tid ^ stride;
+        for (int a = 0; a < a_dim; a++) {
+            const float v = s_z[a * b_dim + tid];
+            const float p = s_z[a * b_dim + partner];
+            r_new[a] = ((tid & stride) == 0) ? (v + p) : (p - v);
+        }
+        __syncthreads();
+        for (int a = 0; a < a_dim; a++) {
+            s_z[a * b_dim + tid] = r_new[a];
+        }
+        __syncthreads();
+    }
+
+    // Normalize, then Y[k][l] = sum_i H_a[i, k] * Z[i][l] (per-thread lane).
+    const float inv_sqrt_b = rsqrtf((float) b_dim);
+    float z_col[16];
+    for (int i = 0; i < a_dim; i++) {
+        z_col[i] = s_z[i * b_dim + tid] * inv_sqrt_b;
+    }
+    float y_col[16];
+    float local_max = 0.0f;
+    for (int k = 0; k < a_dim; k++) {
+        float s = 0.0f;
+        for (int i = 0; i < a_dim; i++) {
+            s += h_a[i * a_dim + k] * z_col[i];
+        }
+        y_col[k] = s;
+        local_max = fmaxf(local_max, fabsf(s));
+    }
+
+    s_red[tid] = local_max;
+    __syncthreads();
+    for (int off = b_dim / 2; off > 0; off >>= 1) {
+        if (tid < off) {
+            s_red[tid] = fmaxf(s_red[tid], s_red[tid + off]);
+        }
+        __syncthreads();
+    }
+
+    const float scale     = fmaxf(s_red[0] * (1.0f / ML8_FP8_E4M3_MAX), ML8_ACT_SCALE_EPS);
+    const float inv_scale = 1.0f / scale;
+    if (tid == 0) {
+        a_scale[m] = scale;
+    }
+
+    for (int k = 0; k < a_dim; k++) {
+        row_out[k * b_dim + tid] = ml8_fp32_to_e4m3(y_col[k] * inv_scale);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // GGML_OP_ML8_MUL_MAT HIP dispatch.
 // ─────────────────────────────────────────────────────────────────────
 
-void ggml_cuda_op_ml8_mul_mat(
+#ifdef GGML_HIP_AITER
+// Shared core for the plain and fused ML8_MUL_MAT dispatch. `x` is the fp32
+// activation input; when `h_a` is non-null, `x` is the PRE-rotation tensor
+// (rot->src[0]) and the fused rotation+quantize prologue runs instead of the
+// plain quantize (G.6.d). Shape/gate validation for the fused case happens
+// in ggml_cuda_ml8_can_fuse_rot_mm before the graph picks this path.
+static void ml8_mul_mat_core(
     ggml_backend_cuda_context & ctx,
-    ggml_tensor *               dst) {
-#ifndef GGML_HIP_AITER
-    // ml8 inference dispatches through the AITER Triton-AOT GEMM, only built with
-    // -DGGML_HIP_AITER=ON. Without it ml8 inference is unavailable (the box that
-    // calibrates ml8 weights and the box that runs them can differ — gfx1201 runs).
-    GGML_UNUSED(ctx); GGML_UNUSED(dst);
-    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
-#else
+    ggml_tensor *               dst,
+    const ggml_tensor *         x,
+    const ggml_tensor *         h_a,
+    int32_t                     a_dim,
+    int32_t                     b_dim) {
     const ggml_tensor * w    = dst->src[0];
     const ggml_tensor * cent = dst->src[1];
-    const ggml_tensor * x    = dst->src[2];
 
     GGML_ASSERT(w    != nullptr && cent != nullptr && x != nullptr);
     GGML_ASSERT(w->type    == GGML_TYPE_ML8_4);
@@ -888,6 +1019,13 @@ void ggml_cuda_op_ml8_mul_mat(
     GGML_ASSERT(cent->ne[0] == n_centroids);
     GGML_ASSERT(cent->ne[1] == n_groups_k);
 
+    if (h_a != nullptr) {
+        GGML_ASSERT(h_a->type == GGML_TYPE_F32 && ggml_is_contiguous(h_a));
+        GGML_ASSERT(a_dim > 0 && a_dim <= 16);
+        GGML_ASSERT((int64_t) a_dim * (int64_t) b_dim == (int64_t) K);
+        GGML_ASSERT(h_a->ne[0] == a_dim && h_a->ne[1] == a_dim);
+    }
+
     cudaStream_t stream = ctx.stream();
 
     // ── 1. Repack weights (cached after first call for this w).
@@ -899,7 +1037,7 @@ void ggml_cuda_op_ml8_mul_mat(
     // path at 20.30 t/s, 60% of f16 reference 50.89 t/s). Set ML8_NO_GEMV=1
     // to disable and fall back to the Triton blockscale path (kept for A/B).
     static const bool ml8_no_gemv = (std::getenv("ML8_NO_GEMV") != nullptr);
-    if (M == 1 && !ml8_no_gemv) {
+    if (M == 1 && !ml8_no_gemv && h_a == nullptr) {
         const bool ok = ml8_gemv_dispatch_env(
             stream,
             (const float *)   x->data,
@@ -919,40 +1057,43 @@ void ggml_cuda_op_ml8_mul_mat(
     const mt_ml8_tuned_cfg pad_cfg = ml8_pick_config(M, K, N);
     const int32_t M_pad = ((M + pad_cfg.bm - 1) / pad_cfg.bm) * pad_cfg.bm;
 
-    // Padded fp32 activations (M_pad × K). Zero-pad the trailing rows
-    // so they produce zero output — the dst slice ignores them anyway.
-    ggml_cuda_pool_alloc<float> x_padded(ctx.pool());
-    const float * x_src;
-    if (M_pad == M) {
-        x_src = (const float *) x->data;
-    } else {
-        x_padded.alloc((size_t) M_pad * (size_t) K);
-        CUDA_CHECK(cudaMemsetAsync(x_padded.get(), 0,
-            (size_t) M_pad * (size_t) K * sizeof(float), stream));
-        CUDA_CHECK(cudaMemcpyAsync(x_padded.get(), x->data,
-            (size_t) M * (size_t) K * sizeof(float),
-            cudaMemcpyDeviceToDevice, stream));
-        x_src = x_padded.get();
-    }
-
-    // ── 3. Quantize fp32 → fp8 + per-row scale.
+    // ── 3. Quantize fp32 → fp8 + per-row scale. M-padding is folded into
+    // the kernels (rows ≥ M emit zero fp8 + eps scale), so no zero-padded
+    // fp32 staging copy of x is needed.
     ggml_cuda_pool_alloc<uint8_t> a_fp8(ctx.pool(),    (size_t) M_pad * (size_t) K);
     ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) M_pad);
 
+    const float * x_src = (const float *) x->data;
+
     // G.6.g.C: dump pre-quant fp32 activation that the kernel will see.
+    // (The fused-rotation path never dumps: can_fuse gates on ML8_DUMP off.)
     if (ml8_dump_enabled() && !g_ml8_dump_quant_done.load()) {
-        const int64_t shp[2] = { (int64_t) K, (int64_t) M_pad };
+        const int64_t shp[2] = { (int64_t) K, (int64_t) M };
         ml8_dump_fp32("/tmp/ml8_hip_x_prequant.bin", x_src,
-                      (size_t) M_pad * (size_t) K, stream, 2, shp);
+                      (size_t) M * (size_t) K, stream, 2, shp);
     }
 
-    ggml_cuda_ml8_quantize_activations(
-        stream,
-        x_src,
-        a_fp8.get(),
-        a_scale.get(),
-        M_pad,
-        K);
+    if (h_a != nullptr) {
+        // G.6.d fused prologue: FWHT + H_a^T + quantize in one launch.
+        const dim3   grid((unsigned) M_pad, 1, 1);
+        const dim3   block((unsigned) b_dim, 1, 1);
+        const size_t lds_bytes = (size_t) K * sizeof(float);
+        ml8_fused_rot_quant_kernel<<<grid, block, lds_bytes, stream>>>(
+            x_src,
+            (const float *) h_a->data,
+            a_fp8.get(),
+            a_scale.get(),
+            K, a_dim, b_dim, M);
+    } else {
+        ggml_cuda_ml8_quantize_activations(
+            stream,
+            x_src,
+            a_fp8.get(),
+            a_scale.get(),
+            M_pad,
+            K,
+            M);
+    }
 
     // G.6.g.C: dump fp8 quantized activations + per-row scale on first call.
     if (ml8_dump_enabled() && !g_ml8_dump_quant_done.exchange(true)) {
@@ -1009,6 +1150,81 @@ void ggml_cuda_op_ml8_mul_mat(
         ml8_dump_fp32("/tmp/ml8_hip_y_out.bin", (const float *) dst->data,
                       (size_t) M * (size_t) N, stream, 2, shape);
     }
+}
+#endif // GGML_HIP_AITER
+
+void ggml_cuda_op_ml8_mul_mat(
+    ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst) {
+#ifndef GGML_HIP_AITER
+    // ml8 inference dispatches through the AITER Triton-AOT GEMM, only built with
+    // -DGGML_HIP_AITER=ON. Without it ml8 inference is unavailable (the box that
+    // calibrates ml8 weights and the box that runs them can differ — gfx1201 runs).
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
+    ml8_mul_mat_core(ctx, dst, dst->src[2], /*h_a=*/nullptr, 0, 0);
+#endif // GGML_HIP_AITER
+}
+
+bool ggml_cuda_ml8_can_fuse_rot_mm(
+    const ggml_tensor * rot,
+    const ggml_tensor * mm) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(rot); GGML_UNUSED(mm);
+    return false;
+#else
+    static const bool no_fuse = (std::getenv("ML8_NO_FUSE") != nullptr);
+    if (no_fuse || ml8_dump_enabled()) {  // ML8_DUMP harness expects the unfused chain
+        return false;
+    }
+    if (rot == nullptr || mm == nullptr ||
+        rot->op != GGML_OP_ML8_APPLY_ROTATION || mm->op != GGML_OP_ML8_MUL_MAT ||
+        mm->src[2] != rot) {
+        return false;
+    }
+    const ggml_tensor * x = rot->src[0];
+    if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    const int32_t * pp    = (const int32_t *) rot->op_params;
+    const int32_t   a_dim = pp[0];
+    const int32_t   b_dim = pp[1];
+    if (a_dim <= 0 || a_dim > 16) {                          // z/y register arrays
+        return false;
+    }
+    if (b_dim < 16 || b_dim > 1024 || (b_dim & (b_dim - 1)) != 0) {
+        return false;
+    }
+    const int64_t K = (int64_t) a_dim * (int64_t) b_dim;
+    if (x->ne[0] != K || mm->src[0] == nullptr || mm->src[0]->ne[0] != K) {
+        return false;
+    }
+    // dynamic K-fp32 LDS + the kernel's static 4KB reduce array must fit.
+    if (K * sizeof(float) + 1024 * sizeof(float) > 64 * 1024) {
+        return false;
+    }
+    // M == 1 decode keeps the unfused GEMV fast path.
+    const int64_t M = x->ne[1] * x->ne[2] * x->ne[3];
+    return M > 1;
+#endif // GGML_HIP_AITER
+}
+
+void ggml_cuda_op_ml8_mul_mat_fused(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         rot,
+    ggml_tensor *               dst) {
+#ifndef GGML_HIP_AITER
+    GGML_UNUSED(ctx); GGML_UNUSED(rot); GGML_UNUSED(dst);
+    GGML_ABORT("ml8 mul_mat inference requires ggml-hip built with -DGGML_HIP_AITER=ON");
+#else
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        fprintf(stderr, "[ml8-fuse] rotation+mul_mat fusion ACTIVE (first hit: %s)\n",
+                dst->name);
+    }
+    const int32_t * pp = (const int32_t *) rot->op_params;
+    ml8_mul_mat_core(ctx, dst, rot->src[0], rot->src[1], pp[0], pp[1]);
 #endif // GGML_HIP_AITER
 }
 
@@ -1174,7 +1390,7 @@ void ggml_cuda_op_ml8_fp8_mul_mat(
     ggml_cuda_pool_alloc<uint8_t> a_fp8(ctx.pool(),    (size_t) M_pad * (size_t) K);
     ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) M_pad);
     ggml_cuda_ml8_quantize_activations(
-        stream, x_src, a_fp8.get(), a_scale.get(), M_pad, K);
+        stream, x_src, a_fp8.get(), a_scale.get(), M_pad, K, /*M_valid=*/M_pad);
 
     // ── 4. bf16 output (M_pad × N) and launch mt_ml8_gemm with WEIGHT_FORMAT=0.
     ggml_cuda_pool_alloc<nv_bfloat16> c_bf16(ctx.pool(), (size_t) M_pad * (size_t) N);
@@ -1645,7 +1861,7 @@ void ggml_cuda_op_ml8_mul_mat_id(
     ggml_cuda_pool_alloc<uint8_t> a_fp8  (ctx.pool(), (size_t) n_pairs * (size_t) K);
     ggml_cuda_pool_alloc<float>   a_scale(ctx.pool(), (size_t) n_pairs);
     ggml_cuda_ml8_quantize_activations(
-        stream, (const float *) x->data, a_fp8.get(), a_scale.get(), n_pairs, K);
+        stream, (const float *) x->data, a_fp8.get(), a_scale.get(), n_pairs, K, /*M_valid=*/n_pairs);
 
     // ── 4. Allocate sorted bf16 output [n_total, N] and launch wrapper.
     ggml_cuda_pool_alloc<nv_bfloat16> y_sorted(ctx.pool(), (size_t) n_total * (size_t) N);

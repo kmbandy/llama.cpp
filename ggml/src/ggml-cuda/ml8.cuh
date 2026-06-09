@@ -89,13 +89,19 @@ void ggml_cuda_ml8_clear_cache(void);
 //
 // All pointers are device. Caller owns allocations. dst_a_fp8 must be
 // at least M*K bytes; dst_a_scale must be at least M*sizeof(float).
+//
+// M_valid ≤ M: rows in [M_valid, M) are emitted as zero fp8 + epsilon scale
+// WITHOUT reading src_fp32 — this folds the GEMM M-padding into the quantize
+// kernel so callers don't need a zero-padded fp32 staging copy of x
+// (src_fp32 only needs M_valid rows). Pass M_valid == M when src has all rows.
 void ggml_cuda_ml8_quantize_activations(
     cudaStream_t stream,
-    const float * src_fp32,    // device, fp32 [M, K] row-major
+    const float * src_fp32,    // device, fp32 [M_valid, K] row-major
     void *        dst_a_fp8,   // device, uint8 [M, K] row-major
     float *       dst_a_scale, // device, fp32 [M]
     int32_t       M,
-    int32_t       K);
+    int32_t       K,
+    int32_t       M_valid);
 
 struct ggml_backend_cuda_context;
 
@@ -210,4 +216,33 @@ void ggml_cuda_op_ml8_mul_mat_id(
 // the intermediate (a*b) fp32 buffer (≤ 36KB at a=9, b=1024 — fits AMD LDS).
 void ggml_cuda_op_ml8_apply_rotation(
     ggml_backend_cuda_context & ctx,
+    ggml_tensor *               dst);
+
+// ─────────────────────────────────────────────────────────────────────
+// G.6.d — fused {ML8_APPLY_ROTATION → ML8_MUL_MAT} dispatch.
+//
+// The rotation's FWHT (H_b) + small H_a^T left-multiply are absorbed into
+// the GEMM's activation-quantize prologue as ONE kernel, eliding the
+// rotation node's output tensor and its memcpy/fwht/h_a_left launches.
+// Per rotated GEMM the chain shrinks from
+//   copy → fwht → h_a_left → quantize → gemm → bf16→fp32
+// to
+//   fused_rot_quant → gemm → bf16→fp32.
+// Bitwise-equivalent math to the unfused chain (same butterfly schedule,
+// normalize, accumulation and quantize ordering).
+//
+// can_fuse gate (cheap, called from ggml_cuda_try_fuse):
+//   mm->src[2] == rot, fp32 contiguous input, a_dim ≤ 16, b_dim pow2 in
+//   [16, 1024], K = a_dim*b_dim fits LDS, M > 1 (M == 1 keeps the GEMV
+//   fast path unfused), ML8_NO_FUSE unset, ML8_DUMP debug harness off.
+bool ggml_cuda_ml8_can_fuse_rot_mm(
+    const ggml_tensor * rot,
+    const ggml_tensor * mm);
+
+// `rot` is the ML8_APPLY_ROTATION node, `dst` the ML8_MUL_MAT node.
+// Reads x from rot->src[0] and h_a from rot->src[1]; rot->data is never
+// touched (the tensor is elided by the fusion).
+void ggml_cuda_op_ml8_mul_mat_fused(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor *         rot,
     ggml_tensor *               dst);
