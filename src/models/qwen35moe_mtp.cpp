@@ -11,12 +11,8 @@ void llama_model_qwen35moe_mtp::load_arch_hparams(llama_model_loader & ml) {
     GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer());
     GGML_ASSERT(hparams.n_expert > 0 && "QWEN35MOE_MTP requires n_expert > 0");
 
-    // only the MTP layers get a KV cache, trunk layers are skipped.
-    hparams.kv_only_nextn         = true;
+    // nextn/recurrence now handled by upstream (auto-computed is_recr + n_layer_nextn); MTP KV behavior to re-verify post-sync.
     hparams.n_layer_kv_from_start = -1;
-    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
-        hparams.recurrent_layer_arr[i] = false;
-    }
 
     type = LLM_TYPE_UNKNOWN;
 }
