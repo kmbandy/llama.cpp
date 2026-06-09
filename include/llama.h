@@ -420,6 +420,9 @@ extern "C" {
         bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar
         const char * kv_tier_instance_id;        // MAD-131: per-instance ID for cold subdir + lockfile (nullptr => pid)
         int32_t      kv_tier_cold_budget_mb;     // MAD-131: cap cold pool to N MiB (0 => no limit)
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {

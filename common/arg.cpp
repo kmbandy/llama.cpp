@@ -449,7 +449,13 @@ bool common_params_handle_models(common_params & params, llama_example curr_ex) 
     opts.offline         = params.offline;
     opts.skip_download   = params.skip_download;
     opts.download_mtp    = spec_type_draft_mtp;
-    opts.download_mmproj = !params.no_mmproj;
+    opts.download_mmproj = !params.no_mmproj && params.mmproj.path.empty() && params.mmproj.url.empty();
+
+    // sub-models (draft, mmproj, vocoder) are explicitly specified by the user,
+    // so we should not auto-discover mtp/mmproj siblings for them
+    common_download_opts sub_opts = opts;
+    sub_opts.download_mtp    = false;
+    sub_opts.download_mmproj = false;
 
     try {
         auto res = common_params_handle_model(params.model, opts);
@@ -462,7 +468,7 @@ bool common_params_handle_models(common_params & params, llama_example curr_ex) 
         // only download mmproj if the current example is using it
         for (const auto & ex : mmproj_examples) {
             if (curr_ex == ex) {
-                common_params_handle_model(params.mmproj, opts);
+                common_params_handle_model(params.mmproj, sub_opts);
                 break;
             }
         }
@@ -475,8 +481,8 @@ bool common_params_handle_models(common_params & params, llama_example curr_ex) 
             params.speculative.draft.mparams.url.empty()) {
             params.speculative.draft.mparams.path = res.mtp.path;
         }
-        common_params_handle_model(params.speculative.draft.mparams, opts);
-        common_params_handle_model(params.vocoder.model,             opts);
+        common_params_handle_model(params.speculative.draft.mparams, sub_opts);
+        common_params_handle_model(params.vocoder.model,             sub_opts);
         return true;
     } catch (const common_skip_download_exception &) {
         return false;
@@ -1820,7 +1826,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("samplers that will be used for generation in the order, separated by \';\'\n(default: %s)", sampler_type_names.c_str()),
         [](common_params & params, const std::string & value) {
             const auto sampler_names = string_split<std::string>(value, ';');
-            params.sampling.samplers = common_sampler_types_from_names(sampler_names, true);
+            params.sampling.samplers = common_sampler_types_from_names(sampler_names);
             params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
         }
     ).set_sampling());

@@ -619,6 +619,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+struct ggml_backend_cuda_device_context {
+    int device;
+    std::string name;
+    std::string description;
+    std::string pci_bus_id;
+    int op_offload_min_batch_size;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::mutex device_mutex;
+    int active_count = 0;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+};
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
@@ -642,6 +654,13 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // a stale repack if the allocator later hands the same address to a
     // different weight. Cheap no-op when no ml8 weights are in use.
     ggml_cuda_ml8_clear_cache();
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buffer->buft->device->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count--;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     delete ctx;
 }
 
@@ -811,6 +830,12 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buft->device->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count++;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
@@ -821,7 +846,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    size_t size = ggml_nbytes(tensor);
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
     if (ggml_is_quantized(tensor->type)) {
@@ -832,8 +861,6 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     }
 
     return size;
-
-    GGML_UNUSED(buft);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
@@ -1531,6 +1558,12 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buffer->buft->device->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count--;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1538,6 +1571,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
+
+    ggml_cuda_set_device(0); // cudaMallocHost can create the implicit CUDA device context, make sure that this is consistently done on device 0.
 
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
@@ -1563,6 +1598,12 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) buft->device->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count++;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return buffer;
 }
@@ -3427,6 +3468,12 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) backend->device->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count--;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     delete cuda_ctx;
     delete backend;
 }
@@ -5194,14 +5241,6 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
 
 // backend device
 
-struct ggml_backend_cuda_device_context {
-    int device;
-    std::string name;
-    std::string description;
-    std::string pci_bus_id;
-    int op_offload_min_batch_size;
-};
-
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -5290,6 +5329,11 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 
 static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::lock_guard<std::mutex> lock(ctx->device_mutex);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemGetInfo(free, total));
 
@@ -5316,6 +5360,13 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     }
 #endif // defined(__linux__)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // If no backends or buffers are active, the cudaMemGetInfo call above lazily created a CUDA
+    // context that permanently consumes VRAM. Reset the device to free it.
+    if (ctx->active_count == 0) {
+        CUDA_CHECK(cudaDeviceReset());
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
@@ -6156,12 +6207,20 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device);
+
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
         /* .iface   = */ ggml_backend_cuda_interface,
-        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+        /* .device  = */ dev,
         /* .context = */ ctx,
     };
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    std::lock_guard<std::mutex> lock(dev_ctx->device_mutex);
+    dev_ctx->active_count++;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return cuda_backend;
 }

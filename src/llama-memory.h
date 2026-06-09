@@ -46,6 +46,7 @@ struct llama_memory_params {
     bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar
     const char * kv_tier_instance_id;        // MAD-131: per-instance ID for cold subdir + lockfile (nullptr => pid)
     int32_t      kv_tier_cold_budget_mb;     // MAD-131: cap cold pool to N MiB (0 => no limit)
+    llama_memory_t mem_other;
 };
 
 enum llama_memory_status {
@@ -107,6 +108,8 @@ struct llama_memory_i {
     // this callback is used to specify which layers should reuse memory from other layers
     // return negative value to indicate that the layer il should not reuse memory
     using layer_reuse_cb = std::function<int32_t(int32_t il)>;
+
+    using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
 
