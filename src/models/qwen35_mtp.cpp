@@ -4,14 +4,14 @@ void llama_model_qwen35_mtp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
 
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
-    GGML_ASSERT(hparams.nextn_predict_layers > 0   && "QWEN35_MTP requires nextn_predict_layers > 0");
-    GGML_ASSERT(hparams.nextn_predict_layers <= hparams.n_layer);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn > 0   && "QWEN35_MTP requires nextn_predict_layers > 0");
+    GGML_ASSERT(hparams.n_layer_nextn <= hparams.n_layer());
 
     // only the MTP layers get a KV cache, trunk layers are skipped.
     hparams.kv_only_nextn         = true;
     hparams.n_layer_kv_from_start = -1;
-    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
         hparams.recurrent_layer_arr[i] = false;
     }
 
@@ -28,7 +28,7 @@ void llama_model_qwen35_mtp::load_arch_tensors(llama_model_loader &) {
         output  = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    const uint32_t n_main = n_layer - hparams.nextn_predict_layers;
+    const uint32_t n_main = n_layer - hparams.n_layer_nextn;
     for (int i = 0; i < n_layer; ++i) {
         if (static_cast<uint32_t>(i) < n_main) {
             continue;  // trunk layer — owned by the sibling QWEN35 model
@@ -66,14 +66,14 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35_mtp::build_arch_graph(cons
 // LLM_ARCH_QWEN35_MTP draft head for Qwen3.5/3.6 dense series
 llama_model_qwen35_mtp::graph::graph(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
-    GGML_ASSERT(hparams.nextn_predict_layers > 0 && "QWEN35_MTP requires nextn_predict_layers > 0");
-    GGML_ASSERT(hparams.nextn_predict_layers == 1 && "QWEN35_MTP currently only supports a single MTP block");
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35_MTP requires nextn_predict_layers > 0");
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35_MTP currently only supports a single MTP block");
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // The MTP block lives at the source file's original layer index.
-    const int il = (int) hparams.n_layer - (int) hparams.nextn_predict_layers;
+    const int il = (int) hparams.n_layer() - (int) hparams.n_layer_nextn;
     const auto & layer = model.layers[il];
 
     GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");

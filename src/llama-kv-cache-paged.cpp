@@ -107,7 +107,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     // `cache.layer(il)` works directly from the graph; non-attn entries
     // stay default-constructed (k/v == nullptr) and never queried.
     const auto & hparams = model.hparams;
-    const uint32_t n_layer    = hparams.n_layer;
+    const uint32_t n_layer    = hparams.n_layer();
     const uint32_t head_dim   = hparams.n_embd_head_v(/*il=*/0);
     const uint32_t n_kv_heads = hparams.n_head_kv(/*il=*/0);
 
@@ -191,7 +191,7 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     if (type_k_ == GGML_TYPE_TURBO4_FP8_BS256 || type_v_ == GGML_TYPE_TURBO4_FP8_BS256) {
         mt_turbo_fp8::model_fingerprint fp {
             .arch       = model.arch_name(),
-            .n_layer    = (int) hparams.n_layer,
+            .n_layer    = (int) hparams.n_layer(),
             .n_embd     = (int) hparams.n_embd,
             .head_dim   = (int) head_dim,
             .n_kv_heads = (int) n_kv_heads,

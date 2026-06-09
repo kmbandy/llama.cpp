@@ -158,7 +158,7 @@ llama_kv_cache::llama_kv_cache(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -300,7 +300,7 @@ llama_kv_cache::llama_kv_cache(
                     return mode;
                 }
                 // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer >= 8) {
+                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
                     return 7;
                 }
@@ -308,7 +308,7 @@ llama_kv_cache::llama_kv_cache(
             }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
-            const uint32_t n_layer = hparams.n_layer;
+            const uint32_t n_layer = hparams.n_layer();
             if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
@@ -410,7 +410,7 @@ llama_kv_cache::llama_kv_cache(
     if (type_k == GGML_TYPE_TURBO4_FP8_BS256 || type_v == GGML_TYPE_TURBO4_FP8_BS256) {
         mt_turbo_fp8::model_fingerprint fp {
             .arch       = model.arch_name(),
-            .n_layer    = (int) hparams.n_layer,
+            .n_layer    = (int) hparams.n_layer(),
             .n_embd     = (int) hparams.n_embd,
             .head_dim   = (int) hparams.n_embd_head_k(),
             .n_kv_heads = (int) hparams.n_head_kv(),
