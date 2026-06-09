@@ -42,15 +42,19 @@ class Qwen35BlockAdapter(DefaultBlockAdapter):
     # mlp.down_proj under ML8_TIER_OVERRIDE=ffn_down=fp8) drops out cleanly, and a leaf
     # tiered ml8 (mlp.down_proj by default) is included. The sub-group SHAPE below only
     # encodes causal DEPENDENCY ORDER (which leaves share an input / must be quantized
-    # before which), so it is safe to list every quantizable leaf — the tier map gates
-    # membership. (Bugfix: down_proj was previously omitted here, so under default
-    # tiering it was silently dropped — neither ml8 nor fp8 — leaving the highest-slack
-    # FFN tensor unquantized unless an override forced it to fp8.)
-    #   in_proj_qkv, in_proj_z   -- read block input together
+    # before which), so EVERY quantizable leaf MUST be listed — the tier map gates
+    # membership. (Bugfix history: down_proj was omitted -> silently bf16 under default
+    # tiering; then out_proj was omitted -> the 2026-06-09 B3 cell wrote 24 ssm_out
+    # tensors as raw bf16 under ssm_out=ml8. The driver now fails loud on any
+    # enumerated-but-unwalked target, and test_block_sequential asserts full coverage.)
+    #   in_proj_qkv/z/a/b        -- all read the block input together
+    #   out_proj                 -- reads the delta-net core output (depends on quantized in_proj_*)
     #   gate_proj, up_proj       -- read FFN input together
     #   down_proj                -- reads the (quantized) FFN intermediate -> own sub-group, LAST
     _SSM_GROUPS = [
-        ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"],
+        ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+         "linear_attn.in_proj_a", "linear_attn.in_proj_b"],
+        ["linear_attn.out_proj"],
         ["mlp.gate_proj", "mlp.up_proj"],
         ["mlp.down_proj"],
     ]

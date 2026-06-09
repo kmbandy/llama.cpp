@@ -221,3 +221,60 @@ def test_walk_frees_hessian_on_hook_after_quantize():
     assert made, "no hooks were created"
     held = [i for i, hk in enumerate(made) if getattr(hk, "H", None) is not None]
     assert held == [], f"Hessian not freed on {len(held)} hook(s) after quantize (VRAM leak)"
+
+
+class _FakeQwen35SSMBlock(torch.nn.Module):
+    """All 8 quantizable linears of a qwen35 delta-net block (Step-1 probe list)."""
+    def __init__(self, k=4):
+        super().__init__()
+        self.linear_attn = torch.nn.Module()
+        for leaf in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"):
+            setattr(self.linear_attn, leaf, torch.nn.Linear(k, k, bias=False))
+        self.mlp = torch.nn.Module()
+        for leaf in ("gate_proj", "up_proj", "down_proj"):
+            setattr(self.mlp, leaf, torch.nn.Linear(k, k, bias=False))
+
+
+class _FakeQwen35AttnBlock(torch.nn.Module):
+    def __init__(self, k=4):
+        super().__init__()
+        self.self_attn = torch.nn.Module()
+        for leaf in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            setattr(self.self_attn, leaf, torch.nn.Linear(k, k, bias=False))
+        self.mlp = torch.nn.Module()
+        for leaf in ("gate_proj", "up_proj", "down_proj"):
+            setattr(self.mlp, leaf, torch.nn.Linear(k, k, bias=False))
+
+
+def test_qwen35_ssm_groups_cover_every_quantizable_leaf():
+    """Every nn.Linear in the block must be reachable by the walk when its tier
+    says ml8 — an omitted leaf is silently left bf16 (the B3 ssm_out bug:
+    out_proj was missing from _SSM_GROUPS, so ssm_out=ml8 dropped 24 tensors)."""
+    from block_arch_adapter import Qwen35BlockAdapter
+    block = _FakeQwen35SSMBlock()
+    all_linears = {n for n, m in block.named_modules() if isinstance(m, torch.nn.Linear)}
+    groups = Qwen35BlockAdapter().ml8_targets(block, 0, lambda n: True)
+    walked = {n for g in groups for n in g.names}
+    assert walked == all_linears, f"walk misses: {sorted(all_linears - walked)}"
+
+
+def test_qwen35_ssm_out_proj_after_in_proj_before_mlp():
+    """Causal order: out_proj reads the delta-net core output (depends on the
+    quantized in_proj_*), and the MLP reads the residual after the attn sublayer."""
+    from block_arch_adapter import Qwen35BlockAdapter
+    block = _FakeQwen35SSMBlock()
+    groups = Qwen35BlockAdapter().ml8_targets(block, 0, lambda n: True)
+    flat = [tuple(g.names) for g in groups]
+    pos = {n: i for i, names in enumerate(flat) for n in names}
+    assert pos["linear_attn.out_proj"] > pos["linear_attn.in_proj_qkv"]
+    assert pos["linear_attn.out_proj"] < pos["mlp.gate_proj"]
+    assert ("linear_attn.out_proj",) in flat  # own sub-group (re-collect H after in_proj)
+
+
+def test_qwen35_attn_groups_cover_every_quantizable_leaf():
+    from block_arch_adapter import Qwen35BlockAdapter
+    block = _FakeQwen35AttnBlock()
+    all_linears = {n for n, m in block.named_modules() if isinstance(m, torch.nn.Linear)}
+    groups = Qwen35BlockAdapter().ml8_targets(block, 0, lambda n: True)
+    walked = {n for g in groups for n in g.names}
+    assert walked == all_linears, f"walk misses: {sorted(all_linears - walked)}"

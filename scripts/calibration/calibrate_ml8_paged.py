@@ -2154,7 +2154,9 @@ def main():
                     return (prefix + leaf) in ml8_full_names
                 return _base_adapter.ml8_targets(block, b_idx, _is_ml8_full)
         adapter = _ScopedAdapter()
+        _walked_names = set()
         def quantize_fn(full_name, layer, idx, H, n_tok, sum_abs, rotation_hook):
+            _walked_names.add(full_name)
             quantize_one_target(full_name, layer, idx, H, n_tok, sum_abs, rotation_hook,
                                 args, dtype, manifest, Path(args.output_dir), TIMER)
         with TIMER.phase("hessian_forward"):
@@ -2163,6 +2165,22 @@ def main():
                               quantize_fn=quantize_fn,
                               hook_factory=_BlockHessianHook)
         print(f"[block-sequential] quantized {n_done} ml8 targets via causal walk")
+        # Fail loud on any enumerated ml8 target inside a walked block that the
+        # adapter's sub-groups never visited — an omitted leaf is silently written
+        # bf16 by the converter (the B3 ssm_out bug, 2026-06-09). Targets outside
+        # model.model.layers (lm_head/eh_proj/embedding) are handled elsewhere.
+        _n_walk_blocks = len(_base_adapter.iter_blocks(model))
+        _expected = set()
+        for _n in ml8_full_names:
+            _m = re.match(r"model\.layers\.(\d+)\.", _n)
+            if _m and int(_m.group(1)) < _n_walk_blocks:
+                _expected.add(_n)
+        _missed = _expected - _walked_names
+        if _missed:
+            raise RuntimeError(
+                f"[block-sequential] walk MISSED {len(_missed)} enumerated ml8 target(s) — "
+                f"the {args.arch!r} adapter's sub-groups don't cover them; they would be "
+                f"silently left bf16. First 8: {sorted(_missed)[:8]}")
     else:
         for i, (name, layer) in enumerate(targets):
             if i < resume_start:
