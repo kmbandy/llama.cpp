@@ -89,17 +89,17 @@ struct TieredConfig {
     float       semantic_threshold = 0.65f;
     int         semantic_top_k     = 5;
 
-    // Paged-blocks refactor (PHASE 2a, opt-in, off by default).
+    // Paged-blocks KV cache (vLLM-style block-indexed): selects the
+    // llama_kv_cache_paged path. The phased rollout is COMPLETE — Phase 2b/2c/2d
+    // landed, the legacy position-keyed tiered paths were removed in MAD-127, and
+    // MAD-134 made this the EFFECTIVE default whenever --kv-tiered is set
+    // (auto-enabled in common_context_params_to_llama unless the operator passes
+    // --no-kv-tier-paged-blocks; the `= false` below is only the raw struct
+    // default, before that auto-enable step). Validated end-to-end on hybrid
+    // models (Qwen3.x); non-hybrid + ctx > 16k may hit kernel LDS limits.
     //
-    // When true, llama_memory_tiered allocates a mt::BlockPool +
-    // mt::BlockTable alongside the existing position-keyed bookkeeping.
-    // Phase 2a only INSTANTIATES the new structures and logs init —
-    // no live wiring yet. Phase 2b will start using BlockTable on the
-    // write side; Phase 2c on the read side; Phase 2d makes paged
-    // the default and removes the position-keyed paths.
-    //
-    // block_size is fixed at 16 tokens for now (matches vLLM default).
-    // Configurable in a later phase if benchmarks show otherwise.
+    // block_size is fixed at 16 tokens (matches vLLM default); configurable in a
+    // later phase if benchmarks show otherwise.
     bool     paged_blocks    = false;
     uint32_t paged_block_size = 16;
 };

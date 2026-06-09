@@ -41,7 +41,7 @@ struct llama_memory_params {
     const char * kv_tier_semantic_index;
     float        kv_tier_semantic_threshold;
     int32_t      kv_tier_semantic_topk;
-    bool         kv_tier_paged_blocks;       // Phase 2a opt-in
+    bool         kv_tier_paged_blocks;       // select llama_kv_cache_paged; effective default-on with --kv-tiered (MAD-134)
     int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
     bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar
     const char * kv_tier_instance_id;        // MAD-131: per-instance ID for cold subdir + lockfile (nullptr => pid)
