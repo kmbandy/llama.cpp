@@ -412,6 +412,15 @@ def batched_gptq_quantize(
             torch.cuda.empty_cache()
         importance = H_orig.diagonal(dim1=-2, dim2=-1).mean(0)          # [K] (shared H ⇒ same per e)
         perm = torch.argsort(importance, descending=True)
+        if os.environ.get("ML8_DEBUG_ACTORDER"):
+            _imp = importance.float().clamp_min(0)
+            _s = _imp.sort(descending=True).values
+            _tot = _s.sum().clamp_min(1e-30)
+            _top5 = (_s[:max(1, K // 20)].sum() / _tot).item() * 100.0
+            _cv = (_imp.std() / _imp.mean().clamp_min(1e-30)).item()
+            _mm = (_imp.max() / _imp.min().clamp_min(1e-30)).item()
+            print(f"[actorder-dbg] K={K} diagH: cv={_cv:.3f} max/min={_mm:.2f} "
+                  f"top5%_share={_top5:.1f}% (uniform=5%)", flush=True)
         gidx_orig = torch.arange(K, device=dev) // group_size
         Hp = H_orig[:, perm][:, :, perm]                               # [E,K,K] permuted
         Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
@@ -455,7 +464,21 @@ def batched_gptq_quantize(
             orig_f = W_stack.float()                                    # ORIGINAL weights = tune target
             gidx_f = torch.arange(K, device=dev) // group_size
             cent = centroids_all.clone(); scl = scales_all.clone()
+            # Env-gated heavy-FT dissection (ML8_DEBUG_HEAVY): per-round trajectory of
+            # the frozen-index tune loss AND the shipped (post-reassign) output-space
+            # Y_SNR. Forks H1-vs-overfit: tune-loss drops but post-reassign Y_SNR flat
+            # ⇒ tune gain discarded by reassign/error-prop (objective mismatch); Y_SNR
+            # climbs on calib but PPL doesn't ⇒ overfit. Zero cost when unset.
+            _dbg_heavy = os.environ.get("ML8_DEBUG_HEAVY")
+            def _ydb(Qx):                                              # output-space SNR (dB), mean over E
+                _dy = orig_f - Qx
+                _ey = torch.einsum("eij,ejk,eik->e", _dy, H_orig, _dy).clamp_min(1e-30)
+                _sy = torch.einsum("eij,ejk,eik->e", orig_f, H_orig, orig_f).clamp_min(1e-30)
+                return (10.0 * torch.log10(_sy / _ey)).mean().item()
+            if _dbg_heavy:
+                print(f"[heavy-dbg] pre-heavy (straight-sweep) Y_SNR={_ydb(Q):.4f} dB", flush=True)
             for _r in range(heavy_rounds):
+                _l0 = None
                 with torch.enable_grad():
                     cp = cent.detach().requires_grad_(True)
                     sp = scl.detach().requires_grad_(True)
@@ -476,10 +499,16 @@ def batched_gptq_quantize(
                             loss = (tmp * d).sum()
                         else:
                             loss = torch.einsum("eij,ejk,eik->e", d, H_orig, d).sum()
+                        if _dbg_heavy and _s == 0:
+                            _l0 = float(loss.detach())
                         opt.zero_grad(); loss.backward(); opt.step()
                 cent = cp.detach(); scl = sp.detach()
                 cent_use = snap_to_e4m3(cent) if snap_centroids == "e4m3" else cent
                 indices, Q = _reassign(cent_use, scl)                  # frozen-index tune → reassign
+                if _dbg_heavy:
+                    print(f"[heavy-dbg] round {_r}: tune_loss {_l0:.4e} -> {float(loss.detach()):.4e} "
+                          f"(frozen-idx, {heavy_steps} steps) | post-reassign Y_SNR={_ydb(Q):.4f} dB",
+                          flush=True)
                 if dev.type == "cuda":
                     torch.cuda.empty_cache()
             centroids_all = snap_to_e4m3(cent) if snap_centroids == "e4m3" else cent
