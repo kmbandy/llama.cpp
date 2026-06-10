@@ -803,6 +803,190 @@ def alloc_conf_hint(device_str, env=None):
     )
 
 
+# ─── env-gated layer-divergence probe ────────────────────────────────────────
+
+
+def _find_decoder_layers(hf_model):
+    """Locate the decoder-layer ModuleList of an HF causal-LM, agnostic to the
+    wrapper depth (Qwen3.5 nests it under .model.layers or
+    .model.language_model.layers depending on the config head). Returns the
+    torch.nn.ModuleList of decoder blocks. Raises if not found."""
+    candidates = [
+        getattr(getattr(hf_model, "model", None), "layers", None),
+        getattr(getattr(getattr(hf_model, "model", None), "language_model", None),
+                "layers", None),
+        getattr(hf_model, "layers", None),
+    ]
+    for c in candidates:
+        if c is not None and len(c) > 0:
+            return c
+    # last resort: scan named_modules for the deepest ModuleList of decoder blocks
+    best = None
+    for name, mod in hf_model.named_modules():
+        if name.endswith(".layers") and isinstance(mod, torch.nn.ModuleList):
+            if best is None or len(mod) > len(best):
+                best = mod
+    if best is None:
+        raise RuntimeError("could not locate decoder .layers ModuleList")
+    return best
+
+
+def _rel_div(s, t):
+    """Relative L2 divergence |s - t| / (|t| + 1e-9), fp32, scalar float.
+    Tensors are flattened/cast to fp32 on whatever device they arrive."""
+    s = s.detach().float()
+    t = t.detach().float()
+    num = (s - t).norm().item()
+    den = t.norm().item() + 1e-9
+    return num / den
+
+
+def run_divergence_probe(student_hf, args, teacher, batches, hold_idx, device):
+    """First-divergence probe (ACT_REPLAY_PROBE=1).
+
+    Forwards ONE holdout batch through the frozen bf16 TEACHER then the attached
+    ml8 STUDENT, capturing the fp32 output hidden state of every decoder layer and
+    the F.linear output of each layer-0 2D-matmul submodule. Prints, per layer i,
+    rel = |s_i - t_i| / (|t_i| + 1e-9); and per layer-0 module the same rel on the
+    linear output. The first layer / submodule whose rel rises well above the e4m3
+    quant noise floor (~1e-2..3e-2) localizes where the student leaves the teacher.
+
+    Everything (hooks, teacher, captured activations) is freed before returning.
+    This is a diagnostic: main() sys.exit()s right after.
+    """
+    import torch.nn.functional as F  # noqa: F401  (parity w/ student F.linear path)
+
+    # pick one holdout batch (fall back to batch 0 if the holdout is empty)
+    probe_i = int(hold_idx[0].item()) if len(hold_idx) > 0 else 0
+    ids = batches[probe_i]
+    print(f"[probe] using holdout batch idx={probe_i} ids.shape={tuple(ids.shape)}",
+          flush=True)
+
+    # The frozen bf16 teacher HF model. For the live teacher it is already
+    # resident (teacher.model is the _LMWrap, .m is the HF model); otherwise load a
+    # fresh frozen parent. NEVER the attached student (that has ml8 targets).
+    teacher_hf = None
+    tm = getattr(teacher, "model", None)
+    if tm is not None and hasattr(tm, "m"):
+        teacher_hf = tm.m
+    loaded_teacher = False
+    if teacher_hf is None:
+        teacher_hf = load_hf_model(args.model, device, freeze=True)
+        loaded_teacher = True
+    teacher_hf.eval()
+    student_hf.eval()
+
+    s_layers = _find_decoder_layers(student_hf)
+    t_layers = _find_decoder_layers(teacher_hf)
+    n_layers = min(len(s_layers), len(t_layers))
+    print(f"[probe] decoder layers: student={len(s_layers)} teacher={len(t_layers)} "
+          f"probing {n_layers}", flush=True)
+
+    # ── per-layer output-hidden-state capture ────────────────────────────────
+    s_out, t_out = {}, {}
+
+    def _layer_hook(store, i):
+        def hook(_mod, _inp, out):
+            # decoder layers return a tuple (hidden_state, ...) or a bare tensor
+            h = out[0] if isinstance(out, (tuple, list)) else out
+            store[i] = h.detach().float().cpu()
+        return hook
+
+    handles = []
+    for i in range(n_layers):
+        handles.append(s_layers[i].register_forward_hook(_layer_hook(s_out, i)))
+        handles.append(t_layers[i].register_forward_hook(_layer_hook(t_out, i)))
+
+    # ── per-target layer-0 submodule F.linear-output capture ─────────────────
+    # Layer 0 of qwen3.5-4B is a linear_attention block: its 2D-matmul linears are
+    # linear_attn.in_proj_qkv (attn_qkv), linear_attn.in_proj_z (in_proj_z / gate),
+    # linear_attn.out_proj; the MLP carries gate_proj/up_proj/down_proj. We capture
+    # the Linear *output* (== F.linear(x, W)) so the diff is the per-module matmul
+    # divergence the ml8 dequant-STE student introduces vs the teacher's bf16 W.
+    L0_SUBMODULES = [
+        ("attn_qkv", "linear_attn.in_proj_qkv"),
+        ("in_proj_z", "linear_attn.in_proj_z"),
+        ("out_proj", "linear_attn.out_proj"),
+        ("gate", "mlp.gate_proj"),
+        ("up", "mlp.up_proj"),
+        ("down", "mlp.down_proj"),
+        # full-attention fallbacks (in case layer 0 is ever a full_attention block)
+        ("q_proj", "self_attn.q_proj"),
+        ("k_proj", "self_attn.k_proj"),
+        ("v_proj", "self_attn.v_proj"),
+        ("o_proj", "self_attn.o_proj"),
+    ]
+    s_mod, t_mod = {}, {}
+
+    def _mod_hook(store, label):
+        def hook(_mod, _inp, out):
+            h = out[0] if isinstance(out, (tuple, list)) else out
+            store[label] = h.detach().float().cpu()
+        return hook
+
+    def _submods(layer0):
+        d = dict(layer0.named_modules())
+        return d
+
+    s_l0 = _submods(s_layers[0])
+    t_l0 = _submods(t_layers[0])
+    present = []
+    for label, path in L0_SUBMODULES:
+        sm = s_l0.get(path)
+        tm_ = t_l0.get(path)
+        if sm is not None and tm_ is not None and hasattr(sm, "weight"):
+            handles.append(sm.register_forward_hook(_mod_hook(s_mod, label)))
+            handles.append(tm_.register_forward_hook(_mod_hook(t_mod, label)))
+            present.append(label)
+    print(f"[probe] layer-0 submodules hooked: {present}", flush=True)
+
+    # ── forward both models on the same batch (no grad) ──────────────────────
+    with torch.no_grad():
+        ids_dev = ids.to(device)
+        teacher_hf(ids_dev)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        student_hf(ids_dev)
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+    # ── report per-layer divergence ──────────────────────────────────────────
+    print("[probe] ===== per-decoder-layer output divergence "
+          "rel=|s-t|/(|t|+1e-9) =====", flush=True)
+    first_layer = None
+    NOISE = 3e-2  # e4m3 noise-floor ceiling
+    for i in range(n_layers):
+        if i not in s_out or i not in t_out:
+            continue
+        rel = _rel_div(s_out[i], t_out[i])
+        flag = "  <-- FIRST > noise" if (first_layer is None and rel > NOISE) else ""
+        if first_layer is None and rel > NOISE:
+            first_layer = i
+        print(f"[probe] layer {i:2d}  rel={rel:.6e}{flag}", flush=True)
+
+    # ── report layer-0 per-submodule divergence ──────────────────────────────
+    print("[probe] ===== layer-0 per-submodule F.linear-output divergence =====",
+          flush=True)
+    for label in present:
+        if label in s_mod and label in t_mod:
+            rel = _rel_div(s_mod[label], t_mod[label])
+            print(f"[probe] layer0.{label:10s} rel={rel:.6e}", flush=True)
+
+    if first_layer is not None:
+        print(f"[probe] VERDICT: first decoder layer with rel > {NOISE:.0e} "
+              f"is layer {first_layer}", flush=True)
+    else:
+        print(f"[probe] VERDICT: no decoder layer exceeded the noise floor "
+              f"{NOISE:.0e} (student tracks teacher within e4m3 noise)", flush=True)
+
+    # ── free everything ──────────────────────────────────────────────────────
+    for h in handles:
+        h.remove()
+    s_out.clear(); t_out.clear(); s_mod.clear(); t_mod.clear()
+    if loaded_teacher:
+        del teacher_hf
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
 def main(argv=None):
     """Wire the full pipeline. HF-dependent path; exercised end-to-end only with
     a real model + GPU (the unit tests import the functions above directly)."""
@@ -957,6 +1141,18 @@ def main(argv=None):
     kl0 = eval_kl(wrapped, teacher, batches, hold_idx, resp_delims=resp_delims)
     print(f"[act-replay] step {start_step} holdout_kl {kl0:.6f} (pre-train)", flush=True)
     _memlog("post-step0eval")
+
+    # ── env-gated layer-divergence probe (ACT_REPLAY_PROBE=1) ────────────────
+    # Goal: name the FIRST decoder layer / submodule where the attached ml8
+    # student leaves the bf16 teacher. Forward ONE holdout batch through teacher
+    # then student with hooks on every decoder layer capturing the fp32 output
+    # hidden state, and per-target hooks on layer-0's 2D-matmul linears capturing
+    # each F.linear output. Print per-layer relative L2 divergence + the layer-0
+    # per-module diffs, then exit BEFORE training (this is a diagnostic, not a run).
+    if os.environ.get("ACT_REPLAY_PROBE"):
+        run_divergence_probe(model, args, teacher, batches, hold_idx, device)
+        print("[probe] done — exiting before training (ACT_REPLAY_PROBE)", flush=True)
+        sys.exit(0)
 
     ckpt_path = out_dir / "ckpt.pt"
     final_step = train(
