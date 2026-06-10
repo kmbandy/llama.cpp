@@ -11,6 +11,8 @@ from act_replay import (
     parse_args,
     split_holdout,
     map_gguf_to_hf,
+    build_response_mask,
+    batch_response_mask,
     train,
     save_ckpt,
     load_ckpt,
@@ -73,6 +75,7 @@ def test_parse_args_defaults():
     assert a.seed == 0
     assert a.eval_interval == 200
     assert a.micro_batch == 1
+    assert a.no_grad_ckpt is False  # grad checkpointing on by default
 
 
 def test_holdout_split_deterministic():
@@ -103,6 +106,111 @@ def test_map_gguf_to_hf():
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+def test_map_gguf_to_hf_linear_attn():
+    # hybrid (qwen35) linear-attn 2D matmul targets — only the ML8 matmuls map.
+    assert map_gguf_to_hf("blk.0.attn_qkv.weight") == "model.layers.0.linear_attn.in_proj_qkv"
+    assert map_gguf_to_hf("blk.5.attn_gate.weight") == "model.layers.5.linear_attn.in_proj_z"
+    assert map_gguf_to_hf("blk.2.ssm_out.weight") == "model.layers.2.linear_attn.out_proj"
+    # FP8 / NATIVE ssm-core tensors are intentionally NOT mapped (raise KeyError).
+    for stem in ("ssm_alpha", "ssm_beta", "ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm"):
+        try:
+            map_gguf_to_hf(f"blk.0.{stem}.weight")
+            assert False, f"expected KeyError for {stem}"
+        except KeyError:
+            pass
+
+
+def test_linear_attn_names_resolve_via_role_targets():
+    """The GGUF names role_targets assigns to the linear-attn ML8 (2D matmul)
+    targets must each resolve through act_replay's GGUF->HF map. This pins the two
+    tables together: if role_targets/TensorNameMap renames a linear-attn matmul,
+    this test trips rather than the trainer silently dropping the target."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
+    from role_targets import classify_role, configure, Tier
+
+    configure("qwen35", 32)
+    # HF names from the real Qwen3.5 checkpoint (see test_role_targets.py).
+    hf_linear_attn = {
+        "model.language_model.layers.0.linear_attn.in_proj_qkv": "linear_attn.in_proj_qkv",
+        "model.language_model.layers.0.linear_attn.in_proj_z":   "linear_attn.in_proj_z",
+        "model.language_model.layers.0.linear_attn.out_proj":    "linear_attn.out_proj",
+    }
+    for hf_name, hf_suffix in hf_linear_attn.items():
+        gguf_name, _role, tier = classify_role(hf_name)
+        assert tier is Tier.ML8, f"{hf_name} should be ML8, got {tier}"
+        # the gguf name role_targets produced must round-trip through act_replay's map
+        assert map_gguf_to_hf(gguf_name) == f"model.layers.0.{hf_suffix}"
+
+
+def test_build_response_mask_basic():
+    # ids:        [ A,  B,  S,  C,  D,  E,  S ]  start=[2], end=[6]
+    #  span starts after the start token (idx 2) -> tokens 3,4,5 inside, 6 (end) excluded
+    ids = torch.tensor([10, 11, 2, 30, 31, 32, 6])
+    m = build_response_mask(ids, start_seq=[2], end_seq=[6])
+    assert m.tolist() == [0, 0, 0, 1, 1, 1, 0]
+
+
+def test_build_response_mask_multi_span_and_multitoken_delims():
+    # two assistant spans, multi-token start/end delimiters
+    start, end = [90, 91], [80, 81]
+    ids = torch.tensor([1, 90, 91, 5, 6, 80, 81, 2, 90, 91, 7, 80, 81, 9])
+    m = build_response_mask(ids, start, end)
+    #            1   90  91  5  6  80 81  2  90 91  7  80 81  9
+    assert m.tolist() == [0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+
+
+def test_build_response_mask_unclosed_span_runs_to_end():
+    ids = torch.tensor([1, 7, 9, 9, 9])           # start=[7], no end token present
+    m = build_response_mask(ids, start_seq=[7], end_seq=[8])
+    assert m.tolist() == [0, 0, 1, 1, 1]
+
+
+def test_build_response_mask_no_start_is_all_zero():
+    ids = torch.tensor([1, 2, 3, 4])
+    m = build_response_mask(ids, start_seq=[99], end_seq=[98])
+    assert m.tolist() == [0, 0, 0, 0]
+
+
+def test_batch_response_mask_raw_text_fallback_all_ones():
+    # no assistant span anywhere -> all-ones fallback so KL still trains on it
+    ids = torch.tensor([[1, 2, 3, 4]])
+    m = batch_response_mask(ids, [99], [98])
+    assert m.shape == ids.shape
+    assert m.sum().item() == 4.0
+
+
+def test_batch_response_mask_masks_response():
+    ids = torch.tensor([[1, 2, 5, 6, 7, 9]])      # start=[2], end=[9]
+    m = batch_response_mask(ids, [2], [9])
+    #             1  2  5  6  7  9   (tokens after start@1 up to end@5 exclusive)
+    assert m.reshape(-1).tolist() == [0, 0, 1, 1, 1, 0]
+
+
+def test_train_masked_loss_runs():
+    """train() with resp_delims masks the KL but still descends and steps."""
+    from teacher_source import LiveTeacher
+
+    student, teacher, at = _build_student_teacher()
+    teacher.eval()
+    teacher_src = LiveTeacher(teacher, 8)
+    g = torch.Generator().manual_seed(2)
+    # ids built so a start/end delimiter pair occurs -> a real (non-fallback) mask
+    batches = []
+    for _ in range(4):
+        body = torch.randint(0, 32, (1, 14), generator=g)
+        ids = torch.cat([torch.tensor([[3]]), body, torch.tensor([[4]])], dim=1)
+        batches.append(ids)
+    train_idx = torch.arange(3)
+    hold_idx = torch.tensor([3])
+    opt = torch.optim.Adam([at.centroids, at.scales], lr=1e-2)
+    step = train(student, teacher_src, batches, train_idx, hold_idx, opt,
+                 grad_accum=1, epochs=2, eval_interval=0,
+                 resp_delims=([3], [4]))
+    assert step >= 1
 
 
 def _build_student_teacher():

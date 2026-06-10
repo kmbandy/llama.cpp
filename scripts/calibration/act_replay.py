@@ -69,6 +69,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     # ckpt / device
     p.add_argument("--resume", default=None, help="checkpoint .pt to resume from")
     p.add_argument("--device", default="cuda:0", help="device for student + live teacher")
+    p.add_argument("--no-grad-ckpt", action="store_true",
+                   help="disable gradient checkpointing (default: enabled, non-reentrant)")
     return p.parse_args(argv)
 
 
@@ -91,12 +93,131 @@ def split_holdout(n: int, frac: float, seed: int):
     return torch.sort(train_idx).values, torch.sort(hold_idx).values
 
 
+# ─── response-token masking ──────────────────────────────────────────────────
+
+
+def _find_subseq(hay, needle, start=0):
+    """Index of the first occurrence of list `needle` in list `hay` at/after
+    `start`, or -1. Plain O(n*m) scan — needles are short delimiter sequences."""
+    n, m = len(hay), len(needle)
+    if m == 0 or m > n:
+        return -1
+    for i in range(start, n - m + 1):
+        if hay[i:i + m] == needle:
+            return i
+    return -1
+
+
+def build_response_mask(ids, start_seq, end_seq):
+    """Per-token assistant-response mask for one sequence of token ids.
+
+    Design ("Loss = KL over response tokens"): we only want the KL to count the
+    model's *assistant* output, not the prompt/system/user scaffolding. The chat
+    template renders assistant turns as ``<start_seq> … <end_seq>`` (e.g.
+    ``<|im_start|>assistant`` … ``<|im_end|>``); `start_seq`/`end_seq` are those
+    delimiters already tokenized to id lists.
+
+    Marks tokens strictly INSIDE each assistant span = 1, else 0:
+      * the start delimiter tokens themselves are 0 (mask begins right after them);
+      * the end delimiter is exclusive — tokens up to (not including) `end_seq` are
+        1, and the end delimiter tokens are 0.
+    Spans that open but never close run to the end of the sequence. If no start
+    delimiter occurs at all the mask is all-zeros — the caller decides the
+    all-ones raw-text fallback (so this stays a pure, side-effect-free function).
+
+    Pure tensor function: `ids` is a 1-D LongTensor (or list); returns a 1-D
+    float mask of the same length. Fully CPU-testable with a stub tokenizer.
+    """
+    seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
+    n = len(seq)
+    mask = torch.zeros(n, dtype=torch.float32)
+    if not start_seq:
+        return mask
+    s = list(start_seq)
+    e = list(end_seq) if end_seq else []
+    pos = 0
+    while pos < n:
+        a = _find_subseq(seq, s, pos)
+        if a < 0:
+            break
+        inner = a + len(s)                       # first token after the start delim
+        if e:
+            b = _find_subseq(seq, e, inner)
+            if b < 0:
+                mask[inner:] = 1.0               # unclosed span → to end of sequence
+                break
+            mask[inner:b] = 1.0                  # end delim exclusive
+            pos = b + len(e)
+        else:
+            mask[inner:] = 1.0                   # no end delim → rest of sequence
+            break
+    return mask
+
+
+def assistant_delimiters(tokenizer):
+    """Tokenize the model's assistant-turn open/close delimiters from its chat
+    template. Returns (start_ids, end_ids) as plain int lists.
+
+    Renders a tiny two-turn conversation through the tokenizer's own chat template
+    and reads back the literal text it inserts around the assistant content, so
+    this needs ZERO per-model delimiter strings (Qwen ``<|im_start|>assistant`` /
+    ``<|im_end|>``, Llama headers, Gemma ``<start_of_turn>model`` …). Falls back to
+    the common ChatML pair if the template can't be introspected.
+    """
+    SENTINEL = "⁣RESP⁣"               # invisible separator, unlikely to tokenize-merge
+    try:
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "u"},
+             {"role": "assistant", "content": SENTINEL}],
+            tokenize=False, add_generation_prompt=False)
+        head, _, tail = rendered.partition(SENTINEL)
+        # start delim = template text from the last newline before the sentinel
+        # (the "<|im_start|>assistant\n" header); end delim = text right after it.
+        start_txt = head[head.rfind("<") :] if "<" in head else head[-32:]
+        end_txt = tail[: tail.find(">") + 1] if ">" in tail else tail[:32]
+        start_ids = tokenizer(start_txt, add_special_tokens=False)["input_ids"]
+        end_ids = tokenizer(end_txt, add_special_tokens=False)["input_ids"]
+        if start_ids and end_ids:
+            return list(start_ids), list(end_ids)
+    except Exception:
+        pass
+    # ChatML fallback.
+    return (tokenizer("<|im_start|>assistant", add_special_tokens=False)["input_ids"],
+            tokenizer("<|im_end|>", add_special_tokens=False)["input_ids"])
+
+
+def batch_response_mask(ids, start_seq, end_seq, _warned=[]):
+    """Build a [*ids.shape] float mask for one batch's ids via build_response_mask.
+
+    ids: a [1, T] (or [T]) LongTensor. If the batch has no assistant span (e.g. a
+    raw wiki-text record with no chat delimiters) the mask falls back to ALL-ONES
+    so the KL still trains on it; that fallback is logged exactly once.
+    """
+    flat = ids.reshape(-1)
+    m = build_response_mask(flat, start_seq, end_seq)
+    if m.sum() == 0:
+        if not _warned:
+            print("[act-replay] no assistant span in a batch — falling back to "
+                  "all-ones response mask (raw-text record). Logged once.", flush=True)
+            _warned.append(True)
+        m = torch.ones_like(m)
+    return m.to(ids.device).reshape(ids.shape if ids.dim() > 1 else (-1,))
+
+
 # ─── GGUF -> HF name mapping ─────────────────────────────────────────────────
 
-# Dense / attention GGUF tensor stems -> HF module path (sans trailing ".weight").
-# Linear-attention / hybrid (qwen35) modules are intentionally NOT mapped here;
-# the GPU stage may extend this table. Unknown stems raise KeyError so a typo or
-# an unsupported module fails loudly rather than silently skipping a target.
+# Dense / attention / hybrid-linear-attn GGUF tensor stems -> HF module path
+# (sans trailing ".weight"). Unknown stems raise KeyError so a typo or an
+# unsupported module fails loudly rather than silently skipping a target.
+#
+# The linear-attn (qwen35 gated-delta-net) entries below mirror role_targets'
+# authoritative TensorNameMap resolution. Only the ML8-tier *2D matmul* linears
+# of a linear-attn block are mapped — in_proj_qkv (attn_qkv), in_proj_z
+# (attn_gate) and out_proj (ssm_out). The block's other tensors are intentionally
+# omitted: in_proj_a/in_proj_b (ssm_alpha/ssm_beta) are FP8 (frozen, never trained
+# as ml8 targets), and conv1d/dt/A_log/norm (ssm_conv1d/ssm_dt/ssm_a/ssm_norm) are
+# NATIVE SSM-core tensors, not nn.Linear matmul weights. An unmapped linear-attn
+# stem therefore raises KeyError rather than silently attaching the wrong module.
 _GGUF_STEM_TO_HF = {
     "ffn_gate": "mlp.gate_proj",
     "ffn_up": "mlp.up_proj",
@@ -105,6 +226,10 @@ _GGUF_STEM_TO_HF = {
     "attn_k": "self_attn.k_proj",
     "attn_v": "self_attn.v_proj",
     "attn_output": "self_attn.o_proj",
+    # hybrid (qwen35) linear-attn 2D matmul targets
+    "attn_qkv": "linear_attn.in_proj_qkv",
+    "attn_gate": "linear_attn.in_proj_z",
+    "ssm_out": "linear_attn.out_proj",
 }
 
 
@@ -188,8 +313,12 @@ def load_ckpt(path, targets, optimizer):
 # ─── training loop ───────────────────────────────────────────────────────────
 
 
-def eval_kl(model, teacher, batches, hold_idx):
-    """Mean holdout KL over the held-out batches (no grad)."""
+def eval_kl(model, teacher, batches, hold_idx, resp_delims=None):
+    """Mean holdout KL over the held-out batches (no grad).
+
+    resp_delims: optional (start_ids, end_ids) — when given, the KL is masked to
+    the assistant-response tokens of each batch (all-ones fallback for raw text).
+    """
     model.eval()
     total, n = 0.0, 0
     with torch.no_grad():
@@ -198,7 +327,9 @@ def eval_kl(model, teacher, batches, hold_idx):
             idx, vals, tail = teacher.get(i, ids)
             logits = model(ids)
             V = logits.shape[-1]
-            total += kl_topk(logits.reshape(-1, V), idx, vals, tail).item()
+            mask = (batch_response_mask(ids, *resp_delims).reshape(-1)
+                    if resp_delims is not None else None)
+            total += kl_topk(logits.reshape(-1, V), idx, vals, tail, mask=mask).item()
             n += 1
     model.train()
     return total / max(n, 1)
@@ -206,7 +337,7 @@ def eval_kl(model, teacher, batches, hold_idx):
 
 def train(model, teacher, batches, train_idx, hold_idx, optimizer,
           grad_accum=8, epochs=1, steps=None, eval_interval=200,
-          start_step=0, ckpt_path=None, targets=None):
+          start_step=0, ckpt_path=None, targets=None, resp_delims=None):
     """Run the act-replay KL training loop.
 
     Per train batch (in train_idx order): student logits -> kl_topk vs the
@@ -214,6 +345,11 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
     micro-steps) -> optimizer.step() every grad_accum batches. Every
     eval_interval optimizer steps, print one holdout-KL line to stdout.
     Returns the final optimizer step count.
+
+    resp_delims: optional (start_ids, end_ids) assistant-turn delimiters. When
+    given, the KL loss is masked to response tokens per batch (Design: "Loss = KL
+    over response tokens"); raw-text batches with no assistant span fall back to
+    an all-ones mask.
     """
     model.train()
     step = start_step
@@ -225,7 +361,9 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
             idx, vals, tail = teacher.get(i, ids)
             logits = model(ids)
             V = logits.shape[-1]
-            loss = kl_topk(logits.reshape(-1, V), idx, vals, tail) / grad_accum
+            mask = (batch_response_mask(ids, *resp_delims).reshape(-1)
+                    if resp_delims is not None else None)
+            loss = kl_topk(logits.reshape(-1, V), idx, vals, tail, mask=mask) / grad_accum
             loss.backward()
             micro += 1
             if micro % grad_accum == 0:
@@ -233,7 +371,7 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                 optimizer.zero_grad()
                 step += 1
                 if eval_interval and step % eval_interval == 0:
-                    kl = eval_kl(model, teacher, batches, hold_idx)
+                    kl = eval_kl(model, teacher, batches, hold_idx, resp_delims=resp_delims)
                     print(f"[act-replay] step {step} holdout_kl {kl:.6f}", flush=True)
                     if ckpt_path is not None and targets is not None:
                         save_ckpt(ckpt_path, step, targets, optimizer)
@@ -355,10 +493,20 @@ def main(argv=None):
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16).to(device).eval()
+        args.model, torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa").to(device).eval()
 
-    def _logits_forward(ids):
-        return model(ids.to(device)).logits
+    # Gradient checkpointing (non-reentrant) — trades recompute for activation
+    # memory so the full-seq KL forward fits. --no-grad-ckpt disables it.
+    if not args.no_grad_ckpt:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    # RDNA fp32 linear-attn scan shim (no-op on CDNA / NVIDIA / CPU, or if fla is
+    # absent); the CPU fallback swaps Triton kernels for torch refs when needed.
+    import fla_compat
+    fla_compat.apply_fla_arch_shim(model, device)
+    fla_compat.apply_fla_cpu_fallback(model, device)
 
     # wrap so callers (teacher_source / kl) get a plain logits tensor
     class _LMWrap(torch.nn.Module):
@@ -405,12 +553,18 @@ def main(argv=None):
         start_step = load_ckpt(args.resume, targets, optimizer)
         print(f"[act-replay] resumed at step {start_step}")
 
+    # assistant-response delimiters for KL masking (Design: KL over response
+    # tokens). Derived from the model's own chat template, so no per-model strings.
+    resp_delims = assistant_delimiters(tokenizer)
+    print(f"[act-replay] response mask delimiters: start={resp_delims[0]} "
+          f"end={resp_delims[1]}")
+
     ckpt_path = out_dir / "ckpt.pt"
     final_step = train(
         wrapped, teacher, batches, train_idx, hold_idx, optimizer,
         grad_accum=args.grad_accum, epochs=args.epochs, steps=args.steps,
         eval_interval=args.eval_interval, start_step=start_step,
-        ckpt_path=ckpt_path, targets=targets)
+        ckpt_path=ckpt_path, targets=targets, resp_delims=resp_delims)
     print(f"[act-replay] training done at step {final_step}")
     save_ckpt(ckpt_path, final_step, targets, optimizer)
 
