@@ -435,15 +435,168 @@ def map_gguf_to_hf(gguf_name: str) -> str:
     raise KeyError(f"no HF mapping for GGUF tensor {gguf_name!r}")
 
 
+# ─── GGUF -> HF linear-attn V-head reorder inversion ─────────────────────────
+#
+# convert_hf_to_gguf.py (_LinearAttentionVReorderBase in conversion/qwen.py)
+# reorders the linear-attn V heads from HF's GROUPED layout
+# ([G0_v0..v{r-1}, G1_v0..v{r-1}, ...]) to ggml's TILED layout
+# ([G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]) so ggml_repeat can broadcast K over V.
+# When num_value_heads == num_key_heads (r == 1, e.g. the 0.8B model) the reorder
+# is the identity; for r > 1 (4B/9B/27B) it is a real permutation.
+#
+# The act-replay trainer rehydrates GGUF-order weights and attaches them onto HF
+# modules whose downstream consumers (SSM core, gates, out_proj) expect the
+# GROUPED order. We must therefore apply the INVERSE reorder (tiled -> grouped)
+# along the OUTPUT-channel axis (rows) for in_proj_qkv (V rows only), in_proj_z,
+# in_proj_a, in_proj_b, and along the INPUT axis (columns) for out_proj.
+#
+# This is a pure index reorder of output (or input) channels — no arithmetic on
+# the weight values — so it commutes with both the ml8 dequant (reorder the
+# `indices`/`scales` rows together) and the fp8 dequant (reorder the rows of the
+# materialized weight). The Kronecker rotation carried by the ml8 targets is an
+# INPUT-space transform handled separately by AttachedTarget.apply_acts and is
+# orthogonal to this output-channel reorder.
+
+# GGUF stem -> (axis, head_dim_key) for the V-reorder inversion.
+#   axis 0  -> reorder output rows; axis 1 -> reorder input columns.
+#   head_dim_key picks which HF head dim sizes the reordered block:
+#     "v"  -> linear_value_head_dim;  "1" -> scalar per-head (head_dim == 1).
+#   "qkv" is special-cased: only the trailing V rows are reordered.
+_GGUF_STEM_V_REORDER = {
+    "attn_qkv": ("qkv", "v"),   # in_proj_qkv: reorder ONLY the V rows
+    "attn_gate": (0, "v"),      # in_proj_z:   reorder all rows
+    "ssm_alpha": (0, "1"),      # in_proj_a:   reorder rows (head_dim == 1)
+    "ssm_beta": (0, "1"),       # in_proj_b:   reorder rows (head_dim == 1)
+    "ssm_out": (1, "v"),        # out_proj:    reorder input columns
+}
+
+
+def _linear_attn_head_dims(model_config):
+    """Pull (num_k_heads, num_v_heads, head_v_dim, head_k_dim) from an HF config.
+
+    Qwen3.5 nests these under config.text_config; fall back to the top level for
+    a flat text-only config. Returns None if the model is not a linear-attn
+    variant (no linear_num_value_heads) — callers then treat every perm as
+    identity.
+    """
+    cfg = getattr(model_config, "text_config", None) or model_config
+
+    def _get(key):
+        if isinstance(cfg, dict):
+            return cfg.get(key)
+        return getattr(cfg, key, None)
+
+    num_v = _get("linear_num_value_heads")
+    num_k = _get("linear_num_key_heads")
+    if not num_v or not num_k:
+        return None
+    head_v = _get("linear_value_head_dim")
+    head_k = _get("linear_key_head_dim")
+    return int(num_k), int(num_v), int(head_v), int(head_k)
+
+
+def _tiled_to_grouped_index(num_k_heads, num_v_per_k, head_dim):
+    """Index tensor that maps a TILED-order axis back to GROUPED order.
+
+    The forward (HF grouped -> GGUF tiled) reorder swaps the (num_k_heads,
+    num_v_per_k) axes of a [num_k_heads, num_v_per_k, head_dim] view. Building
+    the forward permutation on an arange and argsort-ing it yields the inverse
+    (tiled -> grouped) index. `tiled[inv]` is grouped order.
+    """
+    n = num_k_heads * num_v_per_k * head_dim
+    arange = torch.arange(n, dtype=torch.long).reshape(
+        num_k_heads, num_v_per_k, head_dim)
+    fwd = arange.permute(1, 0, 2).reshape(-1)  # grouped -> tiled mapping
+    return torch.argsort(fwd)                  # tiled -> grouped
+
+
+def gguf_to_hf_perm(gguf_name, shape, model_config):
+    """Inverse V-head reorder for one linear-attn GGUF tensor, or None.
+
+    Returns (axis, index) such that applying ``t.index_select(axis, index)`` to a
+    GGUF-order tensor of the given ``shape`` yields the HF (grouped) order the
+    student module expects. Returns None when no reorder is needed: the tensor is
+    not a linear-attn projection, the model is not a linear-attn variant, or the
+    reorder is the identity (num_value_heads == num_key_heads, e.g. the 0.8B
+    model — so existing 0.8B tests stay green).
+
+    The Kronecker rotation on ml8 targets is NOT handled here (it is an input-space
+    transform applied by AttachedTarget.apply_acts); this is purely an
+    output-/input-channel index reorder.
+    """
+    name = gguf_name
+    if name.endswith(".weight"):
+        name = name[: -len(".weight")]
+    parts = name.split(".")
+    if len(parts) != 3 or parts[0] != "blk":
+        return None
+    stem = parts[2]
+    spec = _GGUF_STEM_V_REORDER.get(stem)
+    if spec is None:
+        return None
+
+    dims = _linear_attn_head_dims(model_config)
+    if dims is None:
+        return None
+    num_k_heads, num_v_heads, head_v_dim, head_k_dim = dims
+    if num_v_heads == num_k_heads:
+        return None  # identity reorder (num_v_per_k == 1)
+    num_v_per_k = num_v_heads // num_k_heads
+
+    axis, hd_key = spec
+    head_dim = head_v_dim if hd_key == "v" else 1
+    inv = _tiled_to_grouped_index(num_k_heads, num_v_per_k, head_dim)
+
+    if axis == "qkv":
+        # in_proj_qkv rows are [q (k_dim) | k (k_dim) | v (v_dim)]; only V reorders.
+        k_dim = head_k_dim * num_k_heads
+        v_dim = num_v_heads * head_v_dim
+        n_rows = shape[0]
+        if n_rows != 2 * k_dim + v_dim:
+            raise ValueError(
+                f"{gguf_name}: rows {n_rows} != 2*k_dim({k_dim}) + v_dim({v_dim})")
+        idx = torch.arange(n_rows, dtype=torch.long)
+        idx[2 * k_dim:] = (2 * k_dim) + inv
+        return 0, idx
+
+    return axis, inv
+
+
+def _apply_perm_to_ml8_entry(entry, perm):
+    """Reorder an ml8 state entry's rows in place per a (axis, index) perm.
+
+    Only output-row reorders (axis 0) are valid for an ml8 target: the indices
+    [N,K] and scales [N,G] are reordered along their row axis together (the
+    per-group centroids are untouched — they index the input/group axis). Column
+    reorders (axis 1) on an ml8 target are unsupported and raise; the only
+    column-reordered linear-attn tensor (out_proj) is an fp8 frozen weight, never
+    an ml8 target.
+    """
+    if perm is None:
+        return entry
+    axis, index = perm
+    if axis != 0:
+        raise ValueError(
+            "ml8 target reorder must be along output rows (axis 0); got "
+            f"axis={axis}")
+    entry = dict(entry)
+    entry["indices"] = entry["indices"].index_select(0, index.to(entry["indices"].device))
+    entry["scales"] = entry["scales"].index_select(0, index.to(entry["scales"].device))
+    return entry
+
+
 # ─── attach targets to an HF model ───────────────────────────────────────────
 
 
-def attach_targets(model_named_modules, state, train, skip):
+def attach_targets(model_named_modules, state, train, skip, model_config=None):
     """Attach selected ml8 targets to their host linears in an HF model.
 
     model_named_modules: dict-like {module_path: nn.Module} (e.g. dict(model.named_modules())).
     state: an Ml8State (or anything with a `.ml8` dict of {gguf_name: target}).
     train/skip: forwarded to select_targets.
+    model_config: HF model config used to invert the linear-attn V-head reorder
+        (see gguf_to_hf_perm). None disables the reorder (identity) — safe for
+        non-linear-attn models and the 0.8B case.
 
     Returns {gguf_name: AttachedTarget} for every attached target. Raises KeyError
     if a selected target's mapped HF module is not present in the model.
@@ -456,12 +609,17 @@ def attach_targets(model_named_modules, state, train, skip):
         if hf_path not in modules:
             raise KeyError(
                 f"target {gguf_name!r} -> {hf_path!r} not found in model modules")
-        at = attach_to_linear(modules[hf_path], state.ml8[gguf_name])
+        entry = state.ml8[gguf_name]
+        if model_config is not None:
+            shape = tuple(entry["indices"].shape)
+            perm = gguf_to_hf_perm(gguf_name, shape, model_config)
+            entry = _apply_perm_to_ml8_entry(entry, perm)
+        at = attach_to_linear(modules[hf_path], entry)
         attached[gguf_name] = at
     return attached
 
 
-def install_frozen_fp8(model, frozen, map_fn, device, dtype):
+def install_frozen_fp8(model, frozen, map_fn, device, dtype, model_config=None):
     """Install dequantized frozen fp8 weights INTO the student in-place.
 
     The HF student is loaded with its bf16 parent weights; for tensors that were
@@ -472,6 +630,11 @@ def install_frozen_fp8(model, frozen, map_fn, device, dtype):
     (KeyError from map_fn) are skipped with a single warning. Each frozen tensor
     is popped from `frozen` as it is consumed so its RAM is freed immediately
     (host has only 15GB). Returns the number of weights actually installed.
+
+    model_config: when given, the linear-attn V-head reorder is inverted
+    (see gguf_to_hf_perm) before the weight is copied in — out_proj (in_proj_a/b)
+    columns/rows are reordered from GGUF (tiled) to HF (grouped) order so the
+    installed weight matches the HF module's channel layout. None -> identity.
     """
     modules = dict(model.named_modules())
     n_installed = 0
@@ -495,6 +658,11 @@ def install_frozen_fp8(model, frozen, map_fn, device, dtype):
                       flush=True)
                 warned = True
             continue
+        if model_config is not None:
+            perm = gguf_to_hf_perm(gguf_name, tuple(w.shape), model_config)
+            if perm is not None:
+                axis, index = perm
+                w = w.index_select(axis, index.to(w.device))
         with torch.no_grad():
             mod.weight.copy_(w.to(device=device, dtype=dtype))
         n_installed += 1
@@ -1040,7 +1208,8 @@ def main(argv=None):
     _memlog("post-rehydrate")
 
     targets = attach_targets(dict(model.named_modules()), gstate,
-                             train=args.tensors_train, skip=args.tensors_skip)
+                             train=args.tensors_train, skip=args.tensors_skip,
+                             model_config=getattr(model, "config", None))
     print(f"[act-replay] attached {len(targets)} ml8 targets")
     _memlog("post-attach")
     hf_names = {g: map_gguf_to_hf(g) for g in targets}
@@ -1055,7 +1224,8 @@ def main(argv=None):
         print("[act-replay] fp8 install SKIPPED (ACT_REPLAY_NO_FP8_INSTALL)")
     else:
         n_fp8 = install_frozen_fp8(
-            model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16)
+            model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16,
+            model_config=getattr(model, "config", None))
         print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
     _memlog("post-install")
 

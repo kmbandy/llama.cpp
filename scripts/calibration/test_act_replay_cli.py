@@ -4,6 +4,7 @@ No HF model required: a tiny stub LM exposing named_modules() with one nn.Linear
 stands in for the student/teacher. Run from scripts/calibration with
 PYTHONPATH=../../gguf-py.
 """
+import pytest
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,8 @@ from act_replay import (
     split_holdout,
     split_batches_seq,
     map_gguf_to_hf,
+    gguf_to_hf_perm,
+    attach_targets,
     build_response_mask,
     batch_response_mask,
     train,
@@ -737,3 +740,148 @@ def test_alloc_conf_hint_cuda_unset_warns():
 def test_alloc_conf_hint_cuda_already_set_is_none():
     env = {"PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True"}
     assert alloc_conf_hint("cuda:0", env=env) is None
+
+
+# ─── linear-attn GGUF -> HF V-head reorder inversion ─────────────────────────
+
+
+class _Cfg:
+    """Minimal HF-config stand-in nesting linear-attn head dims under text_config."""
+
+    def __init__(self, num_k, num_v, head_v=128, head_k=128):
+        self.text_config = type("TC", (), {
+            "linear_num_key_heads": num_k,
+            "linear_num_value_heads": num_v,
+            "linear_value_head_dim": head_v,
+            "linear_key_head_dim": head_k,
+        })()
+
+
+def _reorder_v_heads_ref(tensor, dim, num_k_heads, num_v_per_k, head_dim):
+    """Reference grouped->tiled reorder, copied from conversion/qwen.py."""
+    shape = list(tensor.shape)
+    if dim < 0:
+        dim += len(shape)
+    new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+    t = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return t.permute(*perm).contiguous().reshape(*shape)
+
+
+def test_gguf_to_hf_perm_08b_identity():
+    """0.8B has num_value_heads == num_key_heads (r == 1) -> every perm is None."""
+    cfg = _Cfg(num_k=16, num_v=16)
+    for stem, shape in [("attn_qkv", (8192, 1024)), ("attn_gate", (2048, 1024)),
+                        ("ssm_out", (1024, 2048)), ("ssm_alpha", (16, 1024)),
+                        ("ssm_beta", (16, 1024))]:
+        assert gguf_to_hf_perm(f"blk.0.{stem}.weight", shape, cfg) is None
+
+
+def test_gguf_to_hf_perm_non_linear_attn_is_none():
+    cfg = _Cfg(num_k=16, num_v=32)
+    assert gguf_to_hf_perm("blk.0.ffn_gate.weight", (9216, 2560), cfg) is None
+    assert gguf_to_hf_perm("blk.0.attn_q.weight", (4096, 2560), cfg) is None
+    assert gguf_to_hf_perm("token_embd.weight", (248320, 2560), cfg) is None
+
+
+def test_gguf_to_hf_perm_none_config_is_none():
+    assert gguf_to_hf_perm("blk.0.attn_gate.weight", (4096, 2560), None) is None
+
+
+def test_gguf_to_hf_perm_4b_inverts_reorder():
+    """The returned perm is the exact inverse of the convert-time grouped->tiled
+    reorder for each 4B linear-attn tensor (num_k=16, num_v=32, head_dim=128)."""
+    nk, nv, hv, hk = 16, 32, 128, 128
+    nvpk = nv // nk
+    cfg = _Cfg(num_k=nk, num_v=nv, head_v=hv, head_k=hk)
+    q_dim = k_dim = hk * nk        # 2048
+    v_dim = nv * hv                # 4096
+
+    # in_proj_z (attn_gate): all rows reorder. Round-trip: grouped -> tiled (the
+    # GGUF layout) then perm should recover grouped.
+    grouped = torch.arange(v_dim)
+    tiled = _reorder_v_heads_ref(grouped.unsqueeze(-1), 0, nk, nvpk, hv).squeeze(-1)
+    axis, idx = gguf_to_hf_perm("blk.0.attn_gate.weight", (v_dim, 2560), cfg)
+    assert axis == 0
+    assert torch.equal(tiled[idx], grouped)
+
+    # in_proj_qkv (attn_qkv): only the trailing V rows reorder; q/k rows fixed.
+    n_rows = 2 * k_dim + v_dim
+    axis, idx = gguf_to_hf_perm("blk.0.attn_qkv.weight", (n_rows, 2560), cfg)
+    assert axis == 0
+    assert torch.equal(idx[:2 * k_dim], torch.arange(2 * k_dim))
+    # rebuild full GGUF (tiled) row order and confirm perm recovers HF (grouped)
+    gguf_rows = torch.cat([torch.arange(2 * k_dim), (2 * k_dim) + tiled])
+    hf_rows = torch.cat([torch.arange(2 * k_dim), (2 * k_dim) + grouped])
+    assert torch.equal(gguf_rows[idx], hf_rows)
+
+    # out_proj (ssm_out): COLUMN (input) reorder over the V space.
+    axis, idx = gguf_to_hf_perm("blk.0.ssm_out.weight", (2560, v_dim), cfg)
+    assert axis == 1
+    assert torch.equal(tiled[idx], grouped)
+
+    # in_proj_a / in_proj_b (ssm_alpha/ssm_beta): row reorder with head_dim == 1.
+    grouped_h = torch.arange(nv)
+    tiled_h = _reorder_v_heads_ref(grouped_h.unsqueeze(-1), 0, nk, nvpk, 1).squeeze(-1)
+    for stem in ("ssm_alpha", "ssm_beta"):
+        axis, idx = gguf_to_hf_perm(f"blk.0.{stem}.weight", (nv, 2560), cfg)
+        assert axis == 0
+        assert torch.equal(tiled_h[idx], grouped_h)
+
+
+def test_gguf_to_hf_perm_qkv_row_count_mismatch_raises():
+    cfg = _Cfg(num_k=16, num_v=32)
+    with pytest.raises(ValueError):
+        gguf_to_hf_perm("blk.0.attn_qkv.weight", (9999, 2560), cfg)
+
+
+def test_attach_targets_applies_v_reorder():
+    """attach_targets reorders an ml8 in_proj_z target's rows to HF order when a
+    linear-attn config is supplied (and is a no-op when num_v == num_k)."""
+    nk, nv, hv = 16, 32, 128
+    nvpk = nv // nk
+    N = nv * hv            # 4096 rows
+    K = 128                # small input dim for a fast test
+
+    # Distinct per-row scales so a row reorder is observable; group count G=1.
+    state_entry = {
+        "indices": torch.randint(0, 16, (N, K)),
+        "scales": (torch.arange(N, dtype=torch.float32) + 1.0).reshape(N, 1),
+        "centroids": torch.randn(1, 16).to(torch.float8_e4m3fn).to(torch.float32),
+        "rotation": None,
+    }
+
+    class _State:
+        ml8 = {"blk.0.attn_gate.weight": state_entry}
+
+    class _LM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Module()])
+            la = nn.Module()
+            la.in_proj_z = nn.Linear(K, N, bias=False)
+            self.model.layers[0].linear_attn = la
+
+    lm = _LM()
+    cfg = _Cfg(num_k=nk, num_v=nv, head_v=hv)
+    # No model_config -> no reorder: scales stay in GGUF (tiled) order.
+    base = attach_targets(dict(_LM().named_modules()), _State(),
+                          train="ml8", skip=None, model_config=None)
+    assert torch.equal(base["blk.0.attn_gate.weight"].scales.detach(),
+                       state_entry["scales"])
+
+    attached = attach_targets(dict(lm.named_modules()), _State(),
+                              train="ml8", skip=None, model_config=cfg)
+    at = attached["blk.0.attn_gate.weight"]
+
+    # With the config, rows are index_select'd by the inverse perm so the attached
+    # scales are exactly state_entry["scales"][idx] — and since row r holds value
+    # r+1, that equals idx+1.
+    tiled = _reorder_v_heads_ref(torch.arange(N).unsqueeze(-1), 0, nk, nvpk, hv).squeeze(-1)
+    idx = torch.argsort(tiled)                       # tiled -> grouped, == perm idx
+    expected = state_entry["scales"][idx]
+    assert torch.equal(at.scales.detach(), expected)
+    # The reorder is real (not identity): some rows actually moved.
+    assert not torch.equal(at.scales.detach(), state_entry["scales"])
