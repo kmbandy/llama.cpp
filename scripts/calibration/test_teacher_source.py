@@ -1,3 +1,4 @@
+import pytest
 import torch, torch.nn as nn
 from teacher_source import LiveTeacher, CachedTeacher, DeviceTeacher, make_teacher
 
@@ -52,3 +53,27 @@ def test_make_teacher_factory(tmp_path):
     assert isinstance(make_teacher("device:0", lambda: m, K=8, cache_dir=tmp_path, batches=None), DeviceTeacher)
     ct = make_teacher("cache", lambda: m, K=8, cache_dir=tmp_path, batches=_batches(), cache_key="kx")
     assert isinstance(ct, CachedTeacher)
+
+def test_changed_batch_rebuilds(tmp_path):
+    # Same key/K/n_batches, but one token flipped in one batch. The ids-content
+    # hash_chain must differ from the cached one, forcing a rebuild (model called)
+    # rather than silently serving stale shards from the prior corpus.
+    batches = _batches()
+    CachedTeacher.build(StubLM(), batches, tmp_path, key="kc", K=8)
+
+    flipped = [b.clone() for b in batches]
+    flipped[0][0, 0] ^= 1  # flip one token -> different ids content
+    m = StubLM()
+    CachedTeacher.build(m, flipped, tmp_path, key="kc", K=8)
+    assert m.calls > 0  # cache must NOT hit: a rebuild forward happened
+
+def test_get_wrong_ids_raises(tmp_path):
+    batches = _batches()
+    ct = CachedTeacher.build(StubLM(), batches, tmp_path, key="kw", K=8)
+    # Correct ids: fine.
+    ct.get(0, batches[0])
+    # Wrong ids for that batch index: per-batch hash mismatch must raise.
+    wrong = batches[0].clone()
+    wrong[0, 0] ^= 1
+    with pytest.raises(RuntimeError, match="ids hash mismatch"):
+        ct.get(0, wrong)

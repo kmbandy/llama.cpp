@@ -9,6 +9,7 @@ All strategies return identical (idx, vals, tail) for the same model+batch:
 Cache shards are written under a caller-provided directory (never /tmp).
 """
 import copy
+import hashlib
 import json
 import os
 from abc import ABC, abstractmethod
@@ -18,6 +19,18 @@ from pathlib import Path
 import torch
 
 from kl_loss import topk_teacher
+
+
+def _ids_hash(ids):
+    """Stable 16-hex-char blake2b digest of an ids tensor's content."""
+    raw = ids.cpu().contiguous().numpy().tobytes()
+    return hashlib.blake2b(raw).hexdigest()[:16]
+
+
+def _hash_chain(ids_hashes):
+    """blake2b over the concatenation of per-batch hashes -> 16-hex chain id."""
+    joined = "".join(ids_hashes).encode()
+    return hashlib.blake2b(joined).hexdigest()[:16]
 
 
 class TeacherSource(ABC):
@@ -70,54 +83,100 @@ class DeviceTeacher(TeacherSource):
 
 
 class CachedTeacher(TeacherSource):
-    """Precomputed per-batch shards on disk, reused when (key, K, n_batches) match."""
+    """Precomputed per-batch shards on disk.
+
+    A cache hit requires every one of {key, K, n_batches, T, V, hash_chain} to
+    match. The hash_chain binds the cache to the exact ids content of every
+    batch, so reusing shards across a different corpus (same key/K/n_batches but
+    different tokens) is detected instead of silently serving stale logits. Each
+    shard additionally stores its own ids_hash; get() re-checks it on read.
+    """
 
     def __init__(self, cache_dir, K):
         self.cache_dir = Path(cache_dir)
         self.K = K
-        self._lru = OrderedDict()  # batch_idx -> (idx, vals, tail)
+        self._lru = OrderedDict()  # batch_idx -> (idx, vals, tail, ids_hash)
+
+    @classmethod
+    def try_open(cls, root, key, K, n_batches, T, hash_chain):
+        """Return a CachedTeacher if root holds a complete matching cache, else None.
+
+        Gate: meta {key, K, n_batches, T, hash_chain} must match AND all
+        n_batches shard files must exist. V is intentionally NOT checked here so
+        callers can validate a hit before a forward pass reveals V (V is still
+        recorded in meta and is part of build's own gate). A None return means
+        "miss": the caller should (re)build.
+        """
+        root = Path(root)
+        meta_path = root / "meta.json"
+        if not meta_path.exists():
+            return None
+        meta = json.loads(meta_path.read_text())
+        if not (meta.get("key") == key
+                and meta.get("K") == K
+                and meta.get("n_batches") == n_batches
+                and meta.get("T") == T
+                and meta.get("hash_chain") == hash_chain):
+            return None
+        # Validate shard count: every expected shard file must be present.
+        for i in range(n_batches):
+            if not cls._shard_path(root, i).exists():
+                return None
+        return cls(root, K)
 
     @classmethod
     def build(cls, model, batches, cache_dir, key, K):
         """Build (or reuse) a shard cache. Only calls model.forward on a miss.
 
         Layout: Path(cache_dir)/f"teacher_{key}_K{K}"/
-          meta.json    : {"key", "K", "n_batches"}
-          shard_{i}.pt : {"idx", "vals", "tail"} per batch
+          meta.json    : {"key", "K", "n_batches", "T", "V", "hash_chain"}
+          shard_{i}.pt : {"idx", "vals", "tail", "ids_hash"} per batch
         """
         root = Path(cache_dir) / f"teacher_{key}_K{K}"
-        meta_path = root / "meta.json"
         n_batches = len(batches)
+        T = batches[0].shape[-1] if n_batches else 0
+        ids_hashes = [_ids_hash(b) for b in batches]
+        chain = _hash_chain(ids_hashes)
 
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            if (meta.get("key") == key
-                    and meta.get("K") == K
-                    and meta.get("n_batches") == n_batches):
-                # Cache hit: do not call the model.
-                return cls(root, K)
+        # Cache hit requires the full gate to match and every shard present.
+        hit = cls.try_open(root, key, K, n_batches, T, chain)
+        if hit is not None:
+            return hit
 
         # Miss: compute every shard via LiveTeacher and write atomically.
+        # V (vocabulary width) comes from the first forward's logits width.
         root.mkdir(parents=True, exist_ok=True)
         live = LiveTeacher(model, K)
+        V = cls._infer_vocab(model, batches)
         for i, ids in enumerate(batches):
             idx, vals, tail = live.get(i, ids)
-            cls._write_shard(root, i, idx, vals, tail)
+            cls._write_shard(root, i, idx, vals, tail, ids_hashes[i])
 
         # meta written last, atomically, to mark the cache complete.
-        meta = {"key": key, "K": K, "n_batches": n_batches}
-        cls._atomic_write_text(meta_path, json.dumps(meta))
+        meta = {"key": key, "K": K, "n_batches": n_batches,
+                "T": T, "V": V, "hash_chain": chain}
+        cls._atomic_write_text(root / "meta.json", json.dumps(meta))
         return cls(root, K)
+
+    @staticmethod
+    def _infer_vocab(model, batches):
+        """Vocabulary width V from a forward on the first batch (no_grad)."""
+        if not batches:
+            return 0
+        with torch.no_grad():
+            logits = model(batches[0])
+        return int(logits.shape[-1])
 
     @staticmethod
     def _shard_path(root, i):
         return Path(root) / f"shard_{i}.pt"
 
     @classmethod
-    def _write_shard(cls, root, i, idx, vals, tail):
+    def _write_shard(cls, root, i, idx, vals, tail, ids_hash):
         path = cls._shard_path(root, i)
         tmp = path.with_name(path.name + ".tmp")
-        torch.save({"idx": idx, "vals": vals, "tail": tail}, tmp)
+        torch.save({"idx": idx, "vals": vals, "tail": tail,
+                    "ids_hash": ids_hash}, tmp)
         os.rename(tmp, path)
 
     @staticmethod
@@ -128,16 +187,23 @@ class CachedTeacher(TeacherSource):
         os.rename(tmp, path)
 
     def get(self, batch_idx, ids):
+        want = _ids_hash(ids)
         if batch_idx in self._lru:
             self._lru.move_to_end(batch_idx)
-            return self._lru[batch_idx]
-        shard = torch.load(self._shard_path(self.cache_dir, batch_idx))
-        out = (shard["idx"], shard["vals"], shard["tail"])
-        self._lru[batch_idx] = out
-        self._lru.move_to_end(batch_idx)
-        while len(self._lru) > 2:  # simple LRU of 2
-            self._lru.popitem(last=False)
-        return out
+            idx, vals, tail, ids_hash = self._lru[batch_idx]
+        else:
+            shard = torch.load(self._shard_path(self.cache_dir, batch_idx))
+            idx, vals, tail = shard["idx"], shard["vals"], shard["tail"]
+            ids_hash = shard.get("ids_hash")
+            self._lru[batch_idx] = (idx, vals, tail, ids_hash)
+            self._lru.move_to_end(batch_idx)
+            while len(self._lru) > 2:  # simple LRU of 2
+                self._lru.popitem(last=False)
+        if ids_hash != want:
+            raise RuntimeError(
+                f"teacher cache stale: ids hash mismatch for batch {batch_idx} "
+                f"(shard {ids_hash!r} != requested {want!r})")
+        return (idx, vals, tail)
 
 
 def make_teacher(spec, model_loader, K, cache_dir, batches=None, cache_key=None):
@@ -157,15 +223,17 @@ def make_teacher(spec, model_loader, K, cache_dir, batches=None, cache_key=None)
     if spec == "cache":
         if batches is None or cache_key is None:
             raise ValueError("cache strategy requires batches and cache_key")
-        # Check the cache dir/meta BEFORE calling model_loader; only load on miss.
+        # Hashing the ids is cheap CPU work; doing it BEFORE deciding lets us
+        # validate the full hit gate without ever loading the model. The model
+        # is loaded only on a miss. V is not part of the try_open gate (it is
+        # unknown until a forward), which is fine — build re-records it.
         root = Path(cache_dir) / f"teacher_{cache_key}_K{K}"
-        meta_path = root / "meta.json"
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            if (meta.get("key") == cache_key
-                    and meta.get("K") == K
-                    and meta.get("n_batches") == len(batches)):
-                return CachedTeacher(root, K)
+        n_batches = len(batches)
+        T = batches[0].shape[-1] if n_batches else 0
+        chain = _hash_chain([_ids_hash(b) for b in batches])
+        hit = CachedTeacher.try_open(root, cache_key, K, n_batches, T, chain)
+        if hit is not None:
+            return hit
         return CachedTeacher.build(model_loader(), batches, cache_dir,
                                    key=cache_key, K=K)
 
