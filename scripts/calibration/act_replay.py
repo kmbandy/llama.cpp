@@ -67,12 +67,13 @@ def load_hf_model(path, device, *, grad_ckpt=False, freeze=False):
     import fla_compat
 
     device = torch.device(device)
-    # low_cpu_mem_usage streams the bf16 weights straight from the checkpoint
-    # mmap into the model instead of staging a full fp32 copy in host RAM — the
-    # 15GB host can't afford the double-buffer when loading the 4B bf16 parent.
+    # device_map streams each bf16 weight from the checkpoint mmap STRAIGHT to
+    # the target device — never assembling the full model in host RAM. The 15GB
+    # host OOMs if the 4B bf16 parent (8.3GB) is staged on CPU before .to():
+    # measured 11G cgroup kill with low_cpu_mem_usage + .to(device) alone.
     model = AutoModelForCausalLM.from_pretrained(
         path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-        attn_implementation="sdpa").to(device).eval()
+        device_map={"": device}, attn_implementation="sdpa").eval()
 
     if grad_ckpt:
         model.gradient_checkpointing_enable(
