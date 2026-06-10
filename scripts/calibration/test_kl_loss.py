@@ -40,3 +40,13 @@ def test_grad_flows():
     idx, vals, tail = topk_teacher(t, 5)
     kl_topk(s, idx, vals, tail).backward()
     assert s.grad is not None and torch.isfinite(s.grad).all()
+
+def test_k_equals_v_finite():
+    g = torch.Generator().manual_seed(4)
+    t = torch.randn(3, 8, generator=g)
+    s = torch.randn(3, 8, generator=g, requires_grad=True)
+    idx, vals, tail = topk_teacher(t, 8)
+    loss = kl_topk(s, idx, vals, tail)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(s.grad).all()
