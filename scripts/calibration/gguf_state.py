@@ -39,6 +39,7 @@ def decode_centroids_fp8(cent_u8):
 # ─── Rehydration ───────────────────────────────────────────────────────────
 
 
+# Frozen tensors are materialized fp32 (~2x bf16 model size). Fine for 4B (~8GB); for 35B reuse switch frozen to bf16 or lazy mmap.
 @dataclass
 class Ml8State:
     """Trainer state rehydrated from an ml8 GGUF.
@@ -85,7 +86,8 @@ def _logical_N_bytes(tensor):
 
 def _row_major_bytes(tensor, N, nbytes):
     """tensor.data as a contiguous [N, nbytes] uint8 array."""
-    arr = np.ascontiguousarray(tensor.data).view(np.uint8).reshape(N, nbytes)
+    # always copy — tensor.data is a view into the reader's mmap; consumers may outlive the reader.
+    arr = np.ascontiguousarray(tensor.data).copy().view(np.uint8).reshape(N, nbytes)
     return arr
 
 
