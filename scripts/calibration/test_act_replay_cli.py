@@ -10,6 +10,7 @@ import torch.nn as nn
 from act_replay import (
     parse_args,
     split_holdout,
+    split_batches_seq,
     map_gguf_to_hf,
     build_response_mask,
     batch_response_mask,
@@ -18,6 +19,7 @@ from act_replay import (
     load_ckpt,
     export_blobs,
     install_frozen_fp8,
+    alloc_conf_hint,
 )
 from act_replay_student import attach_to_linear
 from centroid_quantizer import snap_to_e4m3
@@ -147,12 +149,20 @@ def test_map_gguf_to_hf():
 
 
 def test_map_gguf_to_hf_linear_attn():
-    # hybrid (qwen35) linear-attn 2D matmul targets — only the ML8 matmuls map.
+    # hybrid (qwen35) linear-attn 2D matmul targets — the ML8 matmuls map.
     assert map_gguf_to_hf("blk.0.attn_qkv.weight") == "model.layers.0.linear_attn.in_proj_qkv"
     assert map_gguf_to_hf("blk.5.attn_gate.weight") == "model.layers.5.linear_attn.in_proj_z"
     assert map_gguf_to_hf("blk.2.ssm_out.weight") == "model.layers.2.linear_attn.out_proj"
-    # FP8 / NATIVE ssm-core tensors are intentionally NOT mapped (raise KeyError).
-    for stem in ("ssm_alpha", "ssm_beta", "ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm"):
+    # FP8 in_proj_a/in_proj_b (ssm_alpha/ssm_beta) DO map now: they're frozen FP8,
+    # never trained as ml8 targets, but the re-emit must still write them under an
+    # HF name the converter's classify_role resolves to Tier.FP8 (else they'd be
+    # skipped and dropped to bf16 — the re-emit coverage bug).
+    assert map_gguf_to_hf("blk.0.ssm_alpha.weight") == "model.layers.0.linear_attn.in_proj_a"
+    assert map_gguf_to_hf("blk.7.ssm_beta.weight") == "model.layers.7.linear_attn.in_proj_b"
+    # MTP / NextN draft head eh_proj (4-part GGUF name) maps to its HF name.
+    assert map_gguf_to_hf("blk.24.nextn.eh_proj.weight") == "model.layers.24.nextn.eh_proj"
+    # Genuinely NATIVE ssm-core tensors (not nn.Linear matmuls) still raise KeyError.
+    for stem in ("ssm_conv1d", "ssm_dt", "ssm_a", "ssm_norm"):
         try:
             map_gguf_to_hf(f"blk.0.{stem}.weight")
             assert False, f"expected KeyError for {stem}"
@@ -565,3 +575,165 @@ def test_export_blobs_roundtrip(tmp_path):
     W_blob = ml8_io.reconstruct_weight(blob)
     W_at = at.weight().detach()
     assert torch.equal(W_blob, W_at)
+
+
+# ─── BUG: re-emit coverage — fp8 export schema the converter accepts ──────────
+
+
+def _configure_qwen35():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
+    from role_targets import configure
+    configure("qwen35", 32)
+
+
+def test_export_fp8_blob_has_name_and_classifies_fp8(tmp_path):
+    """Regression for the act_replay re-emit 0.3%-coverage bug: the exported
+    *.fp8.pt blobs used to carry only {e4m3, scale} with NO 'name', so the
+    converter's _build_fp8_blob_map skipped every one ('blob has no name field')
+    and the SSM/embed weights silently shipped bf16. The fix writes the canonical
+    fp8 schema (name/tier/shape/group_size) and uses HF names that classify FP8."""
+    from role_targets import classify_role, Tier
+    _configure_qwen35()
+
+    N, K = 16, 64                       # K divisible by FP8 group size (32)
+    e4m3 = torch.randn(N, K).to(torch.float8_e4m3fn).to(torch.float32)
+    scale = (torch.rand(N, K // 32) + 0.1).to(torch.float16)
+    # GGUF names as produced by _read_frozen_fp8_raw; main() maps these to HF names.
+    frozen_raw = {"blk.0.ssm_alpha.weight": (e4m3, scale)}
+    hf_names = {"blk.0.ssm_alpha.weight": map_gguf_to_hf("blk.0.ssm_alpha.weight")}
+
+    export_blobs({}, hf_names, tmp_path, frozen_fp8_raw=frozen_raw)
+
+    blob_path = tmp_path / "model.layers.0.linear_attn.in_proj_a.fp8.pt"
+    assert blob_path.exists()
+    blob = torch.load(blob_path, map_location="cpu", weights_only=False)
+    # canonical schema fields the converter requires.
+    assert blob["name"] == "model.layers.0.linear_attn.in_proj_a"
+    assert blob["tier"] == "fp8"
+    assert list(blob["shape"]) == [N, K]
+    assert blob["group_size"] == 32
+    assert "e4m3" in blob and "scale" in blob
+    # the converter keys off blob['name'] -> classify_role -> Tier.FP8.
+    _gguf, _role, tier = classify_role(blob["name"])
+    assert tier is Tier.FP8, f"expected FP8 tier, got {tier}"
+
+
+def test_export_untrained_ml8_reemitted(tmp_path):
+    """Untrained ML8 tensors (present in the source GGUF but not training targets,
+    e.g. a narrowed --tensors-train glob) must be re-exported with a converter-
+    valid schema, else they drop to bf16 and tank re-emit coverage."""
+    from role_targets import classify_role, Tier
+    _configure_qwen35()
+
+    t = _mk_state(N=8, K=128, G=2, seed=11)
+    # snap centroids so the round-trip is lattice-exact (export snaps internally).
+    t = dict(t)
+    t["centroids"] = snap_to_e4m3(t["centroids"])
+    untrained = {"blk.2.ffn_down.weight": t}
+
+    # No trained targets; only the untrained ml8 map is supplied.
+    export_blobs({}, {}, tmp_path, untrained_ml8=untrained)
+
+    blob_path = tmp_path / "model.layers.2.mlp.down_proj.pt"
+    assert blob_path.exists()
+    blob = ml8_io.load_ml8_layer(blob_path)
+    assert blob["name"] == "model.layers.2.mlp.down_proj"
+    assert list(blob["shape"]) == [8, 128]
+    # classifies as an ML8 weight the converter will pack.
+    _gguf, _role, tier = classify_role(blob["name"])
+    assert tier is Tier.ML8
+    # a trained target for the SAME tensor wins over the untrained copy.
+    at = attach_to_linear(nn.Linear(128, 8, bias=False), _mk_state(N=8, K=128, G=2, seed=99))
+    with torch.no_grad():
+        at.centroids.copy_(snap_to_e4m3(at.centroids))
+    export_blobs({"blk.2.ffn_down.weight": at},
+                 {"blk.2.ffn_down.weight": "model.layers.2.mlp.down_proj"},
+                 tmp_path, untrained_ml8=untrained)
+    W_blob = ml8_io.reconstruct_weight(ml8_io.load_ml8_layer(blob_path))
+    assert torch.equal(W_blob, at.weight().detach())
+
+
+# ─── 4B memory knob: --train-seq-len window splitting ─────────────────────────
+
+
+def test_split_batches_seq_counts():
+    # Two full batches of T=10 each; window=4 -> ceil(10/4)=3 windows per batch.
+    batches = [torch.arange(10).reshape(1, 10), torch.arange(10, 20).reshape(1, 10)]
+    train_idx = torch.tensor([0, 1])
+    win_batches, win_idx = split_batches_seq(batches, train_idx, train_seq_len=4)
+    assert len(win_batches) == 6          # 3 + 3
+    assert win_idx.tolist() == list(range(6))
+    # window lengths tile the full sequence: 4,4,2 per source batch (no tokens lost).
+    lens = [w.shape[-1] for w in win_batches]
+    assert lens == [4, 4, 2, 4, 4, 2]
+    # concatenating the windows of batch 0 reproduces the original ids exactly.
+    cat0 = torch.cat(win_batches[:3], dim=-1)
+    assert torch.equal(cat0, batches[0])
+
+
+def test_split_batches_seq_disabled_passthrough():
+    batches = [torch.arange(8).reshape(1, 8)]
+    train_idx = torch.tensor([0])
+    # None disables; window >= T passes the batch through whole.
+    for tsl in (None, 8, 16):
+        wb, wi = split_batches_seq(batches, train_idx, train_seq_len=tsl)
+        assert len(wb) == 1 and wi.tolist() == [0]
+        assert torch.equal(wb[0], batches[0])
+
+
+def test_split_batches_seq_only_train_idx():
+    # Three batches but only indices {0,2} are train; batch 1 (holdout) is untouched.
+    batches = [torch.arange(6).reshape(1, 6),
+               torch.full((1, 6), -1),
+               torch.arange(100, 106).reshape(1, 6)]
+    train_idx = torch.tensor([0, 2])
+    wb, wi = split_batches_seq(batches, train_idx, train_seq_len=3)
+    assert len(wb) == 4                   # 2 windows each for batches 0 and 2
+    # holdout sentinel batch never appears in the windowed train list.
+    assert all((w != -1).all() for w in wb)
+
+
+def test_split_batches_seq_mask_preserved_per_window():
+    """The response mask is recomputed from each window's ids at train time, so
+    splitting ids preserves masking WITHIN a window: a window that contains the
+    assistant START still masks its response tokens exactly. (A window with NO
+    START falls back to the documented all-ones raw-text mask — the same fallback
+    batch_response_mask applies to any record without an assistant span.)"""
+    start, end = [1], [2]                 # 1-token start/end delimiters
+    # ids: [pad, START, r, r, END, x, x, x]  -> response tokens are indices 2,3.
+    ids = torch.tensor([[0, 1, 5, 6, 2, 8, 9, 4]])
+    full_mask = batch_response_mask(ids, start, end)
+    assert full_mask[0].tolist() == [0, 0, 1, 1, 0, 0, 0, 0]
+
+    wb, wi = split_batches_seq([ids], torch.tensor([0]), train_seq_len=4)
+    assert len(wb) == 2
+    # window 0 = ids[:4] = [0,1,5,6] -> START at idx1, span open to window end -> 2,3=1
+    win0_mask = batch_response_mask(wb[0], start, end)
+    assert win0_mask[0].tolist() == [0, 0, 1, 1]
+    # window 0's mask == the matching slice of the full-sequence mask (1:1 preserved).
+    assert torch.equal(win0_mask, full_mask[:, :4])
+    # window 1 = ids[4:] = [2,8,9,4] -> no START -> all-ones raw-text fallback.
+    win1_mask = batch_response_mask(wb[1], start, end)
+    assert win1_mask[0].tolist() == [1, 1, 1, 1]
+    # no tokens are lost: concatenating the windows reproduces the source ids.
+    assert torch.equal(torch.cat(wb, dim=-1), ids)
+
+
+# ─── 4B memory knob: alloc-conf launch hint ───────────────────────────────────
+
+
+def test_alloc_conf_hint_cpu_is_none():
+    assert alloc_conf_hint("cpu", env={}) is None
+
+
+def test_alloc_conf_hint_cuda_unset_warns():
+    msg = alloc_conf_hint("cuda:0", env={})
+    assert msg is not None
+    assert "PYTORCH_HIP_ALLOC_CONF=expandable_segments:True" in msg
+
+
+def test_alloc_conf_hint_cuda_already_set_is_none():
+    env = {"PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True"}
+    assert alloc_conf_hint("cuda:0", env=env) is None

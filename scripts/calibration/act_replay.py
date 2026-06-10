@@ -167,6 +167,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--corpus", default="mix", help="calib_corpus composition name")
     p.add_argument("--token-budget", type=int, default=512000, help="total calibration token budget")
     p.add_argument("--seq-len", type=int, default=2048, help="per-sample sequence length")
+    p.add_argument("--train-seq-len", type=int, default=None,
+                   help="if set, TRAIN batches are split along the time axis into "
+                        "windows of this length (response mask preserved per window) "
+                        "to cap per-forward activation memory on the 4B host. The "
+                        "corpus is still drawn at --seq-len and EVAL keeps the full "
+                        "sequence. Default None = train at the full --seq-len.")
     # teacher
     p.add_argument("--teacher", default="live", help="teacher source spec: live | cache | device:N")
     p.add_argument("--teacher-cache-dir", default=None, help="dir for the cache teacher's shards (never /tmp)")
@@ -210,6 +216,50 @@ def split_holdout(n: int, frac: float, seed: int):
     train_idx = perm[: n - n_hold].clone()
     # sort each side so callers iterate in stable batch order
     return torch.sort(train_idx).values, torch.sort(hold_idx).values
+
+
+def split_batches_seq(batches, train_idx, train_seq_len):
+    """Split TRAIN batches along the time axis into windows of `train_seq_len`.
+
+    The 4B-host memory knob: the corpus is drawn at the full --seq-len (eval needs
+    it), but a full-length forward + KL retains too much activation memory at 4B.
+    Splitting each TRAIN sequence into shorter windows caps the per-forward cost
+    while keeping every token (and thus the response mask, which is recomputed from
+    the windowed ids downstream) — windows just tile the original sequence.
+
+    Args:
+        batches: list of [1, T] (or [T]) LongTensors — the full corpus draw.
+        train_idx: 1-D LongTensor of batch indices to train on.
+        train_seq_len: window length along T. None / <= 0 / >= T disables splitting
+                       for a given batch (that batch passes through whole).
+
+    Returns:
+        (win_batches, win_train_idx):
+          win_batches  — new list of windowed [1, t] tensors (t <= train_seq_len),
+                         a tail window shorter than train_seq_len is kept (not
+                         dropped) so no tokens are lost.
+          win_train_idx — LongTensor indexing win_batches, in train_idx order.
+
+    Eval is unaffected: callers keep iterating the ORIGINAL `batches` for holdout.
+    """
+    if train_seq_len is None or train_seq_len <= 0:
+        return list(batches), train_idx.clone()
+    win_batches = []
+    win_idx = []
+    for i in train_idx.tolist():
+        ids = batches[i]
+        twod = ids.dim() == 2
+        T = ids.shape[-1]
+        if T <= train_seq_len:
+            win_idx.append(len(win_batches))
+            win_batches.append(ids)
+            continue
+        for start in range(0, T, train_seq_len):
+            stop = min(start + train_seq_len, T)
+            window = ids[:, start:stop] if twod else ids[start:stop]
+            win_idx.append(len(win_batches))
+            win_batches.append(window)
+    return win_batches, torch.tensor(win_idx, dtype=torch.long)
 
 
 # ─── response-token masking ──────────────────────────────────────────────────
@@ -349,6 +399,14 @@ _GGUF_STEM_TO_HF = {
     "attn_qkv": "linear_attn.in_proj_qkv",
     "attn_gate": "linear_attn.in_proj_z",
     "ssm_out": "linear_attn.out_proj",
+    # FP8-tier linear-attn projections (frozen, never trained as ml8 targets):
+    # ssm_alpha/ssm_beta are the in_proj_a/in_proj_b gates. These never appear in
+    # `targets` (only ml8 tiers attach), but they DO surface in the frozen-fp8
+    # re-emit map, so map them here so export_blobs writes a `name` the converter's
+    # classify_role resolves to Tier.FP8 (rather than a GGUF-name fallback the
+    # converter rejects).
+    "ssm_alpha": "linear_attn.in_proj_a",
+    "ssm_beta": "linear_attn.in_proj_b",
 }
 
 
@@ -370,6 +428,10 @@ def map_gguf_to_hf(gguf_name: str) -> str:
         stem = parts[2]
         if stem in _GGUF_STEM_TO_HF:
             return f"model.layers.{layer}.{_GGUF_STEM_TO_HF[stem]}"
+    # MTP / NextN draft head: blk.{L}.nextn.eh_proj.weight -> model.layers.{L}.nextn.eh_proj
+    # (4-part GGUF name; classify_role keys eh_proj off the HF leaf, not the GGUF one.)
+    if len(parts) == 4 and parts[0] == "blk" and parts[2] == "nextn" and parts[3] == "eh_proj":
+        return f"model.layers.{parts[1]}.nextn.eh_proj"
     raise KeyError(f"no HF mapping for GGUF tensor {gguf_name!r}")
 
 
@@ -504,7 +566,8 @@ def eval_kl(model, teacher, batches, hold_idx, resp_delims=None):
 
 def train(model, teacher, batches, train_idx, hold_idx, optimizer,
           grad_accum=8, epochs=1, steps=None, eval_interval=200,
-          start_step=0, ckpt_path=None, targets=None, resp_delims=None):
+          start_step=0, ckpt_path=None, targets=None, resp_delims=None,
+          eval_batches=None):
     """Run the act-replay KL training loop.
 
     Per train batch (in train_idx order): student logits -> kl_topk vs the
@@ -517,7 +580,15 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
     given, the KL loss is masked to response tokens per batch (Design: "Loss = KL
     over response tokens"); raw-text batches with no assistant span fall back to
     an all-ones mask.
+
+    eval_batches: optional separate batch list for the interleaved holdout eval
+    (indexed by hold_idx). Defaults to `batches`. Set this when `batches` has been
+    time-split for training (--train-seq-len) but the holdout must keep full-length
+    sequences — train and eval then draw from different lists with their own index
+    spaces.
     """
+    if eval_batches is None:
+        eval_batches = batches
     model.train()
     step = start_step
     micro = 0
@@ -549,7 +620,7 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                 if step == start_step + 1:
                     _tensor_census(f"post-train-step{step}")
                 if eval_interval and step % eval_interval == 0:
-                    kl = eval_kl(model, teacher, batches, hold_idx, resp_delims=resp_delims)
+                    kl = eval_kl(model, teacher, eval_batches, hold_idx, resp_delims=resp_delims)
                     print(f"[act-replay] step {step} holdout_kl {kl:.6f}", flush=True)
                     if ckpt_path is not None and targets is not None:
                         save_ckpt(ckpt_path, step, targets, optimizer)
@@ -607,14 +678,49 @@ def _read_frozen_fp8_raw(gguf_path):
     return out
 
 
-def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None):
+def _write_ml8_blob(out_dir, hf_name, indices, centroids, scales):
+    """Write one ml8_io-schema .pt blob (name/shape/group_size/n_centroids/
+    indices int8/centroids_per_group/scale_per_group + zeroed metrics).
+
+    indices [N,K], centroids [G,16], scales [N,G] — torch tensors on CPU.
+    group_size = K // G. Centroids are snapped to the e4m3 lattice (the on-disk
+    sidecar dtype) so the blob round-trips bit-exactly through ml8_to_gguf.
+    """
+    indices = indices.detach().cpu().to(torch.int8)
+    N, K = indices.shape
+    cent = snap_to_e4m3(centroids.detach().cpu().to(torch.float32))
+    G = cent.shape[0]
+    scales = scales.detach().cpu().to(torch.float32)
+    blob = {
+        "name": hf_name,
+        "shape": [int(N), int(K)],
+        "group_size": int(K // G),
+        "n_centroids": int(cent.shape[1]),
+        "indices": indices,
+        "centroids_per_group": cent,
+        "scale_per_group": scales,
+        "mse": 0.0,
+        "w_snr_db": 0.0,
+        "y_snr_db": 0.0,
+        "rel_err": 0.0,
+    }
+    torch.save(blob, out_dir / f"{hf_name}.pt")
+
+
+def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=None):
     """Write each ml8 target as an ml8_io-schema blob, plus frozen fp8 tensors.
 
     state: {gguf_name: AttachedTarget}.
     hf_names: {gguf_name: hf_tensor_name} — the blob's `name` and filename stem.
     out_dir: destination dir (never /tmp); created if needed.
     frozen_fp8_raw: optional {gguf_name: (e4m3 fp32 [N,K], scale fp16 [N,n_b])} —
-        written as {hf_name}.fp8.pt = {"e4m3": fp32, "scale": fp16}.
+        written as {hf_name}.fp8.pt = canonical fp8 schema
+        (name/tier/shape/group_size/e4m3/scale).
+    untrained_ml8: optional {gguf_name: {"indices","scales","centroids"}} — ML8_4
+        tensors that exist in the source GGUF but were NOT selected as training
+        targets (e.g. with a narrowed --tensors-train glob). Without re-emitting
+        these, a partial-training run would silently drop them to bf16 in the
+        re-emitted GGUF and tank coverage. Re-exported verbatim from the source.
 
     Per ml8 target: snap_to_e4m3 the final centroids, then write the schema
     (name/shape/group_size/n_centroids/indices int8/centroids_per_group/
@@ -624,38 +730,47 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for gguf_name, at in state.items():
-        hf_name = hf_names[gguf_name]
-        indices = at.indices.detach().cpu().to(torch.int8)
-        N, K = indices.shape
-        cent = snap_to_e4m3(at.centroids.detach().cpu().to(torch.float32))
-        G = cent.shape[0]
-        group_size = K // G
-        scales = at.scales.detach().cpu().to(torch.float32)
-        blob = {
-            "name": hf_name,
-            "shape": [int(N), int(K)],
-            "group_size": int(group_size),
-            "n_centroids": int(cent.shape[1]),
-            "indices": indices,
-            "centroids_per_group": cent,
-            "scale_per_group": scales,
-            "mse": 0.0,
-            "w_snr_db": 0.0,
-            "y_snr_db": 0.0,
-            "rel_err": 0.0,
-        }
-        torch.save(blob, out_dir / f"{hf_name}.pt")
+        _write_ml8_blob(out_dir, hf_names[gguf_name],
+                        at.indices, at.centroids, at.scales)
+
+    if untrained_ml8:
+        for gguf_name, ent in untrained_ml8.items():
+            if gguf_name in state:
+                continue  # a trained target already wrote the up-to-date blob
+            hf_name = hf_names.get(gguf_name)
+            if hf_name is None:
+                try:
+                    hf_name = map_gguf_to_hf(gguf_name)
+                except KeyError:
+                    hf_name = gguf_name
+            _write_ml8_blob(out_dir, hf_name, ent["indices"],
+                            ent["centroids"], ent["scales"])
 
     if frozen_fp8_raw:
+        from ml8_to_gguf import _FP8_GROUP_SIZE
         for gguf_name, (e4m3, scale) in frozen_fp8_raw.items():
             hf_name = hf_names.get(gguf_name)
             if hf_name is None:
                 # frozen fp8 tensors that don't map to a known HF name keep their
                 # GGUF name as the stem (sanitized for the filesystem).
                 hf_name = gguf_name
+            e4m3 = e4m3.detach().cpu().to(torch.float32)
+            scale = scale.detach().cpu().to(torch.float16)
+            N, K = int(e4m3.shape[0]), int(e4m3.shape[1])
+            # Write the CANONICAL fp8 blob schema (matches calibrate_ml8_paged's
+            # *.fp8.pt output): name/tier/shape/group_size + e4m3/scale. The earlier
+            # export wrote only {e4m3, scale}, so ml8_to_gguf._build_fp8_blob_map —
+            # which keys off blob['name'] then classify_role — skipped every fp8
+            # blob with "blob has no 'name' field", collapsing re-emit coverage.
             torch.save(
-                {"e4m3": e4m3.detach().cpu().to(torch.float32),
-                 "scale": scale.detach().cpu().to(torch.float16)},
+                {
+                    "name": hf_name,
+                    "tier": "fp8",
+                    "shape": [N, K],
+                    "group_size": int(_FP8_GROUP_SIZE),
+                    "e4m3": e4m3,
+                    "scale": scale,
+                },
                 out_dir / f"{hf_name}.fp8.pt")
     return out_dir
 
@@ -663,10 +778,41 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None):
 # ─── CLI entry point ─────────────────────────────────────────────────────────
 
 
+def alloc_conf_hint(device_str, env=None):
+    """Return a launch-time recommendation string if the HIP expandable-segments
+    allocator knob is unset for a CUDA/HIP run, else None.
+
+    This module imports torch at load time, so setting PYTORCH_HIP_ALLOC_CONF from
+    inside the process is too late — the caching allocator is already configured.
+    The only correct fix is to export it BEFORE launching python. We therefore
+    just DETECT the gap and print the exact launch line; we do not pretend an
+    in-process os.environ.setdefault would take effect (it wouldn't).
+
+    Returns None for CPU runs or when the var is already set (any non-empty value).
+    """
+    env = os.environ if env is None else env
+    if not str(device_str).startswith("cuda"):
+        return None
+    if env.get("PYTORCH_HIP_ALLOC_CONF"):
+        return None
+    return (
+        "[act-replay] HINT: PYTORCH_HIP_ALLOC_CONF is unset. On the 15GB 4B host, "
+        "fragmentation can OOM mid-train. torch is imported at module load, so this "
+        "MUST be set BEFORE launching python — re-launch with:\n"
+        "    PYTORCH_HIP_ALLOC_CONF=expandable_segments:True python3 act_replay.py ..."
+    )
+
+
 def main(argv=None):
     """Wire the full pipeline. HF-dependent path; exercised end-to-end only with
     a real model + GPU (the unit tests import the functions above directly)."""
     args = parse_args(argv)
+
+    # Allocator-fragmentation hint for CUDA/HIP runs (must be set at launch time —
+    # torch is already imported, so we only advise, we don't try to set it here).
+    _hint = alloc_conf_hint(args.device)
+    if _hint:
+        print(_hint, flush=True)
 
     out_dir = Path(args.out_dir)
     if str(out_dir).startswith("/tmp"):
@@ -723,8 +869,19 @@ def main(argv=None):
     print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
     _memlog("post-install")
 
-    # The rehydrated ml8 codebooks now live in the attached targets; the gstate
-    # copies are dead weight on the 15GB host — free them before the calib draw.
+    # Capture the ML8_4 tensors that are NOT attached training targets (e.g. when
+    # --tensors-train is a narrowed glob). These still need to be re-emitted at
+    # their source codebooks, else the re-emitted GGUF silently drops them to bf16
+    # and tanks coverage (the act_replay re-emit 0.3%-coverage bug class). The
+    # trained targets are excluded here — their up-to-date codebooks win at export.
+    untrained_ml8 = {g: ent for g, ent in gstate.ml8.items() if g not in targets}
+    if untrained_ml8:
+        print(f"[act-replay] {len(untrained_ml8)} untrained ml8 tensor(s) will be "
+              f"re-emitted verbatim from the source GGUF")
+
+    # The rehydrated ml8 codebooks now live in the attached targets; the remaining
+    # gstate copies (now captured in untrained_ml8) are dead weight on the 15GB
+    # host — free the dict's hold before the calib draw.
     gstate.ml8.clear()
     _memlog("post-clear")
 
@@ -737,6 +894,25 @@ def main(argv=None):
     _memlog("post-corpus")
 
     train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
+
+    # --train-seq-len: time-split the TRAIN batches into shorter windows to cap
+    # per-forward activation memory at 4B, while EVAL keeps full --seq-len holdout
+    # sequences. train_batches/train_idx_w live in their own index space; eval keeps
+    # the original (batches, hold_idx).
+    train_batches = batches
+    train_idx_w = train_idx
+    if args.train_seq_len is not None and args.train_seq_len < args.seq_len:
+        if args.teacher != "live":
+            print(f"[act-replay] WARNING: --train-seq-len with --teacher "
+                  f"{args.teacher!r} — the cache/device teacher is keyed on the "
+                  f"full-sequence batches; window-splitting is only validated with "
+                  f"the live teacher. Falling back to no split.")
+        else:
+            train_batches, train_idx_w = split_batches_seq(
+                batches, train_idx, args.train_seq_len)
+            print(f"[act-replay] train-seq-len={args.train_seq_len}: split "
+                  f"{len(train_idx)} train batch(es) (seq_len={args.seq_len}) into "
+                  f"{len(train_idx_w)} window(s)")
 
     # teacher = frozen bf16 parent — a SEPARATE from_pretrained instance with NO
     # attached ml8 targets, for every strategy (live/cache/device). Distilling
@@ -778,24 +954,27 @@ def main(argv=None):
 
     ckpt_path = out_dir / "ckpt.pt"
     final_step = train(
-        wrapped, teacher, batches, train_idx, hold_idx, optimizer,
+        wrapped, teacher, train_batches, train_idx_w, hold_idx, optimizer,
         grad_accum=args.grad_accum, epochs=args.epochs, steps=args.steps,
         eval_interval=args.eval_interval, start_step=start_step,
-        ckpt_path=ckpt_path, targets=targets, resp_delims=resp_delims)
+        ckpt_path=ckpt_path, targets=targets, resp_delims=resp_delims,
+        eval_batches=batches)
     print(f"[act-replay] training done at step {final_step}")
     save_ckpt(ckpt_path, final_step, targets, optimizer)
 
-    # export blobs (+ frozen fp8) then re-emit a GGUF
+    # export blobs (+ frozen fp8 + untrained ml8) then re-emit a GGUF
     blob_dir = out_dir / "blobs"
     frozen_raw = _read_frozen_fp8_raw(args.gguf)
-    # frozen fp8 names are GGUF names; map the ones we can, leave the rest as-is
-    fp8_hf = {}
-    for gname in frozen_raw:
+    # frozen fp8 + untrained-ml8 names are GGUF names; map the ones we can, leave
+    # the rest as-is (the converter classifies on the blob's HF/GGUF name field).
+    extra_hf = {}
+    for gname in list(frozen_raw) + list(untrained_ml8):
         try:
-            fp8_hf[gname] = map_gguf_to_hf(gname)
+            extra_hf[gname] = map_gguf_to_hf(gname)
         except KeyError:
-            fp8_hf[gname] = gname
-    export_blobs(targets, {**hf_names, **fp8_hf}, blob_dir, frozen_fp8_raw=frozen_raw)
+            extra_hf[gname] = gname
+    export_blobs(targets, {**hf_names, **extra_hf}, blob_dir,
+                 frozen_fp8_raw=frozen_raw, untrained_ml8=untrained_ml8)
     print(f"[act-replay] wrote blobs to {blob_dir}")
 
     from ml8_to_gguf import convert_to_ml8_gguf
