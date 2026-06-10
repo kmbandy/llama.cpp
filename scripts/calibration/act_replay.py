@@ -596,6 +596,10 @@ def main(argv=None):
     print(f"[act-replay] response mask delimiters: start={resp_delims[0]} "
           f"end={resp_delims[1]}")
 
+    # step-0 sanity: pre-train holdout KL (= the PTQ artifact's KL on this draw)
+    kl0 = eval_kl(wrapped, teacher, batches, hold_idx, resp_delims=resp_delims)
+    print(f"[act-replay] step {start_step} holdout_kl {kl0:.6f} (pre-train)", flush=True)
+
     ckpt_path = out_dir / "ckpt.pt"
     final_step = train(
         wrapped, teacher, batches, train_idx, hold_idx, optimizer,
