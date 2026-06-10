@@ -32,6 +32,57 @@ from centroid_quantizer import snap_to_e4m3
 from kl_loss import kl_topk
 
 
+# ─── HF model loading + LM wrapper ───────────────────────────────────────────
+
+
+class _LMWrap(torch.nn.Module):
+    """Wrap an HF causal-LM so callers (teacher_source / kl) get a plain logits
+    tensor. The forward moves ids onto the wrapped model's device first."""
+
+    def __init__(self, m, device=None):
+        super().__init__()
+        self.m = m
+        if device is None:
+            try:
+                device = next(m.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+        self.device = torch.device(device)
+
+    def forward(self, ids):
+        return self.m(ids.to(self.device)).logits
+
+
+def load_hf_model(path, device, *, grad_ckpt=False, freeze=False):
+    """Load a fresh HF causal-LM from `path` onto `device`.
+
+    A NEW from_pretrained instance every call — the student and the (frozen
+    bf16 parent) teacher must be SEPARATE objects, never the same monkeypatched
+    model. Applies the RDNA fp32 linear-attn scan shim (no-op off RDNA/CPU).
+
+    grad_ckpt: enable non-reentrant gradient checkpointing (student path).
+    freeze:    eval() + requires_grad_(False) — the frozen teacher parent.
+    """
+    from transformers import AutoModelForCausalLM
+    import fla_compat
+
+    device = torch.device(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        path, torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa").to(device).eval()
+
+    if grad_ckpt:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    fla_compat.apply_fla_arch_shim(model, device)
+    fla_compat.apply_fla_cpu_fallback(model, device)
+
+    if freeze:
+        model.requires_grad_(False)
+    return model
+
+
 # ─── arg parsing ─────────────────────────────────────────────────────────────
 
 
@@ -487,37 +538,17 @@ def main(argv=None):
     gstate = load_ml8_gguf(args.gguf)
 
     # HF model + tokenizer (untested path).
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     from calib_corpus import collect_calibration
 
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa").to(device).eval()
 
-    # Gradient checkpointing (non-reentrant) — trades recompute for activation
-    # memory so the full-seq KL forward fits. --no-grad-ckpt disables it.
-    if not args.no_grad_ckpt:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False})
-
-    # RDNA fp32 linear-attn scan shim (no-op on CDNA / NVIDIA / CPU, or if fla is
-    # absent); the CPU fallback swaps Triton kernels for torch refs when needed.
-    import fla_compat
-    fla_compat.apply_fla_arch_shim(model, device)
-    fla_compat.apply_fla_cpu_fallback(model, device)
-
-    # wrap so callers (teacher_source / kl) get a plain logits tensor
-    class _LMWrap(torch.nn.Module):
-        def __init__(self, m):
-            super().__init__()
-            self.m = m
-
-        def forward(self, ids):
-            return self.m(ids.to(device)).logits
-
-    wrapped = _LMWrap(model)
+    # Student: a fresh bf16 model whose selected ml8 linears get monkeypatched
+    # with trainable dequant-STE targets below. Gradient checkpointing
+    # (non-reentrant) trades recompute for activation memory; --no-grad-ckpt off.
+    model = load_hf_model(args.model, device, grad_ckpt=not args.no_grad_ckpt)
+    wrapped = _LMWrap(model, device)
 
     targets = attach_targets(dict(model.named_modules()), gstate,
                              train=args.tensors_train, skip=args.tensors_skip)
@@ -533,11 +564,17 @@ def main(argv=None):
 
     train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
 
-    # teacher
+    # teacher = frozen bf16 parent — a SEPARATE from_pretrained instance with NO
+    # attached ml8 targets, for every strategy (live/cache/device). Distilling
+    # against the trained-on student would chase a moving target; a cache built
+    # from the attached model would distill KL-to-quant — the wrong target. live
+    # keeps both resident (~2x model RAM); cache/device load the parent lazily.
     from teacher_source import make_teacher
     cache_dir = args.teacher_cache_dir or str(out_dir / "teacher_cache")
+    teacher_loader = lambda: _LMWrap(
+        load_hf_model(args.model, device, freeze=True), device)
     teacher = make_teacher(
-        args.teacher, model_loader=lambda: wrapped, K=args.topk,
+        args.teacher, model_loader=teacher_loader, K=args.topk,
         cache_dir=cache_dir, batches=batches, cache_key=f"{args.model}_{args.corpus}")
 
     # optimizer with separate lr groups for centroids vs scales

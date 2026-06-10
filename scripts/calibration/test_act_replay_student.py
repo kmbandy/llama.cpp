@@ -71,6 +71,28 @@ def test_ste_off_lattice():
     assert at.centroids.grad is not None
 
 
+def test_bf16_host_dtype_cast():
+    """BUG 1 regression: a bf16 host nn.Linear + bf16 activations must run the
+    attached forward without an fp32/bf16 dtype crash in F.linear. The fp32
+    centroids/scales are cast to the activation dtype AFTER the STE dequant, so
+    gradients still flow back to the fp32 leaves and stay finite (CPU bf16 OK)."""
+    t = _mk_state(N=8, K=128)
+    lin = nn.Linear(128, 8, bias=True).to(torch.bfloat16)  # bf16 host weight + bias
+    at = attach_to_linear(lin, t)
+
+    x = torch.randn(3, 128, dtype=torch.bfloat16)
+    y = lin(x)                                  # must not raise on dtype mismatch
+    assert y.dtype == torch.bfloat16
+
+    # backward flows into the fp32 codebook leaves; grads are finite.
+    y.sum().backward()
+    assert at.centroids.grad is not None and at.scales.grad is not None
+    assert torch.isfinite(at.centroids.grad).all()
+    assert torch.isfinite(at.scales.grad).all()
+    # codebook leaves stay fp32 despite the bf16 forward cast.
+    assert at.centroids.dtype == torch.float32 and at.scales.dtype == torch.float32
+
+
 def test_faithful_acts():
     """With a rotation present, the forward must apply the W4A8 faithful path:
     x_eff = quantize_act_per_row(x @ Q) @ Q.T, then F.linear(x_eff, W)."""

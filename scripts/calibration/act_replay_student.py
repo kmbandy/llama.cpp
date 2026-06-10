@@ -136,7 +136,13 @@ def attach_to_linear(lin: nn.Linear, target: dict,
 
     def _forward(x):
         x_eff = at.apply_acts(x) if use_acts else x
-        return F.linear(x_eff, at.weight(), bias)
+        # The codebook params are fp32 leaves but the host model may run in bf16
+        # (or fp16). Cast the dequant weight (and bias) to the activation dtype so
+        # F.linear doesn't crash on a dtype mismatch. The cast happens AFTER the
+        # STE dequant, so gradients still flow back to the fp32 centroids/scales.
+        w = at.weight().to(x_eff.dtype)
+        b = bias.to(x_eff.dtype) if bias is not None else None
+        return F.linear(x_eff, w, b)
 
     lin.forward = _forward  # type: ignore[assignment]
     return at

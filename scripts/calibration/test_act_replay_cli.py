@@ -269,6 +269,139 @@ def test_train_step_loss_down():
     assert kl30 < kl0, f"KL did not decrease: {kl0} -> {kl30}"
 
 
+def test_frozen_separate_teacher(tmp_path):
+    """BUG 2 regression: the teacher must be a SEPARATE frozen instance, not the
+    monkeypatched student the trainer trains. We attach ml8 targets to the
+    student copy, build a LiveTeacher from a FRESH stub (the frozen parent), then
+    train 30 steps and assert:
+      * the teacher was actually called (teacher.calls > 0),
+      * the student's KL to that fixed teacher decreased,
+      * the teacher's output for fixed ids is IDENTICAL at step 0 and after
+        training — i.e. it is frozen and not the moving student.
+    """
+    from teacher_source import LiveTeacher
+    from kl_loss import kl_topk
+
+    student, _teacher_unused, at = _build_student_teacher()
+
+    # Frozen separate parent: a fresh stub built from the SAME dequant weight,
+    # sharing embed/head, with grads off. It is NOT the student object.
+    t = _mk_state(N=8, K=128, G=2, seed=0)
+    W = dequant_ml8_state(t)
+    parent = StubLM(vocab=32, K=128, N=8, weight=W)
+    with torch.no_grad():
+        parent.embed.weight.copy_(student.embed.weight)
+        parent.head.weight.copy_(student.head.weight)
+    parent.eval().requires_grad_(False)
+    assert parent is not student
+
+    class _CountingTeacher(LiveTeacher):
+        calls = 0
+
+        def get(self, batch_idx, ids):
+            type(self).calls += 1
+            return super().get(batch_idx, ids)
+
+    K_top = 8
+    teacher_src = _CountingTeacher(parent, K_top)
+
+    g = torch.Generator().manual_seed(0)
+    batches = [torch.randint(0, 32, (1, 16), generator=g) for _ in range(4)]
+
+    # fixed-ids teacher output BEFORE training
+    probe = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+    idx0, vals0, tail0 = teacher_src.get(0, probe)
+    idx0, vals0, tail0 = idx0.clone(), vals0.clone(), tail0.clone()
+    calls_after_probe = _CountingTeacher.calls
+
+    def _kl_now():
+        tot = 0.0
+        for i, ids in enumerate(batches):
+            idx, vals, tail = teacher_src.get(i, ids)
+            logits = student(ids)
+            V = logits.shape[-1]
+            tot += kl_topk(logits.reshape(-1, V), idx, vals, tail).item()
+        return tot / len(batches)
+
+    kl0 = _kl_now()
+    opt = torch.optim.Adam([at.centroids, at.scales], lr=1e-2)
+    for _ in range(30):
+        for i, ids in enumerate(batches):
+            idx, vals, tail = teacher_src.get(i, ids)
+            logits = student(ids)
+            V = logits.shape[-1]
+            loss = kl_topk(logits.reshape(-1, V), idx, vals, tail)
+            opt.zero_grad(); loss.backward(); opt.step()
+    kl30 = _kl_now()
+
+    # teacher was actually exercised, separately from student steps
+    assert _CountingTeacher.calls > calls_after_probe
+    assert kl30 < kl0, f"KL did not decrease: {kl0} -> {kl30}"
+
+    # frozen: teacher output for the SAME ids is bit-identical after training.
+    idx1, vals1, tail1 = teacher_src.get(0, probe)
+    assert torch.equal(idx0, idx1)
+    assert torch.equal(vals0, vals1)
+    assert torch.equal(tail0, tail1)
+
+
+def test_load_hf_model_separate_instances():
+    """load_hf_model returns a NEW object each call (student != teacher parent),
+    and _LMWrap yields plain logits. Exercised with a stub patched in for
+    AutoModelForCausalLM so no real HF download is needed."""
+    import act_replay
+
+    made = []
+
+    class _StubAuto:
+        @staticmethod
+        def from_pretrained(path, **kw):
+            m = StubLM(vocab=32, K=128, N=8)
+            made.append(m)
+            return m
+
+    import types, sys
+    fake_tf = types.ModuleType("transformers")
+    fake_tf.AutoModelForCausalLM = _StubAuto
+    fake_fla = types.ModuleType("fla_compat")
+    fake_fla.apply_fla_arch_shim = lambda *a, **k: None
+    fake_fla.apply_fla_cpu_fallback = lambda *a, **k: None
+    saved = {k: sys.modules.get(k) for k in ("transformers", "fla_compat")}
+    sys.modules["transformers"] = fake_tf
+    sys.modules["fla_compat"] = fake_fla
+    try:
+        student = act_replay.load_hf_model("stub", "cpu")
+        parent = act_replay.load_hf_model("stub", "cpu", freeze=True)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    assert student is not parent and len(made) == 2
+    # frozen parent has grads off; student does not.
+    assert all(not p.requires_grad for p in parent.parameters())
+    assert any(p.requires_grad for p in student.parameters())
+
+    # _LMWrap returns the plain logits tensor from an HF-style .logits output.
+    class _Out:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class _HFLike(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = nn.Linear(4, 32, bias=False)
+
+        def forward(self, ids):
+            return _Out(self.head(ids.float()))
+
+    wrapped = act_replay._LMWrap(_HFLike(), "cpu")
+    out = wrapped(torch.zeros(1, 4))
+    assert out.shape == (1, 32)  # plain logits tensor, not the wrapper object
+
+
 def test_ckpt_roundtrip(tmp_path):
     student, teacher, at = _build_student_teacher()
     from teacher_source import LiveTeacher
