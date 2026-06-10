@@ -19,6 +19,7 @@ Run the CLI tests from scripts/calibration with PYTHONPATH=../../gguf-py.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"
 from act_replay_student import attach_to_linear, select_targets
 from centroid_quantizer import snap_to_e4m3
 from kl_loss import kl_topk
+
+
+# ─── env-gated host-RSS phase accounting ─────────────────────────────────────
+
+
+def _rss_gb():
+    """Resident set size in GB from /proc/self/status VmRSS (no psutil dep)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # "VmRSS:\t   12345 kB"
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    return float("nan")
+
+
+def _memlog(phase):
+    """Env-gated host-RSS phase trace (ACT_REPLAY_MEMLOG=1) for localizing the
+    act-replay trainer's anonymous-RAM growth. Mirrors block_sequential._memlog,
+    but tracks HOST RSS (the leak we're chasing is on the 15GB host, not VRAM)."""
+    if not os.environ.get("ACT_REPLAY_MEMLOG"):
+        return
+    vram = ""
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        vram = (f" vram={torch.cuda.memory_allocated()/1e9:.2f}GB"
+                f" peak={torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+    print(f"[memlog] {phase} rss={_rss_gb():.2f}GB{vram}", flush=True)
+
+
+def _tensor_census(phase, top_n=10):
+    """Live-tensor census (ACT_REPLAY_MEMLOG=2): aggregate every torch tensor
+    reachable from the GC by (shape,dtype,device), report the top_n by bytes.
+    Same pattern as block_sequential's BLOCKSEQ_MEMLOG=2 CUDA census, but covers
+    ALL devices (the host leak is CPU tensors), so we can see retained dequants /
+    fp32 KL chains hanging off the graph after a train step."""
+    if os.environ.get("ACT_REPLAY_MEMLOG") != "2":
+        return
+    import gc
+    import collections
+    agg = collections.defaultdict(lambda: [0, 0])  # (shape,dtype,dev) -> [count, bytes]
+    total = 0
+    for o in gc.get_objects():
+        try:
+            if torch.is_tensor(o):
+                key = (tuple(o.shape), str(o.dtype), str(o.device))
+                byt = o.element_size() * o.nelement()
+                agg[key][0] += 1
+                agg[key][1] += byt
+                total += byt
+        except Exception:
+            pass
+    top = sorted(agg.items(), key=lambda kv: kv[1][1], reverse=True)[:top_n]
+    print(f"[memlog] {phase} tensor-census total={total/1e9:.3f}GB "
+          f"across {len(agg)} (shape,dtype,device) groups", flush=True)
+    for (shape, dt, dev), (cnt, byt) in top:
+        print(f"    [census] {byt/1e9:7.3f}GB  x{cnt:<5d} {dt:14s} {dev:8s} {shape}",
+              flush=True)
 
 
 # ─── HF model loading + LM wrapper ───────────────────────────────────────────
@@ -465,6 +525,11 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
+                _memlog(f"post-train-step{step}")
+                # Live-tensor census after the FIRST optimizer step: this is where
+                # retained dequant STE buffers / fp32 KL chains would show up.
+                if step == start_step + 1:
+                    _tensor_census(f"post-train-step{step}")
                 if eval_interval and step % eval_interval == 0:
                     kl = eval_kl(model, teacher, batches, hold_idx, resp_delims=resp_delims)
                     print(f"[act-replay] step {step} holdout_kl {kl:.6f}", flush=True)
@@ -584,6 +649,7 @@ def main(argv=None):
     from calib_corpus import collect_calibration
 
     device = torch.device(args.device)
+    _memlog("start")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     # ORDER MATTERS on the 15GB host: load the student FIRST (its ~8.3GB bf16
@@ -595,16 +661,19 @@ def main(argv=None):
     # (non-reentrant) trades recompute for activation memory; --no-grad-ckpt off.
     model = load_hf_model(args.model, device, grad_ckpt=not args.no_grad_ckpt)
     wrapped = _LMWrap(model, device)
+    _memlog("post-student")
 
     print(f"[act-replay] rehydrating trainer state from {args.gguf}")
     # frozen_mode="fp8": keep ONLY ML8_FP8 tensors frozen (stored bf16), skip the
     # bf16/F32 pass-throughs — the HF student already carries those weights, so
     # materializing them here is ~10GB of pure RAM tax on a 4B model (host=15GB).
     gstate = load_ml8_gguf(args.gguf, frozen_mode="fp8")
+    _memlog("post-rehydrate")
 
     targets = attach_targets(dict(model.named_modules()), gstate,
                              train=args.tensors_train, skip=args.tensors_skip)
     print(f"[act-replay] attached {len(targets)} ml8 targets")
+    _memlog("post-attach")
     hf_names = {g: map_gguf_to_hf(g) for g in targets}
 
     # Install the FP8-faithful frozen weights into the student in-place, replacing
@@ -613,10 +682,12 @@ def main(argv=None):
     n_fp8 = install_frozen_fp8(
         model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16)
     print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
+    _memlog("post-install")
 
     # The rehydrated ml8 codebooks now live in the attached targets; the gstate
     # copies are dead weight on the 15GB host — free them before the calib draw.
     gstate.ml8.clear()
+    _memlog("post-clear")
 
     # calibration draw
     n_samples = max(1, args.token_budget // max(args.seq_len, 1))
@@ -624,6 +695,7 @@ def main(argv=None):
         tokenizer, n_samples=n_samples, seq_len=args.seq_len,
         composition=args.corpus, seed=args.seed, token_budget=args.token_budget)
     batches = [b.to(device) for b in batches]
+    _memlog("post-corpus")
 
     train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
 
@@ -639,6 +711,7 @@ def main(argv=None):
     teacher = make_teacher(
         args.teacher, model_loader=teacher_loader, K=args.topk,
         cache_dir=cache_dir, batches=batches, cache_key=f"{args.model}_{args.corpus}")
+    _memlog("post-teacher")
 
     # optimizer with separate lr groups for centroids vs scales
     cent_params = [at.centroids for at in targets.values()]
@@ -662,6 +735,7 @@ def main(argv=None):
     # step-0 sanity: pre-train holdout KL (= the PTQ artifact's KL on this draw)
     kl0 = eval_kl(wrapped, teacher, batches, hold_idx, resp_delims=resp_delims)
     print(f"[act-replay] step {start_step} holdout_kl {kl0:.6f} (pre-train)", flush=True)
+    _memlog("post-step0eval")
 
     ckpt_path = out_dir / "ckpt.pt"
     final_step = train(
