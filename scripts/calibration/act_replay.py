@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""act_replay.py — act-replay KL trainer CLI (Task 6).
+
+Ties together the act-replay modules into a runnable trainer:
+
+  * gguf_state.load_ml8_gguf      — rehydrate ml8 + frozen fp8 trainer state
+  * act_replay_student            — attach ml8 dequant-STE targets to HF linears
+  * teacher_source.make_teacher   — live / cache / device:N teacher top-K
+  * kl_loss.kl_topk               — forward-KL on the top-K + tail partition
+  * calib_corpus.collect_calibration — calibration draw (chat-formatted)
+  * ml8_io (schema) + ml8_to_gguf.convert_to_ml8_gguf — blob export + re-emit
+
+Only the codebook centroids/scales of the selected ml8 targets train; the host
+nn.Linear weights stay frozen. Output dirs/GGUFs go under user-provided paths,
+NEVER /tmp.
+
+Run the CLI tests from scripts/calibration with PYTHONPATH=../../gguf-py.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"))
+
+from act_replay_student import attach_to_linear, select_targets
+from centroid_quantizer import snap_to_e4m3
+from kl_loss import kl_topk
+
+
+# ─── arg parsing ─────────────────────────────────────────────────────────────
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse trainer flags. argv=None reads sys.argv (CLI); pass a list in tests."""
+    p = argparse.ArgumentParser(
+        description="Act-replay KL trainer: fine-tune ml8 codebooks against a "
+                    "live/cached teacher, then export blobs + re-emit a GGUF.")
+    # required I/O
+    p.add_argument("--gguf", required=True, help="ml8 GGUF to rehydrate trainer state from")
+    p.add_argument("--model", required=True, help="HF model id/path for the student + live teacher")
+    p.add_argument("--out-dir", required=True, help="output dir (blobs + GGUF re-emit); never /tmp")
+    # corpus
+    p.add_argument("--corpus", default="mix", help="calib_corpus composition name")
+    p.add_argument("--token-budget", type=int, default=512000, help="total calibration token budget")
+    p.add_argument("--seq-len", type=int, default=2048, help="per-sample sequence length")
+    # teacher
+    p.add_argument("--teacher", default="live", help="teacher source spec: live | cache | device:N")
+    p.add_argument("--teacher-cache-dir", default=None, help="dir for the cache teacher's shards (never /tmp)")
+    p.add_argument("--topk", type=int, default=256, help="teacher top-K width for the KL partition")
+    # optimization
+    p.add_argument("--lr-cent", type=float, default=1e-2, help="lr for centroid params")
+    p.add_argument("--lr-scale", type=float, default=1e-3, help="lr for per-row scale params")
+    p.add_argument("--grad-accum", type=int, default=8, help="grad-accumulation steps per optimizer step")
+    p.add_argument("--micro-batch", type=int, default=1, help="micro-batch size (sequences per forward)")
+    # target selection
+    p.add_argument("--tensors-train", default="ml8",
+                   help="'ml8' (all ml8 tensors) or comma-separated fnmatch globs")
+    p.add_argument("--tensors-skip", default="", help="comma-separated fnmatch globs to drop")
+    # schedule
+    p.add_argument("--steps", type=int, default=None, help="hard cap on optimizer steps (None = full epochs)")
+    p.add_argument("--epochs", type=int, default=1, help="passes over the train split")
+    p.add_argument("--eval-interval", type=int, default=200, help="optimizer steps between holdout evals")
+    p.add_argument("--seed", type=int, default=0, help="seed for the holdout split + corpus draw")
+    # ckpt / device
+    p.add_argument("--resume", default=None, help="checkpoint .pt to resume from")
+    p.add_argument("--device", default="cuda:0", help="device for student + live teacher")
+    return p.parse_args(argv)
+
+
+# ─── deterministic holdout split ─────────────────────────────────────────────
+
+
+def split_holdout(n: int, frac: float, seed: int):
+    """Deterministic (train_idx, hold_idx) split of range(n).
+
+    Uses a seeded torch.Generator permutation so the same (n, frac, seed) always
+    yields the same partition; different seeds yield different partitions. The
+    last floor(n*frac) of the permutation are held out.
+    """
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=g)
+    n_hold = int(n * frac)
+    hold_idx = perm[n - n_hold:].clone() if n_hold > 0 else perm[n:].clone()
+    train_idx = perm[: n - n_hold].clone()
+    # sort each side so callers iterate in stable batch order
+    return torch.sort(train_idx).values, torch.sort(hold_idx).values
+
+
+# ─── GGUF -> HF name mapping ─────────────────────────────────────────────────
+
+# Dense / attention GGUF tensor stems -> HF module path (sans trailing ".weight").
+# Linear-attention / hybrid (qwen35) modules are intentionally NOT mapped here;
+# the GPU stage may extend this table. Unknown stems raise KeyError so a typo or
+# an unsupported module fails loudly rather than silently skipping a target.
+_GGUF_STEM_TO_HF = {
+    "ffn_gate": "mlp.gate_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_output": "self_attn.o_proj",
+}
+
+
+def map_gguf_to_hf(gguf_name: str) -> str:
+    """Map a GGUF tensor name to its HF module path.
+
+    blk.N.<stem>.weight -> model.layers.N.<hf_suffix>
+    token_embd.weight    -> model.embed_tokens
+    Unknown names raise KeyError.
+    """
+    name = gguf_name
+    if name.endswith(".weight"):
+        name = name[: -len(".weight")]
+    if name == "token_embd":
+        return "model.embed_tokens"
+    parts = name.split(".")
+    if len(parts) == 3 and parts[0] == "blk":
+        layer = parts[1]
+        stem = parts[2]
+        if stem in _GGUF_STEM_TO_HF:
+            return f"model.layers.{layer}.{_GGUF_STEM_TO_HF[stem]}"
+    raise KeyError(f"no HF mapping for GGUF tensor {gguf_name!r}")
+
+
+# ─── attach targets to an HF model ───────────────────────────────────────────
+
+
+def attach_targets(model_named_modules, state, train, skip):
+    """Attach selected ml8 targets to their host linears in an HF model.
+
+    model_named_modules: dict-like {module_path: nn.Module} (e.g. dict(model.named_modules())).
+    state: an Ml8State (or anything with a `.ml8` dict of {gguf_name: target}).
+    train/skip: forwarded to select_targets.
+
+    Returns {gguf_name: AttachedTarget} for every attached target. Raises KeyError
+    if a selected target's mapped HF module is not present in the model.
+    """
+    modules = dict(model_named_modules)
+    selected = select_targets(list(state.ml8.keys()), train=train, skip=skip)
+    attached = {}
+    for gguf_name in selected:
+        hf_path = map_gguf_to_hf(gguf_name)
+        if hf_path not in modules:
+            raise KeyError(
+                f"target {gguf_name!r} -> {hf_path!r} not found in model modules")
+        at = attach_to_linear(modules[hf_path], state.ml8[gguf_name])
+        attached[gguf_name] = at
+    return attached
+
+
+# ─── checkpoint save / resume ────────────────────────────────────────────────
+
+
+def save_ckpt(path, step, targets, optimizer):
+    """Persist {step, cent, scl, opt}. targets: {gguf_name: AttachedTarget}."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        "step": int(step),
+        "cent": {name: at.centroids.detach().cpu().clone() for name, at in targets.items()},
+        "scl": {name: at.scales.detach().cpu().clone() for name, at in targets.items()},
+        "opt": optimizer.state_dict(),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(ckpt, tmp)
+    tmp.replace(path)
+    return path
+
+
+def load_ckpt(path, targets, optimizer):
+    """Restore centroids/scales into `targets` and optimizer state. Returns step."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    for name, at in targets.items():
+        with torch.no_grad():
+            at.centroids.copy_(ckpt["cent"][name].to(at.centroids.device))
+            at.scales.copy_(ckpt["scl"][name].to(at.scales.device))
+    optimizer.load_state_dict(ckpt["opt"])
+    return int(ckpt["step"])
+
+
+# ─── training loop ───────────────────────────────────────────────────────────
+
+
+def eval_kl(model, teacher, batches, hold_idx):
+    """Mean holdout KL over the held-out batches (no grad)."""
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for i in hold_idx.tolist():
+            ids = batches[i]
+            idx, vals, tail = teacher.get(i, ids)
+            logits = model(ids)
+            V = logits.shape[-1]
+            total += kl_topk(logits.reshape(-1, V), idx, vals, tail).item()
+            n += 1
+    model.train()
+    return total / max(n, 1)
+
+
+def train(model, teacher, batches, train_idx, hold_idx, optimizer,
+          grad_accum=8, epochs=1, steps=None, eval_interval=200,
+          start_step=0, ckpt_path=None, targets=None):
+    """Run the act-replay KL training loop.
+
+    Per train batch (in train_idx order): student logits -> kl_topk vs the
+    teacher's top-K for that batch -> backward (averaged over grad_accum
+    micro-steps) -> optimizer.step() every grad_accum batches. Every
+    eval_interval optimizer steps, print one holdout-KL line to stdout.
+    Returns the final optimizer step count.
+    """
+    model.train()
+    step = start_step
+    micro = 0
+    optimizer.zero_grad()
+    for _epoch in range(epochs):
+        for i in train_idx.tolist():
+            ids = batches[i]
+            idx, vals, tail = teacher.get(i, ids)
+            logits = model(ids)
+            V = logits.shape[-1]
+            loss = kl_topk(logits.reshape(-1, V), idx, vals, tail) / grad_accum
+            loss.backward()
+            micro += 1
+            if micro % grad_accum == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                step += 1
+                if eval_interval and step % eval_interval == 0:
+                    kl = eval_kl(model, teacher, batches, hold_idx)
+                    print(f"[act-replay] step {step} holdout_kl {kl:.6f}", flush=True)
+                    if ckpt_path is not None and targets is not None:
+                        save_ckpt(ckpt_path, step, targets, optimizer)
+                if steps is not None and step >= steps:
+                    # flush any pending grad fraction so it isn't lost silently
+                    if micro % grad_accum != 0:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    return step
+    # flush a trailing partial accumulation window
+    if micro % grad_accum != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+        step += 1
+    return step
+
+
+# ─── blob export ─────────────────────────────────────────────────────────────
+
+
+def _read_frozen_fp8_raw(gguf_path):
+    """Re-read ML8_FP8 tensors from a GGUF as (e4m3 fp32 [N,K], scale fp16 [N,n_b]).
+
+    The trainer state's `frozen` dict only keeps the *dequantized* fp8 tensors;
+    to re-emit the frozen tensors as {hf_name}.fp8.pt we need the raw e4m3 lattice
+    values + their per-group fp16 scales, which we recover straight from the GGUF.
+    """
+    import gguf
+    from gguf import GGMLQuantizationType
+    from gguf_state import unpack_scaled_fp8_blocks, _logical_N_bytes, _row_major_bytes
+    from ml8_to_gguf import _FP8_BLOCK_BYTES, _FP8_GROUP_SIZE
+
+    out = {}
+    reader = gguf.GGUFReader(str(gguf_path))
+    for tensor in reader.tensors:
+        if tensor.tensor_type != GGMLQuantizationType.ML8_FP8:
+            continue
+        N, nbytes = _logical_N_bytes(tensor)
+        K = nbytes // _FP8_BLOCK_BYTES * _FP8_GROUP_SIZE
+        packed = _row_major_bytes(tensor, N, nbytes)
+        e4m3, scale = unpack_scaled_fp8_blocks(packed, N, K)
+        out[tensor.name] = (e4m3, scale)
+    return out
+
+
+def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None):
+    """Write each ml8 target as an ml8_io-schema blob, plus frozen fp8 tensors.
+
+    state: {gguf_name: AttachedTarget}.
+    hf_names: {gguf_name: hf_tensor_name} — the blob's `name` and filename stem.
+    out_dir: destination dir (never /tmp); created if needed.
+    frozen_fp8_raw: optional {gguf_name: (e4m3 fp32 [N,K], scale fp16 [N,n_b])} —
+        written as {hf_name}.fp8.pt = {"e4m3": fp32, "scale": fp16}.
+
+    Per ml8 target: snap_to_e4m3 the final centroids, then write the schema
+    (name/shape/group_size/n_centroids/indices int8/centroids_per_group/
+    scale_per_group + mse/w_snr_db/y_snr_db/rel_err = 0.0). group_size = K // G.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for gguf_name, at in state.items():
+        hf_name = hf_names[gguf_name]
+        indices = at.indices.detach().cpu().to(torch.int8)
+        N, K = indices.shape
+        cent = snap_to_e4m3(at.centroids.detach().cpu().to(torch.float32))
+        G = cent.shape[0]
+        group_size = K // G
+        scales = at.scales.detach().cpu().to(torch.float32)
+        blob = {
+            "name": hf_name,
+            "shape": [int(N), int(K)],
+            "group_size": int(group_size),
+            "n_centroids": int(cent.shape[1]),
+            "indices": indices,
+            "centroids_per_group": cent,
+            "scale_per_group": scales,
+            "mse": 0.0,
+            "w_snr_db": 0.0,
+            "y_snr_db": 0.0,
+            "rel_err": 0.0,
+        }
+        torch.save(blob, out_dir / f"{hf_name}.pt")
+
+    if frozen_fp8_raw:
+        for gguf_name, (e4m3, scale) in frozen_fp8_raw.items():
+            hf_name = hf_names.get(gguf_name)
+            if hf_name is None:
+                # frozen fp8 tensors that don't map to a known HF name keep their
+                # GGUF name as the stem (sanitized for the filesystem).
+                hf_name = gguf_name
+            torch.save(
+                {"e4m3": e4m3.detach().cpu().to(torch.float32),
+                 "scale": scale.detach().cpu().to(torch.float16)},
+                out_dir / f"{hf_name}.fp8.pt")
+    return out_dir
+
+
+# ─── CLI entry point ─────────────────────────────────────────────────────────
+
+
+def main(argv=None):
+    """Wire the full pipeline. HF-dependent path; exercised end-to-end only with
+    a real model + GPU (the unit tests import the functions above directly)."""
+    args = parse_args(argv)
+
+    out_dir = Path(args.out_dir)
+    if str(out_dir).startswith("/tmp"):
+        raise ValueError("refusing to write outputs under /tmp; pass a user path")
+
+    from gguf_state import load_ml8_gguf
+    print(f"[act-replay] rehydrating trainer state from {args.gguf}")
+    gstate = load_ml8_gguf(args.gguf)
+
+    # HF model + tokenizer (untested path).
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from calib_corpus import collect_calibration
+
+    device = torch.device(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, torch_dtype=torch.bfloat16).to(device).eval()
+
+    def _logits_forward(ids):
+        return model(ids.to(device)).logits
+
+    # wrap so callers (teacher_source / kl) get a plain logits tensor
+    class _LMWrap(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, ids):
+            return self.m(ids.to(device)).logits
+
+    wrapped = _LMWrap(model)
+
+    targets = attach_targets(dict(model.named_modules()), gstate,
+                             train=args.tensors_train, skip=args.tensors_skip)
+    print(f"[act-replay] attached {len(targets)} ml8 targets")
+    hf_names = {g: map_gguf_to_hf(g) for g in targets}
+
+    # calibration draw
+    n_samples = max(1, args.token_budget // max(args.seq_len, 1))
+    batches = collect_calibration(
+        tokenizer, n_samples=n_samples, seq_len=args.seq_len,
+        composition=args.corpus, seed=args.seed, token_budget=args.token_budget)
+    batches = [b.to(device) for b in batches]
+
+    train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
+
+    # teacher
+    from teacher_source import make_teacher
+    cache_dir = args.teacher_cache_dir or str(out_dir / "teacher_cache")
+    teacher = make_teacher(
+        args.teacher, model_loader=lambda: wrapped, K=args.topk,
+        cache_dir=cache_dir, batches=batches, cache_key=f"{args.model}_{args.corpus}")
+
+    # optimizer with separate lr groups for centroids vs scales
+    cent_params = [at.centroids for at in targets.values()]
+    scl_params = [at.scales for at in targets.values()]
+    optimizer = torch.optim.Adam([
+        {"params": cent_params, "lr": args.lr_cent},
+        {"params": scl_params, "lr": args.lr_scale},
+    ])
+
+    start_step = 0
+    if args.resume:
+        start_step = load_ckpt(args.resume, targets, optimizer)
+        print(f"[act-replay] resumed at step {start_step}")
+
+    ckpt_path = out_dir / "ckpt.pt"
+    final_step = train(
+        wrapped, teacher, batches, train_idx, hold_idx, optimizer,
+        grad_accum=args.grad_accum, epochs=args.epochs, steps=args.steps,
+        eval_interval=args.eval_interval, start_step=start_step,
+        ckpt_path=ckpt_path, targets=targets)
+    print(f"[act-replay] training done at step {final_step}")
+    save_ckpt(ckpt_path, final_step, targets, optimizer)
+
+    # export blobs (+ frozen fp8) then re-emit a GGUF
+    blob_dir = out_dir / "blobs"
+    frozen_raw = _read_frozen_fp8_raw(args.gguf)
+    # frozen fp8 names are GGUF names; map the ones we can, leave the rest as-is
+    fp8_hf = {}
+    for gname in frozen_raw:
+        try:
+            fp8_hf[gname] = map_gguf_to_hf(gname)
+        except KeyError:
+            fp8_hf[gname] = gname
+    export_blobs(targets, {**hf_names, **fp8_hf}, blob_dir, frozen_fp8_raw=frozen_raw)
+    print(f"[act-replay] wrote blobs to {blob_dir}")
+
+    from ml8_to_gguf import convert_to_ml8_gguf
+    out_gguf = out_dir / "act_replay.gguf"
+    convert_to_ml8_gguf(Path(args.gguf), blob_dir, out_gguf)
+    print(f"[act-replay] re-emitted GGUF -> {out_gguf}")
+
+
+if __name__ == "__main__":
+    main()
