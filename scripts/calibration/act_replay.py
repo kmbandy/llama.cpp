@@ -864,9 +864,15 @@ def main(argv=None):
     # Install the FP8-faithful frozen weights into the student in-place, replacing
     # the bf16 parent weights of those modules (closes the faithfulness gap).
     # install_frozen_fp8 frees each frozen tensor as it goes, draining gstate.frozen.
-    n_fp8 = install_frozen_fp8(
-        model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16)
-    print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
+    if os.environ.get("ACT_REPLAY_NO_FP8_INSTALL"):
+        # bisect lever: leave fp8-tier modules on their bf16 parent weights
+        n_fp8 = 0
+        gstate.frozen.clear()
+        print("[act-replay] fp8 install SKIPPED (ACT_REPLAY_NO_FP8_INSTALL)")
+    else:
+        n_fp8 = install_frozen_fp8(
+            model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16)
+        print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
     _memlog("post-install")
 
     # Capture the ML8_4 tensors that are NOT attached training targets (e.g. when
