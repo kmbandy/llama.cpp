@@ -91,10 +91,18 @@ std::string build_signature_ml8(const mt_ml8_gemm_shape_t & s, int32_t runtime_M
     const int32_t weight_format = s.weight_format;
 
     char buf[2048];
+    // Integer arg hints (i32:16 = divisible by 16, i32:1 = the value 1).
+    // The torch-Triton JIT specializes these automatically and emits
+    // vectorized global loads; triton.tools.compile only gets what the
+    // signature says — plain i32 cost a 5-7x slowdown at M=512 (#185).
+    // Guarantees come from ml8.cu: M padded to %16, K % 64 == 0, N % 16
+    // == 0, all tensors contiguous → unit inner strides, outer strides
+    // = K or N. Arg order: M, N, K, am, ak, bk, bn, 0, cm, cn, 1, 0,
+    // bscale_k, bscale_n.
     std::snprintf(buf, sizeof(buf),
         "*fp8e4nv:16, %s, *bf16:16, *fp32:16, *fp32:16, "
-        "i32, i32, i32, "
-        "i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, "
+        "i32:16, i32:16, i32:16, "
+        "i32:16, i32:1, i32:16, i32:1, i32:16, i32:16, i32:1, i32:1, i32:16, i32:16, i32:1, "
         // GROUP_K, GROUP_N, BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE_M,
         // NUM_KSPLIT, SPLITK_BLOCK_SIZE, EVEN_K, GRID_MN, num_stages
         "%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, "
@@ -227,6 +235,24 @@ extern "C" hipError_t mt_ml8_gemm(hipStream_t stream, const mt_ml8_gemm_args_t *
     // G.6.b: pick tuned config per (M, K, N). Block sizes vary by tier and shape.
     const mt_ml8_tuned_cfg cfg = ml8_pick_config(args->M, args->shape.K, args->shape.N);
 
+    // ML8_GEMM_LOG=1: print each unique (M, K, N) once with its chosen config —
+    // the ground truth for which shapes ride tuned configs vs Phase-A defaults.
+    static const bool gemm_log = (std::getenv("ML8_GEMM_LOG") != nullptr);
+    if (gemm_log) {
+        static std::mutex log_mtx;
+        static std::unordered_map<std::string, int> seen;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%d/%d/%d/%d",
+                      args->M, args->shape.K, args->shape.N, args->shape.weight_format);
+        std::lock_guard<std::mutex> lk(log_mtx);
+        if (seen.emplace(buf, 1).second) {
+            std::fprintf(stderr,
+                "[ml8-gemm] M=%-5d K=%-6d N=%-6d wf=%d -> bm=%d bn=%d gsm=%d nw=%d\n",
+                args->M, args->shape.K, args->shape.N, args->shape.weight_format,
+                cfg.bm, cfg.bn, cfg.gsm, cfg.nw);
+        }
+    }
+
     // Validate constraints against the chosen config's block sizes.
     if (args->M % cfg.bm != 0) {
         std::fprintf(stderr,
@@ -334,14 +360,27 @@ extern "C" hipError_t mt_ml8_gemm(hipStream_t stream, const mt_ml8_gemm_args_t *
     hipDeviceptr_t p_global_scratch  = (hipDeviceptr_t) nullptr;
     hipDeviceptr_t p_profile_scratch = (hipDeviceptr_t) nullptr;
 
+    // #185: the signature value-specializes the unit strides (i32:1 →
+    // constexpr), so stride_ak / stride_bn / stride_cn / stride_ascale_m /
+    // stride_bscale_n are baked into the binary and DROPPED from the runtime
+    // arg list. They must actually be 1 — enforced here, guaranteed by ml8.cu
+    // (contiguous tensors only).
+    if (stride_ak != 1 || stride_bn != 1 || stride_cn != 1 ||
+        stride_ascale_m != 1 || stride_bscale_n != 1) {
+        std::fprintf(stderr, "mt_ml8_gemm: non-unit inner stride (ak=%d bn=%d cn=%d asm=%d bsn=%d)"
+                     " — signature specializes these to 1\n",
+                     stride_ak, stride_bn, stride_cn, stride_ascale_m, stride_bscale_n);
+        return hipErrorInvalidValue;
+    }
+
     void * kernel_args[] = {
         &a_ptr, &b_ptr, &c_ptr, &as_ptr, &bs_ptr,
         &M, &N, &K,
-        &stride_am, &stride_ak,
-        &stride_bk, &stride_bn,
-        &stride_ck, &stride_cm, &stride_cn,
-        &stride_ascale_m, &stride_ascale_k,
-        &stride_bscale_k, &stride_bscale_n,
+        &stride_am,
+        &stride_bk,
+        &stride_ck, &stride_cm,
+        &stride_ascale_k,
+        &stride_bscale_k,
         &lut_ptr, &stride_lut_k,
         &p_global_scratch, &p_profile_scratch,
     };

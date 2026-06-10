@@ -77,7 +77,19 @@ static inline mt_ml8_tuned_cfg ml8_pick_config(int32_t M, int32_t K, int32_t N) 
             ? mt_ml8_tuned_cfg{128, 64, 1, 4}
             : mt_ml8_tuned_cfg{ 16, 32, 4, 4};
     }
-    // Unknown shape — safe Phase-A defaults.
+    // Generic shapes (#185): the explicit G.6.a winners above are both
+    // BM=128 / BN=64 at prefill, and the BM=16/BN=16 Phase-A defaults are
+    // ~5x off at M=512 (measured: qkv 2560x8192 2.34ms vs 0.42ms-class).
+    // Apply the winning tile shape whenever divisibility allows, largest
+    // BM/BN first. ml8.cu pads M to a multiple of cfg.bm, so any BM here
+    // is legal; BN must divide N exactly.
+    const int32_t bm = prefill ? 128 : 16;
+    for (int32_t bn = 64; bn >= 16; bn >>= 1) {
+        if (N % bn == 0) {
+            return mt_ml8_tuned_cfg{bm, bn, prefill ? 4 : 1, 4};
+        }
+    }
+    // N not a multiple of 16 — Phase-A fallback.
     return mt_ml8_tuned_cfg{16, 16, 1, 4};
 }
 

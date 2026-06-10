@@ -271,6 +271,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     )
     target_link_libraries(test_mt_ml8_gemm PRIVATE aiter_triton_aot)
 
+    # #185 — isolated per-shape timing through the production wrapper
+    add_executable(bench_mt_ml8_gemm
+        wrappers/bench_mt_ml8_gemm.cpp
+    )
+    target_link_libraries(bench_mt_ml8_gemm PRIVATE aiter_triton_aot)
+
     # MAD-223 Phase C.3 — ml8 MoE GEMM wrapper smoke test (MAD-244)
     add_executable(test_mt_ml8_moe_gemm
         wrappers/test_mt_ml8_moe_gemm.cpp
