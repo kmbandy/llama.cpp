@@ -578,11 +578,6 @@ def main(argv=None):
         raise ValueError("refusing to write outputs under /tmp; pass a user path")
 
     from gguf_state import load_ml8_gguf
-    print(f"[act-replay] rehydrating trainer state from {args.gguf}")
-    # frozen_mode="fp8": keep ONLY ML8_FP8 tensors frozen (stored bf16), skip the
-    # bf16/F32 pass-throughs — the HF student already carries those weights, so
-    # materializing them here is ~10GB of pure RAM tax on a 4B model (host=15GB).
-    gstate = load_ml8_gguf(args.gguf, frozen_mode="fp8")
 
     # HF model + tokenizer (untested path).
     from transformers import AutoTokenizer
@@ -591,11 +586,21 @@ def main(argv=None):
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
+    # ORDER MATTERS on the 15GB host: load the student FIRST (its ~8.3GB bf16
+    # staging is transient — weights land on GPU and the host copy frees), THEN
+    # rehydrate the ~4.5GB trainer state. Doing both concurrently resident was
+    # an 11G cgroup OOM (measured). Teacher loads later, after gstate.ml8.clear().
     # Student: a fresh bf16 model whose selected ml8 linears get monkeypatched
     # with trainable dequant-STE targets below. Gradient checkpointing
     # (non-reentrant) trades recompute for activation memory; --no-grad-ckpt off.
     model = load_hf_model(args.model, device, grad_ckpt=not args.no_grad_ckpt)
     wrapped = _LMWrap(model, device)
+
+    print(f"[act-replay] rehydrating trainer state from {args.gguf}")
+    # frozen_mode="fp8": keep ONLY ML8_FP8 tensors frozen (stored bf16), skip the
+    # bf16/F32 pass-throughs — the HF student already carries those weights, so
+    # materializing them here is ~10GB of pure RAM tax on a 4B model (host=15GB).
+    gstate = load_ml8_gguf(args.gguf, frozen_mode="fp8")
 
     targets = attach_targets(dict(model.named_modules()), gstate,
                              train=args.tensors_train, skip=args.tensors_skip)
