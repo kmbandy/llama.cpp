@@ -8,7 +8,8 @@ import torch.nn as nn
 
 from act_replay_student import AttachedTarget, attach_to_linear, select_targets
 from centroid_quantizer import snap_to_e4m3
-from kronecker_rotation import KroneckerRotation, sylvester
+from kronecker_rotation import KroneckerRotation, random_orthogonal
+from ml8_e4m3_sim import quantize_act_per_row
 
 
 def _mk_state(N=8, K=128, G=2, seed=0):
@@ -106,10 +107,10 @@ def test_bf16_host_dtype_cast():
 
 
 def test_faithful_acts():
-    """With a rotation present, the forward must apply the W4A8 faithful path:
-    x_eff = quantize_act_per_row(x @ Q) @ Q.T, then F.linear(x_eff, W)."""
-    from ml8_e4m3_sim import quantize_act_per_row
-
+    """With a rotation present, the forward must apply the W4A8 faithful path in
+    the ROTATED basis (NO inverse): x_eff = quantize_act_per_row(x @ Q), then
+    F.linear(x_eff, W_rot). The weight is rehydrated from GGUF already rotated,
+    so the deployed kernel is y = e4m3(x@Q) @ W_rot.T with no derotation."""
     t = _mk_state()
     h_a = torch.eye(4)
     b_dim = 32
@@ -119,12 +120,49 @@ def test_faithful_acts():
     attach_to_linear(lin, t)  # auto-faithful: rotation present
 
     rot = KroneckerRotation(h_a=h_a, b_dim=b_dim)
-    W = _ref_weight(t)
+    W = _ref_weight(t)  # this IS W_rot (the GGUF-dequant'd rotated weight)
     x = torch.randn(3, 128)
 
-    x_eff = rot.inverse(quantize_act_per_row(rot.forward(x)))
+    x_eff = quantize_act_per_row(rot.forward(x))  # NO inverse
     expected = x_eff @ W.t()
     assert torch.allclose(lin(x), expected, atol=1e-6)
+
+
+def test_faithful_acts_rotated_basis_no_inverse():
+    """Regression for the KL 12.15 fingerprint: AttachedTarget weights rehydrated
+    from GGUF are in the ROTATED basis (W_rot), so the deployed kernel computes
+    y = e4m3(x @ Q) @ W_rot.T with NO inverse rotation. Keeping the inverse (as
+    calibration's FaithfulActHook did, because it had overridden the weight with
+    the UNROTATED W_unrot) leaves W un-derotated and blows up holdout KL.
+
+    Two assertions:
+      1. EXACT (fp32) equality to the rotated-basis kernel math.
+      2. allclose to the calibration-faithful identity
+         e4m3(x@Q) @ Q.T @ W_unrot.T == e4m3(x@Q) @ W_rot.T, with
+         W_unrot = W_rot @ Q.T."""
+    h_a = random_orthogonal(4, seed=0)
+    b_dim = 32
+    t = _mk_state()
+    t["rotation"] = {"h_a": h_a, "a_dim": 4, "b_dim": b_dim}
+
+    lin = nn.Linear(128, 8, bias=False)
+    attach_to_linear(lin, t)  # auto-faithful: rotation present
+
+    rot = KroneckerRotation(h_a=h_a, b_dim=b_dim)
+    W_rot = _ref_weight(t)  # GGUF dequant — already rotated basis
+    x = torch.randn(3, 128)
+
+    a_q = quantize_act_per_row(rot.forward(x))  # rotated-basis quantized acts
+
+    # (1) EXACT: deployed kernel y = e4m3(x@Q) @ W_rot.T, no inverse.
+    reference = a_q @ W_rot.t()
+    assert torch.equal(lin(x), reference)
+
+    # (2) Identity: calibration's hook (inverse + UNROTATED weight) is equivalent.
+    # W_unrot = W_rot @ Q.T = rot.inverse(W_rot) (inverse right-multiplies by Q.T).
+    W_unrot = rot.inverse(W_rot)
+    calib_faithful = rot.inverse(a_q) @ W_unrot.t()
+    assert torch.allclose(reference, calib_faithful, atol=1e-4)
 
 
 def test_attach_rotation_dim_mismatch_raises():

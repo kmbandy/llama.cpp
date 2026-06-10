@@ -7,7 +7,9 @@ The student is the ORIGINAL model with selected ml8 linears wrapped so that:
     e4m3 snap is straight-through (snap in forward, identity grad in backward).
   * When the target carries a Kronecker rotation, the forward runs the
     deployment-faithful W4A8 activation path before the matmul:
-        x_eff = quantize_act_per_row(x @ Q) @ Q.T   (Q = rotation, orthogonal)
+        x_eff = quantize_act_per_row(x @ Q)   (Q = rotation, orthogonal)
+    NO inverse rotation: the weight is rehydrated from GGUF in the ROTATED
+    basis (W_rot), and the deployed kernel computes y = e4m3(x@Q) @ W_rot.T.
 
 Indices stay FROZEN (argmin is non-differentiable). The original nn.Linear.weight
 is left untouched — we monkey-patch module.forward so nothing about the host
@@ -90,14 +92,27 @@ class AttachedTarget(nn.Module):
         return gathered * self.scales[:, self.gidx]     # × per-col scale
 
     def apply_acts(self, x: torch.Tensor) -> torch.Tensor:
-        """Faithful W4A8 activation transform x_eff = e4m3(x @ Q) @ Q.T.
+        """Faithful W4A8 activation transform x_eff = e4m3(x @ Q) — NO inverse.
+
+        The AttachedTarget weight is rehydrated from GGUF in the ROTATED basis
+        (the deployed kernel layout W_rot), so the deployed math is
+            y = e4m3(x @ Q) @ W_rot.T
+        with no inverse rotation. We therefore leave the quantized activation in
+        the rotated basis and matmul directly against W_rot.
+
+        (Calibration's FaithfulActHook applied the inverse Q.T because it had
+        OVERRIDDEN the weight with the UNROTATED W_unrot = W_rot @ Q.T, making
+        e4m3(x@Q) @ Q.T @ W_unrot.T == e4m3(x@Q) @ W_rot.T. With rotated weights
+        rehydrated from GGUF, the inverse must go — keeping it leaves W
+        un-derotated and produces garbage, e.g. holdout KL 12.15 nats.)
+
         Returns x unchanged when no rotation is attached."""
         if self.rotation is None:
             return x
         orig_dtype = x.dtype
         flat = x.reshape(-1, x.shape[-1]).float()
         a_q = quantize_act_per_row(self.rotation.forward(flat))
-        x_eff = self.rotation.inverse(a_q).reshape(x.shape).to(orig_dtype)
+        x_eff = a_q.reshape(x.shape).to(orig_dtype)
         return x_eff
 
 
