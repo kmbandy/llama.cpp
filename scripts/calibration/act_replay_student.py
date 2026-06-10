@@ -111,6 +111,15 @@ def attach_to_linear(lin: nn.Linear, target: dict,
     """
     at = AttachedTarget(target)
 
+    if at.rotation is not None:
+        rot = target["rotation"]
+        a_dim = int(rot["a_dim"])
+        b_dim = int(rot["b_dim"])
+        if a_dim * b_dim != lin.in_features:
+            raise ValueError(
+                f"rotation dim mismatch: a_dim={a_dim} * b_dim={b_dim} = "
+                f"{a_dim * b_dim} != lin.in_features={lin.in_features}")
+
     if faithful_acts is None:
         use_acts = at.rotation is not None
     else:

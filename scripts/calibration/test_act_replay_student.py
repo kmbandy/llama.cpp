@@ -93,6 +93,19 @@ def test_faithful_acts():
     assert torch.allclose(lin(x), expected, atol=1e-6)
 
 
+def test_attach_rotation_dim_mismatch_raises():
+    """attach_to_linear must raise ValueError when rotation a_dim*b_dim != in_features."""
+    t = _mk_state(N=8, K=128)
+    # 4 * 16 = 64, but lin.in_features = 128 — mismatch
+    t["rotation"] = {"h_a": torch.eye(4), "a_dim": 4, "b_dim": 16}
+    lin = nn.Linear(128, 8, bias=False)
+    try:
+        attach_to_linear(lin, t)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "rotation dim mismatch" in str(exc)
+
+
 def test_select_targets_skip_down():
     names = [
         "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
