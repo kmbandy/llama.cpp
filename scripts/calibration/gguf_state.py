@@ -39,7 +39,9 @@ def decode_centroids_fp8(cent_u8):
 # ─── Rehydration ───────────────────────────────────────────────────────────
 
 
-# Frozen tensors are materialized fp32 (~2x bf16 model size). Fine for 4B (~8GB); for 35B reuse switch frozen to bf16 or lazy mmap.
+# Frozen-tensor footprint depends on load_ml8_gguf's frozen_mode: "all" keeps
+# fp8+passthrough as fp32 (~2x bf16 model size); "fp8" keeps only ML8_FP8 as bf16
+# (the act-replay default on a 15GB host); "none" keeps nothing.
 @dataclass
 class Ml8State:
     """Trainer state rehydrated from an ml8 GGUF.
@@ -47,8 +49,9 @@ class Ml8State:
     ml8:    {tensor_name: {"indices": long [N,K], "scales": fp32 [N,n_g],
                            "centroids": fp32 [n_g,16],
                            "rotation": None | {"h_a": fp32 [a,a], "a_dim", "b_dim"}}}
-    frozen: {tensor_name: fp32 [N,K]} — ML8_FP8 dequantized (e4m3*scale, expanded
-            over groups) and any BF16/F16/F32 pass-through tensor cast to fp32.
+    frozen: {tensor_name: [N,K]} — ML8_FP8 dequantized (e4m3*scale, expanded over
+            groups; fp32 in "all" mode, bf16 in "fp8" mode) plus, in "all" mode,
+            any BF16/F16/F32 pass-through tensor cast to fp32. See frozen_mode.
     meta:   {"arch", "block_count", ...} — cheap scalar metadata.
     """
     ml8: dict = field(default_factory=dict)
@@ -91,16 +94,27 @@ def _row_major_bytes(tensor, N, nbytes):
     return arr
 
 
-def load_ml8_gguf(path) -> Ml8State:
+def load_ml8_gguf(path, frozen_mode="all") -> Ml8State:
     """Rehydrate an Ml8State from an ml8 GGUF in one pass over reader.tensors.
 
     First collect ML8_4 main tensors, then attach .centroids / .rotation_h_a /
-    .rotation_meta sidecars to their base. ML8_FP8 and pass-through (BF16/F16/F32)
-    tensors go into `frozen` as fp32. `.awq_scale` sidecars are skipped with a
-    warning (the trainer does not consume them yet).
+    .rotation_meta sidecars to their base. `.awq_scale` sidecars are skipped with
+    a warning (the trainer does not consume them yet).
+
+    frozen_mode controls what lands in `frozen`:
+      * "all"  (default) — ML8_FP8 dequantized to fp32 AND every BF16/F16/F32
+                pass-through tensor cast to fp32 (legacy behavior).
+      * "fp8"  — ONLY ML8_FP8 tensors, dequantized and stored as BF16 (halves
+                their RAM vs fp32; the host has only 15GB). Pass-through tensors
+                are skipped entirely — the HF student already carries those bf16
+                weights, so materializing them here is pure RAM tax.
+      * "none" — nothing frozen (empty dict).
     """
     import gguf
     from gguf import GGMLQuantizationType
+
+    if frozen_mode not in ("all", "fp8", "none"):
+        raise ValueError(f"frozen_mode must be 'all'|'fp8'|'none', got {frozen_mode!r}")
 
     reader = gguf.GGUFReader(str(path))
 
@@ -153,6 +167,8 @@ def load_ml8_gguf(path) -> Ml8State:
             continue
 
         if ttype == GGMLQuantizationType.ML8_FP8:
+            if frozen_mode == "none":
+                continue
             N, nbytes = _logical_N_bytes(tensor)
             K = nbytes // _FP8_BLOCK_BYTES * _FP8_GROUP_SIZE
             packed = _row_major_bytes(tensor, N, nbytes)
@@ -160,11 +176,20 @@ def load_ml8_gguf(path) -> Ml8State:
             # Expand per-group fp16 scale over the 32-wide groups and dequantize.
             n_b = K // _FP8_GROUP_SIZE
             scale_cols = scale.to(torch.float32).repeat_interleave(_FP8_GROUP_SIZE, dim=1)
-            st.frozen[name] = (e4m3 * scale_cols).contiguous()
+            dequant = (e4m3 * scale_cols).contiguous()
+            # "fp8" mode stores BF16 (halves RAM vs fp32; host has only 15GB).
+            if frozen_mode == "fp8":
+                dequant = dequant.to(torch.bfloat16)
+            st.frozen[name] = dequant
             continue
 
-        # Pass-through: cast to fp32. tensor.data is already the dequantized
-        # ndarray for F32/F16/BF16 (gguf-py widens BF16/F16 → float32).
+        # Pass-through (BF16/F16/F32). In "fp8"/"none" we skip these entirely —
+        # the HF student already carries those bf16 weights, so re-materializing
+        # them here is pure RAM tax (~10GB on a 4B model). Only "all" keeps them.
+        if frozen_mode != "all":
+            continue
+        # cast to fp32. tensor.data is already the dequantized ndarray for
+        # F32/F16/BF16 (gguf-py widens BF16/F16 → float32).
         arr = np.array(tensor.data, dtype=np.float32, copy=True)
         st.frozen[name] = torch.from_numpy(arr).contiguous()
 

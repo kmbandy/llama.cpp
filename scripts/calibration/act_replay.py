@@ -67,8 +67,11 @@ def load_hf_model(path, device, *, grad_ckpt=False, freeze=False):
     import fla_compat
 
     device = torch.device(device)
+    # low_cpu_mem_usage streams the bf16 weights straight from the checkpoint
+    # mmap into the model instead of staging a full fp32 copy in host RAM — the
+    # 15GB host can't afford the double-buffer when loading the 4B bf16 parent.
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16,
+        path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         attn_implementation="sdpa").to(device).eval()
 
     if grad_ckpt:
@@ -331,6 +334,46 @@ def attach_targets(model_named_modules, state, train, skip):
     return attached
 
 
+def install_frozen_fp8(model, frozen, map_fn, device, dtype):
+    """Install dequantized frozen fp8 weights INTO the student in-place.
+
+    The HF student is loaded with its bf16 parent weights; for tensors that were
+    quantized to ML8_FP8 we want the student to carry the FP8-faithful dequant,
+    not the bf16 parent (closing the faithfulness gap). For each {gguf_name:
+    weight} in `frozen`, map gguf_name -> HF module path via `map_fn` and copy the
+    weight into that module's `.weight` in-place under no_grad. Unmapped names
+    (KeyError from map_fn) are skipped with a single warning. Each frozen tensor
+    is popped from `frozen` as it is consumed so its RAM is freed immediately
+    (host has only 15GB). Returns the number of weights actually installed.
+    """
+    modules = dict(model.named_modules())
+    n_installed = 0
+    warned = False
+    for gguf_name in list(frozen.keys()):
+        w = frozen.pop(gguf_name)  # free as we go
+        try:
+            hf_path = map_fn(gguf_name)
+        except KeyError:
+            if not warned:
+                print(f"[act-replay] install_frozen_fp8: no HF mapping for "
+                      f"{gguf_name!r} (and possibly others) — skipping. Logged once.",
+                      flush=True)
+                warned = True
+            continue
+        mod = modules.get(hf_path)
+        if mod is None or not hasattr(mod, "weight"):
+            if not warned:
+                print(f"[act-replay] install_frozen_fp8: {gguf_name!r} -> "
+                      f"{hf_path!r} not a weighted module — skipping. Logged once.",
+                      flush=True)
+                warned = True
+            continue
+        with torch.no_grad():
+            mod.weight.copy_(w.to(device=device, dtype=dtype))
+        n_installed += 1
+    return n_installed
+
+
 # ─── checkpoint save / resume ────────────────────────────────────────────────
 
 
@@ -535,7 +578,10 @@ def main(argv=None):
 
     from gguf_state import load_ml8_gguf
     print(f"[act-replay] rehydrating trainer state from {args.gguf}")
-    gstate = load_ml8_gguf(args.gguf)
+    # frozen_mode="fp8": keep ONLY ML8_FP8 tensors frozen (stored bf16), skip the
+    # bf16/F32 pass-throughs — the HF student already carries those weights, so
+    # materializing them here is ~10GB of pure RAM tax on a 4B model (host=15GB).
+    gstate = load_ml8_gguf(args.gguf, frozen_mode="fp8")
 
     # HF model + tokenizer (untested path).
     from transformers import AutoTokenizer
@@ -554,6 +600,17 @@ def main(argv=None):
                              train=args.tensors_train, skip=args.tensors_skip)
     print(f"[act-replay] attached {len(targets)} ml8 targets")
     hf_names = {g: map_gguf_to_hf(g) for g in targets}
+
+    # Install the FP8-faithful frozen weights into the student in-place, replacing
+    # the bf16 parent weights of those modules (closes the faithfulness gap).
+    # install_frozen_fp8 frees each frozen tensor as it goes, draining gstate.frozen.
+    n_fp8 = install_frozen_fp8(
+        model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16)
+    print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
+
+    # The rehydrated ml8 codebooks now live in the attached targets; the gstate
+    # copies are dead weight on the 15GB host — free them before the calib draw.
+    gstate.ml8.clear()
 
     # calibration draw
     n_samples = max(1, args.token_budget // max(args.seq_len, 1))

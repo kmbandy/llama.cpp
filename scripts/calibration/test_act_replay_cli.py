@@ -17,6 +17,7 @@ from act_replay import (
     save_ckpt,
     load_ckpt,
     export_blobs,
+    install_frozen_fp8,
 )
 from act_replay_student import attach_to_linear
 from centroid_quantizer import snap_to_e4m3
@@ -450,6 +451,54 @@ def test_ckpt_roundtrip(tmp_path):
         V = logits.shape[-1]
         loss = kl_topk(logits.reshape(-1, V), idx, vals, tail)
         opt2.zero_grad(); loss.backward(); opt2.step()
+
+
+def test_install_frozen_fp8_copies_and_frees():
+    """install_frozen_fp8 copies each frozen fp8 weight into the matching module
+    weight in-place under no_grad, frees each frozen tensor as installed, and
+    skips (with a single warning) any frozen name that has no HF mapping."""
+    # A module tree with a mappable target and a head that won't be touched.
+    model = StubLM(vocab=32, K=128, N=8)
+    modules = dict(model.named_modules())
+    # rename .lin to the mapped HF path so map_gguf_to_hf resolves to it.
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.up = nn.Linear(64, 4, bias=False)
+
+    # Build a model whose named_modules contains the mapped path.
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.up_proj = nn.Linear(64, 4, bias=False)
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([_Layer()])
+
+    m = _Model()
+    target_mod = m.model.layers[0].mlp.up_proj
+    with torch.no_grad():
+        target_mod.weight.zero_()
+    new_w = torch.arange(4 * 64, dtype=torch.bfloat16).reshape(4, 64)
+    frozen = {
+        "blk.0.ffn_up.weight": new_w,             # maps -> model.layers.0.mlp.up_proj
+        "blk.0.totally_unmapped.weight": torch.ones(4, 64),  # no HF mapping -> skip+warn
+    }
+
+    n_installed = install_frozen_fp8(
+        m, frozen, map_gguf_to_hf, device=torch.device("cpu"), dtype=torch.bfloat16)
+
+    # the mapped weight was copied in-place; frozen drained as it installed.
+    assert torch.equal(target_mod.weight.detach().to(torch.bfloat16), new_w)
+    assert "blk.0.ffn_up.weight" not in frozen          # popped/freed
+    assert "blk.0.totally_unmapped.weight" not in frozen  # unmapped also drained
+    assert n_installed == 1
+    assert frozen == {}
 
 
 def test_export_blobs_roundtrip(tmp_path):
