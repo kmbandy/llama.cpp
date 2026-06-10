@@ -60,14 +60,15 @@ class StubLM(nn.Module):
 
 
 def test_parse_args_defaults():
-    a = parse_args(["--gguf", "g", "--model", "m", "--out-dir", "o"])
+    a = parse_args(["--gguf", "g", "--base-gguf", "b", "--model", "m", "--out-dir", "o"])
+    assert a.base_gguf == "b"
     assert a.corpus == "mix"
     assert a.token_budget == 512000
     assert a.seq_len == 2048
     assert a.teacher == "live"
     assert a.topk == 256
-    assert a.lr_cent == 1e-2
-    assert a.lr_scale == 1e-3
+    assert a.lr_cent == 1e-3
+    assert a.lr_scale == 1e-4
     assert a.grad_accum == 8
     assert a.tensors_train == "ml8"
     assert a.tensors_skip == ""
@@ -77,6 +78,42 @@ def test_parse_args_defaults():
     assert a.eval_interval == 200
     assert a.micro_batch == 1
     assert a.no_grad_ckpt is False  # grad checkpointing on by default
+
+
+def test_parse_args_base_gguf_required():
+    # --base-gguf is required: argparse exits (SystemExit) when it's absent.
+    import pytest
+    with pytest.raises(SystemExit):
+        parse_args(["--gguf", "g", "--model", "m", "--out-dir", "o"])
+
+
+def _write_gguf(path, *, with_centroids):
+    """Write a tiny GGUF; include a .centroids tensor iff with_centroids."""
+    import gguf
+    from gguf import GGMLQuantizationType
+    import numpy as np
+
+    w = gguf.GGUFWriter(str(path), arch="qwen35")
+    w.add_tensor("blk.0.ffn_up.weight", np.ones((4, 8), np.float32))
+    if with_centroids:
+        w.add_tensor("blk.0.attn_qkv.centroids",
+                     np.ones((2, 16), np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def test_looks_ml8_gguf_detects_centroids(tmp_path):
+    from act_replay import _looks_ml8_gguf
+
+    base = tmp_path / "base.gguf"
+    ml8 = tmp_path / "ml8.gguf"
+    _write_gguf(base, with_centroids=False)
+    _write_gguf(ml8, with_centroids=True)
+
+    assert _looks_ml8_gguf(ml8) is True
+    assert _looks_ml8_gguf(base) is False
 
 
 def test_holdout_split_deterministic():

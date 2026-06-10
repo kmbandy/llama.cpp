@@ -33,6 +33,26 @@ def test_kl_mask():
     first2 = kl_topk(s[:2], idx[:2], vals[:2], tail[:2])
     assert torch.allclose(masked, first2, atol=1e-6)
 
+def test_kl_chunked_equals_single_shot():
+    # chunked KL (5-token chunks) must equal the whole-sequence single-shot call.
+    g = torch.Generator().manual_seed(7)
+    t, s = torch.randn(23, 40, generator=g), torch.randn(23, 40, generator=g)
+    idx, vals, tail = topk_teacher(t, 6)
+    whole = kl_topk(s, idx, vals, tail, chunk=0)        # single slab
+    chunked = kl_topk(s, idx, vals, tail, chunk=5)      # 5-token slabs
+    assert abs(chunked - whole) < 1e-6
+
+
+def test_kl_chunked_equals_single_shot_masked():
+    g = torch.Generator().manual_seed(8)
+    t, s = torch.randn(23, 40, generator=g), torch.randn(23, 40, generator=g)
+    idx, vals, tail = topk_teacher(t, 6)
+    m = (torch.arange(23) % 3 != 0).float()
+    whole = kl_topk(s, idx, vals, tail, mask=m, chunk=0)
+    chunked = kl_topk(s, idx, vals, tail, mask=m, chunk=5)
+    assert abs(chunked - whole) < 1e-6
+
+
 def test_grad_flows():
     g = torch.Generator().manual_seed(3)
     t = torch.randn(3, 20, generator=g)

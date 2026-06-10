@@ -157,6 +157,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     "live/cached teacher, then export blobs + re-emit a GGUF.")
     # required I/O
     p.add_argument("--gguf", required=True, help="ml8 GGUF to rehydrate trainer state from")
+    p.add_argument("--base-gguf", required=True,
+                   help="bf16/F16 base GGUF to re-emit FROM (NOT an ml8 GGUF); "
+                        "convert_to_ml8_gguf streams its pass-through tensors and "
+                        "overlays the trained ml8 blobs. Refused if it looks ml8.")
     p.add_argument("--model", required=True, help="HF model id/path for the student + live teacher")
     p.add_argument("--out-dir", required=True, help="output dir (blobs + GGUF re-emit); never /tmp")
     # corpus
@@ -168,8 +172,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--teacher-cache-dir", default=None, help="dir for the cache teacher's shards (never /tmp)")
     p.add_argument("--topk", type=int, default=256, help="teacher top-K width for the KL partition")
     # optimization
-    p.add_argument("--lr-cent", type=float, default=1e-2, help="lr for centroid params")
-    p.add_argument("--lr-scale", type=float, default=1e-3, help="lr for per-row scale params")
+    p.add_argument("--lr-cent", type=float, default=1e-3, help="lr for centroid params")
+    p.add_argument("--lr-scale", type=float, default=1e-4, help="lr for per-row scale params")
     p.add_argument("--grad-accum", type=int, default=8, help="grad-accumulation steps per optimizer step")
     p.add_argument("--micro-batch", type=int, default=1, help="micro-batch size (sequences per forward)")
     # target selection
@@ -484,9 +488,17 @@ def eval_kl(model, teacher, batches, hold_idx, resp_delims=None):
             V = logits.shape[-1]
             mask = (batch_response_mask(ids, *resp_delims).reshape(-1)
                     if resp_delims is not None else None)
-            total += kl_topk(logits.reshape(-1, V), idx, vals, tail, mask=mask).item()
+            kl = kl_topk(logits.reshape(-1, V), idx, vals, tail, mask=mask)
+            total += float(kl.item())
             n += 1
+            # free this batch's logits + KL chain before the next iteration so the
+            # eval working set stays at one batch, not the whole holdout.
+            del logits, kl, idx, vals, tail, mask
     model.train()
+    # eval is a natural boundary (no live graph); drain the CUDA caching allocator
+    # so the next train step starts from a clean arena (NOT done in the hot loop).
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
     return total / max(n, 1)
 
 
@@ -520,6 +532,12 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                     if resp_delims is not None else None)
             loss = kl_topk(logits.reshape(-1, V), idx, vals, tail, mask=mask) / grad_accum
             loss.backward()
+            # The backward is done: drop every handle into this micro's autograd
+            # graph (loss/logits + the teacher top-K + mask) so its ~1.2GB of
+            # retained activations frees before the next micro builds its own.
+            # Only floats survive across iterations (step counters); empty_cache is
+            # deliberately NOT called here (hot loop) — only at eval boundaries.
+            del loss, logits, idx, vals, tail, mask
             micro += 1
             if micro % grad_accum == 0:
                 optimizer.step()
@@ -550,6 +568,18 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
 
 
 # ─── blob export ─────────────────────────────────────────────────────────────
+
+
+def _looks_ml8_gguf(gguf_path):
+    """True if `gguf_path` looks like an already-quantized ml8 GGUF.
+
+    Cheap precheck for the re-emit base: an ml8 GGUF carries the codebook sidecar
+    tensors whose names end in ``.centroids`` (e.g. ``blk.0.attn_qkv.centroids``).
+    A clean bf16/F16 base has none. We scan tensor names only (no data read).
+    """
+    import gguf
+    reader = gguf.GGUFReader(str(gguf_path))
+    return any(t.name.endswith(".centroids") for t in reader.tensors)
 
 
 def _read_frozen_fp8_raw(gguf_path):
@@ -641,6 +671,15 @@ def main(argv=None):
     out_dir = Path(args.out_dir)
     if str(out_dir).startswith("/tmp"):
         raise ValueError("refusing to write outputs under /tmp; pass a user path")
+
+    # Re-emit base precheck (cheap, name-only): the GGUF we re-emit FROM must be a
+    # clean bf16/F16 base, not an already-quantized ml8 GGUF. Refuse early — before
+    # loading the model / running any training — if the base carries ml8 codebook
+    # (.centroids) sidecar tensors, which would produce a corrupt double-quant.
+    if _looks_ml8_gguf(args.base_gguf):
+        raise ValueError(
+            f"--base-gguf {args.base_gguf!r} looks like an ml8 GGUF (has "
+            f".centroids tensors); pass the original bf16/F16 base GGUF instead")
 
     from gguf_state import load_ml8_gguf
 
@@ -761,7 +800,7 @@ def main(argv=None):
 
     from ml8_to_gguf import convert_to_ml8_gguf
     out_gguf = out_dir / "act_replay.gguf"
-    convert_to_ml8_gguf(Path(args.gguf), blob_dir, out_gguf)
+    convert_to_ml8_gguf(Path(args.base_gguf), blob_dir, out_gguf)
     print(f"[act-replay] re-emitted GGUF -> {out_gguf}")
 
 
