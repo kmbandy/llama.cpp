@@ -1,4 +1,5 @@
 import numpy as np, torch
+import pytest
 from ml8_to_gguf import pack_ml8_blocks, pack_scaled_fp8_blocks, cast_centroids_to_fp8
 from gguf_state import unpack_ml8_blocks, unpack_scaled_fp8_blocks, decode_centroids_fp8
 
@@ -25,3 +26,9 @@ def test_centroid_roundtrip():
     c = torch.randn(2, 16, generator=g)
     on_lattice = c.to(torch.float8_e4m3fn).to(torch.float32)
     assert torch.equal(decode_centroids_fp8(cast_centroids_to_fp8(c)), on_lattice)
+
+def test_unpack_rejects_bad_K():
+    with pytest.raises(ValueError):
+        unpack_ml8_blocks(np.zeros((2, 36), np.uint8), N=2, K=63)
+    with pytest.raises(ValueError):
+        unpack_scaled_fp8_blocks(np.zeros((2, 34), np.uint8), N=2, K=33)

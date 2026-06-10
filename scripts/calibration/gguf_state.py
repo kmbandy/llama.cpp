@@ -9,6 +9,8 @@ from ml8_to_gguf import QK_ML8, ML8_BLOCK_BYTES, _FP8_GROUP_SIZE, _FP8_BLOCK_BYT
 
 def unpack_ml8_blocks(packed, N, K):
     """packed [N, n_g*36] uint8 -> (indices long [N,K], scales fp32 [N,K//64])."""
+    if K % QK_ML8 != 0:
+        raise ValueError(f"K={K} not divisible by QK_ML8={QK_ML8}")
     n_g = K // QK_ML8
     blocks = np.ascontiguousarray(packed).reshape(N, n_g, ML8_BLOCK_BYTES)
     scales = blocks[:, :, :4].copy().view('<f4').reshape(N, n_g)
@@ -21,6 +23,8 @@ def unpack_ml8_blocks(packed, N, K):
 
 def unpack_scaled_fp8_blocks(packed, N, K):
     """packed [N, n_b*34] uint8 -> (e4m3 fp32 [N,K], scale fp16 [N,K//32])."""
+    if K % _FP8_GROUP_SIZE != 0:
+        raise ValueError(f"K={K} not divisible by FP8 group size {_FP8_GROUP_SIZE}")
     n_b = K // _FP8_GROUP_SIZE
     blocks = np.ascontiguousarray(packed).reshape(N, n_b, _FP8_BLOCK_BYTES)
     scale = torch.from_numpy(blocks[:, :, :2].copy()).view(torch.float16).reshape(N, n_b)
