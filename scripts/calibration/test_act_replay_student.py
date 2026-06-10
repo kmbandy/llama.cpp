@@ -36,6 +36,18 @@ def test_step0_bit_equal():
     assert torch.equal(lin(x), x @ W.t())
 
 
+def test_indices_buffer_is_uint8():
+    """Regression: AttachedTarget stores indices as a uint8 buffer (8x smaller
+    than long), and step-0 dequant is still bit-exact against the reference."""
+    t = _mk_state()  # _mk_state produces int64 indices (torch.randint default)
+    lin = nn.Linear(128, 8, bias=False)
+    at = attach_to_linear(lin, t)
+    assert at.indices.dtype == torch.uint8
+    W = _ref_weight(t)
+    x = torch.randn(3, 128)
+    assert torch.equal(lin(x), x @ W.t())
+
+
 def test_grads_only_cent_scl():
     t = _mk_state()
     lin = nn.Linear(128, 8, bias=False)

@@ -9,7 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"
 from ml8_to_gguf import QK_ML8, ML8_BLOCK_BYTES, _FP8_GROUP_SIZE, _FP8_BLOCK_BYTES
 
 def unpack_ml8_blocks(packed, N, K):
-    """packed [N, n_g*36] uint8 -> (indices long [N,K], scales fp32 [N,K//64])."""
+    """packed [N, n_g*36] uint8 -> (indices uint8 [N,K], scales fp32 [N,K//64]).
+
+    Indices are codebook entries in [0,15]; uint8 suffices (8x smaller than the
+    int64 that .long() would allocate over all 136 ml8 tensors ≈ 21GB → 2.6GB).
+    Consumers that need a long tensor convert per-forward with .long()."""
     if K % QK_ML8 != 0:
         raise ValueError(f"K={K} not divisible by QK_ML8={QK_ML8}")
     n_g = K // QK_ML8
@@ -19,7 +23,7 @@ def unpack_ml8_blocks(packed, N, K):
     idx = np.empty((N, n_g, QK_ML8), dtype=np.uint8)
     idx[:, :, 0::2] = qs & 0x0F
     idx[:, :, 1::2] = qs >> 4
-    return (torch.from_numpy(idx.reshape(N, K).astype(np.int64)),
+    return (torch.from_numpy(idx.reshape(N, K)),
             torch.from_numpy(scales.astype(np.float32)))
 
 def unpack_scaled_fp8_blocks(packed, N, K):
@@ -46,7 +50,7 @@ def decode_centroids_fp8(cent_u8):
 class Ml8State:
     """Trainer state rehydrated from an ml8 GGUF.
 
-    ml8:    {tensor_name: {"indices": long [N,K], "scales": fp32 [N,n_g],
+    ml8:    {tensor_name: {"indices": uint8 [N,K], "scales": fp32 [N,n_g],
                            "centroids": fp32 [n_g,16],
                            "rotation": None | {"h_a": fp32 [a,a], "a_dim", "b_dim"}}}
     frozen: {tensor_name: [N,K]} — ML8_FP8 dequantized (e4m3*scale, expanded over
@@ -219,7 +223,7 @@ def dequant_ml8_state(t) -> torch.Tensor:
     """Dequantize one ml8 entry to fp32 [N,K] per the ml8_io formula:
     W[r,c] = centroids[c//QK_ML8, indices[r,c]] * scales[r, c//QK_ML8].
     """
-    idx = t["indices"]                       # long [N,K]
+    idx = t["indices"].long()                # uint8 [N,K] -> long for indexing
     scales = t["scales"]                     # fp32 [N,n_g]
     cent = t["centroids"]                    # fp32 [n_g,16]
     N, K = idx.shape

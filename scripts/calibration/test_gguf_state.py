@@ -9,7 +9,8 @@ def test_ml8_roundtrip():
     scl = torch.rand(8, 2, generator=g) + 0.1
     packed = pack_ml8_blocks(idx, scl)
     idx2, scl2 = unpack_ml8_blocks(packed, N=8, K=128)
-    assert torch.equal(idx2, idx.to(torch.long))
+    assert idx2.dtype == torch.uint8
+    assert torch.equal(idx2.long(), idx.to(torch.long))
     assert torch.equal(scl2, scl)
 
 def test_fp8_roundtrip():
@@ -51,9 +52,10 @@ def test_rehydrate_synthetic(tmp_path):
     from gguf_state import load_ml8_gguf, dequant_ml8_state
     st = load_ml8_gguf(p)
     t = st.ml8["blk.0.ffn_up.weight"]
-    assert torch.equal(t["indices"], idx.long()) and torch.equal(t["scales"], scl) and torch.equal(t["centroids"], cent)
+    assert t["indices"].dtype == torch.uint8
+    assert torch.equal(t["indices"].long(), idx.long()) and torch.equal(t["scales"], scl) and torch.equal(t["centroids"], cent)
     gidx = torch.arange(128) // 64
-    W = cent[gidx, t["indices"]] * scl[:, gidx]
+    W = cent[gidx, t["indices"].long()] * scl[:, gidx]
     assert torch.equal(dequant_ml8_state(t), W)
     assert "blk.0.ffn_norm.weight" in st.frozen
 
@@ -114,3 +116,13 @@ def test_frozen_mode_all_default(tmp_path):
     st = load_ml8_gguf(p)  # default 'all'
     assert "blk.0.ssm_alpha.weight" in st.frozen
     assert "blk.0.ffn_norm.weight" in st.frozen
+
+
+def test_rehydrated_indices_are_uint8(tmp_path):
+    """Regression: rehydrated ml8 indices stay uint8 (not int64). Stored uint8
+    is 8x smaller than long over all ml8 tensors (~21GB -> 2.6GB rehydrate RAM)."""
+    from gguf_state import load_ml8_gguf
+    p, _e4m3, _scale = _write_mini_gguf_with_fp8(tmp_path)
+    st = load_ml8_gguf(p, frozen_mode="none")
+    for name, entry in st.ml8.items():
+        assert entry["indices"].dtype == torch.uint8, name

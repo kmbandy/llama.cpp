@@ -44,14 +44,17 @@ class AttachedTarget(nn.Module):
     """Trainable ml8 codebook attached to one linear.
 
     Leaf params (trainable): centroids [G, 16], scales [N, G].
-    Buffers (frozen):         indices [N, K] long, gidx [K] long.
+    Buffers (frozen):         indices [N, K] uint8, gidx [K] long.
     weight() returns the STE dequant — snapped e4m3 centroids in the forward,
     identity gradient into the raw fp32 centroids in the backward.
+
+    Indices are stored uint8 (values 0..15; 8x smaller than int64 over all 136
+    ml8 tensors) and promoted to long transiently inside weight() for gather().
     """
 
     def __init__(self, target: dict):
         super().__init__()
-        indices = target["indices"].long()
+        indices = target["indices"].to(torch.uint8)
         centroids = target["centroids"].to(torch.float32).clone()
         scales = target["scales"].to(torch.float32).clone()
 
@@ -80,9 +83,10 @@ class AttachedTarget(nn.Module):
         cent_ste = c + (snap_to_e4m3(c) - c).detach()   # snap fwd, identity grad
         # cent_ste[gidx, indices]: gather centroid per (row, col) by its group LUT.
         cent_per_col = cent_ste[self.gidx]              # [K, 16]
+        idx_long = self.indices.long()                  # uint8 -> long for gather
         gathered = cent_per_col.unsqueeze(0).expand(
             self.indices.shape[0], -1, -1).gather(
-            2, self.indices.unsqueeze(-1)).squeeze(-1)  # [N, K]
+            2, idx_long.unsqueeze(-1)).squeeze(-1)       # [N, K]
         return gathered * self.scales[:, self.gidx]     # × per-col scale
 
     def apply_acts(self, x: torch.Tensor) -> torch.Tensor:
