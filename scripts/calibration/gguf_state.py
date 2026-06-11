@@ -98,21 +98,28 @@ def _row_major_bytes(tensor, N, nbytes):
     return arr
 
 
-def load_ml8_gguf(path, frozen_mode="all") -> Ml8State:
-    """Rehydrate an Ml8State from an ml8 GGUF in one pass over reader.tensors.
+def open_ml8_gguf(path, frozen_mode="all"):
+    """STREAMING rehydrate: return (meta, iterator) over an ml8 GGUF.
 
-    First collect ML8_4 main tensors, then attach .centroids / .rotation_h_a /
-    .rotation_meta sidecars to their base. `.awq_scale` sidecars are skipped with
-    a warning (the trainer does not consume them yet).
+    The iterator yields (kind, name, payload) one MAIN tensor at a time:
+      kind "ml8"    -> payload {"indices" uint8 [N,K], "scales" fp32 [N,n_g],
+                                "centroids" fp32 [n_g,16],
+                                "rotation" None | {"h_a","a_dim","b_dim"}}
+      kind "frozen" -> payload dequantized weight (fp32 for frozen_mode="all",
+                                bf16 for "fp8")
 
-    frozen_mode controls what lands in `frozen`:
-      * "all"  (default) — ML8_FP8 dequantized to fp32 AND every BF16/F16/F32
+    Sidecars (.centroids/.rotation_*; KBs each) are collected in a metadata
+    pre-pass and attached to their base entry as it is yielded. The heavyweight
+    main tensors are unpacked ONE AT A TIME so the host never materializes the
+    whole trainer state at once (~5-6GB on the 4B — the 15GB-host rehydrate
+    spike; consumers attach/install each payload to the GPU and drop it).
+
+    frozen_mode controls which non-ml8 tensors are yielded as "frozen":
+      * "all"  — ML8_FP8 dequantized to fp32 AND every BF16/F16/F32
                 pass-through tensor cast to fp32 (legacy behavior).
-      * "fp8"  — ONLY ML8_FP8 tensors, dequantized and stored as BF16 (halves
-                their RAM vs fp32; the host has only 15GB). Pass-through tensors
-                are skipped entirely — the HF student already carries those bf16
-                weights, so materializing them here is pure RAM tax.
-      * "none" — nothing frozen (empty dict).
+      * "fp8"  — ONLY ML8_FP8 tensors, dequantized to BF16. Pass-through
+                tensors are skipped — the HF student already carries them.
+      * "none" — no frozen tensors yielded.
     """
     import gguf
     from gguf import GGMLQuantizationType
@@ -130,92 +137,116 @@ def load_ml8_gguf(path, frozen_mode="all") -> Ml8State:
         if bc is not None:
             meta["block_count"] = int(bc.contents())
 
-    st = Ml8State(meta=meta)
-
-    # Sidecar payloads keyed by base name (tensor.name minus ".weight").
-    centroids_by_base: dict[str, np.ndarray] = {}
-    rot_h_a_by_base: dict[str, np.ndarray] = {}
-    rot_meta_by_base: dict[str, np.ndarray] = {}
-
     def _base_of(name: str, suffix: str) -> str:
         return name[: -len(suffix)]
 
+    # Sidecar pre-pass (small payloads only; main tensor data is NOT touched —
+    # reader.tensors are mmap views, so nothing heavyweight is faulted in).
+    centroids_by_base: dict[str, np.ndarray] = {}
+    rot_h_a_by_base: dict[str, np.ndarray] = {}
+    rot_meta_by_base: dict[str, np.ndarray] = {}
     for tensor in reader.tensors:
         name = tensor.name
-        ttype = tensor.tensor_type
-
         if name.endswith(".centroids"):
             N, nbytes = _logical_N_bytes(tensor)
             centroids_by_base[_base_of(name, ".centroids")] = \
                 _row_major_bytes(tensor, N, nbytes)
-            continue
-        if name.endswith(".rotation_h_a"):
+        elif name.endswith(".rotation_h_a"):
             rot_h_a_by_base[_base_of(name, ".rotation_h_a")] = \
                 np.ascontiguousarray(tensor.data)
-            continue
-        if name.endswith(".rotation_meta"):
+        elif name.endswith(".rotation_meta"):
             rot_meta_by_base[_base_of(name, ".rotation_meta")] = \
                 np.ascontiguousarray(tensor.data).astype(np.int64).reshape(-1)
-            continue
-        if name.endswith(".awq_scale"):
-            print(f"[skip] {name}: awq_scale sidecar not consumed by trainer state")
-            continue
 
-        if ttype == GGMLQuantizationType.ML8_4:
-            N, nbytes = _logical_N_bytes(tensor)
-            K = nbytes // ML8_BLOCK_BYTES * QK_ML8
-            packed = _row_major_bytes(tensor, N, nbytes)
-            idx, scl = unpack_ml8_blocks(packed, N, K)
-            st.ml8[name] = {"indices": idx, "scales": scl,
-                            "centroids": None, "rotation": None}
-            continue
+    def _stream():
+        for tensor in reader.tensors:
+            name = tensor.name
+            ttype = tensor.tensor_type
 
-        if ttype == GGMLQuantizationType.ML8_FP8:
-            if frozen_mode == "none":
+            if (name.endswith(".centroids") or name.endswith(".rotation_h_a")
+                    or name.endswith(".rotation_meta")):
                 continue
-            N, nbytes = _logical_N_bytes(tensor)
-            K = nbytes // _FP8_BLOCK_BYTES * _FP8_GROUP_SIZE
-            packed = _row_major_bytes(tensor, N, nbytes)
-            e4m3, scale = unpack_scaled_fp8_blocks(packed, N, K)
-            # Expand per-group fp16 scale over the 32-wide groups and dequantize.
-            n_b = K // _FP8_GROUP_SIZE
-            scale_cols = scale.to(torch.float32).repeat_interleave(_FP8_GROUP_SIZE, dim=1)
-            dequant = (e4m3 * scale_cols).contiguous()
-            # "fp8" mode stores BF16 (halves RAM vs fp32; host has only 15GB).
-            if frozen_mode == "fp8":
-                dequant = dequant.to(torch.bfloat16)
-            st.frozen[name] = dequant
-            continue
+            if name.endswith(".awq_scale"):
+                print(f"[skip] {name}: awq_scale sidecar not consumed by trainer state")
+                continue
 
-        # Pass-through (BF16/F16/F32). In "fp8"/"none" we skip these entirely —
-        # the HF student already carries those bf16 weights, so re-materializing
-        # them here is pure RAM tax (~10GB on a 4B model). Only "all" keeps them.
-        if frozen_mode != "all":
-            continue
-        # cast to fp32. tensor.data is already the dequantized ndarray for
-        # F32/F16/BF16 (gguf-py widens BF16/F16 → float32).
-        arr = np.array(tensor.data, dtype=np.float32, copy=True)
-        st.frozen[name] = torch.from_numpy(arr).contiguous()
+            if ttype == GGMLQuantizationType.ML8_4:
+                N, nbytes = _logical_N_bytes(tensor)
+                K = nbytes // ML8_BLOCK_BYTES * QK_ML8
+                packed = _row_major_bytes(tensor, N, nbytes)
+                idx, scl = unpack_ml8_blocks(packed, N, K)
+                entry = {"indices": idx, "scales": scl,
+                         "centroids": None, "rotation": None}
+                base = name[: -len(".weight")] if name.endswith(".weight") else name
+                cent_u8 = centroids_by_base.get(base)
+                if cent_u8 is None:
+                    raise ValueError(
+                        f"{name}: missing centroids sidecar for base {base!r}")
+                entry["centroids"] = decode_centroids_fp8(cent_u8)
+                h_a = rot_h_a_by_base.get(base)
+                if h_a is not None:
+                    rmeta = rot_meta_by_base.get(base)
+                    a_dim = int(rmeta[0]) if rmeta is not None and rmeta.size >= 1 \
+                        else int(h_a.shape[0])
+                    b_dim = int(rmeta[1]) if rmeta is not None and rmeta.size >= 2 \
+                        else None
+                    entry["rotation"] = {
+                        "h_a": torch.from_numpy(np.ascontiguousarray(h_a)).to(torch.float32),
+                        "a_dim": a_dim,
+                        "b_dim": b_dim,
+                    }
+                yield "ml8", name, entry
+                continue
 
-    # Attach sidecars to their ML8_4 base tensors.
-    for name, entry in st.ml8.items():
-        base = name[: -len(".weight")] if name.endswith(".weight") else name
-        cent_u8 = centroids_by_base.get(base)
-        if cent_u8 is None:
-            raise ValueError(f"{name}: missing centroids sidecar for base {base!r}")
-        entry["centroids"] = decode_centroids_fp8(cent_u8)
+            if ttype == GGMLQuantizationType.ML8_FP8:
+                if frozen_mode == "none":
+                    continue
+                N, nbytes = _logical_N_bytes(tensor)
+                K = nbytes // _FP8_BLOCK_BYTES * _FP8_GROUP_SIZE
+                packed = _row_major_bytes(tensor, N, nbytes)
+                e4m3, scale = unpack_scaled_fp8_blocks(packed, N, K)
+                # Expand per-group fp16 scale over the 32-wide groups, dequantize.
+                scale_cols = scale.to(torch.float32).repeat_interleave(
+                    _FP8_GROUP_SIZE, dim=1)
+                dequant = (e4m3 * scale_cols).contiguous()
+                if frozen_mode == "fp8":
+                    dequant = dequant.to(torch.bfloat16)
+                yield "frozen", name, dequant
+                continue
 
-        h_a = rot_h_a_by_base.get(base)
-        if h_a is not None:
-            rmeta = rot_meta_by_base.get(base)
-            a_dim = int(rmeta[0]) if rmeta is not None and rmeta.size >= 1 else int(h_a.shape[0])
-            b_dim = int(rmeta[1]) if rmeta is not None and rmeta.size >= 2 else None
-            entry["rotation"] = {
-                "h_a": torch.from_numpy(np.ascontiguousarray(h_a)).to(torch.float32),
-                "a_dim": a_dim,
-                "b_dim": b_dim,
-            }
+            # Pass-through (BF16/F16/F32) — "all" mode only; see docstring.
+            if frozen_mode != "all":
+                continue
+            arr = np.array(tensor.data, dtype=np.float32, copy=True)
+            yield "frozen", name, torch.from_numpy(arr).contiguous()
 
+    return meta, _stream()
+
+
+def list_ml8_names(path):
+    """Names of the ML8_4 main tensors in a GGUF (metadata scan, no unpack)."""
+    import gguf
+    from gguf import GGMLQuantizationType
+
+    reader = gguf.GGUFReader(str(path))
+    return [t.name for t in reader.tensors
+            if t.tensor_type == GGMLQuantizationType.ML8_4]
+
+
+def load_ml8_gguf(path, frozen_mode="all") -> Ml8State:
+    """Rehydrate a FULL Ml8State (everything resident on host).
+
+    Implemented on open_ml8_gguf's stream — kept for tests and small models;
+    the act-replay trainer consumes the stream directly so the host holds one
+    tensor at a time (see open_ml8_gguf).
+    """
+    meta, stream = open_ml8_gguf(path, frozen_mode=frozen_mode)
+    st = Ml8State(meta=meta)
+    for kind, name, payload in stream:
+        if kind == "ml8":
+            st.ml8[name] = payload
+        else:
+            st.frozen[name] = payload
     return st
 
 

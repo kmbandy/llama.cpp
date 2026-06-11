@@ -627,20 +627,28 @@ def attach_targets(model_named_modules, state, train, skip, model_config=None):
     """
     modules = dict(model_named_modules)
     selected = select_targets(list(state.ml8.keys()), train=train, skip=skip)
-    attached = {}
-    for gguf_name in selected:
-        hf_path = map_gguf_to_hf(gguf_name)
-        if hf_path not in modules:
-            raise KeyError(
-                f"target {gguf_name!r} -> {hf_path!r} not found in model modules")
-        entry = state.ml8[gguf_name]
-        if model_config is not None:
-            shape = tuple(entry["indices"].shape)
-            perm = gguf_to_hf_perm(gguf_name, shape, model_config)
-            entry = _apply_perm_to_ml8_entry(entry, perm)
-        at = attach_to_linear(modules[hf_path], entry)
-        attached[gguf_name] = at
-    return attached
+    return {g: _attach_one(modules, g, state.ml8[g], model_config)
+            for g in selected}
+
+
+def _attach_one(modules, gguf_name, entry, model_config=None):
+    """Attach ONE ml8 entry to its host linear; returns the AttachedTarget.
+
+    Applies the linear-attn V-head reorder inversion when model_config is given
+    (see gguf_to_hf_perm). Raises KeyError if the mapped HF module is missing.
+    The streaming rehydrate path calls this per tensor so the host never holds
+    the full trainer state; attach_to_linear moves the entry to the module's
+    device, freeing the host copy as each tensor lands.
+    """
+    hf_path = map_gguf_to_hf(gguf_name)
+    if hf_path not in modules:
+        raise KeyError(
+            f"target {gguf_name!r} -> {hf_path!r} not found in model modules")
+    if model_config is not None:
+        shape = tuple(entry["indices"].shape)
+        perm = gguf_to_hf_perm(gguf_name, shape, model_config)
+        entry = _apply_perm_to_ml8_entry(entry, perm)
+    return attach_to_linear(modules[hf_path], entry)
 
 
 def install_frozen_fp8(model, frozen, map_fn, device, dtype, model_config=None):
@@ -662,35 +670,48 @@ def install_frozen_fp8(model, frozen, map_fn, device, dtype, model_config=None):
     """
     modules = dict(model.named_modules())
     n_installed = 0
-    warned = False
+    state = {"warned": False}
     for gguf_name in list(frozen.keys()):
         w = frozen.pop(gguf_name)  # free as we go
-        try:
-            hf_path = map_fn(gguf_name)
-        except KeyError:
-            if not warned:
-                print(f"[act-replay] install_frozen_fp8: no HF mapping for "
-                      f"{gguf_name!r} (and possibly others) — skipping. Logged once.",
-                      flush=True)
-                warned = True
-            continue
-        mod = modules.get(hf_path)
-        if mod is None or not hasattr(mod, "weight"):
-            if not warned:
-                print(f"[act-replay] install_frozen_fp8: {gguf_name!r} -> "
-                      f"{hf_path!r} not a weighted module — skipping. Logged once.",
-                      flush=True)
-                warned = True
-            continue
-        if model_config is not None:
-            perm = gguf_to_hf_perm(gguf_name, tuple(w.shape), model_config)
-            if perm is not None:
-                axis, index = perm
-                w = w.index_select(axis, index.to(w.device))
-        with torch.no_grad():
-            mod.weight.copy_(w.to(device=device, dtype=dtype))
-        n_installed += 1
+        n_installed += _install_one(modules, gguf_name, w, map_fn, device,
+                                    dtype, model_config, state)
     return n_installed
+
+
+def _install_one(modules, gguf_name, w, map_fn, device, dtype,
+                 model_config=None, warn_state=None):
+    """Install ONE frozen fp8 dequant into the student; returns 1 if installed.
+
+    Used by both install_frozen_fp8 (resident dict) and the streaming rehydrate
+    path (one tensor at a time). warn_state: shared {"warned": bool} so skip
+    warnings print once per run.
+    """
+    warn_state = warn_state if warn_state is not None else {"warned": False}
+    try:
+        hf_path = map_fn(gguf_name)
+    except KeyError:
+        if not warn_state["warned"]:
+            print(f"[act-replay] install_frozen_fp8: no HF mapping for "
+                  f"{gguf_name!r} (and possibly others) — skipping. Logged once.",
+                  flush=True)
+            warn_state["warned"] = True
+        return 0
+    mod = modules.get(hf_path)
+    if mod is None or not hasattr(mod, "weight"):
+        if not warn_state["warned"]:
+            print(f"[act-replay] install_frozen_fp8: {gguf_name!r} -> "
+                  f"{hf_path!r} not a weighted module — skipping. Logged once.",
+                  flush=True)
+            warn_state["warned"] = True
+        return 0
+    if model_config is not None:
+        perm = gguf_to_hf_perm(gguf_name, tuple(w.shape), model_config)
+        if perm is not None:
+            axis, index = perm
+            w = w.index_select(axis, index.to(w.device))
+    with torch.no_grad():
+        mod.weight.copy_(w.to(device=device, dtype=dtype))
+    return 1
 
 
 # ─── checkpoint save / resume ────────────────────────────────────────────────
@@ -855,6 +876,20 @@ def _looks_ml8_gguf(gguf_path):
     return any(t.name.endswith(".centroids") for t in reader.tensors)
 
 
+def _iter_untrained_ml8(gguf_path, names):
+    """Yield (gguf_name, ml8 entry) for the given untrained ML8_4 names,
+    re-read one at a time from the source GGUF at export time (streaming —
+    nothing is held on host during training for these)."""
+    want = set(names)
+    if not want:
+        return
+    from gguf_state import open_ml8_gguf
+    _, stream = open_ml8_gguf(gguf_path, frozen_mode="none")
+    for kind, name, payload in stream:
+        if kind == "ml8" and name in want:
+            yield name, payload
+
+
 def _frozen_fp8_names(gguf_path):
     """Names of the ML8_FP8 tensors in a GGUF (metadata scan only, no unpack)."""
     import gguf
@@ -968,11 +1003,13 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
         dict OR an iterable of such pairs (e.g. _iter_frozen_fp8_raw's stream) —
         written as {hf_name}.fp8.pt = canonical fp8 schema
         (name/tier/shape/group_size/e4m3/scale).
-    untrained_ml8: optional {gguf_name: {"indices","scales","centroids"}} — ML8_4
-        tensors that exist in the source GGUF but were NOT selected as training
-        targets (e.g. with a narrowed --tensors-train glob). Without re-emitting
-        these, a partial-training run would silently drop them to bf16 in the
-        re-emitted GGUF and tank coverage. Re-exported verbatim from the source.
+    untrained_ml8: optional {gguf_name: {"indices","scales","centroids"}} dict
+        OR an iterable of such (name, entry) pairs (e.g. _iter_untrained_ml8's
+        stream) — ML8_4 tensors that exist in the source GGUF but were NOT
+        selected as training targets (e.g. with a narrowed --tensors-train
+        glob). Without re-emitting these, a partial-training run would silently
+        drop them to bf16 in the re-emitted GGUF and tank coverage.
+        Re-exported verbatim from the source.
 
     Per ml8 target: snap_to_e4m3 the final centroids, then write the schema
     (name/shape/group_size/n_centroids/indices int8/centroids_per_group/
@@ -985,8 +1022,10 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
         _write_ml8_blob(out_dir, hf_names[gguf_name],
                         at.indices, at.centroids, at.scales)
 
-    if untrained_ml8:
-        for gguf_name, ent in untrained_ml8.items():
+    if untrained_ml8 is not None:
+        pairs = (untrained_ml8.items()
+                 if hasattr(untrained_ml8, "items") else untrained_ml8)
+        for gguf_name, ent in pairs:
             if gguf_name in state:
                 continue  # a trained target already wrote the up-to-date blob
             hf_name = hf_names.get(gguf_name)
@@ -1269,7 +1308,7 @@ def main(argv=None):
             f"--base-gguf {args.base_gguf!r} looks like an ml8 GGUF (has "
             f".centroids tensors); pass the original bf16/F16 base GGUF instead")
 
-    from gguf_state import load_ml8_gguf
+    # streaming rehydrate (open_ml8_gguf) imported at the consumption site below
 
     # HF model + tokenizer (untested path).
     from transformers import AutoTokenizer
@@ -1350,51 +1389,52 @@ def main(argv=None):
     _trim_host()
     _memlog("post-student")
 
-    print(f"[act-replay] rehydrating trainer state from {args.gguf}")
-    # frozen_mode="fp8": keep ONLY ML8_FP8 tensors frozen (stored bf16), skip the
-    # bf16/F32 pass-throughs — the HF student already carries those weights, so
-    # materializing them here is ~10GB of pure RAM tax on a 4B model (host=15GB).
-    gstate = load_ml8_gguf(args.gguf, frozen_mode="fp8")
-    _memlog("post-rehydrate")
-
-    targets = attach_targets(dict(model.named_modules()), gstate,
-                             train=args.tensors_train, skip=args.tensors_skip,
-                             model_config=getattr(model, "config", None))
+    print(f"[act-replay] rehydrating trainer state from {args.gguf} (streaming)")
+    # STREAMING rehydrate: one tensor at a time, GGUF -> unpack -> attach/install
+    # on the GPU -> host copy freed. The old load-everything-then-attach path
+    # materialized the full trainer state (~5-6GB on the 4B) on the 15GB host —
+    # the worst of the phase spikes. frozen_mode="fp8": only ML8_FP8 tensors
+    # stream as frozen; bf16/F32 pass-throughs stay with the HF student.
+    from gguf_state import open_ml8_gguf, list_ml8_names
+    modules = dict(model.named_modules())
+    model_config = getattr(model, "config", None)
+    selected = set(select_targets(list_ml8_names(args.gguf),
+                                  train=args.tensors_train,
+                                  skip=args.tensors_skip))
+    no_fp8_install = bool(os.environ.get("ACT_REPLAY_NO_FP8_INSTALL"))
+    targets = {}
+    untrained_ml8_names = []
+    n_fp8 = 0
+    warn_state = {"warned": False}
+    _, stream = open_ml8_gguf(args.gguf, frozen_mode="fp8")
+    for kind, name, payload in stream:
+        if kind == "ml8":
+            if name in selected:
+                targets[name] = _attach_one(modules, name, payload, model_config)
+            else:
+                # Re-read verbatim from the source GGUF at export time (names
+                # only are kept) — dropping them would silently bf16 them in
+                # the re-emit and tank coverage.
+                untrained_ml8_names.append(name)
+        elif not no_fp8_install:
+            # FP8-faithful frozen weight replaces the bf16 parent weight
+            # in-place (closes the faithfulness gap).
+            n_fp8 += _install_one(modules, name, payload, map_gguf_to_hf,
+                                  device, torch.bfloat16, model_config,
+                                  warn_state)
+        del payload
+    del modules
+    _trim_host()
     print(f"[act-replay] attached {len(targets)} ml8 targets")
-    _memlog("post-attach")
-    hf_names = {g: map_gguf_to_hf(g) for g in targets}
-
-    # Install the FP8-faithful frozen weights into the student in-place, replacing
-    # the bf16 parent weights of those modules (closes the faithfulness gap).
-    # install_frozen_fp8 frees each frozen tensor as it goes, draining gstate.frozen.
-    if os.environ.get("ACT_REPLAY_NO_FP8_INSTALL"):
-        # bisect lever: leave fp8-tier modules on their bf16 parent weights
-        n_fp8 = 0
-        gstate.frozen.clear()
+    if no_fp8_install:
         print("[act-replay] fp8 install SKIPPED (ACT_REPLAY_NO_FP8_INSTALL)")
     else:
-        n_fp8 = install_frozen_fp8(
-            model, gstate.frozen, map_gguf_to_hf, device=device, dtype=torch.bfloat16,
-            model_config=getattr(model, "config", None))
         print(f"[act-replay] installed {n_fp8} frozen fp8 tensors into the student")
-    _memlog("post-install")
-
-    # Capture the ML8_4 tensors that are NOT attached training targets (e.g. when
-    # --tensors-train is a narrowed glob). These still need to be re-emitted at
-    # their source codebooks, else the re-emitted GGUF silently drops them to bf16
-    # and tanks coverage (the act_replay re-emit 0.3%-coverage bug class). The
-    # trained targets are excluded here — their up-to-date codebooks win at export.
-    untrained_ml8 = {g: ent for g, ent in gstate.ml8.items() if g not in targets}
-    if untrained_ml8:
-        print(f"[act-replay] {len(untrained_ml8)} untrained ml8 tensor(s) will be "
-              f"re-emitted verbatim from the source GGUF")
-
-    # The rehydrated ml8 codebooks now live in the attached targets; the remaining
-    # gstate copies (now captured in untrained_ml8) are dead weight on the 15GB
-    # host — free the dict's hold.
-    gstate.ml8.clear()
-    _trim_host()
-    _memlog("post-clear")
+    if untrained_ml8_names:
+        print(f"[act-replay] {len(untrained_ml8_names)} untrained ml8 tensor(s) "
+              f"will be re-emitted verbatim from the source GGUF")
+    hf_names = {g: map_gguf_to_hf(g) for g in targets}
+    _memlog("post-rehydrate-attach-install")
 
     # optimizer with separate lr groups for centroids vs scales
     cent_params = [at.centroids for at in targets.values()]
@@ -1459,21 +1499,21 @@ def main(argv=None):
     # frozen fp8 + untrained-ml8 names are GGUF names; map the ones we can, leave
     # the rest as-is (the converter classifies on the blob's HF/GGUF name field).
     extra_hf = {}
-    for gname in _frozen_fp8_names(args.gguf) + list(untrained_ml8):
+    for gname in _frozen_fp8_names(args.gguf) + untrained_ml8_names:
         try:
             extra_hf[gname] = map_gguf_to_hf(gname)
         except KeyError:
             extra_hf[gname] = gname
     export_blobs(targets, {**hf_names, **extra_hf}, blob_dir,
                  frozen_fp8_raw=_iter_frozen_fp8_raw(args.gguf),
-                 untrained_ml8=untrained_ml8)
+                 untrained_ml8=_iter_untrained_ml8(args.gguf, untrained_ml8_names))
     print(f"[act-replay] wrote blobs to {blob_dir}")
 
     # Everything the re-emit needs is now ON DISK (blobs + ckpt). Drop the
     # trainer's remaining big holds (attached codebooks/indices, untrained ml8
     # entries) before the converter walks the base GGUF — run e (2026-06-10)
     # was cgroup-OOM-killed in convert_to_ml8_gguf while still carrying them.
-    del targets, untrained_ml8
+    del targets
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     _trim_host()
