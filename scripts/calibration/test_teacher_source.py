@@ -67,13 +67,39 @@ def test_changed_batch_rebuilds(tmp_path):
     CachedTeacher.build(m, flipped, tmp_path, key="kc", K=8)
     assert m.calls > 0  # cache must NOT hit: a rebuild forward happened
 
-def test_get_wrong_ids_raises(tmp_path):
+def test_get_unbuilt_ids_raises(tmp_path):
     batches = _batches()
     ct = CachedTeacher.build(StubLM(), batches, tmp_path, key="kw", K=8)
     # Correct ids: fine.
     ct.get(0, batches[0])
-    # Wrong ids for that batch index: per-batch hash mismatch must raise.
+    # A sequence that was never built must raise (stale/incomplete cache),
+    # never silently serve another shard.
     wrong = batches[0].clone()
     wrong[0, 0] ^= 1
-    with pytest.raises(RuntimeError, match="ids hash mismatch"):
+    with pytest.raises(RuntimeError, match="no shard for ids hash"):
         ct.get(0, wrong)
+
+
+def test_cache_is_content_addressed_across_index_spaces(tmp_path):
+    # The act-replay trainer asks for train WINDOWS and full holdout batches
+    # through the same get() API with UNRELATED index spaces. Content
+    # addressing must serve both: same ids -> same shard, whatever the index.
+    m = StubLM()
+    full = _batches(n=2, T=8)
+    windows = [full[0][:, :4], full[0][:, 4:], full[1][:, :4], full[1][:, 4:]]
+    ct = CachedTeacher.build(StubLM(), full + windows, tmp_path, key="kz", K=8)
+    ref = LiveTeacher(m, K=8)
+    for any_index, ids in ((7, windows[2]), (0, full[1]), (3, windows[0])):
+        for a, r in zip(ct.get(any_index, ids), ref.get(0, ids)):
+            assert torch.equal(a, r)
+
+
+def test_build_is_incremental(tmp_path):
+    # Extending an existing cache with new sequences only forwards the NEW ones.
+    base = _batches(n=2)
+    CachedTeacher.build(StubLM(), base, tmp_path, key="ki", K=8)
+    m = StubLM()
+    extra = _batches(n=3)[2:]  # one new sequence (different from base draw? n=3 same gen seed)
+    # _batches reseeds, so batches 0..1 repeat base and batch 2 is new.
+    CachedTeacher.build(m, base + extra, tmp_path, key="ki", K=8)
+    assert m.calls == 1  # only the genuinely new sequence was forwarded

@@ -40,6 +40,23 @@ from kl_loss import kl_topk
 _EMPTY_CACHE_EVERY = int(os.environ.get("ML8_EMPTY_CACHE_EVERY", "10"))
 
 
+def _trim_host():
+    """Return freed glibc arenas to the OS (gc first so refcounts drop).
+
+    CPython/glibc retain the allocation high-water mark: streaming a 4B model's
+    safetensors shards through host buffers leaves multi-GB of freed-but-held
+    arena RSS (measured 2026-06-10: 9GB RSS over a ~3GB live working set during
+    the teacher-load phase on the 15GB host). malloc_trim(0) actually gives the
+    memory back; called at phase boundaries, never in the hot loop.
+    """
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass  # non-glibc platform — trimming is best-effort
+
+
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
 
 
@@ -733,9 +750,11 @@ def eval_kl(model, teacher, batches, hold_idx, resp_delims=None):
             del logits, kl, idx, vals, tail, mask
     model.train()
     # eval is a natural boundary (no live graph); drain the CUDA caching allocator
-    # so the next train step starts from a clean arena (NOT done in the hot loop).
+    # and the glibc arenas so the next train step starts from a clean slate (NOT
+    # done in the hot loop).
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.empty_cache()
+    _trim_host()
     return total / max(n, 1)
 
 
@@ -1260,15 +1279,68 @@ def main(argv=None):
     _memlog("start")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    # ORDER MATTERS on the 15GB host: load the student FIRST (its ~8.3GB bf16
-    # staging is transient — weights land on GPU and the host copy frees), THEN
-    # rehydrate the ~4.5GB trainer state. Doing both concurrently resident was
-    # an 11G cgroup OOM (measured). Teacher loads later, after gstate.ml8.clear().
+    # ORDER MATTERS on the 15GB host — one model resident at a time wherever
+    # possible. Corpus + holdout split first (tokenizer-only work), then the
+    # TEACHER (--teacher cache loads the parent once, writes its top-K shards
+    # to disk and FREES it — training never holds a second model in host RAM
+    # or VRAM), then the student, then the trainer-state rehydrate.
+    n_samples = max(1, args.token_budget // max(args.seq_len, 1))
+    batches = collect_calibration(
+        tokenizer, n_samples=n_samples, seq_len=args.seq_len,
+        composition=args.corpus, seed=args.seed, token_budget=args.token_budget)
+    batches = [b.to(device) for b in batches]
+    _memlog("post-corpus")
+
+    train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
+
+    # --train-seq-len: time-split the TRAIN batches into shorter windows to cap
+    # per-forward activation memory at 4B, while EVAL keeps full --seq-len
+    # holdout sequences. train_batches/train_idx_w live in their own index
+    # space; eval keeps the original (batches, hold_idx). The cached teacher is
+    # content-addressed (shards keyed by ids hash), so the mixed window/full
+    # sequence set is fine — no live-teacher-only restriction anymore.
+    train_batches = batches
+    train_idx_w = train_idx
+    if args.train_seq_len is not None and args.train_seq_len < args.seq_len:
+        train_batches, train_idx_w = split_batches_seq(
+            batches, train_idx, args.train_seq_len)
+        print(f"[act-replay] train-seq-len={args.train_seq_len}: split "
+              f"{len(train_idx)} train batch(es) (seq_len={args.seq_len}) into "
+              f"{len(train_idx_w)} window(s)")
+
+    # teacher = frozen bf16 parent — a SEPARATE from_pretrained instance with NO
+    # attached ml8 targets, for every strategy (live/cache/device). Distilling
+    # against the trained-on student would chase a moving target; a cache built
+    # from the attached model would distill KL-to-quant — the wrong target.
+    # cache: built over EXACTLY the sequences training/eval will request
+    # (holdout full batches + train windows); the parent is freed after the
+    # build — the permanent fix for the live teacher's ~9GB host residency.
+    from teacher_source import make_teacher
+    cache_dir = args.teacher_cache_dir or str(out_dir / "teacher_cache")
+    teacher_loader = lambda: _LMWrap(
+        load_hf_model(args.model, device, freeze=True), device)
+    teacher_batches = ([batches[i] for i in hold_idx.tolist()]
+                       + [train_batches[i] for i in train_idx_w.tolist()])
+    teacher = make_teacher(
+        args.teacher, model_loader=teacher_loader, K=args.topk,
+        cache_dir=cache_dir, batches=teacher_batches,
+        cache_key=f"{args.model}_{args.corpus}")
+    del teacher_batches
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+    _trim_host()
+    _memlog("post-teacher")
+
     # Student: a fresh bf16 model whose selected ml8 linears get monkeypatched
-    # with trainable dequant-STE targets below. Gradient checkpointing
-    # (non-reentrant) trades recompute for activation memory; --no-grad-ckpt off.
+    # with trainable dequant-STE targets below. Loaded AFTER the teacher so the
+    # cache strategy never has two models resident, but still BEFORE the
+    # rehydrate (the ~8.3GB bf16 staging is transient — weights land on GPU and
+    # the host copy frees; rehydrate-then-load was an 11G cgroup OOM, measured).
+    # Gradient checkpointing (non-reentrant) trades recompute for activation
+    # memory; --no-grad-ckpt off.
     model = load_hf_model(args.model, device, grad_ckpt=not args.no_grad_ckpt)
     wrapped = _LMWrap(model, device)
+    _trim_host()
     _memlog("post-student")
 
     print(f"[act-replay] rehydrating trainer state from {args.gguf}")
@@ -1312,52 +1384,10 @@ def main(argv=None):
 
     # The rehydrated ml8 codebooks now live in the attached targets; the remaining
     # gstate copies (now captured in untrained_ml8) are dead weight on the 15GB
-    # host — free the dict's hold before the calib draw.
+    # host — free the dict's hold.
     gstate.ml8.clear()
+    _trim_host()
     _memlog("post-clear")
-
-    # calibration draw
-    n_samples = max(1, args.token_budget // max(args.seq_len, 1))
-    batches = collect_calibration(
-        tokenizer, n_samples=n_samples, seq_len=args.seq_len,
-        composition=args.corpus, seed=args.seed, token_budget=args.token_budget)
-    batches = [b.to(device) for b in batches]
-    _memlog("post-corpus")
-
-    train_idx, hold_idx = split_holdout(len(batches), frac=0.1, seed=args.seed)
-
-    # --train-seq-len: time-split the TRAIN batches into shorter windows to cap
-    # per-forward activation memory at 4B, while EVAL keeps full --seq-len holdout
-    # sequences. train_batches/train_idx_w live in their own index space; eval keeps
-    # the original (batches, hold_idx).
-    train_batches = batches
-    train_idx_w = train_idx
-    if args.train_seq_len is not None and args.train_seq_len < args.seq_len:
-        if args.teacher != "live":
-            print(f"[act-replay] WARNING: --train-seq-len with --teacher "
-                  f"{args.teacher!r} — the cache/device teacher is keyed on the "
-                  f"full-sequence batches; window-splitting is only validated with "
-                  f"the live teacher. Falling back to no split.")
-        else:
-            train_batches, train_idx_w = split_batches_seq(
-                batches, train_idx, args.train_seq_len)
-            print(f"[act-replay] train-seq-len={args.train_seq_len}: split "
-                  f"{len(train_idx)} train batch(es) (seq_len={args.seq_len}) into "
-                  f"{len(train_idx_w)} window(s)")
-
-    # teacher = frozen bf16 parent — a SEPARATE from_pretrained instance with NO
-    # attached ml8 targets, for every strategy (live/cache/device). Distilling
-    # against the trained-on student would chase a moving target; a cache built
-    # from the attached model would distill KL-to-quant — the wrong target. live
-    # keeps both resident (~2x model RAM); cache/device load the parent lazily.
-    from teacher_source import make_teacher
-    cache_dir = args.teacher_cache_dir or str(out_dir / "teacher_cache")
-    teacher_loader = lambda: _LMWrap(
-        load_hf_model(args.model, device, freeze=True), device)
-    teacher = make_teacher(
-        args.teacher, model_loader=teacher_loader, K=args.topk,
-        cache_dir=cache_dir, batches=batches, cache_key=f"{args.model}_{args.corpus}")
-    _memlog("post-teacher")
 
     # optimizer with separate lr groups for centroids vs scales
     cent_params = [at.centroids for at in targets.values()]
@@ -1412,9 +1442,9 @@ def main(argv=None):
     # reference cycles, so gc.collect() must run before empty_cache actually
     # returns the segments.
     del wrapped, model, teacher, optimizer, batches, train_batches
-    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _trim_host()
     _memlog("post-gpu-release")
 
     # export blobs (+ frozen fp8 + untrained ml8) then re-emit a GGUF
@@ -1437,9 +1467,9 @@ def main(argv=None):
     # entries) before the converter walks the base GGUF — run e (2026-06-10)
     # was cgroup-OOM-killed in convert_to_ml8_gguf while still carrying them.
     del targets, untrained_ml8
-    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _trim_host()
     _memlog("pre-convert")
 
     # The converter classifies blob tiers via the role table; reproduce the
