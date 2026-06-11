@@ -1317,14 +1317,21 @@ def main(argv=None):
     # build — the permanent fix for the live teacher's ~9GB host residency.
     from teacher_source import make_teacher
     cache_dir = args.teacher_cache_dir or str(out_dir / "teacher_cache")
-    teacher_loader = lambda: _LMWrap(
-        load_hf_model(args.model, device, freeze=True), device)
+
+    def teacher_loader():
+        m = _LMWrap(load_hf_model(args.model, device, freeze=True), device)
+        # Trim NOW, not after the multi-minute build pass: the shard-streaming
+        # staging (~one safetensors shard at a time through host tensors) leaves
+        # a multi-GB glibc high-water that would otherwise sit retained for the
+        # whole cache build (measured 8.5GB RSS over a ~2GB working set).
+        _trim_host()
+        return m
     teacher_batches = ([batches[i] for i in hold_idx.tolist()]
                        + [train_batches[i] for i in train_idx_w.tolist()])
     teacher = make_teacher(
         args.teacher, model_loader=teacher_loader, K=args.topk,
         cache_dir=cache_dir, batches=teacher_batches,
-        cache_key=f"{args.model}_{args.corpus}")
+        cache_key=f"{Path(args.model).name}_{args.corpus}")
     del teacher_batches
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.empty_cache()

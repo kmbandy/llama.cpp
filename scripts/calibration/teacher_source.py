@@ -27,6 +27,25 @@ def _ids_hash(ids):
     return hashlib.blake2b(raw).hexdigest()[:16]
 
 
+def _cache_root(cache_dir, key, K):
+    """Cache directory for (key, K). The key is sanitized so a model PATH used
+    as a key (slashes) cannot nest directories outside/inside cache_dir."""
+    safe = str(key).replace(os.sep, "_")
+    return Path(cache_dir) / f"teacher_{safe}_K{K}"
+
+
+def _trim_host_arenas():
+    """Best-effort glibc malloc_trim — return freed buffers to the OS during
+    long shard-build passes (glibc retains the high-water mark otherwise)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+
+
 class TeacherSource(ABC):
     """Strategy-agnostic source of teacher top-K logits for a batch."""
 
@@ -129,16 +148,18 @@ class CachedTeacher(TeacherSource):
             meta.json         : {"key", "K", "V"}
             shard_{hash}.pt   : {"idx", "vals", "tail", "ids_hash"}
         """
-        root = Path(cache_dir) / f"teacher_{key}_K{K}"
+        root = _cache_root(cache_dir, key, K)
         root.mkdir(parents=True, exist_ok=True)
 
         live = LiveTeacher(model, K)
-        for ids in batches:
+        for n, ids in enumerate(batches):
             h = _ids_hash(ids)
             if cls._shard_path(root, h).exists():
                 continue
             idx, vals, tail = live.get(0, ids)
             cls._write_shard(root, h, idx, vals, tail)
+            if n % 50 == 49:
+                _trim_host_arenas()  # cap serialization-buffer arena creep
 
         # meta written last, atomically, to mark the cache usable.
         cls._atomic_write_text(root / "meta.json",
@@ -209,7 +230,7 @@ def make_teacher(spec, model_loader, K, cache_dir, batches=None, cache_key=None)
         # validate the hit gate without ever loading the model. The model is
         # loaded only when at least one sequence has no shard yet (and build
         # is incremental — present shards are never recomputed).
-        root = Path(cache_dir) / f"teacher_{cache_key}_K{K}"
+        root = _cache_root(cache_dir, cache_key, K)
         hit = CachedTeacher.try_open(root, cache_key, K, batches)
         if hit is not None:
             return hit

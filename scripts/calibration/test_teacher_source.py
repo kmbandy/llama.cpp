@@ -103,3 +103,15 @@ def test_build_is_incremental(tmp_path):
     # _batches reseeds, so batches 0..1 repeat base and batch 2 is new.
     CachedTeacher.build(m, base + extra, tmp_path, key="ki", K=8)
     assert m.calls == 1  # only the genuinely new sequence was forwarded
+
+
+def test_cache_key_with_path_separators_stays_in_cache_dir(tmp_path):
+    # A model PATH as the key must not nest directories outside cache_dir.
+    batches = _batches(n=1)
+    ct = CachedTeacher.build(StubLM(), batches, tmp_path,
+                             key="/home/user/models/Qwen-hf_mix", K=8)
+    roots = [p.name for p in tmp_path.iterdir()]
+    assert roots == ["teacher__home_user_models_Qwen-hf_mix_K8"]
+    for a, r in zip(ct.get(0, batches[0]),
+                    LiveTeacher(StubLM(), K=8).get(0, batches[0])):
+        assert torch.equal(a, r)
