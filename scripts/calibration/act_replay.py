@@ -34,6 +34,12 @@ from centroid_quantizer import snap_to_e4m3
 from kl_loss import kl_topk
 
 
+# Optimizer steps between torch.cuda.empty_cache() drains in the train loop
+# (0 disables). See the train-loop comment: caps the caching allocator's
+# reserved-VRAM ratchet now that expandable_segments is banned on gfx1201.
+_EMPTY_CACHE_EVERY = int(os.environ.get("ML8_EMPTY_CACHE_EVERY", "10"))
+
+
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
 
 
@@ -783,6 +789,14 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
+                # Without expandable_segments (page-faults gfx1201 — see
+                # alloc_conf_hint) the caching allocator ratchets reserved VRAM
+                # toward the high-water mark (~33GB on the 4B, breaching the
+                # 95% headroom rule). Draining every few steps costs ~10ms
+                # against a multi-second optimizer step and caps the ratchet.
+                if _EMPTY_CACHE_EVERY and step % _EMPTY_CACHE_EVERY == 0:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        torch.cuda.empty_cache()
                 _memlog(f"post-train-step{step}")
                 # Live-tensor census after the FIRST optimizer step: this is where
                 # retained dequant STE buffers / fp32 KL chains would show up.
