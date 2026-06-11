@@ -1,12 +1,42 @@
 # kl_loss.py
 """Exact forward-KL over a top-K + tail-bucket partition of teacher logits."""
+import os
 import torch
+
+# Vocab-chunk width for the two-stage topk. A single vocab-wide torch.topk on
+# [T, ~248k] fp32 dispatches PyTorch's multi-block radix path
+# (at::native::mbtopk::gatherTopK, grid ~465k threads), which page-faults on
+# gfx1201 under PYTORCH_HIP_ALLOC_CONF=expandable_segments:True (5/5 trainer
+# runs 2026-06-10; clean without the env var). Chunking keeps every topk call
+# on the small-slice path and is exact (values identical; tie ORDER within
+# equal logits may differ, which the K+1-bucket KL is invariant to).
+# 0 disables chunking.
+_TOPK_CHUNK = int(os.environ.get("ML8_TOPK_CHUNK", "65536"))
+
+
+def _topk_lastdim(x, K, chunk=None):
+    """torch.topk over the last dim, two-stage-chunked to avoid mbtopk."""
+    chunk = _TOPK_CHUNK if chunk is None else chunk
+    V = x.shape[-1]
+    if not chunk or V <= chunk:
+        return x.topk(K, dim=-1)
+    vs, js = [], []
+    for s in range(0, V, chunk):
+        e = min(s + chunk, V)
+        v, j = x[..., s:e].topk(min(K, e - s), dim=-1)
+        vs.append(v)
+        js.append(j + s)
+    cand_v = torch.cat(vs, -1)
+    cand_j = torch.cat(js, -1)
+    v2, i2 = cand_v.topk(K, dim=-1)
+    return v2, cand_j.gather(-1, i2)
+
 
 @torch.no_grad()
 def topk_teacher(logits, K):
     """fp32 (idx [T,K] long, vals [T,K], tail_logsumexp [T])."""
     lg = logits.float()
-    vals, idx = lg.topk(K, dim=-1)
+    vals, idx = _topk_lastdim(lg, K)
     full_lse = torch.logsumexp(lg, -1)
     top_mass = (vals - full_lse.unsqueeze(-1)).exp().sum(-1).clamp_max(1 - 1e-7)
     tail = full_lse + torch.log1p(-top_mass)

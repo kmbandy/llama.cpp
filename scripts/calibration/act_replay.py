@@ -19,6 +19,7 @@ Run the CLI tests from scripts/calibration with PYTHONPATH=../../gguf-py.
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -821,19 +822,69 @@ def _looks_ml8_gguf(gguf_path):
     return any(t.name.endswith(".centroids") for t in reader.tensors)
 
 
-def _read_frozen_fp8_raw(gguf_path):
-    """Re-read ML8_FP8 tensors from a GGUF as (e4m3 fp32 [N,K], scale fp16 [N,n_b]).
+def _frozen_fp8_names(gguf_path):
+    """Names of the ML8_FP8 tensors in a GGUF (metadata scan only, no unpack)."""
+    import gguf
+    from gguf import GGMLQuantizationType
+
+    reader = gguf.GGUFReader(str(gguf_path))
+    return [t.name for t in reader.tensors
+            if t.tensor_type == GGMLQuantizationType.ML8_FP8]
+
+
+def derive_tier_override(gguf_path):
+    """Derive the ML8_TIER_OVERRIDE spec from a source GGUF's tensor types.
+
+    The re-emit must reproduce the SOURCE artifact's role->tier layout, which
+    may invert the default role table (the A3 bit-swap cell has ffn_up=fp8 /
+    ffn_down=ml8 — without the override the converter skips every ffn_up fp8
+    blob as tier-mismatched and the coverage gate refuses at 76%). The source
+    GGUF already encodes the truth per tensor (ML8_4 vs ML8_FP8).
+
+    Tiers are role-uniform across main layers by design ("tread shaping"), so
+    layer 0's stems define each blk role's tier; the trailing mtp/nextn block
+    (e.g. blk.32 on the 4B) may legitimately differ and is NOT a role-table
+    leaf, so blk indices > 0 are ignored. Non-blk tensors (token_embd, output)
+    map directly. Returns a 'leaf=tier,...' spec string (may be empty).
+    """
+    import gguf
+    from gguf import GGMLQuantizationType as Q
+
+    tier_of = {Q.ML8_4: "ml8", Q.ML8_FP8: "fp8"}
+    reader = gguf.GGUFReader(str(gguf_path))
+    leaves = {}
+    for t in reader.tensors:
+        tier = tier_of.get(t.tensor_type)
+        if tier is None:
+            continue
+        name = t.name
+        if name.endswith(".weight"):
+            name = name[: -len(".weight")]
+        parts = name.split(".")
+        if parts[0] == "blk":
+            if len(parts) != 3 or parts[1] != "0":
+                continue
+            leaves[parts[2]] = tier
+        elif len(parts) == 1:
+            leaves[parts[0]] = tier
+    return ",".join(f"{k}={v}" for k, v in sorted(leaves.items()))
+
+
+def _iter_frozen_fp8_raw(gguf_path):
+    """Yield (gguf_name, (e4m3 fp32 [N,K], scale fp16 [N,n_b])) one at a time.
 
     The trainer state's `frozen` dict only keeps the *dequantized* fp8 tensors;
     to re-emit the frozen tensors as {hf_name}.fp8.pt we need the raw e4m3 lattice
     values + their per-group fp16 scales, which we recover straight from the GGUF.
+    Streaming (vs materializing all ~113 tensors at once) keeps the export tail's
+    host RAM bounded on the 15GB box — each tensor is unpacked, consumed by
+    export_blobs, and freed before the next.
     """
     import gguf
     from gguf import GGMLQuantizationType
     from gguf_state import unpack_scaled_fp8_blocks, _logical_N_bytes, _row_major_bytes
     from ml8_to_gguf import _FP8_BLOCK_BYTES, _FP8_GROUP_SIZE
 
-    out = {}
     reader = gguf.GGUFReader(str(gguf_path))
     for tensor in reader.tensors:
         if tensor.tensor_type != GGMLQuantizationType.ML8_FP8:
@@ -842,8 +893,7 @@ def _read_frozen_fp8_raw(gguf_path):
         K = nbytes // _FP8_BLOCK_BYTES * _FP8_GROUP_SIZE
         packed = _row_major_bytes(tensor, N, nbytes)
         e4m3, scale = unpack_scaled_fp8_blocks(packed, N, K)
-        out[tensor.name] = (e4m3, scale)
-    return out
+        yield tensor.name, (e4m3, scale)
 
 
 def _write_ml8_blob(out_dir, hf_name, indices, centroids, scales):
@@ -881,7 +931,8 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
     state: {gguf_name: AttachedTarget}.
     hf_names: {gguf_name: hf_tensor_name} — the blob's `name` and filename stem.
     out_dir: destination dir (never /tmp); created if needed.
-    frozen_fp8_raw: optional {gguf_name: (e4m3 fp32 [N,K], scale fp16 [N,n_b])} —
+    frozen_fp8_raw: optional {gguf_name: (e4m3 fp32 [N,K], scale fp16 [N,n_b])}
+        dict OR an iterable of such pairs (e.g. _iter_frozen_fp8_raw's stream) —
         written as {hf_name}.fp8.pt = canonical fp8 schema
         (name/tier/shape/group_size/e4m3/scale).
     untrained_ml8: optional {gguf_name: {"indices","scales","centroids"}} — ML8_4
@@ -914,9 +965,11 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
             _write_ml8_blob(out_dir, hf_name, ent["indices"],
                             ent["centroids"], ent["scales"])
 
-    if frozen_fp8_raw:
+    if frozen_fp8_raw is not None:
         from ml8_to_gguf import _FP8_GROUP_SIZE
-        for gguf_name, (e4m3, scale) in frozen_fp8_raw.items():
+        pairs = (frozen_fp8_raw.items()
+                 if hasattr(frozen_fp8_raw, "items") else frozen_fp8_raw)
+        for gguf_name, (e4m3, scale) in pairs:
             hf_name = hf_names.get(gguf_name)
             if hf_name is None:
                 # frozen fp8 tensors that don't map to a known HF name keep their
@@ -947,27 +1000,31 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
 
 
 def alloc_conf_hint(device_str, env=None):
-    """Return a launch-time recommendation string if the HIP expandable-segments
-    allocator knob is unset for a CUDA/HIP run, else None.
+    """Return a launch-time WARNING string if the HIP expandable-segments
+    allocator knob IS set for a CUDA/HIP run, else None.
 
-    This module imports torch at load time, so setting PYTORCH_HIP_ALLOC_CONF from
-    inside the process is too late — the caching allocator is already configured.
-    The only correct fix is to export it BEFORE launching python. We therefore
-    just DETECT the gap and print the exact launch line; we do not pretend an
-    in-process os.environ.setdefault would take effect (it wouldn't).
+    POLARITY FLIP (2026-06-10): expandable_segments:True page-faults the GPU on
+    gfx1201 under this trainer's allocation pattern — 5/5 4B runs died with
+    "Memory access fault ... Page not present" (last serialized dispatch:
+    at::native::mbtopk::gatherTopK), and the identical run without the env var
+    completed clean end-to-end. Fragmentation is managed instead by
+    empty_cache() at eval boundaries and the pre-export GPU release.
 
-    Returns None for CPU runs or when the var is already set (any non-empty value).
+    This module imports torch at load time, so the allocator is already
+    configured by the time we run — we can only DETECT and warn, not fix.
+    Returns None for CPU runs or when the var is unset/empty.
     """
     env = os.environ if env is None else env
     if not str(device_str).startswith("cuda"):
         return None
-    if env.get("PYTORCH_HIP_ALLOC_CONF"):
+    conf = env.get("PYTORCH_HIP_ALLOC_CONF", "")
+    if "expandable_segments" not in conf:
         return None
     return (
-        "[act-replay] HINT: PYTORCH_HIP_ALLOC_CONF is unset. On the 15GB 4B host, "
-        "fragmentation can OOM mid-train. torch is imported at module load, so this "
-        "MUST be set BEFORE launching python — re-launch with:\n"
-        "    PYTORCH_HIP_ALLOC_CONF=expandable_segments:True python3 act_replay.py ..."
+        "[act-replay] WARNING: PYTORCH_HIP_ALLOC_CONF contains "
+        f"expandable_segments ({conf!r}). On gfx1201 this page-faults the GPU "
+        "mid-run (mbtopk; 2026-06-10, 5/5 repro). Unset it — fragmentation is "
+        "handled by eval-boundary empty_cache() + the pre-export release."
     )
 
 
@@ -1334,20 +1391,51 @@ def main(argv=None):
     print(f"[act-replay] training done at step {final_step}")
     save_ckpt(ckpt_path, final_step, targets, optimizer)
 
+    # The export tail (blob writes + GGUF re-emit) is CPU-bound but previously
+    # held both 8GB models near-full VRAM for its whole multi-minute duration.
+    # The attached targets own their codebooks/indices outright, so the student,
+    # teacher and optimizer state can go. The monkeypatched module forwards are
+    # reference cycles, so gc.collect() must run before empty_cache actually
+    # returns the segments.
+    del wrapped, model, teacher, optimizer, batches, train_batches
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _memlog("post-gpu-release")
+
     # export blobs (+ frozen fp8 + untrained ml8) then re-emit a GGUF
     blob_dir = out_dir / "blobs"
-    frozen_raw = _read_frozen_fp8_raw(args.gguf)
     # frozen fp8 + untrained-ml8 names are GGUF names; map the ones we can, leave
     # the rest as-is (the converter classifies on the blob's HF/GGUF name field).
     extra_hf = {}
-    for gname in list(frozen_raw) + list(untrained_ml8):
+    for gname in _frozen_fp8_names(args.gguf) + list(untrained_ml8):
         try:
             extra_hf[gname] = map_gguf_to_hf(gname)
         except KeyError:
             extra_hf[gname] = gname
     export_blobs(targets, {**hf_names, **extra_hf}, blob_dir,
-                 frozen_fp8_raw=frozen_raw, untrained_ml8=untrained_ml8)
+                 frozen_fp8_raw=_iter_frozen_fp8_raw(args.gguf),
+                 untrained_ml8=untrained_ml8)
     print(f"[act-replay] wrote blobs to {blob_dir}")
+
+    # Everything the re-emit needs is now ON DISK (blobs + ckpt). Drop the
+    # trainer's remaining big holds (attached codebooks/indices, untrained ml8
+    # entries) before the converter walks the base GGUF — run e (2026-06-10)
+    # was cgroup-OOM-killed in convert_to_ml8_gguf while still carrying them.
+    del targets, untrained_ml8
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _memlog("pre-convert")
+
+    # The converter classifies blob tiers via the role table; reproduce the
+    # SOURCE artifact's layout (it may invert the defaults — A3 swap config).
+    # An operator-set ML8_TIER_OVERRIDE wins; otherwise derive from the GGUF.
+    if not os.environ.get("ML8_TIER_OVERRIDE"):
+        spec = derive_tier_override(args.gguf)
+        if spec:
+            os.environ["ML8_TIER_OVERRIDE"] = spec
+            print(f"[act-replay] derived ML8_TIER_OVERRIDE={spec}")
 
     from ml8_to_gguf import convert_to_ml8_gguf
     out_gguf = out_dir / "act_replay.gguf"

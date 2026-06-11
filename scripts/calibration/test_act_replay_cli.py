@@ -727,18 +727,26 @@ def test_split_batches_seq_mask_preserved_per_window():
 # ─── 4B memory knob: alloc-conf launch hint ───────────────────────────────────
 
 
+# POLARITY FLIP 2026-06-10: expandable_segments page-faults gfx1201 under this
+# trainer (mbtopk; 5/5 repro) — the hint now WARNS when it IS set.
 def test_alloc_conf_hint_cpu_is_none():
-    assert alloc_conf_hint("cpu", env={}) is None
-
-
-def test_alloc_conf_hint_cuda_unset_warns():
-    msg = alloc_conf_hint("cuda:0", env={})
-    assert msg is not None
-    assert "PYTORCH_HIP_ALLOC_CONF=expandable_segments:True" in msg
-
-
-def test_alloc_conf_hint_cuda_already_set_is_none():
     env = {"PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True"}
+    assert alloc_conf_hint("cpu", env=env) is None
+
+
+def test_alloc_conf_hint_cuda_unset_is_none():
+    assert alloc_conf_hint("cuda:0", env={}) is None
+
+
+def test_alloc_conf_hint_cuda_expandable_warns():
+    env = {"PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True"}
+    msg = alloc_conf_hint("cuda:0", env=env)
+    assert msg is not None
+    assert "expandable_segments" in msg and "WARNING" in msg
+
+
+def test_alloc_conf_hint_cuda_other_conf_is_none():
+    env = {"PYTORCH_HIP_ALLOC_CONF": "max_split_size_mb:256"}
     assert alloc_conf_hint("cuda:0", env=env) is None
 
 

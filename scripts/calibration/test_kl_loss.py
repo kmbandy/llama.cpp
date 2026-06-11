@@ -70,3 +70,24 @@ def test_k_equals_v_finite():
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(s.grad).all()
+
+
+def test_chunked_topk_matches_plain():
+    from kl_loss import _topk_lastdim
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn(17, 1000, generator=g)
+    v_ref, i_ref = x.topk(64, dim=-1)
+    for chunk in (37, 64, 100, 999, 1000, 4096):
+        v, i = _topk_lastdim(x, 64, chunk=chunk)
+        assert torch.equal(v, v_ref), f"values differ at chunk={chunk}"
+        assert torch.equal(x.gather(-1, i), v_ref), f"indices differ at chunk={chunk}"
+
+
+def test_chunked_topk_k_larger_than_chunk():
+    from kl_loss import _topk_lastdim
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(5, 200, generator=g)
+    v_ref, _ = x.topk(50, dim=-1)
+    v, i = _topk_lastdim(x, 50, chunk=32)  # K > chunk: per-chunk topk caps at 32
+    assert torch.equal(v, v_ref)
+    assert torch.equal(x.gather(-1, i), v_ref)
