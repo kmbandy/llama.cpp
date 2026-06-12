@@ -849,7 +849,9 @@ def eval_kl(model, teacher, batches, hold_idx, resp_delims=None):
 def train(model, teacher, batches, train_idx, hold_idx, optimizer,
           grad_accum=8, epochs=1, steps=None, eval_interval=200,
           start_step=0, ckpt_path=None, targets=None, resp_delims=None,
-          eval_batches=None):
+          eval_batches=None, warmup_steps=0, total_steps=None,
+          reassign_mode="none", reassign_interval=50, reassign_frac=0.1,
+          loss_scale=1.0):
     """Run the act-replay KL training loop.
 
     Per train batch (in train_idx order): student logits -> kl_topk vs the
@@ -872,6 +874,8 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
     if eval_batches is None:
         eval_batches = batches
     model.train()
+    Ml8Fp8Fn.loss_scale = loss_scale
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
     step = start_step
     micro = 0
     optimizer.zero_grad()
@@ -896,6 +900,10 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
                 optimizer.step()
                 optimizer.zero_grad()
                 step += 1
+                if total_steps is not None:
+                    _apply_lr_schedule(optimizer, base_lrs, step, warmup_steps, total_steps)
+                if reassign_mode != "none" and step % reassign_interval == 0 and targets is not None:
+                    reassign_targets(list(targets.values()), reassign_mode, frac=reassign_frac)
                 # Without expandable_segments (page-faults gfx1201 — see
                 # alloc_conf_hint) the caching allocator ratchets reserved VRAM
                 # toward the high-water mark (~33GB on the 4B, breaching the
@@ -1627,12 +1635,19 @@ def main(argv=None):
         sys.exit(0)
 
     ckpt_path = out_dir / "ckpt.pt"
+    if args.steps is not None:
+        _total_steps = args.steps
+    else:
+        _total_steps = max(1, (len(train_idx_w) * args.epochs) // args.grad_accum)
     final_step = train(
         wrapped, teacher, train_batches, train_idx_w, hold_idx, optimizer,
         grad_accum=args.grad_accum, epochs=args.epochs, steps=args.steps,
         eval_interval=args.eval_interval, start_step=start_step,
         ckpt_path=ckpt_path, targets=targets, resp_delims=resp_delims,
-        eval_batches=batches)
+        eval_batches=batches,
+        warmup_steps=args.lr_warmup_steps, total_steps=_total_steps,
+        reassign_mode=args.reassign, reassign_interval=args.reassign_interval,
+        reassign_frac=args.reassign_frac, loss_scale=args.loss_scale)
     print(f"[act-replay] training done at step {final_step}")
     save_ckpt(ckpt_path, final_step, targets, optimizer)
 
