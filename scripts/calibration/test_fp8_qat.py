@@ -1,4 +1,5 @@
 # test_fp8_qat.py
+import pytest
 import torch
 from fp8_qat import fp8_quant, FP8_E4M3_MAX, FP8_E5M2_MAX
 from fp8_qat import pad_to_multiple
@@ -36,3 +37,16 @@ def test_pad_to_multiple_noop_when_aligned():
     x = torch.randn(16, 8)
     xp, n_pad = pad_to_multiple(x, 16, dim=0)
     assert n_pad == 0 and torch.equal(xp, x)
+
+import pytest
+from fp8_qat import ml8_ref_linear
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp8 GEMM needs GPU")
+def test_ref_linear_matches_dequant_matmul():
+    dev = "cuda"
+    x = torch.randn(16, 64, device=dev) * 0.3
+    W = torch.randn(32, 64, device=dev) * 0.1          # [N, K]
+    y = ml8_ref_linear(x, W)                            # fp8 fwd
+    y_ref = x @ W.t()
+    rel = (y.float() - y_ref).norm() / y_ref.norm()
+    assert rel < 0.1                                    # fp8 rounding band

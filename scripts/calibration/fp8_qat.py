@@ -24,3 +24,15 @@ def pad_to_multiple(x: torch.Tensor, m: int, dim: int = 0):
     shape = list(x.shape); shape[dim] = n_pad
     pad = x.new_zeros(shape)
     return torch.cat([x, pad], dim=dim), n_pad
+
+def ml8_ref_linear(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+    """Reference fp8 linear y = x @ W.T via torch._scaled_mm (test oracle)."""
+    x8, sx = fp8_quant(x, "e4m3")                       # [M,K], [M,1]
+    w8, sw = fp8_quant(W, "e4m3")                       # [N,K], [N,1]
+    # _scaled_mm(A[M,K], B[K,N]) needs B to be column-major.
+    # w8 is [N,K] row-major; w8.contiguous().t() is [K,N] column-major.
+    w8_col = w8.contiguous().t()                         # [K,N], column-major
+    out = torch._scaled_mm(x8, w8_col,
+                           scale_a=sx, scale_b=sw.t(),
+                           out_dtype=torch.bfloat16)
+    return out
