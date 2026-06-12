@@ -39,12 +39,15 @@ class Ml8Fp8Fn(torch.autograd.Function):
         indices    -- uint8 Buffer   [N, K]
         gidx       -- long  Buffer   [K]
 
-    Returns bf16 output [..., N].  Backward raises NotImplementedError (Task A.5).
+    Returns bf16 output [..., N].
 
     The STE boundary: forward computes with e4m3-snapped centroids
     (identical to the deployed kernel's LUT), while the gradient flows
     through the fp32 master centroids via the straight-through identity.
     """
+
+    loss_scale = 1.0           # set by the trainer
+    last_dLdW = {}             # side-channel: id(ctx) -> dL/dW_raw (for Axis B)
 
     @staticmethod
     def forward(ctx, x, centroids, scales, indices, gidx):
@@ -81,7 +84,28 @@ class Ml8Fp8Fn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
-        raise NotImplementedError("Task A.5")
+        x8, sx, cent_e4m3, scales, indices, gidx = ctx.saved_tensors
+        N, K = indices.shape
+        dyf = dy.reshape(-1, dy.shape[-1]) / Ml8Fp8Fn.loss_scale      # [M,N]
+        dy8, sdy = fp8_quant(dyf, "e5m2")
+        # reconstruct raw e4m3 weight W[N,K] = cent_e4m3[gidx, indices] * scales[:,gidx]
+        cent_per_col = cent_e4m3[gidx]                                # [K,16]
+        W = cent_per_col.unsqueeze(0).expand(N, -1, -1).gather(
+            2, indices.long().unsqueeze(-1)).squeeze(-1) * scales[:, gidx]   # [N,K]
+        x = (x8.float() * sx)                                         # dequant acts [M,K]
+        dx = (dy8.float() * sdy) @ W                                  # [M,K]
+        dW_raw = (dy8.float() * sdy).t() @ x                          # [N,K]
+        Ml8Fp8Fn.last_dLdW[id(ctx)] = dW_raw                          # Axis B taps this
+        # chain dW_raw -> dcentroids (scatter-add over (group, index)) and -> dscales
+        dW_scaled = dW_raw * scales[:, gidx]                          # dW/dcent path
+        dcent = torch.zeros_like(cent_e4m3)                          # [G,16]
+        flat_g = gidx.unsqueeze(0).expand(N, -1).reshape(-1)         # [N*K]
+        flat_i = indices.long().reshape(-1)
+        dcent.index_put_((flat_g, flat_i), dW_scaled.reshape(-1), accumulate=True)
+        dscales = torch.zeros_like(scales)                          # [N,G]
+        contrib = (dW_raw * W / scales[:, gidx].clamp_min(1e-12))   # d(W)/dscale = cent
+        dscales.index_add_(1, gidx, contrib)                        # sum cols per group
+        return (dx.reshape(dy.shape[:-1] + (K,)), dcent, dscales, None, None)
 
 
 def ml8_ref_linear(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:

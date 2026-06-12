@@ -66,3 +66,22 @@ def test_fp8fn_forward_matches_ste_weight():
         y_ref = x @ at.weight().t()                    # bf16 STE dequant path
     rel = (y.float() - y_ref.float()).norm() / y_ref.float().norm()
     assert rel < 0.12                                  # fp8 vs bf16 rounding
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_backward_matches_ste_grads():
+    dev = "cuda"
+    s = _mk_state(N=32, K=128, G=2)
+    at_a = AttachedTarget(s).to(dev); at_b = AttachedTarget(s).to(dev)
+    x = torch.randn(16, 128, device=dev) * 0.3
+    g = torch.randn(16, 32, device=dev)
+    # fp8 path
+    y_a = Ml8Fp8Fn.apply(x, at_a.centroids, at_a.scales, at_a.indices, at_a.gidx)
+    y_a.backward(g)
+    # bf16 STE reference path
+    y_b = x @ at_b.weight().t(); y_b.backward(g)
+    # cosine of centroid grads should be high (same descent direction)
+    ca, cb = at_a.centroids.grad.flatten(), at_b.centroids.grad.flatten()
+    cos = torch.nn.functional.cosine_similarity(ca, cb, dim=0)
+    assert cos > 0.95, f"centroid grad cosine {cos:.3f}"
+    assert at_a.scales.grad is not None and torch.isfinite(at_a.scales.grad).all()
