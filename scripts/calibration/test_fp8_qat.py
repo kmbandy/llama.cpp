@@ -97,3 +97,23 @@ def test_fp8fn_backward_stashes_dLdW_by_indices_id():
     key = id(at.indices)
     assert key in Ml8Fp8Fn.last_dLdW
     assert Ml8Fp8Fn.last_dLdW[key].shape == at.indices.shape   # [N,K]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_backward_stashes_curvature_h_by_indices_id():
+    # D.1: backward stashes per-input-column GPTQ Hessian diagonal h_k = E[x_k^2]
+    # (mean over the M batch rows, matching the token-mean loss convention of g).
+    dev = "cuda"
+    at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
+    K = at.indices.shape[1]                          # 128
+    x = torch.randn(16, K, device=dev) * 0.1
+    x[:, K // 2:] *= 10.0                             # second half has ~100x the energy
+    y = Ml8Fp8Fn.apply(x, at.centroids, at.scales, at.indices, at.gidx)
+    y.sum().backward()
+    key = id(at.indices)
+    assert key in Ml8Fp8Fn.last_h
+    h = Ml8Fp8Fn.last_h[key]
+    assert h.shape == (K,)                            # per input column
+    assert torch.isfinite(h).all() and (h >= 0).all()
+    # h tracks per-column second moment: high-energy half >> low-energy half
+    assert h[K // 2:].mean() > h[:K // 2].mean() * 10
