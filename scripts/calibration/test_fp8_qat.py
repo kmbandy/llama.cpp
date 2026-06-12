@@ -1,6 +1,7 @@
 # test_fp8_qat.py
 import torch
 from fp8_qat import fp8_quant, FP8_E4M3_MAX, FP8_E5M2_MAX
+from fp8_qat import pad_to_multiple
 
 def test_fp8_quant_e4m3_roundtrip_per_row():
     x = torch.tensor([[1.0, 2.0, 4.0], [100.0, 200.0, 400.0]])
@@ -23,3 +24,15 @@ def test_fp8_quant_e5m2_wider_range():
     q, scale = fp8_quant(x, fmt="e5m2")
     assert q.dtype == torch.float8_e5m2
     assert torch.allclose(q.float() * scale, x, rtol=0.1)
+
+def test_pad_to_multiple_pads_and_unpads():
+    x = torch.randn(20, 8)
+    xp, n_pad = pad_to_multiple(x, 16, dim=0)
+    assert xp.shape[0] == 32 and n_pad == 12
+    assert torch.equal(xp[:20], x) and xp[20:].abs().sum() == 0
+    assert torch.equal(xp[: xp.shape[0] - n_pad], x)
+
+def test_pad_to_multiple_noop_when_aligned():
+    x = torch.randn(16, 8)
+    xp, n_pad = pad_to_multiple(x, 16, dim=0)
+    assert n_pad == 0 and torch.equal(xp, x)

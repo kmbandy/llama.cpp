@@ -14,3 +14,13 @@ def fp8_quant(x: torch.Tensor, fmt: str = "e4m3"):
     scale = torch.where(amax > 0, scale, torch.ones_like(scale))
     x_fp8 = (x / scale).to(dt)
     return x_fp8, scale
+
+def pad_to_multiple(x: torch.Tensor, m: int, dim: int = 0):
+    """Zero-pad `x` along `dim` up to a multiple of `m`. Returns (padded, n_pad)."""
+    n = x.shape[dim]
+    n_pad = (-n) % m
+    if n_pad == 0:
+        return x, 0
+    shape = list(x.shape); shape[dim] = n_pad
+    pad = x.new_zeros(shape)
+    return torch.cat([x, pad], dim=dim), n_pad
