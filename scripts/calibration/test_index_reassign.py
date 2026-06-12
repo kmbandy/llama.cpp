@@ -31,3 +31,10 @@ def test_pv_vstep_applies_loss_reducing_flips():
     # now dL/dW negative → loss decreases if W increases → want centroid 3 (+1.0)
     new_idx2, n2 = pv_vstep(idx, -torch.ones(N, K), centroids, scales, gidx, frac=1.0)
     assert (new_idx2 == 3).all() and n2 == N * K
+
+from index_reassign import index_reassign
+
+def test_index_reassign_dispatch_none_is_noop():
+    idx = torch.randint(0,16,(4,8),dtype=torch.uint8)
+    out, n = index_reassign(idx, "none", None, None, None, None, None)
+    assert torch.equal(out, idx) and n == 0

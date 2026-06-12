@@ -30,3 +30,12 @@ def pv_vstep(indices, dLdW, centroids, scales, gidx, frac=0.1):
     do_flip = (improve >= thresh) & (improve > 0)
     new_idx = torch.where(do_flip, best_j.to(torch.uint8), indices)
     return new_idx, int(do_flip.sum())
+
+def index_reassign(indices, mode, W_orig, dLdW, centroids, scales, gidx, frac=0.1):
+    if mode == "none":
+        return indices.clone(), 0
+    if mode == "mse":
+        return mse_estep(W_orig, centroids, scales, gidx), -1
+    if mode == "pv":
+        return pv_vstep(indices, dLdW, centroids, scales, gidx, frac=frac)
+    raise ValueError(f"unknown reassign mode {mode}")
