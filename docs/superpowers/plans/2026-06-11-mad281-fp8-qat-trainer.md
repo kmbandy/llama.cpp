@@ -570,4 +570,25 @@ def test_lr_warmup_cosine_shape():
 - **`dscales` gradient** (A.5) uses the `W/scale` approximation; the A.5 cosine-vs-STE test is the gate. If scale-grad cosine is low, derive the exact `∂(cent·scale)/∂scale = cent` form (gather centroid value, sum per group) — the test will catch it.
 - **`last_dLdW` side-channel** (A.5) is rehomed to a per-`AttachedTarget` attribute in C.2 (cleaner than `id(ctx)` keying); both forms satisfy the same Axis-B contract.
 - **Phase 0 Task 0.3** is a deliberate decision gate, not an unconditional rebuild — it executes only post-Phase-C or on a measured need, with the rollback tarball from 0.1.
+
+---
+
+## Phase D — Axis B `pv` redesign: curvature-corrected flip (added 2026-06-12, post-C.3)
+
+**C.3 result (`smoke_fp8_qat.py`, Qwen3.5-0.8B):** Axis A (`frozen`) is the win — holdout KL 0.1093 → **0.0514** (~53% durable). `mse` inert (0.0494, tied within noise). **`pv` diverged at every frac** (0.1/1e-3/1e-4/1e-5; step-10 KL 15.9/12.8/6.84/0.449 — KL ∝ flip count).
+
+**Root cause (confirmed in `index_reassign.py:23-24`):** `ΔL(j) = dLdW·(cent_j−cur)·scale` is **linear in `cent_j`**; `argmin` over a discrete set always picks an **extreme** → every flip slams the weight to a codebook endpoint (max ΔW, where the first-order estimate is most invalid). Not a sign bug — a missing curvature term.
+
+### Task D.0: Confirm the diagnosis (no forward needed)
+- [ ] Add a one-off check that `best_j` from `pv_vstep` lands predominantly on codebook extremes (0 or `NC−1`) on a real reassign. Print the histogram. Expected: heavily bimodal at the ends → confirms the linear-argmin degeneracy.
+
+### Task D.1: Stash diagonal curvature in the fp8 backward
+- [ ] In `Ml8Fp8Fn.backward`, accumulate `h_k ≈ E[x_k²]` (per input column, the GPTQ Hessian diagonal) from the already-dequantized `x`, and stash it beside `last_dLdW` keyed by `ctx.indices_id`. Unit-test the second-moment accumulation.
+
+### Task D.2: `pv_vstep` v2 — quadratic criterion
+- [ ] Replace the linear criterion with `ΔL(j) ≈ g·Δw + ½·h·Δw²` (`g=dLdW`, `Δw=(cent_j−cur)·scale`, `h` from D.1). `argmin` of the **quadratic** picks the centroid nearest the local Newton point `W − g/h` (a small move), not the extreme. Keep the top-`frac` trust region.
+- [ ] **TDD:** on a constructed case where the linear criterion picks the extreme, assert the quadratic criterion picks the near-Newton centroid instead.
+
+### Task D.3: Re-run the smoke `pv` arm
+- [ ] `python smoke_fp8_qat.py --arms pv --pv-fracs 0.1,1e-2,1e-3 --eval-interval 5`. Gate: `pv` stable AND ideally final KL **< 0.0514** (the frozen floor) → Axis B finally earns its keep. Record to `MAD281_RUNG_RESULTS.md`.
 ```
