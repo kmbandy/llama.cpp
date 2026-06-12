@@ -203,6 +203,65 @@ def _cholesky_inv_upper(
 
 
 @torch.no_grad()
+def batched_gptq_reassign(
+    W_stack: torch.Tensor,        # [E, N, K] fp32 — reconstruction target (e.g. W_orig)
+    H_stack: torch.Tensor,        # [E, K, K] fp32 — activation Hessian
+    centroids: torch.Tensor,      # [E, n_groups_k, n_centroids] fp32 — FIXED grid (sorted)
+    scales: torch.Tensor,         # [E, N, n_groups_k] fp32 — FIXED per-(row,group) scale
+    *,
+    group_size: int,
+    percdamp: float = 0.05,
+    act_order: bool = True,
+    chunk_E: int = 8,
+) -> torch.Tensor:
+    """GPTQ index reassignment against a FIXED codebook (no Lloyd-Max refit).
+
+    W_stack   [E, N, K] fp32  — reconstruction target (e.g. W_orig)
+    H_stack   [E, K, K] fp32  — activation Hessian
+    centroids [E, n_groups_k, n_centroids] fp32 — FIXED grid (sorted), Axis-A-tuned
+    scales    [E, N, n_groups_k] fp32 — FIXED per-(row,group) scale
+    Returns indices [E, N, K] int8. Sequential column sweep, H^-1 compensation;
+    optionally Hessian-importance (act_order) permuted. This is the exact loop
+    the validated `batched_gptq_quantize(..., act_order=True)` runs internally.
+    """
+    dev = W_stack.device
+    E, N, K = W_stack.shape
+    W_stack = W_stack.float()
+    H = H_stack.float()
+    eye_K = torch.eye(K, device=dev)
+    diag_means = H.diagonal(dim1=-2, dim2=-1).mean(dim=1)          # [E]
+    damp = (percdamp * diag_means).view(E, 1, 1)                    # [E, 1, 1]
+    gidx_orig = torch.arange(K, device=dev) // group_size
+    if act_order:
+        importance = H.diagonal(dim1=-2, dim2=-1).mean(0)           # [K]
+        perm = torch.argsort(importance, descending=True)
+    else:
+        perm = torch.arange(K, device=dev)
+    Hp = H[:, perm][:, :, perm]
+    Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
+    for cs in range(0, E, chunk_E):
+        ce = min(cs + chunk_E, E)
+        chol_chunk, _ = _cholesky_inv_upper(Hp[cs:ce], damp[cs:ce], eye_K.unsqueeze(0))
+        Hinv_p[cs:ce] = chol_chunk
+        del chol_chunk
+    del Hp
+    Wp = W_stack[:, :, perm].clone()
+    idx_p = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
+    for c in range(K):
+        g = int(gidx_orig[perm[c]])
+        sc = scales[:, :, g]; cg = centroids[:, g, :]
+        di = (Wp[:, :, c].div(sc).unsqueeze(-1) - cg.unsqueeze(1)).abs().argmin(-1)
+        q = cg.gather(1, di) * sc
+        idx_p[:, :, c] = di.to(torch.int8)
+        err = (Wp[:, :, c] - q) / Hinv_p[:, c, c].clamp_min(1e-30).unsqueeze(1)
+        if c + 1 < K:
+            Wp[:, :, c + 1:].sub_(err.unsqueeze(2) * Hinv_p[:, c, c + 1:].unsqueeze(1))
+    idx_full = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
+    idx_full.index_copy_(2, perm, idx_p)
+    return idx_full
+
+
+@torch.no_grad()
 def batched_gptq_quantize(
     W_stack: torch.Tensor,        # [E, N, K] fp32 (or bf16 — cast to fp32 inside)
     H_stack: torch.Tensor,        # [E, K, K] fp32
@@ -432,31 +491,27 @@ def batched_gptq_quantize(
             del chol_chunk
         del Hp
 
-        @torch.no_grad()
         def _reassign(cents, scls):
-            """act_order GPTQ assignment vs FIXED (cents, scls). Returns (idx int8, Q) [E,N,K]."""
-            Wp = W_stack.float()[:, :, perm].clone()
-            idx_p = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
-            Qp = torch.zeros_like(Wp)
-            for c in range(K):
-                g = int(gidx_orig[perm[c]])                            # ORIGINAL group of this column
-                sc = scls[:, :, g]; cg = cents[:, g, :]
-                di = (Wp[:, :, c].div(sc).unsqueeze(-1) - cg.unsqueeze(1)).abs().argmin(-1)
-                q = cg.gather(1, di) * sc
-                idx_p[:, :, c] = di.to(torch.int8)
-                Qp[:, :, c] = q
-                err = (Wp[:, :, c] - q) / Hinv_p[:, c, c].clamp_min(1e-30).unsqueeze(1)
-                if c + 1 < K:
-                    Wp[:, :, c + 1:].sub_(err.unsqueeze(2) * Hinv_p[:, c, c + 1:].unsqueeze(1))
-                if yield_every > 0 and is_cuda_dev and (c + 1) % yield_every == 0 and c + 1 < K:
-                    torch.cuda.synchronize(dev)
-                    if yield_secs > 0.0:
-                        time.sleep(yield_secs)
-            idx_full = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
-            Q_full = torch.zeros((E, N, K), dtype=torch.float32, device=dev)
-            idx_full.index_copy_(2, perm, idx_p)
-            Q_full.index_copy_(2, perm, Qp)
-            del Wp, Qp, idx_p
+            """act_order GPTQ assignment vs FIXED (cents, scls). Returns (idx int8, Q) [E,N,K].
+
+            Delegates index computation to `batched_gptq_reassign` (same math, DRY).
+            Q_full is reconstructed from the returned indices via a simple gather — no
+            second sweep needed, since Q[e,n,k] = cents[e, gidx_orig[k], idx[e,n,k]] * scls[e,n,gidx_orig[k]].
+            """
+            idx_full = batched_gptq_reassign(
+                W_stack, H_stack, cents, scls,
+                group_size=group_size, percdamp=percdamp, act_order=True,
+                chunk_E=chunk_E,
+            )
+            # Reconstruct Q from the reassigned indices + fixed (cents, scls).
+            # gidx_orig[k] maps each column to its group; gather the centroid at idx, scale by scls.
+            gidx_f = torch.arange(K, device=dev) // group_size          # [K]
+            idx_long = idx_full.long()                                   # [E, N, K]
+            cents_exp = cents[:, gidx_f, :]                              # [E, K, n_centroids]
+            # gather centroid value at each (e, n, k): expand to [E, N, K, nc], gather dim 3
+            cents_enk = cents_exp.unsqueeze(1).expand(E, N, K, -1)       # [E, N, K, nc]
+            q_vals = cents_enk.gather(3, idx_long.unsqueeze(-1)).squeeze(-1)  # [E, N, K]
+            Q_full = q_vals * scls[:, :, gidx_f]                         # [E, N, K]
             return idx_full, Q_full
 
         if heavy_rounds > 0:
