@@ -337,6 +337,79 @@ def ml8_layer_from_blob(
     )
 
 
+def layer_from_components(
+    centroids: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    gidx: torch.Tensor,
+    device: torch.device | str = "cpu",
+) -> Ml8Layer:
+    """Build a kernel-ready Ml8Layer from live trainer tensors.
+
+    Args:
+        centroids: fp32 or fp8-e4m3 [G, 16] codebook centroids.
+        scales:    fp32 [N, G] per-(row, group) scale.
+        indices:   uint8 [N, K] centroid index per weight element (values 0..15).
+        gidx:      long [K] group index per input column — MUST be uniform
+                   contiguous grouping (gidx[c] == c // group_size for all c);
+                   the ml8 kernel only supports this layout.
+        device:    target device for the returned Ml8Layer tensors.
+
+    Returns:
+        Ml8Layer in kernel-friendly layout (indices packed lo-first nibbles,
+        scales transposed to [G, N], centroids cast to fp8-e4m3).
+
+    Raises:
+        ValueError: if gidx does not match uniform contiguous grouping.
+    """
+    device = torch.device(device)
+    indices = indices.to(torch.uint8)
+    N, K = indices.shape
+    G = centroids.shape[0]
+    n_centroids = centroids.shape[1]
+    group_size = K // G
+
+    # Validate uniform contiguous grouping — kernel only supports this layout.
+    expected_gidx = torch.arange(K, dtype=torch.long) // group_size
+    if not torch.equal(gidx.cpu().long(), expected_gidx):
+        raise ValueError(
+            f"layer_from_components: gidx does not match uniform contiguous grouping "
+            f"(group_size={group_size}, K={K}, G={G}). "
+            "The ml8 kernel only supports uniform contiguous K-groups."
+        )
+
+    # Pack indices [N, K] uint8 → [K//2, N] uint8 (lo-first nibble convention).
+    idx_np = indices.cpu().contiguous().numpy()   # [N, K]
+    lo = idx_np[:, 0::2]
+    hi = idx_np[:, 1::2]
+    packed_n_kp = (lo & 0x0F) | ((hi & 0x0F) << 4)   # [N, K//2] uint8
+    indices_packed = (
+        torch.from_numpy(packed_n_kp.T.copy()).contiguous().to(device)
+    )  # [K//2, N]
+
+    # Cast centroids to fp8 e4m3 (accept fp32 or already-fp8).
+    if centroids.dtype == torch.float8_e4m3fn:
+        centroids_fp8 = centroids.contiguous().to(device)
+    else:
+        centroids_fp8 = (
+            centroids.to(torch.float32).to(torch.float8_e4m3fn).contiguous().to(device)
+        )
+
+    # Transpose scales [N, G] → [G, N] for K-major kernel access.
+    scales_fp32 = scales.to(torch.float32).T.contiguous().to(device)  # [G, N]
+
+    return Ml8Layer(
+        n_rows=N,
+        n_cols=K,
+        group_size=group_size,
+        n_centroids=n_centroids,
+        indices_packed=indices_packed,
+        centroids_fp8=centroids_fp8,
+        scales_fp32=scales_fp32,
+        nibble_lo_first=True,
+    )
+
+
 class Ml8Linear(torch.nn.Module):
     """Drop-in nn.Linear replacement that invokes the ml8 kernel.
 
