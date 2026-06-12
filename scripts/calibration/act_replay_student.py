@@ -106,12 +106,25 @@ class AttachedTarget(nn.Module):
         rehydrated from GGUF, the inverse must go — keeping it leaves W
         un-derotated and produces garbage, e.g. holdout KL 12.15 nats.)
 
+        The activation e4m3 quant is applied through a STRAIGHT-THROUGH estimator
+        (snap in the forward value, identity gradient in the backward), mirroring
+        the weight-quant STE in weight(). quantize_act_per_row is @no_grad and
+        non-differentiable; without the STE the activation path detaches x_eff
+        from x, so in a stack the gradient to an upstream layer's centroids/scales
+        is severed (a single-linear test cannot see this — there is no trainable
+        param upstream of the detach). The forward VALUE is unchanged: x_rot +
+        (q - x_rot).detach() == q exactly; only the backward gains the identity
+        path through the (piecewise-constant) act quant, back through the linear
+        rotation to x.
+
         Returns x unchanged when no rotation is attached."""
         if self.rotation is None:
             return x
         orig_dtype = x.dtype
         flat = x.reshape(-1, x.shape[-1]).float()
-        a_q = quantize_act_per_row(self.rotation.forward(flat))
+        x_rot = self.rotation.forward(flat)
+        # STE: forward value = quantized acts; backward = identity into x_rot.
+        a_q = x_rot + (quantize_act_per_row(x_rot) - x_rot).detach()
         x_eff = a_q.reshape(x.shape).to(orig_dtype)
         return x_eff
 

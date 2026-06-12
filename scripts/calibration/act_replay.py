@@ -900,6 +900,69 @@ def _frozen_fp8_names(gguf_path):
             if t.tensor_type == GGMLQuantizationType.ML8_FP8]
 
 
+def _derive_tier_spec(named_tiers):
+    """Reduce (tensor_name, tier|None) pairs to a 'leaf=tier,...' override spec.
+
+    `tier` is 'ml8'/'fp8' for ML8_4/ML8_FP8 tensors, None for untiered (F32/bf16)
+    tensors. The spec reproduces the source role->tier layout across the MAIN
+    blk layers plus non-blk leaves (token_embd, output).
+
+    Roles are NOT uniformly present in layer 0. A hybrid arch interleaves
+    SSM/fused-qkv layers (which carry `attn_qkv`) with full-attention layers
+    (which carry split `attn_q/k/v/output`), and a surgically-protected tensor
+    such as `attn_v` may be fp8 in ONLY the full-attention layers — none of
+    which is layer 0. Deriving from layer 0 alone DROPS those roles; the
+    converter then tier-mismatches their fp8 blobs, skips them, and the
+    re-emitted tensors become byte-garbage (catastrophic KL). So every main
+    layer is scanned, not just blk.0.
+
+    The trailing MTP/nextn block (identified by its nextn/eh_proj tensors)
+    legitimately re-tiers shared roles and is excluded — it is not a role-table
+    leaf. A role carrying two tiers across the MAIN layers raises: a
+    role-uniform spec cannot express it, and failing loudly beats silently
+    corrupting half the re-emit.
+    """
+    named = list(named_tiers)
+    # MTP/nextn block layer indices: any blk.L tensor named nextn/eh_proj.
+    mtp_layers = set()
+    for name, _tier in named:
+        parts = name.split(".")
+        if parts[0] == "blk" and len(parts) >= 2 and ("nextn" in name or "eh_proj" in name):
+            try:
+                mtp_layers.add(int(parts[1]))
+            except ValueError:
+                pass
+    leaf_tiers = {}  # leaf -> set of tiers seen across main layers
+    for name, tier in named:
+        if tier is None:
+            continue
+        leaf_name = name[: -len(".weight")] if name.endswith(".weight") else name
+        parts = leaf_name.split(".")
+        if parts[0] == "blk":
+            if len(parts) != 3:
+                continue
+            try:
+                layer = int(parts[1])
+            except ValueError:
+                continue
+            if layer in mtp_layers:
+                continue
+            leaf = parts[2]
+        elif len(parts) == 1:
+            leaf = parts[0]
+        else:
+            continue
+        leaf_tiers.setdefault(leaf, set()).add(tier)
+    spec = {}
+    for leaf, tiers in leaf_tiers.items():
+        if len(tiers) > 1:
+            raise ValueError(
+                f"{leaf}: mixed tier across main layers {sorted(tiers)} — a "
+                "role-uniform ML8_TIER_OVERRIDE cannot reproduce this layout")
+        spec[leaf] = next(iter(tiers))
+    return ",".join(f"{k}={v}" for k, v in sorted(spec.items()))
+
+
 def derive_tier_override(gguf_path):
     """Derive the ML8_TIER_OVERRIDE spec from a source GGUF's tensor types.
 
@@ -909,33 +972,20 @@ def derive_tier_override(gguf_path):
     blob as tier-mismatched and the coverage gate refuses at 76%). The source
     GGUF already encodes the truth per tensor (ML8_4 vs ML8_FP8).
 
-    Tiers are role-uniform across main layers by design ("tread shaping"), so
-    layer 0's stems define each blk role's tier; the trailing mtp/nextn block
-    (e.g. blk.32 on the 4B) may legitimately differ and is NOT a role-table
-    leaf, so blk indices > 0 are ignored. Non-blk tensors (token_embd, output)
-    map directly. Returns a 'leaf=tier,...' spec string (may be empty).
+    The per-role tiers are derived across all MAIN layers (see _derive_tier_spec):
+    a layer-0-only scan misses roles absent from layer 0 — e.g. the fp8-protected
+    `attn_v`, which lives only in the full-attention layers of a hybrid arch and
+    whose omission silently corrupts those tensors on re-emit. The trailing
+    mtp/nextn block (e.g. blk.32 on the 4B) is excluded. Non-blk tensors
+    (token_embd, output) map directly. Returns a 'leaf=tier,...' spec (may be empty).
     """
     import gguf
     from gguf import GGMLQuantizationType as Q
 
     tier_of = {Q.ML8_4: "ml8", Q.ML8_FP8: "fp8"}
     reader = gguf.GGUFReader(str(gguf_path))
-    leaves = {}
-    for t in reader.tensors:
-        tier = tier_of.get(t.tensor_type)
-        if tier is None:
-            continue
-        name = t.name
-        if name.endswith(".weight"):
-            name = name[: -len(".weight")]
-        parts = name.split(".")
-        if parts[0] == "blk":
-            if len(parts) != 3 or parts[1] != "0":
-                continue
-            leaves[parts[2]] = tier
-        elif len(parts) == 1:
-            leaves[parts[0]] = tier
-    return ",".join(f"{k}={v}" for k, v in sorted(leaves.items()))
+    named = [(t.name, tier_of.get(t.tensor_type)) for t in reader.tensors]
+    return _derive_tier_spec(named)
 
 
 def _iter_frozen_fp8_raw(gguf_path):
@@ -964,13 +1014,20 @@ def _iter_frozen_fp8_raw(gguf_path):
         yield tensor.name, (e4m3, scale)
 
 
-def _write_ml8_blob(out_dir, hf_name, indices, centroids, scales):
+def _write_ml8_blob(out_dir, hf_name, indices, centroids, scales, rotation=None):
     """Write one ml8_io-schema .pt blob (name/shape/group_size/n_centroids/
     indices int8/centroids_per_group/scale_per_group + zeroed metrics).
 
     indices [N,K], centroids [G,16], scales [N,G] — torch tensors on CPU.
     group_size = K // G. Centroids are snapped to the e4m3 lattice (the on-disk
     sidecar dtype) so the blob round-trips bit-exactly through ml8_to_gguf.
+
+    rotation: optional {"h_a","a_dim","b_dim"} — the FROZEN Kronecker input
+    rotation the source GGUF carried on this tensor. The trained centroids/scales
+    encode the weight in the ROTATED basis (W_rot), so the re-emit MUST carry the
+    rotation forward or the deployed kernel matmuls W_rot in the wrong basis
+    (every ml8 GEMM wrong; ~12 KLD). ml8_to_gguf writes rotation_h_a/_meta only
+    when the blob has a 'rotation' dict, so we populate it here.
     """
     indices = indices.detach().cpu().to(torch.int8)
     N, K = indices.shape
@@ -990,10 +1047,19 @@ def _write_ml8_blob(out_dir, hf_name, indices, centroids, scales):
         "y_snr_db": 0.0,
         "rel_err": 0.0,
     }
+    if rotation is not None:
+        blob["rotation"] = {
+            "kind": "kronecker_orth_sylvester",
+            "a_dim": int(rotation["a_dim"]),
+            "b_dim": int(rotation["b_dim"]),
+            "in_features": int(K),
+            "h_a": rotation["h_a"].detach().cpu().to(torch.float32),
+        }
     torch.save(blob, out_dir / f"{hf_name}.pt")
 
 
-def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=None):
+def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=None,
+                 model_config=None):
     """Write each ml8 target as an ml8_io-schema blob, plus frozen fp8 tensors.
 
     state: {gguf_name: AttachedTarget}.
@@ -1019,8 +1085,27 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for gguf_name, at in state.items():
+        # The frozen Kronecker rotation rides on the AttachedTarget as a
+        # KroneckerRotation (.h_a/.a_dim/.b_dim); normalize to the blob dict so
+        # the re-emit reproduces the source's rotation_h_a/_meta sidecars.
+        at_rot = getattr(at, "rotation", None)
+        rot = None if at_rot is None else {
+            "h_a": at_rot.h_a, "a_dim": int(at_rot.a_dim), "b_dim": int(at_rot.b_dim)}
+        # attach_targets reordered GGUF->HF rows (gguf_to_hf_perm) so the student
+        # trained in HF layout; INVERT that here so the re-emit writes GGUF-order
+        # rows. Identity for non-linear-attn / 0.8B (num_v == num_k). Without it
+        # the V-reordered ml8 tensors (attn_qkv/attn_gate) ship scrambled by
+        # 90-136% — every such GEMM wrong, ~10 KLD.
+        idx_out, scl_out = at.indices, at.scales
+        perm = gguf_to_hf_perm(gguf_name, tuple(at.indices.shape), model_config)
+        if perm is not None:
+            axis, index = perm
+            unp = _apply_perm_to_ml8_entry(
+                {"indices": at.indices, "scales": at.scales},
+                (axis, torch.argsort(index)))
+            idx_out, scl_out = unp["indices"], unp["scales"]
         _write_ml8_blob(out_dir, hf_names[gguf_name],
-                        at.indices, at.centroids, at.scales)
+                        idx_out, at.centroids, scl_out, rotation=rot)
 
     if untrained_ml8 is not None:
         pairs = (untrained_ml8.items()
@@ -1035,7 +1120,8 @@ def export_blobs(state, hf_names, out_dir, frozen_fp8_raw=None, untrained_ml8=No
                 except KeyError:
                     hf_name = gguf_name
             _write_ml8_blob(out_dir, hf_name, ent["indices"],
-                            ent["centroids"], ent["scales"])
+                            ent["centroids"], ent["scales"],
+                            rotation=ent.get("rotation"))
 
     if frozen_fp8_raw is not None:
         from ml8_to_gguf import _FP8_GROUP_SIZE
@@ -1506,7 +1592,8 @@ def main(argv=None):
             extra_hf[gname] = gname
     export_blobs(targets, {**hf_names, **extra_hf}, blob_dir,
                  frozen_fp8_raw=_iter_frozen_fp8_raw(args.gguf),
-                 untrained_ml8=_iter_untrained_ml8(args.gguf, untrained_ml8_names))
+                 untrained_ml8=_iter_untrained_ml8(args.gguf, untrained_ml8_names),
+                 model_config=model_config)
     print(f"[act-replay] wrote blobs to {blob_dir}")
 
     # Everything the re-emit needs is now ON DISK (blobs + ckpt). Drop the

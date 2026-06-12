@@ -23,6 +23,7 @@ from act_replay import (
     export_blobs,
     install_frozen_fp8,
     alloc_conf_hint,
+    _derive_tier_spec,
 )
 from act_replay_student import attach_to_linear
 from centroid_quantizer import snap_to_e4m3
@@ -893,3 +894,213 @@ def test_attach_targets_applies_v_reorder():
     assert torch.equal(at.scales.detach(), expected)
     # The reorder is real (not identity): some rows actually moved.
     assert not torch.equal(at.scales.detach(), state_entry["scales"])
+
+
+# ─── derive_tier_override: heterogeneous-arch tier derivation ────────────────
+
+
+def test_derive_tier_spec_captures_role_absent_from_layer0():
+    """A role that lives ONLY in non-zero layers must still be captured.
+
+    This is the A3 attn_v regression: the source GGUF is a hybrid arch where
+    only every Nth layer is full-attention, so blk.0 is an SSM/fused-qkv layer
+    with NO split attn_v. attn_v is fp8-protected in the full-attention layers
+    (3, 7, ...). Deriving the tier spec from blk.0 stems alone DROPS attn_v;
+    the converter then sees its fp8 blob as tier-mismatched, skips it, and the
+    re-emitted tensor is byte-garbage (catastrophic KL). The spec must reflect
+    every role across the MAIN layers, not just layer 0.
+    """
+    named = [
+        ("blk.0.attn_qkv.weight", "ml8"),     # layer 0: fused qkv (no split v)
+        ("blk.0.ffn_up.weight", "fp8"),
+        ("blk.0.ffn_down.weight", "ml8"),
+        ("blk.0.attn_norm.weight", None),     # F32 — not a tiered leaf
+        ("blk.3.attn_q.weight", "ml8"),       # full-attention layer
+        ("blk.3.attn_v.weight", "fp8"),       # fp8-protected, absent from blk.0
+        ("blk.7.attn_v.weight", "fp8"),
+        ("token_embd.weight", "fp8"),
+    ]
+    spec = _derive_tier_spec(named)
+    d = dict(kv.split("=") for kv in spec.split(",") if kv)
+    assert d.get("attn_v") == "fp8"        # THE BUG: previously dropped
+    assert d.get("attn_q") == "ml8"
+    assert d.get("attn_qkv") == "ml8"
+    assert d.get("ffn_up") == "fp8"
+    assert d.get("ffn_down") == "ml8"
+    assert d.get("token_embd") == "fp8"
+    assert "attn_norm" not in d             # F32 leaves carry no tier
+
+
+def test_derive_tier_spec_excludes_trailing_mtp_block():
+    """The trailing MTP/nextn block legitimately re-tiers shared roles (e.g.
+    everything ML8_FP8 in blk.32). It is NOT a role-table leaf, so its tiers
+    must not contaminate — nor conflict with — the main-layer derivation.
+    """
+    named = [
+        ("blk.0.ffn_up.weight", "fp8"),
+        ("blk.0.ffn_down.weight", "ml8"),
+        ("blk.0.attn_qkv.weight", "ml8"),
+        # MTP block (index 8 here): nextn marker + everything fp8.
+        ("blk.8.nextn.eh_proj.weight", "fp8"),
+        ("blk.8.ffn_down.weight", "fp8"),     # main ffn_down is ml8 — MTP differs
+        ("blk.8.attn_qkv.weight", "fp8"),
+    ]
+    spec = _derive_tier_spec(named)
+    d = dict(kv.split("=") for kv in spec.split(",") if kv)
+    assert d.get("ffn_down") == "ml8"      # main-layer tier wins, not MTP's fp8
+    assert d.get("attn_qkv") == "ml8"
+    assert d.get("ffn_up") == "fp8"
+    assert "nextn" not in spec and "eh_proj" not in spec
+
+
+def test_derive_tier_spec_raises_on_mixed_main_layer_tier():
+    """If a role genuinely carries two tiers across MAIN (non-MTP) layers, a
+    role-uniform spec cannot express it — fail loudly rather than silently
+    pick one and corrupt half the tensors.
+    """
+    named = [
+        ("blk.0.ffn_down.weight", "ml8"),
+        ("blk.4.ffn_down.weight", "fp8"),     # same role, conflicting tier, both main
+    ]
+    with pytest.raises(ValueError, match="mixed tier"):
+        _derive_tier_spec(named)
+
+
+# ─── export must preserve the (frozen) Kronecker rotation sidecar ────────────
+
+
+def _rotated_target(N=4, a_dim=4, b_dim=2, G=2):
+    """A synthetic ml8 target dict carrying a Kronecker rotation (K = a_dim*b_dim)."""
+    K = a_dim * b_dim
+    torch.manual_seed(0)
+    h_a, _ = torch.linalg.qr(torch.randn(a_dim, a_dim))   # orthogonal a×a
+    return {
+        "indices": torch.randint(0, 16, (N, K), dtype=torch.uint8),
+        "centroids": torch.randn(G, 16),
+        "scales": torch.rand(N, G) + 0.01,
+        "rotation": {"h_a": h_a, "a_dim": a_dim, "b_dim": b_dim},
+    }, K
+
+
+def test_faithful_acts_passes_gradient_to_upstream_layer():
+    """STACKED faithful-acts layers must let gradient reach an UPSTREAM layer's
+    codebook. apply_acts quantizes activations through an e4m3 STE (mirroring the
+    weight-quant STE); without it, quantize_act_per_row's @no_grad detaches x_eff
+    from x and the gradient to any layer feeding a downstream rotated linear is
+    severed — exactly zero. A single-linear test cannot catch this (no trainable
+    param upstream of the detach); it only appears with stacked layers. Regression
+    guard for the 2026-06-11 act-STE fix.
+    """
+    tA, K = _rotated_target(N=8, a_dim=4, b_dim=2)
+    tB, _ = _rotated_target(N=8, a_dim=4, b_dim=2)
+    linA = nn.Linear(K, 8, bias=False)
+    linB = nn.Linear(8, 8, bias=False)
+    atA = attach_to_linear(linA, tA, faithful_acts=True)
+    atB = attach_to_linear(linB, tB, faithful_acts=True)
+
+    out = linB(linA(torch.randn(4, K)))
+    out.pow(2).sum().backward()
+
+    up = float(atA.centroids.grad.abs().sum()) + float(atA.scales.grad.abs().sum())
+    down = float(atB.centroids.grad.abs().sum()) + float(atB.scales.grad.abs().sum())
+    assert down > 0, "sanity: the downstream rotated layer must get gradient"
+    assert up > 0, "UPSTREAM rotated layer got zero gradient — act STE severed"
+
+
+def test_faithful_acts_forward_value_unchanged_by_ste():
+    """The act-STE must change ONLY the backward: forward value stays exactly the
+    raw quantize_act_per_row(x@Q). Guards against the STE silently altering the
+    deployed-faithful activation path."""
+    from ml8_e4m3_sim import quantize_act_per_row
+    target, K = _rotated_target(N=8, a_dim=4, b_dim=2)
+    at = attach_to_linear(nn.Linear(K, 8, bias=False), target, faithful_acts=True)
+    x = torch.randn(4, K)
+    ref = quantize_act_per_row(
+        at.rotation.forward(x.reshape(-1, K).float())).reshape(x.shape)
+    assert torch.equal(at.apply_acts(x), ref), "act-STE altered the forward value"
+
+
+def test_export_blobs_preserves_rotation_sidecar(tmp_path):
+    """A rehydrated rotated ml8 target must re-emit its rotation. The trained
+    weights live in the ROTATED basis; dropping the rotation sidecar makes the
+    deployed kernel matmul in the wrong basis — every ml8 GEMM wrong, ~12 KLD.
+    The converter writes rotation_h_a/_meta ONLY when the blob carries a
+    'rotation' dict, so export_blobs must populate it.
+    """
+    target, K = _rotated_target()
+    at = attach_to_linear(nn.Linear(K, 4, bias=False), target, faithful_acts=True)
+    state = {"blk.0.ffn_gate.weight": at}
+    hf_names = {"blk.0.ffn_gate.weight": "model.layers.0.mlp.gate_proj"}
+    export_blobs(state, hf_names, tmp_path)
+    blob = torch.load(tmp_path / "model.layers.0.mlp.gate_proj.pt", weights_only=False)
+    assert blob.get("rotation") is not None, "rotation sidecar DROPPED on export"
+    rot = blob["rotation"]
+    assert rot["kind"] == "kronecker_orth_sylvester"
+    assert int(rot["a_dim"]) == 4 and int(rot["b_dim"]) == 2
+    assert int(rot["in_features"]) == K
+    assert torch.allclose(rot["h_a"].float(), target["rotation"]["h_a"].float())
+
+
+def test_export_blobs_no_rotation_is_clean(tmp_path):
+    """A target with no rotation must not invent one (legacy/identity blobs)."""
+    target, K = _rotated_target()
+    target.pop("rotation")
+    at = attach_to_linear(nn.Linear(K, 4, bias=False), target, faithful_acts=False)
+    export_blobs({"blk.0.ffn_gate.weight": at},
+                 {"blk.0.ffn_gate.weight": "model.layers.0.mlp.gate_proj"}, tmp_path)
+    blob = torch.load(tmp_path / "model.layers.0.mlp.gate_proj.pt", weights_only=False)
+    assert blob.get("rotation") in (None, {}), "fabricated a rotation where none exists"
+
+
+# ─── export must INVERT the attach-time GGUF->HF V-head permutation ──────────
+
+
+class _LinAttnCfg:
+    linear_num_value_heads = 4
+    linear_num_key_heads = 2
+    linear_value_head_dim = 4
+    linear_key_head_dim = 4
+
+
+def test_export_inverts_vhead_permutation_roundtrip(tmp_path):
+    """attach_targets reorders GGUF->HF rows (gguf_to_hf_perm) so the student
+    trains in HF layout; export MUST invert it so the re-emit is GGUF-order.
+    On the 4B (num_v != num_k) the perm is NON-identity, so attn_qkv/attn_gate
+    ship scrambled (~90-136% weight error, ~10 KLD) if export skips the inverse.
+    It was invisible on the 0.8B (num_v == num_k -> identity perm), where the
+    existing round-trip tests live.
+    """
+    from act_replay import gguf_to_hf_perm, _apply_perm_to_ml8_entry
+    cfg = _LinAttnCfg()
+    name = "blk.0.attn_gate.weight"
+    N, K, G = 16, 64, 1                          # N = num_v_heads*head_v_dim = 16
+    torch.manual_seed(0)
+    gguf_entry = {                               # canonical GGUF (grouped) order
+        "indices": torch.randint(0, 16, (N, K), dtype=torch.uint8),
+        "centroids": torch.randn(G, 16),
+        "scales": torch.rand(N, G) + 0.01,
+    }
+    perm = gguf_to_hf_perm(name, (N, K), cfg)
+    assert perm is not None, "test config must produce a non-identity perm"
+    # Simulate attach_targets: reorder into HF order, then wrap.
+    hf_entry = _apply_perm_to_ml8_entry({k: v.clone() for k, v in gguf_entry.items()}, perm)
+    at = attach_to_linear(nn.Linear(K, N, bias=False), hf_entry, faithful_acts=False)
+    export_blobs({name: at}, {name: "model.layers.0.x"}, tmp_path, model_config=cfg)
+    blob = torch.load(tmp_path / "model.layers.0.x.pt", weights_only=False)
+    assert torch.equal(blob["indices"].to(torch.uint8), gguf_entry["indices"]), \
+        "export did NOT invert the V-head permutation — rows scrambled"
+    assert torch.equal(blob["scale_per_group"], gguf_entry["scales"])
+
+
+def test_export_roundtrip_identity_when_no_config(tmp_path):
+    """No model_config (or non-linear-attn) => identity perm => unchanged rows
+    (preserves 0.8B / dense behavior)."""
+    torch.manual_seed(1)
+    N, K, G = 16, 64, 1
+    entry = {"indices": torch.randint(0, 16, (N, K), dtype=torch.uint8),
+             "centroids": torch.randn(G, 16), "scales": torch.rand(N, G) + 0.01}
+    at = attach_to_linear(nn.Linear(K, N, bias=False), entry, faithful_acts=False)
+    export_blobs({"blk.0.attn_gate.weight": at},
+                 {"blk.0.attn_gate.weight": "model.layers.0.x"}, tmp_path, model_config=None)
+    blob = torch.load(tmp_path / "model.layers.0.x.pt", weights_only=False)
+    assert torch.equal(blob["indices"].to(torch.uint8), entry["indices"])
