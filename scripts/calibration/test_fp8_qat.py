@@ -85,3 +85,15 @@ def test_fp8fn_backward_matches_ste_grads():
     cos = torch.nn.functional.cosine_similarity(ca, cb, dim=0)
     assert cos > 0.95, f"centroid grad cosine {cos:.3f}"
     assert at_a.scales.grad is not None and torch.isfinite(at_a.scales.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_backward_stashes_dLdW_by_indices_id():
+    dev = "cuda"
+    at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
+    x = torch.randn(16, 128, device=dev) * 0.3
+    y = Ml8Fp8Fn.apply(x, at.centroids, at.scales, at.indices, at.gidx)
+    y.sum().backward()
+    key = id(at.indices)
+    assert key in Ml8Fp8Fn.last_dLdW
+    assert Ml8Fp8Fn.last_dLdW[key].shape == at.indices.shape   # [N,K]

@@ -79,6 +79,7 @@ class Ml8Fp8Fn(torch.autograd.Function):
         if n_pad:
             y = y[: y.shape[0] - n_pad]               # [M, N]
 
+        ctx.indices_id = id(indices)
         ctx.save_for_backward(x8, sx, cent_e4m3, scales, indices, gidx)
         return y.reshape(*x.shape[:-1], y.shape[-1])
 
@@ -95,7 +96,7 @@ class Ml8Fp8Fn(torch.autograd.Function):
         x = (x8.float() * sx)                                         # dequant acts [M,K]
         dx = (dy8.float() * sdy) @ W                                  # [M,K]
         dW_raw = (dy8.float() * sdy).t() @ x                          # [N,K]
-        Ml8Fp8Fn.last_dLdW[id(ctx)] = dW_raw                          # Axis B taps this
+        Ml8Fp8Fn.last_dLdW[ctx.indices_id] = dW_raw                   # Axis B taps this
         # chain dW_raw -> dcentroids (scatter-add over (group, index)) and -> dscales
         dW_scaled = dW_raw * scales[:, gidx]                          # dW/dcent path
         dcent = torch.zeros_like(cent_e4m3)                          # [G,16]
