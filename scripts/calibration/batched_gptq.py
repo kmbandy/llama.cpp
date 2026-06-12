@@ -213,6 +213,11 @@ def batched_gptq_reassign(
     percdamp: float = 0.05,
     act_order: bool = True,
     chunk_E: int = 8,
+    Hinv_chol: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+    yield_every: int = 0,
+    yield_secs: float = 0.0,
+    is_cuda_dev: bool | None = None,
 ) -> torch.Tensor:
     """GPTQ index reassignment against a FIXED codebook (no Lloyd-Max refit).
 
@@ -223,28 +228,44 @@ def batched_gptq_reassign(
     Returns indices [E, N, K] int8. Sequential column sweep, H^-1 compensation;
     optionally Hessian-importance (act_order) permuted. This is the exact loop
     the validated `batched_gptq_quantize(..., act_order=True)` runs internally.
+
+    Optional reuse/safety knobs (used by `batched_gptq_quantize`'s heavy_rounds
+    loop so it neither recomputes the Cholesky each round nor drops the display-GPU
+    compositor yield):
+      Hinv_chol [E, K, K] — precomputed upper-tri Cholesky of (H_perm + damp)^-1.
+                            If given, skip the internal Cholesky.
+      perm      [K]       — precomputed column permutation. If given, skip act_order.
+      yield_every/yield_secs/is_cuda_dev — restore the mandatory compositor yield
+                            (drain + brief sleep so the gfx ring isn't starved on a
+                            display GPU). Default 0 ⇒ no yield (fine for short/CPU runs).
     """
     dev = W_stack.device
     E, N, K = W_stack.shape
     W_stack = W_stack.float()
     H = H_stack.float()
-    eye_K = torch.eye(K, device=dev)
-    diag_means = H.diagonal(dim1=-2, dim2=-1).mean(dim=1)          # [E]
-    damp = (percdamp * diag_means).view(E, 1, 1)                    # [E, 1, 1]
     gidx_orig = torch.arange(K, device=dev) // group_size
-    if act_order:
-        importance = H.diagonal(dim1=-2, dim2=-1).mean(0)           # [K]
-        perm = torch.argsort(importance, descending=True)
+    if is_cuda_dev is None:
+        is_cuda_dev = dev.type == "cuda"
+    if perm is None:
+        if act_order:
+            importance = H.diagonal(dim1=-2, dim2=-1).mean(0)          # [K]
+            perm = torch.argsort(importance, descending=True)
+        else:
+            perm = torch.arange(K, device=dev)
+    if Hinv_chol is None:
+        eye_K = torch.eye(K, device=dev)
+        diag_means = H.diagonal(dim1=-2, dim2=-1).mean(dim=1)          # [E]
+        damp = (percdamp * diag_means).view(E, 1, 1)                    # [E, 1, 1]
+        Hp = H[:, perm][:, :, perm]
+        Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
+        for cs in range(0, E, chunk_E):
+            ce = min(cs + chunk_E, E)
+            chol_chunk, _ = _cholesky_inv_upper(Hp[cs:ce], damp[cs:ce], eye_K.unsqueeze(0))
+            Hinv_p[cs:ce] = chol_chunk
+            del chol_chunk
+        del Hp
     else:
-        perm = torch.arange(K, device=dev)
-    Hp = H[:, perm][:, :, perm]
-    Hinv_p = torch.empty((E, K, K), device=dev, dtype=torch.float32)
-    for cs in range(0, E, chunk_E):
-        ce = min(cs + chunk_E, E)
-        chol_chunk, _ = _cholesky_inv_upper(Hp[cs:ce], damp[cs:ce], eye_K.unsqueeze(0))
-        Hinv_p[cs:ce] = chol_chunk
-        del chol_chunk
-    del Hp
+        Hinv_p = Hinv_chol
     Wp = W_stack[:, :, perm].clone()
     idx_p = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
     for c in range(K):
@@ -256,6 +277,10 @@ def batched_gptq_reassign(
         err = (Wp[:, :, c] - q) / Hinv_p[:, c, c].clamp_min(1e-30).unsqueeze(1)
         if c + 1 < K:
             Wp[:, :, c + 1:].sub_(err.unsqueeze(2) * Hinv_p[:, c, c + 1:].unsqueeze(1))
+        if yield_every > 0 and is_cuda_dev and (c + 1) % yield_every == 0 and c + 1 < K:
+            torch.cuda.synchronize(dev)
+            if yield_secs > 0.0:
+                time.sleep(yield_secs)
     idx_full = torch.zeros((E, N, K), dtype=torch.int8, device=dev)
     idx_full.index_copy_(2, perm, idx_p)
     return idx_full
@@ -502,6 +527,11 @@ def batched_gptq_quantize(
                 W_stack, H_stack, cents, scls,
                 group_size=group_size, percdamp=percdamp, act_order=True,
                 chunk_E=chunk_E,
+                # Reuse the Cholesky + perm already computed for this act_order pass
+                # (no redundant inversion across heavy_rounds), and keep the mandatory
+                # display-GPU compositor yield that the standalone default omits.
+                Hinv_chol=Hinv_p, perm=perm,
+                yield_every=yield_every, yield_secs=yield_secs, is_cuda_dev=is_cuda_dev,
             )
             # Reconstruct Q from the reassigned indices + fixed (cents, scls).
             # gidx_orig[k] maps each column to its group; gather the centroid at idx, scale by scls.
