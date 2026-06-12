@@ -196,3 +196,24 @@ def test_select_targets_train_glob():
     ]
     sel = select_targets(names, train="blk.0*", skip=None)
     assert set(sel) == {"blk.0.ffn_gate.weight", "blk.0.ffn_down.weight"}
+
+
+import pytest
+from test_act_replay_cli import _mk_state as _mk_state_cli
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_attach_fp8_forward_backprops_to_centroids():
+    dev = "cuda"
+    N, K, G = 32, 128, 2
+    state = _mk_state_cli(N=N, K=K, G=G)
+    lin = nn.Linear(K, N, bias=False).to(dev).to(torch.bfloat16)
+    at = attach_to_linear(lin, state, fp8=True)
+    x = torch.randn(16, K, device=dev, dtype=torch.bfloat16) * 0.3
+    y = lin(x)                              # monkeypatched fp8 forward
+    assert torch.isfinite(y).all()
+    y.float().sum().backward()
+    assert at.centroids.grad is not None and torch.isfinite(at.centroids.grad).all()
+    assert at.scales.grad is not None and torch.isfinite(at.scales.grad).all()
+    # W_orig anchor captured
+    assert at.W_orig.shape == (N, K)

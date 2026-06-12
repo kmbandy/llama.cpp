@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from centroid_quantizer import snap_to_e4m3
+from fp8_qat import Ml8Fp8Fn
 from kronecker_rotation import KroneckerRotation
 from ml8_e4m3_sim import quantize_act_per_row
 
@@ -70,6 +71,9 @@ class AttachedTarget(nn.Module):
         self.scales = nn.Parameter(scales)         # [N, G]  fp32, trainable
         self.register_buffer("indices", indices)   # [N, K] long, frozen
         self.register_buffer("gidx", _gidx_for(K, G, indices.device))  # [K] long
+
+        # Frozen anchor: initial bf16 ml8 dequant for the mse E-step index-reassign.
+        self.register_buffer("W_orig", self.weight().detach().clone())  # [N, K]
 
         # Optional deployment-faithful rotation (W4A8 activation path).
         rot = target.get("rotation")
@@ -130,7 +134,8 @@ class AttachedTarget(nn.Module):
 
 
 def attach_to_linear(lin: nn.Linear, target: dict,
-                     faithful_acts: bool | None = None) -> AttachedTarget:
+                     faithful_acts: bool | None = None,
+                     fp8: bool = False) -> AttachedTarget:
     """Wrap `lin` so its forward uses the ml8 dequant-STE weight (and, when a
     rotation is present and faithful_acts is on, the W4A8 activation path).
 
@@ -168,6 +173,11 @@ def attach_to_linear(lin: nn.Linear, target: dict,
 
     def _forward(x):
         x_eff = at.apply_acts(x) if use_acts else x
+        if fp8:
+            y = Ml8Fp8Fn.apply(x_eff, at.centroids, at.scales, at.indices, at.gidx)
+            if bias is not None:
+                y = y + bias.to(y.dtype)
+            return y
         # The codebook params are fp32 leaves but the host model may run in bf16
         # (or fp16). Cast the dequant weight (and bias) to the activation dtype so
         # F.linear doesn't crash on a dtype mismatch. The cast happens AFTER the
