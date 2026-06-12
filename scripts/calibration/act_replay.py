@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "gguf-py"
 
 from act_replay_student import attach_to_linear, select_targets
 from centroid_quantizer import snap_to_e4m3
+from fp8_qat import Ml8Fp8Fn
+from index_reassign import index_reassign
 from kl_loss import kl_topk
 
 
@@ -77,6 +79,32 @@ def _apply_lr_schedule(optimizer, base_lrs, step, warmup, total):
     for g, blr in zip(optimizer.param_groups, base_lrs):
         g["lr"] = blr * m
     return m
+
+
+def reassign_targets(targets, mode, frac=0.1):
+    """Axis-B discrete index reassignment over AttachedTargets, in place.
+
+    mode 'none' -> no-op (returns 0). 'mse' re-solves indices vs each target's
+    W_orig anchor using current snapped centroids/scales. 'pv' uses the loss
+    gradient dL/dW_raw stashed in Ml8Fp8Fn.last_dLdW[id(at.indices)] from the
+    most recent backward; targets without a stashed grad are skipped.
+    Returns the total number of elements changed (mse counts changed entries).
+    """
+    if mode == "none":
+        return 0
+    total = 0
+    for at in targets:
+        cent = snap_to_e4m3(at.centroids).detach()
+        scl = at.scales.detach()
+        dLdW = Ml8Fp8Fn.last_dLdW.get(id(at.indices))
+        if mode == "pv" and dLdW is None:
+            continue
+        new_idx, n = index_reassign(at.indices, mode, at.W_orig, dLdW,
+                                    cent, scl, at.gidx, frac=frac)
+        changed = int((new_idx != at.indices).sum().item()) if n < 0 else int(n)
+        at.indices.copy_(new_idx.to(at.indices.dtype))
+        total += changed
+    return total
 
 
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────

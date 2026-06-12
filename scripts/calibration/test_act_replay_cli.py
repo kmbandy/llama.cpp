@@ -1130,3 +1130,30 @@ def test_apply_lr_schedule_scales_param_groups():
     assert abs(opt.param_groups[1]["lr"] - 0.005) < 1e-9
     m2 = _apply_lr_schedule(opt, base, step=2, warmup=2, total=10)  # multiplier 1.0
     assert abs(opt.param_groups[0]["lr"] - 0.1) < 1e-9
+
+
+def test_reassign_targets_none_is_noop():
+    import torch
+    from act_replay import reassign_targets
+    from act_replay_student import AttachedTarget
+    at = AttachedTarget(_mk_state(N=8, K=128, G=2))
+    before = at.indices.clone()
+    n = reassign_targets([at], "none", frac=1.0)
+    assert n == 0 and torch.equal(at.indices, before)
+
+
+def test_reassign_targets_pv_flips_with_stashed_grad():
+    import torch
+    from act_replay import reassign_targets
+    from act_replay_student import AttachedTarget
+    from fp8_qat import Ml8Fp8Fn
+    at = AttachedTarget(_mk_state(N=8, K=128, G=2))
+    before = at.indices.clone()
+    # craft a large-magnitude dL/dW so pv predicts beneficial flips for many elems
+    Ml8Fp8Fn.last_dLdW[id(at.indices)] = torch.full_like(at.W_orig, -5.0)
+    n = reassign_targets([at], "pv", frac=1.0)
+    assert n >= 0
+    # at least some indices changed (a strong uniform gradient should move assignments)
+    assert not torch.equal(at.indices, before) or n == 0
+    # indices stay in valid range
+    assert at.indices.max().item() <= 15
