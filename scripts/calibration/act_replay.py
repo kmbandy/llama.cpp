@@ -70,6 +70,15 @@ def lr_warmup_cosine(step, warmup, total):
     return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _apply_lr_schedule(optimizer, base_lrs, step, warmup, total):
+    """Set each param-group lr = base_lr * lr_warmup_cosine(step, warmup, total).
+    Returns the multiplier. base_lrs is the per-group starting lrs (same order)."""
+    m = lr_warmup_cosine(step, warmup, total)
+    for g, blr in zip(optimizer.param_groups, base_lrs):
+        g["lr"] = blr * m
+    return m
+
+
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
 
 

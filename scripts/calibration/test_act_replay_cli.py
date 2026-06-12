@@ -1116,3 +1116,17 @@ def test_lr_warmup_cosine_shape():
     from act_replay import lr_warmup_cosine
     assert lr_warmup_cosine(1,2,10) == 0.5 and lr_warmup_cosine(2,2,10) == 1.0
     assert lr_warmup_cosine(10,2,10) == 0.0 and lr_warmup_cosine(6,2,10) < 1.0
+
+
+def test_apply_lr_schedule_scales_param_groups():
+    import torch
+    from act_replay import _apply_lr_schedule
+    p1 = torch.nn.Parameter(torch.zeros(2)); p2 = torch.nn.Parameter(torch.zeros(2))
+    opt = torch.optim.SGD([{"params":[p1],"lr":0.1},{"params":[p2],"lr":0.01}], lr=0.1)
+    base = [0.1, 0.01]
+    m = _apply_lr_schedule(opt, base, step=1, warmup=2, total=10)   # multiplier 0.5
+    assert abs(m - 0.5) < 1e-9
+    assert abs(opt.param_groups[0]["lr"] - 0.05) < 1e-9
+    assert abs(opt.param_groups[1]["lr"] - 0.005) < 1e-9
+    m2 = _apply_lr_schedule(opt, base, step=2, warmup=2, total=10)  # multiplier 1.0
+    assert abs(opt.param_groups[0]["lr"] - 0.1) < 1e-9
