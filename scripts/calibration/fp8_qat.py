@@ -25,6 +25,65 @@ def pad_to_multiple(x: torch.Tensor, m: int, dim: int = 0):
     pad = x.new_zeros(shape)
     return torch.cat([x, pad], dim=dim), n_pad
 
+import ml8_runtime
+from centroid_quantizer import snap_to_e4m3
+
+
+class Ml8Fp8Fn(torch.autograd.Function):
+    """Forward pass for ml8 weight-format-1 GEMM via the deployed LUT kernel.
+
+    Inputs:
+        x          -- fp32/bf16 activations [..., K]
+        centroids  -- fp32 Parameter [G, 16]
+        scales     -- fp32 Parameter [N, G]
+        indices    -- uint8 Buffer   [N, K]
+        gidx       -- long  Buffer   [K]
+
+    Returns bf16 output [..., N].  Backward raises NotImplementedError (Task A.5).
+
+    The STE boundary: forward computes with e4m3-snapped centroids
+    (identical to the deployed kernel's LUT), while the gradient flows
+    through the fp32 master centroids via the straight-through identity.
+    """
+
+    @staticmethod
+    def forward(ctx, x, centroids, scales, indices, gidx):
+        # STE: snap centroids to e4m3 lattice in forward, identity grad to fp32 master.
+        cent_e4m3 = centroids + (snap_to_e4m3(centroids) - centroids).detach()
+
+        # Build kernel-ready Ml8Layer from live trainer tensors.
+        layer = ml8_runtime.layer_from_components(
+            centroids=cent_e4m3, scales=scales, indices=indices, gidx=gidx,
+            device=x.device)
+
+        K = x.shape[-1]
+        xf = x.reshape(-1, K).to(torch.float32)   # flatten leading dims, ensure fp32
+        M = xf.shape[0]
+
+        # Per-row fp8 quantization of activations.
+        x8, sx = fp8_quant(xf, "e4m3")            # x8:[M,K] fp8, sx:[M,1] fp32
+
+        # Pad M to multiple of 16 (kernel block_size_m requirement).
+        x8p, n_pad = pad_to_multiple(x8, 16, dim=0)   # [M', K]
+        sxp, _ = pad_to_multiple(sx, 16, dim=0)       # [M', 1]
+
+        # a_scale must be [M'] contiguous float32 (matches Ml8Linear.forward contract).
+        a_scale = sxp.squeeze(-1).contiguous()         # [M']
+
+        y = ml8_runtime.ml8_gemm(x8p, layer, a_scale=a_scale)   # [M', N] bf16
+
+        # Strip padding rows.
+        if n_pad:
+            y = y[: y.shape[0] - n_pad]               # [M, N]
+
+        ctx.save_for_backward(x8, sx, cent_e4m3, scales, indices, gidx)
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+
+    @staticmethod
+    def backward(ctx, dy):
+        raise NotImplementedError("Task A.5")
+
+
 def ml8_ref_linear(x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
     """Reference fp8 linear y = x @ W.T via torch._scaled_mm (test oracle)."""
     x8, sx = fp8_quant(x, "e4m3")                       # [M,K], [M,1]

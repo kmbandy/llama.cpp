@@ -50,3 +50,19 @@ def test_ref_linear_matches_dequant_matmul():
     y_ref = x @ W.t()
     rel = (y.float() - y_ref).norm() / y_ref.norm()
     assert rel < 0.1                                    # fp8 rounding band
+
+
+from fp8_qat import Ml8Fp8Fn
+from act_replay_student import AttachedTarget
+from test_act_replay_cli import _mk_state   # reuse the tiny ml8 target builder
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_forward_matches_ste_weight():
+    dev = "cuda"
+    at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
+    x = torch.randn(16, 128, device=dev) * 0.3
+    with torch.no_grad():
+        y = Ml8Fp8Fn.apply(x, at.centroids, at.scales, at.indices, at.gidx)
+        y_ref = x @ at.weight().t()                    # bf16 STE dequant path
+    rel = (y.float() - y_ref.float()).norm() / y_ref.float().norm()
+    assert rel < 0.12                                  # fp8 vs bf16 rounding
