@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import math
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,18 @@ def _trim_host():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except OSError:
         pass  # non-glibc platform — trimming is best-effort
+
+
+def lr_warmup_cosine(step, warmup, total):
+    """LR multiplier in [0,1]: linear ramp to 1.0 over `warmup` steps, then
+    cosine decay to 0.0 at `total`. step is 1-based."""
+    if warmup > 0 and step <= warmup:
+        return step / warmup
+    if total <= warmup:
+        return 1.0
+    progress = (step - warmup) / (total - warmup)
+    progress = min(max(progress, 0.0), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
@@ -202,10 +215,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--teacher-cache-dir", default=None, help="dir for the cache teacher's shards (never /tmp)")
     p.add_argument("--topk", type=int, default=256, help="teacher top-K width for the KL partition")
     # optimization
-    p.add_argument("--lr-cent", type=float, default=1e-3, help="lr for centroid params")
-    p.add_argument("--lr-scale", type=float, default=1e-4, help="lr for per-row scale params")
+    p.add_argument("--lr-cent", type=float, default=2e-4, help="lr for centroid params")
+    p.add_argument("--lr-scale", type=float, default=2e-5, help="lr for per-row scale params")
+    p.add_argument("--lr-warmup-steps", type=int, default=0,
+                   help="linear lr warmup steps before cosine decay")
     p.add_argument("--grad-accum", type=int, default=8, help="grad-accumulation steps per optimizer step")
     p.add_argument("--micro-batch", type=int, default=1, help="micro-batch size (sequences per forward)")
+    # fp8 engine + discrete index reassignment
+    p.add_argument("--fp8", action="store_true",
+                   help="train through the fp8 forward+backward engine (Ml8Fp8Fn)")
+    p.add_argument("--loss-scale", type=float, default=1.0,
+                   help="loss scale for fp8 backward dy (e5m2) dynamic range")
+    p.add_argument("--reassign", default="none", choices=["none", "mse", "pv"],
+                   help="discrete index reassignment mode (Axis B)")
+    p.add_argument("--reassign-interval", type=int, default=50,
+                   help="optimizer steps between index reassignments")
+    p.add_argument("--reassign-frac", type=float, default=0.1,
+                   help="pv-mode: fraction of elements to flip per reassign")
     # target selection
     p.add_argument("--tensors-train", default="ml8",
                    help="'ml8' (all ml8 tensors) or comma-separated fnmatch globs")
@@ -612,7 +638,8 @@ def _apply_perm_to_ml8_entry(entry, perm):
 # ─── attach targets to an HF model ───────────────────────────────────────────
 
 
-def attach_targets(model_named_modules, state, train, skip, model_config=None):
+def attach_targets(model_named_modules, state, train, skip, model_config=None,
+                   fp8: bool = False):
     """Attach selected ml8 targets to their host linears in an HF model.
 
     model_named_modules: dict-like {module_path: nn.Module} (e.g. dict(model.named_modules())).
@@ -621,17 +648,18 @@ def attach_targets(model_named_modules, state, train, skip, model_config=None):
     model_config: HF model config used to invert the linear-attn V-head reorder
         (see gguf_to_hf_perm). None disables the reorder (identity) — safe for
         non-linear-attn models and the 0.8B case.
+    fp8: when True, wire the fp8 forward+backward engine for each attached target.
 
     Returns {gguf_name: AttachedTarget} for every attached target. Raises KeyError
     if a selected target's mapped HF module is not present in the model.
     """
     modules = dict(model_named_modules)
     selected = select_targets(list(state.ml8.keys()), train=train, skip=skip)
-    return {g: _attach_one(modules, g, state.ml8[g], model_config)
+    return {g: _attach_one(modules, g, state.ml8[g], model_config, fp8=fp8)
             for g in selected}
 
 
-def _attach_one(modules, gguf_name, entry, model_config=None):
+def _attach_one(modules, gguf_name, entry, model_config=None, fp8: bool = False):
     """Attach ONE ml8 entry to its host linear; returns the AttachedTarget.
 
     Applies the linear-attn V-head reorder inversion when model_config is given
@@ -639,6 +667,8 @@ def _attach_one(modules, gguf_name, entry, model_config=None):
     The streaming rehydrate path calls this per tensor so the host never holds
     the full trainer state; attach_to_linear moves the entry to the module's
     device, freeing the host copy as each tensor lands.
+    fp8: when True, wire the fp8 forward+backward engine (Ml8Fp8Fn) via
+    attach_to_linear's fp8 flag.
     """
     hf_path = map_gguf_to_hf(gguf_name)
     if hf_path not in modules:
@@ -648,7 +678,7 @@ def _attach_one(modules, gguf_name, entry, model_config=None):
         shape = tuple(entry["indices"].shape)
         perm = gguf_to_hf_perm(gguf_name, shape, model_config)
         entry = _apply_perm_to_ml8_entry(entry, perm)
-    return attach_to_linear(modules[hf_path], entry)
+    return attach_to_linear(modules[hf_path], entry, fp8=fp8)
 
 
 def install_frozen_fp8(model, frozen, map_fn, device, dtype, model_config=None):
@@ -1496,7 +1526,8 @@ def main(argv=None):
     for kind, name, payload in stream:
         if kind == "ml8":
             if name in selected:
-                targets[name] = _attach_one(modules, name, payload, model_config)
+                targets[name] = _attach_one(modules, name, payload, model_config,
+                                             fp8=args.fp8)
             else:
                 # Re-read verbatim from the source GGUF at export time (names
                 # only are kept) — dropping them would silently bf16 them in

@@ -73,8 +73,8 @@ def test_parse_args_defaults():
     assert a.seq_len == 2048
     assert a.teacher == "live"
     assert a.topk == 256
-    assert a.lr_cent == 1e-3
-    assert a.lr_scale == 1e-4
+    assert a.lr_cent == 2e-4
+    assert a.lr_scale == 2e-5
     assert a.grad_accum == 8
     assert a.tensors_train == "ml8"
     assert a.tensors_skip == ""
@@ -1104,3 +1104,15 @@ def test_export_roundtrip_identity_when_no_config(tmp_path):
                  {"blk.0.attn_gate.weight": "model.layers.0.x"}, tmp_path, model_config=None)
     blob = torch.load(tmp_path / "model.layers.0.x.pt", weights_only=False)
     assert torch.equal(blob["indices"].to(torch.uint8), entry["indices"])
+
+
+def test_parse_args_fp8_defaults():
+    a = parse_args(["--gguf","g","--base-gguf","b","--model","m","--out-dir","o"])
+    assert a.fp8 is False and a.reassign == "none" and a.lr_warmup_steps == 0
+    assert a.lr_cent == 2e-4 and a.lr_scale == 2e-5
+
+
+def test_lr_warmup_cosine_shape():
+    from act_replay import lr_warmup_cosine
+    assert lr_warmup_cosine(1,2,10) == 0.5 and lr_warmup_cosine(2,2,10) == 1.0
+    assert lr_warmup_cosine(10,2,10) == 0.0 and lr_warmup_cosine(6,2,10) < 1.0
