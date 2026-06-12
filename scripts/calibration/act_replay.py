@@ -86,8 +86,9 @@ def reassign_targets(targets, mode, frac=0.1):
 
     mode 'none' -> no-op (returns 0). 'mse' re-solves indices vs each target's
     W_orig anchor using current snapped centroids/scales. 'pv' uses the loss
-    gradient dL/dW_raw stashed in Ml8Fp8Fn.last_dLdW[id(at.indices)] from the
-    most recent backward; targets without a stashed grad are skipped.
+    gradient dL/dW_raw and the diagonal curvature h stashed in
+    Ml8Fp8Fn.last_dLdW / last_h (keyed by id(at.indices)) from the most recent
+    backward; targets without a stashed grad+curvature are skipped.
     Returns the total number of elements changed (mse counts changed entries).
     """
     if mode == "none":
@@ -97,9 +98,10 @@ def reassign_targets(targets, mode, frac=0.1):
         cent = snap_to_e4m3(at.centroids).detach()
         scl = at.scales.detach()
         dLdW = Ml8Fp8Fn.last_dLdW.get(id(at.indices))
-        if mode == "pv" and dLdW is None:
+        h = Ml8Fp8Fn.last_h.get(id(at.indices))
+        if mode == "pv" and (dLdW is None or h is None):
             continue
-        new_idx, n = index_reassign(at.indices, mode, at.W_orig, dLdW,
+        new_idx, n = index_reassign(at.indices, mode, at.W_orig, dLdW, h,
                                     cent, scl, at.gidx, frac=frac)
         changed = int((new_idx != at.indices).sum().item()) if n < 0 else int(n)
         at.indices.copy_(new_idx.to(at.indices.dtype))
