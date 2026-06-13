@@ -133,6 +133,42 @@ def collect_target_hessians(targets, calib, model, dev):
     return {name: at.finalize_hessian() for name, at in targets.items()}
 
 
+def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
+    """Axis B (full-H GPTQ): re-solve each target's indices vs its CURRENT
+    (Axis-A-tuned, e4m3-snapped) centroids using the per-target rotated Hessian.
+    Builds E=1 stacks and calls batched_gptq_reassign. Targets without a stashed H
+    are skipped. Returns the total number of index entries changed.
+
+    W_orig, the rotated Hessian H, and the centroids all live in the SAME rotated
+    basis — no rotation handling is needed here. Reassigns against the SNAPPED
+    centroids (the actual e4m3 LUT values the forward/kernel uses), matching the
+    convention in reassign_targets.
+    """
+    from batched_gptq import batched_gptq_reassign
+
+    total = 0
+    for name, at in targets.items():
+        H = H_by_name.get(name)
+        if H is None:
+            continue
+        K = at.indices.shape[1]
+        n_groups = at.centroids.shape[0]
+        group_size = K // n_groups
+        W = at.W_orig.unsqueeze(0).float()                        # [1, N, K]
+        Hs = H.to(W.device).unsqueeze(0).float()                  # [1, K, K]
+        cents = snap_to_e4m3(at.centroids).detach().unsqueeze(0)  # [1, n_groups, NC]
+        scl = at.scales.detach().unsqueeze(0)                     # [1, N, n_groups]
+        new_idx = batched_gptq_reassign(W, Hs, cents, scl,
+                                        group_size=group_size,
+                                        percdamp=percdamp,
+                                        act_order=act_order)[0]   # [N, K] int8
+        new_idx = new_idx.to(at.indices.dtype)
+        changed = int((new_idx != at.indices).sum().item())
+        at.indices.copy_(new_idx)
+        total += changed
+    return total
+
+
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
 
 

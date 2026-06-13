@@ -1289,3 +1289,67 @@ def test_collect_target_hessians_end_to_end():
     assert H.dtype == torch.float32
     # must be symmetric
     assert torch.allclose(H, H.t(), atol=1e-5)
+
+
+# ─── E.4: gptq_reassign_targets — full-H GPTQ index re-solve ─────────────────
+
+
+def test_gptq_reassign_targets_lowers_reconstruction_and_updates_indices():
+    """E.4: gptq_reassign_targets re-solves each target's indices via full-Hessian
+    GPTQ against its current (Axis-A-tuned, e4m3-snapped) centroids.
+
+    Recipe: build a target from good_idx (so W_orig == dequant(good_idx));
+    corrupt live indices to bad_idx; run gptq_reassign_targets; assert the
+    H-weighted reconstruction error LOWERS and at.indices is updated in-place.
+    The function is rotation-agnostic: W_orig, H, and centroids all share the
+    same space — no rotation handling needed here.
+    """
+    from act_replay import gptq_reassign_targets
+    from act_replay_student import AttachedTarget
+    from centroid_quantizer import snap_to_e4m3
+
+    K, N, G, NC = 64, 8, 2, 16
+    g = torch.Generator().manual_seed(7)
+    # Build e4m3-snapped centroids (sorted so they're well-separated).
+    cent = (torch.randn(G, NC, generator=g)
+            .to(torch.float8_e4m3fn).to(torch.float32)
+            .sort(-1).values)
+    scales = torch.rand(N, G, generator=g) + 0.5
+    # good_idx: the reconstruction target — W_orig will be built from this.
+    good_idx = torch.randint(0, NC, (N, K), generator=g)
+    state = {"indices": good_idx.clone(), "scales": scales, "centroids": cent,
+             "rotation": None}
+    at = AttachedTarget(state)
+    # at.W_orig is now dequant(good_idx) — the target we want to reconstruct.
+
+    # Build activation Hessian H = X^T X / n (small random activations, CPU).
+    X = torch.randn(300, K, generator=g)
+    H = (X.t() @ X) / X.shape[0]
+
+    # Helper: H-weighted reconstruction error ‖W_orig - Wq‖²_H.
+    def recon_err(idx):
+        gmap = torch.arange(K) // (K // G)           # column -> group index [K]
+        # cg[n, k, :] = cent[gmap[k], :]
+        cg = cent[gmap].unsqueeze(0).expand(N, K, NC)  # [N, K, NC]
+        Wq = cg.gather(2, idx.long().unsqueeze(-1)).squeeze(-1) * scales[:, gmap]
+        d = (at.W_orig - Wq).float()
+        return torch.einsum("nk,kj,nj->", d, H, d).item()
+
+    # Corrupt the live indices — deliberately stale/bad assignment.
+    bad_idx = (good_idx + 5) % NC
+    at.indices.copy_(bad_idx.to(at.indices.dtype))
+
+    before = recon_err(at.indices)
+
+    n = gptq_reassign_targets({"t": at}, {"t": H}, percdamp=0.05, act_order=True)
+
+    after = recon_err(at.indices)
+
+    # Sanity: function returns an int count > 0 (bad -> good changes happened).
+    assert isinstance(n, int) and n > 0, f"expected some indices to change, got n={n}"
+    # In-range: all indices are valid centroid indices [0, NC).
+    assert int(at.indices.max()) < NC and int(at.indices.min()) >= 0, \
+        f"indices out of range [0,{NC}): min={int(at.indices.min())} max={int(at.indices.max())}"
+    # The essential contract: GPTQ re-solve must lower H-reconstruction error.
+    assert after < before, \
+        f"GPTQ re-solve must lower H-reconstruction error: {after:.4f} !< {before:.4f}"
