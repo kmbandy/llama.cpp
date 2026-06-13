@@ -56,6 +56,7 @@ def pick_gfx1201():
 
 
 def main():
+    global MODEL, GGUF   # allow --model/--gguf to override the module defaults
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="frozen,mse,pv",
@@ -67,11 +68,15 @@ def main():
     ap.add_argument("--eval-interval", type=int, default=1,
                     help="holdout-eval cadence in optimizer steps (>1 = much faster)")
     ap.add_argument("--steps", type=int, default=MAX_STEPS)
+    ap.add_argument("--model", default=MODEL, help="bf16 HF model dir (teacher + host)")
+    ap.add_argument("--gguf", default=GGUF, help="rotated/faithful ml8 GGUF to rehydrate")
     args = ap.parse_args()
     ARMS = [a.strip() for a in args.arms.split(",") if a.strip()]
     PV_FRACS = [float(x) for x in args.pv_fracs.split(",") if x.strip()]
     EVAL_INTERVAL = max(1, args.eval_interval)
     STEPS = args.steps
+    MODEL = args.model      # shadow module defaults so the harness runs on any size (e.g. 4B)
+    GGUF = args.gguf
 
     dev = pick_gfx1201()
     print(f"[dev] {dev}  loss_scale={LOSS_SCALE}  arms={ARMS} pv_fracs={PV_FRACS} "
