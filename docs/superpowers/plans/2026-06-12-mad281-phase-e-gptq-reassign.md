@@ -488,3 +488,25 @@ The QAT **product loop has never been closed on any model.** Every result is **h
 2. **Real PPL gate:** `llama-perplexity --kl-divergence` of the re-emitted GGUF vs the bf16 parent (verify ml8 inference dispatch first).
 3. **Close the loop cheaply on the already-calibrated 0.8B first** (fast iteration), then run the genuine end-to-end on the 4B (and eventually 35B-A3B) so the result is a **shippable PPL-gated artifact, not just a KL number.**
 4. **Calibrator bug to fix:** `calibrate_ml8_paged` dense meta-init path doesn't re-tie `lm_head` for tied-embedding models → `--eval-ppl` is garbage (4B baseline printed 248320 not ~8.3). Non-blocking (per-target Y_SNR 27–28 dB proves the blobs are valid); ignore `--eval-ppl`, use `llama-perplexity`.
+
+---
+
+## Status (2026-06-13) — 4B attach unblocked + trainer memory teardown; backward must be rewritten
+
+**4B verdict: still NOT achieved.** Three attach/OOM/fault blockers got fixed (below); the verdict run finally trained but only reached `frozen` step 5 (KL 0.2090→0.2131) before being stopped — **no `gptq` comparison, so Axis B's value on the 4B remains unanswered.**
+
+**Fixes landed (all TDD, committed on `sync/upstream-2026-06-09`):**
+- `3f1cf520c` — **ml8 input-column V-head reorder.** The 4B smoke crashed at attach: `ssm_out` (linear-attn out_proj) is ml8-tiered (`role_targets` BASE) but needs an axis-1 (input-column) V-head reorder, which `_apply_perm_to_ml8_entry` rejected (Phase E assumed out_proj was always fp8-frozen). The 0.8B masked it (symmetric heads → identity perm). Fix: carry the inverse perm on `AttachedTarget.col_perm` and reorder the **input activation** hf→tiled at the front of `apply_acts`, leaving W/Q/scales/centroids in GGUF order — exact (per-row act-quant commutes with a column perm) and never conjugates the Kronecker rotation. Keeps the Hessian in the GGUF-rotated basis so Axis-B GPTQ on `ssm_out` stays consistent.
+- `a3ffb0941` — skip the `W_orig` mse/pv anchor unless an mse/pv arm runs.
+- `e821168f3` — gate `Ml8Fp8Fn.capture_dLdW` (stop hoarding a dense fp32 `dL/dW` per layer every backward).
+- `f54201910` — free the **dead bf16 host weights** (`attach_to_linear(free_host_weight=True)`; the patched forward never reads `lin.weight`) + move the arm-reset `init_idx` snapshot off VRAM. **Measured 4B QAT peak 20.4GB → 9.68GB torch-allocated** (rocm-smi 26→16; the residual ~6GB on rocm-smi is torch allocator reserve ~4GB + HIP/kernel context ~2GB, NOT the model). The 4B QAT fits in **<10GB of 32GB** — the card was never the constraint, the trainer was double-storing the model.
+
+**GPU-safety note:** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` caused a hard GPU memory-access fault ("page not present") on ROCm/RDNA4 (required a machine restart). **Never set it on this hardware** — the HIP virtual-memory path is flaky.
+
+### THE decision that supersedes Phase F (kmbandy, 2026-06-13): rewrite the fp8 BACKWARD on-substrate
+mad-lab is documented **aiter/Triton/AMD-first for fp8**, and the ml8 **forward is already a fused aiter kernel** — but `Ml8Fp8Fn.backward` (`fp8_qat.py`) is **Python-orchestrated dense fp32 PyTorch**: per layer per micro it rebuilds dense `W`, `dW_raw`, `dW_scaled`, `contrib` `[N,K]` then scatters into a 16-entry codebook (~2400 tiny ops/micro). Result: **dispatch-bound** (GPU 30–55%, CPU pegged, ~16s/micro → ~4hr for a 3-arm verdict) **and** memory-wasteful. The memory waste and the speed waste are the **same off-substrate bug**. A correct reference is fine as throwaway scaffolding, but it shipped as the trainer.
+
+**NEXT (after compact) — brainstorm → spec → plan, then build:**
+1. **Fused aiter/Triton ml8-QAT backward kernel** — compute the codebook gradient (`dcent`, `dscales`, `dx`) directly from `(dy, x, indices, gidx, scales)` with **no dense weight reconstruction** and no Python per-layer op loop. Mirror the fused forward. This dissolves both the dispatch stall and the dense-fp32 memory cost.
+2. **Streaming memory model** — `init_idx` re-read from the GGUF on NVMe at arm boundaries (not hoarded in VRAM or host RAM; my host-snapshot fix was backwards — it relieved abundant 32GB VRAM by loading scarce 15GB host RAM). Weights can page like `calibrate_ml8_paged`'s `WeightPager` if scale demands.
+3. Then resume the **4B Axis-B verdict** (frozen vs gptq vs gptq-interleave) — fast and lean on the fused trainer — and only after that, Phase F re-emit + PPL gate.
