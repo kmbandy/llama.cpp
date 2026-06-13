@@ -206,15 +206,21 @@ def test_collect_target_hessians_returns_spd_per_target():
 Run: `python -m pytest test_act_replay_cli.py::test_collect_target_hessians_returns_spd_per_target -x -q`
 Expected: FAIL with `ImportError: cannot import name 'collect_target_hessians'`.
 
-- [ ] **Step 3: Implement `collect_target_hessians`**
+> **⚠️ CRITICAL CORRECTNESS REFINEMENT (verified 2026-06-12 — ALL 102 ml8 targets of the 0.8B carry a Kronecker rotation `Q`).** The ml8 weights are rehydrated in the **rotated** space and the forward computes `x_eff = x @ Q` before the GEMM (`act_replay_student.py`, `AttachedTarget._forward`). The GPTQ reconstruction target `W_orig` and the centroids ALSO live in that rotated space. Therefore the Hessian MUST be `XᵀX` of the **post-rotation, pre-quant** activations `x_eff_unquant = x @ Q` — **NOT** the raw linear input `x`. A naive `register_forward_pre_hook` on the host linear captures raw `x` and produces a silently wrong-space `H` (the exact "looks fine, is broken" trap). Two correct options — pick one and TDD it:
+> 1. **Reuse the faithful collector** `faithful_forward.collect_hessians_single_pass` / `FaithfulActHook`, which is purpose-built to capture the rotated faithful Hessian in one pass (preferred — it's already validated for this).
+> 2. **Capture inside `AttachedTarget._forward`** at the post-rotation point: add an opt-in accumulation buffer on `AttachedTarget` that, when enabled, accumulates `x_eff_unquant.T @ x_eff_unquant` for the rotated activation the weights actually consume. (`x_eff_unquant` is the rotated value BEFORE the `quantize_act_per_row` STE — match the space `W_orig` was quantized against.)
+>
+> The CPU TDD test must construct a target WITH a non-identity rotation and assert the collected `H` equals `(x @ Q)ᵀ(x @ Q)` (rotated), and is NOT equal to `xᵀx` (raw) — so the test actually pins the rotated space. The reference code below is the WRONG (raw) version, kept only to show the shape/structure; replace the `x = inp[0]...` capture with the rotated-activation capture per the option chosen.
+
+- [ ] **Step 3: Implement `collect_target_hessians` (rotated-Hessian — see refinement above)**
 
 ```python
+# REFERENCE STRUCTURE ONLY — the `x` capture below is RAW (wrong space). Replace it
+# with the post-rotation activation x_eff_unquant = x @ Q per the refinement note.
 def collect_target_hessians(targets, calib, model, dev):
-    """Per-target static activation Hessian H = (1/N) sum X^T X over calib windows.
-
-    Returns {name: H[K,K] fp32}. Uses forward pre-hooks on each AttachedTarget's
-    host linear to accumulate X^T X of the (faithful) input activations — the same
-    quantity `compute_hessian` collects, batched across all targets in one pass.
+    """Per-target static activation Hessian H = (1/N) sum Xeff^T Xeff over calib
+    windows, where Xeff = x @ Q is the ROTATED (faithful) activation the ml8
+    weights consume. Returns {name: H[K,K] fp32}. One forward pass, all targets.
     """
     import torch
     acc = {n: None for n in targets}
@@ -222,7 +228,7 @@ def collect_target_hessians(targets, calib, model, dev):
     handles = []
     def mk(n):
         def hook(mod, inp):
-            x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()
+            x = inp[0].detach().reshape(-1, inp[0].shape[-1]).float()  # RAW — WRONG; rotate first
             xtx = x.t() @ x
             acc[n] = xtx if acc[n] is None else acc[n] + xtx
             cnt[n] += x.shape[0]
