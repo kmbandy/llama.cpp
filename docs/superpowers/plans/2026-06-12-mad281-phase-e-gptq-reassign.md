@@ -467,3 +467,24 @@ git commit -m "chore(mad281): E.7 retire diagonal pv path (superseded by GPTQ re
 - **Spec coverage:** §4 core component → Task 1 (+anchor) & Task 2; §5 static `H` → Task 3; §6 rung A → Task 5, rung B → Task 6; §8 tests → Tasks 1/2/3/4 (CPU TDD) + Task 5 (GPU integration); §9 deferrals (online `H`, UD comparison, scale-up) → explicitly out; §10 success criteria → Task 1 (equivalence), Task 5 (stable + gate).
 - **Type consistency:** `batched_gptq_reassign(W_stack, H_stack, centroids, scales, *, group_size, percdamp, act_order, chunk_E)` returns `[E,N,K]` int8; `gptq_reassign_targets(targets, H_by_name, *, percdamp, act_order) -> int`; `collect_target_hessians(targets, calib, model, dev) -> {name: H[K,K]}`. Names used consistently across Tasks 1/3/4/5.
 - **Open implementation confirmations flagged inline (not placeholders):** the `AttachedTarget` host-linear attribute name (Task 3) and centroid-sortedness (Task 4) are called out with a concrete fallback in each task.
+
+---
+
+## Status (2026-06-12 night) + revised next steps
+
+**Built (E.1–E.6), committed, on `origin/master`:** `batched_gptq_reassign` (bit-identical anchor), `collect_target_hessians` (rotated faithful `H`), `gptq_reassign_targets`, rung-A `gptq` + rung-B `gptq-interleave` smoke arms, smoke parametrized `--model/--gguf`.
+
+**0.8B verdict:** full-`H` GPTQ reassignment is **stable + correct** (0.0540 vs 0.0531 frozen floor — never diverged, unlike every pv arm) but **inert** here (9457/250M indices changed). Reason: the 0.8B is near-lossless, so Axis A barely moves the centroids → indices stay optimal → nothing to re-solve. **Not a valid test of Axis B's value** (no gap to close).
+
+**4B test (running overnight):** `run_4b_phaseE_chain.sh` = calibrate (`--dense-coverage full --faithful-acts/weights --rotation kronecker`, 200 ml8 + 49 fp8) → `ml8_to_gguf` → smoke `frozen,gptq,gptq-interleave`. AM: read `~/models/act_replay/MAD281_4B_chain.log`.
+
+**E.7 (retire pv): DROPPED.** Keep the working, tested pv path for future use — don't delete working code.
+
+### THE GAP that reframes everything (kmbandy, 2026-06-12)
+The QAT **product loop has never been closed on any model.** Every result is **holdout KL — a training-internal metric.** We have never re-emitted a tuned GGUF, loaded it in llama.cpp, or PPL-gated it. The product is a QAT trainer that outputs an **improved, deployable, PPL-verified** ml8 quant; the loop is **open at the re-emit boundary** everywhere.
+
+### Revised next steps (Phase F — close the product loop)
+1. **Build re-emit:** checkpoint the smoke's tuned centroids/indices for the winning arm → write a deployable GGUF (reuse `ml8_to_gguf` machinery). TDD, supervised.
+2. **Real PPL gate:** `llama-perplexity --kl-divergence` of the re-emitted GGUF vs the bf16 parent (verify ml8 inference dispatch first).
+3. **Close the loop cheaply on the already-calibrated 0.8B first** (fast iteration), then run the genuine end-to-end on the 4B (and eventually 35B-A3B) so the result is a **shippable PPL-gated artifact, not just a KL number.**
+4. **Calibrator bug to fix:** `calibrate_ml8_paged` dense meta-init path doesn't re-tie `lm_head` for tied-embedding models → `--eval-ppl` is garbage (4B baseline printed 248320 not ~8.3). Non-blocking (per-target Y_SNR 27–28 dB proves the blobs are valid); ignore `--eval-ppl`, use `llama-perplexity`.
