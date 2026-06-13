@@ -1174,8 +1174,11 @@ def test_collect_target_hessian_is_rotated_space_not_raw():
     a_dim, b_dim = 8, 16          # a*b = 128 = K; b_dim power of 2
     g = torch.Generator().manual_seed(3)
     state = _mk_state(N=N, K=K, G=G)
-    state["rotation"] = {"h_a": torch.randn(a_dim, a_dim, generator=g),
-                         "a_dim": a_dim, "b_dim": b_dim}
+    h_a, _ = torch.linalg.qr(torch.randn(a_dim, a_dim, generator=g))   # orthogonal a×a
+    # Guard the test's discriminating power: the negative (H != raw) assertion is
+    # only meaningful if Q is genuinely non-identity, regardless of seed.
+    assert (h_a - torch.eye(a_dim)).norm() > 1.0, "rotation too close to identity"
+    state["rotation"] = {"h_a": h_a, "a_dim": a_dim, "b_dim": b_dim}
     at = AttachedTarget(state)
     xs = [torch.randn(1, 5, K, generator=g) for _ in range(3)]   # 3 windows, [B,T,K]
     at.start_hessian_collection()

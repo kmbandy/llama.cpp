@@ -119,6 +119,10 @@ def collect_target_hessians(targets, calib, model, dev):
     CRITICAL: the Hessian is in the ROTATED basis (x @ Q, post-rotation pre-quant)
     because the ml8 weight indices are solved in that rotated basis. Capturing raw
     x would produce a silently wrong-space H — the whole point of this function.
+
+    Memory: each target holds a live [K, K] float32 accumulator (~K²·4 bytes) for
+    the whole pass — ~196 MB at K=7168. For large K or many simultaneous targets,
+    collect in target subgroups rather than all at once.
     """
     for at in targets.values():
         at.start_hessian_collection()
