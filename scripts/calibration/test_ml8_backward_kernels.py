@@ -54,3 +54,27 @@ def test_wgrad_torch_dscales_reshape_is_exact():
     _, dscales_ref = _reference_grads(dW_raw, indices, gidx, cent, scales)
     _, dscales = ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
     assert (dscales - dscales_ref).abs().max().item() < 1e-3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+@pytest.mark.parametrize("N,K,G", [(64, 256, 4), (128, 1024, 8), (256, 1216, 76)])
+def test_wgrad_triton_matches_torch(N, K, G):
+    from ml8_backward_kernels import ml8_wgrad_torch, ml8_wgrad_triton
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(N, K, G, dev, seed=N)
+    dc_t, ds_t = ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
+    dc_k, ds_k = ml8_wgrad_triton(dW_raw, indices, cent, scales, gsz)
+    assert torch.allclose(dc_k, dc_t, atol=2e-2, rtol=2e-2), (dc_k - dc_t).abs().max()
+    assert torch.allclose(ds_k, ds_t, atol=1e-2, rtol=1e-2), (ds_k - ds_t).abs().max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_wgrad_triton_odd_N_masking():
+    """N not a multiple of BLOCK_N must still be exact (masked tail rows)."""
+    from ml8_backward_kernels import ml8_wgrad_torch, ml8_wgrad_triton
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(70, 512, 4, dev, seed=7)
+    dc_t, ds_t = ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
+    dc_k, ds_k = ml8_wgrad_triton(dW_raw, indices, cent, scales, gsz)
+    assert torch.allclose(dc_k, dc_t, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(ds_k, ds_t, atol=1e-2, rtol=1e-2)

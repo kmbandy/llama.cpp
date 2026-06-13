@@ -8,6 +8,8 @@ dscales a plain reshape-sum instead of a scatter. See
 docs/superpowers/specs/2026-06-13-ml8-qat-fused-wgrad-kernel-design.md.
 """
 import torch
+import triton
+import triton.language as tl
 
 
 def ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz):
@@ -40,4 +42,82 @@ def ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz):
     flat_i = idx.reshape(-1)
     dcent = torch.zeros_like(centroids)
     dcent.index_put_((flat_g, flat_i), dW_scaled.reshape(-1), accumulate=True)
+    return dcent, dscales
+
+
+@triton.jit
+def _ml8_wgrad_kernel(
+    dW_ptr, idx_ptr, cent_ptr, scales_ptr,      # inputs
+    dcent_ptr, dscales_ptr,                      # outputs
+    N, K,
+    stride_dw_n, stride_dw_k,
+    stride_idx_n, stride_idx_k,
+    stride_cent_g, stride_cent_c,
+    stride_s_n, stride_s_g,
+    stride_dc_g, stride_dc_c,
+    stride_ds_n, stride_ds_g,
+    GSZ: tl.constexpr,
+    N_CENT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Grid (G, cdiv(N, BLOCK_N)). Program (g, nt) owns rows [nt*BLOCK_N:...]
+    and the contiguous K-slab [g*GSZ:(g+1)*GSZ]. Emits dscales[rows,g] (no
+    atomics) and atomic-adds the 16-bin dcent[g,:] histogram."""
+    g = tl.program_id(0)
+    nt = tl.program_id(1)
+
+    offs_n = nt * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+    offs_k = g * GSZ + tl.arange(0, GSZ)                          # cols of this group
+
+    dw = tl.load(
+        dW_ptr + offs_n[:, None] * stride_dw_n + offs_k[None, :] * stride_dw_k,
+        mask=mask_n[:, None], other=0.0).to(tl.float32)           # [BLOCK_N, GSZ]
+    idx = tl.load(
+        idx_ptr + offs_n[:, None] * stride_idx_n + offs_k[None, :] * stride_idx_k,
+        mask=mask_n[:, None], other=0).to(tl.int32)               # [BLOCK_N, GSZ]
+    scal = tl.load(scales_ptr + offs_n * stride_s_n + g * stride_s_g,
+                   mask=mask_n, other=0.0).to(tl.float32)         # [BLOCK_N]
+
+    dw_scaled = dw * scal[:, None]                                # [BLOCK_N, GSZ]
+    centval = tl.zeros((BLOCK_N, GSZ), dtype=tl.float32)
+    for c in tl.static_range(N_CENT):
+        cent_c = tl.load(cent_ptr + g * stride_cent_g + c * stride_cent_c)  # scalar
+        is_c = idx == c
+        centval = tl.where(is_c, cent_c, centval)
+        bin_sum = tl.sum(tl.where(is_c, dw_scaled, 0.0))         # scalar over tile
+        tl.atomic_add(dcent_ptr + g * stride_dc_g + c * stride_dc_c, bin_sum)
+
+    dscales_row = tl.sum(dw * centval, axis=1)                    # [BLOCK_N]
+    tl.store(dscales_ptr + offs_n * stride_ds_n + g * stride_ds_g,
+             dscales_row, mask=mask_n)
+
+
+def ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz, block_n=64):
+    """Fused Triton wgrad: returns (dcent [G,16], dscales [N,G]) fp32."""
+    N, K = indices.shape
+    G = scales.shape[1]
+    assert K == G * gsz, f"K={K} != G*gsz={G*gsz}"
+    N_CENT = centroids.shape[1]
+    dW_raw = dW_raw.contiguous()
+    indices = indices.contiguous()
+    centroids = centroids.contiguous()
+    scales = scales.contiguous()
+    dcent = torch.zeros_like(centroids)                          # atomic_add target
+    dscales = torch.empty_like(scales)
+    grid = (G, triton.cdiv(N, block_n))
+    _ml8_wgrad_kernel[grid](
+        dW_raw, indices, centroids, scales,
+        dcent, dscales,
+        N, K,
+        dW_raw.stride(0), dW_raw.stride(1),
+        indices.stride(0), indices.stride(1),
+        centroids.stride(0), centroids.stride(1),
+        scales.stride(0), scales.stride(1),
+        dcent.stride(0), dcent.stride(1),
+        dscales.stride(0), dscales.stride(1),
+        GSZ=gsz, N_CENT=N_CENT, BLOCK_N=block_n,
+        num_stages=1,   # gfx1201 RDNA4: num_stages>=2 triggers UAF (forward audit)
+        num_warps=4,
+    )
     return dcent, dscales
