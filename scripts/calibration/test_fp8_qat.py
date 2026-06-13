@@ -141,3 +141,70 @@ def test_fp8fn_backward_skips_stash_when_capture_off():
     assert key not in Ml8Fp8Fn.last_h
     assert at.centroids.grad is not None and torch.isfinite(at.centroids.grad).all()
     assert at.scales.grad is not None and torch.isfinite(at.scales.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_backward_grads_match_scatter_reference():
+    """Ml8Fp8Fn.backward (now kernel-backed) must match the old scatter math."""
+    import torch
+    from fp8_qat import Ml8Fp8Fn, fp8_quant
+    dev = "cuda"
+    N, K, G, M = 32, 256, 4, 48
+    gsz = K // G
+    x8 = (torch.randn(M, K, device=dev) * 0.3).to(torch.float8_e4m3fn)
+    sx = torch.rand(M, 1, device=dev) * 0.01 + 0.01
+    cent = torch.randn(G, 16, device=dev) * 0.1
+    scales = torch.rand(N, G, device=dev) * 0.05 + 0.01
+    indices = torch.randint(0, 16, (N, K), dtype=torch.uint8, device=dev)
+    gidx = (torch.arange(K, device=dev) // gsz).long()
+    dy = torch.randn(M, N, device=dev)
+
+    class Ctx:  # minimal ctx stand-in for backward
+        pass
+    ctx = Ctx()
+    ctx.saved_tensors = (x8, sx, cent, scales, indices, gidx)
+    ctx.indices_id = id(indices)
+    Ml8Fp8Fn.capture_dLdW = False
+    dx, dcent, dscales, _, _ = Ml8Fp8Fn.backward(ctx, dy)
+
+    # Reference: the pre-kernel scatter math.
+    from test_ml8_backward_kernels import _reference_grads
+    dyf = dy
+    dy8, sdy = fp8_quant(dyf, "e5m2")
+    xq = x8.float() * sx
+    dW_raw = (dy8.float() * sdy).t() @ xq
+    dcent_ref, dscales_ref = _reference_grads(dW_raw, indices, gidx, cent, scales)
+    assert torch.allclose(dcent, dcent_ref, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(dscales, dscales_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_backward_capture_dLdW_still_populated():
+    """The pv/Axis-B side channel must still receive dW_raw + h when enabled."""
+    import torch
+    from fp8_qat import Ml8Fp8Fn
+    dev = "cuda"
+    N, K, G, M = 32, 256, 4, 48
+    gsz = K // G
+    x8 = (torch.randn(M, K, device=dev) * 0.3).to(torch.float8_e4m3fn)
+    sx = torch.rand(M, 1, device=dev) * 0.01 + 0.01
+    cent = torch.randn(G, 16, device=dev) * 0.1
+    scales = torch.rand(N, G, device=dev) * 0.05 + 0.01
+    indices = torch.randint(0, 16, (N, K), dtype=torch.uint8, device=dev)
+    gidx = (torch.arange(K, device=dev) // gsz).long()
+    dy = torch.randn(M, N, device=dev)
+
+    class Ctx:
+        pass
+    ctx = Ctx()
+    ctx.saved_tensors = (x8, sx, cent, scales, indices, gidx)
+    ctx.indices_id = id(indices)
+    Ml8Fp8Fn.last_dLdW.clear(); Ml8Fp8Fn.last_h.clear()
+    Ml8Fp8Fn.capture_dLdW = True
+    try:
+        Ml8Fp8Fn.backward(ctx, dy)
+        assert Ml8Fp8Fn.last_dLdW[id(indices)].shape == (N, K)
+        assert Ml8Fp8Fn.last_h[id(indices)].shape == (K,)
+    finally:
+        Ml8Fp8Fn.capture_dLdW = False
+        Ml8Fp8Fn.last_dLdW.clear(); Ml8Fp8Fn.last_h.clear()

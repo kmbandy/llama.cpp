@@ -27,6 +27,7 @@ def pad_to_multiple(x: torch.Tensor, m: int, dim: int = 0):
 
 import ml8_runtime
 from centroid_quantizer import snap_to_e4m3
+from ml8_backward_kernels import ml8_wgrad
 
 
 class Ml8Fp8Fn(torch.autograd.Function):
@@ -113,15 +114,10 @@ class Ml8Fp8Fn(torch.autograd.Function):
             # the token-mean loss convention of dW_raw). pv v2 uses this to make the flip
             # criterion quadratic so argmin lands near the Newton point, not an extreme.
             Ml8Fp8Fn.last_h[ctx.indices_id] = (x * x).mean(dim=0)     # [K]
-        # chain dW_raw -> dcentroids (scatter-add over (group, index)) and -> dscales
-        dW_scaled = dW_raw * scales[:, gidx]                          # dW/dcent path
-        dcent = torch.zeros_like(cent_e4m3)                          # [G,16]
-        flat_g = gidx.unsqueeze(0).expand(N, -1).reshape(-1)         # [N*K]
-        flat_i = indices.long().reshape(-1)
-        dcent.index_put_((flat_g, flat_i), dW_scaled.reshape(-1), accumulate=True)
-        dscales = torch.zeros_like(scales)                          # [N,G]
-        contrib = (dW_raw * W / scales[:, gidx].clamp_min(1e-12))   # d(W)/dscale = cent
-        dscales.index_add_(1, gidx, contrib)                        # sum cols per group
+        # Fused wgrad: dcent[G,16] + dscales[N,G] from dW_raw + indices, no dense
+        # W-scatter. gsz = K // G; groups are contiguous (gidx == arange(K)//gsz).
+        gsz = K // scales.shape[1]
+        dcent, dscales = ml8_wgrad(dW_raw, indices, cent_e4m3, scales, gsz)
         return (dx.reshape(dy.shape[:-1] + (K,)), dcent, dscales, None, None)
 
 
