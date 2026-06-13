@@ -83,7 +83,7 @@ def pick_gfx1201():
 
 
 def main():
-    global MODEL, GGUF   # allow --model/--gguf to override the module defaults
+    global MODEL, GGUF, LR_CENT, LR_SCALE, WARMUP, N_WIN, LOSS_SCALE   # CLI overrides
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="frozen,mse,pv",
@@ -102,6 +102,19 @@ def main():
                          "memory; the MAD-264 peak-VRAM-prop-tokens lever). Holdout eval "
                          "keeps the full --seq-len, so the verdict metric is unaffected. "
                          "None = no chunking (fits small models at full length).")
+    ap.add_argument("--lr-cent", type=float, default=LR_CENT,
+                    help="Axis-A centroid LR. Default (2e-4) was tuned on the 0.8B; a "
+                         "bigger model with a larger PTQ gap overshoots at the warmup "
+                         "peak — lower it (e.g. 5e-5) for the 4B (MAD-283).")
+    ap.add_argument("--lr-scale", type=float, default=LR_SCALE, help="Axis-A scale LR")
+    ap.add_argument("--warmup-steps", type=int, default=WARMUP,
+                    help="linear LR warmup steps before cosine decay")
+    ap.add_argument("--n-win", type=int, default=N_WIN,
+                    help="total calib windows (train = n_win - n_hold). More windows = "
+                         "more data for the trainer to actually descend below the PTQ "
+                         "floor (MAD-283: small regimes only break-even).")
+    ap.add_argument("--loss-scale", type=float, default=LOSS_SCALE,
+                    help="Ml8Fp8Fn.loss_scale (gradient scaling)")
     args = ap.parse_args()
     ARMS = [a.strip() for a in args.arms.split(",") if a.strip()]
     # W_orig (the [N,K] fp32 mse/pv reassign anchor) summed over all ml8 targets is
@@ -113,6 +126,8 @@ def main():
     STEPS = args.steps
     MODEL = args.model      # shadow module defaults so the harness runs on any size (e.g. 4B)
     GGUF = args.gguf
+    LR_CENT = args.lr_cent; LR_SCALE = args.lr_scale; WARMUP = args.warmup_steps
+    N_WIN = args.n_win; LOSS_SCALE = args.loss_scale
 
     dev = pick_gfx1201()
     print(f"[dev] {dev}  loss_scale={LOSS_SCALE}  arms={ARMS} pv_fracs={PV_FRACS} "
