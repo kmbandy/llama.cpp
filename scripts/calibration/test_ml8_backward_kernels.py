@@ -78,3 +78,31 @@ def test_wgrad_triton_odd_N_masking():
     dc_k, ds_k = ml8_wgrad_triton(dW_raw, indices, cent, scales, gsz)
     assert torch.allclose(dc_k, dc_t, atol=2e-2, rtol=2e-2)
     assert torch.allclose(ds_k, ds_t, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_dispatch_env_forces_backend(monkeypatch):
+    import ml8_backward_kernels as M
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(64, 256, 4, dev)
+    dc_ref, ds_ref = M.ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
+    for backend in ("torch", "triton"):
+        monkeypatch.setenv("ML8_WGRAD_BACKEND", backend)
+        M._BACKEND_CACHE = None  # reset memoized choice
+        dc, ds = M.ml8_wgrad(dW_raw, indices, cent, scales, gsz)
+        assert torch.allclose(dc, dc_ref, atol=2e-2, rtol=2e-2)
+        assert torch.allclose(ds, ds_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_dispatch_auto_picks_a_valid_backend(monkeypatch):
+    import ml8_backward_kernels as M
+    monkeypatch.delenv("ML8_WGRAD_BACKEND", raising=False)
+    M._BACKEND_CACHE = None
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(64, 256, 4, dev)
+    dc_ref, ds_ref = M.ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
+    dc, ds = M.ml8_wgrad(dW_raw, indices, cent, scales, gsz)
+    assert M._BACKEND_CACHE in ("torch", "triton")
+    assert torch.allclose(dc, dc_ref, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(ds, ds_ref, atol=1e-2, rtol=1e-2)

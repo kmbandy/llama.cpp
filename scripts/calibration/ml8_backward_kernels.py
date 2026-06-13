@@ -121,3 +121,40 @@ def ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz, block_n=64):
         num_warps=4,
     )
     return dcent, dscales
+
+
+import os
+
+_BACKEND_CACHE = None   # memoized backend choice ("torch" | "triton")
+
+
+def _probe_backend(dW_raw, indices, centroids, scales, gsz):
+    """One-time choice. Env override wins; else time both on the live shape and
+    pick the faster, falling back to torch if the kernel errors."""
+    forced = os.environ.get("ML8_WGRAD_BACKEND")
+    if forced in ("torch", "triton"):
+        return forced
+    import time
+    def _t(fn):
+        for _ in range(3):
+            fn()
+        torch.cuda.synchronize(); s = time.perf_counter()
+        for _ in range(10):
+            fn()
+        torch.cuda.synchronize(); return time.perf_counter() - s
+    try:
+        t_tri = _t(lambda: ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz))
+    except Exception:
+        return "torch"
+    t_tor = _t(lambda: ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz))
+    return "triton" if t_tri < t_tor else "torch"
+
+
+def ml8_wgrad(dW_raw, indices, centroids, scales, gsz):
+    """Dispatch to the chosen backend (memoized after first call)."""
+    global _BACKEND_CACHE
+    if _BACKEND_CACHE is None:
+        _BACKEND_CACHE = _probe_backend(dW_raw, indices, centroids, scales, gsz)
+    if _BACKEND_CACHE == "triton":
+        return ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz)
+    return ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz)
