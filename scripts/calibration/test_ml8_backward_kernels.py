@@ -106,3 +106,38 @@ def test_dispatch_auto_picks_a_valid_backend(monkeypatch):
     assert M._BACKEND_CACHE in ("torch", "triton")
     assert torch.allclose(dc, dc_ref, atol=2e-2, rtol=2e-2)
     assert torch.allclose(ds, ds_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_dispatch_prefers_triton_on_real_shape(monkeypatch):
+    """The probe must not let a per-shape timing race lock the multi-shape
+    training loop to the slow path: triton wins on every real ml8 shape, so the
+    auto choice should be triton whenever the kernel runs without error."""
+    import ml8_backward_kernels as M
+    monkeypatch.delenv("ML8_WGRAD_BACKEND", raising=False)
+    M._BACKEND_CACHE = None
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(64, 256, 4, dev)
+    M.ml8_wgrad(dW_raw, indices, cent, scales, gsz)
+    assert M._BACKEND_CACHE == "triton"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_dispatch_falls_back_and_warns_when_triton_raises(monkeypatch):
+    """A kernel failure must fall back to torch AND surface a warning, never
+    silently degrade to the slow path with no signal."""
+    import ml8_backward_kernels as M
+    monkeypatch.delenv("ML8_WGRAD_BACKEND", raising=False)
+    M._BACKEND_CACHE = None
+    dev = "cuda"
+    dW_raw, indices, gidx, cent, scales, gsz = _mk_case(64, 256, 4, dev)
+    dc_ref, ds_ref = M.ml8_wgrad_torch(dW_raw, indices, cent, scales, gsz)
+
+    def _boom(*a, **k):
+        raise RuntimeError("simulated kernel failure")
+    monkeypatch.setattr(M, "ml8_wgrad_triton", _boom)
+    with pytest.warns(RuntimeWarning):
+        dc, ds = M.ml8_wgrad(dW_raw, indices, cent, scales, gsz)
+    assert M._BACKEND_CACHE == "torch"
+    assert torch.allclose(dc, dc_ref, atol=2e-2, rtol=2e-2)
+    assert torch.allclose(ds, ds_ref, atol=1e-2, rtol=1e-2)

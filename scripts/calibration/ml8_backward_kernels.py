@@ -7,6 +7,9 @@ ml8 groups are CONTIGUOUS K-blocks (gidx == arange(K)//gsz), which is what makes
 dscales a plain reshape-sum instead of a scatter. See
 docs/superpowers/specs/2026-06-13-ml8-qat-fused-wgrad-kernel-design.md.
 """
+import os
+import warnings
+
 import torch
 import triton
 import triton.language as tl
@@ -123,31 +126,30 @@ def ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz, block_n=64):
     return dcent, dscales
 
 
-import os
-
 _BACKEND_CACHE = None   # memoized backend choice ("torch" | "triton")
 
 
 def _probe_backend(dW_raw, indices, centroids, scales, gsz):
-    """One-time choice. Env override wins; else time both on the live shape and
-    pick the faster, falling back to torch if the kernel errors."""
+    """One-time backend choice (memoized in _BACKEND_CACHE).
+
+    The fused Triton kernel beats the torch scatter on every real ml8 shape
+    (39-49x; see bench_ml8_wgrad.py), so prefer it whenever it runs without
+    error. We deliberately do NOT time-race the two backends per-shape: the
+    trainer calls ml8_wgrad across many shapes per micro, and a timing race
+    decided on the first (possibly tiny) layer could lock the whole loop to the
+    slow path. Env ML8_WGRAD_BACKEND={torch,triton} overrides; a kernel failure
+    falls back to torch but warns (never silently degrades)."""
     forced = os.environ.get("ML8_WGRAD_BACKEND")
     if forced in ("torch", "triton"):
         return forced
-    import time
-    def _t(fn):
-        for _ in range(3):
-            fn()
-        torch.cuda.synchronize(); s = time.perf_counter()
-        for _ in range(10):
-            fn()
-        torch.cuda.synchronize(); return time.perf_counter() - s
     try:
-        t_tri = _t(lambda: ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz))
-    except Exception:
+        ml8_wgrad_triton(dW_raw, indices, centroids, scales, gsz)
+        return "triton"
+    except Exception as e:
+        warnings.warn(
+            f"ml8_wgrad: Triton kernel failed ({type(e).__name__}: {e}); "
+            f"falling back to the slower torch wgrad path.", RuntimeWarning)
         return "torch"
-    t_tor = _t(lambda: ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz))
-    return "triton" if t_tri < t_tor else "torch"
 
 
 def ml8_wgrad(dW_raw, indices, centroids, scales, gsz):
