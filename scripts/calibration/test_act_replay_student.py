@@ -233,6 +233,30 @@ def test_attach_one_input_reorder_routes_to_activation_perm():
     assert torch.equal(at.col_perm.cpu(), torch.argsort(index))
 
 
+def test_keep_w_orig_false_skips_anchor():
+    """W_orig (the [N,K] fp32 mse/pv reassign anchor) summed over all ml8 targets is
+    ~the whole model in fp32 — a major VRAM cost that OOM'd the 4B smoke. Arms that
+    never run the mse/pv E-step (frozen / gptq / gptq-interleave) must be able to
+    skip it: keep_w_orig=False -> at.W_orig is None, and the dequant forward stays
+    bit-exact (W_orig is only an mse anchor, never used in the forward path)."""
+    t = _mk_state()
+    lin = nn.Linear(128, 8, bias=False)
+    at = attach_to_linear(lin, t, keep_w_orig=False)
+    assert at.W_orig is None
+    W = _ref_weight(t)
+    x = torch.randn(3, 128)
+    assert torch.equal(lin(x), x @ W.t())
+
+
+def test_keep_w_orig_default_true_preserves_anchor():
+    """Default (keep_w_orig unset) still captures the W_orig anchor — the mse/pv
+    reassign path depends on it, so the default must not regress."""
+    t = _mk_state()
+    lin = nn.Linear(128, 8, bias=False)
+    at = attach_to_linear(lin, t)
+    assert at.W_orig is not None and at.W_orig.shape == t["indices"].shape
+
+
 def test_attach_rotation_dim_mismatch_raises():
     """attach_to_linear must raise ValueError when rotation a_dim*b_dim != in_features."""
     t = _mk_state(N=8, K=128)

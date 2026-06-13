@@ -55,7 +55,7 @@ class AttachedTarget(nn.Module):
     ml8 tensors) and promoted to long transiently inside weight() for gather().
     """
 
-    def __init__(self, target: dict):
+    def __init__(self, target: dict, keep_w_orig: bool = True):
         super().__init__()
         indices = target["indices"].to(torch.uint8)
         centroids = target["centroids"].to(torch.float32).clone()
@@ -72,8 +72,14 @@ class AttachedTarget(nn.Module):
         self.register_buffer("indices", indices)   # [N, K] long, frozen
         self.register_buffer("gidx", _gidx_for(K, G, indices.device))  # [K] long
 
-        # Frozen anchor: initial bf16 ml8 dequant for the mse E-step index-reassign.
-        self.register_buffer("W_orig", self.weight().detach().clone())  # [N, K]
+        # Frozen anchor: initial bf16 ml8 dequant for the mse/pv E-step index-
+        # reassign. Summed over all ml8 targets this is ~the whole model in fp32, so
+        # arms that never run mse/pv (frozen / gptq / gptq-interleave) skip it via
+        # keep_w_orig=False to avoid the large VRAM cost (it OOM'd the 4B smoke).
+        if keep_w_orig:
+            self.register_buffer("W_orig", self.weight().detach().clone())  # [N, K]
+        else:
+            self.W_orig = None
 
         # Optional deployment-faithful rotation (W4A8 activation path).
         rot = target.get("rotation")
@@ -200,7 +206,8 @@ class AttachedTarget(nn.Module):
 
 def attach_to_linear(lin: nn.Linear, target: dict,
                      faithful_acts: bool | None = None,
-                     fp8: bool = False) -> AttachedTarget:
+                     fp8: bool = False,
+                     keep_w_orig: bool = True) -> AttachedTarget:
     """Wrap `lin` so its forward uses the ml8 dequant-STE weight (and, when a
     rotation is present and faithful_acts is on, the W4A8 activation path).
 
@@ -211,7 +218,7 @@ def attach_to_linear(lin: nn.Linear, target: dict,
     faithful_acts: None (default) -> auto: on iff the target carries a rotation.
                    True/False     -> explicit override.
     """
-    at = AttachedTarget(target)
+    at = AttachedTarget(target, keep_w_orig=keep_w_orig)
 
     if at.rotation is not None:
         rot = target["rotation"]

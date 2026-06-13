@@ -72,6 +72,10 @@ def main():
     ap.add_argument("--gguf", default=GGUF, help="rotated/faithful ml8 GGUF to rehydrate")
     args = ap.parse_args()
     ARMS = [a.strip() for a in args.arms.split(",") if a.strip()]
+    # W_orig (the [N,K] fp32 mse/pv reassign anchor) summed over all ml8 targets is
+    # ~the whole model in fp32 — it OOM'd the 4B on the 32GB R9700. Only the mse/pv
+    # arms use it; frozen/gptq/gptq-interleave don't, so skip it unless asked for.
+    NEEDS_W_ORIG = any(a in ("mse", "pv") for a in ARMS)
     PV_FRACS = [float(x) for x in args.pv_fracs.split(",") if x.strip()]
     EVAL_INTERVAL = max(1, args.eval_interval)
     STEPS = args.steps
@@ -116,7 +120,8 @@ def main():
     for kind, name, payload in stream:
         if kind == "ml8":
             if name in selected:
-                targets[name] = _attach_one(modules, name, payload, mcfg, fp8=True)
+                targets[name] = _attach_one(modules, name, payload, mcfg, fp8=True,
+                                            keep_w_orig=NEEDS_W_ORIG)
         else:
             n_fp8 += _install_one(modules, name, payload, map_gguf_to_hf, dev,
                                   torch.bfloat16, mcfg, warn)
