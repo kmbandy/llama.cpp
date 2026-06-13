@@ -139,6 +139,9 @@ def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
     Builds E=1 stacks and calls batched_gptq_reassign. Targets without a stashed H
     are skipped. Returns the total number of index entries changed.
 
+    NOTE: `targets` is a dict {name: AttachedTarget} (names index into H_by_name) —
+    NOT a list like the sibling reassign_targets takes.
+
     W_orig, the rotated Hessian H, and the centroids all live in the SAME rotated
     basis — no rotation handling is needed here. Reassigns against the SNAPPED
     centroids (the actual e4m3 LUT values the forward/kernel uses), matching the
