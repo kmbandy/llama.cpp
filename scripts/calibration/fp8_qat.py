@@ -49,6 +49,12 @@ class Ml8Fp8Fn(torch.autograd.Function):
     loss_scale = 1.0           # set by the trainer
     last_dLdW = {}             # side-channel: id(indices) -> dL/dW_raw (for Axis B)
     last_h = {}                # side-channel: id(indices) -> diag curvature h_k=E[x_k^2]
+    # Each stashed dL/dW is a DENSE [N,K] fp32 tensor; populated every backward across
+    # all targets it hoards ~the whole model in fp32 (~14GB on the 4B) in module state
+    # autograd can't free — it OOM'd the 4B. Only the pv reassign path (and the pv
+    # diagnostic) consume it, so capture is OFF by default; the trainer sets it True
+    # only for a pv run. frozen/gptq/mse never read it.
+    capture_dLdW = False
 
     @staticmethod
     def forward(ctx, x, centroids, scales, indices, gidx):
@@ -97,11 +103,16 @@ class Ml8Fp8Fn(torch.autograd.Function):
         x = (x8.float() * sx)                                         # dequant acts [M,K]
         dx = (dy8.float() * sdy) @ W                                  # [M,K]
         dW_raw = (dy8.float() * sdy).t() @ x                          # [N,K]
-        Ml8Fp8Fn.last_dLdW[ctx.indices_id] = dW_raw                   # Axis B taps this
-        # Diagonal GPTQ curvature h_k = E[x_k^2] (mean over the M batch rows, matching
-        # the token-mean loss convention of dW_raw). Axis B pv v2 uses this to make the
-        # flip criterion quadratic so argmin lands near the Newton point, not an extreme.
-        Ml8Fp8Fn.last_h[ctx.indices_id] = (x * x).mean(dim=0)         # [K]
+        # Axis-B (pv) side channel — see capture_dLdW note above. OFF by default so
+        # these dense [N,K] fp32 tensors are NOT retained in module state across layers
+        # (that hoard is what OOM'd the 4B). dW_raw itself is still computed (transient)
+        # for the dcent/dscales gradient below and freed when this layer's backward ends.
+        if Ml8Fp8Fn.capture_dLdW:
+            Ml8Fp8Fn.last_dLdW[ctx.indices_id] = dW_raw               # Axis B taps this
+            # Diagonal GPTQ curvature h_k = E[x_k^2] (mean over the M batch rows, matching
+            # the token-mean loss convention of dW_raw). pv v2 uses this to make the flip
+            # criterion quadratic so argmin lands near the Newton point, not an extreme.
+            Ml8Fp8Fn.last_h[ctx.indices_id] = (x * x).mean(dim=0)     # [K]
         # chain dW_raw -> dcentroids (scatter-add over (group, index)) and -> dscales
         dW_scaled = dW_raw * scales[:, gidx]                          # dW/dcent path
         dcent = torch.zeros_like(cent_e4m3)                          # [G,16]

@@ -90,6 +90,7 @@ def test_fp8fn_backward_matches_ste_grads():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
 def test_fp8fn_backward_stashes_dLdW_by_indices_id():
     dev = "cuda"
+    Ml8Fp8Fn.capture_dLdW = True               # opt in to the pv side channel
     at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
     x = torch.randn(16, 128, device=dev) * 0.3
     y = Ml8Fp8Fn.apply(x, at.centroids, at.scales, at.indices, at.gidx)
@@ -97,6 +98,7 @@ def test_fp8fn_backward_stashes_dLdW_by_indices_id():
     key = id(at.indices)
     assert key in Ml8Fp8Fn.last_dLdW
     assert Ml8Fp8Fn.last_dLdW[key].shape == at.indices.shape   # [N,K]
+    Ml8Fp8Fn.capture_dLdW = False              # restore default for other tests
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
@@ -104,6 +106,7 @@ def test_fp8fn_backward_stashes_curvature_h_by_indices_id():
     # D.1: backward stashes per-input-column GPTQ Hessian diagonal h_k = E[x_k^2]
     # (mean over the M batch rows, matching the token-mean loss convention of g).
     dev = "cuda"
+    Ml8Fp8Fn.capture_dLdW = True               # opt in to the pv side channel
     at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
     K = at.indices.shape[1]                          # 128
     x = torch.randn(16, K, device=dev) * 0.1
@@ -117,3 +120,24 @@ def test_fp8fn_backward_stashes_curvature_h_by_indices_id():
     assert torch.isfinite(h).all() and (h >= 0).all()
     # h tracks per-column second moment: high-energy half >> low-energy half
     assert h[K // 2:].mean() > h[:K // 2].mean() * 10
+    Ml8Fp8Fn.capture_dLdW = False              # restore default for other tests
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_backward_skips_stash_when_capture_off():
+    """The [N,K] fp32 dL/dW stash is an Axis-B (pv) side channel that, populated every
+    backward across all targets, hoards ~the whole model in fp32 in module state
+    autograd can't free (it OOM'd the 4B). It MUST be off by default: capture_dLdW=False
+    -> last_dLdW/last_h are not populated, yet centroid/scale grads are still computed."""
+    dev = "cuda"
+    Ml8Fp8Fn.last_dLdW.clear(); Ml8Fp8Fn.last_h.clear()
+    Ml8Fp8Fn.capture_dLdW = False                     # the default
+    at = AttachedTarget(_mk_state(N=32, K=128, G=2)).to(dev)
+    x = torch.randn(16, 128, device=dev) * 0.3
+    y = Ml8Fp8Fn.apply(x, at.centroids, at.scales, at.indices, at.gidx)
+    y.sum().backward()
+    key = id(at.indices)
+    assert key not in Ml8Fp8Fn.last_dLdW              # not hoarded
+    assert key not in Ml8Fp8Fn.last_h
+    assert at.centroids.grad is not None and torch.isfinite(at.centroids.grad).all()
+    assert at.scales.grad is not None and torch.isfinite(at.scales.grad).all()

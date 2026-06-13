@@ -68,6 +68,7 @@ def main():
 
     # one real backward (bf16 teacher vs quantized student) to populate g and h
     model.train()
+    Ml8Fp8Fn.capture_dLdW = True       # this diagnostic reads the pv dL/dW side channel
     lg = wrapped(ids)
     m = batch_response_mask(ids, *resp).reshape(-1).to(dev)
     loss = kl_topk(lg.reshape(-1, lg.shape[-1]), *teach, mask=m)

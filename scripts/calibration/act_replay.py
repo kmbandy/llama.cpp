@@ -957,6 +957,9 @@ def train(model, teacher, batches, train_idx, hold_idx, optimizer,
         eval_batches = batches
     model.train()
     Ml8Fp8Fn.loss_scale = loss_scale
+    # Only pv reassign reads the dense [N,K] dL/dW side channel; capturing it otherwise
+    # hoards ~the whole model in fp32 in module state (OOM risk). Enable only for pv.
+    Ml8Fp8Fn.capture_dLdW = (reassign_mode == "pv")
     base_lrs = [g["lr"] for g in optimizer.param_groups]
     step = start_step
     micro = 0

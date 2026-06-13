@@ -161,6 +161,9 @@ def main():
         model.train()
         k0 = holdout_kl()
         print(f"\n=== ARM {label}  (reassign={reassign_mode} frac={reassign_frac:g}) ===", flush=True)
+        # Only the pv reassign path reads the dense [N,K] dL/dW side channel; capturing
+        # it otherwise hoards ~the whole model in fp32 (OOM'd the 4B). Off for all else.
+        Ml8Fp8Fn.capture_dLdW = (reassign_mode == "pv")
         print(f"{'step':>4} {'holdoutKL':>10} {'lr_c':>9} {'flips':>10}", flush=True)
         print(f"{0:>4} {k0:>10.4f} {'-':>9} {'-':>10}", flush=True)
         micro = step = 0; opt.zero_grad(); t0 = time.time(); kf = k0
