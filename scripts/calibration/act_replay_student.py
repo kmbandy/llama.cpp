@@ -207,7 +207,8 @@ class AttachedTarget(nn.Module):
 def attach_to_linear(lin: nn.Linear, target: dict,
                      faithful_acts: bool | None = None,
                      fp8: bool = False,
-                     keep_w_orig: bool = True) -> AttachedTarget:
+                     keep_w_orig: bool = True,
+                     free_host_weight: bool = False) -> AttachedTarget:
     """Wrap `lin` so its forward uses the ml8 dequant-STE weight (and, when a
     rotation is present and faithful_acts is on, the W4A8 activation path).
 
@@ -259,6 +260,14 @@ def attach_to_linear(lin: nn.Linear, target: dict,
         return F.linear(x_eff, w, b)
 
     lin.forward = _forward  # type: ignore[assignment]
+    if free_host_weight:
+        # The host bf16 weight is DEAD after this patch: _forward computes the output
+        # from the ml8 dequant (at.weight()) or the fp8 engine, never lin.weight. Keeping
+        # it double-stores the model (bf16 + ml8) — ~7GB on the 4B. Release it, leaving a
+        # 0-element Parameter so `.weight` still exists for any incidental attribute read.
+        # (Caller should empty_cache() once after the rehydrate sweep to free the blocks.)
+        lin.weight = nn.Parameter(
+            torch.empty(0, device=at.indices.device), requires_grad=False)
     return at
 
 

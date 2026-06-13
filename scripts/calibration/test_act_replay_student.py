@@ -233,6 +233,30 @@ def test_attach_one_input_reorder_routes_to_activation_perm():
     assert torch.equal(at.col_perm.cpu(), torch.argsort(index))
 
 
+def test_free_host_weight_releases_dead_bf16():
+    """The host nn.Linear.weight is DEAD after attach — the patched forward uses the
+    ml8 dequant (or fp8 engine), never lin.weight. Measured on the 4B: keeping it
+    double-stores the model (bf16 + ml8) = ~7GB wasted. free_host_weight=True releases
+    it (0-element Parameter) and the forward stays bit-exact via the ml8 dequant."""
+    t = _mk_state()
+    lin = nn.Linear(128, 8, bias=False)
+    W = _ref_weight(t)
+    x = torch.randn(3, 128)
+    expected = x @ W.t()
+    at = attach_to_linear(lin, t, free_host_weight=True)
+    assert lin.weight.numel() == 0              # dead bf16 weight released
+    assert torch.equal(lin(x), expected)        # forward still exact via ml8 dequant
+
+
+def test_free_host_weight_default_keeps_weight():
+    """Default keeps the host weight intact (preserves callers/tests that inspect it)."""
+    t = _mk_state()
+    lin = nn.Linear(128, 8, bias=False)
+    w0 = lin.weight.detach().clone()
+    attach_to_linear(lin, t)
+    assert lin.weight.numel() == 128 * 8 and torch.equal(lin.weight.detach(), w0)
+
+
 def test_keep_w_orig_false_skips_anchor():
     """W_orig (the [N,K] fp32 mse/pv reassign anchor) summed over all ml8 targets is
     ~the whole model in fp32 — a major VRAM cost that OOM'd the 4B smoke. Arms that

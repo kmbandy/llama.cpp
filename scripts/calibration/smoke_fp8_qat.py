@@ -29,12 +29,21 @@ sys.path.insert(0, ".")
 from transformers import AutoTokenizer
 from act_replay import (load_hf_model, _LMWrap, _attach_one, _install_one,
                         map_gguf_to_hf, assistant_delimiters, batch_response_mask,
-                        reassign_targets, lr_warmup_cosine,
+                        reassign_targets, lr_warmup_cosine, split_batches_seq,
                         collect_target_hessians, gptq_reassign_targets)
 from act_replay_student import select_targets
 from gguf_state import open_ml8_gguf, list_ml8_names
 from kl_loss import topk_teacher, kl_topk
 from fp8_qat import Ml8Fp8Fn
+
+def _mem(tag):
+    """VRAM breakdown probe: current allocated, reserved, and running peak."""
+    import torch
+    a = torch.cuda.memory_allocated() / 1e9
+    r = torch.cuda.memory_reserved() / 1e9
+    p = torch.cuda.max_memory_allocated() / 1e9
+    print(f"[mem] {tag:30s} alloc={a:6.2f}  reserved={r:6.2f}  peak={p:6.2f} GB", flush=True)
+
 
 MODEL = "/home/kmbandy/models/Qwen3.5-0.8B-hf"
 GGUF = "/home/kmbandy/models/act_replay/Qwen3.5-0.8B-ml8.gguf"   # A-cell ml8+fp8
@@ -70,6 +79,11 @@ def main():
     ap.add_argument("--steps", type=int, default=MAX_STEPS)
     ap.add_argument("--model", default=MODEL, help="bf16 HF model dir (teacher + host)")
     ap.add_argument("--gguf", default=GGUF, help="rotated/faithful ml8 GGUF to rehydrate")
+    ap.add_argument("--train-seq-len", type=int, default=None,
+                    help="chunk TRAIN windows to this length (caps per-step activation "
+                         "memory; the MAD-264 peak-VRAM-prop-tokens lever). Holdout eval "
+                         "keeps the full --seq-len, so the verdict metric is unaffected. "
+                         "None = no chunking (fits small models at full length).")
     args = ap.parse_args()
     ARMS = [a.strip() for a in args.arms.split(",") if a.strip()]
     # W_orig (the [N,K] fp32 mse/pv reassign anchor) summed over all ml8 targets is
@@ -96,12 +110,24 @@ def main():
     wins = [(b if b.dim() == 2 else b.unsqueeze(0)).to(dev) for b in raw][:N_WIN]
     n_masked = sum(int(batch_response_mask(w, *resp).sum() > 0) for w in wins)
     train_w, hold_w = wins[:-N_HOLD], wins[-N_HOLD:]
+    # Token-bounding lever (the 4B-on-32GB knob, mirroring act_replay --train-seq-len /
+    # the MAD-264 peak-VRAM-prop-tokens result): tile each TRAIN window into shorter
+    # windows BEFORE the teacher pass so the per-step forward+backward activation graph
+    # is bounded. Done pre-teacher so each window's top-K teacher matches it. Holdout
+    # stays full --seq-len (eval/verdict unaffected).
+    if args.train_seq_len:
+        n_before = len(train_w)
+        train_w, _ = split_batches_seq(
+            train_w, torch.arange(len(train_w)), args.train_seq_len)
+        print(f"[data] train windows tiled {n_before} -> {len(train_w)} "
+              f"@ seq_len {args.train_seq_len} (holdout stays {SEQ})", flush=True)
     print(f"[data] {len(train_w)} train + {len(hold_w)} holdout; "
           f"{n_masked}/{len(wins)} have assistant spans", flush=True)
 
     print("[load] bf16 0.8B...", flush=True)
     model = load_hf_model(MODEL, dev, grad_ckpt=True)
     wrapped = _LMWrap(model, dev)
+    _mem("after model load (bf16 student)")
 
     print("[teacher] bf16 top-K (captured pre-quant = lossless teacher)...", flush=True)
     teach_tr, teach_ho = [], []
@@ -111,6 +137,7 @@ def main():
         for ids in hold_w:
             lg = wrapped(ids); teach_ho.append(topk_teacher(lg.reshape(-1, lg.shape[-1]), K)); del lg
     torch.cuda.empty_cache()
+    _mem("after teacher pass (+top-K cache)")
 
     print("[rehydrate] A-cell ml8 + fp8 (fp8 engine attached)...", flush=True)
     modules = dict(model.named_modules()); mcfg = getattr(model, "config", None)
@@ -121,19 +148,25 @@ def main():
         if kind == "ml8":
             if name in selected:
                 targets[name] = _attach_one(modules, name, payload, mcfg, fp8=True,
-                                            keep_w_orig=NEEDS_W_ORIG)
+                                            keep_w_orig=NEEDS_W_ORIG,
+                                            free_host_weight=True)
         else:
             n_fp8 += _install_one(modules, name, payload, map_gguf_to_hf, dev,
                                   torch.bfloat16, mcfg, warn)
         del payload
     print(f"[rehydrate] {len(targets)} ml8 (fp8 fwd+bwd), {n_fp8} fp8-tier", flush=True)
+    torch.cuda.empty_cache()   # release the freed dead bf16 ml8-layer weights
+    _mem("after rehydrate (+ml8 buffers)")
 
     tlist = list(targets.values())
     cent = [at.centroids for at in tlist]
     scl = [at.scales for at in tlist]
     # snapshot for arm reset — INCLUDING indices (mse/pv mutate them in place)
     init_cs = [p.detach().clone() for p in cent + scl]
-    init_idx = [at.indices.detach().clone() for at in tlist]
+    # Arm-reset snapshot of all 200 targets' indices — keep it on the HOST, not VRAM
+    # (it's ~3.5GB of uint8 on the 4B, only touched between arms; restore() copies it
+    # back H2D). Saves that VRAM from the per-step training budget.
+    init_idx = [at.indices.detach().cpu() for at in tlist]
 
     def restore():
         with torch.no_grad():
@@ -167,6 +200,8 @@ def main():
         print(f"{'step':>4} {'holdoutKL':>10} {'lr_c':>9} {'flips':>10}", flush=True)
         print(f"{0:>4} {k0:>10.4f} {'-':>9} {'-':>10}", flush=True)
         micro = step = 0; opt.zero_grad(); t0 = time.time(); kf = k0
+        torch.cuda.reset_peak_memory_stats(); _mem("arm resident (pre-train)")
+        _probed = [False]
         gptq_H = {"H": None}   # rung B: rotated Hessian, collected once, reused per re-solve
         while step < max_steps:
             for ids, (idx, vals, tail) in zip(train_w, teach_tr):
@@ -174,6 +209,8 @@ def main():
                 m = batch_response_mask(ids, *resp).reshape(-1).to(dev)
                 loss = kl_topk(lg.reshape(-1, lg.shape[-1]), idx, vals, tail, mask=m) / GRAD_ACCUM
                 loss.backward(); del loss, lg, m
+                if not _probed[0]:
+                    _mem("after 1st fwd+bwd (PEAK)"); _probed[0] = True
                 micro += 1
                 if micro % GRAD_ACCUM == 0:
                     mult = lr_warmup_cosine(step + 1, WARMUP, max_steps)

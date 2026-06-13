@@ -766,7 +766,7 @@ def attach_targets(model_named_modules, state, train, skip, model_config=None,
 
 
 def _attach_one(modules, gguf_name, entry, model_config=None, fp8: bool = False,
-                keep_w_orig: bool = True):
+                keep_w_orig: bool = True, free_host_weight: bool = False):
     """Attach ONE ml8 entry to its host linear; returns the AttachedTarget.
 
     Applies the linear-attn V-head reorder inversion when model_config is given
@@ -797,7 +797,8 @@ def _attach_one(modules, gguf_name, entry, model_config=None, fp8: bool = False,
             entry["col_perm"] = torch.argsort(index)
         else:
             entry = _apply_perm_to_ml8_entry(entry, perm)  # axis-0 row reorder / None
-    return attach_to_linear(modules[hf_path], entry, fp8=fp8, keep_w_orig=keep_w_orig)
+    return attach_to_linear(modules[hf_path], entry, fp8=fp8, keep_w_orig=keep_w_orig,
+                            free_host_weight=free_host_weight)
 
 
 def install_frozen_fp8(model, frozen, map_fn, device, dtype, model_config=None):
