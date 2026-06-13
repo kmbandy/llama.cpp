@@ -29,7 +29,8 @@ sys.path.insert(0, ".")
 from transformers import AutoTokenizer
 from act_replay import (load_hf_model, _LMWrap, _attach_one, _install_one,
                         map_gguf_to_hf, assistant_delimiters, batch_response_mask,
-                        reassign_targets, lr_warmup_cosine)
+                        reassign_targets, lr_warmup_cosine,
+                        collect_target_hessians, gptq_reassign_targets)
 from act_replay_student import select_targets
 from gguf_state import open_ml8_gguf, list_ml8_names
 from kl_loss import topk_teacher, kl_topk
@@ -58,7 +59,8 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="frozen,mse,pv",
-                    help="comma list of arms: frozen,mse,pv (pv expands over --pv-fracs)")
+                    help="comma list of arms: frozen,mse,pv,gptq "
+                         "(pv expands over --pv-fracs; gptq = Axis B v2 full-H re-solve)")
     ap.add_argument("--pv-fracs", default="0.1",
                     help="comma list of pv trust-region fractions (one pv arm each)")
     ap.add_argument("--eval-interval", type=int, default=1,
@@ -164,7 +166,9 @@ def main():
                     opt.param_groups[1]["lr"] = base[1] * mult
                     opt.step(); opt.zero_grad(); step += 1
                     flips = 0
-                    if reassign_mode != "none" and step % REASSIGN_INTERVAL == 0:
+                    # mse/pv reassign in-loop; gptq (Axis B v2) is a single post-Axis-A
+                    # re-solve done after the loop, so it trains frozen here.
+                    if reassign_mode in ("mse", "pv") and step % REASSIGN_INTERVAL == 0:
                         flips = reassign_targets(tlist, reassign_mode, frac=reassign_frac)
                     # Eval cadence: reassign_interval is a multiple of eval_interval in
                     # practice, so every reassign step also reports its post-flip KL.
@@ -176,6 +180,15 @@ def main():
                         break
         sps = max_steps / (time.time() - t0)
         print(f"[arm {label}] start {k0:.4f} -> final {kf:.4f}  ({sps:.3f} steps/s)", flush=True)
+        # Axis B rung A: ONE full-H GPTQ index re-solve against the now-tuned centroids.
+        # Collect the rotated activation Hessian fresh for THIS arm's tuned state, then
+        # re-solve indices (sequential, H^-1-compensated — cannot diverge like pv).
+        if reassign_mode == "gptq":
+            print(f"[arm {label}] collecting rotated Hessians ({len(targets)} targets)...", flush=True)
+            H_by_name = collect_target_hessians(targets, train_w, model, dev)
+            nflip = gptq_reassign_targets(targets, H_by_name, percdamp=0.05, act_order=True)
+            kf = holdout_kl()
+            print(f"[arm {label}] post-GPTQ-reassign KL {kf:.4f}  ({nflip} indices changed)", flush=True)
         return k0, kf
 
     # Build arm specs from CLI: frozen/mse once, pv once per requested frac.
@@ -188,6 +201,8 @@ def main():
         elif a == "pv":
             for fr in PV_FRACS:
                 arm_specs.append((f"pv_f{fr:g}", "pv", fr))
+        elif a == "gptq":
+            arm_specs.append(("gptq", "gptq", 0.0))
     results = {}
     for label, mode, fr in arm_specs:
         results[label] = run_arm(label, mode, fr, EVAL_INTERVAL, STEPS)
