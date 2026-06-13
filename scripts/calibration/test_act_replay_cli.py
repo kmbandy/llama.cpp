@@ -1157,3 +1157,132 @@ def test_reassign_targets_pv_flips_with_stashed_grad():
     assert not torch.equal(at.indices, before) or n == 0
     # indices stay in valid range
     assert at.indices.max().item() <= 15
+
+
+# ─── E.3: collect_target_hessians — rotated faithful Hessian accumulation ─────
+
+
+def test_collect_target_hessian_is_rotated_space_not_raw():
+    """THE correctness proof: H collected via apply_acts must be XrotᵀXrot / N,
+    where Xrot = x @ Q is the ROTATED activation the ml8 weights consume.
+    It must NOT match the raw-input-space H (XᵀX / N).
+    Capturing raw x produces a silently wrong-space H — this test pins that it
+    can't happen."""
+    from act_replay_student import AttachedTarget
+
+    K, N, G = 128, 8, 2
+    a_dim, b_dim = 8, 16          # a*b = 128 = K; b_dim power of 2
+    g = torch.Generator().manual_seed(3)
+    state = _mk_state(N=N, K=K, G=G)
+    state["rotation"] = {"h_a": torch.randn(a_dim, a_dim, generator=g),
+                         "a_dim": a_dim, "b_dim": b_dim}
+    at = AttachedTarget(state)
+    xs = [torch.randn(1, 5, K, generator=g) for _ in range(3)]   # 3 windows, [B,T,K]
+    at.start_hessian_collection()
+    for x in xs:
+        at.apply_acts(x)
+    H = at.finalize_hessian()
+
+    assert H.shape == (K, K)
+    assert H.dtype == torch.float32
+
+    # expected rotated H = (1/Ntok) sum (x@Q)^T (x@Q)
+    Hrot = None
+    raw = None
+    ntok = 0
+    for x in xs:
+        flat = x.reshape(-1, K).float()
+        xr = at.rotation.forward(flat)
+        Hrot = xr.t() @ xr if Hrot is None else Hrot + xr.t() @ xr
+        raw = flat.t() @ flat if raw is None else raw + flat.t() @ flat
+        ntok += flat.shape[0]
+    Hrot = Hrot / ntok
+    raw = raw / ntok
+
+    assert torch.allclose(H, Hrot, atol=1e-4), "collected H must be ROTATED-space"
+    assert not torch.allclose(H, raw, atol=1e-3), "collected H must NOT be raw-input-space"
+
+
+def test_collect_target_hessian_symmetric_psd():
+    """finalize_hessian() must return a symmetric PSD [K,K] fp32 matrix."""
+    from act_replay_student import AttachedTarget
+
+    K, N, G = 64, 4, 2
+    a_dim, b_dim = 4, 16          # 4*16 = 64
+    g = torch.Generator().manual_seed(7)
+    state = _mk_state(N=N, K=K, G=G)
+    state["rotation"] = {"h_a": torch.randn(a_dim, a_dim, generator=g),
+                         "a_dim": a_dim, "b_dim": b_dim}
+    at = AttachedTarget(state)
+    at.start_hessian_collection()
+    for _ in range(5):
+        at.apply_acts(torch.randn(2, 8, K, generator=g))
+    H = at.finalize_hessian()
+
+    assert H.shape == (K, K)
+    assert H.dtype == torch.float32
+    assert torch.allclose(H, H.t(), atol=1e-5), "H must be symmetric"
+    eigvals = torch.linalg.eigvalsh(H)
+    assert float(eigvals.min()) >= -1e-3, f"H has negative eigenvalue: {float(eigvals.min())}"
+
+
+def test_finalize_hessian_no_rotation_raises():
+    """finalize_hessian() on a target with no rotation (never ran apply_acts
+    with accumulation) must raise RuntimeError, not silently return zeros."""
+    from act_replay_student import AttachedTarget
+
+    state = _mk_state(N=8, K=128, G=2)   # rotation=None
+    at = AttachedTarget(state)
+    at.start_hessian_collection()
+    # no apply_acts call (rotation is None, so apply_acts is a no-op that
+    # never touches the accumulator)
+    with pytest.raises(RuntimeError):
+        at.finalize_hessian()
+
+
+def test_hessian_accumulation_attrs_not_registered_buffers():
+    """Hessian collection state must NOT be registered as nn.Module buffers —
+    it's transient and must not pollute state_dict."""
+    from act_replay_student import AttachedTarget
+
+    K, N, G = 64, 4, 2
+    a_dim, b_dim = 4, 16
+    g = torch.Generator().manual_seed(11)
+    state = _mk_state(N=N, K=K, G=G)
+    state["rotation"] = {"h_a": torch.randn(a_dim, a_dim, generator=g),
+                         "a_dim": a_dim, "b_dim": b_dim}
+    at = AttachedTarget(state)
+    sd_keys = set(at.state_dict().keys())
+    # none of the transient collection attrs should appear as buffers
+    for bad in ("_h_acc", "_h_tokens", "_collecting_h"):
+        assert bad not in sd_keys, f"{bad!r} must not be a registered buffer"
+
+
+def test_collect_target_hessians_end_to_end():
+    """collect_target_hessians runs one forward pass over calib and returns
+    per-target H dicts with the correct shape."""
+    from act_replay import collect_target_hessians
+
+    K, N, G = 128, 8, 2
+    a_dim, b_dim = 8, 16
+    g = torch.Generator().manual_seed(5)
+    state = _mk_state(N=N, K=K, G=G)
+    state["rotation"] = {"h_a": torch.randn(a_dim, a_dim, generator=g),
+                         "a_dim": a_dim, "b_dim": b_dim}
+
+    # Build a stub LM with the target attached to .lin
+    student = StubLM(vocab=32, K=K, N=N)
+    at = attach_to_linear(student.lin, state)
+
+    targets = {"blk.0.ffn_up.weight": at}
+    calib = [torch.randint(0, 32, (1, 8), generator=g) for _ in range(4)]
+    dev = torch.device("cpu")
+
+    hessians = collect_target_hessians(targets, calib, student, dev)
+
+    assert "blk.0.ffn_up.weight" in hessians
+    H = hessians["blk.0.ffn_up.weight"]
+    assert H.shape == (K, K)
+    assert H.dtype == torch.float32
+    # must be symmetric
+    assert torch.allclose(H, H.t(), atol=1e-5)

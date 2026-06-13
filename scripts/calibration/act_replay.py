@@ -109,6 +109,26 @@ def reassign_targets(targets, mode, frac=0.1):
     return total
 
 
+def collect_target_hessians(targets, calib, model, dev):
+    """Per-target static activation Hessian H = (1/N) sum Xrot^T Xrot over the
+    calib windows, where Xrot = x @ Q is the ROTATED (faithful) activation the
+    ml8 weights consume (NOT the raw linear input). Returns {name: H[K,K] fp32}.
+
+    One forward pass over `calib`; all targets accumulate simultaneously.
+
+    CRITICAL: the Hessian is in the ROTATED basis (x @ Q, post-rotation pre-quant)
+    because the ml8 weight indices are solved in that rotated basis. Capturing raw
+    x would produce a silently wrong-space H — the whole point of this function.
+    """
+    for at in targets.values():
+        at.start_hessian_collection()
+    model.eval()
+    with torch.no_grad():
+        for ids in calib:
+            model(ids.to(dev))
+    return {name: at.finalize_hessian() for name, at in targets.items()}
+
+
 # ─── env-gated host-RSS phase accounting ─────────────────────────────────────
 
 

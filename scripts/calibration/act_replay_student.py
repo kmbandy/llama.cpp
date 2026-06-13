@@ -83,6 +83,43 @@ class AttachedTarget(nn.Module):
         else:
             self.rotation = None
 
+        # Transient Hessian collection state — plain Python attrs, NOT registered
+        # buffers (must not appear in state_dict or pollute checkpoints).
+        self._collecting_h = False
+        self._h_acc = None        # [K, K] fp32 accumulator, None until first batch
+        self._h_tokens = 0        # total token count accumulated so far
+
+    def start_hessian_collection(self) -> None:
+        """Enable per-target rotated-space Hessian accumulation.
+
+        After calling this, every subsequent apply_acts call accumulates
+        xrot^T xrot into self._h_acc (where xrot = x @ Q is the ROTATED,
+        pre-quant activation). Call finalize_hessian() to retrieve the result.
+        """
+        self._collecting_h = True
+        self._h_acc = None
+        self._h_tokens = 0
+
+    def finalize_hessian(self) -> torch.Tensor:
+        """Stop accumulation and return H = (1/N) sum Xrot^T Xrot as fp32 [K, K].
+
+        Raises RuntimeError if no data was accumulated (either the target has
+        no rotation — apply_acts is a no-op — or start_hessian_collection was
+        never called before any apply_acts invocation).
+        """
+        self._collecting_h = False
+        if self._h_acc is None:
+            raise RuntimeError(
+                "collect_target_hessians: no rotated activations were accumulated "
+                "for this target. This target either has no rotation (apply_acts is "
+                "a no-op and never accumulates), or start_hessian_collection() was "
+                "not called before the forward passes. Hessian collection requires a "
+                "rotated target whose apply_acts ran at least once.")
+        H = self._h_acc / max(1, self._h_tokens)
+        self._h_acc = None
+        self._h_tokens = 0
+        return H
+
     def weight(self) -> torch.Tensor:
         """Differentiable ml8 dequant [N, K] with e4m3 straight-through snap."""
         c = self.centroids
@@ -127,6 +164,14 @@ class AttachedTarget(nn.Module):
         orig_dtype = x.dtype
         flat = x.reshape(-1, x.shape[-1]).float()
         x_rot = self.rotation.forward(flat)
+        # Accumulate rotated-space Hessian when collection is active.
+        # Uses .detach() so this never perturbs gradients; runs only when
+        # _collecting_h is True (a cheap attr check, off the training hot path).
+        if self._collecting_h:
+            xr = x_rot.detach().float()                  # [tokens, K] ROTATED, pre-quant
+            xtx = xr.t() @ xr                            # [K, K]
+            self._h_acc = xtx if self._h_acc is None else self._h_acc + xtx
+            self._h_tokens += xr.shape[0]
         # STE: forward value = quantized acts; backward = identity into x_rot.
         a_q = x_rot + (quantize_act_per_row(x_rot) - x_rot).detach()
         x_eff = a_q.reshape(x.shape).to(orig_dtype)
