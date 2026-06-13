@@ -1167,7 +1167,11 @@ static __device__ __forceinline__ float fp8_e4m3_byte_to_fp32_dev(uint8_t b) {
     int e    = (b >> 3) & 0xF;
     int m    = b & 0x7;
     float v  = (e == 0) ? (1.0f / 64.0f) * (m / 8.0f)
+#if defined(GGML_USE_HIP)
                         : __builtin_amdgcn_ldexp(1.0f + m / 8.0f, e - 7);
+#else
+                        : ldexpf(1.0f + m / 8.0f, e - 7);
+#endif
     return sign ? -v : v;
 }
 

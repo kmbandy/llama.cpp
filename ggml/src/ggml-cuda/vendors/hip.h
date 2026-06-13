@@ -52,6 +52,11 @@
 #define __SHFL_XOR_GET(_1, _2, _3, _4, NAME, ...) NAME
 #define __shfl_xor_sync(...) __SHFL_XOR_GET(__VA_ARGS__, __SHFL_XOR_SYNC_4, __SHFL_XOR_SYNC_3)(__VA_ARGS__)
 
+// __syncwarp: HIP/ROCm has no warp-mask sync intrinsic (undeclared on gfx803 and
+// in this toolchain on RDNA arches). A wavefront execution barrier is the
+// equivalent; HIP ignores the lane mask, like the __shfl_*_sync shims above.
+#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
+
 // __shfl_down_sync: support 3-arg and 4-arg calls (HIP ignores mask)
 #define __SHFL_DOWN_SYNC_3(mask, var, delta)        __shfl_down(var, delta, warpSize)
 #define __SHFL_DOWN_SYNC_4(mask, var, delta, width) __shfl_down(var, delta, width)
@@ -82,6 +87,7 @@
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled

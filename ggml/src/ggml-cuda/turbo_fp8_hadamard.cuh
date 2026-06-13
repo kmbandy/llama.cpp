@@ -95,14 +95,14 @@ __global__ void mt_turbo_fp8_fwht_kernel(float * __restrict__ data, int n_rows, 
 //
 // row_stride is in fp32 elements (typically == head_dim for tightly packed rows).
 // ─────────────────────────────────────────────────────────────────────────
-static inline hipError_t mt_turbo_fp8_fwht(
-    hipStream_t stream,
+static inline cudaError_t mt_turbo_fp8_fwht(
+    cudaStream_t stream,
     float *     data_device,
     int         n_rows,
     int         head_dim,
     int         row_stride
 ) {
-    if (n_rows <= 0) return hipSuccess;
+    if (n_rows <= 0) return cudaSuccess;
     dim3 grid(n_rows, 1, 1);
 
     switch (head_dim) {
@@ -128,9 +128,9 @@ static inline hipError_t mt_turbo_fp8_fwht(
             mt_turbo_fp8_fwht_kernel<1024><<<grid, dim3(1024),0, stream>>>(data_device, n_rows, row_stride);
             break;
         default:
-            return hipErrorInvalidValue;
+            return cudaErrorInvalidValue;
     }
-    return hipGetLastError();
+    return cudaGetLastError();
 }
 
 
@@ -176,14 +176,14 @@ __global__ void mt_turbo_fp8_fwht_half_kernel(__half * __restrict__ data, int n_
     row_ptr[tid] = __float2half(smem[tid] * scale);
 }
 
-static inline hipError_t mt_turbo_fp8_fwht_half(
-    hipStream_t stream,
+static inline cudaError_t mt_turbo_fp8_fwht_half(
+    cudaStream_t stream,
     __half *    data_device,
     int         n_rows,
     int         head_dim,
     int         row_stride
 ) {
-    if (n_rows <= 0) return hipSuccess;
+    if (n_rows <= 0) return cudaSuccess;
     dim3 grid(n_rows, 1, 1);
 
     switch (head_dim) {
@@ -194,9 +194,9 @@ static inline hipError_t mt_turbo_fp8_fwht_half(
         case 256:  mt_turbo_fp8_fwht_half_kernel<256> <<<grid, dim3(256), 0, stream>>>(data_device, n_rows, row_stride); break;
         case 512:  mt_turbo_fp8_fwht_half_kernel<512> <<<grid, dim3(512), 0, stream>>>(data_device, n_rows, row_stride); break;
         case 1024: mt_turbo_fp8_fwht_half_kernel<1024><<<grid, dim3(1024),0, stream>>>(data_device, n_rows, row_stride); break;
-        default: return hipErrorInvalidValue;
+        default: return cudaErrorInvalidValue;
     }
-    return hipGetLastError();
+    return cudaGetLastError();
 }
 
 
