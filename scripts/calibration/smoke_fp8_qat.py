@@ -59,8 +59,9 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", default="frozen,mse,pv",
-                    help="comma list of arms: frozen,mse,pv,gptq "
-                         "(pv expands over --pv-fracs; gptq = Axis B v2 full-H re-solve)")
+                    help="comma list of arms: frozen,mse,pv,gptq,gptq-interleave "
+                         "(pv expands over --pv-fracs; gptq = rung-A single re-solve; "
+                         "gptq-interleave = rung-B re-solve every REASSIGN_INTERVAL steps)")
     ap.add_argument("--pv-fracs", default="0.1",
                     help="comma list of pv trust-region fractions (one pv arm each)")
     ap.add_argument("--eval-interval", type=int, default=1,
@@ -153,6 +154,7 @@ def main():
         print(f"{'step':>4} {'holdoutKL':>10} {'lr_c':>9} {'flips':>10}", flush=True)
         print(f"{0:>4} {k0:>10.4f} {'-':>9} {'-':>10}", flush=True)
         micro = step = 0; opt.zero_grad(); t0 = time.time(); kf = k0
+        gptq_H = {"H": None}   # rung B: rotated Hessian, collected once, reused per re-solve
         while step < max_steps:
             for ids, (idx, vals, tail) in zip(train_w, teach_tr):
                 lg = wrapped(ids)
@@ -170,6 +172,18 @@ def main():
                     # re-solve done after the loop, so it trains frozen here.
                     if reassign_mode in ("mse", "pv") and step % REASSIGN_INTERVAL == 0:
                         flips = reassign_targets(tlist, reassign_mode, frac=reassign_frac)
+                    # rung B: interleaved full-H GPTQ re-solve every REASSIGN_INTERVAL steps.
+                    # H collected once (lazily) and reused — centroid drift, not H drift, is
+                    # what stales the indices. Each re-solve re-optimizes indices for the
+                    # centroids Axis A has moved since the last one.
+                    if reassign_mode == "gptq-interleave" and step % REASSIGN_INTERVAL == 0:
+                        if gptq_H["H"] is None:
+                            print(f"[arm {label}] collecting rotated Hessians "
+                                  f"({len(targets)} targets)...", flush=True)
+                            gptq_H["H"] = collect_target_hessians(targets, train_w, model, dev)
+                            model.train()
+                        flips = gptq_reassign_targets(targets, gptq_H["H"],
+                                                      percdamp=0.05, act_order=True)
                     # Eval cadence: reassign_interval is a multiple of eval_interval in
                     # practice, so every reassign step also reports its post-flip KL.
                     if step % eval_interval == 0 or step >= max_steps:
@@ -203,6 +217,8 @@ def main():
                 arm_specs.append((f"pv_f{fr:g}", "pv", fr))
         elif a == "gptq":
             arm_specs.append(("gptq", "gptq", 0.0))
+        elif a == "gptq-interleave":
+            arm_specs.append(("gptqi", "gptq-interleave", 0.0))
     results = {}
     for label, mode, fr in arm_specs:
         results[label] = run_arm(label, mode, fr, EVAL_INTERVAL, STEPS)
