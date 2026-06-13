@@ -36,13 +36,31 @@ from gguf_state import open_ml8_gguf, list_ml8_names
 from kl_loss import topk_teacher, kl_topk
 from fp8_qat import Ml8Fp8Fn
 
+def _host_rss():
+    """Host memory: (RssAnon, RssFile) GB from /proc/self/status. RssAnon is the
+    real pressure (private dirty); RssFile is mostly reclaimable mmap (e.g. the
+    device_map checkpoint), so it inflates RSS without being a true cost."""
+    anon = file = 0.0
+    try:
+        with open("/proc/self/status") as f:
+            for ln in f:
+                if ln.startswith("RssAnon:"):
+                    anon = int(ln.split()[1]) / 1e6      # kB -> GB
+                elif ln.startswith("RssFile:"):
+                    file = int(ln.split()[1]) / 1e6
+    except OSError:
+        pass
+    return anon, file
+
 def _mem(tag):
-    """VRAM breakdown probe: current allocated, reserved, and running peak."""
+    """VRAM + host-RAM breakdown probe."""
     import torch
     a = torch.cuda.memory_allocated() / 1e9
     r = torch.cuda.memory_reserved() / 1e9
     p = torch.cuda.max_memory_allocated() / 1e9
-    print(f"[mem] {tag:30s} alloc={a:6.2f}  reserved={r:6.2f}  peak={p:6.2f} GB", flush=True)
+    ha, hf = _host_rss()
+    print(f"[mem] {tag:30s} vram(alloc={a:6.2f} reserved={r:6.2f} peak={p:6.2f}) "
+          f"host(anon={ha:5.2f} file={hf:5.2f}) GB", flush=True)
 
 
 MODEL = "/home/kmbandy/models/Qwen3.5-0.8B-hf"
