@@ -165,6 +165,74 @@ def test_faithful_acts_rotated_basis_no_inverse():
     assert torch.allclose(reference, calib_faithful, atol=1e-4)
 
 
+def test_faithful_acts_with_input_column_reorder():
+    """ml8 target needing a GGUF(tiled)->HF(grouped) INPUT-column reorder — the
+    linear-attn out_proj V-head reorder on asymmetric-head models (4B: 32 value
+    vs 16 key heads). The reorder is handled by permuting the INPUT ACTIVATION
+    hf->tiled at the FRONT of apply_acts, leaving W/Q/scales/centroids/indices in
+    pristine GGUF order: per-row act-quant commutes with a column permutation and
+    the Kronecker rotation is never conjugated. The student fed HF-order input must
+    reproduce the deployment kernel fed GGUF-order input EXACTLY.
+
+    Uses a NON-involutive (3-cycle) column permutation so a wrong perm direction
+    (forgetting the argsort inverse) is caught — an involutive swap would pass even
+    with the inverse dropped.
+    """
+    K, N, G = 192, 8, 3
+    a_dim, b_dim = 6, 32  # a_dim*b_dim = 192 = K
+    h_a = random_orthogonal(a_dim, seed=2)
+    t = _mk_state(N=N, K=K, G=G, seed=3)
+    t["rotation"] = {"h_a": h_a, "a_dim": a_dim, "b_dim": b_dim}
+
+    # tiled->hf column index (gguf_to_hf_perm convention: W_hf = W_gguf[:, index]).
+    # 3-cycle on the three 64-wide groups: hf = [group2, group0, group1].
+    g0 = torch.arange(0, 64); g1 = torch.arange(64, 128); g2 = torch.arange(128, 192)
+    index = torch.cat([g2, g0, g1]).long()
+    assert not torch.equal(torch.argsort(index), index)  # genuinely non-involutive
+
+    # The target carries the INVERSE (hf->tiled) ACTIVATION permutation.
+    t["col_perm"] = torch.argsort(index)
+
+    lin = nn.Linear(K, N, bias=False)
+    attach_to_linear(lin, t)  # auto-faithful: rotation present
+
+    rot = KroneckerRotation(h_a=h_a, b_dim=b_dim)
+    W_gguf = _ref_weight(t)                       # GGUF-order rotated weight
+    x_gguf = torch.randn(3, K)
+    reference = quantize_act_per_row(rot.forward(x_gguf)) @ W_gguf.t()
+
+    x_hf = x_gguf.index_select(-1, index)         # what the HF module emits
+    assert torch.equal(lin(x_hf), reference)
+
+
+def test_attach_one_input_reorder_routes_to_activation_perm():
+    """_attach_one must NOT reject an axis-1 (input-column) V-head reorder on an
+    ml8 target. It converts gguf_to_hf_perm's tiled->hf index into the inverse
+    (hf->tiled) ACTIVATION permutation carried on the AttachedTarget, leaving the
+    ml8 weight/scales/centroids untouched in GGUF order (applied in apply_acts)."""
+    from types import SimpleNamespace
+
+    from act_replay import _attach_one, gguf_to_hf_perm, map_gguf_to_hf
+
+    K, N, G = 96, 8, 3
+    a_dim, b_dim = 3, 32  # a_dim*b_dim = 96 = K
+    # 6 value vs 2 key heads (num_v_per_k=3) -> a NON-involutive V-head reorder.
+    cfg = SimpleNamespace(linear_num_value_heads=6, linear_num_key_heads=2,
+                          linear_value_head_dim=16, linear_key_head_dim=16)
+    gname = "blk.0.ssm_out.weight"
+    ax, index = gguf_to_hf_perm(gname, (N, K), cfg)
+    assert ax == 1 and not torch.equal(torch.argsort(index), index)
+
+    t = _mk_state(N=N, K=K, G=G, seed=5)
+    t["rotation"] = {"h_a": random_orthogonal(a_dim, seed=5),
+                     "a_dim": a_dim, "b_dim": b_dim}
+    modules = {map_gguf_to_hf(gname): nn.Linear(K, N, bias=False)}
+
+    at = _attach_one(modules, gname, t, cfg)      # must NOT raise on axis-1
+    assert at.col_perm is not None
+    assert torch.equal(at.col_perm.cpu(), torch.argsort(index))
+
+
 def test_attach_rotation_dim_mismatch_raises():
     """attach_to_linear must raise ValueError when rotation a_dim*b_dim != in_features."""
     t = _mk_state(N=8, K=128)

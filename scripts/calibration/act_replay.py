@@ -717,12 +717,16 @@ def gguf_to_hf_perm(gguf_name, shape, model_config):
 def _apply_perm_to_ml8_entry(entry, perm):
     """Reorder an ml8 state entry's rows in place per a (axis, index) perm.
 
-    Only output-row reorders (axis 0) are valid for an ml8 target: the indices
-    [N,K] and scales [N,G] are reordered along their row axis together (the
-    per-group centroids are untouched — they index the input/group axis). Column
-    reorders (axis 1) on an ml8 target are unsupported and raise; the only
-    column-reordered linear-attn tensor (out_proj) is an fp8 frozen weight, never
-    an ml8 target.
+    This helper handles ONLY output-row reorders (axis 0): the indices [N,K] and
+    scales [N,G] are reordered along their row axis together (the per-group
+    centroids are untouched — they index the input/group axis). It RAISES on an
+    axis-1 (input-column) perm: a column reorder of an ml8 target is handled
+    upstream in _attach_one by carrying the inverse permutation on the activation
+    (AttachedTarget.col_perm), NOT by permuting the weight — permuting the weight
+    columns would force conjugating the Kronecker rotation by an arbitrary head
+    permutation, breaking the Kronecker structure the deployed kernel requires. So
+    by the time an entry reaches here, any axis-1 perm has already been diverted;
+    reaching this raise means a caller bypassed that routing.
     """
     if perm is None:
         return entry
@@ -779,7 +783,19 @@ def _attach_one(modules, gguf_name, entry, model_config=None, fp8: bool = False)
     if model_config is not None:
         shape = tuple(entry["indices"].shape)
         perm = gguf_to_hf_perm(gguf_name, shape, model_config)
-        entry = _apply_perm_to_ml8_entry(entry, perm)
+        if perm is not None and perm[0] == 1:
+            # Input-column (V-head) reorder: NOT applied to the ml8 weight (that
+            # would force conjugating the Kronecker rotation by an arbitrary head
+            # permutation, breaking its Kronecker structure). Instead carry the
+            # inverse (hf->tiled) ACTIVATION permutation; apply_acts reorders the
+            # incoming HF-order activation into GGUF order before the rotation. The
+            # gguf_to_hf index maps tiled->hf (W_hf = W_gguf[:, index]); the inverse
+            # argsort(index) maps the HF-order activation back to GGUF/tiled order.
+            _, index = perm
+            entry = dict(entry)
+            entry["col_perm"] = torch.argsort(index)
+        else:
+            entry = _apply_perm_to_ml8_entry(entry, perm)  # axis-0 row reorder / None
     return attach_to_linear(modules[hf_path], entry, fp8=fp8)
 
 

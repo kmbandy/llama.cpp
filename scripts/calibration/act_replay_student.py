@@ -83,6 +83,20 @@ class AttachedTarget(nn.Module):
         else:
             self.rotation = None
 
+        # Optional input-column (V-head) reorder, carried as the hf->tiled (=GGUF)
+        # ACTIVATION permutation. The ml8 weight/scales/centroids stay in pristine
+        # GGUF order; apply_acts reorders the incoming HF-order activation into GGUF
+        # order BEFORE the rotation. This is exact (per-row act-quant commutes with a
+        # column permutation) and never conjugates the Kronecker rotation — unlike
+        # permuting the weight columns, which would break the Kronecker structure the
+        # deployed kernel requires. See _attach_one for where col_perm = argsort(index).
+        col_perm = target.get("col_perm")
+        if col_perm is not None:
+            self.register_buffer(
+                "col_perm", torch.as_tensor(col_perm, dtype=torch.long))
+        else:
+            self.col_perm = None
+
         # Transient Hessian collection state — plain Python attrs, NOT registered
         # buffers (must not appear in state_dict or pollute checkpoints).
         self._collecting_h = False
@@ -158,7 +172,13 @@ class AttachedTarget(nn.Module):
         path through the (piecewise-constant) act quant, back through the linear
         rotation to x.
 
-        Returns x unchanged when no rotation is attached."""
+        When an input-column reorder is attached (col_perm), the incoming HF-order
+        activation is permuted into GGUF order FIRST, so it lines up with the
+        GGUF-order weight columns; this happens whether or not a rotation follows.
+
+        Returns x unchanged when neither a col_perm nor a rotation is attached."""
+        if self.col_perm is not None:
+            x = x.index_select(-1, self.col_perm)
         if self.rotation is None:
             return x
         orig_dtype = x.dtype
@@ -203,7 +223,7 @@ def attach_to_linear(lin: nn.Linear, target: dict,
                 f"{a_dim * b_dim} != lin.in_features={lin.in_features}")
 
     if faithful_acts is None:
-        use_acts = at.rotation is not None
+        use_acts = at.rotation is not None or at.col_perm is not None
     else:
         use_acts = bool(faithful_acts)
         if use_acts and at.rotation is None:
