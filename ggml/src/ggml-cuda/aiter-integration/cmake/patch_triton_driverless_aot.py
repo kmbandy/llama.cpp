@@ -26,14 +26,29 @@ idempotent. If an anchor is missing AND the patched form is also absent, it exit
 non-zero so a Triton version bump can't silently reintroduce the GPU dependency.
 
 Usage:  patch_triton_driverless_aot.py [/opt/triton]
+        patch_triton_driverless_aot.py --check <triton_root>
 """
+import argparse
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/triton")
-target = root / "python" / "triton" / "tools" / "compile.py"
-if not target.is_file():
-    sys.exit(f"[patch_triton_driverless_aot] not found: {target}")
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--check", action="store_true",
+                    help="Dry-run: verify anchors/already-patched; exit 0=ok, 2=missing anchor")
+parser.add_argument("triton_root", nargs="?", default="/opt/triton")
+args = parser.parse_args()
+
+root = Path(args.triton_root)
+# Support both repo-root usage (/opt/triton → .../python/triton/tools/compile.py)
+# and editable-install usage (.../python → .../python/triton/tools/compile.py).
+_candidate1 = root / "python" / "triton" / "tools" / "compile.py"
+_candidate2 = root / "triton" / "tools" / "compile.py"
+if _candidate1.is_file():
+    target = _candidate1
+elif _candidate2.is_file():
+    target = _candidate2
+else:
+    sys.exit(f"[patch_triton_driverless_aot] not found: {_candidate1} (also tried {_candidate2})")
 
 src = target.read_text()
 
@@ -48,6 +63,7 @@ EDITS = [
      "from triton.backends.amd.driver import ty_to_cpp"),
 ]
 
+missing_anchors = []
 for anchor, repl in EDITS:
     if anchor in src:
         src = src.replace(anchor, repl)
@@ -55,10 +71,21 @@ for anchor, repl in EDITS:
     # idempotent: already patched?  removal -> anchor simply absent; replace -> repl present
     if repl == "" or repl in src:
         continue
-    sys.exit(
-        f"[patch_triton_driverless_aot] ANCHOR NOT FOUND: {anchor!r}\n"
-        f"  Triton's AOT source changed — re-verify the driverless fix before trusting it."
-    )
+    missing_anchors.append(anchor)
+    if not args.check:
+        sys.exit(
+            f"[patch_triton_driverless_aot] ANCHOR NOT FOUND: {anchor!r}\n"
+            f"  Triton's AOT source changed — re-verify the driverless fix before trusting it."
+        )
+
+if args.check:
+    if missing_anchors:
+        for anchor in missing_anchors:
+            print(f"[patch_triton_driverless_aot] --check FAILED: anchor not found and not yet patched: {anchor!r}",
+                  file=sys.stderr)
+        sys.exit(2)
+    print(f"[patch_triton_driverless_aot] --check OK: all anchors present or already patched in {target}")
+    sys.exit(0)
 
 target.write_text(src)
 print(f"[patch_triton_driverless_aot] patched {target} — AOT is now driverless (gfx942, no GPU)")
