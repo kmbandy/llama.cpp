@@ -143,37 +143,73 @@ def test_fp8fn_backward_skips_stash_when_capture_off():
     assert at.scales.grad is not None and torch.isfinite(at.scales.grad).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
-def test_backward_grads_match_scatter_reference():
-    """Ml8Fp8Fn.backward (now kernel-backed) must match the old scatter math."""
-    import torch
-    from fp8_qat import Ml8Fp8Fn, fp8_quant
-    dev = "cuda"
-    N, K, G, M = 32, 256, 4, 48
+def _mk_backward_ctx(dev, N=32, K=256, G=4, M=48, seed=0):
+    """Minimal saved-tensor ctx for exercising Ml8Fp8Fn.backward directly."""
+    g = torch.Generator(device=dev).manual_seed(seed)
     gsz = K // G
-    x8 = (torch.randn(M, K, device=dev) * 0.3).to(torch.float8_e4m3fn)
-    sx = torch.rand(M, 1, device=dev) * 0.01 + 0.01
-    cent = torch.randn(G, 16, device=dev) * 0.1
-    scales = torch.rand(N, G, device=dev) * 0.05 + 0.01
-    indices = torch.randint(0, 16, (N, K), dtype=torch.uint8, device=dev)
+    x8 = (torch.randn(M, K, generator=g, device=dev) * 0.3).to(torch.float8_e4m3fn)
+    sx = torch.rand(M, 1, generator=g, device=dev) * 0.01 + 0.01
+    cent = torch.randn(G, 16, generator=g, device=dev) * 0.1
+    scales = torch.rand(N, G, generator=g, device=dev) * 0.05 + 0.01
+    indices = torch.randint(0, 16, (N, K), generator=g, dtype=torch.uint8, device=dev)
     gidx = (torch.arange(K, device=dev) // gsz).long()
-    dy = torch.randn(M, N, device=dev)
+    dy = torch.randn(M, N, generator=g, device=dev)
 
-    class Ctx:  # minimal ctx stand-in for backward
+    class Ctx:
         pass
     ctx = Ctx()
     ctx.saved_tensors = (x8, sx, cent, scales, indices, gidx)
     ctx.indices_id = id(indices)
+    return ctx, dy, (x8, sx, cent, scales, indices, gidx)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_fp8fn_backward_dx_uses_fp8_gemm():
+    """dx (input grad) must come from the fp8 _scaled_mm path (ml8_backward_gemms),
+    not the fp32 `@` placeholder (fp8_qat.py:105) — the MAD-290 ~3.4s bottleneck.
+    With loss_scale=1 the wired backward calls the same helper, so dx matches the
+    helper reference to near-bit precision (the fp32 placeholder would not)."""
+    import torch
+    from fp8_qat import Ml8Fp8Fn
+    from ml8_backward_kernels import ml8_backward_gemms
+    dev = "cuda"
+    ctx, dy, (x8, sx, cent, scales, indices, gidx) = _mk_backward_ctx(dev)
+    N = scales.shape[0]
     Ml8Fp8Fn.capture_dLdW = False
+    Ml8Fp8Fn.loss_scale = 1.0
     dx, dcent, dscales, _, _ = Ml8Fp8Fn.backward(ctx, dy)
 
-    # Reference: the pre-kernel scatter math.
-    from test_ml8_backward_kernels import _reference_grads
-    dyf = dy
-    dy8, sdy = fp8_quant(dyf, "e5m2")
+    # Independent fp8 reference: reconstruct W, run the trusted helper.
+    cent_per_col = cent[gidx]
+    W = cent_per_col.unsqueeze(0).expand(N, -1, -1).gather(
+        2, indices.long().unsqueeze(-1)).squeeze(-1) * scales[:, gidx]   # [N,K]
     xq = x8.float() * sx
-    dW_raw = (dy8.float() * sdy).t() @ xq
-    dcent_ref, dscales_ref = _reference_grads(dW_raw, indices, gidx, cent, scales)
+    dx_ref, _ = ml8_backward_gemms(dy, W, xq)
+    assert torch.allclose(dx.float(), dx_ref.float(), atol=1e-3, rtol=1e-3), \
+        (dx.float() - dx_ref.float()).abs().max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU")
+def test_backward_grads_match_scatter_reference():
+    """The wgrad scatter math (dcent/dscales) must match _reference_grads fed the
+    SAME dW_raw the backward used (now from the fp8 helper, not the fp32 formula)."""
+    import torch
+    from fp8_qat import Ml8Fp8Fn
+    from ml8_backward_kernels import ml8_backward_gemms
+    dev = "cuda"
+    ctx, dy, (x8, sx, cent, scales, indices, gidx) = _mk_backward_ctx(dev)
+    N = scales.shape[0]
+    Ml8Fp8Fn.capture_dLdW = False
+    Ml8Fp8Fn.loss_scale = 1.0
+    dx, dcent, dscales, _, _ = Ml8Fp8Fn.backward(ctx, dy)
+
+    # Reference: same fp8 dW_raw the backward computes, then the scatter math.
+    from test_ml8_backward_kernels import _reference_grads
+    cent_per_col = cent[gidx]
+    W = cent_per_col.unsqueeze(0).expand(N, -1, -1).gather(
+        2, indices.long().unsqueeze(-1)).squeeze(-1) * scales[:, gidx]
+    _, dW_raw = ml8_backward_gemms(dy, W, x8.float() * sx)
+    dcent_ref, dscales_ref = _reference_grads(dW_raw.float(), indices, gidx, cent, scales)
     assert torch.allclose(dcent, dcent_ref, atol=2e-2, rtol=2e-2)
     assert torch.allclose(dscales, dscales_ref, atol=1e-2, rtol=1e-2)
 

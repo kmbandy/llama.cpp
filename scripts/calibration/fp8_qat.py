@@ -27,7 +27,7 @@ def pad_to_multiple(x: torch.Tensor, m: int, dim: int = 0):
 
 import ml8_runtime
 from centroid_quantizer import snap_to_e4m3
-from ml8_backward_kernels import ml8_wgrad
+from ml8_backward_kernels import ml8_wgrad, ml8_backward_gemms
 
 
 class Ml8Fp8Fn(torch.autograd.Function):
@@ -96,14 +96,17 @@ class Ml8Fp8Fn(torch.autograd.Function):
         x8, sx, cent_e4m3, scales, indices, gidx = ctx.saved_tensors
         N, K = indices.shape
         dyf = dy.reshape(-1, dy.shape[-1]) / Ml8Fp8Fn.loss_scale      # [M,N]
-        dy8, sdy = fp8_quant(dyf, "e5m2")
         # reconstruct raw e4m3 weight W[N,K] = cent_e4m3[gidx, indices] * scales[:,gidx]
         cent_per_col = cent_e4m3[gidx]                                # [K,16]
         W = cent_per_col.unsqueeze(0).expand(N, -1, -1).gather(
             2, indices.long().unsqueeze(-1)).squeeze(-1) * scales[:, gidx]   # [N,K]
         x = (x8.float() * sx)                                         # dequant acts [M,K]
-        dx = (dy8.float() * sdy) @ W                                  # [M,K]
-        dW_raw = (dy8.float() * sdy).t() @ x                          # [N,K]
+        # fp8 tensor-core backward GEMMs (MAD-290) — replaces the fp32 `@` placeholder
+        # that landed on bad rocBLAS MT16/MT8 tiles. Deployment-faithful: W is fp8 in
+        # the gradient too (in llama.cpp the weight IS ML8_FP8). dx[M,K], dW_raw[N,K].
+        dx, dW_raw = ml8_backward_gemms(dyf, W, x)
+        dx = dx.float()
+        dW_raw = dW_raw.float()
         # Axis-B (pv) side channel — see capture_dLdW note above. OFF by default so
         # these dense [N,K] fp32 tensors are NOT retained in module state across layers
         # (that hoard is what OOM'd the 4B). dW_raw itself is still computed (transient)

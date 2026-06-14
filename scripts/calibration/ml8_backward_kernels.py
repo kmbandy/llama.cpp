@@ -15,6 +15,69 @@ import triton
 import triton.language as tl
 
 
+# ─── fp8 backward GEMMs (dx, dW_raw) ─────────────────────────────────────────
+# Replaces the fp32 `@` placeholder in Ml8Fp8Fn.backward (the MAD-290 bottleneck):
+# both gradient GEMMs run on fp8 tensor cores via torch._scaled_mm. Per-tensor
+# (scalar) amax scaling so one quantization of each operand serves both
+# contraction orientations (dx contracts N, dW_raw contracts M).
+_FP8 = {"e4m3": (torch.float8_e4m3fn, 448.0), "e5m2": (torch.float8_e5m2, 57344.0)}
+
+
+def _quant_tensorwise(t, fmt):
+    """Per-tensor amax fp8 quant. Returns (q_fp8 [row-major], scale[1,1]).
+
+    q is forced contiguous: in the live graph the inputs (reshaped grad, gathered
+    weight) are strided, and torch._scaled_mm requires strict row-major x
+    column-major operands."""
+    dt, fmax = _FP8[fmt]
+    amax = t.detach().abs().amax().clamp_min(1e-12)
+    scale = (amax / fmax).to(torch.float32)
+    q = (t / scale).clamp(-fmax, fmax).to(dt).contiguous()
+    return q, scale.reshape(1, 1)
+
+
+def _pad_rows(t, mult=16):
+    """Zero-pad dim-0 up to a multiple of `mult` (fp8 _scaled_mm contraction
+    alignment). Zeros do not change the contracted sum."""
+    r = t.shape[0]
+    pad = (-r) % mult
+    if pad:
+        t = torch.nn.functional.pad(t, (0, 0, 0, pad))
+    return t
+
+
+def ml8_backward_gemms(dy, W, x):
+    """fp8 tensor-core backward GEMMs for Ml8Fp8Fn.backward.
+
+        dx     [M,K] = dy[M,N]   @ W[N,K]   (contract N)
+        dW_raw [N,K] = dy.t()[N,M] @ x[M,K] (contract M)
+
+    Both via torch._scaled_mm (fp8), replacing the fp32 `@`. dy uses e5m2
+    (wider range for gradients); W and x use e4m3. Returns (dx, dW_raw) bf16.
+    """
+    M, N = dy.shape
+    K = W.shape[1]
+    dy8, sdy = _quant_tensorwise(dy, "e5m2")    # [M,N]
+    w8, sw = _quant_tensorwise(W, "e4m3")       # [N,K]
+    x8, sx = _quant_tensorwise(x, "e4m3")       # [M,K]
+
+    # dx[M,K] = dy8[M,N] @ W[N,K]: _scaled_mm(A[M,N], B[N,K] col-major). N is the
+    # contraction (mult of 16 for ml8 shapes); B col-major = W.t().contiguous().t().
+    w_col = w8.t().contiguous().t()             # [N,K], column-major
+    dx = torch._scaled_mm(dy8, w_col, scale_a=sdy, scale_b=sw,
+                          out_dtype=torch.bfloat16)            # [M,K]
+
+    # dW_raw[N,K] = dy8.t()[N,M] @ x8[M,K]: contraction M may be odd -> pad M (the
+    # shared dim) on both operands before transposing. Zero rows add nothing.
+    dy8p = _pad_rows(dy8)                        # [Mp,N]
+    x8p = _pad_rows(x8)                          # [Mp,K]
+    dyt = dy8p.t().contiguous()                 # [N,Mp] row-major
+    x_col = x8p.t().contiguous().t()            # [Mp,K] column-major
+    dW_raw = torch._scaled_mm(dyt, x_col, scale_a=sdy, scale_b=sx,
+                             out_dtype=torch.bfloat16)         # [N,K]
+    return dx, dW_raw
+
+
 def ml8_wgrad_torch(dW_raw, indices, centroids, scales, gsz):
     """Pure-torch reference/fallback. Exact dscales via contiguous reshape;
     dcent via index_put_ (the best pure-torch option per the bench).

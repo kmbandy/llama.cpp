@@ -10,13 +10,38 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from kronecker_rotation import (  # noqa: E402
     sylvester, random_orthogonal, KroneckerRotation,
-    factor_for_dim, rotate_hessian,
+    factor_for_dim, rotate_hessian, fwht_raw,
 )
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor, tol: float, label: str):
     diff = (actual - expected).abs().max().item()
     assert diff <= tol, f"{label}: max abs diff {diff:.3e} > tol {tol:.3e}"
+
+
+def test_fwht_raw_matches_dense_hadamard():
+    """fwht_raw(x)/sqrt(n) == x @ sylvester(n) (the normalized Sylvester right-multiply).
+
+    This is the fast butterfly that replaces the dense H_b matmul in the rotation:
+    same math, O(n log n) instead of O(n^2), and it's what the deployed ml8 kernel
+    does for the H_b leg (ml8.cu fused rot+quant)."""
+    torch.manual_seed(0)
+    for n in [2, 4, 16, 256, 512, 1024]:
+        H = sylvester(n)                                   # normalized: H_raw / sqrt(n)
+        x = torch.randn(7, n)
+        expected = x @ H                                   # dense normalized right-mul
+        actual = fwht_raw(x) / math.sqrt(n)                # fast butterfly + normalize
+        _assert_close(actual, expected, tol=1e-4, label=f"fwht_raw n={n}")
+    # works on a batched (..., a, n) tensor along the last dim
+    x = torch.randn(4, 5, 512)
+    expected = x @ sylvester(512)
+    actual = fwht_raw(x) / math.sqrt(512)
+    _assert_close(actual, expected, tol=1e-4, label="fwht_raw batched")
+    # gradient flows (used inside the autograd-tracked rotation forward)
+    xg = torch.randn(3, 256, requires_grad=True)
+    fwht_raw(xg).sum().backward()
+    assert xg.grad is not None and torch.isfinite(xg.grad).all()
+    print("  PASS test_fwht_raw_matches_dense_hadamard")
 
 
 def test_sylvester_orthonormal():

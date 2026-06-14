@@ -28,6 +28,29 @@ from typing import Optional
 import torch
 
 
+def fwht_raw(x: torch.Tensor) -> torch.Tensor:
+    """Unnormalized fast Walsh-Hadamard transform along the last dim (size = power
+    of 2). Computes ``x @ H_raw`` where H_raw is the +/-1 Sylvester matrix, in
+    O(n log n) butterfly stages instead of the O(n^2) dense matmul.
+
+    ``fwht_raw(x) / sqrt(n) == x @ sylvester(n)`` to float precision (sylvester is
+    normalized by 1/sqrt(n)). This mirrors the deployed ml8 kernel's fused FWHT
+    H_b leg (ml8.cu / turbo_fp8_hadamard.cuh). Autograd-friendly (cat/slice/add)."""
+    n = x.shape[-1]
+    if n & (n - 1) != 0:
+        raise ValueError(f"fwht_raw: last dim must be a power of 2, got {n}")
+    orig = x.shape
+    h = 1
+    y = x
+    while h < n:
+        y = y.reshape(*y.shape[:-1], n // (2 * h), 2 * h)
+        a = y[..., :h]
+        b = y[..., h:2 * h]
+        y = torch.cat([a + b, a - b], dim=-1).reshape(orig)
+        h *= 2
+    return y
+
+
 class KroneckerRotation:
     """Factored orthogonal rotation Q = H_a ⊗ H_b applied to last dim of inputs.
 
@@ -52,6 +75,7 @@ class KroneckerRotation:
         self.b_dim = b_dim
         self.d = self.a_dim * b_dim
         self.h_b = sylvester(b_dim).to(dtype=h_a.dtype)
+        self._inv_sqrt_b = 1.0 / math.sqrt(b_dim)   # FWHT normalization (== sylvester)
 
     def _factors_on(self, x: torch.Tensor):
         h_a = self.h_a.to(device=x.device, dtype=x.dtype)
@@ -67,9 +91,12 @@ class KroneckerRotation:
         """
         if x.shape[-1] != self.d:
             raise ValueError(f"last dim {x.shape[-1]} != d={self.d}")
-        h_a, h_b = self._factors_on(x)
+        h_a, _ = self._factors_on(x)
         X = x.reshape(*x.shape[:-1], self.a_dim, self.b_dim)
-        Y = h_a.T @ X @ h_b
+        # H_b leg via fast Walsh-Hadamard (O(b log b), == X @ sylvester(b) to float
+        # precision; mirrors the deployed ml8 fused FWHT prologue). H_a leg stays a
+        # small a×a matmul. Same fp32 math as the dense `h_a.T @ X @ h_b`.
+        Y = h_a.T @ (fwht_raw(X) * self._inv_sqrt_b)
         return Y.reshape(x.shape)
 
     def inverse(self, x: torch.Tensor) -> torch.Tensor:
@@ -79,9 +106,11 @@ class KroneckerRotation:
         """
         if x.shape[-1] != self.d:
             raise ValueError(f"last dim {x.shape[-1]} != d={self.d}")
-        h_a, h_b = self._factors_on(x)
+        h_a, _ = self._factors_on(x)
         X = x.reshape(*x.shape[:-1], self.a_dim, self.b_dim)
-        Y = h_a @ X @ h_b.T
+        # Sylvester H_b is symmetric (H_b.T == H_b), so the inverse b-leg is the
+        # same FWHT/sqrt(b); the a-leg uses h_a (not transposed).
+        Y = h_a @ (fwht_raw(X) * self._inv_sqrt_b)
         return Y.reshape(x.shape)
 
     def to_dict(self) -> dict:

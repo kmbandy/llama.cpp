@@ -3,6 +3,57 @@ import pytest
 import torch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp8 _scaled_mm needs GPU")
+@pytest.mark.parametrize("M,N,K", [(64, 2560, 9216), (48, 4096, 2560),
+                                   (16, 2560, 2560), (33, 1024, 512)])
+def test_backward_gemms_run_fp8_and_match_fp32(M, N, K):
+    """The two backward GEMMs (dx, dW_raw) must run on fp8 tensor cores
+    (_scaled_mm), not the fp32 `@` placeholder in Ml8Fp8Fn.backward
+    (fp8_qat.py:105-106) — the MAD-290 ~3.4s bottleneck. Result must track the
+    fp32 reference within fp8 precision (relative Frobenius error)."""
+    from ml8_backward_kernels import ml8_backward_gemms
+    dev = "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+    dy = torch.randn(M, N, generator=g, device=dev)
+    W = torch.randn(N, K, generator=g, device=dev) * 0.05
+    x = torch.randn(M, K, generator=g, device=dev) * 0.1
+
+    dx_ref = dy @ W              # [M,K]
+    dW_ref = dy.t() @ x          # [N,K]
+
+    dx, dW_raw = ml8_backward_gemms(dy, W, x)
+    assert dx.shape == (M, K) and dW_raw.shape == (N, K)
+
+    def relerr(a, b):
+        return (a.float() - b).norm() / b.norm().clamp_min(1e-12)
+
+    assert relerr(dx, dx_ref) < 0.10, f"dx relerr {relerr(dx, dx_ref):.3f}"
+    assert relerr(dW_raw, dW_ref) < 0.10, f"dW_raw relerr {relerr(dW_raw, dW_ref):.3f}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fp8 _scaled_mm needs GPU")
+def test_backward_gemms_handle_noncontiguous_inputs():
+    """In the live autograd graph dy is a reshaped gradient and W is a gathered
+    (strided) reconstruction — both non-contiguous. _scaled_mm requires strict
+    row-major x col-major operands, so the helper must normalize layout itself.
+    Regression for the cuBLASLt 'row-major and column-major' crash."""
+    from ml8_backward_kernels import ml8_backward_gemms
+    dev = "cuda"
+    M, N, K = 48, 2560, 9216
+    g = torch.Generator(device=dev).manual_seed(1)
+    # non-contiguous dy (transpose view) and W (transpose view), as in the real path
+    dy = (torch.randn(N, M, generator=g, device=dev)).t()        # [M,N] non-contig
+    W = (torch.randn(K, N, generator=g, device=dev) * 0.05).t()  # [N,K] non-contig
+    x = (torch.randn(K, M, generator=g, device=dev) * 0.1).t()   # [M,K] non-contig
+    assert not dy.is_contiguous() and not W.is_contiguous() and not x.is_contiguous()
+
+    dx, dW_raw = ml8_backward_gemms(dy, W, x)        # must not raise
+    assert dx.shape == (M, K) and dW_raw.shape == (N, K)
+    relerr = lambda a, b: (a.float() - b).norm() / b.norm().clamp_min(1e-12)
+    assert relerr(dx, dy @ W) < 0.10
+    assert relerr(dW_raw, dy.t() @ x) < 0.10
+
+
 def _reference_grads(dW_raw, indices, gidx, centroids, scales):
     """Oracle: byte-for-byte the two scatter blocks from Ml8Fp8Fn.backward
     (fp8_qat.py:116-124), the path this work replaces."""

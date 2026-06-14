@@ -177,6 +177,7 @@ def main():
     modules = dict(model.named_modules()); mcfg = getattr(model, "config", None)
     selected = set(select_targets(list_ml8_names(GGUF), train="ml8", skip=""))
     targets, warn, n_fp8 = {}, {"warned": False}, 0
+    fp8_tier_gguf = []   # gguf names that took the bf16 fp8-tier install branch (diag)
     _, stream = open_ml8_gguf(GGUF, frozen_mode="fp8")
     for kind, name, payload in stream:
         if kind == "ml8":
@@ -185,12 +186,71 @@ def main():
                                             keep_w_orig=NEEDS_W_ORIG,
                                             free_host_weight=True)
         else:
-            n_fp8 += _install_one(modules, name, payload, map_gguf_to_hf, dev,
-                                  torch.bfloat16, mcfg, warn)
+            inst = _install_one(modules, name, payload, map_gguf_to_hf, dev,
+                                torch.bfloat16, mcfg, warn)
+            n_fp8 += inst
+            if inst:
+                fp8_tier_gguf.append(name)
         del payload
     print(f"[rehydrate] {len(targets)} ml8 (fp8 fwd+bwd), {n_fp8} fp8-tier", flush=True)
     torch.cuda.empty_cache()   # release the freed dead bf16 ml8-layer weights
     _mem("after rehydrate (+ml8 buffers)")
+
+    # ── env-gated module enumeration (ENUMERATE_MODULES=1): classify every
+    # residual nn.Linear that still runs a bf16 aten::mm into fp8-tier-as-bf16
+    # vs untiered, size each by N*K (a FLOP proxy at fixed token count M), then
+    # exit. This sizes MAD-290 lever #1 (route frozen bf16 linears -> fp8 a8w8):
+    # how much of the profiled ~4.5s aten::mm is fp8-tier vs untiered residual.
+    if os.environ.get("ENUMERATE_MODULES"):
+        import torch.nn as _nn, sys as _sys
+        ml8_hf, fp8_hf = set(), set()
+        for _g in targets:
+            try: ml8_hf.add(map_gguf_to_hf(_g))
+            except KeyError: pass
+        for _g in fp8_tier_gguf:
+            try: fp8_hf.add(map_gguf_to_hf(_g))
+            except KeyError: pass
+        cats = {"ml8": [], "fp8_tier": [], "untiered": []}
+        nonstd = 0
+        for nm, mod in model.named_modules():
+            if isinstance(mod, _nn.Linear):
+                c = "ml8" if nm in ml8_hf else ("fp8_tier" if nm in fp8_hf else "untiered")
+                w = getattr(mod, "weight", None)
+                if w is None or w.dim() != 2:
+                    # ml8-attached shell / freed weight: count membership, skip sizing
+                    nonstd += 1
+                    cats[c].append((nm, 0, 0, "non-2d"))
+                    continue
+                N, Kk = int(w.shape[0]), int(w.shape[1])
+                cats[c].append((nm, N, Kk, str(w.dtype)))
+        print(f"(non-2d Linear shells skipped for sizing: {nonstd})", flush=True)
+        print("\n===== MODULE ENUMERATION (residual nn.Linear) =====", flush=True)
+        tot_nk = sum(N * Kk for c in cats for _, N, Kk, _ in cats[c]) or 1
+        for c in ("ml8", "fp8_tier", "untiered"):
+            n = len(cats[c]); nk = sum(N * Kk for _, N, Kk, _ in cats[c])
+            params = nk / 1e6
+            print(f"[{c:9}] count={n:4d}  sum(N*K)={params:9.1f}M  "
+                  f"FLOP-share={100*nk/tot_nk:5.1f}%", flush=True)
+        # the bf16 aten::mm cost is fp8_tier + untiered; report their internal split
+        bf16_nk = sum(N * Kk for c in ("fp8_tier", "untiered") for _, N, Kk, _ in cats[c]) or 1
+        for c in ("fp8_tier", "untiered"):
+            nk = sum(N * Kk for _, N, Kk, _ in cats[c])
+            print(f"   of-bf16-mm: {c:9} = {100*nk/bf16_nk:5.1f}%", flush=True)
+        # break down untiered + fp8_tier by unique (name-suffix, shape) so we can
+        # see WHICH projections dominate (gate/up/down/qkv/head/ssm)
+        from collections import Counter as _Counter
+        for c in ("fp8_tier", "untiered"):
+            agg = _Counter()
+            aggnk = {}
+            for nm, N, Kk, _ in cats[c]:
+                suf = nm.split(".")[-1]
+                key = f"{suf}[{N}x{Kk}]"
+                agg[key] += 1; aggnk[key] = aggnk.get(key, 0) + N * Kk
+            print(f"-- {c} breakdown by (proj, shape) --", flush=True)
+            for key, cnt in sorted(agg.items(), key=lambda kv: -aggnk[kv[0]]):
+                print(f"   {cnt:4d}x {key:28} sum(N*K)={aggnk[key]/1e6:8.1f}M", flush=True)
+        _sys.stdout.flush()
+        _sys.exit(0)
 
     tlist = list(targets.values())
     cent = [at.centroids for at in tlist]
@@ -263,6 +323,57 @@ def main():
                 init_idx_i.shape[0], -1, -1).gather(
                 2, idx_long.unsqueeze(-1)).squeeze(-1)  # [N, K]
             return gathered * init_scl_i[:, gidx]       # [N, K]
+        # ── env-gated matmul tracer (TRACE_MM=1): attribute the big aten::mm calls
+        # to their python call-site (fla scan is Triton, so these are HF-modeling `@`
+        # ops, not fla). Patches torch matmul entry points, runs ONE fwd+bwd, prints
+        # big matmuls grouped by (shapes, source line), exits. MAD-290 diagnostic.
+        if os.environ.get("TRACE_MM"):
+            import sys as _sys, traceback as _tb, collections as _c
+            _sw, _st = (train_w, teach_tr) if train_w else (hold_w, teach_ho)
+            ids0, (i0, v0, t0_) = _sw[0], _st[0]
+            m0 = batch_response_mask(ids0, *resp).reshape(-1).to(dev)
+            agg = _c.defaultdict(int)
+            THRESH = 500_000   # output-numel threshold for "big"
+            _real_tmm = torch.Tensor.matmul
+            _real_fmm = torch.matmul
+            _real_mm = torch.mm
+
+            def _site():
+                for fr in reversed(_tb.extract_stack()[:-2]):
+                    fn = fr.filename
+                    if "smoke_fp8_qat" in fn or "fp8_qat.py" in fn:
+                        continue
+                    if "/torch/" in fn and "modeling_" not in fn:
+                        continue
+                    return f"{fn.split('/')[-1]}:{fr.lineno} {fr.name}"
+                return "?"
+
+            def _rec(out, a, b):
+                try:
+                    if out.dim() >= 2 and out.numel() >= THRESH:
+                        agg[(tuple(a.shape), tuple(b.shape), _site())] += 1
+                except Exception:
+                    pass
+                return out
+
+            _real_dmm = torch.Tensor.__matmul__
+            torch.Tensor.matmul = lambda self, other, *a, **k: _rec(_real_tmm(self, other, *a, **k), self, other)
+            torch.Tensor.__matmul__ = lambda self, other: _rec(_real_dmm(self, other), self, other)
+            torch.matmul = lambda a, b, *ar, **k: _rec(_real_fmm(a, b, *ar, **k), a, b)
+            torch.mm = lambda a, b, *ar, **k: _rec(_real_mm(a, b, *ar, **k), a, b)
+            opt.zero_grad(set_to_none=True)
+            lg = wrapped(ids0)
+            loss = kl_topk(lg.reshape(-1, lg.shape[-1]), i0, v0, t0_, mask=m0)
+            loss.backward()
+            torch.cuda.synchronize()
+            torch.Tensor.matmul = _real_tmm; torch.Tensor.__matmul__ = _real_dmm
+            torch.matmul = _real_fmm; torch.mm = _real_mm
+            print("\n===== BIG MATMUL CALL-SITES (TRACE_MM) =====", flush=True)
+            print(f"(captured {sum(agg.values())} big-matmul calls)", flush=True)
+            for (sa, sb, site), cnt in sorted(agg.items(), key=lambda kv: -kv[1])[:24]:
+                print(f"  {cnt:4d}x  {list(sa)} @ {list(sb)}   <- {site}", flush=True)
+            _sys.exit(0)
+
         # ── env-gated dispatch profiler (PROFILE_STEPS=N): profile the REAL ml8
         # micro-step (fwd through fp8 LUT + SSM, kl_topk loss, backward), report
         # GPU-bound vs host-bound via CPU-blocked-on-GPU time, then exit. Same code
@@ -290,7 +401,14 @@ def main():
             torch.cuda.synchronize()
             wall = (_t.perf_counter() - _s) / 8 * 1e3
             torch.cuda.synchronize()
-            with _profile(activities=[_PA.CPU, _PA.CUDA]) as prof:
+            # Print wall early + allow a profiler-free exit: the torch profiler with
+            # record_shapes chokes on the FWHT rotation's butterfly op explosion
+            # (thousands of slice/cat/add); WALL_ONLY gets a clean step time.
+            print(f"\n[wall-only] {wall:8.1f} ms/micro", flush=True)
+            if os.environ.get("WALL_ONLY"):
+                import sys as _sys2
+                _sys2.exit(0)
+            with _profile(activities=[_PA.CPU, _PA.CUDA], record_shapes=True) as prof:
                 for _ in range(NPF):
                     _micro()
                 torch.cuda.synchronize()
@@ -323,6 +441,18 @@ def main():
             print("-- top HOST self --", flush=True)
             for e in sorted(ka, key=_cpu, reverse=True)[:14]:
                 print(f"  {_cpu(e) / NPF / 1e3:8.2f} ms  x{e.count // NPF:>5}  {e.key[:46]}", flush=True)
+            # ── GEMM attribution by operand shape: which matmuls own the bf16 mm
+            # cost? lm_head is 2560x248320, in_proj 2560x32; small head-dim shapes
+            # => SSM functional matmuls (fla f32 scan), NOT routable via Linear attach.
+            kas = prof.key_averages(group_by_input_shape=True)
+            gemm = [e for e in kas if e.key in ("aten::mm", "aten::addmm",
+                    "aten::matmul", "aten::bmm")]
+            print("-- GEMM (aten::mm/addmm/bmm) by operand shape (device time) --",
+                  flush=True)
+            for e in sorted(gemm, key=_dev, reverse=True)[:20]:
+                shp = getattr(e, "input_shapes", "")
+                print(f"  {_dev(e) / NPF / 1e3:8.2f} ms  x{e.count // NPF:>5}  "
+                      f"{e.key:11} {str(shp)[:60]}", flush=True)
             _sys.exit(0)
 
         while step < max_steps:
