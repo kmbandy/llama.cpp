@@ -341,12 +341,14 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
-        // For turbo types, pad K head_dim to next multiple of 64 for full WHT groups.
-        // WHT auto-detects group_size=64 when head_dim % 128 != 0, so 64-alignment is sufficient.
+        // For turbo types, pad K head_dim to next multiple of 128. MUST match the cpy_k store
+        // path and get_k read path, which both pad to 128; allocating at a smaller (64-aligned)
+        // size makes cpy_k abort when it reshapes the cache to the 128-padded width (e.g. LFM2.5
+        // head_dim 64). No-op when head_dim is already a multiple of 128 (e.g. Qwen).
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
         const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
-        if (k_is_turbo && n_embd_head_k % 64 != 0) {
-            const uint32_t padded_head_k = ((n_embd_head_k + 63) / 64) * 64;
+        if (k_is_turbo && n_embd_head_k % 128 != 0) {
+            const uint32_t padded_head_k = ((n_embd_head_k + 127) / 128) * 128;
             const uint32_t n_head_kv = n_embd_k_gqa / n_embd_head_k;
             n_embd_k_gqa_eff = n_head_kv * padded_head_k;
             if (il == 0) {
