@@ -263,6 +263,68 @@ def main():
                 init_idx_i.shape[0], -1, -1).gather(
                 2, idx_long.unsqueeze(-1)).squeeze(-1)  # [N, K]
             return gathered * init_scl_i[:, gidx]       # [N, K]
+        # ── env-gated dispatch profiler (PROFILE_STEPS=N): profile the REAL ml8
+        # micro-step (fwd through fp8 LUT + SSM, kl_topk loss, backward), report
+        # GPU-bound vs host-bound via CPU-blocked-on-GPU time, then exit. Same code
+        # path as the train loop below, so it is faithful, not a proxy.
+        if os.environ.get("PROFILE_STEPS"):
+            import time as _t, sys as _sys
+            from torch.profiler import profile as _profile, ProfilerActivity as _PA
+            NPF = int(os.environ["PROFILE_STEPS"])
+            _sw, _st = (train_w, teach_tr) if train_w else (hold_w, teach_ho)
+            ids0, (i0, v0, t0_) = _sw[0], _st[0]
+            m0 = batch_response_mask(ids0, *resp).reshape(-1).to(dev)
+
+            def _micro():
+                opt.zero_grad(set_to_none=True)
+                lg = wrapped(ids0)
+                loss = kl_topk(lg.reshape(-1, lg.shape[-1]), i0, v0, t0_, mask=m0)
+                loss.backward()
+
+            for _ in range(3):
+                _micro()
+            torch.cuda.synchronize()
+            _s = _t.perf_counter()
+            for _ in range(8):
+                _micro()
+            torch.cuda.synchronize()
+            wall = (_t.perf_counter() - _s) / 8 * 1e3
+            torch.cuda.synchronize()
+            with _profile(activities=[_PA.CPU, _PA.CUDA]) as prof:
+                for _ in range(NPF):
+                    _micro()
+                torch.cuda.synchronize()
+            ka = prof.key_averages()
+
+            def _dev(e):
+                for a in ("self_device_time_total", "self_cuda_time_total"):
+                    if hasattr(e, a):
+                        return getattr(e, a)
+                return 0
+
+            def _cpu(e):
+                return getattr(e, "self_cpu_time_total", 0)
+
+            def _ck(subs):
+                return sum(e.count for e in ka if any(s in e.key for s in subs))
+
+            sync_ms = sum(_cpu(e) for e in ka if "Synchronize" in e.key) / NPF / 1e3
+            launch_ms = sum(_cpu(e) for e in ka if "LaunchKernel" in e.key) / NPF / 1e3
+            launches = _ck(["LaunchKernel"]) / NPF
+            print("\n===== REAL ML8 MICRO-STEP PROFILE =====", flush=True)
+            print(f"[wall]                              {wall:8.1f} ms/micro", flush=True)
+            print(f"[CPU blocked-on-GPU (Synchronize)]  {sync_ms:8.1f} ms/micro "
+                  f"=> {sync_ms / wall * 100:4.0f}% of wall  (HIGH => GPU-bound)", flush=True)
+            print(f"[CPU dispatch (LaunchKernel self)]  {launch_ms:8.1f} ms/micro "
+                  f"({launches:.0f} launches)  (HIGH + low-sync => HOST-bound)", flush=True)
+            print("-- top DEVICE (GPU) kernels --", flush=True)
+            for e in sorted(ka, key=_dev, reverse=True)[:14]:
+                print(f"  {_dev(e) / NPF / 1e3:8.2f} ms  x{e.count // NPF:>5}  {e.key[:46]}", flush=True)
+            print("-- top HOST self --", flush=True)
+            for e in sorted(ka, key=_cpu, reverse=True)[:14]:
+                print(f"  {_cpu(e) / NPF / 1e3:8.2f} ms  x{e.count // NPF:>5}  {e.key[:46]}", flush=True)
+            _sys.exit(0)
+
         while step < max_steps:
             for ids, (idx, vals, tail) in zip(train_w, teach_tr):
                 lg = wrapped(ids)
