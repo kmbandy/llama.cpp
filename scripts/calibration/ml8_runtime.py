@@ -26,6 +26,7 @@ Loading and kernel-launch convention (matches kernel expectations):
 from __future__ import annotations
 
 import sys
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -337,6 +338,52 @@ def ml8_layer_from_blob(
     )
 
 
+# Packed-indices cache: id(indices) -> (weakref, version, device_str, packed).
+# During Axis-A QAT the index buffers are FROZEN (only the reassign step mutates
+# them, in place). Packing them once and reusing across forwards removes the
+# per-forward .cpu()/numpy() host round-trip that dominated step time (MAD-281
+# trainer profile: ~12.9s/65% of host self-time was this repack). Keyed on the
+# tensor's _version so an in-place reassign auto-invalidates; weakref guards
+# against id() reuse after a buffer is freed.
+_PACK_CACHE: dict[int, tuple[Any, int, str, torch.Tensor]] = {}
+
+
+def _pack_indices_lo_first(
+    indices: torch.Tensor, device: torch.device | str = "cpu"
+) -> torch.Tensor:
+    """Pack [N, K] uint8 centroid indices (0..15) → [K//2, N] lo-first nibbles.
+
+    Pure torch bit-ops, ON the indices' device — no numpy, no host round-trip.
+    Byte-identical to the deployed kernel's nibble layout: for packed column
+    ``k`` the low nibble is input column ``2k`` and the high nibble is ``2k+1``.
+    """
+    idx = indices.to(torch.uint8)
+    lo = idx[:, 0::2]                                   # [N, K//2]
+    hi = idx[:, 1::2]                                   # [N, K//2]
+    packed = (lo & 0x0F) | ((hi & 0x0F) << 4)          # [N, K//2] uint8
+    return packed.t().contiguous().to(device)           # [K//2, N]
+
+
+def _packed_indices_cached(
+    indices: torch.Tensor, device: torch.device | str
+) -> torch.Tensor:
+    """Packed indices for ``indices``, reusing a cached buffer until it mutates.
+
+    Cache key is (id, _version, device): an in-place reassign bumps ``_version``
+    and re-packs; a weakref identity check rejects a stale entry whose id() was
+    reused by a different tensor.
+    """
+    key = id(indices)
+    dev = str(torch.device(device))
+    ver = indices._version
+    hit = _PACK_CACHE.get(key)
+    if hit is not None and hit[0]() is indices and hit[1] == ver and hit[2] == dev:
+        return hit[3]
+    packed = _pack_indices_lo_first(indices, device)
+    _PACK_CACHE[key] = (weakref.ref(indices), ver, dev, packed)
+    return packed
+
+
 def layer_from_components(
     centroids: torch.Tensor,
     scales: torch.Tensor,
@@ -378,14 +425,9 @@ def layer_from_components(
             "The ml8 kernel only supports uniform contiguous K-groups."
         )
 
-    # Pack indices [N, K] uint8 → [K//2, N] uint8 (lo-first nibble convention).
-    idx_np = indices.cpu().contiguous().numpy()   # [N, K]
-    lo = idx_np[:, 0::2]
-    hi = idx_np[:, 1::2]
-    packed_n_kp = (lo & 0x0F) | ((hi & 0x0F) << 4)   # [N, K//2] uint8
-    indices_packed = (
-        torch.from_numpy(packed_n_kp.T.copy()).contiguous().to(device)
-    )  # [K//2, N]
+    # Pack indices [N, K] uint8 → [K//2, N] uint8 (lo-first nibble convention),
+    # on-device with torch bit-ops and cached until the buffer is mutated.
+    indices_packed = _packed_indices_cached(indices, device)
 
     # Cast centroids to fp8 e4m3 (accept fp32 or already-fp8).
     if centroids.dtype == torch.float8_e4m3fn:
