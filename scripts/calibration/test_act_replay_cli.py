@@ -1353,3 +1353,76 @@ def test_gptq_reassign_targets_lowers_reconstruction_and_updates_indices():
     # The essential contract: GPTQ re-solve must lower H-reconstruction error.
     assert after < before, \
         f"GPTQ re-solve must lower H-reconstruction error: {after:.4f} !< {before:.4f}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="GPU-gated (matches gptq-arm test neighbors)")
+def test_gptq_reassign_targets_anchor_provider_matches_w_orig():
+    """The streaming anchor_provider path must be BIT-EXACT equivalent to the
+    captured-W_orig path.
+
+    The gptq arm skips capturing W_orig (keep_w_orig=False) to avoid holding all
+    ~200 fp32 anchors (~16GB) on the GPU. gptq_reassign_targets must instead
+    accept an anchor_provider(name, at) that reconstructs the initial PTQ anchor
+    on demand. This test proves that, given an anchor_provider returning the SAME
+    tensor W_orig would have held, the re-solve yields IDENTICAL indices + count.
+
+    Anchor math (must match AttachedTarget.weight() at attach time, detached):
+        snap_to_e4m3(init_centroids)[gidx] gathered by init_indices.long(),
+        times init_scales[:, gidx].
+    """
+    from act_replay import gptq_reassign_targets
+    from act_replay_student import AttachedTarget
+    from centroid_quantizer import snap_to_e4m3
+
+    dev = torch.device("cuda")
+    K, N, G, NC = 64, 8, 2, 16
+    g = torch.Generator().manual_seed(7)
+    cent = (torch.randn(G, NC, generator=g)
+            .to(torch.float8_e4m3fn).to(torch.float32)
+            .sort(-1).values)
+    scales = torch.rand(N, G, generator=g) + 0.5
+    good_idx = torch.randint(0, NC, (N, K), generator=g)
+    state = {"indices": good_idx.clone(), "scales": scales, "centroids": cent,
+             "rotation": None}
+    at = AttachedTarget(state).to(dev)
+    # at.W_orig is dequant(good_idx) on dev — the captured anchor.
+
+    # Tiny SPD Hessian H = X^T X / n (on dev).
+    X = torch.randn(300, K, generator=g).to(dev)
+    H = (X.t() @ X) / X.shape[0]
+    H_by_name = {"t": H}
+
+    # Capture the initial anchor ingredients BEFORE we null W_orig, so the closure
+    # reconstructs the bit-exact initial anchor (snap on init centroids, init
+    # indices long-gather, init scales broadcast by gidx).
+    init_cent = at.centroids.detach().clone()
+    init_scl = at.scales.detach().clone()
+    init_idx = at.indices.detach().clone()
+    init_gidx = at.gidx.detach().clone()
+    orig_live_idx = at.indices.detach().clone()  # to reset between runs
+
+    # ── Run A: captured-W_orig path ─────────────────────────────────────────
+    nA = gptq_reassign_targets({"t": at}, H_by_name, percdamp=0.05, act_order=True)
+    idx_A = at.indices.detach().clone()
+
+    # ── Run B: streaming anchor_provider path ───────────────────────────────
+    at.indices.copy_(orig_live_idx)   # reset live indices to the pre-resolve state
+    at.W_orig = None                  # simulate keep_w_orig=False
+
+    def anchor_provider(name, tgt):
+        cent_snap = snap_to_e4m3(init_cent)               # [G, NC]
+        cent_per_col = cent_snap[init_gidx]               # [K, NC]
+        idx_long = init_idx.long()                        # [N, K]
+        gathered = cent_per_col.unsqueeze(0).expand(
+            init_idx.shape[0], -1, -1).gather(
+            2, idx_long.unsqueeze(-1)).squeeze(-1)        # [N, K]
+        return gathered * init_scl[:, init_gidx]          # [N, K]
+
+    nB = gptq_reassign_targets({"t": at}, H_by_name, percdamp=0.05,
+                               act_order=True, anchor_provider=anchor_provider)
+    idx_B = at.indices.detach().clone()
+
+    assert nA == nB, f"changed-count differs: W_orig={nA} vs provider={nB}"
+    assert torch.equal(idx_A, idx_B), \
+        "streaming anchor_provider must reproduce captured-W_orig indices exactly"

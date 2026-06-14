@@ -32,6 +32,7 @@ from act_replay import (load_hf_model, _LMWrap, _attach_one, _install_one,
                         reassign_targets, lr_warmup_cosine, split_batches_seq,
                         collect_target_hessians, gptq_reassign_targets)
 from act_replay_student import select_targets
+from centroid_quantizer import snap_to_e4m3
 from gguf_state import open_ml8_gguf, list_ml8_names
 from kl_loss import topk_teacher, kl_topk
 from fp8_qat import Ml8Fp8Fn
@@ -236,6 +237,32 @@ def main():
         torch.cuda.reset_peak_memory_stats(); _mem("arm resident (pre-train)")
         _probed = [False]
         gptq_H = {"H": None}   # rung B: rotated Hessian, collected once, reused per re-solve
+        # RAM-safe streaming anchor for the gptq / gptq-interleave arms. Those skip
+        # capturing W_orig (keep_w_orig=False) — holding all ~200 fp32 anchors ≈ the
+        # whole 4B model (~16GB) and OOM'd the GPU. Instead reconstruct the INITIAL
+        # ml8-dequant PTQ anchor on demand (peak ~one [N,K] ~100MB, freed after each
+        # target). Uses the pre-train snapshot (init_cs / init_idx, in tlist order),
+        # bit-exact to AttachedTarget.weight() at attach time:
+        #   snap_to_e4m3(init_centroids)[gidx] gathered by init_indices.long()
+        #   times init_scales[:, gidx].
+        # The anchor is the FIXED initial PTQ target (init indices, NOT the mutated
+        # current ones), so it stays constant across interleaved re-solves.
+        name_to_i = {nm: i for i, nm in enumerate(targets.keys())}
+        n = len(tlist)
+
+        def anchor_provider(name, at):
+            i = name_to_i[name]
+            init_cent = init_cs[i].to(dev)              # [G, NC]
+            init_scl_i = init_cs[n + i].to(dev)         # [N, G]
+            init_idx_i = init_idx[i].to(dev)            # [N, K] uint8
+            gidx = at.gidx                              # [K] long
+            cent_snap = snap_to_e4m3(init_cent)         # [G, NC]
+            cent_per_col = cent_snap[gidx]              # [K, NC]
+            idx_long = init_idx_i.long()                # [N, K]
+            gathered = cent_per_col.unsqueeze(0).expand(
+                init_idx_i.shape[0], -1, -1).gather(
+                2, idx_long.unsqueeze(-1)).squeeze(-1)  # [N, K]
+            return gathered * init_scl_i[:, gidx]       # [N, K]
         while step < max_steps:
             for ids, (idx, vals, tail) in zip(train_w, teach_tr):
                 lg = wrapped(ids)
@@ -266,7 +293,8 @@ def main():
                             gptq_H["H"] = collect_target_hessians(targets, train_w, model, dev)
                             model.train()
                         flips = gptq_reassign_targets(targets, gptq_H["H"],
-                                                      percdamp=0.05, act_order=True)
+                                                      percdamp=0.05, act_order=True,
+                                                      anchor_provider=anchor_provider)
                     # Eval cadence: reassign_interval is a multiple of eval_interval in
                     # practice, so every reassign step also reports its post-flip KL.
                     if step % eval_interval == 0 or step >= max_steps:
@@ -283,7 +311,9 @@ def main():
         if reassign_mode == "gptq":
             print(f"[arm {label}] collecting rotated Hessians ({len(targets)} targets)...", flush=True)
             H_by_name = collect_target_hessians(targets, train_w, model, dev)
-            nflip = gptq_reassign_targets(targets, H_by_name, percdamp=0.05, act_order=True)
+            nflip = gptq_reassign_targets(targets, H_by_name, percdamp=0.05,
+                                          act_order=True,
+                                          anchor_provider=anchor_provider)
             kf = holdout_kl()
             print(f"[arm {label}] post-GPTQ-reassign KL {kf:.4f}  ({nflip} indices changed)", flush=True)
         return k0, kf

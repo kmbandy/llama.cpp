@@ -133,7 +133,8 @@ def collect_target_hessians(targets, calib, model, dev):
     return {name: at.finalize_hessian() for name, at in targets.items()}
 
 
-def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
+def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True,
+                          anchor_provider=None):
     """Axis B (full-H GPTQ): re-solve each target's indices vs its CURRENT
     (Axis-A-tuned, e4m3-snapped) centroids using the per-target rotated Hessian.
     Builds E=1 stacks and calls batched_gptq_reassign. Targets without a stashed H
@@ -142,10 +143,22 @@ def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
     NOTE: `targets` is a dict {name: AttachedTarget} (names index into H_by_name) —
     NOT a list like the sibling reassign_targets takes.
 
+    The reconstruction anchor (the initial ml8-dequant PTQ target GPTQ re-solves
+    toward) is `at.W_orig`, the same fixed initial weight across repeated re-solves.
     W_orig, the rotated Hessian H, and the centroids all live in the SAME rotated
     basis — no rotation handling is needed here. Reassigns against the SNAPPED
     centroids (the actual e4m3 LUT values the forward/kernel uses), matching the
     convention in reassign_targets.
+
+    `anchor_provider` (Callable[[str, AttachedTarget], Tensor] | None): RAM-safe
+    streaming anchor source for arms that skip capturing W_orig (keep_w_orig=False)
+    to avoid holding all ~200 fp32 anchors (~16GB) on the GPU. When `at.W_orig` is
+    None, the anchor is fetched via `anchor_provider(name, at)` -> [N, K] tensor,
+    reconstructed on demand and freed after each target so peak stays at one anchor
+    (~100MB) rather than the whole model. The provider MUST return the same fixed
+    initial PTQ anchor each call (reconstructed from INIT centroids/indices/scales),
+    so the re-solve target stays constant across interleaved re-solves. If W_orig is
+    None and no provider is given, raises ValueError naming the target.
     """
     from batched_gptq import batched_gptq_reassign
 
@@ -157,7 +170,17 @@ def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
         K = at.indices.shape[1]
         n_groups = at.centroids.shape[0]
         group_size = K // n_groups
-        W = at.W_orig.unsqueeze(0).float()                        # [1, N, K]
+        if at.W_orig is not None:
+            w_src = at.W_orig
+        elif anchor_provider is not None:
+            w_src = anchor_provider(name, at)            # [N, K], reconstructed
+        else:
+            raise ValueError(
+                f"gptq_reassign_targets: target {name!r} has W_orig=None and no "
+                "anchor_provider was supplied. The gptq arm needs either a captured "
+                "W_orig or an anchor_provider(name, at) to reconstruct the initial "
+                "ml8-dequant anchor on demand.")
+        W = w_src.unsqueeze(0).float()                            # [1, N, K]
         Hs = H.to(W.device).unsqueeze(0).float()                  # [1, K, K]
         cents = snap_to_e4m3(at.centroids).detach().unsqueeze(0)  # [1, n_groups, NC]
         scl = at.scales.detach().unsqueeze(0)                     # [1, N, n_groups]
@@ -169,6 +192,8 @@ def gptq_reassign_targets(targets, H_by_name, *, percdamp=0.05, act_order=True):
         changed = int((new_idx != at.indices).sum().item())
         at.indices.copy_(new_idx)
         total += changed
+        # Free the (possibly streamed) anchor so peak stays at one target's [N,K].
+        del w_src, W, Hs, cents, scl, new_idx
     return total
 
 
