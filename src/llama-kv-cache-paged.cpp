@@ -108,8 +108,17 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     // stay default-constructed (k/v == nullptr) and never queried.
     const auto & hparams = model.hparams;
     const uint32_t n_layer    = hparams.n_layer();
-    const uint32_t head_dim   = hparams.n_embd_head_v(/*il=*/0);
-    const uint32_t n_kv_heads = hparams.n_head_kv(/*il=*/0);
+    // Hybrid models (e.g. LFM2.5 lfm2moe) interleave conv/recurrent layers
+    // (n_head_kv == 0) with attention layers; layer 0 may be non-attention.
+    // Size the paged K/V storage from the first attention layer (n_head_kv > 0).
+    uint32_t head_dim = 0, n_kv_heads = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hparams.n_head_kv(il) > 0) {
+            n_kv_heads = hparams.n_head_kv(il);
+            head_dim   = hparams.n_embd_head_v(il);
+            break;
+        }
+    }
 
     GGML_ASSERT(head_dim > 0 && "head_dim must be > 0");
     GGML_ASSERT(n_kv_heads > 0 && "n_kv_heads must be > 0");
