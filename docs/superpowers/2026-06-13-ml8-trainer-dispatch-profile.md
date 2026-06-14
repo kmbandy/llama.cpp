@@ -88,3 +88,79 @@ ops, then exits. `profile_dispatch.py` is the plain-model variant.) RAM-safe: ru
 - Profiler tooling (`profile_dispatch.py`, `PROFILE_STEPS` block in `smoke_fp8_qat.py`)
   — commit alongside this doc.
 - mneme daemon (127.0.0.1:8810) was 500-ing on writes through this session.
+
+---
+
+## UPDATE 2026-06-13 (evening) — #223+#224 landed, re-profiled, new bottleneck
+
+### Result: 1.87× faster, root cause confirmed
+Re-ran the identical 4B / 1×1024 profiled micro-step after committing #223
+(`192e7da8c`, pack indices on-GPU + cache packed layer) and #224 (`da0e0ca3b`,
+validate gidx once per buffer).
+
+| Metric | Before | After | |
+|---|---|---|---|
+| wall | 19,800 ms | **10,603 ms** | **1.87×** |
+| CPU blocked-on-GPU | 1,329 ms (7%) | 2,387 ms (23%) | flipped toward GPU-bound |
+| **Ml8Fp8Fn host self** | **12,863 ms (65%)** | **207 ms** | the host mountain is gone |
+| DtoH memcpys | 2,000 | 800 | index repack + gidx copy removed |
+| kernel launches | 77,012 | 76,964 | unchanged (still to do) |
+
+The `indices.cpu().numpy()` repack collapsed 12.86s → 0.21s exactly as predicted.
+The step is no longer host-bound on our custom op. (Both numbers are *profiled*
+wall — profiler inflates CPU — so they're apples-to-apples; unprofiled wall is
+lower.) RAM-safe SOP held: watchdog re-asserted oom_adj=600, RAM dipped to 873MB
+but stayed above the 600MB floor, clean exit.
+
+### NEW dominant cost: bf16 GEMM on the *frozen* weights (only ml8 targets are fp8)
+After-profile top GPU cost is **`aten::mm` 4,549 ms (1,195 calls)** — bf16 linears,
+NOT fp8. Root cause found in the rehydrate path (`smoke_fp8_qat.py:181-189`):
+- **ml8 targets (200)** → `_attach_one(fp8=True)` → real `Ml8Fp8Fn` a8w8 fp8 kernel.
+  These are the only genuine fp8-compute layers.
+- **"fp8-tier" tensors (49)** → the `else` branch → `_install_one(..., torch.bfloat16,
+  ...)` → `mod.weight.copy_(w.to(dtype=bfloat16))` (`act_replay.py:888`). "fp8-tier"
+  is their *storage/deployment* tier; in this PyTorch trainer they are dequantized
+  to **bf16** and run as ordinary `nn.Linear` → bf16 `aten::mm`.
+- **Untiered residual linears** (anything not in the GGUF stream: SSM gates/projections,
+  head, whatever calibration left un-quantized) keep their bf16 parent weights → also
+  `aten::mm`.
+
+So the frozen, non-trained weights took a bf16 shortcut (numerically fine — frozen,
+carrying fp8-faithful dequant values — but a big chunk of GEMM FLOPs runs bf16). In
+*deployment* (llama.cpp C++) those same weights run `ML8_FP8` WMMA (fp8). Why it's
+slow specifically: rocBLAS mis-selected **`MT16`/`MT8` skinny tiles (~7 ms/call)** for
+M≈1024 GEMMs that should use `MT128` (~1 ms/call). rocBLAS tile autotune is
+non-deterministic — the *before* run happened to pick MT128, this run picked MT16.
+
+### Remaining speedup backlog (re-scoped from fresh numbers)
+Ranked by lever size on the 10.6s step:
+1. **Route frozen fp8-tier + untiered linears through the fp8 a8w8 path** (the one
+   the ml8 targets already use). Matches deployment numerics AND sidesteps the bad
+   rocBLAS tiles. Biggest lever: ~4.5s of bf16 `aten::mm` → est ~1.5s. **(was #225's
+   surprise — promote to #225-A.)**
+2. **Trace + kill the remaining 800 DtoH memcpys** (`hipMemcpyWithStream` 3,852 ms) —
+   ~4 per ml8 layer, likely the backward dense-`W` rebuild / fp8-quant amax path.
+3. **Cut the 77K launches** (`hipLaunchKernel` 2,378 ms) — fuse the small elementwise
+   (`snap_to_e4m3`: ~10.8K `bitwise_and` + 4.4K `bitwise_or` + `where`/`copy_`;
+   fp8-quant; index pack) into the Triton path; drop the dense `[N,K]` W rebuild in
+   `Ml8Fp8Fn.backward`. The original #225 framing.
+4. **Multithreaded producer/consumer dispatch queue** (kmbandy's idea) — keep the GPU
+   fed across remaining launches. Only pays off after the forced syncs/host-serial
+   points are gone (which #223/#224 mostly did).
+
+### Open / not-yet-pinned
+- **Confirm the rocBLAS tile non-determinism** with one more profile before committing
+  to lever #1 — verify the 4.5s `aten::mm` is stable, not a one-off bad autotune.
+- **Exact split** of the 4.5s between the 49 fp8-tier-as-bf16 and the untiered residual:
+  enumerate the student's Linear modules, classify each as ml8 / fp8-tier-bf16 /
+  untiered-bf16 (one 4B load).
+- **VRAM note from #223:** packed indices are now resident per layer (cached, not
+  rebuilt-and-freed each forward) — a bounded +~half-the-index-bytes on GPU. R9700 is
+  32GB (not 16 as earlier assumed: torch reports cuda:0 = AMD Radeon AI PRO R9700 34.2GB),
+  step peaked ~11GB VRAM, so headroom is fine.
+- The R9700 is torch **cuda:0**; the RX 6900 XT is cuda:1 (now hosts the E2Rank
+  embedding server — moved off host RAM). Pin trainer with `HIP_VISIBLE_DEVICES=0`.
+
+### Jira / KG
+Backlog filed as a MAD story (fp8-QAT trainer speedup follow-ups). KG updated
+(mneme back up after the embedding migration that caused the all-session 500s).
