@@ -374,6 +374,58 @@ def main():
                 print(f"  {cnt:4d}x  {list(sa)} @ {list(sb)}   <- {site}", flush=True)
             _sys.exit(0)
 
+        # ── TRACE_ELEM: attribute the host-bound elementwise launch storm
+        # (bitwise_and/or, where, copy_, .to) to call-sites, one fwd+bwd. Tells us
+        # whether the ~49K small-op launches concentrate in a fusable ml8 prologue
+        # or spread across the model forward (decides fusion vs whole-step capture).
+        if os.environ.get("TRACE_ELEM"):
+            import sys as _sys, traceback as _tb, collections as _c
+            _sw, _st = (train_w, teach_tr) if train_w else (hold_w, teach_ho)
+            ids0, (i0, v0, t0_) = _sw[0], _st[0]
+            m0 = batch_response_mask(ids0, *resp).reshape(-1).to(dev)
+            agg = _c.defaultdict(int)
+
+            def _esite():
+                for fr in reversed(_tb.extract_stack()[:-2]):
+                    fn = fr.filename
+                    if "/torch/" in fn or "traceback" in fn or "smoke_fp8_qat" in fn:
+                        continue
+                    return f"{fn.split('/')[-1]}:{fr.lineno} {fr.name}"
+                return "?"
+
+            _ba, _bo, _wh = torch.bitwise_and, torch.bitwise_or, torch.where
+            _cp, _to = torch.Tensor.copy_, torch.Tensor.to
+
+            def _mk(name, real, is_method):
+                def _w(*a, **k):
+                    agg[(name, _esite())] += 1
+                    return real(*a, **k)
+                return _w
+            torch.bitwise_and = _mk("bitwise_and", _ba, False)
+            torch.bitwise_or = _mk("bitwise_or", _bo, False)
+            torch.where = _mk("where", _wh, False)
+            torch.Tensor.copy_ = _mk("copy_", _cp, True)
+            torch.Tensor.to = _mk("to", _to, True)
+            opt.zero_grad(set_to_none=True)
+            lg = wrapped(ids0)
+            loss = kl_topk(lg.reshape(-1, lg.shape[-1]), i0, v0, t0_, mask=m0)
+            loss.backward()
+            torch.cuda.synchronize()
+            torch.bitwise_and = _ba; torch.bitwise_or = _bo; torch.where = _wh
+            torch.Tensor.copy_ = _cp; torch.Tensor.to = _to
+            print("\n===== ELEMENTWISE CALL-SITES (TRACE_ELEM, one fwd+bwd) =====", flush=True)
+            print(f"(captured {sum(agg.values())} traced-op calls)", flush=True)
+            by_site = _c.defaultdict(int)
+            for (op, site), cnt in agg.items():
+                by_site[site] += cnt
+            print("-- by call-site (all ops summed) --", flush=True)
+            for site, cnt in sorted(by_site.items(), key=lambda kv: -kv[1])[:20]:
+                print(f"  {cnt:5d}  {site}", flush=True)
+            print("-- by (op, site) --", flush=True)
+            for (op, site), cnt in sorted(agg.items(), key=lambda kv: -kv[1])[:25]:
+                print(f"  {cnt:5d}  {op:12s} {site}", flush=True)
+            _sys.exit(0)
+
         # ── env-gated dispatch profiler (PROFILE_STEPS=N): profile the REAL ml8
         # micro-step (fwd through fp8 LUT + SSM, kl_topk loss, backward), report
         # GPU-bound vs host-bound via CPU-blocked-on-GPU time, then exit. Same code
