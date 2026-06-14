@@ -99,3 +99,44 @@ def test_layer_caches_packed_indices_until_mutated():
     assert l3.indices_packed.data_ptr() != l1.indices_packed.data_ptr()
     # And the re-packed layout is still correct for the mutated indices.
     assert torch.equal(_unpack(l3.indices_packed, N, K), indices)
+
+
+def test_gidx_validation_still_rejects_nonuniform():
+    # The uniform-contiguous-grouping invariant must still be enforced — the ml8
+    # kernel only supports it. A scrambled gidx raises ValueError.
+    N, K, G, NC = 4, 8, 2, 16
+    gsize = K // G
+    centroids = torch.randn(G, NC).to(torch.float8_e4m3fn).float()
+    scales = torch.rand(N, G) + 0.5
+    indices = torch.randint(0, NC, (N, K), dtype=torch.uint8)
+    bad_gidx = (torch.arange(K) // gsize).flip(0)                    # non-contiguous
+    try:
+        ml8_runtime.layer_from_components(
+            centroids=centroids, scales=scales, indices=indices, gidx=bad_gidx)
+        raise AssertionError("expected ValueError for non-uniform gidx")
+    except ValueError:
+        pass
+
+
+def test_gidx_validated_once_across_repeated_calls(monkeypatch):
+    # gidx is invariant during training; validating it on every forward forced a
+    # DtoH sync (~200/micro). It must be validated once per buffer, then skipped.
+    N, K, G, NC = 4, 8, 2, 16
+    gsize = K // G
+    centroids = torch.randn(G, NC).to(torch.float8_e4m3fn).float()
+    scales = torch.rand(N, G) + 0.5
+    indices = torch.randint(0, NC, (N, K), dtype=torch.uint8)
+    gidx = torch.arange(K) // gsize
+
+    calls = {"equal": 0}
+    real_equal = torch.equal
+
+    def spy_equal(a, b):
+        calls["equal"] += 1
+        return real_equal(a, b)
+
+    monkeypatch.setattr(torch, "equal", spy_equal)
+    for _ in range(3):
+        ml8_runtime.layer_from_components(
+            centroids=centroids, scales=scales, indices=indices, gidx=gidx)
+    assert calls["equal"] == 1, f"gidx validated {calls['equal']}x, expected once"

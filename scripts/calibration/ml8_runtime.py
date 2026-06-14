@@ -364,6 +364,32 @@ def _pack_indices_lo_first(
     return packed.t().contiguous().to(device)           # [K//2, N]
 
 
+# gidx (column→group map) is invariant for the life of an ml8 buffer, but the
+# kernel only supports uniform contiguous grouping, so it must be checked. Doing
+# the check every forward forced a DtoH sync (torch.equal) ~200×/micro. Validate
+# once per (id, _version) and remember the result instead.
+_GIDX_OK: set[tuple[int, int]] = set()
+
+
+def _validate_gidx_once(gidx: torch.Tensor, group_size: int, K: int, G: int) -> None:
+    """Assert gidx is uniform contiguous grouping; validate once per buffer.
+
+    Builds the expected map on gidx's own device (no host copy of the buffer) and
+    compares once; subsequent calls with the same unmutated gidx are a set lookup.
+    """
+    key = (id(gidx), gidx._version)
+    if key in _GIDX_OK:
+        return
+    expected = torch.arange(K, device=gidx.device, dtype=torch.long) // group_size
+    if not torch.equal(gidx.to(torch.long), expected):
+        raise ValueError(
+            f"layer_from_components: gidx does not match uniform contiguous grouping "
+            f"(group_size={group_size}, K={K}, G={G}). "
+            "The ml8 kernel only supports uniform contiguous K-groups."
+        )
+    _GIDX_OK.add(key)
+
+
 def _packed_indices_cached(
     indices: torch.Tensor, device: torch.device | str
 ) -> torch.Tensor:
@@ -417,13 +443,8 @@ def layer_from_components(
     group_size = K // G
 
     # Validate uniform contiguous grouping — kernel only supports this layout.
-    expected_gidx = torch.arange(K, dtype=torch.long) // group_size
-    if not torch.equal(gidx.cpu().long(), expected_gidx):
-        raise ValueError(
-            f"layer_from_components: gidx does not match uniform contiguous grouping "
-            f"(group_size={group_size}, K={K}, G={G}). "
-            "The ml8 kernel only supports uniform contiguous K-groups."
-        )
+    # Cached per buffer so the DtoH sync happens once, not every forward.
+    _validate_gidx_once(gidx, group_size, K, G)
 
     # Pack indices [N, K] uint8 → [K//2, N] uint8 (lo-first nibble convention),
     # on-device with torch bit-ops and cached until the buffer is mutated.
