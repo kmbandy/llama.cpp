@@ -170,3 +170,90 @@ exercised).
 * Reverting the multi-seq commits — they aren't the cause.
 * Rewriting from scratch — the existing kernel is mostly right; it's
   one or two layout / shape assumption bugs.
+
+---
+
+## 2026-06-15 session — non-WMMA prefill, gfx803 perf, checkpoint+paged, tool bleed
+
+Investigation on **mad-lab-2026** (GTX 1070 / sm_61 / CUDA `build-army`;
+RX 480 / gfx803 / HIP `build-rocm-gfx803` in docker `rx480-army`).
+
+### A. Paged PREFILL was on the slow scalar kernel for ALL non-WMMA GPUs (fixed)
+
+`nsys` on a 2501-tok paged prefill (1070): `mt_paged_attention_kernel`
+= **84.7% of GPU time, 623 ms/launch**, grid `n_heads×num_seqs` (NO query
+parallelism). Root cause: the fast query-tiled prefill kernel
+(`mt_pagedattn_tile.cu`, grid `n_heads×num_seqs×n_q_tiles`) is gated at
+`mt_pagedattn.cu` behind `tile_gate_on = wmma_ok && tile_env_on`, and
+`wmma_ok = amd_wmma_available(cc)` is **RDNA3/4-only**. So Pascal (1070)
+and GCN/gfx803 (480) both fall through to the scalar O(n_q·n_kv) kernel.
+Decode was unaffected (`launch_paged_attn_decode` is not WMMA-gated).
+
+**Fix (uncommitted, working tree):**
+1. Added a portable FMA `#else` body to `mt_paged_attention_tile_kernel`
+   (was `NO_DEVICE_CODE`): QK^T as smem dot-products, scores→`smem_s`,
+   scores·V as smem GEMM. Same lane layout as the WMMA path; shfl
+   reductions pass explicit `WARP_SIZE` (correct on gfx803 64-lane waves).
+   Footprint ~13 KiB @ HS128 (fits Pascal's 48 KiB).
+2. Dispatch: `tile_gate_on = tile_env_on` (drop `wmma_ok`); force
+   `mw_on=false` on non-WMMA (multi-warp tile still WMMA-only).
+3. **Also fixed a latent grid-sizing bug** (same class as the decode
+   `93a1e6a11` fix): the tile launches sized `n_q_tiles` from
+   `avg_q_len = total_q_tokens/num_seqs`, which floors with idle
+   `--parallel` slots (1 active + N idle) → high Q-tiles never launch →
+   uncomputed rows → token-salad. Now use `total_q_tokens`. **This also
+   fixes the WMMA path and is very likely the core of MAD-288.**
+
+**Verified:** 1070 (CUDA) paged prefill **160 → 328 t/s** (non-paged ref
+395), output byte-matches the scalar oracle (`GGML_PAGED_TILE=0`) for
+Qwen3.5-9B (HS128) and LFM2.5-8B-A1B (HS64 **padded to 128** in the paged
+cache → uses the tile path; no separate HS64 work needed — clarifies
+MAD-298). 480 (gfx803): output correct, no crash. Revert: `GGML_PAGED_TILE=0`.
+
+### B. gfx803 (RX 480) ROCm is ~10× slower than Vulkan — and it's NOT the attn kernel
+
+Same card, Qwen3.5-9B, `-p512 -n128`:
+
+| Path | Prefill | Decode |
+|---|---|---|
+| gfx803 ROCm/HIP, paged tile | 16.6 t/s | — |
+| gfx803 ROCm/HIP, paged scalar | 13.8 t/s | — |
+| **480 via Vulkan0 (RADV, f16 KV)** | **162 t/s** | 20.4 t/s |
+| 1070 via Vulkan | 181 t/s | — |
+
+Tile ≈ scalar on gfx803 (both ~16) → the bottleneck is **gfx803 ROCm/HIP
+itself**, not the attention kernel and not the Polaris silicon. Suspects:
+turbo4 per-element dequant in `stage_k/v_tile` (`ops::k_load`), paged-block
+gather, or `gated_delta_net` hybrid layers under HIP. **Decision (Kurtis):
+keep the custom paged/turbo4/tiered features on gfx803, find the ROCm perf
+bug — do NOT port to Vulkan** (Vulkan lacks all custom kernels; only viable
+for standard dense models that fit VRAM). NEXT: profile the gfx803 paged
+prefill (rocprof not installed in `rx480-army` — needs a profiling path).
+
+### C. Checkpoint reuse vs paged cache — block-alignment crash (NOT fixed)
+
+`--ctx-checkpoints>0` would let hybrid/recurrent models reuse the prompt
+prefix (the restore path at `server-context.cpp` ~3397 already exists, and
+with paged the checkpoints are tiny — **0.282 MiB**, blocks referenced not
+copied). But restore sets `n_past` to the checkpoint pos (e.g. 1364), and
+`llama_kv_cache_paged::seq_rm` requires **block-aligned (×16)** ranges →
+unaligned trim leaves stale partial blocks → `GGML_ASSERT compute_slot_mapping
+failed` abort. This is why LFM2.5 runs `--ctx-checkpoints 0` and full-
+reprocesses every turn (~2.5 min for ~3700 tok). **Two fix attempts failed:**
+round-at-restore is wrong (recurrent state can't be partially rolled back —
+must reuse exactly `pos_max+1`); block-aligning the checkpoint batch-break at
+creation crashed turn-1 prefill. **Reverted.** Needs a deeper design (paged
+`seq_rm`/`compute_slot_mapping` tolerant of the boundary, or a hybrid+paged-
+aware checkpoint path). Upstream unmerged references: PRs #20955, #21099, #20428.
+
+### D. Tool-schema bleed (LFM2.5)
+
+"hello!" → model regurgitates tool-schema JSON fragments then hallucinates.
+The LFM2.5 jinja template renders the tool list as a **plain-text system
+message** `List of tools: [{json}]` (faithful to the official template;
+`common/chat.cpp:2226` detects this variant, vs LFM2's native
+`<|tool_list_start|>` tokens at :622). Tool *calls* are correct
+(grammar-constrained `<|tool_call_start|>`). With `thinking=1` the model
+also reasons verbosely about the tools. Fix TBD (limit/disable reasoning on
+tool turns, or revisit tool presentation). Single/multi-turn tool calls
+otherwise correct on 1070.
