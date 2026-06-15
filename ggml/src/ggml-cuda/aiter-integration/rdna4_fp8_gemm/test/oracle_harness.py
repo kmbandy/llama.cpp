@@ -133,12 +133,15 @@ def _ml8_case(M, N, K, group_size, seed, tol):
 
 def test_ml8_single_tile():  _ml8_case(16, 16, 64, 64, 42, 5e-2)
 def test_ml8_real_shape():   _ml8_case(64, 2560, 9216, 64, 7, 5e-2)  # ml8-4 down-proj-ish
+# M,N multiples of the 128 block -> exercises the vectorized full-tile ml8 B-fill
+# (the path the bench runs); the M<128 cases above only hit the scalar ragged fill.
+def test_ml8_full_tile():    _ml8_case(128, 256, 9216, 64, 11, 5e-2)
 
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("no GPU"); sys.exit(1)
     for t in (test_single_tile, test_square, test_real_shape,
-              test_ml8_single_tile, test_ml8_real_shape):
+              test_ml8_single_tile, test_ml8_real_shape, test_ml8_full_tile):
         t(); print(f"  ✓ {t.__name__}")
     print("PASS")
