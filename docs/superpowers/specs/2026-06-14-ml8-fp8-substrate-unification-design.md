@@ -6,6 +6,8 @@
 **Recon sources:** `docs/superpowers/recon/2026-06-14-{triton,aiter,rocm-therock}-rdna4-fp8.md`.
 **Profile source:** `docs/superpowers/2026-06-13-ml8-trainer-dispatch-profile.md`.
 
+> **UPDATE 2026-06-14 (Phase 0 reframe — read first):** Phase 0 measurement found the **ml8 LUT GEMM at ~2.9% of RDNA4 dense FP8 (383 TF)** — the binding perf constraint, well below the prologue/config concerns this spec was written around. Two gathers per K-iteration (`tl.gather` nibble-expand + per-element indexed centroid-LUT load) starve the WMMA units. The **LUT-kernel optimization is now the headline lever** — tracked as **MAD-299**; see `docs/superpowers/results/2026-06-14-ml8-fp8-phase0-microbench.md`. Phase 1's prologue fusion still stands; the GEMM substrate work shifts from "tune a8w8 configs" (secondary ~2×) to "fix the LUT dequant" (primary ~30×).
+
 ---
 
 ## 1. Goal
