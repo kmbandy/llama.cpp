@@ -2659,9 +2659,27 @@ ggml_tensor * llm_graph_context::build_attn(
             }
             return x;
         };
-        ggml_tensor * q_cast = to_f16_cont(q_cur);
-        ggml_tensor * k_cast = to_f16_cont(k_cur);
-        ggml_tensor * v_cast = to_f16_cont(v_cur);
+        // Turbo paged kernel quantizes 128-element blocks (QK_TURBO=128); a
+        // head_dim < 128 (e.g. LFM2.5 head_dim 64) is smaller than one block,
+        // which the kernel rejects. Zero-pad each head to 128 so the proven
+        // HS=128 path runs: the turbo WHT identity makes <WHT(Qp),WHT(Kp)> ==
+        // <Q,K>, and the padded V dims contribute zero and are sliced off the
+        // output below. Mirrors the non-paged turbo path. ggml_pad needs F32,
+        // so pad before the F16 cast.
+        const bool paged_turbo_pad =
+            (layer.k->type == GGML_TYPE_TURBO2_0 ||
+             layer.k->type == GGML_TYPE_TURBO3_0 ||
+             layer.k->type == GGML_TYPE_TURBO4_0);
+        const int64_t paged_orig_head = q_cur->ne[0];
+        const bool    paged_pad_head  = paged_turbo_pad && (paged_orig_head % 128 != 0);
+        auto pad_head_to_128 = [&](ggml_tensor * t) -> ggml_tensor * {
+            const int64_t pad = ((paged_orig_head + 127) / 128) * 128 - paged_orig_head;
+            ggml_tensor * x = (t->type == GGML_TYPE_F32) ? t : ggml_cast(ctx0, t, GGML_TYPE_F32);
+            return ggml_pad(ctx0, x, pad, 0, 0, 0);
+        };
+        ggml_tensor * q_cast = to_f16_cont(paged_pad_head ? pad_head_to_128(q_cur) : q_cur);
+        ggml_tensor * k_cast = to_f16_cont(paged_pad_head ? pad_head_to_128(k_cur) : k_cur);
+        ggml_tensor * v_cast = to_f16_cont(paged_pad_head ? pad_head_to_128(v_cur) : v_cur);
 
         // 2) Forward-expand the source nodes so they're fully computed
         //    before paged_attn reads them.
@@ -2691,6 +2709,14 @@ ggml_tensor * llm_graph_context::build_attn(
         //    projection (often quantized weight × F32 activation) is
         //    typically wired only for F32 activations.
         cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+
+        // Slice the turbo head padding back off (see paged_pad_head above):
+        // output mirrors q as [padded_head, n_heads, n_tokens]; keep the first
+        // paged_orig_head dims per head.
+        if (paged_pad_head) {
+            cur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, paged_orig_head, cur->ne[1], cur->ne[2],
+                                               cur->nb[1], cur->nb[2], 0));
+        }
 
         // 6) Reshape to (head_dim*n_heads, n_tokens) for the wo projection.
         const int64_t n_embd_full = q_cur->ne[0] * q_cur->ne[1];
