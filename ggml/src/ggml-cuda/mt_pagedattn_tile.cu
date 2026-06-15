@@ -571,13 +571,159 @@ __global__ void mt_paged_attention_tile_kernel(
         }
     }
 #else
-    // Non-WMMA hardware should not be dispatched here; existing scalar
-    // kernel is the fallback. NO_DEVICE_CODE traps if we somehow are.
-    GGML_UNUSED(out); GGML_UNUSED(q); GGML_UNUSED(k_cache); GGML_UNUSED(v_cache);
-    GGML_UNUSED(block_tables); GGML_UNUSED(context_lens); GGML_UNUSED(q_lens);
-    GGML_UNUSED(max_blocks_per_seq); GGML_UNUSED(n_kv_heads); GGML_UNUSED(n_heads);
-    GGML_UNUSED(scale);
-    NO_DEVICE_CODE;
+    // ── Portable FMA tile flash-attention (non-WMMA: NVIDIA Pascal sm_61,
+    // AMD GCN gfx803). Mirrors the WMMA path's Q-tile + online-softmax
+    // structure, but the two matmuls run as explicit shared-memory GEMMs
+    // instead of matrix-core fragments. Lane ownership is kept identical to
+    // the WMMA fragment layout (row = tid%16, cols 8*(tid/16)+l), so the
+    // masking / softmax / writeback logic matches the #if branch line-for-line.
+    // One 32-lane warp per block; shuffles pass explicit WARP_SIZE so a 32-wide
+    // logical reduction is correct on gfx803's 64-lane waves too.
+    static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
+    constexpr int N_INNER = HEAD_SIZE / K_INNER;
+
+    const int head_idx   = blockIdx.x;
+    const int seq_idx    = blockIdx.y;
+    const int q_tile_idx = blockIdx.z;
+    const int tid        = threadIdx.x;
+
+    const int q_len = q_lens[seq_idx];
+    const int q_tile_start = q_tile_idx * Q_TILE_M;
+    if (q_tile_start >= q_len) {
+        return;
+    }
+    const int q_tile_actual = (q_tile_start + Q_TILE_M <= q_len) ? Q_TILE_M : (q_len - q_tile_start);
+
+    const int kv_head_idx       = head_idx / (n_heads / n_kv_heads);
+    const int ctx_len_after_q   = context_lens[seq_idx];
+    const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) {
+        seq_q_offset += (size_t) q_lens[s];
+    }
+
+    const int q_pos_base = (ctx_len_after_q - q_len) + q_tile_start;
+
+    // smem: Q[16,HS] + K[16,HS] + V[16,HS] half, then scores[16,16] f32.
+    extern __shared__ unsigned char smem_raw[];
+    __half * smem_q = (__half *)(smem_raw);
+    __half * smem_k = smem_q + Q_TILE_M * HEAD_SIZE;
+    __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
+    float  * smem_s = (float *)(smem_v + K_TILE_N * HEAD_SIZE);  // [Q_TILE_M * K_TILE_N]
+
+    const size_t q_global_base = ((seq_q_offset + (size_t) q_tile_start) * (size_t) n_heads + (size_t) head_idx)
+                                 * (size_t) HEAD_SIZE;
+    stage_q_tile<HEAD_SIZE>(smem_q, q, q_global_base, q_tile_actual, n_heads, tid);
+    __syncthreads();
+
+    // Lane ownership: row = tid%16 (Q row), half = tid/16 -> cols 8*half+l.
+    const int row  = tid % 16;
+    const int half = tid / 16;
+
+    // Online-softmax state + output accumulators (this lane's 8 cols per HS block).
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc[N_INNER][8];
+    #pragma unroll
+    for (int n = 0; n < N_INNER; ++n) {
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) acc[n][l] = 0.0f;
+    }
+
+    const int q_pos_last = q_pos_base + (q_tile_actual - 1);
+    const int valid_ctx  = q_pos_last + 1;
+    const int q_pos      = q_pos_base + row;
+    const bool row_valid = (row < q_tile_actual);
+
+    for (int k_tile_start = 0; k_tile_start < valid_ctx; k_tile_start += K_TILE_N) {
+        stage_k_tile<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
+            smem_k, k_cache, seq_block_table, k_tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, tid);
+        __syncthreads();
+
+        // scores[row, col] = scale * (Q[row] . K[col])  for this lane's 8 cols.
+        float sc[8];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int col = 8 * half + l;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < HEAD_SIZE; ++d) {
+                dot += __half2float(smem_q[row * HEAD_SIZE + d]) * __half2float(smem_k[col * HEAD_SIZE + d]);
+            }
+            const int  k_pos   = k_tile_start + col;
+            const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
+            sc[l] = visible ? (dot * scale) : -INFINITY;
+        }
+
+        // Per-row max: 8-wide local then pair-lane (tid^16) via shfl_xor.
+        float local_max = -INFINITY;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) local_max = max(local_max, sc[l]);
+        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
+        const float new_max = max(running_max, row_max);
+
+        // Rescale running state on new max.
+        if (running_max > -INFINITY) {
+            const float rescale = __expf(running_max - new_max);
+            running_sum *= rescale;
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) acc[n][l] *= rescale;
+            }
+        }
+
+        // exp(scores - new_max) + per-row sum.
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const float e = (sc[l] == -INFINITY) ? 0.0f : __expf(sc[l] - new_max);
+            sc[l] = e;
+            local_sum += e;
+            smem_s[row * K_TILE_N + (8 * half + l)] = e;  // publish full row for PV
+        }
+        running_sum += local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
+        running_max  = new_max;
+
+        stage_v_tile<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
+            smem_v, v_cache, seq_block_table, k_tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, tid);
+        __syncthreads();  // smem_s (all 16 cols) + smem_v visible to the warp
+
+        // acc[n][l] += sum_k scores[row, k] * V[k, d],  d = n*16 + 8*half + l.
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int d = n * K_INNER + 8 * half + l;
+                float pv = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < K_TILE_N; ++k) {
+                    pv += smem_s[row * K_TILE_N + k] * __half2float(smem_v[k * HEAD_SIZE + d]);
+                }
+                acc[n][l] += pv;
+            }
+        }
+        __syncthreads();  // before next iter overwrites smem_k / smem_v / smem_s
+    }
+
+    // Writeback (same layout as the WMMA branch).
+    const float inv_sum = 1.0f / (running_sum + 1e-6f);
+    if (row < q_tile_actual) {
+        const int q_row_global = q_tile_start + row;
+        const size_t out_row_base =
+            ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads + (size_t) head_idx) * (size_t) HEAD_SIZE;
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int d = n * K_INNER + 8 * half + l;
+                out[out_row_base + (size_t) d] = __float2half(acc[n][l] * inv_sum);
+            }
+        }
+    }
 #endif // AMD_WMMA_AVAILABLE
 }
 
@@ -603,7 +749,10 @@ void launch_paged_attn_tile(
     dim3 grid(n_heads, num_seqs, n_q_tiles);
     dim3 block(TILE_NUM_THREADS);
 
-    const size_t smem_bytes = (size_t)(Q_TILE_M + 2 * K_TILE_N) * (size_t) HEAD_SIZE * sizeof(__half);
+    // half Q/K/V tiles + (non-WMMA path only) an f32 scores[Q_TILE_M*K_TILE_N]
+    // scratch. Allocated unconditionally; the WMMA branch simply ignores it.
+    const size_t smem_bytes = (size_t)(Q_TILE_M + 2 * K_TILE_N) * (size_t) HEAD_SIZE * sizeof(__half)
+                            + (size_t) Q_TILE_M * (size_t) K_TILE_N * sizeof(float);
 
     mt_paged_attention_tile_kernel<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>
         <<<grid, block, smem_bytes, stream>>>(

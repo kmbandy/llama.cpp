@@ -1105,7 +1105,11 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
                 const bool wmma_ok           = amd_wmma_available(cc);
                 const bool tile_env_on       = get_paged_tile_mode() != 0;
-                const bool tile_gate_on      = wmma_ok && tile_env_on;
+                // Tile kernel now has a portable FMA #else path (non-WMMA: Pascal
+                // sm_61, GCN gfx803) in addition to the RDNA3/4 WMMA path, so it is
+                // no longer gated on wmma_ok. GGML_PAGED_TILE=0 reverts to the slow
+                // scalar prefill kernel. (Multi-warp variant stays WMMA-only below.)
+                const bool tile_gate_on      = tile_env_on;
                 if (tile_gate_on && avg_q_len >= 16) {
                     if (probe_on) {
                         int n = probe_tile.fetch_add(1, std::memory_order_relaxed);
@@ -1123,7 +1127,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const int32_t *) slot_mapping->data,
                         (const int32_t *) q_lens->data,
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
-                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0;
+                    // Multi-warp tile kernel is still WMMA-only (not yet ported);
+                    // non-WMMA hardware uses the portable single-warp tile kernel.
+                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0 && wmma_ok;
                     if (mw_on) {
                         launch_paged_attn_tile_mw<HS, BS, CT>(
                             (__half *) dst->data,
@@ -1134,7 +1140,7 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                             (const int32_t *) context_lens->data,
                             (const int32_t *) q_lens->data,
                             num_seqs, n_heads, n_kv_heads, max_bps,
-                            avg_q_len,
+                            total_q_tokens,  // see note below: size grid.z by max, not avg, q_len
                             scale, stream);
                     } else {
                         launch_paged_attn_tile<HS, BS, CT>(
@@ -1146,7 +1152,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                             (const int32_t *) context_lens->data,
                             (const int32_t *) q_lens->data,
                             num_seqs, n_heads, n_kv_heads, max_bps,
-                            avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
+                            total_q_tokens,  // grid.z (n_q_tiles) must cover the LARGEST per-seq
+                                             // q_len. avg_q_len = total/num_seqs floors with idle
+                                             // parallel slots (1 active + N idle) and under-sizes
+                                             // the grid -> high Q-tiles never launch -> uncomputed
+                                             // rows -> garbage. total_q_tokens is a safe upper bound
+                                             // (kernel still skips tiles with q_tile_start >= q_len).
                             scale, stream);
                     }
                     return;
