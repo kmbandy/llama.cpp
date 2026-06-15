@@ -1208,7 +1208,7 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
 
                     const int num_chunks    = paged_attn_decode_num_chunks(max_ctx_len);
-                    const int max_q_len     = avg_q_len;  // see comment above
+                    const int max_q_len     = total_q_tokens;  // partials inner stride: must be >= max per-seq q_len. avg_q_len = total/num_seqs floors to 0 with idle parallel slots (1 active + N idle), collapsing every head/seq/chunk partial offset to 0 -> OOB corruption. total_q_tokens (gate-capped <= 8) is a safe upper bound.
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
                                             * (size_t) num_chunks * (size_t) max_q_len
                                             * (size_t) (HS + 2);
