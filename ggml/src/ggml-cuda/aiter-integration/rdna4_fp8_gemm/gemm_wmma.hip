@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
+#include <cassert>
 #include "gemm_capi.h"
 using namespace rocwmma;
 
@@ -15,7 +16,7 @@ using namespace rocwmma;
 // Tunables: Task 6 sweeps these. Constraints baked in below assume BM/BN multiples
 // of 16 (WMMA M/N) and BK a multiple of 16 (WMMA K). With BM=BN=128, BK=32 and 4 waves
 // (WAVES_M=WAVES_N=2), each wave owns a 64x64 region = 4x4 = 16 accumulator fragments
-// (NACC=16 keeps the matrix unit's ILP saturated; ~166 VGPRs, no spills, occ 9 waves/SIMD).
+// (NACC keeps the matrix unit's ILP saturated; ~166 VGPRs, no spills, occ 9 waves/SIMD).
 // Each loaded A/B element feeds BN/16 = BM/16 = 8 MACs along the free dim (the reuse lever).
 constexpr int BM = 128, BN = 128, BK = 32;
 constexpr int WAVES_M = 2, WAVES_N = 2;
@@ -25,6 +26,8 @@ constexpr int BLOCK_THREADS = WAVES * WAVE_SIZE;     // 128 lanes
 constexpr int FRAGS_M = (BM / WAVES_M) / 16;         // 2 acc frags down M per wave
 constexpr int FRAGS_N = (BN / WAVES_N) / 16;         // 2 acc frags across N per wave
 constexpr int KSTEPS = BK / 16;                      // 2 WMMA-K steps per LDS tile
+// number of WMMA accumulator fragments each wave keeps live
+[[maybe_unused]] constexpr int NACC = FRAGS_M * FRAGS_N;
 
 __global__ void __launch_bounds__(BLOCK_THREADS)
 gemm_fp8_tiled(const float8_t* __restrict__ A, const float8_t* __restrict__ B,
@@ -41,13 +44,14 @@ gemm_fp8_tiled(const float8_t* __restrict__ A, const float8_t* __restrict__ B,
     const int wid    = tid / WAVE_SIZE;
     const int wave_m = wid / WAVES_N;
     const int wave_n = wid % WAVES_N;
+    const int lane   = tid % WAVE_SIZE;  // wave-local lane (0-31)
 
     fragment<accumulator, 16, 16, 16, float> acc[FRAGS_M][FRAGS_N];
     for (int mi = 0; mi < FRAGS_M; ++mi)
         for (int ni = 0; ni < FRAGS_N; ++ni)
             fill_fragment(acc[mi][ni], 0.0f);
 
-    const float8_t f8zero = (float8_t)0.0f;
+    const float8_t f8zero = static_cast<float8_t>(0.0f);
 
     // Fully-interior tile? (true for every block of the bench shapes — all multiples of
     // BM/BN/BK). Lets us use vectorized 16B (int4) global->LDS copies. Each As/Bs row is a
@@ -55,14 +59,16 @@ gemm_fp8_tiled(const float8_t* __restrict__ A, const float8_t* __restrict__ B,
     // since K,N % 16 == 0 and k0,tn step by BK,BN. Ragged tiles take the scalar bounds path.
     const bool full_mn = (tm + BM <= M) && (tn + BN <= N);
 
+    // vectorized aliases of the fp8 operands/LDS tiles (loop-invariant)
+    const int4* Av = reinterpret_cast<const int4*>(A);
+    const int4* Bv = reinterpret_cast<const int4*>(B);
+    int4* Asv = reinterpret_cast<int4*>(As);
+    int4* Bsv = reinterpret_cast<int4*>(Bs);
+
     for (int k0 = 0; k0 < K; k0 += BK) {
         const bool full = full_mn && (k0 + BK <= K);
         if (full) {
             // Vectorized: int4 = 16 fp8 bytes. As: BM*BK/16 vecs; Bs: BK*BN/16 vecs.
-            const int4* Av = reinterpret_cast<const int4*>(A);
-            const int4* Bv = reinterpret_cast<const int4*>(B);
-            int4* Asv = reinterpret_cast<int4*>(As);
-            int4* Bsv = reinterpret_cast<int4*>(Bs);
             constexpr int AVEC = BM * BK / 16;          // int4 count for As
             constexpr int BVEC = BK * BN / 16;          // int4 count for Bs
             constexpr int BKv = BK / 16;                // int4 per A row
@@ -116,13 +122,14 @@ gemm_fp8_tiled(const float8_t* __restrict__ A, const float8_t* __restrict__ B,
     // scratch (one 16x16 region per wave), then a_scale[row]*b_scale[col] -> bf16.
     __shared__ float scratch[WAVES][16 * 16];
     float* ws = scratch[wid];
+    // store_matrix_sync is wave-synchronous, so reusing this wave's scratch slot across (mi,ni) needs no __syncthreads().
     for (int mi = 0; mi < FRAGS_M; ++mi) {
         for (int ni = 0; ni < FRAGS_N; ++ni) {
             store_matrix_sync(ws, acc[mi][ni], 16, mem_row_major);
             // 32 lanes cooperatively scale+cast this 16x16 frag.
             int row0 = tm + (wave_m * FRAGS_M + mi) * 16;
             int col0 = tn + (wave_n * FRAGS_N + ni) * 16;
-            for (int t = tid % WAVE_SIZE; t < 256; t += WAVE_SIZE) {
+            for (int t = lane; t < 256; t += WAVE_SIZE) {
                 int gr = row0 + t / 16, gc = col0 + t % 16;
                 if (gr < M && gc < N) {
                     float v = ws[t] * a_scale[gr] * b_scale[gc];
@@ -139,6 +146,7 @@ extern "C" void rdna4_gemm_fp8_forward(const void* A, const void* B, void* C,
     // 2D grid: blockIdx.x -> N tiles, blockIdx.y -> M tiles. Ceil-div so ragged
     // small oracle shapes (16x16x16, 256^3) still cover the full output.
     dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    assert(K % 16 == 0 && N % 16 == 0);
     gemm_fp8_tiled<<<grid, BLOCK_THREADS, 0, stream>>>(
         (const float8_t*)A, (const float8_t*)B, (__hip_bfloat16*)C, a_scale, b_scale, M, N, K);
 }
