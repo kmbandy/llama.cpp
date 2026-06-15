@@ -5,6 +5,17 @@
 
 ---
 
+> **⚠️ CORRECTION (2026-06-15) — read first.** The root cause in §3 ("the LUT kernel starves
+> the WMMA units" via the two gathers) is **WRONG** and the §4 "kill the gathers → 80% of 383"
+> optimization plan is **retired.** Measured on gfx1201: removing gather #1 regressed ~25%,
+> removing gather #2 regressed ~40–50% — the dequant is cheap. The real wall is **occupancy**:
+> the tiny 16×16 tiles ran at 6–8/16 waves once enlarged for reuse (VGPR-pressure-limited).
+> The raw fp8 WMMA ceiling is **307 TF** (measured, 2.09× f16), not 143; the entire gap is
+> feeding/occupancy. The lever is occupancy-aware tiling + RDNA4 dynamic VGPR (`s_alloc_vgpr`).
+> See the superseding spec: `docs/superpowers/specs/2026-06-15-rdna4-fp8-gemm-occupancy-unlock-design.md`.
+
+---
+
 ## 1. The denominator (official AMD spec, R9700)
 
 Dense vs sparse is mechanical — every "Structured Sparsity" row is **exactly 2×** its dense row, and the precision ladder doubles each step:
