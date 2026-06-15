@@ -1,0 +1,4 @@
+*.hsaco
+harness
+loadonly
+*.o
