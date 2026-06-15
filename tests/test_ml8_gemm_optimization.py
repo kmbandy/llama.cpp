@@ -12,29 +12,36 @@ sys.path.insert(0, str(REPO_ROOT / "scripts/calibration"))
 
 def test_tflops_and_pct_math():
     import bench_ml8_gemm as B
-    assert abs(B.tflops(1024, 1024, 1024, 1e-3) - (2 * 1024**3 / 1e-3 / 1e12)) < 1e-9
-    assert abs(B.pct_of_dense(383.0) - 100.0) < 1e-9
-    assert abs(B.pct_of_dense(11.0) - (11.0 / 383.0 * 100.0)) < 1e-6
-    assert B.DENSE_FP8_TFLOPS == 383.0
+    expected_tflops = 2 * 1024**3 / 1e-3 / 1e12
+    actual_tflops = B.tflops(1024, 1024, 1024, 1e-3)
+    assert abs(actual_tflops - expected_tflops) < 1e-9, (
+        f"tflops(1024,1024,1024,1e-3): got {actual_tflops}, expected {expected_tflops}")
+    actual_pct_383 = B.pct_of_dense(383.0)
+    assert abs(actual_pct_383 - 100.0) < 1e-9, (
+        f"pct_of_dense(383.0): got {actual_pct_383}, expected 100.0")
+    expected_pct_11 = 11.0 / 383.0 * 100.0
+    actual_pct_11 = B.pct_of_dense(11.0)
+    assert abs(actual_pct_11 - expected_pct_11) < 1e-6, (
+        f"pct_of_dense(11.0): got {actual_pct_11}, expected {expected_pct_11}")
+    assert B.DENSE_FP8_TFLOPS == 383.0, (
+        f"DENSE_FP8_TFLOPS: got {B.DENSE_FP8_TFLOPS}, expected 383.0")
 
 
-import numpy as np
-import torch
-
-sys.path.insert(0, str(REPO_ROOT / "tests"))
-from test_ml8_kernel_stage1_dequant import reference_dequant_gemm, run_ml8_kernel  # noqa: E402
-# ml8_to_packed lives in scripts/calibration (already in sys.path above)
-from ml8_to_packed import pack_indices  # noqa: E402
-
-
-def _pack_kn(indices_kn: torch.Tensor, N: int, K: int) -> torch.Tensor:
+def _pack_kn(indices_kn, N: int, K: int):
     """[K,N] int8 indices -> [K//2,N] uint8 lo-first packed (kernel layout)."""
+    import numpy as np
+    sys.path.insert(0, str(REPO_ROOT / "scripts/calibration"))
+    from ml8_to_packed import pack_indices  # noqa: E402
     packed_bytes = pack_indices(indices_kn.T.cpu().contiguous(), nibble_lo_first=True)
     packed_np = np.frombuffer(packed_bytes, dtype=np.uint8).reshape(N, K // 2)
-    return torch.from_numpy(packed_np.T.copy()).contiguous().to(indices_kn.device)
+    return __import__("torch").from_numpy(packed_np.T.copy()).contiguous().to(indices_kn.device)
 
 
 def _oracle_case(M, N, K, group_size, seed, tol):
+    import torch
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_ml8_kernel_stage1_dequant import reference_dequant_gemm, run_ml8_kernel  # noqa: E402
+
     device = torch.device("cuda")
     torch.manual_seed(seed)
     n_centroids = 16
@@ -53,6 +60,10 @@ def _oracle_case(M, N, K, group_size, seed, tol):
     C_kernel = run_ml8_kernel(a_fp8, b_packed, centroids_fp8, b_scale, a_scale,
                               group_size=group_size, n_centroids=n_centroids)
     max_err = (C_kernel.to(torch.float32) - C_ref.to(torch.bfloat16).to(torch.float32)).abs().max().item()
+    # Tolerance rationale (mirrors test_ml8_kernel_stage1_dequant.py):
+    # bf16 output-cast rounding + fp32->bf16 + fp8 quant noise on A and centroids.
+    # Single-tile is looser (5e-2) because fp8 noise is a larger fraction of a small sum;
+    # multi-tile/large shapes are tighter (1e-2) as errors average down.
     assert max_err < tol, f"M={M} N={N} K={K}: max_err {max_err:.4g} exceeds {tol}"
 
 
@@ -66,3 +77,7 @@ def test_oracle_multi_tile_cross_kgroup():
 
 def test_oracle_real_4b_shape():
     _oracle_case(M=64, N=2560, K=9216, group_size=64, seed=7, tol=1e-2)
+
+
+def test_oracle_asymmetric_shape():
+    _oracle_case(M=16, N=48, K=64, group_size=64, seed=7, tol=2e-2)

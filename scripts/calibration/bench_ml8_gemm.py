@@ -56,6 +56,10 @@ def launch(a_fp8, layer, a_scale, *, block_m=16, block_n=16, num_warps=4):
     stride_bk, stride_bn = layer.indices_packed.stride()
     stride_cm, stride_cn = c.stride()
     stride_bscale_k, stride_bscale_n = layer.scales_fp32.stride()
+    if M % block_m or N % block_n:
+        raise ValueError(
+            f"launch: M={M} must be divisible by block_m={block_m} and "
+            f"N={N} by block_n={block_n} (else grid truncates and TFLOPS inflate)")
     grid_mn = (M // block_m) * (N // block_n)
     gemm_ml8._gemm_a8w8_blockscale_kernel[(grid_mn,)](
         a_fp8, layer.indices_packed, c, a_scale, layer.scales_fp32,
@@ -115,7 +119,7 @@ def main():
                 rows.append(bench_shape(name, N, K, M, dev,
                                         block_m=args.block_m, block_n=args.block_n,
                                         num_warps=args.num_warps))
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001 — record, don't abort the sweep
                 rows.append(dict(shape=name, M=M, N=N, K=K, error=str(e)[:300]))
     out = dict(label=args.label, triton_version=__import__("triton").__version__, rows=rows)
     args.out.write_text(json.dumps(out, indent=2))
