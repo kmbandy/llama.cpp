@@ -8,14 +8,22 @@ HERE = Path(__file__).resolve().parent.parent
 LIB = HERE / "out" / "librdna4_gemm.so"
 
 
+_LIB_CACHE = None
+
+
 def _lib():
-    lib = ctypes.CDLL(str(LIB))
-    lib.rdna4_gemm_fp8_forward.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-    lib.rdna4_gemm_fp8_forward.restype = None
-    return lib
+    # Cache the handle: the bench (gemm_bench.py) calls gemm_fp8 in a hot timed
+    # loop, so rebuilding the ctypes wrapper per call would skew the timing.
+    global _LIB_CACHE
+    if _LIB_CACHE is None:
+        lib = ctypes.CDLL(str(LIB))
+        lib.rdna4_gemm_fp8_forward.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.rdna4_gemm_fp8_forward.restype = None
+        _LIB_CACHE = lib
+    return _LIB_CACHE
 
 
 def gemm_fp8(a_fp8, b_fp8, a_scale, b_scale):
