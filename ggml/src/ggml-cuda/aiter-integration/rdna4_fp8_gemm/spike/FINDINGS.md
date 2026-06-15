@@ -234,6 +234,46 @@ only. This spike deliberately stopped at compile/assemble/inspect.
 
 ---
 
+## ADDENDUM (2026-06-15, raw-HSA feasibility dig) — the enable bit is gfx1250-ONLY
+
+Following the "prove it on silicon (raw-HSA)" decision, we chased the launch-enable to
+the register level. The decisive artifact is LLVM's own kernel-descriptor field map
+(`/opt/rocm/llvm/include/llvm/Support/AMDHSAKernelDescriptor.h`, COMPUTE_PGM_RSRC3 enum):
+
+```
+COMPUTE_PGM_RSRC3_GFX10_GFX120(RESERVED4, 14, 8),      // gfx10..gfx1201: bits 14-21 RESERVED
+COMPUTE_PGM_RSRC3_GFX125(NAMED_BAR_CNT, 14, 3),        // gfx1250 only
+COMPUTE_PGM_RSRC3_GFX125(ENABLE_DYNAMIC_VGPR, 17, 1),  // gfx1250 only  <-- the launch-enable bit
+COMPUTE_PGM_RSRC3_GFX125(TCP_SPLIT, 18, 3),            // gfx1250 only
+COMPUTE_PGM_RSRC3_GFX125(ENABLE_DIDT_THROTTLE, 21, 1), // gfx1250 only
+```
+
+- The `COMPUTE_PGM_RSRC3` **ENABLE_DYNAMIC_VGPR launch-enable bit (position 17)** is defined
+  **exclusively for `GFX125` (gfx1250)**. For the gfx10..**gfx120** range — which includes
+  **gfx1201 / RDNA4 / R9700** — bits 14-21 are `RESERVED4`. AMD's own toolchain treats
+  descriptor-launchable dynamic-VGPR for compute as a **gfx1250 feature**, not gfx1201.
+- There is **no `.amdhsa_*` assembler directive** to set ENABLE_DYNAMIC_VGPR on *either*
+  target (`.amdhsa_enable_dynamic_vgpr` is rejected as "unknown .amdhsa_kernel directive" on
+  both gfx1201 and gfx1250) — the backend sets it internally, only on the `amdgpu_cs_chain` path.
+
+**Consequence for the silicon-proof experiment.** The `S_ALLOC_VGPR` instruction runs on
+gfx1201 silicon and the §3.3.3 dynamic-VGPR machinery exists, but the *compute* launch-enable
+(COMPUTE_PGM_RSRC3 bit 17) is wired only for gfx1250. On the R9700, the only way to attempt a
+dynamic-VGPR compute launch is to **hand-write a kernel descriptor with a RESERVED bit (17)
+set and dispatch it via a from-scratch raw-HSA harness** (bypassing HIP/ROCr entirely, since
+neither exposes the bit) — i.e. gamble that gfx1201 firmware honors a bit AMD only validated
+on gfx1250. Outcomes: honored (occupancy proof + a major finding) / ignored (clean no-op
+failure) / undefined (WGP/CP hang). This is reserved-firmware-bit territory, not a
+spec-supported path.
+
+**Sharpened upstream / partnership ask (supersedes the generic 4-layer list for RDNA4):**
+backport the COMPUTE_PGM_RSRC3 `ENABLE_DYNAMIC_VGPR` bit (+ the `.dynamic_vgpr_en` metadata
+emission for `amdgpu_kernel` and the ROCr dispatch plumbing) from **gfx1250 to gfx1201**. That
+single, already-shipping-on-gfx1250 mechanism is what stands between the R9700 and the
+occupancy headroom — the GEMM that would consume it is already written and oracle-green.
+
+---
+
 ## Kernel basis for the P2 dynamic-VGPR work
 
 The verified raw-WMMA-intrinsic kernel
