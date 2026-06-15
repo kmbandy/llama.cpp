@@ -131,3 +131,22 @@ The hand-written kernel is written against the ISA, not recollection. Key anchor
 - **Sparse 2:4 path** (`V_SWMMAC_F32_16X16X32_FP8_FP8`, the 766 ceiling) — requires pruning+recalibration, a different model. Noted, deferred.
 - **gfx1250 wide-K WMMA** (K=64/128 fp8) — not present on gfx1201; relevant only if/when hardware changes.
 - Phase B backward implementation detail (tracked in §4.1, designed when reached).
+
+## 11. Upstream / contribution posture
+
+A deliberate first-impression play: **give the foundational primitive, hold the differentiating kernel.** Structure the work so the upstream-able piece lifts out clean instead of being an afterthought.
+
+**The gift (upstream — clean, foundational, citable):** the dynamic-VGPR *enablement*. The `s_alloc_vgpr` feature is reportedly absent from LLVM/Linux usage; if our Phase-2 spike (§7) determines what's actually missing in the installed toolchain (clang 22, ROCm 7.2 — verify first; the intrinsic may already exist), that gap *is* the contribution:
+- an **LLVM AMDGPU intrinsic** `llvm.amdgcn.s.alloc.vgpr` + clang builtin → `llvm/llvm-project`
+- **HIP/HSA support for launching in `DYN_VGPR_EN` mode** → `ROCm/clr` (HIP) / `ROCm/ROCR-Runtime`
+
+**The moat (keep, or negotiate into the partnership):** the high-occupancy ml8+fp8 GEMM. Candidate homes if/when offered: `ROCm/aiter` (applied LLM kernels — most likely), `ROCm/composable_kernel` (needs a real RDNA4 WMMA path), `ROCm/rocWMMA` (as a GEMM sample); `ROCm/hipBLASLt` = technique feedback, not a clean PR.
+
+**Consumer-side, natural PR in *this* repo:** a HIP fp8 GEMM op in llama.cpp's `ggml-cuda`/HIP backend (the inference forward path).
+
+**Three structuring rules baked in from the start (cheap now, expensive to retrofit):**
+1. **The dynamic-VGPR helper is a standalone, ISA-cited unit** (its own header + test), *not* tangled into the GEMM — so it lifts out to LLVM/HIP untouched.
+2. **Permissive license + clean provenance** — stay MIT (already vendored), no GPL contamination, ISA sections cited.
+3. **Minimal deps + no local paths** — HIP + rocWMMA only, reproducible bench, real tests → builds anywhere ROCm does.
+
+The Phase-2 spike's first deliverable is therefore a short **"what's missing in the toolchain" report** — which doubles as the scope of the upstream PR(s).
