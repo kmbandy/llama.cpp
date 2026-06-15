@@ -421,7 +421,7 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
     const int      lane            = j % WARP_SIZE;
     const uint8_t  my_nibble       = idx & 0xF;
-    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1);
+    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1, WARP_SIZE);
     if ((j & 1) == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }

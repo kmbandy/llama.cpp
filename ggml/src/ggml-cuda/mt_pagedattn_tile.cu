@@ -230,7 +230,7 @@ static __device__ __forceinline__ void coop_stage_turbo4_tile(
         }
 
         // Broadcast norm from lane 0 to all 32 lanes of this warp.
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         // Each lane reads 2 bytes (4 nibbles = 4 elements). qs is uint8_t[64],
         // 2-byte aligned at qs[2*lane_id] for any lane.
@@ -308,7 +308,7 @@ static __device__ __forceinline__ void coop_stage_turbo3_tile(
         }
 
         // Broadcast norm from lane 0 to all 32 lanes of this warp.
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         // Each lane reads 1 byte of qs (its 4 elements' low2 bits) and 1
         // byte of signs (covers this lane's 4 elements' high1 bits, plus
@@ -476,7 +476,7 @@ __global__ void mt_paged_attention_tile_kernel(
         for (int l = 0; l < scores.ne; ++l) {
             local_max = max(local_max, scores.x[l]);
         }
-        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
         const float new_max = max(running_max, row_max);
 
@@ -502,7 +502,7 @@ __global__ void mt_paged_attention_tile_kernel(
             scores.x[l]   = e;
             local_sum   += e;
         }
-        const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+        const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
         running_sum += row_sum;
         running_max  = new_max;
 
@@ -861,7 +861,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             for (int l = 0; l < scores.ne; ++l) {
                 local_max = max(local_max, scores.x[l]);
             }
-            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
             const float new_max = max(running_max, row_max);
 
@@ -887,7 +887,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                 scores.x[l]   = e;
                 local_sum   += e;
             }
-            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
             running_sum += row_sum;
             running_max  = new_max;
 
