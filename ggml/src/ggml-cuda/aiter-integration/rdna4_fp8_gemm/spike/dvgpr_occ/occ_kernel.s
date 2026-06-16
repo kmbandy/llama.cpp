@@ -28,18 +28,22 @@
 //
 // Register map (NO register exceeds the reservation -- under-reserving = OOB = hang):
 //   lean phase : v0=lane, v2/v3=atomic, v4=0                       (<= 32-VGPR launch block)
-//   fat phase  : v6=lane*8, v7=lane*32, A=v[8:9], B=v[10:11],
-//                acc_k = v[16+8k : 23+8k]   (NACC=8 -> v16..v79 ; NACC=16 -> v16..v143)
+//   fat phase  : v6=lane*8, v7=lane*32, v12=timer, A=v[8:9], B=v[10:11],
+//                acc_k = v[32+8k : 39+8k]   (NACC=8 -> v32..v95 ; NACC=16 -> v32..v159)
+//   accumulators are ABOVE the 32-VGPR lean block: dyn-VGPR grows above the launch size, so an
+//   accumulator straddling v0..v31 corrupts the dyn variant (Phase-2 layout = v32+).
 .ifndef NACC
     .set NACC, 16
 .endif
 .ifndef DYNVGPR
     .set DYNVGPR, 0
 .endif
+// s_alloc_vgpr block granularity: Phase 2 proved 128 and 32 work; keep FATREGS a multiple of 32
+// and >= the highest VGPR used (NACC=16 -> v159 -> 160 ; NACC=8 -> v95 -> 96).
 .if NACC > 8
-    .set FATREGS, 144          // v16..v143 -> 144 VGPRs
+    .set FATREGS, 160          // v32..v159 (160 used) -> 160 VGPRs
 .else
-    .set FATREGS, 80           // v16..v79  ->  80 VGPRs
+    .set FATREGS, 96           // v32..v95  ( 96 used) ->  96 VGPRs
 .endif
 
     .text
@@ -64,31 +68,39 @@ occ_kernel:
     // ---- KDEPTH (loop count) from user SGPR s6 (coherent; not a memory load) ----
     s_mov_b32 s9, s6
 .if DYNVGPR
+    // Drain the in-flight admission atomics (live/maxlive/total) BEFORE growing the VGPR block.
+    // Phase 2's busy-wait incidentally covered this; without it, s_alloc_vgpr races the in-flight
+    // VMEM and the grown registers come up wrong -> the A/B load reads 0 -> all-zero WMMA result.
+    s_wait_loadcnt 0x0
+    s_wait_storecnt 0x0
     s_alloc_vgpr FATREGS                 // grow lean launch block to the compute footprint
 .endif
     // ---- load A/B fragments ONCE (compute isolation) ----
     v_lshlrev_b32 v6, 3, v0              // lane*8 bytes (2 i32)
-    global_load_b64 v[8:9],   v6, s[2:3]            // A frag
-    global_load_b64 v[10:11], v6, s[2:3] offset:256 // B frag (A block = 32*8 = 256 bytes)
+    global_load_b64 v[16:17], v6, s[2:3]            // A frag (v16:v19 = Phase-2 proven location)
+    global_load_b64 v[18:19], v6, s[2:3] offset:256 // B frag (A block = 32*8 = 256 bytes)
     s_wait_loadcnt 0x0
     // ---- peel iteration 0: srcC = 0 (initializes each accumulator) ----
-    v_wmma_f32_16x16x16_fp8_fp8 v[16:23], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[24:31], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[32:39], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[40:47], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[48:55], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[56:63], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[64:71], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[72:79], v[8:9], v[10:11], 0
+    // Accumulators live at v32+ (ABOVE the 32-VGPR lean launch block). Dyn-VGPR grows the block
+    // above the launch size, so accumulators must NOT straddle the lean block (v0..v31), or the
+    // dyn variant corrupts -- this matches Phase-2's proven v32+ layout.
+    v_wmma_f32_16x16x16_fp8_fp8 v[32:39],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[40:47],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[48:55],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[56:63],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[64:71],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[72:79],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[16:17], v[18:19], 0
 .if NACC > 8
-    v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[8:9], v[10:11], 0
-    v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[8:9], v[10:11], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[144:151], v[16:17], v[18:19], 0
+    v_wmma_f32_16x16x16_fp8_fp8 v[152:159], v[16:17], v[18:19], 0
 .endif
     // ---- in-kernel timer (whole-dispatch span) t0: GPU clock (wall_clock64) BEFORE the loop ----
     // Host submit->fence timing does not bracket the kernel on this raw-PM4 path; the GPU clock
@@ -110,23 +122,23 @@ occ_kernel:
     s_cmp_eq_u32 s9, 0
     s_cbranch_scc1 .Lkdone                // KDEPTH==1 (correctness pass) -> skip the loop
 .Lkloop:
-    v_wmma_f32_16x16x16_fp8_fp8 v[16:23], v[8:9], v[10:11], v[16:23]
-    v_wmma_f32_16x16x16_fp8_fp8 v[24:31], v[8:9], v[10:11], v[24:31]
-    v_wmma_f32_16x16x16_fp8_fp8 v[32:39], v[8:9], v[10:11], v[32:39]
-    v_wmma_f32_16x16x16_fp8_fp8 v[40:47], v[8:9], v[10:11], v[40:47]
-    v_wmma_f32_16x16x16_fp8_fp8 v[48:55], v[8:9], v[10:11], v[48:55]
-    v_wmma_f32_16x16x16_fp8_fp8 v[56:63], v[8:9], v[10:11], v[56:63]
-    v_wmma_f32_16x16x16_fp8_fp8 v[64:71], v[8:9], v[10:11], v[64:71]
-    v_wmma_f32_16x16x16_fp8_fp8 v[72:79], v[8:9], v[10:11], v[72:79]
+    v_wmma_f32_16x16x16_fp8_fp8 v[32:39],   v[16:17], v[18:19], v[32:39]
+    v_wmma_f32_16x16x16_fp8_fp8 v[40:47],   v[16:17], v[18:19], v[40:47]
+    v_wmma_f32_16x16x16_fp8_fp8 v[48:55],   v[16:17], v[18:19], v[48:55]
+    v_wmma_f32_16x16x16_fp8_fp8 v[56:63],   v[16:17], v[18:19], v[56:63]
+    v_wmma_f32_16x16x16_fp8_fp8 v[64:71],   v[16:17], v[18:19], v[64:71]
+    v_wmma_f32_16x16x16_fp8_fp8 v[72:79],   v[16:17], v[18:19], v[72:79]
+    v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[16:17], v[18:19], v[80:87]
+    v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[16:17], v[18:19], v[88:95]
 .if NACC > 8
-    v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[8:9], v[10:11], v[80:87]
-    v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[8:9], v[10:11], v[88:95]
-    v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[8:9], v[10:11], v[96:103]
-    v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[8:9], v[10:11], v[104:111]
-    v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[8:9], v[10:11], v[112:119]
-    v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[8:9], v[10:11], v[120:127]
-    v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[8:9], v[10:11], v[128:135]
-    v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[8:9], v[10:11], v[136:143]
+    v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[16:17], v[18:19], v[96:103]
+    v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[16:17], v[18:19], v[104:111]
+    v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[16:17], v[18:19], v[112:119]
+    v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[16:17], v[18:19], v[120:127]
+    v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[16:17], v[18:19], v[128:135]
+    v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[16:17], v[18:19], v[136:143]
+    v_wmma_f32_16x16x16_fp8_fp8 v[144:151], v[16:17], v[18:19], v[144:151]
+    v_wmma_f32_16x16x16_fp8_fp8 v[152:159], v[16:17], v[18:19], v[152:159]
 .endif
     s_sub_u32 s9, s9, 1
     s_cmp_lg_u32 s9, 0
@@ -145,8 +157,8 @@ occ_kernel:
     s_mov_b32 exec_lo, s8
     // ---- store acc0 tile (256 f32) for the CPU fp8 oracle ----
     v_lshlrev_b32 v7, 5, v0              // lane*32 bytes
-    global_store_b128 v7, v[16:19], s[4:5]
-    global_store_b128 v7, v[20:23], s[4:5] offset:16
+    global_store_b128 v7, v[32:35], s[4:5]
+    global_store_b128 v7, v[36:39], s[4:5] offset:16
     s_wait_storecnt 0x0
 .if DYNVGPR
     s_alloc_vgpr 32                      // shrink back to the lean block

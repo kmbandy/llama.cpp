@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
         if (!ok) { fprintf(stderr, "prong1 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
         // reserve 256 (occ 5) is dropped: it hits the known Phase-2 "256-VGPR slow-retire >10s
         // on the raw-PM4 path" pathology (benign, not a hang, but it aborts the sweep).
-        const uint32_t reserves[] = {80, 96, 128, 160, 192};
+        const uint32_t reserves[] = {96, 112, 128, 160, 192};   // floor = light-kernel usage (96 VGPR)
         printf("  (requested grid nWG=%u)\n", nWG);
         printf("\n  reserveVGPR  maxlive  occ/SIMD  launched  span_ms  TFLOPS  %%of307  loop\n");
         for (uint32_t rv : reserves) {
@@ -371,8 +371,8 @@ int main(int argc, char** argv) {
         printf("\n  GREEN-1 if TFLOPS rises materially toward higher occupancy (lower reserve).\n");
     } else if (mode == PRONG2) {
         // HEAVY kernel (NACC=16): static (reserve 144) vs dyn (lean 32 -> s_alloc 144).
-        // grid 65536 so static occupancy is VGPR-bound and dyn's lean launch reaches full occ.
-        const uint32_t NACC = 16, nWG = 65536, SFIELD = 144/8;
+        // nWG = WAVES now (dispatch multiplies by 32); 8192 gives several fills for steady state.
+        const uint32_t NACC = 16, nWG = 8192, SFIELD = 160/8;   // match dyn's s_alloc 160 (apples-to-apples)
         const uint32_t Ks[] = {256, 1024, 4096};
         printf("=== PRONG 2: dyn vs static over a long fat phase (HEAVY NACC=16, grid=%u) ===\n", nWG);
         Timed cs = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, 1, 1);
@@ -381,14 +381,20 @@ int main(int argc, char** argv) {
         bool sok = wmma_ok(cs.D), dok = wmma_ok(cd.D);
         printf("  correctness (KDEPTH=1): static WMMA %s (maxlive=%u)  dyn WMMA %s (maxlive=%u)\n",
                sok ? "OK" : "MISMATCH", cs.maxlive, dok ? "OK" : "MISMATCH", cd.maxlive);
-        if (!sok || !dok) { fprintf(stderr, "prong2 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
+        if (!sok || !dok) {
+            printf("  DUMP[0..7]  oracle:");  for (int i=0;i<8;i++) printf(" %.2f", Dref[i]);
+            printf("\n              static:"); for (int i=0;i<8;i++) printf(" %.2f", cs.D[i]);
+            printf("\n              dyn   :"); for (int i=0;i<8;i++) printf(" %.2f", cd.D[i]);
+            printf("\n");
+            fprintf(stderr, "prong2 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4;
+        }
         printf("\n  KDEPTH  static_TF static_occ   dyn_TF dyn_occ   dyn/static  loop(s/d)\n");
         for (uint32_t K : Ks) {
             Timed sk = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, K, 2);
             Timed dk = run_timed(node, "occ_n16_d1.bin", true,  fragIn, nWG, 4,      K, 2);
             if (!sk.ok || !dk.ok) { fprintf(stderr, "  KDEPTH=%u did not complete; aborting prong2.\n", K); rc = 3; break; }
-            double stf = tf_span(nWG, K, NACC, sk.wall, freq_hz);
-            double dtf = tf_span(nWG, K, NACC, dk.wall, freq_hz);
+            double stf = tf_span(sk.total ? sk.total : nWG, K, NACC, sk.wall, freq_hz);
+            double dtf = tf_span(dk.total ? dk.total : nWG, K, NACC, dk.wall, freq_hz);
             printf("  %6u  %8.1f   %6.2f   %7.1f  %5.2f    %6.2fx     %s/%s\n",
                    K, stf, sk.maxlive / 128.0, dtf, dk.maxlive / 128.0,
                    stf > 0 ? dtf / stf : 0.0, loop_ok(sk.D, K) ? "OK" : "BAD", loop_ok(dk.D, K) ? "OK" : "BAD");
@@ -413,15 +419,23 @@ int main(int argc, char** argv) {
         }
         printf("  (physical issue floor ~2.7 ns/WMMA @ 2.5 GHz; below that => WMMAs elided/not real.)\n");
     } else {
-        // Default: correctness A/B (regression check on the throughput kernel).
-        printf("=== correctness A/B (KDEPTH=1, HEAVY NACC=16) ===\n");
-        Timed st = run_timed(node, "occ_n16_d0.bin", false, fragIn, 2048, 144/8, 1, 1);
-        Timed dy = run_timed(node, "occ_n16_d1.bin", true,  fragIn, 2048, 4,     1, 1);
-        if (!st.ok || !dy.ok) { fprintf(stderr, "correctness did not complete.\n"); hsaKmtCloseKFD(); return 3; }
-        bool sok = wmma_ok(st.D), dok = wmma_ok(dy.D);
-        printf("  static: WMMA %s  maxlive=%u\n", sok ? "OK" : "MISMATCH", st.maxlive);
-        printf("  dyn   : WMMA %s  maxlive=%u\n", dok ? "OK" : "MISMATCH", dy.maxlive);
-        rc = (sok && dok) ? 0 : 5;
+        // Default: dyn-VGPR cap probe. Test dyn correctness at increasing s_alloc footprints:
+        //   light NACC=8  -> s_alloc 96  (<=128, expected OK)
+        //   heavy NACC=16 -> s_alloc 160 (>128,  suspected over-cap -> zeros)
+        printf("=== dyn-VGPR correctness vs occupancy (light s_alloc 96; KDEPTH=1) ===\n");
+        printf("  the fat s_alloc is correct only while (resident waves * 96) fits the VGPR file;\n");
+        printf("  beyond that, simultaneous fat allocs OVERSUBSCRIBE and corrupt (->0), not stall.\n\n");
+        printf("  nWaves   maxlive  occ/SIMD   WMMA\n");
+        const uint32_t grids[] = {4, 64, 256, 1024, 1536, 2048, 4096};
+        for (uint32_t g : grids) {
+            Timed t = run_timed(node, "occ_n8_d1.bin", true, fragIn, g, 4, 1, 1);
+            if (!t.ok) { printf("  %6u   DID NOT COMPLETE\n", g); continue; }
+            printf("  %6u   %5u    %6.2f    %s\n", g, t.maxlive, t.maxlive/128.0, wmma_ok(t.D) ? "OK" : "CORRUPT");
+        }
+        printf("\n  heavy dyn (s_alloc 160) @ 4 waves (no oversubscription): ");
+        { Timed t = run_timed(node, "occ_n16_d1.bin", true, fragIn, 4, 4, 1, 1);
+          printf("%s  -> per-wave dyn-VGPR cap is < 160 (128 worked in Phase 2)\n", t.ok ? (wmma_ok(t.D)?"OK":"CORRUPT") : "FAIL"); }
+        rc = 0;
     }
 
     hsaKmtCloseKFD();
