@@ -855,5 +855,82 @@ int main(){
         printf("  bslds vs baseline max|Δ|  = %.4g  %s\n",mdl,mdl<1e-2?"(match)":"(*** MISMATCH ***)");
         hipFree(A);hipFree(B);hipFree(Bshuf);hipFree(Cb);hipFree(Ct);hipFree(Ct2);hipFree(Cd);hipFree(Cl);hipFree(as);hipFree(bs);
     }
+
+    // ---------- Phase-3 FREE PREVIEW: acc-tile reuse sweep — does a BIGGER accumulator
+    //   tile raise WMMA/cycle? acc[4][4] (TBM=128) is the 140-TF/7.35-WMMA-per-cyc winner.
+    //   Raising FRAGS_M amortizes operand loads over more WMMAs (reuse 2.00->2.22->2.40
+    //   WMMA/load) but costs VGPR -> lower static occupancy. All three fit the 256-VGPR
+    //   static-wave cap (acc[8][8]=512 would not -> that one needs dyn-VGPR). Dims are
+    //   divisible by lcm(128,160,192)=1920 so there is NO edge-tile waste: useful-TF ==
+    //   WMMA issue rate, and WMMA/cyc = (TF/307)*15.9 exactly (clock pinned, same ceiling).
+    //   NOTE: the trfeed A-fill is unguarded, so TBM MUST divide M/N (hence 1920/3840). ----
+    {
+        // -- oracle @ 1920x1920x256 (1920 divisible by 128/160/192 -> A-fill in-bounds) --
+        const int M=1920,N=1920,K=256;
+        std::vector<uint8_t> Ah,Bh; build_io(M,N,K,Ah,Bh);
+        std::vector<uint8_t> Bshufh((size_t)K*N,0); preshuffle_B(Bh.data(),Bshufh.data(),K,N);
+        std::vector<float> oref((size_t)M*N,0.f);
+        for(int i=0;i<M;i++)for(int j=0;j<N;j++){
+            float acc=0; for(int k=0;k<K;k++) acc+=dec(Ah[(size_t)i*K+k])*dec(Bh[(size_t)k*N+j]);
+            oref[(size_t)i*N+j]=acc;   // a_scale=b_scale=1
+        }
+        float8_t *A; uint8_t* Bshuf; __hip_bfloat16*C; float*as,*bs;
+        HCK(hipMalloc(&A,Ah.size())); HCK(hipMalloc(&Bshuf,Bshufh.size()));
+        HCK(hipMalloc(&C,(size_t)M*N*2)); HCK(hipMalloc(&as,M*4)); HCK(hipMalloc(&bs,N*4));
+        HCK(hipMemcpy(A,Ah.data(),Ah.size(),hipMemcpyHostToDevice));
+        HCK(hipMemcpy(Bshuf,Bshufh.data(),Bshufh.size(),hipMemcpyHostToDevice));
+        std::vector<float> ones(N,1.f);
+        HCK(hipMemcpy(as,ones.data(),M*4,hipMemcpyHostToDevice));
+        HCK(hipMemcpy(bs,ones.data(),N*4,hipMemcpyHostToDevice));
+        auto chk=[&](const char*name)->float{
+            std::vector<uint16_t> H((size_t)M*N);
+            HCK(hipMemcpy(H.data(),C,(size_t)M*N*2,hipMemcpyDeviceToHost));
+            float mx=0; for(size_t t=0;t<(size_t)M*N;t++){
+                uint32_t b=(uint32_t)H[t]<<16; float gv; __builtin_memcpy(&gv,&b,4);
+                float rv=oref[t], e=fabsf(gv-rv)/(fabsf(rv)+1e-3f); if(e>mx)mx=e; }
+            printf("  oracle %-9s max_rel_err=%.4f  %s\n",name,mx,mx<0.03f?"PASS":"*** FAIL ***");
+            return mx; };
+        printf("\n=== acc-tile reuse sweep — oracle @ %d^3 ===\n",M);
+        { dim3 g((N+BN-1)/BN,(M+128-1)/128); gemm_fp8_trfeed<128,2><<<g,128>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize()); }
+        float o4=chk("acc[4][4]");
+        { dim3 g((N+BN-1)/BN,(M+160-1)/160); gemm_fp8_trfeed<160,2><<<g,128>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize()); }
+        float o5=chk("acc[5][4]");
+        { dim3 g((N+BN-1)/BN,(M+192-1)/192); gemm_fp8_trfeed<192,2><<<g,128>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize()); }
+        float o6=chk("acc[6][4]");
+        hipFree(A);hipFree(Bshuf);hipFree(C);hipFree(as);hipFree(bs);
+        if(o4>=0.03f||o5>=0.03f||o6>=0.03f) printf("  acc-tile ORACLE FAILED — perf below is meaningless.\n");
+    }
+    {
+        // -- perf @ 3840x3840x4096 (divisible by 128/160/192; compute-bound) --
+        const int M=3840,N=3840,K=4096;
+        std::vector<uint8_t> Ah,Bh; build_io(M,N,K,Ah,Bh);
+        std::vector<uint8_t> Bshufh((size_t)K*N,0); preshuffle_B(Bh.data(),Bshufh.data(),K,N);
+        float8_t *A; uint8_t* Bshuf; __hip_bfloat16*C; float*as,*bs;
+        HCK(hipMalloc(&A,Ah.size())); HCK(hipMalloc(&Bshuf,Bshufh.size()));
+        HCK(hipMalloc(&C,(size_t)M*N*2)); HCK(hipMalloc(&as,M*4)); HCK(hipMalloc(&bs,N*4));
+        HCK(hipMemcpy(A,Ah.data(),Ah.size(),hipMemcpyHostToDevice));
+        HCK(hipMemcpy(Bshuf,Bshufh.data(),Bshufh.size(),hipMemcpyHostToDevice));
+        std::vector<float> ones(N,1.f);
+        HCK(hipMemcpy(as,ones.data(),M*4,hipMemcpyHostToDevice));
+        HCK(hipMemcpy(bs,ones.data(),N*4,hipMemcpyHostToDevice));
+        double gflop=2.0*M*N*K/1e12;
+        float m4=time_trfeed<128,2>(A,Bshuf,C,as,bs,M,N,K,30);
+        float m5=time_trfeed<160,2>(A,Bshuf,C,as,bs,M,N,K,30);
+        float m6=time_trfeed<192,2>(A,Bshuf,C,as,bs,M,N,K,30);
+        double t4=gflop/(m4/1e3),t5=gflop/(m5/1e3),t6=gflop/(m6/1e3);
+        const double WPC=15.9;                       // WMMA/cyc at the 307 TF ceiling
+        printf("\n=== acc-tile reuse sweep — perf @ %d^3 (ceiling %.0f TF = %.1f WMMA/cyc) ===\n",M,CEIL,WPC);
+        printf("  acc[4][4] TBM=128 (128 acc-VGPR, reuse 2.00): %7.3f ms  %6.1f TF  (%2.0f%% of 307)  %.2f WMMA/cyc\n",
+               m4,t4,100*t4/CEIL,WPC*t4/CEIL);
+        printf("  acc[5][4] TBM=160 (160 acc-VGPR, reuse 2.22): %7.3f ms  %6.1f TF  (%2.0f%% of 307)  %.2f WMMA/cyc\n",
+               m5,t5,100*t5/CEIL,WPC*t5/CEIL);
+        printf("  acc[6][4] TBM=192 (192 acc-VGPR, reuse 2.40): %7.3f ms  %6.1f TF  (%2.0f%% of 307)  %.2f WMMA/cyc\n",
+               m6,t6,100*t6/CEIL,WPC*t6/CEIL);
+        printf("  slope acc[4]->acc[6]: %+.1f TF  (%+.2f WMMA/cyc)\n", t6-t4, WPC*(t6-t4)/CEIL);
+        printf("  VERDICT: %s\n", t6>t4*1.02 ? "RISES -> reuse lever bends the curve; extrapolate acc[8][8] (needs dyn-VGPR)"
+                                 : (t6<t4*0.98 ? "FALLS -> static occupancy loss outweighs reuse; dyn-VGPR REQUIRED to realize big tiles"
+                                              : "FLAT -> reuse gain ~cancels static occupancy loss; dyn-VGPR needed to break the tie"));
+        hipFree(A);hipFree(Bshuf);hipFree(C);hipFree(as);hipFree(bs);
+    }
     return 0;
 }
