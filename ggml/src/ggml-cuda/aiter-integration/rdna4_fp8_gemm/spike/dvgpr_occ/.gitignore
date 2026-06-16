@@ -9,3 +9,8 @@ wmma_seed-*
 *.hipfb
 *.hipi
 *.bc
+
+# Approach-2 cross-check (P3-T5): binary + hipcc --save-temps intermediates
+gemm_occ_pad
+gemm_occ_pad-*
+gemm_occ_pad_*
