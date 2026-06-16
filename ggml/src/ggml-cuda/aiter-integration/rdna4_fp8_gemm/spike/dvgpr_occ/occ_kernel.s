@@ -16,12 +16,14 @@
 // Encodings (Phase 2 + the two lifted in P3-T1 vs llvm-objdump, NOT guessed):
 //   accumulating WMMA : v_wmma_f32_16x16x16_fp8_fp8 v[D:D+7], vA[0:1], vB[0:1], v[D:D+7]  (srcC = acc reg)
 //   peel/init WMMA    : v_wmma_f32_16x16x16_fp8_fp8 v[D:D+7], vA[0:1], vB[0:1], 0          (srcC = 0 literal, Phase-2-proven)
-//   scalar load       : s_load_b32 s9, s[0:1], 0x8   then   s_wait_kmcnt 0x0
 //   returning atom    : global_atomic_add_u32 vDst,vAddr,vData,s[b] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
 //   non-ret atom      : global_atomic_<op>_u32 vAddr,vData,s[b] scope:SCOPE_DEV
 //   wait model        : s_wait_loadcnt 0x0 (loads/returning-atomic), s_wait_storecnt 0x0 (stores)
 //
-// User data (USER_SGPR=6): s[0:1]=occ[live@0,maxlive@4,KDEPTH@8]  s[2:3]=fragIn(A@0,B@256)  s[4:5]=fragOut
+// User data (USER_SGPR=7): s[0:1]=occ[live@0,maxlive@4]  s[2:3]=fragIn(A@0,B@256)  s[4:5]=fragOut
+//                          s6 = KDEPTH (runtime loop count, passed as a user SGPR -- NOT a
+//                          memory load: the scalar K-cache is not invalidated by the dispatch's
+//                          AcquireMem, so a memory KDEPTH reads stale across dispatches).
 // v0 = thread id x (lane 0..31) via TIDIG_COMP_CNT (set by the harness in RSRC2).
 //
 // Register map (NO register exceeds the reservation -- under-reserving = OOB = hang):
@@ -58,9 +60,8 @@ occ_kernel:
     global_atomic_max_u32 v4, v3, s[0:1] offset:4 scope:SCOPE_DEV
 .Lafter_inc:
     s_mov_b32 exec_lo, s8
-    // ---- KDEPTH (loop count) <- occ[8], runtime ----
-    s_load_b32 s9, s[0:1], 0x8
-    s_wait_kmcnt 0x0
+    // ---- KDEPTH (loop count) from user SGPR s6 (coherent; not a memory load) ----
+    s_mov_b32 s9, s6
 .if DYNVGPR
     s_alloc_vgpr FATREGS                 // grow lean launch block to the compute footprint
 .endif

@@ -161,9 +161,11 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
     GpuBuf fence = AllocGpu(node, 0x1000, /*exec*/false, /*uncached*/true);
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
     memcpy(fin.ptr, fragIn, 128 * sizeof(uint32_t));
-    volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;    // occW[0]=live, occW[1]=maxlive, occW[2]=KDEPTH
+    volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;    // occW[0]=live, occW[1]=maxlive
     volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
-    occW[0] = 0; occW[1] = 0; occW[2] = kdepth; *fenceW = 0;
+    occW[0] = 0; occW[1] = 0; *fenceW = 0;
+    // KDEPTH travels in a user SGPR (s6), not memory: the scalar K-cache is not invalidated by
+    // AcquireMem, so a memory KDEPTH reads stale across dispatches (buffer VAs get reused).
 
     Ring ring;
     ring.buf    = AllocGpu(node, 0x10000, /*exec*/true, /*uncached*/true);
@@ -187,17 +189,19 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
     uint32_t rsrc1 = BuildPgmRsrc1(false);
     uint32_t launchField = dynvgpr ? 4u : (staticVgprField & 0x3fu);
     rsrc1 = (rsrc1 & ~0x3fu) | (launchField & 0x3fu);
-    // RSRC2: keep TGID_X_EN | TIDIG_COMP_CNT | EXCP and bit6 (dyn); force USER_SGPR 4 -> 6.
-    uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (6u << RSRC2_USER_SGPR_SHIFT);
+    // RSRC2: keep TGID_X_EN | TIDIG_COMP_CNT | EXCP and bit6 (dyn); force USER_SGPR 4 -> 7
+    // (3 pointers in s0:s5 + KDEPTH in s6; TGID_X then lands in s7, leaving s8/s9 free scratch).
+    uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (7u << RSRC2_USER_SGPR_SHIFT);
     uint32_t rsrc[2]    = { rsrc1, rsrc2 };
     uint32_t reslim[1]  = {0};
     uint32_t tmpring[1] = {0};
     uint32_t restart[4] = {0, 0, 0, 0};
     uint32_t userdata[16] = {
-        (uint32_t)occVa,  (uint32_t)(occVa >> 32),    // s0:s1 = occ[live,maxlive,KDEPTH]
+        (uint32_t)occVa,  (uint32_t)(occVa >> 32),    // s0:s1 = occ[live,maxlive]
         (uint32_t)finVa,  (uint32_t)(finVa >> 32),    // s2:s3 = fragIn (A@0, B@256)
         (uint32_t)foutVa, (uint32_t)(foutVa >> 32),   // s4:s5 = fragOut
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        kdepth,                                       // s6     = KDEPTH (runtime loop count)
+        0, 0, 0, 0, 0, 0, 0, 0, 0
     };
     uint32_t dispInit = BuildDispatchInitiator();
 
@@ -279,6 +283,16 @@ int main(int argc, char** argv) {
             if (std::fabs(D[i] - Dref[i]) > 1e-3f * std::fabs(Dref[i]) + 1e-3f) return false;
         return true;
     };
+    // Self-validating loop check: after KDEPTH iterations acc0 = KDEPTH * (A.B) = KDEPTH*Dref.
+    // Confirms the timed run actually executed the right loop count (catches a stale/garbled
+    // loop counter -- the exact bug a memory-loaded KDEPTH caused). Loose tol for f32 accum.
+    auto loop_ok = [&](const float* D, uint32_t K) {
+        for (int i = 0; i < 256; ++i) {
+            float want = (float)K * Dref[i];
+            if (std::fabs(D[i] - want) > 5e-3f * std::fabs(want) + 1e-2f) return false;
+        }
+        return true;
+    };
 
     CHECK(hsaKmtOpenKFD());
     uint32_t node = FindGfx1201Node();
@@ -286,7 +300,9 @@ int main(int argc, char** argv) {
     int rc = 0;
     if (mode == PRONG1) {
         // LIGHT kernel (NACC=8): occupancy -> throughput. Reservation floor = 80 (kernel usage).
-        const char* BIN = "occ_n8_d0.bin"; const uint32_t NACC = 8, nWG = 8192, K = 16384;
+        // grid 65536 so occupancy is VGPR-bound (not launch-rate-bound at grid/32); KDEPTH 2048
+        // keeps each dispatch well under the 10 s fence timeout.
+        const char* BIN = "occ_n8_d0.bin"; const uint32_t NACC = 8, nWG = 65536, K = 2048;
         printf("=== PRONG 1: occupancy -> throughput (LIGHT NACC=8, grid=%u, KDEPTH=%u, static) ===\n", nWG, K);
         Timed corr = run_timed(node, BIN, false, fragIn, nWG, 128/8, 1, 1);
         if (!corr.ok) { fprintf(stderr, "prong1 correctness did not complete.\n"); hsaKmtCloseKFD(); return 3; }
@@ -294,19 +310,21 @@ int main(int argc, char** argv) {
         printf("  correctness (KDEPTH=1, reserve=128): WMMA %s  maxlive=%u\n", ok ? "OK" : "MISMATCH", corr.maxlive);
         if (!ok) { fprintf(stderr, "prong1 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
         const uint32_t reserves[] = {80, 96, 128, 160, 192, 256};
-        printf("\n  reserveVGPR  maxlive  occ/SIMD   TFLOPS\n");
+        printf("\n  reserveVGPR  maxlive  occ/SIMD   TFLOPS  loop\n");
         for (uint32_t rv : reserves) {
             Timed tk = run_timed(node, BIN, false, fragIn, nWG, rv/8, K, 3);
             Timed t1 = run_timed(node, BIN, false, fragIn, nWG, rv/8, 1, 3);
             if (!tk.ok || !t1.ok) { fprintf(stderr, "  reserve=%u did not complete; aborting prong1.\n", rv); rc = 3; break; }
             double tf = tf_diff(nWG, K, NACC, tk.secs, t1.secs);
-            printf("  %8u     %5u    %6.2f   %7.1f\n", rv, tk.maxlive, tk.maxlive / 128.0, tf);
+            bool lk = loop_ok(tk.D, K);
+            printf("  %8u     %5u    %6.2f   %7.1f  %s\n", rv, tk.maxlive, tk.maxlive / 128.0, tf, lk ? "OK" : "BAD");
         }
         printf("\n  GREEN-1 if TFLOPS rises materially toward higher occupancy (lower reserve).\n");
     } else if (mode == PRONG2) {
         // HEAVY kernel (NACC=16): static (reserve 144) vs dyn (lean 32 -> s_alloc 144).
-        const uint32_t NACC = 16, nWG = 8192, SFIELD = 144/8;
-        const uint32_t Ks[] = {1024, 4096, 8192};
+        // grid 65536 so static occupancy is VGPR-bound and dyn's lean launch reaches full occ.
+        const uint32_t NACC = 16, nWG = 65536, SFIELD = 144/8;
+        const uint32_t Ks[] = {256, 1024, 4096};
         printf("=== PRONG 2: dyn vs static over a long fat phase (HEAVY NACC=16, grid=%u) ===\n", nWG);
         Timed cs = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, 1, 1);
         Timed cd = run_timed(node, "occ_n16_d1.bin", true,  fragIn, nWG, 4,      1, 1);
@@ -315,7 +333,7 @@ int main(int argc, char** argv) {
         printf("  correctness (KDEPTH=1): static WMMA %s (maxlive=%u)  dyn WMMA %s (maxlive=%u)\n",
                sok ? "OK" : "MISMATCH", cs.maxlive, dok ? "OK" : "MISMATCH", cd.maxlive);
         if (!sok || !dok) { fprintf(stderr, "prong2 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
-        printf("\n  KDEPTH   static_TF  static_occ   dyn_TF  dyn_occ   dyn/static\n");
+        printf("\n  KDEPTH   static_TF  static_occ   dyn_TF  dyn_occ   dyn/static   loop(s/d)\n");
         for (uint32_t K : Ks) {
             Timed sk = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, K, 2);
             Timed s1 = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, 1, 2);
@@ -324,8 +342,9 @@ int main(int argc, char** argv) {
             if (!sk.ok || !s1.ok || !dk.ok || !d1.ok) { fprintf(stderr, "  KDEPTH=%u did not complete; aborting prong2.\n", K); rc = 3; break; }
             double stf = tf_diff(nWG, K, NACC, sk.secs, s1.secs);
             double dtf = tf_diff(nWG, K, NACC, dk.secs, d1.secs);
-            printf("  %6u   %8.1f   %7.2f   %7.1f  %6.2f   %6.2fx\n",
-                   K, stf, sk.maxlive / 128.0, dtf, dk.maxlive / 128.0, stf > 0 ? dtf / stf : 0.0);
+            printf("  %6u   %8.1f   %7.2f   %7.1f  %6.2f   %6.2fx      %s/%s\n",
+                   K, stf, sk.maxlive / 128.0, dtf, dk.maxlive / 128.0, stf > 0 ? dtf / stf : 0.0,
+                   loop_ok(sk.D, K) ? "OK" : "BAD", loop_ok(dk.D, K) ? "OK" : "BAD");
         }
         printf("\n  GREEN-2 if dyn >= static TFLOPS at realistic KDEPTH (no serialization penalty).\n");
     } else {
