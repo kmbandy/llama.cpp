@@ -1127,9 +1127,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const int32_t *) slot_mapping->data,
                         (const int32_t *) q_lens->data,
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
-                    // Multi-warp tile kernel is still WMMA-only (not yet ported);
-                    // non-WMMA hardware uses the portable single-warp tile kernel.
-                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0 && wmma_ok;
+                    // Multi-warp tile kernel now has a portable FMA #else path
+                    // (MAD-301C), so non-WMMA hardware (gfx803, Pascal) uses it too:
+                    // K/V staged once per block + shared across warps (HBM-reuse win)
+                    // and N_WARPS*32 threads fill gfx803's 64-lane wave (occupancy win).
+                    // GGML_PAGED_TILE_MULTIWARP=0 reverts to the single-warp tile kernel.
+                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0;
                     if (mw_on) {
                         launch_paged_attn_tile_mw<HS, BS, CT>(
                             (__half *) dst->data,
