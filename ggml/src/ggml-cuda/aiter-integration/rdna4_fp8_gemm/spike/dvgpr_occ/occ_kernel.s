@@ -30,7 +30,13 @@ occ_kernel:
 .Lafter_inc:
     s_mov_b32 exec_lo, s8                // restore full wave
     // ---- long busy-wait at the SMALL block (where occupancy is measured) ----
-    s_movk_i32 s9, 0x4000
+    // SPIN sets the wave lifetime; it must be long enough that waves pile up to
+    // the VGPR-limited ceiling (else occupancy is launch-rate-bound, not VGPR-bound).
+    // Tunable via -Wa,-defsym,SPIN=0x...  (32-bit, so use s_mov_b32 not s_movk_i32).
+.ifndef SPIN
+    .set SPIN, 0x00400000
+.endif
+    s_mov_b32 s9, SPIN
 .Lspin:
     s_sub_u32 s9, s9, 1
     s_cmp_lg_u32 s9, 0
