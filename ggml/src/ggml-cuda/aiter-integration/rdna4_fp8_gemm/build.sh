@@ -15,6 +15,10 @@ mkdir -p "$HERE/out"
 echo "== build ceiling microbench =="
 cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" "$HERE/bench/wmma_peak.hip" -o "$HERE/out/wmma_peak"
 
+echo "== build global_load_tr_probe =="
+cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" \
+  "$HERE/bench/global_load_tr_probe.hip" -o "$HERE/out/global_load_tr_probe"
+
 if [ -f "$HERE/gemm_wmma.hip" ]; then
   echo "== build librdna4_gemm.so =="
   cap hipcc --offload-arch="$ARCH" -O3 -fPIC --shared -I"$ROCM_INC" \
