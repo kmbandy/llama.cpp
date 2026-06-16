@@ -1,0 +1,10 @@
+# Build artifacts (reproducible via ./build.sh)
+*.o
+*.bin
+pm4_dispatch
+
+# Local reference tree: the full kfdtest originals (Dispatch.cpp, BaseQueue/PM4Queue,
+# gfx_7_2_sh_mask.h, etc.) used while building this spike. Re-fetchable verbatim from
+# the same pinned commit ROCm/ROCR-Runtime@ba56a24c. Not committed (1.7MB); the
+# minimal subset actually compiled lives in vendor/.
+ref/

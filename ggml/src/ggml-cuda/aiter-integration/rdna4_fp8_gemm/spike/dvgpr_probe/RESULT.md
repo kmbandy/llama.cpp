@@ -44,3 +44,54 @@ already written (`../../gemm_wmma.hip`, `../gemm_wmma_raw_intrinsic_verified.hip
 
 Files: `probe.hip`, `patch_kd.py`, `harness.cpp`, `loadonly.cpp` (sources committed; the
 `.hsaco` binaries + compiled harnesses are reproducible build artifacts, not committed).
+
+---
+
+## UPDATE 2 — we had patched the WRONG bit. Corrected probe (RSRC2 bit 6).
+
+**The bit above (`COMPUTE_PGM_RSRC3` bit 17) is the gfx1250 (GFX125) enable.** On gfx1201
+(GFX120) that bit is genuinely `RESERVED` — so its no-op is *expected*, not informative.
+
+The **RDNA4 (gfx1200/gfx1201 = GFX120)** dynamic-VGPR enable is a different bit in a different
+register, and it has been in our installed toolchain header all along — ROCm 7.2.3
+`AMDHSAKernelDescriptor.h`:
+```
+157:  COMPUTE_PGM_RSRC2_GFX6_GFX11(ENABLE_TRAP_HANDLER, 6, 1),
+158:  COMPUTE_PGM_RSRC2_GFX120(ENABLE_DYNAMIC_VGPR,    6, 1),   <- the RDNA4 enable
+230:  COMPUTE_PGM_RSRC3_GFX125(ENABLE_DYNAMIC_VGPR,   17, 1),   <- what UPDATE 1 patched (gfx1250)
+```
+Documented for GFX120* in the ROCm 7.13.0-preview LLVM `AMDGPUUsage` doc:
+> "Enables dynamic VGPR mode, where each wave allocates one VGPR chunk at launch and can request
+> for additional space to use during execution in SQ. **Used by CP to set up
+> COMPUTE_PGM_RSRC2.DYNAMIC_VGPR.**"
+
+`COMPUTE_PGM_RSRC2` is at KD byte offset **52** (static_assert-verified in the header).
+`patch_kd_rsrc2.py` flips bit 6 there (`0x84 -> 0xc4`, one bit).
+
+### Corrected result
+| dispatch | `DYN_VGPR_EN` | notes |
+|---|---|---|
+| control (`probe.hsaco`, RSRC2 bit 6 = 0) | **0** | normal wave |
+| **patched (`probe_rsrc2_patched.hsaco`, RSRC2 bit 6 = 1)** | **0** | **right bit, still not armed. No hang, GPU healthy.** |
+
+Probe **validated**: RDNA4 ISA line 1587 confirms `STATUS[30] = DYN_VGPR_EN`
+("Indicates that the wave is running using Dynamic VGPRs"). So `0` is a true negative.
+
+### Refined verdict — the gate is *below* the kernel descriptor
+The per-dispatch enable bit is **necessary but not sufficient.** RDNA4 ISA §3.3.3 (line 1350):
+> "A single-state (**chip-wide**) config register defines the maximum number of waves per SIMD
+> that can be present when using dynamic VGPRs: **SQ_DYN_VGPR**."
+
+If `SQ_DYN_VGPR.max_waves == 0` (never programmed), zero wave-slots can hold a dynamic-VGPR
+wave, so the KD bit is inert → `DYN_VGPR_EN=0`. That is the most likely cause. So the open
+question is no longer "can we set the bit" (yes — proven harmless) but **who programs the
+chip-wide `SQ_DYN_VGPR`**:
+- **open amdgpu KMD via MMIO** → portable, a kernel-driver patch (best case); or
+- **closed MES firmware** (gfx1201 = `gc_12_0_1_mes.bin` / `gc_12_0_1_uni_mes.bin`, both present
+  on this host) → AMD-side wall.
+
+That fork is the remaining feasibility question (task #259). It needs the *real* amdgpu + Mesa
+RADV source (the local `/usr/src/linux-cachyos` tree is a sparse build tree — driver `.c` absent).
+Decisive artifacts: (1) does Mesa RADV's work-graph/dyn-VGPR path emit a `SQ_DYN_VGPR` PM4
+register write from userspace (→ open/portable), and (2) does the MES v12 queue/dispatch ABI
+(`mes_v12_api_def.h`) carry a dynamic-VGPR field (→ firmware-mediated).

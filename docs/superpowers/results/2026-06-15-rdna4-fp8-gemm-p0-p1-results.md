@@ -125,3 +125,51 @@ built the fp8/ml8 GEMM that would consume it.
 
 All work committed on `sync/upstream-2026-06-09`; baseline kernel at `eb8dce81`, T5/T6 reverted
 per the no-regression ratchet, spike at `14995432b`.
+
+---
+
+## ADDENDUM (2026-06-15, later session): dynamic-VGPR reachability — the real map
+
+The earlier "NEEDS-HSA-PATH / AMD-side change" verdict was built on a **wrong-bit** experiment.
+A from-scratch re-investigation this session mapped the feature at every layer on the R9700
+(gfx1201) silicon. Spike: `spike/dvgpr_probe/` (corrected probe) + `spike/dvgpr_pm4/` (the unlock).
+
+**1. We had patched the wrong bit.** There are two `ENABLE_DYNAMIC_VGPR` enables:
+gfx1250 = `COMPUTE_PGM_RSRC3` bit 17 (what #258 patched — *reserved* on gfx1201, correctly ignored);
+**RDNA4 gfx1200/1201 = `COMPUTE_PGM_RSRC2` bit 6** (the bit that is `ENABLE_TRAP_HANDLER` on
+GFX6–11). Both are in our installed ROCm 7.2.3 `AMDHSAKernelDescriptor.h` (lines 158, 230) and
+documented for GFX120* in the 7.13.0-preview LLVM `AMDGPUUsage` doc.
+
+**2. The chip-wide gate is already ON.** Live `umr` read (`spike/dvgpr_probe/patch_kd_rsrc2.py`
+proved KD-patching rsrc2.6 is harmless; then `umr -r '*.*.SQ_DYN_VGPR'`):
+`regSQ_DYN_VGPR = 0xff` → `WAVE_LIMIT=15`, `FWD_PROGRESS=1`, `MAX_BLOCK_ALLOC=7`. Dynamic VGPR is
+**enabled at the SQ level**; the open kernel never writes this register, so the MES firmware (or a
+silicon reset default) programs it.
+
+**3. Layer map (all proven this session):**
+
+| Layer | dyn-VGPR? | Evidence |
+|---|---|---|
+| Silicon (SQ) | ✅ enabled | `regSQ_DYN_VGPR=0xff`, WAVE_LIMIT=15 |
+| `rsrc2.6` enable | ✅ open, settable | documented GFX120; flipped on silicon, no hang |
+| LLVM (compute path) | ❌ won't emit | `amdgpu_kernel` + `amdgpu-dynamic-vgpr-block-size` → plain KD; bit 6 still "TRAP_HANDLER". dyn-VGPR codegen is `amdgpu_cs_chain`-only |
+| ROCr | ❌ no concept | 0 `dynamic_vgpr` refs in ROCR-Runtime; passes the KD through verbatim |
+| MES (compute/AQL) | ❌ drops the bit | rsrc2.6 set on an AQL dispatch → `STATUS.DYN_VGPR_EN=0`, no hang |
+| PAL / Mesa (graphics) | ✅ works | PAL sets the same bit (`gfx12PipelineChunkCs.cpp:383`); MES arms it for work-graph queues |
+
+**4. The unlock — raw PM4 on a KFD compute queue (lift Vulkan/PAL's method).** The card uses
+whatever is in `mmCOMPUTE_PGM_RSRC2`; the only difference between paths is *who writes it*. HIP/AQL
+lets the MES program it from the KD (drops bit 6); Vulkan/PAL — and ROCm's own
+`libhsakmt/tests/kfdtest/src/Dispatch.cpp` — write it via `SET_SH_REG` directly in the PM4 IB, and
+the CP consumes it verbatim (MES bypassed). `Dispatch.cpp:149-152` gates bit 6 behind
+`if (m_FamilyId < FAMILY_GFX12)` (because bit 6 *became* `DYNAMIC_VGPR` on GFX12) — so the lift is
+**one line**: `if (family >= GFX12 && dynvgpr) pgmRsrc2 |= (1u << 6);`. No LLVM, ROCr, or firmware
+change. No prior art exists for this on RDNA4 compute (GitHub/forums/web checked).
+
+**Build (in progress, `spike/dvgpr_pm4/`):** `PLAN.md` (approach + protocol); `probe.s` **done &
+verified** (32-byte gfx1201 raw ISA: `s_getreg STATUS[30]` → `global_store`). Remaining:
+`pm4_defs.h` (vendored PM4 packets + gfx12 reg offsets), `pm4_dispatch.cpp` (links the installed
+`libhsakmt.a`), `build.sh`. **Run protocol:** baseline (bit clear → must read 0) then lift
+(bit set → `DYN_VGPR_EN`). Risk: raw PM4 on the **headless** R9700 (GPU[1], `0000:42:00.0`) can
+hang the compute queue / MODE1 reset (recoverable). Tooling: self-built `umr` 1.0.11 (pinned,
+reviewed) at `~/GitHub/umr/build/src/app/umr`.
