@@ -19,6 +19,10 @@ echo "== build global_load_tr_probe =="
 cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" \
   "$HERE/bench/global_load_tr_probe.hip" -o "$HERE/out/global_load_tr_probe"
 
+echo "== build gemm_trfeed_bench =="
+cap hipcc --offload-arch="$ARCH" -O3 -I"$ROCM_INC" \
+  "$HERE/bench/gemm_trfeed_bench.hip" -o "$HERE/out/gemm_trfeed_bench"
+
 if [ -f "$HERE/gemm_wmma.hip" ]; then
   echo "== build librdna4_gemm.so =="
   cap hipcc --offload-arch="$ARCH" -O3 -fPIC --shared -I"$ROCM_INC" \
