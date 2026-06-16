@@ -3,3 +3,9 @@
 *.bin
 test_oracle
 occ_dispatch
+
+# wmma_seed.hip --save-temps intermediates (one-time encoding probe, Task 2)
+wmma_seed-*
+*.hipfb
+*.hipi
+*.bc
