@@ -70,7 +70,7 @@ static constexpr int DECODE_K_TILE_N = 16;
 // 1024 = 64 sub-chunks/block. At 400K ctx → ~400 chunks × n_heads = 12800
 // blocks (well above RDNA4 R9700's ~240 concurrent block ceiling, so we
 // run in waves and amortize scratch).
-static constexpr int CHUNK_KV = 1024;
+static constexpr int CHUNK_KV = 256;  // MAD-301A: was 1024 (tuned for 400K ctx / RDNA4 240-block ceiling); too coarse for gfx803's 36 CUs at mid ctx (ctx 1751 -> only 2 chunks -> few blocks -> CU under-utilization). 256 -> 4x more parallel blocks. TODO: make arch-tunable.
 
 // Threads/block. 4 warps (32 lanes each) — fits LDS budget for 2× tile
 // (smem_k + smem_v at HEAD_SIZE=128 = 4 KiB each = 8 KiB) plus Q+logits.
@@ -519,21 +519,12 @@ __global__ void mt_paged_attention_decode_kernel(
     };
 
     if (chunk_start >= valid_ctx_max) {
-        // No visible tokens for any query — write neutral partials so the
-        // reducer's pass over all chunks doesn't see uninitialized memory.
-        // Loop over (qh, qi) so we cover every head this block owns.
-        for (int qh = 0; qh < num_queries_per_kv; ++qh) {
-            const int head_idx = head_base + qh;
-            const size_t base = partial_chunk_base_for_head(head_idx);
-            for (int qi = 0; qi < q_len; ++qi) {
-                const size_t off = base + (size_t) qi * (HEAD_SIZE + 2);
-                for (int d = tid; d < HEAD_SIZE; d += DECODE_NUM_THREADS) partials[off + d] = 0.0f;
-                if (tid == 0) {
-                    partials[off + HEAD_SIZE]     = -INFINITY;
-                    partials[off + HEAD_SIZE + 1] = 0.0f;
-                }
-            }
-        }
+        // MAD-301A: this chunk is entirely beyond the seq's real context
+        // (num_chunks is sized by ALLOCATED ctx, not actual — and with a small
+        // CHUNK_KV + large --ctx-size there are thousands of these). The reduce
+        // kernel now bounds its loop to ceil(context_lens/CHUNK_KV), so it never
+        // reads partials from these chunks — skip the neutral-partial writes and
+        // just retire the block. Makes decode cost scale with actual depth.
         return;
     }
     const int chunk_end = min(chunk_start + CHUNK_KV, valid_ctx_max);
@@ -1058,9 +1049,11 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
     __half        * __restrict__ out,
     const float   * __restrict__ partials,
     const int32_t * __restrict__ q_lens,
+    const int32_t * __restrict__ context_lens,
+    int             num_chunks,
+    int             chunk_kv,
     int             n_heads,
     int             n_seqs,
-    int             num_chunks,
     int             max_q_len) {
     const int head_idx = blockIdx.x;
     const int seq_idx  = blockIdx.y;
@@ -1070,6 +1063,16 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
     size_t seq_q_offset = 0;
     for (int s = 0; s < seq_idx; ++s) seq_q_offset += (size_t) q_lens[s];
     const int q_len = q_lens[seq_idx];
+
+    // MAD-301A: num_chunks is sized by ALLOCATED ctx (max_blocks_per_seq*block_size).
+    // With small CHUNK_KV + a large --ctx-size, that's thousands of chunks while a
+    // decode step only fills context_lens[seq] tokens. Bound the reduction to the
+    // chunks that actually hold data so cost scales with real depth, not allocated
+    // capacity. Pass-1 chunk blocks beyond this range early-return without writing
+    // neutral partials, so they must never be read here.
+    const int ctx_len      = context_lens[seq_idx];
+    const int chunks_full  = (ctx_len + chunk_kv - 1) / chunk_kv;
+    const int valid_chunks = chunks_full < num_chunks ? chunks_full : num_chunks;
 
     // Stride from chunk c → chunk c+1 in the partials buffer.
     const size_t chunk_stride_q     = (size_t) max_q_len * (size_t) (HEAD_SIZE + 2);
@@ -1082,7 +1085,7 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
 
         // Pass 1: global max across chunks for this query position.
         float global_max = -INFINITY;
-        for (int c = 0; c < num_chunks; ++c) {
+        for (int c = 0; c < valid_chunks; ++c) {
             const float m = partials[partial_seq_base + (size_t) c * chunk_stride_q + qi_stride + HEAD_SIZE];
             global_max = max(global_max, m);
         }
@@ -1090,7 +1093,7 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
         // Pass 2: merge across chunks.
         float global_sum = 0.0f;
         float v_d        = 0.0f;
-        for (int c = 0; c < num_chunks; ++c) {
+        for (int c = 0; c < valid_chunks; ++c) {
             const size_t cbase = partial_seq_base + (size_t) c * chunk_stride_q + qi_stride;
             const float  c_max = partials[cbase + HEAD_SIZE];
             if (c_max == -INFINITY) continue;
@@ -1187,7 +1190,8 @@ void launch_paged_attn_decode(
     dim3 block2(HEAD_SIZE);
     mt_paged_attention_decode_reduce_kernel<HEAD_SIZE>
         <<<grid2, block2, 0, stream>>>(
-            out, partials_scratch, q_lens, n_heads, num_seqs, num_chunks, max_q_len);
+            out, partials_scratch, q_lens, context_lens, num_chunks, CHUNK_KV,
+            n_heads, num_seqs, max_q_len);
 }
 
 // ── explicit instantiations ────────────────────────────────────────────
