@@ -422,19 +422,26 @@ int main(int argc, char** argv) {
         // Default: dyn-VGPR cap probe. Test dyn correctness at increasing s_alloc footprints:
         //   light NACC=8  -> s_alloc 96  (<=128, expected OK)
         //   heavy NACC=16 -> s_alloc 160 (>128,  suspected over-cap -> zeros)
-        printf("=== dyn-VGPR correctness vs occupancy (light s_alloc 96; KDEPTH=1) ===\n");
-        printf("  the fat s_alloc is correct only while (resident waves * 96) fits the VGPR file;\n");
-        printf("  beyond that, simultaneous fat allocs OVERSUBSCRIBE and corrupt (->0), not stall.\n\n");
-        printf("  nWaves   maxlive  occ/SIMD   WMMA\n");
-        const uint32_t grids[] = {4, 64, 256, 1024, 1536, 2048, 4096};
+        printf("=== dyn-VGPR correctness INVESTIGATION (light s_alloc 96; KDEPTH=1) ===\n");
+        printf("  Is the occ-16 'corruption' deterministic silicon, or a flaky harness race?\n");
+        printf("  Each grid run 6x; report OK/CORRUPT counts + whether all-zero or partial.\n\n");
+        printf("  nWaves  maxlive  occ/SIMD   OK/6   note\n");
+        const uint32_t grids[] = {1536, 1792, 1920, 2048, 2176, 2560, 4096};
         for (uint32_t g : grids) {
-            Timed t = run_timed(node, "occ_n8_d1.bin", true, fragIn, g, 4, 1, 1);
-            if (!t.ok) { printf("  %6u   DID NOT COMPLETE\n", g); continue; }
-            printf("  %6u   %5u    %6.2f    %s\n", g, t.maxlive, t.maxlive/128.0, wmma_ok(t.D) ? "OK" : "CORRUPT");
+            int ok = 0, allzero = 0; uint32_t mx = 0;
+            for (int r = 0; r < 6; ++r) {
+                RunResult rr = run_variant(node, "occ_n8_d1.bin", true, fragIn, g, 4, 1);
+                if (!rr.ok) continue;
+                mx = rr.maxlive;
+                if (wmma_ok(rr.D)) ok++;
+                else { bool z = true; for (int i=0;i<256;i++) if (rr.D[i]!=0.0f) { z=false; break; } if (z) allzero++; }
+            }
+            printf("  %6u  %5u    %6.2f    %d/6   %s\n", g, mx, mx/128.0, ok,
+                   ok==6 ? "all OK" : (allzero==(6-ok) ? "fails = all-zero" : "fails = partial/garbage"));
         }
-        printf("\n  heavy dyn (s_alloc 160) @ 4 waves (no oversubscription): ");
-        { Timed t = run_timed(node, "occ_n16_d1.bin", true, fragIn, 4, 4, 1, 1);
-          printf("%s  -> per-wave dyn-VGPR cap is < 160 (128 worked in Phase 2)\n", t.ok ? (wmma_ok(t.D)?"OK":"CORRUPT") : "FAIL"); }
+        printf("\n  heavy dyn (s_alloc 160) @ 4 waves x6 (no oversubscription -> isolates per-wave cap):\n  ");
+        { int ok=0; for(int r=0;r<6;r++){ RunResult rr=run_variant(node,"occ_n16_d1.bin",true,fragIn,4,4,1); if(rr.ok&&wmma_ok(rr.D)) ok++; }
+          printf("OK %d/6  -> if 0/6, the per-wave dyn-VGPR cap is genuinely < 160\n", ok); }
         rc = 0;
     }
 
