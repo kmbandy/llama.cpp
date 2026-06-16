@@ -2930,7 +2930,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        // routing_active forces MMQ: it is the only mul_mat_id path that honors the
+        // weight-pager expert pointers here (MMVQ handled above for small batch). On
+        // gfx80x ggml_cuda_should_use_mmq() now returns false for large batches (no
+        // hardware dp4a -> route to dequant+hipBLAS), so without this OR the routing
+        // case would fall through to the GGML_ABORT below.
+        if (routing_active || ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }

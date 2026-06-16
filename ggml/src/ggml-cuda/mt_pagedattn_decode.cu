@@ -70,7 +70,7 @@ static constexpr int DECODE_K_TILE_N = 16;
 // 1024 = 64 sub-chunks/block. At 400K ctx → ~400 chunks × n_heads = 12800
 // blocks (well above RDNA4 R9700's ~240 concurrent block ceiling, so we
 // run in waves and amortize scratch).
-static constexpr int CHUNK_KV = 256;  // MAD-301A: was 1024 (tuned for 400K ctx / RDNA4 240-block ceiling); too coarse for gfx803's 36 CUs at mid ctx (ctx 1751 -> only 2 chunks -> few blocks -> CU under-utilization). 256 -> 4x more parallel blocks. TODO: make arch-tunable.
+static constexpr int CHUNK_KV = 128;  // MAD-301A: was 1024 (tuned for 400K ctx / RDNA4 240-block ceiling); too coarse for gfx803's 36 CUs at mid ctx (ctx 1751 -> only 2 chunks -> few blocks -> CU under-utilization). CHUNK_KV sweep on gfx803: 128 (56/38 t/s) > 256 (52/37) > 512 (45/23) @ctx 1751/10501. TODO: make arch-tunable.
 
 // Threads/block. 4 warps (32 lanes each) — fits LDS budget for 2× tile
 // (smem_k + smem_v at HEAD_SIZE=128 = 4 KiB each = 8 KiB) plus Q+logits.
