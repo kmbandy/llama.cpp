@@ -66,6 +66,17 @@ done
 "$L/llvm-objcopy" -O binary --only-section=.text occ_timercheck.o occ_timercheck.bin
 echo "      occ_timercheck.bin: $(wc -c < occ_timercheck.bin) bytes"
 
+# MICRO-BATCH dynamic-queue kernel: persistent waves pull tiles from an atomic queue; per tile
+# dyn-VGPR grows (s_alloc 96) -> computes -> ships -> shrinks (s_alloc 32). NACC=8 fits the
+# default 128 dyn cap (no umr). static (d0) reserves 96 for life; dyn (d1) lean-32 + grow/shrink.
+echo "[1c] micro-batch dynamic-queue kernel -> occ_mb_d{0,1}.bin (NACC=8)"
+for dv in 0 1; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,NACC=8 -c occ_kernel_mb.s -o occ_mb_d${dv}.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_mb_d${dv}.o occ_mb_d${dv}.bin
+    echo "      occ_mb_d${dv}.bin: $(wc -c < occ_mb_d${dv}.bin) bytes"
+done
+
 echo "[2/3] oracle self-test"
 clang++ -std=c++17 test_fp8_oracle.cpp fp8_oracle.cpp -o test_oracle
 ./test_oracle

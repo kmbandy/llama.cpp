@@ -292,8 +292,90 @@ static double tf_span(uint32_t nWG, uint32_t K, uint32_t nacc, uint64_t wall, do
     return work * (2.0 * 16 * 16 * 16) * freq_hz / (double)wall / 1e12;
 }
 
+// ---------------------------------------------------------------------------
+// MICRO-BATCH dynamic-queue dispatch: launch nWaves PERSISTENT waves that pull output-tiles
+// from a global atomic counter (occ[nextTile@20]) and process them until totalTiles drains.
+// Per tile the dyn kernel s_alloc-grows to the accumulator footprint, computes, ships C[ti],
+// and s_alloc-shrinks. Validates every tile == kdepth*Dref. C buffer = totalTiles*1024 B.
+// ---------------------------------------------------------------------------
+struct MbResult { bool ok=false; uint32_t maxlive=0, total=0, okTiles=0, nTiles=0; uint64_t wall=0; double secs=0; };
+static MbResult run_microbatch(uint32_t node, const char* isaPath, bool dynvgpr,
+                               const uint32_t* fragIn, uint32_t nWaves, uint32_t staticVgprField,
+                               uint32_t kdepth, uint32_t totalTiles, const float* Dref) {
+    MbResult res; res.nTiles = totalTiles;
+    size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
+    GpuBuf isa  = AllocGpu(node, 0x1000, true,  false);
+    GpuBuf occ  = AllocGpu(node, 0x1000, false, true);
+    GpuBuf fin  = AllocGpu(node, 0x1000, false, true);
+    uint64_t cbytes = ((uint64_t)totalTiles*1024 + 0xFFF) & ~0xFFFull;
+    GpuBuf C    = AllocGpu(node, cbytes, false, true);
+    GpuBuf fence= AllocGpu(node, 0x1000, false, true);
+    memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
+    memcpy(fin.ptr, fragIn, 128*sizeof(uint32_t));
+    volatile uint32_t* occW=(volatile uint32_t*)occ.ptr;
+    volatile uint32_t* fenceW=(volatile uint32_t*)fence.ptr;
+    occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=0; *fenceW=0;  // occ[5]=nextTile
+
+    Ring ring; ring.buf=AllocGpu(node,0x10000,true,true); ring.dw=(uint32_t*)ring.buf.ptr;
+    ring.sizeDw=(uint32_t)(ring.buf.size/sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node,HSA_QUEUE_COMPUTE,100,HSA_QUEUE_PRIORITY_NORMAL,ring.buf.ptr,ring.buf.size,nullptr,&ring.res));
+
+    uint64_t shiftedIsa=((uint64_t)isa.ptr)>>8;
+    uint64_t occVa=(uint64_t)occ.ptr, finVa=(uint64_t)fin.ptr, cVa=(uint64_t)C.ptr, fenceVa=(uint64_t)fence.ptr;
+    uint32_t dims[8]={0,0,0,32,1,1,0,0};
+    uint32_t pgm[6]={(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    uint32_t rsrc1=BuildPgmRsrc1(false);
+    uint32_t launchField=dynvgpr?4u:(staticVgprField&0x3fu);
+    rsrc1=(rsrc1&~0x3fu)|(launchField&0x3fu);
+    uint32_t rsrc2=(BuildPgmRsrc2(dynvgpr)&~0x3eu)|(8u<<RSRC2_USER_SGPR_SHIFT);   // 8 user SGPRs (s0..s7)
+    uint32_t rsrc[2]={rsrc1,rsrc2};
+    uint32_t reslim[1]={0},tmpring[1]={0},restart[4]={0,0,0,0};
+    uint32_t userdata[16]={
+        (uint32_t)occVa,(uint32_t)(occVa>>32),       // s0:s1 occ
+        (uint32_t)finVa,(uint32_t)(finVa>>32),       // s2:s3 fragIn
+        (uint32_t)cVa, (uint32_t)(cVa>>32),          // s4:s5 C base
+        kdepth, totalTiles, 0,0,0,0,0,0,0,0 };       // s6 KDEPTH, s7 TOTAL_TILES
+    uint32_t dispInit=BuildDispatchInitiator();
+    RingPlace(ring,PM4AcquireMemoryPacket(FAMILY_GFX12));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_START_X,dims,8));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO,pgm,6));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1,rsrc,2));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS,reslim,1));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE,tmpring,1));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X,restart,4));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0,userdata,16));
+    RingPlace(ring,PM4DispatchDirectPacket(nWaves*32u,1,1,dispInit));            // nWaves persistent wave32
+    RingPlace(ring,PM4ReleaseMemoryPacket(FAMILY_GFX12,true,fenceVa,FENCE_VALUE));
+
+    const double timeoutS=20.0;
+    double t0=now_s(); RingSubmit(ring);
+    bool done=false,admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
+    while(true){ double now=now_s();
+        if(occW[1]>0) admitted=true;
+        uint32_t end=occW[3]; if(end!=lastEnd){lastEnd=end;lastEndChange=now;}
+        bool ff=(*fenceW==FENCE_VALUE);
+        if(admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025){done=true;break;}
+        if(now-t0>timeoutS) break;
+    }
+    double t1=now_s();
+    if(!done){ fprintf(stderr,"\n*** MB TIMEOUT (%s): live=%u maxlive=%u nextTile=%u (queue may be hung) ***\n",
+                       isaPath,occW[0],occW[1],occW[5]); res.ok=false; return res; }
+    res.ok=true; res.maxlive=occW[1]; res.total=occW[4];
+    { uint32_t gs=occW[2],ge=occW[3]; res.wall=(ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
+    res.secs=t1-t0;
+    const float* Cf=(const float*)C.ptr; uint32_t okc=0;
+    for(uint32_t t=0;t<totalTiles;t++){ float D[256]; unpack_D(Cf+(size_t)t*256, D);
+        bool good=true; for(int i=0;i<256;i++){ float want=(float)kdepth*Dref[i];
+            if(std::fabs(D[i]-want) > 5e-3f*std::fabs(want)+1e-2f){good=false;break;} }
+        if(good) okc++; }
+    res.okTiles=okc;
+    CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+    FreeGpu(ring.buf);FreeGpu(fence);FreeGpu(C);FreeGpu(fin);FreeGpu(occ);FreeGpu(isa);
+    return res;
+}
+
 int main(int argc, char** argv) {
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH } mode = CORRECT;
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
         else if (!strcmp(argv[i], "--prong2"))    mode = PRONG2;
@@ -301,6 +383,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--combined"))  mode = COMBINED;
         else if (!strcmp(argv[i], "--timercheck"))mode = TIMERCHECK;
         else if (!strcmp(argv[i], "--probe"))     mode = PROBE;
+        else if (!strcmp(argv[i], "--microbatch"))mode = MICROBATCH;
     }
 
     // Test matrices A,B (16x16 e4m3, non-trivial) and the CPU oracle D = A.B.
@@ -523,6 +606,37 @@ int main(int argc, char** argv) {
                    K, hms, sms, ns_iter, ns_wmma, loop_ok(t.D, K) ? "OK" : "BAD");
         }
         printf("  (physical issue floor ~2.7 ns/WMMA @ 2.5 GHz; below that => WMMAs elided/not real.)\n");
+    } else if (mode == MICROBATCH) {
+        // SATURATION SWEEP: hold occupancy fixed, crank work-per-tile (KDEPTH). If TF rises with
+        // KDEPTH we were UNDER-FEEDING (per-tile s_alloc/atomic/reload/store overhead dominated and
+        // the matrix unit idled between tiles); the asymptote is this hand-asm vehicle's saturated
+        // rate (~64 TF, the load-once occ_kernel ceiling). If flat-low -> stall-bound regardless.
+        const uint32_t NACC=8;
+        // PART 1: push work/tile to find the saturated asymptote (occ 8, clean). 307 = matrix ceiling.
+        printf("=== PART 1: saturation asymptote (pool=1024 = occ 8, %u tiles) ===\n", 2048);
+        printf("  KDEPTH  variant  okTiles    span_ms  TFLOPS  %%307\n");
+        { const uint32_t Ks[]={16384, 32768, 65536}, TOTAL=2048, POOL=1024;
+          for (uint32_t K : Ks) for (int dv=0; dv<2; ++dv) {
+              MbResult r=run_microbatch(node,dv?"occ_mb_d1.bin":"occ_mb_d0.bin",dv!=0,fragIn,POOL,96/8,K,TOTAL,Dref);
+              if(!r.ok){ fprintf(stderr,"  K=%u %s incomplete.\n",K,dv?"dyn":"static"); rc=3; continue; }
+              double tf=(double)TOTAL*K*NACC*(2.0*16*16*16)*freq_hz/(double)r.wall/1e12;
+              printf("  %6u  %-6s   %4u/%u  %8.3f  %6.1f  %5.1f\n",
+                     K,dv?"dyn":"static",r.okTiles,TOTAL,(double)r.wall/freq_hz*1e3,tf,100*tf/307.0); } }
+        // PART 2: the real dyn-VGPR throughput test, finally on a SATURATED vehicle:
+        // static-96 caps at occ 12; dyn lean->s_alloc reaches occ 16. At high KDEPTH (saturated),
+        // does the extra 33% occupancy now convert to throughput? (pool 2048 >> ... so all waves busy.)
+        printf("\n=== PART 2: occupancy-at-saturation -- static(occ12) vs dyn(occ16), KDEPTH=16384 ===\n");
+        printf("  pool   variant  maxlive occ/SIMD  okTiles    span_ms  TFLOPS  %%307\n");
+        { const uint32_t K=16384, TOTAL=4096, POOL=2048;
+          for (int dv=0; dv<2; ++dv) {
+              MbResult r=run_microbatch(node,dv?"occ_mb_d1.bin":"occ_mb_d0.bin",dv!=0,fragIn,POOL,96/8,K,TOTAL,Dref);
+              if(!r.ok){ fprintf(stderr,"  %s incomplete.\n",dv?"dyn":"static"); rc=3; continue; }
+              double tf=(double)TOTAL*K*NACC*(2.0*16*16*16)*freq_hz/(double)r.wall/1e12;
+              printf("  %5u  %-6s   %6u  %6.2f   %4u/%u  %8.3f  %6.1f  %5.1f\n",
+                     POOL,dv?"dyn":"static",r.maxlive,r.maxlive/128.0,r.okTiles,TOTAL,
+                     (double)r.wall/freq_hz*1e3,tf,100*tf/307.0); } }
+        printf("\n  PART1: does TF reach ~300 (hand-asm CAN saturate)?  PART2: dyn TF > static TF =>\n");
+        printf("  dyn-VGPR occupancy converts to throughput when saturated (the lever finally pays).\n");
     } else {
         // Default: dyn-VGPR cap probe. Test dyn correctness at increasing s_alloc footprints:
         //   light NACC=8  -> s_alloc 96  (<=128, expected OK)
