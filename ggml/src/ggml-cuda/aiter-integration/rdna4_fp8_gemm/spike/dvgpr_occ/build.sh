@@ -25,13 +25,46 @@ run_capped() {
     fi
 }
 
-echo "[1/3] assembling occ_kernel.s -> occ_n{8,16}_d{0,1}.bin (gfx1201)"
-for nacc in 8 16; do for dv in 0 1; do
+echo "[1/3] assembling occ_kernel.s -> occ_n{8,12,16}_d{0,1}.bin (+ fed-12) (gfx1201)"
+for nacc in 8 12 16; do for dv in 0 1; do
     "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
         -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,NACC=$nacc -c occ_kernel.s -o occ_n${nacc}_d${dv}.o
     "$L/llvm-objcopy" -O binary --only-section=.text occ_n${nacc}_d${dv}.o occ_n${nacc}_d${dv}.bin
     echo "      occ_n${nacc}_d${dv}.bin: $(wc -c < occ_n${nacc}_d${dv}.bin) bytes"
 done; done
+# FEED variants: operand-feed gap (re-fetch B each iter) to test whether dyn-VGPR occupancy
+# converts to throughput when there's a gap to hide. NACC=12 (128 VGPR) fits the current dyn cap;
+# NACC=16 (160 VGPR = the real acc[4][4] tile) needs SQ_DYN_VGPR.BLOCK_SIZE=1 (cap 128->256).
+for nacc in 12 16; do for dv in 0 1; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,NACC=$nacc -Wa,-defsym,FEED=1 -c occ_kernel.s -o occ_n${nacc}fed_d${dv}.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_n${nacc}fed_d${dv}.o occ_n${nacc}fed_d${dv}.bin
+    echo "      occ_n${nacc}fed_d${dv}.bin: $(wc -c < occ_n${nacc}fed_d${dv}.bin) bytes"
+done; done
+
+# COMBINED kernel: all levers stacked (UNROLL x NACC x FEED x dyn-VGPR). UNROLL=8.
+COMB_UNROLL=8
+echo "[1b] combined kernel (unroll=$COMB_UNROLL x ILP x feed x dyn) -> occ_comb_n{8,16}_d{0,1}"
+for nacc in 8 16; do for dv in 0 1; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,NACC=$nacc -Wa,-defsym,FEED=1 -Wa,-defsym,UNROLL=$COMB_UNROLL \
+        -c occ_kernel_combined.s -o occ_comb_n${nacc}_d${dv}.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_comb_n${nacc}_d${dv}.o occ_comb_n${nacc}_d${dv}.bin
+    echo "      occ_comb_n${nacc}_d${dv}.bin: $(wc -c < occ_comb_n${nacc}_d${dv}.bin) bytes"
+done; done
+# no-feed ceiling reference (NACC=8, unrolled): the operands-in-registers throughput ceiling.
+for dv in 0 1; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,NACC=8 -Wa,-defsym,FEED=0 -Wa,-defsym,UNROLL=$COMB_UNROLL \
+        -c occ_kernel_combined.s -o occ_combnf_n8_d${dv}.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_combnf_n8_d${dv}.o occ_combnf_n8_d${dv}.bin
+    echo "      occ_combnf_n8_d${dv}.bin: $(wc -c < occ_combnf_n8_d${dv}.bin) bytes"
+done
+
+# timer-check kernel: measures the actual s_sendmsg REALTIME tick rate (validates freq_hz).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c occ_timercheck.s -o occ_timercheck.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_timercheck.o occ_timercheck.bin
+echo "      occ_timercheck.bin: $(wc -c < occ_timercheck.bin) bytes"
 
 echo "[2/3] oracle self-test"
 clang++ -std=c++17 test_fp8_oracle.cpp fp8_oracle.cpp -o test_oracle

@@ -293,11 +293,14 @@ static double tf_span(uint32_t nWG, uint32_t K, uint32_t nacc, uint64_t wall, do
 }
 
 int main(int argc, char** argv) {
-    enum { CORRECT, PRONG1, PRONG2, PROBE } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE } mode = CORRECT;
     for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i], "--prong1")) mode = PRONG1;
-        else if (!strcmp(argv[i], "--prong2")) mode = PRONG2;
-        else if (!strcmp(argv[i], "--probe"))  mode = PROBE;
+        if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
+        else if (!strcmp(argv[i], "--prong2"))    mode = PRONG2;
+        else if (!strcmp(argv[i], "--prong3"))    mode = PRONG3;
+        else if (!strcmp(argv[i], "--combined"))  mode = COMBINED;
+        else if (!strcmp(argv[i], "--timercheck"))mode = TIMERCHECK;
+        else if (!strcmp(argv[i], "--probe"))     mode = PROBE;
     }
 
     // Test matrices A,B (16x16 e4m3, non-trivial) and the CPU oracle D = A.B.
@@ -400,6 +403,108 @@ int main(int argc, char** argv) {
                    stf > 0 ? dtf / stf : 0.0, loop_ok(sk.D, K) ? "OK" : "BAD", loop_ok(dk.D, K) ? "OK" : "BAD");
         }
         printf("\n  GREEN-2 if dyn >= static TFLOPS at realistic KDEPTH (no serialization penalty).\n");
+    } else if (mode == PRONG3) {
+        // THE wide-feed x dyn-VGPR test (MAD-305 #287): does dyn-VGPR occupancy convert to
+        // throughput for a MATRIX kernel WITH an operand-feed gap (the wide-feed lever's essence,
+        // FEED=1: re-fetch B each iter)? Static reserves its footprint for life (occupancy-capped);
+        // dyn launches lean -> s_alloc -> full occ. If occupancy hides the feed gap, dyn > static.
+        // NACC=12 (128 VGPR) fits the current dyn cap; NACC=16 (160 = the real acc[4][4]) needs
+        // SQ_DYN_VGPR.BLOCK_SIZE=1 (will show loop=BAD until the cap is lifted).
+        struct Cfg { uint32_t nacc, sfield; const char* fed0; const char* fed1; };
+        const Cfg cfgs[] = {
+            {12, 128/8, "occ_n12fed_d0.bin", "occ_n12fed_d1.bin"},
+            {16, 160/8, "occ_n16fed_d0.bin", "occ_n16fed_d1.bin"},
+        };
+        const uint32_t nWG = 8192;
+        const uint32_t Ks[] = {256, 1024, 4096};
+        for (const Cfg& c : cfgs) {
+            printf("\n=== PRONG 3: wide-feed gap x dyn-VGPR (NACC=%u, %u VGPR, grid=%u) ===\n",
+                   c.nacc, c.sfield*8, nWG);
+            Timed cs = run_timed(node, c.fed0, false, fragIn, nWG, c.sfield, 1, 1);
+            Timed cd = run_timed(node, c.fed1, true,  fragIn, nWG, 4,        1, 1);
+            if (!cs.ok || !cd.ok) { fprintf(stderr, "  NACC=%u correctness did not complete; skipping.\n", c.nacc); continue; }
+            bool sok = wmma_ok(cs.D), dok = wmma_ok(cd.D);
+            printf("  correctness (KDEPTH=1): static %s (occ=%.1f)  dyn %s (occ=%.1f)%s\n",
+                   sok?"OK":"MISMATCH", cs.maxlive/128.0, dok?"OK":"MISMATCH", cd.maxlive/128.0,
+                   dok?"":"  <- dyn over cap; flip SQ_DYN_VGPR.BLOCK_SIZE=1");
+            printf("  KDEPTH  static_TF static_occ   dyn_TF dyn_occ   dyn/static  loop(s/d)\n");
+            for (uint32_t K : Ks) {
+                Timed sk = run_timed(node, c.fed0, false, fragIn, nWG, c.sfield, K, 3);
+                Timed dk = run_timed(node, c.fed1, true,  fragIn, nWG, 4,        K, 3);
+                if (!sk.ok || !dk.ok) { fprintf(stderr, "  NACC=%u KDEPTH=%u did not complete.\n", c.nacc, K); break; }
+                double stf = tf_span(sk.total?sk.total:nWG, K, c.nacc, sk.wall, freq_hz);
+                double dtf = tf_span(dk.total?dk.total:nWG, K, c.nacc, dk.wall, freq_hz);
+                printf("  %6u  %8.1f   %6.2f   %7.1f  %5.2f    %6.2fx     %s/%s\n",
+                       K, stf, sk.maxlive/128.0, dtf, dk.maxlive/128.0,
+                       stf>0?dtf/stf:0.0, loop_ok(sk.D,K)?"OK":"BAD", loop_ok(dk.D,K)?"OK":"BAD");
+            }
+        }
+        printf("\n  GREEN-3 if FED dyn/static > 1 (occupancy hides the feed gap), loops OK.\n");
+    } else if (mode == COMBINED) {
+        // THE combined kernel (MAD-305 #287): unroll x ILP(NACC) x feed x dyn-VGPR, all stacked.
+        // s6 = TRIP COUNT; each trip does UNROLL accumulate-rounds; effK = 1 + trip*UNROLL.
+        // Rows: NACC=8 no-feed (the operands-in-register ceiling, ~the 307 microbench), NACC=8 fed,
+        // NACC=16 fed (the real acc[4][4] tile; dyn arm valid only after SQ_DYN_VGPR.BLOCK_SIZE=1).
+        const uint32_t UNROLL = 8, nWG = 8192;
+        const uint32_t trips[] = {64, 256, 512};
+        printf("=== COMBINED: unroll(%u) x ILP x feed x dyn-VGPR  (grid=%u, ceiling=307 TF) ===\n", UNROLL, nWG);
+        struct Cfg { const char* name; uint32_t nacc, sfield; const char* d0; const char* d1; };
+        const Cfg cfgs[] = {
+            {"NACC=8  no-feed (ceiling)", 8,  96/8,  "occ_combnf_n8_d0.bin", "occ_combnf_n8_d1.bin"},
+            {"NACC=8  fed",              8,  96/8,  "occ_comb_n8_d0.bin",   "occ_comb_n8_d1.bin"},
+            {"NACC=16 fed (real tile)",  16, 160/8, "occ_comb_n16_d0.bin",  "occ_comb_n16_d1.bin"},
+        };
+        for (const Cfg& c : cfgs) {
+            printf("\n--- %s ---\n", c.name);
+            Timed cs = run_timed(node, c.d0, false, fragIn, nWG, c.sfield, 0, 1);   // trip=0 -> peel only
+            Timed cd = run_timed(node, c.d1, true,  fragIn, nWG, 4,        0, 1);
+            if (!cs.ok || !cd.ok) { fprintf(stderr, "  %s correctness did not complete; skipping.\n", c.name); continue; }
+            printf("  correctness (trip=0): static %s (occ=%.1f)  dyn %s (occ=%.1f)%s\n",
+                   wmma_ok(cs.D)?"OK":"MISMATCH", cs.maxlive/128.0,
+                   wmma_ok(cd.D)?"OK":"MISMATCH", cd.maxlive/128.0,
+                   wmma_ok(cd.D)?"":"  <- dyn over cap (flip SQ_DYN_VGPR.BLOCK_SIZE=1)");
+            printf("  trip  effK   static_TF s_occ %%307   dyn_TF d_occ %%307  dyn/st  loop(s/d)\n");
+            for (uint32_t trip : trips) {
+                uint32_t effK = 1 + trip*UNROLL;
+                Timed sk = run_timed(node, c.d0, false, fragIn, nWG, c.sfield, trip, 3);
+                Timed dk = run_timed(node, c.d1, true,  fragIn, nWG, 4,        trip, 3);
+                if (!sk.ok || !dk.ok) { fprintf(stderr, "  %s trip=%u did not complete.\n", c.name, trip); break; }
+                double stf = tf_span(sk.total?sk.total:nWG, effK, c.nacc, sk.wall, freq_hz);
+                double dtf = tf_span(dk.total?dk.total:nWG, effK, c.nacc, dk.wall, freq_hz);
+                printf("  %4u %6u   %7.1f %5.2f %5.1f  %7.1f %5.2f %5.1f  %5.2fx  %s/%s\n",
+                       trip, effK, stf, sk.maxlive/128.0, 100*stf/307.0,
+                       dtf, dk.maxlive/128.0, 100*dtf/307.0,
+                       stf>0?dtf/stf:0.0, loop_ok(sk.D,effK)?"OK":"BAD", loop_ok(dk.D,effK)?"OK":"BAD");
+            }
+        }
+        printf("\n  static %%307 = how close unroll+ILP gets to the matrix ceiling; dyn/static = the\n");
+        printf("  dyn-VGPR occupancy contribution (dyn valid <=128 VGPR until SQ_DYN_VGPR.BLOCK_SIZE=1).\n");
+    } else if (mode == TIMERCHECK) {
+        // Resolve the s_sendmsg REALTIME tick rate. Busy-wait T ticks at grid=1; host-time it.
+        // Two targets cancel the fixed submit/fence/poll overhead: freq = dT / d(host_secs).
+        printf("=== TIMER CHECK: actual s_sendmsg REALTIME tick rate ===\n");
+        printf("  assumed freq_hz (hsaKmt GPUClockCounter) = %.2f MHz ; rocprof shader clock ~= 2340 MHz\n",
+               freq_hz/1e6);
+        const uint32_t targets[] = {40000000u, 80000000u, 120000000u};
+        double secs[3] = {0,0,0}; uint64_t span[3] = {0,0,0}; bool ok = true;
+        printf("\n  target_ticks   host_secs   realtime_span(ticks)   span/host(MHz)\n");
+        for (int i = 0; i < 3; ++i) {
+            RunResult rr = run_variant(node, "occ_timercheck.bin", false, fragIn, 1, 8, targets[i]);
+            if (!rr.ok) { fprintf(stderr, "  timercheck target=%u did not complete.\n", targets[i]); ok = false; rc = 3; break; }
+            secs[i] = rr.secs; span[i] = rr.wall;
+            printf("  %11u   %8.4f   %18llu   %8.1f\n",
+                   targets[i], rr.secs, (unsigned long long)rr.wall, (double)rr.wall/rr.secs/1e6);
+        }
+        if (ok) {
+            double f01 = (double)(targets[1]-targets[0])/(secs[1]-secs[0]);
+            double f12 = (double)(targets[2]-targets[1])/(secs[2]-secs[1]);
+            double f   = 0.5*(f01+f12);
+            printf("\n  overhead-cancelled REALTIME freq (dticks / d(host_secs)):  %.1f MHz  (%.1f / %.1f)\n",
+                   f/1e6, f01/1e6, f12/1e6);
+            printf("  -> PM4-timed TFLOPS must be scaled by (actual/assumed) = %.2fx.\n", f/freq_hz);
+            printf("     e.g. combined no-feed NACC=8 reported 64 TF -> really ~%.0f TF;\n", 64.0*f/freq_hz);
+            printf("          combined NACC=16 reported 127 TF -> really ~%.0f TF.\n", 127.0*f/freq_hz);
+        }
     } else if (mode == PROBE) {
         // Single wave -- no occupancy/grid confound. span_ms (in-kernel, min-start..max-end of the
         // ONE wave) is its exact loop wall-time, free of host/launch overhead. ns/WMMA below the

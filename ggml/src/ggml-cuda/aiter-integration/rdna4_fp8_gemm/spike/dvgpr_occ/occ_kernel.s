@@ -38,12 +38,21 @@
 .ifndef DYNVGPR
     .set DYNVGPR, 0
 .endif
+.ifndef FEED
+    .set FEED, 0               // 1 = re-fetch B from global each loop iter (operand-feed gap to
+                               // hide via occupancy). Same address -> L2 hit, B unchanged, so the
+                               // accumulator is still KDEPTH*(A.B) and the oracle/loop check pass.
+.endif
 // s_alloc_vgpr block granularity: Phase 2 proved 128 and 32 work; keep FATREGS a multiple of 32
-// and >= the highest VGPR used (NACC=16 -> v159 -> 160 ; NACC=8 -> v95 -> 96).
-.if NACC > 8
-    .set FATREGS, 160          // v32..v159 (160 used) -> 160 VGPRs
+// and >= the highest VGPR used. NACC=8 -> v95 -> 96 ; NACC=12 -> v127 -> 128 (the dyn-useful
+// occupancy window: static reserve 128 = occ ~12, dyn lean->s_alloc 128 = up to occ 16) ;
+// NACC=16 -> v159 -> 160 (over the proven dyn cap; static-only).
+.if NACC >= 16
+    .set FATREGS, 160          // v32..v159 -> 160 VGPRs
+.elseif NACC >= 12
+    .set FATREGS, 128          // v32..v127 -> 128 VGPRs
 .else
-    .set FATREGS, 96           // v32..v95  ( 96 used) ->  96 VGPRs
+    .set FATREGS, 96           // v32..v95  ->  96 VGPRs
 .endif
 
     .text
@@ -92,11 +101,13 @@ occ_kernel:
     v_wmma_f32_16x16x16_fp8_fp8 v[72:79],   v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[16:17], v[18:19], 0
-.if NACC > 8
+.if NACC >= 12
     v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[16:17], v[18:19], 0
+.endif
+.if NACC >= 16
     v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[16:17], v[18:19], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[144:151], v[16:17], v[18:19], 0
@@ -122,6 +133,10 @@ occ_kernel:
     s_cmp_eq_u32 s9, 0
     s_cbranch_scc1 .Lkdone                // KDEPTH==1 (correctness pass) -> skip the loop
 .Lkloop:
+.if FEED
+    global_load_b64 v[18:19], v6, s[2:3] offset:256   // FEED: re-fetch B (operand gap to hide; same
+    s_wait_loadcnt 0x0                                 // addr -> L2 hit, B unchanged -> acc still K*A.B)
+.endif
     v_wmma_f32_16x16x16_fp8_fp8 v[32:39],   v[16:17], v[18:19], v[32:39]
     v_wmma_f32_16x16x16_fp8_fp8 v[40:47],   v[16:17], v[18:19], v[40:47]
     v_wmma_f32_16x16x16_fp8_fp8 v[48:55],   v[16:17], v[18:19], v[48:55]
@@ -130,11 +145,13 @@ occ_kernel:
     v_wmma_f32_16x16x16_fp8_fp8 v[72:79],   v[16:17], v[18:19], v[72:79]
     v_wmma_f32_16x16x16_fp8_fp8 v[80:87],   v[16:17], v[18:19], v[80:87]
     v_wmma_f32_16x16x16_fp8_fp8 v[88:95],   v[16:17], v[18:19], v[88:95]
-.if NACC > 8
+.if NACC >= 12
     v_wmma_f32_16x16x16_fp8_fp8 v[96:103],  v[16:17], v[18:19], v[96:103]
     v_wmma_f32_16x16x16_fp8_fp8 v[104:111], v[16:17], v[18:19], v[104:111]
     v_wmma_f32_16x16x16_fp8_fp8 v[112:119], v[16:17], v[18:19], v[112:119]
     v_wmma_f32_16x16x16_fp8_fp8 v[120:127], v[16:17], v[18:19], v[120:127]
+.endif
+.if NACC >= 16
     v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[16:17], v[18:19], v[128:135]
     v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[16:17], v[18:19], v[136:143]
     v_wmma_f32_16x16x16_fp8_fp8 v[144:151], v[16:17], v[18:19], v[144:151]
