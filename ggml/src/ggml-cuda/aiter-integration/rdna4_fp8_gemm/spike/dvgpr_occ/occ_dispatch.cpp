@@ -146,7 +146,7 @@ static uint8_t* ReadFile(const char* path, size_t* outLen) {
 // reservation (static) or lean-32 launch (dyn) and runtime KDEPTH. Host-timed
 // submit->fence. Returns the acc0 tile (256 f32) for the oracle and maxlive.
 // ---------------------------------------------------------------------------
-struct RunResult { bool ok = false; uint32_t maxlive = 0; double secs = 0.0; float D[256]; };
+struct RunResult { bool ok = false; uint32_t maxlive = 0; uint32_t total = 0; uint64_t wall = 0; double secs = 0.0; float D[256]; };
 
 static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
                              const uint32_t* fragIn /*128 u32: 64 A then 64 B*/,
@@ -161,9 +161,9 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
     GpuBuf fence = AllocGpu(node, 0x1000, /*exec*/false, /*uncached*/true);
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
     memcpy(fin.ptr, fragIn, 128 * sizeof(uint32_t));
-    volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;    // occW[0]=live, occW[1]=maxlive
+    volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;    // [0]=live [1]=maxlive [2]=min(start) [3]=max(end)
     volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
-    occW[0] = 0; occW[1] = 0; *fenceW = 0;
+    occW[0] = 0; occW[1] = 0; occW[2] = 0xFFFFFFFFu; occW[3] = 0; occW[4] = 0; *fenceW = 0;
     // KDEPTH travels in a user SGPR (s6), not memory: the scalar K-cache is not invalidated by
     // AcquireMem, so a memory KDEPTH reads stale across dispatches (buffer VAs get reused).
 
@@ -213,17 +213,30 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
     RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE,    tmpring,  1));
     RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X,       restart,  4));
     RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0,     userdata, 16));
-    RingPlace(ring, PM4DispatchDirectPacket(nWG, 1, 1, dispInit));
+    // DISPATCH_DIRECT DIM_X is in THREADS (not workgroups): one wave32/WG -> DIM_X = nWG*32.
+    // (Passing nWG directly only launched nWG/32 waves -- the 32x work over-count bug.)
+    RingPlace(ring, PM4DispatchDirectPacket(nWG * 32u, 1, 1, dispInit));
     RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, /*isPolling*/true, fenceVa, FENCE_VALUE));
 
-    // --- timed submit->fence (busy-poll for wall-clock precision) ---
+    // --- submit, then wait for TRUE completion ---
+    // The EOP fence can fire before all waves retire on this raw-PM4 path, which truncates the
+    // in-kernel span counters. The live counter (occ[0]: +1 at admit, -1 at exit) returns to 0
+    // only once every wave has retired -> that, together with the fence, is the real completion.
     const double timeoutS = 10.0;
     double t0 = now_s();
     RingSubmit(ring);
-    bool done = false;
+    bool done = false, admitted = false;
+    uint32_t lastEnd = 0; double lastEndChange = t0;
     while (true) {
-        if (*fenceW == FENCE_VALUE) { done = true; break; }
-        if (now_s() - t0 > timeoutS) break;
+        double now = now_s();
+        if (occW[1] > 0) admitted = true;                 // some wave reached the counter
+        uint32_t end = occW[3];
+        if (end != lastEnd) { lastEnd = end; lastEndChange = now; }   // track max(end) advancing
+        bool fenceFired = (*fenceW == FENCE_VALUE);
+        // True completion: admitted, fence fired, live drained, AND max(end) stable for 25 ms
+        // (guards against transient live==0 between batches truncating the span at scale).
+        if (admitted && occW[0] == 0 && fenceFired && end != 0 && (now - lastEndChange) > 0.025) { done = true; break; }
+        if (now - t0 > timeoutS) break;
     }
     double t1 = now_s();
     if (!done) {
@@ -236,6 +249,12 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
 
     res.ok      = true;
     res.maxlive = occW[1];
+    res.total   = occW[4];   // total waves that actually launched (vs nWG requested)
+    {   // whole-dispatch loop wall span in GPU clock cycles = max(end) - min(start) over all waves
+        uint32_t gs = occW[2], ge = occW[3];
+        res.wall = (ge >= gs) ? (uint64_t)(ge - gs)
+                              : ((uint64_t)ge + 0x100000000ull - (uint64_t)gs);   // 32-bit wrap
+    }
     res.secs    = t1 - t0;
     unpack_D((const float*)fout.ptr, res.D);
 
@@ -244,33 +263,41 @@ static RunResult run_variant(uint32_t node, const char* isaPath, bool dynvgpr,
     return res;
 }
 
-// ---- run reps times, keep the fastest (min secs) ----
-struct Timed { bool ok = false; uint32_t maxlive = 0; double secs = 1e30; float D[256]; };
+// ---- run reps times, keep the best (min host completion time = peak throughput) ----
+// host secs is now robust: we gate completion on live==0 (all waves retired), so t1-t0 is the
+// true kernel duration. We also carry the in-kernel span for cross-check.
+struct Timed { bool ok = false; uint32_t maxlive = 0; uint32_t total = 0; uint64_t wall = ~0ull; double secs = 1e30; float D[256]; };
 static Timed run_timed(uint32_t node, const char* bin, bool dyn, const uint32_t* fragIn,
                        uint32_t nWG, uint32_t field, uint32_t kdepth, int reps) {
-    Timed best;
+    Timed best; bool have = false;
     for (int r = 0; r < reps; ++r) {
         RunResult rr = run_variant(node, bin, dyn, fragIn, nWG, field, kdepth);
         if (!rr.ok) { best.ok = false; return best; }
-        if (rr.secs < best.secs) { best.secs = rr.secs; best.maxlive = rr.maxlive; memcpy(best.D, rr.D, sizeof(best.D)); }
+        if (!have || rr.wall < best.wall) { best.secs = rr.secs; best.wall = rr.wall; best.maxlive = rr.maxlive; best.total = rr.total; memcpy(best.D, rr.D, sizeof(best.D)); have = true; }
         best.ok = true;
     }
     return best;
 }
+// Throughput from host completion time (robust via live==0 gating).
+static double tf_host(uint32_t nWG, uint32_t K, uint32_t nacc, double secs) {
+    if (secs <= 0) return 0.0;
+    return (double)nWG * (double)(K - 1u) * (double)nacc * (2.0 * 16 * 16 * 16) / secs / 1e12;
+}
 
-// loop-only TFLOPS: (work(K) - work(1)) WMMAs over (t_K - t_1), cancelling fixed overhead.
-static double tf_diff(uint32_t nWG, uint32_t K, uint32_t nacc, double t_K, double t_1) {
-    double dwork = (double)nWG * (double)(K - 1u) * (double)nacc;   // accumulating-loop WMMAs
-    double dt = t_K - t_1;
-    if (dt <= 0.0) return 0.0;
-    return dwork * (2.0 * 16 * 16 * 16) / dt / 1e12;
+// Throughput = (whole-grid loop WMMAs) / (whole-dispatch wall span). nWG*(K-1)*NACC WMMAs in
+// (wall/freq) seconds. Bounded by the matrix-unit ceiling by construction (total work / total wall).
+static double tf_span(uint32_t nWG, uint32_t K, uint32_t nacc, uint64_t wall, double freq_hz) {
+    if (wall == 0) return 0.0;
+    double work = (double)nWG * (double)(K - 1u) * (double)nacc;
+    return work * (2.0 * 16 * 16 * 16) * freq_hz / (double)wall / 1e12;
 }
 
 int main(int argc, char** argv) {
-    enum { CORRECT, PRONG1, PRONG2 } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PROBE } mode = CORRECT;
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1")) mode = PRONG1;
         else if (!strcmp(argv[i], "--prong2")) mode = PRONG2;
+        else if (!strcmp(argv[i], "--probe"))  mode = PROBE;
     }
 
     // Test matrices A,B (16x16 e4m3, non-trivial) and the CPU oracle D = A.B.
@@ -297,27 +324,49 @@ int main(int argc, char** argv) {
     CHECK(hsaKmtOpenKFD());
     uint32_t node = FindGfx1201Node();
 
+    // Derive the GPU clock-counter frequency (ticks/s) to convert in-kernel Dmax wall-cycles
+    // to seconds. Two samples over a 200 ms host interval. (Relative throughput maxlive/Dmax is
+    // frequency-independent and is what the GREEN gate needs; freq only sets the absolute TFLOPS.)
+    double freq_hz = 1e8;
+    {
+        HsaClockCounters c0, c1;
+        if (hsaKmtGetClockCounters(node, &c0) == HSAKMT_STATUS_SUCCESS) {
+            double h0 = now_s();
+            struct timespec nap = {0, 200000000}; nanosleep(&nap, nullptr);
+            hsaKmtGetClockCounters(node, &c1);
+            double h1 = now_s();
+            double dg = (double)(c1.GPUClockCounter - c0.GPUClockCounter);
+            if (dg > 0 && h1 > h0) freq_hz = dg / (h1 - h0);
+        }
+        printf("  GPU clock-counter freq ~= %.2f MHz (Dmax cycles -> seconds)\n", freq_hz / 1e6);
+    }
+
     int rc = 0;
     if (mode == PRONG1) {
         // LIGHT kernel (NACC=8): occupancy -> throughput. Reservation floor = 80 (kernel usage).
         // grid 65536 so occupancy is VGPR-bound (not launch-rate-bound at grid/32); KDEPTH 2048
         // keeps each dispatch well under the 10 s fence timeout.
-        const char* BIN = "occ_n8_d0.bin"; const uint32_t NACC = 8, nWG = 65536, K = 2048;
+        const char* BIN = "occ_n8_d0.bin"; const uint32_t NACC = 8, nWG = 16384, K = 2048;
         printf("=== PRONG 1: occupancy -> throughput (LIGHT NACC=8, grid=%u, KDEPTH=%u, static) ===\n", nWG, K);
         Timed corr = run_timed(node, BIN, false, fragIn, nWG, 128/8, 1, 1);
         if (!corr.ok) { fprintf(stderr, "prong1 correctness did not complete.\n"); hsaKmtCloseKFD(); return 3; }
         bool ok = wmma_ok(corr.D);
         printf("  correctness (KDEPTH=1, reserve=128): WMMA %s  maxlive=%u\n", ok ? "OK" : "MISMATCH", corr.maxlive);
         if (!ok) { fprintf(stderr, "prong1 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
-        const uint32_t reserves[] = {80, 96, 128, 160, 192, 256};
-        printf("\n  reserveVGPR  maxlive  occ/SIMD   TFLOPS  loop\n");
+        // reserve 256 (occ 5) is dropped: it hits the known Phase-2 "256-VGPR slow-retire >10s
+        // on the raw-PM4 path" pathology (benign, not a hang, but it aborts the sweep).
+        const uint32_t reserves[] = {80, 96, 128, 160, 192};
+        printf("  (requested grid nWG=%u)\n", nWG);
+        printf("\n  reserveVGPR  maxlive  occ/SIMD  launched  span_ms  TFLOPS  %%of307  loop\n");
         for (uint32_t rv : reserves) {
             Timed tk = run_timed(node, BIN, false, fragIn, nWG, rv/8, K, 3);
-            Timed t1 = run_timed(node, BIN, false, fragIn, nWG, rv/8, 1, 3);
-            if (!tk.ok || !t1.ok) { fprintf(stderr, "  reserve=%u did not complete; aborting prong1.\n", rv); rc = 3; break; }
-            double tf = tf_diff(nWG, K, NACC, tk.secs, t1.secs);
+            if (!tk.ok) { fprintf(stderr, "  reserve=%u did not complete; aborting prong1.\n", rv); rc = 3; break; }
+            uint32_t W = tk.total ? tk.total : nWG;          // use ACTUAL launched waves for work
+            double tf = tf_span(W, K, NACC, tk.wall, freq_hz);
+            double sms = (double)tk.wall / freq_hz * 1e3;
             bool lk = loop_ok(tk.D, K);
-            printf("  %8u     %5u    %6.2f   %7.1f  %s\n", rv, tk.maxlive, tk.maxlive / 128.0, tf, lk ? "OK" : "BAD");
+            printf("  %8u     %5u    %6.2f  %8u  %7.3f  %6.1f  %5.1f   %s\n",
+                   rv, tk.maxlive, tk.maxlive / 128.0, tk.total, sms, tf, 100.0*tf/307.0, lk ? "OK" : "BAD");
         }
         printf("\n  GREEN-1 if TFLOPS rises materially toward higher occupancy (lower reserve).\n");
     } else if (mode == PRONG2) {
@@ -333,20 +382,36 @@ int main(int argc, char** argv) {
         printf("  correctness (KDEPTH=1): static WMMA %s (maxlive=%u)  dyn WMMA %s (maxlive=%u)\n",
                sok ? "OK" : "MISMATCH", cs.maxlive, dok ? "OK" : "MISMATCH", cd.maxlive);
         if (!sok || !dok) { fprintf(stderr, "prong2 WMMA mismatch; aborting.\n"); hsaKmtCloseKFD(); return 4; }
-        printf("\n  KDEPTH   static_TF  static_occ   dyn_TF  dyn_occ   dyn/static   loop(s/d)\n");
+        printf("\n  KDEPTH  static_TF static_occ   dyn_TF dyn_occ   dyn/static  loop(s/d)\n");
         for (uint32_t K : Ks) {
             Timed sk = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, K, 2);
-            Timed s1 = run_timed(node, "occ_n16_d0.bin", false, fragIn, nWG, SFIELD, 1, 2);
             Timed dk = run_timed(node, "occ_n16_d1.bin", true,  fragIn, nWG, 4,      K, 2);
-            Timed d1 = run_timed(node, "occ_n16_d1.bin", true,  fragIn, nWG, 4,      1, 2);
-            if (!sk.ok || !s1.ok || !dk.ok || !d1.ok) { fprintf(stderr, "  KDEPTH=%u did not complete; aborting prong2.\n", K); rc = 3; break; }
-            double stf = tf_diff(nWG, K, NACC, sk.secs, s1.secs);
-            double dtf = tf_diff(nWG, K, NACC, dk.secs, d1.secs);
-            printf("  %6u   %8.1f   %7.2f   %7.1f  %6.2f   %6.2fx      %s/%s\n",
-                   K, stf, sk.maxlive / 128.0, dtf, dk.maxlive / 128.0, stf > 0 ? dtf / stf : 0.0,
-                   loop_ok(sk.D, K) ? "OK" : "BAD", loop_ok(dk.D, K) ? "OK" : "BAD");
+            if (!sk.ok || !dk.ok) { fprintf(stderr, "  KDEPTH=%u did not complete; aborting prong2.\n", K); rc = 3; break; }
+            double stf = tf_span(nWG, K, NACC, sk.wall, freq_hz);
+            double dtf = tf_span(nWG, K, NACC, dk.wall, freq_hz);
+            printf("  %6u  %8.1f   %6.2f   %7.1f  %5.2f    %6.2fx     %s/%s\n",
+                   K, stf, sk.maxlive / 128.0, dtf, dk.maxlive / 128.0,
+                   stf > 0 ? dtf / stf : 0.0, loop_ok(sk.D, K) ? "OK" : "BAD", loop_ok(dk.D, K) ? "OK" : "BAD");
         }
         printf("\n  GREEN-2 if dyn >= static TFLOPS at realistic KDEPTH (no serialization penalty).\n");
+    } else if (mode == PROBE) {
+        // Single wave -- no occupancy/grid confound. span_ms (in-kernel, min-start..max-end of the
+        // ONE wave) is its exact loop wall-time, free of host/launch overhead. ns/WMMA below the
+        // ~2.7ns issue floor (@2.5GHz) would mean the WMMAs are not really executing.
+        const char* BIN = "occ_n8_d0.bin"; const uint32_t NACC = 8;
+        const uint32_t Ks[] = {2000, 4000, 8000, 16000};
+        printf("=== PROBE: single wave (nWG=1, NACC=8, reserve=128) raw per-WMMA cost ===\n");
+        printf("  KDEPTH   host_ms   span_ms   span_ns/iter  span_ns/WMMA  loop\n");
+        for (uint32_t K : Ks) {
+            Timed t = run_timed(node, BIN, false, fragIn, 1, 128/8, K, 3);
+            if (!t.ok) { fprintf(stderr, "  probe KDEPTH=%u did not complete.\n", K); rc = 3; break; }
+            double hms = t.secs * 1e3, sms = (double)t.wall / freq_hz * 1e3;
+            double ns_iter = (double)t.wall / freq_hz / (double)(K - 1) * 1e9;
+            double ns_wmma = ns_iter / NACC;
+            printf("  %6u  %8.2f  %8.4f  %12.3f  %12.4f  %s\n",
+                   K, hms, sms, ns_iter, ns_wmma, loop_ok(t.D, K) ? "OK" : "BAD");
+        }
+        printf("  (physical issue floor ~2.7 ns/WMMA @ 2.5 GHz; below that => WMMAs elided/not real.)\n");
     } else {
         // Default: correctness A/B (regression check on the throughput kernel).
         printf("=== correctness A/B (KDEPTH=1, HEAVY NACC=16) ===\n");

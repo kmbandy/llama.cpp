@@ -58,6 +58,7 @@ occ_kernel:
     s_wait_loadcnt 0x0
     v_add_nc_u32 v3, v3, 1
     global_atomic_max_u32 v4, v3, s[0:1] offset:4 scope:SCOPE_DEV
+    global_atomic_add_u32 v4, v2, s[0:1] offset:16 scope:SCOPE_DEV   // occ[4] += 1 : total waves launched
 .Lafter_inc:
     s_mov_b32 exec_lo, s8
     // ---- KDEPTH (loop count) from user SGPR s6 (coherent; not a memory load) ----
@@ -89,6 +90,21 @@ occ_kernel:
     v_wmma_f32_16x16x16_fp8_fp8 v[128:135], v[8:9], v[10:11], 0
     v_wmma_f32_16x16x16_fp8_fp8 v[136:143], v[8:9], v[10:11], 0
 .endif
+    // ---- in-kernel timer (whole-dispatch span) t0: GPU clock (wall_clock64) BEFORE the loop ----
+    // Host submit->fence timing does not bracket the kernel on this raw-PM4 path; the GPU clock
+    // does. We capture the GLOBAL span: occ[2]=min(start) over all waves, occ[3]=max(end).
+    // Throughput = nWG*(KDEPTH-1)*NACC / (span/freq) -- bounded by the matrix-unit ceiling by
+    // construction (total grid work / total wall). (s_sendmsg_rtn lifted vs llvm-objdump.)
+    s_sendmsg_rtn_b64 s[10:11], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    v_cmp_eq_u32 vcc_lo, 0, v0            // lane 0 only records the span (one atomic per wave)
+    s_mov_b32 s8, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lafter_t0
+    v_mov_b32 v12, s10                    // t0_lo
+    global_atomic_min_u32 v4, v12, s[0:1] offset:8 scope:SCOPE_DEV    // occ[2] = min(start)
+.Lafter_t0:
+    s_mov_b32 exec_lo, s8
     // ---- loop the remaining KDEPTH-1 iterations: srcC = acc (accumulate) ----
     s_sub_u32 s9, s9, 1                   // remaining = KDEPTH - 1
     s_cmp_eq_u32 s9, 0
@@ -116,6 +132,17 @@ occ_kernel:
     s_cmp_lg_u32 s9, 0
     s_cbranch_scc1 .Lkloop
 .Lkdone:
+    // ---- in-kernel timer (whole-dispatch span) t1: GPU clock AFTER the loop -> occ[3]=max(end) ----
+    s_sendmsg_rtn_b64 s[10:11], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    v_cmp_eq_u32 vcc_lo, 0, v0
+    s_mov_b32 s8, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lafter_t1
+    v_mov_b32 v12, s10                   // t1_lo
+    global_atomic_max_u32 v4, v12, s[0:1] offset:12 scope:SCOPE_DEV   // occ[3] = max(end)
+.Lafter_t1:
+    s_mov_b32 exec_lo, s8
     // ---- store acc0 tile (256 f32) for the CPU fp8 oracle ----
     v_lshlrev_b32 v7, 5, v0              // lane*32 bytes
     global_store_b128 v7, v[16:19], s[4:5]

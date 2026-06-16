@@ -14,3 +14,5 @@ wmma_seed-*
 gemm_occ_pad
 gemm_occ_pad-*
 gemm_occ_pad_*
+rtc_seed.hip
+rtc_seed-*
