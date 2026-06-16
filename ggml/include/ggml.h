@@ -439,7 +439,8 @@ extern "C" {
         GGML_TYPE_F8_E4M3 = 49, // MAD-223 Phase G: fp8 e4m3 1-byte storage, used as sidecar dtype for ml8 centroids
         GGML_TYPE_ML8_4_SOA = 50, // MAD-223 Phase G.7 / MAD-244: ml8-4 with stored-as-repacked SOA layout (b_packed bytes followed by b_scale fp32 per expert row). Same numerics as ML8_4; eliminates the runtime MoE repack cache.
         GGML_TYPE_ML8_FP8 = 51,  // MAD Task 9: ml8 fp8 weight quant, 32-element blocks, fp16 per-block scale + 32 e4m3 bytes (34 bytes/block). On-disk id=51; matches gguf-py GGML_QUANT_SIZES[ML8_FP8]=(32,34).
-        GGML_TYPE_COUNT   = 52,
+        GGML_TYPE_TURBO4_64 = 52, // MAD-301C Lever B: native head_dim-64 turbo4 KV cache, 64-element block (34 bytes), no 64->128 pad. Runtime KV-cache-only type (never serialized to GGUF).
+        GGML_TYPE_COUNT   = 53,
     };
 
     // precision

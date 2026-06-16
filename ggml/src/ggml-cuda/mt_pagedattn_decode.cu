@@ -257,6 +257,70 @@ static __device__ __forceinline__ void decode_coop_stage_turbo4(
     }
 }
 
+// TURBO4_64 cooperative dequant for the decode tile (MAD-301C Lever B).
+// Native head_dim-64: 64-element block => 32 lanes × 2 elements (1 qs byte/lane,
+// 2 nibbles). Matches mt_scatter_kv_turbo4_64_kernel packing.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+static __device__ __forceinline__ void decode_coop_stage_turbo4_64(
+        __half        * __restrict__ smem_dst,
+        const void    * __restrict__ cache,
+        const int     * __restrict__ seq_block_table,
+        int            tile_start,
+        int            valid_ctx,
+        int            kv_head_idx,
+        int            n_kv_heads,
+        int            warp_id,
+        int            lane_id) {
+    constexpr int Q_BLOCK            = QK_TURBO4_64;  // 64
+    constexpr int QBLOCKS_PER_TOKEN  = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_QBLOCKS_PER_TILE = DECODE_K_TILE_N * QBLOCKS_PER_TOKEN;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be multiple of QK_TURBO4_64=64");
+    static_assert(Q_BLOCK == 64, "cooperative dequant expects QK_TURBO4_64=64 (32 lanes × 2 elements)");
+
+    const block_turbo4_64 * blocks = (const block_turbo4_64 *) cache;
+
+    #pragma unroll
+    for (int qb = warp_id; qb < N_QBLOCKS_PER_TILE; qb += DECODE_NUM_WARPS) {
+        const int row         = qb / QBLOCKS_PER_TOKEN;
+        const int qb_in_token = qb % QBLOCKS_PER_TOKEN;
+        const int token       = tile_start + row;
+
+        const block_turbo4_64 * blk = nullptr;
+        float norm_f = 0.0f;
+
+        if (token < valid_ctx) {
+            const int logical_block = token / BLOCK_SIZE;
+            const int tok_in_block  = token % BLOCK_SIZE;
+            const int physical      = seq_block_table[logical_block];
+            if (physical != kInvalidBlockTableEntry) {
+                const int64_t ib = ((int64_t) physical * n_kv_heads + kv_head_idx) * BLOCK_SIZE * QBLOCKS_PER_TOKEN
+                                 + (int64_t) tok_in_block * QBLOCKS_PER_TOKEN
+                                 + (int64_t) qb_in_token;
+                blk = &blocks[ib];
+                if (lane_id == 0) {
+                    norm_f = __half2float(blk->norm);
+                }
+            }
+        }
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
+
+        uint8_t packed = 0;
+        if (blk != nullptr) {
+            packed = blk->qs[lane_id];  // 1 byte = 2 nibbles (elements 2*lane, 2*lane+1)
+        }
+
+        const int smem_row_base = row * HEAD_SIZE;
+        const int smem_col_base = qb_in_token * Q_BLOCK + lane_id * 2;
+
+        #pragma unroll
+        for (int l = 0; l < 2; ++l) {
+            const uint8_t idx_nib = (packed >> (l * 4)) & 0xF;
+            const float val = TURBO_CENTROIDS_4BIT[idx_nib] * norm_f;
+            smem_dst[smem_row_base + smem_col_base + l] = __float2half(val);
+        }
+    }
+}
+
 // TURBO3_0 cooperative dequant for the decode tile. Same threading shape as
 // decode_coop_stage_turbo4 (32 lanes × 4 elements per qblock), but unpacks
 // the 3-bit index as (qs low-2 | signs hi-1).
@@ -346,6 +410,10 @@ static __device__ __forceinline__ void decode_stage_k(
         decode_coop_stage_turbo3<HEAD_SIZE, BLOCK_SIZE>(
             smem_dst, cache, seq_block_table, tile_start, valid_ctx,
             kv_head_idx, n_kv_heads, warp_id, lane_id);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64) {
+        decode_coop_stage_turbo4_64<HEAD_SIZE, BLOCK_SIZE>(
+            smem_dst, cache, seq_block_table, tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, warp_id, lane_id);
     } else {
         decode_stage_kv_f16<HEAD_SIZE, BLOCK_SIZE>(
             smem_dst, (const __half *) cache, seq_block_table, tile_start, valid_ctx,
@@ -371,6 +439,10 @@ static __device__ __forceinline__ void decode_stage_v(
             kv_head_idx, n_kv_heads, warp_id, lane_id);
     } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
         decode_coop_stage_turbo3<HEAD_SIZE, BLOCK_SIZE>(
+            smem_dst, cache, seq_block_table, tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, warp_id, lane_id);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64) {
+        decode_coop_stage_turbo4_64<HEAD_SIZE, BLOCK_SIZE>(
             smem_dst, cache, seq_block_table, tile_start, valid_ctx,
             kv_head_idx, n_kv_heads, warp_id, lane_id);
     } else {
@@ -1225,6 +1297,11 @@ template void launch_paged_attn_decode<256, 16, GGML_TYPE_TURBO4_0>(
     float *, int, int, int, int, int, int, float, cudaStream_t);
 
 template void launch_paged_attn_decode<256, 16, GGML_TYPE_TURBO3_0>(
+    __half *, const __half *, const void *, const void *,
+    const int32_t *, const int32_t *, const int32_t *,
+    float *, int, int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4 flash-decode.
+template void launch_paged_attn_decode<64, 16, GGML_TYPE_TURBO4_64>(
     __half *, const __half *, const void *, const void *,
     const int32_t *, const int32_t *, const int32_t *,
     float *, int, int, int, int, int, int, float, cudaStream_t);

@@ -65,6 +65,13 @@ template <int HEAD_SIZE>
 struct TileConfig;
 
 template <>
+struct TileConfig<64> {
+    // MAD-301C Lever B: native head_dim-64 turbo4. LDS at 8 tiles:
+    // 8*16*64*2 + 2*16*64*2 = 16 KiB + 4 KiB = 20 KiB — well under the 64 KiB cap.
+    static constexpr int Q_TILES_PER_BLOCK = 8;
+};
+
+template <>
 struct TileConfig<128> {
     static constexpr int Q_TILES_PER_BLOCK = 8;
 };
@@ -1428,6 +1435,11 @@ template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO3_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4 (LFM2.5, gpt-oss).
+template void launch_paged_attn_tile<64, 16, GGML_TYPE_TURBO4_64>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 
 // Multi-warp launcher instantiations — same (HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE)
 // matrix as the single-warp path. TileConfig picks Q_TILES_PER_BLOCK at
@@ -1453,6 +1465,11 @@ template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO4_0>(
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO3_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4.
+template void launch_paged_attn_tile_mw<64, 16, GGML_TYPE_TURBO4_64>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);

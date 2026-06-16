@@ -107,6 +107,11 @@ GGML_API void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_tur
 GGML_API void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// MAD-301C Lever B: native head_dim-64 turbo4 (64-element block). CPU refs exist to
+// satisfy ggml type-traits; the hot path is CUDA paged (mt_pagedattn). No-RHT, matching
+// the paged scatter convention (dequant = centroid*norm).
+GGML_API void quantize_row_turbo4_64_ref(const float * GGML_RESTRICT x, block_turbo4_64 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4_64(const block_turbo4_64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k);
