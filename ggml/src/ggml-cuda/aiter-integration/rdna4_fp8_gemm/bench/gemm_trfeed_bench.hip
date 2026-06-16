@@ -129,27 +129,36 @@ gemm_fp8_baseline(const float8_t* __restrict__ A, const float8_t* __restrict__ B
 }
 
 // ---------------- trfeed: B fed via global_load_tr_b64 from pre-shuffled global ------------
-__global__ void __launch_bounds__(BLOCK_THREADS)
+// Templated on the M-tiling so bm128 (TBM=128,TWAVES_M=2) and the larger-M amortization
+// variant bm256 (TBM=256,TWAVES_M=4) share one body. N-tiling fixed: BN=128, WAVES_N=2.
+// Larger TBM serves each B column tile across more M-rows -> fewer distinct B-tile DRAM
+// fetches per output tile (amortizes B re-fetch).
+template <int TBM, int TWAVES_M>
+__global__ void __launch_bounds__(TWAVES_M * WAVES_N * WAVE_SIZE)
 gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshuf,
                 __hip_bfloat16* __restrict__ C,
                 const float* __restrict__ a_scale, const float* __restrict__ b_scale,
                 int M, int N, int K) {
-    const int tm = blockIdx.y * BM, tn = blockIdx.x * BN;
-    __shared__ float8_t As[BM * BK];                 // A still staged in LDS (wide read)
+    constexpr int TWAVES   = TWAVES_M * WAVES_N;
+    constexpr int TBLOCK   = TWAVES * WAVE_SIZE;
+    constexpr int TFRAGS_M = (TBM / TWAVES_M) / 16;
+    constexpr int TFRAGS_N = (BN / WAVES_N) / 16;
+    const int tm = blockIdx.y * TBM, tn = blockIdx.x * BN;
+    __shared__ float8_t As[TBM * BK];                // A still staged in LDS (wide read)
     const int tid = threadIdx.x, wid = tid / WAVE_SIZE;
     const int wave_m = wid / WAVES_N, wave_n = wid % WAVES_N, lane = tid % WAVE_SIZE;
     const int NT = N / 16;
 
-    v8f32 acc[FRAGS_M][FRAGS_N];
-    for (int mi = 0; mi < FRAGS_M; ++mi)
-        for (int ni = 0; ni < FRAGS_N; ++ni)
+    v8f32 acc[TFRAGS_M][TFRAGS_N];
+    for (int mi = 0; mi < TFRAGS_M; ++mi)
+        for (int ni = 0; ni < TFRAGS_N; ++ni)
             acc[mi][ni] = v8f32{0,0,0,0,0,0,0,0};
 
     const int4* Av = reinterpret_cast<const int4*>(A);
     int4* Asv = reinterpret_cast<int4*>(As);
     for (int k0 = 0; k0 < K; k0 += BK) {
-        constexpr int AVEC = BM * BK / 16, BKv = BK / 16;
-        for (int e = tid; e < AVEC; e += BLOCK_THREADS) {
+        constexpr int AVEC = TBM * BK / 16, BKv = BK / 16;
+        for (int e = tid; e < AVEC; e += TBLOCK) {
             int r = e / BKv, c = e % BKv;
             int gr = tm + r, gk = k0 + c * 16;
             Asv[e] = Av[(gr * K + gk) / 16];
@@ -159,17 +168,17 @@ gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshu
         const int row_a = lane & 0xF, colhi = (lane >> 4) & 1;
         for (int kk = 0; kk < KSTEPS; ++kk) {
             const int kbase = kk * 16, kt = (k0 + kbase) / 16;
-            v2i32 fa[FRAGS_M], fb[FRAGS_N];
-            for (int mi = 0; mi < FRAGS_M; ++mi) {
-                int lds_row = (wave_m * FRAGS_M + mi) * 16 + row_a;
+            v2i32 fa[TFRAGS_M], fb[TFRAGS_N];
+            for (int mi = 0; mi < TFRAGS_M; ++mi) {
+                int lds_row = (wave_m * TFRAGS_M + mi) * 16 + row_a;
                 fa[mi] = *reinterpret_cast<const v2i32*>(As + lds_row * BK + kbase + colhi * 8);
             }
-            for (int ni = 0; ni < FRAGS_N; ++ni) {
-                int nt = (tn + (wave_n * FRAGS_N + ni) * 16) / 16;
+            for (int ni = 0; ni < TFRAGS_N; ++ni) {
+                int nt = (tn + (wave_n * TFRAGS_N + ni) * 16) / 16;
                 fb[ni] = tr_load8(Bshuf + b_tile_offset(kt, nt, NT) + lane * 8);   // one global_load_tr
             }
-            for (int mi = 0; mi < FRAGS_M; ++mi)
-                for (int ni = 0; ni < FRAGS_N; ++ni)
+            for (int mi = 0; mi < TFRAGS_M; ++mi)
+                for (int ni = 0; ni < TFRAGS_N; ++ni)
                     acc[mi][ni] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
                         fa[mi], fb[ni], acc[mi][ni]);
         }
@@ -177,15 +186,15 @@ gemm_fp8_trfeed(const float8_t* __restrict__ A, const uint8_t* __restrict__ Bshu
     }
 
     // ---- epilogue (identical to baseline) ----
-    __shared__ float scratch[WAVES][16 * 16];
+    __shared__ float scratch[TWAVES][16 * 16];
     float* ws = scratch[wid];
     const int e_col = lane & 0xF, e_rowbase = ((lane >> 4) & 1) * 8;
-    for (int mi = 0; mi < FRAGS_M; ++mi) {
-        for (int ni = 0; ni < FRAGS_N; ++ni) {
+    for (int mi = 0; mi < TFRAGS_M; ++mi) {
+        for (int ni = 0; ni < TFRAGS_N; ++ni) {
             #pragma unroll
             for (int s = 0; s < 8; ++s) ws[(e_rowbase + s) * 16 + e_col] = acc[mi][ni][s];
-            int row0 = tm + (wave_m * FRAGS_M + mi) * 16;
-            int col0 = tn + (wave_n * FRAGS_N + ni) * 16;
+            int row0 = tm + (wave_m * TFRAGS_M + mi) * 16;
+            int col0 = tn + (wave_n * TFRAGS_N + ni) * 16;
             for (int t = lane; t < 256; t += WAVE_SIZE) {
                 int gr = row0 + t / 16, gc = col0 + t % 16;
                 if (gr < M && gc < N) {
@@ -231,14 +240,16 @@ static float time_baseline(const float8_t*A,const float8_t*B,__hip_bfloat16*C,
     return ms/iters;
 }
 
+template <int TBM, int TWAVES_M>
 static float time_trfeed(const float8_t*A,const uint8_t*Bshuf,__hip_bfloat16*C,
                          const float*as,const float*bs,int M,int N,int K,int iters){
-    dim3 grid((N+BN-1)/BN,(M+BM-1)/BM);
-    for(int i=0;i<5;i++) gemm_fp8_trfeed<<<grid,BLOCK_THREADS>>>(A,Bshuf,C,as,bs,M,N,K); // warmup
+    dim3 grid((N+BN-1)/BN,(M+TBM-1)/TBM);
+    constexpr int TBLOCK = TWAVES_M*WAVES_N*WAVE_SIZE;
+    for(int i=0;i<5;i++) gemm_fp8_trfeed<TBM,TWAVES_M><<<grid,TBLOCK>>>(A,Bshuf,C,as,bs,M,N,K); // warmup
     hipDeviceSynchronize();
     hipEvent_t s,e; hipEventCreate(&s); hipEventCreate(&e);
     hipEventRecord(s);
-    for(int i=0;i<iters;i++) gemm_fp8_trfeed<<<grid,BLOCK_THREADS>>>(A,Bshuf,C,as,bs,M,N,K);
+    for(int i=0;i<iters;i++) gemm_fp8_trfeed<TBM,TWAVES_M><<<grid,TBLOCK>>>(A,Bshuf,C,as,bs,M,N,K);
     hipEventRecord(e); hipEventSynchronize(e);
     float ms=0; hipEventElapsedTime(&ms,s,e);
     hipEventDestroy(s); hipEventDestroy(e);
@@ -285,9 +296,12 @@ int main(){
         };
         gemm_fp8_baseline<<<grid,BLOCK_THREADS>>>(A,B,C,as,bs,M,N,K); HCK(hipDeviceSynchronize());
         float eb=check("baseline");
-        gemm_fp8_trfeed<<<grid,BLOCK_THREADS>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize());
-        float et=check("trfeed");
-        if(eb>=0.03f||et>=0.03f){ printf("CORRECTNESS GATE FAILED — perf numbers below are meaningless.\n"); }
+        gemm_fp8_trfeed<128,2><<<grid,128>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize());
+        float et=check("trfeed128");
+        dim3 grid256((N+BN-1)/BN,(M+256-1)/256);
+        gemm_fp8_trfeed<256,4><<<grid256,256>>>(A,Bshuf,C,as,bs,M,N,K); HCK(hipDeviceSynchronize());
+        float et2=check("trfeed256");
+        if(eb>=0.03f||et>=0.03f||et2>=0.03f){ printf("CORRECTNESS GATE FAILED — perf numbers below are meaningless.\n"); }
         hipFree(A);hipFree(B);hipFree(Bshuf);hipFree(C);hipFree(as);hipFree(bs);
     }
 
@@ -296,9 +310,9 @@ int main(){
         const int M=4096,N=4096,K=4096;
         std::vector<uint8_t> Ah,Bh; build_io(M,N,K,Ah,Bh);
         std::vector<uint8_t> Bshufh((size_t)K*N,0); preshuffle_B(Bh.data(),Bshufh.data(),K,N);
-        float8_t *A,*B; uint8_t* Bshuf; __hip_bfloat16*Cb,*Ct; float*as,*bs;
+        float8_t *A,*B; uint8_t* Bshuf; __hip_bfloat16*Cb,*Ct,*Ct2; float*as,*bs;
         HCK(hipMalloc(&A,Ah.size())); HCK(hipMalloc(&B,Bh.size())); HCK(hipMalloc(&Bshuf,Bshufh.size()));
-        HCK(hipMalloc(&Cb,(size_t)M*N*2)); HCK(hipMalloc(&Ct,(size_t)M*N*2));
+        HCK(hipMalloc(&Cb,(size_t)M*N*2)); HCK(hipMalloc(&Ct,(size_t)M*N*2)); HCK(hipMalloc(&Ct2,(size_t)M*N*2));
         HCK(hipMalloc(&as,M*4)); HCK(hipMalloc(&bs,N*4));
         HCK(hipMemcpy(A,Ah.data(),Ah.size(),hipMemcpyHostToDevice));
         HCK(hipMemcpy(B,Bh.data(),Bh.size(),hipMemcpyHostToDevice));
@@ -307,26 +321,33 @@ int main(){
         HCK(hipMemcpy(as,ones.data(),M*4,hipMemcpyHostToDevice));
         HCK(hipMemcpy(bs,ones.data(),N*4,hipMemcpyHostToDevice));
         double gflop = 2.0*M*N*K/1e12;
-        float msb = time_baseline(A,B,Cb,as,bs,M,N,K,30);
-        float mst = time_trfeed (A,Bshuf,Ct,as,bs,M,N,K,30);
-        double tfb = gflop/(msb/1e3), tft = gflop/(mst/1e3);
+        float msb  = time_baseline(A,B,Cb,as,bs,M,N,K,30);
+        float mst  = time_trfeed<128,2>(A,Bshuf,Ct ,as,bs,M,N,K,30);
+        float mst2 = time_trfeed<256,4>(A,Bshuf,Ct2,as,bs,M,N,K,30);
+        double tfb = gflop/(msb/1e3), tft = gflop/(mst/1e3), tft2 = gflop/(mst2/1e3);
         printf("\n=== perf @ %d^3 (ceiling = %.0f TF, hipBLASLt = %.0f TF) ===\n",M,CEIL,HIPBLASLT);
-        printf("  baseline (byte-gather)   : %7.3f ms  %6.1f TF  (%.0f%% of 307, %.2fx 143)\n",
+        printf("  baseline (byte-gather)    : %7.3f ms  %6.1f TF  (%.0f%% of 307, %.2fx 143)\n",
                msb,tfb,100*tfb/CEIL,tfb/HIPBLASLT);
-        printf("  trfeed   (global_load_tr): %7.3f ms  %6.1f TF  (%.0f%% of 307, %.2fx 143)\n",
+        printf("  trfeed bm128 (global_tr)  : %7.3f ms  %6.1f TF  (%.0f%% of 307, %.2fx 143)\n",
                mst,tft,100*tft/CEIL,tft/HIPBLASLT);
-        printf("  speedup                  : %.2fx\n",tft/tfb);
-        // real-shape agreement: trfeed vs baseline outputs must match (same math).
-        std::vector<uint16_t> Hb((size_t)M*N),Ht((size_t)M*N);
+        printf("  trfeed bm256 (amortize B) : %7.3f ms  %6.1f TF  (%.0f%% of 307, %.2fx 143)\n",
+               mst2,tft2,100*tft2/CEIL,tft2/HIPBLASLT);
+        printf("  speedup bm128/baseline    : %.2fx   bm256/baseline : %.2fx\n",tft/tfb,tft2/tfb);
+        // real-shape agreement: both trfeed variants vs baseline must match (same math).
+        std::vector<uint16_t> Hb((size_t)M*N),Ht((size_t)M*N),Ht2((size_t)M*N);
         HCK(hipMemcpy(Hb.data(),Cb,(size_t)M*N*2,hipMemcpyDeviceToHost));
         HCK(hipMemcpy(Ht.data(),Ct,(size_t)M*N*2,hipMemcpyDeviceToHost));
-        double md=0; for(size_t t=0;t<(size_t)M*N;t++){
-            uint32_t a=(uint32_t)Hb[t]<<16,b=(uint32_t)Ht[t]<<16; float fa,fb;
-            __builtin_memcpy(&fa,&a,4);__builtin_memcpy(&fb,&b,4);
-            double d=fabs((double)fa-fb); if(d>md)md=d;
-        }
-        printf("  trfeed vs baseline max|Δ|= %.4g  %s\n",md,md<1e-2?"(match)":"(*** MISMATCH ***)");
-        hipFree(A);hipFree(B);hipFree(Bshuf);hipFree(Cb);hipFree(Ct);hipFree(as);hipFree(bs);
+        HCK(hipMemcpy(Ht2.data(),Ct2,(size_t)M*N*2,hipMemcpyDeviceToHost));
+        auto maxdiff=[&](std::vector<uint16_t>&H)->double{ double md=0;
+            for(size_t t=0;t<(size_t)M*N;t++){
+                uint32_t a=(uint32_t)Hb[t]<<16,b=(uint32_t)H[t]<<16; float fa,fb;
+                __builtin_memcpy(&fa,&a,4);__builtin_memcpy(&fb,&b,4);
+                double d=fabs((double)fa-fb); if(d>md)md=d;
+            } return md; };
+        double md=maxdiff(Ht), md2=maxdiff(Ht2);
+        printf("  bm128 vs baseline max|Δ|  = %.4g  %s\n",md ,md <1e-2?"(match)":"(*** MISMATCH ***)");
+        printf("  bm256 vs baseline max|Δ|  = %.4g  %s\n",md2,md2<1e-2?"(match)":"(*** MISMATCH ***)");
+        hipFree(A);hipFree(B);hipFree(Bshuf);hipFree(Cb);hipFree(Ct);hipFree(Ct2);hipFree(as);hipFree(bs);
     }
     return 0;
 }
