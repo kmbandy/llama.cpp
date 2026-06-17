@@ -240,6 +240,109 @@ gemm_fp8_pipe(const __hip_fp8_e4m3* __restrict__ A, const uint8_t* __restrict__ 
     }
 }
 
+// ============ ISSUE-vs-LATENCY probe kernel: the 155 winner with two diagnostic knobs ============
+// Identical inner loop to gemm_fp8_lever<128,128,2,2,TBK,AFEED=0,DBUF=1> (A in LDS, A double-
+// buffered, B just-in-time global_load_tr). Adds:
+//   MINOCC -> __launch_bounds__(128, MINOCC) 2nd arg = min WAVES per SIMD (AMD semantics). Forces
+//             the compiler's VGPR cap up -> more co-resident waves. Sweeping it at a FIXED inner
+//             loop is the textbook latency-vs-issue discriminator: if WMMA/cyc climbs with
+//             occupancy, the 54% ceiling is latency-stall (hideable); if flat, it's issue-port
+//             contention (silicon for this instruction mix).
+//   NOFEED -> operands loaded ONCE, reused every step (no per-kk ds_read / global_load_tr). The
+//             loads hoist out -> inner loop is a pure 16-way-ILP WMMA chain = this structure's
+//             feed-free ceiling. Throughput probe only; NOT bit-correct (gated out of the oracle).
+template <int TBK, int MINOCC, int NOFEED>
+__global__ void __launch_bounds__(128, MINOCC)
+gemm_fp8_occ(const __hip_fp8_e4m3* __restrict__ A, const uint8_t* __restrict__ Bshuf,
+             __hip_bfloat16* __restrict__ C,
+             const float* __restrict__ a_scale, const float* __restrict__ b_scale,
+             int M, int N, int K) {
+    constexpr int TBM=128, TBN=128, TWM=2, TWN=2;
+    constexpr int WAVE=32, TWAVES=TWM*TWN, TBLOCK=TWAVES*WAVE;
+    constexpr int TFRAGS_M=(TBM/TWM)/16, TFRAGS_N=(TBN/TWN)/16, TKSTEPS=TBK/16, BKv=TBK/16;
+    constexpr int AVEC=TBM*TBK/16, APT = (AVEC/TBLOCK) > 0 ? (AVEC/TBLOCK) : 1;
+    const int tm=blockIdx.y*TBM, tn=blockIdx.x*TBN;
+    const int tid=threadIdx.x, wid=tid/WAVE, wave_m=wid/TWN, wave_n=wid%TWN, lane=tid%WAVE;
+    const int NT=N/16, NTILES=K/TBK;
+    const int row_a=lane&15, colhi=(lane>>4)&1;
+
+    v8f32 acc[TFRAGS_M][TFRAGS_N];
+    for(int mi=0;mi<TFRAGS_M;++mi) for(int ni=0;ni<TFRAGS_N;++ni) acc[mi][ni]=v8f32{0,0,0,0,0,0,0,0};
+
+    const int4* Av=reinterpret_cast<const int4*>(A);
+    __shared__ __hip_fp8_e4m3 As[2*TBM*TBK];
+    int4* Asv=reinterpret_cast<int4*>(As);
+    int4 areg[APT];
+
+    #pragma unroll
+    for(int i=0;i<APT;++i){ int e=tid+i*TBLOCK; int r=e/BKv,c=e%BKv; int gr=tm+r,gk=c*16;
+        areg[i]=(gr<M)?Av[((size_t)gr*K+gk)/16]:int4{0,0,0,0}; }
+    #pragma unroll
+    for(int i=0;i<APT;++i){ int e=tid+i*TBLOCK; Asv[e]=areg[i]; }
+    __syncthreads();
+
+    v2i32 fa0[TFRAGS_M], fb0[TFRAGS_N];                 // NOFEED: one fragment set, reused forever
+    if (NOFEED) {
+        #pragma unroll
+        for(int mi=0;mi<TFRAGS_M;++mi){ int lds_row=(wave_m*TFRAGS_M+mi)*16+row_a;
+            fa0[mi]=*reinterpret_cast<const v2i32*>(As+lds_row*TBK+colhi*8); }
+        #pragma unroll
+        for(int ni=0;ni<TFRAGS_N;++ni){ int nt=(tn+(wave_n*TFRAGS_N+ni)*16)/16;
+            fb0[ni]=tr_load8(Bshuf+b_tile_offset(0,nt,NT)+lane*8); }
+    }
+
+    for(int t=0;t<NTILES;++t){
+        const int k0=t*TBK, buf=t&1;
+        if(!NOFEED && t+1<NTILES){                      // issue tile t+1's A (->areg, in flight)
+            const int nk0=(t+1)*TBK;
+            #pragma unroll
+            for(int i=0;i<APT;++i){ int e=tid+i*TBLOCK; int r=e/BKv,c=e%BKv; int gr=tm+r,gk=nk0+c*16;
+                areg[i]=(gr<M)?Av[((size_t)gr*K+gk)/16]:int4{0,0,0,0}; }
+        }
+        #pragma unroll
+        for(int kk=0;kk<TKSTEPS;++kk){
+            const int kbase=kk*16, kt=(k0+kbase)/16;
+            v2i32 fa[TFRAGS_M], fb[TFRAGS_N];
+            if (NOFEED) {
+                #pragma unroll
+                for(int mi=0;mi<TFRAGS_M;++mi) fa[mi]=fa0[mi];
+                #pragma unroll
+                for(int ni=0;ni<TFRAGS_N;++ni) fb[ni]=fb0[ni];
+            } else {
+                #pragma unroll
+                for(int mi=0;mi<TFRAGS_M;++mi){ int lds_row=(wave_m*TFRAGS_M+mi)*16+row_a;
+                    fa[mi]=*reinterpret_cast<const v2i32*>(As+buf*TBM*TBK+lds_row*TBK+kbase+colhi*8); }
+                #pragma unroll
+                for(int ni=0;ni<TFRAGS_N;++ni){ int nt=(tn+(wave_n*TFRAGS_N+ni)*16)/16;
+                    fb[ni]=tr_load8(Bshuf+b_tile_offset(kt,nt,NT)+lane*8); }
+            }
+            #pragma unroll
+            for(int mi=0;mi<TFRAGS_M;++mi)
+                #pragma unroll
+                for(int ni=0;ni<TFRAGS_N;++ni)
+                    acc[mi][ni]=__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        fa[mi], fb[ni], acc[mi][ni]);
+        }
+        if(!NOFEED && t+1<NTILES){                      // land prefetched A into the other buffer
+            int4* dst=Asv+((t+1)&1)*(TBM*TBK/16);
+            #pragma unroll
+            for(int i=0;i<APT;++i){ int e=tid+i*TBLOCK; dst[e]=areg[i]; }
+            __syncthreads();
+        }
+    }
+
+    __shared__ float scratch[TWAVES][16*16];
+    float* ws=scratch[wid];
+    const int e_col=lane&15, e_rowbase=((lane>>4)&1)*8;
+    for(int mi=0;mi<TFRAGS_M;++mi) for(int ni=0;ni<TFRAGS_N;++ni){
+        #pragma unroll
+        for(int s=0;s<8;++s) ws[(e_rowbase+s)*16+e_col]=acc[mi][ni][s];
+        int row0=tm+(wave_m*TFRAGS_M+mi)*16, col0=tn+(wave_n*TFRAGS_N+ni)*16;
+        for(int u=lane;u<256;u+=WAVE){ int gr=row0+u/16, gc=col0+u%16;
+            if(gr<M&&gc<N){ float v=ws[u]*a_scale[gr]*b_scale[gc]; C[(size_t)gr*N+gc]=(__hip_bfloat16)v; } }
+    }
+}
+
 // ---------------- host ----------------
 #define HCK(x) do{ hipError_t e=(x); if(e!=hipSuccess){ \
   fprintf(stderr,"HIP %s:%d %s\n",__FILE__,__LINE__,hipGetErrorString(e)); return 3; } }while(0)
@@ -330,6 +433,58 @@ static Dev make_dev(int M,int N,int K){
 }
 static void free_dev(Dev&d){ hipFree(d.A);hipFree(d.Bshuf);hipFree(d.C);hipFree(d.as);hipFree(d.bs); }
 
+// --- ISSUE-vs-LATENCY probe harness (gemm_fp8_occ: fixed 128x128/2x2 winner, knobs TBK/MINOCC/NOFEED) ---
+template <int TBK,int MINOCC,int NOFEED>
+static void launch_occ(const Dev& d){
+    dim3 grid(d.N/128, d.M/128);
+    gemm_fp8_occ<TBK,MINOCC,NOFEED><<<grid,128>>>(d.A,d.Bshuf,d.C,d.as,d.bs,d.M,d.N,d.K);
+}
+template <int TBK,int MINOCC,int NOFEED>
+static float time_occ(const Dev& d, int iters){
+    for(int i=0;i<5;i++) launch_occ<TBK,MINOCC,NOFEED>(d);
+    hipDeviceSynchronize();
+    hipEvent_t s,e; hipEventCreate(&s); hipEventCreate(&e);
+    hipEventRecord(s);
+    for(int i=0;i<iters;i++) launch_occ<TBK,MINOCC,NOFEED>(d);
+    hipEventRecord(e); hipEventSynchronize(e);
+    float ms=0; hipEventElapsedTime(&ms,s,e); hipEventDestroy(s); hipEventDestroy(e);
+    return ms/iters;
+}
+template <int TBK,int MINOCC,int NOFEED>
+static float oracle_err_occ(const Dev& d, const std::vector<float>& ref){
+    launch_occ<TBK,MINOCC,NOFEED>(d); hipDeviceSynchronize();
+    std::vector<uint16_t> H((size_t)d.M*d.N);
+    hipMemcpy(H.data(), d.C, (size_t)d.M*d.N*2, hipMemcpyDeviceToHost);
+    float mx=0;
+    for(size_t t=0;t<(size_t)d.M*d.N;t++){ uint32_t b=(uint32_t)H[t]<<16; float gv; __builtin_memcpy(&gv,&b,4);
+        float rv=ref[t], e=fabsf(gv-rv)/(fabsf(rv)+1e-3f); if(e>mx)mx=e; }
+    return mx;
+}
+// achieved-occupancy introspection from the code object: VGPRs, spill bytes, co-resident blocks/waves.
+template <int TBK,int MINOCC,int NOFEED>
+static void occinfo_occ(int& regs,int& spill,int& blocks,int& waves){
+    hipFuncAttributes a; hipFuncGetAttributes(&a,(const void*)gemm_fp8_occ<TBK,MINOCC,NOFEED>);
+    regs=a.numRegs; spill=(int)a.localSizeBytes; blocks=0;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm_fp8_occ<TBK,MINOCC,NOFEED>, 128, 0);
+    waves=blocks*4;   // 128-thread block = 4 wave32
+}
+template <int TBM,int TBN,int TWM,int TWN,int TBK,int AFEED,int DBUF>
+static void occinfo_lever(int& regs,int& spill,int& blocks,int& waves){
+    constexpr int TBLOCK=TWM*TWN*32;
+    hipFuncAttributes a; hipFuncGetAttributes(&a,(const void*)gemm_fp8_lever<TBM,TBN,TWM,TWN,TBK,AFEED,DBUF>);
+    regs=a.numRegs; spill=(int)a.localSizeBytes; blocks=0;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm_fp8_lever<TBM,TBN,TWM,TWN,TBK,AFEED,DBUF>, TBLOCK, 0);
+    waves=blocks*(TBLOCK/32);
+}
+template <int TBM,int TBN,int TWM,int TWN,int TBK>
+static void occinfo_pipe(int& regs,int& spill,int& blocks,int& waves){
+    constexpr int TBLOCK=TWM*TWN*32;
+    hipFuncAttributes a; hipFuncGetAttributes(&a,(const void*)gemm_fp8_pipe<TBM,TBN,TWM,TWN,TBK>);
+    regs=a.numRegs; spill=(int)a.localSizeBytes; blocks=0;
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gemm_fp8_pipe<TBM,TBN,TWM,TWN,TBK>, TBLOCK, 0);
+    waves=blocks*(TBLOCK/32);
+}
+
 static const double CEIL=307.0, HBL=143.0, WPC=15.9;
 
 // one config: oracle (1920^3) gate then perf (3840^3). Prints TF, %ceiling, WMMA/cyc.
@@ -350,6 +505,60 @@ static const double CEIL=307.0, HBL=143.0, WPC=15.9;
 }while(0)
 
 int main(){
+    if (getenv("PROFILE_WINNER")) {                    // isolate the 155-TF winner for rocprof counters
+        Dev d = make_dev(4096, 4096, 8192);            // acc4x4 Alds dbuf @ its peak K=8192
+        for (int i = 0; i < 30; ++i) launch<128,128,2,2,32,0,1>(d);
+        hipDeviceSynchronize(); free_dev(d); return 0;
+    }
+
+    if (getenv("ISSUE_PROBE")) {                       // disambiguate the 54% wall: issue-bound vs latency-bound
+        printf("=== ISSUE-vs-LATENCY PROBE (gemm_fp8_occ = 155-winner inner loop, knobs minWaves/NOFEED) ===\n");
+        // (0) faithful-clone gate: the FEED occ-kernel must match the oracle, else occupancy numbers are noise.
+        const int OM=1920,ON=1920,OK=256;
+        std::vector<uint8_t> Ah,Bh; build_io(OM,ON,OK,Ah,Bh);
+        std::vector<float> oref((size_t)OM*ON,0.f);
+        for(int i=0;i<OM;i++)for(int j=0;j<ON;j++){ float a=0;
+            for(int k=0;k<OK;k++) a+=dec(Ah[(size_t)i*OK+k])*dec(Bh[(size_t)k*ON+j]); oref[(size_t)i*ON+j]=a; }
+        Dev od=make_dev(OM,ON,OK);
+        float er = oracle_err_occ<32,4,0>(od, oref);
+        printf("[gate] occ FEED vs oracle: err=%.4f  %s\n\n", er, er<0.03f?"ok (clone faithful)":"FAIL — clone diverged");
+        free_dev(od);
+
+        // discriminator: sweep forced min-waves/SIMD at a FIXED inner loop. WMMA/cyc rising with
+        // occupancy => latency-bound (250 reachable). flat => issue-port contention (155 = silicon).
+        // spill!=0 points are confounded (extra mem ops) — printed but excluded from the verdict.
+        #define OCCROW(LBL, TBK, MINW, NOFEED, DEV, GFLOP) do{ \
+            int rg,sp,bl,wv; occinfo_occ<TBK,MINW,NOFEED>(rg,sp,bl,wv); \
+            float ms=time_occ<TBK,MINW,NOFEED>(DEV,30); double tf=(GFLOP)/(ms/1e3); \
+            printf("  %-20s VGPR=%3d spill=%4d  occ=%dblk/%2dwv   %6.1f TF  %4.1f%%  %.2f WMMA/cyc\n", \
+                LBL, rg, sp, bl, wv, tf, 100*tf/CEIL, WPC*tf/CEIL); }while(0)
+        struct WG { const char* name; int M,N,K; };
+        WG shapes[] = { {"4096^2 x K16384", 4096,4096,16384}, {"4096x14336 x K16384", 4096,14336,16384} };
+        for (auto& s : shapes) {
+            Dev dw = make_dev(s.M,s.N,s.K);
+            double gf = 2.0*(double)s.M*s.N*s.K/1e12;
+            printf("--- wgrad shape %s  (%.1f GFLOP/iter) ---\n", s.name, gf);
+            // baselines on THIS shape: the 155 winner (lever, B just-in-time) and the deep pipe (A+B prefetched).
+            { int rg,sp,bl,wv; occinfo_lever<128,128,2,2,32,0,1>(rg,sp,bl,wv);
+              float ms=time_ms<128,128,2,2,32,0,1>(dw,30); double tf=gf/(ms/1e3);
+              printf("  %-20s VGPR=%3d spill=%4d  occ=%dblk/%2dwv   %6.1f TF  %4.1f%%  %.2f WMMA/cyc\n",
+                     "lever 4x4 dbuf(155)", rg,sp,bl,wv, tf, 100*tf/CEIL, WPC*tf/CEIL); }
+            { int rg,sp,bl,wv; occinfo_pipe<128,128,2,2,32>(rg,sp,bl,wv);
+              float ms=time_pipe<128,128,2,2,32>(dw,30); double tf=gf/(ms/1e3);
+              printf("  %-20s VGPR=%3d spill=%4d  occ=%dblk/%2dwv   %6.1f TF  %4.1f%%  %.2f WMMA/cyc\n",
+                     "pipe A+B deep", rg,sp,bl,wv, tf, 100*tf/CEIL, WPC*tf/CEIL); }
+            OCCROW("feed minW=4",   32,  4, 0, dw, gf);
+            OCCROW("feed minW=6",   32,  6, 0, dw, gf);
+            OCCROW("feed minW=8",   32,  8, 0, dw, gf);
+            OCCROW("feed minW=10",  32, 10, 0, dw, gf);
+            OCCROW("feed minW=12",  32, 12, 0, dw, gf);
+            OCCROW("NOFEED minW=4", 32,  4, 1, dw, gf);   // feed-free ceiling of this structure
+            free_dev(dw);
+            printf("\n");
+        }
+        #undef OCCROW
+        return 0;
+    }
     hipDeviceProp_t p; hipGetDeviceProperties(&p,0);
     printf("device: %s  CUs=%d   (ceiling %.0f TF = %.1f WMMA/cyc, hipBLASLt %.0f)\n",
            p.name,p.multiProcessorCount,CEIL,WPC,HBL);
@@ -410,6 +619,19 @@ int main(){
             LABEL, tf, 100*tf/CEIL, tf/HBL, WPC*tf/CEIL); }while(0)
     P4KP("pipe acc4x4 bk32",                128,128, 2,2, 32);
     P4KP("pipe acc4x4 bk64",                128,128, 2,2, 64);
+
+    // === K-DEPTH SWEEP on the 155-TF winner (acc4x4 Alds dbuf bk32), M=N=4096 fixed (grid stays full) ===
+    // Parallel to the 276->305 micro-batch test: was 155 the steady-state ceiling, or under-fed?
+    printf("\n=== K-DEPTH SWEEP: 155-TF winner acc4x4 Alds dbuf, M=N=4096, K up ===\n");
+    printf("        K     TFLOPS   %%ceil  x143\n");
+    for (int Ksw : {4096, 8192, 16384, 32768, 65536}) {
+        Dev dk = make_dev(4096, 4096, Ksw);
+        float ms = time_ms<128,128,2,2,32,0,1>(dk, 20);
+        double gf = 2.0 * 4096.0 * 4096.0 * (double)Ksw / 1e12;
+        double tf = gf / (ms / 1e3);
+        printf("  %9d  %6.1f  %5.1f  %.2f\n", Ksw, tf, 100.0*tf/CEIL, tf/HBL);
+        free_dev(dk);
+    }
 
     free_dev(od); free_dev(pd); free_dev(pd4);
     return 0;

@@ -77,6 +77,51 @@ for dv in 0 1; do
     echo "      occ_mb_d${dv}.bin: $(wc -c < occ_mb_d${dv}.bin) bytes"
 done
 
+# FED FAT-TILE micro-batch GEMM: the micro-batch architecture on a REAL fp8 GEMM (real K-stream
+# A direct + B global_load_tr feed). FM/FN = accumulator-tile fragment dims (reuse lever). Stage 1
+# = FM=FN=1 (the fed-plumbing correctness gate). Static (d0) reserves the fat block for life; dyn
+# (d1) lean-32 + s_alloc grow/ship/shrink.
+echo "[1d] FED fat-tile micro-batch GEMM -> occ_mbgemm_{shape}_b{batch}_d{0,1}.bin (reuse x batch-grab)"
+# shape: FMxFN accumulator tile (1x1..2x4 fit the 128 dyn cap; 4x4=192 needs SQ_DYN_VGPR.BLOCK_SIZE=1).
+# batch: tiles claimed per atomic grab (amortizes the contended work-queue counter + grow/shrink).
+for shape in 1x1 2x2 2x4 4x4 5x4; do
+    fm=${shape%x*}; fn=${shape#*x}
+    for batch in 1 8 32; do for dv in 0 1; do
+        "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+            -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,FM=$fm -Wa,-defsym,FN=$fn -Wa,-defsym,BATCH=$batch \
+            -c occ_kernel_mbgemm.s -o occ_mbgemm_${shape}_b${batch}_d${dv}.o
+        "$L/llvm-objcopy" -O binary --only-section=.text occ_mbgemm_${shape}_b${batch}_d${dv}.o occ_mbgemm_${shape}_b${batch}_d${dv}.bin
+    done; done
+    echo "      occ_mbgemm_${shape}_b{1,8,32}_d{0,1}.bin"
+done
+# NOFEED isolation probe: 2x4 dyn batch32, operands loaded ONCE (no per-K feed) -> framework ceiling.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+    -Wa,-defsym,DYNVGPR=1 -Wa,-defsym,FM=2 -Wa,-defsym,FN=4 -Wa,-defsym,BATCH=32 -Wa,-defsym,NOFEED=1 \
+    -c occ_kernel_mbgemm.s -o occ_mbgemm_2x4_b32_nf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_mbgemm_2x4_b32_nf.o occ_mbgemm_2x4_b32_nf.bin
+echo "      occ_mbgemm_2x4_b32_nf.bin (NOFEED probe)"
+# PROFILE variants: in-kernel REALTIME per-phase timing breakdown (fed=prof0, nofeed=prof1), 2x4 b32.
+for nf in 0 1; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=1 -Wa,-defsym,FM=2 -Wa,-defsym,FN=4 -Wa,-defsym,BATCH=32 -Wa,-defsym,PROFILE=1 -Wa,-defsym,NOFEED=$nf \
+        -c occ_kernel_mbgemm.s -o occ_mbgemm_2x4_b32_prof${nf}.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_mbgemm_2x4_b32_prof${nf}.o occ_mbgemm_2x4_b32_prof${nf}.bin
+done
+echo "      occ_mbgemm_2x4_b32_prof{0,1}.bin (PROFILE phase timers)"
+
+# MERGE lockstep-stagger sweep: 4x4 static, BATCH=1 (so all pool waves stay active = neighbors for the
+# stagger to interleave), vary STAGGER to break the persistent-wave K-lockstep (KG 50147c07 -- feed stalls
+# fire in a synchronized burst; phase-offset by TGID_X so they interleave and the existing occupancy hides
+# them). st0 == the un-staggered baseline.
+echo "[1e] merge lockstep-stagger -> occ_mbgemm_4x4_b1_st{0,4,16,64}_d0.bin"
+for st in 0 4 16 64; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,DYNVGPR=0 -Wa,-defsym,FM=4 -Wa,-defsym,FN=4 -Wa,-defsym,BATCH=1 -Wa,-defsym,STAGGER=$st \
+        -c occ_kernel_mbgemm.s -o occ_mbgemm_4x4_b1_st${st}_d0.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_mbgemm_4x4_b1_st${st}_d0.o occ_mbgemm_4x4_b1_st${st}_d0.bin
+done
+echo "      occ_mbgemm_4x4_b1_st{0,4,16,64}_d0.bin"
+
 echo "[2/3] oracle self-test"
 clang++ -std=c++17 test_fp8_oracle.cpp fp8_oracle.cpp -o test_oracle
 ./test_oracle

@@ -27,6 +27,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <ctime>
+#include <vector>
+#include <cstdarg>
+#include <unistd.h>
 
 #include "hsakmt/hsakmt.h"
 #include "pm4_defs.h"        // -I ../dvgpr_pm4  (register offsets + RSRC builders + vendored encoder)
@@ -36,6 +39,17 @@
 // ---- the dgpu flag the vendored PM4 encoder asks for (same as MAD-304) -----
 static bool g_is_dgpu = true;
 bool hsakmt_is_dgpu() { return g_is_dgpu; }
+
+// ---- crash-survivable progress log: write a line to a disk file + fflush + fsync BEFORE each GPU
+// dispatch, so a hard hang/reboot leaves the last "STARTING ..." line ON DISK = exactly which config
+// wedged the queue. Also echoes to stdout. Open g_prog before the run; nullptr = stdout only. ----
+static FILE* g_prog = nullptr;
+static void prog(const char* fmt, ...) {
+    va_list ap; char line[512];
+    va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    printf("%s\n", line);
+    if (g_prog) { fprintf(g_prog, "%s\n", line); fflush(g_prog); fsync(fileno(g_prog)); }
+}
 
 #define CHECK(call) do {                                                       \
     HSAKMT_STATUS _s = (call);                                                 \
@@ -374,8 +388,142 @@ static MbResult run_microbatch(uint32_t node, const char* isaPath, bool dynvgpr,
     return res;
 }
 
+// ---------------------------------------------------------------------------
+// FED FAT-TILE MICRO-BATCH GEMM (MAD-305): the occ_kernel_mbgemm.s vehicle on a REAL fp8 GEMM.
+// Persistent waves pull output-tiles from the atomic queue; per tile dyn-VGPR grows, STREAMS the
+// K-reduction with real A (direct) + B (global_load_tr from pre-shuffled) feed, ships acc[0][0],
+// shrinks. Oracle = per-tile chained wmma_ref over the K-tiles. C buffer = totalTiles*1024 B.
+// ---------------------------------------------------------------------------
+static inline int mbg_trperm(int L, int s) {            // verified closed form (Phase-0 contract)
+    int base = (L & 7) + ((L >> 3) & 1) * 32 + ((L >> 4) & 1) * 128;
+    return base + (s & 3) * 8 + ((s >> 2) & 1) * 64;
+}
+static void mbg_preshuffle_B(const uint8_t* B, uint8_t* Bshuf, int K, int N) {
+    int KT = K / 16, NT = N / 16;
+    for (int kt = 0; kt < KT; ++kt) for (int nt = 0; nt < NT; ++nt) {
+        uint8_t* tile = Bshuf + (size_t)(kt * NT + nt) * 256;
+        for (int L = 0; L < 32; ++L) for (int s = 0; s < 8; ++s) {
+            int kl = ((L >> 4) & 1) * 8 + s, nl = L & 15;
+            tile[mbg_trperm(L, s)] = B[(size_t)(kt * 16 + kl) * N + (nt * 16 + nl)];
+        }
+    }
+}
+struct MbgResult { bool ok=false; uint32_t maxlive=0, total=0, okTiles=0, nChecked=0; uint64_t wall=0; double secs=0; uint32_t phase[6]={0,0,0,0,0,0}; };
+static MbgResult run_mbgemm(uint32_t node, const char* isaPath, bool dynvgpr, uint32_t nWaves,
+                            int M, int N, int K, int FM, int FN, bool fullCheck) {
+    MbgResult res;
+    int TMr = 16 * FM, TNc = 16 * FN, MTL = M / TMr, NTL = N / TNc, KT = K / 16, NT = N / 16;
+    uint32_t TOTAL = (uint32_t)MTL * NTL;
+    if ((NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not power of two\n", NTL); return res; }
+    int log2NTL = 0; while ((1 << log2NTL) < NTL) ++log2NTL;
+
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};   // 1, 2, .5, -1, -2, -.5
+    std::vector<uint8_t> Ah((size_t)M * K), Bh((size_t)K * N), Bshufh((size_t)K * N);
+    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i * 7 + i / (size_t)K) % 6];
+    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i * 5 + (i / (size_t)N) * 3) % 6];
+    mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
+
+    size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
+    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf occ = AllocGpu(node, 0x1000, false, true);
+    GpuBuf Ad  = AllocGpu(node, (Ah.size() + 0xFFF) & ~0xFFFull, false, true);
+    GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true);
+    uint64_t cbytes = ((uint64_t)TOTAL * 1024 + 0xFFF) & ~0xFFFull;
+    GpuBuf C   = AllocGpu(node, cbytes, false, true);
+    GpuBuf fence = AllocGpu(node, 0x1000, false, true);
+    memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
+    memcpy(Ad.ptr, Ah.data(), Ah.size());
+    memcpy(Bd.ptr, Bshufh.data(), Bshufh.size());
+    volatile uint32_t* occW = (volatile uint32_t*)occ.ptr;
+    volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
+    occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=0; *fenceW=0;
+
+    Ring ring; ring.buf = AllocGpu(node, 0x10000, true, true); ring.dw = (uint32_t*)ring.buf.ptr;
+    ring.sizeDw = (uint32_t)(ring.buf.size / sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node, HSA_QUEUE_COMPUTE, 100, HSA_QUEUE_PRIORITY_NORMAL, ring.buf.ptr, ring.buf.size, nullptr, &ring.res));
+
+    uint64_t shiftedIsa = ((uint64_t)isa.ptr) >> 8;
+    uint64_t occVa=(uint64_t)occ.ptr, aVa=(uint64_t)Ad.ptr, bVa=(uint64_t)Bd.ptr, cVa=(uint64_t)C.ptr, fenceVa=(uint64_t)fence.ptr;
+    uint32_t dims[8] = {0,0,0,32,1,1,0,0};
+    uint32_t pgm[6] = {(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    uint32_t fatregs = (uint32_t)((32 + FM*FN*8 + FM*4 + FN*4 + 15) & ~15);  // double-buffered A/B frags
+    uint32_t rsrc1 = BuildPgmRsrc1(false);
+    uint32_t launchField = dynvgpr ? 4u : ((fatregs / 8) & 0x3fu);   // dyn launches lean 32; static reserves fat
+    rsrc1 = (rsrc1 & ~0x3fu) | (launchField & 0x3fu);
+    uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT);   // 15 user SGPRs s0..s14
+    uint32_t rsrc[2] = {rsrc1, rsrc2};
+    uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
+    uint32_t userdata[16] = {
+        (uint32_t)occVa,(uint32_t)(occVa>>32),                 // s0:s1 occ
+        (uint32_t)aVa, (uint32_t)(aVa>>32),                    // s2:s3 A
+        (uint32_t)bVa, (uint32_t)(bVa>>32),                    // s4:s5 Bshuf
+        (uint32_t)cVa, (uint32_t)(cVa>>32),                    // s6:s7 C
+        (uint32_t)KT, (uint32_t)K, (uint32_t)(NT*256), TOTAL,  // s8 KT, s9 K, s10 NTx256, s11 TOTAL
+        (uint32_t)(NTL-1), (uint32_t)log2NTL, (uint32_t)(FN*256), 0 };  // s12 mask, s13 log2, s14 FNx256
+    uint32_t dispInit = BuildDispatchInitiator();
+    RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));
+    RingPlace(ring, PM4DispatchDirectPacket(nWaves * 32u, 1, 1, dispInit));
+    RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
+
+    const double timeoutS = 20.0;
+    double t0 = now_s(); RingSubmit(ring);
+    bool done=false, admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
+    while (true) { double now = now_s();
+        if (occW[1] > 0) admitted = true;
+        uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
+        bool ff = (*fenceW == FENCE_VALUE);
+        if (admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025) { done=true; break; }
+        if (now - t0 > timeoutS) break;
+    }
+    double t1 = now_s();
+    if (!done) {
+        fprintf(stderr, "\n*** MBGEMM TIMEOUT (%s): live=%u maxlive=%u nextTile=%u (queue may be hung) ***\n",
+                isaPath, occW[0], occW[1], occW[5]);
+        CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+        FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+        return res;
+    }
+    res.ok = true; res.maxlive = occW[1]; res.total = occW[4];
+    { uint32_t gs=occW[2], ge=occW[3]; res.wall = (ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
+    res.secs = t1 - t0;
+
+    // ---- per-tile oracle: reference D = sum_kt A_block . B_block (chained wmma_ref, D=A*B+C) ----
+    const float* Cf = (const float*)C.ptr; uint32_t okc=0, checked=0;
+    uint32_t stride = fullCheck ? 1u : (TOTAL > 256 ? TOTAL / 256u : 1u);
+    for (uint32_t ti = 0; ti < TOTAL; ti += stride) {
+        int tc = ti & (NTL - 1), tr = ti >> log2NTL;
+        float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
+        uint8_t Ablk[256], Bblk[256]; float Dout[256];
+        for (int kt = 0; kt < KT; ++kt) {
+            for (int i=0;i<16;i++) for (int j=0;j<16;j++) {   // acc[0][0] origin: rows tr*16*FM, cols tc*16*FN
+                Ablk[i*16+j] = Ah[(size_t)(tr*16*FM+i)*K + (kt*16+j)];
+                Bblk[i*16+j] = Bh[(size_t)(kt*16+i)*N + (tc*16*FN+j)];
+            }
+            wmma_ref_16x16x16(Ablk, Bblk, Cacc, Dout);
+            for (int i=0;i<256;i++) Cacc[i]=Dout[i];
+        }
+        float D[256]; unpack_D(Cf + (size_t)ti * 256, D);
+        bool good=true; for (int i=0;i<256;i++) if (std::fabs(D[i]-Cacc[i]) > 5e-3f*std::fabs(Cacc[i])+1e-2f) { good=false; break; }
+        if (good) ++okc; ++checked;
+    }
+    res.okTiles = okc; res.nChecked = checked;
+    for (int i = 0; i < 6; ++i) res.phase[i] = occW[6 + i];   // PROFILE: per-phase tick totals (occ[24..44], wg0)
+    CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+    FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+    return res;
+}
+
 int main(int argc, char** argv) {
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH } mode = CORRECT;
+    setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: if a raw-PM4 run hangs and gets SIGKILL'd, the log still shows WHERE it died
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBPROF, MERGE } mode = CORRECT;
+    bool fat = false;   // --fat: include >128-VGPR shapes (require umr SQ_DYN_VGPR.BLOCK_SIZE=1, cap 256)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
         else if (!strcmp(argv[i], "--prong2"))    mode = PRONG2;
@@ -384,6 +532,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--timercheck"))mode = TIMERCHECK;
         else if (!strcmp(argv[i], "--probe"))     mode = PROBE;
         else if (!strcmp(argv[i], "--microbatch"))mode = MICROBATCH;
+        else if (!strcmp(argv[i], "--mbgemm"))    mode = MBGEMM;
+        else if (!strcmp(argv[i], "--mbprof"))    mode = MBPROF;
+        else if (!strcmp(argv[i], "--merge"))     mode = MERGE;
+        else if (!strcmp(argv[i], "--fat"))       fat = true;
     }
 
     // Test matrices A,B (16x16 e4m3, non-trivial) and the CPU oracle D = A.B.
@@ -615,7 +767,7 @@ int main(int argc, char** argv) {
         // PART 1: push work/tile to find the saturated asymptote (occ 8, clean). 307 = matrix ceiling.
         printf("=== PART 1: saturation asymptote (pool=1024 = occ 8, %u tiles) ===\n", 2048);
         printf("  KDEPTH  variant  okTiles    span_ms  TFLOPS  %%307\n");
-        { const uint32_t Ks[]={16384, 32768, 65536}, TOTAL=2048, POOL=1024;
+        { const uint32_t Ks[]={65536, 131072, 262144, 524288, 1048576}, TOTAL=2048, POOL=1024;  // push past 65536: was 276 the ceiling or still climbing?
           for (uint32_t K : Ks) for (int dv=0; dv<2; ++dv) {
               MbResult r=run_microbatch(node,dv?"occ_mb_d1.bin":"occ_mb_d0.bin",dv!=0,fragIn,POOL,96/8,K,TOTAL,Dref);
               if(!r.ok){ fprintf(stderr,"  K=%u %s incomplete.\n",K,dv?"dyn":"static"); rc=3; continue; }
@@ -627,7 +779,7 @@ int main(int argc, char** argv) {
         // does the extra 33% occupancy now convert to throughput? (pool 2048 >> ... so all waves busy.)
         printf("\n=== PART 2: occupancy-at-saturation -- static(occ12) vs dyn(occ16), KDEPTH=16384 ===\n");
         printf("  pool   variant  maxlive occ/SIMD  okTiles    span_ms  TFLOPS  %%307\n");
-        { const uint32_t K=16384, TOTAL=4096, POOL=2048;
+        { const uint32_t K=16384, TOTAL=4096, POOL=1536;   // occ 12 (1536x96=1152<file): wedge-safe, no exact-fill edge
           for (int dv=0; dv<2; ++dv) {
               MbResult r=run_microbatch(node,dv?"occ_mb_d1.bin":"occ_mb_d0.bin",dv!=0,fragIn,POOL,96/8,K,TOTAL,Dref);
               if(!r.ok){ fprintf(stderr,"  %s incomplete.\n",dv?"dyn":"static"); rc=3; continue; }
@@ -637,6 +789,136 @@ int main(int argc, char** argv) {
                      (double)r.wall/freq_hz*1e3,tf,100*tf/307.0); } }
         printf("\n  PART1: does TF reach ~300 (hand-asm CAN saturate)?  PART2: dyn TF > static TF =>\n");
         printf("  dyn-VGPR occupancy converts to throughput when saturated (the lever finally pays).\n");
+    } else if (mode == MBGEMM) {
+        // COMPUTE:LOAD (reuse) SWEEP -- the REAL lever. reuse = FM*FN/(FM+FN) = WMMAs per operand
+        // load; only a bigger TILE raises it (K can't). The 128-VGPR "cap" only binds the DYNAMIC
+        // s_alloc path; STATIC reservation reaches the 256-VGPR wave max with NO umr, and static
+        // can't dyn-deadlock -> 4x4(192)/5x4(240) run right now. Cross the barrier we never crossed.
+        struct T { int fm, fn, M, N; bool dyn; const char* tag; bool needUmr; };
+        T tiles[] = {
+            {1,1, 2048,2048, true,  "1x1", false},             // reuse 0.50, 128-cap dyn (ref)
+            {2,2, 2048,2048, true,  "2x2", false},             // reuse 1.00
+            {2,4, 2048,2048, true,  "2x4", false},             // reuse 1.33, the dyn ceiling
+            {4,4, 2048,2048, false, "4x4", false},             // reuse 2.00, 192 VGPR STATIC (no umr)
+            {5,4, 2560,2048, false, "5x4", false},             // reuse 2.22, 240 VGPR STATIC
+            {4,4, 2048,2048, true,  "4x4", true },             // DYN 192 -- big tile + lean occ (THE thesis); umr
+            {5,4, 2560,2048, true,  "5x4", true },             // DYN 240 -- umr
+        };
+        const int batch = 32, K = 2048;
+        printf("=== COMPUTE:LOAD (reuse) SWEEP -- bigger tile = more WMMAs/load. K=%d batch=%d ===\n", K, batch);
+        printf("  static (d0): big tile, low occ, no umr. dyn (d1, --fat): big tile + lean occ, needs umr.\n");
+        printf("  tile  reuse  vgpr  mode    oracle    span_ms  TFLOPS  %%307  x143\n");
+        for (auto& t : tiles) {
+            if (fat ? (t.fm < 4) : t.needUmr) continue;        // --fat: big tiles only (static+dyn head-to-head)
+            int fatregs = (32 + t.fm*t.fn*8 + t.fm*4 + t.fn*4 + 15) & ~15;
+            uint32_t pool;
+            if (t.dyn) { pool = (uint32_t)((1152*128)/fatregs); if (pool>1536u) pool=1536u; pool=(pool/128u)*128u; }
+            else       { pool = 768u; }                        // static: HW caps occ at file/fatregs; no deadlock
+            char bn[80]; snprintf(bn, sizeof bn, "occ_mbgemm_%s_b%d_d%d.bin", t.tag, batch, t.dyn?1:0);
+            double reuse = (double)(t.fm*t.fn)/(t.fm+t.fn);
+            MbgResult o = run_mbgemm(node, bn, t.dyn, pool, 512,512,512, t.fm,t.fn, true);     // oracle gate
+            MbgResult r = run_mbgemm(node, bn, t.dyn, pool, t.M,t.N,K, t.fm,t.fn, false);      // perf
+            if (!o.ok || !r.ok) { fprintf(stderr, "  %s incomplete\n", t.tag); rc=3; continue; }
+            uint32_t TOTAL = (uint32_t)(t.M/(16*t.fm)) * (t.N/(16*t.fn)); int KT = K/16;
+            double work = (double)TOTAL * t.fm * t.fn * KT;
+            double tf = work * (2.0*16*16*16) * freq_hz / (double)r.wall / 1e12;
+            printf("  %-5s %.2f  %4d  %-6s  %s%u/%u  %8.3f  %6.1f  %4.1f  %.2f\n",
+                   t.tag, reuse, fatregs, t.dyn?"dyn":"static",
+                   o.okTiles==o.nChecked ? "OK " : "BAD", o.okTiles, o.nChecked,
+                   (double)r.wall/freq_hz*1e3, tf, 100*tf/307.0, tf/143.0);
+        }
+        // ISOLATION: same kernel, operands loaded ONCE & reused (no per-K feed) -> framework ceiling.
+        if (!fat) {
+            printf("\n  [NO-FEED 2x4 b32 -- operands reused, ZERO per-K load]    K     KT   TFLOPS  span_ms\n");
+            const int nfKs[] = {2048, 8192, 32768};
+            for (int K : nfKs) {
+                MbgResult r = run_mbgemm(node, "occ_mbgemm_2x4_b32_nf.bin", true, 1152u, 2048,2048,K, 2,4, false);
+                if (!r.ok) continue;
+                uint32_t TOTAL = (uint32_t)(2048/32)*(2048/64); int KT = K/16;
+                double work = (double)TOTAL * 8 * KT;
+                double tf = work * (2.0*16*16*16) * freq_hz / (double)r.wall / 1e12;
+                printf("                                                       %6d %5d  %6.1f  %.3f\n",
+                       K, KT, tf, (double)r.wall/freq_hz*1e3);
+            }
+            printf("    CLIMBS with K => per-tile FRAMEWORK overhead is the wall (amortized by work/tile), NOT the\n");
+            printf("    issue port. The fed K-sweep stayed flat only because every K-step re-pays the feed.\n");
+        }
+        printf("\n  TF climbs with reuse -> tile size is the lever; push bigger (umr->8x8, reuse 4.0).\n");
+    } else if (mode == MBPROF) {
+        // IN-KERNEL PHASE TIMING -- the rocprof-equivalent. Workgroup 0 accumulates REALTIME (100 MHz)
+        // ticks spent in each phase of the per-tile cycle; we table the breakdown. 2x4, batch32, 2048^3.
+        printf("=== IN-KERNEL PHASE BREAKDOWN (REALTIME 100MHz, workgroup 0, acc[2x4] b32, 2048^3) ===\n");
+        const char* names[6] = { "ATOMIC (grab)", "GROW (s_alloc up)", "SETUP (decode+zero)",
+                                 "COMPUTE (K-loop+feed)", "STORE", "SHRINK (s_alloc down)" };
+        for (int nf = 0; nf < 2; ++nf) {
+            const char* bn = nf ? "occ_mbgemm_2x4_b32_prof1.bin" : "occ_mbgemm_2x4_b32_prof0.bin";
+            MbgResult r = run_mbgemm(node, bn, true, 1152u, 2048,2048,2048, 2,4, false);
+            if (!r.ok) { fprintf(stderr, "  %s incomplete\n", bn); rc = 3; continue; }
+            uint64_t tot = 0; for (int i = 0; i < 6; ++i) tot += r.phase[i];
+            printf("\n  [%s feed]  wg0 total = %llu ticks = %.3f ms   (whole-dispatch wall %.3f ms)\n",
+                   nf ? "NO" : "REAL", (unsigned long long)tot, tot * 10.0 / 1e6, (double)r.wall/freq_hz*1e3);
+            printf("    phase                       ticks         us     %%\n");
+            for (int i = 0; i < 6; ++i)
+                printf("    %-24s %10u  %9.2f  %5.1f\n", names[i], r.phase[i], r.phase[i] * 10.0 / 1e3,
+                       tot ? 100.0 * r.phase[i] / (double)tot : 0.0);
+        }
+        printf("\n  (10 ns/tick. COMPUTE = the K-loop incl feed waits; the rest = per-tile/per-batch overhead.)\n");
+    } else if (mode == MERGE) {
+        // ===== MAD-305 MERGE (T2 G2 gate): the hand-asm 4x4 with the fine s_wait_loadcnt ladder
+        // (WMMABUF_WAIT) must reach hipcc parity (~147-155 TF) at a wgrad shape, bit-exact, BEFORE the
+        // fat tile goes on. Square big-K only: the power-of-2 tile-grid decode needs N/(16*FN) a power of
+        // two (4096/64=64 OK); the realistic 14336 wgrad dim is non-pow2 and waits on a general-divide
+        // kernel change (T8). Reuses the existing occ_mbgemm_4x4_b32_d0.bin (static 192 VGPR), which now
+        // carries the ladder since occ_kernel_mbgemm.s was rebuilt. =====
+        g_prog = fopen("/tmp/occ_merge_progress.log", "w");
+        prog("=== MAD-305 MERGE (lockstep-stagger, BATCH=1, pool=768) -- crash log: /tmp/occ_merge_progress.log ===");
+        const int FM = 4, FN = 4;
+        // Staged smallest->biggest so a hang is ISOLATED, and each STARTING line is fsync'd to disk BEFORE its
+        // GPU dispatch -> a hard reboot leaves the wedging config named on disk. oracle 512^3 -> smoke 2048^3
+        // (KG-proven shape; isolates BATCH=1) -> the real 4096^2 x K8192 stagger sweep (KG 50147c07).
+        prog("STARTING oracle st0 @512^3");
+        MbgResult o = run_mbgemm(node, "occ_mbgemm_4x4_b1_st0_d0.bin", false, 768u, 512,512,512, FM,FN, true);
+        if (!o.ok) { prog("  oracle INCOMPLETE -> BATCH=1 path hangs even at 512^3"); rc = 3; }
+        else {
+            bool bitexact = (o.okTiles == o.nChecked);
+            prog("DONE oracle 512^3: %s %u/%u bit-exact", bitexact ? "OK" : "BAD", o.okTiles, o.nChecked);
+
+            prog("STARTING smoke st0 @2048^3 (proven shape -- isolates BATCH=1 from the big shape)");
+            { MbgResult s = run_mbgemm(node, "occ_mbgemm_4x4_b1_st0_d0.bin", false, 768u, 2048,2048,2048, FM,FN, false);
+              if (!s.ok) prog("  smoke 2048^3 INCOMPLETE -> the BATCH=1 path itself hangs (not the big shape, not the stagger)");
+              else { uint32_t T=(uint32_t)(2048/(16*FM))*(2048/(16*FN)); int KT=2048/16; double w=(double)T*FM*FN*KT;
+                     double tf=w*(2.0*16*16*16)*freq_hz/(double)s.wall/1e12;
+                     prog("DONE smoke 2048^3: OK  %.3f ms  %.1f TF  maxlive=%u", (double)s.wall/freq_hz*1e3, tf, s.maxlive); } }
+
+            if (getenv("MERGE_BIG")) {
+                // The fair test of the lockstep-stagger fix: does MORE occupancy let it pay off? pool ascending
+                // 768/1152/1536 = ~3/4.5/6 waves/SIMD at 192-VGPR static (37%/56%/75% of the VGPR file -- all
+                // safely BELOW the 2048=100%-file zero-slack deadlock). Lower-risk pools run + log first.
+                prog("-- pool x stagger sweep @ 4096^2 x K8192 (does occupancy unlock the lockstep-stagger fix?) --");
+                const uint32_t pools[] = { 768u, 1152u, 1536u };
+                const int sts[] = { 0, 16, 64 };
+                for (uint32_t pool : pools) {
+                  for (int st : sts) {
+                    char bn[80]; snprintf(bn, sizeof bn, "occ_mbgemm_4x4_b1_st%d_d0.bin", st);
+                    int K = 8192;
+                    prog("STARTING pool=%u st%d @4096^2 x K%d", pool, st, K);
+                    MbgResult r = run_mbgemm(node, bn, false, pool, 4096,4096,K, FM,FN, false);
+                    if (!r.ok) { prog("  pool=%u st%d INCOMPLETE", pool, st); rc = 3; continue; }
+                    uint32_t TOTAL = (uint32_t)(4096/(16*FM)) * (4096/(16*FN)); int KT = K/16;
+                    double work = (double)TOTAL * FM * FN * KT;
+                    double tf = work * (2.0*16*16*16) * freq_hz / (double)r.wall / 1e12;
+                    double wmma_cyc = 15.9 * tf / 307.0;
+                    prog("DONE pool=%-4u st%-3d maxlive=%u  %.3f ms  %.1f TF  %.1f%%  %.2f WMMA/cyc",
+                         pool, st, r.maxlive, (double)r.wall/freq_hz*1e3, tf, 100*tf/307.0, wmma_cyc);
+                  }
+                }
+                prog("Reading: TF rises with pool+stagger => lockstep fix works once it has co-resident waves; flat => single-wave occupancy-dead (cd407a9b).");
+            } else {
+                prog("-- big 4096^2 x K8192 sweep SKIPPED (set MERGE_BIG=1 to run it once the smoke is confirmed clean) --");
+            }
+            if (!bitexact) prog("NOTE: oracle NOT bit-exact (%u/%u).", o.okTiles, o.nChecked);
+        }
+        if (g_prog) { fclose(g_prog); g_prog = nullptr; }
     } else {
         // Default: dyn-VGPR cap probe. Test dyn correctness at increasing s_alloc footprints:
         //   light NACC=8  -> s_alloc 96  (<=128, expected OK)
