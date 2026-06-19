@@ -1866,7 +1866,7 @@ static bool run_lds_bound(uint32_t node, const char* isaPath, uint32_t ldsBytes)
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: if a raw-PM4 run hangs and gets SIGKILL'd, the log still shows WHERE it died
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, WALL82 } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, WALL82 } mode = CORRECT;
     bool fat = false;   // --fat: include >128-VGPR shapes (require umr SQ_DYN_VGPR.BLOCK_SIZE=1, cap 256)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
@@ -1913,6 +1913,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--occsweep"))      mode = OCCSWEEP;
         else if (!strcmp(argv[i], "--reuse82"))       mode = REUSE82;
         else if (!strcmp(argv[i], "--reuse82tw2"))    mode = REUSE82TW2;
+        else if (!strcmp(argv[i], "--reuse82kw2"))    mode = REUSE82KW2;
+        else if (!strcmp(argv[i], "--vgpr82"))        mode = VGPR82;
+        else if (!strcmp(argv[i], "--blds82"))        mode = BLDS82;
         else if (!strcmp(argv[i], "--wall82"))        mode = WALL82;
         else if (!strcmp(argv[i], "--fat"))       fat = true;
     }
@@ -2806,6 +2809,115 @@ int main(int argc, char** argv) {
             }
         }
         printf("    [residWv = maxlive*waves. 8x2 TWN=2 target: re-hide the WMMA -> recover toward the 182 FEEDONLY ceiling.]\n");
+    } else if (mode == REUSE82KW2) {
+        // ===== MAD-305 8x2 KWIN=2 OCCUPANCY lever: today's TWN=2 result proved 8x2 residency is LDS-BOUND at 64 WGs
+        //   (LDS = KWIN*ATILE, TWN-invariant). The fix is NOT fewer waves/WG (TWN) but a SMALLER per-WG LDS footprint:
+        //   halve the A-ring (KWIN 4->2 -> LDS 32772->16388) -> ~2x WGs -> ~1024 resident waves (vs 512) to re-hide the
+        //   WMMA exposed at the 182 FEEDONLY ceiling. KWINPW=2. Tradeoff: 2x A-publish barrier freq. KWIN=4 = control. =====
+        printf("\n=== MAD-305 8x2 @ TWN=4 KWIN=2 (half LDS ring -> ~2x residency) vs KWIN=4 winner (162) ===\n");
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) ---\n");
+        { struct O { const char* name; const char* bin; int fm,fn; uint32_t lds; };
+          O ors[] = {
+            { "8x2 KWIN=2", "occ_wggemm2_82_tw4_kwin2_st1.bin", 8, 2, 16388u },   // THE gate: KWIN=2 publish/consume correctness
+          };
+          for (auto& o : ors) {
+            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, o.fm, o.lds, 26u, 0, 4, o.fn);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-10s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+          }
+        }
+        printf("    %-16s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384;
+        struct G { const char* name; const char* bin; uint32_t lds; };
+        G geoms[] = {
+            { "8x2 KWIN=4", "occ_wggemm2_82_tw4_kwin4_pw4.bin", 32772u },   // the 162 winner (control)
+            { "8x2 KWIN=2", "occ_wggemm2_82_tw4_kwin2_pw2.bin", 16388u },   // half LDS ring
+        };
+        uint32_t nwgs[] = { 256u, 512u, 1024u };
+        for (auto& g : geoms) {
+            printf("  --- %s (8 waves/WG, TWN=4, LDS=%u) ---\n", g.name, g.lds);
+            for (uint32_t nw : nwgs) {
+                WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, g.lds, 26u, 4, 0, 2);
+                if (!r.ok) { printf("    %-16s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                printf("    %-16s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                       g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                       (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                if (r.badSamp) rc=3;
+            }
+        }
+        printf("    [LDS-residency hypothesis: KWIN=2 should ~2x residWv (512->~1024). If TF rises -> latency-bound confirmed,\n");
+        printf("     the 162->182 gap was occupancy. If flat/worse -> 2x barrier cost ate the occupancy win (try KWINNOTAIL).]\n");
+    } else if (mode == VGPR82) {
+        // ===== MAD-305 8x2 VGPR-RESIDENCY PROBE: is the 64-WG cap VGPR-allocation-bound or structural (tile geometry)?
+        //   The 8x2 winner genuinely uses 208 VGPR (v0..v207) so we can't reserve FEWER (would corrupt). Instead sweep
+        //   vgprField UPWARD (over-reserve, always safe -- extra regs unused) on the SAME winner bin and watch maxlive:
+        //     - maxlive DROPS below 64 at/near field 26 -> VGPR reservation is the binding occ limiter at 208 ->
+        //       dyn-VGPR (lean launch, reserve <208 most of the wave's life) WOULD lift residency (2nd payoff).
+        //     - maxlive holds 64 well past 26 (VGPR headroom) -> the 64-WG cap is STRUCTURAL (tile shape, not VGPR) ->
+        //       dyn-VGPR's value is purely the feed-density lever, not residency.
+        //   No kernel rebuild: vgprField is a dispatch-time RSRC1 field. acc00 stays OK (kernel still uses only v0..207). =====
+        printf("\n=== MAD-305 8x2 VGPR-residency probe (sweep RSRC1 vgprField UP on the 162 winner, nWG=512) ===\n");
+        printf("    8x2 genuinely needs 208 VGPR (v207); field>=26 is over-reservation. Watching where maxlive falls off 64.\n");
+        printf("    %6s %8s %9s %9s %9s %8s %s\n","field","~VGPR","maxlvWG","residWv","TF","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384; const uint32_t nWG=512u;
+        const char* bin = "occ_wggemm2_82_tw4_kwin4_pw4.bin";
+        uint32_t fields[] = { 26u, 27u, 28u, 29u, 30u, 32u, 36u, 40u, 48u, 56u, 63u };
+        uint32_t base_maxlive = 0;
+        for (uint32_t vf : fields) {
+            WgpResult r = run_wggemm_perf(node, bin, M,N,Ks, nWG, freq_hz, 8, 32772u, vf, 4, 0, 2);
+            if (!r.ok) { printf("    %6u %8u %9s %9s %9s %8s  %s\n", vf, vf*8u, "INCOMPLETE","-","-","-","(VGPR over-reserve too high to launch)"); continue; }
+            if (vf == 26u) base_maxlive = r.maxlive;
+            const char* tag = "";
+            if (base_maxlive && r.maxlive < base_maxlive) tag = "  <- WG cap dropping (VGPR-bound)";
+            printf("    %6u %8u %9u %9u %9.1f %8.1f  %s%s\n",
+                   vf, vf*8u, r.maxlive, r.maxlive*8u, r.tf,
+                   (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK", tag);
+            if (r.badSamp) rc=3;
+        }
+        printf("    [VERDICT: maxlive falls immediately past field 26 -> VGPR-allocation-bound -> dyn-VGPR lifts residency too.\n");
+        printf("     maxlive holds at 64 with VGPR headroom -> 64-WG cap is STRUCTURAL (tile geometry); dyn-VGPR = feed-density only.]\n");
+    } else if (mode == BLDS82) {
+        // ===== MAD-305 B-in-LDS DEDUP on the 8x2 winner: both wave_m of a wave_n load IDENTICAL B columns today
+        //   (redundant global_load_tr). BLDS=1 -> wave_m==0 loads B -> LDS B-ring, both wave_m read from LDS ->
+        //   HALVES the binding global B-tr feed (B-tr/MAC 0.125->0.0625). Static, no umr, no VGPR change. Cost: a
+        //   B-ring in LDS (49156 B total) + a dedup ds_load in the consume. If TF rises -> binding feed re-cut
+        //   below the 182 ceiling (composable with dyn-VGPR later). If flat -> we were already WMMA-exposed, not
+        //   feed-bound at the margin (then the win needs latency-hiding, not less feed). =====
+        printf("\n=== MAD-305 8x2 + B-in-LDS dedup (halve binding B-tr feed) vs 8x2 winner (162) ===\n");
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) ---\n");
+        { struct O { const char* name; const char* bin; int fm,fn; uint32_t lds; };
+          O ors[] = {
+            { "8x2 BLDS", "occ_wggemm2_82_tw4_kwin4_blds_st1.bin", 8, 2, 49156u },   // THE gate: B-in-LDS dedup correctness
+          };
+          for (auto& o : ors) {
+            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, o.fm, o.lds, 26u, 0, 4, o.fn);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-10s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+          }
+        }
+        printf("    %-16s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384;
+        struct G { const char* name; const char* bin; uint32_t lds; double btr; };
+        G geoms[] = {
+            { "8x2 winner",  "occ_wggemm2_82_tw4_kwin4_pw4.bin",  32772u, 0.125 },
+            { "8x2 B-in-LDS", "occ_wggemm2_82_tw4_kwin4_blds.bin", 49156u, 0.0625 },
+        };
+        uint32_t nwgs[] = { 256u, 512u, 1024u };
+        for (auto& g : geoms) {
+            printf("  --- %s (8 waves/WG, B-tr/MAC=%.4f) ---\n", g.name, g.btr);
+            for (uint32_t nw : nwgs) {
+                WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, g.lds, 26u, 4, 0, 2);
+                if (!r.ok) { printf("    %-16s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                printf("    %-16s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                       g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                       (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                if (r.badSamp) rc=3;
+            }
+        }
+        printf("    [B-in-LDS halves the binding global B-tr feed. >162 -> feed re-cut wins (stacks with dyn later);\n");
+        printf("     flat -> margin is WMMA-exposure not feed (the B-ring ds_load + dedup barrier ate the feed save).]\n");
     } else if (mode == WALL82) {
         // ===== MAD-305 8x2 WALL ATTRIBUTION: after 8x2 broke 4x4's wall (162 vs 149), what is 8x2's NEW wall?
         //   FED / FEEDONLY / NOFEED at saturated 65536^2 x K16384, occupancy-matched (vgprField 26), FED full-oracle.

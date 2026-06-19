@@ -222,6 +222,24 @@ echo "      sustain bins: kwin4_pw{2,4} + nofeed4_perf + tw4_{nofeed,kwin4_pw2,k
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_kwin4_st1.o occ_wggemm2_82_kwin4_st1.bin
 echo "      reuse-tile bins: 82_tw4_kwin4_pw4 (8x2 perf) + {tw4,82_tw4}_kwin4_st1 (oracle) + 82_tw4_{kwin4_pw4_feedonly,nofeed} (wall) built"
 echo "      reuse-tile TWN=2 bins: 82_kwin4_pw4 (8x2 perf, NBANDS=4) + 82_kwin4_st1 (oracle) built"
+# REUSE-TILE 8x2 @ TWN=4 KWIN=2 (MAD-305 OCCUPANCY lever): HALVE the A-LDS ring (KWIN 4->2 -> LDS=KWIN*ATILE=16384,
+#   ldsBytes 16388) to ~2x resident WGs (64->~128 -> ~1024 resident waves) and re-hide the WMMA exposed at the 182
+#   FEEDONLY ceiling. KWINPW=2 (must divide KWIN). NBANDS=FM/TWN=2 -> proven 2-band fast path. Tradeoff: 2x A-publish
+#   barrier frequency. perf (STORE=0) + STORE=1 oracle (gates the KWIN=2 publish/consume).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=2 -Wa,-defsym,KWINPW=2 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin2_pw2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin2_pw2.o occ_wggemm2_82_tw4_kwin2_pw2.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=2 -Wa,-defsym,KWINPW=2 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin2_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin2_st1.o occ_wggemm2_82_tw4_kwin2_st1.bin
+echo "      reuse-tile KWIN=2 bins: 82_tw4_kwin2_pw2 (8x2 perf, half LDS ring) + 82_tw4_kwin2_st1 (oracle) built"
+# REUSE-TILE 8x2 @ TWN=4 + B-IN-LDS DEDUP (MAD-305 binding-feed lever): wave_m==0 loads B (global_load_tr) -> LDS
+#   B-ring; BOTH wave_m read B from LDS in the consume. Both wave_m of a wave_n load IDENTICAL B columns today ->
+#   dedup HALVES the binding global B-tr feed (B-tr/MAC 0.125->0.0625). No VGPR change, no umr. KWINBPF must be 0.
+#   LDS = KWIN*ATILE + KWIN*BTILE = 32768 + 4*4096 = 49152 (+ti) -> ldsBytes 49156. perf (STORE=0) + STORE=1 oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -Wa,-defsym,BLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_blds.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_blds.o occ_wggemm2_82_tw4_kwin4_blds.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -Wa,-defsym,BLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_blds_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_blds_st1.o occ_wggemm2_82_tw4_kwin4_blds_st1.bin
+echo "      reuse-tile B-in-LDS bins: 82_tw4_kwin4_blds (8x2 perf, dedup B) + 82_tw4_kwin4_blds_st1 (oracle) built"
 
 # LDS-FREE A (ANOLDS): per-wave global A, no LDS, no barriers (issue-density structural test). perf (STORE=0) + oracle (STORE=1).
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_perf.o
