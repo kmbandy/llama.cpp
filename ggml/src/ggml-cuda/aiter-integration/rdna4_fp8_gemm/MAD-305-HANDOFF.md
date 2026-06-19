@@ -165,9 +165,15 @@ the **full `pool × stagger` grid** on `4096²×K8192`, BATCH=1:
 ### 4c. The combined conclusion
 - **305 TF** (micro-batch feed-free) and **94%** (HIP `NOFEED`) prove the matrix + the silicon can do
   it. **155 TF** (HIP fed) is the issue-port wall. **0.3 TF** (PM4 fed) is the occupancy wall.
-- The fat tile is the only lever past 155; it requires dyn-VGPR; dyn-VGPR requires the occupancy-dead
-  single-wave vehicle. **No third vehicle exists.** ⇒ **250–300 on a uniform fp8 GEMM is not reachable
-  on gfx1201.** This is now measured from both sides, with a pre-registered rule, not extrapolated.
+- ~~The fat tile is the only lever past 155; it requires dyn-VGPR; dyn-VGPR requires the occupancy-dead
+  single-wave vehicle. **No third vehicle exists.** ⇒ 250–300 on a uniform fp8 GEMM is not reachable
+  on gfx1201.~~
+  **SUPERSEDED (2026-06-19).** A *third vehicle* now exists and is the live winner: the **wave-group
+  cooperative GEMM** (`spike/dvgpr_occ/occ_kernel_wggemm2.s`) — neither the HIP kernel nor the
+  single-wave micro-batch. It is at **162 TF (8×2 reuse tile @ TWN=4), first config to beat HIP 161**,
+  with levers still open (KWIN=2 occupancy, big-reuse tiles). It runs on the **same raw-PM4 harness
+  that arms dyn-VGPR**, so the fat-tile lever is reachable on it — dyn-VGPR is NOT tied to the dead
+  single-wave vehicle. The "250–300 not reachable" conclusion is retracted; the climb is in progress.
 
 ---
 

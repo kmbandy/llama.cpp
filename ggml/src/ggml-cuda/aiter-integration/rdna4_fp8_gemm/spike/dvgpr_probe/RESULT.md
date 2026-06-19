@@ -37,20 +37,23 @@ is set in the kernel descriptor and the kernel is dispatched via the normal HIP 
 - The patched dispatch completed cleanly (exit 0) and the GPU stayed responsive — the
   reserved-bit gamble did **not** hang the WGP/CP. The clean-negative, not the hang.
 
-## Conclusion
-**On the R9700 / gfx1201 with ROCm 7.2, dynamic-VGPR mode cannot be armed from userspace.**
-The descriptor enable bit is silently ignored by the gfx1201 command processor (consistent with
-either the CP not reading bit 17 on this arch, or the chip-wide `SQ_DYN_VGPR` config being off —
-both privileged / firmware-level, not userspace-reachable). Combined with the toolchain analysis
-(`../FINDINGS.md`): the launch-enable is a **gfx1250 feature**, and RDNA4 wires dynamic-VGPR only
-through the `amdgpu_cs_chain` path, which the compute AQL-dispatch path does not use.
+## Conclusion (CORRECTED — the original "AMD-side wall" verdict is WRONG; see banner)
+What this probe actually showed: **the gfx1250-only `COMPUTE_PGM_RSRC3` bit 17, set via the HIP
+module / kernel-descriptor path, is ignored on gfx1201** — a true negative for *that bit on that
+path*, and the *expected* no-op (bit 17 is genuinely reserved on GFX120; see UPDATE 2).
 
-**Implication for the 300+ goal:** unlocking the dynamic-VGPR occupancy lever on the R9700 is a
-genuine **AMD-side change** — backport the gfx1250 `COMPUTE_PGM_RSRC3.ENABLE_DYNAMIC_VGPR` mechanism
-(+ `.dynamic_vgpr_en` metadata for `amdgpu_kernel` + ROCr dispatch plumbing) to gfx1201, or expose
-the cs_chain compute-dispatch path. It is not reachable by any kernel-, descriptor-, or
-runtime-level hack on the current stack. The oracle-green fp8/ml8 GEMM that would consume it is
-already written (`../../gemm_wmma.hip`, `../gemm_wmma_raw_intrinsic_verified.hip`).
+It does **NOT** mean dynamic-VGPR is unreachable on gfx1201. **dyn-VGPR IS armable on gfx1201
+COMPUTE from userspace** — the correct enable is `COMPUTE_PGM_RSRC2` **bit 6** (DYNAMIC_VGPR),
+written via **raw PM4** (`SET_SH_REG` into a KFD compute-queue IB, MES bypassed). **PROVEN in
+MAD-304** (`../dvgpr_pm4/RESULT.md`, commit `133f9d151`): deterministic `DYN_VGPR_EN` 0→1→0→1, no
+hang. The chip-wide `SQ_DYN_VGPR` gate is already open (live umr read: `0xff`). The HIP/ROCr path
+fails only because ROCr/LLVM never emit bit 6 — **not** because the silicon refuses it.
+
+**Implication for the 300+ goal:** the dynamic-VGPR occupancy lever **is reachable today** on the
+R9700 via the raw-PM4 vehicle (`../dvgpr_occ/`) — which is the whole reason that vehicle exists.
+The remaining work is engineering on that vehicle (big-reuse tiles past the 128/256-VGPR cap),
+**not** an AMD-side change. The oracle-green fp8/ml8 GEMM that consumes it is already written
+(`../../gemm_wmma.hip`, `../gemm_wmma_raw_intrinsic_verified.hip`).
 
 Files: `probe.hip`, `patch_kd.py`, `harness.cpp`, `loadonly.cpp` (sources committed; the
 `.hsaco` binaries + compiled harnesses are reproducible build artifacts, not committed).
@@ -100,8 +103,15 @@ chip-wide `SQ_DYN_VGPR`**:
 - **closed MES firmware** (gfx1201 = `gc_12_0_1_mes.bin` / `gc_12_0_1_uni_mes.bin`, both present
   on this host) → AMD-side wall.
 
-That fork is the remaining feasibility question (task #259). It needs the *real* amdgpu + Mesa
-RADV source (the local `/usr/src/linux-cachyos` tree is a sparse build tree — driver `.c` absent).
-Decisive artifacts: (1) does Mesa RADV's work-graph/dyn-VGPR path emit a `SQ_DYN_VGPR` PM4
-register write from userspace (→ open/portable), and (2) does the MES v12 queue/dispatch ABI
-(`mes_v12_api_def.h`) carry a dynamic-VGPR field (→ firmware-mediated).
+### RESOLVED (2026-06-16, MAD-304) — the "who programs SQ_DYN_VGPR / AMD-side wall" fork is closed
+Both halves answered, and neither is an AMD-side wall:
+1. **`SQ_DYN_VGPR` is already open.** Live umr read on this R9700: `regSQ_DYN_VGPR = 0xff`
+   (WAVE_LIMIT=15, FWD_PROGRESS=1, MAX_BLOCK_ALLOC=7). The chip-wide gate is wide open — not off.
+2. **The per-dispatch bit DOES arm it — when set via raw PM4, not via the HIP/ROCr path.** ROCr/LLVM
+   rebuild `compute_pgm_rsrc2` at dispatch and never emit bit 6; raw PM4 (`SET_SH_REG` into a KFD
+   compute-queue IB) sets `COMPUTE_PGM_RSRC2` bit 6 ourselves and the CP consumes it verbatim (MES
+   bypassed). Result: deterministic `DYN_VGPR_EN` 0→1→0→1, no hang — **MAD-304**, `../dvgpr_pm4/`.
+
+So the HIP-path `DYN_VGPR_EN=0` above was a *toolchain* gap (ROCr drops the bit), not silicon. The
+only live cap is the **128-VGPR dyn block** (raise to 256 via `SQ_DYN_VGPR.BLOCK_SIZE=1`, a `sudo
+umr` write). The raw-PM4 vehicle (`../dvgpr_occ/`) is the productionizing path.
