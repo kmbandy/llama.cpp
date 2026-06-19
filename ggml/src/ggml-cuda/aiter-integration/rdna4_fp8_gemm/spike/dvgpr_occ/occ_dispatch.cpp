@@ -1866,7 +1866,7 @@ static bool run_lds_bound(uint32_t node, const char* isaPath, uint32_t ldsBytes)
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: if a raw-PM4 run hangs and gets SIGKILL'd, the log still shows WHERE it died
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, WALL82 } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, BPF82, WALL82 } mode = CORRECT;
     bool fat = false;   // --fat: include >128-VGPR shapes (require umr SQ_DYN_VGPR.BLOCK_SIZE=1, cap 256)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
@@ -1916,6 +1916,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--reuse82kw2"))    mode = REUSE82KW2;
         else if (!strcmp(argv[i], "--vgpr82"))        mode = VGPR82;
         else if (!strcmp(argv[i], "--blds82"))        mode = BLDS82;
+        else if (!strcmp(argv[i], "--bpf82"))         mode = BPF82;
         else if (!strcmp(argv[i], "--wall82"))        mode = WALL82;
         else if (!strcmp(argv[i], "--fat"))       fat = true;
     }
@@ -2918,6 +2919,45 @@ int main(int argc, char** argv) {
         }
         printf("    [B-in-LDS halves the binding global B-tr feed. >162 -> feed re-cut wins (stacks with dyn later);\n");
         printf("     flat -> margin is WMMA-exposure not feed (the B-ring ds_load + dedup barrier ate the feed save).]\n");
+    } else if (mode == BPF82) {
+        // ===== MAD-305 KWINBPF on 8x2 = the RDNA equivalent of CDNA rung-7 DOUBLE-BUFFERING: prefetch next slice's
+        //   B (the binding feed) into the other of 2 ping-pong slots while WMMA runs on the current slice. Overlaps
+        //   B-load latency behind compute -> directly attacks the 162->182 WMMA-exposure gap. No new instrs, no extra
+        //   barrier (descending s_wait_loadcnt 8 keeps next-slice B in flight). >162 -> latency-hiding wins. =====
+        printf("\n=== MAD-305 8x2 + KWINBPF B-prefetch (CDNA rung-7 double-buffer equiv) vs 8x2 winner (162) ===\n");
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) ---\n");
+        { struct O { const char* name; const char* bin; int fm,fn; uint32_t lds; };
+          O ors[] = {
+            { "8x2 BPF", "occ_wggemm2_82_tw4_kwin4_bpf_st1.bin", 8, 2, 32772u },   // THE gate: symbolized ping-pong slots correctness
+          };
+          for (auto& o : ors) {
+            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, o.fm, o.lds, 26u, 0, 4, o.fn);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-10s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+          }
+        }
+        printf("    %-16s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384;
+        struct G { const char* name; const char* bin; };
+        G geoms[] = {
+            { "8x2 winner",  "occ_wggemm2_82_tw4_kwin4_pw4.bin" },
+            { "8x2 KWINBPF", "occ_wggemm2_82_tw4_kwin4_bpf.bin" },
+        };
+        uint32_t nwgs[] = { 256u, 512u, 1024u };
+        for (auto& g : geoms) {
+            printf("  --- %s (8 waves/WG, B-prefetch-one-ahead) ---\n", g.name);
+            for (uint32_t nw : nwgs) {
+                WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, 32772u, 26u, 4, 0, 2);
+                if (!r.ok) { printf("    %-16s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                printf("    %-16s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                       g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                       (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                if (r.badSamp) rc=3;
+            }
+        }
+        printf("    [KWINBPF overlaps next-slice B-load behind current WMMA. >162 -> latency-hiding wins (CDNA rung-7 lands);\n");
+        printf("     flat -> B-load already hidden by KWIN amortization, the exposure is intrinsic WMMA result-latency.]\n");
     } else if (mode == WALL82) {
         // ===== MAD-305 8x2 WALL ATTRIBUTION: after 8x2 broke 4x4's wall (162 vs 149), what is 8x2's NEW wall?
         //   FED / FEEDONLY / NOFEED at saturated 65536^2 x K16384, occupancy-matched (vgprField 26), FED full-oracle.

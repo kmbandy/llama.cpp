@@ -240,6 +240,16 @@ echo "      reuse-tile KWIN=2 bins: 82_tw4_kwin2_pw2 (8x2 perf, half LDS ring) +
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -Wa,-defsym,BLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_blds_st1.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_blds_st1.o occ_wggemm2_82_tw4_kwin4_blds_st1.bin
 echo "      reuse-tile B-in-LDS bins: 82_tw4_kwin4_blds (8x2 perf, dedup B) + 82_tw4_kwin4_blds_st1 (oracle) built"
+# REUSE-TILE 8x2 @ TWN=4 + KWINBPF (MAD-305 CDNA-rung-7 DOUBLE-BUFFER equivalent): B-prefetch-one-ahead. Issue next
+#   slice's B (global_load_tr) into the OTHER of 2 ping-pong slots (FB / FB+4FN) while WMMA runs on the current
+#   slice -> overlaps the binding B-load latency behind compute, hiding the 162->182 WMMA-exposure. NO new instrs,
+#   NO extra barrier (A stays on dscnt, B-only loadcnt with s_wait_loadcnt 8 descending). Slots symbolized for 8x2
+#   (FB=192 -> 192/200, no FA collision). perf (STORE=0) + STORE=1 oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf.o occ_wggemm2_82_tw4_kwin4_bpf.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_st1.o occ_wggemm2_82_tw4_kwin4_bpf_st1.bin
+echo "      reuse-tile KWINBPF bins: 82_tw4_kwin4_bpf (8x2 perf, B-prefetch double-buffer) + _bpf_st1 (oracle) built"
 
 # LDS-FREE A (ANOLDS): per-wave global A, no LDS, no barriers (issue-density structural test). perf (STORE=0) + oracle (STORE=1).
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_perf.o

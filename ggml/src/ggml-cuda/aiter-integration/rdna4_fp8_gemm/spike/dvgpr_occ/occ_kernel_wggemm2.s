@@ -973,7 +973,7 @@ occ_kernel:
     .set u, 0
     .rept KWIN
       .if (u + 1) < KWIN
-        .set BN, (176 + (((u + 1) & 1) * 16))   // prefetch B[t+u+1] into the other slot, advance s20
+        .set BN, (FB + (((u + 1) & 1) * (4*FN)))   // prefetch B[t+u+1] into the other slot, advance s20 (slots FB / FB+4FN; 4x4 FB=176 -> 176/192, 8x2 FB=192 -> 192/200)
         .set ni, 0
         .rept FN
           global_load_tr_b64 v[BN+ni*2:BN+ni*2+1], v9, s[20:21] offset:ni*256
@@ -1000,12 +1000,12 @@ occ_kernel:
         .set kk, kk+1
       .endr
       .if (u + 1) < KWIN
-        s_wait_loadcnt 8                        // B[t+u] landed; B[t+u+1]'s 8 stay in flight
+        s_wait_loadcnt (2*FN)                  // B[t+u] landed; keep next slice's 2*FN B-loads in flight (4x4=8, 8x2=4)
       .else
         s_wait_loadcnt 0x0
       .endif
       s_wait_dscnt 0x0
-      .set BC, (176 + ((u & 1) * 16))           // 32 WMMA with B slot (u&1)
+      .set BC, (FB + ((u & 1) * (4*FN)))           // 32 WMMA with B slot (u&1)  (FB / FB+4FN; matches the BN prefetch slots)
       .set kk, 0
       .rept 2
         .set mi, 0
