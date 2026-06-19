@@ -1,5 +1,15 @@
 # Dynamic-VGPR arm-probe on gfx1201 — RESULT: bit ignored (clean negative, no hang)
 
+> ⚠️ **VERDICT OVERTURNED (2026-06-16).** This doc's conclusion — "dynamic-VGPR cannot be
+> armed from userspace on gfx1201 / AMD-side wall / not reachable by any hack" — is **WRONG**
+> and applies only to the **HIP-module / kernel-descriptor path tested here** (which sets the
+> *gfx1250-only* `COMPUTE_PGM_RSRC3` bit 17, genuinely reserved on gfx1201). The **correct**
+> gfx1201 enable is `COMPUTE_PGM_RSRC2` **bit 6** (DYNAMIC_VGPR), and it **IS armable from
+> userspace via raw PM4** on a KFD compute queue — **PROVEN in MAD-304** (`../dvgpr_pm4/RESULT.md`,
+> commit `133f9d151`): deterministic `DYN_VGPR_EN` 0→1→0→1, no hang, MES bypassed. The chip-wide
+> `SQ_DYN_VGPR` gate is already open (0xff). **Do NOT cite this doc as evidence dyn-VGPR is
+> locked/dead on gfx1201.** Kept below for the historical probe record of the *HIP path only*.
+
 **Date:** 2026-06-15. **Hardware:** AMD R9700 / gfx1201 (RDNA4), HIP device 0.
 
 ## Question

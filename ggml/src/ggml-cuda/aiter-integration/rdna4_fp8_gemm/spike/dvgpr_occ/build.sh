@@ -122,6 +122,227 @@ for st in 0 4 16 64; do
 done
 echo "      occ_mbgemm_4x4_b1_st{0,4,16,64}_d0.bin"
 
+# WAVE-GROUP skeleton (MAD-305 Phase 1): 4-wave (128-thread) cooperative workgroup, grid-stride TGID
+# tile decode, SMOKE per-wave decode mark. Proves the workgroup forms + lane/wave mapping + coverage.
+echo "[1f] wave-group skeleton smoke -> occ_wggemm_smoke.bin (TWM=2 TWN=2 SMOKE=1)"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+    -Wa,-defsym,TWM=2 -Wa,-defsym,TWN=2 -Wa,-defsym,SMOKE=1 \
+    -c occ_kernel_wggemm.s -o occ_wggemm_smoke.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm_smoke.o occ_wggemm_smoke.bin
+echo "      occ_wggemm_smoke.bin: $(wc -c < occ_wggemm_smoke.bin) bytes"
+
+# WAVE-GROUP atomic-claim + LDS-broadcast smoke (MAD-305 Phase 1 pivot): raw-PM4 TGID is unavailable,
+# so the leader atomic-claims a tile and broadcasts it to the 4 waves via LDS+barrier. Proves LDS
+# alloc (RSRC2.GRANULATED_LDS_SIZE) + barrier + atomic distribution. Also the SGPR probe kernel.
+echo "[1g] wave-group LDS-broadcast smoke + SGPR probe -> occ_wglds.bin, occ_wgdiag.bin"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,TWM=2 -Wa,-defsym,TWN=2 \
+    -c occ_kernel_wglds.s -o occ_wglds.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wglds.o occ_wglds.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c occ_kernel_wgdiag.s -o occ_wgdiag.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wgdiag.o occ_wgdiag.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c occ_kernel_ldsbound.s -o occ_ldsbound.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_ldsbound.o occ_ldsbound.bin
+echo "      occ_wglds.bin: $(wc -c < occ_wglds.bin) bytes, occ_wgdiag.bin: $(wc -c < occ_wgdiag.bin) bytes, occ_ldsbound.bin: $(wc -c < occ_ldsbound.bin) bytes"
+
+# Phase 2/3: 4-wave cooperative fp8 GEMM compute (A-LDS + B-global_load_tr + static 4x4). G2 vehicle.
+# STORE=1 (default) = full 16-frag diagnostic store for the oracle (--wggemm-compute).
+# STORE=0 = minimal acc[0][0]-only store for perf (--wggemm-perf) so the 16x diagnostic store traffic
+#           doesn't mask compute throughput at the G2 parity gate.
+echo "[1h] wave-group fp8 GEMM compute -> occ_wggemm2.bin (STORE=1) + occ_wggemm2_perf.bin (STORE=0)"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c occ_kernel_wggemm2.s -o occ_wggemm2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2.o occ_wggemm2.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -c occ_kernel_wggemm2.s -o occ_wggemm2_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_perf.o occ_wggemm2_perf.bin
+echo "      occ_wggemm2.bin: $(wc -c < occ_wggemm2.bin) B, occ_wggemm2_perf.bin: $(wc -c < occ_wggemm2_perf.bin) B"
+# matched FEEDONLY on the real DBUF==1 path: identical feed (loads/prefetch/barriers/waits), WMMA skipped
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,FEEDONLY=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_feedonly_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_feedonly_perf.o occ_wggemm2_feedonly_perf.bin
+echo "      occ_wggemm2_feedonly_perf.bin: $(wc -c < occ_wggemm2_feedonly_perf.bin) B (DBUF==1 feed, no WMMA)"
+# A-LDS-ring K-WINDOW: amortize the publish barrier over KWIN K-tiles (GPT structural lever). NTILES%KWIN==0.
+for U in 2 4 8; do
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=$U -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin$U.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin$U.o occ_wggemm2_kwin$U.bin
+done
+# B-prefetch-one-ahead (KWINBPF=1): 2 B slots, hide the per-slice B wait inside the window
+for U in 2 4; do
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=$U -Wa,-defsym,KWINBPF=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin${U}_bpf.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin${U}_bpf.o occ_wggemm2_kwin${U}_bpf.bin
+done
+# 2-wide publish (KWINPUB2=1): overlap 2 A-slices' loads per wait -> halve publish A-load exposure
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPUB2=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin4_pub2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin4_pub2.o occ_wggemm2_kwin4_pub2.bin
+# single-reuse-barrier (KWINNOTAIL=1): drop the tail barrier. STORE=1 oracle (tail + notail) for the RACE gate; STORE=0 perf.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin4_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin4_st1.o occ_wggemm2_kwin4_st1.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINNOTAIL=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin4nt_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin4nt_st1.o occ_wggemm2_kwin4nt_st1.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINNOTAIL=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin4_notail.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin4_notail.o occ_wggemm2_kwin4_notail.bin
+echo "      occ_wggemm2_kwin{2,4,8}.bin + kwin{2,4}_bpf.bin + kwin4_pub2.bin + kwin4{_st1,nt_st1,_notail}.bin built"
+
+# [1h+] SATURATED SUSTAIN sweep binaries (the --sustain feed-lever A/B). publish-width grid (KWINPW) + per-tile
+#   NOFEED ceilings. KWINPW slots: w0->v16 w1->v176 w2->v192 w3->v200 (field-26 headroom). 128x128 = 4-wave 2x2-grid.
+for PW in 2 4; do
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=$PW -c occ_kernel_wggemm2.s -o occ_wggemm2_kwin4_pw$PW.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_kwin4_pw$PW.o occ_wggemm2_kwin4_pw$PW.bin
+done
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,NOFEED=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_nofeed4_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_nofeed4_perf.o occ_wggemm2_nofeed4_perf.bin
+# LARGER TILE (MAD-305 step): TWN=4 -> 8-wave 128x256 cooperative tile (A-strip reused by 4 N-waves; A-feed halved).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,NOFEED=1 -Wa,-defsym,TWN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_tw4_nofeed.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_tw4_nofeed.o occ_wggemm2_tw4_nofeed.bin
+for PW in 2 4; do
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=$PW -Wa,-defsym,TWN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_tw4_kwin4_pw$PW.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_tw4_kwin4_pw$PW.o occ_wggemm2_tw4_kwin4_pw$PW.bin
+done
+echo "      sustain bins: kwin4_pw{2,4} + nofeed4_perf + tw4_{nofeed,kwin4_pw2,kwin4_pw4} (TWN=4 128x256) built"
+
+# REUSE-TILE 8x2 (MAD-305 B-feed lever): FM=8 FN=2 @ TWN=4 -> per-wave 128x32 quadrant, 256x128 claimed tile.
+#   HALVES the binding per-wave B global_load_tr feed (B-tr/MAC 0.25->0.125) at the cost of 2x A-LDS reads.
+#   acc=128 VGPR (v32-159), A-frags FA=v160-191, B-frags FB=v192-199, pub-slots v200-207 -> max v207 = field26
+#   (occupancy-matched to 4x4@TWN4). LDS = KWIN*ATILE = 4*(256*32) = 32768 (+ti) -> harness passes ldsBytes 32772.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_pw4.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_pw4.o occ_wggemm2_82_tw4_kwin4_pw4.bin
+# STORE=1 full-fragment oracle bins (4x4@TWN4 sanity + 8x2@TWN4 gate): all FM*FN frags stored for CPU wmma_ref check
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_tw4_kwin4_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_tw4_kwin4_st1.o occ_wggemm2_tw4_kwin4_st1.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_st1.o occ_wggemm2_82_tw4_kwin4_st1.bin
+# 8x2 wall-attribution variants: FEEDONLY (KWIN feed, no WMMA) + NOFEED (WMMA ceiling, no feed)
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,FEEDONLY=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_pw4_feedonly.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_pw4_feedonly.o occ_wggemm2_82_tw4_kwin4_pw4_feedonly.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,NOFEED=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_nofeed.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_nofeed.o occ_wggemm2_82_tw4_nofeed.bin
+# REUSE-TILE 8x2 @ TWN=2 (MAD-305 residency lever): same FM=8 FN=2 (B-tr/MAC=0.125) but 4-wave WGs -> +50% resident
+#   waves (768 vs 512 @ TWN4) to re-hide the WMMA exposed at TWN4 (FED/FO 0.887). A-fill = NBANDS=FM/TWN=4 bands
+#   (general band-sequential publish path). Same LDS = KWIN*ATILE = 32768 (+ti) -> ldsBytes 32772 (ATILE TWN-invariant).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=2 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_kwin4_pw4.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_kwin4_pw4.o occ_wggemm2_82_kwin4_pw4.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,TWN=2 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_kwin4_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_kwin4_st1.o occ_wggemm2_82_kwin4_st1.bin
+echo "      reuse-tile bins: 82_tw4_kwin4_pw4 (8x2 perf) + {tw4,82_tw4}_kwin4_st1 (oracle) + 82_tw4_{kwin4_pw4_feedonly,nofeed} (wall) built"
+echo "      reuse-tile TWN=2 bins: 82_kwin4_pw4 (8x2 perf, NBANDS=4) + 82_kwin4_st1 (oracle) built"
+
+# LDS-FREE A (ANOLDS): per-wave global A, no LDS, no barriers (issue-density structural test). perf (STORE=0) + oracle (STORE=1).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_anolds_perf.o occ_wggemm2_anolds_perf.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_anolds_st1.o occ_wggemm2_anolds_st1.bin
+# COALESCING DIAGNOSTIC: ANOLDS with v11=lane*8 (coalesced A access, WRONG DATA) -> isolates strided-access cost.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -Wa,-defsym,ACOAL=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_coal_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_anolds_coal_perf.o occ_wggemm2_anolds_coal_perf.bin
+echo "      anolds bins: occ_wggemm2_anolds_{perf,st1,coal_perf}.bin (LDS-free A + coalescing diag) built"
+# LDS-FREE A via global_load_tr (COALESCED A-shuf) -- the real fix. perf (STORE=0) + oracle (STORE=1).
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDSTR=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anoldstr_perf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_anoldstr_perf.o occ_wggemm2_anoldstr_perf.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,ANOLDSTR=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anoldstr_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_anoldstr_st1.o occ_wggemm2_anoldstr_st1.bin
+echo "      anoldstr bins: occ_wggemm2_anoldstr_{perf,st1}.bin (LDS-free A via global_load_tr) built"
+
+# MAD-305 Step A: FEED-ONLY depth-P pipeline bandwidth probe. No WMMA/LDS/barrier; keeps PDEPTH slices of
+# FRAGS b64 loads in flight via s_wait_loadcnt((P-1)*FRAGS). (P-1)*FRAGS must be <=63 -> F=8 for P<=8, F=4 @ P=16.
+echo "[1i] feed-only depth-P pipeline bandwidth probe -> occ_feedpipe_p{1,2,4,8}_f8 + p16_f4"
+for P in 1 2 4 8; do
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+        -Wa,-defsym,PDEPTH=$P -Wa,-defsym,FRAGS=8 -c occ_kernel_feedpipe.s -o occ_feedpipe_p${P}_f8.o
+    "$L/llvm-objcopy" -O binary --only-section=.text occ_feedpipe_p${P}_f8.o occ_feedpipe_p${P}_f8.bin
+done
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+    -Wa,-defsym,PDEPTH=16 -Wa,-defsym,FRAGS=4 -c occ_kernel_feedpipe.s -o occ_feedpipe_p16_f4.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedpipe_p16_f4.o occ_feedpipe_p16_f4.bin
+echo "      occ_feedpipe_p{1,2,4,8}_f8.bin + occ_feedpipe_p16_f4.bin"
+
+# MAD-305 Step A localization ladder: add 4-wave / barrier / LDS-A-share couplings back onto the 123 GB/s
+# baseline one at a time (GPT rungs 1-5). Same body; WAVES/BARRIER/LDSMODE toggles. barrier=s_barrier_signal/wait.
+echo "[1j] Step A localization ladder -> occ_feedladder_r{1..5}.bin"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,WAVES=1 -Wa,-defsym,BARRIER=0 -Wa,-defsym,LDSMODE=0 -c occ_kernel_feedladder.s -o occ_feedladder_r1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedladder_r1.o occ_feedladder_r1.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,WAVES=4 -Wa,-defsym,BARRIER=0 -Wa,-defsym,LDSMODE=0 -c occ_kernel_feedladder.s -o occ_feedladder_r2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedladder_r2.o occ_feedladder_r2.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,WAVES=4 -Wa,-defsym,BARRIER=1 -Wa,-defsym,LDSMODE=0 -c occ_kernel_feedladder.s -o occ_feedladder_r3.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedladder_r3.o occ_feedladder_r3.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,WAVES=4 -Wa,-defsym,LDSMODE=1 -c occ_kernel_feedladder.s -o occ_feedladder_r4.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedladder_r4.o occ_feedladder_r4.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,WAVES=4 -Wa,-defsym,LDSMODE=2 -c occ_kernel_feedladder.s -o occ_feedladder_r5.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_feedladder_r5.o occ_feedladder_r5.bin
+echo "      occ_feedladder_r{1,2,3,4,5}.bin"
+
+# MAD-305 Step A rung 6: is B's global_load_tr_b64 the FED wall? 6a tr+synthetic, 6b tr+real Bshuf addr,
+# 6d plain global_load_b64 + real Bshuf (negative control). (6c = 6b binary at real VGPR/LDS residency.)
+echo "[1k] rung 6 B-transpose-load probe -> occ_btr_6{a,b,d}.bin"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,TR=1 -Wa,-defsym,BADDR=0 -c occ_kernel_btr.s -o occ_btr_6a.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_btr_6a.o occ_btr_6a.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,TR=1 -Wa,-defsym,BADDR=1 -c occ_kernel_btr.s -o occ_btr_6b.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_btr_6b.o occ_btr_6b.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,TR=0 -Wa,-defsym,BADDR=1 -c occ_kernel_btr.s -o occ_btr_6d.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_btr_6d.o occ_btr_6d.bin
+echo "      occ_btr_6{a,b,d}.bin"
+
+echo "[1k+] Lever A micro-oracle: global_load_tr_b128 fp8 fragment semantics -> occ_btr128.bin"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -c occ_kernel_btr128.s -o occ_btr128.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_btr128.o occ_btr128.bin
+echo "      occ_btr128.bin: $(wc -c < occ_btr128.bin) bytes"
+
+# MAD-305 Step A phase timers: PROFILE build of the real BLADDER FEEDONLY kernel (sampled in-kernel
+# realtime timers around the K-loop; 1 profiler wave -> per-phase tick-sums in occ[8..15]). Non-PROFILE
+# builds are byte-identical (all timer code is under .if PROFILE).
+echo "[1l] real FED phase-timer build -> occ_wggemm2_prof.bin (DEFAULT DBUF==0 path = the 1.4 TF FED; PROFILE=1 STORE=0)"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,PROFILE=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_prof.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_prof.o occ_wggemm2_prof.bin
+echo "      occ_wggemm2_prof.bin: $(wc -c < occ_wggemm2_prof.bin) B"
+
+# [1m] rung 8: inert per-WG phase-stagger sweep (DBUF==1 path; STORE=0, STAGGER=1, NON-PROFILE).
+#   STAGGER=0 build is byte-identical to occ_wggemm2_perf.bin (gate verified by cmp below). MASK=0 is the
+#   delay==0 control (stagger code present, zero loop iters). Sweep MASK at SHIFT5 + two SHIFT probes @MASK15.
+echo "[1m] rung 8 inert per-WG stagger sweep -> occ_wggemm2_stag_m{MASK}_s{SHIFT}.bin"
+build_stag() {  # $1=MASK $2=SHIFT
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
+    -Wa,-defsym,STORE=0 -Wa,-defsym,STAGGER=1 -Wa,-defsym,STAGGER_MASK=$1 -Wa,-defsym,STAGGER_SHIFT=$2 \
+    -c occ_kernel_wggemm2.s -o occ_wggemm2_stag_m$1_s$2.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_stag_m$1_s$2.o occ_wggemm2_stag_m$1_s$2.bin
+}
+for M in 0 3 7 15 31; do build_stag $M 5; done
+build_stag 15 4
+build_stag 15 6
+# gate: STAGGER=0 must be byte-identical to the perf bin (proves the inert path doesn't change non-stagger codegen)
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,STAGGER=0 -c occ_kernel_wggemm2.s -o occ_wggemm2_stag0.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_stag0.o occ_wggemm2_stag0.bin
+if cmp -s occ_wggemm2_stag0.bin occ_wggemm2_perf.bin; then echo "      STAGGER=0 byte-identical to perf bin: OK"; else echo "      *** STAGGER=0 DIFFERS from perf bin -- gate FAILED ***"; fi
+echo "      stagger bins: $(ls -1 occ_wggemm2_stag_m*_s*.bin | wc -l) built ($(wc -c < occ_wggemm2_stag_m15_s5.bin) B each)"
+
+# [1n] rung 9: bisect the PROFILE 70x. Each PB variant adds ONE PROFILE ingredient to the real DBUF==1 path
+#   (STORE=0, non-PROFILE, non-STAGGER). PB=0 (default) == occ_wggemm2_perf.bin (inherits the byte-id gate).
+#   PB1 = per-K sendmsg+kmcnt (all-wave); PB2 = per-tile leader token atomic; PB3 = per-K cmp/branch skeleton
+#   (all-wave); PB4 = per-K inert busy-loop (all-wave, control vs PB1).
+echo "[1n] rung 9 PROFILE-70x bisection -> occ_wggemm2_pb{1,2,3,4}.bin"
+for P in 1 2 3 4; do
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,PB=$P \
+    -c occ_kernel_wggemm2.s -o occ_wggemm2_pb$P.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_pb$P.o occ_wggemm2_pb$P.bin
+done
+echo "      pb bins: $(ls -1 occ_wggemm2_pb*.bin | wc -l) built (pb1=$(wc -c < occ_wggemm2_pb1.bin) pb2=$(wc -c < occ_wggemm2_pb2.bin) pb3=$(wc -c < occ_wggemm2_pb3.bin) pb4=$(wc -c < occ_wggemm2_pb4.bin) B)"
+
+# [1o] STACK LADDER: rebuild the fast feed from a known-good core, +1 obligation/rung (TF/GB/s/proof each).
+echo "[1o] stack ladder rung 1 (load-only truthful base) -> occ_stack_r1.bin"
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,RUNG=1 -c occ_kernel_stack.s -o occ_stack_r1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_stack_r1.o occ_stack_r1.bin
+echo "      occ_stack_r1.bin: $(wc -c < occ_stack_r1.bin) B"
+
+# [1p] CLEAN PM4 streaming bandwidth probe -> occ_bw_{read,copy,write}_b{32,64,128}.bin (prove near-spec BW)
+echo "[1p] clean PM4 bandwidth probe -> occ_bw_*.bin"
+bw() {  # $1=MODE $2=LDW $3=UNROLL $4=name
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,MODE=$1 -Wa,-defsym,LDW=$2 -Wa,-defsym,UNROLL=$3 -c occ_kernel_bw.s -o occ_bw_$4.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_bw_$4.o occ_bw_$4.bin
+}
+bw 0 4  32 read_b32
+bw 0 8  16 read_b64
+bw 0 16 8  read_b128
+bw 1 16 8  copy_b128
+bw 2 16 8  write_b128
+bw 0 8  4  read_b64_u4    # MLP-depth scrutiny: is 45/85 GB/s MLP-limited? (b64 read, UNROLL 4 vs 8 vs 16)
+bw 0 8  8  read_b64_u8
+echo "      bw bins: $(ls -1 occ_bw_*.bin | wc -l) built (read_b128=$(wc -c < occ_bw_read_b128.bin) B)"
+
 echo "[2/3] oracle self-test"
 clang++ -std=c++17 test_fp8_oracle.cpp fp8_oracle.cpp -o test_oracle
 ./test_oracle

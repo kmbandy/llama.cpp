@@ -162,6 +162,14 @@ Of the three candidate mechanisms:
 **Mechanism verdict: (iii) — not reachable from the HIP/ROCr compute path on this
 stack.** (Emitting the instruction is easy; *arming the launch mode* is the wall.)
 
+> ⚠️ **UPDATE (2026-06-16) — this verdict is about the HIP/ROCr/HSA-runtime path ONLY, and
+> that path turned out to be a detour, not the wall.** dyn-VGPR **IS armable on gfx1201 from
+> userspace** by going *under* HIP/ROCr: raw **PM4 on a KFD compute queue** writing
+> `COMPUTE_PGM_RSRC2` **bit 6** (DYNAMIC_VGPR) via `SET_SH_REG` — **PROVEN in MAD-304**
+> (`dvgpr_pm4/RESULT.md`, commit `133f9d151`): deterministic `DYN_VGPR_EN` 0→1, no hang, MES
+> bypassed. The right gfx1201 enable is RSRC2.bit6, **not** the gfx1250-only RSRC3.bit17 probed
+> in `dvgpr_probe/`. **This is the entire reason the spike uses the raw-PM4 / libhsakmt vehicle.**
+
 ---
 
 ## Reachability Verdict (so far): **NEEDS-HSA-PATH (effectively NO-GO on the HIP path)**
