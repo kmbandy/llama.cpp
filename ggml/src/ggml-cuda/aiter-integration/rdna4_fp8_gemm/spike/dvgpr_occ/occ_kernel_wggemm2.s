@@ -56,6 +56,14 @@
 .ifndef KWINBPF
     .set KWINBPF, 0                         // KWIN consume: 1 = B-prefetch one slice ahead (2 B slots Bcur=176/Bnext=192,
 .endif                                      //     loadcnt B-only since A is from LDS). Hides the per-slice B wait. 0 = simple.
+.ifndef SETPRIO
+    .set SETPRIO, 0                         // 1 = s_setprio 1 around the per-slice WMMA burst, s_setprio 0 during feed (CDNA rung-9
+.endif                                      //     gap-filler equivalent): bias the issue port toward WMMA-phase waves so they issue
+                                            //     dense back-to-back while feed-phase waves yield. KWINBPF consume path.
+.ifndef ALD2
+    .set ALD2, 0                            // 1 = WIDE A-read: ds_load_2addr_stride64_b64 loads 2 M-frags/instr (offset*512 == the
+.endif                                      //     mi*512 frag stride, ISA 37307) -> halves A-read issue slots (16->8/slice) so more
+                                            //     dispatch goes to WMMA. Same addresses/bytes as b64 (oracle-identical). KWINBPF path.
 .ifndef KWINPUB2
     .set KWINPUB2, 0                        // KWIN publish: 1 = overlap 2 A-slices' global loads per wait (v16-23 + v176-183)
 .endif                                      //     -> KWIN/2 waits instead of KWIN. Halves publish A-load exposure. KWIN even.
@@ -991,6 +999,18 @@ occ_kernel:
         s_addc_u32 s21, s21, 0
       .endif
       .set kk, 0                                // A-frags from LDS slot u
+.if ALD2
+      // WIDE A-read: 2 M-frags per ds_load_2addr_stride64_b64 (base=v11+u*ATILE+kk*16, offset0/1 = mi at *512 stride).
+      .rept 2
+        v_add_nc_u32 v15, (u*ATILE + kk*16), v11
+        .set p, 0
+        .rept (FM/2)
+          ds_load_2addr_stride64_b64 v[FA+(kk*FM+p*2)*2:FA+(kk*FM+p*2)*2+3], v15 offset0:(p*2) offset1:(p*2+1)
+          .set p, p+1
+        .endr
+        .set kk, kk+1
+      .endr
+.else
       .rept 2
         .set mi, 0
         .rept FM
@@ -999,6 +1019,7 @@ occ_kernel:
         .endr
         .set kk, kk+1
       .endr
+.endif
       .if (u + 1) < KWIN
         s_wait_loadcnt (2*FN)                  // B[t+u] landed; keep next slice's 2*FN B-loads in flight (4x4=8, 8x2=4)
       .else
@@ -1006,6 +1027,9 @@ occ_kernel:
       .endif
       s_wait_dscnt 0x0
       .set BC, (FB + ((u & 1) * (4*FN)))           // 32 WMMA with B slot (u&1)  (FB / FB+4FN; matches the BN prefetch slots)
+.if SETPRIO
+      s_setprio 0                                  // YIELD during WMMA: let cross-wave WMMAs round-robin/interleave (the
+.endif                                             //   actual latency-hider on RDNA's shared issue port -- do NOT monopolize)
       .set kk, 0
       .rept 2
         .set mi, 0
@@ -1019,6 +1043,9 @@ occ_kernel:
         .endr
         .set kk, kk+1
       .endr
+.if SETPRIO
+      s_setprio 1                                  // RAISE during feed: get this slice's B-prefetch + A-load issued fast
+.endif                                             //   and out of the way, then drop back to 0 for the WMMA interleave
       .set u, u+1
     .endr
 .else

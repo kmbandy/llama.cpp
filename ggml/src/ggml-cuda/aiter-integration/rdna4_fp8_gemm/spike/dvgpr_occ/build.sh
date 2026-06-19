@@ -250,6 +250,28 @@ echo "      reuse-tile B-in-LDS bins: 82_tw4_kwin4_blds (8x2 perf, dedup B) + 82
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_st1.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_st1.o occ_wggemm2_82_tw4_kwin4_bpf_st1.bin
 echo "      reuse-tile KWINBPF bins: 82_tw4_kwin4_bpf (8x2 perf, B-prefetch double-buffer) + _bpf_st1 (oracle) built"
+# 4x4 @ TWN=4 + KWINBPF (tile x lever interaction: does the double-buffer help a higher-B-feed tile MORE?)
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,TWN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_tw4_kwin4_bpf.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_tw4_kwin4_bpf.o occ_wggemm2_tw4_kwin4_bpf.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,TWN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_tw4_kwin4_bpf_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_tw4_kwin4_bpf_st1.o occ_wggemm2_tw4_kwin4_bpf_st1.bin
+echo "      4x4 KWINBPF bins: tw4_kwin4_bpf (perf) + _bpf_st1 (oracle) built"
+# 8x2 + KWINBPF + SETPRIO (MAD-305 CDNA rung-9 scheduling equiv, STACKS on the 165 winner): s_setprio 1 around the
+#   per-slice WMMA burst, s_setprio 0 during feed -> bias the issue port toward WMMA-phase waves (denser back-to-back
+#   WMMA, the gap-filler version of CDNA wave ping-pong). perf (STORE=0) + STORE=1 oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp.o occ_wggemm2_82_tw4_kwin4_bpf_sp.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.bin
+echo "      KWINBPF+SETPRIO bins: 82_tw4_kwin4_bpf_sp (perf) + _bpf_sp_st1 (oracle) built"
+# 8x2 + KWINBPF + SETPRIO + ALD2 (MAD-305 issue-slot lever, the "fewer dispatch slots on feed" axis): wide A-read via
+#   ds_load_2addr_stride64_b64 loads 2 M-frags/instr (offset*512 == mi*512 frag stride) -> A-reads 16->8/slice ->
+#   more dispatch bandwidth to WMMA. Same LDS addresses/bytes (oracle-identical). perf (STORE=0) + STORE=1 oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,ALD2=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_a2.o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,ALD2=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.bin
+echo "      wide-A-read bins: 82_tw4_kwin4_bpf_sp_a2 (perf) + _bpf_sp_a2_st1 (oracle) built"
 
 # LDS-FREE A (ANOLDS): per-wave global A, no LDS, no barriers (issue-density structural test). perf (STORE=0) + oracle (STORE=1).
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_perf.o
