@@ -4167,6 +4167,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             ))
             .run();
 
+        // Missing opening <think>: the model dives straight into reasoning and only closes
+        // with </think>. Must still be captured as reasoning, not bled into content
+        // (regression test for the n_thinking=0 bleed on plain chat).
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Missing opening <think> with a trailing tool call after the reasoning block.
+        tst.test("I need to call a function</think>"
+                 "Let me check the time.<|tool_call_start|>[get_time(city=\"Paris\")]<|tool_call_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_time_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "I need to call a function", "Let me check the time.", { { "get_time", "{\"city\":\"Paris\"}" } }
+            ))
+            .run();
+
         // Fake tool call marker inside reasoning is not parsed as a call
         tst.test("<think>Let me think about <|tool_call_start|>[special_function(arg1=1)]<|tool_call_end|> hmm</think>"
                  "<|tool_call_start|>[special_function(arg1=1)]<|tool_call_end|>")
