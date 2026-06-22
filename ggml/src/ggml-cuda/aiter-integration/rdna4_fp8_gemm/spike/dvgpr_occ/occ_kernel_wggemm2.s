@@ -19,6 +19,7 @@
 //
 // User data (USER_SGPR=15):
 //   s0:s1=occ  s2:s3=A  s4:s5=Bshuf  s6:s7=C  s8=K(bytes/A-row)  s9=NT*256  s10=NTL_MASK  s11=NTL_LOG2
+//     (GENDIV=1: s10=magic s11=NTL)
 //   s12=NTILES(K/32)  s13=TOTAL
 // LDS: [0..4095]=A tile (128x32 fp8), [4096..4099]=ti broadcast.  -> request 4100 B (units=9, 4608).
 //
@@ -44,10 +45,33 @@
 .ifndef NOBAR
     .set NOBAR, 0                           // 1 = skip the per-K-tile workgroup barriers (DBUF=0 path) -- INCORRECT (LDS race),
 .endif                                      //     perf-only probe to attribute barrier cost.
+// WSPEC: wave specialization (MAD-305 L2). Builds on BLDS (B-ring). When 1, WSNLOAD extra loader-only waves
+//   (wid >= WAVES) fill the B-ring while the WAVES compute waves do ds_load+WMMA ONLY (no global B in their
+//   stream) -> moves feed out of the compute issue stream (attacks the NOFEED 282 -> FED 164 penalty). The
+//   existing per-K-window publish barrier (s_barrier) is the producer->consumer sync. WSNLOAD is configurable
+//   (sweep 1/2/4); WSPEC=0 = off (byte-identical winner). Harness launches (WAVES+WSNLOAD) waves/WG.
+.ifndef WSPEC
+    .set WSPEC, 0
+.endif
+.ifndef WSNLOAD
+    .set WSNLOAD, 0                         // # loader-only waves added on top of the WAVES compute waves
+.endif
+.if WSPEC
+    .if !BLDS
+        .error "WSPEC requires BLDS=1 (loaders fill the B-ring; compute waves drain it)"
+    .endif
+    .if WSNLOAD < 1
+        .error "WSPEC=1 needs WSNLOAD>=1 (at least one loader wave)"
+    .endif
+.endif
 .ifndef BLADDER
     .set BLADDER, 0                         // 1 = fine descending s_wait_loadcnt ladder on JIT-B (single-buffer A). HIP
 .endif                                      //     WMMABUF_WAIT: load all 8 B frags up front, release 0x7->0x0 so the first
                                             //     WMMA fires when frag-0 lands. Implies DBUF=0 (build with DBUF=0).
+.ifndef GENDIV
+    .set GENDIV, 0                          // 0 = pow2 mask/shift tile decode (default). 1 = magic-reciprocal (round-up)
+.endif                                       //     decode: tile_row=mul_hi(ti,magic), tile_col=ti-row*NTL -> exact for
+                                             //     non-pow2 NTL. s10:=magic=ceil(2^32/NTL), s11:=NTL. Default branch only.
 .ifndef KWIN
     .set KWIN, 0                            // 0 = off. >=2 = A-LDS-ring K-WINDOW: publish KWIN A-slices into KWIN LDS
 .endif                                      //     slots, ONE barrier, consume KWIN slices (32*KWIN WMMA), barrier before reuse.
@@ -69,12 +93,12 @@
 .endif                                      //     -> KWIN/2 waits instead of KWIN. Halves publish A-load exposure. KWIN even.
 .ifndef KWINPW
     .set KWINPW, 1                          // PUBLISH WIDTH: A-slices whose global loads are issued before each s_wait (MLP
-.endif                                      //     depth). 1=plain, 2=old 2-wide. Slots w0->v16 w1->v176 w2->v192 w3->v200 (v192-207
-.if KWINPUB2                                //     = field-26 headroom above v191; no occ cost). Must divide KWIN; max 4.
-    .set KWINPW, 2                          // back-compat: KWINPUB2=1 == publish width 2
+.endif                                      //     depth). 1=plain, 2=old 2-wide. Slots PUBW0..PUBW3 (tile-relative; see the
+.if KWINPUB2                                //     PUBW .set block below). Winner (16-frag) = v16/v176/v192/v200; lean tiles pack
+    .set KWINPW, 2                          //     just above acc. Must divide KWIN; max 4. (back-compat: KWINPUB2=1 == width 2)
 .endif
 .if KWINPW > 4
-    .error "KWINPW max 4 (only 4 register slots: v16/v176/v192/v200)"
+    .error "KWINPW max 4 (only 4 publish register slots: PUBW0..PUBW3)"
 .endif
 .ifndef KWINNOBAR
     .set KWINNOBAR, 0                       // KWIN PERF PROBE: 1 = strip BOTH KWIN barriers (publish + tail). INCORRECT
@@ -155,8 +179,10 @@
     .set TWM_LOG2, 1
 .elseif TWM == 4
     .set TWM_LOG2, 2
+.elseif TWM == 8
+    .set TWM_LOG2, 3
 .else
-    .error "TWM must be 1, 2 or 4"
+    .error "TWM must be 1, 2, 4 or 8"
 .endif
 .if TWN == 1
     .set TWN_LOG2, 0
@@ -164,10 +190,12 @@
     .set TWN_LOG2, 1
 .elseif TWN == 4
     .set TWN_LOG2, 2
+.elseif TWN == 8
+    .set TWN_LOG2, 3                        // 16-wave WG @ TWM=2: 256x256 square cooperative tile (MAD-305 big-tile lever)
 .else
-    .error "TWN must be 1, 2 or 4"
+    .error "TWN must be 1, 2, 4 or 8"
 .endif
-.set WAVES,      TWM*TWN                    // waves per workgroup (4 @ 2x2, 8 @ 2x4, 16 @ 4x4)
+.set WAVES,      TWM*TWN                    // waves per workgroup (4 @ 2x2, 8 @ 2x4, 16 @ 2x8/4x4)
 .set WG_LOG2,    TWM_LOG2+TWN_LOG2+5        // log2(WAVES*32) = log2(workgroup threads)
 .ifndef FM
     .set FM, 4                              // per-wave accumulator rows in frags (4 = 64-row quadrant; 2 = 32-row, 2x2 occ test)
@@ -183,11 +211,21 @@
 .set TM,    TWM*FM*16                       // claimed-tile M rows (128 @ 4x4, 64 @ 2x2)
 .set ATILE, TM*32                           // A-tile bytes in LDS (4096 @ 4x4, 2048 @ 2x2)
 .set BTILE, TWN*(2*FN*256)                  // B-in-LDS per-slice bytes (TWN wave_n * 2 kk * FN frags * 256)
+// LDSTRIM (MAD-305, RGA-surfaced): the KWIN A-ring is KWIN*ATILE (=32768 @ 8x2 winner) and the 4-byte ti-broadcast
+//   scratch sits JUST PAST it -> 32772, which rounds up a full 512B LDS granule to alloc=33280 -> only 1 WG fits a
+//   64KB WGP. LDSTRIM=1 overlaps the ti-broadcast into A-ring slot 0 (byte 0) -> total LDS = 32768 = alloc 32768 ->
+//   2 WGs per WGP (occupancy candidate). The overlap races the broadcast-read vs slot-0 A-fill -> closed by one
+//   s_barrier after the broadcast read (per-tile, amortized over the K-loop). Default 0 = winner byte-identical.
+.ifndef LDSTRIM
+    .set LDSTRIM, 0
+.endif
 .if ANOLDS || ANOLDSTR
     .set TI_OFF, 0                          // LDS-FREE: no A tile; ti-broadcast scratch sits at byte 0 (~512B LDS total)
 .elseif KWIN
   .if BLDS
     .set TI_OFF, KWIN*ATILE + KWIN*BTILE    // KWIN A-ring + KWIN B-ring, ti past both (KWIN=2: 8192+8192=16384)
+  .elseif LDSTRIM
+    .set TI_OFF, 0                          // LDSTRIM: overlap ti-broadcast into A-ring slot 0 -> LDS = KWIN*ATILE (32768)
   .else
     .set TI_OFF, KWIN*ATILE                 // KWIN A-slots; ti broadcast just past the ring
   .endif
@@ -199,13 +237,13 @@
 // shift amounts (FM,FN are powers of 2): A-read wave_m*(FM*512); tile_row*(TM); B tile_col*(FN*512); wave_n*(FN*256)
 .if FM == 8
     .set AROW_SH, 12                        // wave_m * 4096   (128-row quadrant half; FM=8 reuse tile, TWM=2 -> TM=256)
-    .set TROW_SH, 8                         // tile_row * 256
+    .set TROW_SH, 7 + TWM_LOG2             // tile_row * TM = log2(TWM*FM*16); 8 @ TWM=2 (TM=256), 9 @ TWM=4 (TM=512)
 .elseif FM == 4
     .set AROW_SH, 11                        // wave_m * 2048   (64-row quadrant half)
-    .set TROW_SH, 7                         // tile_row * 128
+    .set TROW_SH, 6 + TWM_LOG2             // tile_row * TM = log2(TWM*FM*16); 7 @ TWM=2 (TM=128), 8 @ TWM=4 (TM=256)
 .elseif FM == 2
     .set AROW_SH, 10                        // wave_m * 1024   (32-row quadrant half)
-    .set TROW_SH, 6                         // tile_row * 64
+    .set TROW_SH, 5 + TWM_LOG2             // tile_row * TM = log2(TWM*FM*16); 6 @ TWM=2 (TM=64), 7 @ TWM=4 (TM=128)
 .else
     .error "unsupported FM (only 2, 4, or 8)"
 .endif
@@ -215,6 +253,19 @@
     .set WN_SH,   9                         // wave_n * (FN*256)=512
 .else
     .error "unsupported FN (only 2 or 4)"
+.endif
+// log2(FM*FN) = #accumulator frags per wave (16 frags @ 8x2/4x4, 8 @ 4x2 lean). The STORE=1 oracle
+//   per-wave C stride = FM*FN*1024 B; this was HARDCODED to 16384 (=16 frags) and faulted for FM*FN!=16.
+.if FM*FN == 4
+    .set FMFN_LOG2, 2
+.elseif FM*FN == 8
+    .set FMFN_LOG2, 3
+.elseif FM*FN == 16
+    .set FMFN_LOG2, 4
+.elseif FM*FN == 32
+    .set FMFN_LOG2, 5
+.else
+    .error "unsupported FM*FN (need 4/8/16/32 accumulator frags)"
 .endif
 // tile_col stride in Bshuf = full tile N-width = TWN * (FN*256) bytes -> shift = WN_SH + TWN_LOG2.
 // (Bshuf is [kt][n_frag][16x16] tile-major = tile-size-agnostic; the kernel indexes absolute N-frags,
@@ -247,10 +298,71 @@
 .if BLDS && KWIN && KWINBPF
     .error "BLDS requires KWINBPF=0 (B-in-LDS uses the simple KWIN consume, not the B-prefetch path)"
 .endif
+// ===== B128: 128-bit B feed (MAD-305). RDNA4 has NO 128-bit transpose for 8-bit data, so the
+//   transpose is moved to the CPU preshuffle (mbg_preshuffle_B128 -> frag-ready, lane-linear 512B
+//   blocks). The device then does a PLAIN global_load_b128 (vaddr=lane*16) that delivers TWO K=16
+//   B-frags/instr (kk0=low 8B v[R:R+1], kk1=high 8B v[R+2:R+3]) -> halves B-load issue slots vs
+//   4x global_load_tr_b64. CPU-proven byte-identical to the tr_b64 feed. Block stride doubles to
+//   512B so WN_SH/TCOL_SH each +1; per-slice advance stays 2*s9 (=NT*512, s9 kept at NT*256).
+.ifndef B128
+    .set B128, 0
+.endif
+.if B128
+    .if !KWINBPF
+        .error "B128 requires KWINBPF=1 (the plain-b128 frag-ready feed lives in the KWINBPF consume path)"
+    .endif
+    .if BLDS
+        .error "B128 incompatible with BLDS (B128 feeds B from global, not LDS)"
+    .endif
+    .set WN_SH,   WN_SH + 1                  // frag-ready blocks are 512B (was 256B) -> +1
+    .set TCOL_SH, TCOL_SH + 1
+.endif
+// TILEORD: persistent tile-claim order (MAD-305 L1). 0 = default A-stationary (tile_col = ti & NTL_MASK,
+//   N fastest). 1 = N_STATIONARY (tile_row = ti & MTL_MASK, M fastest -> B/N panel L2 reuse). The harness
+//   swaps the s10/s11 mask/shift to MTL-based and mirrors the decode in the oracle.
+.ifndef TILEORD
+    .set TILEORD, 0
+.endif
 // compacted frag bases for the NOFEED/BLADDER paths: fa right after acc, fb right after fa.
 // (4x4 -> FA=160, FB=176 = unchanged; 2x2 -> FA=64, FB=72 so max VGPR ~80 -> ~16 waves/SIMD.)
 .set FA, ACC + FM*FN*8                      // fa holds 2*FM frags (2 kk)
 .set FB, FA + 2*FM*2                        // fb holds 2*FN frags (all B for the K-tile)
+// ---- KWIN A-publish slot bases (MAD-305 occupancy fix). The publish temps (one b128 + a NBANDS>1 high
+//   half per slot) are pure transients: live ONLY between each slice's global_load_b128 and the matching
+//   ds_store_b128, all BEFORE the publish barrier -> the consume's FA/FB frag region is still DEAD there.
+//   They must merely be a free window ABOVE the acc high-water mark (acc = v[ACC..ACC+8*FM*FN-1]); the low
+//   addressing temps (v0-v15, v24) sit below acc. The bases WERE hardcoded 16/176/192/200, which aliased
+//   the winner's B-frag region (free during publish, zero cost) but FORCED every lean tile to reserve up to
+//   v207 -> killed lean occupancy. Now TILE-RELATIVE: for the 16-frag winner (FM*FN==16) they evaluate to
+//   the EXACT old 16/176/192/200 (byte-identical 8x2/4x4); for leaner tiles they pack into a contiguous
+//   4-slot window (8 regs/slot, holding the +4 high half for NBANDS>1) starting at FA == acc_top+1, so a
+//   lean tile's max VGPR index tracks max(consume-top, publish-top) instead of a fixed 207. Each slot's
+//   low half = v[PUBWx:PUBWx+3], high half (NBANDS>1) = v[PUBWx+4:PUBWx+7]; 8-reg spacing preserves that.
+.if FM*FN == 16
+    .set PUBW0, 16
+    .set PUBW1, 176
+    .set PUBW2, 192
+    .set PUBW3, 200
+.else
+    .set PUBW0, FA                          // FA == ACC + 8*FM*FN == acc_top+1: first free reg above the live acc
+    .set PUBW1, FA + 8
+    .set PUBW2, FA + 16
+    .set PUBW3, FA + 24
+.endif
+// Highest VGPR index the publish window touches (top slot's high half if NBANDS>1, else its low b128).
+.if NBANDS > 1
+    .set PUB_TOP, PUBW3 + 7
+.else
+    .set PUB_TOP, PUBW3 + 3
+.endif
+// Kernel VGPR high-water = max(publish top, consume top). Consume (KWIN+KWINBPF) tops out at the B
+//   double-buffer end FB + 8*FN - 1 (2 slots x 2 kk x FN frags x 2 regs); A-frag region FA+4*FM-1 and acc
+//   ACC+8*FM*FN-1 are both below it. PUB_MAXV+1 is the dispatch next_free_vgpr -> vf = ceil((PUB_MAXV+1)/8).
+.if (FB + 8*FN - 1) > PUB_TOP
+    .set PUB_MAXV, FB + 8*FN - 1
+.else
+    .set PUB_MAXV, PUB_TOP
+.endif
 
 // ---- BSUB curB, prefB: one K-tile (index s26) for the BDBUF pipeline. A single-buffer (As[0]);
 // B for THIS tile already resident in bregs[curB]; prefetch tile s26+1's B into bregs[prefB] (its
@@ -328,7 +440,11 @@ occ_kernel:
     v_lshrrev_b32 v3, TWN_LOG2, v1          // wave_m = wid >> log2(TWN)   (wid = wave_m*TWN + wave_n)
     v_and_b32     v4, (TWN-1), v1           // wave_n = wid & (TWN-1)
     v_mov_b32     v7, 0
+.if B128
+    v_lshlrev_b32 v9, 4, v2                 // v9 = lane*16 (B128 plain-b128 frag-ready vaddr: 2 K-frags/lane)
+.else
     v_lshlrev_b32 v9, 3, v2                 // v9 = lane*8 (B trfeed vaddr)
+.endif
     v_lshlrev_b32 v10, 5, v2                // v10 = lane*32 (C store)
     v_mov_b32     v24, TI_OFF
 .if BLDS
@@ -417,15 +533,23 @@ occ_kernel:
     v_mov_b32 v5, BAND                       // grab BAND contiguous tiles with ONE atomic
     global_atomic_add_u32 v8, v7, v5, s[0:1] offset:20 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
     s_wait_loadcnt 0x0
-    ds_store_b32 v24, v8                     // LDS[TI_OFF] = base_ti
+.if WAVES > 1
+    ds_store_b32 v24, v8                     // LDS[TI_OFF] = base_ti  (CROSS-WAVE broadcast; single-wave skips this)
     s_wait_dscnt 0x0
+.endif
 .Lafter_claim:
     s_mov_b32 exec_lo, s16
-    s_barrier_signal -1
+.if WAVES > 1
+    s_barrier_signal -1                      // cross-wave publish/consume of base_ti (pointless for a 1-wave WG)
     s_barrier_wait -1
     ds_load_b32 v8, v24
     s_wait_dscnt 0x0
-    v_readfirstlane_b32 s38, v8             // base_ti (broadcast to all 4 waves)
+.endif
+    v_readfirstlane_b32 s38, v8             // base_ti: WAVES==1 reads lane0's atomic result directly (no LDS/barrier); multi-wave reads LDS[TI_OFF]
+.if LDSTRIM
+    s_barrier_signal -1
+    s_barrier_wait -1                        // LDSTRIM: all waves must read base_ti from LDS[0] BEFORE any wave's
+.endif                                       //   A-fill overwrites slot 0 (ti-broadcast overlaps A-ring slot 0)
     s_mov_b32 s39, 0                         // local band index
 .Lband:
     s_add_u32  s17, s38, s39                 // ti = base_ti + local  (NO atomic inside the band)
@@ -433,8 +557,22 @@ occ_kernel:
     s_cbranch_scc1 .Lexit
 
     // ---- decode tile_row/col, B col base, row_base_K ----
-    s_lshr_b32 s18, s17, s11                 // tile_row
-    s_and_b32  s19, s17, s10                 // tile_col
+.if TILEORD == 1
+    // N_STATIONARY (B-panel L2 locality, MAD-305 L1): consecutive ti share tile_col (B panel) and
+    // sweep tile_row -> a B/N panel stays hot in L2 across the M-sweep. Harness passes s11=log2MTL,
+    // s10=MTL_MASK for this mode (correctness is claim-order invariant; oracle mirrors the swap).
+    s_and_b32  s18, s17, s10                 // tile_row = ti & MTL_MASK
+    s_lshr_b32 s19, s17, s11                 // tile_col = ti >> log2MTL
+.else
+.if GENDIV
+    s_mul_hi_u32 s18, s17, s10               // tile_row = ti/NTL  (s10 := magic = ceil(2^32/NTL))
+    s_mul_i32    s19, s18, s11               // s19 = tile_row*NTL  (s11 := NTL)
+    s_sub_u32    s19, s17, s19               // tile_col = ti - tile_row*NTL = ti%NTL
+.else
+    s_lshr_b32 s18, s17, s11                 // tile_row = ti >> log2NTL  (default: A-stationary, N fastest)
+    s_and_b32  s19, s17, s10                 // tile_col = ti & NTL_MASK
+.endif
+.endif
     // s_Bbase = Bshuf + tile_col*(FN*512) + wave_n*(FN*256)   (nt_base*256, nt_base=tile_col*(FN*2)+wave_n*FN)
     v_readfirstlane_b32 s22, v4             // wave_n (scalar)
     s_lshl_b32 s23, s19, TCOL_SH             // tile_col*(FN*512)  (2048 @ 4x4, 1024 @ 2x2)
@@ -556,18 +694,120 @@ occ_kernel:
     // ===== LDS-FREE A via global_load_tr (COALESCED -- the fix for ANOLDS's strided catastrophe). A fed EXACTLY
     //   like B: from an A-shuf via global_load_tr (coalesced DRAM read + HW transpose -> the A-frag). No LDS, no
     //   barriers. A base s46:47 (Ashuf + mt_base*256), kk1 @ +s14 (MT*256); B base s20:21 (Bshuf), kk1 @ +s9. =====
+    // LEAN register packing (MAD-305 L4): pack A frags just past the accumulators and B just past A, both
+    //   config-derived, so allocation tracks the lean tile (FM*FN) instead of the winner's fixed v160/v168.
+    //   FIXES the FM>=4 A/B alias (old FB=168 overlapped A's v160+4*FM span) AND tightens VGPR alloc for occupancy.
+    //   8x2 -> FA=160 (winner-region unchanged); 4x2 -> FA=96/FB=112; 2x2 -> FA=64/FB=72.
+    .set FA, ACC + 8*FM*FN                    // A base = just past acc[FM*FN][8] (ACC=32)
+    .set FB, FA + 4*FM                        // B base = just past A's 4*FM-reg span (was fixed 168 -> aliased A @ FM>=4)
+    .ifndef LEANBPF
+        .set LEANBPF, 0                       // 1 = software-pipelined double-buffer prefetch-one-ahead (MAD-305 RGA fix)
+    .endif
+.if LEANBPF
+    // ===== LEANBPF: software-pipelined double-buffer prefetch-one-ahead (MAD-305, RGA-surfaced). The naive loop
+    //   below did [2*FM A + 2*FN B loads -> s_wait_loadcnt 0 -> 2*FM*FN WMMA] per K-tile, exposing the FULL VRAM
+    //   latency every tile (the ~63 TF wall, confirmed in the disasm). Here we prefetch tile t+1 into the OTHER
+    //   feed buffer while computing tile t, so load latency hides behind WMMA (the KWINBPF lever, ported to the
+    //   single-wave global-A/global-B path). buf0 = FA/FB; buf1 just past it. EVERY prefetch is GUARDED by
+    //   (target tile index < NTILES) so it can NEVER read past the exactly-tight buffer end -> NO OOB (lean_bounds_sim
+    //   still bounds all loads at tile NTILES-1; worst case = wrong-results the oracle catches, never a fault/brick).
+    //   NTILES need not be even. LPT = loads/tile = 2*FM+2*FN (the wait target while a prefetch is in flight). =====
+    .set FA1, FB + 4*FN                        // buf1 A base (just past buf0's B span)
+    .set FB1, FA1 + 4*FM                       // buf1 B base
+    .set LPT, 2*FM + 2*FN                      // global_load_tr count per tile
+    .macro LLDT a, b                           // load tile at s46/s20 into (a,b), then advance s46/s20 to next tile
+      .set mi, 0
+      .rept FM
+        global_load_tr_b64 v[\a+mi*2:\a+mi*2+1], v9, s[46:47] offset:mi*256
+        .set mi, mi+1
+      .endr
+      s_add_u32  s48, s46, s14
+      s_addc_u32 s49, s47, 0
+      .set mi, 0
+      .rept FM
+        global_load_tr_b64 v[\a+(FM+mi)*2:\a+(FM+mi)*2+1], v9, s[48:49] offset:mi*256
+        .set mi, mi+1
+      .endr
+      .set ni, 0
+      .rept FN
+        global_load_tr_b64 v[\b+ni*2:\b+ni*2+1], v9, s[20:21] offset:ni*256
+        .set ni, ni+1
+      .endr
+      s_add_u32  s44, s20, s9
+      s_addc_u32 s45, s21, 0
+      .set ni, 0
+      .rept FN
+        global_load_tr_b64 v[\b+(FN+ni)*2:\b+(FN+ni)*2+1], v9, s[44:45] offset:ni*256
+        .set ni, ni+1
+      .endr
+      s_lshl_b32 s43, s14, 1
+      s_add_u32  s46, s46, s43
+      s_addc_u32 s47, s47, 0
+      s_lshl_b32 s43, s9, 1
+      s_add_u32  s20, s20, s43
+      s_addc_u32 s21, s21, 0
+    .endm
+    .macro LWMT a, b                           // 2*FM*FN WMMA (2 kk x FM x FN) from buffer (a,b) into ACC
+      .set kk, 0
+      .rept 2
+        .set mi, 0
+        .rept FM
+          .set ni, 0
+          .rept FN
+            v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[\a+(kk*FM+mi)*2:\a+(kk*FM+mi)*2+1], v[\b+(kk*FN+ni)*2:\b+(kk*FN+ni)*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+            .set ni, ni+1
+          .endr
+          .set mi, mi+1
+        .endr
+        .set kk, kk+1
+      .endr
+    .endm
+    LLDT FA, FB                                // PROLOGUE: load tile 0 -> buf0 (s46/s20 now at tile 1)
+    s_mov_b32 s26, 0                           // s26 = t = current compute tile (counts by 2)
+.Lkt_bpf:
+    s_add_u32  s27, s26, 1                     // t+1
+    s_cmp_lt_u32 s27, s12                      // t+1 < NTILES ?
+    s_cbranch_scc0 .Lbpf_wait0_all            //   no -> nothing to prefetch; wait ALL of buf0
+    LLDT FA1, FB1                              //   yes -> prefetch tile t+1 -> buf1 (advance to t+2)
+    s_wait_loadcnt LPT                         //   buf0 done (buf1's LPT still in flight)
+    s_branch .Lbpf_comp0
+.Lbpf_wait0_all:
+    s_wait_loadcnt 0x0                         // last tile: only buf0 outstanding -> wait everything
+.Lbpf_comp0:
+.if FEEDONLY == 0
+    LWMT FA, FB                                // compute tile t from buf0
+.endif
+    s_cmp_lt_u32 s27, s12                      // does tile t+1 exist? (s27 = t+1)
+    s_cbranch_scc0 .Lkt_bpf_done              //   no (NTILES odd, t was last) -> done
+    s_add_u32  s28, s26, 2                     // t+2
+    s_cmp_lt_u32 s28, s12                      // t+2 < NTILES ?
+    s_cbranch_scc0 .Lbpf_wait1_all            //   no -> nothing to prefetch; wait ALL of buf1
+    LLDT FA, FB                                //   yes -> prefetch tile t+2 -> buf0 (advance to t+3)
+    s_wait_loadcnt LPT                         //   buf1 done (buf0's LPT still in flight)
+    s_branch .Lbpf_comp1
+.Lbpf_wait1_all:
+    s_wait_loadcnt 0x0                         // last tile: only buf1 outstanding -> wait everything
+.Lbpf_comp1:
+.if FEEDONLY == 0
+    LWMT FA1, FB1                              // compute tile t+1 from buf1
+.endif
+    s_add_u32  s26, s26, 2
+    s_cmp_lt_u32 s26, s12
+    s_cbranch_scc1 .Lkt_bpf
+.Lkt_bpf_done:
+.else
     s_mov_b32 s26, 0                          // t = slice index (0..NTILES-1)
 .Lkt_loop:
     .set mi, 0                                // A frags: FM via global_load_tr (kk0 @ s46, kk1 @ s46+s14), offset mi*256
     .rept FM
-      global_load_tr_b64 v[160+mi*2:160+mi*2+1], v9, s[46:47] offset:mi*256
+      global_load_tr_b64 v[FA+mi*2:FA+mi*2+1], v9, s[46:47] offset:mi*256
       .set mi, mi+1
     .endr
     s_add_u32  s48, s46, s14
     s_addc_u32 s49, s47, 0
     .set mi, 0
     .rept FM
-      global_load_tr_b64 v[160+(FM+mi)*2:160+(FM+mi)*2+1], v9, s[48:49] offset:mi*256
+      global_load_tr_b64 v[FA+(FM+mi)*2:FA+(FM+mi)*2+1], v9, s[48:49] offset:mi*256
       .set mi, mi+1
     .endr
     .set ni, 0                                // B frags: FN via global_load_tr (kk0 @ s20, kk1 @ s20+s9), unchanged
@@ -607,6 +847,7 @@ occ_kernel:
     s_add_u32 s26, s26, 1
     s_cmp_lt_u32 s26, s12
     s_cbranch_scc1 .Lkt_loop
+.endif
 .elseif NOFEED
     // ===== NOFEED compute-ceiling probe: fill A once, read 8 A + 8 B frags ONCE, K-loop = 32 WMMA only
     //       (no per-K feed, no barriers). Result is garbage; measures the wave-group WMMA-only ceiling. =====
@@ -793,8 +1034,9 @@ occ_kernel:
 .Lkt_loop:
     // ---- PUBLISH: cooperatively load A-slices [t, t+KWIN) into LDS slots 0..KWIN-1 ----
     // ---- PUBLISH width KWINPW: issue KWINPW slices' A global-loads, ONE s_wait, KWINPW ds_stores. ----
-    //   Each slice = 2x b128 (128-row A-strip = two 64-row halves). Reg slots by w: 0->v16, 1->v176 (B-frag
-    //   regs, free in publish), 2->v192, 3->v200 (v192-207 = field-26 headroom above the v191 top, no occ cost).
+    //   Each slice = 2x b128 (128-row A-strip = two 64-row halves). Reg slots by w: PUBW0..PUBW3 (tile-relative,
+    //   see the .set PUBW block up top). Winner (16-frag) -> v16/v176/v192/v200 (alias the free B-frag region,
+    //   zero occ cost); lean tiles -> packed just above acc so their max VGPR tracks the tile, not a fixed v207.
     //   v24 (ti-broadcast) untouched. KWINPW=1 == plain publish; KWINPW=2 == old 2-wide. Must divide KWIN.
     .if KWIN != (KWIN/KWINPW)*KWINPW
         .error "KWINPW must divide KWIN"
@@ -821,13 +1063,13 @@ occ_kernel:
             .set bb, bb+1
           .endr
           .if w == 0
-            global_load_b128 v[16:19],   v15, s[2:3]
+            global_load_b128 v[PUBW0:PUBW0+3], v15, s[2:3]
           .elseif w == 1
-            global_load_b128 v[176:179], v15, s[2:3]
+            global_load_b128 v[PUBW1:PUBW1+3], v15, s[2:3]
           .elseif w == 2
-            global_load_b128 v[192:195], v15, s[2:3]
+            global_load_b128 v[PUBW2:PUBW2+3], v15, s[2:3]
           .else
-            global_load_b128 v[200:203], v15, s[2:3]
+            global_load_b128 v[PUBW3:PUBW3+3], v15, s[2:3]
           .endif
           .set w, w+1
         .endr
@@ -835,13 +1077,13 @@ occ_kernel:
         .set w, 0
         .rept KWINPW                             // store band b: base v12, band folded into the LDS immediate
           .if w == 0
-            ds_store_b128 v12, v[16:19]   offset:((p*KWINPW+0)*ATILE + b*(TWM*TWN*512))
+            ds_store_b128 v12, v[PUBW0:PUBW0+3] offset:((p*KWINPW+0)*ATILE + b*(TWM*TWN*512))
           .elseif w == 1
-            ds_store_b128 v12, v[176:179] offset:((p*KWINPW+1)*ATILE + b*(TWM*TWN*512))
+            ds_store_b128 v12, v[PUBW1:PUBW1+3] offset:((p*KWINPW+1)*ATILE + b*(TWM*TWN*512))
           .elseif w == 2
-            ds_store_b128 v12, v[192:195] offset:((p*KWINPW+2)*ATILE + b*(TWM*TWN*512))
+            ds_store_b128 v12, v[PUBW2:PUBW2+3] offset:((p*KWINPW+2)*ATILE + b*(TWM*TWN*512))
           .else
-            ds_store_b128 v12, v[200:203] offset:((p*KWINPW+3)*ATILE + b*(TWM*TWN*512))
+            ds_store_b128 v12, v[PUBW3:PUBW3+3] offset:((p*KWINPW+3)*ATILE + b*(TWM*TWN*512))
           .endif
           .set w, w+1
         .endr
@@ -860,28 +1102,28 @@ occ_kernel:
         s_add_u32  s27, s25, s27
         v_add_nc_u32 v15, v14, s27
         .if w == 0
-          global_load_b128 v[16:19],   v15, s[2:3]
+          global_load_b128 v[PUBW0:PUBW0+3], v15, s[2:3]
           .if NBANDS > 1
             v_add_nc_u32 v15, v15, s29
-            global_load_b128 v[20:23], v15, s[2:3]
+            global_load_b128 v[PUBW0+4:PUBW0+7], v15, s[2:3]
           .endif
         .elseif w == 1
-          global_load_b128 v[176:179], v15, s[2:3]
+          global_load_b128 v[PUBW1:PUBW1+3], v15, s[2:3]
           .if NBANDS > 1
             v_add_nc_u32 v15, v15, s29
-            global_load_b128 v[180:183], v15, s[2:3]
+            global_load_b128 v[PUBW1+4:PUBW1+7], v15, s[2:3]
           .endif
         .elseif w == 2
-          global_load_b128 v[192:195], v15, s[2:3]
+          global_load_b128 v[PUBW2:PUBW2+3], v15, s[2:3]
           .if NBANDS > 1
             v_add_nc_u32 v15, v15, s29
-            global_load_b128 v[196:199], v15, s[2:3]
+            global_load_b128 v[PUBW2+4:PUBW2+7], v15, s[2:3]
           .endif
         .else
-          global_load_b128 v[200:203], v15, s[2:3]
+          global_load_b128 v[PUBW3:PUBW3+3], v15, s[2:3]
           .if NBANDS > 1
             v_add_nc_u32 v15, v15, s29
-            global_load_b128 v[204:207], v15, s[2:3]
+            global_load_b128 v[PUBW3+4:PUBW3+7], v15, s[2:3]
           .endif
         .endif
         .set w, w+1
@@ -890,24 +1132,24 @@ occ_kernel:
       .set w, 0
       .rept KWINPW
         .if w == 0
-          ds_store_b128 v12, v[16:19]   offset:((p*KWINPW+0)*ATILE)
+          ds_store_b128 v12, v[PUBW0:PUBW0+3] offset:((p*KWINPW+0)*ATILE)
           .if NBANDS > 1
-            ds_store_b128 v13, v[20:23] offset:((p*KWINPW+0)*ATILE)
+            ds_store_b128 v13, v[PUBW0+4:PUBW0+7] offset:((p*KWINPW+0)*ATILE)
           .endif
         .elseif w == 1
-          ds_store_b128 v12, v[176:179] offset:((p*KWINPW+1)*ATILE)
+          ds_store_b128 v12, v[PUBW1:PUBW1+3] offset:((p*KWINPW+1)*ATILE)
           .if NBANDS > 1
-            ds_store_b128 v13, v[180:183] offset:((p*KWINPW+1)*ATILE)
+            ds_store_b128 v13, v[PUBW1+4:PUBW1+7] offset:((p*KWINPW+1)*ATILE)
           .endif
         .elseif w == 2
-          ds_store_b128 v12, v[192:195] offset:((p*KWINPW+2)*ATILE)
+          ds_store_b128 v12, v[PUBW2:PUBW2+3] offset:((p*KWINPW+2)*ATILE)
           .if NBANDS > 1
-            ds_store_b128 v13, v[196:199] offset:((p*KWINPW+2)*ATILE)
+            ds_store_b128 v13, v[PUBW2+4:PUBW2+7] offset:((p*KWINPW+2)*ATILE)
           .endif
         .else
-          ds_store_b128 v12, v[200:203] offset:((p*KWINPW+3)*ATILE)
+          ds_store_b128 v12, v[PUBW3:PUBW3+3] offset:((p*KWINPW+3)*ATILE)
           .if NBANDS > 1
-            ds_store_b128 v13, v[204:207] offset:((p*KWINPW+3)*ATILE)
+            ds_store_b128 v13, v[PUBW3+4:PUBW3+7] offset:((p*KWINPW+3)*ATILE)
           .endif
         .endif
         .set w, w+1
@@ -964,6 +1206,12 @@ occ_kernel:
     //   prologue issues B[t+0]; each iter issues B[t+u+1] then s_wait_loadcnt 8 retires B[u] (newest 8 = B[u+1] stay
     //   in flight, hidden behind slice u's WMMA). gfx12 loadcnt is in-order. Slice u -> B slot (u&1).
     .set ni, 0                                // prologue: B[t+0] -> slot0, advance s20
+.if B128
+    .rept FN                                  // one b128/ni: kk0=v[R:R+1], kk1=v[R+2:R+3]  (R=FB+ni*4)
+      global_load_b128 v[FB+ni*4:FB+ni*4+3], v9, s[20:21] offset:ni*512
+      .set ni, ni+1
+    .endr
+.else
     .rept FN
       global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[20:21] offset:ni*256
       .set ni, ni+1
@@ -975,6 +1223,7 @@ occ_kernel:
       global_load_tr_b64 v[FB+(FN+ni)*2:FB+(FN+ni)*2+1], v9, s[44:45] offset:ni*256
       .set ni, ni+1
     .endr
+.endif
     s_lshl_b32 s43, s9, 1
     s_add_u32  s20, s20, s43
     s_addc_u32 s21, s21, 0
@@ -983,6 +1232,12 @@ occ_kernel:
       .if (u + 1) < KWIN
         .set BN, (FB + (((u + 1) & 1) * (4*FN)))   // prefetch B[t+u+1] into the other slot, advance s20 (slots FB / FB+4FN; 4x4 FB=176 -> 176/192, 8x2 FB=192 -> 192/200)
         .set ni, 0
+.if B128
+        .rept FN                                   // one b128/ni into slot BN (kk0=v[R:R+1], kk1=v[R+2:R+3], R=BN+ni*4)
+          global_load_b128 v[BN+ni*4:BN+ni*4+3], v9, s[20:21] offset:ni*512
+          .set ni, ni+1
+        .endr
+.else
         .rept FN
           global_load_tr_b64 v[BN+ni*2:BN+ni*2+1], v9, s[20:21] offset:ni*256
           .set ni, ni+1
@@ -994,6 +1249,7 @@ occ_kernel:
           global_load_tr_b64 v[BN+(FN+ni)*2:BN+(FN+ni)*2+1], v9, s[44:45] offset:ni*256
           .set ni, ni+1
         .endr
+.endif
         s_lshl_b32 s43, s9, 1
         s_add_u32  s20, s20, s43
         s_addc_u32 s21, s21, 0
@@ -1021,7 +1277,11 @@ occ_kernel:
       .endr
 .endif
       .if (u + 1) < KWIN
+.if B128
+        s_wait_loadcnt FN                      // B128: slice = FN b128 (was 2*FN b64); keep next slice's FN in flight
+.else
         s_wait_loadcnt (2*FN)                  // B[t+u] landed; keep next slice's 2*FN B-loads in flight (4x4=8, 8x2=4)
+.endif
       .else
         s_wait_loadcnt 0x0
       .endif
@@ -1036,7 +1296,11 @@ occ_kernel:
         .rept FM
           .set ni, 0
           .rept FN
+.if B128
+            v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA+(kk*FM+mi)*2:FA+(kk*FM+mi)*2+1], v[BC+ni*4+kk*2:BC+ni*4+kk*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+.else
             v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA+(kk*FM+mi)*2:FA+(kk*FM+mi)*2+1], v[BC+(kk*FN+ni)*2:BC+(kk*FN+ni)*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+.endif
             .set ni, ni+1
           .endr
           .set mi, mi+1
@@ -1401,9 +1665,10 @@ occ_kernel:
 
     v_readfirstlane_b32 s22, v1             // wid (scalar)
 .if STORE
-    // ---- STORE=1: 16 frags FLAT: C + ti*(WAVES*16384) + wid*16384 + frag*1024 ----
-    s_lshl_b32 s23, s17, (TWM_LOG2+TWN_LOG2+14)   // ti*(WAVES*16384)  (65536 @ 4-wave 2x2)
-    s_lshl_b32 s24, s22, 14                  // wid*16384
+    // ---- STORE=1: FM*FN frags FLAT: C + ti*(WAVES*FM*FN*1024) + wid*(FM*FN*1024) + frag*1024 ----
+    //   per-wave stride = FM*FN*1024 B (16384 @ 16 frags, 8192 @ 8-frag lean). Was hardcoded +14/16384 -> OOB page-fault for FM*FN!=16.
+    s_lshl_b32 s23, s17, (TWM_LOG2+TWN_LOG2+10+FMFN_LOG2)   // ti*(WAVES*FM*FN*1024)
+    s_lshl_b32 s24, s22, (10+FMFN_LOG2)      // wid*(FM*FN*1024)
     s_add_u32  s23, s23, s24
     s_add_u32  s28, s6, s23
     s_addc_u32 s29, s7, 0
@@ -1483,3 +1748,35 @@ occ_kernel:
     s_mov_b32 exec_lo, s16
     s_endpgm
     .size occ_kernel, .-occ_kernel
+
+// RGADESC (MAD-305): analysis-only AMDHSA kernel descriptor so Radeon GPU Analyzer (rga -s bin --co) can
+//   identify the kernel and emit per-kernel ISA / live-VGPR / occupancy. Default 0 -> NOT emitted (the PM4
+//   harness sets RSRC1/RSRC2 itself and reads .text via objcopy, so the production .o is byte-identical and
+//   the .text is unchanged either way -> the live-register profile RGA reports IS the real kernel's). The
+//   declared counts mirror the dispatch (v0-206 used; LDS 32772). Build occ_..._rga.o with -defsym,RGADESC=1.
+.ifndef RGADESC
+    .set RGADESC, 0
+.endif
+.if RGADESC
+.amdhsa_kernel occ_kernel
+    .amdhsa_next_free_vgpr PUB_MAXV + 1      // tile-relative: 208 @ 16-frag winner, lean tiles much lower
+    .amdhsa_next_free_sgpr 46
+    .amdhsa_group_segment_fixed_size 32772
+.end_amdhsa_kernel
+.amdgpu_metadata
+---
+amdhsa.version: [ 1, 2 ]
+amdhsa.kernels:
+  - .name:            occ_kernel
+    .symbol:          occ_kernel.kd
+    .kernarg_segment_size: 64
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 32772
+    .private_segment_fixed_size: 0
+    .wavefront_size:  32
+    .sgpr_count:      46
+    .vgpr_count:      207
+    .max_flat_workgroup_size: 256
+    .args:            []
+.end_amdgpu_metadata
+.endif

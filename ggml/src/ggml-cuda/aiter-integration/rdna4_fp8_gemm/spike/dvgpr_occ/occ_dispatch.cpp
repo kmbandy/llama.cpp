@@ -34,12 +34,14 @@
 
 #include "hsakmt/hsakmt.h"
 #include "pm4_defs.h"        // -I ../dvgpr_pm4  (register offsets + RSRC builders + vendored encoder)
+#include "pm4_perf.h"        // GL2C perfcounter encoders + verified gfx12 register map (in-ring DRAM meter)
 #include "fp8_oracle.h"
 #include "frag_layout.h"
 
 // ---- the dgpu flag the vendored PM4 encoder asks for (same as MAD-304) -----
 static bool g_is_dgpu = true;
 bool hsakmt_is_dgpu() { return g_is_dgpu; }
+static bool g_gl2c = false;   // --gl2c: bracket the dispatch with in-ring GL2C perfcounters (byte-exact DRAM read traffic)
 
 // ---- crash-survivable progress log: write a line to a disk file + fflush + fsync BEFORE each GPU
 // dispatch, so a hard hang/reboot leaves the last "STARTING ..." line ON DISK = exactly which config
@@ -422,6 +424,23 @@ static void mbg_preshuffle_A(const uint8_t* A, uint8_t* Ashuf, int M, int K) {
         }
     }
 }
+// FRAG-READY B for the 128-bit B feed (MAD-305 B128). RDNA4 has NO 128-bit transpose for 8-bit data
+// (tr_b128 is 16-bit only), so we do the transpose HERE and lay B out lane-linear: block
+// [(ktp*NT + nt)]*512; byte [L*16 + kk*8 + s] = B[(2*ktp+kk)*16 + colhi*8 + s][nt*16 + nl], colhi=(L>>4)&1,
+// nl=L&15. The device then does a PLAIN global_load_b128 (vaddr=lane*16) delivering 2 K=16 B-frags/instr
+// (kk0=low 8B, kk1=high 8B). Same total bytes as mbg_preshuffle_B; CPU-proven byte-identical frag values
+// to the tr_b64 path. Requires K%32==0 (paired K-tiles) and N%16==0.
+static void mbg_preshuffle_B128(const uint8_t* B, uint8_t* Bshuf, int K, int N) {
+    int KTP = K / 32, NT = N / 16;
+    for (int ktp = 0; ktp < KTP; ++ktp) for (int nt = 0; nt < NT; ++nt) {
+        uint8_t* blk = Bshuf + (size_t)(ktp * NT + nt) * 512;
+        for (int L = 0; L < 32; ++L) {
+            int colhi = (L >> 4) & 1, nl = L & 15;
+            for (int kk = 0; kk < 2; ++kk) for (int s = 0; s < 8; ++s)
+                blk[L * 16 + kk * 8 + s] = B[(size_t)((2 * ktp + kk) * 16 + colhi * 8 + s) * N + (nt * 16 + nl)];
+        }
+    }
+}
 struct MbgResult { bool ok=false; uint32_t maxlive=0, total=0, okTiles=0, nChecked=0; uint64_t wall=0; double secs=0; uint32_t phase[6]={0,0,0,0,0,0}; };
 // When set (DYNFAT1 single-shot): run_mbgemm builds EVERYTHING (operands, queue, all PM4
 // packets) then BLOCKS on this gate file before RingSubmit, so the volatile umr cap-flip can
@@ -689,20 +708,36 @@ static uint32_t ldsRsrc2Bits(uint32_t ldsBytes, uint32_t* outUnits, uint32_t* ou
 static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, int N, int K,
                                     uint32_t nWG, bool fullCheck,
                                     int FMt = 4, uint32_t ldsBytes = 8196u, uint32_t vgprField = 26u,
-                                    int useAtr = 0, int TWN = 2, int FNt = -1) {
+                                    int useAtr = 0, int TWN = 2, int FNt = -1, int TWMt = 2,
+                                    int useB128 = 0, int useTileord = 0, int edgeData = 0,
+                                    bool useGenDiv = false) {
     WgcResult res;
-    const int FM = FMt, FN = (FNt < 0 ? FMt : FNt), TWM = 2, WAVES = TWM*TWN, TBK = 32;
+    const int FM = FMt, FN = (FNt < 0 ? FMt : FNt), TWM = TWMt, WAVES = TWM*TWN, TBK = 32;
     const int TM = TWM*FM*16, TN = TWN*FN*16;     // claimed tile = (TWM*FM*16)x(TWN*FN*16)
     int NTL = N / TN, MTL = M / TM, NT = N / 16, NTILES = K / TBK;
     uint32_t TOTAL = (uint32_t)MTL * NTL;
-    if ((NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
+    if (!useGenDiv && (NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
     int log2NTL = 0; while ((1 << log2NTL) < NTL) ++log2NTL;
 
     static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
     std::vector<uint8_t> Ah((size_t)M*K), Bh((size_t)K*N), Bshufh((size_t)K*N);
-    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)K) % 6];
-    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)N)*3) % 6];
-    mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
+    if (edgeData) {
+        // FULL-DOMAIN edge-encoding gate (MAD-305 safety floor): A heavy on DENORMALS (0x01-0x07 = exp0,
+        // subnormal ~2^-9, both signs) + small/mid/max + zero; B heavy on MAX-NORMALS (0x7E=448, 0xFE=-448).
+        // -> dot products are dominated by denorm(A)*max(B) ~ 0.002*448 summed over K=512 (~hundreds), so if the
+        // GPU FLUSHES input denormals (default FP_DENORM) while the e4m3fn ref does not, output diverges LOUDLY
+        // (>> 0.5%+1e-2 tol). Also exercises 0x7E saturation + signs. NO NaN (0x7F/0xFF): ref maps NaN->0 but HW
+        // WMMA would emit NaN -> a ref limitation, not a HW bug; tested separately.
+        static const uint8_t EA[16] = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08, 0x81,0x83,0x85,0x87, 0x10,0x38,0x7E,0x00};
+        static const uint8_t EB[16] = {0x7E,0x7C,0x7A,0x78,0xFE,0xFC,0x40,0x38, 0x7E,0x7C,0x40,0x38,0x7E,0x7C,0x40,0x7E};
+        for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = EA[(i*7 + i/(size_t)K) % 16];
+        for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = EB[(i*5 + (i/(size_t)N)*3) % 16];
+    } else {
+        for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)K) % 6];
+        for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)N)*3) % 6];
+    }
+    if (useB128) mbg_preshuffle_B128(Bh.data(), Bshufh.data(), K, N);   // frag-ready 512B blocks for plain b128
+    else         mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
     std::vector<uint8_t> Ashufh;   // ANOLDSTR oracle: A-shuf feed (plain Ah kept for the chained wmma_ref reference)
     if (useAtr) { Ashufh.resize((size_t)M*K); mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K); }
 
@@ -736,11 +771,19 @@ static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, i
     printf("  [wggemm2] %dx%dx%d  tile=%dx%d (FM=FN=%d)  TOTAL=%u tiles  nWG=%u  LDS=%uB(units=%u alloc=%u) VGPR~%u RSRC2=0x%x\n",
            M,N,K, TM,TN,FMt, TOTAL, nWG, ldsBytes, ldsU, ldsA, vgprField*8, rsrc2);
     uint32_t rsrc[2] = {rsrc1, rsrc2};
+    int log2MTL = 0; while ((1 << log2MTL) < MTL) ++log2MTL;
+    if (useTileord && (MTL & (MTL - 1)) != 0) { fprintf(stderr, "  MTL=%d not pow2 (N_STATIONARY needs it)\n", MTL); return res; }
+    uint32_t s10v = useTileord ? (uint32_t)(MTL-1) : (uint32_t)(NTL-1);   // TILEORD=1 swaps decode to MTL mask/shift
+    uint32_t s11v = useTileord ? (uint32_t)log2MTL : (uint32_t)log2NTL;
+    if (useGenDiv && !useTileord) {                                       // GENDIV=1: s10=magic=ceil(2^32/NTL), s11=NTL
+        s10v = (uint32_t)((0x100000000ULL + (uint64_t)NTL - 1) / (uint64_t)NTL);
+        s11v = (uint32_t)NTL;
+    }
     uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
     uint32_t userdata[16] = {
         (uint32_t)occVa,(uint32_t)(occVa>>32), (uint32_t)aVa,(uint32_t)(aVa>>32),
         (uint32_t)bVa,(uint32_t)(bVa>>32), (uint32_t)cVa,(uint32_t)(cVa>>32),
-        (uint32_t)K, (uint32_t)(NT*256), (uint32_t)(NTL-1), (uint32_t)log2NTL,
+        (uint32_t)K, (uint32_t)(NT*256), s10v, s11v,
         (uint32_t)NTILES, TOTAL, 0, 0 };
     if (useAtr) { uint64_t asVa=(uint64_t)AshufD.ptr; userdata[2]=(uint32_t)asVa; userdata[3]=(uint32_t)(asVa>>32); userdata[14]=(uint32_t)((uint64_t)M*16); } // ANOLDSTR oracle: s2:3=Ashuf, s14=MT*256
     uint32_t dispInit = BuildDispatchInitiator();
@@ -778,13 +821,17 @@ static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, i
     const float* Cf = (const float*)C.ptr;
     uint32_t tstride = fullCheck ? 1u : (TOTAL > 64 ? TOTAL/64u : 1u);
     for (uint32_t ti = 0; ti < TOTAL; ti += tstride) {
-        int trow = ti >> log2NTL, tcol = ti & (NTL - 1);
+        int trow, tcol;
+        if (useTileord)     { trow = ti & (MTL - 1); tcol = ti >> log2MTL; }   // N_STATIONARY: mirror kernel TILEORD=1
+        else if (useGenDiv) { trow = (int)(ti / (uint32_t)NTL); tcol = (int)(ti % (uint32_t)NTL); } // GENDIV: exact div/mod
+        else                { trow = ti >> log2NTL;  tcol = ti & (NTL - 1); }
         for (int wid = 0; wid < WAVES; ++wid) {
             int wm = wid / TWN, wn = wid % TWN;
             for (int mi = 0; mi < FM; ++mi) for (int ni = 0; ni < FN; ++ni) {
                 int rowbase = trow*TM + wm*(FM*16) + mi*16;
                 int colbase = tcol*TN + wn*(FN*16) + ni*16;
                 float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
+                float CaccHalf[256]; for (int i=0;i<256;i++) CaccHalf[i]=0.f;  // GEMM over FIRST HALF of K-slices
                 uint8_t Ablk[256], Bblk[256]; float Dout[256];
                 for (int kt = 0; kt < K/16; ++kt) {
                     for (int i=0;i<16;i++) for (int j=0;j<16;j++) {
@@ -793,6 +840,7 @@ static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, i
                     }
                     wmma_ref_16x16x16(Ablk, Bblk, Cacc, Dout);
                     for (int i=0;i<256;i++) Cacc[i]=Dout[i];
+                    if (kt == K/32 - 1) for (int i=0;i<256;i++) CaccHalf[i]=Cacc[i];   // snapshot at first-half-K boundary
                 }
                 int frag = mi*FN + ni;
                 size_t foff = (size_t)ti*(size_t)(WAVES*FM*FN*256) + (size_t)wid*(size_t)(FM*FN*256) + (size_t)frag*256;   // float index
@@ -800,6 +848,26 @@ static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, i
                 bool good=true;
                 for (int i=0;i<256;i++) if (std::fabs(D[i]-Cacc[i]) > 5e-3f*std::fabs(Cacc[i])+1e-2f) { good=false; break; }
                 if (good) res.okFrags++; else res.badFrags++;
+                if (!good && getenv("WGC_DBG")) {
+                    static int dbg = 0;
+                    if (dbg < 24 && ti==0 && wid==0 && frag==0) {
+                        // disambiguate the half: 0.5x-full (magnitude halve) vs first-half-K-slices vs even-kt-only vs even-K-within-WMMA
+                        float CaccEvenKt[256]; for (int i=0;i<256;i++) CaccEvenKt[i]=0.f;
+                        float CaccEvenK[256];  for (int i=0;i<256;i++) CaccEvenK[i]=0.f;
+                        for (int kt=0; kt<K/16; ++kt) {
+                            for (int i=0;i<16;i++) for (int j=0;j<16;j++) { Ablk[i*16+j]=Ah[(size_t)(rowbase+i)*K+(kt*16+j)]; Bblk[i*16+j]=Bh[(size_t)(kt*16+i)*N+(colbase+j)]; }
+                            if ((kt&1)==0) { wmma_ref_16x16x16(Ablk,Bblk,CaccEvenKt,Dout); for(int i=0;i<256;i++) CaccEvenKt[i]=Dout[i]; }   // even kt only
+                            uint8_t Ah2[256],Bh2[256]; for(int i=0;i<16;i++) for(int kk=0;kk<16;kk++){ uint8_t av=(kk&1)?0:Ablk[i*16+kk]; Ah2[i*16+kk]=av; uint8_t bv=(kk&1)?0:Bblk[kk*16+i]; Bh2[kk*16+i]=bv; }
+                            wmma_ref_16x16x16(Ah2,Bh2,CaccEvenK,Dout); for(int i=0;i<256;i++) CaccEvenK[i]=Dout[i];   // even-K within each WMMA (odd K zeroed)
+                        }
+                        auto matchpct=[&](const float* R){ int m=0; for(int i=0;i<256;i++) if(std::fabs(D[i]-R[i])<=5e-3f*std::fabs(R[i])+1e-2f) m++; return m*100/256; };
+                        std::vector<float> half(256); for(int i=0;i<256;i++) half[i]=0.5f*Cacc[i];
+                        float amaxD=0.f,amaxC=0.f; for(int i=0;i<256;i++){amaxD=std::max(amaxD,std::fabs(D[i]));amaxC=std::max(amaxC,std::fabs(Cacc[i]));}
+                        fprintf(stderr, "  [WGC_DBG] K=%d wid=%d frag=%d ratio=%.3f | match%%: 0.5xFull=%d firstHalfK=%d evenKt=%d evenK-in-WMMA=%d\n",
+                                K, wid, frag, amaxC>0?amaxD/amaxC:0.f, matchpct(half.data()), matchpct(CaccHalf), matchpct(CaccEvenKt), matchpct(CaccEvenK));
+                        dbg++;
+                    }
+                }
             }
         }
     }
@@ -818,21 +886,23 @@ struct WgpResult { bool ok=false; uint32_t maxlive=0, total=0; uint64_t wall=0; 
 static WgpResult run_wggemm_perf(uint32_t node, const char* isaPath, int M, int N, int K,
                                  uint32_t nWG, double freq_hz,
                                  int FMt = 4, uint32_t ldsBytes = 8196u, uint32_t vgprField = 26u,
-                                 int TWN = 2, int useAtr = 0, int FNt = -1) {
+                                 int TWN = 2, int useAtr = 0, int FNt = -1, int TWMt = 2,
+                                 int useB128 = 0, int useTileord = 0, bool useGenDiv = false) {
     WgpResult res;
     if (FNt < 0) FNt = FMt;                        // FNt<0 -> square per-wave tile (FN=FM); set explicitly for 8x2 etc.
-    const int TWM = 2, WAVES = TWM*TWN;           // TWM fixed; TWN grows the N-wave count (8 waves @ TWN=4)
+    const int TWM = TWMt, WAVES = TWM*TWN;        // TWM*TWN waves/WG (16 @ TWM=4 TWN=4 lean, or 8 @ TWM=2 TWN=4)
     const int TM = TWM*FMt*16, TN = TWN*FNt*16;   // claimed tile = (TWM*FM*16)x(TWN*FN*16)  (128x256 @ TWN=4)
     int NTL = N / TN, MTL = M / TM, NT = N / 16, NTILES = K / 32;
     uint32_t TOTAL = (uint32_t)MTL * NTL;
-    if ((NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
+    if (!useGenDiv && (NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
     int log2NTL = 0; while ((1 << log2NTL) < NTL) ++log2NTL;
 
     static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
     std::vector<uint8_t> Ah((size_t)M*K), Bh((size_t)K*N), Bshufh((size_t)K*N);
     for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)K) % 6];
     for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)N)*3) % 6];
-    mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
+    if (useB128) mbg_preshuffle_B128(Bh.data(), Bshufh.data(), K, N);   // frag-ready 512B blocks for plain b128
+    else         mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
     std::vector<uint8_t> Ashufh;   // ANOLDSTR: A-shuf feed (mbg_preshuffle_A); plain Ah kept for the acc00 reference
     if (useAtr) { Ashufh.resize((size_t)M*K); mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K); }
 
@@ -870,50 +940,73 @@ static WgpResult run_wggemm_perf(uint32_t node, const char* isaPath, int M, int 
     uint32_t ldsU=0,ldsA=0,ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytes, &ldsU, &ldsA, &ldsG);
     uint32_t rsrc2 = (BuildPgmRsrc2(false) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;
     uint32_t rsrc[2] = {rsrc1, rsrc2};
+    int log2MTL = 0; while ((1 << log2MTL) < MTL) ++log2MTL;
+    if (useTileord && (MTL & (MTL - 1)) != 0) { fprintf(stderr, "  MTL=%d not pow2 (N_STATIONARY needs it)\n", MTL); return res; }
+    uint32_t s10v = useTileord ? (uint32_t)(MTL-1) : (uint32_t)(NTL-1);   // TILEORD=1 swaps decode to MTL mask/shift
+    uint32_t s11v = useTileord ? (uint32_t)log2MTL : (uint32_t)log2NTL;
+    if (useGenDiv && !useTileord) {                                       // GENDIV=1: s10=magic=ceil(2^32/NTL), s11=NTL
+        s10v = (uint32_t)((0x100000000ULL + (uint64_t)NTL - 1) / (uint64_t)NTL);
+        s11v = (uint32_t)NTL;
+    }
     uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
     uint32_t userdata[16] = {
         (uint32_t)occVa,(uint32_t)(occVa>>32), (uint32_t)aVa,(uint32_t)(aVa>>32),
         (uint32_t)bVa,(uint32_t)(bVa>>32), (uint32_t)cVa,(uint32_t)(cVa>>32),
-        (uint32_t)K, (uint32_t)(NT*256), (uint32_t)(NTL-1), (uint32_t)log2NTL,
+        (uint32_t)K, (uint32_t)(NT*256), s10v, s11v,
         (uint32_t)NTILES, TOTAL, 0, 0 };
     if (useAtr) { uint64_t asVa=(uint64_t)AshufD.ptr; userdata[2]=(uint32_t)asVa; userdata[3]=(uint32_t)(asVa>>32); userdata[14]=(uint32_t)((uint64_t)M*16); } // ANOLDSTR: s2:3=Ashuf, s14=MT*256
     uint32_t dispInit = BuildDispatchInitiator();
-    RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
-    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));
-    RingPlace(ring, PM4DispatchDirectPacket(nWG * (uint32_t)(WAVES*32), 1, 1, dispInit));
-    RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
+    // (a) MULTI-ITERATION timing: the wall is a GPU-tick span (occ[2]->occ[3]), so sub-ms shapes (small M) are
+    //   dominated by shader-clock RAMP -- a single cold dispatch is noisy (a byte-identical bin swung +-60% at
+    //   nWG=32). Run WARM warm-up dispatches (ramp the clock) then take the MIN ticks over TIMED runs = steady
+    //   state -> reproducible. Each rep resets occ (claim counter occ[5] + start/end ticks occ[2]/[3]) + fence.
+    const int WARM = 2, TIMED = 4;
+    uint64_t bestWall = ~0ull;
+    for (int rep = 0; rep < WARM + TIMED; ++rep) {
+        occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=0; *fenceW=0;
+        RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));
+        RingPlace(ring, PM4DispatchDirectPacket(nWG * (uint32_t)(WAVES*32), 1, 1, dispInit));
+        RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
 
-    double t0 = now_s(); RingSubmit(ring);
-    bool done=false, admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
-    while (true) { double now = now_s();
-        if (occW[1] > 0) admitted = true;
-        uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
-        bool ff = (*fenceW == FENCE_VALUE);
-        if (admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025) { done=true; break; }
-        if (now - t0 > 40.0) break;
+        double t0 = now_s(); RingSubmit(ring);
+        bool done=false, admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
+        while (true) { double now = now_s();
+            if (occW[1] > 0) admitted = true;
+            uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
+            bool ff = (*fenceW == FENCE_VALUE);
+            if (admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025) { done=true; break; }
+            if (now - t0 > 40.0) break;
+        }
+        if (!done) {
+            fprintf(stderr, "\n*** WGGEMM PERF TIMEOUT (%s): live=%u maxlive=%u claim=%u ***\n", isaPath, occW[0], occW[1], occW[5]);
+            CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+            if (useAtr) FreeGpu(AshufD);
+            FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+            return res;
+        }
+        res.maxlive = occW[1]; res.total = occW[5];
+        uint32_t gs=occW[2], ge=occW[3];
+        uint64_t w = (ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs);
+        if (rep >= WARM && w > 0 && w < bestWall) bestWall = w;   // min over the TIMED runs = warmed-up steady state
     }
-    if (!done) {
-        fprintf(stderr, "\n*** WGGEMM PERF TIMEOUT (%s): live=%u maxlive=%u claim=%u ***\n", isaPath, occW[0], occW[1], occW[5]);
-        CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
-        if (useAtr) FreeGpu(AshufD);
-        FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
-        return res;
-    }
-    res.ok = true; res.maxlive = occW[1]; res.total = occW[5];
-    { uint32_t gs=occW[2], ge=occW[3]; res.wall = (ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
+    res.ok = true; res.wall = (bestWall==~0ull) ? 0 : bestWall;
     res.tf = (res.wall > 0) ? (2.0*(double)M*N*K * freq_hz / (double)res.wall / 1e12) : 0.0;
 
     // ---- sampled acc[0][0] correctness (cheap; ~16 tiles) ----
     const float* Cf = (const float*)C.ptr;
     uint32_t tstride = TOTAL > 16 ? TOTAL/16u : 1u;
     for (uint32_t ti = 0; ti < TOTAL; ti += tstride) {
-        int trow = ti >> log2NTL, tcol = ti & (NTL - 1);
+        int trow, tcol;
+        if (useTileord)     { trow = ti & (MTL - 1); tcol = ti >> log2MTL; }   // N_STATIONARY: mirror kernel TILEORD=1
+        else if (useGenDiv) { trow = (int)(ti / (uint32_t)NTL); tcol = (int)(ti % (uint32_t)NTL); } // GENDIV: exact div/mod
+        else                { trow = ti >> log2NTL;  tcol = ti & (NTL - 1); }
         for (int wid = 0; wid < WAVES; ++wid) {
             int wm = wid/TWN, wn = wid%TWN, rowbase = trow*TM + wm*(FMt*16), colbase = tcol*TN + wn*(FNt*16);
             float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
@@ -933,6 +1026,243 @@ static WgpResult run_wggemm_perf(uint32_t node, const char* isaPath, int M, int 
     }
     CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
     if (useAtr) FreeGpu(AshufD);
+    FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+    return res;
+}
+
+// ===========================================================================
+// MAD-305 #323 WAVE-SPECIALIZED fp8 GEMM (occ_kernel_wavespec.s).
+//   Claimed tile = (NCOMP*FM*16) x (FN*16): NCOMP compute waves stacked in M, ONE shared B-panel.
+//   NLOAD lean loader waves global_load_tr A+B into an LDS slot; compute ds_load + WMMA only.
+//   Both operands preshuffled (Ashuf via mbg_preshuffle_A, Bshuf via mbg_preshuffle_B). NTILES=K/16.
+//   userdata: s0:1=occ s2:3=Ashuf s4:5=Bshuf s6:7=C s8=K s9=NT*256 s10=NTL_MASK s11=NTL_LOG2
+//             s12=NTILES(K/16) s13=TOTAL s14=MT*256.  dynvgpr arms RSRC2 bit6 (T4).
+//   C (STORE=1): C[ti*(NCOMP*FM*FN*256) + cid*(FM*FN*256) + frag*256] floats; frag=mi*FN+ni.
+// ---------------------------------------------------------------------------
+static int wavespec_vgpr_field(int FM, int FN) {        // matches the kernel's NFV = FB + 2*FN + 16
+    int ACC = 32, FA = ACC + 8*FM*FN, FB = FA + 2*FM, NFV = FB + 2*FN + 16;
+    return (NFV + 7) / 8;                                 // rsrc1 VGPR granule = field*8
+}
+static uint32_t wavespec_lds_bytes(int FM, int FN, int NCOMP) {
+    return (uint32_t)((NCOMP*FM + FN) * 256 + 12);        // SLOT + ti + bar_cnt + bar_sense (matches kernel
+                                                          //   LDS_TOTAL; the +8 is the BUSYWAIT barrier slots,
+                                                          //   harmless/unused on the non-busy-wait path).
+}
+
+static WgcResult run_wavespec_compute(uint32_t node, const char* isaPath, int M, int N, int K,
+                                      uint32_t nWG, bool fullCheck,
+                                      int FM, int FN, int NLOAD, int NCOMP, bool dynvgpr) {
+    WgcResult res;
+    const int WAVES_LAUNCH = NLOAD + NCOMP;
+    const int TM = NCOMP*FM*16, TN = FN*16;               // claimed tile (one N-panel, NCOMP M-bands)
+    int NTL = N / TN, MTL = M / TM, NT = N / 16, MT = M / 16, NTILES = K / 16;
+    uint32_t TOTAL = (uint32_t)MTL * NTL;
+    if ((NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
+    int log2NTL = 0; while ((1 << log2NTL) < NTL) ++log2NTL;
+
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
+    std::vector<uint8_t> Ah((size_t)M*K), Bh((size_t)K*N), Ashufh((size_t)M*K), Bshufh((size_t)K*N);
+    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)K) % 6];
+    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)N)*3) % 6];
+    mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K);
+    mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
+
+    uint32_t ldsBytes = wavespec_lds_bytes(FM, FN, NCOMP);
+    // dyn: launch LEAN (32 VGPR = 4 granules; covers the identity/claim prologue v0..v24), then each wave
+    //   s_alloc_vgpr's to its role size (loaders stay 32, compute grow to NFV). static: full NFV-sized launch.
+    uint32_t vgprField = dynvgpr ? 4u : (uint32_t)wavespec_vgpr_field(FM, FN);
+
+    size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
+    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf occ = AllocGpu(node, 0x1000, false, true);
+    GpuBuf Ad  = AllocGpu(node, (Ashufh.size() + 0xFFF) & ~0xFFFull, false, true);
+    GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true);
+    uint64_t cbytes = ((uint64_t)TOTAL * (uint64_t)(NCOMP*FM*FN*256*4) + 0xFFF) & ~0xFFFull;
+    GpuBuf C   = AllocGpu(node, cbytes, false, true);
+    GpuBuf fence = AllocGpu(node, 0x1000, false, true);
+    memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
+    memcpy(Ad.ptr, Ashufh.data(), Ashufh.size());
+    memcpy(Bd.ptr, Bshufh.data(), Bshufh.size());
+    volatile uint32_t* occW = (volatile uint32_t*)occ.ptr;
+    volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
+    occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=0; *fenceW=0;
+
+    Ring ring; ring.buf = AllocGpu(node, 0x10000, true, true); ring.dw = (uint32_t*)ring.buf.ptr;
+    ring.sizeDw = (uint32_t)(ring.buf.size / sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node, HSA_QUEUE_COMPUTE, 100, HSA_QUEUE_PRIORITY_NORMAL, ring.buf.ptr, ring.buf.size, nullptr, &ring.res));
+
+    uint64_t shiftedIsa = ((uint64_t)isa.ptr) >> 8;
+    uint64_t occVa=(uint64_t)occ.ptr, aVa=(uint64_t)Ad.ptr, bVa=(uint64_t)Bd.ptr, cVa=(uint64_t)C.ptr, fenceVa=(uint64_t)fence.ptr;
+    uint32_t dims[8] = {0,0,0,(uint32_t)(WAVES_LAUNCH*32),1,1,0,0};
+    uint32_t pgm[6] = {(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    uint32_t rsrc1 = BuildPgmRsrc1(dynvgpr); rsrc1 = (rsrc1 & ~0x3fu) | (vgprField & 0x3fu);
+    uint32_t ldsU=0,ldsA=0,ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytes, &ldsU, &ldsA, &ldsG);
+    uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;
+    printf("  [wavespec] %dx%dx%d  tile=%dx%d (FM=%d FN=%d NLOAD=%d NCOMP=%d)  TOTAL=%u nWG=%u  LDS=%uB(units=%u alloc=%u) VGPR~%u dyn=%d RSRC2=0x%x\n",
+           M,N,K, TM,TN, FM,FN,NLOAD,NCOMP, TOTAL, nWG, ldsBytes, ldsU, ldsA, vgprField*8, dynvgpr, rsrc2);
+    uint32_t rsrc[2] = {rsrc1, rsrc2};
+    uint32_t s10v = (uint32_t)(NTL-1), s11v = (uint32_t)log2NTL;
+    uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
+    uint32_t userdata[16] = {
+        (uint32_t)occVa,(uint32_t)(occVa>>32), (uint32_t)aVa,(uint32_t)(aVa>>32),
+        (uint32_t)bVa,(uint32_t)(bVa>>32), (uint32_t)cVa,(uint32_t)(cVa>>32),
+        (uint32_t)K, (uint32_t)(NT*256), s10v, s11v,
+        (uint32_t)NTILES, TOTAL, (uint32_t)(MT*256), 0 };
+    uint32_t dispInit = BuildDispatchInitiator();
+    RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));
+    RingPlace(ring, PM4DispatchDirectPacket(nWG * (uint32_t)(WAVES_LAUNCH*32), 1, 1, dispInit));
+    RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
+
+    double t0 = now_s(); RingSubmit(ring);
+    bool done=false, admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
+    while (true) { double now = now_s();
+        if (occW[1] > 0) admitted = true;
+        uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
+        bool ff = (*fenceW == FENCE_VALUE);
+        if (admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025) { done=true; break; }
+        if (now - t0 > 20.0) break;
+    }
+    if (!done) {
+        fprintf(stderr, "\n*** WAVESPEC TIMEOUT (%s): live=%u maxlive=%u claim=%u ***\n", isaPath, occW[0], occW[1], occW[5]);
+        CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+        FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+        return res;
+    }
+    res.ok = true; res.maxlive = occW[1]; res.total = occW[5];
+    { uint32_t gs=occW[2], ge=occW[3]; res.wall = (ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
+
+    // ---- oracle: every frag of every (tile, compute-wave) vs chained wmma_ref ----
+    const float* Cf = (const float*)C.ptr;
+    uint32_t tstride = fullCheck ? 1u : (TOTAL > 64 ? TOTAL/64u : 1u);
+    for (uint32_t ti = 0; ti < TOTAL; ti += tstride) {
+        int trow = ti >> log2NTL, tcol = ti & (NTL - 1);
+        for (int cid = 0; cid < NCOMP; ++cid) {
+            for (int mi = 0; mi < FM; ++mi) for (int ni = 0; ni < FN; ++ni) {
+                int rowbase = trow*TM + cid*(FM*16) + mi*16;
+                int colbase = tcol*TN + ni*16;
+                float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
+                uint8_t Ablk[256], Bblk[256]; float Dout[256];
+                for (int kt = 0; kt < K/16; ++kt) {
+                    for (int i=0;i<16;i++) for (int j=0;j<16;j++) {
+                        Ablk[i*16+j] = Ah[(size_t)(rowbase+i)*K + (kt*16+j)];
+                        Bblk[i*16+j] = Bh[(size_t)(kt*16+i)*N + (colbase+j)];
+                    }
+                    wmma_ref_16x16x16(Ablk, Bblk, Cacc, Dout);
+                    for (int i=0;i<256;i++) Cacc[i]=Dout[i];
+                }
+                int frag = mi*FN + ni;
+                size_t foff = (size_t)ti*(size_t)(NCOMP*FM*FN*256) + (size_t)cid*(size_t)(FM*FN*256) + (size_t)frag*256;
+                float D[256]; unpack_D(Cf + foff, D);
+                bool good=true;
+                for (int i=0;i<256;i++) if (std::fabs(D[i]-Cacc[i]) > 5e-3f*std::fabs(Cacc[i])+1e-2f) { good=false; break; }
+                if (good) res.okFrags++; else res.badFrags++;
+            }
+        }
+    }
+    CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+    FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+    return res;
+}
+
+// WAVESPEC PERF: STORE=0 bin (no C store) -> pure TF timing. Correctness gate is run_wavespec_compute.
+static WgpResult run_wavespec_perf(uint32_t node, const char* isaPath, int M, int N, int K,
+                                   uint32_t nWG, double freq_hz,
+                                   int FM, int FN, int NLOAD, int NCOMP, bool dynvgpr) {
+    WgpResult res;
+    const int WAVES_LAUNCH = NLOAD + NCOMP;
+    const int TM = NCOMP*FM*16, TN = FN*16;
+    int NTL = N / TN, MTL = M / TM, NT = N / 16, MT = M / 16, NTILES = K / 16;
+    uint32_t TOTAL = (uint32_t)MTL * NTL;
+    if ((NTL & (NTL - 1)) != 0) { fprintf(stderr, "  NTL=%d not pow2\n", NTL); return res; }
+    int log2NTL = 0; while ((1 << log2NTL) < NTL) ++log2NTL;
+
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
+    std::vector<uint8_t> Ah((size_t)M*K), Bh((size_t)K*N), Ashufh((size_t)M*K), Bshufh((size_t)K*N);
+    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)K) % 6];
+    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)N)*3) % 6];
+    mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K);
+    mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
+
+    uint32_t ldsBytes = wavespec_lds_bytes(FM, FN, NCOMP);
+    // dyn: launch LEAN (32 VGPR = 4 granules; covers the identity/claim prologue v0..v24), then each wave
+    //   s_alloc_vgpr's to its role size (loaders stay 32, compute grow to NFV). static: full NFV-sized launch.
+    uint32_t vgprField = dynvgpr ? 4u : (uint32_t)wavespec_vgpr_field(FM, FN);
+
+    size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
+    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf occ = AllocGpu(node, 0x1000, false, true);
+    GpuBuf Ad  = AllocGpu(node, (Ashufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);
+    GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);
+    GpuBuf C   = AllocGpu(node, 0x1000, false, true, /*deviceLocal*/true);   // STORE=0: tiny (no C traffic)
+    GpuBuf fence = AllocGpu(node, 0x1000, false, true);
+    if (!(Ad.vram && Bd.vram)) {
+        fprintf(stderr, "\n*** WAVESPEC VRAM GUARD FAILED (%s): A=%d B=%d -> PCIe-fed, PERF INVALID ***\n", isaPath, Ad.vram, Bd.vram);
+        abort();
+    }
+    memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
+    memcpy(Ad.ptr, Ashufh.data(), Ashufh.size());
+    memcpy(Bd.ptr, Bshufh.data(), Bshufh.size());
+    volatile uint32_t* occW = (volatile uint32_t*)occ.ptr;
+    volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
+    occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=0; *fenceW=0;
+
+    Ring ring; ring.buf = AllocGpu(node, 0x10000, true, true); ring.dw = (uint32_t*)ring.buf.ptr;
+    ring.sizeDw = (uint32_t)(ring.buf.size / sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node, HSA_QUEUE_COMPUTE, 100, HSA_QUEUE_PRIORITY_NORMAL, ring.buf.ptr, ring.buf.size, nullptr, &ring.res));
+
+    uint64_t shiftedIsa = ((uint64_t)isa.ptr) >> 8;
+    uint64_t occVa=(uint64_t)occ.ptr, aVa=(uint64_t)Ad.ptr, bVa=(uint64_t)Bd.ptr, cVa=(uint64_t)C.ptr, fenceVa=(uint64_t)fence.ptr;
+    uint32_t dims[8] = {0,0,0,(uint32_t)(WAVES_LAUNCH*32),1,1,0,0};
+    uint32_t pgm[6] = {(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    uint32_t rsrc1 = BuildPgmRsrc1(dynvgpr); rsrc1 = (rsrc1 & ~0x3fu) | (vgprField & 0x3fu);
+    uint32_t ldsU=0,ldsA=0,ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytes, &ldsU, &ldsA, &ldsG);
+    uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;
+    uint32_t rsrc[2] = {rsrc1, rsrc2};
+    uint32_t s10v = (uint32_t)(NTL-1), s11v = (uint32_t)log2NTL;
+    uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
+    uint32_t userdata[16] = {
+        (uint32_t)occVa,(uint32_t)(occVa>>32), (uint32_t)aVa,(uint32_t)(aVa>>32),
+        (uint32_t)bVa,(uint32_t)(bVa>>32), (uint32_t)cVa,(uint32_t)(cVa>>32),
+        (uint32_t)K, (uint32_t)(NT*256), s10v, s11v,
+        (uint32_t)NTILES, TOTAL, (uint32_t)(MT*256), 0 };
+    uint32_t dispInit = BuildDispatchInitiator();
+    RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
+    RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));
+    RingPlace(ring, PM4DispatchDirectPacket(nWG * (uint32_t)(WAVES_LAUNCH*32), 1, 1, dispInit));
+    RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
+
+    double t0 = now_s(); RingSubmit(ring);
+    bool done=false, admitted=false; uint32_t lastEnd=0; double lastEndChange=t0;
+    while (true) { double now = now_s();
+        if (occW[1] > 0) admitted = true;
+        uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
+        bool ff = (*fenceW == FENCE_VALUE);
+        if (admitted && occW[0]==0 && ff && end!=0 && (now-lastEndChange)>0.025) { done=true; break; }
+        if (now - t0 > 40.0) break;
+    }
+    if (!done) {
+        fprintf(stderr, "\n*** WAVESPEC PERF TIMEOUT (%s): live=%u maxlive=%u claim=%u ***\n", isaPath, occW[0], occW[1], occW[5]);
+        CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+        FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+        return res;
+    }
+    res.ok = true; res.maxlive = occW[1]; res.total = occW[5];
+    { uint32_t gs=occW[2], ge=occW[3]; res.wall = (ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
+    res.tf = (res.wall > 0) ? (2.0*(double)M*N*K * freq_hz / (double)res.wall / 1e12) : 0.0;
+    CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
     FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
     return res;
 }
@@ -1149,6 +1479,71 @@ static StkResult run_stack(uint32_t node, const char* isaPath, double freq_hz,
 struct BwResult { bool ok=false; uint32_t maxlive=0, workers=0, steps=0; uint64_t wall=0, bytes=0; double gbps=0;
                   bool proof=false; uint32_t chk=0; };
 
+// ===========================================================================
+// MAD-305 in-ring GL2C DRAM meter (gfx1201). Brackets a dispatch with GL2C
+// hardware perfcounters read from WITHIN our own KFD ring -- the only profiler
+// that can see our raw-PM4 kernels. Register map + sequence: pm4_perf.h +
+// GFX12_PERFCOUNTER_REGISTERS.md. Result BO layout: instance-major, 8 dwords
+// per instance = 4 counters x (LO,HI). Counters: 0=RDREQ_32B 1=RDREQ_64B
+// 2=RDREQ_128B 3=WRREQ.
+// ===========================================================================
+static const uint32_t GL2C_DW_PER_INSTANCE = 8;   // 4 counters * 2 dwords (LO,HI)
+
+// Emit right AFTER ACQUIRE_MEM, before the dispatch: reset, program the 4 GL2C
+// counters (broadcast -- GLOBAL block), start counting.
+static void gl2c_emit_setup_start(Ring& ring) {
+    RingPlace(ring, PM4WriteRegPacket(mmCP_PERFMON_CNTL, CpPerfmonCntl(CP_PERFMON_STATE_DISABLE_RESET, false)));
+    RingPlace(ring, PM4WriteRegPacket(mmGRBM_GFX_INDEX, GrbmBroadcastAll()));
+    RingPlace(ring, PM4WriteRegPacket(mmGL2C_PERFCOUNTER0_SELECT + 0*GL2C_SELECT_STRIDE, Gl2cSelect(GL2C_EVT_EA_RDREQ_32B)));
+    RingPlace(ring, PM4WriteRegPacket(mmGL2C_PERFCOUNTER0_SELECT + 1*GL2C_SELECT_STRIDE, Gl2cSelect(GL2C_EVT_EA_RDREQ_64B)));
+    RingPlace(ring, PM4WriteRegPacket(mmGL2C_PERFCOUNTER0_SELECT + 2*GL2C_SELECT_STRIDE, Gl2cSelect(GL2C_EVT_EA_RDREQ_128B)));
+    RingPlace(ring, PM4WriteRegPacket(mmGL2C_PERFCOUNTER0_SELECT + 3*GL2C_SELECT_STRIDE, Gl2cSelect(GL2C_EVT_EA_WRREQ)));
+    RingPlace(ring, PM4WriteRegPacket(mmCP_PERFMON_CNTL, CpPerfmonCntl(CP_PERFMON_STATE_START, false)));
+}
+
+// Emit right AFTER the dispatch, before RELEASE_MEM: drain waves, stop+latch,
+// then per-instance read the 4 counters (64-bit LO+HI) into resultVa.
+static void gl2c_emit_stop_read(Ring& ring, uint64_t resultVa) {
+    RingPlace(ring, PM4PartialFlushPacket());   // CS_PARTIAL_FLUSH: wait for all waves to retire
+    RingPlace(ring, PM4WriteRegPacket(mmCP_PERFMON_CNTL, CpPerfmonCntl(CP_PERFMON_STATE_STOP, /*sample*/true)));
+    for (uint32_t i = 0; i < NUM_GL2C_INSTANCES; i++) {
+        RingPlace(ring, PM4WriteRegPacket(mmGRBM_GFX_INDEX, GrbmSelectGl2cInstance(i)));
+        uint64_t base = resultVa + (uint64_t)i * GL2C_DW_PER_INSTANCE * sizeof(uint32_t);
+        for (uint32_t c = 0; c < 4; c++) {
+            RingPlace(ring, PM4CopyDataPacket(COPY_DATA_SRC_PERFCOUNTERS,
+                                              mmGL2C_PERFCOUNTER0_LO + c * GL2C_RESULT_STRIDE, 0,
+                                              base + (uint64_t)c * 2 * sizeof(uint32_t),
+                                              /*count64*/true));
+        }
+    }
+    RingPlace(ring, PM4WriteRegPacket(mmGRBM_GFX_INDEX, GrbmBroadcastAll()));   // restore broadcast
+}
+
+// CPU-side reduce + report. `secs` is the measured dispatch wall time; `logicalBytes`
+// is the probe's own intended traffic for a sanity cross-check.
+static void gl2c_reduce_report(const volatile uint32_t* R, double secs, uint64_t logicalBytes, const char* tag) {
+    uint64_t s_rd32=0, s_rd64=0, s_rd128=0, s_wr=0;
+    uint32_t nonzero_inst = 0;
+    for (uint32_t i = 0; i < NUM_GL2C_INSTANCES; i++) {
+        const volatile uint32_t* p = R + (size_t)i * GL2C_DW_PER_INSTANCE;
+        auto v64 = [&](int c)->uint64_t { return (uint64_t)p[c*2] | ((uint64_t)p[c*2+1] << 32); };
+        uint64_t a=v64(0), b=v64(1), d=v64(2), w=v64(3);
+        if (a|b|d|w) nonzero_inst++;
+        s_rd32 += a; s_rd64 += b; s_rd128 += d; s_wr += w;
+    }
+    uint64_t fetch = Gl2cFetchBytes(s_rd32, s_rd64, s_rd128);
+    double fetch_gbps = secs > 0 ? (double)fetch / secs / 1e9 : 0.0;
+    printf("  [GL2C %s] instances_nonzero=%u/%u  RDREQ 32B=%llu 64B=%llu 128B=%llu  WRREQ=%llu\n",
+           tag, nonzero_inst, NUM_GL2C_INSTANCES,
+           (unsigned long long)s_rd32, (unsigned long long)s_rd64,
+           (unsigned long long)s_rd128, (unsigned long long)s_wr);
+    printf("  [GL2C %s] FETCH = %llu bytes (%.2f MB) -> %.1f GB/s effective DRAM-read  | probe logical=%llu B (%.2f MB)\n",
+           tag, (unsigned long long)fetch, fetch/1e6, fetch_gbps,
+           (unsigned long long)logicalBytes, logicalBytes/1e6);
+    if (nonzero_inst == 0)
+        printf("  [GL2C %s] *** ALL COUNTERS ZERO -- plain register writes likely dropped; switch SELECT/CNTL to COPY_DATA->perfcounters (perf window). See GFX12_PERFCOUNTER_REGISTERS.md risk note. ***\n", tag);
+}
+
 static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int mode, uint32_t LDW,
                        uint64_t windowBytes, uint32_t STEPS, uint32_t WGSIZE, uint32_t nWG) {
     BwResult res;
@@ -1166,6 +1561,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     GpuBuf Dd =AllocGpu(node,(BUFSZ+0xFFF)&~0xFFFull,false,true,/*deviceLocal*/true);   // VRAM write/copy dst
     GpuBuf sink=AllocGpu(node,0x1000,false,true);
     GpuBuf fence=AllocGpu(node,0x1000,false,true);
+    GpuBuf gl2c=AllocGpu(node,0x1000,false,true);   // GL2C perfcounter result BO (32 inst * 8 dw), host-visible
     if (!(Sd.vram && Dd.vram)) {   // VRAM GUARD: the BW probe MUST measure device-local memory, not PCIe/GTT
         fprintf(stderr, "\n*** BW VRAM GUARD FAILED (%s): src/dst not device-local (S=%d D=%d) ***\n", isaPath, Sd.vram, Dd.vram);
         abort();
@@ -1175,6 +1571,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     volatile uint32_t* occW=(volatile uint32_t*)occ.ptr;
     volatile uint32_t* fenceW=(volatile uint32_t*)fence.ptr;
     for (int i=0;i<20;i++) occW[i]=0; occW[2]=0xFFFFFFFFu; *fenceW=0;
+    memset(gl2c.ptr,0,0x1000);   // zero the perfcounter result BO before the run
 
     Ring ring; ring.buf=AllocGpu(node,0x10000,true,true); ring.dw=(uint32_t*)ring.buf.ptr;
     ring.sizeDw=(uint32_t)(ring.buf.size/sizeof(uint32_t));
@@ -1193,6 +1590,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
         0,0,0,(uint32_t)BUF_MASK, 0,(uint32_t)STEPS,0,0 };   // s11=BUF_MASK s12=NWORKERS(0=no cap) s13=STEPS
     uint32_t dispInit=BuildDispatchInitiator();
     RingPlace(ring,PM4AcquireMemoryPacket(FAMILY_GFX12));
+    if (g_gl2c) gl2c_emit_setup_start(ring);   // reset+program+start GL2C counters before the dispatch
     RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_START_X,dims,8));
     RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO,pgm,6));
     RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1,rsrc,2));
@@ -1201,6 +1599,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X,restart,4));
     RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0,userdata,16));
     RingPlace(ring,PM4DispatchDirectPacket(nWG*WGSIZE,1,1,dispInit));
+    if (g_gl2c) gl2c_emit_stop_read(ring, (uint64_t)gl2c.ptr);   // drain+stop+read counters before the fence
     RingPlace(ring,PM4ReleaseMemoryPacket(FAMILY_GFX12,true,fenceVa,FENCE_VALUE));
 
     double t0=now_s(); RingSubmit(ring);
@@ -1214,7 +1613,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     }
     if (!done){ fprintf(stderr,"\n*** BW TIMEOUT (%s): live=%u maxlive=%u workers=%u ***\n",isaPath,occW[0],occW[1],occW[5]);
         CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
-        FreeGpu(ring.buf);FreeGpu(fence);FreeGpu(sink);FreeGpu(Dd);FreeGpu(Sd);FreeGpu(occ);FreeGpu(isa); return res; }
+        FreeGpu(ring.buf);FreeGpu(gl2c);FreeGpu(fence);FreeGpu(sink);FreeGpu(Dd);FreeGpu(Sd);FreeGpu(occ);FreeGpu(isa); return res; }
     res.ok=true; res.maxlive=occW[1]; res.workers=occW[5]; res.steps=occW[6]; res.chk=occW[7];
     { uint32_t gs=occW[2],ge=occW[3]; res.wall=(ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs); }
     double secs=(double)res.wall/freq_hz;
@@ -1224,8 +1623,9 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     // proof: every worker did exactly STEPS steps (occ[6]==workers*STEPS) AND (read/copy) checksum != 0
     bool cntOK = ((uint64_t)res.steps == (uint64_t)res.workers * STEPS) && res.workers>0;
     res.proof = cntOK && ((mode==2) ? true : (res.chk != 0));
+    if (g_gl2c) gl2c_reduce_report((volatile uint32_t*)gl2c.ptr, secs, res.bytes, isaPath);
     CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
-    FreeGpu(ring.buf);FreeGpu(fence);FreeGpu(sink);FreeGpu(Dd);FreeGpu(Sd);FreeGpu(occ);FreeGpu(isa);
+    FreeGpu(ring.buf);FreeGpu(gl2c);FreeGpu(fence);FreeGpu(sink);FreeGpu(Dd);FreeGpu(Sd);FreeGpu(occ);FreeGpu(isa);
     return res;
 }
 
@@ -1866,7 +2266,7 @@ static bool run_lds_bound(uint32_t node, const char* isaPath, uint32_t ldsBytes)
 
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: if a raw-PM4 run hangs and gets SIGKILL'd, the log still shows WHERE it died
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, BPF82, SP82, ALD82, WALL82 } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, BPF82, SP82, ALD82, WALL82, TW8, TW4LEAN, B128MODE, TILEORDMODE, FP8EDGE, LDSTRIMMODE, VGPRPROBE, LEAN, DECOMP, WAVESPEC } mode = CORRECT;
     bool fat = false;   // --fat: include >128-VGPR shapes (require umr SQ_DYN_VGPR.BLOCK_SIZE=1, cap 256)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
@@ -1887,6 +2287,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lds-bound"))    mode = LDSBOUND;
         else if (!strcmp(argv[i], "--wggemm-compute")) mode = WGGEMM2;
         else if (!strcmp(argv[i], "--wggemm-perf"))  mode = WGPERF;
+        else if (!strcmp(argv[i], "--wavespec"))     mode = WAVESPEC;
         else if (!strcmp(argv[i], "--wggemm-2x2"))   mode = WG2X2;
         else if (!strcmp(argv[i], "--nofeed-unroll")) mode = NFUNROLL;
         else if (!strcmp(argv[i], "--nofeed-occ"))    mode = NFOCC;
@@ -1900,6 +2301,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--feedpb"))        mode = FEEDPB;
         else if (!strcmp(argv[i], "--stack"))         mode = STACK;
         else if (!strcmp(argv[i], "--bw"))            mode = BW;
+        else if (!strcmp(argv[i], "--gl2c"))          g_gl2c = true;   // bracket dispatch w/ in-ring GL2C perfcounters
         else if (!strcmp(argv[i], "--baselines"))     mode = BASELINES;
         else if (!strcmp(argv[i], "--sustain"))       mode = SUSTAIN;
         else if (!strcmp(argv[i], "--kwin"))          mode = KWIN;
@@ -1920,6 +2322,15 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sp82"))          mode = SP82;
         else if (!strcmp(argv[i], "--ald82"))         mode = ALD82;
         else if (!strcmp(argv[i], "--wall82"))        mode = WALL82;
+        else if (!strcmp(argv[i], "--tw8"))           mode = TW8;
+        else if (!strcmp(argv[i], "--tw4lean"))       mode = TW4LEAN;
+        else if (!strcmp(argv[i], "--b128"))          mode = B128MODE;
+        else if (!strcmp(argv[i], "--tileord"))       mode = TILEORDMODE;
+        else if (!strcmp(argv[i], "--fp8edge"))       mode = FP8EDGE;
+        else if (!strcmp(argv[i], "--ldstrim"))       mode = LDSTRIMMODE;
+        else if (!strcmp(argv[i], "--vgprprobe"))     mode = VGPRPROBE;
+        else if (!strcmp(argv[i], "--lean"))          mode = LEAN;
+        else if (!strcmp(argv[i], "--decomp"))        mode = DECOMP;
         else if (!strcmp(argv[i], "--fat"))       fat = true;
     }
 
@@ -2164,8 +2575,9 @@ int main(int argc, char** argv) {
         // does the extra 33% occupancy now convert to throughput? (pool 2048 >> ... so all waves busy.)
         printf("\n=== PART 2: occupancy-at-saturation -- static(occ12) vs dyn(occ16), KDEPTH=16384 ===\n");
         printf("  pool   variant  maxlive occ/SIMD  okTiles    span_ms  TFLOPS  %%307\n");
-        { const uint32_t K=16384, TOTAL=4096, POOL=1536;   // occ 12 (1536x96=1152<file): wedge-safe, no exact-fill edge
+        { const uint32_t K=16384, TOTAL=4096;
           for (int dv=0; dv<2; ++dv) {
+              const uint32_t POOL = dv ? 2560u : 1536u;   // dyn:2560 -> occ16 (above the 2048 exact-fill race); static:1536 -> occ12 (its 96-VGPR reserve cap). NOW the occ16-vs-occ12 contrast is real.
               MbResult r=run_microbatch(node,dv?"occ_mb_d1.bin":"occ_mb_d0.bin",dv!=0,fragIn,POOL,96/8,K,TOTAL,Dref);
               if(!r.ok){ fprintf(stderr,"  %s incomplete.\n",dv?"dyn":"static"); rc=3; continue; }
               double tf=(double)TOTAL*K*NACC*(2.0*16*16*16)*freq_hz/(double)r.wall/1e12;
@@ -2405,6 +2817,65 @@ int main(int argc, char** argv) {
             double pct = 100.0*r.tf/307.0, wpc = 15.9*r.tf/307.0;
             printf("  %-28s %6.1f TF  %4.1f%%  %.2f WMMA/cyc  maxlive=%u WGs  claims=%u  acc00 OK=%u/%u\n",
                    c.name, r.tf, pct, wpc, r.maxlive, r.total, r.okSamp, r.okSamp + r.badSamp);
+        }
+    } else if (mode == WAVESPEC) {
+        // ===== MAD-305 #323: lean WAVE-SPECIALIZED fp8 GEMM. Oracle (STORE=1) then perf (STORE=0). =====
+        // Config via env: WS_FM WS_FN WS_NLOAD WS_NCOMP WS_DYN (defaults 2/2/1/4/0).
+        int FM = getenv("WS_FM") ? atoi(getenv("WS_FM")) : 2;
+        int FN = getenv("WS_FN") ? atoi(getenv("WS_FN")) : 2;
+        int NLOAD = getenv("WS_NLOAD") ? atoi(getenv("WS_NLOAD")) : 1;
+        int NCOMP = getenv("WS_NCOMP") ? atoi(getenv("WS_NCOMP")) : 4;
+        bool dyn = getenv("WS_DYN") && atoi(getenv("WS_DYN"));
+        printf("\n=== MAD-305 #323: lean wave-specialized fp8 GEMM (FM=%d FN=%d NLOAD=%d NCOMP=%d dyn=%d) ===\n",
+               FM, FN, NLOAD, NCOMP, dyn);
+        // ---- correctness gate: STORE=1 bin, small shape (tile = NCOMP*FM*16 x FN*16) ----
+        int TM = NCOMP*FM*16, TN = FN*16;
+        int Mc = TM*4, Nc = TN*16, Kc = 512;          // 4 M-tiles x 16 N-tiles (NTL pow2), K=512
+        // the kernel BINARY must match (FM,FN,NLOAD,NCOMP,dyn) EXACTLY: DYNVGPR=1 bins carry s_alloc_vgpr +
+        //   the lean streamed loader, and NLOAD/NCOMP are baked into the kernel's wave-role split. Loading a
+        //   mismatched bin under bit6-armed dispatch is the hang/brick. Names are fully qualified per cell
+        //   (build.sh stanza [1h2]): occ_ws_<FM>x<FN>_l<NLOAD>_c<NCOMP>[_dyn][_st].bin.
+        char stbin[128], perfbin[128];
+        // WS_BW=1 (dyn only): the BUSYWAIT variant that swaps the 4 asymmetric K-slice s_barrier for an
+        //   LDS busy-wait (T6 BRICK #4 fix: s_barrier deadlocks under dyn-VGPR at mixed allocations).
+        bool bw = dyn && getenv("WS_BW") && atoi(getenv("WS_BW"));
+        const char* dtag = dyn ? "_dyn" : "";
+        const char* btag = bw ? "_bw" : "";
+        snprintf(perfbin, sizeof perfbin, "occ_ws_%dx%d_l%d_c%d%s%s.bin",    FM, FN, NLOAD, NCOMP, dtag, btag);
+        snprintf(stbin,   sizeof stbin,   "occ_ws_%dx%d_l%d_c%d%s%s_st.bin", FM, FN, NLOAD, NCOMP, dtag, btag);
+        if (bw) printf("  [BUSYWAIT] s_barrier->LDS busy-wait on the 4 K-slice barriers (claim barrier kept)\n");
+        // BRICK-GUARD: if the EXACT bin for this config was not built, REFUSE to dispatch. A file-not-found
+        //   is a safe stop; a geometry/bin mismatch under bit6-armed dyn is what bricked gfx1201. Build first.
+        { const char* miss = nullptr;
+          FILE* fa = fopen(stbin, "rb");   if (fa) fclose(fa);   else miss = stbin;
+          FILE* fb = fopen(perfbin, "rb"); if (fb) fclose(fb);   else if (!miss) miss = perfbin;
+          if (miss) { printf("  *** bin '%s' not built -- run ./build.sh (stanza [1h2]); REFUSING to dispatch (mismatch=brick) ***\n", miss); rc = 4; } }
+        if (rc == 0) {
+        printf("  [oracle] %dx%dx%d  tile=%dx%d  bin=%s\n", Mc, Nc, Kc, TM, TN, stbin);
+        WgcResult o = run_wavespec_compute(node, stbin, Mc, Nc, Kc, 64u, true, FM, FN, NLOAD, NCOMP, dyn);
+        if (!o.ok) { printf("  ORACLE INCOMPLETE (hang/timeout)\n"); rc = 3; }
+        else {
+            uint64_t tot = o.okFrags + o.badFrags;
+            printf("  ORACLE %s  (%llu/%llu frags OK, bad=%llu)  maxlive=%u claims=%u\n",
+                   o.badFrags==0 ? "OK" : "*** MISMATCH ***",
+                   (unsigned long long)o.okFrags, (unsigned long long)tot, (unsigned long long)o.badFrags, o.maxlive, o.total);
+            if (o.badFrags) rc = 3;
+        }
+        }
+        // ---- perf: STORE=0 bin, real shape ----
+        if (rc == 0) {
+            struct Sm { const char* name; int M, N, K; uint32_t nWG; };
+            Sm cases[] = {
+                { "2048x2048xK4096  (medium)", 2048, 2048,  4096, 256u },
+                { "4096x4096xK16384 (TARGET)", 4096, 4096, 16384, 256u },
+            };
+            for (auto& c : cases) {
+                WgpResult r = run_wavespec_perf(node, perfbin, c.M, c.N, c.K, c.nWG, freq_hz, FM, FN, NLOAD, NCOMP, dyn);
+                if (!r.ok) { printf("  %-28s INCOMPLETE (hang/timeout)\n", c.name); rc = 3; continue; }
+                double pct = 100.0*r.tf/307.0;
+                printf("  %-28s %6.1f TF  %4.1f%% of 307  maxlive=%u WGs  claims=%u\n",
+                       c.name, r.tf, pct, r.maxlive, r.total);
+            }
         }
     } else if (mode == WGGEMM2) {
         // ===== MAD-305 Phase 2: wave-group fp8 GEMM compute (A-LDS + B-trfeed + static 4x4). Oracle. =====
@@ -2729,6 +3200,113 @@ int main(int argc, char** argv) {
         }
         printf("    [residWv = maxlive_WG * waves/WG. If TF flattens while nWG climbs -> occupancy-capped (resident wall),\n");
         printf("     not under-fed -> the lever past it is MORE RESIDENT waves (leaner VGPR / dyn-VGPR feed phase), not more nWG.]\n");
+    } else if (mode == LEAN) {
+        // ===== MAD-305 L4: LEAN single-wave register-blocked GEMM. TWM=1 TWN=1 (1 wave/WG = the SAFE regime: no
+        //   co-residency barrier, cannot deadlock), register-blocked FM x FN tile, direct-global ANOLDSTR feed (no
+        //   LDS A-tile, no barriers). A/B frags packed tight just past the accumulators -> VGPR alloc tracks the
+        //   lean tile. Persistent: nWG single-wave WGs claim output tiles. Sweeps (FM,FN) x nWG to DECOUPLE
+        //   occupancy (nWG -> residWv) from B-reuse (FM,FN) -- the high-occupancy-WITH-strong-reuse corner the
+        //   4-wave confound (192 resident but ~149 TF) never measured. Win: residWv >> 64 AND TF > 165.7. =====
+        printf("\n=== MAD-305 L4 LEAN single-wave register-blocked GEMM (TWM=1 TWN=1, ANOLDSTR direct-global feed) ===\n");
+        printf("    winner ref: 8x2 8-wave WG = 165.7 TF @ ~64 resident waves; NOFEED ceiling ~282. closing that gap is the goal.\n");
+        struct LC { const char* tag; int fm, fn; uint32_t vgpr, vgpr_bpf; };  // vgpr=naive ceil((32+8fmfn+4fm+4fn)/8); bpf adds 2nd feed buffer
+        LC cfgs[] = {
+            { "2x2", 2, 2, 10u, 12u },   // naive 80 / bpf 96
+            { "4x2", 4, 2, 15u, 18u },   // naive 120 / bpf 144
+            { "2x4", 2, 4, 15u, 18u },   // naive 120 / bpf 144
+            { "4x4", 4, 4, 24u, 28u },   // naive 192 / bpf 224
+            { "8x2", 8, 2, 25u, 30u },   // naive 200 / bpf 240
+        };
+        struct Var { const char* name; const char* prefix; bool bpf; };   // naive lean vs LEANBPF (prefetch-pipelined)
+        Var vars[] = { {"naive", "occ_lean_", false}, {"bpf", "occ_leanbpf_", true} };
+        // ---- oracle gate @512^3 (EVERY frag of the single wave vs chained CPU wmma_ref) BEFORE any perf; naive + LEANBPF ----
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags vs chained wmma_ref; naive + LEANBPF) ---\n");
+        bool allpass = true;
+        for (auto& c : cfgs) {
+            for (auto& v : vars) {
+                bool bpf = v.bpf;
+                char bin[80]; snprintf(bin, sizeof bin, "%s%s_st1.bin", v.prefix, c.tag);
+                uint32_t vg = bpf ? c.vgpr_bpf : c.vgpr;
+                WgcResult r = run_wggemm_compute(node, bin, 512,512,512, 64u, true, c.fm, 512u, vg,
+                                                 /*useAtr*/1, /*TWN*/1, /*FNt*/c.fn, /*TWMt*/1);
+                bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+                printf("    oracle %-5s lean_%-4s okFrags=%u badFrags=%u  %s\n", v.name, c.tag, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+                if (!pass) { allpass = false; rc = 3; }
+            }
+        }
+        if (!allpass) { printf("    *** oracle FAIL -> perf aborted (debug lean feed/addressing/register-pack/LEANBPF pipeline)\n"); }
+        else {
+            // ---- DURATION-GUARDED SHAPE RAMP. BRICK-#2 LESSON: the old cap was POST-HOC -- it checked span AFTER
+            //   running the dispatch, so it RAN the ~10s 65536^2 shape (which starved the gfx ring) before "stopping".
+            //   A post-hoc check is NOT a guard. Fixed: PREDICT each shape's span from the previous (work ratio) and
+            //   SKIP -- never RUN a dispatch projected over the cap. The smallest shape (4096^2 x 2048) is safe-by-
+            //   construction (<~100ms even at 1 TF). Compares naive vs LEANBPF (the RGA-diagnosed feed-prefetch fix).
+            //   NOTE: still assumes a GPU genuinely ISOLATED from the compositor; a hang is only bounded by the 20s
+            //   harness timeout, which is fatal if the desktop shares the device (see the gfx1201 brick KGs). ----
+            const double SPAN_CAP_MS = 1200.0;   // never RUN a dispatch PREDICTED to exceed this
+            const uint32_t NW = 1024u;
+            struct Shape { int M, N, K; };
+            Shape shapes[] = { {4096,4096,2048}, {8192,8192,2048}, {16384,16384,4096}, {32768,32768,8192}, {65536,65536,16384} };
+            printf("  --- perf RAMP (smallest-first, nWG=%u, PREDICT-AND-SKIP guard @ %.0f ms; naive vs LEANBPF) ---\n", NW, SPAN_CAP_MS);
+            printf("    %-6s %-6s %-18s %8s %7s %9s %9s %s\n","cfg","var","shape(MxNxK)","TF","%307","residWv","span_ms","correct");
+            for (auto& c : cfgs) {
+                for (auto& v : vars) {
+                    bool bpf = v.bpf;
+                    char bin[80]; snprintf(bin, sizeof bin, "%s%s.bin", v.prefix, c.tag);
+                    uint32_t vg = bpf ? c.vgpr_bpf : c.vgpr;
+                    double prev_span = 0.0, prev_work = 0.0;
+                    for (auto& sh : shapes) {
+                        double work = 2.0*(double)sh.M*sh.N*sh.K;
+                        char shp[24]; snprintf(shp, sizeof shp, "%dx%dx%d", sh.M, sh.N, sh.K);
+                        if (prev_span > 0.0) {                                  // PREDICT before running; skip (and stop) if over cap
+                            double pred = prev_span * (work / prev_work);
+                            if (pred > SPAN_CAP_MS) {
+                                printf("    %-6s %-6s %-18s SKIP (pred ~%.0f ms > %.0f cap; larger shapes also skipped)\n",
+                                       c.tag, v.name, shp, pred, SPAN_CAP_MS);
+                                break;
+                            }
+                        }
+                        WgpResult r = run_wggemm_perf(node, bin, sh.M,sh.N,sh.K, NW, freq_hz, c.fm, 512u, vg,
+                                                      /*TWN*/1, /*useAtr*/1, /*FNt*/c.fn, /*TWMt*/1);
+                        if (!r.ok) { printf("    %-6s %-6s %-18s INCOMPLETE -> STOP\n", c.tag, v.name, shp); rc=3; break; }
+                        double span_ms = (double)r.wall/freq_hz*1e3;
+                        printf("    %-6s %-6s %-18s %8.1f %6.1f%% %9u %9.1f  %s\n",
+                               c.tag, v.name, shp, r.tf, 100.0*r.tf/307.0, r.maxlive*1u, span_ms, r.badSamp?"*** BAD":"OK");
+                        if (r.badSamp) rc=3;
+                        prev_span = span_ms; prev_work = work;
+                        if (span_ms > SPAN_CAP_MS) { printf("    [measured %.0f ms > cap -> STOP (predictor undershot)]\n", span_ms); break; }
+                    }
+                }
+            }
+            printf("    [Per shape: LEANBPF (bpf) should lift TF vs naive if feed-latency-bound (the RGA diagnosis).\n");
+            printf("     TF rises with shape -> compute-bound. residWv >> 64 (single-wave) + TF > 165.7 = L4 beats the winner.]\n");
+        }
+    } else if (mode == DECOMP) {
+        // ===== MAD-305: cooperative 4x4 vs 8x2 BOTTLENECK DECOMPOSITION. For each tile: FED (real GEMM), NOFEED
+        //   (WMMA-only compute ceiling), FEEDONLY (feed, no WMMA = feed wall). Reads: FED near NOFEED => compute-
+        //   bound/tapped out; FED near FEEDONLY => feed-bound, headroom = NOFEED-FED. Answers "what binds 4x4, and is
+        //   it fixable to overtake 8x2". Cooperative ~1s winner-class regime (proven safe). 65536^2 x K16384, nWG=256. =====
+        printf("\n=== MAD-305 cooperative 4x4 vs 8x2 BOTTLENECK DECOMPOSITION @65536^2 x K16384 (TWN=4, nWG=256) ===\n");
+        printf("    %-14s %8s %7s %9s %9s\n","config","TF","%307","residWv","span_ms");
+        struct D { const char* name; const char* bin; int fm, fn; uint32_t lds; };
+        D rows[] = {
+            { "4x4 FED",      "occ_wggemm2_tw4_kwin4_pw4.bin",             4, 4, 16388u },
+            { "4x4 NOFEED",   "occ_wggemm2_tw4_nofeed.bin",                4, 4, 16388u },
+            { "4x4 FEEDONLY", "occ_wggemm2_tw4_kwin4_pw4_feedonly.bin",    4, 4, 16388u },
+            { "8x2 FED",      "occ_wggemm2_82_tw4_kwin4_pw4.bin",          8, 2, 32772u },
+            { "8x2 NOFEED",   "occ_wggemm2_82_tw4_nofeed.bin",             8, 2, 32772u },
+            { "8x2 FEEDONLY", "occ_wggemm2_82_tw4_kwin4_pw4_feedonly.bin", 8, 2, 32772u },
+        };
+        const int M=65536, N=65536, K=16384; const uint32_t NW=256u;
+        for (auto& d : rows) {
+            WgpResult r = run_wggemm_perf(node, d.bin, M,N,K, NW, freq_hz, d.fm, d.lds, 26u,
+                                          /*TWN*/4, /*useAtr*/0, /*FNt*/d.fn, /*TWMt*/2);
+            if (!r.ok) { printf("    %-14s INCOMPLETE (hang/timeout)\n", d.name); rc=3; continue; }
+            printf("    %-14s %8.1f %6.1f%% %9u %9.1f\n",
+                   d.name, r.tf, 100.0*r.tf/307.0, r.maxlive*8u, (double)r.wall/freq_hz*1e3);
+        }
+        printf("    [FED near NOFEED -> compute-bound (no headroom). FED near FEEDONLY -> feed-bound (headroom = NOFEED-FED).\n");
+        printf("     4x4 with a BIG NOFEED->FED gap AND FED~FEEDONLY => feed-bound w/ headroom => a B-bandwidth lever could lift it past 8x2.]\n");
     } else if (mode == REUSE82) {
         // ===== MAD-305 REUSE-TILE B-FEED lever: 8x2 per-wave tile HALVES the binding per-wave B global_load_tr
         //   feed (B-tr/MAC 0.25 -> 0.125; A-LDS-rd 0.25 -> 0.50) vs 4x4. Both @ TWN=4 (8-wave WG, vgprField 26 =
@@ -2969,38 +3547,208 @@ int main(int argc, char** argv) {
         // ===== MAD-305 s_setprio scheduling on the 165 winner (KWINBPF) = CDNA rung-9 gap-filler equivalent: s_setprio 1
         //   around the per-slice WMMA burst, s_setprio 0 during feed -> bias the shared issue port toward WMMA-phase
         //   waves so they issue dense back-to-back while feed-phase waves yield. STACKS on the double-buffer. =====
-        printf("\n=== MAD-305 8x2 KWINBPF + s_setprio (CDNA rung-9 sched equiv) vs the 164.9 winner ===\n");
-        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) ---\n");
-        { struct O { const char* name; const char* bin; };
-          O ors[] = { { "bpf+setprio", "occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.bin" } };
-          for (auto& o : ors) {
-            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, 8, 32772u, 26u, 0, 4, 2);
-            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
-            printf("    oracle %-12s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
-            if (!pass) rc=3;
-          }
-        }
-        printf("    %-18s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
-        const int M=65536, N=65536, Ks=16384;
-        struct G { const char* name; const char* bin; };
-        G geoms[] = {
-            { "bpf (164.9 win)",  "occ_wggemm2_82_tw4_kwin4_bpf.bin" },
-            { "bpf + s_setprio",  "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin" },
+        printf("\n=== MAD-305 ml8-shape TILE SWEEP (wggemm2 KWIN=4 KWINBPF; winner 256x128 + smaller tiles) ===\n");
+        // ml8-shape re-targeting: override M/N/K via env (WG_M/WG_N/WG_K) to bench REAL ml8 FFN shapes vs the
+        //   square 65536^2 default. Smaller tiles -> more tiles -> fill the 64 CUs at the small real shapes.
+        //   Constraints: N = pow2 * (TWN*FN*16);  M % (TWM*FM*16) == 0;  K % (32*KWIN) == 0.
+        //   per-tile lds = (TWM*FM*16)*32*KWIN + 4 ; vf = ceil(RGA-livereg-peak / 8). (exact N=9216/2560 needs
+        //   the pow2->div/mod NTL decode generalization; N=8192/2048 are pow2 proxies.)
+        const int M  = getenv("WG_M") ? atoi(getenv("WG_M")) : 65536;
+        const int N  = getenv("WG_N") ? atoi(getenv("WG_N")) : 65536;
+        const int Ks = getenv("WG_K") ? atoi(getenv("WG_K")) : 16384;
+        printf("    [shape: M=%d N=%d K=%d]\n", M, N, Ks);
+        struct T { const char* name; const char* pbin; const char* obin;
+                   int FMt, FNt, TWN, TWMt; uint32_t lds, vf; };
+        T tiles[] = {
+            { "82_tw4 256x128(164.9)", "occ_wggemm2_82_tw4_kwin4_bpf_gd.bin", "occ_wggemm2_82_tw4_kwin4_bpf_gd_st1.bin", 8,2,4,2, 32772u, 26u },
+            // LEAN vf after the publish-register relocation fix (PUBW slots now tile-relative = FA+{0,8,16,24}):
+            //   lean tiles drop from the forced 208 VGPR to their true footprint. vf = ceil((max_vgpr_idx+1)/8):
+            //   42_tw4/42_tw2 idx127->16, 24_tw2 idx135->17, 22_tw2 idx91->12. LDS=KWIN*ATILE+4 unchanged.
+            //   GENDIV bins (_gd infix): magic-reciprocal NTL decode -> exact non-pow2 NTL (N=9216/2560).
+            { "42_tw4 128x128",        "occ_wggemm2_42_tw4_kwin4_bpf_gd.bin", "occ_wggemm2_42_tw4_kwin4_bpf_gd_st1.bin", 4,2,4,2, 16388u, 16u },
+            { "42_tw2 128x64",         "occ_wggemm2_42_tw2_kwin4_bpf_gd.bin", "occ_wggemm2_42_tw2_kwin4_bpf_gd_st1.bin", 4,2,2,2, 16388u, 16u },
+            { "24_tw2 64x128",         "occ_wggemm2_24_tw2_kwin4_bpf_gd.bin", "occ_wggemm2_24_tw2_kwin4_bpf_gd_st1.bin", 2,4,2,2,  8196u, 17u },
+            { "22_tw2 64x64",          "occ_wggemm2_22_tw2_kwin4_bpf_gd.bin", "occ_wggemm2_22_tw2_kwin4_bpf_gd_st1.bin", 2,2,2,2,  8196u, 12u },
         };
-        uint32_t nwgs[] = { 256u, 512u, 1024u };
-        for (auto& g : geoms) {
-            printf("  --- %s ---\n", g.name);
+        printf("  --- oracle gate @512x512x512 (per-tile, all frags) ---\n");
+        for (auto& t : tiles) {
+            WgcResult r = run_wggemm_compute(node, t.obin, 512,512,512, 64u, true, t.FMt, t.lds, t.vf, 0, t.TWN, t.FNt, t.TWMt, 0, 0, 0, /*useGenDiv*/true);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-22s okFrags=%u badFrags=%u  %s\n", t.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+        }
+        printf("    %-22s %6s %8s %8s %9s %8s %s\n","tile","nWG","TF","%307","residWv","span_ms","correct");
+        // nWG sweep extended DOWNWARD (MAD-305 ml8): at small real shapes TF climbs monotonically as nWG drops
+        //   (persistent kernel -> fewer WGs claim more tiles each -> less aggregate prologue/setup overhead).
+        //   gfx1201 = 64 CUs, so 32/64/128 = 0.5/1/2 WG-per-CU. WG_NWG env overrides the whole set with one value.
+        uint32_t nwgs[] = { 32u, 64u, 128u, 256u };
+        for (auto& t : tiles) {
+            printf("  --- %s ---\n", t.name);
             for (uint32_t nw : nwgs) {
-                WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, 32772u, 26u, 4, 0, 2);
-                if (!r.ok) { printf("    %-18s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
-                printf("    %-18s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
-                       g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                WgpResult r = run_wggemm_perf(node, t.pbin, M,N,Ks, nw, freq_hz, t.FMt, t.lds, t.vf, t.TWN, 0, t.FNt, t.TWMt, 0, 0, /*useGenDiv*/true);
+                if (!r.ok) { printf("    %-22s %6u INCOMPLETE\n", t.name, nw); rc=3; continue; }
+                printf("    %-22s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                       t.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
                        (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
                 if (r.badSamp) rc=3;
             }
         }
-        printf("    [s_setprio biases the issue port toward WMMA-phase waves. >164.9 -> the scheduling gap-filler lands\n");
-        printf("     (stacks with double-buffer); flat -> the 8 same-WG waves are already phase-mixed enough by the claim loop.]\n");
+        printf("    [smaller tiles -> more tiles -> fill the 64 CUs at small real shapes. winner row = 164.9-basis baseline.]\n");
+    } else if (mode == B128MODE) {
+        // ===== MAD-305 128-bit B FEED on the 165.7 winner = the ISSUE-SLOT axis via WIDE LOADS. RDNA4 has NO
+        //   128-bit transpose for fp8 (tr_b128 is 16-bit only), so the transpose is moved to the CPU preshuffle
+        //   (mbg_preshuffle_B128 -> frag-ready, lane-linear 512B blocks). The device then does a PLAIN
+        //   global_load_b128 (vaddr=lane*16) delivering 2 K=16 B-frags/instr -> B-feed slots 16->8/K-window
+        //   (HALVED, proven in the disasm). CPU-proven byte-identical frag values to the tr_b64 winner. =====
+        printf("\n=== MAD-305 8x2 KWINBPF+SETPRIO + 128-bit B feed (plain b128 over frag-ready preshuffle) vs the 165.7 winner ===\n");
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) -- THE correctness gate for the wide B load ---\n");
+        { struct O { const char* name; const char* bin; };
+          O ors[] = { { "bpf+sp+b128", "occ_wggemm2_82_tw4_kwin4_bpf_sp_b128_st1.bin" } };
+          for (auto& o : ors) {
+            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, 8, 32772u, 26u, 0, 4, 2, 2, /*useB128*/1);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-12s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+          }
+          if (rc==3) { printf("    [B128 oracle FAILED -> NOT running perf. Frag-ready layout or kernel b128 indexing wrong.]\n"); }
+        }
+        if (rc!=3) {
+          printf("    %-20s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+          const int M=65536, N=65536, Ks=16384;
+          struct G { const char* name; const char* bin; int b128; };
+          G geoms[] = {
+              { "bpf+sp (165.7 win)",  "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin",      0 },
+              { "bpf+sp + b128 feed",  "occ_wggemm2_82_tw4_kwin4_bpf_sp_b128.bin", 1 },
+          };
+          uint32_t nwgs[] = { 256u, 512u, 1024u };
+          for (auto& g : geoms) {
+              printf("  --- %s ---\n", g.name);
+              for (uint32_t nw : nwgs) {
+                  WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, 32772u, 26u, 4, 0, 2, 2, g.b128);
+                  if (!r.ok) { printf("    %-20s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                  printf("    %-20s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                         g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                         (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                  if (r.badSamp) rc=3;
+              }
+          }
+          printf("    [128-bit B load halves B-feed issue slots (16->8/K-window). >165.7 -> the issue-slot model holds and B\n");
+          printf("     feed was part of the wall; flat -> B feed wasn't issue-bound (look to LDS A-reads / WMMA-result latency).]\n");
+        }
+    } else if (mode == TILEORDMODE) {
+        // ===== MAD-305 L1: persistent tile-order / B-panel L2 locality. Default claim order is A-stationary
+        //   (tile_col = ti & NTL_MASK, N fastest) so the B/N panel changes every tile. N_STATIONARY (TILEORD=1)
+        //   makes consecutive ti share tile_col and sweep tile_row -> a B panel stays hot in L2 across the
+        //   M-sweep. Pure claim-order change (no WMMA math); correctness is order-invariant (oracle mirrors it).
+        //   FED-faster -> B-feed latency was partly L2 miss (cache lever real); flat -> not cache. =====
+        printf("\n=== MAD-305 L1: N_STATIONARY tile order (B-panel L2 locality) vs the 165.7 winner ===\n");
+        printf("  --- oracle gate @512x512x512 (mirror-decoded) -- THE correctness gate for the claim-order swap ---\n");
+        { WgcResult r = run_wggemm_compute(node, "occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat_st1.bin", 512,512,512, 64u, true, 8, 32772u, 26u, 0, 4, 2, 2, /*useB128*/0, /*useTileord*/1);
+          bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+          printf("    oracle nstat  okFrags=%llu badFrags=%llu  %s\n", (unsigned long long)r.okFrags, (unsigned long long)r.badFrags, pass?"PASS":"*** FAIL");
+          if (!pass) { rc=3; printf("    [N_STATIONARY oracle FAILED -> NOT running perf. decode swap mismatched.]\n"); }
+        }
+        if (rc!=3) {
+          printf("    %-22s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+          const int M=65536, N=65536, Ks=16384;
+          struct G { const char* name; const char* bin; int tileord; };
+          G geoms[] = {
+              { "A-stat (165.7 win)",  "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin",       0 },
+              { "N_STATIONARY (L2)",   "occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat.bin", 1 },
+          };
+          uint32_t nwgs[] = { 256u, 512u, 1024u };
+          for (auto& g : geoms) {
+              printf("  --- %s ---\n", g.name);
+              for (uint32_t nw : nwgs) {
+                  WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, 32772u, 26u, 4, 0, 2, 2, /*useB128*/0, g.tileord);
+                  if (!r.ok) { printf("    %-22s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                  printf("    %-22s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                         g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                         (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                  if (r.badSamp) rc=3;
+              }
+          }
+          printf("    [N_STATIONARY keeps a B panel hot in L2 across the M-sweep. >165.7 -> B-feed latency was partly L2\n");
+          printf("     miss (cache locality lever is real, make it shape-dependent); flat -> not cache, go to wave-spec (L2).]\n");
+        }
+    } else if (mode == FP8EDGE) {
+        // ===== MAD-305 SAFETY FLOOR: full-fp8-domain edge-encoding gate. The RDNA4 ISA (F8_Mode table) shows e4m3
+        //   has denormals (exp0, ~2^-9) + max-normal 0x7E=448, and FP_DENORM (MODE reg) "affects float ops in VALU"
+        //   (WMMA runs on VALU). Our prior oracles only fed NORMAL mid-range bytes -> never probed whether the GPU's
+        //   default modes interpret denormals/max-normals like our OCP e4m3fn CPU ref. This gate feeds A=denormals,
+        //   B=max-normals so denorm*max dominates the dot product -> any input-denormal FLUSH diverges LOUDLY. =====
+        printf("\n=== MAD-305 fp8 FULL-DOMAIN edge gate: denormals x max-normals vs CPU OCP-e4m3fn ref ===\n");
+        const char* bin = "occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.bin";   // the production 165.7 winner oracle binary
+        printf("  --- control: NICE mid-range data (must PASS -- sanity that binary+harness are clean) ---\n");
+        { WgcResult r = run_wggemm_compute(node, bin, 512,512,512, 64u, true, 8, 32772u, 26u, 0, 4, 2, 2, 0, 0, /*edgeData*/0);
+          bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+          printf("    NICE   okFrags=%llu badFrags=%llu  %s\n", (unsigned long long)r.okFrags, (unsigned long long)r.badFrags, pass?"PASS":"*** FAIL");
+          if (!pass) rc=3; }
+        printf("  --- EDGE: A=denormals(0x01-0x07,signed)+0x7E, B=max-normals(0x7E=448,0xFE=-448)+mid ---\n");
+        { WgcResult r = run_wggemm_compute(node, bin, 512,512,512, 64u, true, 8, 32772u, 26u, 0, 4, 2, 2, 0, 0, /*edgeData*/1);
+          bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+          printf("    EDGE   okFrags=%llu badFrags=%llu  %s\n", (unsigned long long)r.okFrags, (unsigned long long)r.badFrags, pass?"PASS":"*** EDGE MISMATCH");
+          if (!pass) rc=3; }
+        printf("    [EDGE PASS -> GPU WMMA decodes denormals + 0x7E=448 IDENTICALLY to OCP e4m3fn; default FP_DENORM\n");
+        printf("     allows input denorms -> NO HW_REG_MODE setreg needed across the full fp8 magnitude domain. Settled.\n");
+        printf("     EDGE FAIL while NICE PASSES -> a real edge divergence (likely input-denormal flush); rerun with\n");
+        printf("     WGC_DBG=1 to dump the failing values, then decide s_setreg(FP_DENORM) vs ref-fix vs quantizer-clamp.]\n");
+    } else if (mode == VGPRPROBE) {
+        // ===== MAD-305 VGPR sensitivity probe (RGA follow-up): is the 64-wave residency cap VGPR-bound? The kernel
+        //   NEEDS 207 regs (max index v206) so we can't go BELOW the baseline without a repack -- but we can RAISE the
+        //   reservation safely (over-allocation never corrupts) and watch residWv. DROP as VGPR climbs -> we're on the
+        //   VGPR-occupancy boundary, the 192 repack would pay. FLAT -> NOT VGPR-bound (like LDS) -> the cap is the
+        //   SE/persistent-dispatch, go to dyn-VGPR / more persistence. Runs on the LDSTRIM substrate (LDS 32768). =====
+        printf("\n=== MAD-305 VGPR sensitivity probe (raise reservation, watch residWv) on the LDSTRIM substrate ===\n");
+        printf("    %-26s %6s %8s %9s %8s %s\n","reservation","nWG","TF","residWv","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384;
+        const char* bin = "occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim.bin";
+        struct V { const char* name; uint32_t f; };
+        V vs[] = { {"208->216 (field26 base)",26u}, {"232->240 (field29)",29u}, {"256 max (field32)",32u} };
+        for (auto& v : vs) {
+            WgpResult r = run_wggemm_perf(node, bin, M,N,Ks, 512u, freq_hz, 8, 32768u, v.f, 4, 0, 2);
+            if (!r.ok) { printf("    %-26s %6u INCOMPLETE\n", v.name, 512u); rc=3; continue; }
+            const char* tag = r.tf > 307.0 ? "*** timer glitch" : (r.badSamp?"*** acc00 BAD":"acc00 OK");
+            printf("    %-26s %6u %8.1f %9u %8.1f  %s\n", v.name, 512u, r.tf, r.maxlive*8u, (double)r.wall/freq_hz*1e3, tag);
+            if (r.badSamp) rc=3;
+        }
+        printf("    [residWv DROPS as reservation climbs -> VGPR-bound (the 192 repack pays). FLAT across 216..256 ->\n");
+        printf("     NOT VGPR-bound; the 64-wave cap is the SE/persistent-dispatch -> dyn-VGPR (lean launch) is the lever.]\n");
+    } else if (mode == LDSTRIMMODE) {
+        // ===== MAD-305 RGA-surfaced LDS-cliff trim: the winner reserves 32772B LDS (4B over the 32768 boundary) ->
+        //   rounds a full 512B granule -> alloc 33280 -> only 1 WG fits a 64KB WGP. LDSTRIM overlaps the 4B
+        //   ti-broadcast into A-ring slot 0 -> 32768 = alloc 32768 -> 2 WGs/WGP. WATCH residWv: ~2x (64->128 waves)
+        //   = the trim unlocked occupancy; if residWv flat -> occupancy wasn't LDS-bound (it's VGPR/SE/dispatch). =====
+        printf("\n=== MAD-305 LDS-cliff trim: 32772 (alloc 33280, 1 WG/WGP) -> 32768 (alloc 32768, 2 WG/WGP) ===\n");
+        printf("  --- oracle gate @512x512x512 (the ti-broadcast/A-fill overlap + race-closing barrier) ---\n");
+        { WgcResult r = run_wggemm_compute(node, "occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim_st1.bin", 512,512,512, 64u, true, 8, 32768u, 26u, 0, 4, 2);
+          bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+          printf("    oracle ldstrim  okFrags=%llu badFrags=%llu  %s\n", (unsigned long long)r.okFrags, (unsigned long long)r.badFrags, pass?"PASS":"*** FAIL (overlap race / barrier)");
+          if (!pass) { rc=3; printf("    [oracle FAILED -> NOT running perf. The slot-0 overlap raced; barrier placement wrong.]\n"); }
+        }
+        if (rc!=3) {
+          printf("    %-26s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+          const int M=65536, N=65536, Ks=16384;
+          struct G { const char* name; const char* bin; uint32_t lds; };
+          G geoms[] = {
+              { "winner (LDS 33280 alloc)",  "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin",         32772u },
+              { "LDSTRIM (LDS 32768 alloc)", "occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim.bin", 32768u },
+          };
+          uint32_t nwgs[] = { 256u, 512u, 1024u };
+          for (auto& g : geoms) {
+              printf("  --- %s ---\n", g.name);
+              for (uint32_t nw : nwgs) {
+                  WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, g.lds, 26u, 4, 0, 2);
+                  if (!r.ok) { printf("    %-26s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                  printf("    %-26s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                         g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*8u,
+                         (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                  if (r.badSamp) rc=3;
+              }
+          }
+          printf("    [residWv ~2x (e.g. 512->1024 waves) -> the 4-byte trim unlocked 2 WGs/WGP = occupancy was LDS-bound;\n");
+          printf("     and if the wall was occupancy, TF rises. residWv flat -> occupancy NOT LDS-bound (VGPR / SE / dispatch).]\n");
+        }
     } else if (mode == ALD82) {
         // ===== MAD-305 WIDE A-READ on the 165.7 winner = the ISSUE-SLOT axis ("fewer dispatch slots on feed"):
         //   ds_load_2addr_stride64_b64 loads 2 M-frags/instr (offset*512 matches the mi*512 frag stride) -> A-reads
@@ -3038,6 +3786,127 @@ int main(int argc, char** argv) {
         }
         printf("    [wide A-read halves A-read issue slots (16->8/slice). >165.7 -> the issue-slot axis pays (mimic the\n");
         printf("     separate pipe by spending fewer dispatch slots on feed); flat -> the base-adds/bank-conflicts ate it.]\n");
+    } else if (mode == TW8) {
+        // ===== MAD-305 BIG-TILE lever (CDNA rung-8 256x256 equiv): grow the COOPERATIVE tile, not the per-wave tile.
+        //   TWN=8 -> 16-wave WG computing a 256x256 SQUARE region (vs 256x128 @ TWN=4). The 165.7 wall is WMMA-result
+        //   latency hidden by cross-wave WMMA interleave at a structural WG-residency cap; doubling waves/WG puts 2x WMMA
+        //   in flight per WG to hide more of it. Per-wave shape unchanged (FM=8 FN=2, ~128 VGPR static -> co-resides);
+        //   LDS unchanged (TM=TWM*FM*16 is TWN-independent -> 32KB KWIN ring); A-strip reused by 8 N-waves (NBANDS=1). =====
+        printf("\n=== MAD-305 8x2 TWN=8 256x256 SQUARE cooperative tile (16-wave WG) vs the 165.7 TWN=4 winner ===\n");
+        printf("  --- oracle gate @512x512x512 (all FM*FN frags, all waves) -- THE correctness gate for the 16-wave WG ---\n");
+        { struct O { const char* name; const char* bin; int twn; };
+          O ors[] = {
+            { "tw4 win (ref)", "occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.bin",    4 },
+            { "tw8 bpf+sp",    "occ_wggemm2_82_tw8_kwin4_bpf_sp_st1.bin",    8 },
+            { "tw8 +wide-A",   "occ_wggemm2_82_tw8_kwin4_bpf_sp_a2_st1.bin", 8 },
+          };
+          for (auto& o : ors) {
+            WgcResult r = run_wggemm_compute(node, o.bin, 512,512,512, 64u, true, 8, 32772u, 26u, 0, o.twn, 2);
+            bool pass = r.ok && r.badFrags==0 && r.okFrags>0;
+            printf("    oracle %-14s okFrags=%u badFrags=%u  %s\n", o.name, r.okFrags, r.badFrags, pass?"PASS":"*** FAIL");
+            if (!pass) rc=3;
+          }
+        }
+        printf("    %-20s %6s %8s %8s %9s %8s %s\n","geom","nWG","TF","%307","residWv","span_ms","correct");
+        const int M=65536, N=65536, Ks=16384;
+        struct G { const char* name; const char* bin; int twn; };
+        G geoms[] = {
+            { "tw4 bpf+sp (165.7)", "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin",    4 },
+            { "tw8 bpf+sp (sq)",    "occ_wggemm2_82_tw8_kwin4_bpf_sp.bin",    8 },
+            { "tw8 +wide-A (sq)",   "occ_wggemm2_82_tw8_kwin4_bpf_sp_a2.bin", 8 },
+        };
+        uint32_t nwgs[] = { 256u, 512u, 1024u };
+        for (auto& g : geoms) {
+            printf("  --- %s ---\n", g.name);
+            for (uint32_t nw : nwgs) {
+                WgpResult r = run_wggemm_perf(node, g.bin, M,N,Ks, nw, freq_hz, 8, 32772u, 26u, g.twn, 0, 2);
+                if (!r.ok) { printf("    %-20s %6u INCOMPLETE\n", g.name, nw); rc=3; continue; }
+                printf("    %-20s %6u %8.1f %6.1f%% %9u %8.1f  %s\n",
+                       g.name, nw, r.tf, 100.0*r.tf/307.0, r.maxlive*(uint32_t)(2*g.twn),
+                       (double)r.wall/freq_hz*1e3, r.badSamp?"*** acc00 BAD":"acc00 OK");
+                if (r.badSamp) rc=3;
+            }
+        }
+        printf("    [TWN=8 doubles waves/WG (8->16) -> 2x in-flight WMMA per WG to hide WMMA-result latency. >165.7 -> the\n");
+        printf("     big-tile lever lands; flat/down -> residency cap counts WGs not waves (fewer 16-wave WGs fit -> same\n");
+        printf("     total in-flight) or the 16-wave barrier serializes. residWv = maxlive(WGs) * WAVES.]\n");
+    } else if (mode == TW4LEAN) {
+        // ===== MAD-305 LEAN-16-WAVE (TWM=4 TWN=4 FM=4 FN=2, 256x128, 16 lean waves) — SAFE oracle-GATED run. The C-store
+        //   FM*FN=16 hardcode that page-faulted the R9700 (and starved the desktop GPU) is FIXED (FMFN_LOG2 + TROW_SH).
+        //   SAFETY PROTOCOL: run the TINY 512^3 oracle FIRST per vgprField; the big 65536^2 perf runs ONLY where that oracle
+        //   PASSED (no fault, admitted, correct). vf=26 dropped (known 16-wave co-residency deadlock at 208). Goals: (1) confirm
+        //   the page-fault fix (oracle PASS, no fault), (2) find the VGPR-reservation floor where 16 lean waves co-reside,
+        //   (3) compare TF vs the 165.7 winner. Growing TWM also amortizes the BINDING B-feed (M-waves share B). =====
+        printf("\n=== MAD-305 LEAN-16-WAVE (TWM=4 TWN=4 FM=4 FN=2, 256x128) — oracle-GATED, page-fault fix verify ===\n");
+        const int Mo=512, No=512, Ko=512;
+        const int M=65536, N=65536, Ks=16384;
+        const char* obin = "occ_wggemm2_42_tw4x4_kwin4_bpf_sp_st1.bin";
+        const char* pbin = "occ_wggemm2_42_tw4x4_kwin4_bpf_sp.bin";
+        // STEP 0 -- BISECTION CONTROL: same per-wave FM=4 FN=2 but only 8 waves (TWM=2, 128x128). PASS -> the all-wrong bug
+        //   is in the TWM=4/16-wave path; FAIL -> it's the FM=4xFN=2 per-wave/frag math. vf=26 (208) is plenty for 8 waves.
+        printf("  --- STEP 0: bisection control TWM=2 FM=4 FN=2 (8 waves, 128x128) @512^3 ---\n");
+        { WgcResult c = run_wggemm_compute(node, "occ_wggemm2_42_tw2x4_kwin4_bpf_sp_st1.bin", Mo,No,Ko, 64u, true, 4, 32772u, 26u, 0, 4, 2, 2);
+          const char* cst = (!c.ok) ? "HANG/TO" : (c.badFrags==0 && c.okFrags>0 ? "PASS" : "*** FAIL");
+          printf("    control A TWM2 TWN4 FM4 FN2 (8w per-wave)  okFrags=%lu badFrags=%lu  %s  => %s\n",
+                 (unsigned long)c.okFrags, (unsigned long)c.badFrags, cst,
+                 (c.ok && c.badFrags==0 && c.okFrags>0) ? "FM4xFN2 per-wave math OK -> bug is in the TWM=4 path"
+                                                        : "FM4xFN2 per-wave math BROKEN -> bug is the per-wave/frag combo");
+        }
+        // STEP 0b -- M-DOUBLE ISOLATOR: TWM=4 TWN=2 FM=4 FN=4 (wave_m 0-3, TM=256, TROW_SH=8) but 8 waves + PROVEN 2-band fill.
+        { WgcResult c = run_wggemm_compute(node, "occ_wggemm2_44_tw4x2_kwin4_bpf_sp_st1.bin", Mo,No,Ko, 64u, true, 4, 32772u, 26u, 0, 2, 4, 4);
+          const char* cst = (!c.ok) ? "HANG/TO" : (c.badFrags==0 && c.okFrags>0 ? "PASS" : "*** FAIL");
+          printf("    control B TWM4 TWN2 FM4 FN4 (8w M-double)  okFrags=%lu badFrags=%lu  %s  => %s\n",
+                 (unsigned long)c.okFrags, (unsigned long)c.badFrags, cst,
+                 (c.ok && c.badFrags==0 && c.okFrags>0) ? "wave_m 0-3 / TM=256 / TROW_SH=8 OK -> bug is the 16-wave 512-thread fill"
+                                                        : "wave_m 0-3 / TM=256 BROKEN -> bug is the TWM=4 M-doubling path");
+        }
+        // STEP 0d -- KWIN=0 BASE-PATH ISOLATOR: the lean 16-wave geometry on the simplest base path (LDS = 8196, no KWIN ring).
+        //   GUARDED behind TW4LEAN_KWIN0=1: this is a 16-wave dispatch whose co-residency is UNPROVEN; if it can't co-reside it
+        //   DEADLOCKS THE BARRIER AND BRICKS THE GPU (happened at vf=26). Only opt in after warning the user.
+        if (getenv("TW4LEAN_KWIN0")) { WgcResult c = run_wggemm_compute(node, "occ_wggemm2_42_tw4x4_kwin0_st1.bin", Mo,No,Ko, 64u, true, 4, 8196u, 22u, 0, 4, 2, 4);
+          const char* cst = (!c.ok) ? "HANG/TO" : (c.badFrags==0 && c.okFrags>0 ? "PASS" : "*** FAIL");
+          printf("    control C TWM4 TWN4 FM4 FN2 KWIN=0 (16w base)  okFrags=%lu badFrags=%lu  %s  => %s\n",
+                 (unsigned long)c.okFrags, (unsigned long)c.badFrags, cst,
+                 (c.ok && c.badFrags==0 && c.okFrags>0) ? "16-wave base path OK -> half-contraction bug is in the KWIN windowed feed"
+                                                        : "16-wave base path BROKEN -> bug is in the base A-fill/WMMA, not KWIN");
+        }
+        // STEP 0c -- K-SCALING PROBE on the lean bin (WGC_DBG prints ratio=|maxD|/|maxExp|). Constant ratio across K -> a
+        //   proportional feed/data factor; ratio halving as K doubles -> kernel processes a FIXED slice count (K-window loop bug).
+        if (getenv("WGC_DBG")) {
+            printf("  --- STEP 0c: K-scaling probe on lean bin (vf=22) -- see WGC_DBG ratio lines on stderr ---\n");
+            for (int Kp : {256, 512, 1024})
+                run_wggemm_compute(node, obin, 512,512,Kp, 64u, true, 4, 32772u, 22u, 0, 4, 2, 4);
+        }
+        uint32_t fields[] = { 22u };   // ONLY vf=22 (176): proven to admit 16 waves this session w/o bricking. vf>=26 deadlock-bricks; vf<22 under-provisions.
+        bool oraclePass[3] = { false, false, false };
+        printf("  --- STEP 1: tiny 512^3 oracle per vgprField (THE safety gate -- big perf runs only where this PASSes) ---\n");
+        printf("    %-7s %6s  %-8s %9s %9s\n", "vgprFld","VGPR","oracle","okFrags","badFrags");
+        for (int i = 0; i < 3; ++i) {
+            uint32_t vf = fields[i];
+            WgcResult o = run_wggemm_compute(node, obin, Mo,No,Ko, 64u, true, 4, 32772u, vf, 0, 4, 2, 4);
+            bool pass = o.ok && o.badFrags==0 && o.okFrags>0;
+            oraclePass[i] = pass;
+            const char* ost = (!o.ok) ? "HANG/TO" : (pass ? "PASS" : "*** FAIL");
+            printf("    %-7u %6u  %-8s %9lu %9lu\n", vf, vf*8u, ost, (unsigned long)o.okFrags, (unsigned long)o.badFrags);
+            if (o.ok && !pass) rc=3;   // admitted-but-wrong is a real bug; HANG/TO is expected co-residency at high vf
+        }
+        printf("  --- STEP 2: 65536^2 x K16384 perf -- ONLY vgprFields that PASSED the oracle above ---\n");
+        printf("    %-7s %6s | %8s %7s %8s %8s %s\n", "vgprFld","VGPR","nWG","TF","%307","residWv","perf-correct");
+        for (int i = 0; i < 3; ++i) {
+            if (!oraclePass[i]) { printf("    %-7u %6u | skipped (oracle not PASS -> not run on silicon)\n", fields[i], fields[i]*8u); continue; }
+            WgpResult r = run_wggemm_perf(node, pbin, M,N,Ks, 512u, freq_hz, 4, 32772u, fields[i], 4, 0, 2, 4);
+            if (!r.ok) { printf("    %-7u %6u | %8u INCOMPLETE (oracle admitted @nWG=64 but not perf @nWG=512 -> co-residency)\n", fields[i], fields[i]*8u, 512u); continue; }
+            printf("    %-7u %6u | %8u %7.1f %7.1f%% %8u %s\n",
+                   fields[i], fields[i]*8u, 512u, r.tf, 100.0*r.tf/307.0, r.maxlive*16u, r.badSamp?"*** acc00 BAD":"acc00 OK");
+            if (r.badSamp) rc=3;
+        }
+        printf("  --- reference: 8x2 TWM=2 TWN=4 winner (8 fat waves, 256x128) @ vgprField=26 (GPU sanity) ---\n");
+        WgpResult w = run_wggemm_perf(node, "occ_wggemm2_82_tw4_kwin4_bpf_sp.bin", M,N,Ks, 512u, freq_hz, 8, 32772u, 26u, 4, 0, 2, 2);
+        if (w.ok) printf("    %-7u %6u | %8u %7.1f %7.1f%% %8u %s\n",
+                         26u, 208u, 512u, w.tf, 100.0*w.tf/307.0, w.maxlive*8u, w.badSamp?"*** BAD":"acc00 OK");
+        else      printf("    winner reference INCOMPLETE\n");
+        printf("    [oracle PASS at any vf = the page-fault C-store bug is FIXED (no fault). perf TF at a passing vf vs 165.7 =\n");
+        printf("     whether 16 lean waves beat 8 fat. perf INCOMPLETE while oracle PASSed = co-residency only fits at nWG<512.]\n");
     } else if (mode == WALL82) {
         // ===== MAD-305 8x2 WALL ATTRIBUTION: after 8x2 broke 4x4's wall (162 vs 149), what is 8x2's NEW wall?
         //   FED / FEEDONLY / NOFEED at saturated 65536^2 x K16384, occupancy-matched (vgprField 26), FED full-oracle.
