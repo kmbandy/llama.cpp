@@ -1068,7 +1068,7 @@ static __global__ void k_set_rows_turbo4(
     const uint8_t my_nibble = idx & 0xF;
     uint8_t qs_byte = 0;
     // Gather nibble from partner thread
-    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1);
+    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         qs_byte = my_nibble | (partner_nibble << 4);
         blk->qs[j / 2] = qs_byte;

@@ -120,6 +120,15 @@ llama_kv_cache_paged::llama_kv_cache_paged(
         }
     }
 
+    // Turbo cache quantizes 128-element blocks; pad a sub-128 head_dim up to
+    // 128 so each head is exactly one turbo block (matches the graph-level
+    // padding in llm_graph_context::build_attn for the paged path).
+    const bool paged_cache_is_turbo =
+        (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
+    if (paged_cache_is_turbo && head_dim % 128 != 0) {
+        head_dim = ((head_dim + 127) / 128) * 128;
+    }
+
     GGML_ASSERT(head_dim > 0 && "head_dim must be > 0");
     GGML_ASSERT(n_kv_heads > 0 && "n_kv_heads must be > 0");
 

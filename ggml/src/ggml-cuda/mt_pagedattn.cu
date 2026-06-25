@@ -421,7 +421,7 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
     const int      lane            = j % WARP_SIZE;
     const uint8_t  my_nibble       = idx & 0xF;
-    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1);
+    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1, WARP_SIZE);
     if ((j & 1) == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
@@ -1208,7 +1208,7 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
 
                     const int num_chunks    = paged_attn_decode_num_chunks(max_ctx_len);
-                    const int max_q_len     = avg_q_len;  // see comment above
+                    const int max_q_len     = total_q_tokens;  // partials inner stride: must be >= max per-seq q_len. avg_q_len = total/num_seqs floors to 0 with idle parallel slots (1 active + N idle), collapsing every head/seq/chunk partial offset to 0 -> OOB corruption. total_q_tokens (gate-capped <= 8) is a safe upper bound.
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
                                             * (size_t) num_chunks * (size_t) max_q_len
                                             * (size_t) (HS + 2);

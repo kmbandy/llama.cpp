@@ -238,7 +238,7 @@ static __device__ __forceinline__ void decode_coop_stage_turbo4(
                 }
             }
         }
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         uint16_t packed = 0;
         if (blk != nullptr) {
@@ -302,7 +302,7 @@ static __device__ __forceinline__ void decode_coop_stage_turbo3(
                 }
             }
         }
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         uint8_t qs_byte    = 0;
         uint8_t signs_byte = 0;
@@ -386,7 +386,7 @@ template <typename T>
 __device__ __forceinline__ T decode_warp_reduce_sum(T v) {
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        v += __shfl_xor_sync(0xFFFFFFFF, v, mask);
+        v += __shfl_xor_sync(0xFFFFFFFF, v, mask, WARP_SIZE);
     }
     return v;
 }
@@ -395,7 +395,7 @@ template <typename T>
 __device__ __forceinline__ T decode_warp_reduce_max(T v) {
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        v = max(v, __shfl_xor_sync(0xFFFFFFFF, v, mask));
+        v = max(v, __shfl_xor_sync(0xFFFFFFFF, v, mask, WARP_SIZE));
     }
     return v;
 }
@@ -938,7 +938,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
             float local_max = -INFINITY;
             #pragma unroll
             for (int l = 0; l < scores.ne; ++l) local_max = max(local_max, scores.x[l]);
-            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
             const float new_max = max(running_max, row_max);
             float rescale = 1.0f;
@@ -959,7 +959,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
                 scores.x[l] = e;
                 local_sum  += e;
             }
-            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
             running_sum += row_sum;
             running_max  = new_max;
 
