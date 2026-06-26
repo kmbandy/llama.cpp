@@ -609,6 +609,67 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
 #endif
 }
 
+/* MAD-301C Lever B: native head_dim-64 turbo4 (64-element block, no RHT).
+ * Mirrors the CUDA paged scatter convention (mt_scatter_kv_turbo4_64_kernel):
+ * L2-norm -> normalize -> 4-bit centroid quant (NO WHT) -> recon-norm correction;
+ * dequant returns centroid*norm. These CPU refs exist only to satisfy ggml
+ * type-traits for GGML_TYPE_TURBO4_64; the hot path is CUDA paged attention. */
+void quantize_row_turbo4_64_ref(const float * GGML_RESTRICT x, block_turbo4_64 * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) norm_sq += src[i] * src[i];
+        const float norm = sqrtf(norm_sq);
+        float normalized[QK_TURBO4_64];
+        if (norm > 1e-10f) {
+            const float inv = 1.0f / norm;
+            for (int i = 0; i < d; i++) normalized[i] = src[i] * inv;
+        } else {
+            memset(normalized, 0, d * sizeof(float));
+        }
+        uint8_t indices[QK_TURBO4_64];
+        for (int i = 0; i < d; i++) indices[i] = (uint8_t)nearest_centroid_4bit(normalized[i]);
+        float recon_sq = 0.0f;
+        for (int i = 0; i < d; i++) recon_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
+        const float recon_norm     = sqrtf(recon_sq);
+        const float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+        memset(y[block].qs, 0, d / 2);
+        for (int i = 0; i < d; i++) {
+            y[block].qs[i / 2] |= (uint8_t)((indices[i] & 0xF) << ((i % 2) * 4));
+        }
+    }
+}
+
+void dequantize_row_turbo4_64(const block_turbo4_64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+        for (int i = 0; i < d; i++) {
+            uint8_t idx = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
+        }
+    }
+}
+
 size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_UNUSED(imatrix);

@@ -152,6 +152,41 @@ struct paged_cache_ops<GGML_TYPE_TURBO4_0, HEAD_SIZE, BLOCK_SIZE> {
     }
 };
 
+// Turbo4_64 specialization (MAD-301C Lever B): native head_dim-64 4-bit PolarQuant,
+// 64-element blocks. Same layout shape as TURBO4_0 (1 block/token for head_dim 64,
+// since N_QBLOCKS_PER_TOKEN = 64/64 = 1) and same no-RHT dequant; only the block
+// width (64 vs 128) and struct (block_turbo4_64, 34 bytes) differ. No 64->128 pad.
+// kv_store omitted — handled by mt_scatter_kv_turbo4_64_kernel.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO4_64, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO4_64;  // 64
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo4_64 * blocks = (const block_turbo4_64 *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        const float   norm = __half2float(blocks[ib].norm);
+        return turbo4_64_dequant_element(&blocks[ib], iqs, norm);
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
 // Turbo3_0 specialization: 3-bit PolarQuant with WHT rotation, 128-element blocks.
 // Same N_QBLOCKS_PER_TOKEN layout as TURBO4_0; differs in block payload size
 // (14 vs 68 bytes) and dequant centroid table (3-bit Lloyd-Max).
