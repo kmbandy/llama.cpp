@@ -421,7 +421,7 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
     const int      lane            = j % WARP_SIZE;
     const uint8_t  my_nibble       = idx & 0xF;
-    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1);
+    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1, WARP_SIZE);
     if ((j & 1) == 0) {
         blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
     }
@@ -451,6 +451,113 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     if (j == 0) {
         blk->norm  = __float2half(corrected_norm);
         blk->rnorm = __float2half(0.0f);  // reserved/unused in 4-bit mode
+    }
+}
+
+// Turbo4_64 scatter (MAD-301C Lever B): native head_dim-64 cooperative quantize.
+// Identical pipeline to mt_scatter_kv_turbo4_0_kernel but a 64-element block
+// (64 threads / 2 warps), writing block_turbo4_64 (no rnorm field). No RHT.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO4_64)
+__global__ void mt_scatter_kv_turbo4_64_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO4_64;       // 64
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 2
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    const int j                = threadIdx.x;  // 0..63
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo4_64 * blk = (block_turbo4_64 *) dst_buf + block_ib;
+
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = x[j] * x[j];
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // No RHT (see mt_scatter_kv_turbo4_0_kernel step-4 comment): centroid-quant
+    // normalized K directly; dequant returns centroid*norm ~= K.
+    const float   rv  = x[j];
+    const uint8_t idx = turbo_nearest_centroid_4bit(rv);
+
+    const int      lane            = j % WARP_SIZE;
+    const uint8_t  my_nibble       = idx & 0xF;
+    const uint8_t  partner_nibble  = __shfl_sync(0xffffffffu, my_nibble, lane ^ 1, WARP_SIZE);
+    if ((j & 1) == 0) {
+        blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
+    }
+
+    {
+        const float c = TURBO_CENTROIDS_4BIT[idx];
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
     }
 }
 
@@ -639,6 +746,18 @@ static void launch_scatter_kv(
         GGML_UNUSED(q_lens);
         GGML_UNUSED(num_seqs);
         mt_scatter_kv_turbo4_0_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64) {
+        // MAD-301C Lever B: native head_dim-64 turbo4. Same grid topology as
+        // TURBO4_0 but 64 threads/block (one 64-element block per token/head).
+        constexpr int Q_BLOCK             = QK_TURBO4_64;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo4_64_kernel<HEAD_SIZE, BLOCK_SIZE>
             <<<grid, block, 0, stream>>>(
                 k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
     } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
@@ -1097,15 +1216,24 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                            HS, (int) QK_TURBO3);
             } else {
 
-            // MAD-180: WMMA tile FA gate.
-            if constexpr (((HS == 128) || (HS == 256)) && (BS == 16)
-                          && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0 || CT == GGML_TYPE_TURBO3_0)) {
+            // MAD-180: WMMA tile FA gate. HS=128/256 keep F16/TURBO4_0/TURBO3_0.
+            // MAD-301C Lever B adds HS=64 paired ONLY with GGML_TYPE_TURBO4_64
+            // (native head_dim-64 turbo4) — HS=64 for other cache types stays on
+            // the scalar path, so no <64,*> tile instances are needed for them.
+            if constexpr ((BS == 16)
+                          && ((((HS == 128) || (HS == 256))
+                                && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0 || CT == GGML_TYPE_TURBO3_0))
+                              || (HS == 64 && CT == GGML_TYPE_TURBO4_64))) {
                 const int  cc                = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const int  total_q_tokens    = (int) k_cur->ne[2];
                 const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
                 const bool wmma_ok           = amd_wmma_available(cc);
                 const bool tile_env_on       = get_paged_tile_mode() != 0;
-                const bool tile_gate_on      = wmma_ok && tile_env_on;
+                // Tile kernel now has a portable FMA #else path (non-WMMA: Pascal
+                // sm_61, GCN gfx803) in addition to the RDNA3/4 WMMA path, so it is
+                // no longer gated on wmma_ok. GGML_PAGED_TILE=0 reverts to the slow
+                // scalar prefill kernel. (Multi-warp variant stays WMMA-only below.)
+                const bool tile_gate_on      = tile_env_on;
                 if (tile_gate_on && avg_q_len >= 16) {
                     if (probe_on) {
                         int n = probe_tile.fetch_add(1, std::memory_order_relaxed);
@@ -1123,6 +1251,11 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         (const int32_t *) slot_mapping->data,
                         (const int32_t *) q_lens->data,
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
+                    // Multi-warp tile kernel now has a portable FMA #else path
+                    // (MAD-301C), so non-WMMA hardware (gfx803, Pascal) uses it too:
+                    // K/V staged once per block + shared across warps (HBM-reuse win)
+                    // and N_WARPS*32 threads fill gfx803's 64-lane wave (occupancy win).
+                    // GGML_PAGED_TILE_MULTIWARP=0 reverts to the single-warp tile kernel.
                     const bool mw_on = get_paged_tile_multiwarp_mode() != 0;
                     if (mw_on) {
                         launch_paged_attn_tile_mw<HS, BS, CT>(
@@ -1134,7 +1267,7 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                             (const int32_t *) context_lens->data,
                             (const int32_t *) q_lens->data,
                             num_seqs, n_heads, n_kv_heads, max_bps,
-                            avg_q_len,
+                            total_q_tokens,  // see note below: size grid.z by max, not avg, q_len
                             scale, stream);
                     } else {
                         launch_paged_attn_tile<HS, BS, CT>(
@@ -1146,7 +1279,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                             (const int32_t *) context_lens->data,
                             (const int32_t *) q_lens->data,
                             num_seqs, n_heads, n_kv_heads, max_bps,
-                            avg_q_len,   // approximation; tile kernel skips q_tile_start >= q_len
+                            total_q_tokens,  // grid.z (n_q_tiles) must cover the LARGEST per-seq
+                                             // q_len. avg_q_len = total/num_seqs floors with idle
+                                             // parallel slots (1 active + N idle) and under-sizes
+                                             // the grid -> high Q-tiles never launch -> uncomputed
+                                             // rows -> garbage. total_q_tokens is a safe upper bound
+                                             // (kernel still skips tiles with q_tile_start >= q_len).
                             scale, stream);
                     }
                     return;
@@ -1165,6 +1303,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // (rare) heterogeneous case we use it as max_q_len so
                 // the partials buffer's inner stride fits the largest
                 // seq's queries.
+                // MAD-301C Lever B: GGML_TYPE_TURBO4_64 now has a flash-decode
+                // path (decode_coop_stage_turbo4_64), so it uses the same gate as
+                // the other turbo types — no exclusion.
                 const bool decode_env_on  = get_paged_decode_mode() != 0;
                 // **Decode regression root cause (2026-05-18 rocprof hunt)**:
                 // the original gate `avg_q_len >= 1` used integer division
@@ -1208,7 +1349,7 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
 
                     const int num_chunks    = paged_attn_decode_num_chunks(max_ctx_len);
-                    const int max_q_len     = avg_q_len;  // see comment above
+                    const int max_q_len     = total_q_tokens;  // partials inner stride: must be >= max per-seq q_len. avg_q_len = total/num_seqs floors to 0 with idle parallel slots (1 active + N idle), collapsing every head/seq/chunk partial offset to 0 -> OOB corruption. total_q_tokens (gate-capped <= 8) is a safe upper bound.
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
                                             * (size_t) num_chunks * (size_t) max_q_len
                                             * (size_t) (HS + 2);
@@ -1292,6 +1433,16 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 break;
             case GGML_TYPE_TURBO4_0:
                 run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_0>{});
+                break;
+            case GGML_TYPE_TURBO4_64:
+                // MAD-301C Lever B: native head_dim-64 turbo4 — only valid at HS=64.
+                // Guard so run_typed<TURBO4_64> (and its kernel instances) is only
+                // instantiated for HS=64, not 128/256.
+                if constexpr (HS == 64) {
+                    run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_64>{});
+                } else {
+                    GGML_ABORT("mt_paged_attn: GGML_TYPE_TURBO4_64 only supports head_size=64 (got %d)", HS);
+                }
                 break;
             case GGML_TYPE_TURBO3_0:
                 run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO3_0>{});

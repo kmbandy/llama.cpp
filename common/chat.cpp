@@ -1670,7 +1670,15 @@ static common_chat_params common_chat_params_init_lfm2(const common_chat_templat
 
         auto reasoning = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            // LFM2.5's template does not prefill an opening <think> into the generation prompt,
+            // so the model must emit it itself each turn. It sometimes skips the opening tag and
+            // dives straight into reasoning, closing only with </think>. Without forced-open
+            // handling that raw reasoning bleeds into content. Make the opening tag
+            // optional so a leading reasoning block terminated by </think> is captured whether or
+            // not <think> was emitted. A pure-content turn has no </think>, so until() fails to
+            // find the terminator, the sequence fails, and the outer optional collapses -> the
+            // whole output falls through to content exactly as before.
+            reasoning = p.optional(p.optional(p.literal(THINK_START)) + p.reasoning(p.until(THINK_END)) + p.literal(THINK_END));
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {

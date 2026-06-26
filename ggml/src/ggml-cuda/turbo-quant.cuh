@@ -351,6 +351,14 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return TURBO_CENTROIDS_4BIT[idx] * norm;
 }
 
+// MAD-301C Lever B: native head_dim-64 turbo4 dequant. Same nibble layout as
+// block_turbo4_0 (j/2 byte, (j%2)*4 shift); only the block struct width differs.
+static __device__ __forceinline__ float turbo4_64_dequant_element(
+        const block_turbo4_64 * __restrict__ x, int j, float norm) {
+    uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
 // ---- Nearest 3-bit centroid index ----
 
 static __device__ __forceinline__ uint8_t turbo_nearest_centroid_3bit(float val) {

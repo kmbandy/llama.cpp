@@ -16,6 +16,7 @@
 #endif
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <fstream>
@@ -108,8 +109,43 @@ llama_kv_cache_paged::llama_kv_cache_paged(
     // stay default-constructed (k/v == nullptr) and never queried.
     const auto & hparams = model.hparams;
     const uint32_t n_layer    = hparams.n_layer();
-    const uint32_t head_dim   = hparams.n_embd_head_v(/*il=*/0);
-    const uint32_t n_kv_heads = hparams.n_head_kv(/*il=*/0);
+    // Hybrid models (e.g. LFM2.5 lfm2moe) interleave conv/recurrent layers
+    // (n_head_kv == 0) with attention layers; layer 0 may be non-attention.
+    // Size the paged K/V storage from the first attention layer (n_head_kv > 0).
+    uint32_t head_dim = 0, n_kv_heads = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hparams.n_head_kv(il) > 0) {
+            n_kv_heads = hparams.n_head_kv(il);
+            head_dim   = hparams.n_embd_head_v(il);
+            break;
+        }
+    }
+
+    // MAD-301C Lever B: native head_dim-64 turbo4. Remap TURBO4_0 -> TURBO4_64
+    // (64-element block) for head_dim-64 models (LFM2.5, gpt-oss). Each head is
+    // then exactly one 64-wide block with NO 64->128 zero-pad, ~halving the
+    // turbo4 KV footprint. Must run before the pad check + sizing below; the
+    // graph-level pad in build_attn keys off layer.k->type so it auto-skips for
+    // TURBO4_64 (not in its TURBO{2,3,4}_0 list).
+    // GGML_PAGED_TURBO4_64=0 forces the legacy padded-128 path (A/B + rollback).
+    {
+        const char * t464_env = std::getenv("GGML_PAGED_TURBO4_64");
+        const bool   t464_on  = (t464_env == nullptr || t464_env[0] != '0');
+        if (t464_on && head_dim == 64) {
+            if (type_k == GGML_TYPE_TURBO4_0) { type_k = GGML_TYPE_TURBO4_64; type_k_ = GGML_TYPE_TURBO4_64; }
+            if (type_v == GGML_TYPE_TURBO4_0) { type_v = GGML_TYPE_TURBO4_64; type_v_ = GGML_TYPE_TURBO4_64; }
+        }
+    }
+
+    // Turbo cache quantizes 128-element blocks; pad a sub-128 head_dim up to
+    // 128 so each head is exactly one turbo block (matches the graph-level
+    // padding in llm_graph_context::build_attn for the paged path). TURBO4_64
+    // is excluded (its block is exactly head_dim 64 — no pad needed).
+    const bool paged_cache_is_turbo =
+        (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0);
+    if (paged_cache_is_turbo && head_dim % 128 != 0) {
+        head_dim = ((head_dim + 127) / 128) * 128;
+    }
 
     GGML_ASSERT(head_dim > 0 && "head_dim must be > 0");
     GGML_ASSERT(n_kv_heads > 0 && "n_kv_heads must be > 0");

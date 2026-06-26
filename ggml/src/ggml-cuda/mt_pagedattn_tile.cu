@@ -65,6 +65,13 @@ template <int HEAD_SIZE>
 struct TileConfig;
 
 template <>
+struct TileConfig<64> {
+    // MAD-301C Lever B: native head_dim-64 turbo4. LDS at 8 tiles:
+    // 8*16*64*2 + 2*16*64*2 = 16 KiB + 4 KiB = 20 KiB — well under the 64 KiB cap.
+    static constexpr int Q_TILES_PER_BLOCK = 8;
+};
+
+template <>
 struct TileConfig<128> {
     static constexpr int Q_TILES_PER_BLOCK = 8;
 };
@@ -230,7 +237,7 @@ static __device__ __forceinline__ void coop_stage_turbo4_tile(
         }
 
         // Broadcast norm from lane 0 to all 32 lanes of this warp.
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         // Each lane reads 2 bytes (4 nibbles = 4 elements). qs is uint8_t[64],
         // 2-byte aligned at qs[2*lane_id] for any lane.
@@ -308,7 +315,7 @@ static __device__ __forceinline__ void coop_stage_turbo3_tile(
         }
 
         // Broadcast norm from lane 0 to all 32 lanes of this warp.
-        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0);
+        norm_f = __shfl_sync(0xFFFFFFFF, norm_f, 0, WARP_SIZE);
 
         // Each lane reads 1 byte of qs (its 4 elements' low2 bits) and 1
         // byte of signs (covers this lane's 4 elements' high1 bits, plus
@@ -476,7 +483,7 @@ __global__ void mt_paged_attention_tile_kernel(
         for (int l = 0; l < scores.ne; ++l) {
             local_max = max(local_max, scores.x[l]);
         }
-        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
         const float new_max = max(running_max, row_max);
 
@@ -502,7 +509,7 @@ __global__ void mt_paged_attention_tile_kernel(
             scores.x[l]   = e;
             local_sum   += e;
         }
-        const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+        const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
         running_sum += row_sum;
         running_max  = new_max;
 
@@ -571,13 +578,159 @@ __global__ void mt_paged_attention_tile_kernel(
         }
     }
 #else
-    // Non-WMMA hardware should not be dispatched here; existing scalar
-    // kernel is the fallback. NO_DEVICE_CODE traps if we somehow are.
-    GGML_UNUSED(out); GGML_UNUSED(q); GGML_UNUSED(k_cache); GGML_UNUSED(v_cache);
-    GGML_UNUSED(block_tables); GGML_UNUSED(context_lens); GGML_UNUSED(q_lens);
-    GGML_UNUSED(max_blocks_per_seq); GGML_UNUSED(n_kv_heads); GGML_UNUSED(n_heads);
-    GGML_UNUSED(scale);
-    NO_DEVICE_CODE;
+    // ── Portable FMA tile flash-attention (non-WMMA: NVIDIA Pascal sm_61,
+    // AMD GCN gfx803). Mirrors the WMMA path's Q-tile + online-softmax
+    // structure, but the two matmuls run as explicit shared-memory GEMMs
+    // instead of matrix-core fragments. Lane ownership is kept identical to
+    // the WMMA fragment layout (row = tid%16, cols 8*(tid/16)+l), so the
+    // masking / softmax / writeback logic matches the #if branch line-for-line.
+    // One 32-lane warp per block; shuffles pass explicit WARP_SIZE so a 32-wide
+    // logical reduction is correct on gfx803's 64-lane waves too.
+    static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
+    constexpr int N_INNER = HEAD_SIZE / K_INNER;
+
+    const int head_idx   = blockIdx.x;
+    const int seq_idx    = blockIdx.y;
+    const int q_tile_idx = blockIdx.z;
+    const int tid        = threadIdx.x;
+
+    const int q_len = q_lens[seq_idx];
+    const int q_tile_start = q_tile_idx * Q_TILE_M;
+    if (q_tile_start >= q_len) {
+        return;
+    }
+    const int q_tile_actual = (q_tile_start + Q_TILE_M <= q_len) ? Q_TILE_M : (q_len - q_tile_start);
+
+    const int kv_head_idx       = head_idx / (n_heads / n_kv_heads);
+    const int ctx_len_after_q   = context_lens[seq_idx];
+    const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) {
+        seq_q_offset += (size_t) q_lens[s];
+    }
+
+    const int q_pos_base = (ctx_len_after_q - q_len) + q_tile_start;
+
+    // smem: Q[16,HS] + K[16,HS] + V[16,HS] half, then scores[16,16] f32.
+    extern __shared__ unsigned char smem_raw[];
+    __half * smem_q = (__half *)(smem_raw);
+    __half * smem_k = smem_q + Q_TILE_M * HEAD_SIZE;
+    __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
+    float  * smem_s = (float *)(smem_v + K_TILE_N * HEAD_SIZE);  // [Q_TILE_M * K_TILE_N]
+
+    const size_t q_global_base = ((seq_q_offset + (size_t) q_tile_start) * (size_t) n_heads + (size_t) head_idx)
+                                 * (size_t) HEAD_SIZE;
+    stage_q_tile<HEAD_SIZE>(smem_q, q, q_global_base, q_tile_actual, n_heads, tid);
+    __syncthreads();
+
+    // Lane ownership: row = tid%16 (Q row), half = tid/16 -> cols 8*half+l.
+    const int row  = tid % 16;
+    const int half = tid / 16;
+
+    // Online-softmax state + output accumulators (this lane's 8 cols per HS block).
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc[N_INNER][8];
+    #pragma unroll
+    for (int n = 0; n < N_INNER; ++n) {
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) acc[n][l] = 0.0f;
+    }
+
+    const int q_pos_last = q_pos_base + (q_tile_actual - 1);
+    const int valid_ctx  = q_pos_last + 1;
+    const int q_pos      = q_pos_base + row;
+    const bool row_valid = (row < q_tile_actual);
+
+    for (int k_tile_start = 0; k_tile_start < valid_ctx; k_tile_start += K_TILE_N) {
+        stage_k_tile<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
+            smem_k, k_cache, seq_block_table, k_tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, tid);
+        __syncthreads();
+
+        // scores[row, col] = scale * (Q[row] . K[col])  for this lane's 8 cols.
+        float sc[8];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int col = 8 * half + l;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < HEAD_SIZE; ++d) {
+                dot += __half2float(smem_q[row * HEAD_SIZE + d]) * __half2float(smem_k[col * HEAD_SIZE + d]);
+            }
+            const int  k_pos   = k_tile_start + col;
+            const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
+            sc[l] = visible ? (dot * scale) : -INFINITY;
+        }
+
+        // Per-row max: 8-wide local then pair-lane (tid^16) via shfl_xor.
+        float local_max = -INFINITY;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) local_max = max(local_max, sc[l]);
+        const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
+        const float new_max = max(running_max, row_max);
+
+        // Rescale running state on new max.
+        if (running_max > -INFINITY) {
+            const float rescale = __expf(running_max - new_max);
+            running_sum *= rescale;
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) acc[n][l] *= rescale;
+            }
+        }
+
+        // exp(scores - new_max) + per-row sum.
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const float e = (sc[l] == -INFINITY) ? 0.0f : __expf(sc[l] - new_max);
+            sc[l] = e;
+            local_sum += e;
+            smem_s[row * K_TILE_N + (8 * half + l)] = e;  // publish full row for PV
+        }
+        running_sum += local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
+        running_max  = new_max;
+
+        stage_v_tile<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>(
+            smem_v, v_cache, seq_block_table, k_tile_start, valid_ctx,
+            kv_head_idx, n_kv_heads, tid);
+        __syncthreads();  // smem_s (all 16 cols) + smem_v visible to the warp
+
+        // acc[n][l] += sum_k scores[row, k] * V[k, d],  d = n*16 + 8*half + l.
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int d = n * K_INNER + 8 * half + l;
+                float pv = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < K_TILE_N; ++k) {
+                    pv += smem_s[row * K_TILE_N + k] * __half2float(smem_v[k * HEAD_SIZE + d]);
+                }
+                acc[n][l] += pv;
+            }
+        }
+        __syncthreads();  // before next iter overwrites smem_k / smem_v / smem_s
+    }
+
+    // Writeback (same layout as the WMMA branch).
+    const float inv_sum = 1.0f / (running_sum + 1e-6f);
+    if (row < q_tile_actual) {
+        const int q_row_global = q_tile_start + row;
+        const size_t out_row_base =
+            ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads + (size_t) head_idx) * (size_t) HEAD_SIZE;
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int d = n * K_INNER + 8 * half + l;
+                out[out_row_base + (size_t) d] = __float2half(acc[n][l] * inv_sum);
+            }
+        }
+    }
 #endif // AMD_WMMA_AVAILABLE
 }
 
@@ -603,7 +756,10 @@ void launch_paged_attn_tile(
     dim3 grid(n_heads, num_seqs, n_q_tiles);
     dim3 block(TILE_NUM_THREADS);
 
-    const size_t smem_bytes = (size_t)(Q_TILE_M + 2 * K_TILE_N) * (size_t) HEAD_SIZE * sizeof(__half);
+    // half Q/K/V tiles + (non-WMMA path only) an f32 scores[Q_TILE_M*K_TILE_N]
+    // scratch. Allocated unconditionally; the WMMA branch simply ignores it.
+    const size_t smem_bytes = (size_t)(Q_TILE_M + 2 * K_TILE_N) * (size_t) HEAD_SIZE * sizeof(__half)
+                            + (size_t) Q_TILE_M * (size_t) K_TILE_N * sizeof(float);
 
     mt_paged_attention_tile_kernel<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>
         <<<grid, block, smem_bytes, stream>>>(
@@ -861,7 +1017,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             for (int l = 0; l < scores.ne; ++l) {
                 local_max = max(local_max, scores.x[l]);
             }
-            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16));
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
             const float new_max = max(running_max, row_max);
 
@@ -887,7 +1043,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                 scores.x[l]   = e;
                 local_sum   += e;
             }
-            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16);
+            const float row_sum = local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
             running_sum += row_sum;
             running_max  = new_max;
 
@@ -965,12 +1121,255 @@ __global__ void mt_paged_attention_tile_mw_kernel(
         }
     }
 #else
-    GGML_UNUSED(out); GGML_UNUSED(q); GGML_UNUSED(k_cache); GGML_UNUSED(v_cache);
-    GGML_UNUSED(block_tables); GGML_UNUSED(context_lens); GGML_UNUSED(q_lens);
-    GGML_UNUSED(max_blocks_per_seq); GGML_UNUSED(n_kv_heads); GGML_UNUSED(n_heads);
-    GGML_UNUSED(scale);
-    NO_DEVICE_CODE;
-#endif
+    // ── Portable FMA multi-warp tile flash-attention (non-WMMA: NVIDIA
+    // Pascal sm_61, AMD GCN gfx803). Mirrors the WMMA mw path's block layout
+    // (Q_TILES warps/block, K/V staged once into smem and shared across warps
+    // = the HBM-reuse win) but runs the two matmuls as explicit shared-memory
+    // GEMMs per warp, identical math to the single-warp FMA #else above. On
+    // gfx803 the N_WARPS*32 threads fill the 64-lane wave (2 logical warps per
+    // physical wave), recovering the ~2x SIMD utilization the 32-thread
+    // single-warp tile kernel left on the table. No extra LDS over the WMMA
+    // layout: the PV step rebuilds each Q row's full 16-wide score vector from
+    // the pair lane via __shfl_xor(.,16) instead of an smem scratch.
+    static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
+    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int N_WARPS   = Q_TILES;
+    constexpr int N_THREADS = N_WARPS * 32;
+    constexpr int N_INNER   = HEAD_SIZE / K_INNER;
+
+    using ops = paged_cache_ops<CACHE_TYPE, HEAD_SIZE, BLOCK_SIZE>;
+
+    const int head_idx       = blockIdx.x;
+    const int seq_idx        = blockIdx.y;
+    const int q_tile_grp_idx = blockIdx.z;
+    const int tid            = threadIdx.x;
+    const int warp_id        = tid >> 5;     // tid / 32
+    const int lane_id        = tid & 31;     // tid % 32
+
+    const int q_len       = q_lens[seq_idx];
+    const int q_tile_base = q_tile_grp_idx * Q_TILES;
+
+    if (q_tile_base * Q_TILE_M >= q_len) {
+        return;
+    }
+
+    const int my_q_tile_idx    = q_tile_base + warp_id;
+    const int my_q_tile_start  = my_q_tile_idx * Q_TILE_M;
+    const bool warp_active     = (my_q_tile_start < q_len);
+    const int my_q_tile_actual = warp_active
+        ? ((my_q_tile_start + Q_TILE_M <= q_len) ? Q_TILE_M : (q_len - my_q_tile_start))
+        : 0;
+
+    const int kv_head_idx       = head_idx / (n_heads / n_kv_heads);
+    const int ctx_len_after_q   = context_lens[seq_idx];
+    const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
+
+    size_t seq_q_offset = 0;
+    for (int s = 0; s < seq_idx; ++s) {
+        seq_q_offset += (size_t) q_lens[s];
+    }
+
+    const int my_q_pos_base = (ctx_len_after_q - q_len) + my_q_tile_start;
+
+    // Uniform K-loop bound across the block (all warps must hit the same
+    // cooperative __syncthreads); per-warp causal masking handles the rest.
+    const int block_last_q_row = min(q_tile_base * Q_TILE_M + Q_TILES * Q_TILE_M, q_len) - 1;
+    const int block_last_q_pos = (ctx_len_after_q - q_len) + block_last_q_row;
+    const int block_valid_ctx  = block_last_q_pos + 1;
+
+    extern __shared__ unsigned char smem_raw[];
+    __half * smem_q = (__half *)(smem_raw);
+    __half * smem_k = smem_q + Q_TILES * Q_TILE_M * HEAD_SIZE;
+    __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
+
+    // ── cooperative Q load (all threads, all Q_TILES tiles) ──
+    {
+        constexpr int TOTAL_Q_ELEMS = Q_TILES * Q_TILE_M * HEAD_SIZE;
+        for (int idx = tid; idx < TOTAL_Q_ELEMS; idx += N_THREADS) {
+            const int qt     = idx / (Q_TILE_M * HEAD_SIZE);
+            const int qt_off = idx % (Q_TILE_M * HEAD_SIZE);
+            const int qrow   = qt_off / HEAD_SIZE;
+            const int qcol   = qt_off % HEAD_SIZE;
+
+            const int q_tile_idx_local = q_tile_base + qt;
+            const int q_row_global     = q_tile_idx_local * Q_TILE_M + qrow;
+
+            __half val = __float2half(0.0f);
+            if (q_row_global < q_len) {
+                const size_t base = ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads
+                                     + (size_t) head_idx) * (size_t) HEAD_SIZE;
+                val = q[base + (size_t) qcol];
+            }
+            smem_q[idx] = val;
+        }
+    }
+    __syncthreads();
+
+    // Lane ownership within a warp: row = lane%16 (Q row), half = lane/16 ->
+    // this lane owns cols 8*half + l, l in [0,8).
+    const __half * my_smem_q = smem_q + warp_id * Q_TILE_M * HEAD_SIZE;
+    const int row     = lane_id & 15;
+    const int half_id = lane_id >> 4;
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc[N_INNER][8];
+    #pragma unroll
+    for (int n = 0; n < N_INNER; ++n) {
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) acc[n][l] = 0.0f;
+    }
+
+    const int  q_pos     = my_q_pos_base + row;
+    const bool row_valid = (row < my_q_tile_actual);
+
+    for (int k_tile_start = 0; k_tile_start < block_valid_ctx; k_tile_start += K_TILE_N) {
+        // Cooperative K load (shared across all warps in the block).
+        if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
+            coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+            coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else {
+            for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+                const int krow  = idx / HEAD_SIZE;
+                const int kcol  = idx % HEAD_SIZE;
+                const int token = k_tile_start + krow;
+                float val = 0.0f;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        val = ops::k_load(k_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, kcol);
+                    }
+                }
+                smem_k[idx] = __float2half(val);
+            }
+        }
+        __syncthreads();
+
+        // QK: scores[row, col] = scale * (Q[row] . K[col]) for this lane's 8 cols.
+        float sc[8];
+        if (warp_active) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int col = 8 * half_id + l;
+                float dot = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < HEAD_SIZE; ++d) {
+                    dot += __half2float(my_smem_q[row * HEAD_SIZE + d]) * __half2float(smem_k[col * HEAD_SIZE + d]);
+                }
+                const int  k_pos   = k_tile_start + col;
+                const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < block_valid_ctx);
+                sc[l] = visible ? (dot * scale) : -INFINITY;
+            }
+
+            // Per-row max: 8-wide local then pair-lane (lane^16) via shfl_xor.
+            float local_max = -INFINITY;
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) local_max = max(local_max, sc[l]);
+            const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
+            const float new_max = max(running_max, row_max);
+
+            // Rescale running state on new max.
+            if (running_max > -INFINITY) {
+                const float rescale = __expf(running_max - new_max);
+                running_sum *= rescale;
+                #pragma unroll
+                for (int n = 0; n < N_INNER; ++n) {
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) acc[n][l] *= rescale;
+                }
+            }
+
+            // exp(scores - new_max) + per-row sum.
+            float local_sum = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const float e = (sc[l] == -INFINITY) ? 0.0f : __expf(sc[l] - new_max);
+                sc[l] = e;
+                local_sum += e;
+            }
+            running_sum += local_sum + __shfl_xor_sync(0xFFFFFFFF, local_sum, 16, WARP_SIZE);
+            running_max  = new_max;
+        }
+
+        // Cooperative V load (same dispatch as K; turbo* V shares K layout).
+        if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_0) {
+            coop_stage_turbo4_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_v, v_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
+            coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
+                smem_v, v_cache, seq_block_table, k_tile_start, block_valid_ctx,
+                kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else {
+            for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
+                const int vrow  = idx / HEAD_SIZE;
+                const int vcol  = idx % HEAD_SIZE;
+                const int token = k_tile_start + vrow;
+                float val = 0.0f;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        val = ops::v_load(v_cache, physical, kv_head_idx, n_kv_heads, tok_in_block, vcol);
+                    }
+                }
+                smem_v[idx] = __float2half(val);
+            }
+        }
+        __syncthreads();  // smem_v visible to the warp
+
+        // PV: acc[n][l] += sum_c scores[row, c] * V[c, d], d = n*16 + 8*half + l.
+        // This lane owns only its 8 exp-scores (cols 8*half+l); fetch the pair
+        // lane's 8 via shfl_xor(.,16) to rebuild the full 16-wide row.
+        if (warp_active) {
+            float s16[K_TILE_N];
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const float partner = __shfl_xor_sync(0xFFFFFFFF, sc[l], 16, WARP_SIZE);
+                s16[8 * half_id + l]       = sc[l];
+                s16[8 * (1 - half_id) + l] = partner;
+            }
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int d = n * K_INNER + 8 * half_id + l;
+                    float pv = 0.0f;
+                    #pragma unroll
+                    for (int c = 0; c < K_TILE_N; ++c) {
+                        pv += s16[c] * __half2float(smem_v[c * HEAD_SIZE + d]);
+                    }
+                    acc[n][l] += pv;
+                }
+            }
+        }
+        __syncthreads();  // before next iter overwrites smem_k / smem_v
+    }
+
+    // ── per-warp output writeback ───────────────────────────────────────
+    if (warp_active && row < my_q_tile_actual) {
+        const float inv_sum = 1.0f / (running_sum + 1e-6f);
+        const int q_row_global = my_q_tile_start + row;
+        const size_t out_row_base =
+            ((seq_q_offset + (size_t) q_row_global) * (size_t) n_heads + (size_t) head_idx) * (size_t) HEAD_SIZE;
+        #pragma unroll
+        for (int n = 0; n < N_INNER; ++n) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int d = n * K_INNER + 8 * half_id + l;
+                out[out_row_base + (size_t) d] = __float2half(acc[n][l] * inv_sum);
+            }
+        }
+    }
+#endif // AMD_WMMA_AVAILABLE
 }
 
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
@@ -1036,6 +1435,11 @@ template void launch_paged_attn_tile<256, 16, GGML_TYPE_TURBO3_0>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4 (LFM2.5, gpt-oss).
+template void launch_paged_attn_tile<64, 16, GGML_TYPE_TURBO4_64>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 
 // Multi-warp launcher instantiations — same (HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE)
 // matrix as the single-warp path. TileConfig picks Q_TILES_PER_BLOCK at
@@ -1061,6 +1465,11 @@ template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO4_0>(
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
 template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO3_0>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+// HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4.
+template void launch_paged_attn_tile_mw<64, 16, GGML_TYPE_TURBO4_64>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);

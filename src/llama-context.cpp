@@ -2287,6 +2287,16 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    // For embedding models with mean/rank pooling, build_pooling multiplies t_embd (reduced to
+    // [n_outputs, ...] via out_ids) by inp_mean of shape [n_tokens, n_seqs], which requires
+    // n_outputs == n_tokens. Rounding n_tokens up to a multiple of n_seqs above can break that
+    // invariant (callers compute n_outputs from the unrounded n_tokens), so re-establish it here.
+    if (cparams.embeddings &&
+        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN || cparams.pooling_type == LLAMA_POOLING_TYPE_RANK) &&
+        n_outputs != n_tokens) {
+        n_outputs = n_tokens;
+    }
+
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that

@@ -477,5 +477,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return true;
     }
 
+    // gfx80x (Tonga/Fiji/Polaris, GGML_CUDA_CC_GCN4 and earlier) have no hardware dp4a
+    // (v_dot4): ggml_cuda_dp4a falls back to fully-scalar byte emulation, which makes MMQ
+    // ~8x slower than dequantization + hipBLAS for prefill-sized batches (rocBLAS ships
+    // gfx803 fp16/fp32 Tensile kernels). Restrict MMQ to small (decode) batches only.
+    if (GGML_CUDA_CC_IS_GCN(cc) && cc <= GGML_CUDA_CC_GCN4) {
+        return ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+    }
+
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }

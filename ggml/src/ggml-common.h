@@ -329,6 +329,19 @@ static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK
 
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
+// MAD-301C Lever B: native head_dim-64 turbo4 KV cache block.
+// Identical 4-bit PolarQuant + per-block norm as block_turbo4_0, but a 64-element
+// block so a head_dim-64 head (LFM2.5, gpt-oss) is exactly one block with NO
+// 64->128 zero-padding. The paged path skips RHT, so dequant returns
+// centroid*norm and dot products match the padded-128 path bit-for-bit at ~half
+// the storage (34 vs 68 bytes/head). 4-bit centroid layout only.
+#define QK_TURBO4_64 64
+typedef struct {
+    ggml_half  norm;                       //  2 bytes: per-block scale
+    uint8_t    qs[QK_TURBO4_64 / 2];        // 32 bytes: 4-bit PolarQuant indices (nibble packed)
+} block_turbo4_64;                          // 34 bytes total
+static_assert(sizeof(block_turbo4_64) == 2 + QK_TURBO4_64/2, "wrong turbo4_64 block size");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16
