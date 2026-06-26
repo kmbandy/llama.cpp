@@ -55,6 +55,13 @@ std::vector<uint32_t> BlockTable::clear_seq(llama_seq_id seq) {
     return freed;
 }
 
+void BlockTable::truncate(llama_seq_id seq, uint32_t new_num_blocks) {
+    if (seq < 0 || (uint32_t) seq >= max_seqs_) return;
+    auto & row = table_[seq];
+    if (new_num_blocks >= row.size()) return;  // nothing to drop
+    row.resize(new_num_blocks);
+}
+
 void BlockTable::reset() {
     for (auto & row : table_) {
         row.clear();

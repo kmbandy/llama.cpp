@@ -81,6 +81,15 @@ public:
     // seq_rm with sentinel range).
     std::vector<uint32_t> clear_seq(llama_seq_id seq);
 
+    // Drop trailing logical blocks so `seq` holds exactly `new_num_blocks`.
+    // Used by tail-truncate seq_rm to restore the
+    //   num_blocks == ceil(live_tokens / block_size)
+    // invariant after the freed tail blocks have been returned to
+    // BlockPool. No-op if new_num_blocks >= the seq's current block count.
+    // Pure table op: the caller MUST have already freed any live physical
+    // blocks in the dropped range (this never touches BlockPool).
+    void truncate(llama_seq_id seq, uint32_t new_num_blocks);
+
     // Reset everything. Used by mt::clear() (whole-cache wipe). Caller
     // is responsible for releasing block IDs back to BlockPool first.
     void reset();

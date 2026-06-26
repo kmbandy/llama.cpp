@@ -78,6 +78,36 @@ private:
     size_t pos_ = 0;
 };
 
+// Minimal owning builder for a single-seq contiguous-position ubatch.
+// Holds the backing storage the llama_ubatch's raw pointers reference, so
+// it must outlive every use of `ub`. Populates only the fields
+// apply_ubatch_to_state / compute_slot_mapping read: n_tokens, pos[],
+// n_seq_id[], seq_id[][0].
+struct UbatchHolder {
+    std::vector<llama_pos>      pos;
+    std::vector<int32_t>        n_seq_id;
+    std::vector<llama_seq_id>   seq_id_storage;  // one entry per token
+    std::vector<llama_seq_id *> seq_id_ptrs;     // seq_id[i] -> &storage[i]
+    llama_ubatch                ub{};
+};
+
+std::unique_ptr<UbatchHolder> make_ubatch(llama_seq_id seq, llama_pos lo, uint32_t n) {
+    auto h = std::make_unique<UbatchHolder>();
+    h->pos.resize(n);
+    h->n_seq_id.assign(n, 1);
+    h->seq_id_storage.assign(n, seq);
+    h->seq_id_ptrs.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        h->pos[i]         = lo + (llama_pos) i;
+        h->seq_id_ptrs[i] = &h->seq_id_storage[i];
+    }
+    h->ub.n_tokens = n;
+    h->ub.pos      = h->pos.data();
+    h->ub.n_seq_id = h->n_seq_id.data();
+    h->ub.seq_id   = h->seq_id_ptrs.data();
+    return h;
+}
+
 // Per-test directory under TMPDIR so parallel runs and sandboxed
 // environments don't collide.
 std::string tmp_dir(const char * tag) {
@@ -210,6 +240,70 @@ int main(int argc, char * argv[]) {
         const bool ok = cache.seq_rm(/*seq*/ 0, /*p0=*/4, /*p1=*/8);
         assert(ok);
         printf("test-paged-lifecycle: partial seq_rm (middle block, no crash) ok\n");
+    }
+
+    // ─── REGRESSION: tail-truncate seq_rm then re-prefill ───
+    //
+    // Reproduces the paged-hybrid crash (GGML_ASSERT "compute_slot_mapping
+    // failed" at llama-graph.cpp:723) seen under swarm load with shared
+    // prompt prefixes. The server's prompt-cache-reuse path does
+    //   seq_rm(seq, p0, -1)   // truncate divergent tail at matched-prefix p0
+    // then re-prefills from p0. Tail-truncate frees the blocks above p0 by
+    // swapping their table entry to kInvalidBlockId — WITHOUT shrinking
+    // num_blocks. That violates the BlockTable invariant (num_blocks ==
+    // ceil(live_tokens/block_size)); ensure_blocks_for then trusts the
+    // inflated count, no-ops the refill, and the freed tail-blocks remain
+    // as holes. A re-prefill token whose position maps onto a hole resolves
+    // to kInvalidBlockId and compute_slot_mapping returns false → the
+    // graph's set_input GGML_ASSERT aborts the server.
+    {
+        // 8 GPU blocks × block_size 4 = 32 hot tokens — generous headroom.
+        llama_kv_cache_paged cache(
+            *model, buft,
+            /*n_blocks_total=*/8, kBlockSize, kNSeqMax, kMaxBlks,
+            /*n_warm_blocks=*/0,
+            /*n_cold_blocks=*/0,
+            std::string(),
+            false, "test-truncrefill");
+
+        // Prefill seq 0 with positions [0,24): 24 tokens → 6 blocks.
+        auto pre = make_ubatch(/*seq=*/0, /*lo=*/0, /*n=*/24);
+        {
+            std::vector<llama_ubatch> ubs; ubs.push_back(pre->ub);
+            const auto mctx = cache.init_batch_with_ubatches(std::move(ubs));
+            assert(mctx && mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS &&
+                   "prefill ubatch should allocate cleanly");
+        }
+        assert(cache.seq_pos_max(0) == 23);
+
+        // Truncate the divergent tail at a NON-block-aligned boundary
+        // (p0=14, block_size=4 → block 3 [12,16) is partially kept; blocks
+        // 4,5 [16,24) are wholly freed). Mirrors prompt-cache reuse.
+        const bool rm = cache.seq_rm(/*seq*/ 0, /*p0=*/14, /*p1=*/-1);
+        assert(rm);
+        assert(cache.seq_pos_max(0) == 13 && "tail-truncate moves pos_max to p0-1");
+
+        // Re-prefill from p0: positions [14,26) — 12 tokens. Block 4 ([16,20))
+        // and block 5 ([20,24)) were freed above; the new tokens at pos 16..23
+        // map onto them and MUST resolve to freshly-allocated physical slots.
+        auto re = make_ubatch(/*seq=*/0, /*lo=*/14, /*n=*/12);
+        {
+            std::vector<llama_ubatch> ubs; ubs.push_back(re->ub);
+            const auto mctx = cache.init_batch_with_ubatches(std::move(ubs));
+            assert(mctx && mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS &&
+                   "re-prefill ubatch should allocate cleanly");
+        }
+
+        // The crash site: every re-prefill token must resolve to a valid
+        // physical slot. Pre-fix this returns false (holes at logical 4,5).
+        std::vector<int32_t> slots(re->ub.n_tokens, -1);
+        const bool mapped = cache.compute_slot_mapping(&re->ub, slots.data());
+        assert(mapped && "compute_slot_mapping must not hit a freed-block hole "
+                         "after tail-truncate + re-prefill");
+        for (uint32_t i = 0; i < re->ub.n_tokens; ++i) {
+            assert(slots[i] >= 0 && "every re-prefill token needs a real slot");
+        }
+        printf("test-paged-lifecycle: tail-truncate + re-prefill slot mapping ok\n");
     }
 
     // ─── seq_cp — verify the call doesn't crash on simple inputs ───

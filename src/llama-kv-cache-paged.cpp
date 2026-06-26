@@ -1795,6 +1795,25 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     if (p1 > cur_max) {
         seq_states_[seq_id].pos_max = (llama_pos)(p0 - 1);
         if (seq_states_[seq_id].pos_max < 0) seq_states_[seq_id].pos_min = -1;
+
+        // MAD-310: restore the BlockTable invariant
+        //   num_blocks == ceil(live_tokens / block_size).
+        // The wipe loop above freed the wholly-covered tail blocks back to
+        // the pool and marked their table entries kInvalidBlockId, but left
+        // them in the seq's logical list — so num_blocks stayed inflated.
+        // ensure_blocks_for trusts num_blocks and would no-op the refill on
+        // re-prefill, leaving the freed slots as holes. A re-prefill token
+        // whose position maps onto a hole then resolves to kInvalidBlockId
+        // and compute_slot_mapping returns false → the paged / paged-hybrid
+        // set_input GGML_ASSERT aborts the server (the prompt-cache-reuse
+        // crash: seq_rm(seq, p0, -1) then re-prefill from p0). Trim the now
+        // dead trailing slots so re-prefill re-appends fresh blocks. Holes
+        // from a *middle* wipe (p1 <= cur_max) are intentional and left as
+        // is — this only runs on the tail-truncate branch.
+        const llama_pos new_max = seq_states_[seq_id].pos_max;
+        const uint32_t keep_blocks =
+            new_max < 0 ? 0u : ((uint32_t) new_max + bsize) / bsize;  // ceil((new_max+1)/bsize)
+        table_.truncate(seq_id, keep_blocks);
     }
 
     LLAMA_LOG_DEBUG("llama_kv_cache_paged::seq_rm: seq=%d range=[%d,%d) "

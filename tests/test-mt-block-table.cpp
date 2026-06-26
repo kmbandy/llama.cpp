@@ -218,6 +218,42 @@ int main() {
         printf("test-mt-block-table: block_size=32 arithmetic ok\n");
     }
 
+    // ─── truncate() — drop trailing blocks, restore the invariant ───
+    {
+        BlockTable t;
+        t.init(2, 16);
+        for (uint32_t i = 0; i < 5; ++i) t.append_block(0, 500 + i);  // 5 blocks
+        assert(t.num_blocks(0) == 5);
+
+        // Shrink to 3: blocks 3,4 dropped, 0..2 untouched.
+        t.truncate(0, 3);
+        assert(t.num_blocks(0) == 3);
+        assert(t.get_physical(0, 2) == 502);
+        assert(t.get_physical(0, 3) == kInvalidBlockId);  // dropped
+        assert(t.get_physical(0, 4) == kInvalidBlockId);
+
+        // Re-append lands at the new tail (logical 3), not the old one.
+        t.append_block(0, 999);
+        assert(t.num_blocks(0) == 4);
+        assert(t.get_physical(0, 3) == 999);
+
+        // No-op cases: equal or larger target leaves the row alone.
+        t.truncate(0, 4);
+        assert(t.num_blocks(0) == 4);
+        t.truncate(0, 99);
+        assert(t.num_blocks(0) == 4);
+
+        // truncate(0) clears the seq; other seqs unaffected.
+        t.append_block(1, 700);
+        t.truncate(0, 0);
+        assert(t.num_blocks(0) == 0);
+        assert(t.num_blocks(1) == 1 && t.get_physical(1, 0) == 700);
+
+        // Out-of-range seq is safe.
+        t.truncate(99, 0);
+        printf("test-mt-block-table: truncate() ok\n");
+    }
+
     printf("test-mt-block-table: ALL PASS\n");
     return 0;
 }
