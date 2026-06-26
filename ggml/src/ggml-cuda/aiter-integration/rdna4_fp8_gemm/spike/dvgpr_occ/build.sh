@@ -154,6 +154,40 @@ echo "[1h] wave-group fp8 GEMM compute -> occ_wggemm2.bin (STORE=1) + occ_wggemm
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -c occ_kernel_wggemm2.s -o occ_wggemm2_perf.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_perf.o occ_wggemm2_perf.bin
 echo "      occ_wggemm2.bin: $(wc -c < occ_wggemm2.bin) B, occ_wggemm2_perf.bin: $(wc -c < occ_wggemm2_perf.bin) B"
+# MAD-305 #323: lean wave-specialized fp8 GEMM -- WS-T5 sweep matrix.
+#   FULLY-QUALIFIED per-cell bin name: occ_ws_<FM>x<FN>_l<NLOAD>_c<NCOMP>[_dyn][_st].bin so the --wavespec
+#   handler loads the EXACT (FM,FN,NLOAD,NCOMP,dyn) kernel. FM/FN set the tile; NLOAD/NCOMP are BAKED into
+#   the kernel's wave-role split, so a sweep over them needs distinct bins. Loading a mismatched bin under
+#   bit6-armed dyn is the brick -- the handler refuses to dispatch on a missing bin (file-not-found > brick).
+#   Cells: lean four {2x1,2x2,2x4,4x2} @ NLOAD{1,2} + 4x4 stretch @ NLOAD1 ; NCOMP=4 throughout.
+echo "[1h2] wave-specialized fp8 GEMM sweep matrix -> occ_ws_<FMxFN>_l<NLOAD>_c<NCOMP>[_dyn][_st].bin"
+WS_NC=4
+for cell in "2 1 1" "2 1 2" "2 2 1" "2 2 2" "2 4 1" "2 4 2" "4 2 1" "4 2 2" "4 4 1"; do
+  set -- $cell; fm=$1; fn=$2; nl=$3
+  base="occ_ws_${fm}x${fn}_l${nl}_c${WS_NC}"
+  D="-Wa,-defsym,FM=$fm -Wa,-defsym,FN=$fn -Wa,-defsym,NLOAD=$nl -Wa,-defsym,NCOMP=$WS_NC"
+  for dv in 0 1; do
+    [ "$dv" -eq 1 ] && dtag="_dyn" || dtag=""
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 $D -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,STORE=1 -c occ_kernel_wavespec.s -o "${base}${dtag}_st.o"
+    "$L/llvm-objcopy" -O binary --only-section=.text "${base}${dtag}_st.o" "${base}${dtag}_st.bin"
+    "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 $D -Wa,-defsym,DYNVGPR=$dv -Wa,-defsym,STORE=0 -c occ_kernel_wavespec.s -o "${base}${dtag}.o"
+    "$L/llvm-objcopy" -O binary --only-section=.text "${base}${dtag}.o" "${base}${dtag}.bin"
+  done
+done
+echo "      built $(ls occ_ws_*.bin 2>/dev/null | wc -l) wavespec sweep bins (9 cells x static/dyn x st/perf = 36)"
+# T6 BRICK #4 FIX: BUSYWAIT=1 dyn variant of the 2x2 cell -- swaps the 4 asymmetric K-slice s_barrier
+#   (which deadlock under dyn-VGPR at mixed allocations) for an LDS sense-reversing busy-wait. The --wavespec
+#   WS_BW=1 path loads these. Built for the lean four dyn cells @ NLOAD1 (the headless dyn-vs-static retest).
+for cell in "2 1 1" "2 2 1" "2 4 1" "4 2 1"; do
+  set -- $cell; fm=$1; fn=$2; nl=$3
+  base="occ_ws_${fm}x${fn}_l${nl}_c4_dyn_bw"
+  D="-Wa,-defsym,FM=$fm -Wa,-defsym,FN=$fn -Wa,-defsym,NLOAD=$nl -Wa,-defsym,NCOMP=4 -Wa,-defsym,DYNVGPR=1 -Wa,-defsym,BUSYWAIT=1"
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 $D -Wa,-defsym,STORE=1 -c occ_kernel_wavespec.s -o "${base}_st.o"
+  "$L/llvm-objcopy" -O binary --only-section=.text "${base}_st.o" "${base}_st.bin"
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 $D -Wa,-defsym,STORE=0 -c occ_kernel_wavespec.s -o "${base}.o"
+  "$L/llvm-objcopy" -O binary --only-section=.text "${base}.o" "${base}.bin"
+done
+echo "      built $(ls occ_ws_*_bw*.bin 2>/dev/null | wc -l) BUSYWAIT dyn bins (lean four @ NLOAD1 x st/perf = 8)"
 # matched FEEDONLY on the real DBUF==1 path: identical feed (loads/prefetch/barriers/waits), WMMA skipped
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,FEEDONLY=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_feedonly_perf.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_feedonly_perf.o occ_wggemm2_feedonly_perf.bin
@@ -264,6 +298,32 @@ echo "      4x4 KWINBPF bins: tw4_kwin4_bpf (perf) + _bpf_st1 (oracle) built"
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_st1.bin
 echo "      KWINBPF+SETPRIO bins: 82_tw4_kwin4_bpf_sp (perf) + _bpf_sp_st1 (oracle) built"
+# 8x2 + KWINBPF + SETPRIO + B128 (MAD-305 128-bit B feed): RDNA4 has NO fp8 128-bit transpose, so the transpose is
+#   moved to the CPU preshuffle (mbg_preshuffle_B128 -> frag-ready 512B blocks); the device does a PLAIN
+#   global_load_b128 (vaddr=lane*16) delivering 2 K=16 B-frags/instr -> B-feed slots 16->8/K-window (HALVED).
+#   The --b128 harness path feeds the frag-ready preshuffle + the oracle gate. perf (STORE=0) + STORE=1 oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,B128=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_b128.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_b128.o occ_wggemm2_82_tw4_kwin4_bpf_sp_b128.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,B128=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_b128_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_b128_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_b128_st1.bin
+echo "      KWINBPF+SETPRIO+B128 bins: 82_tw4_kwin4_bpf_sp_b128 (perf) + _b128_st1 (oracle) built"
+# 8x2 + KWINBPF + SETPRIO + TILEORD=1 (MAD-305 L1 N_STATIONARY): persistent claim order swapped so consecutive ti
+#   share tile_col (B/N panel) and sweep tile_row -> a B panel stays hot in L2 across the M-sweep. Pure claim-order
+#   change (no WMMA math); the --tileord harness path passes MTL mask/shift + mirror-decodes the oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TILEORD=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat.o occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TILEORD=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_nstat_st1.bin
+echo "      KWINBPF+SETPRIO+TILEORD=1 bins: 82_tw4_kwin4_bpf_sp_nstat (perf) + _nstat_st1 (oracle) built"
+# 8x2 + KWINBPF + SETPRIO + LDSTRIM=1 (MAD-305 RGA-surfaced LDS-cliff trim): the 4-byte ti-broadcast scratch sat
+#   just past the 32768 A-ring -> 32772 -> rounds a full 512B granule to alloc 33280 -> only 1 WG fits a 64KB WGP.
+#   LDSTRIM overlaps the broadcast into A-ring slot 0 -> LDS 32768 = alloc 32768 -> 2 WGs/WGP (occupancy candidate).
+#   +1 s_barrier/tile closes the broadcast-read vs slot-0 A-fill race. Harness reserves 32768 via --ldstrim.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,LDSTRIM=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim.o occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,LDSTRIM=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_ldstrim_st1.bin
+echo "      KWINBPF+SETPRIO+LDSTRIM bins: 82_tw4_kwin4_bpf_sp_ldstrim (perf) + _ldstrim_st1 (oracle) built"
 # 8x2 + KWINBPF + SETPRIO + ALD2 (MAD-305 issue-slot lever, the "fewer dispatch slots on feed" axis): wide A-read via
 #   ds_load_2addr_stride64_b64 loads 2 M-frags/instr (offset*512 == mi*512 frag stride) -> A-reads 16->8/slice ->
 #   more dispatch bandwidth to WMMA. Same LDS addresses/bytes (oracle-identical). perf (STORE=0) + STORE=1 oracle.
@@ -272,6 +332,73 @@ echo "      KWINBPF+SETPRIO bins: 82_tw4_kwin4_bpf_sp (perf) + _bpf_sp_st1 (orac
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,ALD2=1 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.o
 "$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.o occ_wggemm2_82_tw4_kwin4_bpf_sp_a2_st1.bin
 echo "      wide-A-read bins: 82_tw4_kwin4_bpf_sp_a2 (perf) + _bpf_sp_a2_st1 (oracle) built"
+# 8x2 @ TWN=8 (MAD-305 BIG-TILE lever, CDNA rung-8 256x256 equiv): 16-wave WG, 256x256 SQUARE cooperative tile (vs
+#   256x128 @ TWN=4). 2x resident WMMA in flight per WG to hide WMMA-result latency at the structural WG cap; A-strip
+#   reused by 8 N-waves (NBANDS=FM/TWN=1, single-pass A-fill). Same FM=8 -> ~128 VGPR/wave (static, co-resides). Same
+#   LDS (TM=TWM*FM*16 is TWN-independent -> 32KB KWIN ring). Winning stack (KWINBPF+SETPRIO), +/- wide-A. perf + oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWN=8 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw8_kwin4_bpf_sp.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw8_kwin4_bpf_sp.o occ_wggemm2_82_tw8_kwin4_bpf_sp.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWN=8 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw8_kwin4_bpf_sp_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw8_kwin4_bpf_sp_st1.o occ_wggemm2_82_tw8_kwin4_bpf_sp_st1.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,ALD2=1 -Wa,-defsym,TWN=8 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw8_kwin4_bpf_sp_a2.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw8_kwin4_bpf_sp_a2.o occ_wggemm2_82_tw8_kwin4_bpf_sp_a2.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,ALD2=1 -Wa,-defsym,TWN=8 -Wa,-defsym,FM=8 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_82_tw8_kwin4_bpf_sp_a2_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_82_tw8_kwin4_bpf_sp_a2_st1.o occ_wggemm2_82_tw8_kwin4_bpf_sp_a2_st1.bin
+echo "      big-tile TWN=8 bins: 82_tw8_kwin4_bpf_sp{,_a2} (256x256 16-wave perf) + _st1 oracles built"
+# ===== MAD-305 L4: LEAN single-wave register-blocked bins (TWM=1 TWN=1, ANOLDSTR direct-global feed) =====
+#   The existing source parameterizes to a single-wave register-blocked tile: TWM=1 TWN=1 ANOLDSTR=1 FM=M0 FN=N0.
+#   Feed = global_load_tr from A-shuf + B-shuf (NO LDS A-tile, NO barriers); A/B frags packed tight just past the
+#   accumulators (FA=ACC+8*FM*FN, FB=FA+4*FM) so VGPR alloc tracks the lean tile -> high occupancy. ONE wave/WG =
+#   the safe regime (no co-residency barrier). Persistent: harness launches nWG single-wave WGs that claim tiles.
+#   Buildable set (FM*FN in {4,8,16}; FN in {2,4}, FM in {2,4,8}): 2x2 4x2 2x4 4x4 8x2. Per cfg: STORE=0 perf + STORE=1 oracle.
+for cfg in "2 2" "4 2" "2 4" "4 4" "8 2"; do
+  set -- $cfg; FM=$1; FN=$2
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDSTR=1 -Wa,-defsym,TWM=1 -Wa,-defsym,TWN=1 -Wa,-defsym,FM=$FM -Wa,-defsym,FN=$FN -c occ_kernel_wggemm2.s -o occ_lean_${FM}x${FN}.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_lean_${FM}x${FN}.o occ_lean_${FM}x${FN}.bin
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,ANOLDSTR=1 -Wa,-defsym,TWM=1 -Wa,-defsym,TWN=1 -Wa,-defsym,FM=$FM -Wa,-defsym,FN=$FN -c occ_kernel_wggemm2.s -o occ_lean_${FM}x${FN}_st1.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_lean_${FM}x${FN}_st1.o occ_lean_${FM}x${FN}_st1.bin
+done
+echo "      L4 LEAN single-wave bins: occ_lean_{2x2,4x2,2x4,4x4,8x2}{,_st1} built"
+# ===== MAD-305 L4 LEANBPF: software-pipelined (prefetch-one-ahead) lean variants (RGA-surfaced feed-latency fix) =====
+#   The naive lean K-loop stalls on s_wait_loadcnt 0x0 every K-tile (full VRAM latency exposed) -> ~63 TF wall.
+#   LEANBPF=1 double-buffers the feed: prefetch tile t+1 while computing tile t (wait 0x10=LPT, prefetch in flight),
+#   guarded by (tile_idx < NTILES) so it can never read past the exactly-tight buffers (no OOB). RGA-verified offline
+#   (pipeline scheduling + register fit + 0 spills); functional correctness + TF gain are GPU-validation-gated.
+for cfg in "2 2" "4 2" "2 4" "4 4" "8 2"; do
+  set -- $cfg; FM=$1; FN=$2
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDSTR=1 -Wa,-defsym,TWM=1 -Wa,-defsym,TWN=1 -Wa,-defsym,FM=$FM -Wa,-defsym,FN=$FN -Wa,-defsym,LEANBPF=1 -c occ_kernel_wggemm2.s -o occ_leanbpf_${FM}x${FN}.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_leanbpf_${FM}x${FN}.o occ_leanbpf_${FM}x${FN}.bin
+  "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,ANOLDSTR=1 -Wa,-defsym,TWM=1 -Wa,-defsym,TWN=1 -Wa,-defsym,FM=$FM -Wa,-defsym,FN=$FN -Wa,-defsym,LEANBPF=1 -c occ_kernel_wggemm2.s -o occ_leanbpf_${FM}x${FN}_st1.o
+  "$L/llvm-objcopy" -O binary --only-section=.text occ_leanbpf_${FM}x${FN}_st1.o occ_leanbpf_${FM}x${FN}_st1.bin
+done
+echo "      L4 LEANBPF pipelined bins: occ_leanbpf_{2x2,4x2,2x4,4x4,8x2}{,_st1} built"
+# 4x2 @ TWM=4 TWN=4 (MAD-305 LEAN-16-WAVE lever): TWN=8 16-wave WG DEADLOCKS (208-VGPR fat waves can't co-reside; NBANDS=FM/TWN
+#   forces FM>=8 at TWN=8). Get the 16 waves from the M-axis instead: TWM=4 TWN=4 FM=4 FN=2 -> NBANDS=FM/TWN=1, 256x128 tile
+#   (== winner area) but 16 LEAN waves (8 frags not 16 -> lower VGPR -> droppable RSRC1 reservation -> co-resides). Growing TWM
+#   also amortizes the BINDING B-feed (M-waves share B). vgprField swept at run time to find the co-residency floor. perf + oracle.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWM=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=4 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_42_tw4x4_kwin4_bpf_sp.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_42_tw4x4_kwin4_bpf_sp.o occ_wggemm2_42_tw4x4_kwin4_bpf_sp.bin
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWM=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=4 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_42_tw4x4_kwin4_bpf_sp_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_42_tw4x4_kwin4_bpf_sp_st1.o occ_wggemm2_42_tw4x4_kwin4_bpf_sp_st1.bin
+echo "      lean-16-wave bins: 42_tw4x4_kwin4_bpf_sp (TWM4 TWN4 FM4 FN2 256x128 16-wave perf) + _st1 oracle built"
+# 4x2 @ TWM=2 TWN=4 (MAD-305 BISECTION CONTROL): same per-wave FM=4 FN=2 as the lean tile but only 8 waves (TWM=2 ->
+#   NBANDS=FM/TWN=1, TM=128, 128x128 tile, no 16-wave co-residency). Splits the lean all-frags-wrong bug: control PASS ->
+#   bug is in the TWM=4/16-wave path; control FAIL -> bug is the FM=4xFN=2 per-wave/frag math. Oracle (STORE=1) only.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWM=2 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=4 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_42_tw2x4_kwin4_bpf_sp_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_42_tw2x4_kwin4_bpf_sp_st1.o occ_wggemm2_42_tw2x4_kwin4_bpf_sp_st1.bin
+echo "      bisection control bin: 42_tw2x4_kwin4_bpf_sp_st1 (TWM2 TWN4 FM4 FN2 128x128 8-wave oracle) built"
+# 4x4 @ TWM=4 TWN=2 (MAD-305 BISECTION CONTROL B): TWM=4 (wave_m 0-3, TM=256, TROW_SH=8) but only 8 waves (TWN=2) with the
+#   PROVEN 2-band A-fill (NBANDS=FM/TWN=2, identical fill to the 8x2 winner). Splits the 16-wave/TWM=4 bug: PASS -> M-doubling
+#   (wave_m>=2 / TROW_SH) is fine, bug is the 16-wave 512-thread single-band fill; FAIL -> bug is the TWM=4 M-doubling path.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=4 -Wa,-defsym,KWINPW=4 -Wa,-defsym,KWINBPF=1 -Wa,-defsym,SETPRIO=1 -Wa,-defsym,TWM=4 -Wa,-defsym,TWN=2 -Wa,-defsym,FM=4 -Wa,-defsym,FN=4 -c occ_kernel_wggemm2.s -o occ_wggemm2_44_tw4x2_kwin4_bpf_sp_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_44_tw4x2_kwin4_bpf_sp_st1.o occ_wggemm2_44_tw4x2_kwin4_bpf_sp_st1.bin
+echo "      bisection control B bin: 44_tw4x2_kwin4_bpf_sp_st1 (TWM4 TWN2 FM4 FN4 256x128 8-wave, M-double isolator) built"
+# 4x2 lean @ KWIN=0 (MAD-305 BISECTION CONTROL C): the lean 16-wave geometry on the SIMPLEST base path (no KWIN ring, no
+#   KWINBPF, no SETPRIO). PASS -> the half-contraction bug is in the KWIN windowed publish/consume for 16 waves; FAIL ->
+#   the base A-fill/WMMA path itself. LDS = ATILE + ti = TM*32+4 = 8196 (NO KWIN ring). Oracle (STORE=1) only.
+"$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=1 -Wa,-defsym,KWIN=0 -Wa,-defsym,TWM=4 -Wa,-defsym,TWN=4 -Wa,-defsym,FM=4 -Wa,-defsym,FN=2 -c occ_kernel_wggemm2.s -o occ_wggemm2_42_tw4x4_kwin0_st1.o
+"$L/llvm-objcopy" -O binary --only-section=.text occ_wggemm2_42_tw4x4_kwin0_st1.o occ_wggemm2_42_tw4x4_kwin0_st1.bin
+echo "      bisection control C bin: 42_tw4x4_kwin0_st1 (TWM4 TWN4 FM4 FN2 16-wave on KWIN=0 base path) built"
 
 # LDS-FREE A (ANOLDS): per-wave global A, no LDS, no barriers (issue-density structural test). perf (STORE=0) + oracle (STORE=1).
 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 -Wa,-defsym,STORE=0 -Wa,-defsym,ANOLDS=1 -c occ_kernel_wggemm2.s -o occ_wggemm2_anolds_perf.o

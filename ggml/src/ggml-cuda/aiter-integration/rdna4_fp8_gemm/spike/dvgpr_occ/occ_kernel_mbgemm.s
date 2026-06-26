@@ -39,13 +39,32 @@
 .ifndef PROFILE
     .set PROFILE, 0                     // 1 = in-kernel REALTIME-timer phase breakdown (workgroup 0 writes occ[24..44])
 .endif
+.ifndef GENDIV
+    .set GENDIV, 0                      // 0 = pow2 tile-column decode (ti -> row>>LOG2, col&MASK; s12=mask s13=log2).
+.endif                                  // 1 = magic-reciprocal decode for NON-pow2 NTL (real ml8 N): row=mul_hi(ti,magic),
+                                        // col=ti-row*NTL; s12=magic(ceil(2^32/NTL)) s13=NTL. Lets the real ml8 shapes run.
+.ifndef NAIVEFEED
+    .set NAIVEFEED, 0                   // 1 = EXPOSED-feed K-loop (load step -> WAIT -> compute, NO double-buffer
+.endif                                  // prefetch). Puts prong3's "occupancy is the only feed-hider" condition on the
+                                        // REAL GEMM, so dyn-VGPR's lean-launch occupancy has an exposed latency to hide.
+.ifndef DEFERGROW
+    .set DEFERGROW, 0                   // 1 = dyn's PROPER kernel: A/B frags single-buffered in the LEAN block (v11+),
+.endif                                  // grow DEFERRED to after the first lean operand load, grown footprint =
+                                        // accumulators ONLY (smaller -> more fat waves). Single-buffer exposed K-loop
+                                        // (occupancy substitutes for prefetch). Requires DYNVGPR=1. dyn-able tiles only.
 .ifndef STAGGER
     .set STAGGER, 0                     // 0 = lockstep (persistent waves march K synchronized -> all s_wait at once).
 .endif                                  // >0 = one-time startup spin = TGID_X*STAGGER, phase-offsets each wave so feed
                                         // stalls INTERLEAVE and the occupancy we already have hides the feed (KG 50147c07).
+.if DEFERGROW
+.set ABASE,   11                        // DEFERGROW: A/B frags SINGLE-buffered in the lean block (v11.. ; v0,v8,v9,v10 live)
+.set BBASE,   (ABASE + FM*2)            // B frags single-buffer (v(11+FM*2)..); only buffer 0 is ever used
+.set FAT_RAW, (32 + FM*FN*8)            // grown footprint = ACCUMULATORS ONLY (frags live in the lean launch block)
+.else
 .set ABASE,   (32 + FM*FN*8)            // A frags: 2 buffers of FM*2 regs (buf b, frag mi @ ABASE+b*FM*2+mi*2)
 .set BBASE,   (ABASE + FM*4)            // B frags: 2 buffers of FN*2 regs (buf b, frag ni @ BBASE+b*FN*2+ni*2)
 .set FAT_RAW, (BBASE + FN*4)
+.endif
 .set FATREGS, ((FAT_RAW + 15) & ~15)    // grow target, rounded to a 16-VGPR block
 .set WAITN,   (FM + FN)                 // outstanding loads for one buffer (wait target with prefetch in flight)
 
@@ -202,9 +221,18 @@ occ_kernel:
     s_cbranch_scc1 .Ltiles_done
     TICK s51                              // ATOMIC: the grab (per batch)
 .if DYNVGPR
+.if DEFERGROW == 0
     s_wait_loadcnt 0x0
     s_wait_storecnt 0x0
-    s_alloc_vgpr FATREGS                  // ---- GROW once per batch ----
+.Lgrow_retry:
+    s_alloc_vgpr FATREGS                  // ---- GROW once per batch (SCC=1 success / 0 fail) ----
+    s_cbranch_scc0 .Lgrow_retry           // SCC=0 = alloc rejected (SIMD VGPR pool full) -> spin-retry.
+                                          // The 5 prior bricks had NO guard -> a failed grow ran the K-loop
+                                          // on UNALLOCATED VGPRs. This single-wave independent grow cannot
+                                          // cross-wave-deadlock (ISA: forward progress is software's job):
+                                          // a wave that can't grow keeps only its lean 32 and retries, while
+                                          // resident fat waves finish their tile + s_alloc-shrink, freeing blocks.
+.endif                                    // DEFERGROW: grow happens in-tile (after the first lean load), not here.
 .endif
     TICK s52                              // GROW (per batch)
     s_mov_b32 s34, 0                      // j = 0 (intra-batch tile index)
@@ -212,8 +240,14 @@ occ_kernel:
     s_add_u32 s17, s33, s34              // ti = base + j
     s_cmp_ge_u32 s17, s11                 // ti >= TOTAL -> partial last batch, stop
     s_cbranch_scc1 .Lbatch_end
+.if GENDIV
+    s_mul_hi_u32 s19, s17, s12            // tile_row = mul_hi(ti, magic)   (s12 = ceil(2^32/NTL))
+    s_mul_i32  s18, s19, s13              // tmp = tile_row * NTL           (s13 = NTL)
+    s_sub_u32  s18, s17, s18              // tile_col = ti - tile_row*NTL
+.else
     s_and_b32 s18, s17, s12              // tile_col = ti & MASK
     s_lshr_b32 s19, s17, s13             // tile_row = ti >> LOG2
+.endif
     // ---- B col-tile saddr (k=0) ----
     s_mul_i32 s20, s18, s14
     s_add_u32 s20, s4, s20
@@ -231,6 +265,57 @@ occ_kernel:
       .set mi, mi+1
     .endr
     s_wait_storecnt 0x0                   // prev tile's deferred store finishes here (overlapped the decode/setup above)
+.if DEFERGROW
+    // ===== dyn-PROPER: GROW FIRST, then load into the lean-block frags. =====
+    // (load-then-grow WEDGES: s_alloc_vgpr races the VGPR write-back of the just-loaded operands --
+    // the exact hazard Phase-2 documented; ALWAYS grow before loading.) Keeps the accumulators-only
+    // ~96-VGPR footprint (frags live IN the lean launch block, not above the accumulators) + single-
+    // buffer feed (occupancy substitutes for prefetch). Footprint < the 128 of the prefetch path.
+.if DYNVGPR
+    s_cmp_eq_u32 s34, 0                  // first tile of THIS batch? -> grow now (BEFORE any operand load)
+    s_cbranch_scc0 .Lskipgrow_dg
+    s_wait_loadcnt 0x0
+    s_wait_storecnt 0x0
+.Lgrow_dg:
+    s_alloc_vgpr FATREGS                 // GROW to accumulators-only footprint; SCC-retry
+    s_cbranch_scc0 .Lgrow_dg
+.Lskipgrow_dg:
+.endif
+    LOADBUF 0                            // load step0 into lean-block frags AFTER the grow (safe ordering)
+    s_wait_loadcnt 0x0
+    // ---- zero accumulators (now fat) ----
+    .set idx, 0
+    .rept FM*FN
+      v_mov_b32 v[32+idx*8+0], 0
+      v_mov_b32 v[32+idx*8+1], 0
+      v_mov_b32 v[32+idx*8+2], 0
+      v_mov_b32 v[32+idx*8+3], 0
+      v_mov_b32 v[32+idx*8+4], 0
+      v_mov_b32 v[32+idx*8+5], 0
+      v_mov_b32 v[32+idx*8+6], 0
+      v_mov_b32 v[32+idx*8+7], 0
+      .set idx, idx+1
+    .endr
+    TICK s53
+    // ---- single-buffer EXPOSED K-loop: occupancy (more fat waves @ smaller footprint) hides the feed ----
+    s_mov_b32 s26, s8                    // KT steps
+.Lkloop_dg:
+    WMMABUF 0
+    s_sub_u32 s26, s26, 1
+    s_cmp_eq_u32 s26, 0
+    s_cbranch_scc1 .Ldone_dg
+.if !NOFEED
+    LOADBUF 0                            // load next step into the lean frags (latency exposed -> hidden by occupancy)
+    s_wait_loadcnt 0x0
+.else
+    // NOFEED (dg): operands loaded ONCE in the prologue (line ~284), reused for all KT WMMAs -> no
+    // per-K feed. Isolates the DEFERGROW framework's own compute ceiling (grow-tax intact, feed removed).
+    // Same tile/KT/atomic-claim/grow-shrink as the fed dg kernel. Result garbage (perf probe; oracle BAD).
+.endif
+    s_branch .Lkloop_dg
+.Ldone_dg:
+    TICK s54
+.else
     // ---- zero accumulators (all WMMAs accumulate; no srcC=0 peel) ----
     .set idx, 0
     .rept FM*FN
@@ -258,6 +343,20 @@ occ_kernel:
     s_sub_u32 s26, s26, 1
     s_cmp_lg_u32 s26, 0
     s_cbranch_scc1 .Lkloop
+.elseif NAIVEFEED
+    // EXPOSED-FEED (prong3 condition on the REAL GEMM): load step -> WAIT -> compute, NO prefetch
+    // overlap, so the feed latency is fully exposed and only occupancy can hide it. Prologue already
+    // loaded step0 (saddr at step1). KT steps total; last iter computes without loading past K.
+    s_mov_b32 s26, s8                    // KT
+.Lkloop_nv:
+    s_wait_loadcnt 0x0                   // EXPOSED: drain the in-flight load before compute
+    WMMABUF 0
+    s_sub_u32 s26, s26, 1
+    s_cmp_eq_u32 s26, 0
+    s_cbranch_scc1 .Lnaive_done
+    LOADBUF 0                            // load next step (its latency is exposed on the next wait)
+    s_branch .Lkloop_nv
+.Lnaive_done:
 .else
     s_lshr_b32 s26, s8, 1                // KT/2
     s_sub_u32 s26, s26, 1                // KT/2 - 1 full double-steps (tail pair peeled)
@@ -279,6 +378,7 @@ occ_kernel:
     WMMABUF 1
 .endif
     TICK s54                              // COMPUTE: prologue load + K-loop (incl feed waits) (per tile)
+.endif                                    // close .if DEFERGROW (its own load/grow/zero/K-loop above)
     // ---- SHIP: store acc[0][0] (v[32:39]) to C[ti] (256 f32 = 1024 B) ----
     s_lshl_b32 s27, s17, 10
     s_add_u32 s28, s6, s27
@@ -345,3 +445,35 @@ occ_kernel:
     s_mov_b32 exec_lo, s16
     s_endpgm
     .size occ_kernel, .-occ_kernel
+
+// RGADESC (MAD-305): analysis-only AMDHSA descriptor so `rga -s bin --co` can enumerate this kernel
+//   and emit ISA / live-VGPR. Default 0 -> NOT emitted (PM4 harness sets RSRC1/RSRC2 itself; .text is
+//   byte-identical either way, so RGA's live-register profile IS the real dyn kernel's). vgpr declared
+//   256 (ceiling) so livereg reports the true peak-live the s_alloc-grown body actually reaches.
+//   Build occ_mbgemm_*_rga.o with -defsym,RGADESC=1 (+ the same FM/FN/BATCH/DYNVGPR as the dispatch).
+.ifndef RGADESC
+    .set RGADESC, 0
+.endif
+.if RGADESC
+.amdhsa_kernel occ_kernel
+    .amdhsa_next_free_vgpr 256
+    .amdhsa_next_free_sgpr 48
+    .amdhsa_group_segment_fixed_size 0
+.end_amdhsa_kernel
+.amdgpu_metadata
+---
+amdhsa.version: [ 1, 2 ]
+amdhsa.kernels:
+  - .name:            occ_kernel
+    .symbol:          occ_kernel.kd
+    .kernarg_segment_size: 64
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: 0
+    .private_segment_fixed_size: 0
+    .wavefront_size:  32
+    .sgpr_count:      48
+    .vgpr_count:      256
+    .max_flat_workgroup_size: 256
+    .args:            []
+.end_amdgpu_metadata
+.endif

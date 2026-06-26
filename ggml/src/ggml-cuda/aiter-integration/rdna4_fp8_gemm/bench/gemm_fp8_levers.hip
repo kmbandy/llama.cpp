@@ -511,6 +511,12 @@ int main(){
         hipDeviceSynchronize(); free_dev(d); return 0;
     }
 
+    if (getenv("PROFILE_PIPE")) {                      // isolate the deep A+B one-tile-ahead pipeline for rocprof ATT
+        Dev d = make_dev(4096, 4096, 8192);            // same shape as PROFILE_WINNER for apples-to-apples
+        for (int i = 0; i < 30; ++i) launch_pipe<128,128,2,2,32>(d);
+        hipDeviceSynchronize(); free_dev(d); return 0;
+    }
+
     if (getenv("ISSUE_PROBE")) {                       // disambiguate the 54% wall: issue-bound vs latency-bound
         printf("=== ISSUE-vs-LATENCY PROBE (gemm_fp8_occ = 155-winner inner loop, knobs minWaves/NOFEED) ===\n");
         // (0) faithful-clone gate: the FEED occ-kernel must match the oracle, else occupancy numbers are noise.
