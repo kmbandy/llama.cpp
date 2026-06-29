@@ -2413,6 +2413,14 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
+        // turbo4_0: 4-bit transform quantizer; GPU/CPU both use same serial algorithm,
+        // so parity should be byte-exact. Allow Q4_0-equivalent tolerance as safety margin.
+        if (type == GGML_TYPE_TURBO4_0) {
+            double err_estimate = 1.0f/8.0f;
+            err_estimate *= err_estimate;
+            err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
+            return err_estimate;
+        }
         return 1e-7;
     }
 
@@ -7776,6 +7784,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    // turbo4_0 SET_ROWS: dst must be multiple of QUANT_K=128 in ne[0]
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I32, { 128, 5, 1, 3 }, { 1, 1 }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I64, { 128, 5, 1, 3 }, { 1, 1 }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I64, { 256, 3, 1, 2 }, { 1, 1 }, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

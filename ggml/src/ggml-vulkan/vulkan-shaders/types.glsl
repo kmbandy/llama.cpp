@@ -218,6 +218,23 @@ struct block_turbo4_0_packed16
     uint16_t qs[32];    // nibble-packed indices: 128 nibbles → 64 bytes → 32 uint16s
 };
 
+// turbo4_0: generic A_TYPE variant for SET_ROWS (copy_to_quant.comp serial path)
+#define QUANT_K_TURBO4_0 128
+#define QUANT_R_TURBO4_0 1
+
+struct block_turbo4_0
+{
+    float16_t norm;   // corrected L2 norm stored as fp16
+    float16_t rnorm;  // reserved (written as 0)
+    uint8_t   qs[64]; // 4-bit centroid indices, nibble-packed (lo nibble = even element)
+};
+
+#if defined(DATA_A_TURBO4_0)
+#define QUANT_K QUANT_K_TURBO4_0
+#define QUANT_R QUANT_R_TURBO4_0
+#define A_TYPE block_turbo4_0
+#endif
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 
