@@ -206,6 +206,18 @@ struct block_q1_0
 #define A_TYPE block_q1_0
 #endif
 
+// TurboQuant 4-bit: 128-element block, 68 bytes (norm[fp16] + rnorm[fp16] + qs[64])
+// packed16 variant: qs stored as uint16_t[32] (two bytes per uint16, little-endian)
+// so nibble n in block is: (qs[n/4] >> ((n%4)*4)) & 0xF
+#define QK_TURBO4 128
+
+struct block_turbo4_0_packed16
+{
+    float16_t norm;     // corrected L2 norm (fp16)
+    float16_t rnorm;    // reserved (always 0)
+    uint16_t qs[32];    // nibble-packed indices: 128 nibbles → 64 bytes → 32 uint16s
+};
+
 #define QUANT_K_Q8_1 32
 #define QUANT_R_Q8_1 1
 
