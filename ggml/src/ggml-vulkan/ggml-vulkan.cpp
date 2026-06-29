@@ -822,6 +822,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
+    vk_pipeline pipeline_turbo_wht_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
     vk_pipeline pipeline_rms_norm_partials_f32;
@@ -1185,6 +1186,17 @@ struct vk_op_fwht_push_constants {
     uint32_t src_offset;
     uint32_t dst_offset;
     float scale;
+};
+
+struct vk_op_turbo_wht_push_constants {
+    uint32_t n_groups;        // total groups = groups_per_head * n_heads
+    uint32_t group_size;      // WHT group size (128, 64, or 32)
+    uint32_t direction;       // 0 = forward, 1 = inverse
+    uint32_t has_scale;       // 1 if InnerQ scale_inv buffer is valid, else 0
+    uint32_t head_dim;        // src->ne[0]
+    uint32_t groups_per_head; // head_dim / group_size
+    uint32_t src_offset;      // misalignment offset (elements) for src buffer
+    uint32_t dst_offset;      // misalignment offset (elements) for dst buffer
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2096,6 +2108,15 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
 }
 
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_fwht_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.src_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.dst_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src1);
+    GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_turbo_wht_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     p.src_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     p.dst_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 
@@ -4863,6 +4884,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht_f32, "turbo_wht_f32", turbo_wht_f32_len, turbo_wht_f32_data, "main", 3, sizeof(vk_op_turbo_wht_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
@@ -9096,6 +9118,47 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+}
+
+static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];  // InnerQ scale_inv (may be nullptr)
+
+    int direction, group_size;
+    memcpy(&direction,  dst->op_params + 0,          sizeof(int));
+    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
+
+    const int64_t head_dim        = src0->ne[0];
+    const int64_t n_heads         = ggml_nelements(src0) / head_dim;
+    const int64_t groups_per_head = head_dim / group_size;
+    const int64_t n_groups        = groups_per_head * n_heads;
+
+    if (n_groups == 0) {
+        return;
+    }
+
+    vk_pipeline pipeline = ctx->device->pipeline_turbo_wht_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer src0_buf  = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    // When scale is absent, bind src0 as a dummy buffer for binding slot 1
+    const vk_subbuffer scale_buf = src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : src0_buf;
+    const vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+    vk_op_turbo_wht_push_constants pc = {
+        (uint32_t)n_groups,
+        (uint32_t)group_size,
+        (uint32_t)direction,
+        src1 ? 1u : 0u,
+        (uint32_t)head_dim,
+        (uint32_t)groups_per_head,
+        0u,  // src_offset — filled by init_pushconst_tensor_offsets
+        0u,  // dst_offset
+    };
+    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, scale_buf, dst_buf }, pc, { (uint32_t)n_groups, 1, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14374,6 +14437,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_TURBO_WHT:
+        ggml_vk_turbo_wht(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
@@ -16891,6 +16959,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]) &&
                    op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_TURBO_WHT:
+            {
+                if (!op->src[0] || op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->type != GGML_TYPE_F32) return false;
+                if (!ggml_is_contiguous(op->src[0])) return false;
+                int gs;
+                memcpy(&gs, op->op_params + sizeof(int), sizeof(int));
+                return gs > 0 && op->src[0]->ne[0] % gs == 0;
+            }
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

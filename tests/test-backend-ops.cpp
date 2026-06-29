@@ -4165,6 +4165,30 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
+// GGML_OP_TURBO_WHT — TurboQuant Walsh-Hadamard Transform (forward + inverse)
+struct test_turbo_wht : public test_case {
+    const int     direction;   // 0 = forward, 1 = inverse
+    const int64_t ne0;         // head_dim (must be divisible by group_size)
+    const int64_t n_rows;      // total rows
+    const int     group_size;  // 32, 64, or 128
+
+    std::string vars() override {
+        return VARS_TO_STR4(direction, ne0, n_rows, group_size);
+    }
+
+    test_turbo_wht(int direction = 0, int64_t ne0 = 128, int64_t n_rows = 1, int group_size = 128)
+        : direction(direction), ne0(ne0), n_rows(n_rows), group_size(group_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_rows);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, group_size, nullptr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -8384,13 +8408,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
-    // FWHT tests
+    // FWHT tests (MUL_MAT with Hadamard hint)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 128, {2, 3}));
+
+    // TURBO_WHT tests (GGML_OP_TURBO_WHT forward + inverse, d=128, rows 1 and 32)
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 1, 128));   // forward,  1 row
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));   // inverse,  1 row
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));  // forward, 32 rows
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));  // inverse, 32 rows
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -9336,11 +9366,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
 
-    // FWHT tests
+    // FWHT tests (MUL_MAT with Hadamard hint)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
+
+    // TURBO_WHT tests (GGML_OP_TURBO_WHT forward + inverse, d=128, rows 1 and 32)
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 1, 128));
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));

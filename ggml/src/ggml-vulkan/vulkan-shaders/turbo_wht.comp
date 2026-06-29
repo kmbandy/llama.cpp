@@ -1,0 +1,141 @@
+#version 450
+
+// GGML_OP_TURBO_WHT — TurboQuant Walsh-Hadamard Transform (forward + inverse)
+// One workgroup per group. group_size threads per workgroup (fixed local_size_x = 128).
+// For group_size < 128, threads with t >= group_size are inactive but still call
+// every barrier() so workgroup coherency is maintained.
+//
+// wave64-safe: uses only shared memory + barrier(), never subgroup ops.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_groups;       // total groups = groups_per_head * n_heads
+    uint group_size;     // WHT group size (128, 64, or 32)
+    uint direction;      // 0 = forward (s1 -> WHT -> s2), 1 = inverse (s2 -> WHT -> s1)
+    uint has_scale;      // 1 if InnerQ scale_inv buffer is valid, else 0
+    uint head_dim;       // src->ne[0]
+    uint groups_per_head; // head_dim / group_size
+    uint src_offset;     // misalignment offset (elements) for src buffer
+    uint dst_offset;     // misalignment offset (elements) for dst buffer
+};
+
+layout(binding = 0) readonly  buffer SrcBuf   { float src_data[];   };
+layout(binding = 1) readonly  buffer ScaleBuf { float scale_data[]; };
+layout(binding = 2) writeonly buffer DstBuf   { float dst_data[];   };
+
+shared float x[128];
+
+// Sign tables — verbatim from turbo_wht_s1[128] / turbo_wht_s2[128]
+// (ggml/src/ggml-cpu/ops.cpp:10832-10833)
+const float s1[128] = float[](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+const float s2[128] = float[](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+void main() {
+    const uint g = gl_WorkGroupID.x;
+    if (g >= n_groups) { return; }
+
+    const uint t = gl_LocalInvocationID.x;
+
+    // Map group index to position in the flattened float buffer
+    const uint head_idx    = g / groups_per_head;
+    const uint grp_in_head = g % groups_per_head;
+    const uint base        = head_idx * head_dim + grp_in_head * group_size;
+
+    // Threads t >= group_size are inactive for smaller group sizes.
+    // They still call every barrier() to maintain workgroup coherency.
+    const bool is_active = (t < group_size);
+
+    // --- Load into shared memory ----------------------------------------
+    if (is_active) {
+        float val = src_data[src_offset + base + t];
+
+        // InnerQ forward: apply scale_inv BEFORE signs+WHT
+        if (direction == 0u && has_scale != 0u) {
+            val *= scale_data[t];
+        }
+
+        // Apply first sign array
+        x[t] = val * ((direction == 0u) ? s1[t] : s2[t]);
+    } else {
+        x[t] = 0.0;
+    }
+    barrier();
+
+    // --- WHT butterfly (log2(group_size) stages) ------------------------
+    // Each stage: thread with (t & (2h-1)) < h handles pair (x[t], x[t+h]).
+    // All 128 invocations call every barrier() regardless of group_size.
+
+    // h = 1
+    if (is_active && (t & 1u) == 0u) {
+        float a = x[t], b = x[t + 1u]; x[t] = a + b; x[t + 1u] = a - b;
+    }
+    barrier();
+    // h = 2
+    if (is_active && (t & 3u) < 2u) {
+        float a = x[t], b = x[t + 2u]; x[t] = a + b; x[t + 2u] = a - b;
+    }
+    barrier();
+    // h = 4
+    if (is_active && (t & 7u) < 4u) {
+        float a = x[t], b = x[t + 4u]; x[t] = a + b; x[t + 4u] = a - b;
+    }
+    barrier();
+    // h = 8
+    if (is_active && (t & 15u) < 8u) {
+        float a = x[t], b = x[t + 8u]; x[t] = a + b; x[t + 8u] = a - b;
+    }
+    barrier();
+    // h = 16
+    if (is_active && (t & 31u) < 16u) {
+        float a = x[t], b = x[t + 16u]; x[t] = a + b; x[t + 16u] = a - b;
+    }
+    barrier();
+    // h = 32
+    if (is_active && (t & 63u) < 32u) {
+        float a = x[t], b = x[t + 32u]; x[t] = a + b; x[t + 32u] = a - b;
+    }
+    barrier();
+    // h = 64 — only needed for group_size = 128.
+    // group_size is a push constant (dynamically uniform), so this if-else is
+    // taken uniformly by all invocations and barriers inside are always valid.
+    if (group_size >= 128u) {
+        if (is_active && (t & 127u) < 64u) {
+            float a = x[t], b = x[t + 64u]; x[t] = a + b; x[t + 64u] = a - b;
+        }
+        barrier();
+    }
+
+    // Inactive threads have nothing left to do.
+    if (!is_active) { return; }
+
+    // --- Normalize and apply second sign array --------------------------
+    const float inv_sqrt = inversesqrt(float(group_size));
+    const float ss = (direction == 0u) ? s2[t] : s1[t];
+    float result = x[t] * inv_sqrt * ss;
+
+    // InnerQ inverse: apply scale_inv AFTER WHT+signs
+    if (direction == 1u && has_scale != 0u) {
+        result *= scale_data[t];
+    }
+
+    dst_data[dst_offset + base + t] = result;
+}
