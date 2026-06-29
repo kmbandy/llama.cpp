@@ -140,6 +140,7 @@ void main() {
 
     // ---- Step 2: Normalize, then apply s1 sign for forward WHT ----
     const float normalized = (norm > 1e-10f) ? (val / norm) : 0.0f;
+    barrier(); // all lanes have consumed the broadcast norm (shmem[0]) before any lane overwrites shmem
     shmem[t] = normalized * s1[t];
     barrier();
 
@@ -229,6 +230,7 @@ void main() {
     // (elem_idx - t = block_idx * 128, i.e. the first element of this block)
 
     // Store indices in shmem so even threads can pair them for nibble packing.
+    barrier(); // all lanes have consumed the broadcast recon_norm (shmem[0]) before any lane overwrites shmem
     shmem[t] = float(cidx);
     barrier();
 
