@@ -2910,6 +2910,12 @@ struct test_cpy : public test_case {
         if (type_src == type_dst) {
             return 0.0;
         }
+        if (type_dst == GGML_TYPE_TURBO4_0) {
+            // turbo4_0: indices must be bit-exact with the CPU oracle (both use WHT + nearest centroid).
+            // Tolerance covers fp32 reduction-order differences in norm (affects stored fp16 norm by
+            // at most 1 ULP); one centroid mis-assignment would produce NMSE ~1e-4, failing the test.
+            return 1e-5;
+        }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
@@ -8193,6 +8199,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 4, 1, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
+
+    // CPY f32 -> turbo4_0: bespoke Vulkan quantize shader (self-contained, bundles WHT)
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {128, 8, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {256, 4, 1, 1}));
 
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
