@@ -1197,6 +1197,7 @@ struct vk_op_turbo_wht_push_constants {
     uint32_t groups_per_head; // head_dim / group_size
     uint32_t src_offset;      // misalignment offset (elements) for src buffer
     uint32_t dst_offset;      // misalignment offset (elements) for dst buffer
+    uint32_t scale_offset;    // misalignment offset (elements) for scale buffer
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2117,10 +2118,10 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
 }
 
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_turbo_wht_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
-    p.src_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
-    p.dst_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.src_offset   = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.dst_offset   = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+    p.scale_offset = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : 0u;
 
-    GGML_UNUSED(src1);
     GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }
@@ -9153,8 +9154,9 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
         src1 ? 1u : 0u,
         (uint32_t)head_dim,
         (uint32_t)groups_per_head,
-        0u,  // src_offset — filled by init_pushconst_tensor_offsets
-        0u,  // dst_offset
+        0u,  // src_offset   — filled by init_pushconst_tensor_offsets
+        0u,  // dst_offset   — filled by init_pushconst_tensor_offsets
+        0u,  // scale_offset — filled by init_pushconst_tensor_offsets
     };
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
 
@@ -16966,7 +16968,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!ggml_is_contiguous(op->src[0])) return false;
                 int gs;
                 memcpy(&gs, op->op_params + sizeof(int), sizeof(int));
-                return gs > 0 && op->src[0]->ne[0] % gs == 0;
+                // gs=32 (TQ_WEIGHT_SIGNS) unimplemented on Vulkan
+                return (gs == 64 || gs == 128) && op->src[0]->ne[0] % gs == 0;
             }
         case GGML_OP_ADD:
         case GGML_OP_SUB:

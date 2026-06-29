@@ -18,6 +18,7 @@ layout(push_constant) uniform Parameters {
     uint groups_per_head; // head_dim / group_size
     uint src_offset;     // misalignment offset (elements) for src buffer
     uint dst_offset;     // misalignment offset (elements) for dst buffer
+    uint scale_offset;   // misalignment offset (elements) for scale buffer
 };
 
 layout(binding = 0) readonly  buffer SrcBuf   { float src_data[];   };
@@ -70,7 +71,7 @@ void main() {
 
         // InnerQ forward: apply scale_inv BEFORE signs+WHT
         if (direction == 0u && has_scale != 0u) {
-            val *= scale_data[t];
+            val *= scale_data[scale_offset + (t % group_size)];
         }
 
         // Apply first sign array
@@ -109,11 +110,15 @@ void main() {
         float a = x[t], b = x[t + 16u]; x[t] = a + b; x[t + 16u] = a - b;
     }
     barrier();
-    // h = 32
-    if (is_active && (t & 63u) < 32u) {
-        float a = x[t], b = x[t + 32u]; x[t] = a + b; x[t + 32u] = a - b;
+    // h = 32 — only needed for group_size >= 64.
+    // group_size is a push constant (dynamically uniform), so this if-else is
+    // taken uniformly by all invocations and barriers inside are always valid.
+    if (group_size >= 64u) {
+        if (is_active && (t & 63u) < 32u) {
+            float a = x[t], b = x[t + 32u]; x[t] = a + b; x[t + 32u] = a - b;
+        }
+        barrier();
     }
-    barrier();
     // h = 64 — only needed for group_size = 128.
     // group_size is a push constant (dynamically uniform), so this if-else is
     // taken uniformly by all invocations and barriers inside are always valid.
@@ -134,7 +139,7 @@ void main() {
 
     // InnerQ inverse: apply scale_inv AFTER WHT+signs
     if (direction == 1u && has_scale != 0u) {
-        result *= scale_data[t];
+        result *= scale_data[scale_offset + (t % group_size)];
     }
 
     dst_data[dst_offset + base + t] = result;

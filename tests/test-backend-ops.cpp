@@ -8421,6 +8421,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));   // inverse,  1 row
     test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));  // forward, 32 rows
     test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));  // inverse, 32 rows
+    // gs=64 cases (LFM2.5 head_dim=64 production path)
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 1, 64));     // forward,  1 row,  gs=64
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 1, 64));     // inverse,  1 row,  gs=64
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 32, 64));    // forward, 32 rows, gs=64
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 32, 64));    // inverse, 32 rows, gs=64
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -9377,6 +9382,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));
     test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));
     test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));
+    // gs=64 cases (LFM2.5 head_dim=64 production path)
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 1, 64));
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 1, 64));
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 32, 64));
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 32, 64));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));
