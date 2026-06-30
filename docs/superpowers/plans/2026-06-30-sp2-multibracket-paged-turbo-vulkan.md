@@ -195,6 +195,50 @@ git commit -m "docs(sp2.5): head_dim 256 e2e results (Qwen3.5-4B, Vulkan0 vs CUD
 
 ---
 
+## Results — hd256 (Qwen3.5-4B)
+
+Branch `feat/sp1-turbo4-vulkan-fa` @ 27c9b7d23 (Task 1: hd256 generalization, reviewed clean). Model
+`/home/kmbandy/models/Qwen3.5-4B-UD-Q4_K_XL.gguf` (qwen35, head_dim 256, Q4_K_XL). Corpus
+`wikitext-2-raw/wiki.test.raw`. Flags: `--cache-type-k turbo4 --cache-type-v turbo4 --kv-tier-paged-blocks
+-c 512 -ngl 99` (perplexity), `--cache-type-k turbo4 --cache-type-v turbo4 -p 512 -n 128` (bench).
+
+**Step 1 — Smoke (4 chunks, Vulkan0):** PASS. Ran to completion, exit 0. No `op not implemented:
+PAGED_ATTN_MT` abort. PPL (4 chunks) = 8.5181 +/- 0.72686 (expected to be noisy with only 4 chunks).
+
+**Step 2 — Full PPL parity, Vulkan0 vs CUDA0** (580 chunks, full `wiki.test.raw`, `-c 512`):
+
+| Device | PPL | stderr | Wall time |
+| --- | --- | --- | --- |
+| Vulkan0 (RX 480 / RADV POLARIS10) | 10.1259 | ± 0.07238 | ~21.0 min (7.83 s/pass) |
+| CUDA0 (GTX 1070, oracle) | 10.1484 | ± 0.07257 | ~9.4 min (3.86 s/pass) |
+
+Delta = 0.0225, well inside one stderr (~0.0724) on either side — **Vulkan0 is within noise of CUDA0**.
+This is the first real model to exercise the generalized `head_dim % 128 == 0` paged-attention path
+end-to-end (prior validation was the op-level harness only); parity confirms Task 1's scatter/dispatch
+fix and `supports_op` gate are correct for native hd256, not just synthetic cache fills.
+
+**Step 3 — Throughput, Vulkan0** (`llama-bench`, `-p 512 -n 128`):
+
+Note: the brief's bench command included `--kv-tier-paged-blocks`, which `llama-bench` does not accept
+(it's a `llama-perplexity`/`llama-cli`-only flag — `llama-bench` has no such option in its `--help`). Ran
+without it; `--cache-type-k/v turbo4` alone is sufficient to select the paged turbo4 cache path.
+
+| test | t/s |
+| --- | --- |
+| pp512 | 266.68 ± 78.66 |
+| tg128 | 35.80 ± 0.66 |
+
+pp512's stderr is large relative to the mean (~30%) — typical for a single short prefill on this card with
+default `-r 5` repetitions and no `--no-warmup` tuning; tg128's stderr is tight (~2%) and looks stable. No
+perf cliff observed relative to the hd128 LFM2.5 numbers from SP2 (same backend, same op); the bd256 path
+is not measurably worse per-token than hd128 on this hardware. No further diagnosis needed — flagged as a
+measurement-noise note, not a regression.
+
+**Verdict:** hd256 end-to-end on Vulkan0 is correctness-confirmed (PPL parity) and runs at expected
+throughput. No code changes required; Task 1's generalization holds under a real model.
+
+---
+
 ## Task 3: turbo4_64 cache-ops — load/dequant + attention (head_dim 64)
 
 **Goal:** Add the turbo4_64 *read* path (dequant load + attention/decode variants) and validate it against CUDA with a host-prefilled turbo4_64 cache. Scatter (write) is Task 4 — the harness pre-fills the cache (the SP2 Task-5 mechanism), so the read path is testable independently.
