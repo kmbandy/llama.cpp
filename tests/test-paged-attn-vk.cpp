@@ -94,7 +94,9 @@ static ggml_tensor * build_op_noalloc(const paged_case & c, ggml_context ** ctx_
     return out;
 }
 
-static built_graph build_case(const paged_case & c, ggml_backend_t backend) {
+static void fill_turbo4(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4 tables)
+
+static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool fill_cache = false) {
     const int HD            = c.head_dim;
     const int total_tokens  = c.q_len * c.n_seq;
     const int max_blocks    = (c.ctx_len + c.block_size - 1) / c.block_size;
@@ -124,11 +126,25 @@ static built_graph build_case(const paged_case & c, ggml_backend_t backend) {
     // Deterministic inputs — identical seeds on both backends.
     fill_f16(q, 1); fill_f16(k_cur, 2); fill_f16(v_cur, 3);
 
-    // Cache starts zeroed; scatter writes only the touched slots.
-    {
+    // Cache contents. PREFILL cases (fill_cache=false): zeroed; the 32-token
+    // scatter populates the real keys. DECODE cases (fill_cache=true): the op
+    // scatters only the single current token into slot 0, so without a pre-fill
+    // the entire gathered range [1, ctx_len) would be ZERO and every decode case
+    // would collapse to out = softmax[0]*V0 (a degenerate single-term result that
+    // never exercises the split-K cross-chunk reduce). Pre-populate every cache
+    // slot with deterministic VALID non-zero data so the multi-chunk merge runs
+    // over real keys. The cache is sized exactly to ctx_len slots and
+    // block_tables[s][b]=b + slot_mapping[i]=i make physical slot == context
+    // position, so filling the whole buffer fills exactly the gathered range.
+    // Both backends get byte-identical bytes via the leaf-input deep-copy.
+    if (!fill_cache) {
         std::vector<uint8_t> zeros(ggml_nbytes(k_cache), 0);
         ggml_backend_tensor_set(k_cache, zeros.data(), 0, ggml_nbytes(k_cache));
         ggml_backend_tensor_set(v_cache, zeros.data(), 0, ggml_nbytes(v_cache));
+    } else if (c.cache_type == GGML_TYPE_F16) {
+        fill_f16(k_cache, 11); fill_f16(v_cache, 12);
+    } else {
+        fill_turbo4(k_cache, 11); fill_turbo4(v_cache, 12);
     }
 
     // Single-seq contiguous layout: block_tables[s][b] = s*max_blocks + b.
@@ -168,6 +184,57 @@ static uint8_t host_turbo_nearest_4bit(float v) {
         if (v < HOST_TURBO_MID_4BIT[i]) return (uint8_t) i;
     }
     return 15;
+}
+
+// Quantize one 128-element f32 vector into a valid 68-byte block_turbo4_0
+// (norm fp16 + rnorm fp16[reserved=0] + 64 nibble-packed centroid indices),
+// matching the no-RHT host quantizer used by the scatter-readback oracle. Used
+// to PRE-POPULATE the decode KV cache with deterministic, VALID (no NaN/Inf in
+// the norm field) turbo4 blocks so the split-K reduce sees real multi-term data.
+static void host_turbo4_quantize_block(const float * x, uint8_t * out /*68 bytes*/) {
+    float red[128];
+    for (int j = 0; j < 128; ++j) red[j] = x[j] * x[j];
+    for (int s = 64; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) red[j] += red[j + s];
+    const float grp_norm = sqrtf(red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+    uint8_t idxs[128];
+    float   rred[128];
+    for (int j = 0; j < 128; ++j) {
+        const float nv = x[j] * inv_norm;
+        idxs[j] = host_turbo_nearest_4bit(nv);
+        const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+        rred[j] = cv * cv;
+    }
+    for (int s = 64; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) rred[j] += rred[j + s];
+    const float recon_norm     = sqrtf(rred[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+    const ggml_fp16_t norm_h  = ggml_fp32_to_fp16(corrected_norm);
+    const ggml_fp16_t rnorm_h = ggml_fp32_to_fp16(0.0f); // reserved/unused in 4-bit mode
+    memset(out, 0, 68);
+    memcpy(out + 0, &norm_h,  sizeof(ggml_fp16_t));
+    memcpy(out + 2, &rnorm_h, sizeof(ggml_fp16_t));
+    for (int j = 0; j < 128; ++j)
+        out[4 + (j >> 1)] |= (uint8_t)(idxs[j] << ((j & 1) * 4));
+}
+
+// Pre-populate a turbo4_0 cache tensor with deterministic VALID blocks (seeded,
+// reproducible across processes/backends). Every 68-byte block carries a finite
+// norm + valid nibbles, so the dual-backend deep-copy sees byte-identical, NaN-
+// free contents on both Vulkan and CUDA.
+static void fill_turbo4(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 68);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[128];
+        for (int j = 0; j < 128; ++j) x[j] = dist(rng);
+        host_turbo4_quantize_block(x, &buf[(size_t)b * 68]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
 }
 
 // Deterministic, CUDA-free scatter-readback oracle (480-only). Runs the op on
@@ -306,8 +373,10 @@ static bool compare_paged_case(const char * label, const paged_case & c,
         return false;
     }
 
-    built_graph gvk   = build_case(c, vk);
-    built_graph gcuda = build_case(c, cuda);
+    // Decode cases: pre-populate the cache so the split-K reduce runs over
+    // genuine multi-term data (see build_case fill_cache rationale).
+    built_graph gvk   = build_case(c, vk,   /*fill_cache=*/true);
+    built_graph gcuda = build_case(c, cuda, /*fill_cache=*/true);
 
     cb_state st;
     std::vector<const ggml_tensor *> nodes = { gvk.out };
