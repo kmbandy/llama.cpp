@@ -14,12 +14,16 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
-#ifdef DATA_A_TURBO4_0
+#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64)
 #extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
 #extension GL_EXT_shader_8bit_storage                      : require
 #endif
 
+#ifdef DATA_A_TURBO4_64
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 layout (push_constant) uniform parameter {
     uint HS;            // head size (head_dim)
@@ -46,6 +50,14 @@ struct block_turbo4_0 {
 };
 layout (binding = 3)           buffer KCache  { block_turbo4_0 data_k[]; };
 layout (binding = 4)           buffer VCache  { block_turbo4_0 data_v[]; };
+#endif
+#ifdef DATA_A_TURBO4_64
+struct block_turbo4_64 {
+    float16_t norm;      // corrected L2 norm (fp16), NO rnorm field
+    uint8_t   qs[32];    // 4-bit centroid indices, nibble-packed (64 elements)
+};
+layout (binding = 3)           buffer KCache  { block_turbo4_64 data_k[]; };
+layout (binding = 4)           buffer VCache  { block_turbo4_64 data_v[]; };
 #endif
 
 #include "paged_cache_ops.glsl"
@@ -190,3 +202,113 @@ void main() {
     }
 }
 #endif // DATA_A_TURBO4_0
+
+#ifdef DATA_A_TURBO4_64
+// Cooperative no-RHT turbo4_64 quantizer. Mirrors the turbo4_0 quantizer
+// above (mt_scatter_kv_turbo4_64_kernel, mt_pagedattn.cu), just over a
+// 64-element block with 64 active threads (one workgroup = one block).
+// Sequence: load -> L2 norm -> normalize -> (NO Hadamard) -> nearest
+// centroid -> nibble-pack -> recon-norm-correct.
+// wave64-safe: shared-memory tree reductions, no subgroup ops.
+shared float s_x[64];     // working values (normalized in place)
+shared float s_red[64];   // tree-reduction / nibble-share scratch
+
+void main() {
+    const uint j         = gl_LocalInvocationID.x;   // 0..63, element within the turbo4_64 block
+    const uint token     = gl_WorkGroupID.x;         // global token index
+    const uint y_idx     = gl_WorkGroupID.y;         // kv_head*N_QBLK + qb
+    const uint kv_select = gl_WorkGroupID.z;         // 0 = K, 1 = V
+
+    if (token >= p.n_tokens) {
+        return;                                      // uniform across workgroup
+    }
+
+    const uint N_QBLK = p.HS / 64u;
+    const uint kv_head = y_idx / N_QBLK;
+    const uint qb      = y_idx % N_QBLK;
+
+    const int slot = slot_mapping[token];
+    if (slot < 0) {
+        return;                                      // padding token (uniform)
+    }
+
+    const uint paged_block = uint(slot) / p.BS;
+    const uint tok         = uint(slot) % p.BS;
+    const uint d           = qb * 64u + j;
+
+    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
+    const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
+    const float val = (kv_select == 0u) ? float(k_cur[src]) : float(v_cur[src]);
+
+    const uint block_ib = pa_turbo64_block_index(paged_block, kv_head, p.n_kv_heads, tok, qb, p.HS, p.BS);
+
+    // ---- Step 1: load into shared mem ----
+    s_x[j] = val;
+    barrier();
+
+    // ---- Step 2: parallel L2 norm (6-stage binary tree) ----
+    s_red[j] = s_x[j] * s_x[j];
+    barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float grp_norm = sqrt(s_red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    // ---- Step 3: normalize ----
+    s_x[j] *= inv_norm;
+    barrier();
+
+    // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
+
+    // ---- Step 5: nearest centroid ----
+    const uint idx = pa_turbo_nearest_4bit(s_x[j]);
+
+    // ---- Step 7 (parallel): reconstruction norm = sqrt(Σ centroid²) ----
+    // WAR: all lanes have read s_red[0] (grp_norm) before any lane overwrites it.
+    barrier();
+    const float cv = TURBO_CENTROIDS_4BIT[idx];
+    s_red[j] = cv * cv;
+    barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float recon_norm     = sqrt(s_red[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    // ---- Step 6: nibble-pack qs cooperatively ----
+    // Share indices via s_red so even lanes can pair them. WAR: all lanes have
+    // consumed s_red[0] (recon_norm) before any lane overwrites s_red.
+    barrier();
+    s_red[j] = float(idx);
+    barrier();
+
+    // ---- Step 8: thread 0 writes the per-block scalar (NO rnorm field) ----
+    if (j == 0u) {
+        if (kv_select == 0u) {
+            data_k[block_ib].norm = float16_t(corrected_norm);
+        } else {
+            data_v[block_ib].norm = float16_t(corrected_norm);
+        }
+    }
+
+    if ((j & 1u) == 0u) {
+        const uint lo = uint(s_red[j]);
+        const uint hi = uint(s_red[j + 1u]);
+        const uint8_t packed = uint8_t((lo & 0xFu) | ((hi & 0xFu) << 4u));
+        if (kv_select == 0u) {
+            data_k[block_ib].qs[j >> 1u] = packed;
+        } else {
+            data_v[block_ib].qs[j >> 1u] = packed;
+        }
+    }
+}
+#endif // DATA_A_TURBO4_64

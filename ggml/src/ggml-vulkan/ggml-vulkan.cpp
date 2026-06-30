@@ -5005,10 +5005,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_0], "paged_attn_scatter_turbo4_0", paged_attn_scatter_turbo4_0_len, paged_attn_scatter_turbo4_0_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_0],         "paged_attn_turbo4_0",         paged_attn_turbo4_0_len,         paged_attn_turbo4_0_data,         "main", 7, sizeof(vk_op_paged_attn_pc),    {1, 1, 1}, {}, 1);
 
+    // turbo4_64 cache path (Task 3 read side + Task 4 scatter): dequant load
+    // plus the no-RHT cooperative scatter quantizer (64-element blocks).
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_64], "paged_attn_scatter_turbo4_64", paged_attn_scatter_turbo4_64_len, paged_attn_scatter_turbo4_64_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_64],        "paged_attn_turbo4_64",        paged_attn_turbo4_64_len,        paged_attn_turbo4_64_data,        "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
+
     // SP2 Task 5: split-K decode. Pass-1 (decode) has 7 bindings per cache type;
     // pass-2 (reduce) is type-agnostic with 3 bindings. Both wg_denoms {1,1,1}, local_size 128.
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_F16],      "paged_attn_decode_f16",      paged_attn_decode_f16_len,      paged_attn_decode_f16_data,      "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_0], "paged_attn_decode_turbo4_0", paged_attn_decode_turbo4_0_len, paged_attn_decode_turbo4_0_data, "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_64], "paged_attn_decode_turbo4_64", paged_attn_decode_turbo4_64_len, paged_attn_decode_turbo4_64_data, "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode_reduce,              "paged_attn_decode_reduce",   paged_attn_decode_reduce_len,   paged_attn_decode_reduce_data,   "main", 3, sizeof(vk_op_paged_decode_reduce_pc), {1, 1, 1}, {}, 1);
 
 
@@ -10060,7 +10066,7 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     // Phase 1: scatter K_cur/V_cur into the paged cache.
     // grid = { n_tokens, n_kv_heads * n_qblk, 2 } (z selects K vs V; y fans out
     // per 128-element quant-block so head_dim multiples of 128 are supported).
-    const uint32_t qblk_elems = 128u;                       // turbo4_0 / F16 (Task 4: 64 for turbo4_64)
+    const uint32_t qblk_elems = (cache_type == GGML_TYPE_TURBO4_64) ? 64u : 128u; // turbo4_64 uses 64-elt blocks
     const uint32_t n_qblk     = head_size / qblk_elems;     // head_dim is a multiple of qblk_elems
     const vk_op_paged_scatter_pc scatter_pc = { head_size, block_size, n_kv_heads, n_tokens };
     ggml_vk_dispatch_pipeline(ctx, subctx, scatter_pipeline,
@@ -16998,11 +17004,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (q->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // K and V cache must share type; F16 (Task 3) or TURBO4_0 (Task 4).
+                // K and V cache must share type; F16 (Task 3) or TURBO4_0 (Task 4) or
+                // TURBO4_64 (Task 3, head_dim==64 only, read path).
                 if (k_cache->type != v_cache->type) {
                     return false;
                 }
-                if (k_cache->type != GGML_TYPE_F16 && k_cache->type != GGML_TYPE_TURBO4_0) {
+                const bool is_t64 = (k_cache->type == GGML_TYPE_TURBO4_64);
+                if (k_cache->type != GGML_TYPE_F16 &&
+                    k_cache->type != GGML_TYPE_TURBO4_0 &&
+                    !is_t64) {
                     return false;
                 }
                 // Scatter inputs are always F16 regardless of cache type.
@@ -17014,8 +17024,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // head_dim and block_size constraints (cache layout assumptions).
-                if (q->ne[0] % 128 != 0 || (q->ne[0] / 128) > 8 /*MAX_VEC*/) {
-                    return false;
+                if (is_t64) {
+                    if (q->ne[0] != 64) { return false; }          // turbo4_64: one 64-elt block/head
+                } else {
+                    if (q->ne[0] % 128 != 0 || (q->ne[0] / 128) > 8) { return false; }
                 }
                 const int32_t block_size = ((const int32_t *)op->op_params)[1];
                 if (block_size != 16) {

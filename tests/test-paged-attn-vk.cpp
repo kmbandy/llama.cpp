@@ -94,7 +94,8 @@ static ggml_tensor * build_op_noalloc(const paged_case & c, ggml_context ** ctx_
     return out;
 }
 
-static void fill_turbo4(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4 tables)
+static void fill_turbo4(ggml_tensor * t, uint32_t seed);    // defined below (after host turbo4 tables)
+static void fill_turbo4_64(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4 tables)
 
 static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool fill_cache = false) {
     const int HD            = c.head_dim;
@@ -143,6 +144,8 @@ static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool
         ggml_backend_tensor_set(v_cache, zeros.data(), 0, ggml_nbytes(v_cache));
     } else if (c.cache_type == GGML_TYPE_F16) {
         fill_f16(k_cache, 11); fill_f16(v_cache, 12);
+    } else if (c.cache_type == GGML_TYPE_TURBO4_64) {
+        fill_turbo4_64(k_cache, 11); fill_turbo4_64(v_cache, 12);
     } else {
         fill_turbo4(k_cache, 11); fill_turbo4(v_cache, 12);
     }
@@ -237,6 +240,53 @@ static void fill_turbo4(ggml_tensor * t, uint32_t seed) {
     ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
 }
 
+// Quantize one 64-element f32 vector into a valid 34-byte block_turbo4_64
+// (norm fp16 + 32 nibble-packed centroid indices, NO rnorm field). Mirrors
+// host_turbo4_quantize_block (128-element/68-byte) exactly, just over 64
+// elements / 32 packed bytes, reusing the same no-RHT centroid table +
+// nearest-centroid + recon-norm correction.
+static void host_turbo4_64_quantize_block(const float * x /*64*/, uint8_t * out /*34 bytes*/) {
+    float red[64];
+    for (int j = 0; j < 64; ++j) red[j] = x[j] * x[j];
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) red[j] += red[j + s];
+    const float grp_norm = sqrtf(red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+    uint8_t idxs[64];
+    float   rred[64];
+    for (int j = 0; j < 64; ++j) {
+        const float nv = x[j] * inv_norm;
+        idxs[j] = host_turbo_nearest_4bit(nv);
+        const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+        rred[j] = cv * cv;
+    }
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) rred[j] += rred[j + s];
+    const float recon_norm     = sqrtf(rred[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+    const ggml_fp16_t norm_h = ggml_fp32_to_fp16(corrected_norm);
+    memset(out, 0, 34);
+    memcpy(out + 0, &norm_h, sizeof(ggml_fp16_t));
+    for (int j = 0; j < 64; ++j)
+        out[2 + (j >> 1)] |= (uint8_t)(idxs[j] << ((j & 1) * 4));
+}
+
+// Pre-populate a turbo4_64 cache tensor with deterministic VALID blocks
+// (seeded, reproducible across processes/backends), mirroring fill_turbo4.
+static void fill_turbo4_64(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 34);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[64];
+        for (int j = 0; j < 64; ++j) x[j] = dist(rng);
+        host_turbo4_64_quantize_block(x, &buf[(size_t)b * 34]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+}
+
 // Deterministic, CUDA-free scatter-readback oracle (480-only). Runs the op on
 // Vulkan, reads back k_cache, and checks each turbo4 block against a host
 // re-implementation of the no-RHT quantizer (L2-norm -> normalize -> nearest
@@ -244,9 +294,12 @@ static void fill_turbo4(ggml_tensor * t, uint32_t seed) {
 // the expected element_block_index. Asserts per-block norm within 1e-3 and all
 // nibbles exactly equal. Returns true on PASS.
 static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
+    const bool is_t64 = (c.cache_type == GGML_TYPE_TURBO4_64);
+    const char * label = is_t64 ? "scatter turbo4_64 readback" : "scatter turbo4_0 readback";
+
     built_graph g = build_case(c, vk);
     if (ggml_backend_graph_compute(vk, g.gf) != GGML_STATUS_SUCCESS) {
-        printf("scatter turbo4_0 readback: FAIL (graph compute error)\n");
+        printf("%s: FAIL (graph compute error)\n", label);
         free_graph(g);
         return false;
     }
@@ -254,9 +307,13 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
     const int HD           = c.head_dim;
     const int total_tokens = c.q_len * c.n_seq;
     const int BS           = c.block_size;
-    const int N_QBLK       = HD / 128;
-    const int n_kv_heads   = c.n_kv_heads;
-    const size_t BLOCK_BYTES = 68; // fp16 norm + fp16 rnorm + uint8 qs[64]
+    const int QK            = is_t64 ? 64 : 128;
+    const int N_QBLK        = HD / QK;
+    const int n_kv_heads    = c.n_kv_heads;
+    // turbo4_0: fp16 norm + fp16 rnorm + uint8 qs[64] = 68 B.
+    // turbo4_64: fp16 norm (NO rnorm) + uint8 qs[32] = 34 B.
+    const size_t BLOCK_BYTES = is_t64 ? 34 : 68;
+    const size_t QS_OFFSET   = is_t64 ? 2 : 4;
 
     std::vector<ggml_fp16_t> kcur(ggml_nelements(g.k_cur));
     ggml_backend_tensor_get(g.k_cur, kcur.data(), 0, ggml_nbytes(g.k_cur));
@@ -272,30 +329,30 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
         const int slot_in_block = slot % BS;
         for (int h = 0; h < n_kv_heads; ++h) {
             for (int qb = 0; qb < N_QBLK; ++qb) {
-                // Gather the 128-element turbo4 block from k_cur.
+                // Gather the QK-element turbo4 block from k_cur.
                 float x[128];
-                for (int j = 0; j < 128; ++j) {
-                    const int d = qb * 128 + j;
+                for (int j = 0; j < QK; ++j) {
+                    const int d = qb * QK + j;
                     const size_t src = (size_t) t * n_kv_heads * HD + (size_t) h * HD + d;
                     x[j] = ggml_fp16_to_fp32(kcur[src]);
                 }
                 // L2 norm — same pairwise tree order as the shader.
                 float red[128];
-                for (int j = 0; j < 128; ++j) red[j] = x[j] * x[j];
-                for (int s = 64; s > 0; s >>= 1)
+                for (int j = 0; j < QK; ++j) red[j] = x[j] * x[j];
+                for (int s = QK / 2; s > 0; s >>= 1)
                     for (int j = 0; j < s; ++j) red[j] += red[j + s];
                 const float grp_norm = sqrtf(red[0]);
                 const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
                 // Normalize -> (NO Hadamard) -> nearest centroid -> recon norm.
                 uint8_t idxs[128];
                 float   rred[128];
-                for (int j = 0; j < 128; ++j) {
+                for (int j = 0; j < QK; ++j) {
                     const float nv = x[j] * inv_norm;
                     idxs[j] = host_turbo_nearest_4bit(nv);
                     const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
                     rred[j] = cv * cv;
                 }
-                for (int s = 64; s > 0; s >>= 1)
+                for (int s = QK / 2; s > 0; s >>= 1)
                     for (int j = 0; j < s; ++j) rred[j] += rred[j + s];
                 const float recon_norm     = sqrtf(rred[0]);
                 const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
@@ -311,8 +368,8 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
                                           - (double) ggml_fp16_to_fp32(exp_norm_h));
                 if (ne > max_norm_err) max_norm_err = ne;
 
-                for (int j = 0; j < 128; ++j) {
-                    const uint8_t byte = kc[base + 4 + (j >> 1)];
+                for (int j = 0; j < QK; ++j) {
+                    const uint8_t byte = kc[base + QS_OFFSET + (j >> 1)];
                     const uint8_t act  = (byte >> ((j & 1) * 4)) & 0xF;
                     if (act != idxs[j]) nibble_mismatch++;
                 }
@@ -321,8 +378,8 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
     }
 
     const bool pass = (max_norm_err <= 1e-3) && (nibble_mismatch == 0);
-    printf("scatter turbo4_0 readback: %s (max_norm_err=%.6f nibble_mismatch=%d)\n",
-           pass ? "PASS" : "FAIL", max_norm_err, nibble_mismatch);
+    printf("%s: %s (max_norm_err=%.6f nibble_mismatch=%d)\n",
+           label, pass ? "PASS" : "FAIL", max_norm_err, nibble_mismatch);
     free_graph(g);
     return pass;
 }
@@ -522,6 +579,25 @@ int main() {
             all_ok = compare_paged_case(lt, dt, vk, cuda, 5e-2) && all_ok;
             all_ok = compare_paged_case(lf, df, vk, cuda, 2e-3) && all_ok;
         }
+    }
+
+    // ── head_dim 64 turbo4_64: prefill + decode (read path; cache host-prefilled) ──
+    {
+        const paged_case t64 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64 };
+        all_ok = compare_paged_case("paged turbo4_64 hd64 prefill", t64, vk, cuda, 5e-2) && all_ok;
+        for (int ctx : { 128, 512 }) {
+            char l[64]; snprintf(l, sizeof l, "paged turbo4_64 hd64 decode ctx=%d", ctx);
+            const paged_case d64 { 64, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_64 };
+            all_ok = compare_paged_case(l, d64, vk, cuda, 5e-2) && all_ok;
+        }
+    }
+
+    // ── turbo4_64 cooperative scatter quantizer (Task 4): device scatter vs
+    //    host quantizer, bit-exact. Cache is NOT pre-filled, so the device
+    //    scatter is what populates it — exercises real correctness.
+    {
+        const paged_case t64 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64 };
+        all_ok = scatter_turbo4_readback(t64, vk) && all_ok;
     }
 
     ggml_backend_free(vk);
