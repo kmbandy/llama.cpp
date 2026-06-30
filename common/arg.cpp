@@ -1516,7 +1516,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_tier_paged_blocks = value;
             params.kv_tier_paged_blocks_explicit = true;  // MAD-134: user said something
         }
-    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}));
+    ).set_env("LLAMA_ARG_KV_TIER_PAGED_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
         {"--kv-tier-paged-block-size"}, "N",
         "tokens per block when --kv-tier-paged-blocks is enabled (default: 16, matches vLLM)",

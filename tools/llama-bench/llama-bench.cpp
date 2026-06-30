@@ -358,6 +358,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             kv_tier_paged_blocks;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -402,6 +403,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* kv_tier_paged_blocks */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -421,6 +423,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --kv-tier-paged-blocks                      route KV cache through paged-attention path (MAD-134)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -525,6 +528,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.kv_tier_paged_blocks = cmd_params_defaults.kv_tier_paged_blocks;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -1001,6 +1005,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--kv-tier-paged-blocks") {
+                params.kv_tier_paged_blocks = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1180,6 +1186,7 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               kv_tier_paged_blocks;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1257,6 +1264,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.kv_tier_paged_blocks = kv_tier_paged_blocks;
 
         return cparams;
     }
@@ -1326,6 +1334,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_tier_paged_blocks = */ params.kv_tier_paged_blocks,
             };
             instances.push_back(instance);
         }
@@ -1363,6 +1372,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_tier_paged_blocks = */ params.kv_tier_paged_blocks,
             };
             instances.push_back(instance);
         }
@@ -1400,6 +1410,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .kv_tier_paged_blocks = */ params.kv_tier_paged_blocks,
             };
             instances.push_back(instance);
         }

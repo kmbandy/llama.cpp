@@ -217,25 +217,36 @@ This is the first real model to exercise the generalized `head_dim % 128 == 0` p
 end-to-end (prior validation was the op-level harness only); parity confirms Task 1's scatter/dispatch
 fix and `supports_op` gate are correct for native hd256, not just synthetic cache fills.
 
-**Step 3 — Throughput, Vulkan0** (`llama-bench`, `-p 512 -n 128`):
+**Step 3 — Throughput, Vulkan0** (`llama-bench`, `-p 512 -n 128 --kv-tier-paged-blocks`):
 
-Note: the brief's bench command included `--kv-tier-paged-blocks`, which `llama-bench` does not accept
-(it's a `llama-perplexity`/`llama-cli`-only flag — `llama-bench` has no such option in its `--help`). Ran
-without it; `--cache-type-k/v turbo4` alone is sufficient to select the paged turbo4 cache path.
+> **Bug found & fixed (SP2.5 Task 2 follow-up):** the original Step 3 numbers measured the *non-paged*
+> turbo4 cache, not the paged path. `--kv-tier-paged-blocks` was registered in `common/arg.cpp` only for
+> `SERVER`/`CLI`/`PERPLEXITY`, and — more importantly — `llama-bench` uses its **own** standalone arg
+> parser (it never calls `common_params_parse`, and `to_llama_cparams()` never set
+> `cparams.kv_tier_paged_blocks`), so the flag was silently rejected and the paged path was never enabled.
+> Fix: added `LLAMA_EXAMPLE_BENCH` to the arg's `.set_examples(...)` **and** wired `--kv-tier-paged-blocks`
+> directly into `tools/llama-bench/llama-bench.cpp` (parser flag → `cmd_params` → `cmd_params_instance` →
+> `to_llama_cparams()`). Rerun below uses the now-working flag.
 
-| test | t/s |
-| --- | --- |
-| pp512 | 266.68 ± 78.66 |
-| tg128 | 35.80 ± 0.66 |
+Paged path confirmed active (verbose log): `llama_model: hybrid attn routed to llama_kv_cache_paged
+(n_blocks=24, block_size=16, ...)` and `llama_kv_cache_paged: allocated 8/32 attn layers ... head_dim=256,
+type_k=turbo4, type_v=turbo4`. Qwen3.5 is hybrid, so its attention layers run on `llama_kv_cache_paged`
+while recurrent layers stay on `llama_memory_recurrent` — this is the hd256 paged turbo4 path SP2.5 targets.
 
-pp512's stderr is large relative to the mean (~30%) — typical for a single short prefill on this card with
-default `-r 5` repetitions and no `--no-warmup` tuning; tg128's stderr is tight (~2%) and looks stable. No
-perf cliff observed relative to the hd128 LFM2.5 numbers from SP2 (same backend, same op); the bd256 path
-is not measurably worse per-token than hd128 on this hardware. No further diagnosis needed — flagged as a
-measurement-noise note, not a regression.
+| test | t/s (paged, corrected) | t/s (old, non-paged) |
+| --- | --- | --- |
+| pp512 | 280.55 ± 4.07 | 266.68 ± 78.66 |
+| tg128 | 34.98 ± 0.29 | 35.80 ± 0.66 |
 
-**Verdict:** hd256 end-to-end on Vulkan0 is correctness-confirmed (PPL parity) and runs at expected
-throughput. No code changes required; Task 1's generalization holds under a real model.
+The paged path is within noise of the old non-paged numbers on this hardware (pp512 slightly higher mean
+with a *much* tighter stderr — ±4.07 vs ±78.66, corroborating that the prior run exercised a different,
+noisier path; tg128 ~2% lower, within stderr). No perf cliff for the hd256 paged path relative to the
+non-paged turbo4 cache — the paged-attention indirection is not measurably costly here.
+
+**Verdict:** hd256 end-to-end on Vulkan0 is correctness-confirmed (PPL parity, measured via
+`llama-perplexity` which already had the flag) and now throughput-confirmed *on the actual paged path*.
+Task 1's generalization holds under a real model; the only code change needed was registering the flag for
+`llama-bench` (Task 2 measurement-gap fix).
 
 ---
 
