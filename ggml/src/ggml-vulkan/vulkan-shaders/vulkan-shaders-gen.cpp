@@ -803,9 +803,11 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
-    // turbo4_0: SET_ROWS only (no dequant/MMQ/get_rows — serial serial quantize via copy_to_quant.comp)
-    string_to_spv("set_rows_turbo4_0_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
-    string_to_spv("set_rows_turbo4_0_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    // turbo4_0: SET_ROWS only (no dequant/MMQ/get_rows). Bespoke COOPERATIVE shader
+    // (128 threads/block, shared-mem reduction) — the generic copy_to_quant serial path
+    // spilled large per-thread arrays and ran ~67x slower per call.
+    string_to_spv("set_rows_turbo4_0_i32", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("set_rows_turbo4_0_i64", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
