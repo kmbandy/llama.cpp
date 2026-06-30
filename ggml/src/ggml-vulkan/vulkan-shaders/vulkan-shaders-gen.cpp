@@ -813,6 +813,8 @@ void process_shaders() {
     // Shaders are type-generic via paged_cache_ops.glsl; Task 4 adds DATA_A_TURBO4_0.
     string_to_spv("paged_attn_scatter_f16", "paged_attn_scatter.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_f16",         "paged_attn.comp",         {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_0", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_0",         "paged_attn.comp",         {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

@@ -4978,6 +4978,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_F16], "paged_attn_scatter_f16", paged_attn_scatter_f16_len, paged_attn_scatter_f16_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_F16],         "paged_attn_f16",         paged_attn_f16_len,         paged_attn_f16_data,         "main", 7, sizeof(vk_op_paged_attn_pc),    {1, 1, 1}, {}, 1);
 
+    // turbo4_0 cache path (Task 4): no-RHT cooperative scatter quantizer + dequant load.
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_0], "paged_attn_scatter_turbo4_0", paged_attn_scatter_turbo4_0_len, paged_attn_scatter_turbo4_0_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_0],         "paged_attn_turbo4_0",         paged_attn_turbo4_0_len,         paged_attn_turbo4_0_data,         "main", 7, sizeof(vk_op_paged_attn_pc),    {1, 1, 1}, {}, 1);
+
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
@@ -16902,10 +16906,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (q->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // F16 cache only for now; K and V cache must share type.
-                if (k_cache->type != GGML_TYPE_F16 || v_cache->type != GGML_TYPE_F16) {
+                // K and V cache must share type; F16 (Task 3) or TURBO4_0 (Task 4).
+                if (k_cache->type != v_cache->type) {
                     return false;
                 }
+                if (k_cache->type != GGML_TYPE_F16 && k_cache->type != GGML_TYPE_TURBO4_0) {
+                    return false;
+                }
+                // Scatter inputs are always F16 regardless of cache type.
                 if (k_cur->type != GGML_TYPE_F16 || v_cur->type != GGML_TYPE_F16) {
                     return false;
                 }

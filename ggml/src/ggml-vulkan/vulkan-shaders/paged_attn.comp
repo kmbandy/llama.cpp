@@ -17,6 +17,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
+#ifdef DATA_A_TURBO4_0
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#endif
 
 #define WG_SIZE 128u
 #define MAX_VEC 8u                  // ceil(HEAD_SIZE_max / WG_SIZE); HEAD_SIZE<=1024
@@ -34,9 +38,21 @@ layout (push_constant) uniform parameter {
     float scale;
 } p;
 
+// Q is always F16 regardless of cache type. Cache buffers differ by cache type.
 layout (binding = 0) readonly buffer Q       { float16_t q_data[]; };
+#ifdef DATA_A_F16
 layout (binding = 1)          buffer KCache  { float16_t data_k[]; };
 layout (binding = 2)          buffer VCache  { float16_t data_v[]; };
+#endif
+#ifdef DATA_A_TURBO4_0
+struct block_turbo4_0 {
+    float16_t norm;      // corrected L2 norm (fp16)
+    float16_t rnorm;     // reserved (always 0)
+    uint8_t   qs[64];    // 4-bit centroid indices, nibble-packed
+};
+layout (binding = 1)          buffer KCache  { block_turbo4_0 data_k[]; };
+layout (binding = 2)          buffer VCache  { block_turbo4_0 data_v[]; };
+#endif
 layout (binding = 3) readonly buffer BTab    { int   block_tables[]; };
 layout (binding = 4) readonly buffer CtxLens { int   context_lens[]; };
 layout (binding = 5) readonly buffer QLens   { int   q_lens[]; };

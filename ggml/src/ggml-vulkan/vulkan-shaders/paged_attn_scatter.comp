@@ -14,6 +14,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
+#ifdef DATA_A_TURBO4_0
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#endif
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -24,14 +28,29 @@ layout (push_constant) uniform parameter {
     uint n_tokens;      // total tokens (sum of q_lens)
 } p;
 
+// K_cur / V_cur scatter INPUTS are always F16 regardless of cache type.
 layout (binding = 0) readonly  buffer SlotMap { int       slot_mapping[]; };
 layout (binding = 1) readonly  buffer KCur    { float16_t k_cur[]; };
 layout (binding = 2) readonly  buffer VCur    { float16_t v_cur[]; };
+
+// Cache buffers differ by cache type — guard the declarations.
+#ifdef DATA_A_F16
 layout (binding = 3)           buffer KCache  { float16_t data_k[]; };
 layout (binding = 4)           buffer VCache  { float16_t data_v[]; };
+#endif
+#ifdef DATA_A_TURBO4_0
+struct block_turbo4_0 {
+    float16_t norm;      // corrected L2 norm (fp16)
+    float16_t rnorm;     // reserved (written as 0)
+    uint8_t   qs[64];    // 4-bit centroid indices, nibble-packed
+};
+layout (binding = 3)           buffer KCache  { block_turbo4_0 data_k[]; };
+layout (binding = 4)           buffer VCache  { block_turbo4_0 data_v[]; };
+#endif
 
 #include "paged_cache_ops.glsl"
 
+#ifdef DATA_A_F16
 void main() {
     const uint token     = gl_WorkGroupID.x;   // global token index
     const uint kv_head   = gl_WorkGroupID.y;
@@ -61,3 +80,117 @@ void main() {
         pa_v_store(pa_v_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), vval);
     }
 }
+#endif // DATA_A_F16
+
+#ifdef DATA_A_TURBO4_0
+// Cooperative no-RHT turbo4 quantizer. Mirrors mt_scatter_kv_turbo4_0_kernel
+// (mt_pagedattn.cu:323-454): one workgroup per (token, kv_head*N_QBLK+qb, K/V),
+// 128 threads = one element each. Sequence: load -> L2 norm -> normalize ->
+// (NO Hadamard) -> nearest centroid -> nibble-pack -> recon-norm-correct.
+// wave64-safe: shared-memory tree reductions, no subgroup ops.
+shared float s_x[128];     // working values (normalized in place)
+shared float s_red[128];   // tree-reduction / nibble-share scratch
+
+void main() {
+    const uint j         = gl_LocalInvocationID.x;   // 0..127, element within the turbo4 block
+    const uint token     = gl_WorkGroupID.x;         // global token index
+    const uint y_idx     = gl_WorkGroupID.y;         // kv_head*N_QBLK + qb
+    const uint kv_select = gl_WorkGroupID.z;         // 0 = K, 1 = V
+
+    if (token >= p.n_tokens) {
+        return;                                      // uniform across workgroup
+    }
+
+    const uint N_QBLK = p.HS / 128u;
+    const uint kv_head = y_idx / N_QBLK;
+    const uint qb      = y_idx % N_QBLK;
+
+    const int slot = slot_mapping[token];
+    if (slot < 0) {
+        return;                                      // padding token (uniform)
+    }
+
+    const uint paged_block = uint(slot) / p.BS;
+    const uint tok         = uint(slot) % p.BS;
+    const uint d           = qb * 128u + j;
+
+    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
+    const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
+    const float val = (kv_select == 0u) ? float(k_cur[src]) : float(v_cur[src]);
+
+    const uint block_ib = pa_turbo_block_index(paged_block, kv_head, p.n_kv_heads, tok, qb, p.HS, p.BS);
+
+    // ---- Step 1: load into shared mem ----
+    s_x[j] = val;
+    barrier();
+
+    // ---- Step 2: parallel L2 norm (7-stage binary tree) ----
+    s_red[j] = s_x[j] * s_x[j];
+    barrier();
+    if (j < 64u) { s_red[j] += s_red[j + 64u]; } barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float grp_norm = sqrt(s_red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    // ---- Step 3: normalize ----
+    s_x[j] *= inv_norm;
+    barrier();
+
+    // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
+
+    // ---- Step 5: nearest centroid ----
+    const uint idx = pa_turbo_nearest_4bit(s_x[j]);
+
+    // ---- Step 7 (parallel): reconstruction norm = sqrt(Σ centroid²) ----
+    // WAR: all lanes have read s_red[0] (grp_norm) before any lane overwrites it.
+    barrier();
+    const float cv = TURBO_CENTROIDS_4BIT[idx];
+    s_red[j] = cv * cv;
+    barrier();
+    if (j < 64u) { s_red[j] += s_red[j + 64u]; } barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float recon_norm     = sqrt(s_red[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    // ---- Step 6: nibble-pack qs cooperatively ----
+    // Share indices via s_red so even lanes can pair them. WAR: all lanes have
+    // consumed s_red[0] (recon_norm) before any lane overwrites s_red.
+    barrier();
+    s_red[j] = float(idx);
+    barrier();
+
+    // ---- Step 8: thread 0 writes per-block scalars ----
+    if (j == 0u) {
+        if (kv_select == 0u) {
+            data_k[block_ib].norm  = float16_t(corrected_norm);
+            data_k[block_ib].rnorm = float16_t(0.0f);
+        } else {
+            data_v[block_ib].norm  = float16_t(corrected_norm);
+            data_v[block_ib].rnorm = float16_t(0.0f);
+        }
+    }
+
+    if ((j & 1u) == 0u) {
+        const uint lo = uint(s_red[j]);
+        const uint hi = uint(s_red[j + 1u]);
+        const uint8_t packed = uint8_t((lo & 0xFu) | ((hi & 0xFu) << 4u));
+        if (kv_select == 0u) {
+            data_k[block_ib].qs[j >> 1u] = packed;
+        } else {
+            data_v[block_ib].qs[j >> 1u] = packed;
+        }
+    }
+}
+#endif // DATA_A_TURBO4_0
