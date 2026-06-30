@@ -1,0 +1,182 @@
+#version 450
+
+// paged_attn_decode.comp — split-K DECODE pass-1 for paged attention.
+// Single-query-per-seq fast path (q_len == 1). Translates the per-chunk
+// partial computation of mt_paged_attention_decode_kernel
+// (mt_pagedattn_decode.cu): one workgroup per (seq, q_head, kv_chunk),
+// CHUNK_KV = 128. Each workgroup runs the SAME online softmax as the
+// prefill shader (paged_attn.comp) but bounded to its chunk's kv range,
+// and writes an UNNORMALIZED partial (acc[HEAD_SIZE], m_partial, l_partial)
+// to the split-K scratch buffer. A separate reduce shader
+// (paged_attn_decode_reduce.comp) merges the chunk partials per (seq, q_head)
+// with the standard log-sum-exp combine.
+//
+// wave64-safe: the QK dot-product reduction is a 128-thread shared-memory
+// tree reduction (NEVER a 32-lane subgroup collective). All barriers sit
+// outside any thread<N guard so all 128 lanes reach them.
+//
+// Loads via paged_cache_ops.glsl (works for F16 and turbo4_0, unchanged).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_EXT_control_flow_attributes                  : require
+#ifdef DATA_A_TURBO4_0
+#extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
+#extension GL_EXT_shader_8bit_storage                      : require
+#endif
+
+#define WG_SIZE 128u
+#define MAX_VEC 8u                  // ceil(HEAD_SIZE_max / WG_SIZE); HEAD_SIZE<=1024
+#define CHUNK_KV 128u               // tokens per kv chunk (matches CUDA CHUNK_KV)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint  HS;                 // head size (head_dim)
+    uint  BS;                 // block size
+    uint  n_heads;
+    uint  n_kv_heads;
+    uint  max_blocks_per_seq;
+    uint  n_seq;              // number of sequences in the batch
+    uint  num_splits;         // partials stride: ceil(max_ctx / CHUNK_KV)
+    float scale;
+} p;
+
+// Q is always F16 regardless of cache type. Cache buffers differ by cache type.
+layout (binding = 0) readonly buffer Q       { float16_t q_data[]; };
+#ifdef DATA_A_F16
+layout (binding = 1)          buffer KCache  { float16_t data_k[]; };
+layout (binding = 2)          buffer VCache  { float16_t data_v[]; };
+#endif
+#ifdef DATA_A_TURBO4_0
+struct block_turbo4_0 {
+    float16_t norm;      // corrected L2 norm (fp16)
+    float16_t rnorm;     // reserved (always 0)
+    uint8_t   qs[64];    // 4-bit centroid indices, nibble-packed
+};
+layout (binding = 1)          buffer KCache  { block_turbo4_0 data_k[]; };
+layout (binding = 2)          buffer VCache  { block_turbo4_0 data_v[]; };
+#endif
+layout (binding = 3) readonly buffer BTab    { int   block_tables[]; };
+layout (binding = 4) readonly buffer CtxLens { int   context_lens[]; };
+layout (binding = 5) readonly buffer QLens   { int   q_lens[]; };
+layout (binding = 6) writeonly buffer Partials { float partials[]; };
+
+#include "paged_cache_ops.glsl"
+
+shared float s_red[WG_SIZE];        // tree-reduction scratch
+shared float s_score;               // broadcast QK score for the current kv_pos
+
+// Block-wide sum of per-thread `v`, returned (identical) to all threads.
+float block_reduce_sum(float v) {
+    const uint t = gl_LocalInvocationID.x;
+    s_red[t] = v;
+    barrier();
+    [[unroll]] for (uint stride = WG_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (t < stride) { s_red[t] += s_red[t + stride]; }
+        barrier();
+    }
+    return s_red[0];
+}
+
+void main() {
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint s       = gl_WorkGroupID.x;      // sequence index
+    const uint q_head  = gl_WorkGroupID.y;
+    const uint chunk   = gl_WorkGroupID.z;      // kv chunk index
+
+    if (s >= p.n_seq) {
+        return;
+    }
+
+    const int  ctx_len   = context_lens[s];
+    const int  q_len     = q_lens[s];
+    // Decode: single query token per seq, q_pos = ctx_len - 1, attends [0, ctx_len).
+    const int  valid_ctx = ctx_len;
+
+    const int chunk_start = int(chunk) * int(CHUNK_KV);
+    if (chunk_start >= valid_ctx) {
+        // Entirely beyond this seq's real context. The reduce shader bounds its
+        // loop to ceil(context_len/CHUNK_KV), so it never reads this chunk's
+        // partial — skip the write and retire the workgroup (mirrors CUDA).
+        return;
+    }
+    const int chunk_end = min(chunk_start + int(CHUNK_KV), valid_ctx);
+
+    // Per-seq query token index (prefix sum of q_lens). With all q_len==1
+    // (decode gate) this equals s, but compute it for layout correctness.
+    uint qg = 0u;
+    [[loop]] for (uint i = 0u; i < s; ++i) { qg += uint(q_lens[i]); }
+
+    const uint kv_head = q_head / (p.n_heads / p.n_kv_heads);
+
+    // Load this thread's slice of Q (q layout [head_dim, n_heads, n_tokens]).
+    float q_reg[MAX_VEC];
+    [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) {
+        const uint d = tid + v * WG_SIZE;
+        q_reg[v] = (d < p.HS)
+            ? float(q_data[(qg * p.n_heads + q_head) * p.HS + d])
+            : 0.0f;
+    }
+
+    float m_run = -1e30f;           // running max (this chunk only)
+    float l_run = 0.0f;             // running denominator (this chunk only)
+    float acc_o[MAX_VEC];
+    [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) { acc_o[v] = 0.0f; }
+
+    for (int kv_pos = chunk_start; kv_pos < chunk_end; ++kv_pos) {
+        const uint logical_block = uint(kv_pos) / p.BS;
+        const uint tok           = uint(kv_pos) % p.BS;
+        const int  paged_block   = block_tables[s * p.max_blocks_per_seq + logical_block];
+        if (paged_block < 0) {
+            continue;               // invalid block-table entry (kInvalidBlockTableEntry)
+        }
+
+        // QK dot product over head-dim (block-wide reduction).
+        float partial = 0.0f;
+        [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) {
+            const uint d = tid + v * WG_SIZE;
+            if (d < p.HS) {
+                const float kval = pa_k_load(
+                    pa_k_off(uint(paged_block), kv_head, p.n_kv_heads, tok, d, p.HS, p.BS));
+                partial += q_reg[v] * kval;
+            }
+        }
+        const float reduced = block_reduce_sum(partial);
+        if (tid == 0u) { s_score = reduced * p.scale; }
+        barrier();
+        const float score = s_score;
+        barrier();              // all threads consumed s_score before next reuse
+
+        // Online-softmax update (registers; identical across threads).
+        const float m_new = max(m_run, score);
+        const float corr  = exp(m_run - m_new);     // 0 on the first valid kv_pos
+        const float pexp  = exp(score - m_new);
+        l_run = l_run * corr + pexp;
+
+        [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) {
+            const uint d = tid + v * WG_SIZE;
+            if (d < p.HS) {
+                const float vval = pa_v_load(
+                    pa_v_off(uint(paged_block), kv_head, p.n_kv_heads, tok, d, p.HS, p.BS));
+                acc_o[v] = acc_o[v] * corr + pexp * vval;
+            }
+        }
+        m_run = m_new;
+    }
+
+    // Write the UNNORMALIZED partial for this (q_head, seq, chunk).
+    // Layout: ((q_head * n_seq + s) * num_splits + chunk) * (HS + 2).
+    const uint pbase = ((q_head * p.n_seq + s) * p.num_splits + chunk) * (p.HS + 2u);
+    [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) {
+        const uint d = tid + v * WG_SIZE;
+        if (d < p.HS) {
+            partials[pbase + d] = acc_o[v];
+        }
+    }
+    if (tid == 0u) {
+        partials[pbase + p.HS]      = m_run;
+        partials[pbase + p.HS + 1u] = l_run;
+    }
+}

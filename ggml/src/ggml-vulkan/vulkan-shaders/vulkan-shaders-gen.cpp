@@ -816,6 +816,13 @@ void process_shaders() {
     string_to_spv("paged_attn_scatter_turbo4_0", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_turbo4_0",         "paged_attn.comp",         {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
 
+    // SP2 Task 5: split-K decode (q_len==1 fast path). Per-type pass-1 decode
+    // (reuses the type-generic paged_cache_ops.glsl loads), plus ONE
+    // type-agnostic pass-2 reduce (log-sum-exp merge of the chunk partials).
+    string_to_spv("paged_attn_decode_f16",      "paged_attn_decode.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_0", "paged_attn_decode.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_reduce",   "paged_attn_decode_reduce.comp", {{"D_TYPE","float16_t"}});
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

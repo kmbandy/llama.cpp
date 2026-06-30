@@ -823,6 +823,9 @@ struct vk_device_struct {
     // SP2 paged attention (GGML_OP_PAGED_ATTN_MT), indexed by KV cache type.
     vk_pipeline pipeline_paged_attn_scatter[GGML_TYPE_COUNT];
     vk_pipeline pipeline_paged_attn[GGML_TYPE_COUNT];
+    // SP2 Task 5: split-K decode (q_len==1). Pass-1 per cache type, pass-2 reduce type-agnostic.
+    vk_pipeline pipeline_paged_attn_decode[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_paged_attn_decode_reduce;
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_turbo_wht_f32;
@@ -1388,6 +1391,26 @@ struct vk_op_paged_attn_pc {
     uint32_t n_seq;
     uint32_t n_tokens;
     float    scale;
+};
+
+// SP2 Task 5 split-K decode push constants. Must match
+// paged_attn_decode.comp / paged_attn_decode_reduce.comp respectively.
+struct vk_op_paged_decode_pc {
+    uint32_t HS;
+    uint32_t BS;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t max_blocks_per_seq;
+    uint32_t n_seq;
+    uint32_t num_splits;
+    float    scale;
+};
+
+struct vk_op_paged_decode_reduce_pc {
+    uint32_t HS;
+    uint32_t n_heads;
+    uint32_t n_seq;
+    uint32_t num_splits;
 };
 
 struct vk_op_multi_add_push_constants {
@@ -4981,6 +5004,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // turbo4_0 cache path (Task 4): no-RHT cooperative scatter quantizer + dequant load.
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_0], "paged_attn_scatter_turbo4_0", paged_attn_scatter_turbo4_0_len, paged_attn_scatter_turbo4_0_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_0],         "paged_attn_turbo4_0",         paged_attn_turbo4_0_len,         paged_attn_turbo4_0_data,         "main", 7, sizeof(vk_op_paged_attn_pc),    {1, 1, 1}, {}, 1);
+
+    // SP2 Task 5: split-K decode. Pass-1 (decode) has 7 bindings per cache type;
+    // pass-2 (reduce) is type-agnostic with 3 bindings. Both wg_denoms {1,1,1}, local_size 128.
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_F16],      "paged_attn_decode_f16",      paged_attn_decode_f16_len,      paged_attn_decode_f16_data,      "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_0], "paged_attn_decode_turbo4_0", paged_attn_decode_turbo4_0_len, paged_attn_decode_turbo4_0_data, "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode_reduce,              "paged_attn_decode_reduce",   paged_attn_decode_reduce_len,   paged_attn_decode_reduce_data,   "main", 3, sizeof(vk_op_paged_decode_reduce_pc), {1, 1, 1}, {}, 1);
 
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
@@ -9993,8 +10022,29 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline attn_pipeline    = ctx->device->pipeline_paged_attn[cache_type];
     GGML_ASSERT(scatter_pipeline != nullptr && attn_pipeline != nullptr);
 
+    // Decode vs prefill routing. Decode (the split-K single-query fast path) is
+    // valid only when EVERY sequence has q_len == 1. Each seq always has at
+    // least one query token, so the sum of q_lens (== n_tokens == dst->ne[2])
+    // equals n_seq iff every q_len is exactly 1 — a shape-only test, no host
+    // read of the q_lens tensor (no GPU stall). Anything else falls back to the
+    // Task 3-4 prefill path, which is always correct.
+    const bool decode = (n_tokens == n_seq);
+    vk_pipeline decode_pipeline = ctx->device->pipeline_paged_attn_decode[cache_type];
+    vk_pipeline reduce_pipeline = ctx->device->pipeline_paged_attn_decode_reduce;
+
+    // Partials buffer stride: one chunk per CHUNK_KV (=128) tokens of allocated
+    // context (max_blocks_per_seq * block_size is an upper bound on real ctx).
+    const uint32_t CHUNK_KV   = 128u;
+    const uint32_t num_splits = (max_bps * block_size + CHUNK_KV - 1u) / CHUNK_KV;
+
     ggml_pipeline_request_descriptor_sets(ctx, scatter_pipeline, 1);
-    ggml_pipeline_request_descriptor_sets(ctx, attn_pipeline, 1);
+    if (decode) {
+        GGML_ASSERT(decode_pipeline != nullptr && reduce_pipeline != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, decode_pipeline, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, reduce_pipeline, 1);
+    } else {
+        ggml_pipeline_request_descriptor_sets(ctx, attn_pipeline, 1);
+    }
 
     vk_subbuffer q_buf            = ggml_vk_tensor_subbuffer(ctx, q);
     vk_subbuffer k_cache_buf      = ggml_vk_tensor_subbuffer(ctx, k_cache);
@@ -10017,13 +10067,52 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     // Barrier so attention reads the freshly scattered cache.
     ggml_vk_sync_buffers(ctx, subctx);
 
-    // Phase 2: prefill attention. grid = { n_tokens, n_heads, 1 }.
-    const vk_op_paged_attn_pc attn_pc = {
-        head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, n_tokens, scale
-    };
-    ggml_vk_dispatch_pipeline(ctx, subctx, attn_pipeline,
-        { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, dst_buf },
-        attn_pc, { n_tokens, n_heads, 1 });
+    if (decode) {
+        // Phase 2 (decode): split-K. Pass-1 computes per-(seq, head, chunk)
+        // partials into a scratch buffer; pass-2 merges them with a log-sum-exp
+        // combine. Mirrors the flash-attention split-K scratch mechanism: size
+        // ctx->prealloc_split_k via prealloc_size_split_k and reuse that buffer.
+        const uint64_t partials_size =
+            (uint64_t)num_splits * n_seq * n_heads * (head_size + 2) * sizeof(float);
+        if (partials_size > ctx->device->properties.limits.maxStorageBufferRange) {
+            GGML_ABORT("paged decode partials buffer too large");
+        }
+        if (ctx->prealloc_size_split_k < partials_size) {
+            ctx->prealloc_size_split_k = partials_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer partials_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+        // Pass 1: per-chunk partials. grid = { n_seq, n_heads, num_splits }.
+        const vk_op_paged_decode_pc decode_pc = {
+            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, num_splits, scale
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, decode_pipeline,
+            { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, partials_buf },
+            decode_pc, { n_seq, n_heads, num_splits });
+
+        // Barrier so the reduce reads completed partials.
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        // Pass 2: reduce. grid = { n_seq, n_heads, 1 }.
+        const vk_op_paged_decode_reduce_pc reduce_pc = { head_size, n_heads, n_seq, num_splits };
+        ggml_vk_dispatch_pipeline(ctx, subctx, reduce_pipeline,
+            { partials_buf, context_lens_buf, dst_buf },
+            reduce_pc, { n_seq, n_heads, 1 });
+
+        ctx->prealloc_split_k_need_sync = true;
+    } else {
+        // Phase 2: prefill attention. grid = { n_tokens, n_heads, 1 }.
+        const vk_op_paged_attn_pc attn_pc = {
+            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, n_tokens, scale
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, attn_pipeline,
+            { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, dst_buf },
+            attn_pc, { n_tokens, n_heads, 1 });
+    }
 }
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {

@@ -1,0 +1,94 @@
+#version 450
+
+// paged_attn_decode_reduce.comp — split-K DECODE pass-2 (reduce).
+// One workgroup per (seq, q_head). Merges the ceil(context_len/CHUNK_KV)
+// per-chunk partials produced by paged_attn_decode.comp with the standard
+// stable log-sum-exp combine (mirrors mt_paged_attention_decode_reduce_kernel
+// in mt_pagedattn_decode.cu):
+//
+//   m   = max_c m_c
+//   l   = Σ_c l_c · exp(m_c − m)
+//   out = (Σ_c acc_c · exp(m_c − m)) / l
+//
+// Empty/masked chunks (m_c == -inf sentinel, l_c == 0) drop out cleanly: they
+// are skipped in the sum, so they never poison the merge. The reduce loop is
+// bounded by ceil(context_len/CHUNK_KV) — chunks beyond a seq's real context
+// are never scanned (their partials were never written).
+//
+// Type-agnostic (floats only) — one variant serves both F16 and turbo4_0.
+// wave64-safe: per-thread scalar work only, no shared memory, no subgroup ops.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_EXT_control_flow_attributes                  : require
+
+#define WG_SIZE 128u
+#define MAX_VEC 8u
+#define CHUNK_KV 128u
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint HS;
+    uint n_heads;
+    uint n_seq;
+    uint num_splits;          // partials stride per (seq, head)
+} p;
+
+layout (binding = 0) readonly  buffer Partials { float  partials[]; };
+layout (binding = 1) readonly  buffer CtxLens  { int    context_lens[]; };
+layout (binding = 2) writeonly buffer Dst      { D_TYPE dst_data[]; };
+
+void main() {
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint s      = gl_WorkGroupID.x;       // sequence index
+    const uint q_head = gl_WorkGroupID.y;
+
+    if (s >= p.n_seq) {
+        return;
+    }
+
+    const int ctx_len = context_lens[s];
+
+    // Number of chunks that actually hold real keys for this seq. Bound the
+    // merge here so empty (beyond-context) chunks are never read.
+    uint valid_chunks = (uint(ctx_len) + CHUNK_KV - 1u) / CHUNK_KV;
+    if (valid_chunks > p.num_splits) { valid_chunks = p.num_splits; }
+
+    const uint seq_base     = (q_head * p.n_seq + s) * p.num_splits;  // in chunk units
+    const uint chunk_stride = p.HS + 2u;
+
+    // Pass 1: global max across chunks (redundant per-thread; chunk count small).
+    float global_max = -1e30f;
+    [[loop]] for (uint c = 0u; c < valid_chunks; ++c) {
+        const float m = partials[(seq_base + c) * chunk_stride + p.HS];
+        global_max = max(global_max, m);
+    }
+
+    // Pass 2: global denominator (skip empty chunks — they contribute nothing).
+    float global_sum = 0.0f;
+    [[loop]] for (uint c = 0u; c < valid_chunks; ++c) {
+        const float c_max = partials[(seq_base + c) * chunk_stride + p.HS];
+        if (c_max <= -1e30f) { continue; }
+        const float c_sum = partials[(seq_base + c) * chunk_stride + p.HS + 1u];
+        global_sum += c_sum * exp(c_max - global_max);
+    }
+    const float inv_sum = 1.0f / (global_sum + 1e-6f);
+
+    // Pass 3: per-element output. dst mirrors q layout [head_dim, n_heads, n_tokens];
+    // decode token index for seq s == s (all q_len == 1).
+    [[unroll]] for (uint v = 0u; v < MAX_VEC; ++v) {
+        const uint d = tid + v * WG_SIZE;
+        if (d < p.HS) {
+            float o = 0.0f;
+            [[loop]] for (uint c = 0u; c < valid_chunks; ++c) {
+                const float c_max = partials[(seq_base + c) * chunk_stride + p.HS];
+                if (c_max <= -1e30f) { continue; }
+                const float w = exp(c_max - global_max);
+                o += partials[(seq_base + c) * chunk_stride + d] * w;
+            }
+            dst_data[(s * p.n_heads + q_head) * p.HS + d] = D_TYPE(o * inv_sum);
+        }
+    }
+}

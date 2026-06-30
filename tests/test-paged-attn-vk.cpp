@@ -292,6 +292,35 @@ static bool cmp_cb(int /*node_index*/, ggml_tensor * t1, ggml_tensor * t2, void 
     return true;
 }
 
+// Run one Vulkan-vs-CUDA equivalence case on the op output node. Returns true
+// on PASS. Used for the Task 5 decode (q_len==1) cases — CUDA internally routes
+// q_len==1 to its own decode kernel, so this is a decode-vs-decode compare.
+static bool compare_paged_case(const char * label, const paged_case & c,
+                               ggml_backend_t vk, ggml_backend_t cuda, double tol) {
+    ggml_context * tmp_ctx = nullptr;
+    ggml_tensor  * op      = build_op_noalloc(c, &tmp_ctx);
+    bool supported         = ggml_backend_supports_op(vk, op);
+    ggml_free(tmp_ctx);
+    if (!supported) {
+        printf("%s: UNSUPPORTED on Vulkan FAIL\n", label);
+        return false;
+    }
+
+    built_graph gvk   = build_case(c, vk);
+    built_graph gcuda = build_case(c, cuda);
+
+    cb_state st;
+    std::vector<const ggml_tensor *> nodes = { gvk.out };
+    bool ok = ggml_backend_compare_graph_backend(
+        vk, cuda, gvk.gf, cmp_cb, &st, nodes.data(), nodes.size());
+
+    bool pass = ok && st.max_err <= tol;
+    printf("%s: max_err=%.6f tol=%.6f %s\n", label, st.max_err, tol, pass ? "PASS" : "FAIL");
+    free_graph(gvk);
+    free_graph(gcuda);
+    return pass;
+}
+
 int main() {
     ggml_backend_t vk   = init_backend("Vulkan");
     ggml_backend_t cuda = init_backend("CUDA");
@@ -381,6 +410,30 @@ int main() {
 
             free_graph(gvk);
             free_graph(gcuda);
+        }
+    }
+
+    // ── Task 5: split-K DECODE (q_len==1) equivalence across context lengths
+    //    that span chunk boundaries (CHUNK_KV=128):
+    //      ctx=32,128  → single chunk
+    //      ctx=200     → partial second chunk (72 valid tokens) — exercises the
+    //                    reduce's bounded loop + log-sum-exp merge of 2 chunks
+    //      ctx=512     → 4 full chunks — exercises a ≥4-way reduce
+    //    Same tolerances as prefill (F16 2e-3, turbo4_0 5e-2). CUDA routes
+    //    q_len==1 to its decode kernel, so this is decode-vs-decode.
+    {
+        const int ctxs[] = { 32, 128, 200, 512 };
+        for (int ci = 0; ci < 4; ++ci) {
+            const int ctx = ctxs[ci];
+            char label[64];
+
+            const paged_case cf { 128, 8, 2, 16, 1, ctx, 1, GGML_TYPE_F16 };
+            snprintf(label, sizeof(label), "paged f16 decode ctx=%d", ctx);
+            all_ok = compare_paged_case(label, cf, vk, cuda, 2e-3) && all_ok;
+
+            const paged_case ct { 128, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_0 };
+            snprintf(label, sizeof(label), "paged turbo4_0 decode ctx=%d", ctx);
+            all_ok = compare_paged_case(label, ct, vk, cuda, 5e-2) && all_ok;
         }
     }
 
