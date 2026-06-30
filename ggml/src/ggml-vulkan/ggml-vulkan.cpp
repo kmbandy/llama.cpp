@@ -820,6 +820,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
+    // SP2 paged attention (GGML_OP_PAGED_ATTN_MT), indexed by KV cache type.
+    vk_pipeline pipeline_paged_attn_scatter[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_paged_attn[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_turbo_wht_f32;
@@ -1365,6 +1368,26 @@ struct vk_op_binary_push_constants {
     uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
     uint32_t misalign_offsets;
     float param1; float param2; int32_t param3;
+};
+
+// SP2 paged attention push constants. Layouts must match
+// paged_attn_scatter.comp / paged_attn.comp respectively.
+struct vk_op_paged_scatter_pc {
+    uint32_t HS;
+    uint32_t BS;
+    uint32_t n_kv_heads;
+    uint32_t n_tokens;
+};
+
+struct vk_op_paged_attn_pc {
+    uint32_t HS;
+    uint32_t BS;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t max_blocks_per_seq;
+    uint32_t n_seq;
+    uint32_t n_tokens;
+    float    scale;
 };
 
 struct vk_op_multi_add_push_constants {
@@ -4948,6 +4971,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     SET_ROWS(_i32)
     SET_ROWS(_i64)
 #undef SET_ROWS
+
+    // SP2 paged attention (GGML_OP_PAGED_ATTN_MT), F16 cache path (Task 3).
+    // Both shaders dispatch one workgroup per grid element (wg_denoms {1,1,1}),
+    // local_size_x = 128. scatter has 5 bindings, attention has 7.
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_F16], "paged_attn_scatter_f16", paged_attn_scatter_f16_len, paged_attn_scatter_f16_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_F16],         "paged_attn_f16",         paged_attn_f16_len,         paged_attn_f16_data,         "main", 7, sizeof(vk_op_paged_attn_pc),    {1, 1, 1}, {}, 1);
 
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
@@ -9929,6 +9958,70 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// SP2: paged attention (GGML_OP_PAGED_ATTN_MT). Mirrors the CUDA dispatch
+// (mt::ggml_cuda_op_paged_attn_mt): scatter K_cur/V_cur into the paged cache,
+// barrier, then prefill attention. F16 cache path (Task 3); Task 4 adds turbo4_0.
+static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q            = dst->src[0];
+    const ggml_tensor * k_cache      = dst->src[1];
+    const ggml_tensor * v_cache      = dst->src[2];
+    const ggml_tensor * block_tables = dst->src[3];
+    const ggml_tensor * context_lens = dst->src[4];
+    const ggml_tensor * q_lens       = dst->src[5];
+    const ggml_tensor * k_cur        = dst->src[6];
+    const ggml_tensor * v_cur        = dst->src[7];
+    const ggml_tensor * slot_mapping = dst->src[8];
+
+    // op_params: [0]=float scale, [1]=block_size, [2]=max_blocks_per_seq, [3]=n_kv_heads.
+    const float * op_params_f = (const float *)dst->op_params;
+    const float   scale       = op_params_f[0];
+    const uint32_t block_size = ((const int32_t *)dst->op_params)[1];
+    const uint32_t max_bps    = ((const int32_t *)dst->op_params)[2];
+    const uint32_t n_kv_heads = ((const int32_t *)dst->op_params)[3];
+
+    const uint32_t head_size    = (uint32_t)q->ne[0];
+    const uint32_t n_heads      = (uint32_t)q->ne[1];
+    const uint32_t n_tokens     = (uint32_t)q->ne[2];
+    const uint32_t n_seq        = (uint32_t)block_tables->ne[1];
+
+    const ggml_type cache_type = k_cache->type;
+    vk_pipeline scatter_pipeline = ctx->device->pipeline_paged_attn_scatter[cache_type];
+    vk_pipeline attn_pipeline    = ctx->device->pipeline_paged_attn[cache_type];
+    GGML_ASSERT(scatter_pipeline != nullptr && attn_pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, scatter_pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, attn_pipeline, 1);
+
+    vk_subbuffer q_buf            = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_cache_buf      = ggml_vk_tensor_subbuffer(ctx, k_cache);
+    vk_subbuffer v_cache_buf      = ggml_vk_tensor_subbuffer(ctx, v_cache);
+    vk_subbuffer block_tables_buf = ggml_vk_tensor_subbuffer(ctx, block_tables);
+    vk_subbuffer context_lens_buf = ggml_vk_tensor_subbuffer(ctx, context_lens);
+    vk_subbuffer q_lens_buf       = ggml_vk_tensor_subbuffer(ctx, q_lens);
+    vk_subbuffer k_cur_buf        = ggml_vk_tensor_subbuffer(ctx, k_cur);
+    vk_subbuffer v_cur_buf        = ggml_vk_tensor_subbuffer(ctx, v_cur);
+    vk_subbuffer slot_mapping_buf = ggml_vk_tensor_subbuffer(ctx, slot_mapping);
+    vk_subbuffer dst_buf          = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // Phase 1: scatter K_cur/V_cur into the paged cache.
+    // grid = { n_tokens, n_kv_heads, 2 } (z selects K vs V).
+    const vk_op_paged_scatter_pc scatter_pc = { head_size, block_size, n_kv_heads, n_tokens };
+    ggml_vk_dispatch_pipeline(ctx, subctx, scatter_pipeline,
+        { slot_mapping_buf, k_cur_buf, v_cur_buf, k_cache_buf, v_cache_buf },
+        scatter_pc, { n_tokens, n_kv_heads, 2 });
+
+    // Barrier so attention reads the freshly scattered cache.
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // Phase 2: prefill attention. grid = { n_tokens, n_heads, 1 }.
+    const vk_op_paged_attn_pc attn_pc = {
+        head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, n_tokens, scale
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, attn_pipeline,
+        { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, dst_buf },
+        attn_pc, { n_tokens, n_heads, 1 });
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -14438,6 +14531,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_PAGED_ATTN_MT:
+        ggml_vk_paged_attn_mt(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -16783,6 +16881,46 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
 
+                return true;
+            }
+        case GGML_OP_PAGED_ATTN_MT:
+            {
+                // SP2 Task 3: F16 cache path only (Task 4 adds TURBO4_0).
+                const ggml_tensor * q            = op->src[0];
+                const ggml_tensor * k_cache      = op->src[1];
+                const ggml_tensor * v_cache      = op->src[2];
+                const ggml_tensor * block_tables = op->src[3];
+                const ggml_tensor * context_lens = op->src[4];
+                const ggml_tensor * q_lens       = op->src[5];
+                const ggml_tensor * k_cur        = op->src[6];
+                const ggml_tensor * v_cur        = op->src[7];
+                const ggml_tensor * slot_mapping = op->src[8];
+                if (!q || !k_cache || !v_cache || !block_tables || !context_lens ||
+                    !q_lens || !k_cur || !v_cur || !slot_mapping) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                // F16 cache only for now; K and V cache must share type.
+                if (k_cache->type != GGML_TYPE_F16 || v_cache->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (k_cur->type != GGML_TYPE_F16 || v_cur->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (block_tables->type != GGML_TYPE_I32 || context_lens->type != GGML_TYPE_I32 ||
+                    q_lens->type != GGML_TYPE_I32 || slot_mapping->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                // head_dim and block_size constraints (cache layout assumptions).
+                if (q->ne[0] != 128) {
+                    return false;
+                }
+                const int32_t block_size = ((const int32_t *)op->op_params)[1];
+                if (block_size != 16) {
+                    return false;
+                }
                 return true;
             }
         case GGML_OP_FLASH_ATTN_EXT:

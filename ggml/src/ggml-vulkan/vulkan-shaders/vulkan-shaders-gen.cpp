@@ -809,6 +809,11 @@ void process_shaders() {
     string_to_spv("set_rows_turbo4_0_i32", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("set_rows_turbo4_0_i64", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
+    // SP2: paged attention (GGML_OP_PAGED_ATTN_MT). F16 cache path (Task 3).
+    // Shaders are type-generic via paged_cache_ops.glsl; Task 4 adds DATA_A_TURBO4_0.
+    string_to_spv("paged_attn_scatter_f16", "paged_attn_scatter.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_f16",         "paged_attn.comp",         {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

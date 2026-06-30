@@ -196,45 +196,82 @@ int main() {
         return 0;
     }
 
-    // Case: 1 seq, head_dim=128, n_heads=8, n_kv_heads=2 (GQA 4:1),
-    //       block_size=16, prefill q_len=32, context_len=32, TURBO4_0 cache.
-    const paged_case c { 128, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_0 };
+    bool all_ok = true;
 
-    // Build the op in a no-alloc context to query backend support —
-    // avoids allocating TURBO4_0 buffers on a backend that may not support them.
+    // ── Task 3 (F16): full paged plumbing with the trivial F16 cache type.
+    // Same shape as the turbo4 case but F16 cache. Vulkan must support and
+    // match the CUDA reference at F16 tolerance (no quant).
     {
+        const paged_case cf { 128, 8, 2, 16, 32, 32, 1, GGML_TYPE_F16 };
+
+        ggml_context * tmp_ctx = nullptr;
+        ggml_tensor  * op      = build_op_noalloc(cf, &tmp_ctx);
+        bool supported         = ggml_backend_supports_op(vk, op);
+        ggml_free(tmp_ctx);
+
+        if (!supported) {
+            printf("paged f16 prefill: UNSUPPORTED on Vulkan (Task 3 incomplete) FAIL\n");
+            all_ok = false;
+        } else {
+            // The comparator runs the SAME logical graph on CUDA via
+            // ggml_backend_graph_copy (CUDA-resident input copies), so the
+            // reference is a genuine CUDA computation, not Vulkan-vs-Vulkan.
+            built_graph gvk   = build_case(cf, vk);
+            built_graph gcuda = build_case(cf, cuda);   // hook (built-but-unused; copy handles residency)
+
+            cb_state st;
+            std::vector<const ggml_tensor *> nodes = { gvk.out };
+            bool ok = ggml_backend_compare_graph_backend(
+                vk, cuda, gvk.gf, cmp_cb, &st,
+                nodes.data(), nodes.size());
+
+            const double tol = 2e-3;   // F16, no quant
+            bool pass = ok && st.max_err <= tol;
+            printf("paged f16 prefill: max_err=%.6f tol=%.6f %s\n",
+                   st.max_err, tol, pass ? "PASS" : "FAIL");
+            all_ok = all_ok && pass;
+
+            free_graph(gvk);
+            free_graph(gcuda);
+        }
+    }
+
+    // ── turbo4_0: 1 seq, head_dim=128, n_heads=8, n_kv_heads=2 (GQA 4:1),
+    //    block_size=16, prefill q_len=32, context_len=32, TURBO4_0 cache.
+    //    Still EXPECTED-FAIL on Vulkan until Task 4 adds the turbo4_0 path.
+    {
+        const paged_case c { 128, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_0 };
+
         ggml_context * tmp_ctx = nullptr;
         ggml_tensor  * op      = build_op_noalloc(c, &tmp_ctx);
         bool supported         = ggml_backend_supports_op(vk, op);
         ggml_free(tmp_ctx);
 
         if (!supported) {
-            printf("EXPECTED-FAIL: PAGED_ATTN_MT not yet supported on Vulkan\n");
-            ggml_backend_free(vk);
-            ggml_backend_free(cuda);
-            return 0;   // RED baseline — Tasks 3-5 turn this green
+            printf("EXPECTED-FAIL: PAGED_ATTN_MT turbo4_0 not yet supported on Vulkan\n");
+        } else {
+            built_graph gvk   = build_case(c, vk);
+            built_graph gcuda = build_case(c, cuda);
+
+            cb_state st;
+            std::vector<const ggml_tensor *> nodes = { gvk.out };
+            bool ok = ggml_backend_compare_graph_backend(
+                vk, cuda, gvk.gf, cmp_cb, &st,
+                nodes.data(), nodes.size());
+
+            const double tol = 5e-2;   // turbo4-class 4-bit centroid quant
+            bool pass = ok && st.max_err <= tol;
+            printf("paged turbo4_0 prefill: max_err=%.6f tol=%.6f %s\n",
+                   st.max_err, tol, pass ? "PASS" : "FAIL");
+            all_ok = all_ok && pass;
+
+            free_graph(gvk);
+            free_graph(gcuda);
         }
     }
 
-    // Vulkan supports the op: run the real dual-backend comparison.
-    built_graph gvk  = build_case(c, vk);
-    built_graph gcuda = build_case(c, cuda);
-
-    cb_state st;
-    std::vector<const ggml_tensor *> nodes = { gvk.out };
-    bool ok = ggml_backend_compare_graph_backend(
-        vk, cuda, gvk.gf, cmp_cb, &st,
-        nodes.data(), nodes.size());
-
-    const double tol = 5e-2;   // turbo4-class 4-bit centroid quant; tighten once measured
-    printf("paged turbo4_0 prefill: max_err=%.6f tol=%.6f %s\n",
-           st.max_err, tol,
-           (ok && st.max_err <= tol) ? "PASS" : "FAIL");
-
-    free_graph(gvk);
-    free_graph(gcuda);
     ggml_backend_free(vk);
     ggml_backend_free(cuda);
 
-    return (ok && st.max_err <= tol) ? 0 : 1;
+    return all_ok ? 0 : 1;
 }

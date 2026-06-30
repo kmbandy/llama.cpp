@@ -1,0 +1,63 @@
+#version 450
+
+// paged_attn_scatter.comp — type-generic scatter of K_cur/V_cur into the paged
+// K/V cache. Mirrors mt_scatter_kv_kernel (mt_pagedattn.cu:174-225). For the F16
+// cache type this is a pure permutation copy (element-granular store, no
+// cooperative quantization — that is a Task 4 concern for quant types).
+//
+// Threading: local_size_x = HEAD_SIZE (one thread per head-dim element d).
+// One workgroup per (token, kv_head); gl_WorkGroupID.z selects K (0) vs V (1).
+//
+// wave64-safe: no subgroup ops.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage                     : require
+#extension GL_EXT_control_flow_attributes                  : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint HS;            // head size (head_dim)
+    uint BS;            // block size
+    uint n_kv_heads;
+    uint n_tokens;      // total tokens (sum of q_lens)
+} p;
+
+layout (binding = 0) readonly  buffer SlotMap { int       slot_mapping[]; };
+layout (binding = 1) readonly  buffer KCur    { float16_t k_cur[]; };
+layout (binding = 2) readonly  buffer VCur    { float16_t v_cur[]; };
+layout (binding = 3)           buffer KCache  { float16_t data_k[]; };
+layout (binding = 4)           buffer VCache  { float16_t data_v[]; };
+
+#include "paged_cache_ops.glsl"
+
+void main() {
+    const uint token     = gl_WorkGroupID.x;   // global token index
+    const uint kv_head   = gl_WorkGroupID.y;
+    const uint kv_select = gl_WorkGroupID.z;   // 0 = K, 1 = V
+    const uint d         = gl_LocalInvocationID.x;
+
+    if (token >= p.n_tokens || d >= p.HS) {
+        return;
+    }
+
+    const int slot = slot_mapping[token];
+    if (slot < 0) {
+        return;                                  // padding token
+    }
+
+    const uint paged_block = uint(slot) / p.BS;
+    const uint tok         = uint(slot) % p.BS;
+
+    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
+    const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
+
+    if (kv_select == 0u) {
+        const float kval = float(k_cur[src]);
+        pa_k_store(pa_k_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), kval);
+    } else {
+        const float vval = float(v_cur[src]);
+        pa_v_store(pa_v_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), vval);
+    }
+}
