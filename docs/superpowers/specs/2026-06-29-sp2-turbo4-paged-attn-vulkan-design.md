@@ -22,16 +22,24 @@ never ship. turbo4_0 is also *not* harder than F16 here:
 - **turbo4 K and V are symmetric.** Both use the layout
   `[BLOCK_SIZE, HEAD_SIZE/128]` of `block_turbo4_0` with the *same* load path.
   (F16 is asymmetric: V is head-dim-major, K is X-strided with `K_X=8`.)
-- **The WHT rotation lives outside the op.** Per SP1's architecture, Q is
-  rotated by a graph-level `GGML_OP_TURBO_WHT` (already ported to Vulkan in
-  SP1), K/V rotation is bundled inside the scatter-quantizer (SP1's
-  cooperative quantizer), and the read returns rotated `centroid×norm`, so
-  `⟨Q_rot, K_rot⟩ = ⟨Q, K⟩` (WHT is orthogonal). The graph wiring is
-  backend-agnostic → port-for-free. **SP2's op shaders never touch WHT.**
-- **SP1 already built the turbo4_0 pieces.** The cooperative f32→turbo4_0
-  quantizer (`cpy_f32_turbo4_0.comp` / `set_rows_f32_turbo4_0.comp`) and the
-  turbo4_0 dequant (`centroid×norm`) are validated. SP2 reuses them; the new
-  work is *paged plumbing only*.
+- **The paged turbo4 path is RHT-free end-to-end — NO WHT anywhere.** Unlike
+  the non-paged FA path (SP1), the paged scatter
+  (`mt_scatter_kv_turbo4_0_kernel`, `mt_pagedattn.cu:395-414`) *intentionally
+  skips* the Randomized Hadamard Transform: load → L2-norm → normalize →
+  nearest-centroid → recon-norm-correct → nibble-pack, with no s1/butterfly/s2.
+  Dequant returns `centroid·norm ≈ K` *directly* (un-rotated), so `⟨K,Q⟩` is
+  exact — no JL approximation. Correspondingly the graph passes **un-rotated Q**
+  (no `ggml_turbo_wht`) to the paged op (`src/llama-graph.cpp:2696`). This is
+  the opposite of SP1's FA convention (Q graph-rotated, WHT bundled in the
+  quantizer, read in rotated domain). **SP2's scatter must therefore mirror the
+  no-RHT `mt_scatter_kv_turbo4_0_kernel`, NOT SP1's WHT-bundled
+  `cpy_f32_turbo4_0.comp`.**
+- **SP2 reuses SP1's cooperative *structure*, not its WHT.** SP1's cooperative
+  quantizer (shared-mem tree-reduced L2 norm, centroid ladder, recon-norm
+  correction, nibble pack) is the template; SP2's scatter is that structure
+  *minus the WHT steps* — strictly simpler. The turbo4_0 dequant arithmetic
+  (`centroid·norm`, `turbo_centroids.glsl`) is reused as-is, interpreted
+  un-rotated. The new work is *paged plumbing + a no-RHT scatter*.
 
 ## Why turbo4_64 is deferred to SP3 (not in SP2)
 
@@ -97,7 +105,7 @@ element_block_index(paged_block, kv_head, token_in_block, d) =
   + token_in_block * N_QBLK
   + d / 128
 iqs (within block) = d % 128
-dequant = TURBO_CENTROIDS_4BIT[ qs_nibble(iqs) ] * norm     // rotated domain
+dequant = TURBO_CENTROIDS_4BIT[ qs_nibble(iqs) ] * norm     // un-rotated (no RHT)
 ```
 
 K and V use the identical index and load path.
@@ -124,12 +132,14 @@ All wave64-aware (shared-memory reductions; no `gl_SubgroupSize==32`
 assumptions; no coopmat — Polaris has no matrix cores).
 
 1. **`paged_scatter_turbo4_0.comp`** — cooperative f16→turbo4_0
-   quantize-scatter. Reuses SP1's `cpy_f32_turbo4_0.comp` cooperative WHT-quant
-   math (128-thread block, tree-reduced L2 norm, s1/WHT/s2, centroid ladder,
-   recon-norm correction, nibble pack) with **paged addressing**: read
-   `k_cur`/`v_cur` at `src_elem`, write `block_turbo4_0` at
-   `element_block_index(slot)`. One workgroup per `(token, kv_head, qblock)`.
-   K and V scattered by two dispatches (or one over a doubled grid).
+   quantize-scatter, mirroring the **no-RHT** `mt_scatter_kv_turbo4_0_kernel`
+   (`mt_pagedattn.cu:323-455`): 128-thread block, tree-reduced L2 norm,
+   normalize, nearest-centroid, recon-norm correction, nibble pack — **no
+   s1/WHT-butterfly/s2** (the SP1 cooperative structure minus the Hadamard
+   steps). Paged addressing: read `k_cur`/`v_cur` at `src_elem`, write
+   `block_turbo4_0` at `element_block_index(slot)`. One workgroup per
+   `(token, kv_head, qblock)`; K and V via a doubled grid (`gl_WorkGroupID.z` =
+   K/V select, as in the CUDA kernel's `blockIdx.z`).
 
 2. **`paged_attn_turbo4_0.comp`** — general / prefill path. One workgroup per
    `(query_token, q_head)`. Loop KV positions `0..context_len`: map
@@ -222,11 +232,13 @@ swap). Test binary: `build-vk/bin/test-backend-ops`, run with
 
 ## Risks / watch-items
 
-- **WHT graph wiring for the paged branch.** Verify the backend-agnostic graph
-  applies `GGML_OP_TURBO_WHT` to Q around the paged op (as it does for the
-  non-paged FA path) when the cache is turbo4_0. If it only wires WHT for the
-  FA branch, the paged Q would be unrotated and the dot wrong. Confirm in
-  `src/llama-graph.cpp` build_attn paged branch. (Plan task 0 / pre-flight.)
+- **WHT graph wiring — RESOLVED (no action).** Confirmed the paged turbo4 path
+  is RHT-free: the scatter (`mt_scatter_kv_turbo4_0_kernel:395-414`) skips the
+  Hadamard transform and the graph passes un-rotated Q to the paged op
+  (`src/llama-graph.cpp:2696`, no `ggml_turbo_wht`). So `centroid·norm = K`
+  directly and `⟨K,Q⟩` is exact. No graph changes; SP2's scatter must NOT
+  apply WHT (mirror the no-RHT CUDA kernel). This is the opposite convention
+  from SP1's FA path — do not copy SP1's WHT-bundled `cpy_f32_turbo4_0.comp`.
 - **wave64 reductions.** Polaris is wave64. Use shared-memory or
   subgroup-size-agnostic reductions; do not translate CUDA 32-lane warp
   collectives literally.
