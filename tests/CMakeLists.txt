@@ -242,6 +242,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-paged-attn-vk.cpp)
 
 llama_build_and_test(test-weight-pager.cpp)
 target_include_directories(test-weight-pager PRIVATE ${CMAKE_SOURCE_DIR}/src)
