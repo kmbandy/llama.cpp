@@ -52,32 +52,28 @@ layout (binding = 4)           buffer VCache  { block_turbo4_0 data_v[]; };
 
 #ifdef DATA_A_F16
 void main() {
-    const uint token     = gl_WorkGroupID.x;   // global token index
-    const uint kv_head   = gl_WorkGroupID.y;
-    const uint kv_select = gl_WorkGroupID.z;   // 0 = K, 1 = V
-    const uint d         = gl_LocalInvocationID.x;
+    const uint token     = gl_WorkGroupID.x;          // global token index
+    const uint y_idx     = gl_WorkGroupID.y;          // kv_head*N_QBLK + qb
+    const uint kv_select = gl_WorkGroupID.z;          // 0 = K, 1 = V
+    const uint lane      = gl_LocalInvocationID.x;     // 0..127
 
-    if (token >= p.n_tokens || d >= p.HS) {
-        return;
-    }
+    if (token >= p.n_tokens) { return; }
+    const uint N_QBLK = p.HS / 128u;
+    const uint kv_head = y_idx / N_QBLK;
+    const uint qb      = y_idx % N_QBLK;
+    const uint d       = qb * 128u + lane;
+    if (d >= p.HS) { return; }
 
     const int slot = slot_mapping[token];
-    if (slot < 0) {
-        return;                                  // padding token
-    }
-
+    if (slot < 0) { return; }                          // padding token
     const uint paged_block = uint(slot) / p.BS;
     const uint tok         = uint(slot) % p.BS;
 
-    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
     const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
-
     if (kv_select == 0u) {
-        const float kval = float(k_cur[src]);
-        pa_k_store(pa_k_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), kval);
+        pa_k_store(pa_k_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), float(k_cur[src]));
     } else {
-        const float vval = float(v_cur[src]);
-        pa_v_store(pa_v_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), vval);
+        pa_v_store(pa_v_off(paged_block, kv_head, p.n_kv_heads, tok, d, p.HS, p.BS), float(v_cur[src]));
     }
 }
 #endif // DATA_A_F16

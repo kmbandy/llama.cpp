@@ -506,6 +506,24 @@ int main() {
         }
     }
 
+    // ── head_dim 256 (N_QBLK=2): turbo4_0 + F16, prefill + decode ───────────────
+    {
+        const paged_case p256t { 256, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_0 };
+        all_ok = compare_paged_case("paged turbo4_0 hd256 prefill", p256t, vk, cuda, 5e-2) && all_ok;
+        all_ok = scatter_turbo4_readback(p256t, vk) && all_ok;          // exercises N_QBLK=2 scatter
+        const paged_case p256f { 256, 8, 2, 16, 32, 32, 1, GGML_TYPE_F16 };
+        all_ok = compare_paged_case("paged f16 hd256 prefill", p256f, vk, cuda, 2e-3) && all_ok;
+        for (int ctx : { 128, 512 }) {                                  // decode, multi-chunk reduce
+            char lt[64], lf[64];
+            snprintf(lt, sizeof lt, "paged turbo4_0 hd256 decode ctx=%d", ctx);
+            snprintf(lf, sizeof lf, "paged f16 hd256 decode ctx=%d", ctx);
+            const paged_case dt { 256, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_0 };
+            const paged_case df { 256, 8, 2, 16, 1, ctx, 1, GGML_TYPE_F16 };
+            all_ok = compare_paged_case(lt, dt, vk, cuda, 5e-2) && all_ok;
+            all_ok = compare_paged_case(lf, df, vk, cuda, 2e-3) && all_ok;
+        }
+    }
+
     ggml_backend_free(vk);
     ggml_backend_free(cuda);
 

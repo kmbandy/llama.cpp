@@ -10058,11 +10058,14 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     vk_subbuffer dst_buf          = ggml_vk_tensor_subbuffer(ctx, dst);
 
     // Phase 1: scatter K_cur/V_cur into the paged cache.
-    // grid = { n_tokens, n_kv_heads, 2 } (z selects K vs V).
+    // grid = { n_tokens, n_kv_heads * n_qblk, 2 } (z selects K vs V; y fans out
+    // per 128-element quant-block so head_dim multiples of 128 are supported).
+    const uint32_t qblk_elems = 128u;                       // turbo4_0 / F16 (Task 4: 64 for turbo4_64)
+    const uint32_t n_qblk     = head_size / qblk_elems;     // head_dim is a multiple of qblk_elems
     const vk_op_paged_scatter_pc scatter_pc = { head_size, block_size, n_kv_heads, n_tokens };
     ggml_vk_dispatch_pipeline(ctx, subctx, scatter_pipeline,
         { slot_mapping_buf, k_cur_buf, v_cur_buf, k_cache_buf, v_cache_buf },
-        scatter_pc, { n_tokens, n_kv_heads, 2 });
+        scatter_pc, { n_tokens, n_kv_heads * n_qblk, 2 });
 
     // Barrier so attention reads the freshly scattered cache.
     ggml_vk_sync_buffers(ctx, subctx);
@@ -17011,7 +17014,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // head_dim and block_size constraints (cache layout assumptions).
-                if (q->ne[0] != 128) {
+                if (q->ne[0] % 128 != 0 || (q->ne[0] / 128) > 8 /*MAX_VEC*/) {
                     return false;
                 }
                 const int32_t block_size = ((const int32_t *)op->op_params)[1];
