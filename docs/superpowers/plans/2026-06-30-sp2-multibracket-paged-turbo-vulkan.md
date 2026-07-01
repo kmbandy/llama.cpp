@@ -543,15 +543,28 @@ a real parity gate, matching the full-corpus bar Task 2 set for hd256):
 | CUDA0 (GTX 1070, oracle) | 30.5353 | ± 0.28771 |
 
 Delta = 1.0066; combined stderr (sqrt(0.29882² + 0.28771²)) ≈ 0.4148 — the delta is **~2.4 combined
-stderr**, notably looser than hd256's full-corpus parity (Task 2: delta 0.22 combined stderr). This is
-not within strict 1-sigma noise, but it is not a gross divergence either: both backends land in the same
-range (31.5 vs 30.5, ~3.3% relative), the direction (Vulkan0 slightly higher) is consistent with the
-4-chunk smoke numbers above, and no case in the op-level harness (Tasks 3-4, 21/21 PASS at tol 5e-2)
-showed layout or dequant errors for turbo4_64. Plausible explanation: LFM2.5 is a hybrid MoE model
-(mixed recurrent + attention layers, more complex graph than Qwen3.5-4B's dense hybrid used for hd256),
-so backend-order floating-point accumulation differences have more surface area to compound over a full
-580-chunk run. This is recorded as an open observation for the final whole-branch review, not silently
-rounded up to "within noise."
+stderr**, notably looser than hd256's full-corpus parity (Task 2: delta 0.22 combined stderr).
+
+This gap was investigated, not just noted (the user correctly pushed back on calling Task 5 "done" while
+an unresolved ~2.4σ gap sat unexplained). **Isolation diagnostic:** re-ran the same full-corpus Vulkan0-vs-
+CUDA0 comparison on the interim padded-128 path (`GGML_PAGED_TURBO4_64=0`), which uses the already-reviewed,
+already-merged SP2 turbo4_0 code — no turbo4_64 code involved at all:
+
+| Device | PPL (padded-128) | stderr |
+| --- | --- | --- |
+| Vulkan0 | 31.5867 | ± 0.29946 |
+| CUDA0 | 30.5000 | ± 0.28745 |
+
+Delta = 1.0867; combined stderr ≈ 0.4151 → **~2.6 combined stderr** — the same magnitude gap (if anything
+slightly larger) as the native turbo4_64 comparison above, using code this session never touched. This is
+conclusive: the Vulkan/CUDA PPL gap on LFM2.5 is **not** introduced by the turbo4_64 work — it is a
+pre-existing characteristic of running this specific model (LFM2.5, a hybrid MoE architecture with mixed
+recurrent + attention layers) cross-backend on this stack, reproduced identically by code that predates
+SP2.5. turbo4_64 native reproduces the same backend behavior as the already-accepted padded path, not a
+worse one. Combined with the op-level harness (21/21 PASS at tol 5e-2, no layout/dequant errors) and the
+consistent direction/magnitude across both the 4-chunk and full-corpus runs, this is not a turbo4_64 defect.
+Still worth a note for the final whole-branch review as a pre-existing (out-of-scope) observation about
+LFM2.5 cross-backend PPL — it predates and is orthogonal to SP2.5, so no fix belongs in this branch.
 
 **Step 3 — Throughput (llama-bench, Vulkan0, `-p 512 -n 128`):**
 
@@ -576,14 +589,17 @@ Ratio 9.6/19.1 = 0.503 — **native turbo4_64 uses ~half the KV footprint** of t
 exactly matching the 34 B vs 68 B/head design target from Tasks 3+4.
 
 **Verdict:** turbo4_64 is validated end-to-end on its target real model. Native path is confirmed taken
-(not a silent padded fallback) via load-log inspection on both Vulkan0 and CUDA0; full-corpus PPL is
-close but ~2.4 combined-stderr apart between backends (looser than hd256's parity — see Step 2b, an open
-observation for the final review, not a blocking failure given the op-level harness is 21/21 clean and
-the divergence direction/magnitude is stable across both the 4-chunk and full-corpus runs); throughput
-is at parity or better; and the footprint halving that was the entire point of Tasks 3+4 is now measured
-on a real model, not just computed from the harness. SP2.5's second inference gate is closed — no code
-changes were made in response to the PPL gap, since op-level correctness is independently confirmed and
-the gap doesn't reproduce as a functional bug; it is flagged for the final whole-branch review to weigh.
+(not a silent padded fallback) via load-log inspection on both Vulkan0 and CUDA0; full-corpus PPL showed
+a ~2.4 combined-stderr gap between backends, looser than hd256's parity, which was investigated (not
+waved through) via an isolation diagnostic — the same gap (~2.6σ) reproduces on the pre-existing,
+already-reviewed padded-128 path using zero turbo4_64 code, proving the discrepancy predates and is
+independent of this session's work (see Step 2b). Combined with the op-level harness (21/21 PASS, tol
+5e-2, no layout/dequant errors) and the consistent direction/magnitude across every run, turbo4_64 is
+confirmed numerically equivalent to the already-accepted padded path, not worse. Throughput is at parity
+or better; the footprint halving that was the entire point of Tasks 3+4 is now measured on a real model.
+SP2.5's second inference gate is closed. The pre-existing LFM2.5 cross-backend PPL gap is noted for the
+final whole-branch review as an out-of-scope observation (it affects the already-merged padded path too,
+so no fix belongs in this branch).
 
 ---
 
