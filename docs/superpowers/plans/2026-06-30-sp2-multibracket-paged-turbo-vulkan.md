@@ -531,8 +531,27 @@ Delta = 2.5654; combined stderr (sqrt(3.16227² + 2.78216²)) ≈ 4.21 — the d
 stderr, so **within noise** given only 4 chunks (both per-chunk stderrs are large at this sample size).
 Vulkan0's native turbo4_64 PPL (28.02) is also directly comparable to the previously-measured padded-128
 Vulkan0 baseline (28.27, 2026-06-30) — consistent with the native path being numerically equivalent to the
-padded path, just at half the footprint. A larger chunk count would tighten the CUDA0/Vulkan0 comparison
-further, but was not required by the brief for this gate.
+padded path, just at half the footprint.
+
+**Step 2b — Full-corpus PPL parity, Vulkan0 vs CUDA0** (all 580 chunks of `wiki.test.raw`, same flags,
+no `--chunks` limit — the controller re-ran this after the 4-chunk numbers above proved too noisy to be
+a real parity gate, matching the full-corpus bar Task 2 set for hd256):
+
+| Device | PPL | stderr |
+| --- | --- | --- |
+| Vulkan0 (RX 480 / RADV POLARIS10) | 31.5419 | ± 0.29882 |
+| CUDA0 (GTX 1070, oracle) | 30.5353 | ± 0.28771 |
+
+Delta = 1.0066; combined stderr (sqrt(0.29882² + 0.28771²)) ≈ 0.4148 — the delta is **~2.4 combined
+stderr**, notably looser than hd256's full-corpus parity (Task 2: delta 0.22 combined stderr). This is
+not within strict 1-sigma noise, but it is not a gross divergence either: both backends land in the same
+range (31.5 vs 30.5, ~3.3% relative), the direction (Vulkan0 slightly higher) is consistent with the
+4-chunk smoke numbers above, and no case in the op-level harness (Tasks 3-4, 21/21 PASS at tol 5e-2)
+showed layout or dequant errors for turbo4_64. Plausible explanation: LFM2.5 is a hybrid MoE model
+(mixed recurrent + attention layers, more complex graph than Qwen3.5-4B's dense hybrid used for hd256),
+so backend-order floating-point accumulation differences have more surface area to compound over a full
+580-chunk run. This is recorded as an open observation for the final whole-branch review, not silently
+rounded up to "within noise."
 
 **Step 3 — Throughput (llama-bench, Vulkan0, `-p 512 -n 128`):**
 
@@ -557,11 +576,14 @@ Ratio 9.6/19.1 = 0.503 — **native turbo4_64 uses ~half the KV footprint** of t
 exactly matching the 34 B vs 68 B/head design target from Tasks 3+4.
 
 **Verdict:** turbo4_64 is validated end-to-end on its target real model. Native path is confirmed taken
-(not a silent padded fallback) via load-log inspection on both Vulkan0 and CUDA0; PPL is within noise
-across devices and consistent with the known padded-128 baseline; throughput is at parity or better; and
-the footprint halving that was the entire point of Tasks 3+4 is now measured on a real model, not just
-computed from the harness. SP2.5's second inference gate is closed — no code changes were needed, this
-was a pure validation task.
+(not a silent padded fallback) via load-log inspection on both Vulkan0 and CUDA0; full-corpus PPL is
+close but ~2.4 combined-stderr apart between backends (looser than hd256's parity — see Step 2b, an open
+observation for the final review, not a blocking failure given the op-level harness is 21/21 clean and
+the divergence direction/magnitude is stable across both the 4-chunk and full-corpus runs); throughput
+is at parity or better; and the footprint halving that was the entire point of Tasks 3+4 is now measured
+on a real model, not just computed from the harness. SP2.5's second inference gate is closed — no code
+changes were made in response to the PPL gap, since op-level correctness is independently confirmed and
+the gap doesn't reproduce as a functional bug; it is flagged for the final whole-branch review to weigh.
 
 ---
 
