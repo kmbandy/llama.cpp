@@ -125,6 +125,9 @@
 .ifndef DSWS2_CONV
   .set DSWS2_CONV, 0        // 0 = pre-conversion static substrate (Phase A green); 1 = Phase B
 .endif
+.ifndef DSWS2_TICKET_SELFTEST
+  .set DSWS2_TICKET_SELFTEST, 0   // DIAG-only try_gate single-winner smoke (Task 4 Step 3); default 0 = no bytes
+.endif
 .set SNAP_BASE,      (INITFLAG_OFF + 4)         // u32[6]: [parity*3 + {0:nC,1:nA,2:nB}] role-mix snapshots
 .set QUIESCE_CNT_OFF,(SNAP_BASE + 6*4)          // u32 role-agnostic bail counter
 .set DSWS2_STATE_END,(QUIESCE_CNT_OFF + 4)
@@ -386,6 +389,76 @@
     s_min_u32  s61, s60, \dst_b              // cons_b = min(clock, prod_b)
     s_sub_u32  \dst_b, \dst_b, s61           // occ_B  = prod_b - cons_b   in [0,FN]
 .endm
+
+// --------------------------------------------------------------------------------------------
+//  Phase-B controller thresholds + sum-envelope budget (Task 4). EPOCH_SHIFT mirrors coop /
+//  occ_dispatch (epoch = segcnt >> EPOCH_SHIFT). BUDGET is the per-WG VGPR sum-envelope ceiling
+//  the reservation counter must never exceed; default = the launch reservation, which makes the
+//  envelope a strict conservation law (a feed->compute grow can only fit if a compute->feed shrink
+//  already freed the delta). Task 5 may re-tune via `-defsym BUDGET=` if per-SIMD headroom exists.
+// --------------------------------------------------------------------------------------------
+.ifndef EPOCH_SHIFT
+  .set EPOCH_SHIFT, 3        // decision clock: epoch = segcnt >> EPOCH_SHIFT (small = reactive)
+.endif
+.ifndef BUDGET
+  .set BUDGET, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)   // = VRESV_OFF init (conservation ceiling)
+.endif
+
+// try_gate: the lock-free single-winner conversion ticket (transcribed VERBATIM from occ_kernel_coop.s,
+//   which transcribes dsws_ctrl_model.cpp gate_try_win + epoch_of EXACTLY). E = segcnt>>EPOCH_SHIFT.
+//   gate[dir] holds the last epoch dir fired. Among many waves racing the same (g<E), exactly ONE wins
+//   per epoch via the LDS compare-swap; the rest see g advanced. \swin <- 1 iff THIS wave won the
+//   (dir,epoch) ticket, else 0. Read-only on state besides gate[dir]; NO role actuation here (Task 5
+//   acts on \swin). Scratch: s62..s65 (free at the Task-5 occ_sample->try_gate->reserve_try point --
+//   occ_sample's s62/s63 result is consumed into `dir` BEFORE this runs), v5/v6/v7 (<=v15: pre-grow /
+//   lean-safe). CAS operand order (gfx1201, GCN order -- NOT flipped, KG 9ed04f3c):
+//   ds_cmpstore_rtn_b32 vdst,vaddr,vNEW,vCMP -> MEM=(MEM==vCMP)?vNEW:MEM, vdst<-old. So vsrc0=E (new),
+//   vsrc1=g (compare). WIN iff returned-old == g. (Swapping them leaves gate stuck so old==g for ALL
+//   racers -> every racer "wins" -> would-win ~= NCOMP*epochs instead of ~= epochs.)
+.macro try_gate dir, swin
+    lds_get s62, SEGCNT_OFF                    // E = epoch_of(segcnt, EPOCH_SHIFT)
+    s_lshr_b32 s62, s62, EPOCH_SHIFT
+    lds_get s63, (GATE_OFF + (\dir)*4)         // g = gate[dir]
+    s_mov_b32 \swin, 0
+    s_cmp_ge_u32 s63, s62                       // g >= E -> dir already fired this/later epoch -> lose
+    s_cbranch_scc1 .Ltg_done\@
+    s_mov_b32 s65, exec_lo                      // lane0-only CAS (one ticket attempt per WAVE)
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Ltg_restore\@
+    v_mov_b32 v5, (GATE_OFF + (\dir)*4)        // vaddr = &gate[dir]
+    v_mov_b32 v6, s63                           // v6 = g  (vsrc1 = CMP/expected)
+    v_mov_b32 v7, s62                           // v7 = E  (vsrc0 = NEW value to store)
+    ds_cmpstore_rtn_b32 v6, v5, v7, v6          // gate[dir] = (gate[dir]==g) ? E : gate[dir]; v6 <- old
+    s_wait_dscnt 0x0
+.Ltg_restore\@:
+    s_mov_b32 exec_lo, s65
+    v_readfirstlane_b32 s64, v6                 // s64 = old (lane0's CAS result, broadcast)
+    s_cmp_eq_u32 s64, s63                        // WIN iff old == g (we were the swapper)
+    s_cbranch_scc0 .Ltg_done\@
+    s_mov_b32 \swin, 1
+.Ltg_done\@:
+.endm
+
+// reserve_try: the VGPR sum-envelope reservation (transcribes reserve_grow, dsws_ctrl_model.cpp:47).
+//   Reserve first (atomic add of SIGNED \delta on vgpr_reserved), then validate prev+delta <= BUDGET;
+//   on over-budget cleanly UNDO (atomic add of -\delta) and reject. The LDS atomic serializes the <=2
+//   concurrent grows an epoch permits: the second to validate sees the first's reservation and backs off.
+//     GROW  (feed->compute): pass \delta = +(NFV-VLEAN). Over-budget -> undo, \won=0 (stay in role).
+//     SHRINK(compute->feed): pass \delta = -(NFV-VLEAN). new = prev+delta < prev <= BUDGET, so the
+//                            validate branch is a proven no-op -> \won=1 ALWAYS (shrink never fails).
+//   One macro, one call site (Task 5 `reserve_try delta, s_ok`); direction is the sign of \delta.
+//   Scratch: s62/s63 (free at the bail-commit point -- try_gate's s62..s65 are long dead by then).
+.macro reserve_try delta, won
+    lds_fetch_add s62, VRESV_OFF, (\delta)     // s62 = prev reserved; vgpr_reserved += delta
+    s_add_u32 s63, s62, (\delta)               // s63 = new reservation = prev + delta
+    s_mov_b32 \won, 1
+    s_cmp_le_u32 s63, BUDGET                    // new <= BUDGET -> commit (win); shrink always passes
+    s_cbranch_scc1 .Lrt_done\@
+    lds_fetch_add s62, VRESV_OFF, -(\delta)    // over-budget: undo the reservation, reject
+    s_mov_b32 \won, 0
+.Lrt_done\@:
+.endm
 .endif
 
 // ============================================================================================
@@ -434,6 +507,24 @@ occ_kernel:
     v_readfirstlane_b32 s24, v1               // wid (uniform per wave)
     s_cmp_eq_u32 s24, 0
     s_cbranch_scc1 .Lclaimer
+.if DSWS2_CONV && DIAG && DSWS2_TICKET_SELFTEST
+    // Task 4 Step 3 -- try_gate single-winner SMOKE (assemble-only stub; default off). Every non-claimer
+    //   wave races the (dir=0) ticket ONCE and atomic-adds its win (0/1) into occ[28] (byte offset 112,
+    //   clear of the 0/20/24/104/108 control+probe words). On GPU (Task 6, if enabled) the sum should land
+    //   near #epochs, NOT NCOMP*#epochs -- the harness-side proof the LDS-CAS yields <=1 winner/(dir,epoch).
+    //   v4=0 (set in prologue), v2=lane; try_gate temps v5/v6/v7 are <=v15 (pre-grow safe). wid (s24)
+    //   survives -- try_gate touches only s62..s65 / s16. NOTE: pre-init-rendezvous placement -> a real run
+    //   reads gate/segcnt before the claimer publishes them; fine for an assemble/smoke stub.
+    try_gate 0, s50
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_mov_b32 s16, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Ltg_selftest_skip
+    v_mov_b32 v5, s50                          // win flag (0/1) for THIS wave
+    global_atomic_add_u32 v4, v5, s[0:1] offset:112 scope:SCOPE_DEV   // occ[28] += win
+.Ltg_selftest_skip:
+    s_mov_b32 exec_lo, s16
+.endif
     s_cmp_lt_u32 s24, NBFEED
     s_cbranch_scc1 .Lbfeed
     s_cmp_lt_u32 s24, (NBFEED+NAFEED)
