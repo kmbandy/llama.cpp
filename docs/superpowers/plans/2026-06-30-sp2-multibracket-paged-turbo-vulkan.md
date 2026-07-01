@@ -601,9 +601,9 @@ SP2.5's second inference gate is closed. The pre-existing LFM2.5 cross-backend P
 final whole-branch review as an out-of-scope observation (it affects the already-merged padded path too,
 so no fix belongs in this branch).
 
-**Post-Task-5 investigation (in progress, not concluded as of 2026-06-30 night):** the user pushed back on
-filing the PPL gap as a passive footnote, so it was actively root-caused rather than left as "not our
-problem." Findings so far, most to least specific:
+**Post-Task-5 investigation (CONCLUDED 2026-06-30 night):** the user pushed back on filing the PPL gap as
+a passive footnote, so it was actively root-caused rather than left as "not our problem." Findings, most
+to least specific:
 
 1. Not turbo4_64-specific: the already-merged padded-128 path (zero turbo4_64 code) shows the same
    magnitude gap (~2.6σ) as turbo4_64 native (~2.4σ) — see Step 2b above.
@@ -627,21 +627,36 @@ problem." Findings so far, most to least specific:
    attention distribution) correlates with the paged-attention-specific gap and is the leading hypothesis,
    but is not yet proven as causal.
 
-**Two remaining candidate explanations, undistinguished:** (a) a genuine paged-attention wiring bug that
-specifically manifests with LFM2.5's sparse-attention hybrid shape, or (b) the same per-op numerical noise
-floor (~5e-2 op-level tolerance) simply has outsized leverage on final PPL when only 6 layers "shape" the
-output instead of 33. Distinguishing them needs per-layer tensor-dump instrumentation comparing Vulkan0 vs
-CUDA0 output at each of LFM2.5's 6 attention layers on a short deterministic prompt.
+6. **Per-layer tensor-dump result (resolves the investigation):** a diagnostic tool
+   (`examples/pagedattn-dump/pagedattn-dump.cpp`, using `cb_eval`/`ggml_backend_sched_set_eval_callback` to
+   dump `GGML_OP_PAGED_ATTN_MT`'s output tensor per attention-layer invocation) was built and run on both
+   Vulkan0 and CUDA0 against LFM2.5 with a single 16-token deterministic prefill. Result — **layer 0 already
+   diverges by rel_L2 0.152 (15.2%)**, three to four orders of magnitude above the op-level harness noise
+   floor (1e-6 to 5e-4, tol 5e-2). Divergence then grows roughly monotonically across the 6 attention layers
+   (0.152 → 0.244 → 0.297 → 0.322 → 0.376 → 0.452), tripling by layer 5. Full data and analysis in
+   `.superpowers/sdd/paged-attn-layer-divergence-report.md`.
 
-**Status at session end:** a diagnostic tool for this (`examples/pagedattn-dump/pagedattn-dump.cpp`,
-uses `cb_eval`/`ggml_backend_sched_set_eval_callback` to dump the paged-attn op's output tensor per layer)
-was written by a background implementer but **not yet built or run** — no report exists yet. This is
-genuinely unresolved investigative work, not blocking SP2.5's completion (the op-level harness is clean
-and both paged variants are proven numerically equivalent to each other), but it should NOT be silently
-dropped. **NEXT SESSION: resume this investigation** — build `examples/pagedattn-dump` via the capped
-wrapper (`WITH_CUDA=1 bash build-vk.sh pagedattn-dump`), run on Vulkan0 and CUDA0 with LFM2.5, diff the
-6 per-layer dumps, and determine which of hypotheses (a)/(b) holds. This work is currently UNCOMMITTED
-(`examples/pagedattn-dump/` untracked, `examples/CMakeLists.txt` modified) — review before committing;
+**Conclusion:** hypothesis (a), not (b) — this is a **real wiring/config bug**, not noise-floor leverage.
+A clean op (op-level harness passes at 1e-6–5e-4) cannot produce 15.2% divergence at the very first
+invocation from noise alone; the discrepancy is present from layer 0, before any of the 18 recurrent
+layers have had a chance to compound anything. The leading candidate mechanism (not yet proven at the
+line level) is how LFM2.5's per-layer `attention.head_count_kv` array — non-zero only for 6/24 layers,
+zero elsewhere — is consumed when constructing the paged-attn op's inputs or block-table indexing,
+contrasted with Qwen3.5-4B's uniform scalar `head_count_kv` (attention on all 33 layers, tight 0.22σ
+parity). The layer-to-layer growth is a secondary, smaller effect consistent with the layer-0 error
+propagating through the residual stream at each subsequent attention layer, not an independent cause.
+
+**Status:** root cause narrowed to "real bug, LFM2.5-hybrid-specific, in paged-attn's per-layer
+head_count_kv handling" with high confidence, but the exact faulty line has not yet been located. This is
+correctly out of scope for SP2.5 itself (op-level harness is clean; both paged variants — turbo4_64 and
+the pre-existing padded-128 path — are proven numerically equivalent to *each other*, so nothing in this
+branch's own work regressed or needs fixing) but must be filed as a real, confirmed bug for follow-up —
+not a hand-wave. **NEXT SESSION / FOLLOW-UP:** file this as a tracked bug (LFM2.5/hybrid-model paged-attn
+divergence, root-caused in `.superpowers/sdd/paged-attn-layer-divergence-report.md`) and, when picked up,
+locate the exact head_count_kv-array consumption site in the paged-attn op's Vulkan and/or host-side
+setup code that treats LFM2.5's sparse layer array differently from a uniform scalar. The diagnostic tool
+and its output remain UNCOMMITTED (`examples/pagedattn-dump/` untracked, `examples/CMakeLists.txt`
+modified) — review before committing;
 it is separate from the CUDA WIP files and safe to stage once verified.
 
 ---
