@@ -44,14 +44,18 @@ parity-doubled {nC,nA,nB}), `QUIESCE_CNT_OFF=96`.
 
 ## 1. Architecture
 
-Under `DSWS2_CONV=1` the workgroup becomes a **lean-start pool of `N_POOL`
-waves** (empirically-tuned defsym, 12–16 range), all launched at `VLEAN=32`.
-wid-0 is the claimer. A seed subset grows to fat compute at init; the remainder
-are lean A-feed / B-feed. Role lives entirely in the scalar `s59`, and a single
-dispatcher routes every wave — at entry and after every terminal bail — to the
-code for the role `s59` names. Waves rebalance by growing into / shedding VGPR
-budget (bounded by `reserve_try`/`BUDGET`), **never** by forking, merging, or
-parking.
+Under `DSWS2_CONV=1` every wave launches lean at `VLEAN=32` (already Phase-A
+behavior — compute grows to `NFV` per-rowblk on demand and shrinks back; nothing
+launches fat). The launched wave count *is* the pool size (`WAVES` = the mix
+sum). wid-0 is the claimer. Each non-claimer wave is **seeded** with its launch
+role by writing `s59` in the existing wid partition — **no launch-time grow**.
+Role lives entirely in `s59`, and a single dispatcher routes every wave — at
+entry and after every terminal bail — to the code for the role `s59` names.
+Waves rebalance by growing into / shedding VGPR budget (bounded by
+`reserve_try`/`BUDGET`), **never** by forking, merging, or parking. Scaling the
+launched wave count above the current mix sum (the 12–16-wave "bigger pool" for a
+larger feed multiplier) is a follow-on requiring an `occ_dispatch` dims change;
+the mechanism is proven first as role rebalancing *within* the launched mix.
 
 **Wave-count invariant (the hardware truth):** the launched wave count is fixed
 for the kernel's life; `s_alloc_vgpr` resizes *one existing wave*, it does not
@@ -117,35 +121,27 @@ unified per-epoch dispatch loop that collapses the three `_follow` bodies
 
 ---
 
-## 3. Launch & init (lean-start pool)
+## 3. Launch & init (seed the lean partition)
 
-All `N_POOL` waves `s_alloc_vgpr 32` at entry (already the case for feeds and
-claimer; new for compute). wid-0 → claimer (lean, stages B as today).
+Every wave already `s_alloc_vgpr 32` at entry (feeds, claimer, **and** compute —
+compute grows to `NFV` per-rowblk inside its loop and shrinks back). wid-0 →
+claimer. So launch/init is unchanged from Phase A except one addition:
 
-**Seed assignment by wid** (under `DSWS2_CONV`), replacing the fat-launch
-partition:
+**Seed `s59` by wid** (under `DSWS2_CONV`), in the *existing* partition arms —
+`[0,NBFEED)` → B-feed, `[NBFEED,NBFEED+NAFEED)` → A-feed, rest → compute — each
+arm gains a single `s_mov_b32 s59, <slot>` and then falls into `.Ldispatch`.
+**No launch-time `s_alloc_vgpr`** (compute's footprint is handled per-rowblk as
+today). There are no `N_POOL`/`SEED_*` defsyms: the launched mix
+`NCOMP/NAFEED/NBFEED` *is* the seed and its sum *is* the pool size.
 
-- wid-0 → claimer.
-- first `SEED_NCOMP` non-claimer wids → `s59 = NCOMP_SLOT`, grow to `NFV`.
-- next `SEED_NAFEED` wids → `s59 = NAFEED_SLOT` (stay lean).
-- remaining wids → `s59 = NBFEED_SLOT` (stay lean).
+**Defsyms:**
 
-Then every wave falls into `.Ldispatch`.
-
-**Defsyms (all empirically tuned, principled defaults):**
-
-- `N_POOL` — total launched waves (harness dims must match). Default: the
-  feed-heaviest useful count for the target shapes; start 12, sweep. Hard
-  constraint: `N_POOL × VLEAN ≤ BUDGET` (every wave always fits lean → no
-  parking ever needed).
-- `SEED_NCOMP / SEED_NAFEED / SEED_NBFEED` — launch seed mix. Default: the
-  shape's static-best guess (e.g. the current `4c2a2b` scaled to the pool).
-  `SEED_NCOMP ≥ 1` (compute floor at launch).
-- `BUDGET` — the real per-SIMD VGPR ceiling (headroom for growth), **not** the
-  zero-headroom launch-footprint default Task 5 inherited. This is the knob that
-  makes feed→compute grows able to succeed. Validated by the RGA live-VGPR gate
-  and a real dispatch — never a guessed constant.
-- `VRESV` seed = `SEED_NCOMP*NFV + (SEED_NAFEED+SEED_NBFEED)*VLEAN` (the live
+- `BUDGET` — retuned to the real per-SIMD VGPR ceiling (headroom for growth),
+  **not** the zero-headroom launch-footprint default Task 5 inherited. This is
+  the knob that makes feed→compute grows able to succeed. Validated by the RGA
+  live-VGPR gate and a real dispatch — never a guessed constant. Compile-time
+  no-parking invariant: `WAVES × VLEAN ≤ BUDGET` (every wave always fits lean).
+- `VRESV` seed = `NCOMP*NFV + (NAFEED+NBFEED)*VLEAN` (unchanged; the live
   reservation the economy adjusts from).
 
 ---
@@ -213,11 +209,9 @@ silicon.
   footprint already correctly sized (`conv_apply` closed its grow window before
   the bump) and no pending grow.
 - **`conv_apply`'s `s_alloc_vgpr` grow** is unchanged from Task 5's audit: waves
-  are lean-32 at every bail, every pre-grow LDS/atomic temp ≤ v15.
-- **One new grow site — seed-compute growing at launch init.** Cold path before
-  any LDS racing, structurally identical to Phase-A compute's per-rowblk grow and
-  equally lean-on-entry. Must carry the same pre-grow comment block and the
-  ≤ v15 discipline.
+  are lean-32 at every bail, every pre-grow LDS/atomic temp ≤ v15. **This is the
+  only GROW in the design** — seeding adds none (compute's per-rowblk grow is the
+  existing, already-audited Phase-A path).
 
 ---
 
@@ -260,9 +254,10 @@ auto-advance.
 
 ## 9. Open parameters (resolved during implementation, not guessed)
 
-- `N_POOL`, `SEED_*`, `BUDGET`, `K` — all empirically tuned defsyms with the
-  principled defaults in §3–§4; final values set by RGA + real-dispatch
-  measurement on the target ml8 shapes, not chosen a priori.
+- `BUDGET`, `K` — empirically tuned defsyms with the principled defaults in
+  §3–§4; final values set by RGA + real-dispatch measurement on the target ml8
+  shapes, not chosen a priori. (No `N_POOL`/`SEED_*`: pool size == launched mix
+  sum, seed == launch partition — see §3 correction.)
 - Persistent-scalar assignment for the cooldown counter (must sit outside
   `s60–s65` and every macro's clobber set; candidates alongside `s57/s58/s59`) —
   fixed at implementation time against the live register map.
