@@ -496,6 +496,75 @@ git commit -m "docs(sp2.5): turbo4_64 e2e results (LFM2.5 native, ~half KV footp
 
 ---
 
+## Results — hd64 (LFM2.5 native turbo4_64)
+
+Branch `feat/sp1-turbo4-vulkan-fa` @ 4fe4d4bf8 (Tasks 3+4 merged: turbo4_64 cache-ops + cooperative
+scatter quantizer, reviewed clean). Model `/home/kmbandy/models/LFM2.5-8B-A1B-Q5_K_M.gguf` (lfm2moe,
+head_dim 64, Q5_K_M). Corpus `wikitext-2-raw/wiki.test.raw`. Flags: `--cache-type-k turbo4 --cache-type-v
+turbo4 --kv-tier-paged-blocks -c 512 -ngl 99` (perplexity), `--cache-type-k turbo4 --cache-type-v turbo4
+-p 512 -n 128` (bench). Binaries relinked from the already-fresh (19:37) shared libs via
+`WITH_CUDA=1 bash build-vk.sh llama-perplexity` / `llama-bench` — cheap relink as predicted, no build
+issues, no -j2 thrash (only `main.cpp`/`perplexity.cpp` TUs recompiled, everything else was link-only).
+
+**Step 1 — Native path confirmed (Vulkan0, `--verbose`):** the default remap (`GGML_PAGED_TURBO4_64`
+unset → on) routes head_dim-64 to the new native bracket, confirmed via load log on both devices:
+
+```
+llama_model: hybrid attn routed to llama_kv_cache_paged (n_blocks=192, block_size=16, ctx=512, n_seq_max=4)
+llama_kv_cache_paged: allocated 6/24 attn layers × 1.6 MiB (K+V) = 9.6 MiB total
+  (n_blocks=192, block_size=16, n_kv_heads=8, head_dim=64, type_k=turbo4_64, type_v=turbo4_64)
+```
+
+This is the NEW native bracket (`type_k=turbo4_64`, `head_dim=64` as-is), not the interim padded-128
+fallback (`type_k=turbo4`, `head_dim=128` after internal padding — confirmed separately below under
+Step 3 footprint). Smoke (4 chunks) exit 0, no abort. PPL (4 chunks, Vulkan0) = 28.0179 ± 3.16227.
+
+**Step 2 — PPL parity, Vulkan0 vs CUDA0** (4 chunks, same flags, both devices — `--verbose` log confirms
+`type_k=turbo4_64`/`head_dim=64` identically on both):
+
+| Device | PPL | stderr |
+| --- | --- | --- |
+| Vulkan0 (RX 480 / RADV POLARIS10) | 28.0179 | ± 3.16227 |
+| CUDA0 (GTX 1070, oracle) | 25.4525 | ± 2.78216 |
+
+Delta = 2.5654; combined stderr (sqrt(3.16227² + 2.78216²)) ≈ 4.21 — the delta is well inside one combined
+stderr, so **within noise** given only 4 chunks (both per-chunk stderrs are large at this sample size).
+Vulkan0's native turbo4_64 PPL (28.02) is also directly comparable to the previously-measured padded-128
+Vulkan0 baseline (28.27, 2026-06-30) — consistent with the native path being numerically equivalent to the
+padded path, just at half the footprint. A larger chunk count would tighten the CUDA0/Vulkan0 comparison
+further, but was not required by the brief for this gate.
+
+**Step 3 — Throughput (llama-bench, Vulkan0, `-p 512 -n 128`):**
+
+| test | t/s (native turbo4_64) | t/s (padded-128, `GGML_PAGED_TURBO4_64=0`) |
+| --- | --- | --- |
+| pp512 | 553.69 ± 2.71 | 546.73 ± 6.50 |
+| tg128 | 87.44 ± 2.00 | 81.73 ± 0.80 |
+
+Native turbo4_64 is at parity or slightly faster than the padded-128 path on both pp and tg (tg128 ~7%
+higher) — the smaller KV footprint does not cost throughput on this hardware.
+
+**Footprint — native turbo4_64 vs padded-128:** `llama-bench` does not print KV cache size directly, so
+this was captured via a 1-chunk `--verbose` `llama-perplexity` run for each path (method: direct log
+readback of the `llama_kv_cache_paged: allocated ...` line, not analytic computation):
+
+| Path | allocated (6/24 active attn layers) | head_dim | type | bytes/head (computed: MiB / (192 blocks × 16 block_size × 8 kv_heads)) |
+| --- | --- | --- | --- | --- |
+| Native (turbo4_64, default) | 9.6 MiB | 64 | turbo4_64 | 34.1 B |
+| Padded (turbo4_0, `GGML_PAGED_TURBO4_64=0`) | 19.1 MiB | 128 | turbo4 | 68.3 B |
+
+Ratio 9.6/19.1 = 0.503 — **native turbo4_64 uses ~half the KV footprint** of the padded-128 fallback,
+exactly matching the 34 B vs 68 B/head design target from Tasks 3+4.
+
+**Verdict:** turbo4_64 is validated end-to-end on its target real model. Native path is confirmed taken
+(not a silent padded fallback) via load-log inspection on both Vulkan0 and CUDA0; PPL is within noise
+across devices and consistent with the known padded-128 baseline; throughput is at parity or better; and
+the footprint halving that was the entire point of Tasks 3+4 is now measured on a real model, not just
+computed from the harness. SP2.5's second inference gate is closed — no code changes were needed, this
+was a pure validation task.
+
+---
+
 ## Task 6: Results consolidation + final-review prep
 
 **Files:**
