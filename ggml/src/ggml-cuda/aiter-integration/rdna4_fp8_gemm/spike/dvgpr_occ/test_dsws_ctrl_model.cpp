@@ -46,6 +46,41 @@ int main() {
     assert(r.load() == 90);                    // exactly the 3 winners' reservations remain
   }
 
+  // ---- snapshot/quiesce (Phase B Decision 1) ----
+  {
+    // snapshot freezes the counts used to size the quiesce sentinels
+    WgSnap s = snapshot_counts(4, 2, 2);           // G=6, FN=4
+    // not ready: rowblk short of G + nC terminal bails
+    assert(!quiesce_ready(6 + 3, 4 + 2, 6 + 2, s, 6, 4));  // rowblk 9 < 6+4
+    // ready: every counter reached threshold + snapshot bails
+    assert( quiesce_ready(6 + 4, 4 + 2, 6 + 2, s, 6, 4));
+    // a moved partition (3c3a2b) needs different sentinels; old snapshot is wrong high
+    WgSnap s2 = snapshot_counts(3, 3, 2);                  // sentinels: rowblk>=9, bfrag>=6, arow>=9
+    assert( quiesce_ready(6 + 3, 4 + 2, 6 + 3, s2, 6, 4)); // 9,6,9 all meet -> ready
+    assert(!quiesce_ready(6 + 3, 4 + 2, 6 + 2, s2, 6, 4)); // arow 8 < 9 -> NOT ready
+    // N-1 cross-check agrees at the ready point (N=8 -> 7 bails)
+    assert( quiesce_ready_nm1(7, 8));
+    assert(!quiesce_ready_nm1(6, 8));
+  }
+
+  {
+    // Under any interleaving of N-1 bails, quiesce_ready_nm1 must not fire before the last bail.
+    for (uint32_t trial = 0; trial < 64; ++trial) {
+      std::atomic<uint32_t> cnt{0};
+      std::atomic<bool> early{false};
+      std::vector<std::thread> ts;
+      const uint32_t N = 8;
+      for (uint32_t w = 0; w < N - 1; ++w)
+        ts.emplace_back([&]{
+          if (quiesce_ready_nm1(cnt.load(), N)) early.store(true); // read BEFORE our bump
+          cnt.fetch_add(1, std::memory_order_acq_rel);
+        });
+      for (auto& t : ts) t.join();
+      assert(!early.load());               // never ready with a bail still outstanding
+      assert(quiesce_ready_nm1(cnt.load(), N)); // ready once all N-1 landed
+    }
+  }
+
   printf("dsws_ctrl_model: ALL PASS\n");
   return 0;
 }

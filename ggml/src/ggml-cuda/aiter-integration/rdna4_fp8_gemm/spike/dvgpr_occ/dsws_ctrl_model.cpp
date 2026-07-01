@@ -52,3 +52,24 @@ static inline bool reserve_grow(std::atomic<uint32_t>& resv, uint32_t delta, uin
     }
     return true;
 }
+
+struct WgSnap { uint32_t nC, nA, nB; };
+
+static inline WgSnap snapshot_counts(uint32_t nC, uint32_t nA, uint32_t nB) {
+    return WgSnap{nC, nA, nB};
+}
+
+// Sentinels = work-threshold + snapshot role-count terminal bails (Phase A arithmetic,
+// with compile-time constants replaced by the per-epoch snapshot).
+static inline bool quiesce_ready(uint32_t rowblk_next, uint32_t bfrag_next,
+                                 uint32_t arow_next, const WgSnap& s,
+                                 uint32_t G, uint32_t FN) {
+    return rowblk_next >= (G  + s.nC)
+        && bfrag_next  >= (FN + s.nB)
+        && arow_next   >= (G  + s.nA);
+}
+
+// Role-agnostic safety net: fixed N waves, wid0 claimer never bails -> exactly N-1 bails.
+static inline bool quiesce_ready_nm1(uint32_t quiesce_cnt, uint32_t N) {
+    return quiesce_cnt >= (N - 1);
+}
