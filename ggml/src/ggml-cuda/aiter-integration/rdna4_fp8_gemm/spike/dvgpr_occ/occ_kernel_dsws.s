@@ -459,6 +459,103 @@
     s_mov_b32 \won, 0
 .Lrt_done\@:
 .endm
+
+// --------------------------------------------------------------------------------------------
+//  Phase-B (Task 5) watermark thresholds + LDS put-runtime helper + bail-time commit macros.
+//  Watermark decision (SPEC; mirrors coop CTRL_LOW/CTRL_HIGH, occ_dispatch DSWS_LOW/HIGH):
+//    occ_X < CTRL_LOW  -> compute STARVED for X  -> shrink a compute wave into feed-X.
+//    occ_X > CTRL_HIGH_X -> feed-X OVER-SERVING  -> grow a feed-X wave into compute.
+//  occ_A in [0,G], occ_B in [0,FN] (occ_sample bounds), so the HIGH marks are per-ring-depth.
+// --------------------------------------------------------------------------------------------
+.ifndef CTRL_LOW
+  .set CTRL_LOW, 1                             // occ_X < 1 (== 0, ring empty at consume) -> starved
+.endif
+.ifndef CTRL_HIGH_A
+  .set CTRL_HIGH_A, (G-1)                      // occ_A > G-1 -> A-ring saturated -> A-feed over-serving
+.endif
+.ifndef CTRL_HIGH_B
+  .set CTRL_HIGH_B, (FN-1)                     // occ_B > FN-1 -> B-ring saturated -> B-feed over-serving
+.endif
+
+// lds_put_r: lane-0-of-wave write scalar \ssrc -> LDS[\saddr] (RUNTIME byte offset in a sreg). Mirrors
+//   the coop lds_put_v idiom but takes a SCALAR address (symmetry with lds_get_r). Used by the claimer's
+//   Step-4 snapshot write into the runtime parity half of SNAP_BASE. Temps RP_A/RP_D are v11/v14 (<=v15,
+//   pre-grow safe); s49 is the exec save (matches lds_put).
+.macro lds_put_r saddr, ssrc
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lputr_skip\@
+    v_mov_b32 v[RP_A], \saddr
+    v_mov_b32 v[RP_D], \ssrc
+    ds_store_b32 v[RP_A], v[RP_D]
+    s_wait_dscnt 0x0
+.Lputr_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+
+// conv_dec_floor: floor-guarded ATOMIC decrement of a role slot -- \ok <- 1 iff it decremented \slot_off
+//   (only when the current value was > 1), else 0 (floor hit; source role must keep >= 1 wave). A
+//   ds_cmpstore_rtn_b32 CAS loop (re-reads on a lost race), so two same-source converters in one epoch
+//   (e.g. compute->Afeed and compute->Bfeed both dec NCOMP_SLOT) can never drive the slot below 1.
+//   Clob: s52 (read value), s53 (new/CAS-return), s65 (exec save); v5/v6/v7 (<=v15, pre-grow safe).
+.macro conv_dec_floor slot_off, ok
+    s_mov_b32 \ok, 0
+.Lcdf_retry\@:
+    lds_get s52, \slot_off                     // s52 = current source-slot count
+    s_cmp_le_u32 s52, 1
+    s_cbranch_scc1 .Lcdf_done\@                 // <=1 -> at floor, cannot convert away (ok stays 0)
+    s_sub_u32 s53, s52, 1                       // new = old - 1
+    s_mov_b32 s65, exec_lo                      // lane0-only CAS (one attempt per WAVE)
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lcdf_restore\@
+    v_mov_b32 v5, \slot_off                     // vaddr = &slot
+    v_mov_b32 v6, s52                           // v6 = expected old (CMP)
+    v_mov_b32 v7, s53                           // v7 = new value (NEW)
+    ds_cmpstore_rtn_b32 v6, v5, v7, v6          // slot = (slot==old)? new : slot ; v6 <- prior
+    s_wait_dscnt 0x0
+.Lcdf_restore\@:
+    s_mov_b32 exec_lo, s65
+    v_readfirstlane_b32 s53, v6                 // s53 = prior (lane0 CAS result, broadcast)
+    s_cmp_eq_u32 s53, s52                        // success iff prior == expected (we were the swapper)
+    s_cbranch_scc0 .Lcdf_retry\@                // lost the race -> re-read and retry
+    s_mov_b32 \ok, 1
+.Lcdf_done\@:
+.endm
+
+// conv_apply: the bail-time role-conversion COMMIT (SPEC 3.4 Approach A). Precondition: s58 = s_win
+//   (1 iff this wave won the (dir,epoch) ticket). Ordered strictly BEFORE the QUIESCE_CNT bump the
+//   CALLER emits after this macro (the quiesce counter is the snapshot handshake).
+//     ORDER: (a) floor-guarded dec of \src_slot -> (b) reserve the VGPR sum-envelope \delta (shrink
+//     always ok; grow may abort over BUDGET) -> (c) on ok: inc \dst_slot, flip private role reg (s59),
+//     s_alloc_vgpr \alloc_sz (GROW=NFV feed->compute / SHRINK=32 compute->feed) with SCC-retry ->
+//     (d) on floor-fail or reserve-abort: cancel, remain current role (undo the source dec if a
+//     reservation abort happened after the dec).
+//   PRE-GROW OOR WINDOW (SPEC 4, #1 brick risk): the wave is lean-32 on entry; every LDS/atomic temp
+//   read before the s_alloc_vgpr GROW is <=v15 (occ_sample/try_gate v5/v6/v7 + v11/v14; conv_dec_floor
+//   v5/v6/v7; lds_fetch_add v11/v14) and every carried scalar is <=s65. NO >v15 source before GROW.
+//   Clob: s52,s53,s54 (+ conv_dec_floor / reserve_try scratch); s59 = new role slot id (record).
+.macro conv_apply src_slot, dst_slot, delta, alloc_sz
+    s_cmp_eq_u32 s58, 0
+    s_cbranch_scc1 .Lca_skip\@                  // lost the ticket -> no conversion this bail
+    conv_dec_floor \src_slot, s54               // (a) floor-guarded atomic dec of source slot
+    s_cmp_eq_u32 s54, 0
+    s_cbranch_scc1 .Lca_skip\@                  // floor-fail (source at 1) -> cancel, remain current role
+    reserve_try (\delta), s53                   // (b) reserve VGPR envelope (grow may abort; shrink ok)
+    s_cmp_eq_u32 s53, 0
+    s_cbranch_scc0 .Lca_commit\@
+    lds_fetch_add s52, \src_slot, 1             // (d) reserve aborted: UNDO the source dec, cancel
+    s_branch .Lca_skip\@
+.Lca_commit\@:
+    lds_fetch_add s52, \dst_slot, 1             // (c) inc dest slot (unbounded -> plain atomic add)
+    s_mov_b32 s59, \dst_slot                    //     flip private current-role reg (records new role slot id)
+    // ---- s_alloc_vgpr resize: THE pre-grow OOR window closes here; all reads above were <=v15 ----
+.Lca_alloc\@:
+    s_alloc_vgpr \alloc_sz                       // GROW(NFV) / SHRINK(32); SCC-retry (brick-class rule)
+    s_cbranch_scc0 .Lca_alloc\@
+.Lca_skip\@:
+.endm
 .endif
 
 // ============================================================================================
@@ -622,6 +719,24 @@ occ_kernel:
     lds_get s44, EPOCH_OFF                      // ...then bump EPOCH LAST
     s_add_u32 s44, s44, 1
     s_mov_b32 s35, s44
+.if DSWS2_CONV
+    // ---- Step 4 (SPEC 3.4 decision 1): snapshot the LIVE role mix into the NEXT epoch's parity half of
+    //   SNAP_BASE, and reset QUIESCE_CNT, BEFORE the epoch bump below (which is published LAST). Followers
+    //   and the claimer's own wait-done for THIS super-tile then size their quiesce sentinels from
+    //   parity(newEpoch) -- so the quiesce counter is the snapshot handshake (Step 3 reads it). ----
+    s_and_b32 s46, s44, 1                        // parity(newEpoch)
+    s_mul_i32 s46, s46, 12                       // parity*12 (3-word half) -- matches SNAP_BASE comment
+    s_add_u32 s46, s46, SNAP_BASE                // s46 = byte offset of parity half
+    lds_get s47, NCOMP_SLOT
+    lds_put_r s46, s47                           // snap.nC = live NCOMP_SLOT
+    s_add_u32 s46, s46, 4
+    lds_get s47, NAFEED_SLOT
+    lds_put_r s46, s47                           // snap.nA = live NAFEED_SLOT
+    s_add_u32 s46, s46, 4
+    lds_get s47, NBFEED_SLOT
+    lds_put_r s46, s47                           // snap.nB = live NBFEED_SLOT
+    lds_put QUIESCE_CNT_OFF, 0                    // reset the per-super-tile bail counter
+.endif
     lds_put EPOCH_OFF, s44
     BSTAGE                                      // claimer helps stage B for this super-tile (s30,s31)
     // A7 advance gate: free resident A/B only when ALL G rowblks are computed+flushed
@@ -662,6 +777,65 @@ occ_kernel:
     //   decode/resident state (round-table finding #1). Sentinels = threshold + #role-waves (each does
     //   exactly one terminal bail). NOTE: compile-time NCOMP/NAFEED/NBFEED is correct for STATIC roles;
     //   Phase-B conversion must switch these to live role counts / epoch-snapshot drained counters.
+.if DSWS2_CONV
+    // ---- Step 3 (SPEC 3.4 decision 1): size the three claim-counter sentinels from THIS epoch's parity
+    //   snapshot (live role mix written at broadcast, Step 4) instead of compile-time NCOMP/NAFEED/NBFEED,
+    //   so conversions re-tune the quiesce thresholds. A SEPARATE QUIESCE_CNT >= WAVES-1 cross-check is the
+    //   DIAG safety net; under DIAG a mismatch between the two is flagged to occ[29] (byte 116). ----
+    lds_get s45, EPOCH_OFF
+    s_and_b32 s45, s45, 1                        // parity(thisEpoch)
+    s_mul_i32 s45, s45, 12                       // parity*12 (3-word half)
+    s_add_u32 s45, s45, SNAP_BASE
+    lds_get_r s46, s45                           // snap.nC
+    s_add_u32 s45, s45, 4
+    lds_get_r s47, s45                           // snap.nA
+    s_add_u32 s45, s45, 4
+    lds_get_r s48, s45                           // snap.nB
+    s_add_u32 s46, s46, G                        // thr_rowblk = G + snap.nC
+    s_add_u32 s47, s47, G                        // thr_arow   = G + snap.nA
+    s_add_u32 s48, s48, FN                       // thr_bfrag  = FN + snap.nB
+    // sentinels_done (s50) = (ROWBLK_NEXT>=thr_rowblk) & (BFRAG_NEXT>=thr_bfrag) & (AROW_NEXT>=thr_arow)
+    s_mov_b32 s50, 1
+    lds_get s44, ROWBLK_NEXT_OFF
+    s_cmp_lt_u32 s44, s46
+    s_cbranch_scc0 .Lqc_rb_ok
+    s_mov_b32 s50, 0
+.Lqc_rb_ok:
+    lds_get s44, BFRAG_NEXT_OFF
+    s_cmp_lt_u32 s44, s48
+    s_cbranch_scc0 .Lqc_bf_ok
+    s_mov_b32 s50, 0
+.Lqc_bf_ok:
+    lds_get s44, AROW_NEXT_OFF
+    s_cmp_lt_u32 s44, s47
+    s_cbranch_scc0 .Lqc_ar_ok
+    s_mov_b32 s50, 0
+.Lqc_ar_ok:
+    // quiesce_done (s51) = QUIESCE_CNT >= WAVES-1  (each of the WAVES-1 non-claimer waves bumped once)
+    s_mov_b32 s51, 1
+    lds_get s44, QUIESCE_CNT_OFF
+    s_cmp_lt_u32 s44, (WAVES-1)
+    s_cbranch_scc0 .Lqc_q_ok
+    s_mov_b32 s51, 0
+.Lqc_q_ok:
+.if DIAG
+    // DIAG cross-check: the snapshot sentinels and the QUIESCE handshake must AGREE. Publish their XOR
+    //   (1 = mismatch) to occ[29] (byte 116; clear of occ[26]/27=104/108 Task3, occ[28]=112 Task4).
+    s_xor_b32 s52, s50, s51
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_mov_b32 s16, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lqc_diag_skip
+    v_mov_b32 v14, s52                           // v14 <= v15: pre-grow safe (claimer is lean-32 anyway)
+    global_store_b32 v4, v14, s[0:1] offset:116 scope:SCOPE_DEV   // occ[29] = quiesce/snapshot mismatch
+.Lqc_diag_skip:
+    s_mov_b32 exec_lo, s16
+.endif
+    // advance only when BOTH the snapshot sentinels AND the QUIESCE cross-check agree they are done
+    s_and_b32 s50, s50, s51
+    s_cmp_eq_u32 s50, 0
+    s_cbranch_scc1 .Lclaimer_wait_done
+.else
     lds_get s44, ROWBLK_NEXT_OFF                // G claims + NCOMP terminal bails
     s_cmp_lt_u32 s44, (G + NCOMP)
     s_cbranch_scc1 .Lclaimer_wait_done
@@ -671,6 +845,7 @@ occ_kernel:
     lds_get s44, AROW_NEXT_OFF                  // G claims + NAFEED terminal bails
     s_cmp_lt_u32 s44, (G + NAFEED)
     s_cbranch_scc1 .Lclaimer_wait_done
+.endif
     s_branch .Lclaim_loop
 .Lclaimer_terminal:
     lds_put STI_OFF, 0xFFFFFFFF                 // FIX 1(e): publish SENTINEL (not the raw over-claimed sti)...
@@ -714,6 +889,21 @@ occ_kernel:
     s_cbranch_scc1 .Lretire
     DECODE_STI                                   // s30=tcol s31=ksi (mblk unused)
     BSTAGE
+.if DSWS2_CONV
+    // ==== Phase-B decision (Step 1) + bail-time commit (Step 2), B-feed wave ====
+    //   Lean-32 -> PRE-GROW window (the feed->compute GROW closes it inside conv_apply, post all <=v15
+    //   reads). If the B-ring is OVER-SERVED (occ_B>CTRL_HIGH_B) grow one B-feed->compute (dir 3):
+    //   reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay B-feed).
+    s_mov_b32 s58, 0
+    occ_sample s55, s56                          // s55=occ_A, s56=occ_B
+    s_cmp_gt_u32 s56, CTRL_HIGH_B
+    s_cbranch_scc0 .Lbfeed_quiesce
+    s_mov_b32 s57, 3                             // dir 3: B-feed -> compute
+    try_gate 3, s58
+    conv_apply NBFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.Lbfeed_quiesce:
+    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+.endif
     s_branch .Lbfeed_follow
 
 // ============================================================================================
@@ -742,6 +932,22 @@ occ_kernel:
     s_cbranch_scc1 .Lretire
     DECODE_STI                                   // s19=mblk s31=ksi (tcol unused)
     ASTAGE
+.if DSWS2_CONV
+    // ==== Phase-B decision (Step 1) + bail-time commit (Step 2), A-feed wave ====
+    //   Wave is lean-32 here (feeds never grow), so this is a PRE-GROW window; the conversion GROW
+    //   (feed->compute, s_alloc_vgpr NFV) is the ONLY grow and closes the window inside conv_apply, after
+    //   all <=v15 LDS/atomic reads. If the A-ring is OVER-SERVED (occ_A>CTRL_HIGH_A) grow one A-feed->
+    //   compute (dir 2): reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay A-feed).
+    s_mov_b32 s58, 0
+    occ_sample s55, s56                          // s55=occ_A, s56=occ_B
+    s_cmp_gt_u32 s55, CTRL_HIGH_A
+    s_cbranch_scc0 .Lafeed_quiesce
+    s_mov_b32 s57, 2                             // dir 2: A-feed -> compute
+    try_gate 2, s58
+    conv_apply NAFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.Lafeed_quiesce:
+    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+.endif
     s_branch .Lafeed_follow
 
 // ============================================================================================
@@ -861,6 +1067,33 @@ occ_kernel:
     lds_inc ROWBLK_DONE_OFF                      // rowblk r computed + flushed (frees the A7 advance gate)
     s_branch .Lcompute_claim
 .Lcompute_drained:
+.if DSWS2_CONV
+    // ==== Phase-B role-boundary decision (Step 1) + bail-time commit (Step 2), compute wave ====
+    //   Wave is lean-32 here (the last claimed rowblk shrank to 32; a zero-claim drain never grew), so the
+    //   whole decision+commit runs in the PRE-GROW window -- every temp <=v15 / scalar <=s65 (see conv_apply
+    //   OOR note). If compute is STARVED for A (occ_A<CTRL_LOW) it converts one compute->A-feed (dir 0);
+    //   else if starved for B, compute->B-feed (dir 1). Both are SHRINKs: reserve delta -(NFV-VLEAN),
+    //   s_alloc_vgpr 32 (already lean -> no-op). Persistent: s57=dir, s58=s_win, s59=new-role (all outside
+    //   s60..s65 so occ_sample/try_gate/reserve_try/conv_* cannot clobber them while live).
+    s_mov_b32 s58, 0                             // s_win = 0 (default: raced no ticket)
+    occ_sample s55, s56                          // s55=occ_A in [0,G], s56=occ_B in [0,FN]  (clob s60,s61)
+    s_cmp_lt_u32 s55, CTRL_LOW
+    s_cbranch_scc0 .Lcmp_try_b
+    s_mov_b32 s57, 0                             // dir 0: compute -> A-feed
+    try_gate 0, s58                              // s58 = s_win (single-winner per (dir,epoch))
+    conv_apply NCOMP_SLOT, NAFEED_SLOT, -(NFV-VLEAN), 32
+    s_branch .Lcmp_quiesce
+.Lcmp_try_b:
+    s_cmp_lt_u32 s56, CTRL_LOW
+    s_cbranch_scc0 .Lcmp_quiesce
+    s_mov_b32 s57, 1                             // dir 1: compute -> B-feed
+    try_gate 1, s58
+    conv_apply NCOMP_SLOT, NBFEED_SLOT, -(NFV-VLEAN), 32
+.Lcmp_quiesce:
+    // ORDERING (SPEC 3.4 decision 2): the commit above fully completed (role-slot CAS + reservation +
+    //   s_alloc_vgpr) BEFORE this QUIESCE_CNT bump -- the bump is the snapshot handshake the claimer reads.
+    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // exactly one bump per non-claimer wave / super-tile
+.endif
     s_branch .Lcompute_follow                    // this super-tile's compute drained -> re-check epoch/terminal
 
 // ---- A7 role-agnostic terminal (followers): retire. (Claimer retires via .Lclaimer_terminal.) ----

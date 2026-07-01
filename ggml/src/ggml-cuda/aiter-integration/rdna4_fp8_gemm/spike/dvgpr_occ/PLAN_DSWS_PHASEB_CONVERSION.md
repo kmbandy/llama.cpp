@@ -64,9 +64,9 @@ The claimer already publishes `NCOMP/NAFEED/NBFEED_SLOT`, `GATE_OFF[4]=0`, `VRES
     // ready: every counter reached threshold + snapshot bails
     assert( quiesce_ready(6 + 4, 4 + 2, 6 + 2, s, 6, 4));
     // a moved partition (3c3a2b) needs different sentinels; old snapshot is wrong high
-    WgSnap s2 = snapshot_counts(3, 3, 2);
-    assert( quiesce_ready(6 + 3, 4 + 2, 6 + 3, s2, 6, 4));
-    assert(!quiesce_ready(6 + 4, 4 + 2, 6 + 3, s2, 6, 4) == false); // 6+4>=6+3 ok -> ready; sanity
+    WgSnap s2 = snapshot_counts(3, 3, 2);                  // sentinels: rowblk>=9, bfrag>=6, arow>=9
+    assert( quiesce_ready(6 + 3, 4 + 2, 6 + 3, s2, 6, 4)); // 9,6,9 all meet -> ready
+    assert(!quiesce_ready(6 + 3, 4 + 2, 6 + 2, s2, 6, 4)); // arow 8 < 9 -> NOT ready
     // N-1 cross-check agrees at the ready point (N=8 -> 7 bails)
     assert( quiesce_ready_nm1(7, 8));
     assert(!quiesce_ready_nm1(6, 8));
