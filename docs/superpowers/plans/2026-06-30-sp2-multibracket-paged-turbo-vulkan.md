@@ -601,6 +601,49 @@ SP2.5's second inference gate is closed. The pre-existing LFM2.5 cross-backend P
 final whole-branch review as an out-of-scope observation (it affects the already-merged padded path too,
 so no fix belongs in this branch).
 
+**Post-Task-5 investigation (in progress, not concluded as of 2026-06-30 night):** the user pushed back on
+filing the PPL gap as a passive footnote, so it was actively root-caused rather than left as "not our
+problem." Findings so far, most to least specific:
+
+1. Not turbo4_64-specific: the already-merged padded-128 path (zero turbo4_64 code) shows the same
+   magnitude gap (~2.6σ) as turbo4_64 native (~2.4σ) — see Step 2b above.
+2. **Paged-attention itself is implicated**: LFM2.5 with the default *non-paged* f16 KV cache (no
+   `--kv-tier-paged-blocks` at all) shows tight parity (delta 0.3705, combined stderr 0.4416 → **~0.84σ**),
+   vs ~2.4-2.6σ for both paged variants. This rules out the earlier "hybrid MoE models are just noisier"
+   hand-wave — the gap requires paged-attention specifically.
+3. `n_seq_max=4` confirmed identical between the LFM2.5 (this task) and Qwen3.5-4B (Task 2, tight
+   0.22σ parity) perplexity runs — rules out sequence-count/multi-seq batching as the variable.
+4. MAD-288 (a previously-solved CUDA graph-capture corruption bug on `GGML_OP_PAGED_ATTN_MT`, fixed in a
+   *different* worktree `~/GitHub/llama-gpu`/`gpu-portability`) was checked and ruled out: that fix was
+   never ported to this branch (`ggml_cuda_can_use_cuda_graph` has no `PAGED_ATTN_MT` exclusion here), but
+   CUDA graphs are architecturally disabled below Ampere (`ggml-cuda.cu:4828`, `cc < GGML_CUDA_CC_AMPERE`)
+   — the GTX 1070 is Pascal/cc 6.1, so the graph-capture mechanism cannot fire on this hardware regardless.
+   (The missing exclusion is still worth porting separately for future Ampere+ GPU safety — unrelated to
+   this branch's scope.)
+5. GGUF metadata comparison: LFM2.5 has 24 layers with `attention.head_count_kv` as a **per-layer array**,
+   mostly zero — only 6/24 layers (~25%) are attention, the rest recurrent/conv passthrough. Qwen3.5-4B has
+   33 layers with `attention.head_count_kv` as a **single uniform scalar** — attention present on every
+   layer (even though it also carries SSM parameters). This structural difference (sparse vs uniform
+   attention distribution) correlates with the paged-attention-specific gap and is the leading hypothesis,
+   but is not yet proven as causal.
+
+**Two remaining candidate explanations, undistinguished:** (a) a genuine paged-attention wiring bug that
+specifically manifests with LFM2.5's sparse-attention hybrid shape, or (b) the same per-op numerical noise
+floor (~5e-2 op-level tolerance) simply has outsized leverage on final PPL when only 6 layers "shape" the
+output instead of 33. Distinguishing them needs per-layer tensor-dump instrumentation comparing Vulkan0 vs
+CUDA0 output at each of LFM2.5's 6 attention layers on a short deterministic prompt.
+
+**Status at session end:** a diagnostic tool for this (`examples/pagedattn-dump/pagedattn-dump.cpp`,
+uses `cb_eval`/`ggml_backend_sched_set_eval_callback` to dump the paged-attn op's output tensor per layer)
+was written by a background implementer but **not yet built or run** — no report exists yet. This is
+genuinely unresolved investigative work, not blocking SP2.5's completion (the op-level harness is clean
+and both paged variants are proven numerically equivalent to each other), but it should NOT be silently
+dropped. **NEXT SESSION: resume this investigation** — build `examples/pagedattn-dump` via the capped
+wrapper (`WITH_CUDA=1 bash build-vk.sh pagedattn-dump`), run on Vulkan0 and CUDA0 with LFM2.5, diff the
+6 per-layer dumps, and determine which of hypotheses (a)/(b) holds. This work is currently UNCOMMITTED
+(`examples/pagedattn-dump/` untracked, `examples/CMakeLists.txt` modified) — review before committing;
+it is separate from the CUDA WIP files and safe to stage once verified.
+
 ---
 
 ## Task 6: Results consolidation + final-review prep
