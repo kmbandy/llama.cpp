@@ -114,6 +114,20 @@
 .set BFRAG_DONE_OFF, 60     // B-frag STORE-completion counter (compute gates on this, NOT the claim ctr)
 .set AROW_DONE_OFF,  64     // A-rowblk STORE-completion counter (compute gates on this)
 .set INITFLAG_OFF,   68     // barrier-free LDS-init publish flag (claimer writes 0xACED LAST)
+// ---- Phase-B (DSWS2_CONV) control state: role-mix snapshot slots + quiesce counter ----
+//   Based at INITFLAG_OFF+4 (NOT the brief's SEGCNT_OFF+4): the brief predates the A3..A7 control
+//   words (BFRAG_DONE/AROW_DONE/INITFLAG at 60/64/68), so SEGCNT_OFF+4=60 would collide with them.
+//   Basing after the LAST control word keeps the new state inside the 0..255 control gap BELOW the
+//   fixed resident region (BRES_OFF=256), so NO resident-region repoint is needed -- the resident
+//   BRES_OFF/ARES_OFF immediates (emitted unconditionally in the kernel body) stay untouched, which
+//   is what keeps the DSWS2_CONV=0 binary byte-identical to the Phase-A green bin. All `.set`s here
+//   are inert (emit no bytes); the only new code (claimer init) is gated under `.if DSWS2_CONV`.
+.ifndef DSWS2_CONV
+  .set DSWS2_CONV, 0        // 0 = pre-conversion static substrate (Phase A green); 1 = Phase B
+.endif
+.set SNAP_BASE,      (INITFLAG_OFF + 4)         // u32[6]: [parity*3 + {0:nC,1:nA,2:nB}] role-mix snapshots
+.set QUIESCE_CNT_OFF,(SNAP_BASE + 6*4)          // u32 role-agnostic bail counter
+.set DSWS2_STATE_END,(QUIESCE_CNT_OFF + 4)
 .set KSEG_STEPS,     (SEGK/16)             // K16-steps per split-K segment = SEGK K-elements / 16
 // FIX 1(b): NKSEG_SHIFT = log2(KSEG_STEPS), so the prologue can derive n_kseg = KT >> NKSEG_SHIFT instead
 //   of receiving it as a (now-dropped) kernarg. SEGK is always a power-of-two multiple of 16 in every
@@ -140,6 +154,10 @@
 .set LDS_TOTAL_DSWS2, (ARES_OFF + ARES_BYTES)
 .if LDS_TOTAL_DSWS2 > 32768
   .error "DSWS2 LDS layout exceeds 32768B group segment"
+.endif
+// Phase-B state must fit in the control gap below the resident region (inert compile check, no bytes).
+.if DSWS2_STATE_END > BRES_OFF
+  .error "DSWS2 Phase-B state (SNAP_BASE/QUIESCE_CNT) overlaps resident B region (BRES_OFF)"
 .endif
 
 .if DSWS2
@@ -430,6 +448,17 @@ occ_kernel:
     lds_put (GATE_OFF+12), 0
     lds_put VRESV_OFF, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)
     lds_put SEGCNT_OFF, 0
+.if DSWS2_CONV
+    // Phase-B: seed BOTH epoch-parity role-mix snapshots with the launch mix, zero the quiesce counter.
+    // Gated so DSWS2_CONV=0 emits ZERO new bytes -> byte-identical to the Phase-A green bin.
+    lds_put QUIESCE_CNT_OFF, 0
+    lds_put (SNAP_BASE + 0), NCOMP     // parity-0 snapshot = launch mix
+    lds_put (SNAP_BASE + 4), NAFEED
+    lds_put (SNAP_BASE + 8), NBFEED
+    lds_put (SNAP_BASE + 12), NCOMP    // parity-1 = launch mix too (init)
+    lds_put (SNAP_BASE + 16), NAFEED
+    lds_put (SNAP_BASE + 20), NBFEED
+.endif
     lds_put INITFLAG_OFF, 0xACED               // LAST: publishes "LDS ready" to all follower waves
     // FIX 1(e): load this dispatch's chunk terminal bound from occ[24] (host writes occW[6] per chunk;
     //   FIX 1j on the host side). All lanes read the same address -> no exec masking needed, just a
