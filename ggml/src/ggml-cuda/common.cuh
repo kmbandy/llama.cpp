@@ -302,7 +302,9 @@ static bool fp16_available(const int cc) {
 }
 
 static bool fast_fp16_available(const int cc) {
-    return GGML_CUDA_CC_IS_AMD(cc) ||
+    // DIAG(temp): gfx803/Polaris (GCN4) fp16 ALU is not truly full-rate/clean; force the
+    // fp32-accumulation kernel paths there to test the accumulated-precision-margin theory.
+    return (GGML_CUDA_CC_IS_AMD(cc) && !(GGML_CUDA_CC_IS_GCN(cc) && cc <= GGML_CUDA_CC_GCN4)) ||
         (GGML_CUDA_CC_IS_NVIDIA(cc) && fp16_available(cc) && ggml_cuda_highest_compiled_arch(cc) != 610) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && fp16_available(cc));
 }

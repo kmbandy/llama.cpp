@@ -95,9 +95,8 @@ static int get_paged_decode_mode() {
 
 // ───────────────────────── helpers ─────────────────────────
 
-// Warp-level reduce across 32 lanes (HIP wavefront is 64 on some
-// GPUs but ggml-cuda's WARP_SIZE is fixed at 32 — works correctly on
-// gfx1xxx because __shfl_xor_sync over the active mask).
+// Warp-level reduce across 32 lanes. HIP wavefronts can be 64 lanes, while
+// ggml-cuda's WARP_SIZE is fixed at 32, so every shuffle is width-scoped.
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v) {
 #pragma unroll
@@ -373,7 +372,7 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
     {
         float v_sq = x[j] * x[j];
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
     }
@@ -431,7 +430,7 @@ __global__ void mt_scatter_kv_turbo4_0_kernel(
         const float c = TURBO_CENTROIDS_4BIT[idx];
         float rc = c * c;
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
     }
@@ -505,7 +504,7 @@ __global__ void mt_scatter_kv_turbo4_64_kernel(
     {
         float v_sq = x[j] * x[j];
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
     }
@@ -540,7 +539,7 @@ __global__ void mt_scatter_kv_turbo4_64_kernel(
         const float c = TURBO_CENTROIDS_4BIT[idx];
         float rc = c * c;
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
     }
