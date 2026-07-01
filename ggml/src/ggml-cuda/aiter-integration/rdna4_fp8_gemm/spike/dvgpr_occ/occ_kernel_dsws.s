@@ -354,6 +354,41 @@
 .endm
 
 // ============================================================================================
+//  Phase-B (DSWS2_CONV) consume-point ring-occupancy sensor -- Task 3, READ-ONLY (actuation is Task 5).
+//   Mirrors the coop occ_a/occ_b sensor (occ = producer - consumer, sampled where the value is
+//   CONSUMED, not at the segment boundary). The claimer's A7 wait-done spin runs CONCURRENTLY with the
+//   compute drain, so it observes the ring mid-flight; at the segment boundary the resident region has
+//   fully drained and occ would read a stuck ~0 (permanent false-starvation) -- exactly what SPEC warns.
+//
+//   COUNTER IDENTITIES (confirmed against the live claim/consume sites -- see report):
+//     producer = the STORE-completion counters the compute wave actually gates on:
+//                  A-ring: AROW_DONE_OFF   (A rowblks resident, monotonic in [0,G]; lds_inc @ ASTAGE)
+//                  B-ring: BFRAG_DONE_OFF  (B frags   resident, monotonic in [0,FN]; lds_inc @ BSTAGE)
+//                NOT the *_NEXT claim counters: AROW_NEXT/BFRAG_NEXT overshoot the ring depth by the role
+//                terminal-bails (G+NAFEED / FN+NBFEED), which would break the occ <= depth bound.
+//     consumer = ROWBLK_NEXT_OFF, the compute rowblk-claim clock (consume progress through the super-tile:
+//                each claimed rowblk r consumes A(r) and re-reads all FN shared B frags).
+//     min-clamp: cons is clamped to prod before the subtract so the u32 result cannot underflow when the
+//                consume clock outruns a shallower ring (G=6 > FN=4 -> ROWBLK_NEXT can exceed BFRAG_DONE).
+//   INVARIANT preserved: occ_A in [0,G], occ_B in [0,FN]  (nonnegative, bounded by ring depth).
+//
+//   REGISTER DISCIPLINE (brick-critical; this path is reachable pre-grow -- a >v15 vector temp is
+//   OOR-poison under dyn-VGPR, SPEC S4): scalars <= s65 only (s60/s61 scratch; callers pass dst in
+//   [s62,s65]); the only vector temps are inside lds_get, which uses v11/v14 (INTERIOR to the launch
+//   16-VGPR block) -- NO >v15 temp is introduced here.
+.if DSWS2_CONV
+.macro occ_sample dst_a, dst_b               // out: \dst_a=occ_A in [0,G], \dst_b=occ_B in [0,FN]; clob s60,s61
+    lds_get \dst_a, AROW_DONE_OFF            // prod_a: A rowblks resident (store-completion)
+    lds_get \dst_b, BFRAG_DONE_OFF           // prod_b: B frags   resident (store-completion)
+    lds_get s60,    ROWBLK_NEXT_OFF          // cons  : compute rowblk-claim consume clock
+    s_min_u32  s61, s60, \dst_a              // cons_a = min(clock, prod_a)  (clamp -> no u32 underflow)
+    s_sub_u32  \dst_a, \dst_a, s61           // occ_A  = prod_a - cons_a   in [0,G]
+    s_min_u32  s61, s60, \dst_b              // cons_b = min(clock, prod_b)
+    s_sub_u32  \dst_b, \dst_b, s61           // occ_B  = prod_b - cons_b   in [0,FN]
+.endm
+.endif
+
+// ============================================================================================
 //  KERNEL
 // ============================================================================================
     .text
@@ -501,6 +536,26 @@ occ_kernel:
     // A7 advance gate: free resident A/B only when ALL G rowblks are computed+flushed
 .Lclaimer_wait_done:
     s_sleep SLEEPN
+.if DSWS2_CONV
+.if DIAG
+    // Phase-B DIAG probe (Task 3): wid 0 samples the LIVE ring occupancy (compute is mid-drain here)
+    //   and publishes the last-sampled occ_A/occ_B so a GPU run can confirm the sensor OSCILLATES
+    //   rather than reading a stuck 0. Written every wait-done spin -> a live poller observes it vary.
+    //   Spare word-indexed slots occ[26]/occ[27] -> byte offsets 104/108 (well clear of the
+    //   byte-indexed control words occ[0]/occ[20]/occ[24]). READ-ONLY sensing, NO actuation.
+    occ_sample s62, s63
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_mov_b32 s16, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Locc_diag_skip
+    v_mov_b32 v14, s62                          // occ_A (v14 <= v15: pre-grow safe)
+    v_mov_b32 v15, s63                          // occ_B
+    global_store_b32 v4, v14, s[0:1] offset:104 scope:SCOPE_DEV   // occ[26] = last occ_A
+    global_store_b32 v4, v15, s[0:1] offset:108 scope:SCOPE_DEV   // occ[27] = last occ_B
+.Locc_diag_skip:
+    s_mov_b32 exec_lo, s16
+.endif
+.endif
     lds_get s44, ROWBLK_DONE_OFF                // (a) all G rowblks computed + flushed
     s_cmp_lt_u32 s44, G
     s_cbranch_scc1 .Lclaimer_wait_done
