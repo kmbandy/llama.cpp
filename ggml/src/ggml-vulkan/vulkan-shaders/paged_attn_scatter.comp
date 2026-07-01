@@ -14,13 +14,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
-#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64)
+#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64) || defined(DATA_A_Q8_0)
 #extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
 #extension GL_EXT_shader_8bit_storage                      : require
 #endif
 
 #ifdef DATA_A_TURBO4_64
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#elif defined(DATA_A_Q8_0)
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #else
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 #endif
@@ -58,6 +60,14 @@ struct block_turbo4_64 {
 };
 layout (binding = 3)           buffer KCache  { block_turbo4_64 data_k[]; };
 layout (binding = 4)           buffer VCache  { block_turbo4_64 data_v[]; };
+#endif
+#ifdef DATA_A_Q8_0
+struct block_q8_0 {
+    float16_t d;         // scale
+    int8_t    qs[32];    // signed 8-bit quantized values
+};
+layout (binding = 3)           buffer KCache  { block_q8_0 data_k[]; };
+layout (binding = 4)           buffer VCache  { block_q8_0 data_v[]; };
 #endif
 
 #include "paged_cache_ops.glsl"
@@ -312,3 +322,79 @@ void main() {
     }
 }
 #endif // DATA_A_TURBO4_64
+
+#ifdef DATA_A_Q8_0
+// Cooperative Q8_0 quantizer. Mirrors mt_scatter_kv_q8_0_kernel
+// (mt_pagedattn.cu:223-310): one workgroup per (token, kv_head*N_QBLK+qb, K/V),
+// 32 threads = one q8_0 block (one thread per element, matching CUDA's
+// one-warp-per-block design). Sequence: load -> per-block max(|x|) ->
+// scale = amax/127 -> round-to-nearest quantize. No Hadamard, no centroid
+// table, no norm-correction — a plain per-block affine (scale-only) quant.
+// wave64-safe: shared-memory tree reduction, no subgroup ops.
+shared float s_x[32];     // working values
+shared float s_red[32];   // tree-reduction scratch (max |x|)
+
+void main() {
+    const uint j         = gl_LocalInvocationID.x;   // 0..31, element within the q8_0 block
+    const uint token     = gl_WorkGroupID.x;         // global token index
+    const uint y_idx     = gl_WorkGroupID.y;         // kv_head*N_QBLK + qb
+    const uint kv_select = gl_WorkGroupID.z;         // 0 = K, 1 = V
+
+    if (token >= p.n_tokens) {
+        return;                                      // uniform across workgroup
+    }
+
+    const uint N_QBLK = p.HS / 32u;
+    const uint kv_head = y_idx / N_QBLK;
+    const uint qb      = y_idx % N_QBLK;
+
+    const int slot = slot_mapping[token];
+    if (slot < 0) {
+        return;                                      // padding token (uniform)
+    }
+
+    const uint paged_block = uint(slot) / p.BS;
+    const uint tok         = uint(slot) % p.BS;
+    const uint d           = qb * 32u + j;
+
+    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
+    const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
+    const float val = (kv_select == 0u) ? float(k_cur[src]) : float(v_cur[src]);
+
+    const uint block_ib = pa_q80_block_index(paged_block, kv_head, p.n_kv_heads, tok, qb, p.HS, p.BS);
+
+    // ---- Step 1: load into shared mem ----
+    s_x[j] = val;
+    barrier();
+
+    // ---- Step 2: parallel max(|x|) (5-stage binary tree) ----
+    s_red[j] = abs(s_x[j]);
+    barrier();
+    if (j < 16u) { s_red[j] = max(s_red[j], s_red[j + 16u]); } barrier();
+    if (j <  8u) { s_red[j] = max(s_red[j], s_red[j +  8u]); } barrier();
+    if (j <  4u) { s_red[j] = max(s_red[j], s_red[j +  4u]); } barrier();
+    if (j <  2u) { s_red[j] = max(s_red[j], s_red[j +  2u]); } barrier();
+    if (j <  1u) { s_red[j] = max(s_red[j], s_red[j +  1u]); } barrier();
+
+    const float scale     = s_red[0] / 127.0f;
+    const float inv_scale = (scale > 1e-10f) ? (1.0f / scale) : 0.0f;
+
+    // ---- Step 3: quantize (round-to-nearest, GLSL round() — symmetric at .5) ----
+    const int q = int(round(s_x[j] * inv_scale));
+
+    // ---- Step 4: thread 0 writes the per-block scale; every thread writes its qs byte ----
+    if (j == 0u) {
+        if (kv_select == 0u) {
+            data_k[block_ib].d = float16_t(scale);
+        } else {
+            data_v[block_ib].d = float16_t(scale);
+        }
+    }
+
+    if (kv_select == 0u) {
+        data_k[block_ib].qs[j] = int8_t(q);
+    } else {
+        data_v[block_ib].qs[j] = int8_t(q);
+    }
+}
+#endif // DATA_A_Q8_0

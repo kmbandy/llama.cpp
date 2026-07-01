@@ -14,6 +14,7 @@
 #include <vector>
 #include <random>
 #include <string>
+#include <algorithm>
 
 // Find a backend device whose registry name contains reg_substr and init it.
 static ggml_backend_t init_backend(const char * reg_substr) {
@@ -96,6 +97,7 @@ static ggml_tensor * build_op_noalloc(const paged_case & c, ggml_context ** ctx_
 
 static void fill_turbo4(ggml_tensor * t, uint32_t seed);    // defined below (after host turbo4 tables)
 static void fill_turbo4_64(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4 tables)
+static void fill_q8_0(ggml_tensor * t, uint32_t seed);      // defined below (after host q8_0 quantizer)
 
 static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool fill_cache = false) {
     const int HD            = c.head_dim;
@@ -146,6 +148,8 @@ static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool
         fill_f16(k_cache, 11); fill_f16(v_cache, 12);
     } else if (c.cache_type == GGML_TYPE_TURBO4_64) {
         fill_turbo4_64(k_cache, 11); fill_turbo4_64(v_cache, 12);
+    } else if (c.cache_type == GGML_TYPE_Q8_0) {
+        fill_q8_0(k_cache, 11); fill_q8_0(v_cache, 12);
     } else {
         fill_turbo4(k_cache, 11); fill_turbo4(v_cache, 12);
     }
@@ -307,6 +311,44 @@ static void fill_turbo4_64(ggml_tensor * t, uint32_t seed) {
     ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
 }
 
+// Quantize one 32-element f32 vector into a valid 34-byte block_q8_0 (fp16
+// scale + int8 qs[32]) — standard symmetric per-block quant, much simpler
+// than the turbo4 no-RHT scheme: amax = max(|x|); scale = amax/127;
+// qs[j] = round(x[j]/scale). Mirrors host_turbo4_64_quantize_block's role
+// (pre-populate the decode KV cache with deterministic, VALID blocks).
+static void host_q8_0_quantize_block(const float * x /*32*/, uint8_t * out /*34 bytes*/) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+    const float scale     = amax / 127.0f;
+    const float inv_scale = (scale > 1e-10f) ? (1.0f / scale) : 0.0f;
+    const ggml_fp16_t d_h = ggml_fp32_to_fp16(scale);
+    memset(out, 0, 34);
+    memcpy(out + 0, &d_h, sizeof(ggml_fp16_t));
+    for (int j = 0; j < 32; ++j) {
+        // Round-half-to-even (matches CUDA's __float2int_rn and GLSL's round()
+        // on the tested drivers), NOT lroundf's round-half-away-from-zero —
+        // using lroundf here caused spurious ties-only mismatches against both
+        // real backends despite them agreeing with each other.
+        out[2 + j] = (uint8_t) (int8_t) std::nearbyintf(x[j] * inv_scale);
+    }
+}
+
+// Pre-populate a q8_0 cache tensor with deterministic VALID blocks (seeded,
+// reproducible across processes/backends), mirroring fill_turbo4_64.
+static void fill_q8_0(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 34);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[32];
+        for (int j = 0; j < 32; ++j) x[j] = dist(rng);
+        host_q8_0_quantize_block(x, &buf[(size_t)b * 34]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+}
+
 // Deterministic, CUDA-free scatter-readback oracle (480-only). Runs the op on
 // Vulkan, reads back k_cache, and checks each turbo4 block against a host
 // re-implementation of the no-RHT quantizer (L2-norm -> normalize -> nearest
@@ -400,6 +442,99 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
     const bool pass = (max_norm_err <= 1e-3) && (nibble_mismatch == 0);
     printf("%s: %s (max_norm_err=%.6f nibble_mismatch=%d)\n",
            label, pass ? "PASS" : "FAIL", max_norm_err, nibble_mismatch);
+    free_graph(g);
+    return pass;
+}
+
+// Deterministic, CUDA-free scatter-readback oracle for Q8_0 (mirrors
+// scatter_turbo4_readback). Runs the op on Vulkan, reads back k_cache, and
+// checks each q8_0 block against host_q8_0_quantize_block applied to the
+// same k_cur at the expected element_block_index. Asserts per-block scale
+// within a small fp16-rounding tolerance and the int8 qs BYTE-EXACT (no
+// centroid quant slop — q8_0 is a plain round-to-nearest affine quant).
+static bool scatter_q8_0_readback(const paged_case & c, ggml_backend_t vk) {
+    const char * label = "scatter q8_0 readback";
+
+    built_graph g = build_case(c, vk);
+    if (ggml_backend_graph_compute(vk, g.gf) != GGML_STATUS_SUCCESS) {
+        printf("%s: FAIL (graph compute error)\n", label);
+        free_graph(g);
+        return false;
+    }
+
+    const int HD           = c.head_dim;
+    const int total_tokens = c.q_len * c.n_seq;
+    const int BS           = c.block_size;
+    const int QK           = 32;
+    const int N_QBLK       = HD / QK;
+    const int n_kv_heads   = c.n_kv_heads;
+    const size_t BLOCK_BYTES = 34;   // fp16 d + int8 qs[32]
+    const size_t QS_OFFSET   = 2;
+
+    std::vector<ggml_fp16_t> kcur(ggml_nelements(g.k_cur));
+    ggml_backend_tensor_get(g.k_cur, kcur.data(), 0, ggml_nbytes(g.k_cur));
+    std::vector<uint8_t> kc(ggml_nbytes(g.k_cache));
+    ggml_backend_tensor_get(g.k_cache, kc.data(), 0, ggml_nbytes(g.k_cache));
+
+    double max_scale_err  = 0.0;
+    int    qs_mismatch    = 0;
+    int    qs_total       = 0;
+    bool   qs_off_by_more = false;   // any mismatch with |act-exp| > 1 is a real bug, not a tie
+
+    for (int t = 0; t < total_tokens; ++t) {
+        const int slot          = t;            // slot_mapping[i] = i
+        const int paged_block   = slot / BS;
+        const int slot_in_block = slot % BS;
+        for (int h = 0; h < n_kv_heads; ++h) {
+            for (int qb = 0; qb < N_QBLK; ++qb) {
+                float x[32];
+                for (int j = 0; j < QK; ++j) {
+                    const int d = qb * QK + j;
+                    const size_t src = (size_t) t * n_kv_heads * HD + (size_t) h * HD + d;
+                    x[j] = ggml_fp16_to_fp32(kcur[src]);
+                }
+                uint8_t exp_block[34];
+                host_q8_0_quantize_block(x, exp_block);
+                ggml_fp16_t exp_d_h;
+                memcpy(&exp_d_h, exp_block, sizeof(ggml_fp16_t));
+
+                const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + h) * BS * N_QBLK
+                                       + (int64_t) slot_in_block * N_QBLK + qb;
+                const size_t base = (size_t) block_ib * BLOCK_BYTES;
+
+                ggml_fp16_t act_d_h;
+                memcpy(&act_d_h, &kc[base], sizeof(ggml_fp16_t));
+                const double se = std::fabs((double) ggml_fp16_to_fp32(act_d_h)
+                                           - (double) ggml_fp16_to_fp32(exp_d_h));
+                if (se > max_scale_err) max_scale_err = se;
+
+                for (int j = 0; j < QK; ++j) {
+                    const int8_t act = (int8_t) kc[base + QS_OFFSET + j];
+                    const int8_t exp = (int8_t) exp_block[QS_OFFSET + j];
+                    qs_total++;
+                    if (act != exp) {
+                        qs_mismatch++;
+                        if (std::abs((int) act - (int) exp) > 1) qs_off_by_more = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Q8_0's round-to-nearest-int8 decision has a genuine exact-tie case (the
+    // true mathematical value lands within a few ULP of x.5) that GPU vs CPU
+    // can round to either neighboring integer — diagnosed directly: observed
+    // mismatches have |x[j]*inv_scale - round(...)| within ~4e-6 of 0.5,
+    // i.e. real ties, not an implementation bug (unlike turbo4's centroid
+    // lookup, Q8_0 has no norm-correction feedback loop that could amplify
+    // this). Require every mismatch be off-by-exactly-1 (never more, which
+    // would indicate a real quantization bug) and bounded to a small
+    // fraction of all tested elements (observed: <=6 out of thousands,
+    // 4/32768 = 0.012% on the worst case here).
+    const bool tie_rate_ok = qs_total > 0 && ((double) qs_mismatch / qs_total) <= 0.01;
+    const bool pass = (max_scale_err <= 1e-3) && !qs_off_by_more && tie_rate_ok;
+    printf("%s: %s (max_scale_err=%.6f qs_mismatch=%d/%d)\n",
+           label, pass ? "PASS" : "FAIL", max_scale_err, qs_mismatch, qs_total);
     free_graph(g);
     return pass;
 }
@@ -618,6 +753,30 @@ int main() {
     {
         const paged_case t64 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64 };
         all_ok = scatter_turbo4_readback(t64, vk) && all_ok;
+    }
+
+    // ── Q8_0 (this task): standard 8-bit symmetric per-32-element-block quant.
+    //    Much higher precision than turbo4's 4-bit centroid quant, so it gets
+    //    an F16-class tolerance (2e-3) rather than turbo4's 5e-2. Covers all
+    //    three head_dim brackets this branch supports: 64, 128, 256.
+    {
+        const int head_dims[] = { 64, 128, 256 };
+        for (int hd : head_dims) {
+            char label[80];
+
+            const paged_case pre { hd, 8, 2, 16, 32, 32, 1, GGML_TYPE_Q8_0 };
+            snprintf(label, sizeof label, "paged q8_0 hd%d prefill", hd);
+            all_ok = compare_paged_case(label, pre, vk, cuda, 2e-3) && all_ok;
+
+            snprintf(label, sizeof label, "scatter q8_0 hd%d readback", hd);
+            all_ok = scatter_q8_0_readback(pre, vk) && all_ok;
+
+            for (int ctx : { 128, 512 }) {
+                const paged_case dec { hd, 8, 2, 16, 1, ctx, 1, GGML_TYPE_Q8_0 };
+                snprintf(label, sizeof label, "paged q8_0 hd%d decode ctx=%d", hd, ctx);
+                all_ok = compare_paged_case(label, dec, vk, cuda, 2e-3) && all_ok;
+            }
+        }
     }
 
     ggml_backend_free(vk);

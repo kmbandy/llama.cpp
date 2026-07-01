@@ -140,4 +140,34 @@ float pa_v_load(uint off) {
 }
 #endif // DATA_A_TURBO4_64
 
+#ifdef DATA_A_Q8_0
+// Q8_0: standard 8-bit symmetric per-32-element-block quantization. Mirrors
+// paged_cache_ops<GGML_TYPE_Q8_0> (mt_pagedattn_ops.cuh:89-121). Plain
+// per-block scale (no zero-point, no centroid table, no norm-correction) —
+// much simpler than turbo4_0/turbo4_64.
+#define PA_QK8_0 32u
+
+uint pa_q80_block_index(uint paged_block, uint kv_head, uint n_kv_heads, uint tok, uint qb, uint HS, uint BS) {
+    const uint N_QBLOCKS_PER_TOKEN = HS / PA_QK8_0;
+    return ((paged_block*n_kv_heads + kv_head) * BS * N_QBLOCKS_PER_TOKEN) + tok*N_QBLOCKS_PER_TOKEN + qb;
+}
+uint pa_k_off(uint paged_block, uint kv_head, uint n_kv_heads, uint tok, uint d, uint HS, uint BS) {
+    const uint block_ib = pa_q80_block_index(paged_block, kv_head, n_kv_heads, tok, d/PA_QK8_0, HS, BS);
+    return block_ib * PA_QK8_0 + (d % PA_QK8_0);
+}
+uint pa_v_off(uint paged_block, uint kv_head, uint n_kv_heads, uint tok, uint d, uint HS, uint BS) {
+    return pa_k_off(paged_block, kv_head, n_kv_heads, tok, d, HS, BS);
+}
+float pa_k_load(uint off) {
+    const uint ib  = off / PA_QK8_0;
+    const uint iqs = off % PA_QK8_0;
+    return float(data_k[ib].qs[iqs]) * float(data_k[ib].d);
+}
+float pa_v_load(uint off) {
+    const uint ib  = off / PA_QK8_0;
+    const uint iqs = off % PA_QK8_0;
+    return float(data_v[ib].qs[iqs]) * float(data_v[ib].d);
+}
+#endif // DATA_A_Q8_0
+
 #endif // PAGED_CACHE_OPS_GLSL

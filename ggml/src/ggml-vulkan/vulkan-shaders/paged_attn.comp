@@ -17,7 +17,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
-#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64)
+#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64) || defined(DATA_A_Q8_0)
 #extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
 #extension GL_EXT_shader_8bit_storage                      : require
 #endif
@@ -57,6 +57,11 @@ layout (binding = 2)          buffer VCache  { block_turbo4_0 data_v[]; };
 struct block_turbo4_64 { float16_t norm; uint8_t qs[32]; };   // 34 B, no rnorm
 layout (binding = 1) buffer KCache  { block_turbo4_64 data_k[]; };
 layout (binding = 2) buffer VCache  { block_turbo4_64 data_v[]; };
+#endif
+#ifdef DATA_A_Q8_0
+struct block_q8_0 { float16_t d; int8_t qs[32]; };             // 34 B
+layout (binding = 1) buffer KCache  { block_q8_0 data_k[]; };
+layout (binding = 2) buffer VCache  { block_q8_0 data_v[]; };
 #endif
 layout (binding = 3) readonly buffer BTab    { int   block_tables[]; };
 layout (binding = 4) readonly buffer CtxLens { int   context_lens[]; };
