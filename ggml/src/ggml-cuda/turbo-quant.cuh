@@ -351,12 +351,57 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return TURBO_CENTROIDS_4BIT[idx] * norm;
 }
 
+// ---- 4-bit centroids for turbo4_64 (64-element blocks), calibrated from
+// real LFM2.5-8B-A1B K/V activation statistics (2026-07-01 investigation),
+// NOT the N(0, 1/128) Gaussian assumption above. A 64-element group's
+// L2-normalized value has ~sqrt(2)x the typical magnitude of a 128-element
+// group's, AND real K/V activations are heavy-tailed (occasional outlier
+// channels), not Gaussian — the shared TURBO_CENTROIDS_4BIT table (designed
+// for turbo4_0's 128-element blocks) hard-clips ~13% of real turbo4_64
+// values and has 2.8x worse RMSE than this table on real data. Used ONLY by
+// turbo4_64 (native head_dim-64 paged KV cache); does NOT affect turbo4_0
+// (128-element blocks, e.g. Qwen3.5-4B's hd256 path), which keeps its
+// existing, already-validated table unchanged.
+static __constant__ float TURBO_CENTROIDS_4BIT_N64[16] = {
+    -0.489086f, -0.332636f, -0.244498f, -0.182456f,
+    -0.132429f, -0.089625f, -0.051251f, -0.016052f,
+     0.016052f,  0.051251f,  0.089625f,  0.132429f,
+     0.182456f,  0.244498f,  0.332636f,  0.489086f
+};
+
+static __constant__ float TURBO_MID_4BIT_N64[15] = {
+    -0.410861f, -0.288567f, -0.213477f, -0.157443f,
+    -0.111027f, -0.070438f, -0.033652f,  0.000000f,
+     0.033652f,  0.070438f,  0.111027f,  0.157443f,
+     0.213477f,  0.288567f,  0.410861f
+};
+
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_4bit_n64(float val) {
+    if      (val < TURBO_MID_4BIT_N64[ 0]) return  0;
+    else if (val < TURBO_MID_4BIT_N64[ 1]) return  1;
+    else if (val < TURBO_MID_4BIT_N64[ 2]) return  2;
+    else if (val < TURBO_MID_4BIT_N64[ 3]) return  3;
+    else if (val < TURBO_MID_4BIT_N64[ 4]) return  4;
+    else if (val < TURBO_MID_4BIT_N64[ 5]) return  5;
+    else if (val < TURBO_MID_4BIT_N64[ 6]) return  6;
+    else if (val < TURBO_MID_4BIT_N64[ 7]) return  7;
+    else if (val < TURBO_MID_4BIT_N64[ 8]) return  8;
+    else if (val < TURBO_MID_4BIT_N64[ 9]) return  9;
+    else if (val < TURBO_MID_4BIT_N64[10]) return 10;
+    else if (val < TURBO_MID_4BIT_N64[11]) return 11;
+    else if (val < TURBO_MID_4BIT_N64[12]) return 12;
+    else if (val < TURBO_MID_4BIT_N64[13]) return 13;
+    else if (val < TURBO_MID_4BIT_N64[14]) return 14;
+    else                                    return 15;
+}
+
 // MAD-301C Lever B: native head_dim-64 turbo4 dequant. Same nibble layout as
-// block_turbo4_0 (j/2 byte, (j%2)*4 shift); only the block struct width differs.
+// block_turbo4_0 (j/2 byte, (j%2)*4 shift); only the block struct width and
+// the (N=64-calibrated) centroid table differ.
 static __device__ __forceinline__ float turbo4_64_dequant_element(
         const block_turbo4_64 * __restrict__ x, int j, float norm) {
     uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
-    return TURBO_CENTROIDS_4BIT[idx] * norm;
+    return TURBO_CENTROIDS_4BIT_N64[idx] * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----

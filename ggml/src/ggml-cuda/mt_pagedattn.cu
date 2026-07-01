@@ -524,9 +524,11 @@ __global__ void mt_scatter_kv_turbo4_64_kernel(
     __syncthreads();
 
     // No RHT (see mt_scatter_kv_turbo4_0_kernel step-4 comment): centroid-quant
-    // normalized K directly; dequant returns centroid*norm ~= K.
+    // normalized K directly; dequant returns centroid*norm ~= K. Uses the
+    // N=64-calibrated table (turbo_nearest_centroid_4bit_n64), not the shared
+    // N=128 one — see TURBO_CENTROIDS_4BIT_N64 comment in turbo-quant.cuh.
     const float   rv  = x[j];
-    const uint8_t idx = turbo_nearest_centroid_4bit(rv);
+    const uint8_t idx = turbo_nearest_centroid_4bit_n64(rv);
 
     const int      lane            = j % WARP_SIZE;
     const uint8_t  my_nibble       = idx & 0xF;
@@ -536,7 +538,7 @@ __global__ void mt_scatter_kv_turbo4_64_kernel(
     }
 
     {
-        const float c = TURBO_CENTROIDS_4BIT[idx];
+        const float c = TURBO_CENTROIDS_4BIT_N64[idx];
         float rc = c * c;
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
             rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);

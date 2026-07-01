@@ -243,8 +243,28 @@ static void fill_turbo4(ggml_tensor * t, uint32_t seed) {
 // Quantize one 64-element f32 vector into a valid 34-byte block_turbo4_64
 // (norm fp16 + 32 nibble-packed centroid indices, NO rnorm field). Mirrors
 // host_turbo4_quantize_block (128-element/68-byte) exactly, just over 64
-// elements / 32 packed bytes, reusing the same no-RHT centroid table +
-// nearest-centroid + recon-norm correction.
+// elements / 32 packed bytes, reusing the no-RHT scheme + recon-norm
+// correction, but with the N=64-calibrated centroid table (NOT
+// HOST_TURBO_CENTROIDS_4BIT, which is turbo4_0's N=128 table) — see
+// TURBO_CENTROIDS_4BIT_N64 comment in ggml-cuda/turbo-quant.cuh.
+static const float HOST_TURBO_CENTROIDS_4BIT_N64[16] = {
+    -0.489086f, -0.332636f, -0.244498f, -0.182456f,
+    -0.132429f, -0.089625f, -0.051251f, -0.016052f,
+     0.016052f,  0.051251f,  0.089625f,  0.132429f,
+     0.182456f,  0.244498f,  0.332636f,  0.489086f
+};
+static const float HOST_TURBO_MID_4BIT_N64[15] = {
+    -0.410861f, -0.288567f, -0.213477f, -0.157443f,
+    -0.111027f, -0.070438f, -0.033652f,  0.000000f,
+     0.033652f,  0.070438f,  0.111027f,  0.157443f,
+     0.213477f,  0.288567f,  0.410861f
+};
+static uint8_t host_turbo_nearest_4bit_n64(float v) {
+    for (int i = 0; i < 15; ++i) {
+        if (v < HOST_TURBO_MID_4BIT_N64[i]) return (uint8_t) i;
+    }
+    return 15;
+}
 static void host_turbo4_64_quantize_block(const float * x /*64*/, uint8_t * out /*34 bytes*/) {
     float red[64];
     for (int j = 0; j < 64; ++j) red[j] = x[j] * x[j];
@@ -256,8 +276,8 @@ static void host_turbo4_64_quantize_block(const float * x /*64*/, uint8_t * out 
     float   rred[64];
     for (int j = 0; j < 64; ++j) {
         const float nv = x[j] * inv_norm;
-        idxs[j] = host_turbo_nearest_4bit(nv);
-        const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+        idxs[j] = host_turbo_nearest_4bit_n64(nv);
+        const float cv = HOST_TURBO_CENTROIDS_4BIT_N64[idxs[j]];
         rred[j] = cv * cv;
     }
     for (int s = 32; s > 0; s >>= 1)
@@ -348,8 +368,8 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
                 float   rred[128];
                 for (int j = 0; j < QK; ++j) {
                     const float nv = x[j] * inv_norm;
-                    idxs[j] = host_turbo_nearest_4bit(nv);
-                    const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+                    idxs[j] = is_t64 ? host_turbo_nearest_4bit_n64(nv) : host_turbo_nearest_4bit(nv);
+                    const float cv = is_t64 ? HOST_TURBO_CENTROIDS_4BIT_N64[idxs[j]] : HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
                     rred[j] = cv * cv;
                 }
                 for (int s = QK / 2; s > 0; s >>= 1)

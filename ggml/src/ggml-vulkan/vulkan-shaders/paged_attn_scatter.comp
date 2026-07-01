@@ -265,13 +265,13 @@ void main() {
 
     // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
 
-    // ---- Step 5: nearest centroid ----
-    const uint idx = pa_turbo_nearest_4bit(s_x[j]);
+    // ---- Step 5: nearest centroid (N=64-calibrated table, not turbo4_0's) ----
+    const uint idx = pa_turbo64_nearest_4bit(s_x[j]);
 
     // ---- Step 7 (parallel): reconstruction norm = sqrt(Σ centroid²) ----
     // WAR: all lanes have read s_red[0] (grp_norm) before any lane overwrites it.
     barrier();
-    const float cv = TURBO_CENTROIDS_4BIT[idx];
+    const float cv = TURBO_CENTROIDS_4BIT_N64[idx];
     s_red[j] = cv * cv;
     barrier();
     if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();

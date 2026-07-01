@@ -93,8 +93,30 @@ float pa_v_load(uint off) {
 
 #ifdef DATA_A_TURBO4_64
 // turbo4_64: 4-bit PolarQuant, 64-element block (34 B: norm + qs[32], NO rnorm).
-// RHT-FREE: dequant = TURBO_CENTROIDS_4BIT[idx] * norm.
+// RHT-FREE: dequant = TURBO_CENTROIDS_4BIT_N64[idx] * norm (N=64-calibrated
+// table, NOT the shared turbo4_0 one — see turbo_centroids.glsl comment).
 #define PA_QK64 64u
+
+// Nearest 4-bit centroid using the N=64-calibrated table/midpoints.
+uint pa_turbo64_nearest_4bit(float v) {
+    if      (v < TURBO_MID_4BIT_N64[ 0]) return  0u;
+    else if (v < TURBO_MID_4BIT_N64[ 1]) return  1u;
+    else if (v < TURBO_MID_4BIT_N64[ 2]) return  2u;
+    else if (v < TURBO_MID_4BIT_N64[ 3]) return  3u;
+    else if (v < TURBO_MID_4BIT_N64[ 4]) return  4u;
+    else if (v < TURBO_MID_4BIT_N64[ 5]) return  5u;
+    else if (v < TURBO_MID_4BIT_N64[ 6]) return  6u;
+    else if (v < TURBO_MID_4BIT_N64[ 7]) return  7u;
+    else if (v < TURBO_MID_4BIT_N64[ 8]) return  8u;
+    else if (v < TURBO_MID_4BIT_N64[ 9]) return  9u;
+    else if (v < TURBO_MID_4BIT_N64[10]) return 10u;
+    else if (v < TURBO_MID_4BIT_N64[11]) return 11u;
+    else if (v < TURBO_MID_4BIT_N64[12]) return 12u;
+    else if (v < TURBO_MID_4BIT_N64[13]) return 13u;
+    else if (v < TURBO_MID_4BIT_N64[14]) return 14u;
+    else                                  return 15u;
+}
+
 uint pa_turbo64_block_index(uint paged_block, uint kv_head, uint n_kv_heads, uint tok, uint qb, uint HS, uint BS) {
     const uint N_QBLK = HS / PA_QK64;
     return ((paged_block*n_kv_heads + kv_head) * BS * N_QBLK) + tok*N_QBLK + qb;
@@ -109,12 +131,12 @@ uint pa_v_off(uint paged_block, uint kv_head, uint n_kv_heads, uint tok, uint d,
 float pa_k_load(uint off) {
     const uint ib = off / PA_QK64; const uint iqs = off % PA_QK64;
     const uint idx = (uint(data_k[ib].qs[iqs >> 1u]) >> ((iqs & 1u) * 4u)) & 0xFu;
-    return TURBO_CENTROIDS_4BIT[idx] * float(data_k[ib].norm);
+    return TURBO_CENTROIDS_4BIT_N64[idx] * float(data_k[ib].norm);
 }
 float pa_v_load(uint off) {
     const uint ib = off / PA_QK64; const uint iqs = off % PA_QK64;
     const uint idx = (uint(data_v[ib].qs[iqs >> 1u]) >> ((iqs & 1u) * 4u)) & 0xFu;
-    return TURBO_CENTROIDS_4BIT[idx] * float(data_v[ib].norm);
+    return TURBO_CENTROIDS_4BIT_N64[idx] * float(data_v[ib].norm);
 }
 #endif // DATA_A_TURBO4_64
 
