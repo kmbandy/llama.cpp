@@ -636,28 +636,58 @@ to least specific:
    (0.152 → 0.244 → 0.297 → 0.322 → 0.376 → 0.452), tripling by layer 5. Full data and analysis in
    `.superpowers/sdd/paged-attn-layer-divergence-report.md`.
 
-**Conclusion:** hypothesis (a), not (b) — this is a **real wiring/config bug**, not noise-floor leverage.
-A clean op (op-level harness passes at 1e-6–5e-4) cannot produce 15.2% divergence at the very first
-invocation from noise alone; the discrepancy is present from layer 0, before any of the 18 recurrent
-layers have had a chance to compound anything. The leading candidate mechanism (not yet proven at the
-line level) is how LFM2.5's per-layer `attention.head_count_kv` array — non-zero only for 6/24 layers,
-zero elsewhere — is consumed when constructing the paged-attn op's inputs or block-table indexing,
-contrasted with Qwen3.5-4B's uniform scalar `head_count_kv` (attention on all 33 layers, tight 0.22σ
-parity). The layer-to-layer growth is a secondary, smaller effect consistent with the layer-0 error
-propagating through the residual stream at each subsequent attention layer, not an independent cause.
+**Conclusion (2026-07-01, fully resolved):** the earlier "head_count_kv-array consumption bug" hypothesis
+was superseded by a more rigorous investigation the next session. The actual mechanism, verified with
+concrete tests (not assumed):
 
-**Status:** root cause narrowed to "real bug, LFM2.5-hybrid-specific, in paged-attn's per-layer
-head_count_kv handling" with high confidence, but the exact faulty line has not yet been located. This is
-correctly out of scope for SP2.5 itself (op-level harness is clean; both paged variants — turbo4_64 and
-the pre-existing padded-128 path — are proven numerically equivalent to *each other*, so nothing in this
-branch's own work regressed or needs fixing) but must be filed as a real, confirmed bug for follow-up —
-not a hand-wave. **NEXT SESSION / FOLLOW-UP:** file this as a tracked bug (LFM2.5/hybrid-model paged-attn
-divergence, root-caused in `.superpowers/sdd/paged-attn-layer-divergence-report.md`) and, when picked up,
-locate the exact head_count_kv-array consumption site in the paged-attn op's Vulkan and/or host-side
-setup code that treats LFM2.5's sparse layer array differently from a uniform scalar. The diagnostic tool
-and its output remain UNCOMMITTED (`examples/pagedattn-dump/` untracked, `examples/CMakeLists.txt`
-modified) — review before committing;
-it is separate from the CUDA WIP files and safe to stage once verified.
+1. **Identical-input isolation**: feeding the exact same captured Q/K/V into both Vulkan's and CUDA's
+   `paged_attn_mt` kernels produces 0.08% agreement — the kernels themselves are correct and consistent
+   given the same input. The divergence originates *upstream* of the op.
+2. **Pure-math amplification, proven with zero GPU/quantization involvement**: a from-scratch
+   double-precision softmax computed on each backend's own (slightly different, ~2-4%, ordinary
+   cross-vendor floating-point noise) real Q/K/V already produces ~5.6% output divergence — softmax
+   attention is mathematically sensitive to input perturbation, more so at LFM2.5's small head_dim (64)
+   than Qwen's (256).
+3. **The turbo4/turbo4_64 4-bit centroid quantizer adds further amplification on top** (5.6%→15.2%
+   measured), because nearest-centroid quantization is a *discrete* decision — tiny cross-backend input
+   differences occasionally flip which of 16 buckets gets picked, and the group-norm computation
+   (dominated by a few "massive activation" outlier channels per 64-element block, a real, measured
+   property of this model's trained weights, not random per-token content — one channel position is a
+   top-4-magnitude outlier in ~46% of real pooled blocks) crushes the *other* channels' normalized values
+   toward the codebook's decision boundaries, making this worse specifically for LFM2.5's small-block
+   turbo4_64 format. This compounds layer-over-layer via the residual stream, producing the observed
+   15%→45% growth and the resulting ~2.4-2.6σ PPL gap.
+
+**Fix explored and shipped** (see `feat/sp1-turbo4-vulkan-fa` commits `c2280285a`, `880f7add7`,
+`009d9716e`): recalibrating the shared centroid table alone does not work (tested at two very different
+sample sizes, converges to the same table, and makes PPL *worse* — 2.72σ — because it trades inner
+resolution for outlier-tail coverage, hurting the far-more-common typical-magnitude case). What does work,
+verified end-to-end on the real model: **fixed-position outlier-channel extraction**
+(`GGML_TYPE_TURBO4_64_OL`/`_OL8`/`_OL12`) — store a small, fixed (not per-block-selected, to avoid a
+backend-inconsistent selection instability) set of dominant channel positions at full f16 precision,
+4-bit-quantize the rest with the *existing, unmodified* codebook. Full LFM2.5 Vulkan-vs-CUDA PPL sweep:
+
+| Config | σ gap | Storage vs. turbo4_64 baseline |
+|---|---|---|
+| Original uncalibrated turbo4_64 | ~2.4-2.6 | baseline (34B/block) |
+| Recalibrated shared table (dead end) | 2.72 (worse) | same |
+| OL (4 outlier channels) | 1.66 | +18% (40B) |
+| Q8_0 (added this session, full Vulkan implementation) | 0.61 | +100% (68B) |
+| **OL12 (12 outlier channels) — shipped** | **0.54** | **+53% (52B)** |
+
+OL12 closes the gap to the same tier as Q8_0 at roughly half the storage overhead — the best option given
+an 8GB VRAM constraint that rules out Q8_0's footprint. Op-level harness: 38/38 PASS, no regressions to
+F16/turbo4_0/turbo4_64/Q8_0. Full investigation detail, the complete 6-cell sweep matrix (including the
+N=64-recalibrated-table combinations, all of which underperformed the original table at every outlier
+count), and root-cause verification steps are in `.superpowers/sdd/paged-attn-layer-divergence-report.md`,
+`.superpowers/sdd/turbo4_64_outlier-report.md`, and `.superpowers/sdd/outlier-matrix-report.md`.
+
+**Status: RESOLVED.** This was originally filed as out-of-scope for SP2.5 since the op-level harness was
+already clean; it turned into a full root-cause + fix cycle at the user's insistence, and the fix
+(`GGML_TYPE_TURBO4_64_OL12`, selectable via `--cache-type-k/v turbo4_64_ol12`) is available for any
+head_dim-64 hybrid-attention model wanting tight cross-backend parity without Q8_0's footprint cost. The
+diagnostic tooling (`examples/pagedattn-dump/`, `examples/pagedattn-repro/`) remains uncommitted
+(investigative-only, not for merge) — safe to discard or keep for future similar investigations.
 
 ---
 
