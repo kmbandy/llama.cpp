@@ -699,14 +699,61 @@ The diagnostic tooling (`examples/pagedattn-dump/`, `examples/pagedattn-repro/`)
 **Files:**
 - Modify: `docs/superpowers/plans/2026-06-30-sp2-multibracket-paged-turbo-vulkan.md`, `.superpowers/sdd/progress.md`
 
-- [ ] **Step 1: Write the consolidated bracket matrix** (head_dim 64/128/256 × {op-level CUDA-equivalence, e2e PPL parity, perf}) into this plan's Results section, with the carried Minor findings from each task for the final whole-branch review to triage.
-- [ ] **Step 2: Mark SP2.5 complete in the ledger** with the commit range and point the final whole-branch review at `2d96f287b..HEAD` (covers SP2 + SP2.5).
-- [ ] **Step 3: Commit.**
+- [x] **Step 1: Write the consolidated bracket matrix** (head_dim 64/128/256 × {op-level CUDA-equivalence, e2e PPL parity, perf}) into this plan's Results section, with the carried Minor findings from each task for the final whole-branch review to triage.
+- [x] **Step 2: Mark SP2.5 complete in the ledger** with the commit range and point the final whole-branch review at `2d96f287b..HEAD` (covers SP2 + SP2.5).
+- [x] **Step 3: Commit.**
 
 ```bash
 git add docs/superpowers/plans/2026-06-30-sp2-multibracket-paged-turbo-vulkan.md .superpowers/sdd/progress.md
 git commit -m "docs(sp2.5): multi-bracket results matrix + final-review pointer"
 ```
+
+---
+
+## Results — Consolidated bracket matrix (Task 6)
+
+All three native head_dim brackets for `GGML_OP_PAGED_ATTN_MT` on Vulkan, one row per bracket. "Op-level"
+= `tests/test-paged-attn-vk.cpp` dual-backend harness (Vulkan0 vs CUDA0, synthetic/host-prefilled inputs).
+"e2e PPL parity" = full `wiki.test.raw` `llama-perplexity`, Vulkan0 vs CUDA0, combined-stderr sigma.
+"Perf" = `llama-bench -p 512 -n 128`, Vulkan0, paged path confirmed active via verbose load log.
+
+| head_dim | Model used for e2e | Cache type(s) | Op-level (Vulkan0 vs CUDA0) | e2e PPL parity (σ, full corpus) | Perf (pp512 / tg128, Vulkan0) | Footprint vs F16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | LFM2.5-8B-A1B (padded fallback, `GGML_PAGED_TURBO4_64=0`) | F16, turbo4_0 | PASS (SP2 Tasks 3-5, tol 2e-3/5e-2) | ~2.6σ (pre-existing, see note below — not a hd128/turbo4_0 defect) | pp512 546.73±6.50, tg128 81.73±0.80 | turbo4_0 ≈ 68.3 B/head (½ of F16) |
+| 256 | Qwen3.5-4B-UD-Q4_K_XL | F16, turbo4_0 (2 blocks/head) | PASS (Task 1, tol 2e-3/5e-2) | **0.22σ** (10.1259±0.07238 vs 10.1484±0.07257) | pp512 280.55±4.07, tg128 34.98±0.29 | turbo4_0 ≈ 68.3 B/head (¼ of F16 at this head_dim) |
+| 64 | LFM2.5-8B-A1B (native) | turbo4_64, turbo4_64_ol/_ol8/_ol12, Q8_0 | PASS, 38/38 (Tasks 3-4 + outlier work, tol 5e-2) | turbo4_64 baseline **~2.4-2.6σ** (root-caused, see below); **turbo4_64_ol8 0.45σ — shipped fix** | pp512 553.69±2.71, tg128 87.44±2.00 (native turbo4_64, at parity/better than padded-128) | turbo4_64 = 34.1 B/head (**½** of padded-128 turbo4_0); turbo4_64_ol8 = 46 B/head (+35% vs turbo4_64, still 33% under F16) |
+
+**Note on the hd64/hd128 PPL gap (turbo4_64 baseline and padded-128, both ~2.4-2.6σ):** this is NOT a
+head_dim-64 or turbo4_64-specific defect — it is a real, root-caused property of LFM2.5 specifically
+(ordinary cross-vendor floating-point noise, amplified by softmax's sensitivity to small head_dim, further
+amplified by 4-bit nearest-centroid quantization interacting with LFM2.5's real massive-activation outlier
+channels). It reproduces identically on the already-merged, unmodified padded-128 path (zero turbo4_64 code
+involved), and is fully explained and fixed for the turbo4_64 case (see "Post-Task-5 investigation" above,
+`.superpowers/sdd/paged-attn-layer-divergence-report.md`). **`turbo4_64_ol8` is the recommended cache type
+for any head_dim-64 hybrid-attention model wanting tight cross-backend parity**; the hd128 padded-fallback
+path is legacy/interim (superseded by native turbo4_64 for real head_dim-64 models) and carries no
+independent fix in this branch — it is out of scope, flagged for the final whole-branch review as a known,
+explained, non-blocking characteristic.
+
+**Minor findings carried from every task, for the final whole-branch review to triage:**
+- Task 1 (turbo_wht.comp, SP1): `gs=32` comment in a push-constant describes an unreachable code path (supports_op only admits {64,128}). Cosmetic.
+- Task 2 (cpy_f32_turbo4_0.comp, SP1): CUDA `TURBO_MID_4BIT` thresholds differ from the CPU oracle's hardcoded midpoints by ~1e-6 at idx 0,6,8,14 — correct for CUDA-parity, watch-item only.
+- Task 2 (SP1): `wg_denoms={1,1,1}` deserves a clarifying comment; unused `param1`/`param2` push-const fields; no non-contiguous-source CPY test.
+- Task 3 (types.glsl, SP1): `block_turbo4_0_packed16` lacks a comment noting it's FA-only; asymmetric FA combos (K=turbo4_0, V=q4_0) untested; only kv=96 tested for turbo4_0 FA.
+- SP2 Task 3: `supports_op` omits an explicit `n_heads % n_kv_heads == 0` check (CUDA asserts it); multi-seq / invalid-block paths verified by reading, not tested; dead `q_reg`/`acc_o` MAX_VEC slots at HS=128.
+- SP2 Task 4: scatter dispatch grid omits `*N_QBLK` on the y-dim (correct only because SP2 pinned head_dim==128 — now genuinely exercised by SP2.5's hd256/hd64 brackets, which DO set N_QBLK correctly per Task 1/3 changes — reviewer should confirm the grid fix actually landed for those brackets, not just re-flag the original note). Comment-numbering swap in the scatter shader (cosmetic). Scatter-readback oracle only validates K, not V (adequate, no independent V check).
+- SP2 Task 5: `paged_attn_decode.comp` reads an unused `q_len` local; `compare_paged_case` doesn't check CUDA op support explicitly; CUDA's internal q_len==1 decode-vs-tile routing unverified from the diff; multi-seq (n_seq>1) decode untested.
+- SP2.5 Task 3+4 (turbo4_64): two cosmetic-only notes (see task log), no Important/Critical.
+- SP2.5 outlier work (turbo4_64_ol/_ol8/_ol12, Q8_0): CPU-side type-trait stubs are unsupported/abort-only (matches the existing turbo4_64 CPU-stub convention — hot path is CUDA/Vulkan-only); worth a final-review sanity check that this convention is acceptable for merge (it was never in question for turbo4_64 itself, extending it to 4 more types is the only new surface).
+
+**Diagnostic-only files, deliberately left uncommitted (not for merge):** `examples/pagedattn-dump/`,
+`examples/pagedattn-repro/`, the `examples/CMakeLists.txt` `add_subdirectory` lines for them, and the small
+`ggml_format_name` instrumentation hunk in `src/llama-graph.cpp`. Safe to discard, or the final whole-branch
+review can decide whether any of this tooling is worth keeping for future similar investigations.
+
+**Final whole-branch review scope:** `2d96f287b..HEAD` (SP2 + SP2.5 combined — SP2 established the paged
+op and the hd128 bracket, SP2.5 generalized to hd256 and added the native hd64 turbo4_64 bracket plus the
+outlier-channel fix). This is the range for `superpowers:requesting-code-review`'s final reviewer dispatch.
 
 ---
 
