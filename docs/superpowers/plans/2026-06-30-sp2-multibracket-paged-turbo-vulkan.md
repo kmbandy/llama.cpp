@@ -672,21 +672,24 @@ backend-inconsistent selection instability) set of dominant channel positions at
 | Original uncalibrated turbo4_64 | ~2.4-2.6 | baseline (34B/block) |
 | Recalibrated shared table (dead end) | 2.72 (worse) | same |
 | OL (4 outlier channels) | 1.66 | +18% (40B) |
+| **OL8 (8 outlier channels) — chosen** | **0.45** | **+35% (46B)** |
 | Q8_0 (added this session, full Vulkan implementation) | 0.61 | +100% (68B) |
-| **OL12 (12 outlier channels) — shipped** | **0.54** | **+53% (52B)** |
+| OL12 (12 outlier channels) | 0.54 (at full 575-chunk corpus) | +53% (52B) |
 
-OL12 closes the gap to the same tier as Q8_0 at roughly half the storage overhead — the best option given
-an 8GB VRAM constraint that rules out Q8_0's footprint. Op-level harness: 38/38 PASS, no regressions to
-F16/turbo4_0/turbo4_64/Q8_0. Full investigation detail, the complete 6-cell sweep matrix (including the
-N=64-recalibrated-table combinations, all of which underperformed the original table at every outlier
-count), and root-cause verification steps are in `.superpowers/sdd/paged-attn-layer-divergence-report.md`,
+User's final call: **OL8**, not OL12 — 0.45σ (well within noise given the ~0.6 stderr at this sample size)
+at meaningfully less storage than OL12. Both close the gap to Q8_0's tier or better at a fraction of its
+footprint cost. Op-level harness: 38/38 PASS, no regressions to F16/turbo4_0/turbo4_64/Q8_0. Full
+investigation detail, the complete 6-cell sweep matrix (including the N=64-recalibrated-table
+combinations, all of which underperformed the original table at every outlier count), and root-cause
+verification steps are in `.superpowers/sdd/paged-attn-layer-divergence-report.md`,
 `.superpowers/sdd/turbo4_64_outlier-report.md`, and `.superpowers/sdd/outlier-matrix-report.md`.
 
 **Status: RESOLVED.** This was originally filed as out-of-scope for SP2.5 since the op-level harness was
 already clean; it turned into a full root-cause + fix cycle at the user's insistence, and the fix
-(`GGML_TYPE_TURBO4_64_OL12`, selectable via `--cache-type-k/v turbo4_64_ol12`) is available for any
-head_dim-64 hybrid-attention model wanting tight cross-backend parity without Q8_0's footprint cost. The
-diagnostic tooling (`examples/pagedattn-dump/`, `examples/pagedattn-repro/`) remains uncommitted
+(`GGML_TYPE_TURBO4_64_OL8`, selectable via `--cache-type-k/v turbo4_64_ol8`) is the recommended choice for
+any head_dim-64 hybrid-attention model wanting tight cross-backend parity without Q8_0's footprint cost
+(`turbo4_64_ol12` remains available too, for a small additional margin at more storage, if ever needed).
+The diagnostic tooling (`examples/pagedattn-dump/`, `examples/pagedattn-repro/`) remains uncommitted
 (investigative-only, not for merge) — safe to discard or keep for future similar investigations.
 
 ---
