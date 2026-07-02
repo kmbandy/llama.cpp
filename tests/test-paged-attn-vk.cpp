@@ -97,6 +97,9 @@ static ggml_tensor * build_op_noalloc(const paged_case & c, ggml_context ** ctx_
 
 static void fill_turbo4(ggml_tensor * t, uint32_t seed);    // defined below (after host turbo4 tables)
 static void fill_turbo4_64(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4 tables)
+static void fill_turbo4_64_ol(ggml_tensor * t, uint32_t seed); // defined below (after host turbo4_64_ol quantizer)
+static void fill_turbo4_64_ol8(ggml_tensor * t, uint32_t seed);  // outlier-matrix sweep (2026-07-01)
+static void fill_turbo4_64_ol12(ggml_tensor * t, uint32_t seed); // outlier-matrix sweep (2026-07-01)
 static void fill_q8_0(ggml_tensor * t, uint32_t seed);      // defined below (after host q8_0 quantizer)
 
 static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool fill_cache = false) {
@@ -148,6 +151,12 @@ static built_graph build_case(const paged_case & c, ggml_backend_t backend, bool
         fill_f16(k_cache, 11); fill_f16(v_cache, 12);
     } else if (c.cache_type == GGML_TYPE_TURBO4_64) {
         fill_turbo4_64(k_cache, 11); fill_turbo4_64(v_cache, 12);
+    } else if (c.cache_type == GGML_TYPE_TURBO4_64_OL) {
+        fill_turbo4_64_ol(k_cache, 11); fill_turbo4_64_ol(v_cache, 12);
+    } else if (c.cache_type == GGML_TYPE_TURBO4_64_OL8) {
+        fill_turbo4_64_ol8(k_cache, 11); fill_turbo4_64_ol8(v_cache, 12);
+    } else if (c.cache_type == GGML_TYPE_TURBO4_64_OL12) {
+        fill_turbo4_64_ol12(k_cache, 11); fill_turbo4_64_ol12(v_cache, 12);
     } else if (c.cache_type == GGML_TYPE_Q8_0) {
         fill_q8_0(k_cache, 11); fill_q8_0(v_cache, 12);
     } else {
@@ -311,6 +320,194 @@ static void fill_turbo4_64(ggml_tensor * t, uint32_t seed) {
     ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
 }
 
+// ── turbo4_64_ol (SP2.5, 2026-07-01) host quantizer ──
+//
+// turbo4_64 with 4 fixed-position "massive activation" outlier channels
+// {53,49,52,20} extracted verbatim at f16 and excluded from the group-norm
+// and centroid quantization of the remaining 60 elements. Uses the SHARED
+// HOST_TURBO_CENTROIDS_4BIT/HOST_TURBO_MID_4BIT table (turbo4_0's N=128
+// table, above), NOT HOST_TURBO_CENTROIDS_4BIT_N64 — removing the outliers
+// from the norm makes the remaining 60 "typical" values close enough to the
+// N=128 assumption for that table to be appropriate again (see task brief).
+// MUST stay byte-for-byte identical to TURBO4_64_OUTLIER_CHANNELS
+// (ggml-common.h) / TURBO4_64_OL_CHANNELS (turbo-quant.cuh) /
+// PA_TURBO4_64_OL_CHANNELS (paged_cache_ops.glsl).
+static const int HOST_TURBO4_64_OL_CHANNELS[4] = { 53, 49, 52, 20 };
+
+static bool host_turbo64_ol_is_outlier(int d, int * outlier_slot) {
+    for (int o = 0; o < 4; ++o) {
+        if (HOST_TURBO4_64_OL_CHANNELS[o] == d) { *outlier_slot = o; return true; }
+    }
+    return false;
+}
+
+// Quantize one 64-element f32 vector into a valid 40-byte block_turbo4_64_ol
+// (norm fp16 + outliers[4] fp16 + 30 nibble-packed centroid indices for the
+// 60 non-outlier elements). Mirrors host_turbo4_64_quantize_block, but
+// excludes the 4 fixed outlier channels from the norm/quant and stores them
+// verbatim instead.
+static void host_turbo4_64_ol_quantize_block(const float * x /*64*/, uint8_t * out /*40 bytes*/) {
+    bool is_outlier[64];
+    int  outlier_slot[64];
+    for (int j = 0; j < 64; ++j) {
+        outlier_slot[j] = -1;
+        is_outlier[j] = host_turbo64_ol_is_outlier(j, &outlier_slot[j]);
+    }
+
+    float red[64];
+    for (int j = 0; j < 64; ++j) red[j] = is_outlier[j] ? 0.0f : (x[j] * x[j]);
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) red[j] += red[j + s];
+    const float grp_norm = sqrtf(red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    uint8_t idxs[64];
+    float   rred[64];
+    for (int j = 0; j < 64; ++j) {
+        if (is_outlier[j]) { idxs[j] = 0; rred[j] = 0.0f; continue; }
+        const float nv = x[j] * inv_norm;
+        idxs[j] = host_turbo_nearest_4bit(nv);
+        const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+        rred[j] = cv * cv;
+    }
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) rred[j] += rred[j + s];
+    const float recon_norm     = sqrtf(rred[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    memset(out, 0, 40);
+    const ggml_fp16_t norm_h = ggml_fp32_to_fp16(corrected_norm);
+    memcpy(out + 0, &norm_h, sizeof(ggml_fp16_t));
+    for (int o = 0; o < 4; ++o) {
+        const ggml_fp16_t ov = ggml_fp32_to_fp16(x[HOST_TURBO4_64_OL_CHANNELS[o]]);
+        memcpy(out + 2 + o * (int)sizeof(ggml_fp16_t), &ov, sizeof(ggml_fp16_t));
+    }
+    int nib = 0;
+    for (int j = 0; j < 64; ++j) {
+        if (is_outlier[j]) continue;
+        out[10 + (nib >> 1)] |= (uint8_t)(idxs[j] << ((nib & 1) * 4));
+        nib++;
+    }
+}
+
+// Pre-populate a turbo4_64_ol cache tensor with deterministic VALID blocks
+// (seeded, reproducible across processes/backends), mirroring fill_turbo4_64.
+static void fill_turbo4_64_ol(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 40);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[64];
+        for (int j = 0; j < 64; ++j) x[j] = dist(rng);
+        host_turbo4_64_ol_quantize_block(x, &buf[(size_t)b * 40]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+}
+
+// ── turbo4_64_ol8 / turbo4_64_ol12 (outlier-matrix sweep, 2026-07-01) host
+// quantizers ── mechanical mirror of host_turbo4_64_ol_quantize_block above,
+// generalized over N via a small template so both variants share one body.
+// MUST stay byte-for-byte identical to TURBO4_64_OL8_OUTLIER_CHANNELS /
+// TURBO4_64_OL12_OUTLIER_CHANNELS (ggml-common.h) and the CUDA/Vulkan device
+// channel lists.
+static const int HOST_TURBO4_64_OL8_CHANNELS[8]   = { 53, 49, 52, 20, 21, 54, 14, 15 };
+static const int HOST_TURBO4_64_OL12_CHANNELS[12] = { 53, 49, 52, 20, 21, 54, 14, 15, 51, 26, 24, 23 };
+
+template <int N>
+static bool host_turbo64_olN_is_outlier(const int (&channels)[N], int d, int * outlier_slot) {
+    for (int o = 0; o < N; ++o) {
+        if (channels[o] == d) { *outlier_slot = o; return true; }
+    }
+    return false;
+}
+
+// Quantize one 64-element f32 vector into a valid (2 + 2*N + (64-N)/2)-byte
+// block_turbo4_64_olN (norm fp16 + outliers[N] fp16 + nibble-packed centroid
+// indices for the 64-N non-outlier elements).
+template <int N>
+static void host_turbo4_64_olN_quantize_block(const int (&channels)[N], const float * x /*64*/, uint8_t * out) {
+    bool is_outlier[64];
+    int  outlier_slot[64];
+    for (int j = 0; j < 64; ++j) {
+        outlier_slot[j] = -1;
+        is_outlier[j] = host_turbo64_olN_is_outlier<N>(channels, j, &outlier_slot[j]);
+    }
+
+    float red[64];
+    for (int j = 0; j < 64; ++j) red[j] = is_outlier[j] ? 0.0f : (x[j] * x[j]);
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) red[j] += red[j + s];
+    const float grp_norm = sqrtf(red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    uint8_t idxs[64];
+    float   rred[64];
+    for (int j = 0; j < 64; ++j) {
+        if (is_outlier[j]) { idxs[j] = 0; rred[j] = 0.0f; continue; }
+        const float nv = x[j] * inv_norm;
+        idxs[j] = host_turbo_nearest_4bit(nv);
+        const float cv = HOST_TURBO_CENTROIDS_4BIT[idxs[j]];
+        rred[j] = cv * cv;
+    }
+    for (int s = 32; s > 0; s >>= 1)
+        for (int j = 0; j < s; ++j) rred[j] += rred[j + s];
+    const float recon_norm     = sqrtf(rred[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    const size_t block_bytes = 2 + 2 * (size_t)N + (64 - (size_t)N) / 2;
+    memset(out, 0, block_bytes);
+    const ggml_fp16_t norm_h = ggml_fp32_to_fp16(corrected_norm);
+    memcpy(out + 0, &norm_h, sizeof(ggml_fp16_t));
+    for (int o = 0; o < N; ++o) {
+        const ggml_fp16_t ov = ggml_fp32_to_fp16(x[channels[o]]);
+        memcpy(out + 2 + o * (int)sizeof(ggml_fp16_t), &ov, sizeof(ggml_fp16_t));
+    }
+    int nib = 0;
+    const size_t qs_off = 2 + 2 * (size_t)N;
+    for (int j = 0; j < 64; ++j) {
+        if (is_outlier[j]) continue;
+        out[qs_off + (nib >> 1)] |= (uint8_t)(idxs[j] << ((nib & 1) * 4));
+        nib++;
+    }
+}
+
+static void host_turbo4_64_ol8_quantize_block(const float * x /*64*/, uint8_t * out /*46 bytes*/) {
+    host_turbo4_64_olN_quantize_block<8>(HOST_TURBO4_64_OL8_CHANNELS, x, out);
+}
+static void host_turbo4_64_ol12_quantize_block(const float * x /*64*/, uint8_t * out /*52 bytes*/) {
+    host_turbo4_64_olN_quantize_block<12>(HOST_TURBO4_64_OL12_CHANNELS, x, out);
+}
+
+static void fill_turbo4_64_ol8(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 46);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[64];
+        for (int j = 0; j < 64; ++j) x[j] = dist(rng);
+        host_turbo4_64_ol8_quantize_block(x, &buf[(size_t)b * 46]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+}
+
+static void fill_turbo4_64_ol12(ggml_tensor * t, uint32_t seed) {
+    const size_t nbytes = ggml_nbytes(t);
+    const int64_t n_blk = (int64_t)(nbytes / 52);
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint8_t> buf(nbytes, 0);
+    for (int64_t b = 0; b < n_blk; ++b) {
+        float x[64];
+        for (int j = 0; j < 64; ++j) x[j] = dist(rng);
+        host_turbo4_64_ol12_quantize_block(x, &buf[(size_t)b * 52]);
+    }
+    ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+}
+
 // Quantize one 32-element f32 vector into a valid 34-byte block_q8_0 (fp16
 // scale + int8 qs[32]) — standard symmetric per-block quant, much simpler
 // than the turbo4 no-RHT scheme: amax = max(|x|); scale = amax/127;
@@ -442,6 +639,187 @@ static bool scatter_turbo4_readback(const paged_case & c, ggml_backend_t vk) {
     const bool pass = (max_norm_err <= 1e-3) && (nibble_mismatch == 0);
     printf("%s: %s (max_norm_err=%.6f nibble_mismatch=%d)\n",
            label, pass ? "PASS" : "FAIL", max_norm_err, nibble_mismatch);
+    free_graph(g);
+    return pass;
+}
+
+// Deterministic, CUDA-free scatter-readback oracle for turbo4_64_ol (SP2.5,
+// 2026-07-01), mirroring scatter_turbo4_readback. Runs the op on Vulkan,
+// reads back k_cache, and checks each 40-byte block against
+// host_turbo4_64_ol_quantize_block applied to the same k_cur at the
+// expected element_block_index: outlier values within a small fp16-rounding
+// tolerance (verbatim storage, no centroid quant slop) and the 60 packed
+// nibbles exactly equal. Asserts per-block norm within 1e-3.
+static bool scatter_turbo4_64_ol_readback(const paged_case & c, ggml_backend_t vk) {
+    const char * label = "scatter turbo4_64_ol readback";
+
+    built_graph g = build_case(c, vk);
+    if (ggml_backend_graph_compute(vk, g.gf) != GGML_STATUS_SUCCESS) {
+        printf("%s: FAIL (graph compute error)\n", label);
+        free_graph(g);
+        return false;
+    }
+
+    const int HD           = c.head_dim;
+    const int total_tokens = c.q_len * c.n_seq;
+    const int BS           = c.block_size;
+    const int QK           = 64;
+    const int N_QBLK       = HD / QK;
+    const int n_kv_heads   = c.n_kv_heads;
+    const size_t BLOCK_BYTES = 40;  // fp16 norm + outliers[4] fp16 + qs[30]
+
+    std::vector<ggml_fp16_t> kcur(ggml_nelements(g.k_cur));
+    ggml_backend_tensor_get(g.k_cur, kcur.data(), 0, ggml_nbytes(g.k_cur));
+    std::vector<uint8_t> kc(ggml_nbytes(g.k_cache));
+    ggml_backend_tensor_get(g.k_cache, kc.data(), 0, ggml_nbytes(g.k_cache));
+
+    double max_norm_err    = 0.0;
+    double max_outlier_err = 0.0;
+    int    nibble_mismatch = 0;
+
+    for (int t = 0; t < total_tokens; ++t) {
+        const int slot          = t;            // slot_mapping[i] = i
+        const int paged_block   = slot / BS;
+        const int slot_in_block = slot % BS;
+        for (int h = 0; h < n_kv_heads; ++h) {
+            for (int qb = 0; qb < N_QBLK; ++qb) {
+                float x[64];
+                for (int j = 0; j < QK; ++j) {
+                    const int d = qb * QK + j;
+                    const size_t src = (size_t) t * n_kv_heads * HD + (size_t) h * HD + d;
+                    x[j] = ggml_fp16_to_fp32(kcur[src]);
+                }
+                uint8_t exp_block[40];
+                host_turbo4_64_ol_quantize_block(x, exp_block);
+
+                const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + h) * BS * N_QBLK
+                                       + (int64_t) slot_in_block * N_QBLK + qb;
+                const size_t base = (size_t) block_ib * BLOCK_BYTES;
+
+                ggml_fp16_t act_norm_h, exp_norm_h;
+                memcpy(&act_norm_h, &kc[base], sizeof(ggml_fp16_t));
+                memcpy(&exp_norm_h, exp_block, sizeof(ggml_fp16_t));
+                const double ne = std::fabs((double) ggml_fp16_to_fp32(act_norm_h)
+                                          - (double) ggml_fp16_to_fp32(exp_norm_h));
+                if (ne > max_norm_err) max_norm_err = ne;
+
+                for (int o = 0; o < 4; ++o) {
+                    ggml_fp16_t act_ol_h, exp_ol_h;
+                    memcpy(&act_ol_h, &kc[base + 2 + o * sizeof(ggml_fp16_t)], sizeof(ggml_fp16_t));
+                    memcpy(&exp_ol_h, exp_block + 2 + o * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                    const double oe = std::fabs((double) ggml_fp16_to_fp32(act_ol_h)
+                                              - (double) ggml_fp16_to_fp32(exp_ol_h));
+                    if (oe > max_outlier_err) max_outlier_err = oe;
+                }
+
+                int nib = 0;
+                for (int j = 0; j < QK; ++j) {
+                    int outlier_slot;
+                    if (host_turbo64_ol_is_outlier(j, &outlier_slot)) continue;
+                    const uint8_t byte = kc[base + 10 + (nib >> 1)];
+                    const uint8_t act  = (byte >> ((nib & 1) * 4)) & 0xF;
+                    const uint8_t exp_byte = exp_block[10 + (nib >> 1)];
+                    const uint8_t exp  = (exp_byte >> ((nib & 1) * 4)) & 0xF;
+                    if (act != exp) nibble_mismatch++;
+                    nib++;
+                }
+            }
+        }
+    }
+
+    const bool pass = (max_norm_err <= 1e-3) && (max_outlier_err <= 1e-3) && (nibble_mismatch == 0);
+    printf("%s: %s (max_norm_err=%.6f max_outlier_err=%.6f nibble_mismatch=%d)\n",
+           label, pass ? "PASS" : "FAIL", max_norm_err, max_outlier_err, nibble_mismatch);
+    free_graph(g);
+    return pass;
+}
+
+// Deterministic, CUDA-free scatter-readback oracle for turbo4_64_ol8 /
+// turbo4_64_ol12 (outlier-matrix sweep, 2026-07-01), mechanical mirror of
+// scatter_turbo4_64_ol_readback, generalized over N.
+template <int N>
+static bool scatter_turbo4_64_olN_readback(const char * label, const int (&channels)[N],
+                                            void (*quantize_block)(const float *, uint8_t *),
+                                            const paged_case & c, ggml_backend_t vk) {
+    built_graph g = build_case(c, vk);
+    if (ggml_backend_graph_compute(vk, g.gf) != GGML_STATUS_SUCCESS) {
+        printf("%s: FAIL (graph compute error)\n", label);
+        free_graph(g);
+        return false;
+    }
+
+    const int HD           = c.head_dim;
+    const int total_tokens = c.q_len * c.n_seq;
+    const int BS           = c.block_size;
+    const int QK           = 64;
+    const int N_QBLK       = HD / QK;
+    const int n_kv_heads   = c.n_kv_heads;
+    const size_t BLOCK_BYTES = 2 + 2 * (size_t)N + (64 - (size_t)N) / 2;
+    const size_t qs_off      = 2 + 2 * (size_t)N;
+
+    std::vector<ggml_fp16_t> kcur(ggml_nelements(g.k_cur));
+    ggml_backend_tensor_get(g.k_cur, kcur.data(), 0, ggml_nbytes(g.k_cur));
+    std::vector<uint8_t> kc(ggml_nbytes(g.k_cache));
+    ggml_backend_tensor_get(g.k_cache, kc.data(), 0, ggml_nbytes(g.k_cache));
+
+    double max_norm_err    = 0.0;
+    double max_outlier_err = 0.0;
+    int    nibble_mismatch = 0;
+
+    std::vector<uint8_t> exp_block(BLOCK_BYTES);
+
+    for (int t = 0; t < total_tokens; ++t) {
+        const int slot          = t;
+        const int paged_block   = slot / BS;
+        const int slot_in_block = slot % BS;
+        for (int h = 0; h < n_kv_heads; ++h) {
+            for (int qb = 0; qb < N_QBLK; ++qb) {
+                float x[64];
+                for (int j = 0; j < QK; ++j) {
+                    const int d = qb * QK + j;
+                    const size_t src = (size_t) t * n_kv_heads * HD + (size_t) h * HD + d;
+                    x[j] = ggml_fp16_to_fp32(kcur[src]);
+                }
+                quantize_block(x, exp_block.data());
+
+                const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + h) * BS * N_QBLK
+                                       + (int64_t) slot_in_block * N_QBLK + qb;
+                const size_t base = (size_t) block_ib * BLOCK_BYTES;
+
+                ggml_fp16_t act_norm_h, exp_norm_h;
+                memcpy(&act_norm_h, &kc[base], sizeof(ggml_fp16_t));
+                memcpy(&exp_norm_h, exp_block.data(), sizeof(ggml_fp16_t));
+                const double ne = std::fabs((double) ggml_fp16_to_fp32(act_norm_h)
+                                          - (double) ggml_fp16_to_fp32(exp_norm_h));
+                if (ne > max_norm_err) max_norm_err = ne;
+
+                for (int o = 0; o < N; ++o) {
+                    ggml_fp16_t act_ol_h, exp_ol_h;
+                    memcpy(&act_ol_h, &kc[base + 2 + o * sizeof(ggml_fp16_t)], sizeof(ggml_fp16_t));
+                    memcpy(&exp_ol_h, exp_block.data() + 2 + o * sizeof(ggml_fp16_t), sizeof(ggml_fp16_t));
+                    const double oe = std::fabs((double) ggml_fp16_to_fp32(act_ol_h)
+                                              - (double) ggml_fp16_to_fp32(exp_ol_h));
+                    if (oe > max_outlier_err) max_outlier_err = oe;
+                }
+
+                int nib = 0;
+                for (int j = 0; j < QK; ++j) {
+                    int outlier_slot;
+                    if (host_turbo64_olN_is_outlier<N>(channels, j, &outlier_slot)) continue;
+                    const uint8_t byte = kc[base + qs_off + (nib >> 1)];
+                    const uint8_t act  = (byte >> ((nib & 1) * 4)) & 0xF;
+                    const uint8_t exp_byte = exp_block[qs_off + (nib >> 1)];
+                    const uint8_t exp  = (exp_byte >> ((nib & 1) * 4)) & 0xF;
+                    if (act != exp) nibble_mismatch++;
+                    nib++;
+                }
+            }
+        }
+    }
+
+    const bool pass = (max_norm_err <= 1e-3) && (max_outlier_err <= 1e-3) && (nibble_mismatch == 0);
+    printf("%s: %s (max_norm_err=%.6f max_outlier_err=%.6f nibble_mismatch=%d)\n",
+           label, pass ? "PASS" : "FAIL", max_norm_err, max_outlier_err, nibble_mismatch);
     free_graph(g);
     return pass;
 }
@@ -753,6 +1131,50 @@ int main() {
     {
         const paged_case t64 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64 };
         all_ok = scatter_turbo4_readback(t64, vk) && all_ok;
+    }
+
+    // ── turbo4_64_ol (SP2.5, 2026-07-01): turbo4_64 with 4 fixed-position
+    //    outlier channels {53,49,52,20} extracted verbatim and excluded from
+    //    the group-norm/centroid quant of the remaining 60 elements. Same
+    //    5e-2 tolerance as turbo4_64 (still 4-bit-dominant). head_dim==64 only.
+    {
+        const paged_case t64ol { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64_OL };
+        all_ok = compare_paged_case("paged turbo4_64_ol hd64 prefill", t64ol, vk, cuda, 5e-2) && all_ok;
+        for (int ctx : { 128, 512 }) {
+            char l[64]; snprintf(l, sizeof l, "paged turbo4_64_ol hd64 decode ctx=%d", ctx);
+            const paged_case d64ol { 64, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_64_OL };
+            all_ok = compare_paged_case(l, d64ol, vk, cuda, 5e-2) && all_ok;
+        }
+        // Cooperative scatter quantizer: device scatter vs host quantizer,
+        // bit-exact (nibbles) / near-exact (fp16 outliers + norm). Cache is
+        // NOT pre-filled, so the device scatter is what populates it.
+        all_ok = scatter_turbo4_64_ol_readback(t64ol, vk) && all_ok;
+    }
+
+    // ── turbo4_64_ol8 / turbo4_64_ol12 (outlier-matrix sweep, 2026-07-01):
+    //    turbo4_64_ol with 8 / 12 fixed outlier channels instead of 4. Same
+    //    5e-2 tolerance, head_dim==64 only. Mirrors the turbo4_64_ol block above.
+    {
+        const paged_case t64ol8 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64_OL8 };
+        all_ok = compare_paged_case("paged turbo4_64_ol8 hd64 prefill", t64ol8, vk, cuda, 5e-2) && all_ok;
+        for (int ctx : { 128, 512 }) {
+            char l[64]; snprintf(l, sizeof l, "paged turbo4_64_ol8 hd64 decode ctx=%d", ctx);
+            const paged_case d64ol8 { 64, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_64_OL8 };
+            all_ok = compare_paged_case(l, d64ol8, vk, cuda, 5e-2) && all_ok;
+        }
+        all_ok = scatter_turbo4_64_olN_readback<8>("scatter turbo4_64_ol8 readback",
+                     HOST_TURBO4_64_OL8_CHANNELS, host_turbo4_64_ol8_quantize_block, t64ol8, vk) && all_ok;
+    }
+    {
+        const paged_case t64ol12 { 64, 8, 2, 16, 32, 32, 1, GGML_TYPE_TURBO4_64_OL12 };
+        all_ok = compare_paged_case("paged turbo4_64_ol12 hd64 prefill", t64ol12, vk, cuda, 5e-2) && all_ok;
+        for (int ctx : { 128, 512 }) {
+            char l[64]; snprintf(l, sizeof l, "paged turbo4_64_ol12 hd64 decode ctx=%d", ctx);
+            const paged_case d64ol12 { 64, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_64_OL12 };
+            all_ok = compare_paged_case(l, d64ol12, vk, cuda, 5e-2) && all_ok;
+        }
+        all_ok = scatter_turbo4_64_olN_readback<12>("scatter turbo4_64_ol12 readback",
+                     HOST_TURBO4_64_OL12_CHANNELS, host_turbo4_64_ol12_quantize_block, t64ol12, vk) && all_ok;
     }
 
     // ── Q8_0 (this task): standard 8-bit symmetric per-32-element-block quant.

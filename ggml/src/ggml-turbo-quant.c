@@ -670,6 +670,279 @@ void dequantize_row_turbo4_64(const block_turbo4_64 * GGML_RESTRICT x, float * G
     }
 }
 
+/* turbo4_64_ol: turbo4_64 with 4 fixed-position "massive activation" outlier
+ * channels {53,49,52,20} extracted verbatim at f16, excluded from the
+ * group-norm and centroid quantization of the remaining 60 elements. Uses
+ * the SAME shared CENTROIDS_4BIT table as turbo4_0/turbo4_64's CPU stub
+ * above (NOT the N=64-calibrated table used by the CUDA/Vulkan paged hot
+ * path) — removing outliers from the norm makes the remaining 60 "typical"
+ * values close enough to the N=128 assumption for this table to be
+ * appropriate again. These CPU refs exist only to satisfy ggml type-traits
+ * for GGML_TYPE_TURBO4_64_OL; the hot path is CUDA/Vulkan paged attention. */
+void quantize_row_turbo4_64_ol_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL_N_OUTLIERS] = TURBO4_64_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            y[block].outliers[o] = GGML_FP32_TO_FP16(src[outlier_ch[o]]);
+        }
+
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (!is_outlier[i]) norm_sq += src[i] * src[i];
+        }
+        const float norm = sqrtf(norm_sq);
+        const float inv  = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+
+        uint8_t indices[QK_TURBO4_64];
+        memset(indices, 0, sizeof(indices));
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            indices[i] = (uint8_t) nearest_centroid_4bit(src[i] * inv);
+        }
+
+        float recon_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            recon_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
+        }
+        const float recon_norm     = sqrtf(recon_sq);
+        const float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+
+        memset(y[block].qs, 0, sizeof(y[block].qs));
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            y[block].qs[nib / 2] |= (uint8_t)((indices[i] & 0xF) << ((nib % 2) * 4));
+            nib++;
+        }
+    }
+}
+
+void dequantize_row_turbo4_64_ol(const block_turbo4_64_ol * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL_N_OUTLIERS] = TURBO4_64_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            dst[outlier_ch[o]] = GGML_FP16_TO_FP32(x[block].outliers[o]);
+        }
+
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            uint8_t idx = (x[block].qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
+            nib++;
+        }
+    }
+}
+
+/* turbo4_64_ol8 / turbo4_64_ol12: outlier-matrix sweep (2026-07-01) variants
+ * of turbo4_64_ol with 8 / 12 fixed outlier channels instead of 4. Mechanical
+ * mirror of quantize_row_turbo4_64_ol_ref / dequantize_row_turbo4_64_ol above
+ * — same shared CENTROIDS_4BIT table, just a different N_OUTLIERS/channel
+ * list and block struct. CPU refs exist only to satisfy ggml type-traits;
+ * the hot path is CUDA/Vulkan paged attention. */
+void quantize_row_turbo4_64_ol8_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol8 * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL8_N_OUTLIERS] = TURBO4_64_OL8_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL8_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            y[block].outliers[o] = GGML_FP32_TO_FP16(src[outlier_ch[o]]);
+        }
+
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (!is_outlier[i]) norm_sq += src[i] * src[i];
+        }
+        const float norm = sqrtf(norm_sq);
+        const float inv  = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+
+        uint8_t indices[QK_TURBO4_64];
+        memset(indices, 0, sizeof(indices));
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            indices[i] = (uint8_t) nearest_centroid_4bit(src[i] * inv);
+        }
+
+        float recon_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            recon_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
+        }
+        const float recon_norm     = sqrtf(recon_sq);
+        const float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+
+        memset(y[block].qs, 0, sizeof(y[block].qs));
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            y[block].qs[nib / 2] |= (uint8_t)((indices[i] & 0xF) << ((nib % 2) * 4));
+            nib++;
+        }
+    }
+}
+
+void dequantize_row_turbo4_64_ol8(const block_turbo4_64_ol8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL8_N_OUTLIERS] = TURBO4_64_OL8_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL8_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            dst[outlier_ch[o]] = GGML_FP16_TO_FP32(x[block].outliers[o]);
+        }
+
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            uint8_t idx = (x[block].qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
+            nib++;
+        }
+    }
+}
+
+void quantize_row_turbo4_64_ol12_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol12 * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL12_N_OUTLIERS] = TURBO4_64_OL12_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float * src = x + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL12_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            y[block].outliers[o] = GGML_FP32_TO_FP16(src[outlier_ch[o]]);
+        }
+
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (!is_outlier[i]) norm_sq += src[i] * src[i];
+        }
+        const float norm = sqrtf(norm_sq);
+        const float inv  = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+
+        uint8_t indices[QK_TURBO4_64];
+        memset(indices, 0, sizeof(indices));
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            indices[i] = (uint8_t) nearest_centroid_4bit(src[i] * inv);
+        }
+
+        float recon_sq = 0.0f;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            recon_sq += CENTROIDS_4BIT[indices[i]] * CENTROIDS_4BIT[indices[i]];
+        }
+        const float recon_norm     = sqrtf(recon_sq);
+        const float corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        y[block].norm = GGML_FP32_TO_FP16(corrected_norm);
+
+        memset(y[block].qs, 0, sizeof(y[block].qs));
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            y[block].qs[nib / 2] |= (uint8_t)((indices[i] & 0xF) << ((nib % 2) * 4));
+            nib++;
+        }
+    }
+}
+
+void dequantize_row_turbo4_64_ol12(const block_turbo4_64_ol12 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const float CENTROIDS_4BIT[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    static const int outlier_ch[TURBO4_64_OL12_N_OUTLIERS] = TURBO4_64_OL12_OUTLIER_CHANNELS;
+    assert(k % QK_TURBO4_64 == 0);
+    const int nb = k / QK_TURBO4_64;
+    const int d  = QK_TURBO4_64;
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float * dst = y + block * d;
+
+        bool is_outlier[QK_TURBO4_64];
+        memset(is_outlier, 0, sizeof(is_outlier));
+        for (int o = 0; o < TURBO4_64_OL12_N_OUTLIERS; o++) {
+            is_outlier[outlier_ch[o]] = true;
+            dst[outlier_ch[o]] = GGML_FP16_TO_FP32(x[block].outliers[o]);
+        }
+
+        int nib = 0;
+        for (int i = 0; i < d; i++) {
+            if (is_outlier[i]) continue;
+            uint8_t idx = (x[block].qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+            dst[i] = CENTROIDS_4BIT[idx] * norm;
+            nib++;
+        }
+    }
+}
+
 size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                          int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_UNUSED(imatrix);

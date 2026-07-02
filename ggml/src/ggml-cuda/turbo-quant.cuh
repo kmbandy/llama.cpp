@@ -12,6 +12,7 @@
 #include "turbo-innerq.cuh"
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 
 // ---- Quantization ratios for dequantize_block template ----
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
@@ -402,6 +403,100 @@ static __device__ __forceinline__ float turbo4_64_dequant_element(
         const block_turbo4_64 * __restrict__ x, int j, float norm) {
     uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     return TURBO_CENTROIDS_4BIT_N64[idx] * norm;
+}
+
+// ---- turbo4_64_ol: fixed-position outlier-channel extraction (SP2.5, 2026-07-01) ----
+//
+// 4 fixed channel positions per 64-element block are excluded from the
+// group-norm and stored verbatim at f16; the remaining 60 elements are
+// centroid-quantized with the SHARED (unmodified) TURBO_CENTROIDS_4BIT /
+// TURBO_MID_4BIT table above — NOT TURBO_CENTROIDS_4BIT_N64 — since
+// removing the outliers makes the remaining 60 "typical" values close
+// enough to the N=128 assumption for that table to be appropriate again.
+// Positions MUST stay byte-for-byte identical between CUDA and Vulkan.
+static __constant__ int TURBO4_64_OL_CHANNELS[TURBO4_64_OL_N_OUTLIERS] = TURBO4_64_OUTLIER_CHANNELS;
+
+// nib is the index (0..59) into the packed (non-outlier) nibble stream, NOT
+// the raw channel position d — callers must map d -> nib themselves (see
+// paged_cache_ops<TURBO4_64_OL>::k_load, which precomputes this once).
+static __device__ __forceinline__ float turbo4_64_ol_dequant_nib(
+        const block_turbo4_64_ol * __restrict__ x, int nib, float norm) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
+// ---- outlier-matrix sweep (2026-07-01): runtime centroid-table toggle ----
+//
+// Temporary, investigative-only mechanism (see task brief
+// .superpowers/sdd/outlier-matrix-task-brief.md) for sweeping whether the
+// N=64-recalibrated centroid table (TURBO_CENTROIDS_4BIT_N64/TURBO_MID_4BIT_N64)
+// is a better fit than the original TURBO_CENTROIDS_4BIT/TURBO_MID_4BIT table
+// for the NON-outlier elements of turbo4_64_ol/ol8/ol12, once the massive-
+// activation outlier channels have already been removed from the norm.
+// GGML_TURBO4_64_OL_TABLE=n64 selects the N64 table; anything else (including
+// unset) keeps the current/default original-table behavior. Read once on the
+// host per process and cached; callers pass the resulting bool down into the
+// scatter/dequant device functions below. Not a permanent feature.
+static inline bool ggml_cuda_turbo4_64_ol_use_n64_table() {
+    static const bool use_n64 = []() {
+        const char * v = getenv("GGML_TURBO4_64_OL_TABLE");
+        return v != nullptr && strcmp(v, "n64") == 0;
+    }();
+    return use_n64;
+}
+
+// getenv() is host-only and cannot be called from __device__/__global__ code.
+// Device-side kernels must NOT call ggml_cuda_turbo4_64_ol_use_n64_table()
+// directly. Instead, the host reads the env var once (above), syncs it into
+// this __device__ global via ggml_cuda_turbo4_64_ol_sync_n64_table_flag()
+// (call once per process before launching any turbo4_64_ol/ol8/ol12 scatter
+// or paged-attention kernel), and device code reads the global directly via
+// ggml_cuda_turbo4_64_ol_use_n64_table_dev().
+__device__ int g_turbo4_64_ol_use_n64_table = 0;
+
+static inline void ggml_cuda_turbo4_64_ol_sync_n64_table_flag() {
+    static bool synced = false;
+    if (!synced) {
+        const int val = ggml_cuda_turbo4_64_ol_use_n64_table() ? 1 : 0;
+        cudaMemcpyToSymbol(g_turbo4_64_ol_use_n64_table, &val, sizeof(int));
+        synced = true;
+    }
+}
+
+static __device__ __forceinline__ bool ggml_cuda_turbo4_64_ol_use_n64_table_dev() {
+    return g_turbo4_64_ol_use_n64_table != 0;
+}
+
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_4bit_sel(float val, bool use_n64) {
+    return use_n64 ? turbo_nearest_centroid_4bit_n64(val) : turbo_nearest_centroid_4bit(val);
+}
+
+static __device__ __forceinline__ float turbo_centroid_4bit_sel(uint8_t idx, bool use_n64) {
+    return use_n64 ? TURBO_CENTROIDS_4BIT_N64[idx] : TURBO_CENTROIDS_4BIT[idx];
+}
+
+static __device__ __forceinline__ float turbo4_64_ol_dequant_nib_sel(
+        const block_turbo4_64_ol * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
+}
+
+// ---- turbo4_64_ol8: 8 fixed outlier channels (outlier-matrix sweep) ----
+static __constant__ int TURBO4_64_OL8_CHANNELS[TURBO4_64_OL8_N_OUTLIERS] = TURBO4_64_OL8_OUTLIER_CHANNELS;
+
+static __device__ __forceinline__ float turbo4_64_ol8_dequant_nib_sel(
+        const block_turbo4_64_ol8 * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
+}
+
+// ---- turbo4_64_ol12: 12 fixed outlier channels (outlier-matrix sweep) ----
+static __constant__ int TURBO4_64_OL12_CHANNELS[TURBO4_64_OL12_N_OUTLIERS] = TURBO4_64_OL12_OUTLIER_CHANNELS;
+
+static __device__ __forceinline__ float turbo4_64_ol12_dequant_nib_sel(
+        const block_turbo4_64_ol12 * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----

@@ -112,6 +112,19 @@ GGML_API void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, fl
 // the paged scatter convention (dequant = centroid*norm).
 GGML_API void quantize_row_turbo4_64_ref(const float * GGML_RESTRICT x, block_turbo4_64 * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_turbo4_64(const block_turbo4_64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// turbo4_64_ol: turbo4_64 with 4 fixed-position outlier channels {53,49,52,20}
+// extracted verbatim at f16 and excluded from the group-norm/centroid quant of
+// the remaining 60 elements. CPU refs exist to satisfy ggml type-traits; the
+// hot path is CUDA/Vulkan paged attention.
+GGML_API void quantize_row_turbo4_64_ol_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4_64_ol(const block_turbo4_64_ol * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// turbo4_64_ol8 / turbo4_64_ol12: outlier-matrix sweep (2026-07-01), same idea
+// as turbo4_64_ol but with 8 / 12 fixed outlier channels. CPU refs exist to
+// satisfy ggml type-traits; the hot path is CUDA/Vulkan paged attention.
+GGML_API void quantize_row_turbo4_64_ol8_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol8 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4_64_ol8(const block_turbo4_64_ol8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void quantize_row_turbo4_64_ol12_ref(const float * GGML_RESTRICT x, block_turbo4_64_ol12 * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_turbo4_64_ol12(const block_turbo4_64_ol12 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k);

@@ -1380,6 +1380,14 @@ struct vk_op_paged_scatter_pc {
     uint32_t BS;
     uint32_t n_kv_heads;
     uint32_t n_tokens;
+    // Outlier-matrix sweep (2026-07-01, investigative-only): mirrors
+    // GGML_TURBO4_64_OL_TABLE read on the host (see
+    // ggml_vk_turbo4_64_ol_use_n64_table below / ggml_cuda_turbo4_64_ol_use_n64_table
+    // in turbo-quant.cuh). Nonzero selects TURBO_CENTROIDS_4BIT_N64 /
+    // TURBO_MID_4BIT_N64 for the turbo4_64_ol/ol8/ol12 non-outlier elements
+    // instead of the default TURBO_CENTROIDS_4BIT/TURBO_MID_4BIT table.
+    // Ignored by all other cache types. Not a permanent field.
+    uint32_t use_n64_table;
 };
 
 struct vk_op_paged_attn_pc {
@@ -1391,6 +1399,8 @@ struct vk_op_paged_attn_pc {
     uint32_t n_seq;
     uint32_t n_tokens;
     float    scale;
+    // See vk_op_paged_scatter_pc::use_n64_table above (investigative-only).
+    uint32_t use_n64_table;
 };
 
 // SP2 Task 5 split-K decode push constants. Must match
@@ -1404,6 +1414,8 @@ struct vk_op_paged_decode_pc {
     uint32_t n_seq;
     uint32_t num_splits;
     float    scale;
+    // See vk_op_paged_scatter_pc::use_n64_table above (investigative-only).
+    uint32_t use_n64_table;
 };
 
 struct vk_op_paged_decode_reduce_pc {
@@ -5012,11 +5024,29 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_64],        "paged_attn_turbo4_64",        paged_attn_turbo4_64_len,        paged_attn_turbo4_64_data,        "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_Q8_0],             "paged_attn_q8_0",             paged_attn_q8_0_len,             paged_attn_q8_0_data,             "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
 
+    // turbo4_64_ol cache path (SP2.5, 2026-07-01): turbo4_64 with 4 fixed-position
+    // outlier channels excluded from the group-norm/centroid quant, stored verbatim.
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_64_OL], "paged_attn_scatter_turbo4_64_ol", paged_attn_scatter_turbo4_64_ol_len, paged_attn_scatter_turbo4_64_ol_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_64_OL],        "paged_attn_turbo4_64_ol",        paged_attn_turbo4_64_ol_len,        paged_attn_turbo4_64_ol_data,        "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
+
+    // turbo4_64_ol8 / turbo4_64_ol12 (2026-07-01 outlier-matrix sweep): same
+    // family as turbo4_64_ol above, just 8 and 12 fixed outlier channels
+    // respectively (see ggml-common.h TURBO4_64_OL8_OUTLIER_CHANNELS /
+    // TURBO4_64_OL12_OUTLIER_CHANNELS). Shader sources are shared with
+    // turbo4_64_ol via preprocessor defines (see vulkan-shaders-gen.cpp).
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_64_OL8], "paged_attn_scatter_turbo4_64_ol8", paged_attn_scatter_turbo4_64_ol8_len, paged_attn_scatter_turbo4_64_ol8_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_64_OL8],        "paged_attn_turbo4_64_ol8",        paged_attn_turbo4_64_ol8_len,        paged_attn_turbo4_64_ol8_data,        "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_scatter[GGML_TYPE_TURBO4_64_OL12], "paged_attn_scatter_turbo4_64_ol12", paged_attn_scatter_turbo4_64_ol12_len, paged_attn_scatter_turbo4_64_ol12_data, "main", 5, sizeof(vk_op_paged_scatter_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn[GGML_TYPE_TURBO4_64_OL12],        "paged_attn_turbo4_64_ol12",        paged_attn_turbo4_64_ol12_len,        paged_attn_turbo4_64_ol12_data,        "main", 7, sizeof(vk_op_paged_attn_pc),   {1,1,1}, {}, 1);
+
     // SP2 Task 5: split-K decode. Pass-1 (decode) has 7 bindings per cache type;
     // pass-2 (reduce) is type-agnostic with 3 bindings. Both wg_denoms {1,1,1}, local_size 128.
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_F16],      "paged_attn_decode_f16",      paged_attn_decode_f16_len,      paged_attn_decode_f16_data,      "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_0], "paged_attn_decode_turbo4_0", paged_attn_decode_turbo4_0_len, paged_attn_decode_turbo4_0_data, "main", 7, sizeof(vk_op_paged_decode_pc),        {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_64], "paged_attn_decode_turbo4_64", paged_attn_decode_turbo4_64_len, paged_attn_decode_turbo4_64_data, "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_64_OL], "paged_attn_decode_turbo4_64_ol", paged_attn_decode_turbo4_64_ol_len, paged_attn_decode_turbo4_64_ol_data, "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_64_OL8], "paged_attn_decode_turbo4_64_ol8", paged_attn_decode_turbo4_64_ol8_len, paged_attn_decode_turbo4_64_ol8_data, "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_TURBO4_64_OL12], "paged_attn_decode_turbo4_64_ol12", paged_attn_decode_turbo4_64_ol12_len, paged_attn_decode_turbo4_64_ol12_data, "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode[GGML_TYPE_Q8_0],      "paged_attn_decode_q8_0",      paged_attn_decode_q8_0_len,      paged_attn_decode_q8_0_data,      "main", 7, sizeof(vk_op_paged_decode_pc), {1,1,1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_paged_attn_decode_reduce,              "paged_attn_decode_reduce",   paged_attn_decode_reduce_len,   paged_attn_decode_reduce_data,   "main", 3, sizeof(vk_op_paged_decode_reduce_pc), {1, 1, 1}, {}, 1);
 
@@ -10000,6 +10030,24 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// ---- outlier-matrix sweep (2026-07-01): runtime centroid-table toggle ----
+//
+// Vulkan-side equivalent of ggml_cuda_turbo4_64_ol_use_n64_table() in
+// turbo-quant.cuh. Temporary, investigative-only mechanism (see task brief
+// .superpowers/sdd/outlier-matrix-task-brief.md): GGML_TURBO4_64_OL_TABLE=n64
+// selects the N=64-recalibrated centroid table for the non-outlier elements
+// of turbo4_64_ol/ol8/ol12; anything else (including unset) keeps the
+// default table. Read once on the host per process and cached, then passed
+// down as the use_n64_table push-constant field to the scatter/attn/decode
+// pipelines whenever the KV cache type is one of the turbo4_64_ol family.
+static bool ggml_vk_turbo4_64_ol_use_n64_table() {
+    static const bool use_n64 = []() {
+        const char * v = getenv("GGML_TURBO4_64_OL_TABLE");
+        return v != nullptr && strcmp(v, "n64") == 0;
+    }();
+    return use_n64;
+}
+
 // SP2: paged attention (GGML_OP_PAGED_ATTN_MT). Mirrors the CUDA dispatch
 // (mt::ggml_cuda_op_paged_attn_mt): scatter K_cur/V_cur into the paged cache,
 // barrier, then prefill attention. F16 cache path (Task 3); Task 4 adds turbo4_0.
@@ -10069,10 +10117,17 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     // Phase 1: scatter K_cur/V_cur into the paged cache.
     // grid = { n_tokens, n_kv_heads * n_qblk, 2 } (z selects K vs V; y fans out
     // per 128-element quant-block so head_dim multiples of 128 are supported).
+    const bool is_t64_ol_family = (cache_type == GGML_TYPE_TURBO4_64_OL ||
+                                    cache_type == GGML_TYPE_TURBO4_64_OL8 ||
+                                    cache_type == GGML_TYPE_TURBO4_64_OL12);
     const uint32_t qblk_elems = (cache_type == GGML_TYPE_Q8_0) ? 32u :
-                                 (cache_type == GGML_TYPE_TURBO4_64) ? 64u : 128u; // q8_0: 32-elt blocks, turbo4_64: 64-elt blocks
+                                 (cache_type == GGML_TYPE_TURBO4_64 || is_t64_ol_family) ? 64u : 128u; // q8_0: 32-elt blocks, turbo4_64/turbo4_64_ol family: 64-elt blocks
     const uint32_t n_qblk     = head_size / qblk_elems;     // head_dim is a multiple of qblk_elems
-    const vk_op_paged_scatter_pc scatter_pc = { head_size, block_size, n_kv_heads, n_tokens };
+    // Outlier-matrix sweep (investigative-only, see ggml_vk_turbo4_64_ol_use_n64_table
+    // above): only meaningful for the turbo4_64_ol/ol8/ol12 family; 0 (default
+    // table) for every other cache type.
+    const uint32_t use_n64_table = (is_t64_ol_family && ggml_vk_turbo4_64_ol_use_n64_table()) ? 1u : 0u;
+    const vk_op_paged_scatter_pc scatter_pc = { head_size, block_size, n_kv_heads, n_tokens, use_n64_table };
     ggml_vk_dispatch_pipeline(ctx, subctx, scatter_pipeline,
         { slot_mapping_buf, k_cur_buf, v_cur_buf, k_cache_buf, v_cache_buf },
         scatter_pc, { n_tokens, n_kv_heads * n_qblk, 2 });
@@ -10101,7 +10156,7 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
 
         // Pass 1: per-chunk partials. grid = { n_seq, n_heads, num_splits }.
         const vk_op_paged_decode_pc decode_pc = {
-            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, num_splits, scale
+            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, num_splits, scale, use_n64_table
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, decode_pipeline,
             { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, partials_buf },
@@ -10120,7 +10175,7 @@ static void ggml_vk_paged_attn_mt(ggml_backend_vk_context * ctx, vk_context& sub
     } else {
         // Phase 2: prefill attention. grid = { n_tokens, n_heads, 1 }.
         const vk_op_paged_attn_pc attn_pc = {
-            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, n_tokens, scale
+            head_size, block_size, n_heads, n_kv_heads, max_bps, n_seq, n_tokens, scale, use_n64_table
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, attn_pipeline,
             { q_buf, k_cache_buf, v_cache_buf, block_tables_buf, context_lens_buf, q_lens_buf, dst_buf },
@@ -17009,15 +17064,20 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // K and V cache must share type; F16 (Task 3) or TURBO4_0 (Task 4) or
-                // TURBO4_64 (Task 3, head_dim==64 only, read path) or Q8_0 (this task).
+                // TURBO4_64 (Task 3, head_dim==64 only, read path) or Q8_0 (this task)
+                // or TURBO4_64_OL/_OL8/_OL12 (SP2.5 + 2026-07-01 outlier-matrix sweep,
+                // head_dim==64 only, fixed-outlier-channel variants).
                 if (k_cache->type != v_cache->type) {
                     return false;
                 }
-                const bool is_t64  = (k_cache->type == GGML_TYPE_TURBO4_64);
-                const bool is_q8_0 = (k_cache->type == GGML_TYPE_Q8_0);
+                const bool is_t64    = (k_cache->type == GGML_TYPE_TURBO4_64);
+                const bool is_t64_ol = (k_cache->type == GGML_TYPE_TURBO4_64_OL ||
+                                        k_cache->type == GGML_TYPE_TURBO4_64_OL8 ||
+                                        k_cache->type == GGML_TYPE_TURBO4_64_OL12);
+                const bool is_q8_0   = (k_cache->type == GGML_TYPE_Q8_0);
                 if (k_cache->type != GGML_TYPE_F16 &&
                     k_cache->type != GGML_TYPE_TURBO4_0 &&
-                    !is_t64 && !is_q8_0) {
+                    !is_t64 && !is_t64_ol && !is_q8_0) {
                     return false;
                 }
                 // Scatter inputs are always F16 regardless of cache type.
@@ -17029,8 +17089,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // head_dim and block_size constraints (cache layout assumptions).
-                if (is_t64) {
-                    if (q->ne[0] != 64) { return false; }          // turbo4_64: one 64-elt block/head
+                if (is_t64 || is_t64_ol) {
+                    if (q->ne[0] != 64) { return false; }          // turbo4_64/turbo4_64_ol: one 64-elt block/head
                 } else if (is_q8_0) {
                     if (q->ne[0] % 32 != 0) { return false; }       // q8_0: 32-elt blocks divide 64/128/256 evenly
                 } else {

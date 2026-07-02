@@ -815,9 +815,23 @@ void process_shaders() {
     string_to_spv("paged_attn_f16",         "paged_attn.comp",         {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_scatter_turbo4_0", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_scatter_turbo4_64", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_64_ol", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    // turbo4_64_ol8 / turbo4_64_ol12 (2026-07-01 outlier-matrix sweep): same
+    // DATA_A_TURBO4_64_OL shader source as the N=4 variant above, just
+    // parameterized with a different outlier count / channel list via
+    // PA_TURBO4_64_OL_N / PA_TURBO4_64_OL_CHANNELS_INIT (see
+    // paged_cache_ops.glsl / paged_attn_scatter.comp for the generalization).
+    // Channel lists MUST stay byte-for-byte identical to
+    // TURBO4_64_OL8_OUTLIER_CHANNELS / TURBO4_64_OL12_OUTLIER_CHANNELS in
+    // ggml-common.h.
+    string_to_spv("paged_attn_scatter_turbo4_64_ol8",  "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_64_ol12", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_scatter_q8_0",     "paged_attn_scatter.comp", {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_turbo4_0",         "paged_attn.comp",         {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_turbo4_64",        "paged_attn.comp",        {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol",     "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol8",    "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol12",   "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_q8_0",             "paged_attn.comp",        {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
 
     // SP2 Task 5: split-K decode (q_len==1 fast path). Per-type pass-1 decode
@@ -826,6 +840,9 @@ void process_shaders() {
     string_to_spv("paged_attn_decode_f16",      "paged_attn_decode.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_decode_turbo4_0", "paged_attn_decode.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_decode_turbo4_64", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol8",  "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol12", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_decode_q8_0",     "paged_attn_decode.comp", {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
     string_to_spv("paged_attn_decode_reduce",   "paged_attn_decode_reduce.comp", {{"D_TYPE","float16_t"}});
 

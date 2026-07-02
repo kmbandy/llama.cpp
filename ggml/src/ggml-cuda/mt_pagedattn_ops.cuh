@@ -187,6 +187,178 @@ struct paged_cache_ops<GGML_TYPE_TURBO4_64, HEAD_SIZE, BLOCK_SIZE> {
     }
 };
 
+// Turbo4_64_ol specialization (SP2.5, 2026-07-01): turbo4_64 with 4
+// fixed-position outlier channels {53,49,52,20} extracted verbatim at f16
+// and excluded from the group-norm/centroid quant of the remaining 60
+// elements. Same block-index layout as TURBO4_64 (1 block/token at
+// head_dim 64); only the block struct (block_turbo4_64_ol, 40 bytes) and
+// per-element dequant (outlier passthrough vs. nibble lookup) differ.
+// kv_store omitted — handled by a dedicated cooperative scatter kernel.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO4_64_OL, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO4_64;  // 64
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    // Returns true and sets *outlier_slot if channel iqs (0..63) is one of
+    // the 4 fixed outlier positions; otherwise returns false and sets *nib
+    // to the packed-nibble index (0..59) for iqs among the non-outlier
+    // channels, in ascending-d order (must match the scatter kernel's
+    // packing order).
+    __device__ __forceinline__ static bool classify(int iqs, int * outlier_slot, int * nib) {
+        int n = 0;
+        #pragma unroll
+        for (int o = 0; o < TURBO4_64_OL_N_OUTLIERS; o++) {
+            if (TURBO4_64_OL_CHANNELS[o] == iqs) {
+                *outlier_slot = o;
+                return true;
+            }
+            if (TURBO4_64_OL_CHANNELS[o] < iqs) n++;
+        }
+        *nib = iqs - n;
+        return false;
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo4_64_ol * blocks = (const block_turbo4_64_ol *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        int outlier_slot, nib;
+        if (classify(iqs, &outlier_slot, &nib)) {
+            return __half2float(blocks[ib].outliers[outlier_slot]);
+        }
+        const float norm = __half2float(blocks[ib].norm);
+        return turbo4_64_ol_dequant_nib_sel(&blocks[ib], nib, norm, ggml_cuda_turbo4_64_ol_use_n64_table_dev());
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
+// Turbo4_64_ol8 specialization (outlier-matrix sweep): same layout as
+// TURBO4_64_OL, but with 8 fixed-position outlier channels (see
+// TURBO4_64_OL8_CHANNELS / block_turbo4_64_ol8) instead of 4.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO4_64_OL8, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO4_64;  // 64
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    // Returns true and sets *outlier_slot if channel iqs (0..63) is one of
+    // the 8 fixed outlier positions; otherwise returns false and sets *nib
+    // to the packed-nibble index (0..55) for iqs among the non-outlier
+    // channels, in ascending-d order (must match the scatter kernel's
+    // packing order).
+    __device__ __forceinline__ static bool classify(int iqs, int * outlier_slot, int * nib) {
+        int n = 0;
+        #pragma unroll
+        for (int o = 0; o < TURBO4_64_OL8_N_OUTLIERS; o++) {
+            if (TURBO4_64_OL8_CHANNELS[o] == iqs) {
+                *outlier_slot = o;
+                return true;
+            }
+            if (TURBO4_64_OL8_CHANNELS[o] < iqs) n++;
+        }
+        *nib = iqs - n;
+        return false;
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo4_64_ol8 * blocks = (const block_turbo4_64_ol8 *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        int outlier_slot, nib;
+        if (classify(iqs, &outlier_slot, &nib)) {
+            return __half2float(blocks[ib].outliers[outlier_slot]);
+        }
+        const float norm = __half2float(blocks[ib].norm);
+        return turbo4_64_ol8_dequant_nib_sel(&blocks[ib], nib, norm, ggml_cuda_turbo4_64_ol_use_n64_table_dev());
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
+// Turbo4_64_ol12 specialization (outlier-matrix sweep): same layout as
+// TURBO4_64_OL, but with 12 fixed-position outlier channels (see
+// TURBO4_64_OL12_CHANNELS / block_turbo4_64_ol12) instead of 4.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+struct paged_cache_ops<GGML_TYPE_TURBO4_64_OL12, HEAD_SIZE, BLOCK_SIZE> {
+    static constexpr int Q_BLOCK = QK_TURBO4_64;  // 64
+    static constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    __device__ __forceinline__ static int64_t element_block_index(
+            int paged_block, int kv_head, int n_kv_heads, int token_in_block, int d) {
+        return ((int64_t) paged_block * n_kv_heads + kv_head) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+             + (int64_t) token_in_block * N_QBLOCKS_PER_TOKEN
+             + (int64_t) (d / Q_BLOCK);
+    }
+
+    // Returns true and sets *outlier_slot if channel iqs (0..63) is one of
+    // the 12 fixed outlier positions; otherwise returns false and sets *nib
+    // to the packed-nibble index (0..51) for iqs among the non-outlier
+    // channels, in ascending-d order (must match the scatter kernel's
+    // packing order).
+    __device__ __forceinline__ static bool classify(int iqs, int * outlier_slot, int * nib) {
+        int n = 0;
+        #pragma unroll
+        for (int o = 0; o < TURBO4_64_OL12_N_OUTLIERS; o++) {
+            if (TURBO4_64_OL12_CHANNELS[o] == iqs) {
+                *outlier_slot = o;
+                return true;
+            }
+            if (TURBO4_64_OL12_CHANNELS[o] < iqs) n++;
+        }
+        *nib = iqs - n;
+        return false;
+    }
+
+    __device__ __forceinline__ static float k_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        const block_turbo4_64_ol12 * blocks = (const block_turbo4_64_ol12 *) buf;
+        const int64_t ib  = element_block_index(paged_block, kv_head, n_kv_heads, token_in_block, d);
+        const int     iqs = d % Q_BLOCK;
+        int outlier_slot, nib;
+        if (classify(iqs, &outlier_slot, &nib)) {
+            return __half2float(blocks[ib].outliers[outlier_slot]);
+        }
+        const float norm = __half2float(blocks[ib].norm);
+        return turbo4_64_ol12_dequant_nib_sel(&blocks[ib], nib, norm, ggml_cuda_turbo4_64_ol_use_n64_table_dev());
+    }
+
+    __device__ __forceinline__ static float v_load(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d) {
+        return k_load(buf, paged_block, kv_head, n_kv_heads, token_in_block, d);
+    }
+};
+
 // Turbo3_0 specialization: 3-bit PolarQuant with WHT rotation, 128-element blocks.
 // Same N_QBLOCKS_PER_TOKEN layout as TURBO4_0; differs in block payload size
 // (14 vs 68 bytes) and dequant centroid table (3-bit Lloyd-Max).

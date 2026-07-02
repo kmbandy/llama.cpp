@@ -562,6 +562,424 @@ __global__ void mt_scatter_kv_turbo4_64_kernel(
     }
 }
 
+// Turbo4_64_ol scatter (SP2.5, 2026-07-01): identical cooperative pipeline
+// to mt_scatter_kv_turbo4_64_kernel, but 4 fixed channel positions
+// (TURBO4_64_OL_CHANNELS = {53,49,52,20}) are excluded from the group-norm
+// computation and stored verbatim at f16 in blk->outliers[]; the remaining
+// 60 elements are centroid-quantized with the SHARED TURBO_CENTROIDS_4BIT
+// table (turbo_nearest_centroid_4bit), NOT the N=64-calibrated table used
+// by plain turbo4_64 — see turbo4_64_ol_dequant_nib's comment.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO4_64)
+__global__ void mt_scatter_kv_turbo4_64_ol_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO4_64;       // 64
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 2
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    const int j                = threadIdx.x;  // 0..63
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo4_64_ol * blk = (block_turbo4_64_ol *) dst_buf + block_ib;
+
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    // Classify this thread's channel (j == iqs since qb_idx is always 0 for
+    // HEAD_SIZE==64) and compute its packed-nibble index among non-outliers.
+    bool is_outlier   = false;
+    int  outlier_slot = -1;
+    int  n_lt         = 0;
+    #pragma unroll
+    for (int o = 0; o < TURBO4_64_OL_N_OUTLIERS; o++) {
+        if (TURBO4_64_OL_CHANNELS[o] == j) {
+            is_outlier   = true;
+            outlier_slot = o;
+        } else if (TURBO4_64_OL_CHANNELS[o] < j) {
+            n_lt++;
+        }
+    }
+    const int nib = j - n_lt;  // valid only if !is_outlier
+
+    if (is_outlier) {
+        blk->outliers[outlier_slot] = __float2half(x[j]);
+    }
+
+    // ---- Group L2 norm over the 60 non-outlier elements only ----
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = is_outlier ? 0.0f : (x[j] * x[j]);
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // Quantize non-outlier elements only, using the SHARED N=128 table (or
+    // the N=64-recalibrated table if GGML_TURBO4_64_OL_TABLE=n64 selects it).
+    const bool    use_n64 = ggml_cuda_turbo4_64_ol_use_n64_table_dev();
+    const float   rv  = x[j];
+    const uint8_t idx = is_outlier ? 0 : turbo_nearest_centroid_4bit_sel(rv, use_n64);
+
+    // Pack via a shared staging array keyed by nib (not j): with only 4
+    // outliers interleaved among 64 positions, (j, j+1) pairs don't
+    // reliably correspond to (nib, nib+1) pairs near an outlier position,
+    // so warp-shuffle pairing on lane parity of j is unsafe here. Stage into
+    // shared memory keyed by nib instead, then let 30 threads (one per
+    // output byte) pack pairs — simple and correct, no register games.
+    constexpr int N_NONOUTLIER = Q_BLOCK - TURBO4_64_OL_N_OUTLIERS;  // 60
+    __shared__ uint8_t nib_idx[N_NONOUTLIER];
+    if (!is_outlier) {
+        nib_idx[nib] = idx;
+    }
+    __syncthreads();
+    if (j < N_NONOUTLIER / 2) {
+        blk->qs[j] = (nib_idx[2 * j] & 0xF) | ((nib_idx[2 * j + 1] & 0xF) << 4);
+    }
+
+    {
+        const float c = is_outlier ? 0.0f : turbo_centroid_4bit_sel(idx, use_n64);
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+}
+
+// Turbo4_64_ol8 scatter (outlier-matrix sweep): identical cooperative
+// pipeline to mt_scatter_kv_turbo4_64_ol_kernel, but with 8 fixed outlier
+// channels (TURBO4_64_OL8_CHANNELS) instead of 4.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO4_64)
+__global__ void mt_scatter_kv_turbo4_64_ol8_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO4_64;       // 64
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 2
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    const int j                = threadIdx.x;  // 0..63
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo4_64_ol8 * blk = (block_turbo4_64_ol8 *) dst_buf + block_ib;
+
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    // Classify this thread's channel (j == iqs since qb_idx is always 0 for
+    // HEAD_SIZE==64) and compute its packed-nibble index among non-outliers.
+    bool is_outlier   = false;
+    int  outlier_slot = -1;
+    int  n_lt         = 0;
+    #pragma unroll
+    for (int o = 0; o < TURBO4_64_OL8_N_OUTLIERS; o++) {
+        if (TURBO4_64_OL8_CHANNELS[o] == j) {
+            is_outlier   = true;
+            outlier_slot = o;
+        } else if (TURBO4_64_OL8_CHANNELS[o] < j) {
+            n_lt++;
+        }
+    }
+    const int nib = j - n_lt;  // valid only if !is_outlier
+
+    if (is_outlier) {
+        blk->outliers[outlier_slot] = __float2half(x[j]);
+    }
+
+    // ---- Group L2 norm over the non-outlier elements only ----
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = is_outlier ? 0.0f : (x[j] * x[j]);
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // Quantize non-outlier elements only, using the SHARED N=128 table (or
+    // the N=64-recalibrated table if GGML_TURBO4_64_OL_TABLE=n64 selects it).
+    const bool    use_n64 = ggml_cuda_turbo4_64_ol_use_n64_table_dev();
+    const float   rv  = x[j];
+    const uint8_t idx = is_outlier ? 0 : turbo_nearest_centroid_4bit_sel(rv, use_n64);
+
+    // Pack via a shared staging array keyed by nib (not j): with outliers
+    // interleaved among 64 positions, (j, j+1) pairs don't reliably
+    // correspond to (nib, nib+1) pairs near an outlier position, so
+    // warp-shuffle pairing on lane parity of j is unsafe here. Stage into
+    // shared memory keyed by nib instead, then let one thread per output
+    // byte pack pairs — simple and correct, no register games.
+    constexpr int N_NONOUTLIER = Q_BLOCK - TURBO4_64_OL8_N_OUTLIERS;  // 56
+    __shared__ uint8_t nib_idx[N_NONOUTLIER];
+    if (!is_outlier) {
+        nib_idx[nib] = idx;
+    }
+    __syncthreads();
+    if (j < N_NONOUTLIER / 2) {
+        blk->qs[j] = (nib_idx[2 * j] & 0xF) | ((nib_idx[2 * j + 1] & 0xF) << 4);
+    }
+
+    {
+        const float c = is_outlier ? 0.0f : turbo_centroid_4bit_sel(idx, use_n64);
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+}
+
+// Turbo4_64_ol12 scatter (outlier-matrix sweep): identical cooperative
+// pipeline to mt_scatter_kv_turbo4_64_ol_kernel, but with 12 fixed outlier
+// channels (TURBO4_64_OL12_CHANNELS) instead of 4.
+template <int HEAD_SIZE, int BLOCK_SIZE>
+__launch_bounds__(QK_TURBO4_64)
+__global__ void mt_scatter_kv_turbo4_64_ol12_kernel(
+    void           * __restrict__ k_cache,
+    void           * __restrict__ v_cache,
+    const __half   * __restrict__ k_cur,
+    const __half   * __restrict__ v_cur,
+    const int32_t  * __restrict__ slot_mapping,
+    int             n_kv_heads) {
+
+    constexpr int Q_BLOCK             = QK_TURBO4_64;       // 64
+    constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+    constexpr int N_WARPS             = Q_BLOCK / WARP_SIZE;  // 2
+    static_assert(HEAD_SIZE % Q_BLOCK == 0, "HEAD_SIZE must be divisible by QK_TURBO4_64");
+
+    const int j                = threadIdx.x;  // 0..63
+    const int global_token_idx = blockIdx.x;
+    const int y_idx            = blockIdx.y;
+    const int kv_select        = blockIdx.z;   // 0 = K, 1 = V
+    const int kv_head_idx      = y_idx / N_QBLOCKS_PER_TOKEN;
+    const int qb_idx           = y_idx % N_QBLOCKS_PER_TOKEN;
+
+    const int slot = slot_mapping[global_token_idx];
+    if (slot < 0) return;  // padding token
+
+    const int paged_block   = slot / BLOCK_SIZE;
+    const int slot_in_block = slot % BLOCK_SIZE;
+
+    const int    d = qb_idx * Q_BLOCK + j;
+    const __half * src = (kv_select == 0) ? k_cur : v_cur;
+    const size_t src_off = (size_t) global_token_idx * n_kv_heads * HEAD_SIZE
+                         + (size_t) kv_head_idx * HEAD_SIZE
+                         + (size_t) d;
+
+    void * dst_buf = (kv_select == 0) ? k_cache : v_cache;
+    const int64_t block_ib = ((int64_t) paged_block * n_kv_heads + kv_head_idx) * BLOCK_SIZE * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) slot_in_block * N_QBLOCKS_PER_TOKEN
+                           + (int64_t) qb_idx;
+    block_turbo4_64_ol12 * blk = (block_turbo4_64_ol12 *) dst_buf + block_ib;
+
+    __shared__ float x[Q_BLOCK];
+    x[j] = __half2float(src[src_off]);
+    __syncthreads();
+
+    // Classify this thread's channel (j == iqs since qb_idx is always 0 for
+    // HEAD_SIZE==64) and compute its packed-nibble index among non-outliers.
+    bool is_outlier   = false;
+    int  outlier_slot = -1;
+    int  n_lt         = 0;
+    #pragma unroll
+    for (int o = 0; o < TURBO4_64_OL12_N_OUTLIERS; o++) {
+        if (TURBO4_64_OL12_CHANNELS[o] == j) {
+            is_outlier   = true;
+            outlier_slot = o;
+        } else if (TURBO4_64_OL12_CHANNELS[o] < j) {
+            n_lt++;
+        }
+    }
+    const int nib = j - n_lt;  // valid only if !is_outlier
+
+    if (is_outlier) {
+        blk->outliers[outlier_slot] = __float2half(x[j]);
+    }
+
+    // ---- Group L2 norm over the non-outlier elements only ----
+    __shared__ float warp_accum[N_WARPS];
+    {
+        float v_sq = is_outlier ? 0.0f : (x[j] * x[j]);
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_norm_sq = total;
+    }
+    __syncthreads();
+    const float grp_norm = sqrtf(s_norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    x[j] *= inv_norm;
+    __syncthreads();
+
+    // Quantize non-outlier elements only, using the SHARED N=128 table (or
+    // the N=64-recalibrated table if GGML_TURBO4_64_OL_TABLE=n64 selects it).
+    const bool    use_n64 = ggml_cuda_turbo4_64_ol_use_n64_table_dev();
+    const float   rv  = x[j];
+    const uint8_t idx = is_outlier ? 0 : turbo_nearest_centroid_4bit_sel(rv, use_n64);
+
+    // Pack via a shared staging array keyed by nib (not j): with outliers
+    // interleaved among 64 positions, (j, j+1) pairs don't reliably
+    // correspond to (nib, nib+1) pairs near an outlier position, so
+    // warp-shuffle pairing on lane parity of j is unsafe here. Stage into
+    // shared memory keyed by nib instead, then let one thread per output
+    // byte pack pairs — simple and correct, no register games.
+    constexpr int N_NONOUTLIER = Q_BLOCK - TURBO4_64_OL12_N_OUTLIERS;  // 52
+    __shared__ uint8_t nib_idx[N_NONOUTLIER];
+    if (!is_outlier) {
+        nib_idx[nib] = idx;
+    }
+    __syncthreads();
+    if (j < N_NONOUTLIER / 2) {
+        blk->qs[j] = (nib_idx[2 * j] & 0xF) | ((nib_idx[2 * j + 1] & 0xF) << 4);
+    }
+
+    {
+        const float c = is_outlier ? 0.0f : turbo_centroid_4bit_sel(idx, use_n64);
+        float rc = c * c;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
+        }
+        if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
+    }
+    __syncthreads();
+
+    __shared__ float s_recon_sq;
+    if (j == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < N_WARPS; ++w) total += warp_accum[w];
+        s_recon_sq = total;
+    }
+    __syncthreads();
+    const float recon_norm     = sqrtf(s_recon_sq);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+}
+
 // Turbo3_0 scatter: per-128-element-block cooperative quantize.
 //
 // Same threading and pipeline as turbo4 above, but packs 3-bit indices into
@@ -759,6 +1177,42 @@ static void launch_scatter_kv(
         GGML_UNUSED(q_lens);
         GGML_UNUSED(num_seqs);
         mt_scatter_kv_turbo4_64_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64_OL) {
+        // SP2.5: turbo4_64 with fixed-position outlier-channel extraction.
+        // Same grid topology as TURBO4_64.
+        constexpr int Q_BLOCK             = QK_TURBO4_64;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo4_64_ol_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64_OL8) {
+        // outlier-matrix sweep: turbo4_64 with 8 fixed outlier channels.
+        // Same grid topology as TURBO4_64.
+        constexpr int Q_BLOCK             = QK_TURBO4_64;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo4_64_ol8_kernel<HEAD_SIZE, BLOCK_SIZE>
+            <<<grid, block, 0, stream>>>(
+                k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
+    } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO4_64_OL12) {
+        // outlier-matrix sweep: turbo4_64 with 12 fixed outlier channels.
+        // Same grid topology as TURBO4_64.
+        constexpr int Q_BLOCK             = QK_TURBO4_64;
+        constexpr int N_QBLOCKS_PER_TOKEN = HEAD_SIZE / Q_BLOCK;
+        dim3 grid(num_tokens_total, n_kv_heads * N_QBLOCKS_PER_TOKEN, 2);
+        dim3 block(Q_BLOCK);
+        GGML_UNUSED(q_lens);
+        GGML_UNUSED(num_seqs);
+        mt_scatter_kv_turbo4_64_ol12_kernel<HEAD_SIZE, BLOCK_SIZE>
             <<<grid, block, 0, stream>>>(
                 k_cache, v_cache, k_cur, v_cur, slot_mapping, n_kv_heads);
     } else if constexpr (CACHE_TYPE == GGML_TYPE_TURBO3_0) {
@@ -1132,6 +1586,12 @@ static void launch_paged_attn(
 }
 
 void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // outlier-matrix sweep (2026-07-01): sync the GGML_TURBO4_64_OL_TABLE
+    // env-var toggle into the device-readable global once per process,
+    // before any turbo4_64_ol/ol8/ol12 kernel (scatter or dequant) reads it.
+    // Cheap/idempotent for cache types that don't use it.
+    ggml_cuda_turbo4_64_ol_sync_n64_table_flag();
+
     // Path-tracking probes — gated on MAD_PAGEDATTN_PROBE env var. Prints a
     // first-call summary for each path (tile / decode / scalar / aiter), and
     // per-call detail when MAD_PAGEDATTN_PROBE=verbose. Useful for the
@@ -1447,6 +1907,36 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 break;
             case GGML_TYPE_TURBO3_0:
                 run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO3_0>{});
+                break;
+            case GGML_TYPE_TURBO4_64_OL:
+                // SP2.5: turbo4_64 with fixed-position outlier-channel
+                // extraction — only valid at HS=64, same as TURBO4_64.
+                // Not wired into the WMMA tile/flash-decode gates above
+                // (scalar scatter+attn path only for now); functionally
+                // correct, just not the fastest path yet.
+                if constexpr (HS == 64) {
+                    run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_64_OL>{});
+                } else {
+                    GGML_ABORT("mt_paged_attn: GGML_TYPE_TURBO4_64_OL only supports head_size=64 (got %d)", HS);
+                }
+                break;
+            case GGML_TYPE_TURBO4_64_OL8:
+                // outlier-matrix sweep: turbo4_64 with 8 fixed outlier
+                // channels — only valid at HS=64, same as TURBO4_64_OL.
+                if constexpr (HS == 64) {
+                    run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_64_OL8>{});
+                } else {
+                    GGML_ABORT("mt_paged_attn: GGML_TYPE_TURBO4_64_OL8 only supports head_size=64 (got %d)", HS);
+                }
+                break;
+            case GGML_TYPE_TURBO4_64_OL12:
+                // outlier-matrix sweep: turbo4_64 with 12 fixed outlier
+                // channels — only valid at HS=64, same as TURBO4_64_OL.
+                if constexpr (HS == 64) {
+                    run_typed(std::integral_constant<ggml_type, GGML_TYPE_TURBO4_64_OL12>{});
+                } else {
+                    GGML_ABORT("mt_paged_attn: GGML_TYPE_TURBO4_64_OL12 only supports head_size=64 (got %d)", HS);
+                }
                 break;
             default:
                 GGML_ABORT("mt_paged_attn: unsupported cache type %s — add a paged_cache_ops specialization",

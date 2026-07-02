@@ -342,6 +342,62 @@ typedef struct {
 } block_turbo4_64;                          // 34 bytes total
 static_assert(sizeof(block_turbo4_64) == 2 + QK_TURBO4_64/2, "wrong turbo4_64 block size");
 
+// turbo4_64 with fixed-position "massive activation" outlier-channel
+// extraction (SP2.5 investigation, 2026-07-01). Same 64-element block and
+// same shared TURBO_CENTROIDS_4BIT/TURBO_MID_4BIT table as turbo4_0 (NOT
+// the N=64-calibrated TURBO_CENTROIDS_4BIT_N64 table used by plain
+// turbo4_64), but 4 fixed channel positions per block (see
+// TURBO4_64_OUTLIER_CHANNELS) are excluded from the group-norm computation
+// and stored verbatim at f16 instead of being centroid-quantized. This
+// measurably improves both reconstruction accuracy and Vulkan/CUDA
+// cross-backend divergence on real captured K/V data (see task brief).
+#define TURBO4_64_OL_N_OUTLIERS 4
+// Fixed outlier channel positions within a 64-element block (d % 64).
+// Calibrated once from real LFM2.5-8B-A1B K/V activations pooled across all
+// 6 attention layers and 12 diverse text samples — channel 53 alone is in
+// the per-block top-4 by magnitude for 46% of ~239K real blocks; 49, 52,
+// 20 are also frequent ("massive activation" phenomenon, a property of the
+// trained weights, not per-token content). MUST stay byte-for-byte
+// identical between the CUDA and Vulkan backends, like the centroid table.
+#define TURBO4_64_OUTLIER_CHANNELS { 53, 49, 52, 20 }
+typedef struct {
+    ggml_half  norm;                                    //  2 bytes: corrected L2 norm of the 60 non-outlier elements
+    ggml_half  outliers[TURBO4_64_OL_N_OUTLIERS];        //  8 bytes: full-precision values at the 4 fixed outlier channels
+    uint8_t    qs[(QK_TURBO4_64 - TURBO4_64_OL_N_OUTLIERS) / 2]; // 30 bytes: 4-bit centroid indices for the 60 remaining elements
+} block_turbo4_64_ol;                                    // 40 bytes total
+static_assert(sizeof(block_turbo4_64_ol) == 2 + 2*TURBO4_64_OL_N_OUTLIERS + (QK_TURBO4_64 - TURBO4_64_OL_N_OUTLIERS)/2,
+              "wrong turbo4_64_ol block size");
+static_assert(sizeof(block_turbo4_64_ol) == 40, "turbo4_64_ol block must be exactly 40 bytes per task brief");
+
+// turbo4_64_ol with 8 fixed outlier channels (outlier-matrix sweep,
+// 2026-07-01 task brief). Extends TURBO4_64_OUTLIER_CHANNELS with the next
+// 4 most-consistently-dominant channels by pooled top-4-membership
+// frequency. Same shared centroid-table mechanism as N=4 (subject to the
+// GGML_TURBO4_64_OL_TABLE env-var toggle, see turbo-quant.cuh / ggml.c).
+#define TURBO4_64_OL8_N_OUTLIERS 8
+#define TURBO4_64_OL8_OUTLIER_CHANNELS { 53, 49, 52, 20, 21, 54, 14, 15 }
+typedef struct {
+    ggml_half  norm;                                      //  2 bytes: corrected L2 norm of the 56 non-outlier elements
+    ggml_half  outliers[TURBO4_64_OL8_N_OUTLIERS];        // 16 bytes: full-precision values at the 8 fixed outlier channels
+    uint8_t    qs[(QK_TURBO4_64 - TURBO4_64_OL8_N_OUTLIERS) / 2]; // 28 bytes: 4-bit centroid indices for the 56 remaining elements
+} block_turbo4_64_ol8;                                    // 46 bytes total
+static_assert(sizeof(block_turbo4_64_ol8) == 2 + 2*TURBO4_64_OL8_N_OUTLIERS + (QK_TURBO4_64 - TURBO4_64_OL8_N_OUTLIERS)/2,
+              "wrong turbo4_64_ol8 block size");
+static_assert(sizeof(block_turbo4_64_ol8) == 46, "turbo4_64_ol8 block must be exactly 46 bytes per task brief");
+
+// turbo4_64_ol with 12 fixed outlier channels (outlier-matrix sweep,
+// 2026-07-01 task brief). Extends TURBO4_64_OL8_OUTLIER_CHANNELS with 4 more.
+#define TURBO4_64_OL12_N_OUTLIERS 12
+#define TURBO4_64_OL12_OUTLIER_CHANNELS { 53, 49, 52, 20, 21, 54, 14, 15, 51, 26, 24, 23 }
+typedef struct {
+    ggml_half  norm;                                      //  2 bytes: corrected L2 norm of the 52 non-outlier elements
+    ggml_half  outliers[TURBO4_64_OL12_N_OUTLIERS];       // 24 bytes: full-precision values at the 12 fixed outlier channels
+    uint8_t    qs[(QK_TURBO4_64 - TURBO4_64_OL12_N_OUTLIERS) / 2]; // 26 bytes: 4-bit centroid indices for the 52 remaining elements
+} block_turbo4_64_ol12;                                   // 52 bytes total
+static_assert(sizeof(block_turbo4_64_ol12) == 2 + 2*TURBO4_64_OL12_N_OUTLIERS + (QK_TURBO4_64 - TURBO4_64_OL12_N_OUTLIERS)/2,
+              "wrong turbo4_64_ol12 block size");
+static_assert(sizeof(block_turbo4_64_ol12) == 52, "turbo4_64_ol12 block must be exactly 52 bytes per task brief");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16

@@ -402,6 +402,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO3_0,
     GGML_TYPE_TURBO4_0,
     GGML_TYPE_TURBO4_FP8_BS256,  // MAD-214: turbo-FP8 KV cache (centroid LUT + FP8 WMMA)
+    GGML_TYPE_TURBO4_64_OL,      // SP2.5: turbo4_64 with fixed-position outlier-channel extraction (selected directly, no remap; plain TURBO4_64 stays reachable only via TURBO4_0 + GGML_PAGED_TURBO4_64=1)
+    GGML_TYPE_TURBO4_64_OL8,     // outlier-matrix sweep (2026-07-01): turbo4_64_ol with 8 fixed outlier channels
+    GGML_TYPE_TURBO4_64_OL12,    // outlier-matrix sweep (2026-07-01): turbo4_64_ol with 12 fixed outlier channels
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

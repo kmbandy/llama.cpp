@@ -14,12 +14,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage                     : require
 #extension GL_EXT_control_flow_attributes                  : require
-#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64) || defined(DATA_A_Q8_0)
+#if defined(DATA_A_TURBO4_0) || defined(DATA_A_TURBO4_64) || defined(DATA_A_TURBO4_64_OL) || defined(DATA_A_Q8_0)
 #extension GL_EXT_shader_explicit_arithmetic_types_int8    : require
 #extension GL_EXT_shader_8bit_storage                      : require
 #endif
 
-#ifdef DATA_A_TURBO4_64
+#if defined(DATA_A_TURBO4_64) || defined(DATA_A_TURBO4_64_OL)
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #elif defined(DATA_A_Q8_0)
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -32,6 +32,11 @@ layout (push_constant) uniform parameter {
     uint BS;            // block size
     uint n_kv_heads;
     uint n_tokens;      // total tokens (sum of q_lens)
+    // Outlier-matrix sweep (2026-07-01, investigative-only): nonzero selects
+    // the N=64-calibrated centroid table for turbo4_64_ol/ol8/ol12's
+    // non-outlier elements (GGML_TURBO4_64_OL_TABLE=n64 on the host). Ignored
+    // by every other cache type. See paged_cache_ops.glsl / ggml-vulkan.cpp.
+    uint use_n64_table;
 } p;
 
 // K_cur / V_cur scatter INPUTS are always F16 regardless of cache type.
@@ -60,6 +65,22 @@ struct block_turbo4_64 {
 };
 layout (binding = 3)           buffer KCache  { block_turbo4_64 data_k[]; };
 layout (binding = 4)           buffer VCache  { block_turbo4_64 data_v[]; };
+#endif
+#ifdef DATA_A_TURBO4_64_OL
+// N (outlier count) is parameterized via PA_TURBO4_64_OL_N (default 4u,
+// see paged_cache_ops.glsl) so this struct/pipeline is shared by the
+// turbo4_64_ol (N=4), turbo4_64_ol8 (N=8), and turbo4_64_ol12 (N=12)
+// variants, each compiled with a different -D from vulkan-shaders-gen.cpp.
+#ifndef PA_TURBO4_64_OL_N
+#define PA_TURBO4_64_OL_N 4u
+#endif
+struct block_turbo4_64_ol {
+    float16_t norm;                        // corrected L2 norm of the non-outlier elements
+    float16_t outliers[PA_TURBO4_64_OL_N];  // full-precision values at the fixed outlier channels
+    uint8_t   qs[(64u - PA_TURBO4_64_OL_N) / 2u]; // 4-bit centroid indices for the remaining elements, nibble-packed
+};
+layout (binding = 3)           buffer KCache  { block_turbo4_64_ol data_k[]; };
+layout (binding = 4)           buffer VCache  { block_turbo4_64_ol data_v[]; };
 #endif
 #ifdef DATA_A_Q8_0
 struct block_q8_0 {
@@ -322,6 +343,142 @@ void main() {
     }
 }
 #endif // DATA_A_TURBO4_64
+
+#ifdef DATA_A_TURBO4_64_OL
+// Cooperative turbo4_64_ol/ol8/ol12 quantizer (SP2.5, 2026-07-01; OL8/OL12
+// added 2026-07-01 for the outlier-matrix sweep). Identical pipeline to the
+// turbo4_64 quantizer above, but PA_TURBO4_64_OL_N fixed channel positions
+// (PA_TURBO4_64_OL_CHANNELS, see paged_cache_ops.glsl) are excluded from the
+// group-norm computation and stored verbatim at f16 in
+// data_k/data_v[...].outliers[]; the remaining (64-N) elements are
+// centroid-quantized with the SHARED TURBO_CENTROIDS_4BIT table by default
+// (pa_turbo_nearest_4bit_sel), NOT the N=64-calibrated one used by plain
+// turbo4_64 — unless GGML_TURBO4_64_OL_TABLE=n64 selects it via
+// p.use_n64_table (investigative-only, see paged_cache_ops.glsl).
+// wave64-safe: shared-memory tree reductions only, no subgroup ops.
+shared float   s_x[64];       // working values (normalized in place)
+shared float   s_red[64];     // tree-reduction scratch
+shared uint8_t s_nib_idx[64u - PA_TURBO4_64_OL_N]; // packed-nibble staging, keyed by nib (not j)
+
+void main() {
+    const uint j         = gl_LocalInvocationID.x;   // 0..63, element within the block
+    const uint token     = gl_WorkGroupID.x;         // global token index
+    const uint y_idx     = gl_WorkGroupID.y;         // kv_head*N_QBLK + qb
+    const uint kv_select = gl_WorkGroupID.z;         // 0 = K, 1 = V
+
+    if (token >= p.n_tokens) {
+        return;                                      // uniform across workgroup
+    }
+
+    const uint N_QBLK = p.HS / 64u;
+    const uint kv_head = y_idx / N_QBLK;
+    const uint qb      = y_idx % N_QBLK;
+
+    const int slot = slot_mapping[token];
+    if (slot < 0) {
+        return;                                      // padding token (uniform)
+    }
+
+    const uint paged_block = uint(slot) / p.BS;
+    const uint tok         = uint(slot) % p.BS;
+    const uint d           = qb * 64u + j;
+
+    // K_cur / V_cur layout: ne[0]=head_dim, ne[1]=n_kv_heads, ne[2]=n_tokens.
+    const uint src = token * p.n_kv_heads * p.HS + kv_head * p.HS + d;
+    const float val = (kv_select == 0u) ? float(k_cur[src]) : float(v_cur[src]);
+
+    const uint block_ib = pa_turbo64_ol_block_index(paged_block, kv_head, p.n_kv_heads, tok, qb, p.HS, p.BS);
+
+    // ---- Step 1: load into shared mem ----
+    s_x[j] = val;
+    barrier();
+
+    // Classify this thread's channel (j == iqs since qb is always 0 for
+    // HEAD_SIZE==64).
+    uint outlier_slot, nib;
+    const bool is_outlier = pa_turbo64_ol_classify(j, outlier_slot, nib);
+
+    if (is_outlier) {
+        if (kv_select == 0u) {
+            data_k[block_ib].outliers[outlier_slot] = float16_t(s_x[j]);
+        } else {
+            data_v[block_ib].outliers[outlier_slot] = float16_t(s_x[j]);
+        }
+    }
+
+    // ---- Step 2: parallel L2 norm over the 60 non-outlier elements only ----
+    s_red[j] = is_outlier ? 0.0f : (s_x[j] * s_x[j]);
+    barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float grp_norm = sqrt(s_red[0]);
+    const float inv_norm = (grp_norm > 1e-10f) ? (1.0f / grp_norm) : 0.0f;
+
+    // ---- Step 3: normalize ----
+    s_x[j] *= inv_norm;
+    barrier();
+
+    // ---- Step 4: (intentionally NO Randomized Hadamard Transform) ----
+
+    // ---- Step 5: nearest centroid for non-outlier elements (shared table by
+    // default; p.use_n64_table selects the N=64-calibrated one instead —
+    // investigative-only, see paged_cache_ops.glsl) ----
+    const bool  use_n64 = (p.use_n64_table != 0u);
+    const uint idx = is_outlier ? 0u : pa_turbo_nearest_4bit_sel(s_x[j], use_n64);
+
+    // ---- Step 7 (parallel): reconstruction norm over non-outlier elements ----
+    // WAR: all lanes have read s_red[0] (grp_norm) before any lane overwrites it.
+    barrier();
+    const float cv = is_outlier ? 0.0f : pa_turbo_centroid_4bit_sel(idx, use_n64);
+    s_red[j] = cv * cv;
+    barrier();
+    if (j < 32u) { s_red[j] += s_red[j + 32u]; } barrier();
+    if (j < 16u) { s_red[j] += s_red[j + 16u]; } barrier();
+    if (j <  8u) { s_red[j] += s_red[j +  8u]; } barrier();
+    if (j <  4u) { s_red[j] += s_red[j +  4u]; } barrier();
+    if (j <  2u) { s_red[j] += s_red[j +  2u]; } barrier();
+    if (j <  1u) { s_red[j] += s_red[j +  1u]; } barrier();
+
+    const float recon_norm     = sqrt(s_red[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (grp_norm / recon_norm) : grp_norm;
+
+    // ---- Step 6: nibble-pack qs, keyed by nib (not j) ----
+    // With only 4 outliers interleaved among 64 positions, (j, j+1) pairs
+    // don't reliably correspond to (nib, nib+1) pairs near an outlier
+    // position, so pairing by j parity (as turbo4_0/turbo4_64 do) is unsafe
+    // here. Stage into a shared array keyed by nib instead, then let 30
+    // threads (one per output byte) pack pairs.
+    if (!is_outlier) {
+        s_nib_idx[nib] = uint8_t(idx);
+    }
+    barrier();
+
+    // ---- Step 8: thread 0 writes the per-block norm ----
+    if (j == 0u) {
+        if (kv_select == 0u) {
+            data_k[block_ib].norm = float16_t(corrected_norm);
+        } else {
+            data_v[block_ib].norm = float16_t(corrected_norm);
+        }
+    }
+
+    if (j < (64u - PA_TURBO4_64_OL_N) / 2u) {
+        const uint lo = uint(s_nib_idx[2u * j]);
+        const uint hi = uint(s_nib_idx[2u * j + 1u]);
+        const uint8_t packed = uint8_t((lo & 0xFu) | ((hi & 0xFu) << 4u));
+        if (kv_select == 0u) {
+            data_k[block_ib].qs[j] = packed;
+        } else {
+            data_v[block_ib].qs[j] = packed;
+        }
+    }
+}
+#endif // DATA_A_TURBO4_64_OL
 
 #ifdef DATA_A_Q8_0
 // Cooperative Q8_0 quantizer. Mirrors mt_scatter_kv_q8_0_kernel
