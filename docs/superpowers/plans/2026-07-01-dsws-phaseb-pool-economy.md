@@ -6,12 +6,17 @@
 8-wave partition into a lean-start grow-into-budget pool that rebalances its
 {compute, A-feed, B-feed} mix at runtime.
 
-**Architecture:** One scalar (`s59`)-driven dispatcher unifies entry and
-re-dispatch (lands on each role's `_follow`, scalar-only). Every wave already
-launches lean-32 (compute grows to `NFV` per-rowblk on demand and shrinks back —
-Phase-A behavior); "seeding" a role is therefore just setting `s59` in the
-existing lean partition arms, with **no launch-time grow**. The only
-`s_alloc_vgpr` GROW in the whole design remains `conv_apply`'s, already audited.
+**Architecture:** One scalar (`s59`)-driven dispatcher handles **re-dispatch**
+(reached from a `_quiesce` bail; lands on each role's `_follow`, scalar-only).
+**First-time entry is DISTINCT** — it seeds `s59` then runs the full role entry
+(`.Lcompute`/`.Lafeed`/`.Lbfeed` → `_alloc` → `_init` → `_follow`); it must NOT
+reuse `.Ldispatch`, which skips `_alloc`/`_init` (the Pool-T7 brick: corrected
+2026-07-02, committed `b01c722df`). Every wave already launches lean-32 (compute
+grows to `NFV` per-rowblk on demand and shrinks back — Phase-A behavior);
+"seeding" a role is therefore just setting `s59` in the existing lean partition
+arms and falling into that role's existing entry, with **no launch-time grow
+added**. The only `s_alloc_vgpr` GROW in the whole design remains `conv_apply`'s,
+already audited.
 `BUDGET` is retuned to the real per-SIMD ceiling so feed→compute grows can
 succeed (bidirectional balancing within the launched mix). A cooldown `K` damps
 thrash; a `DSWS2_FORCE` hook gives a deterministic first GPU proof. All offline
@@ -141,7 +146,7 @@ Expected: `dsws_ctrl_model: dispatch/cooldown/pool OK` then `dsws_ctrl_model: AL
     s_cmp_lt_u32 s24, (NBFEED+NAFEED)
     s_cbranch_scc1 .Lseed_afeed
     s_mov_b32 s59, NCOMP_SLOT
-    s_branch .Lcompute                     // Task 3 retargets these three to .Ldispatch
+    s_branch .Lcompute                     // FIRST entry: full role entry (_alloc/_init/_follow). Do NOT retarget to .Ldispatch (Pool-T7 brick).
 .Lseed_afeed:
     s_mov_b32 s59, NAFEED_SLOT
     s_branch .Lafeed
@@ -184,14 +189,20 @@ done
 
 ---
 
-## Task 3: The `.Ldispatch` trampoline + tail-branch replacements
+## Task 3: The `.Ldispatch` RE-DISPATCH trampoline + tail-branch replacements
+
+> **CORRECTION 2026-07-02 (Pool-T7 brick, committed `b01c722df`).** `.Ldispatch` is
+> **RE-DISPATCH ONLY** — reached from a `_quiesce` bail, never from first-time entry.
+> The original Step 3 below flipped the Task-2 seed arms to `.Ldispatch`; that skipped
+> `_alloc`/`_init` on first entry and hung the first CONV=1 dispatch (desktop brick).
+> Step 3 is corrected: the seed arms **stay** on the full role entry.
 
 **Files:**
-- Modify: `occ_kernel_dsws.s` (add `.Ldispatch`; replace tail branches at L907, L951, L1097; flip Task-2 seed arms to `.Ldispatch`)
+- Modify: `occ_kernel_dsws.s` (add `.Ldispatch`; replace the 3 `_quiesce`-bail tail branches at L907, L951, L1097. **Leave the Task-2 seed arms on `.Lcompute`/`.Lafeed`/`.Lbfeed` — do NOT retarget them to `.Ldispatch`.**)
 
 **Interfaces:**
 - Consumes: `s59` (seeded in Task 2, flipped by `conv_apply`), the `_follow` labels `.Lcompute_follow`/`.Lafeed_follow`/`.Lbfeed_follow`.
-- Produces: universal per-epoch role dispatch. Every non-claimer wave routes to the `_follow` of the role `s59` names.
+- Produces: per-epoch role RE-dispatch after a bail. A bailed non-claimer wave routes to the `_follow` of the role `s59` names. (First entry does not use this — it runs the full role `_alloc`/`_init`/`_follow`.)
 
 - [ ] **Step 1: Add the trampoline** (under `.if DSWS2_CONV`, placed after the three role bodies so all `_follow` labels are in scope):
 
@@ -216,11 +227,11 @@ done
 .endif
 ```
 
-- [ ] **Step 3: Flip the Task-2 seed arms** from the temporary `.Lcompute`/`.Lafeed`/`.Lbfeed` targets to `.Ldispatch` (three `s_branch .Ldispatch`), so entry uses the same dispatcher. **Verify (name in report):** `.Ldispatch` lands on `_follow` (NOT `_alloc`/`_init`), and `s35` (last-epoch) is preserved across the trampoline so a re-dispatched wave waits for the next epoch.
+- [ ] **Step 3: Leave the Task-2 seed arms on the full role entry.** Do **NOT** retarget them to `.Ldispatch`. First-time entry must run `_alloc` (the `s_alloc_vgpr 32` allocator handshake) and `_init` (the `INITFLAG==0xACED` LDS rendezvous + `s35=0` epoch seed) before its first `_follow` — all of which live only inside the role entry. Only a wave that has *already* run those once (i.e. after a `_quiesce` bail) may use `.Ldispatch`. **Verify (name in report):** the seed arms still branch to `.Lcompute`/`.Lafeed`/`.Lbfeed`; `.Ldispatch` is reached only from the 3 bail tail-branches; on re-dispatch it lands on `_follow` (NOT `_alloc`/`_init`) and `s35` is preserved so the re-dispatched wave waits for the next epoch. *(Original Step 3 flipped these to `.Ldispatch` → Pool-T7 brick; corrected 2026-07-02.)*
 
 - [ ] **Step 4: Assemble + byte-identity + RGA** — same commands as Task 2 Step 4. Expected: CONV=0 sha256 unchanged from baseline; 3× `ASSEMBLE_OK`; RGA 0 spills. Additionally grep the object disassembly is not required, but confirm no `s_barrier` was introduced: `grep -c s_barrier occ_kernel_dsws.s` → unchanged from HEAD.
 
-- [ ] **Step 5: Commit** (*only if kmbandy asks*): `feat(dsws): universal s59 dispatch trampoline (entry + re-dispatch)`
+- [ ] **Step 5: Commit** (*only if kmbandy asks*): `feat(dsws): s59 re-dispatch trampoline (bail → _follow; first entry stays on role entry)`
 
 ---
 

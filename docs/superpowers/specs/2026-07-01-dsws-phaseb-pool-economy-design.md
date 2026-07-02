@@ -91,19 +91,34 @@ wave-uniform trampoline:
     s_branch .Lbfeed_follow
 ```
 
+> **CORRECTION 2026-07-02 (Pool-T7 brick root cause).** `.Ldispatch` is a
+> **RE-DISPATCH-ONLY** trampoline — it is reached from a per-super-tile `_quiesce`
+> bail, **never from first-time entry**. Entry and re-dispatch are **NOT** the same
+> mechanism: first entry must run the full role `_alloc`/`_init` (see §3), and only
+> re-dispatch may land on `_follow`. The original text below said entry could reuse
+> `.Ldispatch`; that routing skipped `_alloc`/`_init` on first entry (no
+> `s_alloc_vgpr 32` handshake, no INITFLAG rendezvous, garbage `s35`) and hung the
+> first CONV=1 dispatch → desktop brick. Points 1–2 hold **for re-dispatch**; point 3
+> is corrected below.
+
 Three properties make this safe and cheap:
 
-1. **Lands on `_follow`, skipping `_alloc`/`_init`.** `conv_apply` already set
-   the wave's VGPR footprint to the target role's size, and `_init` (INITFLAG
-   wait) ran once at launch. Re-running `_alloc` would wrongly resize the wave;
-   re-running `_init` would deadlock (INITFLAG already consumed).
+1. **On RE-DISPATCH, lands on `_follow`, skipping `_alloc`/`_init`.** `conv_apply`
+   already set the wave's VGPR footprint to the target role's size, and the wave
+   already ran `_alloc`/`_init` once at first entry. Re-running `_alloc` would
+   wrongly resize the wave; re-running `_init` would reset `s35 = 0`, breaking the
+   "wait for the *next* epoch" contract (INITFLAG is written once, `0xACED`, and is
+   never cleared — so it is the `s35` reset, not INITFLAG, that `_follow` preserves).
+   **First entry must NOT take this path** — it has run neither `_alloc` nor `_init`.
 2. **Preserves the last-seen-epoch register** (`s35`). A re-dispatched wave
    therefore waits for the *next* epoch in its new role rather than
    re-processing the epoch it just converted in.
-3. **Entry and re-dispatch are the same mechanism.** The entry wid-branch is
-   repurposed to *seed* `s59` (and grow the seed-compute waves), then fall into
-   `.Ldispatch`. A non-converting wave reads back its own role each epoch and
-   loops exactly as today.
+3. **Entry and re-dispatch are DISTINCT.** First entry runs the full role entry
+   (`.Lcompute`/`.Lafeed`/`.Lbfeed` → `_alloc` → `_init` → `_follow`), with the
+   wid-branch *seeding* `s59` first so the role register is set before any later
+   re-dispatch reads it. Only after a bail does a wave use `.Ldispatch`. A
+   non-converting wave, once past first entry, reads back its own role each epoch
+   via `.Ldispatch` and loops exactly as today.
 
 The claimer (wid-0) is **excluded**: it branches to `.Lclaimer` at entry (before
 the seed/`.Ldispatch` path), runs its own `.Lclaim_loop`, never converts, and is
@@ -129,9 +144,13 @@ claimer. So launch/init is unchanged from Phase A except one addition:
 
 **Seed `s59` by wid** (under `DSWS2_CONV`), in the *existing* partition arms —
 `[0,NBFEED)` → B-feed, `[NBFEED,NBFEED+NAFEED)` → A-feed, rest → compute — each
-arm gains a single `s_mov_b32 s59, <slot>` and then falls into `.Ldispatch`.
-**No launch-time `s_alloc_vgpr`** (compute's footprint is handled per-rowblk as
-today). There are no `N_POOL`/`SEED_*` defsyms: the launched mix
+arm gains a single `s_mov_b32 s59, <slot>` and then **falls into the full role
+entry** (`.Lbfeed`/`.Lafeed`/`.Lcompute` → `_alloc` → `_init` → `_follow`).
+**It must NOT branch to `.Ldispatch`** (that skips `_alloc`/`_init` on a wave that
+has run neither → the Pool-T7 brick; see §2 correction). `.Ldispatch` is entered
+only later, from a `_quiesce` bail. **No launch-time `s_alloc_vgpr` is *added*** —
+the seed reuses the role entry's existing `_alloc` (compute's `NFV` footprint is
+still handled per-rowblk). There are no `N_POOL`/`SEED_*` defsyms: the launched mix
 `NCOMP/NAFEED/NBFEED` *is* the seed and its sum *is* the pool size.
 
 **Defsyms:**
