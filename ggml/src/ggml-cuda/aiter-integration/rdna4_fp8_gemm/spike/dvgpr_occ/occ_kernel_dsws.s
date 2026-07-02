@@ -411,6 +411,23 @@
     s_sub_u32  \dst_b, \dst_b, s61           // occ_B  = prod_b - cons_b   in [0,FN]
 .endm
 
+// ---- Pool-T7 chunk-2 wedge localization (DIAG-only; DSWS2_CONV=0 emits nothing -> .text byte-identical).
+//   epoch_mark: lane-0 publishes this role's live epoch (s35) to a host-streamed occ slot so a hung dispatch
+//   shows how far each role advanced (stream field roles[C/A/B]). v14<=v15 (feeds/compute are lean-32 at the
+//   _quiesce call sites), v4=0 (occ base lane offset, prologue), s49 exec-save (LDS-macro convention). ----
+.macro epoch_mark off
+.if DSWS2_CONV && DIAG
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lem_skip\@
+    v_mov_b32 v14, s35
+    global_store_b32 v4, v14, s[0:1] offset:\off scope:SCOPE_DEV
+.Lem_skip\@:
+    s_mov_b32 exec_lo, s49
+.endif
+.endm
+
 // --------------------------------------------------------------------------------------------
 //  Phase-B controller thresholds + sum-envelope budget (Task 4). EPOCH_SHIFT mirrors coop /
 //  occ_dispatch (epoch = segcnt >> EPOCH_SHIFT). BUDGET is the per-WG VGPR sum-envelope ceiling
@@ -874,15 +891,41 @@ occ_kernel:
     s_mov_b32 s51, 0
 .Lqc_q_ok:
 .if DIAG
-    // DIAG cross-check: the snapshot sentinels and the QUIESCE handshake must AGREE. Publish their XOR
-    //   (1 = mismatch) to occ[29] (byte 116; clear of occ[26]/27=104/108 Task3, occ[28]=112 Task4).
+    // DIAG cross-check + Pool-T7 chunk-2 WEDGE FRAME. occ[29]=s50^s51 mismatch. Plus snapshot EVERY advance-gate
+    //   counter to host-streamed occ slots so a hung dispatch reads out exactly which sentinel is unmet:
+    //     stream cons=ROWBLK_DONE tiles=AROW_DONE compPh=BFRAG_DONE (want G/G/FN = all work flushed)
+    //     comp:dsB=QUIESCE_CNT (want WAVES-1 -> short => a follower never bailed; see roles[C/A/B] epochs)
+    //     feed:tr=ROWBLK_NEXT pub=AROW_NEXT rawTi=BFRAG_NEXT (the s50 over-claim sentinels).
+    //   Read counters at full exec, THEN publish under lane-0 mask. Scratch s53-s56/s60-s62 dead here
+    //   (occ_sample's s60-s63 were consumed at the wait_done top). DIAG-only -> CONV=0 byte-identical.
+    lds_get s53, ROWBLK_DONE_OFF
+    lds_get s54, AROW_DONE_OFF
+    lds_get s55, BFRAG_DONE_OFF
+    lds_get s56, QUIESCE_CNT_OFF
+    lds_get s60, ROWBLK_NEXT_OFF
+    lds_get s61, AROW_NEXT_OFF
+    lds_get s62, BFRAG_NEXT_OFF
     s_xor_b32 s52, s50, s51
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s16, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lqc_diag_skip
-    v_mov_b32 v14, s52                           // v14 <= v15: pre-grow safe (claimer is lean-32 anyway)
+    v_mov_b32 v14, s52
     global_store_b32 v4, v14, s[0:1] offset:116 scope:SCOPE_DEV   // occ[29] = quiesce/snapshot mismatch
+    v_mov_b32 v14, s53
+    global_store_b32 v4, v14, s[0:1] offset:40  scope:SCOPE_DEV   // occ[10] cons     = ROWBLK_DONE (want G)
+    v_mov_b32 v14, s54
+    global_store_b32 v4, v14, s[0:1] offset:44  scope:SCOPE_DEV   // occ[11] tiles    = AROW_DONE  (want G)
+    v_mov_b32 v14, s55
+    global_store_b32 v4, v14, s[0:1] offset:28  scope:SCOPE_DEV   // occ[7]  compPh   = BFRAG_DONE (want FN)
+    v_mov_b32 v14, s56
+    global_store_b32 v4, v14, s[0:1] offset:60  scope:SCOPE_DEV   // occ[15] comp:dsB = QUIESCE (want WAVES-1)
+    v_mov_b32 v14, s60
+    global_store_b32 v4, v14, s[0:1] offset:76  scope:SCOPE_DEV   // occ[19] feed:tr  = ROWBLK_NEXT
+    v_mov_b32 v14, s61
+    global_store_b32 v4, v14, s[0:1] offset:84  scope:SCOPE_DEV   // occ[21] pub      = AROW_NEXT
+    v_mov_b32 v14, s62
+    global_store_b32 v4, v14, s[0:1] offset:88  scope:SCOPE_DEV   // occ[22] rawTi    = BFRAG_NEXT
 .Lqc_diag_skip:
     s_mov_b32 exec_lo, s16
 .endif
@@ -983,6 +1026,7 @@ occ_kernel:
 .endif
 .Lbfeed_quiesce:
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+    epoch_mark 144                               // roles[2] = B-feed last epoch bumped (wedge localize)
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch
@@ -1056,6 +1100,7 @@ occ_kernel:
 .endif
 .Lafeed_quiesce:
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+    epoch_mark 140                               // roles[1] = A-feed last epoch bumped (wedge localize)
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch
@@ -1238,6 +1283,7 @@ occ_kernel:
     // ORDERING (SPEC 3.4 decision 2): the commit above fully completed (role-slot CAS + reservation +
     //   s_alloc_vgpr) BEFORE this QUIESCE_CNT bump -- the bump is the snapshot handshake the claimer reads.
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // exactly one bump per non-claimer wave / super-tile
+    epoch_mark 136                               // roles[0] = compute last epoch bumped (wedge localize)
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch
