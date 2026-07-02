@@ -81,6 +81,20 @@ int main() {
     }
   }
 
+  // ---- Task 1: dispatch + cooldown + pool invariants ----
+  assert(role_dispatch(24) == COMPUTE);
+  assert(role_dispatch(28) == AFEED);
+  assert(role_dispatch(32) == BFEED);
+  // cooldown counts down and saturates at 0; in_cooldown true iff >0
+  assert(cooldown_step(3) == 2 && cooldown_step(1) == 0 && cooldown_step(0) == 0);
+  assert(in_cooldown(1) && !in_cooldown(0));
+  // no-parking budget invariant: 16 lean waves fit iff budget >= 512
+  assert( pool_fits_lean(16, 32, 512));
+  assert(!pool_fits_lean(16, 32, 511));
+  // quiesce cross-check generalizes WAVES-1 -> N_POOL-1
+  assert( quiesce_ready_pool(11, 12) && !quiesce_ready_pool(10, 12));
+  printf("dsws_ctrl_model: dispatch/cooldown/pool OK\n");
+
   printf("dsws_ctrl_model: ALL PASS\n");
   return 0;
 }

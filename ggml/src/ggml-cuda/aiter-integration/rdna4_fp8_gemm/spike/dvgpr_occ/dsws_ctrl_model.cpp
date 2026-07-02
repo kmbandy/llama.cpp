@@ -73,3 +73,23 @@ static inline bool quiesce_ready(uint32_t rowblk_next, uint32_t bfrag_next,
 static inline bool quiesce_ready_nm1(uint32_t quiesce_cnt, uint32_t N) {
     return quiesce_cnt >= (N - 1);
 }
+
+// ---- Task 1: dispatch, cooldown, pool invariants ----
+
+enum Role { COMPUTE, AFEED, BFEED };
+
+inline Role role_dispatch(uint32_t slot_id) {
+    return slot_id == 24 ? COMPUTE : (slot_id == 28 ? AFEED : BFEED);
+}
+
+inline uint32_t cooldown_step(uint32_t cd) { return cd ? cd - 1 : 0; }
+
+inline bool in_cooldown(uint32_t cd) { return cd > 0; }
+
+inline bool pool_fits_lean(uint32_t n_pool, uint32_t vlean, uint32_t budget) {
+    return (uint64_t)n_pool * vlean <= budget;
+}
+
+inline bool quiesce_ready_pool(uint32_t quiesce_cnt, uint32_t n_pool) {
+    return quiesce_cnt >= n_pool - 1;
+}

@@ -128,6 +128,27 @@
 .ifndef DSWS2_TICKET_SELFTEST
   .set DSWS2_TICKET_SELFTEST, 0   // DIAG-only try_gate single-winner smoke (Task 4 Step 3); default 0 = no bytes
 .endif
+.ifndef CONV_COOLDOWN
+  .set CONV_COOLDOWN, 0     // Task 4: per-wave post-conversion cooldown epochs. 0 = spec-faithful (no
+                             //   cooldown, byte-identical to pre-Task-4); >0 damps thrash (skip N epochs
+                             //   of watermark decision after a wave converts role).
+.endif
+// Task 5: deterministic bring-up hook. DSWS2_FORCE=1 makes exactly wave DSWS2_FORCE_WID convert
+//   direction DSWS2_FORCE_DIR at epoch DSWS2_FORCE_EPOCH, watermarks bypassed -- a reproducible,
+//   single-wave/single-epoch GPU proof of role conversion. Default DSWS2_FORCE=0 emits ZERO bytes
+//   (byte-identical to pre-Task-5).
+.ifndef DSWS2_FORCE
+  .set DSWS2_FORCE, 0
+.endif
+.ifndef DSWS2_FORCE_WID
+  .set DSWS2_FORCE_WID, 0
+.endif
+.ifndef DSWS2_FORCE_DIR
+  .set DSWS2_FORCE_DIR, 0            // 0/1 = compute->A/B ; 2/3 = A/B->compute
+.endif
+.ifndef DSWS2_FORCE_EPOCH
+  .set DSWS2_FORCE_EPOCH, 1
+.endif
 .set SNAP_BASE,      (INITFLAG_OFF + 4)         // u32[6]: [parity*3 + {0:nC,1:nA,2:nB}] role-mix snapshots
 .set QUIESCE_CNT_OFF,(SNAP_BASE + 6*4)          // u32 role-agnostic bail counter
 .set DSWS2_STATE_END,(QUIESCE_CNT_OFF + 4)
@@ -404,6 +425,13 @@
   .set BUDGET, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)   // = VRESV_OFF init (conservation ceiling)
 .endif
 
+.if DSWS2_CONV
+// compile-time no-parking invariant: every launched wave must fit lean at once
+.if (WAVES * VLEAN) > BUDGET
+  .error "WAVES*VLEAN exceeds BUDGET — pool cannot stay all-lean (parking is out of scope)"
+.endif
+.endif
+
 // try_gate: the lock-free single-winner conversion ticket (transcribed VERBATIM from occ_kernel_coop.s,
 //   which transcribes dsws_ctrl_model.cpp gate_try_win + epoch_of EXACTLY). E = segcnt>>EPOCH_SHIFT.
 //   gate[dir] holds the last epoch dir fired. Among many waves racing the same (g<E), exactly ONE wins
@@ -550,6 +578,9 @@
 .Lca_commit\@:
     lds_fetch_add s52, \dst_slot, 1             // (c) inc dest slot (unbounded -> plain atomic add)
     s_mov_b32 s59, \dst_slot                    //     flip private current-role reg (records new role slot id)
+.if CONV_COOLDOWN > 0
+    s_mov_b32 s66, CONV_COOLDOWN                //     Task 4: committed conversion -> arm cooldown
+.endif
     // ---- s_alloc_vgpr resize: THE pre-grow OOR window closes here; all reads above were <=v15 ----
 .Lca_alloc\@:
     s_alloc_vgpr \alloc_sz                       // GROW(NFV) / SHRINK(32); SCC-retry (brick-class rule)
@@ -622,11 +653,29 @@ occ_kernel:
 .Ltg_selftest_skip:
     s_mov_b32 exec_lo, s16
 .endif
+.if DSWS2_CONV
+.if CONV_COOLDOWN > 0
+    s_mov_b32 s66, 0                             // Task 4: init cooldown ctr (un-cooled at entry)
+.endif
+    s_cmp_lt_u32 s24, NBFEED
+    s_cbranch_scc1 .Lseed_bfeed
+    s_cmp_lt_u32 s24, (NBFEED+NAFEED)
+    s_cbranch_scc1 .Lseed_afeed
+    s_mov_b32 s59, NCOMP_SLOT
+    s_branch .Ldispatch
+.Lseed_afeed:
+    s_mov_b32 s59, NAFEED_SLOT
+    s_branch .Ldispatch
+.Lseed_bfeed:
+    s_mov_b32 s59, NBFEED_SLOT
+    s_branch .Ldispatch
+.else
     s_cmp_lt_u32 s24, NBFEED
     s_cbranch_scc1 .Lbfeed
     s_cmp_lt_u32 s24, (NBFEED+NAFEED)
     s_cbranch_scc1 .Lafeed
     s_branch .Lcompute
+.endif
 
 // ============================================================================================
 //  A3 -- .Lclaimer : pinned wid-0. Owns the super-tile claim+broadcast, the SEGCNT clock, the
@@ -894,17 +943,46 @@ occ_kernel:
     //   Lean-32 -> PRE-GROW window (the feed->compute GROW closes it inside conv_apply, post all <=v15
     //   reads). If the B-ring is OVER-SERVED (occ_B>CTRL_HIGH_B) grow one B-feed->compute (dir 3):
     //   reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay B-feed).
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0
+    s_cbranch_scc0 .Lbfeed_cooldn                // Task 4: s66!=0 -> in cooldown, skip decision
+.endif
+.if DSWS2_FORCE
+.if DSWS2_FORCE_DIR == 3
+    // Task 5: deterministic forced conversion (dir 3: B-feed -> compute), watermark bypassed.
+    //   Convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==DSWS2_FORCE_EPOCH.
+    s_mov_b32 s58, 0
+    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
+    s_cbranch_scc0 .Lbfeed_cooldn
+    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
+    s_cbranch_scc0 .Lbfeed_cooldn
+    s_mov_b32 s57, 3                             // dir 3: B-feed -> compute (forced)
+    try_gate 3, s58
+    conv_apply NBFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.endif
+.else
     s_mov_b32 s58, 0
     occ_sample s55, s56                          // s55=occ_A, s56=occ_B
     s_cmp_gt_u32 s56, CTRL_HIGH_B
-    s_cbranch_scc0 .Lbfeed_quiesce
+    s_cbranch_scc0 .Lbfeed_cooldn
     s_mov_b32 s57, 3                             // dir 3: B-feed -> compute
     try_gate 3, s58
     conv_apply NBFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.endif
+.Lbfeed_cooldn:
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
+    s_cbranch_scc1 .Lbfeed_quiesce
+    s_sub_i32 s66, s66, 1
+.endif
 .Lbfeed_quiesce:
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
 .endif
+.if DSWS2_CONV
+    s_branch .Ldispatch
+.else
     s_branch .Lbfeed_follow
+.endif
 
 // ============================================================================================
 //  A5 -- .Lafeed : A-feed wave. Follows EPOCH/STI, decodes (mblk,ksi), stages its claimed A rowblks.
@@ -938,17 +1016,46 @@ occ_kernel:
     //   (feed->compute, s_alloc_vgpr NFV) is the ONLY grow and closes the window inside conv_apply, after
     //   all <=v15 LDS/atomic reads. If the A-ring is OVER-SERVED (occ_A>CTRL_HIGH_A) grow one A-feed->
     //   compute (dir 2): reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay A-feed).
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0
+    s_cbranch_scc0 .Lafeed_cooldn                // Task 4: s66!=0 -> in cooldown, skip decision
+.endif
+.if DSWS2_FORCE
+.if DSWS2_FORCE_DIR == 2
+    // Task 5: deterministic forced conversion (dir 2: A-feed -> compute), watermark bypassed.
+    //   Convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==DSWS2_FORCE_EPOCH.
+    s_mov_b32 s58, 0
+    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
+    s_cbranch_scc0 .Lafeed_cooldn
+    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
+    s_cbranch_scc0 .Lafeed_cooldn
+    s_mov_b32 s57, 2                             // dir 2: A-feed -> compute (forced)
+    try_gate 2, s58
+    conv_apply NAFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.endif
+.else
     s_mov_b32 s58, 0
     occ_sample s55, s56                          // s55=occ_A, s56=occ_B
     s_cmp_gt_u32 s55, CTRL_HIGH_A
-    s_cbranch_scc0 .Lafeed_quiesce
+    s_cbranch_scc0 .Lafeed_cooldn
     s_mov_b32 s57, 2                             // dir 2: A-feed -> compute
     try_gate 2, s58
     conv_apply NAFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
+.endif
+.Lafeed_cooldn:
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
+    s_cbranch_scc1 .Lafeed_quiesce
+    s_sub_i32 s66, s66, 1
+.endif
 .Lafeed_quiesce:
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
 .endif
+.if DSWS2_CONV
+    s_branch .Ldispatch
+.else
     s_branch .Lafeed_follow
+.endif
 
 // ============================================================================================
 //  A6 -- .Lcompute : compute wave. Follows EPOCH/STI, decodes (mblk,tcol,ksi), waits resident A/B
@@ -1075,6 +1182,31 @@ occ_kernel:
     //   else if starved for B, compute->B-feed (dir 1). Both are SHRINKs: reserve delta -(NFV-VLEAN),
     //   s_alloc_vgpr 32 (already lean -> no-op). Persistent: s57=dir, s58=s_win, s59=new-role (all outside
     //   s60..s65 so occ_sample/try_gate/reserve_try/conv_* cannot clobber them while live).
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0
+    s_cbranch_scc0 .Lcmp_cooldn                  // Task 4: s66!=0 -> in cooldown, skip decision
+.endif
+.if DSWS2_FORCE
+.if DSWS2_FORCE_DIR == 0 || DSWS2_FORCE_DIR == 1
+    // Task 5: deterministic forced conversion (compute is the source role for dir 0 and dir 1).
+    //   Watermark bypassed: convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==
+    //   DSWS2_FORCE_EPOCH. try_gate still runs (sets s58=s_win, conv_apply's precondition).
+    s_mov_b32 s58, 0                             // s_win = 0 default (compares below may bail early)
+    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
+    s_cbranch_scc0 .Lcmp_cooldn
+    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
+    s_cbranch_scc0 .Lcmp_cooldn
+.if DSWS2_FORCE_DIR == 0
+    s_mov_b32 s57, 0                             // dir 0: compute -> A-feed (forced)
+    try_gate 0, s58
+    conv_apply NCOMP_SLOT, NAFEED_SLOT, -(NFV-VLEAN), 32
+.else
+    s_mov_b32 s57, 1                             // dir 1: compute -> B-feed (forced)
+    try_gate 1, s58
+    conv_apply NCOMP_SLOT, NBFEED_SLOT, -(NFV-VLEAN), 32
+.endif
+.endif
+.else
     s_mov_b32 s58, 0                             // s_win = 0 (default: raced no ticket)
     occ_sample s55, s56                          // s55=occ_A in [0,G], s56=occ_B in [0,FN]  (clob s60,s61)
     s_cmp_lt_u32 s55, CTRL_LOW
@@ -1082,19 +1214,49 @@ occ_kernel:
     s_mov_b32 s57, 0                             // dir 0: compute -> A-feed
     try_gate 0, s58                              // s58 = s_win (single-winner per (dir,epoch))
     conv_apply NCOMP_SLOT, NAFEED_SLOT, -(NFV-VLEAN), 32
-    s_branch .Lcmp_quiesce
+    s_branch .Lcmp_cooldn
 .Lcmp_try_b:
     s_cmp_lt_u32 s56, CTRL_LOW
-    s_cbranch_scc0 .Lcmp_quiesce
+    s_cbranch_scc0 .Lcmp_cooldn
     s_mov_b32 s57, 1                             // dir 1: compute -> B-feed
     try_gate 1, s58
     conv_apply NCOMP_SLOT, NBFEED_SLOT, -(NFV-VLEAN), 32
+.endif
+.Lcmp_cooldn:
+.if CONV_COOLDOWN > 0
+    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
+    s_cbranch_scc1 .Lcmp_quiesce
+    s_sub_i32 s66, s66, 1
+.endif
 .Lcmp_quiesce:
     // ORDERING (SPEC 3.4 decision 2): the commit above fully completed (role-slot CAS + reservation +
     //   s_alloc_vgpr) BEFORE this QUIESCE_CNT bump -- the bump is the snapshot handshake the claimer reads.
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // exactly one bump per non-claimer wave / super-tile
 .endif
+.if DSWS2_CONV
+    s_branch .Ldispatch
+.else
     s_branch .Lcompute_follow                    // this super-tile's compute drained -> re-check epoch/terminal
+.endif
+
+.if DSWS2_CONV
+// ============================================================================================
+//  Universal role dispatcher (Task 3): scalar-only trampoline. Reads the role register s59
+//    (seeded at entry / flipped by conv_apply on a role conversion) and branches to the matching
+//    role's per-epoch _follow loop. Lands on _follow (NOT _alloc/_init): the wave's VGPR footprint
+//    is already correct (seed or conv_apply set it) and INIT already ran once -- re-entering
+//    _alloc would wrongly resize, and _init would deadlock on the already-consumed INITFLAG.
+//    s35 (last-seen-epoch) is untouched here, which is what makes a re-dispatched wave wait for
+//    the NEXT epoch at the top of its new role's _follow loop. Scalar-only (s59 read + s_branch) ->
+//    adds ZERO OOR/VGPR exposure.
+// ============================================================================================
+.Ldispatch:
+    s_cmp_eq_u32 s59, NCOMP_SLOT
+    s_cbranch_scc1 .Lcompute_follow
+    s_cmp_eq_u32 s59, NAFEED_SLOT
+    s_cbranch_scc1 .Lafeed_follow
+    s_branch .Lbfeed_follow
+.endif
 
 // ---- A7 role-agnostic terminal (followers): retire. (Claimer retires via .Lclaimer_terminal.) ----
 .Lretire:
