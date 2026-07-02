@@ -93,3 +93,43 @@ inline bool pool_fits_lean(uint32_t n_pool, uint32_t vlean, uint32_t budget) {
 inline bool quiesce_ready_pool(uint32_t quiesce_cnt, uint32_t n_pool) {
     return quiesce_cnt >= n_pool - 1;
 }
+
+// ---- Pool-T7 root cause: first-entry contract (dispatch vs re-dispatch) ----
+//
+// A wave's FIRST-time entry and its RE-dispatch (after a per-super-tile bail) are NOT
+// interchangeable. First entry must run, in order, the per-role _alloc and _init blocks:
+//   (a) ran_alloc      -- s_alloc_vgpr 32, the DYNVGPR per-wave lean allocator handshake,
+//   (b) waited_initflag -- spin until the claimer publishes INITFLAG == 0xACED (LDS ready),
+//   (c) seeded_epoch   -- s35 = 0, the local last-seen-epoch baseline,
+// THEN falls into _follow. Re-dispatch legitimately skips (a)/(b)/(c): the wave already ran
+// them once and conv_apply already sized its footprint -- so the scalar-only .Ldispatch
+// trampoline lands straight on _follow. The bug: the seed arms pointed FIRST entry at
+// .Ldispatch too, so first-time followers skip _alloc/_init and desync from the epoch clock.
+struct WaveEntry { bool ran_alloc; bool waited_initflag; bool seeded_epoch; };
+
+// Where a wave's first-time entry lands. LAND_FOLLOW == seed arms branch to .Ldispatch (the
+// buggy routing); LAND_ROLE_ENTRY == seed arms branch to .Lbfeed/.Lafeed/.Lcompute (the fix).
+enum EntryLanding { LAND_FOLLOW, LAND_ROLE_ENTRY };
+
+inline WaveEntry simulate_first_entry(EntryLanding land) {
+    // Only the role entry labels chain _alloc -> _init -> _follow; landing on _follow skips both.
+    bool full = (land == LAND_ROLE_ENTRY);
+    return WaveEntry{full, full, full};
+}
+
+// A wave is correctly initialized for the follow/quiesce protocol iff it ran all three.
+inline bool entry_safe(const WaveEntry& w) {
+    return w.ran_alloc && w.waited_initflag && w.seeded_epoch;
+}
+
+// End-to-end handshake: does the claimer's per-super-tile QUIESCE_CNT >= WAVES-1 gate ever
+// close? Every non-claimer follower (wid0 is the claimer and never bails) must reach its
+// _quiesce bail once per super-tile; only a follower that entered safely is synced to the
+// epoch clock and reliably does. An unsafe entry is a deterministic code-path defect (garbage
+// s35 + skipped INITFLAG in identically-compiled waves), so ALL seed-entered followers desync
+// -> zero reliable bumps -> the claimer spins forever in .Lclaimer_wait_done.
+inline bool claimer_quiesce_converges(EntryLanding land, uint32_t waves) {
+    uint32_t n_followers = waves - 1;
+    uint32_t n_safe = entry_safe(simulate_first_entry(land)) ? n_followers : 0;
+    return quiesce_ready_pool(n_safe, waves);
+}

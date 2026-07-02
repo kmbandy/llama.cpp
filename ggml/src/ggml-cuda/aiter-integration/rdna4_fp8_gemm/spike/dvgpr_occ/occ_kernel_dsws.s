@@ -657,18 +657,24 @@ occ_kernel:
 .if CONV_COOLDOWN > 0
     s_mov_b32 s66, 0                             // Task 4: init cooldown ctr (un-cooled at entry)
 .endif
+    // FIRST-time entry seeds the role reg s59 then falls into the role's FULL entry
+    //   (.Lcompute/.Lafeed/.Lbfeed -> _alloc -> _init -> _follow). It must NOT jump to
+    //   .Ldispatch: that trampoline lands on _follow and is correct ONLY for RE-dispatch
+    //   (a wave that already ran _alloc/_init once). First entry via _follow would skip the
+    //   s_alloc_vgpr 32 allocator handshake, the INITFLAG==0xACED rendezvous, and the s35=0
+    //   epoch seed -> followers desync and the claimer hangs in .Lclaimer_wait_done (Pool-T7 brick).
     s_cmp_lt_u32 s24, NBFEED
     s_cbranch_scc1 .Lseed_bfeed
     s_cmp_lt_u32 s24, (NBFEED+NAFEED)
     s_cbranch_scc1 .Lseed_afeed
     s_mov_b32 s59, NCOMP_SLOT
-    s_branch .Ldispatch
+    s_branch .Lcompute
 .Lseed_afeed:
     s_mov_b32 s59, NAFEED_SLOT
-    s_branch .Ldispatch
+    s_branch .Lafeed
 .Lseed_bfeed:
     s_mov_b32 s59, NBFEED_SLOT
-    s_branch .Ldispatch
+    s_branch .Lbfeed
 .else
     s_cmp_lt_u32 s24, NBFEED
     s_cbranch_scc1 .Lbfeed
@@ -1241,11 +1247,15 @@ occ_kernel:
 
 .if DSWS2_CONV
 // ============================================================================================
-//  Universal role dispatcher (Task 3): scalar-only trampoline. Reads the role register s59
-//    (seeded at entry / flipped by conv_apply on a role conversion) and branches to the matching
-//    role's per-epoch _follow loop. Lands on _follow (NOT _alloc/_init): the wave's VGPR footprint
-//    is already correct (seed or conv_apply set it) and INIT already ran once -- re-entering
-//    _alloc would wrongly resize, and _init would deadlock on the already-consumed INITFLAG.
+//  Role RE-DISPATCH trampoline (Task 3): scalar-only. Reads the role register s59 (flipped by
+//    conv_apply on a role conversion, else unchanged) and branches to the matching role's
+//    per-epoch _follow loop. RE-DISPATCH ONLY -- reached from a per-super-tile _quiesce bail,
+//    never from first-time entry (the seed arms fall into the full role entry so _alloc/_init
+//    run once; see the seed block). Lands on _follow (NOT _alloc/_init): the wave's VGPR
+//    footprint is already correct (conv_apply set it) and INIT already ran -- re-entering _alloc
+//    would wrongly resize, and re-running _init would reset s35=0, breaking the "wait for the
+//    NEXT epoch" contract (the wave would re-process the current super-tile). INITFLAG is written
+//    once (0xACED) and never cleared, so it is the s35 reset -- not INITFLAG -- that _follow preserves.
 //    s35 (last-seen-epoch) is untouched here, which is what makes a re-dispatched wave wait for
 //    the NEXT epoch at the top of its new role's _follow loop. Scalar-only (s59 read + s_branch) ->
 //    adds ZERO OOR/VGPR exposure.

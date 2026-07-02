@@ -95,6 +95,29 @@ int main() {
   assert( quiesce_ready_pool(11, 12) && !quiesce_ready_pool(10, 12));
   printf("dsws_ctrl_model: dispatch/cooldown/pool OK\n");
 
+  // ---- Pool-T7 brick repro: first-time entry MUST run _alloc/_init before _follow ----
+  //   A wave's first entry has to (a) commit its lean VGPR alloc (s_alloc_vgpr 32), (b) wait the
+  //   claimer's INITFLAG==0xACED LDS rendezvous, and (c) seed its local epoch (s35=0) -- all of which
+  //   live only inside the per-role _alloc/_init blocks. Landing first entry on _follow (what the
+  //   .Ldispatch re-dispatch trampoline does) skips all three -> followers desync from the epoch clock,
+  //   never reach their _quiesce bail, and the claimer spins forever in .Lclaimer_wait_done (the brick).
+  {
+    WaveEntry via_dispatch = simulate_first_entry(LAND_FOLLOW);     // seed arms -> .Ldispatch (buggy)
+    assert(!via_dispatch.ran_alloc && !via_dispatch.waited_initflag && !via_dispatch.seeded_epoch);
+    assert(!entry_safe(via_dispatch));                              // first entry via _follow is UNSAFE
+
+    WaveEntry via_role = simulate_first_entry(LAND_ROLE_ENTRY);     // seed arms -> .Lbfeed/.Lafeed/.Lcompute
+    assert(via_role.ran_alloc && via_role.waited_initflag && via_role.seeded_epoch);
+    assert(entry_safe(via_role));                                   // first entry via role label is SAFE
+
+    // End-to-end handshake: mix 4c2a2b -> WAVES=8, so 7 non-claimer followers must each bump QUIESCE_CNT
+    // once per super-tile. Unsafe entry desyncs EVERY seed-entered follower (deterministic code-path
+    // defect, not a timing race -> all 7 lost), so the claimer's QUIESCE_CNT>=WAVES-1 gate never closes.
+    assert(!claimer_quiesce_converges(LAND_FOLLOW,    8));          // BUG: reproduces the Pool-T7 hang
+    assert( claimer_quiesce_converges(LAND_ROLE_ENTRY, 8));         // FIX: claimer advances
+  }
+  printf("dsws_ctrl_model: entry-contract (Pool-T7 repro) OK\n");
+
   printf("dsws_ctrl_model: ALL PASS\n");
   return 0;
 }
