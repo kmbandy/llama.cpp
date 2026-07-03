@@ -149,9 +149,49 @@
 .ifndef DSWS2_FORCE_EPOCH
   .set DSWS2_FORCE_EPOCH, 1
 .endif
+// Rolling dyn-VGPR sum-envelope (2026-07-02 spec). ENVELOPE routes the per-rowblk compute burst grow
+//   through the shared vgpr_reserved counter so at most PEAK_CONC waves hold peak at once (the
+//   multi-grower collision, ISA 3.3.3.2, becomes unreachable). All default to the byte-identical value:
+//   ENVELOPE=0/STAGGER=0 emit ZERO new bytes and PEAK_CONC/STAGGER_PERIOD are inert unless their gate is on.
+.ifndef DSWS2_ENVELOPE
+  .set DSWS2_ENVELOPE, 0        // 1 = route the per-rowblk compute burst grow through the vgpr_reserved
+.endif                          //     sum-envelope. 0 = HEAD (bare .Lcompute_grow) -> .text byte-identical.
+.ifndef PEAK_CONC
+  .set PEAK_CONC, 2             // concurrent compute peaks the budget admits (R3 sweep). Used iff ENVELOPE=1.
+.endif
+.ifndef DSWS2_STAGGER
+  .set DSWS2_STAGGER, 0        // 1 = lock-free phase-token stagger (Task 9). 0 -> emergent envelope stagger.
+.endif
+.ifndef STAGGER_PERIOD
+  .set STAGGER_PERIOD, NCOMP   // phase slots in the stagger ring (R3 sweep). Used iff STAGGER=1.
+.endif
 .set SNAP_BASE,      (INITFLAG_OFF + 4)         // u32[6]: [parity*3 + {0:nC,1:nA,2:nB}] role-mix snapshots
-.set QUIESCE_CNT_OFF,(SNAP_BASE + 6*4)          // u32 role-agnostic bail counter
+.set QUIESCE_CNT_OFF,(SNAP_BASE + 6*4)          // u32 role-agnostic bail counter (LDS; DSWS2_GQUIESCE=0)
 .set DSWS2_STATE_END,(QUIESCE_CNT_OFF + 4)
+// DSWS2_GQUIESCE (2026-07-02 SUSPECT #2 candidate fix): route the QUIESCE handshake through a DEVICE-SCOPED
+//   GLOBAL atomic in the uncached occ buffer (byte QUIESCE_GOFF), mirroring the GREEN occ[20] claim/occ[0]
+//   live handshake, instead of the barrier-free LDS counter (whose cross-wave visibility is unguaranteed and
+//   is the leading SUSPECT #2 hang mechanism). occ buffer = AllocGpu 0x1000 (1024 u32, uncached); host uses
+//   occ[0..6] + DIAG scratch (<= byte 116); byte 200 (occ[50]) is provably free. Default 0 => LDS path,
+//   .text byte-identical. Requires DSWS2_CONV (QUIESCE only exists there).
+.ifndef DSWS2_GQUIESCE
+  .set DSWS2_GQUIESCE, 0
+.endif
+.set QUIESCE_GOFF,   200                         // occ[] byte offset for the global QUIESCE counter (occ[50])
+// DSWS2_BAILMARK (SUSPECT #2 localization, 2026-07-03): each follower publishes its OWN epoch (s35) to a
+//   PER-WAVE occ slot (BAIL_BASE + wid*4) at its _quiesce bail. One-shot per super-tile per wave -> minimal
+//   timing perturbation (NOT the claimer's per-spin DIAG poll stores, which are the heisenbug source and stay
+//   DIAG-only). After a watchdog abort the host reads occ[BAIL_BASE/4 + wid]: every follower's slot == the
+//   hung epoch => all reached their bail (=> a QUIESCE visibility/lost-update, gq relevant); ONE slot stale
+//   at the prior epoch => that exact wave is the STRAGGLER (stuck in _alloc/_init/_follow; gq irrelevant).
+//   Per-WAVE (not per-role): 4 compute share one role, so a role mark's last-writer-wins would hide a single
+//   straggler. Default 0 => no bytes, .text byte-identical. Requires DSWS2_CONV.
+.ifndef DSWS2_BAILMARK
+  .set DSWS2_BAILMARK, 0
+.endif
+.set BAIL_BASE,      160                         // occ[] byte offset base for per-wave bail marks: occ[40..47]
+                                                 //   (host prints occ[40..47] as BAIL[w0..w7]; clear of the
+                                                 //    occ[32..36]/occ[39] DSWS sensor+roles slots and occ[50] gq)
 .set KSEG_STEPS,     (SEGK/16)             // K16-steps per split-K segment = SEGK K-elements / 16
 // FIX 1(b): NKSEG_SHIFT = log2(KSEG_STEPS), so the prologue can derive n_kseg = KT >> NKSEG_SHIFT instead
 //   of receiving it as a (now-dropped) kernarg. SEGK is always a power-of-two multiple of 16 in every
@@ -409,7 +449,11 @@
 //   OOR-poison under dyn-VGPR, SPEC S4): scalars <= s65 only (s60/s61 scratch; callers pass dst in
 //   [s62,s65]); the only vector temps are inside lds_get, which uses v11/v14 (INTERIOR to the launch
 //   16-VGPR block) -- NO >v15 temp is introduced here.
-.if DSWS2_CONV
+// GATE: DSWS2_CONV || DSWS2_ENVELOPE. reserve_try + the BUDGET default are the pool-economy primitives the
+//   rolling envelope needs INDEPENDENTLY of role conversion (they touch only VRESV_OFF/lds_fetch_add), so the
+//   envelope must be able to run at CONV=0 (the isolation config). Everything in this block is macro/.set
+//   definition (emits ZERO bytes), so widening the gate is byte-identical at CONV=0/ENV=0 and CONV=1.
+.if DSWS2_CONV || DSWS2_ENVELOPE
 .macro occ_sample dst_a, dst_b               // out: \dst_a=occ_A in [0,G], \dst_b=occ_B in [0,FN]; clob s60,s61
     lds_get \dst_a, AROW_DONE_OFF            // prod_a: A rowblks resident (store-completion)
     lds_get \dst_b, BFRAG_DONE_OFF           // prod_b: B frags   resident (store-completion)
@@ -418,6 +462,46 @@
     s_sub_u32  \dst_a, \dst_a, s61           // occ_A  = prod_a - cons_a   in [0,G]
     s_min_u32  s61, s60, \dst_b              // cons_b = min(clock, prod_b)
     s_sub_u32  \dst_b, \dst_b, s61           // occ_B  = prod_b - cons_b   in [0,FN]
+.endm
+
+// ---- DSWS2_GQUIESCE: device-scoped GLOBAL QUIESCE handshake (mirrors the green occ[20]/occ[0] pattern).
+//   All three ops are lane-0-masked (v2==0), exec saved/restored via s49 (the LDS-macro convention -- s49 is
+//   never live across a macro boundary, so it is provably free at every site these replace an lds_* op).
+//   vaddr = v4 (the stable occ-base per-lane offset, =0, prologue-set), data/dst = v3/v5 (occ scratch vregs,
+//   same as the claim/live ops). scope:SCOPE_DEV + uncached occ buffer => device-coherent visibility (the
+//   fix). s_wait_storecnt/loadcnt drain before proceeding so the poll observes committed bumps.
+.macro gq_reset                              // claimer: occ[QUIESCE_GOFF] = 0 (committed before EPOCH publish)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgqr_skip\@
+    v_mov_b32 v3, 0
+    global_store_b32 v4, v3, s[0:1] offset:QUIESCE_GOFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lgqr_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+.macro gq_bump                               // follower: occ[QUIESCE_GOFF] += 1 (one bump/wave/super-tile)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgqb_skip\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:QUIESCE_GOFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lgqb_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+.macro gq_read dst                           // claimer: \dst = occ[QUIESCE_GOFF] (lane0 load + broadcast)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgqrd_skip\@
+    global_load_b32 v5, v4, s[0:1] offset:QUIESCE_GOFF scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+.Lgqrd_skip\@:
+    s_mov_b32 exec_lo, s49
+    v_readfirstlane_b32 \dst, v5
 .endm
 
 // ---- Pool-T7 chunk-2 wedge localization (DIAG-only; DSWS2_CONV=0 emits nothing -> .text byte-identical).
@@ -437,6 +521,26 @@
 .endif
 .endm
 
+// bail_mark: PER-WAVE localization mark. Lane-0 writes this wave's epoch (s35) to occ[BAIL_BASE + wid*4]
+//   (runtime vaddr since the offset depends on wid=s24). s48 scratch, s49 exec-save (macro-local; free at the
+//   _quiesce bail sites), v13 vaddr, v14 data (both <=v15; the wave is lean-32 at every bail site). One-shot
+//   per super-tile -> negligible perturbation vs the DIAG per-spin claimer stores. Enabled by DIAG OR BAILMARK.
+.macro bail_mark
+.if DSWS2_CONV && (DIAG || DSWS2_BAILMARK)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lbmk_skip\@
+    s_lshl_b32 s48, s24, 2                        // wid*4
+    s_add_u32  s48, s48, BAIL_BASE                // occ byte offset for THIS wave
+    v_mov_b32  v13, s48                           // vaddr = per-wave byte offset (lane0)
+    v_mov_b32  v14, s35                           // data  = this wave's current epoch
+    global_store_b32 v13, v14, s[0:1] scope:SCOPE_DEV
+.Lbmk_skip\@:
+    s_mov_b32 exec_lo, s49
+.endif
+.endm
+
 // --------------------------------------------------------------------------------------------
 //  Phase-B controller thresholds + sum-envelope budget (Task 4). EPOCH_SHIFT mirrors coop /
 //  occ_dispatch (epoch = segcnt >> EPOCH_SHIFT). BUDGET is the per-WG VGPR sum-envelope ceiling
@@ -448,13 +552,23 @@
   .set EPOCH_SHIFT, 3        // decision clock: epoch = segcnt >> EPOCH_SHIFT (small = reactive)
 .endif
 .ifndef BUDGET
-  .set BUDGET, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)   // = VRESV_OFF init (conservation ceiling)
+.if DSWS2_ENVELOPE
+  .set BUDGET, (WAVES*VLEAN + PEAK_CONC*(NFV-VLEAN))   // rolling: lean floor + concurrent-peak headroom
+.else
+  .set BUDGET, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)     // = VRESV_OFF init (conservation ceiling)
+.endif
 .endif
 
 .if DSWS2_CONV
 // compile-time no-parking invariant: every launched wave must fit lean at once
 .if (WAVES * VLEAN) > BUDGET
   .error "WAVES*VLEAN exceeds BUDGET — pool cannot stay all-lean (parking is out of scope)"
+.endif
+.endif
+.if DSWS2_ENVELOPE
+// forward-progress: the budget must admit at least one concurrent peak or a claimed wave can never grow
+.if (WAVES*VLEAN + (NFV-VLEAN)) > BUDGET
+  .error "ENVELOPE: BUDGET admits < 1 concurrent peak — forward progress impossible"
 .endif
 .endif
 
@@ -750,12 +864,20 @@ occ_kernel:
     lds_put (GATE_OFF+4), 0
     lds_put (GATE_OFF+8), 0
     lds_put (GATE_OFF+12), 0
+.if DSWS2_ENVELOPE
+    lds_put VRESV_OFF, (WAVES*VLEAN)                          // rolling: everyone lean; counter books peaks
+.else
     lds_put VRESV_OFF, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)
+.endif
     lds_put SEGCNT_OFF, 0
 .if DSWS2_CONV
     // Phase-B: seed BOTH epoch-parity role-mix snapshots with the launch mix, zero the quiesce counter.
     // Gated so DSWS2_CONV=0 emits ZERO new bytes -> byte-identical to the Phase-A green bin.
+.if DSWS2_GQUIESCE
+    gq_reset                           // global QUIESCE = 0 (device-scoped; committed before INITFLAG)
+.else
     lds_put QUIESCE_CNT_OFF, 0
+.endif
     lds_put (SNAP_BASE + 0), NCOMP     // parity-0 snapshot = launch mix
     lds_put (SNAP_BASE + 4), NAFEED
     lds_put (SNAP_BASE + 8), NBFEED
@@ -816,7 +938,11 @@ occ_kernel:
     s_add_u32 s46, s46, 4
     lds_get s47, NBFEED_SLOT
     lds_put_r s46, s47                           // snap.nB = live NBFEED_SLOT
+.if DSWS2_GQUIESCE
+    gq_reset                                     // global QUIESCE = 0 (device-scoped; committed before EPOCH publish)
+.else
     lds_put QUIESCE_CNT_OFF, 0                    // reset the per-super-tile bail counter
+.endif
 .endif
     lds_put EPOCH_OFF, s44
     BSTAGE                                      // claimer helps stage B for this super-tile (s30,s31)
@@ -894,7 +1020,11 @@ occ_kernel:
 .Lqc_ar_ok:
     // quiesce_done (s51) = QUIESCE_CNT >= WAVES-1  (each of the WAVES-1 non-claimer waves bumped once)
     s_mov_b32 s51, 1
+.if DSWS2_GQUIESCE
+    gq_read s44                                  // device-scoped global read (observes committed follower bumps)
+.else
     lds_get s44, QUIESCE_CNT_OFF
+.endif
     s_cmp_lt_u32 s44, (WAVES-1)
     s_cbranch_scc0 .Lqc_q_ok
     s_mov_b32 s51, 0
@@ -935,6 +1065,16 @@ occ_kernel:
     global_store_b32 v4, v14, s[0:1] offset:84  scope:SCOPE_DEV   // occ[21] pub      = AROW_NEXT
     v_mov_b32 v14, s62
     global_store_b32 v4, v14, s[0:1] offset:88  scope:SCOPE_DEV   // occ[22] rawTi    = BFRAG_NEXT
+.if DSWS2_ENVELOPE
+    // Envelope telemetry (2026-07-02 spec 4.5): instantaneous vgpr_reserved at the wedge moment +
+    //   PEAK_CONC config echo. If a dispatch wedges with occ[8]==BUDGET, it is permit-starvation (the
+    //   envelope is saturated); anything below BUDGET points the wedge elsewhere. DIAG+ENVELOPE gated.
+    lds_get s52, VRESV_OFF
+    v_mov_b32 v14, s52
+    global_store_b32 v4, v14, s[0:1] offset:32  scope:SCOPE_DEV   // occ[8]  vgpr_reserved (want < BUDGET)
+    v_mov_b32 v14, PEAK_CONC
+    global_store_b32 v4, v14, s[0:1] offset:56  scope:SCOPE_DEV   // occ[14] PEAK_CONC echo (config readback)
+.endif
 .Lqc_diag_skip:
     s_mov_b32 exec_lo, s16
 .endif
@@ -1034,8 +1174,13 @@ occ_kernel:
     s_sub_i32 s66, s66, 1
 .endif
 .Lbfeed_quiesce:
+.if DSWS2_GQUIESCE
+    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
+.else
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+.endif
     epoch_mark 144                               // roles[2] = B-feed last epoch bumped (wedge localize)
+    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch
@@ -1108,8 +1253,13 @@ occ_kernel:
     s_sub_i32 s66, s66, 1
 .endif
 .Lafeed_quiesce:
+.if DSWS2_GQUIESCE
+    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
+.else
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
+.endif
     epoch_mark 140                               // roles[1] = A-feed last epoch bumped (wedge localize)
+    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch
@@ -1164,6 +1314,18 @@ occ_kernel:
 .if DYNVGPR
     s_wait_loadcnt 0x0
     s_wait_storecnt 0x0
+.if DSWS2_ENVELOPE
+    // Sum-envelope reserve (2026-07-02 spec 4.1): book +Δ against vgpr_reserved before growing so at most
+    //   PEAK_CONC waves hold peak at once. Over-budget -> reserve_try already undid its add -> back off AT
+    //   LEAN and retry (wave is still 32 here; every temp <=v15, pre-grow OOR-safe). s54=won, s62/s63 scratch
+    //   (all dead in the claim loop -- conv only runs at .Lcompute_drained).
+.Lcompute_reserve:
+    reserve_try +(NFV-VLEAN), s54
+    s_cmp_eq_u32 s54, 0
+    s_cbranch_scc0 .Lcompute_grow              // won (s54!=0 -> SCC==0) -> grow
+    s_sleep SLEEPN
+    s_branch .Lcompute_reserve
+.endif
 .Lcompute_grow:
     s_alloc_vgpr NFV                            // grow (SCC-retry guarded, brick-class rule)
     s_cbranch_scc0 .Lcompute_grow
@@ -1230,6 +1392,9 @@ occ_kernel:
 .Lcompute_shrink:
     s_alloc_vgpr 32                             // shrink (SCC-retry guarded)
     s_cbranch_scc0 .Lcompute_shrink
+.if DSWS2_ENVELOPE
+    lds_fetch_add s54, VRESV_OFF, -(NFV-VLEAN)  // envelope release −Δ (shrink committed; wave lean, v<=v15)
+.endif
 .endif
     lds_inc ROWBLK_DONE_OFF                      // rowblk r computed + flushed (frees the A7 advance gate)
     s_branch .Lcompute_claim
@@ -1291,8 +1456,13 @@ occ_kernel:
 .Lcmp_quiesce:
     // ORDERING (SPEC 3.4 decision 2): the commit above fully completed (role-slot CAS + reservation +
     //   s_alloc_vgpr) BEFORE this QUIESCE_CNT bump -- the bump is the snapshot handshake the claimer reads.
+.if DSWS2_GQUIESCE
+    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
+.else
     lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // exactly one bump per non-claimer wave / super-tile
+.endif
     epoch_mark 136                               // roles[0] = compute last epoch bumped (wedge localize)
+    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
 .endif
 .if DSWS2_CONV
     s_branch .Ldispatch

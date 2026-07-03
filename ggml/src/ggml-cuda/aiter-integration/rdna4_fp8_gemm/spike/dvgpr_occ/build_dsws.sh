@@ -24,7 +24,13 @@ mk2() { # $1=NCOMP $2=NAFEED $3=NBFEED  (DSWS2 v2 substrate, occ_kernel_dsws.s; 
   # BUDGET passthrough: default mirrors the in-file .ifndef launch-footprint conservation ceiling
   # (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN, with NFV=112/VLEAN=32 at this file's fixed FM=2 FN=4) so an
   # unset $BUDGET reproduces the existing default exactly; set $BUDGET to give real per-SIMD headroom.
-  local budget="${BUDGET:-$(( $1 * 112 + ($2 + $3) * 32 ))}"
+  # Envelope-mode budget = WAVES*VLEAN + PEAK_CONC*(NFV-VLEAN) = (c+a+b)*32 + PEAK_CONC*80; else static-fat.
+  local budget
+  if [ "${DSWS2_ENVELOPE:-0}" = "1" ]; then
+    budget="${BUDGET:-$(( ($1 + $2 + $3) * 32 + ${PEAK_CONC:-2} * 80 ))}"
+  else
+    budget="${BUDGET:-$(( $1 * 112 + ($2 + $3) * 32 ))}"
+  fi
   # DSWS2_FORCE* passthrough (Task 5): defaults mirror the in-file .ifndef values exactly, so an
   # unset env leaves every existing mk2 call byte-identical (DSWS2_FORCE=0 emits zero bytes).
   nice -19 ionice -c3 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
@@ -33,6 +39,8 @@ mk2() { # $1=NCOMP $2=NAFEED $3=NBFEED  (DSWS2 v2 substrate, occ_kernel_dsws.s; 
      -Wa,-defsym,NCOMP=$1 -Wa,-defsym,NAFEED=$2 -Wa,-defsym,NBFEED=$3 \
      -Wa,-defsym,DSWS2_FORCE=${DSWS2_FORCE:-0} -Wa,-defsym,DSWS2_FORCE_WID=${DSWS2_FORCE_WID:-0} \
      -Wa,-defsym,DSWS2_FORCE_DIR=${DSWS2_FORCE_DIR:-0} -Wa,-defsym,DSWS2_FORCE_EPOCH=${DSWS2_FORCE_EPOCH:-1} \
+     -Wa,-defsym,DSWS2_ENVELOPE=${DSWS2_ENVELOPE:-0} -Wa,-defsym,PEAK_CONC=${PEAK_CONC:-2} \
+     -Wa,-defsym,DSWS2_STAGGER=${DSWS2_STAGGER:-0} -Wa,-defsym,STAGGER_PERIOD=${STAGGER_PERIOD:-4} \
      -c occ_kernel_dsws.s -o "$tag.o" 2>/tmp/dsws2_build.err \
    && { "$L/llvm-objcopy" -O binary --only-section=.text "$tag.o" "$tag.bin"; echo "  OK   $tag.bin ($(wc -c < "$tag.bin")B)"; } \
    || { echo "  FAIL $tag"; sed -n '1,15p' /tmp/dsws2_build.err; fail=1; }

@@ -118,6 +118,23 @@ int main() {
   }
   printf("dsws_ctrl_model: entry-contract (Pool-T7 repro) OK\n");
 
+  // ---- envelope invariant: at most PEAK_CONC concurrent peaks fit; release frees a slot ----
+  {
+    const uint32_t VLEAN = 32, NFV = 112, D = NFV - VLEAN;   // Δ = 80
+    const uint32_t WAVES = 8, PEAK_CONC = 2;
+    const uint32_t BUDGET = WAVES * VLEAN + PEAK_CONC * D;    // 256 + 160 = 416
+    std::atomic<uint32_t> resv{WAVES * VLEAN};               // init: everyone lean
+    uint64_t spins = 0;
+    reserve_spin(resv, D, BUDGET, spins); assert(spins == 0);   // 1st peak fits
+    reserve_spin(resv, D, BUDGET, spins); assert(spins == 0);   // 2nd peak fits (== PEAK_CONC)
+    assert(reserve_grow(resv, D, BUDGET) == false);             // 3rd over-budget -> rejected + undone
+    assert(resv.load() == WAVES * VLEAN + PEAK_CONC * D);       // undo left counter exactly at 2 peaks
+    reserve_release(resv, D);                                    // free one slot
+    assert(reserve_grow(resv, D, BUDGET) == true);              // now the 3rd fits
+    reserve_release(resv, D); reserve_release(resv, D);
+    assert(resv.load() == WAVES * VLEAN);                       // conservation: back to all-lean
+    printf("dsws_ctrl_model: envelope invariant OK\n");
+  }
   printf("dsws_ctrl_model: ALL PASS\n");
   return 0;
 }

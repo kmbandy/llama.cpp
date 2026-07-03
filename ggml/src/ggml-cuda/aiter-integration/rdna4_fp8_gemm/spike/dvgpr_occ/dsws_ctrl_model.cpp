@@ -53,6 +53,18 @@ static inline bool reserve_grow(std::atomic<uint32_t>& resv, uint32_t delta, uin
     return true;
 }
 
+// Compute-burst reserve with spin-retry (models .Lcompute_reserve): reserve +delta against the
+// sum-envelope; on over-budget, reserve_grow has already undone its add, so back off and retry.
+// `spins` accumulates the backoff count (permit-starvation depth). Bounded when >=1 peak fits.
+static inline void reserve_spin(std::atomic<uint32_t>& resv, uint32_t delta,
+                                uint32_t budget, uint64_t& spins) {
+    while (!reserve_grow(resv, delta, budget)) ++spins;
+}
+// Release a booked burst (models the post-shrink lds_fetch_add VRESV_OFF, -delta). Never fails.
+static inline void reserve_release(std::atomic<uint32_t>& resv, uint32_t delta) {
+    resv.fetch_sub(delta, std::memory_order_acq_rel);
+}
+
 struct WgSnap { uint32_t nC, nA, nB; };
 
 static inline WgSnap snapshot_counts(uint32_t nC, uint32_t nA, uint32_t nB) {
