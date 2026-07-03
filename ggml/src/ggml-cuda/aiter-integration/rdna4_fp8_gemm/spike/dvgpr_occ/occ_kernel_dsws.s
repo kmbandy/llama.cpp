@@ -285,8 +285,17 @@
 //   unsigned-division mul_hi (coop GENDIV idiom), since NTL is not generally a power of two.
 // ============================================================================================
 .macro DECODE_STI                  // in: s17=sti, s67=mask, s68=shift ; out: s19=mblk s30=tcol s31=ksi ; clob: s18,s36
-    s_and_b32    s31, s17, s67                // ksi = sti & mask
+    s_and_b32    s31, s17, s67                // ksi = sti & mask  (mask-bounded -> ksi in [0,n_kseg-1])
     s_lshr_b32   s18, s17, s68                // t   = sti >> shift
+.if SAFEPROBE
+    // brick-PROOF ti clamp (the "future ti clamp" line 752 promised; COOP_STATUS.md:145 racy-garbage-ti->OOB).
+    //   A racy/torn sti read (during the claimer's per-super-tile republish) can decode a garbage t -> garbage
+    //   mblk/tcol -> the A/B/C SCALAR base goes out of buffer -> gfxhub page fault -> MODE1 brick. SAFEPROBE
+    //   already pins the per-lane vaddr (v8/v9/v10); this pins the tile index too, so EVERY global address is
+    //   provably in-buffer. s11=TOTAL is userdata, never clobbered. s36 is DECODE_STI scratch (rewritten below).
+    s_sub_u32    s36, s11, 1                  // TOTAL-1
+    s_min_u32    s18, s18, s36                // t clamped to [0,TOTAL-1] -> mblk<MTL, tcol<NTL (garbage -> in-bounds)
+.endif
     s_mul_hi_u32 s19, s18, s12                // mblk = t / NTL
     s_mul_i32    s36, s19, s13                // mblk * NTL
     s_sub_u32    s30, s18, s36                // tcol = t - mblk*NTL
