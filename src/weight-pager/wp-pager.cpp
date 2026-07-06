@@ -541,6 +541,10 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.routing_ptrs_set,
             (unsigned long) s.routing_ptrs_consumed,
             (unsigned long) s.routing_ptrs_discarded_unconsumed);
+        if (s.dense_prefetch_submitted > 0) {
+            LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
+                           (unsigned long) s.dense_prefetch_submitted);
+        }
         return;
     }
 
@@ -576,6 +580,10 @@ void WeightPager::log_stats_summary() {
         (unsigned long) s.routing_ptrs_set,
         (unsigned long) s.routing_ptrs_consumed,
         (unsigned long) s.routing_ptrs_discarded_unconsumed);
+    if (s.dense_prefetch_submitted > 0) {
+        LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
+                       (unsigned long) s.dense_prefetch_submitted);
+    }
 }
 
 int WeightPager::slot_for_page(int page_idx) const {
@@ -822,15 +830,15 @@ void WeightPager::release_async_transfer_event(int event_handle) {
     transport_.release_event(event_handle);
 }
 
-void WeightPager::prefetch_page(int page_idx) {
-    if (!initialized_)                                          return;
-    if (page_idx < 0 || page_idx >= catalog_.size())            return;
-    if (catalog_.at(page_idx).is_pinned)                        return;  // MAD-236: already resident, no slot needed
-    if (page_to_slot_[page_idx] >= 0)                            return;  // loaded or in flight
+bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch) {
+    if (!initialized_)                                          return false;
+    if (page_idx < 0 || page_idx >= catalog_.size())            return false;
+    if (catalog_.at(page_idx).is_pinned)                        return false;  // MAD-236: already resident, no slot needed
+    if (page_to_slot_[page_idx] >= 0)                            return false;  // loaded or in flight
 
     // Allocate (or evict) a slot now so the prefetch knows where to land.
     const int slot = pool_.alloc_slot();
-    if (slot < 0) return;
+    if (slot < 0) return false;
     void * dst = slot_ptr_(slot);
 
     // Track ownership BEFORE submitting so eviction-callbacks resolve right.
@@ -846,14 +854,19 @@ void WeightPager::prefetch_page(int page_idx) {
         page_to_slot_[page_idx] = -1;
         slot_to_page_[slot]     = -1;
         pool_.release_slot(slot);
+        return false;
     } else {
         if (page_idx < (int) prefetch_started_at_.size()) {
             prefetch_started_at_[page_idx] = std::chrono::steady_clock::now();
+        }
+        if (count_dense_prefetch) {
+            ++stats_.dense_prefetch_submitted;
         }
         if (page_idx < (int) cross_layer_prefetch_candidate_.size() &&
             cross_layer_prefetch_candidate_[page_idx]) {
             ++stats_.cross_layer_prefetch_submitted;
         }
+        return true;
     }
 }
 
@@ -862,7 +875,8 @@ void WeightPager::tick() {
     prefetch_.tick();
 }
 
-bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices) {
+bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
+                                       bool count_dense_prefetch) {
     if (!initialized_) return false;
     if (page_indices.empty()) return true;
 
@@ -933,6 +947,9 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices) {
         return false;
     }
     const auto now = std::chrono::steady_clock::now();
+    if (count_dense_prefetch) {
+        stats_.dense_prefetch_submitted += (uint64_t) needed.size();
+    }
     for (int page_idx : needed) {
         if (page_idx < (int) prefetch_started_at_.size()) {
             prefetch_started_at_[page_idx] = now;

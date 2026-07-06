@@ -927,15 +927,36 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     // Step 3: drive the prefetch pipeline forward.
-    //
-    // We deliberately do NOT submit a next-page prefetch here — that
-    // calls pool_.alloc_slot() which can evict an LRU slot, including
-    // one we just patched src->data into for this op. The op would then
-    // read corrupted VRAM. A correct implementation needs slot refcounts
-    // (pin while an op references the slot) or a "current op set" the
-    // pool refuses to evict. Phase 1e work item.
+    {
+        static int s_dense_prefetch_n = -1;
+        if (s_dense_prefetch_n < 0) {
+            const char * env = std::getenv("WP_DENSE_PREFETCH_N");
+            s_dense_prefetch_n = env ? std::atoi(env) : 0;
+            if (s_dense_prefetch_n < 0) s_dense_prefetch_n = 0;
+        }
+        if (s_dense_prefetch_n > 0 && pager->async_prefetch_enabled()) {
+            std::vector<int> future_pages;
+            future_pages.reserve((size_t) s_dense_prefetch_n);
+            for (int page_idx = highest_page + 1;
+                 page_idx < pager->n_pages() && (int) future_pages.size() < s_dense_prefetch_n;
+                 ++page_idx) {
+                const auto & meta = pager->page_meta(page_idx);
+                if (meta.is_pinned || meta.is_consolidated || meta.is_expert || meta.is_sub_expert) {
+                    continue;
+                }
+                future_pages.push_back(page_idx);
+            }
+            if (!future_pages.empty()) {
+                const bool batch_ok = pager->prefetch_pages_batch(future_pages, /*count_dense_prefetch=*/true);
+                if (!batch_ok) {
+                    for (int fp : future_pages) {
+                        pager->prefetch_page(fp, /*count_dense_prefetch=*/true);
+                    }
+                }
+            }
+        }
+    }
     pager->tick();
-    (void) highest_page;  // suppress unused warning; will be used once eviction-safe prefetch lands
 
     return true;
 }

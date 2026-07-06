@@ -59,6 +59,7 @@ public:
         double   io_seconds                     = 0.0;
         uint64_t lru_walk_hot_skips             = 0;
         uint64_t lru_walk_pinned_skips          = 0;
+        uint64_t dense_prefetch_submitted       = 0;
         uint64_t cross_layer_prefetch_submitted = 0;
         uint64_t cross_layer_hit_in_ensure      = 0;
         uint64_t host_tier_hits                 = 0;
@@ -152,7 +153,7 @@ public:
     // Submit a prefetch hint for a page. No-op if the page is already in
     // flight or already loaded. Errors are logged but do not propagate —
     // the eval callback's ensure() will fall back to sync on miss.
-    void prefetch_page(int page_idx);
+    bool prefetch_page(int page_idx, bool count_dense_prefetch = false);
 
     // MAD-235 — batch-prefetch N pages atomically. Reserves N pool slots
     // up-front, builds the file-IO batch, issues one batched submit. If
@@ -163,7 +164,8 @@ public:
     // Skips page indices that are already resident or already in flight
     // — those are no-ops, not failures. Returns true iff every NEEDED
     // request was queued (or no requests were needed).
-    bool prefetch_pages_batch(const std::vector<int> & page_indices);
+    bool prefetch_pages_batch(const std::vector<int> & page_indices,
+                              bool count_dense_prefetch = false);
 
     // Hint the kernel (via POSIX_FADV_WILLNEED on the file_io layer) that
     // we will soon need every paged tensor in layers [block_idx+1,

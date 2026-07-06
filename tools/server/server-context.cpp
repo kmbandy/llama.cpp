@@ -5143,6 +5143,9 @@ void server_routes::init_routes() {
             add_wp_gauge("llama_weight_pager_io_effective_gb_s", "Effective weight pager read bandwidth in GB/s", io_gbps);
             add_wp_gauge("llama_weight_pager_lru_walk_hot_skips_total", "Total LRU walk skips of hot slots", (double) st.lru_walk_hot_skips);
             add_wp_gauge("llama_weight_pager_lru_walk_pinned_skips_total", "Total LRU walk skips of pinned slots", (double) st.lru_walk_pinned_skips);
+            if (st.dense_prefetch_submitted > 0) {
+                add_wp_gauge("llama_weight_pager_dense_prefetch_submitted_total", "Total successful dense forward-prefetch submissions", (double) st.dense_prefetch_submitted);
+            }
             add_wp_gauge("llama_weight_pager_cross_layer_prefetch_submitted_total", "Total successful cross-layer prefetch submissions", (double) st.cross_layer_prefetch_submitted);
             add_wp_gauge("llama_weight_pager_cross_layer_hit_in_ensure_total", "Total ensure-time hits from cross-layer prefetch candidates", (double) st.cross_layer_hit_in_ensure);
             add_wp_gauge("llama_weight_pager_routing_ptrs_set_total", "Total routed expert pointer arrays armed", (double) st.routing_ptrs_set);
