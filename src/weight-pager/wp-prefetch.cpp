@@ -64,7 +64,8 @@ PrefetchScheduler::~PrefetchScheduler() {
 }
 
 bool PrefetchScheduler::init(FileIOLayer * file_io, GpuTransport * gpu,
-                             size_t max_page_size, int queue_depth) {
+                             size_t max_page_size, int queue_depth,
+                             bool async_stage2) {
     if (initialized_) {
         LLAMA_LOG_WARN("wp::PrefetchScheduler: init called twice\n");
         return false;
@@ -78,6 +79,7 @@ bool PrefetchScheduler::init(FileIOLayer * file_io, GpuTransport * gpu,
     gpu_           = gpu;
     max_page_size_ = max_page_size;
     queue_depth_   = queue_depth;
+    async_stage2_  = async_stage2;
 
     slots_.assign((size_t) queue_depth, Slot{});
     staging_.assign((size_t) queue_depth, nullptr);
@@ -101,8 +103,9 @@ bool PrefetchScheduler::init(FileIOLayer * file_io, GpuTransport * gpu,
     }
 
     initialized_ = true;
-    LLAMA_LOG_INFO("wp::PrefetchScheduler: queue_depth=%d, max_page_size=%zu (%.1f MiB pinned per slot)\n",
-                   queue_depth, max_page_size, max_page_size / 1048576.0);
+    LLAMA_LOG_INFO("wp::PrefetchScheduler: queue_depth=%d, max_page_size=%zu (%.1f MiB pinned per slot), async_stage2=%d\n",
+                   queue_depth, max_page_size, max_page_size / 1048576.0,
+                   (int) async_stage2_);
     return true;
 }
 
@@ -129,6 +132,7 @@ void PrefetchScheduler::shutdown() {
     gpu_           = nullptr;
     max_page_size_ = 0;
     queue_depth_   = 0;
+    async_stage2_  = false;
     initialized_   = false;
 }
 
@@ -297,7 +301,9 @@ void PrefetchScheduler::promote_stage2_() {
         Slot & s = slots_[h];
         if (s.state != State::Stage1Done) continue;
 
-        int evt = gpu_->stage_in(s.dst_vram, staging_[h], s.payload_size, s.slot_size);
+        int evt = async_stage2_
+            ? gpu_->stage_in_async(s.dst_vram, staging_[h], s.payload_size, s.slot_size)
+            : gpu_->stage_in(s.dst_vram, staging_[h], s.payload_size, s.slot_size);
         if (evt < 0) {
             LLAMA_LOG_WARN("wp::PrefetchScheduler: stage 2 stage_in failed for page %d\n", s.page_idx);
             s.state = State::Failed;
@@ -312,6 +318,7 @@ void PrefetchScheduler::poll_stage2_() {
     for (int h = 0; h < queue_depth_; ++h) {
         Slot & s = slots_[h];
         if (s.state != State::Stage2Running) continue;
+        if (s.gpu_event < 0) continue;
         if (gpu_->query(s.gpu_event)) {
             gpu_->release_event(s.gpu_event);
             s.gpu_event = -1;
@@ -401,6 +408,18 @@ bool PrefetchScheduler::is_loaded(int page_idx) const {
     auto it = page_to_slot_.find(page_idx);
     if (it == page_to_slot_.end()) return false;
     return slots_[it->second].state == State::Done;
+}
+
+int PrefetchScheduler::take_stage2_event(int page_idx) {
+    if (!initialized_) return -1;
+    auto it = page_to_slot_.find(page_idx);
+    if (it == page_to_slot_.end()) return -1;
+    Slot & s = slots_[it->second];
+    if (s.state != State::Stage2Running || s.gpu_event < 0) return -1;
+
+    const int evt = s.gpu_event;
+    s.gpu_event = -1;
+    return evt;
 }
 
 void PrefetchScheduler::reap(int page_idx) {

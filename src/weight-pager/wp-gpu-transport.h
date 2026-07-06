@@ -33,7 +33,7 @@ public:
     // events. n_events should be at least the prefetch queue depth so that
     // every in-flight stage_in has its own event without blocking on event
     // recycling. Returns false on HIP error or non-HIP builds.
-    bool init(int device_idx, int n_events);
+    bool init(int device_idx, int n_events, bool async_transfer_stream = false);
 
     // Tear down the stream and events. Safe to call multiple times.
     // Called automatically by the destructor.
@@ -55,6 +55,19 @@ public:
     // hipHostMalloc for DMA performance.
     int stage_in(void * dst, const void * src_pinned,
                  size_t payload_size, size_t slot_size);
+
+    // Async variant: queues the H2D copy + padding zero and records the
+    // completion event, but does not synchronize the transport stream before
+    // returning. The returned event handle remains owned by the caller until
+    // release_event().
+    int stage_in_async(void * dst, const void * src_pinned,
+                       size_t payload_size, size_t slot_size);
+
+    // Enqueue `stream` to wait for the completion event. `stream` is a
+    // hipStream_t under HIP, passed as void * to keep HIP types out of this
+    // public header. Returns false on non-HIP builds, invalid handles, or HIP
+    // errors.
+    bool wait_event_on_stream(int event_handle, void * stream);
 
     // Non-blocking: returns true if the event has signalled, false if not
     // yet or on error. Safe to call repeatedly.
@@ -80,6 +93,7 @@ private:
     std::vector<void *>  events_;                  // hipEvent_t under HIP
     std::vector<int>     free_events_;             // free-list of event indices
     bool                 initialized_  = false;
+    bool                 owns_stream_  = false;
 };
 
 }  // namespace wp

@@ -54,6 +54,7 @@ void env_restore(const char * var, bool present, const std::string & prior) {
 
 constexpr const char * kEnvDisableGraphs = "GGML_CUDA_DISABLE_GRAPHS";
 constexpr const char * kEnvWpHipGraphs   = "WP_HIP_GRAPHS";
+constexpr const char * kEnvWpAsyncEnsure = "WP_ASYNC_ENSURE";
 
 bool env_flag_is_one(const char * var) {
     const char * v = std::getenv(var);
@@ -133,6 +134,7 @@ bool WeightPager::init(const Config &             cfg,
     // Snapshot env BEFORE we touch it.
     env_snapshot(kEnvDisableGraphs, env_was_present_, env_prior_value_);
     hip_graphs_enabled_ = env_flag_is_one(kEnvWpHipGraphs);
+    async_ensure_enabled_ = env_flag_is_one(kEnvWpAsyncEnsure);
     env_disable_graphs_forced_ = !hip_graphs_enabled_;
     if (env_disable_graphs_forced_) {
         setenv(kEnvDisableGraphs, "1", /*overwrite=*/1);
@@ -175,7 +177,10 @@ bool WeightPager::init(const Config &             cfg,
 
     // 2. Per-device transfer stream + event pool. Size events generously
     //    so prefetch never blocks waiting for an event.
-    if (!transport_.init(device_idx, cfg_.prefetch_depth + 2)) {
+    const int n_transport_events = async_ensure_enabled_
+        ? cfg_.prefetch_depth * 2 + 8
+        : cfg_.prefetch_depth + 2;
+    if (!transport_.init(device_idx, n_transport_events, async_ensure_enabled_)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: gpu transport init failed\n");
         pool_.~PoolAllocator();   // explicit teardown via dtor (RAII'd)
         new (&pool_) PoolAllocator{};
@@ -196,7 +201,8 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     // 4. Prefetch scheduler bound to the above.
-    if (!prefetch_.init(file_io_.get(), &transport_, slot_size, cfg_.prefetch_depth)) {
+    if (!prefetch_.init(file_io_.get(), &transport_, slot_size, cfg_.prefetch_depth,
+                        async_ensure_enabled_)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: prefetch scheduler init failed\n");
         file_io_.reset();
         transport_.shutdown();
@@ -211,6 +217,7 @@ bool WeightPager::init(const Config &             cfg,
     page_loaded_.assign((size_t)  catalog_.size(), false);
     cross_layer_prefetch_candidate_.assign((size_t) catalog_.size(), false);
     prefetch_started_at_.assign((size_t) catalog_.size(), std::chrono::steady_clock::time_point{});
+    page_async_event_.assign((size_t) catalog_.size(), -1);
     slot_to_page_.assign((size_t) cfg_.n_slots,    -1);
 
     // 6. Shared sync staging buffer (max_page_size pinned host). Allocated
@@ -243,10 +250,11 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     initialized_ = true;
-    LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d\n",
+    LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
                    catalog_.size(), cfg_.n_slots, slot_size,
                    (double) cfg_.n_slots * (double) slot_size / 1048576.0,
-                   cfg_.prefetch_depth, (int) sync_staging_pinned_);
+                   cfg_.prefetch_depth, (int) sync_staging_pinned_,
+                   (int) async_ensure_enabled_);
     return true;
 }
 
@@ -258,11 +266,19 @@ void WeightPager::shutdown() {
         env_was_present_ = false;
         env_prior_value_.clear();
         hip_graphs_enabled_ = false;
+        async_ensure_enabled_ = false;
         return;
     }
 
     log_stats_summary();
     release_graph_pins_();
+    for (int evt : page_async_event_) {
+        if (evt >= 0) {
+            transport_.synchronize(evt);
+            transport_.release_event(evt);
+        }
+    }
+    page_async_event_.clear();
 
     // Tear down in reverse construction order.
     prefetch_.shutdown();
@@ -297,6 +313,7 @@ void WeightPager::shutdown() {
     env_was_present_ = false;
     env_prior_value_.clear();
     hip_graphs_enabled_ = false;
+    async_ensure_enabled_ = false;
 
     initialized_ = false;
 }
@@ -325,6 +342,11 @@ void WeightPager::on_pool_evict_(int slot_idx) {
     if (slot_idx < 0 || slot_idx >= (int) slot_to_page_.size()) return;
     int page = slot_to_page_[slot_idx];
     if (page >= 0 && page < (int) page_to_slot_.size()) {
+        if (page < (int) page_async_event_.size() && page_async_event_[page] >= 0) {
+            transport_.synchronize(page_async_event_[page]);
+            transport_.release_event(page_async_event_[page]);
+            page_async_event_[page] = -1;
+        }
         page_to_slot_[page] = -1;
         page_loaded_[page]  = false;
     }
@@ -446,6 +468,11 @@ void WeightPager::update_graph_pins(const void * graph_key, const std::vector<in
 void * WeightPager::ensure(int page_idx) {
     if (!initialized_)                                         return nullptr;
     if (page_idx < 0 || page_idx >= catalog_.size())           return nullptr;
+    if (page_idx < (int) page_async_event_.size() && page_async_event_[page_idx] >= 0) {
+        transport_.synchronize(page_async_event_[page_idx]);
+        transport_.release_event(page_async_event_[page_idx]);
+        page_async_event_[page_idx] = -1;
+    }
 
     // MAD-236 — pinned (always-resident) pages live in caller-owned VRAM,
     // not the pool. No slot lookup, no LRU update, no IO. Just return the
@@ -475,6 +502,9 @@ void * WeightPager::ensure(int page_idx) {
     bool counted_prefetch_miss = false;
     int slot = page_to_slot_[page_idx];
     if (slot >= 0) {
+        if (async_ensure_enabled_) {
+            prefetch_.tick();
+        }
         const bool loaded_before_wait = prefetch_.is_loaded(page_idx);
         if (loaded_before_wait) {
             ++stats_.prefetch_hits;
@@ -485,6 +515,33 @@ void * WeightPager::ensure(int page_idx) {
         } else {
             ++stats_.prefetch_misses;
             counted_prefetch_miss = true;
+        }
+        if (async_ensure_enabled_ && !loaded_before_wait) {
+            const int evt = prefetch_.take_stage2_event(page_idx);
+            if (evt >= 0) {
+                ++stats_.prefetch_hits;
+                if (counted_prefetch_miss) {
+                    --stats_.prefetch_misses;
+                    counted_prefetch_miss = false;
+                }
+                if (cross_layer_candidate) {
+                    ++stats_.cross_layer_hit_in_ensure;
+                    cross_layer_prefetch_candidate_[page_idx] = false;
+                }
+
+                page_loaded_[page_idx] = true;
+                pool_.mark_used(slot);
+                prefetch_.reap(page_idx);
+                double seconds = 0.0;
+                if (page_idx < (int) prefetch_started_at_.size() &&
+                    prefetch_started_at_[page_idx] != std::chrono::steady_clock::time_point{}) {
+                    seconds = seconds_since(prefetch_started_at_[page_idx]);
+                    prefetch_started_at_[page_idx] = std::chrono::steady_clock::time_point{};
+                }
+                record_page_in_(m_check.size, seconds);
+                page_async_event_[page_idx] = evt;
+                return slot_ptr_(slot);
+            }
         }
         if (prefetch_.wait_for(page_idx, /*timeout_ms=*/-1)) {
             // Stage 2 done; commit and reap.
@@ -523,6 +580,26 @@ void * WeightPager::ensure(int page_idx) {
     slot = page_in_sync_(page_idx);
     if (slot < 0) return nullptr;
     return slot_ptr_(slot);
+}
+
+int WeightPager::take_async_transfer_event(int page_idx) {
+    if (!initialized_) return -1;
+    if (page_idx < 0 || page_idx >= (int) page_async_event_.size()) return -1;
+    const int evt = page_async_event_[page_idx];
+    page_async_event_[page_idx] = -1;
+    return evt;
+}
+
+bool WeightPager::enqueue_async_transfer_wait(int event_handle, void * stream) {
+    return transport_.wait_event_on_stream(event_handle, stream);
+}
+
+bool WeightPager::synchronize_async_transfer_event(int event_handle) {
+    return transport_.synchronize(event_handle);
+}
+
+void WeightPager::release_async_transfer_event(int event_handle) {
+    transport_.release_event(event_handle);
 }
 
 void WeightPager::prefetch_page(int page_idx) {
@@ -768,12 +845,9 @@ int WeightPager::page_in_sync_(int page_idx) {
         return -1;
     }
 
-    // Stage 2: H2D + padding zero. GpuTransport uses hipStreamPerThread
-    // (same stream as ggml-cuda's compute kernels), so stream ordering
-    // already serialises the H2D before any kernel that reads from this
-    // slot. The explicit transport_.synchronize that used to live here
-    // forced the eval-cb thread to block on every page-in, defeating
-    // io_uring depth-N pipelining. (MAD-88 Phase 9d.)
+    // Stage 2: H2D + padding zero. stage_in() preserves the synchronous
+    // "resident on return" contract even when WP_ASYNC_ENSURE selects a
+    // dedicated transport stream for prefetch stage 2.
     int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size());
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
     if (evt < 0) {

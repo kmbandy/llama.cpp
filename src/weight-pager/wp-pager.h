@@ -125,6 +125,7 @@ public:
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
     bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
+    bool   async_ensure_enabled()               const { return async_ensure_enabled_; }
     const Stats & stats() const;
     int    loaded_pages() const;
     int    pending_prefetches() const { return prefetch_.pending(); }
@@ -134,6 +135,14 @@ public:
     // fallback if the page is not (yet) prefetched. Returns nullptr if
     // page_idx is out of range or any underlying op fails.
     void * ensure(int page_idx);
+
+    // WP_ASYNC_ENSURE handoff. ensure() stashes the transfer event here when
+    // it returns before stage 2 has completed; the eval callback takes it,
+    // queues a compute-stream wait, and releases it after that op completes.
+    int  take_async_transfer_event(int page_idx);
+    bool enqueue_async_transfer_wait(int event_handle, void * stream);
+    bool synchronize_async_transfer_event(int event_handle);
+    void release_async_transfer_event(int event_handle);
 
     // Submit a prefetch hint for a page. No-op if the page is already in
     // flight or already loaded. Errors are logged but do not propagate —
@@ -241,6 +250,7 @@ private:
     std::vector<bool> page_loaded_;
     std::vector<bool> cross_layer_prefetch_candidate_;
     std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
+    std::vector<int> page_async_event_;
     // Reverse map: slot_idx -> page_idx (or -1 if free). Used by the
     // eviction callback to clear page_to_slot_ / page_loaded_ correctly.
     std::vector<int> slot_to_page_;
@@ -248,6 +258,7 @@ private:
     Config cfg_;
     bool   initialized_ = false;
     bool   hip_graphs_enabled_ = false;
+    bool   async_ensure_enabled_ = false;
     mutable Stats stats_;
 
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).

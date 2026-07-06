@@ -16,7 +16,7 @@ GpuTransport::~GpuTransport() {
     shutdown();
 }
 
-bool GpuTransport::init(int device_idx, int n_events) {
+bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream) {
     if (initialized_) {
         LLAMA_LOG_WARN("wp::GpuTransport: init called twice — ignoring\n");
         return false;
@@ -35,14 +35,25 @@ bool GpuTransport::init(int device_idx, int n_events) {
         return false;
     }
 
-    // Use hipStreamPerThread (== cudaStreamPerThread under HIP) instead of
-    // a freshly-created stream. Reason: ggml-cuda's compute kernels run on
-    // the per-thread default stream; H2D copies on a separate stream are
-    // not ordered against those kernels and can overwrite VRAM that an
-    // in-flight kernel is still reading. Phase 1e may revisit this with
-    // explicit hipStreamWaitEvent to recover transfer/compute overlap.
-    hipStream_t s = hipStreamPerThread;
-    (void) err;
+    hipStream_t s = nullptr;
+    bool owns_stream = false;
+    if (async_transfer_stream) {
+        err = hipStreamCreateWithFlags(&s, hipStreamNonBlocking);
+        if (err != hipSuccess) {
+            LLAMA_LOG_WARN("wp::GpuTransport::init: hipStreamCreateWithFlags failed: %s\n",
+                           hipGetErrorString(err));
+            hipSetDevice(prev_device);
+            return false;
+        }
+        owns_stream = true;
+    } else {
+        // Use hipStreamPerThread (== cudaStreamPerThread under HIP) instead
+        // of a freshly-created stream. Reason: ggml-cuda's compute kernels
+        // run on the per-thread default stream; H2D copies on a separate
+        // stream are not ordered against those kernels unless the async
+        // ensure path explicitly inserts hipStreamWaitEvent.
+        s = hipStreamPerThread;
+    }
 
     events_.reserve(n_events);
     free_events_.reserve(n_events);
@@ -60,7 +71,9 @@ bool GpuTransport::init(int device_idx, int n_events) {
             }
             events_.clear();
             free_events_.clear();
-            hipStreamDestroy(s);
+            if (owns_stream) {
+                hipStreamDestroy(s);
+            }
             hipSetDevice(prev_device);
             return false;
         }
@@ -71,10 +84,11 @@ bool GpuTransport::init(int device_idx, int n_events) {
     stream_      = (void *) s;
     device_idx_  = device_idx;
     initialized_ = true;
+    owns_stream_ = owns_stream;
 
     hipSetDevice(prev_device);
-    LLAMA_LOG_INFO("wp::GpuTransport: device %d, stream + %d events ready\n",
-                   device_idx, n_events);
+    LLAMA_LOG_INFO("wp::GpuTransport: device %d, %s stream + %d events ready\n",
+                   device_idx, owns_stream_ ? "dedicated" : "per-thread", n_events);
     return true;
 }
 
@@ -86,8 +100,10 @@ void GpuTransport::shutdown() {
     hipSetDevice(device_idx_);
 
     if (stream_) {
-        // We don't own hipStreamPerThread; just sync, don't destroy.
         hipStreamSynchronize((hipStream_t) stream_);
+        if (owns_stream_) {
+            hipStreamDestroy((hipStream_t) stream_);
+        }
         stream_ = nullptr;
     }
     for (void * ev : events_) {
@@ -97,16 +113,39 @@ void GpuTransport::shutdown() {
     free_events_.clear();
     initialized_ = false;
     device_idx_  = -1;
+    owns_stream_ = false;
 
     hipSetDevice(prev_device);
 }
 
 int GpuTransport::stage_in(void * dst, const void * src_pinned,
                            size_t payload_size, size_t slot_size) {
+    int evt_idx = stage_in_async(dst, src_pinned, payload_size, slot_size);
+    if (evt_idx < 0) return -1;
+
+    int prev_device = 0;
+    hipGetDevice(&prev_device);
+    hipSetDevice(device_idx_);
+
+    hipStream_t s  = (hipStream_t) stream_;
+    hipError_t err = hipStreamSynchronize(s);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipStreamSynchronize failed: %s\n",
+                       hipGetErrorString(err));
+        hipSetDevice(prev_device);
+        return -1;
+    }
+
+    hipSetDevice(prev_device);
+    return evt_idx;
+}
+
+int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
+                                 size_t payload_size, size_t slot_size) {
     if (!initialized_ || dst == nullptr || src_pinned == nullptr) return -1;
     if (payload_size > slot_size) return -1;
     if (free_events_.empty()) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: event pool exhausted (queue depth too small?)\n");
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: event pool exhausted (queue depth too small?)\n");
         return -1;
     }
 
@@ -130,7 +169,7 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     // keeps the host blocked only as long as the actual transfer takes.
     err = hipMemcpyAsync(dst, src_pinned, payload_size, hipMemcpyHostToDevice, s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemcpyAsync failed: %s\n",
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipMemcpyAsync failed: %s\n",
                        hipGetErrorString(err));
         hipSetDevice(prev_device);
         return -1;
@@ -140,7 +179,7 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
         err = hipMemsetAsync((char *) dst + payload_size, 0,
                              slot_size - payload_size, s);
         if (err != hipSuccess) {
-            LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipMemsetAsync (padding) failed: %s\n",
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipMemsetAsync (padding) failed: %s\n",
                            hipGetErrorString(err));
             // Best-effort: don't fail the whole call.
         }
@@ -159,25 +198,36 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     hipEvent_t ev = (hipEvent_t) events_[evt_idx];
     err = hipEventRecord(ev, s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipEventRecord failed: %s\n",
+        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipEventRecord failed: %s\n",
                        hipGetErrorString(err));
-        // Continue — we still need to sync to preserve the in-VRAM-on-return
-        // contract; the event is just a handle for future async wiring.
-    }
-
-    // Preserve the "data is in VRAM when this returns" contract that
-    // page_in_sync_ relies on. Stream-scoped — does NOT stall other
-    // streams (compute, graphics) on the device.
-    err = hipStreamSynchronize(s);
-    if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipStreamSynchronize failed: %s\n",
-                       hipGetErrorString(err));
+        release_event(evt_idx);
         hipSetDevice(prev_device);
         return -1;
     }
 
     hipSetDevice(prev_device);
     return evt_idx;
+}
+
+bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
+    if (!initialized_ || stream == nullptr) return false;
+    if (event_handle < 0 || event_handle >= (int) events_.size()) return false;
+    hipEvent_t ev = (hipEvent_t) events_[event_handle];
+    if (ev == nullptr) return false;
+
+    int prev_device = 0;
+    hipGetDevice(&prev_device);
+    hipSetDevice(device_idx_);
+
+    hipError_t err = hipStreamWaitEvent((hipStream_t) stream, ev, 0);
+
+    hipSetDevice(prev_device);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::GpuTransport::wait_event_on_stream: hipStreamWaitEvent failed: %s\n",
+                       hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 bool GpuTransport::query(int event_handle) const {
@@ -229,7 +279,7 @@ void GpuTransport::release_event(int event_handle) {
 
 GpuTransport::~GpuTransport() = default;
 
-bool GpuTransport::init(int /*device_idx*/, int /*n_events*/) {
+bool GpuTransport::init(int /*device_idx*/, int /*n_events*/, bool /*async_transfer_stream*/) {
     LLAMA_LOG_WARN("wp::GpuTransport: HIP support not compiled in; transport disabled\n");
     return false;
 }
@@ -238,6 +288,9 @@ void GpuTransport::shutdown() {}
 
 int  GpuTransport::stage_in(void * /*dst*/, const void * /*src_pinned*/,
                             size_t /*payload_size*/, size_t /*slot_size*/) { return -1; }
+int  GpuTransport::stage_in_async(void * /*dst*/, const void * /*src_pinned*/,
+                                  size_t /*payload_size*/, size_t /*slot_size*/) { return -1; }
+bool GpuTransport::wait_event_on_stream(int /*event_handle*/, void * /*stream*/) { return false; }
 bool GpuTransport::query(int /*event_handle*/) const                       { return false; }
 bool GpuTransport::synchronize(int /*event_handle*/)                       { return false; }
 void GpuTransport::release_event(int /*event_handle*/)                     {}
