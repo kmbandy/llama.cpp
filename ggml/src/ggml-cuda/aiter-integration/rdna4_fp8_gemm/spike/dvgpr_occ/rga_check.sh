@@ -14,7 +14,7 @@ set -euo pipefail
 ROCM=/opt/rocm
 L="$ROCM/llvm/bin"
 RGA=/home/kmbandy/Downloads/rdts/RadeonDeveloperToolSuite-2026-05-28-1806/rga
-KSRC=occ_kernel_wggemm2.s
+KSRC="${KSRC:-occ_kernel_wggemm2.s}"   # override to gate a different kernel, e.g. KSRC=occ_kernel_coop.s
 
 LABEL="${1:?usage: rga_check.sh <label> [DEFSYM=val ...]}"; shift || true
 OUT="rga_out/$LABEL"; mkdir -p "$OUT"
