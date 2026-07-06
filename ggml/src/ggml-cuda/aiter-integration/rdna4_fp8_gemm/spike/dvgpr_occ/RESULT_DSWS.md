@@ -351,3 +351,57 @@ timeout 30 ./occ_dispatch --dsws2 4c2a2b` → expect ok=32 bad=0, occ[0]=0 clean
 (TOTAL_super=32 → 4 chunks of 8). Then n_kseg=8 LOOSE + mixes 6c1a1b/2c3a3b. Gate: static substrate
 oracle-green both tiers before Phase B (conversion). All uncommitted. KG: b8c689cc (A8-ready contract),
 48625333 (kernel round-table), 86e33108 (the blocker + 3/3 consensus).
+
+---
+
+# 2026-07-03 — SUSPECT #2 FIXED (ti clamp) + CONV=1 + SPLIT-K + ADAPTIVE CONVERSION PROVEN ON SILICON
+
+Started the day with the CONV=1 substrate bricking (3 GPU MODE1 resets before the fix). Ended with a
+**correct, adaptive, split-K-capable** wave-specialized kernel, brick-free across 15+ dispatches.
+
+## Root cause (the whole SUSPECT #2 saga was one symptom)
+The CONV=1 hang/brick was a **racy-garbage tile-index -> out-of-buffer A/B/C scalar base -> gfxhub page
+fault -> MODE1** (the COOP_STATUS.md:145 class). SAFEPROBE clamped only the per-lane vaddr (v8/v9/v10); its
+own comment (occ_kernel_dsws.s:752) noted it "pairs with the future ti clamp" — which was **never
+implemented**. A torn `sti` read during the claimer's per-super-tile republish decoded a garbage
+`t -> mblk/tcol` and the scalar base went OOB.
+
+Everything the debugging chased before this — the rolling dyn-VGPR envelope, the device-scoped `gquiesce`
+handshake, the bail-mark localization, the straggler/liveness hypothesis — was circling the symptom. The
+envelope even ran GREEN isolated at CONV=0 (its plumbing is sound), proving it was NOT the blocker.
+
+## THE FIX (committed f0131142f) — 10 lines
+`DECODE_STI`, under `SAFEPROBE`: `t = min(sti>>shift, TOTAL-1)` using `s11=TOTAL` (userdata, never clobbered)
++ `s36` scratch. Now every global address is provably in-buffer: t/mblk/tcol (new clamp), ksi (mask), r/f
+(claim checks), v8/v9/v10 (existing). OOB unreachable by construction; a no-op for valid indices.
+Crucially `s11=TOTAL=MTLsuper*NTL` is the **t-space** bound (NOT TOTAL_super), so the clamp is
+**split-K-correct**, not just n_kseg=1-correct (Fable advisor confirmed).
+
+## GPU RESULTS (all SAFEPROBE=1, 4c2a2b unless noted, n_kseg=1 unless noted)
+- CONV=0 clamped (`c62568f6`, 4872B): GREEN, ok=1536 bad=0 — no-op for valid indices, new safe baseline.
+- CONV=1 clamped (`490db6e5`, 7952B): GREEN + CORRECT, **7/7** dispatches ok=1536 bad=0. Was 3x brick.
+- Other mixes CONV=1: 6c1a1b 2/2, 2c3a3b 2/2 — all ok=1536 bad=0.
+- **n_kseg=2 real split-K**: ok=1536 bad=0 max_rel=0 (EXACT), LOOSE tier, bounds gate A/B doubled + OK.
+  First split-K ever. n_kseg is a RUNTIME lever (`DSWS2_NKSEG=2`) — same .bin as n_kseg=1.
+
+## ADAPTIVE CONVERSION — PROVEN (the DSWS thesis, first time on silicon)
+Added a DIAG conversion-commit counter (`occ[48]`, incremented in `conv_apply` at `.Lca_commit`;
+byte-identical at DIAG=0) + host readout in `run_dsws2` completion (`[dsws2 CONVERSIONS] = N`).
+- **Proof #1 (mechanical, DSWS2_FORCE=1 WID=4 DIR=0 EPOCH=1, EPOCH_SHIFT=0)**: forced wave4 compute->A-feed
+  -> counter **4** (1/chunk x4 chunks), ok=1536 bad=0. A wave switches role + re-dispatches, correct.
+- **Proof #2 (adaptive, watermark-driven, ACTIVE defaults CTRL_LOW=1/HIGH_A=5/HIGH_B=3, EPOCH_SHIFT=0)**:
+  counter **52** — 52 NATURAL role-switches from runtime ring occupancy in one run, result EXACT.
+- **GOTCHA**: `try_gate` gates on the CONTROLLER epoch `E=segcnt>>EPOCH_SHIFT`, NOT the wave's `s35`. With
+  default EPOCH_SHIFT=3, E only reaches 1 at super-tile 8, so conversions need EPOCH_SHIFT small (0 for
+  max reactivity). The prior "are waves switching?" was open because earlier runs used dormant thresholds
+  (CTRL_LOW=0/HIGH=6/4) OR were DIAG=0 (unobserved).
+
+## STATE / NEXT
+- Committed: `f0131142f` (ti clamp fix), `f2cc1f26e` (gated envelope/gquiesce/bailmark scaffolding + offline
+  models + spec/plan). Uncommitted: the conversion-counter instrumentation (occ_kernel_dsws.s occ[48] +
+  occ_dispatch.cpp readout).
+- Safe bins: CONV=0 clamped (4c2a2b c62568f6). occ_dispatch.cpp has ~544 lines pre-existing WIP (NOT ours
+  to bundle) + our ~15 lines (bail/conv readout).
+- **NEXT = PERF.** The `--dsws2` path has NO throughput readout (oracle only). Wire a TF measurement into
+  `run_dsws2` (wall-span -> real WMMA count) for a baseline, then flip the envelope on and sweep occupancy.
+  The thesis (adaptivity beats the feed-bound wall) is UNPROVEN until there's a TF number.

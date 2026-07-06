@@ -269,8 +269,48 @@
 .set ARES_OFF,       (BRES_OFF + BRES_BYTES)   // resident A for current super-tile
 .set ARES_BYTES,     (G*16*FM*SEGK)            // = 6*16*2*64 = 12288 at the default config
 .set LDS_TOTAL_DSWS2, (ARES_OFF + ARES_BYTES)
+// (old single-slot cap check retained; 16640 < 32768 -> always passes. The RING layout below is what
+//  the ring role loops actually use; its own cap check follows.)
 .if LDS_TOTAL_DSWS2 > 32768
   .error "DSWS2 LDS layout exceeds 32768B group segment"
+.endif
+// ============================================================================================
+// FIX 1a -- RING-OF-SLOTS LDS layout (D=2 double-buffered pipeline). NEW symbols; the single-slot
+//   control words above (STI_OFF..INITFLAG_OFF, SNAP/QUIESCE/TRACE state) stay DEFINED (they emit no
+//   bytes and their only *code* uses are under .if DSWS2_CONV/DIAG/TRACE, all 0 here -> not assembled).
+//   The ring role loops reference ONLY the symbols below. GEN is a GLOBAL-monotonic publish counter:
+//   the dispatcher bumps it once per publish and writes it to the published slot's SL_GEN LAST (the
+//   release fence); followers gate "new occupant" on SL_GEN[idx] > last-seen-gen. Slot counters reset
+//   only at FREE->FILLED (SL_RBDONE>=G), only by the dispatcher -> the old QUIESCE handshake is
+//   unnecessary (compute can't bump SL_RBDONE until SL_BFDONE==FN && SL_ARDONE==G, so no straggler is
+//   mid-claim at reset). See RING_SLOTS_DESIGN.md "Protocol refinements".
+.set RING_D,        2
+// ---- shared frontier (single copy, at the front) ----
+.set FILL_IDX_OFF,  0        // slot the feeds are currently staging (dispatcher publishes into it)
+.set DRAIN_IDX_OFF, 4        // slot compute is currently draining
+.set RINGINIT_OFF,  8        // barrier-free LDS-init publish flag (dispatcher writes 0xACED LAST)
+// ---- per-slot control block:  SLOTC_BASE + slot*SLOTC_STRIDE + field ----
+.set SLOTC_BASE,    32
+.set SLOTC_STRIDE,  32
+.set SL_STI,        0        // super-tile id resident in this slot (0xFFFFFFFF = sentinel/retire)
+.set SL_GEN,        4        // global-monotonic publish gen (release fence; consumers gate on > last-seen)
+.set SL_RBNEXT,     8        // rowblk claim counter (compute)
+.set SL_RBDONE,     12       // rowblks computed+flushed; dispatcher recycles this slot when >= G
+.set SL_BFNEXT,     16       // B-frag claim counter (B-feeds)
+.set SL_BFDONE,     20       // B-frags stored; compute gates on == FN
+.set SL_ARNEXT,     24       // A-rowblk claim counter (A-feeds)
+.set SL_ARDONE,     28       // A-rowblks staged; compute gates on == G
+// ---- per-slot operand buffers:  OP_BASE + slot*OPSTRIDE ;  BRES at +BRES_ROFF, ARES at +ARES_ROFF ----
+.set OP_BASE,       256                          // 256B-aligned; below it: frontier + RING_D control blocks
+.set OPSTRIDE,      (BRES_BYTES + ARES_BYTES)    // 4096 + 12288 = 16384 per slot
+.set BRES_ROFF,     0                            // resident B within a slot
+.set ARES_ROFF,     BRES_BYTES                   // resident A within a slot (after B)
+.set LDS_TOTAL_RING,(OP_BASE + RING_D*OPSTRIDE)  // 256 + 2*16384 = 33024
+.if LDS_TOTAL_RING > 65536
+  .error "RING LDS layout exceeds 65536B group segment (hardware WGP limit)"
+.endif
+.if (SLOTC_BASE + RING_D*SLOTC_STRIDE) > OP_BASE
+  .error "RING per-slot control blocks overlap the operand region (raise OP_BASE)"
 .endif
 // Phase-B state must fit in the control gap below the resident region (inert compile check, no bytes).
 .if DSWS2_STATE_END > BRES_OFF
@@ -368,6 +408,50 @@
 .Linc_skip\@:
     s_mov_b32 exec_lo, s49
 .endm
+// ---- FIX 1a ring: RUNTIME-address variants (slot-indexed counters live at SLOTC_BASE+slot*32+field,
+//   a runtime scalar). Mirror lds_fetch_add / lds_inc but take the address in a sreg. ----
+.macro lds_fetch_add_r sdst, saddr, val      // sdst <- old LDS[saddr]; LDS[saddr]+=val (lane-0 atomic, bcast)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lfar_skip\@
+    v_mov_b32 v[RP_A], \saddr
+    v_mov_b32 v[RP_D], \val
+    ds_add_rtn_u32 v[RP_D], v[RP_A], v[RP_D]
+    s_wait_dscnt 0x0
+.Lfar_skip\@:
+    s_mov_b32 exec_lo, s49
+    v_readfirstlane_b32 \sdst, v[RP_D]
+.endm
+.macro lds_inc_r saddr                        // lane-0-of-wave LDS[saddr] += 1 (RUNTIME addr, no return)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lincr_skip\@
+    v_mov_b32 v[RP_A], \saddr
+    v_mov_b32 v[RP_D], 1
+    ds_add_u32 v[RP_A], v[RP_D]
+    s_wait_dscnt 0x0
+.Lincr_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+// lds_put_r (RUNTIME-addr write) is also defined inside the .if DSWS2_CONV||DSWS2_ENVELOPE block below;
+//   the ring needs it at CONV=0/ENV=0, so define an identical copy here, guarded to avoid a double-def
+//   when either gate is on (the ring is always built CONV=0 ENV=0).
+.if !(DSWS2_CONV || DSWS2_ENVELOPE)
+.macro lds_put_r saddr, ssrc                  // lane-0 write ssrc -> LDS[saddr] (RUNTIME addr)
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lputr_skip\@
+    v_mov_b32 v[RP_A], \saddr
+    v_mov_b32 v[RP_D], \ssrc
+    ds_store_b32 v[RP_A], v[RP_D]
+    s_wait_dscnt 0x0
+.Lputr_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+.endif
 
 // ============================================================================================
 // Super-tile decode + resident A/B staging macros (A3..A6). Decode (Naming/symbols):
@@ -483,6 +567,94 @@
     lds_inc AROW_DONE_OFF                           // rowblk r fully STAGED -> publish completion
     s_branch .Lacl\@
 .Lasd\@:
+.endm
+
+// ============================================================================================
+//  FIX 1a -- RING staging macros: slot-indexed BSTAGE_R / ASTAGE_R. Identical math to BSTAGE/ASTAGE
+//    but claim/done counters live in the per-slot control block (\scb = SLOTC_BASE + slot*32, runtime)
+//    and operands land in the per-slot buffer (\sob = OP_BASE + slot*OPSTRIDE, runtime; B at
+//    +BRES_ROFF=0, A at +ARES_ROFF). \scb and \sob are READ-only (never clobbered). Internal address
+//    scratch: s46/s47 (free in the feed context). ds offset immediates are vbase-relative -> unchanged.
+// ============================================================================================
+.macro BSTAGE_R scb, sob             // in: s30=tcol s31=ksi ; clob: s20,s21,s23,s25,s26,s27,s46,s47,v13,v[BSTG..]
+    s_mul_i32  s20, s30, s14                  // tcol * FN*256
+    s_mul_i32  s21, s31, KSEG_STEPS           // ksi * KSEG_STEPS
+    s_mul_i32  s21, s21, s10                  // * NT*256  -> segment k-start byte offset
+    s_add_u32  s20, s20, s21
+    s_add_u32  s20, s4, s20
+    s_addc_u32 s21, s5, 0                      // s[20:21] = B base (tcol,ksi, seg k-step 0)
+    s_add_u32  s46, \scb, SL_BFNEXT            // &SL_BFNEXT[slot]
+.Lbclr\@:
+    lds_fetch_add_r s23, s46, 1                // claim frag f
+    s_cmp_ge_u32 s23, FN
+    s_cbranch_scc1 .Lbsdr\@                     // f>=FN -> all frags claimed
+    s_lshl_b32 s25, s23, 8                      // f*256
+    s_add_u32  s26, s20, s25
+    s_addc_u32 s27, s21, 0                      // s[26:27] = frag f base (seg k0)
+    v_add_nc_u32 v13, v9, \sob                  // + slot operand base
+    v_add_nc_u32 v13, v13, s25                  // + f*256   (BRES_ROFF = 0)
+    .set ks, 0
+    .rept KSEG_STEPS
+      global_load_tr_b64 v[BSTG+ks*2:BSTG+ks*2+1], v9, s[26:27]
+      s_add_u32  s26, s26, s10
+      s_addc_u32 s27, s27, 0
+      .set ks, ks+1
+    .endr
+    s_wait_loadcnt 0x0
+    .set ks, 0
+    .rept KSEG_STEPS
+      ds_store_b64 v13, v[BSTG+ks*2:BSTG+ks*2+1] offset:(ks*FN*256)
+      .set ks, ks+1
+    .endr
+    s_wait_dscnt 0x0
+    s_add_u32  s47, \scb, SL_BFDONE
+    lds_inc_r s47                               // frag f STORED -> compute gates on SL_BFDONE==FN
+    s_branch .Lbclr\@
+.Lbsdr\@:
+.endm
+
+.macro ASTAGE_R scb, sob             // in: s19=mblk s31=ksi ; clob: s22,s23,s25,s32,s36,s40,s41,s44,s45,s46,s47,v13,v[BSTG..]
+    s_lshl_b32 s32, s9, 4                       // rowstride16 = 16*K
+    s_add_u32  s46, \scb, SL_ARNEXT             // &SL_ARNEXT[slot]
+.Laclr\@:
+    lds_fetch_add_r s23, s46, 1                 // claim rowblk r
+    s_cmp_ge_u32 s23, G
+    s_cbranch_scc1 .Lasdr\@
+    s_mul_i32  s36, s19, G
+    s_add_u32  s36, s36, s23                     // rowblk_abs = mblk*G + r
+    s_mul_i32  s22, s36, (16*FM)
+    s_mul_i32  s22, s22, s9                       // rowblk_abs*(16*FM)*K
+    s_mul_i32  s25, s31, SEGK                      // ksi*SEGK
+    s_add_u32  s22, s22, s25
+    s_add_u32  s40, s2, s22
+    s_addc_u32 s41, s3, 0                          // s[40:41] = A base
+    s_mul_i32  s25, s23, (FM*256)                  // r*FM*256
+    v_add_nc_u32 v13, v9, \sob                     // + slot operand base
+    v_add_nc_u32 v13, v13, ARES_ROFF               // + A-within-slot offset (BRES_BYTES)
+    v_add_nc_u32 v13, v13, s25                      // + r*FM*256
+    .set mi, 0
+    .rept FM
+      .if mi == 0
+        s_mov_b32 s44, s40
+        s_mov_b32 s45, s41
+      .else
+        s_add_u32  s44, s44, s32                    // += 16*K (next M-frag)
+        s_addc_u32 s45, s45, 0
+      .endif
+      .set ks, 0
+      .rept KSEG_STEPS
+        global_load_b64 v[BSTG:BSTG+1], v8, s[44:45] offset:(ks*16)
+        s_wait_loadcnt 0x0
+        ds_store_b64 v13, v[BSTG:BSTG+1] offset:((ks*G*FM + mi)*256)
+        s_wait_dscnt 0x0
+        .set ks, ks+1
+      .endr
+      .set mi, mi+1
+    .endr
+    s_add_u32  s47, \scb, SL_ARDONE
+    lds_inc_r s47                                   // rowblk r STAGED -> compute gates on SL_ARDONE==G
+    s_branch .Laclr\@
+.Lasdr\@:
 .endm
 
 // ============================================================================================
@@ -1026,7 +1198,7 @@ occ_kernel:
     // A1: every role label is just a distinct s_endpgm stub (unique s50 tag keeps them at distinct addresses).
     v_readfirstlane_b32 s24, v1               // wid (uniform per wave)
     s_cmp_eq_u32 s24, 0
-    s_cbranch_scc1 .Lclaimer
+    s_cbranch_scc1 .Ldispatcher                // FIX 1a: wid0 = ring dispatcher (was .Lclaimer)
 .if DSWS2_CONV && DIAG && DSWS2_TICKET_SELFTEST
     // Task 4 Step 3 -- try_gate single-winner SMOKE (assemble-only stub; default off). Every non-claimer
     //   wave races the (dir=0) ticket ONCE and atomic-adds its win (0/1) into occ[28] (byte offset 112,
@@ -1076,342 +1248,159 @@ occ_kernel:
 .endif
 
 // ============================================================================================
-//  A3 -- .Lclaimer : pinned wid-0. Owns the super-tile claim+broadcast, the SEGCNT clock, the
-//    barrier-free LDS init, the completion live++/live-- (harness occ[0]==0 gate), AND -- being a
-//    B-feed-class wave -- stages B for the current super-tile each iteration (A4 body via BSTAGE).
-//
-//  CLAIM-COUNTER & completion occ-buffer offsets (occ base = s0:s1; host zero-inits the whole buffer):
-//    occ[0]  (offset 0)  = live counter (claimer +1 at entry, -1 at terminal; harness polls ==0)
-//    occ[20] (offset 20) = GLOBAL super-tile claim counter (mirrors coop's tile-claim at offset:20)
-//    (offsets 4/8/12/16 stay reserved for the coop-style maxlive/timers/total bookkeeping; unused here.)
+//  FIX 1a -- .Ldispatcher : pinned wid-0 (was .Lclaimer). PURE COORDINATION -- NO BSTAGE (deviation
+//    from the old B-feed-class claimer; effective B-stager count is NBFEED-1, so pick the launch mix
+//    accordingly -- the exact feed:compute ratio is fix #3, not 1a). Owns: the barrier-free LDS init
+//    (shared frontier + BOTH slot control blocks), the completion live++/live-- (harness occ[0]==0
+//    gate), the GLOBAL super-tile claim (occ[20]), and the D=2 ring fill/recycle. Registers:
+//      s36 = gen       -- GLOBAL-monotonic publish counter (0 == "slot never published")
+//      s37 = fill_slot -- which slot to fill next (alternates 0,1,0,1 with D=2)
+//      s34 = fill_slot's control base (SLOTC_BASE + fill_slot*SLOTC_STRIDE)
+//      s17 = sti, s69 = chunkHi, s44/s45 = scratch, s16 = exec save
+//    Steady state: fill a FREE slot, publish (STI -> FILL_IDX -> SL_GEN LAST = release fence), then
+//    wait THAT slot READY (SL_BFDONE==FN && SL_ARDONE==G) before alternating fill_slot -- so feeds
+//    never split across slots and compute drains the OTHER slot throughout (STAGE/FOLLOW hidden).
+//    Reset of a slot's counters happens ONLY here, ONLY after the prior occupant's SL_RBDONE>=G, so
+//    the barrier-free reset-race is structurally impossible (see RING_SLOTS_DESIGN.md).
+//    occ[0]=live counter (harness polls ==0); occ[20]=global super-tile claim; occ[24]=chunkHi.
 // ============================================================================================
-.Lclaimer:
+.Ldispatcher:
 .if DYNVGPR
-.Lclaimer_alloc:
-    s_alloc_vgpr 32                            // commit lean (dyn WG-allocator consistency); SCC-retry guard
-    s_cbranch_scc0 .Lclaimer_alloc
+.Ldisp_alloc:
+    s_alloc_vgpr 32                            // dispatcher stays lean (never grows)
+    s_cbranch_scc0 .Ldisp_alloc
 .endif
     // live++ : lane0 occ[0] += 1
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s16, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lclaimer_live
+    s_cbranch_execz .Ldisp_live
     v_mov_b32 v3, 1
     global_atomic_add_u32 v4, v3, s[0:1] scope:SCOPE_DEV
-.Lclaimer_live:
+.Ldisp_live:
     s_mov_b32 exec_lo, s16
-    // --- barrier-free LDS-control init: zero all control words; INITFLAG = 0xACED LAST ---
-    lds_put STI_OFF, 0
-    lds_put EPOCH_OFF, 0
-    lds_put ROWBLK_NEXT_OFF, 0
-    lds_put ROWBLK_DONE_OFF, 0
-    lds_put BFRAG_NEXT_OFF, 0
-    lds_put AROW_NEXT_OFF, 0
-    lds_put BFRAG_DONE_OFF, 0
-    lds_put AROW_DONE_OFF, 0
-    lds_put NCOMP_SLOT, NCOMP
-    lds_put NAFEED_SLOT, NAFEED
-    lds_put NBFEED_SLOT, NBFEED
-    lds_put GATE_OFF, 0
-    lds_put (GATE_OFF+4), 0
-    lds_put (GATE_OFF+8), 0
-    lds_put (GATE_OFF+12), 0
-.if DSWS2_ENVELOPE
-    lds_put VRESV_OFF, (WAVES*VLEAN)                          // rolling: everyone lean; counter books peaks
-.else
-    lds_put VRESV_OFF, (NCOMP*NFV + (NAFEED+NBFEED)*VLEAN)
-.endif
-    lds_put SEGCNT_OFF, 0
-.if DSWS2_CONV
-    // Phase-B: seed BOTH epoch-parity role-mix snapshots with the launch mix, zero the quiesce counter.
-    // Gated so DSWS2_CONV=0 emits ZERO new bytes -> byte-identical to the Phase-A green bin.
-.if DSWS2_GQUIESCE
-    gq_reset                           // global QUIESCE = 0 (device-scoped; committed before INITFLAG)
-.else
-    lds_put QUIESCE_CNT_OFF, 0
-.endif
-    lds_put (SNAP_BASE + 0), NCOMP     // parity-0 snapshot = launch mix
-    lds_put (SNAP_BASE + 4), NAFEED
-    lds_put (SNAP_BASE + 8), NBFEED
-    lds_put (SNAP_BASE + 12), NCOMP    // parity-1 = launch mix too (init)
-    lds_put (SNAP_BASE + 16), NAFEED
-    lds_put (SNAP_BASE + 20), NBFEED
-    lds_put OCCA_PUB_OFF, 2            // SENSOR FIX: neutral ring seed (not <CTRL_LOW, not >CTRL_HIGH) until 1st publish
-    lds_put OCCB_PUB_OFF, 2
-.endif
-    lds_put INITFLAG_OFF, 0xACED               // LAST: publishes "LDS ready" to all follower waves
-    // FIX 1(e): load this dispatch's chunk terminal bound from occ[24] (host writes occW[6] per chunk;
-    //   FIX 1j on the host side). All lanes read the same address -> no exec masking needed, just a
-    //   plain broadcast load; stable for the WHOLE chunk, so load it ONCE here, not per-claim.
+    // --- barrier-free LDS init: shared frontier + BOTH slot control blocks; RINGINIT = 0xACED LAST ---
+    lds_put FILL_IDX_OFF, 0
+    lds_put DRAIN_IDX_OFF, 0
+    // slot 0 control block (8 words)
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_STI),    0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_GEN),    0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_RBNEXT), 0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_RBDONE), 0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_BFNEXT), 0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_BFDONE), 0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_ARNEXT), 0
+    lds_put (SLOTC_BASE + 0*SLOTC_STRIDE + SL_ARDONE), 0
+    // slot 1 control block (8 words)
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_STI),    0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_GEN),    0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_RBNEXT), 0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_RBDONE), 0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_BFNEXT), 0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_BFDONE), 0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_ARNEXT), 0
+    lds_put (SLOTC_BASE + 1*SLOTC_STRIDE + SL_ARDONE), 0
+    lds_put RINGINIT_OFF, 0xACED               // LAST: publishes "LDS ready" to all follower waves
+    // load this dispatch's chunk terminal bound (host writes occ[24] per chunk); stable -> load ONCE
     global_load_b32 v6, v4, s[0:1] offset:24 scope:SCOPE_DEV
     s_wait_loadcnt 0x0
-    v_readfirstlane_b32 s69, v6                // s69 = chunkHi (this dispatch's terminal sti bound)
-    s_mov_b32 s35, 0                           // claimer local epoch
-.if TRACE
-    global_load_b64 v[6:7], v4, s[0:1] offset:TRACE_PTR_OFF scope:SCOPE_DEV   // trace buffer VA
-    global_load_b32 v8,     v4, s[0:1] offset:TRACE_CAP_OFF scope:SCOPE_DEV   // MAXROWS
-    s_wait_loadcnt 0x0
-    v_readfirstlane_b32 s70, v6                // s[70:71] = trace VA (persistent, claimer-only)
-    v_readfirstlane_b32 s71, v7
-    v_readfirstlane_b32 s72, v8                // s72 = MAXROWS
-    // wg_id = claim-order dispenser (TGID_X isn't enabled in s15 -> was all-0). One atomic per WG at entry.
-    v_cmp_eq_u32 vcc_lo, 0, v2
-    s_mov_b32 s49, exec_lo
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    v_mov_b32 v7, 1
-    global_atomic_add_u32 v6, v4, v7, s[0:1] offset:TRACE_WGID_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV
-    s_wait_loadcnt 0x0
-    s_mov_b32 exec_lo, s49
-    v_readfirstlane_b32 s75, v6                // s75 = this WG's claim-order id (persistent, claimer-only)
-.endif
-.Lclaim_loop:
-    // claim next sti: lane0 global_atomic_add occ[20] += 1, return old
+    v_readfirstlane_b32 s69, v6                // s69 = chunkHi (terminal sti bound)
+    s_mov_b32 s36, 0                           // gen = 0 (first real publish will be gen 1)
+    s_mov_b32 s37, 0                           // fill_slot = 0
+.Ldisp_loop:
+    s_lshl_b32 s34, s37, 5                      // fill_slot * SLOTC_STRIDE(32)
+    s_add_u32  s34, s34, SLOTC_BASE            // s34 = fill_slot control base
+    // wait slot FREE: SL_GEN==0 (never published) OR SL_RBDONE>=G (prior occupant drained)
+.Ldisp_wait_free:
+    s_sleep SLEEPN
+    s_add_u32  s45, s34, SL_GEN
+    lds_get_r  s44, s45
+    s_cmp_eq_u32 s44, 0
+    s_cbranch_scc1 .Ldisp_free_ok
+    s_add_u32  s45, s34, SL_RBDONE
+    lds_get_r  s44, s45
+    s_cmp_lt_u32 s44, G
+    s_cbranch_scc1 .Ldisp_wait_free
+.Ldisp_free_ok:
+    // claim next global super-tile: lane0 occ[20] += 1 (return old)
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s16, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lclaim_grabbed
+    s_cbranch_execz .Ldisp_grabbed
     v_mov_b32 v3, 1
     global_atomic_add_u32 v5, v4, v3, s[0:1] offset:20 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
     s_wait_loadcnt 0x0
-.Lclaim_grabbed:
+.Ldisp_grabbed:
     s_mov_b32 exec_lo, s16
     v_readfirstlane_b32 s17, v5                // sti
-    s_cmp_ge_u32 s17, s69                       // sti >= chunkHi (occ[24]) -> terminal
-    s_cbranch_scc1 .Lclaimer_terminal
-    DECODE_STI                                 // -> s19=mblk s30=tcol s31=ksi
-    // reset per-super-tile claim/completion counters BEFORE the epoch bump (followers see them reset)
-    lds_put ROWBLK_NEXT_OFF, 0
-    lds_put ROWBLK_DONE_OFF, 0
-    lds_put BFRAG_NEXT_OFF, 0
-    lds_put AROW_NEXT_OFF, 0
-    lds_put BFRAG_DONE_OFF, 0
-    lds_put AROW_DONE_OFF, 0
-    lds_put STI_OFF, s17                        // publish STI FIRST...
-    lds_get s44, SEGCNT_OFF                     // bump SEGCNT (controller clock; +1/super-tile)
-    s_add_u32 s44, s44, 1
-    lds_put SEGCNT_OFF, s44
-    lds_get s44, EPOCH_OFF                      // ...then bump EPOCH LAST
-    s_add_u32 s44, s44, 1
-    s_mov_b32 s35, s44
-.if DSWS2_CONV
-    // ---- Step 4 (SPEC 3.4 decision 1): snapshot the LIVE role mix into the NEXT epoch's parity half of
-    //   SNAP_BASE, and reset QUIESCE_CNT, BEFORE the epoch bump below (which is published LAST). Followers
-    //   and the claimer's own wait-done for THIS super-tile then size their quiesce sentinels from
-    //   parity(newEpoch) -- so the quiesce counter is the snapshot handshake (Step 3 reads it). ----
-    s_and_b32 s46, s44, 1                        // parity(newEpoch)
-    s_mul_i32 s46, s46, 12                       // parity*12 (3-word half) -- matches SNAP_BASE comment
-    s_add_u32 s46, s46, SNAP_BASE                // s46 = byte offset of parity half
-    lds_get s47, NCOMP_SLOT
-    lds_put_r s46, s47                           // snap.nC = live NCOMP_SLOT
-    s_add_u32 s46, s46, 4
-    lds_get s47, NAFEED_SLOT
-    lds_put_r s46, s47                           // snap.nA = live NAFEED_SLOT
-    s_add_u32 s46, s46, 4
-    lds_get s47, NBFEED_SLOT
-    lds_put_r s46, s47                           // snap.nB = live NBFEED_SLOT
-.if DSWS2_GQUIESCE
-    gq_reset                                     // global QUIESCE = 0 (device-scoped; committed before EPOCH publish)
-.else
-    lds_put QUIESCE_CNT_OFF, 0                    // reset the per-super-tile bail counter
-.endif
-.endif
-    lds_put EPOCH_OFF, s44
-.if DSWS2_CONV
-    s_mov_b32 s73, 0                            // reset this super-tile's ring occ_A peak (SENSOR FIX + TRACE)
-    s_mov_b32 s74, 0                            // reset ring occ_B peak (updated across wait_done spins)
-.endif
-    BSTAGE                                      // claimer helps stage B for this super-tile (s30,s31)
-    // A7 advance gate: free resident A/B only when ALL G rowblks are computed+flushed
-.Lclaimer_wait_done:
+    s_cmp_ge_u32 s17, s69                       // sti >= chunkHi -> terminal
+    s_cbranch_scc1 .Ldisp_terminal
+    // reset this slot's per-super-tile counters BEFORE publishing gen (followers gate on SL_GEN)
+    s_add_u32 s45, s34, SL_RBNEXT
+    lds_put_r s45, 0
+    s_add_u32 s45, s34, SL_RBDONE
+    lds_put_r s45, 0
+    s_add_u32 s45, s34, SL_BFNEXT
+    lds_put_r s45, 0
+    s_add_u32 s45, s34, SL_BFDONE
+    lds_put_r s45, 0
+    s_add_u32 s45, s34, SL_ARNEXT
+    lds_put_r s45, 0
+    s_add_u32 s45, s34, SL_ARDONE
+    lds_put_r s45, 0
+    // publish STI first, then FILL_IDX (feeds now target this slot), then SL_GEN LAST (release fence)
+    s_add_u32 s45, s34, SL_STI
+    lds_put_r s45, s17
+    lds_put FILL_IDX_OFF, s37
+    s_add_u32 s36, s36, 1                        // gen++
+    s_add_u32 s45, s34, SL_GEN
+    lds_put_r s45, s36                            // release: consumers observe the new occupant here
+    // wait THIS slot READY (fully staged) before advancing fill_slot -> feeds never split across slots
+.Ldisp_wait_ready:
     s_sleep SLEEPN
-.if DSWS2_CONV
-    occ_sample s62, s63                         // sample ring mid-drain; keep the per-super-tile PEAK (SENSOR FIX + TRACE)
-    s_max_u32 s73, s73, s62
-    s_max_u32 s74, s74, s63
-.endif
-.if DSWS2_CONV
-.if DIAG
-    // Phase-B DIAG probe (Task 3): wid 0 samples the LIVE ring occupancy (compute is mid-drain here)
-    //   and publishes the last-sampled occ_A/occ_B so a GPU run can confirm the sensor OSCILLATES
-    //   rather than reading a stuck 0. Written every wait-done spin -> a live poller observes it vary.
-    //   Spare word-indexed slots occ[26]/occ[27] -> byte offsets 104/108 (well clear of the
-    //   byte-indexed control words occ[0]/occ[20]/occ[24]). READ-ONLY sensing, NO actuation.
-    occ_sample s62, s63
-    v_cmp_eq_u32 vcc_lo, 0, v2
-    s_mov_b32 s16, exec_lo
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Locc_diag_skip
-    v_mov_b32 v14, s62                          // occ_A (v14 <= v15: pre-grow safe)
-    v_mov_b32 v15, s63                          // occ_B
-    global_store_b32 v4, v14, s[0:1] offset:104 scope:SCOPE_DEV   // occ[26] = last occ_A
-    global_store_b32 v4, v15, s[0:1] offset:108 scope:SCOPE_DEV   // occ[27] = last occ_B
-.Locc_diag_skip:
-    s_mov_b32 exec_lo, s16
-.endif
-.endif
-    lds_get s44, ROWBLK_DONE_OFF                // (a) all G rowblks computed + flushed
-    s_cmp_lt_u32 s44, G
-    s_cbranch_scc1 .Lclaimer_wait_done
-    lds_get s44, BFRAG_DONE_OFF                 //     all B frags stored
+    s_add_u32 s45, s34, SL_BFDONE
+    lds_get_r s44, s45
     s_cmp_lt_u32 s44, FN
-    s_cbranch_scc1 .Lclaimer_wait_done
-    lds_get s44, AROW_DONE_OFF                  //     all A rowblks staged
+    s_cbranch_scc1 .Ldisp_wait_ready
+    s_add_u32 s45, s34, SL_ARDONE
+    lds_get_r s44, s45
     s_cmp_lt_u32 s44, G
-    s_cbranch_scc1 .Lclaimer_wait_done
-    // (b) QUIESCE the CLAIM counters before reset: each role wave must have executed its terminal
-    //   over-claim (fetch_add returns >=threshold, then bails) BEFORE we reset, else a descheduled
-    //   straggler's next fetch_add returns 0 and claims index 0 of the NEXT super-tile against stale
-    //   decode/resident state (round-table finding #1). Sentinels = threshold + #role-waves (each does
-    //   exactly one terminal bail). NOTE: compile-time NCOMP/NAFEED/NBFEED is correct for STATIC roles;
-    //   Phase-B conversion must switch these to live role counts / epoch-snapshot drained counters.
-.if DSWS2_CONV
-    // ---- Step 3 (SPEC 3.4 decision 1): size the three claim-counter sentinels from THIS epoch's parity
-    //   snapshot (live role mix written at broadcast, Step 4) instead of compile-time NCOMP/NAFEED/NBFEED,
-    //   so conversions re-tune the quiesce thresholds. A SEPARATE QUIESCE_CNT >= WAVES-1 cross-check is the
-    //   DIAG safety net; under DIAG a mismatch between the two is flagged to occ[29] (byte 116). ----
-    lds_get s45, EPOCH_OFF
-    s_and_b32 s45, s45, 1                        // parity(thisEpoch)
-    s_mul_i32 s45, s45, 12                       // parity*12 (3-word half)
-    s_add_u32 s45, s45, SNAP_BASE
-    lds_get_r s46, s45                           // snap.nC
-    s_add_u32 s45, s45, 4
-    lds_get_r s47, s45                           // snap.nA
-    s_add_u32 s45, s45, 4
-    lds_get_r s48, s45                           // snap.nB
-    s_add_u32 s46, s46, G                        // thr_rowblk = G + snap.nC
-    s_add_u32 s47, s47, G                        // thr_arow   = G + snap.nA
-    s_add_u32 s48, s48, FN                       // thr_bfrag  = FN + snap.nB
-    // sentinels_done (s50) = (ROWBLK_NEXT>=thr_rowblk) & (BFRAG_NEXT>=thr_bfrag) & (AROW_NEXT>=thr_arow)
-    s_mov_b32 s50, 1
-    lds_get s44, ROWBLK_NEXT_OFF
-    s_cmp_lt_u32 s44, s46
-    s_cbranch_scc0 .Lqc_rb_ok
-    s_mov_b32 s50, 0
-.Lqc_rb_ok:
-    lds_get s44, BFRAG_NEXT_OFF
-    s_cmp_lt_u32 s44, s48
-    s_cbranch_scc0 .Lqc_bf_ok
-    s_mov_b32 s50, 0
-.Lqc_bf_ok:
-    lds_get s44, AROW_NEXT_OFF
-    s_cmp_lt_u32 s44, s47
-    s_cbranch_scc0 .Lqc_ar_ok
-    s_mov_b32 s50, 0
-.Lqc_ar_ok:
-    // quiesce_done (s51) = QUIESCE_CNT >= WAVES-1  (each of the WAVES-1 non-claimer waves bumped once)
-    s_mov_b32 s51, 1
-.if DSWS2_GQUIESCE
-    gq_read s44                                  // device-scoped global read (observes committed follower bumps)
-.else
-    lds_get s44, QUIESCE_CNT_OFF
-.endif
-    s_cmp_lt_u32 s44, (WAVES-1)
-    s_cbranch_scc0 .Lqc_q_ok
-    s_mov_b32 s51, 0
-.Lqc_q_ok:
-.if DSWS2_CONV
-    // SENSOR FIX: publish this super-tile's mid-drain ring PEAK so the followers' NEXT-epoch conversion
-    //   decisions read a true demand signal instead of sampling occ_X~0 at their own post-drain quiesce.
-    s_mov_b32 s49, exec_lo
-    v_cmp_eq_u32 vcc_lo, 0, v2
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lpub_skip
-    v_mov_b32 v14, OCCA_PUB_OFF
-    v_mov_b32 v15, s73
-    ds_store_b32 v14, v15
-    v_mov_b32 v14, OCCB_PUB_OFF
-    v_mov_b32 v15, s74
-    ds_store_b32 v14, v15
-    // (no s_wait_dscnt: followers read this a full super-tile later; async LDS store drains long before)
-.Lpub_skip:
-    s_mov_b32 exec_lo, s49
-.endif
-    trace_row                                    // TRACE: append this super-tile's row (role mix, ring peak, conv, vresv)
-.if DIAG
-    // DIAG cross-check + Pool-T7 chunk-2 WEDGE FRAME. occ[29]=s50^s51 mismatch. Plus snapshot EVERY advance-gate
-    //   counter to host-streamed occ slots so a hung dispatch reads out exactly which sentinel is unmet:
-    //     stream cons=ROWBLK_DONE tiles=AROW_DONE compPh=BFRAG_DONE (want G/G/FN = all work flushed)
-    //     comp:dsB=QUIESCE_CNT (want WAVES-1 -> short => a follower never bailed; see roles[C/A/B] epochs)
-    //     feed:tr=ROWBLK_NEXT pub=AROW_NEXT rawTi=BFRAG_NEXT (the s50 over-claim sentinels).
-    //   Read counters at full exec, THEN publish under lane-0 mask. Scratch s53-s56/s60-s62 dead here
-    //   (occ_sample's s60-s63 were consumed at the wait_done top). DIAG-only -> CONV=0 byte-identical.
-    lds_get s53, ROWBLK_DONE_OFF
-    lds_get s54, AROW_DONE_OFF
-    lds_get s55, BFRAG_DONE_OFF
-    lds_get s56, QUIESCE_CNT_OFF
-    lds_get s60, ROWBLK_NEXT_OFF
-    lds_get s61, AROW_NEXT_OFF
-    lds_get s62, BFRAG_NEXT_OFF
-    s_xor_b32 s52, s50, s51
-    v_cmp_eq_u32 vcc_lo, 0, v2
-    s_mov_b32 s16, exec_lo
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lqc_diag_skip
-    v_mov_b32 v14, s52
-    global_store_b32 v4, v14, s[0:1] offset:116 scope:SCOPE_DEV   // occ[29] = quiesce/snapshot mismatch
-    v_mov_b32 v14, s53
-    global_store_b32 v4, v14, s[0:1] offset:40  scope:SCOPE_DEV   // occ[10] cons     = ROWBLK_DONE (want G)
-    v_mov_b32 v14, s54
-    global_store_b32 v4, v14, s[0:1] offset:44  scope:SCOPE_DEV   // occ[11] tiles    = AROW_DONE  (want G)
-    v_mov_b32 v14, s55
-    global_store_b32 v4, v14, s[0:1] offset:28  scope:SCOPE_DEV   // occ[7]  compPh   = BFRAG_DONE (want FN)
-    v_mov_b32 v14, s56
-    global_store_b32 v4, v14, s[0:1] offset:60  scope:SCOPE_DEV   // occ[15] comp:dsB = QUIESCE (want WAVES-1)
-    v_mov_b32 v14, s60
-    global_store_b32 v4, v14, s[0:1] offset:76  scope:SCOPE_DEV   // occ[19] feed:tr  = ROWBLK_NEXT
-    v_mov_b32 v14, s61
-    global_store_b32 v4, v14, s[0:1] offset:84  scope:SCOPE_DEV   // occ[21] pub      = AROW_NEXT
-    v_mov_b32 v14, s62
-    global_store_b32 v4, v14, s[0:1] offset:88  scope:SCOPE_DEV   // occ[22] rawTi    = BFRAG_NEXT
-.if DSWS2_ENVELOPE
-    // Envelope telemetry (2026-07-02 spec 4.5): instantaneous vgpr_reserved at the wedge moment +
-    //   PEAK_CONC config echo. If a dispatch wedges with occ[8]==BUDGET, it is permit-starvation (the
-    //   envelope is saturated); anything below BUDGET points the wedge elsewhere. DIAG+ENVELOPE gated.
-    lds_get s52, VRESV_OFF
-    v_mov_b32 v14, s52
-    global_store_b32 v4, v14, s[0:1] offset:32  scope:SCOPE_DEV   // occ[8]  vgpr_reserved (want < BUDGET)
-    v_mov_b32 v14, PEAK_CONC
-    global_store_b32 v4, v14, s[0:1] offset:56  scope:SCOPE_DEV   // occ[14] PEAK_CONC echo (config readback)
-.endif
-.Lqc_diag_skip:
-    s_mov_b32 exec_lo, s16
-.endif
-    // advance only when BOTH the snapshot sentinels AND the QUIESCE cross-check agree they are done
-    s_and_b32 s50, s50, s51
-    s_cmp_eq_u32 s50, 0
-    s_cbranch_scc1 .Lclaimer_wait_done
-.else
-    lds_get s44, ROWBLK_NEXT_OFF                // G claims + NCOMP terminal bails
-    s_cmp_lt_u32 s44, (G + NCOMP)
-    s_cbranch_scc1 .Lclaimer_wait_done
-    lds_get s44, BFRAG_NEXT_OFF                 // FN claims + NBFEED terminal bails
-    s_cmp_lt_u32 s44, (FN + NBFEED)
-    s_cbranch_scc1 .Lclaimer_wait_done
-    lds_get s44, AROW_NEXT_OFF                  // G claims + NAFEED terminal bails
-    s_cmp_lt_u32 s44, (G + NAFEED)
-    s_cbranch_scc1 .Lclaimer_wait_done
-.endif
-    s_branch .Lclaim_loop
-.Lclaimer_terminal:
-    lds_put STI_OFF, 0xFFFFFFFF                 // FIX 1(e): publish SENTINEL (not the raw over-claimed sti)...
-    lds_get s44, EPOCH_OFF                      // ...bump epoch so followers wake + retire (A7 terminal)
-    s_add_u32 s44, s44, 1
-    lds_put EPOCH_OFF, s44
+    s_cbranch_scc1 .Ldisp_wait_ready
+    s_xor_b32 s37, s37, 1                         // alternate fill_slot (D=2)
+    s_branch .Ldisp_loop
+.Ldisp_terminal:
+    // Publish SENTINEL into fill_slot (the confirmed-FREE slot; s34 still holds its base) + point
+    //   FILL_IDX at it + bump its gen LAST. Feeds (via FILL_IDX) and compute (via the DRAIN_IDX
+    //   frontier-advance that lands here after the OTHER slot's last real work drains) then wake and
+    //   retire. The other slot, if it still holds live work, is drained normally first -- we do NOT
+    //   sentinel it (that would retire compute before its rowblks are done). See RING_SLOTS_DESIGN.md.
+    s_add_u32 s36, s36, 1                        // gen++ (sentinel publish)
+    s_mov_b32 s44, 0xFFFFFFFF
+    s_add_u32 s45, s34, SL_STI
+    lds_put_r s45, s44                            // STI[fill_slot] = SENTINEL
+    lds_put FILL_IDX_OFF, s37                     // feeds target the sentineled slot
+    s_add_u32 s45, s34, SL_GEN
+    lds_put_r s45, s36                            // release LAST
     // live-- : lane0 occ[0] -= 1 (harness completion gate fires)
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s16, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lclaimer_dead
+    s_cbranch_execz .Ldisp_dead
     v_mov_b32 v3, -1
     global_atomic_add_u32 v4, v3, s[0:1] scope:SCOPE_DEV
-.Lclaimer_dead:
+.Ldisp_dead:
     s_mov_b32 exec_lo, s16
-    tfspan max, 12                             // TFPROBE: claimer stamps occ[3] = max exit tick (wall-span end)
+    tfspan max, 12                             // TFPROBE: dispatcher stamps occ[3] = max exit tick (wall-span end)
     alllive_dec
     s_endpgm
 
 // ============================================================================================
-//  A4 -- .Lbfeed : B-feed wave. Follows EPOCH/STI, decodes (tcol,ksi), stages its claimed B frags.
+//  FIX 1a -- .Lbfeed : B-feed wave. Gates on SL_GEN[FILL_IDX] > last-seen-gen (new occupant), reads
+//    STI[FILL_IDX] (sentinel -> retire), stages its claimed B frags into the FILL_IDX slot's operand
+//    buffer via BSTAGE_R. A feed that skips a generation is SAFE: the dispatcher's wait-READY gate
+//    guarantees the skipped slot was fully staged by other feeds before FILL_IDX advanced off it, and
+//    compute gates on SL_BFDONE (a count), not on which feed contributed (see RING_SLOTS_DESIGN.md).
+//    Registers: s35 = last-seen gen, s38 = FILL_IDX, s48 = scb, s52 = sob, s44/s45 = scratch.
 // ============================================================================================
 .Lbfeed:
 .if DYNVGPR
@@ -1421,76 +1410,32 @@ occ_kernel:
 .endif
 .Lbfeed_init:
     s_sleep 1
-    lds_get s44, INITFLAG_OFF
+    lds_get s44, RINGINIT_OFF
     s_cmp_eq_u32 s44, 0xACED
-    s_cbranch_scc0 .Lbfeed_init                 // wait for the claimer's barrier-free LDS init
-    s_mov_b32 s35, 0                            // local epoch
+    s_cbranch_scc0 .Lbfeed_init                 // wait the dispatcher's barrier-free LDS init
+    s_mov_b32 s35, 0                            // last-seen gen (0 = none staged yet)
 .Lbfeed_follow:
     s_sleep SLEEPN
-    lds_get s44, EPOCH_OFF
-    s_cmp_eq_u32 s44, s35
-    s_cbranch_scc1 .Lbfeed_follow                // wait next super-tile (epoch change)
-    s_mov_b32 s35, s44
-    lds_get s17, STI_OFF
-    s_cmp_eq_u32 s17, 0xFFFFFFFF                  // FIX 1(f): sentinel (A7) -> retire (was: STI>=TOTAL_super)
+    lds_get s38, FILL_IDX_OFF                   // current fill slot
+    s_lshl_b32 s48, s38, 5
+    s_add_u32  s48, s48, SLOTC_BASE            // s48 = scb (FILL_IDX control base)
+    s_add_u32  s45, s48, SL_GEN
+    lds_get_r  s44, s45                          // SL_GEN[FILL_IDX]
+    s_cmp_le_u32 s44, s35                        // gen <= last-seen -> no new occupant yet -> spin
+    s_cbranch_scc1 .Lbfeed_follow
+    s_mov_b32 s35, s44                           // adopt the new gen
+    s_add_u32  s45, s48, SL_STI
+    lds_get_r  s17, s45                          // STI[FILL_IDX]
+    s_cmp_eq_u32 s17, 0xFFFFFFFF                 // sentinel -> retire
     s_cbranch_scc1 .Lretire
     DECODE_STI                                   // s30=tcol s31=ksi (mblk unused)
-    BSTAGE
-.if DSWS2_CONV
-    // ==== Phase-B decision (Step 1) + bail-time commit (Step 2), B-feed wave ====
-    //   Lean-32 -> PRE-GROW window (the feed->compute GROW closes it inside conv_apply, post all <=v15
-    //   reads). If the B-ring is OVER-SERVED (occ_B>CTRL_HIGH_B) grow one B-feed->compute (dir 3):
-    //   reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay B-feed).
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0
-    s_cbranch_scc0 .Lbfeed_cooldn                // Task 4: s66!=0 -> in cooldown, skip decision
-.endif
-.if DSWS2_FORCE
-.if DSWS2_FORCE_DIR == 3
-    // Task 5: deterministic forced conversion (dir 3: B-feed -> compute), watermark bypassed.
-    //   Convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==DSWS2_FORCE_EPOCH.
-    s_mov_b32 s58, 0
-    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
-    s_cbranch_scc0 .Lbfeed_cooldn
-    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
-    s_cbranch_scc0 .Lbfeed_cooldn
-    s_mov_b32 s57, 3                             // dir 3: B-feed -> compute (forced)
-    try_gate 3, s58
-    conv_apply NBFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
-.endif
-.else
-    s_mov_b32 s58, 0
-    lds_get s55, OCCA_PUB_OFF                     // SENSOR FIX: read claimer-published mid-drain peak (not post-drain ~0)
-    lds_get s56, OCCB_PUB_OFF
-    s_cmp_gt_u32 s56, CTRL_HIGH_B
-    s_cbranch_scc0 .Lbfeed_cooldn
-    s_mov_b32 s57, 3                             // dir 3: B-feed -> compute
-    try_gate 3, s58
-    conv_apply NBFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
-.endif
-.Lbfeed_cooldn:
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
-    s_cbranch_scc1 .Lbfeed_quiesce
-    s_sub_i32 s66, s66, 1
-.endif
-.Lbfeed_quiesce:
-.if DSWS2_GQUIESCE
-    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
-.else
-    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
-.endif
-    epoch_mark 144                               // roles[2] = B-feed last epoch bumped (wedge localize)
-    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
-.endif
-.if DSWS2_CONV
-    s_branch .Ldispatch
-.else
+    s_lshl_b32 s52, s38, 14                      // FILL_IDX * OPSTRIDE(16384)
+    s_add_u32  s52, s52, OP_BASE                // s52 = sob (FILL_IDX operand base)
+    BSTAGE_R s48, s52
     s_branch .Lbfeed_follow
-.endif
 
 // ============================================================================================
-//  A5 -- .Lafeed : A-feed wave. Follows EPOCH/STI, decodes (mblk,ksi), stages its claimed A rowblks.
+//  FIX 1a -- .Lafeed : A-feed wave. Symmetric to .Lbfeed; stages A rowblks into FILL_IDX via ASTAGE_R.
 // ============================================================================================
 .Lafeed:
 .if DYNVGPR
@@ -1500,79 +1445,40 @@ occ_kernel:
 .endif
 .Lafeed_init:
     s_sleep 1
-    lds_get s44, INITFLAG_OFF
+    lds_get s44, RINGINIT_OFF
     s_cmp_eq_u32 s44, 0xACED
     s_cbranch_scc0 .Lafeed_init
     s_mov_b32 s35, 0
 .Lafeed_follow:
     s_sleep SLEEPN
-    lds_get s44, EPOCH_OFF
-    s_cmp_eq_u32 s44, s35
+    lds_get s38, FILL_IDX_OFF
+    s_lshl_b32 s48, s38, 5
+    s_add_u32  s48, s48, SLOTC_BASE
+    s_add_u32  s45, s48, SL_GEN
+    lds_get_r  s44, s45
+    s_cmp_le_u32 s44, s35
     s_cbranch_scc1 .Lafeed_follow
     s_mov_b32 s35, s44
-    lds_get s17, STI_OFF
-    s_cmp_eq_u32 s17, 0xFFFFFFFF                  // FIX 1(f): sentinel (A7) -> retire (was: STI>=TOTAL_super)
+    s_add_u32  s45, s48, SL_STI
+    lds_get_r  s17, s45
+    s_cmp_eq_u32 s17, 0xFFFFFFFF
     s_cbranch_scc1 .Lretire
     DECODE_STI                                   // s19=mblk s31=ksi (tcol unused)
-    ASTAGE
-.if DSWS2_CONV
-    // ==== Phase-B decision (Step 1) + bail-time commit (Step 2), A-feed wave ====
-    //   Wave is lean-32 here (feeds never grow), so this is a PRE-GROW window; the conversion GROW
-    //   (feed->compute, s_alloc_vgpr NFV) is the ONLY grow and closes the window inside conv_apply, after
-    //   all <=v15 LDS/atomic reads. If the A-ring is OVER-SERVED (occ_A>CTRL_HIGH_A) grow one A-feed->
-    //   compute (dir 2): reserve delta +(NFV-VLEAN) (may abort over BUDGET -> stay A-feed).
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0
-    s_cbranch_scc0 .Lafeed_cooldn                // Task 4: s66!=0 -> in cooldown, skip decision
-.endif
-.if DSWS2_FORCE
-.if DSWS2_FORCE_DIR == 2
-    // Task 5: deterministic forced conversion (dir 2: A-feed -> compute), watermark bypassed.
-    //   Convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==DSWS2_FORCE_EPOCH.
-    s_mov_b32 s58, 0
-    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
-    s_cbranch_scc0 .Lafeed_cooldn
-    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
-    s_cbranch_scc0 .Lafeed_cooldn
-    s_mov_b32 s57, 2                             // dir 2: A-feed -> compute (forced)
-    try_gate 2, s58
-    conv_apply NAFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
-.endif
-.else
-    s_mov_b32 s58, 0
-    lds_get s55, OCCA_PUB_OFF                     // SENSOR FIX: read claimer-published mid-drain peak (not post-drain ~0)
-    lds_get s56, OCCB_PUB_OFF
-    s_cmp_gt_u32 s55, CTRL_HIGH_A
-    s_cbranch_scc0 .Lafeed_cooldn
-    s_mov_b32 s57, 2                             // dir 2: A-feed -> compute
-    try_gate 2, s58
-    conv_apply NAFEED_SLOT, NCOMP_SLOT, +(NFV-VLEAN), NFV
-.endif
-.Lafeed_cooldn:
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
-    s_cbranch_scc1 .Lafeed_quiesce
-    s_sub_i32 s66, s66, 1
-.endif
-.Lafeed_quiesce:
-.if DSWS2_GQUIESCE
-    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
-.else
-    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // commit-before-bump ordering (SPEC 3.4 decision 2)
-.endif
-    epoch_mark 140                               // roles[1] = A-feed last epoch bumped (wedge localize)
-    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
-.endif
-.if DSWS2_CONV
-    s_branch .Ldispatch
-.else
+    s_lshl_b32 s52, s38, 14
+    s_add_u32  s52, s52, OP_BASE
+    ASTAGE_R s48, s52
     s_branch .Lafeed_follow
-.endif
 
 // ============================================================================================
-//  A6 -- .Lcompute : compute wave. Follows EPOCH/STI, decodes (mblk,tcol,ksi), waits resident A/B
-//    fully staged (DONE counters), then claims rowblks, runs WMMA over the SEGK segment, and flushes
-//    fp32 partials into C via global_atomic_add_f32 (split-K segments accumulate into the same C cell).
+//  FIX 1a -- .Lcompute : compute wave. Gates on SL_GEN[DRAIN_IDX] > last-seen-gen, waits the slot
+//    fully STAGED (SL_BFDONE==FN && SL_ARDONE==G), claims rowblks from SL_RBNEXT[DRAIN_IDX], grows,
+//    runs WMMA over the slot's resident operand buffer, flushes fp32 partials into C via
+//    global_atomic_add_f32 (split-K segments accumulate), shrinks, and bumps SL_RBDONE. The wave whose
+//    SL_RBDONE increment reaches G (old==G-1) is the CLOSER: it advances DRAIN_IDX to the other slot
+//    (lock-free frontier advance). Because the next slot is pre-published AND pre-staged (dispatcher
+//    keeps one ahead + waits READY), FOLLOW_WAIT/STAGE_WAIT collapse toward zero in steady state.
+//    Registers: s35=last-seen gen, s46=DRAIN_IDX, s48=scb (control base), s52=sob (operand base) --
+//    all survive the whole rowblk loop; s44/s45/s47 scratch; s33=rowblk; s37/s38/s39/s28/s29 = C addr.
 // ============================================================================================
 .Lcompute:
 .if DYNVGPR
@@ -1582,19 +1488,24 @@ occ_kernel:
 .endif
 .Lcompute_init:
     s_sleep 1
-    lds_get s44, INITFLAG_OFF
+    lds_get s44, RINGINIT_OFF
     s_cmp_eq_u32 s44, 0xACED
     s_cbranch_scc0 .Lcompute_init
     s_mov_b32 s35, 0
     phase_reset                                  // PHASEPROBE: seed this compute wave's phase clock
 .Lcompute_follow:
     s_sleep SLEEPN
-    lds_get s44, EPOCH_OFF
-    s_cmp_eq_u32 s44, s35
+    lds_get s46, DRAIN_IDX_OFF                  // current drain slot
+    s_lshl_b32 s48, s46, 5
+    s_add_u32  s48, s48, SLOTC_BASE            // s48 = scb (DRAIN control base)
+    s_add_u32  s45, s48, SL_GEN
+    lds_get_r  s44, s45                          // SL_GEN[DRAIN_IDX]
+    s_cmp_le_u32 s44, s35                        // gen <= last-seen -> no new occupant -> spin
     s_cbranch_scc1 .Lcompute_follow
     s_mov_b32 s35, s44
-    phase_stamp s78                             // close FOLLOW_WAIT (spun waiting for next super-tile)
-    lds_get s17, STI_OFF
+    phase_stamp s78                             // close FOLLOW_WAIT (spun waiting for the next super-tile)
+    s_add_u32  s45, s48, SL_STI
+    lds_get_r  s17, s45                          // STI[DRAIN_IDX]
 .if PHASEPROBE
     s_cmp_eq_u32 s17, 0xFFFFFFFF                 // sentinel -> flush phase accumulators, then retire
     s_cbranch_scc0 .Lcompute_go
@@ -1602,17 +1513,21 @@ occ_kernel:
     s_branch .Lretire
 .Lcompute_go:
 .else
-    s_cmp_eq_u32 s17, 0xFFFFFFFF                  // FIX 1(f): sentinel (A7) -> retire (was: STI>=TOTAL_super)
+    s_cmp_eq_u32 s17, 0xFFFFFFFF                 // sentinel -> retire
     s_cbranch_scc1 .Lretire
 .endif
     DECODE_STI                                  // s19=mblk s30=tcol s31=ksi
+    s_lshl_b32 s52, s46, 14                      // DRAIN_IDX * OPSTRIDE(16384)
+    s_add_u32  s52, s52, OP_BASE                // s52 = sob (DRAIN operand base)
     // wait until resident A AND B fully STAGED (B: FN frags stored, A: G rowblks stored)
 .Lcompute_staged:
     s_sleep SLEEPN
-    lds_get s44, BFRAG_DONE_OFF
+    s_add_u32  s45, s48, SL_BFDONE
+    lds_get_r  s44, s45
     s_cmp_lt_u32 s44, FN
     s_cbranch_scc1 .Lcompute_staged
-    lds_get s44, AROW_DONE_OFF
+    s_add_u32  s45, s48, SL_ARDONE
+    lds_get_r  s44, s45
     s_cmp_lt_u32 s44, G
     s_cbranch_scc1 .Lcompute_staged
     phase_stamp s79                             // close STAGE_WAIT (spun waiting for A/B feeds)
@@ -1621,41 +1536,16 @@ occ_kernel:
     s_add_u32 s38, s38, s30
     s_mul_i32 s38, s38, (G*FM*FN*1024)
 .Lcompute_claim:
-    lds_fetch_add s33, ROWBLK_NEXT_OFF, 1       // claim rowblk r in [0,G)
+    s_add_u32  s45, s48, SL_RBNEXT
+    lds_fetch_add_r s33, s45, 1                  // claim rowblk r in [0,G)
     s_cmp_ge_u32 s33, G
     s_cbranch_scc1 .Lcompute_drained
 .if DYNVGPR
     s_wait_loadcnt 0x0
     s_wait_storecnt 0x0
-.if DSWS2_ENVELOPE
-    // Sum-envelope reserve (2026-07-02 spec 4.1): book +Δ against vgpr_reserved before growing so at most
-    //   PEAK_CONC waves hold peak at once. Over-budget -> reserve_try already undid its add -> back off AT
-    //   LEAN and retry (wave is still 32 here; every temp <=v15, pre-grow OOR-safe). s54=won, s62/s63 scratch
-    //   (all dead in the claim loop -- conv only runs at .Lcompute_drained).
-.Lcompute_reserve:
-    reserve_try +(NFV-VLEAN), s54
-    s_cmp_eq_u32 s54, 0
-    s_cbranch_scc0 .Lcompute_grow              // won (s54!=0 -> SCC==0) -> grow
-    s_sleep SLEEPN
-    s_branch .Lcompute_reserve
-.endif
 .Lcompute_grow:
-    s_alloc_vgpr NFV                            // grow (SCC-retry guarded, brick-class rule)
+    s_alloc_vgpr NFV                            // grow (SCC-retry guarded, brick-class rule; M=576 safe)
     s_cbranch_scc0 .Lcompute_grow
-.if TRACE
-    // B-probe: this wave just went fat (NFV VGPR). ++live, track the peak concurrent fat count.
-    v_cmp_eq_u32 vcc_lo, 0, v2
-    s_mov_b32 s49, exec_lo
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lfatg_skip
-    v_mov_b32 v3, 1
-    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:FATLIVE_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV   // v5 = old live
-    s_wait_loadcnt 0x0
-    v_add_nc_u32 v5, v5, 1                       // new live count
-    global_atomic_max_u32 v4, v5, s[0:1] offset:FATMAX_OFF scope:SCOPE_DEV   // peak = max(peak, new)
-.Lfatg_skip:
-    s_mov_b32 exec_lo, s49
-.endif
 .endif
     phase_stamp s80                             // close GROW (rowblk claim + s_alloc_vgpr 32->112)
     // zero FM*FN fp32 accumulators
@@ -1671,10 +1561,11 @@ occ_kernel:
       v_mov_b32 v[ACC+idx*8+7], 0
       .set idx, idx+1
     .endr
-    // resident operand bases (lane*8 + region [+ r*FM*256 for A])
-    v_add_nc_u32 v12, v9, BRES_OFF
+    // resident operand bases: v9 + sob + region [+ r*FM*256 for A]  (BRES_ROFF=0, ARES_ROFF=BRES_BYTES)
+    v_add_nc_u32 v12, v9, s52
     s_mul_i32 s37, s33, (FM*256)
-    v_add_nc_u32 v13, v9, ARES_OFF
+    v_add_nc_u32 v13, v9, s52
+    v_add_nc_u32 v13, v13, ARES_ROFF
     v_add_nc_u32 v13, v13, s37
     // WMMA over the SEGK segment (KSEG_STEPS k-steps); read resident B(ks) + A(ks,r) from LDS
     .set ks, 0
@@ -1728,95 +1619,19 @@ occ_kernel:
 .Lcompute_shrink:
     s_alloc_vgpr 32                             // shrink (SCC-retry guarded)
     s_cbranch_scc0 .Lcompute_shrink
-.if TRACE
-    v_cmp_eq_u32 vcc_lo, 0, v2                  // B-probe: this wave went lean again -> --live
-    s_mov_b32 s49, exec_lo
-    s_and_b32 exec_lo, exec_lo, vcc_lo
-    s_cbranch_execz .Lfats_skip
-    v_mov_b32 v3, -1
-    global_atomic_add_u32 v4, v3, s[0:1] offset:FATLIVE_OFF scope:SCOPE_DEV
-.Lfats_skip:
-    s_mov_b32 exec_lo, s49
-.endif
-.if DSWS2_ENVELOPE
-    lds_fetch_add s54, VRESV_OFF, -(NFV-VLEAN)  // envelope release −Δ (shrink committed; wave lean, v<=v15)
-.endif
 .endif
     phase_stamp s83                           // close SHRINK (s_alloc_vgpr 112->32)
-    lds_inc ROWBLK_DONE_OFF                      // rowblk r computed + flushed (frees the A7 advance gate)
+    // rowblk r computed+flushed: bump SL_RBDONE; the wave whose inc reaches G is the CLOSER and advances
+    //   the drain frontier. old==G-1 detects the closer atomically (exactly one wave).
+    s_add_u32  s45, s48, SL_RBDONE
+    lds_fetch_add_r s44, s45, 1                  // s44 = old SL_RBDONE[DRAIN_IDX]
+    s_cmp_eq_u32 s44, (G-1)
+    s_cbranch_scc0 .Lcompute_claim               // not the closer -> keep claiming (next rowblk / over-claim)
+    s_xor_b32  s47, s46, 1                        // closer: DRAIN_IDX -> other slot (lock-free frontier advance)
+    lds_put DRAIN_IDX_OFF, s47
     s_branch .Lcompute_claim
 .Lcompute_drained:
-.if DSWS2_CONV
-    // ==== Phase-B role-boundary decision (Step 1) + bail-time commit (Step 2), compute wave ====
-    //   Wave is lean-32 here (the last claimed rowblk shrank to 32; a zero-claim drain never grew), so the
-    //   whole decision+commit runs in the PRE-GROW window -- every temp <=v15 / scalar <=s65 (see conv_apply
-    //   OOR note). If compute is STARVED for A (occ_A<CTRL_LOW) it converts one compute->A-feed (dir 0);
-    //   else if starved for B, compute->B-feed (dir 1). Both are SHRINKs: reserve delta -(NFV-VLEAN),
-    //   s_alloc_vgpr 32 (already lean -> no-op). Persistent: s57=dir, s58=s_win, s59=new-role (all outside
-    //   s60..s65 so occ_sample/try_gate/reserve_try/conv_* cannot clobber them while live).
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0
-    s_cbranch_scc0 .Lcmp_cooldn                  // Task 4: s66!=0 -> in cooldown, skip decision
-.endif
-.if DSWS2_FORCE
-.if DSWS2_FORCE_DIR == 0 || DSWS2_FORCE_DIR == 1
-    // Task 5: deterministic forced conversion (compute is the source role for dir 0 and dir 1).
-    //   Watermark bypassed: convert iff wid(s24)==DSWS2_FORCE_WID AND current epoch(s35)==
-    //   DSWS2_FORCE_EPOCH. try_gate still runs (sets s58=s_win, conv_apply's precondition).
-    s_mov_b32 s58, 0                             // s_win = 0 default (compares below may bail early)
-    s_cmp_eq_u32 s24, DSWS2_FORCE_WID
-    s_cbranch_scc0 .Lcmp_cooldn
-    s_cmp_eq_u32 s35, DSWS2_FORCE_EPOCH
-    s_cbranch_scc0 .Lcmp_cooldn
-.if DSWS2_FORCE_DIR == 0
-    s_mov_b32 s57, 0                             // dir 0: compute -> A-feed (forced)
-    try_gate 0, s58
-    conv_apply NCOMP_SLOT, NAFEED_SLOT, -(NFV-VLEAN), 32
-.else
-    s_mov_b32 s57, 1                             // dir 1: compute -> B-feed (forced)
-    try_gate 1, s58
-    conv_apply NCOMP_SLOT, NBFEED_SLOT, -(NFV-VLEAN), 32
-.endif
-.endif
-.else
-    s_mov_b32 s58, 0                             // s_win = 0 (default: raced no ticket)
-    lds_get s55, OCCA_PUB_OFF                     // SENSOR FIX: read claimer-published mid-drain PEAK, not occ_sample
-    lds_get s56, OCCB_PUB_OFF                     //   at post-drain quiesce (~0 -> false "starved" -> 4/2/2->1/6/1 runaway)
-    s_cmp_lt_u32 s55, CTRL_LOW
-    s_cbranch_scc0 .Lcmp_try_b
-    s_mov_b32 s57, 0                             // dir 0: compute -> A-feed
-    try_gate 0, s58                              // s58 = s_win (single-winner per (dir,epoch))
-    conv_apply NCOMP_SLOT, NAFEED_SLOT, -(NFV-VLEAN), 32
-    s_branch .Lcmp_cooldn
-.Lcmp_try_b:
-    s_cmp_lt_u32 s56, CTRL_LOW
-    s_cbranch_scc0 .Lcmp_cooldn
-    s_mov_b32 s57, 1                             // dir 1: compute -> B-feed
-    try_gate 1, s58
-    conv_apply NCOMP_SLOT, NBFEED_SLOT, -(NFV-VLEAN), 32
-.endif
-.Lcmp_cooldn:
-.if CONV_COOLDOWN > 0
-    s_cmp_eq_u32 s66, 0                          // Task 4: decrement once per epoch (saturating)
-    s_cbranch_scc1 .Lcmp_quiesce
-    s_sub_i32 s66, s66, 1
-.endif
-.Lcmp_quiesce:
-    // ORDERING (SPEC 3.4 decision 2): the commit above fully completed (role-slot CAS + reservation +
-    //   s_alloc_vgpr) BEFORE this QUIESCE_CNT bump -- the bump is the snapshot handshake the claimer reads.
-.if DSWS2_GQUIESCE
-    gq_bump                                      // device-scoped global bump (visible to the claimer poll)
-.else
-    lds_fetch_add s61, QUIESCE_CNT_OFF, 1        // exactly one bump per non-claimer wave / super-tile
-.endif
-    epoch_mark 136                               // roles[0] = compute last epoch bumped (wedge localize)
-    bail_mark                                    // per-wave localization: occ[BAIL_BASE + wid*4] = this wave's epoch
-.endif
-.if DSWS2_CONV
-    s_branch .Ldispatch
-.else
-    s_branch .Lcompute_follow                    // this super-tile's compute drained -> re-check epoch/terminal
-.endif
+    s_branch .Lcompute_follow                    // this slot drained -> re-check drain frontier / terminal
 
 .if DSWS2_CONV
 // ============================================================================================
@@ -1857,7 +1672,7 @@ occ_kernel:
 .amdhsa_kernel occ_kernel
     .amdhsa_next_free_vgpr 256
     .amdhsa_next_free_sgpr 72                  // body uses up to s69 (s66=n_kseg s67=mask s68=shift s69=chunkHi, FIX 1)
-    .amdhsa_group_segment_fixed_size 32768
+    .amdhsa_group_segment_fixed_size 65536     // FIX 1a ring: D=2 needs 33024B (RGA-analysis descriptor only)
     .amdhsa_user_sgpr_count 15                 // FIX 1(g): v2 contract now s0..s14 only (n_kseg/TOTAL_super/
                                                 //   magic_kseg dropped -- derived in-kernel / memory-carried)
     .amdhsa_wavefront_size32 1
@@ -1870,7 +1685,7 @@ amdhsa.kernels:
     .symbol:          occ_kernel.kd
     .kernarg_segment_size: 60
     .kernarg_segment_align: 8
-    .group_segment_fixed_size: 32768
+    .group_segment_fixed_size: 65536
     .private_segment_fixed_size: 0
     .wavefront_size:  32
     .sgpr_count:      72
