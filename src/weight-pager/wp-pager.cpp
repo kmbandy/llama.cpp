@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
+#include "wp-eval-cb.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -60,6 +61,7 @@ constexpr const char * kEnvDisableGraphs = "GGML_CUDA_DISABLE_GRAPHS";
 constexpr const char * kEnvWpHipGraphs   = "WP_HIP_GRAPHS";
 constexpr const char * kEnvWpAsyncEnsure = "WP_ASYNC_ENSURE";
 constexpr const char * kEnvWpHostBudgetBytes = "WP_HOST_BUDGET_BYTES";
+constexpr const char * kEnvWpGraphPinMax = "WP_GRAPH_PIN_MAX";
 
 bool env_flag_is_one(const char * var) {
     const char * v = std::getenv(var);
@@ -80,6 +82,34 @@ size_t env_size_bytes(const char * var) {
         return 0;
     }
     return (size_t) n;
+}
+
+int env_nonnegative_int(const char * var, int fallback) {
+    const char * v = std::getenv(var);
+    if (v == nullptr || v[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    long n = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || (end != nullptr && *end != '\0') || n < 0) {
+        LLAMA_LOG_WARN("wp::WeightPager: ignoring invalid %s=%s\n", var, v);
+        return fallback;
+    }
+    return (int) n;
+}
+
+void log_graph_pin_degrade(int page_idx, int slot, int max_slots) {
+    static int s_logs = 0;
+    if (s_logs < 8) {
+        LLAMA_LOG_WARN("wp::WeightPager: graph pin cap reached for page=%d slot=%d "
+                       "(WP_GRAPH_PIN_MAX effective cap=%d); using non-graph pointer for this page\n",
+                       page_idx, slot, max_slots);
+    } else if (s_logs == 8) {
+        LLAMA_LOG_WARN("wp::WeightPager: suppressing further graph pin cap logs\n");
+    }
+    ++s_logs;
 }
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
@@ -324,6 +354,7 @@ void WeightPager::shutdown() {
     }
 
     log_stats_summary();
+    weight_pager_eval_cb_reset(this);
     release_graph_pins_();
     for (int evt : page_async_event_) {
         if (evt >= 0) {
@@ -390,6 +421,36 @@ void WeightPager::release_graph_pins_() {
         }
     }
     graph_pin_slots_.clear();
+}
+
+int WeightPager::graph_pin_max_slots_() const {
+    const int n_slots = cfg_.n_slots > 0 ? cfg_.n_slots : 0;
+    const int floor = std::max(1, cfg_.prefetch_depth + 1);
+    const int hard_max = std::max(0, n_slots - floor);
+    const int requested = env_nonnegative_int(kEnvWpGraphPinMax, hard_max);
+    return std::min(requested, hard_max);
+}
+
+int WeightPager::graph_pin_slot_count_except_(const void * graph_key) const {
+    std::vector<int> slots;
+    for (const auto & kv : graph_pin_slots_) {
+        if (kv.first == graph_key) {
+            continue;
+        }
+        for (int slot : kv.second) {
+            bool seen = false;
+            for (int s : slots) {
+                if (s == slot) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                slots.push_back(slot);
+            }
+        }
+    }
+    return (int) slots.size();
 }
 
 void WeightPager::on_pool_evict_(int slot_idx) {
@@ -547,6 +608,16 @@ void WeightPager::update_graph_pins(const void * graph_key, const std::vector<in
         }
     }
 
+    const int max_slots = graph_pin_max_slots_();
+    const int existing_slots = graph_pin_slot_count_except_(graph_key);
+    const int room = std::max(0, max_slots - existing_slots);
+    if ((int) slots.size() > room) {
+        for (size_t i = (size_t) room; i < slots.size(); ++i) {
+            log_graph_pin_degrade(/*page_idx=*/-1, slots[i], max_slots);
+        }
+        slots.resize((size_t) room);
+    }
+
     auto it = graph_pin_slots_.find(graph_key);
     if (it != graph_pin_slots_.end() && it->second == slots) {
         return;
@@ -567,6 +638,51 @@ void WeightPager::update_graph_pins(const void * graph_key, const std::vector<in
         pool_.pin_slot(slot);
     }
     graph_pin_slots_.emplace(graph_key, std::move(slots));
+}
+
+bool WeightPager::try_add_graph_pin_page(const void * graph_key, int page_idx, std::vector<int> & page_indices) const {
+    if (!initialized_ || !hip_graphs_enabled_ || graph_key == nullptr) {
+        return false;
+    }
+
+    const int slot = slot_for_page(page_idx);
+    if (slot < 0) {
+        return false;
+    }
+
+    std::vector<int> selected_slots;
+    selected_slots.reserve(page_indices.size());
+    for (int p : page_indices) {
+        const int s = slot_for_page(p);
+        if (s < 0) {
+            continue;
+        }
+        bool seen = false;
+        for (int existing : selected_slots) {
+            if (existing == s) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            selected_slots.push_back(s);
+        }
+        if (p == page_idx || s == slot) {
+            return true;
+        }
+    }
+
+    const int max_slots = graph_pin_max_slots_();
+    const int existing_slots = graph_pin_slot_count_except_(graph_key);
+    if (existing_slots + (int) selected_slots.size() + 1 > max_slots) {
+        // Full lifetime-correct graph pinning needs per-node graph arg patching
+        // and release on graph recapture/destroy; that remains hardware work.
+        log_graph_pin_degrade(page_idx, slot, max_slots);
+        return false;
+    }
+
+    page_indices.push_back(page_idx);
+    return true;
 }
 
 void * WeightPager::ensure(int page_idx) {

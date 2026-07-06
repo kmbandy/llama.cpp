@@ -49,8 +49,87 @@ struct PendingAsyncOp {
     std::vector<int> transfer_events;
     hipEvent_t       done = nullptr;
 };
+
+std::vector<int>            s_pinned_pages_prev_op;
+std::vector<int>            s_async_events_prev_op;
+std::vector<PendingAsyncOp> s_pending_async_ops;
+WeightPager *               s_prev_op_pager = nullptr;
+
+void release_async_op(PendingAsyncOp & op) {
+    WeightPager * owner = op.pager;
+    for (int page_idx : op.pages) {
+        if (owner != nullptr) {
+            owner->unpin_page(page_idx);
+        }
+    }
+    for (int evt : op.transfer_events) {
+        if (owner != nullptr) {
+            owner->release_async_transfer_event(evt);
+        }
+    }
+    if (op.done != nullptr) {
+        (void) hipEventDestroy(op.done);
+        op.done = nullptr;
+    }
+}
+#else
+std::vector<int> s_pinned_pages_prev_op;
 #endif
 }  // namespace
+
+void weight_pager_eval_cb_reset(WeightPager * pager) {
+#if defined(GGML_USE_HIP)
+    if (pager == nullptr || !pager->async_ensure_enabled()) {
+        return;
+    }
+
+    for (size_t i = 0; i < s_pending_async_ops.size();) {
+        PendingAsyncOp & op = s_pending_async_ops[i];
+        if (op.pager != pager) {
+            ++i;
+            continue;
+        }
+
+        if (op.done != nullptr) {
+            hipError_t st = hipEventSynchronize(op.done);
+            if (st != hipSuccess) {
+                LLAMA_LOG_WARN("[wp::eval_cb] async pin completion drain failed: %s\n",
+                               hipGetErrorString(st));
+            }
+        } else {
+            (void) hipDeviceSynchronize();
+        }
+        release_async_op(op);
+        s_pending_async_ops.erase(s_pending_async_ops.begin() + (std::ptrdiff_t) i);
+    }
+
+    if (s_prev_op_pager == pager &&
+        (!s_pinned_pages_prev_op.empty() || !s_async_events_prev_op.empty())) {
+        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+        if (wp_stream != nullptr) {
+            hipError_t st = hipStreamSynchronize(wp_stream);
+            if (st != hipSuccess) {
+                LLAMA_LOG_WARN("[wp::eval_cb] previous-op drain stream sync failed: %s\n",
+                               hipGetErrorString(st));
+            }
+        } else {
+            (void) hipDeviceSynchronize();
+        }
+
+        for (int page_idx : s_pinned_pages_prev_op) {
+            pager->unpin_page(page_idx);
+        }
+        for (int evt : s_async_events_prev_op) {
+            pager->release_async_transfer_event(evt);
+        }
+        s_pinned_pages_prev_op.clear();
+        s_async_events_prev_op.clear();
+        s_prev_op_pager = nullptr;
+    }
+#else
+    (void) pager;
+#endif
+}
 
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // Only act on the pre-execution call. The post-execution call is
@@ -78,30 +157,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ggml_cuda_discard_routed_expert_ptrs();
 #endif
 
-    static std::vector<int> s_pinned_pages_prev_op;
 #if defined(GGML_USE_HIP)
-    static std::vector<int>            s_async_events_prev_op;
-    static std::vector<PendingAsyncOp> s_pending_async_ops;
-    static WeightPager *               s_prev_op_pager = nullptr;
-
-    auto release_async_op = [](PendingAsyncOp & op) {
-        WeightPager * owner = op.pager;
-        for (int page_idx : op.pages) {
-            if (owner != nullptr) {
-                owner->unpin_page(page_idx);
-            }
-        }
-        for (int evt : op.transfer_events) {
-            if (owner != nullptr) {
-                owner->release_async_transfer_event(evt);
-            }
-        }
-        if (op.done != nullptr) {
-            hipEventDestroy(op.done);
-            op.done = nullptr;
-        }
-    };
-
     if (pager->async_ensure_enabled()) {
         for (size_t i = 0; i < s_pending_async_ops.size();) {
             hipError_t st = hipEventQuery(s_pending_async_ops[i].done);
@@ -193,8 +249,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #endif
 
     std::vector<int> graph_pin_page_indices;
-    auto capture_ptr_for_page = [pager](int page_idx, void * current) -> void * {
+    auto capture_ptr_for_page = [pager, t, &graph_pin_page_indices](int page_idx, void * current) -> void * {
         if (!pager->hip_graphs_enabled()) {
+            return current;
+        }
+        if (!pager->try_add_graph_pin_page((const void *) t, page_idx, graph_pin_page_indices)) {
             return current;
         }
         const int slot = pager->slot_for_page(page_idx);
@@ -424,9 +483,6 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #if defined(GGML_USE_HIP)
                                             s_prev_op_pager = pager;
 #endif
-                                            if (pager->hip_graphs_enabled()) {
-                                                graph_pin_page_indices.push_back(sub_page_idx);
-                                            }
                                         }
                                     }
                                     // Safety: fill INACTIVE expert slots with a non-null
@@ -813,9 +869,6 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #if defined(GGML_USE_HIP)
         s_prev_op_pager = pager;
 #endif
-        if (pager->hip_graphs_enabled()) {
-            graph_pin_page_indices.push_back(page_idx);
-        }
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
 

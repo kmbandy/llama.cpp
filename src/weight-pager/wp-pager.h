@@ -216,6 +216,7 @@ public:
     // page_indices, unpinning the old exact slots first. No-op unless
     // WP_HIP_GRAPHS=1.
     void update_graph_pins(const void * graph_key, const std::vector<int> & page_indices);
+    bool try_add_graph_pin_page(const void * graph_key, int page_idx, std::vector<int> & page_indices) const;
 
     // Stable slot base address for capture. Valid for the pool lifetime.
     void * slot_base_for_capture(int slot_idx) const { return pool_.slot_base_for_capture(slot_idx); }
@@ -236,6 +237,8 @@ private:
     void record_page_in_(size_t bytes, double seconds);
     void restore_disable_graphs_env_();
     void release_graph_pins_();
+    int  graph_pin_max_slots_() const;
+    int  graph_pin_slot_count_except_(const void * graph_key) const;
 
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;

@@ -24,4 +24,7 @@ class WeightPager;
 // returns true (no-op).
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
+// Drain eval-callback state associated with pager before the pager tears down.
+void weight_pager_eval_cb_reset(WeightPager * pager);
+
 }  // namespace wp
