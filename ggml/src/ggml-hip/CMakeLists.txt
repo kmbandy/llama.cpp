@@ -195,6 +195,8 @@ endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
+target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math>")
+
 # AITER Triton AOT integration (MAD-188). Off by default; opt in with
 # -DGGML_HIP_AITER=ON. Adds AOT-compiled AITER unified_attention kernels plus
 # the mt_aiter_unified_attn wrapper to ggml-hip. Source code dispatches on the
