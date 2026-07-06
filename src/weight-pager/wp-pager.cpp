@@ -13,6 +13,9 @@
 
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime.h>
+
+extern "C++" void ggml_cuda_get_routed_expert_ptrs_stats(
+    uint64_t * set, uint64_t * consumed, uint64_t * discarded_unconsumed);
 #endif
 
 namespace wp {
@@ -408,6 +411,12 @@ void WeightPager::on_pool_evict_(int slot_idx) {
 const WeightPager::Stats & WeightPager::stats() const {
     stats_.lru_walk_hot_skips    = pool_.lru_walk_hot_skips();
     stats_.lru_walk_pinned_skips = pool_.lru_walk_pinned_skips();
+#if defined(GGML_USE_HIP)
+    ggml_cuda_get_routed_expert_ptrs_stats(
+        &stats_.routing_ptrs_set,
+        &stats_.routing_ptrs_consumed,
+        &stats_.routing_ptrs_discarded_unconsumed);
+#endif
     return stats_;
 }
 
@@ -451,7 +460,10 @@ void WeightPager::log_stats_summary() {
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
             "  cross_layer_hit_in_ensure: %lu\n"
-            "  host_tier_hits: %lu\n",
+            "  host_tier_hits: %lu\n"
+            "  routing_ptrs_set: %lu\n"
+            "  routing_ptrs_consumed: %lu\n"
+            "  routing_ptrs_discarded_unconsumed: %lu\n",
             (unsigned long) s.page_ins,
             (unsigned long) s.evictions,
             (unsigned long) s.prefetch_hits,
@@ -464,7 +476,10 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
             (unsigned long) s.cross_layer_hit_in_ensure,
-            (unsigned long) s.host_tier_hits);
+            (unsigned long) s.host_tier_hits,
+            (unsigned long) s.routing_ptrs_set,
+            (unsigned long) s.routing_ptrs_consumed,
+            (unsigned long) s.routing_ptrs_discarded_unconsumed);
         return;
     }
 
@@ -481,7 +496,10 @@ void WeightPager::log_stats_summary() {
         "  lru_walk_hot_skips: %lu\n"
         "  lru_walk_pinned_skips: %lu\n"
         "  cross_layer_prefetch_submitted: %lu\n"
-        "  cross_layer_hit_in_ensure: %lu\n",
+        "  cross_layer_hit_in_ensure: %lu\n"
+        "  routing_ptrs_set: %lu\n"
+        "  routing_ptrs_consumed: %lu\n"
+        "  routing_ptrs_discarded_unconsumed: %lu\n",
         (unsigned long) s.page_ins,
         (unsigned long) s.evictions,
         (unsigned long) s.prefetch_hits,
@@ -493,7 +511,10 @@ void WeightPager::log_stats_summary() {
         (unsigned long) s.lru_walk_hot_skips,
         (unsigned long) s.lru_walk_pinned_skips,
         (unsigned long) s.cross_layer_prefetch_submitted,
-        (unsigned long) s.cross_layer_hit_in_ensure);
+        (unsigned long) s.cross_layer_hit_in_ensure,
+        (unsigned long) s.routing_ptrs_set,
+        (unsigned long) s.routing_ptrs_consumed,
+        (unsigned long) s.routing_ptrs_discarded_unconsumed);
 }
 
 int WeightPager::slot_for_page(int page_idx) const {

@@ -62,6 +62,9 @@ public:
         uint64_t cross_layer_prefetch_submitted = 0;
         uint64_t cross_layer_hit_in_ensure      = 0;
         uint64_t host_tier_hits                 = 0;
+        uint64_t routing_ptrs_set                  = 0;
+        uint64_t routing_ptrs_consumed             = 0;
+        uint64_t routing_ptrs_discarded_unconsumed = 0;
     };
 
     WeightPager() = default;

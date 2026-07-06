@@ -5145,6 +5145,9 @@ void server_routes::init_routes() {
             add_wp_gauge("llama_weight_pager_lru_walk_pinned_skips_total", "Total LRU walk skips of pinned slots", (double) st.lru_walk_pinned_skips);
             add_wp_gauge("llama_weight_pager_cross_layer_prefetch_submitted_total", "Total successful cross-layer prefetch submissions", (double) st.cross_layer_prefetch_submitted);
             add_wp_gauge("llama_weight_pager_cross_layer_hit_in_ensure_total", "Total ensure-time hits from cross-layer prefetch candidates", (double) st.cross_layer_hit_in_ensure);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_set_total", "Total routed expert pointer arrays armed", (double) st.routing_ptrs_set);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_consumed_total", "Total routed expert pointer arrays consumed by MMQ/MMVQ", (double) st.routing_ptrs_consumed);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_discarded_unconsumed_total", "Total routed expert pointer arrays discarded before MMQ/MMVQ consumed them", (double) st.routing_ptrs_discarded_unconsumed);
         }
 
         std::stringstream prometheus;

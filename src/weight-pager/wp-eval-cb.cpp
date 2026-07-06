@@ -10,7 +10,7 @@
 // libggml-hip.so and we link against it. Avoids dragging the full
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
 extern "C++" void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
-extern "C++" const void * const *  ggml_cuda_take_routed_expert_ptrs();
+extern "C++" void                  ggml_cuda_discard_routed_expert_ptrs();
 extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 #endif
 
@@ -73,9 +73,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // ggml_cuda_has_routed_expert_ptrs() (or any path that calls
     // take_) gets a pointer to expert_ptrs that have nothing to do
     // with the current op, leading to near-null GPU faults during
-    // decode. Defensively consume here so the slate is clean before
+    // decode. Defensively discard here so the slate is clean before
     // we (maybe) set it again for this op.
-    ggml_cuda_take_routed_expert_ptrs();
+    ggml_cuda_discard_routed_expert_ptrs();
 #endif
 
     static std::vector<int> s_pinned_pages_prev_op;

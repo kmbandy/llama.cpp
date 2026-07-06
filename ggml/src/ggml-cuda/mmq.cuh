@@ -4224,6 +4224,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
 const void * const *  ggml_cuda_take_routed_expert_ptrs();
 bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
+void                  ggml_cuda_discard_routed_expert_ptrs();
+void                  ggml_cuda_get_routed_expert_ptrs_stats(
+    uint64_t * set, uint64_t * consumed, uint64_t * discarded_unconsumed);
+void                  ggml_cuda_wp_routing_guard_check(
+    const char * path, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
+    const void * const * expert_ptrs);
 
 // MAD-230: expose the CUDA backend's compute stream to libllama (weight
 // pager eval_cb) so it can use hipMemcpyAsync(stream) instead of a
@@ -4235,4 +4241,3 @@ bool                  ggml_cuda_has_routed_expert_ptrs();  // non-consuming peek
 // with cuda types.
 void   ggml_cuda_set_wp_compute_stream(void * stream);
 void * ggml_cuda_get_wp_compute_stream();
-
