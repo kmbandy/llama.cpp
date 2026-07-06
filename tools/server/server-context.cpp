@@ -3564,10 +3564,10 @@ private:
                                 // abort doesn't fire on this same iteration just
                                 // because we haven't built a token batch yet.
                                 n_empty_consecutive = 0;
-                                continue;
+                                return;
                             }
                         }
-                        continue;
+                        return;
                     }
                     // Slot was admitted — any prior no-progress streak ends here.
                     slot.paged_preempt_no_progress_count = 0;
@@ -4081,7 +4081,7 @@ private:
                         slot.i_batch   = batch.size() - 1;
 
                         slot.init_sampler();
-                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.size());
 
                         // MAD-129: prefill-time semantic fingerprint trigger.
                         // Walk the seq's COMPLETE blocks (skip the partial last
@@ -4531,12 +4531,12 @@ private:
                 slot.n_decoded += 1;
 
                 if (slot.n_decoded == 1) {
-                    slot.t_start_generation = t_current;
+                    slot.t_start_generation = t_now;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                     metrics.on_prompt_eval(slot);
                 }
 
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
                 if (slot.n_decoded % 64 == 0 || slot.n_decoded == 1) {
                     const float tps = slot.t_token_generation > 0
@@ -4545,16 +4545,7 @@ private:
                     const int32_t n_think = common_reasoning_budget_get_n_thinking(rbudget);
                     const auto    rb_st   = common_reasoning_budget_get_state(rbudget);
                     SLT_INF(slot, "generate: n_decoded=%d n_past=%d t/s=%.2f rbudget_state=%d n_thinking=%d token_id=%d\n",
-                            slot.n_decoded, slot.prompt.n_tokens(), tps, (int)rb_st, n_think, (int)id);
-                }
-
-                completion_token_output result;
-                result.tok          = id;
-                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-                if (slot.task->params.sampling.n_probs > 0) {
-                    populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                            slot.n_decoded, slot.prompt.n_tokens(), tps, (int)rb_st, n_think, (int)ids[i]);
                 }
 
                 if (!process_token(result, slot)) {
