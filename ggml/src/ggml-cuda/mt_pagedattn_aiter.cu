@@ -296,7 +296,7 @@ __global__ void mt_scatter_kv_turbo4_aiter_kernel(
     {
         float v_sq = x[j] * x[j];
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset);
+            v_sq += __shfl_xor_sync(0xffffffffu, v_sq, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = v_sq;
     }
@@ -332,7 +332,7 @@ __global__ void mt_scatter_kv_turbo4_aiter_kernel(
         const float c = TURBO_CENTROIDS_4BIT[idx];
         float rc = c * c;
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            rc += __shfl_xor_sync(0xffffffffu, rc, offset);
+            rc += __shfl_xor_sync(0xffffffffu, rc, offset, WARP_SIZE);
         }
         if (j % WARP_SIZE == 0) warp_accum[j / WARP_SIZE] = rc;
     }
@@ -456,7 +456,7 @@ __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     // ── Stage 2: per-block max-abs scale ──
     float v_abs = fabsf(x[j]);
     for (int off = 16; off > 0; off >>= 1) {
-        v_abs = fmaxf(v_abs, __shfl_xor_sync(0xffffffffffffffffull, v_abs, off));
+        v_abs = fmaxf(v_abs, __shfl_xor_sync(0xffffffffffffffffull, v_abs, off, WARP_SIZE));
     }
     __shared__ float warp_max[8];
     if ((j % 32) == 0) warp_max[j / 32] = v_abs;
@@ -496,7 +496,7 @@ __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     }
 
     const uint8_t my_nib      = (uint8_t)(best_idx & 0xF);
-    const uint8_t partner_nib = (uint8_t) __shfl_xor_sync(0xffffffffffffffffull, (int) my_nib, 1);
+    const uint8_t partner_nib = (uint8_t) __shfl_xor_sync(0xffffffffffffffffull, (int) my_nib, 1, WARP_SIZE);
     if ((j & 1) == 0) {
         blk[2 + j / 2] = my_nib | (uint8_t)(partner_nib << 4);
     }
@@ -504,8 +504,9 @@ __global__ void mt_scatter_kv_turbo4_fp8_aiter_kernel(
     const uint64_t sign_mask = __ballot_sync(0xffffffffffffffffull, sgn);
     if ((j & 7) == 0) {
         const int byte_idx = j / 8;
-        const int warp_off = (j % 32) / 8;
-        blk[130 + byte_idx] = (uint8_t)((sign_mask >> (warp_off * 8)) & 0xFF);
+        const int hw_lane_base = (threadIdx.x % warpSize) & ~(WARP_SIZE - 1);
+        const int bit_off = hw_lane_base + ((j % WARP_SIZE) & ~7);
+        blk[130 + byte_idx] = (uint8_t)((sign_mask >> bit_off) & 0xFF);
     }
 }
 

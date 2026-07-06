@@ -126,7 +126,7 @@ static __device__ __forceinline__ void coop_stage_turbo4_fp8_bs256_tile(
         // Broadcast scale from lane 0 to all 32 lanes of this warp.
         // 64-bit mask literal required on RDNA4 (gfx12, wave32) per
         // amd_warp_sync_functions.h static_assert.
-        scale_f = __shfl_sync(0xFFFFFFFFFFFFFFFFull, scale_f, 0);
+        scale_f = __shfl_sync(0xFFFFFFFFFFFFFFFFull, scale_f, 0, WARP_SIZE);
 
         // Read this lane's 4-byte qs window (8 nibbles) and 1-byte signs window.
         uint32_t qs_word = 0;
