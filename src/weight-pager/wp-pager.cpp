@@ -4,6 +4,7 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>      // getenv, setenv, unsetenv, malloc, free
 #include <cstring>
 #include <new>          // placement new
@@ -49,6 +50,10 @@ void env_restore(const char * var, bool present, const std::string & prior) {
 }
 
 constexpr const char * kEnvDisableGraphs = "GGML_CUDA_DISABLE_GRAPHS";
+
+double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
 
 }  // anonymous namespace
 
@@ -111,6 +116,7 @@ bool WeightPager::init(const Config &             cfg,
                        devices_used.front(), device_idx);
     }
 
+    stats_ = Stats{};
     cfg_ = cfg;
     if (cfg_.n_slots <= 0) cfg_.n_slots         = catalog_.size();  // pin everything if user didn't pick
     if (cfg_.prefetch_depth <= 0) cfg_.prefetch_depth = 4;
@@ -187,6 +193,8 @@ bool WeightPager::init(const Config &             cfg,
     // 5. Page-to-slot map + per-page loaded flag.
     page_to_slot_.assign((size_t) catalog_.size(), -1);
     page_loaded_.assign((size_t)  catalog_.size(), false);
+    cross_layer_prefetch_candidate_.assign((size_t) catalog_.size(), false);
+    prefetch_started_at_.assign((size_t) catalog_.size(), std::chrono::steady_clock::time_point{});
     slot_to_page_.assign((size_t) cfg_.n_slots,    -1);
 
     // 6. Shared sync staging buffer (max_page_size pinned host). Allocated
@@ -238,6 +246,8 @@ void WeightPager::shutdown() {
         return;
     }
 
+    log_stats_summary();
+
     // Tear down in reverse construction order.
     prefetch_.shutdown();
     file_io_.reset();
@@ -262,6 +272,8 @@ void WeightPager::shutdown() {
 
     page_to_slot_.clear();
     page_loaded_.clear();
+    cross_layer_prefetch_candidate_.clear();
+    prefetch_started_at_.clear();
     slot_to_page_.clear();
     catalog_.clear();
 
@@ -280,6 +292,66 @@ void WeightPager::on_pool_evict_(int slot_idx) {
         page_loaded_[page]  = false;
     }
     slot_to_page_[slot_idx] = -1;
+    ++stats_.evictions;
+}
+
+const WeightPager::Stats & WeightPager::stats() const {
+    stats_.lru_walk_hot_skips    = pool_.lru_walk_hot_skips();
+    stats_.lru_walk_pinned_skips = pool_.lru_walk_pinned_skips();
+    return stats_;
+}
+
+int WeightPager::loaded_pages() const {
+    int n = 0;
+    for (bool loaded : page_loaded_) {
+        if (loaded) ++n;
+    }
+    return n;
+}
+
+void WeightPager::record_page_in_(size_t bytes, double seconds) {
+    ++stats_.page_ins;
+    stats_.io_bytes += (uint64_t) bytes;
+    if (seconds > 0.0) {
+        stats_.io_seconds += seconds;
+    }
+}
+
+void WeightPager::log_stats_summary() {
+    const Stats & s = stats();
+    const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
+    const double hit_rate = prefetch_total > 0
+        ? 100.0 * (double) s.prefetch_hits / (double) prefetch_total
+        : 0.0;
+    const double gb_read = (double) s.io_bytes / 1000000000.0;
+    const double gbps = s.io_seconds > 0.0 ? gb_read / s.io_seconds : 0.0;
+
+    LLAMA_LOG_INFO(
+        "wp::WeightPager summary:\n"
+        "  page_ins: %lu\n"
+        "  evictions: %lu\n"
+        "  prefetch_hits: %lu\n"
+        "  prefetch_misses: %lu\n"
+        "  prefetch_hit_rate: %.2f%%\n"
+        "  io_gb_read: %.3f\n"
+        "  io_effective_gb_s: %.3f\n"
+        "  sync_fallbacks: %lu\n"
+        "  lru_walk_hot_skips: %lu\n"
+        "  lru_walk_pinned_skips: %lu\n"
+        "  cross_layer_prefetch_submitted: %lu\n"
+        "  cross_layer_hit_in_ensure: %lu\n",
+        (unsigned long) s.page_ins,
+        (unsigned long) s.evictions,
+        (unsigned long) s.prefetch_hits,
+        (unsigned long) s.prefetch_misses,
+        hit_rate,
+        gb_read,
+        gbps,
+        (unsigned long) s.sync_fallbacks,
+        (unsigned long) s.lru_walk_hot_skips,
+        (unsigned long) s.lru_walk_pinned_skips,
+        (unsigned long) s.cross_layer_prefetch_submitted,
+        (unsigned long) s.cross_layer_hit_in_ensure);
 }
 
 int WeightPager::slot_for_page(int page_idx) const {
@@ -300,21 +372,52 @@ void * WeightPager::ensure(int page_idx) {
         return m_check.resident_ptr;
     }
 
+    const bool cross_layer_candidate =
+        page_idx >= 0 &&
+        page_idx < (int) cross_layer_prefetch_candidate_.size() &&
+        cross_layer_prefetch_candidate_[page_idx];
+
     // Already committed? Bump LRU and return.
     if (page_loaded_[page_idx]) {
+        if (cross_layer_candidate) {
+            ++stats_.cross_layer_hit_in_ensure;
+            cross_layer_prefetch_candidate_[page_idx] = false;
+        }
         const int slot = page_to_slot_[page_idx];
         pool_.mark_used(slot);
         return slot_ptr_(slot);
     }
 
     // Slot reserved by an in-flight prefetch? Wait for it.
+    bool counted_prefetch_miss = false;
     int slot = page_to_slot_[page_idx];
     if (slot >= 0) {
+        const bool loaded_before_wait = prefetch_.is_loaded(page_idx);
+        if (loaded_before_wait) {
+            ++stats_.prefetch_hits;
+            if (cross_layer_candidate) {
+                ++stats_.cross_layer_hit_in_ensure;
+                cross_layer_prefetch_candidate_[page_idx] = false;
+            }
+        } else {
+            ++stats_.prefetch_misses;
+            counted_prefetch_miss = true;
+        }
         if (prefetch_.wait_for(page_idx, /*timeout_ms=*/-1)) {
             // Stage 2 done; commit and reap.
             page_loaded_[page_idx] = true;
             pool_.mark_used(slot);
             prefetch_.reap(page_idx);
+            double seconds = 0.0;
+            if (page_idx < (int) prefetch_started_at_.size() &&
+                prefetch_started_at_[page_idx] != std::chrono::steady_clock::time_point{}) {
+                seconds = seconds_since(prefetch_started_at_[page_idx]);
+                prefetch_started_at_[page_idx] = std::chrono::steady_clock::time_point{};
+            }
+            record_page_in_(m_check.size, seconds);
+            if (cross_layer_candidate && !loaded_before_wait) {
+                cross_layer_prefetch_candidate_[page_idx] = false;
+            }
             return slot_ptr_(slot);
         }
         // Prefetch failed; tear down the reservation so sync fallback can
@@ -327,6 +430,13 @@ void * WeightPager::ensure(int page_idx) {
     }
 
     // Synchronous fallback: read directly into a slot.
+    if (page_idx < (int) cross_layer_prefetch_candidate_.size()) {
+        cross_layer_prefetch_candidate_[page_idx] = false;
+    }
+    if (!counted_prefetch_miss) {
+        ++stats_.prefetch_misses;
+    }
+    ++stats_.sync_fallbacks;
     slot = page_in_sync_(page_idx);
     if (slot < 0) return nullptr;
     return slot_ptr_(slot);
@@ -356,6 +466,14 @@ void WeightPager::prefetch_page(int page_idx) {
         page_to_slot_[page_idx] = -1;
         slot_to_page_[slot]     = -1;
         pool_.release_slot(slot);
+    } else {
+        if (page_idx < (int) prefetch_started_at_.size()) {
+            prefetch_started_at_[page_idx] = std::chrono::steady_clock::now();
+        }
+        if (page_idx < (int) cross_layer_prefetch_candidate_.size() &&
+            cross_layer_prefetch_candidate_[page_idx]) {
+            ++stats_.cross_layer_prefetch_submitted;
+        }
     }
 }
 
@@ -434,6 +552,16 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices) {
         }
         return false;
     }
+    const auto now = std::chrono::steady_clock::now();
+    for (int page_idx : needed) {
+        if (page_idx < (int) prefetch_started_at_.size()) {
+            prefetch_started_at_[page_idx] = now;
+        }
+        if (page_idx < (int) cross_layer_prefetch_candidate_.size() &&
+            cross_layer_prefetch_candidate_[page_idx]) {
+            ++stats_.cross_layer_prefetch_submitted;
+        }
+    }
     return true;
 }
 
@@ -489,6 +617,15 @@ void WeightPager::advise_layer_lookahead(int block_idx, int k) {
     }
 }
 
+void WeightPager::mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices) {
+    if (!initialized_) return;
+    for (int page_idx : page_indices) {
+        if (page_idx < 0 || page_idx >= (int) cross_layer_prefetch_candidate_.size()) continue;
+        if (catalog_.at(page_idx).is_pinned) continue;
+        cross_layer_prefetch_candidate_[page_idx] = true;
+    }
+}
+
 int WeightPager::page_in_sync_(int page_idx) {
     // Synchronous read into a fresh slot, bypassing the prefetch pipeline.
     // Used by ensure() on miss. Tries the fast staging path through the
@@ -503,6 +640,8 @@ int WeightPager::page_in_sync_(int page_idx) {
                         s_diag_count, page_idx, dm.tensor_name.c_str(),
                         (unsigned) dm.file_idx, (unsigned long) dm.file_offset, dm.size);
     }
+
+    const auto io_t0 = std::chrono::steady_clock::now();
 
     const int slot = pool_.alloc_slot();
     if (slot < 0) return -1;
@@ -566,6 +705,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     page_to_slot_[page_idx] = slot;
     page_loaded_[page_idx]  = true;
     slot_to_page_[slot]     = page_idx;
+    record_page_in_(m.size, seconds_since(io_t0));
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT slot=%d\n", s_diag_count, slot);
     ++s_diag_count;
     return slot;

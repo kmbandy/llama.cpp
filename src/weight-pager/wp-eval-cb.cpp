@@ -468,6 +468,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 }
                                             }
                                             if (!future_pages.empty()) {
+                                                pager->mark_cross_layer_prefetch_candidates(future_pages);
                                                 const bool batch_ok = pager->prefetch_pages_batch(future_pages);
                                                 if (!batch_ok) {
                                                     // Per-page fallback (best-effort, ignores

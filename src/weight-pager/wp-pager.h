@@ -24,6 +24,8 @@
 #include "wp-prefetch.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,6 +44,20 @@ public:
         int  n_slots         = 0;     // size of the VRAM ring; -1 / 0 = auto (one per layer)
         int  prefetch_depth  = 4;     // PrefetchScheduler queue depth
         bool prefer_async_io = true;  // try io_uring for stage 1 before SyncPread
+    };
+
+    struct Stats {
+        uint64_t page_ins                       = 0;
+        uint64_t evictions                      = 0;
+        uint64_t prefetch_hits                  = 0;
+        uint64_t prefetch_misses                = 0;
+        uint64_t sync_fallbacks                 = 0;
+        uint64_t io_bytes                       = 0;
+        double   io_seconds                     = 0.0;
+        uint64_t lru_walk_hot_skips             = 0;
+        uint64_t lru_walk_pinned_skips          = 0;
+        uint64_t cross_layer_prefetch_submitted = 0;
+        uint64_t cross_layer_hit_in_ensure      = 0;
     };
 
     WeightPager() = default;
@@ -106,6 +122,10 @@ public:
     int    n_pages()                            const { return catalog_.size(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
+    const Stats & stats() const;
+    int    loaded_pages() const;
+    int    pending_prefetches() const { return prefetch_.pending(); }
+    bool   async_prefetch_enabled() const { return cfg_.prefer_async_io; }
 
     // Ensure a page is in VRAM, returning the slot pointer. Synchronous
     // fallback if the page is not (yet) prefetched. Returns nullptr if
@@ -141,6 +161,11 @@ public:
     // pressure; on RAM-tight systems keep k low or disable via
     // WP_FADVISE_LOOKAHEAD=0.
     void advise_layer_lookahead(int block_idx, int k);
+
+    // MAD-233 aggregate instrumentation. The eval callback marks candidate
+    // pages before issuing cross-layer prefetches; successful scheduler
+    // submissions and later ensure-time hits are folded into Stats.
+    void mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices);
 
     // Drive the prefetch pipeline forward. Idempotent and non-blocking.
     void tick();
@@ -181,6 +206,9 @@ private:
     // PoolAllocator's eviction callback — clears page_to_slot_[evicted].
     void on_pool_evict_(int slot_idx);
 
+    void log_stats_summary();
+    void record_page_in_(size_t bytes, double seconds);
+
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;
 
@@ -197,12 +225,15 @@ private:
     // OR prefetch stage 2 completed and reaped). False means slot is
     // reserved but the bytes aren't there yet.
     std::vector<bool> page_loaded_;
+    std::vector<bool> cross_layer_prefetch_candidate_;
+    std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
     // Reverse map: slot_idx -> page_idx (or -1 if free). Used by the
     // eviction callback to clear page_to_slot_ / page_loaded_ correctly.
     std::vector<int> slot_to_page_;
 
     Config cfg_;
     bool   initialized_ = false;
+    mutable Stats stats_;
 
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).
     bool        env_was_present_ = false;
