@@ -198,6 +198,12 @@ bool WeightPager::init(const Config &             cfg,
     cfg_ = cfg;
     if (cfg_.n_slots <= 0) cfg_.n_slots         = catalog_.size();  // pin everything if user didn't pick
     if (cfg_.prefetch_depth <= 0) cfg_.prefetch_depth = 4;
+    if (cfg_.io_uring_depth <= 0) cfg_.io_uring_depth = cfg_.prefetch_depth;
+    if (cfg_.io_uring_depth < cfg_.prefetch_depth) {
+        LLAMA_LOG_WARN("wp::WeightPager: io_uring_depth=%d below prefetch_depth=%d; raising to %d\n",
+                       cfg_.io_uring_depth, cfg_.prefetch_depth, cfg_.prefetch_depth);
+        cfg_.io_uring_depth = cfg_.prefetch_depth;
+    }
 
     // Snapshot env BEFORE we touch it.
     env_snapshot(kEnvDisableGraphs, env_was_present_, env_prior_value_);
@@ -262,7 +268,7 @@ bool WeightPager::init(const Config &             cfg,
         (size_t) cfg_.n_slots * slot_size,
     };
     file_io_ = create_file_io(std::move(fds), cfg_.prefer_async_io,
-                              cfg_.prefetch_depth, &p2p_cfg);
+                              cfg_.io_uring_depth, &p2p_cfg);
     if (!file_io_) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: file IO layer init failed\n");
         transport_.shutdown();
@@ -333,10 +339,10 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     initialized_ = true;
-    LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+    LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
                    catalog_.size(), cfg_.n_slots, slot_size,
                    (double) cfg_.n_slots * (double) slot_size / 1048576.0,
-                   cfg_.prefetch_depth, (int) sync_staging_pinned_,
+                   cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
                    (int) async_ensure_enabled_);
     return true;
 }

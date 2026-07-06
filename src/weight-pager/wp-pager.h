@@ -46,6 +46,7 @@ public:
     struct Config {
         int  n_slots         = 0;     // size of the VRAM ring; -1 / 0 = auto (one per layer)
         int  prefetch_depth  = 4;     // PrefetchScheduler queue depth
+        int  io_uring_depth  = 0;     // FileIOLayer SQ depth; 0 = prefetch_depth
         bool prefer_async_io = true;  // try io_uring for stage 1 before SyncPread
     };
 

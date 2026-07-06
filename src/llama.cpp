@@ -14,6 +14,8 @@
 #include "weight-pager/wp-pager.h"
 #include "weight-pager/wp-file-io.h"
 
+#include <cerrno>
+#include <climits>
 #include <cstdlib>  // strtol
 
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
@@ -61,6 +63,32 @@ static int parse_backend_dev_idx(const char * dev_name) {
     long v = std::strtol(p, &end, 10);
     if (end == p) return -1;
     return (int) v;
+}
+
+static int parse_positive_int_env(const char * var, int fallback) {
+    const char * v = std::getenv(var);
+    if (v == nullptr || v[0] == '\0') {
+        return fallback;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (errno != 0 || end == v || (end != nullptr && *end != '\0') || n <= 0 || n > INT_MAX) {
+        LLAMA_LOG_WARN("%s: ignoring invalid %s=%s\n", __func__, var, v);
+        return fallback;
+    }
+    return (int) n;
+}
+
+static int wp_prefetch_depth_from_env() {
+    static const int value = parse_positive_int_env("WP_PREFETCH_DEPTH", 4);
+    return value;
+}
+
+static int wp_iouring_depth_override_from_env() {
+    static const int value = parse_positive_int_env("WP_IOURING_DEPTH", 0);
+    return value;
 }
 
 static bool init_weight_pager(llama_model & model, llama_model_loader & ml, const llama_model_params & params) {
@@ -202,8 +230,19 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     //    confirms one buft, so we pass {device_idx} as devices_used.
     wp::WeightPager::Config cfg;
     cfg.n_slots         = n_slots;
-    cfg.prefetch_depth  = 4;
+    cfg.prefetch_depth  = wp_prefetch_depth_from_env();
+    cfg.io_uring_depth  = wp_iouring_depth_override_from_env();
+    if (cfg.io_uring_depth <= 0) {
+        cfg.io_uring_depth = cfg.prefetch_depth;
+    }
+    if (cfg.io_uring_depth < cfg.prefetch_depth) {
+        LLAMA_LOG_WARN("%s: WP_IOURING_DEPTH effective value %d is below prefetch_depth %d; raising to %d\n",
+                       __func__, cfg.io_uring_depth, cfg.prefetch_depth, cfg.prefetch_depth);
+        cfg.io_uring_depth = cfg.prefetch_depth;
+    }
     cfg.prefer_async_io = params.weight_paging_prefetch;
+    LLAMA_LOG_INFO("%s: weight pager depths: prefetch_depth=%d, io_uring_depth=%d\n",
+                   __func__, cfg.prefetch_depth, cfg.io_uring_depth);
 
     if (!model.wp_pager->init(cfg, buft, device_idx,
                               std::move(fds),
@@ -810,4 +849,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-
