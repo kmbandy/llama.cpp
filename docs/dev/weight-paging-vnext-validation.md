@@ -33,6 +33,25 @@ actually compiled with liburing — treat compile errors there as the first thin
 | P4 | host-tier pinned slab cache | `WP_HOST_BUDGET_BYTES=<bytes>` (+`WP_PIN_HOST=1`) | **Conditional — only enable if P0's baseline shows a high cold-miss rate that P3 P2P doesn't already solve.** Slab/LRU logic is unit-tested; validate the RAM→VRAM hit path lowers cold-miss + raises t/s on a working-set-exceeds-VRAM model. `WP_PIN_HOST` must gracefully fall back on memlock-ulimit and skip on UMA. |
 | P5 | routing hardening | `WP_ROUTING_GUARD=1` | Counters are always-on: confirm `routing_ptrs_discarded_unconsumed` reads **0** across a clean decode (nonzero = MAD-230 leak-class recurrence). Run one decode with `WP_ROUTING_GUARD=1` and confirm no abort (invariant holds). |
 
+## Post-P0..P5 speed levers (Fable gates #4 / #5)
+
+Two additional default-off commits landed after the P0..P5 stack, targeting decode
+throughput once correctness is established:
+
+| Commit | Lever | Flag(s) (default) | What to validate |
+|---|---|---|---|
+| gate #4 | env-tunable prefetch + io_uring queue depth | `WP_PREFETCH_DEPTH=<N>` (4), `WP_IOURING_DEPTH=<N>` (derives from prefetch_depth, clamped ≥ prefetch_depth) | Defaults byte-identical. Sweep `WP_PREFETCH_DEPTH` (e.g. 4/8/16/32) with `--weight-paging-prefetch` + `WP_DENSE_PREFETCH_N` and watch `io_effective_gb_s` climb off the QD≈1 ceiling (~1.6 GB/s measured). SQ depth is coupled to prefetch_depth by default; `WP_IOURING_DEPTH` raises it independently. |
+| gate #5 | size-class VRAM slots | `WP_SIZE_CLASS_SLOTS=1` | **The structural residency unblock.** Fixed slots = max_page_size each, so the 27B holds only ~64 pages resident and paged decode is I/O-bound (re-pages every token). Size-class packs pages by actual size → far more resident → higher prefetch hit-rate, and shrinks the padding memset to near-zero. Prove PPL identical to fixed mode first, then measure resident-page count + prefetch hit-rate + decode t/s. **This is the enabler for MoE decode approaching active-params speed and for P1 graphs to matter (decode must be launch-bound, not I/O-bound).** |
+
+**KNOWN RISK on `WP_SIZE_CLASS_SLOTS=1` — watch for this on hardware:** size-class
+eviction can only reclaim a slot of class **≥** the requested page size (no coalescing of
+several small unpinned slots into one large slot). A large **required** page can therefore
+get `alloc_slot → -1` in `page_in_sync_` even when smaller slots are evictable — fixed mode
+never fails this way. Symptom to watch: `wp::PoolAllocator::alloc_slot: no unpinned
+size-class slot can fit …` WARN followed by a page-in failure / degraded output. If it bites,
+fix direction is to reserve N max-size slots at the arena top, or add slot compaction. It is
+gated off, so the branch default is unaffected.
+
 ## Recommended validation order
 
 1. **P0 baseline** — measure current paged decode (dense first: `Qwen3.5-4B-UD-IQ3_XXS`,
