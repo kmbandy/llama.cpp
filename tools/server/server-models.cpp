@@ -739,8 +739,14 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     }
     meta.placement.exclusive = meta.placement.devs.size() > 1;
 
+    std::vector<int64_t> needs;
     lk.unlock();
-    std::vector<int64_t> needs = estimate_need_bytes(meta);
+    try {
+        needs = estimate_need_bytes(meta);
+    } catch (...) {
+        lk.lock();
+        throw;
+    }
     lk.lock();
 
     if (meta.placement.exclusive) {
@@ -766,6 +772,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         }
 
         std::vector<std::string> evict = choose_gpu_evictions_locked(name, meta.placement);
+        reserve_gpu_placement_locked(name, meta.placement);
         for (const auto & victim : evict) {
             SRV_INF("router placement evicting name=%s for spanning model %s\n", victim.c_str(), name.c_str());
             stopping_models.insert(victim);
@@ -786,7 +793,6 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
                 return true;
             });
         }
-        reserve_gpu_placement_locked(name, meta.placement);
         return;
     }
 
@@ -844,7 +850,18 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
                 cand.newest_last_used = resident.first;
                 auto it = mapping.find(resident.second);
                 if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
-                    free += it->second.meta.placement.need_bytes_per_dev.front();
+                    const auto & victim_placement = it->second.meta.placement;
+                    auto dev_it = std::find(victim_placement.devs.begin(), victim_placement.devs.end(), slot.dev_name);
+                    if (dev_it != victim_placement.devs.end()) {
+                        size_t dev_idx = std::distance(victim_placement.devs.begin(), dev_it);
+                        if (dev_idx < victim_placement.need_bytes_per_dev.size()) {
+                            free += victim_placement.need_bytes_per_dev[dev_idx];
+                        } else {
+                            free += victim_placement.need_bytes_per_dev.front();
+                        }
+                    } else {
+                        free += victim_placement.need_bytes_per_dev.front();
+                    }
                 }
             }
             if (free < need + ROUTER_GPU_MARGIN_BYTES) {
@@ -862,6 +879,10 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         best_idx = best->idx;
         evict = best->victims;
     }
+
+    meta.placement.devs = { gpu_slots[best_idx].dev_name };
+    meta.placement.need_bytes_per_dev = { need };
+    reserve_gpu_placement_locked(name, meta.placement);
 
     for (const auto & victim : evict) {
         SRV_INF("router placement evicting name=%s for model %s\n", victim.c_str(), name.c_str());
@@ -883,10 +904,6 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             return true;
         });
     }
-
-    meta.placement.devs = { gpu_slots[best_idx].dev_name };
-    meta.placement.need_bytes_per_dev = { need };
-    reserve_gpu_placement_locked(name, meta.placement);
 }
 
 void server_models::notify_sse(const std::string & event, const std::string & model_id, const json & data) {
@@ -1426,7 +1443,60 @@ void server_models::load(const std::string & name, const load_options & opts) {
         return;
     }
 
+    bool marked_loading = false;
+    if (gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && !opts.custom_meta.has_value()) {
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            it->second.meta.status = SERVER_MODEL_STATUS_LOADING;
+            marked_loading = true;
+            cv.notify_all();
+        }
+    }
+
+    bool placement_reserved = false;
+    auto rollback_gpu_reservation = [&]() {
+        if (!placement_reserved) {
+            return;
+        }
+        for (size_t i = 0; i < meta.placement.devs.size() && i < meta.placement.need_bytes_per_dev.size(); ++i) {
+            const int slot_idx = find_slot_index(gpu_slots, meta.placement.devs[i]);
+            if (slot_idx < 0) {
+                continue;
+            }
+            auto & slot = gpu_slots[slot_idx];
+            slot.reserved_bytes = std::max<int64_t>(0, slot.reserved_bytes - meta.placement.need_bytes_per_dev[i]);
+            if (slot.exclusive_holder == name) {
+                slot.exclusive_holder.clear();
+            }
+        }
+        placement_reserved = false;
+    };
+    auto rollback_loading_status = [&]() {
+        if (!marked_loading) {
+            return;
+        }
+        auto it = mapping.find(name);
+        if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+            it->second.meta.status = SERVER_MODEL_STATUS_UNLOADED;
+        }
+        stopping_models.erase(name);
+        marked_loading = false;
+        cv.notify_all();
+        cv_stop.notify_all();
+    };
+    auto rollback_load_attempt = [&](void *) {
+        if (!lk.owns_lock()) {
+            lk.lock();
+        }
+        rollback_gpu_reservation();
+        rollback_loading_status();
+    };
+    std::unique_ptr<void, decltype(rollback_load_attempt)> load_attempt_guard(reinterpret_cast<void *>(1), rollback_load_attempt);
+
     ensure_gpu_placement(name, meta, opts.mode, lk);
+    if (gpu_placement_enabled && opts.mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.need_bytes_per_dev.empty()) {
+        placement_reserved = true;
+    }
 
     // Re-check capacity under the lock to prevent concurrent loads from
     // exceeding models_max. Without this, the window between unload_lru()
@@ -1489,20 +1559,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         inst.subproc->sproc.emplace();
         int result = subprocess_create_ex(argv.data(), options, envp.data(), &inst.subproc->get());
         if (result != 0) {
-            if (gpu_placement_enabled) {
-                for (size_t i = 0; i < inst.meta.placement.devs.size() && i < inst.meta.placement.need_bytes_per_dev.size(); ++i) {
-                    const int slot_idx = find_slot_index(gpu_slots, inst.meta.placement.devs[i]);
-                    if (slot_idx >= 0) {
-                        auto & slot = gpu_slots[slot_idx];
-                        slot.reserved_bytes = std::max<int64_t>(0, slot.reserved_bytes - inst.meta.placement.need_bytes_per_dev[i]);
-                        if (slot.exclusive_holder == name) {
-                            slot.exclusive_holder.clear();
-                        }
-                    }
-                }
-            }
+            load_attempt_guard.reset();
             throw std::runtime_error("failed to spawn server instance");
         }
+        load_attempt_guard.release();
     }
 
     // start a thread to manage the child process
