@@ -770,6 +770,7 @@ void process_shaders() {
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("turbo_wht_f32", "turbo_wht.comp", base_dict);
 
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
@@ -795,11 +796,55 @@ void process_shaders() {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
+    // turbo4_0: bespoke shader with self-contained WHT — cannot share copy_to_quant.comp template
+    string_to_spv("cpy_f32_turbo4_0", "cpy_f32_turbo4_0.comp", {});
 
     for (std::string t : {"f32", "f16", "bf16", "q1_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
         string_to_spv("set_rows_" + t + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
+    // turbo4_0: SET_ROWS only (no dequant/MMQ/get_rows). Bespoke COOPERATIVE shader
+    // (128 threads/block, shared-mem reduction) — the generic copy_to_quant serial path
+    // spilled large per-thread arrays and ran ~67x slower per call.
+    string_to_spv("set_rows_turbo4_0_i32", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("set_rows_turbo4_0_i64", "set_rows_f32_turbo4_0.comp", {{"SET_ROWS", "1"}, {"DATA_A_TURBO4_0", "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+    // SP2: paged attention (GGML_OP_PAGED_ATTN_MT). F16 cache path (Task 3).
+    // Shaders are type-generic via paged_cache_ops.glsl; Task 4 adds DATA_A_TURBO4_0.
+    string_to_spv("paged_attn_scatter_f16", "paged_attn_scatter.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_f16",         "paged_attn.comp",         {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_0", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_64", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_64_ol", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    // turbo4_64_ol8 / turbo4_64_ol12 (2026-07-01 outlier-matrix sweep): same
+    // DATA_A_TURBO4_64_OL shader source as the N=4 variant above, just
+    // parameterized with a different outlier count / channel list via
+    // PA_TURBO4_64_OL_N / PA_TURBO4_64_OL_CHANNELS_INIT (see
+    // paged_cache_ops.glsl / paged_attn_scatter.comp for the generalization).
+    // Channel lists MUST stay byte-for-byte identical to
+    // TURBO4_64_OL8_OUTLIER_CHANNELS / TURBO4_64_OL12_OUTLIER_CHANNELS in
+    // ggml-common.h.
+    string_to_spv("paged_attn_scatter_turbo4_64_ol8",  "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_turbo4_64_ol12", "paged_attn_scatter.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_scatter_q8_0",     "paged_attn_scatter.comp", {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_0",         "paged_attn.comp",         {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64",        "paged_attn.comp",        {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol",     "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol8",    "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_turbo4_64_ol12",   "paged_attn.comp",        {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_q8_0",             "paged_attn.comp",        {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
+
+    // SP2 Task 5: split-K decode (q_len==1 fast path). Per-type pass-1 decode
+    // (reuses the type-generic paged_cache_ops.glsl loads), plus ONE
+    // type-agnostic pass-2 reduce (log-sum-exp merge of the chunk partials).
+    string_to_spv("paged_attn_decode_f16",      "paged_attn_decode.comp", {{"DATA_A_F16","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_0", "paged_attn_decode.comp", {{"DATA_A_TURBO4_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol8",  "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","8u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_turbo4_64_ol12", "paged_attn_decode.comp", {{"DATA_A_TURBO4_64_OL","1"},{"PA_TURBO4_64_OL_N","12u"},{"PA_TURBO4_64_OL_CHANNELS_INIT","53u,49u,52u,20u,21u,54u,14u,15u,51u,26u,24u,23u"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_q8_0",     "paged_attn_decode.comp", {{"DATA_A_Q8_0","1"},{"D_TYPE","float16_t"}});
+    string_to_spv("paged_attn_decode_reduce",   "paged_attn_decode_reduce.comp", {{"D_TYPE","float16_t"}});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

@@ -2413,6 +2413,14 @@ struct test_set_rows : public test_case {
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
             return err_estimate;
         }
+        // turbo4_0: 4-bit transform quantizer; GPU/CPU both use same serial algorithm,
+        // so parity should be byte-exact. Allow Q4_0-equivalent tolerance as safety margin.
+        if (type == GGML_TYPE_TURBO4_0) {
+            double err_estimate = 1.0f/8.0f;
+            err_estimate *= err_estimate;
+            err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
+            return err_estimate;
+        }
         return 1e-7;
     }
 
@@ -2909,6 +2917,12 @@ struct test_cpy : public test_case {
     double max_nmse_err() override {
         if (type_src == type_dst) {
             return 0.0;
+        }
+        if (type_dst == GGML_TYPE_TURBO4_0) {
+            // turbo4_0: indices must be bit-exact with the CPU oracle (both use WHT + nearest centroid).
+            // Tolerance covers fp32 reduction-order differences in norm (affects stored fp16 norm by
+            // at most 1 ULP); one centroid mis-assignment would produce NMSE ~1e-4, failing the test.
+            return 1e-5;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -4162,6 +4176,30 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_HADAMARD";
+    }
+};
+
+// GGML_OP_TURBO_WHT — TurboQuant Walsh-Hadamard Transform (forward + inverse)
+struct test_turbo_wht : public test_case {
+    const int     direction;   // 0 = forward, 1 = inverse
+    const int64_t ne0;         // head_dim (must be divisible by group_size)
+    const int64_t n_rows;      // total rows
+    const int     group_size;  // 32, 64, or 128
+
+    std::string vars() override {
+        return VARS_TO_STR4(direction, ne0, n_rows, group_size);
+    }
+
+    test_turbo_wht(int direction = 0, int64_t ne0 = 128, int64_t n_rows = 1, int group_size = 128)
+        : direction(direction), ne0(ne0), n_rows(n_rows), group_size(group_size) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_rows);
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, group_size, nullptr);
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -7746,6 +7784,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    // turbo4_0 SET_ROWS: dst must be multiple of QUANT_K=128 in ne[0]
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I32, { 128, 5, 1, 3 }, { 1, 1 }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I64, { 128, 5, 1, 3 }, { 1, 1 }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_TURBO4_0, GGML_TYPE_I64, { 256, 3, 1, 2 }, { 1, 1 }, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -8170,6 +8212,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
 
+    // CPY f32 -> turbo4_0: bespoke Vulkan quantize shader (self-contained, bundles WHT)
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {128, 8, 1, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO4_0, {256, 4, 1, 1}));
+
     // CPY - different src/dst shapes (reshaping via CPY)
     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.
     // Each src permutation is tested against canonical sorted and reverse dst (skip self).
@@ -8384,13 +8430,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
-    // FWHT tests
+    // FWHT tests (MUL_MAT with Hadamard hint)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 1, 512));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 4, 128, {2, 3}));
+
+    // TURBO_WHT tests (GGML_OP_TURBO_WHT forward + inverse, d=128, rows 1 and 32)
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 1, 128));   // forward,  1 row
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));   // inverse,  1 row
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));  // forward, 32 rows
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));  // inverse, 32 rows
+    // gs=64 cases (LFM2.5 head_dim=64 production path)
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 1, 64));     // forward,  1 row,  gs=64
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 1, 64));     // inverse,  1 row,  gs=64
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 32, 64));    // forward, 32 rows, gs=64
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 32, 64));    // inverse, 32 rows, gs=64
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -9127,6 +9184,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
+    // turbo4_0 block is 128 elements; use hsk=hsv=128 to match a full block
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
@@ -9336,11 +9395,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
 
-    // FWHT tests
+    // FWHT tests (MUL_MAT with Hadamard hint)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 1, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 32, 128));
+
+    // TURBO_WHT tests (GGML_OP_TURBO_WHT forward + inverse, d=128, rows 1 and 32)
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 1, 128));
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 1, 128));
+    test_cases.emplace_back(new test_turbo_wht(0, 128, 32, 128));
+    test_cases.emplace_back(new test_turbo_wht(1, 128, 32, 128));
+    // gs=64 cases (LFM2.5 head_dim=64 production path)
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 1, 64));
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 1, 64));
+    test_cases.emplace_back(new test_turbo_wht(0, 64, 32, 64));
+    test_cases.emplace_back(new test_turbo_wht(1, 64, 32, 64));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));

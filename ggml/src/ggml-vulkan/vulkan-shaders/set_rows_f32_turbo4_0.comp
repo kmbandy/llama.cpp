@@ -1,0 +1,178 @@
+#version 450
+
+// set_rows_f32_turbo4_0.comp — f32 → GGML_TYPE_TURBO4_0 quantizing SET_ROWS
+// (KV-cache write path: scatter quantized rows to indexed destination positions).
+//
+// COOPERATIVE: one workgroup per 128-element block, 128 invocations cooperating via
+// shared memory (no large per-thread arrays — the serial copy_to_quant variant spilled
+// 3×128-float arrays to memory and ran ~67× slower). The quantize math is byte-identical
+// to the validated cpy_f32_turbo4_0.comp (replicates quantize_row_turbo4_0_ref):
+//   L2-norm → normalize → forward WHT → nearest centroid → norm-correction → nibble-pack.
+// Only the addressing differs: the destination block row is looked up from the index
+// buffer (SET_ROWS) instead of a linear copy.
+//
+// wave64-safe: shared-memory tree reductions, no subgroup ops.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+#extension GL_EXT_shader_16bit_storage                   : require
+#extension GL_EXT_shader_8bit_storage                    : require
+#extension GL_EXT_control_flow_attributes                : require
+
+#include "types.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Source f32 (binding 0). generic_binary_head also declares binding 0 (data_a, unused here).
+layout (binding = 0) readonly buffer S {float data_s[];};
+
+#include "generic_binary_head.glsl"
+
+// Index buffer (binding 1) and destination turbo4_0 blocks (binding 2).
+layout (binding = 1) readonly buffer C {B_TYPE data_i[];};
+layout (binding = 2) writeonly buffer Q {block_turbo4_0 data_q[];};
+
+#if B_SIZE == 64
+#define DATA_I_SWIZZLE .x
+#else
+#define DATA_I_SWIZZLE
+#endif
+
+// ---- Centroid / midpoint tables (verbatim from turbo-quant.cuh) ----
+#include "turbo_centroids.glsl"
+
+// ---- Sign tables: turbo_wht_s1[128] / turbo_wht_s2[128]
+// (verbatim from ggml/src/ggml-cpu/ops.cpp:10832-10833) ----
+const float s1[128] = float[](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+const float s2[128] = float[](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+shared float shmem[128];
+
+void main() {
+    const uint t         = gl_LocalInvocationID.x;           // 0..127
+    const uint block_idx = gl_WorkGroupID.z * 262144u
+                         + gl_WorkGroupID.y * 512u
+                         + gl_WorkGroupID.x;
+
+    // First (flat) source element of this block. All 128 threads agree, so the early
+    // return is uniform and the barriers below remain well-formed.
+    const uint idx0 = block_idx * 128u;
+    if (idx0 >= p.ne) {
+        return;
+    }
+
+    // ---- Destination addressing (SET_ROWS): look up the dst row from the index buffer ----
+    uint i00, i01, i02, i03;
+    get_indices(idx0, i00, i01, i02, i03);
+    const uint i12 = fastmod(i03, p.ne12);
+    const uint i11 = fastmod(i02, p.ne11);
+    const uint i10 = i01;
+    const uint i1  = data_i[src1_idx(i10, i11, i12, 0) + get_boffset()] DATA_I_SWIZZLE;
+
+    const uint src_base  = get_aoffset() + src0_idx(i00, i01, i02, i03);
+    const uint dst_block = get_doffset() + dst_idx(i00 / 128u, i1, i02, i03);
+
+    // ---- Step 1: Load source element and compute L2 norm (tree reduction) ----
+    const float val = data_s[src_base + t];
+
+    shmem[t] = val * val;
+    barrier();
+    if (t < 64u) { shmem[t] += shmem[t + 64u]; } barrier();
+    if (t < 32u) { shmem[t] += shmem[t + 32u]; } barrier();
+    if (t < 16u) { shmem[t] += shmem[t + 16u]; } barrier();
+    if (t <  8u) { shmem[t] += shmem[t +  8u]; } barrier();
+    if (t <  4u) { shmem[t] += shmem[t +  4u]; } barrier();
+    if (t <  2u) { shmem[t] += shmem[t +  2u]; } barrier();
+    if (t <  1u) { shmem[t] += shmem[t +  1u]; } barrier();
+
+    const float norm = sqrt(shmem[0]);
+
+    // ---- Step 2: Normalize, then apply s1 sign for forward WHT ----
+    const float normalized = (norm > 1e-10f) ? (val / norm) : 0.0f;
+    barrier(); // all lanes have consumed the broadcast norm (shmem[0]) before any lane overwrites shmem
+    shmem[t] = normalized * s1[t];
+    barrier();
+
+    // ---- Step 3: Forward WHT — 7 butterfly stages ----
+    if ((t &   1u) ==  0u) { float a = shmem[t], b = shmem[t +  1u]; shmem[t] = a + b; shmem[t +  1u] = a - b; } barrier();
+    if ((t &   3u) <   2u) { float a = shmem[t], b = shmem[t +  2u]; shmem[t] = a + b; shmem[t +  2u] = a - b; } barrier();
+    if ((t &   7u) <   4u) { float a = shmem[t], b = shmem[t +  4u]; shmem[t] = a + b; shmem[t +  4u] = a - b; } barrier();
+    if ((t &  15u) <   8u) { float a = shmem[t], b = shmem[t +  8u]; shmem[t] = a + b; shmem[t +  8u] = a - b; } barrier();
+    if ((t &  31u) <  16u) { float a = shmem[t], b = shmem[t + 16u]; shmem[t] = a + b; shmem[t + 16u] = a - b; } barrier();
+    if ((t &  63u) <  32u) { float a = shmem[t], b = shmem[t + 32u]; shmem[t] = a + b; shmem[t + 32u] = a - b; } barrier();
+    if ((t & 127u) <  64u) { float a = shmem[t], b = shmem[t + 64u]; shmem[t] = a + b; shmem[t + 64u] = a - b; } barrier();
+
+    // Apply 1/sqrt(128) scale and s2 sign — completes the forward WHT
+    const float rotated = shmem[t] * inversesqrt(128.0f) * s2[t];
+
+    // ---- Step 4: Nearest centroid ----
+    uint cidx;
+    if      (rotated < TURBO_MID_4BIT[ 0]) cidx =  0u;
+    else if (rotated < TURBO_MID_4BIT[ 1]) cidx =  1u;
+    else if (rotated < TURBO_MID_4BIT[ 2]) cidx =  2u;
+    else if (rotated < TURBO_MID_4BIT[ 3]) cidx =  3u;
+    else if (rotated < TURBO_MID_4BIT[ 4]) cidx =  4u;
+    else if (rotated < TURBO_MID_4BIT[ 5]) cidx =  5u;
+    else if (rotated < TURBO_MID_4BIT[ 6]) cidx =  6u;
+    else if (rotated < TURBO_MID_4BIT[ 7]) cidx =  7u;
+    else if (rotated < TURBO_MID_4BIT[ 8]) cidx =  8u;
+    else if (rotated < TURBO_MID_4BIT[ 9]) cidx =  9u;
+    else if (rotated < TURBO_MID_4BIT[10]) cidx = 10u;
+    else if (rotated < TURBO_MID_4BIT[11]) cidx = 11u;
+    else if (rotated < TURBO_MID_4BIT[12]) cidx = 12u;
+    else if (rotated < TURBO_MID_4BIT[13]) cidx = 13u;
+    else if (rotated < TURBO_MID_4BIT[14]) cidx = 14u;
+    else                                   cidx = 15u;
+
+    // ---- Step 5: Norm correction — Σ centroid²  (tree reduction) ----
+    const float cv = TURBO_CENTROIDS_4BIT[cidx];
+    shmem[t] = cv * cv;
+    barrier();
+    if (t < 64u) { shmem[t] += shmem[t + 64u]; } barrier();
+    if (t < 32u) { shmem[t] += shmem[t + 32u]; } barrier();
+    if (t < 16u) { shmem[t] += shmem[t + 16u]; } barrier();
+    if (t <  8u) { shmem[t] += shmem[t +  8u]; } barrier();
+    if (t <  4u) { shmem[t] += shmem[t +  4u]; } barrier();
+    if (t <  2u) { shmem[t] += shmem[t +  2u]; } barrier();
+    if (t <  1u) { shmem[t] += shmem[t +  1u]; } barrier();
+
+    const float recon_norm     = sqrt(shmem[0]);
+    const float corrected_norm = (recon_norm > 1e-10f) ? (norm / recon_norm) : norm;
+
+    // ---- Step 6: Write output block ----
+    barrier(); // all lanes have consumed the broadcast recon_norm (shmem[0]) before any lane overwrites shmem
+    shmem[t] = float(cidx);
+    barrier();
+
+    if (t == 0u) {
+        data_q[dst_block].norm  = float16_t(corrected_norm);
+        data_q[dst_block].rnorm = float16_t(0.0f);
+    }
+
+    // Even threads pack two consecutive nibbles into one byte of qs[].
+    if ((t & 1u) == 0u) {
+        const uint lo = uint(shmem[t]);
+        const uint hi = uint(shmem[t + 1u]);
+        data_q[dst_block].qs[t >> 1u] = uint8_t((lo & 0xFu) | ((hi & 0xFu) << 4u));
+    }
+}

@@ -61,25 +61,44 @@ static constexpr int K_INNER  = 16;
 // HS=256 sits exactly at the LDS cap; drop Q_TILES_PER_BLOCK to 5 (56 KiB) or
 // 4 (48 KiB) if the compiler complains. Single-warp kernel is the fallback
 // when GGML_PAGED_TILE_MULTIWARP=0.
+//
+// FULL  = sized to AMD's 64 KiB per-block LDS (RDNA, and gfx803 via HIP).
+// NARROW = sized to NVIDIA's 48 KiB dynamic-smem cap. CUDA limits dynamic smem
+//          to 48 KiB without a cudaFuncSetAttribute opt-in (and Pascal sm_61
+//          cannot opt in past 48 KiB at all). These kernels do NOT opt in, so on
+//          any NVIDIA GPU the FULL HS=256 config (64 KiB) fails the launch with
+//          cudaErrorInvalidValue. launch_paged_attn_tile_mw() picks FULL vs
+//          NARROW from the device's reported smpb so the dynamic request always
+//          fits — multi-warp stays on for both vendors, nothing falls back to
+//          the slow scalar path.
 template <int HEAD_SIZE>
 struct TileConfig;
 
 template <>
 struct TileConfig<64> {
     // MAD-301C Lever B: native head_dim-64 turbo4. LDS at 8 tiles:
-    // 8*16*64*2 + 2*16*64*2 = 16 KiB + 4 KiB = 20 KiB — well under the 64 KiB cap.
-    static constexpr int Q_TILES_PER_BLOCK = 8;
+    // 8*16*64*2 + 2*16*64*2 = 16 KiB + 4 KiB = 20 KiB — well under both caps.
+    static constexpr int Q_TILES_PER_BLOCK        = 8;
+    static constexpr int Q_TILES_PER_BLOCK_NARROW = 8;  // 20 KiB — fits 48 KiB too
 };
 
 template <>
 struct TileConfig<128> {
-    static constexpr int Q_TILES_PER_BLOCK = 8;
+    static constexpr int Q_TILES_PER_BLOCK        = 8;  // 40 KiB
+    static constexpr int Q_TILES_PER_BLOCK_NARROW = 8;  // 40 KiB — already fits 48 KiB
 };
 
 template <>
 struct TileConfig<256> {
-    static constexpr int Q_TILES_PER_BLOCK = 6;  // at LDS cap (64 KiB exactly)
+    static constexpr int Q_TILES_PER_BLOCK        = 6;  // 64 KiB (AMD LDS cap)
+    static constexpr int Q_TILES_PER_BLOCK_NARROW = 3;  // 40 KiB (fits NVIDIA 48 KiB)
 };
+
+// Dynamic shared-memory bytes the multi-warp tile kernel requests for a given
+// (Q_TILES, HEAD_SIZE): Q tiles + double-buffered K/V tiles, all __half.
+static constexpr size_t mw_tile_smem_bytes(int q_tiles, int head_size) {
+    return (size_t)(q_tiles * Q_TILE_M + 2 * K_TILE_N) * (size_t) head_size * sizeof(__half);
+}
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -780,8 +799,9 @@ void launch_paged_attn_tile(
 // __syncthreads is needed after each cooperative load (Q once at start, K
 // before QK matmul, V before V matmul, end-of-iter before overwriting smem).
 
-template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
-__launch_bounds__(TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK * 32, 2)
+template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE, bool NARROW_SMEM>
+__launch_bounds__((NARROW_SMEM ? TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK_NARROW
+                               : TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK) * 32, 2)
 __global__ void mt_paged_attention_tile_mw_kernel(
     __half         * __restrict__ out,
     const __half   * __restrict__ q,
@@ -796,7 +816,8 @@ __global__ void mt_paged_attention_tile_mw_kernel(
     float           scale) {
 #if defined(AMD_WMMA_AVAILABLE)
     static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
-    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int Q_TILES   = NARROW_SMEM ? TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK_NARROW
+                                          : TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
     constexpr int N_WARPS   = Q_TILES;
     constexpr int N_THREADS = N_WARPS * 32;
     constexpr int N_INNER   = HEAD_SIZE / K_INNER;
@@ -1132,7 +1153,8 @@ __global__ void mt_paged_attention_tile_mw_kernel(
     // layout: the PV step rebuilds each Q row's full 16-wide score vector from
     // the pair lane via __shfl_xor(.,16) instead of an smem scratch.
     static_assert(HEAD_SIZE % K_INNER == 0, "HEAD_SIZE must be multiple of K_INNER=16");
-    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int Q_TILES   = NARROW_SMEM ? TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK_NARROW
+                                          : TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
     constexpr int N_WARPS   = Q_TILES;
     constexpr int N_THREADS = N_WARPS * 32;
     constexpr int N_INNER   = HEAD_SIZE / K_INNER;
@@ -1372,6 +1394,48 @@ __global__ void mt_paged_attention_tile_mw_kernel(
 #endif // AMD_WMMA_AVAILABLE
 }
 
+template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE, bool NARROW_SMEM>
+static void launch_mw_impl(
+    __half         * out,
+    const __half   * q,
+    const void     * k_cache,
+    const void     * v_cache,
+    const int32_t  * block_tables,
+    const int32_t  * context_lens,
+    const int32_t  * q_lens,
+    int             num_seqs,
+    int             n_heads,
+    int             n_kv_heads,
+    int             max_blocks_per_seq,
+    int             max_q_len,
+    float           scale,
+    cudaStream_t    stream) {
+
+    constexpr int Q_TILES   = NARROW_SMEM ? TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK_NARROW
+                                          : TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
+    constexpr int N_THREADS = Q_TILES * 32;
+
+    const int n_q_tiles       = (max_q_len + Q_TILE_M - 1) / Q_TILE_M;
+    const int n_q_tile_groups = (n_q_tiles + Q_TILES - 1) / Q_TILES;
+
+    dim3 grid(n_heads, num_seqs, n_q_tile_groups);
+    dim3 block(N_THREADS);
+
+    const size_t smem_bytes = mw_tile_smem_bytes(Q_TILES, HEAD_SIZE);
+
+    mt_paged_attention_tile_mw_kernel<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE, NARROW_SMEM>
+        <<<grid, block, smem_bytes, stream>>>(
+            out, q, k_cache, v_cache,
+            block_tables, context_lens, q_lens,
+            max_blocks_per_seq, n_kv_heads, n_heads, scale);
+}
+
+// Public entry point (header-declared; signature stable). Picks the FULL vs
+// NARROW Q_TILES config from the device's max shared-mem-per-block so the
+// kernel's dynamic smem request always fits the hardware: AMD/HIP (64 KiB LDS)
+// keeps FULL; NVIDIA (48 KiB dynamic cap, no opt-in — hard on Pascal sm_61)
+// uses NARROW. Without this, HEAD_SIZE=256 (FULL = 64 KiB) fails the launch on
+// every NVIDIA GPU with cudaErrorInvalidValue.
 template <int HEAD_SIZE, int BLOCK_SIZE, ggml_type CACHE_TYPE>
 void launch_paged_attn_tile_mw(
     __half         * out,
@@ -1389,23 +1453,19 @@ void launch_paged_attn_tile_mw(
     float           scale,
     cudaStream_t    stream) {
 
-    constexpr int Q_TILES   = TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK;
-    constexpr int N_THREADS = Q_TILES * 32;
+    const size_t smpb = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    const bool full_fits =
+        mw_tile_smem_bytes(TileConfig<HEAD_SIZE>::Q_TILES_PER_BLOCK, HEAD_SIZE) <= smpb;
 
-    const int n_q_tiles       = (max_q_len + Q_TILE_M - 1) / Q_TILE_M;
-    const int n_q_tile_groups = (n_q_tiles + Q_TILES - 1) / Q_TILES;
-
-    dim3 grid(n_heads, num_seqs, n_q_tile_groups);
-    dim3 block(N_THREADS);
-
-    const size_t smem_bytes = (size_t)(Q_TILES * Q_TILE_M + 2 * K_TILE_N)
-                            * (size_t) HEAD_SIZE * sizeof(__half);
-
-    mt_paged_attention_tile_mw_kernel<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE>
-        <<<grid, block, smem_bytes, stream>>>(
-            out, q, k_cache, v_cache,
-            block_tables, context_lens, q_lens,
-            max_blocks_per_seq, n_kv_heads, n_heads, scale);
+    if (full_fits) {
+        launch_mw_impl<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE, /*NARROW_SMEM=*/false>(
+            out, q, k_cache, v_cache, block_tables, context_lens, q_lens,
+            num_seqs, n_heads, n_kv_heads, max_blocks_per_seq, max_q_len, scale, stream);
+    } else {
+        launch_mw_impl<HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE, /*NARROW_SMEM=*/true>(
+            out, q, k_cache, v_cache, block_tables, context_lens, q_lens,
+            num_seqs, n_heads, n_kv_heads, max_blocks_per_seq, max_q_len, scale, stream);
+    }
 }
 
 // Explicit instantiations.

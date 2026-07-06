@@ -12,6 +12,7 @@
 #include "turbo-innerq.cuh"
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 
 // ---- Quantization ratios for dequantize_block template ----
 #define QR_TURBO3 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
@@ -351,12 +352,151 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return TURBO_CENTROIDS_4BIT[idx] * norm;
 }
 
+// ---- 4-bit centroids for turbo4_64 (64-element blocks), calibrated from
+// real LFM2.5-8B-A1B K/V activation statistics (2026-07-01 investigation),
+// NOT the N(0, 1/128) Gaussian assumption above. A 64-element group's
+// L2-normalized value has ~sqrt(2)x the typical magnitude of a 128-element
+// group's, AND real K/V activations are heavy-tailed (occasional outlier
+// channels), not Gaussian — the shared TURBO_CENTROIDS_4BIT table (designed
+// for turbo4_0's 128-element blocks) hard-clips ~13% of real turbo4_64
+// values and has 2.8x worse RMSE than this table on real data. Used ONLY by
+// turbo4_64 (native head_dim-64 paged KV cache); does NOT affect turbo4_0
+// (128-element blocks, e.g. Qwen3.5-4B's hd256 path), which keeps its
+// existing, already-validated table unchanged.
+static __constant__ float TURBO_CENTROIDS_4BIT_N64[16] = {
+    -0.489086f, -0.332636f, -0.244498f, -0.182456f,
+    -0.132429f, -0.089625f, -0.051251f, -0.016052f,
+     0.016052f,  0.051251f,  0.089625f,  0.132429f,
+     0.182456f,  0.244498f,  0.332636f,  0.489086f
+};
+
+static __constant__ float TURBO_MID_4BIT_N64[15] = {
+    -0.410861f, -0.288567f, -0.213477f, -0.157443f,
+    -0.111027f, -0.070438f, -0.033652f,  0.000000f,
+     0.033652f,  0.070438f,  0.111027f,  0.157443f,
+     0.213477f,  0.288567f,  0.410861f
+};
+
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_4bit_n64(float val) {
+    if      (val < TURBO_MID_4BIT_N64[ 0]) return  0;
+    else if (val < TURBO_MID_4BIT_N64[ 1]) return  1;
+    else if (val < TURBO_MID_4BIT_N64[ 2]) return  2;
+    else if (val < TURBO_MID_4BIT_N64[ 3]) return  3;
+    else if (val < TURBO_MID_4BIT_N64[ 4]) return  4;
+    else if (val < TURBO_MID_4BIT_N64[ 5]) return  5;
+    else if (val < TURBO_MID_4BIT_N64[ 6]) return  6;
+    else if (val < TURBO_MID_4BIT_N64[ 7]) return  7;
+    else if (val < TURBO_MID_4BIT_N64[ 8]) return  8;
+    else if (val < TURBO_MID_4BIT_N64[ 9]) return  9;
+    else if (val < TURBO_MID_4BIT_N64[10]) return 10;
+    else if (val < TURBO_MID_4BIT_N64[11]) return 11;
+    else if (val < TURBO_MID_4BIT_N64[12]) return 12;
+    else if (val < TURBO_MID_4BIT_N64[13]) return 13;
+    else if (val < TURBO_MID_4BIT_N64[14]) return 14;
+    else                                    return 15;
+}
+
 // MAD-301C Lever B: native head_dim-64 turbo4 dequant. Same nibble layout as
-// block_turbo4_0 (j/2 byte, (j%2)*4 shift); only the block struct width differs.
+// block_turbo4_0 (j/2 byte, (j%2)*4 shift); only the block struct width and
+// the (N=64-calibrated) centroid table differ.
 static __device__ __forceinline__ float turbo4_64_dequant_element(
         const block_turbo4_64 * __restrict__ x, int j, float norm) {
     uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
+    return TURBO_CENTROIDS_4BIT_N64[idx] * norm;
+}
+
+// ---- turbo4_64_ol: fixed-position outlier-channel extraction (SP2.5, 2026-07-01) ----
+//
+// 4 fixed channel positions per 64-element block are excluded from the
+// group-norm and stored verbatim at f16; the remaining 60 elements are
+// centroid-quantized with the SHARED (unmodified) TURBO_CENTROIDS_4BIT /
+// TURBO_MID_4BIT table above — NOT TURBO_CENTROIDS_4BIT_N64 — since
+// removing the outliers makes the remaining 60 "typical" values close
+// enough to the N=128 assumption for that table to be appropriate again.
+// Positions MUST stay byte-for-byte identical between CUDA and Vulkan.
+static __constant__ int TURBO4_64_OL_CHANNELS[TURBO4_64_OL_N_OUTLIERS] = TURBO4_64_OUTLIER_CHANNELS;
+
+// nib is the index (0..59) into the packed (non-outlier) nibble stream, NOT
+// the raw channel position d — callers must map d -> nib themselves (see
+// paged_cache_ops<TURBO4_64_OL>::k_load, which precomputes this once).
+static __device__ __forceinline__ float turbo4_64_ol_dequant_nib(
+        const block_turbo4_64_ol * __restrict__ x, int nib, float norm) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
     return TURBO_CENTROIDS_4BIT[idx] * norm;
+}
+
+// ---- outlier-matrix sweep (2026-07-01): runtime centroid-table toggle ----
+//
+// Temporary, investigative-only mechanism (see task brief
+// .superpowers/sdd/outlier-matrix-task-brief.md) for sweeping whether the
+// N=64-recalibrated centroid table (TURBO_CENTROIDS_4BIT_N64/TURBO_MID_4BIT_N64)
+// is a better fit than the original TURBO_CENTROIDS_4BIT/TURBO_MID_4BIT table
+// for the NON-outlier elements of turbo4_64_ol/ol8/ol12, once the massive-
+// activation outlier channels have already been removed from the norm.
+// GGML_TURBO4_64_OL_TABLE=n64 selects the N64 table; anything else (including
+// unset) keeps the current/default original-table behavior. Read once on the
+// host per process and cached; callers pass the resulting bool down into the
+// scatter/dequant device functions below. Not a permanent feature.
+static inline bool ggml_cuda_turbo4_64_ol_use_n64_table() {
+    static const bool use_n64 = []() {
+        const char * v = getenv("GGML_TURBO4_64_OL_TABLE");
+        return v != nullptr && strcmp(v, "n64") == 0;
+    }();
+    return use_n64;
+}
+
+// getenv() is host-only and cannot be called from __device__/__global__ code.
+// Device-side kernels must NOT call ggml_cuda_turbo4_64_ol_use_n64_table()
+// directly. Instead, the host reads the env var once (above), syncs it into
+// this __device__ global via ggml_cuda_turbo4_64_ol_sync_n64_table_flag()
+// (call once per process before launching any turbo4_64_ol/ol8/ol12 scatter
+// or paged-attention kernel), and device code reads the global directly via
+// ggml_cuda_turbo4_64_ol_use_n64_table_dev().
+__device__ int g_turbo4_64_ol_use_n64_table = 0;
+
+static inline void ggml_cuda_turbo4_64_ol_sync_n64_table_flag() {
+    static bool synced = false;
+    if (!synced) {
+        const int val = ggml_cuda_turbo4_64_ol_use_n64_table() ? 1 : 0;
+        cudaMemcpyToSymbol(g_turbo4_64_ol_use_n64_table, &val, sizeof(int));
+        synced = true;
+    }
+}
+
+static __device__ __forceinline__ bool ggml_cuda_turbo4_64_ol_use_n64_table_dev() {
+    return g_turbo4_64_ol_use_n64_table != 0;
+}
+
+static __device__ __forceinline__ uint8_t turbo_nearest_centroid_4bit_sel(float val, bool use_n64) {
+    return use_n64 ? turbo_nearest_centroid_4bit_n64(val) : turbo_nearest_centroid_4bit(val);
+}
+
+static __device__ __forceinline__ float turbo_centroid_4bit_sel(uint8_t idx, bool use_n64) {
+    return use_n64 ? TURBO_CENTROIDS_4BIT_N64[idx] : TURBO_CENTROIDS_4BIT[idx];
+}
+
+static __device__ __forceinline__ float turbo4_64_ol_dequant_nib_sel(
+        const block_turbo4_64_ol * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
+}
+
+// ---- turbo4_64_ol8: 8 fixed outlier channels (outlier-matrix sweep) ----
+static __constant__ int TURBO4_64_OL8_CHANNELS[TURBO4_64_OL8_N_OUTLIERS] = TURBO4_64_OL8_OUTLIER_CHANNELS;
+
+static __device__ __forceinline__ float turbo4_64_ol8_dequant_nib_sel(
+        const block_turbo4_64_ol8 * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
+}
+
+// ---- turbo4_64_ol12: 12 fixed outlier channels (outlier-matrix sweep) ----
+static __constant__ int TURBO4_64_OL12_CHANNELS[TURBO4_64_OL12_N_OUTLIERS] = TURBO4_64_OL12_OUTLIER_CHANNELS;
+
+static __device__ __forceinline__ float turbo4_64_ol12_dequant_nib_sel(
+        const block_turbo4_64_ol12 * __restrict__ x, int nib, float norm, bool use_n64) {
+    uint8_t idx = (x->qs[nib / 2] >> ((nib % 2) * 4)) & 0xF;
+    return turbo_centroid_4bit_sel(idx, use_n64) * norm;
 }
 
 // ---- Nearest 3-bit centroid index ----
