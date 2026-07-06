@@ -517,20 +517,33 @@
 .Lcasadv_skip\@:
     s_mov_b32 exec_lo, s49
 .endm
-// ---- DEADMAN watchdog: s[70:71] = this wave's start RTC; deadman_check force-retires past the deadline ----
+// ---- DEADMAN watchdog: s70 = this wave's start RTC (low 32b); s71 = throttle counter (repurposed high-RTC
+//   reg, which is unused at TRACE=0 -- deadman_check only reads s70). The message-bus RTC read (s_sendmsg_rtn)
+//   is an SQ-front-end op; hundreds of idle COAST waves hitting it EVERY loop iteration spam the front-end,
+//   starving the compositor's SQC(inst) fetch (2026-07-05 MODE1 brick) AND destabilizing the coast wall
+//   (identical STAGINSTR work measured 0.32s vs 2.0s). THROTTLE: only read the RTC every DEADMAN_EVERY iters. ----
+.ifndef DEADMAN_EVERY
+  .set DEADMAN_EVERY, 64          // message-bus RTC-read cadence (in loop iters); force-retire slack = DEADMAN_EVERY iters
+.endif
 .macro deadman_stamp                          // stamp start RTC (low 32b in s70) once at entry
 .if DEADMAN
     s_sendmsg_rtn_b64 s[70:71], sendmsg(MSG_RTN_GET_REALTIME)
     s_wait_kmcnt 0x0
+    s_mov_b32 s71, 0                           // repurpose the (TRACE=0-unused) high-RTC reg as the throttle counter
 .endif
 .endm
 .macro deadman_check                           // if alive > DEADMAN_TICKS -> clean force-retire (no wedge)
 .if DEADMAN
+    s_add_u32 s71, s71, 1                        // THROTTLE: touch the SQ-front-end message bus only every
+    s_cmp_ge_u32 s71, DEADMAN_EVERY              //   DEADMAN_EVERY iters (idle coast waves would else spam it -> brick)
+    s_cbranch_scc0 .Ldm_skip\@
+    s_mov_b32 s71, 0
     s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
     s_wait_kmcnt 0x0
     s_sub_u32 s62, s62, s70                     // elapsed = now_lo - start_lo  (u32 wrap-safe; deadline << 42s)
     s_cmp_ge_u32 s62, DEADMAN_TICKS
     s_cbranch_scc1 .Lflow_retire
+.Ldm_skip\@:
 .endif
 .endm
 // lds_put_r (RUNTIME-addr write) is also defined inside the .if DSWS2_CONV||DSWS2_ENVELOPE block below;
