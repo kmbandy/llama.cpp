@@ -27,8 +27,8 @@ actually compiled with liburing — treat compile errors there as the first thin
 | Commit | Story | Flag (default) | What to validate |
 |---|---|---|---|
 | P0 | instrumentation + `/metrics` + teardown summary | none (always on) | **Do this first.** Run a paged decode and read the summary: prefetch hit rate, effective GB/s, sync_fallbacks, cross-layer hit rate, routing counters. This is the baseline every other story is judged against. Cross-check GB/s vs `iostat`. |
-| P1 | HIP graphs under paging | `WP_HIP_GRAPHS=1` | Partial scaffolding (coarse recapture + `cudaGraphExecUpdate`, not a per-node arg patcher). Prove PPL identical + token-identical + 0 GPU faults vs flag-off. Watch for over-pinning (pins keyed per-op tensor, released conservatively). |
-| P2 | async ensure / compute-transfer overlap | `WP_ASYNC_ENSURE=1` | **MUST-FIX before enabling:** eval-cb `s_pending_async_ops` is a static that outlives the pager and holds `op.pager` → a pager shutdown with unsignaled pending ops → UAF in a later eval-cb. Add a shutdown drain of that static before turning the flag on. Then validate token-identical + sync_fallback drop + decode t/s. |
+| P1 | HIP graphs under paging | `WP_HIP_GRAPHS=1` | Partial scaffolding (coarse recapture + `cudaGraphExecUpdate`, not a per-node arg patcher). Prove PPL identical + token-identical + 0 GPU faults vs flag-off. Over-pinning is now bounded (`WP_GRAPH_PIN_MAX`, keeps a floor of evictable slots, degrades to non-graph for overflow — see fix commit `3ca8f71f8`); full lifetime-correct pinning still needs the arg-patcher. |
+| P2 | async ensure / compute-transfer overlap | `WP_ASYNC_ENSURE=1` | The shutdown UAF is FIXED (`weight_pager_eval_cb_reset` drained from `shutdown()`, commit `3ca8f71f8`). Validate token-identical + sync_fallback drop + decode t/s. |
 | P3 | dma_buf NVMe→VRAM P2P | `LLAMA_WP_TRANSPORT=p2p` | Run `wp-dmabuf-probe` first to confirm the box supports `hsa_amd_portable_export_dmabuf` (records ROCm version; validated on 7.2.2). Then prove bit-exact output vs the host-staged default, and measure GB/s delta. Fallback ladder (p2p→io_uring-host→sync-pread) should log the active tier. |
 | P4 | host-tier pinned slab cache | `WP_HOST_BUDGET_BYTES=<bytes>` (+`WP_PIN_HOST=1`) | **Conditional — only enable if P0's baseline shows a high cold-miss rate that P3 P2P doesn't already solve.** Slab/LRU logic is unit-tested; validate the RAM→VRAM hit path lowers cold-miss + raises t/s on a working-set-exceeds-VRAM model. `WP_PIN_HOST` must gracefully fall back on memlock-ulimit and skip on UMA. |
 | P5 | routing hardening | `WP_ROUTING_GUARD=1` | Counters are always-on: confirm `routing_ptrs_discarded_unconsumed` reads **0** across a clean decode (nonzero = MAD-230 leak-class recurrence). Run one decode with `WP_ROUTING_GUARD=1` and confirm no abort (invariant holds). |
@@ -40,8 +40,9 @@ actually compiled with liburing — treat compile errors there as the first thin
    20B+ paged run (two prior OOM/hang restarts — don't skip it).
 2. **P5 counters** — cheap, confirms `discarded_unconsumed == 0` (routing health) before
    trusting anything else.
-3. **P1** then **P2** (fix the P2 UAF first) — the launch-overhead + overlap wins Fable
-   ranked highest for decode t/s. Prove correctness (token-identical) before trusting perf.
+3. **P1** then **P2** (the P2 UAF is already fixed, commit `3ca8f71f8`) — the launch-overhead
+   + overlap wins Fable ranked highest for decode t/s. Prove correctness (token-identical)
+   before trusting perf.
 4. **P3** — the bandwidth lever; probe → bit-exact → measure.
 5. **P4** — only if P0 data says the cold-miss rate justifies it.
 
