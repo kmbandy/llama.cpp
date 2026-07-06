@@ -10,9 +10,10 @@
 //      loader integration in Phase 1d).
 //   3. init() once after the catalog is built. Pool, transport, prefetch
 //      scheduler all come up here. GGML_CUDA_DISABLE_GRAPHS is snapshotted
-//      and forced to "1" (ggml's hipGraph capture bakes tensor->data
-//      pointers; the eval callback's per-step rewrites are incompatible).
-//      The original env-var state is restored on shutdown — fixes B-P5.
+//      and forced to "1" unless WP_HIP_GRAPHS=1 (ggml's hipGraph capture
+//      bakes tensor->data pointers; the eval callback's per-step rewrites
+//      need MAD-P1 graph update handling). The original env-var state is
+//      restored on shutdown - fixes B-P5.
 //   4. ensure() / prefetch_next() / tick() during inference, called from
 //      the eval callback adapter.
 //   5. shutdown() (or destructor) tears everything down in reverse order.
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_backend_buffer;
@@ -114,7 +116,7 @@ public:
               const std::vector<int> &   devices_used);
 
     // Tear down in reverse order. Restores GGML_CUDA_DISABLE_GRAPHS to its
-    // pre-init value. Safe to call multiple times.
+    // pre-init value if init forced it. Safe to call multiple times.
     void shutdown();
 
     // Lookup helpers.
@@ -122,6 +124,7 @@ public:
     int    n_pages()                            const { return catalog_.size(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
+    bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
     const Stats & stats() const;
     int    loaded_pages() const;
     int    pending_prefetches() const { return prefetch_.pending(); }
@@ -194,6 +197,15 @@ public:
     // Where a page currently lives in the pool, or -1 if not loaded.
     int slot_for_page(int page_idx) const;
 
+    // MAD-P1: graph-lifetime pins for slots captured by CUDA/HIP graphs.
+    // Replaces the pin set for graph_key with the slots currently backing
+    // page_indices, unpinning the old exact slots first. No-op unless
+    // WP_HIP_GRAPHS=1.
+    void update_graph_pins(const void * graph_key, const std::vector<int> & page_indices);
+
+    // Stable slot base address for capture. Valid for the pool lifetime.
+    void * slot_base_for_capture(int slot_idx) const { return pool_.slot_base_for_capture(slot_idx); }
+
 private:
     // Internal helper: synchronous page-in (used by ensure() on miss).
     // Reads the page's bytes via FileIOLayer (sync path), copies to VRAM,
@@ -208,6 +220,8 @@ private:
 
     void log_stats_summary();
     void record_page_in_(size_t bytes, double seconds);
+    void restore_disable_graphs_env_();
+    void release_graph_pins_();
 
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;
@@ -233,11 +247,18 @@ private:
 
     Config cfg_;
     bool   initialized_ = false;
+    bool   hip_graphs_enabled_ = false;
     mutable Stats stats_;
 
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).
     bool        env_was_present_ = false;
+    bool        env_disable_graphs_forced_ = false;
     std::string env_prior_value_;
+
+    // MAD-P1 graph_key -> exact pool slots pinned for captured graph args.
+    // Stored as slots, not pages, so unpin releases the same refcounts even
+    // if a page later moves to another slot.
+    std::unordered_map<const void *, std::vector<int>> graph_pin_slots_;
 
     // Shared pinned staging buffer for page_in_sync_. Allocated once at
     // init, sized to max_page_size, reused across every sync page-in.

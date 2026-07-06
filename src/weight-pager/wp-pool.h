@@ -157,6 +157,10 @@ public:
     // pool. Returns nullptr if slot_idx is out of range.
     void * slot_ptr(int slot_idx) const;
 
+    // Stable slot base for graph capture. Alias for slot_ptr(), named for
+    // MAD-P1 callers that need the fixed pool-lifetime capture surface.
+    void * slot_base_for_capture(int slot_idx) const { return slot_ptr(slot_idx); }
+
     // Backing buffer; pass to tensor->buffer when paging a tensor in.
     ggml_backend_buffer_t vram_buf() const { return buf_; }
 

@@ -83,6 +83,16 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     s_pinned_pages_prev_op.clear();
 
+    std::vector<int> graph_pin_page_indices;
+    auto capture_ptr_for_page = [pager](int page_idx, void * current) -> void * {
+        if (!pager->hip_graphs_enabled()) {
+            return current;
+        }
+        const int slot = pager->slot_for_page(page_idx);
+        void * base = pager->slot_base_for_capture(slot);
+        return base != nullptr ? base : current;
+    };
+
     // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
     // source is a consolidated MoE parent. This is the entry point for
     // routing-aware paging (MAD-88 Phase 2 part 2). Currently informational
@@ -288,6 +298,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         const int sub_page_idx = weight_page + 1 + e;
                                         void * slot = pager->ensure(sub_page_idx);
                                         if (slot != nullptr) {
+                                            slot = capture_ptr_for_page(sub_page_idx, slot);
                                             host_ptrs[(size_t) e] = slot;
                                             if (first_active_slot == nullptr) {
                                                 first_active_slot = slot;
@@ -298,6 +309,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             // it. Unpinned in the NEXT eval_cb (above).
                                             pager->pin_page(sub_page_idx);
                                             s_pinned_pages_prev_op.push_back(sub_page_idx);
+                                            if (pager->hip_graphs_enabled()) {
+                                                graph_pin_page_indices.push_back(sub_page_idx);
+                                            }
                                         }
                                     }
                                     // Safety: fill INACTIVE expert slots with a non-null
@@ -570,6 +584,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     ++g_debug.ops_seen;
     if (n_page_indices == 0) {
+        if (pager->hip_graphs_enabled()) {
+            pager->update_graph_pins((const void *) t, graph_pin_page_indices);
+        }
         // Diagnostic: did any src LOOK LIKE a weight tensor that we should have found?
         // Helps surface name-mismatch / catalog-miss bugs.
         bool had_weight_looking_src = false;
@@ -671,12 +688,16 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             // keeps debugging signal local to the failing op.
             continue;
         }
+        vram = capture_ptr_for_page(page_idx, vram);
         // MAD-231: pin the slot so a subsequent prefetch alloc_slot in
         // tick() (or in a later op's pre-cb) cannot evict it while the
         // GPU is still reading from it. Unpinned at the top of the NEXT
         // eval_cb invocation.
         pager->pin_page(page_idx);
         s_pinned_pages_prev_op.push_back(page_idx);
+        if (pager->hip_graphs_enabled()) {
+            graph_pin_page_indices.push_back(page_idx);
+        }
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
 
@@ -719,6 +740,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     } else if (g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
         LLAMA_LOG_WARN("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
                        DebugState::kVerboseLimit);
+    }
+
+    if (pager->hip_graphs_enabled()) {
+        pager->update_graph_pins((const void *) t, graph_pin_page_indices);
     }
 
     // Step 3: drive the prefetch pipeline forward.

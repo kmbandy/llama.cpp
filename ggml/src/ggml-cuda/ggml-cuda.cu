@@ -3620,6 +3620,11 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static bool ggml_cuda_wp_hip_graphs_enabled() {
+    const char * env = getenv("WP_HIP_GRAPHS");
+    return env != nullptr && strcmp(env, "1") == 0;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3677,8 +3682,32 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_node_props_equal_except_src_data_ptrs(
+        const ggml_cuda_graph::node_properties & a,
+        const ggml_cuda_graph::node_properties & b) {
+    if (memcmp(&a.node, &b.node, sizeof(a.node)) != 0) {
+        return false;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (memcmp(a.node_src_ne[j], b.node_src_ne[j], sizeof(a.node_src_ne[j])) != 0) {
+            return false;
+        }
+        if (memcmp(a.node_src_nb[j], b.node_src_nb[j], sizeof(a.node_src_nb[j])) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_graph_update_required(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph,
+        bool * src_data_ptrs_only) {
     bool res = false;
+    bool only_src_data_ptrs_changed = true;
+    if (src_data_ptrs_only != nullptr) {
+        *src_data_ptrs_only = false;
+    }
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -3695,6 +3724,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
+        only_src_data_ptrs_changed = false;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
@@ -3710,12 +3740,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!ggml_cuda_graph_node_props_equal_except_src_data_ptrs(graph->node_props[i], prop)) {
+                only_src_data_ptrs_changed = false;
+            }
             graph->node_props[i] = prop;
             res = true;
         }
     }
 
+    if (src_data_ptrs_only != nullptr) {
+        *src_data_ptrs_only = res && only_src_data_ptrs_changed;
+    }
     return res;
 }
 
@@ -4967,7 +5003,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            bool properties_src_data_ptrs_only = false;
+            const bool properties_changed = ggml_cuda_graph_update_required(
+                cuda_ctx, cgraph, &properties_src_data_ptrs_only);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4981,9 +5019,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    if (ggml_cuda_wp_hip_graphs_enabled() &&
+                        properties_src_data_ptrs_only &&
+                        graph->instance != nullptr) {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    } else {
+                        // Properties changed - reset warmup, execute directly until stable again
+                        graph->warmup_complete = false;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;

@@ -20,12 +20,15 @@ namespace wp {
 // EnvSnapshot — record current value of an env var, then restore it later.
 //
 // Used for GGML_CUDA_DISABLE_GRAPHS: the pager forces it to "1" during init
-// (the eval callback's per-step pointer rewrites are incompatible with
-// hipGraph capture, which bakes pointers at capture time). On shutdown we
-// restore whatever value (or absence) the user had before. This fixes
-// B-P5: the previous pager set the var unconditionally and never restored
-// it, leaking the "graphs disabled" state into any subsequent model load
-// in the same process.
+// unless WP_HIP_GRAPHS=1 (default off). With WP_HIP_GRAPHS unset or 0 this
+// preserves today's safety path exactly: graph capture stays disabled because
+// the eval callback rewrites tensor->data before execution. With
+// WP_HIP_GRAPHS=1 we leave the user's graph setting alone so MAD-P1 graph
+// update handling can be tested. On shutdown we restore whatever value (or
+// absence) the user had before when we forced it. This fixes B-P5: the
+// previous pager set the var unconditionally and never restored it, leaking
+// the "graphs disabled" state into any subsequent model load in the same
+// process.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -50,6 +53,12 @@ void env_restore(const char * var, bool present, const std::string & prior) {
 }
 
 constexpr const char * kEnvDisableGraphs = "GGML_CUDA_DISABLE_GRAPHS";
+constexpr const char * kEnvWpHipGraphs   = "WP_HIP_GRAPHS";
+
+bool env_flag_is_one(const char * var) {
+    const char * v = std::getenv(var);
+    return v != nullptr && std::strcmp(v, "1") == 0;
+}
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -123,11 +132,18 @@ bool WeightPager::init(const Config &             cfg,
 
     // Snapshot env BEFORE we touch it.
     env_snapshot(kEnvDisableGraphs, env_was_present_, env_prior_value_);
-    setenv(kEnvDisableGraphs, "1", /*overwrite=*/1);
+    hip_graphs_enabled_ = env_flag_is_one(kEnvWpHipGraphs);
+    env_disable_graphs_forced_ = !hip_graphs_enabled_;
+    if (env_disable_graphs_forced_) {
+        setenv(kEnvDisableGraphs, "1", /*overwrite=*/1);
+    } else {
+        LLAMA_LOG_WARN("wp::WeightPager: WP_HIP_GRAPHS=1, leaving GGML_CUDA_DISABLE_GRAPHS unchanged\n");
+    }
 
     const size_t slot_size = catalog_.max_page_size();
     if (slot_size == 0) {
         LLAMA_LOG_WARN("wp::WeightPager::init: catalog max_page_size is 0\n");
+        restore_disable_graphs_env_();
         return false;
     }
 
@@ -137,7 +153,7 @@ bool WeightPager::init(const Config &             cfg,
     //    MAD-234.
     if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: pool allocation failed\n");
-        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        restore_disable_graphs_env_();
         return false;
     }
     pool_.set_eviction_callback([this](int slot_idx) { on_pool_evict_(slot_idx); });
@@ -163,7 +179,7 @@ bool WeightPager::init(const Config &             cfg,
         LLAMA_LOG_ERROR("wp::WeightPager::init: gpu transport init failed\n");
         pool_.~PoolAllocator();   // explicit teardown via dtor (RAII'd)
         new (&pool_) PoolAllocator{};
-        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        restore_disable_graphs_env_();
         return false;
     }
 
@@ -175,7 +191,7 @@ bool WeightPager::init(const Config &             cfg,
         transport_.shutdown();
         pool_.~PoolAllocator();
         new (&pool_) PoolAllocator{};
-        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        restore_disable_graphs_env_();
         return false;
     }
 
@@ -186,7 +202,7 @@ bool WeightPager::init(const Config &             cfg,
         transport_.shutdown();
         pool_.~PoolAllocator();
         new (&pool_) PoolAllocator{};
-        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        restore_disable_graphs_env_();
         return false;
     }
 
@@ -222,7 +238,7 @@ bool WeightPager::init(const Config &             cfg,
         transport_.shutdown();
         pool_.~PoolAllocator();
         new (&pool_) PoolAllocator{};
-        env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+        restore_disable_graphs_env_();
         return false;
     }
 
@@ -238,15 +254,15 @@ void WeightPager::shutdown() {
     if (!initialized_) {
         // If init partially completed, there's no live state — but the env
         // snapshot may have been taken. Restore it defensively.
-        if (env_was_present_ || !env_prior_value_.empty()) {
-            env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
-            env_was_present_ = false;
-            env_prior_value_.clear();
-        }
+        restore_disable_graphs_env_();
+        env_was_present_ = false;
+        env_prior_value_.clear();
+        hip_graphs_enabled_ = false;
         return;
     }
 
     log_stats_summary();
+    release_graph_pins_();
 
     // Tear down in reverse construction order.
     prefetch_.shutdown();
@@ -277,11 +293,32 @@ void WeightPager::shutdown() {
     slot_to_page_.clear();
     catalog_.clear();
 
-    env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+    restore_disable_graphs_env_();
     env_was_present_ = false;
     env_prior_value_.clear();
+    hip_graphs_enabled_ = false;
 
     initialized_ = false;
+}
+
+void WeightPager::restore_disable_graphs_env_() {
+    if (!env_disable_graphs_forced_) {
+        return;
+    }
+    env_restore(kEnvDisableGraphs, env_was_present_, env_prior_value_);
+    env_disable_graphs_forced_ = false;
+}
+
+void WeightPager::release_graph_pins_() {
+    if (graph_pin_slots_.empty()) {
+        return;
+    }
+    for (const auto & kv : graph_pin_slots_) {
+        for (int slot : kv.second) {
+            pool_.unpin_slot(slot);
+        }
+    }
+    graph_pin_slots_.clear();
 }
 
 void WeightPager::on_pool_evict_(int slot_idx) {
@@ -358,6 +395,52 @@ int WeightPager::slot_for_page(int page_idx) const {
     if (page_idx < 0 || page_idx >= (int) page_to_slot_.size()) return -1;
     if (!page_loaded_[page_idx])                                 return -1;
     return page_to_slot_[page_idx];
+}
+
+void WeightPager::update_graph_pins(const void * graph_key, const std::vector<int> & page_indices) {
+    if (!initialized_ || !hip_graphs_enabled_ || graph_key == nullptr) {
+        return;
+    }
+
+    std::vector<int> slots;
+    slots.reserve(page_indices.size());
+    for (int page_idx : page_indices) {
+        const int slot = slot_for_page(page_idx);
+        if (slot < 0) {
+            continue;
+        }
+        bool seen = false;
+        for (int s : slots) {
+            if (s == slot) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            slots.push_back(slot);
+        }
+    }
+
+    auto it = graph_pin_slots_.find(graph_key);
+    if (it != graph_pin_slots_.end() && it->second == slots) {
+        return;
+    }
+
+    if (it != graph_pin_slots_.end()) {
+        for (int old_slot : it->second) {
+            pool_.unpin_slot(old_slot);
+        }
+        graph_pin_slots_.erase(it);
+    }
+
+    if (slots.empty()) {
+        return;
+    }
+
+    for (int slot : slots) {
+        pool_.pin_slot(slot);
+    }
+    graph_pin_slots_.emplace(graph_key, std::move(slots));
 }
 
 void * WeightPager::ensure(int page_idx) {
