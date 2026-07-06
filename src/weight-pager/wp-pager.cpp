@@ -458,8 +458,9 @@ void WeightPager::on_pool_evict_(int slot_idx) {
     int page = slot_to_page_[slot_idx];
     if (page >= 0 && page < (int) page_to_slot_.size()) {
         if (page < (int) page_async_event_.size() && page_async_event_[page] >= 0) {
-            transport_.synchronize(page_async_event_[page]);
-            transport_.release_event(page_async_event_[page]);
+            const int evt = page_async_event_[page];
+            transport_.synchronize(evt);
+            finish_async_transfer_event(page, evt);
             page_async_event_[page] = -1;
         }
         page_to_slot_[page] = -1;
@@ -697,8 +698,9 @@ void * WeightPager::ensure(int page_idx) {
     if (!initialized_)                                         return nullptr;
     if (page_idx < 0 || page_idx >= catalog_.size())           return nullptr;
     if (page_idx < (int) page_async_event_.size() && page_async_event_[page_idx] >= 0) {
-        transport_.synchronize(page_async_event_[page_idx]);
-        transport_.release_event(page_async_event_[page_idx]);
+        const int evt = page_async_event_[page_idx];
+        transport_.synchronize(evt);
+        finish_async_transfer_event(page_idx, evt);
         page_async_event_[page_idx] = -1;
     }
 
@@ -759,7 +761,9 @@ void * WeightPager::ensure(int page_idx) {
 
                 page_loaded_[page_idx] = true;
                 pool_.mark_used(slot);
-                prefetch_.reap(page_idx);
+                // The async H2D still reads from PrefetchScheduler's pinned
+                // staging buffer until evt signals. Reaping here would recycle
+                // that buffer for another prefetch and corrupt the slot copy.
                 double seconds = 0.0;
                 if (page_idx < (int) prefetch_started_at_.size() &&
                     prefetch_started_at_[page_idx] != std::chrono::steady_clock::time_point{}) {
@@ -824,6 +828,14 @@ bool WeightPager::enqueue_async_transfer_wait(int event_handle, void * stream) {
 
 bool WeightPager::synchronize_async_transfer_event(int event_handle) {
     return transport_.synchronize(event_handle);
+}
+
+void WeightPager::finish_async_transfer_event(int page_idx, int event_handle) {
+    if (!initialized_) return;
+    if (page_idx >= 0) {
+        prefetch_.reap(page_idx);
+    }
+    transport_.release_event(event_handle);
 }
 
 void WeightPager::release_async_transfer_event(int event_handle) {

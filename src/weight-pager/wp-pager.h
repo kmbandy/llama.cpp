@@ -148,6 +148,7 @@ public:
     int  take_async_transfer_event(int page_idx);
     bool enqueue_async_transfer_wait(int event_handle, void * stream);
     bool synchronize_async_transfer_event(int event_handle);
+    void finish_async_transfer_event(int page_idx, int event_handle);
     void release_async_transfer_event(int event_handle);
 
     // Submit a prefetch hint for a page. No-op if the page is already in

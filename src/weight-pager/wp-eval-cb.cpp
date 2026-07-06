@@ -51,15 +51,20 @@ bool eval_debug_enabled() {
 }
 
 #if defined(GGML_USE_HIP)
+struct AsyncTransferEvent {
+    int page_idx = -1;
+    int event_handle = -1;
+};
+
 struct PendingAsyncOp {
     WeightPager *     pager = nullptr;
     std::vector<int> pages;
-    std::vector<int> transfer_events;
+    std::vector<AsyncTransferEvent> transfer_events;
     hipEvent_t       done = nullptr;
 };
 
 std::vector<int>            s_pinned_pages_prev_op;
-std::vector<int>            s_async_events_prev_op;
+std::vector<AsyncTransferEvent> s_async_events_prev_op;
 std::vector<PendingAsyncOp> s_pending_async_ops;
 WeightPager *               s_prev_op_pager = nullptr;
 
@@ -70,9 +75,9 @@ void release_async_op(PendingAsyncOp & op) {
             owner->unpin_page(page_idx);
         }
     }
-    for (int evt : op.transfer_events) {
+    for (const AsyncTransferEvent & evt : op.transfer_events) {
         if (owner != nullptr) {
-            owner->release_async_transfer_event(evt);
+            owner->finish_async_transfer_event(evt.page_idx, evt.event_handle);
         }
     }
     if (op.done != nullptr) {
@@ -127,8 +132,8 @@ void weight_pager_eval_cb_reset(WeightPager * pager) {
         for (int page_idx : s_pinned_pages_prev_op) {
             pager->unpin_page(page_idx);
         }
-        for (int evt : s_async_events_prev_op) {
-            pager->release_async_transfer_event(evt);
+        for (const AsyncTransferEvent & evt : s_async_events_prev_op) {
+            pager->finish_async_transfer_event(evt.page_idx, evt.event_handle);
         }
         s_pinned_pages_prev_op.clear();
         s_async_events_prev_op.clear();
@@ -214,8 +219,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 for (int prev_page : s_pinned_pages_prev_op) {
                     owner->unpin_page(prev_page);
                 }
-                for (int evt : s_async_events_prev_op) {
-                    owner->release_async_transfer_event(evt);
+                for (const AsyncTransferEvent & evt : s_async_events_prev_op) {
+                    owner->finish_async_transfer_event(evt.page_idx, evt.event_handle);
                 }
                 s_pinned_pages_prev_op.clear();
                 s_async_events_prev_op.clear();
@@ -238,14 +243,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
 #if defined(GGML_USE_HIP)
     auto enqueue_async_wait_for_page = [pager](int page_idx,
-                                               std::vector<int> & prev_events) {
+                                               std::vector<AsyncTransferEvent> & prev_events) {
         if (!pager->async_ensure_enabled()) return;
         const int evt = pager->take_async_transfer_event(page_idx);
         if (evt < 0) return;
 
         hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
         if (wp_stream != nullptr && pager->enqueue_async_transfer_wait(evt, wp_stream)) {
-            prev_events.push_back(evt);
+            prev_events.push_back(AsyncTransferEvent{page_idx, evt});
             return;
         }
 
@@ -253,7 +258,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             LLAMA_LOG_WARN("[wp::eval_cb] async transfer event synchronize failed for page %d\n",
                            page_idx);
         }
-        pager->release_async_transfer_event(evt);
+        pager->finish_async_transfer_event(page_idx, evt);
     };
 #endif
 
