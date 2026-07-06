@@ -65,6 +65,23 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
+    if (slot_size <= payload_size) return true;
+    if (dst_vram == nullptr) return false;
+#if defined(GGML_USE_HIP)
+    hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
+                               slot_size - payload_size);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: p2p padding hipMemset failed: %s\n",
+                       hipGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -189,8 +206,12 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     // 3. File IO layer (io_uring or pread).
+    const FileIOP2PConfig p2p_cfg{
+        pool_.slot_ptr(0),
+        (size_t) cfg_.n_slots * slot_size,
+    };
     file_io_ = create_file_io(std::move(fds), cfg_.prefer_async_io,
-                              cfg_.prefetch_depth);
+                              cfg_.prefetch_depth, &p2p_cfg);
     if (!file_io_) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: file IO layer init failed\n");
         transport_.shutdown();
@@ -788,9 +809,8 @@ void WeightPager::mark_cross_layer_prefetch_candidates(const std::vector<int> & 
 
 int WeightPager::page_in_sync_(int page_idx) {
     // Synchronous read into a fresh slot, bypassing the prefetch pipeline.
-    // Used by ensure() on miss. Tries the fast staging path through the
-    // FileIOLayer (sync if iouring, but pinned still helps DMA on async),
-    // then hands off to GpuTransport for the H2D + padding zero.
+    // Used by ensure() on miss. Host transports read into staging and then
+    // hand off to GpuTransport; P2P transports read into the VRAM slot.
 
     static int s_diag_count = 0;
     const bool diag = (s_diag_count < 5);
@@ -822,27 +842,54 @@ int WeightPager::page_in_sync_(int page_idx) {
         return -1;
     }
 
-    // Stage 1: blocking read into staging via the file IO layer.
+    // Stage 1: blocking read via the file IO layer. P2P reads directly
+    // into the VRAM slot; host transports read into the shared pinned
+    // staging buffer and use GpuTransport for the H2D copy below.
     const uint64_t req_id = (uint64_t) -1;  // synthetic; not pipelined
-    bool ok = file_io_->submit(req_id, (int) m.file_idx, m.file_offset, m.size, staging);
-    if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: submit returned ok=%d\n", s_diag_count, (int)ok);
-    if (ok) file_io_->flush();
-    while (ok) {
-        IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
-        if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: wait_any returned req_id=%lu status=%d bytes=%d\n",
-                                  s_diag_count, (unsigned long) r.req_id, (int) r.status, r.bytes_read);
-        if (r.req_id == req_id) {
-            ok = (r.status == IoStatus::Ok && r.bytes_read == (int) m.size);
-            break;
+    bool direct_to_device = file_io_->direct_to_device();
+    void * read_dst = direct_to_device ? dst : staging;
+    auto read_once = [&]() {
+        bool read_ok = file_io_->submit(req_id, (int) m.file_idx, m.file_offset, m.size, read_dst);
+        if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: submit returned ok=%d\n", s_diag_count, (int)read_ok);
+        if (read_ok) file_io_->flush();
+        while (read_ok) {
+            IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
+            if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: wait_any returned req_id=%lu status=%d bytes=%d\n",
+                                      s_diag_count, (unsigned long) r.req_id, (int) r.status, r.bytes_read);
+            if (r.req_id == req_id) {
+                read_ok = (r.status == IoStatus::Ok && r.bytes_read == (int) m.size);
+                break;
+            }
+            // Unrelated completion (could be a stale prefetch). Drop it; the
+            // prefetch path treats unknown req_ids as no-ops in process_io_.
         }
-        // Unrelated completion (could be a stale prefetch). Drop it; the
-        // prefetch path treats unknown req_ids as no-ops in process_io_.
+        return read_ok;
+    };
+    bool ok = read_once();
+    if (!ok && direct_to_device && !file_io_->direct_to_device()) {
+        direct_to_device = false;
+        read_dst = staging;
+        ok = read_once();
     }
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage1 done ok=%d\n", s_diag_count, (int)ok);
     if (!ok) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: file IO failed for page %d\n", page_idx);
         pool_.release_slot(slot);
         return -1;
+    }
+
+    if (direct_to_device) {
+        if (!zero_device_padding(dst, m.size, pool_.slot_size())) {
+            pool_.release_slot(slot);
+            return -1;
+        }
+        page_to_slot_[page_idx] = slot;
+        page_loaded_[page_idx]  = true;
+        slot_to_page_[slot]     = page_idx;
+        record_page_in_(m.size, seconds_since(io_t0));
+        if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT p2p slot=%d\n", s_diag_count, slot);
+        ++s_diag_count;
+        return slot;
     }
 
     // Stage 2: H2D + padding zero. stage_in() preserves the synchronous

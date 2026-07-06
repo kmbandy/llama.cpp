@@ -53,6 +53,23 @@ void free_pinned(void * p) {
 #endif
 }
 
+bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
+    if (slot_size <= payload_size) return true;
+    if (dst_vram == nullptr) return false;
+#if defined(GGML_USE_HIP)
+    hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
+                               slot_size - payload_size);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::PrefetchScheduler: p2p padding hipMemset failed: %s\n",
+                       hipGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -180,8 +197,10 @@ bool PrefetchScheduler::submit(int page_idx, int fd_idx, uint64_t file_offset,
     s.slot_size    = slot_size;
     s.dst_vram     = dst_vram;
     s.gpu_event    = -1;
+    s.direct_to_device = file_io_->direct_to_device();
 
-    if (!file_io_->submit(s.req_id, fd_idx, file_offset, payload_size, staging_[handle])) {
+    void * read_dst = s.direct_to_device ? dst_vram : staging_[handle];
+    if (!file_io_->submit(s.req_id, fd_idx, file_offset, payload_size, read_dst)) {
         // FileIOLayer rejected. Release the slot and report failure.
         s.state = State::Free;
         free_slots_.push_back(handle);
@@ -243,9 +262,11 @@ bool PrefetchScheduler::submit_batch(const std::vector<PrefetchBatchRequest> & r
         s.slot_size    = r.slot_size;
         s.dst_vram     = r.dst_vram;
         s.gpu_event    = -1;
+        s.direct_to_device = file_io_->direct_to_device();
         handles.push_back(h);
         file_reqs.push_back(FileIOBatchRequest{
-            s.req_id, r.fd_idx, r.file_offset, r.payload_size, staging_[h]
+            s.req_id, r.fd_idx, r.file_offset, r.payload_size,
+            s.direct_to_device ? r.dst_vram : staging_[h]
         });
     }
 
@@ -300,6 +321,15 @@ void PrefetchScheduler::promote_stage2_() {
     for (int h = 0; h < queue_depth_; ++h) {
         Slot & s = slots_[h];
         if (s.state != State::Stage1Done) continue;
+
+        if (s.direct_to_device) {
+            if (!zero_device_padding(s.dst_vram, s.payload_size, s.slot_size)) {
+                s.state = State::Failed;
+                continue;
+            }
+            s.state = State::Done;
+            continue;
+        }
 
         int evt = async_stage2_
             ? gpu_->stage_in_async(s.dst_vram, staging_[h], s.payload_size, s.slot_size)

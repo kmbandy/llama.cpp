@@ -31,6 +31,12 @@ enum class IoStatus {
     Timeout,             // wait_any timed out; no request reaped, queue unchanged
 };
 
+enum class FileIOTransport {
+    SyncPread,
+    IoUringHost,
+    IoUringP2P,
+};
+
 struct IoResult {
     uint64_t req_id     = 0;
     IoStatus status     = IoStatus::ErrorNoSubmit;
@@ -112,6 +118,17 @@ public:
     // non-io_uring backends; the SQE-batching syscall savings only apply
     // when the underlying transport is async with a submission queue.
     virtual int submit_batch(const std::vector<FileIOBatchRequest> & reqs);
+
+    // Which transport is currently active. P2P layers may downgrade at
+    // runtime after a transport failure; callers should query this at the
+    // point where they choose the read destination.
+    virtual FileIOTransport transport() const = 0;
+    virtual bool direct_to_device() const { return false; }
+};
+
+struct FileIOP2PConfig {
+    void * pool_base = nullptr;
+    size_t pool_size = 0;
 };
 
 // Factory. `fds` is a list of pre-prepared file descriptors (typically dup'd
@@ -121,7 +138,21 @@ public:
 // unavailable or initialization fails, falls back to SyncPread silently.
 std::unique_ptr<FileIOLayer> create_file_io(std::vector<int> fds,
                                             bool             prefer_async,
-                                            int              queue_depth = 8);
+                                            int              queue_depth = 8,
+                                            const FileIOP2PConfig * p2p = nullptr);
+
+// Host-only factory used by the P2P layer after runtime downgrade. It follows
+// the existing io_uring-host -> SyncPread ladder and never tries P2P.
+std::unique_ptr<FileIOLayer> create_host_file_io(std::vector<int> fds,
+                                                 bool             prefer_async,
+                                                 int              queue_depth = 8);
+
+// P2P factory implemented in wp-file-io-p2p.cpp. Non-HIP or non-io_uring
+// builds compile a stub that returns nullptr.
+std::unique_ptr<FileIOLayer> create_p2p_file_io(std::vector<int> fds,
+                                                bool             prefer_async,
+                                                int              queue_depth,
+                                                const FileIOP2PConfig & cfg);
 
 // Helper: dup `src_fd` and clear O_DIRECT on the result. Returns the new fd
 // or -1 on failure. Callers should use this when handing fds to FileIOLayer

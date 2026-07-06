@@ -141,6 +141,7 @@ private:
         size_t   slot_size       = 0;
         void *   dst_vram        = nullptr;
         int      gpu_event       = -1;
+        bool     direct_to_device = false;
     };
 
     int  alloc_slot_();
