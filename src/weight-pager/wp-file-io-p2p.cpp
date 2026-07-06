@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 #include <unistd.h>
 
@@ -83,27 +82,24 @@ public:
         if (!p2p_enabled_) {
             return host_->submit(req_id, fd_idx, offset, size, dst);
         }
-        if (!ring_ok_ || fd_idx < 0 || (size_t) fd_idx >= fds_.size() ||
-            dst == nullptr || size == 0) {
+        if (!ring_ok_ || pool_mapped_ == nullptr || fd_idx < 0 ||
+            (size_t) fd_idx >= fds_.size() || dst == nullptr || size == 0) {
             return false;
         }
 
-        int dmabuf_fd = -1;
-        uint64_t dmabuf_offset = 0;
-        const uint32_t status = hsa_export_(dst, size, &dmabuf_fd, &dmabuf_offset);
-        if (status != 0 || dmabuf_fd < 0) {
-            switch_to_host_("export failed", status);
+        // Read directly into the persistent pool dma_buf mapping. dst points
+        // into the VRAM slot pool; its byte offset within the pool maps 1:1
+        // onto the once-mmap'd dma_buf. This avoids a per-read
+        // export/mmap/munmap/close (which dominated wall time and made P2P
+        // slower than host staging).
+        char * base = static_cast<char *>(pool_base_);
+        char * d    = static_cast<char *>(dst);
+        if (d < base || d + size > base + pool_size_) {
+            // dst outside the exported pool region; can't P2P this read.
+            switch_to_host_("dst outside pool", 0);
             return false;
         }
-
-        void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                             dmabuf_fd, (off_t) dmabuf_offset);
-        if (mapped == MAP_FAILED) {
-            const int saved_errno = errno;
-            hsa_close_(dmabuf_fd);
-            switch_to_host_errno_("mmap failed", saved_errno);
-            return false;
-        }
+        void * mapped_dst = static_cast<char *>(pool_mapped_) + (d - base);
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
         if (sqe == nullptr) {
@@ -111,16 +107,13 @@ public:
             sqe = io_uring_get_sqe(&ring_);
         }
         if (sqe == nullptr) {
-            munmap(mapped, size);
-            hsa_close_(dmabuf_fd);
             switch_to_host_("SQ ring full", 0);
             return false;
         }
 
-        io_uring_prep_read(sqe, fd_idx, mapped, (unsigned) size, (off_t) offset);
+        io_uring_prep_read(sqe, fd_idx, mapped_dst, (unsigned) size, (off_t) offset);
         sqe->flags    |= IOSQE_FIXED_FILE;
         sqe->user_data = req_id;
-        mappings_.emplace(req_id, Mapping{dmabuf_fd, mapped, size});
         ++pending_;
         return true;
     }
@@ -180,11 +173,6 @@ public:
 
         r.req_id = cqe->user_data;
         const int res = cqe->res;
-        auto it = mappings_.find(r.req_id);
-        if (it != mappings_.end()) {
-            cleanup_mapping_(it->second);
-            mappings_.erase(it);
-        }
         io_uring_cqe_seen(&ring_, cqe);
         --pending_;
 
@@ -241,12 +229,6 @@ public:
     }
 
 private:
-    struct Mapping {
-        int fd = -1;
-        void * addr = nullptr;
-        size_t size = 0;
-    };
-
     IoUringP2PFileIOLayer(std::vector<int> fds, std::unique_ptr<FileIOLayer> host)
         : fds_(std::move(fds)), host_(std::move(host)) {}
 
@@ -281,7 +263,7 @@ private:
             files_registered_ = true;
         }
 
-        return probe_export_(cfg.pool_base, cfg.pool_size);
+        return setup_pool_mapping_(cfg.pool_base, cfg.pool_size);
     }
 
     bool load_hsa_() {
@@ -305,53 +287,45 @@ private:
         return true;
     }
 
-    bool probe_export_(void * ptr, size_t size) {
+    // Export the whole VRAM slot pool as a dma_buf ONCE and mmap it for the
+    // layer's lifetime. Per-read submits then just index into this mapping.
+    bool setup_pool_mapping_(void * ptr, size_t size) {
         if (ptr == nullptr || size == 0) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool probe target is empty\n");
+            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool target is empty\n");
             return false;
         }
-        const size_t probe_size = size < 4096 ? size : 4096;
         int dmabuf_fd = -1;
         uint64_t dmabuf_offset = 0;
-        const uint32_t status = hsa_export_(ptr, probe_size, &dmabuf_fd, &dmabuf_offset);
+        const uint32_t status = hsa_export_(ptr, size, &dmabuf_fd, &dmabuf_offset);
         if (status != 0 || dmabuf_fd < 0) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf probe export failed: %s (0x%04x), fd=%d\n",
+            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf export failed: %s (0x%04x), fd=%d\n",
                            hsa_status_name(status), status, dmabuf_fd);
             return false;
         }
 
         struct stat st {};
         if (fstat(dmabuf_fd, &st) != 0) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf probe fstat failed: %s\n", strerror(errno));
+            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf fstat failed: %s\n", strerror(errno));
             hsa_close_(dmabuf_fd);
             return false;
         }
 
-        void * mapped = mmap(nullptr, probe_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+        void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                              dmabuf_fd, (off_t) dmabuf_offset);
         if (mapped == MAP_FAILED) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf probe mmap failed: %s\n", strerror(errno));
+            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf mmap failed: %s\n", strerror(errno));
             hsa_close_(dmabuf_fd);
             return false;
         }
-        munmap(mapped, probe_size);
-        const uint32_t close_status = hsa_close_(dmabuf_fd);
-        if (close_status != 0) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf probe close failed: %s (0x%04x)\n",
-                           hsa_status_name(close_status), close_status);
-            return false;
-        }
-        p2p_enabled_ = true;
-        return true;
-    }
 
-    void cleanup_mapping_(const Mapping & m) {
-        if (m.addr != nullptr && m.addr != MAP_FAILED && m.size > 0) {
-            munmap(m.addr, m.size);
-        }
-        if (m.fd >= 0 && hsa_close_ != nullptr) {
-            hsa_close_(m.fd);
-        }
+        pool_base_      = ptr;
+        pool_size_      = size;
+        pool_dmabuf_fd_ = dmabuf_fd;
+        pool_mapped_    = mapped;
+        p2p_enabled_    = true;
+        LLAMA_LOG_WARN("wp::IoUringP2PFileIO: P2P enabled — pool dma_buf exported+mmap'd once (%.1f MiB, persistent)\n",
+                       (double) size / 1048576.0);
+        return true;
     }
 
     void switch_to_host_(const char * reason, uint32_t hsa_status) {
@@ -377,15 +351,19 @@ private:
     }
 
     void shutdown_p2p_() {
-        for (auto & kv : mappings_) {
-            cleanup_mapping_(kv.second);
-        }
-        mappings_.clear();
         pending_ = 0;
         if (ring_ok_) {
             if (files_registered_) io_uring_unregister_files(&ring_);
             io_uring_queue_exit(&ring_);
             ring_ok_ = false;
+        }
+        if (pool_mapped_ != nullptr && pool_mapped_ != MAP_FAILED) {
+            munmap(pool_mapped_, pool_size_);
+            pool_mapped_ = nullptr;
+        }
+        if (pool_dmabuf_fd_ >= 0 && hsa_close_ != nullptr) {
+            hsa_close_(pool_dmabuf_fd_);
+            pool_dmabuf_fd_ = -1;
         }
         if (libhsa_ != nullptr) {
             dlclose(libhsa_);
@@ -403,7 +381,12 @@ private:
     void * libhsa_ = nullptr;
     HsaExportDmaBufFn hsa_export_ = nullptr;
     HsaCloseDmaBufFn hsa_close_ = nullptr;
-    std::unordered_map<uint64_t, Mapping> mappings_;
+
+    // Persistent pool dma_buf mapping (exported+mmap'd once in init).
+    void * pool_base_      = nullptr;
+    size_t pool_size_      = 0;
+    int    pool_dmabuf_fd_ = -1;
+    void * pool_mapped_    = nullptr;
 };
 
 }  // anonymous namespace
