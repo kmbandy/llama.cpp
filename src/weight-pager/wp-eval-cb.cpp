@@ -42,6 +42,14 @@ struct DebugState {
 };
 DebugState g_debug;
 
+bool eval_debug_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_EVAL_DEBUG");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
 #if defined(GGML_USE_HIP)
 struct PendingAsyncOp {
     WeightPager *     pager = nullptr;
@@ -138,6 +146,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
+    const bool eval_debug = eval_debug_enabled();
 
 #if defined(GGML_USE_HIP)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
@@ -758,41 +767,41 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         if (pager->hip_graphs_enabled()) {
             pager->update_graph_pins((const void *) t, graph_pin_page_indices);
         }
-        // Diagnostic: did any src LOOK LIKE a weight tensor that we should have found?
-        // Helps surface name-mismatch / catalog-miss bugs.
-        bool had_weight_looking_src = false;
-        for (int i = 0; i < GGML_MAX_SRC; ++i) {
-            struct ggml_tensor * s = t->src[i];
-            if (s == nullptr) break;
-            const char * nm = ggml_get_name(s);
-            if (nm && std::strstr(nm, "weight") != nullptr) {
-                had_weight_looking_src = true;
-                break;
-            }
-        }
-        if (had_weight_looking_src) {
-            if (g_debug.ops_no_paged_with_weight_src < 16) {
-                std::string srcs;
-                for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (t->src[i] == nullptr) break;
-                    if (i > 0) srcs += ", ";
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf), "%s@%p(buf=%p)",
-                                  ggml_get_name(t->src[i]), t->src[i]->data,
-                                  (void*)t->src[i]->buffer);
-                    srcs += buf;
+        if (eval_debug) {
+            // Diagnostic: did any src look like a weight tensor that we should have found?
+            bool had_weight_looking_src = false;
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                struct ggml_tensor * s = t->src[i];
+                if (s == nullptr) break;
+                const char * nm = ggml_get_name(s);
+                if (nm && std::strstr(nm, "weight") != nullptr) {
+                    had_weight_looking_src = true;
+                    break;
                 }
-                LLAMA_LOG_WARN("[wp::eval_cb][MISS] op=%s name=\"%s\" srcs=[%s]\n",
-                               ggml_op_name(t->op), ggml_get_name(t), srcs.c_str());
             }
-            ++g_debug.ops_no_paged_with_weight_src;
-        }
-        // Periodic summary so we know eval_cb is alive even when no patches happen
-        if ((g_debug.ops_seen % 500) == 0) {
-            LLAMA_LOG_WARN("[wp::eval_cb][SUM] ops_seen=%d ops_with_pages=%d patches=%d miss_w=%d fails=%d\n",
-                           g_debug.ops_seen, g_debug.ops_with_pages,
-                           g_debug.patches_total, g_debug.ops_no_paged_with_weight_src,
-                           g_debug.ensures_failed);
+            if (had_weight_looking_src) {
+                if (g_debug.ops_no_paged_with_weight_src < 16) {
+                    std::string srcs;
+                    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                        if (t->src[i] == nullptr) break;
+                        if (i > 0) srcs += ", ";
+                        char buf[128];
+                        std::snprintf(buf, sizeof(buf), "%s@%p(buf=%p)",
+                                      ggml_get_name(t->src[i]), t->src[i]->data,
+                                      (void*)t->src[i]->buffer);
+                        srcs += buf;
+                    }
+                    LLAMA_LOG_WARN("[wp::eval_cb][MISS] op=%s name=\"%s\" srcs=[%s]\n",
+                                   ggml_op_name(t->op), ggml_get_name(t), srcs.c_str());
+                }
+                ++g_debug.ops_no_paged_with_weight_src;
+            }
+            if ((g_debug.ops_seen % 500) == 0) {
+                LLAMA_LOG_WARN("[wp::eval_cb][SUM] ops_seen=%d ops_with_pages=%d patches=%d miss_w=%d fails=%d\n",
+                               g_debug.ops_seen, g_debug.ops_with_pages,
+                               g_debug.patches_total, g_debug.ops_no_paged_with_weight_src,
+                               g_debug.ensures_failed);
+            }
         }
         return true;
     }
@@ -901,17 +910,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     g_debug.patches_total += patches_this_op;
     g_debug.views_patched += views_this_op;
-    // Always-on diagnostics for the first N paged ops so we can see what
-    // the eval cb is doing without relying on env var. Use WARN level so
-    // llama-cli's default log filter doesn't suppress it.
-    if (g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
+    if (eval_debug && g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
         LLAMA_LOG_WARN("[wp::eval_cb][%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d miss_w=%d)\n",
                         g_debug.ops_with_pages, ggml_op_name(t->op),
                         ggml_get_name(t),
                         n_page_indices, patches_this_op, views_this_op,
                         g_debug.patches_total, g_debug.views_patched, g_debug.ensures_failed,
                         g_debug.ops_no_paged_with_weight_src);
-    } else if (g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
+    } else if (eval_debug && g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
         LLAMA_LOG_WARN("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
                        DebugState::kVerboseLimit);
     }

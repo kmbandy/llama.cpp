@@ -333,7 +333,7 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     initialized_ = true;
-    LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+    LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
                    catalog_.size(), cfg_.n_slots, slot_size,
                    (double) cfg_.n_slots * (double) slot_size / 1048576.0,
                    cfg_.prefetch_depth, (int) sync_staging_pinned_,
@@ -507,7 +507,7 @@ void WeightPager::log_stats_summary() {
     const double gbps = s.io_seconds > 0.0 ? gb_read / s.io_seconds : 0.0;
 
     if (host_tier_ || s.host_tier_hits > 0) {
-        LLAMA_LOG_INFO(
+        LLAMA_LOG_WARN(
             "wp::WeightPager summary:\n"
             "  page_ins: %lu\n"
             "  evictions: %lu\n"
@@ -544,7 +544,7 @@ void WeightPager::log_stats_summary() {
         return;
     }
 
-    LLAMA_LOG_INFO(
+    LLAMA_LOG_WARN(
         "wp::WeightPager summary:\n"
         "  page_ins: %lu\n"
         "  evictions: %lu\n"
