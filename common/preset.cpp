@@ -330,7 +330,7 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
             }
         }
 
-        if (preset.name == "*") {
+        if (preset.name == "*" || preset.name == "*global*") {
             // handle global preset
             global = preset;
         } else {

@@ -321,6 +321,14 @@ int llama_server(int argc, char ** argv) {
 
     if (child.is_child() && child.get_mode() == SERVER_CHILD_MODE_DOWNLOAD) {
         return child.run_download(params);
+    } else if (child.is_child() && child.get_mode() == SERVER_CHILD_MODE_ESTIMATE) {
+        try {
+            common_models_handler_apply(models_handler, params);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to resolve model for estimate: %s\n", e.what());
+            return 1;
+        }
+        return child.run_estimate(params);
     } else if (!is_router_server) {
         // single-model mode (NOT spawned by router)
         try {

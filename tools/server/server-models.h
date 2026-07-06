@@ -46,6 +46,7 @@ enum server_model_source {
 enum server_child_mode {
     SERVER_CHILD_MODE_NORMAL,   // load the model and run normally
     SERVER_CHILD_MODE_DOWNLOAD, // download the model and exit
+    SERVER_CHILD_MODE_ESTIMATE, // estimate model VRAM and exit
 };
 
 static std::string server_model_status_to_string(server_model_status status) {
@@ -69,6 +70,22 @@ static std::string server_model_source_to_string(server_model_source source) {
     }
 }
 
+struct server_gpu_slot {
+    std::string dev_name;
+    std::string vram_probe;
+    int64_t total_bytes = 0;
+    int64_t reserved_bytes = 0;
+    std::string exclusive_holder;
+};
+
+struct server_model_placement {
+    std::vector<std::string> devs;
+    std::vector<float> split;
+    std::vector<int64_t> need_bytes_per_dev;
+    bool exclusive = false;
+    bool pinned = false;
+};
+
 struct server_model_meta {
     server_model_source source = SERVER_MODEL_SOURCE_CACHE;
     common_preset preset;
@@ -84,6 +101,7 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    server_model_placement placement;
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     bool is_ready() const {
@@ -118,6 +136,8 @@ private:
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
+    std::vector<server_gpu_slot> gpu_slots;
+    bool gpu_placement_enabled = false;
 
     // for stopping models
     std::condition_variable cv_stop;
@@ -178,6 +198,19 @@ private:
 
     // unload least recently used models if the limit is reached
     void unload_lru();
+
+    bool load_gpu_config(const common_preset & global_preset);
+    void parse_model_placement(server_model_meta & meta);
+    void validate_gpu_slots();
+    json gpu_slots_json();
+    void credit_gpu_reservation_locked(const std::string & name);
+    void reconcile_gpu_reservation_locked(const std::string & name);
+    void ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk);
+    void reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement);
+    std::vector<std::string> choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement);
+    int64_t read_physical_free_bytes(const server_gpu_slot & slot) const;
+    int64_t effective_free_bytes_locked(const server_gpu_slot & slot) const;
+    std::vector<int64_t> estimate_need_bytes(const server_model_meta & meta);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
@@ -270,6 +303,7 @@ struct server_child {
     bool is_child();
     server_child_mode get_mode();
     int run_download(common_params & params);
+    int run_estimate(common_params & params);
 
     // register the shutdown_handler to be called by the router
     // return the monitoring thread (to be joined by the caller)

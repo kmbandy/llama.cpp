@@ -7,8 +7,11 @@
 #include "build-info.h"
 #include "preset.h"
 #include "download.h"
+#include "fit.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
+#include <cinttypes>
+#include <fstream>
 #include <optional>
 #include <sheredom/subprocess.h>
 
@@ -46,9 +49,14 @@ extern char **environ;
 #endif
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
+#define ROUTER_GPU_MARGIN_BYTES (1024LL * 1024LL * 1024LL)
 
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
+
+static constexpr const char * ROUTER_ARG_GPU     = "LLAMA_ARG_ROUTER_GPU";
+static constexpr const char * ROUTER_ARG_VRAM_MB = "LLAMA_ARG_ROUTER_VRAM_MB";
+static constexpr const char * ROUTER_ARG_PINNED  = "LLAMA_ARG_ROUTER_PINNED";
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -148,6 +156,10 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
+    preset.unset_option("LLAMA_ARG_GPUS");
+    preset.unset_option(ROUTER_ARG_GPU);
+    preset.unset_option(ROUTER_ARG_VRAM_MB);
+    preset.unset_option(ROUTER_ARG_PINNED);
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -199,12 +211,38 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
+static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & vec);
+
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+    if (!placement.devs.empty()) {
+        std::string dev_list;
+        for (const auto & dev : placement.devs) {
+            if (!dev_list.empty()) {
+                dev_list += ",";
+            }
+            dev_list += dev;
+        }
+        preset.set_option(ctx_preset, "LLAMA_ARG_DEVICE", dev_list);
+        if (placement.exclusive) {
+            preset.set_option(ctx_preset, "LLAMA_ARG_SPLIT_MODE", "layer");
+            preset.set_option(ctx_preset, "LLAMA_ARG_MAIN_GPU", "0");
+            if (!placement.split.empty()) {
+                std::string split_str;
+                for (float v : placement.split) {
+                    if (!split_str.empty()) {
+                        split_str += ",";
+                    }
+                    split_str += std::to_string(v);
+                }
+                preset.set_option(ctx_preset, "LLAMA_ARG_TENSOR_SPLIT", split_str);
+            }
+        }
+    }
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
@@ -316,6 +354,7 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
+    parse_model_placement(meta);
     meta.update_args(ctx_preset, bin_path); // render args
     meta.update_caps();
     std::string name = meta.name;
@@ -324,6 +363,530 @@ void server_models::add_model(server_model_meta && meta) {
         /* th      */ std::thread(),
         /* meta    */ std::move(meta)
     };
+}
+
+static int64_t parse_mb_to_bytes(const std::string & value) {
+    return std::stoll(value) * 1024LL * 1024LL;
+}
+
+bool server_models::load_gpu_config(const common_preset & global_preset) {
+    if (gpu_placement_enabled) {
+        return true;
+    }
+    std::string spec = base_params.router_gpus;
+    if (spec.empty()) {
+        global_preset.get_option("LLAMA_ARG_GPUS", spec);
+    }
+
+    gpu_slots.clear();
+    gpu_placement_enabled = false;
+    if (spec.empty()) {
+        return false;
+    }
+
+    for (auto entry : string_split<std::string>(spec, ',')) {
+        entry = string_strip(entry);
+        if (entry.empty()) {
+            continue;
+        }
+        const size_t p0 = entry.find(':');
+        const size_t p1 = p0 == std::string::npos ? std::string::npos : entry.find(':', p0 + 1);
+        if (p0 == std::string::npos || p1 == std::string::npos) {
+            throw std::runtime_error("invalid --gpus entry '" + entry + "', expected name:total_mb:probe");
+        }
+        server_gpu_slot slot;
+        slot.dev_name = entry.substr(0, p0);
+        slot.total_bytes = parse_mb_to_bytes(entry.substr(p0 + 1, p1 - p0 - 1));
+        slot.vram_probe = entry.substr(p1 + 1);
+        if (slot.dev_name.empty() || slot.total_bytes <= 0 || slot.vram_probe.empty()) {
+            throw std::runtime_error("invalid --gpus entry '" + entry + "'");
+        }
+        for (const auto & existing : gpu_slots) {
+            if (existing.dev_name == slot.dev_name) {
+                throw std::runtime_error("duplicate GPU slot '" + slot.dev_name + "'");
+            }
+        }
+        gpu_slots.push_back(std::move(slot));
+    }
+
+    gpu_placement_enabled = !gpu_slots.empty();
+    if (gpu_placement_enabled) {
+        validate_gpu_slots();
+        SRV_INF("router GPU placement enabled with %zu declared slots\n", gpu_slots.size());
+    }
+    return gpu_placement_enabled;
+}
+
+void server_models::parse_model_placement(server_model_meta & meta) {
+    meta.placement = {};
+    std::string pinned;
+    if (meta.preset.get_option(ROUTER_ARG_PINNED, pinned)) {
+        meta.placement.pinned = common_arg_utils::is_truthy(pinned);
+    }
+
+    std::string gpu;
+    if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
+        gpu = string_strip(gpu);
+    }
+    if (gpu.empty() || gpu == "any") {
+        return;
+    }
+
+    for (auto dev : string_split<std::string>(gpu, ',')) {
+        dev = string_strip(dev);
+        if (!dev.empty()) {
+            meta.placement.devs.push_back(dev);
+        }
+    }
+    meta.placement.exclusive = meta.placement.devs.size() > 1;
+
+    std::string split_str;
+    if (meta.preset.get_option("LLAMA_ARG_TENSOR_SPLIT", split_str)) {
+        for (auto part : string_split<std::string>(split_str, ',')) {
+            part = string_strip(part);
+            if (!part.empty()) {
+                meta.placement.split.push_back(std::stof(part));
+            }
+        }
+    }
+}
+
+void server_models::validate_gpu_slots() {
+    std::vector<std::string> args = { bin_path, "--list-devices" };
+    std::vector<std::string> env = base_env;
+    std::vector<char *> argv = to_char_ptr_array(args);
+    std::vector<char *> envp = to_char_ptr_array(env);
+    subprocess_s proc;
+    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
+    int rc = subprocess_create_ex(argv.data(), options, envp.data(), &proc);
+    if (rc != 0) {
+        throw std::runtime_error("failed to spawn --list-devices for router GPU validation");
+    }
+    std::string output;
+    FILE * stdout_file = subprocess_stdout(&proc);
+    if (stdout_file) {
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
+            output += buffer;
+        }
+    }
+    int exit_code = 0;
+    subprocess_join(&proc, &exit_code);
+    subprocess_destroy(&proc);
+    if (exit_code != 0) {
+        throw std::runtime_error("--list-devices validation child exited with status " + std::to_string(exit_code));
+    }
+    for (const auto & slot : gpu_slots) {
+        if (output.find(slot.dev_name + ":") == std::string::npos) {
+            throw std::runtime_error("configured GPU slot '" + slot.dev_name + "' was not found in --list-devices output");
+        }
+    }
+}
+
+int64_t server_models::read_physical_free_bytes(const server_gpu_slot & slot) const {
+    if (slot.vram_probe.rfind("nvml:", 0) == 0) {
+        const std::string idx = slot.vram_probe.substr(strlen("nvml:"));
+        const std::string cmd = "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i " + idx + " 2>/dev/null";
+        FILE * pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            return slot.total_bytes;
+        }
+        char buffer[128] = {};
+        std::string out;
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            out = buffer;
+        }
+        pclose(pipe);
+        try {
+            const int64_t used = parse_mb_to_bytes(string_strip(out));
+            return std::max<int64_t>(0, slot.total_bytes - used);
+        } catch (...) {
+            return slot.total_bytes;
+        }
+    }
+
+    std::ifstream file(slot.vram_probe);
+    int64_t used = 0;
+    if (file >> used) {
+        return std::max<int64_t>(0, slot.total_bytes - used);
+    }
+    SRV_WRN("failed to read VRAM probe '%s' for %s, trusting declared total\n",
+            slot.vram_probe.c_str(), slot.dev_name.c_str());
+    return slot.total_bytes;
+}
+
+int64_t server_models::effective_free_bytes_locked(const server_gpu_slot & slot) const {
+    const int64_t physical_free = read_physical_free_bytes(slot);
+    const int64_t ledger_free = std::max<int64_t>(0, slot.total_bytes - slot.reserved_bytes);
+    return std::min(physical_free, ledger_free);
+}
+
+json server_models::gpu_slots_json() {
+    std::lock_guard<std::mutex> lk(mutex);
+    json out = json::array();
+    for (const auto & slot : gpu_slots) {
+        out.push_back({
+            {"name", slot.dev_name},
+            {"total_bytes", slot.total_bytes},
+            {"reserved_bytes", slot.reserved_bytes},
+            {"physical_free_bytes", read_physical_free_bytes(slot)},
+            {"exclusive_holder", slot.exclusive_holder},
+        });
+    }
+    return out;
+}
+
+static int find_slot_index(const std::vector<server_gpu_slot> & slots, const std::string & dev) {
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (slots[i].dev_name == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+void server_models::credit_gpu_reservation_locked(const std::string & name) {
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        return;
+    }
+    auto & placement = it->second.meta.placement;
+    for (size_t i = 0; i < placement.devs.size() && i < placement.need_bytes_per_dev.size(); ++i) {
+        const int slot_idx = find_slot_index(gpu_slots, placement.devs[i]);
+        if (slot_idx < 0) {
+            continue;
+        }
+        auto & slot = gpu_slots[slot_idx];
+        slot.reserved_bytes = std::max<int64_t>(0, slot.reserved_bytes - placement.need_bytes_per_dev[i]);
+        if (slot.exclusive_holder == name) {
+            slot.exclusive_holder.clear();
+        }
+    }
+    placement.need_bytes_per_dev.clear();
+}
+
+void server_models::reserve_gpu_placement_locked(const std::string & name, const server_model_placement & placement) {
+    for (size_t i = 0; i < placement.devs.size() && i < placement.need_bytes_per_dev.size(); ++i) {
+        const int slot_idx = find_slot_index(gpu_slots, placement.devs[i]);
+        GGML_ASSERT(slot_idx >= 0);
+        auto & slot = gpu_slots[slot_idx];
+        slot.reserved_bytes += placement.need_bytes_per_dev[i];
+        if (placement.exclusive) {
+            slot.exclusive_holder = name;
+        }
+    }
+}
+
+void server_models::reconcile_gpu_reservation_locked(const std::string & name) {
+    auto it = mapping.find(name);
+    if (it == mapping.end() || it->second.meta.placement.devs.empty()) {
+        return;
+    }
+    for (size_t i = 0; i < it->second.meta.placement.devs.size(); ++i) {
+        const int slot_idx = find_slot_index(gpu_slots, it->second.meta.placement.devs[i]);
+        if (slot_idx < 0) {
+            continue;
+        }
+        const auto & slot = gpu_slots[slot_idx];
+        SRV_INF("router GPU ledger name=%s dev=%s reserved=%" PRId64 " physical_free=%" PRId64 "\n",
+                name.c_str(), slot.dev_name.c_str(), slot.reserved_bytes, read_physical_free_bytes(slot));
+    }
+}
+
+std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta & meta) {
+    std::string vram_mb;
+    if (meta.preset.get_option(ROUTER_ARG_VRAM_MB, vram_mb)) {
+        return { parse_mb_to_bytes(vram_mb) };
+    }
+
+    const std::string key = [&]() {
+        common_params params;
+        meta.preset.apply_to_params(params, {
+            "LLAMA_ARG_MODEL",
+            "LLAMA_ARG_CTX_SIZE",
+            "LLAMA_ARG_CACHE_TYPE_K",
+            "LLAMA_ARG_CACHE_TYPE_V",
+            "LLAMA_ARG_N_PARALLEL",
+            "LLAMA_ARG_KV_TIERED",
+            "LLAMA_ARG_CTX_CHECKPOINTS",
+            "LLAMA_ARG_CACHE_RAM",
+        });
+        std::string model_path = params.model.path;
+        int64_t mtime = 0;
+        if (!model_path.empty() && std::filesystem::exists(model_path)) {
+            mtime = (int64_t) std::filesystem::last_write_time(model_path).time_since_epoch().count();
+        }
+        return string_format("%s|%" PRId64 "|%d|%d|%d|%d",
+                model_path.c_str(), mtime, params.n_ctx, (int) params.cache_type_k,
+                (int) params.cache_type_v, params.n_parallel);
+    }();
+
+    std::filesystem::path cache_dir = std::filesystem::temp_directory_path() / "llama-router-estimates";
+    std::filesystem::create_directories(cache_dir);
+    const std::filesystem::path cache_file = cache_dir / std::to_string(std::hash<std::string>{}(key));
+    {
+        std::ifstream in(cache_file);
+        if (in.good()) {
+            json data = json::parse(in, nullptr, false);
+            if (data.is_array()) {
+                std::vector<int64_t> cached;
+                for (const auto & v : data) {
+                    cached.push_back(v.get<int64_t>());
+                }
+                if (!cached.empty()) {
+                    return cached;
+                }
+            }
+        }
+    }
+
+    server_model_meta est = meta;
+    est.update_args(ctx_preset, bin_path);
+    std::vector<std::string> child_args = est.args;
+    std::vector<std::string> child_env  = base_env;
+    child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+    child_env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
+
+    std::vector<char *> argv = to_char_ptr_array(child_args);
+    std::vector<char *> envp = to_char_ptr_array(child_env);
+    subprocess_s proc;
+    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
+    int rc = subprocess_create_ex(argv.data(), options, envp.data(), &proc);
+    if (rc != 0) {
+        throw std::runtime_error("failed to spawn estimate child for model " + meta.name);
+    }
+
+    std::vector<int64_t> result;
+    FILE * stdout_file = subprocess_stdout(&proc);
+    if (stdout_file) {
+        char buffer[128 * 1024];
+        while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
+            LOG("[estimate:%s] %s", meta.name.c_str(), buffer);
+            std::string line(buffer);
+            if (!string_starts_with(line.c_str(), CMD_CHILD_TO_ROUTER_STATE)) {
+                continue;
+            }
+            json data = json::parse(line.substr(strlen(CMD_CHILD_TO_ROUTER_STATE)), nullptr, false);
+            if (data.is_discarded()) {
+                continue;
+            }
+            json payload = json_value(data, "payload", json{});
+            if (payload.contains("need_bytes_per_dev") && payload["need_bytes_per_dev"].is_array()) {
+                for (const auto & v : payload["need_bytes_per_dev"]) {
+                    result.push_back(v.get<int64_t>());
+                }
+            }
+        }
+    }
+    int exit_code = 0;
+    subprocess_join(&proc, &exit_code);
+    subprocess_destroy(&proc);
+    if (exit_code != 0 || result.empty()) {
+        throw std::runtime_error("estimate child failed for model " + meta.name);
+    }
+    {
+        std::ofstream out(cache_file);
+        out << safe_json_to_str(json(result));
+    }
+    return result;
+}
+
+std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::string & name, const server_model_placement & placement) {
+    std::vector<std::string> evict;
+    if (!placement.exclusive) {
+        return evict;
+    }
+    std::set<std::string> dev_set(placement.devs.begin(), placement.devs.end());
+    for (const auto & [other_name, inst] : mapping) {
+        if (other_name == name || !inst.meta.is_running()) {
+            continue;
+        }
+        bool overlaps = false;
+        for (const auto & dev : inst.meta.placement.devs) {
+            overlaps = overlaps || dev_set.count(dev) > 0;
+        }
+        if (!overlaps) {
+            continue;
+        }
+        if (inst.meta.placement.pinned) {
+            throw std::runtime_error("spanning model '" + name + "' cannot evict pinned resident '" + other_name + "'");
+        }
+        evict.push_back(other_name);
+    }
+    return evict;
+}
+
+void server_models::ensure_gpu_placement(const std::string & name, server_model_meta & meta, server_child_mode mode, std::unique_lock<std::mutex> & lk) {
+    if (!gpu_placement_enabled) {
+        if (mode == SERVER_CHILD_MODE_NORMAL && !meta.placement.devs.empty()) {
+            throw std::runtime_error("model '" + name + "' uses router gpu= but no router GPU slot table is configured");
+        }
+        return;
+    }
+    if (mode != SERVER_CHILD_MODE_NORMAL) {
+        return;
+    }
+
+    if (meta.placement.devs.empty()) {
+        for (const auto & slot : gpu_slots) {
+            meta.placement.devs.push_back(slot.dev_name);
+        }
+    }
+    for (const auto & dev : meta.placement.devs) {
+        if (find_slot_index(gpu_slots, dev) < 0) {
+            throw std::runtime_error("model '" + name + "' references unknown GPU slot '" + dev + "'");
+        }
+    }
+    meta.placement.exclusive = meta.placement.devs.size() > 1;
+
+    lk.unlock();
+    std::vector<int64_t> needs = estimate_need_bytes(meta);
+    lk.lock();
+
+    if (meta.placement.exclusive) {
+        if (meta.placement.split.empty()) {
+            for (const auto & dev : meta.placement.devs) {
+                const int slot_idx = find_slot_index(gpu_slots, dev);
+                meta.placement.split.push_back((float) gpu_slots[slot_idx].total_bytes);
+            }
+        }
+        if (needs.size() == 1) {
+            const int64_t total_need = needs[0];
+            int64_t total_weight = 0;
+            for (const auto & dev : meta.placement.devs) {
+                total_weight += gpu_slots[find_slot_index(gpu_slots, dev)].total_bytes;
+            }
+            meta.placement.need_bytes_per_dev.clear();
+            for (const auto & dev : meta.placement.devs) {
+                const auto & slot = gpu_slots[find_slot_index(gpu_slots, dev)];
+                meta.placement.need_bytes_per_dev.push_back((total_need * slot.total_bytes) / std::max<int64_t>(1, total_weight));
+            }
+        } else {
+            meta.placement.need_bytes_per_dev.assign(needs.begin(), needs.begin() + std::min(needs.size(), meta.placement.devs.size()));
+        }
+
+        std::vector<std::string> evict = choose_gpu_evictions_locked(name, meta.placement);
+        for (const auto & victim : evict) {
+            SRV_INF("router placement evicting name=%s for spanning model %s\n", victim.c_str(), name.c_str());
+            stopping_models.insert(victim);
+            auto it = mapping.find(victim);
+            if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+                it->second.subproc->terminate();
+            }
+        }
+        if (!evict.empty()) {
+            cv_stop.notify_all();
+            cv.wait(lk, [&]() {
+                for (const auto & victim : evict) {
+                    auto it = mapping.find(victim);
+                    if (it != mapping.end() && it->second.meta.is_running()) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+        }
+        reserve_gpu_placement_locked(name, meta.placement);
+        return;
+    }
+
+    const int64_t need = needs.empty() ? 0 : needs[0];
+    int best_idx = -1;
+    int64_t best_free = -1;
+    for (const auto & dev : meta.placement.devs) {
+        const int idx = find_slot_index(gpu_slots, dev);
+        const auto & slot = gpu_slots[idx];
+        if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name) {
+            continue;
+        }
+        const int64_t free = effective_free_bytes_locked(slot);
+        if (free >= need + ROUTER_GPU_MARGIN_BYTES && free > best_free) {
+            best_free = free;
+            best_idx = idx;
+        }
+    }
+
+    std::vector<std::string> evict;
+    if (best_idx < 0) {
+        struct candidate_t {
+            int idx = -1;
+            std::vector<std::string> victims;
+            int64_t newest_last_used = 0;
+        };
+        std::optional<candidate_t> best;
+        for (const auto & dev : meta.placement.devs) {
+            const int idx = find_slot_index(gpu_slots, dev);
+            const auto & slot = gpu_slots[idx];
+            if (!slot.exclusive_holder.empty() && slot.exclusive_holder != name) {
+                auto holder = mapping.find(slot.exclusive_holder);
+                if (holder != mapping.end() && holder->second.meta.placement.pinned) {
+                    continue;
+                }
+            }
+            std::vector<std::pair<int64_t, std::string>> residents;
+            for (const auto & [other_name, inst] : mapping) {
+                if (other_name == name || !inst.meta.is_running() || inst.meta.status == SERVER_MODEL_STATUS_SLEEPING || inst.meta.placement.pinned) {
+                    continue;
+                }
+                if (std::find(inst.meta.placement.devs.begin(), inst.meta.placement.devs.end(), slot.dev_name) != inst.meta.placement.devs.end()) {
+                    residents.push_back({ inst.meta.last_used, other_name });
+                }
+            }
+            std::sort(residents.begin(), residents.end());
+            int64_t free = effective_free_bytes_locked(slot);
+            candidate_t cand;
+            cand.idx = idx;
+            for (const auto & resident : residents) {
+                if (free >= need + ROUTER_GPU_MARGIN_BYTES) {
+                    break;
+                }
+                cand.victims.push_back(resident.second);
+                cand.newest_last_used = resident.first;
+                auto it = mapping.find(resident.second);
+                if (it != mapping.end() && !it->second.meta.placement.need_bytes_per_dev.empty()) {
+                    free += it->second.meta.placement.need_bytes_per_dev.front();
+                }
+            }
+            if (free < need + ROUTER_GPU_MARGIN_BYTES) {
+                continue;
+            }
+            if (!best.has_value() ||
+                    cand.victims.size() < best->victims.size() ||
+                    (cand.victims.size() == best->victims.size() && cand.newest_last_used < best->newest_last_used)) {
+                best = cand;
+            }
+        }
+        if (!best.has_value()) {
+            throw std::runtime_error("no configured GPU slot has enough capacity for model '" + name + "'");
+        }
+        best_idx = best->idx;
+        evict = best->victims;
+    }
+
+    for (const auto & victim : evict) {
+        SRV_INF("router placement evicting name=%s for model %s\n", victim.c_str(), name.c_str());
+        stopping_models.insert(victim);
+        auto it = mapping.find(victim);
+        if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+            it->second.subproc->terminate();
+        }
+    }
+    if (!evict.empty()) {
+        cv_stop.notify_all();
+        cv.wait(lk, [&]() {
+            for (const auto & victim : evict) {
+                auto it = mapping.find(victim);
+                if (it != mapping.end() && it->second.meta.is_running()) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    meta.placement.devs = { gpu_slots[best_idx].dev_name };
+    meta.placement.need_bytes_per_dev = { need };
+    reserve_gpu_placement_locked(name, meta.placement);
 }
 
 void server_models::notify_sse(const std::string & event, const std::string & model_id, const json & data) {
@@ -357,6 +920,7 @@ void server_models::load_models() {
         custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
         SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
     }
+    load_gpu_config(global);
 
     // cascade, apply global preset first
     cached_models  = ctx_preset.cascade(global, cached_models);
@@ -463,6 +1027,7 @@ void server_models::load_models() {
                 /* exit_code     */ 0,
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                 /* multimodal    */ mtmd_caps{false, false},
+                /* placement     */ {},
                 // /* need_download */ false,
             };
             add_model(std::move(meta));
@@ -477,7 +1042,7 @@ void server_models::load_models() {
                 models_to_load.push_back(name);
             }
         }
-        if ((int)models_to_load.size() > base_params.models_max) {
+        if (!gpu_placement_enabled && (int)models_to_load.size() > base_params.models_max) {
             throw std::runtime_error(string_format(
                 "number of models to load on startup (%zu) exceeds models_max (%d)",
                 models_to_load.size(), base_params.models_max));
@@ -571,6 +1136,7 @@ void server_models::load_models() {
             if (it == final_presets.end()) continue; // erased above
 
             inst.meta.preset = it->second;
+            parse_model_placement(inst.meta);
 
             // re-parse aliases, then validate against other models
             std::set<std::string> new_aliases;
@@ -630,6 +1196,7 @@ void server_models::load_models() {
                     /* exit_code     */ 0,
                     /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                     /* multimodal    */ mtmd_caps{false, false},
+                    /* placement     */ {},
                     // /* need_download */ false,
                 };
                 add_model(std::move(meta));
@@ -811,6 +1378,9 @@ void server_models::unload_lru() {
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
                 count_active++;
+                if (m.second.meta.status == SERVER_MODEL_STATUS_SLEEPING || m.second.meta.placement.pinned) {
+                    continue;
+                }
                 if (m.second.meta.last_used < lru_last_used) {
                     lru_model_name = m.first;
                     lru_last_used = m.second.meta.last_used;
@@ -840,7 +1410,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
+        if (!gpu_placement_enabled) {
+            unload_lru();
+        }
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -854,11 +1426,13 @@ void server_models::load(const std::string & name, const load_options & opts) {
         return;
     }
 
+    ensure_gpu_placement(name, meta, opts.mode, lk);
+
     // Re-check capacity under the lock to prevent concurrent loads from
     // exceeding models_max. Without this, the window between unload_lru()
     // releasing its lock and this lock_guard acquiring allows multiple
     // threads to each observe capacity and all proceed to load.
-    if (base_params.models_max > 0) {
+    if (!gpu_placement_enabled && base_params.models_max > 0) {
         size_t count_active = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
@@ -896,6 +1470,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
             child_env.push_back("LLAMA_ARG_HF_REPO=" + name);
+        } else if (opts.mode == SERVER_CHILD_MODE_ESTIMATE) {
+            child_env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
@@ -913,6 +1489,18 @@ void server_models::load(const std::string & name, const load_options & opts) {
         inst.subproc->sproc.emplace();
         int result = subprocess_create_ex(argv.data(), options, envp.data(), &inst.subproc->get());
         if (result != 0) {
+            if (gpu_placement_enabled) {
+                for (size_t i = 0; i < inst.meta.placement.devs.size() && i < inst.meta.placement.need_bytes_per_dev.size(); ++i) {
+                    const int slot_idx = find_slot_index(gpu_slots, inst.meta.placement.devs[i]);
+                    if (slot_idx >= 0) {
+                        auto & slot = gpu_slots[slot_idx];
+                        slot.reserved_bytes = std::max<int64_t>(0, slot.reserved_bytes - inst.meta.placement.need_bytes_per_dev[i]);
+                        if (slot.exclusive_holder == name) {
+                            slot.exclusive_holder.clear();
+                        }
+                    }
+                }
+            }
             throw std::runtime_error("failed to spawn server instance");
         }
     }
@@ -1095,6 +1683,9 @@ void server_models::update_status(const std::string & name, const update_status_
     auto it = mapping.find(name);
     if (it != mapping.end()) {
         auto & meta = it->second.meta;
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED && !meta.placement.need_bytes_per_dev.empty()) {
+            credit_gpu_reservation_locked(name);
+        }
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
         if (!args.loaded_info.is_null()) {
@@ -1102,6 +1693,9 @@ void server_models::update_status(const std::string & name, const update_status_
         }
         if (!args.progress.is_null()) {
             meta.progress = args.progress;
+        }
+        if (args.status == SERVER_MODEL_STATUS_LOADED && !meta.placement.need_bytes_per_dev.empty()) {
+            reconcile_gpu_reservation_locked(name);
         }
     }
     // broadcast status change to SSE
@@ -1384,6 +1978,8 @@ server_child_mode server_child::get_mode() {
     std::string mode_str(mode ? mode : "");
     if (mode_str == "download") {
         return SERVER_CHILD_MODE_DOWNLOAD;
+    } else if (mode_str == "estimate") {
+        return SERVER_CHILD_MODE_ESTIMATE;
     } else {
         return SERVER_CHILD_MODE_NORMAL;
     }
@@ -1462,6 +2058,47 @@ int server_child::run_download(common_params & params) {
 
     SRV_INF("download completed %s\n", ok ? "successfully" : "with errors");
     return 0;
+}
+
+int server_child::run_estimate(common_params & params) {
+    try {
+        if (params.model.path.empty()) {
+            throw std::runtime_error("estimate mode requires a resolved model path");
+        }
+        auto mparams = common_model_params_to_llama(params);
+        auto cparams = common_context_params_to_llama(params);
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_n_ctx_train = 0;
+        uint32_t hp_n_expert = 0;
+        auto data = common_get_device_memory_data(
+                params.model.path.c_str(),
+                &mparams,
+                &cparams,
+                devs,
+                hp_ngl,
+                hp_n_ctx_train,
+                hp_n_expert,
+                GGML_LOG_LEVEL_WARN);
+
+        json names = json::array();
+        json need = json::array();
+        for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
+            names.push_back(ggml_backend_dev_name(devs[i]));
+            need.push_back((int64_t) (data[i].model + data[i].context + data[i].compute));
+        }
+        notify_to_router(server_state_to_str(SERVER_STATE_READY), {
+            {"devices", names},
+            {"need_bytes_per_dev", need},
+            {"n_gpu_layers", hp_ngl},
+            {"n_ctx_train", hp_n_ctx_train},
+            {"n_expert", hp_n_expert},
+        });
+        return 0;
+    } catch (const std::exception & e) {
+        SRV_ERR("estimate failed: %s\n", e.what());
+        return 1;
+    }
 }
 
 std::thread server_child::setup(const std::function<void(int)> & shutdown_handler) {
@@ -1567,7 +2204,16 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     // resolve alias to canonical model name
     name = meta->name;
     if (models_autoload) {
-        models.ensure_model_ready(name);
+        try {
+            models.ensure_model_ready(name);
+        } catch (const std::runtime_error & e) {
+            res_err(res, {
+                {"message", e.what()},
+                {"type", "server_error"},
+                {"code", 503},
+            });
+            return false;
+        }
     } else {
         if (!meta->is_running()) {
             res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
@@ -1695,7 +2341,16 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.load(meta->name);
+        try {
+            models.load(meta->name);
+        } catch (const std::runtime_error & e) {
+            res_err(res, {
+                {"message", e.what()},
+                {"type", "server_error"},
+                {"code", 503},
+            });
+            return res;
+        }
         res_ok(res, {{"success", true}});
         return res;
     };
@@ -1755,6 +2410,13 @@ void server_models_routes::init_routes() {
                 // {"need_download", meta.need_download},
                 // TODO: add other fields, may require reading GGUF metadata
             };
+            json placement = {
+                {"devices", meta.placement.devs},
+                {"split", meta.placement.split},
+                {"pinned", meta.placement.pinned},
+                {"need_bytes", meta.placement.need_bytes_per_dev},
+            };
+            model_info["placement"] = placement;
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {
@@ -1768,6 +2430,7 @@ void server_models_routes::init_routes() {
         }
         res_ok(res, {
             {"data", models_json},
+            {"devices", models.gpu_slots_json()},
             {"object", "list"},
         });
         return res;

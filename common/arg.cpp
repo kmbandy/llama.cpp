@@ -3482,6 +3482,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--gpus"}, "SPEC",
+        "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]",
+        [](common_params & params, const std::string & value) {
+            params.router_gpus = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPUS"));
+    add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
         string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),
@@ -4532,6 +4539,25 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    args.push_back(common_arg(
+        {"gpu"}, "DEVICE",
+        "in server router mode, place this model on a GPU slot, any, or a comma-separated span",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_GPU").set_preset_only());
+
+    args.push_back(common_arg(
+        {"vram-mb"}, "N",
+        "in server router mode, override estimated VRAM for placement",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_VRAM_MB").set_preset_only());
+
+    args.push_back(common_arg(
+        {"pinned"},
+        {"no-pinned"},
+        "in server router mode, prevent automatic eviction of this model",
+        [](common_params &, bool) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_PINNED").set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},
