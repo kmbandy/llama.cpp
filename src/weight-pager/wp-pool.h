@@ -1,6 +1,6 @@
 #pragma once
 
-// PoolAllocator — a fixed-size VRAM slot ring with LRU eviction.
+// PoolAllocator - a fixed-size VRAM slot ring with LRU eviction.
 //
 // One pool per ggml_backend_buffer_type_t. Phase 1 is single-device by
 // design (the WeightPager rejects multi-device configs at init), but the
@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_backend_buffer;
@@ -78,7 +79,7 @@ public:
     //
     // Returns -1 if the pool is uninitialised, n_slots == 0, or all slots
     // are pinned.
-    int alloc_slot();
+    int alloc_slot(size_t requested_size = 0);
 
     // Bump the LRU tick of an already-allocated slot, signalling a cache
     // hit. Caller must ensure the slot was previously returned by
@@ -166,6 +167,10 @@ public:
 
     int    n_slots()   const { return n_slots_;   }
     size_t slot_size() const { return slot_size_; }
+    size_t slot_size(int slot_idx) const;
+    size_t pool_size() const { return arena_size_; }
+    void * pool_base() const { return base_; }
+    bool   size_class_slots_enabled() const { return size_class_slots_; }
 
     // Inspect LRU state for tests / metrics.
     int lru_slot() const;
@@ -175,10 +180,18 @@ private:
     void *                base_      = nullptr;
     int                   n_slots_   = 0;
     size_t                slot_size_ = 0;
+    size_t                arena_size_ = 0;
+    size_t                slot_alignment_ = 1;
+    bool                  size_class_slots_ = false;
+    size_t                high_water_ = 0;
     uint64_t              tick_      = 0;
 
     std::vector<bool>     used_;
     std::vector<uint64_t> last_used_;
+    std::vector<size_t>   slot_offset_;
+    std::vector<size_t>   slot_bytes_;
+    std::vector<size_t>   slot_class_;
+    std::unordered_map<size_t, std::vector<int>> free_by_class_;
     // Per-slot pin refcount (MAD-231). Slots with pin_count_>0 are skipped
     // by alloc_slot's LRU walk. uint16_t allows 65k simultaneous pins per
     // slot — orders of magnitude more than the conservative
@@ -195,6 +208,15 @@ private:
     uint64_t              n_evictions_since_decay_ = 0;
     uint64_t              n_decays_              = 0;
     static constexpr uint64_t kDecayEvery = 1024;       // halve counts every N evictions
+
+    int    alloc_slot_fixed_();
+    int    alloc_slot_size_class_(size_t requested_size);
+    int    take_free_size_class_slot_(size_t requested_class);
+    int    pick_size_class_victim_(size_t requested_class,
+                                   int & n_pinned_skipped,
+                                   int & n_hot_skipped) const;
+    size_t size_class_for_(size_t requested_size) const;
+    void   decay_after_eviction_();
 };
 
 // ---------------------------------------------------------------------------

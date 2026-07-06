@@ -264,8 +264,8 @@ bool WeightPager::init(const Config &             cfg,
 
     // 3. File IO layer (io_uring or pread).
     const FileIOP2PConfig p2p_cfg{
-        pool_.slot_ptr(0),
-        (size_t) cfg_.n_slots * slot_size,
+        pool_.pool_base(),
+        pool_.pool_size(),
     };
     file_io_ = create_file_io(std::move(fds), cfg_.prefer_async_io,
                               cfg_.io_uring_depth, &p2p_cfg);
@@ -296,7 +296,7 @@ bool WeightPager::init(const Config &             cfg,
     cross_layer_prefetch_candidate_.assign((size_t) catalog_.size(), false);
     prefetch_started_at_.assign((size_t) catalog_.size(), std::chrono::steady_clock::time_point{});
     page_async_event_.assign((size_t) catalog_.size(), -1);
-    slot_to_page_.assign((size_t) cfg_.n_slots,    -1);
+    slot_to_page_.assign((size_t) pool_.n_slots(), -1);
 
     // 6. Shared sync staging buffer (max_page_size pinned host). Allocated
     //    ONCE here so page_in_sync_ doesn't pay hipHostMalloc latency per
@@ -339,11 +339,19 @@ bool WeightPager::init(const Config &             cfg,
     }
 
     initialized_ = true;
-    LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
-                   catalog_.size(), cfg_.n_slots, slot_size,
-                   (double) cfg_.n_slots * (double) slot_size / 1048576.0,
-                   cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
-                   (int) async_ensure_enabled_);
+    if (pool_.size_class_slots_enabled()) {
+        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B budget (%.1f MiB), size_class_slots=1, prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+                       catalog_.size(), cfg_.n_slots, slot_size,
+                       (double) pool_.pool_size() / 1048576.0,
+                       cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
+                       (int) async_ensure_enabled_);
+    } else {
+        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+                       catalog_.size(), cfg_.n_slots, slot_size,
+                       (double) cfg_.n_slots * (double) slot_size / 1048576.0,
+                       cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
+                       (int) async_ensure_enabled_);
+    }
     return true;
 }
 
@@ -430,7 +438,7 @@ void WeightPager::release_graph_pins_() {
 }
 
 int WeightPager::graph_pin_max_slots_() const {
-    const int n_slots = cfg_.n_slots > 0 ? cfg_.n_slots : 0;
+    const int n_slots = pool_.n_slots() > 0 ? pool_.n_slots() : (cfg_.n_slots > 0 ? cfg_.n_slots : 0);
     const int floor = std::max(1, cfg_.prefetch_depth + 1);
     const int hard_max = std::max(0, n_slots - floor);
     const int requested = env_nonnegative_int(kEnvWpGraphPinMax, hard_max);
@@ -474,6 +482,13 @@ void WeightPager::on_pool_evict_(int slot_idx) {
     }
     slot_to_page_[slot_idx] = -1;
     ++stats_.evictions;
+}
+
+void WeightPager::ensure_slot_map_(int slot_idx) {
+    if (slot_idx < 0) return;
+    if (slot_idx >= (int) slot_to_page_.size()) {
+        slot_to_page_.resize((size_t) slot_idx + 1, -1);
+    }
 }
 
 const WeightPager::Stats & WeightPager::stats() const {
@@ -854,9 +869,12 @@ bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch) {
     if (catalog_.at(page_idx).is_pinned)                        return false;  // MAD-236: already resident, no slot needed
     if (page_to_slot_[page_idx] >= 0)                            return false;  // loaded or in flight
 
+    const PageMeta & m = catalog_.at(page_idx);
+
     // Allocate (or evict) a slot now so the prefetch knows where to land.
-    const int slot = pool_.alloc_slot();
+    const int slot = pool_.alloc_slot(m.size);
     if (slot < 0) return false;
+    ensure_slot_map_(slot);
     void * dst = slot_ptr_(slot);
 
     // Track ownership BEFORE submitting so eviction-callbacks resolve right.
@@ -865,9 +883,8 @@ bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch) {
     page_loaded_[page_idx]      = false;
     slot_to_page_[slot]         = page_idx;
 
-    const PageMeta & m = catalog_.at(page_idx);
     if (!prefetch_.submit(page_idx, (int) m.file_idx, m.file_offset,
-                          m.size, dst, pool_.slot_size())) {
+                          m.size, dst, pool_.slot_size(slot))) {
         // Rejected — likely queue full. Roll back our reservation.
         page_to_slot_[page_idx] = -1;
         slot_to_page_[slot]     = -1;
@@ -921,13 +938,15 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
     std::vector<int> slots;
     slots.reserve(needed.size());
     for (size_t i = 0; i < needed.size(); ++i) {
-        const int s = pool_.alloc_slot();
+        const PageMeta & m = catalog_.at(needed[i]);
+        const int s = pool_.alloc_slot(m.size);
         if (s < 0) {
             for (int prev : slots) {
                 pool_.release_slot(prev);
             }
             return false;
         }
+        ensure_slot_map_(s);
         slots.push_back(s);
     }
 
@@ -948,7 +967,7 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
         const PageMeta & m = catalog_.at(page_idx);
         reqs.push_back(PrefetchBatchRequest{
             page_idx, (int) m.file_idx, m.file_offset, m.size,
-            slot_ptr_(slot), pool_.slot_size()
+            slot_ptr_(slot), pool_.slot_size(slot)
         });
     }
 
@@ -1057,12 +1076,13 @@ int WeightPager::page_in_sync_(int page_idx) {
 
     const auto io_t0 = std::chrono::steady_clock::now();
 
-    const int slot = pool_.alloc_slot();
+    const PageMeta & m = catalog_.at(page_idx);
+
+    const int slot = pool_.alloc_slot(m.size);
     if (slot < 0) return -1;
+    ensure_slot_map_(slot);
     void * dst = slot_ptr_(slot);
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: alloc_slot ok, slot=%d dst=%p\n", s_diag_count, slot, dst);
-
-    const PageMeta & m = catalog_.at(page_idx);
 
     // Use the shared pinned staging buffer allocated at init time. Pinning
     // a fresh buffer per call costs hundreds of ms for hundred-MB tensors
@@ -1079,7 +1099,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     if (host_tier_) {
         const void * host_ptr = host_tier_->lookup(page_idx);
         if (host_ptr != nullptr) {
-            int evt = transport_.stage_in(dst, host_ptr, m.size, pool_.slot_size());
+            int evt = transport_.stage_in(dst, host_ptr, m.size, pool_.slot_size(slot));
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
                 LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
@@ -1138,7 +1158,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     }
 
     if (direct_to_device) {
-        if (!zero_device_padding(dst, m.size, pool_.slot_size())) {
+        if (!zero_device_padding(dst, m.size, pool_.slot_size(slot))) {
             pool_.release_slot(slot);
             return -1;
         }
@@ -1158,7 +1178,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     // Stage 2: H2D + padding zero. stage_in() preserves the synchronous
     // "resident on return" contract even when WP_ASYNC_ENSURE selects a
     // dedicated transport stream for prefetch stage 2.
-    int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size());
+    int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size(slot));
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
     if (evt < 0) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: gpu stage_in failed for page %d\n", page_idx);

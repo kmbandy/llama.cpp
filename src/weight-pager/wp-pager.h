@@ -236,6 +236,7 @@ private:
 
     // PoolAllocator's eviction callback — clears page_to_slot_[evicted].
     void on_pool_evict_(int slot_idx);
+    void ensure_slot_map_(int slot_idx);
 
     void log_stats_summary();
     void record_page_in_(size_t bytes, double seconds);

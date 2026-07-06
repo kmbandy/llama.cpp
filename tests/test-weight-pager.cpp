@@ -23,6 +23,27 @@
 #include <unistd.h>
 #include <vector>
 
+struct ScopedEnv {
+    explicit ScopedEnv(const char * name_) : name(name_) {
+        const char * v = std::getenv(name);
+        if (v != nullptr) {
+            had = true;
+            old = v;
+        }
+    }
+    ~ScopedEnv() {
+        if (had) {
+            setenv(name, old.c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+
+    const char * name;
+    bool had = false;
+    std::string old;
+};
+
 #define EXPECT(cond, msg) do { \
     if (!(cond)) { \
         std::fprintf(stderr, "  FAIL: %s (line %d): %s\n", __func__, __LINE__, (msg)); \
@@ -534,6 +555,86 @@ static int test_pool_allocator() {
     int lru = pool.lru_slot();
     EXPECT(lru >= 0 && lru < 4, "lru_slot in range");
 
+    return fails;
+}
+
+static int test_pool_size_class_packs_small_pages() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/2, /*slot_size=*/256), "pool init");
+    EXPECT(pool.size_class_slots_enabled(), "size-class mode enabled");
+    EXPECT_EQ_INT(pool.slot_size(), 256u, "max slot_size remains max page size");
+    EXPECT_EQ_INT(pool.pool_size(), 512u, "arena budget matches fixed-slot bytes");
+    EXPECT(pool.pool_base() != nullptr, "pool base valid before first slot");
+
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+
+    int s0 = pool.alloc_slot(64);
+    int s1 = pool.alloc_slot(64);
+    int s2 = pool.alloc_slot(64);
+    int s3 = pool.alloc_slot(64);
+    (void) s2;
+    EXPECT_EQ_INT(s0, 0, "small alloc 0");
+    EXPECT_EQ_INT(s3, 3, "small alloc 3");
+    EXPECT_EQ_INT(pool.n_slots(), 4, "four small slots fit in one old 256-byte slot");
+    EXPECT_EQ_INT(pool.slot_size(s0), 64u, "slot 0 class size");
+    EXPECT_EQ_INT((intptr_t) pool.slot_ptr(s1) - (intptr_t) pool.slot_ptr(s0),
+                  64, "small slot stride is class size");
+
+    void * p1 = pool.slot_ptr(s1);
+    int s4 = pool.alloc_slot(256);
+    EXPECT_EQ_INT(s4, 4, "large slot allocated after small slots");
+    EXPECT_EQ_INT(pool.n_slots(), 5, "dynamic slot id added inside same arena budget");
+    EXPECT_EQ_INT(pool.slot_size(s4), 256u, "large slot class size");
+    EXPECT_EQ_INT((intptr_t) pool.slot_ptr(s4) - (intptr_t) pool.pool_base(),
+                  256, "large slot starts after four 64-byte slots");
+    EXPECT(pool.slot_ptr(s1) == p1, "existing slot address is stable");
+    EXPECT(pool.slot_base_for_capture(s1) == p1, "capture base matches stable slot ptr");
+
+    int s5 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s5, s0, "full arena evicts LRU within requested size class");
+    EXPECT_EQ_INT(evicted, s0, "eviction callback reports reused slot");
+    EXPECT_EQ_INT(pool.n_slots(), 5, "eviction reuses existing slot id");
+    return fails;
+}
+
+static int test_pool_size_class_pin_skip() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/2, /*slot_size=*/64), "pool init");
+
+    int s0 = pool.alloc_slot(64);
+    int s1 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s0, 0, "alloc 0");
+    EXPECT_EQ_INT(s1, 1, "alloc 1");
+
+    pool.pin_slot(s0);
+    pool.pin_slot(s1);
+    int evicted = -42;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+
+    int s2 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s2, -1, "all pinned size-class slots return -1");
+    EXPECT_EQ_INT(evicted, -42, "eviction callback not fired when all pinned");
+
+    pool.unpin_slot(s1);
+    int s3 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s3, s1, "unpinned slot becomes evictable");
+    EXPECT_EQ_INT(evicted, s1, "eviction callback fired for unpinned slot");
+    pool.unpin_slot(s0);
     return fails;
 }
 
@@ -1435,6 +1536,8 @@ int main() {
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },
         { "pool_allocator",     test_pool_allocator     },
+        { "pool_size_class_packs_small_pages", test_pool_size_class_packs_small_pages },
+        { "pool_size_class_pin_skip",          test_pool_size_class_pin_skip          },
         { "pool_pin_basic",                       test_pool_pin_basic                       },
         { "pool_pin_refcount",                    test_pool_pin_refcount                    },
         { "pool_pin_oob_safe",                    test_pool_pin_oob_safe                    },
