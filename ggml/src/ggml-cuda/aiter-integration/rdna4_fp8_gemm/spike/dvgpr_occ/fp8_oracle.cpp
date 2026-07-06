@@ -29,3 +29,42 @@ void wmma_ref_16x16x16(const uint8_t* A, const uint8_t* B, const float* C, float
             D[i * 16 + j] = acc;
         }
 }
+
+#include <cmath>
+// Tiered oracle comparison. bad = #elements exceeding rel*|ref|+abs_; max_rel = worst |got-ref|/|ref|.
+OracleCmp oracle_compare(const float* got, const float* ref, long n, float rel, float abs_) {
+    OracleCmp r{true, 0, 0.0};
+    for (long i = 0; i < n; ++i) {
+        float d   = std::fabs(got[i] - ref[i]);
+        float thr = rel * std::fabs(ref[i]) + abs_;
+        double rl = (double)d / ((double)std::fabs(ref[i]) + 1e-30);
+        if (rl > r.max_rel) r.max_rel = rl;
+        if (d > thr) { r.ok = false; ++r.bad; }
+    }
+    return r;
+}
+
+#ifdef ORACLE_SELFTEST
+#include <cassert>
+#include <cstdio>
+#include <vector>
+int main() {
+    const long n = 256;
+    // ref ~ O(100) so the abs term doesn't dominate the rel term in the test.
+    std::vector<float> ref(n), id(n), p01(n), p1(n), p5(n);
+    for (long i = 0; i < n; ++i) {
+        float v = 100.0f + 50.0f * (float)(i % 7);
+        ref[i] = v; id[i] = v;
+        p01[i] = v * 1.001f;   // 0.1%
+        p1[i]  = v * 1.01f;    // 1%
+        p5[i]  = v * 1.05f;    // 5%
+    }
+    assert( oracle_compare(id.data(),  ref.data(), n, 5e-3f, 1e-2f).ok);   // identical -> tight ok
+    assert( oracle_compare(p01.data(), ref.data(), n, 5e-3f, 1e-2f).ok);   // 0.1% -> tight ok
+    assert(!oracle_compare(p1.data(),  ref.data(), n, 5e-3f, 1e-2f).ok);   // 1%   -> tight REJECTS
+    assert( oracle_compare(p1.data(),  ref.data(), n, 3e-2f, 2e-2f).ok);   // 1%   -> loose ok
+    assert(!oracle_compare(p5.data(),  ref.data(), n, 3e-2f, 2e-2f).ok);   // 5%   -> loose REJECTS
+    printf("ORACLE_SELFTEST all pass\n");
+    return 0;
+}
+#endif

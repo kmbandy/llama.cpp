@@ -196,3 +196,39 @@ Makefile
 tests/perf-baseline/**/*.log
 tests/perf-baseline/**/rocprof-*/
 tests/perf-baseline/calibration-logs/
+
+# --- rdna4_fp8_gemm / dvgpr spike: local build artifacts, scratch + result logs (2026-07) ---
+# Tracked source (.s/.cpp/.cu/.cuh, CMakeLists.txt, *_DESIGN.md, etc.) is added explicitly;
+# everything below is local-only and must stay out of the tree.
+# repo-root run dumps
+/results.db
+/results.json
+/results.sysinfo.txt
+# scoped scratch doc + build output dirs
+ggml/src/ggml-cuda/aiter-integration/vulkan-port-scope.md
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/out/
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/bench/gemm_fp8_levers
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_pm4/ref_gfx12/
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/build/
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/rga_out/
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/rga_ml8/
+# compiler/assembler dumps, disassembly, objects, scratch copies, generated viz (dvgpr_occ)
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/*.err
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/*.amdisa
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/*.co
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/*.new
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/phase_profile.html
+# result / benchmark logs (explicit prefixes so tracked CMakeLists.txt / TRITON_PIN.txt survive)
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/dynfull_*.txt
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/fairrace_*.txt
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/mbml8_*.txt
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/nofeed_*.txt
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/o_pf_yield_test.txt
+# compiled sim/probe binaries + their scratch sources
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/lean_bounds_sim
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/lean_bounds_sim.cpp
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/simdprobe
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/simdprobe.hip
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/rocprof_smoke
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/rocprof_smoke.hip
+ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/t_ctrl

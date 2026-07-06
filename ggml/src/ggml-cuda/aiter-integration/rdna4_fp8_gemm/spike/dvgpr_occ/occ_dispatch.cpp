@@ -1321,9 +1321,13 @@ struct CoopResult { bool ok=false; uint32_t maxlive=0, total=0; uint64_t okFrags
 static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, uint32_t pool,
                              int M, int N, int K, int FM, int FN, int P, int RINGD,
                              bool fullCheck, bool useGenDiv=false,
-                             uint32_t reps=1, double targetSecs=0.0) {
+                             uint32_t reps=1, double targetSecs=0.0,
+                             int totalWaves=0, uint32_t ldsBytesOverride=0) {
+    // DSWS (MAD-305): totalWaves>0 launches N=NCOMP+NAFEED+NBFEED waves/WG (P=NCOMP for the C-store/oracle
+    //   partition); ldsBytesOverride carries the larger DSWS LDS_TOTAL_DSWS. Both default to the proven 2-role
+    //   coop behavior (1+P waves, coop LDS) so every existing caller is byte-identical.
     CoopResult res;
-    const int WAVES_LAUNCH = 1 + P;                       // 1 feed/claim wave + P compute waves
+    const int WAVES_LAUNCH = totalWaves > 0 ? totalWaves : (1 + P);   // 1 feed + P compute (coop) | N (DSWS)
     const int TM = P*FM*16, TN = FN*16;                   // WG tile: P M-bands (each FM rows-of-16) x shared FN N-cols
     int MTL = M / TM, NTL = N / TN, NT = N / 16, KT = K / 16;
     uint32_t TOTAL = (uint32_t)MTL * NTL;
@@ -1411,7 +1415,8 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
     uint32_t vgprField = dynvgpr ? 4u : ((fatregs / 8) & 0x3fu);
     uint32_t rsrc1 = BuildPgmRsrc1(dynvgpr); rsrc1 = (rsrc1 & ~0x3fu) | (vgprField & 0x3fu);
     // LDS (Step 3 byte layout): B_ring[RINGD*FN*256] + prod_count(u32) + cons_count[P](u32) + tile_slot[3](u32)
-    uint32_t ldsBytes = (uint32_t)(RINGD * FN * 256 + 4 * (1 + P + 3));
+    uint32_t ldsBytes = ldsBytesOverride > 0 ? ldsBytesOverride        // DSWS: the full LDS_TOTAL_DSWS
+                        : (uint32_t)(RINGD * FN * 256 + 4 * (1 + P + 3));   // coop: B-ring + prod/cons/ti/epoch/initflag
     ldsBytes = (ldsBytes + 0x1FFu) & ~0x1FFu;             // round to 512B LDS granule
     uint32_t ldsU=0,ldsA=0,ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytes, &ldsU, &ldsA, &ldsG);
     uint32_t rsrc2 = (BuildPgmRsrc2(dynvgpr) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;
@@ -1458,7 +1463,7 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
         uint32_t chunkHi = (base + chunkTiles < TOTAL) ? (base + chunkTiles) : TOTAL;
         userdata[11] = chunkHi;   // s11 = this chunk's terminal tile (feed exits at claim>=hi; POOLTERM compute follows)
         occW[0]=0; occW[1]=0; occW[2]=0xFFFFFFFFu; occW[3]=0; occW[4]=0; occW[5]=base; *fenceW=0; occW[6]=occW[7]=occW[8]=occW[9]=occW[10]=occW[11]=occW[12]=occW[13]=0;
-        for (int qi=14; qi<28; ++qi) occW[qi]=0;          // DIAGFINE markers: 14-21 hot-step, 22 raw-ti, 23-27 init-window
+        for (int qi=14; qi<52; ++qi) occW[qi]=0;          // DIAGFINE: 14-21 hot-step, 22 raw-ti, 23-27 init, 28-31 A-feed, 32-36 sensors, 39 gate would-win count, 40-47 DSWS2_BAILMARK per-wave bail epochs, 48 conversion-commit count
         RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
         RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
         RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
@@ -1484,10 +1489,12 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
         while (true) { double now = now_s();
             if (streamOn && (now - lastSnap) >= 0.2) { lastSnap = now;
                 fprintf(stderr, "[occ +%5.2fs] live%u maxlive%u claim%u end%u | INIT adm%u tmr%u lds%u flag%u rdv%u | "
-                        "feedPh%u compPh%u cons%u tiles%u | feed:tr%u pub%u comp:dsB%u wm%u rawTi%u | fence=%s\n",
+                        "feedPh%u compPh%u cons%u tiles%u | feed:tr%u pub%u comp:dsB%u wm%u rawTi%u | SENS occ_b%u occ_a%u roles[%u/%u/%u] | BAIL[w1=%u w2=%u w3=%u w4=%u w5=%u w6=%u w7=%u] | fence=%s\n",
                         now-t0, occW[0],occW[1],occW[5],occW[3],
                         occW[23],occW[24],occW[25],occW[26],occW[27],
                         occW[6],occW[7],occW[10],occW[11], occW[19],occW[21],occW[15],occW[17], occW[22],
+                        occW[32],occW[33],occW[34],occW[35],occW[36],
+                        occW[41],occW[42],occW[43],occW[44],occW[45],occW[46],occW[47],   // DSWS2_BAILMARK per-wave bail epochs (wid1..7; wid0=claimer=occ[40])
                         (*fenceW==FENCE_VALUE)?"FIRED":"--"); fflush(stderr);
             }
             if (occW[1] > 0) admitted = true;
@@ -1510,6 +1517,14 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
                     occW[18], occW[19], occW[20], occW[21]);
             fprintf(stderr, "    DIAGFINE compute: prodwait[14]=%u dsloadB[15]=%u Aload[16]=%u wmma[17]=%u consRel[10]=%u  rawTiMax[22]=%u\n",
                     occW[14], occW[15], occW[16], occW[17], occW[10], occW[22]);
+            fprintf(stderr, "    DIAGFINE Afeed  : reached[28]=%u Aload[29]=%u dsstore[30]=%u publish[31]=%u  | Bphase(occ6)=%u Bti(occ8)=%u\n",
+                    occW[28], occW[29], occW[30], occW[31], occW[6], occW[8]);
+            fprintf(stderr, "    DIAGINIT        : adm[23]=%u tmr[24]=%u ldsinit[25]=%u initflag[26]=%u rdv[27]=%u\n",
+                    occW[23], occW[24], occW[25], occW[26], occW[27]);
+            fprintf(stderr, "    DSWS sensors    : occ_b[32]=%u occ_a[33]=%u nComp[34]=%u nAfeed[35]=%u nBfeed[36]=%u  gateWin[39]=%u\n",
+                    occW[32], occW[33], occW[34], occW[35], occW[36], occW[39]);
+            fprintf(stderr, "    DSWS2 BAILMARK  : per-wave last-bailed epoch  w1=%u w2=%u w3=%u w4=%u w5=%u w6=%u w7=%u  (all==hung epoch => visibility; ONE stale => that wave is the STRAGGLER)\n",
+                    occW[41], occW[42], occW[43], occW[44], occW[45], occW[46], occW[47]);
             repFail=true; break;
         }
         uint32_t gs=occW[2], ge=occW[3];
@@ -1546,6 +1561,15 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
       while (*fenceW != FENCE_VALUE && (now_s() - tw) < 5.0) nanosleep(&ts, nullptr); }
     bool queueIdle = (*fenceW == FENCE_VALUE);
     if (!queueIdle) fprintf(stderr, "  [teardown] WARN: EOP fence never fired in 5s; queue NON-IDLE -> NOT destroying (process-exit reclaims). Brick-avoidance.\n");
+    // DSWS Phase-2 sensor readback (always print on clean exit -- a fast oracle finishes before the 200ms
+    //   stream OR the timeout dump ever fires, so this is the guaranteed observation of the LAST chunk's
+    //   final sensor sample). occ_b/occ_a must sit in [0,RINGD] (not pinned 0/RINGD); roles must = launch mix.
+    if (totalWaves > 0) {
+        fprintf(stderr, "  [dsws sensors @clean-exit] occ_b=%u occ_a=%u  roles[nComp=%u nAfeed=%u nBfeed=%u]  gateWin(c->Afeed)[39]=%u  (last chunk)\n",
+                occW[32], occW[33], occW[34], occW[35], occW[36], occW[39]);
+        fprintf(stderr, "  [dsws CONVERSIONS] committed role-switches this run = %u  (occ[48]; >0 => waves ADAPTIVELY switched role)\n",
+                occW[48]);
+    }
     res.ok = true; res.maxlive = lastMaxlive; res.total = lastTotal;
     res.wall = spanSum / (res.repsDone ? res.repsDone : 1);   // mean per-rep span
     res.wallSum = spanSum; res.wallMin = spanMin; res.wallMax = spanMax;
@@ -1608,6 +1632,652 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
         CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
         FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
     }
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// MAD-305 DSWS v2 substrate launch (Task A8, PLAN_DSWS_SUBSTRATE_V2.md). Dispatches occ_kernel_dsws.s: a
+// pinned wid-0 claimer broadcasts super-tiles from a pool; B-feed/A-feed/compute waves drain LDS atomic
+// claim counters against resident-in-LDS A/B for the current super-tile; compute flushes fp32 partials via
+// global_atomic_add_f32 (split-K segments accumulate into the SAME C cell, ksi-independent address).
+//
+// This MIRRORS run_mbcoop's PM4 launch/chunk/teardown/canary infrastructure byte-for-byte where the
+// protocols line up (buffer alloc, VRAM guard, address bounds gate, compositor-safe chunking, fence/settle
+// poll, guarded teardown, C-guard-tail canary) -- re-keyed to the v2 contract:
+//   * occ[20] (=occW[5], byte offset 20) is the SAME global claim counter coop uses for output-tile claims;
+//     v2 claims super-tile ids (`sti`) through it instead.
+//   * The v2 C address formula (ti*(G*FM*FN*1024) + r*(FM*FN*1024) + frag*1024 + lane*32 + e*4) is coop's
+//     formula with P (compute-wave count) replaced by G (super-tile M-extent) and cid replaced by r
+//     (claimed rowblk) -- so the oracle reuses unpack_D/oracle_compare exactly, decoding r where coop
+//     decoded cid.
+//
+// *** FIX 1 (round-table Opus+Codex pass) ***
+//   The original v2 kernarg contract called for COMPUTE_PGM_RSRC2.USER_SGPR=18 (s0..s17 hardware-preloaded)
+//   so n_kseg/TOTAL_super/magic_kseg could ride in as s15/s16/s17, written via a SECOND SET_SH_REG packet
+//   at register (COMPUTE_USER_DATA_0 + 16). That was never deliverable: every OTHER kernel in this harness
+//   uses <=15 user SGPRs, and the project's own pinned PM4 register reference (dvgpr_pm4/ref/gfx_7_2_d.h)
+//   defines COMPUTE_USER_DATA_0..15 ONLY (16 registers, covering s0..s15) -- there is no register defined
+//   for s16/s17 anywhere in this raw-PM4 path, and RESULT_WGGEMM.md's "raw-PM4 TGID is unavailable" probe
+//   already found SGPR delivery beyond s15 under raw-PM4 (CP-direct dispatch, MES bypassed) reads constant
+//   garbage, not a controllable value. On top of that, the per-chunk override of kernarg slot s16 (the
+//   chunk terminal bound) silently collided with s16 also being the would-be TOTAL_super kernarg -- two
+//   unrelated meanings on the same undeliverable slot.
+//   FIX 1 drops s15/s16/s17 from the kernarg contract entirely (USER_SGPR=15, s0..s14 only, ONE SET_SH_REG
+//   packet of 16 registers like every other proven path here, index 15 unused/padding). n_kseg is now
+//   DERIVED in-kernel from KT (s8); the chunk terminal bound is now MEMORY-CARRIED via occ[24] (occW[6],
+//   written once per chunk below) instead of riding in an undeliverable kernarg slot. See the KERNARG
+//   CONTRACT block at the top of occ_kernel_dsws.s for the full new scheme.
+// ---------------------------------------------------------------------------
+struct Dsws2Result {
+    bool ok = false;                 // true iff the run completed cleanly (fence fired, occ[0]==0) AND badFrags==0
+    uint64_t okFrags = 0, badFrags = 0;
+    double maxRel = 0.0;
+    uint32_t occ0 = 0;                // live-counter readback at last clean completion (expect 0)
+    uint32_t occClaim = 0;            // occ[20] readback at last clean completion (global claim counter)
+    double tf = 0.0;                  // TFPROBE throughput (2*M*N*K / summed GPU-tick span); 0 if the bin has no tick capture
+    uint64_t wall = 0;                // summed per-chunk GPU-tick span (occ[3]-occ[2], device busy ticks, excl host gaps)
+};
+
+static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
+                              uint32_t nComp, uint32_t nAfeed, uint32_t nBfeed,
+                              int Gv, int SEGKv, int FMc, int FNc,
+                              int Mo, int No, int Ko,
+                              float orel, float oabs, double freq_hz) {
+    Dsws2Result res;
+    const uint32_t WAVES_LAUNCH = nComp + nAfeed + nBfeed;
+    const int TMsuper = Gv*16*FMc, TN = FNc*16;          // super-tile M rows, N-panel cols
+    if (TMsuper == 0 || TN == 0 || SEGKv <= 0 || Ko <= 0 || (Mo % TMsuper) || (No % TN) || (Ko % SEGKv)) {
+        fprintf(stderr, "  [dsws2] geometry %dx%dx%d does not divide cleanly (G=%d SEGK=%d FM=%d FN=%d)\n",
+                Mo, No, Ko, Gv, SEGKv, FMc, FNc);
+        return res;
+    }
+    const int MTLsuper = Mo / TMsuper, NTL = No / TN, NT = No / 16, KT = Ko / 16;
+    const int KSEG_STEPS = SEGKv / 16;
+    const int n_kseg = Ko / SEGKv;
+    if (MTLsuper == 0 || NTL == 0 || n_kseg == 0 || KSEG_STEPS == 0) {
+        fprintf(stderr, "  [dsws2] degenerate geometry (MTLsuper=%d NTL=%d n_kseg=%d KSEG_STEPS=%d)\n",
+                MTLsuper, NTL, n_kseg, KSEG_STEPS);
+        return res;
+    }
+    // FIX 1(k): the kernel now DERIVES n_kseg in-kernel as KT >> NKSEG_SHIFT (a plain shift) and uses it
+    //   as a shift/mask pair (shift=ff1(n_kseg), mask=n_kseg-1) to split sti -> (t,ksi) -- both of those
+    //   are only correct when n_kseg is a power of two (ff1 finds "the" single set bit; a non-power-of-two
+    //   mask drops bits). Refuse rather than silently mis-decode every super-tile.
+    if ((n_kseg & (n_kseg - 1)) != 0) {
+        fprintf(stderr, "  [dsws2] *** REFUSE: n_kseg=%d is not a power of two (required: the kernel derives "
+                        "shift/mask from n_kseg via s_ff1_i32_b32) ***\n", n_kseg);
+        return res;
+    }
+    const uint32_t TOTAL = (uint32_t)MTLsuper * (uint32_t)NTL;                       // coop-compat output-tile count (C sizing)
+    const uint64_t TOTAL_super = (uint64_t)MTLsuper * (uint64_t)NTL * (uint64_t)n_kseg;  // super-tile pool size
+    const uint32_t magic = (uint32_t)((0x100000000ULL + (uint64_t)NTL - 1) / (uint64_t)NTL);          // ceil(2^32/NTL)
+    const uint32_t magicTotal = (uint32_t)((0x100000000ULL + (uint64_t)TOTAL - 1) / (uint64_t)TOTAL); // ceil(2^32/TOTAL) for KMAJOR ksi=sti/TOTAL
+
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
+    std::vector<uint8_t> Ah((size_t)Mo*Ko), Bh((size_t)Ko*No), Bshufh((size_t)Ko*No);
+    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)Ko) % 6];
+    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)No)*3) % 6];
+    mbg_preshuffle_B(Bh.data(), Bshufh.data(), Ko, No);
+
+    size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
+    if (!isaBytes) { fprintf(stderr, "  [dsws2] cannot read kernel bin '%s'\n", isaPath); return res; }
+    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf occ = AllocGpu(node, 0x1000, false, true);
+    // ---- TRACE: per-super-tile time-series buffer (DSWS2_TRACE=1; requires a TRACE=1 kernel bin + single chunk).
+    //   The claimer appends a 16-u32 row per super-tile (indexed by SEGCNT) capturing the live role mix, ring
+    //   occupancy peak, conversions, and vresv. Host reads it back to CSV after the run. ----
+    const bool traceOn = getenv("DSWS2_TRACE") != nullptr;
+    uint32_t traceMaxRows = 0; GpuBuf traceBuf{}; volatile uint32_t* traceW = nullptr;
+    if (traceOn) {
+        uint64_t want = TOTAL_super + 64; traceMaxRows = (uint32_t)(want > (1u<<21) ? (1u<<21) : want);
+        traceBuf = AllocGpu(node, ((uint64_t)traceMaxRows*64 + 0xFFF)&~0xFFFull, false, true);
+        traceW = (volatile uint32_t*)traceBuf.ptr;
+        if (!traceBuf.ptr) { fprintf(stderr, "  [dsws2 trace] buffer alloc FAILED -> trace disabled\n"); traceW = nullptr; }
+        else memset((void*)traceW, 0, traceBuf.size);
+    }
+    // SAFETY PADDING (mirrors run_mbcoop): a guard tail after each operand so a small dyn off-by-one global
+    //   access lands in mapped VRAM (observable wrong answer) instead of a page-fault brick.
+    uint64_t padB = (uint64_t)(getenv("ML8_COOP_PAD_MB") ? atoi(getenv("ML8_COOP_PAD_MB")) : 64) * 1024ull * 1024ull;
+    GpuBuf Ad = AllocGpu(node, ((Ah.size()+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
+    GpuBuf Bd = AllocGpu(node, ((Bshufh.size()+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
+    uint64_t cbytes = ((uint64_t)TOTAL * (uint64_t)((uint32_t)Gv*FMc*FNc*1024) + 0xFFF) & ~0xFFFull;  // TOTAL output tiles x G*FM*FN frags x 256 f32
+    GpuBuf C = AllocGpu(node, cbytes + padB, false, true, /*deviceLocal*/true);
+    GpuBuf fence = AllocGpu(node, 0x1000, false, true);
+    if (!(Ad.vram && Bd.vram && C.vram)) {
+        fprintf(stderr, "\n*** DSWS2 VRAM GUARD FAILED (%s): operands not device-local -> PERF/SAFETY INVALID ***\n", isaPath);
+        abort();
+    }
+    // ---- ADDRESS BOUNDS GATE (MANDATORY, mirrors run_mbcoop's gate). Formulas re-derived from
+    //   occ_kernel_dsws.s's ASTAGE/BSTAGE/.Lcompute address math (G replaces coop's P; r replaces cid). ----
+    {
+        uint64_t Asize = (uint64_t)Ah.size(), Bsize = (uint64_t)Bshufh.size(), Csz = cbytes;
+        uint64_t rowblkAbsMax = (uint64_t)MTLsuper * (uint64_t)Gv - 1ull;
+        uint64_t Amax = rowblkAbsMax*(uint64_t)16*FMc*Ko + (uint64_t)(FMc-1)*16*Ko
+                        + (uint64_t)(n_kseg-1)*SEGKv + (uint64_t)(KSEG_STEPS-1)*16
+                        + (uint64_t)15*Ko + 8 + 7;
+        uint64_t Bmax = (uint64_t)(NTL-1)*FNc*256 + (uint64_t)(n_kseg-1)*KSEG_STEPS*(uint64_t)NT*256
+                        + (uint64_t)(FNc-1)*256 + (uint64_t)(KSEG_STEPS-1)*(uint64_t)NT*256
+                        + (uint64_t)31*8 + 7;
+        uint64_t Cmax = (uint64_t)(TOTAL-1)*(uint64_t)Gv*FMc*FNc*1024 + (uint64_t)(Gv-1)*(uint64_t)FMc*FNc*1024
+                        + (uint64_t)(FMc*FNc-1)*1024 + (uint64_t)31*32 + (uint64_t)7*4 + 3;
+        bool aok = Amax < Asize, bok = Bmax < Bsize, cok = Cmax < Csz;
+        printf("  [dsws2 bounds] A last=%llu/%llu %s  B last=%llu/%llu %s  C last=%llu/%llu %s\n",
+               (unsigned long long)Amax,(unsigned long long)Asize, aok?"OK":"*OOB*",
+               (unsigned long long)Bmax,(unsigned long long)Bsize, bok?"OK":"*OOB*",
+               (unsigned long long)Cmax,(unsigned long long)Csz,  cok?"OK":"*OOB*");
+        if (!(aok && bok && cok)) {
+            fprintf(stderr, "\n*** DSWS2 ADDRESS BOUNDS GATE FAILED (%s) -> REFUSING to dispatch. ***\n", isaPath);
+            FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+            return res;
+        }
+    }
+    memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
+    memcpy(Ad.ptr, Ah.data(), Ah.size());
+    memcpy(Bd.ptr, Bshufh.data(), Bshufh.size());
+    memset((char*)Ad.ptr + ((Ah.size()+0xFFF)&~0xFFFull), 0, padB);
+    memset((char*)Bd.ptr + ((Bshufh.size()+0xFFF)&~0xFFFull), 0, padB);
+    volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;
+    volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
+    memset((void*)occW, 0, occ.size);   // host zero-init: occ[0] live-count, occ[20] claim-counter, all reserved words
+    *fenceW = 0;
+    memset((char*)C.ptr + cbytes, 0, padB);   // CANARY: zero the C guard tail (any nonzero after run = an OOB store)
+    // FIX 2: the kernel's compute role accumulates into C via global_atomic_add_f32 (split-K segments add
+    //   into the SAME C cell) -- it never initializes a cell, so the host MUST zero the C data region before
+    //   ANY dispatch (occ_kernel_dsws.s's KERNARG CONTRACT comment: "HOST MUST MEMSET C=0"). This was
+    //   missing entirely (only the guard-tail canary was zeroed above). ONCE here, before the chunk loop --
+    //   NOT per chunk, so split-K segments claimed across separate chunk dispatches still accumulate.
+    memset((char*)C.ptr, 0, cbytes);
+
+    Ring ring; ring.buf = AllocGpu(node, 0x10000, true, true); ring.dw = (uint32_t*)ring.buf.ptr;
+    ring.sizeDw = (uint32_t)(ring.buf.size / sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node, HSA_QUEUE_COMPUTE, 100, HSA_QUEUE_PRIORITY_NORMAL, ring.buf.ptr, ring.buf.size, nullptr, &ring.res));
+
+    uint64_t shiftedIsa = ((uint64_t)isa.ptr) >> 8;
+    uint64_t occVa=(uint64_t)occ.ptr, aVa=(uint64_t)Ad.ptr, bVa=(uint64_t)Bd.ptr, cVa=(uint64_t)C.ptr, fenceVa=(uint64_t)fence.ptr;
+    uint32_t dims[8] = {0,0,0,(uint32_t)(WAVES_LAUNCH*32),1,1,0,0};   // NUM_THREAD_X = WAVES_LAUNCH*32 -> WAVES_LAUNCH waves/WG
+    uint32_t pgm[6] = {(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    // DYNVGPR is baked DYNVGPR=1 into this bin's compute role (build_dsws.sh mk2 never overrides it) -- dyn-VGPR
+    //   MUST be armed (RSRC2 bit6) to match; there is no static v2 bin to fall back to if it weren't.
+    const uint32_t vgprField = 4u;   // lean 32-VGPR launch; compute waves s_alloc_vgpr-grow per claimed rowblk
+    uint32_t rsrc1 = BuildPgmRsrc1(true); rsrc1 = (rsrc1 & ~0x3fu) | (vgprField & 0x3fu);
+    // FIX 1 pools: DSWS2_FLOW=1 -> N-deep flow pool (LDS_TOTAL_FLOW = 256 + POOL_N*OPSTRIDE);
+    //   DSWS2_RING=1 -> D=2 ring (33024); neither -> single-slot occ_kernel_dsws.s (16640, byte-identical).
+    uint32_t poolSlots = 1u;
+    if (getenv("DSWS2_FLOW"))      poolSlots = getenv("FLOW_POOL_N") ? (uint32_t)atoi(getenv("FLOW_POOL_N")) : 3u;
+    else if (getenv("DSWS2_RING")) poolSlots = 2u;
+    uint32_t operandBytes = (uint32_t)(FNc*16*SEGKv) + (uint32_t)((uint32_t)Gv*16*FMc*SEGKv);   // per-slot = 16384
+    // FIX 1 STAGGER: flow adds a per-rowblk fp32 reduction accumulator pool (ACC_N banks x FM*FN*1024B) AFTER
+    //   the operand pool. Must match the kernel's ACC_BASE/ACC_STRIDE/ACC_N (DSWS2_ACC_N, default 1; 0 for ring/single).
+    uint32_t accN = getenv("DSWS2_FLOW") ? (getenv("DSWS2_ACC_N") ? (uint32_t)atoi(getenv("DSWS2_ACC_N")) : 1u) : 0u;
+    uint32_t accBytes = accN * (uint32_t)(FMc*FNc*1024);
+    uint32_t ldsBytesRaw = 256u + poolSlots * operandBytes + accBytes;   // flow POOL3/ACC1:57600  POOL2/ACC2:49408
+    uint32_t ldsU=0, ldsA=0, ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytesRaw, &ldsU, &ldsA, &ldsG);
+    uint32_t rsrc2 = (BuildPgmRsrc2(true) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;   // USER_SGPR=15 (FIX 1h: dropped s15..s17)
+    uint32_t rsrc[2] = {rsrc1, rsrc2};
+    printf("  [dsws2] %dx%dx%d  super-tile=%dx%d (G=%d FM=%d FN=%d)  TOTAL=%u TOTAL_super=%llu n_kseg=%d  "
+           "waves/WG=%u(=%uc%ua%ub)  LDS=%uB(alloc %uB)  VGPR~%u dyn=1 RSRC2=0x%x\n",
+           Mo,No,Ko, TMsuper,TN, Gv,FMc,FNc, TOTAL, (unsigned long long)TOTAL_super, n_kseg,
+           WAVES_LAUNCH, nComp,nAfeed,nBfeed, ldsBytesRaw, ldsA, vgprField*8, rsrc2);
+
+    // FIX 1(i): 15 kernargs (s0..s14) only -- n_kseg/TOTAL_super/magic_kseg dropped (derived in-kernel /
+    //   memory-carried via occ[24], see occ_kernel_dsws.s KERNARG CONTRACT). Array is still 16 wide to match
+    //   every other proven path's single 16-register SET_SH_REG packet; index 15 is unused padding (lands
+    //   in the hardware's TGID_X slot, which this kernel does not read).
+    uint32_t userdata[16] = {
+        (uint32_t)occVa,(uint32_t)(occVa>>32), (uint32_t)aVa,(uint32_t)(aVa>>32),   // s0:1 occ, s2:3 A
+        (uint32_t)bVa,(uint32_t)(bVa>>32), (uint32_t)cVa,(uint32_t)(cVa>>32),       // s4:5 Bshuf, s6:7 C
+        (uint32_t)KT, (uint32_t)Ko, (uint32_t)(NT*256), TOTAL,                      // s8 KT, s9 K(bytes/row), s10 NTx256, s11 TOTAL
+        magic, (uint32_t)NTL, (uint32_t)(FNc*256), 0u };                            // s12 magic, s13 NTL, s14 FNx256, [15] unused
+    uint32_t dispInit = BuildDispatchInitiator();
+
+    const uint32_t poolD = getenv("ML8_POOL") ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
+    const uint32_t pool = poolD < 64u ? poolD : 64u;
+    const char* ydis = getenv("ML8_YIELD_DISABLE"); bool yieldOff = ydis && ydis[0]=='1';
+    int yieldMs = getenv("ML8_YIELD_MS") ? atoi(getenv("ML8_YIELD_MS")) : 5;
+    if (yieldMs < 0) yieldMs = 0;
+    double yieldEvery = (getenv("ML8_YIELD_EVERY_MS") ? atoi(getenv("ML8_YIELD_EVERY_MS")) : 100) / 1000.0;  // proven run_mbgemm cadence
+    if (yieldEvery <= 0.0) yieldEvery = 0.1;
+    const double timeoutS = 25.0;
+    // COMPOSITOR-SAFE CHUNKING (mirrors run_mbcoop): bound each dispatch to ML8_COOP_CHUNK super-tiles
+    //   (claim starts at occ[20]=base, terminal bound occ[24]/occW[6]=chunkHi -- FIX 1(j), memory-carried
+    //   since there is no deliverable kernarg slot for it) and yield between dispatches.
+    uint64_t chunkTilesEnv = getenv("ML8_COOP_CHUNK") ? (uint64_t)atoll(getenv("ML8_COOP_CHUNK")) : 0ull;
+    // FIX 1 STAGGER: the flow write-once kernel claims occ[20] as whole TILES (a WG owns a tile's n_kseg
+    //   segments so its per-WG LDS banks sum a full tile); every other dsws2 path claims super-tiles.
+    const uint64_t claimTotal = getenv("DSWS2_FLOW") ? (uint64_t)TOTAL : TOTAL_super;
+    uint64_t chunkTiles = (chunkTilesEnv == 0ull || chunkTilesEnv > claimTotal) ? claimTotal : chunkTilesEnv;
+    uint64_t nChunks = (claimTotal + chunkTiles - 1ull) / chunkTiles;
+    double chunkMaxS = getenv("ML8_COOP_CHUNK_MAXS") ? atof(getenv("ML8_COOP_CHUNK_MAXS")) : 0.75;
+    if (chunkTiles < TOTAL_super) printf("  [dsws2] compositor-safe: %llu super-tiles/dispatch x %llu chunks (yield %dms between; abort chunk > %.2fs)\n",
+                                          (unsigned long long)chunkTiles, (unsigned long long)nChunks, yieldMs, chunkMaxS);
+    bool streamOn = getenv("ML8_COOP_STREAM") != nullptr;
+    uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
+    bool allok = true; uint32_t lastOcc0 = 0, lastOcc20 = 0; uint32_t totalConv = 0;  // occ[48] conv-commit count, summed across chunks (reset per chunk)
+    uint64_t sumSpan = 0; uint32_t spanChunks = 0; bool tfMissing = false;  // TFPROBE: summed per-chunk GPU-tick span (occ[3]-occ[2]); tfMissing => bin has no tick capture
+    // SUSTAINED (DSWS2_REPS>1): re-run the whole chunked GEMM back-to-back, buffers reused, C re-zeroed per rep
+    //   (split-K atomic-adds into C, so a repeated pass without reset would double it). Spans sum across ALL
+    //   reps -> TF is over reps*(2MNK) work / total busy ticks (warm-clock steady state, not a cold ms blip).
+    //   Per-rep span min/max -> the TF spread (glass-flat vs jittery), the trustworthiness signal.
+    uint32_t dswsReps = getenv("DSWS2_REPS") ? (uint32_t)atoi(getenv("DSWS2_REPS")) : 1u;
+    if (dswsReps < 1u) dswsReps = 1u;
+    double dswsTarget = getenv("DSWS2_TARGET_SECS") ? atof(getenv("DSWS2_TARGET_SECS")) : 0.0;  // >0: rep until this many wall-secs
+    double repT0 = now_s();
+    uint64_t repSpanMin = ~0ull, repSpanMax = 0; uint32_t repsDone = 0;
+    for (uint32_t rep = 0; ; ++rep) {
+      if (dswsTarget > 0.0) { if (rep > 0 && (now_s() - repT0) >= dswsTarget) break; }   // duration-bounded
+      else                  { if (rep >= dswsReps) break; }                              // count-bounded
+      if (rep > 0) memset((char*)C.ptr, 0, cbytes);   // split-K accumulation reset before each repeated pass
+      uint64_t repSpanBase = sumSpan;
+      // ML8_CHUNK_DIAG: per-chunk wall + STAGINSTR delta (coast/computed/feed/grow-fail). occ[70..73] are
+      //   OUTSIDE the per-chunk memset (occ[0..63]) so they accumulate; snapshot before each chunk for the delta.
+      //   A slow chunk with grow-fail/coast spiking + computed crawling == VGPR-starvation churn (compositor
+      //   held the SIMD pool during the inter-chunk yield); a slow chunk that is mostly `computed` == real work.
+      const bool chunkDiag = getenv("ML8_CHUNK_DIAG") != nullptr;
+    for (uint64_t base = 0; base < claimTotal; base += chunkTiles) {
+        uint64_t chunkHi = (base + chunkTiles < claimTotal) ? (base + chunkTiles) : claimTotal;
+        uint32_t diagPrevCoast = occW[70], diagPrevComp = occW[71], diagPrevFeed = occW[72], diagPrevGF = occW[73];
+        memset((void*)occW, 0, 0x100);        // re-zero the control region (occ[0] live, occ[20] claim, reserved) each chunk
+        occW[5] = (uint32_t)base;             // occ[20] (=occW[5]) claim counter starts at this chunk's base sti
+        occW[6] = (uint32_t)chunkHi;          // FIX 1(j): occ[24] (=occW[6]) = this chunk's terminal sti bound (memory-carried)
+        occW[2] = 0xFFFFFFFFu;                // TFPROBE: min-sentinel for the entry-tick atomic_min (occ[2]); occ[3] stays 0 (max)
+        occW[62] = magicTotal;                // KMAJOR: magic(TOTAL) for the ksi=sti/TOTAL decode (ignored unless KMAJOR bin)
+        if (traceW) { uint64_t tva=(uint64_t)traceBuf.ptr;   // TRACE: (re-)publish buffer VA + cap (memset above wiped occ[52..54])
+                      occW[52]=(uint32_t)tva; occW[53]=(uint32_t)(tva>>32); occW[54]=traceMaxRows; }
+        *fenceW = 0;
+        RingPlace(ring, PM4AcquireMemoryPacket(FAMILY_GFX12));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_START_X, dims, 8));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO, pgm, 6));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1, rsrc, 2));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS, reslim, 1));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE, tmpring, 1));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X, restart, 4));
+        RingPlace(ring, PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0, userdata, 16));          // s0..s14 (FIX 1i: ONE packet, like every proven path)
+        RingPlace(ring, PM4DispatchDirectPacket(pool * (uint32_t)(WAVES_LAUNCH*32), 1, 1, dispInit));   // grid = pool WGs
+        // NOTE: CS_PARTIAL_FLUSH here was tried (2026-07-05) and STALLS too -- the CP-level terminal-store/wave
+        //   drain is genuinely stuck at 16 waves; no host packet (drop-EOP, drop-ACQUIRE, PARTIAL_FLUSH) fixes it.
+        //   The fix is shader-side (terminal store / dyn-VGPR wave retirement). See KG.
+        // Codex fix (2026-07-05): EOP RELEASE_MEM only on the FINAL chunk. The terminal-store-drain quirk stalls
+        //   the EOP fence with no post-kernel traffic; a per-chunk stalled EOP sits in the in-order queue and
+        //   BLOCKS the next chunk's DispatchDirect from ever launching (that was the chunk1 "occ20 stuck at base,
+        //   0 claims" hang). Non-last chunks serialize via the kernel-done gate (occ0==0 + settle) in the poll
+        //   loop below; only the last chunk arms the real fence (guarded teardown handles it if it too stalls).
+        const bool lastChunk = (chunkHi >= claimTotal);
+        if (lastChunk) RingPlace(ring, PM4ReleaseMemoryPacket(FAMILY_GFX12, true, fenceVa, FENCE_VALUE));
+        double t0 = now_s(); RingSubmit(ring);
+        bool done = false, admitted = false; double lastSnap = t0, lastYield = t0;
+        // Complete on the KERNEL'S OWN done-signal (occ0==0 + settle), NOT the EOP fence. The terminal C store's
+        //   s_endpgm implicit drain stalls the EOP fence on this raw-PM4 path (COOP_STATUS.md; the proven coop
+        //   path completes the same way via ML8_COOP_NOFENCE). The store IS issued -- the settle lets it land
+        //   before the oracle reads C (a stale read fails the oracle, never a false CLEAN). The guarded teardown
+        //   below still refuses to destroy a non-idle queue (brick-avoidance), so a lingering wave is reclaimed
+        //   by process-exit, never a forced destroy. A real hang still trips the timeoutS bail -> forensics.
+        uint32_t lastEnd = 0; double lastEndChange = t0;
+        double settle = getenv("DSWS2_SETTLE") ? atof(getenv("DSWS2_SETTLE")) : 0.30;
+        while (true) { double now = now_s();
+            // COMPOSITOR YIELD (proven run_mbgemm mechanism, was MISSING on the flow path): hand the gfx ring
+            //   (Hyprland) an unconditional render+VGPR window every yieldEvery ms DURING the wait -- so a long or
+            //   stuck dispatch can't starve the desktop's gfx ring into a ring-timeout MODE1 reset. Host sleep
+            //   only; never enters the in-kernel TF span. This is the "let hyprland through every so often" logic.
+            if (!yieldOff && yieldMs > 0 && (now - lastYield) >= yieldEvery) {
+                struct timespec yts = { yieldMs/1000, (long)(yieldMs%1000)*1000000L };
+                nanosleep(&yts, nullptr); lastYield = now_s();
+            }
+            if (streamOn && (now - lastSnap) >= 0.2) { lastSnap = now;
+                fprintf(stderr, "[dsws2 +%5.2fs] occ0(live)=%u occ20(claim)=%u fence=%s\n",
+                        now-t0, occW[0], occW[5], (*fenceW==FENCE_VALUE)?"FIRED":"--"); fflush(stderr); }
+            if (occW[0] > 0) admitted = true;
+            uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
+            bool ff = (*fenceW == FENCE_VALUE);
+            // done = fence fired, OR kernel-done: occ0==0 (all counted waves retired) + a wave stamped its exit
+            //   tick (occ[3]!=0) + settled (store landed). Matches the coop gate.
+            if (admitted && occW[0]==0 && (ff || (end != 0 && (now - lastEndChange) > settle))) { done = true; break; }
+            if (now - t0 > timeoutS) break;
+        }
+        if (!done) {
+            fprintf(stderr, "\n*** DSWS2 TIMEOUT (chunk base=%llu hi=%llu): occ0(live)=%u occ20(claim)=%u fence=%s ***\n",
+                    (unsigned long long)base, (unsigned long long)chunkHi, occW[0], occW[5], (*fenceW==FENCE_VALUE)?"FIRED":"--");
+            // EMERGENT-economy timeout forensics: WHERE did it stall? (all slots stream live during the run)
+            //   computed>0 & rising -> compute progressed (slow/contention); computed~0 & coast huge -> LIVELOCK.
+            fprintf(stderr, "    [timeout forensics] residentPeak occ[1]=%u  fatPeak occ[58]=%u  fatResidual occ[57]=%u  alllive-net occ[60]=%u (TRACE: >0 w/ occ0=0 == waves stuck PRE-LIVE at .Lflow_alloc)\n",
+                    occW[1], occW[58], occW[57], occW[60]);
+            fprintf(stderr, "    [timeout forensics] STAGINSTR  coast occ[70]=%u  computed occ[71]=%u  feed-stages occ[72]=%u  grow-fail occ[73]=%u\n",
+                    occW[70], occW[71], occW[72], occW[73]);
+            allok = false; break;
+        }
+        if (chunkDiag) {
+            double cwall = now_s() - t0;
+            fprintf(stderr, "  [chunk diag] base=%llu hi=%llu wall=%.3fs claim=%u  STAGINSTR d: coast=%u computed=%u feed=%u grow-fail=%u%s\n",
+                    (unsigned long long)base, (unsigned long long)chunkHi, cwall, occW[5],
+                    occW[70]-diagPrevCoast, occW[71]-diagPrevComp, occW[72]-diagPrevFeed, occW[73]-diagPrevGF,
+                    (cwall > 0.5) ? "   <-- SLOW" : "");
+            fflush(stderr);
+        }
+        lastOcc0 = occW[0]; lastOcc20 = occW[5]; totalConv += occW[48];   // accumulate this chunk's role-switch commits (DIAG conv counter)
+        // TFPROBE: read this chunk's device-busy span BEFORE the next iteration re-zeros occ[2]/occ[3]. A stamped
+        //   chunk has occ[2] != 0xFFFFFFFF (entry min written) AND occ[3] != 0 (exit max written). Sum spans across
+        //   chunks -> total GPU busy ticks for the whole GEMM (host inter-chunk gaps excluded). If unstamped, the
+        //   bin lacks TFPROBE tick capture -> flag and skip (no bogus TF from the 0xFFFFFFFF sentinel).
+        { uint32_t gs = occW[2], ge = occW[3];
+          if (gs != 0xFFFFFFFFu && ge != 0) {
+              sumSpan += (ge >= gs) ? (uint64_t)(ge - gs) : ((uint64_t)ge + 0x100000000ull - (uint64_t)gs);
+              spanChunks++;
+          } else tfMissing = true; }
+        if (!yieldOff && yieldMs > 0) { struct timespec ts = { yieldMs/1000, (long)(yieldMs%1000)*1000000L }; nanosleep(&ts, nullptr); }
+        if ((now_s() - t0) > chunkMaxS) {
+            fprintf(stderr, "  [dsws2] WARN chunk @base%llu wall %.2fs > %.2fs cap -> ABORT remaining chunks\n",
+                    (unsigned long long)base, now_s()-t0, chunkMaxS);
+            allok = false; break;
+        }
+    }
+      if (!allok) break;                               // rep loop: bail on any chunk failure/timeout
+      { uint64_t rs = sumSpan - repSpanBase;            // this rep's busy-tick span (across its chunks)
+        if (rs > 0) { if (rs < repSpanMin) repSpanMin = rs; if (rs > repSpanMax) repSpanMax = rs; repsDone++; } }
+    }   // ---- end SUSTAINED rep loop ----
+    if (!allok) {
+        fprintf(stderr, "    [teardown] dsws2 run did not complete cleanly -> NOT destroying queue (brick-avoidance; process-exit reclaims).\n");
+        return res;
+    }
+    { double tw = now_s(); struct timespec ts = {0, 2000000L};
+      while (*fenceW != FENCE_VALUE && (now_s() - tw) < 5.0) nanosleep(&ts, nullptr); }
+    bool queueIdle = (*fenceW == FENCE_VALUE);
+    if (!queueIdle) fprintf(stderr, "  [teardown] WARN: EOP fence never fired in 5s; queue NON-IDLE -> NOT destroying (process-exit reclaims).\n");
+    res.occ0 = lastOcc0; res.occClaim = lastOcc20;
+    printf("  [dsws2 alllive-net] occ[60]=%u  peak-resident occ[1]=%u  (TRACE build: occ[60]>0 w/ occ0=0 == waves stuck PRE-LIVE at .Lflow_alloc)\n", occW[60], occW[1]);
+    printf("  [dsws2 completion] occ[0](live)=%u (0=clean)  occ[20](claim)=%u  (NOTE: with pool>=1, each WG's pinned\n"
+           "    claimer makes exactly one extra terminal over-claim past the bound, so the expected clean value is\n"
+           "    chunkHi(last chunk)+#WGs-that-raced-the-last-claim, NOT exactly TOTAL_super=%llu -- treat occ[20] as a\n"
+           "    'did every WG's claimer reach a terminal claim' liveness signal, occ[0]==0 as the real completion gate)\n",
+           lastOcc0, lastOcc20, (unsigned long long)TOTAL_super);
+    printf("  [dsws2 CONVERSIONS] committed role-switches (occ[48], summed over chunks) = %u  (>0 => waves ADAPTIVELY switched role)\n", totalConv);
+    {   // STAGINSTR write-once diag: feed-vs-compute-bound. occ[70]=coast iters, [71]=computed, [72]=feed stages.
+        uint32_t coastIt = occW[70], compIt = occW[71], feedIt = occW[72], growFail = occW[73];
+        if (coastIt + compIt > 0) {
+            double starve = 100.0 * (double)coastIt / (double)(coastIt + compIt);
+            printf("  [dsws2 STAGINSTR] compute-wave iters: coast=%u  computed=%u  feed-stages=%u  grow-fail=%u\n"
+                   "                    -> coast-frac=%.1f%%  grow-fail(stagger-repulsion)=%u (%.1f%% of coasts)\n",
+                   coastIt, compIt, feedIt, growFail, starve, growFail,
+                   coastIt > 0 ? 100.0 * (double)growFail / (double)coastIt : 0.0);
+        }
+    }
+    if (traceOn) {
+        uint32_t fatPeak = occW[58], fatResidual = occW[57];   // FATMAX / FATLIVE (should end ~0 if balanced)
+        printf("  [dsws2 VGPR-BUDGET PROBE] peak concurrent FAT compute waves (occ[58]) = %u  -> ~%u VGPR in flight (x NFV=112)"
+               "   [residual live=%d]\n", fatPeak, fatPeak*112u, (int)fatResidual);
+        printf("      (per-SIMD B estimate = peak/128 SIMDs x 112; raise DSWS2_BUDGET/pool until this plateaus or s_alloc stalls)\n");
+        uint32_t peakWaves = occW[1];   // occ[1] = peak concurrent RESIDENT waves (all roles), vs 2048 HW ceiling (16/SIMD)
+        printf("  [dsws2 OCCUPANCY] peak concurrent resident waves (occ[1]) = %u of 2048 HW max (%.1f%%, %.2f/SIMD)  "
+               "launched = %u WGs x %u waves = %u\n", peakWaves, peakWaves/2048.0*100.0, peakWaves/128.0,
+               pool, WAVES_LAUNCH, pool*WAVES_LAUNCH);
+    }
+
+    // ---- TFPROBE THROUGHPUT: total useful work / total device-busy span. Work = 2*M*N*K (split-K independent;
+    //   the n_kseg segments reduce the SAME K, so total MACs = M*N*K regardless of how K is partitioned). Span
+    //   = summed per-chunk (occ[3]-occ[2]) GPU ticks -> the on-chip busy time, immune to host launch/fence/poll
+    //   overhead (the reason a host wall-clock is useless at these <1ms shapes). TF = 2*M*N*K*freq / span / 1e12. ----
+    if (spanChunks > 0 && sumSpan > 0) {
+        res.wall = sumSpan;
+        double reps_eff = (repsDone > 0) ? (double)repsDone : 1.0;   // work = reps_eff * (2MNK); span = sum over reps
+        double workAll = 2.0 * (double)Mo * (double)No * (double)Ko * reps_eff;
+        res.tf = workAll * freq_hz / (double)sumSpan / 1e12;
+        double perRepWork = 2.0 * (double)Mo * (double)No * (double)Ko;
+        double tfHi = (repSpanMax > 0) ? perRepWork * freq_hz / (double)repSpanMin / 1e12 : res.tf;  // min span -> peak TF
+        double tfLo = (repSpanMax > 0) ? perRepWork * freq_hz / (double)repSpanMax / 1e12 : res.tf;  // max span -> trough TF
+        printf("  [dsws2 THROUGHPUT] %dx%dx%d  TF=%.1f  (%.1f%% of 307 TF fp8 peak)  span=%llu ticks / %u chunk(s) @ %.0f MHz\n",
+               Mo, No, Ko, res.tf, res.tf / 307.0 * 100.0, (unsigned long long)sumSpan, spanChunks, freq_hz / 1e6);
+        if (repsDone > 1)
+            printf("  [dsws2 SUSTAINED] reps=%u  TF=%.1f mean  (per-rep %.1f-%.1f, spread %.1f%%)  -- glass-flat=trustworthy\n",
+                   repsDone, res.tf, tfLo, tfHi, (tfHi > 0 ? (tfHi - tfLo) / tfHi * 100.0 : 0.0));
+    } else {
+        printf("  [dsws2 THROUGHPUT] n/a -- bin has no TFPROBE tick capture (occ[2]/occ[3] unstamped%s). "
+               "Rebuild the bin with -Wa,-defsym,TFPROBE=1 to measure TF.\n", tfMissing ? "" : "; no chunks completed");
+    }
+
+    // ---- PHASEPROBE: in-kernel per-phase tick breakdown of the COMPUTE wave (the critical path).
+    //   Accumulators at occ[64..69] (bytes 256..276) live ABOVE the 0x100 per-chunk memset -> they SUM
+    //   over the whole run. u32 slots -> keep PHASEPROBE runs short (single/few passes) to avoid wrap; the
+    //   DISTRIBUTION (%) is stable regardless. Ticks are summed across ALL compute waves (aggregate time
+    //   in each phase), so % shows WHERE compute-wave time goes -- measured, not inferred. ----
+    {
+        const char* phName[6] = {"FOLLOW_WAIT","STAGE_WAIT","GROW","WMMA","FLUSH","SHRINK"};
+        uint64_t ph[6] = {0,0,0,0,0,0}, phSum = 0;
+        for (int i = 0; i < 6; i++) { ph[i] = (uint64_t)occW[64 + i]; phSum += ph[i]; }
+        if (phSum > 0) {
+            printf("  [dsws2 PHASE breakdown] compute-wave ticks by phase (summed over all waves+chunks):\n");
+            printf("      %-12s %14s   %6s   %s\n", "phase", "ticks", "share", "what");
+            const char* phWhat[6] = {"idle: waiting for claimer to publish next super-tile",
+                                     "idle: waiting for A/B feeds to stage operands",
+                                     "dyn-VGPR grow 32->112 (+ rowblk claim)",
+                                     "the actual fp8 WMMA compute",
+                                     "split-K C reduction (global_atomic_add_f32)",
+                                     "dyn-VGPR shrink 112->32"};
+            for (int i = 0; i < 6; i++) {
+                double pct = 100.0 * (double)ph[i] / (double)phSum;
+                char bar[41]; int nb = (int)(pct / 2.5 + 0.5); if (nb > 40) nb = 40;
+                for (int k = 0; k < nb; k++) bar[k] = '#'; bar[nb] = 0;
+                printf("      %-12s %14llu   %5.1f%%  %-40s %s\n", phName[i],
+                       (unsigned long long)ph[i], pct, bar, phWhat[i]);
+            }
+            printf("      %-12s %14llu\n", "TOTAL", (unsigned long long)phSum);
+        }
+    }
+
+    // ---- TRACE dump: read the per-super-tile rows back to CSV (real disk). Rows are indexed by SEGCNT
+    //   (1-based), so row 0 stays zero; skip all-zero (unwritten) rows. Single-chunk runs only (chunked
+    //   runs reset SEGCNT per chunk -> rows overwrite). ----
+    if (traceW) {
+        const char* csv = getenv("DSWS2_TRACE_CSV");
+        char path[600];
+        if (!csv) { snprintf(path, sizeof path, "/home/kmbandy/dsws_gpu_logs/trace_%dx%dx%d.csv", Mo, No, Ko); csv = path; }
+        FILE* tf = fopen(csv, "w");
+        if (tf) {
+            fprintf(tf, "row,tick_lo,segcnt,epoch,nComp,nAfeed,nBfeed,occA,occB,convCount,vresv,sti,quiesce,tick_hi,chunkHi,wg_id\n");
+            uint32_t nrows = 0;
+            for (uint32_t r = 0; r < traceMaxRows; ++r) {
+                const volatile uint32_t* row = traceW + (size_t)r*16;
+                bool nz = false; for (int i = 0; i < 16; ++i) if (row[i]) { nz = true; break; }
+                if (!nz) continue;
+                fprintf(tf, "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                        r, row[0],row[1],row[2],row[3],row[4],row[5],row[6],row[7],row[8],row[9],row[10],row[11],row[12],row[13],row[14]);
+                ++nrows;
+            }
+            fclose(tf);
+            printf("  [dsws2 trace] wrote %u rows -> %s\n", nrows, csv);
+        } else fprintf(stderr, "  [dsws2 trace] cannot open '%s' for write\n", csv);
+    }
+
+    // ---- CANARY scan (verbatim pattern from run_mbcoop): did any C store land past the data region? ----
+    { const uint32_t* tail = (const uint32_t*)((const char*)C.ptr + cbytes);
+      uint64_t words = padB/4, firstNZ = ~0ull, lastNZ = 0, nzCount = 0;
+      for (uint64_t w=0; w<words; ++w) if (tail[w]) { if (firstNZ==~0ull) firstNZ=w; lastNZ=w; ++nzCount; }
+      if (nzCount) fprintf(stderr, "  [canary] *** C OOB STORE detected: %llu words written into guard tail; first at +%llu B past C-end ***\n",
+                            (unsigned long long)nzCount, (unsigned long long)(firstNZ*4));
+      else fprintf(stderr, "  [canary] C guard tail clean (no OOB store past C-end).\n"); (void)lastNZ; }
+
+    // ---- ORACLE (A2 tiered compare): for EACH output tile ti=mblk*NTL+tcol and EACH claimed rowblk r in
+    //   [0,G), the reference is the full-K chained 16x16x16 wmma_ref over all KT k-steps. Decodes the C
+    //   buffer EXACTLY like the coop oracle (unpack_D), with cid->r and P->G (the v2 G-extent). ----
+    const float* Cf = (const float*)C.ptr;
+    // SAMPLED ORACLE: full-K CPU reference is ~O(TOTAL*G*KT) MACs -> minutes at training M (640 tiles, KT=128).
+    //   DSWS2_ORACLE_STRIDE>1 checks every Nth output tile (still every rowblk/frag within it) so big-shape
+    //   perf runs verify a representative subset cheaply. Default 1 = full check (unchanged for small shapes).
+    int ostride = getenv("DSWS2_ORACLE_STRIDE") ? atoi(getenv("DSWS2_ORACLE_STRIDE")) : 1;
+    if (ostride < 1) ostride = 1;
+    int nTilesChecked = 0;
+    for (int ti = 0; ti < (int)TOTAL; ti += ostride) {
+        nTilesChecked++;
+        int mblk = ti / NTL, tcol = ti % NTL;
+        for (int r = 0; r < Gv; ++r) {
+            for (int mi = 0; mi < FMc; ++mi) for (int ni = 0; ni < FNc; ++ni) {
+                int rowbase = mblk*TMsuper + r*(FMc*16) + mi*16;
+                int colbase = tcol*TN + ni*16;
+                float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
+                uint8_t Ablk[256], Bblk[256]; float Dout[256];
+                for (int kt = 0; kt < KT; ++kt) {
+                    for (int i=0;i<16;i++) for (int j=0;j<16;j++) {
+                        Ablk[i*16+j] = Ah[(size_t)(rowbase+i)*Ko + (kt*16+j)];
+                        Bblk[i*16+j] = Bh[(size_t)(kt*16+i)*No + (colbase+j)];
+                    }
+                    wmma_ref_16x16x16(Ablk, Bblk, Cacc, Dout);
+                    for (int i=0;i<256;i++) Cacc[i]=Dout[i];
+                }
+                int frag = mi*FNc + ni;
+                size_t foff = (size_t)ti*(size_t)((uint32_t)Gv*FMc*FNc*256) + (size_t)r*(size_t)(FMc*FNc*256) + (size_t)frag*256;
+                float D[256]; unpack_D(Cf + foff, D);
+                OracleCmp cmp = oracle_compare(D, Cacc, 256, orel, oabs);
+                if (cmp.ok) res.okFrags++; else res.badFrags++;
+                if (cmp.max_rel > res.maxRel) res.maxRel = cmp.max_rel;
+            }
+        }
+    }
+    printf("  [dsws2 oracle] ok=%llu bad=%llu max_rel=%.4g  tier=%s (rel=%.0e abs=%.0e)  [%d/%u tiles checked, stride=%d]\n",
+           (unsigned long long)res.okFrags, (unsigned long long)res.badFrags, res.maxRel,
+           n_kseg==1?"TIGHT":"LOOSE", orel, oabs, nTilesChecked, TOTAL, ostride);
+
+    if (queueIdle) {
+        CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+        if (traceOn && traceBuf.ptr) FreeGpu(traceBuf);
+        FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(C); FreeGpu(Bd); FreeGpu(Ad); FreeGpu(occ); FreeGpu(isa);
+    }
+    res.ok = allok && (res.badFrags == 0);
+    return res;
+}
+
+// ===========================================================================================
+// run_grind: the NON-split-K CONTROL. Launches occ_kernel_grind.bin (1 wave = 1 WG owns one
+//   FM*16 x FN*16 output tile, full-K in registers, writes C ONCE with plain global_store, NO
+//   split-K, NO C-atomic reduction). Directly comparable to run_dsws2's TF: does avoiding split-K's
+//   32x C-write amplification beat the split-K kernel's ~2.1 TF? Static VGPR (the anti-moat control).
+//   Self-instrumented tick span (occ[2]/occ[3]) + maxlive (occ[1]) live in the kernel already.
+// ===========================================================================================
+struct GrindResult { bool ok=false; uint64_t okFrags=0, badFrags=0; double maxRel=0.0, tf=0.0; uint64_t wall=0; uint32_t maxlive=0, occ0=0; };
+
+static GrindResult run_grind(uint32_t node, const char* isaPath, int FMc, int FNc,
+                             int Mo, int No, int Ko, float orel, float oabs, double freq_hz) {
+    GrindResult res;
+    const int TM = FMc*16, TN = FNc*16;                 // grind output tile = FM*16 x FN*16 (32x64 @ 2x4)
+    if (TM==0 || TN==0 || Ko<=0 || (Mo%TM) || (No%TN) || (Ko%16)) {
+        fprintf(stderr, "  [grind] geometry %dx%dx%d not tile-aligned (TM=%d TN=%d, K%%16)\n", Mo,No,Ko,TM,TN); return res; }
+    const int MTL = Mo/TM, NTL = No/TN, KT = Ko/16, NT = No/16;
+    const uint32_t TOTAL = (uint32_t)MTL*(uint32_t)NTL;   // grind tile count (finer: no G, no ksi)
+    const uint32_t magic = (uint32_t)((0x100000000ULL + (uint64_t)NTL - 1)/(uint64_t)NTL);
+    const int KCHUNK = getenv("GRIND_KCHUNK") ? atoi(getenv("GRIND_KCHUNK")) : 4;
+
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
+    std::vector<uint8_t> Ah((size_t)Mo*Ko), Bh((size_t)Ko*No), Bshufh((size_t)Ko*No);
+    for (size_t i=0;i<Ah.size();++i) Ah[i]=NICE[(i*7 + i/(size_t)Ko)%6];
+    for (size_t i=0;i<Bh.size();++i) Bh[i]=NICE[(i*5 + (i/(size_t)No)*3)%6];
+    mbg_preshuffle_B(Bh.data(), Bshufh.data(), Ko, No);
+
+    size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
+    if (!isaBytes) { fprintf(stderr,"  [grind] cannot read '%s'\n",isaPath); return res; }
+    GpuBuf isa = AllocGpu(node,(isaLen+0xFFF)&~0xFFFull,true,false);
+    GpuBuf occ = AllocGpu(node,0x1000,false,true);
+    uint64_t padB = (uint64_t)(getenv("ML8_COOP_PAD_MB")?atoi(getenv("ML8_COOP_PAD_MB")):64)*1024ull*1024ull;
+    GpuBuf Ad = AllocGpu(node,((Ah.size()+0xFFF)&~0xFFFull)+padB,false,true,true);
+    GpuBuf Bd = AllocGpu(node,((Bshufh.size()+0xFFF)&~0xFFFull)+padB,false,true,true);
+    uint64_t cbytes = ((uint64_t)TOTAL*(uint64_t)(FMc*FNc*1024) + 0xFFF) & ~0xFFFull;   // TOTAL tiles x FM*FN frags x 256 f32
+    GpuBuf C = AllocGpu(node,cbytes+padB,false,true,true);
+    GpuBuf fence = AllocGpu(node,0x1000,false,true);
+    if (!(Ad.vram && Bd.vram && C.vram)) { fprintf(stderr,"\n*** GRIND VRAM GUARD FAILED -> abort ***\n"); abort(); }
+    // address bounds gate: last A/B/C element the kernel can touch must be in-buffer.
+    { uint64_t Amax = (uint64_t)(MTL*FMc*16-1)*Ko + (uint64_t)(KT-1)*16 + 8 + 7;   // max row=(MTL*FM*16-1), max kcol=(KT-1)*16+8+7
+      uint64_t Bmax = (uint64_t)(NTL-1)*FNc*256 + (uint64_t)(KT-1)*(uint64_t)NT*256 + (uint64_t)(FNc-1)*256 + (uint64_t)31*8 + 7;
+      uint64_t Cmax = (uint64_t)(TOTAL-1)*(uint64_t)(FMc*FNc*1024) + (uint64_t)(FMc*FNc-1)*1024 + (uint64_t)31*32 + 7*4 + 3;
+      bool aok=Amax<Ah.size(), bok=Bmax<Bshufh.size(), cok=Cmax<cbytes;
+      printf("  [grind bounds] A %llu/%zu %s  B %llu/%zu %s  C %llu/%llu %s\n",
+             (unsigned long long)Amax,Ah.size(),aok?"OK":"*OOB*",(unsigned long long)Bmax,Bshufh.size(),bok?"OK":"*OOB*",
+             (unsigned long long)Cmax,(unsigned long long)cbytes,cok?"OK":"*OOB*");
+      if (!(aok&&bok&&cok)) { fprintf(stderr,"\n*** GRIND BOUNDS GATE FAILED -> REFUSE ***\n");
+        FreeGpu(fence);FreeGpu(C);FreeGpu(Bd);FreeGpu(Ad);FreeGpu(occ);FreeGpu(isa); return res; } }
+    memcpy(isa.ptr,isaBytes,isaLen); free(isaBytes);
+    memcpy(Ad.ptr,Ah.data(),Ah.size()); memcpy(Bd.ptr,Bshufh.data(),Bshufh.size());
+    memset((char*)Ad.ptr+((Ah.size()+0xFFF)&~0xFFFull),0,padB);
+    memset((char*)Bd.ptr+((Bshufh.size()+0xFFF)&~0xFFFull),0,padB);
+    volatile uint32_t* occW=(volatile uint32_t*)occ.ptr; volatile uint32_t* fenceW=(volatile uint32_t*)fence.ptr;
+    memset((void*)occW,0,occ.size); *fenceW=0;
+    memset((char*)C.ptr,0,cbytes+padB);   // grind writes each cell once; zero anyway (canary tail + clean)
+
+    Ring ring; ring.buf=AllocGpu(node,0x10000,true,true); ring.dw=(uint32_t*)ring.buf.ptr; ring.sizeDw=(uint32_t)(ring.buf.size/sizeof(uint32_t));
+    CHECK(hsaKmtCreateQueue(node,HSA_QUEUE_COMPUTE,100,HSA_QUEUE_PRIORITY_NORMAL,ring.buf.ptr,ring.buf.size,nullptr,&ring.res));
+    uint64_t shiftedIsa=((uint64_t)isa.ptr)>>8;
+    uint64_t occVa=(uint64_t)occ.ptr,aVa=(uint64_t)Ad.ptr,bVa=(uint64_t)Bd.ptr,cVa=(uint64_t)C.ptr,fenceVa=(uint64_t)fence.ptr;
+    const uint32_t WAVES_LAUNCH=1u;                       // 1 wave/WG (the control)
+    uint32_t dims[8]={0,0,0,WAVES_LAUNCH*32,1,1,0,0};
+    uint32_t pgm[6]={(uint32_t)shiftedIsa,(uint32_t)(shiftedIsa>>32)|(g_is_dgpu?0u:(1u<<8)),0,0,0,0};
+    const uint32_t vgprField=15u;                         // static 120 VGPR (NFV~108); anti-moat control
+    uint32_t rsrc1=BuildPgmRsrc1(false); rsrc1=(rsrc1 & ~0x3fu)|(vgprField & 0x3fu);
+    uint32_t ldsBytesRaw=(uint32_t)(KCHUNK*(FMc+FNc)*256); // 6144 @ KCHUNK=4,FM=2,FN=4
+    uint32_t ldsU=0,ldsA=0,ldsG=0; uint32_t ldsBits=ldsRsrc2Bits(ldsBytesRaw,&ldsU,&ldsA,&ldsG);
+    uint32_t rsrc2=(BuildPgmRsrc2(false) & ~0x3eu)|(15u<<RSRC2_USER_SGPR_SHIFT)|ldsBits;
+    uint32_t rsrc[2]={rsrc1,rsrc2};
+    uint32_t userdata[16]={
+        (uint32_t)occVa,(uint32_t)(occVa>>32),(uint32_t)aVa,(uint32_t)(aVa>>32),
+        (uint32_t)bVa,(uint32_t)(bVa>>32),(uint32_t)cVa,(uint32_t)(cVa>>32),
+        (uint32_t)KT,(uint32_t)Ko,(uint32_t)(NT*256),TOTAL,
+        magic,(uint32_t)NTL,(uint32_t)(FNc*256),0u };
+    uint32_t dispInit=BuildDispatchInitiator();
+    const uint32_t pool=getenv("ML8_POOL")?(uint32_t)atoi(getenv("ML8_POOL")):256u;   // NO 64-clamp: grind is 1 wave/WG, needs many WGs
+    printf("  [grind] %dx%dx%d  tile=%dx%d (FM=%d FN=%d)  TOTAL=%u tiles  waves/WG=1  pool=%u WGs  LDS=%uB(alloc %uB) VGPR=%u static RSRC2=0x%x\n",
+           Mo,No,Ko,TM,TN,FMc,FNc,TOTAL,pool,ldsBytesRaw,ldsA,vgprField*8,rsrc2);
+    uint32_t reslim[1]={0},tmpring[1]={0},restart[4]={0,0,0,0};
+    memset((void*)occW,0,0x100); occW[20]=0; occW[2]=0xFFFFFFFFu; *fenceW=0;   // claim base 0; min-tick sentinel
+    RingPlace(ring,PM4AcquireMemoryPacket(FAMILY_GFX12));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_START_X,dims,8));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_LO,pgm,6));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_PGM_RSRC1,rsrc,2));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_RESOURCE_LIMITS,reslim,1));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_TMPRING_SIZE,tmpring,1));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_RESTART_X,restart,4));
+    RingPlace(ring,PM4SetShaderRegPacket(mmCOMPUTE_USER_DATA_0,userdata,16));
+    RingPlace(ring,PM4DispatchDirectPacket(pool*WAVES_LAUNCH*32,1,1,dispInit));
+    RingPlace(ring,PM4ReleaseMemoryPacket(FAMILY_GFX12,true,fenceVa,FENCE_VALUE));
+    double t0=now_s(); RingSubmit(ring);
+    bool done=false, admitted=false; const double timeoutS=25.0;
+    while (true) { double now=now_s();
+        if (occW[0]>0) admitted=true;
+        if (admitted && occW[0]==0 && *fenceW==FENCE_VALUE) { done=true; break; }
+        if (now-t0>timeoutS) break; }
+    if (!done) { fprintf(stderr,"\n*** GRIND TIMEOUT: occ0=%u fence=%s ***\n",occW[0],(*fenceW==FENCE_VALUE)?"FIRED":"--");
+        fprintf(stderr,"    [teardown] grind did not complete -> NOT destroying queue (process-exit reclaims).\n"); return res; }
+    res.occ0=occW[0]; res.maxlive=occW[1];
+    { uint32_t gs=occW[2],ge=occW[3];
+      if (gs!=0xFFFFFFFFu && ge!=0) { res.wall=(ge>=gs)?(uint64_t)(ge-gs):((uint64_t)ge+0x100000000ull-(uint64_t)gs);
+        res.tf=2.0*(double)Mo*(double)No*(double)Ko*freq_hz/(double)res.wall/1e12; } }
+    printf("  [grind completion] occ[0]=%u (0=clean)  maxlive=%u (of 2048, %.1f%%, %.2f/SIMD)\n",
+           res.occ0,res.maxlive,res.maxlive/2048.0*100.0,res.maxlive/128.0);
+    if (res.wall) printf("  [grind THROUGHPUT] %dx%dx%d  TF=%.1f  (%.1f%% of 307 TF fp8 peak)  span=%llu ticks @ %.0f MHz\n",
+                         Mo,No,Ko,res.tf,res.tf/307.0*100.0,(unsigned long long)res.wall,freq_hz/1e6);
+    else printf("  [grind THROUGHPUT] n/a (occ[2]/occ[3] unstamped)\n");
+    // canary
+    { const uint32_t* tail=(const uint32_t*)((const char*)C.ptr+cbytes); uint64_t words=padB/4,nz=0;
+      for (uint64_t w=0;w<words;++w) if (tail[w]) ++nz;
+      fprintf(stderr,"  [grind canary] C guard tail %s\n",nz?"*** OOB STORE ***":"clean"); }
+    // ---- ORACLE: each tile ti=(mblk,tcol), each (mi,ni) frag = full-K chained wmma_ref ----
+    const float* Cf=(const float*)C.ptr;
+    for (int ti=0; ti<(int)TOTAL; ++ti) {
+        int mblk=ti/NTL, tcol=ti%NTL;
+        for (int mi=0; mi<FMc; ++mi) for (int ni=0; ni<FNc; ++ni) {
+            int rowbase=mblk*TM + mi*16, colbase=tcol*TN + ni*16;
+            float Cacc[256]; for (int i=0;i<256;i++) Cacc[i]=0.f;
+            uint8_t Ablk[256],Bblk[256]; float Dout[256];
+            for (int kt=0; kt<KT; ++kt) {
+                for (int i=0;i<16;i++) for (int j=0;j<16;j++) {
+                    Ablk[i*16+j]=Ah[(size_t)(rowbase+i)*Ko + (kt*16+j)];
+                    Bblk[i*16+j]=Bh[(size_t)(kt*16+i)*No + (colbase+j)]; }
+                wmma_ref_16x16x16(Ablk,Bblk,Cacc,Dout); for (int i=0;i<256;i++) Cacc[i]=Dout[i]; }
+            int frag=mi*FNc+ni;
+            size_t foff=(size_t)ti*(size_t)(FMc*FNc*256) + (size_t)frag*256;
+            float D[256]; unpack_D(Cf+foff,D);
+            OracleCmp cmp=oracle_compare(D,Cacc,256,orel,oabs);
+            if (cmp.ok) res.okFrags++; else res.badFrags++;
+            if (cmp.max_rel>res.maxRel) res.maxRel=cmp.max_rel;
+        }
+    }
+    printf("  [grind oracle] ok=%llu bad=%llu max_rel=%.4g (rel=%.0e abs=%.0e)\n",
+           (unsigned long long)res.okFrags,(unsigned long long)res.badFrags,res.maxRel,orel,oabs);
+    if (*fenceW==FENCE_VALUE) { CHECK(hsaKmtDestroyQueue(ring.res.QueueId));
+        FreeGpu(ring.buf);FreeGpu(fence);FreeGpu(C);FreeGpu(Bd);FreeGpu(Ad);FreeGpu(occ);FreeGpu(isa); }
+    res.ok = (res.occ0==0) && (res.badFrags==0);
     return res;
 }
 
@@ -2667,9 +3337,39 @@ static void run_dynsmoke(uint32_t node) {
     FreeGpu(ring.buf); FreeGpu(fence); FreeGpu(occ); FreeGpu(isa);
 }
 
+// ===== MAD-305 DSWS adaptive wave-role controller (SPEC_DSWS_CONTROLLER.md / PLAN_DSWS_CONTROLLER.md).
+// v1 = static 3-role substrate {compute / A-feed / B-feed}; the controller layers on in Phases 2-4.
+// Config is env-driven so build_dsws.sh / supervised runs stay parameterizable. =====
+struct DswsCfg {
+    uint32_t nComp, nAfeed, nBfeed;   // role partition; N = nComp+nAfeed+nBfeed (wave count never changes)
+    uint32_t ringd;                   // A-ring / B-ring depth
+    uint32_t low, high;               // watermark band: occ<low = starved, occ>high = over-served
+    uint32_t epochShift;              // decision cadence: E = (segments_processed >> epochShift)
+    bool     dyn;                     // arm s_alloc_vgpr dyn-VGPR (COMPUTE_PGM_RSRC2 bit6)
+    uint32_t N() const { return nComp + nAfeed + nBfeed; }
+};
+static DswsCfg parse_dsws_cfg() {
+    DswsCfg c;
+    c.nComp      = getenv("DSWS_NCOMP")      ? (uint32_t)atoi(getenv("DSWS_NCOMP"))      : 4u;
+    c.nAfeed     = getenv("DSWS_NAFEED")     ? (uint32_t)atoi(getenv("DSWS_NAFEED"))     : 2u;
+    c.nBfeed     = getenv("DSWS_NBFEED")     ? (uint32_t)atoi(getenv("DSWS_NBFEED"))     : 2u;
+    c.ringd      = getenv("DSWS_RINGD")      ? (uint32_t)atoi(getenv("DSWS_RINGD"))      : 2u;
+    c.low        = getenv("DSWS_LOW")        ? (uint32_t)atoi(getenv("DSWS_LOW"))        : 1u;
+    c.high       = getenv("DSWS_HIGH")       ? (uint32_t)atoi(getenv("DSWS_HIGH"))       : (c.ringd > 1u ? c.ringd - 1u : 1u);
+    c.epochShift = getenv("DSWS_EPOCHSHIFT") ? (uint32_t)atoi(getenv("DSWS_EPOCHSHIFT")) : 3u;
+    c.dyn        = getenv("DSWS_DYN")        ? atoi(getenv("DSWS_DYN")) != 0             : false;
+    return c;
+}
+
+// FIX 3(m): a positional non-flag argv token (e.g. "4c2a2b" after --dsws2/--dsws) used to be silently
+//   ignored by the argv loop below -- nothing ever read argv[i] once it failed every `--foo` strcmp. A user
+//   passing a role-mix that disagreed with the actual (env-derived) NCOMP/NAFEED/NBFEED got the WRONG
+//   config with zero warning. Captured here so the DSWS2 mode handler can validate it instead.
+static char g_posMixArg[64] = {0};
+
 int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: if a raw-PM4 run hangs and gets SIGKILL'd, the log still shows WHERE it died
-    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, BPF82, SP82, ALD82, WALL82, TW8, TW4LEAN, B128MODE, TILEORDMODE, FP8EDGE, LDSTRIMMODE, VGPRPROBE, LEAN, DECOMP, WAVESPEC, MBML8, MBML8LONG, MBML8GAUNT, MBML8DYN, MBML8GATE, MBML8NF, MBML8PROF, MBML8BATCH, MBML8MATCH, MBML8COOP, DYNSMOKE } mode = CORRECT;
+    enum { CORRECT, PRONG1, PRONG2, PRONG3, COMBINED, TIMERCHECK, PROBE, MICROBATCH, MBGEMM, MBSAT, DYNFAT1, MBPROF, MERGE, WGGEMM, SGPRPROBE, WGLDS, LDSBOUND, WGGEMM2, WGPERF, WG2X2, NFUNROLL, NFOCC, NFBF, BANDSWP, FEEDPIPE, FEEDLADDER, FEEDBTR, FEEDPROF, FEEDSTAG, FEEDPB, STACK, BW, BASELINES, SUSTAIN, KWIN, KWINORACLE, TILEPROBE, BLDSPROBE, BTR128, ANOLDS, ANOLDSTR, WAVESWEEP, OCCSWEEP, REUSE82, REUSE82TW2, REUSE82KW2, VGPR82, BLDS82, BPF82, SP82, ALD82, WALL82, TW8, TW4LEAN, B128MODE, TILEORDMODE, FP8EDGE, LDSTRIMMODE, VGPRPROBE, LEAN, DECOMP, WAVESPEC, MBML8, MBML8LONG, MBML8GAUNT, MBML8DYN, MBML8GATE, MBML8NF, MBML8PROF, MBML8BATCH, MBML8MATCH, MBML8COOP, DYNSMOKE, DSWS, DSWS2, GRIND } mode = CORRECT;
     bool fat = false;   // --fat: include >128-VGPR shapes (require umr SQ_DYN_VGPR.BLOCK_SIZE=1, cap 256)
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--prong1"))    mode = PRONG1;
@@ -2690,6 +3390,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mbml8match")) mode = MBML8MATCH;
         else if (!strcmp(argv[i], "--mbml8coop")) mode = MBML8COOP;
         else if (!strcmp(argv[i], "--dynsmoke"))  mode = DYNSMOKE;
+        else if (!strcmp(argv[i], "--dsws"))      mode = DSWS;
+        else if (!strcmp(argv[i], "--dsws2"))     mode = DSWS2;
+        else if (!strcmp(argv[i], "--grind"))     mode = GRIND;
         else if (!strcmp(argv[i], "--mbml8gate")) mode = MBML8GATE;
         else if (!strcmp(argv[i], "--mbsat"))     mode = MBSAT;
         else if (!strcmp(argv[i], "--dynfat1"))   mode = DYNFAT1;
@@ -2746,6 +3449,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--lean"))          mode = LEAN;
         else if (!strcmp(argv[i], "--decomp"))        mode = DECOMP;
         else if (!strcmp(argv[i], "--fat"))       fat = true;
+        else if (argv[i][0] != '-') {
+            // FIX 3(m): a non-flag positional token (e.g. a "4c2a2b" role-mix string) -- capture it for
+            // DSWS2's validation instead of silently dropping it.
+            snprintf(g_posMixArg, sizeof g_posMixArg, "%s", argv[i]);
+        }
     }
 
     // Test matrices A,B (16x16 e4m3, non-trivial) and the CPU oracle D = A.B.
@@ -5252,6 +5960,249 @@ int main(int argc, char** argv) {
             printf("  %-38s  maxlive=%u WGs  marks OK=%u/%u bad=%u miss=%u  %s\n",
                    c.name, r.maxlive, r.okMarks, expect, r.badMarks, r.missMarks, pass ? "PASS" : "FAIL");
             if (!pass) rc = 3;
+        }
+    } else if (mode == DSWS) {
+        // ===== MAD-305 DSWS adaptive wave-role controller. Phase 1 = STATIC 3-role substrate.
+        // T1.1 (this) = config + validation refuse-path ONLY; the actual --dsws dispatch + oracle gate
+        // wire in at T1.3. Mirrors the WAVESPEC / MBML8COOP brick-guard discipline: a geometry/bin
+        // mismatch under bit6-armed dyn is exactly what bricks gfx1201, so we REFUSE (rc=4, no dispatch)
+        // on any invalid config or missing bin. =====
+        DswsCfg c = parse_dsws_cfg();
+        printf("\n=== MAD-305 DSWS 3-role substrate  (nComp=%u nAfeed=%u nBfeed=%u  N=%u  RINGD=%u  LOW=%u HIGH=%u  EPOCH_SHIFT=%u  dyn=%d) ===\n",
+               c.nComp, c.nAfeed, c.nBfeed, c.N(), c.ringd, c.low, c.high, c.epochShift, c.dyn);
+        // ---- validation refuse-path (spec floors: compute>=1, A-feed>=1, B-feed>=1; band sanity) ----
+        if      (c.nComp  < 1) { printf("  *** REFUSE: nComp>=1 required (compute floor); got %u ***\n",  c.nComp);  rc = 4; }
+        else if (c.nAfeed < 1) { printf("  *** REFUSE: nAfeed>=1 required (A-feed floor); got %u ***\n", c.nAfeed); rc = 4; }
+        else if (c.nBfeed < 1) { printf("  *** REFUSE: nBfeed>=1 required (B-feed floor); got %u ***\n", c.nBfeed); rc = 4; }
+        else if (c.ringd  < 1) { printf("  *** REFUSE: RINGD>=1 required; got %u ***\n", c.ringd); rc = 4; }
+        else if (c.low > c.high)   { printf("  *** REFUSE: LOW(%u) > HIGH(%u) — invalid watermark band ***\n", c.low, c.high); rc = 4; }
+        else if (c.high > c.ringd) { printf("  *** REFUSE: HIGH(%u) > RINGD(%u) — occ is clamped to [0,RINGD] ***\n", c.high, c.ringd); rc = 4; }
+        // ---- bin-presence brick-guard (T1.2/T1.3 build it via ./build_dsws.sh). Absent now by design. ----
+        char dswsBin[160];
+        snprintf(dswsBin, sizeof dswsBin, "occ_dsws_%uc%ua%ub_r%u%s_gd.bin",
+                 c.nComp, c.nAfeed, c.nBfeed, c.ringd, c.dyn ? "_dyn" : "");
+        if (rc == 0) {
+            FILE* fb = fopen(dswsBin, "rb");
+            if (fb) fclose(fb);
+            else { printf("  *** DSWS kernel bin '%s' NOT BUILT — REFUSING to dispatch "
+                          "(build it via ./build_dsws.sh; T1.2/T1.3) ***\n", dswsBin);
+                   rc = 4; }
+        }
+        if (rc == 0) {
+            // ===== T1.3 static 3-role dispatch + oracle gate. Role counts are baked into the bin (defsyms),
+            //   so the harness only sets WG threads = N*32 (totalWaves) and the bigger DSWS LDS; the C-store
+            //   /oracle partition uses P=NCOMP (DSWS compute count). Small tile-multiple oracle shape first
+            //   (sub-second, brick-safe); GENDIV (ml8 N are non-pow2). [SUPERVISED at T1.4.] =====
+            const int FMc = 2, FNc = 4;                  // DSWS v1 fixed coop tile (baked into the kernel + bin name)
+            const int Nwaves = (int)c.N();               // launch N = NCOMP+NAFEED+NBFEED waves/WG
+            // Replicate the kernel's LDS_TOTAL_DSWS EXACTLY (RINGD_A defaults to RINGD):
+            //   BRING + cons[NCOMP] + (prod,ti,epoch,initflag) + prod_b_hi[NBFEED-1] + A-ring + prod_a[NCOMP] + cons_a[NCOMP]
+            uint32_t BRING   = (uint32_t)c.ringd * FNc * 256;
+            uint32_t ldsBase = BRING + 4u*c.nComp + 16u;                       // = LDS_TOTAL (the DSWS=0 prefix)
+            uint32_t aring   = (uint32_t)c.ringd * c.nComp * FMc * 256;         // RINGD_A * NCOMP * FM * 256
+            uint32_t ldsDsws = ldsBase + 4u*(c.nBfeed - 1u) + aring + 8u*c.nComp;
+            const uint32_t poolD = getenv("ML8_POOL") ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
+            const char* onlyShape = getenv("DSWS_ONLY");
+            int oMTL = getenv("DSWS_ORACLE_MTL") ? atoi(getenv("DSWS_ORACLE_MTL")) : 4;
+            int oNTL = getenv("DSWS_ORACLE_NTL") ? atoi(getenv("DSWS_ORACLE_NTL")) : 8;
+            int TM = (int)c.nComp*FMc*16, TN = FNc*16;   // WG tile
+            struct SH { const char* name; int M, K, N; };
+            SH shapes[] = { {"down   ", 2048, 9216, 2560}, {"down_pf", 512, 9216, 2560} };
+            printf("  [dsws] N=%d waves/WG  WGtile=%dx%d  LDS=%uB  bin=%s\n", Nwaves, TM, TN, ldsDsws, dswsBin);
+            for (auto& s : shapes) {
+                if (onlyShape && !strstr(s.name, onlyShape)) continue;
+                int Mo = TM*oMTL, No = TN*oNTL, Ko = 512;          // small tile-multiple oracle shape
+                printf("\n  #### DSWS %s  oracle %dx%dx%d  (STORE=1, GENDIV) ####\n", s.name, Mo, No, Ko);
+                CoopResult o = run_mbcoop(node, dswsBin, c.dyn, poolD < 64u ? poolD : 64u, Mo, No, Ko,
+                                          FMc, FNc, (int)c.nComp, (int)c.ringd, /*fullCheck*/true,
+                                          /*useGenDiv*/true, /*reps*/1, /*targetSecs*/0.0,
+                                          /*totalWaves*/Nwaves, /*ldsBytesOverride*/ldsDsws);
+                if (!o.ok) { printf("  oracle INCOMPLETE (hang/timeout) -> protocol/grow bug; STOP\n"); rc = 3; break; }
+                bool clean = (o.badFrags == 0 && o.okFrags > 0);
+                printf("  oracle %s  ok=%llu bad=%llu  maxlive=%u\n",
+                       clean ? "CLEAN" : "*** BAD (race/math) ***",
+                       (unsigned long long)o.okFrags, (unsigned long long)o.badFrags, o.maxlive);
+                if (!clean) { rc = 3; break; }
+            }
+        }
+    } else if (mode == GRIND) {
+        const int FMc=2, FNc=4;
+        const int Mo = getenv("GRIND_M") ? atoi(getenv("GRIND_M")) : 576;
+        const int No = getenv("GRIND_N") ? atoi(getenv("GRIND_N")) : 512;
+        const int Ko = getenv("GRIND_K") ? atoi(getenv("GRIND_K")) : 2048;
+        const float orel = getenv("GRIND_REL") ? atof(getenv("GRIND_REL")) : 5e-3f;   // full-K single write -> TIGHT tier
+        const float oabs = getenv("GRIND_ABS") ? atof(getenv("GRIND_ABS")) : 1e-2f;
+        const char* gbin = getenv("GRIND_BIN") ? getenv("GRIND_BIN") : "occ_kernel_grind.bin";
+        printf("\n=== GRIND control (non-split-K, one-tile-per-WG, full-K, write-once C) ===\n");
+        FILE* fb=fopen(gbin,"rb"); if (fb) fclose(fb); else { printf("  *** grind bin '%s' NOT BUILT -> refuse ***\n",gbin); rc=4; }
+        if (rc==0) {
+            GrindResult o = run_grind(node,gbin,FMc,FNc,Mo,No,Ko,orel,oabs,freq_hz);
+            if (!o.ok && o.okFrags==0 && o.badFrags==0) { printf("  grind INCOMPLETE (hang/refuse) -> STOP\n"); rc=3; }
+            else if (o.badFrags>0) { printf("  grind oracle *** BAD *** -> STOP\n"); rc=3; }
+            else { printf("  grind oracle CLEAN\n"); rc=0; }
+        }
+    } else if (mode == DSWS2) {
+        // ===== MAD-305 DSWS v2 substrate (PLAN_DSWS_SUBSTRATE_V2.md, Task A8). Computes/dry-prints the
+        //   super-tile pool params for occ_kernel_dsws.s and, when DSWS2_DRYRUN is unset, launches it via
+        //   run_dsws2 (the v2 PM4 launch + tiered-oracle path). DSWS2_DRYRUN=1 -> print params + return
+        //   rc=0 WITHOUT touching the GPU (gate 2 of A8: must still dry-print, never dispatch). =====
+        DswsCfg c = parse_dsws_cfg();
+        const int FMc = 2, FNc = 4;                                  // v2 fixed coop tile (matches build_dsws.sh mk2)
+        const int Gv    = getenv("DSWS2_G")    ? atoi(getenv("DSWS2_G"))    : 6;   // M-extent (rowblks/super-tile) = NCOMP_MAX
+        const int SEGKv = getenv("DSWS2_SEGK") ? atoi(getenv("DSWS2_SEGK")) : 64;  // split-K segment (K-elements)
+        // super-tile geometry (tile-multiple oracle shape, mirroring the --dsws oracle defaults: oMTL/oNTL/Ko).
+        const int TMsuper = Gv*16*FMc;                               // super-tile M rows = G*16*FM
+        const int TN      = FNc*16;                                  // N-panel cols = FN*16
+        const int oMTL = getenv("DSWS2_ORACLE_MTL") ? atoi(getenv("DSWS2_ORACLE_MTL")) : 4;
+        const int oNTL = getenv("DSWS2_ORACLE_NTL") ? atoi(getenv("DSWS2_ORACLE_NTL")) : 8;
+        // n_kseg/Ko: DSWS2_NKSEG (when set) is the PRIMARY lever -- it derives Ko = SEGKv*n_kseg so the
+        //   pool always covers the FULL K range in exactly n_kseg segments (SEGK is a compile-time defsym
+        //   baked into the .bin's KSEG_STEPS-unrolled WMMA loop; Ko/SEGKv must stay exact or the resident
+        //   A/B staging silently undercounts K). This is how the A8 command forces n_kseg=1 (TIGHT tier)
+        //   without needing a separate DSWS2_K=64: `DSWS2_NKSEG=1` -> Ko=SEGKv*1=64 automatically.
+        //   Without DSWS2_NKSEG, Ko comes from DSWS2_K (default 512) and n_kseg = Ko/SEGKv as before.
+        int n_kseg, Ko;
+        if (getenv("DSWS2_NKSEG")) {
+            n_kseg = atoi(getenv("DSWS2_NKSEG"));
+            Ko = (n_kseg > 0) ? SEGKv * n_kseg : 0;
+        } else {
+            Ko = getenv("DSWS2_K") ? atoi(getenv("DSWS2_K")) : 512;
+            n_kseg = (SEGKv > 0) ? (Ko / SEGKv) : 0;          // = KT/(SEGK/16) (same K-units as the --dsws oracle)
+        }
+        const int Mo = TMsuper*oMTL, No = TN*oNTL;                   // tile-multiple oracle shape
+        const int KT = (SEGKv > 0) ? Ko/16 : 0;
+        const int NTL = No / TN;
+        const int MTLsuper = Mo / TMsuper;
+        const long long TOTAL_super = (long long)MTLsuper * NTL * n_kseg;   // (M/(G*16*FM)) * NTL * n_kseg
+        const uint64_t TOTAL64 = (uint64_t)MTLsuper * (uint64_t)NTL;        // coop-compat output-tile count (C sizing)
+        uint32_t poolSlots_h = 1u;   // FIX 1: flow N-deep pool / ring D=2 / single-slot
+        if (getenv("DSWS2_FLOW"))      poolSlots_h = getenv("FLOW_POOL_N") ? (uint32_t)atoi(getenv("FLOW_POOL_N")) : 3u;
+        else if (getenv("DSWS2_RING")) poolSlots_h = 2u;
+        // FIX 1 STAGGER: flow per-rowblk accumulator pool (ACC_N banks x FM*FN*1024B), matches kernel ACC_*.
+        const uint32_t accN_h = getenv("DSWS2_FLOW") ? (getenv("DSWS2_ACC_N") ? (uint32_t)atoi(getenv("DSWS2_ACC_N")) : 1u) : 0u;
+        const uint32_t ldsBytes = 256u + poolSlots_h * ((uint32_t)(FNc*16*SEGKv) + (uint32_t)(Gv*16*FMc*SEGKv))
+                                  + accN_h * (uint32_t)(FMc*FNc*1024);
+        // A2 tiered oracle thresholds: TIGHT (proven gate) for n_kseg==1, LOOSE (split-K reassoc) for n_kseg>1.
+        //   The A8 compare calls oracle_compare(got, ref, n, orel, oabs).
+        const float orel = (n_kseg == 1) ? 5e-3f : 3e-2f;
+        const float oabs = (n_kseg == 1) ? 1e-2f : 2e-2f;
+        const bool dry = getenv("DSWS2_DRYRUN") != nullptr;
+        printf("\n=== MAD-305 DSWS v2 substrate (A8 launch path; PLAN_DSWS_SUBSTRATE_V2.md) ===\n");
+        printf("  G=%d SEGK=%d FM=%d FN=%d  NCOMP=%u NAFEED=%u NBFEED=%u\n",
+               Gv, SEGKv, FMc, FNc, c.nComp, c.nAfeed, c.nBfeed);
+        printf("  oracle shape %dx%dx%d  (super-tile %dx%d, KT=%d, NTL=%d, MTLsuper=%d)\n",
+               Mo, No, Ko, TMsuper, TN, KT, NTL, MTLsuper);
+        printf("  n_kseg=%d  TOTAL_super=%lld  LDS=%uB\n", n_kseg, TOTAL_super, ldsBytes);
+        printf("  oracle tier: %s (rel=%.0e abs=%.0e)\n", n_kseg == 1 ? "TIGHT" : "LOOSE", orel, oabs);
+        // FIX 3(m): DSWS2 input validation refuse-paths (mirror the --dsws T1.1 refuse-path discipline).
+        // Resolve the positional-mix-arg check to a single bool+message BEFORE the dry/refuse chain below,
+        // so it can sit as one `else if` link in that chain (dry-run must keep bypassing ALL of these
+        // checks -- including this one -- exactly like it already bypasses the degenerate-geometry and
+        // Gv/SEGK checks; that's an existing, load-bearing contract: DSWS2_DRYRUN never touches the GPU
+        // AND never refuses, it just prints whatever params were computed).
+        bool posMixBad = false; char posMixMsg[256] = {0};
+        if (g_posMixArg[0]) {
+            uint32_t pc = 0, pa = 0, pb = 0;
+            if (sscanf(g_posMixArg, "%uc%ua%ub", &pc, &pa, &pb) != 3) {
+                posMixBad = true;
+                snprintf(posMixMsg, sizeof posMixMsg,
+                         "unrecognized positional arg '%s' (expected a role-mix like '4c2a2b', or no "
+                         "positional arg at all -- role counts come from DSWS_NCOMP/DSWS_NAFEED/DSWS_NBFEED)",
+                         g_posMixArg);
+            } else if (pc != c.nComp || pa != c.nAfeed || pb != c.nBfeed) {
+                // a positional role-mix token (e.g. "4c2a2b") was given on the command line. The only built
+                // v2 bin is compile-time-fixed at NCOMP=4/NAFEED=2/NBFEED=2 (build_dsws.sh mk2); the bin
+                // filename is actually picked from c.nComp/nAfeed/nBfeed (the DSWS_NCOMP/AFEED/BFEED env
+                // config), NOT from this positional token -- previously the token was silently ignored, so
+                // a user passing a mix that disagreed with the active env config got the WRONG config with
+                // no warning.
+                posMixBad = true;
+                snprintf(posMixMsg, sizeof posMixMsg,
+                         "positional role-mix arg '%s' (%uc%ua%ub) does not match the active DSWS_NCOMP/"
+                         "DSWS_NAFEED/DSWS_NBFEED config (%uc%ua%ub) -- set the env vars to match or drop "
+                         "the positional arg", g_posMixArg, pc, pa, pb, c.nComp, c.nAfeed, c.nBfeed);
+            }
+        }
+        if (dry) { printf("  [DSWS2_DRYRUN] params only -- NO GPU dispatch.\n"); rc = 0; }
+        else if (c.nComp < 1) { printf("  *** REFUSE: nComp>=1 required (compute floor); got %u ***\n",  c.nComp);  rc = 4; }
+        else if (c.nAfeed < 1) { printf("  *** REFUSE: nAfeed>=1 required (A-feed floor); got %u ***\n", c.nAfeed); rc = 4; }
+        else if (c.nBfeed < 1) { printf("  *** REFUSE: nBfeed>=1 required (B-feed floor); got %u ***\n", c.nBfeed); rc = 4; }
+        else if (c.N() != c.nComp + c.nAfeed + c.nBfeed) {
+            // role-floor/SUM check: N() (the launched wave count, WAVES_LAUNCH downstream) must equal the
+            // sum of the role counts actually used to size/decode the dispatch -- guards against a future
+            // refactor desyncing N() from its components (currently tautological by construction).
+            printf("  *** REFUSE: role-count sum mismatch (N()=%u != nComp+nAfeed+nBfeed=%u) ***\n",
+                   c.N(), c.nComp + c.nAfeed + c.nBfeed);
+            rc = 4;
+        } else if (posMixBad && !getenv("DSWS2_FLOW")) {
+            printf("  *** REFUSE: %s ***\n", posMixMsg);
+            rc = 4;
+        } else if (Mo <= 0 || No <= 0 || Ko <= 0 || n_kseg <= 0 || TOTAL_super <= 0) {
+            printf("  *** REFUSE: degenerate geometry (Mo=%d No=%d Ko=%d n_kseg=%d TOTAL_super=%lld) ***\n",
+                   Mo, No, Ko, n_kseg, TOTAL_super);
+            rc = 4;
+        } else if (TOTAL64 > 0xFFFFFFFFull || (uint64_t)TOTAL_super > 0xFFFFFFFFull) {
+            printf("  *** REFUSE: pool size overflows uint32_t (TOTAL=%llu TOTAL_super=%lld) -- occ[20]'s claim "
+                   "counter and the kernel's sti are both 32-bit ***\n", (unsigned long long)TOTAL64, TOTAL_super);
+            rc = 4;
+        } else if (Gv != 6 || (SEGKv != 64 && !(getenv("DSWS2_FLOW") && SEGKv == 32))) {
+            // G/SEGK are compile-time defsyms baked into the kernel's instruction immediates
+            // (KSEG_STEPS-unrolled WMMA loop, resident-LDS strides). A host geometry that disagrees
+            // with the bin's compiled G/SEGK silently corrupts the resident-A/B staging/compute
+            // addressing (wrong strides, not a bounds violation the gate below would catch). REFUSE
+            // rather than guess; rebuild a matching bin before changing these envs.
+            // FIX 1 STAGGER: the flow bin (build_flow.sh) can now be built with SEGK=32 (halves the
+            //   operand footprint so the g=6 write-once accumulator banks fit LDS) -- so SEGK=32 is
+            //   allowed ONLY on the DSWS2_FLOW path, where the run must pass a matching DSWS2_SEGK=32.
+            printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d mismatches the built bin's compile-time geometry "
+                   "(non-flow: G=6 SEGK=64; flow: G=6 SEGK in {32,64}) -- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv);
+            rc = 4;
+        } else {
+            char dswsBin[160];
+            // EMERGENT economy (flow): no baked mix. Derive the launch pool from FLOW_WAVES (host-set),
+            //   cap at 30 (coordinator mailbox squat), sanity-check against the lean-fit budget.
+            uint32_t Wlaunch = getenv("FLOW_WAVES") ? (uint32_t)atoi(getenv("FLOW_WAVES")) : 8u;   // 8 = proven-safe
+            if (Wlaunch < 4)  Wlaunch = 4;                 // floor(wid0/1/2) + >=1 compute
+            // SAFETY: W>~8 at POOL_N=1 overcommits the SIMD dyn-VGPR pool at launch -> some waves' s_alloc_vgpr 32
+            //   fails -> the ONLY in-kernel exit (s_endpgm on a failed-alloc wave) corrupts the pool -> OOB page
+            //   fault -> MODE1 brick (2026-07-05). Until that launch-starvation is root-caused, keep W_launch <= 8.
+            if (Wlaunch > 30) { printf("  [flow] FLOW_WAVES=%u > 30 (coord cap) -> clamping to 30\n", Wlaunch); Wlaunch = 30; }
+            {
+                const uint32_t VB = getenv("FLOW_VBUDGET") ? (uint32_t)atoi(getenv("FLOW_VBUDGET")) : 1536u;
+                const uint32_t leanFit = (VB - (112u - 32u)) / 32u;   // (VBUDGET-(NFV-VLEAN))/VLEAN
+                if (Wlaunch > leanFit)
+                    printf("  [flow] WARNING FLOW_WAVES=%u exceeds lean-fit=%u for VBUDGET=%u (bin's .error would catch a real overflow)\n", Wlaunch, leanFit, VB);
+            }
+            // FIX 1: DSWS2_FLOW -> flow bin, DSWS2_RING -> ring bin, else single-slot bin.
+            if (getenv("DSWS2_FLOW"))
+                snprintf(dswsBin, sizeof dswsBin, "occ_dsws2_w%u_flow_gd.bin", Wlaunch);   // Wlaunch == built WAVES
+            else if (getenv("DSWS2_RING"))
+                snprintf(dswsBin, sizeof dswsBin, "occ_dsws2_%uc%ua%ub_ring_gd.bin", c.nComp, c.nAfeed, c.nBfeed);
+            else
+                snprintf(dswsBin, sizeof dswsBin, "occ_dsws2_%uc%ua%ub_gd.bin", c.nComp, c.nAfeed, c.nBfeed);
+            FILE* fb = fopen(dswsBin, "rb");
+            if (fb) fclose(fb);
+            else {
+                printf("  *** DSWS2 kernel bin '%s' NOT BUILT -- REFUSING to dispatch (build it via "
+                       "./build_dsws.sh, mk2) ***\n", dswsBin);
+                rc = 4;
+            }
+            if (rc == 0) {
+                const bool isFlow = getenv("DSWS2_FLOW");   // flow: launch Wlaunch (emergent), mix args unused
+                Dsws2Result o = run_dsws2(node, dswsBin,
+                                           isFlow ? Wlaunch : c.nComp, isFlow ? 0u : c.nAfeed, isFlow ? 0u : c.nBfeed,
+                                           Gv, SEGKv, FMc, FNc, Mo, No, Ko, orel, oabs, freq_hz);
+                if (!o.ok && o.okFrags == 0 && o.badFrags == 0) {
+                    printf("  dsws2 INCOMPLETE (hang/timeout/refused before oracle) -> protocol/geometry bug; STOP\n");
+                    rc = 3;
+                } else if (o.badFrags > 0) {
+                    printf("  dsws2 oracle *** BAD (race/math) *** -> STOP\n");
+                    rc = 3;
+                } else {
+                    printf("  dsws2 oracle CLEAN\n");
+                    rc = 0;
+                }
+            }
         }
     } else {
         // Default: dyn-VGPR cap probe. Test dyn correctness at increasing s_alloc footprints:
