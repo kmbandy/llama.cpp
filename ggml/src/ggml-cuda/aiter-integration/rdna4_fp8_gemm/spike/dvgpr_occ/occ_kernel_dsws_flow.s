@@ -87,6 +87,15 @@
 .endif                                      //   phase boundary and atomic-adds the delta into per-phase occ accumulators
                                             //   (occ[64..69], bytes 256..276, ABOVE the per-chunk memset -> accumulate over
                                             //   the whole run). Host prints ticks + % per phase. Default 0 => byte-identical.
+.ifndef WOFLUSH
+    .set WOFLUSH, 0                         // BURST-SCOPED FLUSH (LDS-halving lever, council 2026-07-05): 1 = drop the
+.endif                                      //   per-rowblk LDS accumulator banks entirely; each compute burst atomic-adds
+                                            //   its fp32 ACC frags DIRECTLY to C (global_atomic_add_f32, fp32-exact, same
+                                            //   addresses as the write-once completer store). Build with ACC_N=0 (host
+                                            //   DSWS2_ACC_N=0) -> LDS/WG ~8KB -> ~7 WGs/CU -> per-SIMD VGPR pool BINDS ->
+                                            //   the dyn-VGPR traveling-peak finally engages (grow-fail>0). Re-incurs the
+                                            //   n_kseg-x C-write atomic traffic write-once removed; tunable later by burst
+                                            //   K-depth J + KMAJOR. Default 0 => byte-identical to the write-once bin.
 .ifndef NOCFLUSH
     .set NOCFLUSH, 0                        // PERF PROBE ONLY: 1 = skip the global_atomic_add_f32 C-flush loop (keep ALL
 .endif                                      //   other bookkeeping/handshake). Isolates the device-atomic C-reduction cost
@@ -1579,6 +1588,29 @@ occ_kernel:
       .endr
       .set ks, ks+1
     .endr
+.if WOFLUSH
+    // BURST-SCOPED FLUSH (no LDS bank): atomic-add this segment's fp32 ACC frags STRAIGHT to C[rowblk r].
+    //   C is memset 0 by the host; every segment of every rowblk atomic-adds -> C = full split-K sum.
+    //   Same addressing as the write-once completer store (v10=lane*32, offset frag*1024+e*4) so it lands
+    //   in the identical C locations -> correct by construction. s19=mblk s30=tcol s33=rowblk r (all live).
+    s_mul_i32 s38, s19, s13                        // mblk*NTL
+    s_add_u32 s38, s38, s30                        // + tcol
+    s_mul_i32 s38, s38, (G*FM*FN*1024)            // * per-tile C bytes
+    s_mul_i32 s40, s33, (FM*FN*1024)             // + rowblk r * per-rowblk C bytes
+    s_add_u32 s38, s38, s40
+    s_add_u32 s28, s6, s38
+    s_addc_u32 s29, s7, 0                          // s[28:29] = C rowblk base
+    .set frag, 0
+    .rept FM*FN
+      .set e, 0
+      .rept 8
+        global_atomic_add_f32 v10, v[ACC+frag*8+e], s[28:29] offset:(frag*1024 + e*4) scope:SCOPE_DEV
+        .set e, e+1
+      .endr
+      .set frag, frag+1
+    .endr
+    s_wait_storecnt 0x0                            // J=1 correctness baseline: drain this wave's atomics
+.else
     // WRITE-ONCE REDUCE: accumulate this segment's partial into LDS bank[r] (mirrors C frag layout;
     //   vaddr = v10=lane*32, base = ACC_BASE + r*ACC_STRIDE). ksi==0 (tile's first segment, POOL_N=1
     //   guarantees it drains before any later ksi) WRITES; ksi>0 ADDS. C is stored ONCE at ksi==mask
@@ -1609,6 +1641,7 @@ occ_kernel:
     .endr
 .Lflow_bankdn:
     s_wait_dscnt 0x0
+.endif
     instr_inc STINSTR_COMP                        // diag: a rowblk-segment was actually computed+reduced
     s_add_u32 s45, s48, SL_RBDONE
     lds_fetch_add_r s47, s45, 1                   // s47 = old RBDONE; old==G-1 -> I am the UNIQUE completer
@@ -1626,6 +1659,7 @@ occ_kernel:
     //   s19/s30/s31 still hold mblk/tcol/ksi from this wave's own DECODE_STI (untouched by the reduce).
     s_cmp_eq_u32 s31, s67                          // ksi == mask (n_kseg-1) -> tile complete?
     s_cbranch_scc0 .Lflow_drain_adv               // not last ksi -> just advance DRAIN (no store)
+.if !WOFLUSH
     s_mul_i32 s38, s19, s13                        // mblk*NTL
     s_add_u32 s38, s38, s30                        // + tcol
     s_mul_i32 s38, s38, (G*FM*FN*1024)            // * per-tile C bytes
@@ -1649,6 +1683,7 @@ occ_kernel:
       .set r, r+1
     .endr
     s_wait_storecnt 0x0                            // store COMPLETE before DRAIN++ -> banks safe to reuse
+.endif                                             // WOFLUSH: atomics already wrote C incrementally -> no store, just DRAIN++
 .Lflow_drain_adv:
     lds_get s44, DRAIN_HEAD_OFF
     lds_cmpstore_adv DRAIN_HEAD_OFF, s44          // completer advances DRAIN (unique wave; store already done)

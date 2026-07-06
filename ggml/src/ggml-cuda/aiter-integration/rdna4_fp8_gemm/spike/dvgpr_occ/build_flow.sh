@@ -11,7 +11,7 @@ mkflow() { # EMERGENT economy: no mix args. Env: WAVES VBUDGET G SEGK POOL_N ACC
   local tag="occ_dsws2_w${WAVES:-16}_flow_gd"
   nice -19 ionice -c3 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
      -Wa,-defsym,DSWS2=1 -Wa,-defsym,FM=2 -Wa,-defsym,FN=4 -Wa,-defsym,G=${G:-6} -Wa,-defsym,SEGK=${SEGK:-64} \
-     -Wa,-defsym,SAFEPROBE=1 -Wa,-defsym,DIAG=${DIAG:-0} -Wa,-defsym,POOL_N=${POOL_N:-3} -Wa,-defsym,ACC_N=${ACC_N:-1} \
+     -Wa,-defsym,SAFEPROBE=1 -Wa,-defsym,DIAG=${DIAG:-0} -Wa,-defsym,POOL_N=${POOL_N:-3} -Wa,-defsym,ACC_N=${ACC_N:-1} -Wa,-defsym,WOFLUSH=${WOFLUSH:-0} \
      -Wa,-defsym,WAVES=${WAVES:-16} -Wa,-defsym,VBUDGET=${VBUDGET:-1536} \
      -Wa,-defsym,PHASEPROBE=${PHASEPROBE:-0} -Wa,-defsym,NOCFLUSH=${NOCFLUSH:-0} -Wa,-defsym,CSTORE=${CSTORE:-0} \
      -Wa,-defsym,SLEEPN=${SLEEPN:-2} -Wa,-defsym,COORD_PERIOD=${COORD_PERIOD:-64} -Wa,-defsym,TFPROBE=${TFPROBE:-0} -Wa,-defsym,DEADMAN=${DEADMAN:-1} -Wa,-defsym,DEADMAN_TICKS=${DEADMAN_TICKS:-50000000} -Wa,-defsym,STAGINSTR=${STAGINSTR:-0} -Wa,-defsym,TRACE=${TRACE:-0} \
