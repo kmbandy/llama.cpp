@@ -20,6 +20,7 @@
 
 #include "wp-page-catalog.h"
 #include "wp-file-io.h"
+#include "wp-host-tier.h"
 #include "wp-pool.h"
 #include "wp-gpu-transport.h"
 #include "wp-prefetch.h"
@@ -60,6 +61,7 @@ public:
         uint64_t lru_walk_pinned_skips          = 0;
         uint64_t cross_layer_prefetch_submitted = 0;
         uint64_t cross_layer_hit_in_ensure      = 0;
+        uint64_t host_tier_hits                 = 0;
     };
 
     WeightPager() = default;
@@ -240,6 +242,7 @@ private:
     PoolAllocator                pool_;
     GpuTransport                 transport_;
     PrefetchScheduler            prefetch_;
+    std::unique_ptr<HostTier>    host_tier_;
 
     // page_idx -> slot_idx (or -1). Set both for in-flight prefetches and
     // for committed (data-ready) pages — distinguished by page_loaded_.

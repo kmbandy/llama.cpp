@@ -7,12 +7,14 @@
 
 #include "weight-pager/wp-page-catalog.h"
 #include "weight-pager/wp-file-io.h"
+#include "weight-pager/wp-host-tier.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
 
 #include "ggml-backend.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -952,6 +954,132 @@ static int test_pool_alloc_returns_neg1_when_all_pinned() {
 }
 
 // ---------------------------------------------------------------------------
+// HostTier - pinned/pageable host slab + LRU bookkeeping (MAD-P4)
+// ---------------------------------------------------------------------------
+
+static int test_host_tier_store_lookup() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> src(32);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 3 + 1);
+
+    EXPECT(tier.store(/*page_idx=*/7, src.data(), src.size()), "store page");
+    const void * p = tier.lookup(7);
+    EXPECT(p != nullptr, "lookup returns pointer");
+    EXPECT(std::memcmp(p, src.data(), src.size()) == 0, "lookup bytes match");
+    EXPECT_EQ_INT(tier.used_bytes(), src.size(), "used bytes after store");
+    EXPECT_EQ_INT(tier.resident_count(), 1u, "one resident page");
+
+    return fails;
+}
+
+static int test_host_tier_size_class_reuse() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> a(32, 0xA1);
+    std::vector<uint8_t> b(32, 0xB2);
+    std::vector<uint8_t> c(32, 0xC3);
+
+    EXPECT(tier.store(1, a.data(), a.size()), "store page 1");
+    const void * p1 = tier.lookup(1);
+    EXPECT(tier.store(2, b.data(), b.size()), "store page 2");
+    EXPECT(tier.store(3, c.data(), c.size()), "store page 3 evicts page 1");
+    const void * p3 = tier.lookup(3);
+
+    EXPECT(p1 != nullptr && p3 != nullptr, "pointers valid");
+    EXPECT(p3 == p1, "same-size store reuses evicted slot");
+    EXPECT(tier.lookup(1) == nullptr, "evicted page 1 missing");
+    EXPECT(std::memcmp(p3, c.data(), c.size()) == 0, "reused slot has new bytes");
+
+    return fails;
+}
+
+static int test_host_tier_lru_eviction_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x11);
+    EXPECT(tier.store(10, bytes.data(), bytes.size()), "store 10");
+    EXPECT(tier.store(11, bytes.data(), bytes.size()), "store 11");
+    EXPECT(tier.store(12, bytes.data(), bytes.size()), "store 12");
+    EXPECT(tier.store(13, bytes.data(), bytes.size()), "store 13 evicts oldest");
+
+    EXPECT(tier.lookup(10) == nullptr, "oldest page evicted first");
+    EXPECT(tier.lookup(11) != nullptr, "page 11 still resident");
+    EXPECT(tier.lookup(12) != nullptr, "page 12 still resident");
+    EXPECT(tier.lookup(13) != nullptr, "new page resident");
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count stays at capacity");
+
+    return fails;
+}
+
+static int test_host_tier_lookup_touch_keeps_mru() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x22);
+    EXPECT(tier.store(20, bytes.data(), bytes.size()), "store 20");
+    EXPECT(tier.store(21, bytes.data(), bytes.size()), "store 21");
+    EXPECT(tier.store(22, bytes.data(), bytes.size()), "store 22");
+
+    EXPECT(tier.lookup(20) != nullptr, "touch page 20");
+    EXPECT(tier.store(23, bytes.data(), bytes.size()), "store 23 evicts LRU after touch");
+
+    EXPECT(tier.lookup(20) != nullptr, "touched page kept as MRU");
+    EXPECT(tier.lookup(21) == nullptr, "untouched oldest page evicted");
+    EXPECT(tier.lookup(22) != nullptr, "page 22 still resident");
+    EXPECT(tier.lookup(23) != nullptr, "page 23 resident");
+
+    return fails;
+}
+
+static int test_host_tier_over_budget_evict() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x33);
+    EXPECT(tier.store(30, bytes.data(), bytes.size()), "store 30");
+    EXPECT(tier.store(31, bytes.data(), bytes.size()), "store 31");
+    EXPECT_EQ_INT(tier.used_bytes(), 64u, "budget full");
+
+    EXPECT(tier.store(32, bytes.data(), bytes.size()), "store beyond used budget evicts and succeeds");
+    EXPECT_EQ_INT(tier.used_bytes(), 64u, "used bytes remains capped");
+    EXPECT_EQ_INT(tier.resident_count(), 2u, "resident count remains capped");
+    EXPECT(tier.lookup(30) == nullptr, "oldest page evicted under pressure");
+    EXPECT(tier.lookup(31) != nullptr, "page 31 still resident");
+    EXPECT(tier.lookup(32) != nullptr, "new page resident");
+
+    return fails;
+}
+
+static int test_host_tier_lookup_miss() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(16, 0x44);
+    EXPECT(tier.lookup(99) == nullptr, "empty lookup returns nullptr");
+    EXPECT(tier.lookup(-1) == nullptr, "negative lookup returns nullptr");
+    EXPECT(tier.store(40, bytes.data(), bytes.size()), "store 40");
+    EXPECT(tier.lookup(41) == nullptr, "different page lookup misses");
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // compute_advise_ranges — MAD-232 posix_fadvise lookahead
 // ---------------------------------------------------------------------------
 //
@@ -1312,6 +1440,12 @@ int main() {
         { "pool_pin_oob_safe",                    test_pool_pin_oob_safe                    },
         { "pool_alloc_skips_pinned_in_eviction",  test_pool_alloc_skips_pinned_in_eviction  },
         { "pool_alloc_returns_neg1_when_all_pinned", test_pool_alloc_returns_neg1_when_all_pinned },
+        { "host_tier_store_lookup",              test_host_tier_store_lookup              },
+        { "host_tier_size_class_reuse",          test_host_tier_size_class_reuse          },
+        { "host_tier_lru_eviction_order",        test_host_tier_lru_eviction_order        },
+        { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
+        { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
+        { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },

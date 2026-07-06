@@ -4,6 +4,7 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>      // getenv, setenv, unsetenv, malloc, free
 #include <cstring>
@@ -55,10 +56,27 @@ void env_restore(const char * var, bool present, const std::string & prior) {
 constexpr const char * kEnvDisableGraphs = "GGML_CUDA_DISABLE_GRAPHS";
 constexpr const char * kEnvWpHipGraphs   = "WP_HIP_GRAPHS";
 constexpr const char * kEnvWpAsyncEnsure = "WP_ASYNC_ENSURE";
+constexpr const char * kEnvWpHostBudgetBytes = "WP_HOST_BUDGET_BYTES";
 
 bool env_flag_is_one(const char * var) {
     const char * v = std::getenv(var);
     return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+size_t env_size_bytes(const char * var) {
+    const char * v = std::getenv(var);
+    if (v == nullptr || v[0] == '\0') {
+        return 0;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    unsigned long long n = std::strtoull(v, &end, 10);
+    if (errno != 0 || end == v || (end != nullptr && *end != '\0')) {
+        LLAMA_LOG_WARN("wp::WeightPager: ignoring invalid %s=%s\n", var, v);
+        return 0;
+    }
+    return (size_t) n;
 }
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
@@ -270,6 +288,17 @@ bool WeightPager::init(const Config &             cfg,
         return false;
     }
 
+    const size_t host_budget = env_size_bytes(kEnvWpHostBudgetBytes);
+    if (host_budget > 0) {
+        auto host_tier = std::make_unique<HostTier>();
+        if (host_tier->init(host_budget, device_idx)) {
+            host_tier_ = std::move(host_tier);
+        } else {
+            LLAMA_LOG_WARN("wp::WeightPager: WP_HOST_BUDGET_BYTES=%zu requested, but HostTier init failed; continuing disabled\n",
+                           host_budget);
+        }
+    }
+
     initialized_ = true;
     LLAMA_LOG_INFO("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
                    catalog_.size(), cfg_.n_slots, slot_size,
@@ -305,6 +334,7 @@ void WeightPager::shutdown() {
     prefetch_.shutdown();
     file_io_.reset();
     transport_.shutdown();
+    host_tier_.reset();
     if (sync_staging_ != nullptr) {
 #if defined(GGML_USE_HIP)
         if (sync_staging_pinned_) {
@@ -405,6 +435,38 @@ void WeightPager::log_stats_summary() {
         : 0.0;
     const double gb_read = (double) s.io_bytes / 1000000000.0;
     const double gbps = s.io_seconds > 0.0 ? gb_read / s.io_seconds : 0.0;
+
+    if (host_tier_ || s.host_tier_hits > 0) {
+        LLAMA_LOG_INFO(
+            "wp::WeightPager summary:\n"
+            "  page_ins: %lu\n"
+            "  evictions: %lu\n"
+            "  prefetch_hits: %lu\n"
+            "  prefetch_misses: %lu\n"
+            "  prefetch_hit_rate: %.2f%%\n"
+            "  io_gb_read: %.3f\n"
+            "  io_effective_gb_s: %.3f\n"
+            "  sync_fallbacks: %lu\n"
+            "  lru_walk_hot_skips: %lu\n"
+            "  lru_walk_pinned_skips: %lu\n"
+            "  cross_layer_prefetch_submitted: %lu\n"
+            "  cross_layer_hit_in_ensure: %lu\n"
+            "  host_tier_hits: %lu\n",
+            (unsigned long) s.page_ins,
+            (unsigned long) s.evictions,
+            (unsigned long) s.prefetch_hits,
+            (unsigned long) s.prefetch_misses,
+            hit_rate,
+            gb_read,
+            gbps,
+            (unsigned long) s.sync_fallbacks,
+            (unsigned long) s.lru_walk_hot_skips,
+            (unsigned long) s.lru_walk_pinned_skips,
+            (unsigned long) s.cross_layer_prefetch_submitted,
+            (unsigned long) s.cross_layer_hit_in_ensure,
+            (unsigned long) s.host_tier_hits);
+        return;
+    }
 
     LLAMA_LOG_INFO(
         "wp::WeightPager summary:\n"
@@ -842,11 +904,36 @@ int WeightPager::page_in_sync_(int page_idx) {
         return -1;
     }
 
+    if (host_tier_) {
+        const void * host_ptr = host_tier_->lookup(page_idx);
+        if (host_ptr != nullptr) {
+            int evt = transport_.stage_in(dst, host_ptr, m.size, pool_.slot_size());
+            if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
+            if (evt < 0) {
+                LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
+                               page_idx);
+                pool_.release_slot(slot);
+                return -1;
+            }
+            transport_.release_event(evt);
+
+            page_to_slot_[page_idx] = slot;
+            page_loaded_[page_idx]  = true;
+            slot_to_page_[slot]     = page_idx;
+            ++stats_.host_tier_hits;
+            ++stats_.page_ins;
+            if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
+            ++s_diag_count;
+            return slot;
+        }
+    }
+
     // Stage 1: blocking read via the file IO layer. P2P reads directly
     // into the VRAM slot; host transports read into the shared pinned
     // staging buffer and use GpuTransport for the H2D copy below.
     const uint64_t req_id = (uint64_t) -1;  // synthetic; not pipelined
-    bool direct_to_device = file_io_->direct_to_device();
+    const bool host_store_possible = host_tier_ && m.size <= host_tier_->budget_bytes();
+    bool direct_to_device = file_io_->direct_to_device() && !host_store_possible;
     void * read_dst = direct_to_device ? dst : staging;
     auto read_once = [&]() {
         bool read_ok = file_io_->submit(req_id, (int) m.file_idx, m.file_offset, m.size, read_dst);
@@ -890,6 +977,10 @@ int WeightPager::page_in_sync_(int page_idx) {
         if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT p2p slot=%d\n", s_diag_count, slot);
         ++s_diag_count;
         return slot;
+    }
+
+    if (host_tier_) {
+        host_tier_->store(page_idx, staging, m.size);
     }
 
     // Stage 2: H2D + padding zero. stage_in() preserves the synchronous
