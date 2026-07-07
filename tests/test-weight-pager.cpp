@@ -6,6 +6,7 @@
 // runtime — they no-op compile-out under non-HIP builds.
 
 #include "weight-pager/wp-page-catalog.h"
+#include "weight-pager/wp-eval-cb.h"
 #include "weight-pager/wp-file-io.h"
 #include "weight-pager/wp-host-tier.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
@@ -1534,6 +1535,14 @@ static int test_routing_boundary_prepass() {
     return fails;
 }
 
+static int test_wp_paged_batch_flag_default_off() {
+    int fails = 0;
+    ScopedEnv guard("WP_PAGED_BATCH");
+    unsetenv("WP_PAGED_BATCH");
+    if (wp::wp_paged_batch_enabled()) { fprintf(stderr, "FAIL: WP_PAGED_BATCH must default OFF\n"); fails++; }
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1580,6 +1589,7 @@ int main() {
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
         { "pool_default_threshold_zero_lru",     test_pool_default_threshold_zero_is_pure_lru },
         { "routing_boundary_prepass",            test_routing_boundary_prepass            },
+        { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
     };
 
     for (const auto & t : tests) {
