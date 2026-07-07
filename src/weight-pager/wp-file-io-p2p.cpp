@@ -139,16 +139,24 @@ public:
             struct io_uring_cqe * cqe = nullptr;
             int ret = 0;
             if (timeout_ms < 0) {
-                ret = io_uring_wait_cqe(&ring_, &cqe);
+                // Retry on signal interruption — the reads are still in flight,
+                // nothing failed. ROCm/HIP fires signals frequently; treating
+                // -EINTR as a transport failure spuriously downgrades P2P.
+                do {
+                    ret = io_uring_wait_cqe(&ring_, &cqe);
+                } while (ret == -EINTR);
             } else if (timeout_ms == 0) {
                 ret = io_uring_peek_cqe(&ring_, &cqe);
-                if (ret == -EAGAIN) return false;
+                if (ret == -EAGAIN || ret == -EINTR) return false;  // nothing ready yet
             } else {
                 struct __kernel_timespec ts;
                 ts.tv_sec  = timeout_ms / 1000;
                 ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
                 ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-                if (ret == -ETIME) return false;
+                // -EINTR: signal interrupted the bounded wait. Report "no
+                // completion yet" so the caller's deadline loop retries with a
+                // recomputed budget, rather than downgrading the transport.
+                if (ret == -ETIME || ret == -EINTR) return false;
             }
 
             if (ret < 0 || cqe == nullptr) {
@@ -156,7 +164,7 @@ public:
                 out.status     = IoStatus::ErrorIo;
                 out.bytes_read = ret;
                 out.req_id     = 0;  // transport-level failure — fatal, propagate
-                switch_to_host_("io_uring wait failed", 0);
+                switch_to_host_errno_("io_uring wait failed", ret < 0 ? -ret : 0);
                 return true;
             }
 

@@ -270,10 +270,13 @@ public:
         int                   ret = 0;
 
         if (timeout_ms < 0) {
-            ret = io_uring_wait_cqe(&ring_, &cqe);
+            // Retry on signal interruption; the reads are still in flight.
+            do {
+                ret = io_uring_wait_cqe(&ring_, &cqe);
+            } while (ret == -EINTR);
         } else if (timeout_ms == 0) {
             ret = io_uring_peek_cqe(&ring_, &cqe);
-            if (ret == -EAGAIN) {
+            if (ret == -EAGAIN || ret == -EINTR) {
                 return false;  // no completion ready
             }
         } else {
@@ -281,8 +284,10 @@ public:
             ts.tv_sec  = timeout_ms / 1000;
             ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
             ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-            if (ret == -ETIME) {
-                return false;  // timed out
+            // -EINTR: signal interrupted the bounded wait — report "nothing yet"
+            // so the caller's deadline loop retries with a recomputed budget.
+            if (ret == -ETIME || ret == -EINTR) {
+                return false;  // timed out / interrupted
             }
         }
 
