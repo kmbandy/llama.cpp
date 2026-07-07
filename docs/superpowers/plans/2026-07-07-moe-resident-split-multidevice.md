@@ -75,7 +75,25 @@ git add src/llama-model-loader.h src/llama-model.cpp
 git commit -m "feat(wp): tag routed-expert tensors with is_expert at load"
 ```
 
-### Task 2: Gate the paging filter on `WP_RESIDENT_DENSE`
+### Task 2: Gate BOTH filters on `WP_RESIDENT_DENSE` (revised after code trace)
+
+> **Correction (implemented as `07874dba3`):** The original single-filter plan
+> below was WRONG and would have produced garbage. Weight-paging has **two
+> independent filters** that must agree: `is_paged_weight()` (`llama-model.cpp:1608-1616`,
+> the load-bearing one — it drives the manual per-tensor resident allocator at
+> `:1624-1663`) and the catalog population (`:1800`). Touching only the catalog
+> leaves dense tensors `is_paged_weight==true` ⇒ no buffer ⇒ `load_all_data`
+> skips them (`llama-model-loader.cpp:1607` skips `data==NULL`) ⇒
+> never-allocated-never-loaded. The stale comment at `:1822-1833` ("we page
+> everything") is false — the manual allocator already keeps token_embd/output/
+> norms/tiny resident; this feature just widens that set. **Actual change:** a
+> shared `wp_is_routed_expert(name)` predicate + `wp_resident_dense_enabled()`,
+> added to BOTH `is_paged_weight()` (dense → return false → resident) AND the
+> catalog push (`page_this = !gate || info.is_expert`). `init_weight_pager` runs
+> AFTER `load_tensors` (`llama.cpp:604-613`), so the pager pool auto-sizes to the
+> VRAM remaining after dense is resident.
+
+**Original (superseded) single-filter plan:**
 
 **Files:**
 - Modify: `src/llama-model.cpp:1799-1803` (the push into `weight_page_infos` + `weight_tensor_ptrs`)
@@ -224,7 +242,18 @@ git add tests/test-weight-pager.cpp
 git commit -m "test(wp): catalog is_expert classification (dense vs routed)"
 ```
 
-### Task 5: VRAM budget — reserve dense-resident before sizing the expert pool
+### Task 5: VRAM budget — VERIFY ordering (likely no code, per Task-2 trace)
+
+> **Simplified after the Task-2 code trace.** `init_weight_pager` (which sizes
+> the pager pool from free VRAM) runs AFTER `load_tensors` allocates the manual
+> resident buffer that now includes all dense tensors. So `hipMemGetInfo` at
+> pool-sizing time already reports VRAM net of dense-resident — the pool
+> auto-sizes to what's left. This task reduces to: confirm via the Phase-1 gate
+> run that free_vram at pool sizing excludes dense (log line), and that
+> dense+pool+KV fit. Add the subtraction below ONLY if the gate shows the pool
+> over-allocating. Do not add speculative code.
+
+**Contingency (only if the gate shows over-allocation):**
 
 **Files:**
 - Modify: `src/llama.cpp:184-211` (the auto slot-budget block)
