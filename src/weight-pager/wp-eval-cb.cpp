@@ -65,6 +65,8 @@ bool wp_profile_enabled() {
 }
 
 std::uint64_t s_prof_total_ns  = 0;  // total host time inside eval_cb (all paths past null-check)
+std::uint64_t s_prof_pre_ns    = 0;  // entry -> Step 1 (discard + async drain + MUL_MAT_ID handling)
+std::uint64_t s_prof_resolve_ns= 0;  // Step 1: src -> page name resolution (find_page loop)
 std::uint64_t s_prof_ensure_ns = 0;  // of that, time in the Step-2 ensure/patch loop
 std::uint64_t s_prof_calls     = 0;  // eval_cb invocations timed
 std::uint64_t s_prof_ops_pages = 0;  // invocations that had >= 1 paged src
@@ -184,25 +186,31 @@ void weight_pager_eval_cb_reset(WeightPager * pager) {
 
 void weight_pager_eval_cb_print_profile() {
     if (!wp_profile_enabled()) return;
-    const double total_ms   = (double) s_prof_total_ns  / 1e6;
-    const double ensure_ms  = (double) s_prof_ensure_ns / 1e6;
-    const double resolve_ms = total_ms - ensure_ms;   // page-resolution + async-drain + patch overhead
+    const double total_ms   = (double) s_prof_total_ns   / 1e6;
+    const double pre_ms     = (double) s_prof_pre_ns     / 1e6;   // entry -> Step 1
+    const double resolve_ms = (double) s_prof_resolve_ns / 1e6;   // Step 1 find_page loop
+    const double ensure_ms  = (double) s_prof_ensure_ns  / 1e6;   // Step 2 ensure/patch
+    const double other_ms   = total_ms - pre_ms - resolve_ms - ensure_ms;  // patch/tail + unaccounted
     LLAMA_LOG_WARN(
         "wp::eval_cb profile (WP_PROFILE_EVAL) — host-side callback time:\n"
         "  eval_cb_calls: %lu\n"
         "  ops_with_pages: %lu\n"
         "  ensure_calls (pages touched): %lu\n"
         "  eval_cb_host_total_ms: %.2f\n"
+        "  pre_step1_ms (discard+async+mmid): %.2f\n"
+        "  step1_resolve_ms (find_page loop): %.2f\n"
         "  ensure_phase_ms: %.2f\n"
-        "  resolve+other_ms: %.2f\n"
+        "  other_ms (patch+tail): %.2f\n"
         "  avg_us_per_eval_cb_call: %.3f\n"
-        "  avg_us_per_page_ensure: %.3f\n",
+        "  avg_us_pre_step1: %.3f\n"
+        "  avg_us_step1_resolve: %.3f\n",
         (unsigned long) s_prof_calls,
         (unsigned long) s_prof_ops_pages,
         (unsigned long) s_prof_ensures,
-        total_ms, ensure_ms, resolve_ms,
-        s_prof_calls   ? ((double) s_prof_total_ns  / 1000.0) / (double) s_prof_calls   : 0.0,
-        s_prof_ensures ? ((double) s_prof_ensure_ns / 1000.0) / (double) s_prof_ensures : 0.0);
+        total_ms, pre_ms, resolve_ms, ensure_ms, other_ms,
+        s_prof_calls ? ((double) s_prof_total_ns   / 1000.0) / (double) s_prof_calls : 0.0,
+        s_prof_calls ? ((double) s_prof_pre_ns     / 1000.0) / (double) s_prof_calls : 0.0,
+        s_prof_calls ? ((double) s_prof_resolve_ns / 1000.0) / (double) s_prof_calls : 0.0);
 }
 
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -216,8 +224,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // WP_PROFILE_EVAL: time the whole callback body (every return path past
     // here is counted once via the RAII guard). Zero cost when disabled.
-    const bool    wp_profile = wp_profile_enabled();
-    ProfGuard     prof_guard{wp_profile, wp_profile ? wp_now_ns() : 0};
+    // prof_t0 is captured once and reused by the pre-Step1 / resolve sub-timers.
+    const bool          wp_profile = wp_profile_enabled();
+    const std::uint64_t prof_t0    = wp_profile ? wp_now_ns() : 0;
+    ProfGuard           prof_guard{wp_profile, prof_t0};
 
 #if defined(GGML_USE_HIP)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
@@ -763,6 +773,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
+    // WP_PROFILE_EVAL: mark the entry -> Step-1 boundary (discard + async drain
+    // + MUL_MAT_ID routing handling all live above this point).
+    const std::uint64_t prof_tA = wp_profile ? wp_now_ns() : 0;
+    if (wp_profile) s_prof_pre_ns += prof_tA - prof_t0;
+
     // Step 1: walk t->src[] and collect distinct paged-weight page indices.
     // A source counts as paged if either its own name or its view_src's
     // name is in the catalog. View tensors fall in the second category;
@@ -835,6 +850,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             if (page_idx > highest_page) highest_page = page_idx;
         }
     }
+
+    // WP_PROFILE_EVAL: Step-1 (find_page resolution over all srcs) ends here.
+    if (wp_profile) s_prof_resolve_ns += wp_now_ns() - prof_tA;
 
     ++g_debug.ops_seen;
     if (n_page_indices == 0) {
