@@ -284,7 +284,17 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                 continue;
             }
             t->data   = placeholder;
-            t->buffer = nullptr;
+            // Anchor paged weights to the pool's device buffer so the backend
+            // scheduler can name a backend for them (buffer_id) even when a
+            // weight is reached only as a reshape/view's view_src — a leaf with
+            // buffer==NULL whose sole consumer is a view op falls through every
+            // split_graph assignment pass and gets buffer_id -1, tripping the
+            // gallocr assert (DeepSeek V4 wo_a = ggml_reshape_3d(...)->mul_mat).
+            // gallocr still skips it (is_allocated checks data != NULL first);
+            // eval_cb re-patches ->data (and already sets ->buffer = pool_buf)
+            // per op. This just brings load-time state to the post-first-decode
+            // steady state the eval_cb already produces.
+            t->buffer = pool_buf;
             ++n_placed;
         }
         LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p, skipped %zu not in catalog)\n",
