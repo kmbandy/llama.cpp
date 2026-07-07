@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_backend_buffer;
@@ -38,6 +39,9 @@ typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
 struct ggml_backend_buffer_type;
 typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
+
+struct ggml_cgraph;
+struct ggml_tensor;
 
 namespace wp {
 
@@ -147,6 +151,10 @@ public:
     bool   async_ensure_enabled()               const { return async_ensure_enabled_; }
     const Stats & stats() const;
     bool   batch_safe() const;
+    void   mark_routing_boundaries(const struct ggml_cgraph * gf);
+    bool   is_routing_break(const struct ggml_tensor * t) const {
+        return routing_break_tensors_.count(t) != 0;
+    }
     uint64_t sync_fallback_count() const { return stats_.sync_fallbacks; }
     int    loaded_pages() const;
     int    pending_prefetches() const { return prefetch_.pending(); }
@@ -298,6 +306,12 @@ private:
     // Stored as slots, not pages, so unpin releases the same refcounts even
     // if a page later moves to another slot.
     std::unordered_map<const void *, std::vector<int>> graph_pin_slots_;
+    std::unordered_set<const struct ggml_tensor *> routing_break_tensors_;
+    struct {
+        int n_nodes = -1;
+        const void * first = nullptr;
+        const void * last = nullptr;
+    } routing_sig_;
 
     // Shared pinned staging buffer for page_in_sync_. Allocated once at
     // init, sized to max_page_size, reused across every sync page-in.
