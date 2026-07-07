@@ -1048,6 +1048,27 @@ void WeightPager::advise_layer_lookahead(int block_idx, int k) {
     if (!initialized_ || file_io_ == nullptr) return;
     if (k <= 0 || block_idx < 0)              return;
 
+    // Resident-aware skip. advise_prefetch issues posix_fadvise(WILLNEED)
+    // NVMe readahead to warm the page cache for weights that will be paged
+    // in from disk. When the working set is fully resident (size-class pool
+    // holds every page in VRAM), nothing is ever re-read from NVMe, so the
+    // readahead warms nothing and just burns syscalls on the decode critical
+    // path — measured at ~35% of paged-resident decode time. Only advise when
+    // at least one page in the [block+1, block+k] window is NOT resident,
+    // i.e. real paging pressure exists. Self-adjusting: fires during the
+    // initial cold load and for genuinely-paging (pool < working set) models,
+    // stays out of the way once resident.
+    bool any_unresident = false;
+    for (int b = block_idx + 1; b <= block_idx + k && !any_unresident; ++b) {
+        for (int p : catalog_.pages_for_block(b)) {
+            if (p >= 0 && p < (int) page_loaded_.size() && !page_loaded_[p]) {
+                any_unresident = true;
+                break;
+            }
+        }
+    }
+    if (!any_unresident) return;
+
     const std::vector<AdviseRange> ranges = compute_advise_ranges(catalog_, block_idx, k);
     for (const auto & r : ranges) {
         file_io_->advise_prefetch((int) r.fd_idx, r.offset, r.size);
