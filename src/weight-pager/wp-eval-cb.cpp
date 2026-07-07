@@ -778,7 +778,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // If a view of a paged consolidated parent reaches this op without
     // being patched, its data lives at 0x1 + view_offs → near-null fault
     // on kernel read. Log it BEFORE the standard skip path so we see it.
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+    // Gated behind WP_EVAL_DEBUG: this walked every src of every op on the
+    // decode critical path unconditionally, adding host overhead per token
+    // for a fault-hunt probe that only matters when actively debugging.
+    if (eval_debug) for (int i = 0; i < GGML_MAX_SRC; ++i) {
         struct ggml_tensor * src = t->src[i];
         if (src == nullptr) break;
         const uintptr_t data_addr = (uintptr_t) src->data;

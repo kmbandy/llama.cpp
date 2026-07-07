@@ -128,6 +128,18 @@ public:
 
     // Lookup helpers.
     int    find_page(const std::string & name) const { return catalog_.find(name); }
+    // Allocation-free overload for the eval-cb hot path: ggml tensor names
+    // arrive as const char* (t->name), and building a std::string temporary
+    // per lookup heap-allocs for names > SSO (e.g. "blk.23.ffn_gate.weight").
+    // eval_cb calls find_page ~thousands of times per decoded token, so that
+    // alloc/free churn dominated decode (WP_PROFILE_EVAL). A thread_local
+    // scratch string reuses its buffer via assign() → no alloc after warmup.
+    // Overload resolution routes char* callers here automatically.
+    int    find_page(const char * name) const {
+        thread_local std::string key;
+        key.assign(name);
+        return catalog_.find(key);
+    }
     int    n_pages()                            const { return catalog_.size(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
