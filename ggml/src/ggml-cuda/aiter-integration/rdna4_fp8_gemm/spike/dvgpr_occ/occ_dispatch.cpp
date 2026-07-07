@@ -1923,8 +1923,12 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                 nanosleep(&yts, nullptr); lastYield = now_s();
             }
             if (streamOn && (now - lastSnap) >= 0.2) { lastSnap = now;
-                fprintf(stderr, "[dsws2 +%5.2fs] occ0(live)=%u occ20(claim)=%u fence=%s\n",
-                        now-t0, occW[0], occW[5], (*fenceW==FENCE_VALUE)?"FIRED":"--"); fflush(stderr); }
+                // FREEZE-FRAME every 200ms -> real disk: the ONLY forensics that survives a MES-wedge brick
+                //   (timeout/final readouts never fire on a brick). STAGINSTR counters + flow_snapshot frontier.
+                fprintf(stderr, "[dsws2 +%5.2fs] occ0=%u claim=%u fence=%s | comp=%u coast=%u gf=%u | FRONTIER ASSIGN=%u STAGE=%u DRAIN=%u slot[RB=%u BF=%u AR=%u] barrier=%u\n",
+                        now-t0, occW[0], occW[5], (*fenceW==FENCE_VALUE)?"FIRED":"--",
+                        occW[71], occW[70], occW[73],
+                        occW[74], occW[75], occW[76], occW[77], occW[78], occW[79], occW[80]); fflush(stderr); }
             if (occW[0] > 0) admitted = true;
             uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
             bool ff = (*fenceW == FENCE_VALUE);
@@ -1942,13 +1946,17 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                     occW[1], occW[58], occW[57], occW[60]);
             fprintf(stderr, "    [timeout forensics] STAGINSTR  coast occ[70]=%u  computed occ[71]=%u  feed-stages occ[72]=%u  grow-fail occ[73]=%u\n",
                     occW[70], occW[71], occW[72], occW[73]);
+            fprintf(stderr, "    [timeout forensics] FRONTIER  ASSIGN=%u STAGE=%u DRAIN=%u  drain-slot[RBDONE=%u BFDONE=%u ARDONE=%u]  barrier=%u\n"
+                            "        (read: where DRAIN<STAGE<ASSIGN pinpoints the stalled stage; RBDONE<ACC_N=never computed, BFDONE<FN|ARDONE<G=never staged, DRAIN<ASSIGN w/ all-full=completer/drain bug, barrier<WAVES=exit-barrier never closed)\n",
+                    occW[74], occW[75], occW[76], occW[77], occW[78], occW[79], occW[80]);
             allok = false; break;
         }
         if (chunkDiag) {
             double cwall = now_s() - t0;
-            fprintf(stderr, "  [chunk diag] base=%llu hi=%llu wall=%.3fs claim=%u  STAGINSTR d: coast=%u computed=%u feed=%u grow-fail=%u%s\n",
+            fprintf(stderr, "  [chunk diag] base=%llu hi=%llu wall=%.3fs claim=%u  STAGINSTR d: coast=%u computed=%u feed=%u grow-fail=%u  fatPk=%u%s\n",
                     (unsigned long long)base, (unsigned long long)chunkHi, cwall, occW[5],
                     occW[70]-diagPrevCoast, occW[71]-diagPrevComp, occW[72]-diagPrevFeed, occW[73]-diagPrevGF,
+                    occW[58],   // FATMAX: running peak concurrent fat waves (absolute, not a delta -- max isn't additive)
                     (cwall > 0.5) ? "   <-- SLOW" : "");
             fflush(stderr);
         }
@@ -1999,7 +2007,7 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                    coastIt > 0 ? 100.0 * (double)growFail / (double)coastIt : 0.0);
         }
     }
-    if (traceOn) {
+    if (traceOn || occW[58] > 0u) {   // fat gauge populates occ[58]/[57] under STAGINSTR (or TRACE); print whenever data exists
         uint32_t fatPeak = occW[58], fatResidual = occW[57];   // FATMAX / FATLIVE (should end ~0 if balanced)
         printf("  [dsws2 VGPR-BUDGET PROBE] peak concurrent FAT compute waves (occ[58]) = %u  -> ~%u VGPR in flight (x NFV=112)"
                "   [residual live=%d]\n", fatPeak, fatPeak*112u, (int)fatResidual);

@@ -298,6 +298,21 @@
   .set ACC_N,       1         // per-rowblk fp32 reduction accumulator banks (rowblk-lifetime). CO-BUDGET with
 .endif                        //   POOL_N: OP_BASE + POOL_N*OPSTRIDE + ACC_N*ACC_STRIDE <= 65536. Defaults keep
                               //   the POOL_N=3 bare build legal (57600); stagger build uses POOL_N=2 ACC_N=2 (49408).
+// ---- GROUP-SPLIT (B-reuse-in-L2 occupancy lever) ----------------------------------------------------
+//   The tile's G rowblks are reduced through ACC_N LDS banks in GROUPS = G/ACC_N sequential passes.
+//   ACC_N < G shrinks the resident bank footprint (ACC_N*8192 vs G*8192) -> more WGs/CU -> the pool can
+//   bind. Each group RE-SCANS B[:,tcol] (the feed re-stages B per emitted super-tile); since the whole B
+//   column stays warm in L2 (measured L2=8MB), the re-scan is an L2 hit, NOT an HBM refetch -> B-reuse is
+//   retained, no fetch-lag reintroduced. group is packed into the STAMP high bits (STAMP=(group<<28)|sti);
+//   sti < 2^28 for every real shape. ACC_N=G => GROUPS=1 => every `.if GROUPS>1` path drops => the whole-
+//   tile write-once codegen is BYTE-IDENTICAL. POOL_N=1 keeps groups strictly sequential (group g's banks
+//   store + recycle before g+1's ksi=0 re-inits them), so Fable's H1(init-race)/H5(boundary) never fire.
+.if G % ACC_N
+  .error "G must be divisible by ACC_N (group-split needs even rowblk groups)"
+.endif
+.set GROUPS,        (G / ACC_N)                 // rowblk-reduction passes per tile (1 = whole-tile, today)
+.set STAMP_GSHIFT,  28                          // group in STAMP[31:28]; sti in STAMP[27:0]
+.set STI_MASK,      ((1 << STAMP_GSHIFT) - 1)   // = 0x0FFFFFFF
 .ifndef COORD_PERIOD
   .set COORD_PERIOD, 64       // coordinator sense/nudge cadence (loop cycles); lazy is fine (waves coast)
 .endif
@@ -1136,6 +1151,19 @@
 .set STINSTR_COMP,  284                     // occ[71]: rowblk-segments actually computed + reduced
 .set STINSTR_FEED,  288                     // occ[72]: feed stage completions (staging throughput)
 .set STINSTR_GROWFAIL, 292                  // occ[73]: per-burst grow SCC0 (budget full -> coast) = stagger repulsion events
+// ---- FLOW-FRONTIER FREEZE-FRAME (occ[74..80]): wid0 snapshots the 3 pipeline heads + the drain-slot's
+//   staging/reduction counters + the exit-barrier count EVERY coordinator cycle. On a HANG the coordinator
+//   keeps cycling (drainwait->body->loop->here), so the last value on disk (via ML8_COOP_STREAM, or the
+//   host timeout-forensics readout) pinpoints WHICH stage stalled: heads frozen w/ RBDONE<ACC_N => a
+//   super-tile never computed; BFDONE<FN / ARDONE<G => staging never finished; DRAIN<ASSIGN w/ all
+//   counters full => completer/DRAIN-advance bug; QUIESCE<WAVES => barrier never closed. STAGINSTR=0 => none.
+.set FDIAG_ASSIGN_OFF,  296                 // occ[74] ASSIGN_HEAD (super-tiles emitted)
+.set FDIAG_STAGE_OFF,   300                 // occ[75] STAGE_HEAD  (super-tiles fully staged)
+.set FDIAG_DRAIN_OFF,   304                 // occ[76] DRAIN_HEAD  (super-tiles completed+stored)
+.set FDIAG_RBDONE_OFF,  308                 // occ[77] drain-slot SL_RBDONE (rowblks reduced; target ACC_N)
+.set FDIAG_BFDONE_OFF,  312                 // occ[78] drain-slot SL_BFDONE (B-frags staged; target FN)
+.set FDIAG_ARDONE_OFF,  316                 // occ[79] drain-slot SL_ARDONE (A-rowblks staged; target G)
+.set FDIAG_QUIESCE_OFF, 320                 // occ[80] count-to-WAVES exit-barrier check-ins (target WAVES)
 .macro instr_inc off
 .if STAGINSTR
     s_mov_b32 s57, exec_lo
@@ -1146,6 +1174,77 @@
     global_atomic_add_u32 v4, v3, s[0:1] offset:\off scope:SCOPE_DEV   // v4=occ base vaddr(0), v3=1
 .Lii_skip\@:
     s_mov_b32 exec_lo, s57
+.endif
+.endm
+// FAT gauge (STAGINSTR): a live count of GROWN (fat NFV-VGPR) compute waves + its running peak. fat_inc
+//   fires on grow-SUCCESS (once per burst), fat_dec on the paired burst-shrink -> occ[57] FATLIVE is a
+//   live gauge that nets to ~0 at retire (nonzero => inc/dec imbalance bug), occ[58] FATMAX = peak
+//   concurrent fat waves (x NFV = VGPR in flight). GLOBAL (aggregate over co-resident WGs): at a FIXED
+//   grid the peak's TREND vs the burst-length knob J is the Gate-2 signal; grow-fail stays the direct
+//   per-SIMD bind flag. STAGINSTR=0 => emits nothing => byte-identical. lane0-only, off the WMMA path.
+.macro fat_inc
+.if STAGINSTR
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2                // lane0 of the wave only
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lfi_skip\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:FATLIVE_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV  // v5=old live, v4=addr(0)
+    s_wait_loadcnt 0x0
+    v_add_nc_u32 v5, v5, 1                    // new live = old+1
+    global_atomic_max_u32 v4, v5, s[0:1] offset:FATMAX_OFF scope:SCOPE_DEV                            // peak = max(peak, new)
+.Lfi_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+.macro fat_dec
+.if STAGINSTR
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lfd_skip\@
+    v_mov_b32 v3, -1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:FATLIVE_OFF scope:SCOPE_DEV                           // v4=addr(0), v3=-1
+.Lfd_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// flow_snapshot: wid0 writes the pipeline freeze-frame to occ[74..80] each coordinator cycle (POOL_N=1 ->
+//   drain slot is always slot 0 = SLOTC_BASE). Reads are wave-uniform (full exec); only lane0 stores.
+//   STAGINSTR=0 => nothing emitted. Scratch s54..s61 are free at coordinator-duty entry (the emit re-reads).
+.macro flow_snapshot
+.if STAGINSTR
+    s_cmp_eq_u32 s71, 0                         // THROTTLE to the deadman's 64-cycle boundary (requires DEADMAN=1):
+    s_cbranch_scc0 .Lfsnap_done\@              //   7 global stores EVERY coord cycle keep a hung WG's memory engine
+                                                //   hot -> MES can't quiesce -> REMOVE_QUEUE wedge -> MODE1 (Run 7 brick).
+    lds_get s54, ASSIGN_HEAD_OFF
+    lds_get s55, STAGE_HEAD_OFF
+    lds_get s56, DRAIN_HEAD_OFF
+    lds_get s58, (SLOTC_BASE + SL_RBDONE)
+    lds_get s59, (SLOTC_BASE + SL_BFDONE)
+    lds_get s60, (SLOTC_BASE + SL_ARDONE)
+    lds_get s61, QUIESCE_CNT_OFF
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lfsnap_skip\@
+    v_mov_b32 v3, s54
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_ASSIGN_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s55
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_STAGE_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s56
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_DRAIN_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s58
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_RBDONE_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s59
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_BFDONE_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s60
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_ARDONE_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, s61
+    global_store_b32 v4, v3, s[0:1] offset:FDIAG_QUIESCE_OFF scope:SCOPE_DEV
+.Lfsnap_skip\@:
+    s_mov_b32 exec_lo, s57
+.Lfsnap_done\@:
 .endif
 .endm
 // Per-wave phase accumulators live in SGPRs s78..s83 (NO per-stamp store -> zero memory perturbation, no
@@ -1420,6 +1519,7 @@ occ_kernel:
     s_cmp_eq_u32 s24, 0
     s_cbranch_scc0 .Lflow_body                 // non-coordinator -> straight to role work
     // ---- coordinator duty (wid0): ASSIGN + (later) sense/nudge ----
+    flow_snapshot                              // pipeline freeze-frame -> occ[74..80] (STAGINSTR; hang forensics)
     lds_get s44, FLOWTERM_OFF
     s_cmp_eq_u32 s44, 0xDEAD
     s_cbranch_scc1 .Lflow_drainwait            // already terminal -> wait for drain
@@ -1430,9 +1530,15 @@ occ_kernel:
     s_cbranch_scc1 .Lflow_coord_period         // pool full -> no assign this cycle
     // TILE-CLAIM: write-once needs a WG to own a whole tile's n_kseg segments so its LDS banks sum a
     //   full tile. occ[20] now counts TILES; emit n_kseg super-tiles sti=(t<<shift)|ksi per claimed tile.
-    lds_get s55, COORD_KSI_OFF                   // next ksi to emit for the current tile
+    lds_get s55, COORD_KSI_OFF                   // combined cursor = group*n_kseg + ksi (GROUPS=1: just ksi)
+.if GROUPS > 1
+    s_lshl_b32 s46, GROUPS, s68                   // GKSI_MAX = GROUPS * n_kseg  (n_kseg = 1<<shift)
+    s_cmp_lt_u32 s55, s46                          // cursor < GROUPS*n_kseg -> more (group,ksi) for this tile
+    s_cbranch_scc1 .Lflow_same_tile
+.else
     s_cmp_le_u32 s55, s67                        // ksi <= mask (=n_kseg-1) -> continue current tile
     s_cbranch_scc1 .Lflow_same_tile
+.endif
     // ksi exhausted (or sentinel) -> claim a NEW tile: lane0 occ[20]++ (counts tiles)
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s16, exec_lo
@@ -1452,10 +1558,19 @@ occ_kernel:
 .Lflow_same_tile:
     lds_get s56, COORD_T_OFF                     // reuse current tile
 .Lflow_form_sti:
+.if GROUPS > 1
+    s_and_b32 s47, s55, s67                       // ksi   = cursor & mask
+    s_lshl_b32 s17, s56, s68                       // t << shift
+    s_or_b32 s17, s17, s47                          // sti = (t<<shift) | ksi
+    s_lshr_b32 s47, s55, s68                        // group = cursor >> shift  (0..GROUPS-1)
+    s_lshl_b32 s47, s47, STAMP_GSHIFT
+    s_or_b32 s17, s17, s47                          // STAMP = (group<<28) | sti
+.else
     s_lshl_b32 s17, s56, s68                     // t << shift
     s_or_b32 s17, s17, s55                       // sti = (t<<shift) | ksi
+.endif
     s_add_u32 s55, s55, 1
-    lds_put COORD_KSI_OFF, s55                   // advance ksi cursor for next assign
+    lds_put COORD_KSI_OFF, s55                   // advance (group,ksi) cursor for next assign
     // assign sti (s17) to slot(ah): reset counters, STAMP=sti, then ASSIGN_HEAD++ (release LAST)
     slot_of s46, s44, s47                        // slot = ah mod POOL_N
     s_lshl_b32 s48, s46, 5
@@ -1537,14 +1652,22 @@ occ_kernel:
 .if DYNVGPR
     s_alloc_vgpr NFV
     s_cbranch_scc0 .Lflow_growfail
+    fat_inc                                      // grow-success: ++peak-concurrent fat gauge (STAGINSTR)
 .endif
     s_add_u32 s45, s48, SL_RBNEXT
-    lds_fetch_add_r s33, s45, 1                  // claim rowblk r (committed only AFTER grow succeeds)
-    s_cmp_ge_u32 s33, G
+    lds_fetch_add_r s33, s45, 1                  // claim LOCAL rowblk (0..ACC_N-1) within this group
+    s_cmp_ge_u32 s33, ACC_N                       // (== G when GROUPS=1) group's rowblks exhausted?
     s_cbranch_scc1 .Lflow_cmp_tryadv             // rowblks exhausted (we are fat) -> shrink + try advance
     // read STAMP (gsti) for C addressing
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45
+.if GROUPS > 1
+    s_lshr_b32 s41, s17, STAMP_GSHIFT             // s41 = group (persists to A-base + completer C-base)
+.if SAFEPROBE
+    s_min_u32 s41, s41, (GROUPS - 1)               // brick-proof: a torn STAMP read can't push C-base OOB (mirrors the ti clamp)
+.endif
+    s_and_b32 s17, s17, STI_MASK                   // s17 = sti (strip group high bits)
+.endif
     DECODE_STI                                   // s19=mblk s30=tcol s31=ksi
     // zero FM*FN accumulators
     .set idx, 0
@@ -1560,7 +1683,13 @@ occ_kernel:
       .set idx, idx+1
     .endr
     v_add_nc_u32 v12, v9, s52                    // B resident base (BRES_ROFF=0)
+.if GROUPS > 1
+    s_mul_i32 s42, s41, ACC_N                      // actual rowblk = group*ACC_N + local ...
+    s_add_u32 s42, s42, s33
+    s_mul_i32 s37, s42, (FM*256)                   // ... indexes the all-G resident-A staging
+.else
     s_mul_i32 s37, s33, (FM*256)
+.endif
     v_add_nc_u32 v13, v9, s52
     v_add_nc_u32 v13, v13, ARES_ROFF
     v_add_nc_u32 v13, v13, s37                    // A resident base for rowblk r
@@ -1646,12 +1775,13 @@ occ_kernel:
     s_add_u32 s45, s48, SL_RBDONE
     lds_fetch_add_r s47, s45, 1                   // s47 = old RBDONE; old==G-1 -> I am the UNIQUE completer
 .if DYNVGPR
+    fat_dec                                       // burst end: --live fat gauge (STAGINSTR) before the shrink
 .Lflow_bshrink:
     s_alloc_vgpr 32                               // SHRINK -> lean (close the trapezoid burst) BEFORE any store
     s_cbranch_scc0 .Lflow_bshrink
 .endif
     s_add_u32 s47, s47, 1
-    s_cmp_ge_u32 s47, G                            // (old+1) >= G -> I completed this super-tile
+    s_cmp_ge_u32 s47, ACC_N                         // (old+1) >= ACC_N (== G at GROUPS=1) -> I completed this group
     s_cbranch_scc0 .Lflow_loop                     // not the completer -> done, loop
     // COMPLETER (single wave -> NO race, NO redundant store, NO spinning losers): the super-tile is fully
     //   reduced. If it's the tile's LAST ksi (ksi==mask), store the G banks to C ONCE, s_wait_storecnt,
@@ -1665,9 +1795,14 @@ occ_kernel:
     s_mul_i32 s38, s38, (G*FM*FN*1024)            // * per-tile C bytes
     s_add_u32 s28, s6, s38
     s_addc_u32 s29, s7, 0                          // s[28:29] = C tile base (rowblk 0)
+.if GROUPS > 1
+    s_mul_i32 s39, s41, (ACC_N*FM*FN*1024)          // + group * per-group C bytes -> group's first rowblk
+    s_add_u32 s28, s28, s39
+    s_addc_u32 s29, s29, 0
+.endif
     .set r, 0
-    .rept G
-      s_mov_b32 s39, (ACC_BASE + r*(FM*FN*1024))   // bank r LDS base (compile-time)
+    .rept ACC_N                                     // ACC_N local banks this group (== G at GROUPS=1)
+      s_mov_b32 s39, (ACC_BASE + r*(FM*FN*1024))   // bank r LDS base (compile-time, local 0..ACC_N-1)
       v_add_nc_u32 v12, v10, s39                    // v12 = bank r ds vaddr (lane*32)
       .set frag, 0
       .rept FM*FN
@@ -1690,6 +1825,7 @@ occ_kernel:
     s_branch .Lflow_loop
 .Lflow_cmp_tryadv:
 .if DYNVGPR
+    fat_dec                                       // grew-but-exhausted: --live fat gauge (STAGINSTR) before the shrink
 .Lflow_tashrink:
     s_alloc_vgpr 32                               // grew but rowblks exhausted (no claim) -> shrink back lean
     s_cbranch_scc0 .Lflow_tashrink
@@ -1710,6 +1846,9 @@ occ_kernel:
     s_add_u32 s52, s52, OP_BASE                // sob
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45                           // gsti = STAMP (assigned -> set)
+.if GROUPS > 1
+    s_and_b32 s17, s17, STI_MASK                   // strip group bits (feed stages by tcol/ksi, group-agnostic)
+.endif
     DECODE_STI
     s_cmp_eq_u32 s34, ROLE_BFEED
     s_cbranch_scc1 .Lflow_stageB
@@ -1761,12 +1900,18 @@ occ_kernel:
     s_cbranch_scc1 .Lflow_coastB                  // B behind -> help B
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45
+.if GROUPS > 1
+    s_and_b32 s17, s17, STI_MASK
+.endif
     DECODE_STI
     ASTAGE_R s48, s52
     s_branch .Lflow_stage_adv
 .Lflow_coastB:
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45
+.if GROUPS > 1
+    s_and_b32 s17, s17, STI_MASK
+.endif
     DECODE_STI
     BSTAGE_R s48, s52
     s_branch .Lflow_stage_adv
