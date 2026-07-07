@@ -1597,12 +1597,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // (token_embd, output_norm, output.weight) and non-weight tensors
             // (RoPE freqs, positional embeddings, etc.) are NOT paged — they
             // get real allocation + load_all_data via the normal path.
+            // Don't page tiny per-layer weights (RMS/norm scales, hyper-connection
+            // scale/base vectors, attention sinks, expert-prob biases). Paging a
+            // few-byte tensor is pointless (overhead >> payload) and a paged
+            // non-matmul leaf left with buffer==NULL never gets a backend
+            // assigned, tripping the gallocr buffer_id>=0 assert (hit on
+            // DeepSeek V4's hc_attn_scale {3}). Standard {n_embd} norms are well
+            // above this and stay paged, preserving existing behavior.
+            constexpr size_t WP_MIN_PAGED_BYTES = 4096;
             auto is_paged_weight = [&](ggml_tensor * t) -> bool {
                 const char * n = ggml_get_name(t);
                 if (ml.get_weight(n) == nullptr) return false;  // not a weight at all
                 if (std::strncmp(n, "token_embd", 10) == 0) return false;
                 if (std::strncmp(n, "output_norm", 11) == 0) return false;
                 if (std::strcmp (n, "output.weight") == 0)  return false;
+                if (ggml_nbytes(t) < WP_MIN_PAGED_BYTES)    return false;  // tiny -> resident
                 return true;  // it's a paged per-layer weight
             };
             const bool paging_on_device_buft =
@@ -1741,6 +1750,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (std::strncmp(n, "token_embd", 10) == 0 ||
                         std::strncmp(n, "output_norm", 11) == 0 ||
                         std::strcmp (n, "output.weight") == 0) {
+                        continue;
+                    }
+                    // Tiny per-layer weights stay resident — see WP_MIN_PAGED_BYTES
+                    // rationale above (paged non-matmul leaf gets no backend ->
+                    // gallocr buffer_id assert; hit on DeepSeek V4 hc_attn_scale).
+                    if (ggml_nbytes(t) < WP_MIN_PAGED_BYTES) {
                         continue;
                     }
                 }
