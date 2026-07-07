@@ -146,6 +146,8 @@ public:
     bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
     bool   async_ensure_enabled()               const { return async_ensure_enabled_; }
     const Stats & stats() const;
+    bool   batch_safe() const;
+    uint64_t sync_fallback_count() const { return stats_.sync_fallbacks; }
     int    loaded_pages() const;
     int    pending_prefetches() const { return prefetch_.pending(); }
     bool   async_prefetch_enabled() const { return cfg_.prefer_async_io; }

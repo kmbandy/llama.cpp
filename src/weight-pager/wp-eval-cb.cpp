@@ -64,6 +64,14 @@ bool wp_profile_enabled() {
     return enabled;
 }
 
+bool wp_batch_eval_cb_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_BATCH_EVAL_CB");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
 std::uint64_t s_prof_total_ns  = 0;  // total host time inside eval_cb (all paths past null-check)
 std::uint64_t s_prof_pre_ns    = 0;  // entry -> Step 1 (discard + async drain + MUL_MAT_ID handling)
 std::uint64_t s_prof_resolve_ns= 0;  // Step 1: src -> page name resolution (find_page loop)
@@ -221,6 +229,19 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
     const bool eval_debug = eval_debug_enabled();
+    const bool batch_eval_cb = wp_batch_eval_cb_enabled();
+    const uint64_t sync_fallbacks_before =
+        batch_eval_cb ? pager->sync_fallback_count() : 0;
+    bool routing_tls_set = false;
+    auto eval_cb_op_return = [&]() -> bool {
+        if (batch_eval_cb &&
+            pager->batch_safe() &&
+            !routing_tls_set &&
+            pager->sync_fallback_count() == sync_fallbacks_before) {
+            return false;
+        }
+        return true;
+    };
 
     // WP_PROFILE_EVAL: time the whole callback body (every return path past
     // here is counted once via the RAII guard). Zero cost when disabled.
@@ -624,6 +645,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                   hipMemcpyHostToDevice);
                                     }
                                     ggml_cuda_set_routed_expert_ptrs(s_dev_expert_ptrs);
+                                    routing_tls_set = true;
 
                                     if (g_debug.mmid_consolidated <= 4) {
                                         LLAMA_LOG_INFO("[wp::eval_cb] routed: %d/%zu unique active experts ensured\n",
@@ -895,7 +917,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                g_debug.ensures_failed);
             }
         }
-        return true;
+        return eval_cb_op_return();
     }
     ++g_debug.ops_with_pages;
     if (wp_profile) {
@@ -1058,7 +1080,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
     pager->tick();
 
-    return true;
+    return eval_cb_op_return();
 }
 
 }  // namespace wp

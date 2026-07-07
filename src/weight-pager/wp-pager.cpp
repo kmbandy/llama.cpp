@@ -503,6 +503,10 @@ const WeightPager::Stats & WeightPager::stats() const {
     return stats_;
 }
 
+bool WeightPager::batch_safe() const {
+    return stats_.evictions == 0 && pool_.size_class_slots_enabled();
+}
+
 int WeightPager::loaded_pages() const {
     int n = 0;
     for (bool loaded : page_loaded_) {
