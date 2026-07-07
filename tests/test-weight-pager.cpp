@@ -1626,6 +1626,34 @@ static int test_wp_paged_batch_flag_default_off() {
 // main
 // ---------------------------------------------------------------------------
 
+// WP_RESIDENT_DENSE relies on the catalog's expert classification agreeing
+// with the loader's is_consolidated detection (llama-model.cpp) and the
+// is_paged_weight predicate. Lock in the invariant: routed-expert (_exps)
+// tensors are experts; dense tensors — attention, embeddings, and the SHARED
+// expert (ffn_*_shexp, which matches an ffn_ role prefix but is NOT _exps) —
+// are not. A mismatch here would let a dense tensor slip past one filter.
+static int test_catalog_is_expert_classification() {
+    int fails = 0;
+    wp::PageCatalog cat;
+    // Dense tensors — must NOT be experts.
+    int p_attn = cat.add("blk.0.attn_q.weight",         0, 0,   4096);
+    int p_emb  = cat.add("token_embd.weight",           0, 0, 100000);
+    int p_shex = cat.add("blk.0.ffn_down_shexp.weight", 0, 0,   8192);
+    // Consolidated routed experts — MUST be experts (parent + N sub-pages).
+    int first_sub = cat.add_consolidated_experts("blk.0.ffn_gate_exps.weight",
+                                                 0, 0, 256 * 8192, 256);
+    EXPECT(!cat.at(p_attn).is_expert, "attn_q is dense");
+    EXPECT(!cat.at(p_emb).is_expert,  "token_embd is dense");
+    EXPECT(!cat.at(p_shex).is_expert, "ffn_down_shexp is dense (shared expert)");
+    EXPECT(cat.at(first_sub).is_expert, "ffn_gate_exps sub-page is expert");
+    EXPECT(cat.at(first_sub).is_sub_expert, "ffn_gate_exps sub-page is a sub-expert");
+    EXPECT(cat.at(first_sub - 1).is_consolidated, "parent is consolidated");
+    EXPECT(!cat.at(first_sub - 1).is_expert, "consolidated parent is not itself an expert page");
+    EXPECT(cat.has_experts(), "catalog reports experts present");
+    EXPECT_EQ_INT(cat.n_expert_pages(), 256, "256 expert sub-pages counted (parent excluded)");
+    return fails;
+}
+
 int main() {
     int total_fails = 0;
 
@@ -1664,6 +1692,7 @@ int main() {
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },
+        { "catalog_is_expert_classification",    test_catalog_is_expert_classification    },
         { "pool_hit_count_basic",                test_pool_hit_count_basic                },
         { "pool_hot_threshold_protects",         test_pool_hot_threshold_protects_in_eviction },
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
