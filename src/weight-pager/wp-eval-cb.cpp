@@ -65,9 +65,14 @@ bool wp_profile_enabled() {
 }
 
 bool wp_batch_eval_cb_enabled() {
+    // Default ON. The batching is dense-only (batch_safe() requires
+    // !catalog_.has_experts()) and self-gates on full residency + size-class,
+    // so it only ever engages on a fully-resident dense model under
+    // --weight-paging where it matches native decode speed and numerics.
+    // Set WP_BATCH_EVAL_CB=0 to force the legacy per-op-sync path.
     static const bool enabled = []() {
         const char * v = std::getenv("WP_BATCH_EVAL_CB");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     return enabled;
 }
