@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace wp {
@@ -75,11 +76,31 @@ public:
     // Push any pending submissions to the kernel. SyncPread is a no-op.
     virtual void flush() = 0;
 
-    // Wait for the next completion. timeout_ms < 0 = wait indefinitely;
-    // 0 = poll non-blocking. On timeout returns IoStatus::Timeout and the
-    // request stays in flight. On indefinite wait this only returns when a
-    // completion arrives (or on internal error).
-    virtual IoResult wait_any(int timeout_ms = -1) = 0;
+    // Wait for the next completion of ANY in-flight request. timeout_ms < 0 =
+    // wait indefinitely; 0 = poll non-blocking. On timeout returns
+    // IoStatus::Timeout and the request stays in flight.
+    //
+    // Completion demux: this layer buffers reaped-but-unclaimed completions
+    // in `ready_` keyed by req_id. wait_any drains that buffer first, then
+    // reaps one fresh completion from the transport. Concrete (not virtual) —
+    // subclasses supply the raw reap via reap_raw_().
+    IoResult wait_any(int timeout_ms = -1);
+
+    // Wait for the completion of ONE specific req_id. Foreign completions
+    // reaped while waiting are BUFFERED (never discarded), so their owner can
+    // still claim them via a later wait_for_req()/try_take()/wait_any(). This
+    // is the safe primitive when multiple logical consumers share one ring:
+    // it is the fix for the shared-ring cross-drain (a targeted waiter used
+    // to cqe_seen and drop another consumer's completion, hanging its slot).
+    // On timeout returns IoStatus::Timeout; the request stays in flight.
+    IoResult wait_for_req(uint64_t req_id, int timeout_ms = -1);
+
+    // Non-blocking claim of a specific req_id. Drains any immediately-ready
+    // completions from the transport into the buffer, then removes and
+    // returns the one matching `req_id` if present. Returns false (leaving
+    // `out` untouched) when that req_id has not completed yet. Never blocks,
+    // never discards other consumers' completions.
+    bool try_take(uint64_t req_id, IoResult & out);
 
     // How many requests are currently in flight (submitted, not yet reaped).
     virtual int pending() const = 0;
@@ -124,6 +145,21 @@ public:
     // point where they choose the read destination.
     virtual FileIOTransport transport() const = 0;
     virtual bool direct_to_device() const { return false; }
+
+protected:
+    // Reaped-but-unclaimed completions, keyed by req_id. Populated by the
+    // demux methods above when they encounter a completion whose owner has
+    // not yet asked for it. Subclasses count these in pending().
+    std::unordered_map<uint64_t, IoResult> ready_;
+
+    // Reap exactly ONE raw completion from the underlying transport, blocking
+    // up to timeout_ms (<0 = block indefinitely, 0 = non-blocking poll).
+    // Returns true and fills `out` when a completion (including a per-request
+    // error) is reaped; returns false on timeout / no completion available.
+    // A transport-level failure (not tied to a request) is reported by
+    // returning true with out.status == ErrorIo and out.req_id == 0.
+    // Implementations MUST decrement their own in-flight counter here.
+    virtual bool reap_raw_(int timeout_ms, IoResult & out) = 0;
 };
 
 struct FileIOP2PConfig {

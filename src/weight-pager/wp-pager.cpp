@@ -935,25 +935,28 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     // correct; the throughput case that matters for decode is P2P).
     if (file_io_->direct_to_device()) {
         std::vector<FileIOBatchRequest> reqs;
+        std::vector<uint64_t>           req_ids;
         reqs.reserve(misses.size());
+        req_ids.reserve(misses.size());
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const PageMeta & m = catalog_.at(misses[k].page);
-            reqs.push_back({ (uint64_t) k, (int) m.file_idx, m.file_offset,
+            const uint64_t rid = next_io_req_id_++;   // high-bit-tagged; disjoint from prefetch
+            req_ids.push_back(rid);
+            reqs.push_back({ rid, (int) m.file_idx, m.file_offset,
                              m.size, slot_ptr_(misses[k].slot) });
         }
         const int n_sub = file_io_->submit_batch(reqs);
         file_io_->flush();
         std::vector<bool> ok(misses.size(), false);
-        int reaped = 0;
-        while (reaped < n_sub) {
-            IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
-            if (r.req_id < misses.size()) {
-                ok[(std::size_t) r.req_id] =
-                    (r.status == IoStatus::Ok &&
-                     r.bytes_read == (int) catalog_.at(misses[(std::size_t) r.req_id].page).size);
-                ++reaped;
-            }
-            // Unknown req_id (stale prefetch completion): drop, keep waiting.
+        // submit_batch queues the prefix [0, n_sub) in order; the rejected
+        // tail (if any) stays ok[k]=false and sync-fallbacks below. Wait for
+        // each queued read by its OWN req_id: the FileIOLayer demux buffers any
+        // concurrent prefetch completion instead of discarding it, which is
+        // what previously leaked prefetch slots and collapsed effective QD.
+        for (std::size_t k = 0; k < (std::size_t) n_sub; ++k) {
+            IoResult r = file_io_->wait_for_req(req_ids[k], /*timeout_ms=*/-1);
+            ok[k] = (r.status == IoStatus::Ok &&
+                     r.bytes_read == (int) catalog_.at(misses[k].page).size);
         }
         const auto io_t0 = std::chrono::steady_clock::now();
         for (std::size_t k = 0; k < misses.size(); ++k) {
@@ -1296,24 +1299,22 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
     // Stage 1: blocking read via the file IO layer. P2P reads directly
     // into the VRAM slot; host transports read into the shared pinned
     // staging buffer and use GpuTransport for the H2D copy below.
-    const uint64_t req_id = (uint64_t) -1;  // synthetic; not pipelined
     const bool host_store_possible = host_tier_ && m.size <= host_tier_->budget_bytes();
     bool direct_to_device = file_io_->direct_to_device() && !host_store_possible;
     void * read_dst = direct_to_device ? dst : staging;
     auto read_once = [&]() {
+        const uint64_t req_id = next_io_req_id_++;  // unique, high-bit-tagged
         bool read_ok = file_io_->submit(req_id, (int) m.file_idx, m.file_offset, m.size, read_dst);
         if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: submit returned ok=%d\n", s_diag_count, (int)read_ok);
-        if (read_ok) file_io_->flush();
-        while (read_ok) {
-            IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
-            if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: wait_any returned req_id=%lu status=%d bytes=%d\n",
+        if (read_ok) {
+            file_io_->flush();
+            // Wait for OUR completion by req_id. The FileIOLayer demux buffers
+            // any concurrent prefetch completion reaped along the way rather
+            // than discarding it, so no sibling read is lost on the shared ring.
+            IoResult r = file_io_->wait_for_req(req_id, /*timeout_ms=*/-1);
+            if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: wait_for_req req_id=%lu status=%d bytes=%d\n",
                                       s_diag_count, (unsigned long) r.req_id, (int) r.status, r.bytes_read);
-            if (r.req_id == req_id) {
-                read_ok = (r.status == IoStatus::Ok && r.bytes_read == (int) m.size);
-                break;
-            }
-            // Unrelated completion (could be a stale prefetch). Drop it; the
-            // prefetch path treats unknown req_ids as no-ops in process_io_.
+            read_ok = (r.status == IoStatus::Ok && r.bytes_read == (int) m.size);
         }
         return read_ok;
     };

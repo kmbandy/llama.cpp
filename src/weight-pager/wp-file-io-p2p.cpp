@@ -128,67 +128,68 @@ public:
         }
     }
 
-    IoResult wait_any(int timeout_ms) override {
-        if (!p2p_enabled_ && pending_ == 0) {
-            return host_->wait_any(timeout_ms);
-        }
-
-        IoResult r;
-        if (!ring_ok_) {
-            r.status = IoStatus::ErrorNoSubmit;
-            return r;
-        }
-        if (pending_ == 0) {
-            r.status = IoStatus::Timeout;
-            return r;
-        }
-
-        struct io_uring_cqe * cqe = nullptr;
-        int ret = 0;
-        if (timeout_ms < 0) {
-            ret = io_uring_wait_cqe(&ring_, &cqe);
-        } else if (timeout_ms == 0) {
-            ret = io_uring_peek_cqe(&ring_, &cqe);
-            if (ret == -EAGAIN) {
-                r.status = IoStatus::Timeout;
-                return r;
+    // Reap one raw completion for the FileIOLayer base demux. Drains the P2P
+    // ring first (it may hold reads submitted before a mid-flight
+    // switch_to_host_); once the ring is empty and we're in host-fallback
+    // mode, pull one completion from the host layer. Returns false on
+    // timeout / nothing available. req_id routing + foreign-completion
+    // buffering happen in the base.
+    bool reap_raw_(int timeout_ms, IoResult & out) override {
+        if (ring_ok_ && pending_ > 0) {
+            struct io_uring_cqe * cqe = nullptr;
+            int ret = 0;
+            if (timeout_ms < 0) {
+                ret = io_uring_wait_cqe(&ring_, &cqe);
+            } else if (timeout_ms == 0) {
+                ret = io_uring_peek_cqe(&ring_, &cqe);
+                if (ret == -EAGAIN) return false;
+            } else {
+                struct __kernel_timespec ts;
+                ts.tv_sec  = timeout_ms / 1000;
+                ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
+                ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+                if (ret == -ETIME) return false;
             }
-        } else {
-            struct __kernel_timespec ts;
-            ts.tv_sec  = timeout_ms / 1000;
-            ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
-            ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-            if (ret == -ETIME) {
-                r.status = IoStatus::Timeout;
-                return r;
+
+            if (ret < 0 || cqe == nullptr) {
+                out = IoResult{};
+                out.status     = IoStatus::ErrorIo;
+                out.bytes_read = ret;
+                out.req_id     = 0;  // transport-level failure — fatal, propagate
+                switch_to_host_("io_uring wait failed", 0);
+                return true;
             }
+
+            out = IoResult{};
+            out.req_id = cqe->user_data;
+            const int res = cqe->res;
+            io_uring_cqe_seen(&ring_, cqe);
+            --pending_;
+
+            if (res < 0) {
+                out.status     = IoStatus::ErrorIo;
+                out.bytes_read = res;
+                switch_to_host_errno_("read failed", -res);
+            } else {
+                out.status     = IoStatus::Ok;
+                out.bytes_read = res;
+            }
+            return true;
         }
 
-        if (ret < 0 || cqe == nullptr) {
-            r.status = IoStatus::ErrorIo;
-            r.bytes_read = ret;
-            switch_to_host_("io_uring wait failed", 0);
-            return r;
+        // P2P ring drained. In host-fallback mode pull from the host layer;
+        // in active-P2P mode with nothing pending there's nothing to reap.
+        if (!p2p_enabled_) {
+            IoResult r = host_->wait_any(timeout_ms);
+            if (r.status == IoStatus::Timeout) return false;
+            out = r;
+            return true;
         }
-
-        r.req_id = cqe->user_data;
-        const int res = cqe->res;
-        io_uring_cqe_seen(&ring_, cqe);
-        --pending_;
-
-        if (res < 0) {
-            r.status = IoStatus::ErrorIo;
-            r.bytes_read = res;
-            switch_to_host_errno_("read failed", -res);
-        } else {
-            r.status = IoStatus::Ok;
-            r.bytes_read = res;
-        }
-        return r;
+        return false;
     }
 
     int pending() const override {
-        return pending_ + host_->pending();
+        return pending_ + host_->pending() + (int) ready_.size();
     }
 
     int fd(int fd_idx) const override {

@@ -165,6 +165,12 @@ private:
 
     std::unordered_map<int, int>      page_to_slot_;
     std::unordered_map<uint64_t, int> req_to_slot_;
+
+    // req_ids of reads whose slots were rolled back on a partial submit_batch
+    // while the file read was already in flight. tick() reaps-and-drops them
+    // from the shared FileIOLayer demux buffer once they land, so they don't
+    // accumulate unclaimed. Normally empty (pre-flight makes partials rare).
+    std::vector<uint64_t> abandoned_reqs_;
 };
 
 }  // namespace wp

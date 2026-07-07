@@ -144,6 +144,7 @@ void PrefetchScheduler::shutdown() {
     free_slots_.clear();
     page_to_slot_.clear();
     req_to_slot_.clear();
+    abandoned_reqs_.clear();
 
     file_io_       = nullptr;
     gpu_           = nullptr;
@@ -280,8 +281,14 @@ bool PrefetchScheduler::submit_batch(const std::vector<PrefetchBatchRequest> & r
         // no completion arriving for the rejected tail).
         //
         // Note: for the SUCCESSFUL prefix [0, n_ok) the file_io will still
-        // produce completions later. process_io_ tolerates unknown req_ids
-        // (see comment at its top) so the stray completions are harmless.
+        // produce completions later. Record their req_ids so tick() can
+        // reap-and-drop them from the shared demux buffer — the buffer no
+        // longer auto-discards unrouted completions the way the old
+        // wait_any/process_io_ drain did, so an unclaimed prefix would
+        // otherwise linger.
+        for (int i = 0; i < n_ok; ++i) {
+            abandoned_reqs_.push_back(slots_[handles[i]].req_id);
+        }
         for (int h : handles) {
             slots_[h] = Slot{};
             free_slots_.push_back(h);
@@ -367,11 +374,31 @@ void PrefetchScheduler::tick() {
     //    expert reads instead of 16 separate calls.
     file_io_->flush();
 
-    // 1. Drain any completed file reads (non-blocking).
-    while (file_io_->pending() > 0) {
-        IoResult r = file_io_->wait_any(0);
-        if (r.status == IoStatus::Timeout) break;
-        process_io_(r);
+    // 1. Drain completions for OUR in-flight reads (non-blocking). try_take
+    //    pulls all immediately-ready completions from the transport into the
+    //    shared demux buffer, then hands back the one for req_id — so a pager
+    //    completion reaped in the process is buffered for the pager, never
+    //    consumed (and lost) here. Snapshot the keys first: process_io_ erases
+    //    from req_to_slot_ as it runs.
+    std::vector<uint64_t> mine;
+    mine.reserve(req_to_slot_.size());
+    for (const auto & kv : req_to_slot_) mine.push_back(kv.first);
+    IoResult r;
+    for (uint64_t rid : mine) {
+        if (file_io_->try_take(rid, r)) {
+            process_io_(r);
+        }
+    }
+    // Reap-and-drop completions for reads abandoned by a partial submit_batch
+    // rollback; keep the ones that haven't landed yet for a later tick.
+    if (!abandoned_reqs_.empty()) {
+        IoResult tmp;
+        std::vector<uint64_t> still;
+        still.reserve(abandoned_reqs_.size());
+        for (uint64_t rid : abandoned_reqs_) {
+            if (!file_io_->try_take(rid, tmp)) still.push_back(rid);
+        }
+        abandoned_reqs_.swap(still);
     }
     // 2. Promote any newly-ready stage 1 to stage 2.
     promote_stage2_();
@@ -408,9 +435,10 @@ bool PrefetchScheduler::wait_for(int page_idx, int timeout_ms) {
         }
 
         if (s.state == State::Submitted) {
-            // Block on the file IO layer for this specific request.
-            // wait_any may return a different req — process it and loop.
-            IoResult r = file_io_->wait_any(remaining_ms);
+            // Block for THIS slot's read by its req_id. The demux buffers any
+            // other consumer's completion reaped while we wait instead of
+            // dropping it, so nothing on the shared ring is lost.
+            IoResult r = file_io_->wait_for_req(s.req_id, remaining_ms);
             if (r.status == IoStatus::Timeout) return false;
             process_io_(r);
             continue;

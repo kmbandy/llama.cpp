@@ -291,6 +291,14 @@ private:
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;
 
+    // Monotonic req_id source for the pager's OWN direct file_io_ submissions
+    // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
+    // PrefetchScheduler, whose req_ids come from its own low counter; the high
+    // bit here keeps the two spaces disjoint so a prefetch completion can never
+    // be miscredited as a pager read on the shared ring's demux buffer.
+    static constexpr uint64_t kPagerReqIdBit = (uint64_t) 1 << 62;
+    uint64_t next_io_req_id_ = kPagerReqIdBit;
+
     // Owned subsystems.
     std::unique_ptr<FileIOLayer> file_io_;
     PoolAllocator                pool_;

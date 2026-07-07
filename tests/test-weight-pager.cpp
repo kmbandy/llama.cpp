@@ -1384,6 +1384,85 @@ static int test_file_io_submit_batch_partial_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// Completion demux — targeted waits must never drop a sibling's completion
+// ---------------------------------------------------------------------------
+//
+// Regression guard for the shared-ring cross-drain bug: when several logical
+// consumers (prefetch scheduler + synchronous pager page-ins + ensure_batch)
+// submit reads on ONE FileIOLayer, a caller that waits for its OWN req_id may
+// reap a DIFFERENT consumer's completion first. The old code discarded that
+// foreign completion (io_uring_cqe_seen without routing it), permanently
+// losing it — the owner's slot then hung forever and the prefetch pool leaked
+// slots until the pipeline stalled (2x decode regression / depth-8 load hang).
+//
+// The demux contract fixes this: wait_for_req(id) reaps and BUFFERS any
+// foreign completion it encounters, so a later wait_for_req/try_take for that
+// id still finds it. This test drives three reads and claims them strictly
+// out of submit order, asserting none are lost.
+static int test_file_io_demux_no_cross_drain() {
+    int fails = 0;
+    char path[] = "/tmp/wp-test-demux-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+    constexpr size_t N = 8192;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 17 + 3) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/true, 8);
+    EXPECT(layer != nullptr, "create_file_io non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    // Three in-flight reads with distinct req_ids, distinct offsets.
+    std::vector<uint8_t> d1(1024), d2(2048), d3(512);
+    EXPECT(layer->submit(/*req=*/100, 0,    0, 1024, d1.data()), "submit 100");
+    EXPECT(layer->submit(/*req=*/200, 0, 1024, 2048, d2.data()), "submit 200");
+    EXPECT(layer->submit(/*req=*/300, 0, 4096,  512, d3.data()), "submit 300");
+    layer->flush();
+
+    // Claim strictly OUT of submit order. Each targeted wait must return its
+    // own completion; siblings reaped along the way must NOT be lost.
+    wp::IoResult r3 = layer->wait_for_req(300, /*timeout_ms=*/-1);
+    EXPECT(r3.status == wp::IoStatus::Ok, "req 300 status Ok");
+    EXPECT_EQ_INT(r3.req_id, 300, "req 300 round-trips");
+    EXPECT_EQ_INT(r3.bytes_read, 512, "req 300 bytes");
+
+    wp::IoResult r1 = layer->wait_for_req(100, /*timeout_ms=*/-1);
+    EXPECT(r1.status == wp::IoStatus::Ok, "req 100 status Ok (not lost by 300's wait)");
+    EXPECT_EQ_INT(r1.req_id, 100, "req 100 round-trips");
+    EXPECT_EQ_INT(r1.bytes_read, 1024, "req 100 bytes");
+
+    // The remaining one is claimable non-blocking via try_take.
+    wp::IoResult r2{};
+    bool took2 = layer->try_take(200, r2);
+    EXPECT(took2, "try_take 200 succeeds");
+    EXPECT_EQ_INT(r2.req_id, 200, "req 200 round-trips");
+    EXPECT_EQ_INT(r2.bytes_read, 2048, "req 200 bytes");
+
+    // Unknown / already-claimed ids are a clean miss, never a hang.
+    wp::IoResult miss{};
+    EXPECT(!layer->try_take(999, miss), "try_take unknown id -> false");
+    EXPECT(!layer->try_take(300, miss), "try_take already-claimed id -> false");
+
+    // Content integrity: every buffered read landed in the right dst.
+    EXPECT(std::memcmp(d1.data(), pattern.data() +    0, 1024) == 0, "d1 content");
+    EXPECT(std::memcmp(d2.data(), pattern.data() + 1024, 2048) == 0, "d2 content");
+    EXPECT(std::memcmp(d3.data(), pattern.data() + 4096,  512) == 0, "d3 content");
+
+    // Nothing left outstanding.
+    EXPECT_EQ_INT(layer->pending(), 0, "no pending after all claimed");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // FileIOLayer::advise_prefetch — MAD-232 integration with a real fd
 // ---------------------------------------------------------------------------
 //
@@ -1563,6 +1642,7 @@ int main() {
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
         { "file_io_submit_batch",            test_file_io_submit_batch            },
         { "file_io_submit_batch_partial",    test_file_io_submit_batch_partial_failure },
+        { "file_io_demux_no_cross_drain",    test_file_io_demux_no_cross_drain    },
         { "compute_advise_ranges",    test_compute_advise_ranges    },
         { "is_uma_archname",          test_is_uma_archname          },
         { "read_mem_available_bytes", test_read_mem_available_bytes },
