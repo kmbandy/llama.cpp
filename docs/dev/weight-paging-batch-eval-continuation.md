@@ -1,9 +1,125 @@
 # Weight-paging decode-speed work — continuation (morning pickup)
 
-**Branch:** `feat/wp-vnext` (edit/build-check on **mad-lab-2026** at `/home/kmbandy/GitHub/llama.cpp`).
-Pushed to `origin`; **mad-lab-main** is on `feat/dsws-phaseb-conversion` with the wp-vnext commits
-cherry-picked. All GPU validation is on mad-lab-main's **R9700 (ROCm0, gfx1201, 32 GB)**; the 6900XT
-is ROCm1. Remote shell is **fish** → always `ssh mad-lab-main bash -s <<'EOF'`.
+**Branch (CURRENT):** `feat/router-multigpu` = `feat/wp-vnext` (37 commits) **merged with** the router
+branch, + the `ensure_batch` change. Edit/build-check on **mad-lab-2026** at
+`/home/kmbandy/GitHub/llama.cpp`. Pushed to `origin`. **mad-lab-main** GPU box (R9700 / ROCm0 / gfx1201
+/ 32 GB; 6900XT = ROCm1) has this branch checked out in a **git worktree at `~/llama-wp`** (its main
+`~/GitHub/llama.cpp` checkout is on `feat/dsws-phaseb-conversion` with uncommitted MAD-305 DSWS work —
+**do NOT touch/checkout that**; always use the `~/llama-wp` worktree for weight-paging builds/runs).
+Remote shell is **fish** → always `ssh mad-lab-main bash -s <<'EOF'`.
+
+---
+---
+
+# ★★★ 2026-07-07 EVENING — READ THIS FIRST (supersedes the "NEXT FRONT" below) ★★★
+## `ensure_batch` (Colibri QD=N page-in) is BUILT + CORRECT but a **2× DECODE REGRESSION**. Root cause found. Fix = **completion demux**. Do that next.
+
+### What happened this session (chronological, so we don't rehash)
+1. **Inspiration:** the GLM-5.2 CPU engine **Colibri** (`github.com/JustVugg/colibri`, file `c/glm.c`)
+   does exactly our thesis on CPU — streams routed experts from NVMe. Its decode loop (`glm.c:1016`)
+   is the pattern we want: **batch the misses, issue ALL their reads concurrently (`omp parallel`,
+   each a coalesced single read), then wait** — QD1→QDN. User: apply that to our weight paging.
+2. **Merged** `feat/wp-vnext` into `feat/router-multigpu` (0 conflicts; pre-existing WIP
+   `examples/pagedattn-*`, `src/llama-graph.cpp`, `examples/CMakeLists.txt` stashed/popped — **do NOT
+   touch those**). Merge commit on the branch; then implemented `ensure_batch`.
+3. **Implemented `ensure_batch`** — commit **`e5089c241`** (pushed). Three edits:
+   - `wp-pager.h/.cpp`: new `WeightPager::ensure_batch(pages, out_ptrs, out_pinned)` — reserve **and
+     pin** every cold-miss slot up front (alloc_slot skips pinned, so no sibling read can evict it),
+     then on the P2P/direct-to-device path submit all misses in **one `io_uring` batch (QD=N)** into
+     the VRAM slots, wait for all, harvest; on read failure, sync-fallback into the **same pinned
+     slot**. Returns `out_pinned` for the caller to unpin next callback.
+   - `wp-pager.cpp`: `page_in_sync_(page, reuse_slot=-1)` refactor — reads into a caller-owned pinned
+     slot without releasing it on error (the 5 error paths guard `if (owns_slot) release_slot`).
+   - `wp-eval-cb.cpp` (~line 598): the MoE active-expert page-in is gated by **`WP_ENSURE_BATCH=1`**
+     (default OFF; the existing prefetch+ensure path stays in the `else` for A/B + rollback). New
+     branch calls `ensure_batch`, records the returned pins into `s_pinned_pages_prev_op`/`s_range_pins`.
+4. **Built clean** on mad-lab-main worktree `~/llama-wp/build-hip` (gfx1201, **AITER OFF**, ROCWMMA-FA
+   ON). `ensure_batch` compiles with zero errors (only pre-existing `nodiscard hipError_t` warnings).
+5. **Measured on R9700, DeepSeek V4 Flash paged, P2P, `WP_ENSURE_BATCH=1`, ring depth 4:**
+   **decode = 0.023 t/s (vs 0.04 baseline) — a 2× REGRESSION.** Output **fully coherent**
+   (`"...the founding of the city of Rome in 753 BC..."`) → correctness OK, pin-lifecycle sound,
+   **no expert corruption**. So the problem is PERF, not correctness.
+   - (0.04 baseline IS the valid apples-to-apples number: `WP_ENSURE_BATCH=0` on THIS merged branch ==
+     the old wp-vnext path. Do not re-excuse it as "different branch.")
+6. **Tried depth 8/16 first (WP_IOURING_DEPTH=16 WP_PREFETCH_DEPTH=16) — LOAD HANGS.** Confirmed via
+   `/proc/<load-thread>/wchan = io_cqring_wait` (waiting on an io_uring completion that never arrives).
+   Fell back to the known-good depth-4 ring for the run above.
+
+### ROOT CAUSE — one bug explains BOTH the regression and the depth-8/16 hang: **shared io_uring ring CROSS-DRAIN**
+The sync path (`page_in_sync_`, sentinel `req_id=(uint64)-1`) / `ensure_batch`'s wait loop AND the
+`PrefetchScheduler` all drain the **same** io_uring ring. The io layer's `wait_any()`
+(`wp-file-io.cpp` IoUringAsyncFileIO, ~line 255-306) **unconditionally `io_uring_cqe_seen()`s** every
+CQE it returns. Both the sync/ensure_batch waiters and `PrefetchScheduler::tick()` **DROP any completion
+whose `req_id` isn't theirs** — but the CQE is already consumed. `PrefetchScheduler::process_io_`
+(`wp-prefetch.cpp:302`) frees a queue slot only on **its own** completions (via `req_to_slot_`); a
+completion cannibalized by the sync/ensure path **never frees that scheduler slot** → `free_slots_`
+leaks empty → **speculative cross-layer prefetch stalls out**.
+- **DECODE (WP_ENSURE_BATCH=1):** `ensure_batch`'s `while(reaped<n) wait_any(-1)` eats the prefetch
+  scheduler's completions → prefetch pipeline dies → we lose the **compute↔I/O overlap** the old path
+  relied on → every MoE op becomes a cold, un-overlapped read → **2× slower** (net LOSS; "more
+  concurrency" but no overlap, and capped at depth 4 anyway).
+- **LOAD at depth 16:** heavier prefetch traffic → `tick()` (`wait_any(0)` drain) eats
+  `page_in_sync_`'s completion → `page_in_sync_` blocks forever in `io_cqring_wait`. At depth 4 the
+  collision is rare enough to mostly work.
+
+### THE FIX (do this next — it is the real unlock, NOT "just avoid it")
+**Completion demux in the io layer** (`wp-file-io.cpp`, IoUringAsyncFileIO): drain the ring **once**
+into a shared `std::unordered_map<uint64_t req_id, IoResult>` (`io_uring_cqe_seen` exactly once per
+CQE). Every waiter — `page_in_sync_`, `ensure_batch`, `PrefetchScheduler` — first checks that map for
+ITS `req_id`(s); only if absent does it pull a fresh CQE (moving any non-matching completions into the
+map, never discarding). No completion is ever lost to another consumer. This single change is expected
+to fix ALL THREE: (a) the 2× decode regression (prefetch pipeline survives `ensure_batch`), (b) the
+depth-8/16 load hang (`page_in_sync_` never loses its CQE), (c) `ensure_batch` finally gets **true
+QD=8** (raise `WP_IOURING_DEPTH`/`WP_PREFETCH_DEPTH` to ≥8 once the demux lands).
+- **Watch:** the load/decode paths are single-threaded per op (`PrefetchScheduler` +
+  `page_in_sync_`/`ensure_batch` run on the same inference thread during a forward pass), so the map
+  needs no lock — **verify** that assumption before relying on it.
+- Files: `wp-file-io.cpp` (the demux + a `wait_for(req_id)` that consults it), `wp-prefetch.cpp`
+  (`tick()`/`process_io_` pull from the map), `wp-pager.cpp` (`page_in_sync_`, `ensure_batch` waits).
+
+### VALIDATION GATES after the demux (this is the proof the cross-drain was the cause)
+1. **Decode ≥ 0.04** with `WP_ENSURE_BATCH=1` at depth 4 (regression gone: prefetch pipeline restored).
+2. **Depth-8 load does NOT hang** (`WP_IOURING_DEPTH=8 WP_PREFETCH_DEPTH=8`).
+3. **Decode at QD=8** climbs toward the **~0.4 t/s** ceiling (the ~10× headroom the diagnosis predicts).
+4. Output stays coherent; `routing_ptrs_discarded=0`; 0 faults.
+
+### EXACT REBUILD + RUN RECIPE (mad-lab-main, `~/llama-wp` worktree)
+```
+# BUILD (fresh worktree build; ~25 min at -j2, RAM-capped for the 15 GB host; CPU-only, safe):
+ssh mad-lab-main bash -s <<'E'
+cd ~/llama-wp
+ROCM_PATH=/opt/rocm LD_LIBRARY_PATH=/opt/rocm/lib HIP_PATH=/opt/rocm cmake -S . -B build-hip \
+  -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release -DGGML_HIP_ROCWMMA_FATTN=ON \
+  -DGGML_HIP_AITER=OFF -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
+cmake --build build-hip -j2 --target llama-perplexity llama-server
+E
+# RUN a decode measurement (server on :8081, R9700):
+ssh mad-lab-main bash -s <<'E'
+systemd-run --user --unit=dsv4-decode --collect -p MemoryMax=9000M --working-directory=/home/kmbandy/llama-wp \
+  --setenv=WP_SIZE_CLASS_SLOTS=1 --setenv=WP_BATCH_EVAL_CB=1 --setenv=WP_PAGED_BATCH=1 \
+  --setenv=WP_DENSE_PREFETCH_N=8 --setenv=WP_ENSURE_BATCH=1 \
+  --setenv=LLAMA_WP_TRANSPORT=p2p --setenv=LLAMA_WP_TRANSPORT_FORCE=1 \
+  bash -c './build-hip/bin/llama-server -m /home/kmbandy/Downloads/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf \
+    --no-mmap --weight-paging --weight-paging-slots 384 --weight-paging-prefetch \
+    -ngl 99 --device ROCm0 --host 127.0.0.1 --port 8081 --ctx-size 4096 --parallel 1 > /tmp/dsv4-decode.log 2>&1'
+# wait for /health==200 (paged load ~3-5 min), then:
+curl -s http://127.0.0.1:8081/completion -H 'Content-Type: application/json' \
+  -d '{"prompt":"The history of the Roman Empire begins with","n_predict":16,"temperature":0,"cache_prompt":false}' \
+  | python3 -c "import sys,json;t=json.load(sys.stdin)['timings'];print('t/s',t['predicted_per_second'])"
+E
+```
+- **DO NOT** set `WP_IOURING_DEPTH`/`WP_PREFETCH_DEPTH` > 4 until the demux lands (hangs the load).
+- To get clean pager stats (`prefetch_hit_rate`, `sync_fallbacks`, `io_effective_gb_s`) the server MUST
+  shut down GRACEFULLY — `systemctl stop` hard-kills before `log_stats_summary()` runs. Send SIGTERM
+  and let it drain, or add a signal handler, if you need those numbers.
+- R9700 shares the box with the murmur **captain (:8090, ROCm0)** and the **6900XT LFM2.5 (:8092,
+  ROCm1)**. When no murmur is active the captain holds ~0 VRAM so DeepSeek fits the 32 GB fine; if a
+  murmur is running, the captain will contend for ROCm0 — check `rocm-smi --showmeminfo vram` first.
+
+### Related (separate KG handoff notes written this session)
+- **KG `3b83ca79`** — this ensure_batch result + cross-drain root cause + demux fix (full detail).
+- **KG `5e2b8089`** — the recurrent-state mover HIP-only stub bug + 6900xt LFM2.5 concurrent GPU fault
+  (a DIFFERENT subsystem; another session is picking up murmur; not on the critical path here).
 
 ---
 ---
