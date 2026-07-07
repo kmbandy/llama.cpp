@@ -1,6 +1,8 @@
 #include "wp-pager.h"
 
 #include "ggml-backend.h"
+#include "ggml.h"
+#include "../../ggml/src/ggml-impl.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
 #include "wp-eval-cb.h"
 
@@ -510,6 +512,25 @@ bool WeightPager::batch_safe() const {
     // GPU fault. Until the MoE-batching redesign lands (routing op must break the range
     // *before* it), keep MoE on the per-op sync path.
     return stats_.evictions == 0 && pool_.size_class_slots_enabled() && !catalog_.has_experts();
+}
+
+void WeightPager::mark_routing_boundaries(const struct ggml_cgraph * gf) {
+    if (gf == nullptr || gf->n_nodes <= 0) { return; }
+    const void * first = gf->nodes[0];
+    const void * last  = gf->nodes[gf->n_nodes - 1];
+    if (routing_sig_.n_nodes == gf->n_nodes && routing_sig_.first == first && routing_sig_.last == last) { return; }
+    routing_break_tensors_.clear();
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+        routing_break_tensors_.insert(node);
+        struct ggml_tensor * ids = node->src[2];
+        while (ids != nullptr && ids->view_src != nullptr) { ids = ids->view_src; }
+        if (ids != nullptr) { routing_break_tensors_.insert(ids); }
+    }
+    routing_sig_.n_nodes = gf->n_nodes;
+    routing_sig_.first = first;
+    routing_sig_.last  = last;
 }
 
 int WeightPager::loaded_pages() const {

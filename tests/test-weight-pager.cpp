@@ -12,6 +12,7 @@
 #include "weight-pager/wp-pool.h"
 
 #include "ggml-backend.h"
+#include "ggml.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -1511,6 +1512,28 @@ static int test_is_uma_device_smoke() {
     return fails;
 }
 
+static int test_routing_boundary_prepass() {
+    int fails = 0;
+    struct ggml_init_params ip = { /*.mem_size=*/ 16*1024*1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * ids_producer = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+    ggml_set_name(ids_producer, "ids_producer");
+    struct ggml_tensor * ids_view = ggml_view_1d(ctx, ids_producer, 8, 0);
+    struct ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 2);
+    struct ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 8);
+    struct ggml_tensor * mmid = ggml_mul_mat_id(ctx, as, b, ids_view);
+    ggml_set_name(mmid, "mmid");
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, mmid);
+    wp::WeightPager pager;
+    pager.mark_routing_boundaries(gf);
+    if (!pager.is_routing_break(mmid))         { fprintf(stderr, "FAIL: mmid not marked\n"); fails++; }
+    if (!pager.is_routing_break(ids_producer)) { fprintf(stderr, "FAIL: ids producer (view root) not marked\n"); fails++; }
+    if (pager.is_routing_break(b))             { fprintf(stderr, "FAIL: unrelated tensor marked\n"); fails++; }
+    ggml_free(ctx);
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1556,6 +1579,7 @@ int main() {
         { "pool_hot_threshold_protects",         test_pool_hot_threshold_protects_in_eviction },
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
         { "pool_default_threshold_zero_lru",     test_pool_default_threshold_zero_is_pure_lru },
+        { "routing_boundary_prepass",            test_routing_boundary_prepass            },
     };
 
     for (const auto & t : tests) {
