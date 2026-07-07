@@ -14,7 +14,9 @@ extern "C++" void                  ggml_cuda_discard_routed_expert_ptrs();
 extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 #endif
 
+#include <chrono>        // WP_PROFILE_EVAL host-time instrumentation
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>       // getenv
 #include <cstring>
 #include <limits>        // numeric_limits — MAD-232 advise sentinel
@@ -49,6 +51,42 @@ bool eval_debug_enabled() {
     }();
     return enabled;
 }
+
+// WP_PROFILE_EVAL=1 (default off): accumulate host-side wall time spent inside
+// weight_pager_eval_cb. Total measures the per-op callback tax injected into
+// the decode critical path; the ensure-phase split isolates the Step-2
+// ensure/pin/patch loop from page-resolution+other. Printed at teardown.
+bool wp_profile_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_PROFILE_EVAL");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t s_prof_total_ns  = 0;  // total host time inside eval_cb (all paths past null-check)
+std::uint64_t s_prof_ensure_ns = 0;  // of that, time in the Step-2 ensure/patch loop
+std::uint64_t s_prof_calls     = 0;  // eval_cb invocations timed
+std::uint64_t s_prof_ops_pages = 0;  // invocations that had >= 1 paged src
+std::uint64_t s_prof_ensures   = 0;  // total ensure() calls (pages touched)
+
+inline std::uint64_t wp_now_ns() {
+    return (std::uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// RAII: accumulates elapsed host time into s_prof_total_ns on scope exit,
+// so every return path of eval_cb past construction is counted once.
+struct ProfGuard {
+    bool          on;
+    std::uint64_t t0;
+    ~ProfGuard() {
+        if (on) {
+            s_prof_total_ns += wp_now_ns() - t0;
+            ++s_prof_calls;
+        }
+    }
+};
 
 #if defined(GGML_USE_HIP)
 struct AsyncTransferEvent {
@@ -144,6 +182,29 @@ void weight_pager_eval_cb_reset(WeightPager * pager) {
 #endif
 }
 
+void weight_pager_eval_cb_print_profile() {
+    if (!wp_profile_enabled()) return;
+    const double total_ms   = (double) s_prof_total_ns  / 1e6;
+    const double ensure_ms  = (double) s_prof_ensure_ns / 1e6;
+    const double resolve_ms = total_ms - ensure_ms;   // page-resolution + async-drain + patch overhead
+    LLAMA_LOG_WARN(
+        "wp::eval_cb profile (WP_PROFILE_EVAL) — host-side callback time:\n"
+        "  eval_cb_calls: %lu\n"
+        "  ops_with_pages: %lu\n"
+        "  ensure_calls (pages touched): %lu\n"
+        "  eval_cb_host_total_ms: %.2f\n"
+        "  ensure_phase_ms: %.2f\n"
+        "  resolve+other_ms: %.2f\n"
+        "  avg_us_per_eval_cb_call: %.3f\n"
+        "  avg_us_per_page_ensure: %.3f\n",
+        (unsigned long) s_prof_calls,
+        (unsigned long) s_prof_ops_pages,
+        (unsigned long) s_prof_ensures,
+        total_ms, ensure_ms, resolve_ms,
+        s_prof_calls   ? ((double) s_prof_total_ns  / 1000.0) / (double) s_prof_calls   : 0.0,
+        s_prof_ensures ? ((double) s_prof_ensure_ns / 1000.0) / (double) s_prof_ensures : 0.0);
+}
+
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // Only act on the pre-execution call. The post-execution call is
     // informational and would re-trigger the same lookups.
@@ -152,6 +213,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
     const bool eval_debug = eval_debug_enabled();
+
+    // WP_PROFILE_EVAL: time the whole callback body (every return path past
+    // here is counted once via the RAII guard). Zero cost when disabled.
+    const bool    wp_profile = wp_profile_enabled();
+    ProfGuard     prof_guard{wp_profile, wp_profile ? wp_now_ns() : 0};
 
 #if defined(GGML_USE_HIP)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
@@ -811,6 +877,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
     ++g_debug.ops_with_pages;
+    if (wp_profile) {
+        ++s_prof_ops_pages;
+        s_prof_ensures += (std::uint64_t) n_page_indices;
+    }
 
     // MAD-232: posix_fadvise(WILLNEED) for the next K layers' paged tensors.
     // Warms NVMe→page-cache while THIS layer's compute runs, so by the time
@@ -861,6 +931,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     int  patches_this_op = 0;
     int  views_this_op   = 0;
 
+    const std::uint64_t ens_t0 = wp_profile ? wp_now_ns() : 0;
     for (int j = 0; j < n_page_indices; ++j) {
         const int    page_idx = page_indices[j];
         void       * vram     = pager->ensure(page_idx);
@@ -911,6 +982,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #if defined(GGML_USE_HIP)
         enqueue_async_wait_for_page(page_idx, s_async_events_prev_op);
 #endif
+    }
+    if (wp_profile) {
+        s_prof_ensure_ns += wp_now_ns() - ens_t0;
     }
 
     g_debug.patches_total += patches_this_op;

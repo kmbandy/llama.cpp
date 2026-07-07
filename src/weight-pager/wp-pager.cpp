@@ -520,6 +520,9 @@ void WeightPager::record_page_in_(size_t bytes, double seconds) {
 }
 
 void WeightPager::log_stats_summary() {
+    // WP_PROFILE_EVAL host-time breakdown (no-op unless the env flag is set).
+    weight_pager_eval_cb_print_profile();
+
     const Stats & s = stats();
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
     const double hit_rate = prefetch_total > 0
