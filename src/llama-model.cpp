@@ -30,6 +30,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1251,6 +1252,27 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// WP_RESIDENT_DENSE: when "1", the weight pager keeps DENSE weights VRAM-
+// resident and pages ONLY routed-expert tensors. Default off. Both the
+// buffer-allocation filter (is_paged_weight) and the pager-catalog population
+// MUST use the same routed-expert predicate below, or a tensor left out of
+// one but not the other ends up never-allocated-never-loaded (garbage).
+static bool wp_resident_dense_enabled() {
+    const char * v = std::getenv("WP_RESIDENT_DENSE");
+    return v != nullptr && v[0] == '1';
+}
+
+// True iff `name` is a consolidated routed-expert tensor
+// (ffn_{up,gate,down}_exps). Same detection that sets
+// llama_weight_page_info::is_expert at load.
+static bool wp_is_routed_expert(const char * name) {
+    const char * p = name ? std::strstr(name, "ffn_") : nullptr;
+    if (p == nullptr) return false;
+    return std::strstr(p, "ffn_up_exps.")   != nullptr ||
+           std::strstr(p, "ffn_gate_exps.") != nullptr ||
+           std::strstr(p, "ffn_down_exps.") != nullptr;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1612,6 +1634,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (std::strncmp(n, "output_norm", 11) == 0) return false;
                 if (std::strcmp (n, "output.weight") == 0)  return false;
                 if (ggml_nbytes(t) < WP_MIN_PAGED_BYTES)    return false;  // tiny -> resident
+                // WP_RESIDENT_DENSE: page ONLY routed experts; every dense
+                // weight becomes resident (allocated by the manual loop below,
+                // loaded by load_all_data). Must match the catalog filter.
+                if (wp_resident_dense_enabled() && !wp_is_routed_expert(n)) return false;
                 return true;  // it's a paged per-layer weight
             };
             const bool paging_on_device_buft =
@@ -1797,10 +1823,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                     info.is_expert = is_consolidated;
                 }
-                ml.weight_page_infos.push_back(info);
-                // Collect the actual model tensor pointer for the weight pager
-                if (weight_pager) {
-                    weight_pager->weight_tensor_ptrs.push_back(t);
+                // WP_RESIDENT_DENSE: register ONLY routed-expert tensors with
+                // the pager; dense tensors are resident (allocated above by the
+                // manual loop) and must NOT get a pool placeholder. This filter
+                // MUST agree with is_paged_weight() — both use the routed-expert
+                // predicate — or a tensor is never-allocated-never-loaded.
+                const bool page_this = !wp_resident_dense_enabled() || info.is_expert;
+                if (page_this) {
+                    ml.weight_page_infos.push_back(info);
+                    // Collect the actual model tensor pointer for the weight pager
+                    if (weight_pager) {
+                        weight_pager->weight_tensor_ptrs.push_back(t);
+                    }
                 }
                 ctx_has_weights = true;
             }
