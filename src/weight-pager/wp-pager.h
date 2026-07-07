@@ -145,6 +145,7 @@ public:
         return catalog_.find(key);
     }
     int    n_pages()                            const { return catalog_.size(); }
+    int    catalog_n_expert_pages()             const { return catalog_.n_expert_pages(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
     bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
