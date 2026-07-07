@@ -1795,6 +1795,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             info.n_experts = n_exp;
                         }
                     }
+                    info.is_expert = is_consolidated;
                 }
                 ml.weight_page_infos.push_back(info);
                 // Collect the actual model tensor pointer for the weight pager

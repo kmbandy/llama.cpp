@@ -41,6 +41,10 @@ struct llama_weight_page_info {
     // pager may split it into per-expert sub-pages for routing-aware paging
     // (MAD-88 Phase 2). Set to 1 for non-MoE or per-expert tensors.
     int  n_experts = 1;
+
+    // True iff this is a routed-expert consolidated tensor; dense tensors
+    // (attention, shared expert, embeddings, norms) stay false.
+    bool is_expert = false;
 };
 
 struct llama_model_loader {
