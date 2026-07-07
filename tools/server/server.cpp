@@ -166,7 +166,8 @@ int llama_server(int argc, char ** argv) {
         }
 
         // proxy handlers
-        // note: routes.get_health stays the same
+        // router-aware /health: reflect child process health instead of the stock always-ok handler
+        routes.get_health                  = models_routes->get_router_health;
         routes.get_metrics                 = models_routes->proxy_get;
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
