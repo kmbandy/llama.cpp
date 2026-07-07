@@ -1,9 +1,172 @@
 # Weight-paging decode-speed work — continuation (morning pickup)
 
 **Branch:** `feat/wp-vnext` (edit/build-check on **mad-lab-2026** at `/home/kmbandy/GitHub/llama.cpp`).
-Pushed to `origin`; **mad-lab-main** is on `feat/dsws-phaseb-conversion`, FF-merged to the same tip
-`78358b158`. All GPU validation is on mad-lab-main's **R9700 (ROCm0, gfx1201, 32 GB)**; the 6900XT
+Pushed to `origin`; **mad-lab-main** is on `feat/dsws-phaseb-conversion` with the wp-vnext commits
+cherry-picked. All GPU validation is on mad-lab-main's **R9700 (ROCm0, gfx1201, 32 GB)**; the 6900XT
 is ROCm1. Remote shell is **fish** → always `ssh mad-lab-main bash -s <<'EOF'`.
+
+---
+---
+
+# ★★★ 2026-07-07 FULL DAY — READ THIS FIRST ★★★
+## WP_PAGED_BATCH shipped + DeepSeek V4 Flash (284B/162GB) RUNS on 32 GB. Next front: decode-speed I/O parallelism.
+
+### TL;DR of the whole day
+1. **Shipped the `WP_PAGED_BATCH` feature** (MoE-aware batched paging) — 9 commits, validated across
+   **dense/MoE × resident/paged** (all 4 quadrants: correct PPL, zero faults). Fixes the batched-MoE
+   near-null fault (H3 read-before-produce + H4 TLS take-steal) via routing-boundary breaks, and makes
+   batching safe under **eviction** via a per-range pin lifecycle + reactive auto-break.
+2. **Fixed 3 DeepSeek-V4 × weight-paging load bugs** (fit-dry-run crash, tiny-weights-paged,
+   view-only-leaf buffer_id). Root-caused the last two via **codex+Fable consults** converging on
+   `ggml_backend_sched_split_graph` pass-4.
+3. **THE WIN: DeepSeek V4 Flash (284B total / 13B active, 162 GB Q8) runs paged on the 32 GB R9700.**
+   Wikitext **PPL = 4.1524**, **0 GPU faults**, **62,233 evictions/run**, `routing_ptrs_discarded=0`
+   (clean routing). A model **5× the size of VRAM**, computing correctly.
+4. **NEXT FRONT (start here after compact): decode-speed I/O parallelism.** DeepSeek decode is
+   **~0.04 t/s**, gated by **~0.5 GB/s effective I/O = ~1/10th of the SN850's ~5-7 GB/s**. It is
+   **QD≈1-serialized** in the expert page-in (`page_in_sync_` one-page-at-a-time), so P2P dma_buf,
+   io_uring depth 16, and async ensure **did not help** (async made it worse). The fix is code, not
+   flags: **issue a MoE op's N active-expert reads concurrently to fill the io_uring queue**, then wait.
+
+### Commit stack today (all on `feat/wp-vnext`, pushed; tip `d384d93f4`)
+```
+d384d93f4 fix(wp): anchor paged weights to pool_buf so view-only leaves get a backend   (DeepSeek fix #3)
+3faad72a0 fix(wp): keep tiny per-layer weights resident (don't page < 4KB)               (DeepSeek fix #2)
+978a720bf fix(wp): disable weight paging in the memory-fit dry-run                        (DeepSeek fix #1)
+f25563762 feat(wp): reactive auto-break on pin-budget under WP_PAGED_BATCH (5b)
+2854c4f97 feat(wp): per-range pin lifecycle under WP_PAGED_BATCH (release after range sync)  (5a)
+0c9a6e159 feat(wp): break batch range at routing boundaries under WP_PAGED_BATCH (H3/H4)
+e5cb0582e feat(wp): call mark_routing_boundaries before sched compute
+cb15e252a feat(wp): WP_PAGED_BATCH flag + batch_safe pinnability-governed under it
+f64ccfdc8 feat(wp): routing-boundary pre-pass (mark_routing_boundaries/is_routing_break)
+```
+Design spec `docs/superpowers/specs/2026-07-07-moe-aware-batched-paging-design.md`; plan
+`docs/superpowers/plans/2026-07-07-moe-aware-batched-paging.md`.
+
+### The `WP_PAGED_BATCH` feature — architecture (5 units)
+Enable with `WP_PAGED_BATCH=1` (default OFF; requires `WP_BATCH_EVAL_CB=1` + `WP_SIZE_CLASS_SLOTS=1`).
+- **A. Routing-boundary pre-pass** — `WeightPager::mark_routing_boundaries(gf)` (wp-pager.cpp), called
+  from `llama_context::graph_compute` before sched compute (llama-context.cpp ~2492). Marks every
+  `MUL_MAT_ID` node + the view-root of its `src[2]` (ids-producer) into `routing_break_tensors_`.
+  `is_routing_break(t)` is an O(1) lookup. Cached via a topology signature.
+- **B. Break at routing boundaries** — `eval_cb_op_return()` (wp-eval-cb.cpp ~249) returns `true`
+  (end range) when `is_routing_break(t)`. This isolates each `MUL_MAT_ID`, so the router+ids-producer
+  compute+sync first (ids valid = fixes **H3**), and no other op shares its range to `take()`-steal
+  the routed-expert TLS (fixes **H4**; note `ggml_cuda_mul_mat_q` is called for regular mul_mat too,
+  ggml-cuda.cu:2889).
+- **C. Per-range pin lifecycle (5a)** — under paged_batch, pins accumulate in `s_range_pins`, move to
+  `s_range_pins_pending` when a range ends, and release at the **top of the next callback** (post-sync,
+  guaranteed). Replaces the per-op MAD-231 unpin. `reset()` flushes at teardown.
+- **D. Reactive auto-break (5b)** — track `s_range_pinned_bytes` at pin sites; `eval_cb_op_return()`
+  ends the range when it crosses **70% of `pool_arena_bytes()`**. Bounds a range's pinned working set
+  so a dense stretch (no routing boundary) can't overflow pins under eviction (`alloc_slot -1`). This
+  is what lets `batch_safe()` drop the `evictions==0` requirement — batching under real eviction.
+- **E. Flag** — `wp_paged_batch_enabled()` (wp-eval-cb.cpp); `batch_safe()` returns
+  `pool_.size_class_slots_enabled()` when the flag is on (drops `evictions==0 && !has_experts`).
+
+**Validation matrix (all committed, all GPU-validated, PPL exact + 0 faults):**
+| | resident (evictions==0) | paged (evictions>0) |
+|---|---|---|
+| **dense (Qwen3.6-27B)** | PPL 5.4623 @ slots=345 | PPL 5.4623 @ slots=200, **2174 evict** |
+| **MoE (LFM2.5-8B-A1B)** | PPL 27.0938 @ slots=750 | PPL 27.0938 @ slots=300, **7784 evict** |
+| **MoE @ scale (DeepSeek V4)** | — | **PPL 4.1524 @ slots=384, 62233 evict** |
+
+Unit tests: `test_routing_boundary_prepass`, `test_wp_paged_batch_flag_default_off` in
+tests/test-weight-pager.cpp (builds/runs on mad-lab-2026 `build-army`, or mad-lab-main `build-hip`).
+
+### The 3 DeepSeek-V4 × weight-paging load fixes (root causes)
+1. **Fit-dry-run crash** (`978a720bf`, common/fit.cpp:~60): `common_get_device_memory_data`'s
+   `no_alloc` dry-run cleared mmap/mlock/direct_io but NOT `weight_paging_enabled`, so paged tensors got
+   null buffers and `ggml_gallocr` asserted `buffer_id>=0` during the dry-run reserve. **Fix:**
+   `mparams_copy.weight_paging_enabled = false` in the dry-run. (Any paged model was un-loadable via the
+   auto-fit path before this.)
+2. **Tiny weights paged** (`3faad72a0`, src/llama-model.cpp): DeepSeek V4's tiny per-layer weights
+   (hyper-connection `hc_attn_scale` {3}, `hc_*_base` {hc_mix_dim}, sinks, expert-prob bias) were paged;
+   a paged non-matmul leaf gets no backend → assert. **Fix:** `WP_MIN_PAGED_BYTES = 4096` floor
+   (file-scope const) in both `is_paged_weight` and the `weight_page_infos` registration loop. Standard
+   {n_embd} norms stay paged (27B/LFM unchanged).
+3. **View-only-leaf buffer_id** (`d384d93f4`, src/llama.cpp:287) — **the systemic one.** A paged weight
+   consumed **only via a reshape view** (DeepSeek `wo_a = ggml_reshape_3d(...)->mul_mat`, deepseek4.cpp:1068)
+   inherits `buffer_id -1` from `ggml_backend_sched_split_graph` **pass 4** (ggml-backend.cpp:1217-1241):
+   the view's id comes from its `view_src` (paged leaf, `buffer==NULL` → -1), then the src-loop assigns
+   the leaf = the view's still-`-1` id **before** the view's own fallback runs. Directly-consumed weights
+   are rescued at line 1233 by their pass-3-assigned matmul; view-consumed ones aren't. **Fix (1 line):**
+   set paged weights' `t->buffer = pool_buf` (instead of `nullptr`) at init, giving the scheduler a
+   backend to name. Known-safe: the eval_cb **already** sets `src->buffer = pool_buf` on every patch
+   (wp-eval-cb.cpp:1085/1094), so this just brings load-time state to the post-first-decode steady state;
+   gallocr still skips the leaf (`is_allocated` checks `data!=NULL` first). **Eval-time correctness of
+   reshaped/viewed paged weights is already handled** — the eval_cb resolves the page via `view_src`
+   (wp-eval-cb.cpp:919-921) and patches the VIEW's data `= vram + view_offs` (1089-1097, the "B-P1"
+   path). Root-caused by codex + Fable consults converging on the pass-4 ordering.
+
+### DeepSeek V4 Flash — run recipe + geometry
+- **Model:** `~/Downloads/DeepSeek-V4-Flash-UD-Q8_K_XL-0000{1..5}-of-00005.gguf` (162 GB; load via the
+  `-00001-of-00005` file, llama.cpp auto-pulls the rest). Part 1 is a 5 MB **metadata-only shard**
+  (that is normal, not truncated). Arch = `deepseek4` (upstream #24162, has the lightning-indexer / NSA
+  sparse attention). Converter is absent from this tree — use a pre-quantized GGUF.
+- **Geometry:** 33,987 paged pages (after the tiny-weights fix; was 34,349), **max_page = 64 MiB**.
+  slots=384 → 24 GB arena. Total VRAM ~28.6 GB (arena + resident embeds/output + KV/compute). Fits 32 GB.
+- **PPL command (works):**
+  ```
+  ssh mad-lab-main bash -s <<'E'
+  cd /home/kmbandy/GitHub/llama.cpp
+  systemd-run --user --unit=dsv4 --collect -p MemoryMax=30000M --working-directory=/home/kmbandy/GitHub/llama.cpp \
+    --setenv=WP_SIZE_CLASS_SLOTS=1 --setenv=WP_BATCH_EVAL_CB=1 --setenv=WP_PAGED_BATCH=1 --setenv=WP_DENSE_PREFETCH_N=8 \
+    bash -c "./build-hip/bin/llama-perplexity -m ~/Downloads/DeepSeek-V4-Flash-UD-Q8_K_XL-00001-of-00005.gguf \
+      -f wikitext-2-raw/wiki.test.raw --chunks 2 -c 512 --no-mmap --weight-paging --weight-paging-slots 384 \
+      --weight-paging-prefetch -ngl 99 --device ROCm0 > /tmp/dsv4.log 2>&1"
+  E
+  ```
+  Expect PPL 4.1524, evictions ~62k, no fault. **~6.4 min / 2 chunks (I/O-bound).**
+
+### ★ NEXT FRONT — decode-speed I/O parallelism (start here) ★
+**The measured problem:** DeepSeek decode ≈ **0.04 t/s**; per token ~11 GB streams from NVMe at
+**~0.5 GB/s effective ≈ 1/10th of the SN850's ~5-7 GB/s**. Not bandwidth-bound, not compute-bound, not
+sync-bound (batching is irrelevant at this residency). It is **QD≈1 serialized**.
+
+**What was tried and did NOT help (so don't rehash):**
+- P2P dma_buf transport (`LLAMA_WP_TRANSPORT=p2p LLAMA_WP_TRANSPORT_FORCE=1`) — confirmed active
+  ("P2P enabled — pool dma_buf exported+mmap'd", `page_in_sync_ EXIT p2p`); **no change** (still 0.04).
+- `WP_PREFETCH_DEPTH=16 WP_IOURING_DEPTH=16` — **no change** (nothing to parallelize if reads are serial).
+- `WP_ASYNC_ENSURE=1` — **worse** (0.02 t/s); adds overhead on the same serial path (and its compose
+  with the 5a/5b per-range pins is unvalidated — see Task 6).
+
+**Diagnosis:** the expert page-in goes through `page_in_sync_` **one page at a time, waiting on each**,
+so the deep queue is never filled. For a MoE op the N active experts are all known at once (post-routing)
+— they should be issued **concurrently** (fill io_uring SQ to depth N) then waited together, turning
+QD≈1 into QD≈N and approaching NVMe bandwidth (~10× headroom → ~0.4 t/s ceiling at 15% residency).
+
+**Where to work (code):**
+- eval_cb **Step 2 ensure loop** (wp-eval-cb.cpp ~1051): `for (j...) pager->ensure(page_idx)` — serial,
+  each `ensure()` blocks. This is the serialization to break.
+- The **"Pass 1: fire async prefetch for every active expert"** comment (~wp-eval-cb.cpp:531 in the MoE
+  routing branch) — intended concurrency; verify whether it actually issues parallel reads or is inert.
+- `WeightPager::ensure` / `page_in_sync_` (wp-pager.cpp) and the io_uring file-io layer (wp-file-io) —
+  the sync path vs a batched-submit path.
+**Measurement to do first:** `iostat -x /dev/nvme0n1 3` during a decode (was cut off last run — redo),
+plus the pager's `io_effective_gb_s` counter, to confirm QD/throughput and quantify the gap before
+coding. Likely a consult candidate (subtle async/io_uring path).
+
+### Other open items (lower priority than the I/O front)
+- **Task 6 (async compose):** `WP_ASYNC_ENSURE=1` + `WP_PAGED_BATCH` per-range pins is **unvalidated**
+  (5a/5b were validated async-OFF). The async path operates on `s_pinned_pages_prev_op` which paged_batch
+  bypasses (pins go to `s_range_pins`), so it may already be inert-but-safe — needs a correctness check.
+- **Flip `WP_PAGED_BATCH` default-on** — only after Task 6 + a decision; it's self-gated (size-class +
+  batch_eval_cb) so low-risk, but hold until the I/O work settles.
+- **gpt-oss-20b** produces NaN under paging (pre-existing, gpt-oss/MXFP4-specific, `discarded:6`) — NOT a
+  blocker; DeepSeek/LFM route cleanly (`discarded:0`).
+
+### State at compact
+- All 9 commits pushed; `feat/wp-vnext` tip `d384d93f4` == origin. Working tree: only pre-existing WIP
+  (`examples/pagedattn-*`, `src/llama-graph.cpp`, `examples/CMakeLists.txt`) — do NOT touch.
+- mad-lab-main: wp-vnext commits cherry-picked; `src/llama.cpp` + `src/llama-model.cpp` present as
+  staged-matching-origin (applied via `git checkout origin/feat/wp-vnext -- <file>`); the throwaway
+  `ggml-alloc.c` WP-DIAG diagnostic was **reverted** (clean). GPU **clear** (VRAM ~1.3 GB baseline).
+- Build targets on mad-lab-main: `cmake --build build-hip -j2 --target llama llama-perplexity llama-server`
+  in the capped `systemd-run --user` unit (MemoryMax=13000M CPUQuota=600%).
+
+---
+---
 
 ## TL;DR of the session
 
