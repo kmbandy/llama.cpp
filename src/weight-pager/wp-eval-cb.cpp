@@ -129,6 +129,14 @@ std::vector<AsyncTransferEvent> s_async_events_prev_op;
 std::vector<PendingAsyncOp> s_pending_async_ops;
 WeightPager *               s_prev_op_pager = nullptr;
 
+// WP_PAGED_BATCH per-range pin lifecycle. Under paged-batch the callback does
+// NOT unpin per-op; pins accumulate in s_range_pins across the current batch
+// range, move to s_range_pins_pending when the range ends (eval_cb_op_return
+// returns true), and are released at the top of the next callback — which the
+// scheduler guarantees runs only after that range's compute+sync.
+std::vector<int>            s_range_pins;
+std::vector<int>            s_range_pins_pending;
+
 void release_async_op(PendingAsyncOp & op) {
     WeightPager * owner = op.pager;
     for (int page_idx : op.pages) {
@@ -148,11 +156,22 @@ void release_async_op(PendingAsyncOp & op) {
 }
 #else
 std::vector<int> s_pinned_pages_prev_op;
+std::vector<int> s_range_pins;
+std::vector<int> s_range_pins_pending;
 #endif
 }  // namespace
 
 void weight_pager_eval_cb_reset(WeightPager * pager) {
 #if defined(GGML_USE_HIP)
+    // WP_PAGED_BATCH: release any range pins still held at teardown (a range that
+    // ended at a split boundary with no following callback, or reset mid-range).
+    // Independent of async ensure, so do it before the async early-return.
+    if (pager != nullptr && (!s_range_pins.empty() || !s_range_pins_pending.empty())) {
+        for (int p : s_range_pins_pending) { pager->unpin_page(p); }
+        for (int p : s_range_pins)         { pager->unpin_page(p); }
+        s_range_pins.clear();
+        s_range_pins_pending.clear();
+    }
     if (pager == nullptr || !pager->async_ensure_enabled()) {
         return;
     }
@@ -237,32 +256,48 @@ void weight_pager_eval_cb_print_profile() {
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // Only act on the pre-execution call. The post-execution call is
     // informational and would re-trigger the same lookups.
-    if (!ask)             return true;
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
-    const bool eval_debug = eval_debug_enabled();
     const bool batch_eval_cb = wp_batch_eval_cb_enabled();
+    const bool paged_batch   = batch_eval_cb && wp_paged_batch_enabled();
+    // WP_PAGED_BATCH: release the previous range's pins now. The top of this
+    // callback is guaranteed to run after that range's compute+sync (the
+    // scheduler computes+syncs a range before it issues the next ask=true, and
+    // before the ask=false on the range's last node).
+    if (paged_batch && !s_range_pins_pending.empty()) {
+        for (int p : s_range_pins_pending) { pager->unpin_page(p); }
+        s_range_pins_pending.clear();
+    }
+    if (!ask)             return true;
+    const bool eval_debug = eval_debug_enabled();
     const uint64_t sync_fallbacks_before =
         batch_eval_cb ? pager->sync_fallback_count() : 0;
     bool routing_tls_set = false;
-    const bool paged_batch = batch_eval_cb && wp_paged_batch_enabled();
     auto eval_cb_op_return = [&]() -> bool {
+        bool end_range;
         // WP_PAGED_BATCH: break the batch range at every routing boundary
         // (each MUL_MAT_ID and its ids-producer). Ending the range here forces
         // the scheduler's compute+sync, so the router's ids are materialized
         // before the next range reads them, and the routing op runs isolated
         // (fixes the read-before-produce H3 + TLS take-steal H4 faults).
         if (paged_batch && pager->is_routing_break(t)) {
-            return true;
+            end_range = true;
+        } else if (batch_eval_cb &&
+                   pager->batch_safe() &&
+                   !routing_tls_set &&
+                   pager->sync_fallback_count() == sync_fallbacks_before) {
+            end_range = false;
+        } else {
+            end_range = true;
         }
-        if (batch_eval_cb &&
-            pager->batch_safe() &&
-            !routing_tls_set &&
-            pager->sync_fallback_count() == sync_fallbacks_before) {
-            return false;
+        if (paged_batch && end_range) {
+            // Range ends after this op: hand its accumulated pins to the pending
+            // set, released at the top of the next callback (post-sync).
+            for (int p : s_range_pins) { s_range_pins_pending.push_back(p); }
+            s_range_pins.clear();
         }
-        return true;
+        return end_range;
     };
 
     // WP_PROFILE_EVAL: time the whole callback body (every return path past
@@ -612,7 +647,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             // alloc_slot in this same eval_cb can't evict
                                             // it. Unpinned in the NEXT eval_cb (above).
                                             pager->pin_page(sub_page_idx);
-                                            s_pinned_pages_prev_op.push_back(sub_page_idx);
+                                            (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(sub_page_idx);
 #if defined(GGML_USE_HIP)
                                             s_prev_op_pager = pager;
 #endif
@@ -1015,7 +1050,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         // GPU is still reading from it. Unpinned at the top of the NEXT
         // eval_cb invocation.
         pager->pin_page(page_idx);
-        s_pinned_pages_prev_op.push_back(page_idx);
+        (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(page_idx);
 #if defined(GGML_USE_HIP)
         s_prev_op_pager = pager;
 #endif
