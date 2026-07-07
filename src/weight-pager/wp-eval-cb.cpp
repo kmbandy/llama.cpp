@@ -246,7 +246,16 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const uint64_t sync_fallbacks_before =
         batch_eval_cb ? pager->sync_fallback_count() : 0;
     bool routing_tls_set = false;
+    const bool paged_batch = batch_eval_cb && wp_paged_batch_enabled();
     auto eval_cb_op_return = [&]() -> bool {
+        // WP_PAGED_BATCH: break the batch range at every routing boundary
+        // (each MUL_MAT_ID and its ids-producer). Ending the range here forces
+        // the scheduler's compute+sync, so the router's ids are materialized
+        // before the next range reads them, and the routing op runs isolated
+        // (fixes the read-before-produce H3 + TLS take-steal H4 faults).
+        if (paged_batch && pager->is_routing_break(t)) {
+            return true;
+        }
         if (batch_eval_cb &&
             pager->batch_safe() &&
             !routing_tls_set &&
