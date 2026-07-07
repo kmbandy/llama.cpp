@@ -41,6 +41,14 @@
 #include <string>
 #include <vector>
 
+// Weight paging: minimum tensor size to bother paging. Tiny per-layer weights
+// (norm/RMS scales, hyper-connection scale/base vectors, attention sinks,
+// expert-prob biases) stay resident — paging a few-byte tensor is pointless and
+// a paged non-matmul leaf left with buffer==NULL never gets a backend assigned,
+// tripping the gallocr buffer_id>=0 assert (hit on DeepSeek V4 hc_attn_scale
+// {3}). Standard {n_embd} norms are well above this and remain paged.
+static constexpr size_t WP_MIN_PAGED_BYTES = 4096;
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1603,6 +1611,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (std::strncmp(n, "token_embd", 10) == 0) return false;
                 if (std::strncmp(n, "output_norm", 11) == 0) return false;
                 if (std::strcmp (n, "output.weight") == 0)  return false;
+                if (ggml_nbytes(t) < WP_MIN_PAGED_BYTES)    return false;  // tiny -> resident
                 return true;  // it's a paged per-layer weight
             };
             const bool paging_on_device_buft =
@@ -1741,6 +1750,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (std::strncmp(n, "token_embd", 10) == 0 ||
                         std::strncmp(n, "output_norm", 11) == 0 ||
                         std::strcmp (n, "output.weight") == 0) {
+                        continue;
+                    }
+                    // Tiny per-layer weights stay resident — see WP_MIN_PAGED_BYTES
+                    // rationale above (paged non-matmul leaf gets no backend ->
+                    // gallocr buffer_id assert; hit on DeepSeek V4 hc_attn_scale).
+                    if (ggml_nbytes(t) < WP_MIN_PAGED_BYTES) {
                         continue;
                     }
                 }

@@ -24,4 +24,15 @@ class WeightPager;
 // returns true (no-op).
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
+// Drain eval-callback state associated with pager before the pager tears down.
+void weight_pager_eval_cb_reset(WeightPager * pager);
+
+bool wp_paged_batch_enabled();
+
+// Diagnostic (WP_PROFILE_EVAL=1, default off): print the total host-side wall
+// time spent inside weight_pager_eval_cb over the run, split into the Step-2
+// ensure/patch phase vs page-resolution+other. Lets us see whether paged-decode
+// slowdown is host-side callback overhead or GPU/scheduler. No-op when disabled.
+void weight_pager_eval_cb_print_profile();
+
 }  // namespace wp

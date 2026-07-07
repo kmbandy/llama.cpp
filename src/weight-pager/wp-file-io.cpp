@@ -6,6 +6,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <cstdlib>
 #include <unistd.h>
 
 #ifdef LLAMA_HAVE_IO_URING
@@ -172,6 +173,8 @@ public:
 
     int pending() const override { return (int) results_.size(); }
 
+    FileIOTransport transport() const override { return FileIOTransport::SyncPread; }
+
     int fd(int fd_idx) const override {
         if (fd_idx < 0 || (size_t) fd_idx >= fds_.size()) return -1;
         return fds_[fd_idx];
@@ -304,6 +307,8 @@ public:
 
     int pending() const override { return pending_; }
 
+    FileIOTransport transport() const override { return FileIOTransport::IoUringHost; }
+
     int fd(int fd_idx) const override {
         if (fd_idx < 0 || (size_t) fd_idx >= fds_.size()) return -1;
         return fds_[fd_idx];
@@ -414,9 +419,9 @@ int FileIOLayer::submit_batch(const std::vector<FileIOBatchRequest> & reqs) {
 // Factory
 // ---------------------------------------------------------------------------
 
-std::unique_ptr<FileIOLayer> create_file_io(std::vector<int> fds,
-                                            bool             prefer_async,
-                                            int              queue_depth) {
+std::unique_ptr<FileIOLayer> create_host_file_io(std::vector<int> fds,
+                                                 bool             prefer_async,
+                                                 int              queue_depth) {
     const size_t n_fds = fds.size();
 
     // Disable kernel auto-sequential-readahead on every fd before either
@@ -463,6 +468,49 @@ std::unique_ptr<FileIOLayer> create_file_io(std::vector<int> fds,
 #endif
     LLAMA_LOG_INFO("wp::create_file_io: SyncPread (fds=%zu)\n", n_fds);
     return std::unique_ptr<FileIOLayer>(new SyncPreadFileIO(std::move(fds)));
+}
+
+std::unique_ptr<FileIOLayer> create_file_io(std::vector<int> fds,
+                                            bool             prefer_async,
+                                            int              queue_depth,
+                                            const FileIOP2PConfig * p2p) {
+    const char * env = std::getenv("LLAMA_WP_TRANSPORT");
+    const bool want_p2p = (env != nullptr && std::strcmp(env, "p2p") == 0);
+
+    if (!want_p2p) {
+        if (env != nullptr && env[0] != '\0' && std::strcmp(env, "host") != 0) {
+            LLAMA_LOG_WARN("wp::create_file_io: unknown LLAMA_WP_TRANSPORT=%s; using host ladder\n", env);
+        }
+        return create_host_file_io(std::move(fds), prefer_async, queue_depth);
+    }
+
+    if (p2p == nullptr || p2p->pool_base == nullptr || p2p->pool_size == 0) {
+        LLAMA_LOG_WARN("wp::create_file_io: LLAMA_WP_TRANSPORT=p2p requested but pool export target is unavailable; falling back to host ladder\n");
+        return create_host_file_io(std::move(fds), prefer_async, queue_depth);
+    }
+
+    std::vector<int> p2p_fds;
+    p2p_fds.reserve(fds.size());
+    for (int fd : fds) {
+        p2p_fds.push_back((fd >= 0) ? dup(fd) : -1);
+    }
+    auto p2p_layer = create_p2p_file_io(std::move(p2p_fds), prefer_async, queue_depth, *p2p);
+    if (p2p_layer) {
+        for (int fd : fds) {
+            if (fd >= 0) close(fd);
+        }
+        LLAMA_LOG_INFO("wp::create_file_io: active transport=p2p (fallback ladder p2p->io_uring-host->sync-pread, queue_depth=%d)\n",
+                       queue_depth);
+        return p2p_layer;
+    }
+
+    LLAMA_LOG_WARN("wp::create_file_io: p2p unavailable; falling back p2p->io_uring-host->sync-pread\n");
+    auto host = create_host_file_io(std::move(fds), prefer_async, queue_depth);
+    if (host) {
+        LLAMA_LOG_INFO("wp::create_file_io: active transport=%s after p2p fallback\n",
+                       host->transport() == FileIOTransport::IoUringHost ? "io_uring-host" : "sync-pread");
+    }
+    return host;
 }
 
 }  // namespace wp

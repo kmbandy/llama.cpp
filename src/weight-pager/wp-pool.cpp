@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -14,6 +15,25 @@
 #endif
 
 namespace wp {
+
+namespace {
+
+bool env_flag_is_one(const char * var) {
+    const char * v = std::getenv(var);
+    return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+size_t align_up(size_t n, size_t align) {
+    if (align <= 1) return n;
+    const size_t rem = n % align;
+    if (rem == 0) return n;
+    if (n > std::numeric_limits<size_t>::max() - (align - rem)) {
+        return 0;
+    }
+    return n + (align - rem);
+}
+
+}  // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // MAD-234 — UMA / APU safety helpers
@@ -106,6 +126,7 @@ PoolAllocator::~PoolAllocator() {
         buf_ = nullptr;
     }
     base_ = nullptr;
+    arena_size_ = 0;
 }
 
 bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
@@ -123,6 +144,7 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
     }
 
     const size_t total = (size_t) n_slots * slot_size;
+    const bool use_size_classes = env_flag_is_one("WP_SIZE_CLASS_SLOTS");
 
     // MAD-234: UMA / APU pre-flight safety check.
     //
@@ -184,24 +206,57 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
         return false;
     }
 
-    n_slots_   = n_slots;
-    slot_size_ = slot_size;
-    tick_      = 0;
-    used_.assign(n_slots, false);
-    last_used_.assign(n_slots, 0);
-    pin_count_.assign(n_slots, 0);              // MAD-231: refcount starts at 0
+    n_slots_          = use_size_classes ? 0 : n_slots;
+    slot_size_        = slot_size;
+    arena_size_       = total;
+    slot_alignment_   = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft));
+    size_class_slots_ = use_size_classes;
+    high_water_       = 0;
+    tick_             = 0;
+    used_.assign((size_t) n_slots_, false);
+    last_used_.assign((size_t) n_slots_, 0);
+    pin_count_.assign((size_t) n_slots_, 0);              // MAD-231: refcount starts at 0
+    slot_offset_.clear();
+    slot_bytes_.clear();
+    slot_class_.clear();
+    free_by_class_.clear();
+    if (size_class_slots_) {
+        used_.reserve((size_t) n_slots);
+        last_used_.reserve((size_t) n_slots);
+        pin_count_.reserve((size_t) n_slots);
+        hit_count_.reserve((size_t) n_slots);
+        slot_offset_.reserve((size_t) n_slots);
+        slot_bytes_.reserve((size_t) n_slots);
+        slot_class_.reserve((size_t) n_slots);
+    } else {
+        slot_offset_.assign((size_t) n_slots, 0);
+        slot_bytes_.assign((size_t) n_slots, slot_size);
+        slot_class_.assign((size_t) n_slots, slot_size);
+    }
     lru_walk_pinned_skips_ = 0;                 // MAD-231: telemetry reset
-    hit_count_.assign(n_slots, 0);              // MAD-237: popularity counter
+    hit_count_.assign((size_t) n_slots_, 0);              // MAD-237: popularity counter
     lru_walk_hot_skips_      = 0;
     n_evictions_since_decay_ = 0;
     n_decays_                = 0;
 
-    LLAMA_LOG_INFO("wp::PoolAllocator: allocated %d slots x %zu B (%.1f MiB)\n",
-                   n_slots, slot_size, total / 1048576.0);
+    if (size_class_slots_) {
+        LLAMA_LOG_INFO("wp::PoolAllocator: allocated size-class arena budget %zu B (%.1f MiB), max_page_size=%zu, alignment=%zu\n",
+                       total, total / 1048576.0, slot_size, slot_alignment_);
+    } else {
+        LLAMA_LOG_INFO("wp::PoolAllocator: allocated %d slots x %zu B (%.1f MiB)\n",
+                       n_slots, slot_size, total / 1048576.0);
+    }
     return true;
 }
 
-int PoolAllocator::alloc_slot() {
+int PoolAllocator::alloc_slot(size_t requested_size) {
+    if (size_class_slots_) {
+        return alloc_slot_size_class_(requested_size == 0 ? slot_size_ : requested_size);
+    }
+    return alloc_slot_fixed_();
+}
+
+int PoolAllocator::alloc_slot_fixed_() {
     if (n_slots_ == 0 || base_ == nullptr) {
         return -1;
     }
@@ -289,10 +344,194 @@ int PoolAllocator::alloc_slot() {
     hit_count_[lru] = 0;
     // used_ stays true: slot transitions directly from old owner to new one.
 
-    // MAD-237 periodic decay: halve every hit count every kDecayEvery
-    // evictions. Prevents long-running counters from monopolizing the
-    // "hot" set after a workload shift. Cheap — one pass over n_slots_
-    // every 1024 evictions = O(n/1024) amortized per eviction.
+    decay_after_eviction_();
+    return lru;
+}
+
+int PoolAllocator::alloc_slot_size_class_(size_t requested_size) {
+    if (base_ == nullptr || requested_size == 0 || requested_size > slot_size_) {
+        return -1;
+    }
+
+    const size_t requested_class = size_class_for_(requested_size);
+    if (requested_class == 0 || requested_class > slot_size_) {
+        return -1;
+    }
+
+    int slot = take_free_size_class_slot_(requested_class);
+    if (slot >= 0) {
+        used_[slot]      = true;
+        last_used_[slot] = ++tick_;
+        hit_count_[slot] = 0;
+        return slot;
+    }
+
+    if (high_water_ <= arena_size_ && requested_class <= arena_size_ - high_water_) {
+        slot = n_slots_++;
+        used_.push_back(true);
+        last_used_.push_back(++tick_);
+        pin_count_.push_back(0);
+        hit_count_.push_back(0);
+        slot_offset_.push_back(high_water_);
+        slot_bytes_.push_back(requested_class);
+        slot_class_.push_back(requested_class);
+        high_water_ += requested_class;
+        return slot;
+    }
+
+    int n_pinned_skipped_this_walk = 0;
+    int n_hot_skipped_this_walk    = 0;
+    const int lru = pick_size_class_victim_(requested_class,
+                                            n_pinned_skipped_this_walk,
+                                            n_hot_skipped_this_walk);
+    lru_walk_pinned_skips_ += (uint64_t) n_pinned_skipped_this_walk;
+    lru_walk_hot_skips_    += (uint64_t) n_hot_skipped_this_walk;
+
+    if (lru < 0) {
+        LLAMA_LOG_WARN("wp::PoolAllocator::alloc_slot: no unpinned size-class slot can fit %zu B "
+                       "(class=%zu, allocated_slots=%d, budget=%zu B, high_water=%zu B)\n",
+                       requested_size, requested_class, n_slots_, arena_size_, high_water_);
+        return -1;
+    }
+
+    if (on_evict_) {
+        on_evict_(lru);
+    }
+    last_used_[lru] = ++tick_;
+    hit_count_[lru] = 0;
+    decay_after_eviction_();
+    return lru;
+}
+
+size_t PoolAllocator::size_class_for_(size_t requested_size) const {
+    if (requested_size == 0) {
+        return 0;
+    }
+    size_t out = align_up(requested_size, slot_alignment_);
+    if (out == 0) {
+        return 0;
+    }
+    if (out > slot_size_ && requested_size <= slot_size_) {
+        out = slot_size_;
+    }
+    return out;
+}
+
+int PoolAllocator::take_free_size_class_slot_(size_t requested_class) {
+    size_t best_class = 0;
+    int    best_slot  = -1;
+
+    for (const auto & kv : free_by_class_) {
+        const size_t cls = kv.first;
+        if (cls < requested_class) {
+            continue;
+        }
+        if (best_class != 0 && cls >= best_class) {
+            continue;
+        }
+        for (int slot : kv.second) {
+            if (slot < 0 || slot >= n_slots_) {
+                continue;
+            }
+            if (used_[slot] || pin_count_[slot] > 0 || slot_class_[slot] != cls) {
+                continue;
+            }
+            best_class = cls;
+            best_slot  = slot;
+            break;
+        }
+    }
+
+    if (best_slot < 0) {
+        return -1;
+    }
+
+    auto & slots = free_by_class_[best_class];
+    for (auto it = slots.begin(); it != slots.end(); ++it) {
+        if (*it == best_slot) {
+            slots.erase(it);
+            break;
+        }
+    }
+    return best_slot;
+}
+
+int PoolAllocator::pick_size_class_victim_(size_t requested_class,
+                                           int & n_pinned_skipped,
+                                           int & n_hot_skipped) const {
+    n_pinned_skipped = 0;
+    n_hot_skipped    = 0;
+
+    std::vector<size_t> classes;
+    classes.reserve(slot_class_.size());
+    for (int i = 0; i < n_slots_; ++i) {
+        if (!used_[i] || slot_class_[i] < requested_class) {
+            continue;
+        }
+        if (std::find(classes.begin(), classes.end(), slot_class_[i]) == classes.end()) {
+            classes.push_back(slot_class_[i]);
+        }
+    }
+    std::sort(classes.begin(), classes.end());
+
+    const bool hot_enabled = (hot_hit_threshold_ > 0);
+    for (size_t cls : classes) {
+        int      lru   = -1;
+        uint64_t lru_t = std::numeric_limits<uint64_t>::max();
+        int      class_pinned_skips = 0;
+        int      class_hot_skips    = 0;
+
+        if (hot_enabled) {
+            for (int i = 0; i < n_slots_; ++i) {
+                if (!used_[i] || slot_class_[i] != cls) {
+                    continue;
+                }
+                if (pin_count_[i] > 0) {
+                    ++class_pinned_skips;
+                    continue;
+                }
+                if (hit_count_[i] > hot_hit_threshold_) {
+                    ++class_hot_skips;
+                    continue;
+                }
+                if (last_used_[i] < lru_t) {
+                    lru_t = last_used_[i];
+                    lru   = i;
+                }
+            }
+            if (lru >= 0) {
+                n_pinned_skipped = class_pinned_skips;
+                n_hot_skipped    = class_hot_skips;
+                return lru;
+            }
+        }
+
+        class_pinned_skips = 0;
+        lru_t = std::numeric_limits<uint64_t>::max();
+        for (int i = 0; i < n_slots_; ++i) {
+            if (!used_[i] || slot_class_[i] != cls) {
+                continue;
+            }
+            if (pin_count_[i] > 0) {
+                ++class_pinned_skips;
+                continue;
+            }
+            if (last_used_[i] < lru_t) {
+                lru_t = last_used_[i];
+                lru   = i;
+            }
+        }
+        if (lru >= 0) {
+            n_pinned_skipped = class_pinned_skips;
+            n_hot_skipped    = class_hot_skips;
+            return lru;
+        }
+    }
+
+    return -1;
+}
+
+void PoolAllocator::decay_after_eviction_() {
     ++n_evictions_since_decay_;
     if (n_evictions_since_decay_ >= kDecayEvery) {
         for (int i = 0; i < n_slots_; ++i) {
@@ -301,7 +540,6 @@ int PoolAllocator::alloc_slot() {
         n_evictions_since_decay_ = 0;
         ++n_decays_;
     }
-    return lru;
 }
 
 void PoolAllocator::mark_used(int slot_idx) {
@@ -368,16 +606,45 @@ int PoolAllocator::n_pinned() const {
 
 void PoolAllocator::release_slot(int slot_idx) {
     if (slot_idx < 0 || slot_idx >= n_slots_) return;
+    if (size_class_slots_) {
+        if (!used_[slot_idx]) return;
+        used_[slot_idx] = false;
+        free_by_class_[slot_class_[slot_idx]].push_back(slot_idx);
+        return;
+    }
     used_[slot_idx] = false;
 }
 
 void * PoolAllocator::slot_ptr(int slot_idx) const {
     if (slot_idx < 0 || slot_idx >= n_slots_ || base_ == nullptr) return nullptr;
+    if (size_class_slots_) {
+        return (uint8_t *) base_ + slot_offset_[slot_idx];
+    }
     return (uint8_t *) base_ + (size_t) slot_idx * slot_size_;
+}
+
+size_t PoolAllocator::slot_size(int slot_idx) const {
+    if (slot_idx < 0 || slot_idx >= n_slots_) return 0;
+    if (size_class_slots_) {
+        return slot_bytes_[slot_idx];
+    }
+    return slot_size_;
 }
 
 int PoolAllocator::lru_slot() const {
     if (n_slots_ == 0) return -1;
+    if (size_class_slots_) {
+        int      lru   = -1;
+        uint64_t lru_t = std::numeric_limits<uint64_t>::max();
+        for (int i = 0; i < n_slots_; ++i) {
+            if (!used_[i]) continue;
+            if (last_used_[i] < lru_t) {
+                lru_t = last_used_[i];
+                lru   = i;
+            }
+        }
+        return lru;
+    }
     int      lru   = 0;
     uint64_t lru_t = last_used_[0];
     for (int i = 1; i < n_slots_; ++i) {

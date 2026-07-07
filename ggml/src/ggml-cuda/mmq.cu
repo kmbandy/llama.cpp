@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <atomic>
 #include <cstdlib>
 #include <vector>
 
@@ -20,6 +21,9 @@ namespace {
 // MUL_MAT (no MoE) op uses the default nullptr (legacy path,
 // bit-identical to pre-MAD-88).
 thread_local const void * const * tls_routed_expert_ptrs = nullptr;
+std::atomic<uint64_t> g_routed_expert_ptrs_set{0};
+std::atomic<uint64_t> g_routed_expert_ptrs_consumed{0};
+std::atomic<uint64_t> g_routed_expert_ptrs_discarded_unconsumed{0};
 
 // MAD-230 follow-up: GGML's CUDA streams are created with
 // cudaStreamNonBlocking (common.cuh:1439), so they do NOT implicitly
@@ -36,11 +40,20 @@ thread_local void * tls_wp_compute_stream = nullptr;
 }  // namespace
 
 void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr) {
+    if (tls_routed_expert_ptrs != nullptr) {
+        g_routed_expert_ptrs_discarded_unconsumed.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (ptr != nullptr) {
+        g_routed_expert_ptrs_set.fetch_add(1, std::memory_order_relaxed);
+    }
     tls_routed_expert_ptrs = ptr;
 }
 
 const void * const * ggml_cuda_take_routed_expert_ptrs() {
     const void * const * p = tls_routed_expert_ptrs;
+    if (p != nullptr) {
+        g_routed_expert_ptrs_consumed.fetch_add(1, std::memory_order_relaxed);
+    }
     tls_routed_expert_ptrs = nullptr;
     return p;
 }
@@ -50,6 +63,54 @@ bool ggml_cuda_has_routed_expert_ptrs() {
     // whether to bypass kernel paths (mmvq, mmvf, mmf) that don't support
     // routing-aware paging and force the MMQ path which does.
     return tls_routed_expert_ptrs != nullptr;
+}
+
+void ggml_cuda_discard_routed_expert_ptrs() {
+    if (tls_routed_expert_ptrs != nullptr) {
+        g_routed_expert_ptrs_discarded_unconsumed.fetch_add(1, std::memory_order_relaxed);
+    }
+    tls_routed_expert_ptrs = nullptr;
+}
+
+void ggml_cuda_get_routed_expert_ptrs_stats(uint64_t * set, uint64_t * consumed, uint64_t * discarded_unconsumed) {
+    if (set != nullptr) {
+        *set = g_routed_expert_ptrs_set.load(std::memory_order_relaxed);
+    }
+    if (consumed != nullptr) {
+        *consumed = g_routed_expert_ptrs_consumed.load(std::memory_order_relaxed);
+    }
+    if (discarded_unconsumed != nullptr) {
+        *discarded_unconsumed = g_routed_expert_ptrs_discarded_unconsumed.load(std::memory_order_relaxed);
+    }
+}
+
+static bool ggml_cuda_wp_routing_guard_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("WP_ROUTING_GUARD");
+        return env != nullptr && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void ggml_cuda_wp_routing_guard_check(
+        const char * path, const ggml_tensor * src0, const ggml_tensor * ids, const ggml_tensor * dst,
+        const void * const * expert_ptrs) {
+    if (!ggml_cuda_wp_routing_guard_enabled()) {
+        return;
+    }
+    if (ids != nullptr && expert_ptrs != nullptr) {
+        return;
+    }
+
+    fprintf(stderr,
+            "WP_ROUTING_GUARD: %s routed op would read src0->data directly: src0=%s src0_data=%p ids=%p dst=%s expert_ptrs=%p\n",
+            path,
+            src0 != nullptr ? src0->name : "<null>",
+            src0 != nullptr ? src0->data : nullptr,
+            (const void *) ids,
+            dst != nullptr ? dst->name : "<null>",
+            (const void *) expert_ptrs);
+    GGML_ABORT("WP_ROUTING_GUARD routed expert pointer invariant failed");
 }
 
 void ggml_cuda_set_wp_compute_stream(void * stream) {
@@ -163,7 +224,9 @@ void ggml_cuda_mul_mat_q(
     // expert_ptrs side channel instead. Writing past placeholder with size_data
     // bytes faults the GPU (near-null offset since placeholder may be 0-based
     // within the pool view).
-    if (!ggml_cuda_has_routed_expert_ptrs() &&
+    const bool routing_was_set = ggml_cuda_has_routed_expert_ptrs();
+
+    if (!routing_was_set &&
         ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
@@ -172,7 +235,7 @@ void ggml_cuda_mul_mat_q(
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
-    } else if (ggml_cuda_has_routed_expert_ptrs()) {
+    } else if (routing_was_set) {
         static int s_dump = 0;
         if (s_dump < 4) {
             fprintf(stderr, "[mmq DIAG] routing active: src0=%s data=%p buf=%p nbytes=%zu\n",
@@ -200,6 +263,9 @@ void ggml_cuda_mul_mat_q(
     // eval callback. take_*() clears the TLS, so this op consumes it
     // exactly once. nullptr (default) is the legacy bit-identical path.
     const void * const * routed_expert_ptrs = ggml_cuda_take_routed_expert_ptrs();
+    if (routing_was_set) {
+        ggml_cuda_wp_routing_guard_check("MMQ", src0, ids, dst, routed_expert_ptrs);
+    }
 
     // Validation harness for MAD-88 Phase 2 (kernel hook correctness).
     // When WP_MMQ_VALIDATE_EXPERT_PTRS=1 is set in the environment, build

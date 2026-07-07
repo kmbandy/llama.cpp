@@ -8,6 +8,7 @@
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
+#include "../src/weight-pager/wp-pager.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -5115,17 +5116,41 @@ void server_routes::init_routes() {
         }
 
         // Add weight pager metrics if enabled
-        if (ctx_server.model_tgt && ctx_server.model_tgt->weight_pager) {
-            auto * pager = ctx_server.model_tgt->weight_pager.get();
-            { json m; m["name"] = "llama_weight_pager_pages_total"; m["help"] = "Total number of weight pages tracked"; m["value"] = (double)pager->pages.size(); all_metrics_def["gauge"].push_back(m); }
-            { json m; m["name"] = "llama_weight_pager_loaded_pages"; m["help"] = "Number of pages currently loaded in VRAM";
-              size_t loaded = 0;
-              for (const auto & page : pager->pages) { if (page.slot_idx >= 0) loaded++; }
-              m["value"] = (double)loaded; all_metrics_def["gauge"].push_back(m); }
-#ifdef LLAMA_HAVE_IO_URING
-            { json m; m["name"] = "llama_weight_pager_in_flight_prefetches"; m["help"] = "Number of in-flight prefetch requests"; m["value"] = (double)pager->in_flight.size(); all_metrics_def["gauge"].push_back(m); }
-            { json m; m["name"] = "llama_weight_pager_async_prefetch_enabled"; m["help"] = "Async prefetch enabled (1=true, 0=false)"; m["value"] = pager->async_prefetch ? 1.0 : 0.0; all_metrics_def["gauge"].push_back(m); }
-#endif
+        if (ctx_server.model_tgt && ctx_server.model_tgt->wp_pager) {
+            auto * pager = ctx_server.model_tgt->wp_pager.get();
+            const auto & st = pager->stats();
+            const double io_gb = (double) st.io_bytes / 1000000000.0;
+            const double io_gbps = st.io_seconds > 0.0 ? io_gb / st.io_seconds : 0.0;
+            auto add_wp_gauge = [&](const char * name, const char * help, double value) {
+                json m;
+                m["name"]  = name;
+                m["help"]  = help;
+                m["value"] = value;
+                all_metrics_def["gauge"].push_back(m);
+            };
+
+            add_wp_gauge("llama_weight_pager_pages_total", "Total number of weight pages tracked", (double) pager->n_pages());
+            add_wp_gauge("llama_weight_pager_loaded_pages", "Number of pages currently loaded in VRAM", (double) pager->loaded_pages());
+            add_wp_gauge("llama_weight_pager_in_flight_prefetches", "Number of in-flight prefetch requests", (double) pager->pending_prefetches());
+            add_wp_gauge("llama_weight_pager_async_prefetch_enabled", "Async prefetch enabled (1=true, 0=false)", pager->async_prefetch_enabled() ? 1.0 : 0.0);
+            add_wp_gauge("llama_weight_pager_page_ins_total", "Total weight pages read into VRAM", (double) st.page_ins);
+            add_wp_gauge("llama_weight_pager_evictions_total", "Total weight pager pool evictions", (double) st.evictions);
+            add_wp_gauge("llama_weight_pager_prefetch_hits_total", "Total ensure calls where prefetch was already complete", (double) st.prefetch_hits);
+            add_wp_gauge("llama_weight_pager_prefetch_misses_total", "Total ensure calls where prefetch was missing or incomplete", (double) st.prefetch_misses);
+            add_wp_gauge("llama_weight_pager_sync_fallbacks_total", "Total ensure calls that used synchronous page-in fallback", (double) st.sync_fallbacks);
+            add_wp_gauge("llama_weight_pager_io_bytes_total", "Total weight pager bytes read", (double) st.io_bytes);
+            add_wp_gauge("llama_weight_pager_io_seconds_total", "Total measured weight pager IO seconds", st.io_seconds);
+            add_wp_gauge("llama_weight_pager_io_effective_gb_s", "Effective weight pager read bandwidth in GB/s", io_gbps);
+            add_wp_gauge("llama_weight_pager_lru_walk_hot_skips_total", "Total LRU walk skips of hot slots", (double) st.lru_walk_hot_skips);
+            add_wp_gauge("llama_weight_pager_lru_walk_pinned_skips_total", "Total LRU walk skips of pinned slots", (double) st.lru_walk_pinned_skips);
+            if (st.dense_prefetch_submitted > 0) {
+                add_wp_gauge("llama_weight_pager_dense_prefetch_submitted_total", "Total successful dense forward-prefetch submissions", (double) st.dense_prefetch_submitted);
+            }
+            add_wp_gauge("llama_weight_pager_cross_layer_prefetch_submitted_total", "Total successful cross-layer prefetch submissions", (double) st.cross_layer_prefetch_submitted);
+            add_wp_gauge("llama_weight_pager_cross_layer_hit_in_ensure_total", "Total ensure-time hits from cross-layer prefetch candidates", (double) st.cross_layer_hit_in_ensure);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_set_total", "Total routed expert pointer arrays armed", (double) st.routing_ptrs_set);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_consumed_total", "Total routed expert pointer arrays consumed by MMQ/MMVQ", (double) st.routing_ptrs_consumed);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_discarded_unconsumed_total", "Total routed expert pointer arrays discarded before MMQ/MMVQ consumed them", (double) st.routing_ptrs_discarded_unconsumed);
         }
 
         std::stringstream prometheus;

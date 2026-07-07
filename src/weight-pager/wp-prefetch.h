@@ -49,7 +49,8 @@ public:
     // queue_depth pinned host staging buffers of max_page_size each.
     // Returns false on allocation failure or invalid args.
     bool init(FileIOLayer * file_io, GpuTransport * gpu,
-              size_t max_page_size, int queue_depth);
+              size_t max_page_size, int queue_depth,
+              bool async_stage2 = false);
 
     // Drain in-flight requests, free pinned buffers. Safe to call multiple
     // times. Called automatically by the destructor.
@@ -102,6 +103,11 @@ public:
     // reap()ed it returns false.)
     bool is_loaded(int page_idx) const;
 
+    // If stage 2 is already running, detach and return its GPU completion
+    // event. The caller owns the event and must eventually release it via
+    // GpuTransport. Returns -1 if the page has no stage-2 event yet.
+    int take_stage2_event(int page_idx);
+
     // Release all internal state for `page_idx`. After this, queries for
     // page_idx return false. Called by the WeightPager once the page has
     // been successfully consumed (i.e., the eval callback redirected
@@ -135,6 +141,7 @@ private:
         size_t   slot_size       = 0;
         void *   dst_vram        = nullptr;
         int      gpu_event       = -1;
+        bool     direct_to_device = false;
     };
 
     int  alloc_slot_();
@@ -148,6 +155,7 @@ private:
     size_t         max_page_size_ = 0;
     int            queue_depth_   = 0;
     bool           initialized_   = false;
+    bool           async_stage2_  = false;
 
     std::vector<Slot>   slots_;
     std::vector<void *> staging_;          // pinned host buffer per slot

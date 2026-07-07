@@ -10,18 +10,30 @@
 // libggml-hip.so and we link against it. Avoids dragging the full
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
 extern "C++" void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
-extern "C++" const void * const *  ggml_cuda_take_routed_expert_ptrs();
+extern "C++" void                  ggml_cuda_discard_routed_expert_ptrs();
 extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 #endif
 
+#include <chrono>        // WP_PROFILE_EVAL host-time instrumentation
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>       // getenv
 #include <cstring>
 #include <limits>        // numeric_limits — MAD-232 advise sentinel
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace wp {
+
+bool wp_paged_batch_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_PAGED_BATCH");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
 
 namespace {
 // Diagnostic counters. Logged only when WP_EVAL_DEBUG=1 is set in the
@@ -39,15 +51,276 @@ struct DebugState {
     int  ops_no_paged_with_weight_src = 0;  // ops where eval_cb saw a src whose name has "weight" but find_page missed
 };
 DebugState g_debug;
+
+bool eval_debug_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_EVAL_DEBUG");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+// WP_PROFILE_EVAL=1 (default off): accumulate host-side wall time spent inside
+// weight_pager_eval_cb. Total measures the per-op callback tax injected into
+// the decode critical path; the ensure-phase split isolates the Step-2
+// ensure/pin/patch loop from page-resolution+other. Printed at teardown.
+bool wp_profile_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_PROFILE_EVAL");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool wp_batch_eval_cb_enabled() {
+    // Default ON. The batching is dense-only (batch_safe() requires
+    // !catalog_.has_experts()) and self-gates on full residency + size-class,
+    // so it only ever engages on a fully-resident dense model under
+    // --weight-paging where it matches native decode speed and numerics.
+    // Set WP_BATCH_EVAL_CB=0 to force the legacy per-op-sync path.
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_BATCH_EVAL_CB");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t s_prof_total_ns  = 0;  // total host time inside eval_cb (all paths past null-check)
+std::uint64_t s_prof_pre_ns    = 0;  // entry -> Step 1 (discard + async drain + MUL_MAT_ID handling)
+std::uint64_t s_prof_resolve_ns= 0;  // Step 1: src -> page name resolution (find_page loop)
+std::uint64_t s_prof_ensure_ns = 0;  // of that, time in the Step-2 ensure/patch loop
+std::uint64_t s_prof_calls     = 0;  // eval_cb invocations timed
+std::uint64_t s_prof_ops_pages = 0;  // invocations that had >= 1 paged src
+std::uint64_t s_prof_ensures   = 0;  // total ensure() calls (pages touched)
+
+inline std::uint64_t wp_now_ns() {
+    return (std::uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// RAII: accumulates elapsed host time into s_prof_total_ns on scope exit,
+// so every return path of eval_cb past construction is counted once.
+struct ProfGuard {
+    bool          on;
+    std::uint64_t t0;
+    ~ProfGuard() {
+        if (on) {
+            s_prof_total_ns += wp_now_ns() - t0;
+            ++s_prof_calls;
+        }
+    }
+};
+
+#if defined(GGML_USE_HIP)
+struct AsyncTransferEvent {
+    int page_idx = -1;
+    int event_handle = -1;
+};
+
+struct PendingAsyncOp {
+    WeightPager *     pager = nullptr;
+    std::vector<int> pages;
+    std::vector<AsyncTransferEvent> transfer_events;
+    hipEvent_t       done = nullptr;
+};
+
+std::vector<int>            s_pinned_pages_prev_op;
+std::vector<AsyncTransferEvent> s_async_events_prev_op;
+std::vector<PendingAsyncOp> s_pending_async_ops;
+WeightPager *               s_prev_op_pager = nullptr;
+
+// WP_PAGED_BATCH per-range pin lifecycle. Under paged-batch the callback does
+// NOT unpin per-op; pins accumulate in s_range_pins across the current batch
+// range, move to s_range_pins_pending when the range ends (eval_cb_op_return
+// returns true), and are released at the top of the next callback — which the
+// scheduler guarantees runs only after that range's compute+sync.
+std::vector<int>            s_range_pins;
+std::vector<int>            s_range_pins_pending;
+// Bytes pinned in the current batch range — drives the reactive auto-break so a
+// range never tries to pin more than fits in the pool (essential once evictions
+// occur; a dense stretch has no routing boundary to bound it otherwise).
+size_t                      s_range_pinned_bytes = 0;
+
+void release_async_op(PendingAsyncOp & op) {
+    WeightPager * owner = op.pager;
+    for (int page_idx : op.pages) {
+        if (owner != nullptr) {
+            owner->unpin_page(page_idx);
+        }
+    }
+    for (const AsyncTransferEvent & evt : op.transfer_events) {
+        if (owner != nullptr) {
+            owner->finish_async_transfer_event(evt.page_idx, evt.event_handle);
+        }
+    }
+    if (op.done != nullptr) {
+        (void) hipEventDestroy(op.done);
+        op.done = nullptr;
+    }
+}
+#else
+std::vector<int> s_pinned_pages_prev_op;
+std::vector<int> s_range_pins;
+std::vector<int> s_range_pins_pending;
+size_t           s_range_pinned_bytes = 0;
+#endif
 }  // namespace
+
+void weight_pager_eval_cb_reset(WeightPager * pager) {
+#if defined(GGML_USE_HIP)
+    // WP_PAGED_BATCH: release any range pins still held at teardown (a range that
+    // ended at a split boundary with no following callback, or reset mid-range).
+    // Independent of async ensure, so do it before the async early-return.
+    if (pager != nullptr && (!s_range_pins.empty() || !s_range_pins_pending.empty())) {
+        for (int p : s_range_pins_pending) { pager->unpin_page(p); }
+        for (int p : s_range_pins)         { pager->unpin_page(p); }
+        s_range_pins.clear();
+        s_range_pins_pending.clear();
+    }
+    s_range_pinned_bytes = 0;
+    if (pager == nullptr || !pager->async_ensure_enabled()) {
+        return;
+    }
+
+    for (size_t i = 0; i < s_pending_async_ops.size();) {
+        PendingAsyncOp & op = s_pending_async_ops[i];
+        if (op.pager != pager) {
+            ++i;
+            continue;
+        }
+
+        if (op.done != nullptr) {
+            hipError_t st = hipEventSynchronize(op.done);
+            if (st != hipSuccess) {
+                LLAMA_LOG_WARN("[wp::eval_cb] async pin completion drain failed: %s\n",
+                               hipGetErrorString(st));
+            }
+        } else {
+            (void) hipDeviceSynchronize();
+        }
+        release_async_op(op);
+        s_pending_async_ops.erase(s_pending_async_ops.begin() + (std::ptrdiff_t) i);
+    }
+
+    if (s_prev_op_pager == pager &&
+        (!s_pinned_pages_prev_op.empty() || !s_async_events_prev_op.empty())) {
+        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+        if (wp_stream != nullptr) {
+            hipError_t st = hipStreamSynchronize(wp_stream);
+            if (st != hipSuccess) {
+                LLAMA_LOG_WARN("[wp::eval_cb] previous-op drain stream sync failed: %s\n",
+                               hipGetErrorString(st));
+            }
+        } else {
+            (void) hipDeviceSynchronize();
+        }
+
+        for (int page_idx : s_pinned_pages_prev_op) {
+            pager->unpin_page(page_idx);
+        }
+        for (const AsyncTransferEvent & evt : s_async_events_prev_op) {
+            pager->finish_async_transfer_event(evt.page_idx, evt.event_handle);
+        }
+        s_pinned_pages_prev_op.clear();
+        s_async_events_prev_op.clear();
+        s_prev_op_pager = nullptr;
+    }
+#else
+    (void) pager;
+#endif
+}
+
+void weight_pager_eval_cb_print_profile() {
+    if (!wp_profile_enabled()) return;
+    const double total_ms   = (double) s_prof_total_ns   / 1e6;
+    const double pre_ms     = (double) s_prof_pre_ns     / 1e6;   // entry -> Step 1
+    const double resolve_ms = (double) s_prof_resolve_ns / 1e6;   // Step 1 find_page loop
+    const double ensure_ms  = (double) s_prof_ensure_ns  / 1e6;   // Step 2 ensure/patch
+    const double other_ms   = total_ms - pre_ms - resolve_ms - ensure_ms;  // patch/tail + unaccounted
+    LLAMA_LOG_WARN(
+        "wp::eval_cb profile (WP_PROFILE_EVAL) — host-side callback time:\n"
+        "  eval_cb_calls: %lu\n"
+        "  ops_with_pages: %lu\n"
+        "  ensure_calls (pages touched): %lu\n"
+        "  eval_cb_host_total_ms: %.2f\n"
+        "  pre_step1_ms (discard+async+mmid): %.2f\n"
+        "  step1_resolve_ms (find_page loop): %.2f\n"
+        "  ensure_phase_ms: %.2f\n"
+        "  other_ms (patch+tail): %.2f\n"
+        "  avg_us_per_eval_cb_call: %.3f\n"
+        "  avg_us_pre_step1: %.3f\n"
+        "  avg_us_step1_resolve: %.3f\n",
+        (unsigned long) s_prof_calls,
+        (unsigned long) s_prof_ops_pages,
+        (unsigned long) s_prof_ensures,
+        total_ms, pre_ms, resolve_ms, ensure_ms, other_ms,
+        s_prof_calls ? ((double) s_prof_total_ns   / 1000.0) / (double) s_prof_calls : 0.0,
+        s_prof_calls ? ((double) s_prof_pre_ns     / 1000.0) / (double) s_prof_calls : 0.0,
+        s_prof_calls ? ((double) s_prof_resolve_ns / 1000.0) / (double) s_prof_calls : 0.0);
+}
 
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // Only act on the pre-execution call. The post-execution call is
     // informational and would re-trigger the same lookups.
-    if (!ask)             return true;
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
+    const bool batch_eval_cb = wp_batch_eval_cb_enabled();
+    const bool paged_batch   = batch_eval_cb && wp_paged_batch_enabled();
+    // WP_PAGED_BATCH: release the previous range's pins now. The top of this
+    // callback is guaranteed to run after that range's compute+sync (the
+    // scheduler computes+syncs a range before it issues the next ask=true, and
+    // before the ask=false on the range's last node).
+    if (paged_batch && !s_range_pins_pending.empty()) {
+        for (int p : s_range_pins_pending) { pager->unpin_page(p); }
+        s_range_pins_pending.clear();
+    }
+    if (!ask)             return true;
+    const bool eval_debug = eval_debug_enabled();
+    const uint64_t sync_fallbacks_before =
+        batch_eval_cb ? pager->sync_fallback_count() : 0;
+    bool routing_tls_set = false;
+    auto eval_cb_op_return = [&]() -> bool {
+        bool end_range;
+        // WP_PAGED_BATCH: break the batch range at every routing boundary
+        // (each MUL_MAT_ID and its ids-producer). Ending the range here forces
+        // the scheduler's compute+sync, so the router's ids are materialized
+        // before the next range reads them, and the routing op runs isolated
+        // (fixes the read-before-produce H3 + TLS take-steal H4 faults).
+        if (paged_batch && pager->is_routing_break(t)) {
+            end_range = true;
+        } else if (batch_eval_cb &&
+                   pager->batch_safe() &&
+                   !routing_tls_set &&
+                   pager->sync_fallback_count() == sync_fallbacks_before) {
+            end_range = false;
+        } else {
+            end_range = true;
+        }
+        // 5b reactive auto-break: bound the range's pinned working set so it fits
+        // the pool. Without this, a dense stretch (no routing boundary) grows until
+        // a pin can't be satisfied under eviction -> alloc_slot -1 -> page-in fault.
+        // Break at 70% of the arena, leaving headroom for the next range's pins.
+        if (paged_batch && !end_range &&
+            s_range_pinned_bytes >= (pager->pool_arena_bytes() / 10) * 7) {
+            end_range = true;
+        }
+        if (paged_batch && end_range) {
+            // Range ends after this op: hand its accumulated pins to the pending
+            // set, released at the top of the next callback (post-sync).
+            for (int p : s_range_pins) { s_range_pins_pending.push_back(p); }
+            s_range_pins.clear();
+            s_range_pinned_bytes = 0;
+        }
+        return end_range;
+    };
+
+    // WP_PROFILE_EVAL: time the whole callback body (every return path past
+    // here is counted once via the RAII guard). Zero cost when disabled.
+    // prof_t0 is captured once and reused by the pre-Step1 / resolve sub-timers.
+    const bool          wp_profile = wp_profile_enabled();
+    const std::uint64_t prof_t0    = wp_profile ? wp_now_ns() : 0;
+    ProfGuard           prof_guard{wp_profile, prof_t0};
 
 #if defined(GGML_USE_HIP)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
@@ -62,26 +335,114 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // ggml_cuda_has_routed_expert_ptrs() (or any path that calls
     // take_) gets a pointer to expert_ptrs that have nothing to do
     // with the current op, leading to near-null GPU faults during
-    // decode. Defensively consume here so the slate is clean before
+    // decode. Defensively discard here so the slate is clean before
     // we (maybe) set it again for this op.
-    ggml_cuda_take_routed_expert_ptrs();
+    ggml_cuda_discard_routed_expert_ptrs();
 #endif
 
-    // MAD-231: drain pins from the PREVIOUS op's pages now that the GPU
-    // has had a full eval-cb-cycle of latency to finish reading them.
-    // Conservative: this window is a superset of the actual GPU read
-    // (the previous op was dispatched on the compute stream and any
-    // subsequent prefetch H2D is enqueued on the same stream → ordered),
-    // but the pin set is small (handful of pages per op) so the over-
-    // protection is free.
-    //
-    // Single-threaded: ggml's scheduler dispatches eval_cb on one thread,
-    // so no synchronization is needed for s_pinned_pages_prev_op.
-    static std::vector<int> s_pinned_pages_prev_op;
-    for (int prev_page : s_pinned_pages_prev_op) {
-        pager->unpin_page(prev_page);
+#if defined(GGML_USE_HIP)
+    if (pager->async_ensure_enabled()) {
+        for (size_t i = 0; i < s_pending_async_ops.size();) {
+            hipError_t st = hipEventQuery(s_pending_async_ops[i].done);
+            if (st == hipSuccess) {
+                release_async_op(s_pending_async_ops[i]);
+                s_pending_async_ops.erase(s_pending_async_ops.begin() + (std::ptrdiff_t) i);
+                continue;
+            }
+            if (st != hipErrorNotReady) {
+                LLAMA_LOG_WARN("[wp::eval_cb] async pin completion query failed: %s\n",
+                               hipGetErrorString(st));
+                release_async_op(s_pending_async_ops[i]);
+                s_pending_async_ops.erase(s_pending_async_ops.begin() + (std::ptrdiff_t) i);
+                continue;
+            }
+            ++i;
+        }
+
+        if (!s_pinned_pages_prev_op.empty() || !s_async_events_prev_op.empty()) {
+            hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+            if (wp_stream != nullptr) {
+                PendingAsyncOp op;
+                op.pager = s_prev_op_pager != nullptr ? s_prev_op_pager : pager;
+                op.pages = std::move(s_pinned_pages_prev_op);
+                op.transfer_events = std::move(s_async_events_prev_op);
+                s_pinned_pages_prev_op.clear();
+                s_async_events_prev_op.clear();
+                s_prev_op_pager = nullptr;
+
+                hipError_t err = hipEventCreateWithFlags(&op.done, hipEventDisableTiming);
+                if (err == hipSuccess) {
+                    err = hipEventRecord(op.done, wp_stream);
+                }
+                if (err == hipSuccess) {
+                    s_pending_async_ops.push_back(std::move(op));
+                } else {
+                    LLAMA_LOG_WARN("[wp::eval_cb] async pin completion record failed: %s\n",
+                                   hipGetErrorString(err));
+                    hipStreamSynchronize(wp_stream);
+                    release_async_op(op);
+                }
+            } else {
+                hipDeviceSynchronize();
+                WeightPager * owner = s_prev_op_pager != nullptr ? s_prev_op_pager : pager;
+                for (int prev_page : s_pinned_pages_prev_op) {
+                    owner->unpin_page(prev_page);
+                }
+                for (const AsyncTransferEvent & evt : s_async_events_prev_op) {
+                    owner->finish_async_transfer_event(evt.page_idx, evt.event_handle);
+                }
+                s_pinned_pages_prev_op.clear();
+                s_async_events_prev_op.clear();
+                s_prev_op_pager = nullptr;
+            }
+        }
+    } else
+#endif
+    {
+        // MAD-231: drain pins from the PREVIOUS op's pages now that the GPU
+        // has had a full eval-cb-cycle of latency to finish reading them.
+        for (int prev_page : s_pinned_pages_prev_op) {
+            pager->unpin_page(prev_page);
+        }
+        s_pinned_pages_prev_op.clear();
+#if defined(GGML_USE_HIP)
+        s_prev_op_pager = nullptr;
+#endif
     }
-    s_pinned_pages_prev_op.clear();
+
+#if defined(GGML_USE_HIP)
+    auto enqueue_async_wait_for_page = [pager](int page_idx,
+                                               std::vector<AsyncTransferEvent> & prev_events) {
+        if (!pager->async_ensure_enabled()) return;
+        const int evt = pager->take_async_transfer_event(page_idx);
+        if (evt < 0) return;
+
+        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+        if (wp_stream != nullptr && pager->enqueue_async_transfer_wait(evt, wp_stream)) {
+            prev_events.push_back(AsyncTransferEvent{page_idx, evt});
+            return;
+        }
+
+        if (!pager->synchronize_async_transfer_event(evt)) {
+            LLAMA_LOG_WARN("[wp::eval_cb] async transfer event synchronize failed for page %d\n",
+                           page_idx);
+        }
+        pager->finish_async_transfer_event(page_idx, evt);
+    };
+#endif
+
+    std::vector<int> graph_pin_page_indices;
+    auto capture_ptr_for_page = [pager, t, &graph_pin_page_indices](int page_idx, void * current) -> void * {
+        if (!pager->hip_graphs_enabled()) {
+            return current;
+        }
+        if (!pager->try_add_graph_pin_page((const void *) t, page_idx, graph_pin_page_indices)) {
+            return current;
+        }
+        const int slot = pager->slot_for_page(page_idx);
+        void * base = pager->slot_base_for_capture(slot);
+        return base != nullptr ? base : current;
+    };
 
     // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
     // source is a consolidated MoE parent. This is the entry point for
@@ -288,16 +649,24 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         const int sub_page_idx = weight_page + 1 + e;
                                         void * slot = pager->ensure(sub_page_idx);
                                         if (slot != nullptr) {
+                                            slot = capture_ptr_for_page(sub_page_idx, slot);
                                             host_ptrs[(size_t) e] = slot;
                                             if (first_active_slot == nullptr) {
                                                 first_active_slot = slot;
                                             }
                                             ++n_ensures;
+#if defined(GGML_USE_HIP)
+                                            enqueue_async_wait_for_page(sub_page_idx, s_async_events_prev_op);
+#endif
                                             // MAD-231: pin the slot so a later prefetch
                                             // alloc_slot in this same eval_cb can't evict
                                             // it. Unpinned in the NEXT eval_cb (above).
                                             pager->pin_page(sub_page_idx);
-                                            s_pinned_pages_prev_op.push_back(sub_page_idx);
+                                            (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(sub_page_idx);
+                                            if (paged_batch) { s_range_pinned_bytes += pager->page_meta(sub_page_idx).size; }
+#if defined(GGML_USE_HIP)
+                                            s_prev_op_pager = pager;
+#endif
                                         }
                                     }
                                     // Safety: fill INACTIVE expert slots with a non-null
@@ -349,6 +718,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                   hipMemcpyHostToDevice);
                                     }
                                     ggml_cuda_set_routed_expert_ptrs(s_dev_expert_ptrs);
+                                    routing_tls_set = true;
 
                                     if (g_debug.mmid_consolidated <= 4) {
                                         LLAMA_LOG_INFO("[wp::eval_cb] routed: %d/%zu unique active experts ensured\n",
@@ -468,6 +838,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 }
                                             }
                                             if (!future_pages.empty()) {
+                                                pager->mark_cross_layer_prefetch_candidates(future_pages);
                                                 const bool batch_ok = pager->prefetch_pages_batch(future_pages);
                                                 if (!batch_ok) {
                                                     // Per-page fallback (best-effort, ignores
@@ -497,6 +868,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
+    // WP_PROFILE_EVAL: mark the entry -> Step-1 boundary (discard + async drain
+    // + MUL_MAT_ID routing handling all live above this point).
+    const std::uint64_t prof_tA = wp_profile ? wp_now_ns() : 0;
+    if (wp_profile) s_prof_pre_ns += prof_tA - prof_t0;
+
     // Step 1: walk t->src[] and collect distinct paged-weight page indices.
     // A source counts as paged if either its own name or its view_src's
     // name is in the catalog. View tensors fall in the second category;
@@ -512,7 +888,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // If a view of a paged consolidated parent reaches this op without
     // being patched, its data lives at 0x1 + view_offs → near-null fault
     // on kernel read. Log it BEFORE the standard skip path so we see it.
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+    // Gated behind WP_EVAL_DEBUG: this walked every src of every op on the
+    // decode critical path unconditionally, adding host overhead per token
+    // for a fault-hunt probe that only matters when actively debugging.
+    if (eval_debug) for (int i = 0; i < GGML_MAX_SRC; ++i) {
         struct ggml_tensor * src = t->src[i];
         if (src == nullptr) break;
         const uintptr_t data_addr = (uintptr_t) src->data;
@@ -567,47 +946,57 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         }
     }
 
+    // WP_PROFILE_EVAL: Step-1 (find_page resolution over all srcs) ends here.
+    if (wp_profile) s_prof_resolve_ns += wp_now_ns() - prof_tA;
+
     ++g_debug.ops_seen;
     if (n_page_indices == 0) {
-        // Diagnostic: did any src LOOK LIKE a weight tensor that we should have found?
-        // Helps surface name-mismatch / catalog-miss bugs.
-        bool had_weight_looking_src = false;
-        for (int i = 0; i < GGML_MAX_SRC; ++i) {
-            struct ggml_tensor * s = t->src[i];
-            if (s == nullptr) break;
-            const char * nm = ggml_get_name(s);
-            if (nm && std::strstr(nm, "weight") != nullptr) {
-                had_weight_looking_src = true;
-                break;
-            }
+        if (pager->hip_graphs_enabled()) {
+            pager->update_graph_pins((const void *) t, graph_pin_page_indices);
         }
-        if (had_weight_looking_src) {
-            if (g_debug.ops_no_paged_with_weight_src < 16) {
-                std::string srcs;
-                for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (t->src[i] == nullptr) break;
-                    if (i > 0) srcs += ", ";
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf), "%s@%p(buf=%p)",
-                                  ggml_get_name(t->src[i]), t->src[i]->data,
-                                  (void*)t->src[i]->buffer);
-                    srcs += buf;
+        if (eval_debug) {
+            // Diagnostic: did any src look like a weight tensor that we should have found?
+            bool had_weight_looking_src = false;
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                struct ggml_tensor * s = t->src[i];
+                if (s == nullptr) break;
+                const char * nm = ggml_get_name(s);
+                if (nm && std::strstr(nm, "weight") != nullptr) {
+                    had_weight_looking_src = true;
+                    break;
                 }
-                LLAMA_LOG_WARN("[wp::eval_cb][MISS] op=%s name=\"%s\" srcs=[%s]\n",
-                               ggml_op_name(t->op), ggml_get_name(t), srcs.c_str());
             }
-            ++g_debug.ops_no_paged_with_weight_src;
+            if (had_weight_looking_src) {
+                if (g_debug.ops_no_paged_with_weight_src < 16) {
+                    std::string srcs;
+                    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                        if (t->src[i] == nullptr) break;
+                        if (i > 0) srcs += ", ";
+                        char buf[128];
+                        std::snprintf(buf, sizeof(buf), "%s@%p(buf=%p)",
+                                      ggml_get_name(t->src[i]), t->src[i]->data,
+                                      (void*)t->src[i]->buffer);
+                        srcs += buf;
+                    }
+                    LLAMA_LOG_WARN("[wp::eval_cb][MISS] op=%s name=\"%s\" srcs=[%s]\n",
+                                   ggml_op_name(t->op), ggml_get_name(t), srcs.c_str());
+                }
+                ++g_debug.ops_no_paged_with_weight_src;
+            }
+            if ((g_debug.ops_seen % 500) == 0) {
+                LLAMA_LOG_WARN("[wp::eval_cb][SUM] ops_seen=%d ops_with_pages=%d patches=%d miss_w=%d fails=%d\n",
+                               g_debug.ops_seen, g_debug.ops_with_pages,
+                               g_debug.patches_total, g_debug.ops_no_paged_with_weight_src,
+                               g_debug.ensures_failed);
+            }
         }
-        // Periodic summary so we know eval_cb is alive even when no patches happen
-        if ((g_debug.ops_seen % 500) == 0) {
-            LLAMA_LOG_WARN("[wp::eval_cb][SUM] ops_seen=%d ops_with_pages=%d patches=%d miss_w=%d fails=%d\n",
-                           g_debug.ops_seen, g_debug.ops_with_pages,
-                           g_debug.patches_total, g_debug.ops_no_paged_with_weight_src,
-                           g_debug.ensures_failed);
-        }
-        return true;
+        return eval_cb_op_return();
     }
     ++g_debug.ops_with_pages;
+    if (wp_profile) {
+        ++s_prof_ops_pages;
+        s_prof_ensures += (std::uint64_t) n_page_indices;
+    }
 
     // MAD-232: posix_fadvise(WILLNEED) for the next K layers' paged tensors.
     // Warms NVMe→page-cache while THIS layer's compute runs, so by the time
@@ -658,6 +1047,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     int  patches_this_op = 0;
     int  views_this_op   = 0;
 
+    const std::uint64_t ens_t0 = wp_profile ? wp_now_ns() : 0;
     for (int j = 0; j < n_page_indices; ++j) {
         const int    page_idx = page_indices[j];
         void       * vram     = pager->ensure(page_idx);
@@ -670,12 +1060,17 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             // keeps debugging signal local to the failing op.
             continue;
         }
+        vram = capture_ptr_for_page(page_idx, vram);
         // MAD-231: pin the slot so a subsequent prefetch alloc_slot in
         // tick() (or in a later op's pre-cb) cannot evict it while the
         // GPU is still reading from it. Unpinned at the top of the NEXT
         // eval_cb invocation.
         pager->pin_page(page_idx);
-        s_pinned_pages_prev_op.push_back(page_idx);
+        (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(page_idx);
+        if (paged_batch) { s_range_pinned_bytes += pager->page_meta(page_idx).size; }
+#if defined(GGML_USE_HIP)
+        s_prev_op_pager = pager;
+#endif
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
 
@@ -701,37 +1096,65 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 ++views_this_op;
             }
         }
+#if defined(GGML_USE_HIP)
+        enqueue_async_wait_for_page(page_idx, s_async_events_prev_op);
+#endif
+    }
+    if (wp_profile) {
+        s_prof_ensure_ns += wp_now_ns() - ens_t0;
     }
 
     g_debug.patches_total += patches_this_op;
     g_debug.views_patched += views_this_op;
-    // Always-on diagnostics for the first N paged ops so we can see what
-    // the eval cb is doing without relying on env var. Use WARN level so
-    // llama-cli's default log filter doesn't suppress it.
-    if (g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
+    if (eval_debug && g_debug.ops_with_pages <= DebugState::kVerboseLimit) {
         LLAMA_LOG_WARN("[wp::eval_cb][%d]: op=%s op_name=\"%s\" n_pages=%d patches=%d views=%d (cum: patches=%d views=%d fails=%d miss_w=%d)\n",
                         g_debug.ops_with_pages, ggml_op_name(t->op),
                         ggml_get_name(t),
                         n_page_indices, patches_this_op, views_this_op,
                         g_debug.patches_total, g_debug.views_patched, g_debug.ensures_failed,
                         g_debug.ops_no_paged_with_weight_src);
-    } else if (g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
+    } else if (eval_debug && g_debug.ops_with_pages == DebugState::kVerboseLimit + 1) {
         LLAMA_LOG_WARN("[wp::eval_cb] suppressing further per-op logs after first %d paged ops\n",
                        DebugState::kVerboseLimit);
     }
 
-    // Step 3: drive the prefetch pipeline forward.
-    //
-    // We deliberately do NOT submit a next-page prefetch here — that
-    // calls pool_.alloc_slot() which can evict an LRU slot, including
-    // one we just patched src->data into for this op. The op would then
-    // read corrupted VRAM. A correct implementation needs slot refcounts
-    // (pin while an op references the slot) or a "current op set" the
-    // pool refuses to evict. Phase 1e work item.
-    pager->tick();
-    (void) highest_page;  // suppress unused warning; will be used once eviction-safe prefetch lands
+    if (pager->hip_graphs_enabled()) {
+        pager->update_graph_pins((const void *) t, graph_pin_page_indices);
+    }
 
-    return true;
+    // Step 3: drive the prefetch pipeline forward.
+    {
+        static int s_dense_prefetch_n = -1;
+        if (s_dense_prefetch_n < 0) {
+            const char * env = std::getenv("WP_DENSE_PREFETCH_N");
+            s_dense_prefetch_n = env ? std::atoi(env) : 0;
+            if (s_dense_prefetch_n < 0) s_dense_prefetch_n = 0;
+        }
+        if (s_dense_prefetch_n > 0 && pager->async_prefetch_enabled()) {
+            std::vector<int> future_pages;
+            future_pages.reserve((size_t) s_dense_prefetch_n);
+            for (int page_idx = highest_page + 1;
+                 page_idx < pager->n_pages() && (int) future_pages.size() < s_dense_prefetch_n;
+                 ++page_idx) {
+                const auto & meta = pager->page_meta(page_idx);
+                if (meta.is_pinned || meta.is_consolidated || meta.is_expert || meta.is_sub_expert) {
+                    continue;
+                }
+                future_pages.push_back(page_idx);
+            }
+            if (!future_pages.empty()) {
+                const bool batch_ok = pager->prefetch_pages_batch(future_pages, /*count_dense_prefetch=*/true);
+                if (!batch_ok) {
+                    for (int fp : future_pages) {
+                        pager->prefetch_page(fp, /*count_dense_prefetch=*/true);
+                    }
+                }
+            }
+        }
+    }
+    pager->tick();
+
+    return eval_cb_op_return();
 }
 
 }  // namespace wp

@@ -10,22 +10,28 @@
 //      loader integration in Phase 1d).
 //   3. init() once after the catalog is built. Pool, transport, prefetch
 //      scheduler all come up here. GGML_CUDA_DISABLE_GRAPHS is snapshotted
-//      and forced to "1" (ggml's hipGraph capture bakes tensor->data
-//      pointers; the eval callback's per-step rewrites are incompatible).
-//      The original env-var state is restored on shutdown — fixes B-P5.
+//      and forced to "1" unless WP_HIP_GRAPHS=1 (ggml's hipGraph capture
+//      bakes tensor->data pointers; the eval callback's per-step rewrites
+//      need MAD-P1 graph update handling). The original env-var state is
+//      restored on shutdown - fixes B-P5.
 //   4. ensure() / prefetch_next() / tick() during inference, called from
 //      the eval callback adapter.
 //   5. shutdown() (or destructor) tears everything down in reverse order.
 
 #include "wp-page-catalog.h"
 #include "wp-file-io.h"
+#include "wp-host-tier.h"
 #include "wp-pool.h"
 #include "wp-gpu-transport.h"
 #include "wp-prefetch.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_backend_buffer;
@@ -34,6 +40,9 @@ typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 struct ggml_backend_buffer_type;
 typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
+struct ggml_cgraph;
+struct ggml_tensor;
+
 namespace wp {
 
 class WeightPager {
@@ -41,7 +50,27 @@ public:
     struct Config {
         int  n_slots         = 0;     // size of the VRAM ring; -1 / 0 = auto (one per layer)
         int  prefetch_depth  = 4;     // PrefetchScheduler queue depth
+        int  io_uring_depth  = 0;     // FileIOLayer SQ depth; 0 = prefetch_depth
         bool prefer_async_io = true;  // try io_uring for stage 1 before SyncPread
+    };
+
+    struct Stats {
+        uint64_t page_ins                       = 0;
+        uint64_t evictions                      = 0;
+        uint64_t prefetch_hits                  = 0;
+        uint64_t prefetch_misses                = 0;
+        uint64_t sync_fallbacks                 = 0;
+        uint64_t io_bytes                       = 0;
+        double   io_seconds                     = 0.0;
+        uint64_t lru_walk_hot_skips             = 0;
+        uint64_t lru_walk_pinned_skips          = 0;
+        uint64_t dense_prefetch_submitted       = 0;
+        uint64_t cross_layer_prefetch_submitted = 0;
+        uint64_t cross_layer_hit_in_ensure      = 0;
+        uint64_t host_tier_hits                 = 0;
+        uint64_t routing_ptrs_set                  = 0;
+        uint64_t routing_ptrs_consumed             = 0;
+        uint64_t routing_ptrs_discarded_unconsumed = 0;
     };
 
     WeightPager() = default;
@@ -98,24 +127,60 @@ public:
               const std::vector<int> &   devices_used);
 
     // Tear down in reverse order. Restores GGML_CUDA_DISABLE_GRAPHS to its
-    // pre-init value. Safe to call multiple times.
+    // pre-init value if init forced it. Safe to call multiple times.
     void shutdown();
 
     // Lookup helpers.
     int    find_page(const std::string & name) const { return catalog_.find(name); }
+    // Allocation-free overload for the eval-cb hot path: ggml tensor names
+    // arrive as const char* (t->name), and building a std::string temporary
+    // per lookup heap-allocs for names > SSO (e.g. "blk.23.ffn_gate.weight").
+    // eval_cb calls find_page ~thousands of times per decoded token, so that
+    // alloc/free churn dominated decode (WP_PROFILE_EVAL). A thread_local
+    // scratch string reuses its buffer via assign() → no alloc after warmup.
+    // Overload resolution routes char* callers here automatically.
+    int    find_page(const char * name) const {
+        thread_local std::string key;
+        key.assign(name);
+        return catalog_.find(key);
+    }
     int    n_pages()                            const { return catalog_.size(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
     bool   is_initialized()                     const { return initialized_; }
+    bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
+    bool   async_ensure_enabled()               const { return async_ensure_enabled_; }
+    const Stats & stats() const;
+    bool   batch_safe() const;
+    void   mark_routing_boundaries(const struct ggml_cgraph * gf);
+    bool   is_routing_break(const struct ggml_tensor * t) const {
+        return routing_break_tensors_.count(t) != 0;
+    }
+    // VRAM arena size in bytes — used by the WP_PAGED_BATCH reactive auto-break
+    // to bound a batch range's pinned working set below what fits in the pool.
+    size_t pool_arena_bytes() const { return pool_.pool_size(); }
+    uint64_t sync_fallback_count() const { return stats_.sync_fallbacks; }
+    int    loaded_pages() const;
+    int    pending_prefetches() const { return prefetch_.pending(); }
+    bool   async_prefetch_enabled() const { return cfg_.prefer_async_io; }
 
     // Ensure a page is in VRAM, returning the slot pointer. Synchronous
     // fallback if the page is not (yet) prefetched. Returns nullptr if
     // page_idx is out of range or any underlying op fails.
     void * ensure(int page_idx);
 
+    // WP_ASYNC_ENSURE handoff. ensure() stashes the transfer event here when
+    // it returns before stage 2 has completed; the eval callback takes it,
+    // queues a compute-stream wait, and releases it after that op completes.
+    int  take_async_transfer_event(int page_idx);
+    bool enqueue_async_transfer_wait(int event_handle, void * stream);
+    bool synchronize_async_transfer_event(int event_handle);
+    void finish_async_transfer_event(int page_idx, int event_handle);
+    void release_async_transfer_event(int event_handle);
+
     // Submit a prefetch hint for a page. No-op if the page is already in
     // flight or already loaded. Errors are logged but do not propagate —
     // the eval callback's ensure() will fall back to sync on miss.
-    void prefetch_page(int page_idx);
+    bool prefetch_page(int page_idx, bool count_dense_prefetch = false);
 
     // MAD-235 — batch-prefetch N pages atomically. Reserves N pool slots
     // up-front, builds the file-IO batch, issues one batched submit. If
@@ -126,7 +191,8 @@ public:
     // Skips page indices that are already resident or already in flight
     // — those are no-ops, not failures. Returns true iff every NEEDED
     // request was queued (or no requests were needed).
-    bool prefetch_pages_batch(const std::vector<int> & page_indices);
+    bool prefetch_pages_batch(const std::vector<int> & page_indices,
+                              bool count_dense_prefetch = false);
 
     // Hint the kernel (via POSIX_FADV_WILLNEED on the file_io layer) that
     // we will soon need every paged tensor in layers [block_idx+1,
@@ -141,6 +207,11 @@ public:
     // pressure; on RAM-tight systems keep k low or disable via
     // WP_FADVISE_LOOKAHEAD=0.
     void advise_layer_lookahead(int block_idx, int k);
+
+    // MAD-233 aggregate instrumentation. The eval callback marks candidate
+    // pages before issuing cross-layer prefetches; successful scheduler
+    // submissions and later ensure-time hits are folded into Stats.
+    void mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices);
 
     // Drive the prefetch pipeline forward. Idempotent and non-blocking.
     void tick();
@@ -169,6 +240,16 @@ public:
     // Where a page currently lives in the pool, or -1 if not loaded.
     int slot_for_page(int page_idx) const;
 
+    // MAD-P1: graph-lifetime pins for slots captured by CUDA/HIP graphs.
+    // Replaces the pin set for graph_key with the slots currently backing
+    // page_indices, unpinning the old exact slots first. No-op unless
+    // WP_HIP_GRAPHS=1.
+    void update_graph_pins(const void * graph_key, const std::vector<int> & page_indices);
+    bool try_add_graph_pin_page(const void * graph_key, int page_idx, std::vector<int> & page_indices) const;
+
+    // Stable slot base address for capture. Valid for the pool lifetime.
+    void * slot_base_for_capture(int slot_idx) const { return pool_.slot_base_for_capture(slot_idx); }
+
 private:
     // Internal helper: synchronous page-in (used by ensure() on miss).
     // Reads the page's bytes via FileIOLayer (sync path), copies to VRAM,
@@ -180,6 +261,14 @@ private:
 
     // PoolAllocator's eviction callback — clears page_to_slot_[evicted].
     void on_pool_evict_(int slot_idx);
+    void ensure_slot_map_(int slot_idx);
+
+    void log_stats_summary();
+    void record_page_in_(size_t bytes, double seconds);
+    void restore_disable_graphs_env_();
+    void release_graph_pins_();
+    int  graph_pin_max_slots_() const;
+    int  graph_pin_slot_count_except_(const void * graph_key) const;
 
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;
@@ -189,6 +278,7 @@ private:
     PoolAllocator                pool_;
     GpuTransport                 transport_;
     PrefetchScheduler            prefetch_;
+    std::unique_ptr<HostTier>    host_tier_;
 
     // page_idx -> slot_idx (or -1). Set both for in-flight prefetches and
     // for committed (data-ready) pages — distinguished by page_loaded_.
@@ -197,16 +287,34 @@ private:
     // OR prefetch stage 2 completed and reaped). False means slot is
     // reserved but the bytes aren't there yet.
     std::vector<bool> page_loaded_;
+    std::vector<bool> cross_layer_prefetch_candidate_;
+    std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
+    std::vector<int> page_async_event_;
     // Reverse map: slot_idx -> page_idx (or -1 if free). Used by the
     // eviction callback to clear page_to_slot_ / page_loaded_ correctly.
     std::vector<int> slot_to_page_;
 
     Config cfg_;
     bool   initialized_ = false;
+    bool   hip_graphs_enabled_ = false;
+    bool   async_ensure_enabled_ = false;
+    mutable Stats stats_;
 
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).
     bool        env_was_present_ = false;
+    bool        env_disable_graphs_forced_ = false;
     std::string env_prior_value_;
+
+    // MAD-P1 graph_key -> exact pool slots pinned for captured graph args.
+    // Stored as slots, not pages, so unpin releases the same refcounts even
+    // if a page later moves to another slot.
+    std::unordered_map<const void *, std::vector<int>> graph_pin_slots_;
+    std::unordered_set<const struct ggml_tensor *> routing_break_tensors_;
+    struct {
+        int n_nodes = -1;
+        const void * first = nullptr;
+        const void * last = nullptr;
+    } routing_sig_;
 
     // Shared pinned staging buffer for page_in_sync_. Allocated once at
     // init, sized to max_page_size, reused across every sync page-in.

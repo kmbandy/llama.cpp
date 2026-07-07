@@ -6,13 +6,17 @@
 // runtime — they no-op compile-out under non-HIP builds.
 
 #include "weight-pager/wp-page-catalog.h"
+#include "weight-pager/wp-eval-cb.h"
 #include "weight-pager/wp-file-io.h"
+#include "weight-pager/wp-host-tier.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
 
 #include "ggml-backend.h"
+#include "ggml.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +24,27 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+
+struct ScopedEnv {
+    explicit ScopedEnv(const char * name_) : name(name_) {
+        const char * v = std::getenv(name);
+        if (v != nullptr) {
+            had = true;
+            old = v;
+        }
+    }
+    ~ScopedEnv() {
+        if (had) {
+            setenv(name, old.c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+
+    const char * name;
+    bool had = false;
+    std::string old;
+};
 
 #define EXPECT(cond, msg) do { \
     if (!(cond)) { \
@@ -535,6 +560,86 @@ static int test_pool_allocator() {
     return fails;
 }
 
+static int test_pool_size_class_packs_small_pages() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/2, /*slot_size=*/256), "pool init");
+    EXPECT(pool.size_class_slots_enabled(), "size-class mode enabled");
+    EXPECT_EQ_INT(pool.slot_size(), 256u, "max slot_size remains max page size");
+    EXPECT_EQ_INT(pool.pool_size(), 512u, "arena budget matches fixed-slot bytes");
+    EXPECT(pool.pool_base() != nullptr, "pool base valid before first slot");
+
+    int evicted = -1;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+
+    int s0 = pool.alloc_slot(64);
+    int s1 = pool.alloc_slot(64);
+    int s2 = pool.alloc_slot(64);
+    int s3 = pool.alloc_slot(64);
+    (void) s2;
+    EXPECT_EQ_INT(s0, 0, "small alloc 0");
+    EXPECT_EQ_INT(s3, 3, "small alloc 3");
+    EXPECT_EQ_INT(pool.n_slots(), 4, "four small slots fit in one old 256-byte slot");
+    EXPECT_EQ_INT(pool.slot_size(s0), 64u, "slot 0 class size");
+    EXPECT_EQ_INT((intptr_t) pool.slot_ptr(s1) - (intptr_t) pool.slot_ptr(s0),
+                  64, "small slot stride is class size");
+
+    void * p1 = pool.slot_ptr(s1);
+    int s4 = pool.alloc_slot(256);
+    EXPECT_EQ_INT(s4, 4, "large slot allocated after small slots");
+    EXPECT_EQ_INT(pool.n_slots(), 5, "dynamic slot id added inside same arena budget");
+    EXPECT_EQ_INT(pool.slot_size(s4), 256u, "large slot class size");
+    EXPECT_EQ_INT((intptr_t) pool.slot_ptr(s4) - (intptr_t) pool.pool_base(),
+                  256, "large slot starts after four 64-byte slots");
+    EXPECT(pool.slot_ptr(s1) == p1, "existing slot address is stable");
+    EXPECT(pool.slot_base_for_capture(s1) == p1, "capture base matches stable slot ptr");
+
+    int s5 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s5, s0, "full arena evicts LRU within requested size class");
+    EXPECT_EQ_INT(evicted, s0, "eviction callback reports reused slot");
+    EXPECT_EQ_INT(pool.n_slots(), 5, "eviction reuses existing slot id");
+    return fails;
+}
+
+static int test_pool_size_class_pin_skip() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/2, /*slot_size=*/64), "pool init");
+
+    int s0 = pool.alloc_slot(64);
+    int s1 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s0, 0, "alloc 0");
+    EXPECT_EQ_INT(s1, 1, "alloc 1");
+
+    pool.pin_slot(s0);
+    pool.pin_slot(s1);
+    int evicted = -42;
+    pool.set_eviction_callback([&](int slot) { evicted = slot; });
+
+    int s2 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s2, -1, "all pinned size-class slots return -1");
+    EXPECT_EQ_INT(evicted, -42, "eviction callback not fired when all pinned");
+
+    pool.unpin_slot(s1);
+    int s3 = pool.alloc_slot(64);
+    EXPECT_EQ_INT(s3, s1, "unpinned slot becomes evictable");
+    EXPECT_EQ_INT(evicted, s1, "eviction callback fired for unpinned slot");
+    pool.unpin_slot(s0);
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // PoolAllocator — popularity counter + hot-slot protection (MAD-237)
 // ---------------------------------------------------------------------------
@@ -952,6 +1057,132 @@ static int test_pool_alloc_returns_neg1_when_all_pinned() {
 }
 
 // ---------------------------------------------------------------------------
+// HostTier - pinned/pageable host slab + LRU bookkeeping (MAD-P4)
+// ---------------------------------------------------------------------------
+
+static int test_host_tier_store_lookup() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> src(32);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 3 + 1);
+
+    EXPECT(tier.store(/*page_idx=*/7, src.data(), src.size()), "store page");
+    const void * p = tier.lookup(7);
+    EXPECT(p != nullptr, "lookup returns pointer");
+    EXPECT(std::memcmp(p, src.data(), src.size()) == 0, "lookup bytes match");
+    EXPECT_EQ_INT(tier.used_bytes(), src.size(), "used bytes after store");
+    EXPECT_EQ_INT(tier.resident_count(), 1u, "one resident page");
+
+    return fails;
+}
+
+static int test_host_tier_size_class_reuse() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> a(32, 0xA1);
+    std::vector<uint8_t> b(32, 0xB2);
+    std::vector<uint8_t> c(32, 0xC3);
+
+    EXPECT(tier.store(1, a.data(), a.size()), "store page 1");
+    const void * p1 = tier.lookup(1);
+    EXPECT(tier.store(2, b.data(), b.size()), "store page 2");
+    EXPECT(tier.store(3, c.data(), c.size()), "store page 3 evicts page 1");
+    const void * p3 = tier.lookup(3);
+
+    EXPECT(p1 != nullptr && p3 != nullptr, "pointers valid");
+    EXPECT(p3 == p1, "same-size store reuses evicted slot");
+    EXPECT(tier.lookup(1) == nullptr, "evicted page 1 missing");
+    EXPECT(std::memcmp(p3, c.data(), c.size()) == 0, "reused slot has new bytes");
+
+    return fails;
+}
+
+static int test_host_tier_lru_eviction_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x11);
+    EXPECT(tier.store(10, bytes.data(), bytes.size()), "store 10");
+    EXPECT(tier.store(11, bytes.data(), bytes.size()), "store 11");
+    EXPECT(tier.store(12, bytes.data(), bytes.size()), "store 12");
+    EXPECT(tier.store(13, bytes.data(), bytes.size()), "store 13 evicts oldest");
+
+    EXPECT(tier.lookup(10) == nullptr, "oldest page evicted first");
+    EXPECT(tier.lookup(11) != nullptr, "page 11 still resident");
+    EXPECT(tier.lookup(12) != nullptr, "page 12 still resident");
+    EXPECT(tier.lookup(13) != nullptr, "new page resident");
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count stays at capacity");
+
+    return fails;
+}
+
+static int test_host_tier_lookup_touch_keeps_mru() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x22);
+    EXPECT(tier.store(20, bytes.data(), bytes.size()), "store 20");
+    EXPECT(tier.store(21, bytes.data(), bytes.size()), "store 21");
+    EXPECT(tier.store(22, bytes.data(), bytes.size()), "store 22");
+
+    EXPECT(tier.lookup(20) != nullptr, "touch page 20");
+    EXPECT(tier.store(23, bytes.data(), bytes.size()), "store 23 evicts LRU after touch");
+
+    EXPECT(tier.lookup(20) != nullptr, "touched page kept as MRU");
+    EXPECT(tier.lookup(21) == nullptr, "untouched oldest page evicted");
+    EXPECT(tier.lookup(22) != nullptr, "page 22 still resident");
+    EXPECT(tier.lookup(23) != nullptr, "page 23 resident");
+
+    return fails;
+}
+
+static int test_host_tier_over_budget_evict() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x33);
+    EXPECT(tier.store(30, bytes.data(), bytes.size()), "store 30");
+    EXPECT(tier.store(31, bytes.data(), bytes.size()), "store 31");
+    EXPECT_EQ_INT(tier.used_bytes(), 64u, "budget full");
+
+    EXPECT(tier.store(32, bytes.data(), bytes.size()), "store beyond used budget evicts and succeeds");
+    EXPECT_EQ_INT(tier.used_bytes(), 64u, "used bytes remains capped");
+    EXPECT_EQ_INT(tier.resident_count(), 2u, "resident count remains capped");
+    EXPECT(tier.lookup(30) == nullptr, "oldest page evicted under pressure");
+    EXPECT(tier.lookup(31) != nullptr, "page 31 still resident");
+    EXPECT(tier.lookup(32) != nullptr, "new page resident");
+
+    return fails;
+}
+
+static int test_host_tier_lookup_miss() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(16, 0x44);
+    EXPECT(tier.lookup(99) == nullptr, "empty lookup returns nullptr");
+    EXPECT(tier.lookup(-1) == nullptr, "negative lookup returns nullptr");
+    EXPECT(tier.store(40, bytes.data(), bytes.size()), "store 40");
+    EXPECT(tier.lookup(41) == nullptr, "different page lookup misses");
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // compute_advise_ranges — MAD-232 posix_fadvise lookahead
 // ---------------------------------------------------------------------------
 //
@@ -1282,6 +1513,36 @@ static int test_is_uma_device_smoke() {
     return fails;
 }
 
+static int test_routing_boundary_prepass() {
+    int fails = 0;
+    struct ggml_init_params ip = { /*.mem_size=*/ 16*1024*1024, /*.mem_buffer=*/ nullptr, /*.no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * ids_producer = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8);
+    ggml_set_name(ids_producer, "ids_producer");
+    struct ggml_tensor * ids_view = ggml_view_1d(ctx, ids_producer, 8, 0);
+    struct ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 2);
+    struct ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 8);
+    struct ggml_tensor * mmid = ggml_mul_mat_id(ctx, as, b, ids_view);
+    ggml_set_name(mmid, "mmid");
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, mmid);
+    wp::WeightPager pager;
+    pager.mark_routing_boundaries(gf);
+    if (!pager.is_routing_break(mmid))         { fprintf(stderr, "FAIL: mmid not marked\n"); fails++; }
+    if (!pager.is_routing_break(ids_producer)) { fprintf(stderr, "FAIL: ids producer (view root) not marked\n"); fails++; }
+    if (pager.is_routing_break(b))             { fprintf(stderr, "FAIL: unrelated tensor marked\n"); fails++; }
+    ggml_free(ctx);
+    return fails;
+}
+
+static int test_wp_paged_batch_flag_default_off() {
+    int fails = 0;
+    ScopedEnv guard("WP_PAGED_BATCH");
+    unsetenv("WP_PAGED_BATCH");
+    if (wp::wp_paged_batch_enabled()) { fprintf(stderr, "FAIL: WP_PAGED_BATCH must default OFF\n"); fails++; }
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1307,11 +1568,19 @@ int main() {
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },
         { "pool_allocator",     test_pool_allocator     },
+        { "pool_size_class_packs_small_pages", test_pool_size_class_packs_small_pages },
+        { "pool_size_class_pin_skip",          test_pool_size_class_pin_skip          },
         { "pool_pin_basic",                       test_pool_pin_basic                       },
         { "pool_pin_refcount",                    test_pool_pin_refcount                    },
         { "pool_pin_oob_safe",                    test_pool_pin_oob_safe                    },
         { "pool_alloc_skips_pinned_in_eviction",  test_pool_alloc_skips_pinned_in_eviction  },
         { "pool_alloc_returns_neg1_when_all_pinned", test_pool_alloc_returns_neg1_when_all_pinned },
+        { "host_tier_store_lookup",              test_host_tier_store_lookup              },
+        { "host_tier_size_class_reuse",          test_host_tier_size_class_reuse          },
+        { "host_tier_lru_eviction_order",        test_host_tier_lru_eviction_order        },
+        { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
+        { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
+        { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },
@@ -1319,6 +1588,8 @@ int main() {
         { "pool_hot_threshold_protects",         test_pool_hot_threshold_protects_in_eviction },
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
         { "pool_default_threshold_zero_lru",     test_pool_default_threshold_zero_is_pure_lru },
+        { "routing_boundary_prepass",            test_routing_boundary_prepass            },
+        { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
     };
 
     for (const auto & t : tests) {
