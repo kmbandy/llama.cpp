@@ -52,6 +52,32 @@ size-class slot can fit …` WARN followed by a page-in failure / degraded outpu
 fix direction is to reserve N max-size slots at the arena top, or add slot compaction. It is
 gated off, so the branch default is unaffected.
 
+## Decode-speed work (2026-07-06 session) — dense at native speed
+
+Beyond the residency levers above, the session that took paged-resident **dense** decode to native:
+
+| Commit | Lever | Flag (default) | Result |
+|---|---|---|---|
+| `b7a33e849` | resident-aware fadvise | `WP_FADVISE_LOOKAHEAD` now skips when resident | +34% (7.0→9.4 t/s); the readahead warms nothing when the model is in VRAM |
+| `78358b158` | `WP_BATCH_EVAL_CB` — stop the callback de-batching the graph | `WP_BATCH_EVAL_CB=1` (default 0) | **9.4→21.0 t/s = native**, PPL 5.4623 == native |
+
+`WP_PROFILE_EVAL=1` (diag, `5ee99edcd`/`c1bb508e1`) prints a host-time breakdown of `weight_pager_eval_cb`
+at teardown — used to root-cause the above.
+
+**Root cause of the ~2-3× paged-decode gap** (verified in `ggml/src/ggml-backend.cpp:1700-1729`):
+a registered eval callback makes the scheduler compute node-by-node and `ggml_backend_synchronize`
+after each; the range only batches while the callback returns `false`. The pager returned `true`
+everywhere → ~3700 GPU syncs/token. `WP_BATCH_EVAL_CB=1` returns `false` when
+`batch_safe()` (evictions==0 && size-class) && not a routing op && no sync-fallback → batches like
+native. Patching still happens (ask=true per node before compute); only the sync is removed.
+
+**OPEN — `WP_BATCH_EVAL_CB` faults on MoE.** On gpt-oss-20b it caused a near-null routed-expert GPU
+fault (`mul_mat_q … void const* const*`), because the scheduler includes a `true`-returning routing
+op as the *last* node of a batched range (not standalone), so the routing-TLS/expert-pin lifetime
+isn't isolated. **Before any default-on:** add `!catalog_.has_experts()` to the gate (dense-only).
+The proper MoE fix (routing op must break the range *before* it) is a separate effort. Full detail
++ morning pickup: `docs/dev/weight-paging-batch-eval-continuation.md`.
+
 ## Recommended validation order
 
 1. **P0 baseline** — measure current paged decode (dense first: `Qwen3.5-4B-UD-IQ3_XXS`,
