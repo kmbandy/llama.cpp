@@ -504,7 +504,12 @@ const WeightPager::Stats & WeightPager::stats() const {
 }
 
 bool WeightPager::batch_safe() const {
-    return stats_.evictions == 0 && pool_.size_class_slots_enabled();
+    // Dense-only guard: WP_BATCH_EVAL_CB batching is only correct for dense models.
+    // On MoE the scheduler batches a routing op as the *last* node of a range, so the
+    // routed-expert TLS / pinned-slot lifetime isn't isolated -> near-null expert-pointer
+    // GPU fault. Until the MoE-batching redesign lands (routing op must break the range
+    // *before* it), keep MoE on the per-op sync path.
+    return stats_.evictions == 0 && pool_.size_class_slots_enabled() && !catalog_.has_experts();
 }
 
 int WeightPager::loaded_pages() const {
