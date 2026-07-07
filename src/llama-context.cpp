@@ -2489,6 +2489,14 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // WP_PAGED_BATCH: mark each MUL_MAT_ID and its ids-producer as batch-range
+    // break points before the scheduler splits/computes gf, so the eval-cb can
+    // isolate every routing op (fixes the batched-MoE read-before-produce fault).
+    // No-op unless the pager is active; cheap (cached, skips when topology unchanged).
+    if (model.wp_pager) {
+        model.wp_pager->mark_routing_boundaries(gf);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
