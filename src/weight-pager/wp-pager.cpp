@@ -873,6 +873,114 @@ void * WeightPager::ensure(int page_idx) {
     return slot_ptr_(slot);
 }
 
+void WeightPager::ensure_batch(const std::vector<int> & page_indices,
+                               std::vector<void *>     & out_ptrs,
+                               std::vector<int>        & out_pinned) {
+    out_ptrs.assign(page_indices.size(), nullptr);
+    out_pinned.clear();
+    if (!initialized_) return;
+
+    // Pass 1 — resolve hits/pinned inline; for every cold miss reserve AND PIN
+    // a slot up front. Pinning before any sibling read means alloc_slot for a
+    // later miss can never evict an earlier miss's in-flight slot (alloc_slot
+    // skips pinned), which is what collapsed effective QD to ~1 under decode
+    // eviction. Each pinned page is reported in out_pinned for the caller to
+    // release next callback.
+    struct Miss { int page; int slot; std::size_t out_i; };
+    std::vector<Miss> misses;
+    misses.reserve(page_indices.size());
+    for (std::size_t i = 0; i < page_indices.size(); ++i) {
+        const int p = page_indices[i];
+        if (p < 0 || p >= catalog_.size()) continue;
+        const PageMeta & m = catalog_.at(p);
+        if (m.is_pinned) {                       // MAD-236: always-resident, no slot
+            out_ptrs[i] = m.resident_ptr;
+            continue;
+        }
+        if (page_loaded_[p]) {                   // hit — bump LRU, pin, harvest
+            const int s = page_to_slot_[p];
+            pool_.mark_used(s);
+            pool_.pin_slot(s);
+            out_pinned.push_back(p);
+            out_ptrs[i] = slot_ptr_(s);
+            continue;
+        }
+        if (page_to_slot_[p] >= 0) {
+            // Reserved by an in-flight (e.g. cross-layer) prefetch. Harvest via
+            // the tested ensure() path (waits on the prefetch, or syncs), then
+            // pin the result. Not part of the concurrent batch.
+            void * ptr = ensure(p);
+            if (ptr != nullptr) {
+                pool_.pin_slot(page_to_slot_[p]);
+                out_pinned.push_back(p);
+                out_ptrs[i] = ptr;
+            }
+            continue;
+        }
+        const int s = pool_.alloc_slot(m.size);
+        if (s < 0) { ++stats_.sync_fallbacks; continue; }  // pool exhausted (rare)
+        ensure_slot_map_(s);
+        page_to_slot_[p]  = s;
+        slot_to_page_[s]  = p;
+        pool_.pin_slot(s);                       // PIN before the next alloc
+        out_pinned.push_back(p);
+        misses.push_back({ p, s, i });
+    }
+    if (misses.empty()) return;
+
+    // Pass 2 — issue all cold-miss reads. On the P2P/direct-to-device path the
+    // reads land straight in the VRAM slots, so one io_uring batch keeps N reads
+    // in flight at once (true QD=N). Off P2P the shared staging buffer can't
+    // hold N pages, so fall back to serial sync into each pinned slot (still
+    // correct; the throughput case that matters for decode is P2P).
+    if (file_io_->direct_to_device()) {
+        std::vector<FileIOBatchRequest> reqs;
+        reqs.reserve(misses.size());
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const PageMeta & m = catalog_.at(misses[k].page);
+            reqs.push_back({ (uint64_t) k, (int) m.file_idx, m.file_offset,
+                             m.size, slot_ptr_(misses[k].slot) });
+        }
+        const int n_sub = file_io_->submit_batch(reqs);
+        file_io_->flush();
+        std::vector<bool> ok(misses.size(), false);
+        int reaped = 0;
+        while (reaped < n_sub) {
+            IoResult r = file_io_->wait_any(/*timeout_ms=*/-1);
+            if (r.req_id < misses.size()) {
+                ok[(std::size_t) r.req_id] =
+                    (r.status == IoStatus::Ok &&
+                     r.bytes_read == (int) catalog_.at(misses[(std::size_t) r.req_id].page).size);
+                ++reaped;
+            }
+            // Unknown req_id (stale prefetch completion): drop, keep waiting.
+        }
+        const auto io_t0 = std::chrono::steady_clock::now();
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const Miss & mm = misses[k];
+            const PageMeta & m = catalog_.at(mm.page);
+            if (ok[k] && zero_device_padding(slot_ptr_(mm.slot), m.size, pool_.slot_size(mm.slot))) {
+                page_to_slot_[mm.page] = mm.slot;
+                page_loaded_[mm.page]  = true;
+                slot_to_page_[mm.slot] = mm.page;
+                pool_.mark_used(mm.slot);
+                record_page_in_(m.size, seconds_since(io_t0));
+                out_ptrs[mm.out_i] = slot_ptr_(mm.slot);
+            } else {
+                // read (or padding) failed — sync-fallback into the SAME pinned
+                // slot so the up-front pin/out_pinned bookkeeping stays valid.
+                const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+            }
+        }
+    } else {
+        for (const Miss & mm : misses) {
+            const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+            out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+        }
+    }
+}
+
 int WeightPager::take_async_transfer_event(int page_idx) {
     if (!initialized_) return -1;
     if (page_idx < 0 || page_idx >= (int) page_async_event_.size()) return -1;
@@ -1119,10 +1227,13 @@ void WeightPager::mark_cross_layer_prefetch_candidates(const std::vector<int> & 
     }
 }
 
-int WeightPager::page_in_sync_(int page_idx) {
-    // Synchronous read into a fresh slot, bypassing the prefetch pipeline.
-    // Used by ensure() on miss. Host transports read into staging and then
-    // hand off to GpuTransport; P2P transports read into the VRAM slot.
+int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
+    // Synchronous read into a slot, bypassing the prefetch pipeline. Used by
+    // ensure() on miss (reuse_slot < 0: alloc a fresh slot) and by ensure_batch
+    // as its per-page failure fallback (reuse_slot >= 0: read into that already-
+    // reserved+pinned slot; never release it here). Host transports read into
+    // staging and then hand off to GpuTransport; P2P transports read into VRAM.
+    const bool owns_slot = (reuse_slot < 0);
 
     static int s_diag_count = 0;
     const bool diag = (s_diag_count < 5);
@@ -1137,9 +1248,12 @@ int WeightPager::page_in_sync_(int page_idx) {
 
     const PageMeta & m = catalog_.at(page_idx);
 
-    const int slot = pool_.alloc_slot(m.size);
-    if (slot < 0) return -1;
-    ensure_slot_map_(slot);
+    int slot = reuse_slot;
+    if (slot < 0) {
+        slot = pool_.alloc_slot(m.size);
+        if (slot < 0) return -1;
+        ensure_slot_map_(slot);
+    }
     void * dst = slot_ptr_(slot);
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: alloc_slot ok, slot=%d dst=%p\n", s_diag_count, slot, dst);
 
@@ -1151,7 +1265,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     if (staging == nullptr || m.size > sync_staging_size_) {
         LLAMA_LOG_ERROR("wp::WeightPager::page_in_sync_: page %d size %zu exceeds shared staging size %zu\n",
                         page_idx, m.size, sync_staging_size_);
-        pool_.release_slot(slot);
+        if (owns_slot) pool_.release_slot(slot);
         return -1;
     }
 
@@ -1163,7 +1277,7 @@ int WeightPager::page_in_sync_(int page_idx) {
             if (evt < 0) {
                 LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
                                page_idx);
-                pool_.release_slot(slot);
+                if (owns_slot) pool_.release_slot(slot);
                 return -1;
             }
             transport_.release_event(evt);
@@ -1212,13 +1326,13 @@ int WeightPager::page_in_sync_(int page_idx) {
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage1 done ok=%d\n", s_diag_count, (int)ok);
     if (!ok) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: file IO failed for page %d\n", page_idx);
-        pool_.release_slot(slot);
+        if (owns_slot) pool_.release_slot(slot);
         return -1;
     }
 
     if (direct_to_device) {
         if (!zero_device_padding(dst, m.size, pool_.slot_size(slot))) {
-            pool_.release_slot(slot);
+            if (owns_slot) pool_.release_slot(slot);
             return -1;
         }
         page_to_slot_[page_idx] = slot;
@@ -1241,7 +1355,7 @@ int WeightPager::page_in_sync_(int page_idx) {
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
     if (evt < 0) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: gpu stage_in failed for page %d\n", page_idx);
-        pool_.release_slot(slot);
+        if (owns_slot) pool_.release_slot(slot);
         return -1;
     }
     transport_.release_event(evt);

@@ -168,6 +168,20 @@ public:
     // page_idx is out of range or any underlying op fails.
     void * ensure(int page_idx);
 
+    // Batch-ensure a set of pages with all cold-miss reads issued CONCURRENTLY
+    // (Colibri pattern). Each miss's slot is reserved AND pinned up front so no
+    // read in the batch can evict a sibling's not-yet-loaded slot — the eviction
+    // window that collapsed effective io_uring queue depth to ~1 under decode
+    // pressure. On the P2P (direct-to-device) IO path the misses are submitted in
+    // one io_uring batch (true QD=N) reading straight into the VRAM slots.
+    // Fills out_ptrs[i] with the slot pointer for pages[i] (nullptr on failure /
+    // pool exhaustion), and out_pinned with every page this call pinned — the
+    // CALLER must record those and unpin them in the next eval callback (matches
+    // the per-op pin lifecycle used by ensure()+pin_page).
+    void ensure_batch(const std::vector<int> & page_indices,
+                      std::vector<void *>     & out_ptrs,
+                      std::vector<int>        & out_pinned);
+
     // WP_ASYNC_ENSURE handoff. ensure() stashes the transfer event here when
     // it returns before stage 2 has completed; the eval callback takes it,
     // queues a compute-stream wait, and releases it after that op completes.
@@ -254,7 +268,11 @@ private:
     // Internal helper: synchronous page-in (used by ensure() on miss).
     // Reads the page's bytes via FileIOLayer (sync path), copies to VRAM,
     // and zeros the padding. Returns the slot index or -1 on failure.
-    int  page_in_sync_(int page_idx);
+    // reuse_slot >= 0: read into that caller-owned (typically pinned) slot
+    // instead of allocating a fresh one, and do NOT release it on failure — the
+    // caller owns its lifecycle. reuse_slot < 0 keeps the original behavior
+    // (alloc a slot, release it on any error). Returns the slot index or -1.
+    int  page_in_sync_(int page_idx, int reuse_slot = -1);
 
     // Resolve a slot index to a VRAM pointer.
     void * slot_ptr_(int slot_idx) const { return pool_.slot_ptr(slot_idx); }
