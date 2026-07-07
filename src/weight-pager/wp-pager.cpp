@@ -511,6 +511,11 @@ bool WeightPager::batch_safe() const {
     // routed-expert TLS / pinned-slot lifetime isn't isolated -> near-null expert-pointer
     // GPU fault. Until the MoE-batching redesign lands (routing op must break the range
     // *before* it), keep MoE on the per-op sync path.
+    if (wp_paged_batch_enabled()) {
+        // Under WP_PAGED_BATCH, batching is governed by live pinnability and
+        // routing-boundary breaks in wp-eval-cb.cpp, not a static eviction count.
+        return pool_.size_class_slots_enabled();
+    }
     return stats_.evictions == 0 && pool_.size_class_slots_enabled() && !catalog_.has_experts();
 }
 

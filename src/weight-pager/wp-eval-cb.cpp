@@ -27,6 +27,14 @@ extern "C++" void *                ggml_cuda_get_wp_compute_stream();
 
 namespace wp {
 
+bool wp_paged_batch_enabled() {
+    static const bool enabled = []() {
+        const char * v = std::getenv("WP_PAGED_BATCH");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
 namespace {
 // Diagnostic counters. Logged only when WP_EVAL_DEBUG=1 is set in the
 // environment. First few ops get verbose output; afterwards we suppress
