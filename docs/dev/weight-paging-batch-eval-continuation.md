@@ -11,6 +11,36 @@ Took **paged-resident dense-27B decode from 7.0 → 21.0 t/s = native speed**, w
 matching native** (5.4623). Three gated, default-off, committed+pushed commits. Then found that
 the last/biggest fix (`WP_BATCH_EVAL_CB`) **faults on MoE** — that's the open item for the morning.
 
+## UPDATE — morning session 2026-07-07 (Step 1 DONE; Step 2 scoped)
+
+**Step 1 complete — dense win locked in and shipped default-on:**
+- `2a221b9ef` **dense-only guard**: `batch_safe()` now also requires `!catalog_.has_experts()`. On MoE
+  → per-op path (no batching), so no fault.
+- `aa1130789` **flip `WP_BATCH_EVAL_CB` default ON** (off only when `WP_BATCH_EVAL_CB=0`). Self-gated:
+  only engages under `--weight-paging` + size-class + fully-resident + dense.
+- Both pushed to `origin/feat/wp-vnext`; cherry-picked + built + validated on mad-lab-main
+  (`5919648e2`, `656ae5a14`).
+- **Validated:** dense 27B PPL = **5.4623** with explicit `=1` AND with the flag **unset** (default takes
+  effect). MoE guard proof: guarded `=1` is **byte-identical** to `=0` on gpt-oss (same NaN, same stats,
+  no fault) — guard makes `=1` a no-op on MoE.
+
+**Step 2 evidence gathered (LFM2.5-8B-A1B, a small 8B/1B-active MoE, valid finite PPL — a far better
+test case than gpt-oss):**
+- LFM native (no paging) PPL = **27.2266**.
+- LFM paged **per-op** (BATCH=0, slots=750, fully resident) = **27.0938** — matches native within
+  reduction-order noise (same 0.13-ish gap dense shows: 5.4543 vs 5.4623). **Per-op MoE paging is CORRECT.**
+- `routing_ptrs_discarded_unconsumed: 6` appears on BOTH LFM (correct output) and gpt-oss (NaN) →
+  **that counter is a benign accounting artifact, NOT the corruption source.** The gpt-oss NaN is
+  gpt-oss/MXFP4-specific, off the critical path.
+- **Batching fault is GENERAL:** temporarily removed the guard, rebuilt, ran LFM with batching →
+  `Memory access fault … address 0xdc000 … Page not present` (same near-null class as gpt-oss's
+  0x11f000). So the batching-on-MoE fault reproduces on a clean valid-PPL MoE. GPU recovered cleanly.
+  (Experiment reverted; mad-lab-main back to shipped guarded state.)
+
+**Net for Step 2:** the ONLY MoE bug is the batching range/pin lifetime. Per-op is a correct baseline.
+We now have a **clean repro + a valid PPL target (27.09)** to validate the redesign against.
+**Do the redesign on LFM2.5-8B-A1B** (fast, fully resident at slots=750, valid PPL), not gpt-oss.
+
 ## The result (dense Qwen3.6-27B-Q6_K, fully resident, R9700)
 
 | config | decode t/s | PPL (wiki, -c512 --chunks 4) |
@@ -70,6 +100,10 @@ native. Implemented as `eval_cb_op_return()` at the two op-level exits, returnin
 The MAD-230 `ggml_cuda_discard_routed_expert_ptrs()` still runs at the top of every ask=true call.
 
 ## OPEN / NEXT MORNING — WP_BATCH_EVAL_CB faults on MoE
+> **SUPERSEDED by the 2026-07-07 UPDATE above.** Step 1 (guard + default-on) is DONE and shipped.
+> The MoE fault is now confirmed GENERAL (reproduces on clean LFM2.5-8B-A1B), and per-op MoE paging
+> is confirmed CORRECT (valid baseline 27.09). What remains below is the still-accurate root-cause
+> analysis and the redesign spec (path 2). Ignore the "decide first thing" framing — path 1 is done.
 
 **Validated on gpt-oss-20b-MXFP4 (11.3 GB, resident, slots=1024 → 12.24 GB arena, ~15 GB total VRAM):**
 - native PPL = **427** (garbage — gpt-oss is NOT a raw-text LM; wikitext PPL is meaningless for it,
