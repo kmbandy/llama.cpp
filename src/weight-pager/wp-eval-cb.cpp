@@ -136,6 +136,10 @@ WeightPager *               s_prev_op_pager = nullptr;
 // scheduler guarantees runs only after that range's compute+sync.
 std::vector<int>            s_range_pins;
 std::vector<int>            s_range_pins_pending;
+// Bytes pinned in the current batch range — drives the reactive auto-break so a
+// range never tries to pin more than fits in the pool (essential once evictions
+// occur; a dense stretch has no routing boundary to bound it otherwise).
+size_t                      s_range_pinned_bytes = 0;
 
 void release_async_op(PendingAsyncOp & op) {
     WeightPager * owner = op.pager;
@@ -158,6 +162,7 @@ void release_async_op(PendingAsyncOp & op) {
 std::vector<int> s_pinned_pages_prev_op;
 std::vector<int> s_range_pins;
 std::vector<int> s_range_pins_pending;
+size_t           s_range_pinned_bytes = 0;
 #endif
 }  // namespace
 
@@ -172,6 +177,7 @@ void weight_pager_eval_cb_reset(WeightPager * pager) {
         s_range_pins.clear();
         s_range_pins_pending.clear();
     }
+    s_range_pinned_bytes = 0;
     if (pager == nullptr || !pager->async_ensure_enabled()) {
         return;
     }
@@ -291,11 +297,20 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         } else {
             end_range = true;
         }
+        // 5b reactive auto-break: bound the range's pinned working set so it fits
+        // the pool. Without this, a dense stretch (no routing boundary) grows until
+        // a pin can't be satisfied under eviction -> alloc_slot -1 -> page-in fault.
+        // Break at 70% of the arena, leaving headroom for the next range's pins.
+        if (paged_batch && !end_range &&
+            s_range_pinned_bytes >= (pager->pool_arena_bytes() / 10) * 7) {
+            end_range = true;
+        }
         if (paged_batch && end_range) {
             // Range ends after this op: hand its accumulated pins to the pending
             // set, released at the top of the next callback (post-sync).
             for (int p : s_range_pins) { s_range_pins_pending.push_back(p); }
             s_range_pins.clear();
+            s_range_pinned_bytes = 0;
         }
         return end_range;
     };
@@ -648,6 +663,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             // it. Unpinned in the NEXT eval_cb (above).
                                             pager->pin_page(sub_page_idx);
                                             (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(sub_page_idx);
+                                            if (paged_batch) { s_range_pinned_bytes += pager->page_meta(sub_page_idx).size; }
 #if defined(GGML_USE_HIP)
                                             s_prev_op_pager = pager;
 #endif
@@ -1051,6 +1067,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         // eval_cb invocation.
         pager->pin_page(page_idx);
         (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(page_idx);
+        if (paged_batch) { s_range_pinned_bytes += pager->page_meta(page_idx).size; }
 #if defined(GGML_USE_HIP)
         s_prev_op_pager = pager;
 #endif

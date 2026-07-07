@@ -155,6 +155,9 @@ public:
     bool   is_routing_break(const struct ggml_tensor * t) const {
         return routing_break_tensors_.count(t) != 0;
     }
+    // VRAM arena size in bytes — used by the WP_PAGED_BATCH reactive auto-break
+    // to bound a batch range's pinned working set below what fits in the pool.
+    size_t pool_arena_bytes() const { return pool_.pool_size(); }
     uint64_t sync_fallback_count() const { return stats_.sync_fallbacks; }
     int    loaded_pages() const;
     int    pending_prefetches() const { return prefetch_.pending(); }
