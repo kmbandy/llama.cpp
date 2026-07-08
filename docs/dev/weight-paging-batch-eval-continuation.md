@@ -534,3 +534,67 @@ R9700 for expert cache) + Phase 3 (frequency-biased retention + prefetch coverag
 --weight-paging-resident-device flag, dense→resident/expert→paging tensor_buft_overrides, per-device
 pager pools + relaxed >1-device guard, two-pool unit test. 38/38 unit tests. Needs multi-device
 forward validation on the R9700+6900XT(TB3) rig (cross-device activation copies are code-trace-only).
+
+---
+
+## ★★★ 2026-07-07 NIGHT — SESSION WRAP: Phase 1 shipped (52x), consolidated to one build, Phase 2 blocked on cross-device FA ★★★
+
+### What shipped + validated (all merged into feat/dsws-phaseb-conversion, commit 6fceb5953)
+- **completion demux** (550a80517) — shared io_uring ring cross-drain fixed (2x regression + depth-8 hang).
+- **-EINTR retry** (3bd0abbdd) — P2P stops downgrading mid-decode.
+- **WP_RESIDENT_DENSE — Phase 1 dense-resident split** (d4344dfbc..16d486dbd) — page ONLY routed experts,
+  keep dense (~9%, 13.7 GiB) VRAM-resident via the existing manual allocator. TWO filters must agree:
+  is_paged_weight() (llama-model.cpp:1608) + catalog push (:1930), both keyed on wp_is_routed_expert().
+  Fail-loud guard in init_weight_pager. **MEASURED (R9700, DeepSeek V4 Flash Q8, P2P depth 4, slots 2000):
+  0.02 -> 1.038 t/s = 52x, coherent ("...Rome in 753 BC."). Gate PASSED.**
+- **QD>4 hang fix** (945f9074a, Codex) — io_uring_submit's return was IGNORED; at depth 8/16 under
+  resident-dense churn the CQ fills -> submit returns -EBUSY (SQEs NOT submitted) but counted pending_ ->
+  waiter hangs in io_cqring_wait. Fix: pending_submit_ deque + drain-CQ-on-EBUSY + synthesize ErrorNoSubmit
+  if truly stuck (wp-file-io.cpp/wp-file-io-p2p.cpp flush_submissions_/reap_ready_cqe_). GPU-validated:
+  depth-8 P2P resident-dense no longer hangs (0.99 t/s). depth-8 ~= depth-4 -> QD is NOT the bottleneck.
+
+### KEY FINDING — the real bottleneck is expert-cache thrash, NOT QD or transport
+page_ins ~11k, evictions ~9k, prefetch_hit_rate 0% (low cross-token routing locality). Bigger expert cache
+did NOT help (host-slots-3000 SLOWER than 2000). P2P (1.038) slightly beats host (0.93) via direct-to-VRAM.
+Levers toward 1-3 t/s: expert-cache hit rate (Phase 3, uncertain given low locality), faster/striped NVMe
+(most direct multiplier), or lower-bit expert quant (smaller per-token footprint).
+
+### BUILD HYGIENE FIX — one build only, dual-arch
+The ~/llama-wp WORKTREE build-hip I created this session was single-arch (gfx1201 only) — a violation of the
+standing "build-hip is ALWAYS gfx1201;gfx1030" rule. Consolidated: deleted ~/llama-wp, merged ALL
+weight-paging work into feat/dsws-phaseb-conversion on the MAIN checkout (~/GitHub/llama.cpp), rebuilt its
+dual-arch build-hip (confirmed binary has BOTH gfx1030 + gfx1201). ONE build now. Merge was a local commit
+(6fceb5953), NOT pushed yet. DSWS kernel work (03225f6bb) preserved.
+
+### PHASE 2 MULTI-DEVICE — BLOCKED on cross-device Flash Attention (the next task)
+Goal: dense resident on the 6900XT (ROCm1, 16GB, TB3 eGPU), experts paged on the R9700 (ROCm0, 32GB),
+freeing the full 32GB for expert cache. Codex-implemented (--weight-paging-resident-device flag +
+tensor_buft_overrides dense->resident/expert->paging + per-device pools, merged).
+**FAULTS (reproduces on host AND P2P, game-independent):**
+```
+sched_reserve: layer 0 assigned to ROCm0 but Flash Attention tensor assigned to ROCm1 -> FA DISABLED
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 40288 MiB on device 1 -> cudaMalloc OOM (16GB card)
+graph_reserve: failed to allocate compute buffers -> Memory access fault (GPU node-1)
+```
+ROOT CAUSE: cross-device split (attention weights on ROCm1, layer compute on ROCm0) -> ggml scheduler can't
+run cross-device Flash Attention -> disables FA -> non-FA attention materializes the full attention matrix
+-> ~42GB compute buffer pinned to the 16GB card -> OOM -> fault. NOT the game, NOT P2P, NOT the `.*` override
+alone — the FA-disable is the trigger.
+
+STRATEGIC CAVEAT: Phase 2's payoff (bigger expert cache) is exactly what we measured as NOT helping. So
+solving cross-device FA is worth it ONLY if paired with a cache/locality win, OR if the goal is running
+BIGGER-dense models that don't fit one card. **USER DECISION: solve cross-device Flash Attention.**
+
+CANDIDATE APPROACHES for cross-device FA (Codex reviewer analyzing -> /home/kmbandy/wp_logs/codex-review-findings.md):
+(a) force the WHOLE attention subgraph (incl activations) onto ONE device so FA stays intra-device; only the
+    residual stream crosses TB3 (KB-scale). Most promising — matches the original "activations cross, weights don't" design.
+(b) keep attention compute on ROCm0, offload only NON-attention dense (shared expert/embeddings ~2GB) to
+    ROCm1 — frees little (attention q_b/output_a/b are ~11GB of the 13.7GB dense).
+(c) make FA cross-device-capable (deep ggml-cuda change).
+(d) constrain compute-buffer/KV placement off the 16GB card.
+
+### RIG / BUILD REMINDERS
+- ONE build: ~/GitHub/llama.cpp/build-hip, dual-arch (gfx1201;gfx1030). Main checkout on feat/dsws-phaseb-conversion.
+- ggml device order: ROCm0 = R9700 (32GB, gfx1201, paging/compute), ROCm1 = 6900XT (16GB, gfx1030, TB3 eGPU, dense-resident target).
+- GPU data-collection logs -> REAL DISK (/home/kmbandy/wp_logs), never /tmp (brick wipes tmpfs).
+- Two GPU faults this session both recovered WITHOUT reboot (MODE1 reset, VRAM reclaimed).
