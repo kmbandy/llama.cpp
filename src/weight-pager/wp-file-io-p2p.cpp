@@ -116,6 +116,7 @@ public:
         sqe->flags    |= IOSQE_FIXED_FILE;
         sqe->user_data = req_id;
         pending_submit_.push_back(req_id);
+        pending_reqs_.push_back(req_id);
         ++pending_;
         return true;
     }
@@ -174,6 +175,7 @@ public:
                 out.bytes_read = ret;
                 out.req_id     = 0;  // transport-level failure — fatal, propagate
                 switch_to_host_errno_("io_uring wait failed", ret < 0 ? -ret : 0);
+                fail_p2p_pending_(ret < 0 ? ret : -EIO);
                 return true;
             }
 
@@ -182,6 +184,7 @@ public:
             const int res = cqe->res;
             io_uring_cqe_seen(&ring_, cqe);
             --pending_;
+            remove_pending_req_(out.req_id);
 
             if (res < 0) {
                 out.status     = IoStatus::ErrorIo;
@@ -261,6 +264,7 @@ private:
             r.bytes_read = err;
             ready_[req_id] = r;
             --pending_;
+            remove_pending_req_(req_id);
         }
     }
 
@@ -321,6 +325,7 @@ private:
         const int res = cqe->res;
         io_uring_cqe_seen(&ring_, cqe);
         --pending_;
+        remove_pending_req_(r.req_id);
 
         if (res < 0) {
             r.status     = IoStatus::ErrorIo;
@@ -332,6 +337,28 @@ private:
         }
         ready_[r.req_id] = r;
         return true;
+    }
+
+    void remove_pending_req_(uint64_t req_id) {
+        for (auto it = pending_reqs_.begin(); it != pending_reqs_.end(); ++it) {
+            if (*it == req_id) {
+                pending_reqs_.erase(it);
+                return;
+            }
+        }
+    }
+
+    void fail_p2p_pending_(int err) {
+        for (uint64_t req_id : pending_reqs_) {
+            IoResult r;
+            r.req_id     = req_id;
+            r.status     = IoStatus::ErrorIo;
+            r.bytes_read = err;
+            ready_[req_id] = r;
+        }
+        pending_reqs_.clear();
+        pending_submit_.clear();
+        pending_ = 0;
     }
 
     bool init_(int queue_depth, const FileIOP2PConfig & cfg) {
@@ -480,6 +507,7 @@ private:
     bool files_registered_ = false;
     int pending_ = 0;
     std::deque<uint64_t> pending_submit_;
+    std::deque<uint64_t> pending_reqs_;
     struct io_uring ring_ {};
     void * libhsa_ = nullptr;
     HsaExportDmaBufFn hsa_export_ = nullptr;

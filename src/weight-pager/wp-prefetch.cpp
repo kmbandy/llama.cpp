@@ -438,9 +438,22 @@ bool PrefetchScheduler::wait_for(int page_idx, int timeout_ms) {
             // Block for THIS slot's read by its req_id. The demux buffers any
             // other consumer's completion reaped while we wait instead of
             // dropping it, so nothing on the shared ring is lost.
-            IoResult r = file_io_->wait_for_req(s.req_id, remaining_ms);
+            const uint64_t expected_req_id = s.req_id;
+            IoResult r = file_io_->wait_for_req(expected_req_id, remaining_ms);
             if (r.status == IoStatus::Timeout) return false;
+            if (r.req_id != expected_req_id) {
+                LLAMA_LOG_WARN("wp::PrefetchScheduler: stage 1 wait for page %d req_id=%lu failed with status=%d req_id=%lu\n",
+                               s.page_idx,
+                               (unsigned long) expected_req_id,
+                               (int) r.status,
+                               (unsigned long) r.req_id);
+                req_to_slot_.erase(expected_req_id);
+                s.req_id = 0;
+                s.state = State::Failed;
+                return false;
+            }
             process_io_(r);
+            if (s.state == State::Failed) return false;
             continue;
         }
         if (s.state == State::Stage1Done) {

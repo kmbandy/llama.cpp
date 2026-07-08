@@ -8,9 +8,11 @@
 #include "weight-pager/wp-page-catalog.h"
 #include "weight-pager/wp-eval-cb.h"
 #include "weight-pager/wp-file-io.h"
+#include "weight-pager/wp-gpu-transport.h"
 #include "weight-pager/wp-host-tier.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
+#include "weight-pager/wp-prefetch.h"
 #include "weight-pager/wp-router.h"
 
 #include "ggml-backend.h"
@@ -61,6 +63,41 @@ struct ScopedEnv {
         ++fails; \
     } \
 } while (0)
+
+class TransportErrorReqIdZeroFileIO : public wp::FileIOLayer {
+public:
+    bool submit(uint64_t req_id, int /*fd_idx*/, uint64_t /*offset*/,
+                size_t size, void * dst) override {
+        if (req_id == 0 || size == 0 || dst == nullptr || pending_ != 0) {
+            return false;
+        }
+        pending_ = 1;
+        return true;
+    }
+
+    void flush() override {}
+    int pending() const override { return pending_; }
+    int fd(int /*fd_idx*/) const override { return -1; }
+    wp::FileIOTransport transport() const override { return wp::FileIOTransport::SyncPread; }
+
+protected:
+    bool reap_raw_(int timeout_ms, wp::IoResult & out) override {
+        if (timeout_ms == 0 || emitted_) {
+            return false;
+        }
+        emitted_ = true;
+        pending_ = 0;
+        out = wp::IoResult{};
+        out.req_id = 0;
+        out.status = wp::IoStatus::ErrorIo;
+        out.bytes_read = -EIO;
+        return true;
+    }
+
+private:
+    int pending_ = 0;
+    bool emitted_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // PageCatalog
@@ -408,6 +445,33 @@ static int test_dup_clear_o_direct() {
 
     // Negative: dup_clear_o_direct(-1) returns -1.
     EXPECT_EQ_INT(wp::dup_clear_o_direct(-1), -1, "invalid fd returns -1");
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// PrefetchScheduler
+// ---------------------------------------------------------------------------
+
+static int test_prefetch_wait_transport_error_req_id_zero() {
+    int fails = 0;
+
+    TransportErrorReqIdZeroFileIO file_io;
+    wp::GpuTransport gpu;
+    wp::PrefetchScheduler prefetch;
+    std::vector<uint8_t> dst(64, 0);
+
+    EXPECT(prefetch.init(&file_io, &gpu, /*max_page_size=*/64, /*queue_depth=*/1),
+           "prefetch init");
+    EXPECT(prefetch.submit(/*page_idx=*/7, /*fd_idx=*/0, /*file_offset=*/0,
+                           /*payload_size=*/32, dst.data(), /*slot_size=*/64),
+           "prefetch submit");
+
+    bool ok = prefetch.wait_for(/*page_idx=*/7, /*timeout_ms=*/-1);
+    EXPECT(!ok, "transport ErrorIo req_id 0 fails waited slot");
+
+    prefetch.reap(/*page_idx=*/7);
+    EXPECT_EQ_INT(prefetch.pending(), 0, "failed slot can be reaped");
 
     return fails;
 }
@@ -1782,6 +1846,7 @@ int main() {
         { "page_catalog",                test_page_catalog                },
         { "page_catalog_moe_classify",   test_page_catalog_moe_classification },
         { "page_catalog_consolidated",   test_page_catalog_consolidated_split },
+        { "prefetch_wait_transport_error_req_id_zero", test_prefetch_wait_transport_error_req_id_zero },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
