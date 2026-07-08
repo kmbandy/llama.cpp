@@ -113,11 +113,10 @@ public:
     // The caller should obtain them via dup_clear_o_direct() to fix B-P3.
     // The pager takes ownership of the fds; they are closed on shutdown.
     //
-    // `devices_used` is the set of HIP/CUDA device indices the model's
-    // weights are allocated on, taken from the model loader. If size > 1
-    // init returns false with a clear error message — the pager is single-
-    // device by design in Phase 1 (per-device pools are a future extension).
-    // This guard fixes B-P7.
+    // Paging is single-device by contract: under WP_RESIDENT_DENSE only routed
+    // experts page, and they all live on the paging device, so one pool keyed
+    // by that device's buffer type is sufficient. Dense/attention weights are
+    // resident on the (possibly different) attention device and never page.
     //
     // `device_buft` is the buffer type for the device the pager will
     // allocate VRAM on. Should match devices_used.front().

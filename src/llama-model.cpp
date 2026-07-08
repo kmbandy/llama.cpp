@@ -1965,18 +1965,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // load tensor data. With weight-paging enabled, ALL weights are paged
-    // (we removed the token_embd/output_norm/output exclusion to fix the
-    // never-allocated-never-loaded bug), so the GPU-paged ctxs have all
-    // weight tensors with buffer == NULL and the pager handles their data.
-    // Host bufts (when paging is on, these only carry non-weight tensors
-    // like RoPE freqs) still need load_all_data; the host buft path above
-    // allocates them normally.
-    // Iterate every ctx. load_all_data internally skips tensors with
-    // buffer==NULL (the per-layer paged ones, which the pager owns), so
-    // it's safe to call on the GPU-paged ctxs too — it will populate the
-    // resident weights (token_embd, output_norm, output.weight) that we
-    // allocated above and skip the paged ones.
+    // load tensor data. With WP_RESIDENT_DENSE enabled, only routed experts
+    // are cataloged/paged; dense and attention tensors use the normal resident
+    // allocator. Other weight-paging modes still leave paged tensors with
+    // buffer == NULL for the pager to handle. Iterate every ctx:
+    // load_all_data internally skips tensors with buffer == NULL and loads the
+    // resident tensors allocated above.
     {
         int ctx_i = 0;
         for (auto & [ctx, buf_map] : ctx_buf_maps) {

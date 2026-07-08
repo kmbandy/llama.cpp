@@ -130,8 +130,8 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     //    in weight_pager->weight_bufts. Some of those will be host
     //    (token embedding output, RoPE freqs, etc. that always live on
     //    CPU); we only care about the GPU-side bufts because that's what
-    //    the pager pool allocates against. Phase 1 is single-device by
-    //    design (B-P7).
+    //    the pager pool allocates against. Paged tensors are experts-only
+    //    under WP_RESIDENT_DENSE and are single-device by contract.
     std::vector<ggml_backend_buffer_type_t> gpu_bufts;
     for (auto * b : model.weight_pager->weight_bufts) {
         if (b == nullptr) continue;
