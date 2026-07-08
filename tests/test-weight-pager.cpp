@@ -11,6 +11,7 @@
 #include "weight-pager/wp-host-tier.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
+#include "weight-pager/wp-router.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1695,6 +1696,46 @@ static int test_routing_boundary_prepass() {
     return fails;
 }
 
+static int test_router_overrides_expert_only() {
+    int fails = 0;
+
+    // sentinel non-null buft pointers (builder never dereferences them)
+    auto paging = (ggml_backend_buffer_type_t) 0x1;
+    auto ov = wp::build_router_overrides(paging, nullptr);
+    EXPECT_EQ_INT((int) ov.size(), 2, "expert entry + terminator only");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN),
+           "first override is the expert pattern");
+    EXPECT(ov[0].buft == paging, "expert routed to paging buft");
+    EXPECT(ov[1].pattern == nullptr, "list is terminated");
+    for (const auto & o : ov) {
+        if (o.pattern) {
+            EXPECT(std::string(o.pattern) != std::string(".*"),
+                   "no greedy .* dense override present");
+        }
+    }
+    return fails;
+}
+
+static int test_router_overrides_preserve_user() {
+    int fails = 0;
+
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto userbuft = (ggml_backend_buffer_type_t) 0x2;
+    llama_model_tensor_buft_override user[] = {
+        { "attn_q\\.", userbuft },
+        { nullptr, nullptr },
+    };
+    auto ov = wp::build_router_overrides(paging, user);
+    EXPECT_EQ_INT((int) ov.size(), 3, "expert + 1 user override + terminator");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN),
+           "expert override comes first");
+    EXPECT(std::string(ov[1].pattern) == std::string("attn_q\\."),
+           "user override preserved after expert");
+    EXPECT(ov[1].buft == userbuft, "user override buft preserved");
+    EXPECT(ov[2].pattern == nullptr, "list is terminated");
+    return fails;
+}
+
 static int test_wp_paged_batch_flag_default_off() {
     int fails = 0;
     ScopedEnv guard("WP_PAGED_BATCH");
@@ -1781,6 +1822,8 @@ int main() {
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },
         { "pool_default_threshold_zero_lru",     test_pool_default_threshold_zero_is_pure_lru },
         { "routing_boundary_prepass",            test_routing_boundary_prepass            },
+        { "router_overrides_expert_only",        test_router_overrides_expert_only        },
+        { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
     };
 

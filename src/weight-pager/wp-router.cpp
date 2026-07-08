@@ -1,0 +1,21 @@
+#include "weight-pager/wp-router.h"
+
+namespace wp {
+
+const char * const ROUTER_EXPERT_PATTERN = "ffn_(up|gate|down)_exps\\.";
+
+std::vector<llama_model_tensor_buft_override> build_router_overrides(
+        ggml_backend_buffer_type_t paging_buft,
+        const llama_model_tensor_buft_override * user_overrides) {
+    std::vector<llama_model_tensor_buft_override> out;
+    out.push_back({ ROUTER_EXPERT_PATTERN, paging_buft });
+    if (user_overrides != nullptr) {
+        for (const auto * o = user_overrides; o->pattern != nullptr; ++o) {
+            out.push_back(*o);
+        }
+    }
+    out.push_back({ nullptr, nullptr });
+    return out;
+}
+
+} // namespace wp
