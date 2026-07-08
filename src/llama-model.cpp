@@ -1866,13 +1866,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (!weight) { continue; }
                 if (wp_device_router_enabled && ctx_buft != nullptr) {
                     const char * n = ggml_get_name(t);
-                    ggml_backend_buffer_type_t expected_buft =
-                        wp_is_routed_expert(n) ? wp_paging_buft : wp_resident_buft;
-                    if (expected_buft != nullptr && ctx_buft != expected_buft) {
+                    // Routed experts MUST land on the paging device (so they actually page).
+                    // Non-expert (dense) tensors may be resident on EITHER GPU - the .* override
+                    // defaults them to the resident card, but large non-attention tensors
+                    // (token_embd/output) are intentionally placed on the paging card to free
+                    // resident VRAM. Only fail loudly if an expert escaped the paging device.
+                    if (wp_is_routed_expert(n) && wp_paging_buft != nullptr && ctx_buft != wp_paging_buft) {
                         throw std::runtime_error(format(
-                            "weight-paging: tensor %s routed to %s, expected %s",
+                            "weight-paging: routed expert %s landed on %s, expected paging device %s",
                             n, ggml_backend_buft_name(ctx_buft),
-                            ggml_backend_buft_name(expected_buft)));
+                            ggml_backend_buft_name(wp_paging_buft)));
                     }
                 }
                 // MAD-88: skip huge non-block tensors from paging. token_embd

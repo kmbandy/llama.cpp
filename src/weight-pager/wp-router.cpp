@@ -11,6 +11,10 @@ std::vector<llama_model_tensor_buft_override> build_router_overrides(
         const llama_model_tensor_buft_override * user_overrides) {
     std::vector<llama_model_tensor_buft_override> out;
     out.push_back({ ROUTER_EXPERT_PATTERN, paging_buft });
+    // Offload the two large non-attention dense tensors to the paging card to
+    // free resident-card VRAM (they stay resident there, not paged).
+    out.push_back({ "token_embd\\.",  paging_buft });
+    out.push_back({ "output\\.weight", paging_buft });
     if (user_overrides != nullptr) {
         for (const auto * o = user_overrides; o->pattern != nullptr; ++o) {
             out.push_back(*o);
