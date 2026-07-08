@@ -1361,6 +1361,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<llama_model_tensor_buft_override> wp_tensor_buft_overrides;
     ggml_backend_buffer_type_t wp_paging_buft = nullptr;
     ggml_backend_buffer_type_t wp_resident_buft = nullptr;
+    ggml_backend_dev_t         wp_resident_dev = nullptr;   // C1: layer-home device when router active
     bool wp_device_router_enabled = false;
 
     if (params.weight_paging_enabled && wp_resident_dense_enabled() && !devices.empty()) {
@@ -1383,6 +1384,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             wp_tensor_buft_overrides.push_back({ nullptr, nullptr });
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             wp_device_router_enabled = true;
+            wp_resident_dev = devices[resident_idx].dev;   // C1: home device for offloaded layers
             LLAMA_LOG_INFO("%s: WP_RESIDENT_DENSE router: paging=%s (%s), resident=%s (%s)\n",
                            __func__,
                            ggml_backend_dev_name(devices[paging_idx].dev), ggml_backend_buft_name(wp_paging_buft),
@@ -1441,6 +1443,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
+        if (wp_device_router_enabled && wp_resident_dev != nullptr) {
+            // C1: pin every offloaded layer's home to the resident/attention
+            // device so KV cache + attention weights + FA node co-locate there
+            // and Flash Attention stays intra-device. Only routed experts are
+            // moved off (via tensor_buft_overrides), not the layer home.
+            dev = wp_resident_dev;
+        }
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
@@ -1457,6 +1466,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    if (wp_device_router_enabled && wp_resident_dev != nullptr) {
+        LLAMA_LOG_INFO("%s: WP router: layer-home pinned to resident device %s "
+                       "(experts overridden to paging device)\n",
+                       __func__, ggml_backend_dev_name(wp_resident_dev));
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
