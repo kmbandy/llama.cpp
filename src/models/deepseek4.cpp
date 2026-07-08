@@ -1092,6 +1092,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    auto set_layer_boundary_inp = [&](int ib, ggml_tensor * x) {
+        if (ib >= 0 && ib < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[ib]) {
+            res->t_layer_inp[ib] = ggml_reshape_2d(ctx0, x, n_embd*hc, n_tokens);
+            cb(res->t_layer_inp[ib], "layer_inp", ib);
+        }
+    };
+    set_layer_boundary_inp(0, inpL);
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
@@ -1163,6 +1171,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+        set_layer_boundary_inp(il + 1, inpL);
     }
 
     if (inp_out_ids) {
