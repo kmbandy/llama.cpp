@@ -36,7 +36,7 @@ std::atomic<uint64_t> g_routed_expert_ptrs_discarded_unconsumed{0};
 // stream to the eval_cb lets it use hipMemcpyAsync(stream), which is
 // stream-ordered with the MMQ kernels and removes both the race and
 // the device-wide sync.
-thread_local void * tls_wp_compute_stream = nullptr;
+thread_local void * tls_wp_compute_stream[GGML_CUDA_MAX_DEVICES] = { nullptr };
 }  // namespace
 
 void ggml_cuda_set_routed_expert_ptrs(const void * const * ptr) {
@@ -113,12 +113,17 @@ void ggml_cuda_wp_routing_guard_check(
     GGML_ABORT("WP_ROUTING_GUARD routed expert pointer invariant failed");
 }
 
-void ggml_cuda_set_wp_compute_stream(void * stream) {
-    tls_wp_compute_stream = stream;
+void ggml_cuda_set_wp_compute_stream(int device, void * stream) {
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        tls_wp_compute_stream[device] = stream;
+    }
 }
 
-void * ggml_cuda_get_wp_compute_stream() {
-    return tls_wp_compute_stream;
+void * ggml_cuda_get_wp_compute_stream(int device) {
+    if (device >= 0 && device < GGML_CUDA_MAX_DEVICES) {
+        return tls_wp_compute_stream[device];
+    }
+    return nullptr;
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {

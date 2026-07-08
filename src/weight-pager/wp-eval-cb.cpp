@@ -12,7 +12,7 @@
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
 extern "C++" void                  ggml_cuda_set_routed_expert_ptrs(const void * const * ptr);
 extern "C++" void                  ggml_cuda_discard_routed_expert_ptrs();
-extern "C++" void *                ggml_cuda_get_wp_compute_stream();
+extern "C++" void *                ggml_cuda_get_wp_compute_stream(int device);
 #endif
 
 #include <chrono>        // WP_PROFILE_EVAL host-time instrumentation
@@ -166,6 +166,12 @@ struct ScopedHipDevice {
     }
 };
 
+int current_hip_device() {
+    int device = -1;
+    hipError_t err = hipGetDevice(&device);
+    return err == hipSuccess ? device : -1;
+}
+
 struct PendingAsyncOp {
     WeightPager *     pager = nullptr;
     std::vector<int> pages;
@@ -253,7 +259,7 @@ void weight_pager_eval_cb_reset(WeightPager * pager) {
 
     if (s_prev_op_pager == pager &&
         (!s_pinned_pages_prev_op.empty() || !s_async_events_prev_op.empty())) {
-        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
         if (wp_stream != nullptr) {
             hipError_t st = hipStreamSynchronize(wp_stream);
             if (st != hipSuccess) {
@@ -409,7 +415,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         }
 
         if (!s_pinned_pages_prev_op.empty() || !s_async_events_prev_op.empty()) {
-            hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+            hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
             if (wp_stream != nullptr) {
                 PendingAsyncOp op;
                 op.pager = s_prev_op_pager != nullptr ? s_prev_op_pager : pager;
@@ -466,7 +472,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         const int evt = pager->take_async_transfer_event(page_idx);
         if (evt < 0) return;
 
-        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream();
+        hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
         if (wp_stream != nullptr && pager->enqueue_async_transfer_wait(evt, wp_stream)) {
             prev_events.push_back(AsyncTransferEvent{page_idx, evt});
             return;
@@ -588,7 +594,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 // is absent or belongs to another device, fall
                                 // back to host-ordered synchronous copies.
                                 hipStream_t wp_stream =
-                                    (hipStream_t) ggml_cuda_get_wp_compute_stream();
+                                    (hipStream_t) ggml_cuda_get_wp_compute_stream(target_device);
                                 if (wp_stream != nullptr) {
                                     hipDevice_t stream_device = -1;
                                     hipError_t stream_err = hipStreamGetDevice(wp_stream, &stream_device);

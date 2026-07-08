@@ -4239,5 +4239,5 @@ void                  ggml_cuda_wp_routing_guard_check(
 // ggml_backend_cuda_graph_compute at the top of each graph compute.
 // void * carries cudaStream_t (opaque) without polluting the header
 // with cuda types.
-void   ggml_cuda_set_wp_compute_stream(void * stream);
-void * ggml_cuda_get_wp_compute_stream();
+void   ggml_cuda_set_wp_compute_stream(int device, void * stream);
+void * ggml_cuda_get_wp_compute_stream(int device);
