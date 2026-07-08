@@ -532,6 +532,18 @@ void llama_context::sched_reserve() {
         }
 
         if (fa_device_mismatch) {
+            if (model.wp_pager != nullptr && model.n_devices() > 1) {
+                // C4: under the WP two-card resident-dense router, a disabled FA
+                // means the non-FA path will try to allocate the full ~40 GB KQ
+                // matrix on a GPU and OOM / fault. Refuse loudly instead of
+                // silently falling through. See the attention-island design:
+                // layer-home + KV + FA must co-locate on the resident device.
+                throw std::runtime_error(
+                    "weight-paging cross-device: Flash Attention resolved to DISABLED "
+                    "(FA node device != layer/KV device). The non-FA attention path "
+                    "would OOM a full attention matrix. Ensure the resident device "
+                    "hosts attention+KV+FA (home-device inversion / --weight-paging-resident-device).");
+            }
             cparams.flash_attn = false;
             LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
         } else {
