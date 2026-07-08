@@ -1,6 +1,7 @@
 #include "wp-eval-cb.h"
 #include "wp-pager.h"
 
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
 
@@ -115,6 +116,54 @@ struct ProfGuard {
 struct AsyncTransferEvent {
     int page_idx = -1;
     int event_handle = -1;
+};
+
+int hip_device_idx_from_tensor(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return -1;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    const char * dev_name = dev != nullptr ? ggml_backend_dev_name(dev) : nullptr;
+    if (dev_name == nullptr) {
+        return -1;
+    }
+
+    const char * p = dev_name;
+    while (*p != '\0' && (*p < '0' || *p > '9')) {
+        ++p;
+    }
+    if (*p == '\0') {
+        return -1;
+    }
+
+    char * end = nullptr;
+    long v = std::strtol(p, &end, 10);
+    return end != p ? (int) v : -1;
+}
+
+struct ScopedHipDevice {
+    int prev = -1;
+    hipError_t err = hipSuccess;
+
+    explicit ScopedHipDevice(int target) {
+        if (target < 0) {
+            err = hipErrorInvalidDevice;
+            return;
+        }
+        err = hipGetDevice(&prev);
+        if (err != hipSuccess) {
+            return;
+        }
+        err = hipSetDevice(target);
+    }
+
+    ~ScopedHipDevice() {
+        if (err == hipSuccess && prev >= 0) {
+            (void) hipSetDevice(prev);
+        }
+    }
 };
 
 struct PendingAsyncOp {
@@ -490,11 +539,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     // doesn't evict slots that were just ensure()d (LRU
                     // tracks insertion order).
                     //
-                    // Single-buffer device pointer cache: we reuse a
-                    // statically-allocated device array sized for
-                    // kMaxExperts. cudaMemcpyAsync + kernel launch on the
-                    // same stream serialise correctly — no race with the
-                    // previous op.
+                    // Per-device pointer cache: each HIP device needs its
+                    // own device allocation for the table consumed by MMQ.
                     struct ggml_tensor * idx_tensor = t->src[2];
                     if (n_subs > 0 && idx_tensor != nullptr) {
                         constexpr int kMaxExperts = 256;
@@ -502,33 +548,57 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                             LLAMA_LOG_WARN("[wp::eval_cb] consolidated tensor has %d experts > kMaxExperts=%d, skipping routing\n",
                                            n_subs, kMaxExperts);
                         } else {
-                            // Lazy device-buffer init.
-                            static const void * * s_dev_expert_ptrs = nullptr;
-                            if (s_dev_expert_ptrs == nullptr) {
-                                hipError_t alloc_err = hipMalloc(&s_dev_expert_ptrs,
-                                                                 kMaxExperts * sizeof(const void *));
-                                if (alloc_err != hipSuccess) {
-                                    LLAMA_LOG_WARN("[wp::eval_cb] hipMalloc for expert_ptrs failed: %s\n",
-                                                   hipGetErrorString(alloc_err));
-                                    s_dev_expert_ptrs = nullptr;
+                            int target_device = hip_device_idx_from_tensor(t);
+                            if (target_device < 0) {
+                                target_device = hip_device_idx_from_tensor(idx_tensor);
+                            }
+                            ScopedHipDevice hip_device(target_device);
+                            if (hip_device.err != hipSuccess) {
+                                LLAMA_LOG_WARN("[wp::eval_cb] hipSetDevice(%d) for expert_ptrs failed: %s\n",
+                                               target_device, hipGetErrorString(hip_device.err));
+                            }
+
+                            static std::unordered_map<int, const void * *> s_dev_expert_ptrs_by_device;
+                            const void * * dev_expert_ptrs = nullptr;
+                            if (hip_device.err == hipSuccess) {
+                                auto it = s_dev_expert_ptrs_by_device.find(target_device);
+                                if (it != s_dev_expert_ptrs_by_device.end()) {
+                                    dev_expert_ptrs = it->second;
+                                } else {
+                                    hipError_t alloc_err = hipMalloc(&dev_expert_ptrs,
+                                                                     kMaxExperts * sizeof(const void *));
+                                    if (alloc_err == hipSuccess) {
+                                        s_dev_expert_ptrs_by_device[target_device] = dev_expert_ptrs;
+                                    } else {
+                                        LLAMA_LOG_WARN("[wp::eval_cb] hipMalloc for expert_ptrs on device %d failed: %s\n",
+                                                       target_device, hipGetErrorString(alloc_err));
+                                        dev_expert_ptrs = nullptr;
+                                    }
                                 }
                             }
 
-                            if (s_dev_expert_ptrs != nullptr) {
+                            if (dev_expert_ptrs != nullptr) {
                                 // Pick up the GGML CUDA compute stream so all
-                                // host↔device transfers below are stream-ordered
+                                // host-device transfers below are stream-ordered
                                 // with the kernels that produce / consume them.
                                 // GGML creates compute streams with
                                 // cudaStreamNonBlocking (common.cuh:1439), so a
                                 // synchronous hipMemcpy on the default stream
-                                // does NOT serialize with them — that race window
-                                // produced near-null GPU faults during MoE
-                                // prefill (MAD-230). nullptr falls back to
-                                // legacy sync behaviour for safety, but a
-                                // properly-initialised cuda backend always
-                                // provides the stream.
+                                // does NOT serialize with them. If the stream
+                                // is absent or belongs to another device, fall
+                                // back to host-ordered synchronous copies.
                                 hipStream_t wp_stream =
                                     (hipStream_t) ggml_cuda_get_wp_compute_stream();
+                                if (wp_stream != nullptr) {
+                                    hipDevice_t stream_device = -1;
+                                    hipError_t stream_err = hipStreamGetDevice(wp_stream, &stream_device);
+                                    if (stream_err != hipSuccess || (int) stream_device != target_device) {
+                                        LLAMA_LOG_WARN("[wp::eval_cb] compute stream device mismatch for expert_ptrs "
+                                                       "(target=%d, stream=%d, err=%s); using sync copies\n",
+                                                       target_device, (int) stream_device, hipGetErrorString(stream_err));
+                                        wp_stream = nullptr;
+                                    }
+                                }
 
                                 // MAD-230 follow-up: periodic compute-stream
                                 // drain so the GPU's command processor can
@@ -580,6 +650,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         mc_err = hipStreamSynchronize(wp_stream);
                                     }
                                 } else {
+                                    hipDeviceSynchronize();
                                     mc_err = hipMemcpy(host_indices.data(),
                                                        idx_tensor->data,
                                                        (size_t) n_indices * sizeof(int32_t),
@@ -734,24 +805,19 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     }
 
                                     // Write the per-expert pointer array via
-                                    // stream-ordered async H2D. s_dev_expert_ptrs
-                                    // is a STATIC buffer shared by every MoE op
-                                    // in this forward pass, but stream ordering
-                                    // makes that safe: on this same compute
-                                    // stream, the previous MMQ kernel's read
+                                    // stream-ordered async H2D. dev_expert_ptrs
+                                    // is per HIP device and reused by MoE ops on
+                                    // that same device. Stream ordering makes
+                                    // that safe: the previous MMQ kernel's read
                                     // completes before this memcpy executes,
                                     // and the next MMQ kernel's read happens
-                                    // after this memcpy completes. No device-
-                                    // wide sync (previously hipDeviceSynchronize)
-                                    // and no torn-pointer race (the previous
-                                    // sync-on-default-stream design had one;
-                                    // MAD-230). For pageable host memory,
+                                    // after this memcpy completes. For pageable host memory,
                                     // hipMemcpyAsync H2D does an internal
                                     // staging copy before returning, so
                                     // host_ptrs going out of scope at end of
                                     // eval_cb is safe.
                                     if (wp_stream != nullptr) {
-                                        hipMemcpyAsync(s_dev_expert_ptrs,
+                                        hipMemcpyAsync(dev_expert_ptrs,
                                                        host_ptrs.data(),
                                                        (size_t) n_subs * sizeof(const void *),
                                                        hipMemcpyHostToDevice,
@@ -762,12 +828,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         // happen with a properly initialised
                                         // GGML CUDA backend).
                                         hipDeviceSynchronize();
-                                        hipMemcpy(s_dev_expert_ptrs,
+                                        hipMemcpy(dev_expert_ptrs,
                                                   host_ptrs.data(),
                                                   (size_t) n_subs * sizeof(const void *),
                                                   hipMemcpyHostToDevice);
                                     }
-                                    ggml_cuda_set_routed_expert_ptrs(s_dev_expert_ptrs);
+                                    ggml_cuda_set_routed_expert_ptrs(dev_expert_ptrs);
                                     routing_tls_set = true;
 
                                     if (g_debug.mmid_consolidated <= 4) {
