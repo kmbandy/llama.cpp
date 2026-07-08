@@ -234,18 +234,39 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
     if (!slots_user_override) {
         size_t free_vram = 0, total_vram = 0;
-        hipMemGetInfo(&free_vram, &total_vram);
-        const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
-        const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
-        // Post-split per-expert max — small for MoE catalogs.
-        const size_t max_page_size = model.wp_pager->max_page_size();
-        const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
-        if (n_slots > n_slots_fit && n_slots_fit >= 1) {
-            LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
-                           "(%zu MiB free, %zu MiB/slot); pass --weight-paging-slots to override\n",
-                           __func__, n_slots, n_slots_fit,
-                           free_vram / (1024 * 1024), max_page_size / (1024 * 1024));
-            n_slots = n_slots_fit;
+
+        int prev_device = -1;
+        hipError_t hip_err = hipGetDevice(&prev_device);
+        if (hip_err == hipSuccess) {
+            hip_err = hipSetDevice(device_idx);
+        }
+        if (hip_err == hipSuccess) {
+            hip_err = hipMemGetInfo(&free_vram, &total_vram);
+        }
+        if (prev_device >= 0) {
+            hipError_t restore_err = hipSetDevice(prev_device);
+            if (restore_err != hipSuccess) {
+                LLAMA_LOG_WARN("%s: hipSetDevice(%d) restore failed after slot sizing: %s\n",
+                               __func__, prev_device, hipGetErrorString(restore_err));
+            }
+        }
+
+        if (hip_err != hipSuccess) {
+            LLAMA_LOG_WARN("%s: hipMemGetInfo on paging device %d failed: %s\n",
+                           __func__, device_idx, hipGetErrorString(hip_err));
+        } else {
+            const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
+            const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
+            // Post-split per-expert max — small for MoE catalogs.
+            const size_t max_page_size = model.wp_pager->max_page_size();
+            const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
+            if (n_slots > n_slots_fit && n_slots_fit >= 1) {
+                LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
+                               "(%zu MiB free, %zu MiB/slot); pass --weight-paging-slots to override\n",
+                               __func__, n_slots, n_slots_fit,
+                               free_vram / (1024 * 1024), max_page_size / (1024 * 1024));
+                n_slots = n_slots_fit;
+            }
         }
         if (n_slots < 1) n_slots = 1;
     }
