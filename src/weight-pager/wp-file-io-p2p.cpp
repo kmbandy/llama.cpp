@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <vector>
 #include <unistd.h>
@@ -103,7 +104,7 @@ public:
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
         if (sqe == nullptr) {
-            io_uring_submit(&ring_);
+            flush_submissions_();
             sqe = io_uring_get_sqe(&ring_);
         }
         if (sqe == nullptr) {
@@ -114,17 +115,18 @@ public:
         io_uring_prep_read(sqe, fd_idx, mapped_dst, (unsigned) size, (off_t) offset);
         sqe->flags    |= IOSQE_FIXED_FILE;
         sqe->user_data = req_id;
+        pending_submit_.push_back(req_id);
         ++pending_;
         return true;
     }
 
     void flush() override {
+        if (ring_ok_ && !pending_submit_.empty()) {
+            flush_submissions_();
+        }
         if (!p2p_enabled_ && pending_ == 0) {
             host_->flush();
             return;
-        }
-        if (ring_ok_ && pending_ > 0) {
-            io_uring_submit(&ring_);
         }
     }
 
@@ -136,6 +138,13 @@ public:
     // buffering happen in the base.
     bool reap_raw_(int timeout_ms, IoResult & out) override {
         if (ring_ok_ && pending_ > 0) {
+            if (!pending_submit_.empty()) {
+                flush_submissions_();
+            }
+            if (pending_ == 0) {
+                return false;
+            }
+
             struct io_uring_cqe * cqe = nullptr;
             int ret = 0;
             if (timeout_ms < 0) {
@@ -240,6 +249,90 @@ public:
 private:
     IoUringP2PFileIOLayer(std::vector<int> fds, std::unique_ptr<FileIOLayer> host)
         : fds_(std::move(fds)), host_(std::move(host)) {}
+
+    void synthesize_submit_failures_(int err) {
+        while (!pending_submit_.empty()) {
+            const uint64_t req_id = pending_submit_.front();
+            pending_submit_.pop_front();
+
+            IoResult r;
+            r.req_id     = req_id;
+            r.status     = IoStatus::ErrorNoSubmit;
+            r.bytes_read = err;
+            ready_[req_id] = r;
+            --pending_;
+        }
+    }
+
+    bool flush_submissions_() {
+        if (!ring_ok_ || pending_submit_.empty()) {
+            return true;
+        }
+
+        while (!pending_submit_.empty()) {
+            int ret = 0;
+            do {
+                ret = io_uring_submit(&ring_);
+            } while (ret == -EINTR);
+
+            if (ret == -EBUSY || ret == -EAGAIN || ret == 0) {
+                bool drained = false;
+                while (reap_ready_cqe_()) {
+                    drained = true;
+                }
+                if (drained) {
+                    continue;
+                }
+            }
+            if (ret < 0) {
+                switch_to_host_errno_("io_uring submit failed", -ret);
+                synthesize_submit_failures_(ret);
+                return false;
+            }
+            if (ret == 0) {
+                switch_to_host_("io_uring submit made no progress", 0);
+                synthesize_submit_failures_(-EAGAIN);
+                return false;
+            }
+
+            for (int i = 0; i < ret && !pending_submit_.empty(); ++i) {
+                pending_submit_.pop_front();
+            }
+        }
+        return true;
+    }
+
+    bool reap_ready_cqe_() {
+        if (pending_ == 0) {
+            return false;
+        }
+
+        struct io_uring_cqe * cqe = nullptr;
+        int ret = io_uring_peek_cqe(&ring_, &cqe);
+        if (ret == -EAGAIN || ret == -EINTR || cqe == nullptr) {
+            return false;
+        }
+        if (ret < 0) {
+            return false;
+        }
+
+        IoResult r;
+        r.req_id = cqe->user_data;
+        const int res = cqe->res;
+        io_uring_cqe_seen(&ring_, cqe);
+        --pending_;
+
+        if (res < 0) {
+            r.status     = IoStatus::ErrorIo;
+            r.bytes_read = res;
+            switch_to_host_errno_("read failed", -res);
+        } else {
+            r.status     = IoStatus::Ok;
+            r.bytes_read = res;
+        }
+        ready_[r.req_id] = r;
+        return true;
+    }
 
     bool init_(int queue_depth, const FileIOP2PConfig & cfg) {
         int rt_version = 0;
@@ -386,6 +479,7 @@ private:
     bool ring_ok_ = false;
     bool files_registered_ = false;
     int pending_ = 0;
+    std::deque<uint64_t> pending_submit_;
     struct io_uring ring_ {};
     void * libhsa_ = nullptr;
     HsaExportDmaBufFn hsa_export_ = nullptr;

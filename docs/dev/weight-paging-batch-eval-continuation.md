@@ -511,3 +511,26 @@ still ahead.
 hits (routing locality low at this cache size). Levers to go higher: (1) fix the depth>4 hang → QD>4;
 (2) Phase 2 (dense on 6900XT eGPU frees full 32GB R9700 for expert cache); (3) Phase 3 frequency-biased
 retention + prefetch coverage. Slot-count alone is a weak lever. Phase 1 gate: PASSED (coherent, >>0.4).
+
+---
+
+## 2026-07-07 — QD>4 HANG FIXED (Codex, validated) + parallel Codex work
+
+**QD>4 hang FIXED** (commit 945f9074a, merged): io_uring backends counted `pending_` when SQEs
+were PREPARED but ignored `io_uring_submit()`'s return. At depth 8/16 under resident-dense churn the
+CQ ring fills → `io_uring_submit` returns -EBUSY (SQEs NOT submitted) → a blocking wait_cqe waits for
+a req_id never kernel-owned → hang. Fix: track prepared-but-unsubmitted req_ids (pending_submit_
+deque), drain the CQ into the demux ready_ buffer on -EBUSY and retry; synthesize ErrorNoSubmit if
+truly stuck so waiters never hang. Applied to host + P2P io_uring. Regression test
+test_file_io_submit_batch_depth_one_targeted_waits. GPU-VALIDATED: depth-8 P2P resident-dense (was
+hanging) now health@40s, decode 0.9872 t/s, coherent ("...Rome in 753 BC."), sync_fallbacks=0.
+
+**KEY FINDING: QD is NOT the bottleneck.** depth-8 (0.99) ≈ depth-4 (1.04). page_ins 11348,
+evictions 9359, prefetch_hit_rate 0% — the expert cache thrashes (2000 slots ≪ working set, low
+cross-token routing locality). The path to 1-3 t/s is Phase 2 (dense on 6900XT eGPU → full 32GB
+R9700 for expert cache) + Phase 3 (frequency-biased retention + prefetch coverage), NOT queue depth.
+
+**Phase 2 committed on feat/wp-phase2 (Codex, d8196031a) — NOT yet GPU-validated.**
+--weight-paging-resident-device flag, dense→resident/expert→paging tensor_buft_overrides, per-device
+pager pools + relaxed >1-device guard, two-pool unit test. 38/38 unit tests. Needs multi-device
+forward validation on the R9700+6900XT(TB3) rig (cross-device activation copies are code-trace-only).

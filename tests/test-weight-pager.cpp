@@ -1418,6 +1418,52 @@ static int test_file_io_submit_batch_partial_failure() {
     return fails;
 }
 
+static int test_file_io_submit_batch_depth_one_targeted_waits() {
+    int fails = 0;
+
+    char path[] = "/tmp/wp-test-batch-depth1-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+
+    constexpr size_t N = 16384;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 19 + 11) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/true, 1);
+    EXPECT(layer != nullptr, "create_file_io non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    std::vector<std::vector<uint8_t>> dst(8, std::vector<uint8_t>(1024));
+    std::vector<wp::FileIOBatchRequest> reqs;
+    reqs.reserve(dst.size());
+    for (size_t i = 0; i < dst.size(); ++i) {
+        reqs.push_back({ 1000 + i, 0, (uint64_t) (i * 1536), 1024, dst[i].data() });
+    }
+
+    int n_ok = layer->submit_batch(reqs);
+    EXPECT_EQ_INT(n_ok, (int) reqs.size(), "all depth-1 batch entries accepted");
+
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        wp::IoResult r = layer->wait_for_req(reqs[i].req_id, /*timeout_ms=*/5000);
+        EXPECT(r.status == wp::IoStatus::Ok, "targeted wait returns Ok");
+        EXPECT_EQ_INT(r.req_id, reqs[i].req_id, "targeted wait req_id");
+        EXPECT_EQ_INT(r.bytes_read, 1024, "targeted wait bytes");
+        EXPECT(std::memcmp(dst[i].data(), pattern.data() + i * 1536, 1024) == 0,
+               "targeted wait content");
+    }
+    EXPECT_EQ_INT(layer->pending(), 0, "no pending after targeted waits");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // Completion demux — targeted waits must never drop a sibling's completion
 // ---------------------------------------------------------------------------
@@ -1705,6 +1751,7 @@ int main() {
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
         { "file_io_submit_batch",            test_file_io_submit_batch            },
         { "file_io_submit_batch_partial",    test_file_io_submit_batch_partial_failure },
+        { "file_io_submit_batch_depth_one_targeted_waits", test_file_io_submit_batch_depth_one_targeted_waits },
         { "file_io_demux_no_cross_drain",    test_file_io_demux_no_cross_drain    },
         { "compute_advise_ranges",    test_compute_advise_ranges    },
         { "is_uma_archname",          test_is_uma_archname          },
