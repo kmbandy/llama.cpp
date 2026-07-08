@@ -946,6 +946,9 @@ class GGUFWriter:
     def add_block_size(self, value: int) -> None:
         self.add_uint32(Keys.LLM.BLOCK_SIZE.format(arch=self.arch), value)
 
+    def add_dflash_hc_mult(self, value: int) -> None:
+        self.add_uint32(Keys.LLM.DFLASH_HC_MULT.format(arch=self.arch), value)
+
     def add_target_layers(self, value: Sequence[int]) -> None:
         self.add_array(Keys.LLM.TARGET_LAYERS.format(arch=self.arch), value)
 

@@ -11,13 +11,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
 
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+    ml.get_key(LLM_KV_DFLASH_HC_MULT, dflash_hc_mult, false);
+    if (dflash_hc_mult == 0) {
+        throw std::runtime_error("DFlash model has invalid 'dflash.hc_mult' metadata");
+    }
+
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * dflash_hc_mult * hparams.n_embd;
 
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [", __func__);
     for (size_t i = 0; i < target_layer_ids.size(); ++i) {
         LLAMA_LOG_INFO("%d%s", target_layer_ids[i], i + 1 < target_layer_ids.size() ? ", " : "");
     }
     LLAMA_LOG_INFO("]\n");
+    LLAMA_LOG_INFO("%s: DFlash hc_mult = %u\n", __func__, dflash_hc_mult);
 
     // optional interleaved sliding-window attention with per-layer pattern array.
     // DFlash has a single rope, so the SWA rope == main rope.
@@ -36,9 +42,23 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
+    int64_t n_draft_vocab = n_vocab;
+    const struct ggml_tensor * d2t_meta = ml->get_tensor_meta("d2t");
+    if (d2t_meta) {
+        n_draft_vocab = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_draft_vocab }, 0);
+        LLAMA_LOG_INFO("%s: DFlash using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_draft_vocab);
+    } else {
+        d2t = nullptr;
+        LLAMA_LOG_INFO("%s: DFlash without d2t (draft_vocab_size = %lld)\n", __func__, (long long) n_draft_vocab);
+    }
+
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_draft_vocab }, TENSOR_NOT_REQUIRED);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -269,6 +289,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     cur = build_lora_mm(output, cur);
+    if (model.d2t) {
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -631,17 +634,38 @@ class Qwen3_5MoeTextModel(_Qwen35MtpMixin, _Qwen35MRopeMixin, _LinearAttentionVR
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
-    def set_vocab(self):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         if self.target_model_dir is None:
             raise ValueError(
                 "DFlash draft model requires --target-model-dir to be specified. "
-                "Please provide the path to the target model directory containing the tokenizer."
+                "Please provide the path to the target model directory to read config.json"
             )
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            target_config = json.load(f)
+        if "text_config" in target_config:
+            target_config = {**target_config, **target_config["text_config"]}
+        self.target_vocab_size = target_config["vocab_size"]
+
+    def set_vocab(self):
         logger.info(f"DFlash: Using tokenizer from target model: {self.target_model_dir}")
-        original_dir = self.dir_model
-        self.dir_model = self.target_model_dir
-        super().set_vocab()
-        self.dir_model = original_dir
+
+        vocab = gguf.BpeVocab(self.target_model_dir)
+        logger.info(f"DFlash: Converting target tokenizer {vocab}")
+
+        tokens = []
+        toktypes = []
+        for text, _, toktype in vocab.all_tokens():
+            tokens.append(text)
+            toktypes.append(toktype)
+
+        self.gguf_writer.add_tokenizer_model(vocab.tokenizer_model)
+        self.gguf_writer.add_tokenizer_pre("deepseek-v3")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        special_vocab = gguf.SpecialVocab(self.target_model_dir, load_merges=True, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
 
         mask_token_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
         if mask_token_id is not None:
@@ -653,6 +677,7 @@ class DFlashModel(Qwen3Model):
         block_size = self.hparams.get("block_size", 16)
         self.gguf_writer.add_block_size(block_size)
         dflash_config = self.hparams.get("dflash_config", {})
+        self.gguf_writer.add_dflash_hc_mult(self.hparams.get("hc_mult", dflash_config.get("hc_mult", 1)))
 
         target_layer_ids = dflash_config.get("target_layer_ids", [])
         if target_layer_ids:
@@ -673,3 +698,61 @@ class DFlashModel(Qwen3Model):
         if not name.startswith("model."):
             name = "model." + name
         return super().filter_tensors((name, gen))
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        dflash_name = name.removeprefix("model.")
+
+        if dflash_name == "fc.weight":
+            yield (dflash_name, data_torch)
+            return
+
+        if dflash_name == "d2t":
+            if not hasattr(self, "_dflash_int_tensors"):
+                self._dflash_int_tensors = {}
+            self._dflash_int_tensors[dflash_name] = data_torch
+            return
+
+        if dflash_name == "t2d":
+            return
+
+        if dflash_name == "hidden_norm.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ENC_OUTPUT_NORM), data_torch)
+            return
+
+        if dflash_name == "embed_tokens.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.TOKEN_EMBD), data_torch)
+            return
+
+        if dflash_name == "lm_head.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT), data_torch)
+            return
+
+        if dflash_name == "norm.weight":
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT_NORM), data_torch)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        dflash_original_dtypes = {}
+        for name, data_torch in self.get_tensors():
+            dflash_name = name.removeprefix("model.")
+            if dflash_name == "d2t":
+                dflash_original_dtypes[dflash_name] = data_torch.dtype
+
+        super().prepare_tensors()
+
+        if hasattr(self, "_dflash_int_tensors"):
+            for name, data_torch in self._dflash_int_tensors.items():
+                old_dtype = dflash_original_dtypes.get(name, data_torch.dtype)
+                data = data_torch.to(torch.int64).cpu().numpy().reshape(-1)
+                data = data + np.arange(data.size, dtype=np.int64)
+                if np.any((data < 0) | (data >= self.target_vocab_size)):
+                    raise ValueError(f"DFlash d2t target ids out of range for target vocab size {self.target_vocab_size}")
+                if np.unique(data).size != data.size:
+                    raise ValueError("DFlash d2t contains duplicate target ids")
+
+                data_qtype = gguf.GGMLQuantizationType.I64
+                shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                logger.info(f"{name + ',':<30} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
+                self.gguf_writer.add_tensor(name, data, raw_dtype=data_qtype)
