@@ -3,9 +3,11 @@
 namespace wp {
 
 const char * const ROUTER_EXPERT_PATTERN = "ffn_(up|gate|down)_exps\\.";
+const char * const ROUTER_DENSE_PATTERN  = ".*";
 
 std::vector<llama_model_tensor_buft_override> build_router_overrides(
         ggml_backend_buffer_type_t paging_buft,
+        ggml_backend_buffer_type_t resident_buft,
         const llama_model_tensor_buft_override * user_overrides) {
     std::vector<llama_model_tensor_buft_override> out;
     out.push_back({ ROUTER_EXPERT_PATTERN, paging_buft });
@@ -14,6 +16,7 @@ std::vector<llama_model_tensor_buft_override> build_router_overrides(
             out.push_back(*o);
         }
     }
+    out.push_back({ ROUTER_DENSE_PATTERN, resident_buft });
     out.push_back({ nullptr, nullptr });
     return out;
 }

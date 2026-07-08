@@ -1371,10 +1371,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_idx].dev);
         }
         if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
-            // C2: override ONLY routed experts out to the paging device. Dense/
-            // attention tensors default to their layer home (the resident
-            // device, pinned in C1) - no greedy ".*" override.
-            wp_tensor_buft_overrides = wp::build_router_overrides(wp_paging_buft, params.tensor_buft_overrides);
+            // C2: override routed experts out to the paging device, then pin
+            // remaining dense tensors to the resident device.
+            wp_tensor_buft_overrides = wp::build_router_overrides(wp_paging_buft, wp_resident_buft, params.tensor_buft_overrides);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             wp_device_router_enabled = true;
             wp_resident_dev = devices[resident_idx].dev;   // C1: home device for offloaded layers

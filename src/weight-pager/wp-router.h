@@ -11,15 +11,20 @@ namespace wp {
 // identical to the paging catalog / is_paged_weight filter.
 extern const char * const ROUTER_EXPERT_PATTERN;
 
-// Build the tensor_buft_override list for the resident-dense device router.
-// Routes ONLY routed-expert tensors to `paging_buft`; every other tensor is
-// left with no override so it defaults to its layer-home device. Any
-// caller-supplied user overrides (nullptr-terminated array, may be null) are
-// appended AFTER the expert entry, then a {nullptr,nullptr} terminator.
-// The expert entry's .pattern is a static string literal (stable); user
-// patterns are borrowed from `user_overrides` and must outlive the result.
+// Dense catch-all regex (".*") used to pin every non-expert, non-user-overridden
+// tensor to the resident GPU buffer instead of a host/CPU fallback.
+extern const char * const ROUTER_DENSE_PATTERN;
+
+// Build the tensor_buft_override list for the resident-dense device router:
+//   [ {experts -> paging}, <user overrides...>, {".*" -> resident}, {null,null} ]
+// experts match first (win over the ".*"); user overrides come before the ".*"
+// catch-all so user intent is never shadowed; the trailing ".*" pins all
+// remaining dense tensors to the resident GPU buffer. The expert/dense .pattern
+// values are static string literals (stable); user patterns are borrowed from
+// `user_overrides` and must outlive the result.
 std::vector<llama_model_tensor_buft_override> build_router_overrides(
         ggml_backend_buffer_type_t paging_buft,
+        ggml_backend_buffer_type_t resident_buft,
         const llama_model_tensor_buft_override * user_overrides);
 
 } // namespace wp

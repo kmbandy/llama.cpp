@@ -1699,20 +1699,15 @@ static int test_routing_boundary_prepass() {
 static int test_router_overrides_expert_only() {
     int fails = 0;
 
-    // sentinel non-null buft pointers (builder never dereferences them)
-    auto paging = (ggml_backend_buffer_type_t) 0x1;
-    auto ov = wp::build_router_overrides(paging, nullptr);
-    EXPECT_EQ_INT((int) ov.size(), 2, "expert entry + terminator only");
-    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN),
-           "first override is the expert pattern");
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto ov = wp::build_router_overrides(paging, resident, nullptr);
+    EXPECT_EQ_INT((int) ov.size(), 3, "expert + dense catch-all + terminator");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
     EXPECT(ov[0].buft == paging, "expert routed to paging buft");
-    EXPECT(ov[1].pattern == nullptr, "list is terminated");
-    for (const auto & o : ov) {
-        if (o.pattern) {
-            EXPECT(std::string(o.pattern) != std::string(".*"),
-                   "no greedy .* dense override present");
-        }
-    }
+    EXPECT(std::string(ov[1].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all second");
+    EXPECT(ov[1].buft == resident, "dense catch-all routed to resident buft");
+    EXPECT(ov[2].pattern == nullptr, "list is terminated");
     return fails;
 }
 
@@ -1720,19 +1715,19 @@ static int test_router_overrides_preserve_user() {
     int fails = 0;
 
     auto paging   = (ggml_backend_buffer_type_t) 0x1;
-    auto userbuft = (ggml_backend_buffer_type_t) 0x2;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto userbuft = (ggml_backend_buffer_type_t) 0x3;
     llama_model_tensor_buft_override user[] = {
         { "attn_q\\.", userbuft },
         { nullptr, nullptr },
     };
-    auto ov = wp::build_router_overrides(paging, user);
-    EXPECT_EQ_INT((int) ov.size(), 3, "expert + 1 user override + terminator");
-    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN),
-           "expert override comes first");
-    EXPECT(std::string(ov[1].pattern) == std::string("attn_q\\."),
-           "user override preserved after expert");
+    auto ov = wp::build_router_overrides(paging, resident, user);
+    EXPECT_EQ_INT((int) ov.size(), 4, "expert + 1 user override + dense catch-all + terminator");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
+    EXPECT(std::string(ov[1].pattern) == std::string("attn_q\\."), "user override BEFORE dense catch-all (no shadowing)");
     EXPECT(ov[1].buft == userbuft, "user override buft preserved");
-    EXPECT(ov[2].pattern == nullptr, "list is terminated");
+    EXPECT(std::string(ov[2].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all comes after user override");
+    EXPECT(ov[3].pattern == nullptr, "list is terminated");
     return fails;
 }
 
