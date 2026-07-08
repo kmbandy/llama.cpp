@@ -1017,6 +1017,41 @@ static int test_pool_alloc_skips_pinned_in_eviction() {
     return fails;
 }
 
+static int test_pool_allocator_two_pools_independent() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    EXPECT(buft != nullptr, "cpu buffer_type available");
+    if (!buft) return fails;
+
+    wp::PoolAllocator pool_a;
+    wp::PoolAllocator pool_b;
+    EXPECT(pool_a.init(buft, /*n_slots=*/2, /*slot_size=*/128), "pool A init");
+    EXPECT(pool_b.init(buft, /*n_slots=*/3, /*slot_size=*/256), "pool B init");
+
+    int evict_a = -1;
+    int evict_b = -1;
+    pool_a.set_eviction_callback([&](int slot) { evict_a = slot; });
+    pool_b.set_eviction_callback([&](int slot) { evict_b = slot; });
+
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 0, "pool A first slot");
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 1, "pool A second slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 0, "pool B first slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 1, "pool B second slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 2, "pool B third slot");
+
+    pool_a.pin_slot(0);
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 1, "pool A evicts only its unpinned slot");
+    EXPECT_EQ_INT(evict_a, 1, "pool A eviction callback");
+    EXPECT_EQ_INT(evict_b, -1, "pool B not evicted by pool A pressure");
+    EXPECT(pool_a.is_pinned(0), "pool A pin remains local");
+    EXPECT(!pool_b.is_pinned(0), "pool B pin state remains independent");
+
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 0, "pool B evicts its own LRU slot");
+    EXPECT_EQ_INT(evict_b, 0, "pool B eviction callback");
+    pool_a.unpin_slot(0);
+    return fails;
+}
+
 static int test_pool_alloc_returns_neg1_when_all_pinned() {
     int fails = 0;
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
@@ -1676,6 +1711,7 @@ int main() {
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },
         { "pool_allocator",     test_pool_allocator     },
+        { "pool_allocator_two_pools_independent", test_pool_allocator_two_pools_independent },
         { "pool_size_class_packs_small_pages", test_pool_size_class_packs_small_pages },
         { "pool_size_class_pin_skip",          test_pool_size_class_pin_skip          },
         { "pool_pin_basic",                       test_pool_pin_basic                       },

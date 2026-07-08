@@ -1273,6 +1273,54 @@ static bool wp_is_routed_expert(const char * name) {
            std::strstr(p, "ffn_down_exps.") != nullptr;
 }
 
+static int wp_find_device_index_by_name(const std::vector<llama_device> & devices, const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (std::strcmp(ggml_backend_dev_name(devices[i].dev), name) == 0) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static int wp_select_paging_device_index(const llama_model_params & params, const std::vector<llama_device> & devices) {
+    if (devices.empty()) {
+        return -1;
+    }
+    if (params.main_gpu >= 0 && params.main_gpu < (int) devices.size()) {
+        return params.main_gpu;
+    }
+    return 0;
+}
+
+static int wp_select_resident_device_index(const llama_model_params & params,
+                                           const std::vector<llama_device> & devices,
+                                           int paging_idx) {
+    if (devices.empty()) {
+        return -1;
+    }
+    const char * requested = params.weight_paging_resident_device
+        ? params.weight_paging_resident_device
+        : "auto";
+    if (std::strcmp(requested, "auto") != 0) {
+        int idx = wp_find_device_index_by_name(devices, requested);
+        if (idx >= 0) {
+            return idx;
+        }
+        LLAMA_LOG_WARN("%s: resident device '%s' not found; falling back to paging device\n",
+                       __func__, requested);
+        return paging_idx;
+    }
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if ((int) i != paging_idx) {
+            return (int) i;
+        }
+    }
+    return paging_idx;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1306,6 +1354,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+    }
+
+    std::string wp_expert_override_pattern;
+    std::string wp_dense_override_pattern;
+    std::vector<llama_model_tensor_buft_override> wp_tensor_buft_overrides;
+    ggml_backend_buffer_type_t wp_paging_buft = nullptr;
+    ggml_backend_buffer_type_t wp_resident_buft = nullptr;
+    bool wp_device_router_enabled = false;
+
+    if (params.weight_paging_enabled && wp_resident_dense_enabled() && !devices.empty()) {
+        const int paging_idx = wp_select_paging_device_index(params, devices);
+        const int resident_idx = wp_select_resident_device_index(params, devices, paging_idx);
+        if (paging_idx >= 0 && resident_idx >= 0) {
+            wp_paging_buft = ggml_backend_dev_buffer_type(devices[paging_idx].dev);
+            wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_idx].dev);
+        }
+        if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
+            wp_expert_override_pattern = "ffn_(up|gate|down)_exps\\.";
+            wp_dense_override_pattern = ".*";
+            wp_tensor_buft_overrides.push_back({ wp_expert_override_pattern.c_str(), wp_paging_buft });
+            wp_tensor_buft_overrides.push_back({ wp_dense_override_pattern.c_str(),  wp_resident_buft });
+            if (params.tensor_buft_overrides != nullptr) {
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    wp_tensor_buft_overrides.push_back(*o);
+                }
+            }
+            wp_tensor_buft_overrides.push_back({ nullptr, nullptr });
+            ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
+            wp_device_router_enabled = true;
+            LLAMA_LOG_INFO("%s: WP_RESIDENT_DENSE router: paging=%s (%s), resident=%s (%s)\n",
+                           __func__,
+                           ggml_backend_dev_name(devices[paging_idx].dev), ggml_backend_buft_name(wp_paging_buft),
+                           ggml_backend_dev_name(devices[resident_idx].dev), ggml_backend_buft_name(wp_resident_buft));
+        } else {
+            LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router disabled: could not resolve paging/resident bufts\n",
+                           __func__);
+        }
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1760,10 +1845,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             }
 
-            bool ctx_has_weights = false;
+            bool ctx_has_paged_weights = false;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 const auto * weight = ml.get_weight(ggml_get_name(t));
                 if (!weight) { continue; }
+                if (wp_device_router_enabled && ctx_buft != nullptr) {
+                    const char * n = ggml_get_name(t);
+                    ggml_backend_buffer_type_t expected_buft =
+                        wp_is_routed_expert(n) ? wp_paging_buft : wp_resident_buft;
+                    if (expected_buft != nullptr && ctx_buft != expected_buft) {
+                        throw std::runtime_error(format(
+                            "weight-paging: tensor %s routed to %s, expected %s",
+                            n, ggml_backend_buft_name(ctx_buft),
+                            ggml_backend_buft_name(expected_buft)));
+                    }
+                }
                 // MAD-88: skip huge non-block tensors from paging. token_embd
                 // and output are needed every forward pass (vocab embed +
                 // logits), so paging them just adds SSD churn for no win.
@@ -1835,13 +1931,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (weight_pager) {
                         weight_pager->weight_tensor_ptrs.push_back(t);
                     }
+                    ctx_has_paged_weights = true;
                 }
-                ctx_has_weights = true;
             }
 
-            // Record the buft once per ctx that owns weight tensors.
+            // Record the buft once per ctx that owns paged weight tensors.
             // De-dupe so the multi-device guard reads a clean set.
-            if (ctx_has_weights && ctx_buft != nullptr && weight_pager) {
+            if (ctx_has_paged_weights && ctx_buft != nullptr && weight_pager) {
                 bool seen = false;
                 for (auto * existing : weight_pager->weight_bufts) {
                     if (existing == ctx_buft) { seen = true; break; }
@@ -2778,6 +2874,7 @@ llama_model_params llama_model_default_params() {
         /*.weight_paging_enabled       =*/ false,
         /*.weight_paging_slots         =*/ -1,
         /*.weight_paging_prefetch      =*/ false,
+        /*.weight_paging_resident_device =*/ "auto",
     };
 
     return result;

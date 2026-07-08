@@ -174,7 +174,14 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     // 3. Build the new pager: catalog + init.
     model.wp_pager = std::make_unique<wp::WeightPager>();
     for (const auto & info : ml.weight_page_infos) {
-        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts);
+        ggml_backend_buffer_type_t page_buft = buft;
+        for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
+            if (t != nullptr && info.name == ggml_get_name(t) && t->buffer != nullptr) {
+                page_buft = ggml_backend_buffer_get_type(t->buffer);
+                break;
+            }
+        }
+        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts, page_buft);
     }
     LLAMA_LOG_INFO("%s: catalog populated: %d page entries (source had %zu)\n",
                    __func__, model.wp_pager->n_pages(), ml.weight_page_infos.size());

@@ -104,7 +104,8 @@ public:
                  uint16_t            file_idx,
                  uint64_t            file_offset,
                  size_t              size,
-                 int                 n_experts = 1);
+                 int                 n_experts = 1,
+                 ggml_backend_buffer_type_t buft = nullptr);
 
     // Initialise the pool, transport, file-io layer, and prefetch scheduler.
     //
@@ -248,6 +249,7 @@ public:
     // Backing buffer for the pool — used by the eval-cb adapter when
     // patching tensor->buffer (B-P4 requires a valid ggml backend buffer).
     ggml_backend_buffer_t pool_buf() const { return pool_.vram_buf(); }
+    ggml_backend_buffer_t pool_buf(int page_idx) const;
 
     // Slot-and-page metadata (read-only public view).
     const PageMeta & page_meta(int page_idx) const { return catalog_.at(page_idx); }
@@ -317,6 +319,7 @@ private:
     std::vector<bool> cross_layer_prefetch_candidate_;
     std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
     std::vector<int> page_async_event_;
+    std::vector<ggml_backend_buffer_type_t> page_buft_;
     // Reverse map: slot_idx -> page_idx (or -1 if free). Used by the
     // eviction callback to clear page_to_slot_ / page_loaded_ correctly.
     std::vector<int> slot_to_page_;

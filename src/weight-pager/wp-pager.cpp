@@ -150,16 +150,28 @@ int WeightPager::register_pinned(const std::string & name, void * device_ptr, si
 }
 
 int WeightPager::add_page(const std::string & name, uint16_t file_idx,
-                          uint64_t file_offset, size_t size, int n_experts) {
+                          uint64_t file_offset, size_t size, int n_experts,
+                          ggml_backend_buffer_type_t buft) {
+    const int n_before = catalog_.size();
+    int first = -1;
     // Non-MoE / per-expert tensor: add as-is.
     if (n_experts <= 1) {
-        return catalog_.add(name, file_idx, file_offset, size);
+        first = catalog_.add(name, file_idx, file_offset, size);
+    } else {
+        // Consolidated MoE tensor: register N sub-pages, one per expert.
+        // Returns the index of the FIRST sub-page (subsequent experts are at
+        // sequential indices). Per-expert size is the consolidated size
+        // divided by n_experts; per-expert offset is base_offset + e * size_e.
+        first = catalog_.add_consolidated_experts(name, file_idx, file_offset, size, n_experts);
     }
-    // Consolidated MoE tensor: register N sub-pages, one per expert.
-    // Returns the index of the FIRST sub-page (subsequent experts are at
-    // sequential indices). Per-expert size is the consolidated size
-    // divided by n_experts; per-expert offset is base_offset + e * size_e.
-    return catalog_.add_consolidated_experts(name, file_idx, file_offset, size, n_experts);
+    const int n_after = catalog_.size();
+    if ((int) page_buft_.size() < n_after) {
+        page_buft_.resize((size_t) n_after, nullptr);
+    }
+    for (int i = n_before; i < n_after; ++i) {
+        page_buft_[(size_t) i] = buft;
+    }
+    return first;
 }
 
 bool WeightPager::init(const Config &             cfg,
@@ -176,20 +188,11 @@ bool WeightPager::init(const Config &             cfg,
         return false;
     }
 
-    // Multi-GPU guard (B-P7). Phase 1 is single-device by explicit design.
-    // This is the *only* defence — the rest of the pager assumes a single
-    // pool on a single device.
     if (devices_used.size() > 1) {
-        LLAMA_LOG_ERROR(
-            "wp::WeightPager::init: multi-device configurations are not supported by the "
-            "weight pager (got %zu devices). Use --device with a single ROCm/CUDA index "
-            "for paging, or run without --weight-paging.\n",
-            devices_used.size());
-        // Caller passed fds; close them so they don't leak.
-        for (int fd : fds) {
-            if (fd >= 0) close(fd);
-        }
-        return false;
+        LLAMA_LOG_WARN(
+            "wp::WeightPager::init: model uses %zu devices; pager pool remains on configured "
+            "paging device %d and per-page buffer selection is enabled\n",
+            devices_used.size(), device_idx);
     }
     if (!devices_used.empty() && devices_used.front() != device_idx) {
         LLAMA_LOG_WARN("wp::WeightPager::init: device mismatch (used=%d, configured=%d)\n",
@@ -379,6 +382,7 @@ void WeightPager::shutdown() {
         }
     }
     page_async_event_.clear();
+    page_buft_.clear();
 
     // Tear down in reverse construction order.
     prefetch_.shutdown();
@@ -417,6 +421,11 @@ void WeightPager::shutdown() {
     async_ensure_enabled_ = false;
 
     initialized_ = false;
+}
+
+ggml_backend_buffer_t WeightPager::pool_buf(int page_idx) const {
+    (void) page_idx;
+    return pool_.vram_buf();
 }
 
 void WeightPager::restore_disable_graphs_env_() {

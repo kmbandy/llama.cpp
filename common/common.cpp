@@ -1570,9 +1570,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
 
     // Weight paging parameters
-    mparams.weight_paging_enabled  = params.weight_paging_enabled;
-    mparams.weight_paging_slots    = params.weight_paging_slots;
-    mparams.weight_paging_prefetch = params.weight_paging_prefetch;
+    mparams.weight_paging_enabled         = params.weight_paging_enabled;
+    mparams.weight_paging_slots           = params.weight_paging_slots;
+    mparams.weight_paging_prefetch        = params.weight_paging_prefetch;
+    mparams.weight_paging_resident_device = params.weight_paging_resident_device.c_str();
 
     return mparams;
 }

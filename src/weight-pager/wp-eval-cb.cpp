@@ -784,7 +784,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // src0->buffer = nullptr for paged tensors, so without
                                     // this patch we NULL-deref before reaching the
                                     // routing-aware dispatcher gate.
-                                    ggml_backend_buffer_t pool_buf = pager->pool_buf();
+                                    ggml_backend_buffer_t pool_buf = pager->pool_buf(weight_page);
                                     if (t->src[0]->buffer == nullptr && pool_buf != nullptr) {
                                         t->src[0]->buffer = pool_buf;
                                     }
@@ -1093,7 +1093,6 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // Step 2: page each one in (waiting on prefetch if in flight, sync
     // fallback otherwise) and patch the matching src tensors.
-    ggml_backend_buffer_t pool_buf = pager->pool_buf();
     int  patches_this_op = 0;
     int  views_this_op   = 0;
 
@@ -1123,6 +1122,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #endif
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
+        ggml_backend_buffer_t pool_buf = pager->pool_buf(page_idx);
 
         // Patch every src whose direct name OR view_src's name matches
         // this page.
