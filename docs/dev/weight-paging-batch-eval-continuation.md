@@ -466,3 +466,37 @@ build-hip = multi-arch gfx1201;gfx1030, GGML_HIP_AITER=ON (Triton AOT — reuse 
 No GPU processes running; R9700 VRAM at ~1.4 GB (desktop baseline). All work committed + pushed;
 `feat/wp-vnext` == `origin` == mad-lab-main tip `78358b158`. Only uncommitted = pre-existing WIP
 (`examples/pagedattn-*`, `src/llama-graph.cpp`, `examples/CMakeLists.txt`) — do NOT touch.
+
+---
+
+## ★★★ 2026-07-07 LATE — PHASE 1 RESIDENT-DENSE SPLIT VALIDATED (47× win) ★★★
+
+**WP_RESIDENT_DENSE=1 shipped (commits d4344dfbc, 07874dba3, 0b2ae033b, 16d486dbd).**
+Dense weights (n_experts==0: MLA attention, shared expert, embeddings, norms —
+~13.7 GiB, ~9% of DeepSeek V4 Flash Q8) load VRAM-resident via the existing
+manual per-tensor allocator; ONLY routed-expert (_exps) tensors page. Two
+filters made to agree via `wp_is_routed_expert()`: `is_paged_weight()`
+(llama-model.cpp:1608, the load-bearing one) + catalog push. Fail-loud guard
+in init_weight_pager. Unit test catalog_is_expert_classification (38/38 green).
+
+**MEASURED on R9700 (ROCm0), DeepSeek V4 Flash Q8, host transport, --weight-paging-slots 2000:**
+- Baseline (gate OFF, all-paged): **0.02 t/s**, io_effective 0.101 GB/s, ~9121 page-ins, dense thrashing.
+- Gate ON, minimal (no batching, depth 4): **0.63 t/s**, coherent, io 1.384 GB/s, sync_fallbacks≈page_ins (serial).
+- Gate ON, batching (ensure_batch+paged_batch+prefetch, depth 4): **0.93 t/s** (~47×), coherent
+  ("' the founding of the city of Rome in'"), **sync_fallbacks=0** (QD=N working), io 1.399 GB/s.
+- Pool auto-sizes to VRAM after dense resident (Task 5 ordering confirmed). Omit --weight-paging-slots
+  or it OOMs (dense 13.7 + 384×64MB pool > 32GB); slot size drops to ~4.45MB (max expert sub-page).
+
+**KNOWN LIMITATION — depth>4 HANGS under resident-dense (next lever):**
+host+depth-4 works; host+depth-8 AND host+depth-16 HANG (main thread stuck in
+io_cqring_wait, GPU idle, no I/O progress). Reproduces on HOST transport, so it
+is NOT P2P. depth-8 worked WITHOUT resident-dense earlier this session, so it is
+an INTERACTION: the resident-dense page set (only experts, ~4.45MB slots, 2000
+slots) stresses the prefetch/ensure_batch concurrency on the shared io_uring
+ring differently than the all-paged 64MB-slot layout the demux fix was validated
+against. Root-cause needed (ptrace_scope=1 blocks gdb without sudo). This is the
+lever to raise QD past 4 → past 0.93 t/s toward 1-3.
+
+**NOT YET TESTED:** P2P transport + resident-dense at depth 4 (may beat host's
+1.4 GB/s via direct-to-VRAM). Phase 2 (multi-device TB3) + Phase 3 (expert cache)
+still ahead.
