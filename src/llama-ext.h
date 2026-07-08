@@ -124,3 +124,5 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+// returns the DFlash hyper-connection stream multiplier
+LLAMA_API uint32_t        llama_model_dflash_hc_mult    (const struct llama_model * model);

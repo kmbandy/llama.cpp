@@ -909,8 +909,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<common_sampler_ptr> smpls;
 
     int32_t n_embd_dec = 0;  // draft hidden size
-    int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
+    int32_t n_embd_enc = 0;  // target_layer_ids_n * hc_mult * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
+    int32_t hc_mult    = 1;  // target residual streams per tapped layer
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -938,7 +939,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
-        n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
+        hc_mult       = (int32_t) llama_model_dflash_hc_mult(model_dft);
+        GGML_ASSERT(hc_mult > 0);
+        n_embd_enc    = (int32_t) target_layer_ids_n * hc_mult * n_embd_tgt;
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -952,7 +955,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
-        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
+        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, hc_mult=%d\n", __func__, block_size, mask_token_id, target_layer_ids_n, hc_mult);
 
         // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
         if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
@@ -1054,9 +1057,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        const int32_t n_embd_layer = hc_mult * n_embd_tgt;
+                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
+                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_layer;
+                        std::memcpy(dst, src, (size_t) n_embd_layer * sizeof(float));
                     }
                 }
 
