@@ -595,6 +595,56 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         active.insert((int) idx);
                                     }
 
+                                    // WP_ENSURE_BATCH (opt-in): Colibri-style
+                                    // concurrent batch page-in. Reserve+PIN every
+                                    // active-expert slot up front, then issue all
+                                    // cold-miss reads in ONE io_uring batch (true
+                                    // QD=N). Closes the eviction window that let a
+                                    // later expert's read evict an earlier one's
+                                    // not-yet-harvested slot, collapsing effective
+                                    // queue depth to ~1 under decode. Default off;
+                                    // the else branch keeps the current path (A/B).
+                                    static int s_ensure_batch_env = -1;
+                                    if (s_ensure_batch_env < 0) {
+                                        const char * eb = std::getenv("WP_ENSURE_BATCH");
+                                        s_ensure_batch_env = (eb != nullptr && eb[0] == '1') ? 1 : 0;
+                                    }
+                                    int    n_ensures = 0;
+                                    void * first_active_slot = nullptr;
+                                    if (s_ensure_batch_env == 1) {
+                                        std::vector<int> active_pages;
+                                        active_pages.reserve(active.size());
+                                        for (int e : active) {
+                                            active_pages.push_back(weight_page + 1 + e);
+                                        }
+                                        std::vector<void *> active_ptrs;
+                                        std::vector<int>    active_pinned;
+                                        pager->ensure_batch(active_pages, active_ptrs, active_pinned);
+                                        std::size_t ap = 0;
+                                        for (int e : active) {
+                                            void * slot = active_ptrs[ap++];
+                                            if (slot != nullptr) {
+                                                slot = capture_ptr_for_page(weight_page + 1 + e, slot);
+                                                host_ptrs[(size_t) e] = slot;
+                                                if (first_active_slot == nullptr) {
+                                                    first_active_slot = slot;
+                                                }
+                                                ++n_ensures;
+#if defined(GGML_USE_HIP)
+                                                enqueue_async_wait_for_page(weight_page + 1 + e, s_async_events_prev_op);
+#endif
+                                            }
+                                        }
+                                        // Record the pins ensure_batch took so the
+                                        // per-op / per-range lifecycle releases them.
+                                        for (int p : active_pinned) {
+                                            (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(p);
+                                            if (paged_batch) { s_range_pinned_bytes += pager->page_meta(p).size; }
+                                        }
+#if defined(GGML_USE_HIP)
+                                        if (!active_pinned.empty()) { s_prev_op_pager = pager; }
+#endif
+                                    } else {
                                     // Pass 1: fire async prefetch for every
                                     // active expert. With io_uring (depth 4),
                                     // multiple preads can be in flight at
@@ -643,8 +693,6 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // hit; for in-flight pages it waits on
                                     // the async completion; for unloaded
                                     // pages it falls back to sync.
-                                    int n_ensures = 0;
-                                    void * first_active_slot = nullptr;
                                     for (int e : active) {
                                         const int sub_page_idx = weight_page + 1 + e;
                                         void * slot = pager->ensure(sub_page_idx);
@@ -669,6 +717,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #endif
                                         }
                                     }
+                                    }  // end WP_ENSURE_BATCH else (existing prefetch+ensure path)
+
                                     // Safety: fill INACTIVE expert slots with a non-null
                                     // sentinel (first active slot) so a kernel that reads
                                     // expert_ptrs[inactive_idx] gets a valid (wrong) pointer
@@ -734,7 +784,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // src0->buffer = nullptr for paged tensors, so without
                                     // this patch we NULL-deref before reaching the
                                     // routing-aware dispatcher gate.
-                                    ggml_backend_buffer_t pool_buf = pager->pool_buf();
+                                    ggml_backend_buffer_t pool_buf = pager->pool_buf(weight_page);
                                     if (t->src[0]->buffer == nullptr && pool_buf != nullptr) {
                                         t->src[0]->buffer = pool_buf;
                                     }
@@ -1043,7 +1093,6 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // Step 2: page each one in (waiting on prefetch if in flight, sync
     // fallback otherwise) and patch the matching src tensors.
-    ggml_backend_buffer_t pool_buf = pager->pool_buf();
     int  patches_this_op = 0;
     int  views_this_op   = 0;
 
@@ -1073,6 +1122,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 #endif
 
         const std::string & page_name = pager->page_meta(page_idx).tensor_name;
+        ggml_backend_buffer_t pool_buf = pager->pool_buf(page_idx);
 
         // Patch every src whose direct name OR view_src's name matches
         // this page.

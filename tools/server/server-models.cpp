@@ -1388,34 +1388,41 @@ void server_models::unload_lru() {
     }
     // remove one of the servers if we passed the models_max (least recently used - LRU)
     std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
     {
         std::unique_lock<std::mutex> lk(mutex);
+        int64_t lru_last_used = ggml_time_ms();
+        size_t count_active = 0;
         for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-                if (m.second.meta.status == SERVER_MODEL_STATUS_SLEEPING || m.second.meta.placement.pinned) {
-                    continue;
-                }
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
-                }
+            if (!m.second.meta.is_running() || stopping_models.count(m.first)) {
+                // skip models that aren't running, or are already being evicted:
+                // excluding in-flight evictions keeps a concurrent unload_lru() from
+                // selecting a second victim and over-evicting (double-evict race).
+                continue;
+            }
+            count_active++;
+            if (m.second.meta.status == SERVER_MODEL_STATUS_SLEEPING || m.second.meta.placement.pinned) {
+                continue;
+            }
+            if (m.second.meta.last_used < lru_last_used) {
+                lru_model_name = m.first;
+                lru_last_used = m.second.meta.last_used;
             }
         }
-    }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
-        {
-            std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
-            });
+        if (lru_model_name.empty() || count_active < (size_t)base_params.models_max) {
+            return;
         }
+        // Mark the victim as stopping under the SAME lock that selected it, so a
+        // concurrent unload_lru() excludes it in the scan above and cannot evict a
+        // second model. unload() below re-inserts idempotently and triggers the stop.
+        stopping_models.insert(lru_model_name);
     }
+    SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+    unload(lru_model_name);
+    // wait for unload to complete (find-based: safe if the entry was erased mid-wait,
+    // unlike the previous mapping[name] which default-constructed a stray entry)
+    wait(lru_model_name, [](const server_model_meta & meta) {
+        return meta.status == SERVER_MODEL_STATUS_UNLOADED;
+    });
 }
 
 void server_models::load(const std::string & name) {
@@ -1500,17 +1507,45 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
     // Re-check capacity under the lock to prevent concurrent loads from
     // exceeding models_max. Without this, the window between unload_lru()
-    // releasing its lock and this lock_guard acquiring allows multiple
-    // threads to each observe capacity and all proceed to load.
+    // releasing its lock and this lock acquiring allows multiple threads to
+    // each observe capacity and all proceed to load. On a capacity race (a
+    // concurrent load claimed the slot unload_lru() just freed) we evict again
+    // and wait for a slot rather than failing the request with a 500 — the
+    // request effectively queues behind the eviction it triggers.
     if (!gpu_placement_enabled && base_params.models_max > 0) {
-        size_t count_active = 0;
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
+        const int64_t capacity_deadline = ggml_time_ms() + 30000; // 30s cap, then surface a retriable error
+        auto count_running = [this]() {
+            size_t n = 0;
+            for (const auto & m : mapping) {
+                if (m.second.meta.is_running()) {
+                    n++;
+                }
             }
-        }
-        if (count_active >= (size_t)base_params.models_max) {
-            throw std::runtime_error("model limit reached, try again later");
+            return n;
+        };
+        while (count_running() >= (size_t)base_params.models_max) {
+            if (ggml_time_ms() >= capacity_deadline) {
+                // genuinely no evictable slot (e.g. every resident model is pinned) —
+                // surface a retriable error instead of blocking the request forever.
+                throw std::runtime_error("model limit reached, try again later");
+            }
+            // release the lock so unload_lru() can evict + wait for the child to exit,
+            // then re-take it and re-validate our own preconditions.
+            lk.unlock();
+            unload_lru();
+            lk.lock();
+            cv.wait(lk, [this]() { return !is_reloading; });
+            auto it = mapping.find(name);
+            if (it == mapping.end() || it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+                // a concurrent path took over this model while we were evicting
+                SRV_INF("model %s no longer loadable after capacity wait\n", name.c_str());
+                return;
+            }
+            if (count_running() >= (size_t)base_params.models_max) {
+                // eviction couldn't free a slot yet (all residents pinned, or a concurrent
+                // load refilled it); back off briefly instead of hot-spinning to the deadline.
+                cv.wait_for(lk, std::chrono::milliseconds(200));
+            }
         }
     }
 
@@ -2292,6 +2327,30 @@ static bool is_autoload(const common_params & params, const server_http_req & re
     }
 }
 
+// case-insensitive header lookup (HTTP header names are case-insensitive; the map is not)
+static std::string header_value_ci(const std::map<std::string, std::string> & headers, const std::string & target_lower) {
+    for (const auto & [hk, hv] : headers) {
+        if (hk.size() != target_lower.size()) {
+            continue;
+        }
+        bool match = true;
+        for (size_t i = 0; i < hk.size(); ++i) {
+            char c = hk[i];
+            if (c >= 'A' && c <= 'Z') {
+                c = char(c + 32);
+            }
+            if (c != target_lower[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return hv;
+        }
+    }
+    return std::string();
+}
+
 // percent encode one query or path component, covers reserved chars without pulling in
 // httplib::detail. used by the stream routes to forward conversation_id to children safely
 static std::string encode_qs(const std::string & in) {
@@ -2359,6 +2418,44 @@ void server_models_routes::init_routes() {
         return proxy_get(req);
     };
 
+    this->get_router_health = [this](const server_http_req &) {
+        // Unlike the stock /health (which is unconditionally "ok"), reflect child
+        // process health so a crashed/wedged child is visible to fleet monitoring.
+        // The router itself is alive if it can answer at all, so top-level status
+        // stays "ok" (non-breaking for monitors that only check the 200) — the body
+        // carries the per-child detail, including any children that exited non-zero.
+        auto res = std::make_unique<server_http_res>();
+        auto all_models = models.get_all_meta();
+        json by_status = json::object();
+        json unhealthy = json::array();
+        size_t running = 0, loading = 0, sleeping = 0, failed_count = 0;
+        for (const auto & meta : all_models) {
+            const std::string s = server_model_status_to_string(meta.status);
+            by_status[s] = by_status.value(s, 0) + 1;
+            if (meta.status == SERVER_MODEL_STATUS_LOADING)  { loading++; }
+            if (meta.status == SERVER_MODEL_STATUS_SLEEPING) { sleeping++; }
+            if (meta.is_running())                           { running++; }
+            if (meta.is_failed()) {
+                failed_count++;
+                unhealthy.push_back({{"model", meta.name}, {"exit_code", meta.exit_code}});
+            }
+        }
+        res_ok(res, {
+            {"status", "ok"}, // the router process itself is up
+            {"role",   "router"},
+            {"children", {
+                {"total",     all_models.size()},
+                {"running",   running},
+                {"loading",   loading},
+                {"sleeping",  sleeping},
+                {"failed",    failed_count},
+                {"by_status", by_status},
+            }},
+            {"unhealthy", unhealthy}, // children that exited non-zero
+        });
+        return res;
+    };
+
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");
@@ -2372,8 +2469,15 @@ void server_models_routes::init_routes() {
 
     this->proxy_post = [this](const server_http_req & req) {
         std::string method = "POST";
-        json body = json::parse(req.body);
-        std::string name = json_value(body, "model", std::string());
+        // Fast path: honor an explicit X-Model header so we avoid fully parsing a
+        // possibly multi-MB body (e.g. base64 images) just to read "model" — the
+        // child parses the body again anyway. Fall back to the JSON parse when the
+        // header is absent, preserving behavior for existing clients.
+        std::string name = header_value_ci(req.headers, "x-model");
+        if (name.empty()) {
+            json body = json::parse(req.body);
+            name = json_value(body, "model", std::string());
+        }
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
@@ -2730,9 +2834,19 @@ void server_models_routes::init_routes() {
 // used for streaming data between threads
 template<typename T>
 struct pipe_t {
+    // Bound the in-flight buffer so a slow client + fast child cannot force the
+    // router to buffer an entire response in RAM. write() blocks (backpressure)
+    // once either cap is hit; at least one message is always allowed through so
+    // an oversized single chunk can never deadlock.
+    static constexpr size_t max_queue_msgs  = 8192;
+    static constexpr size_t max_queue_bytes = 64ull * 1024 * 1024; // 64 MiB
+
     std::mutex mutex;
-    std::condition_variable cv;
+    std::condition_variable cv;        // signals "data available" to the reader
+    std::condition_variable cv_space;  // signals "space available" to the writer
     std::queue<T> queue;
+    std::queue<size_t> sizes;          // per-message payload bytes, parallel to queue
+    size_t queued_bytes = 0;
     std::atomic<bool> writer_closed{false};
     std::atomic<bool> reader_closed{false};
     void close_write() {
@@ -2742,6 +2856,7 @@ struct pipe_t {
     void close_read() {
         reader_closed.store(true, std::memory_order_relaxed);
         cv.notify_all();
+        cv_space.notify_all(); // wake any writer blocked on backpressure
     }
     bool read(T & output, const std::function<bool()> & should_stop) {
         std::unique_lock<std::mutex> lk(mutex);
@@ -2750,6 +2865,11 @@ struct pipe_t {
             if (!queue.empty()) {
                 output = std::move(queue.front());
                 queue.pop();
+                if (!sizes.empty()) {
+                    queued_bytes -= sizes.front();
+                    sizes.pop();
+                }
+                cv_space.notify_one(); // a slot freed — release a backpressured writer
                 return true;
             }
             if (writer_closed.load()) {
@@ -2762,12 +2882,20 @@ struct pipe_t {
             cv.wait_for(lk, poll_interval);
         }
     }
-    bool write(T && data) {
-        std::lock_guard<std::mutex> lk(mutex);
+    bool write(T && data, size_t bytes) {
+        std::unique_lock<std::mutex> lk(mutex);
+        // block while the queue is full and the reader is still alive; always
+        // admit into an empty queue so a single >cap message can't deadlock.
+        cv_space.wait(lk, [&]() {
+            return reader_closed.load() || queue.empty() ||
+                   (queue.size() < max_queue_msgs && queued_bytes + bytes <= max_queue_bytes);
+        });
         if (reader_closed.load()) {
             return false; // broken pipe
         }
+        queued_bytes += bytes;
         queue.push(std::move(data));
+        sizes.push(bytes);
         cv.notify_one();
         return true;
     }
@@ -2929,12 +3057,13 @@ server_http_proxy::server_http_proxy(
             }
             msg.headers[key] = value;
         }
-        return pipe->write(std::move(msg)); // send headers first
+        const size_t header_bytes = msg.data.size();
+        return pipe->write(std::move(msg), header_bytes); // send headers first
     };
     httplib::ContentReceiverWithProgress content_receiver = [pipe](const char * data, size_t data_length, size_t, size_t) {
         // send data chunks
         // returns false if pipe is closed / broken (signal to stop receiving)
-        return pipe->write({{}, 0, std::string(data, data_length), ""});
+        return pipe->write({{}, 0, std::string(data, data_length), ""}, data_length);
     };
 
     // when files are present, the body was converted from multipart form data to JSON
@@ -3008,8 +3137,10 @@ server_http_proxy::server_http_proxy(
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());
-            pipe->write({{}, 500, "", ""}); // header
-            pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
+            pipe->write({{}, 500, "", ""}, 0); // header
+            std::string err_body = "proxy error: " + err_str;
+            const size_t err_bytes = err_body.size();
+            pipe->write({{}, 0, std::move(err_body), ""}, err_bytes); // body
         }
         pipe->close_write(); // signal EOF to reader
         SRV_DBG("%s", "client request thread ended\n");

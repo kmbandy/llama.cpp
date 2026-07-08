@@ -1017,6 +1017,41 @@ static int test_pool_alloc_skips_pinned_in_eviction() {
     return fails;
 }
 
+static int test_pool_allocator_two_pools_independent() {
+    int fails = 0;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    EXPECT(buft != nullptr, "cpu buffer_type available");
+    if (!buft) return fails;
+
+    wp::PoolAllocator pool_a;
+    wp::PoolAllocator pool_b;
+    EXPECT(pool_a.init(buft, /*n_slots=*/2, /*slot_size=*/128), "pool A init");
+    EXPECT(pool_b.init(buft, /*n_slots=*/3, /*slot_size=*/256), "pool B init");
+
+    int evict_a = -1;
+    int evict_b = -1;
+    pool_a.set_eviction_callback([&](int slot) { evict_a = slot; });
+    pool_b.set_eviction_callback([&](int slot) { evict_b = slot; });
+
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 0, "pool A first slot");
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 1, "pool A second slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 0, "pool B first slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 1, "pool B second slot");
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 2, "pool B third slot");
+
+    pool_a.pin_slot(0);
+    EXPECT_EQ_INT(pool_a.alloc_slot(), 1, "pool A evicts only its unpinned slot");
+    EXPECT_EQ_INT(evict_a, 1, "pool A eviction callback");
+    EXPECT_EQ_INT(evict_b, -1, "pool B not evicted by pool A pressure");
+    EXPECT(pool_a.is_pinned(0), "pool A pin remains local");
+    EXPECT(!pool_b.is_pinned(0), "pool B pin state remains independent");
+
+    EXPECT_EQ_INT(pool_b.alloc_slot(), 0, "pool B evicts its own LRU slot");
+    EXPECT_EQ_INT(evict_b, 0, "pool B eviction callback");
+    pool_a.unpin_slot(0);
+    return fails;
+}
+
 static int test_pool_alloc_returns_neg1_when_all_pinned() {
     int fails = 0;
     ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
@@ -1383,6 +1418,131 @@ static int test_file_io_submit_batch_partial_failure() {
     return fails;
 }
 
+static int test_file_io_submit_batch_depth_one_targeted_waits() {
+    int fails = 0;
+
+    char path[] = "/tmp/wp-test-batch-depth1-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+
+    constexpr size_t N = 16384;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 19 + 11) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/true, 1);
+    EXPECT(layer != nullptr, "create_file_io non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    std::vector<std::vector<uint8_t>> dst(8, std::vector<uint8_t>(1024));
+    std::vector<wp::FileIOBatchRequest> reqs;
+    reqs.reserve(dst.size());
+    for (size_t i = 0; i < dst.size(); ++i) {
+        reqs.push_back({ 1000 + i, 0, (uint64_t) (i * 1536), 1024, dst[i].data() });
+    }
+
+    int n_ok = layer->submit_batch(reqs);
+    EXPECT_EQ_INT(n_ok, (int) reqs.size(), "all depth-1 batch entries accepted");
+
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        wp::IoResult r = layer->wait_for_req(reqs[i].req_id, /*timeout_ms=*/5000);
+        EXPECT(r.status == wp::IoStatus::Ok, "targeted wait returns Ok");
+        EXPECT_EQ_INT(r.req_id, reqs[i].req_id, "targeted wait req_id");
+        EXPECT_EQ_INT(r.bytes_read, 1024, "targeted wait bytes");
+        EXPECT(std::memcmp(dst[i].data(), pattern.data() + i * 1536, 1024) == 0,
+               "targeted wait content");
+    }
+    EXPECT_EQ_INT(layer->pending(), 0, "no pending after targeted waits");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// Completion demux — targeted waits must never drop a sibling's completion
+// ---------------------------------------------------------------------------
+//
+// Regression guard for the shared-ring cross-drain bug: when several logical
+// consumers (prefetch scheduler + synchronous pager page-ins + ensure_batch)
+// submit reads on ONE FileIOLayer, a caller that waits for its OWN req_id may
+// reap a DIFFERENT consumer's completion first. The old code discarded that
+// foreign completion (io_uring_cqe_seen without routing it), permanently
+// losing it — the owner's slot then hung forever and the prefetch pool leaked
+// slots until the pipeline stalled (2x decode regression / depth-8 load hang).
+//
+// The demux contract fixes this: wait_for_req(id) reaps and BUFFERS any
+// foreign completion it encounters, so a later wait_for_req/try_take for that
+// id still finds it. This test drives three reads and claims them strictly
+// out of submit order, asserting none are lost.
+static int test_file_io_demux_no_cross_drain() {
+    int fails = 0;
+    char path[] = "/tmp/wp-test-demux-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        std::fprintf(stderr, "  FAIL: %s: mkstemp failed: %s\n", __func__, std::strerror(errno));
+        return 1;
+    }
+    constexpr size_t N = 8192;
+    std::vector<uint8_t> pattern(N);
+    for (size_t i = 0; i < N; ++i) pattern[i] = (uint8_t) ((i * 17 + 3) & 0xff);
+    ssize_t w = write(fd, pattern.data(), N);
+    EXPECT_EQ_INT((size_t) w, N, "wrote pattern");
+
+    std::vector<int> fds = { fd };
+    auto layer = wp::create_file_io(std::move(fds), /*prefer_async=*/true, 8);
+    EXPECT(layer != nullptr, "create_file_io non-null");
+    if (!layer) { unlink(path); return fails; }
+
+    // Three in-flight reads with distinct req_ids, distinct offsets.
+    std::vector<uint8_t> d1(1024), d2(2048), d3(512);
+    EXPECT(layer->submit(/*req=*/100, 0,    0, 1024, d1.data()), "submit 100");
+    EXPECT(layer->submit(/*req=*/200, 0, 1024, 2048, d2.data()), "submit 200");
+    EXPECT(layer->submit(/*req=*/300, 0, 4096,  512, d3.data()), "submit 300");
+    layer->flush();
+
+    // Claim strictly OUT of submit order. Each targeted wait must return its
+    // own completion; siblings reaped along the way must NOT be lost.
+    wp::IoResult r3 = layer->wait_for_req(300, /*timeout_ms=*/-1);
+    EXPECT(r3.status == wp::IoStatus::Ok, "req 300 status Ok");
+    EXPECT_EQ_INT(r3.req_id, 300, "req 300 round-trips");
+    EXPECT_EQ_INT(r3.bytes_read, 512, "req 300 bytes");
+
+    wp::IoResult r1 = layer->wait_for_req(100, /*timeout_ms=*/-1);
+    EXPECT(r1.status == wp::IoStatus::Ok, "req 100 status Ok (not lost by 300's wait)");
+    EXPECT_EQ_INT(r1.req_id, 100, "req 100 round-trips");
+    EXPECT_EQ_INT(r1.bytes_read, 1024, "req 100 bytes");
+
+    // The remaining one is claimable non-blocking via try_take.
+    wp::IoResult r2{};
+    bool took2 = layer->try_take(200, r2);
+    EXPECT(took2, "try_take 200 succeeds");
+    EXPECT_EQ_INT(r2.req_id, 200, "req 200 round-trips");
+    EXPECT_EQ_INT(r2.bytes_read, 2048, "req 200 bytes");
+
+    // Unknown / already-claimed ids are a clean miss, never a hang.
+    wp::IoResult miss{};
+    EXPECT(!layer->try_take(999, miss), "try_take unknown id -> false");
+    EXPECT(!layer->try_take(300, miss), "try_take already-claimed id -> false");
+
+    // Content integrity: every buffered read landed in the right dst.
+    EXPECT(std::memcmp(d1.data(), pattern.data() +    0, 1024) == 0, "d1 content");
+    EXPECT(std::memcmp(d2.data(), pattern.data() + 1024, 2048) == 0, "d2 content");
+    EXPECT(std::memcmp(d3.data(), pattern.data() + 4096,  512) == 0, "d3 content");
+
+    // Nothing left outstanding.
+    EXPECT_EQ_INT(layer->pending(), 0, "no pending after all claimed");
+
+    layer.reset();
+    unlink(path);
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // FileIOLayer::advise_prefetch — MAD-232 integration with a real fd
 // ---------------------------------------------------------------------------
@@ -1547,6 +1707,34 @@ static int test_wp_paged_batch_flag_default_off() {
 // main
 // ---------------------------------------------------------------------------
 
+// WP_RESIDENT_DENSE relies on the catalog's expert classification agreeing
+// with the loader's is_consolidated detection (llama-model.cpp) and the
+// is_paged_weight predicate. Lock in the invariant: routed-expert (_exps)
+// tensors are experts; dense tensors — attention, embeddings, and the SHARED
+// expert (ffn_*_shexp, which matches an ffn_ role prefix but is NOT _exps) —
+// are not. A mismatch here would let a dense tensor slip past one filter.
+static int test_catalog_is_expert_classification() {
+    int fails = 0;
+    wp::PageCatalog cat;
+    // Dense tensors — must NOT be experts.
+    int p_attn = cat.add("blk.0.attn_q.weight",         0, 0,   4096);
+    int p_emb  = cat.add("token_embd.weight",           0, 0, 100000);
+    int p_shex = cat.add("blk.0.ffn_down_shexp.weight", 0, 0,   8192);
+    // Consolidated routed experts — MUST be experts (parent + N sub-pages).
+    int first_sub = cat.add_consolidated_experts("blk.0.ffn_gate_exps.weight",
+                                                 0, 0, 256 * 8192, 256);
+    EXPECT(!cat.at(p_attn).is_expert, "attn_q is dense");
+    EXPECT(!cat.at(p_emb).is_expert,  "token_embd is dense");
+    EXPECT(!cat.at(p_shex).is_expert, "ffn_down_shexp is dense (shared expert)");
+    EXPECT(cat.at(first_sub).is_expert, "ffn_gate_exps sub-page is expert");
+    EXPECT(cat.at(first_sub).is_sub_expert, "ffn_gate_exps sub-page is a sub-expert");
+    EXPECT(cat.at(first_sub - 1).is_consolidated, "parent is consolidated");
+    EXPECT(!cat.at(first_sub - 1).is_expert, "consolidated parent is not itself an expert page");
+    EXPECT(cat.has_experts(), "catalog reports experts present");
+    EXPECT_EQ_INT(cat.n_expert_pages(), 256, "256 expert sub-pages counted (parent excluded)");
+    return fails;
+}
+
 int main() {
     int total_fails = 0;
 
@@ -1563,11 +1751,14 @@ int main() {
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
         { "file_io_submit_batch",            test_file_io_submit_batch            },
         { "file_io_submit_batch_partial",    test_file_io_submit_batch_partial_failure },
+        { "file_io_submit_batch_depth_one_targeted_waits", test_file_io_submit_batch_depth_one_targeted_waits },
+        { "file_io_demux_no_cross_drain",    test_file_io_demux_no_cross_drain    },
         { "compute_advise_ranges",    test_compute_advise_ranges    },
         { "is_uma_archname",          test_is_uma_archname          },
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },
         { "pool_allocator",     test_pool_allocator     },
+        { "pool_allocator_two_pools_independent", test_pool_allocator_two_pools_independent },
         { "pool_size_class_packs_small_pages", test_pool_size_class_packs_small_pages },
         { "pool_size_class_pin_skip",          test_pool_size_class_pin_skip          },
         { "pool_pin_basic",                       test_pool_pin_basic                       },
@@ -1584,6 +1775,7 @@ int main() {
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },
+        { "catalog_is_expert_classification",    test_catalog_is_expert_classification    },
         { "pool_hit_count_basic",                test_pool_hit_count_basic                },
         { "pool_hot_threshold_protects",         test_pool_hot_threshold_protects_in_eviction },
         { "pool_hot_fallback_when_all_hot",      test_pool_hot_fallback_when_all_hot      },

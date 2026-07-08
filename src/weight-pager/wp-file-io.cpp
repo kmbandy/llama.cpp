@@ -3,6 +3,7 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -157,21 +158,18 @@ public:
 
     void flush() override { /* no-op for sync */ }
 
-    IoResult wait_any(int /*timeout_ms*/) override {
-        if (results_.empty()) {
-            // SyncPread cannot have a pending request that is not already
-            // in results_ — every submit produces a result. Returning
-            // Timeout here means "no completions queued."
-            IoResult r;
-            r.status = IoStatus::Timeout;
-            return r;
-        }
-        IoResult r = results_.front();
+    // Every submit() runs the read inline and queues its result, so a
+    // completion is always immediately available; timeout is irrelevant.
+    bool reap_raw_(int /*timeout_ms*/, IoResult & out) override {
+        if (results_.empty()) return false;
+        out = results_.front();
         results_.pop_front();
-        return r;
+        return true;
     }
 
-    int pending() const override { return (int) results_.size(); }
+    // In-flight = queued-not-yet-reaped (results_) plus reaped-not-yet-claimed
+    // (ready_, held by the base demux for another consumer).
+    int pending() const override { return (int) (results_.size() + ready_.size()); }
 
     FileIOTransport transport() const override { return FileIOTransport::SyncPread; }
 
@@ -235,7 +233,7 @@ public:
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
         if (sqe == nullptr) {
             // Ring full: flush and retry once.
-            io_uring_submit(&ring_);
+            flush_submissions_();
             sqe = io_uring_get_sqe(&ring_);
             if (sqe == nullptr) return false;
         }
@@ -243,69 +241,90 @@ public:
         io_uring_prep_read(sqe, fd_idx, dst, (unsigned) size, (off_t) offset);
         sqe->flags     |= IOSQE_FIXED_FILE;
         sqe->user_data  = req_id;
+        pending_submit_.push_back(req_id);
         ++pending_;
         return true;
     }
 
     void flush() override {
-        if (!ring_ok_ || pending_ == 0) return;
-        io_uring_submit(&ring_);
+        flush_submissions_();
     }
 
-    IoResult wait_any(int timeout_ms) override {
-        IoResult r;
+    // Reap one completion from the ring. The demux/routing (buffering foreign
+    // completions, matching req_ids) lives in the FileIOLayer base — this only
+    // pulls the next raw CQE. Returns false on timeout / nothing ready.
+    bool reap_raw_(int timeout_ms, IoResult & out) override {
         if (!ring_ok_) {
-            r.status = IoStatus::ErrorNoSubmit;
-            return r;
+            // Unreachable on a live layer (init failure returns nullptr), but
+            // signal fatal rather than a silent timeout if it ever happens.
+            out = IoResult{};
+            out.status = IoStatus::ErrorIo;
+            out.req_id = 0;
+            return true;
         }
         if (pending_ == 0) {
-            r.status = IoStatus::Timeout;
-            return r;
+            return false;  // nothing in flight
+        }
+        if (!pending_submit_.empty()) {
+            flush_submissions_();
+        }
+        if (pending_ == 0) {
+            return false;
         }
 
         struct io_uring_cqe * cqe = nullptr;
         int                   ret = 0;
 
         if (timeout_ms < 0) {
-            ret = io_uring_wait_cqe(&ring_, &cqe);
+            // Retry on signal interruption; the reads are still in flight.
+            do {
+                ret = io_uring_wait_cqe(&ring_, &cqe);
+            } while (ret == -EINTR);
         } else if (timeout_ms == 0) {
             ret = io_uring_peek_cqe(&ring_, &cqe);
-            if (ret == -EAGAIN) {
-                r.status = IoStatus::Timeout;
-                return r;
+            if (ret == -EAGAIN || ret == -EINTR) {
+                return false;  // no completion ready
             }
         } else {
             struct __kernel_timespec ts;
             ts.tv_sec  = timeout_ms / 1000;
             ts.tv_nsec = (long) (timeout_ms % 1000) * 1000000L;
             ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-            if (ret == -ETIME) {
-                r.status = IoStatus::Timeout;
-                return r;
+            // -EINTR: signal interrupted the bounded wait — report "nothing yet"
+            // so the caller's deadline loop retries with a recomputed budget.
+            if (ret == -ETIME || ret == -EINTR) {
+                return false;  // timed out / interrupted
             }
         }
 
         if (ret < 0 || cqe == nullptr) {
-            r.status     = IoStatus::ErrorIo;
-            r.bytes_read = ret;
-            return r;
+            // Transport-level failure — not tied to a request. req_id 0 marks
+            // it fatal so a targeted waiter propagates rather than buffers it.
+            out = IoResult{};
+            out.status     = IoStatus::ErrorIo;
+            out.bytes_read = ret;
+            out.req_id     = 0;
+            return true;
         }
 
-        r.req_id = cqe->user_data;
+        out = IoResult{};
+        out.req_id = cqe->user_data;
         const int res = cqe->res;
         if (res < 0) {
-            r.status     = IoStatus::ErrorIo;
-            r.bytes_read = res;
+            out.status     = IoStatus::ErrorIo;
+            out.bytes_read = res;
         } else {
-            r.bytes_read = res;
-            r.status     = IoStatus::Ok;  // caller compares against requested size for Short
+            out.bytes_read = res;
+            out.status     = IoStatus::Ok;  // caller compares against requested size for Short
         }
         io_uring_cqe_seen(&ring_, cqe);
         --pending_;
-        return r;
+        return true;
     }
 
-    int pending() const override { return pending_; }
+    // In-flight = submitted-not-yet-reaped (pending_) plus reaped-not-yet-
+    // claimed (ready_, buffered by the base demux for another consumer).
+    int pending() const override { return pending_ + (int) ready_.size(); }
 
     FileIOTransport transport() const override { return FileIOTransport::IoUringHost; }
 
@@ -334,13 +353,14 @@ public:
             struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
             if (sqe == nullptr) {
                 // SQ ring full mid-batch — flush what we've prepped, then retry once.
-                io_uring_submit(&ring_);
+                flush_submissions_();
                 sqe = io_uring_get_sqe(&ring_);
                 if (sqe == nullptr) break;
             }
             io_uring_prep_read(sqe, r.fd_idx, r.dst, (unsigned) r.size, (off_t) r.offset);
             sqe->flags     |= IOSQE_FIXED_FILE;
             sqe->user_data  = r.req_id;
+            pending_submit_.push_back(r.req_id);
             ++pending_;
             ++n_queued;
         }
@@ -348,13 +368,97 @@ public:
         // win — one syscall covers N expert-prefetches for the MoE layer
         // instead of N separate submits.
         if (n_queued > 0) {
-            io_uring_submit(&ring_);
+            flush_submissions_();
         }
         return n_queued;
     }
 
 private:
     explicit IoUringAsyncFileIO(std::vector<int> fds) : fds_(std::move(fds)) {}
+
+    void synthesize_submit_failures_(int err) {
+        while (!pending_submit_.empty()) {
+            const uint64_t req_id = pending_submit_.front();
+            pending_submit_.pop_front();
+
+            IoResult r;
+            r.req_id     = req_id;
+            r.status     = IoStatus::ErrorNoSubmit;
+            r.bytes_read = err;
+            ready_[req_id] = r;
+            --pending_;
+        }
+    }
+
+    bool flush_submissions_() {
+        if (!ring_ok_ || pending_submit_.empty()) {
+            return true;
+        }
+
+        while (!pending_submit_.empty()) {
+            int ret = 0;
+            do {
+                ret = io_uring_submit(&ring_);
+            } while (ret == -EINTR);
+
+            if (ret == -EBUSY || ret == -EAGAIN || ret == 0) {
+                bool drained = false;
+                while (reap_ready_cqe_()) {
+                    drained = true;
+                }
+                if (drained) {
+                    continue;
+                }
+            }
+            if (ret < 0) {
+                LLAMA_LOG_WARN("wp::IoUringAsyncFileIO: io_uring_submit failed: %s\n",
+                               strerror(-ret));
+                synthesize_submit_failures_(ret);
+                return false;
+            }
+            if (ret == 0) {
+                LLAMA_LOG_WARN("wp::IoUringAsyncFileIO: io_uring_submit made no progress with %zu SQEs pending\n",
+                               pending_submit_.size());
+                synthesize_submit_failures_(-EAGAIN);
+                return false;
+            }
+
+            for (int i = 0; i < ret && !pending_submit_.empty(); ++i) {
+                pending_submit_.pop_front();
+            }
+        }
+        return true;
+    }
+
+    bool reap_ready_cqe_() {
+        if (pending_ == 0) {
+            return false;
+        }
+
+        struct io_uring_cqe * cqe = nullptr;
+        int ret = io_uring_peek_cqe(&ring_, &cqe);
+        if (ret == -EAGAIN || ret == -EINTR || cqe == nullptr) {
+            return false;
+        }
+        if (ret < 0) {
+            return false;
+        }
+
+        IoResult r;
+        r.req_id = cqe->user_data;
+        const int res = cqe->res;
+        if (res < 0) {
+            r.status     = IoStatus::ErrorIo;
+            r.bytes_read = res;
+        } else {
+            r.status     = IoStatus::Ok;
+            r.bytes_read = res;
+        }
+        io_uring_cqe_seen(&ring_, cqe);
+        --pending_;
+        ready_[r.req_id] = r;
+        return true;
+    }
 
     bool init_(int queue_depth) {
         int ret = io_uring_queue_init(queue_depth, &ring_, 0);
@@ -384,6 +488,7 @@ private:
     }
 
     std::vector<int>   fds_;
+    std::deque<uint64_t> pending_submit_;
     bool               ring_ok_          = false;
     bool               files_registered_ = false;
     int                pending_          = 0;
@@ -413,6 +518,94 @@ int FileIOLayer::submit_batch(const std::vector<FileIOBatchRequest> & reqs) {
         ++n_queued;
     }
     return n_queued;
+}
+
+// ---------------------------------------------------------------------------
+// Completion demux — shared base implementation over reap_raw_()
+// ---------------------------------------------------------------------------
+//
+// One FileIOLayer (io_uring ring / pread deque) is shared by several logical
+// consumers: the prefetch scheduler, synchronous pager page-ins, and the
+// ensure_batch expert fetch. Each waits for its OWN req_ids. A completion for
+// consumer A can be reaped by consumer B first; B MUST NOT discard it. These
+// methods buffer any completion whose req_id was not the one asked for, so its
+// owner still claims it later. This is the fix for the shared-ring cross-drain
+// that leaked prefetch slots and stalled the decode pipeline (2x regression).
+
+IoResult FileIOLayer::wait_any(int timeout_ms) {
+    // Buffered completions first — they were reaped earlier for someone who
+    // hadn't asked yet; returning them here keeps them from lingering.
+    if (!ready_.empty()) {
+        auto it = ready_.begin();
+        IoResult r = it->second;
+        ready_.erase(it);
+        return r;
+    }
+    IoResult r;
+    if (reap_raw_(timeout_ms, r)) {
+        return r;
+    }
+    r = IoResult{};
+    r.status = IoStatus::Timeout;
+    return r;
+}
+
+bool FileIOLayer::try_take(uint64_t req_id, IoResult & out) {
+    // Drain everything immediately available into the buffer (non-blocking),
+    // then take our own. This moves foreign completions into ready_ for their
+    // owners rather than leaving them unreaped behind ours in the ring.
+    IoResult r;
+    while (reap_raw_(0, r)) {
+        ready_[r.req_id] = r;
+    }
+    auto it = ready_.find(req_id);
+    if (it == ready_.end()) {
+        return false;
+    }
+    out = it->second;
+    ready_.erase(it);
+    return true;
+}
+
+IoResult FileIOLayer::wait_for_req(uint64_t req_id, int timeout_ms) {
+    IoResult out;
+    if (try_take(req_id, out)) {
+        return out;
+    }
+
+    using clock = std::chrono::steady_clock;
+    const bool        have_deadline = (timeout_ms >= 0);
+    clock::time_point deadline      = have_deadline
+        ? clock::now() + std::chrono::milliseconds(timeout_ms)
+        : clock::time_point{};
+
+    IoResult r;
+    while (true) {
+        int remaining = -1;
+        if (have_deadline) {
+            const auto now = clock::now();
+            if (now >= deadline) break;
+            remaining = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+            if (remaining <= 0) remaining = 1;  // don't degrade a live budget to a poll
+        }
+        if (!reap_raw_(remaining, r)) {
+            // No completion within the budget. For an indefinite wait this can
+            // only mean the transport is drained with nothing in flight — stop
+            // rather than spin.
+            break;
+        }
+        if (r.req_id == req_id) {
+            return r;  // ours
+        }
+        if (r.status == IoStatus::ErrorIo && r.req_id == 0) {
+            return r;  // transport-level failure — propagate, not a request result
+        }
+        ready_[r.req_id] = r;  // foreign completion — buffer for its owner, never drop
+    }
+    out = IoResult{};
+    out.status = IoStatus::Timeout;
+    return out;
 }
 
 // ---------------------------------------------------------------------------

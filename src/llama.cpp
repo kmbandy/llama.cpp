@@ -91,6 +91,13 @@ static int wp_iouring_depth_override_from_env() {
     return value;
 }
 
+// WP_RESIDENT_DENSE: page only routed experts, keep dense weights resident.
+// Must mirror the same-named gate in llama-model.cpp (both read the env).
+static bool wp_resident_dense_from_env() {
+    const char * v = std::getenv("WP_RESIDENT_DENSE");
+    return v != nullptr && v[0] == '1';
+}
+
 static bool init_weight_pager(llama_model & model, llama_model_loader & ml, const llama_model_params & params) {
     if (!params.weight_paging_enabled) {
         return true;
@@ -167,10 +174,44 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
     // 3. Build the new pager: catalog + init.
     model.wp_pager = std::make_unique<wp::WeightPager>();
     for (const auto & info : ml.weight_page_infos) {
-        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts);
+        ggml_backend_buffer_type_t page_buft = buft;
+        for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
+            if (t != nullptr && info.name == ggml_get_name(t) && t->buffer != nullptr) {
+                page_buft = ggml_backend_buffer_get_type(t->buffer);
+                break;
+            }
+        }
+        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts, page_buft);
     }
     LLAMA_LOG_INFO("%s: catalog populated: %d page entries (source had %zu)\n",
                    __func__, model.wp_pager->n_pages(), ml.weight_page_infos.size());
+
+    if (wp_resident_dense_from_env()) {
+        // Under the resident-dense split the catalog must hold ONLY expert-
+        // related pages: routed-expert sub-pages (is_expert), their
+        // consolidated parents (is_consolidated, uncounted), or pinned
+        // entries. A plain-dense page here means is_paged_weight() and the
+        // catalog filter disagree — fail loud rather than silently thrash it.
+        // (Do NOT compare n_pages()==catalog_n_expert_pages(): consolidated
+        // parents inflate n_pages() but are not counted as expert pages.)
+        const int n = model.wp_pager->n_pages();
+        int n_dense = 0;
+        for (int i = 0; i < n; ++i) {
+            const wp::PageMeta & m = model.wp_pager->page_meta(i);
+            if (!m.is_expert && !m.is_consolidated && !m.is_sub_expert && !m.is_pinned) {
+                ++n_dense;
+            }
+        }
+        if (n_dense > 0) {
+            throw std::runtime_error(format(
+                "weight pager: WP_RESIDENT_DENSE on but %d dense (non-expert) "
+                "pages are in the catalog (n_pages=%d) — the is_paged_weight() "
+                "and catalog filters disagree", n_dense, n));
+        }
+        LLAMA_LOG_WARN("%s: resident_dense=ON  paged_pages=%d (expert_subpages=%d, "
+                       "all routed)  dense tensors resident via normal allocator\n",
+                       __func__, n, model.wp_pager->catalog_n_expert_pages());
+    }
 
     // 4. Determine number of slots.
     //    - If the user supplied --weight-paging-slots N (positive), honour it.
@@ -284,7 +325,17 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                 continue;
             }
             t->data   = placeholder;
-            t->buffer = nullptr;
+            // Anchor paged weights to the pool's device buffer so the backend
+            // scheduler can name a backend for them (buffer_id) even when a
+            // weight is reached only as a reshape/view's view_src — a leaf with
+            // buffer==NULL whose sole consumer is a view op falls through every
+            // split_graph assignment pass and gets buffer_id -1, tripping the
+            // gallocr assert (DeepSeek V4 wo_a = ggml_reshape_3d(...)->mul_mat).
+            // gallocr still skips it (is_allocated checks data != NULL first);
+            // eval_cb re-patches ->data (and already sets ->buffer = pool_buf)
+            // per op. This just brings load-time state to the post-first-decode
+            // steady state the eval_cb already produces.
+            t->buffer = pool_buf;
             ++n_placed;
         }
         LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p, skipped %zu not in catalog)\n",
