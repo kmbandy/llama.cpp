@@ -500,3 +500,14 @@ lever to raise QD past 4 → past 0.93 t/s toward 1-3.
 **NOT YET TESTED:** P2P transport + resident-dense at depth 4 (may beat host's
 1.4 GB/s via direct-to-VRAM). Phase 2 (multi-device TB3) + Phase 3 (expert cache)
 still ahead.
+
+**DEPTH-4 SWEEP (best stable config found):**
+- host, slots 2000: 0.93 t/s
+- host, slots 3000: 0.65 t/s (more slots did NOT help — 0% prefetch hit, low cross-token expert locality)
+- **P2P, slots 2000: 1.038 t/s** ← BEST, coherent, ~52× over 0.02 baseline, INTO the 1-3 t/s target.
+  (io_effective "186 GB/s" is the batched-timing artifact for direct-to-VRAM; not literal.)
+
+**Bottleneck now:** page_ins ~11k, evictions ~9k, prefetch_hit_rate 0% — the expert cache barely
+hits (routing locality low at this cache size). Levers to go higher: (1) fix the depth>4 hang → QD>4;
+(2) Phase 2 (dense on 6900XT eGPU frees full 32GB R9700 for expert cache); (3) Phase 3 frequency-biased
+retention + prefetch coverage. Slot-count alone is a weak lever. Phase 1 gate: PASSED (coherent, >>0.4).
