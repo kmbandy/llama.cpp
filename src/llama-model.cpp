@@ -18,6 +18,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "weight-pager/wp-pager.h"  // complete type for unique_ptr<wp::WeightPager> dtor
+#include "weight-pager/wp-router.h"
 
 #include "memory-tier/mt-tiered.h"  // mt::llama_memory_tiered wrapper (Phase 2)
 
@@ -1356,8 +1357,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
     }
 
-    std::string wp_expert_override_pattern;
-    std::string wp_dense_override_pattern;
     std::vector<llama_model_tensor_buft_override> wp_tensor_buft_overrides;
     ggml_backend_buffer_type_t wp_paging_buft = nullptr;
     ggml_backend_buffer_type_t wp_resident_buft = nullptr;
@@ -1372,16 +1371,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_idx].dev);
         }
         if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
-            wp_expert_override_pattern = "ffn_(up|gate|down)_exps\\.";
-            wp_dense_override_pattern = ".*";
-            wp_tensor_buft_overrides.push_back({ wp_expert_override_pattern.c_str(), wp_paging_buft });
-            wp_tensor_buft_overrides.push_back({ wp_dense_override_pattern.c_str(),  wp_resident_buft });
-            if (params.tensor_buft_overrides != nullptr) {
-                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
-                    wp_tensor_buft_overrides.push_back(*o);
-                }
-            }
-            wp_tensor_buft_overrides.push_back({ nullptr, nullptr });
+            // C2: override ONLY routed experts out to the paging device. Dense/
+            // attention tensors default to their layer home (the resident
+            // device, pinned in C1) - no greedy ".*" override.
+            wp_tensor_buft_overrides = wp::build_router_overrides(wp_paging_buft, params.tensor_buft_overrides);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             wp_device_router_enabled = true;
             wp_resident_dev = devices[resident_idx].dev;   // C1: home device for offloaded layers
