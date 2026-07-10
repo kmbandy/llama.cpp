@@ -333,6 +333,88 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         s_range_pins_pending.clear();
     }
     if (!ask)             return true;
+
+    // --- Cross-layer prefetch (WP_PREFETCH_XLAYER), gated OFF by default -----
+    // At the ffn_gate_inp router MUL_MAT (start of each MoE block): src[0] is
+    // the router weight (host-copied once per layer), src[1] is the residual
+    // `cur` (== the expert input). Predict layers L+1..L+K's experts from `cur`
+    // and speculatively prefetch them while layer L computes. The default path
+    // (flag unset) never enters this block, so it stays byte-identical.
+    if (pager->xlayer_prefetch_enabled() && t->op == GGML_OP_MUL_MAT &&
+        t->src[0] != nullptr && t->src[1] != nullptr) {
+        const char * w0 = ggml_get_name(t->src[0]);
+        int L = -1;
+        if (w0 != nullptr && std::strstr(w0, "ffn_gate_inp") != nullptr) {
+            std::sscanf(w0, "blk.%d.", &L);
+        }
+        if (L >= 0) {
+            auto to_f32 = [](const void * src, ggml_type ty, int64_t n,
+                             std::vector<float> & out) -> bool {
+                out.resize((size_t) n);
+                if (ty == GGML_TYPE_F32) {
+                    std::memcpy(out.data(), src, (size_t) n * sizeof(float));
+                    return true;
+                }
+                if (ty == GGML_TYPE_F16) {
+                    const ggml_fp16_t * p = (const ggml_fp16_t *) src;
+                    for (int64_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
+                    return true;
+                }
+                if (ty == GGML_TYPE_BF16) {
+                    const uint16_t * p = (const uint16_t *) src;
+                    for (int64_t i = 0; i < n; ++i) {
+                        uint32_t b = ((uint32_t) p[i]) << 16; float f;
+                        std::memcpy(&f, &b, sizeof(f)); out[i] = f;
+                    }
+                    return true;
+                }
+                return false;
+            };
+            hipStream_t wp_stream =
+                (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
+            auto d2h = [&](const void * dptr, size_t nb, std::vector<char> & host) -> bool {
+                host.resize(nb);
+                hipError_t ce;
+                if (wp_stream != nullptr) {
+                    ce = hipMemcpyAsync(host.data(), dptr, nb, hipMemcpyDeviceToHost, wp_stream);
+                    if (ce == hipSuccess) ce = hipStreamSynchronize(wp_stream);
+                } else {
+                    hipDeviceSynchronize();
+                    ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
+                }
+                return ce == hipSuccess;
+            };
+            // 1) capture this layer's router weight once (n_embd x n_expert).
+            if (!pager->predictor_has_router(L)) {
+                ggml_tensor * w = t->src[0];
+                const int n_embd   = (int) w->ne[0];
+                const int n_expert = (int) w->ne[1];
+                std::vector<char>  hbuf;
+                std::vector<float> wf;
+                if (n_embd > 0 && n_expert > 0 &&
+                    d2h(w->data, ggml_nbytes(w), hbuf) &&
+                    to_f32(hbuf.data(), w->type, (int64_t) n_embd * n_expert, wf)) {
+                    pager->note_router_weight(L, wf.data(), n_expert, n_embd);
+                }
+            }
+            // 2) predict + speculatively prefetch from the residual, per token
+            //    row (DFlash draft rows union naturally via the pager's dedup).
+            {
+                ggml_tensor * hh = t->src[1];
+                const int n_embd = (int) hh->ne[0];
+                const int n_tok  = (int) hh->ne[1];
+                std::vector<char>  hbuf;
+                std::vector<float> hf;
+                if (n_embd > 0 && n_tok > 0 &&
+                    d2h(hh->data, ggml_nbytes(hh), hbuf) &&
+                    to_f32(hbuf.data(), hh->type, (int64_t) n_embd * n_tok, hf)) {
+                    for (int j = 0; j < n_tok; ++j) {
+                        pager->submit_xlayer_prefetch(hf.data() + (size_t) j * n_embd, L);
+                    }
+                }
+            }
+        }
+    }
     const bool eval_debug = eval_debug_enabled();
     const uint64_t sync_fallbacks_before =
         batch_eval_cb ? pager->sync_fallback_count() : 0;

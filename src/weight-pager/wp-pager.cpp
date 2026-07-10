@@ -558,6 +558,45 @@ void WeightPager::expert_sister_pages(int block_idx, int expert_idx,
     out.insert(out.end(), it->second.begin(), it->second.end());
 }
 
+void WeightPager::note_router_weight(int block_idx, const float * W, int n_expert, int n_embd) {
+    predictor_.set_router(block_idx, W, n_expert, n_embd);
+}
+
+bool WeightPager::predictor_has_router(int block_idx) const {
+    return predictor_.has_router(block_idx);
+}
+
+void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
+    if (!initialized_ || !xlayer_prefetch_enabled_ || h == nullptr) return;
+    std::vector<ExpertRef> refs;
+    predictor_.predict(h, from_layer, xlayer_lookahead_k_, xlayer_topk_, n_layer_, refs);
+    if (refs.empty()) return;
+    std::vector<int> pages;
+    for (const ExpertRef & r : refs) {
+        expert_sister_pages(r.layer, r.expert, pages);
+    }
+    if (pages.empty()) return;
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    std::vector<int> fresh;
+    fresh.reserve(pages.size());
+    for (int p : pages) {
+        if (p < 0 || p >= catalog_.size()) continue;
+        if (catalog_.at(p).is_pinned) continue;
+        if (page_to_slot_[p] >= 0) continue;   // resident or already in flight
+        fresh.push_back(p);
+    }
+    if (fresh.empty()) return;
+    // Speculative slot budget: never let speculation exceed the cap.
+    if (xlayer_max_slots_ > 0) {
+        const int budget = xlayer_max_slots_ - pool_.n_speculative();
+        if (budget <= 0) return;
+        if ((int) fresh.size() > budget) fresh.resize((size_t) budget);
+    }
+    mark_cross_layer_prefetch_candidates(fresh);
+    prefetch_pages_batch(fresh, /*count_dense_prefetch=*/false, /*allow_evict=*/true, /*speculative=*/true);
+}
+
 bool WeightPager::init(const Config &             cfg,
                        ggml_backend_buffer_type_t device_buft,
                        int                        device_idx,
@@ -640,6 +679,25 @@ bool WeightPager::init(const Config &             cfg,
             LLAMA_LOG_INFO("wp::WeightPager: WP_HOT_HIT_THRESHOLD=%ld "
                            "(slots with hit_count > %ld are skipped in LRU "
                            "eviction Pass A)\n", t, t);
+        }
+    }
+
+    // Cross-layer prefetch (WP_PREFETCH_XLAYER). Off by default => default path
+    // stays byte-identical. Router weights are captured lazily in the eval cb.
+    {
+        n_layer_ = 0;
+        for (int i = 0; i < catalog_.size(); ++i) {
+            const int b = catalog_.at(i).block_idx;
+            if (b + 1 > n_layer_) n_layer_ = b + 1;
+        }
+        if (const char * e = std::getenv("WP_PREFETCH_XLAYER"))      xlayer_prefetch_enabled_ = (e[0] == '1');
+        if (const char * e = std::getenv("WP_PREFETCH_LOOKAHEAD_K")) { long v = std::strtol(e,nullptr,10); if (v > 0) xlayer_lookahead_k_ = (int) v; }
+        if (const char * e = std::getenv("WP_PREFETCH_TOPK"))        { long v = std::strtol(e,nullptr,10); if (v > 0) xlayer_topk_ = (int) v; }
+        xlayer_max_slots_ = pool_.n_slots() / 4;
+        if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
+        if (xlayer_prefetch_enabled_) {
+            LLAMA_LOG_INFO("wp::xlayer prefetch: on K=%d M=%d cap=%d n_layer=%d\n",
+                           xlayer_lookahead_k_, xlayer_topk_, xlayer_max_slots_, n_layer_);
         }
     }
 
@@ -897,6 +955,7 @@ int WeightPager::graph_pin_slot_count_except_(const void * graph_key) const {
 
 void WeightPager::on_pool_evict_(int slot_idx) {
     if (slot_idx < 0 || slot_idx >= (int) slot_to_page_.size()) return;
+    if (pool_.is_speculative(slot_idx)) ++stats_.speculative_evicted_unused;
     int page = slot_to_page_[slot_idx];
     if (page >= 0 && page < (int) page_to_slot_.size()) {
         if (page < (int) page_async_event_.size() && page_async_event_[page] >= 0) {
@@ -1013,6 +1072,8 @@ void WeightPager::log_stats_summary() {
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
             "  cross_layer_hit_in_ensure: %lu\n"
+        "  speculative_evicted_unused: %lu\n"
+            "  speculative_evicted_unused: %lu\n"
             "  host_tier_hits: %lu\n"
             "  routing_ptrs_set: %lu\n"
             "  routing_ptrs_consumed: %lu\n"
@@ -1071,6 +1132,8 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
             (unsigned long) s.cross_layer_hit_in_ensure,
+        (unsigned long) s.speculative_evicted_unused,
+            (unsigned long) s.speculative_evicted_unused,
             (unsigned long) s.host_tier_hits,
             (unsigned long) s.routing_ptrs_set,
             (unsigned long) s.routing_ptrs_consumed,
@@ -2064,7 +2127,8 @@ void WeightPager::tick() {
 
 bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
                                        bool count_dense_prefetch,
-                                       bool allow_evict) {
+                                       bool allow_evict,
+                                       bool speculative) {
     if (!initialized_) return false;
     if (page_indices.empty()) return true;
 
@@ -2129,6 +2193,7 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
             return false;
         }
         ensure_slot_map_(s);
+        if (speculative) pool_.set_speculative(s, true);
         slots.push_back(s);
     }
     if (slots.empty()) {

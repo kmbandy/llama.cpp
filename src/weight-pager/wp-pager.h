@@ -24,6 +24,7 @@
 #include "wp-pool.h"
 #include "wp-gpu-transport.h"
 #include "wp-prefetch.h"
+#include "wp-router-predictor.h"
 
 #include <condition_variable>
 #include <cstddef>
@@ -76,6 +77,7 @@ public:
         uint64_t dense_prefetch_submitted       = 0;
         uint64_t cross_layer_prefetch_submitted = 0;
         uint64_t cross_layer_hit_in_ensure      = 0;
+        uint64_t speculative_evicted_unused     = 0; // xlayer: prefetched, evicted, never demanded
         uint64_t host_tier_hits                 = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
@@ -269,7 +271,8 @@ public:
     // allow_evict=false: free pool slots only (sample oracle).
     bool prefetch_pages_batch(const std::vector<int> & page_indices,
                               bool count_dense_prefetch = false,
-                              bool allow_evict = true);
+                              bool allow_evict = true,
+                              bool speculative = false);
 
     // Hint the kernel (via POSIX_FADV_WILLNEED on the file_io layer) that
     // we will soon need every paged tensor in layers [block_idx+1,
@@ -294,6 +297,16 @@ public:
     // to `out`, using the reverse index built in init(). O(1) replacement for
     // PageCatalog::pages_for_expert on the cross-layer prefetch hot path.
     void expert_sister_pages(int block_idx, int expert_idx, std::vector<int> & out) const;
+
+    // --- Cross-layer prefetch (WP_PREFETCH_XLAYER) --------------------------
+    // Store a host f32 copy of layer L's ffn_gate_inp router weight so the
+    // RouterPredictor can score future layers' experts from a live residual.
+    void note_router_weight(int block_idx, const float * W, int n_expert, int n_embd);
+    bool predictor_has_router(int block_idx) const;
+    // Predict layer from_layer+1..+K experts from residual h and speculatively
+    // prefetch their sister pages. No-op unless WP_PREFETCH_XLAYER is set.
+    void submit_xlayer_prefetch(const float * h, int from_layer);
+    bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
 
     // --- Draft-as-paging-oracle -------------------------------------------
     // Hash-layer tid2eid(token) is the hard signal (DS4 layers 0..H). Softmax
@@ -397,6 +410,15 @@ private:
     // (block_idx, expert_idx) -> sister page indices (gate/up/down), built
     // once in init() from catalog_. Mirrors PageCatalog::pages_for_expert but O(1).
     std::map<std::pair<int,int>, std::vector<int>> expert_page_index_;
+
+    // Cross-layer prefetch (WP_PREFETCH_XLAYER). predictor_ holds host f32
+    // copies of each layer's ffn_gate_inp; config knobs parsed once in init().
+    RouterPredictor predictor_;
+    bool xlayer_prefetch_enabled_ = false;
+    int  xlayer_lookahead_k_      = 2;
+    int  xlayer_topk_             = 16;
+    int  xlayer_max_slots_        = 0;   // 0 => n_slots/4, set in init()
+    int  n_layer_                 = 0;   // max catalog block_idx + 1
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
