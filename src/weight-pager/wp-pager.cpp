@@ -541,6 +541,23 @@ int WeightPager::add_page(const std::string & name, uint16_t file_idx,
     return first;
 }
 
+void build_expert_page_index(const PageCatalog & catalog,
+                             std::map<std::pair<int,int>, std::vector<int>> & out) {
+    out.clear();
+    for (int i = 0; i < catalog.size(); ++i) {
+        const PageMeta & m = catalog.at(i);
+        if (!m.is_expert || m.expert_idx < 0 || m.block_idx < 0) continue;
+        out[std::make_pair((int) m.block_idx, (int) m.expert_idx)].push_back(i);
+    }
+}
+
+void WeightPager::expert_sister_pages(int block_idx, int expert_idx,
+                                      std::vector<int> & out) const {
+    auto it = expert_page_index_.find(std::make_pair(block_idx, expert_idx));
+    if (it == expert_page_index_.end()) return;
+    out.insert(out.end(), it->second.begin(), it->second.end());
+}
+
 bool WeightPager::init(const Config &             cfg,
                        ggml_backend_buffer_type_t device_buft,
                        int                        device_idx,
@@ -554,6 +571,8 @@ bool WeightPager::init(const Config &             cfg,
         LLAMA_LOG_WARN("wp::WeightPager::init: no pages registered\n");
         return false;
     }
+
+    build_expert_page_index(catalog_, expert_page_index_);
 
     if (devices_used.size() > 1) {
         LLAMA_LOG_WARN(

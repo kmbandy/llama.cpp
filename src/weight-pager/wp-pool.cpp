@@ -235,6 +235,7 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
     }
     lru_walk_pinned_skips_ = 0;                 // MAD-231: telemetry reset
     hit_count_.assign((size_t) n_slots_, 0);              // MAD-237: popularity counter
+    speculative_.assign((size_t) n_slots_, 0);            // cross-layer prefetch tier
     lru_walk_hot_skips_      = 0;
     n_evictions_since_decay_ = 0;
     n_decays_                = 0;
@@ -296,8 +297,9 @@ int PoolAllocator::alloc_slot_no_evict(size_t requested_size) {
                 if (s < 0 || s >= n_slots_ || used_[s] || pin_count_[s] > 0) {
                     continue;
                 }
-                used_[s]      = true;
-                last_used_[s] = ++tick_;
+                used_[s]        = true;
+                last_used_[s]   = ++tick_;
+                speculative_[s] = 0;
                 return s;
             }
         }
@@ -305,12 +307,29 @@ int PoolAllocator::alloc_slot_no_evict(size_t requested_size) {
     }
     for (int i = 0; i < n_slots_; ++i) {
         if (!used_[i] && pin_count_[i] == 0) {
-            used_[i]      = true;
-            last_used_[i] = ++tick_;
+            used_[i]        = true;
+            last_used_[i]   = ++tick_;
+            speculative_[i] = 0;
             return i;
         }
     }
     return -1;
+}
+
+void PoolAllocator::set_speculative(int slot_idx, bool spec) {
+    if (slot_idx < 0 || slot_idx >= n_slots_) return;
+    speculative_[(size_t) slot_idx] = spec ? 1 : 0;
+}
+
+bool PoolAllocator::is_speculative(int slot_idx) const {
+    if (slot_idx < 0 || slot_idx >= n_slots_) return false;
+    return speculative_[(size_t) slot_idx] != 0;
+}
+
+int PoolAllocator::n_speculative() const {
+    int n = 0;
+    for (int i = 0; i < n_slots_; ++i) if (speculative_[(size_t) i]) ++n;
+    return n;
 }
 
 int PoolAllocator::alloc_slot_fixed_() {
@@ -322,9 +341,28 @@ int PoolAllocator::alloc_slot_fixed_() {
     // a pinned slot would mean the caller doesn't know it's still in use.
     for (int i = 0; i < n_slots_; ++i) {
         if (!used_[i] && pin_count_[i] == 0) {
-            used_[i]      = true;
-            last_used_[i] = ++tick_;
+            used_[i]        = true;
+            last_used_[i]   = ++tick_;
+            speculative_[i] = 0;
             return i;
+        }
+    }
+    // Pass 0: recycle the LRU *speculative* slot before evicting the working
+    // set. Speculation must never evict a pinned/hot live page (the footgun).
+    {
+        int      spec_lru   = -1;
+        uint64_t spec_lru_t = std::numeric_limits<uint64_t>::max();
+        for (int i = 0; i < n_slots_; ++i) {
+            if (pin_count_[i] > 0 || !speculative_[i]) continue;
+            if (last_used_[i] < spec_lru_t) { spec_lru_t = last_used_[i]; spec_lru = i; }
+        }
+        if (spec_lru >= 0) {
+            if (on_evict_) on_evict_(spec_lru);   // callback sees is_speculative()==true
+            speculative_[spec_lru] = 0;
+            last_used_[spec_lru]   = ++tick_;
+            hit_count_[spec_lru]   = 0;
+            decay_after_eviction_();
+            return spec_lru;
         }
     }
     // All used (or remaining free are pinned): evict LRU among UNPINNED.
@@ -399,6 +437,7 @@ int PoolAllocator::alloc_slot_fixed_() {
     last_used_[lru] = ++tick_;
     // MAD-237: the evicted slot starts fresh — new owner has no hit history.
     hit_count_[lru] = 0;
+    speculative_[lru] = 0;
     // used_ stays true: slot transitions directly from old owner to new one.
 
     decay_after_eviction_();
@@ -417,9 +456,10 @@ int PoolAllocator::alloc_slot_size_class_(size_t requested_size) {
 
     int slot = take_free_size_class_slot_(requested_class);
     if (slot >= 0) {
-        used_[slot]      = true;
-        last_used_[slot] = ++tick_;
-        hit_count_[slot] = 0;
+        used_[slot]        = true;
+        last_used_[slot]   = ++tick_;
+        hit_count_[slot]   = 0;
+        speculative_[slot] = 0;
         return slot;
     }
 
@@ -429,11 +469,32 @@ int PoolAllocator::alloc_slot_size_class_(size_t requested_size) {
         last_used_.push_back(++tick_);
         pin_count_.push_back(0);
         hit_count_.push_back(0);
+        speculative_.push_back(0);
         slot_offset_.push_back(high_water_);
         slot_bytes_.push_back(requested_class);
         slot_class_.push_back(requested_class);
         high_water_ += requested_class;
         return slot;
+    }
+
+    // Pass 0: recycle the LRU *speculative* slot of an adequate class before
+    // evicting the working set. Speculation never evicts a live page.
+    {
+        int      spec_lru   = -1;
+        uint64_t spec_lru_t = std::numeric_limits<uint64_t>::max();
+        for (int i = 0; i < n_slots_; ++i) {
+            if (!used_[i] || pin_count_[i] > 0 || !speculative_[i]) continue;
+            if (slot_class_[i] < requested_class) continue;
+            if (last_used_[i] < spec_lru_t) { spec_lru_t = last_used_[i]; spec_lru = i; }
+        }
+        if (spec_lru >= 0) {
+            if (on_evict_) on_evict_(spec_lru);
+            speculative_[spec_lru] = 0;
+            last_used_[spec_lru]   = ++tick_;
+            hit_count_[spec_lru]   = 0;
+            decay_after_eviction_();
+            return spec_lru;
+        }
     }
 
     int n_pinned_skipped_this_walk = 0;
@@ -454,8 +515,9 @@ int PoolAllocator::alloc_slot_size_class_(size_t requested_size) {
     if (on_evict_) {
         on_evict_(lru);
     }
-    last_used_[lru] = ++tick_;
-    hit_count_[lru] = 0;
+    last_used_[lru]   = ++tick_;
+    hit_count_[lru]   = 0;
+    speculative_[lru] = 0;
     decay_after_eviction_();
     return lru;
 }
@@ -602,6 +664,7 @@ void PoolAllocator::decay_after_eviction_() {
 void PoolAllocator::mark_used(int slot_idx) {
     if (slot_idx < 0 || slot_idx >= n_slots_) return;
     last_used_[slot_idx] = ++tick_;
+    speculative_[slot_idx] = 0;   // demand hit promotes a speculative slot
     // MAD-237: bump popularity. Saturates rather than wraps — once a slot
     // is "very hot" we don't need more precision.
     if (hit_count_[slot_idx] < std::numeric_limits<uint32_t>::max()) {
@@ -663,6 +726,7 @@ int PoolAllocator::n_pinned() const {
 
 void PoolAllocator::release_slot(int slot_idx) {
     if (slot_idx < 0 || slot_idx >= n_slots_) return;
+    speculative_[slot_idx] = 0;
     if (size_class_slots_) {
         if (!used_[slot_idx]) return;
         used_[slot_idx] = false;

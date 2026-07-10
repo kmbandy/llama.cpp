@@ -89,6 +89,15 @@ public:
     // Count of slots that are free and unpinned (no eviction needed to use).
     int n_free_unpinned() const;
 
+    // --- Speculative eviction tier (cross-layer prefetch) ------------------
+    // A slot flagged speculative holds a prefetched-but-not-yet-demanded page.
+    // alloc_slot() evicts the LRU speculative slot BEFORE touching the pinned/
+    // hot working set, so speculation never evicts live pages. mark_used()
+    // (a demand hit) promotes a speculative slot to non-speculative.
+    void set_speculative(int slot_idx, bool spec);
+    bool is_speculative(int slot_idx) const;
+    int  n_speculative() const;
+
     // Bump the LRU tick of an already-allocated slot, signalling a cache
     // hit. Caller must ensure the slot was previously returned by
     // alloc_slot() and has not been evicted.
@@ -206,6 +215,9 @@ private:
     // pin-during-op-then-unpin lifecycle needs; the cap protects against
     // refcount bugs by failing loudly rather than overflowing silently.
     std::vector<uint16_t> pin_count_;
+    // Per-slot speculative flag (cross-layer prefetch). 1 = prefetched, not yet
+    // demanded; evicted before the working set and cleared on demand-hit/reuse.
+    std::vector<char>     speculative_;
     EvictionCallback      on_evict_;
     // Telemetry: count of LRU-walk iterations that skipped a pinned slot.
     uint64_t              lru_walk_pinned_skips_ = 0;

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -1874,6 +1875,79 @@ static int test_router_predictor() {
     return fails;
 }
 
+static int test_expert_page_index() {
+    int fails = 0;
+    using namespace wp;
+    PageCatalog cat;
+    // block 5: three consolidated MoE roles, 4 experts each.
+    cat.add_consolidated_experts("blk.5.ffn_gate_exps.weight", 0, 0,      4*4096, 4);
+    cat.add_consolidated_experts("blk.5.ffn_up_exps.weight",   0, 100000, 4*4096, 4);
+    cat.add_consolidated_experts("blk.5.ffn_down_exps.weight", 0, 200000, 4*4096, 4);
+    std::map<std::pair<int,int>, std::vector<int>> idx;
+    build_expert_page_index(cat, idx);
+    // (block 5, expert 3) -> gate.3 + up.3 + down.3 = 3 sister pages
+    auto it = idx.find(std::make_pair(5,3));
+    EXPECT(it != idx.end(), "(5,3) present in index");
+    if (it != idx.end()) {
+        EXPECT_EQ_INT((int) it->second.size(), 3, "(5,3) has 3 sister pages");
+        for (int pg : it->second) {
+            EXPECT_EQ_INT(cat.at(pg).block_idx, 5, "sister page block 5");
+            EXPECT_EQ_INT(cat.at(pg).expert_idx, 3, "sister page expert 3");
+        }
+    }
+    // absent (block,expert)
+    EXPECT(idx.find(std::make_pair(99,0)) == idx.end(), "(99,0) absent -> not in index");
+    // cross-check: index result matches the linear pages_for_expert() scan.
+    auto scan = cat.pages_for_expert(5, 3);
+    EXPECT_EQ_INT((int) scan.size(), 3, "pages_for_expert(5,3) also returns 3");
+    return fails;
+}
+
+static int test_pool_speculative() {
+    int fails = 0;
+    using namespace wp;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type available"); return fails; }
+
+    PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/3, /*slot_size=*/256), "pool init 3 slots");
+    int a = pool.alloc_slot(); int b = pool.alloc_slot(); int c = pool.alloc_slot();
+    EXPECT_EQ_INT(a, 0, "alloc a=0"); EXPECT_EQ_INT(b, 1, "alloc b=1"); EXPECT_EQ_INT(c, 2, "alloc c=2");
+    EXPECT(!pool.is_speculative(a), "fresh alloc is non-speculative");
+    EXPECT_EQ_INT(pool.n_speculative(), 0, "no speculative yet");
+
+    pool.set_speculative(b, true);
+    EXPECT(pool.is_speculative(b), "b marked speculative");
+    EXPECT_EQ_INT(pool.n_speculative(), 1, "one speculative");
+
+    pool.pin_slot(a); pool.pin_slot(c);            // a,c are the pinned working set
+    int d = pool.alloc_slot();                     // must evict b (speculative), not a/c
+    EXPECT_EQ_INT(d, b, "alloc evicts the speculative slot first");
+    EXPECT(!pool.is_speculative(d), "reused slot is non-speculative");
+    EXPECT_EQ_INT(pool.n_speculative(), 0, "speculative cleared after reuse");
+
+    // promotion: a speculative slot that gets mark_used is no longer speculative
+    pool.set_speculative(d, true);
+    pool.mark_used(d);
+    EXPECT(!pool.is_speculative(d), "mark_used promotes (clears speculative)");
+    EXPECT_EQ_INT(pool.n_speculative(), 0, "promoted slot not counted");
+    pool.unpin_slot(a); pool.unpin_slot(c);
+
+    // Discriminating case: Pass-0 evicts a NEWER speculative slot before an
+    // OLDER non-speculative one (proves speculative-first beats pure LRU).
+    PoolAllocator p2;
+    EXPECT(p2.init(buft, /*n_slots=*/3, /*slot_size=*/256), "p2 init");
+    int x = p2.alloc_slot(); (void) x;             // oldest, non-speculative
+    int y = p2.alloc_slot();
+    int z = p2.alloc_slot();
+    p2.mark_used(z);                                // z newest by recency
+    p2.set_speculative(z, true);                    // z speculative AND newest
+    p2.pin_slot(y);                                 // isolate x (old) vs z (new,spec)
+    int w = p2.alloc_slot();                        // pure LRU->x; speculative-first->z
+    EXPECT_EQ_INT(w, z, "speculative slot evicted before older non-speculative (Pass 0 > LRU)");
+    return fails;
+}
+
 int main() {
     int total_fails = 0;
 
@@ -1925,6 +1999,8 @@ int main() {
         { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
         { "router_predictor",                    test_router_predictor                    },
+        { "expert_page_index",                   test_expert_page_index                   },
+        { "pool_speculative",                    test_pool_speculative                    },
     };
 
     for (const auto & t : tests) {

@@ -34,6 +34,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -289,6 +290,11 @@ public:
     // submissions and later ensure-time hits are folded into Stats.
     void mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices);
 
+    // Append the sister page indices (gate/up/down) for (block_idx, expert_idx)
+    // to `out`, using the reverse index built in init(). O(1) replacement for
+    // PageCatalog::pages_for_expert on the cross-layer prefetch hot path.
+    void expert_sister_pages(int block_idx, int expert_idx, std::vector<int> & out) const;
+
     // --- Draft-as-paging-oracle -------------------------------------------
     // Hash-layer tid2eid(token) is the hard signal (DS4 layers 0..H). Softmax
     // MMID history is metrics-only (low cross-token locality measured).
@@ -387,6 +393,10 @@ private:
 
     // Catalog of all pages. Built before init().
     PageCatalog catalog_;
+
+    // (block_idx, expert_idx) -> sister page indices (gate/up/down), built
+    // once in init() from catalog_. Mirrors PageCatalog::pages_for_expert but O(1).
+    std::map<std::pair<int,int>, std::vector<int>> expert_page_index_;
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
@@ -592,5 +602,11 @@ struct AdviseRange {
 std::vector<AdviseRange> compute_advise_ranges(const PageCatalog & catalog,
                                                 int                 block_idx,
                                                 int                 k);
+
+// Build a (block_idx, expert_idx) -> sister page indices reverse index from a
+// catalog. Mirrors PageCatalog::pages_for_expert. Pure function, unit-testable
+// without a live pager.
+void build_expert_page_index(const PageCatalog & catalog,
+                             std::map<std::pair<int,int>, std::vector<int>> & out);
 
 }  // namespace wp
