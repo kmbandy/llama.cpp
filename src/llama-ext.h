@@ -126,3 +126,24 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 // returns the DFlash hyper-connection stream multiplier
 LLAMA_API uint32_t        llama_model_dflash_hc_mult    (const struct llama_model * model);
+
+// Weight-pager draft-as-paging-oracle: after a draft model produces tokens,
+// map them through DS4 hash-layer tid2eid and pin/prefetch those expert
+// pages across the draft->target gap. n_tokens <= 0 clears the window.
+// Returns pages submitted for cold prefetch. No-op if paging disabled.
+// NOTE: under WP strip (accept=0), draft token != next input token; prefer
+// llama_wp_on_sampled_token for ground-truth hash-layer paging.
+LLAMA_API int llama_wp_on_draft_tokens(struct llama_context * ctx,
+                                       const llama_token * tokens,
+                                       int n_tokens);
+
+// Ground-truth hash-layer oracle: after the target samples token `id`, the
+// next forward will *consume* that id as input. tid2eid(id) is exact for
+// hash layers 0..H — no draft model required. Call once per sample.
+LLAMA_API int llama_wp_on_sampled_token(struct llama_context * ctx,
+                                        llama_token id);
+
+// Adaptive gate: when false, skip running the draft model this step (pool
+// already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0
+// always returns true. No-op / true if paging disabled.
+LLAMA_API bool llama_wp_draft_oracle_should_run(struct llama_context * ctx);

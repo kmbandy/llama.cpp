@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <vector>
 
+// Optional HIP multi-input stage flush (defined in ggml-cuda.cu when ROCm linked).
+// Weak so CPU-only builds still link.
+extern "C" void ggml_backend_cuda_xdev_batch_flush(void) __attribute__((weak));
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -747,6 +751,45 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// Coalesce multi-view residual staging: HC post creates hc*hc stream views of the
+// same residual parent; without this each view is a separate cross-device copy.
+// GGML_SCHED_VIEW_COALESCE=0 disables. Optional GGML_SCHED_VIEW_COALESCE_MAX (bytes)
+// caps parent size (default 4 MiB) so huge weight views never expand.
+static bool ggml_sched_view_coalesce_enabled(void) {
+    static const int on = []() {
+        const char * e = getenv("GGML_SCHED_VIEW_COALESCE");
+        if (e == nullptr || e[0] == '\0') {
+            return 1; // default ON
+        }
+        return strcmp(e, "0") != 0 ? 1 : 0;
+    }();
+    return on != 0;
+}
+
+static size_t ggml_sched_view_coalesce_max_bytes(void) {
+    static const size_t max_b = []() -> size_t {
+        const char * e = getenv("GGML_SCHED_VIEW_COALESCE_MAX");
+        if (e == nullptr || e[0] == '\0') {
+            return (size_t) 4 * 1024 * 1024;
+        }
+        return (size_t) strtoull(e, nullptr, 10);
+    }();
+    return max_b;
+}
+
+// Root parent + absolute byte offset for a (possibly multi-level) view.
+static const struct ggml_tensor * ggml_sched_view_root(const struct ggml_tensor * t, size_t * abs_offs) {
+    size_t offs = 0;
+    while (t && t->view_src) {
+        offs += t->view_offs;
+        t = t->view_src;
+    }
+    if (abs_offs) {
+        *abs_offs = offs;
+    }
+    return t;
+}
+
 // scheduler
 
 #ifndef GGML_SCHED_MAX_BACKENDS
@@ -1353,19 +1396,89 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
-                        for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
-                                ggml_set_input(tensor_copy);
-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+
+                        // Prefer staging the view root once; rebind this src as a
+                        // view into the parent copy (HC residual stream views).
+                        size_t view_abs_offs = 0;
+                        const struct ggml_tensor * root =
+                            (src->view_src && ggml_sched_view_coalesce_enabled())
+                                ? ggml_sched_view_root(src, &view_abs_offs)
+                                : nullptr;
+                        const size_t root_bytes = root ? ggml_nbytes(root) : 0;
+                        bool coalesce =
+                            root != nullptr &&
+                            root != src &&
+                            root_bytes > 0 &&
+                            root_bytes <= ggml_sched_view_coalesce_max_bytes() &&
+                            view_abs_offs + ggml_nbytes(src) <= root_bytes;
+
+                        if (coalesce) {
+                            const size_t root_id = hash_id(const_cast<struct ggml_tensor *>(root));
+                            const int root_backend_id = sched->hv_tensor_backend_ids[root_id];
+                            // Root must live on the same device as this view.
+                            if (root_backend_id != src_backend_id ||
+                                ggml_backend_sched_buffer_supported(
+                                    sched, const_cast<struct ggml_tensor *>(root), cur_backend_id)) {
+                                coalesce = false;
                             }
-                            tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                            SET_CAUSE(tensor_copy, "4.cpy");
                         }
-                        int n_inputs = split->n_inputs++;
-                        GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
-                        split->inputs[n_inputs] = src;
+
+                        if (coalesce) {
+                            const size_t root_id = hash_id(const_cast<struct ggml_tensor *>(root));
+                            if (tensor_id_copy(root_id, cur_backend_id, 0) == NULL) {
+                                for (int c = 0; c < sched->n_copies; c++) {
+                                    struct ggml_tensor * parent_cpy =
+                                        ggml_dup_tensor_layout(sched->ctx, root);
+                                    ggml_format_name(parent_cpy, "%s#%s#p%d",
+                                        ggml_backend_name(backend), root->name, c);
+                                    if (sched->n_copies > 1) {
+                                        ggml_set_input(parent_cpy);
+                                        ggml_set_output(parent_cpy);
+                                    }
+                                    tensor_id_copy(root_id, cur_backend_id, c) = parent_cpy;
+                                    SET_CAUSE(parent_cpy, "4.cpy.p");
+                                }
+                                int n_inputs = split->n_inputs++;
+                                GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                                split->inputs[n_inputs] = const_cast<struct ggml_tensor *>(root);
+                            }
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * parent_cpy =
+                                    tensor_id_copy(root_id, cur_backend_id, c);
+                                struct ggml_tensor * view_cpy =
+                                    ggml_dup_tensor_layout(sched->ctx, src);
+                                // Real view into the staged parent (no second xdev copy).
+                                view_cpy->view_src  = parent_cpy;
+                                view_cpy->view_offs = view_abs_offs;
+                                view_cpy->data      = nullptr;
+                                view_cpy->buffer    = nullptr;
+                                view_cpy->op        = GGML_OP_VIEW;
+                                ggml_format_name(view_cpy, "%s#%s#v%d",
+                                    ggml_backend_name(backend), src->name, c);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(view_cpy);
+                                    ggml_set_output(view_cpy);
+                                }
+                                tensor_id_copy(src_id, cur_backend_id, c) = view_cpy;
+                                SET_CAUSE(view_cpy, "4.cpy.v");
+                            }
+                        }
+
+                        if (!coalesce) {
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(tensor_copy);
+                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                }
+                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                                SET_CAUSE(tensor_copy, "4.cpy");
+                            }
+                            int n_inputs = split->n_inputs++;
+                            GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                            split->inputs[n_inputs] = src;
+                        }
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -1695,6 +1808,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        // Complete deferred HIP multi-input stages after all split inputs are
+        // queued and BEFORE eval_cb / graph_compute (WP ensure must see staged
+        // activations). No-op when weak symbol is absent or batch is empty.
+        if (ggml_backend_cuda_xdev_batch_flush) {
+            ggml_backend_cuda_xdev_batch_flush();
         }
 
         if (!sched->callback_eval) {

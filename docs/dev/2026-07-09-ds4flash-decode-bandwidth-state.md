@@ -69,3 +69,60 @@ So ~2.2 GB/s effective -> ~1.84 t/s. The device's 6 GB/s is the headroom; both p
 
 ## Process note
 The device ground-truth (`/proc/diskstats`) repeatedly overturned WP's own metrics and my hypotheses (compression, pinned-mem, IOSQE_ASYNC all refuted by measurement). Rule for next session: MEASURE the block layer, do not extrapolate from WP counters or standalone benches. The 2.79× amplification is the one hard, reproducible, unexplained fact — chase it with blktrace before any more read-path code.
+
+---
+
+## Clean baseline matrix (2026-07-09, predictors OFF base; instrumented via /proc/io+diskstats)
+
+128-tok Roman-Empire decode, 6500 slots, hetero (ROCm1 resident / ROCm0 paged), --no-mmap.
+page_ins = 29314 identical across ALL configs (deterministic workload).
+
+| config | t/s | device GB | ampl vs payload | device GB/s | CPU cores |
+|---|---|---|---|---|---|
+| p2p_noprefetch_qd16 | 1.61 | 113.1 | 0.87x | 1.34 | 1.74 |
+| p2p_prefetch_qd16   | 1.61 | 112.8 | 0.86x | 1.34 | 1.74 |
+| p2p_noprefetch_qd32 | 1.61 | 112.8 | 0.86x | 1.34 | 1.72 |
+| p2p_noprefetch_qd64 | 1.61 | 112.8 | 0.86x | 1.34 | 1.73 |
+| odirect_w4          | 1.19 | 298.4 | 2.29x | 2.58 | 2.19 |
+| odirect_w12         | 1.21 | 297.6 | 2.28x | 2.59 | 3.60 |
+| host_buffered_qd16  | 1.38 | 112.8 | 0.86x | 1.10 | 0.98 |
+
+### Corrected findings (supersede earlier "amplification = prefetch waste")
+1. **The 2.79x-class amplification is O_DIRECT-transport-specific (2.29x here), NOT prefetch.**
+   Prefetch on vs off on the p2p path is byte-identical (112.8 GB, same page_ins, same t/s).
+   Byte-efficient paths (p2p BAR, host buffered) run 1:1; only O_DIRECT amplifies.
+2. **Queue depth is inert on p2p** (QD 16=32=64 -> 1.34 GB/s to 3 digits). The 1.34 GB/s
+   ceiling is NOT io_uring queue starvation -> it's per-layer routing-dependency serialization
+   + BAR-write-side throttle. "Deepen the queue" is dead; the fix is structural overlap.
+3. **rchar delta = 0 on p2p** (measured Tier 1): the payload never passes through a userspace
+   read() copy; data DMAs into the BAR mapping. Refutes the "buffered SSD->pagecache->CPU->BAR
+   memcpy" reading of the p2p path (CPU = 1.74 cores, not a 113 GB memcpy).
+4. **Opposite bottlenecks = the opportunity:** p2p is byte-efficient but BW-throttled (1.34);
+   O_DIRECT hits 2.58 GB/s but wastes it on 2.29x amplification. O_DIRECT's bandwidth WITHOUT
+   its amplification (->1:1) ~= 130 GB @ 2.58 GB/s ~= 2.5 t/s, scaling with workers toward 6 GB/s.
+   => The O_DIRECT 2.29x is the real linchpin bug (a concrete amplification defect, blktrace-able),
+   distinct from p2p's structural serialization wall.
+
+### Current best = p2p BAR, 1.61 t/s, 1:1 bytes. Next: blktrace an O_DIRECT config to split
+the 2.29x into unique-vs-duplicate LBAs (alignment blowup / worker re-reads / sister-block overlap).
+
+---
+
+## Cross-layer routing predictability experiment (2026-07-09) — prediction-for-OVERLAP validated
+
+Offline test: does applying layer N's router to layer N-k's hidden predict layer N's experts?
+Captured target router inputs + actual top-6 per layer/token (WP_CAPTURE_ROUTING=1, read-only
+hook in wp-eval-cb.cpp); router weights [256,4096] BF16 from GGUF via gguf-py.
+
+Recall of actual top-6 (predict exactly 6):
+  k=0 (self, sanity) 0.855 | k=1 0.638 | k=2 0.576 | k=3 0.523
+  (k=0<1.0 only because crude plain-top-k ignores DeepSeek grouped-topk+bias -> 0.638 is a FLOOR)
+Over-fetch at k=1: top-8 0.711 | top-12 0.785(2x) | top-16 0.819(2.7x) | top-24 0.857(4x)
+Per-layer: ~0 at L1-L2 (unsettled residual); strong mid/late (L28-33 = 0.77-0.80).
+
+CONCLUSION: cross-layer routing signal is REAL and concentrated where expert traffic is.
+CRUX: target's own N-1 hidden gives only ~1 layer of lead (~4ms) to hide ~10ms/layer I/O ->
+insufficient for overlap. This is WHY DFlash matters: a full draft pass AHEAD of target supplies
+layer-N proxy hidden with the whole pass as lead time. Prediction-for-overlap (not miss-cut) is
+the path. NEXT: capture DFlash hidden at its taps, project through target routers, measure recall
++ lead-time (Sol P2). Harness: ~/wp_logs/accounting/{capture-run.sh,analyze-routing.py,routing_capture.bin}.

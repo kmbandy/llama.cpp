@@ -8,6 +8,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <cstdlib>
+#include <unordered_map>
 #include <unistd.h>
 
 #ifdef LLAMA_HAVE_IO_URING
@@ -239,7 +240,7 @@ public:
         }
         // Use registered-file index (faster than passing raw fds).
         io_uring_prep_read(sqe, fd_idx, dst, (unsigned) size, (off_t) offset);
-        sqe->flags     |= IOSQE_FIXED_FILE;
+        sqe->flags     |= IOSQE_FIXED_FILE | IOSQE_ASYNC;
         sqe->user_data  = req_id;
         pending_submit_.push_back(req_id);
         ++pending_;
@@ -358,7 +359,7 @@ public:
                 if (sqe == nullptr) break;
             }
             io_uring_prep_read(sqe, r.fd_idx, r.dst, (unsigned) r.size, (off_t) r.offset);
-            sqe->flags     |= IOSQE_FIXED_FILE;
+            sqe->flags     |= IOSQE_FIXED_FILE | IOSQE_ASYNC;
             sqe->user_data  = r.req_id;
             pending_submit_.push_back(r.req_id);
             ++pending_;
@@ -606,6 +607,77 @@ IoResult FileIOLayer::wait_for_req(uint64_t req_id, int timeout_ms) {
     out = IoResult{};
     out.status = IoStatus::Timeout;
     return out;
+}
+
+bool FileIOLayer::wait_for_reqs(const std::vector<uint64_t> & ids,
+                                std::vector<IoResult> &       outs,
+                                int                           timeout_ms) {
+    outs.assign(ids.size(), IoResult{});
+    if (ids.empty()) {
+        return true;
+    }
+
+    // req_id -> index in ids/outs (first wins if dups)
+    std::unordered_map<uint64_t, size_t> want;
+    want.reserve(ids.size() * 2);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        want.emplace(ids[i], i);
+        outs[i].req_id = ids[i];
+        outs[i].status = IoStatus::Timeout;
+    }
+
+    size_t left = ids.size();
+    // Claim anything already reaped into ready_.
+    for (size_t i = 0; i < ids.size(); ++i) {
+        IoResult got;
+        if (try_take(ids[i], got)) {
+            outs[i] = got;
+            want.erase(ids[i]);
+            --left;
+        }
+    }
+
+    using clock = std::chrono::steady_clock;
+    const bool        have_deadline = (timeout_ms >= 0);
+    clock::time_point deadline      = have_deadline
+        ? clock::now() + std::chrono::milliseconds(timeout_ms)
+        : clock::time_point{};
+
+    while (left > 0) {
+        int remaining = -1;
+        if (have_deadline) {
+            const auto now = clock::now();
+            if (now >= deadline) {
+                break;
+            }
+            remaining = (int) std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now).count();
+            if (remaining <= 0) {
+                remaining = 1;
+            }
+        }
+        IoResult r = wait_any(remaining);
+        if (r.status == IoStatus::Timeout) {
+            if (timeout_ms < 0) {
+                // Indefinite: transport drained with outstanding wants — fail.
+                break;
+            }
+            continue;
+        }
+        if (r.status == IoStatus::ErrorIo && r.req_id == 0) {
+            return false;
+        }
+        auto it = want.find(r.req_id);
+        if (it != want.end()) {
+            outs[it->second] = r;
+            want.erase(it);
+            --left;
+        } else {
+            // Foreign (prefetch / other consumer) — park for its owner.
+            ready_[r.req_id] = r;
+        }
+    }
+    return left == 0;
 }
 
 // ---------------------------------------------------------------------------

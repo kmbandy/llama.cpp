@@ -256,6 +256,63 @@ int PoolAllocator::alloc_slot(size_t requested_size) {
     return alloc_slot_fixed_();
 }
 
+int PoolAllocator::n_free_unpinned() const {
+    if (n_slots_ == 0 || base_ == nullptr) {
+        return 0;
+    }
+    int n = 0;
+    if (size_class_slots_) {
+        for (const auto & kv : free_by_class_) {
+            for (int s : kv.second) {
+                if (s >= 0 && s < n_slots_ && pin_count_[s] == 0) {
+                    ++n;
+                }
+            }
+        }
+        return n;
+    }
+    for (int i = 0; i < n_slots_; ++i) {
+        if (!used_[i] && pin_count_[i] == 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+int PoolAllocator::alloc_slot_no_evict(size_t requested_size) {
+    if (n_slots_ == 0 || base_ == nullptr) {
+        return -1;
+    }
+    if (size_class_slots_) {
+        const size_t need = requested_size == 0 ? slot_size_ : requested_size;
+        // Any free class that fits; never steal used slots.
+        for (auto & kv : free_by_class_) {
+            if (kv.first < need) {
+                continue;
+            }
+            while (!kv.second.empty()) {
+                const int s = kv.second.back();
+                kv.second.pop_back();
+                if (s < 0 || s >= n_slots_ || used_[s] || pin_count_[s] > 0) {
+                    continue;
+                }
+                used_[s]      = true;
+                last_used_[s] = ++tick_;
+                return s;
+            }
+        }
+        return -1;
+    }
+    for (int i = 0; i < n_slots_; ++i) {
+        if (!used_[i] && pin_count_[i] == 0) {
+            used_[i]      = true;
+            last_used_[i] = ++tick_;
+            return i;
+        }
+    }
+    return -1;
+}
+
 int PoolAllocator::alloc_slot_fixed_() {
     if (n_slots_ == 0 || base_ == nullptr) {
         return -1;

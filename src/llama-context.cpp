@@ -396,6 +396,15 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // Weight-paging hetero split injects tensor_buft_overrides (experts vs
+        // dense). Pipeline PP on that layout tries multi-device compute buffers
+        // that do not fit (measured ~94 GiB ROCm0 reserve fail). Force off.
+        if (pipeline_parallel && model.wp_pager != nullptr) {
+            pipeline_parallel = false;
+            LLAMA_LOG_WARN("%s: pipeline parallelism disabled under weight-paging multi-device\n",
+                           __func__);
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
@@ -2300,7 +2309,15 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        // Pure views/reshapes used as layer-input taps may not receive a sched
+        // backend; walk view_src to the tensor that owns the buffer.
+        ggml_backend_t backend = nullptr;
+        for (ggml_tensor * cur = t; cur != nullptr; cur = cur->view_src) {
+            backend = ggml_backend_sched_get_tensor_backend(sched.get(), cur);
+            if (backend != nullptr) {
+                break;
+            }
+        }
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
@@ -2529,7 +2546,33 @@ ggml_status llama_context::graph_compute(
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    // WP hetero (experts on paging GPU, attn on resident): resolve once.
+    // FFN-island weights (ffn_norm / gate_inp / shexp) live on the paging buft.
+    ggml_backend_t backend_paging = nullptr;
+    const bool wp_hetero =
+        model.wp_pager != nullptr && model.n_devices() > 1 && model.has_tensor_overrides();
+    if (wp_hetero && !model.layers.empty()) {
+        const ggml_tensor * w = model.layers[0].ffn_norm;
+        if (w == nullptr) {
+            w = model.layers[0].ffn_gate_inp;
+        }
+        if (w == nullptr) {
+            w = model.layers[0].ffn_down_shexp;
+        }
+        if (w != nullptr && w->buffer != nullptr) {
+            ggml_backend_dev_t pdev =
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer));
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == pdev) {
+                    backend_paging = backend.get();
+                    break;
+                }
+            }
+        }
+    }
+
+    return [this, wp_hetero, backend_paging](
+                   const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2540,6 +2583,28 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
+            if (wp_hetero && backend_paging != nullptr) {
+                // Under WP router, layer-home is the resident/eGPU (FA+KV).
+                // Pinning every "norm" there yanks ffn_norm onto ROCm1 and then
+                // restages the whole MoE chain (ffn_moe_*) across TB3.
+                // Keep FFN-island activations on the paging GPU instead.
+                // Only FFN-island names. Do NOT pin generic hc_pre/hc_mixes/etc
+                // (shared by attn HC on the resident GPU).
+                const bool ffn_island =
+                    strcmp(name, "ffn_norm") == 0 ||
+                    strcmp(name, "ffn_shexp") == 0 ||
+                    strcmp(name, "ffn_out") == 0 ||
+                    strcmp(name, "l_out") == 0 ||
+                    strncmp(name, "ffn_moe_", 8) == 0 ||
+                    strncmp(name, "hc_ffn", 6) == 0;
+
+                if (ffn_island && ggml_backend_supports_op(backend_paging, cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_paging);
+                }
+                // Deliberately skip the generic "norm" -> layer-home pin.
+                return;
+            }
+
             if (il != -1 && strcmp(name, "norm") == 0) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {

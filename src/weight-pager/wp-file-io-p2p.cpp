@@ -3,10 +3,12 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 #include <unistd.h>
 
@@ -83,24 +85,29 @@ public:
         if (!p2p_enabled_) {
             return host_->submit(req_id, fd_idx, offset, size, dst);
         }
-        if (!ring_ok_ || pool_mapped_ == nullptr || fd_idx < 0 ||
+        if (!ring_ok_ || pool_dmabuf_fd_ < 0 || fd_idx < 0 ||
             (size_t) fd_idx >= fds_.size() || dst == nullptr || size == 0) {
             return false;
         }
 
-        // Read directly into the persistent pool dma_buf mapping. dst points
-        // into the VRAM slot pool; its byte offset within the pool maps 1:1
-        // onto the once-mmap'd dma_buf. This avoids a per-read
-        // export/mmap/munmap/close (which dominated wall time and made P2P
-        // slower than host staging).
+        // ReBAR P2P: NVMe DMA into VRAM via windowed dma_buf maps. Pool is
+        // exported once; we never map the whole pool. A small refcounted
+        // window cache (cap ≈ 2*QD) avoids mmap/munmap per CQE while keeping
+        // peak host VA at a few dozen MiB, not 27 GiB.
         char * base = static_cast<char *>(pool_base_);
         char * d    = static_cast<char *>(dst);
         if (d < base || d + size > base + pool_size_) {
-            // dst outside the exported pool region; can't P2P this read.
             switch_to_host_("dst outside pool", 0);
             return false;
         }
-        void * mapped_dst = static_cast<char *>(pool_mapped_) + (d - base);
+        const uint64_t pool_off = (uint64_t) (d - base);
+
+        void * mapped_dst = nullptr;
+        uint64_t map_key  = 0;
+        if (!acquire_window_(pool_off, size, mapped_dst, map_key)) {
+            switch_to_host_errno_("window mmap failed", errno);
+            return false;
+        }
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
         if (sqe == nullptr) {
@@ -108,13 +115,20 @@ public:
             sqe = io_uring_get_sqe(&ring_);
         }
         if (sqe == nullptr) {
+            release_window_key_(map_key);
             switch_to_host_("SQ ring full", 0);
             return false;
         }
 
         io_uring_prep_read(sqe, fd_idx, mapped_dst, (unsigned) size, (off_t) offset);
-        sqe->flags    |= IOSQE_FIXED_FILE;
+        // FIXED_FILE: registered fds. IOSQE_ASYNC: do not complete inline in
+        // io_uring_submit — measured ensure_batch_submit_ms >> wait_ms (I/O
+        // was finishing inside submit, capping random P2P at ~2 GB/s vs
+        // host O_DIRECT ~6 GB/s at QD=6). Force async so multi-QD wait path
+        // can actually overlap.
+        sqe->flags    |= IOSQE_FIXED_FILE | IOSQE_ASYNC;
         sqe->user_data = req_id;
+        inflight_keys_[req_id] = map_key;
         pending_submit_.push_back(req_id);
         pending_reqs_.push_back(req_id);
         ++pending_;
@@ -185,6 +199,7 @@ public:
             io_uring_cqe_seen(&ring_, cqe);
             --pending_;
             remove_pending_req_(out.req_id);
+            release_inflight_key_(out.req_id);
 
             if (res < 0) {
                 out.status     = IoStatus::ErrorIo;
@@ -265,6 +280,7 @@ private:
             ready_[req_id] = r;
             --pending_;
             remove_pending_req_(req_id);
+            release_inflight_key_(req_id);
         }
     }
 
@@ -326,6 +342,7 @@ private:
         io_uring_cqe_seen(&ring_, cqe);
         --pending_;
         remove_pending_req_(r.req_id);
+        release_inflight_key_(r.req_id);
 
         if (res < 0) {
             r.status     = IoStatus::ErrorIo;
@@ -355,6 +372,7 @@ private:
             r.status     = IoStatus::ErrorIo;
             r.bytes_read = err;
             ready_[req_id] = r;
+            release_inflight_key_(req_id);
         }
         pending_reqs_.clear();
         pending_submit_.clear();
@@ -392,6 +410,15 @@ private:
             files_registered_ = true;
         }
 
+        // Cap cached maps: enough for multi-QD bursts without 27 GiB VA.
+        // Prefer 4*QD so a few ensure_batch waves reuse maps before LRU.
+        max_windows_ = queue_depth * 4;
+        if (max_windows_ < 64) {
+            max_windows_ = 64;
+        }
+        if (max_windows_ > 256) {
+            max_windows_ = 256;
+        }
         return setup_pool_mapping_(cfg.pool_base, cfg.pool_size);
     }
 
@@ -416,13 +443,16 @@ private:
         return true;
     }
 
-    // Export the whole VRAM slot pool as a dma_buf ONCE and mmap it for the
-    // layer's lifetime. Per-read submits then just index into this mapping.
+    // Export the VRAM pool as one dma_buf (ReBAR/device memory). Do NOT map
+    // the whole pool into host VA — that was ~27 GiB page-tables and OOM.
+    // submit() maps only the in-flight destination window (page-aligned),
+    // so NVMe DMA still targets VRAM via ReBAR without a host bounce buffer.
     bool setup_pool_mapping_(void * ptr, size_t size) {
         if (ptr == nullptr || size == 0) {
             LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool target is empty\n");
             return false;
         }
+
         int dmabuf_fd = -1;
         uint64_t dmabuf_offset = 0;
         const uint32_t status = hsa_export_(ptr, size, &dmabuf_fd, &dmabuf_offset);
@@ -439,22 +469,167 @@ private:
             return false;
         }
 
-        void * mapped = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                             dmabuf_fd, (off_t) dmabuf_offset);
-        if (mapped == MAP_FAILED) {
-            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: pool dmabuf mmap failed: %s\n", strerror(errno));
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps < 4096) {
+            ps = 4096;
+        }
+        page_size_ = (size_t) ps;
+
+        // Prove windowed mmap works (one page), then unmap — no full-pool map.
+        void * probe = mmap(nullptr, page_size_, PROT_READ | PROT_WRITE, MAP_SHARED,
+                            dmabuf_fd, (off_t) dmabuf_offset);
+        if (probe == MAP_FAILED) {
+            LLAMA_LOG_WARN("wp::IoUringP2PFileIO: windowed dmabuf mmap probe failed: %s\n",
+                           strerror(errno));
             hsa_close_(dmabuf_fd);
             return false;
         }
+        munmap(probe, page_size_);
 
-        pool_base_      = ptr;
-        pool_size_      = size;
-        pool_dmabuf_fd_ = dmabuf_fd;
-        pool_mapped_    = mapped;
-        p2p_enabled_    = true;
-        LLAMA_LOG_WARN("wp::IoUringP2PFileIO: P2P enabled — pool dma_buf exported+mmap'd once (%.1f MiB, persistent)\n",
-                       (double) size / 1048576.0);
+        pool_base_          = ptr;
+        pool_size_          = size;
+        pool_dmabuf_fd_     = dmabuf_fd;
+        pool_dmabuf_offset_ = dmabuf_offset;
+        p2p_enabled_        = true;
+        LLAMA_LOG_WARN(
+            "wp::IoUringP2PFileIO: P2P enabled — pool dma_buf exported (%.1f MiB VRAM), "
+            "window cache max=%d page=%zu B (no full-pool host map, no host bounce)\n",
+            (double) size / 1048576.0, max_windows_, page_size_);
         return true;
+    }
+
+    // Window cache: key = page-aligned dmabuf map offset. Refcounted while
+    // I/O is in flight; idle entries kept up to max_windows_ then LRU-evicted.
+    struct CacheEntry {
+        void *   base     = nullptr;
+        size_t   len      = 0;
+        int      refs     = 0;
+        uint64_t last_tick = 0;
+    };
+
+    void compute_map_geom_(uint64_t pool_off, size_t size,
+                           uint64_t & map_off, size_t & pad, size_t & map_len) const {
+        const uint64_t abs_off = pool_dmabuf_offset_ + pool_off;
+        map_off = abs_off & ~((uint64_t) page_size_ - 1ull);
+        pad     = (size_t) (abs_off - map_off);
+        map_len = pad + size;
+        map_len = (map_len + page_size_ - 1) & ~(page_size_ - 1);
+    }
+
+    void unmap_entry_(CacheEntry & e) {
+        if (e.base != nullptr && e.base != MAP_FAILED && e.len > 0) {
+            munmap(e.base, e.len);
+        }
+        e = CacheEntry{};
+    }
+
+    // Drop one idle (refs==0) LRU entry. Returns true if something was freed.
+    bool evict_one_idle_() {
+        uint64_t best_key  = UINT64_MAX;
+        uint64_t best_tick = UINT64_MAX;
+        for (auto & kv : window_cache_) {
+            if (kv.second.refs != 0) {
+                continue;
+            }
+            if (kv.second.last_tick < best_tick) {
+                best_tick = kv.second.last_tick;
+                best_key  = kv.first;
+            }
+        }
+        if (best_key == UINT64_MAX) {
+            return false;
+        }
+        unmap_entry_(window_cache_[best_key]);
+        window_cache_.erase(best_key);
+        return true;
+    }
+
+    void trim_idle_to_cap_() {
+        while ((int) window_cache_.size() > max_windows_) {
+            if (!evict_one_idle_()) {
+                break; // all remaining are in-flight
+            }
+        }
+    }
+
+    bool acquire_window_(uint64_t pool_off, size_t size,
+                         void * & mapped_dst, uint64_t & map_key) {
+        uint64_t map_off = 0;
+        size_t pad = 0, map_len = 0;
+        compute_map_geom_(pool_off, size, map_off, pad, map_len);
+        map_key = map_off;
+
+        auto it = window_cache_.find(map_off);
+        if (it != window_cache_.end()) {
+            CacheEntry & e = it->second;
+            if (e.base != nullptr && e.len >= map_len) {
+                ++e.refs;
+                e.last_tick = ++cache_tick_;
+                mapped_dst = static_cast<char *>(e.base) + pad;
+                return true;
+            }
+            // Too small or broken: only replace if idle.
+            if (e.refs == 0) {
+                unmap_entry_(e);
+                window_cache_.erase(it);
+            } else {
+                // In use with smaller map — key collision; fail rare path.
+                errno = EBUSY;
+                return false;
+            }
+        }
+
+        while ((int) window_cache_.size() >= max_windows_) {
+            if (!evict_one_idle_()) {
+                errno = ENOMEM;
+                return false;
+            }
+        }
+
+        void * mapped = mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
+                             pool_dmabuf_fd_, (off_t) map_off);
+        if (mapped == MAP_FAILED) {
+            return false;
+        }
+        CacheEntry e;
+        e.base      = mapped;
+        e.len       = map_len;
+        e.refs      = 1;
+        e.last_tick = ++cache_tick_;
+        window_cache_[map_off] = e;
+        mapped_dst = static_cast<char *>(mapped) + pad;
+        return true;
+    }
+
+    void release_window_key_(uint64_t map_key) {
+        auto it = window_cache_.find(map_key);
+        if (it == window_cache_.end()) {
+            return;
+        }
+        CacheEntry & e = it->second;
+        if (e.refs > 0) {
+            --e.refs;
+        }
+        e.last_tick = ++cache_tick_;
+        // Keep mapped for reuse; only unmap when over cap.
+        trim_idle_to_cap_();
+    }
+
+    void release_inflight_key_(uint64_t req_id) {
+        auto it = inflight_keys_.find(req_id);
+        if (it == inflight_keys_.end()) {
+            return;
+        }
+        release_window_key_(it->second);
+        inflight_keys_.erase(it);
+    }
+
+    void release_all_windows_() {
+        inflight_keys_.clear();
+        for (auto & kv : window_cache_) {
+            unmap_entry_(kv.second);
+        }
+        window_cache_.clear();
     }
 
     void switch_to_host_(const char * reason, uint32_t hsa_status) {
@@ -481,19 +656,20 @@ private:
 
     void shutdown_p2p_() {
         pending_ = 0;
+        release_all_windows_();
         if (ring_ok_) {
             if (files_registered_) io_uring_unregister_files(&ring_);
             io_uring_queue_exit(&ring_);
             ring_ok_ = false;
         }
-        if (pool_mapped_ != nullptr && pool_mapped_ != MAP_FAILED) {
-            munmap(pool_mapped_, pool_size_);
-            pool_mapped_ = nullptr;
-        }
+        // No full-pool munmap — only window maps, already released above.
         if (pool_dmabuf_fd_ >= 0 && hsa_close_ != nullptr) {
             hsa_close_(pool_dmabuf_fd_);
             pool_dmabuf_fd_ = -1;
         }
+        pool_base_ = nullptr;
+        pool_size_ = 0;
+        pool_dmabuf_offset_ = 0;
         if (libhsa_ != nullptr) {
             dlclose(libhsa_);
             libhsa_ = nullptr;
@@ -513,11 +689,16 @@ private:
     HsaExportDmaBufFn hsa_export_ = nullptr;
     HsaCloseDmaBufFn hsa_close_ = nullptr;
 
-    // Persistent pool dma_buf mapping (exported+mmap'd once in init).
-    void * pool_base_      = nullptr;
-    size_t pool_size_      = 0;
-    int    pool_dmabuf_fd_ = -1;
-    void * pool_mapped_    = nullptr;
+    // Pool: device pointer + one dma_buf export. CPU maps only a small window cache.
+    void *   pool_base_          = nullptr;
+    size_t   pool_size_          = 0;
+    int      pool_dmabuf_fd_     = -1;
+    uint64_t pool_dmabuf_offset_ = 0;
+    size_t   page_size_          = 4096;
+    int      max_windows_        = 32;
+    uint64_t cache_tick_         = 0;
+    std::unordered_map<uint64_t, CacheEntry> window_cache_;   // map_off -> entry
+    std::unordered_map<uint64_t, uint64_t>    inflight_keys_;  // req_id -> map_off
 };
 
 }  // anonymous namespace

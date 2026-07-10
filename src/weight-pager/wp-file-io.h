@@ -102,6 +102,16 @@ public:
     // never discards other consumers' completions.
     bool try_take(uint64_t req_id, IoResult & out);
 
+    // Wait until every req_id in `ids` has completed. Completions may arrive
+    // out of order; foreign req_ids (other consumers on the shared ring) are
+    // buffered in ready_ and never dropped. Results are written into `outs`
+    // in the same order as `ids`. Returns false only on transport-level
+    // failure (req_id==0 ErrorIo); individual short/error results are still
+    // placed in outs.
+    bool wait_for_reqs(const std::vector<uint64_t> & ids,
+                       std::vector<IoResult> &       outs,
+                       int                           timeout_ms = -1);
+
     // How many requests are currently in flight (submitted, not yet reaped).
     virtual int pending() const = 0;
 

@@ -2712,9 +2712,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
         {"--weight-paging"},
-        "enable NVMe->VRAM demand paging for model weights (allows models larger than VRAM); single-device only",
+        "enable NVMe->VRAM demand paging for model weights (allows models larger than VRAM); forces --no-mmap",
         [](common_params & params) {
             params.weight_paging_enabled = true;
+            // Never map the GGUF into host address space under weight paging.
+            params.use_mmap = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
     add_opt(common_arg(

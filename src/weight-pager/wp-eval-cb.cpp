@@ -20,6 +20,7 @@ extern "C++" void *                ggml_cuda_get_wp_compute_stream(int device);
 #include <cstdint>
 #include <cstdlib>       // getenv
 #include <cstring>
+#include <cstdio>
 #include <limits>        // numeric_limits — MAD-232 advise sentinel
 #include <unordered_map>
 #include <unordered_set>
@@ -320,6 +321,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t == nullptr)     return true;
     auto * pager = (WeightPager *) user_data;
     if (pager == nullptr) return true;
+
     const bool batch_eval_cb = wp_batch_eval_cb_enabled();
     const bool paged_batch   = batch_eval_cb && wp_paged_batch_enabled();
     // WP_PAGED_BATCH: release the previous range's pins now. The top of this
@@ -499,6 +501,42 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return base != nullptr ? base : current;
     };
 
+    // Layer-0 FA: (1) flush sample-oracle tid2eid I/O (free slots, then
+    // protected LRU) so hash experts load under eGPU attention;
+    // (2) optional sticky hist spec (WP_STICKY_SPEC=1).
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        bool layer0_fa = false;
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            const struct ggml_tensor * s = t->src[si];
+            if (s == nullptr) {
+                break;
+            }
+            const char * nm = ggml_get_name(s);
+            if (nm != nullptr && std::strncmp(nm, "blk.0.", 6) == 0) {
+                layer0_fa = true;
+                break;
+            }
+            if (s->view_src != nullptr) {
+                const char * vn = ggml_get_name(s->view_src);
+                if (vn != nullptr && std::strncmp(vn, "blk.0.", 6) == 0) {
+                    layer0_fa = true;
+                    break;
+                }
+            }
+        }
+        if (layer0_fa) {
+            (void) pager->flush_sample_oracle_at_fa();
+            static int s_sticky_spec = -1;
+            if (s_sticky_spec < 0) {
+                const char * e = std::getenv("WP_STICKY_SPEC");
+                s_sticky_spec = (e != nullptr && e[0] == '1') ? 1 : 0;
+            }
+            if (s_sticky_spec == 1) {
+                (void) pager->prefetch_sticky_hot_experts();
+            }
+        }
+    }
+
     // Diagnostic: detect MUL_MAT_ID ops and check whether their weight
     // source is a consolidated MoE parent. This is the entry point for
     // routing-aware paging (MAD-88 Phase 2 part 2). Currently informational
@@ -672,34 +710,112 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         active.insert((int) idx);
                                     }
 
-                                    // WP_ENSURE_BATCH (opt-in): Colibri-style
-                                    // concurrent batch page-in. Reserve+PIN every
-                                    // active-expert slot up front, then issue all
-                                    // cold-miss reads in ONE io_uring batch (true
-                                    // QD=N). Closes the eviction window that let a
-                                    // later expert's read evict an earlier one's
-                                    // not-yet-harvested slot, collapsing effective
-                                    // queue depth to ~1 under decode. Default off;
-                                    // the else branch keeps the current path (A/B).
+                                    // WP_CAPTURE_ROUTING (read-only, gated OFF by
+                                    // default): dump the router input (gate op
+                                    // src[1]) + selected experts + layer, per token,
+                                    // for offline cross-layer prediction analysis.
+                                    // Zero effect on the paging path when unset.
+                                    {
+                                        static const int s_cap_routing = [](){
+                                            const char* e = std::getenv("WP_CAPTURE_ROUTING");
+                                            return (e && e[0]=='1') ? 1 : 0;
+                                        }();
+                                        const char* w0 = (t->src[0]!=nullptr) ? ggml_get_name(t->src[0]) : nullptr;
+                                        if (s_cap_routing && t->src[1]!=nullptr && w0!=nullptr && std::strstr(w0,"gate")!=nullptr) {
+                                            static FILE* s_cap_fp = std::fopen(
+                                                "/home/kmbandy/wp_logs/accounting/routing_capture.bin","wb");
+                                            if (s_cap_fp!=nullptr) {
+                                                ggml_tensor* ri = t->src[1];
+                                                const size_t nb = ggml_nbytes(ri);
+                                                std::vector<char> hbuf(nb);
+                                                hipError_t ce;
+                                                if (wp_stream!=nullptr) {
+                                                    ce = hipMemcpyAsync(hbuf.data(), ri->data, nb, hipMemcpyDeviceToHost, wp_stream);
+                                                    if (ce==hipSuccess) ce = hipStreamSynchronize(wp_stream);
+                                                } else {
+                                                    hipDeviceSynchronize();
+                                                    ce = hipMemcpy(hbuf.data(), ri->data, nb, hipMemcpyDeviceToHost);
+                                                }
+                                                if (ce==hipSuccess) {
+                                                    int32_t hdr[4] = { (int32_t) meta.block_idx, (int32_t) ri->type,
+                                                                       (int32_t) host_indices.size(), (int32_t) n_subs };
+                                                    int64_t ne[4] = { ri->ne[0], ri->ne[1], ri->ne[2], ri->ne[3] };
+                                                    std::fwrite(hdr,sizeof(hdr),1,s_cap_fp);
+                                                    std::fwrite(ne,sizeof(ne),1,s_cap_fp);
+                                                    std::fwrite(host_indices.data(),sizeof(int32_t),host_indices.size(),s_cap_fp);
+                                                    std::fwrite(hbuf.data(),1,nb,s_cap_fp);
+                                                    std::fflush(s_cap_fp);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // WP_ENSURE_BATCH: multi-QD P2P page-in for MoE
+                                    // actives. Default ON (measured: kills sync_fallbacks
+                                    // serial path). WP_ENSURE_BATCH=0 disables.
                                     static int s_ensure_batch_env = -1;
                                     if (s_ensure_batch_env < 0) {
                                         const char * eb = std::getenv("WP_ENSURE_BATCH");
-                                        s_ensure_batch_env = (eb != nullptr && eb[0] == '1') ? 1 : 0;
+                                        s_ensure_batch_env = (eb != nullptr && eb[0] == '0') ? 0 : 1;
                                     }
                                     int    n_ensures = 0;
                                     void * first_active_slot = nullptr;
-                                    if (s_ensure_batch_env == 1) {
-                                        std::vector<int> active_pages;
-                                        active_pages.reserve(active.size());
-                                        for (int e : active) {
-                                            active_pages.push_back(weight_page + 1 + e);
+                                    std::vector<int> active_pages;
+                                    active_pages.reserve(active.size());
+                                    for (int e : active) {
+                                        active_pages.push_back(weight_page + 1 + e);
+                                    }
+                                    // Feed draft-hot history (recent target routing).
+                                    pager->record_active_expert_pages(active_pages);
+                                    const bool use_ensure_batch =
+                                        (s_ensure_batch_env == 1) || pager->draft_window_active();
+                                    if (use_ensure_batch) {
+                                        // Concurrent P2P for actives. On decode-sized
+                                        // sets (top-k <= 8) also pull gate/up/down
+                                        // sisters into the same burst (cap 18) so one
+                                        // layer pays one multi-QD wait. Measured:
+                                        // async-only sisters (wait this weight only)
+                                        // regressed ~2.03 -> 1.68 t/s — smaller
+                                        // avg_n (~3.4) and more ensure_batch calls
+                                        // cost more than gate-compute hide of
+                                        // sister I/O. Prefill stays actives-only.
+                                        std::vector<int> batch_pages = active_pages;
+                                        if (active.size() <= 8) {
+                                            static std::unordered_map<int, std::vector<int>> s_sister_cache_eb;
+                                            auto sister_it = s_sister_cache_eb.find(weight_page);
+                                            if (sister_it == s_sister_cache_eb.end()) {
+                                                std::vector<int> sisters;
+                                                const int my_block = meta.block_idx;
+                                                for (int i = 0; i < pager->n_pages(); ++i) {
+                                                    if (i == weight_page) continue;
+                                                    const auto & p = pager->page_meta(i);
+                                                    if (!p.is_consolidated) continue;
+                                                    if (p.block_idx != my_block) continue;
+                                                    sisters.push_back(i);
+                                                }
+                                                sister_it = s_sister_cache_eb.emplace(
+                                                    weight_page, std::move(sisters)).first;
+                                            }
+                                            const size_t cap = 18;
+                                            batch_pages.reserve(cap);
+                                            for (int sister_parent : sister_it->second) {
+                                                if (batch_pages.size() >= cap) break;
+                                                for (int e : active) {
+                                                    if (batch_pages.size() >= cap) break;
+                                                    if (e < 0 || e >= n_subs) continue;
+                                                    batch_pages.push_back(sister_parent + 1 + e);
+                                                }
+                                            }
                                         }
-                                        std::vector<void *> active_ptrs;
+                                        std::vector<void *> batch_ptrs;
                                         std::vector<int>    active_pinned;
-                                        pager->ensure_batch(active_pages, active_ptrs, active_pinned);
+                                        pager->ensure_batch(batch_pages, batch_ptrs, active_pinned);
+                                        // First |active| ptrs are this weight's experts.
                                         std::size_t ap = 0;
                                         for (int e : active) {
-                                            void * slot = active_ptrs[ap++];
+                                            void * slot =
+                                                (ap < batch_ptrs.size()) ? batch_ptrs[ap] : nullptr;
+                                            ++ap;
                                             if (slot != nullptr) {
                                                 slot = capture_ptr_for_page(weight_page + 1 + e, slot);
                                                 host_ptrs[(size_t) e] = slot;
@@ -796,17 +912,25 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     }
                                     }  // end WP_ENSURE_BATCH else (existing prefetch+ensure path)
 
-                                    // Safety: fill INACTIVE expert slots with a non-null
-                                    // sentinel (first active slot) so a kernel that reads
-                                    // expert_ptrs[inactive_idx] gets a valid (wrong) pointer
-                                    // instead of NULL-faulting. If the kernel correctly only
-                                    // reads active indices this is dead memory; if it doesn't
-                                    // we'll see wrong logits but no fault, which is recoverable.
-                                    if (first_active_slot != nullptr) {
-                                        for (size_t i = 0; i < host_ptrs.size(); ++i) {
-                                            if (host_ptrs[i] == nullptr) {
-                                                host_ptrs[i] = first_active_slot;
-                                            }
+                                    // Safety: fill only INACTIVE expert slots with a non-null
+                                    // sentinel. Active expert page-in failures must hard-error;
+                                    // otherwise the routed kernel could run another expert's
+                                    // weights and silently corrupt logits.
+                                    for (size_t i = 0; i < host_ptrs.size(); ++i) {
+                                        if (host_ptrs[i] != nullptr) {
+                                            continue;
+                                        }
+                                        const int expert_id = (int) i;
+                                        if (active.find(expert_id) != active.end()) {
+                                            const int sub_page_idx = weight_page + 1 + expert_id;
+                                            LLAMA_LOG_ERROR("[wp::eval_cb] active expert pointer missing: layer=%d "
+                                                            "weight_page=%d expert=%d sub_page=%d tensor=\"%s\"\n",
+                                                            meta.block_idx, weight_page, expert_id,
+                                                            sub_page_idx, ggml_get_name(t->src[0]));
+                                            GGML_ABORT("wp::eval_cb active expert page-in failed");
+                                        }
+                                        if (first_active_slot != nullptr) {
+                                            host_ptrs[i] = first_active_slot;
                                         }
                                     }
 
@@ -861,18 +985,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         t->src[0]->buffer = pool_buf;
                                     }
 
-                                    // MAD-88 Phase 9a: same-layer prefetch.
-                                    // gate / up / down at one MoE layer all share
-                                    // the same active expert set (the router runs
-                                    // once per layer, before any of them). When we
-                                    // process the first MUL_MAT_ID over a sister
-                                    // parent, fire async prefetches for the OTHER
-                                    // sister parents' same expert sub-pages so by
-                                    // the time their MUL_MAT_IDs fire they're
-                                    // either cache hits or already in flight.
-                                    //
-                                    // Sister discovery is O(catalog) on first
-                                    // hit per parent; cached after that.
+                                    // MAD-88 Phase 9a: same-layer sister prefetch.
+                                    // gate/up/down share the router active set. Fire
+                                    // async prefetches for OTHER sister parents so
+                                    // their NVMe reads overlap THIS op's compute
+                                    // (ensure_batch waits only for this weight).
+                                    // Sister discovery O(catalog) once per parent.
                                     static std::unordered_map<int, std::vector<int>> s_sister_cache;
                                     auto sister_it = s_sister_cache.find(weight_page);
                                     if (sister_it == s_sister_cache.end()) {
@@ -887,11 +1005,24 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                         sister_it = s_sister_cache.emplace(weight_page, std::move(sisters)).first;
                                     }
-                                    for (int sister_parent : sister_it->second) {
-                                        for (int e : active) {
-                                            if (e < 0 || e >= n_subs) continue;
-                                            const int sister_sub = sister_parent + 1 + e;
-                                            pager->prefetch_page(sister_sub);
+                                    if (!sister_it->second.empty() && !active.empty()) {
+                                        std::vector<int> sister_pages;
+                                        sister_pages.reserve(sister_it->second.size() * active.size());
+                                        for (int sister_parent : sister_it->second) {
+                                            for (int e : active) {
+                                                if (e < 0 || e >= n_subs) continue;
+                                                sister_pages.push_back(sister_parent + 1 + e);
+                                            }
+                                        }
+                                        if (!sister_pages.empty()) {
+                                            if (!pager->prefetch_pages_batch(sister_pages)) {
+                                                for (int sp : sister_pages) {
+                                                    pager->prefetch_page(sp);
+                                                }
+                                            }
+                                            // Push SQEs before we return so I/O is
+                                            // in flight under the MoE kernel.
+                                            pager->tick();
                                         }
                                     }
 

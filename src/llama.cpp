@@ -363,6 +363,48 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                        __func__, n_placed, placeholder, n_skipped_not_in_catalog);
     }
 
+    // Host copies of DS4 hash-layer tid2eid tables so draft-token expert
+    // prefetch can resolve experts without a GPU round-trip. Tables are
+    // small (I32 [n_vocab x n_expert_used] ~3 MiB/layer x ~3 layers).
+    {
+        int n_reg = 0;
+        int n_seen = 0;
+        for (int il = 0; il < (int) model.layers.size(); ++il) {
+            ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
+            if (t == nullptr) {
+                continue;
+            }
+            ++n_seen;
+            if (t->data == nullptr) {
+                LLAMA_LOG_WARN("%s: tid2eid blk.%d has null data; skip host register\n",
+                               __func__, il);
+                continue;
+            }
+            // Layout matches create_tensor({n_expert_used, n_vocab}): ne[0]=n_used, ne[1]=n_vocab.
+            if (t->type != GGML_TYPE_I32) {
+                LLAMA_LOG_WARN("%s: tid2eid blk.%d type=%d not I32; skip host register\n",
+                               __func__, il, (int) t->type);
+                continue;
+            }
+            const int n_used  = (int) t->ne[0];
+            const int n_vocab = (int) t->ne[1];
+            if (n_used <= 0 || n_vocab <= 0) {
+                continue;
+            }
+            const size_t nbytes = (size_t) n_used * (size_t) n_vocab * sizeof(int32_t);
+            std::vector<int32_t> host(nbytes / sizeof(int32_t));
+            if (t->buffer != nullptr) {
+                ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+            } else {
+                std::memcpy(host.data(), t->data, nbytes);
+            }
+            model.wp_pager->register_tid2eid_host(il, n_used, n_vocab, host.data());
+            ++n_reg;
+        }
+        LLAMA_LOG_WARN("%s: tid2eid host register: seen=%d registered=%d (draft hash-layer prefetch)\n",
+                       __func__, n_seen, n_reg);
+    }
+
     LLAMA_LOG_INFO("%s: weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",
                    __func__, device_idx, n_slots,
                    cfg.prefer_async_io ? "async" : "sync");

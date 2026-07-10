@@ -75,6 +75,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -88,6 +89,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -1663,6 +1665,587 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
 
 #define MUL_MAT_SRC1_COL_STRIDE 128
 
+#if defined(GGML_USE_HIP)
+// Cross-device host staging for mixed-ISA / no-P2P pairs (e.g. gfx1201 + gfx1030 TB3).
+//
+// Env:
+//   GGML_HIP_COPY_STATS=1       count + wall time + direction + atexit summary
+//   GGML_HIP_COPY_STATS_EVERY=N also dump every N stage copies
+//   GGML_HIP_COPY_STRATEGY=...  peer/stage (peer unsafe on mixed-ISA TB3)
+//   GGML_HIP_STAGE_HOST=wc|default|mapped   host slab flags (default: wc)
+//   GGML_HIP_STAGE_1D=1         opt-in contiguous 1D hipMemcpy (default off)
+//   GGML_HIP_STAGE_BATCH=1      enable multi-input stage batching (default off)
+//
+// Peer (hipMemcpyPeer / cross-device D2D) segfaults on gfx1201+gfx1030 — always stage.
+// Multi-input batch: cpy_tensor_async queues cross-device stages; flush before
+// graph_compute does one sync + one setDevice(src) D2H wave + one setDevice(dst) H2D wave.
+
+struct hip_xdev_copy_stats {
+    std::atomic<uint64_t> n_stage{0};
+    std::atomic<uint64_t> n_stage_2d{0};
+    std::atomic<uint64_t> n_stage_1d{0};
+    std::atomic<uint64_t> n_stage_fast1d{0}; // contiguous hipMemcpy path
+    std::atomic<uint64_t> n_peer{0};
+    std::atomic<uint64_t> bytes_stage{0};
+    std::atomic<uint64_t> ns_stage{0};
+    std::atomic<uint64_t> ns_sync{0};
+    std::atomic<uint64_t> n_slab_grow{0};
+    std::atomic<uint64_t> n_b_le_4k{0};
+    std::atomic<uint64_t> n_b_le_64k{0};
+    std::atomic<uint64_t> n_b_le_1m{0};
+    std::atomic<uint64_t> n_b_gt_1m{0};
+    std::atomic<uint64_t> max_bytes{0};
+    // Direction counters (HIP ordinals): useful because TB3 stage is asymmetric.
+    std::atomic<uint64_t> n_dir_0_to_1{0};
+    std::atomic<uint64_t> n_dir_1_to_0{0};
+    std::atomic<uint64_t> n_dir_other{0};
+    std::atomic<uint64_t> ns_dir_0_to_1{0};
+    std::atomic<uint64_t> ns_dir_1_to_0{0};
+    // Multi-input stage batch (sched split inputs amortized)
+    std::atomic<uint64_t> n_batch_flushes{0};
+    std::atomic<uint64_t> n_batch_items{0};
+    std::atomic<uint64_t> n_batch_groups{0}; // (src_dev,dst_dev) groups flushed
+    // Call-site tags (where stage traffic comes from)
+    std::atomic<uint64_t> n_from_sched{0};   // cpy_tensor_async (split inputs)
+    std::atomic<uint64_t> n_from_mul_mat{0}; // ggml_cuda_op_mul_mat peer path
+    std::atomic<uint64_t> n_from_cpy2d{0};   // ggml_cuda_cpy_tensor_2d
+    std::atomic<uint64_t> n_from_other{0};
+    std::atomic<uint64_t> bytes_from_sched{0};
+    std::atomic<uint64_t> bytes_from_mul_mat{0};
+    std::atomic<uint64_t> bytes_from_cpy2d{0};
+    std::atomic<uint64_t> n_unnamed{0}; // sched stages with empty tensor name
+    std::atomic<uint64_t> bytes_unnamed{0};
+};
+
+static hip_xdev_copy_stats g_hip_xdev_stats;
+
+static bool hip_xdev_stats_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_HIP_COPY_STATS");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+
+// Coarse name buckets for "what is crossing" (Codex SAFE TRY #1).
+struct hip_xdev_name_bucket {
+    char     key[48];
+    uint64_t n;
+    uint64_t bytes;
+};
+static constexpr int kHipXdevNameBuckets = 96;
+static hip_xdev_name_bucket g_hip_xdev_names[kHipXdevNameBuckets];
+static std::mutex g_hip_xdev_names_mtx;
+
+// Collapse layer indices and stream views: "hc_attn_post-12 (view)" -> "hc_attn_post* (view)"
+static void hip_xdev_family_key(const char * name, char * out, size_t out_n) {
+    if (strncmp(name, "blk.", 4) == 0) {
+        const char * dot = strchr(name + 4, '.');
+        if (dot && dot[1]) {
+            name = dot + 1;
+        }
+    }
+    size_t o = 0;
+    for (size_t i = 0; name[i] && o + 1 < out_n; ) {
+        if (name[i] >= '0' && name[i] <= '9') {
+            if (o == 0 || out[o - 1] != '*') {
+                out[o++] = '*';
+            }
+            while (name[i] >= '0' && name[i] <= '9') {
+                i++;
+            }
+            continue;
+        }
+        out[o++] = name[i++];
+    }
+    out[o] = '\0';
+}
+
+static void hip_xdev_note_name(const char * name, size_t bytes) {
+    if (!hip_xdev_stats_enabled()) {
+        return;
+    }
+    if (name == nullptr || name[0] == '\0') {
+        g_hip_xdev_stats.n_unnamed.fetch_add(1, std::memory_order_relaxed);
+        g_hip_xdev_stats.bytes_unnamed.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+        return;
+    }
+    char key[48];
+    hip_xdev_family_key(name, key, sizeof(key));
+    std::lock_guard<std::mutex> lk(g_hip_xdev_names_mtx);
+    int free_i = -1;
+    for (int i = 0; i < kHipXdevNameBuckets; ++i) {
+        if (g_hip_xdev_names[i].key[0] == '\0') {
+            if (free_i < 0) {
+                free_i = i;
+            }
+            continue;
+        }
+        if (strncmp(g_hip_xdev_names[i].key, key, sizeof(g_hip_xdev_names[i].key) - 1) == 0) {
+            g_hip_xdev_names[i].n++;
+            g_hip_xdev_names[i].bytes += (uint64_t) bytes;
+            return;
+        }
+    }
+    if (free_i >= 0) {
+        strncpy(g_hip_xdev_names[free_i].key, key, sizeof(g_hip_xdev_names[free_i].key) - 1);
+        g_hip_xdev_names[free_i].key[sizeof(g_hip_xdev_names[free_i].key) - 1] = '\0';
+        g_hip_xdev_names[free_i].n = 1;
+        g_hip_xdev_names[free_i].bytes = (uint64_t) bytes;
+    }
+}
+
+static uint64_t hip_xdev_stats_every() {
+    static const uint64_t every = []() -> uint64_t {
+        const char * e = getenv("GGML_HIP_COPY_STATS_EVERY");
+        if (e == nullptr || e[0] == '\0') {
+            return 0;
+        }
+        return (uint64_t) strtoull(e, nullptr, 10);
+    }();
+    return every;
+}
+
+static void hip_xdev_stats_print(FILE * f) {
+    const uint64_t n   = g_hip_xdev_stats.n_stage.load(std::memory_order_relaxed);
+    const uint64_t n2  = g_hip_xdev_stats.n_stage_2d.load(std::memory_order_relaxed);
+    const uint64_t n1  = g_hip_xdev_stats.n_stage_1d.load(std::memory_order_relaxed);
+    const uint64_t nf  = g_hip_xdev_stats.n_stage_fast1d.load(std::memory_order_relaxed);
+    const uint64_t np  = g_hip_xdev_stats.n_peer.load(std::memory_order_relaxed);
+    const uint64_t by  = g_hip_xdev_stats.bytes_stage.load(std::memory_order_relaxed);
+    const uint64_t ns  = g_hip_xdev_stats.ns_stage.load(std::memory_order_relaxed);
+    const uint64_t nss = g_hip_xdev_stats.ns_sync.load(std::memory_order_relaxed);
+    const uint64_t mb  = g_hip_xdev_stats.max_bytes.load(std::memory_order_relaxed);
+    const uint64_t gr  = g_hip_xdev_stats.n_slab_grow.load(std::memory_order_relaxed);
+    const uint64_t d01 = g_hip_xdev_stats.n_dir_0_to_1.load(std::memory_order_relaxed);
+    const uint64_t d10 = g_hip_xdev_stats.n_dir_1_to_0.load(std::memory_order_relaxed);
+    const uint64_t ns01 = g_hip_xdev_stats.ns_dir_0_to_1.load(std::memory_order_relaxed);
+    const uint64_t ns10 = g_hip_xdev_stats.ns_dir_1_to_0.load(std::memory_order_relaxed);
+    const uint64_t nbf = g_hip_xdev_stats.n_batch_flushes.load(std::memory_order_relaxed);
+    const uint64_t nbi = g_hip_xdev_stats.n_batch_items.load(std::memory_order_relaxed);
+    const uint64_t nbg = g_hip_xdev_stats.n_batch_groups.load(std::memory_order_relaxed);
+    const double ms    = (double) ns / 1e6;
+    const double sync_ms = (double) nss / 1e6;
+    const double avg_us = n > 0 ? (double) ns / (double) n / 1e3 : 0.0;
+    const double avg01 = d01 > 0 ? (double) ns01 / (double) d01 / 1e3 : 0.0;
+    const double avg10 = d10 > 0 ? (double) ns10 / (double) d10 / 1e3 : 0.0;
+    fprintf(f,
+            "ggml-hip xdev-copy: stage=%" PRIu64 " (2d=%" PRIu64 " 1d=%" PRIu64 " fast1d=%" PRIu64 ") peer=%" PRIu64
+            " bytes=%" PRIu64 " max_b=%" PRIu64
+            " wall_ms=%.3f avg_us=%.1f sync_ms=%.3f slab_grow=%" PRIu64
+            " buckets(<=4k/64k/1M/>1M)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " dir0to1=%" PRIu64 " (avg_us=%.1f) dir1to0=%" PRIu64 " (avg_us=%.1f)"
+            " batch_flush=%" PRIu64 " batch_items=%" PRIu64 " batch_groups=%" PRIu64
+            " from(sched/mm/cpy2d/other)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " bytes(sched/mm/cpy2d)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            n, n2, n1, nf, np, by, mb, ms, avg_us, sync_ms, gr,
+            g_hip_xdev_stats.n_b_le_4k.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_b_le_64k.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_b_le_1m.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_b_gt_1m.load(std::memory_order_relaxed),
+            d01, avg01, d10, avg10, nbf, nbi, nbg,
+            g_hip_xdev_stats.n_from_sched.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_from_mul_mat.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_from_cpy2d.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.n_from_other.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.bytes_from_sched.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.bytes_from_mul_mat.load(std::memory_order_relaxed),
+            g_hip_xdev_stats.bytes_from_cpy2d.load(std::memory_order_relaxed));
+    // Top name buckets by count
+    {
+        std::lock_guard<std::mutex> lk(g_hip_xdev_names_mtx);
+        int order[kHipXdevNameBuckets];
+        int n_ord = 0;
+        for (int i = 0; i < kHipXdevNameBuckets; ++i) {
+            if (g_hip_xdev_names[i].key[0]) {
+                order[n_ord++] = i;
+            }
+        }
+        std::sort(order, order + n_ord, [](int a, int b) {
+            return g_hip_xdev_names[a].n > g_hip_xdev_names[b].n;
+        });
+        const int show = n_ord < 20 ? n_ord : 20;
+        if (show > 0) {
+            fprintf(f, "ggml-hip xdev-copy names (top %d by count):", show);
+            for (int i = 0; i < show; ++i) {
+                const auto & b = g_hip_xdev_names[order[i]];
+                fprintf(f, " %s:n=%" PRIu64 "/b=%" PRIu64, b.key, b.n, b.bytes);
+            }
+            fprintf(f, "\n");
+        }
+        fprintf(f, "ggml-hip xdev-copy unnamed: n=%" PRIu64 " bytes=%" PRIu64 "\n",
+                g_hip_xdev_stats.n_unnamed.load(std::memory_order_relaxed),
+                g_hip_xdev_stats.bytes_unnamed.load(std::memory_order_relaxed));
+    }
+    fflush(f);
+}
+
+// Optional call-site tag for the next stage record (thread-local).
+enum class hip_xdev_src_tag { other, sched, mul_mat, cpy2d };
+static thread_local hip_xdev_src_tag g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+
+static void hip_xdev_stats_record(bool is_2d, bool fast1d, size_t bytes, uint64_t ns_total, uint64_t ns_sync,
+                                  int src_dev, int dst_dev) {
+    if (!hip_xdev_stats_enabled()) {
+        return;
+    }
+    static std::once_flag atexit_once;
+    std::call_once(atexit_once, []() {
+        atexit([]() { hip_xdev_stats_print(stderr); });
+    });
+
+    switch (g_hip_xdev_src_tag) {
+        case hip_xdev_src_tag::sched:
+            g_hip_xdev_stats.n_from_sched.fetch_add(1, std::memory_order_relaxed);
+            g_hip_xdev_stats.bytes_from_sched.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+            break;
+        case hip_xdev_src_tag::mul_mat:
+            g_hip_xdev_stats.n_from_mul_mat.fetch_add(1, std::memory_order_relaxed);
+            g_hip_xdev_stats.bytes_from_mul_mat.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+            break;
+        case hip_xdev_src_tag::cpy2d:
+            g_hip_xdev_stats.n_from_cpy2d.fetch_add(1, std::memory_order_relaxed);
+            g_hip_xdev_stats.bytes_from_cpy2d.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+            break;
+        default:
+            g_hip_xdev_stats.n_from_other.fetch_add(1, std::memory_order_relaxed);
+            break;
+    }
+
+    g_hip_xdev_stats.n_stage.fetch_add(1, std::memory_order_relaxed);
+    if (is_2d) {
+        g_hip_xdev_stats.n_stage_2d.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_hip_xdev_stats.n_stage_1d.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (fast1d) {
+        g_hip_xdev_stats.n_stage_fast1d.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_hip_xdev_stats.bytes_stage.fetch_add((uint64_t) bytes, std::memory_order_relaxed);
+    g_hip_xdev_stats.ns_stage.fetch_add(ns_total, std::memory_order_relaxed);
+    g_hip_xdev_stats.ns_sync.fetch_add(ns_sync, std::memory_order_relaxed);
+
+    if (src_dev == 0 && dst_dev == 1) {
+        g_hip_xdev_stats.n_dir_0_to_1.fetch_add(1, std::memory_order_relaxed);
+        g_hip_xdev_stats.ns_dir_0_to_1.fetch_add(ns_total, std::memory_order_relaxed);
+    } else if (src_dev == 1 && dst_dev == 0) {
+        g_hip_xdev_stats.n_dir_1_to_0.fetch_add(1, std::memory_order_relaxed);
+        g_hip_xdev_stats.ns_dir_1_to_0.fetch_add(ns_total, std::memory_order_relaxed);
+    } else {
+        g_hip_xdev_stats.n_dir_other.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (bytes <= 4096) {
+        g_hip_xdev_stats.n_b_le_4k.fetch_add(1, std::memory_order_relaxed);
+    } else if (bytes <= 65536) {
+        g_hip_xdev_stats.n_b_le_64k.fetch_add(1, std::memory_order_relaxed);
+    } else if (bytes <= (1u << 20)) {
+        g_hip_xdev_stats.n_b_le_1m.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_hip_xdev_stats.n_b_gt_1m.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t prev = g_hip_xdev_stats.max_bytes.load(std::memory_order_relaxed);
+    while (bytes > prev &&
+           !g_hip_xdev_stats.max_bytes.compare_exchange_weak(prev, (uint64_t) bytes,
+                                                             std::memory_order_relaxed)) {
+    }
+
+    const uint64_t every = hip_xdev_stats_every();
+    if (every > 0) {
+        const uint64_t n = g_hip_xdev_stats.n_stage.load(std::memory_order_relaxed);
+        if (n % every == 0) {
+            hip_xdev_stats_print(stderr);
+        }
+    }
+}
+
+static void hip_xdev_stats_record_peer() {
+    if (!hip_xdev_stats_enabled()) {
+        return;
+    }
+    g_hip_xdev_stats.n_peer.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Sticky pinned host slabs for residual-sized D2H+H2D (T1). Floor growth at
+// 256 KiB so decode residuals do not thrash host malloc.
+//
+// Host flags (env GGML_HIP_STAGE_HOST):
+//   wc      (default) - hipHostMallocWriteCombined; microbench ~best for pure DMA bounce
+//   default           - hipHostMallocDefault
+//   mapped            - hipHostMallocMapped
+constexpr size_t kHipXdevStagingSlabs = 8;
+constexpr size_t kHipXdevStagingFloor = 256 * 1024;
+
+struct hip_xdev_staging_slab {
+    std::mutex mtx;
+    void *     buf = nullptr;
+    size_t     cap = 0;
+};
+
+static hip_xdev_staging_slab g_hip_xdev_slabs[kHipXdevStagingSlabs];
+static std::atomic<uint32_t> g_hip_xdev_next_slab{0};
+
+static unsigned hip_xdev_host_malloc_flags() {
+    static const unsigned flags = []() -> unsigned {
+        const char * e = getenv("GGML_HIP_STAGE_HOST");
+        if (e && !strcmp(e, "default")) {
+            return hipHostMallocDefault;
+        }
+        if (e && !strcmp(e, "mapped")) {
+            return hipHostMallocMapped;
+        }
+        // default: WriteCombined pure-DMA bounce (no CPU touch of payload)
+        return hipHostMallocWriteCombined;
+    }();
+    return flags;
+}
+
+// Always hipSetDevice: ambient-device caching is unsafe on ROCm multi-GPU
+// (uninitialized thread contexts; see ggml_cuda_set_device).
+static void hip_xdev_set_device(int dev) {
+    hipSetDevice(dev);
+}
+
+// Acquire a sticky slab (lock held until hip_xdev_slab_unlock). *out_buf is pinned host.
+static hipError_t hip_xdev_slab_lock(size_t need, void ** out_buf, hip_xdev_staging_slab ** out_slab) {
+    const uint32_t idx = g_hip_xdev_next_slab.fetch_add(1, std::memory_order_relaxed) % kHipXdevStagingSlabs;
+    hip_xdev_staging_slab & slab = g_hip_xdev_slabs[idx];
+    slab.mtx.lock();
+
+    size_t want = need;
+    if (want < kHipXdevStagingFloor) {
+        want = kHipXdevStagingFloor;
+    }
+    if (want > slab.cap) {
+        if (slab.buf) {
+            hipHostFree(slab.buf);
+            slab.buf = nullptr;
+            slab.cap = 0;
+        }
+        const unsigned flags = hip_xdev_host_malloc_flags();
+        hipError_t err = hipHostMalloc(&slab.buf, want, flags);
+        // WriteCombined/Mapped can fail on some drivers; fall back.
+        if (err != hipSuccess && flags != hipHostMallocDefault) {
+            err = hipHostMalloc(&slab.buf, want, hipHostMallocDefault);
+        }
+        if (err != hipSuccess) {
+            slab.mtx.unlock();
+            return hipErrorOutOfMemory;
+        }
+        slab.cap = want;
+        if (hip_xdev_stats_enabled()) {
+            g_hip_xdev_stats.n_slab_grow.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    *out_buf  = slab.buf;
+    *out_slab = &slab;
+    return hipSuccess;
+}
+
+static void hip_xdev_slab_unlock(hip_xdev_staging_slab * slab) {
+    if (slab) {
+        slab->mtx.unlock();
+    }
+}
+
+// Core host-stage copy used by Memcpy2DPeerAsync / cpy_tensor_2d.
+// Contiguous payloads use 1D hipMemcpy (faster); pitched use hipMemcpy2D.
+static hipError_t hip_xdev_stage_impl(
+        void * dst, int dst_dev, size_t dpitch,
+        const void * src, int src_dev, size_t spitch,
+        size_t width, size_t height,
+        hipStream_t producer_stream,
+        bool skip_producer_sync = false) {
+    if (width == 0 || height == 0) {
+        return hipSuccess;
+    }
+    if (src_dev == dst_dev) {
+        hip_xdev_set_device(dst_dev);
+        if (spitch == width && dpitch == width) {
+            return hipMemcpyAsync(dst, src, width * height, hipMemcpyDeviceToDevice, producer_stream);
+        }
+        return hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, hipMemcpyDeviceToDevice, producer_stream);
+    }
+
+    using clock = std::chrono::steady_clock;
+    const bool stats = hip_xdev_stats_enabled();
+    const auto t0 = stats ? clock::now() : clock::time_point{};
+
+    const auto t_sync0 = stats ? clock::now() : clock::time_point{};
+    // Always sync producer unless batch already did (null stream is valid).
+    if (!skip_producer_sync) {
+        hipStreamSynchronize(producer_stream);
+    }
+    const uint64_t ns_sync = stats && !skip_producer_sync
+        ? (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t_sync0).count()
+        : 0;
+
+    int saved_dev = 0;
+    hipGetDevice(&saved_dev);
+
+    const size_t staging_size = width * height;
+    // 1D only if env opt-in: previously faulted under hetero load without
+    // stream-sync; still gated until more soak. WC host is the main win.
+    static const bool allow_1d = []() {
+        const char * e = getenv("GGML_HIP_STAGE_1D");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    const bool use_1d = allow_1d && (spitch == width && dpitch == width);
+
+    void * host_buf = nullptr;
+    hip_xdev_staging_slab * slab = nullptr;
+    hipError_t err = hip_xdev_slab_lock(staging_size, &host_buf, &slab);
+    if (err != hipSuccess) {
+        hipSetDevice(saved_dev);
+        return err;
+    }
+
+    hip_xdev_set_device(src_dev);
+    if (use_1d) {
+        err = hipMemcpy(host_buf, src, staging_size, hipMemcpyDeviceToHost);
+    } else {
+        err = hipMemcpy2D(host_buf, width, src, spitch, width, height, hipMemcpyDeviceToHost);
+    }
+    if (err == hipSuccess) {
+        hip_xdev_set_device(dst_dev);
+        if (use_1d) {
+            err = hipMemcpy(dst, host_buf, staging_size, hipMemcpyHostToDevice);
+        } else {
+            err = hipMemcpy2D(dst, dpitch, host_buf, width, width, height, hipMemcpyHostToDevice);
+        }
+    }
+    hip_xdev_slab_unlock(slab);
+    hipSetDevice(saved_dev);
+
+    if (stats) {
+        const uint64_t ns_total =
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count();
+        hip_xdev_stats_record(/*is_2d=*/true, /*fast1d=*/use_1d, staging_size, ns_total, ns_sync,
+                              src_dev, dst_dev);
+    }
+    return err;
+}
+
+// ---- Multi-input stage batch (sched split inputs) ----
+// cpy_tensor_async queues; graph_compute / synchronize flush with two-phase
+// D2H-all / H2D-all per (src_dev,dst_dev) group.
+
+static bool hip_xdev_batch_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_HIP_STAGE_BATCH");
+        // default OFF: deferred queue proved fragile under WP eval_cb ordering
+        // on mixed-ISA; set 1 to enable (flush after split inputs via sched hook).
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
+
+struct hip_xdev_batch_item {
+    void *       dst;
+    const void * src;
+    size_t       nbytes;
+    int          src_dev;
+    int          dst_dev;
+    hipStream_t  src_stream;
+};
+
+static constexpr int kHipXdevBatchMax = 32;
+
+struct hip_xdev_batch_state {
+    int n = 0;
+    hip_xdev_batch_item items[kHipXdevBatchMax];
+};
+
+static thread_local hip_xdev_batch_state g_hip_xdev_batch;
+
+static void hip_xdev_batch_flush() {
+    hip_xdev_batch_state & b = g_hip_xdev_batch;
+    if (b.n <= 0) {
+        return;
+    }
+
+    const bool stats = hip_xdev_stats_enabled();
+
+    // Sync each unique producer stream once, then stage each item with
+    // skip_producer_sync. Safer than packing views into one host blob.
+    hipStream_t seen_streams[kHipXdevBatchMax];
+    int n_seen = 0;
+    for (int i = 0; i < b.n; ++i) {
+        hipStream_t s = b.items[i].src_stream;
+        bool found = false;
+        for (int j = 0; j < n_seen; ++j) {
+            if (seen_streams[j] == s) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            seen_streams[n_seen++] = s;
+            hipStreamSynchronize(s);
+        }
+    }
+
+    int n_groups = 0;
+    bool seen_pair[kHipXdevBatchMax] = {};
+    for (int i = 0; i < b.n; ++i) {
+        if (seen_pair[i]) {
+            continue;
+        }
+        n_groups++;
+        for (int j = i; j < b.n; ++j) {
+            if (b.items[j].src_dev == b.items[i].src_dev &&
+                b.items[j].dst_dev == b.items[i].dst_dev) {
+                seen_pair[j] = true;
+            }
+        }
+    }
+
+    for (int i = 0; i < b.n; ++i) {
+        const auto & it = b.items[i];
+        (void) hip_xdev_stage_impl(it.dst, it.dst_dev, it.nbytes,
+                                   it.src, it.src_dev, it.nbytes,
+                                   it.nbytes, 1, it.src_stream,
+                                   /*skip_producer_sync=*/true);
+    }
+
+    if (stats) {
+        g_hip_xdev_stats.n_batch_flushes.fetch_add(1, std::memory_order_relaxed);
+        g_hip_xdev_stats.n_batch_items.fetch_add((uint64_t) b.n, std::memory_order_relaxed);
+        g_hip_xdev_stats.n_batch_groups.fetch_add((uint64_t) n_groups, std::memory_order_relaxed);
+    }
+
+    b.n = 0;
+}
+
+// Public flush entry (also used from WP eval_cb before ensure).
+void ggml_backend_cuda_xdev_batch_flush(void) {
+#if defined(GGML_USE_HIP)
+    hip_xdev_batch_flush();
+#endif
+}
+
+// Queue a contiguous cross-device stage. Returns true if handled (possibly deferred).
+// Items are flushed in hip_xdev_batch_flush() before graph_compute / synchronize / eval_cb.
+static bool hip_xdev_batch_queue(
+        void * dst, int dst_dev,
+        const void * src, int src_dev,
+        size_t nbytes,
+        hipStream_t src_stream) {
+    if (!hip_xdev_batch_enabled() || nbytes == 0 || dst == nullptr || src == nullptr) {
+        return false;
+    }
+    hip_xdev_batch_state & b = g_hip_xdev_batch;
+    // Flush if full
+    if (b.n >= kHipXdevBatchMax) {
+        hip_xdev_batch_flush();
+    }
+    b.items[b.n++] = hip_xdev_batch_item{ dst, src, nbytes, src_dev, dst_dev, src_stream };
+    return true;
+}
+
+#endif // GGML_USE_HIP
+
 static cudaError_t ggml_cuda_cpy_tensor_2d(
     void * dst, const struct ggml_tensor * src, int64_t i3, int64_t i2, int64_t i1_low, int64_t i1_high, cudaStream_t stream) {
 
@@ -1684,7 +2267,7 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
 #if defined(GGML_USE_HIP)
     // hipMemcpyPeerAsync's internal copy kernel is not compiled for all ISAs in a
     // mixed-architecture ROCm build (e.g. gfx1201 + gfx1030), causing async GPU page
-    // faults. Use explicit synchronous CPU staging for cross-device copies instead.
+    // faults. Use sticky host staging (shared with Memcpy2DPeerAsync).
     hipPointerAttribute_t src_attr = {};
     hipPointerAttribute_t dst_attr = {};
     const bool src_ok = hipPointerGetAttributes(&src_attr, x)       == hipSuccess;
@@ -1692,37 +2275,59 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     if (src_ok && dst_ok && src_attr.device != dst_attr.device) {
         const int src_dev = src_attr.device;
         const int dst_dev = dst_attr.device;
-        // Flush stream so prior GPU work writing to src is complete.
+        const size_t row_bytes = (nb0 == ts) ? ts*ne0/bs : ts/bs;
+        const size_t total_bytes = i1_diff * ((nb0 == ts) ? ts*ne0/bs : ne0*(ts/bs));
+        if (total_bytes == 0) {
+            return hipSuccess;
+        }
+        g_hip_xdev_src_tag = hip_xdev_src_tag::cpy2d;
+        // Contiguous block: shared stage impl (WC host + setDevice cache).
+        if (nb0 == ts && nb1 == (int64_t) row_bytes) {
+            hipError_t e = hip_xdev_stage_impl(dst_ptr, dst_dev, row_bytes, x, src_dev, row_bytes,
+                                       row_bytes, (size_t) i1_diff, stream);
+            g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+            return e;
+        }
+        // Non-contiguous rows: gather into sticky host then H2D blob.
+        using clock = std::chrono::steady_clock;
+        const auto t0 = hip_xdev_stats_enabled() ? clock::now() : clock::time_point{};
         hipStreamSynchronize(stream);
         int saved_dev;
         hipGetDevice(&saved_dev);
-        const size_t row_bytes = (nb0 == ts) ? ts*ne0/bs : ts/bs;
-        const size_t total_bytes = i1_diff * ((nb0 == ts) ? ts*ne0/bs : ne0*(ts/bs));
         void * host_buf = nullptr;
-        if (total_bytes > 0 && hipHostMalloc(&host_buf, total_bytes, hipHostMallocDefault) == hipSuccess) {
-            hipSetDevice(src_dev);
-            if (nb0 == ts && nb1 == ts*ne0/bs) {
-                hipMemcpy(host_buf, x, total_bytes, hipMemcpyDeviceToHost);
-            } else if (nb0 == ts) {
-                for (int64_t i1 = 0; i1 < i1_diff; i1++) {
-                    hipMemcpy((char*)host_buf + i1*row_bytes, x + i1*nb1, row_bytes, hipMemcpyDeviceToHost);
-                }
-            } else {
-                const size_t elem = ts/bs;
-                for (int64_t i1 = 0; i1 < i1_diff; i1++) {
-                    for (int64_t e = 0; e < ne0; e++) {
-                        hipMemcpy((char*)host_buf + (i1*ne0+e)*elem, x + i1*nb1 + e*nb0, elem, hipMemcpyDeviceToHost);
-                    }
+        hip_xdev_staging_slab * slab = nullptr;
+        hipError_t err = hip_xdev_slab_lock(total_bytes, &host_buf, &slab);
+        if (err != hipSuccess) {
+            hipSetDevice(saved_dev);
+            return err;
+        }
+        hip_xdev_set_device(src_dev);
+        if (nb0 == ts) {
+            for (int64_t i1 = 0; i1 < i1_diff && err == hipSuccess; i1++) {
+                err = hipMemcpy((char *) host_buf + i1*row_bytes, x + i1*nb1, row_bytes, hipMemcpyDeviceToHost);
+            }
+        } else {
+            const size_t elem = ts/bs;
+            for (int64_t i1 = 0; i1 < i1_diff && err == hipSuccess; i1++) {
+                for (int64_t e = 0; e < ne0 && err == hipSuccess; e++) {
+                    err = hipMemcpy((char *) host_buf + (i1*ne0+e)*elem, x + i1*nb1 + e*nb0, elem, hipMemcpyDeviceToHost);
                 }
             }
-            hipSetDevice(dst_dev);
-            hipMemcpy(dst_ptr, host_buf, total_bytes, hipMemcpyHostToDevice);
-            hipHostFree(host_buf);
-            hipSetDevice(saved_dev);
-            return hipSuccess;
         }
+        if (err == hipSuccess) {
+            hip_xdev_set_device(dst_dev);
+            err = hipMemcpy(dst_ptr, host_buf, total_bytes, hipMemcpyHostToDevice);
+        }
+        hip_xdev_slab_unlock(slab);
         hipSetDevice(saved_dev);
-        return hipErrorOutOfMemory;
+        if (hip_xdev_stats_enabled()) {
+            const uint64_t ns_total =
+                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - t0).count();
+            hip_xdev_stats_record(/*is_2d=*/false, /*fast1d=*/false, total_bytes, ns_total, 0,
+                                  src_dev, dst_dev);
+        }
+        g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+        return err;
     }
 #endif
 
@@ -1999,55 +2604,16 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
                 width, stream);
             if (err != cudaSuccess) { return err; }
         }
+        hip_xdev_stats_record_peer();
         return cudaSuccess;
     }
 
-    // No P2P: synchronous CPU staging avoids the ROCm mixed-ISA copy-kernel bug.
-    // 8-slab ring of pinned host buffers, each with its own mutex. Concurrent
-    // peer copies (e.g. in row-split matmul, where one src1 gets staged to
-    // every device) pick different slabs and don't serialize on a global lock.
-    // (Phase 3 I2 in the rewrite plan.)
-    //
-    // Async via hipMemcpy2DAsync was tried and made things worse on our
-    // hardware: caller's stream still has both ops queued in order, so the
-    // consuming op blocks the same way it did before — but now with extra
-    // event-sync overhead. Sync sticks until I3's full pipelining lands.
-    constexpr size_t kStagingSlabs = 8;
-    struct staging_slab {
-        std::mutex mtx;
-        void *     buf = nullptr;
-        size_t     cap = 0;
-    };
-    static staging_slab          s_slabs[kStagingSlabs];
-    static std::atomic<uint32_t> s_next_slab{0};
-
-    hipStreamSynchronize(stream);
-
-    const size_t staging_size = width * height;
-    int saved_device;
-    hipGetDevice(&saved_device);
-
-    const uint32_t slab_idx = s_next_slab.fetch_add(1, std::memory_order_relaxed) % kStagingSlabs;
-    staging_slab & slab = s_slabs[slab_idx];
-
-    std::lock_guard<std::mutex> lk(slab.mtx);
-    if (staging_size > slab.cap) {
-        if (slab.buf) { hipHostFree(slab.buf); slab.buf = nullptr; }
-        if (hipHostMalloc(&slab.buf, staging_size, hipHostMallocDefault) != hipSuccess) {
-            hipSetDevice(saved_device);
-            return hipErrorOutOfMemory;
-        }
-        slab.cap = staging_size;
-    }
-
-    hipSetDevice(srcDevice);
-    hipError_t err = hipMemcpy2D(slab.buf, width, src, spitch, width, height, hipMemcpyDeviceToHost);
-    if (err == hipSuccess) {
-        hipSetDevice(dstDevice);
-        err = hipMemcpy2D(dst, dpitch, slab.buf, width, width, height, hipMemcpyHostToDevice);
-    }
-    hipSetDevice(saved_device);
-    return (err == hipSuccess) ? cudaSuccess : (cudaError_t)err;
+    // No P2P: host stage via hip_xdev_stage_impl (WC sticky slabs).
+    // Caller must set g_hip_xdev_src_tag if not already (default: other).
+    hipError_t err = hip_xdev_stage_impl(dst, dstDevice, dpitch, src, srcDevice, spitch,
+                                         width, height, stream);
+    g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+    return (err == hipSuccess) ? cudaSuccess : (cudaError_t) err;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
@@ -2282,6 +2848,9 @@ static void ggml_cuda_op_mul_mat(
                 // copy src0, src1 to device if necessary
                 if (src1_is_contiguous) {
                     if (id != ctx.device) {
+#if defined(GGML_USE_HIP)
+                        g_hip_xdev_src_tag = hip_xdev_src_tag::mul_mat;
+#endif
                         if (quantize_src1) {
                             char * src1_ddq_i_source = dev[ctx.device].src1_ddq + src1_ddq_i_offset;
                             if (quantize_src1 == quantize_mmq_q8_1_cuda) {
@@ -2299,6 +2868,9 @@ static void ggml_cuda_op_mul_mat(
                             const size_t nbytes_f = src1_ncols*ne10*sizeof(float);
                             CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(src1_ddf_i, id, nbytes_f, src1_ddf_i_source, ctx.device, nbytes_f, nbytes_f, 1, stream));
                         }
+#if defined(GGML_USE_HIP)
+                        g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+#endif
                     }
                 } else if (src1_on_device && !src1_is_contiguous) {
                     CUDA_CHECK(ggml_cuda_cpy_tensor_2d(
@@ -3581,8 +4153,45 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #elif defined(GGML_USE_HIP)
             {
                 const size_t nb = ggml_nbytes(dst);
-                CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, nb,
-                    const_cast<void *>(src->data), cuda_ctx_src->device, nb, nb, 1, cuda_ctx_src->stream()));
+                // For anonymous graph nodes, key by op+shape so we can fix sources.
+                if (src->name[0] && strncmp(src->name, "node_", 5) == 0) {
+                    char key[64];
+                    snprintf(key, sizeof(key), "node/%s/%ldx%ldx%ld%s",
+                             ggml_op_name(src->op),
+                             (long) src->ne[0], (long) src->ne[1], (long) src->ne[2],
+                             src->view_src ? "/v" : "");
+                    hip_xdev_note_name(key, nb);
+                } else if (src->name[0]) {
+                    hip_xdev_note_name(src->name, nb);
+                } else if (dst->name[0]) {
+                    hip_xdev_note_name(dst->name, nb);
+                } else {
+                    char key[64];
+                    snprintf(key, sizeof(key), "node/%s/%ldx%ldx%ld",
+                             ggml_op_name(src->op),
+                             (long) src->ne[0], (long) src->ne[1], (long) src->ne[2]);
+                    hip_xdev_note_name(key, nb);
+                }
+                g_hip_xdev_src_tag = hip_xdev_src_tag::sched;
+                // Queue for multi-input batch flush before graph_compute.
+                // Falls back to immediate stage if batching disabled.
+                if (hip_xdev_batch_queue(dst->data, cuda_ctx_dst->device,
+                                         src->data, cuda_ctx_src->device,
+                                         nb, cuda_ctx_src->stream())) {
+                    // Defer host-stage until graph_compute/synchronize flush.
+                    // Do NOT skip events when batch is empty after a forced
+                    // path; only skip when items are still pending.
+                    if (g_hip_xdev_batch.n > 0) {
+                        g_hip_xdev_src_tag = hip_xdev_src_tag::other;
+                        return true;
+                    }
+                    // Flushed inside queue (batch was full) - fall through to
+                    // events so dst stream is ordered for subsequent work.
+                } else {
+                    CUDA_CHECK(ggml_cuda_Memcpy2DPeerAsync(dst->data, cuda_ctx_dst->device, nb,
+                        const_cast<void *>(src->data), cuda_ctx_src->device, nb, nb, 1, cuda_ctx_src->stream()));
+                }
+                g_hip_xdev_src_tag = hip_xdev_src_tag::other;
             }
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
@@ -3607,6 +4216,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+#if defined(GGML_USE_HIP)
+    hip_xdev_batch_flush();
+#endif
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
@@ -4979,6 +5591,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+#if defined(GGML_USE_HIP)
+    // Complete any deferred multi-input cross-device stages before kernels run.
+    hip_xdev_batch_flush();
+#endif
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);

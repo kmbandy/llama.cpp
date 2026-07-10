@@ -481,6 +481,29 @@ bool PrefetchScheduler::is_loaded(int page_idx) const {
     return slots_[it->second].state == State::Done;
 }
 
+bool PrefetchScheduler::has_page(int page_idx) const {
+    return page_to_slot_.find(page_idx) != page_to_slot_.end();
+}
+
+bool PrefetchScheduler::is_failed(int page_idx) const {
+    auto it = page_to_slot_.find(page_idx);
+    if (it == page_to_slot_.end()) return false;
+    return slots_[it->second].state == State::Failed;
+}
+
+int PrefetchScheduler::reap_finished() {
+    if (!initialized_) return 0;
+    int n = 0;
+    for (int h = 0; h < queue_depth_; ++h) {
+        Slot & s = slots_[h];
+        if (s.state == State::Done || s.state == State::Failed) {
+            release_slot_(h);
+            ++n;
+        }
+    }
+    return n;
+}
+
 int PrefetchScheduler::take_stage2_event(int page_idx) {
     if (!initialized_) return -1;
     auto it = page_to_slot_.find(page_idx);

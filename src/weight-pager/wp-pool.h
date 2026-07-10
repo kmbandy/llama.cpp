@@ -81,6 +81,14 @@ public:
     // are pinned.
     int alloc_slot(size_t requested_size = 0);
 
+    // Free (unused + unpinned) slots only — never LRU-evicts. For sample
+    // oracle / speculative prefetch that must not thrash the MoE working set.
+    // Returns -1 if none free.
+    int alloc_slot_no_evict(size_t requested_size = 0);
+
+    // Count of slots that are free and unpinned (no eviction needed to use).
+    int n_free_unpinned() const;
+
     // Bump the LRU tick of an already-allocated slot, signalling a cache
     // hit. Caller must ensure the slot was previously returned by
     // alloc_slot() and has not been evicted.

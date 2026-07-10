@@ -10,9 +10,18 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>      // getenv, setenv, unsetenv, malloc, free
+#include <exception>
+#include <fstream>     // WP_ROUTE_TRACE diagnostic dump
 #include <cstring>
+#include <fcntl.h>
+#include <limits.h>
 #include <new>          // placement new
-#include <unistd.h>     // close()
+#include <utility>
+#include <unistd.h>     // close(), pread, readlink
+
+#if defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
+#include <liburing.h>
+#endif
 
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime.h>
@@ -64,6 +73,9 @@ constexpr const char * kEnvWpHipGraphs   = "WP_HIP_GRAPHS";
 constexpr const char * kEnvWpAsyncEnsure = "WP_ASYNC_ENSURE";
 constexpr const char * kEnvWpHostBudgetBytes = "WP_HOST_BUDGET_BYTES";
 constexpr const char * kEnvWpGraphPinMax = "WP_GRAPH_PIN_MAX";
+constexpr const char * kEnvWpStickyL2 = "WP_STICKY_L2";
+constexpr const char * kEnvWpStickyL2Pages = "WP_STICKY_L2_PAGES";
+constexpr const char * kEnvWpStickyL2Stats = "WP_STICKY_L2_STATS";
 
 bool env_flag_is_one(const char * var) {
     const char * v = std::getenv(var);
@@ -102,6 +114,10 @@ int env_nonnegative_int(const char * var, int fallback) {
     return (int) n;
 }
 
+int clamp_int(int n, int lo, int hi) {
+    return std::max(lo, std::min(n, hi));
+}
+
 void log_graph_pin_degrade(int page_idx, int slot, int max_slots) {
     static int s_logs = 0;
     if (s_logs < 8) {
@@ -136,6 +152,357 @@ bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size)
 }
 
 }  // anonymous namespace
+
+bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
+    if (n == 0 || page_bytes == 0) {
+        return false;
+    }
+    // O_DIRECT bounce: align-down prefix (<=511) + size pad to 512.
+    const size_t need = page_bytes + 512 + 512;
+    const size_t alloc = (need + 4095) & ~(size_t) 4095;
+    if (ensure_host_bufs_.size() >= n && ensure_host_buf_bytes_ >= alloc) {
+        return true;
+    }
+    free_ensure_host_bufs_();
+    // Cap pool so we never pin huge prefill unions (same spirit as batch cap).
+    const size_t cap = std::max(n, (size_t) 32);
+    ensure_host_bufs_.assign(cap, nullptr);
+    ensure_host_buf_bytes_ = alloc;
+    ensure_host_bufs_pinned_ = false;
+#if defined(GGML_USE_HIP)
+    static const int s_pageable = [](){ const char* e=std::getenv("WP_ODIRECT_PAGEABLE"); return (e&&e[0]=='1')?1:0; }();
+    bool all_ok = !s_pageable;
+    for (size_t i = 0; !s_pageable && i < cap; ++i) {
+        void * p = nullptr;
+        // hipHostMalloc is page-aligned (O_DIRECT-safe) and faster for H2D.
+        if (hipHostMalloc(&p, alloc, hipHostMallocDefault) != hipSuccess || p == nullptr) {
+            all_ok = false;
+            break;
+        }
+        ensure_host_bufs_[i] = p;
+    }
+    if (all_ok) {
+        ensure_host_bufs_pinned_ = true;
+        return true;
+    }
+    free_ensure_host_bufs_();
+#endif
+    // 4 KiB-aligned malloc fallback for O_DIRECT.
+    ensure_host_bufs_.assign(cap, nullptr);
+    for (size_t i = 0; i < cap; ++i) {
+        void * p = nullptr;
+        if (posix_memalign(&p, 4096, alloc) != 0 || p == nullptr) {
+            free_ensure_host_bufs_();
+            return false;
+        }
+        ensure_host_bufs_[i] = p;
+    }
+    ensure_host_buf_bytes_ = alloc;
+    ensure_host_bufs_pinned_ = false;
+    return true;
+}
+
+void WeightPager::free_ensure_host_bufs_() {
+    shutdown_ensure_odirect_workers_();
+#if defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
+    shutdown_ensure_odirect_ring_();
+#endif
+    for (void * p : ensure_host_bufs_) {
+        if (p == nullptr) continue;
+#if defined(GGML_USE_HIP)
+        if (ensure_host_bufs_pinned_) {
+            hipHostFree(p);
+        } else
+#endif
+        {
+            std::free(p);
+        }
+    }
+    ensure_host_bufs_.clear();
+    ensure_host_buf_bytes_ = 0;
+    ensure_host_bufs_pinned_ = false;
+    for (int fd : ensure_odirect_fds_) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    ensure_odirect_fds_.clear();
+}
+
+int WeightPager::ensure_odirect_worker_count_(size_t n_jobs) const {
+    if (n_jobs == 0) {
+        return 0;
+    }
+
+    static const int s_env_workers = []() {
+        const char * e = std::getenv("WP_ODIRECT_READ_WORKERS");
+        if (e == nullptr || e[0] == '\0') {
+            return -1;
+        }
+        errno = 0;
+        char * end = nullptr;
+        long n = std::strtol(e, &end, 10);
+        if (errno != 0 || end == e || (end != nullptr && *end != '\0') || n <= 0) {
+            LLAMA_LOG_WARN("wp::WeightPager: ignoring invalid WP_ODIRECT_READ_WORKERS=%s\n", e);
+            return -1;
+        }
+        return (int) n;
+    }();
+
+    int n = s_env_workers;
+    if (n <= 0) {
+        n = cfg_.io_uring_depth;
+        if (n <= 0) {
+            n = cfg_.prefetch_depth;
+        }
+    }
+    if (n <= 0) {
+        n = 1;
+    }
+    n = std::min(n, (int) n_jobs);
+    return clamp_int(n, 1, 64);
+}
+
+bool WeightPager::ensure_odirect_workers_ready_(int n_workers) {
+    if (n_workers <= 0) {
+        return false;
+    }
+    if ((int) ensure_odirect_workers_.size() >= n_workers) {
+        return true;
+    }
+    try {
+        while ((int) ensure_odirect_workers_.size() < n_workers) {
+            ensure_odirect_workers_.emplace_back(&WeightPager::ensure_odirect_worker_loop_, this);
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("wp::WeightPager: failed to start O_DIRECT worker: %s\n", e.what());
+        return false;
+    } catch (...) {
+        LLAMA_LOG_WARN("wp::WeightPager: failed to start O_DIRECT worker\n");
+        return false;
+    }
+    static int s_worker_log = 0;
+    if (s_worker_log < 1) {
+        LLAMA_LOG_WARN("wp::WeightPager: O_DIRECT host path using %zu persistent read workers\n",
+                       ensure_odirect_workers_.size());
+        ++s_worker_log;
+    }
+    return true;
+}
+
+void WeightPager::shutdown_ensure_odirect_workers_() {
+    {
+        std::lock_guard<std::mutex> lock(ensure_odirect_mu_);
+        ensure_odirect_workers_stop_ = true;
+    }
+    ensure_odirect_cv_.notify_all();
+    for (std::thread & t : ensure_odirect_workers_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    ensure_odirect_workers_.clear();
+    {
+        std::lock_guard<std::mutex> lock(ensure_odirect_mu_);
+        ensure_odirect_queue_.clear();
+        ensure_odirect_workers_stop_ = false;
+    }
+}
+
+void WeightPager::ensure_odirect_worker_loop_() {
+    for (;;) {
+        EnsureODirectReadJob * job = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(ensure_odirect_mu_);
+            ensure_odirect_cv_.wait(lock, [this]() {
+                return ensure_odirect_workers_stop_ || !ensure_odirect_queue_.empty();
+            });
+            if (ensure_odirect_workers_stop_ && ensure_odirect_queue_.empty()) {
+                return;
+            }
+            job = ensure_odirect_queue_.front();
+            ensure_odirect_queue_.pop_front();
+        }
+
+        bool ok = false;
+        int err = 0;
+        if (job != nullptr && job->fd >= 0 && job->dst != nullptr && job->size > 0) {
+            size_t total = 0;
+            while (total < job->size) {
+                const ssize_t n = pread(job->fd, (char *) job->dst + total,
+                                        job->size - total,
+                                        (off_t) (job->off + total));
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    err = -errno;
+                    break;
+                }
+                if (n == 0) {
+                    err = -EIO;
+                    break;
+                }
+                total += (size_t) n;
+            }
+            ok = (total == job->size);
+        } else {
+            err = -EINVAL;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(ensure_odirect_mu_);
+            if (job != nullptr) {
+                job->ok = ok;
+                job->err = err;
+                job->done = true;
+            }
+        }
+        ensure_odirect_done_cv_.notify_all();
+    }
+}
+
+#if defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
+void WeightPager::shutdown_ensure_odirect_ring_() {
+    if (ensure_odirect_ring_ != nullptr) {
+        if (ensure_odirect_ring_files_registered_) {
+            io_uring_unregister_files(ensure_odirect_ring_);
+        }
+        io_uring_queue_exit(ensure_odirect_ring_);
+        delete ensure_odirect_ring_;
+        ensure_odirect_ring_ = nullptr;
+    }
+    ensure_odirect_fd_registered_.clear();
+    ensure_odirect_ring_files_registered_ = false;
+}
+
+bool WeightPager::ensure_odirect_ring_ready_(size_t n_entries) {
+    if (ensure_odirect_ring_ != nullptr) {
+        return true;
+    }
+
+    unsigned file_cap = 1;
+    for (int i = 0; i < catalog_.size(); ++i) {
+        const PageMeta & m = catalog_.at(i);
+        if (!m.is_pinned && (unsigned) m.file_idx >= file_cap) {
+            file_cap = (unsigned) m.file_idx + 1;
+        }
+    }
+
+    int queue_depth = cfg_.io_uring_depth;
+    if (queue_depth <= 0) {
+        queue_depth = cfg_.prefetch_depth;
+    }
+    if (queue_depth < (int) n_entries) {
+        queue_depth = (int) n_entries;
+    }
+    if (queue_depth <= 0) {
+        queue_depth = 1;
+    }
+
+    ensure_odirect_ring_ = new io_uring();
+    std::memset(ensure_odirect_ring_, 0, sizeof(*ensure_odirect_ring_));
+
+    int ret = io_uring_queue_init(queue_depth, ensure_odirect_ring_, 0);
+    if (ret < 0) {
+        LLAMA_LOG_WARN("wp::ensure_odirect_ring_ready_: queue_init failed: %s\n",
+                       strerror(-ret));
+        delete ensure_odirect_ring_;
+        ensure_odirect_ring_ = nullptr;
+        return false;
+    }
+
+    ret = io_uring_register_files_sparse(ensure_odirect_ring_, file_cap);
+    if (ret < 0) {
+        LLAMA_LOG_WARN("wp::ensure_odirect_ring_ready_: register_files_sparse failed: %s\n",
+                       strerror(-ret));
+        io_uring_queue_exit(ensure_odirect_ring_);
+        delete ensure_odirect_ring_;
+        ensure_odirect_ring_ = nullptr;
+        return false;
+    }
+
+    ensure_odirect_ring_files_registered_ = true;
+    ensure_odirect_fd_registered_.assign(file_cap, 0);
+    return true;
+}
+
+bool WeightPager::ensure_odirect_fixed_fd_ready_(int file_idx, int fd, size_t n_entries) {
+    if (file_idx < 0 || fd < 0) {
+        return false;
+    }
+    if (!ensure_odirect_ring_ready_(n_entries)) {
+        return false;
+    }
+    if ((size_t) file_idx >= ensure_odirect_fd_registered_.size()) {
+        return false;
+    }
+    if (ensure_odirect_fd_registered_[(size_t) file_idx]) {
+        return true;
+    }
+
+    int upd = fd;
+    int ret = io_uring_register_files_update(ensure_odirect_ring_, (unsigned) file_idx, &upd, 1);
+    if (ret < 0) {
+        static int s_reg_warn = 0;
+        if (s_reg_warn < 3) {
+            LLAMA_LOG_WARN("wp::ensure_odirect_fixed_fd_ready_: register fd %d failed: %s\n",
+                           file_idx, strerror(-ret));
+            ++s_reg_warn;
+        }
+        return false;
+    }
+    if (ret != 1) {
+        return false;
+    }
+
+    ensure_odirect_fd_registered_[(size_t) file_idx] = 1;
+    return true;
+}
+#endif
+
+int WeightPager::ensure_odirect_fd_(int file_idx) {
+    if (file_io_ == nullptr || file_idx < 0) {
+        return -1;
+    }
+    if ((size_t) file_idx >= ensure_odirect_fds_.size()) {
+        ensure_odirect_fds_.resize((size_t) file_idx + 1, -1);
+    }
+    if (ensure_odirect_fds_[(size_t) file_idx] >= 0) {
+        return ensure_odirect_fds_[(size_t) file_idx];
+    }
+    const int src = file_io_->fd(file_idx);
+    if (src < 0) {
+        return -1;
+    }
+#ifdef O_DIRECT
+    // Resolve the path of the (buffered) model fd and re-open O_DIRECT.
+    // GGUF offsets are not sector-aligned; callers must bounce-align each read.
+    char link[64];
+    char path[PATH_MAX];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", src);
+    const ssize_t n = ::readlink(link, path, sizeof(path) - 1);
+    if (n <= 0) {
+        return -1;
+    }
+    path[n] = '\0';
+    const int od = ::open(path, O_RDONLY | O_DIRECT);
+    if (od < 0) {
+        static int s_od_warn = 0;
+        if (s_od_warn < 3) {
+            LLAMA_LOG_WARN("wp::ensure_odirect_fd_: open(O_DIRECT) failed for %s: %s\n",
+                           path, strerror(errno));
+            ++s_od_warn;
+        }
+        return -1;
+    }
+    ensure_odirect_fds_[(size_t) file_idx] = od;
+    return od;
+#else
+    (void) src;
+    return -1;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // WeightPager
@@ -214,6 +581,9 @@ bool WeightPager::init(const Config &             cfg,
     env_snapshot(kEnvDisableGraphs, env_was_present_, env_prior_value_);
     hip_graphs_enabled_ = env_flag_is_one(kEnvWpHipGraphs);
     async_ensure_enabled_ = env_flag_is_one(kEnvWpAsyncEnsure);
+    sticky_l2_enabled_ = env_flag_is_one(kEnvWpStickyL2);
+    sticky_l2_max_pages_ = clamp_int(env_nonnegative_int(kEnvWpStickyL2Pages, 32), 1, 256);
+    sticky_l2_stats_ = env_flag_is_one(kEnvWpStickyL2Stats);
     env_disable_graphs_forced_ = !hip_graphs_enabled_;
     if (env_disable_graphs_forced_) {
         setenv(kEnvDisableGraphs, "1", /*overwrite=*/1);
@@ -299,6 +669,14 @@ bool WeightPager::init(const Config &             cfg,
     page_to_slot_.assign((size_t) catalog_.size(), -1);
     page_loaded_.assign((size_t)  catalog_.size(), false);
     cross_layer_prefetch_candidate_.assign((size_t) catalog_.size(), false);
+    draft_tid2eid_mark_.assign((size_t) catalog_.size(), false);
+    oracle_pred_mark_.assign((size_t) catalog_.size(), false);
+    oracle_pred_hit_.assign((size_t) catalog_.size(), false);
+    sticky_l2_score_.assign((size_t) catalog_.size(), 0);
+    sticky_l2_mark_.assign((size_t) catalog_.size(), false);
+    sticky_l2_pinned_.assign((size_t) catalog_.size(), false);
+    sticky_l2_pages_.clear();
+    sticky_l2_hits_since_refresh_ = 0;
     prefetch_started_at_.assign((size_t) catalog_.size(), std::chrono::steady_clock::time_point{});
     page_async_event_.assign((size_t) catalog_.size(), -1);
     slot_to_page_.assign((size_t) pool_.n_slots(), -1);
@@ -375,6 +753,7 @@ void WeightPager::shutdown() {
     log_stats_summary();
     weight_pager_eval_cb_reset(this);
     release_graph_pins_();
+    release_sticky_l2_();
     for (int evt : page_async_event_) {
         if (evt >= 0) {
             transport_.synchronize(evt);
@@ -403,6 +782,7 @@ void WeightPager::shutdown() {
         sync_staging_size_  = 0;
         sync_staging_pinned_ = false;
     }
+    free_ensure_host_bufs_();
     // PoolAllocator dtor frees the ggml buffer.
     pool_.~PoolAllocator();
     new (&pool_) PoolAllocator{};
@@ -410,6 +790,24 @@ void WeightPager::shutdown() {
     page_to_slot_.clear();
     page_loaded_.clear();
     cross_layer_prefetch_candidate_.clear();
+    draft_tid2eid_mark_.clear();
+    oracle_pred_mark_.clear();
+    oracle_pred_hit_.clear();
+    draft_retain_pages_.clear();
+    sticky_l2_score_.clear();
+    sticky_l2_mark_.clear();
+    sticky_l2_pinned_.clear();
+    sticky_l2_pages_.clear();
+    sticky_l2_hits_since_refresh_ = 0;
+    sticky_l2_enabled_ = false;
+    sticky_l2_stats_ = false;
+    sticky_l2_max_pages_ = 32;
+    hot_expert_history_.clear();
+    tid2eid_tables_.clear();
+    sample_sticky_pages_.clear(); // pins already gone with pool; just drop list
+    draft_window_ = 0;
+    draft_warm_streak_ = 0;
+    draft_oracle_fires_ = 0;
     prefetch_started_at_.clear();
     slot_to_page_.clear();
     catalog_.clear();
@@ -505,6 +903,12 @@ void WeightPager::ensure_slot_map_(int slot_idx) {
 const WeightPager::Stats & WeightPager::stats() const {
     stats_.lru_walk_hot_skips    = pool_.lru_walk_hot_skips();
     stats_.lru_walk_pinned_skips = pool_.lru_walk_pinned_skips();
+    stats_.sticky_l2_pins = 0;
+    for (bool pinned : sticky_l2_pinned_) {
+        if (pinned) {
+            ++stats_.sticky_l2_pins;
+        }
+    }
 #if defined(GGML_USE_HIP)
     ggml_cuda_get_routed_expert_ptrs_stats(
         &stats_.routing_ptrs_set,
@@ -593,7 +997,49 @@ void WeightPager::log_stats_summary() {
             "  host_tier_hits: %lu\n"
             "  routing_ptrs_set: %lu\n"
             "  routing_ptrs_consumed: %lu\n"
-            "  routing_ptrs_discarded_unconsumed: %lu\n",
+            "  routing_ptrs_discarded_unconsumed: %lu\n"
+            "  draft_prefetch_calls: %lu\n"
+            "  draft_prefetch_pages_submitted: %lu\n"
+            "  draft_prefetch_pages_resident: %lu\n"
+            "  draft_retain_pins: %lu\n"
+            "  draft_tid2eid_pages: %lu\n"
+            "  draft_cold_pages: %lu\n"
+            "  draft_tid2eid_cold: %lu\n"
+            "  draft_tid2eid_hits_in_ensure: %lu\n"
+            "  draft_oracle_skips: %lu\n"
+            "  draft_window_opens: %lu\n"
+            "  draft_window_closes: %lu\n"
+            "  draft_prefetch_queue_blocked: %lu\n"
+            "  draft_prefetch_harvested: %lu\n"
+            "  draft_hot_records: %lu\n"
+            "  oracle_sample_fires: %lu\n"
+            "  oracle_draft_fires: %lu\n"
+            "  oracle_pred_pages: %lu\n"
+            "  oracle_actual_hash_pages: %lu\n"
+            "  oracle_tp: %lu\n"
+            "  oracle_fn: %lu\n"
+            "  oracle_fp: %lu\n"
+            "  oracle_pages_submitted: %lu\n"
+            "  oracle_pages_free_slot: %lu\n"
+            "  oracle_pages_evict_slot: %lu\n"
+            "  oracle_hash_slots_freed: %lu\n"
+            "  oracle_protect_pins: %lu\n"
+            "  oracle_sticky_pins: %lu\n"
+            "  sticky_l2_pins: %lu\n"
+            "  sticky_l2_hits_in_ensure: %lu\n"
+            "  sticky_l2_promotions: %lu\n"
+            "  sticky_l2_demotions: %lu\n"
+            "  sticky_spec_fires: %lu\n"
+            "  sticky_spec_pages_submitted: %lu\n"
+            "  sticky_spec_pages_resident: %lu\n"
+            "  ensure_batch_calls: %lu\n"
+            "  ensure_batch_pages: %lu\n"
+            "  ensure_batch_max_n: %lu\n"
+            "  ensure_batch_avg_n: %.2f\n"
+            "  ensure_batch_gb_s: %.3f\n"
+            "  ensure_batch_submit_ms: %.1f\n"
+            "  ensure_batch_wait_ms: %.1f\n"
+            "  ensure_batch_timeouts: %lu\n",
             (unsigned long) s.page_ins,
             (unsigned long) s.evictions,
             (unsigned long) s.prefetch_hits,
@@ -609,7 +1055,53 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.host_tier_hits,
             (unsigned long) s.routing_ptrs_set,
             (unsigned long) s.routing_ptrs_consumed,
-            (unsigned long) s.routing_ptrs_discarded_unconsumed);
+            (unsigned long) s.routing_ptrs_discarded_unconsumed,
+            (unsigned long) s.draft_prefetch_calls,
+            (unsigned long) s.draft_prefetch_pages_submitted,
+            (unsigned long) s.draft_prefetch_pages_resident,
+            (unsigned long) s.draft_retain_pins,
+            (unsigned long) s.draft_tid2eid_pages,
+            (unsigned long) s.draft_cold_pages,
+            (unsigned long) s.draft_tid2eid_cold,
+            (unsigned long) s.draft_tid2eid_hits_in_ensure,
+            (unsigned long) s.draft_oracle_skips,
+            (unsigned long) s.draft_window_opens,
+            (unsigned long) s.draft_window_closes,
+            (unsigned long) s.draft_prefetch_queue_blocked,
+            (unsigned long) s.draft_prefetch_harvested,
+            (unsigned long) s.draft_hot_records,
+            (unsigned long) s.oracle_sample_fires,
+            (unsigned long) s.oracle_draft_fires,
+            (unsigned long) s.oracle_pred_pages,
+            (unsigned long) s.oracle_actual_hash_pages,
+            (unsigned long) s.oracle_tp,
+            (unsigned long) s.oracle_fn,
+            (unsigned long) s.oracle_fp,
+            (unsigned long) s.oracle_pages_submitted,
+            (unsigned long) s.oracle_pages_free_slot,
+            (unsigned long) s.oracle_pages_evict_slot,
+            (unsigned long) s.oracle_hash_slots_freed,
+            (unsigned long) s.oracle_protect_pins,
+            (unsigned long) s.oracle_sticky_pins,
+            (unsigned long) s.sticky_l2_pins,
+            (unsigned long) s.sticky_l2_hits_in_ensure,
+            (unsigned long) s.sticky_l2_promotions,
+            (unsigned long) s.sticky_l2_demotions,
+            (unsigned long) s.sticky_spec_fires,
+            (unsigned long) s.sticky_spec_pages_submitted,
+            (unsigned long) s.sticky_spec_pages_resident,
+            (unsigned long) s.ensure_batch_calls,
+            (unsigned long) s.ensure_batch_pages,
+            (unsigned long) s.ensure_batch_max_n,
+            (s.ensure_batch_calls > 0
+                 ? (double) s.ensure_batch_pages / (double) s.ensure_batch_calls
+                 : 0.0),
+            (s.ensure_batch_seconds > 0.0
+                 ? ((double) s.ensure_batch_bytes / 1e9) / s.ensure_batch_seconds
+                 : 0.0),
+            s.ensure_batch_submit_seconds * 1e3,
+            s.ensure_batch_wait_seconds * 1e3,
+            (unsigned long) s.ensure_batch_timeouts);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                            (unsigned long) s.dense_prefetch_submitted);
@@ -633,7 +1125,49 @@ void WeightPager::log_stats_summary() {
         "  cross_layer_hit_in_ensure: %lu\n"
         "  routing_ptrs_set: %lu\n"
         "  routing_ptrs_consumed: %lu\n"
-        "  routing_ptrs_discarded_unconsumed: %lu\n",
+        "  routing_ptrs_discarded_unconsumed: %lu\n"
+        "  draft_prefetch_calls: %lu\n"
+        "  draft_prefetch_pages_submitted: %lu\n"
+        "  draft_prefetch_pages_resident: %lu\n"
+        "  draft_retain_pins: %lu\n"
+        "  draft_tid2eid_pages: %lu\n"
+        "  draft_cold_pages: %lu\n"
+        "  draft_tid2eid_cold: %lu\n"
+        "  draft_tid2eid_hits_in_ensure: %lu\n"
+        "  draft_oracle_skips: %lu\n"
+        "  draft_window_opens: %lu\n"
+        "  draft_window_closes: %lu\n"
+        "  draft_prefetch_queue_blocked: %lu\n"
+        "  draft_prefetch_harvested: %lu\n"
+        "  draft_hot_records: %lu\n"
+        "  oracle_sample_fires: %lu\n"
+        "  oracle_draft_fires: %lu\n"
+        "  oracle_pred_pages: %lu\n"
+        "  oracle_actual_hash_pages: %lu\n"
+        "  oracle_tp: %lu\n"
+        "  oracle_fn: %lu\n"
+        "  oracle_fp: %lu\n"
+        "  oracle_pages_submitted: %lu\n"
+        "  oracle_pages_free_slot: %lu\n"
+        "  oracle_pages_evict_slot: %lu\n"
+        "  oracle_hash_slots_freed: %lu\n"
+        "  oracle_protect_pins: %lu\n"
+        "  oracle_sticky_pins: %lu\n"
+        "  sticky_l2_pins: %lu\n"
+        "  sticky_l2_hits_in_ensure: %lu\n"
+        "  sticky_l2_promotions: %lu\n"
+        "  sticky_l2_demotions: %lu\n"
+        "  sticky_spec_fires: %lu\n"
+        "  sticky_spec_pages_submitted: %lu\n"
+        "  sticky_spec_pages_resident: %lu\n"
+        "  ensure_batch_calls: %lu\n"
+        "  ensure_batch_pages: %lu\n"
+        "  ensure_batch_max_n: %lu\n"
+        "  ensure_batch_avg_n: %.2f\n"
+        "  ensure_batch_gb_s: %.3f\n"
+        "  ensure_batch_submit_ms: %.1f\n"
+        "  ensure_batch_wait_ms: %.1f\n"
+        "  ensure_batch_timeouts: %lu\n",
         (unsigned long) s.page_ins,
         (unsigned long) s.evictions,
         (unsigned long) s.prefetch_hits,
@@ -648,7 +1182,53 @@ void WeightPager::log_stats_summary() {
         (unsigned long) s.cross_layer_hit_in_ensure,
         (unsigned long) s.routing_ptrs_set,
         (unsigned long) s.routing_ptrs_consumed,
-        (unsigned long) s.routing_ptrs_discarded_unconsumed);
+        (unsigned long) s.routing_ptrs_discarded_unconsumed,
+        (unsigned long) s.draft_prefetch_calls,
+        (unsigned long) s.draft_prefetch_pages_submitted,
+        (unsigned long) s.draft_prefetch_pages_resident,
+        (unsigned long) s.draft_retain_pins,
+        (unsigned long) s.draft_tid2eid_pages,
+        (unsigned long) s.draft_cold_pages,
+        (unsigned long) s.draft_tid2eid_cold,
+        (unsigned long) s.draft_tid2eid_hits_in_ensure,
+        (unsigned long) s.draft_oracle_skips,
+        (unsigned long) s.draft_window_opens,
+        (unsigned long) s.draft_window_closes,
+        (unsigned long) s.draft_prefetch_queue_blocked,
+        (unsigned long) s.draft_prefetch_harvested,
+        (unsigned long) s.draft_hot_records,
+        (unsigned long) s.oracle_sample_fires,
+        (unsigned long) s.oracle_draft_fires,
+        (unsigned long) s.oracle_pred_pages,
+        (unsigned long) s.oracle_actual_hash_pages,
+        (unsigned long) s.oracle_tp,
+        (unsigned long) s.oracle_fn,
+        (unsigned long) s.oracle_fp,
+        (unsigned long) s.oracle_pages_submitted,
+        (unsigned long) s.oracle_pages_free_slot,
+        (unsigned long) s.oracle_pages_evict_slot,
+        (unsigned long) s.oracle_hash_slots_freed,
+        (unsigned long) s.oracle_protect_pins,
+        (unsigned long) s.oracle_sticky_pins,
+        (unsigned long) s.sticky_l2_pins,
+        (unsigned long) s.sticky_l2_hits_in_ensure,
+        (unsigned long) s.sticky_l2_promotions,
+        (unsigned long) s.sticky_l2_demotions,
+        (unsigned long) s.sticky_spec_fires,
+        (unsigned long) s.sticky_spec_pages_submitted,
+        (unsigned long) s.sticky_spec_pages_resident,
+        (unsigned long) s.ensure_batch_calls,
+        (unsigned long) s.ensure_batch_pages,
+        (unsigned long) s.ensure_batch_max_n,
+        (s.ensure_batch_calls > 0
+             ? (double) s.ensure_batch_pages / (double) s.ensure_batch_calls
+             : 0.0),
+        (s.ensure_batch_seconds > 0.0
+             ? ((double) s.ensure_batch_bytes / 1e9) / s.ensure_batch_seconds
+             : 0.0),
+        s.ensure_batch_submit_seconds * 1e3,
+        s.ensure_batch_wait_seconds * 1e3,
+        (unsigned long) s.ensure_batch_timeouts);
     if (s.dense_prefetch_submitted > 0) {
         LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                        (unsigned long) s.dense_prefetch_submitted);
@@ -762,6 +1342,155 @@ bool WeightPager::try_add_graph_pin_page(const void * graph_key, int page_idx, s
     return true;
 }
 
+void WeightPager::note_draft_tid2eid_ensure_(int page_idx) {
+    if (page_idx >= 0 &&
+        page_idx < (int) draft_tid2eid_mark_.size() &&
+        draft_tid2eid_mark_[page_idx]) {
+        ++stats_.draft_tid2eid_hits_in_ensure;
+        if (sticky_l2_enabled_ && page_idx < (int) sticky_l2_score_.size()) {
+            if (sticky_l2_score_[page_idx] != 0xffffffffu) {
+                ++sticky_l2_score_[page_idx];
+            }
+            ++sticky_l2_hits_since_refresh_;
+            sticky_l2_refresh_if_due_("ensure");
+        }
+    }
+    if (sticky_l2_enabled_ &&
+        page_idx >= 0 &&
+        page_idx < (int) sticky_l2_mark_.size() &&
+        sticky_l2_mark_[page_idx]) {
+        ++stats_.sticky_l2_hits_in_ensure;
+    }
+}
+
+bool WeightPager::draft_retain_contains_(int page_idx) const {
+    for (int p : draft_retain_pages_) {
+        if (p == page_idx) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void WeightPager::sticky_l2_refresh_if_due_(const char * reason) {
+    if (!sticky_l2_enabled_) {
+        return;
+    }
+    // ~once per ~2 tokens of MoE layers (n_layer~40) with per-route credits.
+    const int refresh_every = std::max(64, sticky_l2_max_pages_ * 2);
+    if (sticky_l2_hits_since_refresh_ >= refresh_every) {
+        sticky_l2_refresh_(reason);
+    }
+}
+
+void WeightPager::sticky_l2_refresh_(const char * reason) {
+    if (!initialized_ || !sticky_l2_enabled_ || sticky_l2_score_.empty()) {
+        return;
+    }
+
+    // Pin set: currently resident high-score pages only (eviction shield).
+    // Cold high-score pages are handled by prefetch_sticky_hot_experts().
+    std::vector<std::pair<uint32_t, int>> candidates;
+    candidates.reserve(sticky_l2_score_.size());
+    for (int p = 0; p < (int) sticky_l2_score_.size(); ++p) {
+        const uint32_t score = sticky_l2_score_[p];
+        if (score == 0) {
+            continue;
+        }
+        if (p >= catalog_.size() || catalog_.at(p).is_pinned) {
+            continue;
+        }
+        if (p >= (int) page_loaded_.size() || !page_loaded_[p]) {
+            continue;
+        }
+        if (p >= (int) page_to_slot_.size() || page_to_slot_[p] < 0) {
+            continue;
+        }
+        candidates.push_back({ score, p });
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const std::pair<uint32_t, int> & a, const std::pair<uint32_t, int> & b) {
+                  if (a.first != b.first) {
+                      return a.first > b.first;
+                  }
+                  return a.second < b.second;
+              });
+    if ((int) candidates.size() > sticky_l2_max_pages_) {
+        candidates.resize((size_t) sticky_l2_max_pages_);
+    }
+
+    std::vector<bool> want(sticky_l2_mark_.size(), false);
+    for (const auto & c : candidates) {
+        want[(size_t) c.second] = true;
+    }
+
+    int promotions = 0;
+    int demotions = 0;
+    std::vector<int> next_pages;
+    next_pages.reserve(candidates.size());
+
+    for (int p : sticky_l2_pages_) {
+        if (p < 0 || p >= (int) sticky_l2_mark_.size()) {
+            continue;
+        }
+        if (want[(size_t) p]) {
+            next_pages.push_back(p);
+            continue;
+        }
+        if (sticky_l2_pinned_[p]) {
+            unpin_page(p);
+            sticky_l2_pinned_[p] = false;
+        }
+        sticky_l2_mark_[p] = false;
+        ++demotions;
+    }
+
+    for (const auto & c : candidates) {
+        const int p = c.second;
+        if (!sticky_l2_mark_[p]) {
+            sticky_l2_mark_[p] = true;
+            ++promotions;
+            next_pages.push_back(p);
+        }
+        if (!sticky_l2_pinned_[p] && !draft_retain_contains_(p)) {
+            pin_page(p);
+            sticky_l2_pinned_[p] = true;
+        }
+    }
+
+    sticky_l2_pages_.swap(next_pages);
+    sticky_l2_hits_since_refresh_ = 0;
+    stats_.sticky_l2_promotions += (uint64_t) promotions;
+    stats_.sticky_l2_demotions += (uint64_t) demotions;
+
+    if (sticky_l2_stats_ && (promotions > 0 || demotions > 0)) {
+        int pins = 0;
+        for (bool pinned : sticky_l2_pinned_) {
+            if (pinned) {
+                ++pins;
+            }
+        }
+        LLAMA_LOG_WARN("sticky-l2: reason=%s candidates=%d pins=%d promotions=%d demotions=%d\n",
+                       reason != nullptr ? reason : "refresh",
+                       (int) candidates.size(), pins, promotions, demotions);
+    }
+}
+
+void WeightPager::release_sticky_l2_() {
+    if (sticky_l2_pinned_.empty()) {
+        return;
+    }
+    for (int p = 0; p < (int) sticky_l2_pinned_.size(); ++p) {
+        if (sticky_l2_pinned_[p]) {
+            unpin_page(p);
+            sticky_l2_pinned_[p] = false;
+        }
+    }
+    std::fill(sticky_l2_mark_.begin(), sticky_l2_mark_.end(), false);
+    sticky_l2_pages_.clear();
+    sticky_l2_hits_since_refresh_ = 0;
+}
+
 void * WeightPager::ensure(int page_idx) {
     if (!initialized_)                                         return nullptr;
     if (page_idx < 0 || page_idx >= catalog_.size())           return nullptr;
@@ -779,6 +1508,8 @@ void * WeightPager::ensure(int page_idx) {
     if (m_check.is_pinned) {
         return m_check.resident_ptr;
     }
+
+    note_draft_tid2eid_ensure_(page_idx);
 
     const bool cross_layer_candidate =
         page_idx >= 0 &&
@@ -907,6 +1638,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             continue;
         }
         if (page_loaded_[p]) {                   // hit — bump LRU, pin, harvest
+            note_draft_tid2eid_ensure_(p);
             const int s = page_to_slot_[p];
             pool_.mark_used(s);
             pool_.pin_slot(s);
@@ -918,6 +1650,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             // Reserved by an in-flight (e.g. cross-layer) prefetch. Harvest via
             // the tested ensure() path (waits on the prefetch, or syncs), then
             // pin the result. Not part of the concurrent batch.
+            // ensure() notes draft tid2eid hits.
             void * ptr = ensure(p);
             if (ptr != nullptr) {
                 pool_.pin_slot(page_to_slot_[p]);
@@ -926,6 +1659,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
             continue;
         }
+        note_draft_tid2eid_ensure_(p);
         const int s = pool_.alloc_slot(m.size);
         if (s < 0) { ++stats_.sync_fallbacks; continue; }  // pool exhausted (rare)
         ensure_slot_map_(s);
@@ -937,6 +1671,206 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     }
     if (misses.empty()) return;
 
+    // Optional: multi-QD O_DIRECT host bounce → H2D.
+    // WP_ENSURE_BATCH_HOST=1. Cold random buffered ~1.1 GB/s; O_DIRECT ~6.2.
+    // GGUF offs are not 512-aligned → align-down bounce then H2D payload slice.
+    static const int s_batch_host = []() {
+        const char * e = std::getenv("WP_ENSURE_BATCH_HOST");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+    if (s_batch_host && ensure_host_bufs_ready_(misses.size(), catalog_.max_page_size())) {
+        const auto io_t0 = std::chrono::steady_clock::now();
+        struct HostJob {
+            int      file_idx;
+            int      fd;       // O_DIRECT fd
+            uint64_t off;      // logical (possibly unaligned) file offset
+            uint64_t base;     // 512-aligned O_DIRECT offset
+            size_t   size;     // payload bytes
+            void *   dst;      // 4k-aligned host bounce (>= size+1k)
+            size_t   buf_cap;
+            size_t   prefix;   // bytes of bounce pad before payload
+            size_t   nbytes;   // 512-padded O_DIRECT byte count
+            bool     queued;
+            bool     seen;
+            bool     ok;
+        };
+        std::vector<HostJob> jobs;
+        jobs.reserve(misses.size());
+        int n_od = 0;
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const PageMeta & m = catalog_.at(misses[k].page);
+            const int od = ensure_odirect_fd_((int) m.file_idx);
+            if (od >= 0) {
+                ++n_od;
+            }
+            jobs.push_back(HostJob{
+                (int) m.file_idx, od, m.file_offset, 0, m.size, ensure_host_bufs_[k],
+                ensure_host_buf_bytes_, 0, 0, false, false, false
+            });
+        }
+        int n_queued = 0;
+        const auto tp_jobs = std::chrono::steady_clock::now();
+        for (std::size_t k = 0; k < jobs.size(); ++k) {
+            HostJob & j = jobs[k];
+            if (j.fd < 0 || j.dst == nullptr || j.size == 0) {
+                continue;
+            }
+
+            j.base   = j.off & ~511ULL;
+            j.prefix = (size_t) (j.off - j.base);
+            j.nbytes = (j.prefix + j.size + 511) & ~(size_t) 511;
+            if (j.nbytes > j.buf_cap || j.nbytes > UINT_MAX) {
+                continue;
+            }
+            j.queued = true;
+            ++n_queued;
+        }
+
+        const auto tp_prep = std::chrono::steady_clock::now();
+        std::vector<EnsureODirectReadJob> read_jobs(jobs.size());
+        const int n_workers = ensure_odirect_worker_count_((size_t) n_queued);
+        bool submit_failed = false;
+        int n_submitted = 0;
+        if (n_queued > 0 && ensure_odirect_workers_ready_(n_workers)) {
+            {
+                std::lock_guard<std::mutex> lock(ensure_odirect_mu_);
+                for (std::size_t k = 0; k < jobs.size(); ++k) {
+                    HostJob & j = jobs[k];
+                    if (!j.queued) {
+                        continue;
+                    }
+                    EnsureODirectReadJob & r = read_jobs[k];
+                    r.fd   = j.fd;
+                    r.off  = j.base;
+                    r.size = j.nbytes;
+                    r.dst  = j.dst;
+                    ensure_odirect_queue_.push_back(&r);
+                    ++n_submitted;
+                }
+            }
+            ensure_odirect_cv_.notify_all();
+        } else if (n_queued > 0) {
+            submit_failed = true;
+        }
+
+        const auto tp_submit = std::chrono::steady_clock::now();
+        int n_seen = 0;
+        if (n_submitted > 0) {
+            std::unique_lock<std::mutex> lock(ensure_odirect_mu_);
+            ensure_odirect_done_cv_.wait(lock, [&read_jobs, n_submitted]() {
+                int n_done = 0;
+                for (const EnsureODirectReadJob & r : read_jobs) {
+                    if (r.done) {
+                        ++n_done;
+                    }
+                }
+                return n_done >= n_submitted;
+            });
+            for (std::size_t k = 0; k < jobs.size(); ++k) {
+                HostJob & j = jobs[k];
+                EnsureODirectReadJob & r = read_jobs[k];
+                if (!j.queued || !r.done) {
+                    continue;
+                }
+                j.seen = true;
+                j.ok = r.ok;
+                ++n_seen;
+                if (!r.ok) {
+                    static int s_read_warn = 0;
+                    if (s_read_warn < 3) {
+                        LLAMA_LOG_WARN("wp::ensure_batch: HOST O_DIRECT pread failed fd=%d off=%llu size=%zu err=%s\n",
+                                       r.fd, (unsigned long long) r.off, r.size,
+                                       r.err < 0 ? strerror(-r.err) : "short read");
+                        ++s_read_warn;
+                    }
+                }
+            }
+        }
+        {
+            const auto tp_reap = std::chrono::steady_clock::now();
+            auto msd = [](auto a2, auto b2){ return std::chrono::duration<double,std::milli>(b2-a2).count(); };
+            static double s_jobs=0,s_prep=0,s_sub=0,s_reap=0; static long s_n=0; static long s_pg=0;
+            s_jobs += msd(io_t0, tp_jobs);
+            s_prep += msd(tp_jobs, tp_prep);
+            s_sub  += msd(tp_prep, tp_submit);
+            s_reap += msd(tp_submit, tp_reap);
+            s_pg   += n_seen;
+            if (++s_n % 1000 == 0) {
+                LLAMA_LOG_WARN("wp ODIRECT phase cum ms @%ld calls (%ld pages): jobs=%.0f prep=%.0f submit=%.0f reap=%.0f\n",
+                               s_n, s_pg, s_jobs, s_prep, s_sub, s_reap);
+            }
+        }
+        (void) submit_failed;
+        const double read_seconds = seconds_since(io_t0);
+        size_t batch_bytes = 0;
+        int    batch_ok_n  = 0;
+#if defined(GGML_USE_HIP)
+        // Queue all H2Ds then one device sync (overlap PCIe copies).
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const Miss & mm = misses[k];
+            const PageMeta & m = catalog_.at(mm.page);
+            void * vram = slot_ptr_(mm.slot);
+            if (!jobs[k].ok || vram == nullptr) {
+                continue;
+            }
+            const void * src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+            hipError_t err = hipMemcpyAsync(vram, src, m.size,
+                                            hipMemcpyHostToDevice, nullptr);
+            if (err != hipSuccess) {
+                jobs[k].ok = false;
+            }
+        }
+        hipDeviceSynchronize();
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const Miss & mm = misses[k];
+            const PageMeta & m = catalog_.at(mm.page);
+            void * vram = slot_ptr_(mm.slot);
+            if (jobs[k].ok && vram != nullptr &&
+                zero_device_padding(vram, m.size, pool_.slot_size(mm.slot))) {
+                page_to_slot_[mm.page] = mm.slot;
+                page_loaded_[mm.page]  = true;
+                slot_to_page_[mm.slot] = mm.page;
+                pool_.mark_used(mm.slot);
+                batch_bytes += m.size;
+                ++batch_ok_n;
+                out_ptrs[mm.out_i] = vram;
+            } else {
+                const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+            }
+        }
+        static int s_host_path_log = 0;
+        if (s_host_path_log < 1) {
+            LLAMA_LOG_WARN("wp::ensure_batch: HOST path O_DIRECT=%d/%d misses first batch\n",
+                           n_od, (int) misses.size());
+            ++s_host_path_log;
+        }
+#else
+        (void) n_od;
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            const int s = page_in_sync_(misses[k].page, /*reuse_slot=*/misses[k].slot);
+            out_ptrs[misses[k].out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+        }
+#endif
+        const double batch_seconds = seconds_since(io_t0);
+        if (batch_ok_n > 0) {
+            stats_.page_ins  += (uint64_t) batch_ok_n;
+            stats_.io_bytes  += (uint64_t) batch_bytes;
+            stats_.io_seconds += batch_seconds;
+            ++stats_.ensure_batch_calls;
+            stats_.ensure_batch_pages   += (uint64_t) batch_ok_n;
+            stats_.ensure_batch_bytes   += (uint64_t) batch_bytes;
+            stats_.ensure_batch_seconds += batch_seconds;
+            stats_.ensure_batch_submit_seconds += read_seconds; // host O_DIRECT phase
+            stats_.ensure_batch_wait_seconds   += (batch_seconds - read_seconds); // H2D
+            stats_.ensure_batch_n_sub_sum      += (uint64_t) batch_ok_n;
+            if ((uint64_t) batch_ok_n > stats_.ensure_batch_max_n) {
+                stats_.ensure_batch_max_n = (uint64_t) batch_ok_n;
+            }
+        }
+        return;
+    }
+
     // Pass 2 — issue all cold-miss reads. On the P2P/direct-to-device path the
     // reads land straight in the VRAM slots, so one io_uring batch keeps N reads
     // in flight at once (true QD=N). Off P2P the shared staging buffer can't
@@ -947,6 +1881,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         std::vector<uint64_t>           req_ids;
         reqs.reserve(misses.size());
         req_ids.reserve(misses.size());
+        // Wall-clock the whole multi-QD burst (submit → last wait), then
+        // attribute that one interval once. Recording per-page after waits
+        // (old) under-counted concurrent P2P BW (~0.4 vs real multi-GB/s).
+        const auto io_t0 = std::chrono::steady_clock::now();
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const PageMeta & m = catalog_.at(misses[k].page);
             const uint64_t rid = next_io_req_id_++;   // high-bit-tagged; disjoint from prefetch
@@ -956,18 +1894,27 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
         const int n_sub = file_io_->submit_batch(reqs);
         file_io_->flush();
+        const double submit_seconds = seconds_since(io_t0);
+        const auto wait_t0 = std::chrono::steady_clock::now();
         std::vector<bool> ok(misses.size(), false);
-        // submit_batch queues the prefix [0, n_sub) in order; the rejected
-        // tail (if any) stays ok[k]=false and sync-fallbacks below. Wait for
-        // each queued read by its OWN req_id: the FileIOLayer demux buffers any
-        // concurrent prefetch completion instead of discarding it, which is
-        // what previously leaked prefetch slots and collapsed effective QD.
-        for (std::size_t k = 0; k < (std::size_t) n_sub; ++k) {
-            IoResult r = file_io_->wait_for_req(req_ids[k], /*timeout_ms=*/-1);
-            ok[k] = (r.status == IoStatus::Ok &&
-                     r.bytes_read == (int) catalog_.at(misses[k].page).size);
+        // Wait per req via demuxing wait_for_req (foreign CQEs buffered in
+        // ready_). A multi-id wait_for_reqs was tried; it could busy-spin
+        // at load (97% CPU, never reach "model loaded") when ensure_batch
+        // fires during graph init. Ordered waits keep multi-QD overlap —
+        // I/O is already in flight from submit_batch; we only reap.
+        uint64_t n_timeout = 0;
+        for (int k = 0; k < n_sub; ++k) {
+            IoResult r = file_io_->wait_for_req(req_ids[(size_t) k], /*timeout_ms=*/-1);
+            ok[(size_t) k] = (r.status == IoStatus::Ok &&
+                              r.bytes_read == (int) catalog_.at(misses[(size_t) k].page).size);
+            if (!ok[(size_t) k]) {
+                ++n_timeout;
+            }
         }
-        const auto io_t0 = std::chrono::steady_clock::now();
+        const double wait_seconds = seconds_since(wait_t0);
+        const double batch_seconds = seconds_since(io_t0);
+        size_t batch_bytes = 0;
+        int    batch_ok_n  = 0;
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
@@ -976,13 +1923,31 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 page_loaded_[mm.page]  = true;
                 slot_to_page_[mm.slot] = mm.page;
                 pool_.mark_used(mm.slot);
-                record_page_in_(m.size, seconds_since(io_t0));
+                batch_bytes += m.size;
+                ++batch_ok_n;
                 out_ptrs[mm.out_i] = slot_ptr_(mm.slot);
             } else {
                 // read (or padding) failed — sync-fallback into the SAME pinned
                 // slot so the up-front pin/out_pinned bookkeeping stays valid.
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+            }
+        }
+        if (batch_ok_n > 0 || n_sub > 0) {
+            // One wall interval for the concurrent burst; page_ins += N.
+            stats_.page_ins  += (uint64_t) batch_ok_n;
+            stats_.io_bytes  += (uint64_t) batch_bytes;
+            stats_.io_seconds += batch_seconds;
+            ++stats_.ensure_batch_calls;
+            stats_.ensure_batch_pages   += (uint64_t) batch_ok_n;
+            stats_.ensure_batch_bytes   += (uint64_t) batch_bytes;
+            stats_.ensure_batch_seconds += batch_seconds;
+            stats_.ensure_batch_submit_seconds += submit_seconds;
+            stats_.ensure_batch_wait_seconds   += wait_seconds;
+            stats_.ensure_batch_timeouts       += n_timeout;
+            stats_.ensure_batch_n_sub_sum      += (uint64_t) n_sub;
+            if ((uint64_t) batch_ok_n > stats_.ensure_batch_max_n) {
+                stats_.ensure_batch_max_n = (uint64_t) batch_ok_n;
             }
         }
     } else {
@@ -1021,16 +1986,26 @@ void WeightPager::release_async_transfer_event(int event_handle) {
     transport_.release_event(event_handle);
 }
 
-bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch) {
+bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch,
+                                bool allow_evict) {
     if (!initialized_)                                          return false;
     if (page_idx < 0 || page_idx >= catalog_.size())            return false;
     if (catalog_.at(page_idx).is_pinned)                        return false;  // MAD-236: already resident, no slot needed
     if (page_to_slot_[page_idx] >= 0)                            return false;  // loaded or in flight
 
+    // Capacity gate: never alloc_slot (which may LRU-evict) if the prefetch
+    // scheduler cannot accept another submit. Evicting for a rejected submit
+    // destroys useful residents for no I/O (Codex draft-prefetch analysis).
+    if (prefetch_.free_queue_slots() <= 0) {
+        return false;
+    }
+
     const PageMeta & m = catalog_.at(page_idx);
 
-    // Allocate (or evict) a slot now so the prefetch knows where to land.
-    const int slot = pool_.alloc_slot(m.size);
+    // Allocate a slot. Sample oracle uses no-evict so we never thrash MoE
+    // working-set pages to make room for hash-layer speculation.
+    const int slot = allow_evict ? pool_.alloc_slot(m.size)
+                                 : pool_.alloc_slot_no_evict(m.size);
     if (slot < 0) return false;
     ensure_slot_map_(slot);
     void * dst = slot_ptr_(slot);
@@ -1069,7 +2044,8 @@ void WeightPager::tick() {
 }
 
 bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
-                                       bool count_dense_prefetch) {
+                                       bool count_dense_prefetch,
+                                       bool allow_evict) {
     if (!initialized_) return false;
     if (page_indices.empty()) return true;
 
@@ -1091,14 +2067,43 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
     }
     if (needed.empty()) return true;
 
+    // Capacity gate: only reserve pool slots for as many pages as the
+    // PrefetchScheduler can accept. Truncating is a successful partial
+    // prefetch (best-effort); allocating beyond free_queue_slots forces
+    // LRU evictions that are rolled back when submit_batch rejects — net
+    // thrash with zero I/O.
+    const int free_q = prefetch_.free_queue_slots();
+    if (free_q <= 0) {
+        return false;
+    }
+    if ((int) needed.size() > free_q) {
+        needed.resize((size_t) free_q);
+    }
+    // Sample oracle: also cap to free pool slots so we never LRU-evict.
+    if (!allow_evict) {
+        const int free_pool = pool_.n_free_unpinned();
+        if (free_pool <= 0) {
+            return false;
+        }
+        if ((int) needed.size() > free_pool) {
+            needed.resize((size_t) free_pool);
+        }
+    }
+
     // Reserve N slots up-front. On failure (any unable to alloc, e.g. all
     // currently pinned per MAD-231), release the prefix and report.
     std::vector<int> slots;
     slots.reserve(needed.size());
     for (size_t i = 0; i < needed.size(); ++i) {
         const PageMeta & m = catalog_.at(needed[i]);
-        const int s = pool_.alloc_slot(m.size);
+        const int s = allow_evict ? pool_.alloc_slot(m.size)
+                                  : pool_.alloc_slot_no_evict(m.size);
         if (s < 0) {
+            // Partial no-evict is OK (use free slots we already took).
+            if (!allow_evict && !slots.empty()) {
+                needed.resize(slots.size());
+                break;
+            }
             for (int prev : slots) {
                 pool_.release_slot(prev);
             }
@@ -1106,6 +2111,9 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
         }
         ensure_slot_map_(s);
         slots.push_back(s);
+    }
+    if (slots.empty()) {
+        return false;
     }
 
     // Wire the provisional page→slot bookkeeping (matches what prefetch_page
@@ -1228,6 +2236,1064 @@ void WeightPager::advise_layer_lookahead(int block_idx, int k) {
     for (const auto & r : ranges) {
         file_io_->advise_prefetch((int) r.fd_idx, r.offset, r.size);
     }
+}
+
+void WeightPager::record_active_expert_pages(const std::vector<int> & page_indices) {
+    if (page_indices.empty()) {
+        return;
+    }
+    // First MoE snap past hash layers: drop sample-oracle sticky pins so MoE
+    // can reclaim those slots. Hash pages remain resident and LRU-hot.
+    for (int p : page_indices) {
+        if (p >= 0 && p < catalog_.size()) {
+            release_sample_sticky_if_past_hash(catalog_.at(p).block_idx);
+            break;
+        }
+    }
+    std::vector<int> snap;
+    snap.reserve(page_indices.size() * 3);
+    auto push_unique = [&](int p) {
+        if (p < 0 || p >= catalog_.size()) {
+            return;
+        }
+        for (int q : snap) {
+            if (q == p) {
+                return;
+            }
+        }
+        snap.push_back(p);
+    };
+    for (int p : page_indices) {
+        push_unique(p);
+        // Expand to gate/up/down sisters for the same (block, expert).
+        if (p >= 0 && p < catalog_.size()) {
+            const PageMeta & m = catalog_.at(p);
+            if (m.is_sub_expert && m.block_idx >= 0 && m.expert_idx >= 0) {
+                for (int s : catalog_.pages_for_expert(m.block_idx, m.expert_idx)) {
+                    push_unique(s);
+                }
+            }
+        }
+    }
+    if (snap.empty()) {
+        return;
+    }
+    // WP_ROUTE_TRACE=<path>: dump per-MoE-op demand (layer + sister-expanded
+    // pages) for offline reuse-distance / Belady analysis. Inert when unset.
+    {
+        static std::ofstream * s_route_trace = []() -> std::ofstream * {
+            const char * v = std::getenv("WP_ROUTE_TRACE");
+            if (v == nullptr || v[0] == '\0') {
+                return nullptr;
+            }
+            return new std::ofstream(v, std::ios::out | std::ios::trunc);
+        }();
+        if (s_route_trace != nullptr && s_route_trace->is_open()) {
+            int blk = -1;
+            if (snap[0] >= 0 && snap[0] < catalog_.size()) {
+                blk = catalog_.at(snap[0]).block_idx;
+            }
+            (*s_route_trace) << blk;
+            for (int p : snap) {
+                (*s_route_trace) << ' ' << p;
+            }
+            (*s_route_trace) << '\n';
+            s_route_trace->flush();
+        }
+    }
+    // Real target routing is the strongest sticky signal (draft tid2eid alone
+    // left sticky_l2_pins~3 with almost no score growth without a draft model).
+    if (sticky_l2_enabled_) {
+        for (int p : snap) {
+            if (p >= 0 && p < (int) sticky_l2_score_.size() &&
+                sticky_l2_score_[p] != 0xffffffffu) {
+                ++sticky_l2_score_[p];
+            }
+        }
+        // One credit per routing event (not per page) so refresh is not every
+        // MoE op — rapid promote/demote thrash cost more than pin hits.
+        ++sticky_l2_hits_since_refresh_;
+        sticky_l2_refresh_if_due_("route");
+    }
+    // Oracle precision: only hash-layer pages are in the prediction set.
+    for (int p : snap) {
+        if (!is_tid2eid_hash_page_(p)) {
+            continue;
+        }
+        ++stats_.oracle_actual_hash_pages;
+        if (p < (int) oracle_pred_mark_.size() && oracle_pred_mark_[p]) {
+            if (p < (int) oracle_pred_hit_.size() && !oracle_pred_hit_[p]) {
+                oracle_pred_hit_[p] = true;
+                ++stats_.oracle_tp;
+            }
+        } else {
+            ++stats_.oracle_fn;
+        }
+    }
+    hot_expert_history_.push_back(std::move(snap));
+    if ((int) hot_expert_history_.size() > kHotHistoryMax) {
+        hot_expert_history_.erase(hot_expert_history_.begin());
+    }
+    ++stats_.draft_hot_records;
+}
+
+void WeightPager::clear_draft_retain_() {
+    for (int p : draft_retain_pages_) {
+        if (sticky_l2_enabled_ &&
+            p >= 0 &&
+            p < (int) sticky_l2_mark_.size() &&
+            sticky_l2_mark_[p] &&
+            !sticky_l2_pinned_[p] &&
+            p < (int) page_loaded_.size() &&
+            page_loaded_[p]) {
+            pin_page(p);
+            sticky_l2_pinned_[p] = true;
+        }
+        unpin_page(p);
+    }
+    draft_retain_pages_.clear();
+    clear_draft_tid2eid_mark_();
+}
+
+void WeightPager::clear_draft_tid2eid_mark_() {
+    if (draft_tid2eid_mark_.empty()) {
+        return;
+    }
+    std::fill(draft_tid2eid_mark_.begin(), draft_tid2eid_mark_.end(), false);
+}
+
+void WeightPager::union_push_(std::vector<int> & dst, int page_idx, int cap) const {
+    if (page_idx < 0 || page_idx >= catalog_.size()) {
+        return;
+    }
+    if ((int) dst.size() >= cap) {
+        return;
+    }
+    for (int q : dst) {
+        if (q == page_idx) {
+            return;
+        }
+    }
+    dst.push_back(page_idx);
+}
+
+void WeightPager::register_tid2eid_host(int block_idx, int n_expert_used, int n_vocab,
+                                        const int32_t * host_data) {
+    if (block_idx < 0 || n_expert_used <= 0 || n_vocab <= 0 || host_data == nullptr) {
+        return;
+    }
+    const size_t n = (size_t) n_expert_used * (size_t) n_vocab;
+    // Replace existing table for this block if re-registered.
+    for (Tid2EidTable & t : tid2eid_tables_) {
+        if (t.block_idx == block_idx) {
+            t.n_expert_used = n_expert_used;
+            t.n_vocab       = n_vocab;
+            t.data.assign(host_data, host_data + n);
+            return;
+        }
+    }
+    Tid2EidTable t;
+    t.block_idx     = block_idx;
+    t.n_expert_used = n_expert_used;
+    t.n_vocab       = n_vocab;
+    t.data.assign(host_data, host_data + n);
+    tid2eid_tables_.push_back(std::move(t));
+    LLAMA_LOG_INFO("wp::WeightPager: tid2eid host table blk=%d n_used=%d n_vocab=%d (%.1f MiB)\n",
+                   block_idx, n_expert_used, n_vocab,
+                   (double) (n * sizeof(int32_t)) / (1024.0 * 1024.0));
+}
+
+void WeightPager::collect_tid2eid_pages_(const int32_t * tokens, int n_tokens,
+                                         std::vector<int> & out, int cap) const {
+    if (tokens == nullptr || n_tokens <= 0 || tid2eid_tables_.empty()) {
+        return;
+    }
+    for (const Tid2EidTable & t : tid2eid_tables_) {
+        for (int ti = 0; ti < n_tokens; ++ti) {
+            const int32_t tok = tokens[ti];
+            if (tok < 0 || tok >= t.n_vocab) {
+                continue;
+            }
+            const size_t base = (size_t) tok * (size_t) t.n_expert_used;
+            for (int k = 0; k < t.n_expert_used; ++k) {
+                const int32_t eid = t.data[base + (size_t) k];
+                if (eid < 0) {
+                    continue;
+                }
+                for (int p : catalog_.pages_for_expert(t.block_idx, (int) eid)) {
+                    union_push_(out, p, cap);
+                    if ((int) out.size() >= cap) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void WeightPager::set_draft_window(int n_draft) {
+    if (n_draft <= 0) {
+        ++stats_.draft_window_closes;
+        clear_draft_retain_();
+        draft_window_ = 0;
+        return;
+    }
+    ++stats_.draft_window_opens;
+    draft_window_ = n_draft;
+}
+
+int WeightPager::harvest_ready_prefetches_() {
+    if (!initialized_) {
+        return 0;
+    }
+    prefetch_.tick();
+    int n = 0;
+    // 1) Commit Done prefetches still mapped in the pool.
+    for (int p = 0; p < (int) page_to_slot_.size(); ++p) {
+        if (page_to_slot_[p] < 0 || page_loaded_[p]) {
+            continue;
+        }
+        if (prefetch_.is_loaded(p)) {
+            page_loaded_[p] = true;
+            pool_.mark_used(page_to_slot_[p]);
+            double seconds = 0.0;
+            if (p < (int) prefetch_started_at_.size() &&
+                prefetch_started_at_[p] != std::chrono::steady_clock::time_point{}) {
+                seconds = seconds_since(prefetch_started_at_[p]);
+                prefetch_started_at_[p] = std::chrono::steady_clock::time_point{};
+            }
+            record_page_in_(catalog_.at(p).size, seconds);
+            prefetch_.reap(p);
+            ++n;
+            continue;
+        }
+        if (prefetch_.is_failed(p)) {
+            const int slot = page_to_slot_[p];
+            prefetch_.reap(p);
+            page_to_slot_[p] = -1;
+            if (slot >= 0 && slot < (int) slot_to_page_.size()) {
+                slot_to_page_[slot] = -1;
+            }
+            pool_.release_slot(slot);
+            ++n;
+            continue;
+        }
+        if (!prefetch_.has_page(p)) {
+            const int slot = page_to_slot_[p];
+            page_to_slot_[p] = -1;
+            if (slot >= 0 && slot < (int) slot_to_page_.size()) {
+                slot_to_page_[slot] = -1;
+            }
+            pool_.release_slot(slot);
+            ++n;
+        }
+    }
+    // 2) Free scheduler slots still holding Done/Failed after pool eviction
+    //    dropped the WeightPager mapping (the free_q=0 deadlock: depth-4
+    //    Done orphans never reaped because ensure never touched those pages).
+    n += prefetch_.reap_finished();
+    return n;
+}
+
+int WeightPager::submit_cold_waves_(const std::vector<int> & cold, bool allow_evict) {
+    if (cold.empty()) {
+        return 0;
+    }
+    // Default 1 wave: at most free_queue_slots (~4) cold submits per fire.
+    // Multi-wave (64) thrash-inflated page_ins and hurt t/s when draft tokens
+    // diverge from the actual sample (accept=0 strip mode).
+    static int s_max_waves = -1;
+    if (s_max_waves < 0) {
+        const char * v = std::getenv("WP_DRAFT_PREFETCH_WAVES");
+        s_max_waves = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 1;
+        if (s_max_waves < 1) {
+            s_max_waves = 1;
+        }
+    }
+
+    int submitted = 0;
+    size_t i = 0;
+    for (int wave = 0; wave < s_max_waves && i < cold.size(); ++wave) {
+        stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+        int free_q = prefetch_.free_queue_slots();
+        if (free_q <= 0) {
+            // Drain completions: Done slots stuck unreaped were the main
+            // free_q=0 cause (depth 4, only ensure() used to reap).
+            for (int d = 0; d < 64 && free_q <= 0; ++d) {
+                tick();
+                stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+                free_q = prefetch_.free_queue_slots();
+            }
+            if (free_q <= 0) {
+                ++stats_.draft_prefetch_queue_blocked;
+                break;
+            }
+        }
+        if (!allow_evict) {
+            const int free_pool = pool_.n_free_unpinned();
+            if (free_pool <= 0) {
+                break; // do not thrash; ensure path will load later
+            }
+            if (free_q > free_pool) {
+                free_q = free_pool;
+            }
+        }
+
+        std::vector<int> batch;
+        batch.reserve((size_t) free_q);
+        while (i < cold.size() && (int) batch.size() < free_q) {
+            const int p = cold[i++];
+            if (p < 0 || p >= (int) page_to_slot_.size()) {
+                continue;
+            }
+            if (page_to_slot_[p] >= 0) {
+                continue; // already reserved / harvested
+            }
+            batch.push_back(p);
+        }
+        if (batch.empty()) {
+            continue;
+        }
+
+        if (prefetch_pages_batch(batch, /*count_dense_prefetch=*/false, allow_evict)) {
+            for (int p : batch) {
+                if (p >= 0 && p < (int) page_to_slot_.size() && page_to_slot_[p] >= 0) {
+                    ++submitted;
+                }
+            }
+        } else {
+            for (int p : batch) {
+                if (prefetch_page(p, /*count_dense_prefetch=*/false, allow_evict)) {
+                    ++submitted;
+                }
+            }
+        }
+        tick(); // flush SQEs for this wave
+    }
+    // Final harvest of anything that completed during submit.
+    stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+    return submitted;
+}
+
+bool WeightPager::draft_oracle_should_run() {
+    if (!initialized_) {
+        return false;
+    }
+    static int s_adaptive = -1;
+    if (s_adaptive < 0) {
+        const char * v = std::getenv("WP_DRAFT_ADAPTIVE");
+        s_adaptive = (v != nullptr && v[0] == '0') ? 0 : 1;
+    }
+    if (s_adaptive == 0) {
+        return true;
+    }
+
+    static int s_always_first = -1;
+    if (s_always_first < 0) {
+        const char * v = std::getenv("WP_DRAFT_ALWAYS_FIRST");
+        s_always_first = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 4;
+        if (s_always_first < 0) {
+            s_always_first = 0;
+        }
+    }
+    static int s_opportunities = 0;
+    const int opp = s_opportunities++;
+    if (opp < s_always_first) {
+        return true;
+    }
+
+    // Update hit ratio for the window since the last draft fire.
+    if (last_tid2eid_n_ > 0) {
+        const uint64_t wh = stats_.draft_tid2eid_hits_in_ensure - hits_at_last_fire_;
+        last_hit_ratio_ = (float) wh / (float) last_tid2eid_n_;
+    }
+
+    // Fully warm hash set: nothing cold last fire.
+    static int s_warm_need = -1;
+    if (s_warm_need < 0) {
+        const char * v = std::getenv("WP_DRAFT_WARM_STREAK");
+        s_warm_need = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 2;
+        if (s_warm_need < 1) {
+            s_warm_need = 1;
+        }
+    }
+    if (draft_warm_streak_ >= s_warm_need) {
+        ++stats_.draft_oracle_skips;
+        sticky_l2_refresh_("adaptive-skip");
+        return false;
+    }
+
+    // Explicit duty cycle (manual override).
+    static int s_every = -1;
+    if (s_every < 0) {
+        const char * v = std::getenv("WP_DRAFT_EVERY");
+        s_every = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 1;
+        if (s_every < 1) {
+            s_every = 1;
+        }
+    }
+
+    // Hit-based duty: if last window barely used draft pages, draft less often.
+    // High hit ratio => always run (oracle is paying off).
+    int every = s_every;
+    if (last_tid2eid_n_ >= 8 && last_hit_ratio_ < 0.10f) {
+        every = std::max(every, 2);
+    } else if (last_tid2eid_n_ >= 8 && last_hit_ratio_ > 0.30f) {
+        every = 1;
+    }
+
+    if (every > 1 && ((opp - s_always_first) % every) != 0) {
+        ++stats_.draft_oracle_skips;
+        sticky_l2_refresh_("duty-skip");
+        return false;
+    }
+    return true;
+}
+
+bool WeightPager::is_tid2eid_hash_page_(int page_idx) const {
+    if (page_idx < 0 || page_idx >= catalog_.size() || tid2eid_tables_.empty()) {
+        return false;
+    }
+    const PageMeta & m = catalog_.at(page_idx);
+    if (!m.is_sub_expert || m.block_idx < 0) {
+        return false;
+    }
+    for (const Tid2EidTable & t : tid2eid_tables_) {
+        if (t.block_idx == m.block_idx) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int WeightPager::free_stale_hash_slots_(int n_need, const std::vector<int> & keep_pages) {
+    if (n_need <= 0 || !initialized_) {
+        return 0;
+    }
+    std::vector<bool> keep((size_t) catalog_.size(), false);
+    for (int p : keep_pages) {
+        if (p >= 0 && p < (int) keep.size()) {
+            keep[(size_t) p] = true;
+        }
+    }
+    // Candidates: resident unpinned hash pages not needed for this fire.
+    // Prefer low hit_count (cold hash leftovers) over recently ensure-hit ones.
+    struct Cand { int page; uint32_t hits; };
+    std::vector<Cand> cands;
+    cands.reserve((size_t) n_need * 4);
+    for (int p = 0; p < (int) catalog_.size(); ++p) {
+        if (keep[(size_t) p] || !is_tid2eid_hash_page_(p)) {
+            continue;
+        }
+        if (p >= (int) page_to_slot_.size() || page_to_slot_[p] < 0) {
+            continue;
+        }
+        if (p >= (int) page_loaded_.size() || !page_loaded_[p]) {
+            continue;
+        }
+        const int slot = page_to_slot_[p];
+        if (pool_.is_pinned(slot)) {
+            continue;
+        }
+        if (sticky_l2_enabled_ &&
+            p < (int) sticky_l2_pinned_.size() &&
+            sticky_l2_pinned_[p]) {
+            continue;
+        }
+        // Skip pages that scored oracle TP this window — still hot for hash.
+        if (p < (int) oracle_pred_hit_.size() && oracle_pred_hit_[p]) {
+            continue;
+        }
+        cands.push_back({ p, pool_.hit_count(slot) });
+        if ((int) cands.size() >= n_need * 8) {
+            break;
+        }
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand & a, const Cand & b) { return a.hits < b.hits; });
+    int freed = 0;
+    for (const Cand & c : cands) {
+        if (freed >= n_need) {
+            break;
+        }
+        const int p = c.page;
+        if (p >= (int) page_to_slot_.size() || page_to_slot_[p] < 0) {
+            continue;
+        }
+        const int slot = page_to_slot_[p];
+        if (pool_.is_pinned(slot)) {
+            continue;
+        }
+        on_pool_evict_(slot);
+        pool_.release_slot(slot);
+        ++freed;
+    }
+    stats_.oracle_hash_slots_freed += (uint64_t) freed;
+    return freed;
+}
+
+void WeightPager::clear_sample_sticky_() {
+    for (int p : sample_sticky_pages_) {
+        unpin_page(p);
+    }
+    sample_sticky_pages_.clear();
+}
+
+void WeightPager::release_sample_sticky_if_past_hash(int block_idx) {
+    if (sample_sticky_pages_.empty() || block_idx < 0) {
+        return;
+    }
+    int max_hash = -1;
+    for (const Tid2EidTable & t : tid2eid_tables_) {
+        if (t.block_idx > max_hash) {
+            max_hash = t.block_idx;
+        }
+    }
+    // No hash tables registered: never auto-release on layer index.
+    if (max_hash < 0) {
+        return;
+    }
+    if (block_idx > max_hash) {
+        clear_sample_sticky_();
+    }
+}
+
+void WeightPager::install_sample_sticky_(const std::vector<int> & tid_pages, int cap) {
+    clear_sample_sticky_();
+    if (cap < 1 || tid_pages.empty()) {
+        return;
+    }
+    // Pin *in-flight only*. Do not pin or mark_used resident pages: both
+    // starve MoE LRU and were measured at +~700 page_ins with submitted=0.
+    sample_sticky_pages_.reserve((size_t) cap);
+    for (int p : tid_pages) {
+        if ((int) sample_sticky_pages_.size() >= cap) {
+            break;
+        }
+        if (p < 0 || p >= (int) page_to_slot_.size() || page_to_slot_[p] < 0) {
+            continue;
+        }
+        if (sticky_l2_enabled_ &&
+            p < (int) sticky_l2_pinned_.size() &&
+            sticky_l2_pinned_[p]) {
+            continue;
+        }
+        const bool loaded = p < (int) page_loaded_.size() && page_loaded_[p];
+        if (loaded) {
+            continue;
+        }
+        bool dup = false;
+        for (int q : sample_sticky_pages_) {
+            if (q == p) { dup = true; break; }
+        }
+        if (dup) {
+            continue;
+        }
+        pin_page(p);
+        sample_sticky_pages_.push_back(p);
+    }
+    stats_.oracle_sticky_pins += (uint64_t) sample_sticky_pages_.size();
+}
+
+void WeightPager::oracle_finalize_fp_() {
+    if (oracle_pred_mark_.empty()) {
+        return;
+    }
+    for (size_t p = 0; p < oracle_pred_mark_.size(); ++p) {
+        if (oracle_pred_mark_[p] && (p >= oracle_pred_hit_.size() || !oracle_pred_hit_[p])) {
+            ++stats_.oracle_fp;
+        }
+    }
+}
+
+void WeightPager::oracle_begin_prediction_(const std::vector<int> & pages) {
+    oracle_finalize_fp_();
+    if (oracle_pred_mark_.size() != (size_t) catalog_.size()) {
+        oracle_pred_mark_.assign((size_t) catalog_.size(), false);
+        oracle_pred_hit_.assign((size_t) catalog_.size(), false);
+    } else {
+        std::fill(oracle_pred_mark_.begin(), oracle_pred_mark_.end(), false);
+        std::fill(oracle_pred_hit_.begin(), oracle_pred_hit_.end(), false);
+    }
+    for (int p : pages) {
+        if (p >= 0 && p < (int) oracle_pred_mark_.size()) {
+            oracle_pred_mark_[p] = true;
+            ++stats_.oracle_pred_pages;
+        }
+    }
+}
+
+int WeightPager::note_sampled_token(int32_t token) {
+    if (!initialized_ || token < 0) {
+        return 0;
+    }
+    pending_sample_token_ = token;
+    pending_sample_flushed_ = false;
+    // Mark prediction for precision stats immediately (even if I/O deferred).
+    std::vector<int> tid_pages;
+    tid_pages.reserve(64);
+    collect_tid2eid_pages_(&token, 1, tid_pages, kHotExpertCap);
+    oracle_begin_prediction_(tid_pages);
+    ++stats_.oracle_sample_fires;
+
+    // Default: start I/O at sample time (post-forward MoE pins are already
+    // down). FA is too short alone to finish a 16-page wave before hash L0-2;
+    // sampling gives the sample->next-FA gap + FA as lead time.
+    // WP_SAMPLE_ORACLE_EAGER=0 defers submit to layer-0 FA only.
+    static int s_eager = -1;
+    if (s_eager < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE_EAGER");
+        s_eager = (v != nullptr && v[0] == '0') ? 0 : 1;
+    }
+    if (s_eager == 1) {
+        return flush_sample_oracle_at_fa();
+    }
+    return 0;
+}
+
+std::vector<int> WeightPager::pin_oracle_protect_set_() {
+    // Temp-pin recent target MoE routing so sample-oracle LRU will not steal
+    // those working-set pages. Sticky L2 already holds its own pins.
+    static int s_hist = -1;
+    if (s_hist < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE_PROTECT_HIST");
+        s_hist = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 8;
+        if (s_hist < 0) {
+            s_hist = 0;
+        }
+        if (s_hist > kHotHistoryMax) {
+            s_hist = kHotHistoryMax;
+        }
+    }
+    std::vector<int> pinned;
+    if (s_hist == 0 || hot_expert_history_.empty()) {
+        return pinned;
+    }
+    std::vector<bool> seen((size_t) catalog_.size(), false);
+    const int n_hist = (int) hot_expert_history_.size();
+    const int from   = n_hist > s_hist ? n_hist - s_hist : 0;
+    pinned.reserve(256);
+    for (int hi = from; hi < n_hist; ++hi) {
+        for (int p : hot_expert_history_[(size_t) hi]) {
+            if (p < 0 || p >= (int) catalog_.size() || seen[(size_t) p]) {
+                continue;
+            }
+            if (p >= (int) page_to_slot_.size() || page_to_slot_[p] < 0) {
+                continue;
+            }
+            if (p >= (int) page_loaded_.size() || !page_loaded_[p]) {
+                continue;
+            }
+            // Already sticky-pinned: skip (would double-pin).
+            if (sticky_l2_enabled_ &&
+                p < (int) sticky_l2_pinned_.size() &&
+                sticky_l2_pinned_[p]) {
+                continue;
+            }
+            seen[(size_t) p] = true;
+            pin_page(p);
+            pinned.push_back(p);
+        }
+    }
+    stats_.oracle_protect_pins += (uint64_t) pinned.size();
+    return pinned;
+}
+
+int WeightPager::flush_sample_oracle_at_fa() {
+    if (!initialized_ || pending_sample_flushed_ || pending_sample_token_ < 0) {
+        return 0;
+    }
+    pending_sample_flushed_ = true;
+    // DIAG: set WP_SAMPLE_ORACLE_FLUSH=0 to measure note-only thrash.
+    static int s_flush = -1;
+    if (s_flush < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE_FLUSH");
+        s_flush = (v != nullptr && v[0] == '0') ? 0 : 1;
+    }
+    if (s_flush == 0) {
+        return 0;
+    }
+    const int32_t tok = pending_sample_token_;
+
+    std::vector<int> tid_pages;
+    tid_pages.reserve(64);
+    collect_tid2eid_pages_(&tok, 1, tid_pages, kHotExpertCap);
+    stats_.draft_tid2eid_pages += (uint64_t) tid_pages.size();
+    for (int p : tid_pages) {
+        if (p >= 0 && p < (int) draft_tid2eid_mark_.size()) {
+            draft_tid2eid_mark_[p] = true;
+        }
+    }
+
+    static int s_max_cold = -1;
+    if (s_max_cold < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE_MAX");
+        s_max_cold = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 16;
+        if (s_max_cold < 1) {
+            s_max_cold = 1;
+        }
+        if (s_max_cold > 64) {
+            s_max_cold = 64;
+        }
+    }
+
+    std::vector<int> cold;
+    cold.reserve(tid_pages.size());
+    int resident = 0;
+    for (int p : tid_pages) {
+        if (p < 0 || p >= catalog_.size() || catalog_.at(p).is_pinned) {
+            continue;
+        }
+        const bool has_slot = p < (int) page_to_slot_.size() && page_to_slot_[p] >= 0;
+        const bool loaded   = has_slot && p < (int) page_loaded_.size() && page_loaded_[p];
+        if (loaded || has_slot) {
+            ++resident;
+        } else {
+            cold.push_back(p);
+        }
+    }
+    stats_.draft_prefetch_pages_resident += (uint64_t) resident;
+    stats_.draft_tid2eid_cold            += (uint64_t) cold.size();
+    stats_.draft_cold_pages              += (uint64_t) cold.size();
+
+    // WP_SAMPLE_ORACLE_EVICT:
+    //   0 = free pool slots only (default; page_ins-safe)
+    //   1 = free_stale hash when free_pool short
+    //   2 = also protected MoE LRU
+    static int s_evict = -1;
+    if (s_evict < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE_EVICT");
+        if (v != nullptr && v[0] == '1') {
+            s_evict = 1;
+        } else if (v != nullptr && v[0] == '2') {
+            s_evict = 2;
+        } else {
+            s_evict = 0;
+        }
+    }
+
+    auto finish_sticky = [&]() {
+        install_sample_sticky_(tid_pages, s_max_cold);
+    };
+
+    // No cold work, or free-only with a full pool: do not touch retain/harvest.
+    // Measured: any flush side-effect with free_pool==0 raised page_ins ~+700.
+    if (cold.empty()) {
+        return 0;
+    }
+    if (s_evict == 0 && pool_.n_free_unpinned() <= 0) {
+        return 0;
+    }
+
+    if ((int) cold.size() > s_max_cold) {
+        cold.resize((size_t) s_max_cold);
+    }
+
+    stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+    // Re-check free pool after harvest (Done slots may free).
+    if (s_evict == 0 && pool_.n_free_unpinned() <= 0) {
+        return 0;
+    }
+
+    int submitted = 0;
+    int free_sub  = 0;
+    int evict_sub = 0;
+
+    auto still_cold_of = [&](const std::vector<int> & src) {
+        std::vector<int> out;
+        out.reserve(src.size());
+        for (int p : src) {
+            if (p >= 0 && p < (int) page_to_slot_.size() && page_to_slot_[p] < 0) {
+                out.push_back(p);
+            }
+        }
+        return out;
+    };
+
+    ++stats_.draft_prefetch_calls;
+    ++draft_oracle_fires_;
+
+    // Phase 1: free pool slots only.
+    {
+        const int free_pool = pool_.n_free_unpinned();
+        if (free_pool > 0) {
+            std::vector<int> free_batch;
+            free_batch.reserve((size_t) free_pool);
+            std::vector<int> remain;
+            remain.reserve(cold.size());
+            for (int p : cold) {
+                if ((int) free_batch.size() < free_pool &&
+                    p >= 0 && p < (int) page_to_slot_.size() && page_to_slot_[p] < 0) {
+                    free_batch.push_back(p);
+                } else {
+                    remain.push_back(p);
+                }
+            }
+            if (!free_batch.empty()) {
+                free_sub = submit_cold_waves_(free_batch, /*allow_evict=*/false);
+                submitted += free_sub;
+            }
+            cold.swap(remain);
+        }
+    }
+
+    // Phase 2: free_stale hash only when still no free slots (sticky from prior
+    // fire should leave headroom; avoid hash churn when free_pool > 0).
+    if (s_evict >= 1 && !cold.empty()) {
+        std::vector<int> still = still_cold_of(cold);
+        if (!still.empty()) {
+            const int free_pool = pool_.n_free_unpinned();
+            if (free_pool <= 0) {
+                (void) free_stale_hash_slots_((int) still.size(), tid_pages);
+            } else if (free_pool < (int) still.size()) {
+                // Partial: free only the shortfall via stale hash.
+                (void) free_stale_hash_slots_((int) still.size() - free_pool, tid_pages);
+            }
+            const int n = submit_cold_waves_(still, /*allow_evict=*/false);
+            free_sub  += n;
+            submitted += n;
+            cold = still_cold_of(still);
+        }
+    }
+
+    // Phase 3 (opt-in): protected MoE LRU.
+    if (s_evict >= 2 && !cold.empty()) {
+        std::vector<int> still = still_cold_of(cold);
+        if (!still.empty()) {
+            std::vector<int> protect = pin_oracle_protect_set_();
+            evict_sub = submit_cold_waves_(still, /*allow_evict=*/true);
+            submitted += evict_sub;
+            for (int p : protect) {
+                unpin_page(p);
+            }
+        }
+    }
+
+    stats_.draft_prefetch_pages_submitted += (uint64_t) submitted;
+    stats_.oracle_pages_submitted         += (uint64_t) submitted;
+    stats_.oracle_pages_free_slot         += (uint64_t) free_sub;
+    stats_.oracle_pages_evict_slot        += (uint64_t) evict_sub;
+
+    // Sticky retain: loaded + in-flight oracle pages (cap MAX) until next sample.
+    finish_sticky();
+    return submitted;
+}
+
+int WeightPager::prefetch_hot_experts(const int32_t * tokens, int n_tokens, int source) {
+    if (!initialized_) {
+        return 0;
+    }
+    // Free SQ slots held by unreaped Done prefetches from prior layers.
+    stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+
+    // Fresh retain set for this fire (old pins drop first).
+    clear_draft_retain_();
+
+    // Hash-only oracle: tid2eid(token). source=0 sample (ground-truth next
+    // input); source=1 draft (speculative — wrong under strip unless accept).
+    static int s_max_tok = -1;
+    if (s_max_tok < 0) {
+        const char * v = std::getenv("WP_DRAFT_ORACLE_MAX_TOK");
+        s_max_tok = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 1;
+        if (s_max_tok < 1) {
+            s_max_tok = 1;
+        }
+    }
+    const int n_use = std::min(n_tokens, s_max_tok);
+
+    std::vector<int> tid_pages;
+    tid_pages.reserve(64);
+    collect_tid2eid_pages_(tokens, n_use, tid_pages, kHotExpertCap);
+    stats_.draft_tid2eid_pages += (uint64_t) tid_pages.size();
+    // Sample path already called oracle_begin_prediction_ in note_sampled_token.
+    if (source != 0) {
+        oracle_begin_prediction_(tid_pages);
+        ++stats_.oracle_draft_fires;
+    }
+
+    for (int p : tid_pages) {
+        if (p >= 0 && p < (int) draft_tid2eid_mark_.size()) {
+            draft_tid2eid_mark_[p] = true;
+        }
+    }
+
+    if (tid_pages.empty()) {
+        draft_warm_streak_ = 0;
+        ++draft_oracle_fires_;
+        hits_at_last_fire_ = stats_.draft_tid2eid_hits_in_ensure;
+        last_tid2eid_n_ = 0;
+        last_tid_cold_ = 0;
+        sticky_l2_refresh_("draft-empty");
+        return 0;
+    }
+    ++stats_.draft_prefetch_calls;
+    ++draft_oracle_fires_;
+    set_draft_window(std::max(1, n_use));
+
+    int resident = 0;
+    int tid_cold = 0;
+    std::vector<int> cold;
+    cold.reserve(tid_pages.size());
+    for (int p : tid_pages) {
+        if (p < 0 || p >= catalog_.size()) {
+            continue;
+        }
+        if (catalog_.at(p).is_pinned) {
+            continue;
+        }
+        const bool has_slot = p < (int) page_to_slot_.size() && page_to_slot_[p] >= 0;
+        const bool loaded   = has_slot && p < (int) page_loaded_.size() && page_loaded_[p];
+        if (loaded) {
+            ++resident;
+        } else if (!has_slot) {
+            cold.push_back(p);
+            ++tid_cold;
+        } else {
+            ++resident; // in-flight or reserved
+        }
+    }
+    stats_.draft_prefetch_pages_resident += (uint64_t) resident;
+    stats_.draft_cold_pages              += (uint64_t) tid_cold;
+    stats_.draft_tid2eid_cold            += (uint64_t) tid_cold;
+
+    // Sample oracle never LRU-evicts: free slots only. That stops the thrash
+    // where hash speculation stole MoE working-set pages (+1k page_ins).
+    const bool allow_evict = (source != 0);
+    const int submitted = submit_cold_waves_(cold, allow_evict);
+    stats_.draft_prefetch_pages_submitted += (uint64_t) submitted;
+
+    // Pin only pages that need eviction protection through the next target
+    // decode: cold/in-flight. Pinning the full already-resident tid2eid set
+    // (~54/page) every token thrash-evicted non-hash experts (+1k page_ins).
+    draft_retain_pages_.reserve(tid_pages.size());
+    for (int p : tid_pages) {
+        if (p < 0 || p >= (int) page_to_slot_.size()) {
+            continue;
+        }
+        if (page_to_slot_[p] < 0) {
+            continue;
+        }
+        const bool loaded = p < (int) page_loaded_.size() && page_loaded_[p];
+        if (loaded && source == 0) {
+            continue; // sample oracle: resident hash pages need no retain pin
+        }
+        if (sticky_l2_enabled_ &&
+            p < (int) sticky_l2_pinned_.size() &&
+            sticky_l2_pinned_[p]) {
+            continue;
+        }
+        pin_page(p);
+        draft_retain_pages_.push_back(p);
+    }
+    stats_.draft_retain_pins += (uint64_t) draft_retain_pages_.size();
+
+    if (tid_cold == 0) {
+        ++draft_warm_streak_;
+    } else {
+        draft_warm_streak_ = 0;
+    }
+
+    // Baseline for next window's hit-ratio (hits accrue during target ensure).
+    hits_at_last_fire_ = stats_.draft_tid2eid_hits_in_ensure;
+    last_tid2eid_n_    = (int) tid_pages.size();
+    last_tid_cold_     = tid_cold;
+
+    static int s_draft_stats = -1;
+    if (s_draft_stats < 0) {
+        const char * v = std::getenv("WP_DRAFT_STATS");
+        s_draft_stats = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+    if (s_draft_stats) {
+        LLAMA_LOG_WARN("draft-oracle: n_tok=%d tid2eid=%d cold=%d submitted=%d retain=%d free_q=%d hit_ratio=%.2f\n",
+                       n_tokens, (int) tid_pages.size(), tid_cold, submitted,
+                       (int) draft_retain_pages_.size(), prefetch_.free_queue_slots(),
+                       last_hit_ratio_);
+    }
+
+    sticky_l2_refresh_("draft-fire");
+
+    return submitted;
+}
+
+int WeightPager::prefetch_sticky_hot_experts() {
+    if (!initialized_ || !sticky_l2_enabled_) {
+        return 0;
+    }
+    ++stats_.sticky_spec_fires;
+    stats_.draft_prefetch_harvested += (uint64_t) harvest_ready_prefetches_();
+
+    // Cap cold I/O so we do not thrash the pool during FA.
+    static int s_max_cold = -1;
+    if (s_max_cold < 0) {
+        const char * v = std::getenv("WP_STICKY_SPEC_MAX");
+        // Default 16: ~one multi-QD wave; higher thrash measured at 32 every FA.
+        s_max_cold = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 16;
+        if (s_max_cold < 1) {
+            s_max_cold = 1;
+        }
+        if (s_max_cold > 64) {
+            s_max_cold = 64;
+        }
+    }
+
+    // Cold submit = recent routing snaps only (sisters already expanded in
+    // record_active_expert_pages). Global score ranks thrash; pins use scores
+    // via sticky_l2_refresh_. Last ~4 snaps ~ a few MoE layers of history.
+    std::vector<int> cold;
+    cold.reserve((size_t) s_max_cold);
+    int resident = 0;
+    int hist_pages = 0;
+    std::vector<bool> seen_cold((size_t) catalog_.size(), false);
+    const int hist_n = std::min(4, (int) hot_expert_history_.size());
+    for (int h = 0; h < hist_n && (int) cold.size() < s_max_cold; ++h) {
+        const auto & snap = hot_expert_history_[hot_expert_history_.size() - 1 - (size_t) h];
+        hist_pages += (int) snap.size();
+        for (int p : snap) {
+            if ((int) cold.size() >= s_max_cold) {
+                break;
+            }
+            if (p < 0 || p >= catalog_.size() || catalog_.at(p).is_pinned) {
+                continue;
+            }
+            if (seen_cold[(size_t) p]) {
+                continue;
+            }
+            seen_cold[(size_t) p] = true;
+            const bool has_slot = p < (int) page_to_slot_.size() && page_to_slot_[p] >= 0;
+            const bool loaded   = has_slot && p < (int) page_loaded_.size() && page_loaded_[p];
+            if (loaded || has_slot) {
+                ++resident;
+                continue;
+            }
+            cold.push_back(p);
+        }
+    }
+    stats_.sticky_spec_pages_resident += (uint64_t) resident;
+
+    const int submitted = cold.empty() ? 0 : submit_cold_waves_(cold);
+    stats_.sticky_spec_pages_submitted += (uint64_t) submitted;
+
+    // Do not force pin refresh every FA fire — that demote/promote churn
+    // raised page_ins. Route-based sticky_l2_refresh_if_due_ is enough.
+    tick();
+
+    static int s_stats = -1;
+    if (s_stats < 0) {
+        const char * v = std::getenv("WP_STICKY_L2_STATS");
+        s_stats = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+    if (s_stats) {
+        int pins = 0;
+        for (bool pinned : sticky_l2_pinned_) {
+            if (pinned) {
+                ++pins;
+            }
+        }
+        LLAMA_LOG_WARN("sticky-spec: hist=%d cold=%d submitted=%d resident=%d free_q=%d pins=%d\n",
+                       hist_pages, (int) cold.size(), submitted, resident,
+                       prefetch_.free_queue_slots(), pins);
+    }
+    return submitted;
 }
 
 void WeightPager::mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices) {

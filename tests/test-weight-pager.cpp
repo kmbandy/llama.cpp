@@ -14,6 +14,7 @@
 #include "weight-pager/wp-pool.h"
 #include "weight-pager/wp-prefetch.h"
 #include "weight-pager/wp-router.h"
+#include "weight-pager/wp-router-predictor.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1765,13 +1766,21 @@ static int test_router_overrides_expert_only() {
 
     auto paging   = (ggml_backend_buffer_type_t) 0x1;
     auto resident = (ggml_backend_buffer_type_t) 0x2;
-    auto ov = wp::build_router_overrides(paging, resident, nullptr);
-    EXPECT_EQ_INT((int) ov.size(), 3, "expert + dense catch-all + terminator");
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
+    auto ov = wp::build_router_overrides(paging, resident, cpu, nullptr);
+    // expert + shexp + ffn_island + token_embd + dense + terminator
+    EXPECT_EQ_INT((int) ov.size(), 6, "expert+shexp+ffn_island+embd+dense+term");
     EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
     EXPECT(ov[0].buft == paging, "expert routed to paging buft");
-    EXPECT(std::string(ov[1].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all second");
-    EXPECT(ov[1].buft == resident, "dense catch-all routed to resident buft");
-    EXPECT(ov[2].pattern == nullptr, "list is terminated");
+    EXPECT(std::string(ov[1].pattern) == std::string(wp::ROUTER_SHEXP_PATTERN), "shexp second");
+    EXPECT(ov[1].buft == paging, "shexp on paging GPU (resident, not paged)");
+    EXPECT(std::string(ov[2].pattern) == std::string(wp::ROUTER_FFN_ISLAND_PATTERN), "ffn island third");
+    EXPECT(ov[2].buft == paging, "ffn island on paging GPU");
+    EXPECT(std::string(ov[3].pattern) == std::string(wp::ROUTER_TOKEN_EMBD_PATTERN), "token_embd fourth");
+    EXPECT(ov[3].buft == cpu, "token_embd on CPU");
+    EXPECT(std::string(ov[4].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all");
+    EXPECT(ov[4].buft == resident, "dense catch-all to resident buft");
+    EXPECT(ov[5].pattern == nullptr, "list is terminated");
     return fails;
 }
 
@@ -1781,17 +1790,19 @@ static int test_router_overrides_preserve_user() {
     auto paging   = (ggml_backend_buffer_type_t) 0x1;
     auto resident = (ggml_backend_buffer_type_t) 0x2;
     auto userbuft = (ggml_backend_buffer_type_t) 0x3;
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
     llama_model_tensor_buft_override user[] = {
         { "attn_q\\.", userbuft },
         { nullptr, nullptr },
     };
-    auto ov = wp::build_router_overrides(paging, resident, user);
-    EXPECT_EQ_INT((int) ov.size(), 4, "expert + 1 user override + dense catch-all + terminator");
+    auto ov = wp::build_router_overrides(paging, resident, cpu, user);
+    // expert + shexp + ffn_island + embd + user + dense + term
+    EXPECT_EQ_INT((int) ov.size(), 7, "expert+shexp+ffn_island+embd+user+dense+term");
     EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
-    EXPECT(std::string(ov[1].pattern) == std::string("attn_q\\."), "user override BEFORE dense catch-all (no shadowing)");
-    EXPECT(ov[1].buft == userbuft, "user override buft preserved");
-    EXPECT(std::string(ov[2].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all comes after user override");
-    EXPECT(ov[3].pattern == nullptr, "list is terminated");
+    EXPECT(std::string(ov[4].pattern) == std::string("attn_q\\."), "user override BEFORE dense catch-all");
+    EXPECT(ov[4].buft == userbuft, "user override buft preserved");
+    EXPECT(std::string(ov[5].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all after user");
+    EXPECT(ov[6].pattern == nullptr, "list is terminated");
     return fails;
 }
 
@@ -1832,6 +1843,34 @@ static int test_catalog_is_expert_classification() {
     EXPECT(!cat.at(first_sub - 1).is_expert, "consolidated parent is not itself an expert page");
     EXPECT(cat.has_experts(), "catalog reports experts present");
     EXPECT_EQ_INT(cat.n_expert_pages(), 256, "256 expert sub-pages counted (parent excluded)");
+    return fails;
+}
+
+static int test_router_predictor() {
+    int fails = 0;
+    using namespace wp;
+    RouterPredictor rp;
+    const int n_expert = 4, n_embd = 3;
+    // layer 1 router: expert 2 aligns with h=(1,0,0); expert 0 second.
+    float W1[n_expert*n_embd] = {
+        0.5f,0,0,   // e0
+        0,1,0,      // e1
+        1,0,0,      // e2 (max dot with h)
+        0,0,1 };    // e3
+    rp.set_router(/*layer=*/1, W1, n_expert, n_embd);
+    EXPECT(rp.has_router(1), "router present after set");
+    EXPECT(!rp.has_router(2), "router absent for unset layer");
+    float h[n_embd] = {1.0f, 0.0f, 0.0f};
+    std::vector<ExpertRef> out;
+    rp.predict(h, /*from_layer=*/0, /*K=*/1, /*M=*/2, /*n_layer=*/43, out);
+    EXPECT_EQ_INT((int)out.size(), 2, "K=1,M=2 -> 2 refs");
+    EXPECT_EQ_INT(out[0].layer, 1, "predicted target layer");
+    EXPECT_EQ_INT(out[0].expert, 2, "top-1 expert is e2");
+    EXPECT_EQ_INT(out[1].expert, 0, "top-2 expert is e0");
+    // K beyond n_layer or unset router -> no refs
+    out.clear();
+    rp.predict(h, /*from_layer=*/1, /*K=*/1, /*M=*/2, /*n_layer=*/43, out); // target 2 unset
+    EXPECT_EQ_INT((int)out.size(), 0, "unset target router -> no refs");
     return fails;
 }
 
@@ -1885,6 +1924,7 @@ int main() {
         { "router_overrides_expert_only",        test_router_overrides_expert_only        },
         { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
+        { "router_predictor",                    test_router_predictor                    },
     };
 
     for (const auto & t : tests) {

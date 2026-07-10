@@ -15,6 +15,31 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
+// Pin activation to the device that owns weight so RMS/mul stay co-located.
+// Without this, hc_pre rms_norm follows residual onto the wrong GPU and the
+// residual-sized flat_norm is staged again for mul_mat(hc_fn) (node/RMS_NORM).
+static void dsv4_pin_to_weight(
+        ggml_backend_sched_t sched,
+        ggml_tensor * act,
+        const ggml_tensor * weight) {
+    if (sched == nullptr || act == nullptr || weight == nullptr || weight->buffer == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t wdev =
+        ggml_backend_buft_get_device(ggml_backend_buffer_get_type(weight->buffer));
+    if (wdev == nullptr) {
+        return;
+    }
+    const int n = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(b) == wdev && ggml_backend_supports_op(b, act)) {
+            ggml_backend_sched_set_tensor_backend(sched, act, b);
+            return;
+        }
+    }
+}
+
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
@@ -296,6 +321,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+    cb(flat_norm, "hc_flat_norm", il);
+    dsv4_pin_to_weight(sched, flat_norm, hc_fn);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
@@ -368,6 +395,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_head(
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+    cb(flat_norm, "hc_head_flat_norm", -1);
+    dsv4_pin_to_weight(sched, flat_norm, hc_fn);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_head_mixes", -1);
 
@@ -1092,9 +1121,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // DFlash taps the pre-collapse multi-stream residual [n_embd, hc, n_tokens].
+    // That layout is contiguous-equivalent to [n_embd*hc, n_tokens] (ne0 innermost),
+    // so extract_layer_inputs can read n_embd*hc floats per token without a reshape.
+    // Do NOT wrap in ggml_reshape_2d: pure views often have no sched backend, and
+    // extract_layer_inputs asserts ggml_backend_sched_get_tensor_backend != null
+    // (seen on first decode of draft-dflash against DS4 Flash).
     auto set_layer_boundary_inp = [&](int ib, ggml_tensor * x) {
         if (ib >= 0 && ib < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[ib]) {
-            res->t_layer_inp[ib] = ggml_reshape_2d(ctx0, x, n_embd*hc, n_tokens);
+            res->t_layer_inp[ib] = x;
             cb(res->t_layer_inp[ib], "layer_inp", ib);
         }
     };

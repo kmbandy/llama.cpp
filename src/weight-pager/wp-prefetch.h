@@ -103,6 +103,17 @@ public:
     // reap()ed it returns false.)
     bool is_loaded(int page_idx) const;
 
+    // Non-blocking: page still has a scheduler slot (any state including Done).
+    bool has_page(int page_idx) const;
+
+    // Non-blocking: page slot is Failed (caller should tear down pool reservation).
+    bool is_failed(int page_idx) const;
+
+    // Release every Done/Failed scheduler slot. WeightPager must commit Done
+    // pages to page_loaded_ *before* calling this, or call harvest first.
+    // Frees free_queue_slots that were stuck holding completed prefetches.
+    int reap_finished();
+
     // If stage 2 is already running, detach and return its GPU completion
     // event. The caller owns the event and must eventually release it via
     // GpuTransport. Returns -1 if the page has no stage-2 event yet.
@@ -121,6 +132,10 @@ public:
     // Inspect.
     int  pending()      const { return queue_depth_ - (int) free_slots_.size(); }
     int  queue_depth()  const { return queue_depth_; }
+    // Scheduler queue slots that can still accept a submit without rejection.
+    // WeightPager must consult this *before* pool alloc_slot so speculative
+    // prefetch cannot LRU-evict resident pages for work the SQ cannot take.
+    int  free_queue_slots() const { return (int) free_slots_.size(); }
     bool is_initialized() const { return initialized_; }
 
 private:

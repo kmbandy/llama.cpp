@@ -9,6 +9,7 @@
 #include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
 #include "../src/weight-pager/wp-pager.h"
+#include "../src/llama-ext.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -900,7 +901,100 @@ struct server_slot {
     }
 };
 
+// How many draft tokens may ride in the *target* batch under weight paging.
+// Multi-token verify unions MoE actives across batch rows (wp-eval-cb), so
+// even "1 draft" means batch=[sampled, draft] with ~1.5x experts/MMID and
+// measured page_ins 15k vs 12.7k no-DFlash. Default auto under WP: 0 drafts
+// in the target batch (single-token decode, page_ins match no-DFlash). Draft
+// model still runs first so llama_wp_on_draft_tokens can tid2eid-prefetch;
+// only the multi-token *target* verify is stripped. Override:
+//   WP_SPEC_VERIFY_MAX=0  -> unlimited (multi-token, thrashy under WP)
+//   WP_SPEC_VERIFY_MAX=N  -> at most N drafts in the target batch
+//   unset + WP            -> 0 (strip; single-token target)
+// Returns (size_t)-1 for "unlimited".
+static size_t wp_spec_verify_max_draft(bool weight_paging_enabled) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char * v = std::getenv("WP_SPEC_VERIFY_MAX");
+        cached = (v != nullptr && v[0] != '\0') ? std::atoi(v) : -1;
+    }
+    if (cached == 0) {
+        return (size_t) -1; // explicit unlimited
+    }
+    if (cached > 0) {
+        return (size_t) cached;
+    }
+    // auto: under WP strip all drafts from target; elsewhere unlimited
+    return weight_paging_enabled ? 0 : (size_t) -1;
+}
 
+static void wp_cap_spec_draft_for_paging(server_slot & slot, bool weight_paging_enabled) {
+    const size_t vmax = wp_spec_verify_max_draft(weight_paging_enabled);
+    if (vmax == (size_t) -1) {
+        return; // unlimited
+    }
+    if (slot.spec_draft.size() <= vmax) {
+        return;
+    }
+    SLT_INF(slot, "weight-paging: target-verify draft %zu -> %zu "
+            "(WP_SPEC_VERIFY_MAX; single-token target keeps MoE at top-k)\n",
+            slot.spec_draft.size(), vmax);
+    slot.spec_draft.resize(vmax);
+}
+
+// Prefill / cold-start draft-oracle (P0): after prompt eval, map the last
+// prompt text token ids through host tid2eid so hash-layer expert pages are
+// submitted before first decode. Pure token-id prior - does not require
+// DFlash. Once per DONE_PROMPT -> GENERATING (not every microbatch).
+//   WP_DRAFT_PREFILL_ORACLE=0 disables (default ON)
+//   also off when WP_DRAFT_PREFETCH=0 (llama_wp_on_draft_tokens gate)
+//   n tokens capped by WP_DRAFT_ORACLE_MAX_TOK (default 1)
+static bool wp_draft_prefill_oracle_enabled() {
+    static int s = -1;
+    if (s < 0) {
+        const char * v = std::getenv("WP_DRAFT_PREFILL_ORACLE");
+        s = (v != nullptr && v[0] == '0') ? 0 : 1;
+    }
+    return s != 0;
+}
+
+static int wp_draft_oracle_max_tok() {
+    static int s = -1;
+    if (s < 0) {
+        const char * v = std::getenv("WP_DRAFT_ORACLE_MAX_TOK");
+        s = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 1;
+        if (s < 1) {
+            s = 1;
+        }
+    }
+    return s;
+}
+
+static void wp_run_prefill_draft_oracle(server_slot & slot) {
+    if (!wp_draft_prefill_oracle_enabled()) {
+        return;
+    }
+    if (slot.ctx_tgt == nullptr) {
+        return;
+    }
+
+    const llama_tokens text = slot.prompt.tokens.get_text_tokens();
+    if (text.empty()) {
+        return;
+    }
+
+    const int max_tok = wp_draft_oracle_max_tok();
+    const int n = std::min((int) text.size(), max_tok);
+    // Last prompt tokens are the next decode *inputs* — ground truth tid2eid.
+    // note_sampled_token defers I/O to layer-0 FA (free slots + hide under FA).
+    int n_sub = 0;
+    for (int i = 0; i < n; ++i) {
+        const llama_token tok = text[(int) text.size() - n + i];
+        n_sub += llama_wp_on_sampled_token(slot.ctx_tgt, tok);
+    }
+    SLT_INF(slot, "prefill sample-oracle: n_tok=%d noted (flush at FA; submitted=%d if eager)\n",
+            n, n_sub);
+}
 
 //
 // server_metrics
@@ -3360,6 +3454,11 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
+                    } else if (params_base.weight_paging_enabled &&
+                               !llama_wp_draft_oracle_should_run(slot.ctx_tgt)) {
+                        // Adaptive: pool already warm for hash-layer experts;
+                        // skip DFlash this step (saves draft GPU time).
+                        SLT_DBG(slot, "%s", "draft-oracle adaptive skip (warm expert cache)\n");
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
@@ -3461,6 +3560,10 @@ private:
                 paged_evicted_this_iter.push_back(slot.id);
                 continue;
             }
+
+            // Cap multi-token speculative *target* batch under weight paging so
+            // MoE expert unions stay near top-k (see wp_spec_verify_max_draft).
+            wp_cap_spec_draft_for_paging(slot, params_base.weight_paging_enabled);
 
             slot.handle_last_sampled_token(batch);
             paged_admitted.push_back(slot.id);
@@ -4360,6 +4463,12 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
+                // P0 prefill draft-oracle: last prompt tokens -> tid2eid
+                // prefetch before first decode (no DFlash required).
+                if (params_base.weight_paging_enabled) {
+                    wp_run_prefill_draft_oracle(slot);
+                }
+
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
@@ -4369,6 +4478,16 @@ private:
 
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
+            }
+
+            // Weight-paging strip mode: drafts were removed from the target
+            // batch after draft-prefetch. Drop the draft-window retain pins
+            // now that this single-token target step is done (accept() is
+            // never entered when spec_draft is empty).
+            // Skip clear on the first sample after prompt (n_decoded == 0) so
+            // prefill-oracle pins survive until after the first target decode.
+            if (params_base.weight_paging_enabled && slot.n_decoded > 0) {
+                llama_wp_on_draft_tokens(slot.ctx_tgt, nullptr, 0);
             }
 
             // shifted according to the current sub-batch
@@ -4383,6 +4502,14 @@ private:
             slot.i_batch = -1;
 
             common_sampler_accept(slot.smpl.get(), id, true);
+
+            // Ground-truth hash-layer oracle: next forward *consumes* `id` as
+            // input, so tid2eid(id) is exact for layers 0..H. Must run after
+            // sample (not on draft tokens under WP strip). Overlaps I/O with
+            // the gap until the next eval_cb / FA.
+            if (params_base.weight_paging_enabled) {
+                (void) llama_wp_on_sampled_token(slot.ctx_tgt, id);
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();

@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include <cstdio>
 
 #include "common.h"
 #include "ggml.h"
@@ -1088,6 +1089,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                {
+                    // WP_CAPTURE_DFLASH (read-only, gated): DFlash predictive hidden inp_g[i]
+                    // (predicts pos+1) + target position. In the DFlash class process(). Off by default.
+                    static const int s_cap_df = [](){ const char* e=std::getenv("WP_CAPTURE_DFLASH"); return (e&&e[0]=='1')?1:0; }();
+                    if (s_cap_df) {
+                        static FILE* s_df_fp = std::fopen("/home/kmbandy/wp_logs/accounting/dflash_capture.bin","wb");
+                        if (s_df_fp) {
+                            for (int32_t i = 0; i < n_chunk; ++i) {
+                                int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_dec };
+                                std::fwrite(hdr, sizeof(hdr), 1, s_df_fp);
+                                std::fwrite(inp_g + (size_t) i * n_embd_dec, sizeof(float), (size_t) n_embd_dec, s_df_fp);
+                            }
+                            std::fflush(s_df_fp);
+                        }
+                    }
+                }
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
@@ -1191,10 +1208,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+
+        // Draft-driven expert prefetch: pass actual draft token ids so the
+        // pager can resolve DS4 hash-layer tid2eid experts (cold pages) and
+        // pin last-pass actives across the draft->verify gap. Empty clears.
+        std::vector<llama_token> draft_toks;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] < 0) {
+                continue;
+            }
+            const auto & res = *dparams[seq_id].result;
+            draft_toks.insert(draft_toks.end(), res.begin(), res.end());
+        }
+        const int n_sub = draft_toks.empty()
+            ? llama_wp_on_draft_tokens(this->params.ctx_tgt, nullptr, 0)
+            : llama_wp_on_draft_tokens(this->params.ctx_tgt, draft_toks.data(),
+                                       (int) draft_toks.size());
+        if (n_sub > 0) {
+            LOG_DBG("%s: draft-prefetch submitted %d expert pages (n_draft_toks=%zu)\n",
+                    __func__, n_sub, draft_toks.size());
+        }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+        // Clear draft-window + retain pins after target verify.
+        llama_wp_on_draft_tokens(this->params.ctx_tgt, nullptr, 0);
     }
 
     bool need_embd() const override {

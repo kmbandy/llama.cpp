@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-context.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -50,6 +51,22 @@
 // tripping the gallocr buffer_id>=0 assert (hit on DeepSeek V4 hc_attn_scale
 // {3}). Standard {n_embd} norms are well above this and remain paged.
 static constexpr size_t WP_MIN_PAGED_BYTES = 4096;
+
+struct llama_wp_draft_prefetch_config {
+    bool enabled;
+    const char * raw;
+};
+
+static const llama_wp_draft_prefetch_config & llama_wp_draft_prefetch_config_get() {
+    static const llama_wp_draft_prefetch_config config = []() {
+        const char * raw = std::getenv("WP_DRAFT_PREFETCH");
+        return llama_wp_draft_prefetch_config{
+            raw != nullptr && raw[0] == '1',
+            raw,
+        };
+    }();
+    return config;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1348,6 +1365,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
+    if (params.weight_paging_enabled) {
+        const auto & cfg = llama_wp_draft_prefetch_config_get();
+        LLAMA_LOG_INFO("%s: wp DFlash draft-prefetch = %s (WP_DRAFT_PREFETCH=%s)\n",
+            __func__, cfg.enabled ? "ON" : "OFF", cfg.raw != nullptr ? cfg.raw : "unset");
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
@@ -1371,13 +1394,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_idx].dev);
         }
         if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
-            // C2: override routed experts out to the paging device, then pin
-            // remaining dense tensors to the resident device.
-            wp_tensor_buft_overrides = wp::build_router_overrides(wp_paging_buft, wp_resident_buft, params.tensor_buft_overrides);
+            // Hetero layout (see docs/dev/2026-07-08-wp-hetero-dflash-oracle-plan.md):
+            //   experts + shexp -> paging GPU; token_embd -> CPU;
+            //   attention/lm_head/... -> resident GPU; layer-home = resident (FA).
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+            wp_tensor_buft_overrides = wp::build_router_overrides(
+                    wp_paging_buft, wp_resident_buft, cpu_buft, params.tensor_buft_overrides);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
+            // Without this, llama_context enables pipeline parallelism on
+            // multi-device (has_tensor_overrides() was still false) and
+            // graph_reserve tries a ~90+ GiB ROCm0 compute buffer.
+            pimpl->has_tensor_overrides = true;
             wp_device_router_enabled = true;
             wp_resident_dev = devices[resident_idx].dev;   // C1: home device for offloaded layers
-            LLAMA_LOG_INFO("%s: WP_RESIDENT_DENSE router: paging=%s (%s), resident=%s (%s)\n",
+            LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router: paging=%s (%s), resident=%s (%s), "
+                           "token_embd=CPU, shexp+ffn_island=paging-resident\n",
                            __func__,
                            ggml_backend_dev_name(devices[paging_idx].dev), ggml_backend_buft_name(wp_paging_buft),
                            ggml_backend_dev_name(devices[resident_idx].dev), ggml_backend_buft_name(wp_resident_buft));
@@ -3340,4 +3371,63 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
 
 uint32_t llama_model_dflash_hc_mult(const struct llama_model * model) {
     return model->dflash_hc_mult;
+}
+
+int llama_wp_on_draft_tokens(struct llama_context * ctx,
+                             const llama_token * tokens,
+                             int n_tokens) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.wp_pager == nullptr) {
+        return 0;
+    }
+    if (!llama_wp_draft_prefetch_config_get().enabled) {
+        // Still allow clear (n_tokens<=0) so retain pins can drop.
+        if (n_tokens <= 0 || tokens == nullptr) {
+            model.wp_pager->set_draft_window(0);
+        }
+        return 0;
+    }
+    if (n_tokens <= 0 || tokens == nullptr) {
+        model.wp_pager->set_draft_window(0);
+        return 0;
+    }
+    model.wp_pager->set_draft_window(n_tokens);
+    return model.wp_pager->prefetch_hot_experts(tokens, n_tokens, /*source=*/1);
+}
+
+int llama_wp_on_sampled_token(struct llama_context * ctx, llama_token id) {
+    if (ctx == nullptr || id < 0) {
+        return 0;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.wp_pager == nullptr) {
+        return 0;
+    }
+    // WP_SAMPLE_ORACLE=0 disables. Default ON: ground-truth next input token.
+    static int s_sample_oracle = -1;
+    if (s_sample_oracle < 0) {
+        const char * v = std::getenv("WP_SAMPLE_ORACLE");
+        s_sample_oracle = (v != nullptr && v[0] == '0') ? 0 : 1;
+    }
+    if (s_sample_oracle == 0) {
+        return 0;
+    }
+    return model.wp_pager->note_sampled_token((int32_t) id);
+}
+
+bool llama_wp_draft_oracle_should_run(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return true;
+    }
+    const llama_model & model = ctx->get_model();
+    if (model.wp_pager == nullptr) {
+        return true; // no pager: leave draft behavior to the server
+    }
+    if (!llama_wp_draft_prefetch_config_get().enabled) {
+        return false; // draft oracle disabled entirely
+    }
+    return model.wp_pager->draft_oracle_should_run();
 }

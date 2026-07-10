@@ -25,14 +25,22 @@
 #include "wp-gpu-transport.h"
 #include "wp-prefetch.h"
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// Forward-declared unconditionally: WeightPager holds an io_uring* member in
+// every build so its layout does not depend on LLAMA_HAVE_IO_URING (see below).
+struct io_uring;
 
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
@@ -71,6 +79,55 @@ public:
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
         uint64_t routing_ptrs_discarded_unconsumed = 0;
+        // Draft-as-paging-oracle (speculative draft model -> expert cache).
+        uint64_t draft_prefetch_calls              = 0;
+        uint64_t draft_prefetch_pages_submitted    = 0;
+        uint64_t draft_prefetch_pages_resident     = 0; // already loaded at draft fire
+        uint64_t draft_retain_pins                 = 0; // pages pinned for draft window
+        uint64_t draft_tid2eid_pages               = 0; // pages from hash-layer token map
+        uint64_t draft_cold_pages                  = 0; // union cold count at draft fire
+        uint64_t draft_tid2eid_cold                = 0; // tid2eid pages that needed I/O
+        uint64_t draft_tid2eid_hits_in_ensure      = 0; // ensure of last draft tid2eid page
+        uint64_t draft_oracle_skips                = 0; // adaptive: skipped DFlash fire
+        uint64_t draft_window_opens                = 0; // set_draft_window(n>0)
+        uint64_t draft_window_closes               = 0; // set_draft_window(0)
+        uint64_t draft_prefetch_queue_blocked      = 0; // waves aborted: free_q==0 after drain
+        uint64_t draft_prefetch_harvested          = 0; // Done prefetches committed before submit
+        uint64_t draft_hot_records                 = 0; // MMID history snaps (metrics only)
+        // Oracle precision (hash-layer tid2eid pages only).
+        // pred = pages marked at last oracle fire; actual = record_active pages
+        // in tid2eid blocks. tp = actual ∩ pred; fn = actual \ pred; fp finalized
+        // at next fire as pred never seen in actual.
+        uint64_t oracle_sample_fires               = 0; // llama_wp_on_sampled_token
+        uint64_t oracle_draft_fires                = 0; // draft-token fires (cold submit path)
+        uint64_t oracle_pred_pages                 = 0; // sum |predicted set| at fires
+        uint64_t oracle_actual_hash_pages          = 0; // hash-layer pages in routing snaps
+        uint64_t oracle_tp                         = 0; // predicted and later routed
+        uint64_t oracle_fn                         = 0; // routed hash page not predicted
+        uint64_t oracle_fp                         = 0; // predicted never routed before next fire
+        uint64_t oracle_pages_submitted            = 0; // cold hash pages queued by sample path
+        uint64_t oracle_pages_free_slot            = 0; // of those, took free pool slots
+        uint64_t oracle_pages_evict_slot           = 0; // of those, recycled stale-hash / MoE LRU
+        uint64_t oracle_hash_slots_freed           = 0; // stale hash pages released for oracle
+        uint64_t oracle_protect_pins               = 0; // temp MoE-history pins during MoE LRU
+        uint64_t oracle_sticky_pins                = 0; // sample-oracle sticky retain installs
+        uint64_t sticky_l2_pins                    = 0; // current sticky L2 pin refs
+        uint64_t sticky_l2_hits_in_ensure          = 0; // ensure of sticky L2 page
+        uint64_t sticky_l2_promotions              = 0; // pages added to sticky L2 set
+        uint64_t sticky_l2_demotions               = 0; // pages removed from sticky L2 set
+        uint64_t sticky_spec_fires                 = 0; // FA-window sticky/hot prefetch calls
+        uint64_t sticky_spec_pages_submitted       = 0; // cold pages submitted in those fires
+        uint64_t sticky_spec_pages_resident        = 0; // already resident at fire
+        // ensure_batch multi-QD bursts (P2P path)
+        uint64_t ensure_batch_calls                = 0;
+        uint64_t ensure_batch_pages                = 0; // cold misses issued in batches
+        uint64_t ensure_batch_max_n                = 0; // largest concurrent miss set
+        uint64_t ensure_batch_bytes                = 0;
+        double   ensure_batch_seconds              = 0.0; // submit+wait wall
+        double   ensure_batch_submit_seconds       = 0.0;
+        double   ensure_batch_wait_seconds         = 0.0;
+        uint64_t ensure_batch_timeouts             = 0; // wait_for_req returned non-Ok
+        uint64_t ensure_batch_n_sub_sum            = 0; // sum of submit_batch return
     };
 
     WeightPager() = default;
@@ -195,7 +252,9 @@ public:
     // Submit a prefetch hint for a page. No-op if the page is already in
     // flight or already loaded. Errors are logged but do not propagate —
     // the eval callback's ensure() will fall back to sync on miss.
-    bool prefetch_page(int page_idx, bool count_dense_prefetch = false);
+    // allow_evict=false: free pool slots only (sample oracle; no thrash).
+    bool prefetch_page(int page_idx, bool count_dense_prefetch = false,
+                       bool allow_evict = true);
 
     // MAD-235 — batch-prefetch N pages atomically. Reserves N pool slots
     // up-front, builds the file-IO batch, issues one batched submit. If
@@ -206,8 +265,10 @@ public:
     // Skips page indices that are already resident or already in flight
     // — those are no-ops, not failures. Returns true iff every NEEDED
     // request was queued (or no requests were needed).
+    // allow_evict=false: free pool slots only (sample oracle).
     bool prefetch_pages_batch(const std::vector<int> & page_indices,
-                              bool count_dense_prefetch = false);
+                              bool count_dense_prefetch = false,
+                              bool allow_evict = true);
 
     // Hint the kernel (via POSIX_FADV_WILLNEED on the file_io layer) that
     // we will soon need every paged tensor in layers [block_idx+1,
@@ -227,6 +288,40 @@ public:
     // pages before issuing cross-layer prefetches; successful scheduler
     // submissions and later ensure-time hits are folded into Stats.
     void mark_cross_layer_prefetch_candidates(const std::vector<int> & page_indices);
+
+    // --- Draft-as-paging-oracle -------------------------------------------
+    // Hash-layer tid2eid(token) is the hard signal (DS4 layers 0..H). Softmax
+    // MMID history is metrics-only (low cross-token locality measured).
+    // set_draft_window / prefetch_hot_experts pin tid2eid pages across the
+    // draft->target gap. draft_oracle_should_run() gates running the draft
+    // model at all when the pool is already warm (adaptive skip).
+    void record_active_expert_pages(const std::vector<int> & page_indices);
+    // Host copy of blk.N.ffn_gate_tid2eid (I32, layout [n_vocab][n_expert_used]).
+    // Call once per hash layer after model tensors are loaded.
+    void register_tid2eid_host(int block_idx, int n_expert_used, int n_vocab,
+                               const int32_t * host_data);
+    // source: 0 = sample (ground truth next input), 1 = draft (speculative)
+    int  prefetch_hot_experts(const int32_t * tokens = nullptr, int n_tokens = 0,
+                              int source = 1);
+    // After target samples token T, record T for tid2eid and (default) flush
+    // cold I/O immediately: free slots first, then capped protected LRU
+    // (WP_SAMPLE_ORACLE_MAX=16, WP_SAMPLE_ORACLE_EVICT=0 free-only).
+    // WP_SAMPLE_ORACLE_EAGER=0 defers submit to layer-0 FA only.
+    int  note_sampled_token(int32_t token);
+    int  flush_sample_oracle_at_fa();
+    // Drop sample-oracle sticky pins once decode is past hash layers so MoE
+    // regains full pool capacity (hash pages stay LRU-hot from ensure hits).
+    void release_sample_sticky_if_past_hash(int block_idx);
+    // Speculative expert page-in for the FA/dense window: top sticky scores +
+    // recent target-routing history. Call from eval_cb on FLASH_ATTN so R9700
+    // NVMe work can run under eGPU attention. Returns cold pages submitted.
+    int  prefetch_sticky_hot_experts();
+    void set_draft_window(int n_draft);
+    bool draft_window_active() const { return draft_window_ > 0; }
+    int  draft_window() const { return draft_window_; }
+    // Adaptive: false when last fires found no cold tid2eid pages (warm pool).
+    // WP_DRAFT_ADAPTIVE=0 forces always true. Counts as skip when false.
+    bool draft_oracle_should_run();
 
     // Drive the prefetch pipeline forward. Idempotent and non-blocking.
     void tick();
@@ -327,6 +422,84 @@ private:
     bool   initialized_ = false;
     bool   hip_graphs_enabled_ = false;
     bool   async_ensure_enabled_ = false;
+
+    // MMID active-set history (metrics / optional future priors only).
+    static constexpr int kHotExpertCap  = 768;
+    static constexpr int kHotHistoryMax = 256;
+    std::vector<std::vector<int>> hot_expert_history_;
+    // Pages we pin_page()'d for the open draft window; unpinned on clear.
+    std::vector<int> draft_retain_pages_;
+    // Last draft fire's tid2eid pages; ensure hits counted while marked.
+    std::vector<bool> draft_tid2eid_mark_;
+    // Precision set: pages predicted at last oracle fire; cleared on next fire.
+    std::vector<bool> oracle_pred_mark_;
+    std::vector<bool> oracle_pred_hit_; // seen in record_active since last fire
+    // Sticky L2 keeps hash-hot resident pages pinned across skipped draft fires.
+    std::vector<uint32_t> sticky_l2_score_;
+    std::vector<bool> sticky_l2_mark_;
+    std::vector<bool> sticky_l2_pinned_;
+    std::vector<int> sticky_l2_pages_;
+    bool sticky_l2_enabled_ = false;
+    bool sticky_l2_stats_ = false;
+    int  sticky_l2_max_pages_ = 32;
+    int  sticky_l2_hits_since_refresh_ = 0;
+    int draft_window_ = 0;
+    // Pending sample-oracle token; flushed at sample (default) or layer-0 FA
+    // when WP_SAMPLE_ORACLE_EAGER=0.
+    int32_t pending_sample_token_ = -1;
+    bool    pending_sample_flushed_ = true;
+    // Sticky retain of sample-oracle hash pages across MoE until next sample.
+    // Independent of draft_retain so set_draft_window(0) does not drop them
+    // mid-window (server clears draft at sample boundary only after use).
+    std::vector<int> sample_sticky_pages_;
+    // Adaptive draft skip state.
+    int draft_warm_streak_   = 0;
+    int draft_oracle_fires_  = 0;
+    int last_tid2eid_n_      = 0;
+    int last_tid_cold_       = 0;
+    uint64_t hits_at_last_fire_ = 0; // draft_tid2eid_hits_in_ensure snapshot
+    float last_hit_ratio_    = 0.f;  // ensure hits / tid2eid pages for last window
+
+    void note_draft_tid2eid_ensure_(int page_idx);
+    bool draft_retain_contains_(int page_idx) const;
+    void sticky_l2_refresh_(const char * reason);
+    void sticky_l2_refresh_if_due_(const char * reason);
+    void release_sticky_l2_();
+    void oracle_begin_prediction_(const std::vector<int> & pages);
+    void oracle_finalize_fp_();
+    bool is_tid2eid_hash_page_(int page_idx) const;
+    // Commit Done prefetches -> page_loaded_ and free scheduler slots.
+    // Without this, depth-4 Done slots block all further draft submits.
+    int  harvest_ready_prefetches_();
+    // Submit cold pages in waves, draining/harvesting between waves.
+    // allow_evict=false: free pool slots only.
+    int  submit_cold_waves_(const std::vector<int> & cold, bool allow_evict = true);
+    // Temp-pin recent MoE routing history so sample-oracle LRU skips them.
+    // Returns pages that were pinned (caller must unpin_page each).
+    std::vector<int> pin_oracle_protect_set_();
+    // Free up to n_need slots by releasing unpinned *stale* hash-layer pages
+    // (not in keep_pages). Does not touch MoE working-set pages. Returns how
+    // many slots were freed.
+    int free_stale_hash_slots_(int n_need, const std::vector<int> & keep_pages);
+    // Pin up to cap resident/in-flight sample-oracle pages until next fire.
+    void clear_sample_sticky_();
+    void install_sample_sticky_(const std::vector<int> & tid_pages, int cap);
+
+    // Hash-layer token->expert tables (host). Indexed by block_idx.
+    struct Tid2EidTable {
+        int block_idx      = -1;
+        int n_expert_used  = 0;
+        int n_vocab        = 0;
+        std::vector<int32_t> data; // [token * n_expert_used + k]
+    };
+    std::vector<Tid2EidTable> tid2eid_tables_;
+
+    void clear_draft_retain_();
+    void clear_draft_tid2eid_mark_();
+    void union_push_(std::vector<int> & dst, int page_idx, int cap) const;
+    void collect_tid2eid_pages_(const int32_t * tokens, int n_tokens,
+                                std::vector<int> & out, int cap) const;
+
     mutable Stats stats_;
 
     // GGML_CUDA_DISABLE_GRAPHS lifecycle (B-P5).
@@ -354,6 +527,51 @@ private:
     void * sync_staging_       = nullptr;
     size_t sync_staging_size_  = 0;
     bool   sync_staging_pinned_ = false;  // true if hipHostMalloc, false if malloc fallback
+
+    // Multi-QD host bounce for ensure_batch (WP_ENSURE_BATCH_HOST=1):
+    // Cold random buffered ~1.1 GB/s; O_DIRECT multi-QD ~6.2 GB/s on SN850X.
+    // GGUF tensor offs are not 512-aligned, so each read uses an O_DIRECT
+    // bounce (align-down offset, pad size) then H2D of the payload slice.
+    std::vector<void *> ensure_host_bufs_;
+    size_t              ensure_host_buf_bytes_ = 0;
+    bool                ensure_host_bufs_pinned_ = false;
+    std::vector<int>    ensure_odirect_fds_; // parallel to file_io fds; -1 = unused
+    struct EnsureODirectReadJob {
+        int      fd     = -1;
+        uint64_t off    = 0;
+        size_t   size   = 0;
+        void *   dst    = nullptr;
+        bool     done   = false;
+        bool     ok     = false;
+        int      err    = 0;
+    };
+    std::vector<std::thread>          ensure_odirect_workers_;
+    std::deque<EnsureODirectReadJob *> ensure_odirect_queue_;
+    std::mutex                       ensure_odirect_mu_;
+    std::condition_variable          ensure_odirect_cv_;
+    std::condition_variable          ensure_odirect_done_cv_;
+    bool                             ensure_odirect_workers_stop_ = false;
+    // Kept unconditional (NOT #if LLAMA_HAVE_IO_URING): a struct layout in a
+    // shared header must never depend on a per-TU macro. LLAMA_HAVE_IO_URING is
+    // PRIVATE to the llama target, so test TUs that include this header lack it;
+    // guarding these members would make sizeof(WeightPager) differ between
+    // libllama and the test, corrupting stack/heap pagers. Used only under the
+    // guard in wp-pager.cpp; harmlessly unused when io_uring is unavailable.
+    struct io_uring *    ensure_odirect_ring_ = nullptr;
+    std::vector<uint8_t> ensure_odirect_fd_registered_;
+    bool                 ensure_odirect_ring_files_registered_ = false;
+    bool ensure_host_bufs_ready_(size_t n, size_t page_bytes);
+    void free_ensure_host_bufs_();
+    int  ensure_odirect_fd_(int file_idx);
+    int  ensure_odirect_worker_count_(size_t n_jobs) const;
+    bool ensure_odirect_workers_ready_(int n_workers);
+    void shutdown_ensure_odirect_workers_();
+    void ensure_odirect_worker_loop_();
+#if defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
+    bool ensure_odirect_ring_ready_(size_t n_entries);
+    bool ensure_odirect_fixed_fd_ready_(int file_idx, int fd, size_t n_entries);
+    void shutdown_ensure_odirect_ring_();
+#endif
 };
 
 // File-range descriptor for advise_prefetch — one per paged tensor in the

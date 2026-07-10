@@ -45,6 +45,10 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// HIP: flush deferred multi-input cross-device stages (no-op on CUDA/non-batch).
+// Call before WP eval_cb / any consumer that must see staged activations.
+GGML_BACKEND_API void ggml_backend_cuda_xdev_batch_flush(void);
+
 #ifdef  __cplusplus
 }
 #endif
