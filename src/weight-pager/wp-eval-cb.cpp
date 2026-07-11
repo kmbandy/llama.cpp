@@ -335,6 +335,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!ask)             return true;
 
     // --- Cross-layer prefetch (WP_PREFETCH_XLAYER), gated OFF by default -----
+    // HIP-only: weight paging is an RDNA/HIP feature (R9700, 6900xt) and this
+    // block uses the HIP-gated side channel (current_hip_device /
+    // ggml_cuda_get_wp_compute_stream, declared only under GGML_USE_HIP) plus
+    // raw hip* device copies. Non-HIP builds (CUDA sm_61 / Vulkan on the 1070
+    // and 480) don't page weights, so compile it out there.
+#if defined(GGML_USE_HIP)
     // At the ffn_gate_inp router MUL_MAT (start of each MoE block): src[0] is
     // the router weight (host-copied once per layer), src[1] is the residual
     // `cur` (== the expert input). Predict layers L+1..L+K's experts from `cur`
@@ -421,6 +427,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
     }
+#endif // GGML_USE_HIP — cross-layer prefetch (weight paging is HIP/RDNA-only)
     const bool eval_debug = eval_debug_enabled();
     const uint64_t sync_fallbacks_before =
         batch_eval_cb ? pager->sync_fallback_count() : 0;
