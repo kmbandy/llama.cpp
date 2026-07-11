@@ -226,7 +226,9 @@ public:
     // automatically — token-IDs-to-text decoding requires upstream
     // (e.g. server-context's slot.prompt.tokens) since the inner cache
     // doesn't store the original token IDs.
-    std::vector<float> embed_text(const std::string & text);
+    std::vector<float> embed_text(const std::string & text, EmbedRole role = EmbedRole::Document);
+    std::vector<std::vector<float>> embed_text_batch(const std::vector<std::string> & texts,
+                                                     EmbedRole role = EmbedRole::Document);
 
 private:
     // Poll inner_->seq_pos_min / seq_pos_max across 0..n_seq_max_, sum

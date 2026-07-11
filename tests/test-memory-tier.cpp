@@ -517,6 +517,21 @@ static int test_embed_basic() {
     EXPECT_NEAR(sim_self, 1.0, 1e-3, "self-similarity ~= 1");
     EXPECT(sim_other < sim_self, "different text scores lower than self");
 
+    auto batch = m.embed_batch({
+        "the capital of France is Paris",
+        "recipes for chocolate cake",
+        "",
+    });
+    EXPECT_EQ_INT(batch.size(), 3, "batch preserves result count");
+    EXPECT_EQ_INT(batch[0].size(), v1.size(), "batch first vector dim");
+    EXPECT_EQ_INT(batch[1].size(), v3.size(), "batch second vector dim");
+    EXPECT(batch[2].empty(), "empty batch item stays empty");
+    double sim_batch = 0.0;
+    for (int i = 0; i < m.n_embd(); ++i) {
+        sim_batch += static_cast<double>(v1[i]) * batch[0][i];
+    }
+    EXPECT(sim_batch > 0.999, "batched and single embeddings agree");
+
     return fails;
 }
 

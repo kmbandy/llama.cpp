@@ -356,14 +356,25 @@ bool llama_memory_tiered::ensure_warm_staging() {
     return true;
 }
 
-std::vector<float> llama_memory_tiered::embed_text(const std::string & text) {
+std::vector<float> llama_memory_tiered::embed_text(const std::string & text, EmbedRole role) {
     if (cfg_.semantic_index.empty()) {
         return {};
     }
     if (!embed_model_) {
         embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
     }
-    return embed_model_->embed(text);
+    return embed_model_->embed(text, role);
+}
+
+std::vector<std::vector<float>> llama_memory_tiered::embed_text_batch(const std::vector<std::string> & texts,
+                                                                     EmbedRole role) {
+    if (cfg_.semantic_index.empty()) {
+        return std::vector<std::vector<float>>(texts.size());
+    }
+    if (!embed_model_) {
+        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
+    }
+    return embed_model_->embed_batch(texts, role);
 }
 
 // MAD-134: warm the bge-small model at construction so the first user

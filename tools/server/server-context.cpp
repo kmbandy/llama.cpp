@@ -115,17 +115,22 @@ static int mt_record_fingerprints_for_range(
     // even if a future caller passes an unaligned range.
     const uint32_t bsize = block_size > 0 ? block_size : 16u;
     const int aligned_p0 = (int)((uint32_t) p0 / bsize) * (int) bsize;
-    int n_recorded = 0;
+    std::vector<uint32_t> lblocks;
+    std::vector<std::string> texts;
     for (int b = aligned_p0; b < hi; b += (int) bsize) {
         const int chunk_hi = std::min(b + (int) bsize, hi);
         if (chunk_hi <= b) continue;
         llama_tokens chunk(toks.begin() + b, toks.begin() + chunk_hi);
         const std::string text = common_detokenize(ctx, chunk, /*special=*/ false);
-        const auto emb = mt_tier->embed_text(text);
-        if (emb.empty()) continue;
-        const uint32_t lblock = (uint32_t) b / bsize;
+        texts.push_back(text);
+        lblocks.push_back((uint32_t) b / bsize);
+    }
+    const auto embeddings = mt_tier->embed_text_batch(texts);
+    int n_recorded = 0;
+    for (size_t i = 0; i < embeddings.size(); ++i) {
+        if (embeddings[i].empty()) continue;
         paged_cache->record_paged_block_fingerprint(
-            seq_id, lblock, emb, mt::SemanticIndex::Tier::Warm);
+            seq_id, lblocks[i], embeddings[i], mt::SemanticIndex::Tier::Warm);
         ++n_recorded;
     }
     return n_recorded;
@@ -3781,7 +3786,7 @@ private:
                                     if (q_max > 0) {
                                         llama_tokens q(qtoks.begin(), qtoks.begin() + q_max);
                                         const std::string qtext = common_detokenize(ctx_tgt, q, /*special=*/ false);
-                                        const auto qemb = mt_tier->embed_text(qtext);
+                                        const auto qemb = mt_tier->embed_text(qtext, mt::EmbedRole::Query);
                                         if (!qemb.empty()) {
                                             // MAD-122/125: paged-blocks routes through
                                             // llama_kv_cache_paged (the active tier
@@ -4215,7 +4220,8 @@ private:
                                 const int n_toks = (int) toks.size();
                                 const int n_complete_blocks = n_toks / (int) bsize;
 
-                                int n_new_fp = 0;
+                                std::vector<uint32_t> new_lblocks;
+                                std::vector<std::string> new_texts;
                                 int n_skipped_existing = 0;
                                 for (int lb = 0; lb < n_complete_blocks; ++lb) {
                                     if (paged_cache->has_paged_fingerprint(slot.id, (uint32_t) lb)) {
@@ -4226,10 +4232,16 @@ private:
                                     const int p1 = p0 + (int) bsize;
                                     llama_tokens chunk(toks.begin() + p0, toks.begin() + p1);
                                     const std::string text = common_detokenize(ctx_tgt, chunk, /*special=*/ false);
-                                    const auto emb = mt_tier->embed_text(text);
-                                    if (emb.empty()) continue;
+                                    new_lblocks.push_back((uint32_t) lb);
+                                    new_texts.push_back(text);
+                                }
+
+                                const auto embeddings = mt_tier->embed_text_batch(new_texts);
+                                int n_new_fp = 0;
+                                for (size_t i = 0; i < embeddings.size(); ++i) {
+                                    if (embeddings[i].empty()) continue;
                                     paged_cache->record_paged_block_fingerprint(
-                                        slot.id, (uint32_t) lb, emb,
+                                        slot.id, new_lblocks[i], embeddings[i],
                                         mt::SemanticIndex::Tier::Hot);
                                     ++n_new_fp;
                                 }

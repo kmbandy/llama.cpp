@@ -9,6 +9,19 @@
 
 namespace mt {
 
+static constexpr int EMBED_BATCH_TOKENS = 512;
+static constexpr int EMBED_BATCH_SEQS   = 32;
+
+// Model-specific asymmetric retrieval prefixes. LFM2.5-Embedding-350M was
+// trained with these exact strings (config_sentence_transformers.json);
+// omitting them silently degrades retrieval quality. Revisit on model swap.
+static constexpr const char * QUERY_PREFIX    = "query: ";
+static constexpr const char * DOCUMENT_PREFIX = "document: ";
+
+static const char * embed_prefix(EmbedRole role) {
+    return role == EmbedRole::Query ? QUERY_PREFIX : DOCUMENT_PREFIX;
+}
+
 EmbeddingModel::EmbeddingModel(std::string path) : path_(std::move(path)) {}
 
 EmbeddingModel::~EmbeddingModel() {
@@ -45,11 +58,12 @@ bool EmbeddingModel::ensure_loaded_locked() {
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx        = 512;                          // bge-small max
+    cparams.n_ctx        = 512;                          // query window is capped at 512; KV blocks are 16 tokens
     cparams.n_batch      = 512;
-    cparams.n_ubatch     = 512;
+    cparams.n_ubatch     = 512;                          // non-causal encode needs n_ubatch >= n_tokens; 512 covers the largest input
+    cparams.n_seq_max    = EMBED_BATCH_SEQS;
     cparams.embeddings   = true;
-    cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;      // matches bge training
+    cparams.pooling_type = LLAMA_POOLING_TYPE_CLS;       // LFM2.5-Embedding-350M uses CLS pooling
 
     ctx_ = llama_init_from_model(model_, cparams);
     if (!ctx_) {
@@ -59,7 +73,11 @@ bool EmbeddingModel::ensure_loaded_locked() {
         return false;
     }
 
-    n_embd_ = llama_model_n_embd(model_);
+    // Use the projected output dim, not the hidden size. Models with a
+    // dense head (e.g. LFM2.5-Embedding's dense_2 -> 1024) emit vectors of
+    // n_embd_out(); n_embd_out() falls back to n_embd for plain encoders
+    // (bge/granite), so this is correct for every embedding model.
+    n_embd_ = llama_model_n_embd_out(model_);
     init_succeeded_ = true;
     LLAMA_LOG_INFO("mt::EmbeddingModel: loaded %s (n_embd=%d)\n", path_.c_str(), n_embd_);
     return true;
@@ -77,91 +95,108 @@ void EmbeddingModel::shutdown_locked() {
     init_succeeded_ = false;
 }
 
-std::vector<float> EmbeddingModel::embed(const std::string & text) {
+std::vector<float> EmbeddingModel::embed(const std::string & text, EmbedRole role) {
+    auto result = embed_batch({text}, role);
+    return result.empty() ? std::vector<float>{} : std::move(result[0]);
+}
+
+std::vector<std::vector<float>> EmbeddingModel::embed_batch(const std::vector<std::string> & texts,
+                                                           EmbedRole role) {
     std::lock_guard<std::mutex> lk(mu_);
 
-    if (!ensure_loaded_locked()) return {};
-    if (text.empty()) return {};
+    std::vector<std::vector<float>> result(texts.size());
+
+    if (!ensure_loaded_locked() || texts.empty()) return result;
 
     const llama_vocab * vocab = llama_model_get_vocab(model_);
     if (!vocab) {
-        LLAMA_LOG_WARN("mt::EmbeddingModel::embed: no vocab on model\n");
-        return {};
+        LLAMA_LOG_WARN("mt::EmbeddingModel::embed_batch: no vocab on model\n");
+        return result;
     }
 
-    // Tokenize. add_special=true to include BOS for bge-style models.
-    // First call with negative count returns the required token count.
-    int n_tokens_max = (int) text.size() + 8;
-    std::vector<llama_token> tokens(n_tokens_max);
-    int n_tokens = llama_tokenize(vocab, text.c_str(), (int) text.size(),
-                                  tokens.data(), n_tokens_max,
-                                  /*add_special=*/ true,
-                                  /*parse_special=*/ false);
-    if (n_tokens < 0) {
-        // Buffer too small. The negative return is -required_size.
-        n_tokens_max = -n_tokens;
-        tokens.resize(n_tokens_max);
-        n_tokens = llama_tokenize(vocab, text.c_str(), (int) text.size(),
-                                  tokens.data(), n_tokens_max, true, false);
+    std::vector<std::vector<llama_token>> tokenized(texts.size());
+    for (size_t i = 0; i < texts.size(); ++i) {
+        const auto & text = texts[i];
+        if (text.empty()) continue;
+        // Prepend the model's asymmetric retrieval prefix before tokenizing.
+        const std::string prefixed = embed_prefix(role) + text;
+        int cap = (int) prefixed.size() + 8;
+        tokenized[i].resize(cap);
+        int n = llama_tokenize(vocab, prefixed.c_str(), (int) prefixed.size(),
+                               tokenized[i].data(), cap, true, false);
+        if (n < 0) {
+            cap = -n;
+            tokenized[i].resize(cap);
+            n = llama_tokenize(vocab, prefixed.c_str(), (int) prefixed.size(),
+                               tokenized[i].data(), cap, true, false);
+        }
+        if (n <= 0) {
+            tokenized[i].clear();
+            continue;
+        }
+        // Clamp to the batch budget, NOT llama_n_ctx(): embedding models
+        // silently inflate n_ctx to their trained max (granite -> 8192,
+        // LFM2.5 -> 128000), so llama_n_ctx() is not a safe per-sequence
+        // cap. A single sequence over n_ubatch/n_batch aborts either the
+        // encode assert (n_ubatch >= n_tokens) or the decode assert
+        // (n_tokens_all <= n_batch). EMBED_BATCH_TOKENS == both (512).
+        tokenized[i].resize(std::min(n, EMBED_BATCH_TOKENS));
     }
-    if (n_tokens <= 0) {
-        LLAMA_LOG_DEBUG("mt::EmbeddingModel::embed: tokenization produced %d tokens\n", n_tokens);
-        return {};
-    }
 
-    // Cap to context size; bge-small's 512 limit is plenty for chunk
-    // fingerprinting (we'd typically embed ~50-200 tokens).
-    const int n_ctx = (int) llama_n_ctx(ctx_);
-    if (n_tokens > n_ctx) n_tokens = n_ctx;
-    tokens.resize(n_tokens);
+    size_t next = 0;
+    while (next < texts.size()) {
+        std::vector<size_t> indices;
+        int n_batch_tokens = 0;
+        while (next < texts.size() && (int) indices.size() < EMBED_BATCH_SEQS) {
+            const int n = (int) tokenized[next].size();
+            if (n == 0) {
+                ++next;
+                continue;
+            }
+            if (!indices.empty() && n_batch_tokens + n > EMBED_BATCH_TOKENS) break;
+            indices.push_back(next++);
+            n_batch_tokens += n;
+        }
+        if (indices.empty()) continue;
 
-    // Build a single-sequence batch. The pooling layer will reduce to
-    // one vector per seq.
-    llama_batch batch = llama_batch_init(n_tokens, /*embd=*/ 0, /*n_seq_max=*/ 1);
-    for (int i = 0; i < n_tokens; ++i) {
-        batch.token   [i] = tokens[i];
-        batch.pos     [i] = i;
-        batch.n_seq_id[i] = 1;
-        batch.seq_id  [i][0] = 0;
-        batch.logits  [i] = (i == n_tokens - 1) ? 1 : 0;
-    }
-    batch.n_tokens = n_tokens;
+        llama_batch batch = llama_batch_init(n_batch_tokens, 0, (int) indices.size());
+        int ib = 0;
+        for (size_t seq = 0; seq < indices.size(); ++seq) {
+            const auto & tokens = tokenized[indices[seq]];
+            for (size_t pos = 0; pos < tokens.size(); ++pos, ++ib) {
+                batch.token   [ib] = tokens[pos];
+                batch.pos     [ib] = (llama_pos) pos;
+                batch.n_seq_id[ib] = 1;
+                batch.seq_id  [ib][0] = (llama_seq_id) seq;
+                batch.logits  [ib] = pos + 1 == tokens.size();
+            }
+        }
+        batch.n_tokens = ib;
 
-    // Reset cache for this seq before decode (the bge model is
-    // single-shot — every call starts fresh).
-    llama_memory_clear(llama_get_memory(ctx_), true);
+        llama_memory_clear(llama_get_memory(ctx_), true);
+        if (llama_decode(ctx_, batch) != 0) {
+            LLAMA_LOG_WARN("mt::EmbeddingModel::embed_batch: llama_decode failed for %zu sequences\n", indices.size());
+            llama_batch_free(batch);
+            continue;
+        }
 
-    if (llama_decode(ctx_, batch) != 0) {
-        LLAMA_LOG_WARN("mt::EmbeddingModel::embed: llama_decode failed\n");
+        for (size_t seq = 0; seq < indices.size(); ++seq) {
+            const float * raw = llama_get_embeddings_seq(ctx_, (llama_seq_id) seq);
+            if (!raw && indices.size() == 1) raw = llama_get_embeddings(ctx_);
+            if (!raw) continue;
+            auto & v = result[indices[seq]];
+            v.assign(raw, raw + n_embd_);
+            double norm_sq = 0.0;
+            for (float x : v) norm_sq += (double) x * x;
+            if (norm_sq > 0.0) {
+                const float inv = (float) (1.0 / std::sqrt(norm_sq));
+                for (float & x : v) x *= inv;
+            }
+        }
         llama_batch_free(batch);
-        return {};
     }
 
-    const float * raw = llama_get_embeddings_seq(ctx_, 0);
-    if (!raw) {
-        // Some pooling configs don't produce per-seq output; fall back to
-        // last-token embedding via llama_get_embeddings.
-        raw = llama_get_embeddings(ctx_);
-    }
-    if (!raw) {
-        LLAMA_LOG_WARN("mt::EmbeddingModel::embed: no embedding output\n");
-        llama_batch_free(batch);
-        return {};
-    }
-
-    std::vector<float> v(raw, raw + n_embd_);
-    llama_batch_free(batch);
-
-    // L2 normalize. SemanticIndex expects normalized vectors so cosine
-    // similarity reduces to a dot product.
-    double norm_sq = 0.0;
-    for (float x : v) norm_sq += (double) x * x;
-    if (norm_sq > 0.0) {
-        const float inv = (float) (1.0 / std::sqrt(norm_sq));
-        for (float & x : v) x *= inv;
-    }
-
-    return v;
+    return result;
 }
 
 }  // namespace mt

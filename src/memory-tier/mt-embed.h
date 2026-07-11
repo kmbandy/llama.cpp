@@ -27,6 +27,16 @@
 
 namespace mt {
 
+// Asymmetric retrieval role. Modern embedders (LFM2.5-Embedding, nomic,
+// arctic, bge) are trained with distinct query/passage instruction
+// prefixes and silently lose recall if you embed both sides the same way.
+// The prefix strings themselves are model-specific and live in mt-embed.cpp.
+// Document is the default because all but one call site embed passages.
+enum class EmbedRole {
+    Document,
+    Query,
+};
+
 class EmbeddingModel {
 public:
     explicit EmbeddingModel(std::string path);
@@ -38,7 +48,12 @@ public:
     // Returns L2-normalized embedding of `text`. Empty vector on failure
     // (model failed to load, tokenization produced no tokens, decode
     // returned no embedding). Lazy-initializes the model on first call.
-    std::vector<float> embed(const std::string & text);
+    std::vector<float> embed(const std::string & text, EmbedRole role = EmbedRole::Document);
+
+    // Embed multiple independent texts with multi-sequence batches. Results
+    // preserve input order; an empty vector marks an item that failed.
+    std::vector<std::vector<float>> embed_batch(const std::vector<std::string> & texts,
+                                                EmbedRole role = EmbedRole::Document);
 
     // Embedding dimensionality of the loaded model. Returns 0 if the
     // model hasn't been initialized yet (no embed() call has succeeded).
