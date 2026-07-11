@@ -315,7 +315,7 @@ static __device__ __forceinline__ void decode_coop_stage_turbo4_64(
         #pragma unroll
         for (int l = 0; l < 2; ++l) {
             const uint8_t idx_nib = (packed >> (l * 4)) & 0xF;
-            const float val = TURBO_CENTROIDS_4BIT[idx_nib] * norm_f;
+            const float val = TURBO_CENTROIDS_4BIT_N64[idx_nib] * norm_f;
             smem_dst[smem_row_base + smem_col_base + l] = __float2half(val);
         }
     }

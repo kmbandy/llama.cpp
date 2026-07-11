@@ -1121,7 +1121,7 @@ int main() {
         for (int ctx : { 128, 512 }) {
             char l[64]; snprintf(l, sizeof l, "paged turbo4_64 hd64 decode ctx=%d", ctx);
             const paged_case d64 { 64, 8, 2, 16, 1, ctx, 1, GGML_TYPE_TURBO4_64 };
-            all_ok = compare_paged_case(l, d64, vk, cuda, 5e-2) && all_ok;
+            all_ok = compare_paged_case(l, d64, vk, cuda, 1e-2) && all_ok;
         }
     }
 
