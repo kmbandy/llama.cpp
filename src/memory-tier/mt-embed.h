@@ -71,6 +71,7 @@ private:
     llama_model    *     model_ = nullptr;
     llama_context  *     ctx_   = nullptr;
     int                  n_embd_ = 0;
+    int                  n_ctx_seq_ = 0;   // per-sequence KV capacity of ctx_ (llama_n_ctx_seq); hard cap per input
     bool                 init_attempted_ = false;
     bool                 init_succeeded_ = false;
 };

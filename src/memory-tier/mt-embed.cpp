@@ -9,8 +9,10 @@
 
 namespace mt {
 
-static constexpr int EMBED_BATCH_TOKENS = 512;
-static constexpr int EMBED_BATCH_SEQS   = 32;
+static constexpr int EMBED_BATCH_TOKENS = 512;   // max tokens per llama_decode (n_batch/n_ubatch) AND per single input
+static constexpr int EMBED_BATCH_SEQS   = 16;    // max sequences per decode. With n_ctx = TOKENS*SEQS below, llama.cpp
+                                                 // derives n_ctx_seq = GGML_PAD(n_ctx/n_seq_max, 256) = 512 per stream,
+                                                 // so each stream can hold a full EMBED_BATCH_TOKENS-length input.
 
 // Model-specific asymmetric retrieval prefixes. LFM2.5-Embedding-350M was
 // trained with these exact strings (config_sentence_transformers.json);
@@ -58,9 +60,21 @@ bool EmbeddingModel::ensure_loaded_locked() {
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx        = 512;                          // query window is capped at 512; KV blocks are 16 tokens
-    cparams.n_batch      = 512;
-    cparams.n_ubatch     = 512;                          // non-causal encode needs n_ubatch >= n_tokens; 512 covers the largest input
+    // KV sizing (learned the hard way, 2026-07-11): llama.cpp derives the
+    // PER-SEQUENCE capacity as n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256),
+    // then re-expands n_ctx = n_ctx_seq * n_seq_max. A single input longer
+    // than n_ctx_seq fails llama_decode with "find_slot: n_tokens > size"
+    // (non-fatal: returns empty embedding, silently dropping the fingerprint).
+    // The old n_ctx=512 + n_seq_max=32 gave n_ctx_seq=256, so 257..512-token
+    // QUERY embeds (q_max is capped at 512 upstream) all failed. Setting
+    // n_ctx = EMBED_BATCH_TOKENS * EMBED_BATCH_SEQS makes n_ctx_seq exactly
+    // EMBED_BATCH_TOKENS (512), so every stream holds a full-length input.
+    // Same total cell count as before (8192) — just 16 streams x 512 instead
+    // of 32 x 256 — so no extra RAM. Inputs are still hard-clamped to the
+    // ACTUAL n_ctx_seq below (n_ctx_seq_) so this can never silently desync.
+    cparams.n_ctx        = EMBED_BATCH_TOKENS * EMBED_BATCH_SEQS;  // 8192 -> n_ctx_seq = 512
+    cparams.n_batch      = EMBED_BATCH_TOKENS;
+    cparams.n_ubatch     = EMBED_BATCH_TOKENS;           // non-causal encode needs n_ubatch >= tokens-per-decode (<= EMBED_BATCH_TOKENS)
     cparams.n_seq_max    = EMBED_BATCH_SEQS;
     cparams.embeddings   = true;
     cparams.pooling_type = LLAMA_POOLING_TYPE_CLS;       // LFM2.5-Embedding-350M uses CLS pooling
@@ -78,8 +92,11 @@ bool EmbeddingModel::ensure_loaded_locked() {
     // n_embd_out(); n_embd_out() falls back to n_embd for plain encoders
     // (bge/granite), so this is correct for every embedding model.
     n_embd_ = llama_model_n_embd_out(model_);
+    // Actual per-sequence KV capacity after llama.cpp's GGML_PAD/re-expand.
+    // This is the hard cap on any single input; inputs are clamped to it.
+    n_ctx_seq_ = (int) llama_n_ctx_seq(ctx_);
     init_succeeded_ = true;
-    LLAMA_LOG_INFO("mt::EmbeddingModel: loaded %s (n_embd=%d)\n", path_.c_str(), n_embd_);
+    LLAMA_LOG_INFO("mt::EmbeddingModel: loaded %s (n_embd=%d, n_ctx_seq=%d)\n", path_.c_str(), n_embd_, n_ctx_seq_);
     return true;
 }
 
@@ -134,13 +151,15 @@ std::vector<std::vector<float>> EmbeddingModel::embed_batch(const std::vector<st
             tokenized[i].clear();
             continue;
         }
-        // Clamp to the batch budget, NOT llama_n_ctx(): embedding models
-        // silently inflate n_ctx to their trained max (granite -> 8192,
-        // LFM2.5 -> 128000), so llama_n_ctx() is not a safe per-sequence
-        // cap. A single sequence over n_ubatch/n_batch aborts either the
-        // encode assert (n_ubatch >= n_tokens) or the decode assert
-        // (n_tokens_all <= n_batch). EMBED_BATCH_TOKENS == both (512).
-        tokenized[i].resize(std::min(n, EMBED_BATCH_TOKENS));
+        // Clamp each input to the context's ACTUAL per-sequence KV capacity
+        // (n_ctx_seq_ = llama_n_ctx_seq()). Do NOT use llama_n_ctx(): embedding
+        // models inflate it to their trained max (granite -> 8192, LFM2.5 ->
+        // 128000), and it is the TOTAL across streams, not the per-seq cap.
+        // A single input longer than n_ctx_seq_ fails llama_decode with
+        // "find_slot: n_tokens > size" -> empty embedding, dropped fingerprint.
+        // (Fallback to EMBED_BATCH_TOKENS if n_ctx_seq_ is somehow unset.)
+        const int seq_cap = n_ctx_seq_ > 0 ? n_ctx_seq_ : EMBED_BATCH_TOKENS;
+        tokenized[i].resize(std::min(n, seq_cap));
     }
 
     size_t next = 0;
