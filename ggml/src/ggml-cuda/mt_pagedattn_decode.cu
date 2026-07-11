@@ -36,6 +36,12 @@ namespace mt {
 
 using namespace ggml_cuda_mma;
 
+// Finite softmax-mask sentinel (mirrors mt_pagedattn_tile.cu). This TU is built
+// with -ffast-math (-ffinite-math-only), so IEEE negative-infinity is UB — the compiler
+// may delete -inf materialization / equality tests. -1e30f is finite and safely
+// below any real logit; expf(-1e30f - x) underflows to 0.
+static constexpr float SOFTMAX_MASK_VAL = -1.0e30f;
+
 // MAD-180 follow-up (2026-05-18): WMMA decode kernel for HEAD_SIZE=128/256.
 //
 // The original mt_paged_attention_decode_kernel was designed BEFORE the GQA
@@ -495,7 +501,7 @@ static __device__ __forceinline__ float decode_block_reduce_max(
     v = decode_warp_reduce_max(v);
     if (lane == 0) red_smem[wid] = v;
     __syncthreads();
-    float partial = (threadIdx.x < DECODE_NUM_WARPS) ? red_smem[lane] : -INFINITY;
+    float partial = (threadIdx.x < DECODE_NUM_WARPS) ? red_smem[lane] : SOFTMAX_MASK_VAL;
     if (wid == 0) {
         partial = decode_warp_reduce_max(partial);
         if (lane == 0) red_smem[0] = partial;
@@ -637,7 +643,7 @@ __global__ void mt_paged_attention_decode_kernel(
     float running_sum[DECODE_MAX_Q];
     #pragma unroll
     for (int qhqi = 0; qhqi < DECODE_MAX_Q; ++qhqi) {
-        running_max[qhqi] = -INFINITY;
+        running_max[qhqi] = SOFTMAX_MASK_VAL;
         running_sum[qhqi] = 0.0f;
         #pragma unroll
         for (int v = 0; v < VEC_PER_THREAD; ++v) v_acc[v][qhqi] = 0.0f;
@@ -679,7 +685,7 @@ __global__ void mt_paged_attention_decode_kernel(
                         const int qi       = qhqi % q_len;   // all q_heads in a group share q_pos
                         const int q_pos_qi = q_pos_first + qi;
                         const bool visible = (t < sub_len) && (token <= q_pos_qi);
-                        smem_logits[qhqi * DECODE_K_TILE_N + t] = visible ? (qk * scale) : -INFINITY;
+                        smem_logits[qhqi * DECODE_K_TILE_N + t] = visible ? (qk * scale) : SOFTMAX_MASK_VAL;
                     }
                 }
             }
@@ -691,12 +697,12 @@ __global__ void mt_paged_attention_decode_kernel(
         for (int qhqi = 0; qhqi < total_q; ++qhqi) {
             float local_max = (tid < DECODE_K_TILE_N)
                               ? smem_logits[qhqi * DECODE_K_TILE_N + tid]
-                              : -INFINITY;
+                              : SOFTMAX_MASK_VAL;
             const float sub_max = decode_block_reduce_max(local_max, red_smem);
 
             const float new_max = max(running_max[qhqi], sub_max);
             float rescale = 1.0f;
-            if (running_max[qhqi] > -INFINITY) {
+            if (running_max[qhqi] > SOFTMAX_MASK_VAL) {
                 rescale = __expf(running_max[qhqi] - new_max);
                 running_sum[qhqi] *= rescale;
                 #pragma unroll
@@ -706,7 +712,7 @@ __global__ void mt_paged_attention_decode_kernel(
             float local_sum = 0.0f;
             if (tid < DECODE_K_TILE_N) {
                 const float lg = smem_logits[qhqi * DECODE_K_TILE_N + tid];
-                const float e  = (lg == -INFINITY) ? 0.0f : __expf(lg - new_max);
+                const float e  = (lg == SOFTMAX_MASK_VAL) ? 0.0f : __expf(lg - new_max);
                 smem_logits[qhqi * DECODE_K_TILE_N + tid] = e;
                 local_sum = e;
             }
@@ -864,7 +870,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
                 const size_t off = base + (size_t) qi * (HEAD_SIZE + 2);
                 for (int d = tid; d < HEAD_SIZE; d += 128) partials[off + d] = 0.0f;
                 if (tid == 0) {
-                    partials[off + HEAD_SIZE]     = -INFINITY;
+                    partials[off + HEAD_SIZE]     = SOFTMAX_MASK_VAL;
                     partials[off + HEAD_SIZE + 1] = 0.0f;
                 }
             }
@@ -924,7 +930,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     // Online softmax state. Each lane owns 8 cols of one Q row; the pair lane
     // (tid ^ 16) owns the other 8 cols of the same row. shfl_xor(_, 16) merges
     // the two halves for per-row reductions.
-    float running_max = -INFINITY;
+    float running_max = SOFTMAX_MASK_VAL;
     float running_sum = 0.0f;
 
     tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
@@ -994,18 +1000,18 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
                 const int col   = 8 * (lane / 16) + l;
                 const int k_pos = sub_start + col;
                 const bool visible = row_valid && (col < sub_len) && (k_pos < valid_ctx_max) && (k_pos <= q_pos_qi);
-                scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
+                scores.x[l] = visible ? (scores.x[l] * scale) : SOFTMAX_MASK_VAL;
             }
 
             // Per-row max
-            float local_max = -INFINITY;
+            float local_max = SOFTMAX_MASK_VAL;
             #pragma unroll
             for (int l = 0; l < scores.ne; ++l) local_max = max(local_max, scores.x[l]);
             const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
 
             const float new_max = max(running_max, row_max);
             float rescale = 1.0f;
-            if (running_max > -INFINITY) {
+            if (running_max > SOFTMAX_MASK_VAL) {
                 rescale = __expf(running_max - new_max);
                 running_sum *= rescale;
                 #pragma unroll
@@ -1018,7 +1024,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
             float local_sum = 0.0f;
             #pragma unroll
             for (int l = 0; l < scores.ne; ++l) {
-                const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
+                const float e = (scores.x[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(scores.x[l] - new_max);
                 scores.x[l] = e;
                 local_sum  += e;
             }
@@ -1156,7 +1162,7 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
         const size_t qi_stride = (size_t) qi * (size_t) (HEAD_SIZE + 2);
 
         // Pass 1: global max across chunks for this query position.
-        float global_max = -INFINITY;
+        float global_max = SOFTMAX_MASK_VAL;
         for (int c = 0; c < valid_chunks; ++c) {
             const float m = partials[partial_seq_base + (size_t) c * chunk_stride_q + qi_stride + HEAD_SIZE];
             global_max = max(global_max, m);
@@ -1168,7 +1174,7 @@ __global__ void mt_paged_attention_decode_reduce_kernel(
         for (int c = 0; c < valid_chunks; ++c) {
             const size_t cbase = partial_seq_base + (size_t) c * chunk_stride_q + qi_stride;
             const float  c_max = partials[cbase + HEAD_SIZE];
-            if (c_max == -INFINITY) continue;
+            if (c_max == SOFTMAX_MASK_VAL) continue;
             const float c_sum = partials[cbase + HEAD_SIZE + 1];
             const float w     = __expf(c_max - global_max);
             global_sum += c_sum * w;

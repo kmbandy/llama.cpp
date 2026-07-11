@@ -17,6 +17,12 @@
 
 namespace mt {
 
+// Finite softmax-mask sentinel (mirrors mt_pagedattn_tile.cu). This TU is built
+// with -ffast-math (-ffinite-math-only), so IEEE negative-infinity is UB — the compiler
+// may delete -inf materialization / equality tests. -1e30f is finite and safely
+// below any real logit; expf(-1e30f - x) underflows to 0.
+static constexpr float SOFTMAX_MASK_VAL = -1.0e30f;
+
 // ───────────────── env-var: fused vs separate scatter ─────────────────
 //
 // Default (unset or GGML_PAGED_FUSED=0): mt_scatter_kv_kernel runs first
@@ -145,7 +151,7 @@ __device__ __forceinline__ float block_reduce_max(float v, float * red_smem) {
     if (lane == 0) red_smem[warp] = v;
     __syncthreads();
 
-    float partial = (lane < NUM_WARPS) ? red_smem[lane] : -INFINITY;
+    float partial = (lane < NUM_WARPS) ? red_smem[lane] : SOFTMAX_MASK_VAL;
     if (warp == 0) {
         partial = warp_reduce_max(partial);
         if (lane == 0) red_smem[0] = partial;
@@ -1415,7 +1421,7 @@ __global__ void mt_paged_attention_kernel(
         // overflow limit on the previous full-pass kernel).
         constexpr int CHUNK_SIZE = 256;
 
-        float running_max = -INFINITY;
+        float running_max = SOFTMAX_MASK_VAL;
         float running_sum = 0.0f;
         float acc[VEC_PER_THREAD];
 #pragma unroll
@@ -1434,7 +1440,7 @@ __global__ void mt_paged_attention_kernel(
             // block. tid==0 stores qk into the chunk-local logits[]. The
             // block_reduce_max at the end of this phase provides the
             // visibility barrier before Phase C reads logits[].
-            float chunk_max = -INFINITY;
+            float chunk_max = SOFTMAX_MASK_VAL;
             for (int i = 0; i < chunk_len; ++i) {
                 const int token         = chunk_start + i;
                 const int logical_block = token / BLOCK_SIZE;
@@ -1455,7 +1461,7 @@ __global__ void mt_paged_attention_kernel(
                 // All threads see the same physical → ternary is uniform;
                 // either all call block_reduce_sum or all skip it.
                 const float qk = (physical == kInvalidBlockTableEntry)
-                    ? -INFINITY
+                    ? SOFTMAX_MASK_VAL
                     : block_reduce_sum<NUM_WARPS>(partial_qk, red_smem) * scale;
 
                 if (tid == 0) logits[i] = qk;
@@ -1465,7 +1471,7 @@ __global__ void mt_paged_attention_kernel(
 
             // ── Phase B: rescale running state to new_max ──
             const float new_max = max(running_max, chunk_max);
-            if (running_max != -INFINITY) {
+            if (running_max != SOFTMAX_MASK_VAL) {
                 const float rescale = __expf(running_max - new_max);
                 running_sum *= rescale;
 #pragma unroll
