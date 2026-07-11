@@ -78,6 +78,11 @@ public:
         uint64_t cross_layer_prefetch_submitted = 0;
         uint64_t cross_layer_hit_in_ensure      = 0;
         uint64_t speculative_evicted_unused     = 0; // xlayer: prefetched, evicted, never demanded
+        uint64_t xlayer_predict_calls           = 0; // submit_xlayer_prefetch invocations
+        uint64_t xlayer_pred_pages              = 0; // predicted sister pages before filters
+        uint64_t xlayer_resident_skips          = 0; // predicted pages already resident/in-flight
+        uint64_t xlayer_blocked_budget          = 0; // submits skipped: speculative cap reached
+        uint64_t xlayer_blocked_free_queue      = 0; // submits skipped: scheduler queue full
         uint64_t host_tier_hits                 = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;

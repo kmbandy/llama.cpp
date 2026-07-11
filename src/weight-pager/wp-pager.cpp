@@ -568,6 +568,7 @@ bool WeightPager::predictor_has_router(int block_idx) const {
 
 void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
     if (!initialized_ || !xlayer_prefetch_enabled_ || h == nullptr) return;
+    ++stats_.xlayer_predict_calls;
     std::vector<ExpertRef> refs;
     predictor_.predict(h, from_layer, xlayer_lookahead_k_, xlayer_topk_, n_layer_, refs);
     if (refs.empty()) return;
@@ -578,21 +579,25 @@ void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
     if (pages.empty()) return;
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    stats_.xlayer_pred_pages += (uint64_t) pages.size();
     std::vector<int> fresh;
     fresh.reserve(pages.size());
     for (int p : pages) {
         if (p < 0 || p >= catalog_.size()) continue;
         if (catalog_.at(p).is_pinned) continue;
-        if (page_to_slot_[p] >= 0) continue;   // resident or already in flight
+        if (page_to_slot_[p] >= 0) { ++stats_.xlayer_resident_skips; continue; }  // resident/in-flight
         fresh.push_back(p);
     }
     if (fresh.empty()) return;
     // Speculative slot budget: never let speculation exceed the cap.
     if (xlayer_max_slots_ > 0) {
         const int budget = xlayer_max_slots_ - pool_.n_speculative();
-        if (budget <= 0) return;
+        if (budget <= 0) { ++stats_.xlayer_blocked_budget; return; }
         if ((int) fresh.size() > budget) fresh.resize((size_t) budget);
     }
+    // Scheduler queue starvation is the other suspect: if the async queue is
+    // full (demand traffic), speculative submits get rejected. Count it.
+    if (prefetch_.free_queue_slots() <= 0) { ++stats_.xlayer_blocked_free_queue; return; }
     mark_cross_layer_prefetch_candidates(fresh);
     prefetch_pages_batch(fresh, /*count_dense_prefetch=*/false, /*allow_evict=*/true, /*speculative=*/true);
 }
@@ -696,7 +701,7 @@ bool WeightPager::init(const Config &             cfg,
         xlayer_max_slots_ = pool_.n_slots() / 4;
         if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
         if (xlayer_prefetch_enabled_) {
-            LLAMA_LOG_INFO("wp::xlayer prefetch: on K=%d M=%d cap=%d n_layer=%d\n",
+            LLAMA_LOG_WARN("wp::xlayer prefetch: on K=%d M=%d cap=%d n_layer=%d\n",
                            xlayer_lookahead_k_, xlayer_topk_, xlayer_max_slots_, n_layer_);
         }
     }
@@ -1046,6 +1051,18 @@ void WeightPager::record_page_in_(size_t bytes, double seconds) {
 }
 
 void WeightPager::log_stats_summary() {
+    if (xlayer_prefetch_enabled_) {
+        LLAMA_LOG_WARN("  [xlayer] predict_calls=%lu pred_pages=%lu resident_skips=%lu "
+                       "blocked_budget=%lu blocked_free_queue=%lu submitted=%lu hit=%lu spec_evict_unused=%lu\n",
+                       (unsigned long) stats_.xlayer_predict_calls,
+                       (unsigned long) stats_.xlayer_pred_pages,
+                       (unsigned long) stats_.xlayer_resident_skips,
+                       (unsigned long) stats_.xlayer_blocked_budget,
+                       (unsigned long) stats_.xlayer_blocked_free_queue,
+                       (unsigned long) stats_.cross_layer_prefetch_submitted,
+                       (unsigned long) stats_.cross_layer_hit_in_ensure,
+                       (unsigned long) stats_.speculative_evicted_unused);
+    }
     // WP_PROFILE_EVAL host-time breakdown (no-op unless the env flag is set).
     weight_pager_eval_cb_print_profile();
 

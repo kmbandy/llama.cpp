@@ -1925,10 +1925,11 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
             if (streamOn && (now - lastSnap) >= 0.2) { lastSnap = now;
                 // FREEZE-FRAME every 200ms -> real disk: the ONLY forensics that survives a MES-wedge brick
                 //   (timeout/final readouts never fire on a brick). STAGINSTR counters + flow_snapshot frontier.
-                fprintf(stderr, "[dsws2 +%5.2fs] occ0=%u claim=%u fence=%s | comp=%u coast=%u gf=%u | FRONTIER ASSIGN=%u STAGE=%u DRAIN=%u slot[RB=%u BF=%u AR=%u] barrier=%u\n",
+                fprintf(stderr, "[dsws2 +%5.2fs] occ0=%u claim=%u fence=%s | comp=%u coast=%u gf=%u | FRONTIER ASSIGN=%u STAGE=%u DRAIN=%u slot[RB=%u BF=%u AR=%u] barrier=%u | SPIN[sh=%u st=%u ta=%u] tick[e=%u x=%u] bank[w=%u a=%u]\n",
                         now-t0, occW[0], occW[5], (*fenceW==FENCE_VALUE)?"FIRED":"--",
                         occW[71], occW[70], occW[73],
-                        occW[74], occW[75], occW[76], occW[77], occW[78], occW[79], occW[80]); fflush(stderr); }
+                        occW[74], occW[75], occW[76], occW[77], occW[78], occW[79], occW[80],
+                        occW[81], occW[82], occW[83], occW[2], occW[3], occW[84], occW[85]); fflush(stderr); }
             if (occW[0] > 0) admitted = true;
             uint32_t end = occW[3]; if (end != lastEnd) { lastEnd = end; lastEndChange = now; }
             bool ff = (*fenceW == FENCE_VALUE);

@@ -1164,6 +1164,18 @@
 .set FDIAG_BFDONE_OFF,  312                 // occ[78] drain-slot SL_BFDONE (B-frags staged; target FN)
 .set FDIAG_ARDONE_OFF,  316                 // occ[79] drain-slot SL_ARDONE (A-rowblks staged; target G)
 .set FDIAG_QUIESCE_OFF, 320                 // occ[80] count-to-WAVES exit-barrier check-ins (target WAVES)
+// ---- COMPLETER-SPIN gauges (2026-07-10 diagnostic): "# waves currently parked in each unbounded, deadman-
+//   FREE inner spin". At a wedge the host reads the last-landed value -> pinpoints which spin holds a resident
+//   wave (the safemode cause). inc on enter / dec on exit; nets to 0 on a clean run, >0 == a stuck wave. ----
+.set FDIAG_SHRINK_OFF,  324                 // occ[81] waves currently in .Lflow_bshrink  (compute burst-shrink)
+.set FDIAG_STORE_OFF,   328                 // occ[82] waves currently in the C-store s_wait_storecnt (completer)
+.set FDIAG_TASHRINK_OFF,332                 // occ[83] waves currently in .Lflow_tashrink (grew-but-exhausted shrink)
+// ---- split-K bank accumulation counters (2026-07-10, group-split bug hunt): monotone counts of bank
+//   fresh-writes (ksi==0) vs accumulate-adds (ksi>0). Expected (24 tiles x GROUPS x ACC_N rowblks): writes
+//   == that product; adds == writes*(n_kseg-1). A count anomaly at n_kseg=64 => a deterministic re-init/
+//   re-process at the group boundary; counts exactly right but C wrong => wrong operands (address overflow). ----
+.set FDIAG_BWRITE_OFF,  336                 // occ[84] bank fresh-write (ds_store, ksi==0) events
+.set FDIAG_BADD_OFF,    340                 // occ[85] bank accumulate-add (ds_add_f32, ksi>0) events
 .macro instr_inc off
 .if STAGINSTR
     s_mov_b32 s57, exec_lo
@@ -1206,6 +1218,22 @@
     v_mov_b32 v3, -1
     global_atomic_add_u32 v4, v3, s[0:1] offset:FATLIVE_OFF scope:SCOPE_DEV                           // v4=addr(0), v3=-1
 .Lfd_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// COMPLETER-SPIN gauge: lane0 +/-1 into occ[81/82/83] to count waves currently parked in an unbounded,
+//   deadman-free inner spin (bshrink / C-store wait / tashrink). Mirrors fat_dec (lane0-only, STAGINSTR-gated,
+//   v3=val v4=addr(0), s57=exec save). The inc's write LANDS in device memory even if a following store-wait
+//   hangs (separate op), so the host's frozen read at a wedge shows exactly which spin holds a resident wave.
+.macro flow_gauge off, val
+.if STAGINSTR
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgg_skip\@
+    v_mov_b32 v3, \val
+    global_atomic_add_u32 v4, v3, s[0:1] offset:\off scope:SCOPE_DEV
+.Lgg_skip\@:
     s_mov_b32 exec_lo, s57
 .endif
 .endm
@@ -1748,6 +1776,7 @@ occ_kernel:
     v_add_nc_u32 v12, v10, s39                     // v12 = bank r ds vaddr (lane*32 + bankbase)
     s_cmp_eq_u32 s31, 0                            // first segment of this tile's rowblk?
     s_cbranch_scc1 .Lflow_bankwr
+    flow_gauge FDIAG_BADD_OFF, 1                    // DIAG count: a ksi>0 accumulate-add event
     .set frag, 0
     .rept FM*FN
       .set e, 0
@@ -1759,6 +1788,7 @@ occ_kernel:
     .endr
     s_branch .Lflow_bankdn
 .Lflow_bankwr:
+    flow_gauge FDIAG_BWRITE_OFF, 1                  // DIAG count: a ksi==0 fresh-write event
     .set frag, 0
     .rept FM*FN
       .set e, 0
@@ -1776,9 +1806,11 @@ occ_kernel:
     lds_fetch_add_r s47, s45, 1                   // s47 = old RBDONE; old==G-1 -> I am the UNIQUE completer
 .if DYNVGPR
     fat_dec                                       // burst end: --live fat gauge (STAGINSTR) before the shrink
+    flow_gauge FDIAG_SHRINK_OFF, 1                // DIAG: entering the unbounded/deadman-free burst-shrink
 .Lflow_bshrink:
     s_alloc_vgpr 32                               // SHRINK -> lean (close the trapezoid burst) BEFORE any store
     s_cbranch_scc0 .Lflow_bshrink
+    flow_gauge FDIAG_SHRINK_OFF, -1               // DIAG: shrink succeeded (occ[81] nets to 0)
 .endif
     s_add_u32 s47, s47, 1
     s_cmp_ge_u32 s47, ACC_N                         // (old+1) >= ACC_N (== G at GROUPS=1) -> I completed this group
@@ -1790,6 +1822,7 @@ occ_kernel:
     s_cmp_eq_u32 s31, s67                          // ksi == mask (n_kseg-1) -> tile complete?
     s_cbranch_scc0 .Lflow_drain_adv               // not last ksi -> just advance DRAIN (no store)
 .if !WOFLUSH
+    flow_gauge FDIAG_STORE_OFF, 1                 // DIAG: entering the completer C-store phase (store loop + wait)
     s_mul_i32 s38, s19, s13                        // mblk*NTL
     s_add_u32 s38, s38, s30                        // + tcol
     s_mul_i32 s38, s38, (G*FM*FN*1024)            // * per-tile C bytes
@@ -1818,6 +1851,7 @@ occ_kernel:
       .set r, r+1
     .endr
     s_wait_storecnt 0x0                            // store COMPLETE before DRAIN++ -> banks safe to reuse
+    flow_gauge FDIAG_STORE_OFF, -1                // DIAG: C-store drained (occ[82] nets to 0)
 .endif                                             // WOFLUSH: atomics already wrote C incrementally -> no store, just DRAIN++
 .Lflow_drain_adv:
     lds_get s44, DRAIN_HEAD_OFF
@@ -1826,9 +1860,11 @@ occ_kernel:
 .Lflow_cmp_tryadv:
 .if DYNVGPR
     fat_dec                                       // grew-but-exhausted: --live fat gauge (STAGINSTR) before the shrink
+    flow_gauge FDIAG_TASHRINK_OFF, 1              // DIAG: entering the grew-but-exhausted shrink
 .Lflow_tashrink:
     s_alloc_vgpr 32                               // grew but rowblks exhausted (no claim) -> shrink back lean
     s_cbranch_scc0 .Lflow_tashrink
+    flow_gauge FDIAG_TASHRINK_OFF, -1             // DIAG: shrink succeeded (occ[83] nets to 0)
 .endif
     s_branch .Lflow_loop                          // the bank store + DRAIN advance are done by the COMPLETER
                                                   //   (the unique wave whose SL_RBDONE inc hit G, in .Lflow_bankdn)
@@ -1940,8 +1976,23 @@ occ_kernel:
     s_cmp_ge_u32 s53, WAVES                     // all WAVES waves in -> exit together
     s_cbranch_scc1 .Lflow_endpgm
     s_add_u32 s52, s52, 1
-    s_cmp_ge_u32 s52, RETBAR_MAX                // safety bound -> exit anyway (never hang)
+    s_cmp_ge_u32 s52, RETBAR_MAX                // hard iteration backstop -> exit anyway (never hang)
     s_cbranch_scc1 .Lflow_endpgm
+.if DEADMAN
+    // WALL-TIME BOUND (fix 2026-07-10): the RETBAR_MAX *iteration* bound stretches to ~18s of resident spin
+    //   under compositor contention (waves get scheduled slowly), which starves the gfx ring -> safemode. Bound
+    //   total ALIVE time to the deadman deadline instead -- but THROTTLED to every DEADMAN_EVERY iters so the
+    //   s_sendmsg_rtn msg-bus read cannot itself spam the SQ front end (the 2026-07-05 brick class; see the
+    //   deadman_check note at :544). s70 = this wave's start RTC (deadman_stamp). Assumes DEADMAN_EVERY is pow2.
+    s_and_b32 s53, s52, (DEADMAN_EVERY-1)
+    s_cbranch_scc1 .Lflow_rb_sleep              // not a DEADMAN_EVERY-th iter -> skip the RTC read
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s62, s62, s70                      // elapsed alive (u32 wrap-safe; deadline << 42s)
+    s_cmp_ge_u32 s62, DEADMAN_TICKS              // resident past the deadman deadline -> drain out NOW (never starve)
+    s_cbranch_scc1 .Lflow_endpgm
+.Lflow_rb_sleep:
+.endif
     s_sleep SLEEPN
     s_branch .Lflow_retbar
 .Lflow_endpgm:

@@ -372,14 +372,20 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             };
             hipStream_t wp_stream =
                 (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
+            // WP_PREFETCH_XLAYER_NOSYNC: skip the per-layer stream sync to isolate
+            // its cost. h may be mid-copy => predictions can be stale, but prefetch
+            // never affects decoded output, only recall — safe as a measurement.
+            static const int s_xl_nosync = [](){ const char* e=std::getenv("WP_PREFETCH_XLAYER_NOSYNC"); return (e&&e[0]=='1')?1:0; }();
             auto d2h = [&](const void * dptr, size_t nb, std::vector<char> & host) -> bool {
                 host.resize(nb);
                 hipError_t ce;
                 if (wp_stream != nullptr) {
                     ce = hipMemcpyAsync(host.data(), dptr, nb, hipMemcpyDeviceToHost, wp_stream);
-                    if (ce == hipSuccess) ce = hipStreamSynchronize(wp_stream);
-                } else {
+                    if (ce == hipSuccess && !s_xl_nosync) ce = hipStreamSynchronize(wp_stream);
+                } else if (!s_xl_nosync) {
                     hipDeviceSynchronize();
+                    ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
+                } else {
                     ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
                 }
                 return ce == hipSuccess;
