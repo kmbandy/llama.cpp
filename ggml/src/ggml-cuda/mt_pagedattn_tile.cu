@@ -39,6 +39,11 @@
 
 namespace mt {
 
+// Finite mask sentinel. Do NOT use IEEE -INFINITY: this TU is built with
+// -ffast-math (-ffinite-math-only), so infinities are UB and the compiler may
+// delete -inf materialization / equality tests. expf(-1e30f - x) underflows to 0.
+static constexpr float SOFTMAX_MASK_VAL = -1.0e30f;
+
 using namespace ggml_cuda_mma;
 
 // Single wave32 warp per block (RDNA3/RDNA4 native wave size).
@@ -437,7 +442,7 @@ __global__ void mt_paged_attention_tile_kernel(
     // Per-row running_max / running_sum live in scalars, shared between the
     // pair via the row-reduce shfl. acc[N_INNER] holds the 16×16 output tiles
     // (one per HEAD_SIZE 16-col block).
-    float running_max = -INFINITY;
+    float running_max = SOFTMAX_MASK_VAL;
     float running_sum = 0.0f;
 
     tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
@@ -492,12 +497,12 @@ __global__ void mt_paged_attention_tile_kernel(
             const int col   = 8 * (tid / 16) + l;
             const int k_pos = k_tile_start + col;
             const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
-            scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
+            scores.x[l] = visible ? (scores.x[l] * scale) : SOFTMAX_MASK_VAL;
         }
 
         // Per-row max: 8-wide local max + shfl_xor(mask=16) with the
         // pair-lane that owns cols 8..15 (vs 0..7) of the same row.
-        float local_max = -INFINITY;
+        float local_max = SOFTMAX_MASK_VAL;
         #pragma unroll
         for (int l = 0; l < scores.ne; ++l) {
             local_max = max(local_max, scores.x[l]);
@@ -508,7 +513,7 @@ __global__ void mt_paged_attention_tile_kernel(
 
         // Rescale running state if needed.
         float rescale = 1.0f;
-        if (running_max > -INFINITY) {
+        if (running_max > SOFTMAX_MASK_VAL) {
             rescale = __expf(running_max - new_max);
             running_sum *= rescale;
             #pragma unroll
@@ -524,7 +529,7 @@ __global__ void mt_paged_attention_tile_kernel(
         float local_sum = 0.0f;
         #pragma unroll
         for (int l = 0; l < scores.ne; ++l) {
-            const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
+            const float e = (scores.x[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(scores.x[l] - new_max);
             scores.x[l]   = e;
             local_sum   += e;
         }
@@ -648,7 +653,7 @@ __global__ void mt_paged_attention_tile_kernel(
     const int half = tid / 16;
 
     // Online-softmax state + output accumulators (this lane's 8 cols per HS block).
-    float running_max = -INFINITY;
+    float running_max = SOFTMAX_MASK_VAL;
     float running_sum = 0.0f;
     float acc[N_INNER][8];
     #pragma unroll
@@ -680,18 +685,18 @@ __global__ void mt_paged_attention_tile_kernel(
             }
             const int  k_pos   = k_tile_start + col;
             const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < valid_ctx);
-            sc[l] = visible ? (dot * scale) : -INFINITY;
+            sc[l] = visible ? (dot * scale) : SOFTMAX_MASK_VAL;
         }
 
         // Per-row max: 8-wide local then pair-lane (tid^16) via shfl_xor.
-        float local_max = -INFINITY;
+        float local_max = SOFTMAX_MASK_VAL;
         #pragma unroll
         for (int l = 0; l < 8; ++l) local_max = max(local_max, sc[l]);
         const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
         const float new_max = max(running_max, row_max);
 
         // Rescale running state on new max.
-        if (running_max > -INFINITY) {
+        if (running_max > SOFTMAX_MASK_VAL) {
             const float rescale = __expf(running_max - new_max);
             running_sum *= rescale;
             #pragma unroll
@@ -705,7 +710,7 @@ __global__ void mt_paged_attention_tile_kernel(
         float local_sum = 0.0f;
         #pragma unroll
         for (int l = 0; l < 8; ++l) {
-            const float e = (sc[l] == -INFINITY) ? 0.0f : __expf(sc[l] - new_max);
+            const float e = (sc[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(sc[l] - new_max);
             sc[l] = e;
             local_sum += e;
             smem_s[row * K_TILE_N + (8 * half + l)] = e;  // publish full row for PV
@@ -913,7 +918,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
     }
 
     // Per-warp online softmax state
-    float running_max = -INFINITY;
+    float running_max = SOFTMAX_MASK_VAL;
     float running_sum = 0.0f;
 
     tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
@@ -1028,12 +1033,12 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                 const int col   = 8 * (lane_id >> 4) + l;   // 8 * (lane_id / 16) + l
                 const int k_pos = k_tile_start + col;
                 const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < block_valid_ctx);
-                scores.x[l] = visible ? (scores.x[l] * scale) : -INFINITY;
+                scores.x[l] = visible ? (scores.x[l] * scale) : SOFTMAX_MASK_VAL;
             }
 
             // Per-row max via warp-local shfl_xor (mask=16 covers the two
             // threads that own cols 0-7 vs 8-15 of the same row).
-            float local_max = -INFINITY;
+            float local_max = SOFTMAX_MASK_VAL;
             #pragma unroll
             for (int l = 0; l < scores.ne; ++l) {
                 local_max = max(local_max, scores.x[l]);
@@ -1044,7 +1049,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
 
             // Rescale running state
             float rescale = 1.0f;
-            if (running_max > -INFINITY) {
+            if (running_max > SOFTMAX_MASK_VAL) {
                 rescale = __expf(running_max - new_max);
                 running_sum *= rescale;
                 #pragma unroll
@@ -1060,7 +1065,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             float local_sum = 0.0f;
             #pragma unroll
             for (int l = 0; l < scores.ne; ++l) {
-                const float e = (scores.x[l] == -INFINITY) ? 0.0f : __expf(scores.x[l] - new_max);
+                const float e = (scores.x[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(scores.x[l] - new_max);
                 scores.x[l]   = e;
                 local_sum   += e;
             }
@@ -1233,7 +1238,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
     const int row     = lane_id & 15;
     const int half_id = lane_id >> 4;
 
-    float running_max = -INFINITY;
+    float running_max = SOFTMAX_MASK_VAL;
     float running_sum = 0.0f;
     float acc[N_INNER][8];
     #pragma unroll
@@ -1287,18 +1292,18 @@ __global__ void mt_paged_attention_tile_mw_kernel(
                 }
                 const int  k_pos   = k_tile_start + col;
                 const bool visible = row_valid && (k_pos <= q_pos) && (k_pos < block_valid_ctx);
-                sc[l] = visible ? (dot * scale) : -INFINITY;
+                sc[l] = visible ? (dot * scale) : SOFTMAX_MASK_VAL;
             }
 
             // Per-row max: 8-wide local then pair-lane (lane^16) via shfl_xor.
-            float local_max = -INFINITY;
+            float local_max = SOFTMAX_MASK_VAL;
             #pragma unroll
             for (int l = 0; l < 8; ++l) local_max = max(local_max, sc[l]);
             const float row_max = max(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, 16, WARP_SIZE));
             const float new_max = max(running_max, row_max);
 
             // Rescale running state on new max.
-            if (running_max > -INFINITY) {
+            if (running_max > SOFTMAX_MASK_VAL) {
                 const float rescale = __expf(running_max - new_max);
                 running_sum *= rescale;
                 #pragma unroll
@@ -1312,7 +1317,7 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             float local_sum = 0.0f;
             #pragma unroll
             for (int l = 0; l < 8; ++l) {
-                const float e = (sc[l] == -INFINITY) ? 0.0f : __expf(sc[l] - new_max);
+                const float e = (sc[l] == SOFTMAX_MASK_VAL) ? 0.0f : __expf(sc[l] - new_max);
                 sc[l] = e;
                 local_sum += e;
             }
