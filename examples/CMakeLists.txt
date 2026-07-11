@@ -18,6 +18,8 @@ else()
     add_subdirectory(debug)
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
+    add_subdirectory(pagedattn-dump)
+    add_subdirectory(pagedattn-repro)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)

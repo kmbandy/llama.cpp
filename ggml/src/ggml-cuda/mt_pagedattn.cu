@@ -1717,7 +1717,23 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     // K/V staged once per block + shared across warps (HBM-reuse win)
                     // and N_WARPS*32 threads fill gfx803's 64-lane wave (occupancy win).
                     // GGML_PAGED_TILE_MULTIWARP=0 reverts to the single-warp tile kernel.
-                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0;
+                    //
+                    // Correctness gate (2026-07-11): the HS=256 multi-warp tile prefill
+                    // corrupts attention output on RDNA4/gfx1201 — runtime-isolated
+                    // 2026-07-10 (mw on -> "////" garbage; GGML_PAGED_TILE_MULTIWARP=0 ->
+                    // coherent; prefill-only, decode is fine). Deep static analysis found
+                    // NO source-level defect (index/barrier/OOB/race all cleared); the
+                    // failure is a compiler/resource sensitivity in this very register- &
+                    // LDS-heavy specialization (16 Q + 16 out WMMA frags, 64 KiB LDS,
+                    // __launch_bounds__(192,2)), likely tipped by header-symbol changes in
+                    // the 2026-07-06 sync. We therefore route RDNA4 HS=256 to the
+                    // proven-correct single-warp WMMA tile (still WMMA-accelerated).
+                    // Scoped by HS (not cache type): F16/TURBO3_0 at HS=256 also hit this
+                    // kernel and are unverified on RDNA4, so gate them too. The env var
+                    // cannot re-enable the broken path here.
+                    // See docs/dev/2026-07-10-turbo4-paged-mw-wmma-rdna4-corruption.md.
+                    const bool mw_on = get_paged_tile_multiwarp_mode() != 0
+                                       && !(GGML_CUDA_CC_IS_RDNA4(cc) && HS == 256);
                     if (mw_on) {
                         launch_paged_attn_tile_mw<HS, BS, CT>(
                             (__half *) dst->data,

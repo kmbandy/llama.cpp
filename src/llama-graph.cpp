@@ -3016,6 +3016,15 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cast = to_f16_cont(paged_pad_head ? pad_head_to_128(k_cur) : k_cur);
         ggml_tensor * v_cast = to_f16_cont(paged_pad_head ? pad_head_to_128(v_cur) : v_cur);
 
+        // TEMP DIAGNOSTIC (paged-attn cross-backend divergence investigation,
+        // not for merge): name the op's own Q/K/V inputs so an external
+        // cb_eval-based tool can dump them alongside the op's output and
+        // determine whether divergence originates upstream of this op or
+        // inside it.
+        ggml_format_name(q_cast, "paged_q_cast_l%d", il);
+        ggml_format_name(k_cast, "paged_k_cast_l%d", il);
+        ggml_format_name(v_cast, "paged_v_cast_l%d", il);
+
         // 2) Forward-expand the source nodes so they're fully computed
         //    before paged_attn reads them.
         ggml_build_forward_expand(gf, q_cast);

@@ -15,7 +15,7 @@
 // covers attention layers; recurrent state still flows through the
 // wrapper for hybrid models.
 //
-// HIP-only. Stub for non-HIP builds (return false everywhere).
+// Uses ggml's backend-neutral tensor transfer API.
 
 #include "mt-inner-access.h"
 
