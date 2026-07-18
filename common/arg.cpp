@@ -1596,6 +1596,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_INDEX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--kv-tier-semantic-parallel"}, "N",
+        "embedder contexts for the semantic index (default: 1). The fingerprint sweep runs the "
+        "embedder synchronously on the server's inference thread, so at N=1 every slot serializes "
+        "behind one embed lock. N>1 lets slots embed concurrently; the model is shared, so each "
+        "extra context costs only its own small KV buffers.",
+        [](common_params & params, int value) {
+            params.kv_semantic_parallel = value > 1 ? value : 1;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-span"}, "N",
+        "paged blocks covered by ONE semantic fingerprint (default: 16, i.e. 256-token passages "
+        "at the default 16-token block size). Decouples semantic granularity from KV PAGING "
+        "granularity, which are not the same concern: paging wants small blocks, retrieval wants "
+        "passages. At N=1 (the old behaviour) the sweep runs one embedder forward pass per 16 "
+        "tokens of context -- an 18k prompt costs ~1128 embeds and prefill collapses ~13x. "
+        "Raising N cuts the embed count by N and raises the cosine scores (a 16-token chunk scores "
+        "0.36 against its own query; a 256-token passage scores 0.56), so it interacts with "
+        "--kv-tier-semantic-threshold. N=1 restores per-block fingerprints.",
+        [](common_params & params, int value) {
+            params.kv_semantic_span = value > 1 ? value : 1;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_SPAN").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-threads"}, "N",
+        "CPU threads for the semantic-index embedder (default: follow --threads). This was "
+        "previously never set, so it inherited ggml's default of 4 regardless of the machine -- "
+        "a 350M model on 4 threads embeds at ~360 tok/s, and an 18k-token prefill sweep spent "
+        "50-68s in it. Following --threads is deliberately box-aware: a hardcoded 'cores-1' would "
+        "hand 11 threads to a 12-core host but only 3 to a 4-core one, i.e. FEWER than the old "
+        "default. On a small host the thread lever is exhausted -- reduce the TOKENS embedded "
+        "(--kv-tier-semantic-span) instead.",
+        [](common_params & params, int value) {
+            params.kv_semantic_threads = value > 0 ? value : -1;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_THREADS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-query-prefix"}, "STR",
+        "retrieval prefix prepended to QUERY embeddings. A property of the EMBEDDING MODEL, not "
+        "of llama.cpp: LFM2.5-Embedding wants \"query: \", BGE wants an instruction sentence, "
+        "Granite wants NONE. A wrong prefix is SILENT recall loss (no crash, no log). Default: empty.",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_query_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_QUERY_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-tier-semantic-doc-prefix"}, "STR",
+        "retrieval prefix prepended to DOCUMENT (fingerprint) embeddings. See "
+        "--kv-tier-semantic-query-prefix. LFM2.5-Embedding wants \"document: \"; BGE and Granite "
+        "want none. Must match the model, and must match --kv-tier-semantic-threshold, which is "
+        "also model-specific (measured: LFM2.5 0.35, BGE 0.63, Granite 0.84). Default: empty.",
+        [](common_params & params, const std::string & value) {
+            params.kv_semantic_doc_prefix = value;
+        }
+    ).set_env("LLAMA_ARG_KV_TIER_SEMANTIC_DOC_PREFIX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--kv-semantic-index"}, "PATH",
         "[DEPRECATED — use --kv-tier-semantic-index] semantic prefetch index",
         [](common_params & params, const std::string & value) {
@@ -3494,6 +3550,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--models-idle-timeout"}, "SECONDS",
+        string_format("for router server, unload a model after it has been idle this long, giving its GPU\n"
+                      "and its host-side KV back. A model is idle only when it has NO in-flight request,\n"
+                      "so a long generation is never interrupted. Pinned models are never unloaded.\n"
+                      "(default: %d, 0 = never unload)", params.models_idle_timeout),
+        [](common_params & params, int value) {
+            params.models_idle_timeout = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_IDLE_TIMEOUT"));
+    add_opt(common_arg(
         {"--gpus"}, "SPEC",
         "for router server, declared GPU slots as name:total_mb:probe[,name:total_mb:probe...]",
         [](common_params & params, const std::string & value) {
@@ -4570,6 +4636,15 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, prevent automatic eviction of this model",
         [](common_params &, bool) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_PINNED").set_preset_only());
+
+    args.push_back(common_arg(
+        {"exclusive"},
+        {"no-exclusive"},
+        "in server router mode, this model owns its GPU(s) outright: no other model may be\n"
+        "resident on the same GPU, and loading it evicts whatever is there (default: enabled).\n"
+        "Set no-exclusive to allow the VRAM ledger to co-locate models on one GPU.",
+        [](common_params &, bool) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_EXCLUSIVE").set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

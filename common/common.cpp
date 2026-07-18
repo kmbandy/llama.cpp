@@ -1634,6 +1634,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
                                               : params.kv_semantic_index.c_str();
     cparams.kv_tier_semantic_threshold  = params.kv_semantic_threshold;
     cparams.kv_tier_semantic_topk       = params.kv_semantic_top_k;
+    cparams.kv_tier_semantic_query_prefix = params.kv_semantic_query_prefix.empty()
+                                            ? nullptr : params.kv_semantic_query_prefix.c_str();
+    cparams.kv_tier_semantic_doc_prefix   = params.kv_semantic_doc_prefix.empty()
+                                            ? nullptr : params.kv_semantic_doc_prefix.c_str();
+    cparams.kv_tier_semantic_parallel   = params.kv_semantic_parallel;
+    // MAD-348: default the embedder's thread count to the MAIN MODEL's (-t), which is
+    // already per-box (common_cpu_get_num_math()) and operator-tunable. Never silently
+    // fall back to ggml's 4.
+    cparams.kv_tier_semantic_threads    = params.kv_semantic_threads > 0
+                                            ? params.kv_semantic_threads
+                                            : params.cpuparams.n_threads;
     // MAD-134: auto-enable paged-blocks when --kv-tiered is set AND
     // the user didn't explicitly choose either way. The army-goal use
     // case (hybrid models + multi-agent serving) wants paged-on; the

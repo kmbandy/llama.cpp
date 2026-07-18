@@ -86,8 +86,21 @@ struct TieredConfig {
 
     // Optional semantic-similarity prefetch. Non-empty enables it.
     std::string semantic_index;
-    float       semantic_threshold = 0.65f;
+    float       semantic_threshold = 0.84f;  // MAD-348: measured for granite-embedding-small-r2; see common.h
     int         semantic_top_k     = 5;
+    // Embedder context-pool size. The fingerprint sweep runs the embedder
+    // SYNCHRONOUSLY on the server's single inference thread, so with one
+    // context every slot serializes behind one mutex. >1 lets slots embed
+    // concurrently; the llama_model is shared, so each extra context costs
+    // only its (tiny) KV/compute buffers, not another copy of the weights.
+    int         semantic_parallel  = 1;
+    int         semantic_threads   = 0;   // MAD-348: <=0 => ggml default (4). Set from --threads.
+    // MAD-348: asymmetric retrieval prefixes. These belong to the MODEL, not to us.
+    // LFM2.5-Embedding: "query: " / "document: ". BGE: an instruction on the query only.
+    // Granite: none. Empty by default -- a wrong prefix is silent recall loss, so the
+    // preset must state it alongside the model path.
+    std::string semantic_query_prefix;
+    std::string semantic_doc_prefix;
 
     // Paged-blocks KV cache (vLLM-style block-indexed): selects the
     // llama_kv_cache_paged path. The phased rollout is COMPLETE — Phase 2b/2c/2d

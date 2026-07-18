@@ -417,8 +417,16 @@ extern "C" {
         bool         kv_tier_warm_mlock;         // mlock the host-RAM warm tier (prevents kernel swap-out)
         int32_t      kv_tier_total_ctx;          // 0 = use n_ctx
         const char * kv_tier_semantic_index;     // nullptr => disabled
+        // MAD-348: asymmetric retrieval prefixes. MODEL-SPECIFIC -- LFM2.5-Embedding is
+        // trained on "query: "/"document: ", BGE wants an instruction on the query only,
+        // Granite wants NONE. Hardcoding one model's prefixes silently degrades another's
+        // recall. nullptr => empty.
+        const char * kv_tier_semantic_query_prefix;
+        const char * kv_tier_semantic_doc_prefix;
         float        kv_tier_semantic_threshold;
         int32_t      kv_tier_semantic_topk;
+        int32_t      kv_tier_semantic_parallel;  // embedder contexts (0/1 = one); >1 lets slots embed concurrently
+        int32_t      kv_tier_semantic_threads;   // CPU threads for the embedder (<=0 => ggml default of 4)
         bool         kv_tier_paged_blocks;       // Phase 2a opt-in (off => current path)
         int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
         bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar

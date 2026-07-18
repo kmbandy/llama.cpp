@@ -20,6 +20,7 @@
 
 #include "llama.h"
 
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,7 +40,12 @@ enum class EmbedRole {
 
 class EmbeddingModel {
 public:
-    explicit EmbeddingModel(std::string path);
+    // `parallel` = size of the llama_context pool (values < 1 clamp to 1).
+    // The llama_model is loaded ONCE and shared by every context, so an extra
+    // context costs only its own KV/compute buffers (a few MB), not another
+    // copy of the weights.
+    explicit EmbeddingModel(std::string path, int parallel = 1, int n_threads = 0,
+                            std::string query_prefix = {}, std::string doc_prefix = {});
     ~EmbeddingModel();
 
     EmbeddingModel(const EmbeddingModel &)             = delete;
@@ -66,12 +72,27 @@ private:
     bool ensure_loaded_locked();
     void shutdown_locked();
 
-    mutable std::mutex   mu_;
+    // Take a context out of the pool, blocking until one frees up. Returns
+    // nullptr if the model failed to load. Every acquire() MUST be matched by
+    // a release() or the pool leaks a slot and eventually deadlocks.
+    llama_context * acquire_ctx();
+
+    // MAD-348: the model's own retrieval prefix for this role (may be empty).
+    const std::string & embed_prefix_for(EmbedRole role) const;
+    void            release_ctx(llama_context * ctx);
+
+    mutable std::mutex      mu_;
+    std::condition_variable cv_;           // signalled when a context returns to free_
     std::string          path_;
+    int                  parallel_ = 1;
+    int                  n_threads_ = 0;   // MAD-348: <=0 => ggml default (4)
+    std::string          query_prefix_;    // MAD-348: model-specific; empty => none
+    std::string          doc_prefix_;
     llama_model    *     model_ = nullptr;
-    llama_context  *     ctx_   = nullptr;
+    std::vector<llama_context *> ctxs_;    // owned; parallel_ entries once loaded
+    std::vector<llama_context *> free_;    // the currently-available subset of ctxs_
     int                  n_embd_ = 0;
-    int                  n_ctx_seq_ = 0;   // per-sequence KV capacity of ctx_ (llama_n_ctx_seq); hard cap per input
+    int                  n_ctx_seq_ = 0;   // per-sequence KV capacity (llama_n_ctx_seq); hard cap per input
     bool                 init_attempted_ = false;
     bool                 init_succeeded_ = false;
 };

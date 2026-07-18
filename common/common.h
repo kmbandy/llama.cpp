@@ -644,8 +644,71 @@ struct common_params {
     bool  kv_tier_warm_mlock    = true;  // mlock the host-RAM warm tier so it's not eligible for kernel swap (see mt-locked-buffer.h)
     int   kv_tier_total_ctx     = 0;     // full ctx budget across all tiers (set at load time)
     std::string kv_semantic_index = "";   // path to embedding model for semantic KV index (empty = disabled)
-    float kv_semantic_threshold = 0.65f;  // minimum cosine similarity threshold for prefetch hints
+    // Minimum cosine similarity for a prefetch hint. MEASURED for
+    // LFM2.5-Embedding-350M (2026-07-14, 12 passage/query pairs, 144 pairings):
+    //   true positives (query vs its OWN passage): min 0.332, median 0.521, max 0.634
+    //   false pairs   (query vs every other):      median 0.052, p95 0.263, max 0.352
+    // The old default of 0.65 admitted ZERO of 12 true positives -- the restore gate
+    // (`if (s < threshold) break;` in mt-semantic.cpp) rejected every genuinely correct
+    // match, so the semantic index paid its full cost and prefetched nothing. 0.65 is a
+    // sane default for bge/sentence-transformers, whose scores run hot; this embedder's
+    // do not. Same class of bug as the "bge-small is tiny" comment in mt-embed.cpp: the
+    // model was swapped and the constants tuned for the old one were never revisited.
+    // 0.35 admits 11/12 true positives and leaks 1/132 false (a false positive only
+    // costs a wasted block restore; a false negative loses the feature entirely).
+    // Default tracks the DEFAULT EMBEDDER (granite-embedding-small-r2, 0.84 measured).
+    // If you change --kv-tier-semantic-index you MUST change this too -- see the table above.
+    float kv_semantic_threshold = 0.84f;
     int   kv_semantic_top_k     = 5;      // number of prefetch hints to return
+    int   kv_semantic_parallel  = 1;      // embedder context-pool size; >1 lets slots embed concurrently
+
+    // MAD-348: how many PAGED BLOCKS one semantic fingerprint covers.
+    //
+    // The fingerprint sweep used to embed EVERY paged block, and the paged block size
+    // is 16 tokens -- so semantic granularity was accidentally welded to KV *paging*
+    // granularity. Those two want opposite things: paging wants small blocks (less
+    // fragmentation), retrieval wants passages. The result was one 350M-param CPU
+    // embedder forward pass per 16 tokens of context: an 18k prompt did ~1128 embeds
+    // and prefill collapsed 11-14x (3364 -> 243 tok/s).
+    //
+    // Retrieval ACCURACY was not the problem -- measured 2026-07-14, 16-token chunks
+    // still hit 100% top-1 even on same-topic passages. The problems were (a) cost and
+    // (b) absolute cosine: a 16-token chunk scores 0.355 against its own query while a
+    // 256-token passage scores 0.563, so the block size silently moved the calibration
+    // of kv_semantic_threshold. Decoupling fixes both.
+    //
+    // span=16 blocks x 16 tokens = 256-token passages: ~16x fewer embeds, and squarely
+    // in the range this embedder was trained on. span=1 restores the old behaviour.
+    int   kv_semantic_span      = 16;     // paged blocks per fingerprint (1 = per-block, legacy)
+
+    // MAD-348: CPU threads for the semantic embedder.
+    //
+    // mt-embed.cpp never set this, so it silently inherited ggml's
+    // GGML_DEFAULT_N_THREADS = 4 (whose own definition is commented "TODO: better
+    // default"). On a 12-core box that ran a 350M model on FOUR threads: measured
+    // ~360 tok/s of embedding, and an 18k-token prefill sweep took 50-68 s with a
+    // phase probe attributing 100% of it to embed_text_batch.
+    //
+    // DEFAULT (-1) = follow the MAIN MODEL's thread count (params.cpuparams.n_threads,
+    // itself defaulted to common_cpu_get_num_math() and overridable with -t). That is
+    // deliberately box-aware: a hardcoded "physical cores - 1" would have handed 11
+    // threads to a 12c/24t host and only THREE to a 4c/8t one -- i.e. FEWER than the
+    // old default of 4, a regression on the smaller box, while also starving a server
+    // that is already driving two GPUs on those same four cores.
+    //
+    // On a small host the thread lever is simply exhausted; embedding fewer TOKENS
+    // (see kv_semantic_span / stride) is the lever that remains there.
+    int   kv_semantic_threads   = -1;     // <=0 => follow the main model's --threads
+
+    // MAD-348: asymmetric retrieval prefixes -- a property of the EMBEDDING MODEL.
+    // These were hardcoded to LFM2.5-Embedding's ("query: " / "document: ") with a comment
+    // saying "Revisit on model swap". Nobody did. Same failure as kv_semantic_threshold
+    // (0.65 was BGE's number, stranded when LFM2.5 arrived, which silently rejected 100%
+    // of true positives). Measured 2026-07-14: LFM2.5 "query: "/"document: ", BGE an
+    // instruction on the query only, Granite NONE. Empty default: a preset must state the
+    // prefixes next to the model path, because a wrong prefix is SILENT recall loss.
+    std::string kv_semantic_query_prefix;   // empty => none
+    std::string kv_semantic_doc_prefix;     // empty => none
     bool  kv_tier_paged_blocks    = false;  // enable mt:: paged-attention KV cache (vLLM-style block-indexed); standard + hybrid models supported
     bool  kv_tier_paged_blocks_explicit = false;  // MAD-134: true when user typed --kv-tier-paged-blocks or --no-...; false → auto-default applies
     int   kv_tier_paged_block_size = 16;    // tokens per block when paged_blocks is enabled (must be a power of 2; 16 matches vLLM)
@@ -690,6 +753,7 @@ struct common_params {
     std::string models_preset = "";     // directory containing model presets for the router server
     int models_max = 4;                 // maximum number of models to load simultaneously
     bool models_autoload = true;        // automatically load models when requested via the router server
+    int models_idle_timeout = 0;        // router: unload a model after N seconds idle (0 = never)
     std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
     std::string router_gpus = "";       // declared router GPU slots: name:total_mb:probe,...
 

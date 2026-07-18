@@ -7,6 +7,8 @@
 #include "server-http.h"
 #include "server-queue.h"
 
+#include <atomic>
+#include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
@@ -131,6 +133,10 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
         std::thread th;
         server_model_meta meta;
+        // Requests currently being proxied to this model. The idle sweeper refuses to
+        // unload a model with any in flight -- `meta.last_used` is stamped when a request
+        // STARTS, so a long generation looks idle and would otherwise be killed mid-stream.
+        int inflight = 0;
     };
 
     std::mutex mutex;
@@ -138,6 +144,21 @@ private:
     std::map<std::string, instance_t> mapping;
     std::vector<server_gpu_slot> gpu_slots;
     bool gpu_placement_enabled = false;
+
+public:
+    // Runtime master switch for on-demand loading. Seeded from --models-autoload, but
+    // flippable at runtime via POST /models/autoload so a human can take the GPUs back
+    // (gaming, kernel work) without stopping the router: while this is false the router
+    // will not bring a model up to satisfy a request.
+    std::atomic<bool> autoload_enabled{true};
+
+private:
+
+    // idle sweeper: unloads models that have gone quiet, handing back their GPU and
+    // their host-side KV tier (which on a 15 GB box is the scarcer resource).
+    std::thread idle_th;
+    std::atomic<bool> idle_stop{false};
+    void idle_sweeper_loop();
 
     // for stopping models
     std::condition_variable cv_stop;
@@ -201,6 +222,7 @@ private:
 
     bool load_gpu_config(const common_preset & global_preset);
     void parse_model_placement(server_model_meta & meta);
+    static bool model_wants_exclusive(const server_model_meta & meta);
     void validate_gpu_slots();
     json gpu_slots_json();
     void credit_gpu_reservation_locked(const std::string & name);
@@ -223,6 +245,7 @@ public:
     conv_model_tracker conv_models;
 
     server_models(const common_params & params, int argc, char ** argv);
+    ~server_models();
 
     server_response sse; // for real-time updates via SSE endpoint
 
@@ -343,6 +366,7 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;
+    server_http_context::handler_t post_router_models_autoload;
     // management API
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;

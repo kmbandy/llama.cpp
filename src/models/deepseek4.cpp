@@ -41,6 +41,17 @@ static void dsv4_pin_to_weight(
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    // NextN/MTP: DS4 ships the MTP block as one extra block beyond the main
+    // stack, so block_count = n_layer + 1. Read this FIRST: n_layer() is
+    // n_layer_all - n_layer_nextn, and the per-layer arrays read below
+    // (swiglu_clamp_exp/shexp) are sized to the MAIN stack only (43) while
+    // compress_ratios covers all 44. Reading nextn later would size those
+    // reads to 44 and fail the load.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all &&
+                "n_layer_nextn must be < block_count");
+    hparams.n_layer_kv_from_start = hparams.n_layer_all - hparams.n_layer_nextn;
+
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
@@ -109,7 +120,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
     hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
     hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
 
-    for (int i = 0; i < n_layer; ++i) {
+    // Runs to n_layer_all so the MTP block (i == n_layer) is LOADED. It is
+    // not executed: the graph's main loop runs i < n_layer. blk.43 carries a
+    // full DS4 body (compress_ratios[43] == 0, so no compressor/indexer
+    // tensors) plus the nextn head loaded at the bottom of this loop.
+    for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
@@ -168,6 +183,22 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+
+        // NextN/MTP head. This GGUF ships neither nextn.embed_tokens nor
+        // nextn.shared_head_head, so the MTP branch falls back to the
+        // model-level tok_embd / output (hence TENSOR_NOT_REQUIRED).
+        if (i >= n_layer) {
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, 0);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, 0);
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, 0);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, 0);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hc_mult}, 0);
+            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hc_mult}, 0);
+            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, 0);
+        }
     }
 }
 
