@@ -1055,7 +1055,23 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             }
         }
 
-        // Whole-seq wipe (sentinel p0=-1 or p1=-1) is the "task done"
+        // Whole-seq wipe is the "task done" signal for an agent-style
+        // worker reusing a slot for unrelated tasks.
+        //
+        // MAD-389: the sentinels are ASYMMETRIC (include/llama.h:762-763):
+        //     p0 < 0 -> [0, p1]     (head trim)
+        //     p1 < 0 -> [p0, inf)   (TAIL trim)
+        // Only a range covering the whole sequence is a wipe: p0 <= 0 AND
+        // p1 < 0. The old `p0 < 0 || p1 < 0` misread a tail trim as a wipe,
+        // and speculative decode issues exactly that shape every cycle
+        // (server-context.cpp:4684, seq_rm(seq, pos_next, -1)) -- so every
+        // draft cycle tore down the whole tier state and, because the
+        // warm_recur_buf_ erase below defeated backup_seq_rm_recurrent's
+        // idempotency guard, re-swept ~150 MiB of recurrent state GPU->host
+        // and discarded it. Measured 78.6 ms/cycle.
+        //
+        // (original note follows)
+        // Whole-seq wipe is the "task done"
         // signal for an agent-style worker reusing a slot for unrelated
         // tasks. Free warm slots so VRAM/RAM is reclaimed, drop cold-tier
         // index entries (the on-disk file persists as scratch and gets
@@ -1067,7 +1083,7 @@ bool llama_memory_tiered::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         //
         // n_seq_max=1 today so "for this seq" === "all of it." When mt::
         // grows multi-seq tracking, scope these wipes by seq_id.
-        if (p0 < 0 || p1 < 0) {
+        if (p0 <= 0 && p1 < 0) {
             // MAD-127: paged whole-seq wipe is now handled inside
             // llama_kv_cache_paged::seq_rm (which the wrapper delegates to
             // via inner_->seq_rm above). The wrapper only handles the
