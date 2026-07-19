@@ -598,6 +598,21 @@ void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
         if (budget <= 0) { ++stats_.xlayer_blocked_budget; return; }
         if ((int) fresh.size() > budget) fresh.resize((size_t) budget);
     }
+    // Done-but-unreaped slots hold queue capacity that no reservation can free.
+    // WP_SPEC_RESERVE was measured to move blocked_free_queue by 2 counts out of
+    // 7630 even with the reservation genuinely enforced on both demand paths, so
+    // the capacity is not held by demand submissions — it is held by finished
+    // work nobody has collected. Harvest first, then test the gate.
+    //
+    // harvest_ready_prefetches_() and NOT prefetch_.reap_finished(): reaping
+    // without committing would release slots whose completed data never reached
+    // page_loaded_, marking pages resident with uncommitted contents (see the
+    // contract on PrefetchScheduler::reap_finished in wp-prefetch.h).
+    if (spec_reap_) {
+        const int harvested = harvest_ready_prefetches_();
+        ++stats_.xlayer_harvest_calls;
+        stats_.xlayer_harvested_pages += (uint64_t) (harvested > 0 ? harvested : 0);
+    }
     // Scheduler queue starvation is the other suspect: if the async queue is
     // full (demand traffic), speculative submits get rejected. Count it.
     if (prefetch_.free_queue_slots() <= 0) { ++stats_.xlayer_blocked_free_queue; return; }
@@ -704,6 +719,10 @@ bool WeightPager::init(const Config &             cfg,
         xlayer_max_slots_ = pool_.n_slots() / 4;
         if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
         if (const char * e = std::getenv("WP_SPEC_RESERVE"))         { long v = std::strtol(e,nullptr,10); if (v >= 0) spec_reserve_ = (int) v; }
+        if (const char * e = std::getenv("WP_SPEC_REAP"))            spec_reap_ = (e[0] == '1');
+        if (spec_reap_) {
+            LLAMA_LOG_WARN("wp::spec reap: harvesting finished prefetches before the speculative gate\n");
+        }
         // Never let the reservation swallow the whole queue: demand must always
         // be able to make progress or we deadlock decode instead of accelerating it.
         if (spec_reserve_ > cfg_.prefetch_depth / 2) {
@@ -1081,6 +1100,11 @@ void WeightPager::log_stats_summary() {
     if (spec_reserve_ > 0) {
         LLAMA_LOG_WARN("  [spec-reserve] slots=%d demand_trimmed=%lu\n",
                        spec_reserve_, (unsigned long) stats_.demand_trimmed_by_reserve);
+    }
+    if (spec_reap_) {
+        LLAMA_LOG_WARN("  [spec-reap] harvest_calls=%lu harvested_pages=%lu\n",
+                       (unsigned long) stats_.xlayer_harvest_calls,
+                       (unsigned long) stats_.xlayer_harvested_pages);
     }
     // WP_PROFILE_EVAL host-time breakdown (no-op unless the env flag is set).
     weight_pager_eval_cb_print_profile();

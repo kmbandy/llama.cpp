@@ -84,6 +84,8 @@ public:
         uint64_t xlayer_blocked_budget          = 0; // submits skipped: speculative cap reached
         uint64_t xlayer_blocked_free_queue      = 0; // submits skipped: scheduler queue full
         uint64_t demand_trimmed_by_reserve      = 0; // demand pages withheld to protect the reserve
+        uint64_t xlayer_harvest_calls           = 0; // harvests run before the speculative gate
+        uint64_t xlayer_harvested_pages         = 0; // Done prefetches committed+reaped by them
         uint64_t host_tier_hits                 = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
@@ -424,6 +426,11 @@ private:
 
     // Queue slots withheld from demand for speculative use (WP_SPEC_RESERVE).
     int  spec_reserve_ = 0;
+
+    // Harvest finished prefetches before the speculative capacity gate
+    // (WP_SPEC_REAP). Done-but-unreaped slots hold queue capacity that no
+    // reservation can reclaim. 0 = off = previous behaviour exactly.
+    bool spec_reap_ = false;
 
     // Cross-layer prefetch (WP_PREFETCH_XLAYER). predictor_ holds host f32
     // copies of each layer's ffn_gate_inp; config knobs parsed once in init().
