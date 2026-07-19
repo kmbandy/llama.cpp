@@ -2114,7 +2114,14 @@ bool WeightPager::prefetch_page(int page_idx, bool count_dense_prefetch,
     // Capacity gate: never alloc_slot (which may LRU-evict) if the prefetch
     // scheduler cannot accept another submit. Evicting for a rejected submit
     // destroys useful residents for no I/O (Codex draft-prefetch analysis).
-    if (prefetch_.free_queue_slots() <= 0) {
+    //
+    // Also honour the speculative reservation. This is a DEMAND path -- the
+    // speculative submitter (submit_xlayer_prefetch) goes through
+    // prefetch_pages_batch, never here -- so it must leave spec_reserve_ slots
+    // for speculation. Measured 2026-07-19: gating only prefetch_pages_batch
+    // left blocked_free_queue bit-identical (7630) because demand drained the
+    // pool through THIS path instead.
+    if (prefetch_.free_queue_slots() <= spec_reserve_) {
         return false;
     }
 
