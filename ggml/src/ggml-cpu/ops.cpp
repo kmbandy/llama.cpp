@@ -4179,6 +4179,116 @@ void ggml_compute_forward_group_norm(
     }
 }
 
+// ggml_compute_forward_sinkhorn_norm
+//
+// Reference implementation. Mirrors the DS4 graph op sequence literally --
+// see ggml/src/ggml-cuda/sinkhorn.cu for why the exact order and the two
+// separate uses of eps are load-bearing (routing/paging depend on it).
+
+static void ggml_compute_forward_sinkhorn_norm_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    const int32_t iters = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(eps >= 0.0f);
+    GGML_ASSERT(iters >= 1);
+    GGML_ASSERT(ne00 == ne01);
+
+    const int64_t n  = ne00;
+    const int64_t nt = ne02*ne03;
+
+    for (int64_t t = ith; t < nt; t += nth) {
+        const float * xs = (const float *) src0->data + t*n*n;
+        float       * ys = (float *)       dst->data  + t*n*n;
+
+        for (int64_t j = 0; j < n; ++j) {
+            float mx = -INFINITY;
+            for (int64_t i = 0; i < n; ++i) {
+                mx = fmaxf(mx, xs[j*n + i]);
+            }
+            float s = 0.0f;
+            for (int64_t i = 0; i < n; ++i) {
+                const float e = expf(xs[j*n + i] - mx);
+                ys[j*n + i] = e;
+                s += e;
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                ys[j*n + i] /= s;
+            }
+        }
+
+        for (int64_t k = 0; k < n*n; ++k) {
+            ys[k] += eps;
+        }
+
+        for (int64_t i = 0; i < n; ++i) {
+            float s = 0.0f;
+            for (int64_t j = 0; j < n; ++j) {
+                s += ys[j*n + i];
+            }
+            s += eps;
+            for (int64_t j = 0; j < n; ++j) {
+                ys[j*n + i] /= s;
+            }
+        }
+
+        for (int32_t it = 1; it < iters; ++it) {
+            for (int64_t j = 0; j < n; ++j) {
+                float s = 0.0f;
+                for (int64_t i = 0; i < n; ++i) {
+                    s += ys[j*n + i];
+                }
+                s += eps;
+                for (int64_t i = 0; i < n; ++i) {
+                    ys[j*n + i] /= s;
+                }
+            }
+            for (int64_t i = 0; i < n; ++i) {
+                float s = 0.0f;
+                for (int64_t j = 0; j < n; ++j) {
+                    s += ys[j*n + i];
+                }
+                s += eps;
+                for (int64_t j = 0; j < n; ++j) {
+                    ys[j*n + i] /= s;
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_sinkhorn_norm(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_sinkhorn_norm_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_l2_norm
 
 static void ggml_compute_forward_l2_norm_f32(

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -308,6 +310,24 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
         ggml_tensor * comb,
         int           il) const {
     GGML_UNUSED(il);
+
+    // WP_DS4_FUSED_SINKHORN=1 replaces the ~139-node graph form below with a
+    // single fused dispatch. Measured on DS4-Flash Q8: the graph form cost
+    // 10.09s of 30.20s total GPU kernel time and 2.2M of 4.3M dispatches over a
+    // 192-token decode -- to normalize a [4,4,n_tokens] tensor (16 floats per
+    // token, ~1300 FLOPs). Default OFF so the stock path stays byte-identical;
+    // having both in one binary is what makes the A/B trustworthy, since DS4
+    // expert routing is hypersensitive to numerics and a rebuild-to-compare
+    // would confound the kernel with everything else that changed.
+    static const bool use_fused = []() {
+        const char * v = std::getenv("WP_DS4_FUSED_SINKHORN");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+
+    if (use_fused) {
+        return ggml_sinkhorn_norm(ctx0, comb, hparams.dsv4_hc_eps,
+                                  (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+    }
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
     // row softmax over dst, one column normalization, then repeated row/column normalization.

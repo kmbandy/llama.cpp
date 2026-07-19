@@ -6261,6 +6261,34 @@ struct test_group_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_SINKHORN_NORM
+struct test_sinkhorn_norm : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const int32_t iters;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne, eps, iters);
+    }
+
+    test_sinkhorn_norm(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {4, 4, 32, 1},
+            float eps = 1e-6f,
+            int32_t iters = 20)
+        : type(type), ne(ne), eps(eps), iters(iters) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_sinkhorn_norm(ctx, a, eps, iters);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_L2_NORM
 struct test_l2_norm : public test_case {
     const ggml_type type;
@@ -8386,6 +8414,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
+            // sinkhorn: n=4 is the DS4 production shape (hc=4); iters=1 pins the
+            // boundary where the (iters-1) loop never runs and only the single
+            // unconditional norm_cols() applies.
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 4, 4, 32, 1 }, 1e-6f, 20));
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 4, 4, 1,  1 }, 1e-6f, 20));
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 4, 4, 32, 1 }, 1e-6f, 1));
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 2, 2, 16, 1 }, 1e-6f, 5));
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 8, 8, 16, 1 }, 1e-6f, 20));
         }
     }
 

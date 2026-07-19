@@ -869,6 +869,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_L2_NORM: {
                 split_state = handle_per_row(src_ss);
             } break;
+            case GGML_OP_SINKHORN_NORM: {
+                // NOT handle_per_row: Sinkhorn couples elements across BOTH
+                // ne0 and ne1 within a token, so neither of those axes may be
+                // split. handle_per_row only forbids axis 0 and would silently
+                // permit an axis-1 split.
+                GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+                GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
+                split_state = src_ss[0];
+            } break;
             case GGML_OP_MUL_MAT:
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
