@@ -2655,17 +2655,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_DEEPSEEK4) {
-                        // DS4 MTP head — same shape as the qwen35 case above (MAD-388).
-                        // deepseek4.cpp sets n_layer_kv_from_start = n_layer_all -
-                        // n_layer_nextn, so hparams.has_kv(il) is false for exactly the
-                        // MTP layers — precisely the set this filter selects. Without the
-                        // authoritative flag llama_kv_cache discards them and the cache is
-                        // built with zero layers (map_layer_ids.at() then throws).
-                        filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                        filter_authoritative = true;
-                    }
-
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
@@ -2682,8 +2671,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ubatch,
                                 1,
                                 filter,
-                                reuse,
-                                filter_authoritative);
+                                reuse);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2715,8 +2703,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share,
-                                    filter_authoritative);
+                                    share);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2733,8 +2720,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share,
-                                    filter_authoritative);
+                                    share);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
