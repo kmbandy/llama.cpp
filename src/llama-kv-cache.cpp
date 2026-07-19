@@ -525,6 +525,7 @@ llama_kv_cache::llama_kv_cache(
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
+                n_embd_head_k_all > 0 &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
@@ -1779,10 +1780,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
+        while (nrot <= n_embd_head_k_all/2 && n_embd_head_k_all % (2*nrot) == 0) {
             nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
