@@ -703,6 +703,18 @@ bool WeightPager::init(const Config &             cfg,
         if (const char * e = std::getenv("WP_PREFETCH_TOPK"))        { long v = std::strtol(e,nullptr,10); if (v > 0) xlayer_topk_ = (int) v; }
         xlayer_max_slots_ = pool_.n_slots() / 4;
         if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
+        if (const char * e = std::getenv("WP_SPEC_RESERVE"))         { long v = std::strtol(e,nullptr,10); if (v >= 0) spec_reserve_ = (int) v; }
+        // Never let the reservation swallow the whole queue: demand must always
+        // be able to make progress or we deadlock decode instead of accelerating it.
+        if (spec_reserve_ > cfg_.prefetch_depth / 2) {
+            LLAMA_LOG_WARN("wp::spec reserve %d too large for queue depth %d; clamping to %d\n",
+                           spec_reserve_, cfg_.prefetch_depth, cfg_.prefetch_depth / 2);
+            spec_reserve_ = cfg_.prefetch_depth / 2;
+        }
+        if (spec_reserve_ > 0) {
+            LLAMA_LOG_WARN("wp::spec reserve: %d of %d queue slots withheld from demand\n",
+                           spec_reserve_, cfg_.prefetch_depth);
+        }
         if (xlayer_prefetch_enabled_) {
             LLAMA_LOG_WARN("wp::xlayer prefetch: on K=%d M=%d cap=%d n_layer=%d\n",
                            xlayer_lookahead_k_, xlayer_topk_, xlayer_max_slots_, n_layer_);
@@ -1065,6 +1077,10 @@ void WeightPager::log_stats_summary() {
                        (unsigned long) stats_.cross_layer_prefetch_submitted,
                        (unsigned long) stats_.cross_layer_hit_in_ensure,
                        (unsigned long) stats_.speculative_evicted_unused);
+    }
+    if (spec_reserve_ > 0) {
+        LLAMA_LOG_WARN("  [spec-reserve] slots=%d demand_trimmed=%lu\n",
+                       spec_reserve_, (unsigned long) stats_.demand_trimmed_by_reserve);
     }
     // WP_PROFILE_EVAL host-time breakdown (no-op unless the env flag is set).
     weight_pager_eval_cb_print_profile();
@@ -2175,7 +2191,19 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
     // prefetch (best-effort); allocating beyond free_queue_slots forces
     // LRU evictions that are rolled back when submit_batch rejects — net
     // thrash with zero I/O.
-    const int free_q = prefetch_.free_queue_slots();
+    int free_q = prefetch_.free_queue_slots();
+    // Withhold the speculative reservation from DEMAND. Measured 2026-07-19:
+    // demand drains the shared pool to zero regardless of its size, so
+    // speculative submits are rejected on 94% of calls (blocked_free_queue
+    // 8119/8643, identical at depth 16/64/128). Capacity was never the
+    // constraint; contention for one pool was.
+    if (!speculative && spec_reserve_ > 0) {
+        const int avail = free_q - spec_reserve_;
+        if (avail < (int) needed.size()) {
+            stats_.demand_trimmed_by_reserve += (uint64_t) ((int) needed.size() - std::max(avail, 0));
+        }
+        free_q = avail;
+    }
     if (free_q <= 0) {
         return false;
     }

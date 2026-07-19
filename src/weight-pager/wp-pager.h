@@ -83,6 +83,7 @@ public:
         uint64_t xlayer_resident_skips          = 0; // predicted pages already resident/in-flight
         uint64_t xlayer_blocked_budget          = 0; // submits skipped: speculative cap reached
         uint64_t xlayer_blocked_free_queue      = 0; // submits skipped: scheduler queue full
+        uint64_t demand_trimmed_by_reserve      = 0; // demand pages withheld to protect the reserve
         uint64_t host_tier_hits                 = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
@@ -313,6 +314,11 @@ public:
     void submit_xlayer_prefetch(const float * h, int from_layer);
     bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
 
+    // Scheduler queue slots that DEMAND prefetch may not consume, so that
+    // speculative submits are not starved by demand contention for one shared
+    // pool (WP_SPEC_RESERVE). 0 = off = previous behaviour exactly.
+    int  spec_reserve() const { return spec_reserve_; }
+
     // --- Draft-as-paging-oracle -------------------------------------------
     // Hash-layer tid2eid(token) is the hard signal (DS4 layers 0..H). Softmax
     // MMID history is metrics-only (low cross-token locality measured).
@@ -415,6 +421,9 @@ private:
     // (block_idx, expert_idx) -> sister page indices (gate/up/down), built
     // once in init() from catalog_. Mirrors PageCatalog::pages_for_expert but O(1).
     std::map<std::pair<int,int>, std::vector<int>> expert_page_index_;
+
+    // Queue slots withheld from demand for speculative use (WP_SPEC_RESERVE).
+    int  spec_reserve_ = 0;
 
     // Cross-layer prefetch (WP_PREFETCH_XLAYER). predictor_ holds host f32
     // copies of each layer's ffn_gate_inp; config knobs parsed once in init().
