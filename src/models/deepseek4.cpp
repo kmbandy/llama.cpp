@@ -311,17 +311,27 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
         int           il) const {
     GGML_UNUSED(il);
 
-    // WP_DS4_FUSED_SINKHORN=1 replaces the ~139-node graph form below with a
-    // single fused dispatch. Measured on DS4-Flash Q8: the graph form cost
+    // This replaces the ~139-node graph form below with one fused dispatch;
+    // WP_DS4_FUSED_SINKHORN=0 restores the graph form.
+    // Measured on DS4-Flash Q8: the graph form cost
     // 10.09s of 30.20s total GPU kernel time and 2.2M of 4.3M dispatches over a
     // 192-token decode -- to normalize a [4,4,n_tokens] tensor (16 floats per
-    // token, ~1300 FLOPs). Default OFF so the stock path stays byte-identical;
-    // having both in one binary is what makes the A/B trustworthy, since DS4
-    // expert routing is hypersensitive to numerics and a rebuild-to-compare
-    // would confound the kernel with everything else that changed.
+    // token, ~1300 FLOPs).
+    //
+    // DEFAULT ON, and that is a CORRECTNESS decision, not a perf one. The graph
+    // form is BROKEN ON MULTI-DEVICE: it emits permute/cont/sum_rows, which the
+    // backend splitter treats as per-row (ggml-backend-meta.cpp handle_per_row
+    // asserts only axis != 0), but Sinkhorn couples BOTH ne0 and ne1 within a
+    // token. Split across devices mid-chain, the coupling is severed and the
+    // result is silently wrong. Measured on ROCm0+ROCm1: the graph form decodes
+    // " 1.1.1.1.1..." while this fused op decodes coherent prose, at two
+    // different pool sizes; single-device is fine either way. A single node
+    // cannot be split mid-computation, which is the fix.
+    // The two forms agree to 1.2e-07 (CPU) and 1.5e-07 (ROCm0) when compared
+    // directly in one graph -- see the cmp harnesses in the session notes.
     static const bool use_fused = []() {
         const char * v = std::getenv("WP_DS4_FUSED_SINKHORN");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "0") != 0;
     }();
 
     if (use_fused) {
