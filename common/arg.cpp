@@ -3960,7 +3960,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
+        {"--spec-cache-type-k", "--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
@@ -3973,7 +3973,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
-        {"--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
+        {"--spec-cache-type-v", "--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"
