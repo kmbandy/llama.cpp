@@ -2627,6 +2627,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_filter_cb filter = nullptr;
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
                     llama_kv_cache::layer_share_cb share = nullptr;
+                    bool filter_authoritative = false;
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
@@ -2642,11 +2643,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (mtp_on_hybrid_qwen35) {
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        filter_authoritative = true;
                     }
 
                     if (arch == LLM_ARCH_STEP35 && hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter_authoritative = true;
                         } else {
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
                         }
@@ -2738,7 +2741,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                filter_authoritative);
                     }
                 }
             }
