@@ -91,6 +91,13 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
 
+    // set_swa_pattern() deliberately classifies generic nextn layers as dense,
+    // but the DS4 MTP block is a full DS4 body. Its ratio-0 attention uses the
+    // raw sliding-window cache, just like ratio-0 blocks in the main stack.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = true;
+    }
+
     switch (hparams.n_layer()) {
         case 43: type = LLM_TYPE_UNKNOWN; break;
         default: type = LLM_TYPE_UNKNOWN;
