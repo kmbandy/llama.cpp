@@ -504,6 +504,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         const bool ok = paged_parent->compute_slot_mapping(ubatch, slots.data());
         GGML_ASSERT(ok && "paged compute_slot_mapping failed — block_table out of sync with ubatch positions");
 
+        update_paged_attn_max_ctx_len();
         ggml_backend_tensor_set(paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
         ggml_backend_tensor_set(paged_context_lens, paged_parent->h_context_lens_data(), 0,
@@ -528,6 +529,32 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
+    }
+}
+
+int32_t llm_graph_input_attn_kv::paged_max_ctx_len() const {
+    GGML_ASSERT(is_paged && mctx_paged != nullptr);
+
+    const auto * paged_parent = mctx_paged->parent();
+    const size_t n_seqs = paged_parent->h_q_lens_size();
+    GGML_ASSERT(paged_parent->h_context_lens_size() == n_seqs);
+
+    const int32_t * q_lens = paged_parent->h_q_lens_data();
+    const int32_t * context_lens = paged_parent->h_context_lens_data();
+    int32_t max_ctx_len = 0;
+    for (size_t s = 0; s < n_seqs; ++s) {
+        if (q_lens[s] > 0 && context_lens[s] > max_ctx_len) {
+            max_ctx_len = context_lens[s];
+        }
+    }
+
+    return max_ctx_len;
+}
+
+void llm_graph_input_attn_kv::update_paged_attn_max_ctx_len() {
+    const int32_t max_ctx_len = paged_max_ctx_len();
+    for (ggml_tensor * op : paged_attn_ops) {
+        op->op_params[5] = max_ctx_len;
     }
 }
 
@@ -1009,6 +1036,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         const bool ok = paged_parent->compute_slot_mapping(ubatch, slots.data());
         GGML_ASSERT(ok && "paged hybrid set_input: compute_slot_mapping failed");
 
+        inp_attn->update_paged_attn_max_ctx_len();
         ggml_backend_tensor_set(inp_attn->paged_slot_mapping, slots.data(), 0,
                                 sizeof(int32_t) * slots.size());
         ggml_backend_tensor_set(inp_attn->paged_context_lens, paged_parent->h_context_lens_data(), 0,
@@ -3047,6 +3075,15 @@ ggml_tensor * llm_graph_context::build_attn(
         // overflow). 0 would mean "unset" -> dispatch keeps the old behavior.
         cur->op_params[4] = ubatch.equal_seqs() ? (int32_t) ubatch.n_seq_tokens
                                                 : (int32_t) ubatch.n_tokens;
+        // MAD-378: op_params[5] (max live context) is populated by
+        // update_paged_attn_max_ctx_len() from set_input(), which runs before
+        // every execution including on reused graphs. Do NOT query it here at
+        // graph-build time — during warmup the paged context is not in a state
+        // where that query is safe, and doing so hangs startup (MAD-384).
+        // ggml zeroes op_params at creation, and 0 means "unset" -> the
+        // dispatcher falls back to the allocated-capacity bound, so a graph
+        // that somehow executes without set_input still behaves correctly.
+        inp->paged_attn_ops.push_back(cur);
         cb(cur, "kqv_paged_out", il);
 
         // 5) Cast back to F32 to match the regular path's contract — the

@@ -2,20 +2,27 @@
 # ============================================================================
 # dsws.sh — THE canonical DSWS run. ALL values hard-coded. Do NOT re-derive.
 #
-#   kmbandy, 2026-07-18: "hard code all of the values. Stagger, baton, decentasn,
-#   banked, dyn vgpr, deep j all enabled and K=64. I'm exhausted with trying to
-#   correct this every single day."
+#   *** JDEPTH=1 IS LOCKED (kmbandy, 2026-07-18). DEEP-J (JDEPTH>1) IS RETIRED. ***
+#   Deep-J in this kernel = ONE carrier wave computes J K-slices SERIALLY in its own
+#   registers (walking pool slots, WAITING for each to stage = jwait), flush once.
+#   That LOSES on committed-clock runs (2s): J=1=9.5 TF vs J=2=8.7 TF @ product 256.
+#   The CORRECT design (kmbandy's) is J=1 BANKED: each wave computes ONE slice ->
+#   ds_add_f32 into the shared LDS bank -> the TILEDONE completer (a free wave) does
+#   the ONE C-store. PARALLEL compute, DECOUPLED delivery. (The 2026-07-16 "higher-J
+#   = better" numbers were ALL sub-0.5s idle-clock -- refuted by the 2s runs.)
 #
-# THE CONFIG (every feature ON; split-K keeps compute peaks SHORT by construction):
-#   DECENTASN=1  intra-WG decentralized assign  (feed-ABA + cold-start fixes, 2026-07-18)
-#   STAGGER=1 BATONGATE=1  traveling-peak baton (pure notification)
-#   BANKZERO=1 WOFLUSH=0    BANKED LDS reduce (the flush is dead)
-#   DYNVGPR=1 (default)     dyn-VGPR grow/shrink per rowblk-burst
-#   JDEPTH=2               deep-J (moderate: short bursts, NOT a big-J plateau)
-#   SEGK=64               split-K segment = 64 ("K=64"): peak = one short segment
-#   G=6 ACC_N=6 (GROUPS=1) POOL_N=2 WAVES=30 FM=1 FN=4
-#   (SEGK=64 does NOT fit LDS at G=18/GROUPS=3 -- operands are 2x at SEGK=64 --
-#    so the SEGK=64 canonical is the proven G=6 fed baseline.)
+# THE CONFIG (J=1 banked; the correctness-proven canonical):
+#   JDEPTH=1               *** deep-J OFF -- the locked decision ***
+#   DECENTASN=1            intra-WG decentralized assign (B-addr 64-bit fix IN, 2026-07-18)
+#   BANKZERO=1 WOFLUSH=0   BANKED LDS reduce + TILEDONE completer (= the correct design)
+#   STAGGER=1 BATONGATE=1  baton machinery present but INERT (grow-fail=0 -> no regime; retired)
+#   DYNVGPR=1 (default)    dyn-VGPR grow/shrink per rowblk-burst
+#   SEGK=64               proven-correct segment (full-oracle bad=0). *** SEGK IS THE THROUGHPUT
+#                          LEVER: bigger SEGK = fewer flushes; J=1/SEGK=256/ACC_N=3 = 9.5 TF (best
+#                          measured, needs a correctness gate). The WALL is FEED/staging. ***
+#   G=6 ACC_N=6 (GROUPS=1) POOL_N=2 WAVES=30 FM=1 FN=4 MSDRAIN=1 RBU=1
+#   MEASUREMENT RULE: NEVER quote TF from <2s. Feed to >=2s clock-committed via BIG M (many
+#   tiles, low RAM); deep-K OOMs (~30GB) at 2s. See DSWS_TESTING_LOG.md 2026-07-18.
 #
 # USAGE:
 #   ./dsws.sh              # FED deep-K run (steady state, the architecture measurement)
@@ -28,7 +35,7 @@ MODE="${1:-fed}"
 
 # ---- BUILD (all defsyms baked) --------------------------------------------
 echo "== building canonical DSWS bin =="
-DECENTASN=1 STAGGER=1 BATONGATE=1 BANKZERO=1 WOFLUSH=0 JDEPTH=2 \
+DECENTASN=1 STAGGER=1 BATONGATE=1 BANKZERO=1 WOFLUSH=0 JDEPTH=1 \
 FM=1 G=6 ACC_N=6 POOL_N=2 SEGK=64 WAVES=30 MSDRAIN=1 RBU=1 \
 STAGINSTR=1 TFPROBE=1 ./build_flow.sh || exit 1
 echo "  bin sha: $(sha256sum occ_dsws2_w30_flow_gd.bin | cut -c1-8)"

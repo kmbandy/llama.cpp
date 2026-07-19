@@ -69,15 +69,27 @@ built; banking/dyn-VGPR/stagger/GROUPS = built; deliver = already next-available
 the producer bottleneck and no wave blocks waiting for assignment. **Global `DECENTASN=1` stays dead** (silicon-refuted).
 Thread B (full-K/no-split-K) parked.
 
-### ⭐ CANONICAL CONFIG — RUN VIA `./dsws.sh` (hard-coded; do NOT re-derive — kmbandy 2026-07-18)
-**ALL features ON, `SEGK=64` ("K=64"), split-K → short peaks.** `./dsws.sh` = FED deep-K (architecture); `./dsws.sh correct`
-= bounded K + full oracle. Build baked into the script:
+### ⭐⭐⭐ CANONICAL CONFIG — **J=1 (JDEPTH=1) IS LOCKED** — RUN VIA `./dsws.sh` — kmbandy 2026-07-18 ⭐⭐⭐
+> **JDEPTH=1. DEEP-J (JDEPTH>1) IS RETIRED. DO NOT RE-ENABLE IT. DO NOT DROP THIS.**
+> Deep-J in this kernel = ONE carrier wave computes J K-slices SERIALLY in its own registers (walking pool slots, WAITING
+> for each to stage = `jwait`), flush once. It **LOSES** on 2s clock-committed runs: **J=1 = 9.5 TF vs J=2 = 8.7 TF @ product 256**.
+> The CORRECT design (kmbandy's) is **J=1 BANKED**: each wave computes ONE slice → `ds_add_f32` into the shared LDS bank → the
+> **TILEDONE completer** (a free wave) does the ONE C-store. PARALLEL compute, DECOUPLED delivery — that is the design, and it is
+> what wins. (The 2026-07-16 "higher-J = better" numbers were ALL sub-0.5s idle-clock; the 2s-committed runs REFUTE them.)
+
+**Build baked into `./dsws.sh` (do NOT re-derive):**
 ```
-DECENTASN=1 STAGGER=1 BATONGATE=1 BANKZERO=1 WOFLUSH=0 JDEPTH=2 FM=1 G=6 ACC_N=6 POOL_N=2 SEGK=64 WAVES=30 MSDRAIN=1 RBU=1
+DECENTASN=1 STAGGER=1 BATONGATE=1 BANKZERO=1 WOFLUSH=0 JDEPTH=1 FM=1 G=6 ACC_N=6 POOL_N=2 SEGK=64 WAVES=30 MSDRAIN=1 RBU=1
 ```
-(DYNVGPR=1 default. GROUPS=1 because **SEGK=64 does NOT fit LDS at G=18/GROUPS=3** — operands are 2× at SEGK=64; the SEGK=64
-canonical is the proven G=6 fed baseline.) Canonical bin = **`9cce13fa`** (was `3bf705db` before the 2026-07-18 64-bit B-address
-fix). Correctness ✅ (`./dsws.sh correct`: ok=9216 bad=0, computed=73728 EXACT, at 576×4096×2048 n_kseg=32).
+Host geom: `FLOW_WAVES=30 DSWS2_FLOW=1 DSWS2_FM=1 DSWS2_G=6 DSWS2_ACC_N=6 FLOW_POOL_N=2 DSWS2_SEGK=64` ; shape (attn_q):
+`DSWS2_ORACLE_MTL=6 DSWS2_ORACLE_NTL=64`. `./dsws.sh` = fed run; `./dsws.sh correct` = bounded-K full stride=1 oracle.
+Correctness ✅ (SEGK=64 J=1 is the simplest/safest banked path; B-addr 64-bit fix IN). **DYNVGPR=1 default.**
+
+**THROUGHPUT MAP (measured 2s clock-committed, 2026-07-18):** SEGK is THE lever (bigger SEGK = fewer flushes, no carrier cost) —
+**J=1/SEGK=256/ACC_N=3 = 9.5 TF** > J=1/SEGK=64/ACC_N=6 = 7.5 TF, still climbing (SEGK=256 needs a correctness gate). **G is NOT a
+lever** (flat/negative). **The traveling-peak BATON has NO regime** (grow-fail=0 at G=6 AND G=18) — retired. **The WALL is
+FEED/STAGING** (`nothing-staged` ~95-98% of coast) — the next lever. **MEASUREMENT RULE: NEVER quote TF from a run <2s; feed to
+≥2s clock-committed via BIG M (many tiles, low RAM), NOT deep-K (OOMs ~30GB at 2s).**
 
 **⭐ 2026-07-18 — 64-BIT B-ADDRESS FIX (deep-K wrong-C):** deep-K feeding (`DSWS2_K` large, single chunk — the CORRECT way to add
 work; reps trip the fat-carrier deadman) exposed a 32-bit integer overflow in the shuffled-B segment offset (`ksi*KSEG_STEPS*s10`

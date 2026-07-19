@@ -395,6 +395,9 @@ private:
             return false;
         }
         int ret = io_uring_queue_init(queue_depth, &ring_, 0);
+        if (ret >= 0) {
+            set_iowq_max_workers(&ring_, "p2p");
+        }
         if (ret < 0) {
             LLAMA_LOG_WARN("wp::IoUringP2PFileIO: queue_init failed: %s\n", strerror(-ret));
             return false;

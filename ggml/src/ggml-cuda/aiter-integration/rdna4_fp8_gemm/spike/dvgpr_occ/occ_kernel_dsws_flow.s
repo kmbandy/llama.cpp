@@ -797,6 +797,14 @@
 .ifndef DECENTASN
     .set DECENTASN, 0                            // decentralized assign: assign is a ROLE any starved wave does (kills the single-producer wall)
 .endif
+.ifndef SELFSERVE
+    .set SELFSERVE, 0                            // SELF-SERVE COMPUTE (DSWS_SELFSERVE_DESIGN.md, 2026-07-19): when the ring is
+.endif                                           //   empty (door1: DRAIN>=STAGE) a wave, instead of coasting, claims a work-item
+                                                 //   and self-loads its own A/B from L2/L3 into VGPR (no shared slot) -> in-flight
+                                                 //   parallelism = WAVE COUNT not POOL_N -> the per-SIMD VGPR budget finally BINDS ->
+                                                 //   the stagger/traveling-peak engine engages. Ring stays as opportunistic fast-path.
+                                                 //   0 = byte-identical (all body gated .if SELFSERVE). Needs BANKZERO=1 (shared-bank
+                                                 //   ds_add is the merge) + JDEPTH=1 (v1 scope). Enable: DECENTASN=1 for the claim path.
 .if DECENTASN && WOFLUSH
   .error "DECENTASN is now BANKED-ONLY (build WOFLUSH=0 BANKZERO=1). The WOFLUSH (next,inflight) pin path was retired 2026-07-16 -- guard 697's 'SL_GEN aliases the store-claim' collision was STALE (the banked completer elects the store owner via TILEDONE, not SL_GEN; every SL_GEN reader is DECENTASN-gated). See DECENTASN_BANKED_DEEPJ_DESIGN_2026-07-16.md."
 .endif

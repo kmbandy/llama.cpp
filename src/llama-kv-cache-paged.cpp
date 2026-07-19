@@ -1839,6 +1839,13 @@ bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         const llama_pos new_max = seq_states_[seq_id].pos_max;
         const uint32_t keep_blocks =
             new_max < 0 ? 0u : ((uint32_t) new_max + bsize) / bsize;  // ceil((new_max+1)/bsize)
+        for (uint32_t lblock = keep_blocks; lblock < n_blocks_seq; ++lblock) {
+            const uint32_t physical = table_.get_physical(seq_id, lblock);
+            if (physical != mt::kInvalidBlockId) {
+                pool_.free_block(physical);
+            }
+            paged_semantic_.remove_block(seq_id, lblock);
+        }
         table_.truncate(seq_id, keep_blocks);
     }
 

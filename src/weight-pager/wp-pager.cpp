@@ -404,6 +404,9 @@ bool WeightPager::ensure_odirect_ring_ready_(size_t n_entries) {
     std::memset(ensure_odirect_ring_, 0, sizeof(*ensure_odirect_ring_));
 
     int ret = io_uring_queue_init(queue_depth, ensure_odirect_ring_, 0);
+    if (ret >= 0) {
+        wp::set_iowq_max_workers(ensure_odirect_ring_, "ensure-odirect");
+    }
     if (ret < 0) {
         LLAMA_LOG_WARN("wp::ensure_odirect_ring_ready_: queue_init failed: %s\n",
                        strerror(-ret));

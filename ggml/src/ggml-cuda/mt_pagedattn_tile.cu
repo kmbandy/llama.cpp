@@ -20,8 +20,8 @@
 // is one __shfl_xor_sync(..., mask=16) call.
 //
 // Targets HEAD_SIZE=128, BLOCK_SIZE=16, CACHE_TYPE in {F16, TURBO4_0}.
-// AMD wave32 WMMA only. Existing scalar kernel handles decode (q_len<16),
-// non-WMMA hardware, and other (HEAD_SIZE, BLOCK_SIZE) cases.
+// AMD wave32 WMMA only. Flash-decode handles small q_len when enabled; the
+// scalar kernel remains the correctness backstop for other cases.
 //
 // STATUS: F16 path drafted; awaiting llama-server validation cycle.
 // TURBO4_0 path is staged with a tile-dequant via the existing

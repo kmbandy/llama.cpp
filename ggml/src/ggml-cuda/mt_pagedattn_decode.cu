@@ -519,7 +519,6 @@ static __device__ __forceinline__ float decode_block_reduce_max(
 // Bumped from 8 → 16 to cover the Qwen3.5/3.6 MTP common case. Beyond 16
 // the dispatch gate sends it to the scalar fallback. Larger q_len batches
 // are prefill territory and go to the tile kernel.
-static constexpr int DECODE_MAX_Q = 16;
 
 // ── Pass 1: per-chunk partial kernel ───────────────────────────────────
 //
@@ -570,6 +569,8 @@ __global__ void mt_paged_attention_decode_kernel(
     const int head_base          = kv_head_idx * num_queries_per_kv;
     const int total_q            = num_queries_per_kv * q_len;
     const int * seq_block_table  = block_tables + seq_idx * max_blocks_per_seq;
+
+    if (q_len == 0) return;
 
     // Per-block check — defensive. Dispatch gate enforces both q_len and
     // total_q caps; clamp here in case a future op_param flow sneaks
@@ -831,6 +832,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     const int num_queries_per_kv = n_heads / n_kv_heads;
     const int head_base          = kv_head_idx * num_queries_per_kv;
     const int total_q            = num_queries_per_kv * q_len;
+    if (q_len == 0) return;
     if (q_len > DECODE_MAX_Q || total_q > DECODE_MAX_Q) return;
 
     const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
@@ -1232,13 +1234,15 @@ void launch_paged_attn_decode(
                             + sizeof(float)  * DECODE_MAX_Q * DECODE_K_TILE_N     // smem_logits
                             + sizeof(float)  * DECODE_NUM_WARPS;                  // red_smem
 
-    // WMMA gate: HS in {128, 256}, F16 cache, WMMA-capable device, env on.
+    // WMMA gate: HS in {128, 256}, F16/TURBO4_0/TURBO3_0 cache, WMMA-capable device, env on.
     int dev = 0; cudaGetDevice(&dev);
     const int cc = ggml_cuda_info().devices[dev].cc;
     const bool wmma_path = get_paged_decode_wmma_mode() != 0
                         && amd_wmma_available(cc)
                         && (HEAD_SIZE == 128 || HEAD_SIZE == 256)
-                        && (CACHE_TYPE == GGML_TYPE_F16);
+                        && (CACHE_TYPE == GGML_TYPE_F16
+                         || CACHE_TYPE == GGML_TYPE_TURBO4_0
+                         || CACHE_TYPE == GGML_TYPE_TURBO3_0);
 
     if (wmma_path) {
         // 4-warp block: warp 0 does WMMA compute, warps 1-3 help with K/V

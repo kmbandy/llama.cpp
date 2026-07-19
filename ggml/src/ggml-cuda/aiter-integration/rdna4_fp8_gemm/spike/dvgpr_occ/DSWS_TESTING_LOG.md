@@ -751,3 +751,157 @@ recorded here vs the hipBLASLt baseline.
 - **FOLLOW-UP (not yet done):** the A-address side uses the same 32-bit pattern; Mo=576 keeps A<4GiB until K>~7.4M,
   so audit/port the same 64-bit fix to ASTAGE before feeding beyond that. Deep-K oracle is LOOSE/sampled (1 tile);
   correctness ALSO independently proven by Codex's CPU reproducer.
+
+### 2026-07-18 — BINDING-G fed (G=18/GROUPS=3/SEGK=32) post-fix — budget STILL non-binding (grow-fail=0) — DECENTASN
+- **Config:** DECENTASN=1 STAGGER=1 BATONGATE=1 banked J=2 **G=18 ACC_N=6 GROUPS=3 POOL_N=2 SEGK=32**, bin `fc5191fb`
+  (picks up the 64-bit B-fix). Deep-J >J=2 is LDS-blocked on the decentralized path (POOL_N%J==0 + LDS: J=4→POOL_N=4
+  overflows 65536B at SEGK=64/G=6, confirmed by .error), so binding-G (SEGK=32) is the way to probe budget-binding.
+- **Bring-up (correctness):** bounded K=2048 (n_kseg=64) FULL stride=1 oracle → **ok=9216 bad=0 max_rel=0** — the B-fix
+  does NOT break binding-G.
+- **Fed run:** 576×4096×524288 (n_kseg=16384, SEGK=32), deep-K single chunk, ORACLE_STRIDE=384.
+- **Outcome:** oracle ok=72 bad=0 (sampled) CLEAN; computed=37748736 = TOTAL(128)·G(18)·n_kseg(16384) WORK-EXACT;
+  span **0.72s CLOCK-COMMITTED**; **door4 grow-fail=0 (VGPR budget NON-binding even at G=18)**; occ[98] baton=0 (inert);
+  occ[88] jwait **22.46/seg** (WORSE than G=6/J=2's 14.5); occ[86] 62.9% assign-bound; **TF=3.4** (BELOW G=6/J=2's 7.7 —
+  G=18 has 3× fewer/bigger tiles: 128 vs 384). occ[0]=0 clean, no DMFAT/reset.
+- **Verdict:** ❌ binding-G does NOT bind the budget on the real shape — grow-fail=0 at BOTH G=6 and G=18, fed +
+  clock-committed + correct. The traveling-peak baton has NO activation regime at reachable geometry; the consistent
+  wall is STAGING/ASSIGN throughput, not VGPR budget. Refutes the 07-16 "G>12 binds the budget" premise (measured on
+  the pre-fix corrupted path). NEXT (kmbandy to steer): attack the staging/assign throughput (the actual wall), or
+  accept the G=6/J=2 baseline. Board note: another session re-claimed R9700 in the check→dispatch gap; this run
+  completed clean (no collision observed), then held.
+
+### 2026-07-18 — ⭐ J×G MATRIX SWEEP (SEGK=16, post-fix) — J lifts TF ~3×, G flat/negative, budget NEVER binds — DECENTASN
+- **Motivation:** stop basing conclusions on the hardcoded J=2. Systematic J×G sweep (kmbandy: "not going to figure this
+  out by guessing"). Offline-designed: LDS feasibility + M=576 tiling (G must divide 36) + host allow-list (flow G≤32).
+- **Cells:** J∈{1,2,4} × G∈{6,12,18}, ACC_N=6, POOL_N=J, SEGK=16 (fixed → widest J range; real amortization depth = J·SEGK),
+  GROUPS=G/6, banked DECENTASN=1 STAGGER=1. Fed deep-K K=524288 (n_kseg=32768). 9 cells ran (G=36 REFUSED by host allow-list
+  G≤32; G=24 invalid — not a /36 divisor for M=576; J=8 needs an OP_BASE co-change, deferred). Peak host RAM 5.7GB.
+- **All 9 cells: oracle bad=0, computed=75497472 work-exact (=2304·n_kseg, const across G since TOTAL·G=2304), no DMFAT.**
+  | TF        | J=1 | J=2 | J=4 |   | jwait/seg | J=1 | J=2 | J=4 |
+  |-----------|-----|-----|-----|---|-----------|-----|-----|-----|
+  | G=6       | 1.2 | 2.1 | 3.4 |   | G=6       | 0.0 | 12.3| 16.7|
+  | G=12      | 1.1 | 1.9 | 3.3 |   | G=12      | 0.0 | 13.5| 18.6|
+  | G=18      | 1.1 | 1.8 | 2.7 |   | G=18      | 0.0 | 19.5| 28.6|
+  **grow-fail=0 and baton=0 in ALL 9 cells.** spans 0.7–2.3s (mostly clock-committed).
+- **Verdict:** (1) **J is THE throughput lever** — J1→J4 ~3× TF; J=2 (the old basis) left ~40% on the table. (2) **G is not a
+  lever** — flat-to-negative; more compute breadth just worsens staging. (3) **Budget NEVER binds anywhere** (grow-fail=0
+  across the whole matrix) → the traveling-peak baton has NO activation regime; that thread is dead, now proven not asserted.
+  (4) The kernel is **FEED/STAGING-bound** (not compute-bound: G flat; not budget-bound: grow-fail=0); jwait is the wall and
+  grows with both J and G. CAVEAT: absolute TF maxes at 3.4 due to the SEGK=16 penalty (canonical SEGK=64/J=2 = 7.7) — J and
+  SEGK share LDS (J·SEGK amortization budget). NEXT: **J×SEGK sweep at fixed LDS budget** to find the throughput-optimal split;
+  retire the baton/budget-binding line (comprehensively refuted).
+
+### 2026-07-18 — ⭐⭐ J×SEGK SWEEP (G=6) — SEGK is THE lever, deep-J is DOMINATED, TF ∝ amortization depth — DECENTASN
+- 9 cells G=6 ACC_N=6 POOL_N=J, J∈{1,2,4} × SEGK∈{16,32,64,128} with J·SEGK≤128 feasible (SEGK≤128 OPSTRIDE cap;
+  J·SEGK≤252 LDS). K=262144. All bad=0, work-exact, no DMFAT, grow-fail=0. spans 0.18–1.1s (product-128 cells <0.5s
+  idle-clock → abs TF conservative; ratios trustworthy, identical K).
+- Grouped by amortization depth (J·SEGK; flush count/tile = K/(J·SEGK); flush LDS-ops/WMMA = 128/SEGK):
+  | J·SEGK | cell (flush/wmma) → TF, jwait/seg |
+  |--------|-----------------------------------|
+  | 16  | J1S16 (8.0) → 1.1, jw0 |
+  | 32  | **J1S32 (4.0) → 2.1, jw0** ; J2S16 (8.0) → 1.9, jw12 |
+  | 64  | **J1S64 (2.0) → 3.9, jw0** ; J2S32 (4.0) → 3.8, jw13 ; J4S16 (8.0) → 3.3, jw17 |
+  | 128 | **J1S128 (1.0) → 7.0, jw0** ; J2S64 (2.0) → 6.7, jw13 ; J4S32 (4.0) → 6.1, jw17 |
+- **Findings:** (1) TF ∝ amortization depth (J·SEGK): 16→32→64→128 = 1.1→2.1→3.9→7.0, ~doubling, NO plateau at 128 → deeper
+  = higher. (2) At FIXED depth, **lower-J / bigger-SEGK WINS** (J1 ≥ J2 > J4 in every product group). Deep-J is DOMINATED:
+  it buys the same amortization SEGK gives for free but ADDS jwait (J1=0, J2~13, J4~17 spins/seg) + lead-gate coast.
+- **VERDICT: SEGK is the throughput lever; deep-J (carrier/coupled-cursor/POOL_N%J/baton machinery) is NOT the win.**
+  Recipe = **J=1, SEGK as large as LDS allows.** Less split-K = faster; the limit (SEGK→K, flush once) = hipBLASLt's GSU1
+  no-split design (KG HIPBLASLT_TEARDOWN). NEXT: push SEGK>128 by freeing LDS (lower ACC_N banks and/or G at J=1), and/or
+  test the full-K no-split path (Thread B). The "canonical" should be J=1/max-SEGK, not J=2/S=64.
+
+### 2026-07-18 — DEEPER-PRODUCT sweep (G=6, ACC_N=3) — climb CONTINUES past 128 (MEASURED), J=1/max-SEGK wins to product 256
+- Motivation: the J×SEGK sweep capped at product 128 (LDS at ACC_N=6); I claimed "no plateau" WITHOUT testing higher (kmbandy
+  caught the extrapolation: "why didn't you do J4/S128?" — that's product 512, physically impossible: operand pool alone > 64KB).
+  Product 256 IS reachable by dropping ACC_N 6→3 (banks 24KB→12KB), so measure it.
+- 5 cells G=6 ACC_N=3 (GROUPS=2), K=262144. All bad=0, no DMFAT, grow-fail=0. spans 0.13–0.40s (idle-clock; ratios trustworthy).
+  | J | SEGK | product | TF | jwait/seg |
+  |---|------|---------|----|-----------|
+  | 1 | 64   | 64      | 3.1 | 0 |
+  | 2 | 64   | 128     | 5.3 | 11.6 |
+  | 1 | 128  | 128     | 6.0 | 0 |
+  | 2 | 128  | 256     | 8.6 | 19.7 |
+  | 1 | 256  | 256     | **9.7** | 0 |
+- Findings: (1) TF KEEPS CLIMBING past 128 — product 256 J1/S256 = 9.7 (measured, not extrapolated); no plateau. (2) J=1/max-SEGK
+  WINS at every product (J1>J2: 6.0>5.3 @128, 9.7>8.6 @256). (3) ACC confound quantified: J1/S128 = 7.0 @ACC=6 vs 6.0 @ACC=3
+  (dropping banks 6→3 costs ~1 TF), BUT product 128→256 @ACC=3 gains +3.7 (6.0→9.7) — NET WIN over the ACC penalty. Bigger SEGK
+  wins even paying the bank cost.
+- **VERDICT confirms J×SEGK:** SEGK is the throughput lever, deep-J dominated. Recipe = J=1, SEGK max (SEGK=256 @ G=6/ACC=3 =
+  9.7 idle-clock TF, STILL climbing). Endpoint = full-K no-split (hipBLASLt GSU1). NEXT: SEGK=512 needs G≤2 (confound) OR the
+  full-K no-split path (Thread B); and a committed-clock run (deeper K, memory-managed) for real absolute TF at the winning config.
+
+### 2026-07-18 — ⭐ FED / CLOCK-COMMITTED same-flush-count comparison (product 128) + PHASE (door) breakdown — DECENTASN
+- CORRECTION to the J×SEGK / deeper sweeps: those were sub-0.5s = idle-clock (~1147 vs 2350 MHz) → TF was duration-confounded,
+  NOT clean throughput. Re-ran the KEY same-flush-count pair FED (single K=1048576 chunk, span ~0.6s = CLOCK-COMMITTED), one at a
+  time, RAM-watchdog. (J1/S256 & J2/S128 product-256 cells: watchdog-killed at avail 1744MB — K=1M's 9.2GB operands hit the ceiling;
+  product-256 needs a smaller K, secondary. clean kill, no latch.)
+- Product 128, G=6 ACC_N=6, CLOCK-COMMITTED:
+  | J | SEGK | span | TF | coast% | door1 nothing-staged | door2 lead-gate | jwait/seg |
+  |---|------|------|----|--------|----------------------|-----------------|-----------|
+  | 1 | 128  | 0.605s | **8.2** | 95.7% | **100%** | 0% | 0 |
+  | 2 | 64   | 0.654s | **7.6** | 93.0% | 74.1% | **25.9%** | **14.7** |
+- Findings (MEASURED, committed, phase-resolved): (1) At the SAME flush count, committed-clock, J=1 (8.2) beats J=2 (7.6) by ~8%
+  — deep-J does NOT tie. (idle-clock had shown 7.0/6.7; committing the clock lifted both ~15% and preserved the J1>J2 gap.)
+  (2) WHY, from the door breakdown: J=2 pays door2 LEAD-GATE 25.9% ((J-1)/J structural — non-lead slices the carrier walks) +
+  jwait 14.7 spins/seg (carrier goes fat then WAITS holding its accumulator for the next slice to stage); J=1 pays ZERO of both.
+  (3) BUT door1 NOTHING-STAGED = 100% of J1's coast / 74% of J2's — both ~95% coast because there's nothing staged: the kernel is
+  overwhelmingly FEED-LIMITED. So J's only benefit (fewer flushes) is wasted (flush isn't the wall), while its jwait (waiting on
+  that slow feed) + lead-gate bite.
+- **VERDICT: deep-J is FEED-STARVED, not inherently bad.** The wall is FEED (nothing-staged). Fix the feed → deep-J's flush-
+  amortization starts paying AND its jwait shrinks. NEXT: attack the FEED/staging throughput (the measured wall) — helps TF
+  directly AND is the prerequisite for deep-J to pay. And: the process rule (COMMIT THE CLOCK / feed before any TF) — do NOT
+  quote TF from <0.5s again.
+
+### 2026-07-18 — ⭐ 2s-COMMITTED same-flush-count comparison (products 128 & 256) — J=1 beats J=2 by ~7-9%, feed-limited — DECENTASN
+- kmbandy: "0.6s is not enough, 2s minimum." Fed via BIG M (many tiles, MTL=200, K=131072) — spans ≥2s at low RAM (~3.5GB)
+  vs deep-K which would OOM (~30GB) at 2s. All bad=0, no DMFAT, no latch.
+  | J | SEGK | prod | span | TF | coast% | door1 nostg | door2 lead | jwait/seg |
+  |---|------|------|------|----|--------|-------------|------------|-----------|
+  | 1 | 128  | 128  | 2.74s | 7.5 | 95.6% | 100% | 0%    | 0 |
+  | 2 | 64   | 128  | 2.96s | 7.0 | 92.9% | 73.6%| 26.4% | 13.5 |
+  | 1 | 256  | 256  | 2.16s | 9.5 | 98.3% | 100% | 0%    | 0 |
+  | 2 | 128  | 256  | 2.36s | 8.7 | 97.2% | 78.3%| 21.7% | 17.9 |
+- Findings (2s committed, phase-resolved): (1) J=1 beats J=2 at BOTH products (~7% @128, ~9% @256) — SAME result & mechanism
+  as the 0.6s run → robust, not a clock artifact. deep-J costs ~7-9% at equal flush count. (2) J=2's overhead = door2 lead-gate
+  22-26% + jwait 13-18/seg; J=1 = zero of both. (3) All ~95-98% coast, nothing-staged dominated → FEED-LIMITED (confirmed at 2s).
+- CAVEAT: absolute TF is feed-method-sensitive — big-M/many-tiles reads ~7.5 where deep-K single-chunk 0.6s read 8.2 (many small
+  tiles carry more per-tile coordinator overhead; OR chunked commits the clock less than a single continuous chunk). The RELATIVE
+  J1>J2 gap is method-independent. Absolute peak needs a single deep-K ≥2s chunk → direct-to-VRAM operand gen (DSWS2_VRAMGEN, ~40
+  lines occ_dispatch, host can't hold ~30GB) — not built.
+- **VERDICT (measured, 2s): deep-J is FEED-STARVED, not broken.** Wall = FEED (nothing-staged). Fix feed → deep-J's flush-
+  amortization pays + jwait shrinks → deep-J flips from ~8% cost to lever. NEXT: attack FEED/staging throughput (coordinator
+  publish rate / POOL depth / feeder count / barrier cadence — never swept, always measured downstream of it).
+
+### 2026-07-19 — ⭐⭐ LDS-SPLIT FRONTIER SWEEP (SEGK×POOL_N×ACC_N, 18 cells) — door1=100% & grow-fail=0 EVERYWHERE → the ring/POOL coupling is the wall
+- kmbandy: "do the whole matrix, >2 values each, at the winning K, fully fed." Corrected off two of my errors: the dead COORD_PERIOD
+  axis, and sweeping POOL_N at losing SEGK (32/64, ACC_N=6) instead of the winning regime. Winning config = **SEGK=256/ACC_N=3/POOL_N=1**
+  (not the dsws.sh "canonical" POOL_N=2/SEGK=64/ACC_N=6). LDS reality: SEGK⊥POOL_N — SEGK=256 fits POOL_N=1 ONLY (any ACC_N).
+- METHOD: full feasible grid, each cell big-M fed (MTL=256 K=131072) ≥3.2s clock-committed; correctness-gate phase first
+  (bounded K, FULL stride=1 oracle, 64 ring-wraps) — **all 18 gated bad=0**. POOL_N=4 has a wrong-C race ISOLATED to GROUPS=1
+  (S32/A6/P4 bad=24; S32/A3/P4 & S64/A3/P4 CLEAN) — excluded, follow-up.
+  | ACC_N | SEGK | POOL_N | GROUPS | span | TF | door1 | occ86 |
+  |---|---|---|---|---|---|---|---|
+  | 3 | 256 | 1 | 2 | 3.20 | **8.2** | 100% | 85.1% | ◄ PEAK
+  | 2 | 256 | 1 | 3 | 3.42 | 7.7 | 100% | 84.1% |
+  | 3 | 128 | 2 | 2 | 4.01 | 6.6 | 100% | 47.7% |
+  | 6 | 128 | 1 | 1 | 4.80 | 5.5 | 100% | 87.8% | ◄ best GROUPS=1 (clean single-carrier model)
+  | 3 | 128 | 1 | 2 | 5.28 | 5.0 | 100% | 82.2% |
+  | 6 | 64 | 2 | 1 | 5.77 | 4.6 | 100% | 47.5% |
+  | 6 | 64 | 1 | 1 | 6.32 | 4.2 | 100% | 84.9% |
+  | 6 | 64 | 3 | 1 | 6.45 | 4.1 | 100% | 55.4% |
+  | 3 | 64 | 1..4 | 2 | 7.0-8.3 | 3.2→3.8 | 100% | 24-84% |
+  | 2 | 64/128 | 1..4 | 3 | 4.9-11.8 | 2.2-5.4 | 100% | 10-88% |
+- VERDICTS (all 18 cells): (1) SEGK is THE lever (TF tracks SEGK; all S256 top, S64 bottom). (2) **door1 nothing-staged = 100.0%
+  in EVERY cell** — no LDS knob moves it. (3) POOL_N weak/situational (helps only when it fits w/o costing SEGK: G2/S128 P1→P2 = 5.0→6.6).
+  (4) GROUPS matters only via the SEGK it unlocks (G1 caps at S128=5.5; G2 unlocks S256=8.2; G3 unlocks nothing better + rescan tax).
+- ⭐ THE REAL FINDING: **door1=100% AND grow-fail=0 (door4) in every cell.** The wall is NOT any LDS knob — it's that compute is
+  chained to POOL_N staged slots, so at SEGK=256/POOL_N=1 only ~ACC_N waves ever go fat → the per-SIMD VGPR budget NEVER binds →
+  the dyn-VGPR moat + stagger/traveling-peak (built, `:596`) sit IDLE (grow-fail=0, baton occ98=0). The whole DSWS economy is a
+  cold engine with no fuel line. occ86 (assign starvation) swings 10-88% with ZERO correlation to TF → assign is NOT the wall
+  (eliminated). CORRECTIONS kmbandy drove this session: B-reuse is L2/L3 (not LDS — self-load B is a cache hit, no HBM blowup);
+  STAGGER is admission-control on the fat population (the occupancy engine), NOT a deadlock guard; SEGK=256 is the ceiling by
+  DESIGN (peak-duty ~13% = the stagger trapezoid precondition; bigger = plateau = stagger dies), not just by LDS.
+- NEXT (spec written, DSWS_SELFSERVE_DESIGN.md): break the last coupling — coast→self-serve-compute tier (claim work-item, self-load
+  A/B from L2/L3 into VGPR, WMMA, ds_add into shared bank) so parallelism = wave count not slot count → budget binds → the stagger
+  engine engages. Fingerprint to confirm: grow-fail 0→large, door1 100%→<100%, baton occ98>0, TF>8.2. Hook site = `.Lflow_compute`
+  door1 branch (:2783-2786). Ring stays as opportunistic fast-path. GATE-defined build S0-S4 in the spec.

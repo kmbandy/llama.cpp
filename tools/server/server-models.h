@@ -11,6 +11,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -214,8 +215,11 @@ private:
     std::string bin_path;
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
+    std::unordered_map<std::string, std::filesystem::file_time_type> models_preset_applied_mtimes;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
+    std::optional<std::filesystem::file_time_type> get_models_preset_mtime() const;
+    void reload_models_preset_if_changed(server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
     void unload_lru();

@@ -5587,6 +5587,8 @@ struct ggml_tensor * ggml_paged_attn_mt(
     //   [1]: int32_t block_size
     //   [2]: int32_t max_blocks_per_seq (= block_tables->ne[0])
     //   [3]: int32_t n_kv_heads
+    //   [4]: int32_t max_q_len (optional graph-builder override)
+    //   [5]: int32_t max active context length (optional graph-builder override)
     int32_t max_blocks_per_seq = (int32_t) block_tables->ne[0];
     int32_t params_i32[4];
     memcpy(&params_i32[0], &scale, sizeof(scale));

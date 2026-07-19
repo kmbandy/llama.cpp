@@ -322,6 +322,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    int32_t paged_max_ctx_len() const;
+    void update_paged_attn_max_ctx_len();
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
@@ -363,6 +366,7 @@ public:
     // marks "skip this token" (padding); the scatter kernel honors the
     // sentinel and the attention kernel never reads from those slots.
     ggml_tensor * paged_slot_mapping = nullptr;
+    std::vector<ggml_tensor *> paged_attn_ops;
     const class llama_kv_cache_paged_context * mctx_paged = nullptr;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs

@@ -76,6 +76,51 @@ void fadvise_random_once(int fd) {
 
 }  // anonymous namespace
 
+void set_iowq_max_workers(struct io_uring * ring, const char * who) {
+#ifdef LLAMA_HAVE_IO_URING
+    if (ring == nullptr) {
+        return;
+    }
+    // Read once; 0 / unset / invalid => leave the kernel default untouched, so
+    // the default path is byte-identical to before this knob existed.
+    static const unsigned s_workers = []() -> unsigned {
+        const char * e = std::getenv("WP_IOWQ_MAX_WORKERS");
+        if (e == nullptr || e[0] == '\0') {
+            return 0u;
+        }
+        char * end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end == e || v <= 0 || v > 4096) {
+            LLAMA_LOG_WARN("wp::set_iowq_max_workers: ignoring invalid WP_IOWQ_MAX_WORKERS=%s\n", e);
+            return 0u;
+        }
+        return (unsigned) v;
+    }();
+
+    if (s_workers == 0u) {
+        return;
+    }
+    // values[0] = BOUNDED workers (regular file I/O -- this is the one that
+    // gates us, because IOSQE_ASYNC sends every read down the bounded path).
+    // values[1] = UNBOUNDED (sockets/pipes); left equal for simplicity.
+    unsigned values[2] = { s_workers, s_workers };
+    const int ret = io_uring_register_iowq_max_workers(ring, values);
+    if (ret < 0) {
+        LLAMA_LOG_WARN("wp::set_iowq_max_workers[%s]: register failed: %s\n",
+                       who, strerror(-ret));
+        return;
+    }
+    // On success the kernel writes back the PREVIOUS limits, so this logs what
+    // the ceiling actually was -- the number we could not otherwise observe.
+    // WARN level on purpose: this is once per ring, and it is the only way to
+    // observe the kernel default io-wq ceiling (INFO is filtered in server logs).
+    LLAMA_LOG_WARN("wp::set_iowq_max_workers[%s]: bounded %u -> %u (unbounded %u -> %u)\n",
+                   who, values[0], s_workers, values[1], s_workers);
+#else
+    (void) ring; (void) who;
+#endif
+}
+
 int dup_clear_o_direct(int src_fd) {
     if (src_fd < 0) {
         return -1;
@@ -463,6 +508,9 @@ private:
 
     bool init_(int queue_depth) {
         int ret = io_uring_queue_init(queue_depth, &ring_, 0);
+        if (ret >= 0) {
+            set_iowq_max_workers(&ring_, "host");
+        }
         if (ret < 0) {
             LLAMA_LOG_WARN("wp::IoUringAsyncFileIO: queue_init failed: %s\n", strerror(-ret));
             return false;
