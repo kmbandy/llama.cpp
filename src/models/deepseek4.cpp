@@ -1138,6 +1138,87 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        GGML_ASSERT(hparams.n_layer_nextn == 1 && "DeepSeek4 MTP currently supports one block");
+
+        const int il = hparams.n_layer();
+        const auto & layer = model.layers[il];
+        const int64_t hc = hparams.dsv4_hc_mult;
+
+        GGML_ASSERT(hparams.dsv4_compress_ratios[il] == 0 && "DeepSeek4 MTP block must use raw attention");
+        GGML_ASSERT(layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.eh_proj);
+        GGML_ASSERT(layer.nextn.hc_head_fn && layer.nextn.hc_head_base && layer.nextn.hc_head_scale);
+
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd*hc);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        ggml_tensor * tok_embd = ubatch.token
+            ? ggml_get_rows(ctx0, layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd, inp->tokens)
+            : inp->embd;
+        cb(tok_embd, "mtp_tok_embd", il);
+
+        ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
+        res->add_input(std::move(inp));
+
+        ggml_tensor * inp_pos = build_inp_pos();
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+        ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+
+        ggml_tensor * h_embd = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+        h_embd = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+        tok_embd = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * cur = ggml_concat(ctx0, tok_embd, h_embd, 0);
+        cur = build_lora_mm(layer.nextn.eh_proj, cur);
+        cb(cur, "mtp_eh_proj", il);
+
+        inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+
+        ggml_tensor * residual = inpL;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
+
+        residual = inpL;
+        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * moe_out = build_moe_ffn(cur,
+                layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        inpL = build_hc_post(cur, residual, post, comb, il);
+
+        cur = build_hc_head(inpL, layer.nextn.hc_head_fn, layer.nextn.hc_head_scale, layer.nextn.hc_head_base);
+        cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = ggml_mul_mat(ctx0, layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
