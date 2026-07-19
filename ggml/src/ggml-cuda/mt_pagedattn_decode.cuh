@@ -28,7 +28,7 @@ namespace mt {
 
 // Keep this cap and the host dispatch ceiling together. The decode kernels
 // allocate their per-query state to this bound.
-static constexpr int DECODE_MAX_Q = 16;
+static constexpr int DECODE_MAX_Q = 32;
 
 static inline int paged_attn_decode_q_len_ceiling(int num_queries_per_kv) {
     const int gqa_ceiling = DECODE_MAX_Q / num_queries_per_kv;
