@@ -96,6 +96,23 @@ if grep -qE "\*\*\* REFUSE:" "$LOG"; then
   echo "  [gpu_run] host REFUSED the geometry before dispatch (no GPU work) -- not latching." >&2
   exit 4
 fi
+# ---- WORK-EXACTNESS IS A FULL STOP (2026-07-20). Same class as a hang. ----
+#   An audit of 31 runs on the oracle shape found 10 that SILENTLY DROPPED WORK -- and the worst of
+#   them ALSO printed "oracle CLEAN", because the oracle samples 32 of 16384 tiles (0.2%). A run that
+#   drops work and reports clean will be logged as a result unless something refuses it. Dropped work
+#   also FLATTERS TF (less work, same span), so this invalidates the perf number, not just correctness.
+if grep -q "WORK-INEXACT" "$LOG"; then
+  { echo "  WORK-INEXACT (dropped/duplicated work) run: $LOG"; echo "  at: $(date)"; echo "  cmd: $*";
+    grep -A4 "WORK-INEXACT" "$LOG" | sed 's/^/  /'; } > "$LATCH"
+  echo "  [gpu_run] *** WORK-INEXACT LATCHED -- the kernel dropped or double-counted work." >&2
+  echo "  [gpu_run] *** THE THROUGHPUT NUMBER IS INVALID. Further dispatches BLOCKED until a human clears $LATCH ***" >&2
+  exit 5
+fi
+# A run that never reached the STAGINSTR verdict cannot be trusted either -- absence of the gate is
+#   not a pass. (STAGINSTR=0 builds have no counters; those must not be used for perf verdicts.)
+if grep -qE "\[dsws2 STAGINSTR\]" "$LOG" && ! grep -qE "WORK-EXACT|WORK-INEXACT" "$LOG"; then
+  echo "  [gpu_run] *** WARNING: STAGINSTR ran but no WORK-EXACT verdict -- host is stale, rebuild it. ***" >&2
+fi
 if grep -qE "INCOMPLETE|WARN chunk .* -> ABORT|INVALID RUN" "$LOG"; then
   { echo "  hung/invalid run: $LOG"; echo "  at: $(date)"; echo "  cmd: $*"; } > "$LATCH"
   echo "  [gpu_run] *** HANG/INVALID LATCHED -- further dispatches BLOCKED until a human clears $LATCH ***" >&2

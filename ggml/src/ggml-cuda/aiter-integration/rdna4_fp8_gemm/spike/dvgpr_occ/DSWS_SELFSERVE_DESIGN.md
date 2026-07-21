@@ -190,3 +190,225 @@ must NOT reuse `s46` as a DRAIN cursor.
 completer election (exactly one C-store per rowblk); (b) concurrent ds_add vs the completer's bank read
 (`s_wait_dscnt 0` ordering, mirror Codex C1 from the DA boundary); (c) the WMMA operand register map;
 (d) does bypassing the POOL_N cap create any straddle with the parallel ring feed path.
+
+---
+
+## 11. AS-BUILT (2026-07-19) — supersedes §10 where they disagree
+
+§10 was the pre-implementation sketch. Reading the code changed three of its load-bearing choices, and the
+S2 adversarial review (Codex, job `task-mrruaejr`) then found five defects in the first draft. This section
+is the **as-built** design. Where §10 and §11 conflict, §11 is correct.
+
+### 11.1 Three divergences from §10
+
+1. **The ring is NOT a parallel tier — SELFSERVE is the AUTHORITATIVE claim.** §10 assumed self-serve could
+   run alongside the ring, "both advancing the same `SL_RBNEXT`/`SL_RBDONE`". Those counters are **per-slot**,
+   and a self-serve wave has no slot — so a flat self-serve claim plus the ring's poison-encoded per-slot
+   claim would enumerate the same `G*n_kseg` work items **twice** (double-compute). There is no pre-existing
+   flat claim counter to share. So under `SELFSERVE`: `.Lflow_compute` and `.Lflow_feed` both branch to
+   `.Lflow_selfserve`, and `.Lflow_coast` yields instead of entering the DA reservation. The ring/DECENTASN
+   frontier is unreachable (verified by review). Ring-as-operand-cache is deferred to **S1b**.
+2. **No `RBDONE_SS` array.** The existing **`TILEDONE`** completer is already slot-independent (the C-store is
+   elected by the first wave to cross `ACC_N*n_kseg`), so self-serve reuses it as-is. §10's per-rowblk done
+   array is unnecessary. The elected closer — unique by construction — also drives the group/tile boundary,
+   so the boundary needs **no ZLOCK**.
+3. **`SS_NEXT` is per-group with a folded generation, not a flat tile-wide counter.** A flat counter needs a
+   divide by `ACC_N` (non-pow2) to recover the group. Counting *within* a group makes the decode divide-free.
+
+### 11.2 The claim word (the S2 repair)
+
+```
+SS_NEXT = (curg << SS_GSHIFT=16) | item        item in [0, ACC_N*n_kseg),  curg in [0, GROUPS)
+sentinels (all >= SS_RESV=0xFFFFFFFD, never claimable):
+  0xFFFFFFFF = needs first tile claim   0xFFFFFFFE = first-claim election in flight   0xFFFFFFFD = terminal
+```
+
+One CAS claims **generation + item atomically**, and `curg` is decoded **from the claimed value**. This is
+load-bearing for two independent reasons:
+
+- **Generation safety.** A claimant stalled across a boundary simply loses the CAS; it can never compute an
+  item under a stale group/tile identity.
+- **Register safety.** `curg` never has to survive an LDS helper macro. **`s49` is this kernel's reserved
+  `exec_lo` save slot for every `lds_put` / `lds_*_add` / `lds_inc` / `lds_cmpstore_adv` / `lds_cas_rtn`
+  macro.** The first draft held `curg` in `s49`; every claim CAS destroyed it (deterministic corruption on
+  every dispatch). The working copy now lives in **`s41`**, the register the ring already uses for "group".
+
+`DA_TILE` is published **before** `SS_NEXT`; `SS_NEXT` is the sole release fence. No ZLOCK: `item >=
+ACC_N*n_kseg` naturally blocks all claims for the entire boundary window.
+
+### 11.3 Decode (divide-free; requires pow2 `n_kseg`)
+
+```
+curg    = w >> 16                 ksi     = item & mask        (mask = n_kseg-1)
+item    = w & 0xFFFF              localrb = item >> shift      (bank index, 0..ACC_N-1)
+abs_rowblk = curg*ACC_N + localrb            gi = (t << shift) | ksi   -> DECODE_STI -> mblk, tcol, ksi
+```
+
+Valid **only for power-of-two `n_kseg`**: otherwise `shift`/`mask` describe a *padded* field while `SS_NEXT`
+counts *densely*, so items alias onto invalid K-segments (K=6144 -> n_kseg=24 is a live example). The old
+DECENTASN path fail-safes on this at `.Lflow_da_peek`, which SELFSERVE bypasses — so the guard (pow2 **and**
+`n_kseg > 1`) now sits at the first claim and fails **safe** to terminal.
+
+### 11.4 Ordering rules that must not be broken
+
+- **Grow BEFORE claim.** A grow that fails after a claim would drop the item (short count -> wrong C).
+- **`ds_add` drains (`s_wait_dscnt 0`) before the `TILEDONE` bump**, so `TILEDONE == target` proves every
+  segment of the group is globally visible — that is what makes the closer's bank read safe.
+- **C-store drains (`s_wait_storecnt 0`) before `zero_banks`** reuses those banks for the next group.
+- **`DA_TILE` before `SS_NEXT`** (release fence).
+- Terminal parks `SS_NEXT = SS_RESV` **before** broadcasting `FLOWTERM`, so no wave can claim against a tile
+  that was never published.
+
+### 11.5 Known deferred
+
+- **32-bit A/C offset truncation** (>4 GiB offsets wrap). Real, but it reproduces `ASTAGE_R`'s pre-existing
+  ring limitation (the math was lifted verbatim) — parity, not a self-serve regression.
+- **S1b:** ring-as-operand-cache fast path; the baton poke in the self-serve shrink (perf only).
+
+### 11.6 Offline gates (both green as of 2026-07-19)
+
+`SELFSERVE=0` byte-identical to canonical `43beb082`. `SELFSERVE=1` (WAVES=30 G=6 **FM=1** SEGK=256 POOL_N=1
+ACC_N=3 JDEPTH=1 DECENTASN=1 BANKZERO=1 STAGGER=1) = `a563a9f1`, 0 scratch instructions,
+`private_segment_fixed_size: 0`; `POOL_N=2/SEGK=128` also assembles. **Note FM=1** — the winning frontier
+config is FM=1, not FM=2 (`ARES_BYTES = G*16*FM*SEGK` overflows LDS at FM=2/SEGK=256).
+
+**S3/S4 remain gated: no GPU run yet.**
+
+### 11.7 S2 pass-2 (verification of the repairs) — 2026-07-19
+
+Repairs **2 (generation-coupled CAS), 3 (terminal), 4 (pow2 guard placement)** confirmed **CLOSED**, with `s41`
+verified clobber-free through the whole live range in the emitted ISA. Repair **1 was NOT CLOSED** and two new
+issues surfaced; all three are now fixed:
+
+1. **Item-field capacity guard was unsound.** The build-time check assumed a maximum `n_kseg`, but `n_kseg` is
+   **runtime** (`KT/SEGK`). With `ACC_N*n_kseg > 0xFFFF` the claim's `item++` **carries into the `curg` field**:
+   the group never reaches its completion target (no closer elected, C never stored) while waves start
+   computing under a bogus group with unzeroed banks. Replaced with a **runtime fail-safe at first-claim**
+   (`ACC_N*n_kseg > SS_ITEMMASK` -> terminal), alongside the pow2 check. *Lesson: any bound involving `n_kseg`
+   is a RUNTIME bound.*
+2. **`KMAJOR=1` incompatibility.** Self-serve builds a tile-major `gi = (t<<shift)|ksi`, but `DECODE_STI` under
+   `KMAJOR` decodes `ksi*TOTAL + tile` — silently wrong tile+segment, no guard existed. Now a build-time
+   `.error`: **SELFSERVE v1 requires `KMAJOR=0`** (verified: `KMAJOR=1` now refuses to assemble).
+3. **Rule-5 store drain before the self-serve shrink.** `fat_dec`/`flow_gauge` can emit a non-returning global
+   atomic with no drain of its own (FATGAUGE/STAGINSTR builds), and `s_alloc_vgpr` does *not* drain VMEM
+   stores. Added an explicit `s_wait_storecnt 0x0` before the shrink rather than depending on build config.
+
+Post-fix gates: `SELFSERVE=0` byte-identical (`43beb082`); `SELFSERVE=1` = `e2606a24`, 0 scratch instructions;
+`KMAJOR=1` correctly refuses; `POOL_N=2/SEGK=128` assembles.
+
+### 11.8 S2 pass-3 — 2026-07-19
+
+Repair **2 (`KMAJOR=0` guard) CLOSED** (verified `KMAJOR=1` actually fails assembly). Repairs 1 and 3 were
+**NOT CLOSED**; both are now fixed:
+
+1. **The overflow guard itself overflowed.** `s_mul_i32 ACC_N * n_kseg` truncates to 32 bits *before* the
+   comparison: at `ACC_N=8, n_kseg=2^29` the product is exactly `2^32` -> reads as **0** -> `0 > 0xFFFF` is
+   false -> guard passes, `items` reads 0, every gate coasts forever, and the already-claimed global tile is
+   never computed (incomplete C). **Fix: never compute the product.** `ACC_N` is a build constant, so compare
+   `n_kseg` against the compile-time `SS_ITEMMASK / ACC_N`. Exact in both directions, cannot overflow.
+   (The `items == SS_ITEMMASK` boundary was independently confirmed correct: last claim is `0xFFFE`, stores
+   `0xFFFF`, no carry.)
+2. **The Rule-5 drain covered only one of the reachable reallocation sites.** Now drained on the self-serve
+   side of *every* one: before the **grow**, before the **post-claim shrink**, and via a new
+   `.Lflow_ss_noclaim` trampoline before branching into the shared `.Lflow_cmp_tryadv` shrink. The trampoline
+   exists because that shared path is pre-existing ring code with no drain of its own, and editing it would
+   break `SELFSERVE=0` byte-identity. Undrained emitters this defends against: the entry `live++` atomic,
+   `fat_inc`/`fat_dec` under `FATGAUGE`, `TRACE`'s atomic max, and wid0's `FORENSICS` `flow_snapshot` — wid0's
+   feed role now redirects into self-serve, which is what made that last one newly reachable.
+
+**PRE-EXISTING, NOT FIXED HERE (kmbandy's call, affects the ring identically):** the entry `live++` atomic,
+`TRACE`'s atomic, and `FORENSICS` `flow_snapshot` reach the *initial* `s_alloc_vgpr` (role adoption, ~2520 /
+~2826) with no drain, independent of `SELFSERVE`. Fixing that means editing shared code and giving up the
+byte-identical `SELFSERVE=0` baseline, so it is filed rather than silently changed.
+
+Gates: `SELFSERVE=0` byte-identical `43beb082`; `SELFSERVE=1` = `cb0ef618`, 0 scratch instructions;
+`KMAJOR=1` refuses; `POOL_N=2/SEGK=128` and the `ACC_N=8/SEGK=16` overflow geometry both assemble.
+
+### 11.9 S2 pass-4 — 2026-07-19 (partial: two job failures) + a follow-up fix
+
+**Repair 1 (overflow-free capacity bound): CLOSED — corroborated independently twice.** Both my own audit and
+the (partial) pass-4 audit reached the same conclusion: the floor bound `n_kseg > (SS_ITEMMASK / ACC_N)` is
+exact for every legal `ACC_N` — it neither admits a geometry whose real product exceeds the field nor rejects
+one that would fit (verified for ACC_N 1..8, including the non-dividing 3/5/6/7), and every remaining 32-bit
+product is downstream of that bound. The degenerate `n_kseg == 0` case (KT < SEGK, `s66` wraps to
+`0xFFFFFFFF`) is rejected by the **pow2 test**, which runs first. That ordering is now called out in the
+source as load-bearing: the capacity test alone would ADMIT it (`s66+1` wraps to 0 -> items 0 -> every gate
+coasts forever on an already-claimed tile). **Do not reorder those two checks.**
+
+**Repair 2 (Rule-5 drains): the pass-3 fix was insufficient; now closed properly.** Draining *before* branching
+into the shared `.Lflow_cmp_tryadv` does not help, because that path runs `fat_dec` -> `flow_gauge` ->
+`s_alloc_vgpr`: under **`FATGAUGE=1 FORENSICS=0`**, `fat_dec` emits a `global_atomic_add_u32` with no drain of
+its own, and `flow_gauge` — which carries the only `s_wait_storecnt` — is **compiled out** by `FORENSICS=0`.
+So a store is in flight across the realloc regardless of what is drained beforehand. Fix: self-serve no longer
+enters the shared shrink at all; `.Lflow_ss_noclaim` now branches to `.Lflow_ss_shrink`, which orders its drain
+**after** `fat_dec`. Verified: no self-serve path reaches `.Lflow_cmp_tryadv`, and every `s_alloc_vgpr`
+reachable from self-serve is preceded by a drain that follows the last emitter. (Diag note: grew-but-no-claim
+now counts the burst-shrink gauge rather than TASHRINK.)
+
+Gates: `SELFSERVE=0` byte-identical `43beb082`; `SELFSERVE=1` = `1e9f70ee`; `FATGAUGE=1 FORENSICS=0` assembles.
+
+**Caveat for the next session:** the `.Lflow_ss_noclaim` reroute above was found and fixed after the last
+completed review pass, so it is the one change in this feature that has NOT been through an independent
+adversarial review. It is a single branch retarget to an already-reviewed shrink, but it should be the first
+thing a pass-5 looks at.
+
+---
+
+## 12. First silicon run: HANG — root cause, fix, and the instrumentation gap (2026-07-19)
+
+The first-ever `SELFSERVE=1` dispatch (bounded oracle, 576x4096x4096, n_kseg=16, GROUPS=2, chunk=96) **hung**.
+Card was undamaged: no MODE1 reset, no page fault, VRAM back to idle, `gpu_run.sh` latched as designed.
+
+### 12.1 Root cause — a "safety improvement" I added
+
+I had added a `deadman_check` to the SELFSERVE coast spin. It was **100% redundant**: `.Lflow_loop` (:2639)
+already runs `deadman_check` at every loop head, and the coast path is literally `coast -> s_sleep ->
+.Lflow_loop`. So it **doubled the `s_sendmsg_rtn` REALTIME message traffic from idle coasting waves**.
+`deadman_check` sends a REALTIME message every 64th call then `s_wait_kmcnt 0`; with thousands of synchronized
+coast waves the duplicated traffic saturates the SQ message path, KMCNT never returns, the wave blocks in
+`s_wait_kmcnt` forever, never retires, and the dispatch wedges. This is the exact class CLAUDE.md Rule 5 names
+and that this source documents at :1111-1124.
+
+**The meta-lesson.** The comment I wrote *in the same edit* said "self-throttles its RTC read 1-in-64, so it is
+safe in a coast spin (Rule 5)". I reasoned correctly about the throttle and never asked the prior question:
+**is there already a watchdog on this path?** There was, one branch away. Citing a rule is not checking the
+invariant the rule protects. **Before adding any watchdog/probe/counter to a spin path in this kernel, walk the
+loop to its head and enumerate the message-bus and store traffic already there.** Note also that this survived
+FOUR adversarial passes — because it was framed (by me, to myself and to reviewers) as an obviously-good safety
+addition rather than as a change to hot-path message traffic. Reviewers challenge what you point them at.
+
+### 12.2 Fixes
+
+1. Removed the redundant `deadman_check`; the loop-head watchdog owns it.
+2. The FAT post-grow `SS_NEXT` CAS retry was the one self-serve spin with no watchdog above it. Closed it
+   **without** adding a deadman (that repeats the mistake): a **bounded retry budget of 8**, mirroring
+   `.Lflow_da_peek`'s peek budget — on exhaustion bail to shrink+coast, which reaches the loop-head watchdog.
+   No claim is held there, so nothing is lost, and it adds **zero** message traffic.
+
+### 12.3 The instrumentation gap (and its fix)
+
+The run could not explain itself. Every `CNT_*` is a per-wave SGPR flushed by `cnt_emit` **at retire** — so when
+the failure *is* "waves never retire" they all read 0 and carry no information. `fatPeak`/`residentPeak` are
+FATGAUGE/TRACE-gated and were structurally 0. The self-serve lifecycle had exactly **one** eager observable
+(`occ[20]`).
+
+Added an **eager** lifecycle snapshot, `.if SELFSERVE && FORENSICS`, folded into the existing `flow_snapshot`
+so it inherits that macro's wid0-only scope and 1-in-64 throttle (7 stores/coord-cycle already carry a
+documented MES-quiesce risk, so this deliberately does **not** get its own cadence, and stores only 3-4 words):
+
+| slot | field | reads |
+|---|---|---|
+| `occ[40]` | raw `SS_NEXT` | `0xFFFFFFFF` no tile yet, `0xFFFFFFFE` first-claim in flight, `0xFFFFFFFD` terminal; else `(curg<<16)\|item` |
+| `occ[41]` | `DA_TILE` | the WG's pinned tile |
+| `occ[42]` / `occ[43]` | `TILEDONE[0]` / `[1]` | segments completed per group (target `ACC_N*n_kseg`) |
+
+These live in the LOW control region the host re-zeroes **per chunk**, so on a timeout they show the *failing*
+chunk. The host prints them under `[timeout forensics] SELFSERVE` with a read-key: `item` short with
+`TILEDONE[curg]` shorter still == claimed-but-never-completed; `item` maxed with `TILEDONE` short == a claimant
+died holding an item.
+
+Gates: `FORENSICS=0` byte-identical both ways (`SELFSERVE=0` = `43beb082`, `SELFSERVE=1` = `e952e6ef`);
+`FORENSICS=1 SELFSERVE=1` assembles (22948B); host compiles clean.
+
+**Next silicon run must be the `FORENSICS=1` build** so the death is self-explaining. Requires: human clears
+`.gpu_last_hang`, fresh greenlight, new board claim.

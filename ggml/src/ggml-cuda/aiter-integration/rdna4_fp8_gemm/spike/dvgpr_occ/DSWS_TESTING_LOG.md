@@ -905,3 +905,701 @@ recorded here vs the hipBLASLt baseline.
   A/B from L2/L3 into VGPR, WMMA, ds_add into shared bank) so parallelism = wave count not slot count → budget binds → the stagger
   engine engages. Fingerprint to confirm: grow-fail 0→large, door1 100%→<100%, baton occ98>0, TF>8.2. Hook site = `.Lflow_compute`
   door1 branch (:2783-2786). Ring stays as opportunistic fast-path. GATE-defined build S0-S4 in the spec.
+
+### 2026-07-19 EVENING — ⭐⭐⭐ SELFSERVE CARRY-THROUGH LANDS: 8.2 → 15.6 TF (1.90x) ON THE PEAK CELL
+- **S1 = carry-through on DECENTASN**, not a new mechanism. If the ring is empty, the assigning wave carries its own
+  reservation through compute (self-loads A/B from L2/L3, WMMA, ds_add into the shared bank) instead of stamping a slot
+  and walking away. At POOL_N=1 the handoff bought nothing. Ring stays as the opportunistic fast path.
+- Config of record (unchanged from the 2026-07-19 frontier sweep peak cell): `WAVES=30 G=6 FM=1 FN=4 SEGK=256 POOL_N=1
+  ACC_N=3 JDEPTH=1 KMAJOR=0 DECENTASN=1 BANKZERO=1 STAGGER=1 SELFSERVE=1 FORENSICS=0 STAGINSTR=1 TFPROBE=1 DEADMAN=1`.
+  Shape 24576x4096x131072 (MTL=256 NTL=64 K=131072 n_kseg=512), chunk 384x43 MAXS=3.0, oracle stride=512.
+  **Fed by BIG-M, not deep-K** (deep-K OOMs ~30GB host at a 2s span; big-M stays ~3.5GB).
+
+  | run | build | TF | span | oracle | computed | note |
+  |-----|-------|----|------|--------|----------|------|
+  | baseline | SELFSERVE=0 | 8.2 | 3.20s | CLEAN | 50330112 | **1536 SHORT** (dropped work) |
+  | #8 | SELFSERVE=1 FORENSICS=0 | 15.1 | 1.749s | CLEAN | 50331648 | EXACT |
+  | #9 | + SGPR fix | **15.6** | **1.690s** | **CLEAN** | **50331648** | EXACT, deadman armed |
+- Run-to-run spread 3.3%, inside the ~15.6% throughput noise another session measured on this box the same evening;
+  the gap to 8.2 is far outside it. **S1 is also MORE work-exact than the baseline** — baseline dropped 1536 rowblk
+  segments, S1 drops zero. Per the standing rule that dropped work FLATTERS TF, the 1.9x is if anything conservative.
+- Funnel: `entered == shrunk == 16777216` (= 2*TOTAL_super, one emission per GROUP; GROUPS=2). Every reservation
+  carried through; ZERO fell back to the ring handoff. We are now INSIDE the hipBLASLt band (12.6-70.6 TF), at the low end.
+- ⭐ **THE WIN DID NOT COME FROM THE MOAT.** `grow-fail=0`, `door1=100%`, `occ[98] baton=0` — ALL UNCHANGED from
+  baseline in both runs. The 1.9x came purely from deleting the ring handoff. The dyn-VGPR budget still never binds and
+  the stagger/traveling-peak engine is still idle. The design-doc fingerprint (grow-fail 0->large, door1 <100%, baton>0)
+  has NOT fired. **15.6 is not the ceiling.**
+- CAUTION — two of our wall-indicators may now be TAUTOLOGIES under S1 and must be re-derived before being used as
+  evidence again: (a) `door1 NOTHING-STAGED=100%` — carry-through waves never stage for anyone, so the ring is empty BY
+  CONSTRUCTION and a coasting wave MUST find nothing staged; (b) `occ[86]` ASSIGN-starvation 98.4% — the feed path
+  hunting work it no longer handles. Last night's "the wall is FEED" verdict was correct under the RING economy; it
+  cannot be carried forward unexamined.
+- ALSO VOID: last night's "POOL_N weak/situational" conclusion. Under the ring POOL_N bought staging depth; under
+  carry-through POOL_N is the CONCURRENCY knob. Same symbol, different meaning — do not carry the sweep forward.
+
+### 2026-07-19 EVENING — ROOT CAUSE OF THE 15.6 CEILING (confirmed in source, not inferred)
+- `occ_kernel_dsws_flow.s` reservation gate: `s_sub_u32 s47, s44, s45 (ASSIGN-DRAIN) ; s_cmp_ge_u32 s47, POOL_N ;
+  s_cbranch_scc1 .Lflow_feedmt_sleep`. At POOL_N=1 that is **exactly ONE outstanding super-tile per workgroup** — 64
+  carriers across 1920 waves = 3.3% of the fleet, against 5.1%-of-peak measured. Arithmetic closes: 16,777,216
+  reservations / 64 WGs / 1.69s = **~6.4us per reserve->drain cycle**, i.e. exposed L2/L3 latency with no occupancy to
+  hide it behind.
+- Under SELFSERVE the slot holds only a 32-byte PRE-COMPLETED SENTINEL, not operands. POOL_N is pinned at 1 because it
+  sizes the LDS-expensive OPERAND pool (`OP_BASE + POOL_N*OPSTRIDE`) — a service carry-through never uses. **The window
+  is being rationed at operand-pool prices.**
+
+### 2026-07-19 EVENING — ❌ SSWIN=8 HANGS + GPU RESET (run #10). LATCHED. DO NOT RE-RUN AS-IS.
+- New defsym `SSWIN` (Codex) decouples the carry-through reservation window from the operand-pool depth: `SSWIN` defaults
+  to `POOL_N`; new `SLOT_N` drives `slot_of`; LDS guard at :715 accounts for the wider 32B control array; gate at :3664
+  compares against `SSWIN`; seven `SELFSERVE && SSWIN>POOL_N` sites handle the boundary cases; new guard refuses
+  `SSWIN < POOL_N`.
+- OFFLINE GATES ALL PASSED: SELFSERVE=0 = `43beb082`; **SSWIN-unset BIT-IDENTICAL to `be1bb047`** (inert until raised);
+  SSWIN=8 = `f36c06a0` 0-spill; SSWIN=16 fits LDS; KMAJOR=1 / DUTYPROBE=1 / SSWIN<POOL_N all refuse.
+- ON SILICON: **hang on the FIRST chunk + 1 GPU RESET.** `occ0(live)=1763` of 1920, `computed=312` (expected 50331648),
+  `FRONTIER ASSIGN=0 STAGE=0 DRAIN=0` — the frontier never left zero, so reservations stopped happening ENTIRELY.
+- **The window hypothesis is NEITHER confirmed NOR dead** — the run never got far enough to test whether the budget binds.
+  `grow-fail=0` here is meaningless.
+- ⚠️ **THE GATES PROVED THE CHANGE IS INERT WHEN OFF. THEY PROVED NOTHING ABOUT CORRECTNESS WHEN ON.** That distinction
+  should have been stated before dispatching, not after. The plan itself named the tile/group boundary interlock
+  (ZLOCK / DA_ZDONE / GSTORED, and the fact that a 1-deep window is what currently PREVENTS a boundary firing under a
+  live reservation) as the PRIMARY RISK — and that is exactly where it broke.
+- SSWIN is inert by default, so the tree is safe; only the opt-in SSWIN=8 build is broken.
+
+---
+
+## 2026-07-20 MORNING — run #10 (SSWIN=8) hang: ROOT CAUSE FOUND OFFLINE
+
+**Verdict: host/kernel LDS contract break. NOT the boundary interlock flagged as primary risk.**
+
+`occ_kernel_dsws_flow.s:715-719` — when `SSWIN > POOL_N` the kernel relocates the per-slot
+control array from the low control gap (`SLOTC_INLINE_BASE`=148) to the TOP of LDS, above the
+accumulator pool, growing the group segment by `SSWIN*SLOTC_STRIDE`.
+`occ_dispatch.cpp:1836` computed `ldsBytesRaw = kOpBase + poolSlots*operandBytes + accBytes`
+— a hand-mirror of the kernel's OLD total, with **no SSWIN term**.
+
+Exact arithmetic at the config of record (POOL_N=1 ACC_N=3 FM=1 FN=4 G=6 SEGK=256), values
+EXTRACTED from the assembler (not hand-derived) by `gate_lds.sh`:
+
+| SSWIN | kernel LDS_TOTAL_FLOW | host raw (pre-fix) | granule-rounded | result |
+|-------|----------------------|--------------------|-----------------|--------|
+| unset | 53760                | 53760              | 53760           | fits   |
+| 8     | 54016                | 53760              | 53760           | **256B OOB** |
+| 16    | 54272                | 53760              | 53760           | **512B OOB** |
+
+`GRANULE=512`, and `53760 = 105 granules EXACTLY` — **zero slack**. One byte more and the
+control array would have fit by accident and hidden the defect indefinitely.
+
+**Mechanism** (under-allocation certain; precise OOB semantics inferred): control array OOB →
+writes dropped, reads 0 → `SL_GEN`=0 (only generation 0 passes the v3 gate); `SL_RBNEXT`=0
+reads as staged+claimable so *every* wave's `CAS(0→1)` "wins" the same rowblk (explains
+`computed=312` of duplicated work); `SL_RBDONE` never increments → `DRAIN` pinned at 0 →
+`ASSIGN−DRAIN` saturates `SSWIN` → all waves sleep. Hang + 1 GPU reset.
+`FRONTIER ASSIGN=0` was a **never-published snapshot**, not a live zero — `computed>0` proves
+`ASSIGN` advanced.
+
+**Fix:** `occ_dispatch.cpp` now adds `ssWin*32` when `ssWin > poolSlots`, reading the SAME
+`SSWIN` env var the build uses (a separate `DSWS2_*` name could drift from the assembled binary).
+Inert when unset (`ssWin == poolSlots`). Kernel unchanged — `SSWIN=8` still assembles to `f36c06a0`.
+
+**Process finding — the important one.** All six kernel gates passed before run #10, including
+the bit-identical-when-inert proof. They were *structurally incapable* of catching this: the
+defect was on the other side of a two-sided contract. Added `gate_lds.sh`, which does **not**
+re-mirror the formula (a third copy would drift too) — it extracts the assembled truth by
+bisecting on an assembler predicate and compares to the host allocation. **Validated by negative
+control:** with the SSWIN term removed it FAILS at 8 and 16, PASSES when unset. A gate that
+passes but cannot fail proves nothing.
+
+Status: fix is static-verified only. Confirmation requires a run; `.gpu_last_hang` still SET.
+
+## 2026-07-20 — RUN #11 (SSWIN=8 + PHIST): NO HANG. LDS FIX CONFIRMED. SSWIN HYPOTHESIS IS DEAD.
+
+Config: `SSWIN=8 PHIST=1` on the config of record (WAVES=30 G=6 FM=1 FN=4 SEGK=256 POOL_N=1 ACC_N=3
+JDEPTH=1 KMAJOR=0 DECENTASN=1 BANKZERO=1 STAGGER=1 SELFSERVE=1 FORENSICS=0 STAGINSTR=1 TFPROBE=1
+DEADMAN=1), shape 24576x4096x131072, ML8_COOP_CHUNK=384, 43 chunks.
+Log: `~/dsws_gpu_logs/s1_sswin8_phist_run11_075448.log`. No latch, no GPU reset.
+
+**1. THE LDS FIX IS CONFIRMED ON SILICON.** Host reported `LDS=54016B(alloc 54272B)` — exactly what
+`gate_lds.sh` predicted (54016 needed, granule-rounds to 54272). Run #10's deadlock did not recur.
+`occ[0](live)=0` clean completion, oracle CLEAN (ok=768 bad=0 max_rel=0), `computed=50331648` EXACT,
+`entered==shrunk==16777216`. The run #10 root cause was the host LDS under-allocation and nothing else.
+
+**2. THE SSWIN HYPOTHESIS IS WRONG — REPORT AND STOP.** `PLAN_SS_WINDOW.md` set the falsification
+criterion in advance: *"If grow-fail stays 0 the hypothesis is wrong — report that, do not chase it
+further."* At SSWIN=8:
+
+| fingerprint | run #9 (SSWIN unset, 15.6 TF) | run #11 (SSWIN=8) |
+|---|---|---|
+| door4 GROW-FAIL (VGPR budget) | 0 | **0** |
+| occ[98] baton | 0 | **0** |
+| door1 NOTHING-STAGED | 100% of coast | **100% of coast** |
+
+Widening the reservation window did NOT make the dyn-VGPR budget bind. The moat is still idle. The
+ceiling was never the `ASSIGN-DRAIN < POOL_N` gate in the way the plan assumed.
+
+**3. TF=4.8, down from 15.6 — but this number is UNATTRIBUTABLE and must not be quoted.** The run
+carried TWO variables (SSWIN=8 and PHIST=1), flagged as such before dispatch. PHIST alone was budgeted
+at ~10%; this is -69%. Cannot separate them from one run. Also note the board's standing warning that
+this box showed 15.6% run-to-run spread on unrelated work, so even a clean A/B needs interleaved arms.
+
+**4. NEW SIGNAL: the wall moved to ASSIGN.** `occ[86]` starvation = 156066768 = **98.4% of all feed-path
+iters found an EMPTY ASSIGN frontier**, and coast rose to 156618346 (75.7% coast-frac), door1 100%.
+Reading: waves are not blocked on the window any more, they are blocked with *nothing to do* — the
+reservation/publish side cannot feed 1920 waves. `occ[97]` release-bails also rose 14.6M -> 48.1M.
+
+**5. MY ERROR: the PHIST histogram was collected and DISCARDED.** I wired the print only into the
+`if (!done)` timeout branch. Run #11 finished clean, so occ[104..113] was never shown — the exact bug
+documented for the run #6 funnel, in a file whose own comment at occ_dispatch.cpp:2100 reads
+*"Instrument the success path."* Fixed by extracting ONE `printPhist()` helper called from BOTH paths
+(a function, not two pasted blocks, because this project's recurring defect is a value mirrored in two
+places that drift). **So run #11 gave us no wave-parking data at all; the 98.4% ASSIGN-starvation read
+above comes from the pre-existing occ[86] counter, not from PHIST.**
+
+NEXT: (a) re-run PHIST=1 SSWIN=8 to actually READ the histogram, or (b) drop SSWIN and A/B PHIST alone
+to price it, or (c) take the ASSIGN-starvation signal seriously and look at publish rate. Needs a call.
+
+## 2026-07-20 — RUN #12 + LOCK-IN: SSWIN=8 IS FREE, AND IS NOW THE CONFIG OF RECORD
+
+**Run #12** (`PHIST=0 SSWIN=8`, kernel sha `f36c06a0` = bit-identical to run #10's kernel; only the host
+LDS fix differs). Log `~/dsws_gpu_logs/s1_sswin8_phist0_run12_090941.log`.
+
+| run | window | TF | span | oracle | computed |
+|---|---|---|---|---|---|
+| #9  | 1 (`SSWIN` unset = `POOL_N`) | 15.6 | 1.690 s | CLEAN | 50331648 |
+| **#12** | **8** | **15.5** | **1.704 s** | CLEAN | 50331648 |
+| #11 | 8 + PHIST | 4.8 | 5.45 s | CLEAN | 50331648 |
+
+**SSWIN=8 has NO DETECTABLE COST.** 0.8% apart, against a box the board measured at 15.6% run-to-run
+spread. Claim defended: "no detectable cost." NOT defended: that 8 is *better* than 1, or that a
+couple-percent regression is excluded — those are single runs on different days, not interleaved arms.
+
+**MY RUN #11 DECOMPOSITION WAS WRONG IN BOTH TERMS.** I estimated PHIST ~1.8 s / SSWIN ~1.9 s. Actual:
+**PHIST ~3.75 s, SSWIN ~0.** I extrapolated from run #7's per-atomic cost assuming the 1/64 throttle
+scaled it linearly, then assigned the residual to SSWIN purely because it was the other variable
+present. That estimate was the *sole* support for "keep SSWIN inert" -- one measurement inverted the
+conclusion. **PHIST costs ~220%, not the ~10% budgeted; it is a FORENSICS-class tool.**
+
+**DECISION (kmbandy): SSWIN=8 is the config of record.** Rationale: it is the mechanism for a
+bottleneck we expect to bind, it is measured free, and leaving it inert means every future run
+re-validates the mechanism we intend to abandon -- which is exactly how `POOL_N=1` calcified into a
+"design decision" for weeks when it was really a hardcoded-`OPSTRIDE` bug artifact.
+**The SSWIN sweep is DEFERRED until TF moves off ~15.5** -- sweeping a flat curve teaches nothing;
+1 vs 8 are indistinguishable only because ASSIGN is starving and the extra slots sit empty.
+NOTE: 8 is an ARBITRARY placeholder (power-of-2 constraint from `slot_of`; LDS cost `SSWIN*32` is
+negligible). It was never derived from the reserve->drain latency or the publish rate.
+
+**HOST/KERNEL LDS DRIFT: FIXED PROPERLY, NOT JUST GUARDED.** Making SSWIN the default upgraded the
+drift risk from "footgun you might step on" to "footgun you step on by FORGETTING an env var". So the
+value now travels WITH THE ARTIFACT: the kernel emits `LDS_TOTAL_FLOW` into a `.lds_total` section
+(`.pushsection`, so `.text` is untouched and every kernel binary stays byte-identical -- verified,
+sha still `f36c06a0`); `build_flow.sh` objcopy's it to `<tag>.lds`; the host READS that file and it
+WINS over the host-side reconstruction, printing loudly on disagreement **and on agreement** (a silent
+success is indistinguishable from the read never happening -- the run #11 PHIST lesson).
+`gate_lds.sh` is retained as the offline guard.
+
+Gate note: `gate_sswin.sh` G2 ("SSWIN unset == `be1bb047`") now proves *the mechanism is inert at
+SSWIN==POOL_N*, NOT *the default build is unchanged* -- the default build is `f36c06a0` now.
+
+All gates green: gate_sswin 6/6, gate_phist 6/6, gate_lds 3/3.
+
+## 2026-07-20 — THE DUTY-CYCLE INVARIANT IS NOW ENFORCED BY THE ASSEMBLER
+
+**Trigger:** I proposed raising `SEGK` 256 -> 1024, having noticed that carry-through freed SEGK from
+its LDS cap (`OPSTRIDE = 16*SEGK*(FN+G*FM)` on a pool carry-through never reads). Correct about the
+cap. Blind to what SEGK is *paid for with*. kmbandy has had to explain this on multiple separate days.
+
+**The invariant.** DSWS beats a static register-blocked GEMM ONLY because split-K keeps each wave's
+VGPR peak BRIEF: grow(112) -> one short K-segment -> flush -> shrink. Low duty => TRAPEZOID => peaks
+phase-offset => many waves time-multiplex ONE per-SIMD budget. **TIME AT PEAK ~ JDEPTH*SEGK.** Raise
+either and duty -> 100%, the trapezoid becomes a full-K SQUARE WAVE, average footprint -> peak,
+staggering buys nothing, and a wave fat for twice as long cannot coast, feed, or adapt -- the D *and*
+the A stop meaning anything. `dyn == static` was MEASURED at full-K: 0% benefit.
+
+**Why a KG note was never going to be enough -- the repo argued FOR the violation:**
+- `:136` "flush/WMMA = 128/SEGK -- so the ONLY way to pay it down is more K accumulated per flush"
+- `:177` JDEPTH "does the same thing for **FREE**"
+
+Both true about flush/LDS, both silent on duty cycle. A memory entry loses to the source file, because
+the source file is what gets read while reasoning about SEGK. **The fix had to go at the point of
+temptation.** Note also that `J*SEGK` is the same product this log already calls *amortization depth* --
+the repo had the right metric and read it with exactly the wrong sign.
+
+**Shipped (offline; every binary bit-identical, default sha still `f36c06a0`):**
+1. `STOP. READ THIS BEFORE RAISING SEGK OR JDEPTH` invariant block at the head of the flush-lever comment.
+2. Old master-equation comment annotated as a HALF-TRUTH; "FREE" on JDEPTH flagged as the most
+   dangerous word in the file (free in LDS *bytes*, expensive in *duty*; `.Lflow_jwait` spins
+   FAT + ACC-live + IDLE = a 100%-duty square wave).
+3. Note at the `.set SEGK` definition site.
+4. **Assembler guard** `:DUTYGUARD` -- `.error` when `JDEPTH*SEGK > DUTY_KMAX` (sanctioned 256),
+   escapable only by an explicit `DUTY_OVERRIDE=1`.
+5. `gate_duty.sh`, **10/10, both directions**:
+
+| SEGK | J | J*SEGK | verdict |
+|---|---|---|---|
+| 32/64/128/256 | 1 | <=256 | pass (every historical geometry) |
+| 128 | 2 | 256 | pass |
+| 512 / 1024 | 1 | 512/1024 | **refuse** (what I proposed) |
+| 256 | 2 / 4 | 512/1024 | **refuse** (same violation via the JDEPTH path) |
+| 1024 | 1 | 1024 | pass *only* with `DUTY_OVERRIDE=1` |
+
+**Standing rule going forward:** `grow-fail == 0` is NOT headroom to spend on a longer peak -- it is
+the symptom that the moat has not engaged. **Judge every lever by whether it puts MORE WAVES THROUGH
+BRIEF PEAKS**, not by whether it makes one wave's segment cheaper.
+
+Surviving levers (none raise duty): `ACC_N=6`->GROUPS=1 (halves B traffic, deletes the boundary
+quiesce; `ACC_STRIDE` is independent of SEGK so time at peak is unchanged); tile swizzle (index
+arithmetic only, attacks the ~256x B re-stream); freeing the dead 40960B operand pool.
+**RETRACTED: raise SEGK.**
+
+## 2026-07-20 AFTERNOON — FIVE ABLATIONS. THE COMPUTE BURST IS FREE. THE WALL IS THE HEAD-PIN.
+
+All on the config of record (`SSWIN=8 ACC_N=3 SEGK=256 SELFSERVE=1 DECENTASN=1 BANKZERO=1`),
+same shape, `computed=50331648` EXACT in every run, no latch, no reset.
+
+| run | ablated | span | delta | oracle |
+|---|---|---|---|---|
+| #12 | control | 1.704 s | — | CLEAN |
+| #13 | every C store (`NOCFLUSH=1`) | 1.710 s | +0.32% | bad (proof) |
+| #14 | every B load, 768 GB (`NOBLOAD=1`) | 1.747 s | +2.50% | bad (proof) |
+| #15 | **all WMMA math** (`NOWMMA=1`) | 1.711 s | **+0.43%** | bad (proof) |
+
+**LOADS, MATH AND STORES ARE ALL FREE.** Delete the entire compute burst and the kernel still takes
+1.7 s. Every oracle failure is the intended proof the ablation bit; every binary was gated with a
+negative control (off-state byte-identical to `f36c06a0`, on-state provably different).
+
+### What this killed
+
+Four bandwidth theories, all built and all wrong: 605 GB/s "94% of DRAM"; the 1536x B request
+amplification; the ~256x tile-row re-stream; and every lever aimed at them — the tile swizzle,
+K-blocking, and the B-in-LDS cache. **They target work that costs nothing.** Also retired for this
+config: "the flush is the kernel" (that was WOFLUSH per-segment atomics at SEGK=128; at SEGK=256
+banked the C store is 0.3%).
+
+### What it found
+
+Coordination latency, unhidden because too few waves are in flight:
+```
+2167 ns per rowblk-segment per WG  /  ACC_N=3 concurrent  =  ~6.5 us unhidden round-trip
+192 of 1920 resident waves computing = 10%
+```
+6.5 us is the same reserve->drain figure computed in the morning and misattributed to memory.
+
+**THE CAP IS `MSSCAN=0` (head-pinned compute), and it is NOT the banks.** `acc_base_of` is
+`bank*ACC_STRIDE + ACC_BASE` — no slot term, *deliberately*: many in-flight slots holding different
+`ksi` of the same tile all `ds_add_f32` into the same bank, which IS the split-K sum, made
+concurrency-safe by `BANKZERO=1`. `MAXFAT=0` (off). `VBUDGET=1536` is the physical throttle that
+should bind and never gets the chance. `MSSCAN=0` pins every wave to the DRAIN-head slot, which
+offers exactly `ACC_N` claims. `SSWIN=8` already has 8 reservations stamped and staged — **the work
+is there and the compute path refuses to look at it.**
+
+### Process findings (worth more than the perf result)
+
+1. **`NOCFLUSH` was INERT on the banked path** — `NOCFLUSH=0` and `=1` assembled byte-identical
+   (`f36c06a0`). Its one gate gnuards the `!BANKZERO` atomic flush; we run `BANKZERO=1`. Dispatching it
+   would have returned a flat span and "proved" the C store is free — a fabricated finding from a dead
+   knob. Caught by an offline sha compare BEFORE the run. Now wired into `.Lflow_cstore` with a
+   negative control. Fifth instance of this class (`STINSTR_FEED`, `CSTORE`, `DIAG`, `NOCFLUSH` v1).
+2. **THE ANSWER WAS ALREADY WRITTEN DOWN, TWICE.** `DSWS_MORNING_2026-07-14.md:54` labels `G`(==`ACC_N`)
+   **"THE BIG LEVER... == the number of waves that can EVER compute concurrently... Capped by LDS"**, and
+   the 07-16 KG entry says **"coast is geometry, not memory."** Five GPU dispatches were spent
+   re-deriving a documented result. The ablations are still worth having — they converted an assertion
+   into evidence and killed four theories permanently — but reading the repo first would have started
+   here this morning.
+3. **A real lever died attached to a false justification.** `ACC_N=6` was proposed in the morning
+   ranked #1, but justified by *bandwidth*; when the bandwidth premise collapsed the lever collapsed
+   with it. Attach levers to the reason they actually work.
+4. **When a constraint is lifted, enumerate everything it was blocking.** S1 made the operand pool dead,
+   which unblocked both `SEGK` (rejected on duty-cycle grounds, correctly) and `ACC_N`/concurrency (the
+   actual answer). Only the first was checked.
+
+Instrumentation added today, all gated + negative-controlled: `PHIST` (bail-door histogram, ~220%
+overhead, FORENSICS-class), `NOCFLUSH` on the banked path, `NOBLOAD`, `NOWMMA`, `gate_duty.sh`,
+`gate_lds.sh`, and the `.lds_total` published-LDS contract.
+
+## 2026-07-20 LATE — ⛔ ALL OF TODAY'S THROUGHPUT NUMBERS ARE RETRACTED. THE KERNEL DROPS WORK.
+
+**Nothing measured today is a result.** Not 15.5, not 19.2, not 20.8, not the ablations. Retracted.
+
+### How it surfaced
+
+A repeat of the chunk=12288 run (kmbandy: *"run it again"*) returned `computed=50330112` against an
+expected 50331648 — **1536 short = `ACC_N*n_kseg` = exactly one group of one tile, silently dropped.**
+Same binary, same command, one run exact and one short: **an intermittent race.**
+Both runs reported **oracle CLEAN**, because the oracle samples 32 of 16384 tiles (0.2%).
+
+### The audit (31 runs on this shape, expected = GROUPS*TOTAL_super*ACC_N == G*TOTAL_super)
+
+| era | runs | dropped work |
+|---|---|---|
+| pre-S1 (`fperf_*`, 2026-07-19) | 18 | **8** — incl. counts that OVERSHOOT (+30, +2) and shorts that are NOT 1536 multiples (548764, 298954) |
+| S1 (runs #6-#19) | 12 | 0 |
+| S1 run #20 | 1 | **1** (1x1536) |
+
+**10 of 31 runs dropped or miscounted work.** The pre-S1 overshoots and non-1536 shorts are a *different*
+and messier failure than the clean S1-era one-group drop.
+
+### kmbandy's call, and it is the right one
+
+> *"if it broke somewhere at a larger workload, that means it's still broken at a smaller workload.
+> it doesn't matter, it's not defensible."*
+
+The race is in the kernel, not in chunk=12288 — a larger workload only made it likelier to fire. It is
+present at chunk=384 and 1536 too; those runs simply did not hit it. **12 consecutive exact S1 runs is
+NOT proof of correctness** — it is equally consistent with a rare race we got lucky on twelve times, and
+one short in thirteen is exactly what a rare race looks like. I cannot distinguish those.
+
+This also retracts last night's brief claim that *"S1 is MORE work-exact than the baseline"*: that rested
+on ONE short baseline run vs S1 runs that happened to be exact. Never supported.
+
+### The real defect: THE VERIFICATION, NOT THE KERNEL
+
+A run could drop a whole tile, print `oracle CLEAN`, and be logged as a result. That happened today.
+- the oracle samples **0.2%** of tiles — a missing tile passes
+- `computed`-exactness was **printed, never enforced**
+- `TILEDONE`/`DRAIN`/`GSTORED` are count-based and (per Codex) structurally cannot detect wrong/missing work
+- **dropped work FLATTERS TF** — less work in the same span reads as higher throughput, so this
+  invalidates the PERF number, not just correctness
+
+### Shipped (offline, no dispatch)
+
+1. **`occ_dispatch.cpp` WORK-EXACTNESS GATE** — computes `expected = G*TOTAL_super` (the `ACC_N` cancels
+   out of `GROUPS*TOTAL_super*ACC_N`; identity verified against all 7 geometries in the audit) and prints
+   a hard `WORK-EXACT` / `*** WORK-INEXACT -- RUN IS INVALID ***` verdict, decoding the delta into
+   `N x 1536` whole groups where it divides.
+2. **`gpu_run.sh` LATCHES on `WORK-INEXACT`** (exit 5) — same class as the hang latch, cleared only by a
+   human. Plus a warning when STAGINSTR ran but no verdict appeared (stale host).
+3. **NEGATIVE-CONTROLLED**: replayed run #20's real log -> latch FIRES; run #19 -> passes; an old
+   pre-gate log -> "host is stale, rebuild it". A gate that cannot be shown to fail is worthless, and
+   five instruments today (`NOCFLUSH` v1, `STINSTR_FEED`, `CSTORE`, `DIAG`, the PHIST zero-buckets)
+   were exactly that.
+
+### Still open
+
+- **The race itself is unfixed and un-root-caused.** One group of one tile, intermittent.
+- **Oracle coverage is still 0.2%.** The work-exactness gate catches DROPPED work globally, but only the
+  oracle can catch WRONG values, and it samples almost nothing. Full-check on this shape is CPU-infeasible;
+  a denser stride for correctness runs is the open question.
+- No throughput baseline currently exists that is verified rather than merely un-caught.
+
+## 2026-07-20 — DROPPED-GROUP RACE: ROOT-CAUSED AND FIXED (s_barrier at init). 20/20 CLEAN.
+
+**The bug:** intermittent silent work-loss (~1 in 8 at chunk 12288), a whole group of one tile dropped,
+oracle CLEAN because it samples 0.2% of tiles. Present since S1 (and messier pre-S1 with overshoots).
+
+**The hunt (BNDPROBE, exact boundary-transition counters):**
+1. `computed`-exactness gate caught it (run #20) after a repeat kmbandy demanded.
+2. BNDPROBE `occ[118]` (ASSIGN != z at the boundary decision) fired, correlated 1:1:1 with missing
+   group-advances and lost groups.
+3. Skew-value capture: `ASSIGN=7 z=0 z-base=1024` -> **ASSIGN AHEAD of z = over-reservation past
+   DA_ZDONE**. This FALSIFIED Codex's CAS argument (which said it couldn't happen) AND confirmed my
+   original hypothesis was directionally right.
+4. Classifier: **12/12 skews at z==0, 12/12 at a TILE decision -> 100% at the FIRST-TILE BOOTSTRAP**,
+   never steady state. That collapsed the search space entirely.
+
+**Root cause:** the init handshake published readiness via a lock-free LDS flag (`RINGINIT=0xACED`,
+written LAST by wid0), used as a release fence. On RDNA that is a BROKEN release/acquire: `lds_put` =
+`ds_store` + `s_wait_dscnt 0x0`, and `s_wait_dscnt` orders only the ISSUING wave's LDS completion --
+it gives NO cross-wave ordering. So `wid0`'s init store of `DA_ZDONE=0` could land AFTER the bootstrap
+winner's `DA_ZDONE=n_kseg`, reverting the cursor to exactly its init state (z=0, base=-TOTAL), reopening
+the reservation window past the boundary -> over-reservation -> whole groups lost. The exact-init-value
+signature (`z=0`, `base=-1024`) is the fingerprint of that late-store clobber.
+
+**The fix (INITBAR=1, now default):** one `s_barrier_signal -1` / `s_barrier_wait -1` pair (RDNA4
+replaced `s_barrier`) after wid0's init, on both the wid0 and waiter arms. It provides the cross-wave
+happens-before the flag-spin cannot: wid0's `lds_put`s are all drained before its barrier, so every wave
+past the barrier sees the fully-published init. ONE-TIME, in the prologue -- NOT a hot-loop dam, so it
+does not violate the river principle (kmbandy's call: "setting up the riverbed before the water flows").
+
+**FIRST s_barrier in this dyn-VGPR kernel.** De-risked per rule 7: small-chunk bring-up first (a barrier
+deadlock is NOT deadman-caught -> would be a true hang, not a clean retire). All 30 waves provably reach
+it (all pass `s_alloc_vgpr 32`, no early exit before the init point). Bring-up: no hang, no deadlock,
+no reset.
+
+**CONFIRMATION: 20 runs at chunk 12288, INITBAR=1 BNDPROBE=1 -> WORK-INEXACT 0, skew>0 0, oracle-clean
+20/20.** At the old ~1/8 rate that is ~2.7 expected failures of exposure; zero. Falsification criterion
+was pre-registered (any single skew kills it); none.
+
+**Gating:** `INITBAR=0` is byte-identical to the buggy `f36c06a0`. Default is now `INITBAR=1` = sha
+`0a03f7e9`, the FIXED config of record. gate_duty/gate_lds/gate_phist all green.
+
+**Correctness note:** the WORK-EXACTNESS GATE (host) + latch (gpu_run) that were built earlier today are
+what caught this class in the first place, and they remain the standing guard -- a run that drops work
+now REFUSES to be logged as a result.
+
+## 2026-07-20 EVENING — N1-N3: SECOND RACE FIXED, VERIFIED BASELINE, ABLATIONS RE-CONFIRMED
+
+**N1 -- TERMFIX (terminal-publication race, Codex-found, benign but real).**
+`.Lflow_da_bnd_term` published `FLOWTERM=0xDEAD` LATE (after releasing ZLOCK), leaving a window for a
+2nd wave to re-win the exhausted boundary -> duplicate `occ[20]++` (terminal=256 not 128 at 2 chunks).
+FIX: publish `FLOWTERM=0xDEAD` WHILE holding ZLOCK and KEEP ZLOCK held (never restore clean z) -- a
+permanently-locked `DA_ZDONE` means no wave can ever re-win the boundary CAS; the terminal drain uses
+ASSIGN/DRAIN not DA_ZDONE, so it is harmless. Gated `TERMFIX` (default 1); `TERMFIX=0` byte-identical
+to the INITBAR-only build `0a03f7e9`. Bring-up (chunk 384): **terminal=2752 = 64x43 EXACTLY (the floor
+= zero duplicates across 2752 opportunities)**, skew=0, WORK-EXACT, oracle CLEAN, no hang.
+
+**N2 -- VERIFIED THROUGHPUT BASELINE (the first trustworthy S1 number).**
+Default fixed kernel `1e78b027` (INITBAR=1 TERMFIX=1), chunk 384, `BNDPROBE=0`, 5 interleaved runs:
+**TF=15.5, mean span 1.703s, spread 0.53%**, all WORK-EXACT, all oracle CLEAN. Matches the pre-fix
+15.5 -> the barrier + termfix cost nothing (one-time prologue). THIS REPLACES EVERY RETRACTED NUMBER.
+
+**N3 -- coordination-bound conclusion RE-CONFIRMED on the fixed kernel:**
+| ablation | span | vs 1.703s |
+|---|---|---|
+| NOWMMA (all math) | 1.702s | -0.1% |
+| NOBLOAD (768 GB B) | 1.669s | -2.0% |
+Deleting compute or operands barely moves span. The wall is COORDINATION, not compute/bandwidth.
+Both WORK-EXACT (drop values, not work), oracle bad by design. Closes the "measured on the buggy
+kernel" caveat on the finding that drives the direction.
+
+**CONFIG OF RECORD: `1e78b027`** = WAVES=30 G=6 FM=1 FN=4 SEGK=256 POOL_N=1 ACC_N=3 JDEPTH=1 KMAJOR=0
+DECENTASN=1 BANKZERO=1 STAGGER=1 SELFSERVE=1 SSWIN=8 INITBAR=1 TERMFIX=1, dispatch ML8_COOP_CHUNK=384.
+Both correctness fixes default-on; every probe/ablation gate byte-identical when off.
+
+## === NEXT SESSION: N4 -- THE COORDINATION/ADMISSION WALL (the real perf frontier) ===
+Coordination is no longer corrupting itself, so throughput now lives in the reserve/publish path.
+Baseline to beat: 15.5 TF / 1.703s. Signals: ~98% of feed iters find an EMPTY ASSIGN frontier;
+reservations contended (run #16 TRY/WIN~3.45 but PHIST-contaminated -> RE-MEASURE cleanly). Codex's
+pointer: admission happens at GETTING A RESERVATION (grow-fail=0 => every wave that reserves computes).
+The dyn-VGPR moat STILL never engages (grow-fail=0) -- the architecture's entire headroom, downstream
+of this wall. Deferred/named: chunk-size (~24% apparent gain RETRACTED, needs one clean re-measure, but
+it is a compositor-safety knob); SSWIN sweep (deferred until TF moves).
+
+================================================================================
+=== 2026-07-20  N4 OPEN — CONFIG-OF-RECORD FED BASELINE LOCKED (20.9 TF) ======
+================================================================================
+LOCKED baseline (supersedes the underfed 15.5 TF number for all perf comparison):
+
+  bin    : 1e78b027 + BNDPROBE=1 (byte-identical perf to BNDPROBE=0; probe is exact/cheap)
+  geom   : 24576x4096x131072  G=6 FM=1 SEGK=256 POOL_N=1 ACC_N=3 SSWIN=8 JDEPTH=1
+  feed   : ML8_COOP_CHUNK=12288  (2 chunks) MAXS=3.0   <-- FED, clock committed
+  run    : s1_n4_fed01_185439.log
+
+  TF          = 20.9   (6.8% of 307 TF fp8 peak)
+  span        = 126331415 ticks = 1.263 s
+  computed    = 50331648  -> WORK-EXACT (= G*TOTAL_super; no work dropped)
+  BNDPROBE    = group-adv=16384 tile-adv=16384 gap=+0 (cursor CLOSES); ASSIGN!=z=0 (clean)
+  canary      = C guard tail clean (no OOB)
+  deadman/dmfat/tokleak = 0
+  ORACLE      = value spot-check NOT captured (my Bash-tool 120s cap SIGTERM'd the host
+                during the oracle CPU ref-compute; kernel had already retired clean, no latch).
+                Same kernel was oracle-CLEAN at chunk 384 (N2 x5, termfix run 23). kmbandy
+                greenlit locking without the re-run: count+boundary+OOB cover correctness here.
+
+WHY 15.5 -> 20.9 IS NOT A GAIN: same work, same kernel. The 15.5 was UNDERFED (43 chunks,
+  clock never committed). 20.9 is the true steady-state number. (The bimodal-clock trap:
+  never quote TF < ~1s; under-fed runs give false architecture.)
+
+*** THE FIX HOLDS AT THE SCALE WHERE IT BROKE. *** Chunk 12288 is exactly where run #8
+  dropped 2 groups on the buggy bin. Fed, fixed kernel = WORK-EXACT + BNDPROBE-clean. First
+  proof the INITBAR+TERMFIX fixes survive the fed regime.
+
+*** THE WALL, RE-MEASURED FED (diagnosis UNCHANGED from underfed -> now defensible): ***
+  coast-frac    58.1%   (was 77-81% underfed)
+  empty ASSIGN  97.2%   -> ASSIGN-BOUND: the coordinator cannot PUBLISH work fast enough
+  coast door1   100%    (NOTHING-STAGED: DRAIN>=STAGE)
+  door4 GROW-FAIL = 0   -> dyn-VGPR moat STILL idle; all headroom is downstream of this wall
+  carrier-stall = 0, baton = 0, jwait = 0  -> NOT stage-bound, NOT compute-bound
+  occ[96] emissions = 16777216 = TOTAL_super  -> coordinator DID emit every assignment;
+                                                 consumption outruns publication.
+  => N4 = attack the PUBLICATION RATE of the ASSIGN frontier. Next step: read the assign/
+     publish mechanism and find why 97% of consumer polls see an empty frontier.
+
+================================================================================
+=== 2026-07-20  N4 MEASUREMENT — RESVPROBE: THE WALL IS CURSOR CONTENTION ======
+================================================================================
+Clean replacement for run #16's PHIST TRY/WIN~3.45 (~294% contaminated). RESVPROBE
+counts the .Lflow_da_peek exits by register-accumulate (reuses CNT_FATFULL s94 /
+CNT_CLEAD s96, both structurally 0 at config of record), so it is measured INSIDE
+the quotable build. RESVPROBE=0 byte-identical to 1e78b027 (gated, proven).
+
+  run    : s1_n4_resvprobe01_191818.log  (fed, chunk 12288)
+  TF=21.0  computed=50331648 WORK-EXACT  oracle CLEAN  no latch  (fully trustworthy)
+
+  WIN (reservations reaching stamp) = 16777216 = TOTAL_super
+  CAS-loss (occ[87])   = 24592252  -> 1.466 collisions per successful reserve
+  window-full (occ[89]) =  3728949  -> 6.3% of empty-frontier bails
+
+VERDICT: CURSOR-CONTENDED (not stage-bound).
+  - window-full only 6.3% => the SSWIN=8 window almost never fills => the single
+    cursor CANNOT get ahead of consumers => reservation-RATE limited, NOT stage-bound.
+  - 1.466 collisions/reserve => ~41M CAS attempts to place 16.8M reservations; 40%
+    of attempts on the single ASSIGN_HEAD LDS word collide.
+  => DECENTASN decentralized the ROLE; the reservation CURSOR is still ONE word, and
+     that word is the publication throttle. NEXT: shard the cursor (S independent
+     reservation lanes). CO-SUSPECT not yet isolated: ZLOCK boundary serialization
+     (DA_ZDONE) is shared state; any shard design must handle boundaries across lanes
+     (this is exactly where INITBAR/TERMFIX races lived -- design carefully).
+
+================================================================================
+=== 2026-07-20  N4 BATCHED-RESERVATION = REJECTED (correct but net loss) =======
+================================================================================
+Grok-implemented (BATCH defsym, s72/s73 backlog, N=min(BATCH,z-r,SSWIN-(r-d))), I reviewed the
+diff + re-ran gates + traced the backlog-drain (both terminal exits continue the backlog; not-done
+exits unreachable from the SS stamp path; s72/s73 batch-only + s67/s68 kernel constants).
+
+BRING-UP run s1_n4_batch4_bringup_200726 (BATCH=4, fed chunk 12288, BNDPROBE=1 RESVPROBE=1):
+  CORRECT: computed=50331648 WORK-EXACT, BNDPROBE cursor CLOSES, ASSIGN!=z=0, oracle CLEAN, no latch.
+           -> the batched serial-drain is correct; no work dropped. Impl + review held.
+  SLOWER:  TF 21.0 -> 16.0.  coast-frac 58.1% -> 96.9%.  window-full 6.3% -> 96.6% (1.57 BILLION).
+           CAS-loss/reserve 1.466 -> 1.873 (WORSE, not the expected ~0.37).
+
+WHY: batching CONCENTRATES claims. A wave claims 4, drains them SERIALLY (each a full compute burst),
+  holding the SSWIN=8 window FULL the whole time -> every other wave hits r-DRAIN>=SSWIN and bails ->
+  mass starvation (coast 96.9%). Fewer concurrent computers -> slower drain -> window stays full. The
+  "self-serve concentration" cost flagged in the plan caveats bit hard.
+
+*** THE FINDING (pre-set falsifier fired): single-cursor CAS contention is NOT the binding wall. ***
+  Attacking it made TF WORSE. The window drains only as fast as waves COMPUTE+STAGE; concentrating claims
+  starves that. The wall is DOWNSTREAM -- window-drain / staging / compute-concurrency, NOT the reservation
+  cursor. The 1.466 CAS-loss was a SYMPTOM, not the cause.
+
+REVERTED: on-disk bin back to config of record 1e78b027 (BATCH=1 byte-identical, gate-proven). BATCH knob
+  kept in-source as a tested-rejected lever. PLAN_CURSOR_BATCH.md marked REJECTED.
+
+NEXT: the ZLOCK/DA_ZDONE boundary stall + staging throughput is now the prime suspect. Measure before any
+  fix. Do NOT widen SSWIN blindly (at BATCH=1 window-full is only 6.3% -- a wider window is not the BATCH=1
+  constraint). Baseline to beat remains 21.0 TF / 1.263s fed.
+
+================================================================================
+=== 2026-07-20  N4 BATCH=2 -> RE-FRAME: batch is a SHELVED WORKING LEVER =======
+================================================================================
+CORRECTION to the "rejected" framing above. BATCH=2 (run s1_n4_batch2, fed): TF=20.5, coast 89.9%,
+window-full 92.2%, CAS-loss/reserve 3.216. WORK-EXACT, oracle CLEAN.
+
+THE SCAN (all WORK-EXACT / oracle CLEAN):
+    BATCH | TF   | coast | window-full | concurrent holders (SSWIN/BATCH)
+      1   | 21.0 | 58.1% |   6.3%      |  ~8
+      2   | 20.5 | 89.9% |  92.2%      |  ~4
+      4   | 16.0 | 96.9% |  96.6%      |  ~2
+
+TF is FLAT while concurrent holders >= ~4 (21.0 vs 20.5), then CLIFFS at ~2 (16.0). Throughput tracks
+CONCURRENCY; ~4 concurrent waves already SATURATE the pipeline. Batching is a CORRECT, VERIFIED mechanism
+for RESERVATION-CAS CONTENTION -- it just isn't the CURRENT binding bottleneck, so it's SHELVED inert
+(BATCH=1 byte-identical), ready to switch on when reservation contention binds (higher concurrency / after
+the coordination wall is cut). This is a built-ahead lever, not a dead end. See PLAN_CURSOR_BATCH.md.
+
+*** THE ACTUAL FINDING the scan bought: the current wall is NOT admission/concurrency. Ruled out: compute
+    (NOWMMA free), operands (NOBLOAD free), and now concurrency (batch scan: enough at baseline). The 21 TF
+    ceiling is PER-WAVE COORDINATION THROUGHPUT -- the fixed LDS-handshake / s_alloc_vgpr / ZLOCK-boundary
+    cost each wave pays, which ~4 concurrent waves already max out. NEXT: measure WHICH per-wave coordination
+    step dominates, then cut it. ***
+
+================================================================================
+=== 2026-07-20  N4 PHASE TIMER — THE WALL IS THE dyn-VGPR ROUND-TRIP ==========
+================================================================================
+Stopped over-ablating; ran the EXISTING phase timer (PHASEPROBE, phase_stamp -> occ[64..69]).
+Direct per-compute-wave tick breakdown (run s1_n4_phaseprobe_211638, K=32768, WORK-EXACT, oracle CLEAN):
+
+    phase        share   what
+    FOLLOW        1.0%   idle: waiting for a stage
+    GROW         33.5%   s_alloc_vgpr grow 32->112 + rowblk claim
+    WMMA         24.1%   the actual fp8 WMMA compute
+    FLUSH        33.7%   split-K ds_add reduction
+    SHRINK        7.6%   s_alloc_vgpr shrink 112->32
+
+*** THE ACTUAL MATH (WMMA) IS ONLY 24%. dyn-VGPR round-trip GROW+SHRINK = 41%. Reduction = 34%. ***
+
+RECONCILES THE ABLATIONS (they measured OVERLAP, not cost): NOWMMA flat because WMMA overlaps loads;
+NODSADD ~flat because the ds_add reduction overlaps too. The ONE phase that CANNOT overlap is
+s_alloc_vgpr -- it is a WaitIdle barrier. So of the big three, GROW+SHRINK (41%) is the REAL wall:
+biggest serialized cost AND the only one that cannot be hidden. This is the s_alloc_vgpr cost, in-vehicle
+(supersedes the prior "GROW/SHRINK ~0%" which was the ml8 STATIC framework vehicle, not DSWS flow).
+
+*** THE KICKER: grow-fail=0. The dyn-VGPR moat NEVER ENGAGES here, so the 41% round-trip buys NOTHING.
+    We pay the most expensive phase for a stagger/moat that is not converting. ***
+
+LEVER FORK (dyn-VGPR is the DSWS ethos -- discuss, do not unilaterally change):
+  (a) make the moat CONVERT: find a regime where the VGPR budget binds (grow-fail>0) so the round-trip
+      buys wave-multiplexing -- but must not violate the DUTY-CYCLE invariant (raising SEGK/JDEPTH forbidden;
+      raising G/concurrency is the candidate).
+  (b) if it cannot convert HERE, stop paying: amortize the round-trip (grow once per reservation, fewer
+      grow/shrink) or a bounded-static regime -- reduces the 41% directly.
+NEXT: pick the fork with kmbandy. Verified fed baseline to beat: 21.0 TF / 1.263s.
+
+================================================================================
+=== 2026-07-20  N4 END-OF-NIGHT — FED NUMBER CONFIRMED, HOST LOWMEM FIX ========
+================================================================================
+FED THROUGHPUT CONFIRMED (the "feed it" instinct VALIDATED the number, did not move it):
+  24576x4096x524288 : TF=23.5  span=4.5s  oracle CLEAN  WORK-EXACT (computed=201326592)
+  24576x8192x524288 : TF=23.5  span=8.96s oracle CLEAN  WORK-EXACT (computed=402653184)
+  => 23.5 TF at BOTH 4.5s AND 9s steady state. NOT an underfed artifact. Coordination wall
+     is real + feed-independent. grow-fail=0 (moat idle), coast 41%, ASSIGN-bound ~82% at both.
+
+HOST FIX (occ_dispatch.cpp, uncommitted): A+B now FORMULA-GENERATED straight into VRAM
+  (Aval/Bval + mbg_gen_preshuffle_B), auto-on when an operand >4GB (or DSWS2_LOWMEM=1). Host
+  RAM stays FLAT (~6GB) at ANY shape -- the --no-mmap equivalent. Verified: oracle CLEAN proves
+  the formulas are byte-exact; RAM dead-flat across a 9s/22GB run. Fill uses chunked host staging
+  + bulk memcpy. KNOWN-SLOW: the per-element division in Aval/Bval makes the fill ~90s for ~17GB
+  (TODO: row-based fill, i/Ko is constant per row -> kill the per-element div, ~6x faster).
+
+GOTCHA BANKED: n_kseg (= K/SEGK) MUST BE A POWER OF 2. K=655360 -> n_kseg=2560 (non-pow2) ->
+  computed=0 (kernel handed out NO work, 100% coast, 14ms, TF=18082 garbage) -> WORK-INEXACT latch.
+  Use K = SEGK * pow2 (e.g. 524288->2048, 1048576->4096). (Also: DSWS2_ORACLE_MTL/NTL set the
+  SHAPE dims M=96*MTL, N=64*NTL -- mislabeled "oracle".)
+
+INCIDENTS (own them): 2x host OOM (host built full A/B vectors before the lowmem fix); 1x ags
+  crash (GTK app, VRAM contention -- displays fine, restartable); 1x computed=0 latch (non-pow2
+  n_kseg). All recovered, no bricks.
+
+hipBLASLt same-shape bar: NOT captured -- torch/ROCm threw "register fat binary failed" spam.
+  TODO tomorrow (env issue, not our kernel). Prior baseline: hipBLASLt 12.6-190 TF on ml8 shapes.
+
+NEXT (tomorrow): the phase-timer verdict stands -- the wall is the dyn-VGPR grow/shrink round-trip
+  (41% of compute-wave time, 0 overlap, buys nothing at grow-fail=0). FORK: (a) make the moat
+  ENGAGE (bind the VGPR budget so the round-trip converts) vs (b) reduce/amortize the round-trip.
+  Plus: fix the fill speed, get the hipBLASLt bar.
+
+================================================================================
+## 2026-07-21 — ⭐⭐⭐ FIRST DSWS vs hipBLASLt HEAD-TO-HEAD ON THE REAL SHAPES
+##              CONFIG OF RECORD. FULL TABLE -> RESULTS_DSWS_vs_hipBLASLt_2026-07-21.md
+================================================================================
+CONFIG: config of record, bin sha 397bfbe1 (G=6 ACC_N=3 FM=1 FN=4 SEGK=256 POOL_N=1 SSWIN=8
+  JDEPTH=1 DECENTASN=1 SELFSERVE=1 BANKZERO=1 STAGGER=1 INITBAR=1 TERMFIX=1). GROUPS=2.
+  M padded UP to the 96-row super-tile; TF corrected back to REAL FLOP (padding counts against us).
+  26 shapes, ALL WORK-EXACT + oracle CLEAN. Raw: ~/dsws_gpu_logs/dsws_sweep_CONFIGOFRECORD.out
+  + dsws_vs_hipblaslt_configofrecord.json.
+
+*** DSWS WINS 4/26 -- ALL IN THE TINY-M MoE DECODE CORNER WHERE hipBLASLt COLLAPSES ***
+  ml8 moe attn_kv     M=64   10.87 vs  1.70  = 6.39x
+  ml8 moe ffn_down    M=64    8.00 vs  1.60  = 5.00x
+  ml8 moe ffn_gate/up M=64    6.60 vs  1.70  = 3.88x
+  ml8 moe ffn_gate/up M=512  20.36 vs 15.40  = 1.32x
+
+*** THE FLATNESS RESULT (the DSWS thesis, MEASURED not asserted) ***
+              DSWS        hipBLASLt
+  mean        6.00        69.18
+  median      5.25        57.30
+  stdev       4.20        63.81
+  CV          0.700       0.922      <- DSWS IS FLATTER ACROSS THE REAL WORKLOAD
+  min/max     0.20/20.36  1.60/189.30
+  We are measurably more clustered than the vendor. hipBLASLt is spiky: 189 TF on big dense,
+  COLLAPSING to 1.6 TF on MoE decode (its fp8 loses to its own bf16 there). We win where it
+  collapses. HONEST OTHER HALF: our mean is 11.5x lower -- today the flatness is "consistently
+  LOW". Strategy is NOT to out-peak them on dense; it is RAISE THE FLOOR WHILE STAYING FLAT.
+  A flat ~150 TF would beat the vendor on most of this table. Curve shape right, level is the work.
+  ATTACK VECTOR: DSWS TF falls as total work rises -- worst is lm_head (201 GFLOP) at 0.20 TF.
+
+WHAT UNBLOCKED IT: real ml8/mlmf K give NON-POW2 n_kseg (2560->10, 9216->36, 768->3, 1536->6) and
+  NO legal SEGK makes them pow2. The DECENTASN coupled cursor was "POW2 n_kseg only" with an
+  explicit fail-safe routing non-pow2 to .Lflow_da_terminal => clean retire, computed=0, SILENTLY
+  NO WORK. Half these shapes returned zeros before today. FIX (uncommitted): reservation span now
+  strides the ksi FIELD WIDTH (2^shift) not n_kseg -- keeps TOTAL=GROUPS<<shift, z>>shift,
+  ksi=within&mask, group=within>>shift EXACT for any n_kseg with NO division and NO spare SGPR.
+  Phantom indices (2^shift - n_kseg per field) are NEVER reserved: peek stops at the real end
+  (ksi = r & mask, register-only -- base is always 2^shift-aligned so no LDS read), and the
+  boundary re-bases ASSIGN/DRAIN/STAGE past the gap under ZLOCK while quiesced. BYTE-IDENTICAL
+  for pow2 n_kseg. Verified: non-pow2 n_kseg=3 exact+clean; pow2 n_kseg=8 regression clean.
+
+HOST FIXES (occ_dispatch.cpp, uncommitted):
+  (1) WORK-EXACT gate is REPS-AWARE (occ[71] accumulates across DSWS2_TARGET_SECS reps; gate now
+      compares G*TOTAL_super*repsDone). It was FALSE-LATCHING every reps>1 run.
+  (2) *** THE COMPOSITOR CAP WAS STRUCTURALLY BROKEN AND IS NOW FIXED. *** chunkMaxS is evaluated
+      BETWEEN chunks so it can only abort REMAINING ones; the old default chunkTiles=claimTotal gave
+      ONE chunk for the whole problem => nChunks==1 => ZERO protection, while still printing
+      "compositor-safe". A 2.46s single chunk (PHIST build, ~220% overhead) took HYPRLAND TO SAFE
+      MODE -- rule 7 exactly: desktop dies, no GPU reset, no other guard sees it. EVERY run before
+      this fix was unbounded by default. Now: default chunk 512 tiles (nChunks>1, cap has
+      granularity) and the single-chunk case WARNS instead of reassuring. Both branches verified.
+
+STILL OPEN: n_kseg==1 (K=256, router_MLP) fail-safe; N%64 (mamba in_proj N=4200/4208);
+  occ[20] over-claim (benign: WORK-EXACT + clean oracle, unexplained).
+PERF DIAGNOSIS UNCHANGED (2026-07-20 phase timer, NOT re-litigated): GROW 33.5% + SHRINK 7.6% =
+  41% dyn-VGPR round-trip, WMMA 24%, FLUSH 34%, grow-fail=0 => the 41% buys nothing. FORK stands.
