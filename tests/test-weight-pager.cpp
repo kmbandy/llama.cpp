@@ -10,6 +10,7 @@
 #include "weight-pager/wp-file-io.h"
 #include "weight-pager/wp-gpu-transport.h"
 #include "weight-pager/wp-host-tier.h"
+#include "weight-pager/wp-host-prefetch.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
 #include "weight-pager/wp-prefetch.h"
@@ -20,6 +21,7 @@
 #include "ggml.h"
 
 #include <cerrno>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +29,7 @@
 #include <fcntl.h>
 #include <map>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -1172,9 +1175,9 @@ static int test_host_tier_store_lookup() {
     for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 3 + 1);
 
     EXPECT(tier.store(/*page_idx=*/7, src.data(), src.size()), "store page");
-    const void * p = tier.lookup(7);
-    EXPECT(p != nullptr, "lookup returns pointer");
-    EXPECT(std::memcmp(p, src.data(), src.size()) == 0, "lookup bytes match");
+    std::vector<uint8_t> out(src.size());
+    EXPECT(tier.lookup(7, out.data(), out.size()), "lookup copies page");
+    EXPECT(std::memcmp(out.data(), src.data(), src.size()) == 0, "lookup bytes match");
     EXPECT_EQ_INT(tier.used_bytes(), src.size(), "used bytes after store");
     EXPECT_EQ_INT(tier.resident_count(), 1u, "one resident page");
 
@@ -1192,15 +1195,13 @@ static int test_host_tier_size_class_reuse() {
     std::vector<uint8_t> c(32, 0xC3);
 
     EXPECT(tier.store(1, a.data(), a.size()), "store page 1");
-    const void * p1 = tier.lookup(1);
     EXPECT(tier.store(2, b.data(), b.size()), "store page 2");
     EXPECT(tier.store(3, c.data(), c.size()), "store page 3 evicts page 1");
-    const void * p3 = tier.lookup(3);
+    std::vector<uint8_t> out(c.size());
 
-    EXPECT(p1 != nullptr && p3 != nullptr, "pointers valid");
-    EXPECT(p3 == p1, "same-size store reuses evicted slot");
-    EXPECT(tier.lookup(1) == nullptr, "evicted page 1 missing");
-    EXPECT(std::memcmp(p3, c.data(), c.size()) == 0, "reused slot has new bytes");
+    EXPECT(tier.lookup(3, out.data(), out.size()), "lookup reused page");
+    EXPECT(!tier.lookup(1, out.data(), out.size()), "evicted page 1 missing");
+    EXPECT(std::memcmp(out.data(), c.data(), c.size()) == 0, "reused slot has new bytes");
 
     return fails;
 }
@@ -1217,10 +1218,11 @@ static int test_host_tier_lru_eviction_order() {
     EXPECT(tier.store(12, bytes.data(), bytes.size()), "store 12");
     EXPECT(tier.store(13, bytes.data(), bytes.size()), "store 13 evicts oldest");
 
-    EXPECT(tier.lookup(10) == nullptr, "oldest page evicted first");
-    EXPECT(tier.lookup(11) != nullptr, "page 11 still resident");
-    EXPECT(tier.lookup(12) != nullptr, "page 12 still resident");
-    EXPECT(tier.lookup(13) != nullptr, "new page resident");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(10, out.data(), out.size()), "oldest page evicted first");
+    EXPECT(tier.lookup(11, out.data(), out.size()), "page 11 still resident");
+    EXPECT(tier.lookup(12, out.data(), out.size()), "page 12 still resident");
+    EXPECT(tier.lookup(13, out.data(), out.size()), "new page resident");
     EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count stays at capacity");
 
     return fails;
@@ -1237,13 +1239,14 @@ static int test_host_tier_lookup_touch_keeps_mru() {
     EXPECT(tier.store(21, bytes.data(), bytes.size()), "store 21");
     EXPECT(tier.store(22, bytes.data(), bytes.size()), "store 22");
 
-    EXPECT(tier.lookup(20) != nullptr, "touch page 20");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(tier.lookup(20, out.data(), out.size()), "touch page 20");
     EXPECT(tier.store(23, bytes.data(), bytes.size()), "store 23 evicts LRU after touch");
 
-    EXPECT(tier.lookup(20) != nullptr, "touched page kept as MRU");
-    EXPECT(tier.lookup(21) == nullptr, "untouched oldest page evicted");
-    EXPECT(tier.lookup(22) != nullptr, "page 22 still resident");
-    EXPECT(tier.lookup(23) != nullptr, "page 23 resident");
+    EXPECT(tier.lookup(20, out.data(), out.size()), "touched page kept as MRU");
+    EXPECT(!tier.lookup(21, out.data(), out.size()), "untouched oldest page evicted");
+    EXPECT(tier.lookup(22, out.data(), out.size()), "page 22 still resident");
+    EXPECT(tier.lookup(23, out.data(), out.size()), "page 23 resident");
 
     return fails;
 }
@@ -1262,9 +1265,10 @@ static int test_host_tier_over_budget_evict() {
     EXPECT(tier.store(32, bytes.data(), bytes.size()), "store beyond used budget evicts and succeeds");
     EXPECT_EQ_INT(tier.used_bytes(), 64u, "used bytes remains capped");
     EXPECT_EQ_INT(tier.resident_count(), 2u, "resident count remains capped");
-    EXPECT(tier.lookup(30) == nullptr, "oldest page evicted under pressure");
-    EXPECT(tier.lookup(31) != nullptr, "page 31 still resident");
-    EXPECT(tier.lookup(32) != nullptr, "new page resident");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(30, out.data(), out.size()), "oldest page evicted under pressure");
+    EXPECT(tier.lookup(31, out.data(), out.size()), "page 31 still resident");
+    EXPECT(tier.lookup(32, out.data(), out.size()), "new page resident");
 
     return fails;
 }
@@ -1276,11 +1280,96 @@ static int test_host_tier_lookup_miss() {
     EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
 
     std::vector<uint8_t> bytes(16, 0x44);
-    EXPECT(tier.lookup(99) == nullptr, "empty lookup returns nullptr");
-    EXPECT(tier.lookup(-1) == nullptr, "negative lookup returns nullptr");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(99, out.data(), out.size()), "empty lookup misses");
+    EXPECT(!tier.lookup(-1, out.data(), out.size()), "negative lookup misses");
     EXPECT(tier.store(40, bytes.data(), bytes.size()), "store 40");
-    EXPECT(tier.lookup(41) == nullptr, "different page lookup misses");
+    EXPECT(!tier.lookup(41, out.data(), out.size()), "different page lookup misses");
 
+    return fails;
+}
+
+static int test_host_tier_concurrency() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/512, /*device_idx=*/-1), "host tier init");
+
+    constexpr int n_threads = 4;
+    constexpr int n_pages = 8;
+    constexpr int n_iters = 25000;
+    constexpr size_t page_size = 32;
+    std::atomic<int> bad_lookups{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&tier, &bad_lookups, t]() {
+            std::vector<uint8_t> expected(page_size);
+            std::vector<uint8_t> out(page_size);
+            for (int i = 0; i < n_iters; ++i) {
+                const int page = (i + t) % n_pages;
+                std::fill(expected.begin(), expected.end(), (uint8_t) page);
+                if ((i % 7) == 0) {
+                    tier.erase(page);
+                } else {
+                    tier.store(page, expected.data(), expected.size());
+                }
+                if (tier.lookup(page, out.data(), out.size()) &&
+                    std::memcmp(out.data(), expected.data(), out.size()) != 0) {
+                    ++bad_lookups;
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ_INT(bad_lookups.load(), 0, "lookup bytes remain page-consistent");
+    EXPECT(tier.used_bytes() <= tier.budget_bytes(), "used bytes stay within budget");
+    EXPECT(tier.resident_count() <= n_pages, "resident pages stay within page set");
+    return fails;
+}
+
+static int test_host_prefetcher() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::map<int, std::vector<uint8_t>> pages;
+    pages.emplace(1, std::vector<uint8_t>(32, 0x11));
+    pages.emplace(2, std::vector<uint8_t>(32, 0x22));
+    pages.emplace(3, std::vector<uint8_t>(32, 0x33));
+    wp::HostPrefetcher prefetcher(
+        [&pages](int page, void * dst, size_t capacity) -> int64_t {
+            const auto it = pages.find(page);
+            if (it == pages.end() || it->second.size() > capacity) {
+                return -1;
+            }
+            std::memcpy(dst, it->second.data(), it->second.size());
+            return (int64_t) it->second.size();
+        },
+        [&tier](int page, const void * bytes, size_t n) {
+            return tier.store(page, bytes, n);
+        },
+        [](int page) { return page == 2; },
+        /*max_queue_depth=*/2, /*max_page_size=*/32);
+
+    prefetcher.enqueue(1);
+    prefetcher.enqueue(2);
+    prefetcher.enqueue(3);
+    prefetcher.start();
+    prefetcher.stop();
+
+    std::vector<uint8_t> out(32);
+    EXPECT(tier.lookup(1, out.data(), out.size()), "non-skipped page stored");
+    EXPECT(std::memcmp(out.data(), pages[1].data(), out.size()) == 0, "stored bytes match");
+    EXPECT(!tier.contains(2), "skipped page not stored");
+    EXPECT(!tier.contains(3), "dropped page not stored");
+    EXPECT_EQ_INT(prefetcher.enqueued(), 2u, "two pages accepted into queue");
+    EXPECT_EQ_INT(prefetcher.dropped(), 1u, "queue oversubscription drops newest page");
+    EXPECT_EQ_INT(prefetcher.read_ok(), 1u, "one page read successfully");
+    EXPECT_EQ_INT(prefetcher.read_fail(), 0u, "no read failures");
+    EXPECT_EQ_INT(prefetcher.skipped(), 1u, "one page skipped");
     return fails;
 }
 
@@ -1986,6 +2075,8 @@ int main() {
         { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
         { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
         { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },
+        { "host_tier_concurrency",               test_host_tier_concurrency               },
+        { "host_prefetcher",                     test_host_prefetcher                     },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },

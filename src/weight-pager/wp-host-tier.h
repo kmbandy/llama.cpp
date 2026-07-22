@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -27,15 +28,27 @@ public:
     void shutdown();
 
     bool store(int page_idx, const void * src_bytes, size_t n);
-    const void * lookup(int page_idx);
+    // Copy a resident page into caller-owned storage. The copy is completed
+    // while holding mu_, so a concurrent store/erase cannot reclaim the arena
+    // slot before the caller consumes the bytes. `n` must equal the page size.
+    bool lookup(int page_idx, void * dst_bytes, size_t n);
 
-    bool   is_initialized() const { return arena_ != nullptr && budget_bytes_ > 0; }
-    size_t budget_bytes()   const { return budget_bytes_; }
-    size_t used_bytes()     const { return used_bytes_; }
-    size_t high_water()     const { return high_water_; }
-    size_t resident_count() const { return resident_.size(); }
-    bool   backend_pinned() const { return backend_pinned_; }
-    bool   mlocked()        const { return mlocked_; }
+    // Store a page whose bytes live in DEVICE memory (D2H copy into the arena).
+    // The exclusive victim path: a VRAM slot being evicted is moved to RAM.
+    // Returns false if the tier is disabled or the copy fails.
+    bool store_from_device(int page_idx, const void * device_bytes, size_t n);
+
+    // Remove a page from the tier (used when it is promoted back to VRAM, so a
+    // page never lives in both tiers).
+    void erase(int page_idx);
+
+    bool   is_initialized() const;
+    size_t budget_bytes()   const;
+    size_t used_bytes()     const;
+    size_t high_water()     const;
+    size_t resident_count() const;
+    bool   backend_pinned() const;
+    bool   mlocked()        const;
     bool   contains(int page_idx) const;
 
 private:
@@ -59,6 +72,7 @@ private:
     std::unordered_map<int, Resident> resident_;
     std::unordered_map<size_t, std::vector<size_t>> free_lists_;
     std::deque<int> lru_;
+    mutable std::mutex mu_;
 };
 
 }  // namespace wp

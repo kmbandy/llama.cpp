@@ -20,6 +20,7 @@
 
 #include "wp-page-catalog.h"
 #include "wp-file-io.h"
+#include "wp-host-prefetch.h"
 #include "wp-host-tier.h"
 #include "wp-pool.h"
 #include "wp-gpu-transport.h"
@@ -87,6 +88,11 @@ public:
         uint64_t xlayer_harvest_calls           = 0; // harvests run before the speculative gate
         uint64_t xlayer_harvested_pages         = 0; // Done prefetches committed+reaped by them
         uint64_t host_tier_hits                 = 0;
+        uint64_t host_prefetch_enqueued         = 0;
+        uint64_t host_prefetch_dropped          = 0;
+        uint64_t host_prefetch_read             = 0;
+        uint64_t host_prefetch_read_fail        = 0;
+        uint64_t host_prefetch_skipped          = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
         uint64_t routing_ptrs_discarded_unconsumed = 0;
@@ -315,6 +321,8 @@ public:
     // prefetch their sister pages. No-op unless WP_PREFETCH_XLAYER is set.
     void submit_xlayer_prefetch(const float * h, int from_layer);
     bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
+    void submit_host_prefetch(const float * h, int from_layer);
+    bool host_prefetch_enabled() const { return host_prefetcher_ != nullptr; }
 
     // Scheduler queue slots that DEMAND prefetch may not consume, so that
     // speculative submits are not starved by demand contention for one shared
@@ -440,6 +448,8 @@ private:
     int  xlayer_topk_             = 16;
     int  xlayer_max_slots_        = 0;   // 0 => n_slots/4, set in init()
     int  n_layer_                 = 0;   // max catalog block_idx + 1
+    int  host_prefetch_lookahead_ = 2;
+    int  host_prefetch_topm_      = 16;
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
@@ -451,10 +461,13 @@ private:
 
     // Owned subsystems.
     std::unique_ptr<FileIOLayer> file_io_;
+    std::unique_ptr<FileIOLayer> host_prefetch_file_io_;
     PoolAllocator                pool_;
     GpuTransport                 transport_;
     PrefetchScheduler            prefetch_;
     std::unique_ptr<HostTier>    host_tier_;
+    std::unique_ptr<HostPrefetcher> host_prefetcher_;
+    uint64_t next_host_prefetch_req_id_ = 1;
 
     // page_idx -> slot_idx (or -1). Set both for in-flight prefetches and
     // for committed (data-ready) pages — distinguished by page_loaded_.

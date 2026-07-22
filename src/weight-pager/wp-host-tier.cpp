@@ -32,7 +32,8 @@ HostTier::~HostTier() {
 }
 
 bool HostTier::init(size_t budget_bytes, int device_idx) {
-    if (is_initialized()) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ != nullptr && budget_bytes_ > 0) {
         LLAMA_LOG_WARN("wp::HostTier: init called twice\n");
         return false;
     }
@@ -96,6 +97,7 @@ bool HostTier::init(size_t budget_bytes, int device_idx) {
 }
 
 void HostTier::shutdown() {
+    std::lock_guard<std::mutex> lock(mu_);
     resident_.clear();
     free_lists_.clear();
     lru_.clear();
@@ -126,11 +128,13 @@ void HostTier::shutdown() {
 }
 
 bool HostTier::contains(int page_idx) const {
+    std::lock_guard<std::mutex> lock(mu_);
     return resident_.find(page_idx) != resident_.end();
 }
 
 bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
-    if (!is_initialized() || page_idx < 0 || src_bytes == nullptr || n == 0) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_bytes == nullptr || n == 0) {
         return false;
     }
     if (n > budget_bytes_) {
@@ -152,16 +156,95 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     return true;
 }
 
-const void * HostTier::lookup(int page_idx) {
-    if (!is_initialized() || page_idx < 0) {
-        return nullptr;
+void HostTier::erase(int page_idx) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (page_idx < 0) {
+        return;
+    }
+    erase_resident_(page_idx);
+}
+
+bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || device_bytes == nullptr || n == 0) {
+        return false;
+    }
+    if (n > budget_bytes_) {
+        erase_resident_(page_idx);
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    erase_resident_(page_idx);
+    size_t offset = 0;
+    if (!acquire_slot_(page_idx, n, offset)) {
+        return false;
+    }
+    // Synchronous D2H: the caller (on_pool_evict_) has already synchronized any
+    // in-flight transfer for this page, so the device slot is settled here.
+    hipError_t err = hipMemcpy(arena_ + offset, device_bytes, n, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::HostTier::store_from_device: hipMemcpy D2H(%zu) page %d failed: %s\n",
+                       n, page_idx, hipGetErrorString(err));
+        free_lists_[n].push_back(offset);  // return the acquired slot
+        return false;
+    }
+    resident_[page_idx] = Resident{offset, n};
+    used_bytes_ += n;
+    lru_.push_back(page_idx);
+    return true;
+#else
+    (void) device_bytes;
+    return false;
+#endif
+}
+
+bool HostTier::lookup(int page_idx, void * dst_bytes, size_t n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || dst_bytes == nullptr || n == 0) {
+        return false;
     }
     auto it = resident_.find(page_idx);
-    if (it == resident_.end()) {
-        return nullptr;
+    if (it == resident_.end() || it->second.bytes != n) {
+        return false;
     }
     touch_lru_(page_idx);
-    return arena_ + it->second.offset;
+    std::memcpy(dst_bytes, arena_ + it->second.offset, n);
+    return true;
+}
+
+bool HostTier::is_initialized() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return arena_ != nullptr && budget_bytes_ > 0;
+}
+
+size_t HostTier::budget_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return budget_bytes_;
+}
+
+size_t HostTier::used_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return used_bytes_;
+}
+
+size_t HostTier::high_water() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return high_water_;
+}
+
+size_t HostTier::resident_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return resident_.size();
+}
+
+bool HostTier::backend_pinned() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return backend_pinned_;
+}
+
+bool HostTier::mlocked() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return mlocked_;
 }
 
 bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {

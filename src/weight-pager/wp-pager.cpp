@@ -76,6 +76,10 @@ constexpr const char * kEnvWpGraphPinMax = "WP_GRAPH_PIN_MAX";
 constexpr const char * kEnvWpStickyL2 = "WP_STICKY_L2";
 constexpr const char * kEnvWpStickyL2Pages = "WP_STICKY_L2_PAGES";
 constexpr const char * kEnvWpStickyL2Stats = "WP_STICKY_L2_STATS";
+constexpr const char * kEnvWpHostPrefetch = "WP_HOST_PREFETCH";
+constexpr const char * kEnvWpHostPrefetchLookahead = "WP_HOST_PREFETCH_LOOKAHEAD";
+constexpr const char * kEnvWpHostPrefetchTopM = "WP_HOST_PREFETCH_TOPM";
+constexpr const char * kEnvWpHostPrefetchQueue = "WP_HOST_PREFETCH_QUEUE";
 
 bool env_flag_is_one(const char * var) {
     const char * v = std::getenv(var);
@@ -620,6 +624,19 @@ void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
     prefetch_pages_batch(fresh, /*count_dense_prefetch=*/false, /*allow_evict=*/true, /*speculative=*/true);
 }
 
+void WeightPager::submit_host_prefetch(const float * h, int from_layer) {
+    if (!initialized_ || !host_prefetcher_ || h == nullptr) return;
+
+    std::vector<ExpertRef> refs;
+    predictor_.predict(h, from_layer, host_prefetch_lookahead_, host_prefetch_topm_,
+                       n_layer_, refs);
+    for (const ExpertRef & r : refs) {
+        for (int page_idx : catalog_.pages_for_expert(r.layer, r.expert)) {
+            host_prefetcher_->enqueue(page_idx);
+        }
+    }
+}
+
 bool WeightPager::init(const Config &             cfg,
                        ggml_backend_buffer_type_t device_buft,
                        int                        device_idx,
@@ -837,6 +854,63 @@ bool WeightPager::init(const Config &             cfg,
         }
     }
 
+    if (env_flag_is_one(kEnvWpHostPrefetch)) {
+        if (!host_tier_) {
+            LLAMA_LOG_WARN("wp::host prefetch: WP_HOST_PREFETCH=1 requested but HostTier is disabled; no-op\n");
+        } else {
+            host_prefetch_lookahead_ = env_nonnegative_int(kEnvWpHostPrefetchLookahead, 2);
+            host_prefetch_topm_ = env_nonnegative_int(kEnvWpHostPrefetchTopM, 16);
+            const int queue_depth = env_nonnegative_int(kEnvWpHostPrefetchQueue, 256);
+            int max_file_idx = -1;
+            for (int i = 0; i < catalog_.size(); ++i) {
+                max_file_idx = std::max(max_file_idx, (int) catalog_.at(i).file_idx);
+            }
+            std::vector<int> prefetch_fds;
+            prefetch_fds.reserve((size_t) std::max(0, max_file_idx + 1));
+            for (int i = 0; i <= max_file_idx; ++i) {
+                const int fd = file_io_->fd(i);
+                prefetch_fds.push_back(fd >= 0 ? dup_clear_o_direct(fd) : -1);
+            }
+            host_prefetch_file_io_ = create_host_file_io(std::move(prefetch_fds),
+                                                          /*prefer_async=*/false,
+                                                          /*queue_depth=*/1);
+            if (!host_prefetch_file_io_) {
+                LLAMA_LOG_WARN("wp::host prefetch: dedicated SyncPread layer init failed; no-op\n");
+            } else {
+                host_prefetcher_ = std::make_unique<HostPrefetcher>(
+                    [this](int page_idx, void * dst, size_t capacity) -> int64_t {
+                        if (page_idx < 0 || page_idx >= catalog_.size()) return -1;
+                        const PageMeta & m = catalog_.at(page_idx);
+                        if (m.size > capacity) return -1;
+                        const uint64_t req_id = next_host_prefetch_req_id_++;
+                        if (!host_prefetch_file_io_->submit(req_id, (int) m.file_idx,
+                                                            m.file_offset, m.size, dst)) {
+                            return -1;
+                        }
+                        host_prefetch_file_io_->flush();
+                        const IoResult result = host_prefetch_file_io_->wait_for_req(req_id);
+                        return result.status == IoStatus::Ok && result.bytes_read == (int) m.size
+                            ? result.bytes_read : -1;
+                    },
+                    [this](int page_idx, const void * bytes, size_t n) {
+                        return host_tier_->store(page_idx, bytes, n);
+                    },
+                    [this](int page_idx) {
+                        if (page_idx < 0 || page_idx >= (int) page_to_slot_.size()) return true;
+                        // Intentional benign race: page_to_slot_ is written by the eval
+                        // thread without locking. A stale read can create a transient
+                        // RAM+VRAM duplicate (removed on promotion/eviction) or miss a
+                        // prefetch; neither affects correctness or steady-state exclusivity.
+                        return page_to_slot_[page_idx] >= 0 || host_tier_->contains(page_idx);
+                    },
+                    (size_t) queue_depth, catalog_.max_page_size());
+                host_prefetcher_->start();
+                LLAMA_LOG_WARN("wp::host prefetch: on K=%d M=%d queue=%d\n",
+                               host_prefetch_lookahead_, host_prefetch_topm_, queue_depth);
+            }
+        }
+    }
+
     initialized_ = true;
     if (pool_.size_class_slots_enabled()) {
         LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B budget (%.1f MiB), size_class_slots=1, prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
@@ -866,6 +940,9 @@ void WeightPager::shutdown() {
         return;
     }
 
+    if (host_prefetcher_) {
+        host_prefetcher_->stop();
+    }
     log_stats_summary();
     weight_pager_eval_cb_reset(this);
     release_graph_pins_();
@@ -881,6 +958,8 @@ void WeightPager::shutdown() {
 
     // Tear down in reverse construction order.
     prefetch_.shutdown();
+    host_prefetcher_.reset();
+    host_prefetch_file_io_.reset();
     file_io_.reset();
     transport_.shutdown();
     host_tier_.reset();
@@ -1003,6 +1082,15 @@ void WeightPager::on_pool_evict_(int slot_idx) {
             finish_async_transfer_event(page, evt);
             page_async_event_[page] = -1;
         }
+        // Exclusive victim tier: move the evicted page's bytes to RAM (D2H)
+        // before dropping the slot mapping, so a later re-reference is served
+        // from Tier 1 instead of re-read from NVMe. The async transfer (if any)
+        // was synchronized just above, so the slot contents are valid here.
+        // Skip speculative pages (prefetched-but-unused = not real working set).
+        if (host_tier_ && page_loaded_[page] && !pool_.is_speculative(slot_idx)) {
+            host_tier_->store_from_device(page, slot_ptr_(slot_idx),
+                                          catalog_.at(page).size);
+        }
         page_to_slot_[page] = -1;
         page_loaded_[page]  = false;
     }
@@ -1025,6 +1113,13 @@ const WeightPager::Stats & WeightPager::stats() const {
         if (pinned) {
             ++stats_.sticky_l2_pins;
         }
+    }
+    if (host_prefetcher_) {
+        stats_.host_prefetch_enqueued = host_prefetcher_->enqueued();
+        stats_.host_prefetch_dropped = host_prefetcher_->dropped();
+        stats_.host_prefetch_read = host_prefetcher_->read_ok();
+        stats_.host_prefetch_read_fail = host_prefetcher_->read_fail();
+        stats_.host_prefetch_skipped = host_prefetcher_->skipped();
     }
 #if defined(GGML_USE_HIP)
     ggml_cuda_get_routed_expert_ptrs_stats(
@@ -1132,9 +1227,13 @@ void WeightPager::log_stats_summary() {
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
             "  cross_layer_hit_in_ensure: %lu\n"
-        "  speculative_evicted_unused: %lu\n"
             "  speculative_evicted_unused: %lu\n"
             "  host_tier_hits: %lu\n"
+            "  host_prefetch_enqueued: %lu\n"
+            "  host_prefetch_dropped: %lu\n"
+            "  host_prefetch_read: %lu\n"
+            "  host_prefetch_read_fail: %lu\n"
+            "  host_prefetch_skipped: %lu\n"
             "  routing_ptrs_set: %lu\n"
             "  routing_ptrs_consumed: %lu\n"
             "  routing_ptrs_discarded_unconsumed: %lu\n"
@@ -1192,9 +1291,13 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
             (unsigned long) s.cross_layer_hit_in_ensure,
-        (unsigned long) s.speculative_evicted_unused,
             (unsigned long) s.speculative_evicted_unused,
             (unsigned long) s.host_tier_hits,
+            (unsigned long) s.host_prefetch_enqueued,
+            (unsigned long) s.host_prefetch_dropped,
+            (unsigned long) s.host_prefetch_read,
+            (unsigned long) s.host_prefetch_read_fail,
+            (unsigned long) s.host_prefetch_skipped,
             (unsigned long) s.routing_ptrs_set,
             (unsigned long) s.routing_ptrs_consumed,
             (unsigned long) s.routing_ptrs_discarded_unconsumed,
@@ -1700,6 +1803,7 @@ void * WeightPager::ensure(int page_idx) {
                     cross_layer_prefetch_candidate_[page_idx] = false;
                 }
 
+                if (pool_.is_speculative(slot)) pool_.unpin_slot(slot);  // release in-flight speculative pin
                 page_loaded_[page_idx] = true;
                 pool_.mark_used(slot);
                 // The async H2D still reads from PrefetchScheduler's pinned
@@ -1718,6 +1822,7 @@ void * WeightPager::ensure(int page_idx) {
         }
         if (prefetch_.wait_for(page_idx, /*timeout_ms=*/-1)) {
             // Stage 2 done; commit and reap.
+            if (pool_.is_speculative(slot)) pool_.unpin_slot(slot);  // release in-flight speculative pin
             page_loaded_[page_idx] = true;
             pool_.mark_used(slot);
             prefetch_.reap(page_idx);
@@ -1738,6 +1843,7 @@ void * WeightPager::ensure(int page_idx) {
         prefetch_.reap(page_idx);
         page_to_slot_[page_idx] = -1;
         slot_to_page_[slot]     = -1;
+        if (pool_.is_speculative(slot)) pool_.unpin_slot(slot);  // release in-flight speculative pin (leak guard)
         pool_.release_slot(slot);
         // fall through to sync fallback
     }
@@ -1836,11 +1942,28 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             bool     seen;
             bool     ok;
         };
+        // Tier-1 (host RAM) lookup partition. HostTier copies a hit into the
+        // per-miss bounce buffer while holding its lock, so the worker may
+        // reclaim arena slots immediately after lookup returns.
+        std::vector<bool> host_hit(misses.size(), false);
         std::vector<HostJob> jobs;
         jobs.reserve(misses.size());
-        int n_od = 0;
+        int n_od = 0, n_host_hit = 0;
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const PageMeta & m = catalog_.at(misses[k].page);
+            if (host_tier_) {
+                if (host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
+                    host_hit[k] = true;
+                    ++n_host_hit;
+                    // fd=-1, queued stays false -> no O_DIRECT read issued.
+                    jobs.push_back(HostJob{
+                        (int) m.file_idx, -1, m.file_offset, 0, m.size,
+                        ensure_host_bufs_[k], ensure_host_buf_bytes_, 0, 0,
+                        false, false, false
+                    });
+                    continue;
+                }
+            }
             const int od = ensure_odirect_fd_((int) m.file_idx);
             if (od >= 0) {
                 ++n_od;
@@ -1952,30 +2075,63 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
             void * vram = slot_ptr_(mm.slot);
-            if (!jobs[k].ok || vram == nullptr) {
+            if (vram == nullptr) {
                 continue;
             }
-            const void * src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+            // RAM hit and fresh reads both use the per-miss bounce buffer;
+            // O_DIRECT reads begin after their 512-align prefix.
+            const void * src = nullptr;
+            if (host_hit[k]) {
+                src = ensure_host_bufs_[k];
+            } else if (jobs[k].ok) {
+                src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+            } else {
+                continue;
+            }
             hipError_t err = hipMemcpyAsync(vram, src, m.size,
                                             hipMemcpyHostToDevice, nullptr);
             if (err != hipSuccess) {
                 jobs[k].ok = false;
+                host_hit[k] = false;
             }
         }
-        hipDeviceSynchronize();
+        // A copy that fails at EXECUTION time (vs enqueue) only surfaces here.
+        // If the sync failed, some slot may hold garbage -- do NOT commit any of
+        // them; force the whole batch down the sync fallback, which re-reads and
+        // re-checks residency correctly. (Guards the wrong-expert-weights class.)
+        const hipError_t sync_err = hipDeviceSynchronize();
+        const bool sync_ok = (sync_err == hipSuccess);
+        if (!sync_ok) {
+            LLAMA_LOG_WARN("wp::ensure_batch: hipDeviceSynchronize failed (%s); routing batch to sync fallback\n",
+                           hipGetErrorString(sync_err));
+        }
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
             void * vram = slot_ptr_(mm.slot);
-            if (jobs[k].ok && vram != nullptr &&
+            const bool ready = sync_ok && (host_hit[k] || jobs[k].ok);
+            if (ready && vram != nullptr &&
                 zero_device_padding(vram, m.size, pool_.slot_size(mm.slot))) {
                 page_to_slot_[mm.page] = mm.slot;
                 page_loaded_[mm.page]  = true;
                 slot_to_page_[mm.slot] = mm.page;
                 pool_.mark_used(mm.slot);
-                batch_bytes += m.size;
                 ++batch_ok_n;
                 out_ptrs[mm.out_i] = vram;
+                if (host_hit[k]) {
+                    ++stats_.host_tier_hits;   // served from RAM; no NVMe bytes
+                    // Exclusive tier: the page is back in VRAM, so drop its RAM
+                    // copy. It re-enters Tier 1 only if evicted again.
+                    if (host_tier_) {
+                        host_tier_->erase(mm.page);
+                    }
+                } else {
+                    batch_bytes += m.size;     // real storage read
+                    // Do NOT populate Tier 1 on read: a page resident in VRAM must
+                    // not also sit in RAM (that made RAM a useless duplicate of the
+                    // pool). Fresh reads are VRAM-only; a page enters Tier 1 as a
+                    // victim via on_pool_evict_ (D2H on eviction).
+                }
             } else {
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
@@ -1983,8 +2139,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
         static int s_host_path_log = 0;
         if (s_host_path_log < 1) {
-            LLAMA_LOG_WARN("wp::ensure_batch: HOST path O_DIRECT=%d/%d misses first batch\n",
-                           n_od, (int) misses.size());
+            LLAMA_LOG_WARN("wp::ensure_batch: HOST path O_DIRECT=%d/%d misses, host_tier_hits=%d first batch\n",
+                           n_od, (int) misses.size(), n_host_hit);
             ++s_host_path_log;
         }
 #else
@@ -2312,6 +2468,18 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
         }
         return false;
     }
+    // MAD-231 extension: pin each speculative slot for its in-flight lifetime.
+    // The async read (p2p direct-to-device) lands straight in this VRAM slot;
+    // without the pin, alloc_slot's Pass-0 "recycle LRU speculative" (or LRU
+    // eviction) could hand the slot to another page before the read completes,
+    // and the late read would corrupt the new owner. Mirrors ensure_batch's
+    // in-flight miss pin. Released at each commit/teardown site below, keyed on
+    // is_speculative (still set there, before mark_used()/release_slot() clears it).
+    if (speculative) {
+        for (int s : slots) {
+            pool_.pin_slot(s);
+        }
+    }
     const auto now = std::chrono::steady_clock::now();
     if (count_dense_prefetch) {
         stats_.dense_prefetch_submitted += (uint64_t) needed.size();
@@ -2617,6 +2785,10 @@ int WeightPager::harvest_ready_prefetches_() {
             continue;
         }
         if (prefetch_.is_loaded(p)) {
+            // Release the in-flight speculative pin (see prefetch_pages_batch)
+            // before mark_used clears the speculative flag. Read has landed, so
+            // the slot is now safe to recycle. No-op for demand pages.
+            if (pool_.is_speculative(page_to_slot_[p])) pool_.unpin_slot(page_to_slot_[p]);
             page_loaded_[p] = true;
             pool_.mark_used(page_to_slot_[p]);
             double seconds = 0.0;
@@ -2637,6 +2809,9 @@ int WeightPager::harvest_ready_prefetches_() {
             if (slot >= 0 && slot < (int) slot_to_page_.size()) {
                 slot_to_page_[slot] = -1;
             }
+            // release_slot does NOT clear pin_count_, so drop the in-flight
+            // speculative pin first or the freed slot stays pinned (leak).
+            if (pool_.is_speculative(slot)) pool_.unpin_slot(slot);
             pool_.release_slot(slot);
             ++n;
             continue;
@@ -2647,6 +2822,9 @@ int WeightPager::harvest_ready_prefetches_() {
             if (slot >= 0 && slot < (int) slot_to_page_.size()) {
                 slot_to_page_[slot] = -1;
             }
+            // release_slot does NOT clear pin_count_; drop the speculative pin
+            // first (leak guard).
+            if (pool_.is_speculative(slot)) pool_.unpin_slot(slot);
             pool_.release_slot(slot);
             ++n;
         }
@@ -3511,9 +3689,8 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
     }
 
     if (host_tier_) {
-        const void * host_ptr = host_tier_->lookup(page_idx);
-        if (host_ptr != nullptr) {
-            int evt = transport_.stage_in(dst, host_ptr, m.size, pool_.slot_size(slot));
+        if (host_tier_->lookup(page_idx, staging, m.size)) {
+            int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size(slot));
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
                 LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
@@ -3528,6 +3705,7 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
             slot_to_page_[slot]     = page_idx;
             ++stats_.host_tier_hits;
             ++stats_.page_ins;
+            host_tier_->erase(page_idx);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
             ++s_diag_count;
             return slot;
