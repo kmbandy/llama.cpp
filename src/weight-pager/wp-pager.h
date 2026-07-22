@@ -450,6 +450,7 @@ private:
     int  n_layer_                 = 0;   // max catalog block_idx + 1
     int  host_prefetch_lookahead_ = 2;
     int  host_prefetch_topm_      = 16;
+    float host_prefetch_min_conf_ = 0.0f;
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the

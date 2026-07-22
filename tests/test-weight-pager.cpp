@@ -1964,6 +1964,37 @@ static int test_router_predictor() {
     return fails;
 }
 
+static int test_router_predictor_confidence() {
+    int fails = 0;
+    using namespace wp;
+    const int n_expert = 4, n_embd = 1;
+    float h[n_embd] = { 1.0f };
+    std::vector<ExpertRef> out;
+
+    // PEAKED: e0 logit 10, others 0 -> softmax(e0) ~ 0.9999.
+    RouterPredictor rp;
+    float Wpk[n_expert*n_embd] = { 10.0f, 0.0f, 0.0f, 0.0f };
+    rp.set_router(1, Wpk, n_expert, n_embd);
+    rp.predict(h, 0, 1, 4, 43, out, 0.5f);
+    EXPECT_EQ_INT((int)out.size(), 1, "peaked+min_conf0.5 -> only e0");
+    if (!out.empty()) EXPECT_EQ_INT(out[0].expert, 0, "peaked survivor is e0");
+    out.clear();
+    rp.predict(h, 0, 1, 4, 43, out, 0.0f);
+    EXPECT_EQ_INT((int)out.size(), 4, "min_conf0 gate off -> all M pass");
+
+    // FLAT: all logits 0 -> each softmax prob 0.25.
+    RouterPredictor rf;
+    float Wfl[n_expert*n_embd] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    rf.set_router(1, Wfl, n_expert, n_embd);
+    out.clear();
+    rf.predict(h, 0, 1, 4, 43, out, 0.5f);
+    EXPECT_EQ_INT((int)out.size(), 0, "flat+min_conf0.5 -> none pass");
+    out.clear();
+    rf.predict(h, 0, 1, 4, 43, out, 0.2f);
+    EXPECT_EQ_INT((int)out.size(), 4, "flat+min_conf0.2 -> all pass, p=0.25");
+    return fails;
+}
+
 static int test_expert_page_index() {
     int fails = 0;
     using namespace wp;
@@ -2090,6 +2121,7 @@ int main() {
         { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
         { "router_predictor",                    test_router_predictor                    },
+        { "router_predictor_confidence",         test_router_predictor_confidence         },
         { "expert_page_index",                   test_expert_page_index                   },
         { "pool_speculative",                    test_pool_speculative                    },
     };

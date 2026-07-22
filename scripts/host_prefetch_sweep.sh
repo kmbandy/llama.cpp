@@ -23,13 +23,15 @@ disk_sectors() {
 }
 
 run_arm() {
-    local round="$1" arm="$2" prefetch="$3"
-    local tag="${round}_${arm}" log="$OUT/${tag}.log" json="$OUT/${tag}.json"
+    local round="$1" arm="$2" prefetch="$3" minconf="${4:-0}" lookahead="${5:-2}"
+    local tag="${round}_${arm}"
+    local log="$OUT/${tag}.log"
+    local json="$OUT/${tag}.json"
     : > "$log"
 
-    echo "######## [$tag] WP_HOST_PREFETCH=$prefetch slots=$SLOTS NPRED=$NPRED ########"
+    echo "######## [$tag] WP_HOST_PREFETCH=$prefetch MIN_CONF=$minconf K=$lookahead slots=$SLOTS NPRED=$NPRED ########"
     env WP_ENSURE_BATCH_HOST=1 WP_HOST_BUDGET_BYTES=8000000000 WP_PIN_HOST=0 \
-        WP_HOST_PREFETCH="$prefetch" WP_PREFETCH_XLAYER=0 WP_SPEC_REAP=0 \
+        WP_HOST_PREFETCH="$prefetch" WP_HOST_PREFETCH_MIN_CONF="$minconf" WP_HOST_PREFETCH_LOOKAHEAD="$lookahead" WP_PREFETCH_XLAYER=0 WP_SPEC_REAP=0 \
         WP_PREFETCH_DEPTH=16 WP_IOURING_DEPTH=16 WP_RESIDENT_DENSE=1 \
         WP_SIZE_CLASS_SLOTS=1 WP_PAGED_BATCH=1 WP_DENSE_PREFETCH_N=0 \
         WP_FADVISE_LOOKAHEAD=0 WP_SAMPLE_ORACLE=0 WP_DRAFT_PREFETCH=0 \
@@ -113,8 +115,11 @@ PY
 
 echo "Host-prefetch sweep: victim vs prefetch, $ROUNDS interleaved rounds"
 for round in $(seq 1 "$ROUNDS"); do
-    run_arm "$round" victim 0
-    run_arm "$round" prefetch 1
+    run_arm "$round" victim 0 0 2
+    run_arm "$round" k1c20 1 0.20 1
+    run_arm "$round" k1c35 1 0.35 1
+    run_arm "$round" k2c35 1 0.35 2
+    run_arm "$round" k2c50 1 0.50 2
 done
 
 echo "########## SUMMARY ##########"

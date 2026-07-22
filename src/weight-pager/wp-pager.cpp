@@ -629,7 +629,7 @@ void WeightPager::submit_host_prefetch(const float * h, int from_layer) {
 
     std::vector<ExpertRef> refs;
     predictor_.predict(h, from_layer, host_prefetch_lookahead_, host_prefetch_topm_,
-                       n_layer_, refs);
+                       n_layer_, refs, host_prefetch_min_conf_);
     for (const ExpertRef & r : refs) {
         for (int page_idx : catalog_.pages_for_expert(r.layer, r.expert)) {
             host_prefetcher_->enqueue(page_idx);
@@ -860,6 +860,8 @@ bool WeightPager::init(const Config &             cfg,
         } else {
             host_prefetch_lookahead_ = env_nonnegative_int(kEnvWpHostPrefetchLookahead, 2);
             host_prefetch_topm_ = env_nonnegative_int(kEnvWpHostPrefetchTopM, 16);
+            const char * mc_env = std::getenv("WP_HOST_PREFETCH_MIN_CONF");
+            host_prefetch_min_conf_ = (mc_env && *mc_env) ? std::strtof(mc_env, nullptr) : 0.10f;
             const int queue_depth = env_nonnegative_int(kEnvWpHostPrefetchQueue, 256);
             int max_file_idx = -1;
             for (int i = 0; i < catalog_.size(); ++i) {
@@ -905,8 +907,8 @@ bool WeightPager::init(const Config &             cfg,
                     },
                     (size_t) queue_depth, catalog_.max_page_size());
                 host_prefetcher_->start();
-                LLAMA_LOG_WARN("wp::host prefetch: on K=%d M=%d queue=%d\n",
-                               host_prefetch_lookahead_, host_prefetch_topm_, queue_depth);
+                LLAMA_LOG_WARN("wp::host prefetch: on K=%d M=%d min_conf=%.3f queue=%d\n",
+                               host_prefetch_lookahead_, host_prefetch_topm_, host_prefetch_min_conf_, queue_depth);
             }
         }
     }
