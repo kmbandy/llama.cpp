@@ -1976,8 +1976,53 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         magic, (uint32_t)NTL, (uint32_t)(FNc*256), 0u };                            // s12 magic, s13 NTL, s14 FNx256, [15] unused
     uint32_t dispInit = BuildDispatchInitiator();
 
-    const uint32_t poolD = getenv("ML8_POOL") ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
-    const uint32_t pool = poolD < 64u ? poolD : 64u;
+    // ---- NEVER LAUNCH A WORKGROUP THAT CANNOT CLAIM A TILE (2026-07-22). ----
+    //   `pool` was hard-defaulted to 64 with NO reference to TOTAL, so a small shape launched 64 WGs
+    //   of which TOTAL..63 were idle BY CONSTRUCTION -- they still pay the full prologue, LDS-init
+    //   participation, entry/exit atomics, instrumentation and the retire barrier. MEASURED on
+    //   96x512x2048 (TOTAL=8): 64 WGs = 1920 waves = 5.816 ms span; 8 WGs = 240 waves = 1.007 ms,
+    //   a 5.78x speedup with `computed` IDENTICAL (384) and the dense oracle clean in both. The
+    //   1680 removed waves cost 4.809 ms, i.e. 2.86 us each -- which is where the "3.0 us per
+    //   launched wave" fixed cost came from. It was never a per-wave execution cost; it was the
+    //   cost of launching waves that had no work to reach them.
+    //   THE CAP APPLIES TO THE DEFAULT ONLY. An explicit ML8_POOL is honoured literally (up to 64)
+    //   so the pre-fix behaviour stays reproducible -- ML8_POOL=64 on an 8-tile shape must still be
+    //   able to reproduce the 5.816 ms measurement, or the A/B above becomes uncheckable.
+    const bool poolExplicit = getenv("ML8_POOL") != nullptr;
+    const uint32_t poolD = poolExplicit ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
+    //   CEILING RAISED 64 -> 256 (2026-07-22) so MORE THAN ONE WG PER CU CAN BE TESTED AT ALL. It had
+    //   been a hard 64 since e06a59944 -- the ONLY commit ever to touch these lines -- which means
+    //   ML8_POOL=128 was SILENTLY CLAMPED to 64 and the standing "2 WGs/CU is garbage" result was
+    //   never actually 2 WGs/CU. The default is unchanged at 64 (= 1 WG/CU on this 64-CU part).
+    uint32_t pool = poolD < 256u ? poolD : 256u;
+    if (!poolExplicit) {
+        if (pool > 64u) pool = 64u;
+        if (TOTAL > 0u && pool > TOTAL) {
+            printf("  [dsws2] pool %u -> %u WGs (capped at TOTAL=%u: %u workgroups could never claim a tile)\n",
+                   pool, TOTAL, TOTAL, pool - TOTAL);
+            pool = TOTAL;
+        }
+    }
+    if (pool < 1u) pool = 1u;
+    //   >1 WG/CU must ACTUALLY FIT or we are queueing, not parallelising -- and a queued run still
+    //   produces a clean-looking number, which is worse than an error. R9700 = 64 CUs, 65536B LDS
+    //   and 32 wave slots per CU (verified via rocminfo). Both budgets must hold simultaneously.
+    if (pool > 64u) {
+        const uint32_t perCU    = (pool + 63u) / 64u;
+        const uint64_t ldsNeed  = (uint64_t)perCU * (uint64_t)ldsBytesRaw;
+        const uint32_t waveNeed = perCU * (uint32_t)WAVES_LAUNCH;
+        if (ldsNeed > 65536ull || waveNeed > 32u) {
+            fprintf(stderr, "  [dsws2] *** REFUSE: ML8_POOL=%u means %u WG/CU, which needs %lluB LDS"
+                            " (budget 65536) and %u wave slots (budget 32).\n"
+                            "      This bin publishes %uB LDS and launches %d waves/WG. They cannot be"
+                            " co-resident, so this would SERIALISE rather than parallelise -- and the\n"
+                            "      run would still print a plausible number. Rebuild with smaller"
+                            " SEGK/ACC_N (LDS <= %lluB) and WAVES <= %u. ***\n",
+                    pool, perCU, (unsigned long long)ldsNeed, waveNeed, ldsBytesRaw, WAVES_LAUNCH,
+                    (unsigned long long)(65536ull / perCU), 32u / perCU);
+            return res;
+        }
+    }
     const char* ydis = getenv("ML8_YIELD_DISABLE"); bool yieldOff = ydis && ydis[0]=='1';
     int yieldMs = getenv("ML8_YIELD_MS") ? atoi(getenv("ML8_YIELD_MS")) : 5;
     if (yieldMs < 0) yieldMs = 0;
@@ -2021,6 +2066,16 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
     bool allok = true; uint32_t lastOcc0 = 0, lastOcc20 = 0; uint32_t totalConv = 0;  // occ[48] conv-commit count, summed across chunks (reset per chunk)
     uint64_t sumSpan = 0; uint32_t spanChunks = 0; bool tfMissing = false;  // TFPROBE: summed per-chunk GPU-tick span (occ[3]-occ[2]); tfMissing => bin has no tick capture
+    // ML8_SPANFLIP: MUST match a bin built -Wa,-defsym,SPANFLIP=1. That bin reverses BOTH tfspan
+    //   atomics, so occ[2]=MAX entry tick and occ[3]=MIN exit tick, and occ[3]-occ[2] becomes the
+    //   ALL-RESIDENT WINDOW (every wave simultaneously live) rather than the first-in/last-out span.
+    //   The sentinels must therefore be seeded the OTHER way round or the atomics can never move off
+    //   them. A mismatch between bin and env does NOT silently lie: the seed stays put and the
+    //   stamped-check below reports the chunk as unstamped (tfMissing), exactly as for a TFPROBE=0 bin.
+    const bool spanFlip = getenv("ML8_SPANFLIP") && atoi(getenv("ML8_SPANFLIP")) != 0;
+    long long flipWindowMin = 0; bool flipAny = false;   // signed: a NEGATIVE window means the first
+                                                         // wave exited BEFORE the last wave entered,
+                                                         // i.e. the waves were never all resident.
     // SUSTAINED (DSWS2_REPS>1): re-run the whole chunked GEMM back-to-back, buffers reused, C re-zeroed per rep
     //   (split-K atomic-adds into C, so a repeated pass without reset would double it). Spans sum across ALL
     //   reps -> TF is over reps*(2MNK) work / total busy ticks (warm-clock steady state, not a cold ms blip).
@@ -2046,7 +2101,8 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         memset((void*)occW, 0, 0x100);        // re-zero the control region (occ[0] live, occ[20] claim, reserved) each chunk
         occW[5] = (uint32_t)base;             // occ[20] (=occW[5]) claim counter starts at this chunk's base sti
         occW[6] = (uint32_t)chunkHi;          // FIX 1(j): occ[24] (=occW[6]) = this chunk's terminal sti bound (memory-carried)
-        occW[2] = 0xFFFFFFFFu;                // TFPROBE: min-sentinel for the entry-tick atomic_min (occ[2]); occ[3] stays 0 (max)
+        if (spanFlip) { occW[2] = 0u; occW[3] = 0xFFFFFFFFu; }   // SPANFLIP: entry is atomic_MAX (seed 0), exit is atomic_MIN (seed ~0)
+        else            occW[2] = 0xFFFFFFFFu;                    // TFPROBE: min-sentinel for the entry-tick atomic_min (occ[2]); occ[3] stays 0 (max)
         occW[62] = magicTotal;                // KMAJOR: magic(TOTAL) for the ksi=sti/TOTAL decode (ignored unless KMAJOR bin)
         if (traceW) { uint64_t tva=(uint64_t)traceBuf.ptr;   // TRACE: (re-)publish buffer VA + cap (memset above wiped occ[52..54])
                       occW[52]=(uint32_t)tva; occW[53]=(uint32_t)(tva>>32); occW[54]=traceMaxRows; }
@@ -2164,7 +2220,16 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         //   chunks -> total GPU busy ticks for the whole GEMM (host inter-chunk gaps excluded). If unstamped, the
         //   bin lacks TFPROBE tick capture -> flag and skip (no bogus TF from the 0xFFFFFFFF sentinel).
         { uint32_t gs = occW[2], ge = occW[3];
-          if (gs != 0xFFFFFFFFu && ge != 0) {
+          if (spanFlip) {
+              // gs = MAX entry (seeded 0), ge = MIN exit (seeded ~0). Both must have moved off seed.
+              // The difference is SIGNED and may legitimately be negative -- that is the whole point.
+              if (gs != 0u && ge != 0xFFFFFFFFu) {
+                  long long w = (long long)(int64_t)(uint64_t)ge - (long long)(int64_t)(uint64_t)gs;
+                  if (!flipAny || w < flipWindowMin) flipWindowMin = w;
+                  flipAny = true;
+                  spanChunks++;
+              } else tfMissing = true;
+          } else if (gs != 0xFFFFFFFFu && ge != 0) {
               sumSpan += (ge >= gs) ? (uint64_t)(ge - gs) : ((uint64_t)ge + 0x100000000ull - (uint64_t)gs);
               spanChunks++;
           } else tfMissing = true; }
@@ -2229,6 +2294,28 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         uint32_t coastIt = occW[70], compIt = occW[71], feedIt = occW[72], growFail = occW[73];
         uint32_t feedMT  = occW[86], fatFull = occW[87];
         uint32_t jWait   = occW[88], cLead = occW[89], cNoStg = occW[90];
+        // ---- A GATE THAT CANNOT EVALUATE MUST SAY SO (2026-07-22). ----
+        //   Before today this whole block was simply SKIPPED when the counters read 0, which meant a
+        //   STAGINSTR=0 bin produced NO work-exactness verdict at all -- and gpu_run.sh's latch keys on
+        //   the string "WORK-INEXACT", so such a run sailed through with silent non-coverage. Absence of
+        //   a verdict was indistinguishable from a passing verdict. That is the same failure class as the
+        //   reps-aware bug: a check that quietly declines to run reads as a check that passed.
+        //   occ[71] is emitted by cnt_flush, so it is 0 for exactly two reasons -- disambiguated here by
+        //   occ[20] (occW[5], tiles claimed), an INDEPENDENT witness that the kernel did real work.
+        if (coastIt + compIt == 0) {
+            uint32_t claimed = occW[5];
+            printf("\n*** DSWS2 WORK-EXACT: CANNOT-EVALUATE -- NO CORRECTNESS VERDICT ***\n"
+                   "    computed(occ[71])=0 coast(occ[70])=0: the STAGINSTR counters are absent, so\n"
+                   "    work-exactness was NOT CHECKED. This is not a pass.\n");
+            if (claimed > 0)
+                printf("    occ[20] claim=%u -> tiles WERE claimed, so the kernel ran and the counters are\n"
+                       "    simply not built in (STAGINSTR=0). Rebuild -Wa,-defsym,STAGINSTR=1 to get a\n"
+                       "    verdict, or use CNTLEAN=1 to keep the verdict while trimming the retire flush.\n", claimed);
+            else
+                printf("    occ[20] claim=0 -> NO tiles were claimed either. The kernel did no work; this is\n"
+                       "    a REAL FAILURE, not a missing instrument.\n");
+            printf("    Do not quote this run's throughput as validated.\n\n");
+        }
         if (coastIt + compIt > 0) {
             double tot = (double)(coastIt + compIt);
             printf("  [dsws2 STAGINSTR] computed=%u  coast=%u  (coast-frac=%.1f%%)  feed-stages=%u\n",
@@ -2436,7 +2523,28 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   the n_kseg segments reduce the SAME K, so total MACs = M*N*K regardless of how K is partitioned). Span
     //   = summed per-chunk (occ[3]-occ[2]) GPU ticks -> the on-chip busy time, immune to host launch/fence/poll
     //   overhead (the reason a host wall-clock is useless at these <1ms shapes). TF = 2*M*N*K*freq / span / 1e12. ----
-    if (spanChunks > 0 && sumSpan > 0) {
+    if (spanFlip) {
+        // DIAGNOSTIC MODE -- this run measures RESIDENCY, not throughput. Deliberately prints no TF:
+        // occ[3]-occ[2] here is the all-resident window, and dividing work by it would be nonsense.
+        if (!flipAny) {
+            printf("  [dsws2 SPANFLIP] n/a -- occ[2]/occ[3] never moved off their seeds. Either the bin\n"
+                   "      was NOT built -Wa,-defsym,SPANFLIP=1 (env and bin must MATCH), or no chunk completed.\n");
+        } else {
+            double us = (double)flipWindowMin / freq_hz * 1e6;
+            printf("  [dsws2 SPANFLIP] ALL-RESIDENT WINDOW = %lld ticks (%.1f us) over %u chunk(s) @ %.0f MHz\n"
+                   "      occ[2]=MAX entry tick (last wave to arrive), occ[3]=MIN exit tick (first wave to leave).\n",
+                   flipWindowMin, us, spanChunks, freq_hz / 1e6);
+            if (flipWindowMin <= 0)
+                printf("      *** NEGATIVE/ZERO: the FIRST wave exited BEFORE (or as) the LAST wave entered.\n"
+                       "      The launched waves were NEVER all simultaneously resident. The normal span\n"
+                       "      (min entry -> max exit) is therefore measuring a LAUNCH/RETIRE RAMP, not\n"
+                       "      concurrent execution -- and per-wave 'cost' derived from it is a RATE, not work.\n");
+            else
+                printf("      Positive: compare against the normal-mode span for this same shape. If the window\n"
+                       "      is a small fraction of that span, most of the span is still ramp, not residency.\n");
+        }
+        printf("  [dsws2 SPANFLIP] (no TF reported: this is a residency probe, not a throughput run)\n");
+    } else if (spanChunks > 0 && sumSpan > 0) {
         res.wall = sumSpan;
         double reps_eff = (repsDone > 0) ? (double)repsDone : 1.0;   // work = reps_eff * (2MNK); span = sum over reps
         double workAll = 2.0 * (double)Mo * (double)No * (double)Ko * reps_eff;
@@ -2460,14 +2568,43 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   DISTRIBUTION (%) is stable regardless. Ticks are summed across ALL compute waves (aggregate time
     //   in each phase), so % shows WHERE compute-wave time goes -- measured, not inferred. ----
     {
-        const char* phName[6] = {"FOLLOW_WAIT","STAGE_WAIT","GROW","WMMA","FLUSH","SHRINK"};
+        // *** LABELS CORRECTED 2026-07-22 -- THE FIRST TWO WERE BOTH WRONG. ***
+        //   occ[64] (kernel s78) is stamped at .Lflow_havestage (occ_kernel_dsws_flow.s:3314), reached
+        //     ONLY after "DRAIN >= STAGE -> nothing fully staged -> coast". It therefore accumulates
+        //     time spent WAITING FOR A STAGE, not time following a claimer. It was labelled
+        //     FOLLOW_WAIT "waiting for claimer to publish next super-tile" -- wrong.
+        //   occ[65] (kernel s79) is stamped after the C-store loop and its s_wait_storecnt
+        //     (occ_kernel_dsws_flow.s:3859), where the kernel comment already read "PH_CSTORE (occ[65];
+        //     host label says STAGE_WAIT)". It is the C-STORE, not a stage wait.
+        //   These two labels sent a 2026-07-22 measurement to the exactly opposite conclusion: the
+        //   profile was read as "stage wait is 0.1%, the feed path is free" when the truth is that
+        //   STAGE WAIT IS 55.5% AND THE C-STORE IS 0.1%. There is currently NO follow-wait timer.
+        //   If you add one, give it its own accumulator -- do not reuse these.
+        // ML8_PHSPLIT=1 MUST match a bin built PHSPLIT=1: the self-serve reservation wait is then
+        // stamped into s79 instead of s78, so occ[64]=RING stage-wait alone and occ[65]=SELF-SERVE
+        // reservation wait PLUS the C-store (measured 0.1% at PHSPLIT=0 -- subtract it when reading).
+        const bool phSplit = getenv("ML8_PHSPLIT") && atoi(getenv("ML8_PHSPLIT")) != 0;
+        const char* phName[6] = {"WORK_WAIT","C_STORE","GROW","WMMA","FLUSH","SHRINK"};
+        const char* phNameSplit[6] = {"RING_WAIT","SS_WAIT","GROW","WMMA","FLUSH","SHRINK"};
+        const char** phN = phSplit ? phNameSplit : phName;
         uint64_t ph[6] = {0,0,0,0,0,0}, phSum = 0;
-        for (int i = 0; i < 6; i++) { ph[i] = (uint64_t)occW[64 + i]; phSum += ph[i]; }
+        // ML8_PHSHIFT MUST MATCH the bin's PHSHIFT defsym (default 8). The kernel right-shifts each
+        // phase accumulator at emit so the u32 occ slots survive a FED run (at 1920 waves an unshifted
+        // slot wraps after 22.4 ms, and a sub-second PHASEPROBE run measures spin-up, not steady state
+        // -- the 2026-07-13 error). Shares are shift-invariant; ABSOLUTE TICKS ARE NOT, so scale here
+        // or the printed tick counts are 2^PHSHIFT too small.
+        const uint32_t phShift = getenv("ML8_PHSHIFT") ? (uint32_t)atoi(getenv("ML8_PHSHIFT")) : 8u;
+        for (int i = 0; i < 6; i++) { ph[i] = (uint64_t)occW[64 + i] << phShift; phSum += ph[i]; }
         if (phSum > 0) {
-            printf("  [dsws2 PHASE breakdown] compute-wave ticks by phase (summed over all waves+chunks):\n");
+            printf("  [dsws2 PHASE breakdown] compute-wave ticks by phase (summed over all waves+chunks;"
+                   " emit-shift 2^%u restored):\n", phShift);
             printf("      %-12s %14s   %6s   %s\n", "phase", "ticks", "share", "what");
-            const char* phWhat[6] = {"idle: waiting for claimer to publish next super-tile",
-                                     "idle: waiting for A/B feeds to stage operands",
+            const char* phWhatMerged0 = "idle: getting work -- ring stage wait (:3314) OR self-serve reservation wait (:4409)";
+            const char* phWhatMerged1 = "C-store: final global_store of C + its drain (kernel :3859)";
+            const char* phWhatSplit0  = "idle: RING stage wait only -- DRAIN>=STAGE at .Lflow_havestage (:3314)";
+            const char* phWhatSplit1  = "idle: SELF-SERVE reservation wait (:4409) + ~0.1% C-store bleed";
+            const char* phWhat[6] = {phSplit ? phWhatSplit0 : phWhatMerged0,
+                                     phSplit ? phWhatSplit1 : phWhatMerged1,
                                      "dyn-VGPR grow 32->112 (+ rowblk claim)",
                                      "the actual fp8 WMMA compute",
                                      "split-K C reduction (global_atomic_add_f32)",
@@ -2476,7 +2613,7 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                 double pct = 100.0 * (double)ph[i] / (double)phSum;
                 char bar[41]; int nb = (int)(pct / 2.5 + 0.5); if (nb > 40) nb = 40;
                 for (int k = 0; k < nb; k++) bar[k] = '#'; bar[nb] = 0;
-                printf("      %-12s %14llu   %5.1f%%  %-40s %s\n", phName[i],
+                printf("      %-12s %14llu   %5.1f%%  %-40s %s\n", phN[i],
                        (unsigned long long)ph[i], pct, bar, phWhat[i]);
             }
             printf("      %-12s %14llu\n", "TOTAL", (unsigned long long)phSum);

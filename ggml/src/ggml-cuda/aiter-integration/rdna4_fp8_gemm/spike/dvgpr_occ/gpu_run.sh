@@ -110,7 +110,15 @@ if grep -q "WORK-INEXACT" "$LOG"; then
 fi
 # A run that never reached the STAGINSTR verdict cannot be trusted either -- absence of the gate is
 #   not a pass. (STAGINSTR=0 builds have no counters; those must not be used for perf verdicts.)
-if grep -qE "\[dsws2 STAGINSTR\]" "$LOG" && ! grep -qE "WORK-EXACT|WORK-INEXACT" "$LOG"; then
+# NOTE the greps below match "[dsws2 WORK-EXACT]" IN BRACKETS -- only the PASS path prints that. The
+#   host's CANNOT-EVALUATE notice also contains the substring "WORK-EXACT", so a loose grep would let
+#   an unverdicted run masquerade as a verdicted one. Absence of a gate must never read as a pass.
+if grep -q "WORK-EXACT: CANNOT-EVALUATE" "$LOG"; then
+  echo "  [gpu_run] *** NO CORRECTNESS VERDICT: the STAGINSTR counters are absent (STAGINSTR=0)." >&2
+  echo "  [gpu_run] *** Work-exactness was NOT checked. Not latching (this is a coverage gap, not a" >&2
+  echo "  [gpu_run] *** detected fault) -- but DO NOT quote this run's throughput as validated." >&2
+  echo "  [gpu_run] *** For an instrumentation ablation use CNTLEAN=1, which KEEPS the verdict." >&2
+elif grep -qE "\[dsws2 STAGINSTR\]" "$LOG" && ! grep -qE "\[dsws2 WORK-EXACT\]|WORK-INEXACT" "$LOG"; then
   echo "  [gpu_run] *** WARNING: STAGINSTR ran but no WORK-EXACT verdict -- host is stale, rebuild it. ***" >&2
 fi
 if grep -qE "INCOMPLETE|WARN chunk .* -> ABORT|INVALID RUN" "$LOG"; then

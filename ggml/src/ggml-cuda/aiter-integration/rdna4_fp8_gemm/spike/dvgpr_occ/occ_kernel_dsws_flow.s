@@ -23,13 +23,13 @@
 //    s12   = magic(ceil(2^32/NTL))     (unsigned-div magic for /NTL ; tcol/mblk decode)
 //    s13   = NTL         (number of N tile-columns)
 //    s14   = FN*256      (B-saddr stride per N-frag)
-//    (TGID_X now lands in s15 -- UNUSED; this kernel is pool-claim, not workgroup-id based.)
+//    (TGID_X now lands in s15 -- unused by CFASSIGN=0; CFASSIGN overwrites it with a private cohort token.)
 //  NOTE: G and SEGK are COMPILE-TIME defsyms (baked into instruction immediates); they are NOT kernargs.
 //        FIX 1 (round-table Opus+Codex pass): v1 of this contract passed n_kseg/TOTAL_super/magic_kseg as
 //        s15/s16/s17, but the PM4 host only preloads COMPUTE_USER_DATA_0..15 (USER_SGPR<=16; every proven
 //        launch path in this tree uses 15) -- s16/s17 could NEVER actually arrive in hardware SGPRs, AND
 //        s16 was independently being reused per-chunk on the host as the compositor-safe chunk terminal
-//        (a second, unrelated collision on the same slot). This file now drops s15/s16/s17 entirely:
+//        (a second, unrelated collision on the same slot). This file drops s15/s16/s17 as kernargs entirely:
 //          n_kseg  is DERIVED in-kernel from KT (s8) and the compile-time KSEG_STEPS=SEGK/16:
 //                  n_kseg = KT >> NKSEG_SHIFT, where NKSEG_SHIFT=log2(KSEG_STEPS) is a compile-time `.set`
 //                  (small .if ladder over KSEG_STEPS in {1,2,4,8,16}; SEGK is always a power-of-two
@@ -156,6 +156,9 @@
 .endif                   //   ONE CAS (r -> r+N), then process them serially one-ksi-per-burst (duty-safe).
                          //   N = min(BATCH, DA_ZDONE-r, SSWIN-(r-DRAIN)), N>=1. Default 1 = byte-identical.
                          //   BATCH>1 reuses TRACE-only SGPRs s72 (curr) / s73 (end exclusive). See guards below.
+.ifndef CFASSIGN
+    .set CFASSIGN, 0     // counter-free DECENTASN: pre-publish one wave-sized cohort, then map wid directly
+.endif
 .ifndef NOWMMA
     .set NOWMMA, 0       // PERF PROBE ONLY: 1 = drop v_wmma from the SS burst. C WRONG -> oracle MUST fail.
 .endif                   //   Read SPAN only; the printed TF is nominal-FLOP based and meaningless here.
@@ -964,6 +967,24 @@
 .endif
 .if SELFSERVE && DUTYPROBE
   .error "SELFSERVE is incompatible with DUTYPROBE=1: CNT_SS_SHRUNK and DP_CYC both live in s103."
+.endif
+.if CFASSIGN && !DECENTASN
+  .error "CFASSIGN requires DECENTASN=1."
+.endif
+.if CFASSIGN && !SELFSERVE
+  .error "CFASSIGN requires SELFSERVE=1."
+.endif
+.if CFASSIGN && (BATCH != 1)
+  .error "CFASSIGN requires BATCH=1; counter batches and counter-free cohorts are mutually exclusive."
+.endif
+.if CFASSIGN && (WAVES > SSWIN)
+  .error "CFASSIGN requires WAVES <= SSWIN: a flat wid mapping must not alias control slots."
+.endif
+.if CFASSIGN && (WAVES < 1)
+  .error "CFASSIGN requires at least one wave."
+.endif
+.if CFASSIGN && (WAVES > 1)
+  .set CF_WMAGIC, (0x100000000 / WAVES)
 .endif
 .if BATCH < 1
   .error "BATCH must be >= 1 (1 = off, byte-identical to single-step reservation)."
@@ -2167,6 +2188,22 @@
 //    into occ[\off] and re-seeds. Lane-0-only atomic add; occ slots are ABOVE the per-chunk memset
 //    so they sum over the whole run. Scratch s62/s63 (RTC), s64 (delta) -- all free in CONV=0 compute.
 //    Six phases -> six occ accumulators (bytes 256..276):
+// PHSHIFT: right-shift applied to each phase accumulator AT EMIT so the u32 occ slots survive a FED
+//   run (see phase_flush). 0 = old behaviour. Ratios are shift-invariant; absolute ticks scale by 2^n.
+.ifndef PHSHIFT
+    .set PHSHIFT, 8
+.endif
+// PHSPLIT: separate the two halves of WORK_WAIT (ring stage-wait vs self-serve reservation wait)
+//   by redirecting the self-serve wait stamp to s79. Diagnostic only; requires PHASEPROBE=1.
+.ifndef PHSPLIT
+    .set PHSPLIT, 0
+.endif
+.if PHSPLIT && !PHASEPROBE
+  .error "PHSPLIT needs PHASEPROBE=1 -- it only re-targets a phase_stamp."
+.endif
+.if PHASEPROBE && (PHSHIFT > 24)
+  .error "PHSHIFT > 24 throws away more than the phase signal itself."
+.endif
 .set PH_FOLLOW_OFF, 256                     // occ[64]: waiting on claimer to publish next super-tile
 .set PH_STAGE_OFF,  260                     // occ[65]: waiting on A/B feeds to stage this super-tile
 .set PH_GROW_OFF,   264                     // occ[66]: claim rowblk + s_alloc_vgpr GROW 32->112
@@ -2178,6 +2215,40 @@
 //   STAGINSTR=0 => emits nothing => byte-identical. Ratio COAST/(COAST+COMP) = compute-wave feed-starve.
 .ifndef STAGINSTR
     .set STAGINSTR, 0
+.endif
+// ---- CNTLEAN: emit ONLY the two counters the WORK-EXACT gate needs (COAST+COMP), skipping the
+//   ~5-9 diagnostic emits. This exists so `cnt_flush` can be ABLATED WITHOUT LOSING CORRECTNESS:
+//   occ[71] is the gate's input AND is emitted by the very macro under test (occ_dispatch.cpp:2255),
+//   so plain STAGINSTR=0 removes the instrument and the correctness verdict together. CNTLEAN=1
+//   keeps the verdict at 2 atomics/wave; the delta vs CNTLEAN=0 is the retire-flush cost.
+//   CNTLEAN=0 => byte-identical to the pre-2026-07-22 flush. Meaningless (and inert) at STAGINSTR=0.
+.ifndef CNTLEAN
+    .set CNTLEAN, 0
+.endif
+// ---- SPANFLIP: DIAGNOSTIC. Flip BOTH tfspan atomics so the SAME two occ slots record the OPPOSITE
+//   extremes: occ[2] = MAX entry tick (the LAST wave to arrive), occ[3] = MIN exit tick (the FIRST
+//   wave to leave). Their difference is then the ALL-RESIDENT WINDOW -- the interval during which
+//   every launched wave was simultaneously live.
+//   WHY: the normal span (min entry -> max exit) is first-wave-in to last-wave-out, which CANNOT
+//   distinguish "N waves each doing real work" from "N waves launching over a long ramp and each
+//   doing almost nothing". Measured on 96x512x2048: span 5.816 ms, but all instrumented activity
+//   (384 computed segments + 873 spin iters/wave) accounts for well under 15% of it even on
+//   generous cycle assumptions. This flag settles where the rest goes.
+//   READ IT: window >> 0 and close to the span => waves really are concurrently busy. window small
+//   or NEGATIVE (first exit BEFORE last entry) => the waves were never all resident, and the span is
+//   measuring a LAUNCH/RETIRE RAMP, not execution.
+//   COSTS NOTHING: same two atomics at the same two sites, only the opcode changes. No new occ slot
+//   (deliberately -- the control region below OP_BASE is densely packed with computed offsets and a
+//   "free" slot picked by static analysis is a silent-corruption risk), no new message-bus traffic.
+//   The host MUST seed the sentinels the other way round: pass ML8_SPANFLIP=1 to occ_dispatch.
+.ifndef SPANFLIP
+    .set SPANFLIP, 0
+.endif
+.if SPANFLIP && !TFPROBE
+  .error "SPANFLIP needs TFPROBE=1 -- it only reverses the tfspan atomics, which TFPROBE=0 removes."
+.endif
+.if CNTLEAN && !STAGINSTR
+  .error "CNTLEAN needs STAGINSTR=1 -- at STAGINSTR=0 there is no flush to trim and no WORK-EXACT gate."
 .endif
 .set STINSTR_COAST, 280                     // occ[70]: compute-wave loop iters spent coasting (feed-starved)
 .set STINSTR_COMP,  284                     // occ[71]: rowblk-segments actually computed + reduced
@@ -2441,8 +2512,9 @@
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lcf_skip\@
-    cnt_emit CNT_COAST,    STINSTR_COAST
-    cnt_emit CNT_COMP,     STINSTR_COMP
+    cnt_emit CNT_COAST,    STINSTR_COAST   // \  the WORK-EXACT gate's inputs: kept under CNTLEAN so the
+    cnt_emit CNT_COMP,     STINSTR_COMP    // /  correctness verdict survives the ablation (see :2200)
+.if !CNTLEAN
     cnt_emit CNT_FEED,     STINSTR_FEED
     cnt_emit CNT_GROWFAIL, STINSTR_GROWFAIL
     cnt_emit CNT_BWRITE,   FDIAG_BWRITE_OFF
@@ -2468,7 +2540,8 @@
     cnt_emit DP_CYC, FDIAG_DUTYCYC_OFF
 .endif
     cnt_emit CNT_FATFULL,  FDIAG_FATFULL_OFF
-    s_wait_storecnt 0x0
+.endif                                          // !CNTLEAN
+    s_wait_storecnt 0x0                         // still required: CNTLEAN still emits 2 atomics
 .Lcf_skip\@:
     s_mov_b32 exec_lo, s57
 .endif
@@ -2694,6 +2767,22 @@
     s_mov_b32 s49, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lphf_skip\@
+    //   PHSHIFT (2026-07-22): the occ[64..69] slots are u32 and accumulate the SUM ACROSS ALL WAVES,
+    //   so at 1920 waves they WRAP AFTER 22.4 ms of per-wave residency. The FEED-IT rule requires
+    //   >= ~5 s of steady state (2026-07-13: "assign-starved" read 76.1% at 0.03 s and 1.8% at 6.64 s
+    //   -- a short PHASEPROBE run measures SPIN-UP, which is exactly the error that cost that day).
+    //   So the probe as it stood COULD NOT measure a fed run. Shift right before the atomic, the same
+    //   trick DUTYPROBE uses at :2498 -- ALL SIX phases shift equally, so the DISTRIBUTION (the whole
+    //   point of this probe) is untouched, and range grows 2^PHSHIFT. At the default 8 that is 5.7 s
+    //   at 1920 waves. Per-wave SGPR accumulation is NOT shifted, so precision is only lost once, at
+    //   emit: 2^8 = 256 ticks = 2.56 us per wave per phase.
+    //   The HOST must scale back by 2^PHSHIFT to print absolute ticks; percentages need no correction.
+    s_lshr_b32 s78, s78, PHSHIFT
+    s_lshr_b32 s79, s79, PHSHIFT
+    s_lshr_b32 s80, s80, PHSHIFT
+    s_lshr_b32 s81, s81, PHSHIFT
+    s_lshr_b32 s82, s82, PHSHIFT
+    s_lshr_b32 s83, s83, PHSHIFT
     v_mov_b32 v5, s78
     global_atomic_add_u32 v4, v5, s[0:1] offset:PH_FOLLOW_OFF scope:SCOPE_DEV
     v_mov_b32 v5, s79
@@ -2856,7 +2945,11 @@ occ_kernel:
     v_min_u32 v10, 0x400, v10                 // clamp C vaddr    (1024 >= lane*32 max 992)
 .endif
 
+.if SPANFLIP
+    tfspan max, 8                             // SPANFLIP: occ[2] = MAX entry tick = the LAST wave to arrive
+.else
     tfspan min, 8                             // TFPROBE: every wave stamps occ[2] = min entry tick (wall-span start)
+.endif
 .if TRACE
     // total-occupancy: every wave ++live at entry, atomic-max the peak concurrent resident count (occ[1]).
     v_cmp_eq_u32 vcc_lo, 0, v2
@@ -2904,6 +2997,9 @@ occ_kernel:
     duty_init
 .if BATCH > 1
     s_mov_b32 s73, 0                            // batch_end=0 => no serial backlog (ring drain_adv is inert)
+.endif
+.if CFASSIGN
+    s_mov_b32 s15, 0xFFFFFFFF                   // no cohort served yet; later holds this wave's served cohort end
 .endif
     s_cmp_eq_u32 s24, 0
     s_cbranch_scc0 .Lflow_wait_init            // non-coordinator waits for LDS init
@@ -3969,9 +4065,52 @@ occ_kernel:
     lds_get s46, FLOWTERM_OFF
     s_cmp_eq_u32 s46, 0xDEAD
     s_cbranch_scc1 .Lflow_feedmt_sleep            // already terminal -> yield
+.if !CFASSIGN
     s_mov_b32 s48, 0                               // peek retry budget
+.endif
 .Lflow_da_peek:
     phist_bump PH_RESV_TRY                        // attempts incl. retries (SCC dead: recomputed below)
+.if CFASSIGN
+    lds_get s51, DA_ZDONE_OFF                     // z: zeroed field end; bit 0 is the boundary lock
+    s_and_b32 s47, s51, ZLOCK
+    s_cmp_lg_u32 s47, 0
+    s_cbranch_scc1 .Lflow_feedmt_sleep            // a wave is handling a group/tile boundary
+    lds_get s44, ASSIGN_HEAD_OFF                   // ASSIGN == z for the whole current field
+    lds_get s45, DRAIN_HEAD_OFF
+    s_cmp_ge_u32 s45, s44
+    s_cbranch_scc1 .Lflow_da_boundary
+    // current cohort = the WAVES-wide partition containing DRAIN, relative to this field's aligned start.
+    // DRAIN cannot cross that cohort until every eligible wid has published its unique generation.
+    s_add_u32 s46, s67, 1                         // field width
+    s_sub_u32 s47, s51, s46                       // field start = z - field width
+    s_sub_u32 s46, s45, s47                       // progress within this field
+.if WAVES == 1
+    s_mov_b32 s44, s46                            // cohort offset = progress
+.else
+    s_mul_hi_u32 s44, s46, CF_WMAGIC              // approximate floor(progress / WAVES)
+    s_mul_i32 s44, s44, WAVES                     // cohort offset candidate
+    s_sub_u32 s46, s46, s44                       // remainder, possibly >= WAVES with floor magic
+    s_cmp_ge_u32 s46, WAVES
+    s_cbranch_scc0 .Lflow_da_cf_remok
+    s_add_u32 s44, s44, WAVES                     // one correction yields floor(progress/WAVES)*WAVES
+.Lflow_da_cf_remok:
+.endif
+    s_add_u32 s44, s47, s44                       // cohort start
+    s_add_u32 s45, s44, WAVES
+    s_min_u32 s45, s45, s51                       // cohort end, clipped at field end
+    s_cmp_eq_u32 s15, s45
+    s_cbranch_scc1 .Lflow_feedmt_sleep             // this wave already served this cohort
+    s_sub_u32 s46, s45, s44                       // cohort width
+    s_cmp_ge_u32 s24, s46
+    s_cbranch_scc1 .Lflow_da_cf_no_unit            // short cohort: high wave ids have no unit
+    s_mov_b32 s15, s45                             // mark served before any slot release or compute
+    s_add_u32 s44, s44, s24                       // r = cohort_start + wid
+    s_branch .Lflow_da_cf_decode
+.Lflow_da_cf_no_unit:
+    s_mov_b32 s15, s45                             // still served: do not reconsider this short cohort
+    s_branch .Lflow_feedmt_sleep
+.Lflow_da_cf_decode:
+.else
     s_cmp_ge_u32 s48, 8
     s_cbranch_scc1 .Lflow_feedmt_sleep            // too contended -> bail to help (hold NOTHING; retry next loop)
     lds_get s51, DA_ZDONE_OFF                       // z (top bit ZLOCK = a wave is handling a boundary)
@@ -4038,6 +4177,7 @@ occ_kernel:
     s_cmp_eq_u32 s47, s44
     s_cbranch_scc0 .Lflow_da_peek_retry            // lost the reservation -> retry peek (nothing consumed)
 .endif
+.endif
     // r=s44 reserved (unstamped). DA_TILE/DA_BASE are FROZEN: my slot keeps DRAIN<ASSIGN, so no tile boundary can
     //   fire (and my reserve won only because ASSIGN was unchanged since the peek -> no boundary advanced base).
     //   within = r - base in [0,TOTAL). ksi = within & mask ; group = within >> shift.
@@ -4060,6 +4200,7 @@ occ_kernel:
     s_or_b32 s52, s52, s47                            // STAMP = (group<<GSHIFT) | gi
 .endif
     s_branch .Lflow_da_stamp                          // stamp slot(r): SL_STI=s52 (STAMP), SL_GEN=r LAST (release)
+.if !CFASSIGN
 .Lflow_da_peek_retry:
 .if RESVPROBE
     cnt_inc CNT_FATFULL                            // RESVPROBE: CAS-loss (lost the single-cursor ASSIGN_HEAD CAS) -> occ[87].
@@ -4070,6 +4211,7 @@ occ_kernel:
 .Lflow_da_poolfull_probe:                          // RESVPROBE only: window full (r-DRAIN >= SSWIN). Count, then bail.
     cnt_inc CNT_CLEAD                               //   pool-full bail -> occ[89]. ACC dead (lean peek), SALU-only.
     s_branch .Lflow_feedmt_sleep
+.endif
 .endif
 .Lflow_da_boundary:
     phist_bump PH_BOUNDARY                       // (SCC dead here; the s_or_b32 below recomputes it)
@@ -4145,11 +4287,21 @@ occ_kernel:
     // RE-BASE past the phantom gap: reservations stopped at base+n_kseg, the next field starts at z (s51).
     //   Safe here and ONLY here: we hold ZLOCK and the drain-gate above proved DRAIN>=ASSIGN (quiesced).
     //   MUST precede the DA_ZDONE store, which is what releases ZLOCK.
+.if CFASSIGN
+    lds_put DRAIN_HEAD_OFF,  s51
+    lds_put STAGE_HEAD_OFF,  s51
+    s_add_u32 s46, s67, 1                            // field width
+    s_add_u32 s45, s51, s46                          // z for the next group
+    lds_put ASSIGN_HEAD_OFF, s45                      // ASSIGN=z completion target before release
+.else
     lds_put ASSIGN_HEAD_OFF, s51
     lds_put DRAIN_HEAD_OFF,  s51
     lds_put STAGE_HEAD_OFF,  s51
+.endif
+.if !CFASSIGN
     s_add_u32 s46, s67, 1                            // 2^shift = mask+1  (ksi FIELD width)
     s_add_u32 s45, s51, s46                          // z + 2^shift  (s51 is clean z -> top bit clears)
+.endif
     lds_put DA_ZDONE_OFF, s45                        // advance (release) -> this group's ksi now reservable
     bnd_bump BND_GRP_OFF                             // BNDPROBE: one GROUP advance (SCC dead: branch follows)
     s_branch .Lflow_da_peek
@@ -4172,11 +4324,21 @@ occ_kernel:
     lds_put DA_BASE_OFF, s51                          // base = z   (release-ordered BEFORE the DA_ZDONE advance below)
     // RE-BASE past the phantom gap (see the GROUP-boundary note): the new tile's field starts at z (s51),
     //   which is also the new base -> within = idx-base stays in [0,n_kseg) for every reserved index.
+.if CFASSIGN
+    lds_put DRAIN_HEAD_OFF,  s51
+    lds_put STAGE_HEAD_OFF,  s51
+    s_add_u32 s46, s67, 1                            // field width
+    s_add_u32 s45, s51, s46                          // z for group 0 of the new tile
+    lds_put ASSIGN_HEAD_OFF, s45                      // ASSIGN=z completion target before release
+.else
     lds_put ASSIGN_HEAD_OFF, s51
     lds_put DRAIN_HEAD_OFF,  s51
     lds_put STAGE_HEAD_OFF,  s51
+.endif
+.if !CFASSIGN
     s_add_u32 s46, s67, 1                            // 2^shift = mask+1 (FIELD-STRIDED span)
     s_add_u32 s45, s51, s46                          // z + 2^shift
+.endif
     lds_put DA_ZDONE_OFF, s45                        // advance (clears ZLOCK) -> group 0 of t_new now reservable
     bnd_bump BND_TILE_OFF                            // BNDPROBE: one TILE advance (SCC dead: branch follows)
     s_branch .Lflow_da_peek
@@ -4195,6 +4357,7 @@ occ_kernel:
     lds_put DA_ZDONE_OFF, s51                        // release ZLOCK (restore clean z); go terminal (RACY: window
 .endif                                               //   before .Lflow_da_terminal sets FLOWTERM -> duplicate claim)
     s_branch .Lflow_da_terminal
+.if !CFASSIGN
 .Lflow_da_rollback:
     // transient bail: un-reserve slot r (CAS ASSIGN_HEAD: r+1 -> r). If lost, publish a pre-completed sentinel
     //   at slot r so no consumer wedges. NON-terminal (retry next loop). Cursor is left untouched -> no work lost.
@@ -4202,6 +4365,7 @@ occ_kernel:
     lds_cas_rtn s47, ASSIGN_HEAD_OFF, s46, s44
     s_cmp_eq_u32 s47, s46
     s_cbranch_scc1 .Lflow_feedmt_sleep               // rolled back cleanly -> bail, retry next loop iter
+.endif
 .Lflow_da_sentinel:                                  // ALSO the PHANTOM entry (ksi >= n_kseg): reservation is real,
                                                      //   carries no work -> publish it pre-completed. s44=r live; s47 scratch.
     slot_of s46, s44, s47                            // rollback lost / phantom -> pre-completed sentinel at slot(r)
@@ -4223,9 +4387,58 @@ occ_kernel:
     lds_put_r s45, 0
     s_add_u32 s45, s46, SL_GEN
     lds_put_r s45, s44                               // SL_GEN=r LAST -> release. Walk passes, pickers bail.
+.if CFASSIGN
+    // Counter-free fields deliberately include the field-stride phantoms. An all-phantom cohort has no
+    // self-serve computer to walk STAGE/DRAIN, so its publisher must perform the same pre-completed walk.
+.Lflow_da_cf_sentinel_stage_walk:
+    lds_get s44, STAGE_HEAD_OFF
+    lds_get s45, ASSIGN_HEAD_OFF
+    s_cmp_ge_u32 s44, s45
+    s_cbranch_scc1 .Lflow_da_cf_sentinel_stage_done
+    slot_of s46, s44, s47
+    s_lshl_b32 s48, s46, 5
+    s_add_u32 s48, s48, SLOTC_BASE
+    s_add_u32 s45, s48, SL_GEN
+    lds_get_r s47, s45
+    s_cmp_lg_u32 s47, s44
+    s_cbranch_scc1 .Lflow_da_cf_sentinel_stage_done
+    s_add_u32 s45, s48, SL_RBNEXT
+    lds_get_r s47, s45
+    s_and_b32 s47, s47, RB_PENDING
+    s_cmp_lg_u32 s47, 0
+    s_cbranch_scc1 .Lflow_da_cf_sentinel_stage_done
+    lds_cmpstore_adv STAGE_HEAD_OFF, s44
+    s_branch .Lflow_da_cf_sentinel_stage_walk
+.Lflow_da_cf_sentinel_stage_done:
+    drain_advance
+.endif
     s_branch .Lflow_feedmt_sleep                      // sentinel published -> bail (retry), NOT terminal
 .Lflow_da_stamp:
-    phist_bump PH_RESV_WIN                        // CAS won (SCC dead: cnt_inc below sets it)
+    // *** MISSING WAIT STAMP, ADDED 2026-07-22. phase_stamp charges ALL time since the PREVIOUS stamp
+    //   to the accumulator you name, so an unstamped region is not "unmeasured" -- it is silently
+    //   BILLED TO THE NEXT PHASE. The ring path closes its wait at .Lflow_havestage (s78, :3314); this
+    //   self-serve path had NO equivalent, so every wave's reservation wait was charged to s80 = GROW.
+    //   That is why GROW read 21.3% on 2026-07-22 against 1.3-2.8% on 2026-07-04: it was not grow.
+    //   With SELFSERVE=1 every super-tile takes THIS path (entered==shrunk==TOTAL_super), so the whole
+    //   measurement was affected. Stamping here closes the wait interval at "reservation secured", so
+    //   s80 below now contains only s_wait_storecnt + s_alloc_vgpr + duty_grow + fat_inc.
+    //   RULE 5 CHECK: this is the reservation SUCCESS path, executed once per super-tile -- the same
+    //   frequency as the s80 stamp already three lines below it. It is NOT in the coast spin, which is
+    //   where added message-bus traffic bricked the box on 2026-07-19.
+.if PHSPLIT
+    // PHSPLIT=1: send the SELF-SERVE reservation wait to s79 instead of s78, so the two halves of
+    //   WORK_WAIT separate: s78 = RING stage-wait only (:3314), s79 = SELF-SERVE reservation wait.
+    //   Costs NOTHING -- no new accumulator, no new occ slot, no removed stamp. s79's existing
+    //   occupant is the C-store, measured at 0.1%, which simply bleeds into this bucket and is
+    //   subtracted when reading. Needed because WORK_WAIT is 77.5% and its two halves have
+    //   DIFFERENT FIXES: a ring stage-wait means the feed/staging pipe, a reservation wait means the
+    //   DA_ZDONE/ZLOCK boundary gate. Until they are split, "77.5% waiting" is not actionable.
+    phase_stamp s79                               // PH_SS_WAIT (+0.1% C-store bleed)
+.else
+    phase_stamp s78                               // PH_WORK_WAIT: all time since the last stamp was
+                                                  //   spent GETTING WORK, not growing registers.
+.endif
+    phist_bump PH_RESV_WIN                        // reservation selected (CAS or counter-free; SCC dead below)
     cnt_inc CLAIM_NOPERSIST                          // *** INSTRUMENT (occ[96], repurposed): count REAL super-tile EMISSIONS (expect==TOTAL_super) ***
 .if SELFSERVE
     // The DECENTASN reservation already owns this item. Grow before committing it to carry-through; if the
@@ -4572,6 +4785,7 @@ occ_kernel:
     s_mov_b32 s73, 0                                 // clear backlog so ring drain_adv stays inert
     s_branch .Lflow_loop
 .endif
+.if !CFASSIGN
 .Lflow_da_termslot:
     // gi>=bound: try to ROLL BACK the reservation (CAS RESV: r+1 -> r). Wins unless a later wave already reserved r+1.
     s_add_u32 s46, s44, 1                          // r+1
@@ -4600,6 +4814,7 @@ occ_kernel:
     s_add_u32 s45, s46, SL_GEN
     lds_put_r s45, s44                             // SL_GEN=r LAST -> release. Walk passes, pickers bail.
     // fall through to terminal
+.endif
 .Lflow_da_terminal:
     lds_put FLOWTERM_OFF, 0xDEAD                    // stop NEW claims
 .Lflow_da_drain:
@@ -4746,7 +4961,11 @@ occ_kernel:
     global_atomic_add_u32 v4, v3, s[0:1] scope:SCOPE_DEV
 .Lflow_dead:
     s_mov_b32 exec_lo, s16
+.if SPANFLIP
+    tfspan min, 12                             // SPANFLIP: occ[3] = MIN exit tick = the FIRST wave to leave
+.else
     tfspan max, 12                             // TFPROBE: wall-span end
+.endif
     alllive_dec
 .if RETBARRIER
     // COUNT-TO-WAVES collective exit: check in, then all s_endpgm TOGETHER once the WG's count hits WAVES.

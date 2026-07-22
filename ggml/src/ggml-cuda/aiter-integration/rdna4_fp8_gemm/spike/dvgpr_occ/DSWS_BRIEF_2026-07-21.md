@@ -53,9 +53,37 @@ Corrected three times. It was a usage-budget call, not architecture (KG `148eddf
 `25cd06d9` is DELETED). What survives independently: don't put **unexecuted** implementation code in
 plan docs. Commission Codex for a REASON (parallel worktrees, adversarial review), never by reflex.
 
+### R8. ⛔ NEVER PUBLISH A NUMBER YOU HAVE NOT CHECKED AGAINST ITS SOURCE. ⛔
+**Two fabrication-class defects on 2026-07-21, same root cause: a value was written into documents
+without ever being verified against the thing it claimed to describe.**
+
+1. **The whole DSWS throughput column was a parser bug.** `sweep_dsws_realshapes.sh` matched
+   `'<num> TF'`; the kernel prints `TF=<num>`, so it NEVER matched and every row silently took the
+   **last decimal on the line** — the `spread N%` or `N% of peak` field. It manufactured four "wins"
+   over hipBLASLt and a flatness result, both of which propagated into this brief, the results file,
+   the testing log, the KG, and the auto-injected SOP summary. **The `M=64` MoE "6.39x win" was
+   `TF=0.0`.** Corrected: 0 wins / 26, and we are LESS flat than the vendor.
+2. **The "bin sha `397bfbe1cb010c6e`" was unverifiable.** It matched no hash (sha256/sha1/md5/cksum)
+   of any artifact and appeared ONLY in my own three documents. Removed below.
+
+**RULES:**
+- **Anchor extraction on a unique key** (`TF=`), take the FIRST match on the line, and **spot-check the
+  harness against a raw log before trusting a single row.** A positional regex will return a
+  *different, plausible* number forever without ever erroring.
+- **A sha you did not compute in-session is not a sha.** Print the command and its output, or omit it.
+- When a result is exciting, that is exactly when to re-derive it from the raw log. Both defects
+  survived because the numbers were *good news*.
+
 ---
 
-# §1 — CONFIG OF RECORD (bin sha `397bfbe1cb010c6e`)
+# §1 — CONFIG OF RECORD
+
+**Identify the build by COMMIT + defsyms, not by a remembered hash.** Verify with:
+`sha256sum occ_dsws2_w30_flow_gd.bin` (HEAD `652053c69` at the defsyms below rebuilds deterministically
+to `4ecdab1dafca36bb`, 24008B, LDS 54016B; archived at
+`~/dsws_gpu_logs/CONFIGOFRECORD_652053c69_4ecdab1d.bin`). The earlier `397bfbe1cb010c6e` was
+unverifiable — see R8. **NOTE: `WAVES=30` is now known to be a REGRESSION on real shapes (§3); it is
+recorded here as the historical baseline, not as a recommendation.**
 
 ```
 BUILD
@@ -83,32 +111,74 @@ Sweep harness: `./sweep_dsws_realshapes.sh` (STRIDE, TARGET_SECS, ONLY= env).
 
 ---
 
-# §3 — THE HEADLINE RESULT (full table in `RESULTS_DSWS_vs_hipBLASLt_2026-07-21.md`)
+# §3 — ⛔ RETRACTED HEADLINE + THE REAL RESULT (see `RESULTS_DSWS_vs_hipBLASLt_2026-07-21.md` §0)
 
-First DSWS-vs-hipBLASLt head-to-head on the real ml8/mlambaformer shapes at the config of record.
-26 shapes, **ALL WORK-EXACT + oracle CLEAN**.
+**THE ORIGINAL §3 OF THIS BRIEF WAS WRONG. The DSWS TF column it cited was a PARSER BUG.**
+`sweep_dsws_realshapes.sh` matched `'<num> TF'`; the kernel prints `TF=<num>`, so the pattern NEVER
+matched and every row fell through to a fallback that grabbed the **LAST decimal on the line** — the
+`spread N%` field, or the `N% of 307 TF peak` field. It was never throughput.
 
-**DSWS WINS 4/26 — all in the tiny-M MoE decode corner where the vendor collapses:**
-| shape | M | DSWS | hipBLASLt | |
-|---|---|---|---|---|
-| ml8 moe attn_kv | 64 | 10.87 | 1.70 | **6.39x** |
-| ml8 moe ffn_down | 64 | 8.00 | 1.60 | **5.00x** |
-| ml8 moe ffn_gate/up | 64 | 6.60 | 1.70 | **3.88x** |
-| ml8 moe ffn_gate/up | 512 | 20.36 | 15.40 | **1.32x** |
+**RETRACTED:** all 4 "wins" (the three `M=64` MoE shapes actually read **`TF=0.0`**); the flatness
+thesis; "mean 11.5x lower".
 
-**THE FLATNESS THESIS IS MEASURED, NOT ASSERTED:**
-| | DSWS | hipBLASLt |
-|---|---:|---:|
-| mean / median | 6.00 / 5.25 | 69.18 / 57.30 |
-| stdev | 4.20 | 63.81 |
-| **CV** | **0.700** | **0.922** |
+**CORRECTED (rebuilt offline from the archived `~/dsws_gpu_logs/rs_*.log`):**
+| | **DSWS (true)** | ~~retracted~~ | hipBLASLt |
+|---|---:|---:|---:|
+| mean / median | **0.87 / 0.48** | ~~6.00 / 5.25~~ | 69.18 / 57.30 |
+| **CV** | **1.128** | ~~0.687~~ | **0.905** |
+| **wins** | **0 / 26** | ~~4 / 26~~ | — |
 
-We are flatter across the real workload. hipBLASLt spikes to 189 TF on big dense then **collapses to
-1.6** on MoE decode (its fp8 loses to its own bf16 there). **Honest other half: our mean is 11.5x
-lower** — today the flatness is "consistently LOW". kmbandy's strategy, confirmed by this data:
-**RAISE THE FLOOR WHILE STAYING FLAT**, not out-peak them on dense. A flat ~150 TF beats the vendor on
-most of that table. **Attack vector: DSWS TF falls as total work rises** (worst = lm_head 201 GFLOP at
-0.20 TF).
+**WE ARE LESS FLAT THAN THE VENDOR, NOT MORE — the corrected data CONTRADICTS the flatness thesis.**
+We lose every shape, by 43x to >1000x. Correctness was never in question (all 26 WORK-EXACT + oracle
+CLEAN); only the speed claims were false.
+
+**⭐ WHAT THE BUG WAS HIDING — THROUGHPUT TRACKS `n_kseg = K/SEGK`:**
+| n_kseg | 36 | 16 | 10 | 8 | 6 | 3 | 2 |
+|---|---|---|---|---|---|---|---|
+| true TF | 4.36, 2.40 | 2.33, 1.24, 1.07, 0.20 | 1.55, 1.55, 1.33, 1.24, 1.16, 0.36 | 0.98, 0.18, 0.18, 0.13, 0.00 | 0.69, 0.18 | 0.60, 0.30, 0.20, 0.18 | 0.18, 0.00 |
+
+Derived from source BEFORE these runs: reservations are legal only while `r < DA_ZDONE` (:3983);
+`DA_ZDONE` advances ONE field width per group boundary (:4151); that boundary needs `DRAIN>=ASSIGN`
+(:4086) AND the prior group's C-store drained (:4093), because banks are REUSED (:4144); and one
+reservation = one `ksi` carried by ONE wave across `ACC_N` rowblks (:4358,:4487).
+=> **instantaneous per-WG parallelism = `min(WAVES, n_kseg)`.** At `WAVES=30` with `K=768` (n_kseg=3),
+**90% of the workgroup is idle BY CONSTRUCTION.** `WAVES=30` was tuned on the deep-K synthetic
+(n_kseg=2048) where units always outnumbered waves — the same synthetic-vs-real trap as the FLUSH
+artifact.
+
+**MEASURED CONSEQUENCE — FEWER WAVES IS WORTH ~4.3x** (each point its own build; the binary is
+selected by name `occ_dsws2_w<N>_flow_gd.bin`; all WORK-EXACT + oracle CLEAN; TF read directly off
+`TF=`, never through the sweep script):
+| shape | n_kseg | W=30 | W=10 | W=5 | gain |
+|---|---:|---:|---:|---:|---:|
+| `ffn_gate_up M512 K2560` | 10 | 1.5 | 4.1 | **6.5** | **4.3x** |
+| `lm_head M4096 K768` | 3 | 0.6 | — | **2.6** | **4.3x** |
+
+Same 4.3x at n_kseg=3 and n_kseg=10 => not shape-specific. coast 93.5%->64.0%, boundary bails
+754k->205k, starvation 5.86M->1.21M. `door1 NOTHING-STAGED` = 100% of coast at EVERY wave count: the
+**supply of units is the wall**. `door3`/`door4` = 0 throughout — the dyn-VGPR moat never engages.
+**`WAVES=4` is unbuildable** (`NCOMPUTE=1` -> `BATON_MAGIC=2^32`, not 32-bit; the `.if NCOMPUTE < 1`
+guard at :780 catches 0 but not 1 — fails loud at assembly, a gap not a hazard).
+
+**⚠ I BRIEFLY WROTE HERE THAT THIS "RETIRED" COUNTER-FREE ASSIGN. THAT IS RETRACTED — TWICE WRONG:**
+wrong on the merits (see below), and **wrong to decide unilaterally. Cancelling planned architecture is
+kmbandy's call. Do not read a one-measurement result as authority to drop planned work.**
+
+**TWO FOLLOW-UPS INVERTED THE DIAGNOSIS — THE SHARED CURSOR IS THE BOTTLENECK:**
+| change | result |
+|---|---|
+| `SEGK 256->64` (4x units: n_kseg 10->40, all 30 waves feedable) | **1.5 -> 1.2 TF, WORSE**; coast ROSE 93.5%->97.5% |
+| `BATCH=2` at `WAVES=5` (more work per CAS) | **ABORTED** — chunk 0.81s vs ~0.08s, >=10x slower |
+
+**UNITS ARE NOT THE WALL — `min(WAVES, n_kseg)` IS DEAD AS A THROUGHPUT EXPLANATION.** More units =>
+each reservation carries LESS work => MORE CAS traffic per unit of output. And `door1 NOTHING-STAGED
+= 100%` was never evidence about supply: under SELFSERVE it is the **vestigial ring** door and reads
+100% regardless. `BATCH=2` failed at BOTH `WAVES=30` and `WAVES=5`, so holding the shared `SSWIN`
+window while draining serially is **intrinsic to the shared cursor**, not a wave-count artifact.
+
+**=> ALL THREE RESULTS FIT ONE CAUSE: THE SINGLE SHARED `ASSIGN` CURSOR CAS. COUNTER-FREE ASSIGN (§6,
+KG `efa5d89f`) IS THE INDICATED FIX AND REMAINS THE PLANNED WORK** — now with `WAVES=5` as a much
+cleaner starting point than this morning's `WAVES=30`.
 
 ---
 

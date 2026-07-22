@@ -1603,3 +1603,87 @@ STILL OPEN: n_kseg==1 (K=256, router_MLP) fail-safe; N%64 (mamba in_proj N=4200/
   occ[20] over-claim (benign: WORK-EXACT + clean oracle, unexplained).
 PERF DIAGNOSIS UNCHANGED (2026-07-20 phase timer, NOT re-litigated): GROW 33.5% + SHRINK 7.6% =
   41% dyn-VGPR round-trip, WMMA 24%, FLUSH 34%, grow-fail=0 => the 41% buys nothing. FORK stands.
+
+---
+
+## 2026-07-21 (later) — ⛔ RETRACTION: THE REAL-SHAPE TF COLUMN WAS A PARSER BUG ⛔
+
+**Every DSWS throughput number published earlier today is retracted.** `sweep_dsws_realshapes.sh:87`
+matched `'<num> TF'`; the kernel prints `TF=<num>`. The pattern never matched on any shape, so every
+row fell through to the line-88 fallback, which took the LAST decimal on the throughput line — i.e.
+the `spread N%` field of `SUSTAINED`, or the `N% of 307 TF peak` field of `THROUGHPUT`.
+
+| shape | published | log said | actually captured |
+|---|---:|---:|---|
+| ml8 moe attn_kv M=64 | 10.87 ("6.39x WIN") | `TF=0.0` | `spread 16.3%` |
+| ml8 dense attn_o M=512 | 9.07 | `TF=1.4` | `spread 10.2%` |
+| mlmf lm_head | 0.20 | `TF=0.6` | `0.2% of peak` |
+
+RETRACTED: all 4 wins over hipBLASLt (there is NO MoE-decode corner where we win; the three M=64
+shapes read TF=0.0 — 137 chunks for a 0.1 GFLOP problem); the flatness thesis (corrected CV: DSWS
+**1.128** vs hipBLASLt **0.905** — we are LESS flat, the data CONTRADICTS the thesis); "mean 11.5x
+lower" (true: ~80x, 0.87 vs 69.18). SURVIVES: the hipBLASLt column (separate harness); WORK-EXACT +
+oracle CLEAN on all 26 (correctness was never in question); the non-pow2 n_kseg fix.
+
+FIXED: extractor now anchors on `TF=`, FIRST match, preferring `SUSTAINED` over `THROUGHPUT`; verified
+against archived logs. **The corrected table was rebuilt with ZERO GPU time** — `~/dsws_gpu_logs/rs_*.log`
+survived. Output: `~/dsws_gpu_logs/dsws_vs_hipblaslt_CORRECTED.json`.
+
+### WHAT THE BUG WAS HIDING: throughput tracks `n_kseg = K/SEGK`
+n_kseg 36 -> 4.36, 2.40 | 16 -> 2.33, 1.24, 1.07, 0.20 | 10 -> 1.55, 1.55, 1.33, 1.24, 1.16, 0.36 |
+8 -> 0.98, 0.18, 0.18, 0.13, 0.00 | 6 -> 0.69, 0.18 | 3 -> 0.60, 0.30, 0.20, 0.18 | 2 -> 0.18, 0.00.
+The corrupt column showed no such structure.
+
+MECHANISM (derived from source before the runs): reservations legal only while `r < DA_ZDONE` (:3983);
+`DA_ZDONE` advances ONE field width per group boundary (:4151); the boundary needs `DRAIN>=ASSIGN`
+(:4086) AND the prior group's C-store drained (:4093) because banks are REUSED (:4144); one
+reservation = one ksi carried by ONE wave over ACC_N rowblks (:4358,:4487).
+=> **per-WG parallelism = min(WAVES, n_kseg)**. At WAVES=30 / K=768 (n_kseg=3): 90% of the WG idle by
+construction. WAVES=30 was tuned on the deep-K synthetic (n_kseg=2048) where units always outnumbered
+waves — same synthetic-vs-real trap as the FLUSH artifact.
+
+### MEASURED: fewer waves = ~4.3x (each point its own build; TF read directly off `TF=`)
+| shape | n_kseg | W=30 | W=10 | W=5 | gain |
+|---|---:|---:|---:|---:|---:|
+| ffn_gate_up M512 K2560 | 10 | 1.5 | 4.1 | **6.5** | **4.3x** |
+| lm_head M4096 K768 | 3 | 0.6 | — | **2.6** | **4.3x** |
+
+All WORK-EXACT + oracle CLEAN. coast 93.5%->64.0%; boundary bails occ[97] 754,475->205,288;
+starvation occ[86] 5.86M->1.21M; feed-stages 0->1,568. `door1 NOTHING-STAGED` = 100% of coast at EVERY
+wave count => the SUPPLY OF UNITS is the wall. door3/door4 = 0 throughout (dyn-VGPR moat never engages).
+
+PREDICTION FALSIFIED (registered in advance): I predicted the optimum sits AT n_kseg and that going
+below loses parallelism. `W=5 > W=10` at n_kseg=10 falsifies it — contention among starved waves
+outweighs the parallelism they add. **WAVES=4 unbuildable**: NCOMPUTE=1 -> BATON_MAGIC=2^32, not
+32-bit; the `.if NCOMPUTE < 1` guard (:780) catches 0 but not 1. Fails loud at assembly = gap, not hazard.
+
+**RETRACTED WITHIN THE HOUR — I wrote here that this "retired counter-free assign on evidence". WRONG
+TWICE: wrong on the merits (below), and WRONG TO DECIDE UNILATERALLY. Cancelling planned architecture
+is kmbandy's call, not a conclusion to draw from one measurement.**
+
+### TWO FOLLOW-UPS INVERT THE DIAGNOSIS: THE SHARED CURSOR IS THE BOTTLENECK
+| change | result |
+|---|---|
+| SEGK 256->64 (4x units: n_kseg 10->40, all 30 waves feedable) | **1.5 -> 1.2 TF, WORSE**; coast ROSE 93.5%->97.5% |
+| BATCH=2 at WAVES=5 (more work per CAS) | **ABORTED** — chunk 0.81s vs ~0.08s at BATCH=1, >=10x slower |
+
+UNITS ARE NOT THE WALL; `min(WAVES, n_kseg)` is dead as a throughput explanation. More units => each
+reservation carries LESS work => MORE CAS traffic per unit of output. `door1 NOTHING-STAGED = 100%` was
+never evidence about supply — under SELFSERVE it is the VESTIGIAL RING door and reads 100% regardless.
+BATCH=2 failed at BOTH WAVES=30 and WAVES=5 => holding the shared SSWIN window while draining serially
+is INTRINSIC TO THE SHARED CURSOR, not a wave-count artifact.
+
+The BATCH=2 abort was caught by the compositor cap (0.81s > 0.75s), teardown declined to destroy the
+queue, journal CLEAN (0 lines, no GPU reset). `.gpu_last_hang` LATCH SET 13:27 — a human clears it.
+
+**=> ALL THREE RESULTS FIT ONE CAUSE: THE SINGLE SHARED `ASSIGN` CURSOR CAS. COUNTER-FREE ASSIGN
+REMAINS THE PLANNED WORK** (brief §6 + KG efa5d89f) — it is the one lever that removes the shared thing
+instead of working around it, and WAVES=5 is a far cleaner starting point than WAVES=30.
+"More units per group" is REFUTED by the SEGK=64 run.
+
+ALSO: the "bin sha 397bfbe1cb010c6e" cited in three documents was UNVERIFIABLE — it matched no hash of
+any artifact and appeared only in my own writing. HEAD 652053c69 at the config-of-record defsyms
+rebuilds deterministically to `4ecdab1dafca36bb` (24008B, LDS 54016B), archived as
+`~/dsws_gpu_logs/CONFIGOFRECORD_652053c69_4ecdab1d.bin`. Two archived .bak binaries labelled
+"CONFIGOFRECORD"/"SWEEP" both PREDATE the non-pow2 fix and cannot be what produced any real-shape
+table; they have been renamed `MISNAMED_*`.
