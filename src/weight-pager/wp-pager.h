@@ -93,6 +93,11 @@ public:
         uint64_t host_prefetch_read             = 0;
         uint64_t host_prefetch_read_fail        = 0;
         uint64_t host_prefetch_skipped          = 0;
+        // Soft-prefetch policy (HostTier path): predictions held until N strikes
+        // and/or trimmed by the per-wave byte budget.
+        uint64_t host_prefetch_strike_held      = 0;
+        uint64_t host_prefetch_budget_trim      = 0;
+        uint64_t ensure_batch_host_hits         = 0; // P2P/path misses served from HostTier
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
         uint64_t routing_ptrs_discarded_unconsumed = 0;
@@ -451,6 +456,14 @@ private:
     int  host_prefetch_lookahead_ = 2;
     int  host_prefetch_topm_      = 16;
     float host_prefetch_min_conf_ = 0.0f;
+    // Soft host-prefetch policy (decaying horizon + thrash guards).
+    // conf for distance d: min(0.99, min_conf + (d-1)*conf_step).
+    // M for distance d: topm for d==1, max(1, topm >> (d-1)) otherwise.
+    float  host_prefetch_conf_step_     = 0.10f;
+    int    host_prefetch_strikes_needed_ = 2;   // 1 = enqueue on first conf pass
+    size_t host_prefetch_bytes_budget_  = 64ull << 20; // 0 = unlimited per wave
+    // Per-page prediction strike counts for the 2-strike gate (catalog-sized).
+    std::vector<uint8_t> host_prefetch_strikes_;
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
