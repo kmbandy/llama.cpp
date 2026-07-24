@@ -200,3 +200,102 @@ line of work, as do `tools/server/server-models.{cpp,h}` and
 `docs/examples/router-fleet-main.ini`. The flag plumbing touches `common/arg.cpp`. Edits
 there must be strictly additive, and unrelated hunks must not be reverted or swept into a
 commit.
+
+---
+
+## 11. Measured results (2026-07-24, mad-lab-main, commit 447744bb5)
+
+Config: DS4-Flash Q8 (44L / 256E / 6 used), `--weight-paging-slots 5500`
+(5500 x 4456448 B = 23375 MiB pool, 33924 catalog pages), paging=ROCm0 (R9700),
+resident=ROCm1 (6900XT), `-c 4096 --parallel 1`, HostTier on, xlayer prefetch off.
+Arms differ **only** by `--weight-paging-ffn-island-device ROCm1`. Island engaged:
+`ffn_island=ROCm1 (1348016784 bytes)` = **1.26 GiB** actually placed (above the
+1.09 GiB GGUF estimate in §2; the runtime sum uses the same regex the loader
+places with and is authoritative).
+
+`llama-router.service` was live throughout on port 8090; runs used port 8099 and
+reaped only their own PIDs. VRAM sampling confirms no contention: the 6900XT sat
+at 90 MB before every arm.
+
+### 11.1 Correctness — PASS
+
+| arm | wikitext PPL, 8 chunks, n_ctx 512 |
+|---|---|
+| island off | **1.9007** ± 0.07421 |
+| island on  | **1.9035** ± 0.07425 |
+
++0.15%, about 4% of one standard error. The placement is numerically neutral.
+
+Greedy generations *do* diverge token-by-token (identical first token, different
+continuations, both fluent and factually correct). That is benign FP
+reduction-order difference from running the shared expert on gfx1030 kernels
+instead of gfx1201 — confirmed benign by the PPL equality, which is why PPL and
+not eyeballing is the arbiter.
+
+NOTE: 1.90 is **not** comparable to the 4.1524 full-corpus reference; the running
+estimate falls 3.37 -> 1.90 across these 8 chunks. Only the arm-vs-arm comparison
+is valid here.
+
+### 11.2 Throughput — NO measurable effect
+
+Three interleaved rounds, arm order alternated between rounds (round 1 and 3
+control-first, round 2 island-first).
+
+| arm | tok/s | mean | range |
+|---|---|---|---|
+| island off | 1.689, 1.920, 1.798 | 1.802 | 12.8% spread |
+| island on  | 1.788, 1.854, 1.938 | 1.860 | 8.1% spread |
+
+Nominally +3.2%, but the ranges **overlap** (control max 1.920 > island min
+1.788) and a position effect dominates: in all three rounds the arm that ran
+**second was faster, regardless of which arm it was**. Position-matched, the
+comparison contradicts itself — island is +6.3% in slot 1 and -3.0% in slot 2.
+
+**Conclusion: no throughput difference distinguishable from noise at n=3.**
+Alternating the order was necessary; the first round alone (control first) would
+have reported a spurious +5.9%.
+
+### 11.3 NVMe traffic — real, reproducible reduction
+
+| arm | NVMe GB over 128 decoded tokens | page_ins | evictions |
+|---|---|---|---|
+| island off | 220.54, 219.50, 220.27 (mean **220.10**) | 20025 | 14541 |
+| island on  | 206.62, 205.48, 206.00 (mean **206.03**) | 18900 | 13416 |
+
+**-6.4% NVMe bytes, with clean separation** — the groups do not overlap and
+within-group spread is under 0.3%. Page-ins fall by exactly 1125 (-5.6%) and
+evictions by exactly the same 1125, which is what a full pool at steady state
+does: one eviction per miss.
+
+**Mechanism NOT established.** The pool is identical in both arms (5500 slots,
+33924 catalog pages), so this is not "the pool got bigger". The reading most
+consistent with the data is that shexp / FFN-island pages were competing for the
+same 5500 shared slots, and moving them off leaves more effective capacity for
+routed experts. The identical catalog page count (33924 in both arms) is an
+unresolved loose end against that story and should be checked before the
+mechanism is stated as fact.
+
+### 11.4 The §7 overlap question is NOT answered — and this experiment cannot answer it
+
+§7 framed the increment's value as resting on whether `cpy_tensor_async` works
+R9700<->6900XT across TB3, so the two cards' compute can overlap. The throughput
+result is null, but that does **not** demonstrate the absence of overlap, because
+**decode here is I/O-bound, not compute-bound** (the tiered design's §1 finding:
+concurrency-starved io_uring ring, avg_n ~5.4 of 16). Moving ~13% of expert GEMV
+onto an otherwise-idle card cannot show up in wall-clock while the bottleneck is
+storage concurrency — whether or not the two cards overlap.
+
+Answering §7 requires a measurement where compute actually binds: either direct
+observation of concurrent kernel execution on both devices (profiler / stream
+timeline), or an A/B at high enough residency that the expert step is no longer
+storage-bound. Until then the overlap premise behind the hot-expert half of
+Phase 3 remains **untested**, and the §2a sizing correction (25.2 MiB per expert,
+not ~13.4 MB) makes that half look weaker than the original design assumed.
+
+### 11.5 Verdict
+
+The role works, is numerically safe, is off by default, and buys a reproducible
+~6% cut in NVMe traffic — which is real but does not convert into throughput
+while decode is concurrency-bound. It is worth keeping for the I/O reduction and
+as the placement plumbing; it is **not** evidence for or against the dual-device
+bandwidth thesis.
