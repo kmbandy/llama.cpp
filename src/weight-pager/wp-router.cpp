@@ -15,7 +15,8 @@ std::vector<llama_model_tensor_buft_override> build_router_overrides(
         ggml_backend_buffer_type_t paging_buft,
         ggml_backend_buffer_type_t resident_buft,
         ggml_backend_buffer_type_t cpu_buft,
-        const llama_model_tensor_buft_override * user_overrides) {
+        const llama_model_tensor_buft_override * user_overrides,
+        bool emit_dense_catch_all) {
     std::vector<llama_model_tensor_buft_override> out;
 
     // 1) Routed experts -> paging device (catalog/paged pool).
@@ -41,7 +42,9 @@ std::vector<llama_model_tensor_buft_override> build_router_overrides(
 
     // 6) Everything else dense (attention, lm_head, attn norms, ...)
     //    -> resident / attention-island GPU.
-    out.push_back({ ROUTER_DENSE_PATTERN, resident_buft });
+    if (emit_dense_catch_all) {
+        out.push_back({ ROUTER_DENSE_PATTERN, resident_buft });
+    }
     out.push_back({ nullptr, nullptr });
     return out;
 }

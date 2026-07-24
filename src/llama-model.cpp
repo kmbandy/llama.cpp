@@ -1315,30 +1315,50 @@ static int wp_select_paging_device_index(const llama_model_params & params, cons
     return 0;
 }
 
-static int wp_select_resident_device_index(const llama_model_params & params,
-                                           const std::vector<llama_device> & devices,
-                                           int paging_idx) {
+static std::vector<int> wp_select_resident_device_indices(const llama_model_params & params,
+                                                          const std::vector<llama_device> & devices,
+                                                          int paging_idx) {
     if (devices.empty()) {
-        return -1;
+        return {};
     }
     const char * requested = params.weight_paging_resident_device
         ? params.weight_paging_resident_device
         : "auto";
     if (std::strcmp(requested, "auto") != 0) {
-        int idx = wp_find_device_index_by_name(devices, requested);
-        if (idx >= 0) {
-            return idx;
+        const char * comma = std::strchr(requested, ',');
+        if (comma == nullptr) {
+            int idx = wp_find_device_index_by_name(devices, requested);
+            if (idx >= 0) {
+                return { idx };
+            }
+            LLAMA_LOG_WARN("%s: resident device '%s' not found; falling back to paging device\n",
+                           __func__, requested);
+            return { paging_idx };
         }
-        LLAMA_LOG_WARN("%s: resident device '%s' not found; falling back to paging device\n",
-                       __func__, requested);
-        return paging_idx;
+
+        std::vector<int> result;
+        std::stringstream names(requested);
+        std::string name;
+        while (std::getline(names, name, ',')) {
+            int idx = wp_find_device_index_by_name(devices, name.c_str());
+            if (idx < 0) {
+                LLAMA_LOG_WARN("%s: resident device '%s' not found; ignoring it\n",
+                               __func__, name.c_str());
+            } else if (idx == paging_idx) {
+                LLAMA_LOG_WARN("%s: resident device '%s' is the paging device; ignoring it\n",
+                               __func__, name.c_str());
+            } else if (std::find(result.begin(), result.end(), idx) == result.end()) {
+                result.push_back(idx);
+            }
+        }
+        return result;
     }
     for (size_t i = 0; i < devices.size(); ++i) {
         if ((int) i != paging_idx) {
-            return (int) i;
+            return { (int) i };
         }
     }
-    return paging_idx;
+    return { paging_idx };
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -1385,15 +1405,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<llama_model_tensor_buft_override> wp_tensor_buft_overrides;
     ggml_backend_buffer_type_t wp_paging_buft = nullptr;
     ggml_backend_buffer_type_t wp_resident_buft = nullptr;
-    ggml_backend_dev_t         wp_resident_dev = nullptr;   // C1: layer-home device when router active
+    std::vector<ggml_backend_dev_t> wp_resident_devs;
+    std::vector<float> wp_resident_splits;
     bool wp_device_router_enabled = false;
 
     if (params.weight_paging_enabled && wp_resident_dense_enabled() && !devices.empty()) {
         const int paging_idx = wp_select_paging_device_index(params, devices);
-        const int resident_idx = wp_select_resident_device_index(params, devices, paging_idx);
-        if (paging_idx >= 0 && resident_idx >= 0) {
+        const std::vector<int> resident_indices =
+                wp_select_resident_device_indices(params, devices, paging_idx);
+        if (paging_idx >= 0 && !resident_indices.empty()) {
             wp_paging_buft = ggml_backend_dev_buffer_type(devices[paging_idx].dev);
-            wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_idx].dev);
+            wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_indices[0]].dev);
+            float resident_split_sum = 0.0f;
+            for (int idx : resident_indices) {
+                size_t free;
+                size_t total;
+                ggml_backend_dev_memory(devices[idx].dev, &free, &total);
+                resident_split_sum += free;
+                wp_resident_splits.push_back(resident_split_sum);
+                wp_resident_devs.push_back(devices[idx].dev);
+            }
+            if (resident_split_sum == 0.0f) {
+                for (size_t i = 0; i < wp_resident_splits.size(); ++i) {
+                    wp_resident_splits[i] = i + 1;
+                }
+                resident_split_sum = wp_resident_splits.size();
+            }
+            for (float & split : wp_resident_splits) {
+                split /= resident_split_sum;
+            }
         }
         if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
             // Hetero layout (see docs/dev/2026-07-08-wp-hetero-dflash-oracle-plan.md):
@@ -1401,19 +1441,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             //   attention/lm_head/... -> resident GPU; layer-home = resident (FA).
             ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
             wp_tensor_buft_overrides = wp::build_router_overrides(
-                    wp_paging_buft, wp_resident_buft, cpu_buft, params.tensor_buft_overrides);
+                    wp_paging_buft, wp_resident_buft, cpu_buft, params.tensor_buft_overrides,
+                    wp_resident_devs.size() == 1);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             // Without this, llama_context enables pipeline parallelism on
             // multi-device (has_tensor_overrides() was still false) and
             // graph_reserve tries a ~90+ GiB ROCm0 compute buffer.
             pimpl->has_tensor_overrides = true;
             wp_device_router_enabled = true;
-            wp_resident_dev = devices[resident_idx].dev;   // C1: home device for offloaded layers
-            LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router: paging=%s (%s), resident=%s (%s), "
+            std::string resident_names;
+            for (ggml_backend_dev_t dev : wp_resident_devs) {
+                resident_names += resident_names.empty() ? "" : ",";
+                resident_names += ggml_backend_dev_name(dev);
+            }
+            LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router: paging=%s (%s), residents=%s, "
                            "token_embd=CPU, shexp+ffn_island=paging-resident\n",
                            __func__,
                            ggml_backend_dev_name(devices[paging_idx].dev), ggml_backend_buft_name(wp_paging_buft),
-                           ggml_backend_dev_name(devices[resident_idx].dev), ggml_backend_buft_name(wp_resident_buft));
+                           resident_names.c_str());
         } else {
             LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router disabled: could not resolve paging/resident bufts\n",
                            __func__);
@@ -1468,12 +1513,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
-        if (wp_device_router_enabled && wp_resident_dev != nullptr) {
-            // C1: pin every offloaded layer's home to the resident/attention
-            // device so KV cache + attention weights + FA node co-locate there
-            // and Flash Attention stays intra-device. Only routed experts are
-            // moved off (via tensor_buft_overrides), not the layer home.
-            dev = wp_resident_dev;
+        if (wp_device_router_enabled && !wp_resident_devs.empty()) {
+            const float fraction = float(il - i_gpu_start)/act_gpu_layers;
+            const size_t resident = std::upper_bound(
+                    wp_resident_splits.begin(), wp_resident_splits.end(), fraction) -
+                    wp_resident_splits.begin();
+            dev = wp_resident_devs.at(resident);
         }
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
@@ -1492,10 +1537,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
-    if (wp_device_router_enabled && wp_resident_dev != nullptr) {
-        LLAMA_LOG_INFO("%s: WP router: layer-home pinned to resident device %s "
-                       "(experts overridden to paging device)\n",
-                       __func__, ggml_backend_dev_name(wp_resident_dev));
+    if (wp_device_router_enabled && !wp_resident_devs.empty()) {
+        for (ggml_backend_dev_t dev : wp_resident_devs) {
+            int first = -1;
+            int last = -1;
+            for (int il = i_gpu_start; il < n_layer_all; ++il) {
+                if (pimpl->dev_layer[il].dev == dev) {
+                    first = first < 0 ? il : first;
+                    last = il;
+                }
+            }
+            LLAMA_LOG_INFO("%s: WP router: resident device %s layer-home range %d..%d "
+                           "(experts overridden to paging device)\n",
+                           __func__, ggml_backend_dev_name(dev), first, last);
+        }
     }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
