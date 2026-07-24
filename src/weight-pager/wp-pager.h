@@ -27,6 +27,7 @@
 #include "wp-prefetch.h"
 #include "wp-router-predictor.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,69 @@ struct ggml_cgraph;
 struct ggml_tensor;
 
 namespace wp {
+
+// Achieved-concurrency accounting for the HOST O_DIRECT read-worker pool
+// (see ensure_odirect_worker_loop_ in wp-pager.cpp). ensure_batch_max_n /
+// ensure_batch_avg_n (Stats, below) only count how many jobs were QUEUED
+// per batch -- they say nothing about how many pread()s were genuinely
+// executing at once. This tracker answers that question directly:
+// begin() is called by a worker immediately before issuing its pread(),
+// end() immediately after that pread() returns (success or failure).
+//
+// Deliberately lock-free -- three independent atomics, no mutex -- because
+// this sits on the hot read path and any lock here would itself become the
+// bottleneck it exists to diagnose.
+//
+//   peak()    -- the highest in-flight count observed by ANY begin() call
+//                across the whole run (a running high-water mark).
+//   average() -- the in-flight count is SAMPLED at the instant each
+//                begin() call happens (i.e. how many reads -- including
+//                the one just starting -- are in flight at that moment),
+//                and average() is the mean of those per-begin samples.
+//                This is a call-weighted average of queue depth at
+//                read-start, NOT a time-weighted average over wall-clock
+//                (a time-weighted version would need a timestamp per event
+//                plus an integral, which is not worth the added cost or
+//                complexity here). It is cheap -- one atomic fetch_add per
+//                begin() -- and is defensible for the question it exists
+//                to answer: are ~9 queued jobs actually running ~9 deep,
+//                or effectively serializing? A pool that truly serializes
+//                reports avg == 1.0 (every read starts finding itself
+//                alone in flight); a pool that overlaps N reads at a time
+//                reports avg close to N.
+struct EnsureODirectInFlightTracker {
+    std::atomic<int64_t> current_{0};
+    std::atomic<int64_t> peak_{0};
+    std::atomic<int64_t> sample_sum_{0};
+    std::atomic<int64_t> samples_{0};
+
+    // Call immediately before issuing pread(). Returns the post-increment
+    // in-flight count (informational; callers may ignore it).
+    int64_t begin() {
+        const int64_t n = current_.fetch_add(1, std::memory_order_relaxed) + 1;
+        sample_sum_.fetch_add(n, std::memory_order_relaxed);
+        samples_.fetch_add(1, std::memory_order_relaxed);
+        int64_t prev = peak_.load(std::memory_order_relaxed);
+        while (n > prev && !peak_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+            // prev is updated to the current value by compare_exchange_weak
+            // on failure; loop retries until we win or another begin() has
+            // already pushed the peak >= n.
+        }
+        return n;
+    }
+
+    // Call immediately after pread() returns (success or failure).
+    void end() {
+        current_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    int64_t current() const { return current_.load(std::memory_order_relaxed); }
+    int64_t peak()    const { return peak_.load(std::memory_order_relaxed); }
+    double  average() const {
+        const int64_t n = samples_.load(std::memory_order_relaxed);
+        return n > 0 ? (double) sample_sum_.load(std::memory_order_relaxed) / (double) n : 0.0;
+    }
+};
 
 class WeightPager {
 public:
@@ -666,6 +730,11 @@ private:
     std::condition_variable          ensure_odirect_cv_;
     std::condition_variable          ensure_odirect_done_cv_;
     bool                             ensure_odirect_workers_stop_ = false;
+    // Achieved-concurrency counter for the HOST O_DIRECT path (see
+    // EnsureODirectInFlightTracker above). Incremented/decremented in
+    // ensure_odirect_worker_loop_ around each job's pread(); read only
+    // at log time in log_stats_summary().
+    EnsureODirectInFlightTracker     ensure_odirect_inflight_;
     // Kept unconditional (NOT #if LLAMA_HAVE_IO_URING): a struct layout in a
     // shared header must never depend on a per-TU macro. LLAMA_HAVE_IO_URING is
     // PRIVATE to the llama target, so test TUs that include this header lack it;

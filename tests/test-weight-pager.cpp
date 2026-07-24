@@ -2066,6 +2066,75 @@ static int test_expert_page_index() {
     return fails;
 }
 
+static int test_ensure_odirect_inflight_serial_peak_one() {
+    int fails = 0;
+    using namespace wp;
+    // Strictly serial: each read finishes before the next begins. This is
+    // the case that would actually diagnose the suspected "9 queued but
+    // effectively serialized" problem -- if reads never overlap, peak must
+    // be 1 no matter how many jobs were queued.
+    EnsureODirectInFlightTracker t;
+    for (int i = 0; i < 5; ++i) {
+        const int64_t n = t.begin();
+        EXPECT_EQ_INT(n, 1, "serial begin() always observes in-flight==1");
+        t.end();
+    }
+    EXPECT_EQ_INT(t.peak(), 1, "serial sequence: peak in-flight == 1");
+    EXPECT_EQ_INT(t.current(), 0, "serial sequence: counter back to zero");
+    const double avg = t.average();
+    EXPECT(avg > 0.999 && avg < 1.001, "serial sequence: avg in-flight == 1.0");
+    return fails;
+}
+
+static int test_ensure_odirect_inflight_overlap_peak_and_average() {
+    int fails = 0;
+    using namespace wp;
+    EnsureODirectInFlightTracker t;
+    // b1 b2 b3 e1 b4 e2 e3 e4 -> in-flight samples at each begin(): 1,2,3,3
+    // (b1=1, b2=2, b3=3 [peak], e1 drops to 2, b4 samples 3 again).
+    t.begin();               // sample 1
+    t.begin();               // sample 2
+    const int64_t n3 = t.begin(); // sample 3 (peak)
+    EXPECT_EQ_INT(n3, 3, "third overlapping begin() observes in-flight==3");
+    t.end();                 // one read completes; current drops to 2
+    const int64_t n4 = t.begin(); // sample 3 again (2 in flight + this one)
+    EXPECT_EQ_INT(n4, 3, "begin() after one completion observes in-flight==3 again");
+    t.end();
+    t.end();
+    t.end();
+    EXPECT_EQ_INT(t.peak(), 3, "overlap sequence: peak in-flight == 3");
+    EXPECT_EQ_INT(t.current(), 0, "overlap sequence: counter back to zero (no leak)");
+    // samples = {1, 2, 3, 3} -> sum 9, avg 2.25.
+    const double avg = t.average();
+    EXPECT(avg > 2.249 && avg < 2.251, "overlap sequence: avg in-flight == 2.25 per documented definition");
+    return fails;
+}
+
+static int test_ensure_odirect_inflight_no_leak_on_pairing() {
+    int fails = 0;
+    using namespace wp;
+    EnsureODirectInFlightTracker t;
+    // A larger mixed begin/end interleaving; regardless of the pattern,
+    // every begin() must be matched by exactly one end(), so the counter
+    // must return to zero once all reads complete -- no leak in the
+    // increment/decrement pairing.
+    for (int i = 0; i < 8; ++i) {
+        t.begin();
+    }
+    for (int i = 0; i < 3; ++i) {
+        t.end();
+    }
+    for (int i = 0; i < 4; ++i) {
+        t.begin();
+    }
+    for (int i = 0; i < 9; ++i) {
+        t.end();
+    }
+    EXPECT_EQ_INT(t.current(), 0, "mixed begin/end sequence: counter back to zero, no leak");
+    EXPECT(t.peak() >= 8, "mixed sequence: peak reflects the highest overlap actually reached");
+    return fails;
+}
+
 static int test_pool_speculative() {
     int fails = 0;
     using namespace wp;
@@ -2169,6 +2238,9 @@ int main() {
         { "router_predictor_confidence",         test_router_predictor_confidence         },
         { "expert_page_index",                   test_expert_page_index                   },
         { "pool_speculative",                    test_pool_speculative                    },
+        { "ensure_odirect_inflight_serial_peak_one", test_ensure_odirect_inflight_serial_peak_one },
+        { "ensure_odirect_inflight_overlap_peak_and_average", test_ensure_odirect_inflight_overlap_peak_and_average },
+        { "ensure_odirect_inflight_no_leak_on_pairing", test_ensure_odirect_inflight_no_leak_on_pairing },
     };
 
     for (const auto & t : tests) {

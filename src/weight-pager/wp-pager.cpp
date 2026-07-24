@@ -334,6 +334,12 @@ void WeightPager::ensure_odirect_worker_loop_() {
         bool ok = false;
         int err = 0;
         if (job != nullptr && job->fd >= 0 && job->dst != nullptr && job->size > 0) {
+            // Achieved-concurrency: begin() brackets exactly the interval
+            // this worker is actually reading (from the first pread() of
+            // this job to the point its bytes are fully read or it fails).
+            // See EnsureODirectInFlightTracker in wp-pager.h for what
+            // peak()/average() mean.
+            ensure_odirect_inflight_.begin();
             size_t total = 0;
             while (total < job->size) {
                 const ssize_t n = pread(job->fd, (char *) job->dst + total,
@@ -353,6 +359,7 @@ void WeightPager::ensure_odirect_worker_loop_() {
                 total += (size_t) n;
             }
             ok = (total == job->size);
+            ensure_odirect_inflight_.end();
         } else {
             err = -EINVAL;
         }
@@ -1314,6 +1321,23 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.ensure_batch_host_path_batches,
             (unsigned long) s.ensure_batch_p2p_path_batches,
             (unsigned long) s.ensure_batch_serial_path_batches);
+    }
+
+    // Achieved concurrency on the HOST O_DIRECT path: how many pread()s
+    // were genuinely in flight at once, as distinct from
+    // ensure_batch_max_n / ensure_batch_avg_n below, which only count how
+    // many jobs were QUEUED per batch -- queue occupancy, not reads
+    // actually executing. See EnsureODirectInFlightTracker in wp-pager.h
+    // for exactly what peak/avg mean. Both read 0 on runs that never used
+    // the HOST path (no begin() calls were ever made).
+    {
+        const int64_t inflight_peak = ensure_odirect_inflight_.peak();
+        const double  inflight_avg  = ensure_odirect_inflight_.average();
+        LLAMA_LOG_WARN(
+            "wp::ensure_batch HOST ACHIEVED CONCURRENCY (reads genuinely in "
+            "flight -- NOT queued jobs, do not confuse with ensure_batch_max_n"
+            "/ensure_batch_avg_n below): inflight_peak=%lld inflight_avg_at_read_start=%.2f\n",
+            (long long) inflight_peak, inflight_avg);
     }
 
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
