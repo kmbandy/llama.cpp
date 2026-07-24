@@ -140,7 +140,15 @@ public:
         uint64_t sticky_spec_fires                 = 0; // FA-window sticky/hot prefetch calls
         uint64_t sticky_spec_pages_submitted       = 0; // cold pages submitted in those fires
         uint64_t sticky_spec_pages_resident        = 0; // already resident at fire
-        // ensure_batch multi-QD bursts (P2P path)
+        // ensure_batch multi-QD bursts. ensure_batch_submit_seconds/wait_seconds
+        // carry their ORIGINAL P2P-path meaning: submit is io_uring enqueue
+        // time, wait is completion-wait time. The HOST O_DIRECT pthread-pool
+        // path (WP_ENSURE_BATCH_HOST=1) also writes these two fields, as
+        // aliases, for backward compatibility -- but on that path submit is
+        // actually the whole storage-read wall-clock and wait is actually the
+        // H2D copy phase. Do not read submit/wait as "P2P path" numbers; the
+        // ensure_batch_host_* fields below are the ones that name the
+        // HOST-path phases correctly and should be used for HOST-path analysis.
         uint64_t ensure_batch_calls                = 0;
         uint64_t ensure_batch_pages                = 0; // cold misses issued in batches
         uint64_t ensure_batch_max_n                = 0; // largest concurrent miss set
@@ -150,6 +158,14 @@ public:
         double   ensure_batch_wait_seconds         = 0.0;
         uint64_t ensure_batch_timeouts             = 0; // wait_for_req returned non-Ok
         uint64_t ensure_batch_n_sub_sum            = 0; // sum of submit_batch return
+        // HOST O_DIRECT pthread-pool path only (WP_ENSURE_BATCH_HOST=1): the
+        // five phases of ensure_batch's HOST branch, named for what each
+        // actually measures. Unset (0.0) on the P2P and serial-fallback paths.
+        double   ensure_batch_host_jobs_seconds      = 0.0; // building the job list (HostTier lookup + fd resolution)
+        double   ensure_batch_host_prep_seconds      = 0.0; // computing O_DIRECT alignment/bounce params
+        double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
+        double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
+        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase
     };
 
     WeightPager() = default;

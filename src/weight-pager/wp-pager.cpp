@@ -1363,7 +1363,12 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_gb_s: %.3f\n"
             "  ensure_batch_submit_ms: %.1f\n"
             "  ensure_batch_wait_ms: %.1f\n"
-            "  ensure_batch_timeouts: %lu\n",
+            "  ensure_batch_timeouts: %lu\n"
+            "  ensure_batch_host_jobs_ms: %.1f\n"
+            "  ensure_batch_host_prep_ms: %.1f\n"
+            "  ensure_batch_host_enqueue_ms: %.1f\n"
+            "  ensure_batch_host_read_wait_ms: %.1f\n"
+            "  ensure_batch_host_h2d_ms: %.1f\n",
             (unsigned long) s.page_ins,
             (unsigned long) s.evictions,
             (unsigned long) s.prefetch_hits,
@@ -1434,7 +1439,12 @@ void WeightPager::log_stats_summary() {
                  : 0.0),
             s.ensure_batch_submit_seconds * 1e3,
             s.ensure_batch_wait_seconds * 1e3,
-            (unsigned long) s.ensure_batch_timeouts);
+            (unsigned long) s.ensure_batch_timeouts,
+            s.ensure_batch_host_jobs_seconds * 1e3,
+            s.ensure_batch_host_prep_seconds * 1e3,
+            s.ensure_batch_host_enqueue_seconds * 1e3,
+            s.ensure_batch_host_read_wait_seconds * 1e3,
+            s.ensure_batch_host_h2d_seconds * 1e3);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                            (unsigned long) s.dense_prefetch_submitted);
@@ -1500,7 +1510,12 @@ void WeightPager::log_stats_summary() {
         "  ensure_batch_gb_s: %.3f\n"
         "  ensure_batch_submit_ms: %.1f\n"
         "  ensure_batch_wait_ms: %.1f\n"
-        "  ensure_batch_timeouts: %lu\n",
+        "  ensure_batch_timeouts: %lu\n"
+        "  ensure_batch_host_jobs_ms: %.1f\n"
+        "  ensure_batch_host_prep_ms: %.1f\n"
+        "  ensure_batch_host_enqueue_ms: %.1f\n"
+        "  ensure_batch_host_read_wait_ms: %.1f\n"
+        "  ensure_batch_host_h2d_ms: %.1f\n",
         (unsigned long) s.page_ins,
         (unsigned long) s.evictions,
         (unsigned long) s.prefetch_hits,
@@ -1561,7 +1576,12 @@ void WeightPager::log_stats_summary() {
              : 0.0),
         s.ensure_batch_submit_seconds * 1e3,
         s.ensure_batch_wait_seconds * 1e3,
-        (unsigned long) s.ensure_batch_timeouts);
+        (unsigned long) s.ensure_batch_timeouts,
+        s.ensure_batch_host_jobs_seconds * 1e3,
+        s.ensure_batch_host_prep_seconds * 1e3,
+        s.ensure_batch_host_enqueue_seconds * 1e3,
+        s.ensure_batch_host_read_wait_seconds * 1e3,
+        s.ensure_batch_host_h2d_seconds * 1e3);
     if (s.dense_prefetch_submitted > 0) {
         LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                        (unsigned long) s.dense_prefetch_submitted);
@@ -2139,9 +2159,17 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 }
             }
         }
+        const auto tp_reap = std::chrono::steady_clock::now();
+        auto msd = [](auto a2, auto b2){ return std::chrono::duration<double,std::milli>(b2-a2).count(); };
+        // Named HOST-path phase breakdown (seconds), reported via Stats
+        // below. Unlike ensure_batch_submit_seconds/wait_seconds -- which on
+        // this path are aliases with different, legacy meanings (see
+        // wp-pager.h) -- these four intervals mean exactly what they say.
+        const double host_jobs_seconds      = msd(io_t0,     tp_jobs)   / 1e3;
+        const double host_prep_seconds      = msd(tp_jobs,   tp_prep)   / 1e3;
+        const double host_enqueue_seconds   = msd(tp_prep,   tp_submit) / 1e3;
+        const double host_read_wait_seconds = msd(tp_submit, tp_reap)   / 1e3;
         {
-            const auto tp_reap = std::chrono::steady_clock::now();
-            auto msd = [](auto a2, auto b2){ return std::chrono::duration<double,std::milli>(b2-a2).count(); };
             static double s_jobs=0,s_prep=0,s_sub=0,s_reap=0; static long s_n=0; static long s_pg=0;
             s_jobs += msd(io_t0, tp_jobs);
             s_prep += msd(tp_jobs, tp_prep);
@@ -2256,6 +2284,11 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             stats_.ensure_batch_seconds += batch_seconds;
             stats_.ensure_batch_submit_seconds += read_seconds; // host O_DIRECT phase
             stats_.ensure_batch_wait_seconds   += (batch_seconds - read_seconds); // H2D
+            stats_.ensure_batch_host_jobs_seconds      += host_jobs_seconds;
+            stats_.ensure_batch_host_prep_seconds      += host_prep_seconds;
+            stats_.ensure_batch_host_enqueue_seconds   += host_enqueue_seconds;
+            stats_.ensure_batch_host_read_wait_seconds += host_read_wait_seconds;
+            stats_.ensure_batch_host_h2d_seconds       += (batch_seconds - read_seconds);
             stats_.ensure_batch_n_sub_sum      += (uint64_t) batch_ok_n;
             if ((uint64_t) batch_ok_n > stats_.ensure_batch_max_n) {
                 stats_.ensure_batch_max_n = (uint64_t) batch_ok_n;
