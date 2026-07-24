@@ -1361,6 +1361,66 @@ static std::vector<int> wp_select_resident_device_indices(const llama_model_para
     return { paging_idx };
 }
 
+// Default VRAM headroom kept free on the FFN-island device before the
+// preflight vetoes the placement. Overridable via WP_FFN_ISLAND_RESERVE_MB.
+static const size_t WP_FFN_ISLAND_RESERVE_MB_DEFAULT = 1024;
+
+static size_t wp_ffn_island_reserve_bytes() {
+    size_t reserve_mb = WP_FFN_ISLAND_RESERVE_MB_DEFAULT;
+    if (const char * e = std::getenv("WP_FFN_ISLAND_RESERVE_MB")) {
+        long v = std::strtol(e, nullptr, 10);
+        if (v > 0) {
+            reserve_mb = (size_t) v;
+        }
+    }
+    return reserve_mb * 1024ull * 1024ull;
+}
+
+// Sentinel meaning "no FFN-island device"; a valid device index is always >= 0.
+static const int WP_NO_FFN_ISLAND = -1;
+
+// Resolve the FFN-island device role: a second GPU that hosts the shared
+// expert + FFN-island dense tensors, separate from the paging device.
+// See wp::build_router_overrides island_buft parameter.
+static int wp_select_ffn_island_device_index(const llama_model_params & params,
+                                              const std::vector<llama_device> & devices,
+                                              int paging_idx,
+                                              const std::vector<int> & resident_indices) {
+    if (devices.empty()) {
+        return WP_NO_FFN_ISLAND;
+    }
+    const char * requested = params.weight_paging_ffn_island_device;
+    if (requested == nullptr || requested[0] == '\0') {
+        requested = std::getenv("WP_FFN_ISLAND_DEVICE");
+    }
+    if (requested == nullptr || requested[0] == '\0' ||
+        std::strcmp(requested, "off") == 0 || std::strcmp(requested, "none") == 0) {
+        return WP_NO_FFN_ISLAND;
+    }
+
+    int idx = WP_NO_FFN_ISLAND;
+    if (std::strcmp(requested, "auto") == 0) {
+        if (resident_indices.empty()) {
+            return WP_NO_FFN_ISLAND;
+        }
+        idx = resident_indices[0];
+    } else {
+        idx = wp_find_device_index_by_name(devices, requested);
+        if (idx < 0) {
+            LLAMA_LOG_WARN("%s: FFN-island device '%s' not found; disabling FFN-island role\n",
+                           __func__, requested);
+            return WP_NO_FFN_ISLAND;
+        }
+    }
+
+    if (idx == paging_idx) {
+        LLAMA_LOG_WARN("%s: FFN-island device resolves to the paging device; role would be a no-op, disabling\n",
+                       __func__);
+        return WP_NO_FFN_ISLAND;
+    }
+    return idx;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1409,10 +1469,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<float> wp_resident_splits;
     bool wp_device_router_enabled = false;
 
+    int wp_ffn_island_idx = WP_NO_FFN_ISLAND;
+    ggml_backend_buffer_type_t wp_island_buft = nullptr;
+    size_t wp_island_bytes = 0;
     if (params.weight_paging_enabled && wp_resident_dense_enabled() && !devices.empty()) {
         const int paging_idx = wp_select_paging_device_index(params, devices);
         const std::vector<int> resident_indices =
                 wp_select_resident_device_indices(params, devices, paging_idx);
+        wp_ffn_island_idx = wp_select_ffn_island_device_index(params, devices, paging_idx, resident_indices);
+        if (wp_ffn_island_idx != WP_NO_FFN_ISLAND) {
+            // VRAM preflight: sum the bytes of tensors that would move onto
+            // the island device (shexp + FFN-island patterns) and veto the
+            // placement if they would not fit within free VRAM minus reserve.
+            static const std::regex shexp_pattern(wp::ROUTER_SHEXP_PATTERN);
+            static const std::regex ffn_island_pattern(wp::ROUTER_FFN_ISLAND_PATTERN);
+            for (const auto & kv : ml.weights_map) {
+                const std::string & tensor_name = kv.first;
+                if (std::regex_search(tensor_name, shexp_pattern) ||
+                    std::regex_search(tensor_name, ffn_island_pattern)) {
+                    wp_island_bytes += ggml_nbytes(kv.second.tensor);
+                }
+            }
+            size_t island_free;
+            size_t island_total;
+            ggml_backend_dev_memory(devices[wp_ffn_island_idx].dev, &island_free, &island_total);
+            const size_t reserve_bytes = wp_ffn_island_reserve_bytes();
+            const size_t budget_bytes = island_free > reserve_bytes ? island_free - reserve_bytes : 0;
+            if (wp_island_bytes > budget_bytes) {
+                LLAMA_LOG_WARN("%s: FFN-island device '%s' has insufficient VRAM for shexp+ffn_island "
+                               "(%zu bytes needed vs %zu bytes free - %zu reserve); disabling FFN-island role\n",
+                               __func__, ggml_backend_dev_name(devices[wp_ffn_island_idx].dev),
+                               wp_island_bytes, island_free, reserve_bytes);
+                wp_ffn_island_idx = WP_NO_FFN_ISLAND;
+                wp_island_bytes = 0;
+            } else {
+                wp_island_buft = ggml_backend_dev_buffer_type(devices[wp_ffn_island_idx].dev);
+            }
+        }
         if (paging_idx >= 0 && !resident_indices.empty()) {
             wp_paging_buft = ggml_backend_dev_buffer_type(devices[paging_idx].dev);
             wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_indices[0]].dev);
@@ -1442,7 +1535,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
             wp_tensor_buft_overrides = wp::build_router_overrides(
                     wp_paging_buft, wp_resident_buft, cpu_buft, params.tensor_buft_overrides,
-                    wp_resident_devs.size() == 1);
+                    wp_resident_devs.size() == 1, wp_island_buft);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             // Without this, llama_context enables pipeline parallelism on
             // multi-device (has_tensor_overrides() was still false) and
@@ -1459,6 +1552,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                            __func__,
                            ggml_backend_dev_name(devices[paging_idx].dev), ggml_backend_buft_name(wp_paging_buft),
                            resident_names.c_str());
+            LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router: ffn_island=%s (%zu bytes)\n",
+                           __func__,
+                           wp_ffn_island_idx != WP_NO_FFN_ISLAND ? ggml_backend_dev_name(devices[wp_ffn_island_idx].dev) : "none",
+                           wp_island_bytes);
         } else {
             LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router disabled: could not resolve paging/resident bufts\n",
                            __func__);
