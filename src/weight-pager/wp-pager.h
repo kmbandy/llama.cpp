@@ -151,13 +151,32 @@ public:
         // HOST-path phases correctly and should be used for HOST-path analysis.
         uint64_t ensure_batch_calls                = 0;
         uint64_t ensure_batch_pages                = 0; // cold misses issued in batches
-        uint64_t ensure_batch_max_n                = 0; // largest concurrent miss set
+        uint64_t ensure_batch_max_n                = 0; // largest concurrent *real storage*
+                                                         // submission set (excludes HostTier hits)
         uint64_t ensure_batch_bytes                = 0;
-        double   ensure_batch_seconds              = 0.0; // submit+wait wall
+        // Denominator for ensure_batch_gb_s: storage-read-phase wall time
+        // only, comparable across transports. On the HOST path this
+        // excludes the H2D copy phase; the P2P path has no separate H2D
+        // phase (direct_to_device reads land in the VRAM slot directly),
+        // so its submit+wait wall already qualifies. Batches with zero
+        // real storage bytes (pure HostTier hits) contribute no time here.
+        double   ensure_batch_seconds              = 0.0;
         double   ensure_batch_submit_seconds       = 0.0;
         double   ensure_batch_wait_seconds         = 0.0;
         uint64_t ensure_batch_timeouts             = 0; // wait_for_req returned non-Ok
-        uint64_t ensure_batch_n_sub_sum            = 0; // sum of submit_batch return
+        // Real storage submissions only. Both paths must exclude HostTier
+        // hits: on HOST this is the count of jobs actually enqueued to the
+        // O_DIRECT worker pool (n_submitted); on P2P it is submit_batch's
+        // return value (n_sub). HostTier hits never reach either queue.
+        uint64_t ensure_batch_n_sub_sum            = 0;
+        // Transport identity: which ensure_batch branch actually served
+        // each batch's reads this run. More than one can be nonzero in a
+        // single run (e.g. a HOST-path read failing over to the per-page
+        // sync fallback), so all three are counted rather than keeping
+        // only the last path taken.
+        uint64_t ensure_batch_host_path_batches    = 0; // served by HOST O_DIRECT pthread pool
+        uint64_t ensure_batch_p2p_path_batches     = 0; // served by P2P direct_to_device
+        uint64_t ensure_batch_serial_path_batches  = 0; // served by serial sync fallback
         // HOST O_DIRECT pthread-pool path only (WP_ENSURE_BATCH_HOST=1): the
         // five phases of ensure_batch's HOST branch, named for what each
         // actually measures. Unset (0.0) on the P2P and serial-fallback paths.

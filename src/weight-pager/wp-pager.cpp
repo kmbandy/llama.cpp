@@ -1287,6 +1287,35 @@ void WeightPager::log_stats_summary() {
     weight_pager_eval_cb_print_profile();
 
     const Stats & s = stats();
+
+    // Transport identity: one unmissable line naming which ensure_batch
+    // path(s) actually served reads this run. WP_ENSURE_BATCH_HOST=1
+    // bypasses the P2P path entirely and nothing else stated this
+    // plainly which transport ran -- exactly the ambiguity that let a
+    // long-standing confusion about it survive.
+    {
+        const int n_transports_used =
+            (s.ensure_batch_host_path_batches   > 0 ? 1 : 0) +
+            (s.ensure_batch_p2p_path_batches    > 0 ? 1 : 0) +
+            (s.ensure_batch_serial_path_batches > 0 ? 1 : 0);
+        const char * active = "none (no ensure_batch reads this run)";
+        if (n_transports_used > 1) {
+            active = "MIXED -- see per-path counts below";
+        } else if (s.ensure_batch_host_path_batches > 0) {
+            active = "HOST (O_DIRECT pthread pool)";
+        } else if (s.ensure_batch_p2p_path_batches > 0) {
+            active = "P2P (direct_to_device)";
+        } else if (s.ensure_batch_serial_path_batches > 0) {
+            active = "SERIAL (sync fallback)";
+        }
+        LLAMA_LOG_WARN(
+            "wp::ensure_batch TRANSPORT: active=%s  host_batches=%lu p2p_batches=%lu serial_batches=%lu\n",
+            active,
+            (unsigned long) s.ensure_batch_host_path_batches,
+            (unsigned long) s.ensure_batch_p2p_path_batches,
+            (unsigned long) s.ensure_batch_serial_path_batches);
+    }
+
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
     const double hit_rate = prefetch_total > 0
         ? 100.0 * (double) s.prefetch_hits / (double) prefetch_total
@@ -2035,6 +2064,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         return (e != nullptr && e[0] == '1') ? 1 : 0;
     }();
     if (s_batch_host && ensure_host_bufs_ready_(misses.size(), catalog_.max_page_size())) {
+        ++stats_.ensure_batch_host_path_batches;
         const auto io_t0 = std::chrono::steady_clock::now();
         struct HostJob {
             int      file_idx;
@@ -2281,7 +2311,14 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             ++stats_.ensure_batch_calls;
             stats_.ensure_batch_pages   += (uint64_t) batch_ok_n;
             stats_.ensure_batch_bytes   += (uint64_t) batch_bytes;
-            stats_.ensure_batch_seconds += batch_seconds;
+            // Headline gb/s denominator: storage-read-phase time only
+            // (excludes H2D), and only when real storage bytes were
+            // actually read -- a batch served entirely by HostTier
+            // reads zero storage bytes and must not inflate the wall
+            // time this ratio is divided by.
+            if (batch_bytes > 0) {
+                stats_.ensure_batch_seconds += read_seconds;
+            }
             stats_.ensure_batch_submit_seconds += read_seconds; // host O_DIRECT phase
             stats_.ensure_batch_wait_seconds   += (batch_seconds - read_seconds); // H2D
             stats_.ensure_batch_host_jobs_seconds      += host_jobs_seconds;
@@ -2289,9 +2326,13 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             stats_.ensure_batch_host_enqueue_seconds   += host_enqueue_seconds;
             stats_.ensure_batch_host_read_wait_seconds += host_read_wait_seconds;
             stats_.ensure_batch_host_h2d_seconds       += (batch_seconds - read_seconds);
-            stats_.ensure_batch_n_sub_sum      += (uint64_t) batch_ok_n;
-            if ((uint64_t) batch_ok_n > stats_.ensure_batch_max_n) {
-                stats_.ensure_batch_max_n = (uint64_t) batch_ok_n;
+            // Real storage submissions only: n_submitted counts jobs
+            // actually enqueued to the O_DIRECT worker pool. HostTier
+            // hits never reach the queue (their HostJob has fd=-1 and
+            // queued stays false) and must not inflate this count.
+            stats_.ensure_batch_n_sub_sum      += (uint64_t) n_submitted;
+            if ((uint64_t) n_submitted > stats_.ensure_batch_max_n) {
+                stats_.ensure_batch_max_n = (uint64_t) n_submitted;
             }
         }
         return;
@@ -2308,6 +2349,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     // re-reads. Previously P2P bypassed HostTier entirely — soft prefetch
     // could never pay off under the default decode transport.
     if (file_io_->direct_to_device()) {
+        ++stats_.ensure_batch_p2p_path_batches;
         std::vector<Miss> cold;
         cold.reserve(misses.size());
         int n_host_hit = 0;
@@ -2336,10 +2378,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             if (n_host_hit > 0) {
                 ++stats_.ensure_batch_calls;
                 stats_.ensure_batch_pages += (uint64_t) n_host_hit;
-                stats_.ensure_batch_n_sub_sum += (uint64_t) n_host_hit;
-                if ((uint64_t) n_host_hit > stats_.ensure_batch_max_n) {
-                    stats_.ensure_batch_max_n = (uint64_t) n_host_hit;
-                }
+                // Entirely HostTier hits -- zero real storage submissions,
+                // so ensure_batch_n_sub_sum/ensure_batch_max_n must not move.
             }
             return;
         }
@@ -2413,16 +2453,26 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             ++stats_.ensure_batch_calls;
             stats_.ensure_batch_pages   += (uint64_t) total_ok;
             stats_.ensure_batch_bytes   += (uint64_t) batch_bytes;
-            stats_.ensure_batch_seconds += batch_seconds;
+            // Headline gb/s denominator: storage-read-phase time only
+            // (submit+wait; no separate H2D stage on this path), and
+            // only when real storage bytes were actually read.
+            if (batch_bytes > 0) {
+                stats_.ensure_batch_seconds += batch_seconds;
+            }
             stats_.ensure_batch_submit_seconds += submit_seconds;
             stats_.ensure_batch_wait_seconds   += wait_seconds;
             stats_.ensure_batch_timeouts       += n_timeout;
-            stats_.ensure_batch_n_sub_sum      += (uint64_t) n_sub + (uint64_t) n_host_hit;
-            if ((uint64_t) total_ok > stats_.ensure_batch_max_n) {
-                stats_.ensure_batch_max_n = (uint64_t) total_ok;
+            // Real storage submissions only: n_sub is submit_batch's
+            // return value (jobs actually queued to io_uring). n_host_hit
+            // came from HostTier and never reached submit_batch, so it
+            // must not inflate the submission/concurrency counters.
+            stats_.ensure_batch_n_sub_sum      += (uint64_t) n_sub;
+            if ((uint64_t) n_sub > stats_.ensure_batch_max_n) {
+                stats_.ensure_batch_max_n = (uint64_t) n_sub;
             }
         }
     } else {
+        ++stats_.ensure_batch_serial_path_batches;
         for (const Miss & mm : misses) {
             const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
             out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
