@@ -2800,6 +2800,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_DEVICE"));
     add_opt(common_arg(
+        {"--weight-paging-ffn-island-device"}, "<dev|auto|off>",
+        "device hosting the shared experts and FFN island; \"auto\" selects the first\n"
+        "resident device; \"off\" or unset disables the role and keeps those tensors on\n"
+        "the paging device (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_paging_ffn_island_device = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_FFN_ISLAND_DEVICE"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

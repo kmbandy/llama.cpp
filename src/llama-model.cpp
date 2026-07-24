@@ -3001,6 +3001,7 @@ llama_model_params llama_model_default_params() {
         /*.weight_paging_slots         =*/ -1,
         /*.weight_paging_prefetch      =*/ false,
         /*.weight_paging_resident_device =*/ "auto",
+        /*.weight_paging_ffn_island_device =*/ nullptr,
     };
 
     return result;
