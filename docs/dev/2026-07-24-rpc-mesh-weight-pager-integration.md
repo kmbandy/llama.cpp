@@ -34,8 +34,11 @@ aggregate VRAM.
 - The rpc-server target is named **`ggml-rpc-server`**, not `rpc-server`.
 - The fork trips an upstream tripwire: `ggml/include/ggml-rpc.h` has
   `static_assert(GGML_OP_COUNT == 97)`, which fails because the fork appends custom
-  ops (`ML8_*`, `SINKHORN_NORM`, `PAGED_ATTN_MT`, `TURBO_WHT`, ...). Neutralised
-  locally to `> 0`.
+  ops (`ML8_*`, `SINKHORN_NORM`, `PAGED_ATTN_MT`, `TURBO_WHT`, ...). Now pinned to
+  the fork's real count, `== 105` (commit `2de864288`) — *not* neutralised to
+  `> 0`, so adding an op still trips the tripwire and forces a patch-version
+  bump. That guard is load-bearing here: see the same-commit warning below about
+  op-enum divergence between the two ends.
 - **Both ends must be built from the same commit.** The graph is serialized by
   op-enum value; a fork whose `GGML_OP` enum differs from the peer would
   mis-deserialize every node after the divergence point. We rsync'd main's tree to
@@ -256,18 +259,54 @@ Open before a run:
 
 ---
 
-## 10. Uncommitted work
+## 10. What landed, and what is still uncommitted
 
-Codex was asked to add **multi-device resident support** (comma-separated
-`--weight-paging-resident-device`, layer homes distributed across the listed
-devices proportional to free VRAM, dense `.*` catch-all suppressed when
-multi-resident so layer-home placement governs). Changes are in the working tree
-of `src/llama-model.cpp`, `src/weight-pager/wp-router.{cpp,h}`,
-`src/weight-pager/wp-pager.{cpp,h}` — **unreviewed and uncommitted**. Note §9.3:
-this is a real capability but likely not on GLM's critical path.
+**Landed 2026-07-24** (on `master`, local only — *not pushed*; origin is now 37
+ahead):
 
-Also uncommitted and pre-existing from other sessions (do not sweep into a
+| commit | contents |
+|---|---|
+| `2de864288` | `fix(rpc)`: op-count tripwire pinned to 105 + patch version 4.0.2 |
+| `6a1dcfe0d` | `feat(weight-pager)`: soft host-prefetch policy + HostTier on the P2P ensure path |
+| `09c5636b2` | `feat(weight-pager)`: multi-device resident islands |
+| `37867ab5e` | this doc |
+
+Note `6a1dcfe0d` was **not** part of the multi-device work — the working tree
+held two independent efforts at once, and this doc's earlier revision
+mis-attributed the `wp-pager.*` changes. It carries one behaviour change worth
+remembering: **speculative VRAM prefetch no longer evicts** (`allow_evict=0`),
+so any pre-2026-07-24 measurement of cross-layer VRAM prefetch was taken under
+a policy that could thrash the demand set.
+
+Review findings on `09c5636b2` / `6a1dcfe0d`, deliberately **not** fixed in
+those commits so the landed code matches what was measured in §6/§7:
+
+1. **Instrument contamination** (`6a1dcfe0d`, `wp-pager.cpp` ensure_batch P2P):
+   `ensure_batch_n_sub_sum += n_sub + n_host_hit` and `ensure_batch_max_n` from
+   `total_ok` fold HostTier hits into the io_uring **queue-depth** instrument —
+   the same counter the decode-bandwidth work reads to judge QD. Log-only, no
+   logic depends on it, but it makes QD look deeper than the ring really went.
+   Keep `n_sub` pure and report host hits separately.
+2. **Lost overlap** (same path): host hits are serviced with blocking
+   `page_in_sync_` H2D *before* the cold batch is submitted. Submitting the
+   NVMe batch first and doing the H2D while I/O is in flight would recover that
+   overlap — relevant because decode is I/O-bound.
+3. **Strike counters never decay** (`6a1dcfe0d`): they reset only when a page
+   lands in VRAM, so two predictions arbitrarily far apart satisfy a 2-strike
+   gate. Weakens "repeatedly predicted" but is conservative in the safe
+   direction.
+4. **All-invalid resident list disables the router** (`09c5636b2`): a
+   comma-separated list whose names all fail to resolve leaves
+   `resident_indices` empty, and the WP router silently turns off (single bad
+   name still falls back to the paging device). Fall back to `{paging_idx}` for
+   parity.
+
+Checked and *not* a bug: the output-layer call `get_layer_buft_list(n_layer_all)`
+cannot index past `wp_resident_splits` — `fraction` is strictly < 1.0 and the
+normalised cumulative array ends at exactly 1.0.
+
+Still uncommitted, pre-existing from other sessions (do not sweep into a
 commit): `common/arg.cpp`, `tools/server/server-models.{cpp,h}`,
-`docs/examples/router-fleet-main.ini` (kmbandy's live config), and deletions
-under `ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/`
-(the DSWS session's scratch area).
+`docs/examples/router-fleet-main.ini` (kmbandy's live config), and the DSWS
+session's scratch area under
+`ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/`.
