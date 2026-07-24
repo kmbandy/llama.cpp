@@ -16,17 +16,22 @@ std::vector<llama_model_tensor_buft_override> build_router_overrides(
         ggml_backend_buffer_type_t resident_buft,
         ggml_backend_buffer_type_t cpu_buft,
         const llama_model_tensor_buft_override * user_overrides,
-        bool emit_dense_catch_all) {
+        bool emit_dense_catch_all,
+        ggml_backend_buffer_type_t island_buft) {
     std::vector<llama_model_tensor_buft_override> out;
+
+    ggml_backend_buffer_type_t shexp_ffn_buft = island_buft != nullptr ? island_buft : paging_buft;
 
     // 1) Routed experts -> paging device (catalog/paged pool).
     out.push_back({ ROUTER_EXPERT_PATTERN, paging_buft });
 
-    // 2) Shared expert -> paging device, always-resident (not in paged set).
-    out.push_back({ ROUTER_SHEXP_PATTERN, paging_buft });
+    // 2) Shared expert -> paging device, always-resident (not in paged set);
+    //    or island device when the FFN-island role is configured.
+    out.push_back({ ROUTER_SHEXP_PATTERN, shexp_ffn_buft });
 
-    // 3) FFN island dense -> paging (T4: fewer TB3 intermediate activations).
-    out.push_back({ ROUTER_FFN_ISLAND_PATTERN, paging_buft });
+    // 3) FFN island dense -> paging (T4: fewer TB3 intermediate activations);
+    //    or island device when the FFN-island role is configured.
+    out.push_back({ ROUTER_FFN_ISLAND_PATTERN, shexp_ffn_buft });
 
     // 4) token_embd -> CPU when available (row gather; frees eGPU for draft/attn).
     if (cpu_buft != nullptr) {

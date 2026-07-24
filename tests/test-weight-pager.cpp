@@ -1896,6 +1896,49 @@ static int test_router_overrides_preserve_user() {
     return fails;
 }
 
+static int test_router_overrides_island_null_matches_default() {
+    int fails = 0;
+
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
+    auto baseline = wp::build_router_overrides(paging, resident, cpu, nullptr);
+    auto ov       = wp::build_router_overrides(paging, resident, cpu, nullptr, true, nullptr);
+    EXPECT_EQ_INT((int) ov.size(), (int) baseline.size(), "island=nullptr does not change entry count");
+    for (size_t i = 0; i < baseline.size(); i++) {
+        bool same_pattern = (baseline[i].pattern == nullptr && ov[i].pattern == nullptr) ||
+                             (baseline[i].pattern != nullptr && ov[i].pattern != nullptr &&
+                              std::string(baseline[i].pattern) == std::string(ov[i].pattern));
+        EXPECT(same_pattern, "island=nullptr: pattern matches baseline entry-for-entry");
+        EXPECT(baseline[i].buft == ov[i].buft, "island=nullptr: buft matches baseline entry-for-entry");
+    }
+    return fails;
+}
+
+static int test_router_overrides_island_routes_shexp_and_ffn() {
+    int fails = 0;
+
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
+    auto island   = (ggml_backend_buffer_type_t) 0x8;
+    auto ov = wp::build_router_overrides(paging, resident, cpu, nullptr, true, island);
+    // expert + shexp + ffn_island + token_embd + dense + terminator
+    EXPECT_EQ_INT((int) ov.size(), 6, "expert+shexp+ffn_island+embd+dense+term");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
+    EXPECT(ov[0].buft == paging, "routed experts still on paging buft");
+    EXPECT(std::string(ov[1].pattern) == std::string(wp::ROUTER_SHEXP_PATTERN), "shexp second");
+    EXPECT(ov[1].buft == island, "shexp routed to island buft");
+    EXPECT(std::string(ov[2].pattern) == std::string(wp::ROUTER_FFN_ISLAND_PATTERN), "ffn island third");
+    EXPECT(ov[2].buft == island, "ffn island routed to island buft");
+    EXPECT(std::string(ov[3].pattern) == std::string(wp::ROUTER_TOKEN_EMBD_PATTERN), "token_embd fourth");
+    EXPECT(ov[3].buft == cpu, "token_embd on CPU");
+    EXPECT(std::string(ov[4].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all");
+    EXPECT(ov[4].buft == resident, "dense catch-all still on resident buft");
+    EXPECT(ov[5].pattern == nullptr, "list is terminated");
+    return fails;
+}
+
 static int test_wp_paged_batch_flag_default_off() {
     int fails = 0;
     ScopedEnv guard("WP_PAGED_BATCH");
@@ -2119,6 +2162,8 @@ int main() {
         { "routing_boundary_prepass",            test_routing_boundary_prepass            },
         { "router_overrides_expert_only",        test_router_overrides_expert_only        },
         { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
+        { "router_overrides_island_null_matches_default", test_router_overrides_island_null_matches_default },
+        { "router_overrides_island_routes_shexp_and_ffn", test_router_overrides_island_routes_shexp_and_ffn },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
         { "router_predictor",                    test_router_predictor                    },
         { "router_predictor_confidence",         test_router_predictor_confidence         },
