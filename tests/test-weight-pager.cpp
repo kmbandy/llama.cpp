@@ -1491,6 +1491,304 @@ static int test_host_tier_lru_touch_is_not_linear_scan() {
     return fails;
 }
 
+// ---------------------------------------------------------------------------
+// HostTier borrow/release -- zero-copy promotion (2026-07-25 design)
+// ---------------------------------------------------------------------------
+
+// 1. Borrow returns the arena address, not a copy: contents match, and the
+// pointer is stable across two successive borrow/release cycles for an
+// untouched entry.
+static int test_host_tier_borrow_returns_arena_address() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> src(32);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 7 + 3);
+    EXPECT(tier.store(80, src.data(), src.size()), "store page 80");
+
+    const void * p1 = nullptr;
+    EXPECT(tier.borrow(80, &p1, src.size()), "first borrow hits");
+    EXPECT(p1 != nullptr, "first borrow returns non-null");
+    EXPECT(std::memcmp(p1, src.data(), src.size()) == 0, "first borrow bytes match");
+    tier.release(80);
+
+    const void * p2 = nullptr;
+    EXPECT(tier.borrow(80, &p2, src.size()), "second borrow hits");
+    EXPECT(std::memcmp(p2, src.data(), src.size()) == 0, "second borrow bytes match");
+    EXPECT(p1 == p2, "borrow pointer stable across borrow/release cycles for an untouched entry");
+    tier.release(80);
+
+    return fails;
+}
+
+// 2. Borrow misses for an absent page, and for a resident page requested
+// with the wrong size -- both must return false and leave the out-pointer
+// untouched.
+static int test_host_tier_borrow_miss() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x81);
+    EXPECT(tier.store(81, bytes.data(), bytes.size()), "store page 81");
+
+    const void * sentinel = (const void *) 0x1;
+    const void * out = sentinel;
+    EXPECT(!tier.borrow(999, &out, bytes.size()), "borrow of absent page misses");
+    EXPECT(out == sentinel, "absent-page borrow leaves out-pointer untouched");
+
+    out = sentinel;
+    EXPECT(!tier.borrow(81, &out, bytes.size() - 1), "borrow with wrong size misses");
+    EXPECT(out == sentinel, "wrong-size borrow leaves out-pointer untouched");
+
+    return fails;
+}
+
+// 3. A borrowed page is not evicted: fill the arena to capacity, borrow the
+// LRU-front page, store a new page forcing an eviction, and confirm the
+// borrowed page's bytes are intact and the *second*-oldest page was the
+// victim instead.
+static int test_host_tier_borrow_blocks_eviction() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> b90(32, 0x90), b91(32, 0x91), b92(32, 0x92), b93(32, 0x93);
+    EXPECT(tier.store(90, b90.data(), b90.size()), "store 90");
+    EXPECT(tier.store(91, b91.data(), b91.size()), "store 91");
+    EXPECT(tier.store(92, b92.data(), b92.size()), "store 92");
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "arena full at capacity");
+
+    const void * borrowed = nullptr;
+    EXPECT(tier.borrow(90, &borrowed, b90.size()), "borrow LRU-front page 90");
+
+    EXPECT(tier.store(93, b93.data(), b93.size()), "store 93 forces an eviction");
+
+    EXPECT(std::memcmp(borrowed, b90.data(), b90.size()) == 0, "borrowed page 90 bytes intact");
+    EXPECT(tier.contains(90), "borrowed page 90 still resident (protected from eviction)");
+    EXPECT(!tier.contains(91), "second-oldest page 91 was evicted instead");
+    EXPECT(tier.contains(92), "page 92 untouched");
+    EXPECT(tier.contains(93), "new page 93 resident");
+
+    tier.release(90);
+    return fails;
+}
+
+// 4. All-borrowed saturation fails the store cleanly: borrow every resident
+// entry, attempt a store, confirm it returns false and no borrowed content
+// changed.
+static int test_host_tier_all_borrowed_store_fails_cleanly() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> a(32, 0xA0), b(32, 0xB0);
+    EXPECT(tier.store(100, a.data(), a.size()), "store 100");
+    EXPECT(tier.store(101, b.data(), b.size()), "store 101");
+
+    const void * pa = nullptr;
+    const void * pb = nullptr;
+    EXPECT(tier.borrow(100, &pa, a.size()), "borrow 100");
+    EXPECT(tier.borrow(101, &pb, b.size()), "borrow 101");
+
+    std::vector<uint8_t> c(32, 0xC0);
+    EXPECT(!tier.store(102, c.data(), c.size()), "store fails when every resident entry is borrowed");
+
+    EXPECT(std::memcmp(pa, a.data(), a.size()) == 0, "borrowed page 100 unchanged");
+    EXPECT(std::memcmp(pb, b.data(), b.size()) == 0, "borrowed page 101 unchanged");
+    EXPECT(tier.contains(100), "page 100 still resident");
+    EXPECT(tier.contains(101), "page 101 still resident");
+    EXPECT(!tier.contains(102), "failed store did not create page 102");
+
+    tier.release(100);
+    tier.release(101);
+    return fails;
+}
+
+// 5. Deferred retirement: borrow a page, erase() it, confirm contains() is
+// immediately false and the borrowed bytes are still readable; then
+// release() and confirm the slot is reused by the next same-size store.
+static int test_host_tier_deferred_retirement() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0xD0);
+    EXPECT(tier.store(110, bytes.data(), bytes.size()), "store 110");
+
+    const void * borrowed = nullptr;
+    EXPECT(tier.borrow(110, &borrowed, bytes.size()), "borrow 110");
+
+    tier.erase(110);
+    EXPECT(!tier.contains(110), "erase() while borrowed makes contains() false immediately");
+    EXPECT(std::memcmp(borrowed, bytes.data(), bytes.size()) == 0,
+           "borrowed bytes still readable after erase() while retirement is deferred");
+
+    tier.release(110);
+
+    // The slot freed by 110's deferred reclamation, plus the still-free
+    // second slot, gives room for two more same-size stores without a
+    // forced eviction of anything -- if the slot were leaked, capacity
+    // would silently shrink to one page instead of two.
+    std::vector<uint8_t> other1(32, 0xD1), other2(32, 0xD2);
+    EXPECT(tier.store(111, other1.data(), other1.size()), "slot reused after release drains retirement");
+    EXPECT(tier.store(112, other2.data(), other2.size()), "second slot also available (no leak)");
+    EXPECT_EQ_INT(tier.resident_count(), 2u, "exactly two pages resident, no leaked/duplicated slot");
+
+    return fails;
+}
+
+// 6. Re-store while borrowed does not alias: borrow page A, store() page A
+// again with different bytes, confirm the borrowed pointer still yields the
+// *original* bytes (it must have been given a different slot).
+static int test_host_tier_restore_while_borrowed_no_alias() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> original(32, 0xE0);
+    std::vector<uint8_t> replacement(32, 0xE1);
+    EXPECT(tier.store(120, original.data(), original.size()), "store 120 (original)");
+
+    const void * borrowed = nullptr;
+    EXPECT(tier.borrow(120, &borrowed, original.size()), "borrow 120");
+
+    EXPECT(tier.store(120, replacement.data(), replacement.size()), "re-store 120 while borrowed");
+
+    EXPECT(std::memcmp(borrowed, original.data(), original.size()) == 0,
+           "borrowed pointer still yields the ORIGINAL bytes -- re-store used a different slot");
+
+    std::vector<uint8_t> out(replacement.size());
+    EXPECT(tier.lookup(120, out.data(), out.size()), "lookup sees the NEW resident entry for 120");
+    EXPECT(std::memcmp(out.data(), replacement.data(), replacement.size()) == 0,
+           "new resident entry for 120 has the replacement bytes");
+
+    tier.release(120);
+    return fails;
+}
+
+// 7. Refcount, not a flag: borrow the same page twice, release once and
+// confirm it is still protected from eviction; release again and confirm it
+// becomes evictable.
+static int test_host_tier_borrow_is_refcounted() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> b130(32, 0x30), b131(32, 0x31), b132(32, 0x32);
+    EXPECT(tier.store(130, b130.data(), b130.size()), "store 130");
+    EXPECT(tier.store(131, b131.data(), b131.size()), "store 131 fills arena to capacity");
+
+    const void * p1 = nullptr;
+    const void * p2 = nullptr;
+    EXPECT(tier.borrow(130, &p1, b130.size()), "first borrow of 130");
+    EXPECT(tier.borrow(130, &p2, b130.size()), "second borrow of 130");
+    EXPECT(p1 == p2, "both borrows of the same page return the same address");
+
+    tier.release(130);
+    EXPECT(tier.store(132, b132.data(), b132.size()),
+           "store after ONE release still succeeds (131 is the only evictable victim)");
+    EXPECT(tier.contains(130), "130 still protected -- one borrow remains outstanding");
+    EXPECT(!tier.contains(131), "131 evicted as the only unborrowed resident entry");
+
+    tier.release(130);
+    // Now 130 has zero outstanding borrows and is the sole resident page
+    // (alongside 132); a further store must be able to evict it.
+    std::vector<uint8_t> b133(32, 0x33);
+    EXPECT(tier.store(133, b133.data(), b133.size()), "store after SECOND release evicts 130");
+    EXPECT(!tier.contains(130), "130 evictable once its refcount reached zero");
+    EXPECT(tier.contains(132), "132 untouched");
+    EXPECT(tier.contains(133), "133 resident");
+
+    return fails;
+}
+
+// 8. Concurrency: borrow/release racing with store/erase must never mutate a
+// borrowed region while it is held, and used-bytes accounting must return to
+// a consistent state at the end. Shaped like test_host_tier_concurrency.
+static int test_host_tier_borrow_release_concurrency() {
+    int fails = 0;
+    wp::HostTier tier;
+    // Only 2 32-byte slots for 4 threads' pages -- deliberately undersized so
+    // the 2 pages not currently held by their owning thread are under
+    // constant eviction pressure from each other while this thread's own
+    // borrow is outstanding.
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    // Each thread owns exactly one page_idx (thread t <-> page t) and only
+    // ever calls store()/erase()/borrow()/release() for its own page. release()
+    // is keyed only by page_idx (matching the production call site, where a
+    // page is borrowed and released once within a single uninterrupted
+    // ensure_batch call and never re-store()'d by its own borrower first) --
+    // it has no way to tell apart two independently-outstanding borrows of
+    // the SAME page_idx from different callers, so this test does not create
+    // that situation. What it does exercise concurrently, across all threads
+    // sharing one arena/mutex/free-list/LRU: store/erase churn on other
+    // pages, eviction pressure (the shared budget is deliberately too small
+    // for every thread's page to stay resident at once), and this thread's
+    // own borrow/release -- verifying a borrowed page is never corrupted or
+    // reclaimed by contention over the REST of the arena.
+    constexpr int n_threads = 4;
+    constexpr int n_iters = 20000;
+    constexpr size_t page_size = 32;
+    // Room for 2 of the 4 threads' pages at once: forces real eviction
+    // pressure (and deferred-retirement churn) on the pages NOT currently
+    // borrowed by their owning thread.
+    std::atomic<int> bad_borrows{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&tier, &bad_borrows, t]() {
+            const int page = t;
+            std::vector<uint8_t> expected(page_size, (uint8_t) page);
+            for (int i = 0; i < n_iters; ++i) {
+                if ((i % 7) == 0) {
+                    tier.erase(page);
+                } else {
+                    tier.store(page, expected.data(), expected.size());
+                }
+                const void * borrowed = nullptr;
+                if (tier.borrow(page, &borrowed, page_size)) {
+                    // Hold the borrow across a bit of concurrent churn from
+                    // the other threads (store/erase/evict on THEIR pages),
+                    // then confirm this page's region is still exactly what
+                    // it should read as -- never torn, aliased, or reclaimed
+                    // out from under the borrow by that unrelated churn.
+                    std::this_thread::yield();
+                    bool consistent = true;
+                    const uint8_t * p = (const uint8_t *) borrowed;
+                    for (size_t j = 0; j < page_size; ++j) {
+                        if (p[j] != (uint8_t) page) {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                    if (!consistent) {
+                        ++bad_borrows;
+                    }
+                    tier.release(page);
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ_INT(bad_borrows.load(), 0, "no borrowed region was ever mutated/aliased while held");
+    EXPECT(tier.used_bytes() <= tier.budget_bytes(), "used bytes stay within budget");
+    EXPECT(tier.resident_count() <= n_threads, "resident pages stay within the thread-owned page set");
+    return fails;
+}
+
 static int test_host_prefetcher() {
     int fails = 0;
     wp::HostTier tier;
@@ -2512,6 +2810,14 @@ int main() {
         { "host_tier_erase_middle_preserves_order",    test_host_tier_erase_middle_preserves_order    },
         { "host_tier_touch_absent_is_noop",            test_host_tier_touch_absent_is_noop            },
         { "host_tier_lru_touch_is_not_linear_scan",    test_host_tier_lru_touch_is_not_linear_scan    },
+        { "host_tier_borrow_returns_arena_address",     test_host_tier_borrow_returns_arena_address     },
+        { "host_tier_borrow_miss",                      test_host_tier_borrow_miss                      },
+        { "host_tier_borrow_blocks_eviction",            test_host_tier_borrow_blocks_eviction            },
+        { "host_tier_all_borrowed_store_fails_cleanly",  test_host_tier_all_borrowed_store_fails_cleanly  },
+        { "host_tier_deferred_retirement",               test_host_tier_deferred_retirement               },
+        { "host_tier_restore_while_borrowed_no_alias",   test_host_tier_restore_while_borrowed_no_alias   },
+        { "host_tier_borrow_is_refcounted",              test_host_tier_borrow_is_refcounted              },
+        { "host_tier_borrow_release_concurrency",        test_host_tier_borrow_release_concurrency        },
         { "host_prefetcher",                     test_host_prefetcher                     },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },

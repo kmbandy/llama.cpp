@@ -269,6 +269,13 @@ public:
         // H2D copies differently and their per-page cost could differ.
         uint64_t ensure_batch_host_promotion_count      = 0;   // pages promoted RAM->VRAM in ensure_batch HOST path
         double   ensure_batch_host_promotion_h2d_seconds = 0.0; // their H2D copy time only
+        // Of ensure_batch_host_promotion_count above, how many sourced their
+        // H2D straight from the pinned HostTier arena via borrow() (2026-07-25
+        // zero-copy design) instead of lookup()'s memcpy-into-bounce-buffer
+        // fallback (taken when the arena isn't HIP-pinned). Lets a session
+        // tell the fast path from the fallback in a log instead of inferring
+        // it from indirect evidence.
+        uint64_t ensure_batch_host_zerocopy_promotions   = 0;
         uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
         double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
         uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_

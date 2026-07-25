@@ -35,6 +35,34 @@ extern "C++" void ggml_cuda_get_routed_expert_ptrs_stats(
 namespace wp {
 
 // ---------------------------------------------------------------------------
+// HostBorrowGuard — releases every HostTier zero-copy borrow() taken during
+// ensure_batch's HOST path, on every exit from the borrow/sync region.
+//
+// See docs/superpowers/specs/2026-07-25-hosttier-zerocopy-promotion-design.md
+// §4: auditing exits by hand is how this class of bug ships (a borrowed page
+// left un-released is stuck un-evictable forever), so ownership of the
+// borrowed-page list -- and releasing all of it -- is a single RAII object
+// instead. Deliberately NOT copyable/movable: exactly one guard owns exactly
+// one borrow list for the duration of one ensure_batch call.
+struct HostBorrowGuard {
+    HostTier *       tier = nullptr;
+    std::vector<int> pages;
+
+    explicit HostBorrowGuard(HostTier * t) : tier(t) {}
+    HostBorrowGuard(const HostBorrowGuard &)             = delete;
+    HostBorrowGuard & operator=(const HostBorrowGuard &) = delete;
+
+    ~HostBorrowGuard() {
+        if (tier == nullptr) {
+            return;
+        }
+        for (int p : pages) {
+            tier->release(p);
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // EnvSnapshot — record current value of an env var, then restore it later.
 //
 // Used for GGML_CUDA_DISABLE_GRAPHS: the pager forces it to "1" during init
@@ -1528,6 +1556,7 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_host_read_wait_ms: %.1f\n"
             "  ensure_batch_host_h2d_ms: %.1f\n"
             "  ensure_batch_host_promotion_count: %lu\n"
+            "  ensure_batch_host_zerocopy_promotions: %lu\n"
             "  ensure_batch_host_promotion_h2d_ms: %.1f\n"
             "  ensure_batch_host_fresh_count: %lu\n"
             "  ensure_batch_host_fresh_h2d_ms: %.1f\n"
@@ -1613,6 +1642,7 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_host_read_wait_seconds * 1e3,
             s.ensure_batch_host_h2d_seconds * 1e3,
             (unsigned long) s.ensure_batch_host_promotion_count,
+            (unsigned long) s.ensure_batch_host_zerocopy_promotions,
             s.ensure_batch_host_promotion_h2d_seconds * 1e3,
             (unsigned long) s.ensure_batch_host_fresh_count,
             s.ensure_batch_host_fresh_h2d_seconds * 1e3,
@@ -2226,17 +2256,53 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             bool     seen;
             bool     ok;
         };
-        // Tier-1 (host RAM) lookup partition. HostTier copies a hit into the
-        // per-miss bounce buffer while holding its lock, so the worker may
-        // reclaim arena slots immediately after lookup returns.
+        // Tier-1 (host RAM) lookup partition.
+        //
+        // Zero-copy promotion (2026-07-25 design): when the tier's arena is
+        // HIP-pinned, borrow() hands back a pointer straight into the arena
+        // instead of lookup()'s memcpy into the per-miss bounce buffer --
+        // legal because the pinned arena is itself a valid hipMemcpyAsync
+        // source. Every borrow() taken here is released by host_borrow_guard
+        // below, after this whole HOST-path region (including the H2D
+        // enqueue and the single hipDeviceSynchronize()) is done with it.
+        // Gated on GGML_USE_HIP because backend_pinned() is only ever true
+        // there (a CPU-only build's arena is plain malloc, and the #else
+        // branch below ignores `jobs`/`host_hit` entirely in favor of
+        // page_in_sync_ -- calling borrow() there would leak the refcount
+        // with nothing to release it).
+#if defined(GGML_USE_HIP)
+        const bool host_zerocopy = host_tier_ != nullptr && host_tier_->backend_pinned();
+#else
+        const bool host_zerocopy = false;
+#endif
         std::vector<bool> host_hit(misses.size(), false);
+        // Source of the promotion H2D copy for each host_hit[k]: either the
+        // borrowed arena pointer (zero-copy) or ensure_host_bufs_[k] (the
+        // lookup() bounce buffer), populated as each hit is resolved below.
+        std::vector<const void *> host_hit_src(misses.size(), nullptr);
+        std::vector<bool> host_hit_zerocopy(misses.size(), false);
         std::vector<HostJob> jobs;
         jobs.reserve(misses.size());
+        HostBorrowGuard host_borrow_guard(host_tier_.get());
+        host_borrow_guard.pages.reserve(misses.size());
         int n_od = 0, n_host_hit = 0;
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const PageMeta & m = catalog_.at(misses[k].page);
             if (host_tier_) {
-                if (host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
+                bool hit = false;
+                if (host_zerocopy) {
+                    const void * src = nullptr;
+                    if (host_tier_->borrow(misses[k].page, &src, m.size)) {
+                        hit = true;
+                        host_hit_src[k]       = src;
+                        host_hit_zerocopy[k]  = true;
+                        host_borrow_guard.pages.push_back(misses[k].page);
+                    }
+                } else if (host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
+                    hit = true;
+                    host_hit_src[k] = ensure_host_bufs_[k];
+                }
+                if (hit) {
                     host_hit[k] = true;
                     ++n_host_hit;
                     // fd=-1, queued stays false -> no O_DIRECT read issued.
@@ -2426,11 +2492,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             if (vram == nullptr) {
                 return;
             }
-            // RAM hit and fresh reads both use the per-miss bounce buffer;
+            // A RAM hit's source is the borrowed arena pointer (zero-copy) or
+            // the per-miss bounce buffer (lookup() fallback, unpinned arena);
             // O_DIRECT reads begin after their 512-align prefix.
             const void * src = nullptr;
             if (host_hit[k]) {
-                src = ensure_host_bufs_[k];
+                src = host_hit_src[k];
             } else if (jobs[k].ok) {
                 src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
             } else {
@@ -2510,6 +2577,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     ++stats_.host_tier_hits;   // served from RAM; no NVMe bytes
                     ++stats_.ensure_batch_host_hits;
                     ++stats_.ensure_batch_host_promotion_count;
+                    if (host_hit_zerocopy[k]) {
+                        // Sourced the H2D straight from the pinned HostTier
+                        // arena (borrow()), not lookup()'s bounce-buffer
+                        // memcpy -- see the 2026-07-25 zero-copy design.
+                        ++stats_.ensure_batch_host_zerocopy_promotions;
+                    }
                     // Exclusive tier: the page is back in VRAM, so drop its RAM
                     // copy. It re-enters Tier 1 only if evicted again.
                     if (host_tier_) {
