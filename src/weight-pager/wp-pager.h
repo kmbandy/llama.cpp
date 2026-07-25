@@ -294,9 +294,6 @@ public:
         uint64_t tier_promotion_async_enqueued            = 0;
         uint64_t tier_promotion_sync_enqueued             = 0;
         uint64_t tier_promotion_event_pool_exhausted      = 0;
-        // Wall-clock from submitting a promotion batch through its completion.
-        // This has the same completed-H2D meaning as synchronous stage_in().
-        double   tier_promotion_h2d_seconds               = 0.0;
         // The completion-fence subset above, separately visible for diagnosis.
         double   tier_promotion_fence_seconds             = 0.0;
         uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
@@ -678,9 +675,9 @@ private:
     bool   initialized_ = false;
     bool   hip_graphs_enabled_ = false;
     bool   async_ensure_enabled_ = false;
-    // WP_PIPELINE_PROMOTIONS is deliberately opt-in while the async path is
-    // evaluated.  Off preserves the pre-pipeline synchronous promotion route.
-    bool   pipeline_promotions_enabled_ = false;
+    // WP_PIPELINE_PROMOTIONS defaults on; setting it to 0 selects the
+    // synchronous promotion route for A/B control and required configurations.
+    bool   pipeline_promotions_enabled_ = true;
 
     // MMID active-set history (metrics / optional future priors only).
     static constexpr int kHotExpertCap  = 768;

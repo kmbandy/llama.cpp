@@ -1745,12 +1745,10 @@ void WeightPager::log_stats_summary() {
         LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
                        "  tier_promotion_sync_enqueued: %lu\n"
                        "  tier_promotion_event_pool_exhausted: %lu\n"
-                       "  tier_promotion_h2d_ms: %.1f\n"
                        "  tier_promotion_fence_ms: %.1f\n",
                        (unsigned long) s.tier_promotion_async_enqueued,
                        (unsigned long) s.tier_promotion_sync_enqueued,
                        (unsigned long) s.tier_promotion_event_pool_exhausted,
-                       s.tier_promotion_h2d_seconds * 1e3,
                        s.tier_promotion_fence_seconds * 1e3);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
@@ -1892,12 +1890,10 @@ void WeightPager::log_stats_summary() {
     LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
                    "  tier_promotion_sync_enqueued: %lu\n"
                    "  tier_promotion_event_pool_exhausted: %lu\n"
-                   "  tier_promotion_h2d_ms: %.1f\n"
                    "  tier_promotion_fence_ms: %.1f\n",
                    (unsigned long) s.tier_promotion_async_enqueued,
                    (unsigned long) s.tier_promotion_sync_enqueued,
                    (unsigned long) s.tier_promotion_event_pool_exhausted,
-                   s.tier_promotion_h2d_seconds * 1e3,
                    s.tier_promotion_fence_seconds * 1e3);
     if (s.dense_prefetch_submitted > 0) {
         LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
@@ -2924,7 +2920,6 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // stream while the read batch is in flight. Failed event acquisition is
         // intentionally left out of `promotions`, and is read synchronously
         // after the batch rather than being silently committed.
-        const auto promotion_h2d_t0 = std::chrono::steady_clock::now();
         std::vector<TierPromotion> promotions;
         enqueue_tier_promotions_(promotion_requests, promotions,
             [this](void * dst, const void * src, size_t size, size_t slot_size, int & event) {
@@ -2953,7 +2948,6 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
         }
         const bool promotions_ok = synchronize_tier_promotions_(promotions);
-        stats_.tier_promotion_h2d_seconds += seconds_since(promotion_h2d_t0);
         // Completion is observed before this release: the HostTier arena must
         // remain immutable through the event fence, not merely through enqueue.
         release_tier_promotions_(promotions);
@@ -4551,7 +4545,6 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
                 ++stats_.page_in_sync_zerocopy_promotions;
             }
             stats_.page_in_sync_promotion_h2d_seconds += stage_seconds;
-            stats_.tier_promotion_h2d_seconds += stage_seconds;
             host_tier_->erase(page_idx);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
             ++s_diag_count;
@@ -4644,7 +4637,7 @@ read_from_storage:
 
 bool wp_pipeline_promotions_enabled() {
     const char * v = std::getenv("WP_PIPELINE_PROMOTIONS");
-    return v != nullptr && std::strcmp(v, "1") == 0;
+    return v == nullptr || std::strcmp(v, "0") != 0;
 }
 
 }  // namespace wp
