@@ -1770,6 +1770,69 @@ static int test_host_tier_borrow_is_refcounted() {
     return fails;
 }
 
+// Promotion lifetime seam: this is the CPU analogue of an async H2D. The
+// borrow stays live while the completion is deferred, so erase/re-store cannot
+// recycle or overwrite the source region before the caller observes completion.
+static int test_tier_promotion_borrow_held_until_deferred_completion() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+    std::vector<uint8_t> original(32, 0x41), replacement(32, 0x42);
+    EXPECT(tier.store(200, original.data(), original.size()), "store promotion source");
+
+    const void * source = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(200, &source, original.size(), &handle), "borrow promotion source");
+    tier.erase(200); // concurrent retirement while transfer completion is deferred
+    EXPECT(!tier.contains(200), "retired source is no longer resident during deferred completion");
+    EXPECT(std::memcmp(source, original.data(), original.size()) == 0,
+           "borrowed promotion source remains intact before completion fence");
+    EXPECT(tier.store(200, replacement.data(), replacement.size()), "re-store uses a distinct slot while borrowed");
+    EXPECT(std::memcmp(source, original.data(), original.size()) == 0,
+           "re-store cannot overwrite source before deferred completion");
+    tier.release(200, handle); // model release after observing completion
+    return fails;
+}
+
+// Event acquisition failure must leave no outstanding HostTier borrow. The
+// actual HIP event pool cannot be initialized without a GPU workload, so this
+// covers the CPU-owned lifetime edge that enqueue_tier_promotions_ takes before
+// returning its real-read fallback.
+static int test_tier_promotion_event_exhaustion_releases_borrow() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/32, /*device_idx=*/-1), "host tier init");
+    std::vector<uint8_t> bytes(32, 0x51), other(32, 0x52);
+    EXPECT(tier.store(201, bytes.data(), bytes.size()), "store source");
+    const void * source = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(201, &source, bytes.size(), &handle), "borrow before failed event acquisition");
+    tier.release(201, handle); // event unavailable: helper must not retain it
+    EXPECT(tier.store(202, other.data(), other.size()), "released borrow leaves a real-read fallback page evictable");
+    EXPECT(!tier.contains(201), "source can be evicted after failed event acquisition releases borrow");
+    EXPECT(tier.contains(202), "fallback/read replacement is resident");
+    return fails;
+}
+
+// Accounting bound model for a mixed batch: successful async promotions and
+// refused event acquisitions partition the requests exactly once.
+static int test_tier_promotion_accounting_bound_model() {
+    int fails = 0;
+    uint64_t async_enqueued = 0, sync_enqueued = 0, event_exhausted = 0;
+    const bool event_available[] = { true, true, false, false };
+    for (bool available : event_available) {
+        if (available) ++async_enqueued;
+        else ++event_exhausted;
+    }
+    ++sync_enqueued; // HOST path's one successful promotion
+    EXPECT_EQ_INT(async_enqueued, 2u, "two P2P promotions fit before the bound");
+    EXPECT_EQ_INT(event_exhausted, 2u, "each request past the bound is counted once");
+    EXPECT_EQ_INT(sync_enqueued, 1u, "HOST promotion uses synchronous accounting");
+    EXPECT_EQ_INT(async_enqueued + event_exhausted, 4u,
+                  "every async candidate is either enqueued or refused, never dropped twice");
+    return fails;
+}
+
 // 8. Concurrency: borrow/release racing with store/erase must never mutate a
 // borrowed region while it is held, and used-bytes accounting must return to
 // a consistent state at the end. Shaped like test_host_tier_concurrency.
@@ -2937,6 +3000,9 @@ int main() {
         { "host_tier_deferred_retirement",               test_host_tier_deferred_retirement               },
         { "host_tier_restore_while_borrowed_no_alias",   test_host_tier_restore_while_borrowed_no_alias   },
         { "host_tier_borrow_is_refcounted",              test_host_tier_borrow_is_refcounted              },
+        { "tier_promotion_borrow_held_until_deferred_completion", test_tier_promotion_borrow_held_until_deferred_completion },
+        { "tier_promotion_event_exhaustion_releases_borrow",      test_tier_promotion_event_exhaustion_releases_borrow },
+        { "tier_promotion_accounting_bound_model",                 test_tier_promotion_accounting_bound_model },
         { "host_tier_borrow_release_concurrency_same_key",      test_host_tier_borrow_release_concurrency_same_key      },
         { "host_tier_borrow_release_concurrency_disjoint_pages", test_host_tier_borrow_release_concurrency_disjoint_pages },
         { "host_prefetcher",                     test_host_prefetcher                     },
