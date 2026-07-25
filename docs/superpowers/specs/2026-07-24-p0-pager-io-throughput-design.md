@@ -328,3 +328,96 @@ floor, not a ceiling.
 - Attribution between the two causes (alignment vs btrfs compression) is still
   unmeasured; both changed before this run.
 - The RAM tier question is untouched here and remains open in both directions.
+
+---
+
+## 10. Decode rerun, post-fix (2026-07-24, 4 arms x 3 rounds, order rotated)
+
+DS4-Flash Q8, paging=ROCm0, resident=ROCm1, slots 5500, `-c 4096`, 128 tokens
+greedy. **Victim tier only — prefetch was OFF in every arm** (`wp::host prefetch:
+on` never logged; `host_prefetch_enqueued/read` = 0). Tier arms at 4 GB, not 8:
+an 8 GB pinned arena left only 1.1 GB available on this 16 GB box, so the harness
+now refuses to launch an arm below tier+3 GB.
+
+| arm | tok/s (3 samples) | settled | NVMe | read_wait | h2d |
+|---|---|---|---|---|---|
+| **h0** HOST, no tier | 3.298 / 3.563 / 3.577 | **3.570** | 82.72 GB | 15865 ms | 3736 ms |
+| **h4** HOST, 4 GB tier | 2.792 / 3.352 / 3.357 | 3.354 | 68.69 GB | 13478 ms | 3923 ms |
+| **p0** serial, no tier | 2.262 / 2.265 / 2.308 | 2.287 | 82.28 GB | n/a | n/a |
+| **p4** serial, 4 GB tier | 1.668 / 1.833 / 1.992 | 1.913 | 72.77 GB | n/a | n/a |
+
+"Settled" drops each arm's round-1 sample, which is consistently a cold outlier.
+All arms COHERENT.
+
+**Decode throughput doubled: h0 1.736 -> 3.570 tok/s (+106%)** from the alignment
+and compression fixes alone. Serial gained +20% (1.911 -> 2.287) — it was never
+amplified, so its gain is the removal of zstd decompression. **HOST now beats
+serial 3.570 vs 2.287**, reversing the pre-fix inversion in which the "slow"
+fallback won purely by reading 2.7x fewer bytes.
+
+Reproducibility, for future reference: `read_wait` replicates to **0.08%** on h0
+and `h2d` to 0.2%, while tok/s varies 8% on h0 and 0.1% on p0 — variance is
+**arm-dependent**, not a property of the metric. Read each arm against its own
+replicates.
+
+### 10.1 Promotion is healthy; the RAM tier's cost is a redundant memcpy
+
+Promotion H2D, measured directly over thousands of events rather than differenced:
+
+| path | per page | replication |
+|---|---|---|
+| HOST promotion (RAM -> VRAM) | **0.223 ms** | 697.6 / 690.0 / 689.9 ms (0.16%) |
+| HOST fresh-read H2D | 0.171 ms | — |
+| serial promotion | 0.322 ms | 649.5 / 647.0 / 644.2 ms (0.4%) |
+
+0.223 ms for a 4.25 MB page is **~20 GB/s** — in line with the link. The earlier
+inference of "~5.7 ms per promotion, ~30x off link speed" was **wrong by ~25x**;
+it came from differencing two noisy aggregates. Promotion was never the problem.
+
+The real cost is in the `jobs` phase:
+
+| `jobs` phase (HostTier lookup) | |
+|---|---|
+| h0 (no tier) | **1.5 ms** |
+| h4 (4 GB tier) | **1724.5 / 1704.7 ms** (1.2% spread) |
+
+`HostTier::lookup` (wp-host-tier.cpp:213) does
+`std::memcpy(dst_bytes, arena_ + offset, n)` — a **full 4.25 MB page copy on the
+eval thread, inside the mutex**, per hit. 3135 hits x 4.456 MB = **13.97 GB of
+RAM->RAM memcpy per run**, and 13.97 GB / 1.71 s = **8.2 GB/s**, exactly
+single-threaded memcpy speed on this box.
+
+**Tier ledger, settled:**
+
+| | measured | if H2D went direct from the arena |
+|---|---|---|
+| read-wait saved | **-2387 ms** | -2387 ms |
+| lookup memcpy | **+1710 ms** | ~0 |
+| h2d | +187 ms | +187 ms |
+| **net** | **-490 ms (a wash)** | **~-2200 ms (~+6% end-to-end)** |
+
+So the victim tier is not a bad idea and is not a net loss — it is **carrying an
+unnecessary host-to-host copy**. The arena is already pinned `hipHostMalloc`
+memory and could be the H2D source directly.
+
+**Constraint on that fix, so it is not mistaken for a deletion:** the copy exists
+deliberately — it lets the worker reclaim arena slots immediately after lookup
+returns. Removing it requires the slot to stay valid until the async H2D
+completes, i.e. slot pinning or a borrow/release protocol. That deserves a spec.
+
+### 10.2 Still not established
+
+- **Attribution** between the two amplification causes (512-vs-4096 alignment and
+  btrfs zstd) — both changed before any post-fix measurement.
+- **Whether these tier numbers generalise to GLM.** DS4 is 256 experts / 6 used
+  with only moderate routing skew (top 10% of instances = 41%), which is close to
+  the worst case for any cache. A coarser or more concentrated MoE should hit far
+  more often. GLM's expert count is read from GGUF metadata at load time and the
+  weights are not downloaded, so its concentration is unmeasured — a hypothesis
+  with a clear test (routing capture), not a claim.
+- **Serial-path phase visibility**: the serial arms report `read_wait`/`h2d` as 0
+  because those are HOST-path counters. Fine while HOST wins, but it means the
+  serial path is uninstrumented.
+- **8 GB tier viability on a 16 GB host.** Not viable alongside the model process;
+  roadmap P2's split sizing assumed 8 GB of RAM tier per machine and needs
+  redoing at ~4 GB.
