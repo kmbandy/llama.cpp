@@ -54,9 +54,10 @@ extern char **environ;
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
-static constexpr const char * ROUTER_ARG_GPU     = "LLAMA_ARG_ROUTER_GPU";
-static constexpr const char * ROUTER_ARG_VRAM_MB = "LLAMA_ARG_ROUTER_VRAM_MB";
-static constexpr const char * ROUTER_ARG_PINNED  = "LLAMA_ARG_ROUTER_PINNED";
+static constexpr const char * ROUTER_ARG_GPU       = "LLAMA_ARG_ROUTER_GPU";
+static constexpr const char * ROUTER_ARG_VRAM_MB   = "LLAMA_ARG_ROUTER_VRAM_MB";
+static constexpr const char * ROUTER_ARG_PINNED    = "LLAMA_ARG_ROUTER_PINNED";
+static constexpr const char * ROUTER_ARG_EXCLUSIVE = "LLAMA_ARG_ROUTER_EXCLUSIVE";
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -228,7 +229,11 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
             dev_list += dev;
         }
         preset.set_option(ctx_preset, "LLAMA_ARG_DEVICE", dev_list);
-        if (placement.exclusive) {
+        // Split/tensor-split only mean anything across MULTIPLE devices. `exclusive` is
+        // now the default for single-GPU models too (a model owns its card), so gate this
+        // on the span -- otherwise a one-GPU model gets a nonsense one-element
+        // --tensor-split of the card's byte count.
+        if (placement.exclusive && placement.devs.size() > 1) {
             preset.set_option(ctx_preset, "LLAMA_ARG_SPLIT_MODE", "layer");
             preset.set_option(ctx_preset, "LLAMA_ARG_MAIN_GPU", "0");
             if (!placement.split.empty()) {
@@ -303,6 +308,17 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
     load_models();
+    autoload_enabled.store(params.models_autoload, std::memory_order_relaxed);
+    if (params.models_idle_timeout > 0) {
+        idle_th = std::thread(&server_models::idle_sweeper_loop, this);
+    }
+}
+
+server_models::~server_models() {
+    idle_stop.store(true, std::memory_order_relaxed);
+    if (idle_th.joinable()) {
+        idle_th.join();
+    }
 }
 
 void server_models::add_model(server_model_meta && meta) {
@@ -417,6 +433,25 @@ bool server_models::load_gpu_config(const common_preset & global_preset) {
     return gpu_placement_enabled;
 }
 
+// Whether this model owns its GPU(s) outright.
+//
+// DEFAULT IS TRUE, deliberately. The VRAM ledger's best-fit placement will happily
+// co-locate two models on one card whenever they both "fit" on paper, and a bad
+// estimate then OOMs a GPU that a human may be using for something else. One model
+// per GPU unless the operator explicitly says otherwise (`no-exclusive`) is the safe
+// default: loading a model evicts whatever else is on that card, and nothing ever
+// arrives on a card behind your back.
+//
+// A multi-GPU span is always exclusive regardless -- that predates this and is
+// independent (it needs the whole set to tensor-split across).
+bool server_models::model_wants_exclusive(const server_model_meta & meta) {
+    std::string v;
+    if (meta.preset.get_option(ROUTER_ARG_EXCLUSIVE, v)) {
+        return common_arg_utils::is_truthy(v);
+    }
+    return true;
+}
+
 void server_models::parse_model_placement(server_model_meta & meta) {
     meta.placement = {};
     std::string pinned;
@@ -438,7 +473,7 @@ void server_models::parse_model_placement(server_model_meta & meta) {
             meta.placement.devs.push_back(dev);
         }
     }
-    meta.placement.exclusive = meta.placement.devs.size() > 1;
+    meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
 
     std::string split_str;
     if (meta.preset.get_option("LLAMA_ARG_TENSOR_SPLIT", split_str)) {
@@ -709,7 +744,11 @@ std::vector<std::string> server_models::choose_gpu_evictions_locked(const std::s
             continue;
         }
         if (inst.meta.placement.pinned) {
-            throw std::runtime_error("spanning model '" + name + "' cannot evict pinned resident '" + other_name + "'");
+            // A pinned resident is a hard hold: it makes its GPU unavailable to every
+            // other model until a human unpins it. This is what protects an in-flight
+            // kernel/weight-paging experiment from having a model dropped on top of it.
+            throw std::runtime_error("model '" + name + "' cannot load: GPU is held by pinned model '"
+                                     + other_name + "' (unpin it first)");
         }
         evict.push_back(other_name);
     }
@@ -737,7 +776,10 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             throw std::runtime_error("model '" + name + "' references unknown GPU slot '" + dev + "'");
         }
     }
-    meta.placement.exclusive = meta.placement.devs.size() > 1;
+    // NOTE: this must OR with the parsed option, not overwrite it -- otherwise a
+    // single-GPU model silently loses its exclusivity here and the ledger is free to
+    // co-locate something alongside it.
+    meta.placement.exclusive = model_wants_exclusive(meta) || meta.placement.devs.size() > 1;
 
     std::vector<int64_t> needs;
     lk.unlock();
@@ -750,7 +792,11 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
     lk.lock();
 
     if (meta.placement.exclusive) {
-        if (meta.placement.split.empty()) {
+        // Split weights only mean something across a MULTI-GPU span. Single-GPU models are
+        // exclusive by default now, so gate ONLY this on the span -- everything below
+        // (need_bytes, eviction, reservation) must still run for a one-card model, or
+        // exclusivity silently stops evicting and two models land on the same GPU.
+        if (meta.placement.split.empty() && meta.placement.devs.size() > 1) {
             for (const auto & dev : meta.placement.devs) {
                 const int slot_idx = find_slot_index(gpu_slots, dev);
                 meta.placement.split.push_back((float) gpu_slots[slot_idx].total_bytes);
@@ -774,7 +820,7 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
         std::vector<std::string> evict = choose_gpu_evictions_locked(name, meta.placement);
         reserve_gpu_placement_locked(name, meta.placement);
         for (const auto & victim : evict) {
-            SRV_INF("router placement evicting name=%s for spanning model %s\n", victim.c_str(), name.c_str());
+            SRV_INF("router placement: evicting %s to make room for %s (exclusive: one model per GPU)\n", victim.c_str(), name.c_str());
             stopping_models.insert(victim);
             auto it = mapping.find(victim);
             if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
@@ -1966,9 +2012,17 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     if (!meta->is_running()) {
         throw std::invalid_argument("model name=" + name + " is not running");
     }
-    if (update_last_used) {
+    {
+        // Count this request as in flight for the whole life of the proxy (see the cleanup
+        // chain below). last_used alone is not enough: it is stamped HERE, at request start,
+        // so a 20-minute generation looks idle to the sweeper and would be unloaded
+        // mid-stream. Do this regardless of update_last_used -- a health poll still keeps
+        // the model alive for its duration, which is correct and costs nothing.
         std::unique_lock<std::mutex> lk(mutex);
-        mapping[name].meta.last_used = ggml_time_ms();
+        mapping[name].inflight++;
+        if (update_last_used) {
+            mapping[name].meta.last_used = ggml_time_ms();
+        }
     }
     SRV_INF("proxying request to model %s on port %d\n", name.c_str(), meta->port);
     std::string proxy_path = req.path;
@@ -1988,7 +2042,79 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             base_params.timeout_read,
             base_params.timeout_write
             );
+
+    // Chain onto the proxy's own cleanup (it sets one in its ctor -- do NOT clobber it).
+    // When the proxy dies the request is done, so drop the in-flight count and re-stamp
+    // last_used: the idle clock should start when the response ENDS, not when it began.
+    auto prev_cleanup = proxy->cleanup;
+    proxy->cleanup = [this, name, prev_cleanup]() {
+        if (prev_cleanup) {
+            prev_cleanup();
+        }
+        std::unique_lock<std::mutex> lk(mutex);
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            if (it->second.inflight > 0) {
+                it->second.inflight--;
+            }
+            it->second.meta.last_used = ggml_time_ms();
+        }
+    };
     return proxy;
+}
+
+// Unload models that have gone quiet. This is what makes the fleet give the machine back:
+// an idle model holds its whole GPU (exclusive placement) AND its host-side KV tier, which
+// on a 15 GB box is gigabytes of RAM sitting there doing nothing.
+//
+// Two hard rules:
+//   - never unload a model with a request in flight (a generation can run for many minutes
+//     with no new request, so last_used alone would kill it mid-stream);
+//   - never unload a pinned model (pinning is a human saying "leave this alone").
+void server_models::idle_sweeper_loop() {
+    const int timeout_s = base_params.models_idle_timeout;
+    if (timeout_s <= 0) {
+        return;
+    }
+    SRV_INF("router idle sweeper: models unload after %ds idle\n", timeout_s);
+
+    while (!idle_stop.load(std::memory_order_relaxed)) {
+        for (int i = 0; i < 10 && !idle_stop.load(std::memory_order_relaxed); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (idle_stop.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        std::vector<std::string> victims;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            const int64_t now = ggml_time_ms();
+            for (const auto & [name, inst] : mapping) {
+                if (!inst.meta.is_running() || stopping_models.count(name)) {
+                    continue;
+                }
+                if (inst.meta.placement.pinned || inst.inflight > 0) {
+                    continue;
+                }
+                if (inst.meta.last_used <= 0) {
+                    continue; // never served a request; leave it to LRU/eviction
+                }
+                if (now - inst.meta.last_used >= (int64_t) timeout_s * 1000) {
+                    victims.push_back(name);
+                }
+            }
+        }
+        for (const auto & name : victims) {
+            SRV_INF("router idle sweeper: unloading %s (idle > %ds); GPU and host KV released\n",
+                    name.c_str(), timeout_s);
+            try {
+                unload(name);
+            } catch (const std::exception & e) {
+                SRV_WRN("router idle sweeper: failed to unload %s: %s\n", name.c_str(), e.what());
+            }
+        }
+    }
 }
 
 void server_models::handle_child_state(const std::string & name, const std::string & raw_input) {
@@ -2318,7 +2444,13 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     return true;
 }
 
-static bool is_autoload(const common_params & params, const server_http_req & req) {
+static bool is_autoload(const common_params & params, const server_http_req & req, const server_models & models) {
+    // The runtime master switch wins over everything, including an explicit
+    // ?autoload=true on the request. When a human has taken the GPUs back, no request
+    // gets to bring a model up behind their back.
+    if (!models.autoload_enabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
     std::string autoload = req.get_param("autoload");
     if (autoload.empty()) {
         return params.models_autoload;
@@ -2459,7 +2591,7 @@ void server_models_routes::init_routes() {
     this->proxy_get = [this](const server_http_req & req) {
         std::string method = "GET";
         std::string name = req.get_param("model");
-        bool autoload = is_autoload(params, req);
+        bool autoload = is_autoload(params, req, models);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
@@ -2478,7 +2610,7 @@ void server_models_routes::init_routes() {
             json body = json::parse(req.body);
             name = json_value(body, "model", std::string());
         }
-        bool autoload = is_autoload(params, req);
+        bool autoload = is_autoload(params, req, models);
         auto error_res = std::make_unique<server_http_res>();
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
@@ -2578,6 +2710,7 @@ void server_models_routes::init_routes() {
                 {"devices", meta.placement.devs},
                 {"split", meta.placement.split},
                 {"pinned", meta.placement.pinned},
+                {"exclusive", meta.placement.exclusive},
                 {"need_bytes", meta.placement.need_bytes_per_dev},
             };
             model_info["placement"] = placement;
@@ -2615,6 +2748,38 @@ void server_models_routes::init_routes() {
         }
         models.unload(model->name);
         res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    // Master switch. POST /models/autoload {"enabled": false, "unload_all": true}
+    //
+    // This exists so a human can take the GPUs back without stopping the router: while
+    // disabled, no request can bring a model up. `unload_all` additionally evicts what
+    // is already resident, so you can go from "the fleet is using both cards" to "both
+    // cards are mine" in one call -- the point being that nothing can then decide to
+    // load a 29 GB model into the card you are gaming on.
+    this->post_router_models_autoload = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!body.contains("enabled")) {
+            res_err(res, format_error_response("'enabled' (bool) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const bool enabled = json_value(body, "enabled", true);
+        models.autoload_enabled.store(enabled, std::memory_order_relaxed);
+        SRV_INF("router autoload %s by request\n", enabled ? "ENABLED" : "DISABLED");
+
+        json unloaded = json::array();
+        if (!enabled && json_value(body, "unload_all", false)) {
+            for (const auto & meta : models.get_all_meta()) {
+                if (meta.is_running()) {
+                    models.unload(meta.name);
+                    unloaded.push_back(meta.name);
+                }
+            }
+            SRV_INF("router unloaded %zu model(s); GPUs released\n", unloaded.size());
+        }
+        res_ok(res, {{"autoload", enabled}, {"unloaded", unloaded}});
         return res;
     };
 

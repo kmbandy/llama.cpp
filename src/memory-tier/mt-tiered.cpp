@@ -360,9 +360,10 @@ std::vector<float> llama_memory_tiered::embed_text(const std::string & text, Emb
     if (cfg_.semantic_index.empty()) {
         return {};
     }
-    if (!embed_model_) {
-        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
-    }
+    std::call_once(embed_model_once_, [this]() {
+        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index, cfg_.semantic_parallel, cfg_.semantic_threads,
+                                                       cfg_.semantic_query_prefix, cfg_.semantic_doc_prefix);
+    });
     return embed_model_->embed(text, role);
 }
 
@@ -371,9 +372,10 @@ std::vector<std::vector<float>> llama_memory_tiered::embed_text_batch(const std:
     if (cfg_.semantic_index.empty()) {
         return std::vector<std::vector<float>>(texts.size());
     }
-    if (!embed_model_) {
-        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index);
-    }
+    std::call_once(embed_model_once_, [this]() {
+        embed_model_ = std::make_unique<EmbeddingModel>(cfg_.semantic_index, cfg_.semantic_parallel, cfg_.semantic_threads,
+                                                       cfg_.semantic_query_prefix, cfg_.semantic_doc_prefix);
+    });
     return embed_model_->embed_batch(texts, role);
 }
 

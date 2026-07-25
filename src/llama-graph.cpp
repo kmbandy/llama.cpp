@@ -3037,6 +3037,16 @@ ggml_tensor * llm_graph_context::build_attn(
             k_cast, v_cast,
             inp->paged_slot_mapping,
             block_size, n_kv_heads, kq_scale);
+        // MAD-348: thread this graph's true per-seq max q_len into op_params[4].
+        // The CUDA flash-decode gate needs the PER-SEQ q_len (the decode kernel
+        // processes one seq per block), but only had total_q_tokens on host — a
+        // sum-across-seqs over-estimate that forced GQA-4 x par>4 pure decode
+        // onto the 24x-slower scalar kernel (mt_paged_attention_kernel). For an
+        // equal_seqs ubatch every seq has n_seq_tokens; otherwise n_tokens is a
+        // safe upper bound (never under-gates -> no per-block DECODE_MAX_Q
+        // overflow). 0 would mean "unset" -> dispatch keeps the old behavior.
+        cur->op_params[4] = ubatch.equal_seqs() ? (int32_t) ubatch.n_seq_tokens
+                                                : (int32_t) ubatch.n_tokens;
         cb(cur, "kqv_paged_out", il);
 
         // 5) Cast back to F32 to match the regular path's contract — the

@@ -612,6 +612,9 @@ bool llama_kv_cache_paged::evict_block_to_warm(llama_seq_id seq_id, uint32_t log
     table_.swap_block(seq_id, logical_block, cpu_physical);
     pool_.free_block(gpu_physical);
     ++evict_h2w_total_;  // MAD-133
+    if (!has_paged_fingerprint(seq_id, logical_block)) {
+        pending_fp_evicted_.emplace_back(seq_id, logical_block);
+    }
     return true;
 }
 
@@ -1462,15 +1465,38 @@ void llama_kv_cache_paged::prepare_batch_tensors() {
         for (uint32_t b = 0; b < n_blk; ++b) {
             // Layout is [max_blocks_per_seq, n_seq_max] in ggml-style
             // ne[0]=max_bps fastest-changing, ne[1]=n_seq_max.
+            //
+            // MAD-348: the GPU attention kernels index k_cache/v_cache by this
+            // entry as a GPU physical, and mask the token when it == -1
+            // (kInvalidBlockTableEntry). A block that lives in WARM/COLD has a
+            // valid physical id >= n_blocks_total_ that is NOT a GPU address —
+            // writing it here makes the kernel read out-of-bounds GPU memory
+            // ("Page not present" fault). Only GPU-resident blocks belong in the
+            // GPU block table; a non-resident block is masked (kInvalidBlockTableEntry)
+            // so the kernel skips it. The tier machinery (fault-in + semantic
+            // prefetch) decides which blocks are resident; the rest are simply
+            // not attended this step.
+            const uint32_t phys = table_.get_physical((llama_seq_id) s, b);
             h_block_table_[(size_t) s * max_blocks_per_seq_ + b] =
-                (int32_t) table_.get_physical((llama_seq_id) s, b);
+                pool_.is_gpu(phys) ? (int32_t) phys : kInvalidBlockTableEntry;
         }
         h_context_lens_[s] = (int32_t) std::max<llama_pos>(0, seq_states_[s].pos_max + 1);
         // q_lens is filled by init_batch when it knows the ubatch shape.
     }
 
-    ggml_backend_tensor_set(block_table_,  h_block_table_.data(),  0,
-                            sizeof(int32_t) * h_block_table_.size());
+    // MAD-348: skip the synchronous full-table H2D upload when the block table
+    // is unchanged since the last upload. The table is append-only across decode
+    // steps (a new block only every block_size tokens), so ~15/16 steps upload an
+    // identical table -- a per-step pipeline stall that left the GPU ~38% idle at
+    // par128 and pinned aggregate decode flat with concurrency. Content-compared
+    // (not a dirty flag), so every logical change -- alloc, evict, tier-move,
+    // restore -- is caught via the rebuilt h_block_table_. prepare_batch_tensors
+    // is the ONLY writer of block_table_ (verified), so the shadow stays accurate.
+    if (h_block_table_gpu_ != h_block_table_) {
+        ggml_backend_tensor_set(block_table_,  h_block_table_.data(),  0,
+                                sizeof(int32_t) * h_block_table_.size());
+        h_block_table_gpu_ = h_block_table_;
+    }
     // MAD-114: context_lens and q_lens are no longer uploaded here.
     // They're per-graph now (allocated in build_attn_inp_kv_paged_impl,
     // populated by the corresponding set_input from these host mirrors).

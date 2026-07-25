@@ -99,6 +99,22 @@ static int get_paged_decode_mode() {
     return mode;
 }
 
+// MAD-348: minimum allocated ctx for the flash-decode gate. The old hard-coded
+// 8192 floor forced SHORT-context, HIGH-concurrency decode (e.g. the synth
+// workload: par128 x ~400-tok ctx) onto the scalar kernel, which at high par is
+// ~12 ms/call and eats ~64% of GPU time. Measured: flash-decode wins there too.
+// Default lowered to 512 (a couple of chunks) and env-tunable per the original
+// "tune later via env var" note; set GGML_PAGED_DECODE_MIN_CTX to override.
+static int get_paged_decode_min_ctx() {
+    static int v = -1;
+    if (v < 0) {
+        const char * env = std::getenv("GGML_PAGED_DECODE_MIN_CTX");
+        v = env ? std::max(0, atoi(env)) : 512;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_DECODE_MIN_CTX=%d (flash-decode ctx floor)\n", v);
+    }
+    return v;
+}
+
 // ───────────────────────── helpers ─────────────────────────
 
 // Warp-level reduce across 32 lanes. HIP wavefronts can be 64 lanes, while
@@ -1639,6 +1655,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int32_t block_size  = ((const int32_t *)(op_params_f + 1))[0];
     const int32_t max_bps     = ((const int32_t *)(op_params_f + 2))[0];
     const int32_t n_kv_heads  = ((const int32_t *)(op_params_f + 3))[0];
+    // MAD-348: true per-seq max q_len from the graph builder. 0 => legacy caller
+    // that didn't set it; fall back to total_q_tokens (the old over-estimate).
+    const int32_t max_q_len_param = ((const int32_t *)(op_params_f + 4))[0];
 
     const int head_size = q->ne[0];
     const int n_heads   = q->ne[1];
@@ -1701,7 +1720,17 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // no longer gated on wmma_ok. GGML_PAGED_TILE=0 reverts to the slow
                 // scalar prefill kernel. (Multi-warp variant stays WMMA-only below.)
                 const bool tile_gate_on      = tile_env_on;
-                if (tile_gate_on && avg_q_len >= 16) {
+                // MAD-348: avg_q_len (total_q_tokens/num_seqs) is dilution-prone —
+                // at high concurrency a big-q prefill seq batched with many q=1
+                // decode seqs averages below 16 and wrongly falls to the slow
+                // scalar kernel (rocprof: scalar mt_paged_attention_kernel = 47%
+                // of paged GPU time). Gate on the TRUE per-seq max q_len
+                // (op_params[4]) — the same fix already applied to the decode gate
+                // below — so prefill always reaches the fast tile kernel regardless
+                // of decode dilution. Falls back to avg_q_len when the param is unset.
+                const int  tile_gate_q_len   = (max_q_len_param > 0) ? (int) max_q_len_param
+                                                                     : avg_q_len;
+                if (tile_gate_on && tile_gate_q_len >= 16) {
                     if (probe_on) {
                         int n = probe_tile.fetch_add(1, std::memory_order_relaxed);
                         if (probe_verbose || n == 0) {
@@ -1792,10 +1821,19 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // long as the product stays under DECODE_MAX_Q.
                 const int  num_queries_per_kv = n_heads / n_kv_heads;
                 const int  decode_max_q       = 16;  // matches DECODE_MAX_Q
+                // MAD-348: the decode kernel processes ONE seq per block, so the
+                // DECODE_MAX_Q bound is per-seq (num_queries_per_kv * this seq's
+                // q_len), NOT the whole batch. Gate on the true per-seq max q_len
+                // (op_params[4]); total_q_tokens is a sum-across-seqs over-estimate
+                // that wrongly forced GQA-4 x par>4 pure decode (4*8=32 > 16) onto
+                // the scalar kernel even though each block only does 4 queries.
+                // Fall back to total_q_tokens when the param is unset (== 0).
+                const int  gate_q_len = (max_q_len_param > 0) ? (int) max_q_len_param
+                                                              : total_q_tokens;
                 const bool decode_gate_on = decode_env_on
-                                            && (total_q_tokens >= 1) && (total_q_tokens <= 8)
-                                            && (num_queries_per_kv * total_q_tokens <= decode_max_q)
-                                            && (max_ctx_len >= 8192);
+                                            && (gate_q_len >= 1) && (gate_q_len <= 8)
+                                            && (num_queries_per_kv * gate_q_len <= decode_max_q)
+                                            && (max_ctx_len >= get_paged_decode_min_ctx());
                 if (decode_gate_on) {
                     if (probe_on) {
                         int n = probe_decode.fetch_add(1, std::memory_order_relaxed);
@@ -1816,7 +1854,12 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                         num_seqs, (int) k_cur->ne[2], n_kv_heads, stream);
 
                     const int num_chunks    = paged_attn_decode_num_chunks(max_ctx_len);
-                    const int max_q_len     = total_q_tokens;  // partials inner stride: must be >= max per-seq q_len. avg_q_len = total/num_seqs floors to 0 with idle parallel slots (1 active + N idle), collapsing every head/seq/chunk partial offset to 0 -> OOB corruption. total_q_tokens (gate-capped <= 8) is a safe upper bound.
+                    // Partials inner stride must be >= every seq's q_len. gate_q_len
+                    // is the true per-seq max (op_params[4], equal_seqs: n_seq_tokens;
+                    // else n_tokens) -> exact/safe upper bound, and correctly sized
+                    // (was total_q_tokens, an 8x over-allocation at par8 decode).
+                    // Falls back to total_q_tokens when op_params[4] is unset.
+                    const int max_q_len     = gate_q_len;
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
                                             * (size_t) num_chunks * (size_t) max_q_len
                                             * (size_t) (HS + 2);

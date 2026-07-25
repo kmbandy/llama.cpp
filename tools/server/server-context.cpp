@@ -24,12 +24,18 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -256,6 +262,9 @@ struct server_batch {
 
 struct server_slot {
     int id;
+
+    // Invalidates fingerprint jobs when this slot is released or reused.
+    uint64_t fp_epoch = 0;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -604,6 +613,8 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            ++fp_epoch;
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1038,6 +1049,29 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    struct fp_job {
+        llama_seq_id seq;
+        uint32_t     lblock;
+        uint64_t     epoch;
+        std::string  text;
+    };
+
+    struct fp_result {
+        llama_seq_id     seq;
+        uint32_t         lblock;
+        uint64_t         epoch;
+        std::vector<float> emb;
+    };
+
+    std::thread                fp_worker_;
+    std::mutex                 fp_job_mtx_;
+    std::condition_variable    fp_job_cv_;
+    std::deque<fp_job>         fp_jobs_;
+    std::mutex                 fp_res_mtx_;
+    std::deque<fp_result>      fp_results_;
+    std::atomic<bool>          fp_worker_stop_{false};
+    mt::llama_memory_tiered *  fp_embedder_ = nullptr;
+
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1059,7 +1093,166 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    void start_fp_worker(mt::llama_memory_tiered * mt_tier) {
+        if (fp_worker_.joinable()) {
+            return;
+        }
+
+        fp_embedder_ = mt_tier;
+        fp_worker_stop_.store(false);
+        fp_worker_ = std::thread([this] {
+            for (;;) {
+                std::vector<fp_job> batch;
+                {
+                    std::unique_lock<std::mutex> lock(fp_job_mtx_);
+                    fp_job_cv_.wait(lock, [this] {
+                        return fp_worker_stop_.load() || !fp_jobs_.empty();
+                    });
+                    if (fp_worker_stop_.load() && fp_jobs_.empty()) {
+                        return;
+                    }
+                    while (!fp_jobs_.empty() && batch.size() < 16) {
+                        batch.push_back(std::move(fp_jobs_.front()));
+                        fp_jobs_.pop_front();
+                    }
+                }
+
+                std::vector<std::string> texts;
+                texts.reserve(batch.size());
+                for (const fp_job & job : batch) {
+                    texts.push_back(job.text);
+                }
+
+                const auto embeddings = fp_embedder_->embed_text_batch(texts);
+                {
+                    std::lock_guard<std::mutex> lock(fp_res_mtx_);
+                    for (size_t i = 0; i < batch.size(); ++i) {
+                        if (i >= embeddings.size() || embeddings[i].empty()) {
+                            continue;
+                        }
+                        fp_results_.push_back({
+                            batch[i].seq,
+                            batch[i].lblock,
+                            batch[i].epoch,
+                            embeddings[i],
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    void stop_fp_worker() {
+        fp_worker_stop_.store(true);
+        fp_job_cv_.notify_all();
+        if (fp_worker_.joinable()) {
+            fp_worker_.join();
+        }
+
+        fp_embedder_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(fp_job_mtx_);
+            fp_jobs_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(fp_res_mtx_);
+            fp_results_.clear();
+        }
+    }
+
+    void drain_paged_fingerprints() {
+        if (!params_base.kv_tier_paged_blocks) {
+            return;
+        }
+
+        auto * paged_cache = mt_get_paged_cache(llama_get_memory(ctx_tgt));
+        if (!paged_cache) {
+            return;
+        }
+
+        // Always drain the eviction queue on the inference thread, even when the
+        // semantic index is off, so pending_fp_evicted_ cannot grow without bound
+        // on a tiered-but-nosem run that evicts (the evict_block_to_warm hook
+        // records unconditionally).
+        auto evicted = paged_cache->take_pending_fp_evicted();
+
+        if (params_base.kv_semantic_index.empty()) {
+            return;  // semantic off: nothing to fingerprint, queue already cleared
+        }
+
+        auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx_tgt));
+        if (!mt_tier) {
+            return;
+        }
+
+        start_fp_worker(mt_tier);
+
+        if (!evicted.empty()) {
+            // Backpressure: eviction can outrun the ~285 ms CPU embed. If the
+            // worker is already far behind, drop new jobs rather than grow the
+            // queue (and the detokenize cost) unboundedly. Fingerprinting is
+            // best-effort — a dropped block simply isn't semantically restorable
+            // until it is re-evicted with the worker caught up.
+            constexpr size_t kMaxPendingJobs = 512;
+            size_t backlog;
+            {
+                std::lock_guard<std::mutex> lock(fp_job_mtx_);
+                backlog = fp_jobs_.size();
+            }
+            if (backlog < kMaxPendingJobs) {
+                const uint32_t bsize = (uint32_t) std::max(1, params_base.kv_tier_paged_block_size);
+                std::vector<fp_job> jobs;
+                jobs.reserve(evicted.size());
+                for (const auto & [seq, lblock] : evicted) {
+                    server_slot * slot = get_slot_by_id(seq);
+                    if (!slot) {
+                        continue;
+                    }
+
+                    const auto & toks = slot->prompt.tokens.get_text_tokens();
+                    const int p0 = (int) lblock * (int) bsize;
+                    const int p1 = p0 + (int) bsize;
+                    if (p1 > (int) toks.size()) {
+                        continue;
+                    }
+
+                    llama_tokens chunk(toks.begin() + p0, toks.begin() + p1);
+                    jobs.push_back({
+                        seq,
+                        lblock,
+                        slot->fp_epoch,
+                        common_detokenize(ctx_tgt, chunk, /*special=*/ false),
+                    });
+                }
+
+                if (!jobs.empty()) {
+                    std::lock_guard<std::mutex> lock(fp_job_mtx_);
+                    for (fp_job & job : jobs) {
+                        fp_jobs_.push_back(std::move(job));
+                    }
+                    fp_job_cv_.notify_one();
+                }
+            }
+        }
+
+        std::deque<fp_result> done;
+        {
+            std::lock_guard<std::mutex> lock(fp_res_mtx_);
+            done.swap(fp_results_);
+        }
+        for (fp_result & result : done) {
+            server_slot * slot = get_slot_by_id(result.seq);
+            if (!slot || slot->fp_epoch != result.epoch) {
+                continue;
+            }
+            paged_cache->record_paged_block_fingerprint(
+                result.seq, result.lblock, std::move(result.emb), mt::SemanticIndex::Tier::Warm);
+        }
+    }
+
     void destroy() {
+        stop_fp_worker();
+
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -2069,6 +2262,7 @@ private:
             slot.smpl.reset();
         }
 
+        ++slot.fp_epoch;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -3120,6 +3314,8 @@ private:
         }
 #endif
 
+        drain_paged_fingerprints();
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3164,6 +3360,7 @@ private:
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
+                drain_paged_fingerprints();
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3675,35 +3872,57 @@ private:
                             // is the active memory.
                             if (auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx_tgt))) {
                                 if (!params_base.kv_semantic_index.empty() && !input_tokens.has_mtmd) {
-                                    // Embed the new prompt (or its leading window).
-                                    // bge-small caps at ~512 tokens; truncate the
-                                    // prompt to that for the query embedding.
-                                    const auto & qtoks = input_tokens.get_text_tokens();
-                                    const int q_max = std::min<int>(512, (int) qtoks.size());
-                                    if (q_max > 0) {
-                                        llama_tokens q(qtoks.begin(), qtoks.begin() + q_max);
-                                        const std::string qtext = common_detokenize(ctx_tgt, q, /*special=*/ false);
-                                        const auto qemb = mt_tier->embed_text(qtext, mt::EmbedRole::Query);
-                                        if (!qemb.empty()) {
-                                            // MAD-122/125: paged-blocks routes through
-                                            // llama_kv_cache_paged (the active tier
-                                            // layer for hybrid+paged). Non-paged falls
-                                            // back to the chunk-level wrapper path.
-                                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
-                                                ? mt_get_paged_cache(llama_get_memory(ctx_tgt)) : nullptr;
-                                            const uint32_t restored = paged_cache
-                                                ? paged_cache->restore_semantic_paged(
-                                                      slot.id, qemb,
-                                                      params_base.kv_semantic_top_k,
-                                                      params_base.kv_semantic_threshold)
-                                                : mt_tier->restore_semantic(
-                                                      slot.id, qemb,
-                                                      params_base.kv_semantic_top_k,
-                                                      params_base.kv_semantic_threshold);
-                                            if (restored > 0) {
-                                                SLT_INF(slot, "tier semantic: restored %u positions/blocks via cosine search (%s path)\n",
-                                                        restored,
-                                                        paged_cache ? "paged-block" : "chunk");
+                                    // MAD-122/125: paged-blocks routes through
+                                    // llama_kv_cache_paged (the active tier
+                                    // layer for hybrid+paged). Non-paged falls
+                                    // back to the chunk-level wrapper path.
+                                    llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
+                                        ? mt_get_paged_cache(llama_get_memory(ctx_tgt)) : nullptr;
+
+                                    // MAD-348: do NOT pay an embedder forward pass to
+                                    // build a query vector for a search that provably
+                                    // cannot return anything. restore_semantic_paged()
+                                    // only acts on fingerprinted blocks that are mapped
+                                    // and NOT already hot; if every block is resident,
+                                    // it returns 0 no matter what the query vector is.
+                                    //
+                                    // This is not a micro-optimisation. The embed runs
+                                    // SYNCHRONOUSLY on the single-threaded server loop
+                                    // (measured: ~285 ms/call, CPU embedder), so every
+                                    // wasted call stalls the batch carrying every other
+                                    // slot's decode token. On a short-context, high
+                                    // fan-out workload nothing is ever evicted, so this
+                                    // fired on every request and restored nothing.
+                                    const bool can_restore = paged_cache
+                                        ? paged_cache->has_restorable_blocks(slot.id)
+                                        : true;  // chunk path has no cheap predicate; unchanged
+
+
+                                    if (can_restore) {
+                                        // Embed the new prompt (or its leading window).
+                                        // bge-small caps at ~512 tokens; truncate the
+                                        // prompt to that for the query embedding.
+                                        const auto & qtoks = input_tokens.get_text_tokens();
+                                        const int q_max = std::min<int>(512, (int) qtoks.size());
+                                        if (q_max > 0) {
+                                            llama_tokens q(qtoks.begin(), qtoks.begin() + q_max);
+                                            const std::string qtext = common_detokenize(ctx_tgt, q, /*special=*/ false);
+                                            const auto qemb = mt_tier->embed_text(qtext, mt::EmbedRole::Query);
+                                            if (!qemb.empty()) {
+                                                const uint32_t restored = paged_cache
+                                                    ? paged_cache->restore_semantic_paged(
+                                                          slot.id, qemb,
+                                                          params_base.kv_semantic_top_k,
+                                                          params_base.kv_semantic_threshold)
+                                                    : mt_tier->restore_semantic(
+                                                          slot.id, qemb,
+                                                          params_base.kv_semantic_top_k,
+                                                          params_base.kv_semantic_threshold);
+                                                if (restored > 0) {
+                                                    SLT_INF(slot, "tier semantic: restored %u positions/blocks via cosine search (%s path)\n",
+                                                            restored,
+                                                            paged_cache ? "paged-block" : "chunk");
+                                                }
                                             }
                                         }
                                     }
@@ -4088,71 +4307,6 @@ private:
 
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.size());
-
-                        // MAD-129: prefill-time semantic fingerprint trigger.
-                        // Walk the seq's COMPLETE blocks (skip the partial last
-                        // block, which fills on the next prefill) and embed any
-                        // that don't already have a fingerprint. Skip-already-
-                        // fingerprinted via has_paged_fingerprint keeps
-                        // multi-turn cost bounded — only NEW blocks (the
-                        // accumulated assistant response from the prior turn)
-                        // get embedded on each turn's prefill.
-                        //
-                        // Why here vs proactive-backup: the chunk-level trigger
-                        // at the proactive-backup site doesn't fire for
-                        // hybrid+paged because the server's eviction threshold
-                        // uses full ctx (cap arithmetic returns 0 for
-                        // hybrid+paged) so the trigger never crosses. And
-                        // eviction in the paged cache is internal — the server
-                        // doesn't see those events anyway. Per Epic A2:
-                        // write at prefill, not at eviction.
-                        if (!params_base.kv_semantic_index.empty() && !slot.prompt.tokens.has_mtmd) {
-                            llama_kv_cache_paged * paged_cache = params_base.kv_tier_paged_blocks
-                                ? mt_get_paged_cache(llama_get_memory(ctx_tgt)) : nullptr;
-                            auto * mt_tier = dynamic_cast<mt::llama_memory_tiered *>(llama_get_memory(ctx_tgt));
-
-                            if (paged_cache && mt_tier) {
-                                const uint32_t bsize = (uint32_t) std::max(1, params_base.kv_tier_paged_block_size);
-                                const auto & toks = slot.prompt.tokens.get_text_tokens();
-                                const int n_toks = (int) toks.size();
-                                const int n_complete_blocks = n_toks / (int) bsize;
-
-                                std::vector<uint32_t> new_lblocks;
-                                std::vector<std::string> new_texts;
-                                int n_skipped_existing = 0;
-                                for (int lb = 0; lb < n_complete_blocks; ++lb) {
-                                    if (paged_cache->has_paged_fingerprint(slot.id, (uint32_t) lb)) {
-                                        ++n_skipped_existing;
-                                        continue;
-                                    }
-                                    const int p0 = lb * (int) bsize;
-                                    const int p1 = p0 + (int) bsize;
-                                    llama_tokens chunk(toks.begin() + p0, toks.begin() + p1);
-                                    const std::string text = common_detokenize(ctx_tgt, chunk, /*special=*/ false);
-                                    new_lblocks.push_back((uint32_t) lb);
-                                    new_texts.push_back(text);
-                                }
-
-                                const auto embeddings = mt_tier->embed_text_batch(new_texts);
-                                int n_new_fp = 0;
-                                for (size_t i = 0; i < embeddings.size(); ++i) {
-                                    if (embeddings[i].empty()) continue;
-                                    paged_cache->record_paged_block_fingerprint(
-                                        slot.id, new_lblocks[i], embeddings[i],
-                                        mt::SemanticIndex::Tier::Hot);
-                                    ++n_new_fp;
-                                }
-
-                                if (n_new_fp > 0 || n_skipped_existing > 0) {
-                                    SLT_INF(slot, "tier semantic: prefill fingerprint sweep — "
-                                            "%d new, %d already-fingerprinted, %d total complete blocks "
-                                            "(of %d total tokens, partial tail block of %d slots not "
-                                            "yet embedded)\n",
-                                            n_new_fp, n_skipped_existing, n_complete_blocks,
-                                            n_toks, n_toks % (int) bsize);
-                                }
-                            }
-                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt

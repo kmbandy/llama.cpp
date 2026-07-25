@@ -122,6 +122,103 @@ int main(int argc, char * argv[]) {
         (void) restored;
         assert(cache.semantic_attempts_total() == attempts_before + 1);
         printf("test-paged-semantic: restore_semantic_paged attempts counter ticks ok\n");
+
+        // ─── MAD-348: has_restorable_blocks() is the server's precondition ───
+        //
+        // The server uses this to decide whether to pay a ~285 ms embedder
+        // forward pass (on its single-threaded inference loop) to build a query
+        // vector. The SAFETY PROPERTY is one-directional and absolute:
+        //
+        //     restore_semantic_paged() can restore > 0  ==>  has_restorable_blocks()
+        //
+        // A false negative silently disables semantic prefetch — a quality
+        // regression that no throughput number would ever reveal. A false
+        // positive only costs the embed we would have paid anyway.
+        //
+        // Right now every block for seq 0 is hot, so a restore is a provable
+        // no-op and the guard MUST say so.
+        assert(!cache.has_restorable_blocks(0) &&
+               "all blocks hot => restore is a no-op => guard must be false");
+
+        // A seq with no fingerprints at all can never restore either.
+        assert(!cache.has_restorable_blocks(1) && "no fingerprints => guard must be false");
+
+        // Now evict a FINGERPRINTED block to warm. That block is no longer on
+        // the GPU, so restore_semantic_paged() can genuinely fault it back —
+        // and therefore the guard MUST now open the gate. This is the case that
+        // would break semantic prefetch if the predicate were too aggressive.
+        const bool evicted = cache.evict_block_to_warm(/*seq*/ 0, /*logical_block=*/ 0);
+        assert(evicted && "test setup: expected lblock 0 to evict to warm");
+
+        assert(cache.has_restorable_blocks(0) &&
+               "a fingerprinted block lives off-GPU => guard MUST allow the restore");
+
+        // And the guard must agree with reality: the restore it just permitted
+        // actually does restore the evicted block.
+        const uint32_t restored_after_evict = cache.restore_semantic_paged(
+            /*seq*/ 0, normed({1, 0, 0, 0}), /*top_k=*/2, /*threshold=*/0.5f);
+        assert(restored_after_evict >= 1 &&
+               "guard said restorable, so the restore must actually restore something");
+
+        // Having faulted it back in, everything is hot again — the gate closes.
+        assert(!cache.has_restorable_blocks(0) &&
+               "after restore everything is hot again => guard must be false");
+
+        printf("test-paged-semantic: has_restorable_blocks guard (MAD-348) ok\n");
+
+        // ─── MAD-348: the restore THRESHOLD must admit real-world similarities ───
+        //
+        // mt-semantic.cpp gates hints with `if (s < threshold) break;`. The default used
+        // to be 0.65, inherited from bge/sentence-transformers, whose cosine scores run
+        // hot. LFM2.5-Embedding-350M's do not. Measured 2026-07-14 over 12 passage/query
+        // pairs (144 pairings):
+        //
+        //     true positives (query vs its OWN passage): min 0.332, median 0.521, max 0.634
+        //     false pairs   (query vs every other):      median 0.052, p95 0.263, max 0.352
+        //
+        // So 0.65 admitted ZERO of 12 true positives: the semantic index paid its whole
+        // cost and prefetched nothing, silently. The classes separate cleanly, just far
+        // below 0.65 — hence the 0.35 default.
+        //
+        // This test pins the GATE's behaviour at realistic similarity magnitudes, so the
+        // regression cannot come back if someone "rounds the threshold up to a nicer
+        // number". A query at cosine ~0.52 (this embedder's MEDIAN true positive) must
+        // restore; a 0.65 gate must reject it.
+        {
+            llama_kv_cache_paged cache(
+                *model, buft,
+                kNBlocks, kBlockSize, kNSeqMax, kMaxBlks,
+                kWarmBlocks, /*n_cold_blocks=*/0,
+                std::string(), /*cold_resume=*/false, /*instance_id=*/"test-threshold");
+
+            assert(cache.ensure_blocks_for(/*seq*/ 0, 4 * kBlockSize));
+
+            // Fingerprint pointing along e0.
+            const std::vector<float> fp = normed({1, 0, 0, 0});
+            cache.record_paged_block_fingerprint(0, 0, fp, mt::SemanticIndex::Tier::Hot);
+
+            // Query at cosine ≈ 0.52 to that fingerprint — this embedder's MEDIAN score
+            // for a genuinely correct match. cos = 0.52 => q = 0.52*e0 + sqrt(1-0.52^2)*e1.
+            const float c = 0.52f;
+            const std::vector<float> q = normed({c, std::sqrt(1.0f - c * c), 0, 0});
+
+            assert(cache.evict_block_to_warm(0, 0) && "test setup: block 0 should evict");
+            assert(cache.has_restorable_blocks(0));
+
+            // The OLD default (0.65) rejects a correct match — the bug, pinned.
+            const uint32_t at_065 = cache.restore_semantic_paged(0, q, /*top_k=*/5, /*threshold=*/0.65f);
+            assert(at_065 == 0 &&
+                   "0.65 rejects a 0.52-cosine match: that IS the MAD-348 bug — "
+                   "real true-positives for this embedder top out at 0.634");
+
+            // The NEW default (0.35) admits it.
+            const uint32_t at_035 = cache.restore_semantic_paged(0, q, /*top_k=*/5, /*threshold=*/0.35f);
+            assert(at_035 >= 1 &&
+                   "0.35 must admit a median true-positive similarity and restore the block");
+
+            printf("test-paged-semantic: restore threshold calibration (MAD-348) ok "
+                   "— cos=0.52 rejected at 0.65, restored at 0.35\n");
+        }
     }
 
     // ─── Whole-seq seq_rm drops the seq's fingerprints ───

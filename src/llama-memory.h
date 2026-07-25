@@ -39,8 +39,12 @@ struct llama_memory_params {
     bool         kv_tier_warm_mlock;         // mlock the host-RAM warm tier (prevents kernel swap-out)
     int32_t      kv_tier_total_ctx;
     const char * kv_tier_semantic_index;
+    const char * kv_tier_semantic_query_prefix;  // MAD-348: model-specific; nullptr => empty
+    const char * kv_tier_semantic_doc_prefix;
     float        kv_tier_semantic_threshold;
     int32_t      kv_tier_semantic_topk;
+    int32_t      kv_tier_semantic_parallel;
+    int32_t      kv_tier_semantic_threads;   // MAD-348: CPU threads for the embedder (<=0 => ggml default)
     bool         kv_tier_paged_blocks;       // select llama_kv_cache_paged; effective default-on with --kv-tiered (MAD-134)
     int32_t      kv_tier_paged_block_size;   // tokens/block (0 => default 16)
     bool         kv_tier_cold_resume;        // MAD-130: skip O_TRUNC on cold-tier files; load index sidecar

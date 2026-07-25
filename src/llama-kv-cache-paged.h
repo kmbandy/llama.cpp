@@ -389,11 +389,62 @@ public:
     // Diagnostic: how many fingerprints currently held.
     size_t n_paged_fingerprints() const { return paged_semantic_.size(); }
 
+    // Fraction of the hot GPU block pool currently in use, in [0,1]. Used to
+    // gate proactive work (the prefill fingerprint sweep): when the pool is far
+    // from full, no hot->warm eviction can occur, so fingerprints would be pure
+    // waste. Fingerprinting only needs to happen before a block is evicted, and
+    // eviction only fires when the pool is ~full.
+    float hot_pool_fill_fraction() const {
+        const uint32_t total = pool_.total_gpu_blocks();
+        if (total == 0) return 1.0f;  // unknown -> don't skip (safe default)
+        const size_t used = (size_t) total - pool_.n_free_gpu();
+        return (float) used / (float) total;
+    }
+
+    // MAD-348: is there anything restore_semantic_paged() could possibly pull
+    // back for this seq? It can only act on a fingerprinted block that is
+    // (a) mapped and (b) NOT already resident on the GPU -- see the
+    // `is_gpu(phys) -> already_hot` skip in restore_semantic_paged(). If every
+    // block is hot, or no tier is configured, or the seq has no fingerprints,
+    // then the restore is guaranteed to return 0.
+    //
+    // The caller (the server's prefill path) otherwise pays a full embedder
+    // forward pass -- measured at ~285 ms, on the single-threaded inference
+    // loop, stalling every other slot's decode -- to compute a query embedding
+    // for a search that CANNOT return anything. This predicate is the cheap
+    // precondition: a handful of pointer checks instead of 285 ms.
+    //
+    // Deliberately conservative: it answers "could a restore do anything",
+    // not "will it". A true here still runs the full search; only a false is
+    // load-bearing, and a false is exactly the case where the search is a
+    // provable no-op.
+    bool has_restorable_blocks(llama_seq_id seq_id) const {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max_)     return false;
+        if (!warm_enabled() && !cold_enabled())                return false;
+        if (n_fingerprints_for_seq(seq_id) == 0)               return false;
+
+        const uint32_t nb = table_.num_blocks(seq_id);
+        for (uint32_t lb = 0; lb < nb; ++lb) {
+            const uint32_t phys = table_.get_physical(seq_id, lb);
+            if (phys == mt::kInvalidBlockId) continue;
+            if (!pool_.is_gpu(phys))         return true;  // something off-GPU to pull back
+        }
+        return false;
+    }
+
     // MAD-129: O(1) check whether (seq_id, lblock) already has a
     // fingerprint. Used by the server's prefill-time write trigger to
     // skip blocks already fingerprinted on prior turns.
     bool has_paged_fingerprint(llama_seq_id seq_id, uint32_t lblock) const {
         return paged_semantic_.has_fingerprint(seq_id, lblock);
+    }
+
+    // Drain blocks evicted hot->warm without a fingerprint. The server
+    // detokenizes, embeds, and records them asynchronously.
+    std::vector<std::pair<llama_seq_id, uint32_t>> take_pending_fp_evicted() {
+        std::vector<std::pair<llama_seq_id, uint32_t>> out;
+        out.swap(pending_fp_evicted_);
+        return out;
     }
 
     // MAD-130: persist the cold-tier index to a sidecar file at
@@ -558,6 +609,10 @@ private:
     mt::BlockTable         table_;
     mt::BlockSemanticIndex paged_semantic_;  // MAD-125
 
+    // Blocks evicted hot->warm that have no fingerprint yet. Both population
+    // and drain occur on the server inference thread, so this needs no lock.
+    std::vector<std::pair<llama_seq_id, uint32_t>> pending_fp_evicted_;
+
     // Per-seq position tracking.
     std::vector<seq_state> seq_states_;
 
@@ -576,6 +631,14 @@ private:
     std::vector<int32_t> h_block_table_;   // size = max_blocks_per_seq * n_seq_max
     std::vector<int32_t> h_context_lens_;  // size = n_seq_max
     std::vector<int32_t> h_q_lens_;        // size = n_seq_max
+    // MAD-348: shadow of what is currently uploaded to block_table_ on the GPU.
+    // The block table is append-only across decode steps (a new physical block
+    // only every block_size tokens), so re-uploading the full table every step
+    // is a synchronous H2D stall that idles the decode pipeline (~38% GPU idle
+    // at par128, aggregate flat with concurrency). prepare_batch_tensors is the
+    // ONLY writer of block_table_, so this shadow stays accurate and the upload
+    // is skipped when the rebuilt table is byte-identical.
+    std::vector<int32_t> h_block_table_gpu_;
 };
 
 // Per-batch context — what the graph builder consumes during

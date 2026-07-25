@@ -2854,9 +2854,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         tcfg.warm_mlock          = params.kv_tier_warm_mlock;
         if (params.kv_tier_semantic_index && params.kv_tier_semantic_index[0]) {
             tcfg.semantic_index = params.kv_tier_semantic_index;
+            if (params.kv_tier_semantic_query_prefix) {
+                tcfg.semantic_query_prefix = params.kv_tier_semantic_query_prefix;
+            }
+            if (params.kv_tier_semantic_doc_prefix) {
+                tcfg.semantic_doc_prefix = params.kv_tier_semantic_doc_prefix;
+            }
         }
         tcfg.semantic_threshold  = params.kv_tier_semantic_threshold;
         tcfg.semantic_top_k      = params.kv_tier_semantic_topk;
+        tcfg.semantic_parallel   = params.kv_tier_semantic_parallel;
+        tcfg.semantic_threads    = params.kv_tier_semantic_threads;
         tcfg.paged_blocks        = params.kv_tier_paged_blocks;
         if (params.kv_tier_paged_block_size > 0) {
             tcfg.paged_block_size = (uint32_t) params.kv_tier_paged_block_size;

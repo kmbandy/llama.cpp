@@ -37,6 +37,7 @@
 
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -298,7 +299,15 @@ private:
 
     // Lazy-loaded embedding model (only constructed when
     // cfg_.semantic_index is non-empty). nullptr otherwise.
+    //
+    // MAD-348: embed_text/embed_text_batch are now called from BACKGROUND
+    // workers (the server dispatches the prefill fingerprint sweep off the
+    // inference thread), so the lazy `if (!embed_model_) embed_model_ = ...`
+    // is a data race — two workers could both see null and both construct.
+    // once_flag makes the construction happen exactly once; EmbeddingModel
+    // itself is internally threadsafe thereafter.
     std::unique_ptr<EmbeddingModel> embed_model_;
+    std::once_flag                  embed_model_once_;
 
     // Warm-tier host staging. Lazily allocated on first eviction.
     // Per-attn-layer base offsets:

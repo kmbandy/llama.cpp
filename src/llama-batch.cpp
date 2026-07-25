@@ -4,6 +4,7 @@
 #include "llama-vocab.h"
 #include "llama-memory.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <algorithm>
@@ -138,7 +139,13 @@ bool llama_batch_allocr::init(
         }
 
         if (warn) {
-            LLAMA_LOG_WARN("%s: embeddings required but some input tokens were not marked as outputs -> overriding\n", __func__);
+            // An embedding server runs with embeddings=true by definition, so this fires on
+            // every batch -- and the condition is self-correcting, we override it right below.
+            // Warn once instead of flooding the log with one line per batch.
+            static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+            if (!warned.test_and_set(std::memory_order_relaxed)) {
+                LLAMA_LOG_WARN("%s: embeddings required but some input tokens were not marked as outputs -> overriding (further occurrences suppressed)\n", __func__);
+            }
 
             output.resize(batch.n_tokens, true);
             batch.logits = output.data();
