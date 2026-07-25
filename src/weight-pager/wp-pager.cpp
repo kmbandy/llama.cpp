@@ -73,6 +73,54 @@ struct HostBorrowGuard {
     }
 };
 
+void WeightPager::enqueue_tier_promotions_(
+        const std::vector<TierPromotionRequest> & requests,
+        std::vector<TierPromotion> & queued,
+        const TierPromotionEnqueue & enqueue,
+        bool transport_events) {
+    queued.clear();
+    queued.reserve(requests.size());
+    if (!host_tier_) return;
+
+    for (const TierPromotionRequest & request : requests) {
+        const PageMeta & m = catalog_.at(request.page);
+        const void * src = nullptr;
+        HostTier::BorrowHandle borrow = HostTier::kInvalidBorrowHandle;
+        if (!host_tier_->borrow(request.page, &src, m.size, &borrow)) continue;
+
+        // Do not consume a borrow if no completion event can be acquired. The
+        // caller leaves this request on its real-read path, rather than
+        // committing a slot whose promotion was silently skipped.
+        if (transport_events && transport_.n_free_events() <= 0) {
+            ++stats_.tier_promotion_event_pool_exhausted;
+            host_tier_->release(request.page, borrow);
+            continue;
+        }
+        int event = -1;
+        if (!enqueue(slot_ptr_(request.slot), src, m.size, pool_.slot_size(request.slot), event)) {
+            host_tier_->release(request.page, borrow);
+            continue;
+        }
+        queued.push_back({request.page, borrow, event});
+        if (transport_events) ++stats_.tier_promotion_async_enqueued;
+        else                  ++stats_.tier_promotion_sync_enqueued;
+    }
+}
+
+bool WeightPager::synchronize_tier_promotions_(const std::vector<TierPromotion> & queued) {
+    // The transport stream is ordered, so its final completion event is also
+    // the completion fence for every earlier promotion in this batch.
+    return queued.empty() || queued.back().event < 0 || transport_.synchronize(queued.back().event);
+}
+
+void WeightPager::release_tier_promotions_(std::vector<TierPromotion> & queued) {
+    for (const TierPromotion & promotion : queued) {
+        if (promotion.event >= 0) transport_.release_event(promotion.event);
+        if (host_tier_) host_tier_->release(promotion.page, promotion.borrow);
+    }
+    queued.clear();
+}
+
 // ---------------------------------------------------------------------------
 // EnvSnapshot — record current value of an env var, then restore it later.
 //
@@ -1683,9 +1731,15 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_host_fresh_h2d_seconds * 1e3,
             (unsigned long) s.page_in_sync_promotion_count,
             s.page_in_sync_promotion_h2d_seconds * 1e3,
-            (unsigned long) s.page_in_sync_zerocopy_promotions,
-            (unsigned long) s.page_in_sync_fresh_count,
-            s.page_in_sync_fresh_h2d_seconds * 1e3);
+        (unsigned long) s.page_in_sync_zerocopy_promotions,
+        (unsigned long) s.page_in_sync_fresh_count,
+        s.page_in_sync_fresh_h2d_seconds * 1e3);
+        LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
+                       "  tier_promotion_sync_enqueued: %lu\n"
+                       "  tier_promotion_event_pool_exhausted: %lu\n",
+                       (unsigned long) s.tier_promotion_async_enqueued,
+                       (unsigned long) s.tier_promotion_sync_enqueued,
+                       (unsigned long) s.tier_promotion_event_pool_exhausted);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                            (unsigned long) s.dense_prefetch_submitted);
@@ -1823,6 +1877,12 @@ void WeightPager::log_stats_summary() {
         s.ensure_batch_host_enqueue_seconds * 1e3,
         s.ensure_batch_host_read_wait_seconds * 1e3,
         s.ensure_batch_host_h2d_seconds * 1e3);
+    LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
+                   "  tier_promotion_sync_enqueued: %lu\n"
+                   "  tier_promotion_event_pool_exhausted: %lu\n",
+                   (unsigned long) s.tier_promotion_async_enqueued,
+                   (unsigned long) s.tier_promotion_sync_enqueued,
+                   (unsigned long) s.tier_promotion_event_pool_exhausted);
     if (s.dense_prefetch_submitted > 0) {
         LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                        (unsigned long) s.dense_prefetch_submitted);
@@ -2319,23 +2379,24 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         std::vector<bool> host_hit_zerocopy(misses.size(), false);
         std::vector<HostJob> jobs;
         jobs.reserve(misses.size());
-        HostBorrowGuard host_borrow_guard(host_tier_.get());
-        host_borrow_guard.pages.reserve(misses.size());
+        std::vector<TierPromotion> tier_promotions;
+        if (host_zerocopy) {
+            // Reserve these as promotion candidates now so they are not sent
+            // to the O_DIRECT workers. The shared helper borrows and enqueues
+            // them below, immediately before the existing H2D timing region.
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (host_tier_->contains(misses[k].page)) {
+                    host_hit[k] = true;
+                    host_hit_zerocopy[k] = true;
+                }
+            }
+        }
         int n_od = 0, n_host_hit = 0;
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const PageMeta & m = catalog_.at(misses[k].page);
             if (host_tier_) {
-                bool hit = false;
-                if (host_zerocopy) {
-                    const void * src = nullptr;
-                    HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
-                    if (host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
-                        hit = true;
-                        host_hit_src[k]       = src;
-                        host_hit_zerocopy[k]  = true;
-                        host_borrow_guard.pages.push_back({misses[k].page, handle});
-                    }
-                } else if (host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
+                bool hit = host_hit[k];
+                if (!hit && host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
                     hit = true;
                     host_hit_src[k] = ensure_host_bufs_[k];
                 }
@@ -2522,6 +2583,25 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         if (h2d_timing_ok) {
             hipEventRecord(h2d_ev_start, nullptr);
         }
+        std::vector<TierPromotionRequest> promotion_requests;
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            if (host_hit[k] && host_hit_zerocopy[k]) {
+                promotion_requests.push_back({misses[k].page, misses[k].slot});
+            }
+        }
+        enqueue_tier_promotions_(promotion_requests, tier_promotions,
+            [](void * dst, const void * src, size_t size, size_t, int & event) {
+                event = -1;
+                return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, nullptr) == hipSuccess;
+            }, false);
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            if (!host_hit_zerocopy[k]) continue;
+            bool queued = false;
+            for (const TierPromotion & promotion : tier_promotions) {
+                if (promotion.page == misses[k].page) { queued = true; break; }
+            }
+            if (!queued) host_hit[k] = false; // page_in_sync_ performs the real read
+        }
         auto issue_h2d_copy = [&](std::size_t k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
@@ -2547,13 +2627,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 host_hit[k] = false;
             }
         };
-        size_t n_promo_copy = 0, n_fresh_copy = 0;
-        for (std::size_t k = 0; k < misses.size(); ++k) {
-            if (host_hit[k]) {
-                issue_h2d_copy(k);
-                ++n_promo_copy;
-            }
-        }
+        size_t n_promo_copy = tier_promotions.size(), n_fresh_copy = 0;
         if (h2d_timing_ok) {
             hipEventRecord(h2d_ev_mid, nullptr);
         }
@@ -2597,6 +2671,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         if (h2d_ev_start) hipEventDestroy(h2d_ev_start);
         if (h2d_ev_mid)   hipEventDestroy(h2d_ev_mid);
         if (h2d_ev_end)   hipEventDestroy(h2d_ev_end);
+        // hipDeviceSynchronize above is the observable completion fence for
+        // these default-stream promotions. Only now may HostTier recycle the
+        // borrowed arena regions.
+        release_tier_promotions_(tier_promotions);
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
@@ -2710,37 +2788,15 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         ++stats_.ensure_batch_p2p_path_batches;
         const auto p2p_jobs_t0 = std::chrono::steady_clock::now();
         std::vector<Miss> cold;
+        std::vector<TierPromotionRequest> promotion_requests;
         cold.reserve(misses.size());
-        int n_host_hit = 0;
+        promotion_requests.reserve(misses.size());
         for (const Miss & mm : misses) {
             if (host_tier_ && host_tier_->contains(mm.page)) {
-                // page_in_sync_ does HostTier lookup → H2D, increments
-                // host_tier_hits, and erases the exclusive RAM copy.
-                const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
-                out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
-                if (s >= 0) {
-                    ++n_host_hit;
-                    ++stats_.ensure_batch_host_hits;
-                    if (mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {
-                        host_prefetch_strikes_[(size_t) mm.page] = 0;
-                    }
-                } else {
-                    // HostTier claimed it but promote failed — fall through to NVMe.
-                    cold.push_back(mm);
-                }
+                promotion_requests.push_back({mm.page, mm.slot});
             } else {
                 cold.push_back(mm);
             }
-        }
-
-        if (cold.empty()) {
-            if (n_host_hit > 0) {
-                ++stats_.ensure_batch_calls;
-                stats_.ensure_batch_pages += (uint64_t) n_host_hit;
-                // Entirely HostTier hits -- zero real storage submissions,
-                // so ensure_batch_n_sub_sum/ensure_batch_max_n must not move.
-            }
-            return;
         }
 
         std::vector<FileIOBatchRequest> reqs;
@@ -2760,8 +2816,21 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
         const auto p2p_enqueue_t0 = std::chrono::steady_clock::now();
         const double p2p_jobs_seconds = seconds_since(p2p_jobs_t0);
-        const int n_sub = file_io_->submit_batch(reqs);
-        file_io_->flush();
+        const int n_sub = reqs.empty() ? 0 : file_io_->submit_batch(reqs);
+        if (n_sub > 0) file_io_->flush();
+        // Submit NVMe first, then queue RAM->VRAM on the independent transport
+        // stream while the read batch is in flight. Failed event acquisition is
+        // intentionally left out of `promotions`, and is read synchronously
+        // after the batch rather than being silently committed.
+        std::vector<TierPromotion> promotions;
+        enqueue_tier_promotions_(promotion_requests, promotions,
+            [this](void * dst, const void * src, size_t size, size_t slot_size, int & event) {
+                event = transport_.stage_in_async(dst, src, size, slot_size);
+                return event >= 0;
+            }, true);
+        std::vector<int> promoted_pages;
+        promoted_pages.reserve(promotions.size());
+        for (const TierPromotion & promotion : promotions) promoted_pages.push_back(promotion.page);
         const double submit_seconds = seconds_since(io_t0);
         const double p2p_enqueue_seconds = seconds_since(p2p_enqueue_t0);
         const auto wait_t0 = std::chrono::steady_clock::now();
@@ -2780,6 +2849,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 ++n_timeout;
             }
         }
+        const bool promotions_ok = synchronize_tier_promotions_(promotions);
+        // Completion is observed before this release: the HostTier arena must
+        // remain immutable through the event fence, not merely through enqueue.
+        release_tier_promotions_(promotions);
         const double wait_seconds = seconds_since(wait_t0);
         const double batch_seconds = seconds_since(io_t0);
         size_t batch_bytes = 0;
@@ -2803,6 +2876,34 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 // slot so the up-front pin/out_pinned bookkeeping stays valid.
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+            }
+        }
+        int n_host_hit = 0;
+        for (const TierPromotionRequest & request : promotion_requests) {
+            const bool promoted = promotions_ok &&
+                std::find(promoted_pages.begin(), promoted_pages.end(), request.page) != promoted_pages.end();
+            if (promoted) {
+                page_to_slot_[request.page] = request.slot;
+                page_loaded_[request.page] = true;
+                slot_to_page_[request.slot] = request.page;
+                pool_.mark_used(request.slot);
+                ++n_host_hit;
+                ++stats_.host_tier_hits;
+                ++stats_.ensure_batch_host_hits;
+                ++stats_.page_in_sync_promotion_count;
+                host_tier_->erase(request.page);
+                for (const Miss & mm : misses) {
+                    if (mm.page == request.page) out_ptrs[mm.out_i] = slot_ptr_(request.slot);
+                }
+            } else {
+                // The promotion could not obtain an event (or its completion
+                // fence failed). Retire this tier copy before the serial path
+                // so page_in_sync_ performs a genuine storage read.
+                host_tier_->erase(request.page);
+                const int s = page_in_sync_(request.page, request.slot);
+                for (const Miss & mm : misses) {
+                    if (mm.page == request.page) out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+                }
             }
         }
         const int total_ok = batch_ok_n + n_host_hit;
@@ -4308,17 +4409,29 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
         }
         if (tier_hit) {
             const auto stage_t0 = std::chrono::steady_clock::now();
-            int evt = transport_.stage_in(dst, tier_src, m.size, pool_.slot_size(slot));
+            // page_in_sync_ deliberately uses the same async promotion helper
+            // as ensure_batch, then fences immediately to retain its resident-
+            // on-return contract. The helper acquires its own generation borrow.
+            std::vector<TierPromotion> promotions;
+            std::vector<TierPromotionRequest> requests = {{page_idx, slot}};
+            enqueue_tier_promotions_(requests, promotions,
+                [this](void * out, const void * in, size_t size, size_t slot_size, int & event) {
+                    event = transport_.stage_in_async(out, in, size, slot_size);
+                    return event >= 0;
+                }, true);
+            const bool promotion_ok = promotions.size() == 1 && synchronize_tier_promotions_(promotions);
+            release_tier_promotions_(promotions);
+            int evt = promotion_ok ? 0 : -1;
             const double stage_seconds = seconds_since(stage_t0);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
                 LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
                                page_idx);
-                if (owns_slot) pool_.release_slot(slot);
-                return -1;
+                // An async event failure must not drop a page. Retire the
+                // tier candidate and take the ordinary storage-read path.
+                host_tier_->erase(page_idx);
+                goto read_from_storage;
             }
-            transport_.release_event(evt);
-
             page_to_slot_[page_idx] = slot;
             page_loaded_[page_idx]  = true;
             slot_to_page_[slot]     = page_idx;
@@ -4336,6 +4449,7 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
         }
     }
 
+read_from_storage:
     // Stage 1: blocking read via the file IO layer. P2P reads directly
     // into the VRAM slot; host transports read into the shared pinned
     // staging buffer and use GpuTransport for the H2D copy below.

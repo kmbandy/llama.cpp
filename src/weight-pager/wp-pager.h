@@ -28,6 +28,7 @@
 #include "wp-router-predictor.h"
 
 #include <atomic>
+#include <functional>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -287,6 +288,9 @@ public:
         // tell the fast path from the fallback in a log instead of inferring
         // it from indirect evidence.
         uint64_t ensure_batch_host_zerocopy_promotions   = 0;
+        uint64_t tier_promotion_async_enqueued            = 0;
+        uint64_t tier_promotion_sync_enqueued             = 0;
+        uint64_t tier_promotion_event_pool_exhausted      = 0;
         uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
         double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
         uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_
@@ -551,6 +555,26 @@ public:
     void * slot_base_for_capture(int slot_idx) const { return pool_.slot_base_for_capture(slot_idx); }
 
 private:
+    struct TierPromotionRequest {
+        int page;
+        int slot;
+    };
+    struct TierPromotion {
+        int                    page;
+        HostTier::BorrowHandle  borrow;
+        int                    event;
+    };
+    using TierPromotionEnqueue = std::function<bool(void *, const void *, size_t, size_t, int &)>;
+
+    // Borrows sources, enqueues copies, and retains generation handles until
+    // release_tier_promotions_ is called after the caller's completion fence.
+    // Requests which cannot enqueue deliberately remain absent from `queued`.
+    void enqueue_tier_promotions_(const std::vector<TierPromotionRequest> & requests,
+                                  std::vector<TierPromotion> & queued,
+                                  const TierPromotionEnqueue & enqueue,
+                                  bool transport_events);
+    bool synchronize_tier_promotions_(const std::vector<TierPromotion> & queued);
+    void release_tier_promotions_(std::vector<TierPromotion> & queued);
     // Internal helper: synchronous page-in (used by ensure() on miss).
     // Reads the page's bytes via FileIOLayer (sync path), copies to VRAM,
     // and zeros the padding. Returns the slot index or -1 on failure.
