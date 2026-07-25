@@ -1814,24 +1814,6 @@ static int test_tier_promotion_event_exhaustion_releases_borrow() {
     return fails;
 }
 
-// Accounting bound model for a mixed batch: successful async promotions and
-// refused event acquisitions partition the requests exactly once.
-static int test_tier_promotion_accounting_bound_model() {
-    int fails = 0;
-    uint64_t async_enqueued = 0, sync_enqueued = 0, event_exhausted = 0;
-    const bool event_available[] = { true, true, false, false };
-    for (bool available : event_available) {
-        if (available) ++async_enqueued;
-        else ++event_exhausted;
-    }
-    ++sync_enqueued; // HOST path's one successful promotion
-    EXPECT_EQ_INT(async_enqueued, 2u, "two P2P promotions fit before the bound");
-    EXPECT_EQ_INT(event_exhausted, 2u, "each request past the bound is counted once");
-    EXPECT_EQ_INT(sync_enqueued, 1u, "HOST promotion uses synchronous accounting");
-    EXPECT_EQ_INT(async_enqueued + event_exhausted, 4u,
-                  "every async candidate is either enqueued or refused, never dropped twice");
-    return fails;
-}
 
 // 8. Concurrency: borrow/release racing with store/erase must never mutate a
 // borrowed region while it is held, and used-bytes accounting must return to
@@ -3002,7 +2984,6 @@ int main() {
         { "host_tier_borrow_is_refcounted",              test_host_tier_borrow_is_refcounted              },
         { "tier_promotion_borrow_held_until_deferred_completion", test_tier_promotion_borrow_held_until_deferred_completion },
         { "tier_promotion_event_exhaustion_releases_borrow",      test_tier_promotion_event_exhaustion_releases_borrow },
-        { "tier_promotion_accounting_bound_model",                 test_tier_promotion_accounting_bound_model },
         { "host_tier_borrow_release_concurrency_same_key",      test_host_tier_borrow_release_concurrency_same_key      },
         { "host_tier_borrow_release_concurrency_disjoint_pages", test_host_tier_borrow_release_concurrency_disjoint_pages },
         { "host_prefetcher",                     test_host_prefetcher                     },
