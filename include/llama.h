@@ -338,6 +338,7 @@ extern "C" {
         int32_t weight_paging_slots;   // number of VRAM slots for weight paging (-1 = auto)
         bool weight_paging_prefetch;   // enable async prefetch of next layer
         const char * weight_paging_resident_device; // dense-resident device name or "auto"
+        const char * weight_paging_ffn_island_device; // device hosting shared experts and FFN island, or "auto"/"off"
     };
 
     struct llama_sampler_seq_config {

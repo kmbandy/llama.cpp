@@ -242,6 +242,11 @@ llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-paged-attn-vk.cpp)
 
+# MAD-392: numeric oracle for the paged decode kernels. Compares the flash-decode
+# and WMMA-decode paths against the scalar path elementwise. Driven by
+# scratchpad/oracle.sh, which supplies the env that selects each kernel arm.
+llama_build_and_test(test-paged-decode-oracle.cpp)
+
 llama_build_and_test(test-weight-pager.cpp)
 target_include_directories(test-weight-pager PRIVATE ${CMAKE_SOURCE_DIR}/src)
 

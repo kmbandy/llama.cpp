@@ -321,6 +321,89 @@ server_models::~server_models() {
     }
 }
 
+std::optional<std::filesystem::file_time_type> server_models::get_models_preset_mtime() const {
+    if (base_params.models_preset.empty()) {
+        return std::nullopt;
+    }
+
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(base_params.models_preset, ec);
+    if (ec) {
+        SRV_WRN("failed to stat models preset '%s': %s\n", base_params.models_preset.c_str(), ec.message().c_str());
+        return std::nullopt;
+    }
+
+    return mtime;
+}
+
+void server_models::reload_models_preset_if_changed(server_model_meta & meta) {
+    const auto mtime_before = get_models_preset_mtime();
+    const auto applied_mtime = models_preset_applied_mtimes.find(meta.name);
+    if (!mtime_before.has_value() ||
+            (applied_mtime != models_preset_applied_mtimes.end() && *mtime_before == applied_mtime->second)) {
+        return;
+    }
+
+    try {
+        common_presets cached_models = ctx_preset.load_from_cache();
+        common_presets local_models;
+        if (!base_params.models_dir.empty()) {
+            local_models = ctx_preset.load_from_models_dir(base_params.models_dir);
+        }
+
+        common_preset global;
+        common_presets custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
+        const auto mtime_after = get_models_preset_mtime();
+        if (!mtime_after.has_value() || *mtime_before != *mtime_after) {
+            SRV_WRN("models preset '%s' changed while reloading; keeping last-known-good preset for model '%s'\n",
+                base_params.models_preset.c_str(), meta.name.c_str());
+            return;
+        }
+
+        cached_models  = ctx_preset.cascade(global, cached_models);
+        local_models   = ctx_preset.cascade(global, local_models);
+        custom_presets = ctx_preset.cascade(global, custom_presets);
+
+        common_presets final_presets;
+        std::unordered_map<std::string, server_model_source> source_map;
+        for (const auto & [name, preset] : cached_models) {
+            final_presets[name] = preset;
+            source_map[name] = SERVER_MODEL_SOURCE_CACHE;
+        }
+        for (const auto & [name, preset] : local_models) {
+            final_presets[name] = preset;
+            source_map[name] = SERVER_MODEL_SOURCE_MODELS_DIR;
+        }
+        for (const auto & [name, custom] : custom_presets) {
+            if (final_presets.find(name) != final_presets.end()) {
+                final_presets[name].merge(custom);
+            } else {
+                final_presets[name] = custom;
+            }
+            source_map[name] = SERVER_MODEL_SOURCE_PRESET;
+        }
+        for (auto & [name, preset] : final_presets) {
+            preset.merge(base_preset);
+        }
+
+        auto it = final_presets.find(meta.name);
+        if (it == final_presets.end()) {
+            throw std::runtime_error("updated models preset no longer resolves model '" + meta.name + "'");
+        }
+
+        meta.preset = it->second;
+        meta.source = source_map.at(meta.name);
+        parse_model_placement(meta);
+        meta.update_args(ctx_preset, bin_path);
+        meta.update_caps();
+        models_preset_applied_mtimes[meta.name] = *mtime_after;
+        SRV_INF("reloaded models preset '%s' for child model '%s'\n", base_params.models_preset.c_str(), meta.name.c_str());
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to reload models preset '%s' for child model '%s': %s; keeping last-known-good preset\n",
+            base_params.models_preset.c_str(), meta.name.c_str(), e.what());
+    }
+}
+
 void server_models::add_model(server_model_meta && meta) {
     if (mapping.find(meta.name) != mapping.end()) {
         throw std::runtime_error(string_format("model '%s' appears multiple times", meta.name.c_str()));
@@ -967,6 +1050,7 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
 
 void server_models::load_models() {
     // Phase 1: load presets from all sources - pure I/O, no lock needed
+    std::optional<std::filesystem::file_time_type> models_preset_loaded_mtime;
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
     SRV_INF("Loaded %zu cached model presets\n", cached_models.size());
@@ -980,7 +1064,15 @@ void server_models::load_models() {
     common_preset global = {};
     common_presets custom_presets = {};
     if (!base_params.models_preset.empty()) {
+        const auto mtime_before = get_models_preset_mtime();
         custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
+        const auto mtime_after = get_models_preset_mtime();
+        if (mtime_before.has_value() && mtime_after.has_value() && *mtime_before == *mtime_after) {
+            models_preset_loaded_mtime = *mtime_after;
+        } else {
+            SRV_WRN("models preset '%s' changed while loading; it will be retried before the next child spawn\n",
+                base_params.models_preset.c_str());
+        }
         SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
     }
     load_gpu_config(global);
@@ -1069,6 +1161,12 @@ void server_models::load_models() {
     // which locks the mutex, so joining while holding it would deadlock).
     std::unique_lock<std::mutex> lk(mutex);
 
+    if (models_preset_loaded_mtime.has_value()) {
+        models_preset_applied_mtimes.clear();
+        for (const auto & entry : final_presets) {
+            models_preset_applied_mtimes[entry.first] = *models_preset_loaded_mtime;
+        }
+    }
     need_reload = false;
     bool is_first_load = mapping.empty();
 
@@ -1494,6 +1592,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
     if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
         return;
+    }
+
+    if (!opts.custom_meta.has_value()) {
+        reload_models_preset_if_changed(meta);
     }
 
     bool marked_loading = false;

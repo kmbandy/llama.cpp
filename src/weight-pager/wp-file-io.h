@@ -21,6 +21,12 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward-declared at GLOBAL scope on purpose: declaring the parameter as
+// "struct io_uring *" inside namespace wp would implicitly declare a NEW
+// incomplete wp::io_uring that shadows liburing.h ::io_uring, breaking every
+// later use of the real type.
+struct io_uring;
+
 namespace wp {
 
 // Status flags for a completed request.
@@ -53,6 +59,15 @@ struct FileIOBatchRequest {
     uint64_t offset;
     size_t   size;
     void *   dst;
+};
+
+// Cumulative read concurrency observed by an asynchronous transport.  `peak`
+// and `average_at_start` describe reads accepted by the kernel, not merely
+// requests queued by WeightPager.
+struct FileIOConcurrency {
+    uint64_t starts = 0;
+    uint64_t peak = 0;
+    double average_at_start = 0.0;
 };
 
 class FileIOLayer {
@@ -155,6 +170,7 @@ public:
     // point where they choose the read destination.
     virtual FileIOTransport transport() const = 0;
     virtual bool direct_to_device() const { return false; }
+    virtual FileIOConcurrency concurrency() const { return {}; }
 
 protected:
     // Reaped-but-unclaimed completions, keyed by req_id. Populated by the
@@ -176,6 +192,13 @@ struct FileIOP2PConfig {
     void * pool_base = nullptr;
     size_t pool_size = 0;
 };
+
+// P2P-only tunables.  Unset values reproduce the pre-tunable derivation:
+// queue depth comes from the pager configuration, and windows are clamp(4*QD,
+// 64, 256). Invalid values fall back to those defaults.
+int  resolve_p2p_queue_depth(int configured_depth);
+int  resolve_p2p_window_cache_max(int queue_depth);
+bool p2p_direct_to_device_with_tier();
 
 // Factory. `fds` is a list of pre-prepared file descriptors (typically dup'd
 // from the model loader's fds with O_DIRECT cleared via
@@ -206,5 +229,18 @@ std::unique_ptr<FileIOLayer> create_p2p_file_io(std::vector<int> fds,
 // silently round reads to the prior 512-byte boundary on some filesystems
 // (bug B-P3 in docs/dev/memory-tier-bug-catalog.md).
 int dup_clear_o_direct(int src_fd);
+
+// Raise the io-wq BOUNDED worker ceiling for `ring`.
+//
+// We set IOSQE_ASYNC on every SQE (deliberately -- without it, cold reads
+// complete INLINE inside io_uring_submit and serialise the submitter; measured
+// ensure_batch_submit_ms >> wait_ms, capping random P2P at ~2 GB/s). The cost of
+// that choice is that every read is handed to an io-wq bounded worker, so the
+// EFFECTIVE queue depth is bounded by the worker count -- not by the ring size
+// or WP_IOURING_DEPTH. Left unset, that ceiling is the kernel default.
+//
+// Reads WP_IOWQ_MAX_WORKERS. 0 / unset = leave the kernel default (unchanged
+// behaviour). No-op on builds without io_uring.
+void set_iowq_max_workers(struct io_uring * ring, const char * who);
 
 }  // namespace wp

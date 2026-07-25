@@ -10,7 +10,7 @@ public:
     // Append top-M experts for each target layer from_layer+1..from_layer+K
     // (that has a router and is < n_layer) to out. Plain top-M of W[T].h.
     void predict(const float* h, int from_layer, int K, int M,
-                 int n_layer, std::vector<ExpertRef>& out) const;
+                 int n_layer, std::vector<ExpertRef>& out, float min_conf = 0.0f) const;
     int n_expert() const { return n_expert_; }
     int n_embd()   const { return n_embd_; }
 private:

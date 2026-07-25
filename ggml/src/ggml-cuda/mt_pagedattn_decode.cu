@@ -519,7 +519,6 @@ static __device__ __forceinline__ float decode_block_reduce_max(
 // Bumped from 8 → 16 to cover the Qwen3.5/3.6 MTP common case. Beyond 16
 // the dispatch gate sends it to the scalar fallback. Larger q_len batches
 // are prefill territory and go to the tile kernel.
-static constexpr int DECODE_MAX_Q = 16;
 
 // ── Pass 1: per-chunk partial kernel ───────────────────────────────────
 //
@@ -570,6 +569,8 @@ __global__ void mt_paged_attention_decode_kernel(
     const int head_base          = kv_head_idx * num_queries_per_kv;
     const int total_q            = num_queries_per_kv * q_len;
     const int * seq_block_table  = block_tables + seq_idx * max_blocks_per_seq;
+
+    if (q_len == 0) return;
 
     // Per-block check — defensive. Dispatch gate enforces both q_len and
     // total_q caps; clamp here in case a future op_param flow sneaks
@@ -784,8 +785,8 @@ __global__ void mt_paged_attention_decode_kernel(
 // per-pair warp_reduce_sum.
 //
 // One warp per block. Grid (n_kv_heads, n_seqs, num_chunks). With GQA fanout
-// the per-block query count `total_q = num_queries_per_kv * q_len` fills the
-// 16-row WMMA tile (caps at DECODE_MAX_Q=16). Rows beyond total_q produce
+// the per-block query count `total_q = num_queries_per_kv * q_len` is handled
+// by one or more 16-row WMMA tiles. Rows beyond total_q in the final tile produce
 // don't-care output that the write-back loop masks.
 //
 // HEAD_SIZE: 128 (N_INNER=8) and 256 (N_INNER=16). Register footprint:
@@ -831,6 +832,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     const int num_queries_per_kv = n_heads / n_kv_heads;
     const int head_base          = kv_head_idx * num_queries_per_kv;
     const int total_q            = num_queries_per_kv * q_len;
+    if (q_len == 0) return;
     if (q_len > DECODE_MAX_Q || total_q > DECODE_MAX_Q) return;
 
     const int * seq_block_table = block_tables + seq_idx * max_blocks_per_seq;
@@ -880,7 +882,7 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     const int chunk_end = min(chunk_start + CHUNK_KV, valid_ctx_max);
 
     // ── Shared memory layout ──
-    //   smem_q  [16 * HEAD_SIZE]            __half  — staged once
+    //   smem_q  [16 * HEAD_SIZE]            __half  — re-staged per row block
     //   smem_k  [DECODE_K_TILE_N * HEAD_SIZE] __half
     //   smem_v  [DECODE_K_TILE_N * HEAD_SIZE] __half
     // At HS=256: 16*256*2 + 16*256*2*2 = 8 KiB + 16 KiB = 24 KiB. Fine.
@@ -888,26 +890,6 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     __half * smem_q = (__half *)(smem_raw);
     __half * smem_k = smem_q + 16 * HEAD_SIZE;     // 16 rows even when total_q < 16 (WMMA pads)
     __half * smem_v = smem_k + K_TILE_N * HEAD_SIZE;
-
-    // ── Stage Q: 16 rows × HEAD_SIZE. Rows [total_q..15] are padded with 0. ──
-    // All 4 warps cooperate on staging for max BW.
-    for (int idx = tid; idx < 16 * HEAD_SIZE; idx += 128) {
-        const int qhqi = idx / HEAD_SIZE;
-        const int d    = idx % HEAD_SIZE;
-        __half val = (__half) 0;
-        if (qhqi < total_q) {
-            const int qh = qhqi / q_len;
-            const int qi = qhqi % q_len;
-            const int head_idx = head_base + qh;
-            const size_t q_off = ((seq_q_offset + (size_t) qi) * (size_t) n_heads + (size_t) head_idx)
-                                 * (size_t) HEAD_SIZE + (size_t) d;
-            val = q[q_off];
-        }
-        smem_q[idx] = val;
-    }
-    __syncwarp();
-
-    __syncthreads();
 
     // Multi-warp design: warp 0 owns the WMMA compute + softmax state +
     // partials write. Warps 1-3 only help with staging via decode_stage_k/v
@@ -917,33 +899,62 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     // of decode time.
     const bool is_compute_warp = (wid == 0);
 
-    // Load Q tiles into registers — only warp 0.
+    // These register tiles are reused for each row block; only the 16 rows
+    // currently staged in smem_q are live at once.
     tile<16, 8, half2, DATA_LAYOUT_I_MAJOR> Q_tiles[N_INNER];
-    if (is_compute_warp) {
+    tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
+    float running_max;
+    float running_sum;
+
+    const int n_row_blocks = (total_q + 15) / 16;
+    const int row_local = lane % 16;
+    for (int rb = 0; rb < n_row_blocks; ++rb) {
+        const int row_base  = rb * 16;
+        const int row_g     = row_base + row_local;
+
+        // ── Stage Q: this block's 16 rows × HEAD_SIZE. Rows beyond total_q
+        // are padded with 0. All 4 warps cooperate on staging for max BW.
+        for (int idx = tid; idx < 16 * HEAD_SIZE; idx += 128) {
+            const int row_local_q = idx / HEAD_SIZE;
+            const int d           = idx % HEAD_SIZE;
+            const int row_g_q     = row_base + row_local_q;
+            __half val = (__half) 0;
+            if (row_g_q < total_q) {
+                const int qh = row_g_q / q_len;
+                const int qi = row_g_q % q_len;
+                const int head_idx = head_base + qh;
+                const size_t q_off = ((seq_q_offset + (size_t) qi) * (size_t) n_heads + (size_t) head_idx)
+                                     * (size_t) HEAD_SIZE + (size_t) d;
+                val = q[q_off];
+            }
+            smem_q[idx] = val;
+        }
+        __syncwarp();
+        __syncthreads();
+
+        // Load Q tiles into registers — only warp 0.
+        if (is_compute_warp) {
+            #pragma unroll
+            for (int n = 0; n < N_INNER; ++n) {
+                const half2 * src = (const half2 *)(smem_q + n * K_INNER);
+                load_ldmatrix(Q_tiles[n], src, HEAD_SIZE / 2);
+            }
+        }
+
+        // Online-softmax state is private to this row block. Each lane owns 8
+        // cols of one Q row; its pair (tid ^ 16) owns the other 8 cols.
+        running_max = SOFTMAX_MASK_VAL;
+        running_sum = 0.0f;
+
         #pragma unroll
         for (int n = 0; n < N_INNER; ++n) {
-            const half2 * src = (const half2 *)(smem_q + n * K_INNER);
-            load_ldmatrix(Q_tiles[n], src, HEAD_SIZE / 2);
+            #pragma unroll
+            for (int e = 0; e < acc[n].ne; ++e) acc[n].x[e] = 0.0f;
         }
-    }
 
-    // Online softmax state. Each lane owns 8 cols of one Q row; the pair lane
-    // (tid ^ 16) owns the other 8 cols of the same row. shfl_xor(_, 16) merges
-    // the two halves for per-row reductions.
-    float running_max = SOFTMAX_MASK_VAL;
-    float running_sum = 0.0f;
-
-    tile<16, 16, float, DATA_LAYOUT_I_MAJOR> acc[N_INNER];
-    #pragma unroll
-    for (int n = 0; n < N_INNER; ++n) {
-        #pragma unroll
-        for (int e = 0; e < acc[n].ne; ++e) acc[n].x[e] = 0.0f;
-    }
-
-    const int row      = lane % 16;
-    const int qi_row   = (row < total_q) ? (row % q_len) : 0;
-    const int q_pos_qi = q_pos_first + qi_row;
-    const bool row_valid = is_compute_warp && (row < total_q);
+        const int qi_row   = (row_g < total_q) ? (row_g % q_len) : 0;
+        const int q_pos_qi = q_pos_first + qi_row;
+        const bool row_valid = is_compute_warp && (row_g < total_q);
 
     // ── Sub-tile loop ──
     for (int sub_start = chunk_start; sub_start < chunk_end; sub_start += K_TILE_N) {
@@ -1094,8 +1105,8 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
             if (row_valid) {
                 const int col_in_tile = 8 * (tid / 16) + l;
                 const int d           = n * 16 + col_in_tile;
-                const int qh          = row / q_len;
-                const int qi          = row % q_len;
+                const int qh          = row_g / q_len;
+                const int qi          = row_g % q_len;
                 const int head_idx    = head_base + qh;
                 const size_t off = partial_chunk_base_for_head(head_idx)
                                  + (size_t) qi * (HEAD_SIZE + 2)
@@ -1107,13 +1118,14 @@ __global__ void mt_paged_attention_decode_kernel_wmma(
     // Lanes 0..15 own one row of running state each (mask=16 shfl_xor merged
     // them with their pair lane). One write per row.
     if (tid < 16 && row_valid) {
-        const int qh = row / q_len;
-        const int qi = row % q_len;
+        const int qh = row_g / q_len;
+        const int qi = row_g % q_len;
         const int head_idx = head_base + qh;
         const size_t base = partial_chunk_base_for_head(head_idx)
                           + (size_t) qi * (HEAD_SIZE + 2);
         partials[base + HEAD_SIZE]     = running_max;
         partials[base + HEAD_SIZE + 1] = running_sum;
+    }
     }
 }
 
@@ -1232,13 +1244,15 @@ void launch_paged_attn_decode(
                             + sizeof(float)  * DECODE_MAX_Q * DECODE_K_TILE_N     // smem_logits
                             + sizeof(float)  * DECODE_NUM_WARPS;                  // red_smem
 
-    // WMMA gate: HS in {128, 256}, F16 cache, WMMA-capable device, env on.
+    // WMMA gate: HS in {128, 256}, F16/TURBO4_0/TURBO3_0 cache, WMMA-capable device, env on.
     int dev = 0; cudaGetDevice(&dev);
     const int cc = ggml_cuda_info().devices[dev].cc;
     const bool wmma_path = get_paged_decode_wmma_mode() != 0
                         && amd_wmma_available(cc)
                         && (HEAD_SIZE == 128 || HEAD_SIZE == 256)
-                        && (CACHE_TYPE == GGML_TYPE_F16);
+                        && (CACHE_TYPE == GGML_TYPE_F16
+                         || CACHE_TYPE == GGML_TYPE_TURBO4_0
+                         || CACHE_TYPE == GGML_TYPE_TURBO3_0);
 
     if (wmma_path) {
         // 4-warp block: warp 0 does WMMA compute, warps 1-3 help with K/V

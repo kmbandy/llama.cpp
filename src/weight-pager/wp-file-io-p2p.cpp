@@ -9,6 +9,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <unistd.h>
 
@@ -60,6 +61,7 @@ public:
                                                          bool prefer_async,
                                                          int queue_depth,
                                                          const FileIOP2PConfig & cfg) {
+        queue_depth = resolve_p2p_queue_depth(queue_depth);
         auto host = create_host_file_io(dup_fds(fds), prefer_async, queue_depth);
         if (!host) {
             return nullptr;
@@ -200,6 +202,7 @@ public:
             --pending_;
             remove_pending_req_(out.req_id);
             release_inflight_key_(out.req_id);
+            finish_p2p_read_(out.req_id);
 
             if (res < 0) {
                 out.status     = IoStatus::ErrorIo;
@@ -264,6 +267,15 @@ public:
         return p2p_enabled_;
     }
 
+    FileIOConcurrency concurrency() const override {
+        FileIOConcurrency out;
+        out.starts = p2p_inflight_starts_;
+        out.peak = p2p_inflight_peak_;
+        out.average_at_start = p2p_inflight_starts_ == 0 ? 0.0 :
+            p2p_inflight_sum_at_start_ / (double) p2p_inflight_starts_;
+        return out;
+    }
+
 private:
     IoUringP2PFileIOLayer(std::vector<int> fds, std::unique_ptr<FileIOLayer> host)
         : fds_(std::move(fds)), host_(std::move(host)) {}
@@ -316,6 +328,7 @@ private:
             }
 
             for (int i = 0; i < ret && !pending_submit_.empty(); ++i) {
+                start_p2p_read_(pending_submit_.front());
                 pending_submit_.pop_front();
             }
         }
@@ -343,6 +356,7 @@ private:
         --pending_;
         remove_pending_req_(r.req_id);
         release_inflight_key_(r.req_id);
+        finish_p2p_read_(r.req_id);
 
         if (res < 0) {
             r.status     = IoStatus::ErrorIo;
@@ -373,13 +387,31 @@ private:
             r.bytes_read = err;
             ready_[req_id] = r;
             release_inflight_key_(req_id);
+            finish_p2p_read_(req_id);
         }
         pending_reqs_.clear();
         pending_submit_.clear();
         pending_ = 0;
     }
 
+    void start_p2p_read_(uint64_t req_id) {
+        p2p_submitted_.insert(req_id);
+        ++p2p_inflight_;
+        p2p_inflight_sum_at_start_ += (double) p2p_inflight_;
+        ++p2p_inflight_starts_;
+        if ((uint64_t) p2p_inflight_ > p2p_inflight_peak_) {
+            p2p_inflight_peak_ = (uint64_t) p2p_inflight_;
+        }
+    }
+
+    void finish_p2p_read_(uint64_t req_id) {
+        if (p2p_submitted_.erase(req_id) > 0 && p2p_inflight_ > 0) {
+            --p2p_inflight_;
+        }
+    }
+
     bool init_(int queue_depth, const FileIOP2PConfig & cfg) {
+        queue_depth_ = queue_depth;
         int rt_version = 0;
         if (hipRuntimeGetVersion(&rt_version) == hipSuccess) {
             const int major = rt_version / 10000000;
@@ -395,6 +427,9 @@ private:
             return false;
         }
         int ret = io_uring_queue_init(queue_depth, &ring_, 0);
+        if (ret >= 0) {
+            set_iowq_max_workers(&ring_, "p2p");
+        }
         if (ret < 0) {
             LLAMA_LOG_WARN("wp::IoUringP2PFileIO: queue_init failed: %s\n", strerror(-ret));
             return false;
@@ -412,13 +447,7 @@ private:
 
         // Cap cached maps: enough for multi-QD bursts without 27 GiB VA.
         // Prefer 4*QD so a few ensure_batch waves reuse maps before LRU.
-        max_windows_ = queue_depth * 4;
-        if (max_windows_ < 64) {
-            max_windows_ = 64;
-        }
-        if (max_windows_ > 256) {
-            max_windows_ = 256;
-        }
+        max_windows_ = resolve_p2p_window_cache_max(queue_depth);
         return setup_pool_mapping_(cfg.pool_base, cfg.pool_size);
     }
 
@@ -491,10 +520,15 @@ private:
         pool_dmabuf_fd_     = dmabuf_fd;
         pool_dmabuf_offset_ = dmabuf_offset;
         p2p_enabled_        = true;
+        const char * iowq_workers = std::getenv("WP_IOWQ_MAX_WORKERS");
         LLAMA_LOG_WARN(
             "wp::IoUringP2PFileIO: P2P enabled — pool dma_buf exported (%.1f MiB VRAM), "
-            "window cache max=%d page=%zu B (no full-pool host map, no host bounce)\n",
-            (double) size / 1048576.0, max_windows_, page_size_);
+            "window cache max=%d queue_depth=%d iowq_workers=%s tier_mode=%s page=%zu B "
+            "(no full-pool host map, no host bounce)\n",
+            (double) size / 1048576.0, max_windows_, queue_depth_,
+            (iowq_workers != nullptr && iowq_workers[0] != '\0') ? iowq_workers : "kernel-default",
+            p2p_direct_to_device_with_tier() ? "direct-to-VRAM/skip-tier" : "staging/store-tier",
+            page_size_);
         return true;
     }
 
@@ -699,6 +733,12 @@ private:
     uint64_t cache_tick_         = 0;
     std::unordered_map<uint64_t, CacheEntry> window_cache_;   // map_off -> entry
     std::unordered_map<uint64_t, uint64_t>    inflight_keys_;  // req_id -> map_off
+    int      queue_depth_        = 0;
+    int      p2p_inflight_       = 0;
+    uint64_t p2p_inflight_starts_ = 0;
+    uint64_t p2p_inflight_peak_   = 0;
+    double   p2p_inflight_sum_at_start_ = 0.0;
+    std::unordered_set<uint64_t> p2p_submitted_;
 };
 
 }  // anonymous namespace

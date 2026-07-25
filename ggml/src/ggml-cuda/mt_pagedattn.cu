@@ -54,9 +54,8 @@ static int get_paged_fused_mode() {
     return mode;
 }
 
-// MAD-180: WMMA tile kernel toggle. Default ON when the runtime gate
-// (amd_wmma_available + HEAD_SIZE=128 + BLOCK_SIZE=16 + q_len>=16 +
-// CACHE_TYPE in {F16, TURBO4_0}) is satisfied. Set GGML_PAGED_TILE=0 to
+// MAD-180: tile kernel toggle. Default ON when the supported
+// HEAD_SIZE/BLOCK_SIZE/CACHE_TYPE shape gate is satisfied. Set GGML_PAGED_TILE=0 to
 // force the scalar fallback (debugging / regression bisection).
 static int get_paged_tile_mode() {
     static int mode = -1;
@@ -67,6 +66,28 @@ static int get_paged_tile_mode() {
                       mode, mode ? "enabled" : "disabled");
     }
     return mode;
+}
+
+// MAD-386: tile kernels mask incomplete Q tiles. Keep the configured floor at
+// one so the tile path covers every q_len when flash-decode is unavailable. Set
+// GGML_PAGED_TILE_MIN_Q=16 to restore the former gate exactly.
+static constexpr int PAGED_TILE_MIN_Q_DEFAULT = 1;
+
+// Returns an explicit operator override, or 0 meaning "derive it". Deriving is
+// the normal path: the floor is computed from the flash-decode ceiling at the
+// call site so the two gates abut exactly for every GQA ratio. A hardcoded
+// floor cannot do that — at num_queries_per_kv >= 12 the decode ceiling is 1,
+// so a floor of 3 would strand q_len==2 on the scalar kernel (reachable via MTP
+// draft-verify batches on MQA models).
+static int get_paged_tile_min_q_override() {
+    static int v = -1;
+    if (v < 0) {
+        const char * env = std::getenv("GGML_PAGED_TILE_MIN_Q");
+        v = env ? std::max(1, atoi(env)) : 0;
+        GGML_LOG_INFO("mt_paged_attn: GGML_PAGED_TILE_MIN_Q=%d (tile q_len floor; "
+                      "0 = auto-derive from the flash-decode ceiling)\n", v);
+    }
+    return v;
 }
 
 // MAD-180 follow-up: multi-warp tile kernel toggle. When tile path is
@@ -1551,6 +1572,8 @@ __global__ void mt_paged_attention_kernel(
 //   [1]: int32_t block_size
 //   [2]: int32_t max_blocks_per_seq
 //   [3]: int32_t n_kv_heads
+//   [4]: int32_t max_q_len
+//   [5]: int32_t max active context length
 //
 // src tensors:
 //   src[0] = Q     [head_size, n_heads, sum(q_lens), 1]   — packed across seqs
@@ -1658,6 +1681,8 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     // MAD-348: true per-seq max q_len from the graph builder. 0 => legacy caller
     // that didn't set it; fall back to total_q_tokens (the old over-estimate).
     const int32_t max_q_len_param = ((const int32_t *)(op_params_f + 4))[0];
+    // 0 means an older graph builder, so retain the allocated-capacity bound.
+    const int32_t max_ctx_len_param = ((const int32_t *)(op_params_f + 5))[0];
 
     const int head_size = q->ne[0];
     const int n_heads   = q->ne[1];
@@ -1673,9 +1698,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(v_cur->ne[1] == n_kv_heads);
     GGML_ASSERT(slot_mapping->ne[0] == k_cur->ne[2]);
 
-    // For smem sizing we need the longest context in this batch.
-    // Cheap upper bound: max_blocks_per_seq * block_size.
-    const int max_ctx_len = max_bps * block_size;
+    const int max_ctx_len_capacity = max_bps * block_size;
+    const int max_ctx_len = max_ctx_len_param > 0 ? (int) max_ctx_len_param
+                                                   : max_ctx_len_capacity;
 
     cudaStream_t stream = ctx.stream();
     const bool do_fused = (get_paged_fused_mode() != 0);
@@ -1730,7 +1755,25 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // of decode dilution. Falls back to avg_q_len when the param is unset.
                 const int  tile_gate_q_len   = (max_q_len_param > 0) ? (int) max_q_len_param
                                                                      : avg_q_len;
-                if (tile_gate_on && tile_gate_q_len >= 16) {
+                const int  num_queries_per_kv = n_heads / n_kv_heads;
+                const int  decode_ceiling = paged_attn_decode_q_len_ceiling(num_queries_per_kv);
+                const bool decode_env_on  = get_paged_decode_mode() != 0;
+                const bool decode_available = decode_env_on
+                                           && (max_ctx_len >= get_paged_decode_min_ctx());
+                // MAD-386: the tile gate is evaluated BEFORE the decode gate, so
+                // the tile floor must sit exactly one above the flash-decode
+                // ceiling — higher strands q_len on the ~116 ms/call scalar
+                // kernel, lower steals work flash-decode does 10-20x cheaper.
+                // Derived, never hardcoded: decode_ceiling varies with the
+                // model's GQA ratio (8 at nqpkv<=2, 1 at nqpkv>=16). When
+                // flash-decode cannot run at all, tile covers from q_len 1 so
+                // the scalar path stays unreachable.
+                const int tile_min_q_override = get_paged_tile_min_q_override();
+                const int tile_min_q = tile_min_q_override > 0
+                                     ? tile_min_q_override
+                                     : (decode_available ? decode_ceiling + 1
+                                                         : PAGED_TILE_MIN_Q_DEFAULT);
+                if (tile_gate_on && tile_gate_q_len >= tile_min_q) {
                     if (probe_on) {
                         int n = probe_tile.fetch_add(1, std::memory_order_relaxed);
                         if (probe_verbose || n == 0) {
@@ -1802,7 +1845,6 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // MAD-301C Lever B: GGML_TYPE_TURBO4_64 now has a flash-decode
                 // path (decode_coop_stage_turbo4_64), so it uses the same gate as
                 // the other turbo types — no exclusion.
-                const bool decode_env_on  = get_paged_decode_mode() != 0;
                 // **Decode regression root cause (2026-05-18 rocprof hunt)**:
                 // the original gate `avg_q_len >= 1` used integer division
                 // `total_q_tokens / num_seqs`, which floors to 0 for the
@@ -1812,15 +1854,13 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // on Qwen3.5/3.6 decode under --kv-tiered.
                 //
                 // Fix: gate on total_q_tokens directly, which is the actual
-                // "any work to do" condition. Cap at DECODE_MAX_Q=16 to
+                // "any work to do" condition. Cap at DECODE_MAX_Q to
                 // bound smem + register pressure.
                 //
                 // num_queries_per_kv * total_q_tokens worst-case check
                 // bounds the GQA-fanout per-block work too: even if all
                 // tokens land in one seq, the kernel can handle them as
                 // long as the product stays under DECODE_MAX_Q.
-                const int  num_queries_per_kv = n_heads / n_kv_heads;
-                const int  decode_max_q       = 16;  // matches DECODE_MAX_Q
                 // MAD-348: the decode kernel processes ONE seq per block, so the
                 // DECODE_MAX_Q bound is per-seq (num_queries_per_kv * this seq's
                 // q_len), NOT the whole batch. Gate on the true per-seq max q_len
@@ -1830,10 +1870,9 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 // Fall back to total_q_tokens when the param is unset (== 0).
                 const int  gate_q_len = (max_q_len_param > 0) ? (int) max_q_len_param
                                                               : total_q_tokens;
-                const bool decode_gate_on = decode_env_on
-                                            && (gate_q_len >= 1) && (gate_q_len <= 8)
-                                            && (num_queries_per_kv * gate_q_len <= decode_max_q)
-                                            && (max_ctx_len >= get_paged_decode_min_ctx());
+                const bool decode_gate_on = decode_available
+                                            && (gate_q_len >= 1)
+                                            && (gate_q_len <= decode_ceiling);
                 if (decode_gate_on) {
                     if (probe_on) {
                         int n = probe_decode.fetch_add(1, std::memory_order_relaxed);

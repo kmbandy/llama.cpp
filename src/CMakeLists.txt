@@ -7,7 +7,7 @@ llama_add_compile_flags()
 # llama
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
-file(GLOB LLAMA_WEIGHT_PAGER_SOURCES "weight-pager/*.cpp")
+file(GLOB LLAMA_WEIGHT_PAGER_SOURCES CONFIGURE_DEPENDS "weight-pager/*.cpp")
 file(GLOB LLAMA_MEMORY_TIER_SOURCES "memory-tier/*.cpp")
 
 add_library(llama

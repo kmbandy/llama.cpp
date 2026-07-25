@@ -1,0 +1,159 @@
+DSWS real-shape log validation
+inputs=114 pass=91 fail=23 other=0
+
+status real/pad M       N      K  reps spread% padded_TF real_TF provenance / reason
+------ ---------- ------- ------ ----- ------- --------- ------- -------------------
+PASS   2048/2112    1024   2560   116    13.8  1.544271 1.497475 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_kv_M2048_145602.log
+PASS    512/576     1024   2560   122    11.8  0.435204 0.386848 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_kv_M512_145620.log
+PASS   2048/2112    2560   4096     5     7.2  2.678945 2.597765 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_o_M2048_145636.log
+PASS    512/576     2560   4096   114     7.1  1.571801 1.397156 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_o_M512_145702.log
+PASS   2048/2112    4096   2560     3     0.8  2.018545 1.957377 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_q_M2048_145517.log
+PASS    512/576     4096   2560   117     5.7  1.697519 1.508906 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_attn_q_M512_145543.log
+PASS   2048/2112    2560   9216     5    11.0  4.521655 4.384635 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_ffn_down_M2048_145418.log
+PASS    512/576     2560   9216    99     4.4  2.818394 2.505239 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_ffn_down_M512_145455.log
+PASS   2048/2112    9216   2560     1     n/a  1.918607 1.860467 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_ffn_gate_up_M2048_145316.log
+PASS    512/576     9216   2560     5     1.3  1.873062 1.664944 /home/kmbandy/dsws_gpu_logs/cfa_ml8_dense_ffn_gate_up_M512_145355.log
+PASS    512/576      512   2048   132     9.8  0.196712 0.174855 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_kv_M512_145913.log
+PASS     64/96       512   2048   136    20.1  0.034338 0.022892 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_kv_M64_145858.log
+PASS    512/576     2048   4096   116     8.1  1.288788 1.145589 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_o_M512_145945.log
+PASS     64/96      2048   4096   130    17.4  0.253015 0.168676 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_o_M64_145929.log
+PASS    512/576     4096   2048   117    10.1  1.351017 1.200904 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_q_M512_145839.log
+PASS     64/96      4096   2048   123    33.8  0.233552 0.155702 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_attn_q_M64_145823.log
+PASS    512/576     2048    512   127     6.3  0.190143 0.169016 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_ffn_down_M512_145807.log
+PASS     64/96      2048    512   134    14.2  0.033867 0.022578 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_ffn_down_M64_145752.log
+PASS    512/576      512   2048   129    20.0  0.188310 0.167386 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_ffn_gate_up_M512_145736.log
+PASS     64/96       512   2048   137    29.7  0.034636 0.023091 /home/kmbandy/dsws_gpu_logs/cfa_ml8_moe_ffn_gate_up_M64_145720.log
+PASS    512/576     1536    768   127    18.4  0.213103 0.189425 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_MoE_expert_fc1_M512_150003.log
+PASS    512/576      768   1536   127    13.9  0.205772 0.182908 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_MoE_expert_fc2_M512_150019.log
+PASS   4096/4128     192    768   129     6.4  0.195745 0.194227 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_attn_linear_k_M4096_150251.log
+PASS   4096/4128     768    768     5     2.2  0.388468 0.385456 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_attn_o_proj_M4096_150217.log
+PASS   4096/4128   32000    768     1     n/a  0.724070 0.718457 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_lm_head_M4096_150035.log
+PASS   4096/4128     768   1536     5     5.2  0.756934 0.751066 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_mamba_out_proj_M4096_150159.log
+PASS   4096/4128     256    768   127     7.8  0.256171 0.254185 /home/kmbandy/dsws_gpu_logs/cfa_mlmf_router_down_proj_M4096_150234.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_batch2_ffn_gate_up_M2048_114101.log :: INVALID_RUN_MARKER: WARN chunk @base0 wall 0.81s > 0.75s cap -> ABORT
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bndprobe_ffn_down_nkseg36_094629.log :: INVALID_RUN_MARKER: WORK-INEXACT
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bndprobe_nonpow2_m64n64k768_085216.log :: INVALID_RUN_MARKER: WORK-INEXACT
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bringup_B_fieldstride_m64n64k768_092429.log :: NOT_A_REAL_SHAPE: geometry does not match the recovered 33-shape inventory
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bringup_moe_attn_q_M512_075737.log :: INVALID_RUN_MARKER: WORK-INEXACT
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bringup_nkseg_native_m64n64k768_090744.log :: INVALID_RUN_MARKER: WORK-INEXACT
+PASS   2048/2048    9216   2560    65     8.8  7.154289 7.154289 /home/kmbandy/dsws_gpu_logs/rs_bringup_peekfix_ffn_gate_up_M2048_101742.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_bringup_phantomfree_m64n64k768_095602.log :: NOT_A_REAL_SHAPE: geometry does not match the recovered 33-shape inventory
+PASS   2048/2048    9216   2560     1     n/a  1.258744 1.258744 /home/kmbandy/dsws_gpu_logs/rs_capverify_ffn_gate_up_102833.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_capwarn_negcontrol_102914.log :: NOT_A_REAL_SHAPE: geometry does not match the recovered 33-shape inventory
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_dense_attn_o_171549.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_dense_ffn_down_171511.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_fw_segk128_pool2_113336.log :: PARSE_ORACLE: expected exactly one emission, found 0
+PASS   2048/2048    1024   2560   108    10.2  1.295848 1.295848 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_kv_M2048_100121.log
+PASS   2048/2112    1024   2560   103     5.6  1.243863 1.206170 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_kv_M2048_110258.log
+PASS    512/512     1024   2560   125     9.5  0.400346 0.400346 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_kv_M512_100137.log
+PASS    512/576     1024   2560   119     8.5  0.415580 0.369404 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_kv_M512_110315.log
+PASS   2048/2048    2560   4096    91    20.0  4.247186 4.247186 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_o_M2048_100153.log
+PASS   2048/2112    2560   4096     5     3.4  2.385909 2.313609 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_o_M2048_110331.log
+PASS    512/512     2560   4096   109     6.3  1.285994 1.285994 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_o_M512_100212.log
+PASS    512/576     2560   4096   105    10.2  1.386149 1.232133 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_o_M512_110349.log
+PASS   2048/2048    4096   2560    86    18.6  4.146417 4.146417 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_q_M2048_100046.log
+PASS   2048/2112    4096   2560     3     4.2  1.607084 1.558384 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_q_M2048_110223.log
+PASS    512/512     4096   2560   107     9.9  1.287482 1.287482 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_q_M512_100104.log
+PASS    512/576     4096   2560   104     4.0  1.392591 1.237859 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_attn_q_M512_110242.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_down_M2048_093411.log :: INVALID_RUN_MARKER: WORK-INEXACT
+PASS   2048/2048    2560   9216    78     6.0  7.462661 7.462661 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_down_M2048_100007.log
+PASS   2048/2112    2560   9216     5     1.2  4.536572 4.399100 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_down_M2048_110144.log
+PASS    512/512     2560   9216   100    13.7  2.540576 2.540576 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_down_M512_100028.log
+PASS    512/576     2560   9216    97     5.3  2.745842 2.440748 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_down_M512_110206.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M2048_082859.log :: INVALID_RUN_MARKER: WORK-INEXACT
+PASS   2048/2048    9216   2560    12    97.3  0.705712 0.705712 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M2048_093331.log
+PASS   2048/2048    9216   2560    65     5.9  7.235895 7.235895 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M2048_095928.log
+PASS   2048/2112    9216   2560     1     n/a  1.608950 1.560194 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M2048_110104.log
+PASS    512/512     9216   2560    25    98.1  0.348353 0.348353 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M512_093353.log
+PASS    512/512     9216   2560    95     8.3  2.536763 2.536763 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M512_095950.log
+PASS    512/576     9216   2560     5     1.7  1.485315 1.320280 /home/kmbandy/dsws_gpu_logs/rs_ml8_dense_ffn_gate_up_M512_110126.log
+PASS    512/512      512   2048   134     7.7  0.181149 0.181149 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_kv_M512_100421.log
+PASS    512/576      512   2048   133     9.4  0.198413 0.176367 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_kv_M512_110556.log
+PASS     64/64       512   2048   139    14.5  0.024112 0.024112 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_kv_M64_100405.log
+PASS     64/96       512   2048   137    16.3  0.035038 0.023359 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_kv_M64_110541.log
+PASS    512/512     2048   4096   111     5.2  1.059718 1.059718 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_o_M512_100453.log
+PASS    512/576     2048   4096   109     9.4  1.155838 1.027412 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_o_M512_110628.log
+PASS     64/64      2048   4096   133     8.1  0.176423 0.176423 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_o_M64_100437.log
+PASS     64/96      2048   4096   129     7.2  0.250036 0.166691 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_o_M64_110612.log
+PASS    512/512     4096   2048   108     8.5  1.039156 1.039156 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_q_M512_100348.log
+PASS    512/576     4096   2048   105     5.7  1.120203 0.995736 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_q_M512_110524.log
+PASS     64/64      4096   2048   132    25.0  0.175443 0.175443 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_q_M64_100332.log
+PASS     64/96      4096   2048   123    14.7  0.233284 0.155523 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_attn_q_M64_110509.log
+PASS    512/512     2048    512   120    14.5  0.152459 0.152459 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_down_M512_100316.log
+PASS    512/576     2048    512   123     4.9  0.178318 0.158505 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_down_M512_110453.log
+PASS     64/64      2048    512   141    12.0  0.024750 0.024750 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_down_M64_100300.log
+PASS     64/96      2048    512   138    12.0  0.035514 0.023676 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_down_M64_110437.log
+PASS    512/512      512   2048   134    10.1  0.179341 0.179341 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_gate_up_M512_100244.log
+PASS    512/576      512   2048   128    22.9  0.186004 0.165337 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_gate_up_M512_110422.log
+PASS     64/64       512   2048   140    16.3  0.024414 0.024414 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_gate_up_M64_100228.log
+PASS     64/96       512   2048   137     9.9  0.035110 0.023406 /home/kmbandy/dsws_gpu_logs/rs_ml8_moe_ffn_gate_up_M64_110406.log
+PASS    512/512     1536    768   129     8.2  0.192693 0.192693 /home/kmbandy/dsws_gpu_logs/rs_mlmf_MoE_expert_fc1_M512_100509.log
+PASS    512/576     1536    768   122     7.0  0.195722 0.173975 /home/kmbandy/dsws_gpu_logs/rs_mlmf_MoE_expert_fc1_M512_110644.log
+PASS    512/512      768   1536   132     8.1  0.199424 0.199424 /home/kmbandy/dsws_gpu_logs/rs_mlmf_MoE_expert_fc2_M512_100525.log
+PASS    512/576      768   1536   128     6.6  0.211973 0.188420 /home/kmbandy/dsws_gpu_logs/rs_mlmf_MoE_expert_fc2_M512_110700.log
+PASS   4096/4096     768    768   109     9.6  0.613835 0.613835 /home/kmbandy/dsws_gpu_logs/rs_mlmf_attn_o_proj_M4096_100628.log
+PASS   4096/4128     768    768     5     3.8  0.344935 0.342261 /home/kmbandy/dsws_gpu_logs/rs_mlmf_attn_o_proj_M4096_110814.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_mlmf_expert_dn_171633.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_mlmf_expert_up_171616.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+PASS   4096/4096   32000    768    24    21.0  7.204911 7.204911 /home/kmbandy/dsws_gpu_logs/rs_mlmf_lm_head_M4096_100541.log
+PASS   4096/4128   32000    768     1     n/a  0.573614 0.569167 /home/kmbandy/dsws_gpu_logs/rs_mlmf_lm_head_M4096_110715.log
+PASS   4096/4096     768   1536   105    64.5  1.168707 1.168707 /home/kmbandy/dsws_gpu_logs/rs_mlmf_mamba_out_proj_M4096_100612.log
+PASS   4096/4128     768   1536     5     2.2  0.689855 0.684508 /home/kmbandy/dsws_gpu_logs/rs_mlmf_mamba_out_proj_M4096_110757.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_mlmf_router_MLP_M4096_100701.log :: INVALID_RUN_MARKER: WORK-INEXACT
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_mlmf_router_MLP_M4096_110846.log :: INVALID_RUN_MARKER: WORK-INEXACT
+PASS   4096/4096     256    768   126     9.4  0.249920 0.249920 /home/kmbandy/dsws_gpu_logs/rs_mlmf_router_down_proj_M4096_100645.log
+PASS   4096/4128     256    768   120    10.4  0.229920 0.228138 /home/kmbandy/dsws_gpu_logs/rs_mlmf_router_down_proj_M4096_110830.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_moe_attn_kv_171346.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_moe_attn_o_171312.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_moe_ffn_down_171425.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_moe_ffn_gu_171405.log :: PARSE_WORK_EXACT: expected exactly one emission, found 0
+PASS   2048/2048    2560   9216    77     5.0  7.373797 7.373797 /home/kmbandy/dsws_gpu_logs/rs_phantomfree_ffn_down_nkseg36_095716.log
+PASS   2048/2112    9216   2560     1     n/a  0.163296 0.158348 /home/kmbandy/dsws_gpu_logs/rs_phase_LOSS_ffn_gate_up_M2048_112645.log
+PASS     64/96       512   2048     1     n/a  0.017755 0.011837 /home/kmbandy/dsws_gpu_logs/rs_phase_WIN_moe_attn_kv_M64_112750.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_phist_nonpow2_m64n64k768_085745.log :: INVALID_RUN_MARKER: WORK-INEXACT
+PASS   2048/2048    9216   2560     1     n/a  0.033438 0.033438 /home/kmbandy/dsws_gpu_logs/rs_phist_pf_chunked_104009.log
+FAIL            -       -      -     -       -         -       - /home/kmbandy/dsws_gpu_logs/rs_phist_phantomfree_ffn_gate_up_102430.log :: INVALID_RUN_MARKER: WARN chunk @base0 wall 2.46s > 0.75s cap -> ABORT
+PASS   2048/2048    9216   2560    65     3.5  7.176321 7.176321 /home/kmbandy/dsws_gpu_logs/rs_prelockdrain_ffn_gate_up_M2048_102317.log
+PASS    512/512     4096   2048   108     5.5  1.044982 1.044982 /home/kmbandy/dsws_gpu_logs/rs_regress_pow2_moe_attn_q_M512_092714.log
+PASS   2048/2112    9216   2560     1     n/a  0.241225 0.233915 /home/kmbandy/dsws_gpu_logs/rs_resvprobe_ffn_gate_up_M2048_113843.log
+PASS    512/512     4096   2048   108    10.6  1.039876 1.039876 /home/kmbandy/dsws_gpu_logs/rs_verify_gatefix_moe_attn_q_M512_082609.log
+
+TF columns are emitted only for PASS records. Every TF row names its exact source log.
+real_TF = padded_TF * real_M / padded_M. spread=n/a means reps=1.
+
+Recovered real-shape inventory (live config: M tile=96, N tile=64, SEGK=256)
+live_status label                       real/pad M       N      K reason / passing archived logs
+----------- --------------------------- ---------- ------- ------ ------------------------------
+SUPPORTED   ml8_dense_ffn_gate_up       2048/2112    9216   2560 PASS_LOG_AVAILABLE; passing_archived_logs=4
+SUPPORTED   ml8_dense_ffn_gate_up        512/576     9216   2560 PASS_LOG_AVAILABLE; passing_archived_logs=4
+SUPPORTED   ml8_dense_ffn_down          2048/2112    2560   9216 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_ffn_down           512/576     2560   9216 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_q            2048/2112    4096   2560 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_q             512/576     4096   2560 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_kv           2048/2112    1024   2560 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_kv            512/576     1024   2560 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_o            2048/2112    2560   4096 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_dense_attn_o             512/576     2560   4096 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_ffn_gate_up           64/96       512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_ffn_gate_up          512/576      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_ffn_down              64/96      2048    512 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_ffn_down             512/576     2048    512 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_q                64/96      4096   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_q               512/576     4096   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_kv               64/96       512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_kv              512/576      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_o                64/96      2048   4096 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   ml8_moe_attn_o               512/576     2048   4096 PASS_LOG_AVAILABLE; passing_archived_logs=3
+UNSUPPORTED mlmf_mamba_in_proj          4096/4128    4200    768 N%64=40
+UNSUPPORTED mlmf_in_proj_ML8PAD         4096/4128    4208    768 N%64=48
+SUPPORTED   mlmf_MoE_expert_fc1          512/576     1536    768 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_MoE_expert_fc2          512/576      768   1536 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_lm_head                4096/4128   32000    768 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_mamba_out_proj         4096/4128     768   1536 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_attn_o_proj            4096/4128     768    768 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_router_down_proj       4096/4128     256    768 PASS_LOG_AVAILABLE; passing_archived_logs=3
+SUPPORTED   mlmf_router_MLP             4096/4128     256    256 NO_ACCEPTED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_attn_linear_k          4096/4128     192    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+UNSUPPORTED mlmf_attn_val_proj1         4096/4128      96    768 N%64=32
+UNSUPPORTED mlmf_router_out             4096/4128       8    256 N%64=8
+UNSUPPORTED mlmf_routerout_ML8PAD       4096/4128      16    256 N%64=16

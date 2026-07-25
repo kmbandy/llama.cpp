@@ -20,12 +20,15 @@
 
 #include "wp-page-catalog.h"
 #include "wp-file-io.h"
+#include "wp-host-prefetch.h"
 #include "wp-host-tier.h"
 #include "wp-pool.h"
 #include "wp-gpu-transport.h"
 #include "wp-prefetch.h"
 #include "wp-router-predictor.h"
 
+#include <atomic>
+#include <functional>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +58,72 @@ struct ggml_tensor;
 
 namespace wp {
 
+// Explicit opt-in resolver, kept CPU-testable without a HIP pager instance.
+bool wp_pipeline_promotions_enabled();
+
+// Achieved-concurrency accounting for the HOST O_DIRECT read-worker pool
+// (see ensure_odirect_worker_loop_ in wp-pager.cpp). ensure_batch_max_n /
+// ensure_batch_avg_n (Stats, below) only count how many jobs were QUEUED
+// per batch -- they say nothing about how many pread()s were genuinely
+// executing at once. This tracker answers that question directly:
+// begin() is called by a worker immediately before issuing its pread(),
+// end() immediately after that pread() returns (success or failure).
+//
+// Deliberately lock-free -- three independent atomics, no mutex -- because
+// this sits on the hot read path and any lock here would itself become the
+// bottleneck it exists to diagnose.
+//
+//   peak()    -- the highest in-flight count observed by ANY begin() call
+//                across the whole run (a running high-water mark).
+//   average() -- the in-flight count is SAMPLED at the instant each
+//                begin() call happens (i.e. how many reads -- including
+//                the one just starting -- are in flight at that moment),
+//                and average() is the mean of those per-begin samples.
+//                This is a call-weighted average of queue depth at
+//                read-start, NOT a time-weighted average over wall-clock
+//                (a time-weighted version would need a timestamp per event
+//                plus an integral, which is not worth the added cost or
+//                complexity here). It is cheap -- one atomic fetch_add per
+//                begin() -- and is defensible for the question it exists
+//                to answer: are ~9 queued jobs actually running ~9 deep,
+//                or effectively serializing? A pool that truly serializes
+//                reports avg == 1.0 (every read starts finding itself
+//                alone in flight); a pool that overlaps N reads at a time
+//                reports avg close to N.
+struct EnsureODirectInFlightTracker {
+    std::atomic<int64_t> current_{0};
+    std::atomic<int64_t> peak_{0};
+    std::atomic<int64_t> sample_sum_{0};
+    std::atomic<int64_t> samples_{0};
+
+    // Call immediately before issuing pread(). Returns the post-increment
+    // in-flight count (informational; callers may ignore it).
+    int64_t begin() {
+        const int64_t n = current_.fetch_add(1, std::memory_order_relaxed) + 1;
+        sample_sum_.fetch_add(n, std::memory_order_relaxed);
+        samples_.fetch_add(1, std::memory_order_relaxed);
+        int64_t prev = peak_.load(std::memory_order_relaxed);
+        while (n > prev && !peak_.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {
+            // prev is updated to the current value by compare_exchange_weak
+            // on failure; loop retries until we win or another begin() has
+            // already pushed the peak >= n.
+        }
+        return n;
+    }
+
+    // Call immediately after pread() returns (success or failure).
+    void end() {
+        current_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    int64_t current() const { return current_.load(std::memory_order_relaxed); }
+    int64_t peak()    const { return peak_.load(std::memory_order_relaxed); }
+    double  average() const {
+        const int64_t n = samples_.load(std::memory_order_relaxed);
+        return n > 0 ? (double) sample_sum_.load(std::memory_order_relaxed) / (double) n : 0.0;
+    }
+};
+
 class WeightPager {
 public:
     struct Config {
@@ -83,7 +152,27 @@ public:
         uint64_t xlayer_resident_skips          = 0; // predicted pages already resident/in-flight
         uint64_t xlayer_blocked_budget          = 0; // submits skipped: speculative cap reached
         uint64_t xlayer_blocked_free_queue      = 0; // submits skipped: scheduler queue full
+        uint64_t demand_trimmed_by_reserve      = 0; // demand pages withheld to protect the reserve
+        uint64_t xlayer_harvest_calls           = 0; // harvests run before the speculative gate
+        uint64_t xlayer_harvested_pages         = 0; // Done prefetches committed+reaped by them
         uint64_t host_tier_hits                 = 0;
+        uint64_t host_prefetch_enqueued         = 0;
+        uint64_t host_prefetch_dropped          = 0;
+        uint64_t host_prefetch_read             = 0;
+        uint64_t host_prefetch_read_fail        = 0;
+        uint64_t host_prefetch_skipped          = 0;
+        // Soft-prefetch policy (HostTier path): predictions held until N strikes
+        // and/or trimmed by the per-wave byte budget.
+        uint64_t host_prefetch_strike_held      = 0;
+        uint64_t host_prefetch_budget_trim      = 0;
+        uint64_t ensure_batch_host_hits         = 0; // P2P/path misses served from HostTier
+        // MAD: O_DIRECT alignment fixed to the filesystem's actual block size
+        // (was hardcoded 512, wrong for e.g. btrfs's 4096) -- see
+        // resolve_odirect_alignment()/compute_odirect_read_plan() below. This
+        // counter fires when the padded, aligned read for a page would not
+        // fit the sized bounce buffer; previously that case was a silent
+        // `continue` that fell back to the slower sync path with no signal.
+        uint64_t ensure_batch_host_odirect_cap_skips = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
         uint64_t routing_ptrs_discarded_unconsumed = 0;
@@ -126,16 +215,94 @@ public:
         uint64_t sticky_spec_fires                 = 0; // FA-window sticky/hot prefetch calls
         uint64_t sticky_spec_pages_submitted       = 0; // cold pages submitted in those fires
         uint64_t sticky_spec_pages_resident        = 0; // already resident at fire
-        // ensure_batch multi-QD bursts (P2P path)
+        // ensure_batch multi-QD bursts. ensure_batch_submit_seconds/wait_seconds
+        // carry their ORIGINAL P2P-path meaning: submit is io_uring enqueue
+        // time, wait is completion-wait time. The HOST O_DIRECT pthread-pool
+        // path (WP_ENSURE_BATCH_HOST=1) also writes these two fields, as
+        // aliases, for backward compatibility -- but on that path submit is
+        // actually the whole storage-read wall-clock and wait is actually the
+        // H2D copy phase. Do not read submit/wait as "P2P path" numbers; the
+        // ensure_batch_host_* fields below are the ones that name the
+        // HOST-path phases correctly and should be used for HOST-path analysis.
         uint64_t ensure_batch_calls                = 0;
         uint64_t ensure_batch_pages                = 0; // cold misses issued in batches
-        uint64_t ensure_batch_max_n                = 0; // largest concurrent miss set
+        uint64_t ensure_batch_max_n                = 0; // largest concurrent *real storage*
+                                                         // submission set (excludes HostTier hits)
         uint64_t ensure_batch_bytes                = 0;
-        double   ensure_batch_seconds              = 0.0; // submit+wait wall
+        // Denominator for ensure_batch_gb_s: storage-read-phase wall time
+        // only, comparable across transports. On the HOST path this
+        // excludes the H2D copy phase; the P2P path has no separate H2D
+        // phase (direct_to_device reads land in the VRAM slot directly),
+        // so its submit+wait wall already qualifies. Batches with zero
+        // real storage bytes (pure HostTier hits) contribute no time here.
+        double   ensure_batch_seconds              = 0.0;
         double   ensure_batch_submit_seconds       = 0.0;
         double   ensure_batch_wait_seconds         = 0.0;
         uint64_t ensure_batch_timeouts             = 0; // wait_for_req returned non-Ok
-        uint64_t ensure_batch_n_sub_sum            = 0; // sum of submit_batch return
+        // Real storage submissions only. Both paths must exclude HostTier
+        // hits: on HOST this is the count of jobs actually enqueued to the
+        // O_DIRECT worker pool (n_submitted); on P2P it is submit_batch's
+        // return value (n_sub). HostTier hits never reach either queue.
+        uint64_t ensure_batch_n_sub_sum            = 0;
+        // Transport identity: which ensure_batch branch actually served
+        // each batch's reads this run. More than one can be nonzero in a
+        // single run (e.g. a HOST-path read failing over to the per-page
+        // sync fallback), so all three are counted rather than keeping
+        // only the last path taken.
+        uint64_t ensure_batch_host_path_batches    = 0; // served by HOST O_DIRECT pthread pool
+        uint64_t ensure_batch_p2p_path_batches     = 0; // served by P2P direct_to_device
+        uint64_t ensure_batch_serial_path_batches  = 0; // served by serial sync fallback
+        // HOST O_DIRECT pthread-pool path only (WP_ENSURE_BATCH_HOST=1): the
+        // five phases of ensure_batch's HOST branch, named for what each
+        // actually measures. Unset (0.0) on the P2P and serial-fallback paths.
+        double   ensure_batch_host_jobs_seconds      = 0.0; // building the job list (HostTier lookup + fd resolution)
+        double   ensure_batch_host_prep_seconds      = 0.0; // computing O_DIRECT alignment/bounce params
+        double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
+        double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
+        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase (mixed: promotion + fresh)
+        // P2P direct-to-device path: names deliberately mirror the HOST
+        // phases so arm-to-arm logs are comparable. H2D is structurally zero
+        // on a successful direct read, but remains explicit in the summary.
+        double   ensure_batch_p2p_jobs_seconds       = 0.0;
+        double   ensure_batch_p2p_prep_seconds       = 0.0;
+        double   ensure_batch_p2p_enqueue_seconds    = 0.0;
+        double   ensure_batch_p2p_read_wait_seconds  = 0.0;
+        double   ensure_batch_p2p_h2d_seconds        = 0.0;
+        uint64_t ensure_batch_p2p_fresh_count        = 0;
+        uint64_t ensure_batch_p2p_inflight_peak      = 0;
+        double   ensure_batch_p2p_inflight_avg_at_read_start = 0.0;
+        // MAD-P4 follow-up: ensure_batch_host_h2d_seconds above mixes two
+        // different kinds of H2D copy -- a HostTier RAM->VRAM promotion
+        // (page already read once from storage, now just moving host RAM
+        // bytes to a VRAM slot) and a fresh storage read's H2D (first time
+        // this page's bytes land in VRAM this run). Differencing separate
+        // aggregate phases to infer a per-promotion cost is unreliable (a
+        // 36% spread was observed across two runs); these fields measure
+        // each kind directly instead. Both are 0.0 unless host_tier_ is
+        // enabled. Reported distinctly per call site (ensure_batch's HOST
+        // O_DIRECT path vs page_in_sync_) since the two paths batch their
+        // H2D copies differently and their per-page cost could differ.
+        uint64_t ensure_batch_host_promotion_count      = 0;   // pages promoted RAM->VRAM in ensure_batch HOST path
+        double   ensure_batch_host_promotion_h2d_seconds = 0.0; // their H2D copy time only
+        // Of ensure_batch_host_promotion_count above, how many sourced their
+        // H2D straight from the pinned HostTier arena via borrow() (2026-07-25
+        // zero-copy design) instead of lookup()'s memcpy-into-bounce-buffer
+        // fallback (taken when the arena isn't HIP-pinned). Lets a session
+        // tell the fast path from the fallback in a log instead of inferring
+        // it from indirect evidence.
+        uint64_t ensure_batch_host_zerocopy_promotions   = 0;
+        uint64_t tier_promotion_async_enqueued            = 0;
+        uint64_t tier_promotion_sync_enqueued             = 0;
+        uint64_t tier_promotion_event_pool_exhausted      = 0;
+        // The completion-fence subset above, separately visible for diagnosis.
+        double   tier_promotion_fence_seconds             = 0.0;
+        uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
+        double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
+        uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_
+        double   page_in_sync_promotion_h2d_seconds      = 0.0; // their H2D copy time only (transport_.stage_in)
+        uint64_t page_in_sync_zerocopy_promotions         = 0;   // HostTier borrow() source, not lookup() copy
+        uint64_t page_in_sync_fresh_count                = 0;   // fresh storage reads' H2D in page_in_sync_
+        double   page_in_sync_fresh_h2d_seconds          = 0.0; // their H2D copy time only (transport_.stage_in)
     };
 
     WeightPager() = default;
@@ -312,6 +479,13 @@ public:
     // prefetch their sister pages. No-op unless WP_PREFETCH_XLAYER is set.
     void submit_xlayer_prefetch(const float * h, int from_layer);
     bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
+    void submit_host_prefetch(const float * h, int from_layer);
+    bool host_prefetch_enabled() const { return host_prefetcher_ != nullptr; }
+
+    // Scheduler queue slots that DEMAND prefetch may not consume, so that
+    // speculative submits are not starved by demand contention for one shared
+    // pool (WP_SPEC_RESERVE). 0 = off = previous behaviour exactly.
+    int  spec_reserve() const { return spec_reserve_; }
 
     // --- Draft-as-paging-oracle -------------------------------------------
     // Hash-layer tid2eid(token) is the hard signal (DS4 layers 0..H). Softmax
@@ -386,6 +560,26 @@ public:
     void * slot_base_for_capture(int slot_idx) const { return pool_.slot_base_for_capture(slot_idx); }
 
 private:
+    struct TierPromotionRequest {
+        int page;
+        int slot;
+    };
+    struct TierPromotion {
+        int                    page;
+        HostTier::BorrowHandle  borrow;
+        int                    event;
+    };
+    using TierPromotionEnqueue = std::function<bool(void *, const void *, size_t, size_t, int &)>;
+
+    // Borrows sources, enqueues copies, and retains generation handles until
+    // release_tier_promotions_ is called after the caller's completion fence.
+    // Requests which cannot enqueue deliberately remain absent from `queued`.
+    void enqueue_tier_promotions_(const std::vector<TierPromotionRequest> & requests,
+                                  std::vector<TierPromotion> & queued,
+                                  const TierPromotionEnqueue & enqueue,
+                                  bool transport_events);
+    bool synchronize_tier_promotions_(const std::vector<TierPromotion> & queued);
+    void release_tier_promotions_(std::vector<TierPromotion> & queued);
     // Internal helper: synchronous page-in (used by ensure() on miss).
     // Reads the page's bytes via FileIOLayer (sync path), copies to VRAM,
     // and zeros the padding. Returns the slot index or -1 on failure.
@@ -416,6 +610,14 @@ private:
     // once in init() from catalog_. Mirrors PageCatalog::pages_for_expert but O(1).
     std::map<std::pair<int,int>, std::vector<int>> expert_page_index_;
 
+    // Queue slots withheld from demand for speculative use (WP_SPEC_RESERVE).
+    int  spec_reserve_ = 0;
+
+    // Harvest finished prefetches before the speculative capacity gate
+    // (WP_SPEC_REAP). Done-but-unreaped slots hold queue capacity that no
+    // reservation can reclaim. 0 = off = previous behaviour exactly.
+    bool spec_reap_ = false;
+
     // Cross-layer prefetch (WP_PREFETCH_XLAYER). predictor_ holds host f32
     // copies of each layer's ffn_gate_inp; config knobs parsed once in init().
     RouterPredictor predictor_;
@@ -424,6 +626,17 @@ private:
     int  xlayer_topk_             = 16;
     int  xlayer_max_slots_        = 0;   // 0 => n_slots/4, set in init()
     int  n_layer_                 = 0;   // max catalog block_idx + 1
+    int  host_prefetch_lookahead_ = 2;
+    int  host_prefetch_topm_      = 16;
+    float host_prefetch_min_conf_ = 0.0f;
+    // Soft host-prefetch policy (decaying horizon + thrash guards).
+    // conf for distance d: min(0.99, min_conf + (d-1)*conf_step).
+    // M for distance d: topm for d==1, max(1, topm >> (d-1)) otherwise.
+    float  host_prefetch_conf_step_     = 0.10f;
+    int    host_prefetch_strikes_needed_ = 2;   // 1 = enqueue on first conf pass
+    size_t host_prefetch_bytes_budget_  = 64ull << 20; // 0 = unlimited per wave
+    // Per-page prediction strike counts for the 2-strike gate (catalog-sized).
+    std::vector<uint8_t> host_prefetch_strikes_;
 
     // Monotonic req_id source for the pager's OWN direct file_io_ submissions
     // (page_in_sync_ and ensure_batch). The FileIOLayer is shared with the
@@ -435,10 +648,13 @@ private:
 
     // Owned subsystems.
     std::unique_ptr<FileIOLayer> file_io_;
+    std::unique_ptr<FileIOLayer> host_prefetch_file_io_;
     PoolAllocator                pool_;
     GpuTransport                 transport_;
     PrefetchScheduler            prefetch_;
     std::unique_ptr<HostTier>    host_tier_;
+    std::unique_ptr<HostPrefetcher> host_prefetcher_;
+    uint64_t next_host_prefetch_req_id_ = 1;
 
     // page_idx -> slot_idx (or -1). Set both for in-flight prefetches and
     // for committed (data-ready) pages — distinguished by page_loaded_.
@@ -459,6 +675,9 @@ private:
     bool   initialized_ = false;
     bool   hip_graphs_enabled_ = false;
     bool   async_ensure_enabled_ = false;
+    // WP_PIPELINE_PROMOTIONS defaults on; setting it to 0 selects the
+    // synchronous promotion route for A/B control and required configurations.
+    bool   pipeline_promotions_enabled_ = true;
 
     // MMID active-set history (metrics / optional future priors only).
     static constexpr int kHotExpertCap  = 768;
@@ -567,12 +786,29 @@ private:
 
     // Multi-QD host bounce for ensure_batch (WP_ENSURE_BATCH_HOST=1):
     // Cold random buffered ~1.1 GB/s; O_DIRECT multi-QD ~6.2 GB/s on SN850X.
-    // GGUF tensor offs are not 512-aligned, so each read uses an O_DIRECT
-    // bounce (align-down offset, pad size) then H2D of the payload slice.
+    // GGUF tensor offs are not filesystem-block-aligned, so each read uses an
+    // O_DIRECT bounce (align-down offset, pad size) then H2D of the payload
+    // slice. The alignment authority is the FILESYSTEM's block size (e.g.
+    // btrfs = 4096), not the device's logical_block_size (512) -- using the
+    // device value under-aligns on filesystems with a larger block size and
+    // causes read amplification (measured 2.49x on btrfs). See
+    // resolve_odirect_alignment() / compute_odirect_read_plan().
     std::vector<void *> ensure_host_bufs_;
     size_t              ensure_host_buf_bytes_ = 0;
     bool                ensure_host_bufs_pinned_ = false;
     std::vector<int>    ensure_odirect_fds_; // parallel to file_io fds; -1 = unused
+    // Parallel to ensure_odirect_fds_: the resolved O_DIRECT alignment (bytes,
+    // power of two) and cached file size for each file_idx, populated once in
+    // ensure_odirect_fd_() alongside opening the fd. 0 = not yet resolved.
+    std::vector<size_t>   ensure_odirect_align_;
+    std::vector<uint64_t> ensure_odirect_filesize_;
+    // Running max of ensure_odirect_align_ across all resolved shards -- used
+    // to size the shared bounce buffers (ensure_host_bufs_ready_) before any
+    // individual file_idx's alignment may be known yet. Defaults to 4096
+    // (the fallback alignment) until the first shard resolves, which already
+    // covers the common btrfs case; self-corrects (triggers reallocation) if
+    // a later-resolved shard needs a larger alignment.
+    size_t                ensure_odirect_align_max_ = 0;
     struct EnsureODirectReadJob {
         int      fd     = -1;
         uint64_t off    = 0;
@@ -588,6 +824,11 @@ private:
     std::condition_variable          ensure_odirect_cv_;
     std::condition_variable          ensure_odirect_done_cv_;
     bool                             ensure_odirect_workers_stop_ = false;
+    // Achieved-concurrency counter for the HOST O_DIRECT path (see
+    // EnsureODirectInFlightTracker above). Incremented/decremented in
+    // ensure_odirect_worker_loop_ around each job's pread(); read only
+    // at log time in log_stats_summary().
+    EnsureODirectInFlightTracker     ensure_odirect_inflight_;
     // Kept unconditional (NOT #if LLAMA_HAVE_IO_URING): a struct layout in a
     // shared header must never depend on a per-TU macro. LLAMA_HAVE_IO_URING is
     // PRIVATE to the llama target, so test TUs that include this header lack it;
@@ -610,6 +851,43 @@ private:
     void shutdown_ensure_odirect_ring_();
 #endif
 };
+
+// Resolve the O_DIRECT alignment to use for a shard given its filesystem's
+// reported block size (statfs/fstatfs f_bsize). This is the alignment
+// AUTHORITY for O_DIRECT: the device's logical_block_size is NOT sufficient
+// -- a filesystem (e.g. btrfs, f_bsize=4096) can require coarser alignment
+// than the underlying device reports (512), and misaligned O_DIRECT reads
+// silently amplify (measured 2.49x: 221.9 GB delivered vs 82.7 GB buffered
+// for identical 89.24 GB of requested pages). Guards: never returns a value
+// below kLogicalBlockFloor; requires a power of two; falls back to
+// kFallbackAlign if the input is <= 0 or not a power of two after flooring.
+// Pure function -- no syscalls, unit-testable directly.
+size_t resolve_odirect_alignment(long fs_bsize);
+
+// The aligned, EOF-clamped O_DIRECT read window for one payload read of
+// [off, off+size) bytes.
+struct OdirectReadPlan {
+    uint64_t base;    // align-down start offset for the O_DIRECT pread
+    size_t   prefix;  // payload's byte offset within the bounce buffer
+    size_t   nbytes;  // bytes to actually request this read
+};
+
+// Compute the O_DIRECT read plan for a payload at [off, off+size) against a
+// filesystem alignment `align` (must be a power of two -- see
+// resolve_odirect_alignment) and a shard of `file_size` bytes. `file_size ==
+// 0` means "unknown / unresolved" and disables EOF clamping.
+//
+// Pads [off, off+size) out to `align`-aligned boundaries on both ends, then
+// clamps the padded tail so the request never reads past `file_size`: on
+// O_DIRECT, a padded read that overruns EOF returns EIO rather than a short
+// read (the pre-existing bug this also fixes -- it fired 3x/run at 512
+// alignment and gets strictly worse at 4096, since the overrun can grow to
+// up to align-1 bytes). The payload itself is always fully covered even if
+// `file_size` is inconsistent with `off+size`.
+//
+// Pure function -- no I/O, no global state. Unit-tested directly without a
+// real pager or a real file.
+OdirectReadPlan compute_odirect_read_plan(uint64_t off, size_t size, size_t align, uint64_t file_size);
 
 // File-range descriptor for advise_prefetch — one per paged tensor in the
 // catalog walk. Exposed at namespace scope so unit tests can validate the

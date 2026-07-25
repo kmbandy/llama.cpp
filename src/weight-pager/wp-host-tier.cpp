@@ -3,8 +3,8 @@
 #include "wp-pool.h"      // is_uma_device
 #include "llama-impl.h"  // LLAMA_LOG_*
 
-#include <algorithm>
 #include <cerrno>
+#include <iterator>
 #include <cstdlib>
 #include <cstring>
 
@@ -32,7 +32,8 @@ HostTier::~HostTier() {
 }
 
 bool HostTier::init(size_t budget_bytes, int device_idx) {
-    if (is_initialized()) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ != nullptr && budget_bytes_ > 0) {
         LLAMA_LOG_WARN("wp::HostTier: init called twice\n");
         return false;
     }
@@ -96,9 +97,12 @@ bool HostTier::init(size_t budget_bytes, int device_idx) {
 }
 
 void HostTier::shutdown() {
+    std::lock_guard<std::mutex> lock(mu_);
     resident_.clear();
+    pending_.clear();
     free_lists_.clear();
     lru_.clear();
+    lru_pos_.clear();
     used_bytes_ = 0;
     high_water_ = 0;
 
@@ -126,11 +130,13 @@ void HostTier::shutdown() {
 }
 
 bool HostTier::contains(int page_idx) const {
+    std::lock_guard<std::mutex> lock(mu_);
     return resident_.find(page_idx) != resident_.end();
 }
 
 bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
-    if (!is_initialized() || page_idx < 0 || src_bytes == nullptr || n == 0) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_bytes == nullptr || n == 0) {
         return false;
     }
     if (n > budget_bytes_) {
@@ -146,22 +152,156 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     }
 
     std::memcpy(arena_ + offset, src_bytes, n);
-    resident_[page_idx] = Resident{offset, n};
+    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
     used_bytes_ += n;
     lru_.push_back(page_idx);
+    lru_pos_[page_idx] = std::prev(lru_.end());
     return true;
 }
 
-const void * HostTier::lookup(int page_idx) {
-    if (!is_initialized() || page_idx < 0) {
-        return nullptr;
+void HostTier::erase(int page_idx) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (page_idx < 0) {
+        return;
+    }
+    erase_resident_(page_idx);
+}
+
+bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || device_bytes == nullptr || n == 0) {
+        return false;
+    }
+    if (n > budget_bytes_) {
+        erase_resident_(page_idx);
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    erase_resident_(page_idx);
+    size_t offset = 0;
+    if (!acquire_slot_(page_idx, n, offset)) {
+        return false;
+    }
+    // Synchronous D2H: the caller (on_pool_evict_) has already synchronized any
+    // in-flight transfer for this page, so the device slot is settled here.
+    hipError_t err = hipMemcpy(arena_ + offset, device_bytes, n, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::HostTier::store_from_device: hipMemcpy D2H(%zu) page %d failed: %s\n",
+                       n, page_idx, hipGetErrorString(err));
+        free_lists_[n].push_back(offset);  // return the acquired slot
+        return false;
+    }
+    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
+    used_bytes_ += n;
+    lru_.push_back(page_idx);
+    lru_pos_[page_idx] = std::prev(lru_.end());
+    return true;
+#else
+    (void) device_bytes;
+    return false;
+#endif
+}
+
+bool HostTier::lookup(int page_idx, void * dst_bytes, size_t n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || dst_bytes == nullptr || n == 0) {
+        return false;
     }
     auto it = resident_.find(page_idx);
-    if (it == resident_.end()) {
-        return nullptr;
+    if (it == resident_.end() || it->second.bytes != n) {
+        return false;
     }
     touch_lru_(page_idx);
-    return arena_ + it->second.offset;
+    std::memcpy(dst_bytes, arena_ + it->second.offset, n);
+    return true;
+}
+
+bool HostTier::borrow(int page_idx, const void ** src_out, size_t n, BorrowHandle * handle_out) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_out == nullptr ||
+        handle_out == nullptr || n == 0) {
+        return false;
+    }
+    auto it = resident_.find(page_idx);
+    if (it == resident_.end() || it->second.bytes != n) {
+        return false;
+    }
+    touch_lru_(page_idx);
+    it->second.borrow_count++;
+    *src_out    = arena_ + it->second.offset;
+    *handle_out = it->second.gen;
+    return true;
+}
+
+void HostTier::release(int page_idx, BorrowHandle handle) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (page_idx < 0 || handle == kInvalidBorrowHandle) {
+        return;
+    }
+
+    // The handle names the EXACT entry generation borrow() saw, so there is
+    // no ambiguity even if this page_idx has since been erase()'d and
+    // re-store()'d (or evicted) any number of times: check whether the
+    // CURRENT resident_[page_idx] entry (if any) is that generation first,
+    // then fall back to pending_ (entries retired-while-borrowed live there,
+    // keyed by their own generation, never by page_idx).
+    auto it = resident_.find(page_idx);
+    if (it != resident_.end() && it->second.gen == handle) {
+        if (it->second.borrow_count > 0) {
+            it->second.borrow_count--;
+        }
+        return;
+    }
+
+    auto pit = pending_.find(handle);
+    if (pit != pending_.end()) {
+        Resident & r = pit->second;
+        if (r.borrow_count > 0) {
+            r.borrow_count--;
+        }
+        if (r.borrow_count == 0) {
+            reclaim_(r);
+            pending_.erase(pit);
+        }
+        return;
+    }
+
+    // Neither: a stale/double-released handle. No-op.
+}
+
+bool HostTier::is_initialized() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return arena_ != nullptr && budget_bytes_ > 0;
+}
+
+size_t HostTier::budget_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return budget_bytes_;
+}
+
+size_t HostTier::used_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return used_bytes_;
+}
+
+size_t HostTier::high_water() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return high_water_;
+}
+
+size_t HostTier::resident_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return resident_.size();
+}
+
+bool HostTier::backend_pinned() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return backend_pinned_;
+}
+
+bool HostTier::mlocked() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return mlocked_;
 }
 
 bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
@@ -192,23 +332,33 @@ bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
 }
 
 bool HostTier::evict_one_lru_() {
-    if (lru_.empty()) {
-        return false;
-    }
+    // Walk from the LRU front (least recently used) to the first entry with
+    // no outstanding borrows and evict that one. A borrowed entry is skipped,
+    // not removed -- its arena bytes are in flight to/from a caller and must
+    // stay valid until release(). If every resident entry is borrowed, no
+    // victim exists and the store this was called for fails cleanly (a
+    // failed soft-prefetch store is a non-event by design).
+    for (auto lit = lru_.begin(); lit != lru_.end(); ++lit) {
+        const int page_idx = *lit;
+        auto it = resident_.find(page_idx);
+        if (it == resident_.end() || it->second.borrow_count > 0) {
+            continue;
+        }
 
-    const int page_idx = lru_.front();
-    lru_.pop_front();
-
-    auto it = resident_.find(page_idx);
-    if (it == resident_.end()) {
+        const Resident r = it->second;
+        resident_.erase(it);
+        lru_pos_.erase(page_idx);
+        lru_.erase(lit);
+        free_lists_[r.bytes].push_back(r.offset);
+        used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
         return true;
     }
+    return false;
+}
 
-    const Resident r = it->second;
-    resident_.erase(it);
+void HostTier::reclaim_(const Resident & r) {
     free_lists_[r.bytes].push_back(r.offset);
     used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
-    return true;
 }
 
 void HostTier::erase_resident_(int page_idx) {
@@ -219,22 +369,35 @@ void HostTier::erase_resident_(int page_idx) {
 
     const Resident r = it->second;
     resident_.erase(it);
-    free_lists_[r.bytes].push_back(r.offset);
-    used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
 
-    auto pos = std::find(lru_.begin(), lru_.end(), page_idx);
-    if (pos != lru_.end()) {
-        lru_.erase(pos);
+    auto pos_it = lru_pos_.find(page_idx);
+    if (pos_it != lru_pos_.end()) {
+        lru_.erase(pos_it->second);
+        lru_pos_.erase(pos_it);
     }
+
+    if (r.borrow_count > 0) {
+        // Deferred retirement: gone from resident_/lru_ (contains() is
+        // false, no aliasing on a re-store) but the slot itself is withheld
+        // from free_lists_ until release() drains the last outstanding
+        // borrow on it. Keyed by this entry's OWN generation handle so a
+        // later borrow()/release() pair on a NEW entry for the same
+        // page_idx can never collide with it.
+        pending_[r.gen] = r;
+        return;
+    }
+
+    reclaim_(r);
 }
 
 void HostTier::touch_lru_(int page_idx) {
-    auto pos = std::find(lru_.begin(), lru_.end(), page_idx);
-    if (pos == lru_.end()) {
+    auto pos_it = lru_pos_.find(page_idx);
+    if (pos_it == lru_pos_.end()) {
         return;
     }
-    lru_.erase(pos);
-    lru_.push_back(page_idx);
+    // Move the node to the back (MRU) in O(1) without invalidating any
+    // other iterator, using splice on the same list instance.
+    lru_.splice(lru_.end(), lru_, pos_it->second);
 }
 
 }  // namespace wp

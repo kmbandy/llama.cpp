@@ -640,6 +640,14 @@ extern "C" {
         //   dst    = y (GGML_TYPE_F32, [K, n_rows, ...])
         GGML_OP_ML8_GET_ROWS,
 
+        // Fused Sinkhorn normalization for the DeepSeek-V4 hyper-connection
+        // mixer. Replaces ~139 tiny ggml nodes per call (39 sum_rows + 40 add
+        // + 39 div + 20 cont) with one dispatch. src[0] is a contiguous
+        // [n, n, n_tokens] f32 tensor, n in {2,4,8}.
+        //   op_params[0] = eps   (float)
+        //   op_params[1] = iters (int32, >= 1)
+        GGML_OP_SINKHORN_NORM,
+
         GGML_OP_COUNT,
     };
 
@@ -1459,6 +1467,21 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             float                 eps);
+
+    // fused Sinkhorn normalization over a square [n, n, n_tokens] tensor.
+    // a must be contiguous with a->ne[0] == a->ne[1], n in {2,4,8}.
+    // Semantics (mirrors the DS4 graph form exactly):
+    //   A  = softmax over ne0, per src column
+    //   A += eps
+    //   norm_cols()                                  // one unconditional pass
+    //   repeat (iters-1): norm_rows(); norm_cols()
+    // where norm_cols divides each dst row by (sum over src)+eps and norm_rows
+    // divides each src column by (sum over dst)+eps.
+    GGML_API struct ggml_tensor * ggml_sinkhorn_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps,
+            int32_t               iters);
 
     // a - x
     // b - dy

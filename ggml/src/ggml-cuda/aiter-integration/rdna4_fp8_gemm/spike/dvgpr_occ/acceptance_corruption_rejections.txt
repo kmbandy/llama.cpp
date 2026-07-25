@@ -1,0 +1,47 @@
+DSWS real-shape log validation
+inputs=2 pass=0 fail=2 other=0
+
+status real/pad M       N      K  reps spread% padded_TF real_TF provenance / reason
+------ ---------- ------- ------ ----- ------- --------- ------- -------------------
+FAIL            -       -      -     -       -         -       - /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/acceptance_bad_oracle.txt :: ORACLE_FAILED: require ok>0 and bad=0
+FAIL            -       -      -     -       -         -       - /home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ/acceptance_corrupt_ticks.txt :: SELF_VALIDATION_MISMATCH: ticks/geometry/reps disagree with rendered TF
+
+TF columns are emitted only for PASS records. Every TF row names its exact source log.
+real_TF = padded_TF * real_M / padded_M. spread=n/a means reps=1.
+
+Recovered real-shape inventory (live config: M tile=96, N tile=64, SEGK=256)
+live_status label                       real/pad M       N      K reason / passing archived logs
+----------- --------------------------- ---------- ------- ------ ------------------------------
+SUPPORTED   ml8_dense_ffn_gate_up       2048/2112    9216   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_ffn_gate_up        512/576     9216   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_ffn_down          2048/2112    2560   9216 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_ffn_down           512/576     2560   9216 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_q            2048/2112    4096   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_q             512/576     4096   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_kv           2048/2112    1024   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_kv            512/576     1024   2560 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_o            2048/2112    2560   4096 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_dense_attn_o             512/576     2560   4096 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_ffn_gate_up           64/96       512   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_ffn_gate_up          512/576      512   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_ffn_down              64/96      2048    512 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_ffn_down             512/576     2048    512 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_q                64/96      4096   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_q               512/576     4096   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_kv               64/96       512   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_kv              512/576      512   2048 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_o                64/96      2048   4096 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   ml8_moe_attn_o               512/576     2048   4096 NO_ARCHIVED_LOG; passing_archived_logs=0
+UNSUPPORTED mlmf_mamba_in_proj          4096/4128    4200    768 N%64=40
+UNSUPPORTED mlmf_in_proj_ML8PAD         4096/4128    4208    768 N%64=48
+SUPPORTED   mlmf_MoE_expert_fc1          512/576     1536    768 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_MoE_expert_fc2          512/576      768   1536 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_lm_head                4096/4128   32000    768 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_mamba_out_proj         4096/4128     768   1536 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_attn_o_proj            4096/4128     768    768 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_router_down_proj       4096/4128     256    768 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_router_MLP             4096/4128     256    256 NO_ARCHIVED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_attn_linear_k          4096/4128     192    768 NO_ARCHIVED_LOG; passing_archived_logs=0
+UNSUPPORTED mlmf_attn_val_proj1         4096/4128      96    768 N%64=32
+UNSUPPORTED mlmf_router_out             4096/4128       8    256 N%64=8
+UNSUPPORTED mlmf_routerout_ML8PAD       4096/4128      16    256 N%64=16

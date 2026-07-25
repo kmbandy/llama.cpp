@@ -1,0 +1,11 @@
+  GPU clock-counter freq ~= 100.00 MHz (Dmax cycles -> seconds)
+  G=6 SEGK=256 FM=1 FN=4  NCOMP=4 NAFEED=2 NBFEED=2
+  oracle shape 96x512x2048  (super-tile 96x64, KT=128, NTL=8, MTLsuper=1)
+  [dsws2 bounds] A last=1/2 OK  B last=1/2 OK  C last=1/2 OK
+  [dsws2] 96x512x2048  super-tile=96x64 (G=6 FM=1 FN=4)  TOTAL=8 TOTAL_super=64 n_kseg=8
+  [dsws2] *** WARNING: SINGLE CHUNK (8 tiles) -- the 0.75s cap CANNOT fire mid-chunk
+  [dsws2 completion] occ[0](live)=0 (0=clean)  occ[20](claim)=8
+  [dsws2 WORK-EXACT] computed == G*TOTAL_super == 384  (no work dropped)
+  [dsws2 THROUGHPUT] 96x512x2048  TF=0.2  (0.1% of 307 TF fp8 peak)  span=10000 ticks / 1 chunk(s) @ 100 MHz
+  [dsws2 oracle] ok=24 bad=0 max_rel=0 tier=LOOSE
+  dsws2 oracle CLEAN

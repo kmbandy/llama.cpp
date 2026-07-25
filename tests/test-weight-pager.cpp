@@ -10,6 +10,7 @@
 #include "weight-pager/wp-file-io.h"
 #include "weight-pager/wp-gpu-transport.h"
 #include "weight-pager/wp-host-tier.h"
+#include "weight-pager/wp-host-prefetch.h"
 #include "weight-pager/wp-pager.h"   // compute_advise_ranges / AdviseRange
 #include "weight-pager/wp-pool.h"
 #include "weight-pager/wp-prefetch.h"
@@ -20,6 +21,8 @@
 #include "ggml.h"
 
 #include <cerrno>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +30,7 @@
 #include <fcntl.h>
 #include <map>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -100,6 +104,33 @@ private:
     int pending_ = 0;
     bool emitted_ = false;
 };
+
+static int test_p2p_tunable_resolution() {
+    int fails = 0;
+    ScopedEnv queue_guard("WP_P2P_QUEUE_DEPTH");
+    ScopedEnv window_guard("WP_P2P_WINDOW_CACHE_MAX");
+    ScopedEnv tier_guard("WP_P2P_DIRECT_TO_DEVICE");
+
+    unsetenv("WP_P2P_QUEUE_DEPTH");
+    unsetenv("WP_P2P_WINDOW_CACHE_MAX");
+    unsetenv("WP_P2P_DIRECT_TO_DEVICE");
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 16, "queue default preserves configured depth");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 64, "window default preserves clamp(4*QD,64,256)");
+    EXPECT(!wp::p2p_direct_to_device_with_tier(), "tier-direct default preserves staging/store behavior");
+
+    setenv("WP_P2P_QUEUE_DEPTH", "32", 1);
+    setenv("WP_P2P_WINDOW_CACHE_MAX", "99", 1);
+    setenv("WP_P2P_DIRECT_TO_DEVICE", "1", 1);
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 32, "queue env override");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 99, "independent window env override");
+    EXPECT(wp::p2p_direct_to_device_with_tier(), "tier-direct explicit opt-in");
+
+    setenv("WP_P2P_QUEUE_DEPTH", "0", 1);
+    setenv("WP_P2P_WINDOW_CACHE_MAX", "99999", 1);
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 1, "queue lower clamp");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 4096, "window upper clamp");
+    return fails;
+}
 
 // ---------------------------------------------------------------------------
 // PageCatalog
@@ -1172,9 +1203,9 @@ static int test_host_tier_store_lookup() {
     for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 3 + 1);
 
     EXPECT(tier.store(/*page_idx=*/7, src.data(), src.size()), "store page");
-    const void * p = tier.lookup(7);
-    EXPECT(p != nullptr, "lookup returns pointer");
-    EXPECT(std::memcmp(p, src.data(), src.size()) == 0, "lookup bytes match");
+    std::vector<uint8_t> out(src.size());
+    EXPECT(tier.lookup(7, out.data(), out.size()), "lookup copies page");
+    EXPECT(std::memcmp(out.data(), src.data(), src.size()) == 0, "lookup bytes match");
     EXPECT_EQ_INT(tier.used_bytes(), src.size(), "used bytes after store");
     EXPECT_EQ_INT(tier.resident_count(), 1u, "one resident page");
 
@@ -1192,15 +1223,13 @@ static int test_host_tier_size_class_reuse() {
     std::vector<uint8_t> c(32, 0xC3);
 
     EXPECT(tier.store(1, a.data(), a.size()), "store page 1");
-    const void * p1 = tier.lookup(1);
     EXPECT(tier.store(2, b.data(), b.size()), "store page 2");
     EXPECT(tier.store(3, c.data(), c.size()), "store page 3 evicts page 1");
-    const void * p3 = tier.lookup(3);
+    std::vector<uint8_t> out(c.size());
 
-    EXPECT(p1 != nullptr && p3 != nullptr, "pointers valid");
-    EXPECT(p3 == p1, "same-size store reuses evicted slot");
-    EXPECT(tier.lookup(1) == nullptr, "evicted page 1 missing");
-    EXPECT(std::memcmp(p3, c.data(), c.size()) == 0, "reused slot has new bytes");
+    EXPECT(tier.lookup(3, out.data(), out.size()), "lookup reused page");
+    EXPECT(!tier.lookup(1, out.data(), out.size()), "evicted page 1 missing");
+    EXPECT(std::memcmp(out.data(), c.data(), c.size()) == 0, "reused slot has new bytes");
 
     return fails;
 }
@@ -1217,10 +1246,11 @@ static int test_host_tier_lru_eviction_order() {
     EXPECT(tier.store(12, bytes.data(), bytes.size()), "store 12");
     EXPECT(tier.store(13, bytes.data(), bytes.size()), "store 13 evicts oldest");
 
-    EXPECT(tier.lookup(10) == nullptr, "oldest page evicted first");
-    EXPECT(tier.lookup(11) != nullptr, "page 11 still resident");
-    EXPECT(tier.lookup(12) != nullptr, "page 12 still resident");
-    EXPECT(tier.lookup(13) != nullptr, "new page resident");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(10, out.data(), out.size()), "oldest page evicted first");
+    EXPECT(tier.lookup(11, out.data(), out.size()), "page 11 still resident");
+    EXPECT(tier.lookup(12, out.data(), out.size()), "page 12 still resident");
+    EXPECT(tier.lookup(13, out.data(), out.size()), "new page resident");
     EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count stays at capacity");
 
     return fails;
@@ -1237,13 +1267,14 @@ static int test_host_tier_lookup_touch_keeps_mru() {
     EXPECT(tier.store(21, bytes.data(), bytes.size()), "store 21");
     EXPECT(tier.store(22, bytes.data(), bytes.size()), "store 22");
 
-    EXPECT(tier.lookup(20) != nullptr, "touch page 20");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(tier.lookup(20, out.data(), out.size()), "touch page 20");
     EXPECT(tier.store(23, bytes.data(), bytes.size()), "store 23 evicts LRU after touch");
 
-    EXPECT(tier.lookup(20) != nullptr, "touched page kept as MRU");
-    EXPECT(tier.lookup(21) == nullptr, "untouched oldest page evicted");
-    EXPECT(tier.lookup(22) != nullptr, "page 22 still resident");
-    EXPECT(tier.lookup(23) != nullptr, "page 23 resident");
+    EXPECT(tier.lookup(20, out.data(), out.size()), "touched page kept as MRU");
+    EXPECT(!tier.lookup(21, out.data(), out.size()), "untouched oldest page evicted");
+    EXPECT(tier.lookup(22, out.data(), out.size()), "page 22 still resident");
+    EXPECT(tier.lookup(23, out.data(), out.size()), "page 23 resident");
 
     return fails;
 }
@@ -1262,9 +1293,10 @@ static int test_host_tier_over_budget_evict() {
     EXPECT(tier.store(32, bytes.data(), bytes.size()), "store beyond used budget evicts and succeeds");
     EXPECT_EQ_INT(tier.used_bytes(), 64u, "used bytes remains capped");
     EXPECT_EQ_INT(tier.resident_count(), 2u, "resident count remains capped");
-    EXPECT(tier.lookup(30) == nullptr, "oldest page evicted under pressure");
-    EXPECT(tier.lookup(31) != nullptr, "page 31 still resident");
-    EXPECT(tier.lookup(32) != nullptr, "new page resident");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(30, out.data(), out.size()), "oldest page evicted under pressure");
+    EXPECT(tier.lookup(31, out.data(), out.size()), "page 31 still resident");
+    EXPECT(tier.lookup(32, out.data(), out.size()), "new page resident");
 
     return fails;
 }
@@ -1276,11 +1308,691 @@ static int test_host_tier_lookup_miss() {
     EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
 
     std::vector<uint8_t> bytes(16, 0x44);
-    EXPECT(tier.lookup(99) == nullptr, "empty lookup returns nullptr");
-    EXPECT(tier.lookup(-1) == nullptr, "negative lookup returns nullptr");
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(99, out.data(), out.size()), "empty lookup misses");
+    EXPECT(!tier.lookup(-1, out.data(), out.size()), "negative lookup misses");
     EXPECT(tier.store(40, bytes.data(), bytes.size()), "store 40");
-    EXPECT(tier.lookup(41) == nullptr, "different page lookup misses");
+    EXPECT(!tier.lookup(41, out.data(), out.size()), "different page lookup misses");
 
+    return fails;
+}
+
+static int test_host_tier_concurrency() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/512, /*device_idx=*/-1), "host tier init");
+
+    constexpr int n_threads = 4;
+    constexpr int n_pages = 8;
+    constexpr int n_iters = 25000;
+    constexpr size_t page_size = 32;
+    std::atomic<int> bad_lookups{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&tier, &bad_lookups, t]() {
+            std::vector<uint8_t> expected(page_size);
+            std::vector<uint8_t> out(page_size);
+            for (int i = 0; i < n_iters; ++i) {
+                const int page = (i + t) % n_pages;
+                std::fill(expected.begin(), expected.end(), (uint8_t) page);
+                if ((i % 7) == 0) {
+                    tier.erase(page);
+                } else {
+                    tier.store(page, expected.data(), expected.size());
+                }
+                if (tier.lookup(page, out.data(), out.size()) &&
+                    std::memcmp(out.data(), expected.data(), out.size()) != 0) {
+                    ++bad_lookups;
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ_INT(bad_lookups.load(), 0, "lookup bytes remain page-consistent");
+    EXPECT(tier.used_bytes() <= tier.budget_bytes(), "used bytes stay within budget");
+    EXPECT(tier.resident_count() <= n_pages, "resident pages stay within page set");
+    return fails;
+}
+
+static int test_host_tier_repeated_touches_eviction_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x55);
+    EXPECT(tier.store(50, bytes.data(), bytes.size()), "store 50");
+    EXPECT(tier.store(51, bytes.data(), bytes.size()), "store 51");
+    EXPECT(tier.store(52, bytes.data(), bytes.size()), "store 52");
+    EXPECT(tier.store(53, bytes.data(), bytes.size()), "store 53");
+
+    std::vector<uint8_t> out(bytes.size());
+
+    // Repeatedly touch 50 and 51 so 52 and 53 remain the least-recently-used,
+    // in that order, regardless of how many times the MRU pages are re-touched.
+    for (int i = 0; i < 5; ++i) {
+        EXPECT(tier.lookup(51, out.data(), out.size()), "repeated touch of 51");
+        EXPECT(tier.lookup(50, out.data(), out.size()), "repeated touch of 50");
+    }
+
+    // Budget for 4 pages of 32 bytes; storing a 5th must evict 52 (now LRU).
+    EXPECT(tier.store(54, bytes.data(), bytes.size()), "store 54 evicts current LRU (52)");
+    EXPECT(!tier.lookup(52, out.data(), out.size()), "52 evicted first despite earlier insertion order");
+    EXPECT(tier.lookup(53, out.data(), out.size()), "53 still resident");
+    EXPECT(tier.lookup(50, out.data(), out.size()), "50 still resident (touched)");
+    EXPECT(tier.lookup(51, out.data(), out.size()), "51 still resident (touched)");
+    EXPECT(tier.lookup(54, out.data(), out.size()), "54 resident");
+
+    // Next eviction should now take 53, the next-oldest untouched page.
+    EXPECT(tier.store(55, bytes.data(), bytes.size()), "store 55 evicts next LRU (53)");
+    EXPECT(!tier.lookup(53, out.data(), out.size()), "53 evicted second");
+    EXPECT(tier.lookup(55, out.data(), out.size()), "55 resident");
+
+    return fails;
+}
+
+static int test_host_tier_erase_middle_preserves_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x66);
+    EXPECT(tier.store(60, bytes.data(), bytes.size()), "store 60");
+    EXPECT(tier.store(61, bytes.data(), bytes.size()), "store 61");
+    EXPECT(tier.store(62, bytes.data(), bytes.size()), "store 62");
+    EXPECT(tier.store(63, bytes.data(), bytes.size()), "store 63");
+
+    // Erase the middle element (61); the relative recency order of the
+    // remaining pages (60, 62, 63) must be unaffected.
+    tier.erase(61);
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "erase drops resident count by one");
+
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(61, out.data(), out.size()), "erased page gone");
+
+    // Budget holds 4 pages; after freeing 61's slot there is room for two more
+    // stores before an eviction is forced, and the LRU order among (60,62,63)
+    // must still be 60 first.
+    EXPECT(tier.store(64, bytes.data(), bytes.size()), "store 64 into freed slot");
+    EXPECT(tier.store(65, bytes.data(), bytes.size()), "store 65 forces eviction of oldest (60)");
+    EXPECT(!tier.lookup(60, out.data(), out.size()), "60 was oldest remaining and is evicted first");
+    EXPECT(tier.lookup(62, out.data(), out.size()), "62 still resident");
+    EXPECT(tier.lookup(63, out.data(), out.size()), "63 still resident");
+    EXPECT(tier.lookup(64, out.data(), out.size()), "64 still resident");
+    EXPECT(tier.lookup(65, out.data(), out.size()), "65 still resident");
+
+    return fails;
+}
+
+static int test_host_tier_touch_absent_is_noop() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x77);
+    EXPECT(tier.store(70, bytes.data(), bytes.size()), "store 70");
+    EXPECT(tier.store(71, bytes.data(), bytes.size()), "store 71");
+    EXPECT(tier.store(72, bytes.data(), bytes.size()), "store 72");
+
+    std::vector<uint8_t> out(bytes.size());
+
+    // Looking up (and thus attempting to touch) a page that was never stored,
+    // and erasing a page that was never stored, must not disturb existing
+    // residency, byte accounting, or LRU order.
+    EXPECT(!tier.lookup(999, out.data(), out.size()), "lookup of absent page misses");
+    tier.erase(998);
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count unaffected by no-op touch/erase");
+    EXPECT_EQ_INT(tier.used_bytes(), 96u, "used bytes unaffected by no-op touch/erase");
+
+    // LRU order should still be 70, 71, 72 (oldest first) since the no-op
+    // lookups/erases above must not have touched anything.
+    EXPECT(tier.store(73, bytes.data(), bytes.size()), "store 73 evicts true LRU (70)");
+    EXPECT(!tier.lookup(70, out.data(), out.size()), "70 evicted as expected, unaffected by no-op calls");
+    EXPECT(tier.lookup(71, out.data(), out.size()), "71 still resident");
+    EXPECT(tier.lookup(72, out.data(), out.size()), "72 still resident");
+    EXPECT(tier.lookup(73, out.data(), out.size()), "73 resident");
+
+    return fails;
+}
+
+// Regression test for the O(n) std::find LRU scan (measured ~2.95s for
+// ~20000 lookups against ~1880 resident pages in production). Reproduces
+// the same shape with small synthetic pages so the cost measured here is
+// the bookkeeping (touch/erase) itself, not the memcpy. Lookups are issued
+// in a fixed pseudo-random order (not insertion order) so each touch must
+// actually locate an arbitrary page in the recency list rather than always
+// finding the next-oldest page sitting at the front — a purely sequential
+// access pattern would let an O(n) std::find degenerate to O(1) per call
+// and hide the defect. An O(1) LRU (list + index map) finishes this well
+// within the deadline; the O(n) std::find-based version does not.
+static int test_host_tier_lru_touch_is_not_linear_scan() {
+    int fails = 0;
+
+    constexpr int n_pages = 200000;
+    constexpr size_t page_bytes = 16;
+    constexpr int n_iters = 8000;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/(size_t) n_pages * page_bytes, /*device_idx=*/-1),
+           "host tier init");
+
+    std::vector<uint8_t> bytes(page_bytes, 0x99);
+    for (int i = 0; i < n_pages; ++i) {
+        EXPECT(tier.store(i, bytes.data(), bytes.size()), "prime resident set");
+    }
+    EXPECT_EQ_INT(tier.resident_count(), (size_t) n_pages, "all pages resident before timing");
+
+    // Deterministic pseudo-random page order (xorshift32), independent of
+    // insertion order, so lookups land throughout the recency list instead
+    // of only ever hitting whichever page is currently at the front.
+    std::vector<int> order(n_iters);
+    uint32_t rng_state = 0x9e3779b9u;
+    for (int i = 0; i < n_iters; ++i) {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 17;
+        rng_state ^= rng_state << 5;
+        order[i] = (int) (rng_state % (uint32_t) n_pages);
+    }
+
+    std::vector<uint8_t> out(page_bytes);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n_iters; ++i) {
+        (void) tier.lookup(order[i], out.data(), out.size());
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::fprintf(stderr, "  [perf] %d random-order touches over %d resident pages took %.1f ms\n",
+                 n_iters, n_pages, elapsed_ms);
+
+    constexpr double deadline_ms = 500.0;
+    EXPECT(elapsed_ms < deadline_ms, "LRU touch must be O(1), not a linear scan of the resident set");
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// HostTier borrow/release -- zero-copy promotion (2026-07-25 design)
+// ---------------------------------------------------------------------------
+
+// 1. Borrow returns the arena address, not a copy: contents match, and the
+// pointer is stable across two successive borrow/release cycles for an
+// untouched entry.
+static int test_host_tier_borrow_returns_arena_address() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> src(32);
+    for (size_t i = 0; i < src.size(); ++i) src[i] = (uint8_t) (i * 7 + 3);
+    EXPECT(tier.store(80, src.data(), src.size()), "store page 80");
+
+    const void * p1 = nullptr;
+    wp::HostTier::BorrowHandle h1 = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(80, &p1, src.size(), &h1), "first borrow hits");
+    EXPECT(p1 != nullptr, "first borrow returns non-null");
+    EXPECT(h1 != wp::HostTier::kInvalidBorrowHandle, "first borrow returns a valid handle");
+    EXPECT(std::memcmp(p1, src.data(), src.size()) == 0, "first borrow bytes match");
+    tier.release(80, h1);
+
+    const void * p2 = nullptr;
+    wp::HostTier::BorrowHandle h2 = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(80, &p2, src.size(), &h2), "second borrow hits");
+    EXPECT(std::memcmp(p2, src.data(), src.size()) == 0, "second borrow bytes match");
+    EXPECT(p1 == p2, "borrow pointer stable across borrow/release cycles for an untouched entry");
+    EXPECT(h1 == h2, "same entry generation across borrow/release cycles for an untouched entry");
+    tier.release(80, h2);
+
+    return fails;
+}
+
+// 2. Borrow misses for an absent page, and for a resident page requested
+// with the wrong size -- both must return false and leave the out-pointer
+// untouched.
+static int test_host_tier_borrow_miss() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x81);
+    EXPECT(tier.store(81, bytes.data(), bytes.size()), "store page 81");
+
+    const void * sentinel = (const void *) 0x1;
+    const wp::HostTier::BorrowHandle handle_sentinel = (wp::HostTier::BorrowHandle) 0xDEAD;
+    const void * out = sentinel;
+    wp::HostTier::BorrowHandle handle = handle_sentinel;
+    EXPECT(!tier.borrow(999, &out, bytes.size(), &handle), "borrow of absent page misses");
+    EXPECT(out == sentinel, "absent-page borrow leaves out-pointer untouched");
+    EXPECT(handle == handle_sentinel, "absent-page borrow leaves handle-out untouched");
+
+    out = sentinel;
+    handle = handle_sentinel;
+    EXPECT(!tier.borrow(81, &out, bytes.size() - 1, &handle), "borrow with wrong size misses");
+    EXPECT(out == sentinel, "wrong-size borrow leaves out-pointer untouched");
+    EXPECT(handle == handle_sentinel, "wrong-size borrow leaves handle-out untouched");
+
+    return fails;
+}
+
+// 3. A borrowed page is not evicted: fill the arena to capacity, borrow the
+// LRU-front page, store a new page forcing an eviction, and confirm the
+// borrowed page's bytes are intact and the *second*-oldest page was the
+// victim instead.
+static int test_host_tier_borrow_blocks_eviction() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> b90(32, 0x90), b91(32, 0x91), b92(32, 0x92), b93(32, 0x93);
+    EXPECT(tier.store(90, b90.data(), b90.size()), "store 90");
+    EXPECT(tier.store(91, b91.data(), b91.size()), "store 91");
+    EXPECT(tier.store(92, b92.data(), b92.size()), "store 92");
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "arena full at capacity");
+
+    const void * borrowed = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(90, &borrowed, b90.size(), &handle), "borrow LRU-front page 90");
+
+    EXPECT(tier.store(93, b93.data(), b93.size()), "store 93 forces an eviction");
+
+    EXPECT(std::memcmp(borrowed, b90.data(), b90.size()) == 0, "borrowed page 90 bytes intact");
+    EXPECT(tier.contains(90), "borrowed page 90 still resident (protected from eviction)");
+    EXPECT(!tier.contains(91), "second-oldest page 91 was evicted instead");
+    EXPECT(tier.contains(92), "page 92 untouched");
+    EXPECT(tier.contains(93), "new page 93 resident");
+
+    tier.release(90, handle);
+    return fails;
+}
+
+// 4. All-borrowed saturation fails the store cleanly: borrow every resident
+// entry, attempt a store, confirm it returns false and no borrowed content
+// changed.
+static int test_host_tier_all_borrowed_store_fails_cleanly() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> a(32, 0xA0), b(32, 0xB0);
+    EXPECT(tier.store(100, a.data(), a.size()), "store 100");
+    EXPECT(tier.store(101, b.data(), b.size()), "store 101");
+
+    const void * pa = nullptr;
+    const void * pb = nullptr;
+    wp::HostTier::BorrowHandle ha = wp::HostTier::kInvalidBorrowHandle;
+    wp::HostTier::BorrowHandle hb = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(100, &pa, a.size(), &ha), "borrow 100");
+    EXPECT(tier.borrow(101, &pb, b.size(), &hb), "borrow 101");
+
+    std::vector<uint8_t> c(32, 0xC0);
+    EXPECT(!tier.store(102, c.data(), c.size()), "store fails when every resident entry is borrowed");
+
+    EXPECT(std::memcmp(pa, a.data(), a.size()) == 0, "borrowed page 100 unchanged");
+    EXPECT(std::memcmp(pb, b.data(), b.size()) == 0, "borrowed page 101 unchanged");
+    EXPECT(tier.contains(100), "page 100 still resident");
+    EXPECT(tier.contains(101), "page 101 still resident");
+    EXPECT(!tier.contains(102), "failed store did not create page 102");
+
+    tier.release(100, ha);
+    tier.release(101, hb);
+    return fails;
+}
+
+// 5. Deferred retirement: borrow a page, erase() it, confirm contains() is
+// immediately false and the borrowed bytes are still readable; then
+// release() and confirm the slot is reused by the next same-size store.
+static int test_host_tier_deferred_retirement() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0xD0);
+    EXPECT(tier.store(110, bytes.data(), bytes.size()), "store 110");
+
+    const void * borrowed = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(110, &borrowed, bytes.size(), &handle), "borrow 110");
+
+    tier.erase(110);
+    EXPECT(!tier.contains(110), "erase() while borrowed makes contains() false immediately");
+    EXPECT(std::memcmp(borrowed, bytes.data(), bytes.size()) == 0,
+           "borrowed bytes still readable after erase() while retirement is deferred");
+
+    tier.release(110, handle);
+
+    // The slot freed by 110's deferred reclamation, plus the still-free
+    // second slot, gives room for two more same-size stores without a
+    // forced eviction of anything -- if the slot were leaked, capacity
+    // would silently shrink to one page instead of two.
+    std::vector<uint8_t> other1(32, 0xD1), other2(32, 0xD2);
+    EXPECT(tier.store(111, other1.data(), other1.size()), "slot reused after release drains retirement");
+    EXPECT(tier.store(112, other2.data(), other2.size()), "second slot also available (no leak)");
+    EXPECT_EQ_INT(tier.resident_count(), 2u, "exactly two pages resident, no leaked/duplicated slot");
+
+    return fails;
+}
+
+// 6. Re-store while borrowed does not alias: borrow page A, store() page A
+// again with different bytes, confirm the borrowed pointer still yields the
+// *original* bytes (it must have been given a different slot).
+static int test_host_tier_restore_while_borrowed_no_alias() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> original(32, 0xE0);
+    std::vector<uint8_t> replacement(32, 0xE1);
+    EXPECT(tier.store(120, original.data(), original.size()), "store 120 (original)");
+
+    const void * borrowed = nullptr;
+    wp::HostTier::BorrowHandle old_handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(120, &borrowed, original.size(), &old_handle), "borrow 120");
+
+    EXPECT(tier.store(120, replacement.data(), replacement.size()), "re-store 120 while borrowed");
+
+    EXPECT(std::memcmp(borrowed, original.data(), original.size()) == 0,
+           "borrowed pointer still yields the ORIGINAL bytes -- re-store used a different slot");
+
+    std::vector<uint8_t> out(replacement.size());
+    EXPECT(tier.lookup(120, out.data(), out.size()), "lookup sees the NEW resident entry for 120");
+    EXPECT(std::memcmp(out.data(), replacement.data(), replacement.size()) == 0,
+           "new resident entry for 120 has the replacement bytes");
+
+    // Borrowing the NEW entry must yield a DIFFERENT generation handle from
+    // the one still held on the retired original -- this is exactly the
+    // disambiguation release() relies on to route each release() call to
+    // the correct physical entry.
+    const void * new_borrowed = nullptr;
+    wp::HostTier::BorrowHandle new_handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(120, &new_borrowed, replacement.size(), &new_handle),
+           "borrow the new entry for 120");
+    EXPECT(old_handle != new_handle,
+           "re-stored entry has a distinguishably different generation handle");
+    EXPECT(new_borrowed != borrowed, "new entry occupies a different arena slot");
+
+    // Release each generation's handle; each must free/decrement the entry
+    // it actually belongs to, not whichever one currently occupies page 120.
+    tier.release(120, new_handle);
+    tier.release(120, old_handle);
+    return fails;
+}
+
+// 7. Refcount, not a flag: borrow the same page twice, release once and
+// confirm it is still protected from eviction; release again and confirm it
+// becomes evictable.
+static int test_host_tier_borrow_is_refcounted() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> b130(32, 0x30), b131(32, 0x31), b132(32, 0x32);
+    EXPECT(tier.store(130, b130.data(), b130.size()), "store 130");
+    EXPECT(tier.store(131, b131.data(), b131.size()), "store 131 fills arena to capacity");
+
+    const void * p1 = nullptr;
+    const void * p2 = nullptr;
+    wp::HostTier::BorrowHandle h1 = wp::HostTier::kInvalidBorrowHandle;
+    wp::HostTier::BorrowHandle h2 = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(130, &p1, b130.size(), &h1), "first borrow of 130");
+    EXPECT(tier.borrow(130, &p2, b130.size(), &h2), "second borrow of 130");
+    EXPECT(p1 == p2, "both borrows of the same page return the same address");
+    EXPECT(h1 == h2, "both borrows of the same page return the same generation handle");
+
+    tier.release(130, h1);
+    EXPECT(tier.store(132, b132.data(), b132.size()),
+           "store after ONE release still succeeds (131 is the only evictable victim)");
+    EXPECT(tier.contains(130), "130 still protected -- one borrow remains outstanding");
+    EXPECT(!tier.contains(131), "131 evicted as the only unborrowed resident entry");
+
+    tier.release(130, h2);
+    // Now 130 has zero outstanding borrows and is the sole resident page
+    // (alongside 132); a further store must be able to evict it.
+    std::vector<uint8_t> b133(32, 0x33);
+    EXPECT(tier.store(133, b133.data(), b133.size()), "store after SECOND release evicts 130");
+    EXPECT(!tier.contains(130), "130 evictable once its refcount reached zero");
+    EXPECT(tier.contains(132), "132 untouched");
+    EXPECT(tier.contains(133), "133 resident");
+
+    return fails;
+}
+
+// Promotion lifetime seam: this is the CPU analogue of an async H2D. The
+// borrow stays live while the completion is deferred, so erase/re-store cannot
+// recycle or overwrite the source region before the caller observes completion.
+static int test_tier_promotion_borrow_held_until_deferred_completion() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+    std::vector<uint8_t> original(32, 0x41), replacement(32, 0x42);
+    EXPECT(tier.store(200, original.data(), original.size()), "store promotion source");
+
+    const void * source = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(200, &source, original.size(), &handle), "borrow promotion source");
+    tier.erase(200); // concurrent retirement while transfer completion is deferred
+    EXPECT(!tier.contains(200), "retired source is no longer resident during deferred completion");
+    EXPECT(std::memcmp(source, original.data(), original.size()) == 0,
+           "borrowed promotion source remains intact before completion fence");
+    EXPECT(tier.store(200, replacement.data(), replacement.size()), "re-store uses a distinct slot while borrowed");
+    EXPECT(std::memcmp(source, original.data(), original.size()) == 0,
+           "re-store cannot overwrite source before deferred completion");
+    tier.release(200, handle); // model release after observing completion
+    return fails;
+}
+
+// Event acquisition failure must leave no outstanding HostTier borrow. The
+// actual HIP event pool cannot be initialized without a GPU workload, so this
+// covers the CPU-owned lifetime edge that enqueue_tier_promotions_ takes before
+// returning its real-read fallback.
+static int test_tier_promotion_event_exhaustion_releases_borrow() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/32, /*device_idx=*/-1), "host tier init");
+    std::vector<uint8_t> bytes(32, 0x51), other(32, 0x52);
+    EXPECT(tier.store(201, bytes.data(), bytes.size()), "store source");
+    const void * source = nullptr;
+    wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+    EXPECT(tier.borrow(201, &source, bytes.size(), &handle), "borrow before failed event acquisition");
+    tier.release(201, handle); // event unavailable: helper must not retain it
+    EXPECT(tier.store(202, other.data(), other.size()), "released borrow leaves a real-read fallback page evictable");
+    EXPECT(!tier.contains(201), "source can be evicted after failed event acquisition releases borrow");
+    EXPECT(tier.contains(202), "fallback/read replacement is resident");
+    return fails;
+}
+
+
+// 8. Concurrency: borrow/release racing with store/erase must never mutate a
+// borrowed region while it is held, and used-bytes accounting must return to
+// a consistent state at the end. Shaped like test_host_tier_concurrency.
+//
+// This is the ORIGINAL version: independent threads race borrow/release/
+// store/erase on the SAME page_idx, with no coordination between them. Before
+// borrow()/release() carried a generation handle, release(page_idx) alone
+// could not tell apart two independently-outstanding borrows of the same
+// key -- it always guessed "the pending (retired) entry", which was wrong
+// whenever the release actually belonged to whatever fresh entry currently
+// occupies resident_[page_idx]. That produced real corruption under this
+// exact test (24/80000 mismatches observed). Each borrow() now returns the
+// handle of the EXACT generation it saw, and release(page_idx, handle)
+// decrements that generation specifically -- resident_[page_idx] first if
+// its `gen` matches, else the matching entry in pending_ (keyed by handle,
+// not by page_idx) -- so two overlapping generations of the same page_idx
+// can never be confused with each other.
+static int test_host_tier_borrow_release_concurrency_same_key() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/512, /*device_idx=*/-1), "host tier init");
+
+    constexpr int n_threads = 4;
+    constexpr int n_pages = 8;
+    constexpr int n_iters = 20000;
+    constexpr size_t page_size = 32;
+    std::atomic<int> bad_borrows{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&tier, &bad_borrows, t]() {
+            std::vector<uint8_t> expected(page_size);
+            for (int i = 0; i < n_iters; ++i) {
+                const int page = (i + t) % n_pages;
+                std::fill(expected.begin(), expected.end(), (uint8_t) page);
+                if ((i % 7) == 0) {
+                    tier.erase(page);
+                } else {
+                    tier.store(page, expected.data(), expected.size());
+                }
+                const void * borrowed = nullptr;
+                wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+                if (tier.borrow(page, &borrowed, page_size, &handle)) {
+                    // Hold the borrow across a bit of concurrent churn from
+                    // other threads, then confirm the region is still
+                    // exactly what a resident page of `page` should read as
+                    // (all bytes == page), never a torn/aliased mix.
+                    std::this_thread::yield();
+                    bool consistent = true;
+                    const uint8_t * p = (const uint8_t *) borrowed;
+                    for (size_t j = 0; j < page_size; ++j) {
+                        if (p[j] != (uint8_t) page) {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                    if (!consistent) {
+                        ++bad_borrows;
+                    }
+                    tier.release(page, handle);
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ_INT(bad_borrows.load(), 0, "no borrowed region was ever mutated/aliased while held");
+    EXPECT(tier.used_bytes() <= tier.budget_bytes(), "used bytes stay within budget");
+    EXPECT(tier.resident_count() <= n_pages, "resident pages stay within the page set");
+    return fails;
+}
+
+// Additional coverage kept alongside the same-key race above: each thread
+// owns a disjoint page_idx (no cross-thread key collisions at all), while
+// still exercising real cross-thread arena contention -- shared mutex,
+// eviction pressure, deferred-retirement churn on other threads' pages.
+static int test_host_tier_borrow_release_concurrency_disjoint_pages() {
+    int fails = 0;
+    wp::HostTier tier;
+    // Only 2 32-byte slots for 4 threads' pages -- deliberately undersized so
+    // the 2 pages not currently held by their owning thread are under
+    // constant eviction pressure from each other while this thread's own
+    // borrow is outstanding.
+    EXPECT(tier.init(/*budget_bytes=*/64, /*device_idx=*/-1), "host tier init");
+
+    constexpr int n_threads = 4;
+    constexpr int n_iters = 20000;
+    constexpr size_t page_size = 32;
+    std::atomic<int> bad_borrows{0};
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([&tier, &bad_borrows, t]() {
+            const int page = t;
+            std::vector<uint8_t> expected(page_size, (uint8_t) page);
+            for (int i = 0; i < n_iters; ++i) {
+                if ((i % 7) == 0) {
+                    tier.erase(page);
+                } else {
+                    tier.store(page, expected.data(), expected.size());
+                }
+                const void * borrowed = nullptr;
+                wp::HostTier::BorrowHandle handle = wp::HostTier::kInvalidBorrowHandle;
+                if (tier.borrow(page, &borrowed, page_size, &handle)) {
+                    // Hold the borrow across a bit of concurrent churn from
+                    // the other threads (store/erase/evict on THEIR pages),
+                    // then confirm this page's region is still exactly what
+                    // it should read as -- never torn, aliased, or reclaimed
+                    // out from under the borrow by that unrelated churn.
+                    std::this_thread::yield();
+                    bool consistent = true;
+                    const uint8_t * p = (const uint8_t *) borrowed;
+                    for (size_t j = 0; j < page_size; ++j) {
+                        if (p[j] != (uint8_t) page) {
+                            consistent = false;
+                            break;
+                        }
+                    }
+                    if (!consistent) {
+                        ++bad_borrows;
+                    }
+                    tier.release(page, handle);
+                }
+            }
+        });
+    }
+    for (std::thread & thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ_INT(bad_borrows.load(), 0, "no borrowed region was ever mutated/aliased while held");
+    EXPECT(tier.used_bytes() <= tier.budget_bytes(), "used bytes stay within budget");
+    EXPECT(tier.resident_count() <= n_threads, "resident pages stay within the thread-owned page set");
+    return fails;
+}
+
+static int test_host_prefetcher() {
+    int fails = 0;
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::map<int, std::vector<uint8_t>> pages;
+    pages.emplace(1, std::vector<uint8_t>(32, 0x11));
+    pages.emplace(2, std::vector<uint8_t>(32, 0x22));
+    pages.emplace(3, std::vector<uint8_t>(32, 0x33));
+    wp::HostPrefetcher prefetcher(
+        [&pages](int page, void * dst, size_t capacity) -> int64_t {
+            const auto it = pages.find(page);
+            if (it == pages.end() || it->second.size() > capacity) {
+                return -1;
+            }
+            std::memcpy(dst, it->second.data(), it->second.size());
+            return (int64_t) it->second.size();
+        },
+        [&tier](int page, const void * bytes, size_t n) {
+            return tier.store(page, bytes, n);
+        },
+        [](int page) { return page == 2; },
+        /*max_queue_depth=*/2, /*max_page_size=*/32);
+
+    prefetcher.enqueue(1);
+    prefetcher.enqueue(2);
+    prefetcher.enqueue(3);
+    prefetcher.start();
+    prefetcher.stop();
+
+    std::vector<uint8_t> out(32);
+    EXPECT(tier.lookup(1, out.data(), out.size()), "non-skipped page stored");
+    EXPECT(std::memcmp(out.data(), pages[1].data(), out.size()) == 0, "stored bytes match");
+    EXPECT(!tier.contains(2), "skipped page not stored");
+    EXPECT(!tier.contains(3), "dropped page not stored");
+    EXPECT_EQ_INT(prefetcher.enqueued(), 2u, "two pages accepted into queue");
+    EXPECT_EQ_INT(prefetcher.dropped(), 1u, "queue oversubscription drops newest page");
+    EXPECT_EQ_INT(prefetcher.read_ok(), 1u, "one page read successfully");
+    EXPECT_EQ_INT(prefetcher.read_fail(), 0u, "no read failures");
+    EXPECT_EQ_INT(prefetcher.skipped(), 1u, "one page skipped");
     return fails;
 }
 
@@ -1367,6 +2079,129 @@ static int test_compute_advise_ranges() {
         auto r = wp::compute_advise_ranges(cat, /*block_idx=*/0, /*k=*/100);
         EXPECT_EQ_INT(r.size(), 15u, "k=100 caps at available blocks");
     }
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// resolve_odirect_alignment / compute_odirect_read_plan — O_DIRECT alignment
+// authority fix. The pager previously hardcoded 512 (the NVMe device's
+// logical_block_size) as the O_DIRECT alignment. That's the wrong authority:
+// alignment must come from the FILESYSTEM's block size (statfs f_bsize),
+// e.g. btrfs = 4096. Using 512 on a 4096-block filesystem measured 2.49x
+// read amplification (221.9 GB delivered vs 82.7 GB buffered for the exact
+// same 89.24 GB of requested pages). This also couples in a fix for a
+// pre-existing bug: the padded tail of the last page of a shard can run
+// past EOF, and O_DIRECT returns EIO (not a short read) rather than
+// truncating — padding to a coarser alignment makes the overrun worse, not
+// better, so the clamp has to move with the alignment fix.
+// ---------------------------------------------------------------------------
+
+static int test_resolve_odirect_alignment() {
+    int fails = 0;
+
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(4096), 4096, "btrfs f_bsize=4096 -> 4096");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(512),  512,  "f_bsize=512 -> 512 (already >= floor, pow2)");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(8192), 8192, "larger pow2 f_bsize is honored, not clamped to 4096");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(-1),   4096, "fstatfs failure sentinel (<=0) -> 4096 fallback");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(0),    4096, "f_bsize=0 -> 4096 fallback");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(300),  512,  "below device logical-block floor -> floored to 512, still pow2");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(600),  4096, "not a power of two after flooring -> 4096 fallback");
+
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_aligned_offset() {
+    int fails = 0;
+
+    // Already-aligned offset: zero prefix, and the total never grows beyond
+    // one pad past the payload (align_up(size, align)).
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const uint64_t off  = align * 10;   // exactly aligned
+        const size_t   size = 1000;
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, /*file_size=*/0);
+        EXPECT_EQ_INT(plan.base, off, "aligned offset: base == off");
+        EXPECT_EQ_INT(plan.prefix, 0u, "aligned offset: zero prefix");
+        const size_t expect_nbytes = (size + align - 1) & ~(align - 1);
+        EXPECT_EQ_INT(plan.nbytes, expect_nbytes, "aligned offset: nbytes is size padded up to align, no extra growth");
+        EXPECT(plan.nbytes % align == 0, "aligned offset: nbytes is a multiple of align");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_unaligned_offset() {
+    int fails = 0;
+
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const uint64_t base_off = align * 7;
+        const size_t   prefix_in = align / 4;              // partial-block unaligned offset
+        const uint64_t off  = base_off + prefix_in;
+        const size_t   size = align + 17;                  // spans more than one block
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, /*file_size=*/0);
+        EXPECT_EQ_INT(plan.base, base_off, "unaligned offset: base is align-down of off");
+        EXPECT_EQ_INT(plan.prefix, prefix_in, "unaligned offset: prefix is off - base");
+        EXPECT(plan.nbytes % align == 0, "unaligned offset: total is a multiple of align");
+        EXPECT(plan.prefix + size <= plan.nbytes, "unaligned offset: padded window fully covers the payload");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_never_exceeds_buf_cap() {
+    int fails = 0;
+
+    // Buffers are sized as page_bytes + 2*align (see ensure_host_bufs_ready_).
+    // The worst case (max prefix, max tail pad) must still fit.
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const size_t page_bytes = 16384;
+        const size_t buf_cap = page_bytes + 2 * align;
+        // Worst-case prefix: align-1.
+        const uint64_t off = (align * 3) + (align - 1);
+        const auto plan = wp::compute_odirect_read_plan(off, page_bytes, align, /*file_size=*/0);
+        EXPECT(plan.nbytes <= buf_cap, "worst-case prefix/pad never exceeds the sized buffer capacity");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_eof_clamp() {
+    int fails = 0;
+
+    // Mirrors the measured production case: a shard's last page overruns
+    // EOF once padded. At align=512 this is the pre-existing bug (fires 3x
+    // per run in production); at align=4096 the same offset overruns by
+    // MORE, which is exactly why the clamp has to move with the alignment
+    // fix rather than staying a 512-only patch.
+    const uint64_t shard_size = 46774881376ULL;
+    const uint64_t off        = 46770424832ULL;
+    const size_t   size       = (size_t) (shard_size - off);  // last page's real payload size
+
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, shard_size);
+        EXPECT(plan.base + plan.nbytes <= shard_size,
+               "padded end is clamped at EOF, never reads past shard_size");
+        EXPECT(plan.prefix + size <= plan.nbytes,
+               "clamped window still fully covers the payload bytes");
+    }
+
+    // file_size == 0 means "unresolved" -- no clamping should be applied,
+    // i.e. the plan pads out fully even though that would run past a
+    // (currently unknown) real EOF.
+    {
+        const auto plan = wp::compute_odirect_read_plan(off, size, /*align=*/4096, /*file_size=*/0);
+        const size_t expect_nbytes = (size_t) (((off - (off & ~4095ULL)) + size + 4095) & ~(size_t) 4095);
+        EXPECT_EQ_INT(plan.nbytes, expect_nbytes, "file_size=0 (unresolved) disables EOF clamping");
+    }
+
+    // A second measured overrun case, at the smaller shard.
+    {
+        const uint64_t shard_size2 = 46789437824ULL;
+        const uint64_t off2        = 46784980992ULL;
+        const size_t   size2       = (size_t) (shard_size2 - off2);
+        for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+            const auto plan = wp::compute_odirect_read_plan(off2, size2, align, shard_size2);
+            EXPECT(plan.base + plan.nbytes <= shard_size2, "second shard: clamped at EOF");
+            EXPECT(plan.prefix + size2 <= plan.nbytes, "second shard: payload still fully covered");
+        }
+    }
+
     return fails;
 }
 
@@ -1807,11 +2642,66 @@ static int test_router_overrides_preserve_user() {
     return fails;
 }
 
+static int test_router_overrides_island_null_matches_default() {
+    int fails = 0;
+
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
+    auto baseline = wp::build_router_overrides(paging, resident, cpu, nullptr);
+    auto ov       = wp::build_router_overrides(paging, resident, cpu, nullptr, true, nullptr);
+    EXPECT_EQ_INT((int) ov.size(), (int) baseline.size(), "island=nullptr does not change entry count");
+    for (size_t i = 0; i < baseline.size(); i++) {
+        bool same_pattern = (baseline[i].pattern == nullptr && ov[i].pattern == nullptr) ||
+                             (baseline[i].pattern != nullptr && ov[i].pattern != nullptr &&
+                              std::string(baseline[i].pattern) == std::string(ov[i].pattern));
+        EXPECT(same_pattern, "island=nullptr: pattern matches baseline entry-for-entry");
+        EXPECT(baseline[i].buft == ov[i].buft, "island=nullptr: buft matches baseline entry-for-entry");
+    }
+    return fails;
+}
+
+static int test_router_overrides_island_routes_shexp_and_ffn() {
+    int fails = 0;
+
+    auto paging   = (ggml_backend_buffer_type_t) 0x1;
+    auto resident = (ggml_backend_buffer_type_t) 0x2;
+    auto cpu      = (ggml_backend_buffer_type_t) 0x4;
+    auto island   = (ggml_backend_buffer_type_t) 0x8;
+    auto ov = wp::build_router_overrides(paging, resident, cpu, nullptr, true, island);
+    // expert + shexp + ffn_island + token_embd + dense + terminator
+    EXPECT_EQ_INT((int) ov.size(), 6, "expert+shexp+ffn_island+embd+dense+term");
+    EXPECT(std::string(ov[0].pattern) == std::string(wp::ROUTER_EXPERT_PATTERN), "expert pattern first");
+    EXPECT(ov[0].buft == paging, "routed experts still on paging buft");
+    EXPECT(std::string(ov[1].pattern) == std::string(wp::ROUTER_SHEXP_PATTERN), "shexp second");
+    EXPECT(ov[1].buft == island, "shexp routed to island buft");
+    EXPECT(std::string(ov[2].pattern) == std::string(wp::ROUTER_FFN_ISLAND_PATTERN), "ffn island third");
+    EXPECT(ov[2].buft == island, "ffn island routed to island buft");
+    EXPECT(std::string(ov[3].pattern) == std::string(wp::ROUTER_TOKEN_EMBD_PATTERN), "token_embd fourth");
+    EXPECT(ov[3].buft == cpu, "token_embd on CPU");
+    EXPECT(std::string(ov[4].pattern) == std::string(wp::ROUTER_DENSE_PATTERN), "dense catch-all");
+    EXPECT(ov[4].buft == resident, "dense catch-all still on resident buft");
+    EXPECT(ov[5].pattern == nullptr, "list is terminated");
+    return fails;
+}
+
 static int test_wp_paged_batch_flag_default_off() {
     int fails = 0;
     ScopedEnv guard("WP_PAGED_BATCH");
     unsetenv("WP_PAGED_BATCH");
     if (wp::wp_paged_batch_enabled()) { fprintf(stderr, "FAIL: WP_PAGED_BATCH must default OFF\n"); fails++; }
+    return fails;
+}
+
+static int test_wp_pipeline_promotions_flag_default_on() {
+    int fails = 0;
+    ScopedEnv guard("WP_PIPELINE_PROMOTIONS");
+    unsetenv("WP_PIPELINE_PROMOTIONS");
+    EXPECT(wp::wp_pipeline_promotions_enabled(), "pipeline promotions must default ON");
+    setenv("WP_PIPELINE_PROMOTIONS", "0", 1);
+    EXPECT(!wp::wp_pipeline_promotions_enabled(), "literal 0 disables pipeline promotions");
+    setenv("WP_PIPELINE_PROMOTIONS", "1", 1);
+    EXPECT(wp::wp_pipeline_promotions_enabled(), "literal 1 enables pipeline promotions");
     return fails;
 }
 
@@ -1875,6 +2765,37 @@ static int test_router_predictor() {
     return fails;
 }
 
+static int test_router_predictor_confidence() {
+    int fails = 0;
+    using namespace wp;
+    const int n_expert = 4, n_embd = 1;
+    float h[n_embd] = { 1.0f };
+    std::vector<ExpertRef> out;
+
+    // PEAKED: e0 logit 10, others 0 -> softmax(e0) ~ 0.9999.
+    RouterPredictor rp;
+    float Wpk[n_expert*n_embd] = { 10.0f, 0.0f, 0.0f, 0.0f };
+    rp.set_router(1, Wpk, n_expert, n_embd);
+    rp.predict(h, 0, 1, 4, 43, out, 0.5f);
+    EXPECT_EQ_INT((int)out.size(), 1, "peaked+min_conf0.5 -> only e0");
+    if (!out.empty()) EXPECT_EQ_INT(out[0].expert, 0, "peaked survivor is e0");
+    out.clear();
+    rp.predict(h, 0, 1, 4, 43, out, 0.0f);
+    EXPECT_EQ_INT((int)out.size(), 4, "min_conf0 gate off -> all M pass");
+
+    // FLAT: all logits 0 -> each softmax prob 0.25.
+    RouterPredictor rf;
+    float Wfl[n_expert*n_embd] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    rf.set_router(1, Wfl, n_expert, n_embd);
+    out.clear();
+    rf.predict(h, 0, 1, 4, 43, out, 0.5f);
+    EXPECT_EQ_INT((int)out.size(), 0, "flat+min_conf0.5 -> none pass");
+    out.clear();
+    rf.predict(h, 0, 1, 4, 43, out, 0.2f);
+    EXPECT_EQ_INT((int)out.size(), 4, "flat+min_conf0.2 -> all pass, p=0.25");
+    return fails;
+}
+
 static int test_expert_page_index() {
     int fails = 0;
     using namespace wp;
@@ -1900,6 +2821,75 @@ static int test_expert_page_index() {
     // cross-check: index result matches the linear pages_for_expert() scan.
     auto scan = cat.pages_for_expert(5, 3);
     EXPECT_EQ_INT((int) scan.size(), 3, "pages_for_expert(5,3) also returns 3");
+    return fails;
+}
+
+static int test_ensure_odirect_inflight_serial_peak_one() {
+    int fails = 0;
+    using namespace wp;
+    // Strictly serial: each read finishes before the next begins. This is
+    // the case that would actually diagnose the suspected "9 queued but
+    // effectively serialized" problem -- if reads never overlap, peak must
+    // be 1 no matter how many jobs were queued.
+    EnsureODirectInFlightTracker t;
+    for (int i = 0; i < 5; ++i) {
+        const int64_t n = t.begin();
+        EXPECT_EQ_INT(n, 1, "serial begin() always observes in-flight==1");
+        t.end();
+    }
+    EXPECT_EQ_INT(t.peak(), 1, "serial sequence: peak in-flight == 1");
+    EXPECT_EQ_INT(t.current(), 0, "serial sequence: counter back to zero");
+    const double avg = t.average();
+    EXPECT(avg > 0.999 && avg < 1.001, "serial sequence: avg in-flight == 1.0");
+    return fails;
+}
+
+static int test_ensure_odirect_inflight_overlap_peak_and_average() {
+    int fails = 0;
+    using namespace wp;
+    EnsureODirectInFlightTracker t;
+    // b1 b2 b3 e1 b4 e2 e3 e4 -> in-flight samples at each begin(): 1,2,3,3
+    // (b1=1, b2=2, b3=3 [peak], e1 drops to 2, b4 samples 3 again).
+    t.begin();               // sample 1
+    t.begin();               // sample 2
+    const int64_t n3 = t.begin(); // sample 3 (peak)
+    EXPECT_EQ_INT(n3, 3, "third overlapping begin() observes in-flight==3");
+    t.end();                 // one read completes; current drops to 2
+    const int64_t n4 = t.begin(); // sample 3 again (2 in flight + this one)
+    EXPECT_EQ_INT(n4, 3, "begin() after one completion observes in-flight==3 again");
+    t.end();
+    t.end();
+    t.end();
+    EXPECT_EQ_INT(t.peak(), 3, "overlap sequence: peak in-flight == 3");
+    EXPECT_EQ_INT(t.current(), 0, "overlap sequence: counter back to zero (no leak)");
+    // samples = {1, 2, 3, 3} -> sum 9, avg 2.25.
+    const double avg = t.average();
+    EXPECT(avg > 2.249 && avg < 2.251, "overlap sequence: avg in-flight == 2.25 per documented definition");
+    return fails;
+}
+
+static int test_ensure_odirect_inflight_no_leak_on_pairing() {
+    int fails = 0;
+    using namespace wp;
+    EnsureODirectInFlightTracker t;
+    // A larger mixed begin/end interleaving; regardless of the pattern,
+    // every begin() must be matched by exactly one end(), so the counter
+    // must return to zero once all reads complete -- no leak in the
+    // increment/decrement pairing.
+    for (int i = 0; i < 8; ++i) {
+        t.begin();
+    }
+    for (int i = 0; i < 3; ++i) {
+        t.end();
+    }
+    for (int i = 0; i < 4; ++i) {
+        t.begin();
+    }
+    for (int i = 0; i < 9; ++i) {
+        t.end();
+    }
+    EXPECT_EQ_INT(t.current(), 0, "mixed begin/end sequence: counter back to zero, no leak");
+    EXPECT(t.peak() >= 8, "mixed sequence: peak reflects the highest overlap actually reached");
     return fails;
 }
 
@@ -1960,6 +2950,7 @@ int main() {
         { "page_catalog_moe_classify",   test_page_catalog_moe_classification },
         { "page_catalog_consolidated",   test_page_catalog_consolidated_split },
         { "prefetch_wait_transport_error_req_id_zero", test_prefetch_wait_transport_error_req_id_zero },
+        { "p2p_tunable_resolution", test_p2p_tunable_resolution },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },
@@ -1968,6 +2959,11 @@ int main() {
         { "file_io_submit_batch_depth_one_targeted_waits", test_file_io_submit_batch_depth_one_targeted_waits },
         { "file_io_demux_no_cross_drain",    test_file_io_demux_no_cross_drain    },
         { "compute_advise_ranges",    test_compute_advise_ranges    },
+        { "resolve_odirect_alignment", test_resolve_odirect_alignment },
+        { "compute_odirect_read_plan_aligned_offset", test_compute_odirect_read_plan_aligned_offset },
+        { "compute_odirect_read_plan_unaligned_offset", test_compute_odirect_read_plan_unaligned_offset },
+        { "compute_odirect_read_plan_never_exceeds_buf_cap", test_compute_odirect_read_plan_never_exceeds_buf_cap },
+        { "compute_odirect_read_plan_eof_clamp", test_compute_odirect_read_plan_eof_clamp },
         { "is_uma_archname",          test_is_uma_archname          },
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },
@@ -1986,6 +2982,23 @@ int main() {
         { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
         { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
         { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },
+        { "host_tier_concurrency",               test_host_tier_concurrency               },
+        { "host_tier_repeated_touches_eviction_order", test_host_tier_repeated_touches_eviction_order },
+        { "host_tier_erase_middle_preserves_order",    test_host_tier_erase_middle_preserves_order    },
+        { "host_tier_touch_absent_is_noop",            test_host_tier_touch_absent_is_noop            },
+        { "host_tier_lru_touch_is_not_linear_scan",    test_host_tier_lru_touch_is_not_linear_scan    },
+        { "host_tier_borrow_returns_arena_address",     test_host_tier_borrow_returns_arena_address     },
+        { "host_tier_borrow_miss",                      test_host_tier_borrow_miss                      },
+        { "host_tier_borrow_blocks_eviction",            test_host_tier_borrow_blocks_eviction            },
+        { "host_tier_all_borrowed_store_fails_cleanly",  test_host_tier_all_borrowed_store_fails_cleanly  },
+        { "host_tier_deferred_retirement",               test_host_tier_deferred_retirement               },
+        { "host_tier_restore_while_borrowed_no_alias",   test_host_tier_restore_while_borrowed_no_alias   },
+        { "host_tier_borrow_is_refcounted",              test_host_tier_borrow_is_refcounted              },
+        { "tier_promotion_borrow_held_until_deferred_completion", test_tier_promotion_borrow_held_until_deferred_completion },
+        { "tier_promotion_event_exhaustion_releases_borrow",      test_tier_promotion_event_exhaustion_releases_borrow },
+        { "host_tier_borrow_release_concurrency_same_key",      test_host_tier_borrow_release_concurrency_same_key      },
+        { "host_tier_borrow_release_concurrency_disjoint_pages", test_host_tier_borrow_release_concurrency_disjoint_pages },
+        { "host_prefetcher",                     test_host_prefetcher                     },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },
         { "catalog_clear_resets_pinned",         test_catalog_clear_resets_pinned_counters },
@@ -1997,10 +3010,17 @@ int main() {
         { "routing_boundary_prepass",            test_routing_boundary_prepass            },
         { "router_overrides_expert_only",        test_router_overrides_expert_only        },
         { "router_overrides_preserve_user",      test_router_overrides_preserve_user      },
+        { "router_overrides_island_null_matches_default", test_router_overrides_island_null_matches_default },
+        { "router_overrides_island_routes_shexp_and_ffn", test_router_overrides_island_routes_shexp_and_ffn },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
+        { "wp_pipeline_promotions_flag_default_on",  test_wp_pipeline_promotions_flag_default_on },
         { "router_predictor",                    test_router_predictor                    },
+        { "router_predictor_confidence",         test_router_predictor_confidence         },
         { "expert_page_index",                   test_expert_page_index                   },
         { "pool_speculative",                    test_pool_speculative                    },
+        { "ensure_odirect_inflight_serial_peak_one", test_ensure_odirect_inflight_serial_peak_one },
+        { "ensure_odirect_inflight_overlap_peak_and_average", test_ensure_odirect_inflight_overlap_peak_and_average },
+        { "ensure_odirect_inflight_no_leak_on_pairing", test_ensure_odirect_inflight_no_leak_on_pairing },
     };
 
     for (const auto & t : tests) {

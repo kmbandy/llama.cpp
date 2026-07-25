@@ -2800,6 +2800,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_DEVICE"));
     add_opt(common_arg(
+        {"--weight-paging-ffn-island-device"}, "<dev|auto|off>",
+        "device hosting the shared experts and FFN island; \"auto\" selects the first\n"
+        "resident device; \"off\" or unset disables the role and keeps those tensors on\n"
+        "the paging device (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_paging_ffn_island_device = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_FFN_ISLAND_DEVICE"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
@@ -3960,7 +3972,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
+        {"--spec-cache-type-k", "--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
             "allowed values: %s\n"
@@ -3973,7 +3985,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
     add_opt(common_arg(
-        {"--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
+        {"--spec-cache-type-v", "--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
         string_format(
             "KV cache data type for V for the draft model\n"
             "allowed values: %s\n"

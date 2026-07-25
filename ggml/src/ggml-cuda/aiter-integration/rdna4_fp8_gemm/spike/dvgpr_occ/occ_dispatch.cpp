@@ -92,6 +92,16 @@ static GpuBuf AllocGpu(uint32_t node, uint64_t size, bool isExec, bool isUncache
     CHECK(hsaKmtMapMemoryToGPUNodes(b.ptr, size, nullptr, mf, 1, &node));
     return b;
 }
+// Bytes to map for a kernel .text image: page-round the ISA, then add ONE TRAILING GUARD PAGE.
+//   The SQC instruction prefetcher reads ahead past s_endpgm. With an exactly-page-rounded mapping, a bin
+//   whose .text happens to end near the page boundary makes that prefetch walk into the next, UNMAPPED page
+//   -> [gfxhub] SQC(inst) page fault (RW=0, MAPPING_ERROR=1) -> MES cannot REMOVE_QUEUE -> MODE1 brick.
+//   Whether a given build bricks is a lottery on .text size. Measured 2026-07-12 (gfx1201):
+//     16316B bin (68B slack in a 16KiB mapping) -> BRICKED;  12568/13136/17140B (3+KiB slack) -> clean.
+//   AllocGpu memsets the whole allocation, so the guard page is mapped and zero-filled.
+static inline uint64_t IsaMapBytes(size_t isaLen) {
+    return (((uint64_t)isaLen + 0xFFFull) & ~0xFFFull) + 0x1000ull;
+}
 static void FreeGpu(GpuBuf& b) {
     if (!b.ptr) return;
     hsaKmtUnmapMemoryToGPU(b.ptr);
@@ -401,6 +411,25 @@ static inline int mbg_trperm(int L, int s) {            // verified closed form 
     int base = (L & 7) + ((L >> 3) & 1) * 32 + ((L >> 4) & 1) * 128;
     return base + (s & 3) * 8 + ((s >> 2) & 1) * 64;
 }
+// LOW-MEM B (2026-07-20): formula-generate B AND preshuffle it straight into dst (== Bd VRAM ptr), so the
+//   full K*N host B vectors (Bh + Bshufh) are never allocated. Byte-identical to building Bh from the NICE
+//   formula then mbg_preshuffle_B(Bh, dst). Lets a fed run scale K/shape without touching host RAM.
+static void mbg_gen_preshuffle_B(uint8_t* Bshuf, int K, int N) {
+    static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
+    int KT = K / 16, NT = N / 16;
+    std::vector<uint8_t> stage((size_t)NT * 256);        // one kt-row of tiles, built cached then bulk-copied to VRAM
+    for (int kt = 0; kt < KT; ++kt) {
+        for (int nt = 0; nt < NT; ++nt) {
+            uint8_t* tile = stage.data() + (size_t)nt * 256;
+            for (int L = 0; L < 32; ++L) for (int s = 0; s < 8; ++s) {
+                int kl = ((L >> 4) & 1) * 8 + s, nl = L & 15;
+                size_t bidx = (size_t)(kt * 16 + kl) * N + (nt * 16 + nl);
+                tile[mbg_trperm(L, s)] = NICE[(bidx*5 + (bidx/(size_t)N)*3) % 6];
+            }
+        }
+        memcpy(Bshuf + (size_t)kt * NT * 256, stage.data(), (size_t)NT * 256);
+    }
+}
 static void mbg_preshuffle_B(const uint8_t* B, uint8_t* Bshuf, int K, int N) {
     int KT = K / 16, NT = N / 16;
     for (int kt = 0; kt < KT; ++kt) for (int nt = 0; nt < NT; ++nt) {
@@ -468,7 +497,7 @@ static MbgResult run_mbgemm(uint32_t node, const char* isaPath, bool dynvgpr, ui
     mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, (Ah.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);    // VRAM: the A feed
     GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true); // VRAM: the B feed
@@ -635,7 +664,7 @@ static WgResult run_wggemm_smoke(uint32_t node, const char* isaPath, int M, int 
     int WAVES = TWM * TWN;
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     uint64_t cbytes = ((uint64_t)TOTAL * WAVES * 4 + 0xFFF) & ~0xFFFull;   // WAVES u32 marks per tile
     GpuBuf C   = AllocGpu(node, cbytes, false, true);
@@ -738,6 +767,37 @@ struct WgcResult { bool ok=false; uint32_t maxlive=0, total=0; uint64_t okFrags=
 
 static uint32_t ldsRsrc2Bits(uint32_t ldsBytes, uint32_t* outUnits, uint32_t* outAlloc, uint32_t* outGranule);
 
+// ---- PHIST bail-door histogram (occ[104..113]); zero unless the bin was built PHIST=1 ----------------
+//   ONE implementation called from BOTH the timeout path and the success path. It is a function and not
+//   two pasted blocks on purpose: this whole project's recurring defect is a value mirrored in two places
+//   that silently drift (kOpBase/OP_BASE, the host LDS total vs LDS_TOTAL_FLOW, occ[100]/occ[102] read
+//   after the kernel stopped writing them).
+//   *** WHY IT PRINTS ON THE SUCCESS PATH TOO (run #6 lesson, re-learned the hard way on run #11): a
+//   funnel wired ONLY into the `if (!done)` timeout branch is silently discarded by every CLEAN run --
+//   which is most of them. Run #11 finished clean and threw the entire histogram away. A diagnostic you
+//   only get to read when the run fails is a diagnostic you mostly never read. ***
+static void printPhist(const volatile uint32_t* occW, const char* tag) {   // occW is volatile (device-mapped)
+    static const char* phName[12] = {"loophead","feedmt","gatefull","zlock","terminal",
+                                     "bnd-lost","boundary","growfail","drainwait","coast",
+                                     "RESV-try","RESV-win"};
+    uint32_t phTot = 0; for (int i = 0; i < 12; ++i) phTot += occW[104+i];
+    if (!phTot) {
+        fprintf(stderr, "  [%s] PHIST: all zero -- bin NOT built with PHIST=1 (PHIST=1 ./build_flow.sh);"
+                        " wave parking distribution UNKNOWN.\n", tag);
+        return;
+    }
+    uint32_t den = occW[104] ? occW[104] : 1u;
+    fprintf(stderr, "  [%s] PHIST bail doors (throttled 1/64 on the deadman boundary, survives a wedge):\n", tag);
+    for (int i = 0; i < 12; ++i)
+        fprintf(stderr, "      occ[%3d] %-10s %12u  (%6.1f%% of loophead)\n",
+                104+i, phName[i], occW[104+i], 100.0*(double)occW[104+i]/(double)den);
+    fprintf(stderr, "      (READ AS RATIOS vs loophead, the denominator. feedmt/loophead ~1.0 => nearly every\n"
+                    "       pass bails to the park site = the reservation gate is shut. boundary or drainwait\n"
+                    "       dominating instead => the wedge/stall is the tile-group boundary interlock, NOT the\n"
+                    "       window. NOTE: zlock/gatefull/terminal/bnd-lost/growfail have NO bump sites yet --\n"
+                    "       they all funnel into feedmt; splitting them needs per-door trampolines.)\n");
+}
+
 static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, int N, int K,
                                     uint32_t nWG, bool fullCheck,
                                     int FMt = 4, uint32_t ldsBytes = 8196u, uint32_t vgprField = 26u,
@@ -775,7 +835,7 @@ static WgcResult run_wggemm_compute(uint32_t node, const char* isaPath, int M, i
     if (useAtr) { Ashufh.resize((size_t)M*K); mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K); }
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, (Ah.size() + 0xFFF) & ~0xFFFull, false, true);
     GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true);
@@ -940,7 +1000,7 @@ static WgpResult run_wggemm_perf(uint32_t node, const char* isaPath, int M, int 
     if (useAtr) { Ashufh.resize((size_t)M*K); mbg_preshuffle_A(Ah.data(), Ashufh.data(), M, K); }
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, (Ah.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);   // VRAM: the A feed
     GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);// VRAM: the B feed
@@ -1106,7 +1166,7 @@ static WgcResult run_wavespec_compute(uint32_t node, const char* isaPath, int M,
     uint32_t vgprField = dynvgpr ? 4u : (uint32_t)wavespec_vgpr_field(FM, FN);
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, (Ashufh.size() + 0xFFF) & ~0xFFFull, false, true);
     GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true);
@@ -1229,7 +1289,7 @@ static WgpResult run_wavespec_perf(uint32_t node, const char* isaPath, int M, in
     uint32_t vgprField = dynvgpr ? 4u : (uint32_t)wavespec_vgpr_field(FM, FN);
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, (Ashufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);
     GpuBuf Bd  = AllocGpu(node, (Bshufh.size() + 0xFFF) & ~0xFFFull, false, true, /*deviceLocal*/true);
@@ -1345,7 +1405,7 @@ static CoopResult run_mbcoop(uint32_t node, const char* isaPath, bool dynvgpr, u
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
     if (!isaBytes) { fprintf(stderr, "  [coop] cannot read kernel bin '%s'\n", isaPath); return res; }
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     // ---- SAFETY PADDING (ML8_COOP_PAD_MB, default 64): map a guard tail AFTER each operand so a small dyn
     //   off-by-one global access lands in mapped VRAM (observable wrong answer) instead of a page-fault brick.
@@ -1700,12 +1760,17 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         return res;
     }
     // FIX 1(k): the kernel now DERIVES n_kseg in-kernel as KT >> NKSEG_SHIFT (a plain shift) and uses it
-    //   as a shift/mask pair (shift=ff1(n_kseg), mask=n_kseg-1) to split sti -> (t,ksi) -- both of those
-    //   are only correct when n_kseg is a power of two (ff1 finds "the" single set bit; a non-power-of-two
-    //   mask drops bits). Refuse rather than silently mis-decode every super-tile.
-    if ((n_kseg & (n_kseg - 1)) != 0) {
-        fprintf(stderr, "  [dsws2] *** REFUSE: n_kseg=%d is not a power of two (required: the kernel derives "
-                        "shift/mask from n_kseg via s_ff1_i32_b32) ***\n", n_kseg);
+    //   *** LIFTED 2026-07-14: the kernel no longer needs a power-of-two n_kseg. ***
+    //   It used to derive shift = s_ff1(n_kseg) (the EXACT log2), which only exists for a power of two.
+    //   It now uses shift = CEIL(log2 n_kseg) and packs ksi into a power-of-2-SIZED field big enough to
+    //   HOLD it: sti = (t<<shift) | ksi with ksi < n_kseg <= 2^shift. Decode stays a pure AND/SHIFT.
+    //   That one line was making 10 of our 18 REAL shapes illegal -- every mlambaformer GEMM but the
+    //   router (K=768 -> n_kseg=24, K=1536 -> 48) and most of ml8 dense (K=9216 -> 288, K=2560 -> 80).
+    //   What IS still required: JDEPTH must be a power of two AND divide n_kseg (a J-carrier walks J
+    //   consecutive segments of one tile; if J does not divide n_kseg it walks off the tile's end).
+    if (n_kseg <= 0) {
+        fprintf(stderr, "  [dsws2] *** REFUSE: n_kseg=%d (K=%d must be a positive multiple of SEGK=%d) ***\n",
+                n_kseg, Ko, SEGKv);
         return res;
     }
     const uint32_t TOTAL = (uint32_t)MTLsuper * (uint32_t)NTL;                       // coop-compat output-tile count (C sizing)
@@ -1714,14 +1779,26 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     const uint32_t magicTotal = (uint32_t)((0x100000000ULL + (uint64_t)TOTAL - 1) / (uint64_t)TOTAL); // ceil(2^32/TOTAL) for KMAJOR ksi=sti/TOTAL
 
     static const uint8_t NICE[6] = {0x38,0x40,0x30,0xB8,0xC0,0xB0};
-    std::vector<uint8_t> Ah((size_t)Mo*Ko), Bh((size_t)Ko*No), Bshufh((size_t)Ko*No);
-    for (size_t i = 0; i < Ah.size(); ++i) Ah[i] = NICE[(i*7 + i/(size_t)Ko) % 6];
-    for (size_t i = 0; i < Bh.size(); ++i) Bh[i] = NICE[(i*5 + (i/(size_t)No)*3) % 6];
-    mbg_preshuffle_B(Bh.data(), Bshufh.data(), Ko, No);
+    // ---- LOW-MEM operand generation (the --no-mmap-equivalent, 2026-07-20). The A pattern is DETERMINISTIC
+    //   (Aval(i) below), so at large K the 24576*K-byte host A vector (13 GB @ K=524288) is pure waste that
+    //   OOMs this 16 GB host. When A would exceed 4 GB (or DSWS2_LOWMEM is set), skip the host A vector: fill
+    //   the host-accessible VRAM buffer straight from the formula, and have the oracle recompute A the same way.
+    //   Byte-identical to the memcpy path (Aval == the fill loop); baseline K=131072 (A=3.2 GB) is unaffected. ----
+    const size_t Abytes = (size_t)Mo*Ko;
+    const size_t Bbytes = (size_t)Ko*No;
+    const bool   lowmemA = (getenv("DSWS2_LOWMEM") != nullptr) || (Abytes > (4ull<<30)) || (Bbytes > (4ull<<30));
+    auto Aval = [&](size_t i) -> uint8_t { return NICE[(i*7 + i/(size_t)Ko) % 6]; };
+    auto Bval = [&](size_t i) -> uint8_t { return NICE[(i*5 + (i/(size_t)No)*3) % 6]; };
+    std::vector<uint8_t> Ah, Bh, Bshufh;
+    if (!lowmemA) {
+        Ah.resize(Abytes);     for (size_t i = 0; i < Abytes; ++i) Ah[i] = Aval(i);
+        Bh.resize(Bbytes);     for (size_t i = 0; i < Bbytes; ++i) Bh[i] = Bval(i);
+        Bshufh.resize(Bbytes); mbg_preshuffle_B(Bh.data(), Bshufh.data(), Ko, No);
+    } else printf("  [dsws2 LOWMEM] A (%.1f GB) + B (%.1f GB) generated into VRAM on the fly -- host operand vectors skipped (host RAM stays flat)\n", Abytes/1e9, Bbytes/1e9);
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
     if (!isaBytes) { fprintf(stderr, "  [dsws2] cannot read kernel bin '%s'\n", isaPath); return res; }
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     // ---- TRACE: per-super-tile time-series buffer (DSWS2_TRACE=1; requires a TRACE=1 kernel bin + single chunk).
     //   The claimer appends a 16-u32 row per super-tile (indexed by SEGCNT) capturing the live role mix, ring
@@ -1738,8 +1815,8 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     // SAFETY PADDING (mirrors run_mbcoop): a guard tail after each operand so a small dyn off-by-one global
     //   access lands in mapped VRAM (observable wrong answer) instead of a page-fault brick.
     uint64_t padB = (uint64_t)(getenv("ML8_COOP_PAD_MB") ? atoi(getenv("ML8_COOP_PAD_MB")) : 64) * 1024ull * 1024ull;
-    GpuBuf Ad = AllocGpu(node, ((Ah.size()+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
-    GpuBuf Bd = AllocGpu(node, ((Bshufh.size()+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
+    GpuBuf Ad = AllocGpu(node, ((Abytes+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
+    GpuBuf Bd = AllocGpu(node, ((Bbytes+0xFFF)&~0xFFFull) + padB, false, true, /*deviceLocal*/true);
     uint64_t cbytes = ((uint64_t)TOTAL * (uint64_t)((uint32_t)Gv*FMc*FNc*1024) + 0xFFF) & ~0xFFFull;  // TOTAL output tiles x G*FM*FN frags x 256 f32
     GpuBuf C = AllocGpu(node, cbytes + padB, false, true, /*deviceLocal*/true);
     GpuBuf fence = AllocGpu(node, 0x1000, false, true);
@@ -1750,7 +1827,7 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     // ---- ADDRESS BOUNDS GATE (MANDATORY, mirrors run_mbcoop's gate). Formulas re-derived from
     //   occ_kernel_dsws.s's ASTAGE/BSTAGE/.Lcompute address math (G replaces coop's P; r replaces cid). ----
     {
-        uint64_t Asize = (uint64_t)Ah.size(), Bsize = (uint64_t)Bshufh.size(), Csz = cbytes;
+        uint64_t Asize = (uint64_t)Abytes, Bsize = (uint64_t)Bbytes, Csz = cbytes;
         uint64_t rowblkAbsMax = (uint64_t)MTLsuper * (uint64_t)Gv - 1ull;
         uint64_t Amax = rowblkAbsMax*(uint64_t)16*FMc*Ko + (uint64_t)(FMc-1)*16*Ko
                         + (uint64_t)(n_kseg-1)*SEGKv + (uint64_t)(KSEG_STEPS-1)*16
@@ -1772,10 +1849,20 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         }
     }
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
-    memcpy(Ad.ptr, Ah.data(), Ah.size());
-    memcpy(Bd.ptr, Bshufh.data(), Bshufh.size());
-    memset((char*)Ad.ptr + ((Ah.size()+0xFFF)&~0xFFFull), 0, padB);
-    memset((char*)Bd.ptr + ((Bshufh.size()+0xFFF)&~0xFFFull), 0, padB);
+    if (lowmemA) {   // A + B generated straight into VRAM via a small host staging buffer (byte-wise writes to
+                     //   uncached coarse-grained VRAM are ~100 MB/s; a cached fill + bulk memcpy is ~10 GB/s).
+        const size_t STG = 64ull<<20;
+        std::vector<uint8_t> stage(STG < Abytes ? STG : Abytes);
+        for (size_t off=0; off<Abytes; off+=STG) {
+            size_t n = (Abytes-off) < STG ? (Abytes-off) : STG;
+            for (size_t j=0;j<n;++j) stage[j]=Aval(off+j);
+            memcpy((char*)Ad.ptr+off, stage.data(), n);
+        }
+        mbg_gen_preshuffle_B((uint8_t*)Bd.ptr, Ko, No);
+    }
+    else         { memcpy(Ad.ptr, Ah.data(), Abytes); memcpy(Bd.ptr, Bshufh.data(), Bbytes); }
+    memset((char*)Ad.ptr + ((Abytes+0xFFF)&~0xFFFull), 0, padB);
+    memset((char*)Bd.ptr + ((Bbytes+0xFFF)&~0xFFFull), 0, padB);
     volatile uint32_t* occW   = (volatile uint32_t*)occ.ptr;
     volatile uint32_t* fenceW = (volatile uint32_t*)fence.ptr;
     memset((void*)occW, 0, occ.size);   // host zero-init: occ[0] live-count, occ[20] claim-counter, all reserved words
@@ -1810,7 +1897,66 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   the operand pool. Must match the kernel's ACC_BASE/ACC_STRIDE/ACC_N (DSWS2_ACC_N, default 1; 0 for ring/single).
     uint32_t accN = getenv("DSWS2_FLOW") ? (getenv("DSWS2_ACC_N") ? (uint32_t)atoi(getenv("DSWS2_ACC_N")) : 1u) : 0u;
     uint32_t accBytes = accN * (uint32_t)(FMc*FNc*1024);
-    uint32_t ldsBytesRaw = 256u + poolSlots * operandBytes + accBytes;   // flow POOL3/ACC1:57600  POOL2/ACC2:49408
+    // *** CO-CHANGE: kOpBase MUST MATCH OP_BASE in occ_kernel_dsws_flow.s. ***
+    //   Raised 256->512 (2026-07-13). At 256 the kernel's per-slot control blocks (SLOTC_BASE=148 + N*32)
+    //   overran the operand pool for N>3, hard-capping POOL_N at 3 -- and POOL_N is the ceiling on how far
+    //   ASSIGN may lead DRAIN, i.e. it caps ALL in-flight work. If this disagrees with the kernel the host
+    //   under-allocates LDS and the workgroup SILENTLY NEVER LAUNCHES (all counters read 0 -- looks like a
+    //   hang, is really a dispatch that could not fit). Do not "fix" one side alone.
+    constexpr uint32_t kOpBase = 512u;
+    static_assert(kOpBase >= 148u + 4u*32u, "kOpBase must clear SLOTC_BASE + POOL_N*SLOTC_STRIDE");
+    uint32_t ldsBytesRaw = kOpBase + poolSlots * operandBytes + accBytes;   // WOFLUSH POOL4: 512 + 4*8192 = 33280
+    // *** CO-CHANGE: SSWIN MUST MATCH the SSWIN defsym passed to occ_kernel_dsws_flow.s. ***
+    //   When SSWIN > POOL_N the kernel RELOCATES its per-slot control array from the low control gap
+    //   (SLOTC_INLINE_BASE=148) to the TOP of LDS, above the accumulator pool (kernel :715-719):
+    //       SLOTC_BASE = <this ldsBytesRaw> ; LDS_TOTAL_FLOW = SLOTC_BASE + SSWIN*32
+    //   so the group segment grows by SSWIN*32 bytes. Reading the SAME env var the build does is
+    //   deliberate -- a separate DSWS2_* name could silently drift from the assembled binary.
+    //   RUN #10 POST-MORTEM (2026-07-19): this term was missing. At the config of record ldsBytesRaw
+    //   is 53760 = EXACTLY 105 granules of 512B, i.e. ZERO slack, so the 256B control array at
+    //   [53760,54016) fell outside the allocation. OOB LDS drops writes and reads as 0 => SL_GEN==0
+    //   (only generation 0 passes the v3 gate), SL_RBNEXT==0 (reads as staged+claimable, so EVERY
+    //   wave's CAS(0->1) "wins" the same rowblk), SL_RBDONE never increments => DRAIN pinned at 0 =>
+    //   ASSIGN-DRAIN saturates SSWIN => every wave sleeps. Hang + 1 GPU reset. Had the total landed
+    //   one byte into a fresh granule this would have worked by accident and hidden the defect.
+    uint32_t ssWin = getenv("SSWIN") ? (uint32_t)atoi(getenv("SSWIN")) : poolSlots;
+    if (ssWin > poolSlots) ldsBytesRaw += ssWin * 32u;   // kernel SLOTC_STRIDE = 32
+    // *** AUTHORITATIVE OVERRIDE: <bin>.lds, emitted by the assembler from LDS_TOTAL_FLOW itself. ***
+    //   Everything above this point is the host's own RECONSTRUCTION of the kernel's layout, and that
+    //   reconstruction is exactly what broke in run #10. When SSWIN became the default it stopped being
+    //   a footgun you might step on and became one you step on by FORGETTING an env var -- so the value
+    //   now travels WITH THE ARTIFACT. build_flow.sh objcopy's the .lds_total section next to the .bin;
+    //   .text is untouched, so kernel binaries stay byte-identical. If the file is present it WINS, and
+    //   a disagreement with the reconstruction is printed loudly rather than silently preferred.
+    {
+        std::string ldsPath = std::string(isaPath) + ".lds";
+        size_t n = ldsPath.size();
+        if (n > 8 && ldsPath.compare(n-8, 8, ".bin.lds") == 0) ldsPath.replace(n-8, 8, ".lds");
+        if (FILE* f = fopen(ldsPath.c_str(), "rb")) {
+            uint32_t published = 0;
+            if (fread(&published, 4, 1, f) == 1 && published >= 512u && published <= 65536u) {
+                if (published != ldsBytesRaw)
+                    fprintf(stderr, "  [dsws2] LDS: host reconstruction says %uB but the BIN PUBLISHES %uB"
+                                    " -- trusting the bin (%s). Check SSWIN/POOL_N/ACC_N env vs the build.\n",
+                            ldsBytesRaw, published, ldsPath.c_str());
+                else
+                    fprintf(stderr, "  [dsws2] LDS: %uB published by the bin, host reconstruction AGREES.\n",
+                            published);   // print on AGREEMENT too: a silent success is indistinguishable
+                                          //   from the read never happening. (run #11 PHIST lesson.)
+                ldsBytesRaw = published;
+            }
+            fclose(f);
+        } else {
+            fprintf(stderr, "  [dsws2] LDS: no %s next to the bin -- falling back to the host-side formula"
+                            " (%uB). Rebuild with build_flow.sh to publish it.\n", ldsPath.c_str(), ldsBytesRaw);
+        }
+    }
+    if (ldsBytesRaw > 65536u) {   // the kernel .errors on this at assemble time; the host must not sail past it
+        fprintf(stderr, "  [dsws2] FATAL: LDS %uB > 65536 (POOL_N=%u accN=%u). The WG would silently never launch.\n"
+                        "          Under WOFLUSH=1 pass DSWS2_ACC_N=0 -- the kernel allocates NO accumulator banks.\n",
+                ldsBytesRaw, poolSlots, accN);
+        return res;
+    }
     uint32_t ldsU=0, ldsA=0, ldsG=0; uint32_t ldsBits = ldsRsrc2Bits(ldsBytesRaw, &ldsU, &ldsA, &ldsG);
     uint32_t rsrc2 = (BuildPgmRsrc2(true) & ~0x3eu) | (15u << RSRC2_USER_SGPR_SHIFT) | ldsBits;   // USER_SGPR=15 (FIX 1h: dropped s15..s17)
     uint32_t rsrc[2] = {rsrc1, rsrc2};
@@ -1830,8 +1976,53 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         magic, (uint32_t)NTL, (uint32_t)(FNc*256), 0u };                            // s12 magic, s13 NTL, s14 FNx256, [15] unused
     uint32_t dispInit = BuildDispatchInitiator();
 
-    const uint32_t poolD = getenv("ML8_POOL") ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
-    const uint32_t pool = poolD < 64u ? poolD : 64u;
+    // ---- NEVER LAUNCH A WORKGROUP THAT CANNOT CLAIM A TILE (2026-07-22). ----
+    //   `pool` was hard-defaulted to 64 with NO reference to TOTAL, so a small shape launched 64 WGs
+    //   of which TOTAL..63 were idle BY CONSTRUCTION -- they still pay the full prologue, LDS-init
+    //   participation, entry/exit atomics, instrumentation and the retire barrier. MEASURED on
+    //   96x512x2048 (TOTAL=8): 64 WGs = 1920 waves = 5.816 ms span; 8 WGs = 240 waves = 1.007 ms,
+    //   a 5.78x speedup with `computed` IDENTICAL (384) and the dense oracle clean in both. The
+    //   1680 removed waves cost 4.809 ms, i.e. 2.86 us each -- which is where the "3.0 us per
+    //   launched wave" fixed cost came from. It was never a per-wave execution cost; it was the
+    //   cost of launching waves that had no work to reach them.
+    //   THE CAP APPLIES TO THE DEFAULT ONLY. An explicit ML8_POOL is honoured literally (up to 64)
+    //   so the pre-fix behaviour stays reproducible -- ML8_POOL=64 on an 8-tile shape must still be
+    //   able to reproduce the 5.816 ms measurement, or the A/B above becomes uncheckable.
+    const bool poolExplicit = getenv("ML8_POOL") != nullptr;
+    const uint32_t poolD = poolExplicit ? (uint32_t)atoi(getenv("ML8_POOL")) : 64u;
+    //   CEILING RAISED 64 -> 256 (2026-07-22) so MORE THAN ONE WG PER CU CAN BE TESTED AT ALL. It had
+    //   been a hard 64 since e06a59944 -- the ONLY commit ever to touch these lines -- which means
+    //   ML8_POOL=128 was SILENTLY CLAMPED to 64 and the standing "2 WGs/CU is garbage" result was
+    //   never actually 2 WGs/CU. The default is unchanged at 64 (= 1 WG/CU on this 64-CU part).
+    uint32_t pool = poolD < 256u ? poolD : 256u;
+    if (!poolExplicit) {
+        if (pool > 64u) pool = 64u;
+        if (TOTAL > 0u && pool > TOTAL) {
+            printf("  [dsws2] pool %u -> %u WGs (capped at TOTAL=%u: %u workgroups could never claim a tile)\n",
+                   pool, TOTAL, TOTAL, pool - TOTAL);
+            pool = TOTAL;
+        }
+    }
+    if (pool < 1u) pool = 1u;
+    //   >1 WG/CU must ACTUALLY FIT or we are queueing, not parallelising -- and a queued run still
+    //   produces a clean-looking number, which is worse than an error. R9700 = 64 CUs, 65536B LDS
+    //   and 32 wave slots per CU (verified via rocminfo). Both budgets must hold simultaneously.
+    if (pool > 64u) {
+        const uint32_t perCU    = (pool + 63u) / 64u;
+        const uint64_t ldsNeed  = (uint64_t)perCU * (uint64_t)ldsBytesRaw;
+        const uint32_t waveNeed = perCU * (uint32_t)WAVES_LAUNCH;
+        if (ldsNeed > 65536ull || waveNeed > 32u) {
+            fprintf(stderr, "  [dsws2] *** REFUSE: ML8_POOL=%u means %u WG/CU, which needs %lluB LDS"
+                            " (budget 65536) and %u wave slots (budget 32).\n"
+                            "      This bin publishes %uB LDS and launches %d waves/WG. They cannot be"
+                            " co-resident, so this would SERIALISE rather than parallelise -- and the\n"
+                            "      run would still print a plausible number. Rebuild with smaller"
+                            " SEGK/ACC_N (LDS <= %lluB) and WAVES <= %u. ***\n",
+                    pool, perCU, (unsigned long long)ldsNeed, waveNeed, ldsBytesRaw, WAVES_LAUNCH,
+                    (unsigned long long)(65536ull / perCU), 32u / perCU);
+            return res;
+        }
+    }
     const char* ydis = getenv("ML8_YIELD_DISABLE"); bool yieldOff = ydis && ydis[0]=='1';
     int yieldMs = getenv("ML8_YIELD_MS") ? atoi(getenv("ML8_YIELD_MS")) : 5;
     if (yieldMs < 0) yieldMs = 0;
@@ -1845,15 +2036,46 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     // FIX 1 STAGGER: the flow write-once kernel claims occ[20] as whole TILES (a WG owns a tile's n_kseg
     //   segments so its per-WG LDS banks sum a full tile); every other dsws2 path claims super-tiles.
     const uint64_t claimTotal = getenv("DSWS2_FLOW") ? (uint64_t)TOTAL : TOTAL_super;
-    uint64_t chunkTiles = (chunkTilesEnv == 0ull || chunkTilesEnv > claimTotal) ? claimTotal : chunkTilesEnv;
+    // *** COMPOSITOR SAFETY -- REAL FIX (2026-07-21). The chunkMaxS cap is evaluated BETWEEN chunks, so it can
+    //   only abort the REMAINING ones; it can NEVER stop the chunk already in flight. The old default
+    //   (chunkTiles = claimTotal) therefore produced ONE chunk covering the whole problem => nChunks==1 =>
+    //   the cap could not fire at all and the run was UNBOUNDED. That is rule 7's exact failure mode: the
+    //   R9700 drives the displays off the same HBM bus, so a long chunk starves the compositor and trips the
+    //   Hyprland watchdog -- WITHOUT a GPU reset, so none of the hang/reset guards ever see it.
+    //   MEASURED 2026-07-21: a PHIST build (~220% overhead) ran a single 2.46s chunk against the 0.75s cap and
+    //   dropped Hyprland to safe mode. The cap "fired" afterwards and aborted zero remaining chunks.
+    //   FIX: bound the DEFAULT chunk so nChunks>1 and the cap has granularity to act between chunks.
+    const uint64_t CHUNK_DEFAULT = 512ull;                       // tiles/dispatch when ML8_COOP_CHUNK is unset
+    uint64_t chunkTiles = (chunkTilesEnv == 0ull)
+                            ? (claimTotal < CHUNK_DEFAULT ? claimTotal : CHUNK_DEFAULT)
+                            : (chunkTilesEnv > claimTotal ? claimTotal : chunkTilesEnv);
     uint64_t nChunks = (claimTotal + chunkTiles - 1ull) / chunkTiles;
     double chunkMaxS = getenv("ML8_COOP_CHUNK_MAXS") ? atof(getenv("ML8_COOP_CHUNK_MAXS")) : 0.75;
-    if (chunkTiles < TOTAL_super) printf("  [dsws2] compositor-safe: %llu super-tiles/dispatch x %llu chunks (yield %dms between; abort chunk > %.2fs)\n",
-                                          (unsigned long long)chunkTiles, (unsigned long long)nChunks, yieldMs, chunkMaxS);
+    //   Gate the reassurance on REAL protection (nChunks>1), not on the old apples-to-oranges
+    //   `chunkTiles < TOTAL_super` (tiles vs SUPER-tiles), which printed "compositor-safe" for a 1-chunk run.
+    if (nChunks > 1) {
+        printf("  [dsws2] compositor-safe: %llu tiles/dispatch x %llu chunks (yield %dms between; abort after a chunk > %.2fs)\n",
+               (unsigned long long)chunkTiles, (unsigned long long)nChunks, yieldMs, chunkMaxS);
+    } else {
+        fprintf(stderr, "  [dsws2] *** WARNING: SINGLE CHUNK (%llu tiles) -- the %.2fs cap CANNOT fire mid-chunk, so this\n"
+                        "      run is UNBOUNDED and can starve the compositor (rule 7: desktop dies, no GPU reset).\n"
+                        "      Lower ML8_COOP_CHUNK if this shape runs long. ***\n",
+                (unsigned long long)chunkTiles, chunkMaxS);
+    }
     bool streamOn = getenv("ML8_COOP_STREAM") != nullptr;
     uint32_t reslim[1]={0}, tmpring[1]={0}, restart[4]={0,0,0,0};
     bool allok = true; uint32_t lastOcc0 = 0, lastOcc20 = 0; uint32_t totalConv = 0;  // occ[48] conv-commit count, summed across chunks (reset per chunk)
     uint64_t sumSpan = 0; uint32_t spanChunks = 0; bool tfMissing = false;  // TFPROBE: summed per-chunk GPU-tick span (occ[3]-occ[2]); tfMissing => bin has no tick capture
+    // ML8_SPANFLIP: MUST match a bin built -Wa,-defsym,SPANFLIP=1. That bin reverses BOTH tfspan
+    //   atomics, so occ[2]=MAX entry tick and occ[3]=MIN exit tick, and occ[3]-occ[2] becomes the
+    //   ALL-RESIDENT WINDOW (every wave simultaneously live) rather than the first-in/last-out span.
+    //   The sentinels must therefore be seeded the OTHER way round or the atomics can never move off
+    //   them. A mismatch between bin and env does NOT silently lie: the seed stays put and the
+    //   stamped-check below reports the chunk as unstamped (tfMissing), exactly as for a TFPROBE=0 bin.
+    const bool spanFlip = getenv("ML8_SPANFLIP") && atoi(getenv("ML8_SPANFLIP")) != 0;
+    long long flipWindowMin = 0; bool flipAny = false;   // signed: a NEGATIVE window means the first
+                                                         // wave exited BEFORE the last wave entered,
+                                                         // i.e. the waves were never all resident.
     // SUSTAINED (DSWS2_REPS>1): re-run the whole chunked GEMM back-to-back, buffers reused, C re-zeroed per rep
     //   (split-K atomic-adds into C, so a repeated pass without reset would double it). Spans sum across ALL
     //   reps -> TF is over reps*(2MNK) work / total busy ticks (warm-clock steady state, not a cold ms blip).
@@ -1879,7 +2101,8 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         memset((void*)occW, 0, 0x100);        // re-zero the control region (occ[0] live, occ[20] claim, reserved) each chunk
         occW[5] = (uint32_t)base;             // occ[20] (=occW[5]) claim counter starts at this chunk's base sti
         occW[6] = (uint32_t)chunkHi;          // FIX 1(j): occ[24] (=occW[6]) = this chunk's terminal sti bound (memory-carried)
-        occW[2] = 0xFFFFFFFFu;                // TFPROBE: min-sentinel for the entry-tick atomic_min (occ[2]); occ[3] stays 0 (max)
+        if (spanFlip) { occW[2] = 0u; occW[3] = 0xFFFFFFFFu; }   // SPANFLIP: entry is atomic_MAX (seed 0), exit is atomic_MIN (seed ~0)
+        else            occW[2] = 0xFFFFFFFFu;                    // TFPROBE: min-sentinel for the entry-tick atomic_min (occ[2]); occ[3] stays 0 (max)
         occW[62] = magicTotal;                // KMAJOR: magic(TOTAL) for the ksi=sti/TOTAL decode (ignored unless KMAJOR bin)
         if (traceW) { uint64_t tva=(uint64_t)traceBuf.ptr;   // TRACE: (re-)publish buffer VA + cap (memset above wiped occ[52..54])
                       occW[52]=(uint32_t)tva; occW[53]=(uint32_t)(tva>>32); occW[54]=traceMaxRows; }
@@ -1950,6 +2173,36 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
             fprintf(stderr, "    [timeout forensics] FRONTIER  ASSIGN=%u STAGE=%u DRAIN=%u  drain-slot[RBDONE=%u BFDONE=%u ARDONE=%u]  barrier=%u\n"
                             "        (read: where DRAIN<STAGE<ASSIGN pinpoints the stalled stage; RBDONE<ACC_N=never computed, BFDONE<FN|ARDONE<G=never staged, DRAIN<ASSIGN w/ all-full=completer/drain bug, barrier<WAVES=exit-barrier never closed)\n",
                     occW[74], occW[75], occW[76], occW[77], occW[78], occW[79], occW[80]);
+            // SELFSERVE CARRY-THROUGH FUNNEL (occ[100..103]) -- eager global-atomic ADDs fired at the four
+            //   ACC-dead seams of the carry-through path, so they aggregate across every WG and SURVIVE a
+            //   wedge. All zero => FORENSICS=0 or SELFSERVE=0 build.
+            //
+            //   *** 2026-07-19: this replaces three prints that read occ[4..13] and occ[40..49]. Those slots
+            //   belonged to a DELETED implementation -- NONE of their symbols exist in the current kernel.
+            //   Worse, occ[5] is the LIVE claim word (printed as occ20 above) and occ[2..3] are the start/end
+            //   ticks, so the old "BREADCRUMB LADDER" was rendering live kernel state as if it were a counter
+            //   (that is where run #5's nonsensical "entry=0 alive=236 gate=96" came from). Do not reintroduce
+            //   a counter below occ[70] without checking it against the .set FDIAG_* block in the kernel. ***
+            {
+                // *** 2026-07-20: this block USED to read occ[100] as "entered" and occ[102] as "settled".
+                //   Both counters were DELETED on 2026-07-19 (the run #8 s99/s101 SGPR-collision post-mortem);
+                //   nothing writes those words any more, so the print reported entered=0 settled=0 on every
+                //   timeout and would have sent the reader chasing "carry-through never engaged". Derive
+                //   entered the same way the success path does: occ[96] emissions - occ[73] grow-fails.
+                uint32_t ssGrowFail = occW[73], ssShrunk = occW[103], ssEmis = occW[96];
+                long ssEnter = (long)ssEmis - (long)ssGrowFail;
+                long inFlight = ssEnter - (long)ssShrunk;            // committed but never finished + shrank
+                fprintf(stderr, "    [timeout forensics] SELFSERVE-CARRYTHROUGH  entered=%ld (occ[96] %u - occ[73] %u)  shrunk=%u\n"
+                                "        =>  STUCK-in-carrythrough=%ld\n"
+                                "        (read: the funnel is CLOSED when entered == shrunk. entered==0 with a live DECENTASN means\n"
+                                "         carry-through never engaged at all -- every reservation took the grow-fail/ring path, so look\n"
+                                "         at grow-fail. STUCK-in-carrythrough>0 == wedged inside the settle walk or the WMMA/ds_add burst\n"
+                                "         .Lflow_da_ss_rowblk -- that burst is deliberately UNINSTRUMENTED because it holds ACC, so\n"
+                                "         cross-reference computed occ[71], FRONTIER above, and the PHIST histogram below.\n"
+                                "         entered==shrunk with a TIMEOUT == carry-through is CLEAN; the stall is elsewhere.)\n",
+                        ssEnter, ssEmis, ssGrowFail, ssShrunk, inFlight);
+                printPhist(occW, "timeout forensics");
+            }
             allok = false; break;
         }
         if (chunkDiag) {
@@ -1967,7 +2220,16 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         //   chunks -> total GPU busy ticks for the whole GEMM (host inter-chunk gaps excluded). If unstamped, the
         //   bin lacks TFPROBE tick capture -> flag and skip (no bogus TF from the 0xFFFFFFFF sentinel).
         { uint32_t gs = occW[2], ge = occW[3];
-          if (gs != 0xFFFFFFFFu && ge != 0) {
+          if (spanFlip) {
+              // gs = MAX entry (seeded 0), ge = MIN exit (seeded ~0). Both must have moved off seed.
+              // The difference is SIGNED and may legitimately be negative -- that is the whole point.
+              if (gs != 0u && ge != 0xFFFFFFFFu) {
+                  long long w = (long long)(int64_t)(uint64_t)ge - (long long)(int64_t)(uint64_t)gs;
+                  if (!flipAny || w < flipWindowMin) flipWindowMin = w;
+                  flipAny = true;
+                  spanChunks++;
+              } else tfMissing = true;
+          } else if (gs != 0xFFFFFFFFu && ge != 0) {
               sumSpan += (ge >= gs) ? (uint64_t)(ge - gs) : ((uint64_t)ge + 0x100000000ull - (uint64_t)gs);
               spanChunks++;
           } else tfMissing = true; }
@@ -1998,21 +2260,259 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
            "    'did every WG's claimer reach a terminal claim' liveness signal, occ[0]==0 as the real completion gate)\n",
            lastOcc0, lastOcc20, (unsigned long long)TOTAL_super);
     printf("  [dsws2 CONVERSIONS] committed role-switches (occ[48], summed over chunks) = %u  (>0 => waves ADAPTIVELY switched role)\n", totalConv);
-    {   // STAGINSTR write-once diag: feed-vs-compute-bound. occ[70]=coast iters, [71]=computed, [72]=feed stages.
+    {   // SELFSERVE CARRY-THROUGH FUNNEL (occ[100..103]) on the SUCCESS path.
+        //   *** 2026-07-19, run #6: this block originally existed ONLY inside the timeout branch. Run #6 then
+        //   COMPLETED CLEAN -- so the funnel was collected and silently discarded, and the one question the run
+        //   was dispatched to answer (did carry-through engage at all?) went unanswered on a successful run.
+        //   A correct-but-slow run needs this MORE than a hang does: a hang at least tells you where waves are
+        //   parked, whereas TF=0.1 with a clean oracle looks identical whether carry-through fired 6144 times
+        //   or zero times. Instrument the success path. ***
+        // STAGINSTR-gated (was FORENSICS-gated eager atomics until run #7 showed that cost 63s of a 66s run).
+        //   *** 2026-07-19, run #8: occ[100] and occ[102] ARE NO LONGER WRITTEN and MUST NOT be read. Those
+        //   counters lived in s99/s101, which are really FATHELD and DM_PROG (.set aliases, invisible to a
+        //   grep for the register spelling). Incrementing them corrupted the fat-token flag and permanently
+        //   satisfied the deadman's progress flag, disabling the anti-brick watchdog. Both deleted in the
+        //   kernel; see occ_kernel_dsws_flow.s :2120. `entered` is now DERIVED from two independent
+        //   pre-existing counters, which is strictly more trustworthy than the counter I removed. ***
+        uint32_t emis = occW[96], gf = occW[73], k = occW[103];
+        long entered = (long)emis - (long)gf;      // reservations that COMMITTED to carry-through
+        printf("  [dsws2 SELFSERVE] carry-through entered=%ld (occ[96] emissions %u - occ[73] grow-fail %u)  shrunk=%u\n"
+               "      (expect entered==shrunk on a clean run. entered==0 => carry-through NEVER ENGAGED: every\n"
+               "       DECENTASN reservation took the ring handoff, so S1 is inert and this is just the old ring\n"
+               "       economy. entered>shrunk => items committed but never finished the WMMA/reduce burst.\n"
+               "       entered>0 with door4 GROW-FAIL==0 below => S1 engaged but the VGPR budget STILL never\n"
+               "       binds, i.e. the dyn-VGPR moat and the stagger engine remain idle -- headroom left.)\n",
+               entered, emis, gf, k);
+        printPhist(occW, "dsws2 SELFSERVE");   // *** SUCCESS PATH TOO: run #11 finished clean and discarded the whole histogram. ***
+    }
+    {   // STAGINSTR: FULL COAST DECOMPOSITION (2026-07-14). `coast` was ONE bucket with FOUR doors into it,
+        //   and we spent a day tuning doors 3+4 (which are 0.008% of it) because we could not see doors 1+2.
+        //   coast == CNOSTG + CLEAD + FATFULL + GROWFAIL  (the sum is a self-check: if it does not close, a
+        //   door is miscounted). And occ[88] JWAIT is the one that was NEVER counted: a FAT carrier holding
+        //   ACC in registers, spinning for its next segment to be staged. That is the only place a fat wave
+        //   burns time, and it was invisible in every prior measurement.
         uint32_t coastIt = occW[70], compIt = occW[71], feedIt = occW[72], growFail = occW[73];
+        uint32_t feedMT  = occW[86], fatFull = occW[87];
+        uint32_t jWait   = occW[88], cLead = occW[89], cNoStg = occW[90];
+        // ---- A GATE THAT CANNOT EVALUATE MUST SAY SO (2026-07-22). ----
+        //   Before today this whole block was simply SKIPPED when the counters read 0, which meant a
+        //   STAGINSTR=0 bin produced NO work-exactness verdict at all -- and gpu_run.sh's latch keys on
+        //   the string "WORK-INEXACT", so such a run sailed through with silent non-coverage. Absence of
+        //   a verdict was indistinguishable from a passing verdict. That is the same failure class as the
+        //   reps-aware bug: a check that quietly declines to run reads as a check that passed.
+        //   occ[71] is emitted by cnt_flush, so it is 0 for exactly two reasons -- disambiguated here by
+        //   occ[20] (occW[5], tiles claimed), an INDEPENDENT witness that the kernel did real work.
+        if (coastIt + compIt == 0) {
+            uint32_t claimed = occW[5];
+            printf("\n*** DSWS2 WORK-EXACT: CANNOT-EVALUATE -- NO CORRECTNESS VERDICT ***\n"
+                   "    computed(occ[71])=0 coast(occ[70])=0: the STAGINSTR counters are absent, so\n"
+                   "    work-exactness was NOT CHECKED. This is not a pass.\n");
+            if (claimed > 0)
+                printf("    occ[20] claim=%u -> tiles WERE claimed, so the kernel ran and the counters are\n"
+                       "    simply not built in (STAGINSTR=0). Rebuild -Wa,-defsym,STAGINSTR=1 to get a\n"
+                       "    verdict, or use CNTLEAN=1 to keep the verdict while trimming the retire flush.\n", claimed);
+            else
+                printf("    occ[20] claim=0 -> NO tiles were claimed either. The kernel did no work; this is\n"
+                       "    a REAL FAILURE, not a missing instrument.\n");
+            printf("    Do not quote this run's throughput as validated.\n\n");
+        }
         if (coastIt + compIt > 0) {
-            double starve = 100.0 * (double)coastIt / (double)(coastIt + compIt);
-            printf("  [dsws2 STAGINSTR] compute-wave iters: coast=%u  computed=%u  feed-stages=%u  grow-fail=%u\n"
-                   "                    -> coast-frac=%.1f%%  grow-fail(stagger-repulsion)=%u (%.1f%% of coasts)\n",
-                   coastIt, compIt, feedIt, growFail, starve, growFail,
-                   coastIt > 0 ? 100.0 * (double)growFail / (double)coastIt : 0.0);
+            double tot = (double)(coastIt + compIt);
+            printf("  [dsws2 STAGINSTR] computed=%u  coast=%u  (coast-frac=%.1f%%)  feed-stages=%u\n",
+                   compIt, coastIt, 100.0 * (double)coastIt / tot, feedIt);
+            // ---- WORK-EXACTNESS GATE (2026-07-20). A HARD verdict, not a printed number. ----
+            //   expected = GROUPS * TOTAL_super * ACC_N, and GROUPS==G/ACC_N, so ACC_N cancels:
+            //       expected == G * TOTAL_super           (verified against every geometry in the audit)
+            //   WHY THIS IS A GATE AND NOT A PRINT: on 2026-07-20 an audit of 31 runs on this shape found
+            //   10 THAT SILENTLY DROPPED WORK -- including run #20 (one group of one tile, 1x1536) which
+            //   ALSO reported "oracle CLEAN", because the oracle samples 32 of 16384 tiles (0.2%) and
+            //   missed the dropped tile entirely. Count-based gates (TILEDONE/DRAIN/GSTORED) structurally
+            //   cannot see it either. So a run could drop work, print CLEAN, and be logged as a result --
+            //   which is exactly what happened before this gate existed.
+            //   DROPPED WORK FLATTERS TF: less work in the same span reads as higher throughput. A short
+            //   count therefore does not just invalidate correctness, it invalidates the PERF number too.
+            //   NOTE: compIt is uint32; at very large geometries expected can exceed 2^32 and this check
+            //   would need widening. It is exact for every shape run to date.
+            //   REPS-AWARE (2026-07-21): occ[71] is NOT zeroed between reps in the sustained loop
+            //   (DSWS2_TARGET_SECS / DSWS2_REPS), so it ACCUMULATES across repsDone submissions. Compare
+            //   against G*TOTAL_super*repsDone, not the single-rep count -- else every reps>1 run
+            //   false-flags WORK-INEXACT (compIt = single-rep-exact * repsDone). Still catches a real
+            //   drop: a short rep makes compIt fall below the reps-scaled expectation.
+            {
+                unsigned long long perRep = (unsigned long long)Gv * TOTAL_super;
+                unsigned long long expComputed = perRep * (unsigned long long)(repsDone > 0 ? repsDone : 1);
+                long long shortBy = (long long)expComputed - (long long)compIt;
+                if (shortBy == 0) {
+                    printf("  [dsws2 WORK-EXACT] computed == G*TOTAL_super == %llu  (no work dropped)\n", expComputed);
+                } else {
+                    printf("\n*** DSWS2 WORK-INEXACT -- RUN IS INVALID ***\n"
+                           "    computed=%u  expected=%llu  delta=%+lld", compIt, expComputed, -shortBy);
+                    if (shortBy > 0 && shortBy % 1536 == 0)
+                        printf("  (= %lld x 1536 = %lld whole group(s) of one tile DROPPED)", shortBy/1536, shortBy/1536);
+                    printf("\n    Work was silently lost or double-counted. THE THROUGHPUT NUMBER FROM THIS RUN IS\n"
+                           "    MEANINGLESS -- dropped work makes TF look BETTER. Do not log it, do not compare\n"
+                           "    against it. The oracle can NOT be trusted to catch this (0.2%% tile sampling).\n\n");
+                }
+            }
+            // ---- BNDPROBE: exact boundary-transition accounting (occ[116..120]) ----
+            //   Zero unless built BNDPROBE=1. This is the correctness probe for the intermittent
+            //   dropped-group race: it tests an EQUALITY, so it is unthrottled and exact.
+            {
+                uint32_t bGrp = occW[116], bTile = occW[117];
+                uint32_t bSkew = occW[118], bQbad = occW[119], bTerm = occW[120];
+                if (bGrp | bTile | bSkew | bQbad | bTerm) {
+                    uint32_t GROUPSv = (accN > 0) ? (uint32_t)Gv / accN : 1u;
+                    // Every tile needs exactly ONE tile-advance (which claims/re-bases it) and
+                    // GROUPS-1 group-advances. So: expected groupAdv == tileAdv * (GROUPS-1),
+                    // minus edge effects from the per-WG init claim and terminal over-claims.
+                    long long expGrp = (long long)bTile * (long long)(GROUPSv - 1);
+                    long long gap = expGrp - (long long)bGrp;
+                    printf("  [dsws2 BNDPROBE] group-adv=%u  tile-adv=%u  terminal=%u   (GROUPS=%u)\n"
+                           "      expected group-adv ~= tile-adv*(GROUPS-1) = %lld   gap=%+lld%s\n"
+                           "  [dsws2 BNDPROBE] DIVERGENCE  ASSIGN!=z at decision (occ[118]) = %u %s\n"
+                           "                               (z-base)>>shift out of [1,GROUPS] (occ[119]) = %u %s\n",
+                           bGrp, bTile, bTerm, GROUPSv, expGrp, -gap,
+                           gap == 0 ? "  (cursor accounting CLOSES)" : "  *** GROUP ADVANCES MISSING ***",
+                           bSkew, bSkew ? "*** SKEW DETECTED -- see raw values below ***" : "(clean)",
+                           bQbad, bQbad ? "*** CORRUPTED DA_BASE/DA_ZDONE GENERATION ***" : "(clean)");
+                    if (bSkew) {
+                        uint32_t sA = occW[121], sZ = occW[122], sZB = occW[123], sD = occW[124];
+                        long long delta = (long long)sA - (long long)sZ;
+                        printf("  [dsws2 BNDPROBE] SKEW SAMPLE (last of %u): ASSIGN=%u  z=%u  ASSIGN-z=%+lld\n"
+                               "                   z-base=%u  DRAIN=%u   -> %s\n",
+                               bSkew, sA, sZ, delta, sZB, sD,
+                               delta > 0 ? "ASSIGN AHEAD OF z == a reservation slipped PAST DA_ZDONE (over-reservation)"
+                                         : "ASSIGN BEHIND z == ASSIGN moved BACKWARD (a rollback path IS reachable)");
+                        uint32_t zZero = occW[125], tileDec = occW[126];
+                        printf("                   CLASSIFY: skews-at-z==0 (bootstrap) = %u / %u total   skews-at-TILE-decision = %u / %u\n"
+                               "                   -> %s\n",
+                               zZero, bSkew, tileDec, bSkew,
+                               zZero == bSkew ? "ALL SKEWS ARE AT THE BOOTSTRAP (z==0) -- the bug is the FIRST-TILE claim, not steady state"
+                                              : "MIXED -- some skews are steady-state group/tile boundaries, NOT just bootstrap");
+                    }
+                }
+            }
+            uint32_t doors = cNoStg + cLead + fatFull + growFail;
+            printf("  [dsws2 COAST DECOMP]  (door sum=%u vs coast=%u : %s)\n"
+                   "      door1 NOTHING-STAGED (DRAIN>=STAGE) = %-12u %5.1f%% of coast\n"
+                   "      door2 LEAD-GATE      (ksi%%J != 0)   = %-12u %5.1f%% of coast   <- STRUCTURAL: (J-1)/J by construction\n"
+                   "      door3 FAT-PEAK-FULL  (stagger cap)  = %-12u %5.1f%% of coast\n"
+                   "      door4 GROW-FAIL      (VGPR budget)  = %-12u %5.1f%% of coast\n",
+                   doors, coastIt,
+                   (doors == coastIt ? "CLOSES" : "*** DOES NOT CLOSE -- a door is miscounted ***"),
+                   cNoStg,   coastIt ? 100.0*(double)cNoStg/(double)coastIt : 0.0,
+                   cLead,    coastIt ? 100.0*(double)cLead/(double)coastIt  : 0.0,
+                   fatFull,  coastIt ? 100.0*(double)fatFull/(double)coastIt: 0.0,
+                   growFail, coastIt ? 100.0*(double)growFail/(double)coastIt:0.0);
+            // THE CARRIER STALL. jWait is NOT a coast -- the wave is FAT and cannot do anything else.
+            //   jWait >> comp  => the carriers are starved: staging cannot keep a fat wave fed. STAGE-BOUND, and
+            //                     no amount of admission control / grow-fail elimination can touch it.
+            //   jWait << comp  => carriers run to completion; the cost is elsewhere.
+            // *** DUTYPROBE: peak/cycle -- the number the whole traveling-peak design rests on. ***
+            //   A wave's fat window vs its full cycle. If duty is LOW the peaks can be phase-offset and the
+            //   resident budget becomes the AVERAGE footprint, not the max (kmbandy's governing rule) -- that is
+            //   where the headroom for a much larger G lives. If duty is ~100% the wave is a SQUARE WAVE and no
+            //   amount of staggering can help (that is what a big JDEPTH does: it re-creates full-K).
+            uint32_t dFat = occW[93], dCyc = occW[94];
+            if (dCyc > 0) {
+                double duty  = (double)dFat / (double)dCyc;   // peak / cycle -- EVERY burst measured, no sampling
+                double lanes = duty > 0 ? 1.0 / duty : 0.0;                       // waves that can SHARE one peak slot
+                uint32_t accN = getenv("DSWS2_G") ? (uint32_t)atoi(getenv("DSWS2_G")) : 15u;
+                printf("  [dsws2 DUTY] peak/cycle = %.1f%%   (fat=%u cyc=%u shader-cycles>>12, every burst)\n"
+                       "      -> %.1f waves can SHARE one peak slot (1/duty)\n"
+                       "      -> %u carriers x %.3f duty = %.1f peaks needed CONCURRENTLY (vs %u if unstaggered)\n"
+                       "      -> %s\n",
+                       100.0*duty, dFat, dCyc, lanes,
+                       accN, duty, accN*duty, accN,
+                       duty > 0.75 ? "SQUARE WAVE -- staggering CANNOT help here (peak ~= average)"
+                     : duty > 0.35 ? "moderate duty -- a stagger buys some, not a lot"
+                                   : "*** LOW DUTY -- TRAPEZOID. The traveling peak has real headroom here. ***");
+            }
+            uint32_t dmFat = occW[91], tokLeak = occW[92];
+            if (tokLeak > 0u)
+                fprintf(stderr, "  [dsws2 STAGGER] %u wave(s) retired HOLDING a fat token (occ[92]) -- leak caught+returned\n"
+                                "      (unfixed, each leak permanently burns one of MAXFAT slots -> FATTOK saturates -> WG wedges)\n", tokLeak);
+            if (dmFat > 0u) {
+                // .Lflow_retire assumes "ACC dead, wave lean". A carrier force-retired out of .Lflow_jwait is FAT with an
+                //   UNFLUSHED ACC -> its partial sum is dropped AND the slot's RBDONE never advances. The C matrix is wrong.
+                //   This ate 34% of the computed segments at J=64 on 2026-07-14 and the 1-tile oracle sample never saw it.
+                fprintf(stderr,
+                    "\n  *** [dsws2 INVALID RUN] DEADMAN FORCE-RETIRED %u FAT CARRIER(S) (occ[91]) ***\n"
+                    "      A fat carrier holds its split-K partial sum IN REGISTERS. .Lflow_retire does NOT flush it.\n"
+                    "      => C IS WRONG and `computed` UNDERCOUNTS. DO NOT USE THIS RUN'S TF OR COUNTERS.\n"
+                    "      Raise DEADMAN_TICKS (currently ~10s) or shorten the chunk (ML8_COOP_CHUNK_MAXS).\n\n", dmFat);
+            }
+            printf("  [dsws2 CARRIER STALL] occ[88] .Lflow_jwait spins (FAT, ACC live, waiting for a STAGE) = %u\n"
+                   "                    -> %.2f spin-iters per computed rowblk-segment  => %s\n",
+                   jWait,
+                   compIt ? (double)jWait / (double)compIt : 0.0,
+                   (compIt && (double)jWait > (double)compIt)
+                       ? "*** CARRIERS ARE STAGE-STARVED (fat waves spend more time waiting than computing) ***"
+                       : "carriers are fed (stall is not the wall)");
+            // THE BATON (2026-07-16): a carrier that refused a fat-token but HAD staged work waited on the
+            //   per-SIMD VGPR-budget pool (.Lflow_batonwait) instead of coasting, then grew into the registers
+            //   a shrinking carrier freed at shrink-START. occ[98] > 0 is the proof the traveling peak ENGAGED
+            //   (distinct from occ[87] FATFULL, which counts refusals that COASTED). Compare STAGGER=1 vs =0.
+            uint32_t batonWait = occW[98];
+            printf("  [dsws2 BATON] occ[98] .Lflow_batonwait spins (carrier waited on the VGPR-budget pool, then grew) = %u\n"
+                   "                    -> %s\n",
+                   batonWait,
+                   batonWait > 0u ? "the traveling peak ENGAGED -- a shrinking carrier handed its budget to a waiter"
+                                  : "no baton handoff (no carrier-with-work ever hit a full pool -- or STAGGER=0)");
+            // feedMT is emitted by BOTH lean feed waves AND coasting compute waves, so it is NOT a subset of
+            //   coast -- dividing by coast printed 196.2% on 2026-07-13. Correct denominator = all feed-path iters.
+            double feedTot = (double)feedIt + (double)feedMT;
+            printf("  [dsws2 STARVATION] feed-path iters with NOTHING ASSIGNED (occ[86]) = %u\n"
+                   "                    -> %.1f%% of ALL feed-path iters found an empty ASSIGN frontier  => %s\n",
+                   feedMT,
+                   feedTot > 0 ? 100.0 * (double)feedMT / feedTot : 0.0,
+                   (feedTot > 0 && (double)feedMT > 0.5 * feedTot)
+                       ? "ASSIGN-BOUND (coordinator cannot publish fast enough)"
+                       : "STAGE-BOUND (work is assigned; feeds/pool cannot stage it fast enough)");
+            // DECENTASN CLAIM-PERSISTENCE DIAGNOSTIC (sol gpt-5.6-sol, 2026-07-15): both reviews converged that
+            //   the seed is a PHANTOM claim (claim CAS reports success but does not persist to LDS). Measure it
+            //   directly at the claim, upstream of every propagation story.
+            if (occW[95] > 0u || occW[96] > 0u || occW[97] > 0u) {
+                printf("  [dsws2 DECENTASN CLAIM-DIAG]\n"
+                       "      occ[95] exec lane0 INACTIVE at claim CAS (lds_cas_rtn false-'won' precondition) = %u\n"
+                       "      occ[96] super-tile EMISSIONS reaching .Lflow_da_stamp (expect == TOTAL_super)  = %u\n"
+                       "      occ[97] release bailed on inflight==0 (containment, no underflow)          = %u\n"
+                       "      *** occ[96] IS NO LONGER THE PHANTOM COUNTER. The kernel repurposed CLAIM_NOPERSIST at\n"
+                       "          occ_kernel_dsws_flow.s:3661 to count REAL super-tile emissions; this label said\n"
+                       "          'PHANTOM' through run #6, which reported 12288 emissions as 12288 phantom claims.\n"
+                       "          occ[95]>0 is still the exec-mask false-'won' precondition (931/939). ***\n",
+                       occW[95], occW[96], occW[97]);
+            }
+            // ---- RESVPROBE (2026-07-20, N4): the CLEAN split of the empty-ASSIGN-frontier into WHY a wave
+            //   failed to reserve. Replaces run #16's PHIST TRY/WIN (~294% contaminated). occ[87]/occ[89] are
+            //   register-accumulated (CNT_FATFULL/CNT_CLEAD, both structurally 0 at config of record), so this
+            //   is measured INSIDE the quotable-TF build. Only meaningful for a bin built RESVPROBE=1.
+            if (getenv("DSWS2_RESVPROBE")) {
+                uint32_t winR = occW[96];      // WIN: reservations that reached .Lflow_da_stamp (== TOTAL_super)
+                uint32_t casLoss = occW[87];   // CAS-loss: lost the single-cursor ASSIGN_HEAD CAS (retry)
+                uint32_t poolFull = occW[89];   // window-full bail: r-DRAIN >= SSWIN (consumers behind)
+                uint32_t feedMTr = occW[86];   // empty-frontier bails (all reasons), for the denominator
+                double contention = winR ? (double)casLoss / (double)winR : 0.0;   // collisions per successful reserve
+                double pfFrac = feedMTr ? 100.0 * (double)poolFull / (double)feedMTr : 0.0;
+                const char* verdict =
+                    (pfFrac > 50.0)      ? "WINDOW FULL -> STAGE-BOUND: ASSIGN is AHEAD; the wall is staging/drain, NOT the cursor. DO NOT shard."
+                  : (contention > 1.0)   ? "CURSOR-CONTENDED: >1 CAS collision per reserve on the single ASSIGN_HEAD word -> SHARD THE CURSOR."
+                  : (contention > 0.15)  ? "MILD CURSOR CONTENTION: measurable collisions; sharding may help but is not the dominant wall."
+                                         : "NEITHER: window not full AND cursor barely contended -> the empties are ZLOCK BOUNDARY bails (serialization).";
+                printf("  [dsws2 RESVPROBE] reservation-exit split (WIN=%u = TOTAL_super):\n"
+                       "      CAS-loss (lost single-cursor CAS, occ[87]) = %u   -> %.3f collisions per successful reserve\n"
+                       "      window-full bail (r-DRAIN>=SSWIN, occ[89]) = %u   -> %.1f%% of empty-frontier bails\n"
+                       "      => %s\n",
+                       winR, casLoss, contention, poolFull, pfFrac, verdict);
+            }
         }
     }
     if (traceOn || occW[58] > 0u) {   // fat gauge populates occ[58]/[57] under STAGINSTR (or TRACE); print whenever data exists
         uint32_t fatPeak = occW[58], fatResidual = occW[57];   // FATMAX / FATLIVE (should end ~0 if balanced)
-        printf("  [dsws2 VGPR-BUDGET PROBE] peak concurrent FAT compute waves (occ[58]) = %u  -> ~%u VGPR in flight (x NFV=112)"
-               "   [residual live=%d]\n", fatPeak, fatPeak*112u, (int)fatResidual);
-        printf("      (per-SIMD B estimate = peak/128 SIMDs x 112; raise DSWS2_BUDGET/pool until this plateaus or s_alloc stalls)\n");
+        const uint32_t nfv = (uint32_t)(((32 + 8*FMc*FNc + 2*FMc) + 2*FNc + 15) & ~15);  // matches kernel NFV (=112 @ FM2FN4, 80 @ FM1FN4)
+        printf("  [dsws2 VGPR-BUDGET PROBE] peak concurrent FAT compute waves (occ[58]) = %u  -> ~%u VGPR in flight (x NFV=%u)"
+               "   [residual live=%d]\n", fatPeak, fatPeak*nfv, nfv, (int)fatResidual);
+        printf("      (per-SIMD B estimate = peak/128 SIMDs x %u; raise DSWS2_BUDGET/pool until this plateaus or s_alloc stalls)\n", nfv);
         uint32_t peakWaves = occW[1];   // occ[1] = peak concurrent RESIDENT waves (all roles), vs 2048 HW ceiling (16/SIMD)
         printf("  [dsws2 OCCUPANCY] peak concurrent resident waves (occ[1]) = %u of 2048 HW max (%.1f%%, %.2f/SIMD)  "
                "launched = %u WGs x %u waves = %u\n", peakWaves, peakWaves/2048.0*100.0, peakWaves/128.0,
@@ -2023,7 +2523,28 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   the n_kseg segments reduce the SAME K, so total MACs = M*N*K regardless of how K is partitioned). Span
     //   = summed per-chunk (occ[3]-occ[2]) GPU ticks -> the on-chip busy time, immune to host launch/fence/poll
     //   overhead (the reason a host wall-clock is useless at these <1ms shapes). TF = 2*M*N*K*freq / span / 1e12. ----
-    if (spanChunks > 0 && sumSpan > 0) {
+    if (spanFlip) {
+        // DIAGNOSTIC MODE -- this run measures RESIDENCY, not throughput. Deliberately prints no TF:
+        // occ[3]-occ[2] here is the all-resident window, and dividing work by it would be nonsense.
+        if (!flipAny) {
+            printf("  [dsws2 SPANFLIP] n/a -- occ[2]/occ[3] never moved off their seeds. Either the bin\n"
+                   "      was NOT built -Wa,-defsym,SPANFLIP=1 (env and bin must MATCH), or no chunk completed.\n");
+        } else {
+            double us = (double)flipWindowMin / freq_hz * 1e6;
+            printf("  [dsws2 SPANFLIP] ALL-RESIDENT WINDOW = %lld ticks (%.1f us) over %u chunk(s) @ %.0f MHz\n"
+                   "      occ[2]=MAX entry tick (last wave to arrive), occ[3]=MIN exit tick (first wave to leave).\n",
+                   flipWindowMin, us, spanChunks, freq_hz / 1e6);
+            if (flipWindowMin <= 0)
+                printf("      *** NEGATIVE/ZERO: the FIRST wave exited BEFORE (or as) the LAST wave entered.\n"
+                       "      The launched waves were NEVER all simultaneously resident. The normal span\n"
+                       "      (min entry -> max exit) is therefore measuring a LAUNCH/RETIRE RAMP, not\n"
+                       "      concurrent execution -- and per-wave 'cost' derived from it is a RATE, not work.\n");
+            else
+                printf("      Positive: compare against the normal-mode span for this same shape. If the window\n"
+                       "      is a small fraction of that span, most of the span is still ramp, not residency.\n");
+        }
+        printf("  [dsws2 SPANFLIP] (no TF reported: this is a residency probe, not a throughput run)\n");
+    } else if (spanChunks > 0 && sumSpan > 0) {
         res.wall = sumSpan;
         double reps_eff = (repsDone > 0) ? (double)repsDone : 1.0;   // work = reps_eff * (2MNK); span = sum over reps
         double workAll = 2.0 * (double)Mo * (double)No * (double)Ko * reps_eff;
@@ -2047,14 +2568,43 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   DISTRIBUTION (%) is stable regardless. Ticks are summed across ALL compute waves (aggregate time
     //   in each phase), so % shows WHERE compute-wave time goes -- measured, not inferred. ----
     {
-        const char* phName[6] = {"FOLLOW_WAIT","STAGE_WAIT","GROW","WMMA","FLUSH","SHRINK"};
+        // *** LABELS CORRECTED 2026-07-22 -- THE FIRST TWO WERE BOTH WRONG. ***
+        //   occ[64] (kernel s78) is stamped at .Lflow_havestage (occ_kernel_dsws_flow.s:3314), reached
+        //     ONLY after "DRAIN >= STAGE -> nothing fully staged -> coast". It therefore accumulates
+        //     time spent WAITING FOR A STAGE, not time following a claimer. It was labelled
+        //     FOLLOW_WAIT "waiting for claimer to publish next super-tile" -- wrong.
+        //   occ[65] (kernel s79) is stamped after the C-store loop and its s_wait_storecnt
+        //     (occ_kernel_dsws_flow.s:3859), where the kernel comment already read "PH_CSTORE (occ[65];
+        //     host label says STAGE_WAIT)". It is the C-STORE, not a stage wait.
+        //   These two labels sent a 2026-07-22 measurement to the exactly opposite conclusion: the
+        //   profile was read as "stage wait is 0.1%, the feed path is free" when the truth is that
+        //   STAGE WAIT IS 55.5% AND THE C-STORE IS 0.1%. There is currently NO follow-wait timer.
+        //   If you add one, give it its own accumulator -- do not reuse these.
+        // ML8_PHSPLIT=1 MUST match a bin built PHSPLIT=1: the self-serve reservation wait is then
+        // stamped into s79 instead of s78, so occ[64]=RING stage-wait alone and occ[65]=SELF-SERVE
+        // reservation wait PLUS the C-store (measured 0.1% at PHSPLIT=0 -- subtract it when reading).
+        const bool phSplit = getenv("ML8_PHSPLIT") && atoi(getenv("ML8_PHSPLIT")) != 0;
+        const char* phName[6] = {"WORK_WAIT","C_STORE","GROW","WMMA","FLUSH","SHRINK"};
+        const char* phNameSplit[6] = {"RING_WAIT","SS_WAIT","GROW","WMMA","FLUSH","SHRINK"};
+        const char** phN = phSplit ? phNameSplit : phName;
         uint64_t ph[6] = {0,0,0,0,0,0}, phSum = 0;
-        for (int i = 0; i < 6; i++) { ph[i] = (uint64_t)occW[64 + i]; phSum += ph[i]; }
+        // ML8_PHSHIFT MUST MATCH the bin's PHSHIFT defsym (default 8). The kernel right-shifts each
+        // phase accumulator at emit so the u32 occ slots survive a FED run (at 1920 waves an unshifted
+        // slot wraps after 22.4 ms, and a sub-second PHASEPROBE run measures spin-up, not steady state
+        // -- the 2026-07-13 error). Shares are shift-invariant; ABSOLUTE TICKS ARE NOT, so scale here
+        // or the printed tick counts are 2^PHSHIFT too small.
+        const uint32_t phShift = getenv("ML8_PHSHIFT") ? (uint32_t)atoi(getenv("ML8_PHSHIFT")) : 8u;
+        for (int i = 0; i < 6; i++) { ph[i] = (uint64_t)occW[64 + i] << phShift; phSum += ph[i]; }
         if (phSum > 0) {
-            printf("  [dsws2 PHASE breakdown] compute-wave ticks by phase (summed over all waves+chunks):\n");
+            printf("  [dsws2 PHASE breakdown] compute-wave ticks by phase (summed over all waves+chunks;"
+                   " emit-shift 2^%u restored):\n", phShift);
             printf("      %-12s %14s   %6s   %s\n", "phase", "ticks", "share", "what");
-            const char* phWhat[6] = {"idle: waiting for claimer to publish next super-tile",
-                                     "idle: waiting for A/B feeds to stage operands",
+            const char* phWhatMerged0 = "idle: getting work -- ring stage wait (:3314) OR self-serve reservation wait (:4409)";
+            const char* phWhatMerged1 = "C-store: final global_store of C + its drain (kernel :3859)";
+            const char* phWhatSplit0  = "idle: RING stage wait only -- DRAIN>=STAGE at .Lflow_havestage (:3314)";
+            const char* phWhatSplit1  = "idle: SELF-SERVE reservation wait (:4409) + ~0.1% C-store bleed";
+            const char* phWhat[6] = {phSplit ? phWhatSplit0 : phWhatMerged0,
+                                     phSplit ? phWhatSplit1 : phWhatMerged1,
                                      "dyn-VGPR grow 32->112 (+ rowblk claim)",
                                      "the actual fp8 WMMA compute",
                                      "split-K C reduction (global_atomic_add_f32)",
@@ -2063,7 +2613,7 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                 double pct = 100.0 * (double)ph[i] / (double)phSum;
                 char bar[41]; int nb = (int)(pct / 2.5 + 0.5); if (nb > 40) nb = 40;
                 for (int k = 0; k < nb; k++) bar[k] = '#'; bar[nb] = 0;
-                printf("      %-12s %14llu   %5.1f%%  %-40s %s\n", phName[i],
+                printf("      %-12s %14llu   %5.1f%%  %-40s %s\n", phN[i],
                        (unsigned long long)ph[i], pct, bar, phWhat[i]);
             }
             printf("      %-12s %14llu\n", "TOTAL", (unsigned long long)phSum);
@@ -2123,8 +2673,8 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                 uint8_t Ablk[256], Bblk[256]; float Dout[256];
                 for (int kt = 0; kt < KT; ++kt) {
                     for (int i=0;i<16;i++) for (int j=0;j<16;j++) {
-                        Ablk[i*16+j] = Ah[(size_t)(rowbase+i)*Ko + (kt*16+j)];
-                        Bblk[i*16+j] = Bh[(size_t)(kt*16+i)*No + (colbase+j)];
+                        { size_t aidx=(size_t)(rowbase+i)*Ko + (kt*16+j); Ablk[i*16+j] = lowmemA ? Aval(aidx) : Ah[aidx]; }
+                        { size_t bidx=(size_t)(kt*16+i)*No + (colbase+j); Bblk[i*16+j] = lowmemA ? Bval(bidx) : Bh[bidx]; }
                     }
                     wmma_ref_16x16x16(Ablk, Bblk, Cacc, Dout);
                     for (int i=0;i<256;i++) Cacc[i]=Dout[i];
@@ -2179,7 +2729,7 @@ static GrindResult run_grind(uint32_t node, const char* isaPath, int FMc, int FN
 
     size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
     if (!isaBytes) { fprintf(stderr,"  [grind] cannot read '%s'\n",isaPath); return res; }
-    GpuBuf isa = AllocGpu(node,(isaLen+0xFFF)&~0xFFFull,true,false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node,0x1000,false,true);
     uint64_t padB = (uint64_t)(getenv("ML8_COOP_PAD_MB")?atoi(getenv("ML8_COOP_PAD_MB")):64)*1024ull*1024ull;
     GpuBuf Ad = AllocGpu(node,((Ah.size()+0xFFF)&~0xFFFull)+padB,false,true,true);
@@ -2311,7 +2861,7 @@ static ProfResult run_feedprof(uint32_t node, const char* isaPath, int M, int N,
     mbg_preshuffle_B(Bh.data(), Bshufh.data(), K, N);
 
     size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
-    GpuBuf isa=AllocGpu(node,(isaLen+0xFFF)&~0xFFFull,true,false);
+    GpuBuf isa=AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ=AllocGpu(node,0x1000,false,true);
     GpuBuf Ad=AllocGpu(node,(Ah.size()+0xFFF)&~0xFFFull,false,true);
     GpuBuf Bd=AllocGpu(node,(Bshufh.size()+0xFFF)&~0xFFFull,false,true);
@@ -2419,7 +2969,7 @@ static StkResult run_stack(uint32_t node, const char* isaPath, double freq_hz,
     { std::mt19937 rg(0x5A5Au); for (uint64_t i=0;i<BUFSZ;i++) Bh[i]=(uint8_t)rg(); }
 
     size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
-    GpuBuf isa=AllocGpu(node,(isaLen+0xFFF)&~0xFFFull,true,false);
+    GpuBuf isa=AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ=AllocGpu(node,0x1000,false,true);
     GpuBuf Ad=AllocGpu(node,(BUFSZ+0xFFF)&~0xFFFull,false,true);
     GpuBuf Bd=AllocGpu(node,(BUFSZ+0xFFF)&~0xFFFull,false,true);
@@ -2578,7 +3128,7 @@ static BwResult run_bw(uint32_t node, const char* isaPath, double freq_hz, int m
     { std::mt19937 rg(0xBEEF); for (uint64_t i=0;i<BUFSZ;i++) src[i]=(uint8_t)rg(); }
 
     size_t isaLen=0; uint8_t* isaBytes=ReadFile(isaPath,&isaLen);
-    GpuBuf isa=AllocGpu(node,(isaLen+0xFFF)&~0xFFFull,true,false);
+    GpuBuf isa=AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ=AllocGpu(node,0x1000,false,true);
     GpuBuf Sd =AllocGpu(node,(BUFSZ+0xFFF)&~0xFFFull,false,true,/*deviceLocal*/true);   // VRAM stream src
     GpuBuf Dd =AllocGpu(node,(BUFSZ+0xFFF)&~0xFFFull,false,true,/*deviceLocal*/true);   // VRAM write/copy dst
@@ -2666,7 +3216,7 @@ static BfResult run_nofeed_bf(uint32_t node, const char* isaPath, int M, int N, 
     uint32_t CLAIM_CEIL = (uint32_t)(((uint64_t)M * N) / 4096);
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, 0x1000, false, true);   // operands are garbage -> tiny
     GpuBuf Bd  = AllocGpu(node, 0x1000, false, true);
@@ -2743,7 +3293,7 @@ static FpResult run_feedpipe(uint32_t node, const char* isaPath, uint32_t thread
     FpResult res;
     const uint64_t STREAM = 64u*1024*1024;             // 64 MiB stream buffer (BUF_MASK=0x3FFFFFF)
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, STREAM, false, false);  // cached -> realistic L2/DRAM feed path
     GpuBuf Bd  = AllocGpu(node, 0x1000, false, true);    // unused by the probe
@@ -2819,7 +3369,7 @@ static FpResult run_feedladder(uint32_t node, const char* isaPath, uint32_t thre
     FpResult res;
     const uint64_t STREAM = 64u*1024*1024;
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, STREAM, false, false);
     GpuBuf Bd  = AllocGpu(node, 0x1000, false, true);
@@ -2899,7 +3449,7 @@ static FpResult run_btr(uint32_t node, const char* isaPath, uint32_t threads, ui
     // past the wrap, so the allocation must extend beyond 64 MiB or those loads fault OOB and the wave hangs.
     const uint64_t STREAM = 96u*1024*1024;
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf Ad  = AllocGpu(node, 0x1000, false, true);    // unused
     GpuBuf Bd  = AllocGpu(node, STREAM, false, false);    // Bshuf stream (cached)
@@ -2993,7 +3543,7 @@ static uint32_t ldsRsrc2Bits(uint32_t ldsBytes, uint32_t* outUnits, uint32_t* ou
 static int run_btr128_oracle(uint32_t node, const char* isaPath) {
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
     if (!isaBytes) { fprintf(stderr, "  [btr128] cannot read %s\n", isaPath); return 3; }
-    GpuBuf isa  = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa  = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ  = AllocGpu(node, 0x1000,  false, true);   // unused by kernel
     GpuBuf Ad   = AllocGpu(node, 0x1000,  false, true);   // unused
     GpuBuf Bd   = AllocGpu(node, 0x10000, false, true);   // 64 KB host-visible (only 512B used)
@@ -3098,7 +3648,7 @@ static WgResult run_wglds_smoke(uint32_t node, const char* isaPath, int M, int N
     int WAVES = TWM * TWN;
 
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     uint64_t cbytes = ((uint64_t)TOTAL * WAVES * 4 + 0xFFF) & ~0xFFFull;
     GpuBuf C   = AllocGpu(node, cbytes, false, true);
@@ -3183,7 +3733,7 @@ static WgResult run_wglds_smoke(uint32_t node, const char* isaPath, int M, int N
 // ---------------------------------------------------------------------------
 static void run_sgpr_probe(uint32_t node, const char* isaPath, uint32_t nWG) {
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x4000, false, true);
     GpuBuf fence = AllocGpu(node, 0x1000, false, true);
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
@@ -3236,7 +3786,7 @@ static void run_sgpr_probe(uint32_t node, const char* isaPath, uint32_t nWG) {
 // ---------------------------------------------------------------------------
 static bool run_lds_bound(uint32_t node, const char* isaPath, uint32_t ldsBytes) {
     size_t isaLen = 0; uint8_t* isaBytes = ReadFile(isaPath, &isaLen);
-    GpuBuf isa = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ = AllocGpu(node, 0x1000, false, true);
     GpuBuf fence = AllocGpu(node, 0x1000, false, true);
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
@@ -3299,7 +3849,7 @@ static void run_dynsmoke(uint32_t node) {
     bool priv = !getenv("ML8_SMOKE_NOPRIV");
     { FILE* fb=fopen(bin,"rb"); if(!fb){ printf("*** dynsmoke bin '%s' not built -> REFUSING.\n", bin); return; } fclose(fb); }
     size_t isaLen=0; uint8_t* isaBytes = ReadFile(bin, &isaLen);
-    GpuBuf isa  = AllocGpu(node, (isaLen + 0xFFF) & ~0xFFFull, true, false);
+    GpuBuf isa  = AllocGpu(node, IsaMapBytes(isaLen), true, false);
     GpuBuf occ  = AllocGpu(node, 0x1000, false, true);
     GpuBuf fence= AllocGpu(node, 0x1000, false, true);
     memcpy(isa.ptr, isaBytes, isaLen); free(isaBytes);
@@ -6056,7 +6606,14 @@ int main(int argc, char** argv) {
         //   run_dsws2 (the v2 PM4 launch + tiered-oracle path). DSWS2_DRYRUN=1 -> print params + return
         //   rc=0 WITHOUT touching the GPU (gate 2 of A8: must still dry-print, never dispatch). =====
         DswsCfg c = parse_dsws_cfg();
-        const int FMc = 2, FNc = 4;                                  // v2 fixed coop tile (matches build_dsws.sh mk2)
+        const int FNc = 4;                                           // FN is fixed (the shared N-reuse operand)
+        // FM is a LEVER (2026-07-14). FM=1 drops NFV 112->80 (Gmax 3->6) and changes the super-tile M
+        //   extent from G*16*FM to G*16, so REAL shapes only need M % (G*16) instead of M % (G*32) --
+        //   doubling how many rowblks/waves can compute. FMc is a COMPILE-TIME MATCH to the bin: it sets
+        //   the resident-A stride, C tile bytes, and oracle addressing. A host FMc that disagrees with the
+        //   built FM silently corrupts C (wrong strides -- the oracle catches it as BAD, same discipline as
+        //   G/SEGK). ALWAYS rebuild the flow bin with a MATCHING -defsym FM before changing DSWS2_FM.
+        const int FMc = getenv("DSWS2_FM") ? atoi(getenv("DSWS2_FM")) : 2;   // default 2 == legacy fixed coop tile
         const int Gv    = getenv("DSWS2_G")    ? atoi(getenv("DSWS2_G"))    : 6;   // M-extent (rowblks/super-tile) = NCOMP_MAX
         const int SEGKv = getenv("DSWS2_SEGK") ? atoi(getenv("DSWS2_SEGK")) : 64;  // split-K segment (K-elements)
         // super-tile geometry (tile-multiple oracle shape, mirroring the --dsws oracle defaults: oMTL/oNTL/Ko).
@@ -6154,7 +6711,28 @@ int main(int argc, char** argv) {
             printf("  *** REFUSE: pool size overflows uint32_t (TOTAL=%llu TOTAL_super=%lld) -- occ[20]'s claim "
                    "counter and the kernel's sti are both 32-bit ***\n", (unsigned long long)TOTAL64, TOTAL_super);
             rc = 4;
-        } else if (Gv != 6 || (SEGKv != 64 && !(getenv("DSWS2_FLOW") && SEGKv == 32))) {
+        } else if ( getenv("DSWS2_FLOW")
+                        ? !((Gv >= 2 && Gv <= 32) &&
+                            (SEGKv == 16 || SEGKv == 32 || SEGKv == 64 || SEGKv == 128 || SEGKv == 256) &&
+                            (FMc == 1 || FMc == 2))                    // flow: FM=1 (Gmax->6) or FM=2 (legacy) -- bin must match
+                        : (Gv != 6 || SEGKv != 64 || FMc != 2) ) {     // non-flow: fixed coop tile is always FM=2
+            // G RAISED TO 16 (2026-07-13 night). G == ACC_N == the number of rowblks in a super-tile ==
+            //   THE NUMBER OF WAVES THAT CAN EVER COMPUTE CONCURRENTLY (SL_RBNEXT hands out 0..ACC_N-1).
+            //   At G=4 only 4 of 24 waves per WG could ever run a WMMA -- 83% of the fleet was
+            //   GEOMETRICALLY FORBIDDEN from computing, which is what the 93.6% coast-frac really was.
+            //   It also meant 4*112 = 448 VGPRs of a ~1536 budget, so the VGPR budget could NEVER bind
+            //   and grow-fail was structurally pinned to 0 -- which is why the stagger looked dead.
+            //   G was capped at 4 by the LDS accumulator banks (ACC_N*8192 = 64KB at G=8). K-DEPTH J
+            //   makes WOFLUSH cheap again (J-fold fewer atomics), the banks go away, and G is free.
+            // TILE GEOMETRY IS A LEVER (2026-07-13). Measured: the C flush is 83-97% of runtime, and
+            //   flush/WMMA = 128/SEGK -- FM*FN cancels, so SEGK (K-depth per super-tile) is the ONLY
+            //   knob on the flush:compute ratio. SEGK is capped by the 32KB operand pool
+            //   (OPSTRIDE = SEGK*16*(FN + G*FM)), so raising SEGK REQUIRES lowering G. Hence the flow
+            //   path must accept G in [2,6] x SEGK in {32,64,128,256}, not just G=6.
+            //   The guard below still stands for the non-flow bin (fixed G=6 SEGK=64 geometry).
+            //   NOTE this only widens what the HOST will *accept*: the bin must still be BUILT with
+            //   matching -defsym G/SEGK. Always rebuild immediately before running (build_flow.sh
+            //   rm -f's its bin on failure, so a failed build can never leave a runnable stale artifact).
             // G/SEGK are compile-time defsyms baked into the kernel's instruction immediates
             // (KSEG_STEPS-unrolled WMMA loop, resident-LDS strides). A host geometry that disagrees
             // with the bin's compiled G/SEGK silently corrupts the resident-A/B staging/compute
@@ -6163,8 +6741,9 @@ int main(int argc, char** argv) {
             // FIX 1 STAGGER: the flow bin (build_flow.sh) can now be built with SEGK=32 (halves the
             //   operand footprint so the g=6 write-once accumulator banks fit LDS) -- so SEGK=32 is
             //   allowed ONLY on the DSWS2_FLOW path, where the run must pass a matching DSWS2_SEGK=32.
-            printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d mismatches the built bin's compile-time geometry "
-                   "(non-flow: G=6 SEGK=64; flow: G=6 SEGK in {32,64}) -- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv);
+            printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d DSWS2_FM=%d mismatches the built bin's compile-time geometry "
+                   "(non-flow: G=6 SEGK=64 FM=2; flow: G in [2,32] SEGK in {16,32,64,128,256} FM in {1,2}) "
+                   "-- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv, FMc);
             rc = 4;
         } else {
             char dswsBin[160];

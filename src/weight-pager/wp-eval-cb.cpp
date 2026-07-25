@@ -346,7 +346,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // `cur` (== the expert input). Predict layers L+1..L+K's experts from `cur`
     // and speculatively prefetch them while layer L computes. The default path
     // (flag unset) never enters this block, so it stays byte-identical.
-    if (pager->xlayer_prefetch_enabled() && t->op == GGML_OP_MUL_MAT &&
+    if ((pager->xlayer_prefetch_enabled() || pager->host_prefetch_enabled()) &&
+        t->op == GGML_OP_MUL_MAT &&
         t->src[0] != nullptr && t->src[1] != nullptr) {
         const char * w0 = ggml_get_name(t->src[0]);
         int L = -1;
@@ -422,6 +423,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     to_f32(hbuf.data(), hh->type, (int64_t) n_embd * n_tok, hf)) {
                     for (int j = 0; j < n_tok; ++j) {
                         pager->submit_xlayer_prefetch(hf.data() + (size_t) j * n_embd, L);
+                        pager->submit_host_prefetch(hf.data() + (size_t) j * n_embd, L);
                     }
                 }
             }

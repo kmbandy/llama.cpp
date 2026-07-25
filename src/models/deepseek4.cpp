@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -41,6 +43,17 @@ static void dsv4_pin_to_weight(
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    // NextN/MTP: DS4 ships the MTP block as one extra block beyond the main
+    // stack, so block_count = n_layer + 1. Read this FIRST: n_layer() is
+    // n_layer_all - n_layer_nextn, and the per-layer arrays read below
+    // (swiglu_clamp_exp/shexp) are sized to the MAIN stack only (43) while
+    // compress_ratios covers all 44. Reading nextn later would size those
+    // reads to 44 and fail the load.
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all &&
+                "n_layer_nextn must be < block_count");
+    hparams.n_layer_kv_from_start = hparams.n_layer_all - hparams.n_layer_nextn;
+
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
@@ -80,6 +93,13 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
 
+    // set_swa_pattern() deliberately classifies generic nextn layers as dense,
+    // but the DS4 MTP block is a full DS4 body. Its ratio-0 attention uses the
+    // raw sliding-window cache, just like ratio-0 blocks in the main stack.
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        hparams.is_swa_impl[il] = true;
+    }
+
     switch (hparams.n_layer()) {
         case 43: type = LLM_TYPE_UNKNOWN; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -109,7 +129,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
     hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
     hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
 
-    for (int i = 0; i < n_layer; ++i) {
+    // Runs to n_layer_all so the MTP block (i == n_layer) is LOADED. It is
+    // not executed: the graph's main loop runs i < n_layer. blk.43 carries a
+    // full DS4 body (compress_ratios[43] == 0, so no compressor/indexer
+    // tensors) plus the nextn head loaded at the bottom of this loop.
+    for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
@@ -168,6 +192,22 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+
+        // NextN/MTP head. This GGUF ships neither nextn.embed_tokens nor
+        // nextn.shared_head_head, so the MTP branch falls back to the
+        // model-level tok_embd / output (hence TENSOR_NOT_REQUIRED).
+        if (i >= n_layer) {
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, 0);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, 0);
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, 0);
+            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, 0);
+            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hc_mult}, 0);
+            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hc_mult}, 0);
+            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, 0);
+        }
     }
 }
 
@@ -270,6 +310,34 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
         ggml_tensor * comb,
         int           il) const {
     GGML_UNUSED(il);
+
+    // This replaces the ~139-node graph form below with one fused dispatch;
+    // WP_DS4_FUSED_SINKHORN=0 restores the graph form.
+    // Measured on DS4-Flash Q8: the graph form cost
+    // 10.09s of 30.20s total GPU kernel time and 2.2M of 4.3M dispatches over a
+    // 192-token decode -- to normalize a [4,4,n_tokens] tensor (16 floats per
+    // token, ~1300 FLOPs).
+    //
+    // DEFAULT ON, and that is a CORRECTNESS decision, not a perf one. The graph
+    // form is BROKEN ON MULTI-DEVICE: it emits permute/cont/sum_rows, which the
+    // backend splitter treats as per-row (ggml-backend-meta.cpp handle_per_row
+    // asserts only axis != 0), but Sinkhorn couples BOTH ne0 and ne1 within a
+    // token. Split across devices mid-chain, the coupling is severed and the
+    // result is silently wrong. Measured on ROCm0+ROCm1: the graph form decodes
+    // " 1.1.1.1.1..." while this fused op decodes coherent prose, at two
+    // different pool sizes; single-device is fine either way. A single node
+    // cannot be split mid-computation, which is the fix.
+    // The two forms agree to 1.2e-07 (CPU) and 1.5e-07 (ROCm0) when compared
+    // directly in one graph -- see the cmp harnesses in the session notes.
+    static const bool use_fused = []() {
+        const char * v = std::getenv("WP_DS4_FUSED_SINKHORN");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+
+    if (use_fused) {
+        return ggml_sinkhorn_norm(ctx0, comb, hparams.dsv4_hc_eps,
+                                  (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+    }
 
     // comb is [dst_hc, src_hc, n_tokens]. Sinkhorn follows the reference:
     // row softmax over dst, one column normalization, then repeated row/column normalization.
@@ -1107,6 +1175,87 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        GGML_ASSERT(hparams.n_layer_nextn == 1 && "DeepSeek4 MTP currently supports one block");
+
+        const int il = hparams.n_layer();
+        const auto & layer = model.layers[il];
+        const int64_t hc = hparams.dsv4_hc_mult;
+
+        GGML_ASSERT(hparams.dsv4_compress_ratios[il] == 0 && "DeepSeek4 MTP block must use raw attention");
+        GGML_ASSERT(layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.eh_proj);
+        GGML_ASSERT(layer.nextn.hc_head_fn && layer.nextn.hc_head_base && layer.nextn.hc_head_scale);
+
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd*hc);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+
+        ggml_tensor * tok_embd = ubatch.token
+            ? ggml_get_rows(ctx0, layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd, inp->tokens)
+            : inp->embd;
+        cb(tok_embd, "mtp_tok_embd", il);
+
+        ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
+        res->add_input(std::move(inp));
+
+        ggml_tensor * inp_pos = build_inp_pos();
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+        ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+
+        ggml_tensor * h_embd = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+        h_embd = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+        tok_embd = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * cur = ggml_concat(ctx0, tok_embd, h_embd, 0);
+        cur = build_lora_mm(layer.nextn.eh_proj, cur);
+        cb(cur, "mtp_eh_proj", il);
+
+        inpL = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+
+        ggml_tensor * residual = inpL;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+        inpL = build_hc_post(cur, residual, post, comb, il);
+
+        residual = inpL;
+        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+
+        ggml_tensor * moe_out = build_moe_ffn(cur,
+                layer.ffn_gate_inp, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) hparams.expert_gating_func, -1);
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        inpL = build_hc_post(cur, residual, post, comb, il);
+
+        cur = build_hc_head(inpL, layer.nextn.hc_head_fn, layer.nextn.hc_head_scale, layer.nextn.hc_head_base);
+        cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
+
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = ggml_mul_mat(ctx0, layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
