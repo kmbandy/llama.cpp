@@ -2693,6 +2693,18 @@ static int test_wp_paged_batch_flag_default_off() {
     return fails;
 }
 
+static int test_wp_pipeline_promotions_flag_default_off() {
+    int fails = 0;
+    ScopedEnv guard("WP_PIPELINE_PROMOTIONS");
+    unsetenv("WP_PIPELINE_PROMOTIONS");
+    EXPECT(!wp::wp_pipeline_promotions_enabled(), "pipeline promotions must default OFF");
+    setenv("WP_PIPELINE_PROMOTIONS", "0", 1);
+    EXPECT(!wp::wp_pipeline_promotions_enabled(), "only literal 1 enables pipeline promotions");
+    setenv("WP_PIPELINE_PROMOTIONS", "1", 1);
+    EXPECT(wp::wp_pipeline_promotions_enabled(), "literal 1 enables pipeline promotions");
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -3001,6 +3013,7 @@ int main() {
         { "router_overrides_island_null_matches_default", test_router_overrides_island_null_matches_default },
         { "router_overrides_island_routes_shexp_and_ffn", test_router_overrides_island_routes_shexp_and_ffn },
         { "wp_paged_batch_flag_default_off",     test_wp_paged_batch_flag_default_off     },
+        { "wp_pipeline_promotions_flag_default_off", test_wp_pipeline_promotions_flag_default_off },
         { "router_predictor",                    test_router_predictor                    },
         { "router_predictor_confidence",         test_router_predictor_confidence         },
         { "expert_page_index",                   test_expert_page_index                   },

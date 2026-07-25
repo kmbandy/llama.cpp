@@ -58,6 +58,9 @@ struct ggml_tensor;
 
 namespace wp {
 
+// Explicit opt-in resolver, kept CPU-testable without a HIP pager instance.
+bool wp_pipeline_promotions_enabled();
+
 // Achieved-concurrency accounting for the HOST O_DIRECT read-worker pool
 // (see ensure_odirect_worker_loop_ in wp-pager.cpp). ensure_batch_max_n /
 // ensure_batch_avg_n (Stats, below) only count how many jobs were QUEUED
@@ -291,6 +294,11 @@ public:
         uint64_t tier_promotion_async_enqueued            = 0;
         uint64_t tier_promotion_sync_enqueued             = 0;
         uint64_t tier_promotion_event_pool_exhausted      = 0;
+        // Wall-clock from submitting a promotion batch through its completion.
+        // This has the same completed-H2D meaning as synchronous stage_in().
+        double   tier_promotion_h2d_seconds               = 0.0;
+        // The completion-fence subset above, separately visible for diagnosis.
+        double   tier_promotion_fence_seconds             = 0.0;
         uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
         double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
         uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_
@@ -670,6 +678,9 @@ private:
     bool   initialized_ = false;
     bool   hip_graphs_enabled_ = false;
     bool   async_ensure_enabled_ = false;
+    // WP_PIPELINE_PROMOTIONS is deliberately opt-in while the async path is
+    // evaluated.  Off preserves the pre-pipeline synchronous promotion route.
+    bool   pipeline_promotions_enabled_ = false;
 
     // MMID active-set history (metrics / optional future priors only).
     static constexpr int kHotExpertCap  = 768;

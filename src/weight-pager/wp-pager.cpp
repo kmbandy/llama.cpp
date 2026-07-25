@@ -110,7 +110,12 @@ void WeightPager::enqueue_tier_promotions_(
 bool WeightPager::synchronize_tier_promotions_(const std::vector<TierPromotion> & queued) {
     // The transport stream is ordered, so its final completion event is also
     // the completion fence for every earlier promotion in this batch.
-    return queued.empty() || queued.back().event < 0 || transport_.synchronize(queued.back().event);
+    if (queued.empty() || queued.back().event < 0) return true;
+    const auto fence_t0 = std::chrono::steady_clock::now();
+    const bool ok = transport_.synchronize(queued.back().event);
+    stats_.tier_promotion_fence_seconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - fence_t0).count();
+    return ok;
 }
 
 void WeightPager::release_tier_promotions_(std::vector<TierPromotion> & queued) {
@@ -931,6 +936,7 @@ bool WeightPager::init(const Config &             cfg,
     env_snapshot(kEnvDisableGraphs, env_was_present_, env_prior_value_);
     hip_graphs_enabled_ = env_flag_is_one(kEnvWpHipGraphs);
     async_ensure_enabled_ = env_flag_is_one(kEnvWpAsyncEnsure);
+    pipeline_promotions_enabled_ = wp_pipeline_promotions_enabled();
     sticky_l2_enabled_ = env_flag_is_one(kEnvWpStickyL2);
     sticky_l2_max_pages_ = clamp_int(env_nonnegative_int(kEnvWpStickyL2Pages, 32), 1, 256);
     sticky_l2_stats_ = env_flag_is_one(kEnvWpStickyL2Stats);
@@ -1192,17 +1198,19 @@ bool WeightPager::init(const Config &             cfg,
 
     initialized_ = true;
     if (pool_.size_class_slots_enabled()) {
-        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B budget (%.1f MiB), size_class_slots=1, prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B budget (%.1f MiB), size_class_slots=1, prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d, WP_PIPELINE_PROMOTIONS=%d (%s)\n",
                        catalog_.size(), cfg_.n_slots, slot_size,
                        (double) pool_.pool_size() / 1048576.0,
                        cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
-                       (int) async_ensure_enabled_);
+                       (int) async_ensure_enabled_, (int) pipeline_promotions_enabled_,
+                       pipeline_promotions_enabled_ ? "async/batched" : "synchronous");
     } else {
-        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d\n",
+        LLAMA_LOG_WARN("wp::WeightPager: %d pages, %d slots x %zu B (%.1f MiB), prefetch_depth=%d, io_uring_depth=%d, sync_staging_pinned=%d, WP_ASYNC_ENSURE=%d, WP_PIPELINE_PROMOTIONS=%d (%s)\n",
                        catalog_.size(), cfg_.n_slots, slot_size,
                        (double) cfg_.n_slots * (double) slot_size / 1048576.0,
                        cfg_.prefetch_depth, cfg_.io_uring_depth, (int) sync_staging_pinned_,
-                       (int) async_ensure_enabled_);
+                       (int) async_ensure_enabled_, (int) pipeline_promotions_enabled_,
+                       pipeline_promotions_enabled_ ? "async/batched" : "synchronous");
     }
     return true;
 }
@@ -1736,10 +1744,14 @@ void WeightPager::log_stats_summary() {
         s.page_in_sync_fresh_h2d_seconds * 1e3);
         LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
                        "  tier_promotion_sync_enqueued: %lu\n"
-                       "  tier_promotion_event_pool_exhausted: %lu\n",
+                       "  tier_promotion_event_pool_exhausted: %lu\n"
+                       "  tier_promotion_h2d_ms: %.1f\n"
+                       "  tier_promotion_fence_ms: %.1f\n",
                        (unsigned long) s.tier_promotion_async_enqueued,
                        (unsigned long) s.tier_promotion_sync_enqueued,
-                       (unsigned long) s.tier_promotion_event_pool_exhausted);
+                       (unsigned long) s.tier_promotion_event_pool_exhausted,
+                       s.tier_promotion_h2d_seconds * 1e3,
+                       s.tier_promotion_fence_seconds * 1e3);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                            (unsigned long) s.dense_prefetch_submitted);
@@ -1879,10 +1891,14 @@ void WeightPager::log_stats_summary() {
         s.ensure_batch_host_h2d_seconds * 1e3);
     LLAMA_LOG_WARN("  tier_promotion_async_enqueued: %lu\n"
                    "  tier_promotion_sync_enqueued: %lu\n"
-                   "  tier_promotion_event_pool_exhausted: %lu\n",
+                   "  tier_promotion_event_pool_exhausted: %lu\n"
+                   "  tier_promotion_h2d_ms: %.1f\n"
+                   "  tier_promotion_fence_ms: %.1f\n",
                    (unsigned long) s.tier_promotion_async_enqueued,
                    (unsigned long) s.tier_promotion_sync_enqueued,
-                   (unsigned long) s.tier_promotion_event_pool_exhausted);
+                   (unsigned long) s.tier_promotion_event_pool_exhausted,
+                   s.tier_promotion_h2d_seconds * 1e3,
+                   s.tier_promotion_fence_seconds * 1e3);
     if (s.dense_prefetch_submitted > 0) {
         LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                        (unsigned long) s.dense_prefetch_submitted);
@@ -2589,18 +2605,35 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 promotion_requests.push_back({misses[k].page, misses[k].slot});
             }
         }
-        enqueue_tier_promotions_(promotion_requests, tier_promotions,
-            [](void * dst, const void * src, size_t size, size_t, int & event) {
-                event = -1;
-                return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, nullptr) == hipSuccess;
-            }, false);
-        for (std::size_t k = 0; k < misses.size(); ++k) {
-            if (!host_hit_zerocopy[k]) continue;
-            bool queued = false;
-            for (const TierPromotion & promotion : tier_promotions) {
-                if (promotion.page == misses[k].page) { queued = true; break; }
+        size_t sync_promotion_count = 0;
+        if (pipeline_promotions_enabled_) {
+            enqueue_tier_promotions_(promotion_requests, tier_promotions,
+                [](void * dst, const void * src, size_t size, size_t, int & event) {
+                    event = -1;
+                    return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, nullptr) == hipSuccess;
+                }, false);
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (!host_hit_zerocopy[k]) continue;
+                bool queued = false;
+                for (const TierPromotion & promotion : tier_promotions) {
+                    if (promotion.page == misses[k].page) { queued = true; break; }
+                }
+                if (!queued) host_hit[k] = false;
             }
-            if (!queued) host_hit[k] = false; // page_in_sync_ performs the real read
+        } else {
+            // Exact pre-pipeline HOST promotion route: all tier hits enqueue on
+            // the default stream before the existing mid event and device fence.
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (!host_hit[k]) continue;
+                const PageMeta & m = catalog_.at(misses[k].page);
+                if (hipMemcpyAsync(slot_ptr_(misses[k].slot), host_hit_src[k], m.size,
+                                   hipMemcpyHostToDevice, nullptr) != hipSuccess) {
+                    jobs[k].ok = false;
+                    host_hit[k] = false;
+                } else {
+                    ++sync_promotion_count;
+                }
+            }
         }
         auto issue_h2d_copy = [&](std::size_t k) {
             const Miss & mm = misses[k];
@@ -2627,7 +2660,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 host_hit[k] = false;
             }
         };
-        size_t n_promo_copy = tier_promotions.size(), n_fresh_copy = 0;
+        size_t n_promo_copy = pipeline_promotions_enabled_ ? tier_promotions.size() : sync_promotion_count;
+        size_t n_fresh_copy = 0;
         if (h2d_timing_ok) {
             hipEventRecord(h2d_ev_mid, nullptr);
         }
@@ -2791,11 +2825,41 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         std::vector<TierPromotionRequest> promotion_requests;
         cold.reserve(misses.size());
         promotion_requests.reserve(misses.size());
-        for (const Miss & mm : misses) {
-            if (host_tier_ && host_tier_->contains(mm.page)) {
-                promotion_requests.push_back({mm.page, mm.slot});
-            } else {
-                cold.push_back(mm);
+        if (!pipeline_promotions_enabled_) {
+            // This is the pre-a563629a5 P2P route: each HostTier hit completes
+            // synchronously before the cold-read batch is submitted.
+            int n_host_hit = 0;
+            for (const Miss & mm : misses) {
+                if (host_tier_ && host_tier_->contains(mm.page)) {
+                    const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                    out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+                    if (s >= 0) {
+                        ++n_host_hit;
+                        ++stats_.ensure_batch_host_hits;
+                        if (mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {
+                            host_prefetch_strikes_[(size_t) mm.page] = 0;
+                        }
+                    } else {
+                        cold.push_back(mm);
+                    }
+                } else {
+                    cold.push_back(mm);
+                }
+            }
+            if (cold.empty()) {
+                if (n_host_hit > 0) {
+                    ++stats_.ensure_batch_calls;
+                    stats_.ensure_batch_pages += (uint64_t) n_host_hit;
+                }
+                return;
+            }
+        } else {
+            for (const Miss & mm : misses) {
+                if (host_tier_ && host_tier_->contains(mm.page)) {
+                    promotion_requests.push_back({mm.page, mm.slot});
+                } else {
+                    cold.push_back(mm);
+                }
             }
         }
 
@@ -2822,6 +2886,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // stream while the read batch is in flight. Failed event acquisition is
         // intentionally left out of `promotions`, and is read synchronously
         // after the batch rather than being silently committed.
+        const auto promotion_h2d_t0 = std::chrono::steady_clock::now();
         std::vector<TierPromotion> promotions;
         enqueue_tier_promotions_(promotion_requests, promotions,
             [this](void * dst, const void * src, size_t size, size_t slot_size, int & event) {
@@ -2850,6 +2915,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
         }
         const bool promotions_ok = synchronize_tier_promotions_(promotions);
+        stats_.tier_promotion_h2d_seconds += seconds_since(promotion_h2d_t0);
         // Completion is observed before this release: the HostTier arena must
         // remain immutable through the event fence, not merely through enqueue.
         release_tier_promotions_(promotions);
@@ -4409,19 +4475,24 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
         }
         if (tier_hit) {
             const auto stage_t0 = std::chrono::steady_clock::now();
-            // page_in_sync_ deliberately uses the same async promotion helper
-            // as ensure_batch, then fences immediately to retain its resident-
-            // on-return contract. The helper acquires its own generation borrow.
-            std::vector<TierPromotion> promotions;
-            std::vector<TierPromotionRequest> requests = {{page_idx, slot}};
-            enqueue_tier_promotions_(requests, promotions,
-                [this](void * out, const void * in, size_t size, size_t slot_size, int & event) {
-                    event = transport_.stage_in_async(out, in, size, slot_size);
-                    return event >= 0;
-                }, true);
-            const bool promotion_ok = promotions.size() == 1 && synchronize_tier_promotions_(promotions);
-            release_tier_promotions_(promotions);
-            int evt = promotion_ok ? 0 : -1;
+            int evt = -1;
+            if (!pipeline_promotions_enabled_) {
+                // Pre-pipeline route: stage_in synchronizes and returns the
+                // completion event, preserving the original promo_ms meaning.
+                evt = transport_.stage_in(dst, tier_src, m.size, pool_.slot_size(slot));
+                if (evt >= 0) transport_.release_event(evt);
+            } else {
+                std::vector<TierPromotion> promotions;
+                std::vector<TierPromotionRequest> requests = {{page_idx, slot}};
+                enqueue_tier_promotions_(requests, promotions,
+                    [this](void * out, const void * in, size_t size, size_t slot_size, int & event) {
+                        event = transport_.stage_in_async(out, in, size, slot_size);
+                        return event >= 0;
+                    }, true);
+                const bool promotion_ok = promotions.size() == 1 && synchronize_tier_promotions_(promotions);
+                release_tier_promotions_(promotions);
+                evt = promotion_ok ? 0 : -1;
+            }
             const double stage_seconds = seconds_since(stage_t0);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
@@ -4442,6 +4513,7 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
                 ++stats_.page_in_sync_zerocopy_promotions;
             }
             stats_.page_in_sync_promotion_h2d_seconds += stage_seconds;
+            stats_.tier_promotion_h2d_seconds += stage_seconds;
             host_tier_->erase(page_idx);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
             ++s_diag_count;
@@ -4530,6 +4602,11 @@ read_from_storage:
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT slot=%d\n", s_diag_count, slot);
     ++s_diag_count;
     return slot;
+}
+
+bool wp_pipeline_promotions_enabled() {
+    const char * v = std::getenv("WP_PIPELINE_PROMOTIONS");
+    return v != nullptr && std::strcmp(v, "1") == 0;
 }
 
 }  // namespace wp
