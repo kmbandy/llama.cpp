@@ -207,25 +207,47 @@ the way to the per-page sync path. Consequences:
   unavailable.
 - The HostTier-on-P2P integration in `6a1dcfe0d` still has never executed.
 
-### 8.3 The RAM tier is a net throughput loss
+### 8.3 The RAM tier regressed throughput here — and the counters point at a
+### defect in promotion, not at tiering
 
-It does what it was designed to do on bytes — NVMe falls 221.9 -> 158.9 GB
-(**-28%**, close to the tiered design's predicted -24% at 8 GB) and 82.7 -> 69.4 GB
-(-16%) — and still **loses throughput in both transports**: 1.736 -> 0.960 (-45%)
-and 1.911 -> 1.186 (-38%). The direction is consistent across all four samples; the
-serial magnitude is uncertain (0.782 vs 1.590).
+**READ THE CAVEAT FIRST.** n=2 per arm, and the serial+tier arm's two samples were
+**0.782 and 1.590** — a 2x spread, wider than the effect being claimed. An earlier
+revision of this section called the RAM tier "a net throughput loss"; that was an
+over-claim from one underpowered run and has been retracted. Nothing below supports
+a verdict on whether RAM tiering is worthwhile. What it does support is a specific
+defect worth chasing.
 
-The mechanism is visible in the new phase counters: on h8, `h2d` rises from
-**6.3 s to 35.3 s** while `read_wait` falls 57.2 -> 45.6 s. 5114 host hits adding
-~29 s of H2D is **~5.7 ms per 4.25 MB page**, i.e. ~0.75 GB/s on a link that should
-do ~25 GB/s. That is a synchronisation cost in the RAM->VRAM promotion path, not a
-bandwidth limit — promotion appears to be serial per page with a device
-synchronise, and it costs more than the NVMe read it avoids.
+**Bytes: the tier works.** NVMe falls 221.9 -> 158.9 GB (**-28%**, close to the
+tiered design's predicted -24% at 8 GB) and 82.7 -> 69.4 GB (-16%).
 
-**This matters beyond P0.** The distributed-paging direction (roadmap P2) assumes
-each machine's RAM tier is a win. On today's evidence it is a net loss, so the
-promotion path must be fixed *before* the split is designed, or the split will
-inherit a tier that makes things slower on both sides.
+**Time: the promotion path squanders the saving.** On h8 the new phase counters
+show `read_wait` falling **57.2 -> 45.6 s (-11.6 s)** while `h2d` rises
+**6.3 -> 35.3 s (+29 s)**. So:
+
+| | |
+|---|---|
+| NVMe read time the tier SAVED | **-11.6 s** |
+| H2D time the tier ADDED | **+29 s** |
+| per-page promotion cost | ~29 s / 5114 hits = **~5.7 ms per 4.25 MB page** |
+| implied promotion bandwidth | **~0.75 GB/s** on a link that should do ~25 GB/s |
+
+~5.7 ms to move 4.25 MB is roughly **30x slower than the link allows**. That is a
+synchronisation cost, not a bandwidth limit — the shape suggests promotion is
+serial per page with a device synchronise, rather than batched or stream-ordered.
+
+**The counterfactual is what matters.** At a plausible ~0.2 ms per page, 5114
+promotions would cost ~1 s against an 11.6 s read saving — the tier would be a
+clear net win of ~10 s. The byte reduction it delivers is genuinely valuable; the
+current promotion implementation is giving it all back and more.
+
+So the finding is: **promotion is ~30x off its own link speed, and fixing it is
+what determines whether the tier's real byte savings can be realised.** That is a
+bug to locate, and it needs proper replication plus a direct measurement of the
+promotion path rather than inference from two runs.
+
+**This still gates roadmap P2.** The distributed-paging direction assumes each
+machine's RAM tier pays for itself. Until promotion is fixed and re-measured with
+adequate replication, that premise is unverified in either direction.
 
 ### 8.4 The fastest arm is the one nobody chose
 
