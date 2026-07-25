@@ -134,10 +134,16 @@ RPC is remote-tensor-ops and cannot express this.
       central MCP (:18800), mneme daemon (:8810), dashboard (:18810). Dedicating
       8 GB of its 15 GB RAM plus sustained NVMe paging will contend with those in a
       way main (a pure compute box) does not.
-- [ ] **Re-derive the hot-set coverage curve at the corrected expert size.** The
-      2026-07-21 design assumes ~13.4 MB per expert; the measured Q8 expert is
-      **25.2 MiB**, so coverage at any VRAM budget is materially lower than that
-      table states and the "44% balance point" would need ~30 GB.
+- [x] **Hot-set coverage curve: NO re-derivation needed.** An earlier revision of
+      this roadmap claimed the 2026-07-21 design underestimated per-expert size by
+      2x (25.2 MiB vs its ~13.4 MB). That claim was WRONG and is retracted: the
+      283.5 GB routed-expert total it rested on exceeds the whole 160.0 GB model
+      file. The pager's own figures settle it -- 33792 expert sub-pages
+      (44 x 256 x 3) at the 4456448 B slot = 150.6 GB, i.e. **12.75 MiB per
+      expert**, cross-checking to ~12.9 MiB from file size minus non-expert
+      tensors. The design's ~13.4 MB was right; its coverage table stands. The
+      OTHER caveat on that table is untouched and still open: coverage was
+      measured on a single non-representative prompt.
 - [ ] **The dual-GPU overlap question (tiered design §7) is still unanswered** and
       cannot be answered while decode is storage-bound. Needs a profiler/stream
       timeline showing concurrent kernels, or an A/B at compute-bound residency.

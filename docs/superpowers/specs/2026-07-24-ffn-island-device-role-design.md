@@ -52,6 +52,23 @@ cheaply, before the expensive half is built.
 
 ### 2a. Correction to the 2026-07-21 design's sizing
 
+> **RETRACTED 2026-07-24 (same day):** the "2x per-expert sizing correction" below
+> is WRONG and the 2026-07-21 design's ~13.4 MB figure was correct. The 283.5 GB
+> routed-expert total it rests on is larger than the entire 160.0 GB model file --
+> physically impossible, and it should have been caught immediately. It came from a
+> gguf dump that computed logical dimensions at 1 byte/weight, ignoring that DS4's
+> experts are mixed 4/8-bit (noted in the tiered design's own §8a).
+>
+> The pager's own numbers settle it: 33792 expert sub-pages (44 layers x 256
+> experts x 3 matrices = exactly 33792) at the 4456448 B slot size = 150.6 GB of
+> paged expert data, i.e. **12.75 MiB per expert**. Cross-check from file size minus
+> non-expert tensors: ~12.9 MiB. So hot-set coverage per GB of VRAM is as the
+> 2026-07-21 design stated, and no re-derivation is needed on account of size.
+>
+> Text kept below for the record; do not act on it.
+
+
+
 That doc's §3 hot-set coverage table ("8 GB → 31% coverage", "~15 GB for the 44% balance
 point") assumes **~13.4 MB per expert**. The measured Q8 expert is **25.2 MiB** — about
 2× larger. An 8 GB hot set therefore holds ~318 experts, not ~600, and the coverage at any
