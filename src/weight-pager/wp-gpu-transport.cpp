@@ -124,19 +124,34 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     if (evt_idx < 0) return -1;
 
     int prev_device = 0;
-    hipGetDevice(&prev_device);
-    hipSetDevice(device_idx_);
+    hipError_t device_err = hipGetDevice(&prev_device);
+    if (device_err != hipSuccess) {
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in hipGetDevice failed: %s\n",
+                        hipGetErrorString(device_err));
+        return -1;
+    }
+    device_err = hipSetDevice(device_idx_);
+    if (device_err != hipSuccess) {
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in hipSetDevice(%d) failed: %s\n",
+                        device_idx_, hipGetErrorString(device_err));
+        return -1;
+    }
 
     hipStream_t s  = (hipStream_t) stream_;
     hipError_t err = hipStreamSynchronize(s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in: hipStreamSynchronize failed: %s\n",
-                       hipGetErrorString(err));
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in hipStreamSynchronize failed: stream=%p dst=%p src=%p bytes=%zu err=%s\n",
+                        (void *) s, dst, src_pinned, payload_size, hipGetErrorString(err));
         hipSetDevice(prev_device);
         return -1;
     }
 
-    hipSetDevice(prev_device);
+    device_err = hipSetDevice(prev_device);
+    if (device_err != hipSuccess) {
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in restore hipSetDevice(%d) failed: %s\n",
+                        prev_device, hipGetErrorString(device_err));
+        return -1;
+    }
     return evt_idx;
 }
 
@@ -150,8 +165,18 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
     }
 
     int prev_device = 0;
-    hipGetDevice(&prev_device);
-    hipSetDevice(device_idx_);
+    hipError_t device_err = hipGetDevice(&prev_device);
+    if (device_err != hipSuccess) {
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in_async hipGetDevice failed: %s\n",
+                        hipGetErrorString(device_err));
+        return -1;
+    }
+    device_err = hipSetDevice(device_idx_);
+    if (device_err != hipSuccess) {
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in_async hipSetDevice(%d) failed: %s\n",
+                        device_idx_, hipGetErrorString(device_err));
+        return -1;
+    }
 
     hipStream_t s  = (hipStream_t) stream_;
     hipError_t  err;
@@ -169,8 +194,8 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
     // keeps the host blocked only as long as the actual transfer takes.
     err = hipMemcpyAsync(dst, src_pinned, payload_size, hipMemcpyHostToDevice, s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipMemcpyAsync failed: %s\n",
-                       hipGetErrorString(err));
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in_async hipMemcpyAsync failed: dst=%p src=%p bytes=%zu stream=%p err=%s\n",
+                        dst, src_pinned, payload_size, (void *) s, hipGetErrorString(err));
         hipSetDevice(prev_device);
         return -1;
     }
@@ -179,8 +204,9 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
         err = hipMemsetAsync((char *) dst + payload_size, 0,
                              slot_size - payload_size, s);
         if (err != hipSuccess) {
-            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipMemsetAsync (padding) failed: %s\n",
-                           hipGetErrorString(err));
+            LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in_async hipMemsetAsync failed: dst=%p offset=%zu bytes=%zu stream=%p err=%s\n",
+                            dst, payload_size, slot_size - payload_size, (void *) s,
+                            hipGetErrorString(err));
             // Best-effort: don't fail the whole call.
         }
     }
@@ -198,8 +224,8 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
     hipEvent_t ev = (hipEvent_t) events_[evt_idx];
     err = hipEventRecord(ev, s);
     if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: hipEventRecord failed: %s\n",
-                       hipGetErrorString(err));
+        LLAMA_LOG_ERROR("[WP_HIP_DIAG] stage_in_async hipEventRecord failed: event=%d stream=%p dst=%p src=%p bytes=%zu err=%s\n",
+                        evt_idx, (void *) s, dst, src_pinned, payload_size, hipGetErrorString(err));
         release_event(evt_idx);
         hipSetDevice(prev_device);
         return -1;

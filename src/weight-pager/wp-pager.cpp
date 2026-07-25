@@ -2395,6 +2395,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         std::vector<bool> host_hit_zerocopy(misses.size(), false);
         std::vector<HostJob> jobs;
         jobs.reserve(misses.size());
+        // The synchronous HOST route retains these borrows through its one
+        // hipDeviceSynchronize(), exactly as it did before the promotion
+        // helper was introduced. The pipelined route owns its borrows in
+        // tier_promotions instead.
+        HostBorrowGuard host_borrow_guard(host_tier_.get());
+        host_borrow_guard.pages.reserve(misses.size());
         std::vector<TierPromotion> tier_promotions;
         if (host_zerocopy) {
             // Reserve these as promotion candidates now so they are not sent
@@ -2597,7 +2603,11 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             hipEventCreate(&h2d_ev_mid)   == hipSuccess &&
             hipEventCreate(&h2d_ev_end)   == hipSuccess;
         if (h2d_timing_ok) {
-            hipEventRecord(h2d_ev_start, nullptr);
+            const hipError_t event_err = hipEventRecord(h2d_ev_start, nullptr);
+            if (event_err != hipSuccess) {
+                LLAMA_LOG_ERROR("[WP_HIP_DIAG] HOST promotion start hipEventRecord failed: err=%s\n",
+                                hipGetErrorString(event_err));
+            }
         }
         std::vector<TierPromotionRequest> promotion_requests;
         for (std::size_t k = 0; k < misses.size(); ++k) {
@@ -2626,8 +2636,28 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             for (std::size_t k = 0; k < misses.size(); ++k) {
                 if (!host_hit[k]) continue;
                 const PageMeta & m = catalog_.at(misses[k].page);
-                if (hipMemcpyAsync(slot_ptr_(misses[k].slot), host_hit_src[k], m.size,
-                                   hipMemcpyHostToDevice, nullptr) != hipSuccess) {
+                // The helper owns and fills the borrowed source only when
+                // pipelining is enabled. Reacquire it here for the synchronous
+                // route; otherwise host_hit_src[k] is null and HIP latches
+                // hipErrorInvalidValue at this copy.
+                if (host_hit_zerocopy[k]) {
+                    const void * src = nullptr;
+                    HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+                    if (!host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
+                        jobs[k].ok = false;
+                        host_hit[k] = false;
+                        continue;
+                    }
+                    host_hit_src[k] = src;
+                    host_borrow_guard.pages.push_back({misses[k].page, handle});
+                }
+                const hipError_t copy_err = hipMemcpyAsync(
+                    slot_ptr_(misses[k].slot), host_hit_src[k], m.size,
+                    hipMemcpyHostToDevice, nullptr);
+                if (copy_err != hipSuccess) {
+                    LLAMA_LOG_ERROR("[WP_HIP_DIAG] HOST promotion hipMemcpyAsync failed: page=%d slot=%d dst=%p src=%p bytes=%zu err=%s\n",
+                                    misses[k].page, misses[k].slot, slot_ptr_(misses[k].slot),
+                                    host_hit_src[k], m.size, hipGetErrorString(copy_err));
                     jobs[k].ok = false;
                     host_hit[k] = false;
                 } else {
@@ -2663,7 +2693,11 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         size_t n_promo_copy = pipeline_promotions_enabled_ ? tier_promotions.size() : sync_promotion_count;
         size_t n_fresh_copy = 0;
         if (h2d_timing_ok) {
-            hipEventRecord(h2d_ev_mid, nullptr);
+            const hipError_t event_err = hipEventRecord(h2d_ev_mid, nullptr);
+            if (event_err != hipSuccess) {
+                LLAMA_LOG_ERROR("[WP_HIP_DIAG] HOST promotion mid hipEventRecord failed: err=%s\n",
+                                hipGetErrorString(event_err));
+            }
         }
         for (std::size_t k = 0; k < misses.size(); ++k) {
             if (!host_hit[k]) {
@@ -2672,7 +2706,11 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
         }
         if (h2d_timing_ok) {
-            hipEventRecord(h2d_ev_end, nullptr);
+            const hipError_t event_err = hipEventRecord(h2d_ev_end, nullptr);
+            if (event_err != hipSuccess) {
+                LLAMA_LOG_ERROR("[WP_HIP_DIAG] HOST promotion end hipEventRecord failed: err=%s\n",
+                                hipGetErrorString(event_err));
+            }
         }
         // A copy that fails at EXECUTION time (vs enqueue) only surfaces here.
         // If the sync failed, some slot may hold garbage -- do NOT commit any of
