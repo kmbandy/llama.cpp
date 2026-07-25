@@ -5,6 +5,76 @@
 machines with ~8 GB of host RAM per machine, weight-paging on both sides. Throughput is
 explicitly secondary.
 
+## 0. VERIFIED 2026-07-25 — §6 questions 1 and 6 are now ANSWERED
+
+Source investigation resolved the two blocking unknowns. **The numbers in §2 and §3
+below were written before this and are wrong where they conflict with this section.**
+
+**The inter-layer carrier IS 4-stream.** Hyper-connections are fully implemented for
+`deepseek4` in this fork. `GGML_ASSERT(hc == 4)` at `src/models/deepseek4.cpp:387`;
+`hparams.dsv4_hc_mult` read at `:77-79`. `inpL` is broadcast to `[n_embd, hc, n_tokens]`
+at `:1268-1271` and holds that shape through the entire loop — `build_hc_pre` (:374)
+collapses to single-stream for the attention/FFN body, `build_hc_post` (:426) rebuilds
+the 4 streams. **There is no collapse anywhere inside the stack**; the only one is at
+the head, `build_hc_head` (:455), called at `:1367`.
+
+The `n_stream` trap was real and did not apply: `llama-graph.cpp:36,56` `n_stream` is
+`ubatch.n_seqs_unq`, the KV sequence-stream count, unrelated to hyper-connections. The
+HC multiplier is only ever `hparams.dsv4_hc_mult`.
+
+**PAYLOAD PER TOKEN = 65536 bytes (64 KiB) f32, 32 KiB f16.**
+`n_embd(4096) x hc_mult(4) x 4`. This is exactly what `llama_context_layer_inp_size`
+returns for `LLM_ARCH_DEEPSEEK4` (`src/llama-context.cpp:2124-2130`). **This is 4x the
+figure used in §2/§3 below.** A 4096-token prefill is therefore **256 MiB f32 / 128 MiB
+f16** in one shot, not ~34 MB — still chunkable, but a real number to engineer around.
+
+The §2 conclusion is unaffected: 64 KiB against a ~333 ms token budget remains well
+under 1%, so a synchronous round trip per token still holds and cross-machine
+pipelining is still unnecessary.
+
+**43 EXECUTED LAYERS, NOT 44.** `block_count` is 44 but `blk.43` is the MTP/NextN
+block — loaded and never executed (`deepseek4.cpp:132-135`). All layer arithmetic in
+§3 is off by one.
+
+**LEGAL CUT POINTS: `ib` in [3, 43]**, where `ib` = input to layer `ib` = output of
+layer `ib-1`.
+- `ib < 3` requires shipping raw token IDs too: layers below
+  `hparams.dsv4_hash_layer_count` (=3) do `ggml_get_rows(..., res->t_inp_tokens)`
+  (`deepseek4.cpp:1321-1323`).
+- `ib = 0` is legal but pointless — the 4 streams are identical copies of the token
+  embedding (`ggml_repeat_4d`, `:1270`), so send token IDs instead.
+- **Mid-layer cuts are FORBIDDEN**, not merely awkward: `build_hc_pre` produces
+  `post` `[hc, nt]` and `comb` `[hc, hc, nt]` (`:411-421`) that `build_hc_post`
+  consumes, so a mid-layer boundary would have to ship those as well.
+- Nothing in [3, 43] is structurally special — balance the cut by weight bytes per
+  stage.
+
+**THE TAP EXISTS; THE INJECT DOES NOT.** `t_layer_inp` /
+`llama_get_embeddings_layer_inp` is production code already feeding the DFlash drafter
+(`deepseek4.cpp:1273-1285`, `llama-context.cpp:2294-2327`,
+`common/speculative.cpp:982-983`). It is a working read-only boundary tap at exactly the
+right granularity. **There is no injection counterpart** — no API and no graph path to
+start a `deepseek4` forward pass from a supplied residual at layer K, verified by
+absence across `include/llama.h`, `src/llama-ext.h`, `src/llama-cparams.h`,
+`src/llama-context.cpp`. **That is the actual engineering work of §4a**, and
+`src/models/dflash.cpp:97-99,115-116` is the template to copy (a `llm_graph_input_embd`
+sized to the encoder input).
+
+**§6 QUESTION 6 (eval callback) — MOOT, CONFIRMED.** The callback is installed on the
+process-local `llama_context::sched` and constrains only splits between backends inside
+one scheduler. Nothing in that path is reachable from another process.
+
+But it surfaced a **per-machine performance floor** worth recording: the callback is not
+cheap on non-paged nodes (a name-hash `find_page` per source plus a fixed prologue,
+`wp-eval-cb.cpp:318,1264-1272`), and `eval_cb_op_return` (`:437-470`) only extends a
+node group when `batch_safe()` holds — which "requires `!catalog_.has_experts()`"
+(`:78-84`). **On an MoE model like DS4-Flash that is false, so batching does not engage
+and each pager-enabled stage already synchronizes near-per-node.** Consequence: do not
+expect async GPU work to hide network latency on a paging stage. Size latency budgets
+from measured per-stage decode time, not theoretical overlap.
+
+---
+
 ## 1. Why two processes, and a correction to the record
 
 The roadmap and my own earlier statements assert *"llama.cpp has no pipeline parallelism
