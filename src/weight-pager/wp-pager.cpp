@@ -1482,6 +1482,13 @@ void WeightPager::log_stats_summary() {
             "/ensure_batch_avg_n below): inflight_peak=%lld inflight_avg_at_read_start=%.2f\n",
             (long long) inflight_peak, inflight_avg);
     }
+    {
+        LLAMA_LOG_WARN(
+            "wp::ensure_batch P2P ACHIEVED CONCURRENCY (kernel-submitted reads): "
+            "inflight_peak=%lu inflight_avg_at_read_start=%.2f\n",
+            (unsigned long) s.ensure_batch_p2p_inflight_peak,
+            s.ensure_batch_p2p_inflight_avg_at_read_start);
+    }
 
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
     const double hit_rate = prefetch_total > 0
@@ -1566,6 +1573,14 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_host_enqueue_ms: %.1f\n"
             "  ensure_batch_host_read_wait_ms: %.1f\n"
             "  ensure_batch_host_h2d_ms: %.1f\n"
+            "  ensure_batch_p2p_jobs_ms: %.1f\n"
+            "  ensure_batch_p2p_prep_ms: %.1f\n"
+            "  ensure_batch_p2p_enqueue_ms: %.1f\n"
+            "  ensure_batch_p2p_read_wait_ms: %.1f\n"
+            "  ensure_batch_p2p_h2d_ms: %.1f\n"
+            "  ensure_batch_p2p_fresh_count: %lu\n"
+            "  ensure_batch_p2p_inflight_peak: %lu\n"
+            "  ensure_batch_p2p_inflight_avg_at_read_start: %.2f\n"
             "  ensure_batch_host_promotion_count: %lu\n"
             "  ensure_batch_host_zerocopy_promotions: %lu\n"
             "  ensure_batch_host_promotion_h2d_ms: %.1f\n"
@@ -1573,6 +1588,7 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_host_fresh_h2d_ms: %.1f\n"
             "  page_in_sync_promotion_count: %lu\n"
             "  page_in_sync_promotion_h2d_ms: %.1f\n"
+            "  page_in_sync_zerocopy_promotions: %lu\n"
             "  page_in_sync_fresh_count: %lu\n"
             "  page_in_sync_fresh_h2d_ms: %.1f\n",
             (unsigned long) s.page_ins,
@@ -1652,6 +1668,14 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_host_enqueue_seconds * 1e3,
             s.ensure_batch_host_read_wait_seconds * 1e3,
             s.ensure_batch_host_h2d_seconds * 1e3,
+            s.ensure_batch_p2p_jobs_seconds * 1e3,
+            s.ensure_batch_p2p_prep_seconds * 1e3,
+            s.ensure_batch_p2p_enqueue_seconds * 1e3,
+            s.ensure_batch_p2p_read_wait_seconds * 1e3,
+            s.ensure_batch_p2p_h2d_seconds * 1e3,
+            (unsigned long) s.ensure_batch_p2p_fresh_count,
+            (unsigned long) s.ensure_batch_p2p_inflight_peak,
+            s.ensure_batch_p2p_inflight_avg_at_read_start,
             (unsigned long) s.ensure_batch_host_promotion_count,
             (unsigned long) s.ensure_batch_host_zerocopy_promotions,
             s.ensure_batch_host_promotion_h2d_seconds * 1e3,
@@ -1659,6 +1683,7 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_host_fresh_h2d_seconds * 1e3,
             (unsigned long) s.page_in_sync_promotion_count,
             s.page_in_sync_promotion_h2d_seconds * 1e3,
+            (unsigned long) s.page_in_sync_zerocopy_promotions,
             (unsigned long) s.page_in_sync_fresh_count,
             s.page_in_sync_fresh_h2d_seconds * 1e3);
         if (s.dense_prefetch_submitted > 0) {
@@ -2683,6 +2708,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     // could never pay off under the default decode transport.
     if (file_io_->direct_to_device()) {
         ++stats_.ensure_batch_p2p_path_batches;
+        const auto p2p_jobs_t0 = std::chrono::steady_clock::now();
         std::vector<Miss> cold;
         cold.reserve(misses.size());
         int n_host_hit = 0;
@@ -2732,9 +2758,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             reqs.push_back({ rid, (int) m.file_idx, m.file_offset,
                              m.size, slot_ptr_(cold[k].slot) });
         }
+        const auto p2p_enqueue_t0 = std::chrono::steady_clock::now();
+        const double p2p_jobs_seconds = seconds_since(p2p_jobs_t0);
         const int n_sub = file_io_->submit_batch(reqs);
         file_io_->flush();
         const double submit_seconds = seconds_since(io_t0);
+        const double p2p_enqueue_seconds = seconds_since(p2p_enqueue_t0);
         const auto wait_t0 = std::chrono::steady_clock::now();
         std::vector<bool> ok(cold.size(), false);
         // Wait per req via demuxing wait_for_req (foreign CQEs buffered in
@@ -2795,6 +2824,17 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             stats_.ensure_batch_submit_seconds += submit_seconds;
             stats_.ensure_batch_wait_seconds   += wait_seconds;
             stats_.ensure_batch_timeouts       += n_timeout;
+            stats_.ensure_batch_p2p_jobs_seconds      += p2p_jobs_seconds;
+            // P2P has no O_DIRECT alignment/bounce preparation phase.
+            stats_.ensure_batch_p2p_enqueue_seconds   += p2p_enqueue_seconds;
+            stats_.ensure_batch_p2p_read_wait_seconds += wait_seconds;
+            stats_.ensure_batch_p2p_fresh_count       += (uint64_t) batch_ok_n;
+            const FileIOConcurrency p2p_concurrency = file_io_->concurrency();
+            if (p2p_concurrency.peak > stats_.ensure_batch_p2p_inflight_peak) {
+                stats_.ensure_batch_p2p_inflight_peak = p2p_concurrency.peak;
+            }
+            stats_.ensure_batch_p2p_inflight_avg_at_read_start =
+                p2p_concurrency.average_at_start;
             // Real storage submissions only: n_sub is submit_batch's
             // return value (jobs actually queued to io_uring). n_host_hit
             // came from HostTier and never reached submit_batch, so it
@@ -4249,9 +4289,26 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
     }
 
     if (host_tier_) {
-        if (host_tier_->lookup(page_idx, staging, m.size)) {
+        const void * tier_src = staging;
+        bool zerocopy = false;
+        bool tier_hit = false;
+        HostBorrowGuard page_borrow_guard(host_tier_.get());
+        if (host_tier_->backend_pinned()) {
+            HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+            const void * borrowed = nullptr;
+            if (host_tier_->borrow(page_idx, &borrowed, m.size, &handle)) {
+                tier_src = borrowed;
+                zerocopy = true;
+                tier_hit = true;
+                page_borrow_guard.pages.push_back({page_idx, handle});
+            }
+        } else if (host_tier_->lookup(page_idx, staging, m.size)) {
+            tier_src = staging;
+            tier_hit = true;
+        }
+        if (tier_hit) {
             const auto stage_t0 = std::chrono::steady_clock::now();
-            int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size(slot));
+            int evt = transport_.stage_in(dst, tier_src, m.size, pool_.slot_size(slot));
             const double stage_seconds = seconds_since(stage_t0);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
@@ -4268,6 +4325,9 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
             ++stats_.host_tier_hits;
             ++stats_.page_ins;
             ++stats_.page_in_sync_promotion_count;
+            if (zerocopy) {
+                ++stats_.page_in_sync_zerocopy_promotions;
+            }
             stats_.page_in_sync_promotion_h2d_seconds += stage_seconds;
             host_tier_->erase(page_idx);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
@@ -4280,7 +4340,9 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
     // into the VRAM slot; host transports read into the shared pinned
     // staging buffer and use GpuTransport for the H2D copy below.
     const bool host_store_possible = host_tier_ && m.size <= host_tier_->budget_bytes();
-    bool direct_to_device = file_io_->direct_to_device() && !host_store_possible;
+    const bool p2p_skip_tier_store = p2p_direct_to_device_with_tier();
+    bool direct_to_device = file_io_->direct_to_device() &&
+                            (!host_store_possible || p2p_skip_tier_store);
     void * read_dst = direct_to_device ? dst : staging;
     auto read_once = [&]() {
         const uint64_t req_id = next_io_req_id_++;  // unique, high-bit-tagged

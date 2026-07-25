@@ -105,6 +105,33 @@ private:
     bool emitted_ = false;
 };
 
+static int test_p2p_tunable_resolution() {
+    int fails = 0;
+    ScopedEnv queue_guard("WP_P2P_QUEUE_DEPTH");
+    ScopedEnv window_guard("WP_P2P_WINDOW_CACHE_MAX");
+    ScopedEnv tier_guard("WP_P2P_DIRECT_TO_DEVICE");
+
+    unsetenv("WP_P2P_QUEUE_DEPTH");
+    unsetenv("WP_P2P_WINDOW_CACHE_MAX");
+    unsetenv("WP_P2P_DIRECT_TO_DEVICE");
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 16, "queue default preserves configured depth");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 64, "window default preserves clamp(4*QD,64,256)");
+    EXPECT(!wp::p2p_direct_to_device_with_tier(), "tier-direct default preserves staging/store behavior");
+
+    setenv("WP_P2P_QUEUE_DEPTH", "32", 1);
+    setenv("WP_P2P_WINDOW_CACHE_MAX", "99", 1);
+    setenv("WP_P2P_DIRECT_TO_DEVICE", "1", 1);
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 32, "queue env override");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 99, "independent window env override");
+    EXPECT(wp::p2p_direct_to_device_with_tier(), "tier-direct explicit opt-in");
+
+    setenv("WP_P2P_QUEUE_DEPTH", "0", 1);
+    setenv("WP_P2P_WINDOW_CACHE_MAX", "99999", 1);
+    EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 1, "queue lower clamp");
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 4096, "window upper clamp");
+    return fails;
+}
+
 // ---------------------------------------------------------------------------
 // PageCatalog
 // ---------------------------------------------------------------------------
@@ -2866,6 +2893,7 @@ int main() {
         { "page_catalog_moe_classify",   test_page_catalog_moe_classification },
         { "page_catalog_consolidated",   test_page_catalog_consolidated_split },
         { "prefetch_wait_transport_error_req_id_zero", test_prefetch_wait_transport_error_req_id_zero },
+        { "p2p_tunable_resolution", test_p2p_tunable_resolution },
         { "dup_clear_o_direct", test_dup_clear_o_direct },
         { "file_io_sync_pread", test_file_io_sync_pread },
         { "file_io_advise_prefetch",  test_file_io_advise_prefetch  },

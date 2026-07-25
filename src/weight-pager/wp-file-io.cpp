@@ -17,6 +17,41 @@
 
 namespace wp {
 
+namespace {
+
+int parse_p2p_positive_env(const char * name, int fallback, int min_value, int max_value) {
+    const char * e = std::getenv(name);
+    if (e == nullptr || e[0] == '\0') return fallback;
+    char * end = nullptr;
+    const long value = std::strtol(e, &end, 10);
+    if (end == e || *end != '\0') {
+        LLAMA_LOG_WARN("wp: ignoring invalid %s=%s; using %d\n", name, e, fallback);
+        return fallback;
+    }
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return (int) value;
+}
+
+}  // namespace
+
+int resolve_p2p_queue_depth(int configured_depth) {
+    const int fallback = configured_depth > 0 ? configured_depth : 1;
+    return parse_p2p_positive_env("WP_P2P_QUEUE_DEPTH", fallback, 1, 4096);
+}
+
+int resolve_p2p_window_cache_max(int queue_depth) {
+    int fallback = queue_depth * 4;
+    if (fallback < 64) fallback = 64;
+    if (fallback > 256) fallback = 256;
+    return parse_p2p_positive_env("WP_P2P_WINDOW_CACHE_MAX", fallback, 1, 4096);
+}
+
+bool p2p_direct_to_device_with_tier() {
+    const char * e = std::getenv("WP_P2P_DIRECT_TO_DEVICE");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

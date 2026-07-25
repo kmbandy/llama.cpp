@@ -61,6 +61,15 @@ struct FileIOBatchRequest {
     void *   dst;
 };
 
+// Cumulative read concurrency observed by an asynchronous transport.  `peak`
+// and `average_at_start` describe reads accepted by the kernel, not merely
+// requests queued by WeightPager.
+struct FileIOConcurrency {
+    uint64_t starts = 0;
+    uint64_t peak = 0;
+    double average_at_start = 0.0;
+};
+
 class FileIOLayer {
 public:
     virtual ~FileIOLayer() = default;
@@ -161,6 +170,7 @@ public:
     // point where they choose the read destination.
     virtual FileIOTransport transport() const = 0;
     virtual bool direct_to_device() const { return false; }
+    virtual FileIOConcurrency concurrency() const { return {}; }
 
 protected:
     // Reaped-but-unclaimed completions, keyed by req_id. Populated by the
@@ -182,6 +192,13 @@ struct FileIOP2PConfig {
     void * pool_base = nullptr;
     size_t pool_size = 0;
 };
+
+// P2P-only tunables.  Unset values reproduce the pre-tunable derivation:
+// queue depth comes from the pager configuration, and windows are clamp(4*QD,
+// 64, 256). Invalid values fall back to those defaults.
+int  resolve_p2p_queue_depth(int configured_depth);
+int  resolve_p2p_window_cache_max(int queue_depth);
+bool p2p_direct_to_device_with_tier();
 
 // Factory. `fds` is a list of pre-prepared file descriptors (typically dup'd
 // from the model loader's fds with O_DIRECT cleared via

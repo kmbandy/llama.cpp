@@ -256,6 +256,17 @@ public:
         double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
         double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
         double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase (mixed: promotion + fresh)
+        // P2P direct-to-device path: names deliberately mirror the HOST
+        // phases so arm-to-arm logs are comparable. H2D is structurally zero
+        // on a successful direct read, but remains explicit in the summary.
+        double   ensure_batch_p2p_jobs_seconds       = 0.0;
+        double   ensure_batch_p2p_prep_seconds       = 0.0;
+        double   ensure_batch_p2p_enqueue_seconds    = 0.0;
+        double   ensure_batch_p2p_read_wait_seconds  = 0.0;
+        double   ensure_batch_p2p_h2d_seconds        = 0.0;
+        uint64_t ensure_batch_p2p_fresh_count        = 0;
+        uint64_t ensure_batch_p2p_inflight_peak      = 0;
+        double   ensure_batch_p2p_inflight_avg_at_read_start = 0.0;
         // MAD-P4 follow-up: ensure_batch_host_h2d_seconds above mixes two
         // different kinds of H2D copy -- a HostTier RAM->VRAM promotion
         // (page already read once from storage, now just moving host RAM
@@ -280,6 +291,7 @@ public:
         double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
         uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_
         double   page_in_sync_promotion_h2d_seconds      = 0.0; // their H2D copy time only (transport_.stage_in)
+        uint64_t page_in_sync_zerocopy_promotions         = 0;   // HostTier borrow() source, not lookup() copy
         uint64_t page_in_sync_fresh_count                = 0;   // fresh storage reads' H2D in page_in_sync_
         double   page_in_sync_fresh_h2d_seconds          = 0.0; // their H2D copy time only (transport_.stage_in)
     };
