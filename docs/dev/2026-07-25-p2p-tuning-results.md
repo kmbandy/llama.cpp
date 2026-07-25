@@ -1,3 +1,14 @@
+> **SUPERSEDED IN PART — read `2026-07-25-final-pipelining-results.md` first.**
+> Two recommendations below are WITHDRAWN on later measurement:
+> 1. Window cache 4096 is called "the one real gain". It is **net harmful** — best read
+>    bandwidth of any arm, worst throughput (1.817 vs ~2.73 tok/s). Reproduced twice.
+> 2. The full-pool host map is named the highest-value remaining P2P change. **Withdrawn**
+>    — it is the same mechanism amplified, so the evidence now predicts it is worse.
+>
+> Also: `tier_promotion_h2d_ms`, referenced later, has been deleted as unusable (its scope
+> spanned the read window). The rest of this document stands — notably the 5.29 in-flight
+> ceiling from ~6.05 pages per ensure_batch call, and queue depth / iowq being dead knobs.
+
 # P2P tuning sweep — results. Target 5-6 GB/s NOT reached; one real gain, three nulls
 
 **Date:** 2026-07-25 · **Machine:** mad-lab-main · **Tip:** `04ecae824`
