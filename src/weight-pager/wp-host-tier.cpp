@@ -152,7 +152,7 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     }
 
     std::memcpy(arena_ + offset, src_bytes, n);
-    resident_[page_idx] = Resident{offset, n};
+    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
     used_bytes_ += n;
     lru_.push_back(page_idx);
     lru_pos_[page_idx] = std::prev(lru_.end());
@@ -191,7 +191,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
         free_lists_[n].push_back(offset);  // return the acquired slot
         return false;
     }
-    resident_[page_idx] = Resident{offset, n};
+    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
     used_bytes_ += n;
     lru_.push_back(page_idx);
     lru_pos_[page_idx] = std::prev(lru_.end());
@@ -216,9 +216,10 @@ bool HostTier::lookup(int page_idx, void * dst_bytes, size_t n) {
     return true;
 }
 
-bool HostTier::borrow(int page_idx, const void ** src_out, size_t n) {
+bool HostTier::borrow(int page_idx, const void ** src_out, size_t n, BorrowHandle * handle_out) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_out == nullptr || n == 0) {
+    if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_out == nullptr ||
+        handle_out == nullptr || n == 0) {
         return false;
     }
     auto it = resident_.find(page_idx);
@@ -227,40 +228,45 @@ bool HostTier::borrow(int page_idx, const void ** src_out, size_t n) {
     }
     touch_lru_(page_idx);
     it->second.borrow_count++;
-    *src_out = arena_ + it->second.offset;
+    *src_out    = arena_ + it->second.offset;
+    *handle_out = it->second.gen;
     return true;
 }
 
-void HostTier::release(int page_idx) {
+void HostTier::release(int page_idx, BorrowHandle handle) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (page_idx < 0) {
+    if (page_idx < 0 || handle == kInvalidBorrowHandle) {
         return;
     }
 
-    // A retired-while-borrowed entry (oldest first) takes priority: it is no
-    // longer reachable through resident_, so if one is pending for this
-    // page_idx the borrow being released must be one of those, not whatever
-    // (unrelated, freshly stored) entry may now occupy resident_[page_idx].
-    auto pit = pending_.find(page_idx);
-    if (pit != pending_.end() && !pit->second.empty()) {
-        Resident & r = pit->second.front();
+    // The handle names the EXACT entry generation borrow() saw, so there is
+    // no ambiguity even if this page_idx has since been erase()'d and
+    // re-store()'d (or evicted) any number of times: check whether the
+    // CURRENT resident_[page_idx] entry (if any) is that generation first,
+    // then fall back to pending_ (entries retired-while-borrowed live there,
+    // keyed by their own generation, never by page_idx).
+    auto it = resident_.find(page_idx);
+    if (it != resident_.end() && it->second.gen == handle) {
+        if (it->second.borrow_count > 0) {
+            it->second.borrow_count--;
+        }
+        return;
+    }
+
+    auto pit = pending_.find(handle);
+    if (pit != pending_.end()) {
+        Resident & r = pit->second;
         if (r.borrow_count > 0) {
             r.borrow_count--;
         }
         if (r.borrow_count == 0) {
             reclaim_(r);
-            pit->second.pop_front();
-            if (pit->second.empty()) {
-                pending_.erase(pit);
-            }
+            pending_.erase(pit);
         }
         return;
     }
 
-    auto it = resident_.find(page_idx);
-    if (it != resident_.end() && it->second.borrow_count > 0) {
-        it->second.borrow_count--;
-    }
+    // Neither: a stale/double-released handle. No-op.
 }
 
 bool HostTier::is_initialized() const {
@@ -374,8 +380,10 @@ void HostTier::erase_resident_(int page_idx) {
         // Deferred retirement: gone from resident_/lru_ (contains() is
         // false, no aliasing on a re-store) but the slot itself is withheld
         // from free_lists_ until release() drains the last outstanding
-        // borrow on it.
-        pending_[page_idx].push_back(r);
+        // borrow on it. Keyed by this entry's OWN generation handle so a
+        // later borrow()/release() pair on a NEW entry for the same
+        // page_idx can never collide with it.
+        pending_[r.gen] = r;
         return;
     }
 

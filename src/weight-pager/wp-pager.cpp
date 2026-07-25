@@ -44,9 +44,20 @@ namespace wp {
 // borrowed-page list -- and releasing all of it -- is a single RAII object
 // instead. Deliberately NOT copyable/movable: exactly one guard owns exactly
 // one borrow list for the duration of one ensure_batch call.
+//
+// Stores (page_idx, generation handle) pairs, not bare page indices: HostTier
+// keys a retired-while-borrowed entry by its own generation (see
+// HostTier::release()), so releasing the exact entry THIS borrow() call saw
+// -- as opposed to whatever entry currently occupies the same page_idx --
+// requires carrying the handle borrow() returned, not just the page_idx.
 struct HostBorrowGuard {
-    HostTier *       tier = nullptr;
-    std::vector<int> pages;
+    struct Borrowed {
+        int                   page;
+        HostTier::BorrowHandle handle;
+    };
+
+    HostTier *             tier = nullptr;
+    std::vector<Borrowed>  pages;
 
     explicit HostBorrowGuard(HostTier * t) : tier(t) {}
     HostBorrowGuard(const HostBorrowGuard &)             = delete;
@@ -56,8 +67,8 @@ struct HostBorrowGuard {
         if (tier == nullptr) {
             return;
         }
-        for (int p : pages) {
-            tier->release(p);
+        for (const Borrowed & b : pages) {
+            tier->release(b.page, b.handle);
         }
     }
 };
@@ -2292,11 +2303,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 bool hit = false;
                 if (host_zerocopy) {
                     const void * src = nullptr;
-                    if (host_tier_->borrow(misses[k].page, &src, m.size)) {
+                    HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+                    if (host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
                         hit = true;
                         host_hit_src[k]       = src;
                         host_hit_zerocopy[k]  = true;
-                        host_borrow_guard.pages.push_back(misses[k].page);
+                        host_borrow_guard.pages.push_back({misses[k].page, handle});
                     }
                 } else if (host_tier_->lookup(misses[k].page, ensure_host_bufs_[k], m.size)) {
                     hit = true;
