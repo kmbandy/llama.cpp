@@ -1621,6 +1621,129 @@ static int test_compute_advise_ranges() {
 }
 
 // ---------------------------------------------------------------------------
+// resolve_odirect_alignment / compute_odirect_read_plan — O_DIRECT alignment
+// authority fix. The pager previously hardcoded 512 (the NVMe device's
+// logical_block_size) as the O_DIRECT alignment. That's the wrong authority:
+// alignment must come from the FILESYSTEM's block size (statfs f_bsize),
+// e.g. btrfs = 4096. Using 512 on a 4096-block filesystem measured 2.49x
+// read amplification (221.9 GB delivered vs 82.7 GB buffered for the exact
+// same 89.24 GB of requested pages). This also couples in a fix for a
+// pre-existing bug: the padded tail of the last page of a shard can run
+// past EOF, and O_DIRECT returns EIO (not a short read) rather than
+// truncating — padding to a coarser alignment makes the overrun worse, not
+// better, so the clamp has to move with the alignment fix.
+// ---------------------------------------------------------------------------
+
+static int test_resolve_odirect_alignment() {
+    int fails = 0;
+
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(4096), 4096, "btrfs f_bsize=4096 -> 4096");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(512),  512,  "f_bsize=512 -> 512 (already >= floor, pow2)");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(8192), 8192, "larger pow2 f_bsize is honored, not clamped to 4096");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(-1),   4096, "fstatfs failure sentinel (<=0) -> 4096 fallback");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(0),    4096, "f_bsize=0 -> 4096 fallback");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(300),  512,  "below device logical-block floor -> floored to 512, still pow2");
+    EXPECT_EQ_INT(wp::resolve_odirect_alignment(600),  4096, "not a power of two after flooring -> 4096 fallback");
+
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_aligned_offset() {
+    int fails = 0;
+
+    // Already-aligned offset: zero prefix, and the total never grows beyond
+    // one pad past the payload (align_up(size, align)).
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const uint64_t off  = align * 10;   // exactly aligned
+        const size_t   size = 1000;
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, /*file_size=*/0);
+        EXPECT_EQ_INT(plan.base, off, "aligned offset: base == off");
+        EXPECT_EQ_INT(plan.prefix, 0u, "aligned offset: zero prefix");
+        const size_t expect_nbytes = (size + align - 1) & ~(align - 1);
+        EXPECT_EQ_INT(plan.nbytes, expect_nbytes, "aligned offset: nbytes is size padded up to align, no extra growth");
+        EXPECT(plan.nbytes % align == 0, "aligned offset: nbytes is a multiple of align");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_unaligned_offset() {
+    int fails = 0;
+
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const uint64_t base_off = align * 7;
+        const size_t   prefix_in = align / 4;              // partial-block unaligned offset
+        const uint64_t off  = base_off + prefix_in;
+        const size_t   size = align + 17;                  // spans more than one block
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, /*file_size=*/0);
+        EXPECT_EQ_INT(plan.base, base_off, "unaligned offset: base is align-down of off");
+        EXPECT_EQ_INT(plan.prefix, prefix_in, "unaligned offset: prefix is off - base");
+        EXPECT(plan.nbytes % align == 0, "unaligned offset: total is a multiple of align");
+        EXPECT(plan.prefix + size <= plan.nbytes, "unaligned offset: padded window fully covers the payload");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_never_exceeds_buf_cap() {
+    int fails = 0;
+
+    // Buffers are sized as page_bytes + 2*align (see ensure_host_bufs_ready_).
+    // The worst case (max prefix, max tail pad) must still fit.
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const size_t page_bytes = 16384;
+        const size_t buf_cap = page_bytes + 2 * align;
+        // Worst-case prefix: align-1.
+        const uint64_t off = (align * 3) + (align - 1);
+        const auto plan = wp::compute_odirect_read_plan(off, page_bytes, align, /*file_size=*/0);
+        EXPECT(plan.nbytes <= buf_cap, "worst-case prefix/pad never exceeds the sized buffer capacity");
+    }
+    return fails;
+}
+
+static int test_compute_odirect_read_plan_eof_clamp() {
+    int fails = 0;
+
+    // Mirrors the measured production case: a shard's last page overruns
+    // EOF once padded. At align=512 this is the pre-existing bug (fires 3x
+    // per run in production); at align=4096 the same offset overruns by
+    // MORE, which is exactly why the clamp has to move with the alignment
+    // fix rather than staying a 512-only patch.
+    const uint64_t shard_size = 46774881376ULL;
+    const uint64_t off        = 46770424832ULL;
+    const size_t   size       = (size_t) (shard_size - off);  // last page's real payload size
+
+    for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+        const auto plan = wp::compute_odirect_read_plan(off, size, align, shard_size);
+        EXPECT(plan.base + plan.nbytes <= shard_size,
+               "padded end is clamped at EOF, never reads past shard_size");
+        EXPECT(plan.prefix + size <= plan.nbytes,
+               "clamped window still fully covers the payload bytes");
+    }
+
+    // file_size == 0 means "unresolved" -- no clamping should be applied,
+    // i.e. the plan pads out fully even though that would run past a
+    // (currently unknown) real EOF.
+    {
+        const auto plan = wp::compute_odirect_read_plan(off, size, /*align=*/4096, /*file_size=*/0);
+        const size_t expect_nbytes = (size_t) (((off - (off & ~4095ULL)) + size + 4095) & ~(size_t) 4095);
+        EXPECT_EQ_INT(plan.nbytes, expect_nbytes, "file_size=0 (unresolved) disables EOF clamping");
+    }
+
+    // A second measured overrun case, at the smaller shard.
+    {
+        const uint64_t shard_size2 = 46789437824ULL;
+        const uint64_t off2        = 46784980992ULL;
+        const size_t   size2       = (size_t) (shard_size2 - off2);
+        for (size_t align : { (size_t) 512, (size_t) 4096 }) {
+            const auto plan = wp::compute_odirect_read_plan(off2, size2, align, shard_size2);
+            EXPECT(plan.base + plan.nbytes <= shard_size2, "second shard: clamped at EOF");
+            EXPECT(plan.prefix + size2 <= plan.nbytes, "second shard: payload still fully covered");
+        }
+    }
+
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
 // FileIOLayer::submit_batch — MAD-235 batched io_uring submission
 // ---------------------------------------------------------------------------
 //
@@ -2361,6 +2484,11 @@ int main() {
         { "file_io_submit_batch_depth_one_targeted_waits", test_file_io_submit_batch_depth_one_targeted_waits },
         { "file_io_demux_no_cross_drain",    test_file_io_demux_no_cross_drain    },
         { "compute_advise_ranges",    test_compute_advise_ranges    },
+        { "resolve_odirect_alignment", test_resolve_odirect_alignment },
+        { "compute_odirect_read_plan_aligned_offset", test_compute_odirect_read_plan_aligned_offset },
+        { "compute_odirect_read_plan_unaligned_offset", test_compute_odirect_read_plan_unaligned_offset },
+        { "compute_odirect_read_plan_never_exceeds_buf_cap", test_compute_odirect_read_plan_never_exceeds_buf_cap },
+        { "compute_odirect_read_plan_eof_clamp", test_compute_odirect_read_plan_eof_clamp },
         { "is_uma_archname",          test_is_uma_archname          },
         { "read_mem_available_bytes", test_read_mem_available_bytes },
         { "is_uma_device_smoke",      test_is_uma_device_smoke      },

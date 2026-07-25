@@ -162,6 +162,13 @@ public:
         uint64_t host_prefetch_strike_held      = 0;
         uint64_t host_prefetch_budget_trim      = 0;
         uint64_t ensure_batch_host_hits         = 0; // P2P/path misses served from HostTier
+        // MAD: O_DIRECT alignment fixed to the filesystem's actual block size
+        // (was hardcoded 512, wrong for e.g. btrfs's 4096) -- see
+        // resolve_odirect_alignment()/compute_odirect_read_plan() below. This
+        // counter fires when the padded, aligned read for a page would not
+        // fit the sized bounce buffer; previously that case was a silent
+        // `continue` that fell back to the slower sync path with no signal.
+        uint64_t ensure_batch_host_odirect_cap_skips = 0;
         uint64_t routing_ptrs_set                  = 0;
         uint64_t routing_ptrs_consumed             = 0;
         uint64_t routing_ptrs_discarded_unconsumed = 0;
@@ -728,12 +735,29 @@ private:
 
     // Multi-QD host bounce for ensure_batch (WP_ENSURE_BATCH_HOST=1):
     // Cold random buffered ~1.1 GB/s; O_DIRECT multi-QD ~6.2 GB/s on SN850X.
-    // GGUF tensor offs are not 512-aligned, so each read uses an O_DIRECT
-    // bounce (align-down offset, pad size) then H2D of the payload slice.
+    // GGUF tensor offs are not filesystem-block-aligned, so each read uses an
+    // O_DIRECT bounce (align-down offset, pad size) then H2D of the payload
+    // slice. The alignment authority is the FILESYSTEM's block size (e.g.
+    // btrfs = 4096), not the device's logical_block_size (512) -- using the
+    // device value under-aligns on filesystems with a larger block size and
+    // causes read amplification (measured 2.49x on btrfs). See
+    // resolve_odirect_alignment() / compute_odirect_read_plan().
     std::vector<void *> ensure_host_bufs_;
     size_t              ensure_host_buf_bytes_ = 0;
     bool                ensure_host_bufs_pinned_ = false;
     std::vector<int>    ensure_odirect_fds_; // parallel to file_io fds; -1 = unused
+    // Parallel to ensure_odirect_fds_: the resolved O_DIRECT alignment (bytes,
+    // power of two) and cached file size for each file_idx, populated once in
+    // ensure_odirect_fd_() alongside opening the fd. 0 = not yet resolved.
+    std::vector<size_t>   ensure_odirect_align_;
+    std::vector<uint64_t> ensure_odirect_filesize_;
+    // Running max of ensure_odirect_align_ across all resolved shards -- used
+    // to size the shared bounce buffers (ensure_host_bufs_ready_) before any
+    // individual file_idx's alignment may be known yet. Defaults to 4096
+    // (the fallback alignment) until the first shard resolves, which already
+    // covers the common btrfs case; self-corrects (triggers reallocation) if
+    // a later-resolved shard needs a larger alignment.
+    size_t                ensure_odirect_align_max_ = 0;
     struct EnsureODirectReadJob {
         int      fd     = -1;
         uint64_t off    = 0;
@@ -776,6 +800,43 @@ private:
     void shutdown_ensure_odirect_ring_();
 #endif
 };
+
+// Resolve the O_DIRECT alignment to use for a shard given its filesystem's
+// reported block size (statfs/fstatfs f_bsize). This is the alignment
+// AUTHORITY for O_DIRECT: the device's logical_block_size is NOT sufficient
+// -- a filesystem (e.g. btrfs, f_bsize=4096) can require coarser alignment
+// than the underlying device reports (512), and misaligned O_DIRECT reads
+// silently amplify (measured 2.49x: 221.9 GB delivered vs 82.7 GB buffered
+// for identical 89.24 GB of requested pages). Guards: never returns a value
+// below kLogicalBlockFloor; requires a power of two; falls back to
+// kFallbackAlign if the input is <= 0 or not a power of two after flooring.
+// Pure function -- no syscalls, unit-testable directly.
+size_t resolve_odirect_alignment(long fs_bsize);
+
+// The aligned, EOF-clamped O_DIRECT read window for one payload read of
+// [off, off+size) bytes.
+struct OdirectReadPlan {
+    uint64_t base;    // align-down start offset for the O_DIRECT pread
+    size_t   prefix;  // payload's byte offset within the bounce buffer
+    size_t   nbytes;  // bytes to actually request this read
+};
+
+// Compute the O_DIRECT read plan for a payload at [off, off+size) against a
+// filesystem alignment `align` (must be a power of two -- see
+// resolve_odirect_alignment) and a shard of `file_size` bytes. `file_size ==
+// 0` means "unknown / unresolved" and disables EOF clamping.
+//
+// Pads [off, off+size) out to `align`-aligned boundaries on both ends, then
+// clamps the padded tail so the request never reads past `file_size`: on
+// O_DIRECT, a padded read that overruns EOF returns EIO rather than a short
+// read (the pre-existing bug this also fixes -- it fired 3x/run at 512
+// alignment and gets strictly worse at 4096, since the overrun can grow to
+// up to align-1 bytes). The payload itself is always fully covered even if
+// `file_size` is inconsistent with `off+size`.
+//
+// Pure function -- no I/O, no global state. Unit-tested directly without a
+// real pager or a real file.
+OdirectReadPlan compute_odirect_read_plan(uint64_t off, size_t size, size_t align, uint64_t file_size);
 
 // File-range descriptor for advise_prefetch — one per paged tensor in the
 // catalog walk. Exposed at namespace scope so unit tests can validate the

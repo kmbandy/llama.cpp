@@ -18,6 +18,8 @@
 #include <new>          // placement new
 #include <utility>
 #include <unistd.h>     // close(), pread, readlink
+#include <sys/stat.h>   // fstat() -- shard file size, cached alongside the O_DIRECT fd
+#include <sys/vfs.h>    // fstatfs() -- filesystem block size, the O_DIRECT alignment authority
 
 #if defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
 #include <liburing.h>
@@ -164,8 +166,19 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     if (n == 0 || page_bytes == 0) {
         return false;
     }
-    // O_DIRECT bounce: align-down prefix (<=511) + size pad to 512.
-    const size_t need = page_bytes + 512 + 512;
+    // O_DIRECT bounce buffer: align-down prefix (<= align-1) + size pad to
+    // align on the tail (<= align-1), so a read needs up to size + 2*align.
+    // Sized against the largest alignment resolved so far across shards
+    // (ensure_odirect_align_max_); before any shard has been opened this
+    // defaults to 4096, which already covers the common btrfs case. If a
+    // later-resolved shard needs a larger alignment, the size grows here on
+    // the next call and free_ensure_host_bufs_()+reallocation follows
+    // automatically via the size check below -- was hardcoded to the O_DIRECT
+    // *device* sector size (512), which under-sized the buffer once the fix
+    // in compute_odirect_read_plan()/resolve_odirect_alignment() aligns to
+    // the *filesystem* block size (4096 on btrfs) instead.
+    const size_t align = ensure_odirect_align_max_ > 0 ? ensure_odirect_align_max_ : (size_t) 4096;
+    const size_t need = page_bytes + 2 * align;
     const size_t alloc = (need + 4095) & ~(size_t) 4095;
     if (ensure_host_bufs_.size() >= n && ensure_host_buf_bytes_ >= alloc) {
         return true;
@@ -478,12 +491,78 @@ bool WeightPager::ensure_odirect_fixed_fd_ready_(int file_idx, int fd, size_t n_
 }
 #endif
 
+// MAD: alignment authority fix. O_DIRECT alignment must come from the
+// FILESYSTEM's block size (statfs f_bsize), not the device's
+// logical_block_size -- see the doc comment on the declaration in
+// wp-pager.h for the measured 2.49x read-amplification this fixes.
+size_t resolve_odirect_alignment(long fs_bsize) {
+    constexpr size_t kLogicalBlockFloor = 512;   // known NVMe logical_block_size lower bound
+    constexpr size_t kFallbackAlign     = 4096;  // btrfs's actual block size; safe fallback
+    if (fs_bsize <= 0) {
+        return kFallbackAlign;
+    }
+    size_t v = (size_t) fs_bsize;
+    if (v < kLogicalBlockFloor) {
+        v = kLogicalBlockFloor;
+    }
+    if ((v & (v - 1)) != 0) {
+        // Not a power of two after flooring -- implausible statfs result.
+        // The alignment math below is a bitmask op and requires pow2; fall
+        // back rather than silently mis-aligning every read.
+        return kFallbackAlign;
+    }
+    return v;
+}
+
+OdirectReadPlan compute_odirect_read_plan(uint64_t off, size_t size, size_t align, uint64_t file_size) {
+    // Defensive: callers are expected to pass an `align` already validated by
+    // resolve_odirect_alignment(), but never let a bad value corrupt the
+    // mask arithmetic below -- degrade to the safe fallback instead.
+    if (align == 0 || (align & (align - 1)) != 0) {
+        align = 4096;
+    }
+    const uint64_t mask   = (uint64_t) align - 1;
+    const uint64_t base   = off & ~mask;
+    const size_t   prefix = (size_t) (off - base);
+
+    // Bytes actually required to deliver the full payload, unpadded.
+    const uint64_t payload_end = base + (uint64_t) prefix + (uint64_t) size;
+    // Payload padded out to the next alignment boundary on both ends.
+    const uint64_t padded_len = ((uint64_t) prefix + (uint64_t) size + mask) & ~mask;
+    uint64_t clamp_end = base + padded_len;
+
+    // Clamp the padded tail at EOF: O_DIRECT returns EIO (not a short read)
+    // for a request that runs past the end of the file, and padding to a
+    // coarser alignment makes the overrun bigger, not smaller. file_size==0
+    // means "unresolved" -- skip clamping rather than truncate to nothing.
+    if (file_size != 0 && file_size < clamp_end) {
+        clamp_end = file_size;
+    }
+    // Never clamp below what the payload itself needs delivered, even if
+    // file_size turns out to be inconsistent with off+size (that would be a
+    // separate, pre-existing data bug -- not something to paper over here).
+    if (clamp_end < payload_end) {
+        clamp_end = payload_end;
+    }
+    if (clamp_end < base) {
+        clamp_end = base;
+    }
+
+    OdirectReadPlan plan;
+    plan.base   = base;
+    plan.prefix = prefix;
+    plan.nbytes = (size_t) (clamp_end - base);
+    return plan;
+}
+
 int WeightPager::ensure_odirect_fd_(int file_idx) {
     if (file_io_ == nullptr || file_idx < 0) {
         return -1;
     }
     if ((size_t) file_idx >= ensure_odirect_fds_.size()) {
         ensure_odirect_fds_.resize((size_t) file_idx + 1, -1);
+        ensure_odirect_align_.resize((size_t) file_idx + 1, 0);
+        ensure_odirect_filesize_.resize((size_t) file_idx + 1, 0);
     }
     if (ensure_odirect_fds_[(size_t) file_idx] >= 0) {
         return ensure_odirect_fds_[(size_t) file_idx];
@@ -514,6 +593,31 @@ int WeightPager::ensure_odirect_fd_(int file_idx) {
         return -1;
     }
     ensure_odirect_fds_[(size_t) file_idx] = od;
+
+    // Resolve the O_DIRECT alignment authority (filesystem block size) and
+    // cache the shard's byte size, once, alongside the fd -- both are on the
+    // hot read path via ensure_batch and must not be re-queried per read.
+    struct statfs sfs;
+    const bool statfs_ok = (::fstatfs(od, &sfs) == 0);
+    const size_t align = resolve_odirect_alignment(statfs_ok ? (long) sfs.f_bsize : -1);
+    ensure_odirect_align_[(size_t) file_idx] = align;
+    if (align > ensure_odirect_align_max_) {
+        ensure_odirect_align_max_ = align;
+    }
+
+    struct stat st;
+    ensure_odirect_filesize_[(size_t) file_idx] =
+        (::fstat(od, &st) == 0 && st.st_size > 0) ? (uint64_t) st.st_size : 0;
+
+    static int s_align_log = 0;
+    if (s_align_log < 8) {  // one line per distinct shard, capped defensively
+        LLAMA_LOG_WARN("wp::ensure_odirect_fd_: file_idx=%d path=%s O_DIRECT alignment resolved to "
+                       "%zu bytes (fstatfs %s, f_bsize=%ld), shard size=%llu\n",
+                       file_idx, path, align, statfs_ok ? "ok" : "FAILED",
+                       statfs_ok ? (long) sfs.f_bsize : -1L,
+                       (unsigned long long) ensure_odirect_filesize_[(size_t) file_idx]);
+        ++s_align_log;
+    }
     return od;
 #else
     (void) src;
@@ -1365,6 +1469,7 @@ void WeightPager::log_stats_summary() {
             "  speculative_evicted_unused: %lu\n"
             "  host_tier_hits: %lu\n"
             "  ensure_batch_host_hits: %lu\n"
+            "  ensure_batch_host_odirect_cap_skips: %lu\n"
             "  host_prefetch_enqueued: %lu\n"
             "  host_prefetch_dropped: %lu\n"
             "  host_prefetch_read: %lu\n"
@@ -1445,6 +1550,7 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.speculative_evicted_unused,
             (unsigned long) s.host_tier_hits,
             (unsigned long) s.ensure_batch_host_hits,
+            (unsigned long) s.ensure_batch_host_odirect_cap_skips,
             (unsigned long) s.host_prefetch_enqueued,
             (unsigned long) s.host_prefetch_dropped,
             (unsigned long) s.host_prefetch_read,
@@ -2159,10 +2265,42 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 continue;
             }
 
-            j.base   = j.off & ~511ULL;
-            j.prefix = (size_t) (j.off - j.base);
-            j.nbytes = (j.prefix + j.size + 511) & ~(size_t) 511;
+            // Alignment/file-size were resolved once and cached by
+            // ensure_odirect_fd_() when j.fd was opened; look them up by
+            // file_idx (parallel to ensure_odirect_fds_) rather than
+            // hardcoding 512, which is the DEVICE's logical_block_size and
+            // the wrong authority for O_DIRECT alignment -- see
+            // resolve_odirect_alignment()/compute_odirect_read_plan().
+            const size_t align =
+                (j.file_idx >= 0 && (size_t) j.file_idx < ensure_odirect_align_.size() &&
+                 ensure_odirect_align_[(size_t) j.file_idx] > 0)
+                    ? ensure_odirect_align_[(size_t) j.file_idx]
+                    : (size_t) 4096;
+            const uint64_t file_size =
+                (j.file_idx >= 0 && (size_t) j.file_idx < ensure_odirect_filesize_.size())
+                    ? ensure_odirect_filesize_[(size_t) j.file_idx]
+                    : 0;
+            const OdirectReadPlan plan = compute_odirect_read_plan(j.off, j.size, align, file_size);
+            j.base   = plan.base;
+            j.prefix = plan.prefix;
+            j.nbytes = plan.nbytes;
             if (j.nbytes > j.buf_cap || j.nbytes > UINT_MAX) {
+                // Was a silent `continue` that degraded invisibly to the
+                // slower page_in_sync_ fallback below. Make it observable:
+                // a counter plus a one-shot warning so a future session can
+                // see this is happening instead of just seeing lower
+                // throughput.
+                ++stats_.ensure_batch_host_odirect_cap_skips;
+                static int s_cap_skip_warn = 0;
+                if (s_cap_skip_warn < 3) {
+                    LLAMA_LOG_WARN("wp::ensure_batch: HOST O_DIRECT read for page skipped -- "
+                                   "aligned/padded size %zu exceeds bounce buf_cap %zu "
+                                   "(align=%zu off=%llu payload=%zu); falling back to "
+                                   "page_in_sync_ for this page\n",
+                                   j.nbytes, j.buf_cap, align,
+                                   (unsigned long long) j.off, j.size);
+                    ++s_cap_skip_warn;
+                }
                 continue;
             }
             j.queued = true;
