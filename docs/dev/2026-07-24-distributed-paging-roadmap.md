@@ -130,10 +130,15 @@ RPC is remote-tensor-ops and cannot express this.
 
 ## Open questions
 
-- [ ] **Does 2026 tolerate this load?** It hosts the fleet's infrastructure —
-      central MCP (:18800), mneme daemon (:8810), dashboard (:18810). Dedicating
-      8 GB of its 15 GB RAM plus sustained NVMe paging will contend with those in a
-      way main (a pure compute box) does not.
+- [x] **RAM tier stays at 8 GB per machine — SETTLED by kmbandy (2026-07-24).**
+      He will kill superfluous services to make room when these runs happen; that
+      is his call and it is not to be re-litigated. Sizing therefore stands as
+      written: main 48 GB VRAM + 8 = 56 GB, 2026 16 GB VRAM + 8 = 24 GB, ~70/30,
+      ~13 of 44 DS4 layers on 2026 (~45 GB shard; ~72 GB for GLM IQ2).
+      For the record, the measured constraint that prompted the question: an 8 GB
+      pinned arena alongside the model process left 1.1 GB available on the 16 GB
+      box during an unattended sweep. That is a reason to free RAM first, not a
+      reason to shrink the tier.
 - [x] **Hot-set coverage curve: NO re-derivation needed.** An earlier revision of
       this roadmap claimed the 2026-07-21 design underestimated per-expert size by
       2x (25.2 MiB vs its ~13.4 MB). That claim was WRONG and is retracted: the
