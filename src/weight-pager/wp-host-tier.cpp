@@ -12,9 +12,7 @@
 #include <sys/mman.h>
 #endif
 
-#if defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
-#endif
+#include "wp-gpu-runtime.h"
 
 namespace wp {
 
@@ -43,7 +41,7 @@ bool HostTier::init(size_t budget_bytes, int device_idx) {
 
     budget_bytes_ = budget_bytes;
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     void * p = nullptr;
     hipError_t err = hipHostMalloc(&p, budget_bytes_, hipHostMallocDefault);
     if (err == hipSuccess) {
@@ -112,7 +110,7 @@ void HostTier::shutdown() {
             munlock(arena_, budget_bytes_);
         }
 #endif
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (backend_pinned_) {
             (void) hipHostFree(arena_);
         } else {
@@ -176,7 +174,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
         erase_resident_(page_idx);
         return false;
     }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     erase_resident_(page_idx);
     size_t offset = 0;
     if (!acquire_slot_(page_idx, n, offset)) {

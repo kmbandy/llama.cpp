@@ -4,9 +4,9 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
+#include "wp-gpu-runtime.h"
 
-#if defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 // Forward decl of the ggml-cuda side channel — the actual symbol lives in
 // libggml-hip.so and we link against it. Avoids dragging the full
 // ggml-cuda/mmq.cuh into libllama's wp-eval-cb compilation unit.
@@ -113,7 +113,7 @@ struct ProfGuard {
     }
 };
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 struct AsyncTransferEvent {
     int page_idx = -1;
     int event_handle = -1;
@@ -223,7 +223,7 @@ size_t           s_range_pinned_bytes = 0;
 }  // namespace
 
 void weight_pager_eval_cb_reset(WeightPager * pager) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // WP_PAGED_BATCH: release any range pins still held at teardown (a range that
     // ended at a split boundary with no following callback, or reset mid-range).
     // Independent of async ensure, so do it before the async early-return.
@@ -340,7 +340,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // ggml_cuda_get_wp_compute_stream, declared only under GGML_USE_HIP) plus
     // raw hip* device copies. Non-HIP builds (CUDA sm_61 / Vulkan on the 1070
     // and 480) don't page weights, so compile it out there.
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // At the ffn_gate_inp router MUL_MAT (start of each MoE block): src[0] is
     // the router weight (host-copied once per layer), src[1] is the residual
     // `cur` (== the expert input). Predict layers L+1..L+K's experts from `cur`
@@ -476,7 +476,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const std::uint64_t prof_t0    = wp_profile ? wp_now_ns() : 0;
     ProfGuard           prof_guard{wp_profile, prof_t0};
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
     // consumed by a CUDA kernel on the previous op. eval_cb fires
     // for EVERY op the scheduler dispatches, including ops that
@@ -494,7 +494,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ggml_cuda_discard_routed_expert_ptrs();
 #endif
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     if (pager->async_ensure_enabled()) {
         for (size_t i = 0; i < s_pending_async_ops.size();) {
             hipError_t st = hipEventQuery(s_pending_async_ops[i].done);
@@ -559,12 +559,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             pager->unpin_page(prev_page);
         }
         s_pinned_pages_prev_op.clear();
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         s_prev_op_pager = nullptr;
 #endif
     }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     auto enqueue_async_wait_for_page = [pager](int page_idx,
                                                std::vector<AsyncTransferEvent> & prev_events) {
         if (!pager->async_ensure_enabled()) return;
@@ -665,7 +665,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                        ggml_get_name(t->src[0]), weight_page, n_subs);
                     }
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                     // MAD-88 Phase 2-6: routing-aware paging.
                     //
                     // Read the indices tensor (t->src[2], shape
@@ -920,7 +920,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                     first_active_slot = slot;
                                                 }
                                                 ++n_ensures;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                                 enqueue_async_wait_for_page(weight_page + 1 + e, s_async_events_prev_op);
 #endif
                                             }
@@ -931,7 +931,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(p);
                                             if (paged_batch) { s_range_pinned_bytes += pager->page_meta(p).size; }
                                         }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                         if (!active_pinned.empty()) { s_prev_op_pager = pager; }
 #endif
                                     } else {
@@ -993,7 +993,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 first_active_slot = slot;
                                             }
                                             ++n_ensures;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                             enqueue_async_wait_for_page(sub_page_idx, s_async_events_prev_op);
 #endif
                                             // MAD-231: pin the slot so a later prefetch
@@ -1002,7 +1002,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             pager->pin_page(sub_page_idx);
                                             (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(sub_page_idx);
                                             if (paged_batch) { s_range_pinned_bytes += pager->page_meta(sub_page_idx).size; }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                             s_prev_op_pager = pager;
 #endif
                                         }
@@ -1417,7 +1417,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         pager->pin_page(page_idx);
         (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(page_idx);
         if (paged_batch) { s_range_pinned_bytes += pager->page_meta(page_idx).size; }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         s_prev_op_pager = pager;
 #endif
 
@@ -1446,7 +1446,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 ++views_this_op;
             }
         }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         enqueue_async_wait_for_page(page_idx, s_async_events_prev_op);
 #endif
     }

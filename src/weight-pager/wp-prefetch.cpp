@@ -7,9 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
-#endif
+#include "wp-gpu-runtime.h"
 
 namespace wp {
 
@@ -24,7 +22,7 @@ namespace {
 
 void * alloc_pinned(size_t bytes) {
     if (bytes == 0) return nullptr;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     void * p = nullptr;
     hipError_t err = hipHostMalloc(&p, bytes, hipHostMallocDefault);
     if (err != hipSuccess) {
@@ -40,7 +38,7 @@ void * alloc_pinned(size_t bytes) {
 
 void free_pinned(void * p) {
     if (p == nullptr) return;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // hipHostFree on a malloc'd ptr is undefined. We pessimistically try
     // hipHostFree first; if it fails we leak (rare — only on the fallback
     // path). To avoid this, callers should track which alloc path was used.
@@ -56,7 +54,7 @@ void free_pinned(void * p) {
 bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
     if (slot_size <= payload_size) return true;
     if (dst_vram == nullptr) return false;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
                                slot_size - payload_size);
     if (err != hipSuccess) {

@@ -1,14 +1,11 @@
 #include "wp-gpu-transport.h"
 
 #include "llama-impl.h"  // LLAMA_LOG_*
-
-#if defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
-#endif
+#include "wp-gpu-runtime.h"
 
 namespace wp {
 
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 
 // --- HIP implementation ----------------------------------------------------
 
@@ -294,7 +291,7 @@ void GpuTransport::release_event(int event_handle) {
     free_events_.push_back(event_handle);
 }
 
-#else  // !GGML_USE_HIP
+#else  // !GGML_USE_HIP && !GGML_USE_CUDA
 
 // --- Stub for non-HIP builds ----------------------------------------------
 //
@@ -321,6 +318,6 @@ bool GpuTransport::query(int /*event_handle*/) const                       { ret
 bool GpuTransport::synchronize(int /*event_handle*/)                       { return false; }
 void GpuTransport::release_event(int /*event_handle*/)                     {}
 
-#endif  // GGML_USE_HIP
+#endif  // GGML_USE_HIP || GGML_USE_CUDA
 
 }  // namespace wp

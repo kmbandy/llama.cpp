@@ -25,8 +25,9 @@
 #include <liburing.h>
 #endif
 
-#if defined(GGML_USE_HIP)
-#include <hip/hip_runtime.h>
+#include "wp-gpu-runtime.h"
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 
 extern "C++" void ggml_cuda_get_routed_expert_ptrs_stats(
     uint64_t * set, uint64_t * consumed, uint64_t * discarded_unconsumed);
@@ -238,7 +239,7 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
     if (slot_size <= payload_size) return true;
     if (dst_vram == nullptr) return false;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
                                slot_size - payload_size);
     if (err != hipSuccess) {
@@ -281,7 +282,7 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     ensure_host_bufs_.assign(cap, nullptr);
     ensure_host_buf_bytes_ = alloc;
     ensure_host_bufs_pinned_ = false;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     static const int s_pageable = [](){ const char* e=std::getenv("WP_ODIRECT_PAGEABLE"); return (e&&e[0]=='1')?1:0; }();
     bool all_ok = !s_pageable;
     for (size_t i = 0; !s_pageable && i < cap; ++i) {
@@ -321,7 +322,7 @@ void WeightPager::free_ensure_host_bufs_() {
 #endif
     for (void * p : ensure_host_bufs_) {
         if (p == nullptr) continue;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (ensure_host_bufs_pinned_) {
             hipHostFree(p);
         } else
@@ -1078,7 +1079,7 @@ bool WeightPager::init(const Config &             cfg,
     //    per access.
     sync_staging_size_ = slot_size;
     sync_staging_      = nullptr;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     if (hipHostMalloc(&sync_staging_, sync_staging_size_, hipHostMallocDefault) == hipSuccess) {
         sync_staging_pinned_ = true;
     } else {
@@ -1252,7 +1253,7 @@ void WeightPager::shutdown() {
     host_tier_.reset();
     host_prefetch_strikes_.clear();
     if (sync_staging_ != nullptr) {
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (sync_staging_pinned_) {
             hipHostFree(sync_staging_);
         } else {
@@ -1409,7 +1410,7 @@ const WeightPager::Stats & WeightPager::stats() const {
         stats_.host_prefetch_read_fail = host_prefetcher_->read_fail();
         stats_.host_prefetch_skipped = host_prefetcher_->skipped();
     }
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     ggml_cuda_get_routed_expert_ptrs_stats(
         &stats_.routing_ptrs_set,
         &stats_.routing_ptrs_consumed,
@@ -2378,7 +2379,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // branch below ignores `jobs`/`host_hit` entirely in favor of
         // page_in_sync_ -- calling borrow() there would leak the refcount
         // with nothing to release it).
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         const bool host_zerocopy = host_tier_ != nullptr && host_tier_->backend_pinned();
 #else
         const bool host_zerocopy = false;
@@ -2581,7 +2582,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         bool   h2d_events_valid = false;
         double promo_h2d_ms     = 0.0;
         double fresh_h2d_ms     = 0.0;
-#if defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         // Queue all H2Ds then one device sync (overlap PCIe copies).
         //
         // MAD-P4 follow-up: promotion (HostTier RAM->VRAM) copies are

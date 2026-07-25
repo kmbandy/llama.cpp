@@ -62,6 +62,9 @@ if(GGML_HIP)
     target_include_directories(llama PRIVATE /opt/rocm/include)
     target_compile_definitions(llama PRIVATE __HIP_PLATFORM_AMD__)
 endif()
+if(GGML_CUDA)
+    target_include_directories(llama PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
