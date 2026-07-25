@@ -12,10 +12,6 @@
 
 #include <cuda_runtime.h>
 
-static inline cudaError_t wp_cuda_stream_get_device(cudaStream_t /*stream*/, int * device) {
-    return cudaGetDevice(device);
-}
-
 #define hipDeviceAttributeIntegrated cudaDevAttrIntegrated
 #define hipDeviceGetAttribute         cudaDeviceGetAttribute
 #define hipDeviceProp_t               cudaDeviceProp
@@ -50,7 +46,14 @@ static inline cudaError_t wp_cuda_stream_get_device(cudaStream_t /*stream*/, int
 #define hipSetDevice                  cudaSetDevice
 #define hipStreamCreateWithFlags      cudaStreamCreateWithFlags
 #define hipStreamDestroy              cudaStreamDestroy
-#define hipStreamGetDevice            wp_cuda_stream_get_device
+// NOTE: hipStreamGetDevice is deliberately NOT mapped. CUDA gained
+// cudaStreamGetDevice only in 12.8 (this box builds against 12.0), and the
+// obvious substitute -- cudaGetDevice -- answers a DIFFERENT question: the
+// currently-active device rather than the stream's. At the one call site
+// (wp-eval-cb.cpp) the current device has already been set to target_device by
+// ScopedHipDevice, so such a substitution would make the guard tautologically
+// true and silently inert. A safety check that can never fire is worse than an
+// absent one, so the call site skips the check explicitly on CUDA instead.
 #define hipStreamNonBlocking          cudaStreamNonBlocking
 #define hipStreamPerThread            cudaStreamPerThread
 #define hipStreamSynchronize          cudaStreamSynchronize

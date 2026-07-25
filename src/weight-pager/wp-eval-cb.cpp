@@ -730,6 +730,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 // back to host-ordered synchronous copies.
                                 hipStream_t wp_stream =
                                     (hipStream_t) ggml_cuda_get_wp_compute_stream(target_device);
+#if defined(GGML_USE_HIP)
                                 if (wp_stream != nullptr) {
                                     hipDevice_t stream_device = -1;
                                     hipError_t stream_err = hipStreamGetDevice(wp_stream, &stream_device);
@@ -740,6 +741,23 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         wp_stream = nullptr;
                                     }
                                 }
+#else
+                                // CUDA: this verification is UNAVAILABLE, not merely skipped.
+                                // cudaStreamGetDevice landed in CUDA 12.8 and we build against
+                                // 12.0. Substituting cudaGetDevice would answer a different
+                                // question -- the active device, which ScopedHipDevice has
+                                // already set to target_device above -- making the guard
+                                // tautologically true. An inert safety check is worse than an
+                                // acknowledged gap, so we take neither.
+                                //
+                                // Accepted because the stream is device-indexed by
+                                // construction: ggml_cuda_get_wp_compute_stream(target_device)
+                                // returns tls_wp_compute_stream[target_device]. This guard was
+                                // defence-in-depth against a bug in that accessor, and on CUDA
+                                // we proceed unverified. Revisit if the build moves to CUDA
+                                // 12.8+ (use cudaStreamGetDevice) or if a second CUDA device is
+                                // ever paged to on one host.
+#endif
 
                                 // MAD-230 follow-up: periodic compute-stream
                                 // drain so the GPU's command processor can
