@@ -278,3 +278,53 @@ Unit 3's targets are now evidence-based, and none of them is "add concurrency":
 
 Achieved concurrency measured 5.06-5.28 average against a peak of 16, so raising
 sustained depth remains a *minor* lever compared with reading 2.5x less.
+
+---
+
+## 9. Post-fix validation (2026-07-24, tip a9f2c139b)
+
+Same script, same settings, same corpus, HOST O_DIRECT path, no island, no RAM
+tier — so the pre-fix PPL run is an exact control.
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `page_ins` | 264150 | **264150** (identical work) |
+| `io_gb_read` (bytes the pager requested) | 1177.171 GB | **1177.171 GB** (identical) |
+| **`ensure_batch_gb_s`** | **2.248** | **6.206** (**2.76x**) |
+| wikitext PPL (8 chunks, n_ctx 512) | 1.9007 +/- 0.07421 | **1.9007 +/- 0.07421** |
+| pread failures | **3** | **0** |
+| wall | 818 s | **580 s** (-29%) |
+
+**Correctness: identical to four decimals with the same stderr**, and every
+per-chunk value matched ([5]2.1745, [6]2.0328, [7]1.9620, [8]1.9007). The fix
+changes which byte *ranges* are read; it delivers the same payload.
+
+**Amplification eliminated.** 1189.61 GB delivered for 1177.171 GB requested =
+**1.011x**, against 2.49x measured pre-fix. The alignment resolved as intended:
+`O_DIRECT alignment resolved to 4096 bytes (fstatfs ok, f_bsize=4096)` for every
+shard.
+
+**The EOF clamp did better than predicted.** §8 warned it might swap EIO for
+EINVAL, since no shard size is 4096-aligned. Measured: **0 pread failures**,
+down from 3. The clamp is genuinely handling the tail, not merely relocating the
+error.
+
+### 9.1 A ceiling correction
+
+Earlier revisions of this spec quoted a "~2.84-2.95 GB/s drive ceiling at QD16"
+and inferred "~2x available headroom". That figure came from a 128-read probe and
+was **too low** — the SN850X is rated ~7 GB/s and this run sustains **6.206
+GB/s**. Real headroom was materially larger than stated, which is why the
+realised gain exceeds the predicted one. Treat short-burst probe numbers as a
+floor, not a ceiling.
+
+### 9.2 Not established by this run
+
+- `ensure_batch_host_odirect_cap_skips` does not appear in the log at all, so it
+  is unconfirmed whether it is zero or simply not printed. Follow-up.
+- `inflight_avg_at_read_start` was **15.53** here versus 5.06 in the decode A/B.
+  These are **not comparable** — prefill queues far deeper than decode. Nothing
+  about achieved concurrency during *decode* is established by this run.
+- Attribution between the two causes (alignment vs btrfs compression) is still
+  unmeasured; both changed before this run.
+- The RAM tier question is untouched here and remains open in both directions.
