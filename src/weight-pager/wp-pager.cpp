@@ -1421,7 +1421,15 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_host_prep_ms: %.1f\n"
             "  ensure_batch_host_enqueue_ms: %.1f\n"
             "  ensure_batch_host_read_wait_ms: %.1f\n"
-            "  ensure_batch_host_h2d_ms: %.1f\n",
+            "  ensure_batch_host_h2d_ms: %.1f\n"
+            "  ensure_batch_host_promotion_count: %lu\n"
+            "  ensure_batch_host_promotion_h2d_ms: %.1f\n"
+            "  ensure_batch_host_fresh_count: %lu\n"
+            "  ensure_batch_host_fresh_h2d_ms: %.1f\n"
+            "  page_in_sync_promotion_count: %lu\n"
+            "  page_in_sync_promotion_h2d_ms: %.1f\n"
+            "  page_in_sync_fresh_count: %lu\n"
+            "  page_in_sync_fresh_h2d_ms: %.1f\n",
             (unsigned long) s.page_ins,
             (unsigned long) s.evictions,
             (unsigned long) s.prefetch_hits,
@@ -1497,7 +1505,15 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_host_prep_seconds * 1e3,
             s.ensure_batch_host_enqueue_seconds * 1e3,
             s.ensure_batch_host_read_wait_seconds * 1e3,
-            s.ensure_batch_host_h2d_seconds * 1e3);
+            s.ensure_batch_host_h2d_seconds * 1e3,
+            (unsigned long) s.ensure_batch_host_promotion_count,
+            s.ensure_batch_host_promotion_h2d_seconds * 1e3,
+            (unsigned long) s.ensure_batch_host_fresh_count,
+            s.ensure_batch_host_fresh_h2d_seconds * 1e3,
+            (unsigned long) s.page_in_sync_promotion_count,
+            s.page_in_sync_promotion_h2d_seconds * 1e3,
+            (unsigned long) s.page_in_sync_fresh_count,
+            s.page_in_sync_fresh_h2d_seconds * 1e3);
         if (s.dense_prefetch_submitted > 0) {
             LLAMA_LOG_WARN("  dense_prefetch_submitted: %lu\n",
                            (unsigned long) s.dense_prefetch_submitted);
@@ -2239,14 +2255,38 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         const double read_seconds = seconds_since(io_t0);
         size_t batch_bytes = 0;
         int    batch_ok_n  = 0;
+        // Populated inside the GGML_USE_HIP branch below; declared here
+        // (with inert defaults) because the stats-fold block after the
+        // #if/#else/#endif is shared by both branches.
+        bool   h2d_events_valid = false;
+        double promo_h2d_ms     = 0.0;
+        double fresh_h2d_ms     = 0.0;
 #if defined(GGML_USE_HIP)
         // Queue all H2Ds then one device sync (overlap PCIe copies).
-        for (std::size_t k = 0; k < misses.size(); ++k) {
+        //
+        // MAD-P4 follow-up: promotion (HostTier RAM->VRAM) copies are
+        // enqueued before fresh-read copies so three timing events can
+        // bracket each group and measure its total device H2D time
+        // directly (see Stats::ensure_batch_host_promotion_h2d_seconds /
+        // ensure_batch_host_fresh_h2d_seconds). This only changes enqueue
+        // ORDER -- both groups still land on the same default stream and
+        // are still committed by the single hipDeviceSynchronize() below,
+        // unchanged. hipEventRecord does not block the host, so no new
+        // synchronization point is introduced.
+        hipEvent_t h2d_ev_start = nullptr, h2d_ev_mid = nullptr, h2d_ev_end = nullptr;
+        const bool h2d_timing_ok =
+            hipEventCreate(&h2d_ev_start) == hipSuccess &&
+            hipEventCreate(&h2d_ev_mid)   == hipSuccess &&
+            hipEventCreate(&h2d_ev_end)   == hipSuccess;
+        if (h2d_timing_ok) {
+            hipEventRecord(h2d_ev_start, nullptr);
+        }
+        auto issue_h2d_copy = [&](std::size_t k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
             void * vram = slot_ptr_(mm.slot);
             if (vram == nullptr) {
-                continue;
+                return;
             }
             // RAM hit and fresh reads both use the per-miss bounce buffer;
             // O_DIRECT reads begin after their 512-align prefix.
@@ -2256,7 +2296,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             } else if (jobs[k].ok) {
                 src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
             } else {
-                continue;
+                return;
             }
             hipError_t err = hipMemcpyAsync(vram, src, m.size,
                                             hipMemcpyHostToDevice, nullptr);
@@ -2264,6 +2304,25 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 jobs[k].ok = false;
                 host_hit[k] = false;
             }
+        };
+        size_t n_promo_copy = 0, n_fresh_copy = 0;
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            if (host_hit[k]) {
+                issue_h2d_copy(k);
+                ++n_promo_copy;
+            }
+        }
+        if (h2d_timing_ok) {
+            hipEventRecord(h2d_ev_mid, nullptr);
+        }
+        for (std::size_t k = 0; k < misses.size(); ++k) {
+            if (!host_hit[k]) {
+                issue_h2d_copy(k);
+                ++n_fresh_copy;
+            }
+        }
+        if (h2d_timing_ok) {
+            hipEventRecord(h2d_ev_end, nullptr);
         }
         // A copy that fails at EXECUTION time (vs enqueue) only surfaces here.
         // If the sync failed, some slot may hold garbage -- do NOT commit any of
@@ -2275,6 +2334,27 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             LLAMA_LOG_WARN("wp::ensure_batch: hipDeviceSynchronize failed (%s); routing batch to sync fallback\n",
                            hipGetErrorString(sync_err));
         }
+        // Direct measurement of each group's H2D device time (see the
+        // enqueue split above). Only valid if event creation succeeded and
+        // the batch sync itself succeeded (a failed sync leaves the events'
+        // completion state meaningless).
+        h2d_events_valid = h2d_timing_ok && sync_ok;
+        if (h2d_events_valid) {
+            float ms = 0.0f;
+            if (n_promo_copy > 0 && hipEventElapsedTime(&ms, h2d_ev_start, h2d_ev_mid) == hipSuccess) {
+                promo_h2d_ms = (double) ms;
+            }
+            ms = 0.0f;
+            if (n_fresh_copy > 0 && hipEventElapsedTime(&ms, h2d_ev_mid, h2d_ev_end) == hipSuccess) {
+                fresh_h2d_ms = (double) ms;
+            }
+        }
+        // Destroy whichever events were actually created, even if creation
+        // only partially succeeded (a partial failure must not leak the
+        // events that DID get created).
+        if (h2d_ev_start) hipEventDestroy(h2d_ev_start);
+        if (h2d_ev_mid)   hipEventDestroy(h2d_ev_mid);
+        if (h2d_ev_end)   hipEventDestroy(h2d_ev_end);
         for (std::size_t k = 0; k < misses.size(); ++k) {
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
@@ -2291,6 +2371,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 if (host_hit[k]) {
                     ++stats_.host_tier_hits;   // served from RAM; no NVMe bytes
                     ++stats_.ensure_batch_host_hits;
+                    ++stats_.ensure_batch_host_promotion_count;
                     // Exclusive tier: the page is back in VRAM, so drop its RAM
                     // copy. It re-enters Tier 1 only if evicted again.
                     if (host_tier_) {
@@ -2301,6 +2382,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     }
                 } else {
                     batch_bytes += m.size;     // real storage read
+                    ++stats_.ensure_batch_host_fresh_count;
                     // Do NOT populate Tier 1 on read: a page resident in VRAM must
                     // not also sit in RAM (that made RAM a useless duplicate of the
                     // pool). Fresh reads are VRAM-only; a page enters Tier 1 as a
@@ -2350,6 +2432,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             stats_.ensure_batch_host_enqueue_seconds   += host_enqueue_seconds;
             stats_.ensure_batch_host_read_wait_seconds += host_read_wait_seconds;
             stats_.ensure_batch_host_h2d_seconds       += (batch_seconds - read_seconds);
+            if (h2d_events_valid) {
+                stats_.ensure_batch_host_promotion_h2d_seconds += promo_h2d_ms / 1e3;
+                stats_.ensure_batch_host_fresh_h2d_seconds     += fresh_h2d_ms / 1e3;
+            }
             // Real storage submissions only: n_submitted counts jobs
             // actually enqueued to the O_DIRECT worker pool. HostTier
             // hits never reach the queue (their HostJob has fd=-1 and
@@ -3941,7 +4027,9 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
 
     if (host_tier_) {
         if (host_tier_->lookup(page_idx, staging, m.size)) {
+            const auto stage_t0 = std::chrono::steady_clock::now();
             int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size(slot));
+            const double stage_seconds = seconds_since(stage_t0);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: host tier stage_in returned evt=%d\n", s_diag_count, evt);
             if (evt < 0) {
                 LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: host tier gpu stage_in failed for page %d\n",
@@ -3956,6 +4044,8 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
             slot_to_page_[slot]     = page_idx;
             ++stats_.host_tier_hits;
             ++stats_.page_ins;
+            ++stats_.page_in_sync_promotion_count;
+            stats_.page_in_sync_promotion_h2d_seconds += stage_seconds;
             host_tier_->erase(page_idx);
             if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT host-tier slot=%d\n", s_diag_count, slot);
             ++s_diag_count;
@@ -4019,7 +4109,9 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
     // Stage 2: H2D + padding zero. stage_in() preserves the synchronous
     // "resident on return" contract even when WP_ASYNC_ENSURE selects a
     // dedicated transport stream for prefetch stage 2.
+    const auto fresh_stage_t0 = std::chrono::steady_clock::now();
     int evt = transport_.stage_in(dst, staging, m.size, pool_.slot_size(slot));
+    const double fresh_stage_seconds = seconds_since(fresh_stage_t0);
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: stage_in returned evt=%d\n", s_diag_count, evt);
     if (evt < 0) {
         LLAMA_LOG_WARN("wp::WeightPager::page_in_sync_: gpu stage_in failed for page %d\n", page_idx);
@@ -4027,6 +4119,8 @@ int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
         return -1;
     }
     transport_.release_event(evt);
+    ++stats_.page_in_sync_fresh_count;
+    stats_.page_in_sync_fresh_h2d_seconds += fresh_stage_seconds;
 
     // Shared sync_staging_ is owned by the WeightPager; no per-call free.
 

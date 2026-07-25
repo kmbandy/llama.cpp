@@ -248,7 +248,26 @@ public:
         double   ensure_batch_host_prep_seconds      = 0.0; // computing O_DIRECT alignment/bounce params
         double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
         double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
-        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase
+        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase (mixed: promotion + fresh)
+        // MAD-P4 follow-up: ensure_batch_host_h2d_seconds above mixes two
+        // different kinds of H2D copy -- a HostTier RAM->VRAM promotion
+        // (page already read once from storage, now just moving host RAM
+        // bytes to a VRAM slot) and a fresh storage read's H2D (first time
+        // this page's bytes land in VRAM this run). Differencing separate
+        // aggregate phases to infer a per-promotion cost is unreliable (a
+        // 36% spread was observed across two runs); these fields measure
+        // each kind directly instead. Both are 0.0 unless host_tier_ is
+        // enabled. Reported distinctly per call site (ensure_batch's HOST
+        // O_DIRECT path vs page_in_sync_) since the two paths batch their
+        // H2D copies differently and their per-page cost could differ.
+        uint64_t ensure_batch_host_promotion_count      = 0;   // pages promoted RAM->VRAM in ensure_batch HOST path
+        double   ensure_batch_host_promotion_h2d_seconds = 0.0; // their H2D copy time only
+        uint64_t ensure_batch_host_fresh_count           = 0;   // fresh storage reads' H2D in ensure_batch HOST path
+        double   ensure_batch_host_fresh_h2d_seconds     = 0.0; // their H2D copy time only
+        uint64_t page_in_sync_promotion_count            = 0;   // pages promoted RAM->VRAM in page_in_sync_
+        double   page_in_sync_promotion_h2d_seconds      = 0.0; // their H2D copy time only (transport_.stage_in)
+        uint64_t page_in_sync_fresh_count                = 0;   // fresh storage reads' H2D in page_in_sync_
+        double   page_in_sync_fresh_h2d_seconds          = 0.0; // their H2D copy time only (transport_.stage_in)
     };
 
     WeightPager() = default;
