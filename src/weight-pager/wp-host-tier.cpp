@@ -3,8 +3,8 @@
 #include "wp-pool.h"      // is_uma_device
 #include "llama-impl.h"  // LLAMA_LOG_*
 
-#include <algorithm>
 #include <cerrno>
+#include <iterator>
 #include <cstdlib>
 #include <cstring>
 
@@ -101,6 +101,7 @@ void HostTier::shutdown() {
     resident_.clear();
     free_lists_.clear();
     lru_.clear();
+    lru_pos_.clear();
     used_bytes_ = 0;
     high_water_ = 0;
 
@@ -153,6 +154,7 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     resident_[page_idx] = Resident{offset, n};
     used_bytes_ += n;
     lru_.push_back(page_idx);
+    lru_pos_[page_idx] = std::prev(lru_.end());
     return true;
 }
 
@@ -191,6 +193,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
     resident_[page_idx] = Resident{offset, n};
     used_bytes_ += n;
     lru_.push_back(page_idx);
+    lru_pos_[page_idx] = std::prev(lru_.end());
     return true;
 #else
     (void) device_bytes;
@@ -281,6 +284,7 @@ bool HostTier::evict_one_lru_() {
 
     const int page_idx = lru_.front();
     lru_.pop_front();
+    lru_pos_.erase(page_idx);
 
     auto it = resident_.find(page_idx);
     if (it == resident_.end()) {
@@ -305,19 +309,21 @@ void HostTier::erase_resident_(int page_idx) {
     free_lists_[r.bytes].push_back(r.offset);
     used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
 
-    auto pos = std::find(lru_.begin(), lru_.end(), page_idx);
-    if (pos != lru_.end()) {
-        lru_.erase(pos);
+    auto pos_it = lru_pos_.find(page_idx);
+    if (pos_it != lru_pos_.end()) {
+        lru_.erase(pos_it->second);
+        lru_pos_.erase(pos_it);
     }
 }
 
 void HostTier::touch_lru_(int page_idx) {
-    auto pos = std::find(lru_.begin(), lru_.end(), page_idx);
-    if (pos == lru_.end()) {
+    auto pos_it = lru_pos_.find(page_idx);
+    if (pos_it == lru_pos_.end()) {
         return;
     }
-    lru_.erase(pos);
-    lru_.push_back(page_idx);
+    // Move the node to the back (MRU) in O(1) without invalidating any
+    // other iterator, using splice on the same list instance.
+    lru_.splice(lru_.end(), lru_, pos_it->second);
 }
 
 }  // namespace wp

@@ -22,6 +22,7 @@
 
 #include <cerrno>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1330,6 +1331,166 @@ static int test_host_tier_concurrency() {
     return fails;
 }
 
+static int test_host_tier_repeated_touches_eviction_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x55);
+    EXPECT(tier.store(50, bytes.data(), bytes.size()), "store 50");
+    EXPECT(tier.store(51, bytes.data(), bytes.size()), "store 51");
+    EXPECT(tier.store(52, bytes.data(), bytes.size()), "store 52");
+    EXPECT(tier.store(53, bytes.data(), bytes.size()), "store 53");
+
+    std::vector<uint8_t> out(bytes.size());
+
+    // Repeatedly touch 50 and 51 so 52 and 53 remain the least-recently-used,
+    // in that order, regardless of how many times the MRU pages are re-touched.
+    for (int i = 0; i < 5; ++i) {
+        EXPECT(tier.lookup(51, out.data(), out.size()), "repeated touch of 51");
+        EXPECT(tier.lookup(50, out.data(), out.size()), "repeated touch of 50");
+    }
+
+    // Budget for 4 pages of 32 bytes; storing a 5th must evict 52 (now LRU).
+    EXPECT(tier.store(54, bytes.data(), bytes.size()), "store 54 evicts current LRU (52)");
+    EXPECT(!tier.lookup(52, out.data(), out.size()), "52 evicted first despite earlier insertion order");
+    EXPECT(tier.lookup(53, out.data(), out.size()), "53 still resident");
+    EXPECT(tier.lookup(50, out.data(), out.size()), "50 still resident (touched)");
+    EXPECT(tier.lookup(51, out.data(), out.size()), "51 still resident (touched)");
+    EXPECT(tier.lookup(54, out.data(), out.size()), "54 resident");
+
+    // Next eviction should now take 53, the next-oldest untouched page.
+    EXPECT(tier.store(55, bytes.data(), bytes.size()), "store 55 evicts next LRU (53)");
+    EXPECT(!tier.lookup(53, out.data(), out.size()), "53 evicted second");
+    EXPECT(tier.lookup(55, out.data(), out.size()), "55 resident");
+
+    return fails;
+}
+
+static int test_host_tier_erase_middle_preserves_order() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x66);
+    EXPECT(tier.store(60, bytes.data(), bytes.size()), "store 60");
+    EXPECT(tier.store(61, bytes.data(), bytes.size()), "store 61");
+    EXPECT(tier.store(62, bytes.data(), bytes.size()), "store 62");
+    EXPECT(tier.store(63, bytes.data(), bytes.size()), "store 63");
+
+    // Erase the middle element (61); the relative recency order of the
+    // remaining pages (60, 62, 63) must be unaffected.
+    tier.erase(61);
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "erase drops resident count by one");
+
+    std::vector<uint8_t> out(bytes.size());
+    EXPECT(!tier.lookup(61, out.data(), out.size()), "erased page gone");
+
+    // Budget holds 4 pages; after freeing 61's slot there is room for two more
+    // stores before an eviction is forced, and the LRU order among (60,62,63)
+    // must still be 60 first.
+    EXPECT(tier.store(64, bytes.data(), bytes.size()), "store 64 into freed slot");
+    EXPECT(tier.store(65, bytes.data(), bytes.size()), "store 65 forces eviction of oldest (60)");
+    EXPECT(!tier.lookup(60, out.data(), out.size()), "60 was oldest remaining and is evicted first");
+    EXPECT(tier.lookup(62, out.data(), out.size()), "62 still resident");
+    EXPECT(tier.lookup(63, out.data(), out.size()), "63 still resident");
+    EXPECT(tier.lookup(64, out.data(), out.size()), "64 still resident");
+    EXPECT(tier.lookup(65, out.data(), out.size()), "65 still resident");
+
+    return fails;
+}
+
+static int test_host_tier_touch_absent_is_noop() {
+    int fails = 0;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "host tier init");
+
+    std::vector<uint8_t> bytes(32, 0x77);
+    EXPECT(tier.store(70, bytes.data(), bytes.size()), "store 70");
+    EXPECT(tier.store(71, bytes.data(), bytes.size()), "store 71");
+    EXPECT(tier.store(72, bytes.data(), bytes.size()), "store 72");
+
+    std::vector<uint8_t> out(bytes.size());
+
+    // Looking up (and thus attempting to touch) a page that was never stored,
+    // and erasing a page that was never stored, must not disturb existing
+    // residency, byte accounting, or LRU order.
+    EXPECT(!tier.lookup(999, out.data(), out.size()), "lookup of absent page misses");
+    tier.erase(998);
+    EXPECT_EQ_INT(tier.resident_count(), 3u, "resident count unaffected by no-op touch/erase");
+    EXPECT_EQ_INT(tier.used_bytes(), 96u, "used bytes unaffected by no-op touch/erase");
+
+    // LRU order should still be 70, 71, 72 (oldest first) since the no-op
+    // lookups/erases above must not have touched anything.
+    EXPECT(tier.store(73, bytes.data(), bytes.size()), "store 73 evicts true LRU (70)");
+    EXPECT(!tier.lookup(70, out.data(), out.size()), "70 evicted as expected, unaffected by no-op calls");
+    EXPECT(tier.lookup(71, out.data(), out.size()), "71 still resident");
+    EXPECT(tier.lookup(72, out.data(), out.size()), "72 still resident");
+    EXPECT(tier.lookup(73, out.data(), out.size()), "73 resident");
+
+    return fails;
+}
+
+// Regression test for the O(n) std::find LRU scan (measured ~2.95s for
+// ~20000 lookups against ~1880 resident pages in production). Reproduces
+// the same shape with small synthetic pages so the cost measured here is
+// the bookkeeping (touch/erase) itself, not the memcpy. Lookups are issued
+// in a fixed pseudo-random order (not insertion order) so each touch must
+// actually locate an arbitrary page in the recency list rather than always
+// finding the next-oldest page sitting at the front — a purely sequential
+// access pattern would let an O(n) std::find degenerate to O(1) per call
+// and hide the defect. An O(1) LRU (list + index map) finishes this well
+// within the deadline; the O(n) std::find-based version does not.
+static int test_host_tier_lru_touch_is_not_linear_scan() {
+    int fails = 0;
+
+    constexpr int n_pages = 200000;
+    constexpr size_t page_bytes = 16;
+    constexpr int n_iters = 8000;
+
+    wp::HostTier tier;
+    EXPECT(tier.init(/*budget_bytes=*/(size_t) n_pages * page_bytes, /*device_idx=*/-1),
+           "host tier init");
+
+    std::vector<uint8_t> bytes(page_bytes, 0x99);
+    for (int i = 0; i < n_pages; ++i) {
+        EXPECT(tier.store(i, bytes.data(), bytes.size()), "prime resident set");
+    }
+    EXPECT_EQ_INT(tier.resident_count(), (size_t) n_pages, "all pages resident before timing");
+
+    // Deterministic pseudo-random page order (xorshift32), independent of
+    // insertion order, so lookups land throughout the recency list instead
+    // of only ever hitting whichever page is currently at the front.
+    std::vector<int> order(n_iters);
+    uint32_t rng_state = 0x9e3779b9u;
+    for (int i = 0; i < n_iters; ++i) {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 17;
+        rng_state ^= rng_state << 5;
+        order[i] = (int) (rng_state % (uint32_t) n_pages);
+    }
+
+    std::vector<uint8_t> out(page_bytes);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n_iters; ++i) {
+        (void) tier.lookup(order[i], out.data(), out.size());
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::fprintf(stderr, "  [perf] %d random-order touches over %d resident pages took %.1f ms\n",
+                 n_iters, n_pages, elapsed_ms);
+
+    constexpr double deadline_ms = 500.0;
+    EXPECT(elapsed_ms < deadline_ms, "LRU touch must be O(1), not a linear scan of the resident set");
+
+    return fails;
+}
+
 static int test_host_prefetcher() {
     int fails = 0;
     wp::HostTier tier;
@@ -2219,6 +2380,10 @@ int main() {
         { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
         { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },
         { "host_tier_concurrency",               test_host_tier_concurrency               },
+        { "host_tier_repeated_touches_eviction_order", test_host_tier_repeated_touches_eviction_order },
+        { "host_tier_erase_middle_preserves_order",    test_host_tier_erase_middle_preserves_order    },
+        { "host_tier_touch_absent_is_noop",            test_host_tier_touch_absent_is_noop            },
+        { "host_tier_lru_touch_is_not_linear_scan",    test_host_tier_lru_touch_is_not_linear_scan    },
         { "host_prefetcher",                     test_host_prefetcher                     },
         { "catalog_add_pinned_basic",            test_catalog_add_pinned_basic            },
         { "catalog_add_pinned_mixed_with_paged", test_catalog_add_pinned_mixed_with_paged },

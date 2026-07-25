@@ -9,7 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -71,7 +71,10 @@ private:
 
     std::unordered_map<int, Resident> resident_;
     std::unordered_map<size_t, std::vector<size_t>> free_lists_;
-    std::deque<int> lru_;
+    // LRU order: front = least recently used, back = most recently used.
+    // lru_pos_ gives O(1) access to a page's node so touch/erase never scan.
+    std::list<int> lru_;
+    std::unordered_map<int, std::list<int>::iterator> lru_pos_;
     mutable std::mutex mu_;
 };
 
