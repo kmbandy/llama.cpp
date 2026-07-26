@@ -68,6 +68,9 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Weight paging: each expert's offset into the pager's pool, in elements.
+// Bound to a dummy when p.paged == 0.
+layout (binding = 5) readonly buffer WPOFF {uint data_wp_expert_off[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -88,6 +91,14 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    // Declared so the offsets line up with vk_mat_mat_id_push_constants, which
+    // carries padded_N ahead of paged. Unused here.
+    uint padded_N;
+    // Weight paging: paged=0 keeps stock addressing. paged=1 means binding 0 is
+    // the pager's pool and data_wp_expert_off[expert_idx] is that expert's
+    // offset within it, in ELEMENTS (see ggml_vk_mul_mat_id_q_f16) so it divides
+    // by LOAD_VEC_A_EFF exactly like batch_stride_a does.
+    uint paged;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -247,7 +258,10 @@ void main() {
 
     uint pos_a =
 #ifdef MUL_MAT_ID
-        expert_idx * (p.batch_stride_a / LOAD_VEC_A_EFF) +
+        // Under weight paging the expert is at an arbitrary pool slot, so the
+        // uniform stride does not describe where its weights are.
+        ((p.paged != 0) ? (data_wp_expert_off[expert_idx] / LOAD_VEC_A_EFF)
+                        : expert_idx * (p.batch_stride_a / LOAD_VEC_A_EFF)) +
 #else
         batch_idx_a * (p.batch_stride_a / LOAD_VEC_A_EFF) +
 #endif
