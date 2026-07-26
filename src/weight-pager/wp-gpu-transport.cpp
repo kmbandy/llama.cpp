@@ -224,8 +224,12 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
         const int evt_idx = free_events_.back();
         free_events_.pop_back();
         void * event = nullptr;
-        if (!ggml_backend_vk_wp_stage_in(buffer_, dst, src_pinned, payload_size, slot_size, &event) ||
-            !ggml_backend_vk_wp_event_wait(event)) {
+        // Genuinely async: record the fence and return without waiting. This
+        // used to call ggml_backend_vk_wp_event_wait() right here, which made
+        // every "async" stage a submit-and-block and collapsed the batch paths
+        // to one page in flight at a time. Callers wait via synchronize() (which
+        // stage_in() does for them) or poll query().
+        if (!ggml_backend_vk_wp_stage_in(buffer_, dst, src_pinned, payload_size, slot_size, &event)) {
             ggml_backend_vk_wp_event_free(event);
             free_events_.push_back(evt_idx);
             return -1;
@@ -304,6 +308,26 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
 
     hipSetDevice(prev_device);
     return evt_idx;
+}
+
+void * GpuTransport::host_alloc(size_t size) {
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return ggml_backend_vk_wp_host_alloc(buffer_, size);
+    }
+#endif
+    (void) size;
+    return nullptr;
+}
+
+void GpuTransport::host_free(void * ptr) {
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        ggml_backend_vk_wp_host_free(buffer_, ptr);
+        return;
+    }
+#endif
+    (void) ptr;
 }
 
 bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {

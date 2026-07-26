@@ -8380,6 +8380,25 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
     }
 
     std::lock_guard<std::recursive_mutex> guard(dst_buffer->device->mutex);
+
+    // Can this transfer safely be left in flight? Only if `src` is host memory
+    // registered with THIS Vulkan device, in which case the copy reads straight
+    // from it. Otherwise ggml_vk_buffer_write_async routes through the single
+    // device-wide `device->sync_staging` buffer, and two overlapping transfers
+    // would each memcpy into that same region — the second clobbering data the
+    // first's queued copy has not executed yet. So an unpinned source MUST be
+    // fenced before this function returns; the caller cannot know this, because
+    // the staging decision is made in here.
+    //
+    // The pager's O_DIRECT bounce arena is currently hipHostMalloc'd, which this
+    // device knows nothing about, so today it always takes the fenced path.
+    // Register that arena with Vulkan and this becomes genuinely async with no
+    // other change.
+    vk_buffer pinned_buf    = nullptr;
+    size_t    pinned_offset = 0;
+    ggml_vk_host_get(dst_buffer->device, src, pinned_buf, pinned_offset);
+    const bool src_is_pinned = pinned_buf != nullptr;
+
     // GGML_VK_WP_CQUEUE=1: stage on the COMPUTE queue instead of the transfer
     // queue. On this device the two are separate queues (same family, 4 queues on
     // RADV Polaris), and nothing orders a transfer-queue submission against the
@@ -8410,6 +8429,11 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
         dst_buffer->device->device.createFence({}),
     };
     ggml_vk_submit(context, wp_event->fence);
+
+    // Shared-staging transfers cannot be left in flight — see the note above.
+    if (!src_is_pinned) {
+        (void) ggml_backend_vk_wp_event_wait(wp_event);
+    }
 
     if (wp_hashchk_enabled()) {
         const size_t n = std::min<size_t>(payload_size, WP_HASH_SPAN);
@@ -8444,6 +8468,30 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
 
     *event = wp_event;
     return true;
+}
+
+void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t size) {
+    if (pool_buffer == nullptr || size == 0) {
+        return nullptr;
+    }
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) pool_buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return nullptr;
+    }
+    // Registered against the POOL's device, not vk_instance.devices[0], so
+    // ggml_vk_host_get finds it when staging into this pool.
+    return ggml_vk_host_malloc(buffer_ctx->dev_buffer->device, size);
+}
+
+void ggml_backend_vk_wp_host_free(ggml_backend_buffer_t pool_buffer, void * ptr) {
+    if (pool_buffer == nullptr || ptr == nullptr) {
+        return;
+    }
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) pool_buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return;
+    }
+    ggml_vk_host_free(buffer_ctx->dev_buffer->device, ptr);
 }
 
 // Weight-paging consumption bridge. Mirrors the CUDA backend's

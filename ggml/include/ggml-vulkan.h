@@ -32,6 +32,21 @@ GGML_BACKEND_API bool ggml_backend_vk_wp_event_query(void * event);
 GGML_BACKEND_API bool ggml_backend_vk_wp_event_wait(void * event);
 GGML_BACKEND_API void ggml_backend_vk_wp_event_free(void * event);
 
+// Host staging memory registered with the same Vulkan device as `pool_buffer`.
+// This matters for more than speed: a stage_in whose source is registered here
+// is copied straight from it, while an unregistered source has to go through the
+// single device-wide staging buffer, which forces the transfer to be fenced
+// before stage_in returns (two overlapping unpinned transfers would clobber that
+// shared region). So allocating the pager's bounce arena here is what allows
+// transfers to actually stay in flight.
+//
+// Returns memory suitable for O_DIRECT only if the returned pointer is
+// sufficiently aligned — the caller must check, since the alignment comes from
+// vkMapMemory and is not guaranteed to be a filesystem block size. Returns null
+// if the buffer is not a Vulkan buffer or the allocation fails.
+GGML_BACKEND_API void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t size);
+GGML_BACKEND_API void   ggml_backend_vk_wp_host_free(ggml_backend_buffer_t pool_buffer, void * ptr);
+
 // Weight-paging consumption bridge — the counterpart of the CUDA backend's
 // ggml_cuda_set_routed_expert_ptrs. Publishes, for the NEXT mul_mat_id node
 // only, where each active expert's weights actually live: `pool_buffer` is the

@@ -282,6 +282,53 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     ensure_host_bufs_.assign(cap, nullptr);
     ensure_host_buf_bytes_ = alloc;
     ensure_host_bufs_pinned_ = false;
+    ensure_host_bufs_vk_pinned_ = false;
+
+    // Vulkan first: an arena registered with the pool's device lets stage_in copy
+    // straight from it, which is both faster than the shared-staging hop AND the
+    // precondition for leaving transfers in flight. Only usable if the mapped
+    // pointer happens to satisfy O_DIRECT alignment — vkMapMemory promises
+    // minMemoryMapAlignment, which is not required to be a filesystem block
+    // size, and this project has already been burned once by assuming an
+    // alignment rather than checking it. Verify, and fall through if it fails.
+    if (transport_.is_vulkan()) {
+        const size_t od_align = align;
+        bool vk_ok = true;
+        for (size_t i = 0; i < cap; ++i) {
+            void * p = transport_.host_alloc(alloc);
+            if (p == nullptr) {
+                LLAMA_LOG_WARN("wp::ensure_host_bufs: vulkan host_alloc failed at buffer %zu/%zu "
+                               "(%zu B); falling back to unregistered arena (staging hop retained)\n",
+                               i, cap, alloc);
+                vk_ok = false;
+                break;
+            }
+            if (((uintptr_t) p % od_align) != 0) {
+                LLAMA_LOG_WARN("wp::ensure_host_bufs: vulkan pinned arena at %p is not %zu-aligned; "
+                               "falling back to unregistered arena (staging hop retained)\n",
+                               p, od_align);
+                transport_.host_free(p);
+                vk_ok = false;
+                break;
+            }
+            ensure_host_bufs_[i] = p;
+        }
+        if (vk_ok) {
+            ensure_host_bufs_vk_pinned_ = true;
+            LLAMA_LOG_WARN("wp::ensure_host_bufs: %zu x %zu B vulkan-registered pinned arena "
+                           "(stage_in copies direct, transfers can stay in flight)\n",
+                           cap, alloc);
+            return true;
+        }
+        // Release whatever was taken before the failure.
+        for (size_t i = 0; i < cap; ++i) {
+            if (ensure_host_bufs_[i] != nullptr) {
+                transport_.host_free(ensure_host_bufs_[i]);
+                ensure_host_bufs_[i] = nullptr;
+            }
+        }
+    }
+
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     static const int s_pageable = [](){ const char* e=std::getenv("WP_ODIRECT_PAGEABLE"); return (e&&e[0]=='1')?1:0; }();
     bool all_ok = !s_pageable;
@@ -322,6 +369,10 @@ void WeightPager::free_ensure_host_bufs_() {
 #endif
     for (void * p : ensure_host_bufs_) {
         if (p == nullptr) continue;
+        if (ensure_host_bufs_vk_pinned_) {
+            transport_.host_free(p);
+            continue;
+        }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (ensure_host_bufs_pinned_) {
             hipHostFree(p);
@@ -334,6 +385,7 @@ void WeightPager::free_ensure_host_bufs_() {
     ensure_host_bufs_.clear();
     ensure_host_buf_bytes_ = 0;
     ensure_host_bufs_pinned_ = false;
+    ensure_host_bufs_vk_pinned_ = false;
     for (int fd : ensure_odirect_fds_) {
         if (fd >= 0) {
             close(fd);
@@ -2592,7 +2644,127 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         bool   h2d_events_valid = false;
         double promo_h2d_ms     = 0.0;
         double fresh_h2d_ms     = 0.0;
+        // Set by the Vulkan route below so the HIP/CUDA route is skipped. Note
+        // this file is compiled WITH -DGGML_USE_CUDA even for Vulkan-only runs,
+        // so the guard below is not enough on its own — without this flag a
+        // Vulkan run would fall into raw cudaMemcpy against the pool sentinel.
+        bool   vk_h2d_handled   = false;
+
+#if defined(GGML_USE_VULKAN)
+        if (transport_.is_vulkan()) {
+            vk_h2d_handled = true;
+            // Vulkan H2D for the HOST O_DIRECT batch. The multi-QD read above is
+            // backend-neutral and has already landed the payloads in the pinned
+            // bounce arena; all that differs here is the copy into the pool,
+            // which must go through the transport bridge rather than a device
+            // memcpy. Queue every page first, then wait once, so a batch of N
+            // pages costs one fence rather than N submit-and-blocks.
+            //
+            // Deliberately simpler than the HIP route: no three-event device
+            // timing and no pipelined tier promotions. Those are optimisations
+            // on top of a working copy, and the copy is what was missing.
+            std::vector<int> vk_events(misses.size(), -1);
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                const Miss     & mm = misses[k];
+                const PageMeta & m  = catalog_.at(mm.page);
+                void * vram = slot_ptr_(mm.slot);
+                if (vram == nullptr) { continue; }
+
+                const void * src = nullptr;
+                if (host_hit[k]) {
+                    // RAM hit. Borrow the arena region as the copy source and
+                    // hold the handle until after the fence, exactly as the
+                    // synchronous HIP route does.
+                    if (host_hit_zerocopy[k]) {
+                        const void * borrowed = nullptr;
+                        HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+                        if (host_tier_ == nullptr ||
+                            !host_tier_->borrow(mm.page, &borrowed, m.size, &handle)) {
+                            jobs[k].ok  = false;
+                            host_hit[k] = false;
+                            continue;
+                        }
+                        host_hit_src[k] = borrowed;
+                        host_borrow_guard.pages.push_back({mm.page, handle});
+                    }
+                    src = host_hit_src[k];
+                } else if (jobs[k].ok) {
+                    src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+                } else {
+                    continue;
+                }
+                if (src == nullptr) { jobs[k].ok = false; host_hit[k] = false; continue; }
+
+                // stage_in_async also zeroes the slot tail, so the HIP route's
+                // zero_device_padding() is neither needed nor usable here (it is
+                // a hipMemset and the destination is a Vulkan sentinel pointer).
+                vk_events[k] = transport_.stage_in_async(
+                    vram, src, m.size, pool_.slot_size(mm.slot));
+                if (vk_events[k] < 0) {
+                    jobs[k].ok  = false;
+                    host_hit[k] = false;
+                }
+            }
+
+            bool vk_all_ok = true;
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (vk_events[k] < 0) { continue; }
+                if (!transport_.synchronize(vk_events[k])) {
+                    vk_all_ok   = false;
+                    jobs[k].ok  = false;
+                    host_hit[k] = false;
+                }
+                transport_.release_event(vk_events[k]);
+            }
+            if (!vk_all_ok) {
+                LLAMA_LOG_WARN("wp::ensure_batch: vulkan stage fence failed; affected pages routed to sync fallback\n");
+            }
+
+            // Commit. Same bookkeeping as the HIP route, minus the padding
+            // memset. A page whose stage failed goes down page_in_sync_, which
+            // re-reads and re-checks residency.
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                const Miss     & mm = misses[k];
+                const PageMeta & m  = catalog_.at(mm.page);
+                void * vram = slot_ptr_(mm.slot);
+                if (vram != nullptr && vk_events[k] >= 0 && (host_hit[k] || jobs[k].ok)) {
+                    page_to_slot_[mm.page] = mm.slot;
+                    page_loaded_[mm.page]  = true;
+                    slot_to_page_[mm.slot] = mm.page;
+                    pool_.mark_used(mm.slot);
+                    ++batch_ok_n;
+                    out_ptrs[mm.out_i] = vram;
+                    if (host_hit[k]) {
+                        ++stats_.host_tier_hits;
+                        ++stats_.ensure_batch_host_hits;
+                        ++stats_.ensure_batch_host_promotion_count;
+                        if (host_hit_zerocopy[k]) {
+                            ++stats_.ensure_batch_host_zerocopy_promotions;
+                        }
+                        if (host_tier_) { host_tier_->erase(mm.page); }
+                    } else {
+                        batch_bytes += m.size;
+                        ++stats_.ensure_batch_host_fresh_count;
+                    }
+                    if (mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {
+                        host_prefetch_strikes_[(size_t) mm.page] = 0;
+                    }
+                } else {
+                    const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                    out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+                }
+            }
+            static int s_vk_host_path_log = 0;
+            if (s_vk_host_path_log < 1) {
+                LLAMA_LOG_WARN("wp::ensure_batch: HOST path (vulkan) O_DIRECT=%d/%d misses, host_tier_hits=%d first batch\n",
+                               n_od, (int) misses.size(), n_host_hit);
+                ++s_vk_host_path_log;
+            }
+        }
+#endif
+
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        if (!vk_h2d_handled) {
         // Queue all H2Ds then one device sync (overlap PCIe copies).
         //
         // MAD-P4 follow-up: promotion (HostTier RAM->VRAM) copies are
@@ -2807,13 +2979,17 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                            n_od, (int) misses.size(), n_host_hit);
             ++s_host_path_log;
         }
+        }   // end if (!vk_h2d_handled)
 #else
         (void) n_od;
-        for (std::size_t k = 0; k < misses.size(); ++k) {
-            const int s = page_in_sync_(misses[k].page, /*reuse_slot=*/misses[k].slot);
-            out_ptrs[misses[k].out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+        if (!vk_h2d_handled) {
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                const int s = page_in_sync_(misses[k].page, /*reuse_slot=*/misses[k].slot);
+                out_ptrs[misses[k].out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+            }
         }
 #endif
+        (void) vk_h2d_handled;
         const double batch_seconds = seconds_since(io_t0);
         if (batch_ok_n > 0) {
             stats_.page_ins  += (uint64_t) batch_ok_n;

@@ -85,8 +85,22 @@ public:
     // handle is invalid; subsequent query/synchronize calls return false.
     void release_event(int event_handle);
 
+    // Host staging memory registered with this transport's device, so stage_in
+    // can copy straight from it instead of routing through the backend's shared
+    // staging buffer. Returns null when the backend has no such concept (HIP and
+    // CUDA callers keep using hipHostMalloc) or on failure; the caller is then
+    // expected to fall back to its own allocation.
+    void * host_alloc(size_t size);
+    void   host_free(void * ptr);
+
     // Inspect transport state.
     bool is_initialized() const { return initialized_; }
+    // True when this transport stages into a Vulkan pool buffer via the
+    // ggml_backend_vk_wp_* bridge rather than through hip*/cuda* calls. Callers
+    // that would otherwise reach for a raw device copy MUST check this: a Vulkan
+    // pool "pointer" is the backend's sentinel base plus an offset, not an
+    // address a hipMemcpy can write to.
+    bool is_vulkan()      const { return is_vulkan_; }
     int  device_idx()     const { return device_idx_; }
     int  n_events()       const { return (int) events_.size(); }
     int  n_free_events()  const { return (int) free_events_.size(); }
