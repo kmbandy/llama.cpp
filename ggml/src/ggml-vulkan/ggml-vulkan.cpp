@@ -858,6 +858,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    vk_pipeline pipeline_sinkhorn_norm_f32[3];
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];
@@ -1576,6 +1577,15 @@ struct vk_op_soft_max_push_constants {
     uint32_t n_head_log2;
     uint32_t nrows_x;
     uint32_t has_sinks;
+};
+
+struct vk_op_sinkhorn_norm_push_constants {
+    uint32_t n;
+    uint32_t nt;
+    float eps;
+    int32_t iters;
+    uint32_t a_offset;
+    uint32_t d_offset;
 };
 
 struct vk_op_argsort_push_constants {
@@ -5191,6 +5201,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sinkhorn_norm_f32[0], "sinkhorn_norm_f32_n2", sinkhorn_norm_f32_n2_len, sinkhorn_norm_f32_n2_data, "main", 2, sizeof(vk_op_sinkhorn_norm_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sinkhorn_norm_f32[1], "sinkhorn_norm_f32_n4", sinkhorn_norm_f32_n4_len, sinkhorn_norm_f32_n4_data, "main", 2, sizeof(vk_op_sinkhorn_norm_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_sinkhorn_norm_f32[2], "sinkhorn_norm_f32_n8", sinkhorn_norm_f32_n8_len, sinkhorn_norm_f32_n8_data, "main", 2, sizeof(vk_op_sinkhorn_norm_push_constants), {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -11087,6 +11100,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_l2_norm_f32;
         }
         return nullptr;
+    case GGML_OP_SINKHORN_NORM:
+        if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+            return nullptr;
+        }
+        switch (src0->ne[0]) {
+        case 2: return ctx->device->pipeline_sinkhorn_norm_f32[0];
+        case 4: return ctx->device->pipeline_sinkhorn_norm_f32[1];
+        case 8: return ctx->device->pipeline_sinkhorn_norm_f32[2];
+        default: return nullptr;
+        }
     case GGML_OP_UNARY:
         if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
             (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) ||
@@ -11561,6 +11584,15 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src3);
 }
 
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_sinkhorn_norm_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src1);
+    GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_glu_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     const uint32_t b_offset = src1 ? get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type) : a_offset;
@@ -11717,6 +11749,21 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements = { 512, CEIL_DIV(nr, 512), 1 };
             } else {
                 elements = { nr, 1, 1 };
+            }
+        } break;
+    case GGML_OP_SINKHORN_NORM:
+        {
+            // One invocation per TOKEN, not per row: the shader holds the whole
+            // n*n matrix for a token in registers. ggml_nrows() here would be
+            // n*nt and dispatch n x more invocations than exist tokens, all of
+            // which return immediately on the t >= nt guard.
+            const uint32_t nt = (uint32_t)(ne02 * ne03);
+            if (nt > 262144) {
+                elements = { 512, 512, CEIL_DIV(nt, 262144) };
+            } else if (nt > 512) {
+                elements = { 512, CEIL_DIV(nt, 512), 1 };
+            } else {
+                elements = { nt, 1, 1 };
             }
         } break;
     case GGML_OP_SOLVE_TRI:
@@ -12967,6 +13014,30 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
     p.param1 = op_params[0];
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
+}
+
+static void ggml_vk_sinkhorn_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    const int32_t iters = ggml_get_op_params_i32(dst, 1);
+    const int64_t n = src0->ne[0];
+
+    GGML_ASSERT(eps >= 0.0f);
+    GGML_ASSERT(iters >= 1);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(n == src0->ne[1]);
+    GGML_ASSERT(n == 2 || n == 4 || n == 8);
+
+    ggml_vk_op_f32<vk_op_sinkhorn_norm_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SINKHORN_NORM, {
+        (uint32_t) n,
+        (uint32_t) (src0->ne[2] * src0->ne[3]),
+        eps,
+        iters,
+        0,
+        0,
+    });
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -15097,6 +15168,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_L2_NORM:
         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
+
+        break;
+    case GGML_OP_SINKHORN_NORM:
+        ggml_vk_sinkhorn_norm(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_UNARY:
@@ -17869,6 +17944,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_SINKHORN_NORM:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op->src[0], op) &&
+                   op->src[0]->ne[0] == op->src[0]->ne[1] &&
+                   (op->src[0]->ne[0] == 2 || op->src[0]->ne[0] == 4 || op->src[0]->ne[0] == 8);
         case GGML_OP_TURBO_WHT:
             {
                 if (!op->src[0] || op->src[0]->type != GGML_TYPE_F32) return false;
@@ -18738,6 +18821,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_L2_NORM) {
             const float eps = ((float *) tensor->op_params)[0];
             tensor_clone = ggml_l2_norm(ggml_ctx, src_clone[0], eps);
+        } else if (tensor->op == GGML_OP_SINKHORN_NORM) {
+            const float eps = ((float *) tensor->op_params)[0];
+            const int32_t iters = ggml_get_op_params_i32(tensor, 1);
+            tensor_clone = ggml_sinkhorn_norm(ggml_ctx, src_clone[0], eps, iters);
         } else if (tensor->op == GGML_OP_SOFT_MAX) {
             if (tensor->src[1] != nullptr) {
                 const float * params = (const float *)tensor->op_params;

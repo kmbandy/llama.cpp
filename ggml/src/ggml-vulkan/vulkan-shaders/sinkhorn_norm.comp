@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#ifndef N
+#error "N must be defined"
+#endif
+
+// 64 = the RDNA/GCN wave width; two full warps on NVIDIA. Must stay equal to
+// the pipeline's wg_denoms[0] in ggml-vulkan.cpp.
+#define BLOCK_SIZE 64
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n;
+    uint nt;
+    float eps;
+    int iters;
+    uint a_offset;
+    uint d_offset;
+} p;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer D { float data_d[]; };
+
+void main() {
+    // The dispatch is decomposed across x/y/z once the token count exceeds 512
+    // (see the GGML_OP_SINKHORN_NORM case in ggml_vk_op_f32), so the token index
+    // must be reconstructed from all three -- reading only GlobalInvocationID.x
+    // silently drops every token past 512 and recomputes the earlier ones.
+    const uint t = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_GlobalInvocationID.x;
+    if (t >= p.nt) {
+        return;
+    }
+
+    const uint a_base = p.a_offset + t*N*N;
+    const uint d_base = p.d_offset + t*N*N;
+
+    float m[N*N];
+
+    [[unroll]] for (uint j = 0; j < N; ++j) {
+        float mx = -1.0/0.0;
+        [[unroll]] for (uint i = 0; i < N; ++i) {
+            mx = max(mx, data_a[a_base + j*N + i]);
+        }
+        float s = 0.0;
+        [[unroll]] for (uint i = 0; i < N; ++i) {
+            const float e = exp(data_a[a_base + j*N + i] - mx);
+            m[j*N + i] = e;
+            s += e;
+        }
+        [[unroll]] for (uint i = 0; i < N; ++i) {
+            m[j*N + i] /= s;
+        }
+    }
+
+    [[unroll]] for (uint k = 0; k < N*N; ++k) {
+        m[k] += p.eps;
+    }
+
+    [[unroll]] for (uint i = 0; i < N; ++i) {
+        float s = 0.0;
+        [[unroll]] for (uint j = 0; j < N; ++j) {
+            s += m[j*N + i];
+        }
+        s += p.eps;
+        [[unroll]] for (uint j = 0; j < N; ++j) {
+            m[j*N + i] /= s;
+        }
+    }
+
+    for (int it = 1; it < p.iters; ++it) {
+        [[unroll]] for (uint j = 0; j < N; ++j) {
+            float s = 0.0;
+            [[unroll]] for (uint i = 0; i < N; ++i) {
+                s += m[j*N + i];
+            }
+            s += p.eps;
+            [[unroll]] for (uint i = 0; i < N; ++i) {
+                m[j*N + i] /= s;
+            }
+        }
+        [[unroll]] for (uint i = 0; i < N; ++i) {
+            float s = 0.0;
+            [[unroll]] for (uint j = 0; j < N; ++j) {
+                s += m[j*N + i];
+            }
+            s += p.eps;
+            [[unroll]] for (uint j = 0; j < N; ++j) {
+                m[j*N + i] /= s;
+            }
+        }
+    }
+
+    [[unroll]] for (uint k = 0; k < N*N; ++k) {
+        data_d[d_base + k] = m[k];
+    }
+}

@@ -8422,6 +8422,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 4, 4, 32, 1 }, 1e-6f, 1));
             test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 2, 2, 16, 1 }, 1e-6f, 5));
             test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 8, 8, 16, 1 }, 1e-6f, 20));
+            // nt > 512 crosses the point where a backend may decompose the
+            // dispatch across more than one grid dimension. Every case above is
+            // small enough to hide an index reconstructed from only one of them.
+            test_cases.emplace_back(new test_sinkhorn_norm(GGML_TYPE_F32, { 4, 4, 1024, 1 }, 1e-6f, 20));
         }
     }
 
