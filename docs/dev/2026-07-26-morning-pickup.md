@@ -6,6 +6,62 @@ anything; the Vulkan section in particular records five things that are already
 
 ---
 
+## 0. RESOLVED 2026-07-26 — read this before §4
+
+**Vulkan weight paging works.** Fixed in `93c8008f4`. wikitext PPL over 6 chunks
+at `c=512`: **26.4196 ± 2.38258 paged vs 26.4172 ± 2.38248 resident** (0.009%),
+12384 page-ins confirming paging was active. `MUL_MAT_ID` passes on all four
+backends.
+
+**§4.3 named the wrong suspect.** The cause was not slot lifetime. It was that
+`ggml_vk_mul_mat_id` forks on `ggml_vk_use_mul_mat_vec_id` (`src2->ne[1] <= 8`)
+and only the **vec** path had paged addressing. The repro prompt becomes **10
+tokens** once llama-cli's chat template is applied, so the whole **prefill** ran
+`mul_mm.comp` with uniform-stride expert addressing against a `src0->data` that
+points at one pool slot. Prefill produced garbage, poisoned the KV cache, and
+decode emitted `6666…` forever *even though the decode path was already correct*.
+`mul_mm.comp:250` was listed in §4.3 as a separate nice-to-have for long
+prefills; it was in fact the whole bug.
+
+One-line proof, available at any point yesterday: `-p "Hi"` stays under 8 tokens,
+takes zero mm dispatches, and gave fully coherent output from the same binary and
+the same 150-slot pool.
+
+**Two corrections to §4.3's evidence table:**
+
+1. *Slot lifetime is dead as a hypothesis.* `ggml-backend.cpp:1849` does an
+   **unconditional** `ggml_backend_synchronize(split_backend)` after every
+   eval_cb range, so a recorded Vulkan dispatch cannot outlive its range.
+   `GGML_VK_WP_HASHCHK=1` (new) checked 2208 offsets at dispatch-record time
+   under maximum recycling pressure: 0 mismatched, 0 untracked. Also note
+   `wp-eval-cb.cpp`'s pin machinery is inside
+   `#if GGML_USE_HIP || GGML_USE_CUDA` **and `build-army` compiles that file with
+   `-DGGML_USE_CUDA`**, so pins and the reactive auto-break are live on Vulkan
+   runs (`lru_walk_pinned_skips: 40624`). The `#else` branch is dead code here.
+
+2. *The "shader / SSBO / flag" row was vacuous as written.* "`WP_FORCE=1` on a
+   non-paged model → coherent output" would hold **equally well if `p.paged`
+   never arrived**, because the shader would fall back to stock addressing, which
+   is correct for a non-paged model. A passing result that a broken system also
+   produces proves nothing. What does prove it is FORCE *plus* an offset
+   perturbation, or reading the SPIR-V directly (bindings 0–6 present,
+   push-constant member offsets 0…48 step 4).
+
+**A trap worth not repeating.** Perturbation knobs that collapse or rotate the
+published offsets look like sensitivity tests but are near no-ops on the paged
+path: inactive experts already share the `first_active_slot` fallback and the
+active experts keep their own correct offsets. "No change" then invites the false
+conclusion that the shader ignores the pool — which I briefly drew. Every check
+keyed on *offsets* is blind to expert **identity**; `GGML_VK_WP_IDCHK` and
+`GGML_VK_WP_EXPDUMP` test identity instead, and the per-expert dump is what
+localised this (8 experts matching, 24 sharing one fallback value).
+
+Still open: the coopmat2 and MMQ id variants get the extra binding but their
+shaders do not read it, so paged prefill on a device that selects those needs the
+same seam. Polaris selects neither.
+
+---
+
 ## 1. TL;DR
 
 Three things shipped and are verified. One is half-built with a precisely
