@@ -1166,6 +1166,10 @@ struct vk_mat_vec_id_push_constants {
     uint32_t ne11;
     uint32_t expert_i1;
     uint32_t nbi1;
+    // Weight paging. paged=0 keeps the stock uniform-stride addressing, so the
+    // non-paged path is bit-identical. paged=1 means binding 0 is the pager's
+    // pool and binding 6 holds each expert's block offset within it.
+    uint32_t paged;
 };
 
 struct vk_flash_attn_push_constants {
@@ -2181,6 +2185,11 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // Per-expert block offsets for weight paging. One slice per mul_mat_id node
+    // because dispatches execute after recording; cursor resets each graph.
+    vk_buffer              prealloc_wp_expert_off;
+    size_t                 wp_expert_off_cursor = 0;
+    std::vector<vk_buffer> wp_expert_off_retired;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -4932,7 +4941,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
     const uint32_t force_subgroup_size16 = use_subgroups16 ? subgroup_size16 : 0;
     static constexpr uint32_t mul_mat_vec_num_bindings = 5;
-    static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
+    // 6 stock + 1 for the weight-paging per-expert offset array (binding 6).
+    static constexpr uint32_t mul_mat_vec_id_num_bindings = 7;
 
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
@@ -8310,6 +8320,148 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     ggml_vk_queue_command_pools_cleanup(dst->device);
 }
 
+struct ggml_vk_wp_event {
+    vk_device device;
+    vk_context context;
+    vk::Fence fence;
+};
+
+bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
+                                 void * dst, const void * src,
+                                 size_t payload_size, size_t slot_size,
+                                 void ** event) {
+    if (buffer == nullptr || dst == nullptr || src == nullptr || event == nullptr || payload_size > slot_size) {
+        return false;
+    }
+
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return false;
+    }
+
+    vk_buffer dst_buffer = buffer_ctx->dev_buffer;
+    const size_t offset = (uintptr_t) dst - (uintptr_t) vk_ptr_base;
+    if (offset > dst_buffer->size || slot_size > dst_buffer->size - offset) {
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(dst_buffer->device->mutex);
+    vk_context context = ggml_vk_create_temporary_context(dst_buffer->device->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(dst_buffer->device, context);
+    if (!ggml_vk_buffer_write_async(context, dst_buffer, offset, src, payload_size, true)) {
+        return false;
+    }
+    if (slot_size > payload_size) {
+        ggml_vk_buffer_memset_async(context, dst_buffer, offset + payload_size, 0, slot_size - payload_size);
+    }
+    ggml_vk_ctx_end(context);
+
+    for (auto & copy : context->in_memcpys) {
+        memcpy(copy.dst, copy.src, copy.n);
+    }
+    for (auto & memset : context->memsets) {
+        ::memset(memset.dst, memset.val, memset.n);
+    }
+
+    auto * wp_event = new ggml_vk_wp_event{
+        dst_buffer->device,
+        context,
+        dst_buffer->device->device.createFence({}),
+    };
+    ggml_vk_submit(context, wp_event->fence);
+
+    // GGML_VK_WP_VERIFY=1: read the slot straight back and compare with the
+    // source. Answers "did the bytes actually land" without inference in the
+    // way. Debug only -- it stalls the queue on every page.
+    static const bool wp_verify = getenv("GGML_VK_WP_VERIFY") != nullptr;
+    if (wp_verify) {
+        (void) ggml_backend_vk_wp_event_wait(wp_event);
+        static int checked = 0, bad = 0;
+        const size_t n = std::min<size_t>(payload_size, 4096);
+        std::vector<uint8_t> back(n);
+        ggml_vk_buffer_read(dst_buffer, offset, back.data(), n);
+        if (memcmp(back.data(), src, n) != 0) {
+            if (bad < 4) {
+                size_t i = 0;
+                while (i < n && back[i] == ((const uint8_t *) src)[i]) { ++i; }
+                fprintf(stderr, "[vk-wp-verify] MISMATCH at slot offset %zu, first bad byte %zu: "
+                                "got 0x%02x want 0x%02x (payload %zu)\n",
+                        offset, i, back[i], ((const uint8_t *) src)[i], payload_size);
+            }
+            ++bad;
+        }
+        if (++checked % 500 == 0) {
+            fprintf(stderr, "[vk-wp-verify] %d pages checked, %d mismatched\n", checked, bad);
+        }
+    }
+
+    *event = wp_event;
+    return true;
+}
+
+// Weight-paging consumption bridge. Mirrors the CUDA backend's
+// ggml_cuda_set_routed_expert_ptrs: the pager publishes where the active
+// experts actually live, and the very next mul_mat_id dispatch consumes it.
+// Thread-local for the same reason CUDA's is — eval runs on the compute thread
+// and a publication must not leak across threads.
+struct vk_wp_expert_offsets {
+    ggml_backend_buffer_t pool_buffer = nullptr;
+    std::vector<uint32_t> offsets;
+    bool                  valid       = false;
+};
+static thread_local vk_wp_expert_offsets tls_wp_expert_offsets;
+
+void ggml_backend_vk_wp_set_expert_offsets(ggml_backend_buffer_t pool_buffer,
+                                           const uint32_t * block_offsets,
+                                           int n_experts) {
+    if (pool_buffer == nullptr || block_offsets == nullptr || n_experts <= 0) {
+        tls_wp_expert_offsets.valid = false;
+        return;
+    }
+    tls_wp_expert_offsets.pool_buffer = pool_buffer;
+    tls_wp_expert_offsets.offsets.assign(block_offsets, block_offsets + n_experts);
+    tls_wp_expert_offsets.valid = true;
+}
+
+// Take-and-clear, so a publication can never be applied to two nodes.
+static bool ggml_vk_wp_take_expert_offsets(vk_wp_expert_offsets & out) {
+    if (!tls_wp_expert_offsets.valid) {
+        return false;
+    }
+    out = tls_wp_expert_offsets;
+    tls_wp_expert_offsets.valid = false;
+    return true;
+}
+
+bool ggml_backend_vk_wp_event_query(void * event) {
+    auto * wp_event = (ggml_vk_wp_event *) event;
+    if (wp_event == nullptr) {
+        return false;
+    }
+    return wp_event->device->device.getFenceStatus(wp_event->fence) == vk::Result::eSuccess;
+}
+
+bool ggml_backend_vk_wp_event_wait(void * event) {
+    auto * wp_event = (ggml_vk_wp_event *) event;
+    if (wp_event == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> guard(wp_event->device->mutex);
+    VK_CHECK(wp_event->device->device.waitForFences({ wp_event->fence }, true, UINT64_MAX), "wp stage_in waitForFences");
+    ggml_vk_queue_command_pools_cleanup(wp_event->device);
+    return true;
+}
+
+void ggml_backend_vk_wp_event_free(void * event) {
+    auto * wp_event = (ggml_vk_wp_event *) event;
+    if (wp_event == nullptr) {
+        return;
+    }
+    ggml_backend_vk_wp_event_wait(wp_event);
+    wp_event->device->device.destroyFence(wp_event->fence);
+    delete wp_event;
+}
+
 static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
@@ -10240,13 +10392,95 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
+    // Weight paging: if the pager published offsets for this node, the experts
+    // live at arbitrary slots in its pool rather than at a uniform stride in
+    // src0, so bind the pool and hand the shader the per-slot offsets. Only
+    // applies when the active-expert count fits the push constants; otherwise
+    // fall through to stock addressing, which for a paged model is wrong but
+    // visibly so rather than silently.
+    vk_wp_expert_offsets wp_off;
+    bool wp_paged = ggml_vk_wp_take_expert_offsets(wp_off);
+    // GGML_VK_WP_FORCE=1: exercise the paged shader path on a NON-paged model,
+    // publishing offsets that reproduce the stock stride and leaving data_a on
+    // src0. Correct output here proves the flag/SSBO/shader plumbing; garbage
+    // proves the plumbing itself is broken, independent of the pager.
+    if (getenv("GGML_VK_WP_TRACE") != nullptr) {
+        static int n = 0;
+        if (n < 8) {
+            ++n;
+            fprintf(stderr, "[vk-wp-trace] dispatch src0=%-28s paged=%d off0=%u\n",
+                    ggml_get_name(src0), (int) wp_paged,
+                    wp_off.offsets.empty() ? 0u : wp_off.offsets[0]);
+        }
+    }
+    static const bool wp_force = getenv("GGML_VK_WP_FORCE") != nullptr;
+    if (wp_force && !wp_paged) {
+        const uint32_t blocks_per_expert =
+            (uint32_t) ((ne00 * ne01) / ggml_blck_size(src0->type));
+        wp_off.offsets.resize((size_t) src0->ne[2]);
+        for (size_t e = 0; e < wp_off.offsets.size(); ++e) {
+            wp_off.offsets[e] = (uint32_t) e * blocks_per_expert;
+        }
+        wp_off.pool_buffer = nullptr;
+        wp_paged = true;
+    }
+    vk_subbuffer d_WP = d_ids;   // dummy binding when not paged
+    // GGML_VK_WP_STOCKOFF=1: keep the paged plumbing (flag + SSBO) but publish
+    // offsets that reproduce the stock uniform stride and leave data_a on src0.
+    // Isolates "is the SSBO/flag/shader path correct" from "are the pool
+    // offsets/binding correct" -- the two halves fail identically otherwise.
+    static const bool wp_stockoff = getenv("GGML_VK_WP_STOCKOFF") != nullptr;
+    if (wp_paged && wp_stockoff) {
+        const uint32_t blocks_per_expert =
+            (uint32_t) ((ne00 * ne01) / ggml_blck_size(src0->type));
+        for (size_t e = 0; e < wp_off.offsets.size(); ++e) {
+            wp_off.offsets[e] = (uint32_t) e * blocks_per_expert;
+        }
+    }
+    if (wp_paged && !wp_stockoff && wp_off.pool_buffer != nullptr) {
+        auto * pool_ctx = (ggml_backend_vk_buffer_context *) wp_off.pool_buffer->context;
+        d_X = vk_subbuffer{ pool_ctx->dev_buffer, 0, pool_ctx->dev_buffer->size };
+    }
+    if (wp_paged) {
+
+        // Each node gets its OWN slice. The dispatches recorded here do not run
+        // until the graph's command buffer is submitted, so a single shared
+        // region written eagerly per node would leave every dispatch reading the
+        // LAST node's offsets. (CUDA sidesteps this because its pointer upload is
+        // a stream-ordered async memcpy interleaved with the kernels.)
+        const size_t nbytes = wp_off.offsets.size() * sizeof(uint32_t);
+        const size_t align  = std::max<size_t>(
+            ctx->device->properties.limits.minStorageBufferOffsetAlignment, 4);
+        const size_t stride = (nbytes + align - 1) / align * align;
+
+        if (ctx->prealloc_wp_expert_off == nullptr ||
+            ctx->prealloc_wp_expert_off->size < ctx->wp_expert_off_cursor + stride) {
+            const size_t grow = std::max<size_t>(
+                ctx->wp_expert_off_cursor + stride * 64, 64 * 1024);
+            vk_buffer old = ctx->prealloc_wp_expert_off;
+            ctx->prealloc_wp_expert_off = ggml_vk_create_buffer_device(ctx->device, grow);
+            if (old != nullptr) {
+                // Anything already recorded still points into `old`; keep it
+                // alive until the graph completes rather than freeing here.
+                ctx->wp_expert_off_retired.push_back(old);
+            }
+            ctx->wp_expert_off_cursor = 0;
+        }
+
+        const size_t slice = ctx->wp_expert_off_cursor;
+        ggml_vk_buffer_write(ctx->prealloc_wp_expert_off, slice, wp_off.offsets.data(), nbytes);
+        ctx->wp_expert_off_cursor += stride;
+        d_WP = vk_subbuffer{ ctx->prealloc_wp_expert_off, slice, nbytes };
+    }
+
     // Loop over the batch dimension
     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
         const vk_mat_vec_id_push_constants pc = {
             (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
             fusion_flags,
-            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1
+            (uint32_t)nei0, (uint32_t)ne11, expert_i1, nbi1,
+            wp_paged ? 1u : 0u
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
             {
@@ -10256,6 +10490,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
                 d_F0,
                 d_F1,
                 d_ids,
+                d_WP,
             },
             pc, { groups_x, (uint32_t)nei0, groups_z });
     }
@@ -16653,6 +16888,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
+
+    // Weight paging: every mul_mat_id node in this graph takes its own slice of
+    // the expert-offset buffer, so the cursor restarts per graph. Buffers
+    // retired by a mid-graph grow are only safe to free once the previous
+    // graph has completed, which it has by the time we get here.
+    ctx->wp_expert_off_cursor = 0;
+    for (auto & b : ctx->wp_expert_off_retired) {
+        ggml_vk_destroy_buffer(b);
+    }
+    ctx->wp_expert_off_retired.clear();
     ctx->do_add_rms_partials_offset_calculation = false;
 
     int last_node = cgraph->n_nodes - 1;

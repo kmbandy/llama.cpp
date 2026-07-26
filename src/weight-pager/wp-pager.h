@@ -549,6 +549,9 @@ public:
     // Backing buffer for the pool — used by the eval-cb adapter when
     // patching tensor->buffer (B-P4 requires a valid ggml backend buffer).
     ggml_backend_buffer_t pool_buf() const { return pool_.vram_buf(); }
+    // Base of the slot pool. On Vulkan this is the backend's fixed pointer
+    // sentinel, so slot_ptr() - pool_base() is the true buffer offset.
+    void *                pool_base() const { return pool_.pool_base(); }
     ggml_backend_buffer_t pool_buf(int page_idx) const;
 
     // Slot-and-page metadata (read-only public view).

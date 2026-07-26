@@ -1031,7 +1031,7 @@ bool WeightPager::init(const Config &             cfg,
     const int n_transport_events = async_ensure_enabled_
         ? cfg_.prefetch_depth * 2 + 8
         : cfg_.prefetch_depth + 2;
-    if (!transport_.init(device_idx, n_transport_events, async_ensure_enabled_)) {
+    if (!transport_.init(device_idx, n_transport_events, async_ensure_enabled_, pool_.vram_buf())) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: gpu transport init failed\n");
         pool_.~PoolAllocator();   // explicit teardown via dtor (RAII'd)
         new (&pool_) PoolAllocator{};

@@ -31,6 +31,10 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint expert_i1;
     uint nbi1;
+    // Weight paging: paged=0 keeps stock addressing. paged=1 means binding 0 is
+    // the pager's pool and data_wp_expert_off[expert_id] is that expert's block
+    // offset within it. See ggml_backend_vk_wp_set_expert_offsets.
+    uint paged;
 #else
     uint base_work_group_y;
     uint ne02;
@@ -68,7 +72,12 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 
     a_offset =
 #ifdef MUL_MAT_ID
-            expert_id * (p.batch_stride_a / QUANT_K);
+            // Under weight paging an expert is at an arbitrary pool slot, so the
+            // uniform stride does not describe where its weights are. Indexed by
+            // expert_id, not by active slot, so one publication serves every
+            // token in the batch — different tokens route to different experts.
+            (p.paged != 0) ? data_wp_expert_off[expert_id]
+                           : expert_id * (p.batch_stride_a / QUANT_K);
 #else
             batch_idx_a * (p.batch_stride_a / QUANT_K);
 #endif

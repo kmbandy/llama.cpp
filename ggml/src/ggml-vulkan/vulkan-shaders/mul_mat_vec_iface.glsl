@@ -31,5 +31,9 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
+// Weight paging: block offset of each expert inside the pager's pool, indexed
+// by expert id exactly like the CUDA backend's routed-expert pointer array.
+// Only read when p.paged != 0; bound to a dummy buffer otherwise.
+layout (binding = 6) readonly buffer WPOFF {uint data_wp_expert_off[];};
 #endif
 

@@ -3,7 +3,27 @@
 #include "llama-impl.h"  // LLAMA_LOG_*
 #include "wp-gpu-runtime.h"
 
+#include "ggml-backend.h"
+
+#if defined(GGML_USE_VULKAN)
+#include "ggml-vulkan.h"
+#endif
+
+#include <cstring>
+
 namespace wp {
+
+#if defined(GGML_USE_VULKAN)
+static bool is_vulkan_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+    return name != nullptr && std::strncmp(name, GGML_VK_NAME, std::strlen(GGML_VK_NAME)) == 0;
+}
+#endif
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 
@@ -13,7 +33,7 @@ GpuTransport::~GpuTransport() {
     shutdown();
 }
 
-bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream) {
+bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream, ggml_backend_buffer_t buffer) {
     if (initialized_) {
         LLAMA_LOG_WARN("wp::GpuTransport: init called twice — ignoring\n");
         return false;
@@ -22,6 +42,23 @@ bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream
         LLAMA_LOG_WARN("wp::GpuTransport::init: n_events must be > 0 (got %d)\n", n_events);
         return false;
     }
+
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_buffer(buffer)) {
+        events_.assign(n_events, nullptr);
+        free_events_.reserve(n_events);
+        for (int i = 0; i < n_events; ++i) {
+            free_events_.push_back(i);
+        }
+        buffer_ = buffer;
+        device_idx_ = device_idx;
+        initialized_ = true;
+        is_vulkan_ = true;
+        LLAMA_LOG_INFO("wp::GpuTransport: Vulkan device %d, fence-before-return + %d events ready\n",
+                       device_idx, n_events);
+        return true;
+    }
+#endif
 
     int prev_device = 0;
     hipGetDevice(&prev_device);
@@ -92,6 +129,21 @@ bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream
 void GpuTransport::shutdown() {
     if (!initialized_) return;
 
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        for (void * event : events_) {
+            ggml_backend_vk_wp_event_free(event);
+        }
+        events_.clear();
+        free_events_.clear();
+        buffer_ = nullptr;
+        initialized_ = false;
+        is_vulkan_ = false;
+        device_idx_ = -1;
+        return;
+    }
+#endif
+
     int prev_device = 0;
     hipGetDevice(&prev_device);
     hipSetDevice(device_idx_);
@@ -119,6 +171,12 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
                            size_t payload_size, size_t slot_size) {
     int evt_idx = stage_in_async(dst, src_pinned, payload_size, slot_size);
     if (evt_idx < 0) return -1;
+
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return synchronize(evt_idx) ? evt_idx : -1;
+    }
+#endif
 
     int prev_device = 0;
     hipError_t device_err = hipGetDevice(&prev_device);
@@ -160,6 +218,22 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
         LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: event pool exhausted (queue depth too small?)\n");
         return -1;
     }
+
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        const int evt_idx = free_events_.back();
+        free_events_.pop_back();
+        void * event = nullptr;
+        if (!ggml_backend_vk_wp_stage_in(buffer_, dst, src_pinned, payload_size, slot_size, &event) ||
+            !ggml_backend_vk_wp_event_wait(event)) {
+            ggml_backend_vk_wp_event_free(event);
+            free_events_.push_back(evt_idx);
+            return -1;
+        }
+        events_[evt_idx] = event;
+        return evt_idx;
+    }
+#endif
 
     int prev_device = 0;
     hipError_t device_err = hipGetDevice(&prev_device);
@@ -233,6 +307,11 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
 }
 
 bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return false;
+    }
+#endif
     if (!initialized_ || stream == nullptr) return false;
     if (event_handle < 0 || event_handle >= (int) events_.size()) return false;
     hipEvent_t ev = (hipEvent_t) events_[event_handle];
@@ -254,6 +333,12 @@ bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
 }
 
 bool GpuTransport::query(int event_handle) const {
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return event_handle >= 0 && event_handle < (int) events_.size() &&
+               events_[event_handle] != nullptr && ggml_backend_vk_wp_event_query(events_[event_handle]);
+    }
+#endif
     if (!initialized_ || event_handle < 0 || event_handle >= (int) events_.size()) return false;
     hipEvent_t ev = (hipEvent_t) events_[event_handle];
     if (ev == nullptr) return false;
@@ -268,6 +353,12 @@ bool GpuTransport::query(int event_handle) const {
 }
 
 bool GpuTransport::synchronize(int event_handle) {
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return event_handle >= 0 && event_handle < (int) events_.size() &&
+               events_[event_handle] != nullptr && ggml_backend_vk_wp_event_wait(events_[event_handle]);
+    }
+#endif
     if (!initialized_ || event_handle < 0 || event_handle >= (int) events_.size()) return false;
     hipEvent_t ev = (hipEvent_t) events_[event_handle];
     if (ev == nullptr) return false;
@@ -284,6 +375,15 @@ bool GpuTransport::synchronize(int event_handle) {
 
 void GpuTransport::release_event(int event_handle) {
     if (!initialized_ || event_handle < 0 || event_handle >= (int) events_.size()) return;
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        if (events_[event_handle] == nullptr) return;
+        ggml_backend_vk_wp_event_free(events_[event_handle]);
+        events_[event_handle] = nullptr;
+        free_events_.push_back(event_handle);
+        return;
+    }
+#endif
     // Guard against double-free.
     for (int idx : free_events_) {
         if (idx == event_handle) return;

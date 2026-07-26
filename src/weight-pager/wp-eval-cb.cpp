@@ -5,6 +5,9 @@
 #include "ggml.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
 #include "wp-gpu-runtime.h"
+#if defined(GGML_USE_VULKAN)
+#include "ggml-vulkan.h"   // ggml_backend_vk_wp_set_expert_offsets
+#endif
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 // Forward decl of the ggml-cuda side channel — the actual symbol lives in
@@ -335,11 +338,10 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!ask)             return true;
 
     // --- Cross-layer prefetch (WP_PREFETCH_XLAYER), gated OFF by default -----
-    // HIP-only: weight paging is an RDNA/HIP feature (R9700, 6900xt) and this
-    // block uses the HIP-gated side channel (current_hip_device /
-    // ggml_cuda_get_wp_compute_stream, declared only under GGML_USE_HIP) plus
-    // raw hip* device copies. Non-HIP builds (CUDA sm_61 / Vulkan on the 1070
-    // and 480) don't page weights, so compile it out there.
+    // Guarded to HIP/CUDA because this block reaches for the hip*/cuda* side
+    // channel (current_hip_device / ggml_cuda_get_wp_compute_stream) and raw
+    // device copies, which only those backends declare. This is a limitation of
+    // the prefetch side channel, not of weight paging.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // At the ffn_gate_inp router MUL_MAT (start of each MoE block): src[0] is
     // the router weight (host-copied once per layer), src[1] is the residual
@@ -798,8 +800,26 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 const int64_t n_indices = ggml_nelements(idx_tensor);
                                 std::vector<int32_t> host_indices((size_t) n_indices, 0);
 
-                                hipError_t mc_err;
-                                if (wp_stream != nullptr) {
+                                // Vulkan tensors have no dereferenceable data
+                                // pointer, so the raw hip*/cuda* readback below
+                                // fails and would silently skip the whole routed
+                                // block. Use the backend-neutral accessor there.
+                                bool idx_read_ok = false;
+#if defined(GGML_USE_VULKAN)
+                                if (idx_tensor->buffer != nullptr) {
+                                    const char * bname =
+                                        ggml_backend_buffer_name(idx_tensor->buffer);
+                                    if (bname != nullptr && std::strstr(bname, "Vulkan") != nullptr) {
+                                        ggml_backend_tensor_get(idx_tensor, host_indices.data(), 0,
+                                                                (size_t) n_indices * sizeof(int32_t));
+                                        idx_read_ok = true;
+                                    }
+                                }
+#endif
+                                hipError_t mc_err = hipSuccess;
+                                if (idx_read_ok) {
+                                    // already have the indices
+                                } else if (wp_stream != nullptr) {
                                     mc_err = hipMemcpyAsync(host_indices.data(),
                                                             idx_tensor->data,
                                                             (size_t) n_indices * sizeof(int32_t),
@@ -1048,6 +1068,53 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             host_ptrs[i] = first_active_slot;
                                         }
                                     }
+
+#if defined(GGML_USE_VULKAN)
+                                    // Vulkan consumption path. Unlike HIP/CUDA we
+                                    // cannot hand the shader raw pointers: every slot
+                                    // lives in one VkBuffer and the quantized matmul
+                                    // indexes it as an array of quant blocks. So
+                                    // publish each expert's offset in BLOCKS. The
+                                    // pool's slot stride is padded to a multiple of
+                                    // the block size for exactly this reason (see
+                                    // PoolAllocator::init), so the division is exact
+                                    // -- assert rather than trust it, because a
+                                    // truncation here is silently wrong weights.
+                                    {
+                                        const size_t blk = ggml_type_size(t->src[0]->type);
+                                        const uintptr_t pool_base =
+                                            (uintptr_t) pager->pool_base();
+                                        std::vector<uint32_t> blk_off(host_ptrs.size(), 0);
+                                        bool ok = blk != 0;
+                                        for (size_t i = 0; ok && i < host_ptrs.size(); ++i) {
+                                            if (host_ptrs[i] == nullptr) { continue; }
+                                            const uintptr_t byte_off =
+                                                (uintptr_t) host_ptrs[i] - pool_base;
+                                            if (byte_off % blk != 0) {
+                                                LLAMA_LOG_ERROR("[wp::eval_cb] vulkan: expert %zu slot offset %zu "
+                                                                "is not a multiple of block size %zu\n",
+                                                                i, (size_t) byte_off, blk);
+                                                ok = false;
+                                                break;
+                                            }
+                                            blk_off[i] = (uint32_t) (byte_off / blk);
+                                        }
+                                        if (ok) {
+                                            ggml_backend_vk_wp_set_expert_offsets(
+                                                pager->pool_buf(), blk_off.data(),
+                                                (int) blk_off.size());
+                                            routing_tls_set = true;
+                                            if (getenv("GGML_VK_WP_TRACE") != nullptr) {
+                                                static int n = 0;
+                                                if (n < 8) {
+                                                    ++n;
+                                                    fprintf(stderr, "[vk-wp-trace] publish  src0=%-28s off0=%u\n",
+                                                            ggml_get_name(t->src[0]), blk_off[0]);
+                                                }
+                                            }
+                                        }
+                                    }
+#endif
 
                                     // Write the per-expert pointer array via
                                     // stream-ordered async H2D. dev_expert_ptrs

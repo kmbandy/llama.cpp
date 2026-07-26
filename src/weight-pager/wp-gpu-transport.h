@@ -19,6 +19,9 @@
 #include <cstddef>
 #include <vector>
 
+struct ggml_backend_buffer;
+typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
+
 namespace wp {
 
 class GpuTransport {
@@ -33,7 +36,8 @@ public:
     // events. n_events should be at least the prefetch queue depth so that
     // every in-flight stage_in has its own event without blocking on event
     // recycling. Returns false on HIP error or non-HIP builds.
-    bool init(int device_idx, int n_events, bool async_transfer_stream = false);
+    bool init(int device_idx, int n_events, bool async_transfer_stream = false,
+              ggml_backend_buffer_t buffer = nullptr);
 
     // Tear down the stream and events. Safe to call multiple times.
     // Called automatically by the destructor.
@@ -94,6 +98,8 @@ private:
     std::vector<int>     free_events_;             // free-list of event indices
     bool                 initialized_  = false;
     bool                 owns_stream_  = false;
+    bool                 is_vulkan_    = false;
+    ggml_backend_buffer_t buffer_       = nullptr;
 };
 
 }  // namespace wp
