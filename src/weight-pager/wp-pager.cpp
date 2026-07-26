@@ -959,7 +959,17 @@ bool WeightPager::init(const Config &             cfg,
     //    (Strix Halo etc.) and refuse oversized requests up front rather than
     //    silently allocating from system RAM and triggering a swap storm.
     //    MAD-234.
-    if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx)) {
+    //    cfg_.block_alignment additionally forces every slot offset to a
+    //    multiple of the quant block size. Vulkan needs it: its matmul indexes
+    //    the weight buffer as an array of quant blocks (a_offset = .. / QUANT_K),
+    //    so a slot that is not block-aligned cannot be addressed at all.
+    //    HIP/CUDA leave it at 1 — raw byte pointers, alignment already validated.
+    if (cfg_.block_alignment > 1) {
+        LLAMA_LOG_INFO("wp::WeightPager::init: forcing slot block alignment %zu B\n",
+                       cfg_.block_alignment);
+    }
+
+    if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx, cfg_.block_alignment)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: pool allocation failed\n");
         restore_disable_graphs_env_();
         return false;

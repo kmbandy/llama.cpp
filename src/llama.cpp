@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <ctime>
 #include <stdexcept>
 #include <vector>
@@ -231,29 +232,12 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         n_slots = model.wp_pager->n_pages();
         if (n_slots <= 0) n_slots = 32;
     }
-#if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
     if (!slots_user_override) {
         size_t free_vram = 0, total_vram = 0;
-
-        int prev_device = -1;
-        hipError_t hip_err = hipGetDevice(&prev_device);
-        if (hip_err == hipSuccess) {
-            hip_err = hipSetDevice(device_idx);
-        }
-        if (hip_err == hipSuccess) {
-            hip_err = hipMemGetInfo(&free_vram, &total_vram);
-        }
-        if (prev_device >= 0) {
-            hipError_t restore_err = hipSetDevice(prev_device);
-            if (restore_err != hipSuccess) {
-                LLAMA_LOG_WARN("%s: hipSetDevice(%d) restore failed after slot sizing: %s\n",
-                               __func__, prev_device, hipGetErrorString(restore_err));
-            }
-        }
-
-        if (hip_err != hipSuccess) {
-            LLAMA_LOG_WARN("%s: hipMemGetInfo on paging device %d failed: %s\n",
-                           __func__, device_idx, hipGetErrorString(hip_err));
+        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+        if (total_vram == 0) {
+            LLAMA_LOG_WARN("%s: unable to query free memory on paging device %d\n",
+                           __func__, device_idx);
         } else {
             const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
             const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
@@ -270,7 +254,6 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         }
         if (n_slots < 1) n_slots = 1;
     }
-#endif
 
     // 5. Prepare fds — dup + clear O_DIRECT (B-P3).
     std::vector<int> fds;
@@ -303,6 +286,35 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         cfg.io_uring_depth = cfg.prefetch_depth;
     }
     cfg.prefer_async_io = params.weight_paging_prefetch;
+
+    // Vulkan indexes weight buffers as arrays of quant blocks, so every pool
+    // slot offset must be an exact multiple of the block size or an expert's
+    // base cannot be expressed as a block index. Take the largest block size
+    // over the paged tensors. Other backends address by raw byte pointer and
+    // want no extra constraint.
+    {
+        const char * buft_name = ggml_backend_buft_name(buft);
+        if (buft_name != nullptr && std::strstr(buft_name, "Vulkan") != nullptr) {
+            // LCM, not max: mixed-quant GGUFs (e.g. Unsloth "UD" files) carry
+            // several block sizes among the paged tensors, and a slot offset has
+            // to be an exact multiple of EVERY one of them. Q6_K is 210 B and
+            // Q8_0 is 34 B; aligning to 210 alone leaves Q8_0 experts
+            // unaddressable.
+            size_t blk = 1;
+            for (const ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
+                if (t != nullptr) {
+                    const size_t ts = ggml_type_size(t->type);
+                    if (ts > 0) {
+                        blk = blk / std::gcd(blk, ts) * ts;
+                    }
+                }
+            }
+            cfg.block_alignment = blk;
+            LLAMA_LOG_INFO("%s: Vulkan backend — pool slot block alignment %zu B (lcm over paged types)\n",
+                           __func__, blk);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: weight pager depths: prefetch_depth=%d, io_uring_depth=%d\n",
                    __func__, cfg.prefetch_depth, cfg.io_uring_depth);
 

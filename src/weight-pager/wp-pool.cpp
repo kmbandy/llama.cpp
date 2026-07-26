@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numeric>   // std::gcd
 #include <string>
 
 #if defined(GGML_USE_HIP)
@@ -132,7 +133,8 @@ PoolAllocator::~PoolAllocator() {
 bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
                          int                        n_slots,
                          size_t                     slot_size,
-                         int                        device_idx) {
+                         int                        device_idx,
+                         size_t                     extra_alignment) {
     if (buf_ != nullptr) {
         LLAMA_LOG_WARN("wp::PoolAllocator: init called twice — ignoring second call\n");
         return false;
@@ -143,7 +145,24 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
         return false;
     }
 
-    const size_t total = (size_t) n_slots * slot_size;
+    // Effective slot alignment, and therefore the slot STRIDE. This must be
+    // settled before `total`: slot_ptr() is base + idx*slot_size_, so it is the
+    // stride that decides whether a slot offset is legal, not a recorded
+    // alignment value. lcm() so the result satisfies the buffer type and the
+    // caller's extra constraint at once. See the note on init() in wp-pool.h.
+    const size_t buft_align_ = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft));
+    const size_t extra_      = std::max<size_t>(1, extra_alignment);
+    const size_t align_eff   = buft_align_ / std::gcd(buft_align_, extra_) * extra_;
+
+    const size_t slot_size_eff = (slot_size + align_eff - 1) / align_eff * align_eff;
+    if (slot_size_eff != slot_size) {
+        LLAMA_LOG_INFO("wp::PoolAllocator: slot stride padded %zu -> %zu B for alignment %zu "
+                       "(+%.2f%%)\n",
+                       slot_size, slot_size_eff, align_eff,
+                       100.0 * (double) (slot_size_eff - slot_size) / (double) slot_size);
+    }
+
+    const size_t total = (size_t) n_slots * slot_size_eff;
     const bool use_size_classes = env_flag_is_one("WP_SIZE_CLASS_SLOTS");
 
     // MAD-234: UMA / APU pre-flight safety check.
@@ -207,9 +226,9 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
     }
 
     n_slots_          = use_size_classes ? 0 : n_slots;
-    slot_size_        = slot_size;
+    slot_size_        = slot_size_eff;
     arena_size_       = total;
-    slot_alignment_   = std::max<size_t>(1, ggml_backend_buft_get_alignment(buft));
+    slot_alignment_   = align_eff;
     size_class_slots_ = use_size_classes;
     high_water_       = 0;
     tick_             = 0;

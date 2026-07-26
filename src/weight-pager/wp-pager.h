@@ -131,6 +131,14 @@ public:
         int  prefetch_depth  = 4;     // PrefetchScheduler queue depth
         int  io_uring_depth  = 0;     // FileIOLayer SQ depth; 0 = prefetch_depth
         bool prefer_async_io = true;  // try io_uring for stage 1 before SyncPread
+
+        // Force every pool slot offset to a multiple of this. Vulkan needs the
+        // quant block size here (ggml_type_size of the paged tensors) because
+        // its matmul indexes the weight buffer as an array of quant blocks, so
+        // a slot that is not block-aligned cannot be addressed. 1 = no extra
+        // constraint, which is what HIP/CUDA want: they use raw byte pointers
+        // and their alignment is already validated.
+        size_t block_alignment = 1;
     };
 
     struct Stats {

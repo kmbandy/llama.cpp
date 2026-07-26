@@ -60,10 +60,18 @@ public:
     // we look up the device, detect UMA, and refuse early with an actionable
     // error if total > MemAvailable - 2 GiB. Pass -1 to skip the check (tests,
     // discrete-only setups).
+    // `extra_alignment` forces every slot offset to be a multiple of it, on top
+    // of the buffer type's own alignment. Vulkan needs this: its quantized
+    // matmul indexes the weight buffer as an array of quant blocks, so an
+    // expert's base must be an exact multiple of the block byte size (210 for
+    // Q6_K) or it cannot be expressed as a block index at all. The buffer-type
+    // alignment alone (256 on Vulkan) is not a multiple of that. Harmless
+    // elsewhere: CUDA/HIP pass raw byte pointers and pass 1 here.
     bool init(ggml_backend_buffer_type_t buft,
               int                        n_slots,
               size_t                     slot_size,
-              int                        device_idx = -1);
+              int                        device_idx      = -1,
+              size_t                     extra_alignment = 1);
 
     // Register the eviction callback. Optional; default is a no-op.
     void set_eviction_callback(EvictionCallback cb) { on_evict_ = std::move(cb); }
