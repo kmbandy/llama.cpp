@@ -310,6 +310,28 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
     return evt_idx;
 }
 
+bool GpuTransport::read_to_host(void * dst_host, const void * src_device, size_t n) {
+    if (dst_host == nullptr || src_device == nullptr || n == 0) {
+        return false;
+    }
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return ggml_backend_vk_wp_read(buffer_, src_device, dst_host, n);
+    }
+#endif
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    hipError_t err = hipMemcpy(dst_host, src_device, n, hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+        LLAMA_LOG_WARN("wp::GpuTransport::read_to_host: D2H(%zu) failed: %s\n",
+                       n, hipGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 void * GpuTransport::host_alloc(size_t size) {
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {

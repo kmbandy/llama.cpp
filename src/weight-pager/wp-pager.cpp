@@ -1168,7 +1168,18 @@ bool WeightPager::init(const Config &             cfg,
     if (host_budget > 0) {
         auto host_tier = std::make_unique<HostTier>();
         if (host_tier->init(host_budget, device_idx)) {
+            // The tier must copy out of the pool through the transport, not via
+            // a raw device memcpy: on Vulkan a slot pointer is a sentinel base
+            // plus an offset and cannot be dereferenced by hip*/cuda*.
+            host_tier->set_device_reader(
+                [this](void * dst_host, const void * src_device, size_t n) {
+                    return transport_.read_to_host(dst_host, src_device, n);
+                });
             host_tier_ = std::move(host_tier);
+            LLAMA_LOG_WARN("wp::HostTier: RAM victim tier ENABLED, budget %zu B (%.1f MiB), "
+                           "backend_pinned=%d, D2H via transport (vulkan-safe)\n",
+                           host_budget, (double) host_budget / (1024.0 * 1024.0),
+                           (int) host_tier_->backend_pinned());
         } else {
             LLAMA_LOG_WARN("wp::WeightPager: WP_HOST_BUDGET_BYTES=%zu requested, but HostTier init failed; continuing disabled\n",
                            host_budget);
@@ -1439,8 +1450,12 @@ void WeightPager::on_pool_evict_(int slot_idx) {
         // was synchronized just above, so the slot contents are valid here.
         // Skip speculative pages (prefetched-but-unused = not real working set).
         if (host_tier_ && page_loaded_[page] && !pool_.is_speculative(slot_idx)) {
-            host_tier_->store_from_device(page, slot_ptr_(slot_idx),
-                                          catalog_.at(page).size);
+            if (host_tier_->store_from_device(page, slot_ptr_(slot_idx),
+                                              catalog_.at(page).size)) {
+                ++stats_.host_tier_stores;
+            } else {
+                ++stats_.host_tier_store_fail;
+            }
         }
         page_to_slot_[page] = -1;
         page_loaded_[page]  = false;
@@ -1633,6 +1648,8 @@ void WeightPager::log_stats_summary() {
             "  cross_layer_hit_in_ensure: %lu\n"
             "  speculative_evicted_unused: %lu\n"
             "  host_tier_hits: %lu\n"
+            "  host_tier_stores: %lu\n"
+            "  host_tier_store_fail: %lu\n"
             "  ensure_batch_host_hits: %lu\n"
             "  ensure_batch_host_odirect_cap_skips: %lu\n"
             "  host_prefetch_enqueued: %lu\n"
@@ -1724,6 +1741,8 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.cross_layer_hit_in_ensure,
             (unsigned long) s.speculative_evicted_unused,
             (unsigned long) s.host_tier_hits,
+            (unsigned long) s.host_tier_stores,
+            (unsigned long) s.host_tier_store_fail,
             (unsigned long) s.ensure_batch_host_hits,
             (unsigned long) s.ensure_batch_host_odirect_cap_skips,
             (unsigned long) s.host_prefetch_enqueued,

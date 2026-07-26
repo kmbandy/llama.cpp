@@ -47,6 +47,13 @@ GGML_BACKEND_API void ggml_backend_vk_wp_event_free(void * event);
 GGML_BACKEND_API void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t size);
 GGML_BACKEND_API void   ggml_backend_vk_wp_host_free(ggml_backend_buffer_t pool_buffer, void * ptr);
 
+// Device-to-host read out of the pool, for the RAM victim tier: an evicted
+// slot's bytes are copied to host RAM so a later reference is served from RAM
+// instead of re-read from NVMe. `src` is a pool "pointer" (the backend's fixed
+// base plus an offset) and must not be dereferenced. Synchronous.
+GGML_BACKEND_API bool ggml_backend_vk_wp_read(ggml_backend_buffer_t pool_buffer,
+                                               const void * src, void * dst, size_t n);
+
 // Weight-paging consumption bridge — the counterpart of the CUDA backend's
 // ggml_cuda_set_routed_expert_ptrs. Publishes, for the NEXT mul_mat_id node
 // only, where each active expert's weights actually live: `pool_buffer` is the

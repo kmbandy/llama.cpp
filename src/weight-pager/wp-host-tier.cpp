@@ -174,30 +174,58 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
         erase_resident_(page_idx);
         return false;
     }
+    // Refuse rather than guess. Without a reader the only thing available is a
+    // raw hipMemcpy, and that is WRONG for any pool whose pointers are not real
+    // device addresses -- notably Vulkan, where they are a sentinel base plus an
+    // offset. Note this file is compiled with -DGGML_USE_CUDA even in
+    // Vulkan-only configurations, so the preprocessor cannot be used to decide
+    // this; only the owner knows what the pool actually is.
+    if (!device_reader_) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        // Fall through to the built-in copy below (raw-addressable pool).
+#else
+        (void) device_bytes;
+        return false;
+#endif
+    }
+
     erase_resident_(page_idx);
     size_t offset = 0;
     if (!acquire_slot_(page_idx, n, offset)) {
         return false;
     }
+
     // Synchronous D2H: the caller (on_pool_evict_) has already synchronized any
     // in-flight transfer for this page, so the device slot is settled here.
-    hipError_t err = hipMemcpy(arena_ + offset, device_bytes, n, hipMemcpyDeviceToHost);
-    if (err != hipSuccess) {
-        LLAMA_LOG_WARN("wp::HostTier::store_from_device: hipMemcpy D2H(%zu) page %d failed: %s\n",
-                       n, page_idx, hipGetErrorString(err));
+    bool ok;
+    if (device_reader_) {
+        ok = device_reader_(arena_ + offset, device_bytes, n);
+        if (!ok) {
+            LLAMA_LOG_WARN("wp::HostTier::store_from_device: device read D2H(%zu) page %d failed\n",
+                           n, page_idx);
+        }
+    } else {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        hipError_t err = hipMemcpy(arena_ + offset, device_bytes, n, hipMemcpyDeviceToHost);
+        ok = err == hipSuccess;
+        if (!ok) {
+            LLAMA_LOG_WARN("wp::HostTier::store_from_device: hipMemcpy D2H(%zu) page %d failed: %s\n",
+                           n, page_idx, hipGetErrorString(err));
+        }
+#else
+        ok = false;
+#endif
+    }
+    if (!ok) {
         free_lists_[n].push_back(offset);  // return the acquired slot
         return false;
     }
+
     resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
     used_bytes_ += n;
     lru_.push_back(page_idx);
     lru_pos_[page_idx] = std::prev(lru_.end());
     return true;
-#else
-    (void) device_bytes;
-    return false;
-#endif
 }
 
 bool HostTier::lookup(int page_idx, void * dst_bytes, size_t n) {

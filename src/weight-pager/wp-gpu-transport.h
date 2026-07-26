@@ -93,6 +93,12 @@ public:
     void * host_alloc(size_t size);
     void   host_free(void * ptr);
 
+    // Synchronous device-to-host read from the pool, used by the RAM victim
+    // tier on eviction. Backend-correct: a raw hipMemcpy cannot serve a Vulkan
+    // pool, whose "pointers" are a sentinel base plus an offset. Returns false
+    // if this transport has no way to perform the read.
+    bool read_to_host(void * dst_host, const void * src_device, size_t n);
+
     // Inspect transport state.
     bool is_initialized() const { return initialized_; }
     // True when this transport stages into a Vulkan pool buffer via the

@@ -164,6 +164,8 @@ public:
         uint64_t xlayer_harvest_calls           = 0; // harvests run before the speculative gate
         uint64_t xlayer_harvested_pages         = 0; // Done prefetches committed+reaped by them
         uint64_t host_tier_hits                 = 0;
+        uint64_t host_tier_stores               = 0; // evicted pages copied VRAM->RAM
+        uint64_t host_tier_store_fail           = 0; // D2H refused or failed
         uint64_t host_prefetch_enqueued         = 0;
         uint64_t host_prefetch_dropped          = 0;
         uint64_t host_prefetch_read             = 0;

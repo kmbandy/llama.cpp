@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <mutex>
 #include <unordered_map>
@@ -74,6 +75,15 @@ public:
     // Returns false if the tier is disabled or the copy fails.
     bool store_from_device(int page_idx, const void * device_bytes, size_t n);
 
+    // How to copy device bytes into the arena. MUST be set by the owner when
+    // the pool is anything other than a raw-addressable HIP/CUDA allocation:
+    // a Vulkan pool "pointer" is a sentinel base plus an offset, so the
+    // built-in hipMemcpy fallback would issue a device copy from an address
+    // that does not exist. With no reader set and no HIP/CUDA build,
+    // store_from_device refuses rather than guessing.
+    using DeviceReader = std::function<bool(void * dst_host, const void * src_device, size_t n)>;
+    void set_device_reader(DeviceReader reader) { device_reader_ = std::move(reader); }
+
     // Remove a page from the tier (used when it is promoted back to VRAM, so a
     // page never lives in both tiers).
     void erase(int page_idx);
@@ -106,6 +116,7 @@ private:
     size_t    used_bytes_   = 0;
     size_t    high_water_   = 0;
     bool      backend_pinned_ = false;
+    DeviceReader device_reader_;
     bool      mlocked_        = false;
 
     // Monotonically increasing, never reused. Assigned to a new Resident's

@@ -8483,6 +8483,24 @@ void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t s
     return ggml_vk_host_malloc(buffer_ctx->dev_buffer->device, size);
 }
 
+bool ggml_backend_vk_wp_read(ggml_backend_buffer_t pool_buffer,
+                             const void * src, void * dst, size_t n) {
+    if (pool_buffer == nullptr || src == nullptr || dst == nullptr || n == 0) {
+        return false;
+    }
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) pool_buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return false;
+    }
+    vk_buffer src_buffer = buffer_ctx->dev_buffer;
+    const size_t offset = (uintptr_t) src - (uintptr_t) vk_ptr_base;
+    if (offset > src_buffer->size || n > src_buffer->size - offset) {
+        return false;
+    }
+    ggml_vk_buffer_read(src_buffer, offset, dst, n);
+    return true;
+}
+
 void ggml_backend_vk_wp_host_free(ggml_backend_buffer_t pool_buffer, void * ptr) {
     if (pool_buffer == nullptr || ptr == nullptr) {
         return;
