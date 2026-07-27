@@ -68,6 +68,11 @@ struct FileIOConcurrency {
     uint64_t starts = 0;
     uint64_t peak = 0;
     double average_at_start = 0.0;
+    // Requests the P2P layer rejected for window-cache pressure alone (the
+    // non-fatal EAGAIN path). submit_batch STOPS at the first rejection and
+    // the caller marks [n_queued, N) failed, so one rejection costs the rest
+    // of that batch a serial sync fallback.
+    uint64_t window_pressure_fallbacks = 0;
 };
 
 class FileIOLayer {

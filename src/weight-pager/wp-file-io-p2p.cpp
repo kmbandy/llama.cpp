@@ -300,6 +300,7 @@ public:
         FileIOConcurrency out;
         out.starts = p2p_inflight_starts_;
         out.peak = p2p_inflight_peak_;
+        out.window_pressure_fallbacks = window_pressure_fallbacks_;
         out.average_at_start = p2p_inflight_starts_ == 0 ? 0.0 :
             p2p_inflight_sum_at_start_ / (double) p2p_inflight_starts_;
         return out;

@@ -277,6 +277,7 @@ public:
         // O_DIRECT worker pool (n_submitted); on P2P it is submit_batch's
         // return value (n_sub). HostTier hits never reach either queue.
         uint64_t ensure_batch_n_sub_sum            = 0;
+        uint64_t ensure_batch_window_pressure_fallbacks = 0;
         // Transport identity: which ensure_batch branch actually served
         // each batch's reads this run. More than one can be nonzero in a
         // single run (e.g. a HOST-path read failing over to the per-page

@@ -1620,6 +1620,8 @@ void WeightPager::log_stats_summary() {
         LLAMA_LOG_WARN(
             "wp::ensure_batch P2P ACHIEVED CONCURRENCY (kernel-submitted reads): "
             "inflight_peak=%lu inflight_avg_at_read_start=%.2f\n",
+            (unsigned long) s.ensure_batch_n_sub_sum,
+            (unsigned long) s.ensure_batch_window_pressure_fallbacks,
             (unsigned long) s.ensure_batch_p2p_inflight_peak,
             s.ensure_batch_p2p_inflight_avg_at_read_start);
     }
@@ -1728,6 +1730,8 @@ void WeightPager::log_stats_summary() {
             "  ensure_batch_p2p_read_wait_ms: %.1f\n"
             "  ensure_batch_p2p_h2d_ms: %.1f\n"
             "  ensure_batch_p2p_fresh_count: %lu\n"
+            "  ensure_batch_n_sub_sum: %lu\n"
+            "  ensure_batch_window_pressure_fallbacks: %lu\n"
             "  ensure_batch_p2p_inflight_peak: %lu\n"
             "  ensure_batch_p2p_inflight_avg_at_read_start: %.2f\n"
             "  ensure_batch_host_promotion_count: %lu\n"
@@ -1838,6 +1842,8 @@ void WeightPager::log_stats_summary() {
             s.ensure_batch_p2p_read_wait_seconds * 1e3,
             s.ensure_batch_p2p_h2d_seconds * 1e3,
             (unsigned long) s.ensure_batch_p2p_fresh_count,
+            (unsigned long) s.ensure_batch_n_sub_sum,
+            (unsigned long) s.ensure_batch_window_pressure_fallbacks,
             (unsigned long) s.ensure_batch_p2p_inflight_peak,
             s.ensure_batch_p2p_inflight_avg_at_read_start,
             (unsigned long) s.ensure_batch_host_promotion_count,
@@ -3331,6 +3337,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
             stats_.ensure_batch_p2p_inflight_avg_at_read_start =
                 p2p_concurrency.average_at_start;
+            stats_.ensure_batch_window_pressure_fallbacks =
+                p2p_concurrency.window_pressure_fallbacks;
             // Real storage submissions only: n_sub is submit_batch's
             // return value (jobs actually queued to io_uring). n_host_hit
             // came from HostTier and never reached submit_batch, so it
