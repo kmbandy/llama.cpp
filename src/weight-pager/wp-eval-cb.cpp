@@ -1080,6 +1080,17 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // PoolAllocator::init), so the division is exact
                                     // -- assert rather than trust it, because a
                                     // truncation here is silently wrong weights.
+                                    // Runtime gate, not just the compile-time one
+                                    // above: build-army compiles CUDA + Vulkan +
+                                    // RPC together, so GGML_USE_VULKAN is defined
+                                    // even on a pure CUDA run. Without this the
+                                    // block-alignment check below fires against a
+                                    // CUDA pool (whose slots have no reason to be
+                                    // block-multiples) and logs one ERROR per
+                                    // expert per layer per token — measured at
+                                    // ~100M lines / 200 MB in two minutes, which
+                                    // buries the run rather than corrupting it.
+                                    if (pager->is_vulkan())
                                     {
                                         const size_t blk = ggml_type_size(t->src[0]->type);
                                         const uintptr_t pool_base =

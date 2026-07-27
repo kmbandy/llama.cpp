@@ -555,6 +555,12 @@ public:
     // Base of the slot pool. On Vulkan this is the backend's fixed pointer
     // sentinel, so slot_ptr() - pool_base() is the true buffer offset.
     void *                pool_base() const { return pool_.pool_base(); }
+    // True only when the pool actually lives in a Vulkan buffer. Callers must
+    // gate Vulkan-specific behaviour on THIS, not on #if defined(GGML_USE_VULKAN)
+    // — a build with several backends compiled in (e.g. build-army: CUDA +
+    // Vulkan + RPC) defines the macro on every run regardless of the device
+    // in use.
+    bool                  is_vulkan() const { return transport_.is_vulkan(); }
     ggml_backend_buffer_t pool_buf(int page_idx) const;
 
     // Slot-and-page metadata (read-only public view).
