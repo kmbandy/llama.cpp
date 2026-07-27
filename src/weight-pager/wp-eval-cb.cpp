@@ -932,13 +932,33 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         // widening is measurable rather than assumed.
                                         // Defaults reproduce the previous behaviour
                                         // exactly (8 / 18).
+                                        // MEASURED 2026-07-27 (laguna, 9000 slots,
+                                        // bracketed ctl/test/ctl): widening from
+                                        // 8/18 to cover top-10 gave avg_n
+                                        // 3.86 -> 10.83, ensure_batch_gb_s
+                                        // 2.17 -> 3.21, wait_ms -33%, decode
+                                        // 2.11/2.15 -> 2.67 t/s (+24%, control
+                                        // spread 1.9%) with io_gb_read and
+                                        // page_ins IDENTICAL TO THE DIGIT across
+                                        // all three arms — a pure scheduling
+                                        // change, caching untouched.
+                                        //
+                                        // Cap is now DERIVED, not hardcoded: a
+                                        // layer's three sister tensors for the
+                                        // active experts is exactly 3*|active|.
+                                        // That reproduces the old 18 for DS4
+                                        // (top-6) byte-for-byte and gives laguna
+                                        // (top-10) the 30 it needs. MAXK 12 still
+                                        // keeps PREFILL — whose active set is the
+                                        // union over the batch, typically most of
+                                        // the experts — on the actives-only path.
                                         static int s_sister_maxk = -1;
-                                        static int s_sister_cap  = -1;
+                                        static int s_sister_cap  = -1;  // 0 => derive 3*|active|
                                         if (s_sister_maxk < 0) {
                                             const char * e = std::getenv("WP_ENSURE_BATCH_SISTER_MAXK");
-                                            s_sister_maxk = (e != nullptr) ? std::max(0, atoi(e)) : 8;
+                                            s_sister_maxk = (e != nullptr) ? std::max(0, atoi(e)) : 12;
                                             const char * c = std::getenv("WP_ENSURE_BATCH_CAP");
-                                            s_sister_cap  = (c != nullptr) ? std::max(1, atoi(c)) : 18;
+                                            s_sister_cap  = (c != nullptr) ? std::max(1, atoi(c)) : 0;
                                         }
                                         std::vector<int> batch_pages = active_pages;
                                         if ((int) active.size() <= s_sister_maxk) {
@@ -957,7 +977,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 sister_it = s_sister_cache_eb.emplace(
                                                     weight_page, std::move(sisters)).first;
                                             }
-                                            const size_t cap = (size_t) s_sister_cap;
+                                            const size_t cap = (s_sister_cap > 0)
+                                                ? (size_t) s_sister_cap
+                                                : active.size() * 3;   // the layer's 3 sister tensors
                                             batch_pages.reserve(cap);
                                             for (int sister_parent : sister_it->second) {
                                                 if (batch_pages.size() >= cap) break;
