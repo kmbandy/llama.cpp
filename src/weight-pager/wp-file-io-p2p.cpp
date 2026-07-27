@@ -107,8 +107,23 @@ public:
         void * mapped_dst = nullptr;
         uint64_t map_key  = 0;
         if (!acquire_window_(pool_off, size, mapped_dst, map_key)) {
-            switch_to_host_errno_("window mmap failed", errno);
-            return false;
+            if (errno != EAGAIN) {
+                switch_to_host_errno_("window mmap failed", errno);
+                return false;
+            }
+            // Window pressure. Push queued SQEs so in-flight reads can land,
+            // drain whatever has completed (each completion releases its
+            // window via release_inflight_key_), then try once more. Reaped
+            // results go into ready_, which the normal reap path drains, so
+            // consuming CQEs here cannot lose a completion.
+            flush_submissions_();
+            while (reap_ready_cqe_()) { }
+            if (!acquire_window_(pool_off, size, mapped_dst, map_key)) {
+                // Still no window. Fail THIS request only — the caller falls
+                // back for it — and leave P2P enabled for everything after.
+                ++window_pressure_fallbacks_;
+                return false;
+            }
         }
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
@@ -615,7 +630,14 @@ private:
 
         while ((int) window_cache_.size() >= max_windows_) {
             if (!evict_one_idle_()) {
-                errno = ENOMEM;
+                // TRANSIENT, not fatal: the cache is at cap and every entry is
+                // still referenced by an in-flight read. Signal EAGAIN so the
+                // caller drains completions and retries instead of tearing the
+                // whole transport down. This used to report ENOMEM, which the
+                // caller could not distinguish from a real mmap failure, so a
+                // moment of window pressure permanently downgraded P2P to
+                // sync-pread for the rest of the process.
+                errno = EAGAIN;
                 return false;
             }
         }
@@ -713,6 +735,10 @@ private:
     std::vector<int> fds_;
     std::unique_ptr<FileIOLayer> host_;
     bool p2p_enabled_ = false;
+    // Count of requests that fell back for window pressure alone.
+    // Non-fatal; if this is large the window cache is undersized
+    // relative to queue depth.
+    uint64_t window_pressure_fallbacks_ = 0;
     bool ring_ok_ = false;
     bool files_registered_ = false;
     int pending_ = 0;
