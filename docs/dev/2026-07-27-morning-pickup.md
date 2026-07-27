@@ -357,6 +357,36 @@ as the MoE path is batched, or — if those are the 141 consolidated parents bei
 re-read every token step — **pin them** (269 MB of VRAM to eliminate ~48 GB of
 reads). `page_ins_ensure_async == 0` rules out prefetch diverting pages.
 
+### The serial path is NOT pinning — it is transport rejection
+
+Caller-attributed counters (`82f30a912`) resolved it exactly:
+
+```
+pis_read_failed:      25,432   <-- ALL of it
+pis_from_ensure:           0   (that site is guarded by ++sync_fallbacks, which is 0)
+pis_vk_host / pis_host_path / pis_nonhip / pis_tier_pre / pis_tier_promo / pis_serial_batch: 0
+page_ins_sync_direct: 25,432   == pis_read_failed
+```
+
+**37% of P2P batch reads are marked failed and silently sync-fallen-back.** The
+fast transport only serves 63% of what it is asked for, with no error and no
+timeout (`ensure_batch_timeouts: 0`).
+
+The "141 consolidated parents re-read every token" theory is **dead**. Parents are
+~486 MB each (all 256 experts of a role); 25k reads of them would be orders of
+magnitude beyond the observed 133.694 GB. The arithmetic fit (141 × 175 = 24,675)
+was coincidence. `pis_from_ensure = 0` independently rules out that path.
+
+The constraint any explanation must satisfy: **`ensure_batch_pages` is 44,124 in
+BOTH the narrow (avg_n 3.86) and wide (avg_n 10.83) arms.** `avg_n` rose only
+because *calls* fell 11,419 → 4,073; the same pages succeeded either way. So the
+63/37 split is **page-intrinsic, not batch-shaped** — a per-batch tail effect
+(e.g. `submit_batch` stopping at the first rejection) would scale with width.
+
+`IoUringP2PFileIOLayer::submit_batch` does stop at the first rejection and the
+caller marks `[n_queued, N)` failed, so one rejection costs the rest of that
+batch a serial fallback. Whether that is the mechanism is unresolved.
+
 ---
 
 ## 5. Corrections to the record made today
