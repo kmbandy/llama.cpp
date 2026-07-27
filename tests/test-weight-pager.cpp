@@ -115,7 +115,10 @@ static int test_p2p_tunable_resolution() {
     unsetenv("WP_P2P_WINDOW_CACHE_MAX");
     unsetenv("WP_P2P_DIRECT_TO_DEVICE");
     EXPECT_EQ_INT(wp::resolve_p2p_queue_depth(16), 16, "queue default preserves configured depth");
-    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 64, "window default preserves clamp(4*QD,64,256)");
+    // Default clamp widened from [64,256] to [256,1024] on 2026-07-27: the old
+    // floor starved the P2P window cache under batch-width pressure (measured
+    // 2.13x prefill from raising it). 4*16=64 therefore clamps UP to 256.
+    EXPECT_EQ_INT(wp::resolve_p2p_window_cache_max(16), 256, "window default preserves clamp(4*QD,256,1024)");
     EXPECT(!wp::p2p_direct_to_device_with_tier(), "tier-direct default preserves staging/store behavior");
 
     setenv("WP_P2P_QUEUE_DEPTH", "32", 1);
@@ -2938,6 +2941,65 @@ static int test_pool_speculative() {
     return fails;
 }
 
+// Regression: intra-batch self-cannibalisation (gate 4, diagnosed 2026-07-27).
+//
+// prefetch_pages_batch reserves N slots in a loop. Marking a slot speculative
+// makes it a legal Pass-0 victim for the very next iteration -- and on a seeding
+// batch it is the ONLY speculative slot, so it is trivially the LRU of its
+// cohort and is handed straight back. The batch then carries the same slot
+// twice, two reads DMA into one buffer, and the first page is silently mapped to
+// the second page's bytes. Wrong weights, no crash.
+//
+// The invariant that closes it: pin BEFORE marking, so Pass 0's pin_count_ test
+// excludes the slot from the moment it becomes speculative. Both halves are
+// asserted -- the second documents why the ordering is load-bearing.
+static int test_pool_speculative_batch_no_self_evict() {
+    int fails = 0;
+    using namespace wp;
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type available"); return fails; }
+
+    const int N = 4;   // warm pool: every slot used, unpinned, non-speculative
+
+    // --- Correct order: pin, then mark. A batch must return distinct slots. ---
+    {
+        PoolAllocator pool;
+        EXPECT(pool.init(buft, N, /*slot_size=*/256), "batch pool init");
+        for (int i = 0; i < N; ++i) { int s = pool.alloc_slot(); pool.mark_used(s); }
+
+        std::vector<int> slots;
+        bool dup = false;
+        for (int i = 0; i < N; ++i) {
+            const int s = pool.alloc_slot();          // allow_evict path
+            EXPECT(s >= 0, "batch alloc succeeds");
+            if (s < 0) break;
+            for (int prev : slots) { if (prev == s) dup = true; }
+            slots.push_back(s);
+            pool.pin_slot(s);                          // pin FIRST ...
+            pool.set_speculative(s, true);             // ... then mark
+        }
+        EXPECT(!dup, "batch alloc returns distinct slots when pinned before marking");
+        EXPECT_EQ_INT((int) slots.size(), N, "whole batch allocated");
+        EXPECT_EQ_INT(pool.n_speculative(), N, "all batch slots speculative");
+        for (int s : slots) pool.unpin_slot(s);
+    }
+
+    // --- The hazard itself: mark without pinning and the next alloc reclaims it. ---
+    {
+        PoolAllocator pool;
+        EXPECT(pool.init(buft, N, /*slot_size=*/256), "hazard pool init");
+        for (int i = 0; i < N; ++i) { int s = pool.alloc_slot(); pool.mark_used(s); }
+
+        const int first = pool.alloc_slot();
+        pool.set_speculative(first, true);             // marked but NOT pinned
+        const int second = pool.alloc_slot();
+        EXPECT_EQ_INT(second, first,
+                      "unpinned speculative slot is recycled by the next alloc "
+                      "(this is the corruption the pin-before-mark order prevents)");
+    }
+    return fails;
+}
+
 int main() {
     int total_fails = 0;
 
@@ -3018,6 +3080,7 @@ int main() {
         { "router_predictor_confidence",         test_router_predictor_confidence         },
         { "expert_page_index",                   test_expert_page_index                   },
         { "pool_speculative",                    test_pool_speculative                    },
+        { "pool_speculative_batch_no_self_evict", test_pool_speculative_batch_no_self_evict },
         { "ensure_odirect_inflight_serial_peak_one", test_ensure_odirect_inflight_serial_peak_one },
         { "ensure_odirect_inflight_overlap_peak_and_average", test_ensure_odirect_inflight_overlap_peak_and_average },
         { "ensure_odirect_inflight_no_leak_on_pairing", test_ensure_odirect_inflight_no_leak_on_pairing },

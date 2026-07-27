@@ -3671,12 +3671,34 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
                 break;
             }
             for (int prev : slots) {
+                // Drop the intra-batch pin taken below; release_slot does not.
+                if (speculative) pool_.unpin_slot(prev);
                 pool_.release_slot(prev);
             }
             return false;
         }
         ensure_slot_map_(s);
-        if (speculative) pool_.set_speculative(s, true);
+        if (speculative) {
+            // GATE 4 / INTRA-BATCH SELF-CANNIBALISATION (diagnosed 2026-07-27).
+            // set_speculative() makes this slot a legal victim for the NEXT
+            // iteration's alloc_slot(): Pass 0 of alloc_slot_fixed_ recycles the
+            // LRU slot that is (speculative && pin_count_ == 0), and a slot we
+            // just marked is exactly that -- on the seeding batch it is the ONLY
+            // speculative slot, hence trivially the LRU of its cohort. The batch
+            // then carries the same slot twice, slot_to_page_ keeps only the last
+            // writer, and both reads DMA into one buffer: the first page is
+            // silently mapped to the second page's weights. Wrong experts, no
+            // crash -- the corruption behind the 128-token unprintable output.
+            //
+            // The pin used to be taken after submit_batch (which correctly
+            // protects the in-flight read ACROSS calls); the hole was the window
+            // between marking and pinning WITHIN one call. Pin on allocation so
+            // Pass 0's pin_count_ test excludes it from the moment it is marked.
+            // Unreachable before af1778211: speculative used alloc_slot_no_evict,
+            // which never runs Pass 0. Bootstrap's allow_evict=true opened it.
+            pool_.pin_slot(s);
+            pool_.set_speculative(s, true);
+        }
         slots.push_back(s);
     }
     if (slots.empty()) {
@@ -3712,22 +3734,23 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
         for (size_t i = 0; i < needed.size(); ++i) {
             page_to_slot_[needed[i]] = -1;
             slot_to_page_[slots[i]]  = -1;
+            // Drop the intra-batch pin taken in the alloc loop above.
+            if (speculative) pool_.unpin_slot(slots[i]);
             pool_.release_slot(slots[i]);
         }
         return false;
     }
-    // MAD-231 extension: pin each speculative slot for its in-flight lifetime.
-    // The async read (p2p direct-to-device) lands straight in this VRAM slot;
-    // without the pin, alloc_slot's Pass-0 "recycle LRU speculative" (or LRU
+    // MAD-231 extension: each speculative slot is pinned for its in-flight
+    // lifetime. The async read (p2p direct-to-device) lands straight in this VRAM
+    // slot; without the pin, alloc_slot's Pass-0 "recycle LRU speculative" (or LRU
     // eviction) could hand the slot to another page before the read completes,
     // and the late read would corrupt the new owner. Mirrors ensure_batch's
     // in-flight miss pin. Released at each commit/teardown site below, keyed on
     // is_speculative (still set there, before mark_used()/release_slot() clears it).
-    if (speculative) {
-        for (int s : slots) {
-            pool_.pin_slot(s);
-        }
-    }
+    //
+    // The pin is now taken in the allocation loop above rather than here, so it
+    // also covers the intra-batch window -- see the gate-4 note there. Exactly
+    // one pin per slot either way; the release sites are unchanged.
     const auto now = std::chrono::steady_clock::now();
     if (count_dense_prefetch) {
         stats_.dense_prefetch_submitted += (uint64_t) needed.size();
