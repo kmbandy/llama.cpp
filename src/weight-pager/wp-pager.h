@@ -706,6 +706,15 @@ private:
     // OR prefetch stage 2 completed and reaped). False means slot is
     // reserved but the bytes aren't there yet.
     std::vector<bool> page_loaded_;
+    // Per-page access histogram (WP_PAGE_HIST=1). page_access_ counts how many
+    // times a page was REQUESTED (ensure / ensure_batch), page_pagein_ how many
+    // times it actually had to be read. A page requested every token but always
+    // resident costs nothing; the pin candidates are high-access AND high-pagein.
+    std::vector<uint32_t> page_access_;
+    std::vector<uint32_t> page_pagein_;
+    uint64_t              page_hist_total_accesses_ = 0;
+    bool                  page_hist_enabled_        = false;
+    void log_page_histogram_() const;
     std::vector<bool> cross_layer_prefetch_candidate_;
     std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
     std::vector<int> page_async_event_;

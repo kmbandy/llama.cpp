@@ -1122,6 +1122,16 @@ bool WeightPager::init(const Config &             cfg,
     // 5. Page-to-slot map + per-page loaded flag.
     page_to_slot_.assign((size_t) catalog_.size(), -1);
     page_loaded_.assign((size_t)  catalog_.size(), false);
+    {
+        const char * e = std::getenv("WP_PAGE_HIST");
+        page_hist_enabled_ = (e != nullptr && e[0] == '1');
+        if (page_hist_enabled_) {
+            page_access_.assign((size_t) catalog_.size(), 0u);
+            page_pagein_.assign((size_t) catalog_.size(), 0u);
+            LLAMA_LOG_WARN("wp::WeightPager: WP_PAGE_HIST=1 — per-page access histogram enabled (%zu pages)\n",
+                           (size_t) catalog_.size());
+        }
+    }
     cross_layer_prefetch_candidate_.assign((size_t) catalog_.size(), false);
     draft_tid2eid_mark_.assign((size_t) catalog_.size(), false);
     oracle_pred_mark_.assign((size_t) catalog_.size(), false);
@@ -1545,7 +1555,58 @@ void WeightPager::record_page_in_(size_t bytes, double seconds) {
     }
 }
 
+
+void WeightPager::log_page_histogram_() const {
+    if (!page_hist_enabled_ || page_access_.empty()) return;
+
+    // Pages-per-token is a property of the model, not the run: every token
+    // touches n_expert_used * roles pages per MoE layer. Rather than plumb a
+    // token counter through eval_cb, derive the denominator from the busiest
+    // page -- a page that is genuinely read every step defines 100%.
+    uint32_t max_access = 0;
+    for (uint32_t a : page_access_) max_access = std::max(max_access, a);
+    if (max_access == 0) return;
+
+    struct Row { int page; uint32_t acc; uint32_t pin; };
+    std::vector<Row> rows;
+    rows.reserve(page_access_.size());
+    for (size_t i = 0; i < page_access_.size(); ++i) {
+        if (page_access_[i] > 0) {
+            rows.push_back({(int) i, page_access_[i],
+                            i < page_pagein_.size() ? page_pagein_[i] : 0u});
+        }
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row & a, const Row & b) { return a.acc > b.acc; });
+
+    // Bucket by access frequency relative to the busiest page.
+    const double thresholds[] = {0.80, 0.50, 0.25, 0.10, 0.01};
+    const char * labels[]     = {">=80%", ">=50%", ">=25%", ">=10%", ">=1%"};
+    LLAMA_LOG_WARN("wp::PAGE HISTOGRAM: %zu pages touched of %zu, total_accesses=%llu, busiest=%u\n",
+                   rows.size(), page_access_.size(),
+                   (unsigned long long) page_hist_total_accesses_, max_access);
+    for (int t = 0; t < 5; ++t) {
+        size_t   n = 0;
+        uint64_t pins = 0;
+        for (const Row & r : rows) {
+            if ((double) r.acc / (double) max_access >= thresholds[t]) { ++n; pins += r.pin; }
+        }
+        LLAMA_LOG_WARN("  accessed %s of busiest: %zu pages, %llu page_ins\n",
+                       labels[t], n, (unsigned long long) pins);
+    }
+    const size_t topn = std::min<size_t>(rows.size(), 40);
+    LLAMA_LOG_WARN("  TOP %zu pages by access (page | acc | %%busiest | page_ins | name):\n", topn);
+    for (size_t i = 0; i < topn; ++i) {
+        const Row & r = rows[i];
+        LLAMA_LOG_WARN("    %6d %8u %6.1f%% %8u  %s\n",
+                       r.page, r.acc,
+                       100.0 * (double) r.acc / (double) max_access,
+                       r.pin, catalog_.at(r.page).tensor_name.c_str());
+    }
+}
+
 void WeightPager::log_stats_summary() {
+    log_page_histogram_();
     if (xlayer_prefetch_enabled_) {
         LLAMA_LOG_WARN("  [xlayer] predict_calls=%lu pred_pages=%lu resident_skips=%lu "
                        "blocked_budget=%lu blocked_free_queue=%lu submitted=%lu hit=%lu spec_evict_unused=%lu\n",
@@ -2298,6 +2359,10 @@ void WeightPager::release_sticky_l2_() {
 }
 
 void * WeightPager::ensure(int page_idx) {
+    if (page_hist_enabled_ && page_idx >= 0 && page_idx < (int) page_access_.size()) {
+        ++page_access_[(size_t) page_idx];
+        ++page_hist_total_accesses_;
+    }
     if (!initialized_)                                         return nullptr;
     if (page_idx < 0 || page_idx >= catalog_.size())           return nullptr;
     if (page_idx < (int) page_async_event_.size() && page_async_event_[page_idx] >= 0) {
@@ -2444,6 +2509,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     for (std::size_t i = 0; i < page_indices.size(); ++i) {
         const int p = page_indices[i];
         if (p < 0 || p >= catalog_.size()) continue;
+        if (page_hist_enabled_) {
+            ++page_access_[(size_t) p];
+            ++page_hist_total_accesses_;
+        }
         const PageMeta & m = catalog_.at(p);
         if (m.is_pinned) {                       // MAD-236: always-resident, no slot
             out_ptrs[i] = m.resident_ptr;
@@ -2843,6 +2912,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     slot_to_page_[mm.slot] = mm.page;
                     pool_.mark_used(mm.slot);
                     ++batch_ok_n;
+                if (page_hist_enabled_ && mm.page >= 0 && mm.page < (int) page_pagein_.size()) {
+                    ++page_pagein_[(size_t) mm.page];
+                }
                     out_ptrs[mm.out_i] = vram;
                     if (host_hit[k]) {
                         ++stats_.host_tier_hits;
@@ -3049,6 +3121,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 slot_to_page_[mm.slot] = mm.page;
                 pool_.mark_used(mm.slot);
                 ++batch_ok_n;
+                if (page_hist_enabled_ && mm.page >= 0 && mm.page < (int) page_pagein_.size()) {
+                    ++page_pagein_[(size_t) mm.page];
+                }
                 out_ptrs[mm.out_i] = vram;
                 if (host_hit[k]) {
                     ++stats_.host_tier_hits;   // served from RAM; no NVMe bytes
@@ -3266,6 +3341,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 pool_.mark_used(mm.slot);
                 batch_bytes += m.size;
                 ++batch_ok_n;
+                if (page_hist_enabled_ && mm.page >= 0 && mm.page < (int) page_pagein_.size()) {
+                    ++page_pagein_[(size_t) mm.page];
+                }
                 out_ptrs[mm.out_i] = slot_ptr_(mm.slot);
                 if (mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {
                     host_prefetch_strikes_[(size_t) mm.page] = 0;
@@ -4753,6 +4831,9 @@ void WeightPager::mark_cross_layer_prefetch_candidates(const std::vector<int> & 
 }
 
 int WeightPager::page_in_sync_(int page_idx, int reuse_slot) {
+    if (page_hist_enabled_ && page_idx >= 0 && page_idx < (int) page_pagein_.size()) {
+        ++page_pagein_[(size_t) page_idx];
+    }
     // Synchronous read into a slot, bypassing the prefetch pipeline. Used by
     // ensure() on miss (reuse_slot < 0: alloc a fresh slot) and by ensure_batch
     // as its per-page failure fallback (reuse_slot >= 0: read into that already-
