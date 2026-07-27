@@ -314,6 +314,51 @@ pollution), from data not collected to test it.
 
 ---
 
+## 4e. Demand batching — +24% decode, SHIPPED (2026-07-27)
+
+The lever was framed as unbuilt. **The batcher already existed and laguna was
+silently ineligible for it.** Sister expansion (a layer's gate/up/down tensors in
+one multi-QD burst) was gated on `active.size() <= 8`, `cap = 18` — sized for
+DS4's top-6. laguna is top-10, so every `ensure_batch` call saw ONE tensor's
+actives (~4 cold misses after pool hits).
+
+Bracketed ctl/test/ctl, laguna 9000 slots, 128 forced decode tokens:
+
+| arm | calls | avg_n | eb_gb_s | wait_ms | io_gb_read | page_ins | t/s |
+|---|---|---|---|---|---|---|---|
+| CTL1 | 11419 | 3.86 | 2.174 | 37896 | 133.694 | 70104 | 2.11 |
+| **TEST** | **4073** | **10.83** | **3.210** | **25411** | **133.694** | **70104** | **2.67** |
+| CTL2 | 11419 | 3.86 | 2.232 | 36904 | 133.694 | 70104 | 2.15 |
+| CONFIRM (new default) | 4073 | 10.83 | 3.216 | 25335 | 133.694 | 70104 | 2.61 |
+
+`io_gb_read` and `page_ins` **identical to the digit** in every arm — same bytes,
+same pages, 2.8× fewer calls. Pure scheduling, caching untouched.
+
+Cap is now **derived** as `3*|active|`, which reproduces 18 for DS4 byte-for-byte
+(so DS4 is unaffected by construction) and gives laguna 30. `MAXK` 8 → 12 still
+keeps prefill on the actives-only path. Both env-overridable as A/B instruments.
+
+### page_ins attribution — the next lever, precisely located
+
+New per-call-site counters (`207c37da5`):
+
+```
+page_ins_sync_direct    25431   <- the ENTIRE non-batch population
+page_ins_ensure_sync      548   (= 544 cross-layer prefetch misses + 4)
+page_ins_ensure_async       0
+page_ins_prefetch_reap      0
+44125 + 25431 + 548 = 70104 = page_ins   (closes exactly, no remainder)
+```
+
+36% of page-ins come from `page_in_sync_` called directly by the **generic serial
+loop at `wp-eval-cb.cpp:1522`**, at ~0.64 GB/s (the drives' QD1 rate) while
+consuming ~67% of the I/O time. Two candidate fixes, unevaluated: batch that loop
+as the MoE path is batched, or — if those are the 141 consolidated parents being
+re-read every token step — **pin them** (269 MB of VRAM to eliminate ~48 GB of
+reads). `page_ins_ensure_async == 0` rules out prefetch diverting pages.
+
+---
+
 ## 5. Corrections to the record made today
 
 - **The old brief's §4.3 suspect was wrong.** Vulkan paging's garbage output was
