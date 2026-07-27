@@ -193,6 +193,58 @@ would be better.
 
 ---
 
+## 4b. 2026-07-27 validation on mad-lab-2026 (measured — do not re-derive)
+
+Vehicle: LFM2.5-8B-A1B Q6_K (lfm2moe, 24 blocks, **32 experts / 4 used**, 2 leading
+dense), `llama-perplexity`, 2 chunks, `-c 512`. Not gpt-oss.
+
+| run | PPL | page_ins | sync_fallbacks | exhaustions | exit |
+|---|---|---|---|---|---|
+| CUDA0, 128 slots, tier off | 30.5792 ± 5.28405 | 4436 | 308 | 0 | 0 |
+| CUDA0, 128 slots, tier ON 2 GB | **30.5792 ± 5.28405** | 4436 | 308 | 0 | 0 |
+| CUDA0, 12 slots | — | — | — | 20 | **134 (SIGABRT)** |
+| CUDA0, 6 slots | — | — | — | 26 | **134 (SIGABRT)** |
+| Vulkan0 (RX 480), 128 slots | 30.7924 ± 5.32553 | — | — | 0 | 0 |
+
+**Correction to `f82a6dbfb`'s commit message — it overclaims.** The `ensure()`
+fallback **diagnoses but cannot recover**. Every failing run shows
+`pinned_this_batch == pool size`: `ensure_batch` pins every cold miss *before*
+issuing reads, so whenever `alloc_slot` fails it is because earlier misses **in
+the same batch** hold the pins — and `ensure()` contends for those same pins.
+It can essentially never succeed. The real value delivered is the diagnostic
+(page, size, batch width) replacing a silent NULL. Do not call it a recovery.
+
+**Pool minimum is set by TOTAL experts, not `n_expert_used`.** Under prefill,
+`ensure_batch`'s page set is every expert any token in the chunk routes to — at
+32 experts × 512 tokens that is nearly all of them. A pool below that cannot
+work, and chunking cannot fix it, because the MoE kernel needs all active
+experts resident simultaneously. **The right fix is a startup validation** that
+fails with an actionable message instead of aborting mid-run. Not yet written.
+
+**Negative result that matters: the RAM tier does NOT starve `alloc_slot`.**
+Tier on vs off is byte-identical PPL with 0 exhaustions and
+`host_tier_stores: 4308`. That **eliminates suspect 2** as the cause of the
+2026-07-26 tier-on abort and leaves the P2P chain (§4), which is what the code
+reading concluded independently. It also confirms the tier is numerically
+transparent.
+
+**Q6_K on Vulkan is fine** — 0 block-alignment errors, so `PoolAllocator::init`'s
+padding does produce block-multiple offsets for 210-byte blocks. This closes the
+open question raised in `3b90dd346`'s commit message.
+
+**Still NOT verified:** the four-part P2P fix (`4f9cdc32f`). It is ROCm/HSA
+`dma_buf` only and cannot be exercised on 2026 at all. Needs the R9700.
+
+### Tooling gotchas hit today
+
+- `llama-cli` no longer accepts `-no-cnv` ("use llama-completion"), but
+  `llama-completion` does **not** register `--weight-paging` (SERVER/CLI/PERPLEXITY
+  only). Use `llama-perplexity` for paging work.
+- Piping a run through `| tail` buffers everything; killing it yields an empty log.
+  Redirect to a file instead.
+
+---
+
 ## 5. Corrections to the record made today
 
 - **The old brief's §4.3 suspect was wrong.** Vulkan paging's garbage output was
