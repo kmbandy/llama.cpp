@@ -914,8 +914,34 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         // avg_n (~3.4) and more ensure_batch calls
                                         // cost more than gate-compute hide of
                                         // sister I/O. Prefill stays actives-only.
+                                        // Sister-batch eligibility. The hardcoded
+                                        // `<= 8` was sized for DS4 (top-6): it admits
+                                        // decode-shaped active sets and keeps prefill
+                                        // (union over the whole batch, often most of
+                                        // the experts) on the actives-only path.
+                                        //
+                                        // But laguna is top-10, so it fell off this
+                                        // path entirely and every ensure_batch call
+                                        // saw ONE tensor's actives. Measured
+                                        // 2026-07-27 at 9000 slots: avg_n 3.92 against
+                                        // max_n 236, while the batch path itself ran
+                                        // at 2.273 GB/s — i.e. the fast path was
+                                        // starved of work, not slow.
+                                        //
+                                        // Both bounds are now env-tunable so the
+                                        // widening is measurable rather than assumed.
+                                        // Defaults reproduce the previous behaviour
+                                        // exactly (8 / 18).
+                                        static int s_sister_maxk = -1;
+                                        static int s_sister_cap  = -1;
+                                        if (s_sister_maxk < 0) {
+                                            const char * e = std::getenv("WP_ENSURE_BATCH_SISTER_MAXK");
+                                            s_sister_maxk = (e != nullptr) ? std::max(0, atoi(e)) : 8;
+                                            const char * c = std::getenv("WP_ENSURE_BATCH_CAP");
+                                            s_sister_cap  = (c != nullptr) ? std::max(1, atoi(c)) : 18;
+                                        }
                                         std::vector<int> batch_pages = active_pages;
-                                        if (active.size() <= 8) {
+                                        if ((int) active.size() <= s_sister_maxk) {
                                             static std::unordered_map<int, std::vector<int>> s_sister_cache_eb;
                                             auto sister_it = s_sister_cache_eb.find(weight_page);
                                             if (sister_it == s_sister_cache_eb.end()) {
@@ -931,7 +957,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 sister_it = s_sister_cache_eb.emplace(
                                                     weight_page, std::move(sisters)).first;
                                             }
-                                            const size_t cap = 18;
+                                            const size_t cap = (size_t) s_sister_cap;
                                             batch_pages.reserve(cap);
                                             for (int sister_parent : sister_it->second) {
                                                 if (batch_pages.size() >= cap) break;
