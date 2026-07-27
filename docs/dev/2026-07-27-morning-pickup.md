@@ -245,6 +245,42 @@ open question raised in `3b90dd346`'s commit message.
 
 ---
 
+## 4c. VERIFIED ON HARDWARE 2026-07-27 — §4 IS CLOSED
+
+R9700 (paging) + 6900 XT (residents), laguna-S-2.1 UD-Q4_K_XL, 9000 slots,
+`WP_RESIDENT_DENSE=1`, 128 tokens requested (EOS at 22). Commit `4f9cdc32f`.
+
+| arm | transport | batches | page_ins | io_gb_read | io_eff GB/s | decode t/s | exit |
+|---|---|---|---|---|---|---|---|
+| A tier off | P2P | 3175 / 0 serial | 52278 | 99.619 | 1.024 | 1.48 | 0 |
+| B tier ON 4 GB | P2P | 3175 / 0 serial | 51191 | 97.553 | 1.096 | 1.46 | 0 |
+| C repeat of A | P2P | 3175 / 0 serial | 52278 | **99.619** | 1.131 | 1.51 | 0 |
+| D control | **SERIAL** | 0 / 3174 serial | 52275 | **99.612** | 0.789 | **0.93** | 0 |
+
+**The gate passed.** Arm B is the exact configuration that `GGML_ABORT`ed twice on
+07-26. It completes. `host_tier_hits: 1086`, `host_tier_stores: 42986`.
+
+**P2P survives backpressure:** 3175 / 0 serial, against the broken 142 / 16,549.
+
+**P2P is worth +59–62% on decode** (0.93 → 1.48–1.51), A-vs-C control spread 2%.
+This supersedes the 07-26 "+33%", which compared against a partially-P2P baseline.
+
+**Bytes identical across transports** (99.612 vs 99.619, 3 pages of 52,278) — the
+correct signature for a transport-only change. Judge transport work on bytes and
+batch counts; t/s is secondary on this box.
+
+**Suspect 2 is dead, measured twice.** `sync_fallbacks: 0` and
+`batch_slot_exhaustions: 0` in every arm including tier-on; and on 2026 the tier
+gave byte-identical PPL with 0 exhaustions. `f82a6dbfb` fixes a real latent
+defect but was never the cause of the abort.
+
+**Caveats.** `LLAMA_WP_TRANSPORT=host` resolves to SERIAL, not the io_uring host
+ladder — D is P2P vs sync-pread. And 1.13 GB/s is still only ~39% of the 2.9 GB/s
+these drives give at QD16: **the fix did not touch concurrency.** `avg_n` ~5.4 of
+a 16-deep ring is unchanged and is now the top remaining lever.
+
+---
+
 ## 5. Corrections to the record made today
 
 - **The old brief's §4.3 suspect was wrong.** Vulkan paging's garbage output was
