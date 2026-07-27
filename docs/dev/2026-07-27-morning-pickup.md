@@ -387,6 +387,45 @@ because *calls* fell 11,419 → 4,073; the same pages succeeded either way. So t
 caller marks `[n_queued, N)` failed, so one rejection costs the rest of that
 batch a serial fallback. Whether that is the mechanism is unresolved.
 
+## 4f. P2P window cache was sized off the wrong quantity — prefill 2.13x
+
+`resolve_p2p_window_cache_max` derived its default from `queue_depth`
+(`max(qd*4, 64)`, and qd is 4 in practice → 64). **Wrong quantity.**
+`submit_batch` pushes a whole batch through `submit()` with no reaping in
+between and each request pins a window until its read completes, so
+concurrently-pinned windows equal **batch width**. When the cache runs out,
+`submit()` rejects, `submit_batch` **stops at that first rejection**, and the
+caller marks `[n_queued, N)` failed — silently dropping the remainder to serial
+`page_in_sync_` with no error and no timeout.
+
+| cache | pis_read_failed | eb_pages | avg_n | io GB/s | prefill ms (t/s) | decode | wall |
+|---|---|---|---|---|---|---|---|
+| 64 | 25,428 | 44,128 | 10.83 | 1.292 | 58,248 (0.81) | 2.65 | 1:53 |
+| 128 | 16,350 | 53,197 | 13.06 | 1.538 | 45,764 (1.03) | 2.56 | 1:43 |
+| **256** | **0** | **69,551** | **17.08** | **2.069** | **27,376 (1.72)** | 2.66 | **1:22** |
+
+`page_ins` (70,104) and `io_gb_read` (133.69 GB) unchanged → scheduling only.
+New default `max(qd*4, 256)` verified on hardware (`e94e8a1ee`).
+
+**It is a PREFILL win, not a decode win** (2.65 → 2.66). Prefill's `ensure_batch`
+calls carry the *union* of experts across all prompt tokens and blow past 64
+windows; decode's ~17-page batches already fit. That also explains why
+`pis_read_failed` was constant (25,431/25,432) across earlier arms whose decode
+batch width differed 2.8× — those serial page-ins were all in prefill, which was
+identical in every arm. That constancy killed the per-batch-tail theory.
+
+**QD32 is the control that isolates the cause:** it helped only because
+`resolve_p2p_window_cache_max(32)` incidentally raised the cache to 128, and 128
+still left 16,350 rejections — and it made decode *worse* (2.56). Queue depth is
+not the lever. **Do not raise `WP_P2P_QUEUE_DEPTH`.**
+
+**DEAD THEORY, do not retry:** "the 141 consolidated parents are re-read every
+token, so pin them." The arithmetic fit almost exactly (141 × 175 = 24,675 vs
+25,431) and was wrong. Parents are 432–528 MB each — confirmed live by
+`[mmq DIAG] blk.1.ffn_down_exps.weight nbytes=553648128`. 25k reads would be
+~10 TB against 133.69 GB observed, and `pis_from_ensure = 0` independently ruled
+out that path. A tight arithmetic coincidence is not evidence.
+
 ---
 
 ## 5. Corrections to the record made today
