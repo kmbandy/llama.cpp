@@ -1647,6 +1647,14 @@ void WeightPager::log_stats_summary() {
             "  page_ins_ensure_sync: %lu\n"
             "  page_ins_prefetch_reap: %lu\n"
             "  page_ins_sync_direct: %lu\n"
+            "  pis_from_ensure: %lu\n"
+            "  pis_vk_host: %lu\n"
+            "  pis_host_path: %lu\n"
+            "  pis_nonhip: %lu\n"
+            "  pis_tier_pre: %lu\n"
+            "  pis_read_failed: %lu\n"
+            "  pis_tier_promo: %lu\n"
+            "  pis_serial_batch: %lu\n"
             "  lru_walk_hot_skips: %lu\n"
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
@@ -1745,6 +1753,14 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.page_ins_ensure_sync,
             (unsigned long) s.page_ins_prefetch_reap,
             (unsigned long) s.page_ins_sync_direct,
+            (unsigned long) s.pis_from_ensure,
+            (unsigned long) s.pis_vk_host,
+            (unsigned long) s.pis_host_path,
+            (unsigned long) s.pis_nonhip,
+            (unsigned long) s.pis_tier_pre,
+            (unsigned long) s.pis_read_failed,
+            (unsigned long) s.pis_tier_promo,
+            (unsigned long) s.pis_serial_batch,
             (unsigned long) s.lru_walk_hot_skips,
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
@@ -1864,6 +1880,14 @@ void WeightPager::log_stats_summary() {
             "  page_ins_ensure_sync: %lu\n"
             "  page_ins_prefetch_reap: %lu\n"
             "  page_ins_sync_direct: %lu\n"
+            "  pis_from_ensure: %lu\n"
+            "  pis_vk_host: %lu\n"
+            "  pis_host_path: %lu\n"
+            "  pis_nonhip: %lu\n"
+            "  pis_tier_pre: %lu\n"
+            "  pis_read_failed: %lu\n"
+            "  pis_tier_promo: %lu\n"
+            "  pis_serial_batch: %lu\n"
         "  lru_walk_hot_skips: %lu\n"
         "  lru_walk_pinned_skips: %lu\n"
         "  cross_layer_prefetch_submitted: %lu\n"
@@ -1931,6 +1955,14 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.page_ins_ensure_sync,
             (unsigned long) s.page_ins_prefetch_reap,
             (unsigned long) s.page_ins_sync_direct,
+            (unsigned long) s.pis_from_ensure,
+            (unsigned long) s.pis_vk_host,
+            (unsigned long) s.pis_host_path,
+            (unsigned long) s.pis_nonhip,
+            (unsigned long) s.pis_tier_pre,
+            (unsigned long) s.pis_read_failed,
+            (unsigned long) s.pis_tier_promo,
+            (unsigned long) s.pis_serial_batch,
         (unsigned long) s.lru_walk_hot_skips,
         (unsigned long) s.lru_walk_pinned_skips,
         (unsigned long) s.cross_layer_prefetch_submitted,
@@ -2381,6 +2413,7 @@ void * WeightPager::ensure(int page_idx) {
         ++stats_.prefetch_misses;
     }
     ++stats_.sync_fallbacks;
+    ++stats_.pis_from_ensure;
     slot = page_in_sync_(page_idx);
     if (slot < 0) return nullptr;
     return slot_ptr_(slot);
@@ -2821,6 +2854,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                         host_prefetch_strikes_[(size_t) mm.page] = 0;
                     }
                 } else {
+                    ++stats_.pis_vk_host;
                     const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                     out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
                 }
@@ -3040,6 +3074,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     }
                 }
             } else {
+                ++stats_.pis_host_path;
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             }
@@ -3055,6 +3090,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         (void) n_od;
         if (!vk_h2d_handled) {
             for (std::size_t k = 0; k < misses.size(); ++k) {
+                ++stats_.pis_nonhip;
                 const int s = page_in_sync_(misses[k].page, /*reuse_slot=*/misses[k].slot);
                 out_ptrs[misses[k].out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             }
@@ -3123,6 +3159,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             int n_host_hit = 0;
             for (const Miss & mm : misses) {
                 if (host_tier_ && host_tier_->contains(mm.page)) {
+                    ++stats_.pis_tier_pre;
                     const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                     out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
                     if (s >= 0) {
@@ -3230,6 +3267,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             } else {
                 // read (or padding) failed — sync-fallback into the SAME pinned
                 // slot so the up-front pin/out_pinned bookkeeping stays valid.
+                ++stats_.pis_read_failed;
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             }
@@ -3256,6 +3294,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 // fence failed). Retire this tier copy before the serial path
                 // so page_in_sync_ performs a genuine storage read.
                 host_tier_->erase(request.page);
+                ++stats_.pis_tier_promo;
                 const int s = page_in_sync_(request.page, request.slot);
                 for (const Miss & mm : misses) {
                     if (mm.page == request.page) out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
@@ -3304,6 +3343,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     } else {
         ++stats_.ensure_batch_serial_path_batches;
         for (const Miss & mm : misses) {
+            ++stats_.pis_serial_batch;
             const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
             out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             if (s >= 0 && mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {

@@ -157,6 +157,19 @@ public:
         uint64_t page_ins_ensure_sync           = 0;  // ensure(): sync fallback after prefetch miss
         uint64_t page_ins_prefetch_reap         = 0;  // bulk prefetch reap path
         uint64_t page_ins_sync_direct           = 0;  // page_in_sync_ called directly
+        // Which CALLER invoked page_in_sync_. The page_ins_* counters above
+        // attribute by FUNCTION, which named the what but not the who: 25,431
+        // of 70,104 page_ins went through page_in_sync_ and the total was
+        // IDENTICAL across four arms whose batch width differed 2.8x, so the
+        // serial population is a fixed set of pages, not a queue-depth artifact.
+        uint64_t pis_from_ensure                = 0;  // ensure() sync fallback
+        uint64_t pis_vk_host                    = 0;  // vulkan HOST path per-miss
+        uint64_t pis_host_path                  = 0;  // WP_ENSURE_BATCH_HOST per-miss
+        uint64_t pis_nonhip                     = 0;  // non-HIP/CUDA build path
+        uint64_t pis_tier_pre                   = 0;  // pre-pipeline HostTier hit
+        uint64_t pis_read_failed                = 0;  // P2P read/padding failed
+        uint64_t pis_tier_promo                 = 0;  // tier promotion request
+        uint64_t pis_serial_batch               = 0;  // whole batch went serial
         uint64_t io_bytes                       = 0;
         double   io_seconds                     = 0.0;
         uint64_t lru_walk_hot_skips             = 0;
