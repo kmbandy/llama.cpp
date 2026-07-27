@@ -183,6 +183,7 @@ public:
         uint64_t xlayer_resident_skips          = 0; // predicted pages already resident/in-flight
         uint64_t xlayer_blocked_budget          = 0; // submits skipped: speculative cap reached
         uint64_t xlayer_blocked_free_queue      = 0; // submits skipped: scheduler queue full
+        uint64_t xlayer_bootstrap_allocs        = 0; // WP_SPEC_BOOTSTRAP: speculative slots seeded by eviction
         uint64_t demand_trimmed_by_reserve      = 0; // demand pages withheld to protect the reserve
         uint64_t xlayer_harvest_calls           = 0; // harvests run before the speculative gate
         uint64_t xlayer_harvested_pages         = 0; // Done prefetches committed+reaped by them

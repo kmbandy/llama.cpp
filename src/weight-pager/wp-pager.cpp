@@ -1609,15 +1609,17 @@ void WeightPager::log_stats_summary() {
     log_page_histogram_();
     if (xlayer_prefetch_enabled_) {
         LLAMA_LOG_WARN("  [xlayer] predict_calls=%lu pred_pages=%lu resident_skips=%lu "
-                       "blocked_budget=%lu blocked_free_queue=%lu submitted=%lu hit=%lu spec_evict_unused=%lu\n",
+                       "blocked_budget=%lu blocked_free_queue=%lu bootstrap=%lu submitted=%lu hit=%lu spec_evict_unused=%lu n_spec=%d\n",
                        (unsigned long) stats_.xlayer_predict_calls,
                        (unsigned long) stats_.xlayer_pred_pages,
                        (unsigned long) stats_.xlayer_resident_skips,
                        (unsigned long) stats_.xlayer_blocked_budget,
                        (unsigned long) stats_.xlayer_blocked_free_queue,
+                       (unsigned long) stats_.xlayer_bootstrap_allocs,
                        (unsigned long) stats_.cross_layer_prefetch_submitted,
                        (unsigned long) stats_.cross_layer_hit_in_ensure,
-                       (unsigned long) stats_.speculative_evicted_unused);
+                       (unsigned long) stats_.speculative_evicted_unused,
+                       pool_.n_speculative());
     }
     if (spec_reserve_ > 0) {
         LLAMA_LOG_WARN("  [spec-reserve] slots=%d demand_trimmed=%lu\n",
@@ -3581,12 +3583,54 @@ bool WeightPager::prefetch_pages_batch(const std::vector<int> & page_indices,
         needed.resize((size_t) free_q);
     }
     // Sample oracle: also cap to free pool slots so we never LRU-evict.
+    //
+    // BOOTSTRAP DEADLOCK (diagnosed 2026-07-27, WP_SPEC_BOOTSTRAP=1 lifts it).
+    // n_free_unpinned() counts slots that are !used_ && unpinned — genuinely
+    // UNUSED. On a warm pool that is permanently 0, so this returned false
+    // before submitting anything and speculation never allocated. Since
+    // set_speculative() is only ever called AFTER a successful allocation
+    // here, no slot could ever become speculative, so pool_.n_speculative()
+    // stayed 0 forever, so the xlayer_max_slots_ budget never bound
+    // (blocked_budget == 0), and the pool's speculative-first eviction tier
+    // — built precisely to make this safe — was unreachable dead code.
+    //
+    // That single gate is upstream of every prefetch knob measured "dead":
+    // WP_PREFETCH_MAX_SLOTS (blocked_budget=0), WP_SPEC_RESERVE (reserves
+    // QUEUE slots, not pool slots), WP_PREFETCH_DEPTH and the io-wq cap
+    // (queue depth is irrelevant behind a pool gate). It is also why
+    // WP_SPEC_REAP appeared to "unblock submission" (18 -> 41,778): harvesting
+    // commits finished prefetches and RELEASES their slots, manufacturing the
+    // free slots speculation could not otherwise obtain — bootstrapping the
+    // tier as a side effect, and racing harvest against use while doing it.
+    //
+    // The safety the original rule wanted already exists one layer down:
+    // alloc_slot() evicts the LRU SPECULATIVE slot before touching the
+    // pinned/hot working set, and mark_used() promotes a speculative slot to
+    // non-speculative the moment demand actually hits it. So once the tier is
+    // seeded it recycles within itself. Bounding the seed to xlayer_max_slots_
+    // (default n_slots/4) caps how much demand it may ever displace.
     if (!allow_evict) {
+        static const int s_spec_bootstrap = []() {
+            const char * e = std::getenv("WP_SPEC_BOOTSTRAP");
+            return (e != nullptr && e[0] == '1') ? 1 : 0;
+        }();
         const int free_pool = pool_.n_free_unpinned();
-        if (free_pool <= 0) {
+        const bool may_seed = s_spec_bootstrap && speculative &&
+                              xlayer_max_slots_ > 0 &&
+                              pool_.n_speculative() < xlayer_max_slots_;
+        if (free_pool <= 0 && !may_seed) {
             return false;
         }
-        if ((int) needed.size() > free_pool) {
+        if (may_seed) {
+            // Room left under the speculative cap; allow alloc_slot's
+            // speculative-first LRU to place these.
+            const int headroom = xlayer_max_slots_ - pool_.n_speculative();
+            if ((int) needed.size() > headroom) {
+                needed.resize((size_t) headroom);
+            }
+            allow_evict = true;
+            stats_.xlayer_bootstrap_allocs += (uint64_t) needed.size();
+        } else if ((int) needed.size() > free_pool) {
             needed.resize((size_t) free_pool);
         }
     }
