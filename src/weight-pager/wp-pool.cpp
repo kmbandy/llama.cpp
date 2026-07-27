@@ -691,6 +691,13 @@ void PoolAllocator::mark_used(int slot_idx) {
     }
 }
 
+void PoolAllocator::touch_lru(int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= n_slots_) return;
+    last_used_[slot_idx] = ++tick_;
+    // Deliberately does NOT clear speculative_ and does NOT bump hit_count_:
+    // a landed prefetch is not evidence that the page is wanted.
+}
+
 uint32_t PoolAllocator::hit_count(int slot_idx) const {
     if (slot_idx < 0 || slot_idx >= n_slots_) return 0;
     return hit_count_[slot_idx];

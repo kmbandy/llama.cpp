@@ -661,6 +661,7 @@ private:
     // (WP_SPEC_REAP). Done-but-unreaped slots hold queue capacity that no
     // reservation can reclaim. 0 = off = previous behaviour exactly.
     bool spec_reap_ = false;
+    bool spec_keep_tier_ = false;  // harvest keeps pages speculative (touch_lru, not mark_used)
 
     // Cross-layer prefetch (WP_PREFETCH_XLAYER). predictor_ holds host f32
     // copies of each layer's ffn_gate_inp; config knobs parsed once in init().

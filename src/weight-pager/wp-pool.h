@@ -111,6 +111,15 @@ public:
     // alloc_slot() and has not been evicted.
     void mark_used(int slot_idx);
 
+    // Bump the LRU tick WITHOUT promoting a speculative slot. Use this when a
+    // prefetch's read lands (harvest): the page is now resident but DEMAND has
+    // not asked for it yet, so it must stay in the speculative tier and remain
+    // the first thing evicted. mark_used() is for genuine demand hits only --
+    // calling it on harvest clears speculative_ and the tier never accumulates,
+    // which collapses alloc_slot's speculative-first eviction onto the demand
+    // working set.
+    void touch_lru(int slot_idx);
+
     // Pin / unpin a slot to protect it from eviction. Refcounted: a slot
     // pinned twice must be unpinned twice before becoming evictable again.
     // Used by the eval-callback to keep slots referenced by an in-flight

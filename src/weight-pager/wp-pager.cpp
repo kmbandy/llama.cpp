@@ -1058,6 +1058,27 @@ bool WeightPager::init(const Config &             cfg,
         if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
         if (const char * e = std::getenv("WP_SPEC_RESERVE"))         { long v = std::strtol(e,nullptr,10); if (v >= 0) spec_reserve_ = (int) v; }
         if (const char * e = std::getenv("WP_SPEC_REAP"))            spec_reap_ = (e[0] == '1');
+        // WP_PREFETCH_FIX=1 enables the three-part fix as ONE switch, because
+        // no part works alone:
+        //   1. spec_reap_       -- harvest before the scheduler-queue gate at
+        //                          the top of submit_xlayer_prefetch, or
+        //                          free_queue_slots() is 0 and nothing submits
+        //                          (measured blocked_free_queue 6207-7472).
+        //   2. WP_SPEC_BOOTSTRAP -- let speculation seed the tier by eviction,
+        //                          or n_free_unpinned() is 0 on a warm pool and
+        //                          nothing allocates (bootstrap deadlock).
+        //   3. spec_keep_tier_  -- harvest must NOT promote, or the tier never
+        //                          accumulates and eviction falls onto demand.
+        // Enabling 1+2 without 3 makes speculation evict the demand working
+        // set, which is the exact failure the "hard rule" forbids.
+        if (const char * e = std::getenv("WP_PREFETCH_FIX")) {
+            if (e[0] == '1') {
+                spec_reap_       = true;
+                spec_keep_tier_  = true;
+                setenv("WP_SPEC_BOOTSTRAP", "1", /*overwrite=*/0);
+            }
+        }
+        if (const char * e = std::getenv("WP_SPEC_KEEP_TIER"))       spec_keep_tier_ = (e[0] == '1');
         if (spec_reap_) {
             LLAMA_LOG_WARN("wp::spec reap: harvesting finished prefetches before the speculative gate\n");
         }
@@ -4015,9 +4036,24 @@ int WeightPager::harvest_ready_prefetches_() {
             // Release the in-flight speculative pin (see prefetch_pages_batch)
             // before mark_used clears the speculative flag. Read has landed, so
             // the slot is now safe to recycle. No-op for demand pages.
-            if (pool_.is_speculative(page_to_slot_[p])) pool_.unpin_slot(page_to_slot_[p]);
+            const bool was_spec = pool_.is_speculative(page_to_slot_[p]);
+            if (was_spec) pool_.unpin_slot(page_to_slot_[p]);
             page_loaded_[p] = true;
-            pool_.mark_used(page_to_slot_[p]);
+            // A landed prefetch is NOT a demand hit. mark_used() clears
+            // speculative_, so calling it here promoted every prefetched page
+            // to the hot working set the instant its read completed — the
+            // speculative tier could never accumulate, pool_.n_speculative()
+            // stayed ~0, the xlayer_max_slots_ budget could not bind, and
+            // alloc_slot's speculative-first eviction fell straight through
+            // onto the demand set. touch_lru bumps LRU without promoting, so
+            // an unwanted prediction stays first in line to be evicted and a
+            // genuinely useful one is promoted later by the demand path's own
+            // mark_used(). Gated so the default remains byte-identical.
+            if (was_spec && spec_keep_tier_) {
+                pool_.touch_lru(page_to_slot_[p]);
+            } else {
+                pool_.mark_used(page_to_slot_[p]);
+            }
             double seconds = 0.0;
             if (p < (int) prefetch_started_at_.size() &&
                 prefetch_started_at_[p] != std::chrono::steady_clock::time_point{}) {
