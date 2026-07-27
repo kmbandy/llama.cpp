@@ -148,6 +148,15 @@ public:
         uint64_t prefetch_misses                = 0;
         uint64_t sync_fallbacks                 = 0;
         uint64_t batch_slot_exhaustions         = 0;  // ensure_batch: no slot AND sync fallback failed -> NULL out_ptr
+        // page_ins attribution by call site. page_ins is the SUM of these plus
+        // the ensure_batch bursts; measured 2026-07-27 that ~36% of page_ins on
+        // laguna do NOT come from ensure_batch and run at the drive's QD1 rate
+        // (0.64 GB/s vs the batch path's 2.27), consuming ~67% of the I/O time.
+        // These name which serial path is responsible.
+        uint64_t page_ins_ensure_async          = 0;  // ensure(): prefetch completion harvested
+        uint64_t page_ins_ensure_sync           = 0;  // ensure(): sync fallback after prefetch miss
+        uint64_t page_ins_prefetch_reap         = 0;  // bulk prefetch reap path
+        uint64_t page_ins_sync_direct           = 0;  // page_in_sync_ called directly
         uint64_t io_bytes                       = 0;
         double   io_seconds                     = 0.0;
         uint64_t lru_walk_hot_skips             = 0;

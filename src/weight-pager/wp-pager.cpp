@@ -1643,6 +1643,10 @@ void WeightPager::log_stats_summary() {
             "  io_effective_gb_s: %.3f\n"
             "  sync_fallbacks: %lu\n"
             "  batch_slot_exhaustions: %lu\n"
+            "  page_ins_ensure_async: %lu\n"
+            "  page_ins_ensure_sync: %lu\n"
+            "  page_ins_prefetch_reap: %lu\n"
+            "  page_ins_sync_direct: %lu\n"
             "  lru_walk_hot_skips: %lu\n"
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
@@ -1737,6 +1741,10 @@ void WeightPager::log_stats_summary() {
             gbps,
             (unsigned long) s.sync_fallbacks,
             (unsigned long) s.batch_slot_exhaustions,
+            (unsigned long) s.page_ins_ensure_async,
+            (unsigned long) s.page_ins_ensure_sync,
+            (unsigned long) s.page_ins_prefetch_reap,
+            (unsigned long) s.page_ins_sync_direct,
             (unsigned long) s.lru_walk_hot_skips,
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
@@ -1852,6 +1860,10 @@ void WeightPager::log_stats_summary() {
         "  io_effective_gb_s: %.3f\n"
         "  sync_fallbacks: %lu\n"
             "  batch_slot_exhaustions: %lu\n"
+            "  page_ins_ensure_async: %lu\n"
+            "  page_ins_ensure_sync: %lu\n"
+            "  page_ins_prefetch_reap: %lu\n"
+            "  page_ins_sync_direct: %lu\n"
         "  lru_walk_hot_skips: %lu\n"
         "  lru_walk_pinned_skips: %lu\n"
         "  cross_layer_prefetch_submitted: %lu\n"
@@ -1915,6 +1927,10 @@ void WeightPager::log_stats_summary() {
         gbps,
         (unsigned long) s.sync_fallbacks,
             (unsigned long) s.batch_slot_exhaustions,
+            (unsigned long) s.page_ins_ensure_async,
+            (unsigned long) s.page_ins_ensure_sync,
+            (unsigned long) s.page_ins_prefetch_reap,
+            (unsigned long) s.page_ins_sync_direct,
         (unsigned long) s.lru_walk_hot_skips,
         (unsigned long) s.lru_walk_pinned_skips,
         (unsigned long) s.cross_layer_prefetch_submitted,
@@ -2322,6 +2338,7 @@ void * WeightPager::ensure(int page_idx) {
                     seconds = seconds_since(prefetch_started_at_[page_idx]);
                     prefetch_started_at_[page_idx] = std::chrono::steady_clock::time_point{};
                 }
+                ++stats_.page_ins_ensure_async;
                 record_page_in_(m_check.size, seconds);
                 page_async_event_[page_idx] = evt;
                 return slot_ptr_(slot);
@@ -2339,6 +2356,7 @@ void * WeightPager::ensure(int page_idx) {
                 seconds = seconds_since(prefetch_started_at_[page_idx]);
                 prefetch_started_at_[page_idx] = std::chrono::steady_clock::time_point{};
             }
+            ++stats_.page_ins_ensure_sync;
             record_page_in_(m_check.size, seconds);
             if (cross_layer_candidate && !loaded_before_wait) {
                 cross_layer_prefetch_candidate_[page_idx] = false;
@@ -3836,6 +3854,7 @@ int WeightPager::harvest_ready_prefetches_() {
                 seconds = seconds_since(prefetch_started_at_[p]);
                 prefetch_started_at_[p] = std::chrono::steady_clock::time_point{};
             }
+            ++stats_.page_ins_prefetch_reap;
             record_page_in_(catalog_.at(p).size, seconds);
             prefetch_.reap(p);
             ++n;
@@ -4846,6 +4865,7 @@ read_from_storage:
         page_to_slot_[page_idx] = slot;
         page_loaded_[page_idx]  = true;
         slot_to_page_[slot]     = page_idx;
+        ++stats_.page_ins_sync_direct;
         record_page_in_(m.size, seconds_since(io_t0));
         if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT p2p slot=%d\n", s_diag_count, slot);
         ++s_diag_count;
@@ -4877,6 +4897,7 @@ read_from_storage:
     page_to_slot_[page_idx] = slot;
     page_loaded_[page_idx]  = true;
     slot_to_page_[slot]     = page_idx;
+    ++stats_.page_ins_sync_direct;
     record_page_in_(m.size, seconds_since(io_t0));
     if (diag) LLAMA_LOG_ERROR("[DIAG] page_in_sync_[%d]: EXIT slot=%d\n", s_diag_count, slot);
     ++s_diag_count;
