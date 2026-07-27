@@ -1642,6 +1642,7 @@ void WeightPager::log_stats_summary() {
             "  io_gb_read: %.3f\n"
             "  io_effective_gb_s: %.3f\n"
             "  sync_fallbacks: %lu\n"
+            "  batch_slot_exhaustions: %lu\n"
             "  lru_walk_hot_skips: %lu\n"
             "  lru_walk_pinned_skips: %lu\n"
             "  cross_layer_prefetch_submitted: %lu\n"
@@ -1735,6 +1736,7 @@ void WeightPager::log_stats_summary() {
             gb_read,
             gbps,
             (unsigned long) s.sync_fallbacks,
+            (unsigned long) s.batch_slot_exhaustions,
             (unsigned long) s.lru_walk_hot_skips,
             (unsigned long) s.lru_walk_pinned_skips,
             (unsigned long) s.cross_layer_prefetch_submitted,
@@ -1849,6 +1851,7 @@ void WeightPager::log_stats_summary() {
         "  io_gb_read: %.3f\n"
         "  io_effective_gb_s: %.3f\n"
         "  sync_fallbacks: %lu\n"
+            "  batch_slot_exhaustions: %lu\n"
         "  lru_walk_hot_skips: %lu\n"
         "  lru_walk_pinned_skips: %lu\n"
         "  cross_layer_prefetch_submitted: %lu\n"
@@ -1911,6 +1914,7 @@ void WeightPager::log_stats_summary() {
         gb_read,
         gbps,
         (unsigned long) s.sync_fallbacks,
+            (unsigned long) s.batch_slot_exhaustions,
         (unsigned long) s.lru_walk_hot_skips,
         (unsigned long) s.lru_walk_pinned_skips,
         (unsigned long) s.cross_layer_prefetch_submitted,
@@ -2412,7 +2416,37 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
         note_draft_tid2eid_ensure_(p);
         const int s = pool_.alloc_slot(m.size);
-        if (s < 0) { ++stats_.sync_fallbacks; continue; }  // pool exhausted (rare)
+        if (s < 0) {
+            // No free slot for this miss (alloc_slot skips pinned slots, and
+            // every earlier miss in THIS batch is already pinned). Falling
+            // through with `continue` used to leave out_ptrs[i] NULL with no
+            // fallback and no log — and wp-eval-cb.cpp hard-aborts on a NULL
+            // for an active expert ("active expert page-in failed"). That is
+            // the only NULL-producing path here that logs nothing, which is
+            // why the abort looked like a read failure when the read path was
+            // never involved.
+            //
+            // Serve it synchronously instead, exactly like the in-flight
+            // prefetch branch above. ensure() re-runs eviction and may well
+            // succeed where the batch alloc did not.
+            ++stats_.sync_fallbacks;
+            void * ptr = ensure(p);
+            if (ptr != nullptr) {
+                pool_.pin_slot(page_to_slot_[p]);
+                out_pinned.push_back(p);
+                out_ptrs[i] = ptr;
+                continue;
+            }
+            // Genuinely unservable: the pool cannot hold this batch's working
+            // set. Still leaves a NULL, but now it is diagnosed at the source
+            // rather than surfacing as an abort a hundred frames later.
+            ++stats_.batch_slot_exhaustions;
+            LLAMA_LOG_ERROR("[wp::ensure_batch] pool exhausted: page=%d size=%zu "
+                            "batch_misses=%zu pinned_this_batch=%zu — no slot and "
+                            "sync fallback failed\n",
+                            p, (size_t) m.size, misses.size(), out_pinned.size());
+            continue;
+        }
         ensure_slot_map_(s);
         page_to_slot_[p]  = s;
         slot_to_page_[s]  = p;

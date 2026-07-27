@@ -147,6 +147,7 @@ public:
         uint64_t prefetch_hits                  = 0;
         uint64_t prefetch_misses                = 0;
         uint64_t sync_fallbacks                 = 0;
+        uint64_t batch_slot_exhaustions         = 0;  // ensure_batch: no slot AND sync fallback failed -> NULL out_ptr
         uint64_t io_bytes                       = 0;
         double   io_seconds                     = 0.0;
         uint64_t lru_walk_hot_skips             = 0;
