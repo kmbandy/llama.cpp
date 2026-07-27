@@ -99,16 +99,41 @@ public:
         char * base = static_cast<char *>(pool_base_);
         char * d    = static_cast<char *>(dst);
         if (d < base || d + size > base + pool_size_) {
-            switch_to_host_("dst outside pool", 0);
-            return false;
+            // Not a pool destination. Since submit() can now reject a single
+            // request for window pressure while P2P stays enabled, the pager
+            // retries that read into its host staging buffer — which is
+            // legitimately outside the pool. Treating it as a transport fault
+            // killed P2P AND returned false, so the retry failed on its only
+            // attempt and the caller returned -1 (null active expert -> the
+            // GGML_ABORT in wp-eval-cb).
+            //
+            // A non-pool dst is simply a request the host layer must serve.
+            // reap_raw_ drains host_ whenever it has work outstanding, so the
+            // completion is not stranded.
+            return host_->submit(req_id, fd_idx, offset, size, dst);
         }
         const uint64_t pool_off = (uint64_t) (d - base);
 
         void * mapped_dst = nullptr;
         uint64_t map_key  = 0;
         if (!acquire_window_(pool_off, size, mapped_dst, map_key)) {
-            switch_to_host_errno_("window mmap failed", errno);
-            return false;
+            if (errno != EAGAIN) {
+                switch_to_host_errno_("window mmap failed", errno);
+                return false;
+            }
+            // Window pressure. Push queued SQEs so in-flight reads can land,
+            // drain whatever has completed (each completion releases its
+            // window via release_inflight_key_), then try once more. Reaped
+            // results go into ready_, which the normal reap path drains, so
+            // consuming CQEs here cannot lose a completion.
+            flush_submissions_();
+            while (reap_ready_cqe_()) { }
+            if (!acquire_window_(pool_off, size, mapped_dst, map_key)) {
+                // Still no window. Fail THIS request only — the caller falls
+                // back for it — and leave P2P enabled for everything after.
+                ++window_pressure_fallbacks_;
+                return false;
+            }
         }
 
         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring_);
@@ -215,9 +240,13 @@ public:
             return true;
         }
 
-        // P2P ring drained. In host-fallback mode pull from the host layer;
-        // in active-P2P mode with nothing pending there's nothing to reap.
-        if (!p2p_enabled_) {
+        // P2P ring drained. Pull from the host layer in host-fallback mode, and
+        // ALSO while P2P is still enabled if the host layer has work
+        // outstanding — submit() now routes non-pool destinations there (the
+        // pager's staging-buffer retry after a window-pressure rejection), so
+        // the two coexist. Without this the routed read is submitted and never
+        // reaped, and wait_for_req(req_id, -1) blocks forever.
+        if (!p2p_enabled_ || host_->pending() > 0) {
             IoResult r = host_->wait_any(timeout_ms);
             if (r.status == IoStatus::Timeout) return false;
             out = r;
@@ -615,7 +644,14 @@ private:
 
         while ((int) window_cache_.size() >= max_windows_) {
             if (!evict_one_idle_()) {
-                errno = ENOMEM;
+                // TRANSIENT, not fatal: the cache is at cap and every entry is
+                // still referenced by an in-flight read. Signal EAGAIN so the
+                // caller drains completions and retries instead of tearing the
+                // whole transport down. This used to report ENOMEM, which the
+                // caller could not distinguish from a real mmap failure, so a
+                // moment of window pressure permanently downgraded P2P to
+                // sync-pread for the rest of the process.
+                errno = EAGAIN;
                 return false;
             }
         }
@@ -713,6 +749,10 @@ private:
     std::vector<int> fds_;
     std::unique_ptr<FileIOLayer> host_;
     bool p2p_enabled_ = false;
+    // Count of requests that fell back for window pressure alone.
+    // Non-fatal; if this is large the window cache is undersized
+    // relative to queue depth.
+    uint64_t window_pressure_fallbacks_ = 0;
     bool ring_ok_ = false;
     bool files_registered_ = false;
     int pending_ = 0;

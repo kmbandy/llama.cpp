@@ -4818,7 +4818,15 @@ read_from_storage:
         return read_ok;
     };
     bool ok = read_once();
-    if (!ok && direct_to_device && !file_io_->direct_to_device()) {
+    // Retry through host staging on ANY direct-to-device read failure, not
+    // only when the transport disabled itself. A P2P submit can now fail for
+    // transient window pressure while P2P stays enabled (see
+    // IoUringP2PFileIO::submit) — the old condition required
+    // !file_io_->direct_to_device(), so that case fell through unretried and
+    // returned -1, which surfaces as a null active-expert pointer and the hard
+    // GGML_ABORT in wp-eval-cb. Retrying unconditionally is also correct for
+    // the self-disable case: direct_to_device is already false there.
+    if (!ok && direct_to_device) {
         direct_to_device = false;
         read_dst = staging;
         ok = read_once();
