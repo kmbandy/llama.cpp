@@ -41,9 +41,29 @@ int resolve_p2p_queue_depth(int configured_depth) {
 }
 
 int resolve_p2p_window_cache_max(int queue_depth) {
+    // Sized off BATCH WIDTH, not queue_depth. submit_batch pushes a whole
+    // batch through submit() with no reaping in between and each request
+    // pins a window until its read completes, so the number of
+    // concurrently-pinned windows is the batch width — queue_depth never
+    // bounds it. When the cache runs out, submit() rejects, submit_batch
+    // STOPS at that first rejection, and the caller marks [n_queued, N)
+    // failed, dropping the rest of the batch to serial page_in_sync_.
+    //
+    // MEASURED 2026-07-27 (laguna, R9700, prefill unions experts across all
+    // prompt tokens so its batches are far wider than decode's):
+    //   cache  64 -> pis_read_failed 25,428 | prefill 58,248 ms (0.81 t/s)
+    //   cache 128 -> pis_read_failed 16,350 | prefill 45,764 ms (1.03 t/s)
+    //   cache 256 -> pis_read_failed      0 | prefill 27,376 ms (1.72 t/s)
+    // io_effective 1.292 -> 2.069 GB/s, total wall -27%. Decode is unchanged
+    // (2.65 vs 2.66 t/s) — decode's narrower batches already fit in 64.
+    //
+    // Host VA cost is ~cap * slot_size of *virtual* mappings into the pool's
+    // dma_buf (660 MB at 256 x 2.58 MB for laguna, ~1.1 GB for DS4's 4.45 MB
+    // slots). That is address space, not resident memory, and still far from
+    // mapping the whole 22 GiB pool.
     int fallback = queue_depth * 4;
-    if (fallback < 64) fallback = 64;
-    if (fallback > 256) fallback = 256;
+    if (fallback < 256)  fallback = 256;
+    if (fallback > 1024) fallback = 1024;
     return parse_p2p_positive_env("WP_P2P_WINDOW_CACHE_MAX", fallback, 1, 4096);
 }
 
