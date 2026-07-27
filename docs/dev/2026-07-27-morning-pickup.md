@@ -426,6 +426,72 @@ token, so pin them." The arithmetic fit almost exactly (141 × 175 = 24,675 vs
 ~10 TB against 133.69 GB observed, and `pis_from_ensure = 0` independently ruled
 out that path. A tight arithmetic coincidence is not evidence.
 
+## 4g. Per-page access histogram — static pinning is DEAD, layout is the lever
+
+First time the pager has been asked which pages it touches. `WP_PAGE_HIST=1`
+(`0e093c557`), laguna, two **different** prompts, 128 forced decode tokens.
+
+| | prompt A | prompt B |
+|---|---|---|
+| pages touched | 35,790 / 36,237 (**98.8%**) | 35,805 / 36,237 (98.8%) |
+| busiest page | 319 accesses | 353 accesses |
+| ≥80% of busiest | 90 pages, **213 page_ins** | 36 pages, **75 page_ins** |
+| ≥50% | 453 pages, 1,189 | 225 pages, 469 |
+| ≥10% | 5,099 pages, 14,261 | 4,333 pages, 17,826 |
+
+**Three independent reasons pinning buys nothing:**
+
+1. **The hot pages are already resident.** ~320–353 accesses against **2 page_ins**
+   = **99.4% hit rate**. The LRU pool already keeps them; pinning cannot beat that.
+2. **The hot set is a rounding error in read terms.** The ≥80% set is 213 / 75
+   page_ins of ~70,000 — **0.3% / 0.1%**.
+3. **The hot set is prompt-dependent with ZERO overlap.** Top-40 by access,
+   A vs B: **0 pages in common.** A static pin computed on one prompt is wrong
+   for the next.
+
+98.8% of all 36,237 expert pages touched in one 175-token run — as flat as
+routing gets. Confirms the offline concentration analysis from the pager
+directly, on two prompts.
+
+**Everything structurally hot is already resident**: `WP_RESIDENT_DENSE` puts
+dense/attention on the resident device and shexp+ffn_island on the paging
+device; the 141 non-expert pages are consolidated parents (metadata, no slot).
+
+**Recommendation: spend the 6900 XT's 16 GB on POOL CAPACITY, not a hot set.**
+The measured skew curve (§4d, ~2.1× with no cliff to 8.8% residency) says every
+point of residency pays. A hot set pays 0.3%.
+
+### The real redistribution lever: expert-major file layout
+
+The histogram exposed it — top pages come in triplets exactly **257 page-indices
+apart** (257 = 256 experts + 1 parent):
+
+```
+5532 gate | 5789 up | 6046 down   <- blk.8 expert.134
+```
+
+The GGUF is **role-major**: all 256 experts' `gate`, then all `up`, then all
+`down`. So one expert's three tensors are **~450 MB apart in the file**. Every
+token, for each of 10 active experts, we issue 3 reads scattered ~450 MB apart
+when what we want is that expert's contiguous 5.7 MB.
+
+**Expert-major repack** (`[e0: gate,up,down][e1: …]`) makes it 1 read instead of
+3: ~690 misses/token → **~230 requests**.
+
+**Honest sizing — this is NOT 3× throughput.** The drives already do 2.84–2.95
+GB/s on random 4.45 MB reads and we sit at 2.07 GB/s post-fix (71% of ceiling),
+so bandwidth may gain only 10–30%. The win is **request count** — 3× fewer
+windows, SQEs and completions — which is exactly what cost 25,428 serial
+fallbacks (§4f), and **it scales with model width**: K3 is top-16 (+2 shared) × 3
+= 48 pages/layer vs laguna's 30.
+
+**Implementation:** a GGUF tensor's data must be contiguous, so you cannot
+interleave inside `ffn_gate_exps`. But the pager reads `(file_idx, offset, size)`
+triples, not GGUF tensors — a repack tool can emit an expert-major blob + index
+and the pager streams from it while the GGUF stays canonical. No loader changes,
+no 36k-tensor bloat. **Verification is trivial:** a permutation of identical
+bytes must give bit-identical output at temp 0.
+
 ---
 
 ## 5. Corrections to the record made today
