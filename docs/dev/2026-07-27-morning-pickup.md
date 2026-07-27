@@ -281,6 +281,39 @@ a 16-deep ring is unchanged and is now the top remaining lever.
 
 ---
 
+## 4d. Hit rate vs pool residency — MEASURED, do not re-derive
+
+laguna-S-2.1 UD-Q4_K_XL (73.4 GB), R9700 paging + 6900 XT residents, P2P,
+`--ignore-eos -n 128` (full 128 decode steps every arm), temp 0 so the token
+sequence is identical across arms.
+
+| slots | pool | residency | page_ins | evictions | hit% | skew | io GB/s | t/s |
+|---|---|---|---|---|---|---|---|---|
+| 9000 | 23.22 GB | 31.6% | 70,104 | 61,108 | 61.2 | 1.94× | 1.194 | 2.11 |
+| 6000 | 15.48 GB | 21.1% | 82,486 | 76,490 | 54.3 | 2.57× | 1.317 | 1.84 |
+| 4000 | 10.32 GB | 14.1% | 127,141 | 123,145 | 29.6 | 2.10× | 1.657 | 1.30 |
+| 3400 | 8.77 GB | **11.9%** | 135,184 | 131,788 | 25.1 | 2.11× | 2.070 | 1.24 |
+| 2500 | 6.45 GB | 8.8% | 146,543 | 144,047 | 18.8 | 2.14× | 2.112 | 1.14 |
+
+**The skew factor (hit% ÷ residency) is ~2.1× and does NOT collapse** — 2.10,
+2.11, 2.14 across the bottom three points. Earlier analyses assumed 1.5× and
+flagged anything below ~30% residency as unverified extrapolation. It is now
+measured to 8.8%. **There is no cliff.**
+
+**`io_effective_gb_s` RISES as the pool SHRINKS** (1.194 → 2.112 GB/s). Backwards
+for an I/O-bound system, and decisive for the concurrency-bound diagnosis: small
+pools generate more concurrent demand, filling the io_uring queue and driving the
+NVMe toward saturation. **41% of the 2.9 GB/s QD16 ceiling at 9000 slots, 73% at
+2500.** The drive was never the bottleneck — we are starving it, and the
+small-pool arms only hold up because extra misses accidentally fix queue depth.
+Strongest evidence yet for demand-batching (issue a layer's own known pages
+concurrently the instant the router fires — no prediction, no extra bytes, no
+pollution), from data not collected to test it.
+
+**Throughput degrades gracefully:** a 3.6× pool reduction costs 1.85× throughput.
+
+---
+
 ## 5. Corrections to the record made today
 
 - **The old brief's §4.3 suspect was wrong.** Vulkan paging's garbage output was
