@@ -157,6 +157,33 @@ P2P back to 142).
 No `file IO failed`, no `stage_in failed`. The read path was not the failing link.
 Do not start there.
 
+> **RESOLVED 2026-07-27 — and this paragraph was wrong.** The read path *was*
+> the failing link. `page_in_sync_` logs `file IO failed for page %d` through
+> `LLAMA_LOG_WARN`, which §6 of this very brief records as **suppressed without
+> `-v`**. The log fired; we could not see it. Absence of a log is not absence of
+> execution — we wrote that rule down and then reasoned straight past it.
+>
+> Both suspects below were also wrong in their framing. **Suspect 1 is not a
+> refcount leak** — nothing leaks, every release path is balanced. `submit_batch`
+> pushes the whole batch through `submit()` with no reaping in between and each
+> pins a window until completion, so concurrently-pinned windows equal the
+> **batch width**, never `queue_depth`; `max(queue_depth*4, 64)` is sized off the
+> wrong quantity. That is also why it dies at exactly 142 batches on both run
+> lengths: the first batch whose window spread crosses the cap is a property of
+> the model's layout, not of load.
+>
+> **The abort had a third and fourth cause**, which is why last night's two
+> attempts each failed despite both being individually correct:
+> `submit()` delegated to `host_` only when P2P was *already disabled*, so the
+> staging retry arrived with P2P live, failed the pool bounds check, and hit
+> `switch_to_host_("dst outside pool") + return false` — failing on its only
+> attempt. And `reap_raw_` drained `host_` only when `!p2p_enabled_`, so simply
+> routing the retry would have **hung** instead of aborting.
+>
+> Fixed in `f82a6dbfb` (ensure_batch fallback) and `4f9cdc32f` (all four P2P
+> pieces). **Compiles; NOT yet verified on hardware** — the tier-on run that
+> aborted still needs a rerun on the R9700.
+
 ### Also worth knowing
 
 `FileIOLayer::submit_batch` **stops at the first rejection** and the caller treats
