@@ -32,6 +32,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+    } else {
+        // Some DFlash exports omit the sliding-window key even though the drafter was
+        // trained with SWA. That loads cleanly and silently drafts with full attention,
+        // which only shows up as a lower acceptance rate -- so say so out loud.
+        LLAMA_LOG_WARN("%s: DFlash export declares no sliding window; the drafter will use "
+                       "FULL attention. If this speculator was trained with SWA, acceptance "
+                       "will be degraded.\n", __func__);
     }
 
     type = LLM_TYPE_UNKNOWN;
@@ -57,6 +64,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
+    // Optional per-aux-layer norm applied to each target-layer hidden slice BEFORE
+    // the fc fusion. Present on the Laguna-generation DFlash export, absent on the
+    // original (DS4) one, which normalises only after fc via output_norm_enc.
+    const int64_t n_aux = (int64_t) target_layer_ids.size();
+    aux_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_AUX_NORM, "weight"), { n_embd, n_aux }, TENSOR_NOT_REQUIRED);
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_draft_vocab }, TENSOR_NOT_REQUIRED);
 
@@ -72,6 +85,23 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+
+        // Optional softplus attention-output gate. Present when the drafter is built
+        // from a gated decoder block (dflash.decoder_arch = "laguna"); absent on the
+        // plain qwen3-style block. Width selects the layout exactly as in laguna.cpp
+        // -- never guess between the two.
+        const ggml_tensor * gate_meta = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_GATE, "weight", i).str().c_str());
+        if (gate_meta != nullptr) {
+            const int64_t n_gate_per_head = n_head;
+            const int64_t n_gate_per_elem = n_embd_head_k * n_head;
+            const int64_t n_gate_out      = gate_meta->ne[1];
+            if (n_gate_out != n_gate_per_head && n_gate_out != n_gate_per_elem) {
+                GGML_ABORT("DFlash: unexpected attention gate width %lld at layer %d "
+                           "(expected %lld per-head or %lld per-element)",
+                           (long long) n_gate_out, i, (long long) n_gate_per_head, (long long) n_gate_per_elem);
+            }
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), { n_embd, n_gate_out }, 0);
+        }
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
@@ -111,6 +141,23 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
+
+    // Per-aux-layer norm, applied to each target-layer slice before fusion.
+    // cur is [n_embd*n_aux, n_tokens] with each slice contiguous along ne[0], so
+    // viewing it as [n_embd, n_aux, n_tokens] makes ggml_rms_norm (which reduces
+    // over ne[0]) normalise every slice independently -- one op for all of them.
+    // The weight is [n_embd, n_aux] and broadcasts over the token axis.
+    if (model.aux_norm_enc) {
+        const int64_t n_aux = model.aux_norm_enc->ne[1];
+
+        GGML_ASSERT(cur->ne[0] == model.aux_norm_enc->ne[0] * n_aux);
+
+        cur = ggml_reshape_3d(ctx0, cur, model.aux_norm_enc->ne[0], n_aux, n_tokens);
+        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+        cur = ggml_mul(ctx0, cur, model.aux_norm_enc);
+        cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd_inp_enc(), n_tokens);
+        cb(cur, "aux_norm_out", -1);
+    }
 
     cur = build_lora_mm(model.fc, cur);
     cb(cur, "fc_out", -1);
@@ -249,10 +296,45 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
+        // Softplus output gate (gated decoder block, e.g. dflash.decoder_arch =
+        // "laguna"). Projected from the *pre-attention* hidden state, matching the
+        // reference, and applied to the attention output before o_proj -- so wo is
+        // deferred out of build_attn when a gate is present.
+        ggml_tensor * gate = layer.wqkv_gate
+            ? build_lora_mm(layer.wqkv_gate, noise_norm)
+            : nullptr;
+        if (gate) {
+            cb(gate, "attn_gate_proj", il);
+        }
+
         // cache-aware, non-causal attention
+        ggml_tensor * wo_deferred = gate ? nullptr : layer.wo;
+
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo_deferred, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo_deferred, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+        if (gate) {
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+
+            const int64_t n_gate_tokens = cur->ne[1];
+
+            if (layer.wqkv_gate->ne[1] == n_head) {
+                // per-head: broadcast one scalar per head across head_dim
+                cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_gate_tokens);
+                gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_gate_tokens);
+                cur  = ggml_mul(ctx0, cur, gate);
+                cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_gate_tokens);
+            } else {
+                // per-element: gate spans the full attention output
+                cur = ggml_mul(ctx0, cur, gate);
+            }
+            cb(cur, "attn_gated", il);
+
+            cur = build_lora_mm(layer.wo, cur);
+            cb(cur, "attn_o_proj", il);
+        }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
