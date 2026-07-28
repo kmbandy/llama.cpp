@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <ctime>         // clock_gettime(CLOCK_THREAD_CPUTIME_ID) — predict() cost
 #include <cstdlib>      // getenv, setenv, unsetenv, malloc, free
 #include <exception>
 #include <fstream>     // WP_ROUTE_TRACE diagnostic dump
@@ -920,7 +921,18 @@ void WeightPager::submit_host_prefetch(const float * h, int from_layer) {
 
         std::vector<ExpertRef> refs;
         // from_layer+(d-1) with K=1 predicts exactly layer from_layer+d.
+        // Timed separately from the enclosing eval-cb block so the scalar GEMV
+        // (n_expert x n_embd, single-threaded, plus a full double-precision
+        // softmax when conf > 0) can be attributed on its own. Thread CPU time,
+        // so host-load drift cannot contaminate it.
+        timespec pc0{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &pc0);
         predictor_.predict(h, from_layer + d - 1, /*K=*/1, M, n_layer_, refs, conf);
+        timespec pc1{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &pc1);
+        stats_.host_predict_cpu_ms +=
+            (double)(pc1.tv_sec - pc0.tv_sec) * 1e3 + (double)(pc1.tv_nsec - pc0.tv_nsec) / 1e6;
+        ++stats_.host_predict_calls;
         for (const ExpertRef & r : refs) {
             std::vector<int> pages;
             expert_sister_pages(r.layer, r.expert, pages);
@@ -1797,6 +1809,12 @@ void WeightPager::log_stats_summary() {
             "  host_prefetch_skipped: %lu\n"
             "  host_prefetch_strike_held: %lu\n"
             "  host_prefetch_budget_trim: %lu\n"
+            "  cb_prefetch_calls: %lu\n"
+            "  cb_prefetch_wall_ms: %.1f\n"
+            "  cb_prefetch_cpu_ms: %.1f\n"
+            "  cb_prefetch_blocked_ms: %.1f\n"
+            "  host_predict_calls: %lu\n"
+            "  host_predict_cpu_ms: %.1f\n"
             "  host_spec_resident: %lu\n"
             "  host_spec_evicted_unused: %lu\n"
             "  host_spec_promotions: %lu\n"
@@ -1908,6 +1926,12 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.host_prefetch_skipped,
             (unsigned long) s.host_prefetch_strike_held,
             (unsigned long) s.host_prefetch_budget_trim,
+            (unsigned long) s.cb_prefetch_calls,
+            s.cb_prefetch_wall_ms,
+            s.cb_prefetch_cpu_ms,
+            s.cb_prefetch_wall_ms - s.cb_prefetch_cpu_ms,
+            (unsigned long) s.host_predict_calls,
+            s.host_predict_cpu_ms,
             (unsigned long) s.host_spec_resident,
             (unsigned long) s.host_spec_evicted_unused,
             (unsigned long) s.host_spec_promotions,

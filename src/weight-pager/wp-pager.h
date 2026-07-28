@@ -202,6 +202,19 @@ public:
         // HostTier speculative sub-tier (WP_HOST_SPEC_TIER). The ratio that
         // matters is promotions vs evicted_unused: it is the RAM prefetcher's
         // precision, measured on pages that actually reached the tier.
+        // CRITICAL-PATH PROFILE of the inline prefetch block in the eval cb.
+        // cb_prefetch_cpu_ms  = work on the eval thread (scalar GEMV, f32
+        //                       convert, softmax) -- this is the tax a side
+        //                       thread would remove.
+        // cb_prefetch_wall_ms - cb_prefetch_cpu_ms = blocked/descheduled, i.e.
+        //                       hipStreamSynchronize.
+        // Thread CPU time is load-immune; wall clock on this box is not
+        // (20-23% within-arm spread, decision da055d88).
+        uint64_t cb_prefetch_calls              = 0;
+        double   cb_prefetch_wall_ms            = 0.0;
+        double   cb_prefetch_cpu_ms             = 0.0;
+        uint64_t host_predict_calls             = 0;
+        double   host_predict_cpu_ms            = 0.0; // the router GEMV alone
         uint64_t host_spec_resident             = 0; // unconfirmed predictions in RAM now
         uint64_t host_spec_evicted_unused       = 0; // predictions thrown away unused
         uint64_t host_spec_promotions           = 0; // predictions a demand hit confirmed
@@ -521,6 +534,13 @@ public:
     void submit_xlayer_prefetch(const float * h, int from_layer);
     bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
     void submit_host_prefetch(const float * h, int from_layer);
+    // Accumulate one execution of the inline eval-cb prefetch block. Called
+    // from the block's scope guard so it records on every exit path.
+    void note_cb_prefetch_cost(double wall_ms, double cpu_ms) {
+        ++stats_.cb_prefetch_calls;
+        stats_.cb_prefetch_wall_ms += wall_ms;
+        stats_.cb_prefetch_cpu_ms  += cpu_ms;
+    }
     bool host_prefetch_enabled() const { return host_prefetcher_ != nullptr; }
 
     // Scheduler queue slots that DEMAND prefetch may not consume, so that

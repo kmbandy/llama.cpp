@@ -19,6 +19,7 @@ extern "C++" void *                ggml_cuda_get_wp_compute_stream(int device);
 #endif
 
 #include <chrono>        // WP_PROFILE_EVAL host-time instrumentation
+#include <ctime>         // clock_gettime(CLOCK_THREAD_CPUTIME_ID) — critical-path profile
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>       // getenv
@@ -351,6 +352,34 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if ((pager->xlayer_prefetch_enabled() || pager->host_prefetch_enabled()) &&
         t->op == GGML_OP_MUL_MAT &&
         t->src[0] != nullptr && t->src[1] != nullptr) {
+        // CRITICAL-PATH PROFILE. This block runs INLINE in graph execution, per
+        // layer per token. Wall and thread-CPU are taken separately because they
+        // answer different questions and the difference is itself the answer:
+        //   cpu         = work done ON this thread (the scalar router GEMV, the
+        //                 f32 conversion, the double-precision softmax)
+        //   wall - cpu  = time BLOCKED or descheduled (hipStreamSynchronize)
+        // CLOCK_THREAD_CPUTIME_ID does not advance while blocked in the sync and
+        // does not accrue time stolen by other processes, so `cpu` is immune to
+        // the host-load drift that made tok/s unusable on this box (20-23%
+        // within-arm spread, decision da055d88). Cost is one vdso clock_gettime
+        // pair against a block that already does a D2H and ~1.5 MMAC.
+        const auto blk_w0 = std::chrono::steady_clock::now();
+        timespec   blk_c0{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &blk_c0);
+        struct BlockProfile {
+            WeightPager * p; std::chrono::steady_clock::time_point w0; timespec c0;
+            ~BlockProfile() {
+                timespec c1{};
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+                const double cpu_ms =
+                    (double)(c1.tv_sec - c0.tv_sec) * 1e3 + (double)(c1.tv_nsec - c0.tv_nsec) / 1e6;
+                const double wall_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - w0).count();
+                p->note_cb_prefetch_cost(wall_ms, cpu_ms);
+            }
+        } blk_prof{pager, blk_w0, blk_c0};
+
         const char * w0 = ggml_get_name(t->src[0]);
         int L = -1;
         if (w0 != nullptr && std::strstr(w0, "ffn_gate_inp") != nullptr) {
