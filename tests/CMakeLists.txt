@@ -250,6 +250,20 @@ llama_build_and_test(test-paged-decode-oracle.cpp)
 llama_build_and_test(test-weight-pager.cpp)
 target_include_directories(test-weight-pager PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+add_executable(
+    test-wp-repack
+    test-wp-repack.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-repack/wp-repack-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-page-catalog.cpp
+)
+target_include_directories(test-wp-repack PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-repack
+)
+target_link_libraries(test-wp-repack PRIVATE ggml)
+target_compile_features(test-wp-repack PRIVATE cxx_std_17)
+llama_test(test-wp-repack)
+
 llama_build_and_test(test-memory-tier.cpp)
 target_include_directories(test-memory-tier PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
