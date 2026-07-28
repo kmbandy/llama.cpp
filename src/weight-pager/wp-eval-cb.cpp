@@ -453,8 +453,18 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     d2h(hh->data, ggml_nbytes(hh), hbuf) &&
                     to_f32(hbuf.data(), hh->type, (int64_t) n_embd * n_tok, hf)) {
                     for (int j = 0; j < n_tok; ++j) {
+                        // xlayer stays INLINE: it allocates pool slots and
+                        // submits to the PrefetchScheduler, neither of which is
+                        // thread-safe. Only the host/RAM path moves off-thread.
                         pager->submit_xlayer_prefetch(hf.data() + (size_t) j * n_embd, L);
-                        pager->submit_host_prefetch(hf.data() + (size_t) j * n_embd, L);
+                        if (pager->host_prefetch_async_enabled()) {
+                            // Copies the row and returns; the GEMV happens on
+                            // the worker. This is the 9.1% coming off the path.
+                            pager->submit_host_prefetch_async(hf.data() + (size_t) j * n_embd,
+                                                              n_embd, L);
+                        } else {
+                            pager->submit_host_prefetch(hf.data() + (size_t) j * n_embd, L);
+                        }
                     }
                 }
             }

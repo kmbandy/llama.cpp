@@ -904,6 +904,62 @@ void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
                          /*allow_evict=*/false, /*speculative=*/true);
 }
 
+void WeightPager::submit_host_prefetch_async(const float * h, int n_embd, int from_layer) {
+    if (!initialized_ || !host_prefetcher_ || h == nullptr || n_embd <= 0) return;
+    {
+        std::lock_guard<std::mutex> lk(hp_mu_);
+        if (hp_stop_) return;
+        if (hp_queue_.size() >= hp_max_queue_) {
+            // Shed rather than block. Blocking here would put the eval thread
+            // back on the critical path -- the exact thing this exists to
+            // avoid -- and a dropped prediction costs only recall.
+            ++stats_.hp_async_dropped;
+            return;
+        }
+        hp_queue_.push_back(HostPredictJob{from_layer, std::vector<float>(h, h + n_embd)});
+        ++stats_.hp_async_enqueued;
+        if (hp_queue_.size() > stats_.hp_async_max_depth) {
+            stats_.hp_async_max_depth = hp_queue_.size();
+        }
+    }
+    hp_cv_.notify_one();
+}
+
+void WeightPager::hp_worker_loop_() {
+    for (;;) {
+        HostPredictJob job;
+        {
+            std::unique_lock<std::mutex> lk(hp_mu_);
+            hp_cv_.wait(lk, [this] { return hp_stop_ || !hp_queue_.empty(); });
+            // Drain before exiting is deliberately NOT done: on shutdown the
+            // outstanding predictions are worthless (nothing will consume the
+            // pages) and draining would delay teardown.
+            if (hp_stop_) return;
+            job = std::move(hp_queue_.front());
+            hp_queue_.pop_front();
+        }
+        // Runs OFF the eval thread. Everything it touches was audited:
+        //   predictor_          -- shared_mutex added; set_router resizes.
+        //   host_prefetcher_    -- enqueue() is mutex-guarded.
+        //   host_tier_          -- has its own mutex.
+        //   host_prefetch_strikes_ -- now single-writer (this thread only).
+        //   page_to_slot_       -- read only; the pre-existing documented
+        //                          benign race, which can only cost recall.
+        submit_host_prefetch(job.h.data(), job.layer);
+    }
+}
+
+void WeightPager::hp_stop_worker_() {
+    if (!hp_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(hp_mu_);
+        hp_stop_ = true;
+        hp_queue_.clear();
+    }
+    hp_cv_.notify_all();
+    hp_thread_.join();
+}
+
 void WeightPager::submit_host_prefetch(const float * h, int from_layer) {
     if (!initialized_ || !host_prefetcher_ || h == nullptr) return;
 
@@ -1335,6 +1391,20 @@ bool WeightPager::init(const Config &             cfg,
                     },
                     (size_t) queue_depth, catalog_.max_page_size());
                 host_prefetcher_->start();
+                // Async prediction worker. Default OFF so the inline path
+                // remains the reference until this is measured against it.
+                host_prefetch_async_ = env_flag_is_one("WP_HOST_PREFETCH_ASYNC");
+                if (host_prefetch_async_) {
+                    if (const char * e = std::getenv("WP_HOST_PREFETCH_ASYNC_QUEUE")) {
+                        const long v = std::strtol(e, nullptr, 10);
+                        if (v > 0) hp_max_queue_ = (size_t) v;
+                    }
+                    hp_stop_ = false;
+                    hp_thread_ = std::thread(&WeightPager::hp_worker_loop_, this);
+                    LLAMA_LOG_WARN("wp::host prefetch: ASYNC worker ON (queue=%zu) — "
+                                   "RouterPredictor::predict moved OFF the eval thread\n",
+                                   hp_max_queue_);
+                }
                 LLAMA_LOG_WARN(
                     "wp::host prefetch: on K=%d M=%d min_conf=%.3f conf_step=%.3f "
                     "strikes=%d bytes_budget=%zu queue=%d (soft HostTier only; "
@@ -1368,6 +1438,11 @@ bool WeightPager::init(const Config &             cfg,
 
 void WeightPager::shutdown() {
     if (!initialized_) {
+        // The worker is started late in init(), but init() has failure paths
+        // AFTER that point which leave initialized_ false. Join unconditionally
+        // so a partially-initialised pager can never leave a thread running on
+        // state that is about to be destroyed. No-op when never started.
+        hp_stop_worker_();
         // If init partially completed, there's no live state — but the env
         // snapshot may have been taken. Restore it defensively.
         restore_disable_graphs_env_();
@@ -1378,6 +1453,12 @@ void WeightPager::shutdown() {
         return;
     }
 
+    // ORDER MATTERS. The async worker calls submit_host_prefetch, which touches
+    // predictor_, host_prefetcher_, host_tier_, catalog_ and page_to_slot_. It
+    // must be joined BEFORE any of those are stopped, reset or cleared, or the
+    // worker dereferences a torn-down object during shutdown. Join first, then
+    // everything else, so no teardown site below needs to reason about it.
+    hp_stop_worker_();
     if (host_prefetcher_) {
         host_prefetcher_->stop();
     }
@@ -1815,6 +1896,9 @@ void WeightPager::log_stats_summary() {
             "  cb_prefetch_blocked_ms: %.1f\n"
             "  host_predict_calls: %lu\n"
             "  host_predict_cpu_ms: %.1f\n"
+            "  hp_async_enqueued: %lu\n"
+            "  hp_async_dropped: %lu\n"
+            "  hp_async_max_depth: %lu\n"
             "  host_spec_resident: %lu\n"
             "  host_spec_evicted_unused: %lu\n"
             "  host_spec_promotions: %lu\n"
@@ -1932,6 +2016,9 @@ void WeightPager::log_stats_summary() {
             s.cb_prefetch_wall_ms - s.cb_prefetch_cpu_ms,
             (unsigned long) s.host_predict_calls,
             s.host_predict_cpu_ms,
+            (unsigned long) s.hp_async_enqueued,
+            (unsigned long) s.hp_async_dropped,
+            (unsigned long) s.hp_async_max_depth,
             (unsigned long) s.host_spec_resident,
             (unsigned long) s.host_spec_evicted_unused,
             (unsigned long) s.host_spec_promotions,
