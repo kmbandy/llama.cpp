@@ -61,6 +61,10 @@ SHAPES = (
 
 LIVE_G = 6
 LIVE_FM = 1
+# Set by the LIVE loop to the (label, real_m, real_n, k) it is about to dispatch, so attribution uses
+#   ground truth instead of reverse-mapping padded geometry. None in offline re-parse, where the log is
+#   all we have. See matching_real_shapes().
+EXPECTED_SHAPE = None
 LIVE_FN = 4
 LIVE_TM = LIVE_G * 16 * LIVE_FM
 LIVE_TN = LIVE_FN * 16
@@ -78,6 +82,8 @@ class ParsedRun:
     shape_labels: tuple[str, ...]
     real_m: int
     padded_m: int
+    real_n: int
+    padded_n: int
     n: int
     k: int
     super_tile_m: int
@@ -155,20 +161,46 @@ def rounded_value_agrees(derived: float, rendered: float) -> bool:
     return math.isfinite(derived) and abs(derived - rendered) <= ROUNDING_TOLERANCE
 
 
-def matching_real_shapes(padded_m: int, n: int, k: int, super_tile_m: int) -> tuple[int, tuple[str, ...]]:
+def matching_real_shapes(padded_m: int, padded_n: int, k: int, super_tile_m: int) -> tuple[int, int, tuple[str, ...]]:
+    # The log reports the PADDED geometry (that is what actually ran), so both M and N must be
+    #   matched through the same padding the dispatcher applied. Matching raw shape_n against a
+    #   padded n silently rejected every N-padded shape as NOT_A_REAL_SHAPE.
     candidates = [
-        (label, real_m)
+        (label, real_m, shape_n)
         for label, real_m, shape_n, shape_k in SHAPES
-        if shape_n == n
+        if ((shape_n + LIVE_TN - 1) // LIVE_TN) * LIVE_TN == padded_n
         and shape_k == k
         and ((real_m + super_tile_m - 1) // super_tile_m) * super_tile_m == padded_m
     ]
-    real_ms = {real_m for _, real_m in candidates}
+    real_ms = {real_m for _, real_m, _ in candidates}
+    real_ns = {shape_n for _, _, shape_n in candidates}
     if not candidates:
         raise LogRejected("NOT_A_REAL_SHAPE: geometry does not match the recovered 33-shape inventory")
+    # DISAMBIGUATION BY GROUND TRUTH (added 2026-07-26). This function REVERSE-MAPS the log's padded
+    #   geometry back to a real shape, which is unavoidable when re-parsing arbitrary logs offline --
+    #   but in LIVE mode the caller already KNOWS which shape it just dispatched, so reverse-mapping
+    #   there was throwing away information it had.
+    #   IT HALTED A 30-SHAPE SWEEP: mlmf_mamba_in_proj (N=4200) and mlmf_in_proj_ML8PAD (N=4208) both
+    #   pad to N=4224 at LIVE_TN=64, so the padded geometry genuinely cannot distinguish them and the
+    #   function refused (correctly -- attributing a TF number to the wrong shape would be worse).
+    #   The kernel run itself was CLEAN (WORK-EXACT, oracle bad=0); only the attribution was ambiguous.
+    #   EXPECTED_SHAPE lets live mode say which one it ran. We still VERIFY it is among the candidates
+    #   rather than trusting it blindly -- if the hint disagrees with the geometry that is a real bug
+    #   and must not be papered over.
+    if EXPECTED_SHAPE is not None and len(real_ns) > 1:
+        exp_label, exp_m, exp_n, exp_k = EXPECTED_SHAPE
+        hinted = [c for c in candidates if c[1] == exp_m and c[2] == exp_n]
+        if not hinted:
+            raise LogRejected(
+                f"EXPECTED_SHAPE_MISMATCH: dispatched {exp_label} (M={exp_m} N={exp_n} K={exp_k}) "
+                f"but the log's padded geometry does not admit it -- geometry bug, not an attribution problem")
+        return exp_m, exp_n, (exp_label,)
     if len(real_ms) != 1:
         raise LogRejected("AMBIGUOUS_REAL_M: shape inventory maps this padded geometry to multiple real M values")
-    return next(iter(real_ms)), tuple(sorted({label for label, _ in candidates}))
+    if len(real_ns) != 1:
+        raise LogRejected("AMBIGUOUS_REAL_N: padding collapses two distinct real N onto one padded N "
+                          "(offline re-parse cannot disambiguate; live mode sets EXPECTED_SHAPE)")
+    return next(iter(real_ms)), next(iter(real_ns)), tuple(sorted({label for label, _, _ in candidates}))
 
 
 def parse_log(path: Path) -> ParsedRun:
@@ -281,13 +313,18 @@ def parse_log(path: Path) -> ParsedRun:
     if not rounded_value_agrees(padded_tflops / 307.0 * 100.0, printed_pct):
         raise LogRejected("SELF_VALIDATION_MISMATCH: derived peak percentage disagrees with rendered percentage")
 
-    real_m, shape_labels = matching_real_shapes(padded_m, n, k, super_tile_m)
-    real_tflops = padded_tflops * real_m / padded_m
+    # `n` parsed from the log IS the padded N (that is the geometry that ran).
+    padded_n = n
+    real_m, real_n, shape_labels = matching_real_shapes(padded_m, padded_n, k, super_tile_m)
+    # Correct BOTH axes back to real FLOP so padding always counts AGAINST us, never for us.
+    real_tflops = padded_tflops * (real_m / padded_m) * (real_n / padded_n)
     return ParsedRun(
         path=str(resolved),
         shape_labels=shape_labels,
         real_m=real_m,
         padded_m=padded_m,
+        real_n=real_n,
+        padded_n=padded_n,
         n=n,
         k=k,
         super_tile_m=super_tile_m,
@@ -362,12 +399,22 @@ def parse_paths(paths: Iterable[Path]) -> list[dict[str, object]]:
     return records
 
 
-def shape_supported(shape: tuple[str, int, int, int]) -> tuple[bool, str, int]:
+def shape_supported(shape: tuple[str, int, int, int]) -> tuple[bool, str, int, int]:
     _, real_m, n, k = shape
     padded_m = ((real_m + LIVE_TM - 1) // LIVE_TM) * LIVE_TM
+    # *** N PADDING (2026-07-26, kmbandy: "we can't just have shapes that don't run"). ***
+    #   M has ALWAYS been padded up to the super-tile and the TF divided back down by
+    #   real_m/padded_m so the waste counts AGAINST us. N had no such branch -- it was simply
+    #   REFUSED on n % 64, which silently excluded 6 of 33 real shapes (18% of the workload),
+    #   including mlmf_mamba_in_proj, i.e. HALF the Mamba MIMO GEMM path. That was a gap in this
+    #   harness, never a kernel limitation: the kernel only ever sees NTL = N/64, so a padded N
+    #   is just a wider B and C with garbage columns we do not read -- exactly what M padding is.
+    #   The tell that this was an oversight: mlmf_in_proj_ML8PAD exists at N=4208, i.e. someone
+    #   already padded 4200 -- to a 16-multiple (ml8's alignment) instead of 64 (DSWS's N tile).
+    #   N padding is NOT always cheap (router_out N=8 -> 64 is 8x waste) and it SHOULD look bad:
+    #   the real_n/padded_n correction makes that cost visible instead of hiding the shape.
+    padded_n = ((n + LIVE_TN - 1) // LIVE_TN) * LIVE_TN
     reasons = []
-    if n % LIVE_TN:
-        reasons.append(f"N%{LIVE_TN}={n % LIVE_TN}")
     if k % LIVE_SEGK:
         reasons.append(f"K%{LIVE_SEGK}={k % LIVE_SEGK}")
     # n_kseg == 1 hits the kernel's DOCUMENTED ZLOCK fail-safe (.Lflow_feed_empty: the boundary
@@ -375,16 +422,22 @@ def shape_supported(shape: tuple[str, int, int, int]) -> tuple[bool, str, int]:
     # which is WORK-INEXACT + a bad oracle, which latches gpu_run.sh and halts the whole sweep.
     # 2026-07-21: mlmf_router_MLP (K=256, SEGK=256 -> n_kseg=1) halted a 4-arm matrix this way
     # after 26 good shapes. Declare it UNSUPPORTED with its reason -- it is printed, never skipped.
+    #   2026-07-26: SEGK is now a SWEPT KNOB in {64,128,256} (kmbandy sanctioned the range), so
+    #   n_kseg=1 is no longer a property of the shape -- it is a property of the SEGK you chose.
+    #   mlmf_router_MLP (K=256) is n_kseg=1 at SEGK=256 but n_kseg=2 at SEGK=128. Say so, so the
+    #   reason names the fix instead of reading as "this shape cannot run".
     n_kseg = k // LIVE_SEGK if LIVE_SEGK else 0
     if not reasons and n_kseg < 2:
-        reasons.append(f"n_kseg={n_kseg}<2 (ZLOCK fail-safe needs n_kseg>=2)")
-    return not reasons, ", ".join(reasons), padded_m
+        fix = next((s for s in (128, 64) if s < LIVE_SEGK and k % s == 0 and k // s >= 2), None)
+        hint = f" -- rerun with --segk {fix}" if fix else " -- no legal SEGK in {64,128,256} fixes this"
+        reasons.append(f"n_kseg={n_kseg}<2 at SEGK={LIVE_SEGK} (ZLOCK needs >=2){hint}")
+    return not reasons, ", ".join(reasons), padded_m, padded_n
 
 
 def shape_inventory(records: Sequence[dict[str, object]]) -> list[dict[str, object]]:
     inventory = []
     for label, real_m, n, k in SHAPES:
-        supported, reason, padded_m = shape_supported((label, real_m, n, k))
+        supported, reason, padded_m, padded_n = shape_supported((label, real_m, n, k))
         matching_pass_logs = []
         matching_records = []
         for record in records:
@@ -526,12 +579,24 @@ def run_live(args: argparse.Namespace) -> list[dict[str, object]]:
     # Apply the requested dispatch geometry. LIVE_TM is the super-tile M that shape_supported()
     # pads against, so it MUST track G or the padding correction would be computed for a
     # different tiling than the one actually launched.
-    global LIVE_G, LIVE_TM
+    # FM ADDED 2026-07-26. It was a hardcoded LIVE_FM=1 while --g was a flag, so this harness could
+    #   only ever dispatch DSWS2_FM=1. Running it against an FM=2 bin would have launched FM=1
+    #   geometry at an FM=2 kernel: the super-tile is G*16*FM rows, so every shape's M-padding would
+    #   have been computed for a 96-row tile while the bin wanted 128 -- a silent geometry mismatch of
+    #   exactly the kind that wedged the card earlier today. A knob that is a flag on one axis and a
+    #   constant on a coupled axis is a trap, not a default.
+    global LIVE_G, LIVE_FM, LIVE_TM
     LIVE_G = args.g
+    LIVE_FM = args.fm
     LIVE_TM = LIVE_G * 16 * LIVE_FM
     for shape in SHAPES:
         label, real_m, n, k = shape
-        supported, reason, padded_m = shape_supported(shape)
+        # Ground truth for attribution: we KNOW which shape we are about to dispatch, so the parser must
+        #   not have to reverse-map padded geometry to guess it. Two shapes (mlmf_mamba_in_proj N=4200 and
+        #   mlmf_in_proj_ML8PAD N=4208) both pad to N=4224 and are indistinguishable from the log alone.
+        global EXPECTED_SHAPE
+        EXPECTED_SHAPE = (label, real_m, n, k)
+        supported, reason, padded_m, padded_n = shape_supported(shape)
         if not supported:
             records.append(failure_record("", f"UNSUPPORTED_GEOMETRY: {reason}", status="UNSUPPORTED"))
             records[-1]["shape_candidates"] = [label]
@@ -552,18 +617,28 @@ def run_live(args: argparse.Namespace) -> list[dict[str, object]]:
         ]
         if args.chunk:
             command.append(f"ML8_COOP_CHUNK={args.chunk}")
+        if args.chunk_maxs:
+            # ADDED 2026-07-26. The compositor-safety cap defaults to 0.75s and FM=2 measures 0.81s per
+            #   chunk, so without this every FM=2 shape would ABORT ("chunk wall > cap -> ABORT remaining")
+            #   and the sweep would report 30 failures that are not kernel failures at all.
+            #   NOTE the cap is NOT tile-proportional -- measured 0.81s at BOTH ML8_COOP_CHUNK=512 and 256
+            #   -- so lowering --chunk cannot substitute for raising this. Unlike DEADMAN_TICKS (an
+            #   anti-brick floor that must never move) this is a designed knob: occ_dispatch.cpp:1599 names
+            #   raising it as the remedy, and the check is reactive (measured AFTER the chunk completes).
+            command.append(f"ML8_COOP_CHUNK_MAXS={args.chunk_maxs}")
         command += [
             f"SSWIN={args.sswin}",
             f"FLOW_WAVES={args.waves}",
+            f"ML8_POOL={args.pool}",     # config of record: 128 WGs = 2 WG/CU. NEVER let this default.
             "DSWS2_FLOW=1",
             f"DSWS2_FM={LIVE_FM}",
             f"DSWS2_G={LIVE_G}",
             f"DSWS2_ACC_N={args.acc_n}",
             "FLOW_POOL_N=1",
-            f"DSWS2_SEGK={LIVE_SEGK}",
+            f"DSWS2_SEGK={args.segk}",
             f"DSWS2_K={k}",
             f"DSWS2_ORACLE_MTL={padded_m // LIVE_TM}",
-            f"DSWS2_ORACLE_NTL={n // LIVE_TN}",
+            f"DSWS2_ORACLE_NTL={padded_n // LIVE_TN}",
             f"DSWS2_ORACLE_STRIDE={args.stride}",
             f"DSWS2_TARGET_SECS={args.target_secs}",
             "STAGINSTR=1",
@@ -616,18 +691,31 @@ def build_parser() -> argparse.ArgumentParser:
     live = subparsers.add_parser("live", help="dispatch every shape through gpu_run.sh; requires human approval")
     live.add_argument("--target-secs", type=float, default=1.5)
     live.add_argument("--stride", type=int, default=8)
+    # SEGK is a sanctioned knob in {64,128,256} (kmbandy 2026-07-26). It is what makes the
+    #   n_kseg>=2 shapes reachable: mlmf_router_MLP (K=256) is n_kseg=1 at 256, n_kseg=2 at 128.
+    live.add_argument("--segk", type=int, default=256, choices=(64,128,256), help="DSWS2_SEGK; must match the bin")
     # Dispatch config. These ONLY affect what is launched; the parser, the tick-derivation and
     # every self-validation check are untouched by them. G also sets the super-tile M (G*16*FM),
     # which is what the padding correction is computed from.
     live.add_argument("--g", type=int, default=LIVE_G, help="DSWS2_G (super-tile M = G*16*FM)")
+    live.add_argument("--fm", type=int, default=LIVE_FM, choices=(1, 2),
+                      help="DSWS2_FM; MUST match the bin (super-tile M = G*16*FM). Was hardcoded to 1 until 2026-07-26.")
     live.add_argument("--acc-n", type=int, default=3, help="DSWS2_ACC_N (GROUPS = G/ACC_N)")
-    live.add_argument("--sswin", type=int, default=8, help="SSWIN control-window depth")
-    live.add_argument("--waves", type=int, default=30, help="FLOW_WAVES (selects occ_dsws2_w<N>_flow_gd.bin)")
+    live.add_argument("--sswin", type=int, default=32, help="SSWIN control-window depth")
+    # CONFIG OF RECORD (kmbandy 2026-07-26): 2 WG/CU = 16 waves x 128 WGs = 2048 resident.
+    #   ML8_POOL WAS NEVER PASSED BY THIS SCRIPT, so every sweep it has ever run launched 64 WGs
+    #   (1 WG/CU) regardless of intent -- the dispatcher's silent default. gpu_run.sh now refuses
+    #   that, but the fix belongs here too: pass it explicitly, always, and record it in the JSON.
+    live.add_argument("--waves", type=int, default=16, help="FLOW_WAVES (selects occ_dsws2_w<N>_flow_gd.bin)")
+    live.add_argument("--pool", type=int, default=128, help="ML8_POOL = number of WGs (128 = 2 WG/CU, the config of record)")
     live.add_argument("--tag", type=str, default="rs", help="log-name prefix, so arms do not overwrite each other")
     # ML8_COOP_CHUNK bounds tiles per dispatch. Unset => the dispatcher's 512-tile compositor-safe
     # default. A large value collapses the problem to ONE chunk, which is what the pre-2026-07-21
     # broken cap did; the 0.75s abort CANNOT fire mid-chunk, only between chunks/reps. RULE 7.
     live.add_argument("--chunk", type=int, default=0, help="ML8_COOP_CHUNK tiles/dispatch; 0 = dispatcher default (512)")
+    live.add_argument("--chunk-maxs", type=float, default=0.0,
+                      help="ML8_COOP_CHUNK_MAXS compositor-safety cap in seconds; 0 = dispatcher default (0.75). "
+                           "FM=2 needs ~0.85 (its chunk measures 0.81s, and the cost is NOT tile-proportional).")
     live.add_argument("--json", type=Path, required=True, help="machine-readable output path")
     live.add_argument("--table", type=Path, required=True, help="human-readable output path")
     return parser

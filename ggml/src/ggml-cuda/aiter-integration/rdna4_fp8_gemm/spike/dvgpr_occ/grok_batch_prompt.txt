@@ -1,0 +1,72 @@
+You are implementing ONE kernel change in an AMD gfx1201 (RDNA4) assembly GEMM spike. Work ONLY in
+/home/kmbandy/GitHub/llama.cpp/ggml/src/ggml-cuda/aiter-integration/rdna4_fp8_gemm/spike/dvgpr_occ
+
+========================= ABSOLUTE SAFETY RULES (NON-NEGOTIABLE) =========================
+1. THIS IS OFFLINE-ONLY. You may run the CPU ASSEMBLER via ./build_flow.sh ONLY.
+2. DO NOT run the GPU. NEVER run ./gpu_run.sh, ./occ_dispatch, ./build.sh, or ANY command that
+   dispatches to the GPU. The human runs the GPU after reviewing your diff. If you think you need a
+   GPU run to verify, STOP and say so instead — do not run it.
+3. Edit ONLY two files: occ_kernel_dsws_flow.s and build_flow.sh. Do not touch occ_dispatch.cpp,
+   gpu_run.sh, or anything else. Do NOT write anything to /tmp — use the spike dir for any scratch.
+4. If you cannot make the change correct without a wait/blocking-read/hard-cap in the hot loop,
+   STOP and report that instead of adding one (see THE RIVER caveat in the plan).
+
+========================= WHAT TO BUILD =========================
+Read these two files IN FULL first:
+  - PLAN_CURSOR_BATCH.md   (the complete spec — implement exactly this)
+  - occ_kernel_dsws_flow.s (the kernel; the relevant code is around label .Lflow_da_peek ~line 3909,
+    the reservation CAS on ASSIGN_HEAD_OFF ~line 3929, and the .Lflow_da_stamp / self-serve drain path)
+
+The change (summarized; PLAN_CURSOR_BATCH.md is authoritative):
+  A wave that wins the reservation CAS claims N consecutive indices in ONE bump (ASSIGN_HEAD: r -> r+N)
+  instead of 1, then processes them serially. This amortizes the single-cursor CAS that RESVPROBE
+  measured at 1.466 collisions per reservation.
+
+  N = min( BATCH, DA_ZDONE - r, SSWIN - (r - DRAIN) ),  N >= 1.
+    - BATCH: new defsym, DEFAULT 1 (default MUST make the kernel byte-identical to today).
+    - DA_ZDONE - r: NEVER reserve past the group/tile boundary. This clamp is THE correctness anchor
+      (it keeps the ZLOCK / DA_ZDONE / bank-zero interlock byte-for-byte unchanged). If any path lets a
+      batch cross DA_ZDONE, that is the dropped-group race returning — do not ship it.
+    - SSWIN - (r - DRAIN): never claim more than the control window can hold (also keeps N <= SSWIN so
+      two live indices never alias one slot via slot_of).
+
+  DUTY-CYCLE SAFETY (critical): reserving N does NOT mean computing N in one fat burst. The wave drains
+  its N-deep backlog ONE ksi per fat burst, shrinking to lean between bursts, exactly as JDEPTH=1 does
+  today. Batching changes RESERVATION granularity only; the compute burst stays one ksi. TIME AT PEAK
+  proportional to JDEPTH*SEGK must be untouched.
+
+  Add a BATCH defsym in occ_kernel_dsws_flow.s (default 1) with guards:
+    - BATCH >= 1
+    - BATCH <= SSWIN
+  Add BATCH to build_flow.sh exactly like the existing RESVPROBE/BNDPROBE defsyms are passed
+  (-Wa,-defsym,BATCH=${BATCH:-1}).
+
+========================= HARD CONSTRAINTS =========================
+- ZERO FREE SGPRs. Any register you use for N / the backlog base / the per-i index must survive a
+  compute burst (the burst uses up to ~s71; persistent counters live in s84..s105). To find a free
+  SGPR you MUST grep BOTH spellings: the ".set" alias table AND literal "sNN" AND "s[a:b]" ranges.
+  A symbol that looks free in the .set table may be a live literal register elsewhere. If there is no
+  free SGPR, say so and propose the minimal reuse (do not silently clobber live state).
+- s49 is the reserved exec_lo save for every lds_* macro; never hold a live value across one.
+- Do not add anything to the hot path that touches the message bus (s_sendmsg_rtn) or emits stores.
+
+========================= OFFLINE GATES YOU MUST RUN AND REPORT =========================
+Run these with ./build_flow.sh (CPU assembler only) and paste the results:
+
+GATE 1 (byte-identity — the proof it is inert when off): build with BATCH=1 and confirm the bin sha
+matches the config of record EXACTLY:
+  WAVES=30 G=6 FM=1 SEGK=256 POOL_N=1 ACC_N=3 JDEPTH=1 KMAJOR=0 DECENTASN=1 BANKZERO=1 STAGGER=1 \
+    SELFSERVE=1 SSWIN=8 PHIST=0 NOCFLUSH=0 NOBLOAD=0 NOWMMA=0 BNDPROBE=0 RESVPROBE=0 INITBAR=1 TERMFIX=1 \
+    STAGINSTR=1 TFPROBE=1 DEADMAN=1 BATCH=1 ./build_flow.sh
+  then: sha256sum occ_dsws2_w30_flow_gd.bin | cut -c1-16   MUST EQUAL  1e78b027ec349396
+
+GATE 2: same env but BATCH=4, then BATCH=8. Each MUST assemble with NO spill/scratch/error (check
+  /tmp/flow_build.err) and MUST print LDS=54016B (batching is control-flow only; no new LDS).
+
+If GATE 1 does not match, your change is NOT inert-when-off — find what leaked and fix it before anything
+else. Report all three gate results verbatim.
+
+========================= REPORT WHEN DONE =========================
+Summarize: (1) exactly what you changed and where (line refs), (2) which SGPR(s) you used for N/backlog
+and the evidence they were free (both greps), (3) how the serial drain stays one-ksi-per-burst
+(duty-safe), (4) all gate results. Do NOT run the GPU. End your turn after reporting.

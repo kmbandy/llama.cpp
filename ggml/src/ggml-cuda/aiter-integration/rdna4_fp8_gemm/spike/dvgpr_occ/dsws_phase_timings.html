@@ -1,0 +1,342 @@
+<title>DSWS S1 — Phase Timings, and Why They Don't Hold</title>
+<style>
+:root{
+  --paper:#ECEDEA; --card:#F6F6F4; --ink:#1A1D1A; --ink-2:#4B514B; --ink-3:#767C76;
+  --rule:#D3D6D1; --rule-2:#E2E4E0;
+  --hot:#B4531E; --cool:#2E5E6B; --warn:#8A6D1F; --ok:#3D6B3D; --dead:#9A3B3B;
+  --hotbg:180,83,30; --deadbg:154,59,59;
+}
+@media (prefers-color-scheme:dark){
+  :root{--paper:#14161A;--card:#1B1E22;--ink:#E4E3DE;--ink-2:#A7ACA6;--ink-3:#787E79;
+    --rule:#2C3035;--rule-2:#23272B;--hot:#E08442;--cool:#5FA3B4;--warn:#C9A64A;--ok:#7BAE79;
+    --dead:#D97070;--hotbg:224,132,66;--deadbg:217,112,112;}
+}
+:root[data-theme="dark"]{--paper:#14161A;--card:#1B1E22;--ink:#E4E3DE;--ink-2:#A7ACA6;--ink-3:#787E79;
+  --rule:#2C3035;--rule-2:#23272B;--hot:#E08442;--cool:#5FA3B4;--warn:#C9A64A;--ok:#7BAE79;
+  --dead:#D97070;--hotbg:224,132,66;--deadbg:217,112,112;}
+:root[data-theme="light"]{--paper:#ECEDEA;--card:#F6F6F4;--ink:#1A1D1A;--ink-2:#4B514B;--ink-3:#767C76;
+  --rule:#D3D6D1;--rule-2:#E2E4E0;--hot:#B4531E;--cool:#2E5E6B;--warn:#8A6D1F;--ok:#3D6B3D;
+  --dead:#9A3B3B;--hotbg:180,83,30;--deadbg:154,59,59;}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:52px 28px 96px;display:flex;flex-direction:column;gap:50px}
+
+h1{font:600 13px/1.3 ui-monospace,"SF Mono",Menlo,monospace;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--hot);margin:0 0 14px}
+.lede{font-size:27px;line-height:1.28;font-weight:600;letter-spacing:-.018em;margin:0;
+  text-wrap:balance;max-width:26ch}
+.sub{color:var(--ink-2);max-width:66ch;margin:16px 0 0}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px}
+.chip{font:500 12px/1 ui-monospace,Menlo,monospace;letter-spacing:.04em;padding:7px 11px;
+  border:1px solid var(--rule);border-radius:2px;color:var(--ink-2);background:var(--card)}
+
+h2{font:600 12px/1.3 ui-monospace,"SF Mono",Menlo,monospace;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 6px;padding-bottom:10px;
+  border-bottom:1px solid var(--rule)}
+.h2n{font-size:20px;font-weight:600;letter-spacing:-.012em;margin:0 0 18px;text-wrap:balance}
+section{display:flex;flex-direction:column}
+.note{color:var(--ink-2);font-size:14px;max-width:70ch;margin:14px 0 0}
+
+.alarm{border:1px solid var(--dead);border-left-width:3px;border-radius:3px;padding:22px 24px;
+  background:rgba(var(--deadbg),.055)}
+.alarm .k{font:600 12px ui-monospace,Menlo,monospace;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--dead);margin:0 0 10px}
+.alarm p{margin:0;max-width:70ch;color:var(--ink-2)}
+.alarm p+p{margin-top:11px}
+.alarm b{color:var(--ink);font-weight:600}
+.big2{display:flex;gap:36px;flex-wrap:wrap;margin:18px 0 4px}
+.stat .sv{font:600 30px ui-monospace,Menlo,monospace;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.stat .sl{font:12px ui-monospace,Menlo,monospace;color:var(--ink-3);letter-spacing:.06em;
+  text-transform:uppercase;margin-top:3px}
+.sv.bad{color:var(--dead)} .sv.fine{color:var(--ok)}
+
+.scroll{overflow-x:auto;margin-top:20px;border:1px solid var(--rule);border-radius:3px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:7px 11px;text-align:left;white-space:nowrap}
+thead th{font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-3);border-bottom:1px solid var(--rule);background:var(--card);position:sticky;top:0}
+tbody th{font-weight:500;font-size:13px;color:var(--ink)}
+tbody tr+tr th,tbody tr+tr td{border-top:1px solid var(--rule-2)}
+.n{font-family:ui-monospace,Menlo,monospace;text-align:right;font-variant-numeric:tabular-nums;position:relative}
+.dim{color:var(--ink-3)}
+.n .hb{position:absolute;inset:2px 3px;border-radius:2px;background:rgba(var(--hotbg),var(--a));z-index:0}
+.n .hd{position:absolute;inset:2px 3px;border-radius:2px;background:rgba(var(--deadbg),var(--a));z-index:0}
+.n .v{position:relative;z-index:1}
+.tot{font-weight:600;border-left:1px solid var(--rule)}
+.warn{color:var(--warn);font-weight:600}
+.ok{color:var(--ok)} .bad{color:var(--dead);font-weight:600}
+.big{font-weight:600;font-size:14px}
+td.desc{white-space:normal;color:var(--ink-2);font-size:12.5px;max-width:420px}
+
+.susp{opacity:.62}
+.stamp{display:inline-block;font:600 11px ui-monospace,Menlo,monospace;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--dead);border:1px solid var(--dead);border-radius:2px;
+  padding:4px 9px;margin-bottom:12px}
+.stamp.keep{color:var(--ok);border-color:var(--ok)}
+
+.callout{border-left:2px solid var(--hot);padding:2px 0 2px 18px;margin-top:20px}
+.callout p{margin:0;color:var(--ink-2);font-size:14px;max-width:68ch}
+.callout p+p{margin-top:9px}
+.callout b{color:var(--ink);font-weight:600}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;background:var(--rule-2);
+  padding:1px 5px;border-radius:2px}
+pre{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.5;background:var(--card);
+  border:1px solid var(--rule);border-radius:3px;padding:14px 16px;overflow-x:auto;margin:16px 0 0}
+.foot{border-top:1px solid var(--rule);padding-top:20px;color:var(--ink-3);font-size:13px;max-width:72ch}
+@media (max-width:760px){.lede{font-size:22px}.big2{gap:24px}}
+</style>
+
+<div class="wrap">
+
+<header>
+  <h1>DSWS S1 &middot; MAD-305 &middot; 2026-07-26</h1>
+  <p class="lede">The probe costs four times what it measures &mdash; but differencing recovers the answer.</p>
+  <p class="sub">A six-stage poll decomposition ran across 27 real GEMM shapes &mdash; 162 dispatches,
+  two RTC stamps per stage. The stage numbers came back clean and consistent. They are dominated by the instrument, and the first headline drawn from them was wrong. Differencing against a near-null stage recovers a sharper result than the one it replaces. Everything below is marked by what it rests on.</p>
+  <div class="meta">
+    <span class="chip">2 WG/CU &middot; 128 WG &times; 16 waves</span>
+    <span class="chip">SEGK 256</span>
+    <span class="chip">ML8_COOP_CHUNK 512</span>
+    <span class="chip">27/27 work-exact</span>
+    <span class="chip">oracle bad=0</span>
+  </div>
+</header>
+
+<section>
+  <div class="alarm">
+    <p class="k">Retraction &middot; the instrument dominates</p>
+    <div class="big2">
+      <div class="stat"><div class="sv fine">0.99&times;</div><div class="sl">span vs control</div></div>
+      <div class="stat"><div class="sv bad">0.21&times;</div><div class="sl">loop passes vs control</div></div>
+      <div class="stat"><div class="sv bad">4.8&times;</div><div class="sl">cost per probed pass</div></div>
+    </div>
+    <p>Same wall time, <b>one fifth the loop iterations</b>. The probe build does the same amount of
+    externally-visible work in the same span while executing 5&times; fewer passes &mdash; so each pass
+    carries roughly <b>3.8&times; its own weight in instrument</b>.</p>
+    <p>Stage&nbsp;1 forces the conclusion. It brackets three source lines, and <code>deadman_check</code>
+    is throttled &mdash; on 63 of 64 passes it executes exactly three SALU instructions:</p>
+    <pre>s_add_u32    s71, s71, 1
+s_cmp_ge_u32 s71, DEADMAN_EVERY
+s_cbranch_scc0 .Ldm_skip</pre>
+    <p>Measured: <b>487&nbsp;ns</b>. Three ALU ops are not 487&nbsp;ns. <code>pollstage_enter</code> and
+    <code>leave</code> are two <code>s_sendmsg_rtn</code> RTC reads on the SQ front-end message bus,
+    serialised across 2048 waves &mdash; the exact resource the kernel&rsquo;s own rule-5 comments warn
+    about.</p>
+    <p><b>Consequence for the headline.</b> A large constant added to every stage compresses their
+    shares toward each other. The &ldquo;phase profile is identical on every shape, CV&nbsp;0.09&ndash;0.16&rdquo;
+    result is most likely measuring the probe&rsquo;s uniformity, not the kernel&rsquo;s. The true
+    spread is wider by an unknown amount.</p>
+    <p><b>The check that failed.</b> Probe cost was judged by <em>span</em> &mdash; 0.99&times;, which
+    reads as free. Span was the wrong health metric; pass count was the right one, and it says 0.21&times;.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Probe perturbation &middot; per shape</h2>
+  <p class="h2n">Span barely moves. Pass count collapses everywhere.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>shape</th><th class="n">M</th>
+        <th class="n">control span</th><th class="n">probe span</th><th class="n">span &times;</th>
+        <th class="n">control passes</th><th class="n">probe passes</th><th class="n">pass &times;</th></tr></thead>
+      <tbody><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">512</td><td class="n dim">715,861</td><td class="n dim">711,108</td><td class="n ok">0.99</td><td class="n dim">400,177,242</td><td class="n dim">114,304,212</td><td class="n"><span class="hd" style="--a:0.318"></span><span class="v bad">0.29</span></td></tr><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">2048</td><td class="n dim">853,569</td><td class="n dim">829,439</td><td class="n ok">0.97</td><td class="n dim">556,029,794</td><td class="n dim">117,325,755</td><td class="n"><span class="hd" style="--a:0.525"></span><span class="v bad">0.21</span></td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">512</td><td class="n dim">850,885</td><td class="n dim">812,115</td><td class="n ok">0.95</td><td class="n dim">397,573,865</td><td class="n dim">102,828,775</td><td class="n"><span class="hd" style="--a:0.393"></span><span class="v bad">0.26</span></td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">2048</td><td class="n dim">1,819,387</td><td class="n dim">1,723,933</td><td class="n ok">0.95</td><td class="n dim">44,224,358</td><td class="n dim">9,825,952</td><td class="n"><span class="hd" style="--a:0.494"></span><span class="v bad">0.22</span></td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">512</td><td class="n dim">854,497</td><td class="n dim">836,412</td><td class="n ok">0.98</td><td class="n dim">649,123,252</td><td class="n dim">114,737,751</td><td class="n"><span class="hd" style="--a:0.62"></span><span class="v bad">0.18</span></td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">2048</td><td class="n dim">2,631,560</td><td class="n dim">2,565,943</td><td class="n ok">0.98</td><td class="n dim">45,926,499</td><td class="n dim">9,103,368</td><td class="n"><span class="hd" style="--a:0.561"></span><span class="v bad">0.20</span></td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">512</td><td class="n dim">891,520</td><td class="n dim">847,800</td><td class="n ok">0.95</td><td class="n dim">282,739,476</td><td class="n dim">69,489,925</td><td class="n"><span class="hd" style="--a:0.428"></span><span class="v bad">0.25</span></td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">2048</td><td class="n dim">2,005,973</td><td class="n dim">1,982,784</td><td class="n ok">0.99</td><td class="n dim">25,049,563</td><td class="n dim">7,252,526</td><td class="n"><span class="hd" style="--a:0.307"></span><span class="v bad">0.29</span></td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">1,744,310</td><td class="n dim">1,690,212</td><td class="n ok">0.97</td><td class="n dim">53,697,716</td><td class="n dim">10,092,416</td><td class="n"><span class="hd" style="--a:0.589"></span><span class="v bad">0.19</span></td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">2048</td><td class="n dim">6,023,372</td><td class="n dim">5,935,300</td><td class="n ok">0.99</td><td class="n dim">35,198,223</td><td class="n dim">6,871,444</td><td class="n"><span class="hd" style="--a:0.569"></span><span class="v bad">0.20</span></td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">64</td><td class="n dim">590,257</td><td class="n dim">629,280</td><td class="n ok">1.07</td><td class="n dim">136,898,633</td><td class="n dim">50,685,603</td><td class="n"><span class="hd" style="--a:0.083"></span><span class="v bad">0.37</span></td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">512</td><td class="n dim">631,348</td><td class="n dim">652,551</td><td class="n ok">1.03</td><td class="n dim">349,394,458</td><td class="n dim">104,964,089</td><td class="n"><span class="hd" style="--a:0.277"></span><span class="v bad">0.30</span></td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">64</td><td class="n dim">643,613</td><td class="n dim">669,898</td><td class="n ok">1.04</td><td class="n dim">97,613,358</td><td class="n dim">37,901,886</td><td class="n"><span class="hd" style="--a:0.033"></span><span class="v bad">0.39</span></td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">512</td><td class="n dim">831,543</td><td class="n dim">798,634</td><td class="n ok">0.96</td><td class="n dim">480,878,388</td><td class="n dim">98,012,677</td><td class="n"><span class="hd" style="--a:0.545"></span><span class="v bad">0.20</span></td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">64</td><td class="n dim">648,555</td><td class="n dim">659,533</td><td class="n ok">1.02</td><td class="n dim">423,562,549</td><td class="n dim">88,259,630</td><td class="n"><span class="hd" style="--a:0.532"></span><span class="v bad">0.21</span></td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">512</td><td class="n dim">831,976</td><td class="n dim">794,614</td><td class="n ok">0.96</td><td class="n dim">761,764,643</td><td class="n dim">121,965,249</td><td class="n"><span class="hd" style="--a:0.666"></span><span class="v bad">0.16</span></td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">64</td><td class="n dim">584,640</td><td class="n dim">642,483</td><td class="n ok">1.10</td><td class="n dim">365,612,782</td><td class="n dim">78,710,845</td><td class="n"><span class="hd" style="--a:0.513"></span><span class="v bad">0.22</span></td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">512</td><td class="n dim">623,712</td><td class="n dim">648,604</td><td class="n ok">1.04</td><td class="n dim">784,927,614</td><td class="n dim">103,783,552</td><td class="n"><span class="hd" style="--a:0.744"></span><span class="v bad">0.13</span></td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">64</td><td class="n dim">586,072</td><td class="n dim">637,361</td><td class="n ok">1.09</td><td class="n dim">130,992,880</td><td class="n dim">50,194,834</td><td class="n"><span class="hd" style="--a:0.047"></span><span class="v bad">0.38</span></td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">638,108</td><td class="n dim">652,827</td><td class="n ok">1.02</td><td class="n dim">313,657,753</td><td class="n dim">107,539,797</td><td class="n"><span class="hd" style="--a:0.159"></span><span class="v bad">0.34</span></td></tr><tr><th scope="row">mlmf_MoE_expert_fc1</th><td class="n dim">512</td><td class="n dim">626,452</td><td class="n dim">629,298</td><td class="n ok">1.00</td><td class="n dim">772,111,181</td><td class="n dim">101,193,250</td><td class="n"><span class="hd" style="--a:0.747"></span><span class="v bad">0.13</span></td></tr><tr><th scope="row">mlmf_MoE_expert_fc2</th><td class="n dim">512</td><td class="n dim">642,482</td><td class="n dim">659,567</td><td class="n ok">1.03</td><td class="n dim">465,244,565</td><td class="n dim">119,606,135</td><td class="n"><span class="hd" style="--a:0.397"></span><span class="v bad">0.26</span></td></tr><tr><th scope="row">mlmf_attn_linear_k</th><td class="n dim">4096</td><td class="n dim">625,327</td><td class="n dim">639,802</td><td class="n ok">1.02</td><td class="n dim">758,741,729</td><td class="n dim">96,418,828</td><td class="n"><span class="hd" style="--a:0.758"></span><span class="v bad">0.13</span></td></tr><tr><th scope="row">mlmf_attn_o_proj</th><td class="n dim">4096</td><td class="n dim">1,366,942</td><td class="n dim">1,363,159</td><td class="n ok">1.00</td><td class="n dim">42,976,118</td><td class="n dim">5,451,774</td><td class="n"><span class="hd" style="--a:0.759"></span><span class="v bad">0.13</span></td></tr><tr><th scope="row">mlmf_lm_head</th><td class="n dim">4096</td><td class="n dim">32,629,660</td><td class="n dim">29,541,164</td><td class="n ok">0.91</td><td class="n dim">322,911,477</td><td class="n dim">41,836,668</td><td class="n"><span class="hd" style="--a:0.751"></span><span class="v bad">0.13</span></td></tr><tr><th scope="row">mlmf_mamba_out_proj</th><td class="n dim">4096</td><td class="n dim">1,401,107</td><td class="n dim">1,416,969</td><td class="n ok">1.01</td><td class="n dim">42,745,071</td><td class="n dim">6,823,434</td><td class="n"><span class="hd" style="--a:0.668"></span><span class="v bad">0.16</span></td></tr><tr><th scope="row">mlmf_router_down_proj</th><td class="n dim">4096</td><td class="n dim">645,215</td><td class="n dim">631,733</td><td class="n ok">0.98</td><td class="n dim">741,803,735</td><td class="n dim">108,792,801</td><td class="n"><span class="hd" style="--a:0.704"></span><span class="v bad">0.15</span></td></tr></tbody>
+    </table>
+  </div>
+  <p class="note">Passes counted as <code>occ[86]</code>. Both columns come from the same shape, same
+  config, differing only in whether stage-1 instrumentation is compiled in.</p>
+</section>
+
+<section>
+  <h2>What each stage actually brackets</h2>
+  <p class="h2n">Read from the source, not from the enter/leave labels.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>stage</th><th class="n">lines</th><th>region and contents</th></tr></thead>
+      <tbody><tr><th scope="row">s1</th><td class="n dim">3</td><td class="desc"><code>deadman_check</code> only &mdash; 3 SALU ops, plus a 1-in-64 <code>s_sendmsg_rtn</code> RTC read</td></tr><tr><th scope="row">s2</th><td class="n dim">196</td><td class="desc"><code>.Lflow_assign_top</code> DECENTASN claim / assign &mdash; 12 labels, 14 LDS writes, 11 LDS reads, 1 global atomic</td></tr><tr><th scope="row">s3</th><td class="n dim">807</td><td class="desc"><code>.Lflow_dispatch</code> / <code>.Lflow_compute</code> / <code>.Lflow_shrink</code> &mdash; 27 labels, 4 <code>s_alloc_vgpr</code>, 2 LDS CAS, 2 WMMA</td></tr><tr><th scope="row">s4</th><td class="n dim">144</td><td class="desc"><code>.Lflow_feed_empty</code> &rarr; <code>.Lflow_da_peek</code> gate &mdash; 7 labels, 11 LDS reads, nothing else</td></tr><tr><th scope="row">s5</th><td class="n dim">1,236</td><td class="desc">the DECENTASN reservation machinery &mdash; 49 labels, 57 LDS writes, 31 reads, 8 CAS, 5 <code>s_alloc_vgpr</code></td></tr><tr><th scope="row">s6</th><td class="n dim">29</td><td class="desc">park &mdash; STAGGER mailbox LDS read/write + <code>s_sleep SLEEPN</code></td></tr></tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <p>Stage&nbsp;5 spans <b>49 labels</b> and 1,236 lines, so even an undistorted number there would be
+    an average over very different code paths &mdash; an early bail and a deep walk through the
+    reservation machinery both land in the same bucket.</p>
+    <p>Stage&nbsp;5 only counts passes that end at <code>.Lflow_feedmt_sleep</code>. A pass that gets
+    work exits via <code>.Lflow_loop</code>, never reaches the <code>leave</code>, and is dropped.</p>
+  </div>
+</section>
+
+
+<section>
+  <h2>Recovered &middot; differenced against a null</h2>
+  <span class="stamp keep">Valid within the equal-rate group</span>
+  <p class="h2n">Stage&nbsp;1 brackets three SALU ops. It is a null calibration, so subtracting it cancels the shared probe.</p>
+
+  <div class="callout">
+    <p>Stages&nbsp;1, 2, 5 and 6 all fire the probe at the same rate (<b>f &asymp; 2.0 sendmsg per pass</b>),
+    so they sit in the same contention regime and can be compared to each other. Stage&nbsp;1&rsquo;s
+    bracketed work is three SALU instructions on 63 of 64 passes &mdash; effectively zero. Whatever it
+    measures is the instrument.</p>
+    <p>Stages&nbsp;3 and 4 fire at 1.12 and 0.23 per pass. Different contention, <b>different scale</b>
+    &mdash; they cannot be placed on this axis at all.</p>
+  </div>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>stage</th><th>region</th><th class="n">median ns</th>
+        <th class="n">minus null</th><th class="n">share</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">s1</th><td class="desc">loop head + <code>deadman_check</code> &mdash; <b>the null</b></td>
+            <td class="n">487</td><td class="n dim">0</td><td class="n dim">&mdash;</td></tr>
+        <tr><th scope="row">s2</th><td class="desc">snapshot / FLOWTERM / body-gate</td>
+            <td class="n">485</td><td class="n">&minus;2</td><td class="n">0%</td></tr>
+        <tr><th scope="row">s5</th><td class="desc"><code>da_peek</code> reservation attempt</td>
+            <td class="n">877</td><td class="n"><span class="hb" style="--a:.8"></span><span class="v">+390</span></td>
+            <td class="n big">64%</td></tr>
+        <tr><th scope="row">s6</th><td class="desc">park + <code>s_sleep</code></td>
+            <td class="n">712</td><td class="n"><span class="hb" style="--a:.46"></span><span class="v">+225</span></td>
+            <td class="n big">37%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="h2n" style="margin-top:34px">The validation is sign consistency across 27 independent shapes.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>difference</th><th class="n">median</th><th class="n">min</th><th class="n">max</th>
+        <th class="n">negative on</th><th>reading</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">s5 &minus; s1</th><td class="n">+403</td><td class="n dim">+121</td>
+            <td class="n dim">+575</td><td class="n ok">0 / 27</td>
+            <td class="desc">positive on every shape independently &mdash; noise does not do this</td></tr>
+        <tr><th scope="row">s6 &minus; s1</th><td class="n">+199</td><td class="n dim">&minus;8</td>
+            <td class="n dim">+385</td><td class="n ok">1 / 27</td>
+            <td class="desc">real signal</td></tr>
+        <tr><th scope="row">s2 &minus; s1</th><td class="n">&minus;5</td><td class="n dim">&minus;142</td>
+            <td class="n dim">+66</td><td class="n warn">14 / 27</td>
+            <td class="desc">straddles zero &mdash; the signature of a difference that is genuinely zero</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="alarm" style="margin-top:26px;border-color:var(--ok);background:rgba(61,107,61,.05)">
+    <p class="k" style="color:var(--ok)">This sharpens the original claim rather than restoring it</p>
+    <p>The first version of this page said <b>54% failed-peek-plus-park, 42% watchdog-and-gate</b>.
+    Corrected: the watchdog and the gate cost <b>nothing</b>. The failed reservation attempt and the
+    park that follows are essentially <b>all</b> of the measurable per-pass work, split about 2:1.</p>
+    <p>The 42% previously attributed to stages 1 and 2 was entirely instrument.</p>
+    <p><b>What this rests on:</b> that stage&nbsp;1&rsquo;s bracketed work is ~0 (supported by the
+    source), and that contention is matched inside the group. Absolute values remain inflated by the
+    shared offset &mdash; only the <em>differences</em> are trustworthy. &ldquo;+390&nbsp;ns&rdquo; is a
+    difference against a null, not an absolute cost.</p>
+  </div>
+
+  <p class="h2n" style="margin-top:34px">A general correction is not possible, and that is settled.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>stage</th><th class="n">measured</th><th class="n">implied probe</th>
+        <th class="n">&ldquo;real work&rdquo;</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">s1</th><td class="n">487</td><td class="n dim">626</td><td class="n bad">&minus;138</td></tr>
+        <tr><th scope="row">s2</th><td class="n">485</td><td class="n dim">638</td><td class="n bad">&minus;153</td></tr>
+        <tr><th scope="row">s3</th><td class="n">476</td><td class="n dim">552</td><td class="n bad">&minus;76</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Inverting the pass-count ratio to solve for probe cost yields <b>negative time</b> on
+  three stages. That is a refutation, not a result: the 0.21&times; pass drop is not purely per-pass
+  cost &mdash; the probe also changes behaviour, so it cannot be arithmetically removed. Only the
+  matched-rate differencing above survives.</p>
+</section>
+
+<section class="susp">
+  <h2>Phase timings &middot; retained for record</h2>
+  <span class="stamp">Suspect &middot; instrument-dominated</span>
+  <p class="h2n">ns per loop-head pass. Do not quote these as stage costs.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>shape</th><th class="n">M</th><th class="n">N</th><th class="n">K</th>
+        <th class="n">s1</th><th class="n">s2</th><th class="n">s3</th><th class="n">s4</th>
+        <th class="n">s5</th><th class="n">s6</th><th class="n">total</th></tr></thead>
+      <tbody><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">512</td><td class="n dim">1,024</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.274"></span><span class="v">439</span></td><td class="n"><span class="hb" style="--a:0.396"></span><span class="v">481</span></td><td class="n"><span class="hb" style="--a:0.231"></span><span class="v">35</span></td><td class="n"><span class="hb" style="--a:0.435"></span><span class="v">16</span></td><td class="n"><span class="hb" style="--a:0.358"></span><span class="v">605</span></td><td class="n"><span class="hb" style="--a:0.246"></span><span class="v">474</span></td><td class="n tot"><span class="hb" style="--a:0.318"></span><span class="v">2,050</span></td></tr><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">2048</td><td class="n dim">1,024</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.379"></span><span class="v">520</span></td><td class="n"><span class="hb" style="--a:0.415"></span><span class="v">494</span></td><td class="n"><span class="hb" style="--a:0.307"></span><span class="v">41</span></td><td class="n"><span class="hb" style="--a:0.4"></span><span class="v">15</span></td><td class="n"><span class="hb" style="--a:0.422"></span><span class="v">681</span></td><td class="n"><span class="hb" style="--a:0.332"></span><span class="v">567</span></td><td class="n tot"><span class="hb" style="--a:0.389"></span><span class="v">2,318</span></td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">512</td><td class="n dim">2,560</td><td class="n dim">4,096</td><td class="n"><span class="hb" style="--a:0.308"></span><span class="v">466</span></td><td class="n"><span class="hb" style="--a:0.406"></span><span class="v">488</span></td><td class="n"><span class="hb" style="--a:0.271"></span><span class="v">38</span></td><td class="n"><span class="hb" style="--a:0.206"></span><span class="v">12</span></td><td class="n"><span class="hb" style="--a:0.247"></span><span class="v">468</span></td><td class="n"><span class="hb" style="--a:0.172"></span><span class="v">389</span></td><td class="n tot"><span class="hb" style="--a:0.269"></span><span class="v">1,861</span></td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">2048</td><td class="n dim">2,560</td><td class="n dim">4,096</td><td class="n"><span class="hb" style="--a:0.289"></span><span class="v">451</span></td><td class="n"><span class="hb" style="--a:0.354"></span><span class="v">452</span></td><td class="n"><span class="hb" style="--a:0.311"></span><span class="v">41</span></td><td class="n"><span class="hb" style="--a:0.402"></span><span class="v">15</span></td><td class="n"><span class="hb" style="--a:0.292"></span><span class="v">525</span></td><td class="n"><span class="hb" style="--a:0.222"></span><span class="v">447</span></td><td class="n tot"><span class="hb" style="--a:0.287"></span><span class="v">1,931</span></td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">512</td><td class="n dim">4,096</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.311"></span><span class="v">468</span></td><td class="n"><span class="hb" style="--a:0.407"></span><span class="v">488</span></td><td class="n"><span class="hb" style="--a:0.365"></span><span class="v">45</span></td><td class="n"><span class="hb" style="--a:0.556"></span><span class="v">18</span></td><td class="n"><span class="hb" style="--a:0.42"></span><span class="v">679</span></td><td class="n"><span class="hb" style="--a:0.288"></span><span class="v">520</span></td><td class="n tot"><span class="hb" style="--a:0.362"></span><span class="v">2,218</span></td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">2048</td><td class="n dim">4,096</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.415"></span><span class="v">546</span></td><td class="n"><span class="hb" style="--a:0.52"></span><span class="v">562</span></td><td class="n"><span class="hb" style="--a:0.411"></span><span class="v">48</span></td><td class="n"><span class="hb" style="--a:0.629"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.488"></span><span class="v">756</span></td><td class="n"><span class="hb" style="--a:0.335"></span><span class="v">570</span></td><td class="n tot"><span class="hb" style="--a:0.44"></span><span class="v">2,502</span></td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">512</td><td class="n dim">2,560</td><td class="n dim">9,216</td><td class="n"><span class="hb" style="--a:0.12"></span><span class="v">308</span></td><td class="n"><span class="hb" style="--a:0.153"></span><span class="v">302</span></td><td class="n"><span class="hb" style="--a:0.079"></span><span class="v">22</span></td><td class="n"><span class="hb" style="--a:0.166"></span><span class="v">11</span></td><td class="n"><span class="hb" style="--a:0.111"></span><span class="v">279</span></td><td class="n"><span class="hb" style="--a:0.041"></span><span class="v">214</span></td><td class="n tot"><span class="hb" style="--a:0.1"></span><span class="v">1,136</span></td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">2048</td><td class="n dim">2,560</td><td class="n dim">9,216</td><td class="n"><span class="hb" style="--a:0.117"></span><span class="v">305</span></td><td class="n"><span class="hb" style="--a:0.147"></span><span class="v">297</span></td><td class="n"><span class="hb" style="--a:0.151"></span><span class="v">28</span></td><td class="n"><span class="hb" style="--a:0.676"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.145"></span><span class="v">329</span></td><td class="n"><span class="hb" style="--a:0.062"></span><span class="v">246</span></td><td class="n tot"><span class="hb" style="--a:0.119"></span><span class="v">1,224</span></td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">9,216</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.373"></span><span class="v">515</span></td><td class="n"><span class="hb" style="--a:0.418"></span><span class="v">496</span></td><td class="n"><span class="hb" style="--a:0.39"></span><span class="v">47</span></td><td class="n"><span class="hb" style="--a:0.482"></span><span class="v">16</span></td><td class="n"><span class="hb" style="--a:0.453"></span><span class="v">717</span></td><td class="n"><span class="hb" style="--a:0.331"></span><span class="v">566</span></td><td class="n tot"><span class="hb" style="--a:0.4"></span><span class="v">2,357</span></td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">2048</td><td class="n dim">9,216</td><td class="n dim">2,560</td><td class="n"><span class="hb" style="--a:0.375"></span><span class="v">517</span></td><td class="n"><span class="hb" style="--a:0.499"></span><span class="v">549</span></td><td class="n"><span class="hb" style="--a:0.29"></span><span class="v">39</span></td><td class="n"><span class="hb" style="--a:0.522"></span><span class="v">17</span></td><td class="n"><span class="hb" style="--a:0.486"></span><span class="v">755</span></td><td class="n"><span class="hb" style="--a:0.349"></span><span class="v">584</span></td><td class="n tot"><span class="hb" style="--a:0.429"></span><span class="v">2,461</span></td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">64</td><td class="n dim">512</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.051"></span><span class="v">239</span></td><td class="n"><span class="hb" style="--a:0.142"></span><span class="v">293</span></td><td class="n"><span class="hb" style="--a:0.178"></span><span class="v">31</span></td><td class="n"><span class="hb" style="--a:0.168"></span><span class="v">11</span></td><td class="n"><span class="hb" style="--a:0.127"></span><span class="v">303</span></td><td class="n"><span class="hb" style="--a:0.15"></span><span class="v">363</span></td><td class="n tot"><span class="hb" style="--a:0.122"></span><span class="v">1,240</span></td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">512</td><td class="n dim">512</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.295"></span><span class="v">456</span></td><td class="n"><span class="hb" style="--a:0.309"></span><span class="v">421</span></td><td class="n"><span class="hb" style="--a:0.216"></span><span class="v">34</span></td><td class="n"><span class="hb" style="--a:0.288"></span><span class="v">13</span></td><td class="n"><span class="hb" style="--a:0.396"></span><span class="v">650</span></td><td class="n"><span class="hb" style="--a:0.24"></span><span class="v">468</span></td><td class="n tot"><span class="hb" style="--a:0.315"></span><span class="v">2,041</span></td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">64</td><td class="n dim">2,048</td><td class="n dim">4,096</td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">168</span></td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">145</span></td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">12</span></td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">7</span></td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">68</span></td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">133</span></td><td class="n tot"><span class="hb" style="--a:0.0"></span><span class="v">534</span></td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">512</td><td class="n dim">2,048</td><td class="n dim">4,096</td><td class="n"><span class="hb" style="--a:0.336"></span><span class="v">487</span></td><td class="n"><span class="hb" style="--a:0.373"></span><span class="v">465</span></td><td class="n"><span class="hb" style="--a:0.276"></span><span class="v">38</span></td><td class="n"><span class="hb" style="--a:0.193"></span><span class="v">12</span></td><td class="n"><span class="hb" style="--a:0.26"></span><span class="v">485</span></td><td class="n"><span class="hb" style="--a:0.2"></span><span class="v">422</span></td><td class="n tot"><span class="hb" style="--a:0.281"></span><span class="v">1,909</span></td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">64</td><td class="n dim">4,096</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.321"></span><span class="v">476</span></td><td class="n"><span class="hb" style="--a:0.432"></span><span class="v">505</span></td><td class="n"><span class="hb" style="--a:0.205"></span><span class="v">33</span></td><td class="n"><span class="hb" style="--a:0.287"></span><span class="v">13</span></td><td class="n"><span class="hb" style="--a:0.56"></span><span class="v">836</span></td><td class="n"><span class="hb" style="--a:0.352"></span><span class="v">587</span></td><td class="n tot"><span class="hb" style="--a:0.426"></span><span class="v">2,451</span></td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">512</td><td class="n dim">4,096</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.411"></span><span class="v">543</span></td><td class="n"><span class="hb" style="--a:0.47"></span><span class="v">531</span></td><td class="n"><span class="hb" style="--a:0.492"></span><span class="v">54</span></td><td class="n"><span class="hb" style="--a:0.478"></span><span class="v">16</span></td><td class="n"><span class="hb" style="--a:0.543"></span><span class="v">817</span></td><td class="n"><span class="hb" style="--a:0.381"></span><span class="v">617</span></td><td class="n tot"><span class="hb" style="--a:0.461"></span><span class="v">2,578</span></td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">64</td><td class="n dim">2,048</td><td class="n dim">512</td><td class="n"><span class="hb" style="--a:0.33"></span><span class="v">483</span></td><td class="n"><span class="hb" style="--a:0.286"></span><span class="v">404</span></td><td class="n"><span class="hb" style="--a:0.268"></span><span class="v">38</span></td><td class="n"><span class="hb" style="--a:0.746"></span><span class="v">20</span></td><td class="n"><span class="hb" style="--a:0.28"></span><span class="v">509</span></td><td class="n"><span class="hb" style="--a:0.241"></span><span class="v">469</span></td><td class="n tot"><span class="hb" style="--a:0.285"></span><span class="v">1,923</span></td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">512</td><td class="n dim">2,048</td><td class="n dim">512</td><td class="n"><span class="hb" style="--a:0.455"></span><span class="v">575</span></td><td class="n"><span class="hb" style="--a:0.579"></span><span class="v">600</span></td><td class="n"><span class="hb" style="--a:0.763"></span><span class="v">71</span></td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">21</span></td><td class="n"><span class="hb" style="--a:0.624"></span><span class="v">906</span></td><td class="n"><span class="hb" style="--a:0.544"></span><span class="v">777</span></td><td class="n tot"><span class="hb" style="--a:0.569"></span><span class="v">2,950</span></td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">64</td><td class="n dim">512</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.11"></span><span class="v">299</span></td><td class="n"><span class="hb" style="--a:0.054"></span><span class="v">214</span></td><td class="n"><span class="hb" style="--a:0.047"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.183"></span><span class="v">12</span></td><td class="n"><span class="hb" style="--a:0.337"></span><span class="v">580</span></td><td class="n"><span class="hb" style="--a:0.052"></span><span class="v">231</span></td><td class="n tot"><span class="hb" style="--a:0.147"></span><span class="v">1,354</span></td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">512</td><td class="n dim">2,048</td><td class="n"><span class="hb" style="--a:0.255"></span><span class="v">424</span></td><td class="n"><span class="hb" style="--a:0.369"></span><span class="v">462</span></td><td class="n"><span class="hb" style="--a:0.371"></span><span class="v">45</span></td><td class="n"><span class="hb" style="--a:0.26"></span><span class="v">13</span></td><td class="n"><span class="hb" style="--a:0.37"></span><span class="v">619</span></td><td class="n"><span class="hb" style="--a:0.243"></span><span class="v">471</span></td><td class="n tot"><span class="hb" style="--a:0.314"></span><span class="v">2,035</span></td></tr><tr><th scope="row">mlmf_MoE_expert_fc1</th><td class="n dim">512</td><td class="n dim">1,536</td><td class="n dim">768</td><td class="n"><span class="hb" style="--a:0.526"></span><span class="v">625</span></td><td class="n"><span class="hb" style="--a:0.625"></span><span class="v">629</span></td><td class="n"><span class="hb" style="--a:0.677"></span><span class="v">66</span></td><td class="n"><span class="hb" style="--a:0.561"></span><span class="v">18</span></td><td class="n"><span class="hb" style="--a:0.662"></span><span class="v">946</span></td><td class="n"><span class="hb" style="--a:0.576"></span><span class="v">807</span></td><td class="n tot"><span class="hb" style="--a:0.61"></span><span class="v">3,091</span></td></tr><tr><th scope="row">mlmf_MoE_expert_fc2</th><td class="n dim">512</td><td class="n dim">768</td><td class="n dim">1,536</td><td class="n"><span class="hb" style="--a:0.393"></span><span class="v">530</span></td><td class="n"><span class="hb" style="--a:0.435"></span><span class="v">507</span></td><td class="n"><span class="hb" style="--a:0.423"></span><span class="v">49</span></td><td class="n"><span class="hb" style="--a:0.414"></span><span class="v">15</span></td><td class="n"><span class="hb" style="--a:0.521"></span><span class="v">794</span></td><td class="n"><span class="hb" style="--a:0.452"></span><span class="v">688</span></td><td class="n tot"><span class="hb" style="--a:0.463"></span><span class="v">2,584</span></td></tr><tr><th scope="row">mlmf_attn_linear_k</th><td class="n dim">4096</td><td class="n dim">192</td><td class="n dim">768</td><td class="n"><span class="hb" style="--a:0.517"></span><span class="v">619</span></td><td class="n"><span class="hb" style="--a:0.59"></span><span class="v">607</span></td><td class="n"><span class="hb" style="--a:0.604"></span><span class="v">61</span></td><td class="n"><span class="hb" style="--a:0.524"></span><span class="v">17</span></td><td class="n"><span class="hb" style="--a:0.598"></span><span class="v">878</span></td><td class="n"><span class="hb" style="--a:0.596"></span><span class="v">825</span></td><td class="n tot"><span class="hb" style="--a:0.586"></span><span class="v">3,008</span></td></tr><tr><th scope="row">mlmf_attn_o_proj</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">768</td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">820</span></td><td class="n"><span class="hb" style="--a:0.685"></span><span class="v">666</span></td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">75</span></td><td class="n"><span class="hb" style="--a:0.634"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.753"></span><span class="v">1,042</span></td><td class="n"><span class="hb" style="--a:0.629"></span><span class="v">855</span></td><td class="n tot"><span class="hb" style="--a:0.728"></span><span class="v">3,477</span></td></tr><tr><th scope="row">mlmf_lm_head</th><td class="n dim">4096</td><td class="n dim">32,000</td><td class="n dim">768</td><td class="n"><span class="hb" style="--a:0.792"></span><span class="v">802</span></td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">746</span></td><td class="n"><span class="hb" style="--a:0.698"></span><span class="v">67</span></td><td class="n"><span class="hb" style="--a:0.641"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">1,111</span></td><td class="n"><span class="hb" style="--a:0.82"></span><span class="v">1,027</span></td><td class="n tot"><span class="hb" style="--a:0.82"></span><span class="v">3,772</span></td></tr><tr><th scope="row">mlmf_mamba_out_proj</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">1,536</td><td class="n"><span class="hb" style="--a:0.426"></span><span class="v">554</span></td><td class="n"><span class="hb" style="--a:0.525"></span><span class="v">566</span></td><td class="n"><span class="hb" style="--a:0.439"></span><span class="v">50</span></td><td class="n"><span class="hb" style="--a:0.573"></span><span class="v">18</span></td><td class="n"><span class="hb" style="--a:0.612"></span><span class="v">894</span></td><td class="n"><span class="hb" style="--a:0.373"></span><span class="v">609</span></td><td class="n tot"><span class="hb" style="--a:0.493"></span><span class="v">2,690</span></td></tr><tr><th scope="row">mlmf_router_down_proj</th><td class="n dim">4096</td><td class="n dim">256</td><td class="n dim">768</td><td class="n"><span class="hb" style="--a:0.586"></span><span class="v">666</span></td><td class="n"><span class="hb" style="--a:0.67"></span><span class="v">657</span></td><td class="n"><span class="hb" style="--a:0.561"></span><span class="v">58</span></td><td class="n"><span class="hb" style="--a:0.642"></span><span class="v">19</span></td><td class="n"><span class="hb" style="--a:0.652"></span><span class="v">935</span></td><td class="n"><span class="hb" style="--a:0.692"></span><span class="v">913</span></td><td class="n tot"><span class="hb" style="--a:0.658"></span><span class="v">3,249</span></td></tr></tbody>
+    </table>
+  </div>
+  <p class="note">Approximate correction: a real poll pass is on the order of <b>100&nbsp;ns total</b>,
+  against a measured six-stage sum near 2,300&nbsp;ns. Roughly 370&nbsp;ns per figure is instrument.</p>
+</section>
+
+<section class="susp">
+  <h2>Raw instrument output &middot; retained for record</h2>
+  <span class="stamp">Suspect &middot; instrument-dominated</span>
+  <p class="h2n">Mean ms per stage, straight from the log.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>shape</th><th class="n">M</th><th class="n">s1</th><th class="n">s2</th>
+        <th class="n">s3</th><th class="n">s4</th><th class="n">s5</th><th class="n">s6</th></tr></thead>
+      <tbody><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">512</td><td class="n">0.000439</td><td class="n">0.000471</td><td class="n">0.000345</td><td class="n">0.000148</td><td class="n">0.000716</td><td class="n">0.000557</td></tr><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">2048</td><td class="n">0.000520</td><td class="n">0.000482</td><td class="n">0.000486</td><td class="n">0.000163</td><td class="n">0.000866</td><td class="n">0.000719</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">512</td><td class="n">0.000466</td><td class="n">0.000467</td><td class="n">0.000452</td><td class="n">0.000154</td><td class="n">0.000640</td><td class="n">0.000530</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">2048</td><td class="n">0.000451</td><td class="n">0.000458</td><td class="n">0.000498</td><td class="n">0.000183</td><td class="n">0.000731</td><td class="n">0.000621</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">512</td><td class="n">0.000468</td><td class="n">0.000485</td><td class="n">0.000518</td><td class="n">0.000186</td><td class="n">0.000877</td><td class="n">0.000669</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">2048</td><td class="n">0.000546</td><td class="n">0.000561</td><td class="n">0.000557</td><td class="n">0.000186</td><td class="n">0.000969</td><td class="n">0.000729</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">512</td><td class="n">0.000308</td><td class="n">0.000303</td><td class="n">0.000380</td><td class="n">0.000188</td><td class="n">0.000533</td><td class="n">0.000407</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">2048</td><td class="n">0.000305</td><td class="n">0.000296</td><td class="n">0.000431</td><td class="n">0.000284</td><td class="n">0.000603</td><td class="n">0.000449</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">512</td><td class="n">0.000515</td><td class="n">0.000492</td><td class="n">0.000541</td><td class="n">0.000169</td><td class="n">0.000925</td><td class="n">0.000729</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">2048</td><td class="n">0.000517</td><td class="n">0.000555</td><td class="n">0.000462</td><td class="n">0.000181</td><td class="n">0.000986</td><td class="n">0.000755</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">64</td><td class="n">0.000239</td><td class="n">0.000305</td><td class="n">0.000441</td><td class="n">0.000166</td><td class="n">0.000440</td><td class="n">0.000463</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">512</td><td class="n">0.000456</td><td class="n">0.000420</td><td class="n">0.000338</td><td class="n">0.000146</td><td class="n">0.000756</td><td class="n">0.000541</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">64</td><td class="n">0.000168</td><td class="n">0.000182</td><td class="n">0.000285</td><td class="n">0.000188</td><td class="n">0.000331</td><td class="n">0.000313</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">512</td><td class="n">0.000487</td><td class="n">0.000471</td><td class="n">0.000476</td><td class="n">0.000147</td><td class="n">0.000682</td><td class="n">0.000593</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">64</td><td class="n">0.000476</td><td class="n">0.000532</td><td class="n">0.000337</td><td class="n">0.000151</td><td class="n">0.001022</td><td class="n">0.000712</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">512</td><td class="n">0.000543</td><td class="n">0.000525</td><td class="n">0.000549</td><td class="n">0.000169</td><td class="n">0.000993</td><td class="n">0.000748</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">64</td><td class="n">0.000483</td><td class="n">0.000413</td><td class="n">0.000349</td><td class="n">0.000203</td><td class="n">0.000604</td><td class="n">0.000549</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">512</td><td class="n">0.000575</td><td class="n">0.000600</td><td class="n">0.000639</td><td class="n">0.000212</td><td class="n">0.001045</td><td class="n">0.000889</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">64</td><td class="n">0.000299</td><td class="n">0.000214</td><td class="n">0.000384</td><td class="n">0.000165</td><td class="n">0.000854</td><td class="n">0.000291</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">512</td><td class="n">0.000424</td><td class="n">0.000454</td><td class="n">0.000404</td><td class="n">0.000148</td><td class="n">0.000721</td><td class="n">0.000544</td></tr><tr><th scope="row">mlmf_MoE_expert_fc1</th><td class="n dim">512</td><td class="n">0.000625</td><td class="n">0.000627</td><td class="n">0.000601</td><td class="n">0.000178</td><td class="n">0.001094</td><td class="n">0.000930</td></tr><tr><th scope="row">mlmf_MoE_expert_fc2</th><td class="n dim">512</td><td class="n">0.000530</td><td class="n">0.000509</td><td class="n">0.000471</td><td class="n">0.000151</td><td class="n">0.000921</td><td class="n">0.000797</td></tr><tr><th scope="row">mlmf_attn_linear_k</th><td class="n dim">4096</td><td class="n">0.000619</td><td class="n">0.000608</td><td class="n">0.000545</td><td class="n">0.000177</td><td class="n">0.001022</td><td class="n">0.000950</td></tr><tr><th scope="row">mlmf_attn_o_proj</th><td class="n dim">4096</td><td class="n">0.000820</td><td class="n">0.000678</td><td class="n">0.000735</td><td class="n">0.000201</td><td class="n">0.001294</td><td class="n">0.001026</td></tr><tr><th scope="row">mlmf_lm_head</th><td class="n dim">4096</td><td class="n">0.000802</td><td class="n">0.000746</td><td class="n">0.000634</td><td class="n">0.000187</td><td class="n">0.001287</td><td class="n">0.001187</td></tr><tr><th scope="row">mlmf_mamba_out_proj</th><td class="n dim">4096</td><td class="n">0.000554</td><td class="n">0.000566</td><td class="n">0.000545</td><td class="n">0.000192</td><td class="n">0.001129</td><td class="n">0.000743</td></tr><tr><th scope="row">mlmf_router_down_proj</th><td class="n dim">4096</td><td class="n">0.000666</td><td class="n">0.000654</td><td class="n">0.000566</td><td class="n">0.000190</td><td class="n">0.001077</td><td class="n">0.001046</td></tr></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>What survives</h2>
+  <span class="stamp keep">Counts &middot; immune to timing distortion</span>
+  <p class="h2n">Pure counters are unaffected by how long the probe takes.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>shape</th><th class="n">M</th><th class="n">s1 n / occ[86]</th>
+        <th class="n">s5 n / occ[86]</th><th class="n">s6 n = occ[86]</th></tr></thead>
+      <tbody><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">512</td><td class="n">1.17</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">2048</td><td class="n">1.27</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">512</td><td class="n">1.36</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">2048</td><td class="n">1.39</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">512</td><td class="n">1.29</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">2048</td><td class="n">1.28</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">512</td><td class="n warn">1.90</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">2048</td><td class="n warn">1.83</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">512</td><td class="n">1.29</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">2048</td><td class="n">1.29</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">64</td><td class="n">1.28</td><td class="n warn">0.88</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">512</td><td class="n">1.16</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">64</td><td class="n warn">2.35</td><td class="n warn">0.49</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">512</td><td class="n">1.40</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">64</td><td class="n">1.21</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">512</td><td class="n">1.21</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">64</td><td class="n">1.17</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">512</td><td class="n">1.14</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">64</td><td class="n">1.26</td><td class="n warn">0.85</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">512</td><td class="n">1.16</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_MoE_expert_fc1</th><td class="n dim">512</td><td class="n">1.15</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_MoE_expert_fc2</th><td class="n dim">512</td><td class="n">1.16</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_attn_linear_k</th><td class="n dim">4096</td><td class="n">1.15</td><td class="n">0.99</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_attn_o_proj</th><td class="n dim">4096</td><td class="n">1.20</td><td class="n">0.97</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_lm_head</th><td class="n dim">4096</td><td class="n">1.16</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_mamba_out_proj</th><td class="n dim">4096</td><td class="n">1.22</td><td class="n">0.97</td><td class="n ok">&#10003;</td></tr><tr><th scope="row">mlmf_router_down_proj</th><td class="n dim">4096</td><td class="n">1.15</td><td class="n">1.00</td><td class="n ok">&#10003;</td></tr></tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <p><b>Stage&nbsp;6&rsquo;s count equals its run&rsquo;s park counter exactly, on all 27 shapes.</b>
+    Every digit. The instrument validating its own wiring, independent of any timing claim.</p>
+    <p>The loop-head-to-park ratio runs <b>1.14 to 2.35</b>. An earlier single-shape reading of 1.015
+    was treated as structural; it was not representative.</p>
+    <p>Stage&nbsp;5&rsquo;s reach collapses on two shapes &mdash; <code>moe_attn_o M64</code> at 0.49,
+    <code>moe_ffn_gate_up M64</code> at 0.85, against ~0.99 elsewhere. Half those parks arrive without
+    passing through the reservation attempt. <b>No mechanism attached.</b></p>
+  </div>
+</section>
+
+<section>
+  <h2>Throughput &middot; no probe</h2>
+  <span class="stamp keep">Valid</span>
+  <p class="h2n">Span-based and probe-free. Real-FLOP corrected, so padding counts against us.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>shape</th><th class="n">M</th><th class="n">K</th><th class="n">n_kseg</th>
+        <th class="n">real TF</th><th class="n">reps</th><th class="n">spread%</th></tr></thead>
+      <tbody><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">512</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.032"></span><span class="v">0.375</span></td><td class="n dim">120</td><td class="n dim">6.5</td></tr><tr><th scope="row">ml8_dense_attn_kv</th><td class="n dim">2048</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.151"></span><span class="v">1.258</span></td><td class="n dim">106</td><td class="n dim">4.7</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">512</td><td class="n dim">4,096</td><td class="n dim">16</td><td class="n"><span class="hb" style="--a:0.151"></span><span class="v">1.262</span></td><td class="n dim">107</td><td class="n dim">7.0</td></tr><tr><th scope="row">ml8_dense_attn_o</th><td class="n dim">2048</td><td class="n dim">4,096</td><td class="n dim">16</td><td class="n"><span class="hb" style="--a:0.334"></span><span class="v">2.361</span></td><td class="n dim">5</td><td class="n dim">0.7</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">512</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.151"></span><span class="v">1.257</span></td><td class="n dim">105</td><td class="n dim">7.2</td></tr><tr><th scope="row">ml8_dense_attn_q</th><td class="n dim">2048</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.21"></span><span class="v">1.632</span></td><td class="n dim">3</td><td class="n dim">1.8</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">512</td><td class="n dim">9,216</td><td class="n dim">36</td><td class="n"><span class="hb" style="--a:0.398"></span><span class="v">2.710</span></td><td class="n dim">104</td><td class="n dim">10.3</td></tr><tr><th scope="row">ml8_dense_ffn_down</th><td class="n dim">2048</td><td class="n dim">9,216</td><td class="n dim">36</td><td class="n"><span class="hb" style="--a:0.819"></span><span class="v">4.817</span></td><td class="n dim">5</td><td class="n dim">1.3</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.17"></span><span class="v">1.385</span></td><td class="n dim">5</td><td class="n dim">3.9</td></tr><tr><th scope="row">ml8_dense_ffn_gate_up</th><td class="n dim">2048</td><td class="n dim">2,560</td><td class="n dim">10</td><td class="n"><span class="hb" style="--a:0.205"></span><span class="v">1.604</span></td><td class="n dim">1</td><td class="n dim">n/a</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">64</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">0.023</span></td><td class="n dim">135</td><td class="n dim">12.3</td></tr><tr><th scope="row">ml8_moe_attn_kv</th><td class="n dim">512</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.011"></span><span class="v">0.170</span></td><td class="n dim">130</td><td class="n dim">6.8</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">64</td><td class="n dim">4,096</td><td class="n dim">16</td><td class="n"><span class="hb" style="--a:0.01"></span><span class="v">0.167</span></td><td class="n dim">129</td><td class="n dim">6.2</td></tr><tr><th scope="row">ml8_moe_attn_o</th><td class="n dim">512</td><td class="n dim">4,096</td><td class="n dim">16</td><td class="n"><span class="hb" style="--a:0.117"></span><span class="v">1.033</span></td><td class="n dim">109</td><td class="n dim">7.3</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">64</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.01"></span><span class="v">0.166</span></td><td class="n dim">128</td><td class="n dim">9.4</td></tr><tr><th scope="row">ml8_moe_attn_q</th><td class="n dim">512</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.117"></span><span class="v">1.032</span></td><td class="n dim">107</td><td class="n dim">5.3</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">64</td><td class="n dim">512</td><td class="n dim">2</td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">0.023</span></td><td class="n dim">136</td><td class="n dim">10.8</td></tr><tr><th scope="row">ml8_moe_ffn_down</th><td class="n dim">512</td><td class="n dim">512</td><td class="n dim">2</td><td class="n"><span class="hb" style="--a:0.011"></span><span class="v">0.172</span></td><td class="n dim">129</td><td class="n dim">6.4</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">64</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.0"></span><span class="v">0.023</span></td><td class="n dim">136</td><td class="n dim">12.0</td></tr><tr><th scope="row">ml8_moe_ffn_gate_up</th><td class="n dim">512</td><td class="n dim">2,048</td><td class="n dim">8</td><td class="n"><span class="hb" style="--a:0.011"></span><span class="v">0.168</span></td><td class="n dim">129</td><td class="n dim">11.7</td></tr><tr><th scope="row">mlmf_MoE_expert_fc1</th><td class="n dim">512</td><td class="n dim">768</td><td class="n dim">3</td><td class="n"><span class="hb" style="--a:0.013"></span><span class="v">0.193</span></td><td class="n dim">129</td><td class="n dim">4.4</td></tr><tr><th scope="row">mlmf_MoE_expert_fc2</th><td class="n dim">512</td><td class="n dim">1,536</td><td class="n dim">6</td><td class="n"><span class="hb" style="--a:0.012"></span><span class="v">0.188</span></td><td class="n dim">128</td><td class="n dim">5.4</td></tr><tr><th scope="row">mlmf_attn_linear_k</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">3</td><td class="n"><span class="hb" style="--a:0.013"></span><span class="v">0.193</span></td><td class="n dim">129</td><td class="n dim">7.0</td></tr><tr><th scope="row">mlmf_attn_o_proj</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">3</td><td class="n"><span class="hb" style="--a:0.029"></span><span class="v">0.353</span></td><td class="n dim">5</td><td class="n dim">2.4</td></tr><tr><th scope="row">mlmf_lm_head</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">3</td><td class="n"><span class="hb" style="--a:0.061"></span><span class="v">0.617</span></td><td class="n dim">1</td><td class="n dim">n/a</td></tr><tr><th scope="row">mlmf_mamba_out_proj</th><td class="n dim">4096</td><td class="n dim">1,536</td><td class="n dim">6</td><td class="n"><span class="hb" style="--a:0.07"></span><span class="v">0.690</span></td><td class="n dim">5</td><td class="n dim">3.2</td></tr><tr><th scope="row">mlmf_router_down_proj</th><td class="n dim">4096</td><td class="n dim">768</td><td class="n dim">3</td><td class="n"><span class="hb" style="--a:0.018"></span><span class="v">0.250</span></td><td class="n dim">127</td><td class="n dim">6.4</td></tr></tbody>
+    </table>
+  </div>
+  <p class="note">Best 4.817 TF &mdash; 1.57% of the 307 TF fp8 peak.</p>
+</section>
+
+<section>
+  <h2>Ablation &middot; no probe at all</h2>
+  <span class="stamp keep">Valid &middot; strongest result of the day</span>
+  <p class="h2n">4 arms &times; 27 shapes. Median change vs control; positive means slower without the work.</p>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>arm</th><th>what was deleted</th><th class="n">median &Delta;</th></tr></thead>
+      <tbody><tr><th scope="row">NOWMMA</th><td class="desc">every WMMA deleted</td><td class="n big">+1.6%</td></tr><tr><th scope="row">NODSADD</th><td class="desc">LDS reduction deleted</td><td class="n big">+1.7%</td></tr><tr><th scope="row">NOCFLUSH</th><td class="desc">C store deleted</td><td class="n big">+0.5%</td></tr><tr><th scope="row">NOBLOAD</th><td class="desc">entire B memory stream deleted</td><td class="n big">-0.0%</td></tr></tbody>
+    </table>
+  </div>
+  <p class="note">Noise floor ~1.2%. Three of four arms run <em>slower</em> without the work. Deleting
+  all the math, the LDS reduction, the output stores and the entire B memory stream changes nothing,
+  on every shape, across 18&times; in K and 2,700&times; in tile count. No instrumentation involved &mdash;
+  each arm is a build with code removed and a wall-clock span.</p>
+</section>
+
+<section class="foot">
+  <p>162 phase dispatches + 108 ablation + 27 control. All work-exact with <code>oracle bad=0</code>,
+  zero hangs, zero GPU resets. Every figure generated directly from
+  <code>~/dsws_gpu_logs/{ps_s*,abl2_*,c512ctl_*}.log</code> &mdash; none transcribed by hand.</p>
+  <p style="margin-top:9px">The standing lesson, now twice-learned: <b>ablate, don&rsquo;t probe.</b>
+  Where a probe is unavoidable, judge its cost by work completed, not by elapsed time.</p>
+</section>
+
+</div>

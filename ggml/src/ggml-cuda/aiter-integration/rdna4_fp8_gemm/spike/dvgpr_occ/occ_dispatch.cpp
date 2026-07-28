@@ -1905,7 +1905,41 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   hang, is really a dispatch that could not fit). Do not "fix" one side alone.
     constexpr uint32_t kOpBase = 512u;
     static_assert(kOpBase >= 148u + 4u*32u, "kOpBase must clear SLOTC_BASE + POOL_N*SLOTC_STRIDE");
-    uint32_t ldsBytesRaw = kOpBase + poolSlots * operandBytes + accBytes;   // WOFLUSH POOL4: 512 + 4*8192 = 33280
+    // *** CO-CHANGE (DSWS2_OVERLAP Phase 1, 2026-07-24, DESIGN_OVERLAP_2WGCU_2026-07-24.md S4/S8 step 1):
+    //   when the loaded bin was built with DSWS2_OVERLAP=1, the kernel's ACC_BASE collapses to OP_BASE (the
+    //   operand pool bytes -- poolSlots*operandBytes -- are dropped from the LDS layout; see
+    //   occ_kernel_dsws_flow.s ACC_BASE). The dispatch-time env var below must be set to match whatever the
+    //   loaded .bin was assembled with (mirrors the kernel's `-Wa,-defsym,DSWS2_OVERLAP=` build flag; there
+    //   is no way to read it back out of a raw .bin). Getting this wrong is NOT silently unsafe: the
+    //   "AUTHORITATIVE OVERRIDE" below reads the bin's own published LDS_TOTAL_FLOW (<tag>.lds) and TRUSTS
+    //   it over this reconstruction, printing a loud mismatch warning rather than under-allocating LDS.
+    //   This flag only makes the host's own prediction agree with the bin instead of relying on that
+    //   override + warning on every single overlap-Phase-1 run.
+    // *** FIXED 2026-07-26: THIS MIRRORED ONLY HALF THE KERNEL'S CONDITION, AND THE RESULTING ALWAYS-ON
+    //   WARNING IS WHAT CAUSED A GPU RESET. ***
+    //   The kernel drops the operand pool under `.if SELFSERVE || DSWS2_OVERLAP` (ACC_BASE = OP_BASE,
+    //   "operand pool reclaimed (SELFSERVE owns this)"). The host tested ONLY dsws2Overlap. Our config of
+    //   record is SELFSERVE=1, and DSWS2_OVERLAP is not even in the dispatch env -- so the host added a
+    //   whole operand pool (poolSlots*operandBytes = 40,960B at the config of record) that the kernel had
+    //   reclaimed, over-counting LDS by ~3-4x on EVERY SINGLE RUN.
+    //   THE REAL COST WAS NOT THE WRONG NUMBER, IT WAS THE NOISE. Because the reconstruction was
+    //   systematically wrong, "host reconstruction says N but the BIN PUBLISHES M" printed on every
+    //   dispatch and became a line I had trained myself to skip. On 2026-07-26 a .bin was copied into place
+    //   without its .lds sidecar; that same warning fired with a genuinely dangerous mismatch (13,824B
+    //   allocated for a kernel needing 17,920B), was indistinguishable from the hundreds of benign firings,
+    //   and the kernel ran past its LDS -> MES unrecoverable -> MODE1 reset -> VRAM lost -> kmbandy locked
+    //   out of his desktop. A WARNING THAT FIRES ON EVERY RUN IS A WARNING NOBODY READS. Fixing the
+    //   arithmetic is what restores the warning's signal value; the fail-closed sidecar check added to
+    //   gpu_run.sh the same day is the belt to this braces.
+    //   DEFAULTS MATCH build_flow.sh (`: ${SELFSERVE:=1}` and `: ${DSWS2_OVERLAP:=1}`), so an unset env
+    //   reconstructs the build build_flow.sh actually produces instead of a configuration nobody builds.
+    auto envFlag = [](const char* n, bool dflt) {
+        const char* v = getenv(n); return v ? (atoi(v) != 0) : dflt;
+    };
+    const bool dsws2Overlap = envFlag("DSWS2_OVERLAP", true);
+    const bool selfServe    = envFlag("SELFSERVE",     true);
+    const bool opPoolReclaimed = (selfServe || dsws2Overlap);   // == the kernel's `.if SELFSERVE || DSWS2_OVERLAP`
+    uint32_t ldsBytesRaw = kOpBase + (opPoolReclaimed ? 0u : poolSlots * operandBytes) + accBytes;   // WOFLUSH POOL4: 512 + 4*8192 = 33280
     // *** CO-CHANGE: SSWIN MUST MATCH the SSWIN defsym passed to occ_kernel_dsws_flow.s. ***
     //   When SSWIN > POOL_N the kernel RELOCATES its per-slot control array from the low control gap
     //   (SLOTC_INLINE_BASE=148) to the TOP of LDS, above the accumulator pool (kernel :715-719):
@@ -1920,7 +1954,19 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
     //   ASSIGN-DRAIN saturates SSWIN => every wave sleeps. Hang + 1 GPU reset. Had the total landed
     //   one byte into a fresh granule this would have worked by accident and hidden the defect.
     uint32_t ssWin = getenv("SSWIN") ? (uint32_t)atoi(getenv("SSWIN")) : poolSlots;
-    if (ssWin > poolSlots) ldsBytesRaw += ssWin * 32u;   // kernel SLOTC_STRIDE = 32
+    // *** UNDER-ALLOCATION FIXED 2026-07-26 -- found by gate_lds.sh immediately after the gate was
+    //   repaired to honour its env. THIS IS THE DANGEROUS DIRECTION (OOB LDS -> GPU RESET). ***
+    //   The condition was `ssWin > poolSlots`, but the KERNEL adds this term UNCONDITIONALLY under
+    //   SELFSERVE (occ_kernel_dsws_flow.s: `.if SELFSERVE / SLOTC_BASE = LDS_TOTAL_FLOW /
+    //   LDS_TOTAL_FLOW = SLOTC_BASE + SSWIN*SLOTC_STRIDE`) -- there is no `> POOL_N` guard on that arm,
+    //   because under SELFSERVE there is no POOL_N-deep operand pool and SLOT_N *is* SSWIN.
+    //   So for any SSWIN <= POOL_N (including SSWIN unset, which defaults to poolSlots) the host
+    //   under-allocated by exactly SSWIN*32 bytes. Measured: kernel 12,832 vs host 12,800 at the config
+    //   of record with SSWIN unset. This is precisely the run #10 mechanism documented above -- OOB LDS
+    //   writes are dropped and read back as 0, SL_GEN==0 passes the gate, SL_RBNEXT==0 reads as
+    //   staged+claimable so EVERY wave's CAS(0->1) "wins" the same rowblk -> hang + GPU reset.
+    //   We never tripped it only because the config of record runs SSWIN=32 > POOL_N=1.
+    if (selfServe || ssWin > poolSlots) ldsBytesRaw += ssWin * 32u;   // kernel SLOTC_STRIDE = 32
     // *** AUTHORITATIVE OVERRIDE: <bin>.lds, emitted by the assembler from LDS_TOTAL_FLOW itself. ***
     //   Everything above this point is the host's own RECONSTRUCTION of the kernel's layout, and that
     //   reconstruction is exactly what broke in run #10. When SSWIN became the default it stopped being
@@ -2135,7 +2181,35 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         //   below still refuses to destroy a non-idle queue (brick-avoidance), so a lingering wave is reclaimed
         //   by process-exit, never a forced destroy. A real hang still trips the timeoutS bail -> forensics.
         uint32_t lastEnd = 0; double lastEndChange = t0;
-        double settle = getenv("DSWS2_SETTLE") ? atof(getenv("DSWS2_SETTLE")) : 0.30;
+        // *** DEFAULT LOWERED 0.30 -> 0.02 ON 2026-07-27. MEASURED, NOT GUESSED. ***
+        //   THIS TIMER WAS ~91% OF ALL NON-FINAL CHUNK WALL TIME. The EOP fence is armed ONLY on the
+        //   final chunk (see :2173 and the comment above it), so every non-final chunk cannot use `ff`
+        //   and instead falls through to the settle branch below, burning a flat 0.30s after its last
+        //   wave has already exited. Measured on ml8_dense_ffn_down M2048 K9216 at FM=2 G=4 ACC_N=2,
+        //   with the ONLY changed variable being this value:
+        //       chunk base=0   (512 tiles, NON-final -> settle path):  0.317s -> 0.038s
+        //       chunk base=512 (128 tiles, FINAL -> EOP fence path):   0.013s -> 0.014s  (CONTROL, unmoved)
+        //   Only the settle-path chunk moved; the fence-path chunk did not. That within-run control is
+        //   the proof, and it needs no cross-run comparison.
+        //   RESULT: 4.8x more reps in the same DSWS2_TARGET_SECS budget (5 -> 24); end-to-end
+        //   TF 0.29 -> 1.86 with ZERO kernel change. Span-TF was UNCHANGED (3.2 -> 3.1) exactly as it
+        //   must be -- settle is host idle time AFTER the waves have exited and cannot touch the GPU
+        //   busy span. That invariance is the check that this is what we think it is.
+        //   *** WHY IT SURVIVED SIX DAYS AFTER BEING SWEPT: *** settle 0.05/0.02/0.01 were all swept on
+        //   2026-07-21 (FM=1) and were ALL oracle-clean, but span-TF did not move (2.0/1.9/2.0), so the
+        //   sweep read as a null result and the default was left alone. Our headline metric is
+        //   structurally BLIND to this cost. Do not judge this knob by TF or by wall clock (the rep loop
+        //   is duration-bounded, so a faster rep buys more reps, never a shorter run) -- judge it by
+        //   reps-per-target-second.
+        //   SAFETY: this is FAIL-LOUD. settle exists only to let the terminal C store land before the
+        //   oracle reads C; too short => the oracle FAILS (see the comment at the completion gate:
+        //   "a stale read fails the oracle, never a false CLEAN"). It cannot silently corrupt a result.
+        //   Validated oracle bad=0 at FM=1 (0.05/0.02/0.01) and at FM=2 (0.02, 2048 waves, 640/640
+        //   tiles stride=1). Raise it via DSWS2_SETTLE if a future shape ever trips the oracle here;
+        //   0.05 is the conservative fallback and is still 6x better than the old default.
+        //   NOT CHANGED: the coop path's own settle at ~:1542 -- different kernel, not measured here.
+        //   (Note it already uses 0.025 whenever its fence works, and 0.30 only in its nofence case.)
+        double settle = getenv("DSWS2_SETTLE") ? atof(getenv("DSWS2_SETTLE")) : 0.02;
         while (true) { double now = now_s();
             // COMPOSITOR YIELD (proven run_mbgemm mechanism, was MISSING on the flow path): hand the gfx ring
             //   (Hyprland) an unconditional render+VGPR window every yieldEvery ms DURING the wait -- so a long or
@@ -2189,18 +2263,26 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                 //   nothing writes those words any more, so the print reported entered=0 settled=0 on every
                 //   timeout and would have sent the reader chasing "carry-through never engaged". Derive
                 //   entered the same way the success path does: occ[96] emissions - occ[73] grow-fails.
+                //   *** 2026-07-24: same build-order dependence as the success path (see the banner there).
+                //   Print BOTH readings; the subtraction is only valid for a commit-first (legacy) bin and can
+                //   go negative on a grow-first (CF0) bin, where occ[96] IS `entered`. ***
                 uint32_t ssGrowFail = occW[73], ssShrunk = occW[103], ssEmis = occW[96];
-                long ssEnter = (long)ssEmis - (long)ssGrowFail;
-                long inFlight = ssEnter - (long)ssShrunk;            // committed but never finished + shrank
-                fprintf(stderr, "    [timeout forensics] SELFSERVE-CARRYTHROUGH  entered=%ld (occ[96] %u - occ[73] %u)  shrunk=%u\n"
-                                "        =>  STUCK-in-carrythrough=%ld\n"
+                long ssEnterLegacy  = (long)ssEmis - (long)ssGrowFail;
+                long stuckGrowFirst = (long)ssEmis - (long)ssShrunk;   // committed but never finished + shrank
+                long stuckLegacy    = ssEnterLegacy - (long)ssShrunk;
+                fprintf(stderr, "    [timeout forensics] SELFSERVE-CARRYTHROUGH  shrunk=%u  raw: occ[96]=%u occ[73] grow-fail-events=%u\n"
+                                "        entered / STUCK-in-carrythrough, BY BUILD ORDER -- match to the bin you built:\n"
+                                "          grow-first (DSWS2_ROLEFLOW=1, CF0): entered=%u    STUCK=%ld\n"
+                                "          commit-first (legacy)            : entered=%ld    STUCK=%ld\n"
                                 "        (read: the funnel is CLOSED when entered == shrunk. entered==0 with a live DECENTASN means\n"
-                                "         carry-through never engaged at all -- every reservation took the grow-fail/ring path, so look\n"
+                                "         carry-through never engaged at all -- every reservation took the grow-fail path, so look\n"
                                 "         at grow-fail. STUCK-in-carrythrough>0 == wedged inside the settle walk or the WMMA/ds_add burst\n"
                                 "         .Lflow_da_ss_rowblk -- that burst is deliberately UNINSTRUMENTED because it holds ACC, so\n"
                                 "         cross-reference computed occ[71], FRONTIER above, and the PHIST histogram below.\n"
                                 "         entered==shrunk with a TIMEOUT == carry-through is CLEAN; the stall is elsewhere.)\n",
-                        ssEnter, ssEmis, ssGrowFail, ssShrunk, inFlight);
+                        ssShrunk, ssEmis, ssGrowFail, ssEmis, stuckGrowFirst, ssEnterLegacy, stuckLegacy);
+                if (ssEnterLegacy < 0)
+                    fprintf(stderr, "        NOTE: occ[96] < occ[73] -- IMPOSSIBLE under commit-first; this is a grow-first (CF0) bin.\n");
                 printPhist(occW, "timeout forensics");
             }
             allok = false; break;
@@ -2274,15 +2356,27 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
         //   satisfied the deadman's progress flag, disabling the anti-brick watchdog. Both deleted in the
         //   kernel; see occ_kernel_dsws_flow.s :2120. `entered` is now DERIVED from two independent
         //   pre-existing counters, which is strictly more trustworthy than the counter I removed. ***
+        // *** 2026-07-24: `entered` is BUILD-ORDER DEPENDENT and MUST NOT be printed as one derived number.
+        //   LEGACY (commit-then-grow): the kernel bumped occ[96] BEFORE s_alloc_vgpr, so a grow-fail was an
+        //     emission that did NOT carry through  ->  entered = occ[96] - occ[73].
+        //   CF0 (grow-first/reserve-after, DSWS2_ROLEFLOW): occ[96] is bumped ONLY after a won CAS AND a
+        //     successful grow, while occ[73] counts grow-fail EVENTS on a path that never emitted. The two
+        //     count DISJOINT events, so the subtraction double-counts and can go NEGATIVE  ->  entered = occ[96].
+        //   The host cannot read a build defsym, so print BOTH readings labelled and let the operator match
+        //   them to the bin they built. Printing one silently-wrong number is how a first run gets misread. ***
         uint32_t emis = occW[96], gf = occW[73], k = occW[103];
-        long entered = (long)emis - (long)gf;      // reservations that COMMITTED to carry-through
-        printf("  [dsws2 SELFSERVE] carry-through entered=%ld (occ[96] emissions %u - occ[73] grow-fail %u)  shrunk=%u\n"
-               "      (expect entered==shrunk on a clean run. entered==0 => carry-through NEVER ENGAGED: every\n"
-               "       DECENTASN reservation took the ring handoff, so S1 is inert and this is just the old ring\n"
-               "       economy. entered>shrunk => items committed but never finished the WMMA/reduce burst.\n"
-               "       entered>0 with door4 GROW-FAIL==0 below => S1 engaged but the VGPR budget STILL never\n"
-               "       binds, i.e. the dyn-VGPR moat and the stagger engine remain idle -- headroom left.)\n",
-               entered, emis, gf, k);
+        long enteredLegacy = (long)emis - (long)gf;
+        printf("  [dsws2 SELFSERVE] carry-through  shrunk=%u   raw: occ[96] emissions=%u  occ[73] grow-fail-events=%u\n"
+               "      entered, BY BUILD ORDER -- match this to the bin you built:\n"
+               "        grow-first (DSWS2_ROLEFLOW=1, CF0): entered = occ[96]            = %u\n"
+               "        commit-first (legacy)            : entered = occ[96] - occ[73]  = %ld\n"
+               "      (expect entered==shrunk on a clean run. entered>shrunk => items committed but never finished\n"
+               "       the WMMA/reduce burst. entered>0 with door4 GROW-FAIL==0 below => the VGPR budget STILL\n"
+               "       never binds, i.e. the dyn-VGPR moat and the stagger engine remain idle -- headroom left.)\n",
+               k, emis, gf, emis, enteredLegacy);
+        if (enteredLegacy < 0)
+            printf("      NOTE: occ[96] < occ[73], which is IMPOSSIBLE under the legacy commit-first order --\n"
+                   "        this bin is a grow-first (CF0) build; read the occ[96] line, ignore the legacy line.\n");
         printPhist(occW, "dsws2 SELFSERVE");   // *** SUCCESS PATH TOO: run #11 finished clean and discarded the whole histogram. ***
     }
     {   // STAGINSTR: FULL COAST DECOMPOSITION (2026-07-14). `coast` was ONE bucket with FOUR doors into it,
@@ -2392,16 +2486,77 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                     }
                 }
             }
-            uint32_t doors = cNoStg + cLead + fatFull + growFail;
+            // ---- BNDSPLIT: boundary-interlock waterfall (occ[127..130]), zero unless built BNDSPLIT=1 ----
+            //   Fall-through counters are nested subsets: entries >= zwon >= pdrain >= pcstore. The host
+            //   derives the 4-way split by subtraction: herd(lost the ZLOCK election) vs handler latency
+            //   (won-but-drain-gate / won-but-cstore-gate) vs actual advance.
+            {
+                uint32_t bEntry = occW[127], bZwon = occW[128], bPdrain = occW[129], bPcstore = occW[130];
+                if (bEntry | bZwon | bPdrain | bPcstore) {
+                    uint32_t herd    = (bEntry  >= bZwon)    ? bEntry  - bZwon    : 0;  // lost the ZLOCK election CAS
+                    uint32_t drainB  = (bZwon   >= bPdrain)  ? bZwon   - bPdrain  : 0;  // won, DRAIN<ASSIGN (field not drained)
+                    uint32_t cstoreB = (bPdrain >= bPcstore) ? bPdrain - bPcstore : 0;  // won+drained, GSTORED gate blocked
+                    uint32_t advance = bPcstore;                                        // passed both gates -> advances (+few terminals)
+                    double den = bEntry ? (double)bEntry : 1.0;
+                    printf("  [dsws2 BNDSPLIT] boundary-interlock split (occ[127..130], throttled 1/64 -> ratios exact, sampled entries=%u):\n"
+                           "      ZLOCK_LOST     (herd: lost election CAS)     = %-12u %5.1f%% of entries\n"
+                           "      DRAINGATE_BAIL (won, DRAIN<ASSIGN)           = %-12u %5.1f%% of entries\n"
+                           "      CSTOREGATE_BAIL(won+drained, GSTORED gate)   = %-12u %5.1f%% of entries\n"
+                           "      ADVANCE        (passed both -> DA_ZDONE++)   = %-12u %5.1f%% of entries\n"
+                           "      -> herd dominates => thin the storm on the boundary lock;"
+                           " drain/cstore dominate => handler latency on the critical path.\n",
+                           bEntry,
+                           herd,    100.0*(double)herd/den,
+                           drainB,  100.0*(double)drainB/den,
+                           cstoreB, 100.0*(double)cstoreB/den,
+                           advance, 100.0*(double)advance/den);
+                }
+            }
+            // *** RESVPROBE COUNTER ALIASING -- found 2026-07-27 on the L0 run. ***
+            //   RESVPROBE REUSES the physical registers behind two of these doors:
+            //       CNT_CLEAD   (s96, occ[89])  ->  window-full   (kernel :350)
+            //       CNT_FATFULL (s94, occ[87])  ->  CAS-loss      (kernel :353)
+            //   The kernel guards that reuse as SAFE, and it is -- but only because both originals are
+            //   STRUCTURALLY ZERO at the config of record (ksi%J cannot fire at JDEPTH=1; the FATTOK
+            //   path is compiled to no-ops at BATONGATE=1). This print did not know that, so on a
+            //   RESVPROBE build it displayed RESVPROBE values under the OLD names: the 2026-07-27 L0 run
+            //   printed "door3 FAT-PEAK-FULL (stagger cap) = 507102" for a build where the stagger cap
+            //   CANNOT fire, and "door2 LEAD-GATE (ksi%J != 0) = 402072" at JDEPTH=1 where ksi%J is
+            //   always 0. Both numbers were really occ[87]/occ[89].
+            //   WORSE THAN A LABEL BUG: they were also folded into the coast-door SUM, which they are
+            //   not members of. Dropping them takes the invariant gap from 968,473 to 59,299 -- i.e.
+            //   the sum very nearly CLOSES once the aliases are excluded, and the residue is the known
+            //   non-coasting grow-fail sites (:6054 + :6543). The old print buried that agreement.
+            const bool resvAlias = (getenv("DSWS2_RESVPROBE") != nullptr);
+            uint32_t doors = resvAlias ? (cNoStg + growFail)
+                                       : (cNoStg + cLead + fatFull + growFail);
             printf("  [dsws2 COAST DECOMP]  (door sum=%u vs coast=%u : %s)\n"
                    "      door1 NOTHING-STAGED (DRAIN>=STAGE) = %-12u %5.1f%% of coast\n"
-                   "      door2 LEAD-GATE      (ksi%%J != 0)   = %-12u %5.1f%% of coast   <- STRUCTURAL: (J-1)/J by construction\n"
-                   "      door3 FAT-PEAK-FULL  (stagger cap)  = %-12u %5.1f%% of coast\n"
+                   "      %s = %-12u %5.1f%% of coast\n"
+                   "      %s = %-12u %5.1f%% of coast\n"
                    "      door4 GROW-FAIL      (VGPR budget)  = %-12u %5.1f%% of coast\n",
                    doors, coastIt,
-                   (doors == coastIt ? "CLOSES" : "*** DOES NOT CLOSE -- a door is miscounted ***"),
+                   // *** WHY THIS CAN LEGITIMATELY NOT CLOSE (diagnosed 2026-07-26) ***
+                   //   occ[73]/CNT_GROWFAIL is incremented at THREE sites in occ_kernel_dsws_flow.s, and only
+                   //   ONE of them falls through into .Lflow_coast:
+                   //       :6054  .Lflow_da_cf0_growfail    -- reserved NOTHING, still lean, flows on. NOT coast.
+                   //       :6543  post-reservation self-serve fallback (stamps a slot).            NOT coast.
+                   //       :7176  .Lflow_growfail           -- falls through to .Lflow_coast.      IS  coast.
+                   //   So door4 OVER-counts coast by (:6054 + :6543), and the invariant
+                   //   `coast == CNOSTG + CLEAD + FATFULL + GROWFAIL` MUST fail by exactly that number whenever
+                   //   the dyn-VGPR budget binds. On the 2026-07-26 FM=2 run the gap was 10,799 and that is
+                   //   precisely the non-coast grow-fail count -- the mismatch was a REAL SIGNAL, not noise.
+                   //   Until occ[73] is split into per-site counters, treat a non-closing sum with grow-fail>0
+                   //   as EXPECTED and use the gap as a measurement of the non-coasting fallbacks.
+                   (doors == coastIt ? "CLOSES"
+                     : (growFail > 0u ? "does not close -- EXPECTED: occ[73] merges 3 grow-fail sites, only :7176 coasts; the gap == non-coasting fallbacks"
+                                      : "*** DOES NOT CLOSE -- a door is miscounted (and grow-fail==0, so it is NOT the known occ[73] conflation) ***")),
                    cNoStg,   coastIt ? 100.0*(double)cNoStg/(double)coastIt : 0.0,
+                   resvAlias ? "door2 [RESVPROBE ALIAS -> window-full occ[89], NOT lead-gate; NOT a coast door]"
+                             : "door2 LEAD-GATE      (ksi%J != 0)   <- STRUCTURAL: (J-1)/J by construction    ",
                    cLead,    coastIt ? 100.0*(double)cLead/(double)coastIt  : 0.0,
+                   resvAlias ? "door3 [RESVPROBE ALIAS -> CAS-loss   occ[87], NOT fat-peak;  NOT a coast door]"
+                             : "door3 FAT-PEAK-FULL  (stagger cap)                                            ",
                    fatFull,  coastIt ? 100.0*(double)fatFull/(double)coastIt: 0.0,
                    growFail, coastIt ? 100.0*(double)growFail/(double)coastIt:0.0);
             // THE CARRIER STALL. jWait is NOT a coast -- the wave is FAT and cannot do anything else.
@@ -2448,62 +2603,641 @@ static Dsws2Result run_dsws2(uint32_t node, const char* isaPath,
                    compIt ? (double)jWait / (double)compIt : 0.0,
                    (compIt && (double)jWait > (double)compIt)
                        ? "*** CARRIERS ARE STAGE-STARVED (fat waves spend more time waiting than computing) ***"
-                       : "carriers are fed (stall is not the wall)");
+                       // *** "carriers are fed" REMOVED 2026-07-26 -- occ[88]==0 DOES NOT MEAN THAT. ***
+                       //   occ[88]/CNT_JWAIT is properly wired (cnt_inc at occ_kernel_dsws_flow.s:5406), but
+                       //   .Lflow_jwait is the DEEP-J carrier wait and AT JDEPTH=1 THE PATH DOES NOT EXIST --
+                       //   the kernel says so itself at :2974 ("JDEPTH=1 => no JWAIT/CLEAD"). A carrier at
+                       //   JDEPTH=1 computes one segment and shrinks; it never waits for a next stage.
+                       //   So a zero here is STRUCTURAL, not a measurement, and "stall is not the wall" was a
+                       //   conclusion drawn from a code path that was not in the build.
+                       //   This is the SAME TRAP as an unwired counter wearing different clothes: there the
+                       //   writer was missing, here the writer exists but is unreachable in this config.
+                       //   => CHECK REACHABILITY, NOT JUST THE WRITER. "grep for the call site" is necessary
+                       //      but not sufficient; the call site must also be COMPILED IN and REACHED.
+                       : "occ[88]==0: at JDEPTH=1 .Lflow_jwait DOES NOT EXIST (kernel :2974) -- this zero is "
+                         "STRUCTURAL, NOT a measurement. It does NOT show carriers are fed. Only meaningful at JDEPTH>1.");
             // THE BATON (2026-07-16): a carrier that refused a fat-token but HAD staged work waited on the
             //   per-SIMD VGPR-budget pool (.Lflow_batonwait) instead of coasting, then grew into the registers
             //   a shrinking carrier freed at shrink-START. occ[98] > 0 is the proof the traveling peak ENGAGED
             //   (distinct from occ[87] FATFULL, which counts refusals that COASTED). Compare STAGGER=1 vs =0.
+            // *** occ[98] IS NOT WIRED. DO NOT READ ITS ZERO AS A MEASUREMENT. (2026-07-26) ***
+            //   The kernel contains exactly ONE reference to this slot -- `.set FDIAG_BATON_OFF, 392` at
+            //   occ_kernel_dsws_flow.s:2840 -- and NO WRITER. There is no `.Lflow_batonwait` label at all.
+            //   So occ[98] is structurally always 0, and the old "no baton handoff" verdict below was printed
+            //   with total confidence on a counter nothing increments.
+            //   IT COST US: on the 2026-07-26 FM=2 run I cited "baton spins = 0 despite 489k grow-fails" as
+            //   evidence the traveling peak never engaged. That was an unwired zero, and it is the EIGHTH time
+            //   this project has been misled by one (STINSTR_FEED, NOCFLUSH, CSTORE, DIAG, SPIN[], FATTOK
+            //   uninitialised, ...). The standing rule is GREP FOR THE WRITER, NOT THE DEFINITION -- a counter
+            //   that is read but never written looks exactly like a path that is never taken.
             uint32_t batonWait = occW[98];
-            printf("  [dsws2 BATON] occ[98] .Lflow_batonwait spins (carrier waited on the VGPR-budget pool, then grew) = %u\n"
-                   "                    -> %s\n",
-                   batonWait,
-                   batonWait > 0u ? "the traveling peak ENGAGED -- a shrinking carrier handed its budget to a waiter"
-                                  : "no baton handoff (no carrier-with-work ever hit a full pool -- or STAGGER=0)");
+            {
+                bool batonWired = false;   // flip to true ONLY when a writer to FDIAG_BATON_OFF actually exists
+                if (!batonWired) {
+                    printf("  [dsws2 BATON] occ[98] = %u  *** NOT WIRED -- NO WRITER EXISTS IN THE KERNEL. "
+                           "THIS ZERO IS NOT A MEASUREMENT. ***\n"
+                           "                    -> the baton/traveling-peak cannot be observed from this build. "
+                           "Wire a writer at the wait site or delete the counter; do NOT infer from it.\n",
+                           batonWait);
+                } else {
+                    printf("  [dsws2 BATON] occ[98] .Lflow_batonwait spins (carrier waited on the VGPR-budget pool, then grew) = %u\n"
+                           "                    -> %s\n",
+                           batonWait,
+                           batonWait > 0u ? "the traveling peak ENGAGED -- a shrinking carrier handed its budget to a waiter"
+                                          : "no baton handoff (no carrier-with-work ever hit a full pool -- or STAGGER=0)");
+                }
+            }
             // feedMT is emitted by BOTH lean feed waves AND coasting compute waves, so it is NOT a subset of
             //   coast -- dividing by coast printed 196.2% on 2026-07-13. Correct denominator = all feed-path iters.
             double feedTot = (double)feedIt + (double)feedMT;
-            printf("  [dsws2 STARVATION] feed-path iters with NOTHING ASSIGNED (occ[86]) = %u\n"
-                   "                    -> %.1f%% of ALL feed-path iters found an empty ASSIGN frontier  => %s\n",
+            // *** THE "ASSIGN-BOUND" VERDICT WAS REMOVED 2026-07-26. occ[86] CANNOT SUPPORT IT. ***
+            //   occ[86] increments at the COMMON `.Lflow_feedmt_sleep` exit, which is reached by an empty
+            //   ASSIGN frontier AND by window-full bails AND by ZLOCK boundary bails. It is "gave up on the
+            //   feed path", not "the frontier was empty". Printing a binary ASSIGN-BOUND / STAGE-BOUND
+            //   mechanism from that ratio asserts a cause the counter never measured.
+            //   THIS PROJECT HAS BEEN BURNED BY THIS EXACT CLAIM REPEATEDLY: "ASSIGN-starved 76%" became
+            //   1.8% purely by feeding the kernel to steady state (2026-07-13). kmbandy, 2026-07-26:
+            //   "we've consistently said it was that and then consistently found that it wasn't that...
+            //   we need to measure before we make claims like that."
+            //   THE INSTRUMENT THAT CAN ACTUALLY DECIDE IT IS RESVPROBE (below): it splits the bails into
+            //   occ[87] CAS-loss vs occ[89] window-full vs the boundary remainder. Build RESVPROBE=1 and
+            //   run with DSWS2_RESVPROBE=1. Until then this line reports a COUNT, not a cause.
+            printf("  [dsws2 FEED-PATH BAILS] occ[86] = %u  (%.1f%% of all feed-path iters)\n"
+                   "                    -> NOTE: this counter MERGES empty-frontier + window-full + boundary\n"
+                   "                       bails at the common .Lflow_feedmt_sleep exit. It does NOT identify\n"
+                   "                       a bottleneck. For the actual split run a RESVPROBE=1 bin with\n"
+                   "                       DSWS2_RESVPROBE=1; do NOT infer ASSIGN-bound from this number.\n",
                    feedMT,
-                   feedTot > 0 ? 100.0 * (double)feedMT / feedTot : 0.0,
-                   (feedTot > 0 && (double)feedMT > 0.5 * feedTot)
-                       ? "ASSIGN-BOUND (coordinator cannot publish fast enough)"
-                       : "STAGE-BOUND (work is assigned; feeds/pool cannot stage it fast enough)");
+                   feedTot > 0 ? 100.0 * (double)feedMT / feedTot : 0.0);
             // DECENTASN CLAIM-PERSISTENCE DIAGNOSTIC (sol gpt-5.6-sol, 2026-07-15): both reviews converged that
             //   the seed is a PHANTOM claim (claim CAS reports success but does not persist to LDS). Measure it
             //   directly at the claim, upstream of every propagation story.
             if (occW[95] > 0u || occW[96] > 0u || occW[97] > 0u) {
+                // *** occ[96] EXPECTATION FIXED 2026-07-26 -- IT OMITTED GROUPS AND MANUFACTURED A FALSE BUG. ***
+                //   This line said "expect == TOTAL_super". WRONG. The kernel emits one reservation per
+                //   (group, super-tile): GROUPS = G/ACC_N (occ_kernel_dsws_flow.s ".set GROUPS, (G / ACC_N)"),
+                //   and occ[96] ACCUMULATES across reps like occ[71] does. So the target is
+                //       GROUPS * TOTAL_super * repsDone.
+                //   COST OF THE OLD LABEL: on the 2026-07-26 FM=2 run it printed "expected 46,080" against an
+                //   actual 60,444, so I read UNDER-emission (real target 92,160) as OVER-emission and spent the
+                //   evening hunting a duplicate-claim race that does not exist. At the config of record
+                //   (G=6 ACC_N=3 -> GROUPS=2) the old label was ALSO wrong, just less visibly.
+                //   A diagnostic's EXPECTED value is part of the diagnostic. Getting it wrong does not
+                //   under-inform, it actively points at a fabricated defect.
+                unsigned long long groupsV   = accN ? (unsigned long long)(Gv / accN) : 1ull;
+                unsigned long long expEmit   = groupsV * TOTAL_super
+                                             * (unsigned long long)(repsDone > 0 ? repsDone : 1);
+                long long emitDelta = (long long)occW[96] - (long long)expEmit;
                 printf("  [dsws2 DECENTASN CLAIM-DIAG]\n"
                        "      occ[95] exec lane0 INACTIVE at claim CAS (lds_cas_rtn false-'won' precondition) = %u\n"
-                       "      occ[96] super-tile EMISSIONS reaching .Lflow_da_stamp (expect == TOTAL_super)  = %u\n"
-                       "      occ[97] release bailed on inflight==0 (containment, no underflow)          = %u\n"
-                       "      *** occ[96] IS NO LONGER THE PHANTOM COUNTER. The kernel repurposed CLAIM_NOPERSIST at\n"
-                       "          occ_kernel_dsws_flow.s:3661 to count REAL super-tile emissions; this label said\n"
-                       "          'PHANTOM' through run #6, which reported 12288 emissions as 12288 phantom claims.\n"
-                       "          occ[95]>0 is still the exec-mask false-'won' precondition (931/939). ***\n",
-                       occW[95], occW[96], occW[97]);
+                       "      occ[96] super-tile EMISSIONS reaching .Lflow_da_stamp = %u   expect GROUPS*TOTAL_super*reps = %llu   delta %+lld%s\n"
+                       "      occ[97] boundary drain / C-store-gate bails (occ_kernel_dsws_flow.s:6365)   = %u\n",
+                       occW[95], occW[96], expEmit, emitDelta,
+                       emitDelta < 0 ? "   <- UNDER-EMISSION: reservations never made, not work lost downstream" : "",
+                       occW[97]);
             }
             // ---- RESVPROBE (2026-07-20, N4): the CLEAN split of the empty-ASSIGN-frontier into WHY a wave
             //   failed to reserve. Replaces run #16's PHIST TRY/WIN (~294% contaminated). occ[87]/occ[89] are
             //   register-accumulated (CNT_FATFULL/CNT_CLEAD, both structurally 0 at config of record), so this
             //   is measured INSIDE the quotable-TF build. Only meaningful for a bin built RESVPROBE=1.
             if (getenv("DSWS2_RESVPROBE")) {
-                uint32_t winR = occW[96];      // WIN: reservations that reached .Lflow_da_stamp (== TOTAL_super)
+                // *** occ[96] IS NOT TOTAL_super. *** It is GROUPS*TOTAL_super*reps (the 2026-07-27 L0 run:
+                //   occ[96]=230,400 vs TOTAL_super=23,040). The ratios below are run-total / run-total and
+                //   are therefore unaffected; only the old comment was wrong. Do not "fix" this by dividing.
+                uint32_t winR = occW[96];      // successful reserves that reached .Lflow_da_stamp (WHOLE RUN)
                 uint32_t casLoss = occW[87];   // CAS-loss: lost the single-cursor ASSIGN_HEAD CAS (retry)
                 uint32_t poolFull = occW[89];   // window-full bail: r-DRAIN >= SSWIN (consumers behind)
-                uint32_t feedMTr = occW[86];   // empty-frontier bails (all reasons), for the denominator
+                uint32_t feedMTr = occW[86];   // ALL feed-path bails (empty-frontier + window-full + boundary)
+                uint32_t bndB    = occW[97];   // boundary drain / C-store-gate bails (kernel :6365)
                 double contention = winR ? (double)casLoss / (double)winR : 0.0;   // collisions per successful reserve
                 double pfFrac = feedMTr ? 100.0 * (double)poolFull / (double)feedMTr : 0.0;
+                // *** SHARE-OF-BAILS ACCOUNTING -- ADDED 2026-07-27. ***
+                //   The old verdict compared CAS-loss against occ[96] (successful reserves) and window-full
+                //   against occ[86] (bails) -- two different denominators -- and therefore never asked what
+                //   fraction of the bail population it had actually explained. On the 2026-07-27 L0 run it
+                //   printed "CURSOR-CONTENDED -> SHARD THE CURSOR" on a contention of 2.201, while CAS-loss
+                //   was only 1.8% of the 28.2M bails and 92.9% of them were UNACCOUNTED. Sharding the cursor
+                //   would have been aimed at 1.8% of the wall. A verdict must not out-run its own denominator.
+                uint64_t accounted = (uint64_t)casLoss + (uint64_t)poolFull + (uint64_t)bndB;
+                uint64_t unacc = ((uint64_t)feedMTr > accounted) ? ((uint64_t)feedMTr - accounted) : 0ull;
+                double casFrac  = feedMTr ? 100.0 * (double)casLoss / (double)feedMTr : 0.0;
+                double bndFrac  = feedMTr ? 100.0 * (double)bndB    / (double)feedMTr : 0.0;
+                double unaccFrac= feedMTr ? 100.0 * (double)unacc   / (double)feedMTr : 0.0;
+                double itersPerWin = winR ? (double)feedMTr / (double)winR : 0.0;
                 const char* verdict =
-                    (pfFrac > 50.0)      ? "WINDOW FULL -> STAGE-BOUND: ASSIGN is AHEAD; the wall is staging/drain, NOT the cursor. DO NOT shard."
-                  : (contention > 1.0)   ? "CURSOR-CONTENDED: >1 CAS collision per reserve on the single ASSIGN_HEAD word -> SHARD THE CURSOR."
+                    (unaccFrac > 50.0)   ? "EMPTY-FRONTIER DOMINATES: most bails are neither CAS-loss, window-full, nor boundary -- the frontier is simply EMPTY. The limiter is on the PRODUCER side (publication/advance rate), not the cursor and not the window. Sharding and deeper SSWIN both miss this. SPLIT THIS BUCKET before spending a lever on it."
+                  : (pfFrac > 50.0)      ? "WINDOW FULL -> STAGE-BOUND: ASSIGN is AHEAD; the wall is staging/drain, NOT the cursor. DO NOT shard."
+                  : (casFrac > 25.0)     ? "CURSOR-CONTENDED AND IT MATTERS: CAS-loss is a large share of all bails -> SHARD THE CURSOR."
+                  : (contention > 1.0)   ? "CURSOR CONTENDED BUT SMALL: >1 CAS collision per reserve, yet CAS-loss is a MINORITY of bails. Sharding buys at most its share -- check the unaccounted bucket first."
                   : (contention > 0.15)  ? "MILD CURSOR CONTENTION: measurable collisions; sharding may help but is not the dominant wall."
                                          : "NEITHER: window not full AND cursor barely contended -> the empties are ZLOCK BOUNDARY bails (serialization).";
-                printf("  [dsws2 RESVPROBE] reservation-exit split (WIN=%u = TOTAL_super):\n"
-                       "      CAS-loss (lost single-cursor CAS, occ[87]) = %u   -> %.3f collisions per successful reserve\n"
-                       "      window-full bail (r-DRAIN>=SSWIN, occ[89]) = %u   -> %.1f%% of empty-frontier bails\n"
+                printf("  [dsws2 RESVPROBE] reservation-exit split  (successful reserves occ[96]=%u; all feed-path bails occ[86]=%u = %.1f iters per reserve):\n"
+                       "      CAS-loss    (single-cursor CAS, occ[87]) = %-12u %5.1f%% of bails   (%.3f collisions per successful reserve)\n"
+                       "      window-full (r-DRAIN>=SSWIN,    occ[89]) = %-12u %5.1f%% of bails\n"
+                       "      boundary    (drain/C-store gate,occ[97]) = %-12u %5.1f%% of bails\n"
+                       "      UNACCOUNTED (frontier simply EMPTY)      = %-12llu %5.1f%% of bails\n"
                        "      => %s\n",
-                       winR, casLoss, contention, poolFull, pfFrac, verdict);
+                       winR, feedMTr, itersPerWin,
+                       casLoss, casFrac, contention,
+                       poolFull, pfFrac,
+                       bndB, bndFrac,
+                       (unsigned long long)unacc, unaccFrac,
+                       verdict);
+            }
+        }
+    }
+    {
+        uint32_t advTicks = occW[131], advCount = occW[132];
+        if (advTicks | advCount) {
+            double ticksPerAdvance = advCount ? (double)advTicks / (double)advCount : 0.0;
+            printf("  [dsws2 ADVPROBE] total critical-section ticks (occ[131]) = %u\n"
+                   "      successful advances (occ[132], throttled 1/64) = %u\n"
+                   "      ticks/advance = %.3f  (compare with the ~2600-tick frontier interval)\n",
+                   advTicks, advCount, ticksPerAdvance);
+        }
+    }
+    {   // ---- BNDTIME (2026-07-24): the COST OF A LOSING BOUNDARY PASS, on the SUCCESS path. ----
+        //   ADVPROBE (occ[131..132]) times the WIN path only: election-win -> DA_ZDONE store, ~264 ticks.
+        //   BNDSPLIT (occ[127..130]) counts the outcomes but says nothing about their cost. The 07-24 PHIST
+        //   census put 78.9% of ALL loop passes inside .Lflow_da_boundary and BNDSPLIT put 93.1% of those on
+        //   the losing side of the ZLOCK election -- i.e. ~73% of every loop pass in the kernel is a wave
+        //   entering the boundary and leaving with nothing. This pair prices that pass. Cheap => the boundary
+        //   traffic is noise and the wall is elsewhere; expensive => boundary traffic IS the kernel's cost.
+        //   Zero unless the bin was built -Wa,-defsym,DSWS2_BNDTIME=1 (and that build refuses DEADMAN=0).
+        uint32_t lostTicks = occW[133], lostCount = occW[134];
+        if (lostTicks | lostCount) {
+            double ticksPerLost = lostCount ? (double)lostTicks / (double)lostCount : 0.0;
+            uint32_t advTicks2 = occW[131], advCount2 = occW[132];
+            double ticksPerAdv2 = advCount2 ? (double)advTicks2 / (double)advCount2 : 0.0;
+            printf("  [dsws2 BNDTIME] LOSING-pass boundary timer (the complement of ADVPROBE):\n"
+                   "      total ticks in non-advancing passes (occ[133]) = %u\n"
+                   "      non-advancing boundary passes (occ[134], throttled 1/64, SAME s71 gate as the start\n"
+                   "        latch -> every sampled entry has a sampled exit) = %u\n"
+                   "      ticks/lost-visit = %.3f\n",
+                   lostTicks, lostCount, ticksPerLost);
+            printf("      SCOPE: occ[134] counts EVERY exit from .Lflow_da_boundary that completes no advance --\n"
+                   "        lost ZLOCK election CAS, drain-gate bail, C-store-gate bail, DSWS2_FUNNEL not-ready\n"
+                   "        bail, and the once-per-WG terminal. It is NOT 'bails only'; terminals are <=1 per WG\n"
+                   "        (<=~64 events, then 1/64-sampled) so they cannot move the average.\n");
+            if (advCount2)
+                printf("      vs ADVPROBE ticks/advance = %.3f  -> a losing pass costs %.2fx a winning one.\n",
+                       ticksPerAdv2, ticksPerAdv2 > 0.0 ? ticksPerLost / ticksPerAdv2 : 0.0);
+            printf("      READ IT AGAINST BNDSPLIT occ[127] (sampled entries, same 1/64 gate): lost-visits/entries\n"
+                   "        is the share of boundary traffic that accomplishes nothing, and ticks/lost-visit x\n"
+                   "        occ[134] x 64 is the whole run's wave-time burned on it. CAVEAT: this is a PROBE\n"
+                   "        build -- do NOT quote TF from it (CLAUDE.md measurement rules).\n");
+        }
+    }
+    {   // ---- GAP HEAD/GAP/TAIL (tasks aa5810c9 / ef3308a3). occ[185..194]. ----
+        //   Use sumSpan (this scope), NOT res.wall — res.wall is assigned later in this function.
+        auto u64g = [&](int lo) -> uint64_t {
+            return (uint64_t)occW[lo] | ((uint64_t)occW[lo + 1] << 32);
+        };
+        const uint64_t gapSum  = u64g(185);
+        const uint32_t gapN    = occW[187];
+        const uint64_t headSum = u64g(188);
+        const uint32_t headN   = occW[190];
+        const uint64_t tailSum = u64g(191);
+        const uint32_t tailN   = occW[193];
+        const uint32_t noburst = occW[194];
+        const uint32_t gapLive = occW[195], gapPeak = occW[196], gapEntries = occW[197];
+        const int gapWant = getenv("DSWS2_GAP") != nullptr;
+        const int gapBuilt = (gapSum | gapN | headSum | headN | tailSum | tailN | noburst
+                              | gapLive | gapPeak | gapEntries) != 0;
+        if (gapWant || gapBuilt) {
+            if (!gapBuilt) {
+                printf("  [dsws2 GAP] *** NOT BUILT *** (occ[185..197] zero). Rebuild -Wa,-defsym,DSWS2_GAP=1.\n");
+            } else {
+                const uint32_t poolW  = getenv("ML8_POOL")   ? (uint32_t)atoi(getenv("ML8_POOL"))   : 64u;
+                const uint32_t wavesW = getenv("FLOW_WAVES") ? (uint32_t)atoi(getenv("FLOW_WAVES")) : 30u;
+                const uint64_t span = sumSpan;   // NOT res.wall (still 0 here)
+                const uint64_t budget = span * (uint64_t)poolW * (uint64_t)wavesW;
+                auto mean = [](uint64_t s, uint32_t n) -> double {
+                    return n ? (double)s / (double)n : 0.0;
+                };
+                auto pct = [&](uint64_t s) -> double {
+                    return budget ? 100.0 * (double)s / (double)budget : 0.0;
+                };
+                const uint64_t waveTime = headSum + gapSum + tailSum;
+                const double avgConc = span ? (double)waveTime / (double)span : 0.0;
+                printf("  [dsws2 GAP] HEAD / GAP / TAIL (two stamps each; unthrottled):\n");
+                printf("      budget = sumSpan(%llu) x %u x %u = %llu\n",
+                       (unsigned long long)span, poolW, wavesW, (unsigned long long)budget);
+                printf("      HEAD  total=%llu  n=%u  mean=%.1f  %5.2f%% of budget\n",
+                       (unsigned long long)headSum, headN, mean(headSum, headN), pct(headSum));
+                printf("      GAP   total=%llu  n=%u  mean=%.1f  %5.2f%% of budget\n",
+                       (unsigned long long)gapSum, gapN, mean(gapSum, gapN), pct(gapSum));
+                printf("      TAIL  total=%llu  n=%u  mean=%.1f  %5.2f%% of budget\n",
+                       (unsigned long long)tailSum, tailN, mean(tailSum, tailN), pct(tailSum));
+                printf("      NOBURST_n=%u  HEAD_n=%u TAIL_n=%u\n", noburst, headN, tailN);
+                printf("      PEAK concurrent occ[196]=%u  ENTRIES occ[197]=%u  live_end occ[195]=%u%s\n",
+                       gapPeak, gapEntries, gapLive,
+                       gapLive != 0 ? "  *** live_end != 0 (waves not all retired) ***" : "");
+                printf("      avg concurrency (HEAD+GAP+TAIL)/span = %.1f   peak=%u   nominal=%u\n",
+                       avgConc, gapPeak, poolW * wavesW);
+            }
+        }
+    }
+    {   // ---- POLLSTAGE: one stage of one poll pass (option b: one stage per build). ----
+        //   occ[198]=sum_lo, [199]=sum_hi, [200]=count, [201]=stage id (1..6).
+        //   Report ms only (100 MHz RTC: 100000 ticks = 1 ms). No %, no budget, no residual.
+        auto u64ps = [&](int lo) -> uint64_t {
+            return (uint64_t)occW[lo] | ((uint64_t)occW[lo + 1] << 32);
+        };
+        const uint64_t psSum = u64ps(198);
+        const uint32_t psN   = occW[200];
+        const uint32_t psStg = occW[201];
+        const int psWant = getenv("DSWS2_POLLSTAGE") != nullptr;
+        const int psBuilt = (psSum | psN | psStg) != 0;
+        if (psWant || psBuilt) {
+            if (!psBuilt) {
+                printf("  [dsws2 POLLSTAGE] *** NOT BUILT *** (occ[198..201] zero).\n"
+                       "      Rebuild -Wa,-defsym,DSWS2_POLLSTAGE=N for N=1..6.\n");
+            } else {
+                // mean ms per completed sample; total wave-ms across all waves
+                const double meanMs  = psN ? ((double)psSum / (double)psN) / 100000.0 : 0.0;
+                const double totalMs = (double)psSum / 100000.0;
+                printf("  [dsws2 POLLSTAGE] stage %u:  mean=%.6f ms  n=%u  total=%.3f ms\n",
+                       psStg, meanMs, psN, totalMs);
+            }
+        }
+    }
+    {   // ---- WTBUDGET wave-time partition (tasks 250fc30c / 9c68cbb6). ----
+        //   Tick sums are u64 (lo + hi) so 33 chunks × 1920 waves × ~1e6 ticks do not wrap u32.
+        //   PARTIAL: A/D/E/T exact; C sampled 1/WTB_THR then host-extrapolated; B = T−A−C_est−D.
+        //   RESIDUAL = span × measured_peak − sum(T) − sum(E).  Loud if it does not close.
+        auto u64occ = [&](int lo) -> uint64_t {
+            return (uint64_t)occW[lo] | ((uint64_t)occW[lo + 1] << 32);
+        };
+        const uint64_t wA    = u64occ(167);   // A lo/hi
+        const uint64_t wCsum = u64occ(169);
+        const uint32_t wCsamp = occW[171], wCn = occW[172];
+        const uint64_t wD    = u64occ(173);
+        const uint64_t wE    = u64occ(175);
+        const uint64_t wT    = u64occ(177);
+        const uint32_t wOvf  = occW[179];
+        const uint32_t wLive = occW[180], wPeak = occW[181], wEntries = occW[182];
+        const int wtbWant = getenv("DSWS2_WTBUDGET") != nullptr;
+        const int wtbBuilt = (wA | wCsum | wCsamp | wCn | wD | wE | wT | wOvf | wPeak | wEntries) != 0;
+        if (wtbWant || wtbBuilt) {
+            if (!wtbBuilt) {
+                printf("  [dsws2 WTBUDGET] *** NOT BUILT *** (occ[167..182] all zero with DSWS2_WTBUDGET env set).\n"
+                       "      Rebuild -Wa,-defsym,DSWS2_WTBUDGET=1. Do NOT cite zeros as measurements.\n");
+            } else {
+                const uint64_t span = res.wall;   // TFPROBE span (summed across chunks; same units as RTC low 32b)
+                // MEASURED peak concurrent from WTBUDGET itself (occ[181], above 0x100 memset).
+                //   Fallback: launch geometry, LABELLED ASSUMED if peak is zero (should not happen if built).
+                const uint32_t poolW  = getenv("ML8_POOL")   ? (uint32_t)atoi(getenv("ML8_POOL"))   : 64u;
+                const uint32_t wavesW = getenv("FLOW_WAVES") ? (uint32_t)atoi(getenv("FLOW_WAVES")) : 30u;
+                const uint32_t geomResi = poolW * wavesW;
+                const int peakMeasured = (wPeak > 0);
+                const uint32_t resi = peakMeasured ? wPeak : geomResi;
+                const uint64_t budget = span * (uint64_t)resi;
+                double cEst = 0.0;
+                if (wCsamp > 0 && wCn > 0)
+                    cEst = (double)wCsum * ((double)wCn / (double)wCsamp);
+                double bDer = (double)wT - (double)wA - cEst - (double)wD;
+                if (bDer < 0.0) bDer = 0.0;
+                const double sumT = (double)wT;
+                const double residual = (double)budget - sumT - (double)wE;
+                // T sanity: sum(T) should be within a few % of span×resi for a fully concurrent epoch sum.
+                const double tRatio = budget ? sumT / (double)budget : 0.0;
+                const int tOk = (tRatio >= 0.90 && tRatio <= 1.10);
+                printf("  [dsws2 WTBUDGET] wave-time partition (PARTIAL; B derived; C extrapolated; ticks u64):\n");
+                if (wOvf)
+                    printf("      *** OVERFLOW FLAGS occ[179]=0x%x — per-wave sat flags; still read u64 sums ***\n", wOvf);
+                printf("      residency: peak_MEASURED occ[181]=%u  entries occ[182]=%u  live_net occ[180]=%u\n",
+                       wPeak, wEntries, wLive);
+                if (!peakMeasured)
+                    printf("      residency: peak was 0 — using ASSUMED geom %u×%u=%u (LABEL: ASSUMED)\n",
+                           poolW, wavesW, geomResi);
+                else
+                    printf("      residency: using MEASURED peak=%u (geom would be %u)\n", resi, geomResi);
+                printf("      budget = span(%llu) x resi(%u) = %llu wave-ticks\n",
+                       (unsigned long long)span, resi, (unsigned long long)budget);
+                printf("      sum(T)=%llu  sum(E)=%llu  residual=budget-T-E = %.0f  (%.2f%% of budget)\n",
+                       (unsigned long long)wT, (unsigned long long)wE, residual,
+                       budget ? 100.0 * residual / (double)budget : 0.0);
+                printf("      T SANITY: sum(T)/budget = %.3f  %s  (expect ~1.0 across all chunks; "
+                       "first-build bug was u32 wrap → ~0.03)\n",
+                       tRatio, tOk ? "OK" : "*** FAIL — T does not cover the span ***");
+                if (wEntries > 0) {
+                    const uint32_t expectEnt = geomResi * 33u; // 33 chunks default geometry; informative only
+                    printf("      entries sanity: occ[182]=%u  (geom×33 chunks ≈ %u if 33 chunks; not a hard gate)\n",
+                           wEntries, expectEnt);
+                }
+                printf("      WITHIN T (must sum ~100%% of T):\n");
+                auto pctT = [&](double x) { return sumT > 0.0 ? 100.0 * x / sumT : 0.0; };
+                printf("        A compute-burst     %llu   %6.2f%% of T\n",
+                       (unsigned long long)wA, pctT((double)wA));
+                printf("        B poll-awake (der)  %.0f   %6.2f%% of T\n", bDer, pctT(bDer));
+                printf("        C sleep (extrap)    C_n=%u C_samp=%u C_sum=%llu  C_est=%.0f   %6.2f%% of T\n",
+                       wCn, wCsamp, (unsigned long long)wCsum, cEst, pctT(cEst));
+                printf("        D boundary          %llu   %6.2f%% of T\n",
+                       (unsigned long long)wD, pctT((double)wD));
+                printf("      E init (entry→golive) %llu   %6.2f%% of budget\n",
+                       (unsigned long long)wE, budget ? 100.0 * (double)wE / (double)budget : 0.0);
+                printf("      SAMPLING: C is 1-in-WTB_THR feedmt parks (own thr, NOT s71). "
+                       "C_est = C_sum * (C_n/C_samp). Tick sums are u64 atomics across all chunk relaunches.\n");
+                printf("      B is DERIVED — not a timer. Residual is the LOUD failure mode if T does not cover the span.\n");
+            }
+        }
+    }
+    {   // ---- BURSTCNT Step 0 (counts only; no RTC). occ[160..166]. ----
+        //   Frequency structure of .Lflow_da_ss_rowblk. Per-item expected (FM,FN,KSEG_STEPS=SEGK/16):
+        //     BURST=1, BLOAD=FN*KSEG, ALOAD=FM*KSEG, WAITLD=KSEG, WMMA=FM*FN*KSEG,
+        //     DSADD=FM*FN*8, WAITDS=1. Totals = expected * items (items = TOTAL_super * GROUPS * ACC_N
+        //     for the full shape; with chunking, sum over chunks of emissions * ACC_N).
+        uint32_t bcBurst  = occW[160], bcBload = occW[161], bcAload = occW[162];
+        uint32_t bcWaitLd = occW[163], bcWmma  = occW[164], bcDsadd = occW[165];
+        uint32_t bcWaitDs = occW[166];
+        const int bcWant  = getenv("DSWS2_BURSTCNT") != nullptr;
+        const int bcBuilt = (bcBurst | bcBload | bcAload | bcWaitLd | bcWmma | bcDsadd | bcWaitDs) != 0;
+        if (bcWant || bcBuilt) {
+            if (!bcBuilt) {
+                printf("  [dsws2 BURSTCNT] *** NOT BUILT *** (occ[160..166] all zero with DSWS2_BURSTCNT env set).\n"
+                       "      Rebuild -Wa,-defsym,DSWS2_BURSTCNT=1. Do NOT cite zeros as measurements.\n");
+            } else {
+                printf("  [dsws2 BURSTCNT] Step-0 frequency (SALU accumulate, emit-at-retire; NO RTC):\n"
+                       "      BURST(rowblk)  occ[160]=%u\n"
+                       "      BLOAD(tr)      occ[161]=%u\n"
+                       "      ALOAD(global)  occ[162]=%u   (SS path: global_load_b64, not ds_load)\n"
+                       "      WAIT_LOADCNT   occ[163]=%u\n"
+                       "      WMMA           occ[164]=%u\n"
+                       "      DS_ADD_F32     occ[165]=%u\n"
+                       "      WAIT_DSCNT     occ[166]=%u\n",
+                       bcBurst, bcBload, bcAload, bcWaitLd, bcWmma, bcDsadd, bcWaitDs);
+                if (bcBurst) {
+                    printf("      per-BURST means: BLOAD=%.2f ALOAD=%.2f WAITLD=%.2f WMMA=%.2f DSADD=%.2f WAITDS=%.2f\n",
+                           (double)bcBload / (double)bcBurst,
+                           (double)bcAload / (double)bcBurst,
+                           (double)bcWaitLd / (double)bcBurst,
+                           (double)bcWmma / (double)bcBurst,
+                           (double)bcDsadd / (double)bcBurst,
+                           (double)bcWaitDs / (double)bcBurst);
+                }
+                printf("      COST: 7 atomics/wave at retire only (not per-item). ACC-live sites are pure s_add_u32.\n");
+            }
+        }
+    }
+    {   // ---- PASSTIME (+ settling + 64-bit tick-sums + overflow guards) ----
+        //   Tick-sums are u64 (lo at legacy slot, hi at occ[150..154]). Counts stay u32.
+        //   occ[155] = OR of per-wave overflow flags. Host REFUSES impossible percentages.
+        uint64_t t1Ticks = (uint64_t)occW[135] | ((uint64_t)occW[150] << 32);
+        uint32_t t1EndCount = occW[136];
+        uint64_t t2Ticks = (uint64_t)occW[137] | ((uint64_t)occW[151] << 32);
+        uint32_t t2Count = occW[138];
+        uint64_t t0Ticks = (uint64_t)occW[139] | ((uint64_t)occW[152] << 32);
+        uint32_t t0Count = occW[140];
+        uint32_t unpaired = occW[141], t1Max = occW[142], t1StartCount = occW[143];
+        uint32_t waveEntries = occW[144], peakRes = occW[145];
+        uint32_t gt1kN = occW[146];
+        uint64_t gt1kSum = (uint64_t)occW[147] | ((uint64_t)occW[153] << 32);
+        uint32_t gt64kN = occW[148];
+        uint64_t gt64kSum = (uint64_t)occW[149] | ((uint64_t)occW[154] << 32);
+        uint32_t ovf = occW[155];
+        // P3 prefetch counters (occ[156..158]) + s71 co-tenant mask (occ[159]).
+        uint32_t pfTiles = occW[156], pfBlocks = occW[157], pfIdle = occW[158];
+        uint32_t s71Gates = occW[159];
+        uint32_t parks = occW[86];
+        const int ptWant = getenv("DSWS2_PASSTIME") != nullptr;
+        const int ptBuilt = (t1EndCount | t1StartCount | t0Count | t2Count | unpaired | t1Max
+                             | waveEntries | peakRes
+                             | (uint32_t)(t1Ticks | t2Ticks | t0Ticks | gt1kSum | gt64kSum)
+                             | gt1kN | gt64kN | ovf) != 0;
+        if (ptWant || ptBuilt) {
+            if (!ptBuilt) {
+                printf("  [dsws2 PASSTIME] *** NOT BUILT *** (occ[135..155] all zero with DSWS2_PASSTIME env set).\n"
+                       "      Rebuild -Wa,-defsym,DSWS2_PASSTIME=1. Do NOT cite zeros as measurements.\n");
+            } else {
+                double meanT0 = t0Count ? (double)t0Ticks / (double)t0Count : 0.0;
+                double meanT1 = t1EndCount ? (double)t1Ticks / (double)t1EndCount : 0.0;
+                double meanT2 = t2Count ? (double)t2Ticks / (double)t2Count : 0.0;
+                double t2frac = (t1EndCount > 0) ? ((double)t2Count / (double)t1EndCount) : 0.0;
+                if (t2frac > 1.0) t2frac = 1.0;
+                double corrT1 = meanT1 - meanT0 * (1.0 + 2.0 * t2frac);
+                double corrT2 = meanT2 - meanT0;
+                int t1Bad = (t0Count > 0 && corrT1 < 0.0);
+                int t2Bad = (t0Count > 0 && corrT2 < 0.0);
+                // Overflow / consistency: real counter corruption voids tick-derived verdicts.
+                int voidTicks = 0;
+                // Stratified sampling: x64 extrapolation invalid when other s71 co-tenants exist
+                //   (does NOT mean the sampled T1 values themselves are corrupt).
+                int extrapBad = 0;
+                if (ovf) {
+                    printf("  [dsws2 PASSTIME] *** INCONSISTENT — COUNTERS VOID *** per-wave overflow flags occ[155]=0x%x\n"
+                           "      bits: T1=%d T0=%d T2=%d gt1k=%d gt64k=%d  (sticky saturate fired on a wave)\n",
+                           ovf, !!(ovf&1), !!(ovf&2), !!(ovf&4), !!(ovf&8), !!(ovf&16));
+                    voidTicks = 1;
+                }
+                if (gt64kSum > gt1kSum) {
+                    printf("  [dsws2 PASSTIME] *** INCONSISTENT — COUNTERS VOID *** gt64k_sum (%llu) > gt1k_sum (%llu)\n"
+                           "      (subset cannot exceed superset — classic u32 wrap fingerprint)\n",
+                           (unsigned long long)gt64kSum, (unsigned long long)gt1kSum);
+                    voidTicks = 1;
+                }
+                if (gt1kSum > t1Ticks) {
+                    printf("  [dsws2 PASSTIME] *** INCONSISTENT — COUNTERS VOID *** gt1k_sum (%llu) > T1_total (%llu)\n",
+                           (unsigned long long)gt1kSum, (unsigned long long)t1Ticks);
+                    voidTicks = 1;
+                }
+                if (gt64kN > gt1kN) {
+                    printf("  [dsws2 PASSTIME] *** INCONSISTENT — COUNTERS VOID *** gt64k_n (%u) > gt1k_n (%u)\n",
+                           gt64kN, gt1kN);
+                    voidTicks = 1;
+                }
+                if (gt1kN > t1EndCount) {
+                    printf("  [dsws2 PASSTIME] *** INCONSISTENT — COUNTERS VOID *** gt1k_n (%u) > T1_ends (%u)\n",
+                           gt1kN, t1EndCount);
+                    voidTicks = 1;
+                }
+                printf("  [dsws2 PASSTIME] poll-pass attribution (u64 tick-sums; throttled 1/64):\n"
+                       "      T0: total=%llu samples=%u mean=%.3f ticks\n"
+                       "      T1: total=%llu end_samples=%u mean=%.3f ticks/pass  max=%u\n"
+                       "      T2: total=%llu samples=%u mean=%.3f ticks/CAS\n",
+                       (unsigned long long)t0Ticks, t0Count, meanT0,
+                       (unsigned long long)t1Ticks, t1EndCount, meanT1, t1Max,
+                       (unsigned long long)t2Ticks, t2Count, meanT2);
+                if (voidTicks) {
+                    printf("      CORRECTED T1/T2 = VOID (see INCONSISTENT above)\n");
+                } else if (t0Count == 0) {
+                    printf("      CORRECTED T1/T2 = n/a (no T0 samples)\n");
+                } else {
+                    if (t1Bad)
+                        printf("      *** LOUD: CORRECTED_T1=%.3f NEGATIVE -- probe dominates.\n", corrT1);
+                    else
+                        printf("      CORRECTED_T1 = %.3f ticks/pass\n", corrT1);
+                    if (t2Bad)
+                        printf("      *** LOUD: CORRECTED_T2=%.3f NEGATIVE -- probe dominates.\n", corrT2);
+                    else
+                        printf("      CORRECTED_T2 = %.3f ticks/CAS\n", corrT2);
+                }
+                printf("      --- SETTLING ---\n"
+                       "      unpaired_end (occ[141]) = %u   T1 max (occ[142]) = %u\n"
+                       "      T1 start_count=%u end_count=%u start-end=%d\n"
+                       "      RESIDENCY: peak concurrent (occ[145])=%u  wave-entries (occ[144])=%u\n"
+                       "        (PASSTIME-gated, NOT TRACE; above 0x100 memset)\n",
+                       unpaired, t1Max, t1StartCount, t1EndCount,
+                       (int)t1StartCount - (int)t1EndCount, peakRes, waveEntries);
+                const uint32_t assumedWaves = pool * (uint32_t)WAVES_LAUNCH;
+                double periodAssumed = 0.0, periodPeak = 0.0;
+                if (parks > 0 && sumSpan > 0 && assumedWaves > 0)
+                    periodAssumed = (double)sumSpan * (double)assumedWaves / (double)parks;
+                if (parks > 0 && sumSpan > 0 && peakRes > 0)
+                    periodPeak = (double)sumSpan * (double)peakRes / (double)parks;
+                printf("      PASS PERIOD: sumSpan=%llu chunks=%u parks=%u\n"
+                       "        assumed waves=%u -> period_assumed=%.3f\n"
+                       "        measured peak=%u -> period_peak=%.3f\n",
+                       (unsigned long long)sumSpan, spanChunks, parks,
+                       assumedWaves, periodAssumed, peakRes, periodPeak);
+                if (peakRes == 0)
+                    printf("        *** LOUD: peak concurrent = 0 — residency did not move.\n");
+                else if (assumedWaves > 0) {
+                    double ratio = (double)peakRes / (double)assumedWaves;
+                    if (ratio < 0.75 || ratio > 1.05)
+                        printf("        *** LOUD: peak %u vs assumed %u (ratio %.3f).\n",
+                               peakRes, assumedWaves, ratio);
+                }
+                // EXTERNAL WAVE-TIME BUDGET (2026-07-25 task 59f1dcf9; wording fix task ec4089ed / P3):
+                //   ASSUMPTION: the s71==0 sample is a UNIFORM / representative 1-in-64 draw of all
+                //   poll passes, so extrapolated pass-time = T1_total * 64 is comparable to
+                //   sumSpan * measured_peak_residency. That assumption FAILS whenever anything else
+                //   keys off s71==0 on the same passes (stratified sampling). Sampled T1 intervals
+                //   can still be real; only the x64 EXTRAPOLATION is invalid.
+                //   Real counter corruption still uses voidTicks (ovf / subset fails).
+                {
+                    const double throttle = 64.0;   // DEADMAN_EVERY; PASSTIME samples only on s71==0
+                    // Decode s71 co-tenant mask (kernel-emitted compile-time bits).
+                    printf("      s71 CO-TENANTS (occ[159]=0x%x):", s71Gates);
+                    if (s71Gates == 0u)
+                        printf(" (none reported — mask not emitted or all zero)");
+                    else {
+                        if (s71Gates & 1u)  printf(" PASSTIME");
+                        if (s71Gates & 2u)  printf(" ROLEFLOW");
+                        if (s71Gates & 4u)  printf(" PREFETCH_s71_loads");
+                        if (s71Gates & 8u)  printf(" PHIST");
+                        if (s71Gates & 16u) printf(" FORENSICS");
+                        if (s71Gates & 32u) printf(" DEADMAN");
+                        if (s71Gates & 64u) printf(" ADVPROBE");
+                        if (s71Gates & 128u) printf(" BNDTIME");
+                        if (s71Gates & 256u) printf(" BNDSPLIT");
+                    }
+                    printf("\n");
+                    // Bits other than PASSTIME+DEADMAN mean the s71==0 pass is co-used.
+                    uint32_t coTenants = s71Gates & ~/*PASSTIME|DEADMAN*/(1u | 32u);
+                    if (coTenants)
+                        printf("        (non-PASSTIME co-tenants present => x64 extrapolation is stratified,"
+                               " not a pure uniform poll sample)\n");
+                    if (peakRes > 0 && sumSpan > 0 && t1Ticks > 0) {
+                        double avail = (double)sumSpan * (double)peakRes;
+                        double needed = (double)t1Ticks * throttle;
+                        double xratio = needed / avail;
+                        printf("      WAVE-TIME BUDGET (assumes UNIFORM 1/%g sampling of poll passes):\n"
+                               "        T1_total x %.0f = %.0f  vs  span x residency = %.0f  (ratio %.3fx)\n",
+                               throttle, throttle, needed, avail, xratio);
+                        if (needed > avail) {
+                            printf("  [dsws2 PASSTIME] *** T1 EXTRAPOLATION INVALID — SAMPLED PASS IS NOT"
+                                   " REPRESENTATIVE (ratio %.2fx).\n"
+                                   "      Sampled T1 values remain valid; the x64 extrapolation does not.\n"
+                                   "      Derived dominance / period-ratio verdicts suppressed.\n",
+                                   xratio);
+                            if (coTenants)
+                                printf("      Likely cause: s71 co-tenants (see mask above) stratified the"
+                                       " sample — not counter corruption.\n");
+                            else if (s71Gates == 0u)
+                                printf("      (s71 mask empty — cannot name co-tenants; treat as"
+                                       " stratified until mask is present.)\n");
+                            else
+                                printf("      No non-PASSTIME co-tenants reported; investigate other"
+                                       " non-uniformity (role mix, path bias).\n");
+                            extrapBad = 1;
+                        }
+                    } else if (t1Ticks > 0 && (peakRes == 0 || sumSpan == 0)) {
+                        printf("      WAVE-TIME BUDGET: n/a (need peakRes>0 and sumSpan>0;"
+                               " peakRes=%u sumSpan=%llu) — cannot external-check T1.\n",
+                               peakRes, (unsigned long long)sumSpan);
+                    }
+                }
+                // P3 prefetch counters (zero when PREFETCH=0 / non-PF waves emit nothing)
+                if (pfTiles | pfBlocks | pfIdle) {
+                    double pfBytes = (double)pfBlocks * 256.0;
+                    double blocksPerTile = pfTiles ? (double)pfBlocks / (double)pfTiles : 0.0;
+                    printf("      --- PREFETCH ENGINE (PF_WID only) ---\n"
+                           "      tiles_latched (occ[156]) = %u"
+                           "  (chunk structural max ≈ chunks*(tiles_per_chunk - nWG) when tiles>nWG)\n"
+                           "      blocks_issued (occ[157]) = %u  => %.1f MB  (%.1f blocks/latch;"
+                           " full warm = 640 blocks = 160 KB/tile)\n"
+                           "      idle_not_READY (occ[158]) = %u  (s71-throttled 1/64; x64 ≈ raw idle visits)\n",
+                           pfTiles, pfBlocks, pfBytes / (1024.0 * 1024.0), blocksPerTile, pfIdle);
+                }
+                // Pairing verdict (counts only — safe even if ticks VOID)
+                int suppressDerived = voidTicks || extrapBad;
+                printf("      T1-vs-PERIOD VERDICT (t1_mean=%.3f, period_peak=%.3f, unpaired=%u, t1_max=%u):\n",
+                       voidTicks ? meanT1 : ((!t1Bad && t0Count > 0) ? corrT1 : meanT1),
+                       periodPeak, unpaired, t1Max);
+                if (unpaired > 0u)
+                    printf("        => PAIRING DEFECT CONFIRMED (unpaired_end=%u). Do NOT cite T1.\n", unpaired);
+                else if (t1EndCount == 0)
+                    printf("        => NO T1 END SAMPLES — cannot verdict.\n");
+                else if (voidTicks)
+                    printf("        => TICK COUNTERS VOID — pairing counts OK (unpaired=0) but means unusable.\n");
+                else if (extrapBad)
+                    printf("        => T1 sampled deltas usable; x64 EXTRAPOLATION INVALID — "
+                           "period ratio / dominance suppressed.\n");
+                else if (t1Max > 0 && meanT1 > 0.0 && (double)t1Max > 8.0 * meanT1)
+                    printf("        => unpaired==0 && max>>mean (max=%u mean=%.3f) -> FAT TAIL; attribute paths.\n",
+                           t1Max, meanT1);
+                else {
+                    printf("        => unpaired==0 && max~O(mean) -> T1 DELTAS ARE REAL.\n");
+                    if (peakRes > 0 && periodPeak > 0.0) {
+                        double t1c = (!t1Bad && t0Count > 0) ? corrT1 : meanT1;
+                        if (t1c > 0.0)
+                            printf("           T1/period_peak = %.3f\n", t1c / periodPeak);
+                    }
+                }
+                (void)suppressDerived;  // used below for tail
+                // Tail attribution with impossibility clamp
+                uint64_t bulkSum = (t1Ticks > gt1kSum) ? (t1Ticks - gt1kSum) : 0ull;
+                uint32_t bulkN = (t1EndCount > gt1kN) ? (t1EndCount - gt1kN) : 0u;
+                uint64_t midSum = (gt1kSum > gt64kSum) ? (gt1kSum - gt64kSum) : 0ull;
+                uint32_t midN = (gt1kN > gt64kN) ? (gt1kN - gt64kN) : 0u;
+                double invEnds = t1EndCount ? 100.0 / (double)t1EndCount : 0.0;
+                double invTicks = t1Ticks ? 100.0 / (double)t1Ticks : 0.0;
+                double bulkTp = (double)bulkSum * invTicks;
+                double midTp = (double)midSum * invTicks;
+                double extremeTp = (double)gt64kSum * invTicks;
+                printf("      --- TAIL ATTRIBUTION (u64 sums; thresholds 1K / 64K) ---\n"
+                       "      bulk    <1024     : n=%u (%.2f%%)  ticks=%llu (%.2f%%)\n"
+                       "      mid     1024..64K : n=%u (%.2f%%)  ticks=%llu (%.2f%%)\n"
+                       "      extreme >=64K     : n=%u (%.2f%%)  ticks=%llu (%.2f%%)\n"
+                       "      raw: gt1k n=%u sum=%llu  gt64k n=%u sum=%llu  ovf=0x%x\n",
+                       bulkN, (double)bulkN * invEnds, (unsigned long long)bulkSum, bulkTp,
+                       midN, (double)midN * invEnds, (unsigned long long)midSum, midTp,
+                       gt64kN, (double)gt64kN * invEnds, (unsigned long long)gt64kSum, extremeTp,
+                       gt1kN, (unsigned long long)gt1kSum, gt64kN, (unsigned long long)gt64kSum, ovf);
+                if (voidTicks || bulkTp > 100.01 || midTp > 100.01 || extremeTp > 100.01
+                    || (bulkTp + midTp + extremeTp) > 100.01) {
+                    printf("      TAIL VERDICT: *** INCONSISTENT — COUNTERS VOID *** "
+                           "(refusing to print a dominance claim from impossible arithmetic)\n");
+                } else if (extrapBad) {
+                    printf("      TAIL VERDICT: suppressed (x64 extrapolation invalid — "
+                           "band %%s of T1_total still printed above; do not cite dominance)\n");
+                } else if (t1EndCount == 0 || t1Ticks == 0) {
+                    printf("      TAIL VERDICT: n/a (no T1 samples)\n");
+                } else if (extremeTp >= 50.0) {
+                    printf("      TAIL VERDICT: EXTREME-DOMINATED — >=64K is %.1f%% of T1 time (count %.2f%%).\n"
+                           "        Fat tail IS the wall. Next: which path produces max=%u.\n",
+                           extremeTp, (double)gt64kN * invEnds, t1Max);
+                } else if ((extremeTp + midTp) >= 50.0) {
+                    printf("      TAIL VERDICT: TAIL-DOMINATED — >=1K is %.1f%% of T1 time (count %.2f%%);\n"
+                           "        extreme alone %.1f%%. Mass is in the long tail, not the bulk mean.\n",
+                           extremeTp + midTp, (double)gt1kN * invEnds, extremeTp);
+                } else {
+                    printf("      TAIL VERDICT: BULK-DOMINATED — <1K is %.1f%% of T1 time.\n"
+                           "        Fat tail (max=%u) is %.1f%% of time — curiosity, not the wall.\n",
+                           bulkTp, t1Max, extremeTp + midTp);
+                }
+                printf("      CAVEAT: PROBE build — do NOT quote TF from it.\n");
             }
         }
     }
@@ -6646,8 +7380,30 @@ int main(int argc, char** argv) {
         else if (getenv("DSWS2_RING")) poolSlots_h = 2u;
         // FIX 1 STAGGER: flow per-rowblk accumulator pool (ACC_N banks x FM*FN*1024B), matches kernel ACC_*.
         const uint32_t accN_h = getenv("DSWS2_FLOW") ? (getenv("DSWS2_ACC_N") ? (uint32_t)atoi(getenv("DSWS2_ACC_N")) : 1u) : 0u;
-        const uint32_t ldsBytes = 256u + poolSlots_h * ((uint32_t)(FNc*16*SEGKv) + (uint32_t)(Gv*16*FMc*SEGKv))
-                                  + accN_h * (uint32_t)(FMc*FNc*1024);
+        // *** MADE RECLAIM-AWARE 2026-07-27. ***
+        //   This is a SECOND, INDEPENDENT LDS reconstruction, in a different scope from the
+        //   authoritative ldsBytesRaw (~:1942) that was repaired on 2026-07-26. This copy was left
+        //   behind, so every dispatch printed TWO DIFFERENT LDS NUMBERS: the 2026-07-27 L0 run showed
+        //   "n_kseg=36 TOTAL_super=23040 LDS=65792B" on this line and "LDS: 17920B published by the
+        //   bin, host reconstruction AGREES" three lines later. Two competing LDS numbers in one
+        //   output is precisely the noise that preceded the 07-26 MODE1 reset -- a reader who acts on
+        //   the wrong one has no way to tell which is authoritative, and 65792 is the number that
+        //   would have looked alarming enough to act on.
+        //   Corrections, mirroring the kernel exactly:
+        //     - base is OP_BASE=512, not BRES_OFF=256 (this copy used the operand-region base);
+        //     - under SELFSERVE || DSWS2_OVERLAP the operand pool is RECLAIMED (ACC_BASE = OP_BASE),
+        //       so poolSlots*opstride must not be counted (kernel :1174);
+        //     - SSWIN*32 for the relocated slot-control array (kernel :1192), added unconditionally
+        //       under SELFSERVE.
+        //   Defaults match build_flow.sh (`: ${SELFSERVE:=1}`, `: ${DSWS2_OVERLAP:=1}`).
+        const bool ovl_h   = getenv("DSWS2_OVERLAP") ? (atoi(getenv("DSWS2_OVERLAP")) != 0) : true;
+        const bool ss_h    = getenv("SELFSERVE")     ? (atoi(getenv("SELFSERVE"))     != 0) : true;
+        const uint32_t sswin_h = getenv("SSWIN") ? (uint32_t)atoi(getenv("SSWIN")) : poolSlots_h;
+        const uint32_t ldsBytes = 512u
+                                  + ((ss_h || ovl_h) ? 0u
+                                       : poolSlots_h * ((uint32_t)(FNc*16*SEGKv) + (uint32_t)(Gv*16*FMc*SEGKv)))
+                                  + accN_h * (uint32_t)(FMc*FNc*1024)
+                                  + ((ss_h || sswin_h > poolSlots_h) ? sswin_h * 32u : 0u);
         // A2 tiered oracle thresholds: TIGHT (proven gate) for n_kseg==1, LOOSE (split-K reassoc) for n_kseg>1.
         //   The A8 compare calls oracle_compare(got, ref, n, orel, oabs).
         const float orel = (n_kseg == 1) ? 5e-3f : 3e-2f;

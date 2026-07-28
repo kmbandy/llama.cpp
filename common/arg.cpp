@@ -3563,10 +3563,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
         {"--models-idle-timeout"}, "SECONDS",
-        string_format("for router server, unload a model after it has been idle this long, giving its GPU\n"
+        string_format("for router server, default idle unload for models that do not set their own\n"
+                      "idle-timeout in the preset. Unloads after this many seconds idle, giving its GPU\n"
                       "and its host-side KV back. A model is idle only when it has NO in-flight request,\n"
                       "so a long generation is never interrupted. Pinned models are never unloaded.\n"
-                      "(default: %d, 0 = never unload)", params.models_idle_timeout),
+                      "Per-model preset key idle-timeout overrides this. (default: %d, 0 = never unload)",
+                      params.models_idle_timeout),
         [](common_params & params, int value) {
             params.models_idle_timeout = value;
         }
@@ -4657,6 +4659,14 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "Set no-exclusive to allow the VRAM ledger to co-locate models on one GPU.",
         [](common_params &, bool) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_EXCLUSIVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"idle-timeout"}, "SECONDS",
+        "in server router mode, unload this model after it has been idle this long (overrides\n"
+        "the router-wide --models-idle-timeout). 0 = never idle-unload this model. Omit to\n"
+        "inherit the global default.",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_IDLE_TIMEOUT").set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

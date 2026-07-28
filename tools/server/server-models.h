@@ -103,6 +103,9 @@ struct server_model_meta {
     json progress; // reflect load or download progress info, if any
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
+    // Idle unload: -1 = inherit router --models-idle-timeout; 0 = never idle-unload this model;
+    // >0 = seconds. Preset key `idle-timeout` (LLAMA_ARG_ROUTER_IDLE_TIMEOUT) sets this.
+    int idle_timeout = -1;
     mtmd_caps multimodal; // multimodal capabilities
     server_model_placement placement;
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this

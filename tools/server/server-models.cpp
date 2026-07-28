@@ -54,10 +54,11 @@ extern char **environ;
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
-static constexpr const char * ROUTER_ARG_GPU       = "LLAMA_ARG_ROUTER_GPU";
-static constexpr const char * ROUTER_ARG_VRAM_MB   = "LLAMA_ARG_ROUTER_VRAM_MB";
-static constexpr const char * ROUTER_ARG_PINNED    = "LLAMA_ARG_ROUTER_PINNED";
-static constexpr const char * ROUTER_ARG_EXCLUSIVE = "LLAMA_ARG_ROUTER_EXCLUSIVE";
+static constexpr const char * ROUTER_ARG_GPU          = "LLAMA_ARG_ROUTER_GPU";
+static constexpr const char * ROUTER_ARG_VRAM_MB      = "LLAMA_ARG_ROUTER_VRAM_MB";
+static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED";
+static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
+static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_TIMEOUT";
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -157,10 +158,13 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
+    preset.unset_option("LLAMA_ARG_MODELS_IDLE_TIMEOUT");
     preset.unset_option("LLAMA_ARG_GPUS");
     preset.unset_option(ROUTER_ARG_GPU);
     preset.unset_option(ROUTER_ARG_VRAM_MB);
     preset.unset_option(ROUTER_ARG_PINNED);
+    preset.unset_option(ROUTER_ARG_EXCLUSIVE);
+    preset.unset_option(ROUTER_ARG_IDLE_TIMEOUT);
     if (unset_model_args) {
         preset.unset_option("LLAMA_ARG_MODEL");
         preset.unset_option("LLAMA_ARG_MMPROJ");
@@ -309,9 +313,11 @@ server_models::server_models(
     }
     load_models();
     autoload_enabled.store(params.models_autoload, std::memory_order_relaxed);
-    if (params.models_idle_timeout > 0) {
-        idle_th = std::thread(&server_models::idle_sweeper_loop, this);
-    }
+    // Always start the sweeper in router mode: effective timeout is per-model
+    // (preset idle-timeout if set, else --models-idle-timeout). When every
+    // effective value is 0 the loop is a no-op; when global is 0 but a model
+    // sets idle-timeout=N that model still gets unloaded.
+    idle_th = std::thread(&server_models::idle_sweeper_loop, this);
 }
 
 server_models::~server_models() {
@@ -535,12 +541,44 @@ bool server_models::model_wants_exclusive(const server_model_meta & meta) {
     return true;
 }
 
+// Parse preset idle-timeout into meta.idle_timeout.
+// -1 = inherit router --models-idle-timeout; 0 = never; >0 = seconds.
+static void parse_model_idle_timeout(server_model_meta & meta) {
+    meta.idle_timeout = -1;
+    std::string val;
+    if (!meta.preset.get_option(ROUTER_ARG_IDLE_TIMEOUT, val) || val.empty()) {
+        return;
+    }
+    try {
+        meta.idle_timeout = std::stoi(val);
+        if (meta.idle_timeout < 0) {
+            SRV_WRN("invalid idle-timeout '%s' for model '%s' (negative); inheriting global default\n",
+                    val.c_str(), meta.name.c_str());
+            meta.idle_timeout = -1;
+        }
+    } catch (...) {
+        SRV_WRN("invalid idle-timeout '%s' for model '%s'; inheriting global default\n",
+                val.c_str(), meta.name.c_str());
+        meta.idle_timeout = -1;
+    }
+}
+
+// Effective idle seconds for the sweeper: per-model override, else global.
+// 0 means never idle-unload.
+static int effective_idle_timeout_s(const server_model_meta & meta, int global_timeout_s) {
+    return meta.idle_timeout >= 0 ? meta.idle_timeout : global_timeout_s;
+}
+
 void server_models::parse_model_placement(server_model_meta & meta) {
     meta.placement = {};
     std::string pinned;
     if (meta.preset.get_option(ROUTER_ARG_PINNED, pinned)) {
         meta.placement.pinned = common_arg_utils::is_truthy(pinned);
     }
+
+    // idle-timeout is not placement, but it lives in the same preset and is
+    // re-parsed whenever placement is (load + hot reload paths).
+    parse_model_idle_timeout(meta);
 
     std::string gpu;
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
@@ -1147,6 +1185,17 @@ void server_models::load_models() {
             }
         }
     };
+    // Log only — do NOT re-parse here. parse_model_placement() already set
+    // meta.idle_timeout before update_args() strips the router-only option
+    // from the child preset. Re-parsing after that would always yield -1.
+    auto log_idle_timeouts = [&]() {
+        for (const auto & [name, inst] : mapping) {
+            if (inst.meta.idle_timeout >= 0) {
+                SRV_INF("  model '%s' idle-timeout=%ds (overrides global %ds)\n",
+                        name.c_str(), inst.meta.idle_timeout, base_params.models_idle_timeout);
+            }
+        }
+    };
     // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
     auto preset_options_for_compare = [](common_preset p) {
         p.unset_option("LLAMA_ARG_HOST");
@@ -1187,6 +1236,7 @@ void server_models::load_models() {
                 /* progress      */ {},
                 /* exit_code     */ 0,
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
+                /* idle_timeout  */ -1,
                 /* multimodal    */ mtmd_caps{false, false},
                 /* placement     */ {},
                 // /* need_download */ false,
@@ -1194,6 +1244,7 @@ void server_models::load_models() {
             add_model(std::move(meta));
         }
         apply_stop_timeout();
+        log_idle_timeouts();
         log_available_models();
 
         std::vector<std::string> models_to_load;
@@ -1356,6 +1407,7 @@ void server_models::load_models() {
                     /* progress      */ {},
                     /* exit_code     */ 0,
                     /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
+                    /* idle_timeout  */ -1,
                     /* multimodal    */ mtmd_caps{false, false},
                     /* placement     */ {},
                     // /* need_download */ false,
@@ -1366,6 +1418,7 @@ void server_models::load_models() {
         }
 
         apply_stop_timeout();
+        log_idle_timeouts();
 
         // clear reload flag before unlocking for autoload - load() blocks on !is_reloading,
         // so clearing it here (while still locked) prevents a deadlock in the autoload calls below
@@ -2169,16 +2222,17 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
 // an idle model holds its whole GPU (exclusive placement) AND its host-side KV tier, which
 // on a 15 GB box is gigabytes of RAM sitting there doing nothing.
 //
+// Timeout is per-model: preset `idle-timeout` overrides router `--models-idle-timeout`.
+// Effective 0 means never idle-unload that model.
+//
 // Two hard rules:
 //   - never unload a model with a request in flight (a generation can run for many minutes
 //     with no new request, so last_used alone would kill it mid-stream);
 //   - never unload a pinned model (pinning is a human saying "leave this alone").
 void server_models::idle_sweeper_loop() {
-    const int timeout_s = base_params.models_idle_timeout;
-    if (timeout_s <= 0) {
-        return;
-    }
-    SRV_INF("router idle sweeper: models unload after %ds idle\n", timeout_s);
+    const int global_timeout_s = base_params.models_idle_timeout;
+    SRV_INF("router idle sweeper: global idle-timeout=%ds (0=never); per-model idle-timeout overrides\n",
+            global_timeout_s);
 
     while (!idle_stop.load(std::memory_order_relaxed)) {
         for (int i = 0; i < 10 && !idle_stop.load(std::memory_order_relaxed); ++i) {
@@ -2188,7 +2242,8 @@ void server_models::idle_sweeper_loop() {
             break;
         }
 
-        std::vector<std::string> victims;
+        // (name, effective_timeout_s used for the log line)
+        std::vector<std::pair<std::string, int>> victims;
         {
             std::unique_lock<std::mutex> lk(mutex);
             const int64_t now = ggml_time_ms();
@@ -2202,12 +2257,16 @@ void server_models::idle_sweeper_loop() {
                 if (inst.meta.last_used <= 0) {
                     continue; // never served a request; leave it to LRU/eviction
                 }
+                const int timeout_s = effective_idle_timeout_s(inst.meta, global_timeout_s);
+                if (timeout_s <= 0) {
+                    continue; // 0 = never idle-unload
+                }
                 if (now - inst.meta.last_used >= (int64_t) timeout_s * 1000) {
-                    victims.push_back(name);
+                    victims.emplace_back(name, timeout_s);
                 }
             }
         }
-        for (const auto & name : victims) {
+        for (const auto & [name, timeout_s] : victims) {
             SRV_INF("router idle sweeper: unloading %s (idle > %ds); GPU and host KV released\n",
                     name.c_str(), timeout_s);
             try {
@@ -2816,6 +2875,11 @@ void server_models_routes::init_routes() {
                 {"need_bytes", meta.placement.need_bytes_per_dev},
             };
             model_info["placement"] = placement;
+            // -1 in the ledger means "inherit global"; clients that want the
+            // actual sweeper value can use idle_timeout_effective.
+            model_info["idle_timeout"] = meta.idle_timeout;
+            model_info["idle_timeout_effective"] =
+                effective_idle_timeout_s(meta, params.models_idle_timeout);
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {
