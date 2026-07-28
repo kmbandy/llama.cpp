@@ -191,6 +191,11 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         const float beta_slow_l   = is_swa_il ? 0.0f : beta_slow;
         const int   n_ctx_orig_l  = is_swa_il ? hparams.n_ctx_train : n_ctx_orig;
 
+        // Expose this layer's input so an aux-hidden-state drafter (DFlash) can read
+        // it. Without this the DFlash speculator asserts in set_outputs the moment it
+        // is actually enabled, since it requests hidden states at target_layers.
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // Pre-norm
@@ -318,6 +323,12 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
 
         inpL = cur;
     }
+
+    // t_layer_inp is sized n_layer+1 because index il is the INPUT to layer il, so
+    // index n_layer is the output of the whole stack (pre final norm). DFlash asks for
+    // exactly that: its target_layers [2,11,20,30,39,48] on a 48-layer model addresses
+    // the input of layers 2..48, the last of which only exists as this post-loop value.
+    res->t_layer_inp[n_layer] = inpL;
 
     cur = inpL;
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
