@@ -607,6 +607,11 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // DFlash: per-aux-layer RMS norm weights, packed [n_embd, n_aux_layers].
+    // Column i norms the i-th target-layer hidden slice BEFORE the fc fusion
+    // (vLLM laguna_dflash: aux_hidden_norms ModuleList -> concat -> fc -> hidden_norm).
+    struct ggml_tensor * aux_norm_enc = nullptr;
+
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
