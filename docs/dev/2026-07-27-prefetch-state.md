@@ -1,3 +1,12 @@
+> **SUPERSEDED 2026-07-27 (evening) by
+> [`2026-07-27-prefetch-architecture-brief.md`](2026-07-27-prefetch-architecture-brief.md).**
+> Gate 4 in §1 is FIXED (commit `fdb441155`/`ea3af4891`). The framing here — a
+> correctness race in the VRAM speculation path — is too narrow: the real problem
+> is that prediction runs inline in graph execution with its own host copy of
+> weights that already live in VRAM, and that `LOOKAHEAD_K` counts layers rather
+> than tokens. The §5 hit-rate concern is superseded by the timeliness argument.
+> Kept for the gate history and the correctness-gate method in §6, which stand.
+
 # Cross-layer prefetch — state of play, 2026-07-27
 
 **Headline: prefetch has still never been correctly tested.** Four gates blocked
