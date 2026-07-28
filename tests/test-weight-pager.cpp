@@ -1259,6 +1259,77 @@ static int test_host_tier_lru_eviction_order() {
     return fails;
 }
 
+// HostTier speculative sub-tier (WP_HOST_SPEC_TIER): prefetch and eviction
+// sharing the RAM tier without prefetch degrading it.
+//
+// The invariant under test is the one that matters operationally: a
+// MISPREDICTED PREFETCH MUST NEVER COST A VICTIM PAGE. On one flat LRU the
+// prediction is the most-recently-stored entry, so it outranks the victim and
+// the victim dies -- prefetch actively making the tier worse. This is the same
+// shape as VRAM gate 3, one tier down.
+static int test_host_tier_speculative_evicts_before_victim() {
+    int fails = 0;
+    std::vector<uint8_t> bytes(32, 0x11);
+    std::vector<uint8_t> out(bytes.size());
+
+    // --- Gate ON: the speculative entry dies, the victim survives. ---
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "spec tier init");
+        tier.set_speculative_tier(true);
+
+        // Victim page 10 is the OLDEST entry -- pure LRU would take it first.
+        EXPECT(tier.store(10, bytes.data(), bytes.size(), /*speculative=*/false), "victim 10");
+        EXPECT(tier.store(11, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 11");
+        EXPECT(tier.store(12, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 12");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 2, "two predictions resident");
+
+        // Capacity is 3; this store must evict. Pure LRU picks 10 (oldest);
+        // speculative-first must pick 11 (LRU *among predictions*).
+        EXPECT(tier.store(13, bytes.data(), bytes.size(), /*speculative=*/false), "victim 13 forces evict");
+        EXPECT(tier.lookup(10, out.data(), out.size()),
+               "VICTIM SURVIVES even though it is the oldest entry");
+        EXPECT(!tier.lookup(11, out.data(), out.size()),
+               "LRU prediction evicted instead of the victim");
+        EXPECT_EQ_INT((int) tier.speculative_evicted_unused(), 1, "one prediction wasted");
+    }
+
+    // --- Promotion: landing is not use; only a demand hit confirms. ---
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "promote tier init");
+        tier.set_speculative_tier(true);
+
+        EXPECT(tier.store(20, bytes.data(), bytes.size(), /*speculative=*/true), "prediction 20");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 1, "still speculative after landing");
+        EXPECT(tier.lookup(20, out.data(), out.size()), "demand hit on 20");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 0, "demand hit promotes");
+        EXPECT_EQ_INT((int) tier.speculative_promotions(), 1, "promotion counted");
+
+        // Now confirmed, 20 must be protected exactly like any victim page.
+        EXPECT(tier.store(21, bytes.data(), bytes.size(), /*speculative=*/true), "prediction 21");
+        EXPECT(tier.store(22, bytes.data(), bytes.size(), /*speculative=*/true), "prediction 22");
+        EXPECT(tier.store(23, bytes.data(), bytes.size(), /*speculative=*/false), "forces evict");
+        EXPECT(tier.lookup(20, out.data(), out.size()),
+               "promoted page protected like a victim, despite being oldest");
+    }
+
+    // --- Gate OFF: unchanged flat-LRU behaviour (the victim dies). ---
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "default tier init");
+        // set_speculative_tier NOT called.
+        EXPECT(tier.store(30, bytes.data(), bytes.size(), /*speculative=*/false), "victim 30");
+        EXPECT(tier.store(31, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 31");
+        EXPECT(tier.store(32, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 32");
+        EXPECT(tier.store(33, bytes.data(), bytes.size(), /*speculative=*/false), "forces evict");
+        EXPECT(!tier.lookup(30, out.data(), out.size()),
+               "gate off: oldest victim still dies first (documents what the gate changes)");
+    }
+
+    return fails;
+}
+
 static int test_host_tier_lookup_touch_keeps_mru() {
     int fails = 0;
 
@@ -3041,6 +3112,7 @@ int main() {
         { "host_tier_store_lookup",              test_host_tier_store_lookup              },
         { "host_tier_size_class_reuse",          test_host_tier_size_class_reuse          },
         { "host_tier_lru_eviction_order",        test_host_tier_lru_eviction_order        },
+        { "host_tier_speculative_evicts_before_victim", test_host_tier_speculative_evicts_before_victim },
         { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
         { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
         { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },

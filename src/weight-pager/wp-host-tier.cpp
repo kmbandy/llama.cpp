@@ -132,7 +132,7 @@ bool HostTier::contains(int page_idx) const {
     return resident_.find(page_idx) != resident_.end();
 }
 
-bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
+bool HostTier::store(int page_idx, const void * src_bytes, size_t n, bool speculative) {
     std::lock_guard<std::mutex> lock(mu_);
     if (arena_ == nullptr || budget_bytes_ == 0 || page_idx < 0 || src_bytes == nullptr || n == 0) {
         return false;
@@ -140,6 +140,17 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     if (n > budget_bytes_) {
         erase_resident_(page_idx);
         return false;
+    }
+
+    // Never DOWNGRADE a page that is already here as a victim (a page the GPU
+    // actually used) into a speculative one. The prefetch call site skips
+    // pages the tier already contains, so this should not arise -- but if it
+    // ever does, a re-store must not cost a confirmed page its priority.
+    if (speculative) {
+        auto prev = resident_.find(page_idx);
+        if (prev != resident_.end() && !prev->second.speculative) {
+            speculative = false;
+        }
     }
 
     erase_resident_(page_idx);
@@ -150,7 +161,8 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n) {
     }
 
     std::memcpy(arena_ + offset, src_bytes, n);
-    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++};
+    resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++, speculative};
+    if (speculative) ++spec_count_;
     used_bytes_ += n;
     lru_.push_back(page_idx);
     lru_pos_[page_idx] = std::prev(lru_.end());
@@ -238,6 +250,7 @@ bool HostTier::lookup(int page_idx, void * dst_bytes, size_t n) {
         return false;
     }
     touch_lru_(page_idx);
+    promote_(it->second);   // a demand hit confirms the prediction
     std::memcpy(dst_bytes, arena_ + it->second.offset, n);
     return true;
 }
@@ -253,6 +266,7 @@ bool HostTier::borrow(int page_idx, const void ** src_out, size_t n, BorrowHandl
         return false;
     }
     touch_lru_(page_idx);
+    promote_(it->second);   // a demand hit confirms the prediction
     it->second.borrow_count++;
     *src_out    = arena_ + it->second.offset;
     *handle_out = it->second.gen;
@@ -358,6 +372,36 @@ bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
 }
 
 bool HostTier::evict_one_lru_() {
+    // Pass 0 (only when the speculative tier is enabled): drain the LRU
+    // SPECULATIVE entry before touching anything the GPU actually used.
+    //
+    // A speculative entry is an unconfirmed prediction; a victim entry is a
+    // page VRAM demonstrably touched. On one flat LRU the prediction lands at
+    // the MRU end and outranks the victim, so a wrong guess evicts a known-good
+    // page -- prefetch actively degrading the tier it is meant to fill. This
+    // pass makes a mispredict cost only the bandwidth that fetched it, which is
+    // the same guarantee PoolAllocator::alloc_slot's Pass 0 gives in VRAM.
+    //
+    // Borrowed entries are skipped here for exactly the reason they are skipped
+    // below: their arena bytes are in flight to a caller.
+    if (spec_tier_ && spec_count_ > 0) {
+        for (auto lit = lru_.begin(); lit != lru_.end(); ++lit) {
+            auto it = resident_.find(*lit);
+            if (it == resident_.end() || it->second.borrow_count > 0 ||
+                !it->second.speculative) {
+                continue;
+            }
+            const Resident r = it->second;
+            resident_.erase(it);
+            lru_pos_.erase(*lit);
+            lru_.erase(lit);
+            reclaim_(r);
+            if (spec_count_ > 0) --spec_count_;
+            ++spec_evicted_unused_;
+            return true;
+        }
+    }
+
     // Walk from the LRU front (least recently used) to the first entry with
     // no outstanding borrows and evict that one. A borrowed entry is skipped,
     // not removed -- its arena bytes are in flight to/from a caller and must
@@ -377,9 +421,47 @@ bool HostTier::evict_one_lru_() {
         lru_.erase(lit);
         free_lists_[r.bytes].push_back(r.offset);
         used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
+        if (r.speculative) {
+            if (spec_count_ > 0) --spec_count_;
+            ++spec_evicted_unused_;
+        }
         return true;
     }
     return false;
+}
+
+void HostTier::promote_(Resident & r) {
+    // Landing is NOT use. A prefetch that merely completed stays speculative;
+    // only a genuine demand hit clears the flag. Getting this backwards is
+    // exactly VRAM gate 3, where harvest called mark_used() and promoted every
+    // prefetched page the instant its read completed, so the tier could never
+    // accumulate and eviction fell straight onto the demand set.
+    if (!r.speculative) {
+        return;
+    }
+    r.speculative = false;
+    if (spec_count_ > 0) --spec_count_;
+    ++spec_promotions_;
+}
+
+void HostTier::set_speculative_tier(bool on) {
+    std::lock_guard<std::mutex> lock(mu_);
+    spec_tier_ = on;
+}
+
+size_t HostTier::speculative_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_count_;
+}
+
+uint64_t HostTier::speculative_evicted_unused() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_evicted_unused_;
+}
+
+uint64_t HostTier::speculative_promotions() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_promotions_;
 }
 
 void HostTier::reclaim_(const Resident & r) {
@@ -395,6 +477,13 @@ void HostTier::erase_resident_(int page_idx) {
 
     const Resident r = it->second;
     resident_.erase(it);
+    // Leaving resident_ by ANY route must keep spec_count_ honest, or the
+    // Pass-0 `spec_count_ > 0` guard drifts and starts scanning for entries
+    // that no longer exist. Not counted as evicted-unused: this is erase() /
+    // promotion-back-to-VRAM / displacement by re-store, not eviction.
+    if (r.speculative && spec_count_ > 0) {
+        --spec_count_;
+    }
 
     auto pos_it = lru_pos_.find(page_idx);
     if (pos_it != lru_pos_.end()) {
