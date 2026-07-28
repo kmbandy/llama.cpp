@@ -2839,6 +2839,79 @@ static int test_router_predictor() {
     return fails;
 }
 
+// Regression: predict() runs on the async host-prefetch worker while the EVAL
+// thread keeps calling set_router() as it first sees each layer. Two hazards:
+// routers_ RESIZING under a reader (dangling W), and a router's W being
+// REWRITTEN mid-GEMV (torn read). Both are undefined behaviour; the shared_mutex
+// serialises them.
+//
+// DETECTION IS THE HARD PART. A first version of this test checked only that
+// returned ExpertRefs were in range -- but `expert` is assigned from the loop
+// counter, so it is in range BY CONSTRUCTION and the check passed even with the
+// locks deleted (verified: 3/3 pass unlocked). That test could not fail.
+//
+// This version makes corruption OBSERVABLE. The writer alternates a layer
+// between two weight matrices that disagree about which expert wins:
+//   Wa: logit(e) grows with e   -> argmax is n_expert-1
+//   Wb: logit(e) shrinks with e -> argmax is 0
+// Under the lock a reader sees one matrix or the other, so the top expert is
+// ALWAYS 0 or n_expert-1. A torn read blends the two and yields a middle
+// expert, which no consistent snapshot can produce.
+static int test_router_predictor_concurrent_set_and_predict() {
+    int fails = 0;
+    using namespace wp;
+
+    const int n_expert = 64, n_embd = 64, n_layer = 32;
+    std::vector<float> h((size_t) n_embd, 1.0f);
+    std::vector<float> Wa((size_t) n_expert * n_embd), Wb((size_t) n_expert * n_embd);
+    for (int e = 0; e < n_expert; ++e) {
+        for (int j = 0; j < n_embd; ++j) {
+            Wa[(size_t) e * n_embd + j] =  (float) e / (float) n_expert;   // argmax = n_expert-1
+            Wb[(size_t) e * n_embd + j] = -(float) e / (float) n_expert;   // argmax = 0
+        }
+    }
+
+    RouterPredictor pred;
+    for (int L = 0; L < n_layer; ++L) pred.set_router(L, Wa.data(), n_expert, n_embd);
+
+    std::atomic<bool> torn{false};
+    std::atomic<int>  seen{0};
+    std::atomic<bool> stop{false};
+
+    std::thread writer([&] {
+        for (int rep = 0; rep < 4000 && !stop.load(); ++rep) {
+            const float * W = (rep & 1) ? Wb.data() : Wa.data();
+            for (int L = 0; L < n_layer; ++L) pred.set_router(L, W, n_expert, n_embd);
+        }
+    });
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t) {
+        readers.emplace_back([&] {
+            std::vector<ExpertRef> out;
+            for (int rep = 0; rep < 4000 && !stop.load(); ++rep) {
+                out.clear();
+                pred.predict(h.data(), 0, /*K=*/1, /*M=*/1, n_layer, out, 0.0f);
+                if (!out.empty()) {
+                    const int top = out[0].expert;
+                    seen.fetch_add(1, std::memory_order_relaxed);
+                    if (top != 0 && top != n_expert - 1) {
+                        torn.store(true);      // impossible from any single snapshot
+                        stop.store(true);
+                    }
+                }
+            }
+        });
+    }
+    writer.join();
+    stop.store(true);
+    for (auto & r : readers) r.join();
+
+    EXPECT(seen.load() > 0, "readers actually observed predictions");
+    EXPECT(!torn.load(), "top expert is always 0 or n_expert-1 (no torn read of W)");
+    return fails;
+}
+
 static int test_router_predictor_confidence() {
     int fails = 0;
     using namespace wp;
@@ -3150,6 +3223,7 @@ int main() {
         { "wp_pipeline_promotions_flag_default_on",  test_wp_pipeline_promotions_flag_default_on },
         { "router_predictor",                    test_router_predictor                    },
         { "router_predictor_confidence",         test_router_predictor_confidence         },
+        { "router_predictor_concurrent",         test_router_predictor_concurrent_set_and_predict },
         { "expert_page_index",                   test_expert_page_index                   },
         { "pool_speculative",                    test_pool_speculative                    },
         { "pool_speculative_batch_no_self_evict", test_pool_speculative_batch_no_self_evict },

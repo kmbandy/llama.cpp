@@ -214,7 +214,14 @@ public:
         double   cb_prefetch_wall_ms            = 0.0;
         double   cb_prefetch_cpu_ms             = 0.0;
         uint64_t host_predict_calls             = 0;
-        double   host_predict_cpu_ms            = 0.0; // the router GEMV alone
+        // The router GEMV alone. With WP_HOST_PREFETCH_ASYNC=1 this is the
+        // WORKER thread's CPU, so the pair (cb_prefetch_cpu_ms collapsing while
+        // host_predict_cpu_ms holds) is the proof the work MOVED rather than
+        // vanished. If both fall, prediction is being skipped, not relocated.
+        double   host_predict_cpu_ms            = 0.0;
+        uint64_t hp_async_enqueued              = 0;
+        uint64_t hp_async_dropped               = 0; // queue full — shed, by design
+        uint64_t hp_async_max_depth             = 0;
         uint64_t host_spec_resident             = 0; // unconfirmed predictions in RAM now
         uint64_t host_spec_evicted_unused       = 0; // predictions thrown away unused
         uint64_t host_spec_promotions           = 0; // predictions a demand hit confirmed
@@ -534,6 +541,30 @@ public:
     void submit_xlayer_prefetch(const float * h, int from_layer);
     bool xlayer_prefetch_enabled() const { return xlayer_prefetch_enabled_; }
     void submit_host_prefetch(const float * h, int from_layer);
+
+    // ASYNC HOST PREFETCH (WP_HOST_PREFETCH_ASYNC=1).
+    //
+    // submit_host_prefetch runs RouterPredictor::predict inline in the eval
+    // callback: a scalar single-threaded n_expert x n_embd GEMV plus a
+    // double-precision softmax, per layer per token. Measured 2026-07-27 on
+    // laguna: 16,812 ms of eval-thread CPU on a 184,365 ms run = 9.1%, against
+    // a benefit of 1.5% fewer NVMe bytes. Prediction belongs beside the decode
+    // loop, not inside it.
+    //
+    // This copies the residual row and hands it to a worker thread, which does
+    // the GEMV and the enqueue off the critical path. The eval thread keeps only
+    // the D2H and the f32 convert -- measured at 0.7% of the run, which is why
+    // this does NOT need HIP events or a device-side ring: 93% of the win is in
+    // moving predict() alone, at a fraction of the concurrency surface.
+    //
+    // Staleness is safe by construction. Prefetch can only change WHICH pages
+    // are warm, never what is computed, so a prediction that lands a layer late
+    // costs recall and nothing else -- and LOOKAHEAD_K >= 2 already assumes a
+    // lead. The queue is bounded and DROPS when full: shedding a prediction is
+    // the correct behaviour for a best-effort path, and drops are counted.
+    void submit_host_prefetch_async(const float * h, int n_embd, int from_layer);
+    bool host_prefetch_async_enabled() const { return host_prefetch_async_; }
+
     // Accumulate one execution of the inline eval-cb prefetch block. Called
     // from the block's scope guard so it records on every exit path.
     void note_cb_prefetch_cost(double wall_ms, double cpu_ms) {
@@ -703,6 +734,18 @@ private:
     // Default 0.0f keeps that behaviour until explicitly set.
     float xlayer_min_conf_        = 0.0f;
     float xlayer_conf_step_       = 0.0f;
+
+    // Async host-prefetch worker (see submit_host_prefetch_async).
+    struct HostPredictJob { int layer; std::vector<float> h; };
+    bool                        host_prefetch_async_    = false;
+    std::thread                 hp_thread_;
+    mutable std::mutex          hp_mu_;
+    std::condition_variable     hp_cv_;
+    std::deque<HostPredictJob>  hp_queue_;
+    bool                        hp_stop_       = false;
+    size_t                      hp_max_queue_  = 64;
+    void hp_worker_loop_();
+    void hp_stop_worker_();
     int  n_layer_                 = 0;   // max catalog block_idx + 1
     int  host_prefetch_lookahead_ = 2;
     int  host_prefetch_topm_      = 16;

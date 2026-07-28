@@ -1,23 +1,33 @@
 #include "wp-router-predictor.h"
 #include <algorithm>
+#include <mutex>
 #include <cmath>
 namespace wp {
 void RouterPredictor::set_router(int layer, const float* W, int n_expert, int n_embd) {
     if (layer < 0 || W == nullptr || n_expert <= 0 || n_embd <= 0) return;
+    std::unique_lock<std::shared_mutex> lk(mu_);   // resizes routers_ — exclusive
     if ((int) routers_.size() <= layer) routers_.resize(layer + 1);
     n_expert_ = n_expert; n_embd_ = n_embd;
     routers_[layer].W.assign(W, W + (size_t) n_expert * n_embd);
 }
 bool RouterPredictor::has_router(int layer) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    return has_router_locked_(layer);
+}
+bool RouterPredictor::has_router_locked_(int layer) const {
     return layer >= 0 && layer < (int) routers_.size() && !routers_[layer].W.empty();
 }
 void RouterPredictor::predict(const float* h, int from_layer, int K, int M,
                               int n_layer, std::vector<ExpertRef>& out, float min_conf) const {
     if (h == nullptr || K <= 0 || M <= 0) return;
+    // Held for the whole prediction: W pointers taken below must stay valid,
+    // so the lock cannot be released between has_router_locked_ and the GEMV.
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    if (n_expert_ <= 0 || n_embd_ <= 0) return;
     std::vector<std::pair<float,int>> logits((size_t) n_expert_);
     for (int d = 1; d <= K; ++d) {
         const int T = from_layer + d;
-        if (T >= n_layer || !has_router(T)) continue;
+        if (T >= n_layer || !has_router_locked_(T)) continue;   // already hold the shared lock
         const float* W = routers_[T].W.data();
         for (int e = 0; e < n_expert_; ++e) {
             const float* w = W + (size_t) e * n_embd_;
