@@ -1797,6 +1797,9 @@ void WeightPager::log_stats_summary() {
             "  host_prefetch_skipped: %lu\n"
             "  host_prefetch_strike_held: %lu\n"
             "  host_prefetch_budget_trim: %lu\n"
+            "  host_spec_resident: %lu\n"
+            "  host_spec_evicted_unused: %lu\n"
+            "  host_spec_promotions: %lu\n"
             "  routing_ptrs_set: %lu\n"
             "  routing_ptrs_consumed: %lu\n"
             "  routing_ptrs_discarded_unconsumed: %lu\n"
@@ -1905,6 +1908,9 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.host_prefetch_skipped,
             (unsigned long) s.host_prefetch_strike_held,
             (unsigned long) s.host_prefetch_budget_trim,
+            (unsigned long) s.host_spec_resident,
+            (unsigned long) s.host_spec_evicted_unused,
+            (unsigned long) s.host_spec_promotions,
             (unsigned long) s.routing_ptrs_set,
             (unsigned long) s.routing_ptrs_consumed,
             (unsigned long) s.routing_ptrs_discarded_unconsumed,
