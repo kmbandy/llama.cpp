@@ -199,6 +199,12 @@ public:
         // and/or trimmed by the per-wave byte budget.
         uint64_t host_prefetch_strike_held      = 0;
         uint64_t host_prefetch_budget_trim      = 0;
+        // HostTier speculative sub-tier (WP_HOST_SPEC_TIER). The ratio that
+        // matters is promotions vs evicted_unused: it is the RAM prefetcher's
+        // precision, measured on pages that actually reached the tier.
+        uint64_t host_spec_resident             = 0; // unconfirmed predictions in RAM now
+        uint64_t host_spec_evicted_unused       = 0; // predictions thrown away unused
+        uint64_t host_spec_promotions           = 0; // predictions a demand hit confirmed
         uint64_t ensure_batch_host_hits         = 0; // P2P/path misses served from HostTier
         // MAD: O_DIRECT alignment fixed to the filesystem's actual block size
         // (was hardcoded 512, wrong for e.g. btrfs's 4096) -- see
@@ -670,6 +676,13 @@ private:
     int  xlayer_lookahead_k_      = 2;
     int  xlayer_topk_             = 16;
     int  xlayer_max_slots_        = 0;   // 0 => n_slots/4, set in init()
+    // Confidence gate for VRAM speculation (WP_PREFETCH_MIN_CONF /
+    // _CONF_STEP). The gate shipped 2026-07-22 on the HOST path only; the
+    // xlayer path called predict() without the argument, so it defaulted to
+    // 0.0 and pulled every expert in top-M regardless of routing probability.
+    // Default 0.0f keeps that behaviour until explicitly set.
+    float xlayer_min_conf_        = 0.0f;
+    float xlayer_conf_step_       = 0.0f;
     int  n_layer_                 = 0;   // max catalog block_idx + 1
     int  host_prefetch_lookahead_ = 2;
     int  host_prefetch_topm_      = 16;

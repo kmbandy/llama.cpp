@@ -38,7 +38,21 @@ public:
     using BorrowHandle = uint64_t;
     static constexpr BorrowHandle kInvalidBorrowHandle = 0;
 
-    bool store(int page_idx, const void * src_bytes, size_t n);
+    // `speculative` marks this entry as a PREDICTION rather than a page the
+    // GPU has actually used. Only the host prefetcher passes true.
+    //
+    // Without this distinction the tier keeps one flat LRU in which a
+    // mispredicted prefetch that lands sits at the MRU end -- ahead of a
+    // victim page the GPU demonstrably touched -- and evicts it. The
+    // confidence gate (WP_HOST_PREFETCH_MIN_CONF) limits how many bad
+    // predictions get IN, but cannot change their priority once resident.
+    // This is structurally the same defect as VRAM gate 3 (2026-07-27), where
+    // harvest promoted every speculative page the instant its read landed.
+    //
+    // Landing is NOT use: a speculative entry is promoted to non-speculative
+    // only by a genuine demand hit in lookup()/borrow(). Enable the
+    // eviction-order half with set_speculative_tier(true).
+    bool store(int page_idx, const void * src_bytes, size_t n, bool speculative = false);
     // Copy a resident page into caller-owned storage. The copy is completed
     // while holding mu_, so a concurrent store/erase cannot reclaim the arena
     // slot before the caller consumes the bytes. `n` must equal the page size.
@@ -88,6 +102,13 @@ public:
     // page never lives in both tiers).
     void erase(int page_idx);
 
+    // When on, evict_one_lru_() drains the speculative tier before touching
+    // any victim entry. Off by default so the tier stays byte-identical.
+    void   set_speculative_tier(bool on);
+    size_t   speculative_count()          const;
+    uint64_t speculative_evicted_unused() const;  // predictions thrown away unused
+    uint64_t speculative_promotions()     const;  // predictions a demand hit confirmed
+
     bool   is_initialized() const;
     size_t budget_bytes()   const;
     size_t used_bytes()     const;
@@ -103,11 +124,13 @@ private:
         size_t       bytes        = 0;
         int          borrow_count = 0;  // outstanding borrow()s; blocks eviction while > 0
         BorrowHandle gen          = kInvalidBorrowHandle;  // this entry's generation id
+        bool         speculative  = false; // prefetched prediction, not yet demand-used
     };
 
     bool acquire_slot_(int page_idx, size_t n, size_t & offset_out);
     bool evict_one_lru_();
     void erase_resident_(int page_idx);
+    void promote_(Resident & r);   // demand hit clears speculative; landing does not
     void touch_lru_(int page_idx);
     void reclaim_(const Resident & r);
 
@@ -118,6 +141,14 @@ private:
     bool      backend_pinned_ = false;
     DeviceReader device_reader_;
     bool      mlocked_        = false;
+
+    // Speculative (prefetched-but-unused) sub-tier. spec_count_ is maintained
+    // incrementally at every site that can create, promote, or remove a
+    // speculative entry.
+    bool      spec_tier_      = false;
+    size_t    spec_count_     = 0;
+    uint64_t  spec_evicted_unused_ = 0;
+    uint64_t  spec_promotions_     = 0;
 
     // Monotonically increasing, never reused. Assigned to a new Resident's
     // `gen` at the moment it is created (store()/store_from_device()), so a

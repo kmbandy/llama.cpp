@@ -840,7 +840,18 @@ void WeightPager::submit_xlayer_prefetch(const float * h, int from_layer) {
     std::vector<ExpertRef> refs;
     for (int d = 1; d <= xlayer_lookahead_k_; ++d) {
         const int M = (d == 1) ? xlayer_topk_ : std::max(1, xlayer_topk_ >> (d - 1));
-        predictor_.predict(h, from_layer + d - 1, /*K=*/1, M, n_layer_, refs);
+        // CONFIDENCE GATE (wired 2026-07-27). This call omitted min_conf, so it
+        // defaulted to 0.0f and took the whole top-M no matter how improbable
+        // the tail experts were -- the VRAM path "pulled EVERYTHING in". The
+        // gate was built and unit-tested on 2026-07-22 but wired only into
+        // submit_host_prefetch; this is the same policy applied to the path
+        // that actually spends VRAM. Measured cost of not having it (M=2/M=4,
+        // laguna 3400 slots): +12-14% bytes for a 2-3.6% hit rate, and M=4
+        // scoring WORSE than M=2 because widening M only reaches deeper into
+        // low-probability experts.
+        const float conf = std::min(
+            0.99f, xlayer_min_conf_ + (float) (d - 1) * xlayer_conf_step_);
+        predictor_.predict(h, from_layer + d - 1, /*K=*/1, M, n_layer_, refs, conf);
     }
     if (refs.empty()) return;
     std::vector<int> pages;
@@ -1054,6 +1065,14 @@ bool WeightPager::init(const Config &             cfg,
         if (const char * e = std::getenv("WP_PREFETCH_XLAYER"))      xlayer_prefetch_enabled_ = (e[0] == '1');
         if (const char * e = std::getenv("WP_PREFETCH_LOOKAHEAD_K")) { long v = std::strtol(e,nullptr,10); if (v > 0) xlayer_lookahead_k_ = (int) v; }
         if (const char * e = std::getenv("WP_PREFETCH_TOPK"))        { long v = std::strtol(e,nullptr,10); if (v > 0) xlayer_topk_ = (int) v; }
+        // Confidence gate on VRAM speculation. Mirrors the host path's
+        // MIN_CONF/CONF_STEP pair: a floor on the router's softmax probability
+        // before an expert is worth spending VRAM and NVMe bandwidth on, with
+        // the floor rising for deeper lookahead (a d=2 guess conditioned on a
+        // d=1 guess is strictly less trustworthy). 0.0 = old take-everything
+        // behaviour, so the default remains byte-identical.
+        if (const char * e = std::getenv("WP_PREFETCH_MIN_CONF"))    { const float v = std::strtof(e,nullptr); if (v >= 0.0f) xlayer_min_conf_  = v; }
+        if (const char * e = std::getenv("WP_PREFETCH_CONF_STEP"))   { const float v = std::strtof(e,nullptr); if (v >= 0.0f) xlayer_conf_step_ = v; }
         xlayer_max_slots_ = pool_.n_slots() / 4;
         if (const char * e = std::getenv("WP_PREFETCH_MAX_SLOTS"))   { long v = std::strtol(e,nullptr,10); if (v >= 0) xlayer_max_slots_ = (int) v; }
         if (const char * e = std::getenv("WP_SPEC_RESERVE"))         { long v = std::strtol(e,nullptr,10); if (v >= 0) spec_reserve_ = (int) v; }
@@ -1094,6 +1113,8 @@ bool WeightPager::init(const Config &             cfg,
                            spec_reserve_, cfg_.prefetch_depth);
         }
         if (xlayer_prefetch_enabled_) {
+            LLAMA_LOG_WARN("wp::xlayer prefetch: min_conf=%.3f conf_step=%.3f\n",
+                           xlayer_min_conf_, xlayer_conf_step_);
             LLAMA_LOG_WARN("wp::xlayer prefetch: on K=%d M=%d cap=%d n_layer=%d\n",
                            xlayer_lookahead_k_, xlayer_topk_, xlayer_max_slots_, n_layer_);
         }
@@ -1207,6 +1228,13 @@ bool WeightPager::init(const Config &             cfg,
                     return transport_.read_to_host(dst_host, src_device, n);
                 });
             host_tier_ = std::move(host_tier);
+            // WP_HOST_SPEC_TIER=1: evict prefetched-but-unused entries before
+            // victim pages. Off by default so the tier stays byte-identical.
+            if (env_flag_is_one("WP_HOST_SPEC_TIER")) {
+                host_tier_->set_speculative_tier(true);
+                LLAMA_LOG_WARN("wp::HostTier: speculative sub-tier ON — mispredicted "
+                               "prefetches evict before victim pages\n");
+            }
             LLAMA_LOG_WARN("wp::HostTier: RAM victim tier ENABLED, budget %zu B (%.1f MiB), "
                            "backend_pinned=%d, D2H via transport (vulkan-safe)\n",
                            host_budget, (double) host_budget / (1024.0 * 1024.0),
@@ -1277,7 +1305,13 @@ bool WeightPager::init(const Config &             cfg,
                             ? result.bytes_read : -1;
                     },
                     [this](int page_idx, const void * bytes, size_t n) {
-                        return host_tier_->store(page_idx, bytes, n);
+                        // speculative=true: this is the PREDICTION path. Pages
+                        // arriving here are guesses, and must be evicted ahead
+                        // of victim pages the GPU actually used. Contrast the
+                        // demand-read store at page_in_sync_ and the victim
+                        // store_from_device(), both of which stay non-
+                        // speculative because they record real use.
+                        return host_tier_->store(page_idx, bytes, n, /*speculative=*/true);
                     },
                     [this](int page_idx) {
                         if (page_idx < 0 || page_idx >= (int) page_to_slot_.size()) return true;
@@ -1517,6 +1551,11 @@ const WeightPager::Stats & WeightPager::stats() const {
         stats_.host_prefetch_read = host_prefetcher_->read_ok();
         stats_.host_prefetch_read_fail = host_prefetcher_->read_fail();
         stats_.host_prefetch_skipped = host_prefetcher_->skipped();
+    }
+    if (host_tier_) {
+        stats_.host_spec_resident       = (uint64_t) host_tier_->speculative_count();
+        stats_.host_spec_evicted_unused = host_tier_->speculative_evicted_unused();
+        stats_.host_spec_promotions     = host_tier_->speculative_promotions();
     }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     ggml_cuda_get_routed_expert_ptrs_stats(
