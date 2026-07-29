@@ -6,10 +6,12 @@
 #include "ggml.h"
 #include "llama-impl.h"  // LLAMA_LOG_*
 #include "wp-gpu-runtime.h"
+// Compile-time: Vulkan declarations are absent when that backend is not built.
 #if defined(GGML_USE_VULKAN)
 #include "ggml-vulkan.h"   // ggml_backend_vk_wp_set_expert_offsets
 #endif
 
+// Compile-time: these CUDA side-channel symbols are absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 // Forward decl of the ggml-cuda side channel — the actual symbol lives in
 // libggml-hip.so and we link against it. Avoids dragging the full
@@ -137,6 +139,7 @@ struct ProfGuard {
     }
 };
 
+// Compile-time: the async bookkeeping stores HIP/CUDA event types.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 struct AsyncTransferEvent {
     int page_idx = -1;
@@ -247,6 +250,7 @@ WeightPager * s_prev_op_pager = nullptr;
 }  // namespace
 
 void weight_pager_eval_cb_reset(WeightPager * pager) {
+// Compile-time: teardown calls event APIs absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // WP_PAGED_BATCH: release any range pins still held at teardown (a range that
     // ended at a split boundary with no following callback, or reset mid-range).
@@ -443,9 +447,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 }
                 return false;
             };
+// Compile-time: the optional fast readback uses a CUDA-family stream API.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-            hipStream_t wp_stream =
-                (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
+            hipStream_t wp_stream = pager->is_vulkan()
+                ? nullptr
+                : (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
 #endif
             // WP_PREFETCH_XLAYER_NOSYNC: skip the per-layer stream sync to isolate
             // its cost. h may be mid-copy => predictions can be stale, but prefetch
@@ -470,6 +476,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     ggml_backend_tensor_get(src_t, host.data(), 0, nb);
                     return true;
                 }
+// Compile-time: the raw-pointer fallback calls an API absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                 const void * dptr = src_t->data;
                 if (dptr != nullptr) {
@@ -577,6 +584,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const std::uint64_t prof_t0    = wp_profile ? wp_now_ns() : 0;
     ProfGuard           prof_guard{wp_profile, prof_t0};
 
+// Compile-time: clearing the CUDA TLS requires its linked side-channel symbol.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     // MAD-230: discard any stale routed_expert_ptrs TLS that wasn't
     // consumed by a CUDA kernel on the previous op. eval_cb fires
@@ -595,6 +603,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     ggml_cuda_discard_routed_expert_ptrs();
 #endif
 
+// Compile-time: async pin retirement uses HIP/CUDA event APIs.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     if (pager->async_ensure_enabled()) {
         for (size_t i = 0; i < s_pending_async_ops.size();) {
@@ -665,6 +674,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         s_prev_op_pager = nullptr;
     }
 
+// Compile-time: only CUDA-family builds declare the stream-wait helper below.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     auto enqueue_async_wait_for_page = [](WeightPager * owner, int page_idx,
                                           std::vector<AsyncTransferEvent> & prev_events) {
@@ -775,6 +785,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                        ggml_get_name(t->src[0]), weight_page, n_subs);
                     }
 
+// Ambiguous: CUDA APIs require this guard, but it also encloses Vulkan routing.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                     // MAD-88 Phase 2-6: routing-aware paging.
                     //
@@ -794,24 +805,25 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     // own device allocation for the table consumed by MMQ.
                     struct ggml_tensor * idx_tensor = t->src[2];
                     if (n_subs > 0 && idx_tensor != nullptr) {
+                        const bool runtime_vulkan = weight_pager->is_vulkan();
                         constexpr int kMaxExperts = 256;
                         if (n_subs > kMaxExperts) {
                             LLAMA_LOG_WARN("[wp::eval_cb] consolidated tensor has %d experts > kMaxExperts=%d, skipping routing\n",
                                            n_subs, kMaxExperts);
                         } else {
-                            int target_device = hip_device_idx_from_tensor(t);
-                            if (target_device < 0) {
+                            int target_device = runtime_vulkan ? -1 : hip_device_idx_from_tensor(t);
+                            if (!runtime_vulkan && target_device < 0) {
                                 target_device = hip_device_idx_from_tensor(idx_tensor);
                             }
                             ScopedHipDevice hip_device(target_device);
-                            if (hip_device.err != hipSuccess) {
+                            if (!runtime_vulkan && hip_device.err != hipSuccess) {
                                 LLAMA_LOG_WARN("[wp::eval_cb] hipSetDevice(%d) for expert_ptrs failed: %s\n",
                                                target_device, hipGetErrorString(hip_device.err));
                             }
 
                             static std::unordered_map<int, const void * *> s_dev_expert_ptrs_by_device;
                             const void * * dev_expert_ptrs = nullptr;
-                            if (hip_device.err == hipSuccess) {
+                            if (!runtime_vulkan && hip_device.err == hipSuccess) {
                                 auto it = s_dev_expert_ptrs_by_device.find(target_device);
                                 if (it != s_dev_expert_ptrs_by_device.end()) {
                                     dev_expert_ptrs = it->second;
@@ -828,7 +840,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 }
                             }
 
-                            if (dev_expert_ptrs != nullptr) {
+                            if (runtime_vulkan || dev_expert_ptrs != nullptr) {
                                 // Pick up the GGML CUDA compute stream so all
                                 // host-device transfers below are stream-ordered
                                 // with the kernels that produce / consume them.
@@ -838,10 +850,12 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 // does NOT serialize with them. If the stream
                                 // is absent or belongs to another device, fall
                                 // back to host-ordered synchronous copies.
-                                hipStream_t wp_stream =
-                                    (hipStream_t) ggml_cuda_get_wp_compute_stream(target_device);
+                                hipStream_t wp_stream = runtime_vulkan
+                                    ? nullptr
+                                    : (hipStream_t) ggml_cuda_get_wp_compute_stream(target_device);
+// Compile-time: stream-device inspection is unavailable in CUDA 12.0.
 #if defined(GGML_USE_HIP)
-                                if (wp_stream != nullptr) {
+                                if (!runtime_vulkan && wp_stream != nullptr) {
                                     hipDevice_t stream_device = -1;
                                     hipError_t stream_err = hipStreamGetDevice(wp_stream, &stream_device);
                                     if (stream_err != hipSuccess || (int) stream_device != target_device) {
@@ -913,20 +927,16 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                 // fails and would silently skip the whole routed
                                 // block. Use the backend-neutral accessor there.
                                 bool idx_read_ok = false;
-#if defined(GGML_USE_VULKAN)
-                                if (idx_tensor->buffer != nullptr) {
-                                    const char * bname =
-                                        ggml_backend_buffer_name(idx_tensor->buffer);
-                                    if (bname != nullptr && std::strstr(bname, "Vulkan") != nullptr) {
-                                        ggml_backend_tensor_get(idx_tensor, host_indices.data(), 0,
-                                                                (size_t) n_indices * sizeof(int32_t));
-                                        idx_read_ok = true;
-                                    }
+                                if (runtime_vulkan && idx_tensor->buffer != nullptr) {
+                                    ggml_backend_tensor_get(idx_tensor, host_indices.data(), 0,
+                                                            (size_t) n_indices * sizeof(int32_t));
+                                    idx_read_ok = true;
                                 }
-#endif
                                 hipError_t mc_err = hipSuccess;
                                 if (idx_read_ok) {
                                     // already have the indices
+                                } else if (runtime_vulkan) {
+                                    mc_err = hipErrorInvalidValue;
                                 } else if (wp_stream != nullptr) {
                                     mc_err = hipMemcpyAsync(host_indices.data(),
                                                             idx_tensor->data,
@@ -1120,6 +1130,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                     first_active_slot = slot;
                                                 }
                                                 ++n_ensures;
+// Compile-time: async event handoff is declared only for CUDA-family builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                                 enqueue_async_wait_for_page(
                                                     weight_pager, weight_page + 1 + e,
@@ -1194,6 +1205,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 first_active_slot = slot;
                                             }
                                             ++n_ensures;
+// Compile-time: async event handoff is declared only for CUDA-family builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
                                             enqueue_async_wait_for_page(
                                                 weight_pager, sub_page_idx,
@@ -1232,6 +1244,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                     }
 
+// Compile-time: publishing expert offsets calls the Vulkan backend API.
 #if defined(GGML_USE_VULKAN)
                                     // Vulkan consumption path. Unlike HIP/CUDA we
                                     // cannot hand the shader raw pointers: every slot
@@ -1253,7 +1266,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // expert per layer per token — measured at
                                     // ~100M lines / 200 MB in two minutes, which
                                     // buries the run rather than corrupting it.
-                                    if (weight_pager->is_vulkan())
+                                    if (runtime_vulkan)
                                     {
                                         const size_t blk = ggml_type_size(t->src[0]->type);
                                         const uintptr_t pool_base =
@@ -1302,25 +1315,27 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // staging copy before returning, so
                                     // host_ptrs going out of scope at end of
                                     // eval_cb is safe.
-                                    if (wp_stream != nullptr) {
-                                        hipMemcpyAsync(dev_expert_ptrs,
-                                                       host_ptrs.data(),
-                                                       (size_t) n_subs * sizeof(const void *),
-                                                       hipMemcpyHostToDevice,
-                                                       wp_stream);
-                                    } else {
-                                        // Legacy fallback if the cuda backend
-                                        // didn't publish a stream (shouldn't
-                                        // happen with a properly initialised
-                                        // GGML CUDA backend).
-                                        hipDeviceSynchronize();
-                                        hipMemcpy(dev_expert_ptrs,
-                                                  host_ptrs.data(),
-                                                  (size_t) n_subs * sizeof(const void *),
-                                                  hipMemcpyHostToDevice);
+                                    if (!runtime_vulkan) {
+                                        if (wp_stream != nullptr) {
+                                            hipMemcpyAsync(dev_expert_ptrs,
+                                                           host_ptrs.data(),
+                                                           (size_t) n_subs * sizeof(const void *),
+                                                           hipMemcpyHostToDevice,
+                                                           wp_stream);
+                                        } else {
+                                            // Legacy fallback if the cuda backend
+                                            // didn't publish a stream (shouldn't
+                                            // happen with a properly initialised
+                                            // GGML CUDA backend).
+                                            hipDeviceSynchronize();
+                                            hipMemcpy(dev_expert_ptrs,
+                                                      host_ptrs.data(),
+                                                      (size_t) n_subs * sizeof(const void *),
+                                                      hipMemcpyHostToDevice);
+                                        }
+                                        ggml_cuda_set_routed_expert_ptrs(dev_expert_ptrs);
+                                        routing_tls_set = true;
                                     }
-                                    ggml_cuda_set_routed_expert_ptrs(dev_expert_ptrs);
-                                    routing_tls_set = true;
 
                                     if (g_debug.mmid_consolidated <= 4) {
                                         LLAMA_LOG_INFO("[wp::eval_cb] routed: %d/%zu unique active experts ensured\n",
@@ -1740,6 +1755,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 ++views_this_op;
             }
         }
+// Compile-time: async event handoff is declared only for CUDA-family builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         enqueue_async_wait_for_page(owner, page_idx, s_async_events_prev_op);
 #endif

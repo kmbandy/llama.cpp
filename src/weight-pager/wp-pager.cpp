@@ -28,6 +28,7 @@
 
 #include "wp-gpu-runtime.h"
 
+// Compile-time: the CUDA stats side-channel symbol is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 
 extern "C++" void ggml_cuda_get_routed_expert_ptrs_stats(
@@ -240,6 +241,7 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
     if (slot_size <= payload_size) return true;
     if (dst_vram == nullptr) return false;
+    // Compile-time: direct-to-device file IO exists only with this padding API.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
                                slot_size - payload_size);
@@ -330,6 +332,7 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
         }
     }
 
+    // Compile-time: this is the CUDA-family fallback after the runtime Vulkan allocation.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     static const int s_pageable = [](){ const char* e=std::getenv("WP_ODIRECT_PAGEABLE"); return (e&&e[0]=='1')?1:0; }();
     bool all_ok = !s_pageable;
@@ -374,6 +377,7 @@ void WeightPager::free_ensure_host_bufs_() {
             transport_.host_free(p);
             continue;
         }
+        // Compile-time: only CUDA-family builds can own this allocation kind.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (ensure_host_bufs_pinned_) {
             hipHostFree(p);
@@ -1286,17 +1290,30 @@ bool WeightPager::init(const Config &             cfg,
     //    per access.
     sync_staging_size_ = slot_size;
     sync_staging_      = nullptr;
+    sync_staging_transport_pinned_ = false;
+    if (transport_.is_vulkan()) {
+        sync_staging_ = transport_.host_alloc(sync_staging_size_);
+        sync_staging_transport_pinned_ = sync_staging_ != nullptr;
+    }
+    if (sync_staging_ == nullptr && transport_.is_vulkan()) {
+        sync_staging_ = std::malloc(sync_staging_size_);
+    }
+// Compile-time: the HIP/CUDA host-allocation API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-    if (hipHostMalloc(&sync_staging_, sync_staging_size_, hipHostMallocDefault) == hipSuccess) {
-        sync_staging_pinned_ = true;
-    } else {
-        LLAMA_LOG_WARN("wp::WeightPager: hipHostMalloc(%zu) for shared sync staging failed; falling back to malloc\n",
-                       sync_staging_size_);
-        sync_staging_        = std::malloc(sync_staging_size_);
-        sync_staging_pinned_ = false;
+    if (sync_staging_ == nullptr) {
+        if (hipHostMalloc(&sync_staging_, sync_staging_size_, hipHostMallocDefault) == hipSuccess) {
+            sync_staging_pinned_ = true;
+        } else {
+            LLAMA_LOG_WARN("wp::WeightPager: hipHostMalloc(%zu) for shared sync staging failed; falling back to malloc\n",
+                           sync_staging_size_);
+            sync_staging_        = std::malloc(sync_staging_size_);
+            sync_staging_pinned_ = false;
+        }
     }
 #else
-    sync_staging_ = std::malloc(sync_staging_size_);
+    if (sync_staging_ == nullptr) {
+        sync_staging_ = std::malloc(sync_staging_size_);
+    }
 #endif
     if (sync_staging_ == nullptr) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: shared sync staging allocation failed\n");
@@ -1316,7 +1333,7 @@ bool WeightPager::init(const Config &             cfg,
             : host_budget_raw;
     if (host_budget > 0) {
         auto host_tier = std::make_unique<HostTier>();
-        if (host_tier->init(host_budget, device_idx)) {
+        if (host_tier->init(host_budget, device_idx, &transport_)) {
             // The tier must copy out of the pool through the transport, not via
             // a raw device memcpy: on Vulkan a slot pointer is a sentinel base
             // plus an offset and cannot be dereferenced by hip*/cuda*.
@@ -1508,11 +1525,14 @@ void WeightPager::shutdown() {
     prefetch_.shutdown();
     host_prefetcher_.reset();
     host_prefetch_file_io_.reset();
-    file_io_.reset();
-    transport_.shutdown();
     host_tier_.reset();
+    file_io_.reset();
     host_prefetch_strikes_.clear();
     if (sync_staging_ != nullptr) {
+        if (sync_staging_transport_pinned_) {
+            transport_.host_free(sync_staging_);
+        } else {
+// Compile-time: the HIP/CUDA host-free API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (sync_staging_pinned_) {
             hipHostFree(sync_staging_);
@@ -1522,11 +1542,14 @@ void WeightPager::shutdown() {
 #else
         std::free(sync_staging_);
 #endif
+        }
         sync_staging_       = nullptr;
         sync_staging_size_  = 0;
         sync_staging_pinned_ = false;
+        sync_staging_transport_pinned_ = false;
     }
     free_ensure_host_bufs_();
+    transport_.shutdown();
     // PoolAllocator dtor frees the ggml buffer.
     pool_.~PoolAllocator();
     new (&pool_) PoolAllocator{};
@@ -1681,11 +1704,14 @@ const WeightPager::Stats & WeightPager::stats() const {
         stats_.host_spec_evicted_unused = host_tier_->speculative_evicted_unused();
         stats_.host_spec_promotions     = host_tier_->speculative_promotions();
     }
+// Compile-time: the CUDA stats side-channel symbol is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-    ggml_cuda_get_routed_expert_ptrs_stats(
-        &stats_.routing_ptrs_set,
-        &stats_.routing_ptrs_consumed,
-        &stats_.routing_ptrs_discarded_unconsumed);
+    if (!transport_.is_vulkan()) {
+        ggml_cuda_get_routed_expert_ptrs_stats(
+            &stats_.routing_ptrs_set,
+            &stats_.routing_ptrs_consumed,
+            &stats_.routing_ptrs_discarded_unconsumed);
+    }
 #endif
     return stats_;
 }
@@ -1866,17 +1892,40 @@ void WeightPager::log_stats_summary() {
     {
         LLAMA_LOG_WARN(
             "wp::ensure_batch P2P ACHIEVED CONCURRENCY (kernel-submitted reads): "
-            "inflight_peak=%lu inflight_avg_at_read_start=%.2f\n",
+            "submitted=%lu window_pressure_fallbacks=%lu inflight_peak=%lu "
+            "inflight_avg_at_read_start=%.2f\n",
             (unsigned long) s.ensure_batch_n_sub_sum,
             (unsigned long) s.ensure_batch_window_pressure_fallbacks,
             (unsigned long) s.ensure_batch_p2p_inflight_peak,
             s.ensure_batch_p2p_inflight_avg_at_read_start);
     }
     if (s.ensure_batch_host_h2d_overlap_batches > 0) {
+        if (s.ensure_batch_host_h2d_overlap_copies == 0) {
+            LLAMA_LOG_WARN(
+                "wp::ensure_batch HOST H2D OVERLAP: NOT OBSERVED - batches=%lu "
+                "copies_before_last_read=0 stage_submissions=%lu stage_completions=%lu "
+                "sync_fallback_pages=%lu\n",
+                (unsigned long) s.ensure_batch_host_h2d_overlap_batches,
+                (unsigned long) s.ensure_batch_host_h2d_submissions,
+                (unsigned long) s.ensure_batch_host_h2d_completions,
+                (unsigned long) s.ensure_batch_host_sync_fallback_pages);
+        } else {
+            LLAMA_LOG_WARN(
+                "wp::ensure_batch HOST H2D OVERLAP: batches=%lu copies_before_last_read=%lu "
+                "stage_submissions=%lu stage_completions=%lu sync_fallback_pages=%lu\n",
+                (unsigned long) s.ensure_batch_host_h2d_overlap_batches,
+                (unsigned long) s.ensure_batch_host_h2d_overlap_copies,
+                (unsigned long) s.ensure_batch_host_h2d_submissions,
+                (unsigned long) s.ensure_batch_host_h2d_completions,
+                (unsigned long) s.ensure_batch_host_sync_fallback_pages);
+        }
+    }
+    if (s.ensure_batch_host_sync_fallback_pages > 0) {
         LLAMA_LOG_WARN(
-            "wp::ensure_batch HOST H2D OVERLAP: batches=%lu copies_before_last_read=%lu\n",
-            (unsigned long) s.ensure_batch_host_h2d_overlap_batches,
-            (unsigned long) s.ensure_batch_host_h2d_overlap_copies);
+            "wp::ensure_batch HOST SYNC FALLBACK: pages=%lu page_in_sync_ms=%.1f "
+            "(excluded from HOST h2d_ms)\n",
+            (unsigned long) s.ensure_batch_host_sync_fallback_pages,
+            s.ensure_batch_host_sync_fallback_seconds * 1e3);
     }
 
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
@@ -2824,7 +2873,14 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
     const bool batch_h2d_overlap =
         s_batch_h2d_overlap != 0 && transport_.is_initialized();
     if (s_batch_host && ensure_host_bufs_ready_(misses.size(), catalog_.max_page_size())) {
-        ++stats_.ensure_batch_host_path_batches;
+        static int s_host_runtime_route_log = 0;
+        if (s_host_runtime_route_log < 1) {
+            LLAMA_LOG_WARN(
+                "wp::ensure_batch: HOST runtime backend=%s h2d_route=%s\n",
+                transport_.is_vulkan() ? "vulkan" : "hip/cuda",
+                batch_h2d_overlap ? "transport-overlap" : "backend-barrier");
+            ++s_host_runtime_route_log;
+        }
         const auto io_t0 = std::chrono::steady_clock::now();
         struct HostJob {
             int      file_idx;
@@ -2849,16 +2905,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // source. Every borrow() taken here is released by host_borrow_guard
         // below, after this whole HOST-path region (including the H2D
         // enqueue and the single hipDeviceSynchronize()) is done with it.
-        // Gated on GGML_USE_HIP because backend_pinned() is only ever true
-        // there (a CPU-only build's arena is plain malloc, and the #else
-        // branch below ignores `jobs`/`host_hit` entirely in favor of
-        // page_in_sync_ -- calling borrow() there would leak the refcount
-        // with nothing to release it).
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        // backend_pinned() describes this tier's actual allocation. Do not
+        // infer that runtime property from the set of compiled backends.
         const bool host_zerocopy = host_tier_ != nullptr && host_tier_->backend_pinned();
-#else
-        const bool host_zerocopy = false;
-#endif
         std::vector<bool> host_hit(misses.size(), false);
         // Source of the promotion H2D copy for each host_hit[k]: either the
         // borrowed arena pointer (zero-copy) or ensure_host_bufs_[k] (the
@@ -2995,6 +3044,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
 
         const auto tp_submit = std::chrono::steady_clock::now();
         uint64_t batch_h2d_overlap_copies = 0;
+        uint64_t batch_h2d_submissions = 0;
+        uint64_t batch_h2d_completions = 0;
         std::vector<int> overlap_events;
         std::vector<bool> overlap_copy_ok;
         std::vector<bool> overlap_copy_failed;
@@ -3030,6 +3081,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 return false;
             }
             overlap_events[k] = event;
+            ++batch_h2d_submissions;
             overlap_h2d_issue_times.push_back(std::chrono::steady_clock::now());
             return true;
         };
@@ -3150,6 +3202,14 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
         }
         const auto tp_reap = std::chrono::steady_clock::now();
+        int read_ok_n = 0;
+        size_t read_ok_bytes = 0;
+        for (std::size_t k = 0; k < jobs.size(); ++k) {
+            if (jobs[k].queued && jobs[k].ok) {
+                ++read_ok_n;
+                read_ok_bytes += jobs[k].size;
+            }
+        }
         auto msd = [](auto a2, auto b2){ return std::chrono::duration<double,std::milli>(b2-a2).count(); };
         // Named HOST-path phase breakdown (seconds), reported via Stats
         // below. Unlike ensure_batch_submit_seconds/wait_seconds -- which on
@@ -3177,6 +3237,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         const double read_seconds = seconds_since(io_t0);
         size_t batch_bytes = 0;
         int    batch_ok_n  = 0;
+        uint64_t batch_sync_fallback_pages = 0;
+        double   batch_sync_fallback_seconds = 0.0;
         // Populated inside the GGML_USE_HIP branch below; declared here
         // (with inert defaults) because the stats-fold block after the
         // #if/#else/#endif is shared by both branches.
@@ -3192,6 +3254,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 }
                 overlap_copy_ok[k] = transport_.synchronize(event);
                 overlap_copy_failed[k] = !overlap_copy_ok[k];
+                if (overlap_copy_ok[k]) {
+                    ++batch_h2d_completions;
+                }
                 overlap_wait_failed = overlap_wait_failed || !overlap_copy_ok[k];
                 transport_.release_event(event);
                 overlap_events[k] = -1;
@@ -3224,8 +3289,12 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 if (event < 0) {
                     continue;
                 }
+                ++batch_h2d_submissions;
                 overlap_copy_ok[k] = transport_.synchronize(event);
                 overlap_copy_failed[k] = !overlap_copy_ok[k];
+                if (overlap_copy_ok[k]) {
+                    ++batch_h2d_completions;
+                }
                 overlap_wait_failed = overlap_wait_failed || !overlap_copy_ok[k];
                 transport_.release_event(event);
             }
@@ -3272,7 +3341,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     } else {
                         ++stats_.pis_host_path;
                     }
+                    const auto fallback_t0 = std::chrono::steady_clock::now();
                     const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                    ++batch_sync_fallback_pages;
+                    batch_sync_fallback_seconds += seconds_since(fallback_t0);
                     out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
                 }
             }
@@ -3283,6 +3355,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // Vulkan run would fall into raw cudaMemcpy against the pool sentinel.
         bool   vk_h2d_handled   = batch_h2d_overlap;
 
+// Compile-time: the runtime Vulkan route calls backend APIs absent from other builds.
 #if defined(GGML_USE_VULKAN)
         if (!vk_h2d_handled && transport_.is_vulkan()) {
             vk_h2d_handled = true;
@@ -3387,7 +3460,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     }
                 } else {
                     ++stats_.pis_vk_host;
+                    const auto fallback_t0 = std::chrono::steady_clock::now();
                     const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                    ++batch_sync_fallback_pages;
+                    batch_sync_fallback_seconds += seconds_since(fallback_t0);
                     out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
                 }
             }
@@ -3400,6 +3476,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
 #endif
 
+// Compile-time: the runtime non-Vulkan route calls CUDA-family APIs.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (!vk_h2d_handled) {
         // The default route queues all H2Ds here after the read barrier. The
@@ -3620,7 +3697,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 }
             } else {
                 ++stats_.pis_host_path;
+                const auto fallback_t0 = std::chrono::steady_clock::now();
                 const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                ++batch_sync_fallback_pages;
+                batch_sync_fallback_seconds += seconds_since(fallback_t0);
                 out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             }
         }
@@ -3636,34 +3716,55 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         if (!vk_h2d_handled) {
             for (std::size_t k = 0; k < misses.size(); ++k) {
                 ++stats_.pis_nonhip;
+                const auto fallback_t0 = std::chrono::steady_clock::now();
                 const int s = page_in_sync_(misses[k].page, /*reuse_slot=*/misses[k].slot);
+                ++batch_sync_fallback_pages;
+                batch_sync_fallback_seconds += seconds_since(fallback_t0);
                 out_ptrs[misses[k].out_i] = (s < 0) ? nullptr : slot_ptr_(s);
             }
         }
 #endif
         (void) vk_h2d_handled;
         const double batch_seconds = seconds_since(io_t0);
-        if (batch_h2d_overlap) {
+        const bool host_batch_ran = n_submitted > 0 || n_host_hit > 0;
+        if (host_batch_ran) {
+            ++stats_.ensure_batch_host_path_batches;
+        }
+        if (batch_h2d_overlap && host_batch_ran) {
             ++stats_.ensure_batch_host_h2d_overlap_batches;
             stats_.ensure_batch_host_h2d_overlap_copies += batch_h2d_overlap_copies;
+            stats_.ensure_batch_host_h2d_submissions += batch_h2d_submissions;
+            stats_.ensure_batch_host_h2d_completions += batch_h2d_completions;
         }
-        if (batch_ok_n > 0) {
+        stats_.ensure_batch_host_sync_fallback_pages += batch_sync_fallback_pages;
+        stats_.ensure_batch_host_sync_fallback_seconds += batch_sync_fallback_seconds;
+        if (host_batch_ran) {
+            const int accounted_pages = batch_sync_fallback_pages > 0
+                ? std::max(batch_ok_n, read_ok_n)
+                : batch_ok_n;
+            const size_t accounted_bytes = batch_sync_fallback_pages > 0
+                ? std::max(batch_bytes, read_ok_bytes)
+                : batch_bytes;
             stats_.page_ins  += (uint64_t) batch_ok_n;
             stats_.io_bytes  += (uint64_t) batch_bytes;
-            stats_.io_seconds += batch_seconds;
+            if (batch_ok_n > 0) {
+                stats_.io_seconds += std::max(
+                    0.0, batch_seconds - batch_sync_fallback_seconds);
+            }
             ++stats_.ensure_batch_calls;
-            stats_.ensure_batch_pages   += (uint64_t) batch_ok_n;
-            stats_.ensure_batch_bytes   += (uint64_t) batch_bytes;
+            stats_.ensure_batch_pages   += (uint64_t) accounted_pages;
+            stats_.ensure_batch_bytes   += (uint64_t) accounted_bytes;
             // Headline gb/s denominator: storage-read-phase time only
             // (excludes H2D), and only when real storage bytes were
             // actually read -- a batch served entirely by HostTier
             // reads zero storage bytes and must not inflate the wall
             // time this ratio is divided by.
-            if (batch_bytes > 0) {
+            if (accounted_bytes > 0) {
                 stats_.ensure_batch_seconds += read_seconds;
             }
             stats_.ensure_batch_submit_seconds += read_seconds; // host O_DIRECT phase
-            stats_.ensure_batch_wait_seconds   += (batch_seconds - read_seconds); // H2D
+            stats_.ensure_batch_wait_seconds +=
+                std::max(0.0, batch_seconds - read_seconds - batch_sync_fallback_seconds);
             stats_.ensure_batch_host_jobs_seconds      += host_jobs_seconds;
             stats_.ensure_batch_host_prep_seconds      += host_prep_seconds;
             stats_.ensure_batch_host_enqueue_seconds   += host_enqueue_seconds;
@@ -3671,7 +3772,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             // With overlap enabled this is the residual H2D wait after the
             // final read. Its collapse while read_wait stays flat is the
             // falsifiable signature that the copies actually hid behind I/O.
-            stats_.ensure_batch_host_h2d_seconds       += (batch_seconds - read_seconds);
+            stats_.ensure_batch_host_h2d_seconds +=
+                std::max(0.0, batch_seconds - read_seconds - batch_sync_fallback_seconds);
             if (h2d_events_valid) {
                 stats_.ensure_batch_host_promotion_h2d_seconds += promo_h2d_ms / 1e3;
                 stats_.ensure_batch_host_fresh_h2d_seconds     += fresh_h2d_ms / 1e3;

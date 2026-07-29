@@ -139,6 +139,12 @@ public:
     bool is_initialized() const { return initialized_; }
 
 private:
+    enum class HostAllocKind : uint8_t {
+        Malloc,
+        Backend,
+        Transport,
+    };
+
     enum class State : uint8_t {
         Free,
         Submitted,       // file IO submitted, waiting for stage-1 completion
@@ -174,6 +180,7 @@ private:
 
     std::vector<Slot>   slots_;
     std::vector<void *> staging_;          // pinned host buffer per slot
+    std::vector<HostAllocKind> staging_alloc_kinds_;
     std::vector<int>    free_slots_;       // free-list of slot handles
 
     uint64_t            next_req_id_ = 1;  // 0 reserved for "no request"

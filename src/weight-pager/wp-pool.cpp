@@ -12,6 +12,7 @@
 #include <numeric>   // std::gcd
 #include <string>
 
+// Compile-time: the HIP runtime header is absent from other builds.
 #if defined(GGML_USE_HIP)
 #include <hip/hip_runtime.h>
 #endif
@@ -63,6 +64,7 @@ bool is_uma_archname(const char * arch_name) {
 }
 
 bool is_uma_device(int device_idx) {
+// Compile-time: this probe uses HIP-only device properties and architecture names.
 #if defined(GGML_USE_HIP)
     if (device_idx < 0) return false;
 

@@ -17,6 +17,8 @@
 
 namespace wp {
 
+class GpuTransport;
+
 class HostTier {
 public:
     HostTier() = default;
@@ -25,7 +27,7 @@ public:
     HostTier(const HostTier &)             = delete;
     HostTier & operator=(const HostTier &) = delete;
 
-    bool init(size_t budget_bytes, int device_idx);
+    bool init(size_t budget_bytes, int device_idx, GpuTransport * transport = nullptr);
     void shutdown();
 
     // Opaque identifier for one specific entry generation. Assigned when the
@@ -139,6 +141,8 @@ private:
     size_t    used_bytes_   = 0;
     size_t    high_water_   = 0;
     bool      backend_pinned_ = false;
+    GpuTransport * transport_ = nullptr;
+    bool      transport_pinned_ = false;
     DeviceReader device_reader_;
     bool      mlocked_        = false;
 

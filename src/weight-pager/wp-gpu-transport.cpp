@@ -5,6 +5,7 @@
 
 #include "ggml-backend.h"
 
+// Compile-time: the Vulkan bridge declarations are absent from other builds.
 #if defined(GGML_USE_VULKAN)
 #include "ggml-vulkan.h"
 #endif
@@ -13,6 +14,7 @@
 
 namespace wp {
 
+// Compile-time: Vulkan buffer identification needs the Vulkan backend name.
 #if defined(GGML_USE_VULKAN)
 static bool is_vulkan_buffer(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr) {
@@ -25,6 +27,7 @@ static bool is_vulkan_buffer(ggml_backend_buffer_t buffer) {
 }
 #endif
 
+// Ambiguous: CUDA-family types require this guard, but it also encloses Vulkan support.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
 
 // --- HIP implementation ----------------------------------------------------
@@ -43,6 +46,7 @@ bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream
         return false;
     }
 
+    // Compile-time: the runtime Vulkan init route calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_buffer(buffer)) {
         events_.assign(n_events, nullptr);
@@ -129,6 +133,7 @@ bool GpuTransport::init(int device_idx, int n_events, bool async_transfer_stream
 void GpuTransport::shutdown() {
     if (!initialized_) return;
 
+    // Compile-time: Vulkan event destruction calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         for (void * event : events_) {
@@ -172,6 +177,7 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
     int evt_idx = stage_in_async(dst, src_pinned, payload_size, slot_size);
     if (evt_idx < 0) return -1;
 
+    // Compile-time: Vulkan synchronization calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return synchronize(evt_idx) ? evt_idx : -1;
@@ -219,6 +225,7 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
         return -1;
     }
 
+    // Compile-time: Vulkan staging calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         const int evt_idx = free_events_.back();
@@ -314,11 +321,13 @@ bool GpuTransport::read_to_host(void * dst_host, const void * src_device, size_t
     if (dst_host == nullptr || src_device == nullptr || n == 0) {
         return false;
     }
+    // Compile-time: Vulkan readback calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return ggml_backend_vk_wp_read(buffer_, src_device, dst_host, n);
     }
 #endif
+    // Compile-time: raw D2H is unavailable without a CUDA-family runtime.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     hipError_t err = hipMemcpy(dst_host, src_device, n, hipMemcpyDeviceToHost);
     if (err != hipSuccess) {
@@ -333,6 +342,7 @@ bool GpuTransport::read_to_host(void * dst_host, const void * src_device, size_t
 }
 
 void * GpuTransport::host_alloc(size_t size) {
+    // Compile-time: registered Vulkan host allocation calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return ggml_backend_vk_wp_host_alloc(buffer_, size);
@@ -343,6 +353,7 @@ void * GpuTransport::host_alloc(size_t size) {
 }
 
 void GpuTransport::host_free(void * ptr) {
+    // Compile-time: registered Vulkan host free calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         ggml_backend_vk_wp_host_free(buffer_, ptr);
@@ -353,6 +364,7 @@ void GpuTransport::host_free(void * ptr) {
 }
 
 bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
+    // Compile-time: Vulkan has no CUDA-family stream-wait event.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return false;
@@ -379,6 +391,7 @@ bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
 }
 
 bool GpuTransport::query(int event_handle) const {
+    // Compile-time: Vulkan event polling calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return event_handle >= 0 && event_handle < (int) events_.size() &&
@@ -399,6 +412,7 @@ bool GpuTransport::query(int event_handle) const {
 }
 
 bool GpuTransport::synchronize(int event_handle) {
+    // Compile-time: Vulkan event waiting calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         return event_handle >= 0 && event_handle < (int) events_.size() &&
@@ -421,6 +435,7 @@ bool GpuTransport::synchronize(int event_handle) {
 
 void GpuTransport::release_event(int event_handle) {
     if (!initialized_ || event_handle < 0 || event_handle >= (int) events_.size()) return;
+    // Compile-time: Vulkan event release calls the Vulkan bridge.
 #if defined(GGML_USE_VULKAN)
     if (is_vulkan_) {
         if (events_[event_handle] == nullptr) return;

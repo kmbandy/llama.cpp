@@ -20,8 +20,10 @@ namespace wp {
 
 namespace {
 
-void * alloc_pinned(size_t bytes) {
+void * alloc_pinned(size_t bytes, bool & backend_pinned) {
+    backend_pinned = false;
     if (bytes == 0) return nullptr;
+// Compile-time: the HIP/CUDA host-allocation API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     void * p = nullptr;
     hipError_t err = hipHostMalloc(&p, bytes, hipHostMallocDefault);
@@ -30,23 +32,24 @@ void * alloc_pinned(size_t bytes) {
                        bytes, hipGetErrorString(err));
         return std::malloc(bytes);
     }
+    backend_pinned = true;
     return p;
 #else
     return std::malloc(bytes);
 #endif
 }
 
-void free_pinned(void * p) {
+void free_pinned(void * p, bool backend_pinned) {
     if (p == nullptr) return;
+// Compile-time: the HIP/CUDA host-free API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-    // hipHostFree on a malloc'd ptr is undefined. We pessimistically try
-    // hipHostFree first; if it fails we leak (rare — only on the fallback
-    // path). To avoid this, callers should track which alloc path was used.
-    // For Phase 1b correctness we accept the leak risk on the fallback.
-    if (hipHostFree(p) != hipSuccess) {
+    if (backend_pinned) {
+        (void) hipHostFree(p);
+    } else {
         std::free(p);
     }
 #else
+    (void) backend_pinned;
     std::free(p);
 #endif
 }
@@ -54,6 +57,7 @@ void free_pinned(void * p) {
 bool zero_device_padding(void * dst_vram, size_t payload_size, size_t slot_size) {
     if (slot_size <= payload_size) return true;
     if (dst_vram == nullptr) return false;
+// Compile-time: direct-to-device padding uses an API absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     hipError_t err = hipMemset((char *) dst_vram + payload_size, 0,
                                slot_size - payload_size);
@@ -98,20 +102,38 @@ bool PrefetchScheduler::init(FileIOLayer * file_io, GpuTransport * gpu,
 
     slots_.assign((size_t) queue_depth, Slot{});
     staging_.assign((size_t) queue_depth, nullptr);
+    staging_alloc_kinds_.assign((size_t) queue_depth, HostAllocKind::Malloc);
     free_slots_.clear();
     free_slots_.reserve(queue_depth);
 
     for (int i = 0; i < queue_depth; ++i) {
-        staging_[i] = alloc_pinned(max_page_size);
+        if (gpu_->is_vulkan()) {
+            staging_[i] = gpu_->host_alloc(max_page_size);
+            if (staging_[i] != nullptr) {
+                staging_alloc_kinds_[i] = HostAllocKind::Transport;
+            } else {
+                staging_[i] = std::malloc(max_page_size);
+            }
+        } else {
+            bool backend_pinned = false;
+            staging_[i] = alloc_pinned(max_page_size, backend_pinned);
+            staging_alloc_kinds_[i] =
+                backend_pinned ? HostAllocKind::Backend : HostAllocKind::Malloc;
+        }
         if (staging_[i] == nullptr) {
             LLAMA_LOG_WARN("wp::PrefetchScheduler::init: alloc_pinned[%d] failed\n", i);
             // Tear down what we built.
             for (int j = 0; j < i; ++j) {
-                free_pinned(staging_[j]);
+                if (staging_alloc_kinds_[j] == HostAllocKind::Transport) {
+                    gpu_->host_free(staging_[j]);
+                } else {
+                    free_pinned(staging_[j], staging_alloc_kinds_[j] == HostAllocKind::Backend);
+                }
                 staging_[j] = nullptr;
             }
             slots_.clear();
             staging_.clear();
+            staging_alloc_kinds_.clear();
             return false;
         }
         free_slots_.push_back(i);
@@ -127,8 +149,19 @@ bool PrefetchScheduler::init(FileIOLayer * file_io, GpuTransport * gpu,
 void PrefetchScheduler::shutdown() {
     if (!initialized_) {
         // Even if init failed, free any partial staging.
-        for (void * p : staging_) free_pinned(p);
+        for (size_t i = 0; i < staging_.size(); ++i) {
+            if (i < staging_alloc_kinds_.size() &&
+                staging_alloc_kinds_[i] == HostAllocKind::Transport && gpu_ != nullptr) {
+                gpu_->host_free(staging_[i]);
+            } else {
+                const bool backend_pinned =
+                    i < staging_alloc_kinds_.size() &&
+                    staging_alloc_kinds_[i] == HostAllocKind::Backend;
+                free_pinned(staging_[i], backend_pinned);
+            }
+        }
         staging_.clear();
+        staging_alloc_kinds_.clear();
         slots_.clear();
         return;
     }
@@ -136,8 +169,15 @@ void PrefetchScheduler::shutdown() {
     // Drain in-flight to avoid leaving io_uring SQEs / GPU events orphaned.
     drain();
 
-    for (void * p : staging_) free_pinned(p);
+    for (size_t i = 0; i < staging_.size(); ++i) {
+        if (staging_alloc_kinds_[i] == HostAllocKind::Transport) {
+            gpu_->host_free(staging_[i]);
+        } else {
+            free_pinned(staging_[i], staging_alloc_kinds_[i] == HostAllocKind::Backend);
+        }
+    }
     staging_.clear();
+    staging_alloc_kinds_.clear();
     slots_.clear();
     free_slots_.clear();
     page_to_slot_.clear();

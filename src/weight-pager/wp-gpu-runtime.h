@@ -4,10 +4,12 @@
 // Keep pager implementation sources written against the original HIP names so
 // their HIP preprocessed output remains unchanged.
 
+// Compile-time: select the runtime header and type namespace present in this build.
 #if defined(GGML_USE_HIP)
 
 #include <hip/hip_runtime.h>
 
+// Compile-time: CUDA compatibility aliases require the CUDA runtime header.
 #elif defined(GGML_USE_CUDA)
 
 #include <cuda_runtime.h>

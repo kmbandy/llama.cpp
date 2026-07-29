@@ -1,5 +1,6 @@
 #include "wp-host-tier.h"
 
+#include "wp-gpu-transport.h"
 #include "wp-pool.h"      // is_uma_device
 #include "llama-impl.h"  // LLAMA_LOG_*
 
@@ -29,7 +30,7 @@ HostTier::~HostTier() {
     shutdown();
 }
 
-bool HostTier::init(size_t budget_bytes, int device_idx) {
+bool HostTier::init(size_t budget_bytes, int device_idx, GpuTransport * transport) {
     std::lock_guard<std::mutex> lock(mu_);
     if (arena_ != nullptr && budget_bytes_ > 0) {
         LLAMA_LOG_WARN("wp::HostTier: init called twice\n");
@@ -40,24 +41,36 @@ bool HostTier::init(size_t budget_bytes, int device_idx) {
     }
 
     budget_bytes_ = budget_bytes;
+    transport_ = transport;
 
+    if (transport_ != nullptr && transport_->is_vulkan()) {
+        arena_ = (uint8_t *) transport_->host_alloc(budget_bytes_);
+        backend_pinned_ = arena_ != nullptr;
+        transport_pinned_ = backend_pinned_;
+    }
+    if (arena_ == nullptr && transport_ != nullptr && transport_->is_vulkan()) {
+        arena_ = (uint8_t *) std::malloc(budget_bytes_);
+    }
+    if (arena_ == nullptr) {
+// Compile-time: the HIP/CUDA host-allocation API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-    void * p = nullptr;
-    hipError_t err = hipHostMalloc(&p, budget_bytes_, hipHostMallocDefault);
-    if (err == hipSuccess) {
-        arena_ = (uint8_t *) p;
-        backend_pinned_ = true;
-    } else {
-        LLAMA_LOG_WARN("wp::HostTier: hipHostMalloc(%zu) failed: %s; falling back to malloc\n",
-                       budget_bytes_, hipGetErrorString(err));
+        void * p = nullptr;
+        hipError_t err = hipHostMalloc(&p, budget_bytes_, hipHostMallocDefault);
+        if (err == hipSuccess) {
+            arena_ = (uint8_t *) p;
+            backend_pinned_ = true;
+        } else {
+            LLAMA_LOG_WARN("wp::HostTier: hipHostMalloc(%zu) failed: %s; falling back to malloc\n",
+                           budget_bytes_, hipGetErrorString(err));
+            arena_ = (uint8_t *) std::malloc(budget_bytes_);
+            backend_pinned_ = false;
+        }
+#else
+        (void) device_idx;
         arena_ = (uint8_t *) std::malloc(budget_bytes_);
         backend_pinned_ = false;
-    }
-#else
-    (void) device_idx;
-    arena_ = (uint8_t *) std::malloc(budget_bytes_);
-    backend_pinned_ = false;
 #endif
+    }
 
     if (arena_ == nullptr) {
         LLAMA_LOG_WARN("wp::HostTier::init: allocation of %zu bytes failed\n", budget_bytes_);
@@ -110,6 +123,10 @@ void HostTier::shutdown() {
             munlock(arena_, budget_bytes_);
         }
 #endif
+        if (transport_pinned_ && transport_ != nullptr) {
+            transport_->host_free(arena_);
+        } else {
+// Compile-time: the HIP/CUDA host-free API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (backend_pinned_) {
             (void) hipHostFree(arena_);
@@ -119,11 +136,14 @@ void HostTier::shutdown() {
 #else
         std::free(arena_);
 #endif
+        }
     }
 
     arena_ = nullptr;
     budget_bytes_ = 0;
     backend_pinned_ = false;
+    transport_ = nullptr;
+    transport_pinned_ = false;
     mlocked_ = false;
 }
 
@@ -193,6 +213,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
     // Vulkan-only configurations, so the preprocessor cannot be used to decide
     // this; only the owner knows what the pool actually is.
     if (!device_reader_) {
+// Compile-time: the raw HIP/CUDA fallback API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         // Fall through to the built-in copy below (raw-addressable pool).
 #else
@@ -217,6 +238,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
                            n, page_idx);
         }
     } else {
+// Compile-time: the raw HIP/CUDA fallback API is absent from other builds.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         hipError_t err = hipMemcpy(arena_ + offset, device_bytes, n, hipMemcpyDeviceToHost);
         ok = err == hipSuccess;

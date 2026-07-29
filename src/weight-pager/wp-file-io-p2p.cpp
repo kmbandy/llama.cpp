@@ -13,6 +13,7 @@
 #include <vector>
 #include <unistd.h>
 
+// Compile-time: P2P needs HIP, io_uring, Linux DMA-BUF, and their headers.
 #if defined(GGML_USE_HIP) && defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -24,6 +25,7 @@
 
 namespace wp {
 
+// Compile-time: the P2P implementation calls APIs absent without this feature set.
 #if defined(GGML_USE_HIP) && defined(LLAMA_HAVE_IO_URING) && defined(__linux__)
 
 namespace {

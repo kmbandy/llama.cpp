@@ -326,6 +326,10 @@ public:
         double   ensure_batch_host_h2d_seconds       = 0.0; // post-read H2D wait; residual when overlap is enabled
         uint64_t ensure_batch_host_h2d_overlap_batches = 0; // opt-in overlap path batches
         uint64_t ensure_batch_host_h2d_overlap_copies  = 0; // copies issued before the final read completed
+        uint64_t ensure_batch_host_h2d_submissions      = 0; // transport stages accepted on the overlap route
+        uint64_t ensure_batch_host_h2d_completions      = 0; // accepted stages whose completion fence succeeded
+        uint64_t ensure_batch_host_sync_fallback_pages  = 0; // pages re-read through page_in_sync_ after HOST work
+        double   ensure_batch_host_sync_fallback_seconds = 0.0; // wall time inside those per-page fallbacks
         // P2P direct-to-device path: names deliberately mirror the HOST
         // phases so arm-to-arm logs are comparable. H2D is structurally zero
         // on a successful direct read, but remains explicit in the summary.
@@ -928,7 +932,8 @@ private:
     // the OLD pager's pool.pinned_staging behaviour.
     void * sync_staging_       = nullptr;
     size_t sync_staging_size_  = 0;
-    bool   sync_staging_pinned_ = false;  // true if hipHostMalloc, false if malloc fallback
+    bool   sync_staging_pinned_ = false;  // true if HIP/CUDA host allocation
+    bool   sync_staging_transport_pinned_ = false; // true if allocated by GpuTransport
 
     // Multi-QD host bounce for ensure_batch (WP_ENSURE_BATCH_HOST=1):
     // Cold random buffered ~1.1 GB/s; O_DIRECT multi-QD ~6.2 GB/s on SN850X.
