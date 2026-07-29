@@ -440,3 +440,150 @@ FFN island, draft model) and cannot be filled further without new work (§5.3 it
 `13449ff4` strike gate · `f9c7a065` + `1d798065` + `6380ac29` + `898d9825` + `8e21ea4f` spec-decode
 arc · `9f4959db` hot-threshold negative · `c25f8630` repack design · `d4b2ea95` NEVER FORGET
 (fleet feedback, shared)
+
+---
+
+## 11. Target models: measured geometry and the per-token bill
+
+*Added 2026-07-28 afternoon. Everything in §1-§10 above was measured on Laguna and DS4-Flash,
+which are **not** the target workload. This section replaces model-shaped guesses with the real
+architectures. Read config values as **established** (straight from `config.json`); read derived
+byte figures as **arithmetic** (exact given the quant's bytes/param, which is itself ±10%).*
+
+### 11.1 The two targets
+
+| | GLM-5.2 (`glm_moe_dsa`) | Kimi K3 (`kimi_k3`) |
+|---|---|---|
+| Total / active params | 753B / A40B | 2.78T / A104B |
+| `num_hidden_layers` | 78 | 93 |
+| `first_k_dense_replace` | 3 → **75 MoE layers** | 1 → **92 MoE layers** |
+| `n_routed_experts` | **256** | **896** |
+| `num_experts_per_tok` | **8** | **16** |
+| Shared experts | 1 | 2 |
+| `hidden_size` | 6144 | 7168 |
+| `moe_intermediate_size` | 2048 | 3072 |
+| Expert input width | 6144 | **3584** (`routed_expert_hidden_size`) |
+| KV | MLA, `kv_lora_rank` 512 | MLA, `kv_lora_rank` 512 |
+| Attention | **DSA sparse**, `index_topk` 2048 | linear + full/KDA mix |
+| `num_nextn_predict_layers` | **1 (MTP head)** | **0** |
+
+**Kimi's expert width is a trap.** Experts run in a **half-width latent space** (3584, not 7168) —
+"Stable LatentMoE". That makes an expert 3 x 3584 x 3072 = **33.0M** params, not 66M. Cross-check:
+92 x 896 x 33.0M = **2.72T** against a stated 2.78T. At full width it would be 5.4T, so the latent
+reading is the right one. **Verify this against the GGUF tensor shapes before trusting any Kimi
+number below** — it is the single assumption everything else scales off.
+
+### 11.2 Derived footprint
+
+GLM expert = 3 x 6144 x 2048 = **37.75M** params. 75 x 256 x 37.75M = **725B routed** = **96% of
+the model**. For paging purposes "the model" and "the experts" are the same thing.
+
+At the working quants (GLM Q2 ~0.356 B/param; Kimi Q1 ~0.20 B/param):
+
+| | GLM-5.2 Q2 | Kimi K3 Q1 |
+|---|---|---|
+| Per expert | 13.4 MB | 6.6 MB |
+| **Per-layer expert pool** | **3.44 GB** | **5.9 GB** |
+| Total routed experts | **258 GB** | **545 GB** |
+| Touched per layer per token | 107 MB | 106 MB |
+| **Routed bytes per token** | **8.05 GB** | **9.7 GB** |
+| **Selectivity (n/k)** | **32x** | **56x** |
+
+**Kimi Q1 costs only ~1.2x GLM Q2 per token despite a 2.1x larger file.** The lower bit-width
+shrinks every expert while the *count* touched stays at 16. The download is the scary number; the
+number that governs throughput barely moves. The two models are the same problem at slightly
+different scale, not an easy one and a hard one.
+
+### 11.3 Fleet capacity and the ceiling
+
+Hot storage, keyed on VRAM+RAM (per `5d3e38fa`, RAM tier sized at 8 GB/machine, kmbandy's call):
+main 48+8 = 56 GB, 2026 16+8 = 24 GB, **80 GB total**.
+
+Drive numbers are **already measured** — `5d3e38fa`, 2026-07-24, pager's exact 4.4 MB page,
+O_DIRECT, random offsets. **Do not re-benchmark these.**
+
+```
+mad-lab-2026  WD Black SN750 250GB   QD1 2.13-2.20 | QD4 2.86-2.91 | QD16 2.82-2.89 GB/s
+mad-lab-main  WD_BLACK SN850X 1TB    QD1 0.74-0.91 | QD4 2.38-2.62 | QD16 2.84-2.95 GB/s
+```
+
+The drives are **equivalent at depth**, and the SN750 is **2.5-3x faster at QD1**. 2026's storage is
+not a handicap. Short-burst probes under-measure: post-fix prefill sustains **6.2 GB/s** on main and
+the SN850X is rated ~7, so the QD16 figures are a floor.
+
+| | Residency | Bytes/token off disk | @6.8 GB/s | @9.1 GB/s |
+|---|---|---|---|---|
+| GLM-5.2 Q2 | 80/258 = **31%** | 5.6 GB | 1.2 tok/s | **1.6 tok/s** |
+| Kimi K3 Q1 | 80/545 = **15%** | 8.2 GB | 0.8 tok/s | **1.1 tok/s** |
+
+### 11.4 What the arithmetic ranks
+
+```
+              (number of drives x GB/s per drive)
+tok/s   ~=   ------------------------------------
+              bytes/token x (1 - residency)
+```
+
+1. **A second independent read path — ~2x.** The largest lever available and the only one with no
+   ceiling. Blocked (§11.6).
+2. **Bytes/token** — quantization, expert pruning (REAP), and speculation. GLM ships an MTP head;
+   Kimi does not.
+3. **Residency** — 15-31%. Every VRAM placement decision moves this by single-digit points.
+
+**This retires the "fill the 6900 XT" question.** Its spare ~10.8 GB is **~4% on GLM, ~2% on Kimi**.
+The work is not wasted — the explicit-blocks primitive is how a machine's shard gets named (§11.6) —
+but as a throughput lever it was always going to be noise.
+
+### 11.5 Corrections issued today
+
+1. **Expert-frequency skew is not available on these models.** kmbandy: routed-expert access is
+   close to uniform on everything we intend to run. With uniform access, **any** static residency of
+   X% of the bytes buys X% of the accesses — whole blocks, hot experts, hand-picked, random, all
+   identical. Verified by arithmetic: 2.9 GB held as one complete layer saves ~66 MB/token; the same
+   2.9 GB spread across all layers saves ~71 MB/token. **Whole-layer residency is therefore the
+   correct unit** — equal value, far simpler, and no fused-tensor surgery.
+   **This also kills the hot-expert-pinning argument entirely.**
+2. **It does NOT kill the eviction lever (§5.3 item 2).** Uniform *frequency* and short-range
+   *temporal locality* are independent properties. Measured next-token expert retention was ~33%
+   against a 3.1% chance rate — real structure that caching exploits. An earlier claim today that
+   uniformity voids the LRU-vs-Belady gap was withdrawn.
+3. **Whole-layer *streaming* is dead, at 32x (GLM) / 56x (Kimi).** Distinct from residency: loading a
+   3.44 GB layer to use 107 MB of it. End to end that is ~180 GB/token vs ~5.6 GB, roughly
+   0.04 tok/s vs 1.2. And the selectivity overhead it would remove is already near zero — read
+   amplification is **1.011x** and each fetch is a ~2.9 MB sequential read.
+4. **2026's drive was misidentified as a DRAM-less WD Blue SN570.** It is a **WD Black SN750**, and
+   the KG already recorded that the drives are equivalent at depth. An argument that 2026 is the weak
+   node was built on a model number read off `lsblk` and is withdrawn.
+5. **Storage capacity is not a constraint.** Repeatedly raised today as a blocker; it is a purchase
+   and kmbandy has said so more than once. Stop treating disk space as a stopping condition.
+6. **Search the KG before running any measurement.** The drive benchmark proposed this afternoon has
+   existed since 2026-07-24. Search first; document results when they are produced.
+
+### 11.6 The blocker on the ~2x
+
+Per `5d3e38fa`, already established and unchanged:
+
+> RPC cannot express this. `ggml-rpc-server` executes remote tensor ops on client-allocated tensors
+> — it has no model, no loader, no catalog, so there is nothing there to page. Paging on the 2026
+> side requires each machine running a FULL llama.cpp instance owning its own shard, joined at a
+> layer boundary = **pipeline parallelism, which llama.cpp does not have.**
+
+A contiguous layer split keeps the interconnect trivial: **one ~12-16 KB activation crossing per
+token per direction**, and **zero** cross-machine expert traffic. Split sizing keys on hot storage,
+not layer count: ~**70/30** main:2026.
+
+`--weight-paging-resident-experts <blocks>` (added 2026-07-28, §11.7) is the primitive that names a
+machine's shard. It is not sufficient on its own — pipeline parallelism is the build.
+
+### 11.7 Sequencing
+
+**GLM-5.2 first**, and not only for size: it fits main's existing free space (258 GB vs 336 GB), it
+ships the **MTP head** so the speculation path can be exercised without supplying a draft, and 32x
+selectivity is a gentler test of the pager than 56x. Everything learned transfers to Kimi.
+
+**Open before download:** does llama.cpp support `glm_moe_dsa`? The DSA sparse-attention indexer and
+MLA are not trivial, and a 258 GB download for an unsupported architecture is a wasted day.
+**Check this first.**
+
+The REAP-pruned variant (`0xSero/GLM-5.2-REAP-NU176-526B`, avg 176 of 256 experts, 526B) is a
+~30% cut to read volume with no engineering. Held as a fallback, not the first move.
