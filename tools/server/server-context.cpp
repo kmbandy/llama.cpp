@@ -9,6 +9,7 @@
 #include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
 #include "../src/weight-pager/wp-pager.h"
+#include "../src/weight-pager/wp-pager-set.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -1455,6 +1456,10 @@ private:
         if (params_base.fit_params) {
             if (has_spec) {
                 common_params params_dft = params_base;
+                // The draft model must not inherit the target's resident-expert
+                // placement: it would attempt its own island fill against whatever
+                // VRAM the main model left behind.
+                params_dft.weight_paging_resident_experts = "off";
                 bool measure_model_bytes = true;
 
                 if (has_draft) {
@@ -5283,10 +5288,46 @@ void server_routes::init_routes() {
 
         // Add weight pager metrics if enabled
         if (ctx_server.model_tgt && ctx_server.model_tgt->wp_pager) {
-            auto * pager = ctx_server.model_tgt->wp_pager.get();
-            const auto & st = pager->stats();
-            const double io_gb = (double) st.io_bytes / 1000000000.0;
-            const double io_gbps = st.io_seconds > 0.0 ? io_gb / st.io_seconds : 0.0;
+            // Multi-device paging: these gauges describe the PROCESS, so sum across
+            // every pager. Reporting primary() alone would compile and quietly
+            // under-report whenever more than one device is paging.
+            auto * pagers = ctx_server.model_tgt->wp_pager.get();
+            double wp_n_pages = 0, wp_loaded = 0, wp_pending = 0, wp_async = 0;
+            double wp_page_ins = 0, wp_evictions = 0, wp_prefetch_hits = 0;
+            double wp_prefetch_misses = 0, wp_sync_fallbacks = 0, wp_io_bytes = 0;
+            double wp_io_seconds = 0, wp_lru_hot = 0, wp_lru_pinned = 0;
+            double wp_dense_prefetch = 0, wp_xlayer_sub = 0, wp_xlayer_hit = 0;
+            double wp_rp_set = 0, wp_rp_consumed = 0, wp_rp_discarded = 0;
+            for (const auto & wp_entry : pagers->entries()) {
+                const auto * wp_p = wp_entry.pager.get();
+                if (wp_p == nullptr) {
+                    continue;
+                }
+                const auto & s = wp_p->stats();
+                wp_n_pages          += (double) wp_p->n_pages();
+                wp_loaded           += (double) wp_p->loaded_pages();
+                wp_pending          += (double) wp_p->pending_prefetches();
+                wp_async             = wp_p->async_prefetch_enabled() ? 1.0 : wp_async;
+                wp_page_ins         += (double) s.page_ins;
+                wp_evictions        += (double) s.evictions;
+                wp_prefetch_hits    += (double) s.prefetch_hits;
+                wp_prefetch_misses  += (double) s.prefetch_misses;
+                wp_sync_fallbacks   += (double) s.sync_fallbacks;
+                wp_io_bytes         += (double) s.io_bytes;
+                wp_io_seconds       += s.io_seconds;
+                wp_lru_hot          += (double) s.lru_walk_hot_skips;
+                wp_lru_pinned       += (double) s.lru_walk_pinned_skips;
+                wp_dense_prefetch   += (double) s.dense_prefetch_submitted;
+                wp_xlayer_sub       += (double) s.cross_layer_prefetch_submitted;
+                wp_xlayer_hit       += (double) s.cross_layer_hit_in_ensure;
+                wp_rp_set           += (double) s.routing_ptrs_set;
+                wp_rp_consumed      += (double) s.routing_ptrs_consumed;
+                wp_rp_discarded     += (double) s.routing_ptrs_discarded_unconsumed;
+            }
+            const double io_gb = wp_io_bytes / 1000000000.0;
+            // Summed device-seconds: with concurrent pagers this is aggregate I/O
+            // time, not wall time, so the derived rate is per-device-second.
+            const double io_gbps = wp_io_seconds > 0.0 ? io_gb / wp_io_seconds : 0.0;
             auto add_wp_gauge = [&](const char * name, const char * help, double value) {
                 json m;
                 m["name"]  = name;
@@ -5295,28 +5336,28 @@ void server_routes::init_routes() {
                 all_metrics_def["gauge"].push_back(m);
             };
 
-            add_wp_gauge("llama_weight_pager_pages_total", "Total number of weight pages tracked", (double) pager->n_pages());
-            add_wp_gauge("llama_weight_pager_loaded_pages", "Number of pages currently loaded in VRAM", (double) pager->loaded_pages());
-            add_wp_gauge("llama_weight_pager_in_flight_prefetches", "Number of in-flight prefetch requests", (double) pager->pending_prefetches());
-            add_wp_gauge("llama_weight_pager_async_prefetch_enabled", "Async prefetch enabled (1=true, 0=false)", pager->async_prefetch_enabled() ? 1.0 : 0.0);
-            add_wp_gauge("llama_weight_pager_page_ins_total", "Total weight pages read into VRAM", (double) st.page_ins);
-            add_wp_gauge("llama_weight_pager_evictions_total", "Total weight pager pool evictions", (double) st.evictions);
-            add_wp_gauge("llama_weight_pager_prefetch_hits_total", "Total ensure calls where prefetch was already complete", (double) st.prefetch_hits);
-            add_wp_gauge("llama_weight_pager_prefetch_misses_total", "Total ensure calls where prefetch was missing or incomplete", (double) st.prefetch_misses);
-            add_wp_gauge("llama_weight_pager_sync_fallbacks_total", "Total ensure calls that used synchronous page-in fallback", (double) st.sync_fallbacks);
-            add_wp_gauge("llama_weight_pager_io_bytes_total", "Total weight pager bytes read", (double) st.io_bytes);
-            add_wp_gauge("llama_weight_pager_io_seconds_total", "Total measured weight pager IO seconds", st.io_seconds);
+            add_wp_gauge("llama_weight_pager_pages_total", "Total number of weight pages tracked", wp_n_pages);
+            add_wp_gauge("llama_weight_pager_loaded_pages", "Number of pages currently loaded in VRAM", wp_loaded);
+            add_wp_gauge("llama_weight_pager_in_flight_prefetches", "Number of in-flight prefetch requests", wp_pending);
+            add_wp_gauge("llama_weight_pager_async_prefetch_enabled", "Async prefetch enabled (1=true, 0=false)", wp_async);
+            add_wp_gauge("llama_weight_pager_page_ins_total", "Total weight pages read into VRAM", wp_page_ins);
+            add_wp_gauge("llama_weight_pager_evictions_total", "Total weight pager pool evictions", wp_evictions);
+            add_wp_gauge("llama_weight_pager_prefetch_hits_total", "Total ensure calls where prefetch was already complete", wp_prefetch_hits);
+            add_wp_gauge("llama_weight_pager_prefetch_misses_total", "Total ensure calls where prefetch was missing or incomplete", wp_prefetch_misses);
+            add_wp_gauge("llama_weight_pager_sync_fallbacks_total", "Total ensure calls that used synchronous page-in fallback", wp_sync_fallbacks);
+            add_wp_gauge("llama_weight_pager_io_bytes_total", "Total weight pager bytes read", wp_io_bytes);
+            add_wp_gauge("llama_weight_pager_io_seconds_total", "Total measured weight pager IO seconds", wp_io_seconds);
             add_wp_gauge("llama_weight_pager_io_effective_gb_s", "Effective weight pager read bandwidth in GB/s", io_gbps);
-            add_wp_gauge("llama_weight_pager_lru_walk_hot_skips_total", "Total LRU walk skips of hot slots", (double) st.lru_walk_hot_skips);
-            add_wp_gauge("llama_weight_pager_lru_walk_pinned_skips_total", "Total LRU walk skips of pinned slots", (double) st.lru_walk_pinned_skips);
-            if (st.dense_prefetch_submitted > 0) {
-                add_wp_gauge("llama_weight_pager_dense_prefetch_submitted_total", "Total successful dense forward-prefetch submissions", (double) st.dense_prefetch_submitted);
+            add_wp_gauge("llama_weight_pager_lru_walk_hot_skips_total", "Total LRU walk skips of hot slots", wp_lru_hot);
+            add_wp_gauge("llama_weight_pager_lru_walk_pinned_skips_total", "Total LRU walk skips of pinned slots", wp_lru_pinned);
+            if (wp_dense_prefetch > 0) {
+                add_wp_gauge("llama_weight_pager_dense_prefetch_submitted_total", "Total successful dense forward-prefetch submissions", wp_dense_prefetch);
             }
-            add_wp_gauge("llama_weight_pager_cross_layer_prefetch_submitted_total", "Total successful cross-layer prefetch submissions", (double) st.cross_layer_prefetch_submitted);
-            add_wp_gauge("llama_weight_pager_cross_layer_hit_in_ensure_total", "Total ensure-time hits from cross-layer prefetch candidates", (double) st.cross_layer_hit_in_ensure);
-            add_wp_gauge("llama_weight_pager_routing_ptrs_set_total", "Total routed expert pointer arrays armed", (double) st.routing_ptrs_set);
-            add_wp_gauge("llama_weight_pager_routing_ptrs_consumed_total", "Total routed expert pointer arrays consumed by MMQ/MMVQ", (double) st.routing_ptrs_consumed);
-            add_wp_gauge("llama_weight_pager_routing_ptrs_discarded_unconsumed_total", "Total routed expert pointer arrays discarded before MMQ/MMVQ consumed them", (double) st.routing_ptrs_discarded_unconsumed);
+            add_wp_gauge("llama_weight_pager_cross_layer_prefetch_submitted_total", "Total successful cross-layer prefetch submissions", wp_xlayer_sub);
+            add_wp_gauge("llama_weight_pager_cross_layer_hit_in_ensure_total", "Total ensure-time hits from cross-layer prefetch candidates", wp_xlayer_hit);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_set_total", "Total routed expert pointer arrays armed", wp_rp_set);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_consumed_total", "Total routed expert pointer arrays consumed by MMQ/MMVQ", wp_rp_consumed);
+            add_wp_gauge("llama_weight_pager_routing_ptrs_discarded_unconsumed_total", "Total routed expert pointer arrays discarded before MMQ/MMVQ consumed them", wp_rp_discarded);
         }
 
         std::stringstream prometheus;

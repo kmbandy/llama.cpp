@@ -127,6 +127,23 @@ public:
     const int64_t n_embd = 0;
 };
 
+// pipeline stage input: only the hidden state from the previous stage,
+// carried by ubatch->embd. Unlike llm_graph_input_embd there is no token
+// path -- a token batch is a driver bug and fails loudly in set_input.
+class llm_graph_input_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_hidden(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * hidden = nullptr; // F32 [n_embd, n_batch]
+
+    const int64_t n_embd = 0;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -1096,6 +1113,9 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // pipeline stages without the embedding (first != 0): the previous
+    // stage's hidden state arrives as the batch's embd input
+    ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

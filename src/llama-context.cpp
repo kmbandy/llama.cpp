@@ -15,6 +15,7 @@
 #include "llama-weight-pager.h"
 #include "weight-pager/wp-pager.h"
 #include "weight-pager/wp-eval-cb.h"
+#include "weight-pager/wp-pager-set.h"
 #include "llama-ext.h"
 #include "llama.h"
 

@@ -3,7 +3,7 @@
 // PoolAllocator - a fixed-size VRAM slot ring with LRU eviction.
 //
 // One pool per ggml_backend_buffer_type_t. Phase 1 is single-device by
-// design (the WeightPager rejects multi-device configs at init), but the
+// design (each WeightPager instance owns one device pool), but the
 // API takes a buffer-type so per-device pools are a drop-in extension.
 //
 // Allocation strategy:

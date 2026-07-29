@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-pipeline.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -18,7 +19,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
-#include "weight-pager/wp-pager.h"  // complete type for unique_ptr<wp::WeightPager> dtor
+#include "weight-pager/wp-pager-set.h"  // complete type for unique_ptr dtor
 #include "weight-pager/wp-router.h"
 
 #include "memory-tier/mt-tiered.h"  // mt::llama_memory_tiered wrapper (Phase 2)
@@ -1253,6 +1254,26 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // Stage GGUFs written by wp-stage-split carry their pipeline band as
+    // metadata. Adopt it when the caller did not pass one explicitly. Files
+    // without these keys take the legacy path byte-identically.
+    if (params.pipeline_layer_first == -1 && params.pipeline_layer_last == -1) {
+        int32_t kv_first = -1;
+        int32_t kv_last  = -1;
+        const bool has_first = ml.get_key("pipeline.layer_first", kv_first, false);
+        const bool has_last  = ml.get_key("pipeline.layer_last",  kv_last,  false);
+        if (has_first != has_last) {
+            throw std::runtime_error(format(
+                "pipeline: stage GGUF has only one of pipeline.layer_first/pipeline.layer_last; refusing to load"));
+        }
+        if (has_first) {
+            params.pipeline_layer_first = kv_first;
+            params.pipeline_layer_last  = kv_last;
+            LLAMA_LOG_WARN("%s: pipeline band adopted from GGUF metadata: layers [%d, %d]\n",
+                           __func__, kv_first, kv_last);
+        }
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1286,11 +1307,9 @@ static bool wp_resident_dense_enabled() {
 // (ffn_{up,gate,down}_exps). Same detection that sets
 // llama_weight_page_info::is_expert at load.
 static bool wp_is_routed_expert(const char * name) {
-    const char * p = name ? std::strstr(name, "ffn_") : nullptr;
-    if (p == nullptr) return false;
-    return std::strstr(p, "ffn_up_exps.")   != nullptr ||
-           std::strstr(p, "ffn_gate_exps.") != nullptr ||
-           std::strstr(p, "ffn_down_exps.") != nullptr;
+    // Single definition, shared with the router's placement patterns, so the
+    // two can never drift apart.
+    return wp::is_routed_expert_name(name);
 }
 
 static int wp_find_device_index_by_name(const std::vector<llama_device> & devices, const char * name) {
@@ -1376,6 +1395,30 @@ static size_t wp_ffn_island_reserve_bytes() {
     return reserve_mb * 1024ull * 1024ull;
 }
 
+// Headroom kept free on the island device when FILLING it with resident expert
+// blocks. Deliberately much larger than the island-role reserve above: that one
+// only guards a few hundred MB of norms and shared experts, whereas the fill
+// will happily consume every free byte on a device that must still host the
+// attention island, lm_head, the KV cache, compute buffers and any draft model
+// -- none of which are allocated until after load_tensors returns, and the KV
+// cache in particular depends on a context length that is not known here.
+//
+// So "auto" cannot be provably safe; it is a starting point. Tune with
+// WP_RESIDENT_EXPERTS_RESERVE_MB, or pin an explicit size/block list once the
+// real footprint is known.
+static const size_t WP_RESIDENT_EXPERTS_RESERVE_MB_DEFAULT = 4096;
+
+static size_t wp_resident_experts_reserve_bytes() {
+    size_t reserve_mb = WP_RESIDENT_EXPERTS_RESERVE_MB_DEFAULT;
+    if (const char * e = std::getenv("WP_RESIDENT_EXPERTS_RESERVE_MB")) {
+        long v = std::strtol(e, nullptr, 10);
+        if (v >= 0) {
+            reserve_mb = (size_t) v;
+        }
+    }
+    return reserve_mb * 1024ull * 1024ull;
+}
+
 // Sentinel meaning "no FFN-island device"; a valid device index is always >= 0.
 static const int WP_NO_FFN_ISLAND = -1;
 
@@ -1431,6 +1474,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
+    // Cross-machine pipeline band: refuse to start on any band that would
+    // produce a model which runs and emits garbage (empty band, out-of-range
+    // bounds, one-sided bounds). hparams.n_layer stays GLOBAL -- the band
+    // only filters which tensors/KV this process owns, never renumbers.
+    if (pipeline_band_enabled()) {
+        const llama_pipeline_stage band = llama_pipeline_resolve_band(
+                params.pipeline_layer_first, params.pipeline_layer_last,
+                (int32_t) hparams.n_layer());
+        params.pipeline_layer_first = band.first;
+        params.pipeline_layer_last  = band.last;
+
+        // Only archs whose graph builder iterates the owned band may load a
+        // partial band. Other archs would build a graph over null weights.
+        switch (arch) {
+            case LLM_ARCH_DEEPSEEK2:
+            case LLM_ARCH_DEEPSEEK2OCR:
+            case LLM_ARCH_GLM_DSA:
+            case LLM_ARCH_MISTRAL4:
+                break;
+            default:
+                throw std::runtime_error(format(
+                    "pipeline: arch '%s' does not support layer bands yet "
+                    "(its graph builder does not skip unowned layers)",
+                    llm_arch_name(arch)));
+        }
+
+        LLAMA_LOG_WARN("%s: pipeline band: owning layers [%d, %d] of %d (%s%s)\n",
+                __func__, band.first, band.last, (int) hparams.n_layer(),
+                band.first == 0 ? "head: token_embd " : "",
+                band.last == (int32_t) hparams.n_layer() - 1 ? "tail: output_norm+output" : "");
+    }
+
     // Weight paging and mmap are two different ways to avoid loading the
     // entire model into VRAM/RAM upfront. They step on each other (mmap
     // pre-resolves tensor data pointers; the pager rewrites them per-op,
@@ -1472,6 +1547,61 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     int wp_ffn_island_idx = WP_NO_FFN_ISLAND;
     ggml_backend_buffer_type_t wp_island_buft = nullptr;
     size_t wp_island_bytes = 0;
+    // Blocks whose routed experts are resident on the island device rather than
+    // paged. Declared at load_tensors scope because THREE places must agree on
+    // it: the buft override, is_paged_weight(), and the pager-catalog filter.
+    wp::ResidentExpertPlan wp_resident_experts;
+    // Explicit paged routed-expert bands. This affects placement only; unlike
+    // resident_experts, every covered tensor remains in the pager catalog.
+    wp::DeviceLayerPlan wp_device_layers;
+    if (params.weight_paging_enabled && !devices.empty()) {
+        const char * requested = params.weight_paging_device_layers;
+        if (requested == nullptr || requested[0] == '\0') {
+            requested = std::getenv("WP_DEVICE_LAYERS");
+        }
+        try {
+            for (wp::DeviceLayerRequest req :
+                    wp::parse_device_layer_request(requested)) {
+                const int idx =
+                    wp_find_device_index_by_name(devices, req.device.c_str());
+                if (idx < 0) {
+                    throw std::invalid_argument(
+                        "device-layers: device '" + req.device + "' not found");
+                }
+                for (int block : req.blocks) {
+                    bool found = false;
+                    for (const auto & weight : ml.weights_map) {
+                        int weight_block = -1;
+                        if (wp::is_routed_expert_name(weight.first.c_str()) &&
+                            wp::parse_block_index(
+                                weight.first.c_str(), weight_block) &&
+                            weight_block == block) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        throw std::invalid_argument(
+                            "device-layers: block " + std::to_string(block) +
+                            " has no routed experts");
+                    }
+                }
+                wp_device_layers.add(
+                    std::move(req.device), std::move(req.blocks),
+                    ggml_backend_dev_buffer_type(devices[idx].dev));
+            }
+        } catch (const std::exception & e) {
+            throw std::runtime_error(format(
+                "weight paging: --weight-paging-device-layers: %s", e.what()));
+        }
+        for (const wp::DeviceLayerPlan::Entry & entry :
+                wp_device_layers.entries()) {
+            LLAMA_LOG_WARN(
+                "%s: paged expert band device=%s blocks=%zu pattern=%s\n",
+                __func__, entry.device.c_str(), entry.blocks.size(),
+                entry.pattern.c_str());
+        }
+    }
     if (params.weight_paging_enabled && wp_resident_dense_enabled() && !devices.empty()) {
         const int paging_idx = wp_select_paging_device_index(params, devices);
         const std::vector<int> resident_indices =
@@ -1506,6 +1636,104 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 wp_island_buft = ggml_backend_dev_buffer_type(devices[wp_ffn_island_idx].dev);
             }
         }
+        // Resident routed-expert blocks on the island device. Model-agnostic:
+        // per-block expert bytes are measured from whatever model is loading,
+        // and the budget comes from the device's actual free VRAM.
+        {
+            const char * requested = params.weight_paging_resident_experts;
+            if (requested == nullptr || requested[0] == '\0') {
+                requested = std::getenv("WP_RESIDENT_EXPERTS");
+            }
+            // Requested but unusable is a silent no-op that looks configured --
+            // exactly the kind of thing that wastes a benchmark run. Say so.
+            if (wp_island_buft == nullptr && requested != nullptr && requested[0] != '\0' &&
+                std::strcmp(requested, "off") != 0 && std::strcmp(requested, "none") != 0) {
+                LLAMA_LOG_WARN("%s: resident-experts='%s' ignored: it needs an FFN-island device "
+                               "(pass --weight-paging-ffn-island-device)\n", __func__, requested);
+            }
+        }
+        if (wp_island_buft != nullptr) {
+            const char * requested = params.weight_paging_resident_experts;
+            if (requested == nullptr || requested[0] == '\0') {
+                requested = std::getenv("WP_RESIDENT_EXPERTS");
+            }
+            wp::ResidentExpertRequest req;
+            try {
+                req = wp::parse_resident_expert_request(requested);
+            } catch (const std::exception & e) {
+                throw std::runtime_error(format("weight paging: --weight-paging-resident-experts: %s", e.what()));
+            }
+
+            if (req.enabled) {
+                // Measure the per-block routed-expert footprint: total bytes
+                // (what a resident block costs) and the largest single PAGE it
+                // contributes (what sets the paged pool's uniform slot stride).
+                // The catalog splits each consolidated role tensor into one
+                // sub-page per expert, so one expert is three pages.
+                std::map<int, wp::LayerExpertBytes> per_block;
+                for (const auto & kv : ml.weights_map) {
+                    const char * tname = kv.first.c_str();
+                    int block_idx = -1;
+                    if (!wp::is_routed_expert_name(tname) || !wp::parse_block_index(tname, block_idx)) {
+                        continue;
+                    }
+                    ggml_tensor * t = kv.second.tensor;
+                    const uint64_t nbytes = (uint64_t) ggml_nbytes(t);
+
+                    // Expert axis: ne[2] in the Qwen3-MoE convention, ne[3] in
+                    // some MiniMax-class layouts. Same detection as the catalog
+                    // population below; keep the two in step.
+                    uint64_t n_exp = 0;
+                    if (t->ne[2] > 1) {
+                        n_exp = (uint64_t) t->ne[2];
+                    } else if (t->ne[3] > 1) {
+                        n_exp = (uint64_t) t->ne[3];
+                    }
+                    // No expert axis means the tensor is not split, so it is
+                    // one page in its entirety.
+                    const uint64_t page_bytes = n_exp > 1 ? nbytes / n_exp : nbytes;
+
+                    wp::LayerExpertBytes & e = per_block[block_idx];
+                    e.block_idx = block_idx;
+                    e.bytes    += nbytes;
+                    e.max_page_bytes = std::max(e.max_page_bytes, page_bytes);
+                }
+                std::vector<wp::LayerExpertBytes> per_layer;
+                per_layer.reserve(per_block.size());
+                for (const auto & kv : per_block) {
+                    per_layer.push_back(kv.second);
+                }
+
+                if (per_layer.empty()) {
+                    LLAMA_LOG_WARN("%s: resident-experts requested but the model has no routed-expert "
+                                   "tensors; ignoring\n", __func__);
+                } else {
+                    wp_resident_experts = wp::ResidentExpertPlan::from_blocks(per_layer, req.blocks);
+                    // An explicit list that names blocks the model does not have is
+                    // a typo, not a preference -- and it would silently under-fill.
+                    if (wp_resident_experts.layers().size() != req.blocks.size()) {
+                        throw std::runtime_error(format(
+                            "weight paging: resident-experts named %zu blocks but only %zu have routed "
+                            "experts in this model (requested blocks outside the MoE range?)",
+                            req.blocks.size(), wp_resident_experts.layers().size()));
+                    }
+                    size_t island_free  = 0;
+                    size_t island_total = 0;
+                    ggml_backend_dev_memory(devices[wp_ffn_island_idx].dev, &island_free, &island_total);
+                    const size_t need = wp_island_bytes + wp_resident_experts_reserve_bytes() + wp_resident_experts.bytes();
+                    if (need > island_free) {
+                        throw std::runtime_error(format(
+                            "weight paging: resident-experts blocks %s need %llu bytes on top of the island "
+                            "role, exceeding free VRAM (%zu needed vs %zu free)",
+                            wp_resident_experts.describe().c_str(),
+                            (unsigned long long) wp_resident_experts.bytes(), need, island_free));
+                    }
+                    LLAMA_LOG_WARN("%s: resident-experts: explicit blocks %s -> %llu bytes\n", __func__,
+                                   wp_resident_experts.describe().c_str(),
+                                   (unsigned long long) wp_resident_experts.bytes());
+                }
+            }
+        }
         if (paging_idx >= 0 && !resident_indices.empty()) {
             wp_paging_buft = ggml_backend_dev_buffer_type(devices[paging_idx].dev);
             wp_resident_buft = ggml_backend_dev_buffer_type(devices[resident_indices[0]].dev);
@@ -1529,13 +1757,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         if (wp_paging_buft != nullptr && wp_resident_buft != nullptr) {
+            for (const wp::DeviceLayerPlan::Entry & entry :
+                    wp_device_layers.entries()) {
+                for (int block : entry.blocks) {
+                    if (wp_resident_experts.covers_block(block)) {
+                        throw std::runtime_error(format(
+                            "weight paging: block %d cannot be both resident "
+                            "and assigned to paged device %s",
+                            block, entry.device.c_str()));
+                    }
+                }
+            }
             // Hetero layout (see docs/dev/2026-07-08-wp-hetero-dflash-oracle-plan.md):
             //   experts + shexp -> paging GPU; token_embd -> CPU;
             //   attention/lm_head/... -> resident GPU; layer-home = resident (FA).
             ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
             wp_tensor_buft_overrides = wp::build_router_overrides(
                     wp_paging_buft, wp_resident_buft, cpu_buft, params.tensor_buft_overrides,
-                    wp_resident_devs.size() == 1, wp_island_buft);
+                    wp_resident_devs.size() == 1, wp_island_buft,
+                    &wp_resident_experts, &wp_device_layers);
             ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
             // Without this, llama_context enables pipeline parallelism on
             // multi-device (has_tensor_overrides() was still false) and
@@ -1560,6 +1800,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_WARN("%s: WP_RESIDENT_DENSE router disabled: could not resolve paging/resident bufts\n",
                            __func__);
         }
+    }
+    if (params.weight_paging_enabled && !wp_device_router_enabled &&
+        !wp_device_layers.empty()) {
+        for (const wp::DeviceLayerPlan::Entry & entry :
+                wp_device_layers.entries()) {
+            wp_tensor_buft_overrides.push_back({
+                entry.pattern.c_str(), entry.buft});
+        }
+        if (params.tensor_buft_overrides != nullptr) {
+            for (const auto * override = params.tensor_buft_overrides;
+                 override->pattern != nullptr; ++override) {
+                wp_tensor_buft_overrides.push_back(*override);
+            }
+        }
+        wp_tensor_buft_overrides.push_back({nullptr, nullptr});
+        ml.tensor_buft_overrides = wp_tensor_buft_overrides.data();
+        pimpl->has_tensor_overrides = true;
+        wp_device_router_enabled = true;
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1823,7 +2081,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    const bool partial_load = (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP);
+    // a pipeline band deliberately leaves the other stages' tensors unread
+    const bool partial_load = (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP) ||
+                              pipeline_band_enabled();
     ml.done_getting_tensors(partial_load);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
@@ -1923,6 +2183,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // weight becomes resident (allocated by the manual loop below,
                 // loaded by load_all_data). Must match the catalog filter.
                 if (wp_resident_dense_enabled() && !wp_is_routed_expert(n)) return false;
+                // Routed experts of resident blocks live on the island device as
+                // ordinary tensors: allocated here, loaded by load_all_data, never
+                // paged. MUST match the catalog filter below.
+                if (wp_resident_experts.covers_tensor(n)) return false;
                 return true;  // it's a paged per-layer weight
             };
             const bool paging_on_device_buft =
@@ -2051,16 +2315,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (!weight) { continue; }
                 if (wp_device_router_enabled && ctx_buft != nullptr) {
                     const char * n = ggml_get_name(t);
-                    // Routed experts MUST land on the paging device (so they actually page).
+                    // Routed experts MUST land on their selected paging device.
                     // Non-expert (dense) tensors may be resident on EITHER GPU - the .* override
                     // defaults them to the resident card, but large non-attention tensors
                     // (token_embd/output) are intentionally placed on the paging card to free
                     // resident VRAM. Only fail loudly if an expert escaped the paging device.
-                    if (wp_is_routed_expert(n) && wp_paging_buft != nullptr && ctx_buft != wp_paging_buft) {
+                    const ggml_backend_buffer_type_t expected_paging_buft =
+                        wp_device_layers.buft_for_tensor(n, wp_paging_buft);
+                    if (wp_is_routed_expert(n) && expected_paging_buft != nullptr &&
+                        !wp_resident_experts.covers_tensor(n) &&
+                        ctx_buft != expected_paging_buft) {
                         throw std::runtime_error(format(
                             "weight-paging: routed expert %s landed on %s, expected paging device %s",
                             n, ggml_backend_buft_name(ctx_buft),
-                            ggml_backend_buft_name(wp_paging_buft)));
+                            ggml_backend_buft_name(expected_paging_buft)));
                     }
                 }
                 // MAD-88: skip huge non-block tensors from paging. token_embd
@@ -2127,12 +2395,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // manual loop) and must NOT get a pool placeholder. This filter
                 // MUST agree with is_paged_weight() — both use the routed-expert
                 // predicate — or a tensor is never-allocated-never-loaded.
-                const bool page_this = !wp_resident_dense_enabled() || info.is_expert;
+                // MUST match is_paged_weight() above, including the resident-expert
+                // exclusion: a tensor in one filter but not the other is either
+                // never-allocated-never-loaded or paged-but-unallocated.
+                const bool page_this = (!wp_resident_dense_enabled() || info.is_expert) &&
+                                       !wp_resident_experts.covers_tensor(ggml_get_name(t));
                 if (page_this) {
                     ml.weight_page_infos.push_back(info);
                     // Collect the actual model tensor pointer for the weight pager
                     if (weight_pager) {
                         weight_pager->weight_tensor_ptrs.push_back(t);
+                        weight_pager->weight_tensor_bufts.push_back(ctx_buft);
                     }
                     ctx_has_paged_weights = true;
                 }
@@ -2148,6 +2421,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (!seen) {
                     weight_pager->weight_bufts.push_back(ctx_buft);
                 }
+            }
+        }
+    }
+
+    // Pipeline band: the pager catalog must contain ONLY owned layers. This
+    // follows from create_tensor skipping out-of-band tensors (the catalog is
+    // keyed on the tensors actually loaded), but a disagreement here produces
+    // never-allocated-never-loaded garbage rather than a crash -- so assert
+    // it explicitly instead of assuming it.
+    if (params.weight_paging_enabled && pipeline_band_enabled()) {
+        for (const auto & info : ml.weight_page_infos) {
+            const int32_t blk = llama_pipeline_tensor_block_index(info.name.c_str());
+            if (blk >= 0 && (blk < params.pipeline_layer_first || blk > params.pipeline_layer_last)) {
+                throw std::runtime_error(format(
+                    "pipeline: pager catalog contains out-of-band tensor '%s' (band is [%d, %d])",
+                    info.name.c_str(), params.pipeline_layer_first, params.pipeline_layer_last));
             }
         }
     }
@@ -2198,6 +2487,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // Pipeline band: tensors outside the owned band are simply not created.
+    // The arch loaders store the nullptr and the band-aware graph builders
+    // never touch unowned layers, so this is the single funnel through which
+    // every arch skips out-of-band weights. The predicate is shared with
+    // wp-stage-split (llama_pipeline_owns_tensor) so the tensors a stage
+    // file contains and the tensors the loader creates cannot disagree.
+    if (pipeline_band_enabled()) {
+        const bool duplicated_embd =
+            tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED);
+        if (!llama_pipeline_owns_tensor(
+                params.pipeline_layer_first, params.pipeline_layer_last,
+                (int32_t) hparams.n_layer(), tn.str().c_str(), duplicated_embd)) {
+            return nullptr;
+        }
+    }
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
@@ -2243,6 +2547,23 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+bool llama_model::pipeline_band_enabled() const {
+    return llama_pipeline_band_enabled(params.pipeline_layer_first, params.pipeline_layer_last);
+}
+
+int32_t llama_model::pipeline_layer_first() const {
+    return pipeline_band_enabled() ? params.pipeline_layer_first : 0;
+}
+
+int32_t llama_model::pipeline_layer_last() const {
+    // note: n_layer() excludes the NextN layers -- bands never own those
+    return pipeline_band_enabled() ? params.pipeline_layer_last : (int32_t) hparams.n_layer() - 1;
+}
+
+int32_t llama_model::pipeline_n_owned_layer() const {
+    return pipeline_layer_last() - pipeline_layer_first() + 1;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -2820,6 +3141,23 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_authoritative = true;
                     }
 
+                    // Cross-machine pipeline band: allocate KV only for owned
+                    // layers. Composes with the arch filters above. Absolute
+                    // layer indices are preserved (map_layer_ids still keys on
+                    // the global il), so attention inputs keep addressing the
+                    // real depth.
+                    if (pipeline_band_enabled()) {
+                        const int32_t band_first = pipeline_layer_first();
+                        const int32_t band_last  = pipeline_layer_last();
+                        auto filter_prev = filter;
+                        filter = [filter_prev, band_first, band_last](uint32_t il) {
+                            if ((int32_t) il < band_first || (int32_t) il > band_last) {
+                                return false;
+                            }
+                            return filter_prev ? filter_prev(il) : true;
+                        };
+                    }
+
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
@@ -3099,6 +3437,10 @@ llama_model_params llama_model_default_params() {
         /*.weight_paging_prefetch      =*/ false,
         /*.weight_paging_resident_device =*/ "auto",
         /*.weight_paging_ffn_island_device =*/ nullptr,
+        /*.weight_paging_resident_experts =*/ nullptr,
+        /*.weight_paging_device_layers =*/ nullptr,
+        /*.pipeline_layer_first         =*/ -1,
+        /*.pipeline_layer_last          =*/ -1,
     };
 
     return result;

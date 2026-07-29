@@ -1055,6 +1055,8 @@ bool WeightPager::init(const Config &             cfg,
 
     stats_ = Stats{};
     cfg_ = cfg;
+    device_buft_ = device_buft;
+    device_idx_  = device_idx;
     if (cfg_.n_slots <= 0) cfg_.n_slots         = catalog_.size();  // pin everything if user didn't pick
     if (cfg_.prefetch_depth <= 0) cfg_.prefetch_depth = 4;
     if (cfg_.io_uring_depth <= 0) cfg_.io_uring_depth = cfg_.prefetch_depth;
@@ -1284,7 +1286,11 @@ bool WeightPager::init(const Config &             cfg,
         return false;
     }
 
-    const size_t host_budget = env_size_bytes(kEnvWpHostBudgetBytes);
+    const size_t host_budget_raw = env_size_bytes(kEnvWpHostBudgetBytes);
+    const size_t host_budget =
+        cfg_.host_budget_divisor > 1
+            ? host_budget_raw / cfg_.host_budget_divisor
+            : host_budget_raw;
     if (host_budget > 0) {
         auto host_tier = std::make_unique<HostTier>();
         if (host_tier->init(host_budget, device_idx)) {
@@ -1534,6 +1540,8 @@ void WeightPager::shutdown() {
     async_ensure_enabled_ = false;
 
     initialized_ = false;
+    device_buft_ = nullptr;
+    device_idx_  = -1;
 }
 
 ggml_backend_buffer_t WeightPager::pool_buf(int page_idx) const {
@@ -2574,7 +2582,7 @@ void * WeightPager::ensure(int page_idx) {
         }
         const int slot = page_to_slot_[page_idx];
         pool_.mark_used(slot);
-        return slot_ptr_(slot);
+        return checked_slot_ptr_(page_idx, slot);
     }
 
     // Slot reserved by an in-flight prefetch? Wait for it.
@@ -2623,7 +2631,7 @@ void * WeightPager::ensure(int page_idx) {
                 ++stats_.page_ins_ensure_async;
                 record_page_in_(m_check.size, seconds);
                 page_async_event_[page_idx] = evt;
-                return slot_ptr_(slot);
+                return checked_slot_ptr_(page_idx, slot);
             }
         }
         if (prefetch_.wait_for(page_idx, /*timeout_ms=*/-1)) {
@@ -2643,7 +2651,7 @@ void * WeightPager::ensure(int page_idx) {
             if (cross_layer_candidate && !loaded_before_wait) {
                 cross_layer_prefetch_candidate_[page_idx] = false;
             }
-            return slot_ptr_(slot);
+            return checked_slot_ptr_(page_idx, slot);
         }
         // Prefetch failed; tear down the reservation so sync fallback can
         // start fresh.
@@ -2666,7 +2674,19 @@ void * WeightPager::ensure(int page_idx) {
     ++stats_.pis_from_ensure;
     slot = page_in_sync_(page_idx);
     if (slot < 0) return nullptr;
-    return slot_ptr_(slot);
+    return checked_slot_ptr_(page_idx, slot);
+}
+
+void * WeightPager::checked_slot_ptr_(int page_idx, int slot_idx) const {
+#ifndef NDEBUG
+    GGML_ASSERT(page_idx >= 0 && page_idx < (int) page_buft_.size());
+    GGML_ASSERT(page_buft_[(size_t) page_idx] != nullptr);
+    GGML_ASSERT(device_buft_ != nullptr);
+    GGML_ASSERT(
+        ggml_backend_buft_get_device(page_buft_[(size_t) page_idx]) ==
+        ggml_backend_buft_get_device(device_buft_));
+#endif
+    return slot_ptr_(slot_idx);
 }
 
 void WeightPager::ensure_batch(const std::vector<int> & page_indices,

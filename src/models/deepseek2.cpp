@@ -171,11 +171,25 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
     const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
 
+    // Cross-machine pipeline band (spec: docs/superpowers/specs/2026-07-28-
+    // cross-machine-pipeline-parallelism.md). With no band requested these
+    // resolve to the full range and the graph below is byte-identical to the
+    // pre-pipeline one. Absolute layer indices are preserved: il is always
+    // the global layer index, never renumbered within the band.
+    const int32_t il_first = model.pipeline_layer_first();
+    const int32_t il_last  = model.pipeline_layer_last();
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
     // {n_embd, n_tokens}
-    inpL = build_inp_embd(model.tok_embd);
+    if (model.tok_embd != nullptr) {
+        inpL = build_inp_embd(model.tok_embd);
+    } else {
+        // pipeline stage with first != 0: input is the previous stage's
+        // hidden state, supplied as the batch's embd input
+        inpL = build_inp_hidden();
+    }
 
     // (optional) temperature tuning - used by mistral-large
     ggml_tensor * inp_attn_scale = nullptr;
@@ -191,7 +205,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int32_t il = il_first; il <= il_last; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -365,7 +379,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == il_last && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -423,16 +437,27 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     }
     cur = inpL;
 
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    if (model.output_norm != nullptr) {
+        // tail stage (or a full non-pipeline model): output norm + lm_head
+        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
-    cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
 
-    // lm_head
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+        // lm_head
+        cur = ggml_mul_mat(ctx0, model.output, cur);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+        ggml_build_forward_expand(gf, cur);
+    } else {
+        // pipeline head/middle stage: emit the raw hidden state for the
+        // next stage. The driver requests n_outputs == n_tokens so every
+        // token's hidden state crosses (t_logits intentionally stays null).
+        cb(cur, "result_hidden", -1);
+        res->t_embd = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
 }

@@ -267,6 +267,37 @@ llama_test(test-wp-repack)
 llama_build_and_test(test-memory-tier.cpp)
 target_include_directories(test-memory-tier PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+llama_build_and_test(test-wp-resident-experts.cpp)
+target_include_directories(test-wp-resident-experts PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-wp-multidevice-partition.cpp)
+target_include_directories(test-wp-multidevice-partition PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# cross-machine pipeline band helpers (pure, no ggml dependency)
+add_executable(
+    test-pipeline-band
+    test-pipeline-band.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-pipeline-band PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(test-pipeline-band PRIVATE cxx_std_17)
+llama_test(test-pipeline-band)
+
+# wp-stage-split round-trip: synthetic GGUF -> stage files -> re-read
+add_executable(
+    test-wp-stage-split
+    test-wp-stage-split.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-stage-split/wp-stage-split-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-wp-stage-split PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-stage-split
+)
+target_link_libraries(test-wp-stage-split PRIVATE ggml)
+target_compile_features(test-wp-stage-split PRIVATE cxx_std_17)
+llama_test(test-wp-stage-split)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

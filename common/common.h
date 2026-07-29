@@ -589,6 +589,13 @@ struct common_params {
     bool    weight_paging_prefetch = false;  // enable async prefetch of next layer
     std::string weight_paging_resident_device = "auto"; // dense-resident device name or auto
     std::string weight_paging_ffn_island_device = "off"; // device hosting shared experts and FFN island, or "auto"/"off"
+    std::string weight_paging_resident_experts = "off"; // routed-expert blocks resident on the island device: off/auto/SIZE/BLOCKS
+    std::string weight_paging_device_layers; // explicit paged bands: "ROCm0:0-37;ROCm1:38-74"
+
+    // cross-machine pipeline parallelism: the layer band this process owns
+    // (-1/-1 = own everything, the legacy behaviour)
+    int32_t pipeline_layer_first = -1;
+    int32_t pipeline_layer_last  = -1;
 
     bool single_turn       = false; // single turn chat conversation
 

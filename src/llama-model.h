@@ -9,7 +9,7 @@
 #include "llama-weight-pager.h"
 #include "llama-ml8-registry.h"
 
-namespace wp { class WeightPager; }
+namespace wp { class WeightPagerSet; }
 
 #include <map>
 #include <memory>
@@ -685,11 +685,11 @@ struct llama_model {
     //   inside it is dormant — its init_pool/io_uring paths are not
     //   exercised. Phase 2.0 will delete the type entirely once nothing
     //   in load_tensors needs it.
-    // - `wp_pager` (new): the actual pager. Populated and init'd by
+    // - `wp_pager` (new): owns one actual pager per paging device. Populated by
     //   init_weight_pager in llama.cpp. The eval callback on the
     //   scheduler points at wp::weight_pager_eval_cb.
     std::unique_ptr<llama_weight_pager> weight_pager;
-    std::unique_ptr<wp::WeightPager>    wp_pager;
+    std::unique_ptr<wp::WeightPagerSet> wp_pager;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
@@ -714,6 +714,14 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+
+    // cross-machine pipeline band (src/llama-pipeline.h). When no band was
+    // requested the accessors resolve to the full range [0, n_layer()-1], so
+    // graph builders can use them unconditionally and get today's behaviour.
+    bool    pipeline_band_enabled()  const;
+    int32_t pipeline_layer_first()   const; // resolved
+    int32_t pipeline_layer_last()    const; // resolved
+    int32_t pipeline_n_owned_layer() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

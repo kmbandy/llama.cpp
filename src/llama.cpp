@@ -11,8 +11,9 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-weight-pager.h"
-#include "weight-pager/wp-pager.h"
 #include "weight-pager/wp-file-io.h"
+#include "weight-pager/wp-pager-set.h"
+#include "weight-pager/wp-partition.h"
 
 #include <cerrno>
 #include <climits>
@@ -99,6 +100,7 @@ static bool wp_resident_dense_from_env() {
     return v != nullptr && v[0] == '1';
 }
 
+
 static bool init_weight_pager(llama_model & model, llama_model_loader & ml, const llama_model_params & params) {
     if (!params.weight_paging_enabled) {
         return true;
@@ -107,319 +109,272 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         LLAMA_LOG_WARN("%s: weight paging enabled but no weight page info available\n", __func__);
         return true;
     }
-
-    LLAMA_LOG_INFO("%s: initializing weight pager with %zu pages\n",
-                   __func__, ml.weight_page_infos.size());
-
-    // The legacy llama_weight_pager is created in llama_model_load before
-    // load_tensors so the latter can populate weight_tensor_ptrs. We only
-    // use that vector here — the legacy pager's pool/io_uring paths are
-    // not invoked.
-    if (!model.weight_pager) {
-        throw std::runtime_error("weight pager: legacy weight_pager carrier not initialised before init_weight_pager (caller bug)");
-    }
-    if (model.weight_pager->weight_tensor_ptrs.empty()) {
-        LLAMA_LOG_WARN("%s: no weight tensor pointers collected — nothing to page\n", __func__);
+    if (!model.weight_pager || model.weight_pager->weight_tensor_ptrs.empty()) {
+        LLAMA_LOG_WARN("%s: no weight tensor pointers collected - nothing to page\n", __func__);
         return true;
     }
+    if (model.weight_pager->weight_tensor_ptrs.size() !=
+        model.weight_pager->weight_tensor_bufts.size()) {
+        throw std::runtime_error(
+            "weight pager: tensor/buft carrier size mismatch");
+    }
 
-    // 1. Validate single-device + pick the buft for the pool.
-    //
-    //    Weight tensors themselves have buffer == NULL when paging is on
-    //    (allocator skips them on purpose; see llama-model.cpp ~7995).
-    //    load_tensors records the distinct bufts that own paged weights
-    //    in weight_pager->weight_bufts. Some of those will be host
-    //    (token embedding output, RoPE freqs, etc. that always live on
-    //    CPU); we only care about the GPU-side bufts because that's what
-    //    the pager pool allocates against. Paged tensors are experts-only
-    //    under WP_RESIDENT_DENSE and are single-device by contract.
     std::vector<ggml_backend_buffer_type_t> gpu_bufts;
-    for (auto * b : model.weight_pager->weight_bufts) {
-        if (b == nullptr) continue;
-        if (ggml_backend_buft_is_host(b)) continue;  // CPU/host: not paged
-        gpu_bufts.push_back(b);
+    for (ggml_backend_buffer_type_t buft : model.weight_pager->weight_bufts) {
+        if (buft == nullptr || ggml_backend_buft_is_host(buft)) {
+            continue;
+        }
+        if (std::find(gpu_bufts.begin(), gpu_bufts.end(), buft) == gpu_bufts.end()) {
+            gpu_bufts.push_back(buft);
+        }
     }
     if (gpu_bufts.empty()) {
-        throw std::runtime_error("weight pager: no GPU buffer types found among paged weights — paging requires a GPU device");
+        throw std::runtime_error(
+            "weight pager: no GPU buffer types found among paged weights");
     }
-    if (gpu_bufts.size() > 1) {
-        std::string names;
-        for (size_t i = 0; i < gpu_bufts.size(); ++i) {
-            if (i > 0) names += ", ";
-            names += ggml_backend_buft_name(gpu_bufts[i]);
+
+    auto buft_for_name = [&](const std::string & name) {
+        for (size_t i = 0; i < model.weight_pager->weight_tensor_ptrs.size(); ++i) {
+            ggml_tensor * t = model.weight_pager->weight_tensor_ptrs[i];
+            if (t == nullptr || name != ggml_get_name(t)) {
+                continue;
+            }
+            if (t->buffer != nullptr) {
+                return ggml_backend_buffer_get_type(t->buffer);
+            }
+            return model.weight_pager->weight_tensor_bufts[i];
         }
-        throw std::runtime_error(format(
-            "weight pager: paged weights span multiple GPU devices (%s); "
-            "weight paging requires a single device. Run with one device "
-            "(e.g. --device ROCm0) or without --weight-paging.",
-            names.c_str()));
-    }
-    ggml_backend_buffer_type_t buft = gpu_bufts.front();
+        return (ggml_backend_buffer_type_t) nullptr;
+    };
 
-    // 2. Resolve the integer device index. We need it for hipSetDevice
-    //    inside the GpuTransport. The dev name encodes it, e.g. "ROCm0".
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    if (dev == nullptr) {
-        throw std::runtime_error("weight pager: ggml_backend_buft_get_device returned null");
+    // Build the complete catalog once. Its page_buft_ vector is the canonical
+    // per-page device assignment used for the partition below.
+    wp::WeightPager complete_catalog;
+    for (const llama_weight_page_info & info : ml.weight_page_infos) {
+        ggml_backend_buffer_type_t page_buft = buft_for_name(info.name);
+        if (page_buft == nullptr || ggml_backend_buft_is_host(page_buft)) {
+            throw std::runtime_error(
+                "weight pager: catalog page has no GPU device: " + info.name);
+        }
+        complete_catalog.add_page(
+            info.name, info.file_idx, info.offset, info.size,
+            info.n_experts, page_buft);
     }
-    const int device_idx = parse_backend_dev_idx(ggml_backend_dev_name(dev));
-    if (device_idx < 0) {
-        throw std::runtime_error(format(
-            "weight pager: could not parse device index from name '%s'",
-            ggml_backend_dev_name(dev)));
-    }
-    LLAMA_LOG_INFO("%s: paged weights on device %d (%s), buft=%s\n",
-                   __func__, device_idx, ggml_backend_dev_name(dev),
-                   ggml_backend_buft_name(buft));
 
-    // 3. Build the new pager: catalog + init.
-    model.wp_pager = std::make_unique<wp::WeightPager>();
-    for (const auto & info : ml.weight_page_infos) {
-        ggml_backend_buffer_type_t page_buft = buft;
-        for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
-            if (t != nullptr && info.name == ggml_get_name(t) && t->buffer != nullptr) {
-                page_buft = ggml_backend_buffer_get_type(t->buffer);
+    std::vector<wp::PagePartitionInput> partition_inputs;
+    partition_inputs.reserve((size_t) complete_catalog.n_pages());
+    for (int page_idx = 0; page_idx < complete_catalog.n_pages(); ++page_idx) {
+        partition_inputs.push_back({
+            complete_catalog.page_meta(page_idx).tensor_name,
+            complete_catalog.page_buft(page_idx),
+            true,
+        });
+    }
+    const wp::PartitionedPages partitioned =
+        wp::partition_pages_by_device(partition_inputs);
+    if (partitioned.n_paged != (size_t) complete_catalog.n_pages()) {
+        throw std::runtime_error("weight pager: not every catalog page was partitioned");
+    }
+
+    model.wp_pager = std::make_unique<wp::WeightPagerSet>();
+    for (const wp::PagePartition & partition : partitioned.partitions) {
+        auto buft = (ggml_backend_buffer_type_t) partition.device;
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr) {
+            throw std::runtime_error(
+                "weight pager: partition buffer type has no device");
+        }
+        const int device_idx = parse_backend_dev_idx(ggml_backend_dev_name(dev));
+        if (device_idx < 0) {
+            throw std::runtime_error(format(
+                "weight pager: could not parse device index from '%s'",
+                ggml_backend_dev_name(dev)));
+        }
+        model.wp_pager->add_pager(
+            buft, device_idx, ggml_backend_dev_name(dev));
+    }
+
+    // Re-add each source tensor to exactly one local catalog. Consolidated
+    // parents and all synthesized expert children share page_buft_, so this
+    // preserves their local adjacency and parent indices.
+    for (const llama_weight_page_info & info : ml.weight_page_infos) {
+        const int full_idx = complete_catalog.find_page(info.name);
+        if (full_idx < 0) {
+            throw std::runtime_error(
+                "weight pager: source page missing from complete catalog: " + info.name);
+        }
+        const ggml_backend_buffer_type_t buft =
+            complete_catalog.page_buft(full_idx);
+        wp::WeightPager * target = nullptr;
+        for (wp::WeightPagerSet::Entry & entry : model.wp_pager->entries()) {
+            if (entry.buft == buft) {
+                target = entry.pager.get();
                 break;
             }
         }
-        model.wp_pager->add_page(info.name, info.file_idx, info.offset, info.size, info.n_experts, page_buft);
+        if (target == nullptr) {
+            throw std::runtime_error(
+                "weight pager: no partition owner for page: " + info.name);
+        }
+        target->add_page(
+            info.name, info.file_idx, info.offset, info.size,
+            info.n_experts, buft);
     }
-    LLAMA_LOG_INFO("%s: catalog populated: %d page entries (source had %zu)\n",
-                   __func__, model.wp_pager->n_pages(), ml.weight_page_infos.size());
+
+    model.wp_pager->build_routes((size_t) complete_catalog.n_pages());
+    for (const auto & expected : partitioned.routes) {
+        const wp::WeightPagerSet::Route actual =
+            model.wp_pager->find_page(expected.first);
+        const wp::PagePartitionRoute route = expected.second;
+        if (!actual ||
+            actual.pager != model.wp_pager->entries()[route.partition_idx].pager.get() ||
+            actual.page_idx != route.page_idx) {
+            throw std::runtime_error(
+                "weight pager: partition route mismatch for page: " + expected.first);
+        }
+    }
 
     if (wp_resident_dense_from_env()) {
-        // Under the resident-dense split the catalog must hold ONLY expert-
-        // related pages: routed-expert sub-pages (is_expert), their
-        // consolidated parents (is_consolidated, uncounted), or pinned
-        // entries. A plain-dense page here means is_paged_weight() and the
-        // catalog filter disagree — fail loud rather than silently thrash it.
-        // (Do NOT compare n_pages()==catalog_n_expert_pages(): consolidated
-        // parents inflate n_pages() but are not counted as expert pages.)
-        const int n = model.wp_pager->n_pages();
-        int n_dense = 0;
-        for (int i = 0; i < n; ++i) {
-            const wp::PageMeta & m = model.wp_pager->page_meta(i);
-            if (!m.is_expert && !m.is_consolidated && !m.is_sub_expert && !m.is_pinned) {
-                ++n_dense;
+        for (const wp::WeightPagerSet::Entry & entry : model.wp_pager->entries()) {
+            for (int page_idx = 0; page_idx < entry.pager->n_pages(); ++page_idx) {
+                const wp::PageMeta & meta = entry.pager->page_meta(page_idx);
+                if (!meta.is_expert && !meta.is_consolidated &&
+                    !meta.is_sub_expert && !meta.is_pinned) {
+                    throw std::runtime_error(
+                        "weight pager: resident-dense catalog contains dense page: " +
+                        meta.tensor_name);
+                }
             }
         }
-        if (n_dense > 0) {
-            throw std::runtime_error(format(
-                "weight pager: WP_RESIDENT_DENSE on but %d dense (non-expert) "
-                "pages are in the catalog (n_pages=%d) — the is_paged_weight() "
-                "and catalog filters disagree", n_dense, n));
-        }
-        LLAMA_LOG_WARN("%s: resident_dense=ON  paged_pages=%d (expert_subpages=%d, "
-                       "all routed)  dense tensors resident via normal allocator\n",
-                       __func__, n, model.wp_pager->catalog_n_expert_pages());
     }
 
-    // 4. Determine number of slots.
-    //    - If the user supplied --weight-paging-slots N (positive), honour it.
-    //      No auto-cap: if it's too big, hipMalloc will fail loudly with OOM
-    //      and the user can tune down. Caller-knows-best.
-    //    - Otherwise (auto): aim to keep most catalog entries resident.
-    //      For consolidated MoE that split into per-expert sub-pages
-    //      (MAD-88), the catalog can have tens of thousands of small pages,
-    //      so the slot budget should be computed from the catalog max
-    //      page size (post-split), not the source list (pre-split).
-    int n_slots = params.weight_paging_slots;
-    const bool slots_user_override = (n_slots > 0);
-    if (n_slots <= 0) {
-        // Default target: enough slots to hold the whole catalog if it fits,
-        // or as many as VRAM allows. For non-MoE models the catalog ~= source
-        // list, so this matches the old layer-count default in practice.
-        n_slots = model.wp_pager->n_pages();
-        if (n_slots <= 0) n_slots = 32;
+    const int prefetch_depth = wp_prefetch_depth_from_env();
+    int io_uring_depth = wp_iouring_depth_override_from_env();
+    if (io_uring_depth <= 0) {
+        io_uring_depth = prefetch_depth;
     }
-    if (!slots_user_override) {
-        size_t free_vram = 0, total_vram = 0;
-        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
-        if (total_vram == 0) {
-            LLAMA_LOG_WARN("%s: unable to query free memory on paging device %d\n",
-                           __func__, device_idx);
-        } else {
-            const size_t vram_reserve = 3ULL * 1024 * 1024 * 1024;  // 3 GiB headroom for KV/compute
-            const size_t usable       = (free_vram > vram_reserve) ? (free_vram - vram_reserve) : 0;
-            // Post-split per-expert max — small for MoE catalogs.
-            const size_t max_page_size = model.wp_pager->max_page_size();
-            const int n_slots_fit = (max_page_size > 0) ? (int)(usable / max_page_size) : 0;
-            if (n_slots > n_slots_fit && n_slots_fit >= 1) {
-                LLAMA_LOG_WARN("%s: capping slots %d -> %d to fit free VRAM "
-                               "(%zu MiB free, %zu MiB/slot); pass --weight-paging-slots to override\n",
-                               __func__, n_slots, n_slots_fit,
-                               free_vram / (1024 * 1024), max_page_size / (1024 * 1024));
-                n_slots = n_slots_fit;
+    io_uring_depth = std::max(io_uring_depth, prefetch_depth);
+
+    for (wp::WeightPagerSet::Entry & entry : model.wp_pager->entries()) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(entry.buft);
+        int n_slots = params.weight_paging_slots > 0
+            ? params.weight_paging_slots : entry.pager->n_pages();
+        if (n_slots <= 0) {
+            n_slots = 1;
+        }
+        if (params.weight_paging_slots <= 0) {
+            size_t free_vram = 0;
+            size_t total_vram = 0;
+            ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+            if (total_vram != 0) {
+                const size_t reserve = 3ULL * 1024 * 1024 * 1024;
+                const size_t usable = free_vram > reserve ? free_vram - reserve : 0;
+                const size_t stride = entry.pager->max_page_size();
+                const int fit = stride > 0 ? (int) (usable / stride) : 0;
+                if (fit >= 1) {
+                    n_slots = std::min(n_slots, fit);
+                }
             }
         }
-        if (n_slots < 1) n_slots = 1;
-    }
 
-    // 5. Prepare fds — dup + clear O_DIRECT (B-P3).
-    std::vector<int> fds;
-    fds.reserve(ml.files.size());
-    for (const auto & f : ml.files) {
-        int fd = wp::dup_clear_o_direct(f->file_id());
-        if (fd >= 0) {
-            fds.push_back(fd);
-        } else {
-            LLAMA_LOG_WARN("%s: dup_clear_o_direct failed for file %d\n", __func__, f->file_id());
+        std::vector<int> fds;
+        fds.reserve(ml.files.size());
+        for (const auto & file : ml.files) {
+            const int fd = wp::dup_clear_o_direct(file->file_id());
+            if (fd >= 0) {
+                fds.push_back(fd);
+            }
         }
-    }
-    if (fds.empty()) {
-        model.wp_pager.reset();
-        throw std::runtime_error("weight pager: no usable file descriptors");
-    }
+        if (fds.empty()) {
+            model.wp_pager.reset();
+            throw std::runtime_error("weight pager: no usable file descriptors");
+        }
 
-    // 6. Initialise. Single-device guard: the discovery loop above
-    //    confirms one buft, so we pass {device_idx} as devices_used.
-    wp::WeightPager::Config cfg;
-    cfg.n_slots         = n_slots;
-    cfg.prefetch_depth  = wp_prefetch_depth_from_env();
-    cfg.io_uring_depth  = wp_iouring_depth_override_from_env();
-    if (cfg.io_uring_depth <= 0) {
-        cfg.io_uring_depth = cfg.prefetch_depth;
-    }
-    if (cfg.io_uring_depth < cfg.prefetch_depth) {
-        LLAMA_LOG_WARN("%s: WP_IOURING_DEPTH effective value %d is below prefetch_depth %d; raising to %d\n",
-                       __func__, cfg.io_uring_depth, cfg.prefetch_depth, cfg.prefetch_depth);
-        cfg.io_uring_depth = cfg.prefetch_depth;
-    }
-    cfg.prefer_async_io = params.weight_paging_prefetch;
+        wp::WeightPager::Config cfg;
+        cfg.n_slots             = n_slots;
+        cfg.prefetch_depth      = prefetch_depth;
+        cfg.io_uring_depth      = io_uring_depth;
+        cfg.prefer_async_io     = params.weight_paging_prefetch;
+        cfg.host_budget_divisor = model.wp_pager->size();
 
-    // Vulkan indexes weight buffers as arrays of quant blocks, so every pool
-    // slot offset must be an exact multiple of the block size or an expert's
-    // base cannot be expressed as a block index. Take the largest block size
-    // over the paged tensors. Other backends address by raw byte pointer and
-    // want no extra constraint.
-    {
-        const char * buft_name = ggml_backend_buft_name(buft);
+        const char * buft_name = ggml_backend_buft_name(entry.buft);
         if (buft_name != nullptr && std::strstr(buft_name, "Vulkan") != nullptr) {
-            // LCM, not max: mixed-quant GGUFs (e.g. Unsloth "UD" files) carry
-            // several block sizes among the paged tensors, and a slot offset has
-            // to be an exact multiple of EVERY one of them. Q6_K is 210 B and
-            // Q8_0 is 34 B; aligning to 210 alone leaves Q8_0 experts
-            // unaddressable.
-            size_t blk = 1;
-            for (const ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
-                if (t != nullptr) {
-                    const size_t ts = ggml_type_size(t->type);
-                    if (ts > 0) {
-                        blk = blk / std::gcd(blk, ts) * ts;
+            size_t alignment = 1;
+            for (size_t i = 0; i < model.weight_pager->weight_tensor_ptrs.size(); ++i) {
+                const ggml_tensor * t = model.weight_pager->weight_tensor_ptrs[i];
+                if (t != nullptr && model.weight_pager->weight_tensor_bufts[i] == entry.buft) {
+                    const size_t type_size = ggml_type_size(t->type);
+                    if (type_size > 0) {
+                        alignment = alignment / std::gcd(alignment, type_size) * type_size;
                     }
                 }
             }
-            cfg.block_alignment = blk;
-            LLAMA_LOG_INFO("%s: Vulkan backend — pool slot block alignment %zu B (lcm over paged types)\n",
-                           __func__, blk);
+            cfg.block_alignment = alignment;
         }
+
+        if (!entry.pager->init(
+                cfg, entry.buft, entry.device_idx, std::move(fds),
+                {entry.device_idx})) {
+            model.wp_pager.reset();
+            throw std::runtime_error(format(
+                "weight pager: init failed for device %s with %d slots",
+                entry.device_name.c_str(), n_slots));
+        }
+        LLAMA_LOG_INFO(
+            "%s: device pager ready: %s pages=%d slots=%d max_page=%zu\n",
+            __func__, entry.device_name.c_str(), entry.pager->n_pages(),
+            n_slots, entry.pager->max_page_size());
     }
 
-    LLAMA_LOG_INFO("%s: weight pager depths: prefetch_depth=%d, io_uring_depth=%d\n",
-                   __func__, cfg.prefetch_depth, cfg.io_uring_depth);
-
-    if (!model.wp_pager->init(cfg, buft, device_idx,
-                              std::move(fds),
-                              /*devices_used=*/{device_idx})) {
-        model.wp_pager.reset();
-        throw std::runtime_error(format(
-            "weight pager: wp::WeightPager::init failed (device=%d, n_slots=%d)",
-            device_idx, n_slots));
-    }
-
-    // 7. Set placeholder data on every paged tensor so the graph allocator
-    //    skips them. Use the pool's actual VRAM base as the placeholder —
-    //    if a kernel ever runs against a tensor that the eval callback
-    //    failed to patch, it'll read from a real device address (slot 0
-    //    of the pool) rather than a host address that looks like a GPU
-    //    pointer and produces garbage. The data is still wrong in that
-    //    case (slot 0 doesn't contain the right tensor) but at least the
-    //    GPU doesn't fault and we get diagnosable garbage.
-    {
-        ggml_backend_buffer_t pool_buf = model.wp_pager->pool_buf();
-        void * placeholder = pool_buf ? ggml_backend_buffer_get_base(pool_buf) : nullptr;
+    size_t n_placed = 0;
+    for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
+        if (t == nullptr || t->data != nullptr) {
+            continue;
+        }
+        const wp::WeightPagerSet::Route route =
+            model.wp_pager->find_page(ggml_get_name(t));
+        if (!route) {
+            continue;
+        }
+        ggml_backend_buffer_t pool_buf = route.pager->pool_buf(route.page_idx);
+        void * placeholder =
+            pool_buf != nullptr ? ggml_backend_buffer_get_base(pool_buf) : nullptr;
         if (placeholder == nullptr) {
-            throw std::runtime_error("weight pager: pool_buf has null base — pool init bug");
+            throw std::runtime_error("weight pager: pool buffer has null base");
         }
-        size_t n_placed  = 0;
-        size_t n_skipped_not_in_catalog = 0;
-        for (ggml_tensor * t : model.weight_pager->weight_tensor_ptrs) {
-            if (!t || t->data != nullptr) continue;
-            // Only assign the placeholder to tensors that actually live in the
-            // pager catalog — i.e., ones eval_cb will subsequently patch with a
-            // real slot pointer. Tensors NOT in the catalog (token embed, lm head,
-            // anything classified as host-resident) must keep data == nullptr so
-            // the proper buffer allocator can assign their real data later;
-            // otherwise they end up reading the placeholder forever (= slot 0
-            // base = whatever page lands in slot 0). That produces uniform
-            // garbage output (PPL == vocab_size).
-            if (model.wp_pager->find_page(ggml_get_name(t)) < 0) {
-                ++n_skipped_not_in_catalog;
-                continue;
-            }
-            t->data   = placeholder;
-            // Anchor paged weights to the pool's device buffer so the backend
-            // scheduler can name a backend for them (buffer_id) even when a
-            // weight is reached only as a reshape/view's view_src — a leaf with
-            // buffer==NULL whose sole consumer is a view op falls through every
-            // split_graph assignment pass and gets buffer_id -1, tripping the
-            // gallocr assert (DeepSeek V4 wo_a = ggml_reshape_3d(...)->mul_mat).
-            // gallocr still skips it (is_allocated checks data != NULL first);
-            // eval_cb re-patches ->data (and already sets ->buffer = pool_buf)
-            // per op. This just brings load-time state to the post-first-decode
-            // steady state the eval_cb already produces.
-            t->buffer = pool_buf;
-            ++n_placed;
-        }
-        LLAMA_LOG_INFO("%s: placeholder data set on %zu weight tensors (placeholder=%p, skipped %zu not in catalog)\n",
-                       __func__, n_placed, placeholder, n_skipped_not_in_catalog);
+        t->data   = placeholder;
+        t->buffer = pool_buf;
+        ++n_placed;
     }
 
-    // Host copies of DS4 hash-layer tid2eid tables so draft-token expert
-    // prefetch can resolve experts without a GPU round-trip. Tables are
-    // small (I32 [n_vocab x n_expert_used] ~3 MiB/layer x ~3 layers).
-    {
-        int n_reg = 0;
-        int n_seen = 0;
-        for (int il = 0; il < (int) model.layers.size(); ++il) {
-            ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
-            if (t == nullptr) {
-                continue;
-            }
-            ++n_seen;
-            if (t->data == nullptr) {
-                LLAMA_LOG_WARN("%s: tid2eid blk.%d has null data; skip host register\n",
-                               __func__, il);
-                continue;
-            }
-            // Layout matches create_tensor({n_expert_used, n_vocab}): ne[0]=n_used, ne[1]=n_vocab.
-            if (t->type != GGML_TYPE_I32) {
-                LLAMA_LOG_WARN("%s: tid2eid blk.%d type=%d not I32; skip host register\n",
-                               __func__, il, (int) t->type);
-                continue;
-            }
-            const int n_used  = (int) t->ne[0];
-            const int n_vocab = (int) t->ne[1];
-            if (n_used <= 0 || n_vocab <= 0) {
-                continue;
-            }
-            const size_t nbytes = (size_t) n_used * (size_t) n_vocab * sizeof(int32_t);
-            std::vector<int32_t> host(nbytes / sizeof(int32_t));
-            if (t->buffer != nullptr) {
-                ggml_backend_tensor_get(t, host.data(), 0, nbytes);
-            } else {
-                std::memcpy(host.data(), t->data, nbytes);
-            }
-            model.wp_pager->register_tid2eid_host(il, n_used, n_vocab, host.data());
-            ++n_reg;
+    int n_tid2eid = 0;
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
+        if (t == nullptr || t->data == nullptr || t->type != GGML_TYPE_I32) {
+            continue;
         }
-        LLAMA_LOG_WARN("%s: tid2eid host register: seen=%d registered=%d (draft hash-layer prefetch)\n",
-                       __func__, n_seen, n_reg);
+        const int n_used = (int) t->ne[0];
+        const int n_vocab = (int) t->ne[1];
+        if (n_used <= 0 || n_vocab <= 0) {
+            continue;
+        }
+        const size_t nbytes =
+            (size_t) n_used * (size_t) n_vocab * sizeof(int32_t);
+        std::vector<int32_t> host(nbytes / sizeof(int32_t));
+        if (t->buffer != nullptr) {
+            ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+        } else {
+            std::memcpy(host.data(), t->data, nbytes);
+        }
+        model.wp_pager->register_tid2eid_host(
+            il, n_used, n_vocab, host.data());
+        ++n_tid2eid;
     }
 
-    LLAMA_LOG_INFO("%s: weight pager READY (device=%d, n_slots=%d, prefetch=%s)\n",
-                   __func__, device_idx, n_slots,
-                   cfg.prefer_async_io ? "async" : "sync");
+    LLAMA_LOG_INFO(
+        "%s: weight pager ready: devices=%zu pages=%d placeholders=%zu tid2eid=%d\n",
+        __func__, model.wp_pager->size(), complete_catalog.n_pages(),
+        n_placed, n_tid2eid);
     return true;
 }
 
