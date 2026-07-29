@@ -133,6 +133,19 @@ public:
     // pager populated only with pinned entries). Callers must handle that.
     std::map<size_t, int> page_size_histogram() const;
 
+    // Per-size, per-block slottable page counts: size -> (block_idx -> count).
+    // Same page filter as page_size_histogram (expert, not pinned, not the
+    // consolidated parent); keys are likewise RAW un-aligned payload sizes.
+    //
+    // This is what the pool's pre-carve solver needs to compute a per-class
+    // PIN FLOOR. A whole ensure_batch is pinned at once and alloc_slot will
+    // not evict a pinned slot, so a class must have at least as many slots as
+    // the largest number of its pages any single block owns -- otherwise a
+    // wide batch over that block exhausts the class and the allocator aborts.
+    // Demand share alone cannot see this: on GLM-5.2 the largest class is
+    // 1.75% of all pages but 256 of them live in one block.
+    std::map<size_t, std::map<int, int>> page_size_layer_counts() const;
+
     // True if any page is an MoE expert tensor — i.e. the model is sparse
     // MoE and downstream policy can use routing-aware prefetch / eviction.
     bool has_experts() const { return n_expert_pages_ > 0; }

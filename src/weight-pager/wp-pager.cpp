@@ -1111,8 +1111,15 @@ bool WeightPager::init(const Config &             cfg,
     // are no expert pages to page anyway.
     const std::map<size_t, int> page_size_hist = catalog_.page_size_histogram();
 
+    // Per-block counts drive the per-class PIN FLOOR. Without them the solver
+    // sizes classes by demand share alone, which under-provisions any class
+    // concentrated in a few blocks and aborts on a wide batch (GLM-5.2: the
+    // 6.375 MiB class is 1.75% of pages but 256 of them sit in one block).
+    const std::map<size_t, std::map<int, int>> page_size_layers =
+        catalog_.page_size_layer_counts();
+
     if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx,
-                    cfg_.block_alignment, &page_size_hist)) {
+                    cfg_.block_alignment, &page_size_hist, &page_size_layers)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: pool allocation failed\n");
         restore_disable_graphs_env_();
         return false;

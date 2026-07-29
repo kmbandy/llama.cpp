@@ -457,6 +457,162 @@ int test_precarve_glm_shaped_distribution() {
     return fails;
 }
 
+
+// ---------------------------------------------------------------------------
+// 5. THE PIN FLOOR -- the case every earlier test in this file missed.
+//
+// The existing GLM-shaped test fills the small class and then makes ONE large
+// request. That passes with a single large slot, so it could never see the real
+// failure: a whole ensure_batch is PINNED at once and alloc_slot will not evict
+// a pinned slot, so the class must hold a whole block's expert union
+// simultaneously.
+//
+// Shape below is GLM-5.2 scaled down 16x, preserving the ratio that matters:
+//   large class (256 B): 64 pages, concentrated in 4 blocks at 16 each
+//   small class ( 64 B): 3584 pages, spread over 56 blocks at 64 each
+// The large class is 1.75% of all pages -- exactly GLM's share -- so demand
+// share alone buys it ~4 slots while one block needs 16 pinned at once.
+// ---------------------------------------------------------------------------
+namespace {
+
+// hist + per-block counts for the scaled-down GLM shape.
+void make_concentrated_shape(std::map<size_t, int> & hist,
+                             std::map<size_t, std::map<int, int>> & layers) {
+    hist.clear();
+    layers.clear();
+    // Large class: 4 blocks x 16 pages.
+    for (int b = 0; b < 4; ++b) {
+        layers[256][b] = 16;
+        hist[256]     += 16;
+    }
+    // Small class: 56 blocks x 64 pages.
+    for (int b = 4; b < 60; ++b) {
+        layers[64][b] = 64;
+        hist[64]     += 64;
+    }
+}
+
+const int kBlockUnion = 16;   // pages of the large class owned by one block
+
+}  // namespace
+
+int test_pin_floor_holds_a_whole_block() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    std::map<size_t, int> hist;
+    std::map<size_t, std::map<int, int>> layers;
+    make_concentrated_shape(hist, layers);
+
+    // Arena = 68 * 256 = 17408 B.
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, /*n_slots=*/68, /*slot_size=*/256,
+                     /*device_idx=*/-1, /*extra_alignment=*/1, &hist, &layers),
+           "precarve init with layer counts");
+    EXPECT(pool.size_class_precarved(), "precarved flag set");
+
+    std::map<size_t, int> got;
+    for (int i = 0; i < pool.n_slots(); ++i) got[pool.slot_size(i)] += 1;
+
+    // The floor: the large class must hold one block's whole union.
+    EXPECT(got[256] >= kBlockUnion, "large class has at least one block's union of slots");
+    // The small class must still get the bulk of the pool -- a floor that ate
+    // the arena would be its own regression.
+    EXPECT(got[64] > got[256], "small class still gets the majority of slots");
+
+    size_t carved = 0;
+    for (int i = 0; i < pool.n_slots(); ++i) carved += pool.slot_size(i);
+    EXPECT(carved <= pool.pool_size(), "carved <= arena");
+
+    // THE ACTUAL CRASH: allocate a whole block's worth of the large class and
+    // PIN each one before taking the next, exactly as ensure_batch does. With
+    // demand-share sizing this returns -1 partway through and the caller
+    // aborts. Warm the small class first so the pool is under real pressure.
+    for (int i = 0; i < got[64]; ++i) {
+        (void) pool.alloc_slot(64);
+    }
+    int pinned_ok = 0;
+    for (int i = 0; i < kBlockUnion; ++i) {
+        int s = pool.alloc_slot(256);
+        if (s < 0) break;
+        pool.pin_slot(s);
+        ++pinned_ok;
+    }
+    EXPECT_EQ_INT(pinned_ok, kBlockUnion,
+                  "a whole block's union of the large class allocates while pinned");
+    EXPECT_EQ_INT(pool.n_pinned(), kBlockUnion, "all of them stayed pinned");
+    return fails;
+}
+
+// Same shape, layer counts withheld: documents that demand-share sizing alone
+// under-provisions the concentrated class. This is the witness for the bug --
+// if it ever starts passing, the floor is being applied by some other path and
+// this test has stopped proving anything.
+int test_without_layer_counts_underprovisions() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    std::map<size_t, int> hist;
+    std::map<size_t, std::map<int, int>> layers;
+    make_concentrated_shape(hist, layers);
+
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, 68, 256, -1, 1, &hist, /*layer_counts=*/nullptr),
+           "precarve init without layer counts");
+
+    std::map<size_t, int> got;
+    for (int i = 0; i < pool.n_slots(); ++i) got[pool.slot_size(i)] += 1;
+    EXPECT(got[256] < kBlockUnion,
+           "without layer counts the concentrated class is under-provisioned "
+           "(this is the bug; the floor test above is the fix)");
+
+    // And it fails exactly the way GLM did: -1 partway through a pinned batch.
+    for (int i = 0; i < got[64]; ++i) (void) pool.alloc_slot(64);
+    int pinned_ok = 0;
+    for (int i = 0; i < kBlockUnion; ++i) {
+        int s = pool.alloc_slot(256);
+        if (s < 0) break;
+        pool.pin_slot(s);
+        ++pinned_ok;
+    }
+    EXPECT(pinned_ok < kBlockUnion, "pinned batch runs out of the class (the GLM abort)");
+    return fails;
+}
+
+// Floors that cannot fit must abandon the pre-carve, not carve a pool that will
+// abort on the GPU minutes later. The uniform path still works in that case.
+int test_pin_floor_too_big_falls_back() {
+    int fails = 0;
+    ScopedEnv env("WP_SIZE_CLASS_SLOTS");
+    setenv("WP_SIZE_CLASS_SLOTS", "1", 1);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    if (!buft) { EXPECT(false, "cpu buffer_type unavailable"); return fails; }
+
+    std::map<size_t, int> hist;
+    std::map<size_t, std::map<int, int>> layers;
+    make_concentrated_shape(hist, layers);
+
+    // Arena = 4 * 256 = 1024 B; the large class floor alone needs 16*256 = 4096.
+    wp::PoolAllocator pool;
+    EXPECT(pool.init(buft, 4, 256, -1, 1, &hist, &layers),
+           "init succeeds by falling back");
+    EXPECT(!pool.size_class_precarved(), "pre-carve abandoned when floors do not fit");
+
+    // The fallback must still serve a large request rather than return -1.
+    int s = pool.alloc_slot(256);
+    EXPECT(s >= 0, "fallback path still serves the largest request");
+    return fails;
+}
+
 }  // namespace
 
 int main() {
@@ -470,6 +626,9 @@ int main() {
         { "precarve_large_request_after_small_fill", test_precarve_large_request_after_small_fill },
         { "precarve_eviction_within_class_and_pins", test_precarve_eviction_within_class_and_pins },
         { "precarve_glm_shaped_distribution",      test_precarve_glm_shaped_distribution      },
+        { "pin_floor_holds_a_whole_block",         test_pin_floor_holds_a_whole_block         },
+        { "without_layer_counts_underprovisions",  test_without_layer_counts_underprovisions  },
+        { "pin_floor_too_big_falls_back",          test_pin_floor_too_big_falls_back          },
     };
     for (const auto & t : tests) {
         std::fprintf(stderr, "RUN  test_%s\n", t.name);

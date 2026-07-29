@@ -83,7 +83,8 @@ public:
               size_t                     slot_size,
               int                        device_idx      = -1,
               size_t                     extra_alignment = 1,
-              const std::map<size_t, int> * page_size_hist = nullptr);
+              const std::map<size_t, int> * page_size_hist = nullptr,
+              const std::map<size_t, std::map<int, int>> * page_size_layer_counts = nullptr);
 
     // Register the eviction callback. Optional; default is a no-op.
     void set_eviction_callback(EvictionCallback cb) { on_evict_ = std::move(cb); }
@@ -281,7 +282,8 @@ private:
     // free_by_class_ contiguously, sets n_slots_, and marks precarved_=true.
     // Returns false if the histogram is empty (caller should fall back to
     // the legacy on-demand carve path).
-    bool   carve_size_classes_(const std::map<size_t, int> & hist);
+    bool   carve_size_classes_(const std::map<size_t, int> & hist,
+                               const std::map<size_t, std::map<int, int>> * layer_counts);
 };
 
 // ---------------------------------------------------------------------------

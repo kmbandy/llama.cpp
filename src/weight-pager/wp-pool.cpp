@@ -136,7 +136,8 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
                          size_t                     slot_size,
                          int                        device_idx,
                          size_t                     extra_alignment,
-                         const std::map<size_t, int> * page_size_hist) {
+                         const std::map<size_t, int> * page_size_hist,
+                         const std::map<size_t, std::map<int, int>> * page_size_layer_counts) {
     if (buf_ != nullptr) {
         LLAMA_LOG_WARN("wp::PoolAllocator: init called twice — ignoring second call\n");
         return false;
@@ -269,7 +270,7 @@ bool PoolAllocator::init(ggml_backend_buffer_type_t buft,
     // never carves. On failure (empty histogram) we keep the legacy on-
     // demand carve path (n_slots_ stays 0, high_water_ grows on alloc).
     if (size_class_slots_ && page_size_hist != nullptr) {
-        if (!carve_size_classes_(*page_size_hist)) {
+        if (!carve_size_classes_(*page_size_hist, page_size_layer_counts)) {
             LLAMA_LOG_WARN("wp::PoolAllocator::init: size-class pre-carve skipped "
                            "(empty histogram); falling back to on-demand carve\n");
         }
@@ -722,7 +723,8 @@ void PoolAllocator::decay_after_eviction_() {
 // we carved. A single-class histogram reproduces the uniform layout:
 // avg == s == slot_size_, K = A/s = n_slots, one class with k = K slots at
 // stride slot_size_ -> identical to the fixed-slot path.
-bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist) {
+bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist,
+                                       const std::map<size_t, std::map<int, int>> * layer_counts) {
     if (hist.empty() || arena_size_ == 0 || slot_alignment_ == 0) {
         return false;
     }
@@ -766,38 +768,98 @@ bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist) {
         return false;
     }
 
-    // 3. Total slots K that fit in the arena budget A.
-    const double A = (double) arena_size_;
-    double K_real = A / avg;
-    if (K_real < 1.0) {
-        K_real = 1.0;
+    // 3. Per-class PIN FLOOR.
+    //
+    //    This is the correction to the first cut of this solver, which sized
+    //    every class purely by demand share. Demand share is the wrong axis.
+    //    A whole ensure_batch is pinned at once (wp-pager.cpp pins each page
+    //    as it is allocated, before allocating the next), and alloc_slot
+    //    refuses to evict a pinned slot -- so the binding constraint is the
+    //    peak number of pages of a class pinned SIMULTANEOUSLY, not how often
+    //    the class is requested.
+    //
+    //    That peak is bounded by one block's expert union: an ensure_batch
+    //    covers one tensor of one block, and in the worst case (a wide prefill
+    //    batch) the union is every expert in the block. So the floor for a
+    //    class is the largest number of its pages that any single block owns.
+    //
+    //    Measured on GLM-5.2: the 6.375 MiB class is 1.75% of all pages
+    //    (-> ~72 slots by demand share) but lives in exactly 4 blocks at 256
+    //    pages each. Every run aborted the moment a wide batch reached block 8.
+    //
+    //    layer_counts == nullptr (unit tests, callers that only have a plain
+    //    histogram) leaves every floor at 0, reproducing the previous purely
+    //    proportional behaviour exactly.
+    std::vector<int> floor_c(plan.size(), 0);
+    if (layer_counts != nullptr) {
+        // Merge per-block counts into ALIGNED classes first, then take the max
+        // over blocks. Two raw sizes can coalesce into one class; taking the
+        // max before merging would understate a block that owns both.
+        std::map<int, std::map<size_t, int>> per_block;   // block -> class -> count
+        for (const auto & kv : *layer_counts) {
+            size_t cls = align_up(kv.first, slot_alignment_);
+            if (cls == 0)         continue;
+            if (cls > slot_size_) cls = slot_size_;
+            for (const auto & bc : kv.second) {
+                per_block[bc.first][cls] += bc.second;
+            }
+        }
+        std::map<size_t, int> floor_by_class;
+        for (const auto & b : per_block) {
+            for (const auto & c : b.second) {
+                int & f = floor_by_class[c.first];
+                if (c.second > f) f = c.second;
+            }
+        }
+        for (size_t i = 0; i < plan.size(); ++i) {
+            auto it = floor_by_class.find(plan[i].class_size);
+            if (it != floor_by_class.end()) {
+                floor_c[i] = it->second;
+                // A block cannot own more pages of a class than exist.
+                if (floor_c[i] > plan[i].n_pages) floor_c[i] = plan[i].n_pages;
+            }
+        }
     }
-    // Cap K at total_pages: more slots than pages is pure waste (free slots
-    // cost VRAM that could serve other tiers). The arena still allocates A;
-    // the unused tail stays in high_water_/arena headroom. The auto-sizer
-    // sizes A so that K == total_pages exactly when every page fits.
-    if (K_real > (double) total_pages) {
-        K_real = (double) total_pages;
+
+    // 4. The floors must fit. If they do not, this arena cannot serve a wide
+    //    batch under size classes at all -- carving anyway would just move the
+    //    abort to run time, on the GPU, minutes in. Abandon the pre-carve and
+    //    let the caller fall back to the uniform path, which is what works
+    //    today (uniform slots are all max-size, so any page fits any slot).
+    long long floor_bytes = 0;
+    for (size_t i = 0; i < plan.size(); ++i) {
+        floor_bytes += (long long) floor_c[i] * (long long) plan[i].class_size;
     }
-    const long long K = (long long) llround(K_real);
-    if (K < 1) {
+    if (floor_bytes > (long long) arena_size_) {
+        LLAMA_LOG_WARN("wp::PoolAllocator::carve_size_classes_: per-class pin floors need "
+                       "%.1f MiB but the arena is %.1f MiB; abandoning pre-carve and falling "
+                       "back to uniform slots. Raise the paging budget to use size classes.\n",
+                       (double) floor_bytes / 1048576.0, (double) arena_size_ / 1048576.0);
         return false;
     }
 
-    // 4. Per-class slot counts: k_c = max(1, round(f_c * K)).
+    // 5. Distribute what is left of the arena by demand share, on top of the
+    //    floors. Cap each class at its own page count -- more slots than pages
+    //    of that class is pure waste (those bytes could serve another class).
+    const double R     = (double) arena_size_ - (double) floor_bytes;
+    const double K_rem = (R > 0.0) ? (R / avg) : 0.0;
+
     std::vector<int> kc(plan.size(), 0);
     long long total_k = 0;
     for (size_t i = 0; i < plan.size(); ++i) {
         const double f = (double) plan[i].n_pages / (double) total_pages;
-        long long k = (long long) llround(f * (double) K);
-        if (k < 1) k = 1;                 // every class gets >= 1 slot
+        long long k = (long long) floor_c[i] + (long long) llround(f * K_rem);
+        if (k > plan[i].n_pages) k = plan[i].n_pages;   // no more slots than pages
+        if (k < floor_c[i])      k = floor_c[i];        // the floor outranks the cap
+        if (k < 1)               k = 1;                 // every class gets >= 1 slot
         kc[i] = (int) k;
         total_k += k;
     }
 
-    // 5. Trim if rounding overshoots the arena. Pick the class whose removal
-    //    of one slot reclaims the most bytes and has > 1 slot, so we never
-    //    drop a class below its guaranteed 1. Repeat until it fits.
+    // 6. Trim if rounding overshoots the arena. Pick the class whose removal
+    //    of one slot reclaims the most bytes and still has a slot to spare
+    //    above its floor (and above the >= 1 invariant). Repeat until it fits.
+    //    Dropping a class below its floor would reintroduce the abort.
     auto total_bytes = [&]() -> long long {
         long long b = 0;
         for (size_t i = 0; i < plan.size(); ++i) b += (long long) kc[i] * (long long) plan[i].class_size;
@@ -807,13 +869,14 @@ bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist) {
         int    best_i  = -1;
         size_t best_sz = 0;
         for (size_t i = 0; i < plan.size(); ++i) {
-            if (kc[i] <= 1) continue;            // protect the >= 1 invariant
+            const int keep = floor_c[i] > 1 ? floor_c[i] : 1;
+            if (kc[i] <= keep) continue;         // protect floor / >= 1 invariant
             if (plan[i].class_size > best_sz) {
                 best_sz = plan[i].class_size;
                 best_i  = (int) i;
             }
         }
-        if (best_i < 0) break;                  // every class at 1; can't trim
+        if (best_i < 0) break;                  // everything at its floor; can't trim
         --kc[best_i];
         --total_k;
     }
@@ -821,7 +884,7 @@ bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist) {
         return false;
     }
 
-    // 6. Carve contiguously. Slots are laid out class-by-class in ascending
+    // 7. Carve contiguously. Slots are laid out class-by-class in ascending
     //    class order; within a class they are back-to-back at class_size
     //    stride. All start free and un-pinned, recorded in free_by_class_.
     const int n_carved = (int) total_k;
@@ -876,25 +939,27 @@ bool PoolAllocator::carve_size_classes_(const std::map<size_t, int> & hist) {
     high_water_ = off;     // arena consumed by the carve; no further carving
     precarved_  = true;
 
-    // 7. Human-readable per-class summary. A human sanity-checks the mix
+    // 8. Human-readable per-class summary. A human sanity-checks the mix
     //    here: total slots, total bytes, each class stride / count / share.
-    LLAMA_LOG_INFO("wp::PoolAllocator: pre-carved %d slots (%.1f MiB) from %zu class(es), "
-                   "arena=%.1f MiB, avg_page=%.1f KiB:\n",
+    LLAMA_LOG_WARN("wp::PoolAllocator: pre-carved %d slots (%.1f MiB) from %zu class(es), "
+                   "arena=%.1f MiB, avg_page=%.1f KiB, pin_floor=%.1f MiB:\n",
                    n_carved, (double) off / 1048576.0, plan.size(),
-                   (double) arena_size_ / 1048576.0, avg / 1024.0);
+                   (double) arena_size_ / 1048576.0, avg / 1024.0,
+                   (double) floor_bytes / 1048576.0);
     for (size_t i = 0; i < plan.size(); ++i) {
         const size_t cls = plan[i].class_size;
         const int    n   = kc[i];
         const double share = 100.0 * (double) n / (double) n_carved;
-        LLAMA_LOG_INFO("  class %6.3f MiB (%zu B): %4d slots (%5.1f%% of pool), "
-                       "demand %d pages (%.1f%% of %lld)\n",
+        LLAMA_LOG_WARN("  class %6.3f MiB (%zu B): %4d slots (%5.1f%% of pool), "
+                       "pin_floor %d, demand %d pages (%.1f%% of %lld)\n",
                        (double) cls / 1048576.0, cls, n, share,
+                       floor_c[i],
                        plan[i].n_pages,
                        100.0 * (double) plan[i].n_pages / (double) total_pages,
                        total_pages);
     }
     const long long tb = total_bytes();
-    LLAMA_LOG_INFO("  total: %lld slots, %lld B (%.1f MiB) carved, %.1f MiB arena headroom\n",
+    LLAMA_LOG_WARN("  total: %lld slots, %lld B (%.1f MiB) carved, %.1f MiB arena headroom\n",
                    total_k, tb, (double) tb / 1048576.0,
                    (double) ((long long) arena_size_ - tb) / 1048576.0);
     return true;
