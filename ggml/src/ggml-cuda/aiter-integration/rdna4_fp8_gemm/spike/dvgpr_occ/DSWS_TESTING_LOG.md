@@ -1687,3 +1687,1828 @@ rebuilds deterministically to `4ecdab1dafca36bb` (24008B, LDS 54016B), archived 
 `~/dsws_gpu_logs/CONFIGOFRECORD_652053c69_4ecdab1d.bin`. Two archived .bak binaries labelled
 "CONFIGOFRECORD"/"SWEEP" both PREDATE the non-pow2 fix and cannot be what produced any real-shape
 table; they have been renamed `MISNAMED_*`.
+
+### 2026-07-24 — DSWS2 CF0 bring-up (operands L2-only + role flow + prefetch, CFASSIGN=0) — CORRECT, PERF FLAT/-4%
+- **Config:** A1 geometry but **CFASSIGN=0** + `DSWS2_OVERLAP=1 DSWS2_ROLEFLOW=1 DSWS2_PREFETCH=1 DSWS2_RCONV=1`,
+  bin `85954d3c`. Shape ml8 gate_up 2112x9216x2560 (n_kseg=10), `ML8_COOP_CHUNK=96`, 33 chunks.
+- **CORRECTNESS: CLEAN.** Dense oracle **ok=76032 bad=0 max_rel=0 at stride=1 (ALL 3168 tiles)**;
+  **WORK-EXACT** computed=190080 == G*TOTAL_super; occ[0]=0; carry-through entered==shrunk==63360
+  (funnel closed); no hang, no latch, journal clean (0 amdgpu events).
+  => The whole CF0 stack — operands L2-only, grow-fail ring deleted, grow-first/reserve-after,
+  bidirectional role flow, speculative prefetch — is CORRECT ON SILICON. First execution of this stack.
+- **LDS 54784B -> 13824B CONFIRMED ON HARDWARE** (`LDS=13824B(alloc 13824B)`). The 40,960B operand-pool
+  reclaim is real. This is the durable result: 2x13824 = 27648 < 65536, so **2 WG/CU is now physically
+  possible for the first time** (still needs WAVES<=16 for the 32-wave-slot budget).
+- **THROUGHPUT: FLAT-TO-WORSE.** TF=0.4, span **26,498,256** ticks vs the 2026-07-23 baseline's
+  **25,483,124** at the SAME shape/chunk/geometry = **~4.0% SLOWER**. coast-frac 95.1% (unchanged).
+  door4 GROW-FAIL=0 (the VGPR budget still never binds). CONVERSIONS occ[48]=57031 (role flow IS firing).
+- **THIS IS THE PREDICTED RESULT.** Both independent adversarial reviewers
+  (`REVIEW_DSWS2_CF0_2026-07-24.md`) said the mechanisms could not help: the prefetch warms ~1.5% of its
+  target footprint, roles gate no work under OVERLAP (feed/compute/coast all funnel to the same reserve
+  path), and grow-before-CAS adds pipeline drains proportional to contention. The measurement matches.
+- **VERDICT:** correctness-complete, mechanism-incomplete. Do NOT tune these knobs — the prefetch target
+  and the role economy need redesign, not parameters. The banked asset is the LDS headroom.
+
+### 2026-07-24 — ⭐ FIRST GENUINE 2 WG/CU RUN — measured, and it does NOT help (retires the line on evidence)
+- **Config:** same CF0 stack, but **WAVES=16** (bin `98c97456`) + **`ML8_POOL=128`**. Same shape/chunk as the
+  bring-up above (ml8 gate_up 2112x9216x2560, `ML8_COOP_CHUNK=96`, 33 chunks).
+- **2 WG/CU CONFIRMED REAL, not clamped.** `occ[20]` claim = 3296; TOTAL = 3168 => **128 WGs** raced the
+  final claim (the WAVES=30 run gave 3232-3168 = **64**). `waves/WG=16`, `LDS=13824B(alloc 13824B)`, no
+  REFUSE from the occupancy guard. The 2026-07-21 note that "the standing '2 WGs/CU is garbage' result was
+  never actually 2 WGs/CU" (ML8_POOL silently clamped to 64) is now SUPERSEDED BY A REAL MEASUREMENT.
+- **CORRECTNESS: CLEAN.** Dense oracle ok=76032 bad=0 max_rel=0 (stride=1, all 3168 tiles); WORK-EXACT
+  computed=190080; occ[0]=0; no hang/latch.
+- **RESULT: 3.7% SLOWER.** span **27,485,692** ticks vs the 1 WG/CU WAVES=30 run's **26,498,256**. TF=0.4
+  both. Total resident waves are ~matched (128x16 = 2048 vs 64x30 = 1920), so this is close to an
+  apples-to-apples test of **one 30-wave frontier vs two 16-wave frontiers per CU**.
+  coast-frac 94.8% (vs 95.1%); door4 GROW-FAIL still **0**; occ[97] release-bails ROSE 5.05M -> 7.86M.
+- **INTERPRETATION:** the herd-splitting hypothesis — that 10 slices among 16 waves is easier to manage
+  than among 30, so two smaller funnels beat one big one — is **NOT SUPPORTED**. Splitting the frontier
+  costs slightly more than it saves. Note the dyn-VGPR budget STILL never binds (grow-fail=0) even at
+  2048 resident waves, so occupancy is not the thing gating this kernel.
+- **CAVEAT (honest):** run with the known-ineffective P1/P2 mechanisms enabled. They measured ~4% net cost,
+  so a cleaner base would not flip a 3.7% loss into a win — but a 2 WG/CU test on a mechanism-free CF0
+  build has not been run.
+
+### 2026-07-24 — PHIST bail-door census on the CANONICAL A1 baseline (the "where does the time go" run)
+- **Config:** canonical A1 baseline (`cac3ff7c` source) built `PHIST=1` -> bin `15b91d20`. Same shape/chunk
+  as the day's other runs (ml8 gate_up 2112x9216x2560, `ML8_COOP_CHUNK=96`, 33 chunks).
+  Oracle CLEAN dense stride=1 (ok=76032 bad=0), WORK-EXACT computed=190080, no hang/latch.
+- **THE CENSUS** (throttled 1/64; ratios vs `occ[104] loophead` = the denominator):
+  | door | count | % of loophead |
+  |---|---|---|
+  | loophead (denominator) | 1,165,689 | 100.0% |
+  | **boundary (occ[110])** | **920,040** | **78.9%** |
+  | coast (occ[113]) | 1,117,397 | 95.9% |
+  | feedmt / park (occ[105]) | 1,110,564 | 95.3% |
+  | RESV-try (occ[114]) | 1,138,751 | 97.7% |
+  | **RESV-win (occ[115])** | **40,916** | **3.5%** |
+  | drainwait (occ[112]) | 46 | 0.0% |
+- **HEADLINE: 78.9% of ALL loop iterations enter `.Lflow_da_boundary`, and only 3.5% end in a
+  reservation** — a peek->reservation conversion of **3.6%, i.e. ~28 peek attempts per success**.
+  `drainwait` is ~0, so waves are NOT waiting on drain. The instrument's own read-guide says it:
+  *"boundary or drainwait dominating => the wedge/stall is the tile-group boundary interlock, NOT the window."*
+- **THIS DOES NOT CONTRADICT ADVPROBE — it is the other axis.** ADVPROBE (2026-07-23) measured the
+  critical-section DURATION (~264 ticks once you win). PHIST measures ENTRY FREQUENCY. A cheap critical
+  section entered on 79% of passes is still enormous traffic, and every entrant that loses still pays the
+  reads + the CAS attempt before bailing.
+- **COMBINE WITH BNDSPLIT (2026-07-23): 93.1% of boundary entries LOSE the ZLOCK election.**
+  0.789 x 0.931 => **~73% of ALL loop passes are waves entering the boundary and losing.** That reframes
+  the 07-23 "boundary line is a dead end" conclusion: the advance MECHANISM is cheap, but the ENTRY
+  TRAFFIC is the dominant activity of the kernel.
+- ⚠ **CAVEAT 1 — FIVE OF ELEVEN DOORS ARE UNINSTRUMENTED.** `gatefull`, `zlock`, `terminal`, `bnd-lost`,
+  `growfail` all read 0 because **they have no bump sites** (the print says so). These are NOT
+  measurements — this is the project's recurring "zeros that were never measurements" trap. Do not read
+  them as zero. Consequently PHIST alone CANNOT decompose *why* the 78.9% of boundary entries bail.
+- ⚠ **CAVEAT 2 — PROBE PERTURBATION IS LARGE.** span **263,761,632** ticks vs the probe-off control's
+  **25,483,124** = **10.35x slower**, and coast-frac moved 95.1% -> 99.7%. The regime SHIFTED. Ratios are
+  suggestive, not settled. **TF=0.0 from this run MUST NOT be quoted** (probe build).
+- **WHERE TO DIG NEXT (offline, no GPU):** wire the missing PHIST bump sites (`zlock`, `gatefull`,
+  `bnd-lost`) so the 78.9% can be decomposed at the door level, and/or re-run BNDSPLIT alongside PHIST to
+  cross-check the 93.1% election-loss share on the current source.
+
+### 2026-07-24 — ⭐ BNDTIME: the boundary is NOT the wall. Losing passes cost 36.8 ticks = <1% of wave-time.
+- **Config:** CF0 stack + `DSWS2_BNDTIME=1` @ **WAVES=16 + `ML8_POOL=128` (2 WG/CU)**, bin `48519446`.
+  Same shape/chunk as the day's other runs. Oracle CLEAN dense stride=1 (ok=76032 bad=0), WORK-EXACT 190080,
+  128 WGs confirmed (occ[20]=3296), no hang/latch.
+- **THE MEASUREMENT:** `occ[133]` = 33,483,304 ticks / `occ[134]` = 910,971 non-advancing passes
+  => **ticks/lost-visit = 36.756**. (ADVPROBE's WINNING pass, for contrast, was ~264 ticks.)
+- **THE SHARE — this is the point:**
+  ```
+  lost-boundary wave-ticks = 33,483,304 x 64 (1/64 sample)      = 2.14e9
+  total wave-ticks         = 119,323,116 span x 2048 waves      = 2.44e11
+                                                          share = 0.88%
+  ```
+  **Losing boundary passes are UNDER 1% of total wave-time.**
+- **THE PROBE BIAS FAVOURS THE CONCLUSION.** BNDTIME slowed the run 4.3x (119.3M vs the 27.5M probe-off
+  control) and its probes sit ON the boundary path — so the instrument INFLATES exactly the quantity being
+  bounded. The true share is **<=0.9%**, making the verdict safe rather than marginal.
+- **VERDICT: the boundary election is settled, from both directions.** Winning passes cheap (264t),
+  losing passes cheaper (37t), combined ~1% of time. The 2026-07-23 "boundary line is a dead end"
+  conclusion STANDS.
+- ⚠ **RETRACTION:** earlier today I suggested PHIST's 78.9%-of-passes boundary-entry figure "reframed" that
+  dead-end verdict and made boundary traffic the dominant activity. **That was wrong — frequency is not
+  cost.** 78.9% of passes touch the boundary; they consume <1% of the time. Do not cite the reframing.
+- **WHERE THE TIME ACTUALLY IS, by elimination:** not the boundary (<1%), not carrier stalls (occ[88]=0),
+  not the VGPR budget (grow-fail=0 even at 2048 resident waves), not drain (drainwait~0). 95-99% of passes
+  bail to `.Lflow_feedmt_sleep`. **The time is IDLE WAITING** — which is ADVPROBE's unexplained ~90% gap.
+- **NEXT INSTRUMENT (cheap, and it has an ablation):** how much of the idle is the `s_sleep SLEEPN` yield
+  itself? If waves sleep through work becoming available, that is a latency we are CHOOSING. `SLEEPN` is a
+  defsym, so this is measurable AND directly ablatable.
+
+### 2026-07-25 — ⭐ SLEEPN KILLED OFFLINE (~1%), LDS-CAS CONTENTION REFUTED (~0.01%), and T1 VOIDED as an instrument defect
+- **Run:** CF0 profile + `DSWS2_PASSTIME=1`, bin `c706dd57`, host rebuilt. ml8 2112x9216x2560,
+  `ML8_COOP_CHUNK=96`, 33 chunks, WAVES=30 1 WG/CU. Log `dsws2_passtime`.
+- **CORRECTNESS CLEAN:** oracle ok=76032 bad=0 max_rel=0 at **stride=1 (ALL 3168 tiles)**; WORK-EXACT
+  computed=190080; occ[0]=0; no hang, no latch.
+- **PROBE COST 1.22x** (span 31,009,600 vs 25,483,124 baseline) — the cheapest instrument after ADVPROBE,
+  and far below BNDTIME's 4.3x. The throttled-`s71` + SGPR-accumulate + emit-at-retire shape is confirmed
+  as the right template. Do NOT quote TF from it.
+
+#### 1. `SLEEPN` IS NOT THE WALL — killed OFFLINE, with ZERO dispatches
+`occ[86]` is a per-wave `cnt_emit` atomic-add = a true total park count; `s_sleep N` is ISA-defined at
+64*N clocks. At SLEEPN=2: **1.0-1.2% of wave-time** (w30 1WG/CU, 61,270 parks/wave) and **0.6-0.8%**
+(w16 2WG/CU, 40,011 parks/wave). This also EXPLAINS the historical flat SLEEPN sweep — it was flat
+because there was nothing there. The queued "top candidate" measurement was answered by arithmetic.
+- **METHOD RULE (the distinction that makes this legitimate where 2026-07-24's was not):** count x
+  *fixed ARCHITECTURAL* cost is a valid time bound. Count x *another count* never is. The retracted
+  07-24 claim multiplied PHIST's 78.9% by BNDSPLIT's 93.1% and called the product a time share.
+
+#### 2. LDS-CAS CONTENTION REFUTED — the reservation CAS is ~0.01% of pass time
+Hypothesis under test: the kernel is contention-serialized on LDS atomics on shared cursor words
+(plain LDS latency should be hidden by 15-way SIMD multithreading; atomics on a shared address cannot be).
+- T0 null calibration = **5.153 ticks** (per-end-read overhead) · T2 reservation CAS = **6.291 ticks corrected**.
+- **Only 0.85% of park passes ever reach a reservation CAS** (`t2_count/t1_count = 0.0085`). The CAS was
+  structurally incapable of being the wall.
+- Against the INDEPENDENTLY-derived 525-tick pass period: **<=1.2% worst case** (if every pass hit a CAS),
+  **~0.01% actual**. REFUTED. This verdict does NOT depend on T1 — it rests on T2 and on counters.
+
+#### 3. *** T1 vs THE DERIVED PERIOD DISAGREE BY 3.9x. QUOTE NEITHER. ***
+> **CORRECTION, same day, after Grok's diagnosis (task 40417767):** the heading below originally read
+> "T1 IS AN INSTRUMENT DEFECT — VALUE VOID". **That was an overclaim and it is retracted.** I treated the
+> 525-tick period as ground truth and T1 as the defect. But **525 rests on an ASSUMPTION I never measured**
+> — that all 1920 waves are resident for the whole span. This run's `peak-resident occ[1]=0` is
+> **TRACE-gated**, and TRACE=0 in this build, so residency is UNMEASURED (another "zero that was never a
+> measurement" — and I quoted a number derived from it while policing exactly that error class).
+> If true residency is ~490 waves, the period IS ~2029 and **T1 is correct**.
+> **The honest position: the two numbers disagree, at least one is wrong, and I do not know which.**
+> Grok's static analysis RULED OUT the pairing mechanism I proposed (see below), which weakens the
+> "T1 is broken" side rather than strengthening it.
+T1 (whole head->park pass) reported **2028.859 ticks/pass corrected**. That is **physically impossible**:
+the same run gives a pass period of **525 ticks** (occ[86]=113,526,840 / 1920 waves / span, per chunk).
+A pass cannot take 2029 ticks if passes occur every 525.
+- **The probe-overhead escape hatch FAILS:** T2 measures 11.4 ticks RAW *including its own end read*, so
+  reads are genuinely cheap and cannot account for a ~1500-tick excess.
+- Candidate causes, UNRESOLVED: stale start latches on paths reaching the park without a fresh start, or
+  systematic bias in the `s71==0` sample. A CFG reachability test was INCONCLUSIVE — it cannot model that
+  both guards read the same `s71`, which is constant within a pass, so start/end *should* pair.
+- **HOW IT WAS CAUGHT — adopt this as standard practice:** derive the same quantity a SECOND, independent
+  way and require the two to agree. The period arithmetic cost nothing and killed a number that had
+  survived design, adversarial review, and a clean run. 2029 is exactly the kind of large, impressive
+  figure that gets quoted — it would have been the 7th entry in this file's "numbers that were never
+  measurements" family, and the most convincing one yet.
+
+#### 4. THE STANDING SCOREBOARD
+Eliminated **by direct measurement**, no longer by elimination: boundary (<1%), sleep (~1%), reservation
+CAS (~0.01%), carrier stalls (occ[88]=0), VGPR budget (grow-fail=0), drain (drainwait~0).
+**The ~90% remains unattributed.** The banked asset from this run is the **525-tick measured pass period** —
+the budget any future instrument must account for.
+- Reminder: this run printed `STARVATION 100% => ASSIGN-BOUND`. **Tautological under SELFSERVE. Do not cite.**
+
+#### 3b. WHAT GROK'S STATIC DIAGNOSIS ESTABLISHED (task 40417767, offline, no GPU)
+**RULED OUT with disassembly evidence, under THIS exact profile:**
+- **`s72` is not clobbered on the live park path.** Only two writers exist in bin `c706dd57`: the prologue
+  `passtime_zero` (`s_mov_b32 s72, 0`) and the T1 start (`s_mov_b32 s72, s62` @0x034f0). The `BATCH>1`
+  and `TRACE` s72 stores are `.if`-gated out (profile is BATCH=1 TRACE=0).
+- **`s71` cannot wrap mid-pass on the lean park path.** Only THREE `s71++` sites are emitted (init deadman,
+  loop-head deadman @0x034a4, terminal-drain deadman @0x07580). At **JDEPTH=1 the entire `.Lflow_jwait` /
+  `deadman_check_fat` block is not built** (`.if JDEPTH > 1`, :4252), and the second `deadman_check` is
+  `.if !DECENTASN` (DECENTASN=1). So the mid-pass s71 hammer that would break pairing DOES NOT EXIST here.
+- **=> MY PROPOSED PAIRING DEFECT IS NOT SUPPORTED.** If a wave reaches the park with s71==0, s71 was 0 at
+  that iteration's loop head, so the T1 start DID execute and DID refresh s72 on the same iteration.
+  The 4.55% stale-fraction arithmetic fits perfectly but is **numerology without a mechanism** — none found.
+- **The `s72=0` first-end theory is rejected as the mean driver:** one `now - 0` sample would be ~2^31 and
+  add ~1200 to the mean by itself; the observed mean is large-but-finite, not absolute-RTC contamination.
+- **The CFG BFS I ran was confirmed inconclusive** — it found the s71!=0 fall-through, where the END's
+  guard also skips. Data-dependent guards are invisible to a pure CFG.
+
+**THE INSTRUMENTATION GAP THAT MADE THIS UNDIAGNOSABLE:** the T1 **start bumps no counter** — only the end
+bumps `s77`. So **unpaired starts are invisible** and unpaired ends show up only as fat deltas, never as a
+count mismatch. `parks/T1_samples = 63.82 ≈ 64` proves ends are not missing or extra **relative to parks**;
+it does NOT prove the deltas are per-pass. A count that matches is not a delta that is correct.
+
+#### 3c. THE SETTLING RUN (designed, NOT yet built — one dispatch settles it)
+Three additions, all inside the existing throttled shape:
+1. **ARMED FLAG** — cleared at every loop head; set at T1 start; at T1 end, if `!armed` bump
+   `unpaired_end` and **do not accumulate**. Directly detects the pairing defect.
+2. **MAX T1 DELTA** (SGPR max, emit at retire) — separates "fat tail" from "uniformly long".
+3. **T1 START COUNT** — makes start/end asymmetry visible at last.
+4. **RESIDENCY** — the missing input to the period. Must be a REAL counter, not the TRACE-gated `occ[1]`.
+
+Reading it: `unpaired_end > 0` => pairing defect confirmed, T1 was wrong. `unpaired_end == 0` AND
+`max ~ O(mean)` => **T1 deltas are real and the 525-tick PERIOD is what needs debugging** (residency/span
+assumptions). `unpaired_end == 0` AND `max >> mean` => a genuine fat tail of long passes to attribute.
+**All three outcomes are informative — this run cannot come back empty.**
+
+#### 3d. THE LESSON, RESTATED CORRECTLY
+The original lesson stands but was aimed at the wrong target. It is not "T1 was a fake number caught by
+cross-derivation." It is: **when two derivations disagree, the SECOND one is not automatically the truth.**
+I cross-derived correctly, then immediately privileged my own arithmetic over the instrument and wrote
+"VALUE VOID" into this log — asserting a defect I had not demonstrated, using a denominator that rests on
+an unmeasured residency. Cross-derivation tells you *something is wrong*. It does not tell you *which one*.
+
+### 2026-07-25 — ⭐⭐ THE SETTLING RUN: T1 exonerated-then-convicted, residency MEASURED, and the FIRST POSITIVE LEAD (a 785x fat tail)
+- **Run:** CF0 + `DSWS2_PASSTIME=1` settling build, bin `f3276015`. Same ml8 shape/chunk. Log `dsws2_passtime_settle`.
+- **CORRECTNESS CLEAN:** oracle ok=76032 bad=0 at stride=1 (ALL 3168 tiles); WORK-EXACT computed=190080;
+  no hang, no latch. Probe cost **1.58x** (span 40,330,408 vs 25,483,124 baseline) — up from 1.22x, still
+  cheap, still NOT TF-quotable.
+
+#### THE QUESTION IT SETTLED
+| counter | value | meaning |
+|---|---|---|
+| `unpaired_end` (occ[141]) | **0** | pairing CLEAN — and a zero that IS a measurement (armed path has its own bump site) |
+| **peak concurrent residency** (occ[145]) | **1920** | **MEASURED**, ungated, outside the per-chunk memset |
+| `period_peak` | **508.475 ticks** | now computed from a measured denominator |
+| T1 corrected | **413.97 ticks/pass** | vs 2028.86 in the prior build — **physically consistent at last** |
+| T1 **max delta** (occ[142]) | **329,112 ticks** | **785x the mean** |
+| start / end counts | 2,385,599 / 2,383,385 | 2,214 orphaned starts (0.09%) — benign |
+
+**VERDICT: the 525-tick period was RIGHT and T1's 2029 was the broken number.** Measured residency came
+back at exactly the assumed 1920. My mid-day retraction (which said the period was the suspect number
+because residency was unmeasured) was itself wrong — but it was wrong *for the right reason*: residency
+genuinely WAS unmeasured at the time, and the only way to know was to measure it. Both the original claim
+and its retraction were unjustified when made; only this run justified either.
+
+#### *** OPEN ITEM — DO NOT LET THIS QUIETLY CLOSE ***
+`unpaired_end == 0` proves pairing is clean **in this build**. It does **NOT** explain what contaminated
+`c706dd57` (T1=2034). The armed flag FIXED the contamination without the diagnostic ever IDENTIFYING it —
+the counter cannot retroactively observe what the old binary did. **We have a working instrument and no
+root cause.** Logged as a known unknown; do not write a comfortable story over it later.
+
+#### *** THE FIRST POSITIVE LEAD IN THIS PROJECT ***
+Everything before today was ELIMINATION — boundary <1%, sleep ~1%, reservation CAS ~0.01%, carrier
+stalls 0, VGPR budget never binds, drain ~0. All that ever produced was "~90% unattributed".
+**T1 now ACCOUNTS for ~83% of total wave-residency time** (998,810,104 sampled ticks x64 throttle =
+6.39e10, against span x peak-residency = 40,330,408 x 1920 = 7.74e10).
+And the shape is extreme: **mean 419, max 329,112.** One poll pass consumed **a quarter of an entire
+chunk** (chunk = 1,222,133 ticks).
+- **MEANS ARE THE WRONG STATISTIC FOR THIS DISTRIBUTION**, which is very likely why every previous attempt
+  to find this dissolved into "it's just idle waiting."
+- CAVEAT on the 83%: extrapolating a 1/64 sample assumes sampled passes are representative, which a 785x
+  tail strains. The tail-attribution run is what tests it.
+
+#### NEXT (built, pending dispatch): TAIL ATTRIBUTION
+Count **AND TICK-SUM** of T1 deltas above a few thresholds. The SUM is the load-bearing half:
+"passes over Xk ticks are N% of passes but **M% of all pass-time**."
+- Large M for small N => the tail IS the wall; stop looking at means; ask which code path emits a
+  329,112-tick pass.
+- Small M => the tail is a curiosity and the mass is in the bulk.
+- **A threshold COUNT WITHOUT THE SUM would be instance #8** of this file's "numbers that were never
+  measurements" — it would say how MANY passes are fat and nothing about whether they MATTER.
+
+### 2026-07-25 — 🛑 TAIL-ATTRIBUTION RUN VOID: u32 OVERFLOW. The instrument produced a confident, impossible, and *desired* verdict.
+- **Run:** CF0 + `DSWS2_PASSTIME=1` tail build, bin `6c6993e2`. **Kernel itself CLEAN** — oracle
+  ok=76032 bad=0 stride=1 (all 3168 tiles), WORK-EXACT computed=190080, no hang, no latch.
+  **The kernel has never been in question in this whole sequence. Only the measurement apparatus.**
+
+#### WHAT IT PRINTED
+```
+bulk    delta <  1024 : count=2375559 (78.92%)  ticks=182157116  (30.45% of T1 time)
+mid     1024..65535   : count=620021  (20.60%)  ticks=0          (0.00%)
+extreme delta >=65536: count=14682   (0.49%)   ticks=1330364040 (222.38% of T1 time)
+raw: gt1k n=634703 sum=416070904   gt64k n=14682 sum=1330364040    (T1 total = 598228020)
+TAIL VERDICT: EXTREME-DOMINATED -- passes >=64K are 222.4% of T1 time. The fat tail IS the wall.
+```
+
+#### THREE INDEPENDENT IMPOSSIBILITIES
+1. `extreme` = **222.38%** of the total. A subset cannot exceed the whole.
+2. `mid` = 620,021 passes summing to **ZERO** ticks. Every member is >=1024 => minimum ~635M.
+3. `gt64k` is a **subset** of `gt1k`, yet `sum(gt1k)=416,070,904` **<** `sum(gt64k)=1,330,364,040`.
+
+#### THE OVERFLOW, PINNED EXACTLY
+`2^32 + 416,070,904 = 4,711,038,200` — a single clean u32 wrap of the gt1k sum.
+The `mid=0` is just the host computing `gt1k_sum - gt64k_sum`, going negative, and clamping.
+
+#### *** IT WAS NEVER ONLY THE NEW COUNTERS ***
+The pre-existing **T1 total was already at 84% of the u32 ceiling on the FIRST run**:
+| run | bin | T1 total | % of 2^32 |
+|---|---|---|---|
+| 1 | `c706dd57` | 3,618,636,368 | **84%** |
+| 2 | `f3276015` |   998,810,104 | 23% |
+| 3 | `6c6993e2` |   598,228,020 | 14% |
+Sizing check: total wave-residency = span x peak-residency = 41,411,232 x 1920 = **7.95e10**; sampled
+1/64 => any tick-sum covering most of runtime is **O(1.2e9) and rising with probe cost**. 32-bit was
+never sufficient for this instrument; the early runs merely got away with it.
+
+#### ~~THIS OVERTURNS THE "ARMED FLAG FIXED IT" STORY~~ — ✗ **RETRACTED WITHIN THE HOUR, BY GROK**
+I wrote: *"Overflow is now a better candidate than pairing"* for the original T1=2034, reasoning that
+2034 -> 419 -> 199 tracked accumulator pressure. **That is WRONG and I retract it.**
+> **Run 1's T1 total was 3,618,636,368, which is BELOW 2^32 = 4,294,967,296. IT NEVER WRAPPED.**
+> 84% of the ceiling is not the same as over it. `mean = total/samples` on an unwrapped total is
+> just arithmetic. Overflow explains **run 3's** impossible 222% / mid=0 / gt64k>gt1k. It explains
+> **nothing** about run 1.
+
+**MY ERROR, AND IT IS THE SAME CLASS I SPENT THE DAY POLICING:** I took a suggestive fact ("84% of the
+ceiling!") and promoted it to an explanation without checking whether the wrap actually occurred — one
+subtraction would have settled it. Finding a real bug creates enormous pull to make it explain the
+other open thing too. **A newly-found bug is not a general-purpose explanation.**
+
+=> **THE OPEN ITEM STAYS OPEN: the run-1 contamination mechanism is UNKNOWN.** Do not credit overflow
+with it. Do not credit the armed flag with it either — that was never established, only assumed.
+Suspect: run-3 tick-sums (definitively) and any tick-derived mean not individually checked against
+2^32. Still valid: `unpaired_end=0`, `peak residency=1920`, and correctness.
+
+#### THE PROCESS POINT — THE MOST DANGEROUS NEAR-MISS IN THIS FILE
+This would have been **instance #8** of "numbers that were never measurements", and the worst of them:
+- the impossible number backed **the exact hypothesis I had asked the run to confirm**,
+- the host stated it as a **VERDICT in capital letters** ("The fat tail IS the wall"),
+- and it followed a *correct* prior run, so the instrument had earned trust.
+It was caught **only because a percentage exceeded 100**. That margin is far too thin to rely on.
+**FIX BEING BUILT: 64-bit accumulation for EVERY tick-sum (T0/T1/T2/gt1k/gt64k), overflow-reporting
+guards so a wrap announces itself instead of wrapping silently, AND host-side assertions that REFUSE
+to print a verdict when `subset > superset` or `pct > 100` — printing `*** INCONSISTENT — COUNTERS
+VOID ***` instead.** The host assertions matter as much as the 64-bit fix: they are what turns a
+persuasive wrong answer into a loud refusal.
+
+### 2026-07-25 — ⭐⭐⭐ ROOT CAUSE OF THE 7x: THE PROBE AND THE PREFETCH SHARED A TRIGGER. T1 was never defective.
+- **Ablation:** `DSWS2_PREFETCH=0`, bin `c6c0d0cf` (defsym flip only, -288B .text). Everything else identical.
+- **CLEAN:** oracle 3168/3168 stride=1, WORK-EXACT 190080, no hang/latch.
+
+| | prefetch ON (`54edfb7a`) | prefetch OFF (`c6c0d0cf`) |
+|---|---|---|
+| T1 mean | 2847.7 | **40.9** |
+| wave-time budget ratio | 7.06x **VOID** | **0.217x — PASSES** |
+| parks (poll passes) | 197,296,055 | **413,076,323** |
+| period | 400.0 | 188.6 |
+| tail verdict | TAIL-DOMINATED | **BULK-DOMINATED** |
+| span | 41,102,028 | 40,575,032 (**only 1.3% faster**) |
+
+#### THE MECHANISM
+`DSWS2_PREFETCH` is gated on `s_cmp_lg_u32 s71, 0` — **the SAME 1-in-64 tick PASSTIME samples** — and
+ends in a mandatory blocking `s_wait_loadcnt 0x0`. So **every sampled pass carried a full L2/HBM round
+trip that the other 63-in-64 passes never paid.** The bias was multiplicative and stable across runs,
+which is precisely why it did not look like ordinary selection bias.
+
+#### *** T1 WAS NEVER DEFECTIVE — AND I CALLED IT DEFECTIVE THREE TIMES ***
+Positions held on T1 today: (1) morning "instrument defect, VALUE VOID"; (2) midday retraction
+"the PERIOD is the suspect number"; (3) post-u64 "back to (1), defect confirmed at 7x".
+**All three wrong.** The instrument faithfully measured what it was pointed at. **The EXPERIMENT was
+contaminated**: probe and prefetch shared a trigger.
+=> **NEW CHECKLIST ITEM, and it is not on any list in this file:** before trusting a sampled
+measurement, ask **WHAT ELSE KEYS OFF THE SAME TRIGGER AS THE PROBE.** Every other check this project
+runs — internal consistency, cross-derivation, calibration, byte-identical-off, disassembly audit —
+passes cleanly on a probe whose trigger is shared. None of them can see this.
+
+#### *** FRAMING CORRECTION (kmbandy) — DO NOT MISREAD THIS RESULT ***
+An earlier draft of this entry said *"the prefetch isn't inert, it's expensive."* **WRONG FRAMING.**
+**This prefetch is BUILT WRONG.** Three independent defects:
+1. **Wrong target** — warms `ksi in {0,1,2,3}` of the **CURRENT** tile, lines already resident
+   (~1.5% of its real footprint; `REVIEW_DSWS2_CF0_2026-07-24.md`).
+2. **Blocking** — `s_wait_loadcnt 0x0` makes the ISSUING wave eat the latency inline. A prefetch that
+   blocks its own issuer is not a prefetch, it is a load.
+3. **No lead time** — fires immediately before the wave would proceed; nothing is ever "ahead".
+**DO NOT LOG THIS AS "PREFETCHING DOES NOT HELP THIS KERNEL."** That is the identical error to the
+weight-pager's ten-arm sweep at `WP_PREFETCH_LOOKAHEAD_K=1`, where speculative reads for layer L+1
+queued behind layer L's own demand reads — **refuting a technique by measuring a broken implementation
+of it.** The KG rule from that session applies verbatim here: *K=1 is not a test of prefetch.*
+**A correctly-built prefetch (right target, non-blocking, real lead) remains UNTESTED on this kernel.**
+
+#### WHAT THE CLEAN NUMBERS SAY
+- **The kernel is NOT poll-throughput-bound.** Poll passes MORE THAN DOUBLED (197M -> 413M) while span
+  moved only 1.3%. Spinning the loop twice as fast changes nothing.
+- Passes are **21.7% of the period** (40.9 of 188.6 ticks). The remaining ~148 ticks sit **between the
+  park and the next loop head** — the sleep+wake path. `s_sleep SLEEPN=2` is only ~5 ticks of that.
+- ⚠ **THAT ~78% IS ARITHMETIC INFERENCE (period - T1), NOT A MEASUREMENT.** The arithmetic is sound
+  (period is park-to-park, T1 is head-to-park) but inference is exactly what this file keeps getting
+  burned by. **NEXT: time park->head directly** with the instrument that now demonstrably works.
+- Earlier claim "poll passes account for ~83% of wave-time" was prefetch-inflated. True figure: **21.7%**.
+
+### 2026-07-25 — 🔬 INDEPENDENT CODEX (gpt-5.6-sol) REVIEW OF THE PREFETCH — diagnosis at file:line, and it corrects me twice
+Commissioned INDEPENDENTLY: Codex was given the evidence, the code, the prefetch's GOAL, and the safety
+constraints — and **denied all of my conclusions** (no prior review docs, no hypotheses). Agreement below
+is therefore corroboration, not echo.
+
+#### WHAT IT CONFIRMED (I had these)
+- **Not fire-and-forget.** 4x `global_load_tr_b64` (all to the SAME `v16:v17`) then `s_wait_loadcnt 0x0`
+  at :4890. T1 spans :3812 (head) -> :6064 (park), so the whole stall lands inside the measured pass.
+- **Phase-locked with the probe.** Prefetch fires on `s71==0` at :4858; T1 starts on `s71==0` at :3176.
+- **`tcol` comes from `DA_TILE_OFF` = the CURRENT tile** (:4860). It never addresses the next tile.
+  (I derived this independently from the address math before seeing the review.)
+
+#### WHAT IT FOUND THAT I DID NOT — sharper, and it is the real defect
+- **THE CLAMP COLLAPSES ALL FOUR GUESSES ONTO ONE ADDRESS.** At n_kseg=10 (NOT a power of two), s67=15
+  and s66=9. During drain-park, reservation has stopped at the first phantom index (rejected at :5118),
+  so ASSIGN_HEAD sits at field offset 10 and the guesses are 10,11,12,13 — **all clamped by `s_min_u32`
+  to 9**. All four loads hit ONE identical address: frag 0, K-step 0, slice 9 of the CURRENT tile,
+  already consumed. It is not warming four lines; it is re-warming one dead line four times.
+- **ROOT STRUCTURAL CAUSE: the two-generation frontier is "still NOT built"** (:451, :464). Without a
+  `t_next` identity the code **cannot** form next-tile addresses. This was never a tuning problem.
+- **The comment at :1727 claiming `n_kseg` is always a power of two is STALE** — contradicted by the
+  arbitrary-K decode at :3578. Several assumptions in this file may rest on it.
+
+#### *** WHERE IT CORRECTED ME — BOTH MATTER ***
+1. **THE "7.06x WAVE-TIME IMPOSSIBILITY" WAS MY ERROR, NOT A COUNTER DEFECT.** The host's
+   `T1_total x 64` extrapolation assumes **UNIFORM** sampling. The sampled pass is *exactly* the prefetch
+   pass, so the stratum is deliberately expensive and multiplying it by 64 is invalid. **The individual
+   T1 intervals were real the whole time.** => The external budget assertion I championed is itself only
+   sound under uniform sampling. It must say so and ideally DETECT the stratified case rather than
+   declaring COUNTERS VOID. (Filed into the P3 build.)
+2. **"DRAMATICALLY SLOWER" IS WRONG END-TO-END.** The regression is **1.3%**. The dramatic effects are
+   local poll latency (~70x on sampled passes) and poll-loop throughput (2.1x) — and that throughput is
+   **unused control-plane capacity**. Do not optimise the poll rate.
+
+#### A CORRECTION THAT REACHES PAST THIS TASK
+**`DRAIN_HEAD` IS NOT A VALID COMPLETION SIGNAL UNDER SELFSERVE.** The reservation is published as
+pre-completed BEFORE compute (:5728) and `drain_advance` runs before the burst (:5772). **`TILEDONE`
+(:4627) and `GSTORED` (:4748) are the real productive-completion signals.** Older conclusions in this
+file that lean on ASSIGN-vs-DRAIN are suspect for this reason.
+
+#### WHERE THE KERNEL IS ACTUALLY BOUND (and the honest limit of this A/B)
+The productive tile-completion chain: TILEDONE after reductions (:4627) -> C-store drained before
+GSTORED published (:4748) -> boundary advance waits on GSTORED (:5342). **NOT the poll loop.**
+Codex is explicit that this A/B does **not** discriminate B-load latency vs WMMA vs LDS reduction vs
+C-store drain vs the completion frontier. Naming one requires more device measurement. **Do not let this
+harden into "the C-store is the wall" without measuring it.**
+
+#### THE REBUILD (handed to Grok, phased; ONE dispatch per phase)
+- **P1 — two-generation frontier:** state machine EMPTY -> CLAIMING -> READY(t_next) -> TERMINAL below
+  OP_BASE. MOVE the existing next-tile claim earlier (:5422); this RELOCATES the claim, it does not add
+  one per tile. Trigger = the unique winner reserving the last real ksi of the final group (CAS :5198,
+  decode :5249). That wave publishes an LDS request and issues NO loads (it is fat and mid-compute).
+- **P2 — dedicated prefetch wave + correct addressing:** one feed-floor wave per WG (cold start already
+  labels three at :3720; their staging job is gone under OVERLAP at :4805). It must never
+  `s_alloc_vgpr` — that does WaitIdleExceptStoreCnt (:802), so a growing wave would stall on outstanding
+  prefetch loads and put the latency straight back into a compute dependency chain.
+  Address the EXACT compute set for t_next: `ksi 0..n_kseg-1, ks 0..KSEG_STEPS-1, ni 0..FN-1`.
+  **DO NOT CLAMP PHANTOM CURSOR VALUES INTO REAL ksi — iterate the real count.** No post-issue wait;
+  wait only before reusing destination registers on the next batch.
+- **P3 — bounded retire-emitted counters** + fix the host's uniform-sampling assumption.
+- **BUDGET:** a correct full warm is 10*16*4*256 = 163,840 B/tile => ~519 MB total, **1/6 of the
+  productive 3.114 GB B stream and ~6x LESS than the broken prefetch's 3.132 GB upper bound.**
+  The correct build is CHEAPER than the broken one. Rule 7 is live: compile-time cap is mandatory.
+
+#### PROCESS
+Independence was ENGINEERED, not hoped for: Codex got evidence + code + goal + constraints, and was
+denied every hypothesis I held. It then corrected two of my load-bearing claims. This is the fifth time
+independent review has caught something my own analysis missed, and the first time the reviewer
+overturned a *measurement interpretation* rather than a code defect.
+
+### 2026-07-25 — ✅ PREFETCH REBUILD P1 (two-generation `t_next` frontier) — PASSES, and is the FASTEST run of the day
+- **Bin `3c17e9c4`** (.text 35636B, LDS 13824B unchanged — TNXT words live in the existing control gap
+  below GSTORED). `DSWS2_PREFETCH=0` verified byte-identical to `c6c0d0cf`, both directions.
+
+| gate | result |
+|---|---|
+| `occ[20]` (tile claims) | **3232 — identical to every prior run => NO DOUBLE-CLAIM** |
+| WORK-EXACT | computed = 190080 ✓ |
+| carry-through | entered == shrunk == 63360 ✓ |
+| oracle | 3168/3168 stride=1, bad=0 ✓ |
+| hang / latch / MODE1 | none ✓ |
+
+#### THE BUILDER CAUGHT A HOLE IN THE REVIEWED DESIGN
+Codex's state machine was `EMPTY -> CLAIMING -> READY -> TERMINAL`. Grok **added `BUSY`**, because
+`CLAIMING` alone is not exclusive ownership of the *global* atomic: two lean claimers could both issue
+it and skip a tile. `occ[20]=3232` on silicon is the evidence that the added state is what makes the
+design correct. **An independent review is not a specification — the builder still owns correctness.**
+
+#### SPAN: P1 BEAT EVEN THE FULL ABLATION
+```
+41,102,028   prefetch ON, pre-P1 (broken)
+40,575,032   prefetch OFF (full ablation)
+39,779,080   P1  <- 3.2% faster than pre-P1, 2.0% faster than prefetch-OFF ENTIRELY
+```
+P1 changes only WHERE the next-tile claim happens, and the broken prefetch is still firing. Plausible
+mechanism: the boundary handler no longer issues a global atomic **while holding ZLOCK** — it consumes a
+pre-published `READY(t_next)`. Codex independently named that chain (TILEDONE :4627 -> C-store drained
+before GSTORED :4748 -> boundary advance waits GSTORED :5342) as the real critical path, so removing an
+atomic from it is exactly the right shape of change.
+- ⚠ **NOT BANKED. One unreplicated run, and NO noise estimate exists for this config — no bin has been
+  run twice today.** Mechanism and direction agree, which is more than any previous lead had, but a
+  single run is not a result. **Replicate before this is quoted as a win.**
+
+#### THE HOST GUARD DID ITS JOB
+`*** T1 EXCEEDS AVAILABLE WAVE-TIME BY 8.32x — COUNTERS VOID ***`, and it **suppressed** the tail
+dominance verdict rather than printing a claim from impossible arithmetic. Note per Codex this is
+detecting **stratified sampling** (the prefetch still fires on the sampled `s71==0` pass in P1), not
+counter corruption. P3 must reword it to say so. If the VOID does NOT clear once P2 removes the old
+burst, something else is stratified and that is a finding in itself.
+
+#### NEXT: P2 (dispatched)
+Dedicated prefetch wave (one per WG, lean, never `s_alloc_vgpr` — that does WaitIdleExceptStoreCnt at
+:802 and would drag prefetch latency back into a compute dependency chain), correct `t_next` addressing
+over the REAL `ksi` count with **no phantom clamp**, no post-issue wait, old burst removed, and a
+mandatory compile-time byte cap (rule 7 — this GPU drives the displays off the same HBM bus).
+
+### 2026-07-25 — ⭐⭐⭐⭐ PREFETCH REBUILD P2: **A CORRECTLY-BUILT PREFETCH BEATS NO PREFETCH BY 8.6%** — replicated, noise-bounded
+- **Bin `1d434719`** (.text 36164B, LDS 13824B). `DSWS2_PREFETCH=0` byte-identical to `c6c0d0cf`, both
+  directions. `s_sendmsg_rtn` 13 unchanged. **`s_alloc_vgpr` site count unchanged at 9** — P2 adds none.
+- **RUN TWICE** (first replication of the day): span **36,904,204** and **37,242,000**.
+  => **RUN-TO-RUN NOISE = 0.91%.** This is the number every span claim today was missing.
+
+#### GATES (both runs)
+`occ[20]=3232` — **no double-claim** despite P2 adding a second claim-service site (`global_atomic`
+44 -> 45). WORK-EXACT computed=190080. carry-through entered==shrunk==63360. oracle 3168/3168 at
+stride=1, bad=0. No hang, no latch, no reset, no MODE1.
+
+#### THE RESULT, AGAINST MEASURED NOISE
+```
+41,102,028   prefetch ON, pre-P1 (BROKEN)
+40,575,032   prefetch OFF (FULL ABLATION)
+39,779,080   P1 (claim relocated)
+36,904,204 / 37,242,000   P2 (CORRECT prefetch)
+```
+| comparison | delta | verdict vs 0.9% noise |
+|---|---|---|
+| P2 vs broken prefetch | **9.8% faster** | REAL (11x noise) |
+| **P2 vs NO PREFETCH AT ALL** | **8.6% faster** | **REAL (9x noise)** |
+| P2 vs P1 | 6.8% faster | REAL (7x noise) |
+| P1 vs ablation | 2.0% | **MARGINAL (~2x noise)** — my refusal to bank it was correct |
+
+#### *** THE POINT — AND IT IS THE WHOLE LESSON OF THE DAY ***
+**A correctly-built prefetch is 8.6% FASTER than having no prefetch at all.** Deleting it would have
+shown a **1.3% win** and locked in a permanent **8.6% loss**. kmbandy's standing constraint — "just not
+using it is not an option" — is what forced the rebuild instead of the deletion. Compare the KG's
+weight-pager entry: ten arms swept at `LOOKAHEAD_K=1` nearly retired prefetching on the strength of a
+build that had no lead time. **Two projects, same near-miss, same rule: never refute a TECHNIQUE by
+measuring a BROKEN IMPLEMENTATION of it.**
+
+#### BOTH PRE-REGISTERED PREDICTIONS CONFIRMED (recorded before the run, so they could not be retrofitted)
+1. **T1 mean 4446 -> 51.2.** The blocking `s_wait_loadcnt` in the poll path WAS the sample poison.
+2. **The 8.32x WAVE-TIME VOID cleared to 0.257x.** Removing the burst severed the probe/prefetch shared
+   `s71` trigger. This confirms **Codex's stratified-sampling diagnosis end-to-end** — the counters were
+   never corrupt, the extrapolation was invalid. Tail is now **BULK-DOMINATED** (80% of T1 time under 1K).
+
+#### ANOMALY — LOGGED, NOT WAVED THROUGH
+**Orphaned T1 starts jumped ~200x: 2,300 -> 683,972 (0.09% -> 10.9% of starts).** Expected in DIRECTION
+(the PF wave arms T1 at the loop head, runs the engine, returns to `.Lflow_loop` without ever parking),
+but one wave in 30 is 3.3%, and 10.9% only reconciles if the PF wave visits the loop head ~3.5x more
+often than average. **Plausible, UNVERIFIED.** Benign for correctness; it does change what T1 samples.
+
+#### WHY IT WORKS (mechanism, consistent with Codex's independent read of the critical path)
+P1 removed a global atomic from the boundary handler's ZLOCK-held path. P2 removed a blocking L2/HBM
+round trip from the poll path entirely and pointed the fetch at the NEXT tile's real address set instead
+of one already-consumed 256B block of the CURRENT tile. Both act on the productive completion chain
+(TILEDONE :4627 -> C-store drain :4748 -> GSTORED -> boundary advance :5342), which Codex named as the
+wall — NOT on poll throughput, which is unused control-plane capacity.
+- **BUDGET: the correct build is CHEAPER than the broken one** — ~519 MB/run at real `n_kseg` (cap worst
+  case 830 MB) vs the broken version's 3.132 GB upper bound. ~6x less traffic AND 9.8% faster.
+
+### 2026-07-25 — P3 (counters + host wording + orphan fix): 3/3 PREDICTIONS CONFIRMED, and it found that **THE ENGINE IS STARVED**
+- **Bin `b8918d3c`** (.text 36360B). `DSWS2_PREFETCH=0` byte-identical `c6c0d0cf` both directions.
+  `s_sendmsg_rtn` 13 and `s_alloc_vgpr` 9 **both unchanged**; +4 `global_atomic` (45->49), all retire-emitted.
+- **RUN TWICE:** span 39,786,480 / 39,316,884 (**spread 1.19%**; P2's was 0.91% — consistent noise floor).
+- Correctness clean both runs: `occ[20]=3232`, WORK-EXACT 190080, oracle 3168/3168 stride=1 bad=0.
+
+#### ALL THREE PRE-REGISTERED PREDICTIONS CONFIRMED
+| prediction | result |
+|---|---|
+| orphaned T1 starts 683,972 -> ~2,300 | **1,981 / 1,888** ✓ PF-wave hypothesis was correct |
+| `occ[159]` s71 co-tenant mask = 0x23 | **0x23** ✓ (PASSTIME \| ROLEFLOW \| DEADMAN) |
+| wave-time budget ~0.25x PASS | **0.244x** ✓ |
+
+**ORPHAN ANOMALY RESOLVED.** The PF engine now skips arming T1 entirely — it is not a poll pass and does
+not belong in poll-pass statistics. Counting its orphans would have been the category error.
+**HOST WORDING FIXED:** now prints `WAVE-TIME BUDGET (assumes UNIFORM 1/64 sampling)` and
+`s71 CO-TENANTS (occ[159]=0x23): PASSTIME ROLEFLOW DEADMAN — non-PASSTIME co-tenants present => x64
+extrapolation is stratified`. It names the cause instead of misattributing it as COUNTERS VOID.
+
+#### *** P3 IS 6.7% SLOWER THAN P2 — AND THAT IS THE CORRECT OUTCOME FOR IT ***
+P3 mean 39.55M vs P2 mean 37.07M = **6.7%, ~6x noise, replicated on both sides => REAL.**
+**P3 IS A DIAGNOSTIC BUILD, NOT A SHIPPING BUILD. Its span is NOT quotable.** The performance
+configuration remains **P2 (`1d434719`)**. Prime suspect: `idle_not_READY` incrementing **47M times**
+inside the PF engine loop. This is the day's own rule applied to itself — probe builds distort, and an
+instrument that costs 6.7% is fine as long as nobody quotes its throughput.
+
+#### *** THE FINDING P3 WAS BUILT TO GET: THE ENGINE IS STARVED ***
+```
+tiles_latched   =     1,056   of 3,168 tiles  (EXACTLY 1/3, IDENTICAL both runs)
+blocks_issued   =   152,472 / 186,588  =>  37.2 / 45.6 MB   (budget: 519 MB full warm)
+idle_not_READY  = 47,246,596 / 46,646,395
+```
+- **Only 7-9% of the intended footprint is warmed.** 144-177 blocks per tile against 640 for a full warm.
+- **The trigger fires for exactly ONE THIRD of tiles**, identically across runs. That precision is
+  structural, not chance — **`ACC_N=3` is the obvious suspect** (trigger is `group == GROUPS-1 &&
+  ksi == n_kseg-1`; check how GROUPS resolves at `ACC_N=3, G=6`).
+- The engine idles ~44,000x per tile it latches — it is spinning with nothing to issue almost always.
+- **=> P2's 8.6% win was bought by warming under 9% of what the design intends.** If coverage is the
+  lever, a large multiple may still be available. **This is the first lead of the day with a COUNTER
+  behind it rather than an inference.**
+- ⚠ `blocks_issued` varies 22% run-to-run (152K vs 187K) while span varies 1.2% — the coverage itself is
+  unstable, which is worth understanding before tuning it.
+
+#### NEXT, IN ORDER
+1. **Raise coverage** — why do only 1/3 of tiles latch, and why does the engine idle ~44,000x per latch?
+2. **Then** the completion-chain discrimination probe (design sketched, see below).
+
+### 2026-07-25 — P4 COVERAGE: the fix worked completely (23% -> 100% warm). Span comparison CONFOUNDED — not concluded.
+- **Bin `e2397d95`**, RUN TWICE: span 37,994,252 / 37,917,832 (**spread 0.20%** — tightest config today).
+  `occ[20]=3232`, WORK-EXACT 190080, oracle 3168/3168 stride=1, no hang. OFF byte-identical `c6c0d0cf`.
+
+#### THE ONE-THIRD MYSTERY — SOLVED, AND MY GUESS WAS WRONG
+I suspected `ACC_N=3`. **Wrong** — GROUPS = G/ACC_N = 6/3 = 2, so the group trigger fires once per tile.
+**It is HOST CHUNKING:** `ML8_COOP_CHUNK=96` tiles across 64 WGs => 32 WGs get 2 tiles, 32 get 1. A WG
+can only latch a NEXT tile if it HAS a second tile in-dispatch, so max latches/chunk = 96-64 = 32, and
+33 x 32 = **1056 = 3168/3** exactly. Deterministic partition => bit-identical across runs.
+**The kernel cannot invent next-tiles that do not exist in the dispatch.** Raising `tiles_latched`
+requires host chunk policy — and `ML8_COOP_CHUNK` is the documented compositor-safety knob (96/dispatch
+with a 5ms yield between chunks), so **it is NOT a free lever and does not get bundled into a kernel
+bring-up.** Filed as a separate, careful experiment.
+
+#### COVERAGE FIX: COMPLETE SUCCESS
+| metric | P3 | P4 |
+|---|---|---|
+| blocks per latch | 144–177 | **639.9 / 640.0** (of 640 = full warm) |
+| bytes warmed | 37.2 / 45.6 MB | **165.0 / 165.5 MB** (4.4x) |
+| coverage run-to-run instability | **22%** | **0.3% — GONE** |
+| idle counter (raw) | 47M unthrottled | ~34.8M, throttled 1/64 |
+Grok's read that the READY window was the block limiter was correct; moving the trigger to group 0
+filled it. The instability had the same root cause, as it predicted.
+**Throttling the idle counter recovered 4.0% of P3's 6.7%** (39.55M -> 37.96M), confirming that counter
+was the P3 regression.
+
+#### *** THE SPAN COMPARISON IS CONFOUNDED — DELIBERATELY NOT CONCLUDED ***
+P4 (37.96M) is **2.4% slower than P2** (37.07M), outside noise. **BUT P4 CARRIES THE P3 COUNTERS AND P2
+DOES NOT**, and those counters measure **2.4% (throttled) to 6.7% (unthrottled)**. The coverage effect
+and the instrumentation cost are confounded **at the same order of magnitude**. This pair cannot
+separate them.
+**Attributing P4's 2.4% to coverage here would be instance #10 of this file's "numbers that were never
+measurements".** One dispatch removes the ambiguity, so it gets one dispatch.
+
+#### DECISIVE EXPERIMENT DISPATCHED: **P4-CLEAN** (P4 coverage, diagnostic counters compiled out)
+Interpretation fixed IN ADVANCE so it cannot be retrofitted:
+- **faster than P2** => full coverage wins; make it shipping.
+- **~= P2 (within ~1%)** => coverage is NEUTRAL; P2's 23% was already enough and the extra 4.4x of HBM
+  traffic buys nothing. **That is a real finding about prefetch sizing, not a failure.**
+- **slower than P2** => full coverage HURTS; there is an optimum below full warm — sweep batch size.
+Will be run twice regardless. **Shipping config remains P2 (`1d434719`) until this resolves.**
+
+### 2026-07-25 — ⭐⭐⭐⭐⭐ **THE WALL IS LOCATED: THE COMPUTE BURST, NOT COORDINATION.** Two long-standing root causes refuted.
+Three arms, defsym-only, all `OVERLAP=0 ROLEFLOW=0 RCONV=0 PASSTIME=0 PREFETCH=0`. All correctness-clean
+(WORK-EXACT, `occ[0]=0`, no hang).
+
+| arm | config | bin | items | span | ticks/item |
+|---|---|---|---|---|---|
+| **A** | POOL_N=1 SEGK=256 | `128500f7` | 190,080 | **24,535,292** | **129.1** |
+| **C** | POOL_N=1 SEGK=64 | `74e6227f` | 760,320 | 30,111,052 | 39.6 |
+| **B** | POOL_N=2 SEGK=64 | `8376e32e` | 760,320 | 30,335,700 | 39.9 |
+
+**4x more work items cost only 23% more time.** If coordination dominated, 4x the items would cost ~4x.
+Solving A and C as *work + fixed coordination*:
+```
+work  ~ 29.8 ticks per SEGK=64 unit      coordination ~ 9.8 ticks/item (FIXED)
+=> at SEGK=256:  ~92% COMPUTE BURST,  ~7.6% COORDINATION
+```
+
+#### *** TWO ROOT CAUSES REFUTED ***
+1. **"Coordination costs ~600x the work it coordinates"** (KG, 2026-07-13) — **STALE AND WRONG BY TWO
+   ORDERS OF MAGNITUDE.** It predates SELFSERVE/DECENTASN. Today's measurements had been eroding it all
+   day: boundary <1%, reservation CAS ~0.01%, poll throughput doubled with 1.3% runtime effect.
+2. **"POOL_N=1 is why"** — **REFUTED. Depth-2 pipelining measures NEUTRAL (0.7%, inside noise).**
+   This is the FIRST EVER EXECUTION of `POOL_N=2` on this kernel — clean, working, and useless.
+   It was **blocked-for-nothing**, not blocked-and-valuable. (Also: `POOL_N>1` is refused on the
+   `OVERLAP=1` path by an explicit Phase-1 guard at :895, so the 40KB LDS reclaim can never be spent on
+   pipelining — moot now.)
+
+#### *** WHERE THE WALL ACTUALLY IS ***
+At SEGK=256 the GEMM needs **~324 us of math** at the 307 TF peak and takes **245,000 us — 756x off.**
+Coordination explains **7.6%**. The remaining ~92% sits inside the per-item compute burst, which runs
+**~230x slower than the math it contains.**
+=> **THE WALL IS THE COMPUTE PATH: B loads from L2/HBM, A `ds_load`s, WMMA issue, `ds_add` reduction.**
+NOT the frontier, NOT coordination, NOT the poll loop. **Five sessions of work have been aimed at the
+wrong ~8%.**
+- SEGK remains a real lever (SEGK=256 beats SEGK=64 by 23%) — consistent with the existing log entry
+  that SEGK is the throughput lever. But it is a lever ON the compute burst, not on coordination.
+
+#### PROBE-INFLATION CORRECTION TO EVERYTHING ELSE LOGGED TODAY
+**Every span quoted today was a `DSWS2_PASSTIME=1` PROBE build.** Arm A (probes off) is **24.5M**, next
+to the 07-23 canonical **25.48M** — while today's "best" (P2) read **37.07M**. The prefetch A/B remains
+VALID (controlled, probe-on both sides, 8.6%), but the absolute lineage was inflated throughout and
+**whether the 8.6% survives at `PASSTIME=0` is OPEN and must be re-measured before it is banked.**
+
+#### NEXT — instrument the COMPUTE BURST, not the frontier
+Use Grok's Step-0 design (counts first, then ONE RTC interval at a time, own throttle, PASSTIME=0) to
+discriminate inside the burst: B-load latency vs WMMA issue vs LDS `ds_add` reduction vs C-store.
+The completion-chain probe (TILEDONE -> C-store -> GSTORED -> boundary) is now LOWER priority: that
+chain lives in the 7.6%.
+
+### 2026-07-25 — 🔧 **STRUCTURAL: SELFSERVE LEFT DEAD MACHINERY LIVE. POOL_N IS NOW INERT.** (kmbandy called it, repeatedly)
+**The complaint, verbatim:** *"POOL_N should not matter because SELFSERVE makes it inert — or at least
+should. So once again something isn't built correctly."* **Correct on every count.**
+
+#### THE DEFECT
+Under SELFSERVE waves self-serve from GLOBAL (`global_load_tr` off `Bshuf`, ~:5794/:5838) and never read
+the staged LDS pool. But:
+- `:1122` `.set ACC_BASE, (OP_BASE + POOL_N*OPSTRIDE)` — **the operand pool was allocated by `POOL_N`
+  regardless of SELFSERVE.** Only `DSWS2_OVERLAP` reclaimed it.
+- `ASTAGE_R`/`BSTAGE_R` still ran from `.Lflow_feed` (:5028) and `.Lflow_coast` (:6279) — **staging was
+  still executing** (65,918 events at SEGK=64, 1,454 at SEGK=256) writing operands nobody read.
+- SELFSERVE's guard block (:1255-1275) demanded KMAJOR=0/DECENTASN=1/JDEPTH=1/BANKZERO=1/BATONGATE=1 and
+  **nothing that reclaimed the pool or killed staging.**
+- `DSWS2_OVERLAP` (:891) **explicitly requires SELFSERVE=1** — it was a LATER BOLT-ON reclaiming what
+  SELFSERVE should have killed at source, and only for `POOL_N=1` (:895), which is why it refused
+  pipelining.
+- **SECOND DEFECT, same class, found by the builder:** the dead coordinator still assembled
+  `s_cmp_ge_u32 s46, POOL_N` under DECENTASN — unreachable at runtime, leaking `POOL_N` into `.text`.
+
+#### THE FIX, PROVEN
+| | before | after |
+|---|---|---|
+| `POOL_N=1/2/3` under SELFSERVE | different bins, different LDS | **BYTE-IDENTICAL** (`815f9894` @256, `d7221d80` @64) |
+| LDS @ SEGK=256 | 54,784 | **13,824** (full 40KB reclaim, **no OVERLAP needed**) |
+| LDS @ SEGK=64 | 24,064 | **13,824** |
+| `.text` @ SEGK=64 | 28,428 | **23,564** (~4.9KB dead code) |
+| `feed-stages` | 1,454 / 65,918 | **0, structurally** (macros not emitted) |
+- **`DSWS2_OVERLAP=1` is now byte-identical to SELFSERVE alone** on the pool-only profile. Its entire
+  reclaim purpose was redundant; it survives only as a feature gate for ROLEFLOW/PREFETCH/RCONV.
+- **`SELFSERVE=0` classic ring correctly untouched** — still sizes by POOL_N (23,040 vs 33,280).
+- Runs CLEAN: `occ[0]=0`, WORK-EXACT 190080, `occ[20]=3232`, oracle 3168/3168 stride=1, no hang.
+
+#### *** TIMING: MARGINAL, NOT CLAIMED ***
+span 23,916,748 / 24,203,684 (mean **24,060,216**) vs prior dirty 24,535,292 = **1.9% against a 1.2%
+noise floor.** Too close to call and I am not banking it. At SEGK=256 the dead staging fired only 1,454
+times, so it was never a large TIME cost — **it cost 40KB of LDS, 4.9KB of `.text`, and an entire
+bolt-on subsystem built to work around it.**
+
+#### *** THE PATTERN — THIRD INSTANCE TODAY ***
+1. The **prefetch** aimed at an already-consumed block for months (rebuilt: +8.6% vs no prefetch).
+2. **SELFSERVE's staging pool** — superseded, left allocated and executing.
+3. The **dead coordinator** — unreachable, still assembled, leaking a defsym into `.text`.
+**Superseded machinery left live, then tuned around instead of removed.** In each case the workaround
+(OVERLAP for #2) became load-bearing and constrained everything downstream. **When a knob "matters" that
+architecturally should not, that is the bug — not a tuning opportunity.**
+
+#### CONSEQUENCE FOR THE WALL RESULT
+The three-arm experiment that located the wall ran with this dead staging active in ALL THREE ARMS. The
+conclusion **survives a fortiori** (coordination is even smaller without it), but the arms were not clean
+and I described them as clean. Re-measured at SEGK=256 post-fix: **24,060,216**, still ~740x off the
+~324us of math this GEMM contains. **The wall remains the COMPUTE BURST.**
+
+### 2026-07-25 — 🎯🎯 **THE WALL, NAMED: THE K-STEP LOOP IS NOT DOUBLE-BUFFERED.** Confirmed by counts, arithmetic, AND source.
+#### BURSTCNT Step 0 (bin `b1813ecb`) — ALL SEVEN COUNTS MATCH PREDICTED ARITHMETIC EXACTLY
+```
+BURST      190,080     BLOAD  12,165,120     ALOAD  3,041,280     WAITLD  3,041,280
+WMMA    12,165,120     DSADD   6,082,560     WAITDS   190,080
+per-BURST: BLOAD=64.00  ALOAD=16.00  WAITLD=16.00  WMMA=64.00  DSADD=32.00  WAITDS=1.00
+```
+Exact agreement on all seven validates the counters AND the model. `DSWS2_BURSTCNT=0` byte-identical to
+`815f9894`. **ACC-live invariant verified by disassembly:** all 62 added in-burst instructions are
+`s_add_co_u32` on private SGPRs — zero memory/VGPR/exec/sendmsg; the 7 emit atomics are at retire.
+
+#### THE STRUCTURE
+Per item: **80 global loads (64 B + 16 A — BOTH from global under SELFSERVE)**, **64 WMMA**,
+**32 `ds_add_f32`**, **16 blocking `s_wait_loadcnt` — one per k-step.**
+
+#### *** THE SOURCE SETTLES IT (`.Lflow_da_ss_rowblk`, :5991) ***
+```
+.rept KSEG_STEPS            // 16 @ SEGK=256
+  .rept FN  -> global_load_tr_b64 B   // issue THIS step
+  .rept FM  -> global_load_b64    A   // issue THIS step
+  s_wait_loadcnt 0x0                  // *** WAIT for THIS step ***
+  .rept FM/FN -> v_wmma               // compute THIS step
+.endr
+```
+**Issue -> wait -> compute -> repeat. ZERO overlap.** Step k+1's loads are not issued until step k's
+WMMAs are done, so **all 16 k-steps pay a fully exposed memory latency with nothing in flight to hide
+it.** Under SELFSERVE both operands come from GLOBAL — there is no LDS staging left to hide either
+behind, which is why this is fully exposed rather than partly absorbed.
+
+#### THE ARITHMETIC CLOSES
+An item is 126.6 ticks ≈ **3,040 shader clocks** @2.4GHz. 16 exposed L2 round trips x ~190 clocks
+≈ **3,040 clocks — the ENTIRE item budget.** 64 WMMA at ~16-32 clocks issue ≈ 1,000-2,000, same order.
+Counts predicted it, arithmetic fits it, source confirms it. **Step 1 timing is NOT needed for the
+diagnosis** — the ablation (build the double-buffer, measure) is the better test.
+
+#### THE FIX — classic double-buffer, and it is the PROVEN lever on the sibling kernel
+Prologue issues step 0; loop issues step k+1, THEN waits step k, THEN computes step k.
+Register cost: FA=FM*2=2, FB=FN*2=8 => 10 operand VGPRs today, 20 double-buffered. ACC=FM*FN*8=32.
+Fat allocation is 112, so the +10 should fit — **must be verified, not assumed.**
+`KWINBPF` double-buffering took `occ_kernel_wggemm2.s` from **162 -> 164.9 TF** (2026-06-19 ladder).
+
+#### FLAGGED, NOT CLAIMED
+BURSTCNT probe cost 26% (30,388,412 vs clean 24,060,216) where pure SALU should cost ~nothing — hints
+the k-step loop is ISSUE-sensitive, which would be a second (independent) reason double-buffering helps.
+One unreplicated run; counts unaffected and exact.
+
+### 2026-07-25 — ❌ **KDBUF DOUBLE-BUFFER: REFUTED. And the refutation exposes an arithmetic error of mine that invalidates the "compute burst is 92%" claim.**
+- **Bin `c5138582`**, SEGK=256. span **24,137,328** vs baseline **24,060,216** = **0.32% SLOWER — inside
+  the 1.2% noise floor.** Correctness clean (`occ[0]=0`, `occ[20]=3232`, WORK-EXACT 190080, oracle
+  3168/3168 stride=1, no hang).
+- **The BUILD is correct** — the pipeline is genuinely in the emitted code (`s_wait_loadcnt` census
+  35x`0x0` -> 20x`0x0` + 15x`0x5`; `s_alloc_vgpr` 80 -> 96; k+1 loads issue into the alternate buffer
+  before the wait gating step k). **The HYPOTHESIS was wrong.**
+- **PRE-REGISTERED PREDICTION:** *"multi-x if the diagnosis is right; a few percent means the diagnosis
+  is incomplete."* It came back at **ZERO**. This is what pre-registration is for.
+
+#### *** THE ROOT ERROR, MINE ***
+I computed `span / items` = 129 and called it **"ticks per item"**, treating it as the DURATION OF ONE
+BURST. **It is not.** It is the **system-wide item completion rate** with **1920 waves running
+CONCURRENTLY**. The real wave-time per item is `span x waves / items` ≈ **243,000 wave-ticks** — so the
+burst is a *tiny* fraction of wave-time, not 92%.
+**And that is exactly why double-buffering was inert:** at **15 waves per SIMD** the memory latency was
+**already hidden by multithreading**. While one wave waits on a load, fourteen others issue. Hiding
+latency *within* a wave buys nothing when it was never exposed at the SIMD level.
+
+#### *** SECOND TIME TODAY. SAME ERROR. ***
+The LDS-CAS contention hypothesis died the same way this morning — reasoning about ONE wave's serial
+timeline while forgetting the SIMD hides it. **I had written "plain LDS latency should be hidden by
+15-way SIMD multithreading" in my own notes hours earlier and then failed to apply it here.**
+**RULE: on this kernel, ANY per-wave latency argument must first answer "why is this not hidden by the
+other 14 waves on the SIMD?" A latency that multithreading can absorb is not a wall.**
+
+#### RETRACTED
+- ❌ **"The compute burst is ~92% of runtime."** The A-vs-C decomposition (~29.8 work + ~9.8 fixed per
+  item) is still a valid decomposition of the **SYSTEM THROUGHPUT RATE**, but calling the 92% "the
+  compute burst" was an overreach. It is **"everything that does not scale with item count"** — a much
+  weaker claim admitting several explanations.
+- ❌ **"16 exposed L2 latencies are the wall."** They were not exposed.
+
+#### STILL STANDING (unaffected)
+Coordination is small (~7.6% of the system rate). POOL_N / pipelining NEUTRAL. The SELFSERVE structural
+fix is real (POOL_N inert, 40KB LDS reclaimed, dead staging gone). Boundary <1%, sleep ~1%, CAS ~0.01%,
+carrier stalls 0, grow-fail 0, drain ~0, poll-loop throughput irrelevant to runtime.
+
+#### *** THE WALL IS ONCE AGAIN UNLOCATED ***
+**The next step must start from a PER-WAVE-TIME budget that respects 1920-way concurrency** — not a
+system rate divided by item count. Until that budget is built correctly, every "X is N% of runtime"
+claim on this kernel is suspect, including the ones above.
+
+### 2026-07-25 — ⭐⭐⭐⭐ **ABLATION SWEEP: THE ENTIRE COMPUTE PATH IS ~2% OF RUNTIME.** No instrument. Just span minus span.
+kmbandy's correction, and it is the lesson of the day: *"stop relying on weird entirely too complex
+measuring mechanisms... literally just checkpoint 2 - checkpoint 1. we need numbers."*
+
+| arm | bin | span | vs baseline |
+|---|---|---|---|
+| **BASELINE** | `815f9894` | **24,060,216** | — (replicated 2x, noise ~1.2%) |
+| NOWMMA | `0fe26484` | 24,243,168 | **+0.8% SLOWER** |
+| NODSADD | `25ebf127` | 24,153,200 | **+0.4% SLOWER** |
+| NOCFLUSH | `e35037c1` | 24,392,756 | **+1.4% SLOWER** |
+| NOBLOAD | `9f9bdf8e` | 23,538,772 | **-2.2%** (only mover, barely outside noise) |
+
+Every arm `bad=76032` — the oracle failing IS the proof the ablation took effect — and `computed=190080`,
+so work-exactness held throughout. All four bins verified **distinct** before running, so no arm was
+inert (the `NOCFLUSH`-assembles-byte-identical trap logged 2026-07-20).
+
+#### *** DELETING THE MATH CHANGES NOTHING ***
+All **12,165,120 WMMAs** removed: +0.8%. The LDS reduction removed: +0.4%. The C-store removed: +1.4%.
+Three of four got **slower**. Only the B fetch moves the needle at all, and only by 2.2%.
+=> **The kernel is 743x off peak and ~98% of wave-time is spent NOT executing the compute path.**
+This POSITIVELY MEASURES what had only been inferred, and retires the compute burst as a candidate.
+
+#### *** THE METHOD LESSON — THIS IS THE ONE TO KEEP ***
+**Every reliable number today came from an ABLATION. Every unreliable one came from an IN-KERNEL PROBE.**
+- Ablations (all clean first try): prefetch rebuild (+8.6% vs none), POOL_N (neutral), KDBUF (refuted my
+  own hypothesis in one run), the SELFSERVE structural fix, and this sweep.
+- Probes (all failed, each in a NEW way): PASSTIME (poisoned by a shared `s71` trigger with the
+  prefetch), BURSTCNT (26% schedule tax), WTBUDGET (u32 overflow of the global sum, then a negative
+  residual). Between them: **zero numbers I would defend.**
+**An ablation measures the thing itself. A probe measures whatever it happens to sample — and then you
+have to prove what that was.** Every layer I added to a probe (T0 calibration, armed flags, u64 sums,
+external budget assertions, s71 co-tenant masks, five buckets, sampling, derivation, residuals) existed
+to fix a problem the previous layer created. **Reach for the ablation first. Always.**
+
+#### NEXT — and it is deliberately the simplest possible thing
+`DSWS2_GAP`: ONE timestamp at the end of a compute burst, ONE at the start of the next, subtract,
+accumulate, emit. One accumulator, one count, one number. **No buckets, no sampling, no residual, no
+calibration, no throttle** (99 bursts/wave = 99 pairs, small enough not to need one — and a throttle is
+exactly what poisoned T1). Built by Grok (task aa5810c9), not yet run.
+
+---
+
+## 2026-07-26 — POLLSTAGE COMPLETE: the six-stage poll decomposition closes at 94%
+
+### 0. The blocker from last night's brief was MY error. No kernel defect. No fix needed.
+
+The 2026-07-25 brief refused to quote stage 1 because `n=30.7M` implied 485 passes/wave while
+"`occ[86]` parks = 169.7M" implied 2,679 — a 5.5x gap I called a counter bug.
+**I had compared `PS_N` from the POLLSTAGE build against `occ[86]` from a DIFFERENT build's log.**
+The stage-1 run's own `occ[86]` is **30,289,464**. Within-run:
+
+| run | n (PS_N) | own occ[86] | ratio |
+|---|---|---|---|
+| stage 1 | 30,736,951 | 30,289,464 | 1.015 |
+| stage 2 | 31,516,673 | 31,069,772 | 1.014 |
+| stage 6 | 29,906,543 | 29,906,543 | **1.0000** |
+
+Loop heads are a superset of parks, so ~1.015 is exactly right. **Stage 6 settles it beyond argument:
+its `n` equals its own run's `occ[86]` to the unit** — the park counter and the stage-6 counter are the
+same event. The stamp fires on every iteration, exactly as the source says.
+
+**=> METHOD RULE 9: NEVER COMPARE A COUNTER ACROSS RUNS.** Probe cost changes the pass count by up to
+5x. `occ[86]` legitimately ranges **30M–154M** across these seven runs *at the same kernel and shape*.
+This is the same family as rule 7 (a magnitude match is not a mechanism): a number that looks wrong
+against the wrong denominator is not evidence of anything.
+
+The "possible hang" was also nothing — just my 10-minute command ceiling across 6 builds + 6 runs.
+Latch was clear at start of day; stages 3,4,5,6 all ran clean, one dispatch at a time.
+
+### 1. Offline verification before any dispatch (rule 6)
+
+Reconstructed the build profile from the findings doc and **proved it by rebuilding stage 3 and
+reproducing the on-disk bin bit-for-bit** (`04efe002`). Then built 4/5/6 and checked all three against
+the shas the brief had recorded: `6c6a7888` / `277e17e7` / `10bba694` — **all three matched exactly.**
+That is the whole profile validated before spending a single dispatch.
+
+### 2. The runs (3 dispatches, one at a time, all clean)
+
+All: `computed=190080` WORK-EXACT, `oracle ok=76032 bad=0`, exit 0, no reset, no latch.
+
+```
+stage4  6c6a7888  mean=0.000097 ms  n=14,713,995  total= 1433.486 ms  span=24,580,112
+stage5  277e17e7  mean=0.001206 ms  n=32,544,886  total=39242.256 ms  span=23,423,040
+stage6  10bba694  mean=0.001040 ms  n=29,906,543  total=31107.661 ms  span=23,108,972
+```
+Plus stage 3 had ALREADY run twice on 07-25 and was never recorded in this log:
+```
+stage3  04efe002  mean=0.000487 ms  n=4,567,862  span=22,966,308
+stage3' 04efe002  mean=0.000477 ms  n=4,873,280  span=22,757,568   (replicates to 2%)
+```
+
+### 3. Normalization — and why `total` is NOT comparable across stages
+
+Pass counts differ up to 5x between runs, so raw `total_ms` is apples-to-oranges (stage 4's run had 5x
+more passes than stage 1's yet 13x less total). Run-invariant metric:
+`ns per loop-head pass = mean x reach`, `reach = n / (occ[86] x 1.01477)`, constant from the stage-1
+run — the one run where `n` IS the loop-head count.
+
+### 4. MS PER STAGE, PER WAVE (479 passes/wave)
+
+The six stages are contiguous and non-overlapping (`:4704`→`:7118`) = a true partition of one pass.
+
+| stage | what | ns/pass | ms/wave | share |
+|---|---|---|---|---|
+| **5** | **`da_peek` reservation attempt (ends in a park)** | 1181 | **0.566** | **34.1%** |
+| **6** | **park + `s_sleep`** | 1025 | **0.491** | **29.6%** |
+| 1 | loop head + `deadman_check` | 618 | 0.296 | 17.8% |
+| 2 | snapshot / FLOWTERM / body-gate | 590 | 0.282 | 17.0% |
+| 3 | role select + dispatch | 41 | 0.020 | 1.2% |
+| 4 | feed → `da_peek` gate | 9 | 0.004 | 0.3% |
+| | **SUM** | **3463** | **1.659** | |
+
+### 5. IT CLOSES — and that is the point
+
+**1.659 ms/wave vs 1.77 ms wave lifetime measured independently by the GAP probe = 94% closure.**
+The GAP probe (two-stamp HEAD/TAIL) shares no code with POLLSTAGE. Two instruments, no common
+mechanism, agreeing to 6%. **This is the first decomposition in this project that reconciles against an
+independent measurement rather than against an assumption** — and it is the reason these numbers are
+quotable when yesterday's PASSTIME/BURSTCNT/WTBUDGET numbers were not.
+
+### 6. WHERE THE TIME IS
+
+**63.7% of every poll pass is stage 5 + stage 6: the reservation peek that FAILS, and the park that
+follows it.** Stages 1+2 (34.8%) are loop-head watchdog and gate re-evaluation. The role economy and
+feed dispatch — stages 3+4, the parts with actual logic in them — are **1.5% combined.**
+
+Consistent with everything else on record: work is ~2%, occupancy is full, launch is clean, ~35% of
+waves never run a single burst, and `occ[86]` says 100% of feed-path iterations find an empty frontier.
+The kernel is not slow at doing things. It is spending its life asking for work and being told no.
+
+### 7. TWO CAUTIONS — read before quoting
+
+1. **Stage 3/4 reach (~9%) is NOT "only 9% of passes survive the body gate."** Stage 5 is downstream of
+   stage 4 yet reaches **98%**. Only possible because `pollstage_leave` is ARMED-gated: ~89% of passes
+   **branch into the feed region below `pollstage_enter 4` (`:5710`)** and are never counted by 3 or 4.
+   Stages 3/4 measure TOP-OF-REGION ENTRY, not gate survival. (The ns/pass figures remain correct —
+   mean and reach are consistent with each other.)
+2. **These are WAVE-TIME attributions on a 15-way-multithreaded SIMD, not instruction latencies**
+   (method rule 4). Stage 6 = 0.491 ms/wave is NOT a claim that `s_sleep` runs for 0.491 ms — `SLEEPN=2`
+   is ~128 clocks. It is a claim about where wave-time lands, which is what was asked for.
+
+### 8. What this does NOT answer
+
+The open question is unchanged and now sharper: the peek fails 98% of the time, so **why does the
+frontier expose so little work?** Structural fact already measured: `ML8_COOP_CHUNK=96` across 64 WGs
+means only 32 WGs per chunk have a second tile, capping next-tile latches at `33 x 32 = 1056 = 3168/3`.
+The kernel cannot invent work the dispatch did not give it. `ML8_COOP_CHUNK` is the compositor-safety
+knob — stepping it is a rule-7 conversation, not a free lever.
+
+---
+
+## 2026-07-26 (afternoon) — 2 WG/CU CONFIG OF RECORD: full sweep, ablations, phase decomposition
+
+**Full write-up: `DSWS_FINDINGS_2026-07-26.md`.** This entry is the raw data.
+~300 dispatches. 0 hangs, 0 GPU resets, 0 latches, every run work-exact.
+
+### Config (kmbandy's, now enforced in build_flow.sh + gpu_run.sh)
+```
+WAVES=16 + ML8_POOL=128 = 128 WGs x 16 waves = 2048 waves (2 WG/CU)   DSWS2_PREFETCH=1 DSWS2_OVERLAP=1
+SEGK free in {64,128,256}   bins: 256->585d287e  128->62001b24  64->bc75d341   all LDS=13824B
+```
+Bring-up: `occ[20]=3296` (=128 WGs; 64 WGs reads 3232), oracle ok=76032 bad=0 stride=1, computed=190080.
+
+### THE CHUNK CONFOUND — the "3.5x regression" was mine
+Same bin/config/shape, ONLY `ML8_COOP_CHUNK` differs:
+```
+chunk  96:  10 chunks/rep   span/rep = 7,750,996 ticks
+chunk 512:   2 chunks/rep   span/rep = 2,017,675 ticks
+=> per-chunk fixed C = 716,665 ticks = 7.17 ms ;  per-tile c = 664 ticks = 6.6 us
+```
+71% of runtime is launch/drain at chunk 512; 92% at chunk 96. Cross-checks vs an independent run:
+predicted 7.17ms + 96x6.6us = 7.8 ms/chunk vs 8.33 measured on 07-25.
+**RETRACTED same-day: the "7,866 ticks/tile constant across 18x K" and the "sub-96-tile cliff" are
+artifacts of pinning chunk=96 (which makes chunks proportional to tiles by construction).**
+
+### Fed sweep, chunk 512 (27 PASS / 0 FAIL / 6 UNSUPPORTED)
+best **4.817** (ml8_dense_ffn_down M2048 K=9216) = 1.57% of 307 peak; mean 0.893; median 0.375.
+vs 07-21 published 4.36 at 1 WG/CU => **+10.5%, no regression.**
+TF tracks n_kseg: 36->1.16, 16->0.54, 10->0.38, 8->0.21, 3->0.12, 2->0.09.
+
+### Ablations, 4 arms x 27 shapes (median % change vs control, + = SLOWER without it)
+```
+NOWMMA +1.6%   NODSADD +1.7%   NOCFLUSH +0.5%   NOBLOAD -0.0%      (noise floor ~1.2%)
+```
+Deleting all math, the LDS reduction, the C store, and the ENTIRE B stream changes nothing, on every
+shape. NOT compute-bound, NOT memory-bound. (kmbandy: this was the wrong instrument for "where is the
+slowness" — it re-proves a negative already known from 07-25 and localizes nothing. Correct.)
+
+### *** PHASE DECOMPOSITION, 6 stages x 27 shapes — THE RESULT ***
+Normalized per shape by that shape's OWN stage-1 loop-head count.
+```
+absolute total ns/pass:  CV 0.33  (7.1x spread, 534-3772 ns)
+phase SHARES:            CV 0.09-0.16
+```
+| stage | what | median share | CV |
+|---|---|---|---|
+| 5 | `da_peek` reservation attempt | **30.0%** | 0.16 |
+| 6 | park + `s_sleep` | **23.9%** | 0.11 |
+| 1 | loop head + `deadman_check` | 21.4% | 0.12 |
+| 2 | snapshot / FLOWTERM / body-gate | 21.0% | 0.11 |
+| 3 | role select + dispatch | 2.0% | 0.14 |
+| 4 | feed -> peek gate | 0.7% | 0.32 |
+
+**NO SHAPE-SPECIFIC SLOWNESS.** Every shape burns wave-time in the same mix, scaled by a per-shape
+constant: 54% failed-reservation+park, 42% watchdog+gate, 2.7% real dispatch logic. Reproduces the
+07-25 single-shape run at the OTHER config (1 WG/CU: s5 34% s6 30% s1 18% s2 17%).
+Stages are fractions of WAVE-TIME; the 7.17 ms/chunk launch/drain is outside all six (no wave exists).
+
+**OPEN:** the 7.1x spread in absolute ns/pass is unexplained (ffn_down ~1150 ns cheapest, lm_head 3772).
+**UNMEASURED:** everything today ran at SEGK=256 only. SEGK 64/128 discriminate per-TILE vs
+per-RESERVATION cost (same work, 4x the reservations) — 3 dispatches, queued.
+
+### Harness fixes
+1. Config of record enforced (`build_flow.sh` defaults+REFUSE, `gpu_run.sh` geometry REFUSE).
+2. **`ML8_POOL` was NEVER passed by `dsws_realshape_bench.py`** — every sweep it ever ran was 64 WGs.
+3. **N PADDING**: M was always padded to 96 with TF corrected by real/padded; N was REFUSED on n%64,
+   silently excluding 6 of 33 shapes incl. `mlmf_mamba_in_proj` (half the Mamba MIMO GEMM path).
+   Harness gap, never a kernel limit — the kernel only sees `NTL=N/64`. Now 30/33 legal at SEGK=256,
+   **33/33 at SEGK=128**. Padding waste reported, not hidden (`router_out` N=8->64 = 700%).
+4. `--segk` CLI knob; `n_kseg=1` is now a property of the chosen SEGK, and the message names the fix.
+5. **CLAIM GUARD + `GPU_RUN_DRY=1`** in `gpu_run.sh` (see below).
+Regression-verified: offline re-parse of all 27 control logs returns identical TF.
+
+### INCIDENTS — I ran on a card another session held, TWICE
+**(1) REAL, 11:22:16-11:25:19.** My claim expired at its 3h TTL (11:22:10); the board correctly
+promoted the queued mlambaformer session at 11:22:16; my driver had no notion of claim validity and
+put 8 more dispatches on the card. Announced (55b11793). Their discipline was correct throughout.
+**(2) INERT, 11:53.** Testing the NEW guard's fail-soft branch, I pointed the board URL at a dead
+address — and fail-soft means PROCEED, so it dispatched while another session held the card. Inert
+only by luck (missing DSWS2_K/MTL/NTL => occ_dispatch opened the KFD node and exited before any PM4;
+41-byte log, 0 resets). Announced (66b286fc).
+
+=> **`gpu_run.sh` now REFUSES if the board positively reports a different holder** (fail-soft on
+unreachable board / missing session id, so an outage never halts work). `DSWS_SKIP_CLAIM_CHECK=1`.
+=> **`GPU_RUN_DRY=1`** runs every guard and dispatches nothing.
+=> **METHOD RULE 12: A FAIL-SOFT PATH CANNOT BE VERIFIED BY EXECUTING IT AGAINST LIVE HARDWARE** —
+"proceed" IS the behaviour under test. Read the code or use a dry run. That is precisely how (2) happened.
+=> `board_release` returns a COUNT, not a boolean. `result: 0` = nothing matched. Verify with board_check.
+
+---
+
+## 2026-07-26 (afternoon II) — SEGK DISCRIMINATION + THE PROBE RETRACTION AND ITS FIX
+
+### 1. SEGK: 256 is optimal, and the cost model closes
+Same shape (ffn_down M2048), chunk 512, 2 WG/CU, only SEGK differs. All work-exact, oracle clean.
+```
+SEGK  n_kseg  reservations   span/rep     TF   vs 256
+ 256      36       190,080  2,017,675    5.0    +0.0%
+ 128      72       380,160  2,445,173    4.1   +21.2%
+  64     144       760,320  3,220,081    3.1   +59.6%
+```
+**PRE-REGISTERED PREDICTION HELD:** from the 256-vs-128 fit I predicted SEGK=64 at 3,300,145 ticks /
+TF 3.05 BEFORE running it; actual 3,220,081 / 3.1 = **2.4% error**.
+```
+COST MODEL (fit from TWO independent experiments that agree):
+    time = chunks x 8.06 ms  +  reservations x 21.3 ns
+r = 2.13 ticks/reservation, consistent across all three pairwise fits (2.038-2.249).
+At the config of record: 80% per-chunk, 20% reservations.
+```
+=> There is NO pure per-tile term. The "664 ticks/tile" from the chunk experiment is just
+reservations-per-tile (G*n_kseg = 216) x 21.3 ns = 461 ticks.
+=> **KILLS the "lower SEGK might be free now that the flush is free" idea.** The flush IS free
+(NODSADD +1.7% across 27 shapes), but smaller segments mean MORE RESERVATIONS, and reservations cost.
+Lower SEGK is also jitterier: spread 1.3% -> 16.8% -> 14.1%.
+
+### 2. *** THE POLLSTAGE PROBE COST 4.8x WHAT IT MEASURED — RETRACTED, THEN FIXED ***
+Measured against a probe-free control, 27 shapes:
+```
+SPAN:        0.99x  (0.91-1.10)   <- looks free
+PASS COUNT:  0.21x  (0.13-0.39)   <- 5x FEWER loop passes in the same span
+```
+Same wall time, one fifth the iterations => each probed pass costs ~4.8x a real one.
+**Stage 1 brackets THREE SALU INSTRUCTIONS** (`deadman_check` is throttled 1-in-64) **and reported
+487 ns.** That number was the instrument.
+**THE CHECK THAT FAILED: I judged probe cost by SPAN (0.99x, reads as free). The right metric was
+WORK COMPLETED — pass count — which said 0.21x. Both numbers were in every log all day.**
+
+Worse than a uniform offset: probe load VARIES BY STAGE, because `pollstage_enter` only fires where
+execution reaches it. s1/s2/s5/s6 ~2.0 sendmsg/pass (4.8x, 4.9x, 3.9x, 4.0x); s3 1.12 (2.87x);
+s4 0.23 (**1.06x — free**). The stages I ranked most expensive carried the heaviest probe.
+A GENERAL CORRECTION IS IMPOSSIBLE: inverting the pass ratio to solve for probe cost yields NEGATIVE
+work on s1/s2/s3 (-138, -153, -76 ns). That is a refutation — the probe changes BEHAVIOUR, not just
+per-pass cost, so it cannot be arithmetically removed.
+
+### 3. ROOT CAUSE IS THE CHIP, AND THE FIX IS RATE NOT MECHANISM
+Verified with the assembler: **gfx1201 has NO cheap clock.** `s_memtime` and `s_memrealtime` are
+"not supported on this GPU"; there is no HW_REG shader-cycle register. `s_sendmsg_rtn`
+(MSG_RTN_GET_REALTIME) is the ONLY shader-readable clock, it serialises across 2048 waves, and one
+read costs about what two whole poll passes cost. Hand-rolled RTC stamps exist here at all because
+**rocprof cannot see a raw-PM4 kernel** (RESULT_MBGEMM.md:55) — we dispatch below the HSA layer it
+hooks, which is the price of the dyn-VGPR moat.
+
+FIX SHIPPED: gate the probe 1-in-`DSWS2_POLLSTAGE_EVERY` (default 64) on **PS_THR = s78, a PRIVATE
+counter, deliberately NOT s71** (prefetch keys off s71 — that shared trigger produced the 7x PASSTIME
+phantom on 07-25). Only the ENTER is gated; `leave` already skips on ARMED==0, so start/end cannot
+desync. Unsampled passes cost 3 SALU and touch no message bus.
+Verified offline: POLLSTAGE=0 byte-identical (585d287e); probe adds exactly 2 sendmsg; s78 zeroed;
+EVERY live (1/64/256 give distinct bins); emitted gate confirmed by disassembly
+(`s_add_co_u32 s78` — note the assembler emits `s_add_co_u32`, not `s_add_u32`).
+
+### 4. THROTTLED RESULT — VALIDATED BY CONVERGENCE (ffn_down M2048, 8 dispatches)
+```
+CONVERGENCE (the check that makes these quotable):
+  s1: EVERY=64  45 ns   EVERY=256  44 ns   2.2% apart
+  s5: EVERY=64 273 ns   EVERY=256 265 ns   2.9% apart
+PROBE NOW FREE: pass count 0.88-1.03x control (was 0.13-0.39x); per-pass cost 1.07x (was 4.8x).
+```
+ns per loop-head pass, null-subtracted (s1) and reach-weighted:
+| stage | mean ns | minus null | reach | ns/pass | share |
+|---|---|---|---|---|---|
+| s5 peek reservation attempt | 273 | 228 | 0.563 | **128.3** | **62.0%** |
+| s6 park + s_sleep | 149 | 104 | 0.561 | **58.4** | **28.2%** |
+| s4 feed -> peek gate | 214 | 169 | 0.070 | 11.9 | 5.7% |
+| s3 role select + dispatch | 139 | 94 | 0.068 | 6.4 | 3.1% |
+| s2 snapshot / body-gate | 47 | 2 | 0.971 | 1.9 | 0.9% |
+| s1 loop head + deadman | 45 | NULL | 1.000 | — | — |
+| | | | | **207.0** | total |
+
+**ALL SIX STAGES ARE NOW COMPARABLE** — under the unthrottled probe s3/s4 sat in a different
+contention regime and could not be placed on the same scale at all.
+**CORRECTION:** s3 and s4 are NOT cheap per EXECUTION (94 and 169 ns, same order as s5's 228). They
+are small per-PASS only because they execute on ~7% of passes. **Reach and cost are separate facts.**
+
+=> METHOD RULE 13: JUDGE AN INSTRUMENT'S COST BY WORK COMPLETED, NOT ELAPSED TIME. A probe that
+trades throughput for wall-clock looks free on a span and is not.
+=> METHOD RULE 14: A THROTTLED INSTRUMENT MUST PROVE CONVERGENCE — run two sampling rates and require
+agreement. Without it, "cheap" is an assertion.
+
+---
+
+## 2026-07-26 (evening) — THE BURST, AND RGA ON THE REAL KERNEL
+
+### 1. THE SIX-STAGE PARTITION WAS NEVER A PARTITION (my error, stated as fact earlier today)
+I wrote that stages 1-6 were "contiguous and non-overlapping, a true partition of one poll pass."
+**FALSE.** A wave that WINS work branches into the burst and rejoins at `.Lflow_da_ss_complete` (:5561)
+— **BACKWARD, into stage 3's range**. So a work pass traverses stages 3/4/5 TWICE, never reaches
+`pollstage_leave 5` (its sample is silently DROPPED), and dumps its whole burst into stage 3's interval.
+That is why the six-stage accounting closed to ~4% of runtime: **it partitions the PARK path only.**
+
+### 2. NEW STAGES 7/8/9 — single entry, single exit (EVERY=1: the site runs only ~46x/wave/launch)
+```
+stage 7  burst + grow + shrink   200.253 us   n=316,800
+stage 8  burst + shrink          202.645 us   n=316,800
+stage 9  burst body only         196.667 us   n=316,800
+```
+=> **s_alloc_vgpr GROW ~0 and the SHRINK spin ~0.** The whole 197 us is the burst body.
+*** THIS AGREES WITH PRIOR WORK AND THAT IS THE POINT: *** 2026-06-20 measured GROW+SHRINK = 0.0% of
+COMPUTE with an in-kernel timer, and door4 grow-fail has been 0 in every run ever. The NEW instrument
+reproduced a KNOWN-TRUE result — the external cross-check this project's probes have mostly lacked.
+
+### 3. ARITHMETIC CORRECTION (I got this wrong once before correcting it)
+I first reported "46 bursts/wave, closes at 99%". WRONG — that used the COMPUTED-UNIT count. Each burst
+covers ACC_N=3 units, so it is **15.5 bursts/wave**:
+```
+wave lifetime  9.17 ms      burst 3.10 ms (34%)   poll 0.45 ms (5%)   UNACCOUNTED 5.62 ms (61%)
+```
+=> **METHOD RULE 15: A PER-WAVE WALL-CLOCK DURATION IS NOT MACHINE TIME.** The machine completes a
+burst every **317 ns** while a wave experiences it as 197 us — the difference is 2048-way overlap.
+That dissolves the apparent contradiction with the ablations (deleting burst work moves nothing
+because the burst is overlap, not cost) and it is the SAME "period != cost" trap the 07-25 notes warned
+about. I walked into it twice today.
+
+### 4. *** RGA NOW RUNS ON THE CONFIG-OF-RECORD KERNEL — AND THE DESCRIPTOR WAS LYING ***
+Three things were stale (kmbandy: "this is basically a whole new kernel at this point"):
+- `rga_check.sh` defaults to `KSRC=occ_kernel_wggemm2.s` — **a different kernel entirely**
+- it applies **no config-of-record defsyms**
+- `RGADESC`'s `.amdhsa_group_segment_fixed_size` read **65536** while the config of record publishes
+  **13,824B**. RGA computes occupancy FROM that number, so it would have reported **1 WG/CU on a kernel
+  we run at 2 WG/CU** — a 4.7x error in the single figure RGA is most used for.
+FIXED: the descriptor now reads `LDS_TOTAL_FLOW` — the same symbol emitted into `.lds_total` and read
+by the host — so it can no longer drift from the bin. Verified: `USED_LDS_BYTES 13824`.
+NOTE `build_flow.sh` does NOT pass RGADESC; assemble directly (my first "it assembles" test was a
+silent no-op that proved nothing).
+
+### 5. RGA ON THE REAL KERNEL (config of record: FM=1 G=6 ACC_N=3 SEGK=256 WAVES=16 prefetch on)
+```
+USED_LDS_BYTES 13,824 / 65,536      USED_VGPRs 256 / 256      SPILLS 0 (VGPR and SGPR)
+Maximum # VGPR used  48  (HW allocates 96)   Maximum # SGPR used 54 / 106   ISA_SIZE 26,592
+```
+**PEAK LIVE VGPR IS 48 OF 256.** The 165.7 TF reference kernel measured 187. The register file is ~81%
+unused with zero spills — because **our accumulators live in LDS, not registers** (split-K + ds_add).
+hipBLASLt's gfx1201 fp8 kernels are ALL `_GSU1_`: accumulators in VGPRs across the whole K loop, C
+stored once. That teardown was already in the repo; this is the first time it has been tied to a
+measured register-occupancy number.
+
+### 6. THE TILE SWEEP (RGA static, no GPU)
+```
+FM  G  ACC_N  tileM     LDS   2xLDS  peakVGPR  spill  WMMA  nonWMMA:WMMA
+ 1  6      3     96  13,824  27,648      48      0    128        13.15
+ 2  4      2    128  13,824  27,648      82      0    256         7.38
+```
+**13.15 -> 7.38, a 1.78x reduction in instruction overhead per WMMA**, at IDENTICAL LDS (still 2 WG/CU),
+0 spills, peak-live 48 -> 82 of 256. Reference point: the 165.7 TF kernel runs **0.97** non-WMMA/WMMA.
+EVERY larger tile (FM=2 G=6, FM=4 G=4, FM=2 G=8, FM=4 G=6) is REFUSED by the kernel's own guard:
+*"DSWS2 single-slot operand layout exceeds the 65536B WGP limit"*. So the cap on tile size is the
+**operand layout**, not the register file (32% used) and not LDS (21% used).
+
+CAVEAT, and it matters: this is a STATIC INSTRUCTION COUNT. It says the CODE has 1.78x less non-WMMA
+work per WMMA. It does NOT say throughput improves 1.78x — ports co-issue, and the WMMA-bearing region
+I measured is "first WMMA to last WMMA", which I have NOT proven is only the k-step loop.
+FM=2 G=4 changes the super-tile to 128 rows (from 96), so MTL and M-padding change for every shape =>
+needs its OWN oracle bring-up, not a drop-in into the sweep.
+
+### 7. THREE DEAD-CODE PLACEMENTS, all caught only by pre-registering an expected magnitude
+(a) probe in the `DSWS2_ROLEFLOW=1` arm — compiled out at the config of record -> n=0
+(b) throttle `EVERY=64` on a site executing ~46x/launch, so the counter never reached the modulus -> n=0
+(c) a python `str.replace` that silently no-op'd (comment lines broke the exact match) -> half a probe
+=> **THROTTLE COROLLARY: `EVERY` must be smaller than the site's executions per launch.**
+=> **PATCH RULE: assert the edit landed. A no-op replace is silent.**
+=> A bare `n=0` reads like "this path is free". It is the same "zeros that were never measurements"
+   trap this project has now hit seven times.
+
+### 8. Host bug
+The WTBUDGET print computes `budget = span(0) x resi`, so `T SANITY` ALWAYS reports FAIL. The span
+variable is 0 in that block. All WTBUDGET figures here were computed by hand from the raw sums:
+wave lifetime 9.17 ms, residency sum(T)/(span x 2048) = 0.564, prologue E = 16.5% of budget,
+peak concurrent 2048 = nominal, entries 20,480, live_net 0.
+CAVEAT: that run is 1.58x its matched control, so those proportions are probe-affected.
+
+---
+
+## 2026-07-26 EVENING — FM=2 G=4 ACC_N=2 ORACLE BRING-UP: A GPU RESET, THEN THE FIRST EVER GROW-FAIL
+
+The bring-up the previous entry called for. It reset the GPU once, then ran, then failed correctness.
+**Net: the FM=2 tile is CORRECTNESS-BROKEN, and the reason is that it is the first config in the
+project's history to make the dyn-VGPR budget bind.**
+
+### 1. THE GPU RESET (17:08) — a `.bin` copied without its `.lds` sidecar
+`build_flow.sh` emits TWO artifacts per build: `$tag.bin` AND `$tag.lds` (a 4-byte u32 holding the LDS
+byte count the host must allocate). They are SEPARATE FILES. I built FM=2 as `fm2.bin`, copied only the
+`.bin` into place, and left the `.lds` from a build 14 minutes earlier. Host allocated **13,824B for a
+kernel needing 17,920B** -> ran past its LDS -> `MES failed to respond to msg=REMOVE_QUEUE` -> MODE1
+reset -> VRAM lost. The rebuilt bin has the **SAME sha `e274377d`** as the one that crashed: the binary
+was always correct, only the sidecar was stale.
+
+**BLAST RADIUS — a MODE1 reset on this box kills EVERY GPU client, including the compositor.**
+`llama-server` SIGABRT (router restarted it); **Hyprland itself SIGABRT** in
+`onFrame -> renderMonitor -> beginRender -> CHyprOpenGLImpl::begin -> assertImpl`; `hyprlock` SIGABRT.
+Hyprland restarted but held a session lock whose lockscreen process was gone, so **kmbandy was locked
+out of his own desktop.** Fix: `hyprctl --instance 0 eval 'hl.clear_crashed_lockscreen()'`.
+NOTE this is NOT rule 7 (HBM starvation kills the compositor). The compositor was never starved — a
+RESET killed a GPU CLIENT. Rule 7 watches the compositor only; nothing watched the other GPU consumers.
+
+**NEW FAIL-CLOSED GUARD** in `gpu_run.sh`: refuses when the `.lds` is missing or older than the `.bin`.
+Self-tested on 4 cases incl. a replay of the reset with its real timestamps. Deliberately NOT fail-soft
+like the claim check — a stale sidecar is never ambiguous and never someone else's outage.
+
+**THE LESSON: A WARNING THAT FIRES ON EVERY RUN IS A WARNING NOBODY READS.** The host PRINTED the defect
+before launch (`host reconstruction says 67072B but the BIN PUBLISHES 13824B`). That line prints on EVERY
+dispatch and is normally benign, so I had trained myself past it. See section 4 for why it is always wrong.
+
+### 2. THE COMPOSITOR CAP IS NOT TILE-PROPORTIONAL — a knob sweep that returned a constant
+Per-chunk wall time, FM=2:
+
+```
+ML8_COOP_CHUNK   chunks   wall @base0
+     512            2        0.81s
+     256            3        0.81s
+```
+
+**Identical.** Flat sweep = fixed cost elsewhere (the 07-13 lesson, again). So lowering the chunk can
+NEVER satisfy the 0.75s cap, and the corollary inverts intuition: **fewer, bigger chunks are strictly
+cheaper on this kernel.** I predicted ~0.40s at 256 and was WRONG; "FM=2 doubles work per chunk" is dead.
+
+`ML8_COOP_CHUNK_MAXS` IS a legitimate knob, unlike `DEADMAN_TICKS`: `occ_dispatch.cpp:1599` names raising
+it as the remedy, and the check is **reactive** (`now_s()-t0`, measured AFTER the chunk completes), so an
+over-cap chunk has already executed and the desktop has already survived it. 0.75 -> 0.85 let it finish.
+
+### 3. THE ACTUAL FAILURE — first ever grow-fail, and it is the DESIGNED throttle
+Config: `WAVES=16 G=4 FM=2 FN=4 ACC_N=2 SEGK=256 SSWIN=32 POOL_N=1 JDEPTH=1`, oracle 2048x2560x9216,
+`TOTAL_super=23040`, `n_kseg=36`, `reps=2`, LDS 17,920B (alloc 17,920B).
+
+```
+computed = 110,846   expected = 184,320 (G*TOTAL_super*reps)   -> 40% OF WORK LOST
+oracle   ok=10,416   bad=10,064   max_rel=1                     -> ~half the tiles WRONG
+occ[73] grow-fail                                  =   489,791   <- WAS 0 FOR THE WHOLE PROJECT
+occ[96] emissions reaching .Lflow_da_stamp         =    60,444   (expected 46,080) -> OVER-emitting
+occ[97] release bailed on inflight==0              =    36,426
+occ[95] exec lane0 inactive at claim CAS           =         0
+occ[88] carrier stall / occ[98] baton wait         =     0 / 0   <- baton NEVER engaged despite 489k
+COAST decomposition DOES NOT CLOSE: door sum 256,926,347 vs coast 256,915,548 (off by 10,799)
+```
+
+**OVER-emitting while UNDER-computing simultaneously is the signature of a claim being won more than once.**
+
+**WHY NOW:** FM=2 doubles `ACC_STRIDE` (`FM*FN*1024` = 8192 vs 4096) and the VGPR budget binds for the
+first time. And this path is not an error path — the kernel ASSERTS at `:1338`:
+`.if SELFSERVE && !BATONGATE / .error "SELFSERVE requires BATONGATE=1: physical s_alloc_vgpr grow-fail is
+the only admission throttle."` The FATTOK/MAXFAT software token layer is compiled to no-ops. So
+**grow-fail IS the intended steady-state throttle, it had never once executed, and on its first real
+outing it drops 40% of the work.** Prior art to check: Codex's 2026-07-24 BLOCKER 1 (grow-fail stamp
+writes `SL_RBNEXT=0`/claimable BEFORE `SL_STI`, breaking the poison-clear-means-staged ABA invariant ->
+stale-STI claim -> silent wrong C), which my own notes flagged as **"invisible offline because
+grow-fail=0."** Adversarial Codex review commissioned; my static read is NOT evidence (this bug class has
+beaten static reasoning three times).
+
+### 4. TWO STALE GUARDS, both reporting PASS while measuring the wrong thing
+**(a) `gate_lds.sh` (dated Jul 20) IGNORED its env.** `POOL_N=1; ACC_N=3; FM=1; ...` were plain
+assignments, so `FM=2 ACC_N=2 ./gate_lds.sh` silently tested FM=1 ACC_N=3 anyway. It also never tested
+`SSWIN=32` — the config of record. I read its PASS as evidence the FM=2 LDS number was sound; it was
+evidence of nothing. FIXED: `: ${VAR:=default}` so env wins, SSWIN=32 added, and over-allocation is now
+caught (the old check was `kernel <= host`, which a 4x over-allocation passes happily).
+
+**(b) THE HOST'S LDS RECONSTRUCTION IS WRONG BY ONE OPERAND POOL — this is why the warning always fires.**
+`ldsBytesRaw` includes `POOL_N*opstride`, but under SELFSERVE the kernel RECLAIMS the operand pool
+(`ACC_BASE = OP_BASE`, *"operand pool reclaimed (SELFSERVE owns this)"*). `opstride = FN*16*SEGK +
+G*16*FM*SEGK` = 40,960B at the config of record. The fixed gate now reproduces both sides exactly:
+
+```
+config              SSWIN=32 kernel    host raw    ratio
+FM=1 ACC_N=3 G=6        13,824B        54,784B      ~4x
+FM=2 ACC_N=2 G=4        17,920B        67,072B      ~3x     <- 67,072 is the number in tonight's warning
+```
+
+Kernel side independently hand-derived from source constants (`OP_BASE=512`, `SLOTC_STRIDE=32`,
+`ACC_STRIDE=FM*FN*1024`): `512 + 2*8192 + 32*32 = 17,920` and `512 + 3*4096 + 32*32 = 13,824`. Three
+independent agreements (bin, sidecar, hand-derivation) — the kernel's LDS algebra is RIGHT for FM=2.
+The host's is wrong. `occ_dispatch.cpp` fix NOT yet applied.
+
+### 5. METHOD ERRORS
+**(a) I pre-registered `computed == 92,160` and the real expectation was 184,320** — I dropped the
+`reps=2` factor. 92,160 is EXACTLY HALF, so had the kernel lost precisely 50% of its work I would have
+declared a broken run a success. The pre-registration saved me only because the miss was 40%, not 50%.
+=> **DERIVE THE EXPECTATION FROM THE HOST'S OWN FORMULA INCLUDING `reps`, never from a remembered number.**
+
+**(b) I called a process a survivor without checking its start time.** Reported "Hyprland never crashed"
+from a live pid — which was born 15s AFTER the reset. The disproof (`time: 1785100132` = 17:08:52) was in
+`hyprctl instances` output I had already printed and not read. => **A live pid is not evidence a process
+never died. Compare its START TIME to the incident.**
+
+**(c) `journalctl --time-style` without a date filtered every log in history by time-of-day.** Attributed
+dozens of prior-day runs to tonight's window. => Filter by `-newermt`, not by clock time.
+
+**(d) GPU forensics on this box have a ~38-minute half-life.** A `razeraccessory` error loop is flushing
+the kernel journal; the 17:08 reset lines were GONE by 19:00. "0 resets" then means "the journal no longer
+retains it", NOT "no reset happened". Worth fixing independently of DSWS.
+
+### 6. ADVERSARIAL CODEX REVIEW (19:24) — MY HYPOTHESIS WAS WRONG; THE REAL DEFECT IS A MISSING STAGE PUBLICATION
+
+**THE DEFECT: the grow-fail fallback publishes CLAIMABLE work but never advances `STAGE_HEAD`.**
+`occ_kernel_dsws_flow.s:6603-6615`. The comment there still reads *"deliberately NO STAGE_HEAD walk
+here ... nothing claimable published (RB_PENDING poison, permanent under this defsym)"* — **that comment
+describes a design that no longer exists.** Under `SELFSERVE=1`, line 6580 skips the RB_PENDING poison
+store and line 6590 publishes `0`, which IS claimable. So the fallback stamps a valid claimable slot and
+branches to `.Lflow_loop` without ever publishing it.
+
+**THE CIRCULAR STALL:** compute gates on `DRAIN==STAGE` (`:5082-5087`) and coasts, so it can never reach
+the perfectly valid `RBNEXT=0` claim. Unstaged fallbacks pile up until `ASSIGN-DRAIN==SSWIN`
+(`:5969-5978`), which then rejects every new reservation BEFORE any grow attempt. Even once VGPR space
+frees, nothing can move: ring compute blocked by `DRAIN==STAGE`, self-serve blocked by the window gate.
+`deadman_check` retires waves individually and their reservations die uncomputed -> silent lost work.
+
+**THE ARITHMETIC CLOSES EXACTLY**, which is what makes this conclusive rather than plausible:
+
+```
+missing reservations  31,716 x ACC_N=2   =  63,432
+fallback work lost    21,598 - 11,556    =  10,042
+                              total      =  73,474
+reported loss    184,320 - 110,846       =  73,474   <- exact
+```
+
+It also derives the coast-door mismatch independently: `occ[73]` conflates TWO grow-fail sites (`:6543`
+post-reservation self-serve, `:7176` pre-claim ring-compute) and only the second enters coast, so the host
+invariant `coast == CNOSTG+CLEAD+FATFULL+GROWFAIL` must fail by exactly the self-serve fallback count
+= **10,799** = the observed gap.
+
+**FIVE THINGS FROM SECTION 3 ABOVE ARE WRONG — corrected here:**
+
+| claimed in section 3 | actual |
+| --- | --- |
+| "OVER-emitting while UNDER-computing = a claim won more than once" | **NO over-emission exists.** `GROUPS = G/ACC_N = 2`, so the `occ[96]` target is `GROUPS*TOTAL_super*reps = 92,160`, not 46,080. 60,444 is **UNDER**-emission by 31,716. **The HOST label is wrong** at `occ_dispatch.cpp:2535` (also 2548, 2559) — it says "expect == TOTAL_super" and omits GROUPS. The entire duplicate-claim theory came from a host accounting bug. |
+| "Codex's 2026-07-24 BLOCKER 1 (stale SL_STI) is probably still live" | **FIXED AND COMPLETE.** `:6583-6601` writes `SL_STI` before `SL_RBNEXT=0`, and `SL_RBDONE=0` before `SL_GEN`. Both publication races closed. |
+| "baton never engaged despite 489k grow-fails (`occ[98]=0`)" | **MEANINGLESS.** There is no `.Lflow_batonwait` label and **NO WRITER AT ALL** to `occ[98]`. I cited an unwired counter as evidence — the **EIGHTH** time this project has been misled by a zero that was never a measurement. **GREP FOR THE WRITER, NOT THE READER.** |
+| "100% of feed-path iters found an EMPTY ASSIGN frontier" | `occ[86]` increments at the common `.Lflow_feedmt_sleep` exit including window-full and boundary bails. Label over-specific. |
+| "`occ[97]` = release bailed on inflight==0" | At `:6365` it counts boundary drain / C-store-gate bails. Host label at `occ_dispatch.cpp:2536` is stale. |
+
+**STILL TRUE:** FM=2 doubles `ACC_STRIDE` and is the first config ever to make the VGPR budget bind;
+grow-fail IS the designed admission throttle under SELFSERVE+BATONGATE (`:1338`); the compositor cap is
+not tile-proportional; `ML8_COOP_CHUNK_MAXS` is a legitimate knob unlike `DEADMAN_TICKS`.
+
+**METHOD:** my static read lost AGAIN — **fourth** time this bug class has beaten static reasoning on this
+kernel. The standing "adversarial review is mandatory, my *looks correct* is not evidence" rule paid for
+itself outright. Two process notes: use `codex_handoff`, not the codex-rescue subagent (kmbandy, tonight);
+and I identified the review's rollout by **most-recent-file** and pulled ANOTHER SESSION'S mlambaformer
+bf16 task, nearly reporting it as my verdict — **this box runs Codex from multiple sessions, so identify a
+rollout BY CONTENT, never by recency.**
+
+**FIX NOT WRITTEN.** Indicated repair is a `STAGE_HEAD` publication on the grow-fail path; the existing
+`.Lflow_da_ss_stage_walk` (`:6660-6680`) is reachable only from the successful-grow path. Any fix needs
+its own adversarial review before it is trusted. **The FM=1 control run remains worth doing**: it settles
+whether the config of record has been silently exposed to this same stall all along.
+
+### 7. GROW-FAIL FIX VALIDATED — FULL ml8/mlambaformer SWEEP AT FM=2, 30/30 ORACLE-CLEAN
+
+**(a) Change.** `.Lflow_da_gf_stage_walk` added on the self-serve grow-fail path (Codex, reviewed by me):
+the fallback published a claimable slot (`SL_RBNEXT=0` under SELFSERVE) but never advanced `STAGE_HEAD`,
+so compute — gated on `DRAIN==STAGE` (`:5082-5087`) — could never claim it. Unstaged fallbacks filled
+`SSWIN`, new reservations were then rejected before any grow attempt, and `deadman` retired the stuck
+waves with their reservations uncomputed.
+
+**(b) Config.** Kernel `WAVES=16 G=4 FM=2 FN=4 ACC_N=2 SEGK=256 SSWIN=32 POOL_N=1 JDEPTH=1`,
+LDS 17,920B. Host `FLOW_WAVES=16 ML8_POOL=128 ML8_COOP_CHUNK=512 ML8_COOP_CHUNK_MAXS=0.85
+STAGINSTR=1 TFPROBE=1`, via `dsws_realshape_bench.py live --fm 2 --g 4 --acc-n 2`.
+
+**(c) Shapes.** All 33; **30 legal, 3 UNSUPPORTED** (`n_kseg=1 < 2` at SEGK=256 on the tiny router
+shapes — identical at FM=1, NOT an FM=2 limitation, fixable with `--segk 128`).
+
+**(d) Outcome. 30/30 PASS. oracle bad=0 on every shape. WORK-EXACT on every shape.**
+
+```
+                              M       K     TF    grow-fail   oracle
+ml8_dense_ffn_down         2048    9216   4.20    3,412,194   bad=0   <- best
+ml8_dense_ffn_down          512    9216   2.13   35,362,942   bad=0
+ml8_dense_attn_q           2048    2560   2.07      243,156   bad=0
+ml8_dense_attn_o           2048    4096   2.03    2,102,546   bad=0
+ml8_dense_ffn_gate_up      2048    2560   1.85      222,181   bad=0
+ml8_dense_attn_kv          2048    2560   1.12    2,230,216   bad=0
+mlmf_mamba_out_proj        4096    1536   1.05       41,269   bad=0
+ml8_moe_attn_o              512    4096   0.92   14,067,065   bad=0
+mlmf_lm_head               4096     768   0.66        1,959   bad=0
+mlmf_in_proj_ML8PAD        4096     768   0.64          549   bad=0
+...                                  0.02-4.20    all > 0     all bad=0
+```
+
+*** GROW-FAIL FIRED ON 30/30 SHAPES — 140,708,123 EVENTS TOTAL. *** This is what makes the sweep a real
+test rather than a vacuous pass: the repaired path executed on every shape. Before the fix, this same
+config lost 40% of its work and returned `bad=10,064` of 20,480.
+
+**THE MECHANISM HEADLINE:** `s_alloc_vgpr` grow-fail is the ONLY admission throttle under
+`SELFSERVE=1 BATONGATE=1` (kernel asserts this at `:1338`; the FATTOK/MAXFAT token layer is compiled to
+no-ops). It had been **exactly 0 on every run in this project's history** — the dyn-VGPR moat never once
+engaged. FM=2 doubles `ACC_STRIDE`, the budget binds, and it now runs correctly across the entire real
+workload.
+
+**(e) WHAT THIS DOES NOT SHOW.** TF is 0.02–4.20 against hipBLASLt on these same
+**[CORRECTED 2026-07-27 EVE: the hipBLASLt band on real DENSE shapes is 123-189 TF, not 12.6-70.6. That band was the ml8 MoE M=512 subset only. Mean ratio ~80x. See RESULTS_DSWS_vs_hipBLASLt_2026-07-21.md and the CORRECTION box in DSWS_BRIEF_2026-07-27_AM.md.]**
+
+shapes. **This was a CORRECTNESS fix and throughput did not move.** The ASSIGN-bound wall is unchanged
+(100% of feed-path iters find an empty frontier; coast ~97%). Do not read 30/30 oracle-clean as progress
+on the perf problem — it is permission to *start* measuring FM=2 honestly.
+
+**TWO HARNESS TRAPS FIXED BEFORE THE SWEEP COULD BE TRUSTED:**
+1. `LIVE_FM` was **hardcoded to 1** with no CLI flag while `--g` *was* a flag. The sweep would have
+   dispatched FM=1 geometry (96-row super-tile) against the FM=2 bin (128-row) — every shape's M-padding
+   computed for the wrong tiling. Added `--fm`. *A knob that is a flag on one axis and a constant on a
+   coupled axis is a trap, not a default.*
+2. No `ML8_COOP_CHUNK_MAXS` passthrough. FM=2 measures 0.81s/chunk against the 0.75s compositor cap, so
+   all 30 shapes would have ABORTED and been recorded as 30 "failures" that are not kernel failures.
+   Added `--chunk-maxs` (0.85). The cap is NOT tile-proportional, so lowering `--chunk` cannot substitute.
+
+**A THIRD, FOUND BY THE SWEEP ITSELF.** Run 1 halted at shape 21 with `AMBIGUOUS_REAL_N`:
+`mlmf_mamba_in_proj` (N=4200) and `mlmf_in_proj_ML8PAD` (N=4208) both pad to N=4224, so the parser could
+not attribute the result and refused. **That refusal was correct** — mis-attributing a TF number is worse
+than stopping — and the kernel run itself was clean (`WORK-EXACT`, `bad=0`). But the parser was
+reverse-mapping padded geometry to recover something the live caller already knew. Fixed with
+`EXPECTED_SHAPE`: live mode passes ground truth, offline re-parse still refuses (it genuinely cannot
+know), and **a deliberately wrong hint is rejected**, so the escape hatch cannot mask a geometry bug.
+Run 1 was 20 PASS / 1 attribution-halt / 9 NOT_RUN — 21 of 21 kernels clean, zero correctness failures.
+
+### 8. RETRACTION — "ASSIGN-BOUND" IS NOT SUPPORTED BY occ[86], AND NEITHER IS "CARRIERS ARE FED" BY occ[88]
+
+**RETRACTED from section 7(e) and from tonight's reporting: the claim that the wall is ASSIGN-bound.**
+kmbandy, 2026-07-26: *"we've consistently said it was that and then consistently found that it wasn't
+that...we need to measure before we make claims like that."* He is right, and the failure is worse than a
+loose phrase — Codex told me this same evening that `occ[86]` is over-specific, I wrote that correction
+into section 6 of this very log, and then I asserted "100% of feed-path iters find an empty frontier"
+two messages later.
+
+**WHY occ[86] CANNOT SUPPORT IT.** It increments at the COMMON `.Lflow_feedmt_sleep` exit, reached by an
+empty ASSIGN frontier AND by window-full bails AND by ZLOCK boundary bails. It measures *"gave up on the
+feed path"*, not *"the frontier was empty."* Track record: **"ASSIGN-starved 76%" became 1.8% purely by
+feeding the kernel to steady state (2026-07-13).** This exact claim has a history of evaporating.
+
+**THE HOST WAS PRINTING THE VERDICT TOO** — `=> ASSIGN-BOUND (coordinator cannot publish fast enough)` —
+derived from that conflated ratio. Removed; it now reports the count and explicitly says it does not
+identify a bottleneck, and points at RESVPROBE.
+
+**A THIRD ONE, FOUND WHILE FIXING THE SECOND.** The line above it printed
+`occ[88]=0 -> carriers are fed (stall is not the wall)`. `occ[88]` IS properly wired (`cnt_inc CNT_JWAIT`
+at `:5406`) — but `.Lflow_jwait` is the DEEP-J carrier wait and **at JDEPTH=1 the path does not exist**;
+the kernel states this at `:2974` (*"JDEPTH=1 => no JWAIT/CLEAD"*). A carrier at JDEPTH=1 computes one
+segment and shrinks, never waiting for a next stage. **That zero is structural, not a measurement.**
+
+=> **NEW RULE, generalising the unwired-counter rule: CHECK REACHABILITY, NOT JUST THE WRITER.**
+"Grep for the call site" is necessary but NOT sufficient — the site must also be compiled in AND reachable
+in the config under test. Unwired counter and unreachable-path counter produce the identical symptom (a
+confident zero) and this project has now been fooled by both.
+
+**WHAT WOULD ACTUALLY MEASURE IT: RESVPROBE.** It already exists and splits the bails by cause —
+`occ[87]` CAS-loss (cursor contention) vs `occ[89]` window-full (consumers behind) vs the boundary
+remainder, against `occ[96]` wins. Its verdict logic is legitimate *because it is computed from the split,
+not from the merged total*. Requires a bin built `RESVPROBE=1` and run with `DSWS2_RESVPROBE=1`.
+NOT YET RUN — so as of this entry **we do not know what the wall is at FM=2**, and section 7(e)'s
+"ASSIGN-bound wall is unchanged" should be read as: *coast is ~97% and the cause is unmeasured.*
+
+---
+
+## 2026-07-27 MORNING — THE WALL IS MEASURED. IT IS PRODUCER-SIDE FRONTIER STARVATION.
+
+Answers the question the 2026-07-26 entry closed on ("we do not know what the wall is at FM=2").
+Two dispatches, both clean, both at the FM=2 G=4 ACC_N=2 primary config on
+`ml8_dense_ffn_down M2048 N2560 K9216`. Gates on BOTH: `oracle bad=0` at **640/640 tiles, stride=1**,
+`computed=460,800` WORK-EXACT, `occ[96]` delta **+0**, `occ[0]=0`, canary clean, no resets, no latch.
+
+| run | bin | probes |
+|---|---|---|
+| L0  | `2ca16ea0…` 30,824 B | RESVPROBE=1 |
+| L0b | `61ffe8b2…` 31,016 B | RESVPROBE=1 BNDSPLIT=1 |
+
+### 1. THE ANSWER — 96.1% of feed-path bails are an EMPTY FRONTIER
+
+L0b, 29,928,830 bails = **129.9 feed iterations per successful reserve**:
+
+| bucket | count | share of bails |
+|---|---:|---:|
+| CAS-loss `occ[87]` | 488,061 | 1.6% |
+| window-full `occ[89]` | 164,203 | 0.5% |
+| boundary `occ[97]` | 513,443 | 1.7% |
+| **UNACCOUNTED — frontier simply EMPTY** | **28,763,123** | **96.1%** |
+
+Not the cursor. Not the window. Not the tile, the register file, or LDS. The **producer** cannot
+publish work fast enough.
+
+### 2. BNDSPLIT LOCALIZES IT — only 1.6% of boundary entries ADVANCE
+
+33,653 sampled entries (1/64 throttle → ~2,153,792 real):
+
+| outcome | share |
+|---|---:|
+| `ZLOCK_LOST` (herd: lost the election CAS) | **76.5%** |
+| `DRAINGATE_BAIL` (won, DRAIN<ASSIGN) | **0.0%** |
+| `CSTOREGATE_BAIL` (won+drained, GSTORED gate) | **21.8%** |
+| `ADVANCE` (passed both → DA_ZDONE++) | **1.6%** |
+
+**MEASURED CAUSAL CHAIN:** the frontier only refills on a boundary ADVANCE → only 1.6% of entries
+advance (1 per 61) → of the waves that WIN the lock, **93%** are then blocked by the **GSTORED
+C-store gate** → the other 76.5% never win it → frontier empty 96% of the time → coast 97.2%.
+
+`DRAINGATE_BAIL = 0.0%` is a REAL measurement, not a structural zero: the host computes it as
+`ZWON − PDRAIN`, a difference of two live counters. **Drain is never the blocker.**
+
+### 3. RETRACTION — "SHARD THE CURSOR" IS NOT SUPPORTED
+
+The pre-fix RESVPROBE verdict printed `CURSOR-CONTENDED → SHARD THE CURSOR` on this very run
+(contention 2.118 > 1.0). It was wrong, and wrong *structurally*: it compared CAS-loss against
+`occ[96]` (successful reserves) and window-full against `occ[86]` (bails) — **two different
+denominators** — and so never asked what share of the bail population it had explained. CAS-loss is
+**1.6%** of bails. Sharding would have targeted 1.6% of the wall.
+Third instance of the same species as §8 of 2026-07-26: *a verdict out-running its own denominator.*
+
+### 4. ★ DSWS2_FUNNEL — BUILT FOR EXACTLY THIS, NEVER ONCE COMPILED IN ★
+
+The boundary-advance readiness **pre-gate** checks `GSTORED < DA_ZDONE>>shift` **READ-ONLY, BEFORE**
+the ZLOCK CAS (kernel :6171-6184, election at :6186) — i.e. precisely the measured blocker. It has
+**never been enabled in any run in project history**: absent from `build_flow.sh`'s config-of-record
+block, so it defaulted to 0 in `${DSWS2_FUNNEL:-0}`; kernel :7143 states "0 in both profiles of
+record"; zero mentions in this log.
+**TRAP:** every "funnel" hit in the logs and in `occ_dispatch.cpp` is the UNRELATED *carry-through
+funnel* (`occ[100..103]`). Searching for "funnel" returns false positives.
+Its other condition (`DRAIN < ASSIGN`) measured 0.0%, so it costs nothing and fires never.
+FIXED: `DSWS2_FUNNEL` / `DSWS2_FUNNEL_SPIN_N` are now in the config-of-record block AND printed.
+
+### 5. THE FUNNEL'S SPIN IS INERT — A BENIGN, LOAD-BEARING POLARITY BUG (Codex-audited, ISA-cited)
+
+`s_sub_u32` is the assembler alias for `S_SUB_CO_U32` on gfx12; RDNA4 ISA §16.1 p.206 defines
+`SCC = (S1 > S0)` — SCC is the **borrow**, set only on underflow. Confirmed in the emitted gfx1201
+disassembly (`s_sub_co_u32 s56, s56, 1`).
+So `1024-1=1023` does not borrow → SCC=0 → **every arm bails on the FIRST not-ready**.
+`DSWS2_FUNNEL_SPIN_N` is **inert**; the funnel is a pure **check-once** pre-gate. All three arms were
+written treating SCC=1 as "counter still live", which is inverted.
+**THE BUG IS BENIGN AND CURRENTLY LOAD-BEARING — DO NOT "FIX" IT CASUALLY.** Check-once is the only
+behaviour reviewed as safe. Each retry re-reads FOUR LDS words, and `lds_get` is
+`ds_load_b32 + s_wait_dscnt 0` (a serialized read/drain, :1601-1605), at a site entered ~2.15M times.
+This kernel has a documented **16x** regression (97.3 → 5.9 TF) from ONE extra LDS read in the peek
+path (:5950-5954). Correcting the polarity re-opens a 1024-deep spin on that path.
+A permanent warning is now at `.Lflow_da_funnel_notready`.
+Codex verdict: read-only confirmed (no `lds_put`/CAS/atomic; only private s54-s56); cannot lose work
+or abandon a boundary (bails before the ownership CAS); **no TOCTOU — every gate is re-read after
+winning ZLOCK** (:6199-6202, :6209-6212); probe pairing sound on the bail path in all three arms.
+**Cost if enabled: ~8.6M extra serialized LDS loads.** Safe for ONE guarded bring-up; NOT
+performance-safe; NOT for an unmonitored sweep.
+
+### 6. THREE HOST INSTRUMENT DEFECTS FIXED
+
+1. **RESVPROBE counter aliasing corrupted the COAST DECOMP.** RESVPROBE reuses `CNT_CLEAD` (s96,
+   occ[89]) and `CNT_FATFULL` (s94, occ[87]) (kernel :350, :353). Safe — both originals are
+   structurally zero here — but the print didn't know, and displayed RESVPROBE values under the
+   door2 LEAD-GATE / door3 FAT-PEAK-FULL labels: L0 printed "FAT-PEAK-FULL (stagger cap) = 507,102"
+   for a build where the stagger cap CANNOT fire. Worse, it folded them into the coast-door SUM,
+   which they are not members of. **Excluding them takes the invariant gap 968,473 → 59,299** — the
+   sum very nearly CLOSES, and the residue is the known non-coasting grow-fail sites. The old print
+   buried that agreement.
+2. **A SECOND, UNREPAIRED LDS RECONSTRUCTION** (`occ_dispatch.cpp:7329`), in a different scope from
+   the authoritative `ldsBytesRaw` repaired on 07-26. Every dispatch printed **two different LDS
+   numbers** — `LDS=65792B` on the oracle line and `17920B` three lines later. Two competing LDS
+   numbers is the exact noise that preceded the 07-26 MODE1 reset. Now reclaim-aware; verified
+   **`LDS=17920B` via `DSWS2_DRYRUN=1`, at zero GPU cost.**
+3. **RESVPROBE verdict** — now reports share-of-bails for all four buckets including the unaccounted
+   remainder (see §3).
+
+### 7. METHOD ERRORS — MINE, THREE IN ONE MORNING
+
+- **`grep -c` on a phrase cannot distinguish an assertion from its NEGATION.** I "found" that the two
+  retracted verdicts were still live in `occ_dispatch.cpp` and told kmbandy the 07-26 brief was false.
+  The four hits were the FIXES: `"does NOT show carriers are fed"`, `"do NOT infer ASSIGN-bound"`,
+  and two removal comments. **The brief was correct; my retraction of it was the error.**
+  Verify the CONTEXT of a hit, never the count.
+- **`LDS=65792B` diagnosed as a stale default `G=6`.** Wrong — `Gv` was correctly 4; it was the
+  operand-inclusive formula (§6.2). Right fix, wrong reason, asserted before checking.
+- **An empty disassembly read as a real zero.** `llvm-objdump -b` isn't supported here; the command
+  produced 0 lines and my greps dutifully returned 0 occurrences, which I nearly reported as evidence.
+  The identical symptom as an unwired counter. Always check the instrument produced OUTPUT first.
+
+### 8. NOT SETTLED — L5 per-chunk cost
+
+Total wall **205 s** vs **0.148 s** of kernel (14.8 ms/chunk × 10). But the oracle ran at `stride=1`
+(640/640 tiles vs the sweep's 80/640), so host verification almost certainly dominates that gap.
+**This run cannot separate host verify from GPU per-chunk overhead.** L5's 0.81 s/chunk remains
+unmeasured; it needs an in-host per-chunk timer. Do not quote an end-to-end number until then.
+
+### 9. NEXT
+
+One dispatch: `DSWS2_FUNNEL=1 DSWS2_FUNNEL_SPIN_N=1` (bin `4f567be6…`, 31,144 B, LDS 17,920),
+RESVPROBE+BNDSPLIT on, same shape, for direct comparison against L0b.
+**PRE-REGISTERED:** `ZLOCK_LOST` falls well below 76.5% and `ADVANCE` rises above 1.6%.
+TF may still REGRESS from the ~8.6M added serialized LDS loads — that is a real possible outcome and
+NOT a failure of the experiment. Do not quote TF from a probe build either way.
+Probe weight inflates grow-fail (3.41M → 5.79M → 6.57M across the three builds): treat these as
+RATIOS, not absolutes.
+
+---
+
+## 2026-07-27 AFTERNOON — THE FUNNEL WORKS AND DOESN'T HELP; 91% OF CHUNK WALL WAS A HOST TIMER
+
+### 10. DSWS2_FUNNEL ENABLED FOR THE FIRST TIME — PREDICTION FALSIFIED
+
+Bin `4f567be6` (31,144 B, LDS 17,920) = the L0b bin + `DSWS2_FUNNEL=1 SPIN_N=1` (+128 B).
+Gates: `oracle bad=0` 640/640 stride=1, `computed=460,800` WORK-EXACT, `occ[96]` delta +0, canary clean.
+
+**MECHANISM CONFIRMED** (unthrottled counters — these are the trustworthy ones):
+
+| | L0b | funnel | |
+|---|---:|---:|---|
+| `occ[97]` boundary / C-store-gate bails | 513,443 | **0** | eliminated |
+| `occ[86]` feed-path bails | 29,928,830 | 24,585,102 | −18% |
+| iterations per reserve | 129.9 | 106.7 | −18% |
+| coast-frac | 97.2% | 96.1% | |
+| **TF (span)** | 3.3 | **3.2** | **unmoved** |
+
+**THROUGHPUT DID NOT MOVE**, and the empty-frontier share got *worse* (96.1% → 97.6% of bails).
+I pre-registered "`ZLOCK_LOST` falls below 76.5%, `ADVANCE` rises above 1.6%". `ZLOCK_LOST` rose to
+**100.0%**. Reading: the funnel makes waves hold until the gate opens, then all rush the CAS together —
+it converted a spread-out herd into a **synchronized** one.
+
+**DO NOT TRUST THE BNDSPLIT DELTAS ACROSS THIS A/B.** Sampled `ADVANCE` fell 553 → 22, which cannot be
+literally true: the work completed exactly and the required advance count is fixed by geometry.
+BNDSPLIT is throttled 1/64 on the deadman counter `s71` and its "ratios exact" claim assumes unbiased
+sampling; the funnel changes loop structure and plausibly shifts that phase. Rest only on the
+unthrottled counters above. The TF half is separately confounded — the A/B spanned ~3h on a shared box
+with mlambaformer in between (see the mlambaformer measurement-discipline rule: cross-session absolutes
+are not comparable, only within-session ratios).
+
+**THIS HIT A PRE-REGISTERED FALSIFICATION CRITERION VERBATIM:** *"ADVANCE unchanged while ZLOCK_LOST
+drops → contention was never what limited advancement; the C-store gate is a hard latency floor and
+thinning the herd cannot help. This would redirect the whole effort at GSTORED / C-store retirement,
+not at contention."* **Contention around the boundary is not the lever. The rate at which C-stores
+RETIRE is.**
+
+### 11. ★ 91% OF NON-FINAL CHUNK WALL WAS `DSWS2_SETTLE`, A HOST-SIDE CONSTANT ★
+
+`occ_dispatch.cpp` completion gate: the EOP fence is armed **only on the final chunk** (deliberately —
+a stalled per-chunk fence used to block the next chunk from launching). So every **non-final** chunk
+cannot use `ff` and instead waits `settle` (**default 0.30 s**) of no-change on `occ[3]` *after its
+last wave has already exited*.
+
+**THE WITHIN-RUN CONTROL — this is the proof, and it needs no cross-run comparison:**
+
+| chunk | last? | completion path | settle=0.30 | settle=0.02 |
+|---|---|---|---:|---:|
+| base=0 (512 tiles) | no | **settle** | 0.317 s | **0.038 s** |
+| base=512 (128 tiles) | **yes** | **EOP fence** | 0.013 s | **0.014 s** (CONTROL, unmoved) |
+
+Only the settle-path chunk moved. Same bin, `DSWS2_SETTLE` the only changed variable.
+Gates at FM=2 (previously validated only at FM=1): `oracle bad=0` 640/640, `computed=2,211,840`
+WORK-EXACT, canary clean.
+
+**Span-TF UNCHANGED 3.2 → 3.1**, exactly as it must be — settle is host idle time after the waves have
+exited and cannot touch the GPU busy span. That invariance is the check that this is what we think it is.
+
+**RESULT: reps 5 → 24 in the same `DSWS2_TARGET_SECS` budget (4.8×); end-to-end TF 0.29 → 1.86 (6.4×)
+with ZERO kernel change.**
+
+**WHY IT SURVIVED SIX DAYS AFTER BEING SWEPT:** settle 0.05/0.02/0.01 were all swept on 2026-07-21
+(FM=1) and were **all oracle-clean** — but span-TF did not move (2.0/1.9/2.0), so it read as a null
+result. **OUR HEADLINE METRIC IS STRUCTURALLY BLIND TO THIS COST.** Judge this knob by
+reps-per-target-second, never by TF and never by wall clock.
+
+**A PREDICTION I GOT WRONG, AND IT MATTERS:** I predicted total chunk wall 1.650 s → ~0.25 s. It stayed
+~1.25 s. The rep loop is **duration-bounded**, so a faster rep buys more reps, never a shorter run.
+Anyone judging this change by wall clock will conclude it did nothing.
+
+Also: run spread widened 4.3% → 10.1% (more, shorter reps). And the ~206 s process wall is ~99% host
+oracle verification at `stride=1` — my choice in manual bring-ups; `dsws_realshape_bench.py` uses
+stride=8. Not a kernel or dispatch cost.
+
+### 12. DEFAULTS CHANGED (kmbandy, 2026-07-27)
+
+- **`DSWS2_SETTLE` default 0.30 → 0.02** (`occ_dispatch.cpp`). Fail-loud: settle exists only to let the
+  terminal C store land before the oracle reads C, so too-short **fails the oracle, never a false
+  CLEAN**. Validated FM=1 (0.05/0.02/0.01) and FM=2 (0.02, 2048 waves). `DSWS2_SETTLE` still overrides;
+  0.05 is the conservative fallback and still 6× better than the old default.
+  **NOT changed:** the coop path's own settle (different kernel; it already uses 0.025 when its fence
+  works, 0.30 only in its nofence case).
+- **`DSWS2_FUNNEL` default 0 → 1** (`build_flow.sh`), with `SPIN_N=1`. Justified by ELIMINATING MEASURED
+  WASTE (occ[97] → 0, −18% bails) and a clean Codex correctness audit — **NOT by a demonstrated
+  speedup**. Tested on ONE shape, ONCE. **VALIDATE ON THE FULL 30-SHAPE SWEEP** before relying on it.
+  `DSWS2_FUNNEL=0` reverts byte-identically (verified: 30,812 B, matches the pre-change build exactly).
+  Default build is now **30,940 B** (= 30,812 + 128 funnel), LDS unchanged 17,920.
+
+### 13. THE PATTERN OF THE DAY — TOOLING THAT DEFAULTS OFF
+
+**Four instruments used today were already built, wired, and simply never switched on:** `RESVPROBE`,
+`BNDSPLIT`, `ML8_CHUNK_DIAG`, and `DSWS2_FUNNEL` itself. Plus `DSWS2_SETTLE`, swept and then left at a
+value 15× too high. The recurring failure on this project is **not missing tooling — it is tooling that
+defaults off and never appears in the config of record.** That is the same root cause as the FM=2
+discovery (grow-fail was 0 forever because the moat was never armed). `DSWS2_FUNNEL`/`SPIN_N` are now
+in `build_flow.sh`'s config-of-record block and **printed on every build**.
+
+### 14. METHOD — THREE NEAR-MISSES, ALL THE SAME SHAPE
+
+A name or substring match is a LEAD, NOT EVIDENCE. Verify the context of every hit:
+1. `grep -c 'carriers are fed'` returned 2 — both were the **corrective** text. I told kmbandy the
+   07-26 brief was false. **The brief was right; my retraction was the error.**
+2. `LDS=65792B` diagnosed as a stale default `G=6`. Wrong — `Gv` was correctly 4; it was the
+   operand-inclusive formula. Right fix, wrong reason.
+3. A log named `funnel_bringup_M2048` looked like proof the funnel had run before. It has **zero**
+   `DSWS2_FUNNEL` in its env and is FM=1 G=6 — named for the unrelated carry-through funnel.
+   Checked before it became a fourth false claim.
+Plus: an empty disassembly (`llvm-objdump -b` unsupported) produced 0 greps that I nearly read as real
+zeros. **Always confirm the instrument produced output before believing its zero.**
+
+---
+
+## 2026-07-27 EVENING — +63%: 2 WG/CU IS HARMFUL, THE GROUP BARRIER IS REAL, AND THE MOAT IS AN ARTIFACT
+
+Prompted by an external review (Kimi K3 via opencode, $1.92, read-only agent). Two dispatches at
+MATCHED geometry, back-to-back in one session — a VALID controlled comparison, unlike every cross-sweep
+comparison earlier in the day.
+
+| | WG/CU | waves | ACC_N | GROUPS | TF |
+|---|---|---:|---|---|---:|
+| baseline | 2 | 2048 | 2 | 2 | **4.73** |
+| ARM A | 1 | 1024 | 2 | 2 | **6.70** (+42%) |
+| ARM B | 1 | 1024 | 4 | 1 | **7.70** (+15% / +63%) |
+
+A vs baseline isolates occupancy; B vs A isolates the group barrier with geometry held constant.
+Gates clean on both: `oracle bad=0`, WORK-EXACT, `occ[96]` delta +0, `occ[0]=0`, canary clean.
+**Arm B spread 1.9% over 34 reps — the tightest measurement in this project.**
+
+### 15. 2 WG/CU IS NOT NEUTRAL, IT IS HARMFUL
+Halving the wave count gained 42%. Iterations per successful reserve collapsed **129.9 → 26.3**.
+`ML8_POOL=128` has been over-subscribing the card for the entire campaign, and both `build_flow.sh`
+and `gpu_run.sh` currently ENFORCE it as the standard.
+
+### 16. THE GROUP BARRIER IS REAL, ~15%
+`ACC_N=G` (GROUPS=1) fires the boundary once per TILE instead of once per group: `occ[96]` halved
+(1,520,640 → 783,360) while `computed` slightly ROSE (3,041,280 → 3,133,440). Same work, half the
+coordination. Kimi's "Ceiling B" confirmed at roughly the predicted magnitude.
+
+### 17. ★ grow-fail = 0 IN BOTH ARMS — THE MOAT IS AN OVER-SUBSCRIPTION ARTIFACT ★
+At 2048 waves: 6,574,885. At 1024 waves: **EXACTLY ZERO.**
+The entire justification for promoting FM=2 G=4 ACC_N=2 to primary config that morning — *"grow-fail is
+the only admission throttle and it was 0 on every run in project history; FM=2 finally makes it bind
+(140.7M events); at FM=1 the design cannot be evaluated"* — describes an artifact of launching twice as
+many waves as help. **The moat binds exactly when the kernel is slow and stops binding when it is fast.**
+Fourth independent refutation of the dyn-VGPR thesis, and the most direct.
+
+### 18. dyn-VGPR IS CAPPED AT 128 VGPRs/WAVE (256 HARD MAX) — THE LEDGER'S HEADLINE IS UNREACHABLE
+`cap = (MAX_BLOCK_ALLOC+1) × BLOCK_SIZE = (7+1) × 16 = 128` by default; `BLOCK_SIZE=1` gives 256 and
+`MAX_BLOCK_ALLOC` is 3 bits so **256 is the ceiling**. Therefore `INSTRUCTION_LEDGER.md` Lever B's 8×8
+(512 acc VGPRs) → ~176 TF, and the compounded ~206 TF, are **NOT REACHABLE ON THIS SILICON**.
+What survives: static allocation hard-deadlocks the 8-wave barrier WG at ≥256 VGPRs, so dyn's real
+value is launching lean then growing to ~160-256 — worth about ONE frag-grid step. Note the ledger also
+records the 161 TF winner at 52% of peak on **183 VGPRs**, under the static limit, so even that use is
+unproven-necessary.
+
+### 19. WHAT DID NOT WORK
+`WOFLUSH=1` **does not build** — "DECENTASN is now BANKED-ONLY … the WOFLUSH (next,inflight) pin path
+was retired 2026-07-16". The review proposed it as "a one-defsym experiment you already have"; it is not.
+A first `ACC_N=4` attempt at `ML8_POOL=128` was **REFUSED by the host geometry guard** (34,304 B ×
+2 WG/CU = 68,608 > 65,536) before any packet was submitted — the guard worked exactly as designed and
+is what forced the matched-geometry redesign that made the comparison valid.
+
+### 20. THE TILE FRONTIER (offline, no GPU) — THE VESTIGIAL GUARD IS NOW THE BINDING CONSTRAINT
+Assembled every (FM, G, ACC_N) at FN=4 SEGK=256 SSWIN=32. The `:646` operand-layout guard enforces
+`G·FM ≤ 11`, which blocks **FM=2 G≥6, FM=4 G≥4, and every FM=8 cell**. That guard was verified
+vestigial under SELFSERVE on 2026-07-27 (zero OPSTRIDE/ARES_OFF immediates in the shipped disassembly)
+and Codex-reviewed NOT-REFUTED. It is still live, deliberately, so it would not confound the sweep.
+Legal today at constant super-tile M=128: `FM=1 G=8`, `FM=2 G=4`, `FM=4 G=2` — which is exactly the
+3×2 frag-grid × occupancy sweep pre-registered as the first task for 2026-07-28.

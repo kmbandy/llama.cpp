@@ -131,6 +131,9 @@ public:
         int  prefetch_depth  = 4;     // PrefetchScheduler queue depth
         int  io_uring_depth  = 0;     // FileIOLayer SQ depth; 0 = prefetch_depth
         bool prefer_async_io = true;  // try io_uring for stage 1 before SyncPread
+        // Divide WP_HOST_BUDGET_BYTES among independent device pagers.
+        // One preserves the existing single-pager behavior exactly.
+        size_t host_budget_divisor = 1;
 
         // Force every pool slot offset to a multiple of this. Vulkan needs the
         // quant block size here (ggml_type_size of the paged tensors) because
@@ -319,8 +322,10 @@ public:
         double   ensure_batch_host_jobs_seconds      = 0.0; // building the job list (HostTier lookup + fd resolution)
         double   ensure_batch_host_prep_seconds      = 0.0; // computing O_DIRECT alignment/bounce params
         double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
-        double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
-        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase (mixed: promotion + fresh)
+        double   ensure_batch_host_read_wait_seconds = 0.0; // time blocked waiting for read completions
+        double   ensure_batch_host_h2d_seconds       = 0.0; // post-read H2D wait; residual when overlap is enabled
+        uint64_t ensure_batch_host_h2d_overlap_batches = 0; // opt-in overlap path batches
+        uint64_t ensure_batch_host_h2d_overlap_copies  = 0; // copies issued before the final read completed
         // P2P direct-to-device path: names deliberately mirror the HOST
         // phases so arm-to-arm logs are comparable. H2D is structurally zero
         // on a successful direct read, but remains explicit in the summary.
@@ -406,10 +411,8 @@ public:
     // The caller should obtain them via dup_clear_o_direct() to fix B-P3.
     // The pager takes ownership of the fds; they are closed on shutdown.
     //
-    // Paging is single-device by contract: under WP_RESIDENT_DENSE only routed
-    // experts page, and they all live on the paging device, so one pool keyed
-    // by that device's buffer type is sufficient. Dense/attention weights are
-    // resident on the (possibly different) attention device and never page.
+    // One WeightPager is single-device by contract. Multi-device paging owns
+    // one complete WeightPager per page_buft partition through WeightPagerSet.
     //
     // `device_buft` is the buffer type for the device the pager will
     // allocate VRAM on. Should match devices_used.front().
@@ -440,6 +443,16 @@ public:
     int    n_pages()                            const { return catalog_.size(); }
     int    catalog_n_expert_pages()             const { return catalog_.n_expert_pages(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
+    // MAD-420 — page-size histogram of slottable expert pages, for the
+    // auto-sizer in llama.cpp to size the pool by average page size instead
+    // of max page size. See PageCatalog::page_size_histogram.
+    std::map<size_t, int> page_size_histogram() const { return catalog_.page_size_histogram(); }
+    ggml_backend_buffer_type_t page_buft(int page_idx) const {
+        return page_idx >= 0 && page_idx < (int) page_buft_.size()
+            ? page_buft_[(size_t) page_idx] : nullptr;
+    }
+    ggml_backend_buffer_type_t device_buft() const { return device_buft_; }
+    int    device_idx() const { return device_idx_; }
     bool   is_initialized()                     const { return initialized_; }
     bool   hip_graphs_enabled()                 const { return hip_graphs_enabled_; }
     bool   async_ensure_enabled()               const { return async_ensure_enabled_; }
@@ -692,6 +705,7 @@ private:
 
     // Resolve a slot index to a VRAM pointer.
     void * slot_ptr_(int slot_idx) const { return pool_.slot_ptr(slot_idx); }
+    void * checked_slot_ptr_(int page_idx, int slot_idx) const;
 
     // PoolAllocator's eviction callback — clears page_to_slot_[evicted].
     void on_pool_evict_(int slot_idx);
@@ -797,6 +811,8 @@ private:
     std::vector<std::chrono::steady_clock::time_point> prefetch_started_at_;
     std::vector<int> page_async_event_;
     std::vector<ggml_backend_buffer_type_t> page_buft_;
+    ggml_backend_buffer_type_t device_buft_ = nullptr;
+    int                        device_idx_  = -1;
     // Reverse map: slot_idx -> page_idx (or -1 if free). Used by the
     // eviction callback to clear page_to_slot_ / page_loaded_ correctly.
     std::vector<int> slot_to_page_;
@@ -952,6 +968,8 @@ private:
         bool     done   = false;
         bool     ok     = false;
         int      err    = 0;
+        bool     record_done_at = false;
+        std::chrono::steady_clock::time_point done_at;
     };
     std::vector<std::thread>          ensure_odirect_workers_;
     std::deque<EnsureODirectReadJob *> ensure_odirect_queue_;

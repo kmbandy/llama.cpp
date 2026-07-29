@@ -2812,6 +2812,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_FFN_ISLAND_DEVICE"));
     add_opt(common_arg(
+        {"--weight-paging-resident-experts"}, "<off|BLOCKS>",
+        "hold whole blocks' routed experts resident on the FFN-island device instead of\n"
+        "paging them; requires --weight-paging-ffn-island-device. \"auto\" fills that\n"
+        "device's remaining free VRAM, a size caps the fill (\"12GiB\"), or name blocks\n"
+        "explicitly (\"0-6,20-22\") for a deliberate split (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_paging_resident_experts = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_EXPERTS"));
+    add_opt(common_arg(
+        {"--weight-paging-device-layers"}, "<DEVICE:BLOCKS[;DEVICE:BLOCKS...]>",
+        "page explicit routed-expert block ranges on named devices; for example\n"
+        "\"ROCm0:0-37;ROCm1:38-74\" (no automatic or budget mode)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_paging_device_layers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_DEVICE_LAYERS"));
+    add_opt(common_arg(
+        {"--pipeline-layers"}, "FIRST-LAST",
+        "cross-machine pipeline parallelism: this process owns only layers [FIRST, LAST].\n"
+        "token_embd loads only when FIRST == 0; output_norm/output only when LAST is the\n"
+        "final layer. Absolute layer indices are preserved. Unset = own everything\n"
+        "(unchanged behaviour). See docs/superpowers/specs/2026-07-28-cross-machine-\n"
+        "pipeline-parallelism.md",
+        [](common_params & params, const std::string & value) {
+            int first = -1;
+            int last  = -1;
+            if (std::sscanf(value.c_str(), "%d-%d", &first, &last) != 2 || first < 0 || last < first) {
+                throw std::invalid_argument("expected FIRST-LAST with 0 <= FIRST <= LAST");
+            }
+            params.pipeline_layer_first = first;
+            params.pipeline_layer_last  = last;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_PIPELINE_LAYERS"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
@@ -3563,10 +3604,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
         {"--models-idle-timeout"}, "SECONDS",
-        string_format("for router server, unload a model after it has been idle this long, giving its GPU\n"
+        string_format("for router server, default idle unload for models that do not set their own\n"
+                      "idle-timeout in the preset. Unloads after this many seconds idle, giving its GPU\n"
                       "and its host-side KV back. A model is idle only when it has NO in-flight request,\n"
                       "so a long generation is never interrupted. Pinned models are never unloaded.\n"
-                      "(default: %d, 0 = never unload)", params.models_idle_timeout),
+                      "Per-model preset key idle-timeout overrides this. (default: %d, 0 = never unload)",
+                      params.models_idle_timeout),
         [](common_params & params, int value) {
             params.models_idle_timeout = value;
         }
@@ -4657,6 +4700,14 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "Set no-exclusive to allow the VRAM ledger to co-locate models on one GPU.",
         [](common_params &, bool) { /* unused */ }
     ).set_env("LLAMA_ARG_ROUTER_EXCLUSIVE").set_preset_only());
+
+    args.push_back(common_arg(
+        {"idle-timeout"}, "SECONDS",
+        "in server router mode, unload this model after it has been idle this long (overrides\n"
+        "the router-wide --models-idle-timeout). 0 = never idle-unload this model. Omit to\n"
+        "inherit the global default.",
+        [](common_params &, int) { /* unused */ }
+    ).set_env("LLAMA_ARG_ROUTER_IDLE_TIMEOUT").set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

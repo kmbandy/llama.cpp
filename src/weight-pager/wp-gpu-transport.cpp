@@ -448,7 +448,8 @@ void GpuTransport::release_event(int event_handle) {
 
 GpuTransport::~GpuTransport() = default;
 
-bool GpuTransport::init(int /*device_idx*/, int /*n_events*/, bool /*async_transfer_stream*/) {
+bool GpuTransport::init(int /*device_idx*/, int /*n_events*/, bool /*async_transfer_stream*/,
+                        ggml_backend_buffer_t /*buffer*/) {
     LLAMA_LOG_WARN("wp::GpuTransport: HIP support not compiled in; transport disabled\n");
     return false;
 }
@@ -459,6 +460,14 @@ int  GpuTransport::stage_in(void * /*dst*/, const void * /*src_pinned*/,
                             size_t /*payload_size*/, size_t /*slot_size*/) { return -1; }
 int  GpuTransport::stage_in_async(void * /*dst*/, const void * /*src_pinned*/,
                                   size_t /*payload_size*/, size_t /*slot_size*/) { return -1; }
+// Declared in the header and called from wp-pager, but defined only inside the
+// HIP/CUDA block above -- without these the CPU-only build fails to link
+// libllama.so. Fail closed: no host staging buffer, no device readback.
+void * GpuTransport::host_alloc(size_t /*size*/)                           { return nullptr; }
+void   GpuTransport::host_free(void * /*ptr*/)                             {}
+bool   GpuTransport::read_to_host(void * /*dst_host*/, const void * /*src_device*/,
+                                  size_t /*n*/)                            { return false; }
+
 bool GpuTransport::wait_event_on_stream(int /*event_handle*/, void * /*stream*/) { return false; }
 bool GpuTransport::query(int /*event_handle*/) const                       { return false; }
 bool GpuTransport::synchronize(int /*event_handle*/)                       { return false; }

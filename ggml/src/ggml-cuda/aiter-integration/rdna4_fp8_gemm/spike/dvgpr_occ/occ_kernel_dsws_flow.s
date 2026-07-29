@@ -139,6 +139,89 @@
 .ifndef BNDPROBE
     .set BNDPROBE, 0     // BOUNDARY-TRANSITION PROBE: exact (unthrottled) counts at the DA cursor
 .endif                   //   advances only. Correctness-diagnostic; see the banner at :BNDPROBE.
+.ifndef BNDSPLIT
+    .set BNDSPLIT, 0     // BOUNDARY-INTERLOCK SPLIT PROBE (2026-07-23): 4 fall-through counters in the
+.endif                   //   .Lflow_da_boundary handler (occ[127..130]), waterfall so the host derives
+                         //   herd(ZLOCK-lost) vs drain-gate-bail vs cstore-gate-bail vs advance by
+                         //   subtraction. ACC-DEAD sites, mirrors bnd_bump. BNDSPLIT=0 => byte-identical.
+.ifndef DSWS2_ADVPROBE
+    .set DSWS2_ADVPROBE, 0 // Throttled ZLOCK win -> successful DA_ZDONE advance timer.
+.endif
+.ifndef DSWS2_BNDTIME
+    .set DSWS2_BNDTIME, 0 // BOUNDARY LOSING-PASS TIMER (2026-07-24): times .Lflow_da_boundary from ENTRY to
+.endif                   //   every exit that does NOT complete an advance (occ[133..134]). ADVPROBE already
+                         //   times the WIN path; BNDSPLIT counts the outcomes but not their COST. Since the
+                         //   07-24 PHIST census (78.9% of loop passes enter the boundary, 93.1% of those lose
+                         //   the ZLOCK election => ~73% of ALL loop passes are enter-and-lose), the price of a
+                         //   LOSING pass is the one number that decides whether boundary traffic is noise or
+                         //   the dominant cost of the kernel. Same throttle/idiom as ADVPROBE (s71==0, 1-in-64,
+                         //   requires DEADMAN=1). DSWS2_BNDTIME=0 => ZERO bytes, byte-identical .text.
+.ifndef DSWS2_PASSTIME
+    .set DSWS2_PASSTIME, 0 // POLL-PASS TIMER (2026-07-25): two RTC timers, SGPR-accumulate, emit-once-at-retire.
+.endif                    //   T1 = whole pass .Lflow_loop -> .Lflow_feedmt_sleep (the ~95% park path).
+                          //   T2 = reservation ASSIGN_HEAD CAS only (the shared-cursor commit).
+                          //   Hypothesis under test: kernel is contention-serialized on LDS atomics on the
+                          //   shared cursor words; T2/T1 prices that claim directly. May be WRONG -- do not
+                          //   tune the instrument to confirm it. Shape is a COPY of bndtime_start/end's
+                          //   s71==0 throttle + s_sendmsg_rtn, but NO stores in the hot loop (accumulate in
+                          //   private SGPRs; cnt_emit once at .Lflow_retire). DSWS2_PASSTIME=0 => ZERO bytes.
+// ---- DSWS2_BURSTCNT (Step 0, task ac75274c): counts-only frequency structure of the SELFSERVE compute
+//   burst. Pure s_add_u32 on private SGPRs; ONE emit per wave at .Lflow_retire. NO RTC, NO s_sendmsg,
+//   NO memory in the hot path. ACC-safe by construction (cnt_inc shape). Default 0 => ZERO bytes.
+//   Step 1 (RTC intervals) is a SEPARATE defsym, not built here.
+.ifndef DSWS2_BURSTCNT
+    .set DSWS2_BURSTCNT, 0
+.endif
+// ---- DSWS2_KDBUF (task 6f0081e3): software-pipelined double-buffer of the SELFSERVE K-step loop.
+//   Diagnosis (Step 0 counts + source): .Lflow_da_ss_rowblk is issue->wait_0x0->compute with ZERO overlap;
+//   16 exposed L2 latencies ≈ the entire 126.6 ticks/item budget. Classic one-ahead: issue k+1 into the
+//   OTHER operand buffer while waiting+computing k. Default 0 => ZERO bytes (byte-identical).
+//   Step 1 RTC skipped — the ablation IS the test.
+.ifndef DSWS2_KDBUF
+    .set DSWS2_KDBUF, 0
+.endif
+// ---- DSWS2_WTBUDGET (task 250fc30c): WAVE-TIME PARTITION that must close toward span*residency.
+//   KDBUF refuted the "burst is the wall" hypothesis (0.32% slower, inside noise). Corrected arithmetic:
+//   burst is <0.25% of wave-time. This instrument does NOT time a suspect — it partitions every
+//   wave-tick so the residual NAMES unmeasured state.
+//   AFFORDABLE PARTIAL PARTITION (not exhaustive RTC-per-transition):
+//     A exact  — .Lflow_da_ss_rowblk entry → post-ds_add (ACC-dead boundaries), ~99/wave
+//     C sampled — feedmt s_sleep SLEEPN, 1-in-WTB_THR with OWN counter (not s71); host extrapolates
+//     D exact  — .Lflow_da_boundary entry → leave (flag-guarded; common exits)
+//     E exact  — entry→golive + retire→end of timed teardown
+//     T exact  — golive→retire (wave epoch)
+//     B DERIVED on host: B = T − A − C_est − D  ("poll awake / everything else in the epoch")
+//   RESIDUAL host: span * measured_residency − sum_waves(T) − sum_waves(E).
+//   Default 0 => ZERO bytes. Requires DEADMAN=1 only if you want s71 for other probes; WTB has its own thr.
+.ifndef DSWS2_WTBUDGET
+    .set DSWS2_WTBUDGET, 0
+.endif
+.ifndef WTB_THR
+    .set WTB_THR, 64                         // own C-sample period (feedmt parks). NOT s71.
+.endif
+// ---- DSWS2_GAP (tasks aa5810c9 / ef3308a3): inter-burst GAP + HEAD + TAIL. ----
+//   CP1 = end of .Lflow_da_ss_rowblk (ACC drained). CP2 = start of next .Lflow_da_ss_rowblk.
+//   GAP  += CP2 − CP1          (between bursts)
+//   HEAD += first_CP2 − golive (before first burst); never-burst waves: whole life → HEAD + NOBURST
+//   TAIL += retire − last_CP1  (after last burst)
+//   Two stamps, one subtraction each. u64 emit. No throttle. Default 0 => ZERO bytes.
+.ifndef DSWS2_GAP
+    .set DSWS2_GAP, 0
+.endif
+// ---- DSWS2_POLLSTAGE (task 6f3286fb): one stage of ONE poll pass. Option (b): ONE stage per build. ----
+//   Six stages of the dominant coast path (.Lflow_loop → park). Two RTC reads per completed pass of
+//   the selected stage; SGPR accumulate; emit once at retire. Default 0 => ZERO bytes.
+//   Stages: 1 deadman | 2 snapshot/body-gate | 3 role dispatch | 4 feed→da_peek | 5 da_peek | 6 park+sleep
+//   Build six bins: DSWS2_POLLSTAGE=1..6. Prefer (b) over six-stamps-in-one so probe cost stays ~2 RTC/pass.
+.ifndef DSWS2_POLLSTAGE
+    .set DSWS2_POLLSTAGE, 0
+.endif
+.ifndef DSWS2_FUNNEL
+    .set DSWS2_FUNNEL, 0 // Boundary advance readiness pre-gate. Read-only; not-ready waves flow on.
+.endif
+.ifndef DSWS2_FUNNEL_SPIN_N
+    .set DSWS2_FUNNEL_SPIN_N, 1024
+.endif
 .ifndef RESVPROBE
     .set RESVPROBE, 0    // RESERVATION-EXIT PROBE (2026-07-20, N4): CHEAP (register-accumulate, NO phist)
 .endif                   //   split of the .Lflow_da_peek empties into WHY the wave failed to reserve:
@@ -399,8 +482,44 @@
 .ifndef DSWS2_CONV
   .set DSWS2_CONV, 0        // 0 = pre-conversion static substrate (Phase A green); 1 = Phase B
 .endif
+.ifndef DSWS2_RCONV
+  .set DSWS2_RCONV, 0
+.endif
+.ifndef DSWS2_RCONV_COAST_N
+  .set DSWS2_RCONV_COAST_N, 64
+.endif
 .ifndef DSWS2_TICKET_SELFTEST
   .set DSWS2_TICKET_SELFTEST, 0   // DIAG-only try_gate single-winner smoke (Task 4 Step 3); default 0 = no bytes
+.endif
+// ---- DSWS2_OVERLAP: reused for DESIGN_OVERLAP_2WGCU_2026-07-24.md Phase 1 ("operands L2-only, all
+//   paths"). HISTORY (kept -- both false starts are load-bearing context for the next person):
+//   (1) The ORIGINAL super-tile overlap-prefetch design (DESIGN_OVERLAP_PREFETCH_2026-07-24.md) proposed
+//   triggering an early field-open on ASSIGN-DRAIN<=OVERLAP. STOP-AND-REPORT (2026-07-24, first Sonnet
+//   pass): under SELFSERVE=1, .Lflow_da_ss_decode publishes a PRE-COMPLETED sentinel and drain_advance
+//   walks DRAIN_HEAD past it BEFORE the real compute burst (.Lflow_da_ss_rowblk) even starts, so ASSIGN-
+//   DRAIN is already ~0 for the WHOLE dead gap, not just its tail -- that trigger does not measure real
+//   completion (GSTORED/TILEDONE does) and would blow through the 1-deep bound. See CODEX_OVERLAP_PROGRESS.md.
+//   This is WHY DESIGN_OVERLAP_2WGCU_2026-07-24.md supersedes it and pushes the two-generation frontier to
+//   Phase 2 (still not built here).
+//   (2) The FIRST Phase-1 pass ("just delete the operand pool, self-serve already self-loads") found a
+//   SECOND, deeper STOP: the LDS operand pool is not vestigial -- it is the operand path for the
+//   `s_alloc_vgpr` grow-fail fallback (grow-fail=0 today, but 2 WG/CU is designed to make it bind later).
+//   See CODEX_OVERLAP_P1_PROGRESS.md for the full source trace.
+//   THIS PASS (2026-07-24, corrected Phase 1, CODEX_OVERLAP_P1B_PROGRESS.md) resolves (2): the ring-compute
+//   claim (.Lflow_havestage), the coast opportunistic feed (.Lflow_coast), and the RCONV dedicated feed
+//   role (.Lflow_feed) are ALL converted so nothing reads or writes the LDS operand pool -- the grow-fail
+//   fallback now self-loads A+B from L2 exactly like the primary self-serve burst, and the ring collapses
+//   to a control-only handoff (the grow-fail STAMP no longer poisons SL_RBNEXT with RB_PENDING -- nothing
+//   would ever clear it -- and walks STAGE_HEAD itself since "staged" is now vacuous). ACC_BASE reclaims
+//   the pool bytes. See CODEX_OVERLAP_P1B_PROGRESS.md for the full conversion + correctness argument.
+//   DSWS2_OVERLAP=0 stays BYTE-IDENTICAL to baseline (every new site is `.if DSWS2_OVERLAP`-gated); the
+//   two-generation overlap frontier (design S6/Phase 2) and the 2 WG/CU launch (S8 step 3) are still NOT
+//   built here -- POOL_N stays 1 (one accumulator generation), SEGK/JDEPTH unchanged.
+.ifndef DSWS2_OVERLAP
+  .set DSWS2_OVERLAP, 0
+.endif
+.ifndef OVERLAP
+  .set OVERLAP, 2
 .endif
 .ifndef CONV_COOLDOWN
   .set CONV_COOLDOWN, 0     // Task 4: per-wave post-conversion cooldown epochs. 0 = spec-faithful (no
@@ -549,9 +668,9 @@
 .ifndef SSWIN
   .set SSWIN,       POOL_N    // carry-through reservation/control window; default preserves current codegen
 .endif
-.if SELFSERVE && (SSWIN < POOL_N)
-  .error "SSWIN must be >= POOL_N so the carry-through control window can contain the ring fast-path"
-.endif
+// RETIRED 2026-07-25 (task 8a555bd6): under SELFSERVE the operand pool is reclaimed and SLOT_N=SSWIN;
+//   the old `SSWIN >= POOL_N` guard made POOL_N a lying constraint. Under SELFSERVE=0, SSWIN is unused
+//   for SLOT_N (SLOT_N=POOL_N). No SSWIN/POOL_N cross-check remains.
 .if SELFSERVE
   .set SLOT_N, SSWIN
 .else
@@ -709,15 +828,25 @@
                                                  //   hang, is actually a dispatch that could not fit). The .error
                                                  //   below makes the kernel side self-checking; the host side is
                                                  //   guarded by kOpBase + its own static_assert.
+// Classic ring: slot control lives pre-OP_BASE, sized by POOL_N. Under SELFSERVE the live slot array is
+//   after ACC (SSWIN deep) and this pre-OP_BASE POOL_N footprint is unused -- do not let POOL_N fail the build.
+.if !SELFSERVE
 .if (SLOTC_INLINE_BASE + POOL_N*SLOTC_STRIDE) > OP_BASE // unconditional (was only checked on the banked path, which
   .error "slot control blocks overrun OP_BASE -- raise OP_BASE (and kOpBase in occ_dispatch.cpp)"
 .endif                                             //   meant WOFLUSH builds could silently overlap them)
+.endif
 // ---- per-TILE (per-group) completion counter: the C-store must be gated on the TILE being fully
 //   reduced, NOT on one SLOT finishing. With a deep pool the slot holding ksi==mask can finish BEFORE
 //   the slots holding earlier ksi have accumulated -> the completer would store half-summed banks.
 //   (measured 2026-07-13: POOL_N=2/3 -> bad=96/116.) Every rowblk-segment bumps TILEDONE[group];
 //   whoever brings it to ACC_N*n_kseg owns the C-store. Decouples the completer from POOL_N entirely.
+// Under SELFSERVE the runtime slot array is after ACC (SSWIN deep); do not size the pre-OP_BASE
+//   control gap by POOL_N or POOL_N=1/2/3 would emit different LDS immediates (not byte-identical).
+.if SELFSERVE
+.set TILEDONE_BASE, ((SLOTC_INLINE_BASE + 15) & ~15)
+.else
 .set TILEDONE_BASE, ((SLOTC_INLINE_BASE + POOL_N*SLOTC_STRIDE + 15) & ~15) // GROUPS u32, 16B-aligned, above the inline slots
+.endif
 .if (BANKZERO && !WOFLUSH) && ((TILEDONE_BASE + GROUPS*4) > OP_BASE)
   .error "TILEDONE overruns OP_BASE -- raise OP_BASE"
 .endif
@@ -813,10 +942,240 @@
 .set OPSTRIDE,      (BRES_BYTES + ARES_BYTES)    // 4096 + 12288 = 16384 per slot
 .set BRES_ROFF,     0                            // resident B within a slot
 .set ARES_ROFF,     BRES_BYTES                   // resident A within a slot (after B)
+// ---- Operand-pool reclaim (SELFSERVE owns this; OVERLAP is no longer the only path) ----
+//   DIAGNOSIS (2026-07-25, task 8a555bd6): under SELFSERVE=1 the primary path (.Lflow_da_ss_rowblk)
+//   self-loads A+B from global; the only LDS-pool READER was ring-compute ds_load (OVERLAP=0 branch
+//   at the havestage burst) fed by ASTAGE_R/BSTAGE_R writers in .Lflow_feed/.Lflow_coast, which only
+//   matter for grow-fail RB_PENDING handoff. Measured feed-stages 65k+ with grow-fail≈0 ⇒ dead work.
+//   Fix: reclaim the pool under SELFSERVE (ACC_BASE=OP_BASE), kill feed/coast staging, ring self-loads,
+//   grow-fail publishes claimable (not RB_PENDING). POOL_N becomes layout-inert under SELFSERVE.
+//   DSWS2_OVERLAP still requires SELFSERVE; its POOL_N=1-only guard is relaxed (pool is gone either way).
+.if DSWS2_OVERLAP && !SELFSERVE
+  .error "DSWS2_OVERLAP (operands L2-only) requires SELFSERVE=1"
+.endif
+// ---- DSWS2_ROLEFLOW (DESIGN_DSWS2_ROLE_ECONOMY_2026-07-24.md S6 step P2, part (a)): bidirectional role
+//   economy + a grow-fail that takes nothing. RCONV (above) only builds compute->feed; ROLE_COMPUTE is
+//   otherwise written ONLY at cold-start init, so the compute population can only shrink (a one-way
+//   ratchet) and a grow-fail has nowhere non-claimable to go (CODEX_DSWS2_P1_PROGRESS.md's known,
+//   accepted limitation). REBUILT 2026-07-24 for CFASSIGN=0 after REVIEW_DSWS2_P1_P2_2026-07-24.md; this
+//   defsym adds, and ONLY adds:
+//     (1) a feed->compute reversion (.Lflow_dispatch) whose trigger is "a RESERVABLE INDEX EXISTS" --
+//         literally the gate the shared-cursor reserve path uses -- probed 1-in-DEADMAN_EVERY off s71 so
+//         it is not a hot-path LDS read, with a tick-counting hysteresis and a CAS'd own-mailbox write
+//         that cannot clobber a ROLE_RETIRE broadcast. No designated wave, no cross-wave publish.
+//     (2) GROW-FIRST / RESERVE-AFTER at .Lflow_da_realidx: the s_alloc_vgpr NFV moves to sit immediately
+//         BEFORE the reservation CAS, so a grow-failed wave has reserved nothing, published nothing, and
+//         holds nothing -- it just flows on. NOTE: it does NOT mark deadman_progress (an earlier revision
+//         did; removed 2026-07-24 per CF0 review R2-C1 -- see the banner at .Lflow_da_cf0_growfail). A
+//         force-retire here is HARMLESS precisely BECAUSE the wave holds nothing: it costs parallelism,
+//         never work or liveness. The grow-fail STAMP block, and with it the permanent RB_PENDING poison,
+//         is COMPILED OUT.
+//     (3) the structural consequence of (2): the ring-compute claim is unreachable by construction, so
+//         .Lflow_compute coasts directly instead of paying a futile grow/shrink per DRAIN<STAGE transient.
+//   Does NOT build the two-generation overlap (P3) or 2 WG/CU (P4). Requires DSWS2_RCONV=1 (there is no
+//   feed role to revert FROM without it), DSWS2_OVERLAP=1 (this exists to fix the stall that only occurs
+//   once feed is neutered by the L2-only conversion; at DSWS2_OVERLAP=0 a real feed wave already clears
+//   the grow-fail poison itself via side_final, so P1's original stamp is self-healing there), CFASSIGN=0,
+//   BATCH=1, DEADMAN=1 and TRACE=0 -- all enforced by .error guards below.
+.ifndef DSWS2_ROLEFLOW
+  .set DSWS2_ROLEFLOW, 0
+.endif
+.ifndef DSWS2_ROLEFLOW_BACK_N
+  .set DSWS2_ROLEFLOW_BACK_N, 2      // consecutive THROTTLED-TICK observations of "a reservable index exists
+.endif                               //   right now" before a feed-role wave reverts to ROLE_COMPUTE. The probe
+                                     //   only runs 1-in-DEADMAN_EVERY dispatch passes (s71==0), so BACK_N=2 means
+                                     //   TWO INDEPENDENT SAMPLES 64 loop iterations apart -- far stronger anti-thrash
+                                     //   than the old 16 consecutive same-pass reads, while keeping the reversion
+                                     //   latency (2*64 = 128 iterations) within 2x of the OPPOSITE direction's
+                                     //   DSWS2_RCONV_COAST_N=64, so the economy is roughly symmetric instead of
+                                     //   ratcheting one way. (Was 16 against an every-pass probe; that probe is
+                                     //   gone -- see the hot-path note at .Lflow_dispatch.)
+.if DSWS2_ROLEFLOW && !DSWS2_RCONV
+  .error "DSWS2_ROLEFLOW requires DSWS2_RCONV=1 -- there is no feed role to revert FROM without RCONV's own compute->feed conversion (ROLE_COMPUTE is otherwise written only at cold-start init)."
+.endif
+.if DSWS2_ROLEFLOW && !DSWS2_OVERLAP
+  .error "DSWS2_ROLEFLOW requires DSWS2_OVERLAP=1 -- it exists specifically to fix the permanent grow-fail stall that only occurs when feed is neutered (DSWS2_OVERLAP's L2-only conversion); at DSWS2_OVERLAP=0 feed already does real work and the P1 grow-fail stamp is already self-healing (side_final is reachable)."
+.endif
+// ---- CF0 RETARGET (2026-07-24, supersedes the P2a-rev2 CFASSIGN scoping; see REVIEW_DSWS2_P1_P2 finding 4
+//   and CODEX_DSWS2_CF0_PROGRESS.md). The whole DSWS2 stack is now scoped to the SHARED-CURSOR path
+//   (CFASSIGN=0 / DECENTASN), because that is the only path where the three mechanisms' premises are real:
+//     * ASSIGN_HEAD is genuinely "the next index to be RESERVED" (CAS-incremented at .Lflow_da_realidx),
+//       not the field-completion target z the CFASSIGN peek uses -- so both the reversion trigger and the
+//       prefetch target can be derived from it and MEAN something.
+//     * the reservation is a CAS, so it can be made GROW-FIRST / RESERVE-AFTER: a grow-failed wave has
+//       taken nothing at all and can flow on holding NOTHING (no served-mark to defer, no poisoned slot,
+//       no reservation blocking drain_advance). Under CFASSIGN the reservation is deterministic cohort
+//       math that cannot be "not taken", which is exactly what forced rev2's fragile s15 deferral.
+//   The rev2 CFASSIGN forks are therefore DELETED, not disabled, and the guard is INVERTED.
+.if DSWS2_ROLEFLOW && DYNVGPR && CFASSIGN
+  .error "DSWS2_ROLEFLOW is now scoped to CFASSIGN=0 (the shared-cursor DECENTASN reserve path): its grow-first/reserve-after rebuild replaces the reservation CAS's commit point, which only exists at CFASSIGN=0. Build CFASSIGN=0."
+.endif
+.if DSWS2_ROLEFLOW && DYNVGPR && (BATCH > 1)
+  .error "DSWS2_ROLEFLOW's grow-first/reserve-after rebuild is scoped to BATCH=1: the batch-continuation entry (.Lflow_da_ss_batch_next) re-enters .Lflow_da_stamp for index r+i WITHOUT passing the grow site at .Lflow_da_realidx, so the commit-only stamp arm would commit an index this wave never grew for. Build BATCH=1 with DSWS2_ROLEFLOW=1."
+.endif
+.if DSWS2_ROLEFLOW && !DEADMAN
+  .error "DSWS2_ROLEFLOW requires DEADMAN=1: the feed->compute reversion probe is throttled 1-in-DEADMAN_EVERY off s71 (deadman_check's own throttle counter, the flow_snapshot idiom at .Lflow_loop). Without DEADMAN, s71 is never written and the probe would run on EVERY dispatch pass -- the exact hot-path LDS-read shape that measured 16x (97.3 -> 5.9 TF) on this kernel."
+.endif
+.if DSWS2_ROLEFLOW && TRACE
+  .error "DSWS2_ROLEFLOW uses s75 as its reversion hysteresis counter; TRACE reads s75 as its (never-wired) wg_id row field. Build TRACE=0."
+.endif
+.if DSWS2_ROLEFLOW_BACK_N < 1
+  .error "DSWS2_ROLEFLOW_BACK_N must be >= 1."
+.endif
+// ---- DSWS2_PREFETCH (DESIGN_DSWS2_ROLE_ECONOMY_2026-07-24.md S6 step P2b, "feed = prefetch"): under
+//   DSWS2_OVERLAP every ROLE_AFEED/ROLE_BFEED wave already falls straight through .Lflow_feed to
+//   .Lflow_feed_empty (the self-serve reserve-or-yield fallback) -- it has NO job of its own (the old
+//   LDS-staging job is gone; see the DSWS2_OVERLAP comment at .Lflow_feed). This defsym gives it exactly
+//   one bounded, READ-ONLY action first: peek the already-live frontier fields (ASSIGN_HEAD_OFF,
+//   DA_TILE_OFF, DA_BASE_OFF -- all plain lds_get, no CAS, no lds_put, no atomic, nothing claimable) to
+//   guess the next PREFETCH_LINES (tcol,ksi) B-operand addresses, issue ordinary (non-NT) global loads
+//   for them into a fixed pair of lean scratch VGPRs, and discard the results -- the point is the L2
+//   cache line, not the value. This cannot write ANY shared state (see CODEX_DSWS2_P2B_PROGRESS.md's
+//   memory-touch audit) and therefore cannot affect correctness even if every field it reads is stale,
+//   torn-across-reads, or mid-transition: the ksi guess is unconditionally clamped into [0, n_kseg-1]
+//   before it ever reaches a global address, so the worst case is warming the WRONG (but always
+//   in-buffer) line -- a perf miss, never a fault, never a wrong answer. Bounded per visit
+//   (PREFETCH_LINES, small); never loops until "done"; never blocks; never touches ACC/FA/FB or grows.
+.ifndef DSWS2_PREFETCH
+  .set DSWS2_PREFETCH, 0
+.endif
+.ifndef DSWS2_PF_COUNTERS
+  .set DSWS2_PF_COUNTERS, 0  // 0 = P4-CLEAN (no diagnostic emits); 1 = tiles/blocks/idle + s71 mask
+.endif
+.ifndef PREFETCH_LINES
+  .set PREFETCH_LINES, 4    // k-step (ksi) guesses prefetched per feed-role visit. Small and bounded by
+.endif                      //   design (CLAUDE.md rule 7: a kernel that raises HBM traffic can starve the
+                             //   compositor) -- these are ordinary cached loads to lines every real compute
+                             //   path already reads, never marked non-temporal, capped small on purpose.
+.if DSWS2_PREFETCH && !DSWS2_OVERLAP
+  .error "DSWS2_PREFETCH requires DSWS2_OVERLAP=1 -- it is only reachable from the .Lflow_feed branch-away DSWS2_OVERLAP already adds; at DSWS2_OVERLAP=0 feed still has its own real LDS-staging job and this defsym has nothing to do there."
+.endif
+.if DSWS2_PREFETCH && !DECENTASN
+  .error "DSWS2_PREFETCH requires DECENTASN=1 -- DA_TILE_OFF/ASSIGN_HEAD_OFF are only initialized and meaningful under the DECENTASN coupled-cursor layout (see the .Lflow_live init, .if DECENTASN)."
+.endif
+.if DSWS2_PREFETCH && CFASSIGN
+  .error "DSWS2_PREFETCH is scoped to CFASSIGN=0. Under CFASSIGN, ASSIGN_HEAD is the field COMPLETION TARGET z (the peek says so), and DA_BASE is 2^shift-aligned, so (ASSIGN_HEAD + i) & mask == i on EVERY visit -- the 'next super-tile' guess degenerates to ksi 0..PREFETCH_LINES-1 of the CURRENT tile, lines that are already resident. Zero prefetch value, pure bandwidth (REVIEW_DSWS2_P1_P2_2026-07-24.md, R1-unique). At CFASSIGN=0 ASSIGN_HEAD is the live reserve cursor and the guess is real. Build CFASSIGN=0."
+.endif
+.if DSWS2_PREFETCH && !DEADMAN
+  .error "DSWS2_PREFETCH requires DEADMAN=1: the prefetch burst is throttled 1-in-DEADMAN_EVERY off s71 (deadman_check's own throttle counter). Without DEADMAN, s71 is never written and the burst would fire on EVERY feed-role visit -- ~1KB per wave-visit x 30 waves x 64 WGs in the coast spin, i.e. the CLAUDE.md rule-7 bandwidth shape that starved the compositor on 2026-07-14."
+.endif
+.if PREFETCH_LINES < 1
+  .error "PREFETCH_LINES must be >= 1."
+.endif
+// ---- DSWS2_PREFETCH P1 (2026-07-25): two-generation next-tile identity (t_next frontier). ----
+//   State machine in the control gap just below GSTORED (still below OP_BASE):
+//     EMPTY(0) -> CLAIMING(1) -> BUSY(4) -> READY(2)|TERMINAL(3) -> EMPTY (on consume)
+//   BUSY is the sole deviation from the Codex EMPTY->CLAIMING->READY->TERMINAL sketch: the last-ksi
+//   trigger is fat mid-compute and must issue NO global loads, so it only CAS-publishes CLAIMING; a
+//   LEAN claim service then CAS CLAIMING->BUSY for exclusive ownership of the (relocated) occ[20]++
+//   before publishing READY/TERMINAL. Without BUSY two lean claimers could both issue the atomic.
+//   Boundary: READY consumes t_next (no atomic); CLAIMING|BUSY -> release ZLOCK + retry; EMPTY ->
+//   CAS EMPTY->BUSY and do today's synchronous claim (correctness fallback + cold-start first tile).
+//   This does NOT add a claim per tile -- it relocates the existing tile-boundary atomic earlier.
+// ---- DSWS2_PREFETCH P2 (2026-07-25): dedicated prefetch wave + correct t_next addressing. ----
+//   PF_WID (cold-start ROLE_BFEED wid 2) is the sole prefetch engine: stays lean 32 VGPR, never
+//   feed->compute, never .Lflow_feed_empty, never s_alloc_vgpr after the prologue lean arm, never
+//   zero_banks/C-store (those use v16:v23). Isolation is the point: s_alloc_vgpr WaitIdleExceptStoreCnt
+//   would re-serialize outstanding prefetch loads into a compute dependency chain.
+//   Addressing: magic-div t_next -> tcol; iterate real ksi=0..n_kseg-1 (NO phantom clamp), ks, ni.
+//   Batch PREFETCH_LINES loads to distinct v16:v23; wait ONLY before destination reuse; no post-issue wait.
+//   COMPILE-TIME cap PREFETCH_MAX_BLOCKS_PER_TILE = PREFETCH_MAX_NKSEG * KSEG_STEPS * FN (rule 7).
+.if DSWS2_PREFETCH
+  .set TNXT_EMPTY,    0
+  .set TNXT_CLAIMING, 1
+  .set TNXT_READY,    2
+  .set TNXT_TERMINAL, 3
+  .set TNXT_BUSY,     4
+  .set TNXT_STATE_OFF, (GSTORED_OFF - 8)   // =496 @ OP_BASE=512
+  .set TNXT_TILE_OFF,  (GSTORED_OFF - 4)   // =500: t_next when READY
+  .set PF_WID, 2                           // dedicated engine: cold-start ROLE_BFEED at wid 2
+  .ifndef PREFETCH_MAX_NKSEG
+    .set PREFETCH_MAX_NKSEG, 16            // compile-time n_kseg ceiling (shape uses 10; headroom for larger K)
+  .endif
+  .set PREFETCH_MAX_BLOCKS_PER_TILE, (PREFETCH_MAX_NKSEG * KSEG_STEPS * FN)
+  .set PREFETCH_BLOCK_STRIDE, (KSEG_STEPS * FN)  // blocks per ksi
+  .if (BATON_NEXT_OFF + 4) > TNXT_STATE_OFF
+    .error "TNXT_STATE/TILE collide with BATON_NEXT -- raise OP_BASE (and kOpBase) or lower POOL_N"
+  .endif
+  .if PREFETCH_MAX_NKSEG < 1
+    .error "PREFETCH_MAX_NKSEG must be >= 1."
+  .endif
+  .if PREFETCH_LINES > 4
+    .error "PREFETCH_LINES > 4 needs more dest VGPR pairs than v16:v23 (isolation window). Keep <= 4 or extend dests carefully."
+  .endif
+  .if KMAJOR
+    .error "DSWS2_PREFETCH P2 uses s76 as the engine's latched t_next; KMAJOR loads magic_TOTAL into s76. Build KMAJOR=0."
+  .endif
+  // P4-CLEAN (task 3793ed03): diagnostic counters are OPTIONAL.
+  //   DSWS2_PF_COUNTERS=0 (default) = shipping / decisive coverage build — no PF_TILES/BLOCKS/IDLE
+  //     accumulate, no counter emits, no s71-mask atomic at retire. Same coverage code path as P4.
+  //   DSWS2_PF_COUNTERS=1 = P3/P4 diagnostic: tiles_latched, blocks_issued, idle_not_READY + s71 mask.
+  //   Keep the diagnostic build reachable without confounding span vs P2.
+  .ifndef DSWS2_PF_COUNTERS
+    .set DSWS2_PF_COUNTERS, 0
+  .endif
+.if DSWS2_PF_COUNTERS
+  // P3 counters (PF_WID only; SALU accumulate; emit-at-retire). SGPRs the PF wave never uses for
+  //   their original roles: s92/s93 fat_try scratch; s103=CNT_SS_SHRUNK. cnt_flush skips SS_SHRUNK
+  //   emit on PF_WID when counters are on.
+  .set PF_TILES,  92                           // READY t_next identities latched by the engine
+  .set PF_BLOCKS, 93                           // 256B blocks issued
+  .set PF_IDLE,  103                           // engine visits where TNXT was not READY (s71-throttled 1/64)
+  .set PF_TILES_OFF,  624                      // occ[156]
+  .set PF_BLOCKS_OFF, 628                      // occ[157]
+  .set PF_IDLE_OFF,   632                      // occ[158]
+.endif
+  // P4 coverage: how many PREFETCH_LINES batches to issue per engine visit while READY.
+  //   16 * 4 = 64 blocks/visit => full 640-block warm in 10 visits if the READY window holds.
+  //   No post-issue wait between batches within a visit (wait only before dest reuse at batch top).
+  .ifndef PREFETCH_BATCHES_PER_VISIT
+    .set PREFETCH_BATCHES_PER_VISIT, 16
+  .endif
+  .if PREFETCH_BATCHES_PER_VISIT < 1
+    .error "PREFETCH_BATCHES_PER_VISIT must be >= 1"
+  .endif
+  .if PREFETCH_BATCHES_PER_VISIT > 40
+    .error "PREFETCH_BATCHES_PER_VISIT > 40 risks HBM blowup per visit (rule 7). Cap at 40 (=160 blocks)."
+  .endif
+  // Lean claim service: if CLAIMING, take BUSY and perform the relocated occ[20]++ claim.
+  //   Scratch s16-s20 / v3,v5; ACC-dead, lean-only call sites (.Lflow_feed_empty + PF engine). No sendmsg.
+.macro tnxt_claim_service
+    lds_get s16, TNXT_STATE_OFF
+    s_cmp_lg_u32 s16, TNXT_CLAIMING
+    s_cbranch_scc1 .Ltnxt_svc_done\@
+    lds_cas_rtn s16, TNXT_STATE_OFF, TNXT_CLAIMING, TNXT_BUSY
+    s_cmp_eq_u32 s16, TNXT_CLAIMING
+    s_cbranch_scc0 .Ltnxt_svc_done\@              // lost ownership -- another lean claimer is on it
+    // Won BUSY: issue the ONE next-tile global claim (same atomic the tile boundary used to issue).
+    s_mov_b32 s17, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Ltnxt_svc_giok\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:20 th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+.Ltnxt_svc_giok\@:
+    s_mov_b32 exec_lo, s17
+    v_readfirstlane_b32 s18, v5                   // t_next
+    s_cmp_ge_u32 s18, s69                         // t_next >= chunkHi -> no more tiles
+    s_cbranch_scc1 .Ltnxt_svc_term\@
+    lds_put TNXT_TILE_OFF, s18                    // publish identity BEFORE READY (readers of READY need a valid tile)
+    lds_put TNXT_STATE_OFF, TNXT_READY
+    s_branch .Ltnxt_svc_done\@
+.Ltnxt_svc_term\@:
+    lds_put TNXT_STATE_OFF, TNXT_TERMINAL
+.Ltnxt_svc_done\@:
+.endm
+.endif
 // ---- per-rowblk reduction accumulator pool: ACC_BASE + bank*ACC_STRIDE (bank in [0,ACC_N)) ----
 //   fp32, rowblk-lifetime (persists across all n_kseg K-segments of a rowblk); DISTINCT from the
 //   segment-lifetime operand pool above. One bank = one C-rowblk = FM*FN frags x 1024B.
-.set ACC_BASE,      (OP_BASE + POOL_N*OPSTRIDE)  // after the operand pool
+.if SELFSERVE || DSWS2_OVERLAP
+.set ACC_BASE,      OP_BASE                      // operand pool reclaimed (SELFSERVE owns this; OVERLAP inherits)
+                                                 //   OPSTRIDE/BRES_ROFF/ARES_ROFF stay DEFINED as inert constants.
+.else
+.set ACC_BASE,      (OP_BASE + POOL_N*OPSTRIDE)  // classic ring: after the operand pool
+.endif
 .set ACC_STRIDE,    (FM*FN*1024)                 // = 8192 @ FM=2 FN=4 (one C-rowblk)
 .if WOFLUSH
 .set LDS_TOTAL_FLOW,(ACC_BASE)                     // WOFLUSH: NO LDS accumulator banks -- each burst atomic-adds
@@ -826,9 +1185,9 @@
 .else
 .set LDS_TOTAL_FLOW,(ACC_BASE + ACC_N*ACC_STRIDE)  // POOL3/ACC1: 57600 ; POOL2/ACC2: 49408
 .endif
-.if SELFSERVE && (SSWIN > POOL_N)
-// The operand pool remains POOL_N deep. Put the wider control-only array after the operand and accumulator
-// regions so it cannot displace OP_BASE or any host-coupled low control word.
+.if SELFSERVE
+// Control-only slot array (depth SSWIN) always sits AFTER ACC. No POOL_N-deep operand pool, so
+//   POOL_N does not appear in LDS_TOTAL_FLOW. SLOT_N is already SSWIN under SELFSERVE.
 .set SLOTC_BASE,     LDS_TOTAL_FLOW
 .set LDS_TOTAL_FLOW, (SLOTC_BASE + SSWIN*SLOTC_STRIDE)
 .endif
@@ -845,20 +1204,18 @@
 .pushsection .lds_total, "a"
     .long LDS_TOTAL_FLOW
 .popsection
+.if !SELFSERVE
 .if (SLOTC_INLINE_BASE + POOL_N*SLOTC_STRIDE) > OP_BASE
   .error "FLOW per-slot control blocks overlap the operand region (raise OP_BASE)"
-.endif
-// Phase-B state must fit in the control gap below the OPERAND POOL.
-// *** WAS `> BRES_OFF` (=256) -- the PRE-FLOW single-slot layout. The FLOW path puts operands at
-//   OP_BASE(512) + slot*OPSTRIDE and never uses BRES_OFF (BSTAGE/ASTAGE non-ring are dead here; flow
-//   calls BSTAGE_R/ASTAGE_R). That stale bound was blocking the ROLE-mailbox alias fix from placing the
-//   control words anywhere sane. Same species as the stale `> 32768` LDS guard. ***
-.if DSWS2_STATE_END > OP_BASE
-  .error "DSWS2 Phase-B state (SNAP_BASE/QUIESCE_CNT) overruns OP_BASE -- raise OP_BASE (and kOpBase in occ_dispatch.cpp)"
 .endif
 // and it must not collide with the per-slot control blocks / TILEDONE / FATTOK below it
 .if SNAP_BASE < (SLOTC_INLINE_BASE + POOL_N*SLOTC_STRIDE)
   .error "control words collide with the per-slot control blocks"
+.endif
+.endif
+// Phase-B state must fit in the control gap below OP_BASE.
+.if DSWS2_STATE_END > OP_BASE
+  .error "DSWS2 Phase-B state (SNAP_BASE/QUIESCE_CNT) overruns OP_BASE -- raise OP_BASE (and kOpBase in occ_dispatch.cpp)"
 .endif
 
 .if DSWS2
@@ -878,7 +1235,23 @@
 .set ACC, 32                                 // accumulators: FM*FN frags x 8 f32 (v32..)
 .set FA,  (ACC + 8*FM*FN)                     // compute A frags (from resident LDS): FM x 2
 .set FB,  (FA + 2*FM)                         // compute B frags (from resident LDS): FN x 2
-.set NFV, ((FB + 2*FN + 15) & ~15)            // grown footprint, rounded to a 16-VGPR dyn block (=112 @ 2x4)
+// DSWS2_KDBUF: second A/B buffer pair after FB so step k+1 loads do not clobber step k's operands.
+//   KSEG_STEPS==1 needs no second set (pipeline degenerates to the classic loop). Numbers @ FM=1 FN=4:
+//     baseline: FA=64 FB=66 last=73 NFV=80  (operand 10)
+//     KDBUF:    FA0=64 FB0=66 FA1=74 FB1=76 last=83 NFV=96  (operand 20) — +16 VGPR, fits fat 112 block.
+//   @ FM=2 FN=4: baseline NFV=112; KDBUF NFV=128 (still one 16-block up; PEAK_CONC drops 7->6).
+.if DSWS2_KDBUF && (KSEG_STEPS > 1)
+  .set FA0, FA
+  .set FB0, FB
+  .set FA1, (FB + 2*FN)
+  .set FB1, (FA1 + 2*FM)
+  .set NFV, ((FB1 + 2*FN + 15) & ~15)
+  .set KDBUF_LPT, (FM + FN)                  // loads/k-step (each global_load_* counts 1); wait target while next is in flight
+.else
+  .set FA0, FA
+  .set FB0, FB
+  .set NFV, ((FB + 2*FN + 15) & ~15)            // grown footprint, rounded to a 16-VGPR dyn block (=112 @ 2x4)
+.endif
 .set VLEAN, 32                                // lean footprint (feeds, claimer, compute pre/post rowblk)
 .set BSTG, 16                                 // staging regs (lean block, < 32): B-feed FN-frag / A-feed FM-frag
 ;; ===========================================================================================
@@ -976,6 +1349,177 @@
 .endif
 .if CFASSIGN && (BATCH != 1)
   .error "CFASSIGN requires BATCH=1; counter batches and counter-free cohorts are mutually exclusive."
+.endif
+.if DSWS2_RCONV && DSWS2_CONV
+  .error "DSWS2_RCONV and DSWS2_CONV are mutually exclusive."
+.endif
+.if CFASSIGN && DSWS2_CONV
+  .error "CFASSIGN with DSWS2_CONV is not validated: conversion changes roles while counter-free cohorts are keyed by fixed wid. Use CFASSIGN=0 for Phase B bring-up."
+.endif
+// DSWS2_RCONV scope, RELAXED 2026-07-24 for the CF0 retarget. The old guard was a blanket "requires
+//   CFASSIGN=1" -- a scoping statement, not a mechanism dependency: RCONV only writes the wave's OWN role
+//   mailbox, and NO reservation path (CFASSIGN cohort math or shared-cursor CAS) reads a wave's role. The
+//   one combination that genuinely was never reasoned through is CFASSIGN=0 WITHOUT DSWS2_OVERLAP: there a
+//   converted feed wave picks up the ring's REAL LDS-staging job (ASTAGE_R/BSTAGE_R against the live
+//   operand pool), which changes the staging population -- untested. Under DSWS2_OVERLAP=1 .Lflow_feed has
+//   no staging job at all (it branches straight to .Lflow_feed_empty), so the role flip only changes which
+//   bookkeeping a coasting wave runs, and both roles end up in the same self-serve peek.
+.if DSWS2_RCONV && !CFASSIGN && !DSWS2_OVERLAP
+  .error "DSWS2_RCONV at CFASSIGN=0 requires DSWS2_OVERLAP=1: without OVERLAP a converted feed wave takes on the ring's real LDS operand-staging job, which changes the staging population on a path this combination was never reasoned through. Build DSWS2_OVERLAP=1 (or CFASSIGN=1)."
+.endif
+.if DSWS2_RCONV && (DSWS2_RCONV_COAST_N < 1)
+  .error "DSWS2_RCONV_COAST_N must be >= 1."
+.endif
+.if BNDSPLIT && !DEADMAN
+  .error "BNDSPLIT requires DEADMAN=1: the boundary counters throttle on s71 (the deadman 1-in-64 counter). Without it the hot-path stores are unthrottled -> hung-WG store storm -> MODE1 brick (same reason as PHIST :2697)."
+.endif
+.if DSWS2_ADVPROBE && !DEADMAN
+  .error "DSWS2_ADVPROBE requires DEADMAN=1: both realtime reads and both atomics throttle on s71==0."
+.endif
+.if DSWS2_BNDTIME && !DEADMAN
+  .error "DSWS2_BNDTIME requires DEADMAN=1: both realtime reads and both atomics throttle on s71==0. The START probe sits at .Lflow_da_boundary, which the 2026-07-24 PHIST census measured at 78.9% of ALL loop passes -- unthrottled that is an s_sendmsg_rtn storm off idle coast waves, i.e. CLAUDE.md rule 5 verbatim (DUTYPROBE bricked the box exactly this way)."
+.endif
+.if DSWS2_BNDTIME && PHASEPROBE
+  .error "DSWS2_BNDTIME uses s78:s79 / s80:s81 / s82 / s83, which ARE the PHASEPROBE per-phase accumulators (phase_reset zeroes s78..s83, phase_flush emits them). Build PHASEPROBE=0. (See the run #8 post-mortem at :2670: an SGPR reused through a .set alias corrupted LIVE state, not just a counter.)"
+.endif
+.if DSWS2_PASSTIME && !DEADMAN
+  .error "DSWS2_PASSTIME requires DEADMAN=1: both T1 and T2 throttle on s71==0 before every s_sendmsg_rtn (MSG_RTN_GET_REALTIME). Unthrottled RTC reads in this loop are CLAUDE.md rule 5 verbatim (DUTYPROBE bricked the box exactly this way). See the .error text at the DSWS2_BNDTIME guard above."
+.endif
+.if DSWS2_PASSTIME && PHASEPROBE
+  .error "DSWS2_PASSTIME refuses PHASEPROBE=1: PASSTIME reuses s77 (PHASEPROBE last-stamp RTC) as PT_T1_N. Build PHASEPROBE=0."
+.endif
+.if DSWS2_PASSTIME && DSWS2_BNDTIME
+  .error "DSWS2_PASSTIME refuses DSWS2_BNDTIME=1: both are message-bus RTC timers on the same poll loop; co-building doubles the throttled sendmsg rate and confuses attribution. Build one or the other. (PASSTIME's SGPR range is deliberately DISJOINT from BNDTIME's s78-s83 -- see the passtime banner at the macros -- so this is a semantic/load guard, not a register collision.)"
+.endif
+.if DSWS2_PASSTIME && TRACE
+  .error "DSWS2_PASSTIME uses s72/s73/s74 (TRACE-only backlog/peak regs at TRACE=0). Build TRACE=0."
+.endif
+.if DSWS2_PASSTIME && (BATCH > 1)
+  .error "DSWS2_PASSTIME uses s72/s73 which BATCH>1 reuses for the serial backlog. Build BATCH=1."
+.endif
+.if DSWS2_PASSTIME && (JDEPTH > 1)
+  .error "DSWS2_PASSTIME uses s91 which the deep-J carrier loop reuses as its j counter. Build JDEPTH=1."
+.endif
+.if DSWS2_PASSTIME && DSWS2_ADVPROBE
+  .error "DSWS2_PASSTIME uses s64 as PT_T2_N; ADVPROBE uses s64 as its delta scratch inside advprobe_end. Build DSWS2_ADVPROBE=0."
+.endif
+// ---- DSWS2_BURSTCNT SGPR ownership (PASSTIME range, mutual exclusion) ----
+//   SGPRs: s72=BURST s73=BLOAD s74=ALOAD s77=WAITLD s78=WMMA s79=DSADD s80=WAITDS.
+//   These are free only when PASSTIME=0, PHASEPROBE=0, BNDTIME=0, BATCH=1, TRACE=0.
+//   (ROLEFLOW/PREFETCH own s75/s76 — we deliberately do not touch them.)
+//   NOT s99/s101/s103: those are FATHELD / DM_PROG / CNT_SS_SHRUNK (run #8 post-mortem).
+.if DSWS2_BURSTCNT && DSWS2_PASSTIME
+  .error "DSWS2_BURSTCNT reuses PASSTIME SGPRs s72/s73/s74/s77-s80. Build DSWS2_PASSTIME=0."
+.endif
+.if DSWS2_BURSTCNT && PHASEPROBE
+  .error "DSWS2_BURSTCNT reuses PHASEPROBE accumulators s77-s80. Build PHASEPROBE=0."
+.endif
+.if DSWS2_BURSTCNT && DSWS2_BNDTIME
+  .error "DSWS2_BURSTCNT reuses BNDTIME SGPRs s78-s80. Build DSWS2_BNDTIME=0."
+.endif
+.if DSWS2_BURSTCNT && (BATCH > 1)
+  .error "DSWS2_BURSTCNT uses s72/s73 which BATCH>1 reuses for the serial backlog. Build BATCH=1."
+.endif
+.if DSWS2_BURSTCNT && TRACE
+  .error "DSWS2_BURSTCNT uses s72/s73/s74 (TRACE backlog/peak regs). Build TRACE=0."
+.endif
+.if DSWS2_BURSTCNT && !SELFSERVE
+  .error "DSWS2_BURSTCNT instruments the SELFSERVE carry-through burst (.Lflow_da_ss_rowblk). Build SELFSERVE=1."
+.endif
+.if DSWS2_KDBUF && !SELFSERVE
+  .error "DSWS2_KDBUF double-buffers the SELFSERVE K-step loop (.Lflow_da_ss_rowblk). Build SELFSERVE=1."
+.endif
+// ---- DSWS2_WTBUDGET SGPR ownership (PASSTIME range; mutual exclusion) ----
+//   s72=A  s73=C_sum  s74=D  s77=E  s78=GOLIVE  s79=LATCH  s80=THR_CTR  s81=C_SAMP  s82=C_N  s83=FLAGS/OVF
+//   Reuses PASSTIME SGPRs — refuse PASSTIME/PHASEPROBE/BNDTIME/BURSTCNT/BATCH>1/TRACE/ROLEFLOW/PREFETCH.
+.if DSWS2_WTBUDGET && DSWS2_PASSTIME
+  .error "DSWS2_WTBUDGET reuses PASSTIME SGPRs s72-s83. Build DSWS2_PASSTIME=0."
+.endif
+.if DSWS2_WTBUDGET && PHASEPROBE
+  .error "DSWS2_WTBUDGET reuses PHASEPROBE SGPRs s77-s83. Build PHASEPROBE=0."
+.endif
+.if DSWS2_WTBUDGET && DSWS2_BNDTIME
+  .error "DSWS2_WTBUDGET reuses BNDTIME SGPRs s78-s83. Build DSWS2_BNDTIME=0."
+.endif
+.if DSWS2_WTBUDGET && DSWS2_BURSTCNT
+  .error "DSWS2_WTBUDGET reuses BURSTCNT SGPRs s72-s80. Build DSWS2_BURSTCNT=0 (partition first; counts already known)."
+.endif
+.if DSWS2_WTBUDGET && (BATCH > 1)
+  .error "DSWS2_WTBUDGET uses s72/s73 which BATCH>1 reuses. Build BATCH=1."
+.endif
+.if DSWS2_WTBUDGET && TRACE
+  .error "DSWS2_WTBUDGET uses s72-s74 (TRACE regs). Build TRACE=0."
+.endif
+.if DSWS2_WTBUDGET && DSWS2_ROLEFLOW
+  .error "DSWS2_WTBUDGET uses s75-range neighbors; refuse ROLEFLOW co-build (s75 hysteresis). Build DSWS2_ROLEFLOW=0."
+.endif
+.if DSWS2_WTBUDGET && DSWS2_PREFETCH
+  .error "DSWS2_WTBUDGET refuse PREFETCH co-build (s75/s76). Build DSWS2_PREFETCH=0."
+.endif
+.if DSWS2_WTBUDGET && !SELFSERVE
+  .error "DSWS2_WTBUDGET bucket A is the SELFSERVE burst. Build SELFSERVE=1."
+.endif
+.if DSWS2_WTBUDGET && (WTB_THR < 1)
+  .error "WTB_THR must be >= 1."
+.endif
+.if DSWS2_WTBUDGET && DSWS2_ADVPROBE
+  .error "DSWS2_WTBUDGET uses s64 as WTB_T; ADVPROBE uses s64 as delta scratch. Build DSWS2_ADVPROBE=0."
+.endif
+// ---- DSWS2_GAP SGPRs: s72-s74, s77-s83. Refuse co-tenants. ----
+.if DSWS2_GAP && DSWS2_PASSTIME
+  .error "DSWS2_GAP reuses PASSTIME SGPRs. Build DSWS2_PASSTIME=0."
+.endif
+.if DSWS2_GAP && DSWS2_BURSTCNT
+  .error "DSWS2_GAP reuses BURSTCNT SGPRs. Build DSWS2_BURSTCNT=0."
+.endif
+.if DSWS2_GAP && DSWS2_WTBUDGET
+  .error "DSWS2_GAP reuses WTBUDGET SGPRs. Build DSWS2_WTBUDGET=0."
+.endif
+.if DSWS2_GAP && !SELFSERVE
+  .error "DSWS2_GAP times SELFSERVE burst gaps. Build SELFSERVE=1."
+.endif
+.if DSWS2_GAP && (BATCH > 1)
+  .error "DSWS2_GAP uses s72/s73 which BATCH>1 reuses. Build BATCH=1."
+.endif
+.if DSWS2_GAP && TRACE
+  .error "DSWS2_GAP uses s72-s74. Build TRACE=0."
+.endif
+.if DSWS2_GAP && PHASEPROBE
+  .error "DSWS2_GAP uses s78-s83 (PHASEPROBE range). Build PHASEPROBE=0."
+.endif
+.if DSWS2_GAP && DSWS2_BNDTIME
+  .error "DSWS2_GAP uses s78-s83 (BNDTIME range). Build DSWS2_BNDTIME=0."
+.endif
+.if DSWS2_GAP && DSWS2_ADVPROBE
+  .error "DSWS2_GAP uses s64 as GAP_DID_GL; ADVPROBE uses s64. Build DSWS2_ADVPROBE=0."
+.endif
+// ---- DSWS2_POLLSTAGE: s72/s73/s74/s77. Refuse co-tenants. Value 0..6 only. ----
+.if (DSWS2_POLLSTAGE < 0) || (DSWS2_POLLSTAGE > 9)
+  .error "DSWS2_POLLSTAGE must be 0 (off) or 1..9 (7=burst+grow, 8=burst-grow, 9=burst body only)."
+.endif
+.if DSWS2_POLLSTAGE && DSWS2_GAP
+  .error "DSWS2_POLLSTAGE reuses GAP SGPRs. Build DSWS2_GAP=0."
+.endif
+.if DSWS2_POLLSTAGE && DSWS2_PASSTIME
+  .error "DSWS2_POLLSTAGE reuses PASSTIME SGPRs. Build DSWS2_PASSTIME=0."
+.endif
+.if DSWS2_POLLSTAGE && DSWS2_BURSTCNT
+  .error "DSWS2_POLLSTAGE reuses BURSTCNT SGPRs. Build DSWS2_BURSTCNT=0."
+.endif
+.if DSWS2_POLLSTAGE && DSWS2_WTBUDGET
+  .error "DSWS2_POLLSTAGE reuses WTBUDGET SGPRs. Build DSWS2_WTBUDGET=0."
+.endif
+.if DSWS2_POLLSTAGE && (BATCH > 1)
+  .error "DSWS2_POLLSTAGE uses s72/s73 which BATCH>1 reuses. Build BATCH=1."
+.endif
+.if DSWS2_POLLSTAGE && TRACE
+  .error "DSWS2_POLLSTAGE uses s72-s74. Build TRACE=0."
+.endif
+.if DSWS2_POLLSTAGE && PHASEPROBE
+  .error "DSWS2_POLLSTAGE uses s72-s77 (PHASEPROBE range). Build PHASEPROBE=0."
+.endif
+.if DSWS2_POLLSTAGE && DSWS2_BNDTIME
+  .error "DSWS2_POLLSTAGE uses s72-s77 (BNDTIME range). Build DSWS2_BNDTIME=0."
 .endif
 .if CFASSIGN && (WAVES > SSWIN)
   .error "CFASSIGN requires WAVES <= SSWIN: a flat wid mapping must not alias control slots."
@@ -2372,6 +2916,248 @@
 .set BND_ASNSKEW_OFF, 472                   // occ[118] ASSIGN != z at the group/tile decision  (MUST be 0)
 .set BND_QBAD_OFF,    476                   // occ[119] (z-base)>>shift outside [1,GROUPS]      (MUST be 0)
 .set BND_TERM_OFF,    480                   // occ[120] terminal transitions (out-of-range tile claim)
+// ---- BNDSPLIT waterfall counters (2026-07-23): occ[127..130], clear of BNDPROBE occ[116..126] ----
+//   Each is a fall-through count on the .Lflow_da_boundary path; the host derives the 4-way split:
+//   herd(ZLOCK_LOST)=entry-zwon ; drain_bail=zwon-pdrain ; cstore_bail=pdrain-pcstore ; advance~=pcstore
+.set BNDS_ENTRY_OFF,   508                  // occ[127] boundary entries (every .Lflow_da_boundary)
+.set BNDS_ZWON_OFF,    512                  // occ[128] won the ZLOCK election CAS
+.set BNDS_PDRAIN_OFF,  516                  // occ[129] passed the drain-gate (DRAIN>=ASSIGN)
+.set BNDS_PCSTORE_OFF, 520                  // occ[130] passed the C-store GSTORED gate (-> will advance)
+// ---- ADVPROBE: sampled successful ZLOCK critical-section ticks and advances ----
+.set ADVP_TICKS_OFF,    524                  // occ[131] sum(now - saved ZLOCK-win RTC)
+.set ADVP_COUNT_OFF,    528                  // occ[132] successful advances sampled with the same s71 gate
+// ---- BNDTIME: sampled ticks spent in a boundary pass that does NOT complete an advance ----
+//   The COMPLEMENT of ADVPROBE. ADVPROBE times election-win -> DA_ZDONE store; these two slots time
+//   .Lflow_da_boundary ENTRY -> every non-advancing exit. Highest previously used occ index was 132
+//   (ADVP_COUNT); 133/134 are the first free words and, like ADVPROBE's, sit ABOVE the host's 0x100
+//   per-chunk memset, so they accumulate over the whole run.
+.set BNDT_LOSTTICKS_OFF, 532                 // occ[133] sum(exit RTC - entry RTC) over LOSING boundary passes
+.set BNDT_LOSTCOUNT_OFF, 536                 // occ[134] losing boundary passes sampled with the same s71 gate
+// ---- PASSTIME: whole-pass (T1) + reservation-CAS (T2) + null-interval (T0) timers ----
+//   Highest previously named occ index was 134 (BNDT_LOSTCOUNT). 135..140 are the next free words and,
+//   like ADVPROBE/BNDTIME, sit ABOVE the host's 0x100 per-chunk memset so they accumulate over the run.
+// Tick-sums are 64-bit in occ[] (lo + hi). Per-wave SGPR accums stay 32-bit with SATURATE+FLAG
+//   on SCC carry (a single wave cannot approach 2^32 under DEADMAN); the global atomic_add of
+//   ~1920 waves' partials IS what overflowed (run 3: gt1k sum wrapped once). Emit uses
+//   atomic_add_return on lo + carry into hi so the host sees a true u64.
+.set PT_T1_TICKS_LO_OFF,  540                // occ[135] T1 tick-sum bits[31:0]
+.set PT_T1_COUNT_OFF,     544                // occ[136] T1 END sample count (u32; ~3e6 max, safe)
+.set PT_T2_TICKS_LO_OFF,  548                // occ[137] T2 tick-sum bits[31:0]
+.set PT_T2_COUNT_OFF,     552                // occ[138] T2 sample count
+.set PT_T0_TICKS_LO_OFF,  556                // occ[139] T0 tick-sum bits[31:0]
+.set PT_T0_COUNT_OFF,     560                // occ[140] T0 sample count
+// legacy names (lo only) so existing references keep compiling during the edit
+.set PT_T1_TICKS_OFF,  PT_T1_TICKS_LO_OFF
+.set PT_T2_TICKS_OFF,  PT_T2_TICKS_LO_OFF
+.set PT_T0_TICKS_OFF,  PT_T0_TICKS_LO_OFF
+// ---- PASSTIME settling (2026-07-25, task 3d478566): pairing canary + max + start count + residency ----
+//   All above the 0x100 per-chunk memset. Residency is DSWS2_PASSTIME-gated (NOT TRACE) so it cannot
+//   silently read 0 when TRACE=0 the way occ[1] historically did.
+.set PT_UNPAIRED_OFF,  564                   // occ[141] T1 ends with s71==0 but armed==0 (pairing defect count)
+.set PT_T1_MAX_OFF,    568                   // occ[142] global MAX of armed-matched T1 deltas (atomic_max at retire)
+.set PT_T1_START_OFF,  572                   // occ[143] T1 start samples (s71==0 latch count) -- asymmetry vs occ[136]
+// Residency MUST sit ABOVE the host's 0x100 per-chunk memset (occ[0..63]). TRACE used occ[1] for peak and
+//   that slot is wiped every chunk -- the historical "peak-resident=0" lie when TRACE=0. PASSTIME peak lives
+//   at occ[145] so atomic_max survives the whole multi-chunk run. Live scratch may sit below (per-chunk OK).
+.set PT_LIVE_OFF,      ALLLIVE_OFF           // occ[60] live count for the peak tracker (++entry/--retire; per-chunk OK)
+.set PT_ENTRIES_OFF,   576                   // occ[144] wave-entries (one bump/wave/go-live; sums across chunks)
+.set PT_PEAK_OFF,      580                   // occ[145] peak concurrent resident waves (survives 0x100 memset)
+// ---- PASSTIME tail attribution (2026-07-25, task 521faadd): nested thresholds on armed-matched T1 ----
+//   Two thresholds give THREE regimes without a third pair of SGPRs:
+//     bulk    : delta <  1K     = total - gt1k
+//     mid     : 1K <= delta < 64K = gt1k - gt64k
+//     extreme : delta >= 64K    = gt64k
+//   Thresholds chosen against settling-run mean~419 / max~329112: 1K is the first integer power-of-two
+//   above the bulk mean (~2.4x mean), 64K is the extreme band (max is ~5x 64K). 8K omitted: SGPR
+//   pressure (prefer count+sum over a third count-only bucket). Host derives mid from the two.
+//   SGPRs: reuses STAGINSTR slots that are STRUCTURALLY ZERO under PASSTIME's required profile
+//   (JDEPTH=1 => no JWAIT/CLEAD; BATONGATE=1 => no FATFULL software-token path; DMFAT only on
+//   JDEPTH>1 fat path). cnt_flush SKIPS emitting those four when PASSTIME so we do not poison
+//   occ[87/88/89/91] with threshold data.
+.set PT_T1_GT1K_CNT_OFF,   584               // occ[146] count of armed T1 deltas >= 1024
+.set PT_T1_GT1K_SUM_LO_OFF, 588              // occ[147] gt1k tick-sum bits[31:0]
+.set PT_T1_GT64K_CNT_OFF,  592               // occ[148] count of armed T1 deltas >= 65536
+.set PT_T1_GT64K_SUM_LO_OFF, 596             // occ[149] gt64k tick-sum bits[31:0]
+.set PT_T1_TICKS_HI_OFF,   600               // occ[150] T1 tick-sum bits[63:32]
+.set PT_T2_TICKS_HI_OFF,   604               // occ[151] T2 tick-sum bits[63:32]
+.set PT_T0_TICKS_HI_OFF,   608               // occ[152] T0 tick-sum bits[63:32]
+.set PT_T1_GT1K_SUM_HI_OFF, 612              // occ[153] gt1k tick-sum bits[63:32]
+.set PT_T1_GT64K_SUM_HI_OFF, 616             // occ[154] gt64k tick-sum bits[63:32]
+.set PT_OVF_OFF,           620               // occ[155] OR of per-wave overflow flags (see PT_OVF_*)
+.set PT_T1_GT1K_SUM_OFF,  PT_T1_GT1K_SUM_LO_OFF
+.set PT_T1_GT64K_SUM_OFF, PT_T1_GT64K_SUM_LO_OFF
+.set PT_THR_1K,  1024
+.set PT_THR_64K, 65536
+// Per-wave overflow flag bits in s65 (OR'd into occ[155] at retire). Host treats any bit as VOID.
+.set PT_OVF_T1,    1
+.set PT_OVF_T0,    2
+.set PT_OVF_T2,    4
+.set PT_OVF_GT1K,  8
+.set PT_OVF_GT64K, 16
+// ---- s71 co-tenants (P3, task ec4089ed): compile-time mask of instruments that key off s71==0.
+//   Host uses this to name WHY a T1 x64 extrapolation may be non-representative. Bit meanings:
+//     bit0 PASSTIME T1/T2/T0    bit1 ROLEFLOW reversion probe
+//     bit2 PREFETCH s71-gated loads (0 for P2+ dedicated engine — engine does NOT sample s71)
+//     bit3 PHIST    bit4 FORENSICS flow_snapshot    bit5 DEADMAN (owns the counter)
+//     bit6 ADVPROBE bit7 BNDTIME bit8 BNDSPLIT
+//   Emitted once per wave at retire via atomic_or (idempotent). Above 0x100 memset (survives chunks).
+.set PT_S71_GATES_OFF, 636                   // occ[159]
+.set PT_S71_BIT_PASSTIME,  1
+.set PT_S71_BIT_ROLEFLOW,  2
+.set PT_S71_BIT_PREFETCH,  4                 // only if a future path re-gates PF loads on s71
+.set PT_S71_BIT_PHIST,     8
+.set PT_S71_BIT_FORENSICS, 16
+.set PT_S71_BIT_DEADMAN,   32
+.set PT_S71_BIT_ADVPROBE,  64
+.set PT_S71_BIT_BNDTIME,   128
+.set PT_S71_BIT_BNDSPLIT,  256
+// ---- DSWS2_BURSTCNT: Step-0 frequency counters (SALU accumulate, emit once at retire) ----
+//   Site: .Lflow_da_ss_rowblk only (the wall). Above 0x100 memset; survives multi-chunk.
+//   occ buffer is 0x1000B => occ[160..] is in range.
+.set BCNT_BURST_OFF,  640                    // occ[160] rowblk burst entries
+.set BCNT_BLOAD_OFF,  644                    // occ[161] B global_load_tr_b64 issues
+.set BCNT_ALOAD_OFF,  648                    // occ[162] A global_load_b64 issues (SS path: NOT ds_load)
+.set BCNT_WAITLD_OFF, 652                    // occ[163] s_wait_loadcnt drains in the k-step loop
+.set BCNT_WMMA_OFF,   656                    // occ[164] v_wmma_f32_16x16x16_fp8_fp8 issues
+.set BCNT_DSADD_OFF,  660                    // occ[165] ds_add_f32 reductions
+.set BCNT_WAITDS_OFF, 664                    // occ[166] s_wait_dscnt after the reduce
+// SGPRs (PASSTIME range; see guards at DSWS2_PASSTIME block). NOT s99/s101/s103.
+.set BCNT_BURST,  72
+.set BCNT_BLOAD,  73
+.set BCNT_ALOAD,  74
+.set BCNT_WAITLD, 77
+.set BCNT_WMMA,   78
+.set BCNT_DSADD,  79
+.set BCNT_WAITDS, 80
+// ---- DSWS2_WTBUDGET occ[] (above 0x100 per-chunk memset; survive all 33 chunk relaunches) ----
+//   ROOT CAUSE of first-run negative residual (task 9c68cbb6): tick SUMS were u32 atomics.
+//   Expected sum(T) ≈ span×1920 ≈ 6.65e10 overflows u32 (2^32≈4.3e9) ~15× → residual nonsense.
+//   All tick totals are now u64 (lo+hi) via pt_emit_u64. Counts stay u32.
+.set WTB_A_LO_OFF,       668                 // occ[167] A ticks lo
+.set WTB_A_HI_OFF,       672                 // occ[168] A ticks hi
+.set WTB_C_SUM_LO_OFF,   676                 // occ[169] C sample-sum lo
+.set WTB_C_SUM_HI_OFF,   680                 // occ[170] C sample-sum hi
+.set WTB_C_SAMP_OFF,     684                 // occ[171] # C RTC samples
+.set WTB_C_N_OFF,        688                 // occ[172] # feedmt SLEEPN parks (all)
+.set WTB_D_LO_OFF,       692                 // occ[173] D ticks lo
+.set WTB_D_HI_OFF,       696                 // occ[174] D ticks hi
+.set WTB_E_LO_OFF,       700                 // occ[175] E ticks lo
+.set WTB_E_HI_OFF,       704                 // occ[176] E ticks hi
+.set WTB_T_LO_OFF,       708                 // occ[177] T ticks lo  (sum of epochs across chunks)
+.set WTB_T_HI_OFF,       712                 // occ[178] T ticks hi
+.set WTB_OVF_OFF,        716                 // occ[179] OR of per-wave overflow flags
+.set WTB_LIVE_OFF,       720                 // occ[180] live concurrent (debug; ++enter/--exit)
+.set WTB_PEAK_OFF,       724                 // occ[181] peak concurrent MEASURED (atomic_max)
+.set WTB_ENTRIES_OFF,    728                 // occ[182] wave-instance entries (expect 33×1920=63360)
+.set WTB_OVF_A, 1
+.set WTB_OVF_C, 2
+.set WTB_OVF_D, 4
+.set WTB_OVF_E, 8
+.set WTB_OVF_T, 16
+// SGPRs (PASSTIME range when PASSTIME=0; see guards). s64 = WTB_T (ADVPROBE refused).
+.set WTB_A,      72                          // += burst intervals (many/launch)
+.set WTB_C_SUM,  73                          // += sampled sleep intervals
+.set WTB_D,      74                          // += boundary intervals
+.set WTB_E,      77                          // += E_init (entry→golive); once/launch then emit
+.set WTB_GOLIVE, 78                          // ASSIGN stamp at first .Lflow_loop (re-init each launch)
+.set WTB_LATCH,  79                          // ASSIGN open-interval start (A/C/D/E pieces)
+.set WTB_THR_CTR,80                          // own C throttle (NOT s71)
+.set WTB_C_SAMP, 81                          // += sample count
+.set WTB_C_N,    82                          // += all parks
+.set WTB_FLAGS,  83
+.set WTB_T,      64                          // += (now−golive) at each retire (once/launch; multi-chunk via occ u64)
+// FLAGS layout: bit0=in_A, bit1=in_D, bit2=have_entry, bit3=have_golive; ovf OR'd into bits 8+
+.set WTB_F_IN_A,      1
+.set WTB_F_IN_D,      2
+.set WTB_F_HAVE_ENTRY,4
+.set WTB_F_HAVE_GOLIVE,8
+// ---- DSWS2_GAP: HEAD / GAP / TAIL (above 0x100 memset; survive chunk relaunches) ----
+.set GAP_SUM_LO_OFF,   740                   // occ[185] inter-burst gap sum lo
+.set GAP_SUM_HI_OFF,   744                   // occ[186] gap sum hi
+.set GAP_N_OFF,        748                   // occ[187] # gaps
+.set GAP_HEAD_LO_OFF,  752                   // occ[188] HEAD sum lo
+.set GAP_HEAD_HI_OFF,  756                   // occ[189] HEAD sum hi
+.set GAP_HEAD_N_OFF,   760                   // occ[190] # HEAD samples (= waves with ≥1 burst, or NOBURST)
+.set GAP_TAIL_LO_OFF,  764                   // occ[191] TAIL sum lo
+.set GAP_TAIL_HI_OFF,  768                   // occ[192] TAIL sum hi
+.set GAP_TAIL_N_OFF,   772                   // occ[193] # TAIL samples
+.set GAP_NOBURST_OFF,  776                   // occ[194] waves that never ran a burst
+.set GAP_LIVE_OFF,     780                   // occ[195] live concurrent (++golive / --retire); per-chunk → 0
+.set GAP_PEAK_OFF,     784                   // occ[196] peak concurrent (atomic_max; survives chunks)
+.set GAP_ENTRIES_OFF,  788                   // occ[197] wave-instance entries (cross-check vs HEAD_n)
+.set GAP_SUM,    72
+.set GAP_N,      73
+.set GAP_LATCH,  74                          // last CP1 (end of last burst) / temp
+.set GAP_HAVE,   77                          // 1 = CP1 armed (pending next CP2 or TAIL)
+.set GAP_GOLIVE, 78                          // go-live stamp
+.set GAP_HEAD,   79
+.set GAP_HEAD_N, 80
+.set GAP_TAIL,   81
+.set GAP_TAIL_N, 82
+.set GAP_NOBURST,83
+.set GAP_DID_GL, 64                          // 1 = golive stamped (ADVPROBE refused via PASSTIME guards already)
+// ---- DSWS2_POLLSTAGE: one-stage poll timer (above 0x100 memset) ----
+//   occ[198..201]: sum lo/hi, sample count, build-time stage id echo.
+.set PS_SUM_LO_OFF,   792                   // occ[198] stage tick-sum lo
+.set PS_SUM_HI_OFF,   796                   // occ[199] stage tick-sum hi
+.set PS_N_OFF,        800                   // occ[200] # completed stage samples
+.set PS_STAGE_OFF,    804                   // occ[201] DSWS2_POLLSTAGE echo (1..6)
+.set PS_START,  72                          // entry RTC low (latched at enter)
+.set PS_SUM,    73                          // per-wave tick sum (u32; global emit is u64)
+.set PS_N,      74                          // per-wave sample count
+.set PS_ARMED,  77                          // 1 = enter latched, not yet leave'd
+// *** THROTTLE (2026-07-26). WHY THIS EXISTS, because the unthrottled version produced a
+//   PLAUSIBLE-LOOKING TABLE THAT WAS MOSTLY INSTRUMENT. Measured, 27 shapes: an unthrottled
+//   POLLSTAGE build completes only 0.21x the loop passes of a probe-free control in the SAME span
+//   -- i.e. each probed pass costs ~4.8x a real one. Stage 1 brackets THREE SALU INSTRUCTIONS and
+//   reported 487 ns; that number was the probe, not the work.
+//   ROOT CAUSE IS THE CHIP, NOT THE DESIGN: gfx1201 has NO cheap clock. s_memtime and
+//   s_memrealtime are not supported, and there is no HW_REG shader-cycle register. The message-bus
+//   s_sendmsg_rtn(MSG_RTN_GET_REALTIME) is the ONLY clock a shader can read, it serialises across
+//   2048 waves, and one read costs about what two whole poll passes cost.
+//   THE FIX IS RATE, NOT MECHANISM. Stage 4's build already proved it: its probe fires 0.23x per
+//   pass and perturbs the run by 1.06x -- free. At 1-in-64 every stage lands in that regime.
+//   Only the ENTER is gated. A pass that is not sampled never arms, and `leave` already skips on
+//   ARMED==0, so start/end can never desync -- which is the defect class that voided PASSTIME's
+//   T1 (a stale start paired with a live end).
+//   *** PS_THR IS A PRIVATE COUNTER, DELIBERATELY NOT s71. *** On 2026-07-25 the probe and the
+//   prefetch both keyed off s71, so every sampled pass carried a blocking HBM round trip the other
+//   63 never paid -- a 7x phantom that survived calibration, adversarial review and disassembly.
+//   Before reusing ANY throttle counter, ask what else fires on the same tick.
+.set PS_THR,    78                          // own sampling counter (NOT s71 -- see above)
+.ifndef DSWS2_POLLSTAGE_EVERY
+    .set DSWS2_POLLSTAGE_EVERY, 64          // sample 1 pass in N. Sweep it: if the numbers do not
+.endif                                      //   move between 64 and 256, perturbation is negligible.
+.if DSWS2_POLLSTAGE && (DSWS2_POLLSTAGE_EVERY < 1)
+  .error "DSWS2_POLLSTAGE_EVERY must be >= 1 (1 = unthrottled = the 4.8x-perturbation build)."
+.endif
+// Assemble the mask from active defsyms (pure compile-time).
+.set PT_S71_MASK, 0
+.if DSWS2_PASSTIME
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_PASSTIME)
+.endif
+.if DSWS2_ROLEFLOW
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_ROLEFLOW)
+.endif
+// PREFETCH P2+ engine does NOT gate loads on s71 — leave bit2 clear. (P1's broken burst did; deleted.)
+.if PHIST
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_PHIST)
+.endif
+.if FORENSICS
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_FORENSICS)
+.endif
+.if DEADMAN
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_DEADMAN)
+.endif
+.if DSWS2_ADVPROBE
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_ADVPROBE)
+.endif
+.if DSWS2_BNDTIME
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_BNDTIME)
+.endif
+.if BNDSPLIT
+  .set PT_S71_MASK, (PT_S71_MASK | PT_S71_BIT_BNDSPLIT)
+.endif
 // ---- SKEW VALUE CAPTURE (2026-07-20, after run s1_hunt_08 caught the race). ----
 //   occ[118] proved ASSIGN != z at the decision, 2 events, correlated 1:1 with 2 lost groups and
 //   2 missing group-advances. But a COUNT cannot say WHICH DIRECTION, and the direction decides the
@@ -2520,13 +3306,29 @@
     cnt_emit CNT_BWRITE,   FDIAG_BWRITE_OFF
     cnt_emit CNT_BADD,     FDIAG_BADD_OFF
     cnt_emit CNT_FEEDMT,   FDIAG_FEEDMT_OFF
+.if !DSWS2_PASSTIME
+    // Under PASSTIME, s94/s95/s96/s98 hold T1 tail buckets (see passtime banner). They are
+    //   structurally zero as STAGINSTR counters at PASSTIME's required profile (JDEPTH=1,
+    //   BATONGATE=1), so skipping these four emits loses no diagnostic. ORDER of the remaining
+    //   emits when PASSTIME=0 is byte-identical to the pre-tail layout (do not reorder).
     cnt_emit CNT_JWAIT,    FDIAG_JWAIT_OFF
     cnt_emit CNT_CLEAD,    FDIAG_CLEAD_OFF
+.endif
     cnt_emit CNT_CNOSTG,   FDIAG_CNOSTG_OFF
+.if !DSWS2_PASSTIME
     cnt_emit CNT_DMFAT,    FDIAG_DMFAT_OFF
+.endif
     cnt_emit CNT_TOKLEAK,  FDIAG_TOKLEAK_OFF
 .if SELFSERVE
+.if DSWS2_PREFETCH && DSWS2_PF_COUNTERS
+    // PF_WID reuses s103 (CNT_SS_SHRUNK) as PF_IDLE — only when PF_COUNTERS=1. Skip SS_SHRUNK emit.
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc1 .Lcf_skip_ssshrunk\@
+.endif
     cnt_emit CNT_SS_SHRUNK,  FDIAG_SS_SHRUNK_OFF    // ONE atomic per wave. ENTER/SETTLED deleted -- see :2120.
+.if DSWS2_PREFETCH && DSWS2_PF_COUNTERS
+.Lcf_skip_ssshrunk\@:
+.endif
 .endif
 .if DECENTASN
     cnt_emit CLAIM_EXECBAD,   FDIAG_STRADDLE_OFF
@@ -2539,7 +3341,9 @@
     cnt_emit DP_FAT, FDIAG_DUTYFAT_OFF
     cnt_emit DP_CYC, FDIAG_DUTYCYC_OFF
 .endif
+.if !DSWS2_PASSTIME
     cnt_emit CNT_FATFULL,  FDIAG_FATFULL_OFF
+.endif
 .endif                                          // !CNTLEAN
     s_wait_storecnt 0x0                         // still required: CNTLEAN still emits 2 atomics
 .Lcf_skip\@:
@@ -2643,6 +3447,784 @@
 .Lbb_rest\@:
     s_mov_b32 exec_lo, s57
     s_wait_storecnt 0x0                      // s_alloc_vgpr does NOT drain stores (:2318)
+.endif
+.endm
+.macro bndsplit_bump off                     // BNDSPLIT waterfall counter. THROTTLED like phist_bump (NOT bnd_bump):
+.if BNDSPLIT                                 //   boundary entries are HOT (~82% of loop passes), so an unthrottled
+    s_cmp_eq_u32 s71, 0                       //   store here is a MODE1 brick risk from a hung WG (see PHIST :2697).
+    s_cbranch_scc0 .Lbsp_skip\@               // ANTI-BRICK THROTTLE: deadman's 1-in-64 boundary (requires DEADMAN=1).
+    s_mov_b32 s57, exec_lo                    //   s71 is CONSTANT across one boundary pass (set at the loop head), so
+    v_cmp_eq_u32 vcc_lo, 0, v2                //   all 4 waterfall counters fire-or-skip together -> ratios stay exact.
+    s_and_b32 exec_lo, exec_lo, vcc_lo        //   ACC-DEAD site, s57 exec-save (mirrors bnd_bump/phist_bump).
+    s_cbranch_execz .Lbsp_rest\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:\off scope:SCOPE_DEV
+.Lbsp_rest\@:
+    s_mov_b32 exec_lo, s57
+    s_wait_storecnt 0x0
+.Lbsp_skip\@:
+.endif
+.endm
+.macro advprobe_start
+.if DSWS2_ADVPROBE
+    s_cmp_eq_u32 s71, 0
+    s_cbranch_scc0 .Ladvp_start_skip\@
+    s_sendmsg_rtn_b64 s[58:59], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+.Ladvp_start_skip\@:
+.endif
+.endm
+.macro advprobe_end
+.if DSWS2_ADVPROBE
+    s_cmp_eq_u32 s71, 0
+    s_cbranch_scc0 .Ladvp_end_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s64, s62, s58
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Ladvp_end_restore\@
+    v_mov_b32 v3, s64
+    global_atomic_add_u32 v4, v3, s[0:1] offset:ADVP_TICKS_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:ADVP_COUNT_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Ladvp_end_restore\@:
+    s_mov_b32 exec_lo, s49
+.Ladvp_end_skip\@:
+.endif
+.endm
+// ---- BNDTIME: the LOSING-PASS timer. Deliberately a COPY of advprobe_start/advprobe_end's shape (same
+//   s71==0 throttle, same s_sendmsg_rtn_b64 + s_wait_kmcnt, same modular u32 subtract, same lane-0
+//   exec-masked atomics, same s_wait_storecnt drain). Only the registers and the occ offsets differ.
+//   REGISTERS (audited against the boundary handler's live set s44-s47/s51/s53/s66-s68, RCONV's s50,
+//   the deadman's s70/s71, the lds_* macros' s49, flow_gauge/phist's s57, ROLEFLOW's s75, KMAJOR's s76):
+//     s[78:79] entry RTC (latched at .Lflow_da_boundary, must survive the whole pass)
+//     s[80:81] exit RTC ; s82 delta ; s83 exec save
+//   ALL SIX are PHASEPROBE-only registers (phase_reset/phase_flush own s77..s83) and PHASEPROBE=1 is
+//   REFUSED above. Nothing else in the file writes s78..s83. Distinct from ADVPROBE's s58/s59/s62/s63/
+//   s64/s49, so BNDTIME and ADVPROBE can be built together without either corrupting the other.
+//   ACC-DEAD sites only: the boundary handler is a LEAN wave that holds no slot and no accumulator.
+.macro bndtime_start                         // latch the entry RTC. NO memory touched -- pure message-bus read.
+.if DSWS2_BNDTIME
+    s_cmp_eq_u32 s71, 0                       // *** ANTI-BRICK THROTTLE (CLAUDE.md rule 5). NOT optional: this
+    s_cbranch_scc0 .Lbndt_start_skip\@        //   site is 78.9% of loop passes (2026-07-24 PHIST census).
+    s_sendmsg_rtn_b64 s[78:79], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+.Lbndt_start_skip\@:
+.endif
+.endm
+.macro bndtime_end_lost                      // accumulate (now - s78) and bump the LOSING-pass count.
+.if DSWS2_BNDTIME                             //   s71 CANNOT change inside a boundary pass: the ONLY writers of s71
+    s_cmp_eq_u32 s71, 0                       //   are deadman_stamp (prologue) and deadman_check/_fat at :3433,
+    s_cbranch_scc0 .Lbndt_end_skip\@          //   :3447 (.Lflow_loop head), :4102/:4114 (FAT carrier, unreachable
+                                              //   from this LEAN handler) and :5663 (.Lflow_da_drain, only AFTER the
+                                              //   terminal end site). NONE lies between the entry latch and any
+                                              //   exit site -> a sampled
+    s_sendmsg_rtn_b64 s[80:81], sendmsg(MSG_RTN_GET_REALTIME)   // start ALWAYS pairs with a sampled end.
+    s_wait_kmcnt 0x0
+    s_sub_u32 s82, s80, s78                   // modular u32 delta (a pass is << 2^32 ticks -> wrap-safe)
+    s_mov_b32 s83, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo        // lane0 only
+    s_cbranch_execz .Lbndt_end_restore\@
+    v_mov_b32 v3, s82
+    global_atomic_add_u32 v4, v3, s[0:1] offset:BNDT_LOSTTICKS_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:BNDT_LOSTCOUNT_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0                       // s_alloc_vgpr does NOT drain stores (:2318)
+.Lbndt_end_restore\@:
+    s_mov_b32 exec_lo, s83
+.Lbndt_end_skip\@:
+.endif
+.endm
+// ---- PASSTIME: whole-pass (T1) + reservation-CAS (T2) + null-cal (T0) timers. Deliberately a
+//   COPY of bndtime_start / bndtime_end_lost's PROBE SHAPE (s71==0 throttle BEFORE s_sendmsg_rtn,
+//   s_wait_kmcnt, modular u32 subtract) but with NO stores in the hot loop: accumulate into
+//   private SGPRs and emit ONCE per wave at .Lflow_retire via cnt_emit (the STAGINSTR shape).
+//
+//   REGISTERS (T1/T2 latches+accums DISJOINT from BNDTIME's s78-s83 for the original four;
+//   settling counters sit in the PHASEPROBE/BNDTIME block under mutual exclusion -- BNDTIME and
+//   PHASEPROBE are refused, so s78..s83 are free when PASSTIME is on):
+//     s72  PT_T1_START     entry RTC low at .Lflow_loop (survives the whole pass)
+//     s73  PT_T2_START     entry RTC low just before the reservation CAS
+//                         ALSO reused as T0 null-interval start temp at park (T2 already closed)
+//     s74  PT_T1_TICKS     running sum of ARMED-matched T1 deltas
+//     s77  PT_T1_N         T1 END sample count (armed-matched only)
+//     s91  PT_T2_TICKS     running sum of T2 deltas
+//     s64  PT_T2_N         T2 sample count
+//     s78  PT_T0_TICKS     running sum of NULL-interval deltas
+//     s79  PT_T0_N         T0 sample count
+//     s80  PT_T1_START_N   T1 START sample count (bumped at every successful latch)
+//     s81  PT_ARMED        1 = T1 start latched this pass and not yet consumed/cleared
+//     s82  PT_UNPAIRED     T1 ends with s71==0 but armed==0 (pairing-defect canary; 0 is a REAL result)
+//     s83  PT_T1_MAX       running MAX of armed-matched T1 deltas (this wave; global max at flush)
+//   Tail buckets (structurally-free STAGINSTR SGPRs under PASSTIME's JDEPTH=1/BATONGATE=1 profile;
+//   cnt_flush skips their STAGINSTR emits when PASSTIME so occ[87/88/89/91] stay clean zeros):
+//     s94  PT_GT1K_N       count  delta >= 1024     (was CNT_FATFULL; dead at BATONGATE=1)
+//     s95  PT_GT1K_TICKS   sum    delta >= 1024     (was CNT_JWAIT;    dead at JDEPTH=1)
+//     s96  PT_GT64K_N      count  delta >= 65536    (was CNT_CLEAD;    dead at JDEPTH=1)
+//     s98  PT_GT64K_TICKS  sum    delta >= 65536    (was CNT_DMFAT;    dead at JDEPTH=1)
+//     s65  PT_OVF_FLAGS    OR of PT_OVF_* bits (DIAG/try_gate only otherwise; TRACE=0 FORENSICS=0)
+//   Scratch for "now" RTC: s[62:63] (same deadman/advprobe/phase scratch; only live across
+//   the few instructions of a start/end site; never held across an LDS op or role body).
+//
+//   64-BIT TICK SUMS (task c1add58c): per-wave SGPRs stay 32-bit with SATURATE+FLAG on SCC carry
+//   (pt_add_sat). Emit is 64-bit via atomic_add_return on lo + carry into hi (pt_emit_u64).
+//   A single wave cannot approach 2^32 under DEADMAN; the global sum of ~1920 waves can and did.
+//
+//   SETTLING SEMANTICS (task 3d478566):
+//     * armed is cleared at EVERY .Lflow_loop head (unconditionally), then set only by T1 start.
+//     * T1 end accumulates ONLY when armed==1; otherwise bumps unpaired and skips the delta.
+//     * start_count vs end_count exposes orphaned starts; unpaired exposes orphaned ends.
+//     * Residency (peak + distinct) uses GLOBAL atomics at go-live/retire, DSWS2_PASSTIME-gated
+//       (NOT TRACE). A zero peak under PASSTIME=1 is a real measurement of "nothing entered".
+//
+//   T2 sites: EVERY ASSIGN_HEAD reservation CAS under !CFASSIGN (BATCH>1, ROLEFLOW grow-first,
+//   and the plain r->r+1 arm). CFASSIGN has no reservation CAS (wid-mapped cohort).
+//
+//   FREE-READ REUSE OF deadman_check's RTC: SKIPPED (see prior handoff eb832f63).
+//
+// pt_add_sat: \acc += \delta with unsigned saturate; on overflow set bit \ovfbit in s65.
+//   s_add_u32 sets SCC = carry-out (1 if wrap). SCC0 = no carry = ok.
+.macro pt_add_sat acc, delta, ovfbit
+    s_add_u32 \acc, \acc, \delta
+    s_cbranch_scc0 .Lpt_sat_ok\@
+    s_or_b32 s65, s65, \ovfbit                // sticky overflow flag
+    s_mov_b32 \acc, 0xffffffff                // saturate so we never wrap to a small "plausible" total
+.Lpt_sat_ok\@:
+.endm
+// pt_emit_u64: lane0-only 64-bit global add of a per-wave 32-bit total into occ lo/hi.
+//   Precondition: exec already masked to lane0 (passtime_flush). Uses s62/s63 scratch + v3/v5.
+//   Protocol: old = atomic_add_return(lo, val); if old+val wraps -> atomic_add(hi, 1).
+.macro pt_emit_u64 reg, lo_off, hi_off
+    s_cmp_eq_u32 s[\reg], 0
+    s_cbranch_scc1 .Lpt_e64_skip\@
+    v_mov_b32 v3, s[\reg]
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:\lo_off th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+    v_readfirstlane_b32 s62, v5                 // old lo
+    s_add_u32 s63, s62, s[\reg]                 // SCC = carry if old+val overflowed
+    s_cbranch_scc0 .Lpt_e64_nocarry\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:\hi_off scope:SCOPE_DEV
+.Lpt_e64_nocarry\@:
+.Lpt_e64_skip\@:
+.endm
+.macro passtime_zero
+.if DSWS2_PASSTIME
+    s_mov_b32 s72, 0
+    s_mov_b32 s73, 0
+    s_mov_b32 s74, 0
+    s_mov_b32 s77, 0
+    s_mov_b32 s91, 0
+    s_mov_b32 s64, 0
+    s_mov_b32 s78, 0
+    s_mov_b32 s79, 0
+    s_mov_b32 s80, 0                              // T1 start count
+    s_mov_b32 s81, 0                              // armed
+    s_mov_b32 s82, 0                              // unpaired ends
+    s_mov_b32 s83, 0                              // T1 max delta
+    s_mov_b32 s94, 0                              // gt1k count
+    s_mov_b32 s95, 0                              // gt1k sum
+    s_mov_b32 s96, 0                              // gt64k count
+    s_mov_b32 s98, 0                              // gt64k sum
+    s_mov_b32 s65, 0                              // overflow flags
+.endif
+.endm
+// Clear armed at EVERY loop head (unconditional). Orphaned starts (latched, never parked) are
+//   dropped here without counting as unpaired ends -- start_count vs end_count catches that.
+.macro passtime_disarm
+.if DSWS2_PASSTIME
+    s_mov_b32 s81, 0
+.endif
+.endm
+.macro passtime_t1_start                     // latch loop-head RTC. NO memory -- pure message-bus read.
+.if DSWS2_PASSTIME
+    s_cmp_eq_u32 s71, 0                       // *** ANTI-BRICK THROTTLE (CLAUDE.md rule 5). NOT optional.
+    s_cbranch_scc0 .Lpt_t1s_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s72, s62                        // keep only low 32b (delta math is modular u32)
+    s_mov_b32 s81, 1                          // ARMED: this pass has a live T1 start
+    s_add_u32 s80, s80, 1                     // T1 START count (visible even if never ended)
+.Lpt_t1s_skip\@:
+.endif
+.endm
+.macro passtime_t1_end                       // accumulate only if ARMED; else bump unpaired. SALU only.
+.if DSWS2_PASSTIME
+    s_cmp_eq_u32 s71, 0                       // same s71 gate as start
+    s_cbranch_scc0 .Lpt_t1e_skip\@
+    s_cmp_eq_u32 s81, 0                       // armed?
+    s_cbranch_scc1 .Lpt_t1e_unpaired\@        // !armed -> pairing defect; do NOT touch s74/s77/s83
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s62, s62, s72                   // modular u32 delta (s62 = this pass's T1 ticks)
+    pt_add_sat s74, s62, PT_OVF_T1            // T1 total ticks (sat+flag; armed-matched only)
+    s_add_u32 s77, s77, 1                     // T1 END count
+    s_cmp_gt_u32 s62, s83                     // running MAX of armed-matched deltas
+    s_cbranch_scc0 .Lpt_t1e_nomax\@
+    s_mov_b32 s83, s62
+.Lpt_t1e_nomax\@:
+    // ---- TAIL BUCKETS (reuse s62 delta; NO new RTC). Nested: gt64k is a subset of gt1k. ----
+    s_cmp_ge_u32 s62, PT_THR_1K               // delta >= 1024?
+    s_cbranch_scc0 .Lpt_t1e_notail\@
+    s_add_u32 s94, s94, 1                     // gt1k count
+    pt_add_sat s95, s62, PT_OVF_GT1K          // gt1k tick-sum
+    s_cmp_ge_u32 s62, PT_THR_64K              // delta >= 65536?
+    s_cbranch_scc0 .Lpt_t1e_notail\@
+    s_add_u32 s96, s96, 1                     // gt64k count
+    pt_add_sat s98, s62, PT_OVF_GT64K         // gt64k tick-sum
+.Lpt_t1e_notail\@:
+    s_mov_b32 s81, 0                          // consume armed
+    s_branch .Lpt_t1e_skip\@
+.Lpt_t1e_unpaired\@:
+    s_add_u32 s82, s82, 1                     // unpaired_end++ (NO RTC -- not a measurement of time)
+    // armed already 0; leave it
+.Lpt_t1e_skip\@:
+.endif
+.endm
+.macro passtime_t2_start                     // latch pre-CAS RTC. NO memory.
+.if DSWS2_PASSTIME
+    s_cmp_eq_u32 s71, 0
+    s_cbranch_scc0 .Lpt_t2s_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s73, s62
+.Lpt_t2s_skip\@:
+.endif
+.endm
+.macro passtime_t2_end                       // accumulate (now - s73) into s91; bump s64. SALU only.
+.if DSWS2_PASSTIME
+    s_cmp_eq_u32 s71, 0
+    s_cbranch_scc0 .Lpt_t2e_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s62, s62, s73
+    pt_add_sat s91, s62, PT_OVF_T2            // T2 total ticks
+    s_add_u32 s64, s64, 1                     // T2 sample count
+.Lpt_t2e_skip\@:
+.endif
+.endm
+// T0 NULL INTERVAL (calibration): start RTC then end RTC with NOTHING between. Whatever it
+//   reports IS the per-end-read overhead in the same units on the same run. Placed at the park
+//   site immediately after T1 end so it samples the same s71==0 passes as T1.
+//   Combined into one macro (t0_start; t0_end) so the "nothing between" invariant cannot drift.
+//   Temp latch is s73 (T2 start is dead by park; T2 end already consumed it).
+.macro passtime_t0_null
+.if DSWS2_PASSTIME
+    s_cmp_eq_u32 s71, 0                       // *** ANTI-BRICK THROTTLE -- same gate as T1 end.
+    s_cbranch_scc0 .Lpt_t0_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s73, s62                        // T0 start latch (temp; T2 no longer needs s73)
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s62, s62, s73                   // null delta ≈ one end-read RTT
+    pt_add_sat s78, s62, PT_OVF_T0            // T0 total ticks
+    s_add_u32 s79, s79, 1                     // T0 sample count
+.Lpt_t0_skip\@:
+.endif
+.endm
+.macro passtime_flush                        // ONCE per wave at .Lflow_retire (ACC dead, wave lean).
+.if DSWS2_PASSTIME                            //   Same shape as cnt_flush: lane0 mask + 64-bit tick emits.
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lpt_flush_skip\@
+    // Tick-sums: 64-bit global add (lo + hi with carry). Counts stay 32-bit cnt_emit.
+    pt_emit_u64 74, PT_T1_TICKS_LO_OFF, PT_T1_TICKS_HI_OFF
+    cnt_emit 77, PT_T1_COUNT_OFF              // s77 -> occ[136] END count
+    pt_emit_u64 91, PT_T2_TICKS_LO_OFF, PT_T2_TICKS_HI_OFF
+    cnt_emit 64, PT_T2_COUNT_OFF              // s64 -> occ[138]
+    pt_emit_u64 78, PT_T0_TICKS_LO_OFF, PT_T0_TICKS_HI_OFF
+    cnt_emit 79, PT_T0_COUNT_OFF              // s79 -> occ[140]
+    cnt_emit 82, PT_UNPAIRED_OFF              // s82 -> occ[141] unpaired ends (0 is a REAL exonerate)
+    cnt_emit 80, PT_T1_START_OFF              // s80 -> occ[143] START count
+    cnt_emit 94, PT_T1_GT1K_CNT_OFF           // s94 -> occ[146] tail >=1K count
+    pt_emit_u64 95, PT_T1_GT1K_SUM_LO_OFF, PT_T1_GT1K_SUM_HI_OFF
+    cnt_emit 96, PT_T1_GT64K_CNT_OFF          // s96 -> occ[148] tail >=64K count
+    pt_emit_u64 98, PT_T1_GT64K_SUM_LO_OFF, PT_T1_GT64K_SUM_HI_OFF
+    // T1 max: GLOBAL max across waves (not a sum -- cnt_emit would be wrong here).
+    s_cmp_eq_u32 s83, 0
+    s_cbranch_scc1 .Lpt_flush_nomax\@
+    v_mov_b32 v3, s83
+    global_atomic_max_u32 v4, v3, s[0:1] offset:PT_T1_MAX_OFF scope:SCOPE_DEV
+.Lpt_flush_nomax\@:
+    // Sticky overflow flags: OR into occ[155]. Any nonzero bit => host prints VOID, not a verdict.
+    s_cmp_eq_u32 s65, 0
+    s_cbranch_scc1 .Lpt_flush_noovf\@
+    v_mov_b32 v3, s65
+    global_atomic_or_b32 v4, v3, s[0:1] offset:PT_OVF_OFF scope:SCOPE_DEV
+.Lpt_flush_noovf\@:
+    s_wait_storecnt 0x0
+.Lpt_flush_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// ---- DSWS2_BURSTCNT: counts-only (Step 0). Pure SALU in the burst; emit once at retire. ----
+//   ACC-SAFE: bcnt_add is ONE s_add_u32 on a private SGPR. No memory, no VGPR, no exec, no vcc,
+//   no s_sendmsg. Same invariant as cnt_inc (the 2026-07-13 BADD/BWRITE fix).
+//   COST: scales with times executed (KSEG_STEPS per rowblk * ACC_N per item) but each site is
+//   one SALU (~cycle), not a global_atomic. Emit is 7 atomics total per wave at retire (1920 waves).
+.macro bcnt_add reg, imm
+.if DSWS2_BURSTCNT
+    s_add_u32 s[\reg], s[\reg], \imm
+.endif
+.endm
+.macro burstcnt_zero
+.if DSWS2_BURSTCNT
+    s_mov_b32 s[BCNT_BURST],  0
+    s_mov_b32 s[BCNT_BLOAD],  0
+    s_mov_b32 s[BCNT_ALOAD],  0
+    s_mov_b32 s[BCNT_WAITLD], 0
+    s_mov_b32 s[BCNT_WMMA],   0
+    s_mov_b32 s[BCNT_DSADD],  0
+    s_mov_b32 s[BCNT_WAITDS], 0
+.endif
+.endm
+.macro burstcnt_flush                        // ONCE per wave at .Lflow_retire (ACC dead, wave lean).
+.if DSWS2_BURSTCNT
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lbc_flush_skip\@
+    cnt_emit BCNT_BURST,  BCNT_BURST_OFF
+    cnt_emit BCNT_BLOAD,  BCNT_BLOAD_OFF
+    cnt_emit BCNT_ALOAD,  BCNT_ALOAD_OFF
+    cnt_emit BCNT_WAITLD, BCNT_WAITLD_OFF
+    cnt_emit BCNT_WMMA,   BCNT_WMMA_OFF
+    cnt_emit BCNT_DSADD,  BCNT_DSADD_OFF
+    cnt_emit BCNT_WAITDS, BCNT_WAITDS_OFF
+    s_wait_storecnt 0x0
+.Lbc_flush_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// ---- DSWS2_WTBUDGET: wave-time partition macros (ACC-dead sites only for RTC) ----
+//   Scratch: s[62:63] for RTC (same as PASSTIME/deadman). No s71. Own thr = WTB_THR_CTR.
+.macro wtb_add_sat acc, delta, ovfbit
+.if DSWS2_WTBUDGET
+    s_add_u32 s[\acc], s[\acc], \delta
+    s_cbranch_scc0 .Lwtb_sat_ok\@
+    s_or_b32 s[WTB_FLAGS], s[WTB_FLAGS], (\ovfbit << 8)
+    s_mov_b32 s[\acc], 0xffffffff
+.Lwtb_sat_ok\@:
+.endif
+.endm
+.macro wtb_rtc_lo dst
+.if DSWS2_WTBUDGET
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 \dst, s62
+.endif
+.endm
+.macro wtb_zero
+.if DSWS2_WTBUDGET
+    s_mov_b32 s[WTB_A], 0
+    s_mov_b32 s[WTB_C_SUM], 0
+    s_mov_b32 s[WTB_D], 0
+    s_mov_b32 s[WTB_E], 0
+    s_mov_b32 s[WTB_T], 0                          // epoch accumulator (+= at each retire this launch)
+    s_mov_b32 s[WTB_GOLIVE], 0
+    s_mov_b32 s[WTB_LATCH], 0
+    s_mov_b32 s[WTB_THR_CTR], 0
+    s_mov_b32 s[WTB_C_SAMP], 0
+    s_mov_b32 s[WTB_C_N], 0
+    s_mov_b32 s[WTB_FLAGS], 0
+.endif
+.endm
+// Entry stamp (before long init): for E_init. ACC-dead, lean.
+//   ASSIGN to LATCH (interval start) — correct; each launch re-inits via wtb_zero.
+.macro wtb_entry_stamp
+.if DSWS2_WTBUDGET
+    wtb_rtc_lo s[WTB_LATCH]
+    s_or_b32 s[WTB_FLAGS], s[WTB_FLAGS], WTB_F_HAVE_ENTRY
+.endif
+.endm
+// First .Lflow_loop head: close E_init (+=), open wave epoch (ASSIGN golive stamp).
+//   Also MEASURED residency: ++live, atomic_max peak, ++entries (above 0x100 memset).
+.macro wtb_golive
+.if DSWS2_WTBUDGET
+    s_and_b32 s63, s[WTB_FLAGS], WTB_F_HAVE_GOLIVE
+    s_cmp_lg_u32 s63, 0
+    s_cbranch_scc1 .Lwtb_gl_done\@                 // already golive this launch
+    wtb_rtc_lo s62                                 // now
+    s_and_b32 s63, s[WTB_FLAGS], WTB_F_HAVE_ENTRY
+    s_cmp_eq_u32 s63, 0
+    s_cbranch_scc1 .Lwtb_gl_noentry\@
+    s_sub_u32 s63, s62, s[WTB_LATCH]               // E_init = golive - entry
+    wtb_add_sat WTB_E, s63, WTB_OVF_E              // += (not assign)
+.Lwtb_gl_noentry\@:
+    s_mov_b32 s[WTB_GOLIVE], s62                   // ASSIGN stamp (re-stamped each launch; correct)
+    s_or_b32 s[WTB_FLAGS], s[WTB_FLAGS], WTB_F_HAVE_GOLIVE
+    // Measured residency (once per wave-instance / chunk relaunch)
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lwtb_gl_live_skip\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:WTB_LIVE_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+    v_add_nc_u32 v5, v5, 1
+    global_atomic_max_u32 v4, v5, s[0:1] offset:WTB_PEAK_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:WTB_ENTRIES_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lwtb_gl_live_skip\@:
+    s_mov_b32 exec_lo, s57
+.Lwtb_gl_done\@:
+.endif
+.endm
+// Burst A: ACC-dead entry (zeros next) / ACC-dead exit (after ds_add drain).
+.macro wtb_a_enter
+.if DSWS2_WTBUDGET
+    wtb_rtc_lo s[WTB_LATCH]
+    s_or_b32 s[WTB_FLAGS], s[WTB_FLAGS], WTB_F_IN_A
+.endif
+.endm
+.macro wtb_a_leave
+.if DSWS2_WTBUDGET
+    s_and_b32 s63, s[WTB_FLAGS], WTB_F_IN_A
+    s_cmp_eq_u32 s63, 0
+    s_cbranch_scc1 .Lwtb_al_skip\@
+    wtb_rtc_lo s62
+    s_sub_u32 s62, s62, s[WTB_LATCH]
+    wtb_add_sat WTB_A, s62, WTB_OVF_A
+    s_and_b32 s[WTB_FLAGS], s[WTB_FLAGS], (~WTB_F_IN_A)
+.Lwtb_al_skip\@:
+.endif
+.endm
+// Boundary D: enter at label; leave on any exit (flag-guarded, idempotent).
+.macro wtb_d_enter
+.if DSWS2_WTBUDGET
+    wtb_rtc_lo s[WTB_LATCH]
+    s_or_b32 s[WTB_FLAGS], s[WTB_FLAGS], WTB_F_IN_D
+.endif
+.endm
+.macro wtb_d_leave
+.if DSWS2_WTBUDGET
+    s_and_b32 s63, s[WTB_FLAGS], WTB_F_IN_D
+    s_cmp_eq_u32 s63, 0
+    s_cbranch_scc1 .Lwtb_dl_skip\@
+    wtb_rtc_lo s62
+    s_sub_u32 s62, s62, s[WTB_LATCH]
+    wtb_add_sat WTB_D, s62, WTB_OVF_D
+    s_and_b32 s[WTB_FLAGS], s[WTB_FLAGS], (~WTB_F_IN_D)
+.Lwtb_dl_skip\@:
+.endif
+.endm
+// Feedmt SLEEPN: always count; RTC-sample 1-in-WTB_THR on OWN counter (not s71).
+//   Expands IN PLACE around the sleep: sampled path does RTC-sleep-RTC; unsampled just sleeps.
+.macro wtb_c_sleep
+.if DSWS2_WTBUDGET
+    s_add_u32 s[WTB_C_N], s[WTB_C_N], 1
+    s_add_u32 s[WTB_THR_CTR], s[WTB_THR_CTR], 1
+    s_cmp_lt_u32 s[WTB_THR_CTR], WTB_THR
+    s_cbranch_scc1 .Lwtb_c_nosamp\@
+    s_mov_b32 s[WTB_THR_CTR], 0
+    wtb_rtc_lo s[WTB_LATCH]
+    s_sleep SLEEPN
+    wtb_rtc_lo s62
+    s_sub_u32 s62, s62, s[WTB_LATCH]
+    wtb_add_sat WTB_C_SUM, s62, WTB_OVF_C
+    s_add_u32 s[WTB_C_SAMP], s[WTB_C_SAMP], 1
+    s_branch .Lwtb_c_done\@
+.Lwtb_c_nosamp\@:
+    s_sleep SLEEPN
+.Lwtb_c_done\@:
+.else
+    s_sleep SLEEPN
+.endif
+.endm
+// Retire: T += (now − golive).  MUST be += not assign — each launch is one epoch; multi-chunk
+//   accumulation is in occ[] via u64 atomics (pt_emit_u64). Within a launch, += is the durable
+//   pattern if a wave ever closes more than one epoch (defensive; today once).
+.macro wtb_retire_close
+.if DSWS2_WTBUDGET
+    wtb_rtc_lo s62
+    s_and_b32 s63, s[WTB_FLAGS], WTB_F_HAVE_GOLIVE
+    s_cmp_eq_u32 s63, 0
+    s_cbranch_scc1 .Lwtb_rc_done\@
+    s_sub_u32 s63, s62, s[WTB_GOLIVE]              // this epoch's length
+    wtb_add_sat WTB_T, s63, WTB_OVF_T              // += into T accumulator (NOT assign-overwrite)
+    // Clear golive so a double-close cannot double-count; next launch re-zeros via wtb_zero.
+    s_and_b32 s[WTB_FLAGS], s[WTB_FLAGS], (~WTB_F_HAVE_GOLIVE)
+.Lwtb_rc_done\@:
+.endif
+.endm
+.macro wtb_live_exit                             // MEASURED residency: live--
+.if DSWS2_WTBUDGET
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lwtb_lx_skip\@
+    v_mov_b32 v3, -1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:WTB_LIVE_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lwtb_lx_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+.macro wtb_flush                                 // ONCE at retire, ACC-dead lean. Lane0 atomics.
+.if DSWS2_WTBUDGET
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lwtb_fl_skip\@
+    // Tick totals: u64 atomic add (lo + carry into hi). Survives 33 chunks without wrap.
+    //   pt_emit_u64 clobbers s62/s63 (scratch); exec already lane0-masked.
+    pt_emit_u64 WTB_A,     WTB_A_LO_OFF,     WTB_A_HI_OFF
+    pt_emit_u64 WTB_C_SUM, WTB_C_SUM_LO_OFF, WTB_C_SUM_HI_OFF
+    pt_emit_u64 WTB_D,     WTB_D_LO_OFF,     WTB_D_HI_OFF
+    pt_emit_u64 WTB_E,     WTB_E_LO_OFF,     WTB_E_HI_OFF
+    pt_emit_u64 WTB_T,     WTB_T_LO_OFF,     WTB_T_HI_OFF
+    // Counts stay u32 (C_n ≈ 1.5e8 fits; C_samp ≈ 2.3e6 fits).
+    cnt_emit WTB_C_SAMP, WTB_C_SAMP_OFF
+    cnt_emit WTB_C_N,    WTB_C_N_OFF
+    s_and_b32 s62, s[WTB_FLAGS], 0xff00            // ovf bits 8..
+    s_lshr_b32 s62, s62, 8
+    s_cmp_eq_u32 s62, 0
+    s_cbranch_scc1 .Lwtb_fl_noovf\@
+    v_mov_b32 v3, s62
+    global_atomic_or_b32 v4, v3, s[0:1] offset:WTB_OVF_OFF scope:SCOPE_DEV
+.Lwtb_fl_noovf\@:
+    s_wait_storecnt 0x0
+.Lwtb_fl_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// ---- DSWS2_GAP: HEAD / GAP / TAIL. Unthrottled. Two stamps, one sub each. ----
+.macro gap_zero
+.if DSWS2_GAP
+    s_mov_b32 s[GAP_SUM], 0
+    s_mov_b32 s[GAP_N], 0
+    s_mov_b32 s[GAP_LATCH], 0
+    s_mov_b32 s[GAP_HAVE], 0
+    s_mov_b32 s[GAP_GOLIVE], 0
+    s_mov_b32 s[GAP_HEAD], 0
+    s_mov_b32 s[GAP_HEAD_N], 0
+    s_mov_b32 s[GAP_TAIL], 0
+    s_mov_b32 s[GAP_TAIL_N], 0
+    s_mov_b32 s[GAP_NOBURST], 0
+    s_mov_b32 s[GAP_DID_GL], 0
+.endif
+.endm
+// Go-live: first .Lflow_loop head (ACC-dead, lean). Stamp + live++/peak/entries.
+.macro gap_golive
+.if DSWS2_GAP
+    s_cmp_lg_u32 s[GAP_DID_GL], 0
+    s_cbranch_scc1 .Lgap_gl_done\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s[GAP_GOLIVE], s62
+    s_mov_b32 s[GAP_DID_GL], 1
+    // peak concurrent: ++live, atomic_max peak, ++entries (above 0x100 memset)
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgap_gl_live_skip\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:GAP_LIVE_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+    v_add_nc_u32 v5, v5, 1
+    global_atomic_max_u32 v4, v5, s[0:1] offset:GAP_PEAK_OFF scope:SCOPE_DEV
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:GAP_ENTRIES_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lgap_gl_live_skip\@:
+    s_mov_b32 exec_lo, s57
+.Lgap_gl_done\@:
+.endif
+.endm
+// CP1: finish burst (ACC-dead). Arm latch for next CP2 or TAIL.
+.macro gap_cp1_end
+.if DSWS2_GAP
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s[GAP_LATCH], s62
+    s_mov_b32 s[GAP_HAVE], 1
+.endif
+.endm
+// CP2: start burst (ACC-dead, before zeros).
+//   If HAVE: GAP += now − latch.
+//   If first burst (HEAD_N==0) and golive set: HEAD += now − golive.
+.macro gap_cp2_start
+.if DSWS2_GAP
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    // HEAD on first burst only
+    s_cmp_lg_u32 s[GAP_HEAD_N], 0
+    s_cbranch_scc1 .Lgap_s_nohead\@
+    s_cmp_eq_u32 s[GAP_DID_GL], 0
+    s_cbranch_scc1 .Lgap_s_nohead\@
+    s_sub_u32 s63, s62, s[GAP_GOLIVE]
+    s_add_u32 s[GAP_HEAD], s[GAP_HEAD], s63
+    s_add_u32 s[GAP_HEAD_N], s[GAP_HEAD_N], 1
+.Lgap_s_nohead\@:
+    // GAP if a prior CP1 is armed
+    s_cmp_eq_u32 s[GAP_HAVE], 0
+    s_cbranch_scc1 .Lgap_s_nogap\@
+    s_sub_u32 s63, s62, s[GAP_LATCH]
+    s_add_u32 s[GAP_SUM], s[GAP_SUM], s63
+    s_add_u32 s[GAP_N], s[GAP_N], 1
+    s_mov_b32 s[GAP_HAVE], 0
+.Lgap_s_nogap\@:
+.endif
+.endm
+// Retire: TAIL if we ever finished a burst; else whole life → HEAD + NOBURST.
+.macro gap_retire
+.if DSWS2_GAP
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_cmp_eq_u32 s[GAP_HEAD_N], 0
+    s_cbranch_scc0 .Lgap_r_didburst\@
+    // never ran a burst
+    s_cmp_eq_u32 s[GAP_DID_GL], 0
+    s_cbranch_scc1 .Lgap_r_done\@
+    s_sub_u32 s63, s62, s[GAP_GOLIVE]
+    s_add_u32 s[GAP_HEAD], s[GAP_HEAD], s63
+    s_add_u32 s[GAP_HEAD_N], s[GAP_HEAD_N], 1
+    s_add_u32 s[GAP_NOBURST], s[GAP_NOBURST], 1
+    s_branch .Lgap_r_done\@
+.Lgap_r_didburst\@:
+    // last CP1 still in LATCH if HAVE==1; if HAVE==0 last end was consumed as a gap start (shouldn't for last)
+    s_cmp_eq_u32 s[GAP_HAVE], 0
+    s_cbranch_scc1 .Lgap_r_done\@
+    s_sub_u32 s63, s62, s[GAP_LATCH]
+    s_add_u32 s[GAP_TAIL], s[GAP_TAIL], s63
+    s_add_u32 s[GAP_TAIL_N], s[GAP_TAIL_N], 1
+    s_mov_b32 s[GAP_HAVE], 0
+.Lgap_r_done\@:
+    // live-- only if we ++'d at golive. Expect live→0 at end of each chunk.
+    s_cmp_eq_u32 s[GAP_DID_GL], 0
+    s_cbranch_scc1 .Lgap_r_nolive\@
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgap_r_live_skip\@
+    v_mov_b32 v3, -1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:GAP_LIVE_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lgap_r_live_skip\@:
+    s_mov_b32 exec_lo, s57
+.Lgap_r_nolive\@:
+.endif
+.endm
+.macro gap_flush
+.if DSWS2_GAP
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lgap_fl_skip\@
+    pt_emit_u64 GAP_SUM,  GAP_SUM_LO_OFF,  GAP_SUM_HI_OFF
+    cnt_emit    GAP_N,    GAP_N_OFF
+    pt_emit_u64 GAP_HEAD, GAP_HEAD_LO_OFF, GAP_HEAD_HI_OFF
+    cnt_emit    GAP_HEAD_N, GAP_HEAD_N_OFF
+    pt_emit_u64 GAP_TAIL, GAP_TAIL_LO_OFF, GAP_TAIL_HI_OFF
+    cnt_emit    GAP_TAIL_N, GAP_TAIL_N_OFF
+    cnt_emit    GAP_NOBURST, GAP_NOBURST_OFF
+    s_wait_storecnt 0x0
+.Lgap_fl_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// ---- DSWS2_POLLSTAGE: two RTC stamps around ONE stage (option b). ACC-dead only. ----
+//   Unthrottled: 2 message-bus RTC reads per completed sample of the selected stage.
+//   No memory in the hot path (SGPR accumulate). Orphan enter (no leave) is dropped.
+//   leave only accumulates when ARMED==1. disarm at every .Lflow_loop head.
+.macro pollstage_zero
+.if DSWS2_POLLSTAGE
+    s_mov_b32 s[PS_START], 0
+    s_mov_b32 s[PS_SUM], 0
+    s_mov_b32 s[PS_N], 0
+    s_mov_b32 s[PS_ARMED], 0
+    s_mov_b32 s[PS_THR], 0                    // MUST be zeroed -- occ[87] once accumulated an
+.endif                                        //   uninitialised SGPR (see CNT_SS_SHRUNK note).
+.endm
+.macro pollstage_disarm
+.if DSWS2_POLLSTAGE
+    s_mov_b32 s[PS_ARMED], 0
+.endif
+.endm
+.macro pollstage_enter STAGE
+.if DSWS2_POLLSTAGE == \STAGE
+    // Unsampled passes cost THREE SALU and touch NO message bus. Same shape as deadman_check's
+    //   throttle, on a private counter. Not arming here is what makes `leave` skip.
+    s_add_u32 s[PS_THR], s[PS_THR], 1
+    s_cmp_ge_u32 s[PS_THR], DSWS2_POLLSTAGE_EVERY
+    s_cbranch_scc0 .Lps_en_skip\@
+    s_mov_b32 s[PS_THR], 0
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_mov_b32 s[PS_START], s62
+    s_mov_b32 s[PS_ARMED], 1
+.Lps_en_skip\@:
+.endif
+.endm
+.macro pollstage_leave STAGE
+.if DSWS2_POLLSTAGE == \STAGE
+    s_cmp_eq_u32 s[PS_ARMED], 0
+    s_cbranch_scc1 .Lps_lv_skip\@
+    s_sendmsg_rtn_b64 s[62:63], sendmsg(MSG_RTN_GET_REALTIME)
+    s_wait_kmcnt 0x0
+    s_sub_u32 s63, s62, s[PS_START]           // delta = now - start (u32 modular)
+    s_add_u32 s[PS_SUM], s[PS_SUM], s63       // per-wave sum (DEADMAN-bounded; global is u64)
+    s_add_u32 s[PS_N], s[PS_N], 1
+    s_mov_b32 s[PS_ARMED], 0
+.Lps_lv_skip\@:
+.endif
+.endm
+.macro pollstage_flush
+.if DSWS2_POLLSTAGE
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lps_fl_skip\@
+    pt_emit_u64 PS_SUM, PS_SUM_LO_OFF, PS_SUM_HI_OFF
+    cnt_emit    PS_N,   PS_N_OFF
+    // stage id echo: one atomic_or of the compile-time stage (idempotent across waves)
+    v_mov_b32 v3, DSWS2_POLLSTAGE
+    global_atomic_or_b32 v4, v3, s[0:1] offset:PS_STAGE_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lps_fl_skip\@:
+    s_mov_b32 exec_lo, s57
+.endif
+.endm
+// Peak concurrent + distinct-wave residency. DSWS2_PASSTIME-gated, NOT TRACE-gated.
+//   Peak uses the same slots TRACE used (occ[1] peak, ALLLIVE live) so a PASSTIME=1 TRACE=0 build
+//   finally populates the number the period formula needs. Distinct is a one-shot atomic_add per
+//   wave at go-live (waves that ever entered). Cost: a few atomics once per wave, not per loop.
+.macro passtime_live_enter
+.if DSWS2_PASSTIME
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_mov_b32 s49, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lpt_live_ent_skip\@
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v5, v4, v3, s[0:1] offset:PT_LIVE_OFF th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+    s_wait_loadcnt 0x0
+    v_add_nc_u32 v5, v5, 1                    // new live = old + 1
+    global_atomic_max_u32 v4, v5, s[0:1] offset:PT_PEAK_OFF scope:SCOPE_DEV   // occ[145] = peak (above 0x100 memset)
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:PT_ENTRIES_OFF scope:SCOPE_DEV  // occ[144]++ wave-entries
+    s_wait_storecnt 0x0
+.Lpt_live_ent_skip\@:
+    s_mov_b32 exec_lo, s49
+.endif
+.endm
+.macro passtime_live_exit
+.if DSWS2_PASSTIME
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_mov_b32 s49, exec_lo
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lpt_live_ex_skip\@
+    v_mov_b32 v3, -1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:PT_LIVE_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lpt_live_ex_skip\@:
+    s_mov_b32 exec_lo, s49
 .endif
 .endm
 .macro phist_bump site                      // WEDGE-SURVIVABLE bail-door histogram. See the PHIST banner (:2102).
@@ -2923,6 +4505,11 @@ occ_kernel:
     v_and_b32     v6, 15, v0                 // lane & 15 (A vaddr)
     v_mov_b32     v4, 0
     cnt_zero                                 // STAGINSTR: zero this wave's private SGPR counters (s84..s89)
+    passtime_zero                            // PASSTIME: zero T0/T1/T2 + settling SGPRs (s64/s72-s83/s91)
+    burstcnt_zero                            // BURSTCNT: zero Step-0 burst frequency SGPRs (s72-s74/s77-s80)
+    wtb_zero                                 // WTBUDGET: zero wave-time partition SGPRs
+    gap_zero                                 // GAP: zero inter-burst gap sum/count/latch
+    pollstage_zero                           // POLLSTAGE: zero stage sum/count/armed
     phase_reset                              // PHASEPROBE: zero s78..s83, stamp s77 = now
 .if KMAJOR
     global_load_b32 v3, v4, s[0:1] offset:248 scope:SCOPE_DEV   // occ[62] = magic(TOTAL), host-written
@@ -2950,8 +4537,10 @@ occ_kernel:
 .else
     tfspan min, 8                             // TFPROBE: every wave stamps occ[2] = min entry tick (wall-span start)
 .endif
+    wtb_entry_stamp                            // WTBUDGET E: latch entry RTC (before LDS init / wait_init)
 .if TRACE
     // total-occupancy: every wave ++live at entry, atomic-max the peak concurrent resident count (occ[1]).
+    //   TRACE path only. PASSTIME has its own (passtime_live_enter) so peak is not TRACE-gated to 0.
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_mov_b32 s49, exec_lo
     s_and_b32 exec_lo, exec_lo, vcc_lo
@@ -2964,6 +4553,7 @@ occ_kernel:
 .Lall_enter_skip:
     s_mov_b32 exec_lo, s49
 .endif
+    passtime_live_enter                          // PASSTIME: peak (occ[1]) + distinct (occ[144]); NOT TRACE-gated
 
 .if DSWS2
 // ============================================================================================
@@ -2973,6 +4563,12 @@ occ_kernel:
 //    publish poll anywhere. wid0 = coordinator (single writer): assigns super-tiles to free slots,
 //    seeds/nudges mailboxes, and also does lean B-feed work. See FLOW_ECONOMY_DESIGN.md.
 //  Persistent regs:  s24=wid  s34=cur_role  s50=coord period ctr  s69=chunkHi
+//  DSWS2_ROLEFLOW adds exactly ONE persistent register: s75 = feed->compute reversion hysteresis counter
+//  (audited free: TRACE's own s75 "wg_id" read at trace_row is the ONLY other occurrence of s75 in this
+//  file, and a .error guard now forbids DSWS2_ROLEFLOW && TRACE outright). Everything else the CF0 rebuild
+//  touches is either dead scratch at its site (s44/s45/s46/s47 in the reversion probe and the reserve CAS;
+//  s16-s20/s25-s29 in the prefetch) or read-only kernel-wide state (s10-s14 kernargs, s24 wid, s34
+//  cur_role, s66 n_kseg-1, s67 mask, s71 deadman throttle, s11 TOTAL).
 //  3-frontier pipeline (LDS):  DRAIN_HEAD <= STAGE_HEAD <= ASSIGN_HEAD <= DRAIN_HEAD+POOL_N
 // ============================================================================================
     v_readfirstlane_b32 s24, v1                // wid (uniform)
@@ -2993,6 +4589,25 @@ occ_kernel:
     s_mov_b32 exec_lo, s16
     s_mov_b32 s34, 0xFFFFFFFF                   // cur_role = none -> first .Lflow_body forces a resize
     s_mov_b32 s50, 0                            // coordinator period counter
+.if DSWS2_ROLEFLOW
+    s_mov_b32 s75, 0                            // feed->compute reversion hysteresis counter (see .Lflow_dispatch)
+.endif
+.if DSWS2_PREFETCH
+    // P2 engine private state (only PF_WID reads/writes these; other waves leave them alone).
+    //   s75 = next linear block index within the latched t_next
+    //   s76 = latched t_next (0xFFFFFFFF = none). KMAJOR=0 so s76 is free (guard above).
+    //   Optional P3 counters s92/s93/s103 only when DSWS2_PF_COUNTERS=1.
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc0 .Lflow_pf_init_skip
+    s_mov_b32 s75, 0
+    s_mov_b32 s76, 0xFFFFFFFF
+.if DSWS2_PF_COUNTERS
+    s_mov_b32 s[PF_TILES], 0
+    s_mov_b32 s[PF_BLOCKS], 0
+    s_mov_b32 s[PF_IDLE], 0
+.endif
+.Lflow_pf_init_skip:
+.endif
     deadman_stamp                               // s[70:71] = start RTC (watchdog baseline)
     duty_init
 .if BATCH > 1
@@ -3076,6 +4691,10 @@ occ_kernel:
     lds_put DA_ZDONE_OFF, 0                      // nothing zeroed yet -> ASSIGN(0)==DA_ZDONE(0) -> boundary
     lds_put DA_TILE_OFF, 0                       //   t is don't-care until the first tile is claimed
     lds_put GSTORED_OFF, 0                       // C1: no group C-store has completed yet
+.if DSWS2_PREFETCH
+    lds_put TNXT_STATE_OFF, TNXT_EMPTY           // P1: no next-tile identity yet (first tile = boundary EMPTY fallback)
+    lds_put TNXT_TILE_OFF, 0
+.endif
 .else
     lds_put COORD_KSI_OFF, 0xFFFFFFFF          // tile-claim sentinel: first ASSIGN claims a fresh tile
 .endif
@@ -3112,7 +4731,27 @@ occ_kernel:
 
 // ======================= the unified flow loop =======================
 .Lflow_loop:
+    wtb_golive                                  // WTBUDGET: first visit closes E_init, opens epoch T (ACC-dead)
+    gap_golive                                  // GAP: stamp go-live once (HEAD baseline)
+    pollstage_disarm                            // POLLSTAGE: drop orphaned enter from a non-park exit
+    pollstage_enter 1                           // POLLSTAGE 1: loop head + deadman
     deadman_check                               // watchdog at every loop head: a stalled frontier -> clean drain
+    pollstage_leave 1
+    pollstage_enter 2                           // POLLSTAGE 2: snapshot / FLOWTERM / body-gate
+    passtime_disarm                             // PASSTIME: clear armed EVERY head (orphaned starts drop; start vs end count shows them)
+.if DSWS2_PREFETCH
+    // P3 orphan fix: the PF engine is NOT a poll pass — it re-enters .Lflow_loop without parking, so
+    //   arming T1 here produced ~684k orphaned starts (10.9%). Skip T1 arm entirely for PF_WID.
+    //   Expected: start-end orphans fall back to the pre-P2 baseline (~2.3k / 0.09%). Confirmation of
+    //   the magnitude hypothesis (PF was ~3.5x more loop visits than average) is left to PF_IDLE vs
+    //   parks arithmetic, not to polluting the poll-pass sample.
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc1 .Lflow_loop_skip_t1
+.endif
+    passtime_t1_start                           // PASSTIME T1: latch pass-start RTC (AFTER deadman_check so s71 is current)
+.if DSWS2_PREFETCH
+.Lflow_loop_skip_t1:
+.endif
     phist_bump PH_LOOPHEAD                      // PHIST denominator. MUST follow deadman_check: the s71==0 throttle
                                                 //   means "the iteration right after a tick fired" (flow_snapshot idiom).
 .if DECENTASN
@@ -3127,7 +4766,12 @@ occ_kernel:
     s_cmp_eq_u32 s24, 0
     s_cbranch_scc0 .Lflow_body                 // non-coordinator -> straight to role work
 .endif
+.if !SELFSERVE
     // ---- coordinator duty (wid0): ASSIGN + (later) sense/nudge ----
+    //   Classic SELFSERVE=0 path. Under DECENTASN=1 this body is unreachable fallthrough (both arms above
+    //   branch to .Lflow_body) but is still assembled so DECENTASN+!SELFSERVE stays byte-identical to pre-
+    //   reclaim baselines. Under SELFSERVE=1 it is NOT assembled: previously it still emitted
+    //   `s_cmp_ge_u32 s46, POOL_N`, so POOL_N=1/2/3 were LDS-identical yet not .text-identical.
     flow_snapshot                              // pipeline freeze-frame -> occ[74..80] (STAGINSTR; hang forensics)
     lds_get s44, FLOWTERM_OFF
     s_cmp_eq_u32 s44, 0xDEAD
@@ -3284,9 +4928,12 @@ occ_kernel:
       .set w, w+1
     .endr
     s_branch .Lflow_retire
+.endif                                          // !SELFSERVE coordinator body (POOL_N-bearing; omitted under SELFSERVE)
 
 // ---- role adopt + dispatch (every wave) ----
 .Lflow_body:
+    pollstage_leave 2                           // POLLSTAGE 2 end (snapshot/body-gate done)
+    pollstage_enter 3                           // POLLSTAGE 3: role select + dispatch
     s_lshl_b32 s45, s24, 2
     s_add_u32 s45, s45, ROLE_BASE
     lds_get_r s35, s45                            // role = ROLE[wid]  (stale == last role == coast, free)
@@ -3306,19 +4953,143 @@ occ_kernel:
 .endif
     s_mov_b32 s34, s35                            // cur_role = role
 .Lflow_dispatch:
+.if DSWS2_PREFETCH
+    // P2: dedicated prefetch engine never participates in ROLEFLOW reversion or compute dispatch.
+    //   Branch before any feed->compute probe so s75 stays free as the engine's block cursor.
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc1 .Lflow_prefetch_engine
+.endif
+.if DSWS2_ROLEFLOW
+    s_cmp_eq_u32 s34, ROLE_COMPUTE
+    s_cbranch_scc1 .Lflow_compute
+    // ---- CF0 bidirectional reversion (feed -> compute). REBUILT 2026-07-24; see REVIEW findings 2, 3, 5.
+    //
+    // TRIGGER (finding 2). The old signal was DRAIN_HEAD < STAGE_HEAD. Under DSWS2_OVERLAP nothing is ever
+    //   ring-claimable (RB_PENDING is never cleared -- side_final is unreachable), so that comparison was
+    //   NOT "claimable work exists": it was the transient between a publisher's lds_cmpstore_adv STAGE_HEAD
+    //   and its own drain_advance. The trigger now asks the question the task actually needs -- "is there
+    //   work a COMPUTE-role wave could take right now?" -- by evaluating EXACTLY the gate the shared-cursor
+    //   reserve path (.Lflow_da_peek / .Lflow_da_realidx, CFASSIGN=0 arm) uses to decide it can reserve:
+    //      (a) no boundary in progress            : (DA_ZDONE & ZLOCK) == 0
+    //      (b) the cursor has not reached the end  : ASSIGN_HEAD < z
+    //      (c) the next index is a REAL ksi        : (ASSIGN_HEAD & mask) <= n_kseg-1
+    //                                                (DA_BASE is 2^shift-aligned, so no DA_BASE read is
+    //                                                 needed -- same register-only ALU the peek uses)
+    //      (d) the reservation window has room     : ASSIGN_HEAD - DRAIN_HEAD < SSWIN
+    //   All four true == a reservable index EXISTS == a compute wave would have something to do. That is a
+    //   live property of the frontier, not a publish artifact. (Terminal is covered for free: TERMFIX keeps
+    //   ZLOCK HELD forever once FLOWTERM is published, so (a) fails and no wave reverts after terminal.)
+    //
+    // HOT PATH (finding 5). This probe reads LDS, and .Lflow_dispatch runs every pass for every wave; ONE
+    //   extra LDS read on this path measured 16x (97.3 -> 5.9 TF, :4568-4572). So the WHOLE probe is
+    //   throttled 1-in-DEADMAN_EVERY on s71 == 0 -- deadman_check's own throttle counter, already
+    //   maintained at .Lflow_loop, the same idiom flow_snapshot/PHIST use. Cost on the 63/64 passes that
+    //   skip: one s_cmp + one s_cbranch, zero LDS traffic. Hysteresis therefore counts TICKS, not passes
+    //   (see DSWS2_ROLEFLOW_BACK_N).
+    //
+    // MAILBOX (finding 3). ROLE[wid] has TWO writers: this wave, and the terminal ROLE_RETIRE broadcast
+    //   (.Lflow_drainwait / .Lflow_da_alldrained, which write EVERY wave's slot). A blind lds_put_r here
+    //   can clobber a ROLE_RETIRE that landed in the window; the wave then never sees it, QUIESCE_CNT
+    //   never reaches WAVES, and the collective exit degrades to the RETBAR_MAX/deadman backstop -- the
+    //   ~18s resident-spin compositor-starve condition. The write is now a CAS FROM s34 (this wave's
+    //   cur_role, i.e. exactly what .Lflow_body read one branch ago). Only ROLE_RETIRE can have replaced
+    //   it, and a CAS from s34 cannot overwrite ROLE_RETIRE: it simply no-ops and the retire survives to
+    //   the next .Lflow_body read.
+    //
+    // s75 is a dedicated hysteresis counter (NOT s50 -- s50 already carries RCONV's own meaning; reusing
+    // it would conflate the two directions). Own-mailbox write only; no designated wave, no cross-wave
+    // signal, no shared-state write of any kind.
+    s_cmp_lg_u32 s71, 0
+    s_cbranch_scc1 .Lflow_feed                  // 1-in-DEADMAN_EVERY throttle: not a tick -> no LDS read at
+                                                 //   all, and the hysteresis counter is left UNTOUCHED (it
+                                                 //   counts ticks, so a skipped pass is neither + nor reset)
+    lds_get s44, DA_ZDONE_OFF                   // z (bit 0 = ZLOCK: a wave is handling a group/tile boundary)
+    s_and_b32 s45, s44, ZLOCK
+    s_cmp_lg_u32 s45, 0
+    s_cbranch_scc1 .Lflow_rf_noback             // (a) boundary in progress -> nothing reservable
+    lds_get s45, ASSIGN_HEAD_OFF                 // r = THE shared cursor = next index to be RESERVED
+    s_cmp_ge_u32 s45, s44
+    s_cbranch_scc1 .Lflow_rf_noback             // (b) cursor at the field end -> nothing reservable
+    s_and_b32 s46, s45, s67                      // (c) ksi = r & mask (DA_BASE 2^shift-aligned -> exact)
+    s_cmp_gt_u32 s46, s66
+    s_cbranch_scc1 .Lflow_rf_noback             //     phantom tail -> no REAL work left in this field
+    lds_get s46, DRAIN_HEAD_OFF
+    s_sub_u32 s46, s45, s46                      // (d) r - DRAIN
+.if SELFSERVE
+    s_cmp_ge_u32 s46, SSWIN
+.else
+    s_cmp_ge_u32 s46, POOL_N
+.endif
+    s_cbranch_scc1 .Lflow_rf_noback             //     reservation window full -> nothing reservable
+    s_add_u32 s75, s75, 1                       // a reservable index EXISTS on this tick
+    s_cmp_eq_u32 s75, DSWS2_ROLEFLOW_BACK_N
+    s_cbranch_scc0 .Lflow_feed                  // not enough consecutive ticks yet -> stay feed this pass
+    s_lshl_b32 s45, s24, 2
+    s_add_u32 s45, s45, ROLE_BASE
+    lds_cas_rtn s46, s45, s34, ROLE_COMPUTE     // CAS(ROLE[wid]: s34 -> ROLE_COMPUTE). No-ops (preserving a
+                                                 //   ROLE_RETIRE that landed in the window) if ROLE[wid] is
+                                                 //   no longer my cur_role. Own mailbox only; takes effect
+                                                 //   on the NEXT .Lflow_body visit.
+    s_mov_b32 s75, 0                            // hysteresis consumed
+    s_mov_b32 s50, 0                            // *** re-arm RCONV's OWN coast counter. s50 is FROZEN while
+                                                 //   this wave is not dispatching as ROLE_COMPUTE (.Lflow_coast,
+                                                 //   where s50 increments, is reached only from .Lflow_compute's
+                                                 //   coast fallthrough). Left at a stale value, the exact-equality
+                                                 //   compare (s_cmp_eq_u32 s50, DSWS2_RCONV_COAST_N) could sit
+                                                 //   just past N and never equal N again short of a 2^32 wrap --
+                                                 //   silently disabling THIS wave's future compute->feed
+                                                 //   conversion (an inverted one-way ratchet). Reset keeps the
+                                                 //   economy bidirectional on every trip, not just the first. ***
+    s_branch .Lflow_feed                        // this pass still runs feed's body; the role change lands
+                                                 //   the next time this wave reaches .Lflow_body.
+.Lflow_rf_noback:
+    s_mov_b32 s75, 0
+    s_branch .Lflow_feed
+.else
     s_cmp_eq_u32 s34, ROLE_COMPUTE
     s_cbranch_scc1 .Lflow_compute
     s_branch .Lflow_feed
+.endif
 
 // ---- COMPUTE work (wave is fat): pull one rowblk from the DRAIN_HEAD slot, WMMA, flush ----
 .Lflow_compute:
+.if DSWS2_ROLEFLOW
+    // ---- CF0 (2026-07-24), REVIEW finding 1: THE RING-COMPUTE CLAIM IS PROVABLY UNREACHABLE HERE, so do
+    //   not pay for it. Under DSWS2_ROLEFLOW (which requires DSWS2_OVERLAP=1) the claim gate below can
+    //   never pass, for a reason that is exhaustive over the WRITERS of SL_RBNEXT, not a probabilistic
+    //   argument. In this configuration the complete set of writers is:
+    //     1. cold-start init                                  -> RB_PENDING   (rejected: pending bit set)
+    //     2. .Lflow_da_sentinel / .Lflow_da_ss_decode /
+    //        .Lflow_da_termslot pre-completed sentinels        -> ACC_N        (rejected: next >= ACC_N)
+    //     3. side_final (the ONLY writer that produces a claimable value) -- reached solely from
+    //        ASTAGE_R/BSTAGE_R, whose only call sites are in .Lflow_feed and .Lflow_coast, BOTH of which
+    //        DSWS2_OVERLAP branches away from before reaching them  -> never executes
+    //     4. the grow-fail STAMP block's RB_PENDING            -> COMPILED OUT under DSWS2_ROLEFLOW
+    //        (grow-first/reserve-after means a grow-failed wave holds nothing to publish)
+    //   So SL_RBNEXT is only ever RB_PENDING or ACC_N, and both are rejected. What the old code did with
+    //   that fact was: read two LDS words, observe the DRAIN<STAGE transient a self-serve publisher opens
+    //   between its lds_cmpstore_adv STAGE_HEAD and its own drain_advance, GROW to NFV, fail the claim,
+    //   and SHRINK -- a full grow/shrink pair, plus a whole loop iteration in which the wave never even
+    //   attempted a reservation (.Lflow_cmp_tryadv goes to .Lflow_loop, not to .Lflow_feed_empty). That is
+    //   R1's "OVERLAP MANUFACTURES the grow-fail events ROLEFLOW exists to survive". Coasting directly
+    //   costs nothing, drops two hot-path LDS reads, and lands the wave in .Lflow_feed_empty where it can
+    //   actually reserve work. Unreachability becomes STRUCTURAL (an unconditional branch) instead of
+    //   dynamic-and-always-false. Reported explicitly rather than silently left as never-executed code:
+    //   see CODEX_DSWS2_CF0_PROGRESS.md item 6.
+    cnt_inc CNT_CNOSTG                           // coast door 1 (kept: the counter's meaning is unchanged)
+    s_branch .Lflow_coast
+.else
     lds_get s46, DRAIN_HEAD_OFF                 // dh
     lds_get s44, STAGE_HEAD_OFF                 // sh
     s_cmp_ge_u32 s46, s44                        // DRAIN >= STAGE -> nothing fully staged -> coast to feed
     s_cbranch_scc0 .Lflow_havestage
     cnt_inc CNT_CNOSTG                           // coast door 1
     s_branch .Lflow_coast
+.endif
 .Lflow_havestage:
+.if DSWS2_RCONV
+    s_mov_b32 s50, 0
+.endif
     phase_stamp s78                              // PH_FOLLOW: all time since last stamp was WAITING for a stage
 .if MSSCAN
     // *** spread the waves across the STAGED WINDOW [dh, sh) instead of all piling on the head slot.
@@ -3333,20 +5104,15 @@ occ_kernel:
 .Lflow_mswd:
     s_add_u32 s46, s46, s21                      // my slot = dh + (wid mod window)   -> still < sh
 .endif
-    slot_of s45, s46, s47                        // slot = (my cursor) mod POOL_N
+    slot_of s45, s46, s47                        // slot = (my cursor) mod SLOT_N
     s_lshl_b32 s48, s45, 5
     s_add_u32 s48, s48, SLOTC_BASE              // scb
-.if SELFSERVE && (SSWIN > POOL_N)
-    pool_of s52, s46, s47
-    s_mul_i32 s52, s52, OPSTRIDE
-.else
-    s_mul_i32 s52, s45, OPSTRIDE                 // slot * OPSTRIDE. WAS `s_lshl_b32 s52, s45, 14` = slot*16384, which is the
-                                                  //   SEGK=64 stride HARDCODED. At SEGK=32 OPSTRIDE is 8192, so slot 1
-                                                  //   read its operands from the WRONG address -> POOL_N>1 had NEVER
-                                                  //   worked at SEGK=32, and SEGK=32 is the only size that fits LDS.
-                                                  //   THIS is why POOL_N got nailed to 1. (found 2026-07-13)
-.endif
+.if !(SELFSERVE || DSWS2_OVERLAP)
+    // Classic ring: sob = OP_BASE + slot*OPSTRIDE for LDS operand reads.
+    s_mul_i32 s52, s45, OPSTRIDE
     s_add_u32 s52, s52, OP_BASE                // sob
+.endif
+    // SELFSERVE/OVERLAP: no operand pool; self-load block sets s52 as B base.
 .if JDEPTH > 1
     // LEAD-SEGMENT GATE (before the grow, on purpose): with J>1 only ksi%J==0 admits a claim; the
     //   other J-1 segments are owned by carriers still holding ACC. Without this check a fresh wave
@@ -3402,16 +5168,13 @@ occ_kernel:
     lds_get s44, STAGE_HEAD_OFF                   // fresh sh
     s_cmp_ge_u32 s46, s44                          // caught up during the grow? (DRAIN >= STAGE = nothing staged)
     s_cbranch_scc1 .Lflow_cmp_tryadv              // -> fat_dec + shrink-to-lean + fat_release + loop (NO claim made)
-    slot_of s45, s46, s47                          // slot = dh mod POOL_N   (fresh)
+    slot_of s45, s46, s47                          // slot = dh mod SLOT_N   (fresh)
     s_lshl_b32 s48, s45, 5
     s_add_u32 s48, s48, SLOTC_BASE                // scb (fresh)
-.if SELFSERVE && (SSWIN > POOL_N)
-    pool_of s52, s46, s47
-    s_mul_i32 s52, s52, OPSTRIDE
-.else
+.if !(SELFSERVE || DSWS2_OVERLAP)
     s_mul_i32 s52, s45, OPSTRIDE
-.endif
     s_add_u32 s52, s52, OP_BASE                   // sob (fresh)
+.endif
 .endif
 .if DECENTASN && JDEPTH > 1
     // POST-GROW LEAD RE-CHECK: the pre-grow lead-gate (.Lflow_leadok) tested the OLD pre-grow slot; the grow's
@@ -3506,17 +5269,72 @@ occ_kernel:
     lds_get_r s46, s45                           // s46 = cursor = SL_GEN[claimed slot] (logical reservation index)
 .endif
 .Lflow_jloop:
-    slot_of s45, s46, s47                        // slot = cursor mod POOL_N  (re-derived each segment)
+    slot_of s45, s46, s47                        // slot = cursor mod SLOT_N  (re-derived each segment)
     s_lshl_b32 s48, s45, 5
     s_add_u32 s48, s48, SLOTC_BASE               // scb for THIS segment's slot
-.if SELFSERVE && (SSWIN > POOL_N)
-    pool_of s52, s46, s47
-    s_mul_i32 s52, s52, OPSTRIDE
-.else
+.if !(SELFSERVE || DSWS2_OVERLAP)
     s_mul_i32 s52, s45, OPSTRIDE
-.endif
     s_add_u32 s52, s52, OP_BASE                  // sob for THIS segment's slot
 .endif
+.endif
+.if SELFSERVE || DSWS2_OVERLAP
+    // ---- RING-COMPUTE SELF-LOAD (SELFSERVE pool reclaim / OVERLAP Phase 1). Claimed rowblk s33 of a
+    //   control-only ring item -- no staged operand data in LDS. Self-load A+B from L2 like .Lflow_da_ss_rowblk.
+    s_mul_i32  s20, s30, s14                        // tcol * FN*256
+    s_mul_i32  s21, s31, KSEG_STEPS                 // ksi * KSEG_STEPS
+    s_mul_hi_u32 s25, s21, s10                       // high half of the 64-bit B segment offset
+    s_mul_i32  s21, s21, s10
+    s_add_u32  s20, s20, s21
+    s_addc_u32 s25, s25, 0
+    s_add_u32  s52, s4, s20
+    s_addc_u32 s53, s5, s25                         // s[52:53] = B base for this tile/ksi
+.if GROUPS > 1
+    s_mul_i32 s42, s41, ACC_N                       // absolute rowblk = group*ACC_N + local r
+    s_add_u32 s42, s42, s33
+.else
+    s_mov_b32 s42, s33                              // GROUPS==1: local r IS the absolute rowblk
+.endif
+    s_mul_i32  s36, s19, G
+    s_add_u32  s36, s36, s42
+    s_mul_i32  s22, s36, (16*FM)
+    s_mul_i32  s22, s22, s9
+    s_mul_i32  s25, s31, SEGK
+    s_add_u32  s22, s22, s25
+    s_add_u32  s56, s2, s22
+    s_addc_u32 s57, s3, 0                           // s[56:57] = A base for this row block/ksi
+    s_lshl_b32 s32, s9, 4                           // 16*K A-fragment stride
+    .set ks, 0
+    .rept KSEG_STEPS
+      .set ni, 0
+      .rept FN
+        s_add_u32  s54, s52, (ni*256)
+        s_addc_u32 s55, s53, 0
+        global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[54:55]
+        .set ni, ni+1
+      .endr
+      .set mi, 0
+      .rept FM
+        s_mul_i32  s58, s32, mi
+        s_add_u32  s58, s56, s58
+        s_addc_u32 s59, s57, 0
+        global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
+        .set mi, mi+1
+      .endr
+      s_wait_loadcnt 0x0
+      .set mi, 0
+      .rept FM
+        .set ni, 0
+        .rept FN
+          v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA+mi*2:FA+mi*2+1], v[FB+ni*2:FB+ni*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+          .set ni, ni+1
+        .endr
+        .set mi, mi+1
+      .endr
+      s_add_u32  s52, s52, s10
+      s_addc_u32 s53, s53, 0
+      .set ks, ks+1
+    .endr
+.else
     v_add_nc_u32 v12, v9, s52                    // B resident base (BRES_ROFF=0)
 .if GROUPS > 1
     s_mul_i32 s42, s41, ACC_N                      // actual rowblk = group*ACC_N + local ...
@@ -3552,6 +5370,7 @@ occ_kernel:
       .endr
       .set ks, ks+1
     .endr
+.endif
     phase_stamp s81                              // PH_WMMA: ACC zero + frag loads + v_wmma burst just ended.
                                                   //   HOISTED out of the .else (2026-07-13): it used to sit at the top of
                                                   //   the banked reduce, so under WOFLUSH=1 it was COMPILED OUT -- WMMA read
@@ -3920,17 +5739,22 @@ occ_kernel:
 
 // ---- FEED work: stage the STAGE_HEAD slot (A if ROLE_AFEED, B if ROLE_BFEED), then try-advance STAGE ----
 .Lflow_feed:
+    pollstage_leave 3                           // POLLSTAGE 3 end (role dispatch → feed)
+    pollstage_enter 4                           // POLLSTAGE 4: feed → da_peek gate
+.if SELFSERVE || DSWS2_OVERLAP
+    // Operand pool reclaimed: no ASTAGE_R/BSTAGE_R. Feed-labeled waves reserve-or-yield.
+.if DSWS2_PREFETCH
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc1 .Lflow_prefetch_engine
+.endif
+    s_branch .Lflow_feed_empty
+.else
+    // Classic ring feed: stage into OP_BASE+slot*OPSTRIDE (POOL_N-deep operand pool).
     lds_get s44, STAGE_HEAD_OFF                 // sh
     lds_get s45, ASSIGN_HEAD_OFF               // ah
     s_cmp_ge_u32 s44, s45                        // STAGE >= ASSIGN -> nothing assigned to stage -> yield
     s_cbranch_scc1 .Lflow_feed_empty
 .if MSFEED
-    // *** FEED-SIDE CURSOR FIX (2026-07-14, from the Fable audit). Feeders pinned to slot_of(STAGE_HEAD),
-    //   so useful stagers = FN (B-frags) + G (A-rowblks) = 7 of 30 at the real-shape config. The other
-    //   ~23 coasting waves burned an lds_fetch_add_r on SL_BFNEXT/SL_ARNEXT every iteration, got an index
-    //   >= FN/G, and bailed -- a pure wasted LDS atomic on a per-WG hot word. Same bug as the compute
-    //   side; the pool was decorative on BOTH ends. Now: scan the assigned window [STAGE, ASSIGN),
-    //   starting at (wid mod window) so feeders SPREAD across slots. ***
     s_sub_u32 s20, s45, s44                      // window = ah - sh   (1 .. POOL_N)
     s_mov_b32 s21, s24                           // wid
 .Lflow_fmswa:
@@ -3941,40 +5765,21 @@ occ_kernel:
 .Lflow_fmswb:
     s_add_u32 s44, s44, s21                      // my slot = sh + (wid mod window)   -> still < ah
 .endif
-.if SELFSERVE && (SSWIN > POOL_N)
-    // Control-only sentinels may lead DRAIN by SSWIN, but a ring fallback may stage operands only while
-    // its logical generation is within the POOL_N-deep resident window.
-    lds_get s46, DRAIN_HEAD_OFF
-    s_sub_u32 s46, s44, s46
-    s_cmp_ge_u32 s46, POOL_N
-    s_cbranch_scc1 .Lflow_feed_empty
-.endif
-    slot_of s46, s44, s47                        // slot = (my cursor) mod POOL_N
+    slot_of s46, s44, s47                        // slot = (my cursor) mod SLOT_N
     s_lshl_b32 s48, s46, 5
     s_add_u32 s48, s48, SLOTC_BASE              // scb
-.if SELFSERVE && (SSWIN > POOL_N)
-    pool_of s52, s44, s47
-    s_mul_i32 s52, s52, OPSTRIDE
-.else
-    s_mul_i32 s52, s46, OPSTRIDE                 // slot * OPSTRIDE. WAS `s_lshl_b32 s52, s46, 14` = slot*16384, which is the
-                                                  //   SEGK=64 stride HARDCODED. At SEGK=32 OPSTRIDE is 8192, so slot 1
-                                                  //   read its operands from the WRONG address -> POOL_N>1 had NEVER
-                                                  //   worked at SEGK=32, and SEGK=32 is the only size that fits LDS.
-                                                  //   THIS is why POOL_N got nailed to 1. (found 2026-07-13)
-.endif
+    s_mul_i32 s52, s46, OPSTRIDE
     s_add_u32 s52, s52, OP_BASE                // sob
 .if DECENTASN
-    // v3 GATE: the slot is PRODUCED for logical index s44 only if SL_GEN==s44. Between reserve and stamp it still
-    //   holds the PRIOR occupant (stale STI -> OOB DECODE). Verify BEFORE reading SL_STI. (s44 = cursor index.)
     s_add_u32 s45, s48, SL_GEN
     lds_get_r s47, s45
     s_cmp_lg_u32 s47, s44
-    s_cbranch_scc1 .Lflow_feed_empty            // not produced yet -> yield (do NOT decode a stale/prior STI)
+    s_cbranch_scc1 .Lflow_feed_empty
 .endif
     s_add_u32 s45, s48, SL_STI
-    lds_get_r s17, s45                           // gsti = STAMP (assigned -> set)
+    lds_get_r s17, s45
 .if GROUPS > 1
-    s_and_b32 s17, s17, STI_MASK                   // strip group bits (feed stages by tcol/ksi, group-agnostic)
+    s_and_b32 s17, s17, STI_MASK
 .endif
     DECODE_STI
     s_cmp_eq_u32 s34, ROLE_BFEED
@@ -3984,6 +5789,8 @@ occ_kernel:
 .Lflow_stageB:
     BSTAGE_R s48, s52
 .Lflow_stage_adv:
+.endif
+.if !(SELFSERVE || DSWS2_OVERLAP)
     // try-advance STAGE_HEAD: if the CURRENT STAGE_HEAD slot is fully staged, CAS-bump it.
     // (Already CONDITIONAL on BFDONE==FN && ARDONE==G, so out-of-order staging under MULTISLOT is SAFE
     //  here -- unlike DRAIN, which was an unconditional bump. Under MULTISLOT several slots may become
@@ -4031,8 +5838,15 @@ occ_kernel:
 .else
     s_branch .Lflow_loop
 .endif
+.endif
 .Lflow_feed_empty:
 .if DECENTASN
+.if DSWS2_PREFETCH
+    // P1: lean next-tile claim service. Completes CLAIMING -> READY/TERMINAL via the relocated occ[20]++.
+    //   Runs here (every reserve-or-yield entry) so feed-floor AND coasting compute can finish the claim;
+    //   ACC-dead, still lean (ROLEFLOW grow-first has not run yet). No s71 throttle -- once per tile.
+    tnxt_claim_service
+.endif
     // ===== COUPLED-CURSOR decentralized assign (2026-07-18; replaces the decoupled DA_KSI grab). Many waves
     //   reserve DIFFERENT slots in PARALLEL (CAS on ASSIGN) -> refill scales with #free waves. ksi is DERIVED
     //   from the reservation index (within = r - DA_BASE), so pool POSITION == ksi ORDER -- REQUIRED for deep-J
@@ -4069,6 +5883,8 @@ occ_kernel:
     s_mov_b32 s48, 0                               // peek retry budget
 .endif
 .Lflow_da_peek:
+    pollstage_leave 4                           // POLLSTAGE 4 end (reached reservation peek)
+    pollstage_enter 5                           // POLLSTAGE 5: da_peek reservation attempt
     phist_bump PH_RESV_TRY                        // attempts incl. retries (SCC dead: recomputed below)
 .if CFASSIGN
     lds_get s51, DA_ZDONE_OFF                     // z: zeroed field end; bit 0 is the boundary lock
@@ -4103,6 +5919,9 @@ occ_kernel:
     s_sub_u32 s46, s45, s44                       // cohort width
     s_cmp_ge_u32 s24, s46
     s_cbranch_scc1 .Lflow_da_cf_no_unit            // short cohort: high wave ids have no unit
+    // (The P2a-rev2 DSWS2_ROLEFLOW deferral of this served-mark is DELETED. DSWS2_ROLEFLOW is now
+    //  CFASSIGN=0-only -- see the inverted guard at the DSWS2_ROLEFLOW banner -- so this CFASSIGN arm can
+    //  never be reached with it set, and leaving a fork here would be text that no build can execute.)
     s_mov_b32 s15, s45                             // mark served before any slot release or compute
     s_add_u32 s44, s44, s24                       // r = cohort_start + wid
     s_branch .Lflow_da_cf_decode
@@ -4166,16 +5985,102 @@ occ_kernel:
     s_sub_u32 s45, SSWIN, s47                        // room_w = SSWIN - (r - d)
     s_min_u32 s46, s46, s45                          // N
     s_add_u32 s45, s44, s46                          // r+N
+    passtime_t2_start                                // PASSTIME T2: pre-CAS RTC (BATCH>1 reservation commit)
     lds_cas_rtn s47, ASSIGN_HEAD_OFF, s44, s45       // reserve [r, r+N) (r -> r+N); s47 = old
+    passtime_t2_end                                  // PASSTIME T2: post-CAS RTC (win or lose)
     s_cmp_eq_u32 s47, s44
     s_cbranch_scc0 .Lflow_da_peek_retry              // lost the reservation -> retry peek (nothing consumed)
     s_mov_b32 s72, s44                               // batch curr = r  (survives compute: TRACE-only at TRACE=0)
     s_mov_b32 s73, s45                               // batch end  = r+N (exclusive). 0 = no backlog.
 .else
+.if DSWS2_ROLEFLOW && SELFSERVE && DYNVGPR
+    // ================= CF0 GROW-FIRST / RESERVE-AFTER (2026-07-24; REVIEW finding 4) =================
+    //  THE COMMIT POINT ON THIS PATH IS THE RESERVATION CAS BELOW, not a served-mark. Everything above
+    //  this line is a pure read of the frontier: nothing is claimed, nothing is published, ASSIGN_HEAD is
+    //  untouched. So the grow is moved to sit IMMEDIATELY BEFORE that CAS, and a grow-failed wave has
+    //  literally not taken anything:
+    //     * no abandon   -- there is no reservation to abandon; index r is still at ASSIGN_HEAD and the
+    //                       very next wave to peek reserves it.
+    //     * no poison    -- control never reaches the STAMP block, so SL_RBNEXT = RB_PENDING is never
+    //                       written (under DSWS2_OVERLAP that write is permanent: side_final, its only
+    //                       clearer, is unreachable -- see the ring-reachability note at .Lflow_feed).
+    //     * no park      -- one bounded attempt, then .Lflow_feedmt_sleep, the same bail-and-retry-next-
+    //                       loop target every other "cannot proceed this iteration" branch here uses.
+    //     * no held reservation blocking drain_advance -- DRAIN never has to wait on this wave at all.
+    //
+    //  WHY NOT .Lflow_da_rollback (which the CF0 brief nominated): its CAS (r+1 -> r) LOSES whenever any
+    //  other wave has reserved since -- routine at 30 waves against ~n_kseg live indices -- and on loss it
+    //  falls through to .Lflow_da_sentinel, publishing a PRE-COMPLETED sentinel for r. For a phantom (its
+    //  designed use, and .Lflow_da_termslot's) that is correct: the index carries no work. For a REAL
+    //  index it is not a work loss but a WEDGE: nobody ever computes (t, group, ksi), so TILEDONE[group]
+    //  never reaches n_kseg*ACC_N, the tile-closer C-store at .Lflow_cstore never fires, GSTORED never
+    //  bumps, and the boundary drain-gate ("GSTORED >= z>>shift", .Lflow_da_boundary) never opens again.
+    //  Grow-BEFORE-reserve delivers the same intent ("another wave can take it") with no race at all, so
+    //  the rollback path is deliberately left unused. Argued in full in CODEX_DSWS2_CF0_PROGRESS.md.
+    //
+    //  FAT WINDOW: exactly the six instructions from s_alloc_vgpr NFV to the CAS branch. There is no other
+    //  way out of it. On a lost CAS the budget is returned IMMEDIATELY (shrink to VLEAN) before rejoining
+    //  the ordinary lean retry -- no fat wave ever escapes into the peek loop, the boundary handler, the
+    //  terminal drain, or .Lflow_feedmt_sleep.
+    //
+    //  PHASE ACCOUNTING (finding 6): phase_stamp s78 closes the "getting work" interval right before the
+    //  grow, and phase_stamp s80 closes the grow itself -- so PH_GROW measures THE GROW again, which is
+    //  what the 2026-07-22 fix established and rev2 inverted. .Lflow_da_stamp re-stamps s78 for the
+    //  reserve/decode interval, which is "getting work" by the same definition.
+    phase_stamp s78                                 // close PH_WORK_WAIT at "about to grow for a reservation"
+    s_wait_storecnt 0x0                              // s_alloc_vgpr does NOT drain VMEM stores (CLAUDE.md r5)
+    s_alloc_vgpr NFV
+    s_cbranch_scc0 .Lflow_da_cf0_growfail
+    phase_stamp s80                                 // PH_GROW == exactly the s_alloc_vgpr interval
     s_add_u32 s45, s44, 1                          // r+1
+    passtime_t2_start                              // PASSTIME T2: pre-CAS RTC (ROLEFLOW grow-first commit)
+    lds_cas_rtn s47, ASSIGN_HEAD_OFF, s44, s45     // reserve r (r->r+1); s47 = old   <-- THE commit point
+    passtime_t2_end                                // PASSTIME T2: post-CAS RTC (win or lose; shrink path still counted)
+    s_cmp_eq_u32 s47, s44
+    s_cbranch_scc1 .Lflow_da_cf0_reserved          // won -> carry the (already grown) reservation through
+    // Lost the CAS while fat. Nothing was reserved, so nothing is held; give the VGPR budget back at once
+    //   so this wave cannot starve the waves that DID win, then rejoin the ordinary lean retry.
+    deadman_progress                                // another wave reserved -> the WG advanced; this wave is
+                                                     //   alive and flowing, not stalled (CLAUDE.md rule 4:
+                                                     //   the fix for a false kill is a missing progress SITE)
+    s_wait_storecnt 0x0
+.Lflow_da_cf0_unwind:
+    s_alloc_vgpr 32
+    s_cbranch_scc0 .Lflow_da_cf0_unwind             // same shrink-retry idiom as .Lflow_shrink/.Lflow_da_ss_shrink
+    s_branch .Lflow_da_peek_retry                   // lean again -> ordinary bounded peek retry
+.Lflow_da_cf0_growfail:
+    // The SIMD's dyn-VGPR budget is full: other waves are doing real compute. We reserved NOTHING (the CAS
+    //   above was never executed), we are still lean, and we hold no LDS state whatsoever. Flow on.
+    cnt_inc CNT_GROWFAIL                            // grow-fail EVENT counter (STAGINSTR private SGPR)
+    flow_gauge FDIAG_SS_GROWFAIL_OFF, 1             // FORENSICS only; ACC-dead here (the grow FAILED -> lean)
+    // *** NO deadman_progress HERE. REMOVED 2026-07-24 after the CF0 adversarial review (R2-C1,
+    //   REVIEW_DSWS2_CF0_2026-07-24.md). An earlier revision marked progress at this site, reasoning that
+    //   "budget saturation is the system making progress, not a wedge". THAT IS UNSOUND AND IT DISARMS THE
+    //   ANTI-BRICK WATCHDOG FOR EXACTLY THE MODE IT EXISTS TO CATCH:
+    //     deadman_check re-stamps s70 and clears DM_PROG whenever DM_PROG is set, so a wave reaching this
+    //     site once per DEADMAN_EVERY(64) iterations can NEVER be force-retired, however long the WG is
+    //     stalled. Failing case: wave A wins a reservation, grows to NFV, and stalls inside the burst;
+    //     waves B..Z then loop peek -> s_alloc_vgpr fails (budget held by A) -> mark progress -> sleep,
+    //     forever. Zero forward progress and NOBODY ever reaches DEADMAN_TICKS -> no clean retire -> the
+    //     dispatch presents as a HUNG QUEUE instead of the clean force-retire CLAUDE.md rule 3 relies on.
+    //   A grow-fail observes NOTHING advance -- the wave only learned it could not grow, which is equally
+    //   consistent with "others are computing" and with "one wave stalled fat and holds the budget". It
+    //   cannot tell those apart, so it must not claim progress. (Contrast the LOST-CAS site above, which
+    //   IS legitimate: that wave directly witnessed the strictly-monotone ASSIGN_HEAD advance.)
+    //   REMOVING IT IS SAFE PRECISELY BECAUSE OF GROW-FIRST/RESERVE-AFTER: the CAS was never executed, so a
+    //   force-retired wave here holds NO reservation, NO slot, and blocks NO cursor. Losing it costs
+    //   parallelism, never work or liveness -- which is exactly the trade the watchdog is supposed to make.
+    //   DO NOT re-add this without a mechanism that proves a cursor actually moved. ***
+    s_branch .Lflow_feedmt_sleep
+.Lflow_da_cf0_reserved:
+.else
+    s_add_u32 s45, s44, 1                          // r+1
+    passtime_t2_start                              // PASSTIME T2: pre-CAS RTC (plain single-step reservation)
     lds_cas_rtn s47, ASSIGN_HEAD_OFF, s44, s45     // reserve r (r->r+1); s47 = old
+    passtime_t2_end                                // PASSTIME T2: post-CAS RTC (win or lose)
     s_cmp_eq_u32 s47, s44
     s_cbranch_scc0 .Lflow_da_peek_retry            // lost the reservation -> retry peek (nothing consumed)
+.endif
 .endif
 .endif
     // r=s44 reserved (unstamped). DA_TILE/DA_BASE are FROZEN: my slot keeps DRAIN<ASSIGN, so no tile boundary can
@@ -4191,7 +6096,48 @@ occ_kernel:
     //   idiom) so DRAIN advances and no consumer wedges. NOT stamped, so occ[96] emissions still == TOTAL_super
     //   and `computed` still == G*TOTAL_super. For pow2 n_kseg mask==n_kseg-1, so this NEVER fires (no regression).
     s_cmp_gt_u32 s47, s66                            // ksi > n_kseg-1 -> phantom
+.if DSWS2_ROLEFLOW && SELFSERVE && DYNVGPR
+    s_cbranch_scc0 .Lflow_da_cf0_notphantom
+    // BELT-AND-BRACES (this must never fire at CFASSIGN=0, which is the only place DSWS2_ROLEFLOW builds):
+    //   the PRE-CAS gate at .Lflow_da_peek already rejected every phantom -- it tested r & mask against
+    //   n_kseg-1, and DA_BASE is 2^shift-aligned so (r-base)&mask == r&mask IDENTICALLY (the file's own
+    //   argument for dropping the DA_BASE read there). If that invariant ever broke, this wave would be
+    //   FAT (grow-first) and .Lflow_da_sentinel exits via .Lflow_feedmt_sleep, which never shrinks -- the
+    //   wave would coast fat forever, holding NFV VGPRs against every other wave's grow. Return the budget
+    //   first; correctness of the sentinel itself is unchanged (a phantom genuinely carries no work).
+    s_wait_storecnt 0x0
+.Lflow_da_cf0_phunwind:
+    s_alloc_vgpr 32
+    s_cbranch_scc0 .Lflow_da_cf0_phunwind
+    s_branch .Lflow_da_sentinel
+.Lflow_da_cf0_notphantom:
+.else
     s_cbranch_scc1 .Lflow_da_sentinel
+.endif
+.if DSWS2_PREFETCH
+    // P1/P4 trigger: unique winner of the LAST REAL ksi of group 0 publishes next-tile CLAIMING.
+    //   P1 used group == GROUPS-1 (final group) — READY only after the tile was almost fully reserved,
+    //   so the warm window was the tail of the last group only (P3 measured 144-177 of 640 blocks).
+    //   P4 fires at group == 0 (first group's last real ksi): still EXACTLY once per tile (unique
+    //   reservation), but READY spans the rest of group-0 drain + all later groups + C-store/GSTORED.
+    //   GROUPS=1 (ACC_N==G): group is always 0, identical to "final group". LDS-only; lean claim service
+    //   does the occ[20]++. Live here: s47=ksi, s51=within, s52=t (current).
+    //
+    //   NOTE on tiles_latched == TOTAL/3 (P3 finding): NOT ACC_N/GROUPS. Host chunking
+    //   (ML8_COOP_CHUNK=96 tiles, 64 WGs, 33 chunks) yields per chunk only (96-64)=32 WGs with a
+    //   second tile => max early-claim latches = 33*32 = 1056 = 3168/3. Structural, not a trigger bug.
+    s_cmp_lg_u32 s47, s66                             // ksi != n_kseg-1?
+    s_cbranch_scc1 .Lflow_tnxt_skip_req
+.if GROUPS > 1
+    s_lshr_b32 s45, s51, s68                          // group = within >> shift
+    s_cmp_lg_u32 s45, 0                               // P4: first group only (was GROUPS-1)
+    s_cbranch_scc1 .Lflow_tnxt_skip_req
+.endif
+    lds_cas_rtn s45, TNXT_STATE_OFF, TNXT_EMPTY, TNXT_CLAIMING
+    // ignore CAS result: not-EMPTY means a prior request/ready already owns the slot (should not happen
+    //   mid-tile; belt-and-braces against double publish).
+.Lflow_tnxt_skip_req:
+.endif
     s_lshl_b32 s52, s52, s68                          // t << shift
     s_or_b32 s52, s52, s47                            // gi = (t<<shift) | ksi
 .if GROUPS > 1
@@ -4214,12 +6160,39 @@ occ_kernel:
 .endif
 .endif
 .Lflow_da_boundary:
+    wtb_d_enter                                  // WTBUDGET D: boundary handler open (ACC-dead, lean)
+    bndtime_start                                // BNDTIME: latch the entry RTC FIRST, so the timed region is the
+                                                 //   handler itself and not the other probes' atomics. (SCC is dead
+                                                 //   at every entry to this label -- 4629/4674/4699 all arrive via a
+                                                 //   taken s_cbranch or an unconditional s_branch, and the s_or_b32
+                                                 //   below recomputes it. Same SCC argument phist_bump already relies on.)
     phist_bump PH_BOUNDARY                       // (SCC dead here; the s_or_b32 below recomputes it)
+    bndsplit_bump BNDS_ENTRY_OFF                 // BNDSPLIT: every boundary entry (SCC dead; :4240 s_or recomputes)
+.if DSWS2_FUNNEL
+    s_mov_b32 s56, DSWS2_FUNNEL_SPIN_N
+.Lflow_da_funnel_ready:
+    lds_get s54, DRAIN_HEAD_OFF
+    lds_get s55, ASSIGN_HEAD_OFF
+    s_cmp_lt_u32 s54, s55
+    s_cbranch_scc1 .Lflow_da_funnel_notready
+    lds_get s54, DA_ZDONE_OFF
+    s_and_b32 s54, s54, ~ZLOCK
+    s_lshr_b32 s54, s54, s68
+    lds_get s55, GSTORED_OFF
+    s_cmp_lt_u32 s55, s54
+    s_cbranch_scc1 .Lflow_da_funnel_notready
+.endif
     // ASSIGN == DA_ZDONE: a group or tile boundary. Elect ONE handler: CAS(DA_ZDONE: z -> z|ZLOCK). Losers bail.
     s_or_b32 s45, s51, ZLOCK
     lds_cas_rtn s47, DA_ZDONE_OFF, s51, s45
     s_cmp_eq_u32 s47, s51
+.if DSWS2_WTBUDGET || DSWS2_BNDTIME
+    s_cbranch_scc0 .Lflow_da_bnd_lost_any         // lost ZCAS -> D leave / BNDTIME end -> park
+.else
     s_cbranch_scc0 .Lflow_feedmt_sleep            // lost the boundary claim -> another wave handles it -> bail
+.endif
+    bndsplit_bump BNDS_ZWON_OFF                   // BNDSPLIT: fall-through = won the ZLOCK election (SCC dead; :4249 recomputes)
+    advprobe_start                                // sampled RTC after the ZLOCK election win
     // I own the boundary (ZLOCK held -> reservers bail, ASSIGN frozen at z). DRAIN-GATE (I hold NO slot -> NOT
     //   self-blocking; == the coordinator's DRAIN>=ASSIGN barrier): the finished group/tile occupies [.,z) and
     //   its banks can't be reused until it fully drains. DRAIN < ASSIGN -> release ZLOCK, bail (retry later).
@@ -4227,6 +6200,7 @@ occ_kernel:
     lds_get s46, DRAIN_HEAD_OFF                     // DRAIN
     s_cmp_lt_u32 s46, s44
     s_cbranch_scc1 .Lflow_da_bnd_bail              // still draining -> release ZLOCK, bail
+    bndsplit_bump BNDS_PDRAIN_OFF                 // BNDSPLIT: fall-through = passed the drain-gate (SCC dead; :4256/:4258 recompute)
     // *** Codex C1: also wait for the finishing group's C-store to DRAIN before reusing (zeroing) its banks.
     //   DRAIN==ASSIGN proves all RBDONE bumped, but the banked completer bumps RBDONE BEFORE it READS the banks
     //   for the C-store, so zeroing here could race that read (-> stores zeros). GSTORED counts group C-stores
@@ -4236,6 +6210,7 @@ occ_kernel:
     lds_get s47, GSTORED_OFF                        //   (EXACT under the FIELD-STRIDED span: z advances by 2^shift/group)
     s_cmp_lt_u32 s47, s46
     s_cbranch_scc1 .Lflow_da_bnd_bail              // a drained group's C-store not yet done -> release ZLOCK, retry
+    bndsplit_bump BNDS_PCSTORE_OFF               // BNDSPLIT: fall-through = passed the C-store gate -> will advance (SCC dead; :4262 recomputes)
     // TILE vs GROUP: (z - base) == TOTAL -> tile exhausted ; < TOTAL -> next group of the SAME tile.
     lds_get s53, DA_BASE_OFF
     s_sub_u32 s53, s51, s53                          // z - base  (= groups_zeroed * n_kseg)
@@ -4303,10 +6278,29 @@ occ_kernel:
     s_add_u32 s45, s51, s46                          // z + 2^shift  (s51 is clean z -> top bit clears)
 .endif
     lds_put DA_ZDONE_OFF, s45                        // advance (release) -> this group's ksi now reservable
+    advprobe_end                                  // sampled successful GROUP critical section
     bnd_bump BND_GRP_OFF                             // BNDPROBE: one GROUP advance (SCC dead: branch follows)
+.if DSWS2_WTBUDGET
+    wtb_d_leave                                      // WTBUDGET D close (group advance done → peek)
+.endif
     s_branch .Lflow_da_peek
 .Lflow_da_bnd_tile:
     // ---- TILE boundary: claim the WG's next global tile occ[20]++, re-base, zero group 0, advance DA_ZDONE ----
+.if DSWS2_PREFETCH
+    // P1: prefer pre-claimed t_next (READY). CLAIMING|BUSY -> bail (early claimer still working).
+    //   EMPTY -> take BUSY and do today's synchronous claim (cold start + correctness fallback).
+    //   TERMINAL -> no more tiles (early claim already saw chunkHi).
+    lds_get s53, TNXT_STATE_OFF
+    s_cmp_eq_u32 s53, TNXT_READY
+    s_cbranch_scc1 .Lflow_tnxt_bnd_ready
+    s_cmp_eq_u32 s53, TNXT_TERMINAL
+    s_cbranch_scc1 .Lflow_da_bnd_term
+    s_cmp_eq_u32 s53, TNXT_EMPTY
+    s_cbranch_scc0 .Lflow_da_bnd_bail                // CLAIMING or BUSY: release ZLOCK, retry
+    lds_cas_rtn s53, TNXT_STATE_OFF, TNXT_EMPTY, TNXT_BUSY
+    s_cmp_eq_u32 s53, TNXT_EMPTY
+    s_cbranch_scc0 .Lflow_da_bnd_bail                // lost EMPTY ownership (claim service raced in)
+.endif
     s_mov_b32 s16, exec_lo
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
@@ -4317,6 +6311,14 @@ occ_kernel:
 .Lflow_da_bnd_giok:
     s_mov_b32 exec_lo, s16
     v_readfirstlane_b32 s53, v5                      // t_new
+.if DSWS2_PREFETCH
+    lds_put TNXT_STATE_OFF, TNXT_EMPTY               // EMPTY-fallback claim consumed immediately (not left READY)
+    s_branch .Lflow_tnxt_bnd_have_t
+.Lflow_tnxt_bnd_ready:
+    lds_get s53, TNXT_TILE_OFF                       // t_new from early claim (no second occ[20]++)
+    lds_put TNXT_STATE_OFF, TNXT_EMPTY               // free slot for the next tile's last-ksi request
+.Lflow_tnxt_bnd_have_t:
+.endif
     s_cmp_ge_u32 s53, s69                            // t_new >= chunkHi -> WG out of global work
     s_cbranch_scc1 .Lflow_da_bnd_term              // terminal: release ZLOCK, broadcast retire
     zero_banks                                       // group 0 banks fresh for the new tile (pool drained above)
@@ -4340,13 +6342,39 @@ occ_kernel:
     s_add_u32 s45, s51, s46                          // z + 2^shift
 .endif
     lds_put DA_ZDONE_OFF, s45                        // advance (clears ZLOCK) -> group 0 of t_new now reservable
+    advprobe_end                                  // sampled successful TILE critical section
     bnd_bump BND_TILE_OFF                            // BNDPROBE: one TILE advance (SCC dead: branch follows)
+.if DSWS2_WTBUDGET
+    wtb_d_leave                                      // WTBUDGET D close (tile advance done → peek)
+.endif
     s_branch .Lflow_da_peek
+.if DSWS2_WTBUDGET || DSWS2_BNDTIME
+.Lflow_da_bnd_lost_any:                              // lost ZCAS: close D (if WTBUDGET) + optional BNDTIME
+.if DSWS2_WTBUDGET
+    wtb_d_leave
+.endif
+.if DSWS2_BNDTIME
+    bndtime_end_lost                                 // BNDTIME LOST EXIT 1/5: outside the lock (CAS failed)
+.endif
+    s_branch .Lflow_feedmt_sleep
+.endif
 .Lflow_da_bnd_bail:
+.if DSWS2_WTBUDGET
+    wtb_d_leave                                      // WTBUDGET D close (drain/C-store bail)
+.endif
     cnt_inc REL_IMBAL                                 // *** occ[97]: boundary drain-gate bails (finished group/tile still draining) ***
     lds_put DA_ZDONE_OFF, s51                        // release ZLOCK (restore clean z); retry next loop
+    bndtime_end_lost                                 // BNDTIME LOST EXITS 2/5 (drain-gate) and 3/5 (C-store/GSTORED gate),
+                                                     //   which share this bail. Placed AFTER the ZLOCK release ON PURPOSE:
+                                                     //   timing before it would hold the boundary lock across two RTC reads and
+                                                     //   two device atomics and would distort every OTHER wave's pass.
+                                                     //   The few instructions of release are inside the measured span, which is
+                                                     //   correct -- they are part of the losing pass's cost.
     s_branch .Lflow_feedmt_sleep
 .Lflow_da_bnd_term:
+.if DSWS2_WTBUDGET
+    wtb_d_leave                                      // WTBUDGET D close (terminal)
+.endif
     bnd_bump BND_TERM_OFF                            // BNDPROBE: terminal transition (SCC dead)
 .if TERMFIX
     lds_put FLOWTERM_OFF, 0xDEAD                     // publish terminal WHILE holding ZLOCK, and KEEP ZLOCK held:
@@ -4356,6 +6384,13 @@ occ_kernel:
 .else
     lds_put DA_ZDONE_OFF, s51                        // release ZLOCK (restore clean z); go terminal (RACY: window
 .endif                                               //   before .Lflow_da_terminal sets FLOWTERM -> duplicate claim)
+    bndtime_end_lost                                 // BNDTIME LOST EXIT 4/5: terminal. Leaves the handler WITHOUT an advance,
+                                                     //   so by the "every non-advancing exit" rule it is timed here, which also
+                                                     //   makes start/end pairing TOTAL (every sampled start has a sampled end).
+                                                     //   MAGNITUDE: at most ONE terminal per WG for the whole run (<=64 events),
+                                                     //   and 1-in-64 sampled on top, so its contribution to the LOST average is
+                                                     //   ~1 sample against ~1e6 -- below the noise floor. Do NOT read occ[134] as
+                                                     //   "bails only"; it is "non-advancing passes", terminals included.
     s_branch .Lflow_da_terminal
 .if !CFASSIGN
 .Lflow_da_rollback:
@@ -4414,6 +6449,47 @@ occ_kernel:
 .endif
     s_branch .Lflow_feedmt_sleep                      // sentinel published -> bail (retry), NOT terminal
 .Lflow_da_stamp:
+.if DSWS2_ROLEFLOW && SELFSERVE && DYNVGPR
+    // CF0 COMMIT-ONLY ARM (2026-07-24, replaces the P2a-rev2 grow-here arm). Under DSWS2_ROLEFLOW the
+    //   grow has ALREADY succeeded, at .Lflow_da_realidx, BEFORE the reservation CAS -- so by the time
+    //   control reaches here the wave is fat AND owns index r, and every remaining action is a commit that
+    //   can no longer fail. There is therefore no grow-fail branch on this arm at all: the grow-fail case
+    //   never reserves and never arrives here (see the CF0 GROW-FIRST block for the full argument).
+    //   REACHABILITY: the only two entries into .Lflow_da_stamp are (a) the peek fallthrough, which under
+    //   DSWS2_ROLEFLOW always passes through the grow site, and (b) .Lflow_da_ss_batch_next, which is
+    //   BATCH>1-only and forbidden by the guard at the DSWS2_ROLEFLOW banner. So "already fat" holds on
+    //   every path that can reach this instruction.
+    //   PHASES (REVIEW finding 6): s80/PH_GROW was already closed at the grow itself; this stamp closes
+    //   the reserve-CAS + decode interval into PH_WORK_WAIT, which is the accumulator's own definition
+    //   ("all time since the last stamp was spent GETTING WORK").
+.if PHSPLIT
+    phase_stamp s79                               // PH_SS_WAIT (+0.1% C-store bleed)
+.else
+    phase_stamp s78                               // PH_WORK_WAIT: reservation secured
+.endif
+    phist_bump PH_RESV_WIN                        // reservation selected
+    cnt_inc CLAIM_NOPERSIST                          // *** INSTRUMENT (occ[96]): count REAL super-tile EMISSIONS
+                                                     //   (expect==TOTAL_super). Fires EXACTLY ONCE per r: only
+                                                     //   a WON reservation CAS reaches this instruction. ***
+    duty_grow                                        // DUTYPROBE-only, and SELFSERVE forbids DUTYPROBE (guard
+    fat_inc                                          //   ":SELFSERVE is incompatible with DUTYPROBE=1"), so the
+                                                     //   only live one here is fat_inc (FATGAUGE) -- kept on the
+                                                     //   COMMIT side so it stays exactly 1:1 with the fat_dec at
+                                                     //   .Lflow_da_ss_rows_done and the unwind path needs no
+                                                     //   counterpart.
+    // *** STAGE 7 = THE BURST (2026-07-26). WHY IT EXISTS: stages 1-6 are NOT a partition of a poll
+    //   pass, which I asserted and was wrong about. A wave that WINS work branches from here into the
+    //   burst and rejoins at .Lflow_da_ss_complete (:5561) -- BACKWARD, into stage 3's range. So a
+    //   work pass traverses stages 3/4/5 TWICE, never reaches `pollstage_leave 5` (its sample is
+    //   dropped), and dumps its whole burst into stage 3's interval instead. That is why the six-stage
+    //   accounting closed to ~4% of runtime: it partitions the PARK path only.
+    //   This bracket has ONE entry (reservation won) and ONE exit (branch back to complete).
+    s_branch .Lflow_da_ss_decode
+.else
+    // ORIGINAL commit-then-grow order -- BYTE-IDENTICAL to the pre-rev2 source whenever DSWS2_ROLEFLOW=0,
+    //   SELFSERVE=0, or DYNVGPR=0 (the last two never attempt a grow here at all, so there is nothing for
+    //   P2a rev2 to reorder). The rejected spin-park mechanism (the old .Lflow_da_ss_growfail_retry) has
+    //   been deleted outright, not merely disabled -- see CODEX_DSWS2_P2A_REV2_PROGRESS.md.
     // *** MISSING WAIT STAMP, ADDED 2026-07-22. phase_stamp charges ALL time since the PREVIOUS stamp
     //   to the accumulator you name, so an unstamped region is not "unmeasured" -- it is silently
     //   BILLED TO THE NEXT PHASE. The ring path closes its wait at .Lflow_havestage (s78, :3314); this
@@ -4440,6 +6516,10 @@ occ_kernel:
 .endif
     phist_bump PH_RESV_WIN                        // reservation selected (CAS or counter-free; SCC dead below)
     cnt_inc CLAIM_NOPERSIST                          // *** INSTRUMENT (occ[96], repurposed): count REAL super-tile EMISSIONS (expect==TOTAL_super) ***
+    // STAGE 7 enter -- THE LIVE ARM. My first attempt put this in the DSWS2_ROLEFLOW=1 arm, which is
+    //   compiled out at the config of record, and the run returned n=0. Placed BEFORE the grow so the
+    //   s_alloc_vgpr pipeline drain is inside the measured interval.
+    pollstage_enter 7
 .if SELFSERVE
     // The DECENTASN reservation already owns this item. Grow before committing it to carry-through; if the
     // grow fails, the unchanged stamp path below publishes the item for normal feed/ring compute instead of
@@ -4452,13 +6532,34 @@ occ_kernel:
     fat_inc
     phase_stamp s80
 .endif
+    // STAGE 8 = stage 7 MINUS the grow. s_alloc_vgpr does WaitIdleExceptStoreCnt() -- a full pipeline
+    //   drain -- and no ablation removes it, so it is the only candidate left inside the burst that
+    //   survives NOWMMA/NOBLOAD/NODSADD/NOCFLUSH all measuring ~0. 7 vs 8 isolates it.
+    pollstage_enter 8
+    pollstage_enter 9                                // STAGE 9: same start as 8, ends BEFORE the shrink
     s_branch .Lflow_da_ss_decode
 .if DYNVGPR
 .Lflow_da_ss_growfail:
     cnt_inc CNT_GROWFAIL
     flow_gauge FDIAG_SS_GROWFAIL_OFF, 1          // DIAG: ACC-dead (grow FAILED -> still lean). Fell back to ring stamp.
+    // DSWS2_ROLEFLOW's grow-first/reserve-after rebuild lives in the OUTER .if above (requires
+    //   SELFSERVE && DYNVGPR, both true in this branch) -- so DSWS2_ROLEFLOW is always 0 by the time
+    //   control reaches here. Falls through to the STAMP block below, which publishes a claimable ring
+    //   fallback under SELFSERVE and advances STAGE_HEAD after SL_GEN releases the completed payload.
 .endif
 .endif
+.endif
+.if !(DSWS2_ROLEFLOW && SELFSERVE && DYNVGPR)
+    // *** THIS WHOLE STAMP BLOCK IS COMPILED OUT UNDER DSWS2_ROLEFLOW (CF0, 2026-07-24). ***
+    //   Its ONLY entry was the grow-fail fallthrough from .Lflow_da_ss_growfail (a wave that had already
+    //   taken index r and then could not grow, so it published r for somebody else). Under DSWS2_ROLEFLOW
+    //   the grow happens BEFORE the reservation CAS, so that state is unreachable by construction: a
+    //   grow-failed wave owns nothing to publish, and the .Lflow_da_stamp arm above exits straight to
+    //   .Lflow_da_ss_decode. Excluding it here rather than leaving it as never-executed text is deliberate
+    //   -- it is what makes "no poison" STRUCTURAL: the lds_put_r SL_RBNEXT, RB_PENDING instruction does
+    //   not exist in a DSWS2_ROLEFLOW binary at all, so the permanent-poison stall that finding 4 traced
+    //   (STAGE_HEAD can never pass a poisoned slot; side_final, its only clearer, is unreachable under
+    //   DSWS2_OVERLAP) has no instruction that could create it. It is also -372B of dead .text (measured).
     // ---- STAMP slot(r mod POOL_N) NORMALLY: reset counters, SL_STI=gi, then SL_GEN=r LAST (release fence). ----
     slot_of s46, s44, s47                          // slot = r mod POOL_N ; s47 scratch
     s_lshl_b32 s46, s46, 5
@@ -4470,18 +6571,23 @@ occ_kernel:
     //   the coupled cursor a non-lead slot is turned away from CLAIMING by the pre-grow lead-gate AND the post-grow
     //   lead RE-CHECK (see .Lflow_leadok / the DECENTASN&&J>1 recheck) -- NOT by an ACC_N poison -- so it can arm
     //   to 0 like a lead; the carrier consumes it via the cursor walk (bumping SL_RBDONE, never SL_RBNEXT).
+    // RBNEXT publish:
+    //   Classic ring (SELFSERVE=0): RB_PENDING until feeds stage (side_final arms to 0).
+    //   SELFSERVE (pool reclaimed): no feed will stage. Publish claimable 0 AFTER STI (below) so a
+    //   ring claimer self-loads with the correct gen. STI-before-claimable avoids BLOCKER 1 (claimable
+    //   before STI → prior-occupant decode). Temporary RB_PENDING here only on the non-SELFSERVE path.
+.if !SELFSERVE
     lds_put_r s45, RB_PENDING
+.endif
     s_add_u32 s45, s46, SL_RBDONE
     lds_put_r s45, 0
-    // *** Codex gpt-5.6-sol (2026-07-18): PUBLISH SL_STI BEFORE the feed claim-counter resets. The feed claims a
-    //   frag via fetch_add(SL_BFNEXT/SL_ARNEXT) then decodes SL_STI (SITE-J, ~1428/1503) to address operands, but
-    //   does NOT re-check SL_GEN. If the counters are reset (claimable) BEFORE STI is published, a feeder delayed
-    //   across a g->g+POOL_N slot reuse claims the NEW gen's reset counter yet reads the OLD gen's STI -> stages
-    //   stale-K operands into the new gen's buffer, and compute adds the wrong K-segment (work-EXACT, wrong value,
-    //   ~2.3x double-count on silicon; coordinator immune because it publishes ASSIGN_HEAD++ last). Making STI
-    //   land before BFNEXT/ARNEXT are reset means "counter is claimable" implies "STI is the new gen's". ***
+    // *** Codex gpt-5.6-sol (2026-07-18): PUBLISH SL_STI BEFORE the feed claim-counter resets / claimable.
     s_add_u32 s45, s46, SL_STI
-    lds_put_r s45, s52                             // SL_STI = gi (payload) -- MUST precede the feed-counter resets below
+    lds_put_r s45, s52                             // SL_STI = gi (payload) -- MUST precede claimable/counters
+.if SELFSERVE
+    s_add_u32 s45, s46, SL_RBNEXT
+    lds_put_r s45, 0                               // claimable; ring self-loads; no staging
+.endif
     s_add_u32 s45, s46, SL_BFNEXT
     lds_put_r s45, 0
     s_add_u32 s45, s46, SL_BFDONE
@@ -4493,12 +6599,41 @@ occ_kernel:
     s_add_u32 s45, s46, SL_GEN
     lds_put_r s45, s44                             // SL_GEN=r LAST -> release fence. (Do NOT batch these into one
                                                    //   trailing wait -- the per-store ordering IS the fence.)
+    // SELFSERVE published a real, claimable ring fallback above. Advance STAGE_HEAD so a compute wave can
+    //   observe DRAIN < STAGE and claim it. This is a separate walk from .Lflow_da_ss_stage_walk because
+    //   that walk falls through into the fat carry-through body; this grow-failed wave is still lean.
+.if SELFSERVE
+.Lflow_da_gf_stage_walk:
+    lds_get s44, STAGE_HEAD_OFF
+    lds_get s45, ASSIGN_HEAD_OFF
+    s_cmp_ge_u32 s44, s45
+    s_cbranch_scc1 .Lflow_da_gf_stage_done
+    slot_of s46, s44, s47
+    s_lshl_b32 s48, s46, 5
+    s_add_u32 s48, s48, SLOTC_BASE
+    s_add_u32 s45, s48, SL_GEN
+    lds_get_r s47, s45
+    s_cmp_lg_u32 s47, s44
+    s_cbranch_scc1 .Lflow_da_gf_stage_done
+    s_add_u32 s45, s48, SL_RBNEXT
+    lds_get_r s47, s45
+    s_and_b32 s47, s47, RB_PENDING
+    s_cmp_lg_u32 s47, 0
+    s_cbranch_scc1 .Lflow_da_gf_stage_done
+    lds_cmpstore_adv STAGE_HEAD_OFF, s44
+    s_branch .Lflow_da_gf_stage_walk
+.Lflow_da_gf_stage_done:
+    drain_advance
+    // NO deadman_progress: a grow failure does not prove forward progress, and this path must leave the
+    //   anti-brick watchdog armed.
+.endif
 .if BATCH > 1
     // Ring fallback (grow-fail) still owns the rest of a BATCH>1 claim -- drain serially, do not abandon.
     s_branch .Lflow_da_ss_batch_next
 .else
     s_branch .Lflow_loop
 .endif
+.endif                                             // !(DSWS2_ROLEFLOW && SELFSERVE && DYNVGPR) -- STAMP block
 .if SELFSERVE
 .Lflow_da_ss_decode:
     // NO COUNTER HERE. A cnt_inc at this site used s99 == FATHELD and corrupted the fat-token flag (:2120).
@@ -4570,6 +6705,12 @@ occ_kernel:
     // on v9; A uses ASTAGE_R addressing and a plain load on v8; neither operand round-trips through LDS.
     s_mov_b32 s33, 0                                // local row block
 .Lflow_da_ss_rowblk:
+    // GAP CP2: start of this burst (ACC-dead). Closes gap from prior CP1 if armed.
+    gap_cp2_start
+    // WTBUDGET A enter: ACC-dead (zeros next; no WMMA yet). RTC only — no VGPR/exec/memory.
+    wtb_a_enter
+    // BURSTCNT Step 0: one count per rowblk entry. ACC not yet holding a result (zeros next).
+    bcnt_add BCNT_BURST, 1
     .set idx, 0
     .rept FM*FN
       v_mov_b32 v[ACC+idx*8+0], 0
@@ -4627,6 +6768,140 @@ occ_kernel:
       .set ni, ni+1
     .endr
 .endif
+// ---- K-step loop: classic (issue->wait0->compute) or DSWS2_KDBUF one-ahead double-buffer ----
+//   KDBUF requires KSEG_STEPS>1 and real B loads (NOBLOAD falls back to classic: nothing to hide).
+//   KSEG_STEPS==1: pipeline degenerates; classic path is correct and non-wasteful.
+.if DSWS2_KDBUF && (KSEG_STEPS > 1) && !NOBLOAD
+    // ================= DSWS2_KDBUF: software-pipelined K-step (task 6f0081e3) =================
+    //   PROLOGUE : issue step 0 -> buf0
+    //   BODY k   : advance B base; issue step k+1 -> buf[(k+1)&1];
+    //              s_wait_loadcnt KDBUF_LPT  (retire step k; leave k+1 in flight — NOT 0x0);
+    //              WMMA step k from buf[k&1]
+    //   EPILOGUE : s_wait_loadcnt 0x0; WMMA final step
+    //   Same addresses/bytes as classic (Rule 7: total fetch unchanged; only issue order).
+    //   BURSTCNT still counts every load/wait/wmma (WAITLD still KSEG_STEPS waits; partial vs full).
+    // ----- PROLOGUE: issue step 0 into FA0/FB0 -----
+    .set ni, 0
+    .rept FN
+      s_add_u32  s54, s52, (ni*256)
+      s_addc_u32 s55, s53, 0
+      global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[54:55]
+      .set ni, ni+1
+    .endr
+    bcnt_add BCNT_BLOAD, FN
+    .set mi, 0
+    .rept FM
+      s_mul_i32  s58, s32, mi
+      s_add_u32  s58, s56, s58
+      s_addc_u32 s59, s57, 0
+      global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:0
+      .set mi, mi+1
+    .endr
+    bcnt_add BCNT_ALOAD, FM
+    // ----- BODY: for ks = 0 .. KSEG_STEPS-2 -----
+    .set ks, 0
+    .rept (KSEG_STEPS - 1)
+      s_add_u32  s52, s52, s10                      // B base for step (ks+1)
+      s_addc_u32 s53, s53, 0
+      .set nks, (ks + 1)
+      .set nbuf, (nks & 1)
+      .set cbuf, (ks & 1)
+      // issue step nks into buffer nbuf
+      .if nbuf == 0
+        .set ni, 0
+        .rept FN
+          s_add_u32  s54, s52, (ni*256)
+          s_addc_u32 s55, s53, 0
+          global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[54:55]
+          .set ni, ni+1
+        .endr
+        bcnt_add BCNT_BLOAD, FN
+        .set mi, 0
+        .rept FM
+          s_mul_i32  s58, s32, mi
+          s_add_u32  s58, s56, s58
+          s_addc_u32 s59, s57, 0
+          global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:(nks*16)
+          .set mi, mi+1
+        .endr
+        bcnt_add BCNT_ALOAD, FM
+      .else
+        .set ni, 0
+        .rept FN
+          s_add_u32  s54, s52, (ni*256)
+          s_addc_u32 s55, s53, 0
+          global_load_tr_b64 v[FB1+ni*2:FB1+ni*2+1], v9, s[54:55]
+          .set ni, ni+1
+        .endr
+        bcnt_add BCNT_BLOAD, FN
+        .set mi, 0
+        .rept FM
+          s_mul_i32  s58, s32, mi
+          s_add_u32  s58, s56, s58
+          s_addc_u32 s59, s57, 0
+          global_load_b64 v[FA1+mi*2:FA1+mi*2+1], v8, s[58:59] offset:(nks*16)
+          .set mi, mi+1
+        .endr
+        bcnt_add BCNT_ALOAD, FM
+      .endif
+      // Retire step ks only; KDBUF_LPT of step nks remain outstanding. NOT s_wait_loadcnt 0x0.
+      s_wait_loadcnt KDBUF_LPT
+      bcnt_add BCNT_WAITLD, 1
+.if !NOWMMA
+      .if cbuf == 0
+        .set mi, 0
+        .rept FM
+          .set ni, 0
+          .rept FN
+            v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA0+mi*2:FA0+mi*2+1], v[FB0+ni*2:FB0+ni*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+            .set ni, ni+1
+          .endr
+          .set mi, mi+1
+        .endr
+      .else
+        .set mi, 0
+        .rept FM
+          .set ni, 0
+          .rept FN
+            v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA1+mi*2:FA1+mi*2+1], v[FB1+ni*2:FB1+ni*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+            .set ni, ni+1
+          .endr
+          .set mi, mi+1
+        .endr
+      .endif
+      bcnt_add BCNT_WMMA, (FM*FN)
+.endif
+      .set ks, ks+1
+    .endr
+    // ----- EPILOGUE: drain final buffer, compute final step (ks == KSEG_STEPS-1) -----
+    s_wait_loadcnt 0x0
+    bcnt_add BCNT_WAITLD, 1
+.if !NOWMMA
+    .if (ks & 1) == 0
+      .set mi, 0
+      .rept FM
+        .set ni, 0
+        .rept FN
+          v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA0+mi*2:FA0+mi*2+1], v[FB0+ni*2:FB0+ni*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+          .set ni, ni+1
+        .endr
+        .set mi, mi+1
+      .endr
+    .else
+      .set mi, 0
+      .rept FM
+        .set ni, 0
+        .rept FN
+          v_wmma_f32_16x16x16_fp8_fp8 v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7], v[FA1+mi*2:FA1+mi*2+1], v[FB1+ni*2:FB1+ni*2+1], v[ACC+(mi*FN+ni)*8:ACC+(mi*FN+ni)*8+7]
+          .set ni, ni+1
+        .endr
+        .set mi, mi+1
+      .endr
+    .endif
+    bcnt_add BCNT_WMMA, (FM*FN)
+.endif
+.else
+    // ================= classic: issue -> s_wait_loadcnt 0x0 -> compute (fully exposed) =================
     .set ks, 0
     .rept KSEG_STEPS
 .if !NOBLOAD
@@ -4637,6 +6912,8 @@ occ_kernel:
         global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[54:55]
         .set ni, ni+1
       .endr
+      // BURSTCNT: FN B-load issues this k-step. Pure SALU (ACC may already be live from prior k-steps).
+      bcnt_add BCNT_BLOAD, FN
 .endif
       .set mi, 0
       .rept FM
@@ -4646,7 +6923,10 @@ occ_kernel:
         global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
         .set mi, mi+1
       .endr
+      // BURSTCNT: FM A global_load_b64 this k-step (SS path — not ds_load).
+      bcnt_add BCNT_ALOAD, FM
       s_wait_loadcnt 0x0
+      bcnt_add BCNT_WAITLD, 1                     // the blocking wait for this k-step's A+B loads
 .if !NOWMMA
       .set mi, 0
       .rept FM
@@ -4657,6 +6937,8 @@ occ_kernel:
         .endr
         .set mi, mi+1
       .endr
+      // BURSTCNT: FM*FN WMMA this k-step. MUST be pure SALU — ACC is LIVE here.
+      bcnt_add BCNT_WMMA, (FM*FN)
 .else
       // *** NOWMMA ABLATION (2026-07-20). Drops ONLY the v_wmma math from the carry-through burst. ***
       //   WHY: FOUR ablations returned flat span -- SSWIN 1->8, coast cut 5x, NOCFLUSH (every C store),
@@ -4676,12 +6958,16 @@ occ_kernel:
       s_addc_u32 s53, s53, 0
       .set ks, ks+1
     .endr
+.endif                                          // DSWS2_KDBUF pipeline vs classic
     phase_stamp s81
 
     acc_base_of s39, s33
     v_add_nc_u32 v12, v10, s39
     cnt_inc CNT_BADD
+    // ACC-LIVE WINDOW starts at last v_wmma above and ends at first ds_add_f32 below.
+    //   BURSTCNT: only pure SALU is legal here (same rule as cnt_inc CNT_BADD). Verified by disasm.
 .if !NODSADD                                        // NODSADD ablation: the REAL SELFSERVE split-K LDS reduction.
+    bcnt_add BCNT_DSADD, (FM*FN*8)                  // planned issue count before the ds_add burst
     .set frag, 0
     .rept FM*FN
       .set e, 0
@@ -4692,7 +6978,12 @@ occ_kernel:
       .set frag, frag+1
     .endr
     s_wait_dscnt 0x0
+    bcnt_add BCNT_WAITDS, 1                         // ACC drained into LDS; reduce wait done
 .endif
+    // WTBUDGET A leave: ACC drained (or NODSADD: post-WMMA, no ACC consumer). ACC-dead for RTC.
+    wtb_a_leave
+    // GAP CP1: end of this burst (ACC-dead). Arms latch for next CP2.
+    gap_cp1_end
     phase_stamp s82
     cnt_inc CNT_COMP
     deadman_progress
@@ -4737,6 +7028,7 @@ occ_kernel:
     //   the ring path -- at run #7's scale that is 2 x 16.7M = 33.5M SCOPE_DEV atomics + drains, ~25s of the
     //   63s instrumentation tax. FORENSICS=0 compiles both out, which is why the funnel was moved to
     //   STAGINSTR cnt_inc. DO NOT run SELFSERVE with FORENSICS=1 and expect a meaningful wall time. ***
+    pollstage_leave 9                                // STAGE 9 end: burst BODY done, shrink not yet entered
     flow_gauge FDIAG_SHRINK_OFF, 1
     // This drain follows fat_dec and flow_gauge, both of which can emit under independent config knobs.
     s_wait_storecnt 0x0
@@ -4757,6 +7049,8 @@ occ_kernel:
     // The slot was pre-completed before compute. Seed the shared post-compute path as if its RBDONE increment
     // had returned ACC_N-1; it then performs the final TILEDONE bump, elects/stores C once, and drains normally.
     s_mov_b32 s47, (ACC_N - 1)
+    pollstage_leave 7                                // STAGE 7 end: burst done, rejoining at :5561
+    pollstage_leave 8                                // STAGE 8 end: same exit, grow excluded
     s_branch .Lflow_da_ss_complete
 .endif
 .if BATCH > 1
@@ -4836,7 +7130,56 @@ occ_kernel:
       .set daw, daw+1
     .endr
     s_branch .Lflow_retire
+.if DSWS2_FUNNEL
+// *** DO NOT "FIX" THE BRANCH POLARITY BELOW WITHOUT RE-MEASURING. (audited 2026-07-27) ***
+//   s_sub_u32 is the assembler alias for S_SUB_CO_U32 on gfx12; RDNA4 ISA S16.1 p.206 defines
+//   SCC = (S1 > S0), i.e. SCC is the BORROW, set only on unsigned underflow. Verified in the emitted
+//   gfx1201 disassembly: `s_sub_co_u32 s56, s56, 1`.
+//   CONSEQUENCE: with any positive seed, the first decrement (e.g. 1024-1=1023) does NOT borrow, so
+//   SCC=0 and every arm below BAILS ON THE FIRST NOT-READY OBSERVATION. All three arms were written
+//   treating SCC=1 as "counter still live", which is inverted. So DSWS2_FUNNEL_SPIN_N IS INERT and
+//   the funnel is a pure CHECK-ONCE read-only pre-gate.
+//   THE BUG IS BENIGN, AND IT IS CURRENTLY LOAD-BEARING. Check-once is the behaviour we WANT and the
+//   only behaviour that has been reviewed as safe: each retry re-reads FOUR LDS words, and lds_get is
+//   ds_load_b32 + s_wait_dscnt 0 (a serialized read/drain, see :1601-1605), at a site entered
+//   ~2,150,000 times per run. This kernel has a DOCUMENTED 16x regression (97.3 -> 5.9 TF) from adding
+//   ONE extra LDS read to the peek path -- see :5950-5954. "Correcting" the polarity re-enables a
+//   1024-deep spin of 4 LDS reads on that hot path and is a throughput hazard, not a cleanup.
+//   If you do correct it, the minimal fix is to make SCC mean "s56 != 0" and keep every branch as-is:
+//       s_sub_u32    s56, s56, 1
+//       s_cmp_lg_u32 s56, 0
+//   (merely reversing the branches bails only AFTER underflow -- N+1 checks, not "bail at zero").
+//   Do it behind a defsym, start at SPIN_N=1, and re-measure LDS cost before raising it.
+.Lflow_da_funnel_notready:
+    s_sub_u32 s56, s56, 1
+.if DSWS2_BNDTIME
+    s_cbranch_scc1 .Lflow_da_funnel_retry         // BNDTIME: invert so the exhausted-spin bail can be timed.
+    wtb_d_leave                                   // WTBUDGET D close (funnel exhaust)
+    bndtime_end_lost                              //   LOST EXIT 5/5: funnel pre-gate never opened -> bail without an
+    s_branch .Lflow_feedmt_sleep                  //   advance. The entry latch is taken ONCE, at .Lflow_da_boundary,
+.Lflow_da_funnel_retry:                           //   BEFORE .Lflow_da_funnel_ready -- so the spin is inside the timed
+                                                  //   span (correct: it is time this pass burned) and is NOT re-latched.
+                                                  //   DSWS2_FUNNEL is 0 in both profiles of record; this arm is built
+                                                  //   only when someone turns the funnel on, and is instrumented so
+                                                  //   turning it on cannot silently create an unpaired start.
+.else
+.if DSWS2_WTBUDGET
+    s_cbranch_scc0 .Lflow_da_funnel_bail
+    s_branch .Lflow_da_funnel_ready
+.Lflow_da_funnel_bail:
+    wtb_d_leave
+    s_branch .Lflow_feedmt_sleep
+.else
+    s_cbranch_scc0 .Lflow_feedmt_sleep            // pre-WTBUDGET funnel bail (byte-identical when OFF)
+.endif
+.endif
+    s_branch .Lflow_da_funnel_ready
+.endif
 .Lflow_feedmt_sleep:
+    pollstage_leave 5                           // POLLSTAGE 5 end (peek failed → park)
+    pollstage_enter 6                           // POLLSTAGE 6: park + s_sleep
+    passtime_t1_end                               // PASSTIME T1: park-site end of the whole-pass timer
+    passtime_t0_null                              // PASSTIME T0: null-interval cal (start;end, nothing between)
 .endif
     cnt_inc CNT_FEEDMT                            // feed wave ran, nothing assigned to stage
     phist_bump PH_FEEDMT                          // *** RUN #10's PARK SITE. If the WG wedges again, this bucket
@@ -4853,10 +7196,16 @@ occ_kernel:
     s_cbranch_scc1 .Lflow_feedmt_yield            // not poked -> yield as normal
     s_mov_b32  s93, 0
     lds_put_r  s92, s93                            // consume the poke
+    pollstage_leave 6                             // POLLSTAGE 6: poke-skip path (no sleep)
     s_branch   .Lflow_loop                         // poked -> skip the yield, loop back and grow NOW
 .Lflow_feedmt_yield:
 .endif
+.if DSWS2_WTBUDGET
+    wtb_c_sleep                                   // WTBUDGET C: count all parks; RTC-sample 1-in-WTB_THR (own thr)
+.else
     s_sleep SLEEPN                                // lean feed can't compute without a grow -> yield; coordinator rebalances
+.endif
+    pollstage_leave 6                             // POLLSTAGE 6 end (after sleep)
     s_branch .Lflow_loop
 
 // ---- COAST: a fat COMPUTE wave with no staged work runs feed code (FREE, no resize) to help staging ----
@@ -4867,50 +7216,60 @@ occ_kernel:
 .Lflow_coast:
     cnt_inc CNT_COAST                              // diag: a wave coasted (no staged work, or a grow-fail)
     phist_bump PH_CLEAD                            // coast door (the cnt_inc above sets SCC; recomputed below)
+.if DSWS2_RCONV
+    s_add_u32 s50, s50, 1
+    s_cmp_eq_u32 s50, DSWS2_RCONV_COAST_N
+    s_cbranch_scc0 .Lflow_rconv_skip
+    s_lshl_b32 s45, s24, 2
+    s_add_u32 s45, s45, ROLE_BASE
+    // MAILBOX RACE FIX (2026-07-24, REVIEW finding 3 -- pre-existing in RCONV, not introduced by P2).
+    //   ROLE[wid] has TWO writers: this wave, and the terminal ROLE_RETIRE broadcast (.Lflow_drainwait and
+    //   .Lflow_da_alldrained both write EVERY wave's slot). The old blind lds_put_r could overwrite a
+    //   ROLE_RETIRE that landed in the window between .Lflow_body's read and here; the wave would then
+    //   never see the retire, QUIESCE_CNT would never reach WAVES, and the collective exit would degrade
+    //   to the RETBAR_MAX/deadman backstop -- the ~18s resident-spin compositor-starve condition.
+    //   .Lflow_coast is reachable ONLY from .Lflow_compute / .Lflow_growfail, i.e. ROLE[wid] was
+    //   ROLE_COMPUTE one branch ago, so a CAS from ROLE_COMPUTE is exact: it converts iff nothing else
+    //   wrote the slot, and no-ops (preserving ROLE_RETIRE) if the broadcast got there first. s46 is dead
+    //   scratch here (.Lflow_compute's dh; the coast body reloads s44/s45/s46 before any use).
+    lds_cas_rtn s46, s45, ROLE_COMPUTE, ROLE_AFEED
+    s_mov_b32 s49, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lflow_rconv_restore
+    v_mov_b32 v3, 1
+    global_atomic_add_u32 v4, v3, s[0:1] offset:CONVCNT_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lflow_rconv_restore:
+    s_mov_b32 exec_lo, s49
+.Lflow_rconv_skip:
+.endif
+.if SELFSERVE || DSWS2_OVERLAP
+    // No operand pool to stage into (SELFSERVE reclaim / OVERLAP). Coast -> reserve-or-yield.
+    s_branch .Lflow_feed_empty
+.else
+    // Classic ring coast-staging (SELFSERVE=0 only).
     lds_get s44, STAGE_HEAD_OFF
     lds_get s45, ASSIGN_HEAD_OFF
     s_cmp_ge_u32 s44, s45
-    s_cbranch_scc1 .Lflow_feed_empty              // nothing assigned to stage -> yield
+    s_cbranch_scc1 .Lflow_feed_empty
 .if MSFEED
-    // *** FEED-SIDE CURSOR FIX (2026-07-14, from the Fable audit). Feeders pinned to slot_of(STAGE_HEAD),
-    //   so useful stagers = FN (B-frags) + G (A-rowblks) = 7 of 30 at the real-shape config. The other
-    //   ~23 coasting waves burned an lds_fetch_add_r on SL_BFNEXT/SL_ARNEXT every iteration, got an index
-    //   >= FN/G, and bailed -- a pure wasted LDS atomic on a per-WG hot word. Same bug as the compute
-    //   side; the pool was decorative on BOTH ends. Now: scan the assigned window [STAGE, ASSIGN),
-    //   starting at (wid mod window) so feeders SPREAD across slots. ***
-    s_sub_u32 s20, s45, s44                      // window = ah - sh   (1 .. POOL_N)
-    s_mov_b32 s21, s24                           // wid
+    s_sub_u32 s20, s45, s44
+    s_mov_b32 s21, s24
 .Lflow_cmswa:
     s_cmp_lt_u32 s21, s20
     s_cbranch_scc1 .Lflow_cmswb
-    s_sub_u32 s21, s21, s20                      // wid mod window
+    s_sub_u32 s21, s21, s20
     s_branch .Lflow_cmswa
 .Lflow_cmswb:
-    s_add_u32 s44, s44, s21                      // my slot = sh + (wid mod window)   -> still < ah
-.endif
-.if SELFSERVE && (SSWIN > POOL_N)
-    lds_get s46, DRAIN_HEAD_OFF
-    s_sub_u32 s46, s44, s46
-    s_cmp_ge_u32 s46, POOL_N
-    s_cbranch_scc1 .Lflow_feed_empty
+    s_add_u32 s44, s44, s21
 .endif
     slot_of s46, s44, s47
     s_lshl_b32 s48, s46, 5
     s_add_u32 s48, s48, SLOTC_BASE
-.if SELFSERVE && (SSWIN > POOL_N)
-    pool_of s52, s44, s47
-    s_mul_i32 s52, s52, OPSTRIDE
-.else
-    s_mul_i32 s52, s46, OPSTRIDE                 // slot * OPSTRIDE. WAS `s_lshl_b32 s52, s46, 14` = slot*16384, which is the
-                                                  //   SEGK=64 stride HARDCODED. At SEGK=32 OPSTRIDE is 8192, so slot 1
-                                                  //   read its operands from the WRONG address -> POOL_N>1 had NEVER
-                                                  //   worked at SEGK=32, and SEGK=32 is the only size that fits LDS.
-                                                  //   THIS is why POOL_N got nailed to 1. (found 2026-07-13)
-.endif
+    s_mul_i32 s52, s46, OPSTRIDE
     s_add_u32 s52, s52, OP_BASE
 .if DECENTASN
-    // v3 GATE: same as the feed pick -- verify SL_GEN==cursor before touching this slot's DONE/STI (an
-    //   unstamped reserved slot holds the prior occupant -> stale STI -> OOB DECODE).
     s_add_u32 s45, s48, SL_GEN
     lds_get_r s47, s45
     s_cmp_lg_u32 s47, s44
@@ -4919,7 +7278,7 @@ occ_kernel:
     s_add_u32 s45, s48, SL_BFDONE
     lds_get_r s47, s45
     s_cmp_lt_u32 s47, FN
-    s_cbranch_scc1 .Lflow_coastB                  // B behind -> help B
+    s_cbranch_scc1 .Lflow_coastB
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45
 .if GROUPS > 1
@@ -4937,8 +7296,136 @@ occ_kernel:
     DECODE_STI
     BSTAGE_R s48, s52
     s_branch .Lflow_stage_adv
+.endif
+
+// ---- P2 dedicated prefetch engine (DSWS2_PREFETCH only). Reached ONLY by PF_WID from .Lflow_dispatch
+//   / .Lflow_feed. Never falls into .Lflow_feed_empty, never grows, never handles boundary/zero_banks.
+//   Persistent: s75=block cursor, s76=latched t_next. Scratch: s16-s21,s25-s29. Dest: v16:v23.
+//   Block packing: b = ksi*(KSEG_STEPS*FN) + ks*FN + ni  with ksi in [0,n_kseg), NO phantom clamp.
+//   KSEG_STEPS and FN are powers of two -> pure shift/mask decode (enforced below).
+.if DSWS2_PREFETCH
+.if (KSEG_STEPS & (KSEG_STEPS - 1)) != 0
+  .error "DSWS2_PREFETCH P2 block decode needs KSEG_STEPS power-of-two"
+.endif
+.if (FN & (FN - 1)) != 0
+  .error "DSWS2_PREFETCH P2 block decode needs FN power-of-two"
+.endif
+// log2 ladders for shift decode
+.if FN == 1
+  .set PF_FN_SHIFT, 0
+.elseif FN == 2
+  .set PF_FN_SHIFT, 1
+.elseif FN == 4
+  .set PF_FN_SHIFT, 2
+.elseif FN == 8
+  .set PF_FN_SHIFT, 3
+.else
+  .error "DSWS2_PREFETCH P2: unsupported FN for shift decode"
+.endif
+.if KSEG_STEPS == 1
+  .set PF_KS_SHIFT, 0
+.elseif KSEG_STEPS == 2
+  .set PF_KS_SHIFT, 1
+.elseif KSEG_STEPS == 4
+  .set PF_KS_SHIFT, 2
+.elseif KSEG_STEPS == 8
+  .set PF_KS_SHIFT, 3
+.elseif KSEG_STEPS == 16
+  .set PF_KS_SHIFT, 4
+.else
+  .error "DSWS2_PREFETCH P2: unsupported KSEG_STEPS for shift decode"
+.endif
+.Lflow_prefetch_engine:
+    tnxt_claim_service                            // lean early claim; same service other waves run at feed_empty
+    lds_get s16, TNXT_STATE_OFF
+    s_cmp_eq_u32 s16, TNXT_READY
+    s_cbranch_scc0 .Lflow_pf_not_ready            // EMPTY/CLAIMING/BUSY/TERMINAL -> count idle, yield
+    lds_get s17, TNXT_TILE_OFF                    // t_next (published before READY)
+    s_sub_u32 s18, s11, 1                         // TOTAL-1
+    s_min_u32 s17, s17, s18                       // SAFEPROBE-style tile clamp (brick-proof OOB)
+    s_cmp_eq_u32 s17, s76                         // same tile as last visit?
+    s_cbranch_scc1 .Lflow_pf_same_t
+    s_mov_b32 s76, s17                            // latch new t_next
+    s_mov_b32 s75, 0                              // reset block cursor
+.if DSWS2_PF_COUNTERS
+    s_add_u32 s[PF_TILES], s[PF_TILES], 1         // diagnostic: one tile identity latched
+.endif
+.Lflow_pf_same_t:
+    // max_blocks = min(n_kseg * KSEG_STEPS * FN, PREFETCH_MAX_BLOCKS_PER_TILE)
+    //   n_kseg = s66+1 (COUNT = n_kseg-1). Iterate REAL count only — NO s_min into phantom ksi.
+    s_add_u32 s18, s66, 1
+    s_mul_i32 s18, s18, PREFETCH_BLOCK_STRIDE     // n_kseg * KSEG_STEPS * FN
+    s_min_u32 s18, s18, PREFETCH_MAX_BLOCKS_PER_TILE
+    s_cmp_ge_u32 s75, s18
+    s_cbranch_scc1 .Lflow_pf_idle                 // this t_next fully warmed under the cap
+    // tcol = t_next % NTL via magic-div (DECODE_STI idiom) — once per visit (constant across batches)
+    s_mul_hi_u32 s19, s17, s12                    // mblk = t / NTL
+    s_mul_i32 s20, s19, s13
+    s_sub_u32 s20, s17, s20                       // tcol
+    s_mul_i32 s20, s20, s14                       // tcol * FN*256
+    // P4: up to PREFETCH_BATCHES_PER_VISIT batches per entry while READY. Wait only before each batch
+    //   reuses v16:v23. NO s_sleep on the issue path (P3 slept every batch → READY window expired after
+    //   ~40 batches; idle_not_READY was the cheap path's tax). Sleep only on .Lflow_pf_idle.
+    s_mov_b32 s21, PREFETCH_BATCHES_PER_VISIT
+.Lflow_pf_batch_loop:
+    s_cmp_eq_u32 s21, 0
+    s_cbranch_scc1 .Lflow_pf_batch_done
+    s_cmp_ge_u32 s75, s18
+    s_cbranch_scc1 .Lflow_pf_batch_done
+    s_wait_loadcnt 0x0                            // reuse dest VGPRs (stalls PF engine only)
+    .set pf_i, 0
+    .rept PREFETCH_LINES
+      s_cmp_ge_u32 s75, s18
+      s_cbranch_scc1 .Lflow_pf_batch_done
+      // b -> (ksi, ks, ni): ni = b & (FN-1); tmp = b >> log2(FN); ks = tmp & (KSEG_STEPS-1); ksi = tmp >> log2(KS)
+      s_and_b32 s27, s75, (FN - 1)                // ni
+      s_lshr_b32 s25, s75, PF_FN_SHIFT            // b / FN
+      s_and_b32 s26, s25, (KSEG_STEPS - 1)        // ks
+      s_lshr_b32 s25, s25, PF_KS_SHIFT            // ksi
+      // addr = Bshuf + tcol*FN*256 + (ksi*KSEG_STEPS + ks)*NT*256 + ni*256
+      s_mul_i32 s28, s25, KSEG_STEPS
+      s_add_u32 s28, s28, s26
+      s_mul_hi_u32 s29, s28, s10
+      s_mul_i32 s28, s28, s10
+      s_add_u32 s28, s28, s20
+      s_addc_u32 s29, s29, 0
+      s_mul_i32 s16, s27, 256                     // ni*256 (s16 free scratch here; not s21 = batch countdown)
+      s_add_u32 s28, s28, s16
+      s_addc_u32 s29, s29, 0
+      s_add_u32 s28, s4, s28
+      s_addc_u32 s29, s5, s29
+      global_load_tr_b64 v[16+pf_i*2:17+pf_i*2], v9, s[28:29]
+      s_add_u32 s75, s75, 1
+.if DSWS2_PF_COUNTERS
+      s_add_u32 s[PF_BLOCKS], s[PF_BLOCKS], 1
+.endif
+      .set pf_i, pf_i+1
+    .endr
+    s_sub_u32 s21, s21, 1
+    s_branch .Lflow_pf_batch_loop
+.Lflow_pf_batch_done:
+    deadman_progress                              // issued work -> alive for the watchdog
+    s_branch .Lflow_loop                          // NO sleep — re-enter ASAP while READY may still hold
+.Lflow_pf_not_ready:
+.if DSWS2_PF_COUNTERS
+    // Idle counter s71-throttled 1/64 (diagnostic only; default OFF for P4-CLEAN).
+    s_cmp_lg_u32 s71, 0
+    s_cbranch_scc1 .Lflow_pf_idle
+    s_add_u32 s[PF_IDLE], s[PF_IDLE], 1
+.endif
+.Lflow_pf_idle:
+    s_sleep 1                                     // yield only when nothing to warm
+    s_branch .Lflow_loop                          // never park via feed_empty / never reserve compute
+.endif
 
 .Lflow_retire:
+    gap_retire                                 // GAP: TAIL (or whole-life HEAD if no burst)
+    wtb_retire_close                           // WTBUDGET: close epoch T = now - golive (ACC-dead, lean)
+.if DSWS2_PREFETCH
+    // Drain any outstanding PF-engine loads before teardown. Safe no-op for non-PF waves.
+    //   MUST precede any future s_alloc_vgpr on this path (RETIRE branches here before role-resize).
+    s_wait_loadcnt 0x0
+.endif
 .if STAGGER
     // *** LEAK FIX (2026-07-14): a wave force-retired out of .Lflow_jwait (deadman) or exiting any other
     //   way while FAT still HELD ITS TOKEN. FATTOK lives in per-WG LDS and is never reset, so each leak
@@ -4951,6 +7438,38 @@ occ_kernel:
 .Lflow_notok:
 .endif
     cnt_flush                                  // STAGINSTR: SINGLE emit of this wave's counter totals (ACC dead, wave lean)
+    passtime_flush                             // PASSTIME: emit T0/T1/T2 + unpaired/start/max -> occ[135..143]
+    burstcnt_flush                             // BURSTCNT: emit burst frequency totals -> occ[160..166]
+    wtb_flush                                  // WTBUDGET: emit A/C/D/E/T as u64 (+ counts/ovf) once per wave
+    wtb_live_exit                              // WTBUDGET: measured residency live--
+    gap_flush                                  // GAP: emit inter-burst gap sum (u64) + count
+    pollstage_flush                            // POLLSTAGE: emit one-stage sum (u64) + count + stage id
+.if DSWS2_PREFETCH && DSWS2_PF_COUNTERS
+    // Diagnostic only (DSWS2_PF_COUNTERS=1): PF tiles/blocks/idle + s71 co-tenant mask.
+    //   Default 0 => zero bytes here (P4-CLEAN / shipping coverage path).
+    s_cmp_eq_u32 s24, PF_WID
+    s_cbranch_scc0 .Lflow_pf_cnt_skip
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lflow_pf_cnt_lane
+    cnt_emit PF_TILES,  PF_TILES_OFF
+    cnt_emit PF_BLOCKS, PF_BLOCKS_OFF
+    cnt_emit PF_IDLE,   PF_IDLE_OFF
+    s_wait_storecnt 0x0
+.Lflow_pf_cnt_lane:
+    s_mov_b32 exec_lo, s57
+.Lflow_pf_cnt_skip:
+    s_mov_b32 s57, exec_lo
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz .Lflow_s71mask_skip
+    v_mov_b32 v3, PT_S71_MASK
+    global_atomic_or_b32 v4, v3, s[0:1] offset:PT_S71_GATES_OFF scope:SCOPE_DEV
+    s_wait_storecnt 0x0
+.Lflow_s71mask_skip:
+    s_mov_b32 exec_lo, s57
+.endif
     phase_flush                                // PHASEPROBE: single emit of s78..s83 -> occ[64..69]
     // live-- : lane0 occ[0] -= 1 (harness completion gate)
     v_cmp_eq_u32 vcc_lo, 0, v2
@@ -4966,7 +7485,8 @@ occ_kernel:
 .else
     tfspan max, 12                             // TFPROBE: wall-span end
 .endif
-    alllive_dec
+    alllive_dec                                  // TRACE-gated peak path
+    passtime_live_exit                           // PASSTIME-gated live-- (pairs with passtime_live_enter)
 .if RETBARRIER
     // COUNT-TO-WAVES collective exit: check in, then all s_endpgm TOGETHER once the WG's count hits WAVES.
     //   This coordinated exit is what the EOP needs to register a clean dispatch completion -> fence FIRES
@@ -5015,7 +7535,12 @@ occ_kernel:
                                                //   (RGA-analysis descriptor only -- the PM4 host builds COMPUTE_PGM_RSRC1
                                                //   itself, occ_dispatch.cpp:216, and GFX10+ does not wave-allocate SGPRs.
                                                //   Kept accurate anyway so RGA/static tools report the real high-water.)
-    .amdhsa_group_segment_fixed_size 65536     // FIX 1a ring: D=2 needs 33024B (RGA-analysis descriptor only)
+    // *** DERIVED, NOT HARDCODED (2026-07-26). This read 65536 while the config of record publishes
+    //   13,824B. RGA computes occupancy FROM this number, so it would have reported 1 WG/CU on a
+    //   kernel we actually run at 2 WG/CU -- a 4.7x error in the one figure RGA is most used for.
+    //   LDS_TOTAL_FLOW is the same symbol emitted into .lds_total and read by the host, so the
+    //   descriptor can no longer drift from the bin. ***
+    .amdhsa_group_segment_fixed_size LDS_TOTAL_FLOW
     .amdhsa_user_sgpr_count 15                 // FIX 1(g): v2 contract now s0..s14 only (n_kseg/TOTAL_super/
                                                 //   magic_kseg dropped -- derived in-kernel / memory-carried)
     .amdhsa_wavefront_size32 1
@@ -5028,7 +7553,8 @@ amdhsa.kernels:
     .symbol:          occ_kernel.kd
     .kernarg_segment_size: 60
     .kernarg_segment_align: 8
-    .group_segment_fixed_size: 65536
+    .group_segment_fixed_size: 13824   # config of record (SEGK 64/128/256 all publish this).
+                                      # YAML cannot take LDS_TOTAL_FLOW; rga_check.sh asserts the two agree.
     .private_segment_fixed_size: 0
     .wavefront_size:  32
     .sgpr_count:      72

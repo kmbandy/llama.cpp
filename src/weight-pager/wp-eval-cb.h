@@ -7,7 +7,7 @@
 //   bool (*)(struct ggml_tensor * t, bool ask, void * user_data);
 //
 // Pass &wp::weight_pager_eval_cb to ggml_backend_sched_set_eval_callback,
-// with user_data set to a wp::WeightPager*.
+// with user_data set to a wp::WeightPagerSet*.
 //
 // The callback fires twice per node: once with ask=true before execution
 // (this is when we patch tensor->data and tensor->buffer for paged
@@ -18,9 +18,10 @@ struct ggml_tensor;
 namespace wp {
 
 class WeightPager;
+class WeightPagerSet;
 
 // Free function with the ggml callback signature. user_data must be a
-// WeightPager*; nullptr is treated as "pager not active" and the callback
+// WeightPagerSet*; nullptr is treated as "pager not active" and the callback
 // returns true (no-op).
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 

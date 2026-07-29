@@ -339,6 +339,21 @@ extern "C" {
         bool weight_paging_prefetch;   // enable async prefetch of next layer
         const char * weight_paging_resident_device; // dense-resident device name or "auto"
         const char * weight_paging_ffn_island_device; // device hosting shared experts and FFN island, or "auto"/"off"
+        // Hold whole blocks' routed experts RESIDENT on the FFN-island device instead of paging them.
+        // "off" (default), "auto" (fill free VRAM), a size ("12GiB"), or explicit blocks ("0-6,20-22").
+        const char * weight_paging_resident_experts;
+        // Explicit paged block bands per device, e.g. "ROCm0:0-37;ROCm1:38-74".
+        const char * weight_paging_device_layers;
+
+        // Cross-machine pipeline parallelism: the contiguous layer band
+        // [pipeline_layer_first, pipeline_layer_last] this process owns.
+        // Both -1 (default) means own everything -- the legacy behaviour,
+        // unchanged. When set, only the band's blk.* tensors are loaded,
+        // token_embd only when first == 0 and output_norm/output only when
+        // last == n_layer-1. hparams.n_layer stays global; absolute layer
+        // indices are preserved. See src/llama-pipeline.h.
+        int32_t pipeline_layer_first;
+        int32_t pipeline_layer_last;
     };
 
     struct llama_sampler_seq_config {

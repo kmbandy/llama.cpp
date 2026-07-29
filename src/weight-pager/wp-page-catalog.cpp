@@ -262,6 +262,28 @@ std::vector<int> PageCatalog::pages_for_expert(int block_idx, int expert_idx) co
     return out;
 }
 
+std::map<size_t, int> PageCatalog::page_size_histogram() const {
+    std::map<size_t, int> hist;
+    for (const auto & m : pages_) {
+        if (!m.is_expert)      continue;   // only expert pages can occupy a slot
+        if (m.is_pinned)       continue;   // MAD-236: caller-owned VRAM, no slot
+        if (m.is_consolidated) continue;   // parent metadata; sub-experts slot
+        hist[m.size] += 1;
+    }
+    return hist;
+}
+
+std::map<size_t, std::map<int, int>> PageCatalog::page_size_layer_counts() const {
+    std::map<size_t, std::map<int, int>> out;
+    for (const auto & m : pages_) {
+        if (!m.is_expert)      continue;   // only expert pages can occupy a slot
+        if (m.is_pinned)       continue;   // MAD-236: caller-owned VRAM, no slot
+        if (m.is_consolidated) continue;   // parent metadata; sub-experts slot
+        out[m.size][(int) m.block_idx] += 1;
+    }
+    return out;
+}
+
 void PageCatalog::clear() {
     pages_.clear();
     name_to_idx_.clear();

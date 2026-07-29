@@ -112,6 +112,28 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_hidden::set_input(const llama_ubatch * ubatch) {
+    if (ubatch->token != nullptr || ubatch->embd == nullptr) {
+        throw std::runtime_error(
+            "pipeline: a stage without token_embd must be driven by an embd batch "
+            "(the previous stage's hidden state), not by token ids");
+    }
+
+    GGML_ASSERT(n_embd == hidden->ne[0]);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    ggml_backend_tensor_set(hidden, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(hidden));
+}
+
+bool llm_graph_input_hidden::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= (!params.ubatch.embd) || (hidden && hidden->ne[1] == params.ubatch.n_tokens);
+
+    return res;
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2502,6 +2524,34 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_hidden() const {
+    // Cross-machine pipeline parallelism: a stage whose band does not start
+    // at layer 0 has no token_embd. Its input is the previous stage's hidden
+    // state, supplied as the batch's embd input ([n_embd, n_tokens], F32).
+    // The transport is responsible for getting those floats into
+    // ubatch.embd; here we only build the graph-side input tensor.
+    //
+    // note: graph_reserve() builds with synthetic TOKEN ubatches, so the
+    // graph must build regardless of the batch kind -- the token/embd
+    // distinction is enforced per-decode in llm_graph_input_hidden::set_input.
+    const int64_t n_embd = hparams.n_embd;
+
+    auto inp = std::make_unique<llm_graph_input_hidden>(n_embd);
+
+    inp->hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    cb(inp->hidden, "inp_hidden", -1);
+    ggml_set_input(inp->hidden);
+
+    res->t_inp_embd = inp->hidden;
+
+    res->add_input(std::move(inp));
+
+    // materialize immediately, same as the embedding path
+    ggml_build_forward_expand(gf, inp->hidden);
+
+    return inp->hidden;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

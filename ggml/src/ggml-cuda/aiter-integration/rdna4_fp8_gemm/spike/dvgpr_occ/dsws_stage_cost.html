@@ -1,0 +1,37 @@
+<title>DSWS — Stage Cost by Shape (probe subtracted)</title>
+<style>
+:root{--bg:#ECEDEA;--fg:#1A1D1A;--dim:#7C827C;--rule:#D2D5D1;--zebra:#F5F5F3}
+@media(prefers-color-scheme:dark){:root{--bg:#15171B;--fg:#E3E2DD;--dim:#7A807A;--rule:#2D3136;--zebra:#1B1E22}}
+:root[data-theme="dark"]{--bg:#15171B;--fg:#E3E2DD;--dim:#7A807A;--rule:#2D3136;--zebra:#1B1E22}
+:root[data-theme="light"]{--bg:#ECEDEA;--fg:#1A1D1A;--dim:#7C827C;--rule:#D2D5D1;--zebra:#F5F5F3}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+.w{max-width:820px;margin:0 auto;padding:36px 20px 64px}
+h1{font-size:15px;font-weight:600;margin:0 0 6px}
+p{color:var(--dim);font-size:13px;margin:0 0 4px;max-width:78ch}
+.sc{overflow-x:auto;margin-top:22px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:4px 10px;white-space:nowrap}
+td{text-align:right}
+thead th{text-align:right;border-bottom:1px solid var(--rule);font-weight:600;color:var(--dim);
+ font-size:12px;padding-bottom:6px}
+thead th:first-child{text-align:left}
+tbody th{text-align:left;font-weight:400}
+tbody th span{color:var(--dim);margin-left:8px}
+tbody tr:nth-child(even){background:var(--zebra)}
+tfoot th,tfoot td{border-top:1px solid var(--rule);padding-top:8px;font-weight:600}
+tfoot th{text-align:left}
+</style>
+<div class="w">
+<h1>Per-stage cost by shape, ns per poll pass, instrumentation subtracted</h1>
+<p>Value = that stage&rsquo;s measured mean minus the same shape&rsquo;s stage&nbsp;1. Stage&nbsp;1 brackets
+three ALU instructions, so its measurement is the probe; subtracting it removes the tooling.</p>
+<p>s1 is 0 by construction. s3 and s4 are over-subtracted &mdash; their probe fires 1.12 and 0.23 times
+per pass against 2.0 for s1/s2/s5/s6, so less tooling was added and too much is being taken away.</p>
+<div class="sc"><table>
+<thead><tr><th>shape</th><th>s1</th><th>s2</th><th>s3</th><th>s4</th><th>s5</th><th>s6</th></tr></thead>
+<tbody><tr><th>ml8_dense_attn_kv<span>M512</span></th><td>+0</td><td>+32</td><td>-94</td><td>-291</td><td>+277</td><td>+118</td></tr><tr><th>ml8_dense_attn_kv<span>M2048</span></th><td>+0</td><td>-38</td><td>-34</td><td>-357</td><td>+346</td><td>+199</td></tr><tr><th>ml8_dense_attn_o<span>M512</span></th><td>+0</td><td>+1</td><td>-14</td><td>-312</td><td>+174</td><td>+64</td></tr><tr><th>ml8_dense_attn_o<span>M2048</span></th><td>+0</td><td>+7</td><td>+47</td><td>-268</td><td>+280</td><td>+170</td></tr><tr><th>ml8_dense_attn_q<span>M512</span></th><td>+0</td><td>+17</td><td>+50</td><td>-282</td><td>+409</td><td>+201</td></tr><tr><th>ml8_dense_attn_q<span>M2048</span></th><td>+0</td><td>+15</td><td>+11</td><td>-360</td><td>+423</td><td>+183</td></tr><tr><th>ml8_dense_ffn_down<span>M512</span></th><td>+0</td><td>-5</td><td>+72</td><td>-120</td><td>+225</td><td>+99</td></tr><tr><th>ml8_dense_ffn_down<span>M2048</span></th><td>+0</td><td>-9</td><td>+126</td><td>-21</td><td>+298</td><td>+144</td></tr><tr><th>ml8_dense_ffn_gate_up<span>M512</span></th><td>+0</td><td>-23</td><td>+26</td><td>-346</td><td>+410</td><td>+214</td></tr><tr><th>ml8_dense_ffn_gate_up<span>M2048</span></th><td>+0</td><td>+38</td><td>-55</td><td>-336</td><td>+469</td><td>+238</td></tr><tr><th>ml8_moe_attn_kv<span>M64</span></th><td>+0</td><td>+66</td><td>+202</td><td>-73</td><td>+201</td><td>+224</td></tr><tr><th>ml8_moe_attn_kv<span>M512</span></th><td>+0</td><td>-36</td><td>-118</td><td>-310</td><td>+300</td><td>+85</td></tr><tr><th>ml8_moe_attn_o<span>M64</span></th><td>+0</td><td>+14</td><td>+117</td><td>+20</td><td>+163</td><td>+145</td></tr><tr><th>ml8_moe_attn_o<span>M512</span></th><td>+0</td><td>-16</td><td>-11</td><td>-340</td><td>+195</td><td>+106</td></tr><tr><th>ml8_moe_attn_q<span>M64</span></th><td>+0</td><td>+56</td><td>-139</td><td>-325</td><td>+546</td><td>+236</td></tr><tr><th>ml8_moe_attn_q<span>M512</span></th><td>+0</td><td>-18</td><td>+6</td><td>-374</td><td>+450</td><td>+205</td></tr><tr><th>ml8_moe_ffn_down<span>M64</span></th><td>+0</td><td>-70</td><td>-134</td><td>-280</td><td>+121</td><td>+66</td></tr><tr><th>ml8_moe_ffn_down<span>M512</span></th><td>+0</td><td>+25</td><td>+64</td><td>-363</td><td>+470</td><td>+314</td></tr><tr><th>ml8_moe_ffn_gate_up<span>M64</span></th><td>+0</td><td>-85</td><td>+85</td><td>-134</td><td>+555</td><td>-8</td></tr><tr><th>ml8_moe_ffn_gate_up<span>M512</span></th><td>+0</td><td>+30</td><td>-20</td><td>-276</td><td>+297</td><td>+120</td></tr><tr><th>mlmf_MoE_expert_fc1<span>M512</span></th><td>+0</td><td>+2</td><td>-24</td><td>-447</td><td>+469</td><td>+305</td></tr><tr><th>mlmf_MoE_expert_fc2<span>M512</span></th><td>+0</td><td>-21</td><td>-59</td><td>-379</td><td>+391</td><td>+267</td></tr><tr><th>mlmf_attn_linear_k<span>M4096</span></th><td>+0</td><td>-11</td><td>-74</td><td>-442</td><td>+403</td><td>+331</td></tr><tr><th>mlmf_attn_o_proj<span>M4096</span></th><td>+0</td><td>-142</td><td>-85</td><td>-619</td><td>+474</td><td>+206</td></tr><tr><th>mlmf_lm_head<span>M4096</span></th><td>+0</td><td>-56</td><td>-168</td><td>-615</td><td>+485</td><td>+385</td></tr><tr><th>mlmf_mamba_out_proj<span>M4096</span></th><td>+0</td><td>+12</td><td>-9</td><td>-362</td><td>+575</td><td>+189</td></tr><tr><th>mlmf_router_down_proj<span>M4096</span></th><td>+0</td><td>-12</td><td>-100</td><td>-476</td><td>+411</td><td>+380</td></tr></tbody>
+<tfoot><tr><th>median</th><td>+0</td><td>-5</td><td>-14</td><td>-336</td><td>+403</td><td>+199</td></tr></tfoot>
+</table></div>
+<p style="margin-top:20px">s1 loop head + deadman &middot; s2 snapshot/body-gate &middot; s3 role dispatch
+&middot; s4 feed&rarr;peek gate &middot; s5 peek reservation attempt &middot; s6 park + sleep</p>
+</div>

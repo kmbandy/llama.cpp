@@ -250,8 +250,73 @@ llama_build_and_test(test-paged-decode-oracle.cpp)
 llama_build_and_test(test-weight-pager.cpp)
 target_include_directories(test-weight-pager PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+add_executable(
+    test-wp-repack
+    test-wp-repack.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-repack/wp-repack-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-page-catalog.cpp
+)
+target_include_directories(test-wp-repack PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-repack
+)
+target_link_libraries(test-wp-repack PRIVATE ggml)
+target_compile_features(test-wp-repack PRIVATE cxx_std_17)
+llama_test(test-wp-repack)
+
 llama_build_and_test(test-memory-tier.cpp)
 target_include_directories(test-memory-tier PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-wp-resident-experts.cpp)
+target_include_directories(test-wp-resident-experts PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-wp-multidevice-partition.cpp)
+target_include_directories(test-wp-multidevice-partition PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-wp-size-class-slots.cpp)
+target_include_directories(test-wp-size-class-slots PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# cross-machine pipeline band helpers (pure, no ggml dependency)
+add_executable(
+    test-pipeline-band
+    test-pipeline-band.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-pipeline-band PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(test-pipeline-band PRIVATE cxx_std_17)
+llama_test(test-pipeline-band)
+
+# wp-stage-split round-trip: synthetic GGUF -> stage files -> re-read
+add_executable(
+    test-wp-stage-split
+    test-wp-stage-split.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-stage-split/wp-stage-split-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-wp-stage-split PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-stage-split
+)
+target_link_libraries(test-wp-stage-split PRIVATE ggml)
+target_compile_features(test-wp-stage-split PRIVATE cxx_std_17)
+llama_test(test-wp-stage-split)
+
+# Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model, no
+# sockets: pure buffer encode/decode). Links pipe-transport.cpp only for the
+# frame-IO helpers' symbols; the test never opens a socket.
+add_executable(
+    test-pipe-protocol
+    test-pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-pipe-protocol PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_compile_features(test-pipe-protocol PRIVATE cxx_std_17)
+llama_test(test-pipe-protocol)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

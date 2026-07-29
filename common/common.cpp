@@ -1577,6 +1577,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.weight_paging_prefetch        = params.weight_paging_prefetch;
     mparams.weight_paging_resident_device = params.weight_paging_resident_device.c_str();
     mparams.weight_paging_ffn_island_device = params.weight_paging_ffn_island_device.c_str();
+    mparams.weight_paging_resident_experts = params.weight_paging_resident_experts.c_str();
+    mparams.weight_paging_device_layers = params.weight_paging_device_layers.c_str();
+
+    // cross-machine pipeline band
+    mparams.pipeline_layer_first = params.pipeline_layer_first;
+    mparams.pipeline_layer_last  = params.pipeline_layer_last;
 
     return mparams;
 }

@@ -1,5 +1,6 @@
 #include "wp-eval-cb.h"
 #include "wp-pager.h"
+#include "wp-pager-set.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -25,10 +26,12 @@ extern "C++" void *                ggml_cuda_get_wp_compute_stream(int device);
 #include <cstdlib>       // getenv
 #include <cstring>
 #include <cstdio>
+#include <functional>
 #include <limits>        // numeric_limits — MAD-232 advise sentinel
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <map>
 #include <vector>
 
 namespace wp {
@@ -57,6 +60,23 @@ struct DebugState {
     int  ops_no_paged_with_weight_src = 0;  // ops where eval_cb saw a src whose name has "weight" but find_page missed
 };
 DebugState g_debug;
+
+struct PagerPageKey {
+    WeightPager * pager = nullptr;
+    int           page  = -1;
+
+    bool operator==(const PagerPageKey & other) const {
+        return pager == other.pager && page == other.page;
+    }
+};
+
+struct PagerPageKeyHash {
+    size_t operator()(const PagerPageKey & key) const {
+        const size_t a = std::hash<WeightPager *>{}(key.pager);
+        const size_t b = std::hash<int>{}(key.page);
+        return a ^ (b + (size_t) 0x9e3779b9 + (a << 6) + (a >> 2));
+    }
+};
 
 bool eval_debug_enabled() {
     static const bool enabled = []() {
@@ -187,7 +207,6 @@ struct PendingAsyncOp {
 std::vector<int>            s_pinned_pages_prev_op;
 std::vector<AsyncTransferEvent> s_async_events_prev_op;
 std::vector<PendingAsyncOp> s_pending_async_ops;
-WeightPager *               s_prev_op_pager = nullptr;
 
 // WP_PAGED_BATCH per-range pin lifecycle. Under paged-batch the callback does
 // NOT unpin per-op; pins accumulate in s_range_pins across the current batch
@@ -224,6 +243,7 @@ std::vector<int> s_range_pins;
 std::vector<int> s_range_pins_pending;
 size_t           s_range_pinned_bytes = 0;
 #endif
+WeightPager * s_prev_op_pager = nullptr;
 }  // namespace
 
 void weight_pager_eval_cb_reset(WeightPager * pager) {
@@ -319,14 +339,26 @@ void weight_pager_eval_cb_print_profile() {
         s_prof_calls ? ((double) s_prof_resolve_ns / 1000.0) / (double) s_prof_calls : 0.0);
 }
 
+// Pins this pager contributed for the current op; empty when it contributed none.
+static const std::vector<int> & wp_graph_pins_for(
+        const std::map<WeightPager *, std::vector<int>> & pins, WeightPager * pager) {
+    static const std::vector<int> s_empty;
+    const auto it = pins.find(pager);
+    return it == pins.end() ? s_empty : it->second;
+}
+
 bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // Only act on the pre-execution call. The post-execution call is
     // informational and would re-trigger the same lookups.
     if (t == nullptr)     return true;
-    auto * pager = (WeightPager *) user_data;
-    if (pager == nullptr) return true;
+    auto * pagers = (WeightPagerSet *) user_data;
+    if (pagers == nullptr || pagers->primary() == nullptr) return true;
+    WeightPager * pager = pagers->primary();
 
-    const bool batch_eval_cb = wp_batch_eval_cb_enabled();
+    // The range-pinning batch state is intentionally single-pager. Keep the
+    // established path byte-identical for one pager and use per-op routing for
+    // multi-device catalogs.
+    const bool batch_eval_cb = pagers->size() == 1 && wp_batch_eval_cb_enabled();
     const bool paged_batch   = batch_eval_cb && wp_paged_batch_enabled();
     // WP_PAGED_BATCH: release the previous range's pins now. The top of this
     // callback is guaranteed to run after that range's compute+sync (the
@@ -340,16 +372,19 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     // --- Cross-layer prefetch (WP_PREFETCH_XLAYER), gated OFF by default -----
     // Guarded to HIP/CUDA because this block reaches for the hip*/cuda* side
-    // channel (current_hip_device / ggml_cuda_get_wp_compute_stream) and raw
-    // device copies, which only those backends declare. This is a limitation of
-    // the prefetch side channel, not of weight paging.
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+    // channel (current_hip_device / ggml_cuda_get_wp_compute_stream) for an
+    // async stream readback. That is an OPTIMISATION, not a requirement: the
+    // only backend-specific thing this block needs is a device->host copy of two
+    // small tensors, which ggml_backend_tensor_get provides on every backend.
+    // So the block compiles everywhere and Vulkan devices (RX 480) prefetch too.
+    // Previously HIP-gated (2026-07-11, commit 3e02da766) purely because the raw
+    // hip* symbols broke the build-army compile.
     // At the ffn_gate_inp router MUL_MAT (start of each MoE block): src[0] is
     // the router weight (host-copied once per layer), src[1] is the residual
     // `cur` (== the expert input). Predict layers L+1..L+K's experts from `cur`
     // and speculatively prefetch them while layer L computes. The default path
     // (flag unset) never enters this block, so it stays byte-identical.
-    if ((pager->xlayer_prefetch_enabled() || pager->host_prefetch_enabled()) &&
+    if ((pagers->xlayer_prefetch_enabled() || pagers->host_prefetch_enabled()) &&
         t->op == GGML_OP_MUL_MAT &&
         t->src[0] != nullptr && t->src[1] != nullptr) {
         // CRITICAL-PATH PROFILE. This block runs INLINE in graph execution, per
@@ -408,37 +443,65 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 }
                 return false;
             };
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
             hipStream_t wp_stream =
                 (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
+#endif
             // WP_PREFETCH_XLAYER_NOSYNC: skip the per-layer stream sync to isolate
             // its cost. h may be mid-copy => predictions can be stale, but prefetch
             // never affects decoded output, only recall — safe as a measurement.
+            // Only meaningful on the async stream path; the generic readback is
+            // synchronous by construction.
             static const int s_xl_nosync = [](){ const char* e=std::getenv("WP_PREFETCH_XLAYER_NOSYNC"); return (e&&e[0]=='1')?1:0; }();
-            auto d2h = [&](const void * dptr, size_t nb, std::vector<char> & host) -> bool {
+            (void) s_xl_nosync;
+            // Takes the TENSOR rather than a raw device pointer so the generic
+            // path can go through the backend's buffer interface.
+            auto d2h = [&](const struct ggml_tensor * src_t, std::vector<char> & host) -> bool {
+                if (src_t == nullptr) return false;
+                const size_t nb = ggml_nbytes(src_t);
+                if (nb == 0) return false;
                 host.resize(nb);
-                hipError_t ce;
-                if (wp_stream != nullptr) {
-                    ce = hipMemcpyAsync(host.data(), dptr, nb, hipMemcpyDeviceToHost, wp_stream);
-                    if (ce == hipSuccess && !s_xl_nosync) ce = hipStreamSynchronize(wp_stream);
-                } else if (!s_xl_nosync) {
-                    hipDeviceSynchronize();
-                    ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
-                } else {
-                    ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
+                // Prefer the backend's own buffer interface. On a MIXED-BACKEND box
+                // (build-army is CUDA + Vulkan simultaneously) a compile-time branch
+                // is wrong: it would run cudaMemcpy against a Vulkan tensor's data
+                // pointer. The buffer knows which backend owns it; the raw stream
+                // path below is only for tensors with no buffer at all.
+                if (src_t->buffer != nullptr) {
+                    ggml_backend_tensor_get(src_t, host.data(), 0, nb);
+                    return true;
                 }
-                return ce == hipSuccess;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+                const void * dptr = src_t->data;
+                if (dptr != nullptr) {
+                    hipError_t ce;
+                    if (wp_stream != nullptr) {
+                        ce = hipMemcpyAsync(host.data(), dptr, nb, hipMemcpyDeviceToHost, wp_stream);
+                        if (ce == hipSuccess && !s_xl_nosync) ce = hipStreamSynchronize(wp_stream);
+                    } else if (!s_xl_nosync) {
+                        hipDeviceSynchronize();
+                        ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
+                    } else {
+                        ce = hipMemcpy(host.data(), dptr, nb, hipMemcpyDeviceToHost);
+                    }
+                    return ce == hipSuccess;
+                }
+#endif
+                // No buffer and no HIP/CUDA raw path: decline to predict from this
+                // tensor rather than guess at its memory.
+                return false;
             };
             // 1) capture this layer's router weight once (n_embd x n_expert).
-            if (!pager->predictor_has_router(L)) {
+            if (!pagers->predictors_have_router(L)) {
                 ggml_tensor * w = t->src[0];
                 const int n_embd   = (int) w->ne[0];
                 const int n_expert = (int) w->ne[1];
                 std::vector<char>  hbuf;
                 std::vector<float> wf;
                 if (n_embd > 0 && n_expert > 0 &&
-                    d2h(w->data, ggml_nbytes(w), hbuf) &&
+                    d2h(w, hbuf) &&
                     to_f32(hbuf.data(), w->type, (int64_t) n_embd * n_expert, wf)) {
-                    pager->note_router_weight(L, wf.data(), n_expert, n_embd);
+                    pagers->note_router_weight(
+                        L, wf.data(), n_expert, n_embd);
                 }
             }
             // 2) predict + speculatively prefetch from the residual, per token
@@ -450,27 +513,24 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                 std::vector<char>  hbuf;
                 std::vector<float> hf;
                 if (n_embd > 0 && n_tok > 0 &&
-                    d2h(hh->data, ggml_nbytes(hh), hbuf) &&
+                    d2h(hh, hbuf) &&
                     to_f32(hbuf.data(), hh->type, (int64_t) n_embd * n_tok, hf)) {
                     for (int j = 0; j < n_tok; ++j) {
                         // xlayer stays INLINE: it allocates pool slots and
                         // submits to the PrefetchScheduler, neither of which is
                         // thread-safe. Only the host/RAM path moves off-thread.
-                        pager->submit_xlayer_prefetch(hf.data() + (size_t) j * n_embd, L);
-                        if (pager->host_prefetch_async_enabled()) {
-                            // Copies the row and returns; the GEMV happens on
-                            // the worker. This is the 9.1% coming off the path.
-                            pager->submit_host_prefetch_async(hf.data() + (size_t) j * n_embd,
-                                                              n_embd, L);
-                        } else {
-                            pager->submit_host_prefetch(hf.data() + (size_t) j * n_embd, L);
-                        }
+                        const float * hidden =
+                            hf.data() + (size_t) j * n_embd;
+                        pagers->submit_xlayer_prefetch(hidden, L);
+                        pagers->submit_host_prefetch(
+                            hidden, n_embd, L,
+                            pagers->host_prefetch_async_enabled());
                     }
                 }
             }
         }
     }
-#endif // GGML_USE_HIP — cross-layer prefetch (weight paging is HIP/RDNA-only)
+    // (cross-layer prefetch: backend-generic, HIP/CUDA take an async stream fast path)
     const bool eval_debug = eval_debug_enabled();
     const uint64_t sync_fallbacks_before =
         batch_eval_cb ? pager->sync_fallback_count() : 0;
@@ -596,46 +656,52 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     {
         // MAD-231: drain pins from the PREVIOUS op's pages now that the GPU
         // has had a full eval-cb-cycle of latency to finish reading them.
+        WeightPager * owner =
+            s_prev_op_pager != nullptr ? s_prev_op_pager : pager;
         for (int prev_page : s_pinned_pages_prev_op) {
-            pager->unpin_page(prev_page);
+            owner->unpin_page(prev_page);
         }
         s_pinned_pages_prev_op.clear();
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         s_prev_op_pager = nullptr;
-#endif
     }
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-    auto enqueue_async_wait_for_page = [pager](int page_idx,
-                                               std::vector<AsyncTransferEvent> & prev_events) {
-        if (!pager->async_ensure_enabled()) return;
-        const int evt = pager->take_async_transfer_event(page_idx);
+    auto enqueue_async_wait_for_page = [](WeightPager * owner, int page_idx,
+                                          std::vector<AsyncTransferEvent> & prev_events) {
+        if (!owner->async_ensure_enabled()) return;
+        const int evt = owner->take_async_transfer_event(page_idx);
         if (evt < 0) return;
 
         hipStream_t wp_stream = (hipStream_t) ggml_cuda_get_wp_compute_stream(current_hip_device());
-        if (wp_stream != nullptr && pager->enqueue_async_transfer_wait(evt, wp_stream)) {
+        if (wp_stream != nullptr && owner->enqueue_async_transfer_wait(evt, wp_stream)) {
             prev_events.push_back(AsyncTransferEvent{page_idx, evt});
             return;
         }
 
-        if (!pager->synchronize_async_transfer_event(evt)) {
+        if (!owner->synchronize_async_transfer_event(evt)) {
             LLAMA_LOG_WARN("[wp::eval_cb] async transfer event synchronize failed for page %d\n",
                            page_idx);
         }
-        pager->finish_async_transfer_event(page_idx, evt);
+        owner->finish_async_transfer_event(page_idx, evt);
     };
 #endif
 
-    std::vector<int> graph_pin_page_indices;
-    auto capture_ptr_for_page = [pager, t, &graph_pin_page_indices](int page_idx, void * current) -> void * {
-        if (!pager->hip_graphs_enabled()) {
+    // Page indices are LOCAL to each pager's catalog, so pins must be kept per
+    // owner. Pooling them into one vector and handing it to a single pager pins
+    // the wrong pages on that pager and leaves the other pager's pages
+    // unprotected against eviction while they are still in use.
+    std::map<WeightPager *, std::vector<int>> graph_pins_by_pager;
+    auto capture_ptr_for_page = [t, &graph_pins_by_pager](
+            WeightPager * owner, int page_idx, void * current) -> void * {
+        if (!owner->hip_graphs_enabled()) {
             return current;
         }
-        if (!pager->try_add_graph_pin_page((const void *) t, page_idx, graph_pin_page_indices)) {
+        if (!owner->try_add_graph_pin_page(
+                (const void *) t, page_idx, graph_pins_by_pager[owner])) {
             return current;
         }
-        const int slot = pager->slot_for_page(page_idx);
-        void * base = pager->slot_base_for_capture(slot);
+        const int slot = owner->slot_for_page(page_idx);
+        void * base = owner->slot_base_for_capture(slot);
         return base != nullptr ? base : current;
     };
 
@@ -663,14 +729,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
         if (layer0_fa) {
-            (void) pager->flush_sample_oracle_at_fa();
+            (void) pagers->flush_sample_oracle_at_fa();
             static int s_sticky_spec = -1;
             if (s_sticky_spec < 0) {
                 const char * e = std::getenv("WP_STICKY_SPEC");
                 s_sticky_spec = (e != nullptr && e[0] == '1') ? 1 : 0;
             }
             if (s_sticky_spec == 1) {
-                (void) pager->prefetch_sticky_hot_experts();
+                (void) pagers->prefetch_sticky_hot_experts();
             }
         }
     }
@@ -684,17 +750,20 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     if (t->op == GGML_OP_MUL_MAT_ID) {
         ++g_debug.mmid_ops_seen;
         if (t->src[0] != nullptr) {
-            const int weight_page = pager->find_page(ggml_get_name(t->src[0]));
-            if (weight_page >= 0) {
-                const auto & meta = pager->page_meta(weight_page);
+            const WeightPagerSet::Route weight_route =
+                pagers->find_page(ggml_get_name(t->src[0]));
+            if (weight_route) {
+                WeightPager * weight_pager = weight_route.pager;
+                const int weight_page = weight_route.page_idx;
+                const auto & meta = weight_pager->page_meta(weight_page);
                 if (meta.is_consolidated) {
                     ++g_debug.mmid_consolidated;
 
                     // Count sub-experts of this parent (contiguous insertion
                     // order — see PageCatalog::add_consolidated_experts).
                     int n_subs = 0;
-                    for (int i = weight_page + 1; i < pager->n_pages(); ++i) {
-                        const auto & sub = pager->page_meta(i);
+                    for (int i = weight_page + 1; i < weight_pager->n_pages(); ++i) {
+                        const auto & sub = weight_pager->page_meta(i);
                         if (!sub.is_sub_expert || sub.parent_page_idx != weight_page) {
                             break;
                         }
@@ -940,9 +1009,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         active_pages.push_back(weight_page + 1 + e);
                                     }
                                     // Feed draft-hot history (recent target routing).
-                                    pager->record_active_expert_pages(active_pages);
+                                    weight_pager->record_active_expert_pages(active_pages);
                                     const bool use_ensure_batch =
-                                        (s_ensure_batch_env == 1) || pager->draft_window_active();
+                                        (s_ensure_batch_env == 1) || weight_pager->draft_window_active();
                                     if (use_ensure_batch) {
                                         // Concurrent P2P for actives. On decode-sized
                                         // sets (top-k <= 8) also pull gate/up/down
@@ -1001,20 +1070,25 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                         std::vector<int> batch_pages = active_pages;
                                         if ((int) active.size() <= s_sister_maxk) {
-                                            static std::unordered_map<int, std::vector<int>> s_sister_cache_eb;
-                                            auto sister_it = s_sister_cache_eb.find(weight_page);
+                                            static std::unordered_map<
+                                                PagerPageKey, std::vector<int>,
+                                                PagerPageKeyHash> s_sister_cache_eb;
+                                            const PagerPageKey cache_key{
+                                                weight_pager, weight_page};
+                                            auto sister_it =
+                                                s_sister_cache_eb.find(cache_key);
                                             if (sister_it == s_sister_cache_eb.end()) {
                                                 std::vector<int> sisters;
                                                 const int my_block = meta.block_idx;
-                                                for (int i = 0; i < pager->n_pages(); ++i) {
+                                                for (int i = 0; i < weight_pager->n_pages(); ++i) {
                                                     if (i == weight_page) continue;
-                                                    const auto & p = pager->page_meta(i);
+                                                    const auto & p = weight_pager->page_meta(i);
                                                     if (!p.is_consolidated) continue;
                                                     if (p.block_idx != my_block) continue;
                                                     sisters.push_back(i);
                                                 }
                                                 sister_it = s_sister_cache_eb.emplace(
-                                                    weight_page, std::move(sisters)).first;
+                                                    cache_key, std::move(sisters)).first;
                                             }
                                             const size_t cap = (s_sister_cap > 0)
                                                 ? (size_t) s_sister_cap
@@ -1031,7 +1105,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                         std::vector<void *> batch_ptrs;
                                         std::vector<int>    active_pinned;
-                                        pager->ensure_batch(batch_pages, batch_ptrs, active_pinned);
+                                        weight_pager->ensure_batch(batch_pages, batch_ptrs, active_pinned);
                                         // First |active| ptrs are this weight's experts.
                                         std::size_t ap = 0;
                                         for (int e : active) {
@@ -1039,14 +1113,17 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 (ap < batch_ptrs.size()) ? batch_ptrs[ap] : nullptr;
                                             ++ap;
                                             if (slot != nullptr) {
-                                                slot = capture_ptr_for_page(weight_page + 1 + e, slot);
+                                                slot = capture_ptr_for_page(
+                                                    weight_pager, weight_page + 1 + e, slot);
                                                 host_ptrs[(size_t) e] = slot;
                                                 if (first_active_slot == nullptr) {
                                                     first_active_slot = slot;
                                                 }
                                                 ++n_ensures;
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-                                                enqueue_async_wait_for_page(weight_page + 1 + e, s_async_events_prev_op);
+                                                enqueue_async_wait_for_page(
+                                                    weight_pager, weight_page + 1 + e,
+                                                    s_async_events_prev_op);
 #endif
                                             }
                                         }
@@ -1054,11 +1131,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         // per-op / per-range lifecycle releases them.
                                         for (int p : active_pinned) {
                                             (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(p);
-                                            if (paged_batch) { s_range_pinned_bytes += pager->page_meta(p).size; }
+                                            if (paged_batch) { s_range_pinned_bytes += weight_pager->page_meta(p).size; }
                                         }
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-                                        if (!active_pinned.empty()) { s_prev_op_pager = pager; }
-#endif
+                                        if (!active_pinned.empty()) { s_prev_op_pager = weight_pager; }
                                     } else {
                                     // Pass 1: fire async prefetch for every
                                     // active expert. With io_uring (depth 4),
@@ -1085,7 +1160,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         for (int e : active) {
                                             active_pages.push_back(weight_page + 1 + e);
                                         }
-                                        batch_ok = pager->prefetch_pages_batch(active_pages);
+                                        batch_ok = weight_pager->prefetch_pages_batch(active_pages);
                                     }
                                     if (!batch_ok) {
                                         // Either batch was disabled OR scheduler
@@ -1094,13 +1169,13 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         // effort, ignores individual failures.
                                         for (int e : active) {
                                             const int sub_page_idx = weight_page + 1 + e;
-                                            pager->prefetch_page(sub_page_idx);
+                                            weight_pager->prefetch_page(sub_page_idx);
                                         }
                                     }
                                     // Drive the prefetch state machine forward
                                     // so submitted reads get out the door
                                     // before we start blocking on completions.
-                                    pager->tick();
+                                    weight_pager->tick();
 
                                     // Pass 2: ensure() each, harvesting slot
                                     // pointers. For pages whose prefetch is
@@ -1110,26 +1185,27 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // pages it falls back to sync.
                                     for (int e : active) {
                                         const int sub_page_idx = weight_page + 1 + e;
-                                        void * slot = pager->ensure(sub_page_idx);
+                                        void * slot = weight_pager->ensure(sub_page_idx);
                                         if (slot != nullptr) {
-                                            slot = capture_ptr_for_page(sub_page_idx, slot);
+                                            slot = capture_ptr_for_page(
+                                                weight_pager, sub_page_idx, slot);
                                             host_ptrs[(size_t) e] = slot;
                                             if (first_active_slot == nullptr) {
                                                 first_active_slot = slot;
                                             }
                                             ++n_ensures;
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-                                            enqueue_async_wait_for_page(sub_page_idx, s_async_events_prev_op);
+                                            enqueue_async_wait_for_page(
+                                                weight_pager, sub_page_idx,
+                                                s_async_events_prev_op);
 #endif
                                             // MAD-231: pin the slot so a later prefetch
                                             // alloc_slot in this same eval_cb can't evict
                                             // it. Unpinned in the NEXT eval_cb (above).
-                                            pager->pin_page(sub_page_idx);
+                                            weight_pager->pin_page(sub_page_idx);
                                             (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(sub_page_idx);
-                                            if (paged_batch) { s_range_pinned_bytes += pager->page_meta(sub_page_idx).size; }
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-                                            s_prev_op_pager = pager;
-#endif
+                                            if (paged_batch) { s_range_pinned_bytes += weight_pager->page_meta(sub_page_idx).size; }
+                                            s_prev_op_pager = weight_pager;
                                         }
                                     }
                                     }  // end WP_ENSURE_BATCH else (existing prefetch+ensure path)
@@ -1177,11 +1253,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // expert per layer per token — measured at
                                     // ~100M lines / 200 MB in two minutes, which
                                     // buries the run rather than corrupting it.
-                                    if (pager->is_vulkan())
+                                    if (weight_pager->is_vulkan())
                                     {
                                         const size_t blk = ggml_type_size(t->src[0]->type);
                                         const uintptr_t pool_base =
-                                            (uintptr_t) pager->pool_base();
+                                            (uintptr_t) weight_pager->pool_base();
                                         std::vector<uint32_t> blk_off(host_ptrs.size(), 0);
                                         bool ok = blk != 0;
                                         for (size_t i = 0; ok && i < host_ptrs.size(); ++i) {
@@ -1199,7 +1275,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                         }
                                         if (ok) {
                                             ggml_backend_vk_wp_set_expert_offsets(
-                                                pager->pool_buf(), blk_off.data(),
+                                                weight_pager->pool_buf(), blk_off.data(),
                                                 (int) blk_off.size());
                                             routing_tls_set = true;
                                             if (getenv("GGML_VK_WP_TRACE") != nullptr) {
@@ -1260,7 +1336,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // src0->buffer = nullptr for paged tensors, so without
                                     // this patch we NULL-deref before reaching the
                                     // routing-aware dispatcher gate.
-                                    ggml_backend_buffer_t pool_buf = pager->pool_buf(weight_page);
+                                    ggml_backend_buffer_t pool_buf = weight_pager->pool_buf(weight_page);
                                     if (t->src[0]->buffer == nullptr && pool_buf != nullptr) {
                                         t->src[0]->buffer = pool_buf;
                                     }
@@ -1271,19 +1347,25 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     // their NVMe reads overlap THIS op's compute
                                     // (ensure_batch waits only for this weight).
                                     // Sister discovery O(catalog) once per parent.
-                                    static std::unordered_map<int, std::vector<int>> s_sister_cache;
-                                    auto sister_it = s_sister_cache.find(weight_page);
+                                    static std::unordered_map<
+                                        PagerPageKey, std::vector<int>,
+                                        PagerPageKeyHash> s_sister_cache;
+                                    const PagerPageKey sister_cache_key{
+                                        weight_pager, weight_page};
+                                    auto sister_it =
+                                        s_sister_cache.find(sister_cache_key);
                                     if (sister_it == s_sister_cache.end()) {
                                         std::vector<int> sisters;
                                         const int my_block = meta.block_idx;
-                                        for (int i = 0; i < pager->n_pages(); ++i) {
+                                        for (int i = 0; i < weight_pager->n_pages(); ++i) {
                                             if (i == weight_page) continue;
-                                            const auto & p = pager->page_meta(i);
+                                            const auto & p = weight_pager->page_meta(i);
                                             if (!p.is_consolidated) continue;
                                             if (p.block_idx != my_block) continue;
                                             sisters.push_back(i);
                                         }
-                                        sister_it = s_sister_cache.emplace(weight_page, std::move(sisters)).first;
+                                        sister_it = s_sister_cache.emplace(
+                                            sister_cache_key, std::move(sisters)).first;
                                     }
                                     if (!sister_it->second.empty() && !active.empty()) {
                                         std::vector<int> sister_pages;
@@ -1295,14 +1377,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                             }
                                         }
                                         if (!sister_pages.empty()) {
-                                            if (!pager->prefetch_pages_batch(sister_pages)) {
+                                            if (!weight_pager->prefetch_pages_batch(sister_pages)) {
                                                 for (int sp : sister_pages) {
-                                                    pager->prefetch_page(sp);
+                                                    weight_pager->prefetch_page(sp);
                                                 }
                                             }
                                             // Push SQEs before we return so I/O is
                                             // in flight under the MoE kernel.
-                                            pager->tick();
+                                            weight_pager->tick();
                                         }
                                     }
 
@@ -1339,20 +1421,29 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                     if (s_next_k > 0) {
                                         // Cache: weight_page -> vector of consolidated parent
                                         // indices for blocks [my_block+1, my_block+s_next_k].
-                                        static std::unordered_map<int, std::vector<int>> s_next_layer_parents_cache;
-                                        auto next_it = s_next_layer_parents_cache.find(weight_page);
+                                        static std::unordered_map<
+                                            PagerPageKey, std::vector<int>,
+                                            PagerPageKeyHash>
+                                            s_next_layer_parents_cache;
+                                        const PagerPageKey next_cache_key{
+                                            weight_pager, weight_page};
+                                        auto next_it =
+                                            s_next_layer_parents_cache.find(
+                                                next_cache_key);
                                         if (next_it == s_next_layer_parents_cache.end()) {
                                             std::vector<int> next_parents;
                                             const int my_block = meta.block_idx;
-                                            for (int i = 0; i < pager->n_pages(); ++i) {
-                                                const auto & p = pager->page_meta(i);
+                                            for (int i = 0; i < weight_pager->n_pages(); ++i) {
+                                                const auto & p = weight_pager->page_meta(i);
                                                 if (!p.is_consolidated) continue;
                                                 if (p.block_idx <= my_block) continue;
                                                 if (p.block_idx >  my_block + s_next_k) continue;
                                                 next_parents.push_back(i);
                                             }
-                                            next_it = s_next_layer_parents_cache.emplace(
-                                                weight_page, std::move(next_parents)).first;
+                                            next_it =
+                                                s_next_layer_parents_cache.emplace(
+                                                    next_cache_key,
+                                                    std::move(next_parents)).first;
                                         }
 
                                         // Build a single batched prefetch covering every
@@ -1371,15 +1462,15 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                                                 }
                                             }
                                             if (!future_pages.empty()) {
-                                                pager->mark_cross_layer_prefetch_candidates(future_pages);
-                                                const bool batch_ok = pager->prefetch_pages_batch(future_pages);
+                                                weight_pager->mark_cross_layer_prefetch_candidates(future_pages);
+                                                const bool batch_ok = weight_pager->prefetch_pages_batch(future_pages);
                                                 if (!batch_ok) {
                                                     // Per-page fallback (best-effort, ignores
                                                     // individual failures — eviction will sort
                                                     // it out and ensure() on the next layer
                                                     // falls back to sync if nothing landed).
                                                     for (int fp : future_pages) {
-                                                        pager->prefetch_page(fp);
+                                                        weight_pager->prefetch_page(fp);
                                                     }
                                                 }
                                                 if (g_debug.mmid_consolidated <= 4) {
@@ -1413,6 +1504,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     // address), so we MUST overwrite their data before the op runs — bug
     // B-P1 in docs/dev/memory-tier-bug-catalog.md.
     int  page_indices[GGML_MAX_SRC];
+    WeightPager * page_pagers[GGML_MAX_SRC];
     int  n_page_indices = 0;
     int  highest_page   = -1;
 
@@ -1430,16 +1522,19 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         const uintptr_t data_addr = (uintptr_t) src->data;
         if (data_addr != 0 && data_addr < 0x10000000ULL) {
             const char * vsrc_name = src->view_src ? ggml_get_name(src->view_src) : "(none)";
-            int psrc_page  = pager->find_page(ggml_get_name(src));
-            int psrc_vpage = src->view_src ? pager->find_page(vsrc_name) : -1;
+            const WeightPagerSet::Route psrc =
+                pagers->find_page(ggml_get_name(src));
+            const WeightPagerSet::Route psrc_v =
+                src->view_src ? pagers->find_page(vsrc_name)
+                              : WeightPagerSet::Route{};
             LLAMA_LOG_WARN("[wp::eval_cb][LOW_ADDR_DATA] op=%s op_name=\"%s\" src[%d]=\"%s\" "
                            "data=0x%lx view_offs=%zu view_src=\"%s\" "
                            "src_page=%d view_src_page=%d (consolidated? src=%d vsrc=%d)\n",
                            ggml_op_name(t->op), ggml_get_name(t), i, ggml_get_name(src),
                            (unsigned long) data_addr, src->view_offs, vsrc_name,
-                           psrc_page, psrc_vpage,
-                           (psrc_page  >= 0 ? (int) pager->page_meta(psrc_page).is_consolidated  : -1),
-                           (psrc_vpage >= 0 ? (int) pager->page_meta(psrc_vpage).is_consolidated : -1));
+                           psrc.page_idx, psrc_v.page_idx,
+                           (psrc ? (int) psrc.pager->page_meta(psrc.page_idx).is_consolidated : -1),
+                           (psrc_v ? (int) psrc_v.pager->page_meta(psrc_v.page_idx).is_consolidated : -1));
             std::fflush(stderr);
         }
     }
@@ -1448,11 +1543,14 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         struct ggml_tensor * src = t->src[i];
         if (src == nullptr) break;
 
-        int page_idx = pager->find_page(ggml_get_name(src));
-        if (page_idx < 0 && src->view_src != nullptr) {
-            page_idx = pager->find_page(ggml_get_name(src->view_src));
+        WeightPagerSet::Route route =
+            pagers->find_page(ggml_get_name(src));
+        if (!route && src->view_src != nullptr) {
+            route = pagers->find_page(ggml_get_name(src->view_src));
         }
-        if (page_idx < 0) continue;
+        if (!route) continue;
+        WeightPager * owner = route.pager;
+        const int page_idx = route.page_idx;
 
         // MAD-88: skip consolidated MoE parents in the standard ensure()
         // path. The parent is metadata-only (no slot allocated, full
@@ -1463,7 +1561,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         // itself), the kernel reads from src->data which still points
         // at the placeholder. That's a known limitation; if it bites a
         // real model we'd need to ensure ALL sub-experts for that op.
-        if (pager->page_meta(page_idx).is_consolidated) {
+        if (owner->page_meta(page_idx).is_consolidated) {
             continue;
         }
 
@@ -1471,11 +1569,17 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         // same page; we only need to ensure() once.
         bool already = false;
         for (int j = 0; j < n_page_indices; ++j) {
-            if (page_indices[j] == page_idx) { already = true; break; }
+            if (page_pagers[j] == owner && page_indices[j] == page_idx) {
+                already = true;
+                break;
+            }
         }
         if (!already) {
+            page_pagers[n_page_indices] = owner;
             page_indices[n_page_indices++] = page_idx;
-            if (page_idx > highest_page) highest_page = page_idx;
+            if (pagers->size() == 1 && page_idx > highest_page) {
+                highest_page = page_idx;
+            }
         }
     }
 
@@ -1484,8 +1588,11 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     ++g_debug.ops_seen;
     if (n_page_indices == 0) {
-        if (pager->hip_graphs_enabled()) {
-            pager->update_graph_pins((const void *) t, graph_pin_page_indices);
+        for (wp::WeightPagerSet::Entry & entry : pagers->entries()) {
+            if (entry.pager->hip_graphs_enabled()) {
+                entry.pager->update_graph_pins(
+                    (const void *) t, wp_graph_pins_for(graph_pins_by_pager, entry.pager.get()));
+            }
         }
         if (eval_debug) {
             // Diagnostic: did any src look like a weight tensor that we should have found?
@@ -1558,7 +1665,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         if (s_advise_k > 0) {
             int min_block = std::numeric_limits<int>::max();
             for (int j = 0; j < n_page_indices; ++j) {
-                const int b = pager->page_meta(page_indices[j]).block_idx;
+                const int b =
+                    page_pagers[j]->page_meta(page_indices[j]).block_idx;
                 if (b >= 0 && b < min_block) min_block = b;
             }
             if (min_block != std::numeric_limits<int>::max()) {
@@ -1567,7 +1675,8 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                     s_last_advised_block = -1;
                 }
                 if (min_block > s_last_advised_block) {
-                    pager->advise_layer_lookahead(min_block, s_advise_k);
+                    pagers->pager_for_block(min_block)->advise_layer_lookahead(
+                        min_block, s_advise_k);
                     s_last_advised_block = min_block;
                 }
             }
@@ -1581,8 +1690,9 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
     const std::uint64_t ens_t0 = wp_profile ? wp_now_ns() : 0;
     for (int j = 0; j < n_page_indices; ++j) {
+        WeightPager * owner = page_pagers[j];
         const int    page_idx = page_indices[j];
-        void       * vram     = pager->ensure(page_idx);
+        void       * vram     = owner->ensure(page_idx);
         if (vram == nullptr) {
             ++g_debug.ensures_failed;
             // ensure() logs the failure; we can't make progress on this op.
@@ -1592,20 +1702,21 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             // keeps debugging signal local to the failing op.
             continue;
         }
-        vram = capture_ptr_for_page(page_idx, vram);
+        vram = capture_ptr_for_page(owner, page_idx, vram);
         // MAD-231: pin the slot so a subsequent prefetch alloc_slot in
         // tick() (or in a later op's pre-cb) cannot evict it while the
         // GPU is still reading from it. Unpinned at the top of the NEXT
         // eval_cb invocation.
-        pager->pin_page(page_idx);
+        owner->pin_page(page_idx);
         (paged_batch ? s_range_pins : s_pinned_pages_prev_op).push_back(page_idx);
-        if (paged_batch) { s_range_pinned_bytes += pager->page_meta(page_idx).size; }
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-        s_prev_op_pager = pager;
-#endif
+        if (paged_batch) { s_range_pinned_bytes += owner->page_meta(page_idx).size; }
+        if (s_prev_op_pager != nullptr && s_prev_op_pager != owner) {
+            GGML_ABORT("wp::eval_cb op spans multiple paging devices");
+        }
+        s_prev_op_pager = owner;
 
-        const std::string & page_name = pager->page_meta(page_idx).tensor_name;
-        ggml_backend_buffer_t pool_buf = pager->pool_buf(page_idx);
+        const std::string & page_name = owner->page_meta(page_idx).tensor_name;
+        ggml_backend_buffer_t pool_buf = owner->pool_buf(page_idx);
 
         // Patch every src whose direct name OR view_src's name matches
         // this page.
@@ -1630,7 +1741,7 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             }
         }
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-        enqueue_async_wait_for_page(page_idx, s_async_events_prev_op);
+        enqueue_async_wait_for_page(owner, page_idx, s_async_events_prev_op);
 #endif
     }
     if (wp_profile) {
@@ -1651,8 +1762,15 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
                        DebugState::kVerboseLimit);
     }
 
-    if (pager->hip_graphs_enabled()) {
-        pager->update_graph_pins((const void *) t, graph_pin_page_indices);
+    WeightPager * op_pager = page_pagers[0];
+    // Every pager gets ITS OWN pin list (empty if it contributed none), so a
+    // pager that pinned pages for this op is never skipped and none is handed
+    // another pager's local indices.
+    for (wp::WeightPagerSet::Entry & entry : pagers->entries()) {
+        if (entry.pager->hip_graphs_enabled()) {
+            entry.pager->update_graph_pins(
+                (const void *) t, wp_graph_pins_for(graph_pins_by_pager, entry.pager.get()));
+        }
     }
 
     // Step 3: drive the prefetch pipeline forward.
@@ -1663,29 +1781,33 @@ bool weight_pager_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
             s_dense_prefetch_n = env ? std::atoi(env) : 0;
             if (s_dense_prefetch_n < 0) s_dense_prefetch_n = 0;
         }
-        if (s_dense_prefetch_n > 0 && pager->async_prefetch_enabled()) {
+        if (pagers->size() == 1 && s_dense_prefetch_n > 0 &&
+            op_pager->async_prefetch_enabled()) {
             std::vector<int> future_pages;
             future_pages.reserve((size_t) s_dense_prefetch_n);
             for (int page_idx = highest_page + 1;
-                 page_idx < pager->n_pages() && (int) future_pages.size() < s_dense_prefetch_n;
+                 page_idx < op_pager->n_pages() && (int) future_pages.size() < s_dense_prefetch_n;
                  ++page_idx) {
-                const auto & meta = pager->page_meta(page_idx);
+                const auto & meta = op_pager->page_meta(page_idx);
                 if (meta.is_pinned || meta.is_consolidated || meta.is_expert || meta.is_sub_expert) {
                     continue;
                 }
                 future_pages.push_back(page_idx);
             }
             if (!future_pages.empty()) {
-                const bool batch_ok = pager->prefetch_pages_batch(future_pages, /*count_dense_prefetch=*/true);
+                const bool batch_ok = op_pager->prefetch_pages_batch(
+                    future_pages, /*count_dense_prefetch=*/true);
                 if (!batch_ok) {
                     for (int fp : future_pages) {
-                        pager->prefetch_page(fp, /*count_dense_prefetch=*/true);
+                        op_pager->prefetch_page(fp, /*count_dense_prefetch=*/true);
                     }
                 }
             }
         }
     }
-    pager->tick();
+    // Tick ALL pagers: the idle device is the one with spare capacity to
+    // prefetch, and it is never the owner of the current op.
+    pagers->tick_all();
 
     return eval_cb_op_return();
 }

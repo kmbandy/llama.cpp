@@ -1,0 +1,78 @@
+DSWS real-shape log validation
+inputs=33 pass=30 fail=0 other=3
+
+status real/pad M       N      K  reps spread% padded_TF real_TF provenance / reason
+------ ---------- ------- ------ ----- ------- --------- ------- -------------------
+PASS   2048/2048    9216   2560    10     2.2  1.874267 1.874267 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_ffn_gate_up_M2048_175942.log
+PASS    512/512     9216   2560    31     4.8  1.355037 1.355037 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_ffn_gate_up_M512_180028.log
+PASS   2048/2048    2560   9216    28     9.9  4.351387 4.351387 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_ffn_down_M2048_180057.log
+PASS    512/512     2560   9216    99    11.8  2.493381 2.493381 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_ffn_down_M512_180136.log
+PASS   2048/2048    4096   2560    29     3.0  2.195010 2.195010 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_q_M2048_180159.log
+PASS    512/512     4096   2560   102     6.3  1.187653 1.187653 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_q_M512_180228.log
+PASS   2048/2048    1024   2560   102     7.0  1.172573 1.172573 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_kv_M2048_180248.log
+PASS    512/512     1024   2560   121     6.5  0.377000 0.377000 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_kv_M512_180308.log
+PASS   2048/2048    2560   4096    30     2.9  2.210073 2.210073 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_o_M2048_180327.log
+PASS    512/512     2560   4096    93     4.1  1.010448 1.010448 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_dense_attn_o_M512_180357.log
+PASS     64/128      512   2048   122    13.1  0.037636 0.018818 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_ffn_gate_up_M64_180423.log
+PASS    512/512      512   2048   121    21.5  0.148207 0.148207 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_ffn_gate_up_M512_180443.log
+PASS     64/128     2048    512   132    14.3  0.043531 0.021765 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_ffn_down_M64_180503.log
+PASS    512/512     2048    512   130     7.2  0.173947 0.173947 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_ffn_down_M512_180522.log
+PASS     64/128     4096   2048   119     9.7  0.290364 0.145182 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_q_M64_180541.log
+PASS    512/512     4096   2048   102     5.2  0.947087 0.947087 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_q_M512_180601.log
+PASS     64/128      512   2048   127     8.3  0.040026 0.020013 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_kv_M64_180622.log
+PASS    512/512      512   2048   126     6.7  0.160704 0.160704 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_kv_M512_180642.log
+PASS     64/128     2048   4096   121    15.7  0.295799 0.147900 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_o_M64_180701.log
+PASS    512/512     2048   4096   104    13.9  0.941061 0.941061 /home/kmbandy/dsws_gpu_logs/funneloff_ml8_moe_attn_o_M512_180721.log
+PASS   4096/4096    4224    768    10     1.7  0.639506 0.635873 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_mamba_in_proj_M4096_180743.log
+PASS   4096/4096    4224    768    10     1.3  0.656361 0.653874 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_in_proj_ML8PAD_M4096_180810.log
+PASS    512/512     1536    768   124    13.4  0.177156 0.177156 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_MoE_expert_fc1_M512_180838.log
+PASS    512/512      768   1536   123    11.2  0.173565 0.173565 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_MoE_expert_fc2_M512_180858.log
+PASS   4096/4096   32000    768     2     0.1  0.725912 0.725912 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_lm_head_M4096_180917.log
+PASS   4096/4096     768   1536   100     5.6  1.056025 1.056025 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_mamba_out_proj_M4096_181036.log
+PASS   4096/4096     768    768   107     5.0  0.591222 0.591222 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_attn_o_proj_M4096_181058.log
+PASS   4096/4096     256    768   124     5.4  0.239999 0.239999 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_router_down_proj_M4096_181119.log
+UNSUPPORTED          -       -      -     -       -         -       - - :: UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128
+PASS   4096/4096     192    768   128    25.6  0.190075 0.190075 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_attn_linear_k_M4096_181138.log
+PASS   4096/4096     128    768   133    12.5  0.133296 0.099972 /home/kmbandy/dsws_gpu_logs/funneloff_mlmf_attn_val_proj1_M4096_181157.log
+UNSUPPORTED          -       -      -     -       -         -       - - :: UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128
+UNSUPPORTED          -       -      -     -       -         -       - - :: UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128
+
+TF columns are emitted only for PASS records. Every TF row names its exact source log.
+real_TF = padded_TF * real_M / padded_M. spread=n/a means reps=1.
+
+Recovered real-shape inventory (live config: M tile=96, N tile=64, SEGK=256)
+live_status label                       real/pad M       N      K reason / passing archived logs
+----------- --------------------------- ---------- ------- ------ ------------------------------
+SUPPORTED   ml8_dense_ffn_gate_up       2048/2048    9216   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_ffn_gate_up        512/512     9216   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_ffn_down          2048/2048    2560   9216 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_ffn_down           512/512     2560   9216 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_q            2048/2048    4096   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_q             512/512     4096   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_kv           2048/2048    1024   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_kv            512/512     1024   2560 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_o            2048/2048    2560   4096 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_dense_attn_o             512/512     2560   4096 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_ffn_gate_up           64/128      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_ffn_gate_up          512/512      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_ffn_down              64/128     2048    512 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_ffn_down             512/512     2048    512 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_q                64/128     4096   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_q               512/512     4096   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_kv               64/128      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_kv              512/512      512   2048 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_o                64/128     2048   4096 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   ml8_moe_attn_o               512/512     2048   4096 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_mamba_in_proj          4096/4096    4200    768 NO_ACCEPTED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_in_proj_ML8PAD         4096/4096    4208    768 NO_ACCEPTED_LOG; passing_archived_logs=0
+SUPPORTED   mlmf_MoE_expert_fc1          512/512     1536    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_MoE_expert_fc2          512/512      768   1536 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_lm_head                4096/4096   32000    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_mamba_out_proj         4096/4096     768   1536 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_attn_o_proj            4096/4096     768    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_router_down_proj       4096/4096     256    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+UNSUPPORTED mlmf_router_MLP             4096/4096     256    256 n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128
+SUPPORTED   mlmf_attn_linear_k          4096/4096     192    768 PASS_LOG_AVAILABLE; passing_archived_logs=1
+SUPPORTED   mlmf_attn_val_proj1         4096/4096      96    768 NO_ACCEPTED_LOG; passing_archived_logs=0
+UNSUPPORTED mlmf_router_out             4096/4096       8    256 n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128
+UNSUPPORTED mlmf_routerout_ML8PAD       4096/4096      16    256 n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128

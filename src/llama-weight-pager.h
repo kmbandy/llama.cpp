@@ -76,6 +76,9 @@ struct llama_weight_pager {
     // (they're skipped by the allocator on purpose). Read by the new
     // wp::WeightPager init path to enforce the single-device guard (B-P7).
     std::vector<struct ggml_backend_buffer_type *> weight_bufts;
+    // Parallel to weight_tensor_ptrs: the actual ctx buffer type selected for
+    // each paged tensor. t->buffer is intentionally null before pager init.
+    std::vector<struct ggml_backend_buffer_type *> weight_tensor_bufts;
     uint64_t                 tick = 0;
 
 #ifdef LLAMA_HAVE_IO_URING
