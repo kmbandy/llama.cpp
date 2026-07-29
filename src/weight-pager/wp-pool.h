@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -67,11 +68,22 @@ public:
     // Q6_K) or it cannot be expressed as a block index at all. The buffer-type
     // alignment alone (256 on Vulkan) is not a multiple of that. Harmless
     // elsewhere: CUDA/HIP pass raw byte pointers and pass 1 here.
+    //
+    // MAD-420 — size-class pre-carving. When WP_SIZE_CLASS_SLOTS=1 AND
+    // `page_size_hist` is non-null, the arena is pre-carved into per-class
+    // slots UP FRONT from the histogram (see carve_size_classes_). The on-
+    // demand high_water_ carve path is disabled in that mode, so the class
+    // mix is fixed by the model metadata rather than by first-come demand
+    // (which wedged on GLM: the arena filled with small slots and a later
+    // large page had no adequate class to take or evict). When the env is
+    // set but no histogram is supplied, the legacy on-demand carve path is
+    // retained (used by unit tests that exercise dynamic carving).
     bool init(ggml_backend_buffer_type_t buft,
               int                        n_slots,
               size_t                     slot_size,
               int                        device_idx      = -1,
-              size_t                     extra_alignment = 1);
+              size_t                     extra_alignment = 1,
+              const std::map<size_t, int> * page_size_hist = nullptr);
 
     // Register the eviction callback. Optional; default is a no-op.
     void set_eviction_callback(EvictionCallback cb) { on_evict_ = std::move(cb); }
@@ -205,6 +217,11 @@ public:
     size_t pool_size() const { return arena_size_; }
     void * pool_base() const { return base_; }
     bool   size_class_slots_enabled() const { return size_class_slots_; }
+    // MAD-420 — true when the arena was pre-carved into per-class slots at
+    // init. When true, alloc_slot_size_class_ never carves (no high_water_
+    // bump); it only takes a free slot of the requested class or evicts LRU
+    // within/above that class.
+    bool   size_class_precarved() const { return precarved_; }
 
     // Inspect LRU state for tests / metrics.
     int lru_slot() const;
@@ -217,6 +234,7 @@ private:
     size_t                arena_size_ = 0;
     size_t                slot_alignment_ = 1;
     bool                  size_class_slots_ = false;
+    bool                  precarved_        = false;  // MAD-420: arena pre-carved per class
     size_t                high_water_ = 0;
     uint64_t              tick_      = 0;
 
@@ -225,6 +243,10 @@ private:
     std::vector<size_t>   slot_offset_;
     std::vector<size_t>   slot_bytes_;
     std::vector<size_t>   slot_class_;
+    // MAD-420 — pre-carve plan: (class stride bytes, slot count), sorted by
+    // class ascending. Populated by carve_size_classes_ for logging and
+    // inspection. Empty when not pre-carved.
+    std::vector<std::pair<size_t, int>> slot_class_table_;
     std::unordered_map<size_t, std::vector<int>> free_by_class_;
     // Per-slot pin refcount (MAD-231). Slots with pin_count_>0 are skipped
     // by alloc_slot's LRU walk. uint16_t allows 65k simultaneous pins per
@@ -254,6 +276,12 @@ private:
                                    int & n_hot_skipped) const;
     size_t size_class_for_(size_t requested_size) const;
     void   decay_after_eviction_();
+    // MAD-420 — pre-carve the arena into per-class slots from the catalog
+    // histogram. Populates slot_offset_/slot_bytes_/slot_class_ and
+    // free_by_class_ contiguously, sets n_slots_, and marks precarved_=true.
+    // Returns false if the histogram is empty (caller should fall back to
+    // the legacy on-demand carve path).
+    bool   carve_size_classes_(const std::map<size_t, int> & hist);
 };
 
 // ---------------------------------------------------------------------------

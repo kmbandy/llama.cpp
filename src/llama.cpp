@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstdlib>  // strtol
+#include <map>     // MAD-420: page_size_histogram for size-class auto-sizing
 
 #if defined(GGML_USE_CUDA) && defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
@@ -270,7 +271,43 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
                 const size_t reserve = 3ULL * 1024 * 1024 * 1024;
                 const size_t usable = free_vram > reserve ? free_vram - reserve : 0;
                 const size_t stride = entry.pager->max_page_size();
-                const int fit = stride > 0 ? (int) (usable / stride) : 0;
+                // MAD-420 — when size-class slots are enabled, size the pool
+                //   by the AVERAGE page size, not the max. The uniform
+                //   assumption (usable / max_page_size) under-provisions by
+                //   the waste factor on models whose expert sub-pages are
+                //   strongly non-uniform (GLM-5.2 UD-Q2_K_XL: 97% of pages
+                //   are 3.469/4.594 MiB but max is 6.375 MiB, so uniform
+                //   counts 0.61x the slots that actually fit). Using the
+                //   histogram's average sizes the arena budget to hold
+                //   min(n_pages, usable/avg) pages, which is what the pre-
+                //   carve solver then packs. --weight-paging-slots override
+                //   is left alone (handled by the branch guard above).
+                const char * sc_env = std::getenv("WP_SIZE_CLASS_SLOTS");
+                const bool sc_on = (sc_env != nullptr && sc_env[0] == '1' && sc_env[1] == '\0');
+                int fit = stride > 0 ? (int) (usable / stride) : 0;
+                if (sc_on && stride > 0) {
+                    std::map<size_t, int> hist = entry.pager->page_size_histogram();
+                    long long total_pages = 0;
+                    long long weighted    = 0;
+                    for (const auto & kv : hist) {
+                        total_pages += kv.second;
+                        weighted    += (long long) kv.second * (long long) kv.first;
+                    }
+                    if (total_pages > 0 && weighted > 0) {
+                        const double avg = (double) weighted / (double) total_pages;
+                        // Budget needed to hold every page with size classes:
+                        //   n_pages * avg. If that fits in usable, allocate
+                        //   exactly that (no paging). Otherwise cap at usable
+                        //   and let the pre-carve solver pack K = usable/avg.
+                        const double need_all = (double) total_pages * avg;
+                        const size_t budget = (need_all <= (double) usable)
+                                              ? (size_t) need_all : usable;
+                        const int fit_sc = (int) (budget / stride);
+                        if (fit_sc >= 1) {
+                            fit = fit_sc;
+                        }
+                    }
+                }
                 if (fit >= 1) {
                     n_slots = std::min(n_slots, fit);
                 }

@@ -441,6 +441,10 @@ public:
     int    n_pages()                            const { return catalog_.size(); }
     int    catalog_n_expert_pages()             const { return catalog_.n_expert_pages(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }
+    // MAD-420 — page-size histogram of slottable expert pages, for the
+    // auto-sizer in llama.cpp to size the pool by average page size instead
+    // of max page size. See PageCatalog::page_size_histogram.
+    std::map<size_t, int> page_size_histogram() const { return catalog_.page_size_histogram(); }
     ggml_backend_buffer_type_t page_buft(int page_idx) const {
         return page_idx >= 0 && page_idx < (int) page_buft_.size()
             ? page_buft_[(size_t) page_idx] : nullptr;

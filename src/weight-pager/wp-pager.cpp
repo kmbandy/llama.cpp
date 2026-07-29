@@ -1102,7 +1102,17 @@ bool WeightPager::init(const Config &             cfg,
                        cfg_.block_alignment);
     }
 
-    if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx, cfg_.block_alignment)) {
+    // MAD-420 — feed the catalog's page-size histogram to the pool so the
+    // arena is pre-carved per class up front. Only meaningful when size
+    // classes are enabled (WP_SIZE_CLASS_SLOTS=1); when the env is unset the
+    // pool ignores the histogram and takes the uniform fixed-slot path. An
+    // empty histogram (dense model, no slottable expert pages) makes the
+    // pool fall back to on-demand carving, which is harmless because there
+    // are no expert pages to page anyway.
+    const std::map<size_t, int> page_size_hist = catalog_.page_size_histogram();
+
+    if (!pool_.init(device_buft, cfg_.n_slots, slot_size, device_idx,
+                    cfg_.block_alignment, &page_size_hist)) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: pool allocation failed\n");
         restore_disable_graphs_env_();
         return false;

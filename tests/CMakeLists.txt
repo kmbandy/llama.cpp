@@ -273,6 +273,9 @@ target_include_directories(test-wp-resident-experts PRIVATE ${CMAKE_SOURCE_DIR}/
 llama_build_and_test(test-wp-multidevice-partition.cpp)
 target_include_directories(test-wp-multidevice-partition PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+llama_build_and_test(test-wp-size-class-slots.cpp)
+target_include_directories(test-wp-size-class-slots PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # cross-machine pipeline band helpers (pure, no ggml dependency)
 add_executable(
     test-pipeline-band

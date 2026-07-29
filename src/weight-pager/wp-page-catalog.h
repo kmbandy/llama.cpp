@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -112,6 +113,25 @@ public:
     // Maximum payload size across all pages — used by PoolAllocator to size
     // its slot stride.
     size_t max_page_size() const { return max_size_; }
+
+    // MAD-420 — page-size histogram for size-class slot pre-carving.
+    //
+    // Returns size-in-bytes -> number-of-pages for the SLOTTABLE set only:
+    // pages that can occupy a pool slot, i.e. is_expert && !is_pinned &&
+    // !is_consolidated. Pinned pages live in caller-owned VRAM and never
+    // touch the pool; consolidated parents are pure metadata (their
+    // sub-expert children are the slottable units). Non-expert dense pages
+    // are excluded too — they are either pinned or routed through the
+    // resident-dense path, never paged.
+    //
+    // The keys are RAW per-page payload sizes (un-aligned). The pool's
+    // pre-carve solver aligns each key up to slot_alignment_ to get the
+    // actual class stride, so the histogram is independent of the device
+    // buffer-type alignment that the pool settles at init time.
+    //
+    // Empty when the model has no slottable expert pages (dense model, or a
+    // pager populated only with pinned entries). Callers must handle that.
+    std::map<size_t, int> page_size_histogram() const;
 
     // True if any page is an MoE expert tensor — i.e. the model is sparse
     // MoE and downstream policy can use routing-aware prefetch / eviction.
