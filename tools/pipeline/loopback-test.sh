@@ -21,7 +21,7 @@
 # Requirements (already built by a human, CPU-only build):
 #   build/bin/llama-wp-stage-split
 #   build/bin/llama-pipeline
-#   build/bin/llama-cli            (the single-process reference)
+#   build/bin/llama-completion     (the single-process reference)
 #
 # Usage:
 #   tools/pipeline/loopback-test.sh <model.gguf> <K> [n_tokens]
@@ -39,9 +39,16 @@ N_TOKENS="${3:-32}"
 BIN="${BIN:-build/bin}"
 SPLIT="${BIN}/llama-wp-stage-split"
 PIPE="${BIN}/llama-pipeline"
-CLI="${BIN}/llama-cli"
+# llama-completion, NOT llama-cli: llama-cli is the conversational tool in
+# this tree and REJECTS -no-cnv, then spins on an interactive prompt after
+# generating. One-shot generation lives in tools/completion.
+CLI="${BIN}/llama-completion"
 
-WORK="$(mktemp -d /tmp/pipe-loopback.XXXXXX)"
+# NOTE: /tmp is tmpfs on mad-lab-main (RAM-backed, ~1.7 GB free). The two
+# stage GGUFs together are the size of the WHOLE model, so they must land
+# on disk or the split alone will OOM the box. PIPE_WORK_ROOT overrides.
+WORK_ROOT="${PIPE_WORK_ROOT:-/var/tmp}"
+WORK="$(mktemp -d "${WORK_ROOT}/pipe-loopback.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 HEAD_GGUF="${WORK}/head.gguf"
@@ -55,11 +62,24 @@ SEED=0
 
 echo "== loopback: model=${MODEL} K=${K} n=${N_TOKENS} work=${WORK} =="
 
+# The stage GGUFs together are ~the size of the model. Refuse to start
+# rather than fill the work filesystem partway through a split.
+MODEL_MB=$(( $(stat -c %s "${MODEL}") / 1048576 ))
+AVAIL_MB=$(df -Pm "${WORK}" | awk 'NR==2 {print $4}')
+if (( AVAIL_MB < MODEL_MB + 1024 )); then
+    echo "FAIL: ${WORK} has ${AVAIL_MB} MB free; the split needs ~${MODEL_MB} MB." >&2
+    echo "  Set PIPE_WORK_ROOT to a disk-backed path with room." >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # 0. discover n_layer so the tail's --last is exactly n_layer-1.
 #    wp-stage-split --dry-run prints "layers [F, L] of N (...)" on stderr.
+# Anchor on "layers [F, L] of N". A bare ".* of \([0-9]*\)" is greedy and
+# matches the LAST " of N " on the line -- the TENSOR count, not the layer
+# count (the line also reads "10 of 256 tensors").
 N_LAYER="$("${SPLIT}" --model "${MODEL}" --first 0 --last 0 --dry-run 2>&1 \
-            | sed -n 's/.* of \([0-9][0-9]*\) .*/\1/p' | head -n1)"
+            | sed -n 's/.*layers \[[0-9]*, *[0-9]*\] of \([0-9][0-9]*\) .*/\1/p' | head -n1)"
 if [[ -z "${N_LAYER}" ]]; then
     echo "FAIL: could not read n_layer from ${MODEL} via wp-stage-split" >&2
     exit 1
@@ -85,15 +105,24 @@ COMMON_CPU=(-t 4 -ngl 0)
 GREEDY=(--seed "${SEED}" --temp 0)
 # IO-cleaning flags. -no-cnv is llama-cli-only (the pipeline tool never enters
 # conversation mode and its arg parser would reject the flag).
-CLEAN_IO=(--log-disable --no-display-prompt --simple-io)
-CLI_IO=(-no-cnv)
+# NOTE: --simple-io is deliberately ABSENT. It selects console::readline_simple,
+# which cannot tell EOF from an empty line; on a non-interactive stdin that
+# becomes an unbounded echo loop (measured: 57 min, ~137 GB apparent output,
+# with -n 32 set). --log-disable + --no-display-prompt already give clean stdout.
+CLEAN_IO=(--log-disable --no-display-prompt)
+CLI_IO=(-no-cnv)   # supported by llama-completion; llama-cli rejects it
 
 # ---------------------------------------------------------------------------
 # 2. single-process reference: greedy token sequence
+# Hard ceiling. A correctness gate that has not produced 32 tokens in 10
+# minutes is malfunctioning, not slow; let it fail loudly instead of
+# spinning. Raise TIMEOUT for genuinely large models on slow hardware.
+TIMEOUT="${PIPE_TIMEOUT:-600}"
+
 echo "== reference (single process) =="
-"${CLI}" -m "${MODEL}" "${COMMON_CPU[@]}" "${GREEDY[@]}" "${CLEAN_IO[@]}" "${CLI_IO[@]}" \
+timeout "${TIMEOUT}" "${CLI}" -m "${MODEL}" "${COMMON_CPU[@]}" "${GREEDY[@]}" "${CLEAN_IO[@]}" "${CLI_IO[@]}" \
     -p "${PROMPT}" -n "${N_TOKENS}" \
-    >"${WORK}/ref.txt" 2>"${WORK}/ref.err"
+    >"${WORK}/ref.txt" 2>"${WORK}/ref.err" </dev/null
 
 # ---------------------------------------------------------------------------
 # 3. pipeline: start the tail, then the head driver
@@ -102,7 +131,7 @@ echo "== pipeline (2 stages on ${HOST}) =="
 # the readiness wait below is fast; only the head and reference stdout are diffed.
 "${PIPE}" -m "${TAIL_GGUF}" "${COMMON_CPU[@]}" "${GREEDY[@]}" \
     --pipeline-listen "${HOST}:${TAIL_PORT}" --no-warmup \
-    >"${WORK}/tail.out" 2>"${WORK}/tail.err" &
+    >"${WORK}/tail.out" 2>"${WORK}/tail.err" </dev/null &
 TAIL_PID=$!
 # wait for the tail to finish its HELLO-less listen (it logs "listening")
 for _ in $(seq 1 100); do
@@ -110,10 +139,10 @@ for _ in $(seq 1 100); do
     sleep 0.2
 done
 
-"${PIPE}" -m "${HEAD_GGUF}" "${COMMON_CPU[@]}" "${GREEDY[@]}" "${CLEAN_IO[@]}" \
+timeout "${TIMEOUT}" "${PIPE}" -m "${HEAD_GGUF}" "${COMMON_CPU[@]}" "${GREEDY[@]}" "${CLEAN_IO[@]}" \
     --pipeline-peer "${HOST}:${TAIL_PORT}" \
     -p "${PROMPT}" -n "${N_TOKENS}" \
-    >"${WORK}/pipe.txt" 2>"${WORK}/pipe.err" || true
+    >"${WORK}/pipe.txt" 2>"${WORK}/pipe.err" </dev/null || true
 # the head's canonical greedy token-id stream (ground truth) is on stderr
 grep '^PIPELINE-TOKENS:' "${WORK}/pipe.err" >"${WORK}/pipe.tokens" || true
 
