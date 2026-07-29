@@ -528,6 +528,9 @@ void WeightPager::ensure_odirect_worker_loop_() {
             if (job != nullptr) {
                 job->ok = ok;
                 job->err = err;
+                if (job->record_done_at) {
+                    job->done_at = std::chrono::steady_clock::now();
+                }
                 job->done = true;
             }
         }
@@ -1866,6 +1869,12 @@ void WeightPager::log_stats_summary() {
             (unsigned long) s.ensure_batch_p2p_inflight_peak,
             s.ensure_batch_p2p_inflight_avg_at_read_start);
     }
+    if (s.ensure_batch_host_h2d_overlap_batches > 0) {
+        LLAMA_LOG_WARN(
+            "wp::ensure_batch HOST H2D OVERLAP: batches=%lu copies_before_last_read=%lu\n",
+            (unsigned long) s.ensure_batch_host_h2d_overlap_batches,
+            (unsigned long) s.ensure_batch_host_h2d_overlap_copies);
+    }
 
     const uint64_t prefetch_total = s.prefetch_hits + s.prefetch_misses;
     const double hit_rate = prefetch_total > 0
@@ -2805,6 +2814,21 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         const char * e = std::getenv("WP_ENSURE_BATCH_HOST");
         return (e != nullptr && e[0] == '1') ? 1 : 0;
     }();
+    static const int s_batch_h2d_overlap = []() {
+        const char * e = std::getenv("WP_ENSURE_BATCH_H2D_OVERLAP");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+#if defined(GGML_USE_VULKAN)
+    const bool batch_h2d_overlap =
+        s_batch_h2d_overlap != 0 && !transport_.is_vulkan();
+#else
+    const bool batch_h2d_overlap = s_batch_h2d_overlap != 0;
+#endif
+#else
+    const bool batch_h2d_overlap = false;
+    (void) s_batch_h2d_overlap;
+#endif
     if (s_batch_host && ensure_host_bufs_ready_(misses.size(), catalog_.max_page_size())) {
         ++stats_.ensure_batch_host_path_batches;
         const auto io_t0 = std::chrono::steady_clock::now();
@@ -2965,6 +2989,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     r.off  = j.base;
                     r.size = j.nbytes;
                     r.dst  = j.dst;
+                    r.record_done_at = batch_h2d_overlap;
                     ensure_odirect_queue_.push_back(&r);
                     ++n_submitted;
                 }
@@ -2975,8 +3000,178 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         }
 
         const auto tp_submit = std::chrono::steady_clock::now();
+        uint64_t batch_h2d_overlap_copies = 0;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+        size_t overlap_n_promo_copy = 0;
+        size_t overlap_n_fresh_copy = 0;
+        std::vector<std::chrono::steady_clock::time_point> overlap_h2d_issue_times;
+        auto issue_overlap_copy = [&](std::size_t k) {
+            const Miss & mm = misses[k];
+            const PageMeta & m = catalog_.at(mm.page);
+            void * vram = slot_ptr_(mm.slot);
+            if (vram == nullptr) {
+                return false;
+            }
+            const void * src = nullptr;
+            if (host_hit[k]) {
+                src = host_hit_src[k];
+            } else if (jobs[k].ok) {
+                src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+            }
+            if (src == nullptr) {
+                return false;
+            }
+            const hipError_t err = hipMemcpyAsync(
+                vram, src, m.size, hipMemcpyHostToDevice, nullptr);
+            if (err != hipSuccess) {
+                jobs[k].ok = false;
+                host_hit[k] = false;
+                return false;
+            }
+            return true;
+        };
+        if (batch_h2d_overlap) {
+            overlap_h2d_issue_times.reserve(misses.size());
+
+            // HostTier hits have no read dependency. Queue them immediately,
+            // retaining every borrowed source until the one device fence below.
+            std::vector<TierPromotionRequest> promotion_requests;
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (host_hit[k] && host_hit_zerocopy[k]) {
+                    promotion_requests.push_back({misses[k].page, misses[k].slot});
+                }
+            }
+            if (pipeline_promotions_enabled_) {
+                enqueue_tier_promotions_(promotion_requests, tier_promotions,
+                    [&](void * dst, const void * src, size_t size, size_t, int & event) {
+                        event = -1;
+                        const bool issued =
+                            hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, nullptr) == hipSuccess;
+                        if (issued) {
+                            overlap_h2d_issue_times.push_back(
+                                std::chrono::steady_clock::now());
+                        }
+                        return issued;
+                    }, false);
+                for (std::size_t k = 0; k < misses.size(); ++k) {
+                    if (!host_hit_zerocopy[k]) {
+                        continue;
+                    }
+                    bool queued = false;
+                    for (const TierPromotion & promotion : tier_promotions) {
+                        if (promotion.page == misses[k].page) {
+                            queued = true;
+                            break;
+                        }
+                    }
+                    if (!queued) {
+                        host_hit[k] = false;
+                    } else {
+                        ++overlap_n_promo_copy;
+                    }
+                }
+                // A non-pinned HostTier uses lookup()'s per-index bounce
+                // buffer and is not handled by enqueue_tier_promotions_.
+                for (std::size_t k = 0; k < misses.size(); ++k) {
+                    if (!host_hit[k] || host_hit_zerocopy[k]) {
+                        continue;
+                    }
+                    if (issue_overlap_copy(k)) {
+                        ++overlap_n_promo_copy;
+                        overlap_h2d_issue_times.push_back(
+                            std::chrono::steady_clock::now());
+                    }
+                }
+            } else {
+                for (std::size_t k = 0; k < misses.size(); ++k) {
+                    if (!host_hit[k]) {
+                        continue;
+                    }
+                    const PageMeta & m = catalog_.at(misses[k].page);
+                    if (host_hit_zerocopy[k]) {
+                        const void * src = nullptr;
+                        HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+                        if (!host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
+                            jobs[k].ok = false;
+                            host_hit[k] = false;
+                            continue;
+                        }
+                        host_hit_src[k] = src;
+                        host_borrow_guard.pages.push_back({misses[k].page, handle});
+                    }
+                    if (issue_overlap_copy(k)) {
+                        ++overlap_n_promo_copy;
+                        overlap_h2d_issue_times.push_back(
+                            std::chrono::steady_clock::now());
+                    }
+                }
+            }
+        }
+#endif
         int n_seen = 0;
-        if (n_submitted > 0) {
+        double overlap_read_wait_seconds = 0.0;
+        if (batch_h2d_overlap) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+            while (n_seen < n_submitted) {
+                std::vector<std::size_t> completed;
+                {
+                    std::unique_lock<std::mutex> lock(ensure_odirect_mu_);
+                    const auto wait_t0 = std::chrono::steady_clock::now();
+                    ensure_odirect_done_cv_.wait(lock, [&]() {
+                        for (std::size_t k = 0; k < jobs.size(); ++k) {
+                            if (jobs[k].queued && read_jobs[k].done && !jobs[k].seen) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+                    overlap_read_wait_seconds += seconds_since(wait_t0);
+                    for (std::size_t k = 0; k < jobs.size(); ++k) {
+                        HostJob & j = jobs[k];
+                        EnsureODirectReadJob & r = read_jobs[k];
+                        if (!j.queued || !r.done || j.seen) {
+                            continue;
+                        }
+                        j.seen = true;
+                        j.ok = r.ok;
+                        ++n_seen;
+                        completed.push_back(k);
+                        if (!r.ok) {
+                            static int s_read_warn = 0;
+                            if (s_read_warn < 3) {
+                                LLAMA_LOG_WARN("wp::ensure_batch: HOST O_DIRECT pread failed fd=%d off=%llu size=%zu err=%s\n",
+                                               r.fd, (unsigned long long) r.off, r.size,
+                                               r.err < 0 ? strerror(-r.err) : "short read");
+                                ++s_read_warn;
+                            }
+                        }
+                    }
+                }
+                for (std::size_t k : completed) {
+                    if (!jobs[k].ok) {
+                        continue;
+                    }
+                    if (issue_overlap_copy(k)) {
+                        ++overlap_n_fresh_copy;
+                        overlap_h2d_issue_times.push_back(
+                            std::chrono::steady_clock::now());
+                    }
+                }
+            }
+            std::chrono::steady_clock::time_point last_read_completed_at;
+            for (std::size_t k = 0; k < jobs.size(); ++k) {
+                if (jobs[k].queued && read_jobs[k].done &&
+                    read_jobs[k].done_at > last_read_completed_at) {
+                    last_read_completed_at = read_jobs[k].done_at;
+                }
+            }
+            for (const auto issued_at : overlap_h2d_issue_times) {
+                if (issued_at < last_read_completed_at) {
+                    ++batch_h2d_overlap_copies;
+                }
+            }
+#endif
+        } else if (n_submitted > 0) {
             std::unique_lock<std::mutex> lock(ensure_odirect_mu_);
             ensure_odirect_done_cv_.wait(lock, [&read_jobs, n_submitted]() {
                 int n_done = 0;
@@ -3016,7 +3211,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         const double host_jobs_seconds      = msd(io_t0,     tp_jobs)   / 1e3;
         const double host_prep_seconds      = msd(tp_jobs,   tp_prep)   / 1e3;
         const double host_enqueue_seconds   = msd(tp_prep,   tp_submit) / 1e3;
-        const double host_read_wait_seconds = msd(tp_submit, tp_reap)   / 1e3;
+        const double host_read_wait_seconds = batch_h2d_overlap
+            ? overlap_read_wait_seconds
+            : msd(tp_submit, tp_reap) / 1e3;
         {
             static double s_jobs=0,s_prep=0,s_sub=0,s_reap=0; static long s_n=0; static long s_pg=0;
             s_jobs += msd(io_t0, tp_jobs);
@@ -3164,7 +3361,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
         if (!vk_h2d_handled) {
-        // Queue all H2Ds then one device sync (overlap PCIe copies).
+        // The default route queues all H2Ds here after the read barrier. The
+        // overlap route has already queued each copy as its read completed.
+        // Both routes retain the same single completion fence below.
         //
         // MAD-P4 follow-up: promotion (HostTier RAM->VRAM) copies are
         // enqueued before fresh-read copies so three timing events can
@@ -3176,10 +3375,14 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // unchanged. hipEventRecord does not block the host, so no new
         // synchronization point is introduced.
         hipEvent_t h2d_ev_start = nullptr, h2d_ev_mid = nullptr, h2d_ev_end = nullptr;
-        const bool h2d_timing_ok =
-            hipEventCreate(&h2d_ev_start) == hipSuccess &&
-            hipEventCreate(&h2d_ev_mid)   == hipSuccess &&
-            hipEventCreate(&h2d_ev_end)   == hipSuccess;
+        bool h2d_timing_ok = false;
+        size_t n_promo_copy = overlap_n_promo_copy;
+        size_t n_fresh_copy = overlap_n_fresh_copy;
+        if (!batch_h2d_overlap) {
+        h2d_timing_ok =
+                hipEventCreate(&h2d_ev_start) == hipSuccess &&
+                hipEventCreate(&h2d_ev_mid)   == hipSuccess &&
+                hipEventCreate(&h2d_ev_end)   == hipSuccess;
         if (h2d_timing_ok) {
             const hipError_t event_err = hipEventRecord(h2d_ev_start, nullptr);
             if (event_err != hipSuccess) {
@@ -3268,8 +3471,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 host_hit[k] = false;
             }
         };
-        size_t n_promo_copy = pipeline_promotions_enabled_ ? tier_promotions.size() : sync_promotion_count;
-        size_t n_fresh_copy = 0;
+        n_promo_copy = pipeline_promotions_enabled_ ? tier_promotions.size() : sync_promotion_count;
+        n_fresh_copy = 0;
         if (h2d_timing_ok) {
             const hipError_t event_err = hipEventRecord(h2d_ev_mid, nullptr);
             if (event_err != hipSuccess) {
@@ -3290,6 +3493,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                                 hipGetErrorString(event_err));
             }
         }
+        }
+        // Every bounce buffer has one fixed job index and is not reused within
+        // this batch. HostTier borrows and tier_promotions are also retained
+        // through this fence, so all overlap sources remain live until copied.
         // A copy that fails at EXECUTION time (vs enqueue) only surfaces here.
         // If the sync failed, some slot may hold garbage -- do NOT commit any of
         // them; force the whole batch down the sync fallback, which re-reads and
@@ -3395,6 +3602,10 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
 #endif
         (void) vk_h2d_handled;
         const double batch_seconds = seconds_since(io_t0);
+        if (batch_h2d_overlap) {
+            ++stats_.ensure_batch_host_h2d_overlap_batches;
+            stats_.ensure_batch_host_h2d_overlap_copies += batch_h2d_overlap_copies;
+        }
         if (batch_ok_n > 0) {
             stats_.page_ins  += (uint64_t) batch_ok_n;
             stats_.io_bytes  += (uint64_t) batch_bytes;
@@ -3416,6 +3627,9 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             stats_.ensure_batch_host_prep_seconds      += host_prep_seconds;
             stats_.ensure_batch_host_enqueue_seconds   += host_enqueue_seconds;
             stats_.ensure_batch_host_read_wait_seconds += host_read_wait_seconds;
+            // With overlap enabled this is the residual H2D wait after the
+            // final read. Its collapse while read_wait stays flat is the
+            // falsifiable signature that the copies actually hid behind I/O.
             stats_.ensure_batch_host_h2d_seconds       += (batch_seconds - read_seconds);
             if (h2d_events_valid) {
                 stats_.ensure_batch_host_promotion_h2d_seconds += promo_h2d_ms / 1e3;

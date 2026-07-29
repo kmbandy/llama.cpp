@@ -322,8 +322,10 @@ public:
         double   ensure_batch_host_jobs_seconds      = 0.0; // building the job list (HostTier lookup + fd resolution)
         double   ensure_batch_host_prep_seconds      = 0.0; // computing O_DIRECT alignment/bounce params
         double   ensure_batch_host_enqueue_seconds   = 0.0; // enqueueing jobs to the worker queue
-        double   ensure_batch_host_read_wait_seconds = 0.0; // blocked until all reads complete
-        double   ensure_batch_host_h2d_seconds       = 0.0; // H2D copy phase (mixed: promotion + fresh)
+        double   ensure_batch_host_read_wait_seconds = 0.0; // time blocked waiting for read completions
+        double   ensure_batch_host_h2d_seconds       = 0.0; // post-read H2D wait; residual when overlap is enabled
+        uint64_t ensure_batch_host_h2d_overlap_batches = 0; // opt-in overlap path batches
+        uint64_t ensure_batch_host_h2d_overlap_copies  = 0; // copies issued before the final read completed
         // P2P direct-to-device path: names deliberately mirror the HOST
         // phases so arm-to-arm logs are comparable. H2D is structurally zero
         // on a successful direct read, but remains explicit in the summary.
@@ -966,6 +968,8 @@ private:
         bool     done   = false;
         bool     ok     = false;
         int      err    = 0;
+        bool     record_done_at = false;
+        std::chrono::steady_clock::time_point done_at;
     };
     std::vector<std::thread>          ensure_odirect_workers_;
     std::deque<EnsureODirectReadJob *> ensure_odirect_queue_;
