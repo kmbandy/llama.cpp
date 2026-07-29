@@ -1210,11 +1210,14 @@ bool WeightPager::init(const Config &             cfg,
         }
     }
 
-    // 2. Per-device transfer stream + event pool. Size events generously
-    //    so prefetch never blocks waiting for an event.
-    const int n_transport_events = async_ensure_enabled_
+    // 2. Per-device transfer stream + event pool. When batch overlap is enabled,
+    //    keep the prefetch/async allowance available while ensure_batch holds
+    //    one event per pool slot, its maximum concurrent miss count.
+    const int n_batch_events =
+        env_flag_is_one("WP_ENSURE_BATCH_H2D_OVERLAP") ? pool_.n_slots() : 0;
+    const int n_transport_events = n_batch_events + (async_ensure_enabled_
         ? cfg_.prefetch_depth * 2 + 8
-        : cfg_.prefetch_depth + 2;
+        : cfg_.prefetch_depth + 2);
     if (!transport_.init(device_idx, n_transport_events, async_ensure_enabled_, pool_.vram_buf())) {
         LLAMA_LOG_ERROR("wp::WeightPager::init: gpu transport init failed\n");
         pool_.~PoolAllocator();   // explicit teardown via dtor (RAII'd)
@@ -2818,17 +2821,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         const char * e = std::getenv("WP_ENSURE_BATCH_H2D_OVERLAP");
         return (e != nullptr && e[0] == '1') ? 1 : 0;
     }();
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-#if defined(GGML_USE_VULKAN)
     const bool batch_h2d_overlap =
-        s_batch_h2d_overlap != 0 && !transport_.is_vulkan();
-#else
-    const bool batch_h2d_overlap = s_batch_h2d_overlap != 0;
-#endif
-#else
-    const bool batch_h2d_overlap = false;
-    (void) s_batch_h2d_overlap;
-#endif
+        s_batch_h2d_overlap != 0 && transport_.is_initialized();
     if (s_batch_host && ensure_host_bufs_ready_(misses.size(), catalog_.max_page_size())) {
         ++stats_.ensure_batch_host_path_batches;
         const auto io_t0 = std::chrono::steady_clock::now();
@@ -3001,117 +2995,75 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
 
         const auto tp_submit = std::chrono::steady_clock::now();
         uint64_t batch_h2d_overlap_copies = 0;
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
-        size_t overlap_n_promo_copy = 0;
-        size_t overlap_n_fresh_copy = 0;
+        std::vector<int> overlap_events;
+        std::vector<bool> overlap_copy_ok;
+        std::vector<bool> overlap_copy_failed;
         std::vector<std::chrono::steady_clock::time_point> overlap_h2d_issue_times;
+        bool overlap_async_submission_open = batch_h2d_overlap;
+        auto overlap_source = [&](std::size_t k) -> const void * {
+            if (host_hit[k]) {
+                return host_hit_src[k];
+            }
+            if (jobs[k].ok) {
+                return (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
+            }
+            return nullptr;
+        };
         auto issue_overlap_copy = [&](std::size_t k) {
+            if (!overlap_async_submission_open) {
+                return false;
+            }
             const Miss & mm = misses[k];
             const PageMeta & m = catalog_.at(mm.page);
             void * vram = slot_ptr_(mm.slot);
-            if (vram == nullptr) {
+            const void * src = overlap_source(k);
+            if (vram == nullptr || src == nullptr) {
                 return false;
             }
-            const void * src = nullptr;
-            if (host_hit[k]) {
-                src = host_hit_src[k];
-            } else if (jobs[k].ok) {
-                src = (const char *) ensure_host_bufs_[k] + jobs[k].prefix;
-            }
-            if (src == nullptr) {
+            const int event = transport_.stage_in_async(
+                vram, src, m.size, pool_.slot_size(mm.slot));
+            if (event < 0) {
+                // Preserve this source and stop async submission. Once every
+                // acquired event has been retired, this and all remaining
+                // pages are staged one at a time below.
+                overlap_async_submission_open = false;
                 return false;
             }
-            const hipError_t err = hipMemcpyAsync(
-                vram, src, m.size, hipMemcpyHostToDevice, nullptr);
-            if (err != hipSuccess) {
-                jobs[k].ok = false;
-                host_hit[k] = false;
-                return false;
-            }
+            overlap_events[k] = event;
+            overlap_h2d_issue_times.push_back(std::chrono::steady_clock::now());
             return true;
         };
         if (batch_h2d_overlap) {
+            overlap_events.assign(misses.size(), -1);
+            overlap_copy_ok.assign(misses.size(), false);
+            overlap_copy_failed.assign(misses.size(), false);
             overlap_h2d_issue_times.reserve(misses.size());
 
             // HostTier hits have no read dependency. Queue them immediately,
-            // retaining every borrowed source until the one device fence below.
-            std::vector<TierPromotionRequest> promotion_requests;
+            // retaining every borrowed source until all transport events retire.
             for (std::size_t k = 0; k < misses.size(); ++k) {
-                if (host_hit[k] && host_hit_zerocopy[k]) {
-                    promotion_requests.push_back({misses[k].page, misses[k].slot});
+                if (!host_hit[k]) {
+                    continue;
                 }
-            }
-            if (pipeline_promotions_enabled_) {
-                enqueue_tier_promotions_(promotion_requests, tier_promotions,
-                    [&](void * dst, const void * src, size_t size, size_t, int & event) {
-                        event = -1;
-                        const bool issued =
-                            hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, nullptr) == hipSuccess;
-                        if (issued) {
-                            overlap_h2d_issue_times.push_back(
-                                std::chrono::steady_clock::now());
-                        }
-                        return issued;
-                    }, false);
-                for (std::size_t k = 0; k < misses.size(); ++k) {
-                    if (!host_hit_zerocopy[k]) {
-                        continue;
-                    }
-                    bool queued = false;
-                    for (const TierPromotion & promotion : tier_promotions) {
-                        if (promotion.page == misses[k].page) {
-                            queued = true;
-                            break;
-                        }
-                    }
-                    if (!queued) {
-                        host_hit[k] = false;
-                    } else {
-                        ++overlap_n_promo_copy;
-                    }
-                }
-                // A non-pinned HostTier uses lookup()'s per-index bounce
-                // buffer and is not handled by enqueue_tier_promotions_.
-                for (std::size_t k = 0; k < misses.size(); ++k) {
-                    if (!host_hit[k] || host_hit_zerocopy[k]) {
-                        continue;
-                    }
-                    if (issue_overlap_copy(k)) {
-                        ++overlap_n_promo_copy;
-                        overlap_h2d_issue_times.push_back(
-                            std::chrono::steady_clock::now());
-                    }
-                }
-            } else {
-                for (std::size_t k = 0; k < misses.size(); ++k) {
-                    if (!host_hit[k]) {
-                        continue;
-                    }
+                if (host_hit_zerocopy[k]) {
                     const PageMeta & m = catalog_.at(misses[k].page);
-                    if (host_hit_zerocopy[k]) {
-                        const void * src = nullptr;
-                        HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
-                        if (!host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
-                            jobs[k].ok = false;
-                            host_hit[k] = false;
-                            continue;
-                        }
-                        host_hit_src[k] = src;
-                        host_borrow_guard.pages.push_back({misses[k].page, handle});
+                    const void * src = nullptr;
+                    HostTier::BorrowHandle handle = HostTier::kInvalidBorrowHandle;
+                    if (host_tier_ == nullptr ||
+                        !host_tier_->borrow(misses[k].page, &src, m.size, &handle)) {
+                        jobs[k].ok = false;
+                        host_hit[k] = false;
+                        continue;
                     }
-                    if (issue_overlap_copy(k)) {
-                        ++overlap_n_promo_copy;
-                        overlap_h2d_issue_times.push_back(
-                            std::chrono::steady_clock::now());
-                    }
+                    host_hit_src[k] = src;
+                    host_borrow_guard.pages.push_back({misses[k].page, handle});
                 }
+                issue_overlap_copy(k);
             }
         }
-#endif
         int n_seen = 0;
         double overlap_read_wait_seconds = 0.0;
         if (batch_h2d_overlap) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
             while (n_seen < n_submitted) {
                 std::vector<std::size_t> completed;
                 {
@@ -3151,11 +3103,7 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     if (!jobs[k].ok) {
                         continue;
                     }
-                    if (issue_overlap_copy(k)) {
-                        ++overlap_n_fresh_copy;
-                        overlap_h2d_issue_times.push_back(
-                            std::chrono::steady_clock::now());
-                    }
+                    issue_overlap_copy(k);
                 }
             }
             std::chrono::steady_clock::time_point last_read_completed_at;
@@ -3170,7 +3118,6 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                     ++batch_h2d_overlap_copies;
                 }
             }
-#endif
         } else if (n_submitted > 0) {
             std::unique_lock<std::mutex> lock(ensure_odirect_mu_);
             ensure_odirect_done_cv_.wait(lock, [&read_jobs, n_submitted]() {
@@ -3236,14 +3183,108 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         bool   h2d_events_valid = false;
         double promo_h2d_ms     = 0.0;
         double fresh_h2d_ms     = 0.0;
+        if (batch_h2d_overlap) {
+            bool overlap_wait_failed = false;
+            for (std::size_t k = 0; k < overlap_events.size(); ++k) {
+                const int event = overlap_events[k];
+                if (event < 0) {
+                    continue;
+                }
+                overlap_copy_ok[k] = transport_.synchronize(event);
+                overlap_copy_failed[k] = !overlap_copy_ok[k];
+                overlap_wait_failed = overlap_wait_failed || !overlap_copy_ok[k];
+                transport_.release_event(event);
+                overlap_events[k] = -1;
+            }
+
+            if (!overlap_async_submission_open) {
+                static int s_overlap_fallback_warn = 0;
+                if (s_overlap_fallback_warn < 3) {
+                    LLAMA_LOG_WARN("wp::ensure_batch: async stage submission stopped; "
+                                   "staging remaining pages synchronously\n");
+                    ++s_overlap_fallback_warn;
+                }
+            }
+
+            // All earlier handles are back in the pool before retrying pages
+            // that could not be submitted. Each retry owns at most one handle.
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                if (overlap_copy_ok[k] || overlap_copy_failed[k]) {
+                    continue;
+                }
+                const Miss & mm = misses[k];
+                const PageMeta & m = catalog_.at(mm.page);
+                void * vram = slot_ptr_(mm.slot);
+                const void * src = overlap_source(k);
+                if (vram == nullptr || src == nullptr) {
+                    continue;
+                }
+                const int event = transport_.stage_in_async(
+                    vram, src, m.size, pool_.slot_size(mm.slot));
+                if (event < 0) {
+                    continue;
+                }
+                overlap_copy_ok[k] = transport_.synchronize(event);
+                overlap_copy_failed[k] = !overlap_copy_ok[k];
+                overlap_wait_failed = overlap_wait_failed || !overlap_copy_ok[k];
+                transport_.release_event(event);
+            }
+
+            if (overlap_wait_failed) {
+                LLAMA_LOG_WARN("wp::ensure_batch: transport stage fence failed; "
+                               "affected pages routed to sync fallback\n");
+            }
+
+            for (std::size_t k = 0; k < misses.size(); ++k) {
+                const Miss & mm = misses[k];
+                const PageMeta & m = catalog_.at(mm.page);
+                void * vram = slot_ptr_(mm.slot);
+                if (vram != nullptr && overlap_copy_ok[k]) {
+                    page_to_slot_[mm.page] = mm.slot;
+                    page_loaded_[mm.page]  = true;
+                    slot_to_page_[mm.slot] = mm.page;
+                    pool_.mark_used(mm.slot);
+                    ++batch_ok_n;
+                    if (page_hist_enabled_ && mm.page >= 0 && mm.page < (int) page_pagein_.size()) {
+                        ++page_pagein_[(size_t) mm.page];
+                    }
+                    out_ptrs[mm.out_i] = vram;
+                    if (host_hit[k]) {
+                        ++stats_.host_tier_hits;
+                        ++stats_.ensure_batch_host_hits;
+                        ++stats_.ensure_batch_host_promotion_count;
+                        if (host_hit_zerocopy[k]) {
+                            ++stats_.ensure_batch_host_zerocopy_promotions;
+                        }
+                        if (host_tier_) {
+                            host_tier_->erase(mm.page);
+                        }
+                    } else {
+                        batch_bytes += m.size;
+                        ++stats_.ensure_batch_host_fresh_count;
+                    }
+                    if (mm.page >= 0 && mm.page < (int) host_prefetch_strikes_.size()) {
+                        host_prefetch_strikes_[(size_t) mm.page] = 0;
+                    }
+                } else {
+                    if (transport_.is_vulkan()) {
+                        ++stats_.pis_vk_host;
+                    } else {
+                        ++stats_.pis_host_path;
+                    }
+                    const int s = page_in_sync_(mm.page, /*reuse_slot=*/mm.slot);
+                    out_ptrs[mm.out_i] = (s < 0) ? nullptr : slot_ptr_(s);
+                }
+            }
+        }
         // Set by the Vulkan route below so the HIP/CUDA route is skipped. Note
         // this file is compiled WITH -DGGML_USE_CUDA even for Vulkan-only runs,
         // so the guard below is not enough on its own — without this flag a
         // Vulkan run would fall into raw cudaMemcpy against the pool sentinel.
-        bool   vk_h2d_handled   = false;
+        bool   vk_h2d_handled   = batch_h2d_overlap;
 
 #if defined(GGML_USE_VULKAN)
-        if (transport_.is_vulkan()) {
+        if (!vk_h2d_handled && transport_.is_vulkan()) {
             vk_h2d_handled = true;
             // Vulkan H2D for the HOST O_DIRECT batch. The multi-QD read above is
             // backend-neutral and has already landed the payloads in the pinned
@@ -3376,8 +3417,8 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
         // synchronization point is introduced.
         hipEvent_t h2d_ev_start = nullptr, h2d_ev_mid = nullptr, h2d_ev_end = nullptr;
         bool h2d_timing_ok = false;
-        size_t n_promo_copy = overlap_n_promo_copy;
-        size_t n_fresh_copy = overlap_n_fresh_copy;
+        size_t n_promo_copy = 0;
+        size_t n_fresh_copy = 0;
         if (!batch_h2d_overlap) {
         h2d_timing_ok =
                 hipEventCreate(&h2d_ev_start) == hipSuccess &&
