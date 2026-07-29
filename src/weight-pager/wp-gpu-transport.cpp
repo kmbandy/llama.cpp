@@ -10,6 +10,7 @@
 #include "ggml-vulkan.h"
 #endif
 
+#include <atomic>
 #include <cstring>
 
 namespace wp {
@@ -218,10 +219,35 @@ int GpuTransport::stage_in(void * dst, const void * src_pinned,
 
 int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
                                  size_t payload_size, size_t slot_size) {
-    if (!initialized_ || dst == nullptr || src_pinned == nullptr) return -1;
-    if (payload_size > slot_size) return -1;
+    if (!initialized_) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: rejected because transport is not initialized\n");
+        }
+        return -1;
+    }
+    if (dst == nullptr || src_pinned == nullptr) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: rejected null argument "
+                           "(dst=%p src=%p)\n", dst, src_pinned);
+        }
+        return -1;
+    }
+    if (payload_size > slot_size) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: rejected payload larger than slot "
+                           "(payload=%zu slot=%zu)\n", payload_size, slot_size);
+        }
+        return -1;
+    }
     if (free_events_.empty()) {
-        LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: event pool exhausted (queue depth too small?)\n");
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: rejected because event pool is exhausted "
+                           "(events=%zu)\n", events_.size());
+        }
         return -1;
     }
 
@@ -237,6 +263,10 @@ int GpuTransport::stage_in_async(void * dst, const void * src_pinned,
         // to one page in flight at a time. Callers wait via synchronize() (which
         // stage_in() does for them) or poll query().
         if (!ggml_backend_vk_wp_stage_in(buffer_, dst, src_pinned, payload_size, slot_size, &event)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("wp::GpuTransport::stage_in_async: Vulkan stage bridge returned false\n");
+            }
             ggml_backend_vk_wp_event_free(event);
             free_events_.push_back(evt_idx);
             return -1;
@@ -363,6 +393,29 @@ void GpuTransport::host_free(void * ptr) {
     (void) ptr;
 }
 
+bool GpuTransport::host_register(void * ptr, size_t size) {
+    // Compile-time: Vulkan host registration calls the Vulkan bridge.
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        return ggml_backend_vk_wp_host_register(buffer_, ptr, size);
+    }
+#endif
+    (void) ptr;
+    (void) size;
+    return false;
+}
+
+void GpuTransport::host_unregister(void * ptr) {
+    // Compile-time: Vulkan host unregistration calls the Vulkan bridge.
+#if defined(GGML_USE_VULKAN)
+    if (is_vulkan_) {
+        ggml_backend_vk_wp_host_unregister(buffer_, ptr);
+        return;
+    }
+#endif
+    (void) ptr;
+}
+
 bool GpuTransport::wait_event_on_stream(int event_handle, void * stream) {
     // Compile-time: Vulkan has no CUDA-family stream-wait event.
 #if defined(GGML_USE_VULKAN)
@@ -480,6 +533,8 @@ int  GpuTransport::stage_in_async(void * /*dst*/, const void * /*src_pinned*/,
 // libllama.so. Fail closed: no host staging buffer, no device readback.
 void * GpuTransport::host_alloc(size_t /*size*/)                           { return nullptr; }
 void   GpuTransport::host_free(void * /*ptr*/)                             {}
+bool   GpuTransport::host_register(void * /*ptr*/, size_t /*size*/)        { return false; }
+void   GpuTransport::host_unregister(void * /*ptr*/)                       {}
 bool   GpuTransport::read_to_host(void * /*dst_host*/, const void * /*src_device*/,
                                   size_t /*n*/)                            { return false; }
 

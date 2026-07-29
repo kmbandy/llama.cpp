@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -298,6 +299,7 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -8365,17 +8367,39 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
                                  size_t payload_size, size_t slot_size,
                                  void ** event) {
     if (buffer == nullptr || dst == nullptr || src == nullptr || event == nullptr || payload_size > slot_size) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_stage_in: invalid arguments "
+                          "(buffer=%p dst=%p src=%p event=%p payload=%zu slot=%zu)\n",
+                          (void *) buffer, dst, src, (void *) event, payload_size, slot_size);
+        }
         return false;
     }
 
     auto * buffer_ctx = (ggml_backend_vk_buffer_context *) buffer->context;
     if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_stage_in: missing Vulkan buffer context "
+                          "(context=%p dev_buffer=%p)\n",
+                          (void *) buffer_ctx,
+                          buffer_ctx == nullptr ? nullptr : (void *) buffer_ctx->dev_buffer.get());
+        }
         return false;
     }
 
     vk_buffer dst_buffer = buffer_ctx->dev_buffer;
-    const size_t offset = (uintptr_t) dst - (uintptr_t) vk_ptr_base;
-    if (offset > dst_buffer->size || slot_size > dst_buffer->size - offset) {
+    const uintptr_t base_addr = (uintptr_t) ggml_backend_buffer_get_base(buffer);
+    const uintptr_t dst_addr  = (uintptr_t) dst;
+    const bool below_base = dst_addr < base_addr;
+    const size_t offset = below_base ? 0 : dst_addr - base_addr;
+    if (below_base || offset > dst_buffer->size || slot_size > dst_buffer->size - offset) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_stage_in: destination outside pool buffer "
+                          "(base=%p dst=%p offset=%zu slot=%zu buffer_size=%zu)\n",
+                          (void *) base_addr, dst, offset, slot_size, dst_buffer->size);
+        }
         return false;
     }
 
@@ -8385,15 +8409,14 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
     // registered with THIS Vulkan device, in which case the copy reads straight
     // from it. Otherwise ggml_vk_buffer_write_async routes through the single
     // device-wide `device->sync_staging` buffer, and two overlapping transfers
-    // would each memcpy into that same region — the second clobbering data the
+    // would each memcpy into that same region -- the second clobbering data the
     // first's queued copy has not executed yet. So an unpinned source MUST be
     // fenced before this function returns; the caller cannot know this, because
     // the staging decision is made in here.
     //
-    // The pager's O_DIRECT bounce arena is currently hipHostMalloc'd, which this
-    // device knows nothing about, so today it always takes the fenced path.
-    // Register that arena with Vulkan and this becomes genuinely async with no
-    // other change.
+    // The pager registers its O_DIRECT arena through
+    // ggml_backend_vk_wp_host_register. If import is unavailable, this lookup
+    // stays empty and the correctness-preserving fenced path remains active.
     vk_buffer pinned_buf    = nullptr;
     size_t    pinned_offset = 0;
     ggml_vk_host_get(dst_buffer->device, src, pinned_buf, pinned_offset);
@@ -8409,6 +8432,12 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
                   : dst_buffer->device->transfer_queue.cmd_pool);
     ggml_vk_ctx_begin(dst_buffer->device, context);
     if (!ggml_vk_buffer_write_async(context, dst_buffer, offset, src, payload_size, true)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_stage_in: ggml_vk_buffer_write_async returned false "
+                          "(offset=%zu payload=%zu source_registered=%d)\n",
+                          offset, payload_size, src_is_pinned ? 1 : 0);
+        }
         return false;
     }
     if (slot_size > payload_size) {
@@ -8430,7 +8459,7 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
     };
     ggml_vk_submit(context, wp_event->fence);
 
-    // Shared-staging transfers cannot be left in flight — see the note above.
+    // Shared-staging transfers cannot be left in flight -- see the note above.
     if (!src_is_pinned) {
         (void) ggml_backend_vk_wp_event_wait(wp_event);
     }
@@ -8481,6 +8510,78 @@ void * ggml_backend_vk_wp_host_alloc(ggml_backend_buffer_t pool_buffer, size_t s
     // Registered against the POOL's device, not vk_instance.devices[0], so
     // ggml_vk_host_get finds it when staging into this pool.
     return ggml_vk_host_malloc(buffer_ctx->dev_buffer->device, size);
+}
+
+bool ggml_backend_vk_wp_host_register(
+        ggml_backend_buffer_t pool_buffer, void * ptr, size_t size) {
+    if (pool_buffer == nullptr || ptr == nullptr || size == 0) {
+        return false;
+    }
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) pool_buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return false;
+    }
+
+    vk_device device = buffer_ctx->dev_buffer->device;
+    if (!device->external_memory_host) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_host_register: device does not support "
+                          "VK_EXT_external_memory_host\n");
+        }
+        return false;
+    }
+    const size_t import_alignment = device->min_imported_host_pointer_alignment;
+    if (import_alignment == 0 ||
+        ((uintptr_t) ptr & (import_alignment - 1)) != 0 ||
+        (size & (import_alignment - 1)) != 0) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_host_register: host allocation does not meet "
+                          "Vulkan import alignment (ptr=%p size=%zu alignment=%zu)\n",
+                          ptr, size, import_alignment);
+        }
+        return false;
+    }
+
+    vk_buffer imported = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+    if (imported == nullptr) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            GGML_LOG_WARN("ggml_backend_vk_wp_host_register: Vulkan host pointer import failed "
+                          "(ptr=%p size=%zu)\n", ptr, size);
+        }
+        return false;
+    }
+
+    const uintptr_t begin = (uintptr_t) ptr;
+    const uintptr_t end = begin + size;
+    if (end < begin) {
+        return false;
+    }
+
+    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
+    for (const auto & entry : device->pinned_memory) {
+        const uintptr_t registered_begin = (uintptr_t) std::get<0>(entry);
+        const uintptr_t registered_end = registered_begin + std::get<1>(entry);
+        if (begin < registered_end && registered_begin < end) {
+            return false;
+        }
+    }
+    device->pinned_memory.push_back(std::make_tuple(ptr, size, std::move(imported)));
+    return true;
+}
+
+void ggml_backend_vk_wp_host_unregister(
+        ggml_backend_buffer_t pool_buffer, void * ptr) {
+    if (pool_buffer == nullptr || ptr == nullptr) {
+        return;
+    }
+    auto * buffer_ctx = (ggml_backend_vk_buffer_context *) pool_buffer->context;
+    if (buffer_ctx == nullptr || buffer_ctx->dev_buffer == nullptr) {
+        return;
+    }
+    ggml_vk_host_free(buffer_ctx->dev_buffer->device, ptr);
 }
 
 bool ggml_backend_vk_wp_read(ggml_backend_buffer_t pool_buffer,

@@ -93,6 +93,13 @@ public:
     void * host_alloc(size_t size);
     void   host_free(void * ptr);
 
+    // Register caller-owned host memory with this transport's device. Vulkan
+    // uses this for O_DIRECT buffers whose allocation lifetime remains owned by
+    // the pager. Registration may fail when the device cannot import host
+    // pointers; callers must retain the synchronous staging fallback.
+    bool host_register(void * ptr, size_t size);
+    void host_unregister(void * ptr);
+
     // Synchronous device-to-host read from the pool, used by the RAM victim
     // tier on eviction. Backend-correct: a raw hipMemcpy cannot serve a Vulkan
     // pool, whose "pointers" are a sentinel base plus an offset. Returns false

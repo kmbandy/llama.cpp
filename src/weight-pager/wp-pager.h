@@ -947,11 +947,9 @@ private:
     std::vector<void *> ensure_host_bufs_;
     size_t              ensure_host_buf_bytes_ = 0;
     bool                ensure_host_bufs_pinned_ = false;
-    // Arena came from GpuTransport::host_alloc (Vulkan-registered host memory),
-    // so it must be released through host_free, not hipHostFree/std::free. Kept
-    // separate from ensure_host_bufs_pinned_ because that flag gates HIP-only
-    // zero-copy promotion paths that do not apply here.
-    bool                ensure_host_bufs_vk_pinned_ = false;
+    // The caller-owned arena was imported into the Vulkan device. Unregister
+    // before releasing the underlying hipHostMalloc/posix_memalign allocation.
+    bool                ensure_host_bufs_vk_registered_ = false;
     std::vector<int>    ensure_odirect_fds_; // parallel to file_io fds; -1 = unused
     // Parallel to ensure_odirect_fds_: the resolved O_DIRECT alignment (bytes,
     // power of two) and cached file size for each file_idx, populated once in

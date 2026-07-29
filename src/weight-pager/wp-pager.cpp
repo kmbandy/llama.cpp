@@ -285,54 +285,30 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     ensure_host_bufs_.assign(cap, nullptr);
     ensure_host_buf_bytes_ = alloc;
     ensure_host_bufs_pinned_ = false;
-    ensure_host_bufs_vk_pinned_ = false;
+    ensure_host_bufs_vk_registered_ = false;
 
-    // Vulkan first: an arena registered with the pool's device lets stage_in copy
-    // straight from it, which is both faster than the shared-staging hop AND the
-    // precondition for leaving transfers in flight. Only usable if the mapped
-    // pointer happens to satisfy O_DIRECT alignment — vkMapMemory promises
-    // minMemoryMapAlignment, which is not required to be a filesystem block
-    // size, and this project has already been burned once by assuming an
-    // alignment rather than checking it. Verify, and fall through if it fails.
-    if (transport_.is_vulkan()) {
-        const size_t od_align = align;
-        bool vk_ok = true;
-        for (size_t i = 0; i < cap; ++i) {
-            void * p = transport_.host_alloc(alloc);
-            if (p == nullptr) {
-                LLAMA_LOG_WARN("wp::ensure_host_bufs: vulkan host_alloc failed at buffer %zu/%zu "
-                               "(%zu B); falling back to unregistered arena (staging hop retained)\n",
-                               i, cap, alloc);
-                vk_ok = false;
-                break;
-            }
-            if (((uintptr_t) p % od_align) != 0) {
-                LLAMA_LOG_WARN("wp::ensure_host_bufs: vulkan pinned arena at %p is not %zu-aligned; "
-                               "falling back to unregistered arena (staging hop retained)\n",
-                               p, od_align);
-                transport_.host_free(p);
-                vk_ok = false;
-                break;
-            }
-            ensure_host_bufs_[i] = p;
+    auto register_vulkan_arena = [&]() {
+        if (!transport_.is_vulkan()) {
+            return;
         }
-        if (vk_ok) {
-            ensure_host_bufs_vk_pinned_ = true;
-            LLAMA_LOG_WARN("wp::ensure_host_bufs: %zu x %zu B vulkan-registered pinned arena "
-                           "(stage_in copies direct, transfers can stay in flight)\n",
-                           cap, alloc);
-            return true;
-        }
-        // Release whatever was taken before the failure.
-        for (size_t i = 0; i < cap; ++i) {
-            if (ensure_host_bufs_[i] != nullptr) {
-                transport_.host_free(ensure_host_bufs_[i]);
-                ensure_host_bufs_[i] = nullptr;
+        size_t registered = 0;
+        for (; registered < cap; ++registered) {
+            if (!transport_.host_register(ensure_host_bufs_[registered], alloc)) {
+                LLAMA_LOG_WARN("wp::ensure_host_bufs: Vulkan could not register O_DIRECT buffer "
+                               "%zu/%zu (%p, %zu B); transfers from this arena remain fenced\n",
+                               registered, cap, ensure_host_bufs_[registered], alloc);
+                for (size_t i = 0; i < registered; ++i) {
+                    transport_.host_unregister(ensure_host_bufs_[i]);
+                }
+                return;
             }
         }
-    }
+        ensure_host_bufs_vk_registered_ = true;
+        LLAMA_LOG_WARN("wp::ensure_host_bufs: registered %zu x %zu B O_DIRECT arena "
+                       "with the Vulkan device\n", cap, alloc);
+    };
 
-    // Compile-time: this is the CUDA-family fallback after the runtime Vulkan allocation.
+    // Compile-time: use the CUDA-family allocator when that API is available.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
     static const int s_pageable = [](){ const char* e=std::getenv("WP_ODIRECT_PAGEABLE"); return (e&&e[0]=='1')?1:0; }();
     bool all_ok = !s_pageable;
@@ -347,6 +323,7 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     }
     if (all_ok) {
         ensure_host_bufs_pinned_ = true;
+        register_vulkan_arena();
         return true;
     }
     free_ensure_host_bufs_();
@@ -363,6 +340,7 @@ bool WeightPager::ensure_host_bufs_ready_(size_t n, size_t page_bytes) {
     }
     ensure_host_buf_bytes_ = alloc;
     ensure_host_bufs_pinned_ = false;
+    register_vulkan_arena();
     return true;
 }
 
@@ -373,9 +351,8 @@ void WeightPager::free_ensure_host_bufs_() {
 #endif
     for (void * p : ensure_host_bufs_) {
         if (p == nullptr) continue;
-        if (ensure_host_bufs_vk_pinned_) {
-            transport_.host_free(p);
-            continue;
+        if (ensure_host_bufs_vk_registered_) {
+            transport_.host_unregister(p);
         }
         // Compile-time: only CUDA-family builds can own this allocation kind.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
@@ -390,7 +367,7 @@ void WeightPager::free_ensure_host_bufs_() {
     ensure_host_bufs_.clear();
     ensure_host_buf_bytes_ = 0;
     ensure_host_bufs_pinned_ = false;
-    ensure_host_bufs_vk_pinned_ = false;
+    ensure_host_bufs_vk_registered_ = false;
     for (int fd : ensure_odirect_fds_) {
         if (fd >= 0) {
             close(fd);
@@ -3060,6 +3037,16 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             }
             return nullptr;
         };
+        auto warn_overlap_source_null = [&](std::size_t k, const char * phase) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("wp::ensure_batch: overlap_source returned null before stage_in_async "
+                               "(phase=%s index=%zu page=%d host_hit=%d queued=%d seen=%d read_ok=%d)\n",
+                               phase, k, misses[k].page, host_hit[k] ? 1 : 0,
+                               jobs[k].queued ? 1 : 0, jobs[k].seen ? 1 : 0,
+                               jobs[k].ok ? 1 : 0);
+            }
+        };
         auto issue_overlap_copy = [&](std::size_t k) {
             if (!overlap_async_submission_open) {
                 return false;
@@ -3068,7 +3055,16 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
             const PageMeta & m = catalog_.at(mm.page);
             void * vram = slot_ptr_(mm.slot);
             const void * src = overlap_source(k);
-            if (vram == nullptr || src == nullptr) {
+            if (vram == nullptr) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    LLAMA_LOG_WARN("wp::ensure_batch: slot_ptr returned null before stage_in_async "
+                                   "(index=%zu page=%d slot=%d)\n", k, mm.page, mm.slot);
+                }
+                return false;
+            }
+            if (src == nullptr) {
+                warn_overlap_source_null(k, "overlap");
                 return false;
             }
             const int event = transport_.stage_in_async(
@@ -3281,7 +3277,11 @@ void WeightPager::ensure_batch(const std::vector<int> & page_indices,
                 const PageMeta & m = catalog_.at(mm.page);
                 void * vram = slot_ptr_(mm.slot);
                 const void * src = overlap_source(k);
-                if (vram == nullptr || src == nullptr) {
+                if (vram == nullptr) {
+                    continue;
+                }
+                if (src == nullptr) {
+                    warn_overlap_source_null(k, "sync-retry");
                     continue;
                 }
                 const int event = transport_.stage_in_async(
