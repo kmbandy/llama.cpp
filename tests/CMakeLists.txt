@@ -301,6 +301,23 @@ target_link_libraries(test-wp-stage-split PRIVATE ggml)
 target_compile_features(test-wp-stage-split PRIVATE cxx_std_17)
 llama_test(test-wp-stage-split)
 
+# Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model, no
+# sockets: pure buffer encode/decode). Links pipe-transport.cpp only for the
+# frame-IO helpers' symbols; the test never opens a socket.
+add_executable(
+    test-pipe-protocol
+    test-pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-pipe-protocol PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_compile_features(test-pipe-protocol PRIVATE cxx_std_17)
+llama_test(test-pipe-protocol)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

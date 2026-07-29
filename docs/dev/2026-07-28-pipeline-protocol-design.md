@@ -38,7 +38,8 @@ u64  length       = payload bytes following this header
 u8[] payload
 ```
 
-24-byte fixed header, then payload. Frame types:
+32-byte fixed header, then payload: 4 x u32 (magic, version, type, flags)
+= 16 B, plus u64 seq_id + u64 length = 16 B. Frame types:
 
 ```
 PIPE_HELLO       = 1  (both directions, once per connection)
