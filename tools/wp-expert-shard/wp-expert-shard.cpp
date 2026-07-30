@@ -37,7 +37,7 @@ void print_usage(const char * argv0) {
               << "options:\n"
               << "  --layers FIRST-LAST  emit only these source layers in this invocation\n"
               << "  --verify              re-read output and compare every member byte with the source\n"
-              << "  --manifest-only       write the complete manifest without emitting blob files\n"
+              << "  --manifest-only       write the complete manifest and sidecars without emitting blob files\n"
               << "  -h, --help            show this help\n\n"
               << "Data emission writes blobs and sidecars only. Run --manifest-only separately and\n"
               << "copy that manifest after all per-layer files have reached their destination.\n"

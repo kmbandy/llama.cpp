@@ -177,6 +177,45 @@ static void test_expert_shard() {
     std::printf("expert-index shard\n");
     Fixture fixture;
 
+    const fs::path planned_out_base = fixture.dir / "planned" / "cut";
+
+    wp_expert_shard::Options planned;
+    planned.src_manifest                          = fixture.source_manifest;
+    planned.out_base                              = planned_out_base;
+    planned.expert_first                          = 0;
+    planned.expert_last                           = 1;
+    planned.manifest_only                         = true;
+    const wp_expert_shard::RunStats planned_stats = wp_expert_shard::run(planned);
+
+    const fs::path planned_manifest_path = wp_expert_shard::output_manifest_path(planned_out_base);
+    std::ifstream  planned_manifest_input(planned_manifest_path);
+    json           planned_manifest;
+    planned_manifest_input >> planned_manifest;
+
+    bool                           planned_sidecars_exist = true;
+    bool                           planned_blobs_absent   = true;
+    std::vector<std::vector<char>> planned_sidecars;
+    for (const json & shard : planned_manifest.at("shards")) {
+        const fs::path sidecar = planned_out_base.parent_path() / shard.at("index_file").get<std::string>();
+        const fs::path blob    = planned_out_base.parent_path() / shard.at("blob_file").get<std::string>();
+        planned_sidecars_exist = planned_sidecars_exist && fs::exists(sidecar);
+        planned_blobs_absent   = planned_blobs_absent && !fs::exists(blob);
+        planned_sidecars.push_back(read_bytes(sidecar, 0, fs::file_size(sidecar)));
+    }
+    check(planned_stats.shards == 2 && planned_sidecars_exist && planned_blobs_absent,
+          "manifest-only writes every sidecar without writing blobs");
+
+    wp_expert_shard::Options planned_emit           = planned;
+    planned_emit.manifest_only                      = false;
+    planned_emit.verify                             = true;
+    planned_emit.layers                             = std::make_pair(3, 3);
+    const wp_expert_shard::RunStats planned_layer_3 = wp_expert_shard::run(planned_emit);
+    const fs::path                  planned_layer_3_sidecar =
+        planned_out_base.parent_path() / planned_manifest.at("shards").at(0).at("index_file").get<std::string>();
+    check(planned_layer_3.shards == 1 &&
+              read_bytes(planned_layer_3_sidecar, 0, fs::file_size(planned_layer_3_sidecar)) == planned_sidecars.at(0),
+          "data emission accepts and preserves a matching metadata-only sidecar");
+
     wp_expert_shard::Options emit;
     emit.src_manifest                       = fixture.source_manifest;
     emit.out_base                           = fixture.out_base;
@@ -191,6 +230,17 @@ static void test_expert_shard() {
               layer_4.groups == 2 && layer_4.members == 6,
           "separate layer invocations emit deterministic, non-overlapping files");
 
+    bool                           sidecars_byte_identical = true;
+    std::vector<std::vector<char>> emitted_sidecars;
+    for (size_t shard_index = 0; shard_index < planned_manifest.at("shards").size(); ++shard_index) {
+        const fs::path emitted_sidecar =
+            fixture.dir / planned_manifest.at("shards").at(shard_index).at("index_file").get<std::string>();
+        emitted_sidecars.push_back(read_bytes(emitted_sidecar, 0, fs::file_size(emitted_sidecar)));
+        sidecars_byte_identical =
+            sidecars_byte_identical && emitted_sidecars.back() == planned_sidecars.at(shard_index);
+    }
+    check(sidecars_byte_identical, "manifest-only sidecars are byte-identical to data-run sidecars");
+
     wp_expert_shard::Options manifest_options = emit;
     manifest_options.verify                   = false;
     manifest_options.layers.reset();
@@ -199,10 +249,41 @@ static void test_expert_shard() {
     check(described.shards == layer_3.shards + layer_4.shards && described.groups == layer_3.groups + layer_4.groups &&
               described.bytes == layer_3.bytes + layer_4.bytes,
           "manifest-only describes the independently emitted files");
+    bool emitted_sidecars_unchanged = true;
+    for (size_t shard_index = 0; shard_index < planned_manifest.at("shards").size(); ++shard_index) {
+        const fs::path emitted_sidecar =
+            fixture.dir / planned_manifest.at("shards").at(shard_index).at("index_file").get<std::string>();
+        emitted_sidecars_unchanged =
+            emitted_sidecars_unchanged &&
+            read_bytes(emitted_sidecar, 0, fs::file_size(emitted_sidecar)) == emitted_sidecars.at(shard_index);
+    }
+    check(emitted_sidecars_unchanged, "manifest-only verifies matching data-run sidecars without rewriting them");
 
-    const fs::path manifest_path = wp_expert_shard::output_manifest_path(fixture.out_base);
-    std::ifstream  manifest_input(manifest_path);
-    json           manifest;
+    const fs::path                  manifest_path  = wp_expert_shard::output_manifest_path(fixture.out_base);
+    const std::vector<char>         manifest_bytes = read_bytes(manifest_path, 0, fs::file_size(manifest_path));
+    const wp_expert_shard::RunStats repeated       = wp_expert_shard::run(manifest_options);
+    check(repeated.shards == described.shards &&
+              read_bytes(manifest_path, 0, fs::file_size(manifest_path)) == manifest_bytes,
+          "repeated manifest-only verifies matching metadata without rewriting it");
+
+    const fs::path mismatched_sidecar =
+        planned_out_base.parent_path() / planned_manifest.at("shards").at(1).at("index_file").get<std::string>();
+    {
+        std::ofstream output(mismatched_sidecar, std::ios::binary | std::ios::app);
+        output << ' ';
+    }
+    const std::vector<char> mismatched_bytes  = read_bytes(mismatched_sidecar, 0, fs::file_size(mismatched_sidecar));
+    bool                    mismatch_rejected = false;
+    try {
+        wp_expert_shard::run(planned);
+    } catch (const std::runtime_error &) {
+        mismatch_rejected = true;
+    }
+    check(mismatch_rejected && read_bytes(mismatched_sidecar, 0, fs::file_size(mismatched_sidecar)) == mismatched_bytes,
+          "manifest-only rejects a mismatched existing sidecar without overwriting it");
+
+    std::ifstream manifest_input(manifest_path);
+    json          manifest;
     manifest_input >> manifest;
     check(manifest.at("format") == "llama.cpp.weight-pager.expert-shard-manifest" && manifest.at("version") == 1,
           "preserves the loader format and version");

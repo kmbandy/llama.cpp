@@ -196,6 +196,44 @@ void write_json(const fs::path & path, const json & value) {
     }
 }
 
+std::string serialize_json(const json & value) {
+    return value.dump(2) + '\n';
+}
+
+void verify_existing_json(const fs::path & path, const json & value) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open " + path.string());
+    }
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (input.bad()) {
+        throw std::runtime_error("failed to read " + path.string());
+    }
+    if (contents.str() != serialize_json(value)) {
+        throw std::runtime_error("refusing to overwrite existing output that differs from planned metadata: " +
+                                 path.string());
+    }
+}
+
+void write_or_verify_json(const fs::path & path, const json & value) {
+    const fs::path temp_path = fs::path(path.string() + ".tmp");
+    require_absent(temp_path);
+    if (fs::exists(path)) {
+        verify_existing_json(path, value);
+        return;
+    }
+
+    try {
+        write_json(temp_path, value);
+        fs::rename(temp_path, path);
+    } catch (...) {
+        std::error_code ignored;
+        fs::remove(temp_path, ignored);
+        throw;
+    }
+}
+
 Plan build_plan(const Options & options) {
     const fs::path source_manifest_path = fs::canonical(options.src_manifest);
     const fs::path source_dir           = source_manifest_path.parent_path();
@@ -516,11 +554,14 @@ RunStats write_shard(const Plan & plan, const PlannedShard & shard, bool verify)
     const fs::path   temp_blob  = fs::path(paths.blob.string() + ".tmp");
     const fs::path   temp_index = fs::path(paths.index.string() + ".tmp");
     require_absent(paths.blob);
-    require_absent(paths.index);
     require_absent(temp_blob);
     require_absent(temp_index);
 
-    const json index = build_output_index(plan, shard);
+    const json index        = build_output_index(plan, shard);
+    const bool index_exists = fs::exists(paths.index);
+    if (index_exists) {
+        verify_existing_json(paths.index, index);
+    }
     try {
         std::ifstream source(shard.source_blob, std::ios::binary);
         std::ofstream output(temp_blob, std::ios::binary);
@@ -539,11 +580,13 @@ RunStats write_shard(const Plan & plan, const PlannedShard & shard, bool verify)
         if (!output || fs::file_size(temp_blob) != shard.blob_bytes) {
             throw std::runtime_error("failed to finish output blob for layer " + std::to_string(shard.layer));
         }
-        write_json(temp_index, index);
+        if (!index_exists) {
+            write_json(temp_index, index);
+        }
 
         RunStats stats;
         if (verify) {
-            stats = verify_output(shard, index, temp_index, temp_blob);
+            stats = verify_output(shard, index, index_exists ? paths.index : temp_index, temp_blob);
         } else {
             stats.shards  = 1;
             stats.groups  = shard.groups.size();
@@ -552,7 +595,9 @@ RunStats write_shard(const Plan & plan, const PlannedShard & shard, bool verify)
         }
 
         fs::rename(temp_blob, paths.blob);
-        fs::rename(temp_index, paths.index);
+        if (!index_exists) {
+            fs::rename(temp_index, paths.index);
+        }
         if (verify) {
             std::cout << "verify PASS: layer=" << shard.layer << " groups=" << stats.groups
                       << " members=" << stats.members << " bytes=" << stats.bytes << '\n';
@@ -581,9 +626,6 @@ RunStats plan_stats(const Plan & plan) {
 
 RunStats write_manifest(const Plan & plan, const Options & options) {
     const fs::path manifest_path = output_manifest_path(plan.out_base);
-    const fs::path temp_path     = fs::path(manifest_path.string() + ".tmp");
-    require_absent(manifest_path);
-    require_absent(temp_path);
 
     const RunStats stats    = plan_stats(plan);
     json           manifest = {
@@ -626,14 +668,11 @@ RunStats write_manifest(const Plan & plan, const Options & options) {
         });
     }
 
-    try {
-        write_json(temp_path, manifest);
-        fs::rename(temp_path, manifest_path);
-    } catch (...) {
-        std::error_code ignored;
-        fs::remove(temp_path, ignored);
-        throw;
+    for (const PlannedShard & shard : plan.shards) {
+        const ShardPaths paths = shard_paths(plan.out_base, shard.output_index, plan.shards.size());
+        write_or_verify_json(paths.index, build_output_index(plan, shard));
     }
+    write_or_verify_json(manifest_path, manifest);
 
     std::cout << "manifest complete: shards=" << stats.shards << " groups=" << stats.groups << " bytes=" << stats.bytes
               << " manifest=" << manifest_path.string() << '\n';
