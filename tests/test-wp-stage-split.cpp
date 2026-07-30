@@ -59,20 +59,28 @@ void add_tensor_f32(gguf_context * ctx, ggml_context * ctx_meta, const char * na
     }
 }
 
-// write a synthetic 4-layer model with token_embd + output_norm + output
-void write_source_gguf(const std::string & path, std::vector<std::string> & names,
-                       std::vector<float> & data) {
-    gguf_context * ctx  = gguf_init_empty();
-    ggml_init_params mp = {/*.mem_size =*/ 64*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true};
-    ggml_context * ctx_meta = ggml_init(mp);
-
+void set_source_metadata(gguf_context * ctx, bool has_mtp = true) {
     gguf_set_val_str(ctx, "general.architecture", "glm-dsa");
     gguf_set_val_u32(ctx, "glm-dsa.attention.head_count", 2);
     gguf_set_val_str(ctx, "general.name", "wp-stage-split-test");
+    gguf_set_val_u32(ctx, "glm-dsa.block_count", N_LAYER + (has_mtp ? 1 : 0));
+    if (has_mtp) {
+        gguf_set_val_u32(ctx, "glm-dsa.nextn_predict_layers", 1);
+    }
+}
 
-    // block_count includes the NextN layer, as in glm-dsa
-    gguf_set_val_u32(ctx, "glm-dsa.block_count", N_LAYER + 1);
-    gguf_set_val_u32(ctx, "glm-dsa.nextn_predict_layers", 1);
+// write a synthetic 4-layer model with token_embd + output_norm + output
+void write_source_gguf(const std::string &        path,
+                       std::vector<std::string> & names,
+                       std::vector<float> &       data,
+                       int32_t                    split_no    = -1,
+                       int32_t                    split_count = 1,
+                       bool                       has_mtp      = true) {
+    gguf_context *   ctx = gguf_init_empty();
+    ggml_init_params mp = { /*.mem_size =*/64 * ggml_tensor_overhead(), /*.mem_buffer =*/nullptr, /*.no_alloc =*/true };
+    ggml_context *   ctx_meta = ggml_init(mp);
+
+    set_source_metadata(ctx, has_mtp);
 
     add_tensor_f32(ctx, ctx_meta, "token_embd.weight",   N_EMBD, 16, data); names.push_back("token_embd.weight");
     for (int32_t il = 0; il < N_LAYER; ++il) {
@@ -82,11 +90,19 @@ void write_source_gguf(const std::string & path, std::vector<std::string> & name
         std::snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", il);
         add_tensor_f32(ctx, ctx_meta, name, N_EMBD, 4*N_EMBD, data); names.push_back(name);
     }
-    // NextN/MTP tensors live at blk.N_LAYER, past the real layers
-    add_tensor_f32(ctx, ctx_meta, "blk.4.nextn_eh_proj.weight", N_EMBD, N_EMBD, data);
-    names.push_back("blk.4.nextn_eh_proj.weight");
+    if (has_mtp) {
+        // NextN/MTP tensors live at blk.N_LAYER, past the real layers
+        add_tensor_f32(ctx, ctx_meta, "blk.4.nextn_eh_proj.weight", N_EMBD, N_EMBD, data);
+        names.push_back("blk.4.nextn_eh_proj.weight");
+    }
     add_tensor_f32(ctx, ctx_meta, "output_norm.weight",  N_EMBD, 1,  data); names.push_back("output_norm.weight");
     add_tensor_f32(ctx, ctx_meta, "output.weight",       N_EMBD, 16, data); names.push_back("output.weight");
+
+    if (split_no >= 0) {
+        gguf_set_val_u16(ctx, "split.no", (uint16_t) split_no);
+        gguf_set_val_u16(ctx, "split.count", (uint16_t) split_count);
+        gguf_set_val_i32(ctx, "split.tensors.count", (int32_t) names.size());
+    }
 
     // metadata, then data in info order (same idiom as the splitter)
     std::ofstream fout(path, std::ios::binary);
@@ -114,6 +130,22 @@ void write_source_gguf(const std::string & path, std::vector<std::string> & name
     gguf_free(ctx);
 }
 
+void write_metadata_only_shard(const std::string & path, int32_t split_count, int32_t n_tensors) {
+    gguf_context * ctx = gguf_init_empty();
+    set_source_metadata(ctx);
+    gguf_set_val_u16(ctx, "split.no", 0);
+    gguf_set_val_u16(ctx, "split.count", (uint16_t) split_count);
+    gguf_set_val_i32(ctx, "split.tensors.count", n_tensors);
+
+    std::ofstream fout(path, std::ios::binary);
+    fout.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+    std::vector<uint8_t> meta(gguf_get_meta_size(ctx));
+    gguf_get_meta_data(ctx, meta.data());
+    fout.write((const char *) meta.data(), meta.size());
+    fout.close();
+    gguf_free(ctx);
+}
+
 struct stage_contents {
     std::set<std::string> names;
     int32_t first = -1;
@@ -121,6 +153,9 @@ struct stage_contents {
     int32_t n_kv  = 0;
     std::string arch;
     uint32_t block_count = 0;
+    bool                  has_split_no            = false;
+    bool                  has_split_count         = false;
+    bool                  has_split_tensors_count = false;
 };
 
 stage_contents read_stage(const std::string & path, const std::vector<float> & src_data,
@@ -141,6 +176,9 @@ stage_contents read_stage(const std::string & path, const std::vector<float> & s
     sc.last  = gguf_get_val_i32(ctx, kl);
     sc.arch = gguf_get_val_str(ctx, gguf_find_key(ctx, "general.architecture"));
     sc.block_count = gguf_get_val_u32(ctx, gguf_find_key(ctx, "glm-dsa.block_count"));
+    sc.has_split_no            = gguf_find_key(ctx, "split.no") >= 0;
+    sc.has_split_count         = gguf_find_key(ctx, "split.count") >= 0;
+    sc.has_split_tensors_count = gguf_find_key(ctx, "split.tensors.count") >= 0;
 
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     for (int64_t i = 0; i < n_tensors; ++i) {
@@ -173,7 +211,8 @@ stage_contents read_stage(const std::string & path, const std::vector<float> & s
     return sc;
 }
 
-std::set<std::string> expected_stage(int32_t first, int32_t last, bool head, bool tail) {
+std::set<std::string> expected_stage(
+        int32_t first, int32_t last, bool head, bool tail, bool has_mtp = true) {
     std::set<std::string> exp;
     for (int32_t il = first; il <= last; ++il) {
         char name[64];
@@ -183,9 +222,9 @@ std::set<std::string> expected_stage(int32_t first, int32_t last, bool head, boo
         exp.insert(name);
     }
     if (head) exp.insert("token_embd.weight");
-    if (tail) exp.insert("output_norm.weight");
-    if (tail) exp.insert("output.weight");
-    if (tail) exp.insert("blk.4.nextn_eh_proj.weight"); // NextN belongs to the tail
+    if (tail || (head && has_mtp)) exp.insert("output_norm.weight");
+    if (tail || (head && has_mtp)) exp.insert("output.weight");
+    if (head && has_mtp) exp.insert("blk.4.nextn_eh_proj.weight");
     return exp;
 }
 
@@ -196,8 +235,14 @@ int main() {
     const std::string src  = dir + "/src.gguf";
     const std::string head = dir + "/head.gguf";
     const std::string tail = dir + "/tail.gguf";
+    const std::string split_first  = dir + "/src-split-00001-of-00002.gguf";
+    const std::string split_second = dir + "/src-split-00002-of-00002.gguf";
+    const std::string split_head   = dir + "/split-head.gguf";
+    const std::string split_tail   = dir + "/split-tail.gguf";
+    const std::string no_mtp       = dir + "/no-mtp.gguf";
 
-    std::string cmd = "mkdir -p " + dir + " && rm -f " + src + " " + head + " " + tail;
+    std::string cmd = "mkdir -p " + dir + " && rm -f " + src + " " + head + " " + tail + " " + split_first + " " +
+                      split_second + " " + split_head + " " + split_tail + " " + no_mtp;
     if (std::system(cmd.c_str()) != 0) {
         std::fprintf(stderr, "setup failed\n");
         return 1;
@@ -229,18 +274,84 @@ int main() {
     CHECK(sc_head.block_count == N_LAYER + 1);
     CHECK(sc_tail.block_count == N_LAYER + 1);
 
-    // the two stages together cover every source tensor exactly once,
-    // except output_norm/output which only the tail owns -- i.e. union ==
-    // source set and the intersection is empty
+    // Layer tensors partition exactly. The output tensors are the only
+    // intentionally duplicated globals.
     {
+        const std::set<std::string> expected_duplicates = {
+            "output.weight",
+            "output_norm.weight",
+        };
         std::set<std::string> uni = sc_head.names;
         uni.insert(sc_tail.names.begin(), sc_tail.names.end());
         CHECK(uni.size() == src_names.size());
-        std::vector<std::string> inter;
+
+        std::set<std::string> duplicates;
         for (const auto & n : sc_head.names) {
-            if (sc_tail.names.count(n)) inter.push_back(n);
+            if (sc_tail.names.count(n)) duplicates.insert(n);
         }
-        CHECK(inter.empty());
+        CHECK(duplicates == expected_duplicates);
+        for (const std::string & name : duplicates) {
+            std::printf("intentionally duplicated global: %s\n", name.c_str());
+        }
+
+        for (const std::string & name : src_names) {
+            const int owners = (int) sc_head.names.count(name) + (int) sc_tail.names.count(name);
+            if (llama_pipeline_tensor_block_index(name.c_str()) >= 0) {
+                CHECK(owners == 1);
+            } else if (expected_duplicates.count(name)) {
+                CHECK(owners == 2);
+            } else {
+                CHECK(owners == 1);
+            }
+        }
+    }
+
+    // split input with a metadata-only first shard
+    {
+        std::vector<std::string> split_names;
+        std::vector<float>       split_data;
+        write_source_gguf(split_second, split_names, split_data, 1, 2);
+        write_metadata_only_shard(split_first, 2, (int32_t) split_names.size());
+
+        const wp_stage_split::result r_split_head = wp_stage_split::split_stage(split_first, split_head, 0, 1, false);
+        const wp_stage_split::result r_split_tail = wp_stage_split::split_stage(split_first, split_tail, 2, 3, false);
+        CHECK(r_split_head.n_tensors_in == (int64_t) split_names.size());
+        CHECK(r_split_tail.n_tensors_in == (int64_t) split_names.size());
+
+        const stage_contents sc_split_head = read_stage(split_head, split_data, split_names);
+        const stage_contents sc_split_tail = read_stage(split_tail, split_data, split_names);
+        CHECK(sc_split_head.names == expected_stage(0, 1, true, false));
+        CHECK(sc_split_tail.names == expected_stage(2, 3, false, true));
+        CHECK(!sc_split_head.has_split_no);
+        CHECK(!sc_split_head.has_split_count);
+        CHECK(!sc_split_head.has_split_tensors_count);
+        CHECK(!sc_split_tail.has_split_no);
+        CHECK(!sc_split_tail.has_split_count);
+        CHECK(!sc_split_tail.has_split_tensors_count);
+    }
+
+    // A model without MTP metadata keeps output tensors tail-only.
+    {
+        std::vector<std::string> no_mtp_names;
+        std::vector<float>       no_mtp_data;
+        write_source_gguf(no_mtp, no_mtp_names, no_mtp_data, -1, 1, false);
+
+        const wp_stage_split::result r_no_mtp_head =
+            wp_stage_split::split_stage(no_mtp, "", 0, 1, true);
+        const wp_stage_split::result r_no_mtp_tail =
+            wp_stage_split::split_stage(no_mtp, "", 2, 3, true);
+        const std::set<std::string> no_mtp_head_names(
+            r_no_mtp_head.tensor_names.begin(), r_no_mtp_head.tensor_names.end());
+        const std::set<std::string> no_mtp_tail_names(
+            r_no_mtp_tail.tensor_names.begin(), r_no_mtp_tail.tensor_names.end());
+
+        CHECK(no_mtp_head_names == expected_stage(0, 1, true, false, false));
+        CHECK(no_mtp_tail_names == expected_stage(2, 3, false, true, false));
+        std::vector<std::string> no_mtp_duplicates;
+        for (const std::string & name : no_mtp_head_names) {
+            if (no_mtp_tail_names.count(name)) no_mtp_duplicates.push_back(name);
+        }
+        CHECK(no_mtp_duplicates.empty());
     }
 
     // a middle band must refuse neither head nor tail tensors
