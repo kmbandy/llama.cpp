@@ -1,6 +1,7 @@
 #include "wp-expert-worker.h"
 
 #include <charconv>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -13,13 +14,25 @@ void print_usage(const char * argv0) {
     std::cout
         << "usage: " << argv0
         << " --shard-manifest PATH --descriptor PATH --device DEVICE"
-        << " --listen HOST:PORT --slots N\n";
+        << " --listen HOST:PORT --slots N [--host-budget-bytes N]\n"
+        << "       --slots is the device budget in largest-page equivalents\n"
+        << "       staging defaults to up to 16 largest-page buffers\n"
+        << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n";
 }
 
 int parse_positive_int(const std::string & text, const char * option) {
     int value = 0;
     const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
     if (result.ec != std::errc() || result.ptr != text.data() + text.size() || value <= 0) {
+        throw std::invalid_argument(std::string(option) + " requires a positive integer");
+    }
+    return value;
+}
+
+uint64_t parse_positive_u64(const std::string & text, const char * option) {
+    uint64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc() || result.ptr != text.data() + text.size() || value == 0) {
         throw std::invalid_argument(std::string(option) + " requires a positive integer");
     }
     return value;
@@ -61,6 +74,9 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
             endpoint = take();
         } else if (arg == "--slots") {
             options.slots = parse_positive_int(take(), "--slots");
+        } else if (arg == "--host-budget-bytes") {
+            options.host_budget_bytes =
+                parse_positive_u64(take(), "--host-budget-bytes");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -71,6 +87,13 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
             "--shard-manifest, --descriptor, --device, --listen, and --slots are required");
     }
     parse_endpoint(endpoint, options.listen_host, options.listen_port);
+    if (options.host_budget_bytes == 0) {
+        const char * value = std::getenv("WP_EXPERT_HOST_BUDGET_BYTES");
+        if (value != nullptr && value[0] != '\0') {
+            options.host_budget_bytes =
+                parse_positive_u64(value, "WP_EXPERT_HOST_BUDGET_BYTES");
+        }
+    }
     return options;
 }
 

@@ -15,11 +15,16 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -27,6 +32,7 @@ extern "C" {
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -46,6 +52,159 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace wp_expert_worker {
+
+static constexpr uint64_t DEFAULT_STAGING_BUFFERS = 16;
+
+ResourcePlan plan_resources(
+        const std::vector<ResourcePage> & pages,
+        int requested_slots,
+        uint64_t host_budget_bytes) {
+    if (pages.empty() || requested_slots <= 0) {
+        throw std::invalid_argument("invalid expert resource plan dimensions");
+    }
+
+    std::map<uint64_t, int> histogram;
+    std::map<uint64_t, std::map<int, int>> layer_counts;
+    uint64_t max_page_size = 0;
+    for (const ResourcePage & page : pages) {
+        if (page.layer < 0 || page.size == 0 ||
+            histogram[page.size] == std::numeric_limits<int>::max() ||
+            layer_counts[page.size][page.layer] == std::numeric_limits<int>::max()) {
+            throw std::invalid_argument("invalid expert resource page");
+        }
+        ++histogram[page.size];
+        ++layer_counts[page.size][page.layer];
+        max_page_size = std::max(max_page_size, page.size);
+    }
+    if (max_page_size >
+        std::numeric_limits<uint64_t>::max() / (uint64_t) requested_slots) {
+        throw std::overflow_error("expert device budget overflows");
+    }
+
+    ResourcePlan result;
+    result.requested_slots      = requested_slots;
+    result.device_budget_bytes =
+        max_page_size * (uint64_t) requested_slots;
+
+    uint64_t    total_pages   = 0;
+    long double weighted_bytes = 0.0;
+    uint64_t    floor_bytes   = 0;
+    std::vector<SlotClass> classes;
+    classes.reserve(histogram.size());
+    for (const auto & item : histogram) {
+        int floor = 0;
+        for (const auto & layer : layer_counts.at(item.first)) {
+            floor = std::max(floor, layer.second);
+        }
+        if ((uint64_t) floor >
+            (std::numeric_limits<uint64_t>::max() - floor_bytes) / item.first) {
+            throw std::overflow_error("expert pin floor overflows");
+        }
+        floor_bytes += item.first * (uint64_t) floor;
+        total_pages += (uint64_t) item.second;
+        weighted_bytes +=
+            (long double) item.first * (long double) item.second;
+        classes.push_back({ item.first, 0, floor, item.second });
+    }
+
+    bool use_size_classes = floor_bytes <= result.device_budget_bytes;
+    if (use_size_classes) {
+        const long double average =
+            weighted_bytes / (long double) total_pages;
+        const long double remaining =
+            (long double) (result.device_budget_bytes - floor_bytes);
+        const long double remaining_slots = remaining / average;
+        for (SlotClass & slot_class : classes) {
+            const long double fraction =
+                (long double) slot_class.pages / (long double) total_pages;
+            long long count =
+                (long long) slot_class.pin_floor +
+                std::llround(fraction * remaining_slots);
+            count = std::max<long long>(1, count);
+            count = std::max<long long>(slot_class.pin_floor, count);
+            count = std::min<long long>(slot_class.pages, count);
+            slot_class.slots = (int) count;
+        }
+
+        auto planned_bytes = [&]() {
+            uint64_t bytes = 0;
+            for (const SlotClass & slot_class : classes) {
+                bytes += slot_class.size * (uint64_t) slot_class.slots;
+            }
+            return bytes;
+        };
+        while (planned_bytes() > result.device_budget_bytes) {
+            SlotClass * trim = nullptr;
+            for (SlotClass & slot_class : classes) {
+                const int keep = std::max(1, slot_class.pin_floor);
+                if (slot_class.slots > keep &&
+                    (trim == nullptr || slot_class.size > trim->size)) {
+                    trim = &slot_class;
+                }
+            }
+            if (trim == nullptr) {
+                use_size_classes = false;
+                break;
+            }
+            --trim->slots;
+        }
+    }
+
+    if (!use_size_classes) {
+        int max_layer_pages = 0;
+        std::map<int, int> pages_by_layer;
+        for (const ResourcePage & page : pages) {
+            max_layer_pages =
+                std::max(max_layer_pages, ++pages_by_layer[page.layer]);
+        }
+        if (requested_slots < max_layer_pages) {
+            throw std::invalid_argument(
+                "expert slot budget is smaller than the largest layer request");
+        }
+        classes.clear();
+        classes.push_back({
+            max_page_size, requested_slots, max_layer_pages, (int) pages.size()
+        });
+    }
+
+    result.size_classes = use_size_classes;
+    result.slot_classes = std::move(classes);
+    for (const SlotClass & slot_class : result.slot_classes) {
+        if (slot_class.slots >
+            std::numeric_limits<int>::max() - result.slot_count) {
+            throw std::overflow_error("expert slot count overflows");
+        }
+        result.slot_count += slot_class.slots;
+        result.device_bytes +=
+            slot_class.size * (uint64_t) slot_class.slots;
+    }
+
+    if (max_page_size >
+        std::numeric_limits<uint64_t>::max() / DEFAULT_STAGING_BUFFERS) {
+        throw std::overflow_error("default expert host budget overflows");
+    }
+    result.host_budget_bytes = host_budget_bytes == 0
+        ? max_page_size * std::min<uint64_t>(
+              (uint64_t) result.slot_count, DEFAULT_STAGING_BUFFERS)
+        : host_budget_bytes;
+    if (result.host_budget_bytes < max_page_size) {
+        throw std::invalid_argument(
+            "expert host budget is smaller than the largest page");
+    }
+    const uint64_t staging_count =
+        std::min<uint64_t>(
+            (uint64_t) result.slot_count,
+            result.host_budget_bytes / max_page_size);
+    if (staging_count == 0 ||
+        staging_count > (uint64_t) std::numeric_limits<int>::max()) {
+        throw std::overflow_error("invalid expert staging buffer count");
+    }
+    result.staging_buffers      = (int) staging_count;
+    result.staging_buffer_bytes = max_page_size;
+    result.staging_bytes        = max_page_size * staging_count;
+    return result;
+}
+
 namespace {
 
 static constexpr const char * MANIFEST_FORMAT =
@@ -483,19 +642,157 @@ backend_ptr init_backend(const std::string & device) {
     return backend_ptr(backend);
 }
 
+std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
+    std::vector<ResourcePage> result;
+    result.reserve(catalog.pages.size());
+    for (const auto & item : catalog.pages) {
+        result.push_back({ item.second.layer, item.second.size });
+    }
+    return result;
+}
+
+struct free_deleter {
+    void operator()(void * p) const {
+        std::free(p);
+    }
+};
+
+class StagingPool {
+public:
+    explicit StagingPool(const ResourcePlan & resources) :
+        buffer_bytes_(resources.staging_buffer_bytes) {
+        buffers_.reserve((size_t) resources.staging_buffers);
+        available_.reserve((size_t) resources.staging_buffers);
+        for (int i = 0; i < resources.staging_buffers; ++i) {
+            void * raw = nullptr;
+            if (posix_memalign(
+                    &raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0) {
+                throw std::runtime_error(
+                    "failed to allocate aligned O_DIRECT staging buffer");
+            }
+            buffers_.emplace_back(raw);
+            available_.push_back(raw);
+        }
+    }
+
+    class Lease {
+    public:
+        Lease(Lease && other) noexcept :
+            owner_(other.owner_), data_(other.data_) {
+            other.owner_ = nullptr;
+            other.data_  = nullptr;
+        }
+
+        ~Lease() {
+            if (owner_ != nullptr) {
+                owner_->release(data_);
+            }
+        }
+
+        Lease(const Lease &) = delete;
+        Lease & operator=(const Lease &) = delete;
+        Lease & operator=(Lease &&) = delete;
+
+        void * get() const {
+            return data_;
+        }
+
+    private:
+        friend class StagingPool;
+
+        Lease(StagingPool * owner, void * data) :
+            owner_(owner), data_(data) {
+        }
+
+        StagingPool * owner_ = nullptr;
+        void *        data_  = nullptr;
+    };
+
+    Lease borrow() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        available_cv_.wait(lock, [&]() { return !available_.empty(); });
+        void * result = available_.back();
+        available_.pop_back();
+        return Lease(this, result);
+    }
+
+    int buffer_count() const {
+        return (int) buffers_.size();
+    }
+
+    uint64_t buffer_bytes() const {
+        return buffer_bytes_;
+    }
+
+private:
+    void release(void * data) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            available_.push_back(data);
+        }
+        available_cv_.notify_one();
+    }
+
+    uint64_t                                        buffer_bytes_ = 0;
+    std::vector<std::unique_ptr<void, free_deleter>> buffers_;
+    std::vector<void *>                             available_;
+    std::mutex                                      mutex_;
+    std::condition_variable                         available_cv_;
+};
+
 class ExpertSlotPool {
+private:
+    struct Miss {
+        size_t             entry_index = 0;
+        size_t             slot_index  = 0;
+        const ExpertPage * page        = nullptr;
+        int                fd          = -1;
+    };
+
+    struct ReadResult {
+        size_t                              miss_index = 0;
+        std::unique_ptr<StagingPool::Lease> staging;
+        std::exception_ptr                  error;
+    };
+
+    struct BatchState {
+        std::vector<Miss>                       misses;
+        std::atomic<size_t>                     next{0};
+        std::mutex                              mutex;
+        std::condition_variable                 cv;
+        std::deque<std::unique_ptr<ReadResult>> ready;
+        bool                                    start  = false;
+        bool                                    cancel = false;
+    };
+
 public:
     ExpertSlotPool(
-            ggml_backend_t backend, int n_slots, uint64_t max_page_size) :
-        backend_(backend), capacity_(max_page_size) {
-        if (n_slots <= 0 || capacity_ == 0 ||
-            capacity_ > (uint64_t) std::numeric_limits<size_t>::max()) {
+            ggml_backend_t backend, ResourcePlan resources,
+            TestHooks * test_hooks) :
+        backend_(backend),
+        resources_(std::move(resources)),
+        staging_(resources_),
+        test_hooks_(test_hooks) {
+        if (resources_.slot_count <= 0 ||
+            resources_.staging_buffer_bytes == 0 ||
+            resources_.staging_buffer_bytes >
+                (uint64_t) std::numeric_limits<size_t>::max()) {
             throw std::runtime_error("invalid expert slot pool dimensions");
         }
-        slots_.reserve((size_t) n_slots);
-        for (int i = 0; i < n_slots; ++i) {
-            slots_.push_back(make_slot());
+        slots_.reserve((size_t) resources_.slot_count);
+        resources_.device_bytes = 0;
+        for (const SlotClass & slot_class : resources_.slot_classes) {
+            for (int i = 0; i < slot_class.slots; ++i) {
+                slots_.push_back(make_slot(slot_class.size));
+                resources_.device_bytes +=
+                    ggml_backend_buffer_get_size(slots_.back().buffer.get());
+            }
         }
+        resources_.staging_buffers      = staging_.buffer_count();
+        resources_.staging_buffer_bytes = staging_.buffer_bytes();
+        resources_.staging_bytes =
+            resources_.staging_buffer_bytes *
+            (uint64_t) resources_.staging_buffers;
     }
 
     ~ExpertSlotPool() {
@@ -511,61 +808,351 @@ public:
         void *                base   = nullptr;
     };
 
-    Loaded ensure(const ExpertPage & page) {
-        const std::pair<int, int> key(page.layer, page.expert);
-        for (Slot & slot : slots_) {
-            if (slot.valid && slot.key == key) {
-                slot.tick = ++tick_;
-                return { slot.buffer.get(), ggml_backend_buffer_get_base(slot.buffer.get()) };
-            }
+    class Batch {
+    public:
+        Batch(Batch && other) noexcept;
+        ~Batch();
+
+        Batch(const Batch &) = delete;
+        Batch & operator=(const Batch &) = delete;
+        Batch & operator=(Batch &&) = delete;
+
+        bool is_hit(size_t index) const {
+            return entries_.at(index).hit;
         }
 
-        Slot * victim = nullptr;
-        for (Slot & slot : slots_) {
-            if (!slot.valid || victim == nullptr || slot.tick < victim->tick) {
-                victim = &slot;
-                if (!slot.valid) {
-                    break;
+        const Loaded & loaded(size_t index) const {
+            const Entry & entry = entries_.at(index);
+            if (!entry.ready) {
+                throw std::logic_error("expert batch entry is not ready");
+            }
+            return entry.loaded;
+        }
+
+        void complete();
+
+    private:
+        friend class ExpertSlotPool;
+
+        struct Entry {
+            Loaded loaded;
+            size_t slot_index = std::numeric_limits<size_t>::max();
+            bool   hit        = false;
+            bool   ready      = false;
+        };
+
+        explicit Batch(ExpertSlotPool * owner, size_t count) :
+            owner_(owner), entries_(count) {
+        }
+
+        ExpertSlotPool *           owner_ = nullptr;
+        std::vector<Entry>         entries_;
+        std::shared_ptr<BatchState> state_;
+        std::vector<std::thread>   workers_;
+        bool                       completed_ = false;
+    };
+
+    Batch ensure_batch(const std::vector<const ExpertPage *> & pages) {
+        Batch batch(this, pages.size());
+        try {
+            std::vector<size_t> misses;
+            misses.reserve(pages.size());
+
+            // Resolve and pin every hit before selecting a victim. A hit is
+            // immediately usable while sibling misses are read.
+            for (size_t i = 0; i < pages.size(); ++i) {
+                const ExpertPage & page = *pages[i];
+                const std::pair<int, int> key(page.layer, page.expert);
+                size_t slot_index = slots_.size();
+                for (size_t j = 0; j < slots_.size(); ++j) {
+                    if (slots_[j].valid && slots_[j].key == key) {
+                        slot_index = j;
+                        break;
+                    }
+                }
+                if (slot_index == slots_.size()) {
+                    misses.push_back(i);
+                    continue;
+                }
+                Slot & slot = slots_[slot_index];
+                ++slot.pin_count;
+                slot.tick = ++tick_;
+                batch.entries_[i] = {
+                    { slot.buffer.get(),
+                      ggml_backend_buffer_get_base(slot.buffer.get()) },
+                    slot_index,
+                    true,
+                    true,
+                };
+            }
+
+            // Reserve and pin all miss slots before starting any read. Later
+            // allocations in this request cannot select an earlier miss.
+            for (size_t entry_index : misses) {
+                const ExpertPage & page = *pages[entry_index];
+                const size_t slot_index = select_victim(page.size);
+                if (slot_index == slots_.size()) {
+                    throw std::runtime_error(
+                        "no expert slot can hold requested page");
+                }
+                ++slots_[slot_index].pin_count;
+                batch.entries_[entry_index].slot_index = slot_index;
+            }
+
+            batch.state_ = std::make_shared<BatchState>();
+            batch.state_->misses.reserve(misses.size());
+            for (size_t entry_index : misses) {
+                const ExpertPage & page = *pages[entry_index];
+                const size_t slot_index =
+                    batch.entries_[entry_index].slot_index;
+                Slot & slot = slots_[slot_index];
+                slot.valid = false;
+                batch.state_->misses.push_back({
+                    entry_index, slot_index, &page, fd_for(page.blob)
+                });
+                if (test_hooks_ != nullptr &&
+                    test_hooks_->slot_reserved) {
+                    test_hooks_->slot_reserved(
+                        page.layer, page.expert, (int) slot_index);
                 }
             }
+
+            if (misses.empty()) {
+                batch.completed_ = true;
+                return batch;
+            }
+
+            const size_t worker_count = std::min<size_t>(
+                misses.size(), (size_t) staging_.buffer_count());
+            batch.workers_.reserve(worker_count);
+            for (size_t i = 0; i < worker_count; ++i) {
+                batch.workers_.emplace_back(
+                    [this, state = batch.state_]() {
+                        read_worker(state);
+                    });
+            }
+            {
+                std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                batch.state_->start = true;
+            }
+            batch.state_->cv.notify_all();
+            return batch;
+        } catch (...) {
+            cancel_workers(batch);
+            release_pins(batch);
+            throw;
         }
-        if (victim == nullptr || page.size > capacity_) {
-            throw std::runtime_error("no expert slot can hold requested page");
-        }
-        read_page(page, victim->host.get());
-        ggml_backend_tensor_set(victim->raw, victim->host.get(), 0, (size_t) page.size);
-        victim->valid = true;
-        victim->key   = key;
-        victim->tick  = ++tick_;
-        return { victim->buffer.get(), ggml_backend_buffer_get_base(victim->buffer.get()) };
+    }
+
+    const ResourcePlan & resources() const {
+        return resources_;
     }
 
 private:
-    struct free_deleter {
-        void operator()(void * p) const {
-            std::free(p);
-        }
-    };
-
     struct Slot {
-        std::unique_ptr<void, free_deleter> host;
-        context_ptr                        ctx;
-        buffer_ptr                         buffer;
-        ggml_tensor *                      raw = nullptr;
-        std::pair<int, int>                key;
-        uint64_t                           tick = 0;
-        bool                               valid = false;
+        context_ptr         ctx;
+        buffer_ptr          buffer;
+        ggml_tensor *       raw       = nullptr;
+        std::pair<int, int> key;
+        uint64_t            capacity  = 0;
+        uint64_t            tick      = 0;
+        int                 pin_count = 0;
+        bool                valid     = false;
     };
 
-    Slot make_slot() {
-        void * host_raw = nullptr;
-        if (posix_memalign(&host_raw, DIRECT_ALIGNMENT, (size_t) capacity_) != 0) {
-            throw std::runtime_error("failed to allocate aligned O_DIRECT expert slot");
+    size_t select_victim(uint64_t page_size) const {
+        size_t victim = slots_.size();
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            const Slot & slot = slots_[i];
+            if (slot.pin_count != 0 || slot.valid ||
+                page_size > slot.capacity) {
+                continue;
+            }
+            if (victim == slots_.size() ||
+                slot.capacity < slots_[victim].capacity) {
+                victim = i;
+            }
+        }
+        if (victim != slots_.size()) {
+            return victim;
+        }
+
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            const Slot & slot = slots_[i];
+            if (slot.pin_count != 0 || !slot.valid ||
+                page_size > slot.capacity) {
+                continue;
+            }
+            if (victim == slots_.size() ||
+                slot.capacity < slots_[victim].capacity ||
+                (slot.capacity == slots_[victim].capacity &&
+                 slot.tick < slots_[victim].tick)) {
+                victim = i;
+            }
+        }
+        return victim;
+    }
+
+    void read_worker(const std::shared_ptr<BatchState> & state) {
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&]() {
+                return state->start || state->cancel;
+            });
+            if (state->cancel) {
+                return;
+            }
+        }
+
+        while (true) {
+            const size_t miss_index =
+                state->next.fetch_add(1, std::memory_order_relaxed);
+            if (miss_index >= state->misses.size()) {
+                return;
+            }
+            const Miss & miss = state->misses[miss_index];
+            auto result = std::make_unique<ReadResult>();
+            result->miss_index = miss_index;
+            bool read_started = false;
+            try {
+                result->staging = std::make_unique<StagingPool::Lease>(
+                    staging_.borrow());
+                if (test_hooks_ != nullptr &&
+                    test_hooks_->staging_borrowed) {
+                    test_hooks_->staging_borrowed();
+                }
+                read_started = true;
+                if (test_hooks_ != nullptr &&
+                    test_hooks_->read_started) {
+                    test_hooks_->read_started(
+                        miss.page->layer, miss.page->expert);
+                }
+                read_page(*miss.page, miss.fd, result->staging->get());
+            } catch (...) {
+                result->error = std::current_exception();
+            }
+            if (read_started && test_hooks_ != nullptr &&
+                test_hooks_->read_finished) {
+                try {
+                    test_hooks_->read_finished(
+                        miss.page->layer, miss.page->expert);
+                } catch (...) {
+                    if (result->error == nullptr) {
+                        result->error = std::current_exception();
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->ready.push_back(std::move(result));
+            }
+            state->cv.notify_one();
+        }
+    }
+
+    void complete_batch(Batch & batch) {
+        if (batch.completed_) {
+            return;
+        }
+
+        std::exception_ptr first_error;
+        size_t received = 0;
+        while (received < batch.state_->misses.size()) {
+            std::unique_ptr<ReadResult> result;
+            {
+                std::unique_lock<std::mutex> lock(batch.state_->mutex);
+                batch.state_->cv.wait(lock, [&]() {
+                    return !batch.state_->ready.empty();
+                });
+                result = std::move(batch.state_->ready.front());
+                batch.state_->ready.pop_front();
+            }
+
+            const Miss & miss =
+                batch.state_->misses[result->miss_index];
+            if (result->error != nullptr) {
+                if (first_error == nullptr) {
+                    first_error = result->error;
+                }
+            } else {
+                Slot & slot = slots_[miss.slot_index];
+                ggml_backend_tensor_set(
+                    slot.raw, result->staging->get(), 0,
+                    (size_t) miss.page->size);
+                slot.valid = true;
+                slot.key   = {
+                    miss.page->layer, miss.page->expert
+                };
+                slot.tick  = ++tick_;
+                Batch::Entry & entry =
+                    batch.entries_[miss.entry_index];
+                entry.loaded = {
+                    slot.buffer.get(),
+                    ggml_backend_buffer_get_base(slot.buffer.get())
+                };
+                entry.ready = true;
+            }
+            result.reset();
+            ++received;
+        }
+
+        for (std::thread & worker : batch.workers_) {
+            worker.join();
+        }
+        batch.workers_.clear();
+        batch.completed_ = true;
+        if (first_error != nullptr) {
+            std::rethrow_exception(first_error);
+        }
+    }
+
+    void cancel_workers(Batch & batch) {
+        if (batch.state_ != nullptr && !batch.workers_.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                batch.state_->cancel = true;
+            }
+            batch.state_->cv.notify_all();
+            for (std::thread & worker : batch.workers_) {
+                worker.join();
+            }
+            batch.workers_.clear();
+        }
+    }
+
+    void release_pins(Batch & batch) noexcept {
+        for (const Batch::Entry & entry : batch.entries_) {
+            if (entry.slot_index == std::numeric_limits<size_t>::max()) {
+                continue;
+            }
+            Slot & slot = slots_[entry.slot_index];
+            if (slot.pin_count > 0) {
+                --slot.pin_count;
+            }
+        }
+        batch.entries_.clear();
+    }
+
+    void abandon_batch(Batch & batch) noexcept {
+        if (!batch.completed_) {
+            try {
+                complete_batch(batch);
+            } catch (...) {
+            }
+        }
+        release_pins(batch);
+    }
+
+    Slot make_slot(uint64_t capacity) {
+        if (capacity == 0 ||
+            capacity > (uint64_t) std::numeric_limits<size_t>::max() ||
+            capacity > (uint64_t) std::numeric_limits<int64_t>::max()) {
+            throw std::runtime_error("invalid expert slot capacity");
         }
 
         Slot slot;
-        slot.host.reset(host_raw);
-        slot.buffer.reset(ggml_backend_alloc_buffer(backend_, (size_t) capacity_));
+        slot.capacity = capacity;
+        slot.buffer.reset(ggml_backend_alloc_buffer(backend_, (size_t) capacity));
         if (!slot.buffer) {
             throw std::runtime_error("failed to allocate device expert slot");
         }
@@ -580,7 +1167,8 @@ private:
         if (!slot.ctx) {
             throw std::runtime_error("failed to allocate expert slot metadata");
         }
-        slot.raw = ggml_new_tensor_1d(slot.ctx.get(), GGML_TYPE_I8, (int64_t) capacity_);
+        slot.raw = ggml_new_tensor_1d(
+            slot.ctx.get(), GGML_TYPE_I8, (int64_t) capacity);
         slot.raw->buffer = slot.buffer.get();
         slot.raw->data   = ggml_backend_buffer_get_base(slot.buffer.get());
         if (slot.raw->data == nullptr ||
@@ -610,9 +1198,8 @@ private:
 #endif
     }
 
-    void read_page(const ExpertPage & page, void * dst) {
+    void read_page(const ExpertPage & page, int fd, void * dst) {
 #if defined(__linux__)
-        const int fd = fd_for(page.blob);
         ssize_t n = -1;
         do {
             n = pread(fd, dst, (size_t) page.size, (off_t) page.offset);
@@ -624,16 +1211,41 @@ private:
         }
 #else
         (void) page;
+        (void) fd;
         (void) dst;
 #endif
     }
 
     ggml_backend_t             backend_ = nullptr;
-    uint64_t                   capacity_ = 0;
+    ResourcePlan               resources_;
+    StagingPool                staging_;
+    TestHooks *                test_hooks_ = nullptr;
     uint64_t                   tick_ = 0;
     std::vector<Slot>          slots_;
     std::map<std::string, int> fds_;
 };
+
+ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
+    owner_(other.owner_),
+    entries_(std::move(other.entries_)),
+    state_(std::move(other.state_)),
+    workers_(std::move(other.workers_)),
+    completed_(other.completed_) {
+    other.owner_ = nullptr;
+}
+
+ExpertSlotPool::Batch::~Batch() {
+    if (owner_ != nullptr) {
+        owner_->abandon_batch(*this);
+    }
+}
+
+void ExpertSlotPool::Batch::complete() {
+    if (owner_ == nullptr) {
+        throw std::logic_error("expert batch has no owner");
+    }
+    owner_->complete_batch(*this);
+}
 
 void attach_weight(
         ggml_tensor * tensor, ggml_backend_buffer_t buffer, void * base,
@@ -704,11 +1316,20 @@ std::vector<float> compute_expert(
 
 class Worker {
 public:
-    Worker(Catalog catalog, const std::string & device, int slots) :
+    Worker(
+            Catalog catalog,
+            const std::string & device,
+            int slots,
+            uint64_t host_budget_bytes,
+            TestHooks * test_hooks) :
         catalog_(std::move(catalog)),
         backend_(init_backend(device)),
-        pool_(backend_.get(), slots, catalog_.max_page_size),
-        slots_(slots) {
+        pool_(
+            backend_.get(),
+            plan_resources(
+                resource_pages(catalog_), slots, host_budget_bytes),
+            test_hooks),
+        slots_(pool_.resources().slot_count) {
     }
 
     pipe_expert_hello hello() const {
@@ -763,15 +1384,40 @@ public:
         for (size_t i = 0; i < request.activations.size(); ++i) {
             activation[i] = ggml_fp16_to_fp32((ggml_fp16_t) request.activations[i]);
         }
+        std::vector<const ExpertPage *> pages;
+        pages.reserve(request.assignments.size());
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            pages.push_back(&catalog_.pages.at({
+                request.layer, assignment.expert_id
+            }));
+        }
+        ExpertSlotPool::Batch batch = pool_.ensure_batch(pages);
+
+        std::vector<std::vector<float>> values(request.assignments.size());
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (!batch.is_hit(i)) {
+                continue;
+            }
+            values[i] = compute_expert(
+                backend_.get(), catalog_.descriptor, *pages[i],
+                batch.loaded(i), activation, request.n_tokens);
+        }
+        batch.complete();
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (batch.is_hit(i)) {
+                continue;
+            }
+            values[i] = compute_expert(
+                backend_.get(), catalog_.descriptor, *pages[i],
+                batch.loaded(i), activation, request.n_tokens);
+        }
+
         std::vector<float> sum(
             (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
-        for (const pipe_expert_assignment & assignment : request.assignments) {
-            const ExpertPage & page =
-                catalog_.pages.at({ request.layer, assignment.expert_id });
-            const ExpertSlotPool::Loaded loaded = pool_.ensure(page);
-            const std::vector<float> value = compute_expert(
-                backend_.get(), catalog_.descriptor, page, loaded,
-                activation, request.n_tokens);
+        for (size_t j = 0; j < request.assignments.size(); ++j) {
+            const pipe_expert_assignment & assignment =
+                request.assignments[j];
+            const std::vector<float> & value = values[j];
             for (uint32_t token = 0; token < request.n_tokens; ++token) {
                 const float weight = assignment.weights[token];
                 const size_t base =
@@ -790,6 +1436,10 @@ public:
             response.partial[i] = (uint16_t) ggml_fp32_to_fp16(sum[i]);
         }
         return response;
+    }
+
+    const ResourcePlan & resources() const {
+        return pool_.resources();
     }
 
 private:
@@ -897,6 +1547,21 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
 
 } // namespace
 
+ResourcePlan inspect_resources(const Options & options) {
+    if (options.slots <= 0 || options.device.empty()) {
+        throw std::invalid_argument("invalid expert worker resource options");
+    }
+    const fs::path manifest   = fs::canonical(options.shard_manifest);
+    const fs::path descriptor = fs::canonical(options.descriptor);
+    Worker worker(
+        load_catalog(manifest, descriptor),
+        options.device,
+        options.slots,
+        options.host_budget_bytes,
+        options.test_hooks);
+    return worker.resources();
+}
+
 int run(const Options & options) {
     if (options.slots <= 0 || options.listen_host.empty() ||
         options.listen_port <= 0 || options.listen_port > 65535 ||
@@ -905,8 +1570,14 @@ int run(const Options & options) {
     }
     const fs::path manifest = fs::canonical(options.shard_manifest);
     const fs::path descriptor = fs::canonical(options.descriptor);
-    Worker worker(load_catalog(manifest, descriptor), options.device, options.slots);
+    Worker worker(
+        load_catalog(manifest, descriptor),
+        options.device,
+        options.slots,
+        options.host_budget_bytes,
+        options.test_hooks);
     const pipe_expert_hello advertised = worker.hello();
+    const ResourcePlan & resources = worker.resources();
 
     pipe_socket_ptr server =
         pipe_socket_t::create_server(options.listen_host.c_str(), options.listen_port);
@@ -919,7 +1590,19 @@ int run(const Options & options) {
               << options.listen_port << " device=" << options.device
               << " experts=" << advertised.expert_first << "-"
               << advertised.expert_last << " layers=" << advertised.layers.size()
-              << " slots=" << advertised.n_slots << '\n';
+              << " slots=" << advertised.n_slots
+              << " requested_slots=" << resources.requested_slots
+              << " device_bytes=" << resources.device_bytes
+              << " size_classes=" << (resources.size_classes ? 1 : 0)
+              << " staging=" << resources.staging_buffers << "x"
+              << resources.staging_buffer_bytes
+              << " host_budget=" << resources.host_budget_bytes << '\n';
+    for (const SlotClass & slot_class : resources.slot_classes) {
+        std::cout << "expert slot class bytes=" << slot_class.size
+                  << " slots=" << slot_class.slots
+                  << " pin_floor=" << slot_class.pin_floor
+                  << " pages=" << slot_class.pages << '\n';
+    }
 
     int result = 0;
     do {

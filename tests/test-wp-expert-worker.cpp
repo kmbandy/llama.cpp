@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +21,8 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -34,7 +37,13 @@ namespace {
 static constexpr int N_EMBD   = 32;
 static constexpr int N_FF_EXP = 32;
 static constexpr int LAYER    = 3;
+static constexpr int OTHER_LAYER = 4;
 static constexpr int N_TOKENS = 2;
+static constexpr uint64_t ROLE_BYTES =
+    (uint64_t) N_EMBD * N_FF_EXP * sizeof(float);
+static constexpr uint64_t PAGE_BYTES = ROLE_BYTES * 3;
+
+static_assert(PAGE_BYTES % 4096 == 0, "synthetic expert page must be O_DIRECT aligned");
 
 void require(bool condition, const char * message) {
     if (!condition) {
@@ -95,54 +104,6 @@ Fixture make_fixture(const fs::path & dir) {
     Fixture fixture;
     fixture.descriptor = dir / "synthetic.expert-descriptor.json";
     fixture.manifest   = dir / "synthetic-experts-manifest.json";
-    const fs::path sidecar = dir / "synthetic-00001-of-00001.wpi.json";
-    const fs::path blob    = dir / "synthetic-00001-of-00001.wpb";
-
-    constexpr uint64_t role_bytes = (uint64_t) N_EMBD * N_FF_EXP * sizeof(float);
-    constexpr uint64_t page_bytes = role_bytes * 3;
-    static_assert(page_bytes % 4096 == 0, "synthetic expert page must be O_DIRECT aligned");
-
-    json groups = json::array();
-    std::ofstream blob_output(blob, std::ios::binary);
-    if (!blob_output) {
-        throw std::runtime_error("failed to create synthetic blob");
-    }
-    uint64_t offset = 0;
-    for (int expert = 0; expert < 4; ++expert) {
-        json members = json::array();
-        for (const auto & role : {
-                 std::make_pair(std::string("up"), 1),
-                 std::make_pair(std::string("gate"), 2),
-                 std::make_pair(std::string("down"), 4) }) {
-            const int role_index =
-                role.first == "up" ? 0 : (role.first == "gate" ? 1 : 2);
-            std::vector<float> matrix = make_matrix(expert, role_index);
-            fixture.weights.emplace(
-                std::make_pair(expert, role.first), matrix);
-            blob_output.write(
-                reinterpret_cast<const char *>(matrix.data()),
-                (std::streamsize) (matrix.size() * sizeof(float)));
-            members.push_back({
-                { "role_mask", role.second },
-                { "size", role_bytes },
-                { "offset", offset },
-                { "catalog_name",
-                  "blk.3.ffn_" + role.first + "." + std::to_string(expert) + ".weight" },
-                { "source_tensor_name", "synthetic." + role.first },
-                { "source_file_idx", 0 },
-                { "source_file_offset", offset },
-            });
-            offset += role_bytes;
-        }
-        groups.push_back({
-            { "block_idx", LAYER },
-            { "expert_idx", expert },
-            { "member_count", 3 },
-            { "members", std::move(members) },
-        });
-    }
-    blob_output.close();
-    require(offset == page_bytes * 4, "synthetic blob size mismatch");
 
     const json identity = {
         { "algorithm", "sha256" },
@@ -154,8 +115,19 @@ Fixture make_fixture(const fs::path & dir) {
             { "ggml_type", (int) GGML_TYPE_F32 },
             { "ggml_type_name", ggml_type_name(GGML_TYPE_F32) },
             { "shape", role_shape },
-            { "bytes_per_expert", role_bytes },
+            { "bytes_per_expert", ROLE_BYTES },
             { "source_tensor_name", std::string("synthetic.") + role },
+        };
+    };
+    const auto layer_desc = [&](int layer) {
+        return json{
+            { "layer", layer },
+            { "roles",
+              {
+                  { "gate", role_desc("gate") },
+                  { "up", role_desc("up") },
+                  { "down", role_desc("down") },
+              } },
         };
     };
     write_json(fixture.descriptor, {
@@ -172,7 +144,7 @@ Fixture make_fixture(const fs::path & dir) {
         { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
         { "hparams",
           {
-              { "n_layer", 4 },
+              { "n_layer", 5 },
               { "n_embd", N_EMBD },
               { "n_ff_exp", N_FF_EXP },
               { "n_expert", 4 },
@@ -180,33 +152,88 @@ Fixture make_fixture(const fs::path & dir) {
               { "activation", "silu" },
           } },
         { "layers",
-          {
-              {
-                  { "layer", LAYER },
-                  { "roles",
-                    {
-                        { "gate", role_desc("gate") },
-                        { "up", role_desc("up") },
-                        { "down", role_desc("down") },
-                    } },
-              },
-          } },
+          { layer_desc(LAYER), layer_desc(OTHER_LAYER) } },
     });
 
-    write_json(sidecar, {
-        { "format", "llama.cpp.weight-pager.expert-shard-index" },
-        { "version", 1 },
-        { "blob_file", blob.filename().string() },
-        { "shard_index", 0 },
-        { "shard_count", 1 },
-        { "layer_first", LAYER },
-        { "layer_last", LAYER },
-        { "group_count", 4 },
-        { "blob_bytes", offset },
-        { "content_hash", identity },
-        { "model_files", { "synthetic.gguf" } },
-        { "groups", std::move(groups) },
-    });
+    json shards = json::array();
+    uint64_t total_blob_bytes = 0;
+    int shard_index = 0;
+    for (int layer : { LAYER, OTHER_LAYER }) {
+        const std::string stem =
+            "synthetic-0000" + std::to_string(shard_index + 1) +
+            "-of-00002";
+        const fs::path sidecar = dir / (stem + ".wpi.json");
+        const fs::path blob    = dir / (stem + ".wpb");
+        json groups = json::array();
+        std::ofstream blob_output(blob, std::ios::binary);
+        if (!blob_output) {
+            throw std::runtime_error("failed to create synthetic blob");
+        }
+        uint64_t offset = 0;
+        for (int expert = 0; expert < 4; ++expert) {
+            json members = json::array();
+            for (const auto & role : {
+                     std::make_pair(std::string("up"), 1),
+                     std::make_pair(std::string("gate"), 2),
+                     std::make_pair(std::string("down"), 4) }) {
+                const int role_index =
+                    role.first == "up" ? 0 : (role.first == "gate" ? 1 : 2);
+                std::vector<float> matrix = make_matrix(expert, role_index);
+                fixture.weights.emplace(
+                    std::make_pair(expert, role.first), matrix);
+                blob_output.write(
+                    reinterpret_cast<const char *>(matrix.data()),
+                    (std::streamsize) (matrix.size() * sizeof(float)));
+                members.push_back({
+                    { "role_mask", role.second },
+                    { "size", ROLE_BYTES },
+                    { "offset", offset },
+                    { "catalog_name",
+                      "blk." + std::to_string(layer) + ".ffn_" +
+                      role.first + "." + std::to_string(expert) + ".weight" },
+                    { "source_tensor_name", "synthetic." + role.first },
+                    { "source_file_idx", 0 },
+                    { "source_file_offset", offset },
+                });
+                offset += ROLE_BYTES;
+            }
+            groups.push_back({
+                { "block_idx", layer },
+                { "expert_idx", expert },
+                { "member_count", 3 },
+                { "members", std::move(members) },
+            });
+        }
+        blob_output.close();
+        require(offset == PAGE_BYTES * 4,
+                "synthetic shard size mismatch");
+        write_json(sidecar, {
+            { "format", "llama.cpp.weight-pager.expert-shard-index" },
+            { "version", 1 },
+            { "blob_file", blob.filename().string() },
+            { "shard_index", shard_index },
+            { "shard_count", 2 },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", 4 },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+            { "model_files", { "synthetic.gguf" } },
+            { "groups", std::move(groups) },
+        });
+        shards.push_back({
+            { "blob_file", blob.filename().string() },
+            { "index_file", sidecar.filename().string() },
+            { "shard_index", shard_index },
+            { "layer_first", layer },
+            { "layer_last", layer },
+            { "group_count", 4 },
+            { "blob_bytes", offset },
+            { "content_hash", identity },
+        });
+        total_blob_bytes += offset;
+        ++shard_index;
+    }
 
     write_json(fixture.manifest, {
         { "format", "llama.cpp.weight-pager.expert-shard-manifest" },
@@ -215,23 +242,11 @@ Fixture make_fixture(const fs::path & dir) {
         { "model_files", { "synthetic.gguf" } },
         { "sharding_mode", "expert-index-range" },
         { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
-        { "total_group_count", 4 },
-        { "total_blob_bytes", offset },
-        { "shard_count", 1 },
+        { "total_group_count", 8 },
+        { "total_blob_bytes", total_blob_bytes },
+        { "shard_count", 2 },
         { "content_hash", identity },
-        { "shards",
-          {
-              {
-                  { "blob_file", blob.filename().string() },
-                  { "index_file", sidecar.filename().string() },
-                  { "shard_index", 0 },
-                  { "layer_first", LAYER },
-                  { "layer_last", LAYER },
-                  { "group_count", 4 },
-                  { "blob_bytes", offset },
-                  { "content_hash", identity },
-              },
-          } },
+        { "shards", std::move(shards) },
     });
     return fixture;
 }
@@ -269,6 +284,81 @@ pipe_socket_ptr connect_with_retry(int port) {
     }
     throw std::runtime_error("failed to connect to worker");
 }
+
+class IoTracker {
+public:
+    IoTracker() {
+        hooks.read_started = [this](int, int) {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++current;
+            ++started;
+            peak = std::max(peak, current);
+            cv.notify_all();
+            if (barrier_target > 0 &&
+                !cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+                    return peak >= barrier_target;
+                })) {
+                throw std::runtime_error(
+                    "expert reads did not reach the required concurrency");
+            }
+        };
+        hooks.read_finished = [this](int, int) {
+            std::lock_guard<std::mutex> lock(mutex);
+            --current;
+            cv.notify_all();
+        };
+        hooks.staging_borrowed = [this]() {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++borrows;
+        };
+        hooks.slot_reserved = [this](int, int, int slot) {
+            std::lock_guard<std::mutex> lock(mutex);
+            reserved_slots.push_back(slot);
+        };
+    }
+
+    void reset(int target) {
+        std::lock_guard<std::mutex> lock(mutex);
+        require(current == 0, "read tracker reset with a read in flight");
+        barrier_target = target;
+        started        = 0;
+        peak           = 0;
+        borrows        = 0;
+        reserved_slots.clear();
+    }
+
+    int read_count() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return started;
+    }
+
+    int peak_reads() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return peak;
+    }
+
+    int staging_borrows() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return borrows;
+    }
+
+    std::vector<int> reservations() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return reserved_slots;
+    }
+
+    wp_expert_worker::TestHooks hooks;
+
+private:
+    std::mutex              mutex;
+    std::condition_variable cv;
+    int                     barrier_target = 0;
+    int                     current        = 0;
+    int                     started        = 0;
+    int                     peak           = 0;
+    int                     borrows        = 0;
+    std::vector<int>        reserved_slots;
+};
 
 std::vector<float> reference(
         const Fixture & fixture,
@@ -311,6 +401,72 @@ std::vector<float> reference(
     return result;
 }
 
+const wp_expert_worker::SlotClass & find_class(
+        const wp_expert_worker::ResourcePlan & plan,
+        uint64_t size) {
+    const auto found = std::find_if(
+        plan.slot_classes.begin(), plan.slot_classes.end(),
+        [&](const wp_expert_worker::SlotClass & slot_class) {
+            return slot_class.size == size;
+        });
+    if (found == plan.slot_classes.end()) {
+        throw std::runtime_error("missing planned size class");
+    }
+    return *found;
+}
+
+void test_glm_size_class_plan() {
+    static constexpr uint64_t SMALL = 12091392;
+    static constexpr uint64_t LARGE = 16318464;
+    static constexpr uint64_t MID   = 13959168;
+    static constexpr uint64_t TAIL  = 13664256;
+    static constexpr int EXPERTS = 256;
+
+    std::vector<wp_expert_worker::ResourcePage> pages;
+    pages.reserve((size_t) 76 * EXPERTS);
+    for (int layer = 3; layer <= 78; ++layer) {
+        const uint64_t size =
+            layer == 8 ? LARGE :
+            (layer >= 75 && layer <= 77) ? MID :
+            layer == 78 ? TAIL : SMALL;
+        for (int expert = 0; expert < EXPERTS; ++expert) {
+            pages.push_back({ layer, size });
+        }
+    }
+
+    const wp_expert_worker::ResourcePlan plan =
+        wp_expert_worker::plan_resources(
+            pages, 1600, 2 * LARGE);
+    const wp_expert_worker::ResourcePlan default_plan =
+        wp_expert_worker::plan_resources(pages, 1600);
+    require(plan.size_classes, "GLM distribution did not produce size classes");
+    require(plan.slot_classes.size() == 4, "GLM distribution did not produce four classes");
+    require(plan.slot_count > plan.requested_slots,
+            "size classes did not recover slots from the mixed-quant distribution");
+    require(plan.device_bytes <= plan.device_budget_bytes,
+            "size-class plan exceeded the device budget");
+    require(plan.staging_buffers == 2, "host budget did not set staging concurrency");
+    require(default_plan.staging_buffers == 16,
+            "default staging concurrency is not QD16");
+    require(default_plan.staging_bytes == 16 * LARGE,
+            "default staging allocation bytes mismatch");
+
+    const auto & small = find_class(plan, SMALL);
+    const auto & large = find_class(plan, LARGE);
+    const auto & mid   = find_class(plan, MID);
+    const auto & tail  = find_class(plan, TAIL);
+    require(small.pages == 71 * EXPERTS, "small-class demand count mismatch");
+    require(large.pages == EXPERTS, "large-class demand count mismatch");
+    require(mid.pages == 3 * EXPERTS, "mid-class demand count mismatch");
+    require(tail.pages == EXPERTS, "tail-class demand count mismatch");
+    for (const auto * slot_class : { &small, &large, &mid, &tail }) {
+        require(slot_class->pin_floor == EXPERTS,
+                "size-class pin floor missed the worst-case layer");
+        require(slot_class->slots >= slot_class->pin_floor,
+                "size-class allocation fell below its pin floor");
+    }
+}
+
 void run_test() {
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
@@ -322,8 +478,27 @@ void run_test() {
     options.device         = "CPU";
     options.listen_host    = "127.0.0.1";
     options.listen_port    = port;
-    options.slots          = 2;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
     options.once           = true;
+    IoTracker tracker;
+    options.test_hooks = &tracker.hooks;
+
+    wp_expert_worker::Options large_options = options;
+    large_options.slots = 1600;
+    const wp_expert_worker::ResourcePlan large_resources =
+        wp_expert_worker::inspect_resources(large_options);
+    require(large_resources.requested_slots == 1600,
+            "large worker resource accounting lost requested slot count");
+    require(large_resources.staging_buffers == 2,
+            "large slot count changed staging concurrency");
+    require(large_resources.staging_bytes == 2 * PAGE_BYTES,
+            "large slot count changed staging allocation bytes");
+
+    const wp_expert_worker::ResourcePlan resources =
+        wp_expert_worker::inspect_resources(options);
+    require(resources.staging_buffers == 2,
+            "two-buffer host budget did not bound staging concurrency");
 
     int server_result = -1;
     std::exception_ptr server_error;
@@ -350,7 +525,9 @@ void run_test() {
         require(!worker_hello.model_identity.empty(), "worker HELLO model identity is empty");
         require(worker_hello.shard_identity == "sha256:synthetic-expert-worker-test",
                 "worker HELLO shard identity mismatch");
-        require(worker_hello.layers == std::vector<int32_t>{ LAYER }, "worker HELLO layers mismatch");
+        require(worker_hello.layers ==
+                    std::vector<int32_t>{ LAYER, OTHER_LAYER },
+                "worker HELLO layers mismatch");
 
         pipe_expert_hello client_hello = worker_hello;
         client_hello.role         = PIPE_EXPERT_ROLE_CLIENT;
@@ -369,7 +546,6 @@ void run_test() {
 
         std::vector<float> input((size_t) N_TOKENS * N_EMBD);
         pipe_expert_dispatch_req request;
-        request.layer    = LAYER;
         request.n_tokens = N_TOKENS;
         for (size_t i = 0; i < input.size(); ++i) {
             input[i] = ((int) (i % 13) - 6) * 0.07f;
@@ -381,44 +557,109 @@ void run_test() {
             { 0, { 0.5f, 0.0f } },
             { 1, { -0.25f, 0.75f } },
             { 2, { 0.0f, 0.4f } },
+            { 3, { 0.3f, -0.2f } },
         };
-        require(request.assignments.size() > 2, "batching regression did not exceed model top-k");
-        const std::vector<float> expected =
-            reference(fixture, input, request.assignments);
+        require(request.assignments.size() > (size_t) resources.staging_buffers,
+                "dispatch did not exceed staging concurrency");
 
-        payload = pipe_encode_expert_dispatch_req(request);
-        require(pipe_send_frame(
-            *socket, PIPE_EXPERT_DISPATCH_REQ, 42,
-            payload.data(), payload.size()), "failed to send dispatch");
-        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive partial");
-        require(type == PIPE_EXPERT_PARTIAL, "worker did not return a partial");
-        require(seq_id == 42, "partial sequence id mismatch");
-        const pipe_expert_partial response =
-            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
-        require(response.layer == LAYER, "partial layer mismatch");
-        require(response.n_tokens == N_TOKENS, "partial token count mismatch");
-        require(response.partial.size() == expected.size(), "partial shape mismatch");
-        for (size_t i = 0; i < expected.size(); ++i) {
-            const float actual =
-                ggml_fp16_to_fp32((ggml_fp16_t) response.partial[i]);
-            const float tolerance = 0.002f + 0.01f * std::fabs(expected[i]);
-            if (std::fabs(actual - expected[i]) > tolerance) {
-                throw std::runtime_error(
-                    "partial mismatch at " + std::to_string(i) +
-                    ": actual=" + std::to_string(actual) +
-                    " expected=" + std::to_string(expected[i]));
-            }
-        }
+        const auto dispatch_and_check =
+            [&](uint64_t expected_seq,
+                const pipe_expert_dispatch_req & dispatch) {
+                const std::vector<float> expected =
+                    reference(fixture, input, dispatch.assignments);
+                payload = pipe_encode_expert_dispatch_req(dispatch);
+                require(pipe_send_frame(
+                    *socket, PIPE_EXPERT_DISPATCH_REQ, expected_seq,
+                    payload.data(), payload.size()),
+                    "failed to send dispatch");
+                require(pipe_recv_frame(*socket, type, seq_id, payload),
+                        "failed to receive partial");
+                if (type == PIPE_ERROR) {
+                    const pipe_error error =
+                        pipe_decode_error(payload.data(), payload.size());
+                    throw std::runtime_error(
+                        "worker dispatch failed: " + error.msg);
+                }
+                require(type == PIPE_EXPERT_PARTIAL,
+                        "worker did not return a partial");
+                require(seq_id == expected_seq,
+                        "partial sequence id mismatch");
+                const pipe_expert_partial response =
+                    pipe_decode_expert_partial(
+                        payload.data(), payload.size(), N_EMBD);
+                require(response.layer == dispatch.layer,
+                        "partial layer mismatch");
+                require(response.n_tokens == N_TOKENS,
+                        "partial token count mismatch");
+                require(response.partial.size() == expected.size(),
+                        "partial shape mismatch");
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    const float actual =
+                        ggml_fp16_to_fp32(
+                            (ggml_fp16_t) response.partial[i]);
+                    const float tolerance =
+                        0.002f + 0.01f * std::fabs(expected[i]);
+                    if (std::fabs(actual - expected[i]) > tolerance) {
+                        throw std::runtime_error(
+                            "partial mismatch at " + std::to_string(i) +
+                            ": actual=" + std::to_string(actual) +
+                            " expected=" + std::to_string(expected[i]));
+                    }
+                }
+            };
+
+        pipe_expert_dispatch_req warm = request;
+        warm.layer = OTHER_LAYER;
+        tracker.reset(2);
+        dispatch_and_check(40, warm);
+        require(tracker.read_count() == 4,
+                "cold request did not issue one read per miss");
+        require(tracker.peak_reads() == 2,
+                "cold request did not saturate two staging buffers");
+        require(tracker.staging_borrows() == 4,
+                "staging buffers did not recycle for excess misses");
+
+        pipe_expert_dispatch_req seed = request;
+        seed.layer = LAYER;
+        seed.assignments.resize(1);
+        tracker.reset(1);
+        dispatch_and_check(41, seed);
+        require(tracker.read_count() == 1 && tracker.peak_reads() == 1,
+                "single-miss seed dispatch read accounting mismatch");
+
+        request.layer = LAYER;
+        tracker.reset(2);
+        dispatch_and_check(42, request);
+        require(tracker.read_count() == 3,
+                "mixed request did not preserve its resident hit");
+        require(tracker.peak_reads() == 2,
+                "mixed request did not overlap its misses");
+        const std::vector<int> reservations = tracker.reservations();
+        require(reservations.size() == 3,
+                "mixed request reserved the wrong number of miss slots");
+        const std::set<int> unique_slots(
+            reservations.begin(), reservations.end());
+        require(unique_slots.size() == reservations.size(),
+                "later miss evicted an earlier in-flight slot");
+
+        tracker.reset(0);
+        dispatch_and_check(43, request);
+        require(tracker.read_count() == 0,
+                "all-hit request issued an expert read");
+        require(tracker.staging_borrows() == 0,
+                "all-hit request borrowed staging");
+        require(tracker.reservations().empty(),
+                "all-hit request reserved a miss slot");
 
         pipe_expert_dispatch_req rejected = request;
         rejected.assignments = { { 4, { 1.0f, 1.0f } } };
         payload = pipe_encode_expert_dispatch_req(rejected);
         require(pipe_send_frame(
-            *socket, PIPE_EXPERT_DISPATCH_REQ, 43,
+            *socket, PIPE_EXPERT_DISPATCH_REQ, 44,
             payload.data(), payload.size()), "failed to send rejected dispatch");
         require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive rejection");
         require(type == PIPE_ERROR, "out-of-range expert was not rejected");
-        require(seq_id == 43, "rejection sequence id mismatch");
+        require(seq_id == 44, "rejection sequence id mismatch");
         const pipe_error error = pipe_decode_error(payload.data(), payload.size());
         require(error.code == PIPE_ERR_EXPERT_RANGE, "wrong rejection error code");
 
@@ -488,6 +729,7 @@ void run_test() {
 
 int main() {
     try {
+        test_glm_size_class_plan();
         run_test();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
