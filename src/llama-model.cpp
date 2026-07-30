@@ -1101,6 +1101,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+    ml.get_key("weight_pager.routed_experts_external", routed_experts_external, false);
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams

@@ -387,6 +387,20 @@ target_link_libraries(test-wp-dense-extract PRIVATE ggml)
 target_compile_features(test-wp-dense-extract PRIVATE cxx_std_17)
 llama_test(test-wp-dense-extract)
 
+# GLM-DSA dense spine loader: positive external-expert metadata signal,
+# missing-dispatch refusal, complete-model regression, and empty pager catalog.
+llama_build(
+    test-routed-experts-external.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-dense-extract/wp-dense-extract-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-router.cpp
+)
+target_include_directories(test-routed-experts-external PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-dense-extract
+)
+target_compile_features(test-routed-experts-external PRIVATE cxx_std_17)
+llama_test(test-routed-experts-external)
+
 # Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model), plus a
 # loopback transport check that a closed peer is an ordinary send error.
 add_executable(

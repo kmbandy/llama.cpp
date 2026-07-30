@@ -663,6 +663,10 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // The GGUF contains the dense spine, while routed experts are supplied by
+    // remote expert dispatch.
+    bool routed_experts_external = false;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

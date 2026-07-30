@@ -55,9 +55,16 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
-    if (params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0') {
-        if (model.arch != LLM_ARCH_DEEPSEEK2) {
-            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2 graph");
+    const bool expert_dispatch_enabled =
+        params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0';
+    if (model.routed_experts_external && !expert_dispatch_enabled) {
+        throw std::runtime_error(
+            "model metadata 'weight_pager.routed_experts_external' is true but "
+            "--expert-dispatch is missing; refusing to run without routed experts");
+    }
+    if (expert_dispatch_enabled) {
+        if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA) {
+            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2 or GLM-DSA graph");
         }
         expert_dispatch.reset(new pipe_expert_dispatcher::graph_dispatcher(
             params.expert_dispatch,
