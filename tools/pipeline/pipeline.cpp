@@ -555,15 +555,34 @@ int llama_pipeline(int argc, char ** argv) {
         return 1;
     }
 
-    // Resolve the band now so we can pick the role and validate against the
-    // model after load. Band comes from --pipeline-layers or the stage GGUF.
+    // Resolve the band BEFORE loading. Precedence: an explicit
+    // --pipeline-layers wins; otherwise the band the stage GGUF declares;
+    // otherwise the full range (the legacy single-process path).
+    //
+    // This has to happen before the load, not after, because of warmup: a
+    // stage without token_embd cannot survive a token warmup, and the warmup
+    // runs inside common_init_from_params. Reading the band from the model
+    // afterwards would be too late -- which is exactly what used to happen,
+    // leaving a GGUF-declared stage to warm up and fail.
     const bool band_from_cli = llama_pipeline_band_enabled(
         params.pipeline_layer_first, params.pipeline_layer_last);
 
+    if (!band_from_cli) {
+        int32_t file_first = -1;
+        int32_t file_last  = -1;
+        if (llama_pipeline_peek_band_from_file(params.model.path.c_str(), &file_first, &file_last)) {
+            params.pipeline_layer_first = file_first;
+            params.pipeline_layer_last  = file_last;
+            LOG_INF("pipe: band adopted from stage GGUF metadata: [%d, %d]\n",
+                    file_first, file_last);
+        }
+    }
+
     // Middle/tail stages must not run a token-based warmup decode: a stage
-    // without token_embd fails that warmup by design. Force it off unless the
-    // stage turns out to be the head.
-    if (band_from_cli && params.pipeline_layer_first != 0) {
+    // without token_embd fails that warmup by design. This now covers the
+    // GGUF-declared case too, since the band is known by here either way.
+    if (llama_pipeline_band_enabled(params.pipeline_layer_first, params.pipeline_layer_last) &&
+        params.pipeline_layer_first != 0) {
         if (params.warmup) {
             LOG_WRN("pipe: non-head stage: forcing --no-warmup "
                     "(a token warmup on a stage without token_embd fails by design)\n");
@@ -591,8 +610,10 @@ int llama_pipeline(int argc, char ** argv) {
     s.n_layer = llama_model_n_layer(model);
     s.n_embd  = llama_model_n_embd(model);
 
-    // resolve the band: explicit flag, else stage-GGUF metadata (already
-    // adopted into mparams by the loader), else the full range.
+    // Resolve the band from params, which by now carry either the explicit
+    // flag or the stage GGUF's own declaration (adopted above). The loader saw
+    // the same values, so the band this tool uses, the complement it computes
+    // for the peer, and the band the model loaded all agree by construction.
     llama_pipeline_stage band;
     try {
         band = llama_pipeline_resolve_band(
@@ -605,14 +626,9 @@ int llama_pipeline(int argc, char ** argv) {
     s.last  = band.last;
     resolve_role(s);
 
-    // If the band came only from GGUF metadata (non-head) we could not have
-    // forced --no-warmup above; common_init_from_params already ran a warmup.
-    // That path is the operator's responsibility (pass --no-warmup); we only
-    // guarantee the head warms up normally and warn here.
-    if (!band_from_cli && s.first != 0 && params.warmup) {
-        LOG_WRN("pipe: non-head stage adopted from GGUF ran a token warmup; "
-                "this should have failed by design -- pass --no-warmup\n");
-    }
+    // (The warmup gap that used to live here is closed: the band is now known
+    // before the load, so a GGUF-declared non-head stage gets --no-warmup
+    // forced along with an explicitly-flagged one.)
 
     // The full stage set. Loopback 2-stage: head + tail. We build it from our
     // own band plus the peer we connect to / accept from. For the handshake we

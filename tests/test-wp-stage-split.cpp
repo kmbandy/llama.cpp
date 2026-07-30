@@ -174,6 +174,16 @@ stage_contents read_stage(const std::string & path, const std::vector<float> & s
     CHECK(kf >= 0 && kl >= 0);
     sc.first = gguf_get_val_i32(ctx, kf);
     sc.last  = gguf_get_val_i32(ctx, kl);
+
+    // The band the splitter WROTE must be exactly the band the pipeline tool
+    // READS back before loading. These are the two halves of the same
+    // contract: if they ever disagree, a stage launched without an explicit
+    // --pipeline-layers silently runs the wrong band.
+    int32_t peek_first = -1;
+    int32_t peek_last  = -1;
+    CHECK(llama_pipeline_peek_band_from_file(path.c_str(), &peek_first, &peek_last));
+    CHECK(peek_first == sc.first);
+    CHECK(peek_last  == sc.last);
     sc.arch = gguf_get_val_str(ctx, gguf_find_key(ctx, "general.architecture"));
     sc.block_count = gguf_get_val_u32(ctx, gguf_find_key(ctx, "glm-dsa.block_count"));
     sc.has_split_no            = gguf_find_key(ctx, "split.no") >= 0;

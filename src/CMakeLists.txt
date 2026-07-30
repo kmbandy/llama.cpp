@@ -39,6 +39,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-pipeline.cpp
+            llama-pipeline-gguf.cpp
             llama-weight-pager.cpp
             llama-quant.cpp
             llama-sampler.cpp

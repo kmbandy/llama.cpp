@@ -307,6 +307,7 @@ add_executable(
     test-wp-stage-split.cpp
     ${CMAKE_SOURCE_DIR}/tools/wp-stage-split/wp-stage-split-lib.cpp
     ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline-gguf.cpp
 )
 target_include_directories(test-wp-stage-split PRIVATE
     ${CMAKE_SOURCE_DIR}/src

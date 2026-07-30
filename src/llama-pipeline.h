@@ -65,3 +65,18 @@ void llama_pipeline_validate_stages(const std::vector<llama_pipeline_stage> & st
 // "enc.blk.N."/"dec.blk.N."). Returns -1 when the name carries no block
 // index. Exposed for the pager-catalog band assertion.
 int32_t llama_pipeline_tensor_block_index(const char * name);
+
+// Read the band a stage GGUF declares, WITHOUT loading the model.
+//
+// wp-stage-split records pipeline.layer_first / pipeline.layer_last in the
+// stage file, and the model loader adopts them. But some decisions have to be
+// made before the model exists -- most importantly whether to run a token
+// warmup, which a stage without token_embd cannot survive. This reads just
+// those two keys out of the GGUF header so a caller can know its band up
+// front.
+//
+// Returns true and fills first/last only when the file declares BOTH keys.
+// A file with neither (an ordinary model) returns false and is not an error.
+// A file with exactly one is malformed and also returns false -- the loader
+// rejects that case with a specific message once it gets there.
+bool llama_pipeline_peek_band_from_file(const char * path, int32_t * first, int32_t * last);
