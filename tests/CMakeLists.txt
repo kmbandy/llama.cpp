@@ -291,6 +291,38 @@ target_link_libraries(test-wp-blob-index PRIVATE llama-common)
 target_compile_features(test-wp-blob-index PRIVATE cxx_std_17)
 llama_test(test-wp-blob-index)
 
+# expert-index shard builder (synthetic blobs, no model, no GPU)
+add_executable(
+    test-wp-expert-shard
+    test-wp-expert-shard.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-expert-shard/wp-expert-shard-lib.cpp
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
+)
+target_include_directories(test-wp-expert-shard PRIVATE
+    ${CMAKE_SOURCE_DIR}/common
+    ${CMAKE_SOURCE_DIR}/tools/wp-expert-shard
+    ${CMAKE_SOURCE_DIR}/vendor
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps
+)
+target_link_libraries(test-wp-expert-shard PRIVATE llama-common)
+target_compile_features(test-wp-expert-shard PRIVATE cxx_std_17)
+llama_test(test-wp-expert-shard)
+
+# CPU-only expert worker service: synthetic O_DIRECT shard, real TCP framing,
+# token batching, weighted multi-expert SwiGLU, and ownership rejection.
+add_executable(test-wp-expert-worker test-wp-expert-worker.cpp)
+target_include_directories(test-wp-expert-worker PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/tools/wp-expert-worker
+    ${CMAKE_SOURCE_DIR}/vendor
+)
+target_link_libraries(test-wp-expert-worker PRIVATE
+    llama-wp-expert-worker-lib
+)
+target_compile_features(test-wp-expert-worker PRIVATE cxx_std_17)
+llama_test(test-wp-expert-worker)
+
 # cross-machine pipeline band helpers (pure, no ggml dependency)
 add_executable(
     test-pipeline-band
