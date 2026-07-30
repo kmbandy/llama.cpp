@@ -24,6 +24,10 @@ class llama_io_write_i;
 struct llama_memory_i;
 struct llama_memory_context_i;
 
+namespace pipe_expert_dispatcher {
+class graph_dispatcher;
+}
+
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
@@ -283,6 +287,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -82,6 +82,10 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+namespace pipe_expert_dispatcher {
+class graph_dispatcher;
+}
+
 //
 // llm_graph_input
 //
@@ -729,6 +733,7 @@ struct llm_graph_params {
     const ml8_registry           * ml8_reg = nullptr;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    pipe_expert_dispatcher::graph_dispatcher * expert_dispatch = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -824,6 +829,7 @@ struct llm_graph_params {
             cvec    == other.cvec    &&
             loras   == other.loras   &&
             ml8_reg == other.ml8_reg &&
+            expert_dispatch == other.expert_dispatch &&
             cross   == other.cross;
     }
 };
@@ -961,6 +967,7 @@ struct llm_graph_context {
     const ml8_registry           * ml8_reg = nullptr;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    pipe_expert_dispatcher::graph_dispatcher * expert_dispatch;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

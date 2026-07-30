@@ -2767,6 +2767,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--expert-dispatch"}, "<host:port[,host:port...]>",
+        "dispatch routed expert FFNs to the listed worker endpoints (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_dispatch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_DISPATCH"));
+    add_opt(common_arg(
         {"--weight-paging"},
         "enable NVMe->VRAM demand paging for model weights (allows models larger than VRAM); forces --no-mmap",
         [](common_params & params) {

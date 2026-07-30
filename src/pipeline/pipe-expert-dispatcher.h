@@ -60,6 +60,7 @@ class dispatcher {
                                 const std::vector<pipe_expert_assignment> & assignments);
 
     int32_t                          n_embd() const;
+    int32_t                          n_ff_exp() const;
     int32_t                          n_expert() const;
     int32_t                          n_expert_used() const;
     const std::string &              model_identity() const;

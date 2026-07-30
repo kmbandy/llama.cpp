@@ -1,4 +1,6 @@
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "pipe-expert-dispatch-graph.h"
 #include "pipe-expert-dispatcher.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
@@ -371,6 +373,68 @@ std::vector<float> reference(const weight_map &                          weights
     return result;
 }
 
+void test_graph_op(const weight_map & weights,
+                   const std::vector<float> & activation,
+                   const std::vector<pipe_expert_assignment> & assignments,
+                   const std::vector<int> & ports) {
+    static constexpr int N_SELECTED = 3;
+    static constexpr int selected_by_token[N_TOKENS][N_SELECTED] = {
+        { 0, 1, 3 },
+        { 1, 2, 3 },
+    };
+
+    std::string endpoints;
+    for (size_t i = 0; i < ports.size(); ++i) {
+        if (i != 0) {
+            endpoints += ",";
+        }
+        endpoints += "127.0.0.1:" + std::to_string(ports[i]);
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create custom-op ggml context");
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, N_EMBD, N_TOKENS);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, N_SELECTED, N_TOKENS);
+    ggml_tensor * w   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, N_SELECTED, N_TOKENS);
+    std::memcpy(inp->data, activation.data(), activation.size() * sizeof(float));
+
+    std::vector<int32_t> selected((size_t) N_SELECTED * N_TOKENS);
+    std::vector<float>   selected_weights((size_t) N_SELECTED * N_TOKENS);
+    for (int token = 0; token < N_TOKENS; ++token) {
+        for (int slot = 0; slot < N_SELECTED; ++slot) {
+            const int expert = selected_by_token[token][slot];
+            selected[(size_t) token * N_SELECTED + slot]         = expert;
+            selected_weights[(size_t) token * N_SELECTED + slot] = assignments[(size_t) expert].weights[(size_t) token];
+        }
+    }
+    std::memcpy(ids->data, selected.data(), selected.size() * sizeof(int32_t));
+    std::memcpy(w->data, selected_weights.data(), selected_weights.size() * sizeof(float));
+
+    pipe_expert_dispatcher::graph_dispatcher dispatcher(
+        endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
+    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, w, LAYER);
+    ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
+    ggml_build_forward_expand(gf, out);
+    require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
+            "custom-op graph computation failed");
+
+    const std::vector<float> expected = reference(weights, activation, assignments);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const float actual    = ggml_get_f32_1d(out, (int) i);
+        const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);
+        if (std::fabs(actual - expected[i]) > tolerance) {
+            throw std::runtime_error("custom-op output mismatch at " + std::to_string(i) + ": actual=" +
+                                     std::to_string(actual) + " expected=" + std::to_string(expected[i]));
+        }
+    }
+}
+
 pipe_expert_hello fault_hello() {
     pipe_expert_hello hello;
     hello.role           = PIPE_EXPERT_ROLE_WORKER;
@@ -562,39 +626,44 @@ void run_test() {
     };
     const std::vector<float> expected = reference(weights, activation, assignments);
 
-    pipe_expert_dispatcher::dispatcher dispatcher({
-        { "127.0.0.1", port_a0, "machine-a" },
-        { "127.0.0.1", port_a1, "machine-a" },
-        { "127.0.0.1", port_b0, "machine-b" },
-        { "127.0.0.1", port_b1, "machine-b" },
-    });
-    require(dispatcher.workers()[0].shard_identity != dispatcher.workers()[2].shard_identity,
-            "different shard identities were not preserved");
-    require(!dispatcher.model_identity().empty(), "logical model identity is empty");
-    const std::vector<float>           actual = dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments);
-    require(actual.size() == expected.size(), "reduced output shape mismatch");
-    for (size_t i = 0; i < expected.size(); ++i) {
-        const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);
-        if (std::fabs(actual[i] - expected[i]) > tolerance) {
-            throw std::runtime_error("reduced output mismatch at " + std::to_string(i) + ": actual=" +
-                                     std::to_string(actual[i]) + " expected=" + std::to_string(expected[i]));
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", port_a0, "machine-a" },
+            { "127.0.0.1", port_a1, "machine-a" },
+            { "127.0.0.1", port_b0, "machine-b" },
+            { "127.0.0.1", port_b1, "machine-b" },
+        });
+        require(dispatcher.workers()[0].shard_identity != dispatcher.workers()[2].shard_identity,
+                "different shard identities were not preserved");
+        require(!dispatcher.model_identity().empty(), "logical model identity is empty");
+        const std::vector<float> actual =
+            dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments);
+        require(actual.size() == expected.size(), "reduced output shape mismatch");
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);
+            if (std::fabs(actual[i] - expected[i]) > tolerance) {
+                throw std::runtime_error("reduced output mismatch at " + std::to_string(i) + ": actual=" +
+                                         std::to_string(actual[i]) + " expected=" + std::to_string(expected[i]));
+            }
         }
+
+        const pipe_expert_dispatcher::dispatch_stats & stats = dispatcher.last_dispatch_stats();
+        require(stats.first_await_recorded, "first response await was not instrumented");
+        require(stats.workers_used == 4, "dispatch did not use all four capable workers");
+        require(stats.requests_issued == stats.workers_used, "not every worker request was issued");
+        require(stats.first_await_in_flight == stats.workers_used,
+                "first response was awaited before all worker requests were issued");
+        require(dispatcher.in_flight_requests() == 0, "in-flight requests remain after reduction");
+        require(stats.workers.size() == 4, "worker balance stats are incomplete");
+        for (const pipe_expert_dispatcher::worker_dispatch_stats & worker : stats.workers) {
+            require(worker.n_experts > 0 && worker.n_experts < assignments.size(),
+                    "a capable worker received all work or no work");
+        }
+        std::cout << "measured first_await_in_flight=" << stats.first_await_in_flight
+                  << " workers_used=" << stats.workers_used << '\n';
     }
 
-    const pipe_expert_dispatcher::dispatch_stats & stats = dispatcher.last_dispatch_stats();
-    require(stats.first_await_recorded, "first response await was not instrumented");
-    require(stats.workers_used == 4, "dispatch did not use all four capable workers");
-    require(stats.requests_issued == stats.workers_used, "not every worker request was issued");
-    require(stats.first_await_in_flight == stats.workers_used,
-            "first response was awaited before all worker requests were issued");
-    require(dispatcher.in_flight_requests() == 0, "in-flight requests remain after reduction");
-    require(stats.workers.size() == 4, "worker balance stats are incomplete");
-    for (const pipe_expert_dispatcher::worker_dispatch_stats & worker : stats.workers) {
-        require(worker.n_experts > 0 && worker.n_experts < assignments.size(),
-                "a capable worker received all work or no work");
-    }
-    std::cout << "measured first_await_in_flight=" << stats.first_await_in_flight
-              << " workers_used=" << stats.workers_used << '\n';
+    test_graph_op(weights, activation, assignments, { port_a0, port_a1, port_b0, port_b1 });
 
     const std::string range_error = expect_dispatch_error(fault_mode::reject_range, 2);
     require(range_error.find("code " + std::to_string(PIPE_ERR_EXPERT_RANGE)) != std::string::npos,

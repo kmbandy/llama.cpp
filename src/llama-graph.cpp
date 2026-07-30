@@ -16,6 +16,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <cassert>
 #include <cmath>
@@ -1478,6 +1479,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ml8_reg          (params.ml8_reg),
     mctx             (params.mctx),
     cross            (params.cross),
+    expert_dispatch  (params.expert_dispatch),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2086,6 +2088,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    if (expert_dispatch != nullptr) {
+        if (type_op != LLM_FFN_SILU || weight_before_ffn || up_exps_b != nullptr ||
+            gate_exps_b != nullptr || down_exps_b != nullptr || gate_up_exps_b != nullptr ||
+            up_exps_s != nullptr || gate_exps_s != nullptr || down_exps_s != nullptr) {
+            throw std::runtime_error("expert dispatch does not support this expert FFN variant");
+        }
+        ggml_tensor * moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

@@ -18,6 +18,7 @@
 #include "weight-pager/wp-pager-set.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <cinttypes>
 #include <cstdlib>
@@ -53,6 +54,19 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    if (params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0') {
+        if (model.arch != LLM_ARCH_DEEPSEEK2) {
+            throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2 graph");
+        }
+        expert_dispatch.reset(new pipe_expert_dispatcher::graph_dispatcher(
+            params.expert_dispatch,
+            (int32_t) hparams.n_embd,
+            (int32_t) hparams.n_ff_exp,
+            (int32_t) hparams.n_expert,
+            (int32_t) hparams.n_expert_used));
+        LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -2506,6 +2520,7 @@ llm_graph_params llama_context::graph_params(
         /*.ml8_reg     =*/ &model.ml8_reg,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_dispatch =*/ expert_dispatch.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3656,6 +3671,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tier_instance_id         =*/ nullptr,
         /*.kv_tier_cold_budget_mb      =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.expert_dispatch             =*/ nullptr,
     };
 
     return result;

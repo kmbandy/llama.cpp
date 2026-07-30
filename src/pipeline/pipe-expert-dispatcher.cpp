@@ -429,6 +429,10 @@ int32_t dispatcher::n_embd() const {
     return pimpl->n_embd;
 }
 
+int32_t dispatcher::n_ff_exp() const {
+    return pimpl->n_ff_exp;
+}
+
 int32_t dispatcher::n_expert() const {
     return pimpl->n_expert;
 }
