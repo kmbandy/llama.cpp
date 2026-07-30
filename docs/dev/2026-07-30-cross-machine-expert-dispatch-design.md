@@ -56,7 +56,8 @@ from that asymmetry.
 | Quantity | Value | Source |
 |---|---|---|
 | Expert bytes, layers 3–77 | **234.7 GB** | repack manifest |
-| Per-expert page | **12.22 MB**, one contiguous read | repack (landed today, `0f0a8bb11`) |
+| Per-expert page, mean | **12.22 MB**, one contiguous read | repack (landed today, `0f0a8bb11`) |
+| Per-expert page, max | **16,318,464 B = 15.56 MiB** (layer 8) | shard sidecars |
 | Experts / layer, active | 256 / **8** | GGUF metadata |
 | Routing distribution | sigmoid `noaux_tc`, **near-uniform** | model config |
 | Bytes fed per token | **7.33 GB** (8 × 75 × 12.22 MB) | derived |
@@ -65,6 +66,14 @@ from that asymmetry.
 | Inter-machine link | **104 MB/s**, RTT **0.5–0.6 ms** | measured 2026-07-24 |
 | RAM, main / 2026 | 15 GB total, **9 / 12 GB available** | measured today |
 | Disk free, main / 2026 | **98 GB** / 36 GB (**113 GB** if the 77 GB tail stage is removed) | measured today |
+
+**Expert pages are NOT uniform.** GLM-5.2 UD-Q2_K_XL is a mixed quant: 71 of 76
+layers are 12,091,392 B per expert, but layer 8 is 16,318,464, layers 75-77 are
+13,959,168, and layer 78 is 13,664,256. The types differ too -- gate/up span
+q2_K / iq2_xs / iq3_xxs and down spans q3_K / iq3_xxs / iq4_xs. Two consequences:
+the MEAN drives the bandwidth model above, but the MAXIMUM drives a worker's
+slot stride, and any code assuming one global page size or one global type will
+read most layers at the wrong stride and produce fluent, wrong output.
 
 Two constraints dominate and must shape everything:
 
