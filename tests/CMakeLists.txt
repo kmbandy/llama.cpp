@@ -371,6 +371,22 @@ target_link_libraries(test-wp-stage-split PRIVATE ggml)
 target_compile_features(test-wp-stage-split PRIVATE cxx_std_17)
 llama_test(test-wp-stage-split)
 
+# dense spine extraction: synthetic multi-shard GGUF -> one non-expert GGUF
+add_executable(
+    test-wp-dense-extract
+    test-wp-dense-extract.cpp
+    ${CMAKE_SOURCE_DIR}/tools/wp-dense-extract/wp-dense-extract-lib.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-router.cpp
+)
+target_include_directories(test-wp-dense-extract PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tools/wp-dense-extract
+)
+target_link_libraries(test-wp-dense-extract PRIVATE ggml)
+target_compile_features(test-wp-dense-extract PRIVATE cxx_std_17)
+llama_test(test-wp-dense-extract)
+
 # Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model), plus a
 # loopback transport check that a closed peer is an ordinary send error.
 add_executable(
