@@ -101,62 +101,76 @@ static void test_block_index() {
 
 static void test_owns_tensor() {
     const int32_t n_layer = 78;
+    auto owns = [n_layer](
+            int32_t first, int32_t last, int32_t n_layer_nextn,
+            const char * name, bool duplicated_embd) {
+        return llama_pipeline_owns_tensor(
+            first, last, n_layer, n_layer_nextn, name, duplicated_embd);
+    };
 
     // full range owns everything
     for (const char * n : {"blk.0.attn_q.weight", "blk.77.ffn_down_exps.weight",
                            "token_embd.weight", "output_norm.weight", "output.weight"}) {
-        CHECK(llama_pipeline_owns_tensor(0, 77, n_layer, n, false));
+        CHECK(owns(0, 77, 0, n, false));
     }
 
-    // head stage [0, 56]: owns its layers + token_embd, not output tensors
-    CHECK( llama_pipeline_owns_tensor(0, 56, n_layer, "blk.0.attn_norm.weight",  false));
-    CHECK( llama_pipeline_owns_tensor(0, 56, n_layer, "blk.56.ffn_up_exps.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "blk.57.ffn_up_exps.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "blk.77.attn_out.weight",  false));
-    CHECK( llama_pipeline_owns_tensor(0, 56, n_layer, "token_embd.weight",       false));
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "output_norm.weight",      false));
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "output.weight",           false));
+    // no-MTP head stage [0, 56]: owns its layers + token_embd, not output tensors
+    CHECK( owns(0, 56, 0, "blk.0.attn_norm.weight",    false));
+    CHECK( owns(0, 56, 0, "blk.56.ffn_up_exps.weight", false));
+    CHECK(!owns(0, 56, 0, "blk.57.ffn_up_exps.weight", false));
+    CHECK(!owns(0, 56, 0, "blk.77.attn_out.weight",    false));
+    CHECK( owns(0, 56, 0, "token_embd.weight",         false));
+    CHECK(!owns(0, 56, 0, "output_norm.weight",        false));
+    CHECK(!owns(0, 56, 0, "output.weight",             false));
 
     // tail stage [57, 77]: owns its layers + output tensors, not token_embd
-    CHECK(!llama_pipeline_owns_tensor(57, 77, n_layer, "blk.56.ffn_up_exps.weight", false));
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "blk.57.ffn_up_exps.weight", false));
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "blk.77.ffn_norm.weight",  false));
-    CHECK(!llama_pipeline_owns_tensor(57, 77, n_layer, "token_embd.weight",       false));
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "output_norm.weight",      false));
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "output.weight",           false));
+    CHECK(!owns(57, 77, 0, "blk.56.ffn_up_exps.weight", false));
+    CHECK( owns(57, 77, 0, "blk.57.ffn_up_exps.weight", false));
+    CHECK( owns(57, 77, 0, "blk.77.ffn_norm.weight",    false));
+    CHECK(!owns(57, 77, 0, "token_embd.weight",         false));
+    CHECK( owns(57, 77, 0, "output_norm.weight",        false));
+    CHECK( owns(57, 77, 0, "output.weight",             false));
 
     // ... unless the tail has tied embeddings (duplicated_embd): then it does
     // load token_embd as its lm_head
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "token_embd.weight", true));
+    CHECK(owns(57, 77, 0, "token_embd.weight", true));
 
     // ... but a middle or head-adjacent stage must NOT claim token_embd
     // through the duplicated-output fallback
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "token_embd.weight", true));
-    CHECK( llama_pipeline_owns_tensor( 0, 40, n_layer, "token_embd.weight", true)); // head owns it anyway
+    CHECK(!owns(20, 40, 0, "token_embd.weight", true));
+    CHECK( owns( 0, 40, 0, "token_embd.weight", true)); // head owns it anyway
 
     // middle stage [20, 40]: owns only its layers
-    CHECK( llama_pipeline_owns_tensor(20, 40, n_layer, "blk.20.attn_q.weight", false));
-    CHECK( llama_pipeline_owns_tensor(20, 40, n_layer, "blk.40.attn_q.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "blk.19.attn_q.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "blk.41.attn_q.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "token_embd.weight",    false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "output_norm.weight",   false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "output.weight",        false));
+    CHECK( owns(20, 40, 0, "blk.20.attn_q.weight", false));
+    CHECK( owns(20, 40, 0, "blk.40.attn_q.weight", false));
+    CHECK(!owns(20, 40, 0, "blk.19.attn_q.weight", false));
+    CHECK(!owns(20, 40, 0, "blk.41.attn_q.weight", false));
+    CHECK(!owns(20, 40, 0, "token_embd.weight",    false));
+    CHECK(!owns(20, 40, 0, "output_norm.weight",   false));
+    CHECK(!owns(20, 40, 0, "output.weight",        false));
 
     // small global tensors are owned by every stage
-    CHECK(llama_pipeline_owns_tensor(57, 77, n_layer, "some_global_bias.weight", false));
-    CHECK(llama_pipeline_owns_tensor( 0, 56, n_layer, "some_global_bias.weight", false));
+    CHECK(owns(57, 77, 0, "some_global_bias.weight", false));
+    CHECK(owns( 0, 56, 0, "some_global_bias.weight", false));
 
-    // NextN/MTP tensors (blk index past the real layers) belong to the tail
-    CHECK( llama_pipeline_owns_tensor(57, 77, n_layer, "blk.78.nextn_eh_proj.weight", false));
-    CHECK(!llama_pipeline_owns_tensor( 0, 56, n_layer, "blk.78.nextn_eh_proj.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(20, 40, n_layer, "blk.78.nextn_eh_proj.weight", false));
+    // Without MTP metadata, preserve the old rule for blocks past n_layer.
+    CHECK( owns(57, 77, 0, "blk.78.nextn_eh_proj.weight", false));
+    CHECK(!owns( 0, 56, 0, "blk.78.nextn_eh_proj.weight", false));
+
+    // With MTP metadata, NextN and output tensors also belong to the head.
+    CHECK(!owns(57, 77, 1, "blk.78.nextn_eh_proj.weight", false));
+    CHECK( owns( 0, 56, 1, "blk.78.nextn_eh_proj.weight", false));
+    CHECK(!owns(20, 40, 1, "blk.78.nextn_eh_proj.weight", false));
+    CHECK( owns( 0, 56, 1, "output_norm.weight", false));
+    CHECK( owns( 0, 56, 1, "output.weight",      false));
+    CHECK( owns(57, 77, 1, "output_norm.weight", false));
+    CHECK( owns(57, 77, 1, "output.weight",      false));
 
     // "output" prefix matching must not confuse output_norm with output
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "output_norm.weight", false));
-    CHECK(!llama_pipeline_owns_tensor(0, 56, n_layer, "output.weight",      false));
+    CHECK(!owns(0, 56, 0, "output_norm.weight", false));
+    CHECK(!owns(0, 56, 0, "output.weight",      false));
 
-    CHECK(!llama_pipeline_owns_tensor(0, 77, n_layer, nullptr, false));
+    CHECK(!owns(0, 77, 0, nullptr, false));
 }
 
 static void test_validate_stages() {

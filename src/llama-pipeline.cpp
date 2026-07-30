@@ -65,17 +65,19 @@ int32_t llama_pipeline_tensor_block_index(const char * name) {
     return idx;
 }
 
-bool llama_pipeline_owns_tensor(int32_t first, int32_t last, int32_t n_layer, const char * name, bool duplicated_embd) {
+bool llama_pipeline_owns_tensor(
+        int32_t first, int32_t last, int32_t n_layer, int32_t n_layer_nextn,
+        const char * name, bool duplicated_embd) {
     if (name == nullptr) {
         return false;
     }
     const int32_t blk = llama_pipeline_tensor_block_index(name);
     if (blk >= 0) {
         if (blk >= n_layer) {
-            // NextN/MTP tensors sit past the last real layer. They belong to
-            // the tail: that is where the base model's final hidden state
-            // (their input) exists.
-            return last == n_layer - 1;
+            // NextN/MTP runs on the head, which owns token_embd and has the
+            // resources for its experts. Preserve the old tail rule for
+            // models without an MTP layer.
+            return n_layer_nextn > 0 ? first == 0 : last == n_layer - 1;
         }
         return blk >= first && blk <= last;
     }
@@ -86,10 +88,10 @@ bool llama_pipeline_owns_tensor(int32_t first, int32_t last, int32_t n_layer, co
         return first == 0 || (duplicated_embd && last == n_layer - 1);
     }
     if (std::strncmp(name, "output_norm.", 12) == 0) {
-        return last == n_layer - 1;
+        return last == n_layer - 1 || (n_layer_nextn > 0 && first == 0);
     }
     if (std::strncmp(name, "output.", 7) == 0) {
-        return last == n_layer - 1;
+        return last == n_layer - 1 || (n_layer_nextn > 0 && first == 0);
     }
     // small global tensors (no block index, not one of the gated shared
     // tensors) are owned by every stage that loads them

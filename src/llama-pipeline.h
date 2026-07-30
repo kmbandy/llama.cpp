@@ -39,17 +39,20 @@ llama_pipeline_stage llama_pipeline_resolve_band(int32_t first, int32_t last, in
 // tensors, "token_embd.<...>", "output_norm.<...>", "output.<...>" for the
 // shared tensors.
 //   - blk.N.*            -> first <= N <= last
-//   - blk.N.*, N >= n_layer (NextN/MTP) -> the tail (last == n_layer-1)
+//   - blk.N.*, N >= n_layer (NextN/MTP) -> the head when
+//                           n_layer_nextn > 0, otherwise the tail
 //   - token_embd.*       -> first == 0 (the head owns embeddings), unless
 //                           duplicated_embd is set (a tail with tied
 //                           embeddings loads token_embd as its lm_head)
-//   - output_norm.*/output.* -> last == n_layer-1 (the tail owns the head)
+//   - output_norm.*/output.* -> the tail, plus the head when
+//                           n_layer_nextn > 0
 //   - anything else      -> owned (small global tensors: biases, norms that
 //                           do not follow the blk convention, etc.)
 // This single predicate is used both by the loader (which tensors to create)
 // and by wp-stage-split (which tensors to write), so the two can never
 // disagree about stage contents.
-bool llama_pipeline_owns_tensor(int32_t first, int32_t last, int32_t n_layer, const char * name, bool duplicated_embd);
+bool llama_pipeline_owns_tensor(
+    int32_t first, int32_t last, int32_t n_layer, int32_t n_layer_nextn, const char * name, bool duplicated_embd);
 
 // Validate a complete pipeline: the stages, in order, must cover [0, n_layer-1]
 // exactly once -- no gaps (continuity), no overlaps (two stages owning one

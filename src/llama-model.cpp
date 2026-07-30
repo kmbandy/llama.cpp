@@ -2498,7 +2498,8 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED);
         if (!llama_pipeline_owns_tensor(
                 params.pipeline_layer_first, params.pipeline_layer_last,
-                (int32_t) hparams.n_layer(), tn.str().c_str(), duplicated_embd)) {
+                (int32_t) hparams.n_layer(), (int32_t) hparams.n_layer_nextn,
+                tn.str().c_str(), duplicated_embd)) {
             return nullptr;
         }
     }
