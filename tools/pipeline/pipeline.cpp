@@ -199,7 +199,6 @@ void fill_embd_batch(llama_batch & batch, const pipe_fwd_req & req, int32_t n_em
     std::memcpy(batch.embd, hidden, (size_t) n * n_embd * sizeof(float));
 
     for (int32_t i = 0; i < n; ++i) {
-        batch.token   [i]    = 0; // unused on the embd path
         batch.pos     [i]    = req.pos[(size_t) i * req.n_pos_per_embd];
         batch.n_seq_id[i]    = 1;
         batch.seq_id  [i][0] = 0; // Phase 2: single sequence

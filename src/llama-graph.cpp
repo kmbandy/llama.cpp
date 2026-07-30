@@ -2540,18 +2540,20 @@ ggml_tensor * llm_graph_context::build_inp_hidden() const {
 
     auto inp = std::make_unique<llm_graph_input_hidden>(n_embd);
 
-    inp->hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
-    cb(inp->hidden, "inp_hidden", -1);
-    ggml_set_input(inp->hidden);
+    auto & cur = inp->hidden;
 
-    res->t_inp_embd = inp->hidden;
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    cb(cur, "inp_hidden", -1);
+    ggml_set_input(cur);
+
+    res->t_inp_embd = cur;
 
     res->add_input(std::move(inp));
 
     // materialize immediately, same as the embedding path
-    ggml_build_forward_expand(gf, inp->hidden);
+    ggml_build_forward_expand(gf, cur);
 
-    return inp->hidden;
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

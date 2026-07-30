@@ -437,8 +437,12 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     }
     cur = inpL;
 
-    if (model.output_norm != nullptr) {
-        // tail stage (or a full non-pipeline model): output norm + lm_head
+    const bool is_tail_stage =
+        !model.pipeline_band_enabled() || il_last == (int32_t) hparams.n_layer() - 1;
+    if (is_tail_stage) {
+        // Last pipeline stage (or a full non-pipeline model): output norm + lm_head.
+        GGML_ASSERT(model.output_norm != nullptr);
+        GGML_ASSERT(model.output != nullptr);
         cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
         cb(cur, "result_norm", -1);
@@ -452,7 +456,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
 
         ggml_build_forward_expand(gf, cur);
     } else {
-        // pipeline head/middle stage: emit the raw hidden state for the
+        // Non-tail pipeline stage: emit the raw hidden state for the
         // next stage. The driver requests n_outputs == n_tokens so every
         // token's hidden state crosses (t_logits intentionally stays null).
         cb(cur, "result_hidden", -1);
