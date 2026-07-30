@@ -3440,6 +3440,10 @@ llama_model_params llama_model_default_params() {
         /*.weight_paging_ffn_island_device =*/ nullptr,
         /*.weight_paging_resident_experts =*/ nullptr,
         /*.weight_paging_device_layers =*/ nullptr,
+        /*.weight_paging_blob_files    =*/ nullptr,
+        /*.weight_paging_n_blob_files  =*/ 0,
+        /*.weight_paging_blob_entries  =*/ nullptr,
+        /*.weight_paging_n_blob_entries =*/ 0,
         /*.pipeline_layer_first         =*/ -1,
         /*.pipeline_layer_last          =*/ -1,
     };

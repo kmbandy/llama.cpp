@@ -107,6 +107,25 @@ public:
     // Lookup by name. Returns -1 if not present.
     int find(const std::string & name) const;
 
+    enum class RemapStatus {
+        Ok,
+        NotFound,      // no such page in this catalog
+        NotPageable,   // pinned or a consolidated parent — never reads a file
+        SizeMismatch,  // blob disagrees with the model's tensor geometry
+    };
+
+    // Repoint an existing page at a different (file_idx, file_offset) without
+    // changing anything else about it. This is how wp-repack's expert-major
+    // blobs are adopted: the catalog is built from the source GGUFs as usual,
+    // then each repacked expert page is redirected into its blob. Everything
+    // downstream (pool, transport, prefetch, eval-cb) only ever consumes the
+    // (file_idx, file_offset, size) triple, so nothing else needs to know.
+    //
+    // Must be called BEFORE init() — the fd table is handed to the pager
+    // there, and `file_idx` indexes into it.
+    RemapStatus remap_source(const std::string & name, uint16_t file_idx,
+                             uint64_t file_offset, size_t size);
+
     // Index access. Caller must ensure 0 <= idx < size().
     const PageMeta & at(int idx) const { return pages_[idx]; }
 

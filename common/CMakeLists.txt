@@ -102,6 +102,8 @@ add_library(${TARGET}
     speculative.h
     unicode.cpp
     unicode.h
+    wp-blob-index.cpp
+    wp-blob-index.h
     jinja/lexer.cpp
     jinja/lexer.h
     jinja/parser.cpp

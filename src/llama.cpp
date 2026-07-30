@@ -1,5 +1,6 @@
 #include "llama.h"
 #include <fcntl.h>
+#include <unistd.h>  // close() for weight-pager blob descriptors
 
 #include "llama-impl.h"
 
@@ -235,6 +236,73 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         }
     }
 
+    // wp-repack blobs — redirect routed-expert pages at their expert-major
+    // copy. The catalog was built from the source GGUFs above, so a page with
+    // no blob entry simply keeps reading the original file; the two sources
+    // coexist and `file_idx` distinguishes them. Blob fds are appended AFTER
+    // the model's own fds (see the fds loop below), so a blob's descriptor
+    // index is ml.files.size() + blob_idx.
+    const size_t n_blob_files = params.weight_paging_blob_files != nullptr
+        ? params.weight_paging_n_blob_files : 0;
+    if (n_blob_files > 0 && params.weight_paging_n_blob_entries > 0) {
+        const size_t fd_base = ml.files.size();
+        if (fd_base + n_blob_files > (size_t) UINT16_MAX) {
+            throw std::runtime_error("weight pager: too many files to index with uint16 file_idx");
+        }
+        size_t n_remapped = 0;
+        size_t n_absent   = 0;
+        for (size_t i = 0; i < params.weight_paging_n_blob_entries; ++i) {
+            const llama_wp_blob_entry & e = params.weight_paging_blob_entries[i];
+            if (e.name == nullptr) {
+                throw std::runtime_error("weight pager: blob entry with null name");
+            }
+            if (e.blob_idx >= n_blob_files) {
+                throw std::runtime_error(format(
+                    "weight pager: blob entry '%s' references blob %u of %zu",
+                    e.name, e.blob_idx, n_blob_files));
+            }
+            const uint16_t file_idx = (uint16_t) (fd_base + e.blob_idx);
+            // A page lives in exactly one device pager; ask each until one
+            // owns it. NotFound everywhere is legitimate -- the blob set may
+            // cover layers this process does not own (pipeline band) or
+            // experts held resident rather than paged.
+            bool handled = false;
+            for (wp::WeightPagerSet::Entry & entry : model.wp_pager->entries()) {
+                const wp::PageCatalog::RemapStatus st = entry.pager->remap_page_source(
+                    e.name, file_idx, e.blob_offset, (size_t) e.size);
+                if (st == wp::PageCatalog::RemapStatus::NotFound) {
+                    continue;
+                }
+                if (st == wp::PageCatalog::RemapStatus::SizeMismatch) {
+                    throw std::runtime_error(format(
+                        "weight pager: blob entry '%s' is %" PRIu64 " bytes but the model's "
+                        "page is a different size -- this blob set was built from a "
+                        "different model or quantisation", e.name, e.size));
+                }
+                if (st == wp::PageCatalog::RemapStatus::NotPageable) {
+                    throw std::runtime_error(format(
+                        "weight pager: blob entry '%s' names a pinned or consolidated "
+                        "page, which never reads from a file", e.name));
+                }
+                ++n_remapped;
+                handled = true;
+                break;
+            }
+            if (!handled) {
+                ++n_absent;
+            }
+        }
+        if (n_remapped == 0) {
+            throw std::runtime_error(format(
+                "weight pager: none of the %zu blob entries matched a catalog page -- "
+                "the blob set does not describe this model",
+                params.weight_paging_n_blob_entries));
+        }
+        LLAMA_LOG_INFO("%s: wp-repack blobs: %zu files, %zu pages remapped"
+                       " (%zu entries not owned by this process)\n",
+                       __func__, n_blob_files, n_remapped, n_absent);
+    }
+
     if (wp_resident_dense_from_env()) {
         for (const wp::WeightPagerSet::Entry & entry : model.wp_pager->entries()) {
             for (int page_idx = 0; page_idx < entry.pager->n_pages(); ++page_idx) {
@@ -315,16 +383,43 @@ static bool init_weight_pager(llama_model & model, llama_model_loader & ml, cons
         }
 
         std::vector<int> fds;
-        fds.reserve(ml.files.size());
+        fds.reserve(ml.files.size() + n_blob_files);
         for (const auto & file : ml.files) {
             const int fd = wp::dup_clear_o_direct(file->file_id());
-            if (fd >= 0) {
-                fds.push_back(fd);
+            // Every page carries a file_idx that indexes THIS vector, so a
+            // skipped entry would silently shift every later file's index and
+            // read the wrong bytes from the wrong file. Fail instead.
+            if (fd < 0) {
+                for (int open_fd : fds) {
+                    close(open_fd);
+                }
+                model.wp_pager.reset();
+                throw std::runtime_error(
+                    "weight pager: could not duplicate a model file descriptor");
             }
+            fds.push_back(fd);
         }
         if (fds.empty()) {
             model.wp_pager.reset();
             throw std::runtime_error("weight pager: no usable file descriptors");
+        }
+        // Blob fds follow the model's, in blob_idx order -- this is the
+        // ordering the remap above assumed. Each device pager owns its own
+        // descriptors (init() takes ownership and closes them), so open a
+        // fresh set per entry rather than sharing.
+        for (size_t b = 0; b < n_blob_files; ++b) {
+            const char * path = params.weight_paging_blob_files[b];
+            const int fd = path != nullptr ? open(path, O_RDONLY) : -1;
+            if (fd < 0) {
+                for (int open_fd : fds) {
+                    close(open_fd);
+                }
+                model.wp_pager.reset();
+                throw std::runtime_error(format(
+                    "weight pager: could not open repack blob '%s': %s",
+                    path != nullptr ? path : "(null)", strerror(errno)));
+            }
+            fds.push_back(fd);
         }
 
         wp::WeightPager::Config cfg;

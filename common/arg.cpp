@@ -2774,21 +2774,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // Never map the GGUF into host address space under weight paging.
             params.use_mmap = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING"));
     add_opt(common_arg(
         {"--weight-paging-slots"}, "N",
         "number of VRAM slots for weight paging (-1 = auto = layer count, capped to free VRAM)",
         [](common_params & params, const std::string & value) {
             params.weight_paging_slots = std::stoi(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_SLOTS"));
     add_opt(common_arg(
         {"--weight-paging-prefetch"},
         "enable async io_uring prefetch of next layer (default: disabled)",
         [](common_params & params) {
             params.weight_paging_prefetch = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_PREFETCH"));
     add_opt(common_arg(
         {"--weight-paging-resident-device"}, "<dev|auto>",
         "device for resident dense weights under WP_RESIDENT_DENSE=1 (default: auto)",
@@ -2798,7 +2798,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.weight_paging_resident_device = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_DEVICE"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_DEVICE"));
     add_opt(common_arg(
         {"--weight-paging-ffn-island-device"}, "<dev|auto|off>",
         "device hosting the shared experts and FFN island; \"auto\" selects the first\n"
@@ -2810,7 +2810,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.weight_paging_ffn_island_device = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_FFN_ISLAND_DEVICE"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_FFN_ISLAND_DEVICE"));
     add_opt(common_arg(
         {"--weight-paging-resident-experts"}, "<off|BLOCKS>",
         "hold whole blocks' routed experts resident on the FFN-island device instead of\n"
@@ -2823,7 +2823,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.weight_paging_resident_experts = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_EXPERTS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_RESIDENT_EXPERTS"));
     add_opt(common_arg(
         {"--weight-paging-device-layers"}, "<DEVICE:BLOCKS[;DEVICE:BLOCKS...]>",
         "page explicit routed-expert block ranges on named devices; for example\n"
@@ -2834,7 +2834,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.weight_paging_device_layers = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_WEIGHT_PAGING_DEVICE_LAYERS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_DEVICE_LAYERS"));
+    add_opt(common_arg(
+        {"--weight-paging-blobs"}, "FNAME",
+        "read routed experts from a wp-repack expert-major blob set instead of from the\n"
+        "source GGUFs. FNAME is the set's -manifest.json. Each expert's gate/up/down are\n"
+        "stored contiguously, so a routed expert costs one sequential read rather than\n"
+        "three scattered ones. Requires --weight-paging. Build a set with wp-repack.",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.weight_paging_blobs = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_WEIGHT_PAGING_BLOBS"));
     add_opt(common_arg(
         {"--pipeline-layers"}, "FIRST-LAST",
         "cross-machine pipeline parallelism: this process owns only layers [FIRST, LAST].\n"
@@ -2851,7 +2864,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.pipeline_layer_first = first;
             params.pipeline_layer_last  = last;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_PIPELINE_LAYERS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_PIPELINE_LAYERS"));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"

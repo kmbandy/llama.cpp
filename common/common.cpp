@@ -1580,6 +1580,27 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.weight_paging_resident_experts = params.weight_paging_resident_experts.c_str();
     mparams.weight_paging_device_layers = params.weight_paging_device_layers.c_str();
 
+    // wp-repack expert-major blobs. Parsed once and cached on `params`, which
+    // outlives the load; mparams only borrows pointers into it.
+    if (!params.weight_paging_blobs.empty()) {
+        if (!params.weight_paging_enabled) {
+            throw std::runtime_error(
+                "--weight-paging-blobs requires --weight-paging: the blob set only "
+                "supplies pages to the weight pager");
+        }
+        if (!params.weight_paging_blob_index) {
+            params.weight_paging_blob_index = std::make_shared<common_wp_blob_index>(
+                common_wp_blob_index_load(params.weight_paging_blobs, params.model.path));
+            LOG_INF("%s: wp-repack blob set: %zu blobs, %zu expert pages\n", __func__,
+                    params.weight_paging_blob_index->blob_files.size(),
+                    params.weight_paging_blob_index->entries.size());
+        }
+        mparams.weight_paging_blob_files    = params.weight_paging_blob_index->blob_file_ptrs.data();
+        mparams.weight_paging_n_blob_files  = params.weight_paging_blob_index->blob_file_ptrs.size();
+        mparams.weight_paging_blob_entries  = params.weight_paging_blob_index->entries.data();
+        mparams.weight_paging_n_blob_entries = params.weight_paging_blob_index->entries.size();
+    }
+
     // cross-machine pipeline band
     mparams.pipeline_layer_first = params.pipeline_layer_first;
     mparams.pipeline_layer_last  = params.pipeline_layer_last;

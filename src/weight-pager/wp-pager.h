@@ -444,6 +444,14 @@ public:
         key.assign(name);
         return catalog_.find(key);
     }
+    // Repoint one page at a wp-repack blob. Must be called before init().
+    // See PageCatalog::remap_source.
+    PageCatalog::RemapStatus remap_page_source(const std::string & name,
+                                               uint16_t file_idx,
+                                               uint64_t file_offset,
+                                               size_t   size) {
+        return catalog_.remap_source(name, file_idx, file_offset, size);
+    }
     int    n_pages()                            const { return catalog_.size(); }
     int    catalog_n_expert_pages()             const { return catalog_.n_expert_pages(); }
     size_t max_page_size()                      const { return catalog_.max_page_size(); }

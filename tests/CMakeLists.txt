@@ -276,6 +276,21 @@ target_include_directories(test-wp-multidevice-partition PRIVATE ${CMAKE_SOURCE_
 llama_build_and_test(test-wp-size-class-slots.cpp)
 target_include_directories(test-wp-size-class-slots PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# wp-repack blob-set reader + the catalog remap it drives (no model, no GPU)
+add_executable(
+    test-wp-blob-index
+    test-wp-blob-index.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-page-catalog.cpp
+)
+target_include_directories(test-wp-blob-index PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/weight-pager
+    ${CMAKE_SOURCE_DIR}/common
+)
+target_link_libraries(test-wp-blob-index PRIVATE llama-common)
+target_compile_features(test-wp-blob-index PRIVATE cxx_std_17)
+llama_test(test-wp-blob-index)
+
 # cross-machine pipeline band helpers (pure, no ggml dependency)
 add_executable(
     test-pipeline-band

@@ -293,6 +293,18 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // One repacked routed-expert page: where wp-repack placed it in a blob.
+    // `name` is the pager's catalog page name, i.e. the synthetic sub-expert
+    // form "blk.<L>.ffn_<role>_exps.weight#expert.<E>". `size` is carried so
+    // the loader can reject a blob set that disagrees with the model's own
+    // tensor geometry rather than reading the wrong bytes.
+    struct llama_wp_blob_entry {
+        const char * name;
+        uint32_t     blob_idx;    // index into weight_paging_blob_files
+        uint64_t     blob_offset; // byte offset within that blob
+        uint64_t     size;        // payload bytes; must equal the catalog page size
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -344,6 +356,22 @@ extern "C" {
         const char * weight_paging_resident_experts;
         // Explicit paged block bands per device, e.g. "ROCm0:0-37;ROCm1:38-74".
         const char * weight_paging_device_layers;
+
+        // Expert-major repacked blobs (wp-repack). When set, the pager reads
+        // routed-expert pages from these blobs instead of the source GGUFs.
+        // A blob stores one expert's gate/up/down CONTIGUOUSLY, so a routed
+        // expert costs one sequential read instead of three scattered ones.
+        //
+        // The caller parses the manifest/sidecars (they are JSON, and libllama
+        // carries no JSON dependency) and passes the result as flat arrays it
+        // owns for the duration of the load. Entries name catalog pages using
+        // the pager's synthetic sub-expert form "<tensor>#expert.<E>"; each
+        // one's (blob_idx, offset) replaces that page's source location.
+        // Pages with no entry keep reading from the original GGUF.
+        const char * const * weight_paging_blob_files; // blob paths, indexed by blob_idx
+        size_t weight_paging_n_blob_files;
+        const struct llama_wp_blob_entry * weight_paging_blob_entries;
+        size_t weight_paging_n_blob_entries;
 
         // Cross-machine pipeline parallelism: the contiguous layer band
         // [pipeline_layer_first, pipeline_layer_last] this process owns.

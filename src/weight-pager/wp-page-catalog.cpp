@@ -236,6 +236,33 @@ int PageCatalog::find(const std::string & name) const {
     return it == name_to_idx_.end() ? -1 : it->second;
 }
 
+PageCatalog::RemapStatus PageCatalog::remap_source(const std::string & name,
+                                                   uint16_t file_idx,
+                                                   uint64_t file_offset,
+                                                   size_t   size) {
+    const int idx = find(name);
+    if (idx < 0) {
+        return RemapStatus::NotFound;
+    }
+    PageMeta & meta = pages_[idx];
+    // Only pages that actually perform a read may move. A pinned page has no
+    // file at all and a consolidated parent is pure metadata whose children
+    // carry the real offsets — silently repointing either would produce a
+    // catalog that disagrees with what the pager reads.
+    if (meta.is_pinned || meta.is_consolidated) {
+        return RemapStatus::NotPageable;
+    }
+    // The blob must agree with the model's own tensor geometry. If it does
+    // not, the blob set was built from a different model (or a different
+    // quant) and reading it would silently return the wrong weights.
+    if (meta.size != size) {
+        return RemapStatus::SizeMismatch;
+    }
+    meta.file_idx    = file_idx;
+    meta.file_offset = file_offset;
+    return RemapStatus::Ok;
+}
+
 std::vector<int> PageCatalog::pages_for_block(int block_idx) const {
     std::vector<int> out;
     if (block_idx < 0) return out;

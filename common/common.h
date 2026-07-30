@@ -3,10 +3,12 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "wp-blob-index.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
 
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -591,6 +593,13 @@ struct common_params {
     std::string weight_paging_ffn_island_device = "off"; // device hosting shared experts and FFN island, or "auto"/"off"
     std::string weight_paging_resident_experts = "off"; // routed-expert blocks resident on the island device: off/auto/SIZE/BLOCKS
     std::string weight_paging_device_layers; // explicit paged bands: "ROCm0:0-37;ROCm1:38-74"
+    // wp-repack expert-major blob set: path to its -manifest.json, empty = off.
+    // When set, routed experts are read from the blobs (one contiguous read per
+    // expert) instead of from the source GGUFs (three scattered reads).
+    std::string weight_paging_blobs;
+    // Parsed form of the above. Lives here because llama_model_params holds
+    // borrowed pointers into it for the duration of the model load.
+    std::shared_ptr<common_wp_blob_index> weight_paging_blob_index;
 
     // cross-machine pipeline parallelism: the layer band this process owns
     // (-1/-1 = own everything, the legacy behaviour)
