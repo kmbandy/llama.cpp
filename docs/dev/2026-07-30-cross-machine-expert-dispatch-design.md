@@ -97,6 +97,14 @@ Two constraints dominate and must shape everything:
 - **Scheduler** — runs in the spine process. Per MoE layer, partitions the
   router's top-8 across workers and reduces their partial sums.
 
+**There is no local fast path.** ALL expert compute goes through workers,
+including workers on the same machine as the spine, reached over loopback. The
+R9700 therefore runs the spine *and* a worker process side by side. The
+alternative — a special in-process path for local experts — buys ~0.05 ms of
+loopback RTT against ~10 ms of expert compute, and costs a second code path
+through the most correctness-sensitive part of the system. Uniformity is worth
+more than the RTT.
+
 ### 4.2 Storage sharding — by expert index, not by layer
 
 Shard the expert set **by expert index across all layers**, not by layer range.
@@ -259,8 +267,13 @@ are executed by Claude, never by an implementation agent.
 - **Stage 2 — worker service.** A process that owns a device, loads its shard's
   pager catalog, accepts dispatch frames, computes Σ w_e·FFN_e(x), returns the
   partial. Testable single-machine, one worker, against an in-process reference.
-- **Stage 3 — scheduler + reduction in the spine.** Router top-8 → partition →
-  issue remote first → compute local → reduce. Correctness gate vs single-process.
+- **Stage 3a — the dispatcher.** Partition, issue-before-await, reduce. Proven
+  against real worker processes over the real protocol on CPU, with disjoint
+  synthetic shards. Touches nothing in the inference graph, so the hard part
+  (ordering, balancing, reduction, multi-worker failure handling) is de-risked
+  before the graph path is opened.
+- **Stage 3b — wire into the graph.** Replace the in-graph expert computation
+  with a dispatch at the MoE boundary. Correctness gate vs single-process.
 - **Stage 4 — 4 workers, cross-machine.** All GPUs, both machines. Coherence
   gate, then throughput measurement against the 1.49x hypothesis.
 - **Stage 5 — RAM victim tier on both machines**, read-on-demand /
