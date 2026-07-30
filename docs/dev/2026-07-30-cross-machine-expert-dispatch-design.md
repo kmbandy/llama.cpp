@@ -84,6 +84,30 @@ Two constraints dominate and must shape everything:
 
 ---
 
+## 3a. Canonical weight layout
+
+One copy of each piece, nothing duplicated, so there is never a question of
+which file is authoritative:
+
+| Where | What | Size |
+|---|---|---|
+| mad-lab-2026 `GLM-5.2-eshard/` | experts **0–84** + sidecars + manifest + descriptor | 79,079,669,760 B |
+| mad-lab-main `GLM-5.2-eshard-main/` | experts **85–255** + sidecars + manifest + descriptor | 159,089,688,576 B |
+| mad-lab-main `GLM-5.2-dense/` | dense, attention, embeddings, router, shared experts, MTP | ~15.7 GB |
+
+6,460 + 12,996 = **19,456 groups**, exactly the repack's total, so the two
+machines partition the expert set with no gap and no overlap.
+
+The original 7-shard GGUF and the layer-major repack are deleted once the above
+verify. Together they were 459 GB of duplicated weights on one machine.
+
+**Two steps are unrecoverable if taken late.** The per-(layer, role) expert
+shapes and quant types, and the entire dense portion, exist ONLY in the original
+GGUF — the repack holds routed experts and nothing else. So the descriptors and
+the dense extract must both exist and verify BEFORE the originals are deleted.
+After that, a machine needs no GGUF to serve experts: a shard plus its manifest
+and descriptor is self-sufficient.
+
 ## 4. Architecture
 
 ### 4.1 Roles
