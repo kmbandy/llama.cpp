@@ -49,13 +49,15 @@ static constexpr size_t   PIPE_HEADER_SIZE = 32;
 static constexpr uint64_t PIPE_MAX_PAYLOAD = 512ull * 1024ull * 1024ull; // 512 MiB
 
 enum pipe_frame_type : uint32_t {
-    PIPE_HELLO    = 1,
-    PIPE_FWD_REQ  = 2,
-    PIPE_FWD_RESP = 3,
-    PIPE_TOKEN    = 4,
-    PIPE_ERROR    = 5,
-    PIPE_PING     = 6,
-    PIPE_PONG     = 7,
+    PIPE_HELLO               = 1,
+    PIPE_FWD_REQ             = 2,
+    PIPE_FWD_RESP            = 3,
+    PIPE_TOKEN               = 4,
+    PIPE_ERROR               = 5,
+    PIPE_PING                = 6,
+    PIPE_PONG                = 7,
+    PIPE_EXPERT_DISPATCH_REQ = 8,
+    PIPE_EXPERT_PARTIAL      = 9,
 };
 
 enum pipe_role : uint32_t {
@@ -70,11 +72,14 @@ enum pipe_hidden_type : int32_t {
 };
 
 enum pipe_error_code : uint32_t {
-    PIPE_ERR_GENERIC      = 0,
-    PIPE_ERR_HELLO        = 1, // handshake / stage-set inconsistency
-    PIPE_ERR_BAD_FRAME    = 2, // malformed frame (magic/version/length)
-    PIPE_ERR_STALE_SEQ    = 3, // seq_id from a dead session
-    PIPE_ERR_DECODE       = 4, // llama_decode failed on a stage
+    PIPE_ERR_GENERIC       = 0,
+    PIPE_ERR_HELLO         = 1, // handshake / stage-set inconsistency
+    PIPE_ERR_BAD_FRAME     = 2, // malformed frame (magic/version/length)
+    PIPE_ERR_STALE_SEQ     = 3, // seq_id from a dead session
+    PIPE_ERR_DECODE        = 4, // llama_decode failed on a stage
+    PIPE_ERR_EXPERT_RANGE  = 5, // requested expert is not owned by this worker
+    PIPE_ERR_EXPERT_LAYER  = 6, // requested layer is not served by this worker
+    PIPE_ERR_EXPERT_COMPUTE = 7,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +120,60 @@ struct pipe_error {
     std::string msg;
 };
 
+enum pipe_expert_role : uint32_t {
+    PIPE_EXPERT_ROLE_CLIENT = 0,
+    PIPE_EXPERT_ROLE_WORKER = 1,
+};
+
+// Expert endpoints still exchange PIPE_HELLO frames. The expert payload is
+// separate from pipe_hello so the existing stage protocol remains byte-for-byte
+// compatible. A worker advertises the exact layer set and inclusive expert
+// range it can serve. The client sends the same model identity and hparams with
+// an empty layer set.
+struct pipe_expert_hello {
+    uint32_t             role          = PIPE_EXPERT_ROLE_CLIENT;
+    int32_t              hidden_type   = PIPE_HIDDEN_F16;
+    int32_t              n_embd        = 0;
+    int32_t              n_ff_exp      = 0;
+    int32_t              n_expert      = 0;
+    int32_t              n_expert_used = 0;
+    int32_t              expert_first  = -1;
+    int32_t              expert_last   = -1;
+    uint32_t             n_slots       = 0;
+    std::vector<int32_t> layers;
+    std::string          model_identity;
+};
+
+struct pipe_expert_assignment {
+    int32_t            expert_id = -1;
+    std::vector<float> weights; // one final router weight per token
+};
+
+// seq_id in the fixed frame header is the request's step/sequence id.
+//
+// Payload:
+//   i32 layer
+//   u32 n_tokens
+//   u32 n_assignments
+//   repeated { i32 expert_id; f32 weights[n_tokens] }
+//   f16 activations[n_tokens * n_embd]
+struct pipe_expert_dispatch_req {
+    int32_t                             layer    = -1;
+    uint32_t                            n_tokens = 0;
+    std::vector<pipe_expert_assignment> assignments;
+    std::vector<uint16_t>               activations;
+};
+
+// Payload:
+//   i32 layer
+//   u32 n_tokens
+//   f16 partial[n_tokens * n_embd]
+struct pipe_expert_partial {
+    int32_t               layer    = -1;
+    uint32_t              n_tokens = 0;
+    std::vector<uint16_t> partial;
+};
+
 // ---------------------------------------------------------------------------
 // header + frame primitives (byte-explicit, little-endian)
 
@@ -153,6 +212,9 @@ std::vector<uint8_t> pipe_encode_fwd_req   (const pipe_fwd_req  & p, int32_t hid
 std::vector<uint8_t> pipe_encode_fwd_resp  (const pipe_fwd_resp & p);
 std::vector<uint8_t> pipe_encode_token     (const pipe_token    & p);
 std::vector<uint8_t> pipe_encode_error     (const pipe_error    & p);
+std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
+std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 // PING/PONG carry no payload.
 
 pipe_hello     pipe_decode_hello     (const uint8_t * buf, size_t len);
@@ -160,6 +222,11 @@ pipe_fwd_req   pipe_decode_fwd_req   (const uint8_t * buf, size_t len, int32_t n
 pipe_fwd_resp  pipe_decode_fwd_resp  (const uint8_t * buf, size_t len, int32_t n_embd, int32_t hidden_type);
 pipe_token     pipe_decode_token     (const uint8_t * buf, size_t len);
 pipe_error     pipe_decode_error     (const uint8_t * buf, size_t len);
+pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
+pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
+    const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_partial pipe_decode_expert_partial(
+    const uint8_t * buf, size_t len, int32_t n_embd);
 
 // ---------------------------------------------------------------------------
 // HELLO validation

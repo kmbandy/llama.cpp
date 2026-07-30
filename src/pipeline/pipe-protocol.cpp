@@ -2,8 +2,11 @@
 #include "pipe-transport.h"
 
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <set>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
@@ -25,8 +28,21 @@ static void wr_u64(uint8_t * & p, uint64_t v) {
     p += 8;
 }
 
+static void wr_u16(uint8_t * & p, uint16_t v) {
+    p[0] = (uint8_t) (v >> 0);
+    p[1] = (uint8_t) (v >> 8);
+    p += 2;
+}
+
 static void wr_i32(uint8_t * & p, int32_t v) {
     wr_u32(p, (uint32_t) v);
+}
+
+static void wr_f32(uint8_t * & p, float v) {
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(v), "f32 wire size");
+    std::memcpy(&bits, &v, sizeof(bits));
+    wr_u32(p, bits);
 }
 
 static uint32_t rd_u32(const uint8_t * & p) {
@@ -47,8 +63,21 @@ static uint64_t rd_u64(const uint8_t * & p) {
     return v;
 }
 
+static uint16_t rd_u16(const uint8_t * & p) {
+    const uint16_t v = (uint16_t) p[0] | ((uint16_t) p[1] << 8);
+    p += 2;
+    return v;
+}
+
 static int32_t rd_i32(const uint8_t * & p) {
     return (int32_t) rd_u32(p);
+}
+
+static float rd_f32(const uint8_t * & p) {
+    const uint32_t bits = rd_u32(p);
+    float          value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +177,248 @@ pipe_hello pipe_decode_hello(const uint8_t * buf, size_t len) {
     // hidden_type validity is enforced via elt_size in validate_hello; an
     // unknown type there throws before any tensor buffer is sized from it.
     return h;
+}
+
+// ---------------------------------------------------------------------------
+// expert HELLO
+//
+//   u32 tag = "EXP1"
+//   u32 role
+//   i32 hidden_type
+//   i32 n_embd, n_ff_exp, n_expert, n_expert_used
+//   i32 expert_first, expert_last
+//   u32 n_slots
+//   u32 n_layers
+//   i32 layers[n_layers]
+//   u32 model_identity_len
+//   u8  model_identity[model_identity_len]
+
+static constexpr uint32_t PIPE_EXPERT_HELLO_TAG = 0x31505845u; // "EXP1"
+
+std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p) {
+    if (p.model_identity.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO model identity is too long");
+    }
+    const uint64_t total = 12 * 4ull + (uint64_t) p.layers.size() * 4ull + p.model_identity.size();
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO encode size %llu exceeds max payload",
+             (unsigned long long) total);
+    }
+
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, PIPE_EXPERT_HELLO_TAG);
+    wr_u32(w, p.role);
+    wr_i32(w, p.hidden_type);
+    wr_i32(w, p.n_embd);
+    wr_i32(w, p.n_ff_exp);
+    wr_i32(w, p.n_expert);
+    wr_i32(w, p.n_expert_used);
+    wr_i32(w, p.expert_first);
+    wr_i32(w, p.expert_last);
+    wr_u32(w, p.n_slots);
+    wr_u32(w, (uint32_t) p.layers.size());
+    for (int32_t layer : p.layers) {
+        wr_i32(w, layer);
+    }
+    wr_u32(w, (uint32_t) p.model_identity.size());
+    if (!p.model_identity.empty()) {
+        std::memcpy(w, p.model_identity.data(), p.model_identity.size());
+    }
+    return out;
+}
+
+pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
+    if (len < 12 * 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO payload %zu bytes too small", len);
+    }
+    const uint8_t * p   = buf;
+    const uint8_t * end = buf + len;
+    if (rd_u32(p) != PIPE_EXPERT_HELLO_TAG) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO has the wrong payload tag");
+    }
+
+    pipe_expert_hello h;
+    h.role          = rd_u32(p);
+    h.hidden_type   = rd_i32(p);
+    h.n_embd        = rd_i32(p);
+    h.n_ff_exp      = rd_i32(p);
+    h.n_expert      = rd_i32(p);
+    h.n_expert_used = rd_i32(p);
+    h.expert_first  = rd_i32(p);
+    h.expert_last   = rd_i32(p);
+    h.n_slots       = rd_u32(p);
+    const uint32_t n_layers = rd_u32(p);
+
+    if (h.role > PIPE_EXPERT_ROLE_WORKER) {
+        fail(PIPE_ERR_HELLO, "pipe: expert HELLO role %u out of range", h.role);
+    }
+    if (h.hidden_type != PIPE_HIDDEN_F16) {
+        fail(PIPE_ERR_HELLO, "pipe: expert HELLO hidden type %d is not F16", h.hidden_type);
+    }
+    if (h.n_embd <= 0 || h.n_ff_exp <= 0 || h.n_expert <= 0 || h.n_expert_used <= 0 ||
+        h.n_expert_used > h.n_expert) {
+        fail(PIPE_ERR_HELLO, "pipe: expert HELLO has invalid hparams");
+    }
+    if ((uint64_t) (end - p) < (uint64_t) n_layers * 4ull + 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO layer array is truncated");
+    }
+    h.layers.reserve(n_layers);
+    std::set<int32_t> seen_layers;
+    for (uint32_t i = 0; i < n_layers; ++i) {
+        const int32_t layer = rd_i32(p);
+        if (layer < 0 || !seen_layers.insert(layer).second) {
+            fail(PIPE_ERR_HELLO, "pipe: expert HELLO has an invalid or repeated layer");
+        }
+        h.layers.push_back(layer);
+    }
+
+    const uint32_t identity_len = rd_u32(p);
+    if ((uint64_t) (end - p) != identity_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO model identity bytes %lld, want %u",
+             (long long) (end - p), identity_len);
+    }
+    h.model_identity.assign((const char *) p, identity_len);
+    if (h.model_identity.empty()) {
+        fail(PIPE_ERR_HELLO, "pipe: expert HELLO model identity is empty");
+    }
+
+    if (h.role == PIPE_EXPERT_ROLE_WORKER) {
+        if (h.layers.empty() || h.expert_first < 0 || h.expert_last < h.expert_first ||
+            h.expert_last >= h.n_expert || h.n_slots == 0) {
+            fail(PIPE_ERR_HELLO, "pipe: expert worker HELLO has an invalid service range");
+        }
+    }
+    return h;
+}
+
+// ---------------------------------------------------------------------------
+// expert dispatch request
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p) {
+    if (p.n_tokens == 0 || p.assignments.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch requires tokens and assignments");
+    }
+    uint64_t total = 12;
+    for (const pipe_expert_assignment & assignment : p.assignments) {
+        if (assignment.weights.size() != p.n_tokens) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch weight count does not match n_tokens");
+        }
+        total += 4ull + (uint64_t) assignment.weights.size() * 4ull;
+    }
+    total += (uint64_t) p.activations.size() * 2ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch encode size %llu exceeds max payload",
+             (unsigned long long) total);
+    }
+
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_i32(w, p.layer);
+    wr_u32(w, p.n_tokens);
+    wr_u32(w, (uint32_t) p.assignments.size());
+    for (const pipe_expert_assignment & assignment : p.assignments) {
+        wr_i32(w, assignment.expert_id);
+        for (float weight : assignment.weights) {
+            wr_f32(w, weight);
+        }
+    }
+    for (uint16_t value : p.activations) {
+        wr_u16(w, value);
+    }
+    return out;
+}
+
+pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (n_embd <= 0 || len < 12) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch payload is too small");
+    }
+    const uint8_t * p   = buf;
+    const uint8_t * end = buf + len;
+
+    pipe_expert_dispatch_req r;
+    r.layer               = rd_i32(p);
+    r.n_tokens            = rd_u32(p);
+    const uint32_t n_assignments = rd_u32(p);
+    if (r.layer < 0 || r.n_tokens == 0 || n_assignments == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has invalid dimensions");
+    }
+
+    const uint64_t assignment_bytes =
+        (uint64_t) n_assignments * (4ull + (uint64_t) r.n_tokens * 4ull);
+    const uint64_t activation_bytes =
+        (uint64_t) r.n_tokens * (uint64_t) n_embd * 2ull;
+    if ((uint64_t) (end - p) != assignment_bytes + activation_bytes) {
+        fail(PIPE_ERR_BAD_FRAME,
+             "pipe: expert dispatch payload bytes %lld do not match dimensions",
+             (long long) (end - p));
+    }
+
+    std::set<int32_t> seen_experts;
+    r.assignments.reserve(n_assignments);
+    for (uint32_t i = 0; i < n_assignments; ++i) {
+        pipe_expert_assignment assignment;
+        assignment.expert_id = rd_i32(p);
+        if (assignment.expert_id < 0 || !seen_experts.insert(assignment.expert_id).second) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has an invalid or repeated expert");
+        }
+        assignment.weights.reserve(r.n_tokens);
+        for (uint32_t t = 0; t < r.n_tokens; ++t) {
+            const float weight = rd_f32(p);
+            if (!std::isfinite(weight)) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has a non-finite weight");
+            }
+            assignment.weights.push_back(weight);
+        }
+        r.assignments.push_back(std::move(assignment));
+    }
+
+    const size_t n_activations = (size_t) r.n_tokens * (size_t) n_embd;
+    r.activations.reserve(n_activations);
+    for (size_t i = 0; i < n_activations; ++i) {
+        r.activations.push_back(rd_u16(p));
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// expert partial response
+
+std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
+    const uint64_t total = 8ull + (uint64_t) p.partial.size() * 2ull;
+    if (p.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial response");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_i32(w, p.layer);
+    wr_u32(w, p.n_tokens);
+    for (uint16_t value : p.partial) {
+        wr_u16(w, value);
+    }
+    return out;
+}
+
+pipe_expert_partial pipe_decode_expert_partial(
+        const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (n_embd <= 0 || len < 8) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial payload is too small");
+    }
+    const uint8_t * p   = buf;
+    const uint8_t * end = buf + len;
+    pipe_expert_partial r;
+    r.layer    = rd_i32(p);
+    r.n_tokens = rd_u32(p);
+    const uint64_t n_values = (uint64_t) r.n_tokens * (uint64_t) n_embd;
+    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * 2ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
+    }
+    r.partial.reserve((size_t) n_values);
+    for (uint64_t i = 0; i < n_values; ++i) {
+        r.partial.push_back(rd_u16(p));
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------

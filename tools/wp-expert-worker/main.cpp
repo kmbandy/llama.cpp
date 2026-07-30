@@ -1,0 +1,86 @@
+#include "wp-expert-worker.h"
+
+#include <charconv>
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+
+namespace {
+
+void print_usage(const char * argv0) {
+    std::cout
+        << "usage: " << argv0
+        << " --shard-manifest PATH --descriptor PATH --device DEVICE"
+        << " --listen HOST:PORT --slots N\n";
+}
+
+int parse_positive_int(const std::string & text, const char * option) {
+    int value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc() || result.ptr != text.data() + text.size() || value <= 0) {
+        throw std::invalid_argument(std::string(option) + " requires a positive integer");
+    }
+    return value;
+}
+
+void parse_endpoint(const std::string & text, std::string & host, int & port) {
+    const size_t colon = text.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 == text.size()) {
+        throw std::invalid_argument("--listen expects HOST:PORT");
+    }
+    host = text.substr(0, colon);
+    port = parse_positive_int(text.substr(colon + 1), "--listen");
+    if (port > 65535) {
+        throw std::invalid_argument("--listen port is out of range");
+    }
+}
+
+wp_expert_worker::Options parse_cli(int argc, char ** argv) {
+    wp_expert_worker::Options options;
+    std::string endpoint;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto take = [&]() -> std::string {
+            if (++i >= argc) {
+                throw std::invalid_argument(arg + " requires a value");
+            }
+            return argv[i];
+        };
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else if (arg == "--shard-manifest") {
+            options.shard_manifest = take();
+        } else if (arg == "--descriptor") {
+            options.descriptor = take();
+        } else if (arg == "--device") {
+            options.device = take();
+        } else if (arg == "--listen") {
+            endpoint = take();
+        } else if (arg == "--slots") {
+            options.slots = parse_positive_int(take(), "--slots");
+        } else {
+            throw std::invalid_argument("unknown option: " + arg);
+        }
+    }
+    if (options.shard_manifest.empty() || options.descriptor.empty() ||
+        options.device.empty() || endpoint.empty() || options.slots <= 0) {
+        throw std::invalid_argument(
+            "--shard-manifest, --descriptor, --device, --listen, and --slots are required");
+    }
+    parse_endpoint(endpoint, options.listen_host, options.listen_port);
+    return options;
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    try {
+        return wp_expert_worker::run(parse_cli(argc, argv));
+    } catch (const std::exception & error) {
+        std::cerr << "error: " << error.what() << '\n';
+        return 1;
+    }
+}
