@@ -108,7 +108,7 @@ Fixture make_fixture(const fs::path & dir) {
         throw std::runtime_error("failed to create synthetic blob");
     }
     uint64_t offset = 0;
-    for (int expert = 0; expert < 2; ++expert) {
+    for (int expert = 0; expert < 4; ++expert) {
         json members = json::array();
         for (const auto & role : {
                  std::make_pair(std::string("up"), 1),
@@ -142,7 +142,7 @@ Fixture make_fixture(const fs::path & dir) {
         });
     }
     blob_output.close();
-    require(offset == page_bytes * 2, "synthetic blob size mismatch");
+    require(offset == page_bytes * 4, "synthetic blob size mismatch");
 
     const json identity = {
         { "algorithm", "sha256" },
@@ -169,7 +169,7 @@ Fixture make_fixture(const fs::path & dir) {
               { "name", "synthetic" },
           } },
         { "shard_manifest_identity", identity },
-        { "retained_expert_range", { { "first", 0 }, { "last", 1 } } },
+        { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
         { "hparams",
           {
               { "n_layer", 4 },
@@ -201,7 +201,7 @@ Fixture make_fixture(const fs::path & dir) {
         { "shard_count", 1 },
         { "layer_first", LAYER },
         { "layer_last", LAYER },
-        { "group_count", 2 },
+        { "group_count", 4 },
         { "blob_bytes", offset },
         { "content_hash", identity },
         { "model_files", { "synthetic.gguf" } },
@@ -214,8 +214,8 @@ Fixture make_fixture(const fs::path & dir) {
         { "input_model", "synthetic.gguf" },
         { "model_files", { "synthetic.gguf" } },
         { "sharding_mode", "expert-index-range" },
-        { "retained_expert_range", { { "first", 0 }, { "last", 1 } } },
-        { "total_group_count", 2 },
+        { "retained_expert_range", { { "first", 0 }, { "last", 3 } } },
+        { "total_group_count", 4 },
         { "total_blob_bytes", offset },
         { "shard_count", 1 },
         { "content_hash", identity },
@@ -227,7 +227,7 @@ Fixture make_fixture(const fs::path & dir) {
                   { "shard_index", 0 },
                   { "layer_first", LAYER },
                   { "layer_last", LAYER },
-                  { "group_count", 2 },
+                  { "group_count", 4 },
                   { "blob_bytes", offset },
                   { "content_hash", identity },
               },
@@ -346,7 +346,10 @@ void run_test() {
             pipe_decode_expert_hello(payload.data(), payload.size());
         require(worker_hello.role == PIPE_EXPERT_ROLE_WORKER, "worker HELLO role mismatch");
         require(worker_hello.expert_first == 0, "worker HELLO expert first mismatch");
-        require(worker_hello.expert_last == 1, "worker HELLO expert last mismatch");
+        require(worker_hello.expert_last == 3, "worker HELLO expert last mismatch");
+        require(!worker_hello.model_identity.empty(), "worker HELLO model identity is empty");
+        require(worker_hello.shard_identity == "sha256:synthetic-expert-worker-test",
+                "worker HELLO shard identity mismatch");
         require(worker_hello.layers == std::vector<int32_t>{ LAYER }, "worker HELLO layers mismatch");
 
         pipe_expert_hello client_hello = worker_hello;
@@ -358,6 +361,11 @@ void run_test() {
         payload = pipe_encode_expert_hello(client_hello);
         require(pipe_send_frame(
             *socket, PIPE_HELLO, 0, payload.data(), payload.size()), "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO acknowledgement");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0, "worker did not acknowledge HELLO");
+        const pipe_expert_hello_ack ack =
+            pipe_decode_expert_hello_ack(payload.data(), payload.size());
+        require(ack.accepted, "worker rejected matching HELLO");
 
         std::vector<float> input((size_t) N_TOKENS * N_EMBD);
         pipe_expert_dispatch_req request;
@@ -372,7 +380,9 @@ void run_test() {
         request.assignments = {
             { 0, { 0.5f, 0.0f } },
             { 1, { -0.25f, 0.75f } },
+            { 2, { 0.0f, 0.4f } },
         };
+        require(request.assignments.size() > 2, "batching regression did not exceed model top-k");
         const std::vector<float> expected =
             reference(fixture, input, request.assignments);
 
@@ -401,7 +411,7 @@ void run_test() {
         }
 
         pipe_expert_dispatch_req rejected = request;
-        rejected.assignments = { { 2, { 1.0f, 1.0f } } };
+        rejected.assignments = { { 4, { 1.0f, 1.0f } } };
         payload = pipe_encode_expert_dispatch_req(rejected);
         require(pipe_send_frame(
             *socket, PIPE_EXPERT_DISPATCH_REQ, 43,
@@ -423,6 +433,54 @@ void run_test() {
     }
     if (server_result != 0) {
         throw std::runtime_error("worker returned failure");
+    }
+
+    options.listen_port = reserve_port();
+    server_result       = -1;
+    server_error        = nullptr;
+    std::thread reject_server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+    try {
+        pipe_socket_ptr socket = connect_with_retry(options.listen_port);
+        pipe_frame_type type;
+        uint64_t        seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive reject-test HELLO");
+        pipe_expert_hello client =
+            pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role           = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first   = -1;
+        client.expert_last    = -1;
+        client.n_slots        = 0;
+        client.layers.clear();
+        client.model_identity = "sha256:different-logical-model";
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(
+                    *socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send mismatched client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO rejection");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0, "worker did not explicitly reject HELLO");
+        const pipe_expert_hello_ack ack =
+            pipe_decode_expert_hello_ack(payload.data(), payload.size());
+        require(!ack.accepted, "worker accepted a different logical model");
+        require(ack.reason.find("model identity mismatch") != std::string::npos,
+                "HELLO rejection did not explain the model mismatch");
+        socket.reset();
+    } catch (...) {
+        reject_server.join();
+        throw;
+    }
+    reject_server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    if (server_result == 0) {
+        throw std::runtime_error("worker accepted a mismatched HELLO");
     }
 }
 

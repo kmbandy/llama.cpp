@@ -182,7 +182,7 @@ pipe_hello pipe_decode_hello(const uint8_t * buf, size_t len) {
 // ---------------------------------------------------------------------------
 // expert HELLO
 //
-//   u32 tag = "EXP1"
+//   u32 tag = "EXP2"
 //   u32 role
 //   i32 hidden_type
 //   i32 n_embd, n_ff_exp, n_expert, n_expert_used
@@ -192,14 +192,18 @@ pipe_hello pipe_decode_hello(const uint8_t * buf, size_t len) {
 //   i32 layers[n_layers]
 //   u32 model_identity_len
 //   u8  model_identity[model_identity_len]
+//   u32 shard_identity_len
+//   u8  shard_identity[shard_identity_len]
 
-static constexpr uint32_t PIPE_EXPERT_HELLO_TAG = 0x31505845u; // "EXP1"
+static constexpr uint32_t PIPE_EXPERT_HELLO_TAG = 0x32505845u; // "EXP2"
 
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p) {
-    if (p.model_identity.size() > std::numeric_limits<uint32_t>::max()) {
-        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO model identity is too long");
+    if (p.model_identity.size() > std::numeric_limits<uint32_t>::max() ||
+        p.shard_identity.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO identity is too long");
     }
-    const uint64_t total = 12 * 4ull + (uint64_t) p.layers.size() * 4ull + p.model_identity.size();
+    const uint64_t total = 13 * 4ull + (uint64_t) p.layers.size() * 4ull +
+                           p.model_identity.size() + p.shard_identity.size();
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -224,12 +228,17 @@ std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p) {
     wr_u32(w, (uint32_t) p.model_identity.size());
     if (!p.model_identity.empty()) {
         std::memcpy(w, p.model_identity.data(), p.model_identity.size());
+        w += p.model_identity.size();
+    }
+    wr_u32(w, (uint32_t) p.shard_identity.size());
+    if (!p.shard_identity.empty()) {
+        std::memcpy(w, p.shard_identity.data(), p.shard_identity.size());
     }
     return out;
 }
 
 pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
-    if (len < 12 * 4ull) {
+    if (len < 13 * 4ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO payload %zu bytes too small", len);
     }
     const uint8_t * p   = buf;
@@ -260,7 +269,7 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
         h.n_expert_used > h.n_expert) {
         fail(PIPE_ERR_HELLO, "pipe: expert HELLO has invalid hparams");
     }
-    if ((uint64_t) (end - p) < (uint64_t) n_layers * 4ull + 4ull) {
+    if ((uint64_t) (end - p) < (uint64_t) n_layers * 4ull + 8ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO layer array is truncated");
     }
     h.layers.reserve(n_layers);
@@ -274,13 +283,22 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
     }
 
     const uint32_t identity_len = rd_u32(p);
-    if ((uint64_t) (end - p) != identity_len) {
-        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO model identity bytes %lld, want %u",
-             (long long) (end - p), identity_len);
+    if ((uint64_t) (end - p) < (uint64_t) identity_len + 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO model identity is truncated");
     }
     h.model_identity.assign((const char *) p, identity_len);
+    p += identity_len;
+    const uint32_t shard_identity_len = rd_u32(p);
+    if ((uint64_t) (end - p) != shard_identity_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO shard identity bytes %lld, want %u",
+             (long long) (end - p), shard_identity_len);
+    }
+    h.shard_identity.assign((const char *) p, shard_identity_len);
     if (h.model_identity.empty()) {
         fail(PIPE_ERR_HELLO, "pipe: expert HELLO model identity is empty");
+    }
+    if (h.shard_identity.empty()) {
+        fail(PIPE_ERR_HELLO, "pipe: expert HELLO shard identity is empty");
     }
 
     if (h.role == PIPE_EXPERT_ROLE_WORKER) {
@@ -290,6 +308,74 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len) {
         }
     }
     return h;
+}
+
+// ---------------------------------------------------------------------------
+// expert HELLO acknowledgement
+//
+//   u32 tag = "EXA1"
+//   u32 accepted
+//   u32 reason_len
+//   u8  reason[reason_len]
+
+static constexpr uint32_t PIPE_EXPERT_HELLO_ACK_TAG = 0x31415845u; // "EXA1"
+
+std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & p) {
+    if (p.reason.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement reason is too long");
+    }
+    if (p.accepted && !p.reason.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: accepted expert HELLO has a rejection reason");
+    }
+    if (!p.accepted && p.reason.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: rejected expert HELLO has no reason");
+    }
+    const uint64_t total = 12ull + p.reason.size();
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement exceeds max payload");
+    }
+
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, PIPE_EXPERT_HELLO_ACK_TAG);
+    wr_u32(w, p.accepted ? 1u : 0u);
+    wr_u32(w, (uint32_t) p.reason.size());
+    if (!p.reason.empty()) {
+        std::memcpy(w, p.reason.data(), p.reason.size());
+    }
+    return out;
+}
+
+pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len) {
+    if (len < 12) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement payload is too small");
+    }
+    const uint8_t * p   = buf;
+    const uint8_t * end = buf + len;
+    if (rd_u32(p) != PIPE_EXPERT_HELLO_ACK_TAG) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement has the wrong payload tag");
+    }
+
+    const uint32_t accepted = rd_u32(p);
+    if (accepted > 1) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement has an invalid result");
+    }
+    const uint32_t reason_len = rd_u32(p);
+    if ((uint64_t) (end - p) != reason_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert HELLO acknowledgement reason bytes %lld, want %u",
+             (long long) (end - p), reason_len);
+    }
+
+    pipe_expert_hello_ack result;
+    result.accepted = accepted != 0;
+    result.reason.assign((const char *) p, reason_len);
+    if (result.accepted && !result.reason.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: accepted expert HELLO has a rejection reason");
+    }
+    if (!result.accepted && result.reason.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: rejected expert HELLO has no reason");
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

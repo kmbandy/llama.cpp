@@ -58,6 +58,7 @@ enum pipe_frame_type : uint32_t {
     PIPE_PONG                = 7,
     PIPE_EXPERT_DISPATCH_REQ = 8,
     PIPE_EXPERT_PARTIAL      = 9,
+    PIPE_EXPERT_HELLO_ACK    = 10,
 };
 
 enum pipe_role : uint32_t {
@@ -128,8 +129,10 @@ enum pipe_expert_role : uint32_t {
 // Expert endpoints still exchange PIPE_HELLO frames. The expert payload is
 // separate from pipe_hello so the existing stage protocol remains byte-for-byte
 // compatible. A worker advertises the exact layer set and inclusive expert
-// range it can serve. The client sends the same model identity and hparams with
-// an empty layer set.
+// range it can serve. model_identity identifies the logical source model and
+// is common to all shards made from it. shard_identity is the shard manifest
+// content hash. The client sends the same identities and hparams with an empty
+// layer set.
 struct pipe_expert_hello {
     uint32_t             role          = PIPE_EXPERT_ROLE_CLIENT;
     int32_t              hidden_type   = PIPE_HIDDEN_F16;
@@ -142,6 +145,12 @@ struct pipe_expert_hello {
     uint32_t             n_slots       = 0;
     std::vector<int32_t> layers;
     std::string          model_identity;
+    std::string          shard_identity;
+};
+
+struct pipe_expert_hello_ack {
+    bool        accepted = false;
+    std::string reason;
 };
 
 struct pipe_expert_assignment {
@@ -213,6 +222,7 @@ std::vector<uint8_t> pipe_encode_fwd_resp  (const pipe_fwd_resp & p);
 std::vector<uint8_t> pipe_encode_token     (const pipe_token    & p);
 std::vector<uint8_t> pipe_encode_error     (const pipe_error    & p);
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p);
+std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 // PING/PONG carry no payload.
@@ -223,6 +233,7 @@ pipe_fwd_resp  pipe_decode_fwd_resp  (const uint8_t * buf, size_t len, int32_t n
 pipe_token     pipe_decode_token     (const uint8_t * buf, size_t len);
 pipe_error     pipe_decode_error     (const uint8_t * buf, size_t len);
 pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
+pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len);
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const uint8_t * buf, size_t len, int32_t n_embd);
 pipe_expert_partial pipe_decode_expert_partial(

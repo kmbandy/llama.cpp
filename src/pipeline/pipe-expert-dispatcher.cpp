@@ -124,10 +124,11 @@ struct dispatcher::impl {
                                          " does not match the first worker's model identity and hparams");
             }
 
-            connected.info.expert_first = connected.hello.expert_first;
-            connected.info.expert_last  = connected.hello.expert_last;
-            connected.info.n_slots      = connected.hello.n_slots;
-            connected.info.layers       = connected.hello.layers;
+            connected.info.expert_first   = connected.hello.expert_first;
+            connected.info.expert_last    = connected.hello.expert_last;
+            connected.info.n_slots        = connected.hello.n_slots;
+            connected.info.layers         = connected.hello.layers;
+            connected.info.shard_identity = connected.hello.shard_identity;
 
             pipe_expert_hello client = connected.hello;
             client.role              = PIPE_EXPERT_ROLE_CLIENT;
@@ -140,18 +141,23 @@ struct dispatcher::impl {
                 throw std::runtime_error("expert dispatcher failed to send HELLO to worker " + label);
             }
 
-            if (!pipe_send_frame(*connected.socket, PIPE_PING, 0, nullptr, 0)) {
-                throw std::runtime_error("expert dispatcher failed to confirm HELLO with worker " + label);
-            }
             if (!pipe_recv_frame(*connected.socket, type, seq_id, payload)) {
                 throw std::runtime_error("expert dispatcher worker " + label + " died during HELLO");
             }
-            if (type == PIPE_ERROR) {
-                const pipe_error error = pipe_decode_error(payload.data(), payload.size());
-                throw std::runtime_error("expert dispatcher worker " + label + " rejected HELLO: " + error.msg);
+            if (type != PIPE_EXPERT_HELLO_ACK || seq_id != 0) {
+                throw std::runtime_error("expert dispatcher worker " + label +
+                                         " sent an invalid expert HELLO acknowledgement");
             }
-            if (type != PIPE_PONG || seq_id != 0) {
-                throw std::runtime_error("expert dispatcher worker " + label + " did not confirm the expert HELLO");
+            pipe_expert_hello_ack ack;
+            try {
+                ack = pipe_decode_expert_hello_ack(payload.data(), payload.size());
+            } catch (const std::exception & error) {
+                throw std::runtime_error("expert dispatcher worker " + label +
+                                         " sent an invalid expert HELLO acknowledgement: " + error.what());
+            }
+            if (!ack.accepted) {
+                throw std::runtime_error("expert dispatcher worker " + label +
+                                         " rejected HELLO: " + ack.reason);
             }
 
             public_workers.push_back(connected.info);

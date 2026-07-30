@@ -7,9 +7,14 @@
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 
+extern "C" {
+#include "sha256/sha256.h"
+}
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
@@ -17,11 +22,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -69,6 +76,7 @@ struct Descriptor {
     HParams                                      hparams;
     int                                          expert_first = -1;
     int                                          expert_last  = -1;
+    std::string                                  input_model;
     std::string                                  identity_algorithm;
     std::string                                  identity_value;
     std::vector<std::string>                     model_files;
@@ -167,6 +175,42 @@ int checked_int(uint64_t value, const char * name) {
     return (int) value;
 }
 
+void sha_update_u64(sha256_t & hash, uint64_t value) {
+    std::array<unsigned char, 8> bytes{};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = (unsigned char) ((value >> (i * 8)) & 0xffu);
+    }
+    sha256_update(&hash, bytes.data(), bytes.size());
+}
+
+void sha_update_string(sha256_t & hash, const std::string & value) {
+    sha_update_u64(hash, value.size());
+    sha256_update(
+        &hash, reinterpret_cast<const unsigned char *>(value.data()), value.size());
+}
+
+std::string source_model_identity(
+        const std::string & input_model,
+        const std::vector<std::string> & model_files) {
+    sha256_t hash;
+    sha256_init(&hash);
+    sha_update_string(hash, "llama.cpp.wp-expert.source-model.v1");
+    sha_update_string(hash, input_model);
+    sha_update_u64(hash, model_files.size());
+    for (const std::string & model_file : model_files) {
+        sha_update_string(hash, model_file);
+    }
+
+    std::array<unsigned char, SHA256_DIGEST_SIZE> digest{};
+    sha256_final(&hash, digest.data());
+    std::ostringstream result;
+    result << "sha256:" << std::hex << std::setfill('0');
+    for (unsigned char byte : digest) {
+        result << std::setw(2) << (unsigned int) byte;
+    }
+    return result.str();
+}
+
 RoleSpec parse_role(const json & value, const fs::path & path) {
     RoleSpec role;
     const int type = get_value<int>(value, "ggml_type", path);
@@ -231,11 +275,12 @@ Descriptor load_descriptor(const fs::path & path) {
         throw std::runtime_error(path.string() + ": empty shard manifest identity");
     }
     const json & source_model = value.at("source_model");
+    result.input_model = get_value<std::string>(source_model, "input_model", path);
     for (const json & model_file : get_array(source_model, "model_files", path)) {
         result.model_files.push_back(model_file.get<std::string>());
     }
-    if (result.model_files.empty()) {
-        throw std::runtime_error(path.string() + ": descriptor has no model files");
+    if (result.input_model.empty() || result.model_files.empty()) {
+        throw std::runtime_error(path.string() + ": descriptor has no source model");
     }
 
     const json & layers = get_array(value, "layers", path);
@@ -295,6 +340,10 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
     if (get_array(manifest, "model_files", manifest_path) !=
         json(result.descriptor.model_files)) {
         throw std::runtime_error("descriptor and shard manifest model files disagree");
+    }
+    if (get_value<std::string>(manifest, "input_model", manifest_path) !=
+        result.descriptor.input_model) {
+        throw std::runtime_error("descriptor and shard manifest input models disagree");
     }
     const json & range = manifest.at("retained_expert_range");
     if (get_value<int>(range, "first", manifest_path) != result.descriptor.expert_first ||
@@ -674,7 +723,9 @@ public:
         hello.expert_last   = catalog_.descriptor.expert_last;
         hello.n_slots       = (uint32_t) slots_;
         hello.layers        = catalog_.layers;
-        hello.model_identity =
+        hello.model_identity = source_model_identity(
+            catalog_.descriptor.input_model, catalog_.descriptor.model_files);
+        hello.shard_identity =
             catalog_.descriptor.identity_algorithm + ":" +
             catalog_.descriptor.identity_value;
         return hello;
@@ -687,12 +738,18 @@ public:
                 "worker does not serve layer " + std::to_string(request.layer));
         }
         if (request.assignments.size() >
-            (size_t) catalog_.descriptor.hparams.n_expert_used) {
+            (size_t) catalog_.descriptor.hparams.n_expert) {
             throw pipe_protocol_error(
                 PIPE_ERR_BAD_FRAME,
-                "expert dispatch has more assignments than model top-k");
+                "expert dispatch has more assignments than model experts");
         }
+        std::set<int32_t> seen_experts;
         for (const pipe_expert_assignment & assignment : request.assignments) {
+            if (!seen_experts.insert(assignment.expert_id).second) {
+                throw pipe_protocol_error(
+                    PIPE_ERR_BAD_FRAME,
+                    "expert dispatch repeats expert " + std::to_string(assignment.expert_id));
+            }
             if (assignment.expert_id < catalog_.descriptor.expert_first ||
                 assignment.expert_id > catalog_.descriptor.expert_last ||
                 catalog_.pages.count({ request.layer, assignment.expert_id }) == 0) {
@@ -755,8 +812,18 @@ bool validate_client_hello(
         error = "expert HELLO hparams mismatch";
     } else if (client.model_identity != worker.model_identity) {
         error = "expert HELLO model identity mismatch";
+    } else if (client.shard_identity != worker.shard_identity) {
+        error = "expert HELLO shard identity mismatch";
     }
     return error.empty();
+}
+
+bool send_hello_ack(
+        pipe_socket_t & socket, bool accepted, const std::string & reason) {
+    const std::vector<uint8_t> payload =
+        pipe_encode_expert_hello_ack({ accepted, reason });
+    return pipe_send_frame(
+        socket, PIPE_EXPERT_HELLO_ACK, 0, payload.data(), payload.size());
 }
 
 int serve_connection(pipe_socket_t & socket, Worker & worker) {
@@ -770,8 +837,11 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     pipe_frame_type type;
     uint64_t seq_id = 0;
     std::vector<uint8_t> payload;
-    if (!pipe_recv_frame(socket, type, seq_id, payload) || type != PIPE_HELLO) {
-        pipe_send_error(socket, 0, PIPE_ERR_HELLO, "expected expert HELLO");
+    if (!pipe_recv_frame(socket, type, seq_id, payload)) {
+        return 1;
+    }
+    if (type != PIPE_HELLO || seq_id != 0) {
+        send_hello_ack(socket, false, "expected expert HELLO");
         return 1;
     }
     try {
@@ -779,11 +849,14 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             pipe_decode_expert_hello(payload.data(), payload.size());
         std::string error;
         if (!validate_client_hello(client, mine, error)) {
-            pipe_send_error(socket, 0, PIPE_ERR_HELLO, error);
+            send_hello_ack(socket, false, error);
             return 1;
         }
     } catch (const pipe_protocol_error & error) {
-        pipe_send_error(socket, 0, error.code, error.what());
+        send_hello_ack(socket, false, error.what());
+        return 1;
+    }
+    if (!send_hello_ack(socket, true, "")) {
         return 1;
     }
 

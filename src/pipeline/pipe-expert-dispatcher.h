@@ -25,6 +25,7 @@ struct worker_info {
     int32_t              expert_last  = -1;
     uint32_t             n_slots      = 0;
     std::vector<int32_t> layers;
+    std::string          shard_identity;
 };
 
 struct worker_dispatch_stats {

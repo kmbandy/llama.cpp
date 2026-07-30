@@ -4,12 +4,14 @@ add_library(${TARGET}
     wp-expert-worker.cpp
     ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
     ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
 )
 target_include_directories(${TARGET} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/pipeline
     ${CMAKE_SOURCE_DIR}/vendor
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps
 )
 target_link_libraries(${TARGET} PUBLIC llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PUBLIC cxx_std_17)

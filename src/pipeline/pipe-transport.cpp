@@ -29,6 +29,14 @@ using ssize_t = __int64;
 typedef int sockfd_t;
 #endif
 
+static int pipe_send_flags() {
+#if !defined(_WIN32) && defined(MSG_NOSIGNAL)
+    return MSG_NOSIGNAL;
+#else
+    return 0;
+#endif
+}
+
 // Per-send/recv chunk cap. The RPC transport used 1 GiB; the pipeline moves
 // ubatches, not tensors, so a much smaller cap keeps memory bounded while
 // staying far above any single FWD_REQ payload (n_ubatch * n_embd * 4).
@@ -60,7 +68,7 @@ bool pipe_socket_t::impl::send_data(const void * data, size_t size) {
         if (size_to_send > PIPE_MAX_CHUNK_SIZE) {
             size_to_send = PIPE_MAX_CHUNK_SIZE;
         }
-        ssize_t n = send(fd, (const char *) data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *) data + bytes_sent, size_to_send, pipe_send_flags());
         if (n < 0) {
             PIPE_LOG_ERROR("pipe send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -129,6 +137,16 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#if !defined(_WIN32) && !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *) &flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
+}
+
 pipe_socket_ptr pipe_socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -136,6 +154,10 @@ pipe_socket_ptr pipe_socket_t::accept() {
     }
     if (!set_no_delay(client_socket_fd)) {
         PIPE_LOG_ERROR("pipe: failed to set TCP_NODELAY on accepted socket\n");
+        return nullptr;
+    }
+    if (!set_no_sigpipe(client_socket_fd)) {
+        PIPE_LOG_ERROR("pipe: failed to suppress SIGPIPE on accepted socket\n");
         return nullptr;
     }
     return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(client_socket_fd)));
@@ -177,6 +199,10 @@ pipe_socket_ptr pipe_socket_t::connect(const char * host, int port) {
     }
     if (!set_no_delay(sockfd)) {
         PIPE_LOG_ERROR("pipe: failed to set TCP_NODELAY\n");
+        return nullptr;
+    }
+    if (!set_no_sigpipe(sockfd)) {
+        PIPE_LOG_ERROR("pipe: failed to suppress SIGPIPE\n");
         return nullptr;
     }
     struct sockaddr_in addr;

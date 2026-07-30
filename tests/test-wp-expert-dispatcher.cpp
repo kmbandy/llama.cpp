@@ -105,7 +105,8 @@ fixture make_fixture(const fs::path &    dir,
                      const std::string & name,
                      int                 expert_first,
                      int                 expert_last,
-                     weight_map &        all_weights) {
+                     weight_map &        all_weights,
+                     const std::string & input_model = "synthetic.gguf") {
     fixture result;
     result.descriptor      = dir / (name + ".expert-descriptor.json");
     result.manifest        = dir / (name + "-experts-manifest.json");
@@ -152,8 +153,8 @@ fixture make_fixture(const fs::path &    dir,
     blob_output.close();
 
     const json identity = {
-        { "algorithm", "sha256"                 },
-        { "value",     "synthetic-shared-model" },
+        { "algorithm", "sha256"          },
+        { "value",     name + "-identity" },
     };
     const json role_shape = { N_EMBD, N_FF_EXP };
     const auto role_desc  = [&](const char * role) {
@@ -171,8 +172,8 @@ fixture make_fixture(const fs::path &    dir,
                    { "version",                 1                                                      },
                    { "source_model",
                     {
-                         { "input_model", "synthetic.gguf" },
-                         { "model_files", { "synthetic.gguf" } },
+                         { "input_model", input_model },
+                         { "model_files", { input_model } },
                          { "architecture", "synthetic" },
                          { "name", "synthetic" },
                      }                                                                                 },
@@ -213,15 +214,15 @@ fixture make_fixture(const fs::path &    dir,
                             { "group_count",  group_count                                 },
                             { "blob_bytes",   offset                                      },
                             { "content_hash", identity                                    },
-                            { "model_files",  { "synthetic.gguf" }                        },
+                            { "model_files",  { input_model }                             },
                             { "groups",       std::move(groups)                           },
     });
 
     write_json(result.manifest, {
                                     { "format",                "llama.cpp.weight-pager.expert-shard-manifest"         },
                                     { "version",               1                                                      },
-                                    { "input_model",           "synthetic.gguf"                                       },
-                                    { "model_files",           { "synthetic.gguf" }                                   },
+                                    { "input_model",           input_model                                            },
+                                    { "model_files",           { input_model }                                        },
                                     { "sharding_mode",         "expert-index-range"                                   },
                                     { "retained_expert_range", { { "first", expert_first }, { "last", expert_last } } },
                                     { "total_group_count",     group_count                                            },
@@ -383,6 +384,7 @@ pipe_expert_hello fault_hello() {
     hello.n_slots        = 2;
     hello.layers         = { LAYER };
     hello.model_identity = MODEL_IDENTITY;
+    hello.shard_identity = "sha256:synthetic-fault-shard";
     return hello;
 }
 
@@ -421,9 +423,12 @@ struct fault_server {
                 uint64_t        seq_id = 0;
                 require(pipe_recv_frame(*client, type, seq_id, payload), "fault server failed to receive client HELLO");
                 require(type == PIPE_HELLO, "fault server expected client HELLO");
-                require(pipe_recv_frame(*client, type, seq_id, payload), "fault server failed to receive PING");
-                require(type == PIPE_PING, "fault server expected PING");
-                require(pipe_send_frame(*client, PIPE_PONG, seq_id, nullptr, 0), "fault server failed to send PONG");
+                const std::vector<uint8_t> ack_payload =
+                    pipe_encode_expert_hello_ack({ true, "" });
+                require(pipe_send_frame(
+                            *client, PIPE_EXPERT_HELLO_ACK, 0,
+                            ack_payload.data(), ack_payload.size()),
+                        "fault server failed to acknowledge HELLO");
 
                 require(pipe_recv_frame(*client, type, seq_id, payload), "fault server failed to receive dispatch");
                 require(type == PIPE_EXPERT_DISPATCH_REQ, "fault server expected dispatch");
@@ -495,20 +500,25 @@ void run_test() {
     weight_map    weights;
     const fixture shard_a = make_fixture(temp.path, "shard-a", 0, 1, weights);
     const fixture shard_b = make_fixture(temp.path, "shard-b", 2, 3, weights);
+    const fixture other_model =
+        make_fixture(temp.path, "other-model", 2, 3, weights, "different-model.gguf");
 
     const int                   port_a0 = reserve_port();
     const int                   port_a1 = reserve_port();
     const int                   port_b0 = reserve_port();
     const int                   port_b1 = reserve_port();
+    const int                   port_other = reserve_port();
     std::vector<worker_process> processes;
     processes.emplace_back(shard_a, port_a0, temp.path / "worker-a0.log");
     processes.emplace_back(shard_a, port_a1, temp.path / "worker-a1.log");
     processes.emplace_back(shard_b, port_b0, temp.path / "worker-b0.log");
     processes.emplace_back(shard_b, port_b1, temp.path / "worker-b1.log");
+    processes.emplace_back(other_model, port_other, temp.path / "worker-other.log");
     wait_for_listener(port_a0, processes[0].pid);
     wait_for_listener(port_a1, processes[1].pid);
     wait_for_listener(port_b0, processes[2].pid);
     wait_for_listener(port_b1, processes[3].pid);
+    wait_for_listener(port_other, processes[4].pid);
     bool        gap_rejected = false;
     std::string gap_error;
     try {
@@ -521,6 +531,19 @@ void run_test() {
         gap_rejected = gap_error.find("coverage gap for layer 3 expert 2") != std::string::npos;
     }
     require(gap_rejected, "coverage gap was not rejected at construction: " + gap_error);
+
+    bool        model_rejected = false;
+    std::string model_error;
+    try {
+        pipe_expert_dispatcher::dispatcher mismatch({
+            { "127.0.0.1", port_a0, "machine-a" },
+            { "127.0.0.1", port_other, "machine-b" },
+        });
+    } catch (const std::runtime_error & error) {
+        model_error    = error.what();
+        model_rejected = model_error.find("model identity") != std::string::npos;
+    }
+    require(model_rejected, "different logical model was not rejected: " + model_error);
 
     std::vector<float>    activation((size_t) N_TOKENS * N_EMBD);
     std::vector<uint16_t> activation_f16;
@@ -545,6 +568,9 @@ void run_test() {
         { "127.0.0.1", port_b0, "machine-b" },
         { "127.0.0.1", port_b1, "machine-b" },
     });
+    require(dispatcher.workers()[0].shard_identity != dispatcher.workers()[2].shard_identity,
+            "different shard identities were not preserved");
+    require(!dispatcher.model_identity().empty(), "logical model identity is empty");
     const std::vector<float>           actual = dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments);
     require(actual.size() == expected.size(), "reduced output shape mismatch");
     for (size_t i = 0; i < expected.size(); ++i) {
