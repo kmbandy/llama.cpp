@@ -1,17 +1,13 @@
 set(TARGET llama-wp-expert-dispatcher-lib)
 
-add_library(${TARGET}
-    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-expert-dispatcher.cpp
-    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
-    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
-)
-target_include_directories(${TARGET} PUBLIC
+add_library(${TARGET} INTERFACE)
+target_include_directories(${TARGET} INTERFACE
     ${CMAKE_SOURCE_DIR}/ggml/include
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/pipeline
 )
-target_link_libraries(${TARGET} PUBLIC llama)
-target_compile_features(${TARGET} PUBLIC cxx_std_17)
+target_link_libraries(${TARGET} INTERFACE llama-expert-dispatch llama)
+target_compile_features(${TARGET} INTERFACE cxx_std_17)
 
 set(TARGET llama-wp-expert-dispatcher)
 

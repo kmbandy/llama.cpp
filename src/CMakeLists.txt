@@ -10,6 +10,21 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 file(GLOB LLAMA_WEIGHT_PAGER_SOURCES CONFIGURE_DEPENDS "weight-pager/*.cpp")
 file(GLOB LLAMA_MEMORY_TIER_SOURCES "memory-tier/*.cpp")
 
+add_library(llama-expert-dispatch STATIC
+            pipeline/pipe-expert-dispatch-graph.cpp
+            pipeline/pipe-expert-dispatcher.cpp
+            pipeline/pipe-protocol.cpp
+            pipeline/pipe-transport.cpp
+            )
+target_include_directories(llama-expert-dispatch PUBLIC
+            .
+            pipeline
+            ../ggml/include
+            )
+target_compile_features(llama-expert-dispatch PUBLIC cxx_std_17)
+target_link_libraries(llama-expert-dispatch PUBLIC ggml)
+set_target_properties(llama-expert-dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(llama
             ../include/llama.h
             llama.cpp
@@ -69,7 +84,7 @@ if(GGML_CUDA)
 endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PUBLIC ggml PRIVATE llama-expert-dispatch)
 
 # Optional liburing for the weight pager's async file IO path. When found,
 # the IoUringAsync FileIOLayer is compiled and selected at runtime when
