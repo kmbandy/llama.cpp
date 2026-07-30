@@ -56,7 +56,8 @@ from that asymmetry.
 | Quantity | Value | Source |
 |---|---|---|
 | Expert bytes, layers 3–77 | **234.7 GB** | repack manifest |
-| Per-expert page | **12.22 MB**, one contiguous read | repack (landed today, `0f0a8bb11`) |
+| Per-expert page, mean | **12.22 MB**, one contiguous read | repack (landed today, `0f0a8bb11`) |
+| Per-expert page, max | **16,318,464 B = 15.56 MiB** (layer 8) | shard sidecars |
 | Experts / layer, active | 256 / **8** | GGUF metadata |
 | Routing distribution | sigmoid `noaux_tc`, **near-uniform** | model config |
 | Bytes fed per token | **7.33 GB** (8 × 75 × 12.22 MB) | derived |
@@ -65,6 +66,14 @@ from that asymmetry.
 | Inter-machine link | **104 MB/s**, RTT **0.5–0.6 ms** | measured 2026-07-24 |
 | RAM, main / 2026 | 15 GB total, **9 / 12 GB available** | measured today |
 | Disk free, main / 2026 | **98 GB** / 36 GB (**113 GB** if the 77 GB tail stage is removed) | measured today |
+
+**Expert pages are NOT uniform.** GLM-5.2 UD-Q2_K_XL is a mixed quant: 71 of 76
+layers are 12,091,392 B per expert, but layer 8 is 16,318,464, layers 75-77 are
+13,959,168, and layer 78 is 13,664,256. The types differ too -- gate/up span
+q2_K / iq2_xs / iq3_xxs and down spans q3_K / iq3_xxs / iq4_xs. Two consequences:
+the MEAN drives the bandwidth model above, but the MAXIMUM drives a worker's
+slot stride, and any code assuming one global page size or one global type will
+read most layers at the wrong stride and produce fluent, wrong output.
 
 Two constraints dominate and must shape everything:
 
@@ -87,6 +96,14 @@ Two constraints dominate and must shape everything:
   to it.
 - **Scheduler** — runs in the spine process. Per MoE layer, partitions the
   router's top-8 across workers and reduces their partial sums.
+
+**There is no local fast path.** ALL expert compute goes through workers,
+including workers on the same machine as the spine, reached over loopback. The
+R9700 therefore runs the spine *and* a worker process side by side. The
+alternative — a special in-process path for local experts — buys ~0.05 ms of
+loopback RTT against ~10 ms of expert compute, and costs a second code path
+through the most correctness-sensitive part of the system. Uniformity is worth
+more than the RTT.
 
 ### 4.2 Storage sharding — by expert index, not by layer
 
@@ -250,8 +267,13 @@ are executed by Claude, never by an implementation agent.
 - **Stage 2 — worker service.** A process that owns a device, loads its shard's
   pager catalog, accepts dispatch frames, computes Σ w_e·FFN_e(x), returns the
   partial. Testable single-machine, one worker, against an in-process reference.
-- **Stage 3 — scheduler + reduction in the spine.** Router top-8 → partition →
-  issue remote first → compute local → reduce. Correctness gate vs single-process.
+- **Stage 3a — the dispatcher.** Partition, issue-before-await, reduce. Proven
+  against real worker processes over the real protocol on CPU, with disjoint
+  synthetic shards. Touches nothing in the inference graph, so the hard part
+  (ordering, balancing, reduction, multi-worker failure handling) is de-risked
+  before the graph path is opened.
+- **Stage 3b — wire into the graph.** Replace the in-graph expert computation
+  with a dispatch at the MoE boundary. Correctness gate vs single-process.
 - **Stage 4 — 4 workers, cross-machine.** All GPUs, both machines. Coherence
   gate, then throughput measurement against the 1.49x hypothesis.
 - **Stage 5 — RAM victim tier on both machines**, read-on-demand /
