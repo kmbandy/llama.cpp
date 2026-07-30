@@ -1,22 +1,41 @@
 // Unit tests for the Phase 2 pipeline protocol framing (src/pipeline/pipe-protocol.*).
 //
-// No model, no inference, no sockets: pure buffer encode/decode round-trips,
-// malformed-frame rejection, and the HELLO mismatch matrix. Endianness is
-// exercised by decoding hand-built little-endian byte strings.
+// No model or inference: buffer encode/decode round-trips, malformed-frame
+// rejection, the HELLO mismatch matrix, and a closed-peer loopback send.
+// Endianness is exercised by decoding hand-built little-endian byte strings.
 //
 // Standalone build:
-//   g++ -std=c++17 -I include -I ggml/include -I src -I src/pipeline \
-//       tests/test-pipe-protocol.cpp src/pipeline/pipe-protocol.cpp \
-//       src/pipeline/pipe-transport.cpp src/llama-pipeline.cpp -o /tmp/t && /tmp/t
+//   g++ -std=c++17 -I include -I ggml/include -I src -I src/pipeline
+//       tests/test-pipe-protocol.cpp src/pipeline/pipe-protocol.cpp
+//       src/pipeline/pipe-transport.cpp src/llama-pipeline.cpp -o /tmp/t
 
 #include "pipe-protocol.h"
+#include "pipe-transport.h"
 
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
 
+#ifndef _WIN32
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <signal.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#endif
+
 static int g_failed = 0;
+
+static_assert(PIPE_HELLO == 1 && PIPE_FWD_REQ == 2 && PIPE_FWD_RESP == 3 &&
+              PIPE_TOKEN == 4 && PIPE_ERROR == 5 && PIPE_PING == 6 &&
+              PIPE_PONG == 7, "stage frame values changed");
+static_assert(PIPE_ERR_GENERIC == 0 && PIPE_ERR_HELLO == 1 &&
+              PIPE_ERR_BAD_FRAME == 2 && PIPE_ERR_STALE_SEQ == 3 &&
+              PIPE_ERR_DECODE == 4, "stage error values changed");
+static_assert(pipe_hello::WIRE_SIZE == 28, "stage HELLO wire size changed");
 
 #define CHECK(cond)                                                             \
     do {                                                                        \
@@ -148,6 +167,128 @@ static void test_hello_roundtrip() {
     bad[0] = 9; bad[1] = 0; bad[2] = 0; bad[3] = 0;
     CHECK_THROWS_PROTO(pipe_decode_hello(bad.data(), bad.size()), PIPE_ERR_HELLO);
 }
+
+static void test_expert_hello_roundtrip() {
+    pipe_expert_hello h;
+    h.role           = PIPE_EXPERT_ROLE_WORKER;
+    h.hidden_type    = PIPE_HIDDEN_F16;
+    h.n_embd         = 6144;
+    h.n_ff_exp       = 2048;
+    h.n_expert       = 256;
+    h.n_expert_used  = 8;
+    h.expert_first   = 85;
+    h.expert_last    = 255;
+    h.n_slots        = 4;
+    h.layers         = { 3, 4 };
+    h.model_identity = "sha256:logical-model";
+    h.shard_identity = "sha256:shard-85-255";
+
+    const std::vector<uint8_t> enc = pipe_encode_expert_hello(h);
+    const pipe_expert_hello d = pipe_decode_expert_hello(enc.data(), enc.size());
+    CHECK(d.role           == h.role);
+    CHECK(d.layers         == h.layers);
+    CHECK(d.model_identity == h.model_identity);
+    CHECK(d.shard_identity == h.shard_identity);
+
+    const pipe_expert_hello_ack accepted{ true, "" };
+    const std::vector<uint8_t> accepted_enc =
+        pipe_encode_expert_hello_ack(accepted);
+    const pipe_expert_hello_ack accepted_dec =
+        pipe_decode_expert_hello_ack(accepted_enc.data(), accepted_enc.size());
+    CHECK(accepted_dec.accepted);
+    CHECK(accepted_dec.reason.empty());
+
+    const pipe_expert_hello_ack rejected{ false, "logical model mismatch" };
+    const std::vector<uint8_t> rejected_enc =
+        pipe_encode_expert_hello_ack(rejected);
+    const pipe_expert_hello_ack rejected_dec =
+        pipe_decode_expert_hello_ack(rejected_enc.data(), rejected_enc.size());
+    CHECK(!rejected_dec.accepted);
+    CHECK(rejected_dec.reason == rejected.reason);
+}
+
+#ifndef _WIN32
+static int reserve_transport_port() {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = 0;
+    CHECK(bind(fd, (sockaddr *) &address, sizeof(address)) == 0);
+    socklen_t length = sizeof(address);
+    CHECK(getsockname(fd, (sockaddr *) &address, &length) == 0);
+    const int port = ntohs(address.sin_port);
+    close(fd);
+    return port;
+}
+
+static void test_closed_peer_is_transport_error() {
+    const int port = reserve_transport_port();
+    int ready[2];
+    CHECK(port > 0);
+    CHECK(pipe(ready) == 0);
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(ready[0]);
+        signal(SIGPIPE, SIG_DFL);
+        pipe_socket_ptr server =
+            pipe_socket_t::create_server("127.0.0.1", port);
+        if (!server) {
+            _exit(2);
+        }
+        const uint8_t marker = 1;
+        if (write(ready[1], &marker, 1) != 1) {
+            _exit(3);
+        }
+        close(ready[1]);
+        pipe_socket_ptr peer = server->accept();
+        if (!peer) {
+            _exit(4);
+        }
+        uint8_t byte = 0;
+        if (peer->recv_data(&byte, 1)) {
+            _exit(5);
+        }
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (!peer->send_data(&byte, 1)) {
+                _exit(0);
+            }
+            usleep(10000);
+        }
+        _exit(6);
+    }
+    if (child < 0) {
+        close(ready[0]);
+        close(ready[1]);
+        return;
+    }
+
+    close(ready[1]);
+    uint8_t marker = 0;
+    CHECK(read(ready[0], &marker, 1) == 1);
+    close(ready[0]);
+
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port        = htons(port);
+    CHECK(connect(fd, (sockaddr *) &address, sizeof(address)) == 0);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // FWD_REQ round-trip incl. empty and large payloads
@@ -411,6 +552,10 @@ int main() {
     test_header_roundtrip();
     test_header_rejects();
     test_hello_roundtrip();
+    test_expert_hello_roundtrip();
+#ifndef _WIN32
+    test_closed_peer_is_transport_error();
+#endif
     test_fwd_req_roundtrip();
     test_fwd_req_empty_and_max();
     test_fwd_resp_roundtrip();

@@ -371,9 +371,8 @@ target_link_libraries(test-wp-stage-split PRIVATE ggml)
 target_compile_features(test-wp-stage-split PRIVATE cxx_std_17)
 llama_test(test-wp-stage-split)
 
-# Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model, no
-# sockets: pure buffer encode/decode). Links pipe-transport.cpp only for the
-# frame-IO helpers' symbols; the test never opens a socket.
+# Phase 2 pipeline protocol framing + HELLO mismatch matrix (no model), plus a
+# loopback transport check that a closed peer is an ordinary send error.
 add_executable(
     test-pipe-protocol
     test-pipe-protocol.cpp
