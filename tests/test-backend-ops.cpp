@@ -4496,6 +4496,14 @@ struct test_mul_mat_id : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // MAD Task 11: same reasoning as test_mul_mat -- a routed MoE op reaches the
+        // very same no-LUT FP8-WMMA kernel (ggml_cuda_mul_mat_id decomposes into
+        // per-expert ggml_cuda_mul_mat calls), so it carries the same fp8 activation
+        // quant + bf16 output noise against an fp32 CPU reference. Measured 6.8e-4 on
+        // gfx1201, i.e. just over the 5e-4 default and well inside this bound.
+        if (type_a == GGML_TYPE_ML8_FP8) {
+            return 5e-3;
+        }
         return max_nmse_err();
     }
 
