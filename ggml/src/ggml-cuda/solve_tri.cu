@@ -113,9 +113,11 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
     // k is tiled over blockIdx.y; the (col_idx >= k) guard below retires the ragged tail
     const int col_idx   = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (col_idx >= k) {
-        return;
-    }
+    // NOTE: do NOT early-return here. The k tile can be ragged (e.g. k=200 -> 7
+    // tiles of 32 = 224), and every thread must still take part in the cooperative
+    // sA load below and reach its __syncthreads(). Returning early left sA partially
+    // uninitialised and diverged at the barrier, which produced inf results.
+    const bool active = col_idx < k;
 
     const uint2   i02_i03 = fast_div_modulo(batch_idx, ne02);
     const int64_t i02     = i02_i03.y;
@@ -143,8 +145,8 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
 
     __syncthreads();
 
-    float x_low  = (lane < n) ? B_batch[lane * k + col_idx] : 0.0f;
-    float x_high = (WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k + col_idx] : 0.0f;
+    float x_low  = (active && lane < n) ? B_batch[lane * k + col_idx] : 0.0f;
+    float x_high = (active && WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k + col_idx] : 0.0f;
 
     const int half      = WARP_SIZE;
     const int nrows_low = (n < half) ? n : half;
@@ -179,7 +181,7 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
         const int row = rr * WARP_SIZE + lane;
-        if (row < n) {
+        if (active && row < n) {
             const float val            = (row < half) ? x_low : x_high;
             X_batch[row * k + col_idx] = val;
         }
