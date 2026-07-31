@@ -7,7 +7,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 struct ggml_context;
 struct ggml_tensor;
@@ -33,9 +35,15 @@ class graph_dispatcher {
                         int32_t        layer);
 
     size_t n_workers() const;
+    bool failed() const noexcept;
+    std::string failure_message() const;
+    void begin_decode() noexcept;
+    void end_decode() noexcept;
 
   private:
     struct op_context;
+
+    void latch_failure(const char * message) noexcept;
 
     static void compute(ggml_tensor *       dst,
                         const ggml_tensor * activations,
@@ -48,6 +56,19 @@ class graph_dispatcher {
     dispatcher                                     remote;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
+    std::atomic<bool>                              failed_{ false };
+    mutable std::mutex                             failure_mutex_;
+    std::string                                    failure_message_;
+    bool                                           collect_stats_ = false;
+    bool                                           decode_active_ = false;
+    size_t                                         decode_layers_ = 0;
+    uint64_t                                       decode_ns_pack_ = 0;
+    uint64_t                                       decode_ns_issue_ = 0;
+    uint64_t                                       decode_ns_wait_ = 0;
+    uint64_t                                       decode_ns_unpack_ = 0;
+    uint64_t                                       decode_ns_total_ = 0;
+    uint64_t                                       decode_first_await_in_flight_ = 0;
+    std::vector<worker_dispatch_stats>             decode_workers_;
 };
 
 }  // namespace pipe_expert_dispatcher
