@@ -81,9 +81,27 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
         remote.n_expert_used() != n_expert_used) {
         throw std::runtime_error("expert dispatcher workers do not match the model MoE dimensions");
     }
+
+    // Spec §3: print the ACTUAL runtime value at WARN (logger threshold 3 filters
+    // INFO; libllama WARN maps to 2 and passes). A gate whose value you cannot
+    // see in the log has cost this project three separate retracted measurement sets.
+    // Default 0 = feature off = defer nothing. Do NOT add this to struct Options
+    // (ABI mismatch 2026-07-30); env var read at startup only.
+    const int k = remote.defer_k();
+    LLAMA_LOG_WARN(
+        "expert dispatch: WP_DEFER_K=%d (%s; 0=off/defer nothing; K=immediate experts per token)\n",
+        k,
+        k <= 0 ? "OFF" : "ON");
 }
 
-graph_dispatcher::~graph_dispatcher() = default;
+graph_dispatcher::~graph_dispatcher() {
+    // Best-effort drain so a short-lived context does not leave workers hanging.
+    try {
+        (void) remote.drain_deferred();
+    } catch (...) {
+        // Destructor must not throw; workers will drop on socket close.
+    }
+}
 
 ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
                                       ggml_tensor *  activations,
@@ -132,6 +150,7 @@ std::string graph_dispatcher::failure_message() const {
 }
 
 void graph_dispatcher::begin_decode() noexcept {
+    remote.begin_deferral_window();
     if (!collect_stats_) {
         return;
     }
@@ -150,6 +169,36 @@ void graph_dispatcher::begin_decode() noexcept {
 }
 
 void graph_dispatcher::end_decode() noexcept {
+    // Last-layer path should have left nothing pending; if anything remains it
+    // missed its fold point (bug). Drain and count as late inside the dispatcher.
+    try {
+        const std::vector<float> leftover = remote.drain_deferred();
+        if (!leftover.empty()) {
+            LLAMA_LOG_WARN(
+                "expert dispatch: drained %zu deferred partial values after decode "
+                "(n_deferred_late will reflect this; last layer must not defer)\n",
+                leftover.size());
+        }
+    } catch (const std::exception & error) {
+        latch_failure(error.what());
+    } catch (...) {
+        latch_failure("expert dispatch failed while draining deferred partials");
+    }
+
+    remote.end_deferral_window();
+
+    const deferral_stats & dstats = remote.get_deferral_stats();
+    // Always log mechanism counters at WARN so they are visible under the
+    // llama-server default logger threshold (3); INFO is filtered.
+    LLAMA_LOG_WARN(
+        "expert dispatch deferral: WP_DEFER_K=%d nvme_util_pct=%.1f ns_gap=%.2f ms "
+        "n_deferred=%llu n_deferred_late=%llu\n",
+        dstats.defer_k,
+        dstats.nvme_util_pct,
+        dstats.ns_gap * 1.0e-6,
+        (unsigned long long) dstats.n_deferred,
+        (unsigned long long) dstats.n_deferred_late);
+
     if (!collect_stats_ || !decode_active_) {
         return;
     }
@@ -212,6 +261,9 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         const int64_t n_embd        = activations->ne[0];
         const int64_t n_tokens      = activations->ne[1];
         const int64_t n_expert_used = selected_experts->ne[0];
+        // Weights must be [1, n_expert_used, n_tokens] — a bare [n_tokens] 1-D
+        // tensor PASSES ggml_can_repeat against [n_embd, n_tokens] (because
+        // ne[i] % src1->ne[i] == 0) and then broadcasts along the WRONG AXIS.
         const bool shapes_match =
             n_embd == owner->remote.n_embd() && n_tokens > 0 &&
             activations->ne[2] == 1 && activations->ne[3] == 1 &&
@@ -265,6 +317,9 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         }
 
         const uint64_t           seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
+        // dispatch() issues deferred reads before returning, waits only for
+        // immediate experts, and folds the previous layer's deferred partials
+        // into the returned block (residual path for layer N+1).
         const std::vector<float> result =
             owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments);
         const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
