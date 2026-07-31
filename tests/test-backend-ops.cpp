@@ -2465,7 +2465,7 @@ struct test_set_rows : public test_case {
         }
         // turbo4_0: 4-bit transform quantizer; GPU/CPU both use same serial algorithm,
         // so parity should be byte-exact. Allow Q4_0-equivalent tolerance as safety margin.
-        if (type == GGML_TYPE_TURBO4_0) {
+        if (type_dst == GGML_TYPE_TURBO4_0) {
             double err_estimate = 1.0f/8.0f;
             err_estimate *= err_estimate;
             err_estimate /= 0.25f*float(ne[0] * r * ne[2]*nr23[0] * ne[3]*nr23[1]);
