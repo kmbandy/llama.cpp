@@ -604,8 +604,9 @@ struct dispatcher::impl {
         }
     }
 
-    // Collect previously-issued deferred partials and sum them. Marks late if
-    // the fold point for this batch was already closed (successor returned).
+    // Collect previously-issued deferred partials and sum them. Caller must
+    // already have issued the current layer's requests so N-1 deferred overlaps
+    // N's in-flight reads. Marks late if the fold point was already closed.
     std::vector<float> collect_pending_deferred(bool mark_fold_open) {
         if (pending_def.requests.empty()) {
             return {};
@@ -662,14 +663,6 @@ struct dispatcher::impl {
         }
 
         try {
-            // Fold previous layer's deferred partials into this layer's residual
-            // contribution (added to the returned MoE block). Collect BEFORE
-            // issuing this layer so TCP response order stays simple: each
-            // worker's deferred response from layer N is fully drained before
-            // layer N+1 requests go out. Deferred reads were already in flight
-            // across the inter-layer gap (attention + router of this layer).
-            std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true);
-
             // Decide whether this layer may leave experts deferred.
             // Last routed layer has no successor — do not defer (fold would fall off).
             const bool may_defer =
@@ -691,6 +684,11 @@ struct dispatcher::impl {
                 collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
 
             // Shared assigned_counts so residency balancing sees both sets.
+            // Note: plan runs BEFORE collect_pending_deferred, so choose_worker
+            // does not yet see residency updates from the previous layer's
+            // deferred drain. Residency affinity is a heuristic, not a
+            // correctness property; this only shifts when deferred experts
+            // refresh the LRU relative to the prior order.
             std::vector<size_t> assigned_counts(workers.size(), 0);
             std::vector<planned_request> imm_requests =
                 plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts);
@@ -711,28 +709,34 @@ struct dispatcher::impl {
                 });
             }
 
-            // THE critical ordering: issue deferred reads BEFORE waiting on
-            // immediate, and before this call returns. Issue-then-return is the
-            // whole mechanism — issuing deferred when the next layer begins
-            // reproduces the gap this is meant to close.
-            // Per-worker send order: for each worker, immediate then deferred
-            // would require interleaving. We send all immediate first, then all
-            // deferred. If the same worker is in both, its socket sees imm then
-            // def — await order for that worker is imm first (we only await imm
-            // now; def stays pending).
+            // Occupancy ordering (fetch-against-fetch):
+            //   1. issue layer N immediate AND deferred   <- first
+            //   2. await layer N-1 deferred               <- overlaps with (1)
+            //   3. await layer N immediate
+            //   4. fold N-1 deferred into result, return
+            // Issuing N before collecting N-1 is the whole occupancy win: N-1's
+            // deferred reads stay in flight while N's reads are also in flight.
+            // Collecting first would serialise them (wait N-1 def, then issue N)
+            // and leave nvme_util_pct unchanged.
+            //
+            // Per-worker send order within a layer: all immediate requests, then
+            // all deferred. Both batches share this layer's seq_id; TCP FIFO per
+            // socket plus await_response's seq_id check disambiguate. Do not
+            // invent a separate seq_id band — a mismatch throws loudly.
             issue_requests(imm_requests, seq_id);
             if (!def_requests.empty()) {
-                // Use a distinct seq_id band so a demux mistake surfaces as an
-                // error rather than a silent mix-up. Deferred seq = original |
-                // high bit... actually keep same seq_id so await_response for
-                // deferred later matches what the worker echoes. Workers echo
-                // the request seq_id; both batches share this layer's seq_id.
-                // Ordering on the socket disambiguates.
                 issue_requests(def_requests, seq_id);
             }
             if (collect_stats) {
                 stats.ns_issue = elapsed_ns(issue_start, dispatch_clock::now());
             }
+
+            // Drain previous layer's deferred partials now that layer N is in
+            // flight. Safe with existing wire format: on any worker socket that
+            // carries both, N-1 deferred frames were SENT before N's frames, so
+            // they ARRIVE first (TCP FIFO). await_response validates seq_id and
+            // throws on mismatch — do not weaken that check.
+            std::vector<float> folded_prev = collect_pending_deferred(/*mark_fold_open=*/true);
 
             std::vector<float> result((size_t) activation_count, 0.0f);
             // Fold previous deferred into this layer's output (residual path).
@@ -766,13 +770,12 @@ struct dispatcher::impl {
                 stats.ns_wait = elapsed_ns(wait_start, last_response);
             }
 
-            // Stash deferred requests — do NOT wait. They stay in flight across
-            // the next layer's attention/router work.
+            // Stash deferred requests — do NOT wait. They stay in flight until
+            // the next layer issues and then collects them (fetch-against-fetch).
             if (!def_requests.empty()) {
-                // If we somehow already had pending deferred, the previous
-                // collect should have drained it. Anything still here is a bug.
+                // After the collect above, pending must be empty. Anything still
+                // here is a bug — force-collect and mark late before overwriting.
                 if (!pending_def.requests.empty()) {
-                    // Force-collect and mark late before overwriting.
                     pending_def.fold_closed = true;
                     (void) collect_pending_deferred(/*mark_fold_open=*/false);
                 }
