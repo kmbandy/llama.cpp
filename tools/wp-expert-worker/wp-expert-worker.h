@@ -48,6 +48,7 @@ struct Options {
     int                   listen_port = 0;
     int                   slots       = 0;
     uint64_t              host_budget_bytes = 0;
+    uint64_t              host_victim_bytes = 0;
     TestHooks *           test_hooks = nullptr;
     bool                  once        = false;
 };

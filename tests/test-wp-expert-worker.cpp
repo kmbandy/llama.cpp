@@ -480,6 +480,7 @@ void run_test() {
     options.listen_port    = port;
     options.slots             = 4;
     options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.host_victim_bytes = 8 * PAGE_BYTES;
     options.once           = true;
     IoTracker tracker;
     options.test_hooks = &tracker.hooks;
@@ -651,15 +652,22 @@ void run_test() {
         require(tracker.reservations().empty(),
                 "all-hit request reserved a miss slot");
 
+        tracker.reset(0);
+        dispatch_and_check(44, warm);
+        require(tracker.read_count() == 0,
+                "host victim hit issued an expert read");
+        require(tracker.staging_borrows() == 0,
+                "host victim hit borrowed staging");
+
         pipe_expert_dispatch_req rejected = request;
         rejected.assignments = { { 4, { 1.0f, 1.0f } } };
         payload = pipe_encode_expert_dispatch_req(rejected);
         require(pipe_send_frame(
-            *socket, PIPE_EXPERT_DISPATCH_REQ, 44,
+            *socket, PIPE_EXPERT_DISPATCH_REQ, 45,
             payload.data(), payload.size()), "failed to send rejected dispatch");
         require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive rejection");
         require(type == PIPE_ERROR, "out-of-range expert was not rejected");
-        require(seq_id == 44, "rejection sequence id mismatch");
+        require(seq_id == 45, "rejection sequence id mismatch");
         const pipe_error error = pipe_decode_error(payload.data(), payload.size());
         require(error.code == PIPE_ERR_EXPERT_RANGE, "wrong rejection error code");
 
@@ -725,12 +733,92 @@ void run_test() {
     }
 }
 
+void test_default_off_multi_expert_request() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive default-off worker HELLO");
+        require(type == PIPE_HELLO && seq_id == 0,
+                "default-off worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(
+                    *socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send default-off client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive default-off HELLO acknowledgement");
+        require(type == PIPE_EXPERT_HELLO_ACK && seq_id == 0 &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "default-off worker rejected matching HELLO");
+
+        pipe_expert_dispatch_req request;
+        request.layer = LAYER;
+        request.n_tokens = N_TOKENS;
+        request.activations.resize((size_t) N_TOKENS * N_EMBD);
+        request.assignments = {
+            { 0, { 0.5f, 0.25f } },
+            { 1, { 0.5f, 0.75f } },
+        };
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(
+                    *socket, PIPE_EXPERT_DISPATCH_REQ, 50,
+                    payload.data(), payload.size()),
+                "failed to send default-off multi-expert dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive default-off multi-expert partial");
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 50,
+                "default-off multi-expert dispatch did not complete");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "default-off worker returned failure");
+}
+
 } // namespace
 
 int main() {
     try {
         test_glm_size_class_plan();
         run_test();
+        test_default_off_multi_expert_request();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {
