@@ -8766,8 +8766,8 @@ bool ggml_backend_vk_wp_stage_in(ggml_backend_buffer_t buffer,
     // compute-queue dispatches that read the slot. Same queue == guaranteed order.
     static const bool wp_cqueue = getenv("GGML_VK_WP_CQUEUE") != nullptr;
     vk_context context = ggml_vk_create_temporary_context(
-        wp_cqueue ? dst_buffer->device->compute_queue.cmd_pool
-                  : dst_buffer->device->transfer_queue.cmd_pool);
+        wp_cqueue ? dst_buffer->device->compute_queue->cmd_pool
+                  : dst_buffer->device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(dst_buffer->device, context);
     if (!ggml_vk_buffer_write_async(context, dst_buffer, offset, src, payload_size, true)) {
         static std::atomic<bool> warned{false};
@@ -18926,7 +18926,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
+                auto fa_kv_ok = [coopmat2](ggml_type t) {
                     switch (t) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
