@@ -79,7 +79,11 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
 }
 
 // ======================
-// Fast Kernel (n <= 64, k <= 32) - Warp-based parallel reduction
+// Fast Kernel (n <= 64, ANY k) - Warp-based parallel reduction
+// The k independent right-hand sides (x_i = b_i * A^-1) carry no cross-row
+// dependency, so k is tiled across blockIdx.y in MAX_K_FAST-sized chunks.
+// This keeps blockDim.x*blockDim.y within the 1024-thread limit, which was the
+// ONLY reason k was previously capped at MAX_K_FAST.
 // ======================
 // When ncols_template == 0 the bounds for the loops in this function are not
 // known and can't be unrolled. As we want to keep pragma unroll for all other
@@ -106,7 +110,8 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
 
     const int batch_idx = blockIdx.x;
     const int lane      = threadIdx.x;
-    const int col_idx   = threadIdx.y;
+    // k is tiled over blockIdx.y; the (col_idx >= k) guard below retires the ragged tail
+    const int col_idx   = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (col_idx >= k) {
         return;
@@ -124,8 +129,12 @@ static __global__ void solve_tri_f32_fast(const float * __restrict__ A,
 
     const int offset = threadIdx.x + threadIdx.y * blockDim.x;
 
+    // Number of columns handled by THIS block (== k when k <= MAX_K_FAST). Using the
+    // template constant where available keeps the loop unrollable.
+    const int ktile = (k_template == 0) ? (int) blockDim.y : k_template;
+
 #pragma unroll
-    for (int i = 0; i < n * n; i += k * WARP_SIZE) {
+    for (int i = 0; i < n * n; i += ktile * WARP_SIZE) {
         const int i0 = i + offset;
         if (i0 < n * n) {
             sA[i0] = A_batch[i0];
@@ -195,8 +204,11 @@ static void solve_tri_f32_cuda(const float * A,
                                size_t        nb3,
                                cudaStream_t  stream) {
     const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
-    dim3        threads(WARP_SIZE, k);
-    dim3        grid(ne02 * ne03);
+    // Tile k so blockDim.x*blockDim.y stays <= 1024; grid.y covers the remaining columns.
+    const int   k_tile  = k < MAX_K_FAST ? k : MAX_K_FAST;
+    const int   k_blocks = (k + k_tile - 1) / k_tile;
+    dim3        threads(WARP_SIZE, k_tile);
+    dim3        grid(ne02 * ne03, k_blocks);
     if (n == 64) {
         switch (k) {
             case 32:
@@ -261,7 +273,10 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
+    // NOTE: only n is limited now -- k is tiled inside solve_tri_f32_cuda. This also
+    // keeps us off cuBLAS/hipBLAS Strsm, whose rocBLAS batched path segfaults on
+    // gfx1030 (RX 6900 XT) for the n=k=64 shape every Gated DeltaNet layer produces.
+    if (n <= MAX_N_FAST) {
         solve_tri_f32_cuda((const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
                            src0->ne[2], src0->ne[3], src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
