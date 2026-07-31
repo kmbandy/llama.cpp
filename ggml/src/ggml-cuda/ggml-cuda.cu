@@ -2562,7 +2562,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // FP8-WMMA path (WEIGHT_FORMAT=0) before any of the generic mul_mat
     // kernels — none of which understand the ML8_FP8 block layout.
     if (src0->type == GGML_TYPE_ML8_FP8) {
-        ggml_cuda_op_ml8_fp8_mul_mat(ctx, dst);
+        // ggml_cuda_mul_mat_id() decomposes a MoE op into per-expert slices and calls
+        // us with a synthetic dst (memset to 0), so dst->src[] is null on that path --
+        // it passes the operands as arguments instead. ggml_cuda_op_ml8_fp8_mul_mat()
+        // reads dst->src[0]/[1], so hand it a copy with those wired up. When we are
+        // called normally from ggml_cuda_compute_forward these already match dst->src[].
+        ggml_tensor dst_ml8 = *dst;
+        dst_ml8.src[0] = const_cast<ggml_tensor *>(src0);
+        dst_ml8.src[1] = const_cast<ggml_tensor *>(src1);
+        ggml_cuda_op_ml8_fp8_mul_mat(ctx, &dst_ml8);
         return;
     }
 
