@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -421,8 +422,10 @@ void test_graph_op(const weight_map & weights,
     ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, w, LAYER);
     ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
     ggml_build_forward_expand(gf, out);
+    dispatcher.begin_decode();
     require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
             "custom-op graph computation failed");
+    dispatcher.end_decode();
 
     const std::vector<float> expected = reference(weights, activation, assignments);
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -456,6 +459,8 @@ enum class fault_mode {
     reject_range,
     reject_layer,
     die,
+    die_mid_frame,
+    observe_no_dispatch,
 };
 
 struct fault_server {
@@ -464,6 +469,7 @@ struct fault_server {
     std::thread        thread;
     std::exception_ptr error;
     std::promise<void> ready;
+    std::atomic<int>   dispatches{ 0 };
 
     explicit fault_server(fault_mode mode) : port(reserve_port()), mode(mode) {
         std::future<void> listening = ready.get_future();
@@ -494,10 +500,33 @@ struct fault_server {
                             ack_payload.data(), ack_payload.size()),
                         "fault server failed to acknowledge HELLO");
 
-                require(pipe_recv_frame(*client, type, seq_id, payload), "fault server failed to receive dispatch");
+                const bool received = pipe_recv_frame(*client, type, seq_id, payload);
+                if (this->mode == fault_mode::observe_no_dispatch && !received) {
+                    return;
+                }
+                require(received, "fault server failed to receive dispatch");
+                ++dispatches;
                 require(type == PIPE_EXPERT_DISPATCH_REQ, "fault server expected dispatch");
                 if (this->mode == fault_mode::die) {
                     client.reset();
+                    return;
+                }
+                if (this->mode == fault_mode::die_mid_frame) {
+                    uint8_t header[PIPE_HEADER_SIZE];
+                    pipe_encode_header(header, {
+                                                   PIPE_MAGIC,
+                                                   PIPE_VERSION,
+                                                   PIPE_EXPERT_PARTIAL,
+                                                   0,
+                                                   seq_id,
+                                                   16,
+                                               });
+                    require(client->send_data(header, PIPE_HEADER_SIZE / 2),
+                            "fault server failed to send partial response header");
+                    client.reset();
+                    return;
+                }
+                if (this->mode == fault_mode::observe_no_dispatch) {
                     return;
                 }
                 const pipe_error_code code =
@@ -533,7 +562,7 @@ struct fault_server {
     }
 };
 
-std::string expect_dispatch_error(fault_mode mode, int32_t expert_id) {
+std::string expect_dispatch_error(fault_mode mode, int32_t expert_id, bool test_poisoned = false) {
     fault_server                           server(mode);
     const pipe_expert_dispatcher::endpoint endpoint = {
         "127.0.0.1",
@@ -551,6 +580,19 @@ std::string expect_dispatch_error(fault_mode mode, int32_t expert_id) {
     } catch (const std::runtime_error & error) {
         message = error.what();
     }
+    if (test_poisoned) {
+        std::string poisoned_message;
+        try {
+            dispatcher.dispatch(LAYER, 200 + (uint64_t) expert_id, N_TOKENS, activations,
+                                {
+                                    { expert_id, { 1.0f, 0.0f } }
+            });
+        } catch (const std::runtime_error & error) {
+            poisoned_message = error.what();
+        }
+        require(poisoned_message == "expert dispatcher cannot be reused after a worker or protocol failure",
+                "poisoned dispatcher did not fail fast: " + poisoned_message);
+    }
     server.finish();
     require(!message.empty(), "faulting worker did not fail dispatch");
     require(message.find("127.0.0.1:" + std::to_string(server.port)) != std::string::npos,
@@ -559,7 +601,116 @@ std::string expect_dispatch_error(fault_mode mode, int32_t expert_id) {
     return message;
 }
 
+void init_graph_inputs(ggml_context * ctx, ggml_tensor *& inp, ggml_tensor *& ids, ggml_tensor *& weights) {
+    inp     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N_EMBD, N_TOKENS);
+    ids     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, N_EXPERT, N_TOKENS);
+    weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, N_EXPERT, N_TOKENS);
+    for (int i = 0; i < N_TOKENS * N_EMBD; ++i) {
+        ggml_set_f32_1d(inp, i, 0.25f);
+    }
+    for (int token = 0; token < N_TOKENS; ++token) {
+        for (int expert = 0; expert < N_EXPERT; ++expert) {
+            const int index = token * N_EXPERT + expert;
+            ggml_set_i32_1d(ids, index, expert);
+            ggml_set_f32_1d(weights, index, 1.0f);
+        }
+    }
+}
+
+void require_zero(const ggml_tensor * tensor, const std::string & message) {
+    for (int64_t i = 0; i < ggml_nelements(tensor); ++i) {
+        require(ggml_get_f32_1d(tensor, (int) i) == 0.0f, message);
+    }
+}
+
+void test_graph_failure_isolation() {
+    fault_server server(fault_mode::die);
+    ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create failure-isolation ggml context");
+
+    ggml_tensor * inp;
+    ggml_tensor * ids;
+    ggml_tensor * weights;
+    init_graph_inputs(ctx.get(), inp, ids, weights);
+
+    const std::string endpoints = "127.0.0.1:" + std::to_string(server.port);
+    pipe_expert_dispatcher::graph_dispatcher dispatcher(
+        endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
+    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER);
+    ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
+    ggml_build_forward_expand(gf, out);
+
+    require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
+            "worker death escaped the custom-op callback");
+    require(dispatcher.failed(), "worker death did not latch graph dispatcher failure");
+    const std::string message = dispatcher.failure_message();
+    require(message.find(endpoints) != std::string::npos, "latched failure does not name the dead endpoint");
+    require_zero(out, "worker death did not zero-fill custom-op output");
+
+    for (int64_t i = 0; i < ggml_nelements(out); ++i) {
+        ggml_set_f32_1d(out, (int) i, 1.0f);
+    }
+    require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
+            "latched graph dispatcher did not short-circuit successfully");
+    require_zero(out, "latched graph dispatcher did not zero-fill subsequent output");
+    require(dispatcher.failure_message() == message, "graph dispatcher failure latch did not preserve the first error");
+    server.finish();
+    require(server.dispatches.load() == 1, "latched graph dispatcher repeated network dispatch");
+}
+
+void test_graph_local_failure_short_circuit() {
+    fault_server server(fault_mode::observe_no_dispatch);
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+        require(ctx != nullptr, "failed to create short-circuit ggml context");
+
+        ggml_tensor * inp;
+        ggml_tensor * ids;
+        ggml_tensor * weights;
+        init_graph_inputs(ctx.get(), inp, ids, weights);
+        for (int i = 0; i < N_TOKENS * N_EXPERT; ++i) {
+            ggml_set_i32_1d(ids, i, 0);
+        }
+
+        const std::string endpoints = "127.0.0.1:" + std::to_string(server.port);
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
+        ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER);
+        ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
+        ggml_build_forward_expand(gf, out);
+
+        require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
+                "local custom-op failure escaped the callback");
+        require(dispatcher.failed(), "local custom-op failure did not latch");
+        const std::string message = dispatcher.failure_message();
+        require(message.find("repeated expert") != std::string::npos, "unexpected local failure message: " + message);
+
+        for (int token = 0; token < N_TOKENS; ++token) {
+            for (int expert = 0; expert < N_EXPERT; ++expert) {
+                ggml_set_i32_1d(ids, token * N_EXPERT + expert, expert);
+            }
+        }
+        require(ggml_graph_compute_with_ctx(ctx.get(), gf, 2) == GGML_STATUS_SUCCESS,
+                "failed graph dispatcher did not short-circuit");
+        require_zero(out, "failed graph dispatcher short-circuit did not zero-fill");
+        require(dispatcher.failure_message() == message, "later compute replaced the first latched failure");
+    }
+    server.finish();
+    require(server.dispatches.load() == 0, "failed graph dispatcher performed network I/O");
+}
+
 void run_test() {
+    require(setenv("WP_DISPATCH_STATS", "1", 1) == 0, "failed to enable dispatch stats");
     temp_dir      temp;
     weight_map    weights;
     const fixture shard_a = make_fixture(temp.path, "shard-a", 0, 1, weights);
@@ -653,11 +804,17 @@ void run_test() {
         require(stats.requests_issued == stats.workers_used, "not every worker request was issued");
         require(stats.first_await_in_flight == stats.workers_used,
                 "first response was awaited before all worker requests were issued");
+        require(stats.ns_issue > 0, "dispatch issue time was not instrumented");
+        require(stats.ns_wait > 0, "dispatch wait time was not instrumented");
         require(dispatcher.in_flight_requests() == 0, "in-flight requests remain after reduction");
         require(stats.workers.size() == 4, "worker balance stats are incomplete");
         for (const pipe_expert_dispatcher::worker_dispatch_stats & worker : stats.workers) {
             require(worker.n_experts > 0 && worker.n_experts < assignments.size(),
                     "a capable worker received all work or no work");
+            require(worker.n_requests == 1, "worker dispatch stats did not count the request");
+            require(worker.n_experts_total == worker.n_experts,
+                    "worker dispatch stats did not count assigned experts");
+            require(worker.ns_wait > 0, "worker dispatch stats did not record wait time");
         }
         std::cout << "measured first_await_in_flight=" << stats.first_await_in_flight
                   << " workers_used=" << stats.workers_used << '\n';
@@ -674,6 +831,12 @@ void run_test() {
     const std::string death_error = expect_dispatch_error(fault_mode::die, 3);
     require(death_error.find("died while computing") != std::string::npos,
             "worker death did not surface as a hard transport error");
+    const std::string partial_error = expect_dispatch_error(fault_mode::die_mid_frame, 3, true);
+    require(partial_error.find("died while computing") != std::string::npos,
+            "partial response failure did not poison the dispatcher");
+
+    test_graph_failure_isolation();
+    test_graph_local_failure_short_circuit();
 }
 
 }  // namespace

@@ -2,8 +2,12 @@
 
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "llama-impl.h"
 
 #include <charconv>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -12,6 +16,17 @@
 
 namespace pipe_expert_dispatcher {
 namespace {
+
+using dispatch_clock = std::chrono::steady_clock;
+
+bool dispatch_stats_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_STATS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point end) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+}
 
 int parse_port(const std::string & text) {
     int        port   = 0;
@@ -60,7 +75,8 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
                                    int32_t             n_ff_exp,
                                    int32_t             n_expert,
                                    int32_t             n_expert_used) :
-    remote(parse_endpoints(endpoints)) {
+    remote(parse_endpoints(endpoints)),
+    collect_stats_(dispatch_stats_enabled()) {
     if (remote.n_embd() != n_embd || remote.n_ff_exp() != n_ff_exp || remote.n_expert() != n_expert ||
         remote.n_expert_used() != n_expert_used) {
         throw std::runtime_error("expert dispatcher workers do not match the model MoE dimensions");
@@ -93,6 +109,81 @@ size_t graph_dispatcher::n_workers() const {
     return remote.workers().size();
 }
 
+void graph_dispatcher::latch_failure(const char * message) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(failure_mutex_);
+        if (failed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        failure_message_ = message;
+        failed_.store(true, std::memory_order_release);
+    } catch (...) {
+        failed_.store(true, std::memory_order_release);
+    }
+}
+
+bool graph_dispatcher::failed() const noexcept {
+    return failed_.load(std::memory_order_acquire);
+}
+
+std::string graph_dispatcher::failure_message() const {
+    std::lock_guard<std::mutex> lock(failure_mutex_);
+    return failure_message_;
+}
+
+void graph_dispatcher::begin_decode() noexcept {
+    if (!collect_stats_) {
+        return;
+    }
+    decode_active_                       = true;
+    decode_layers_                       = 0;
+    decode_ns_pack_                      = 0;
+    decode_ns_issue_                     = 0;
+    decode_ns_wait_                      = 0;
+    decode_ns_unpack_                    = 0;
+    decode_ns_total_                     = 0;
+    decode_first_await_in_flight_        = 0;
+    decode_workers_.clear();
+    for (const worker_info & worker : remote.workers()) {
+        decode_workers_.push_back({ worker.endpoint });
+    }
+}
+
+void graph_dispatcher::end_decode() noexcept {
+    if (!collect_stats_ || !decode_active_) {
+        return;
+    }
+    decode_active_ = false;
+    if (decode_layers_ == 0) {
+        return;
+    }
+
+    const double ns_to_ms = 1.0e-6;
+    LLAMA_LOG_WARN(
+        "expert dispatch: layers=%zu pack=%.2f ms issue=%.2f ms wait=%.2f ms unpack=%.2f ms total=%.2f ms "
+        "first_await_in_flight avg=%.1f (workers=%zu)\n",
+        decode_layers_,
+        decode_ns_pack_ * ns_to_ms,
+        decode_ns_issue_ * ns_to_ms,
+        decode_ns_wait_ * ns_to_ms,
+        decode_ns_unpack_ * ns_to_ms,
+        decode_ns_total_ * ns_to_ms,
+        (double) decode_first_await_in_flight_ / (double) decode_layers_,
+        n_workers());
+    for (const worker_dispatch_stats & worker : decode_workers_) {
+        const double avg_wait_ms = worker.n_requests == 0
+            ? 0.0
+            : worker.ns_wait * ns_to_ms / (double) worker.n_requests;
+        LLAMA_LOG_WARN(
+            "expert dispatch worker %s requests=%llu experts=%llu wait=%.2f ms (avg %.2f ms/req)\n",
+            worker.endpoint.c_str(),
+            (unsigned long long) worker.n_requests,
+            (unsigned long long) worker.n_experts_total,
+            worker.ns_wait * ns_to_ms,
+            avg_wait_ms);
+    }
+}
+
 void graph_dispatcher::compute(ggml_tensor *       dst,
                                const ggml_tensor * activations,
                                const ggml_tensor * selected_experts,
@@ -100,64 +191,124 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
                                int                 ith,
                                int                 nth,
                                void *              userdata) {
-    if (ith != 0 || nth != 1) {
-        throw std::runtime_error("expert dispatch custom op must run as one CPU task");
-    }
-    op_context * context = static_cast<op_context *>(userdata);
-    if (context == nullptr || context->owner == nullptr) {
-        throw std::runtime_error("expert dispatch custom op has no dispatcher");
-    }
-
-    const int64_t n_embd        = activations->ne[0];
-    const int64_t n_tokens      = activations->ne[1];
-    const int64_t n_expert_used = selected_experts->ne[0];
-    const bool shapes_match =
-        n_embd == context->owner->remote.n_embd() && n_tokens > 0 &&
-        activations->ne[2] == 1 && activations->ne[3] == 1 &&
-        selected_experts->ne[1] == n_tokens &&
-        selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1 &&
-        weights->ne[0] == 1 && weights->ne[1] == n_expert_used &&
-        weights->ne[2] == n_tokens && weights->ne[3] == 1 &&
-        ggml_are_same_shape(dst, activations);
-    if (!shapes_match) {
-        throw std::runtime_error("expert dispatch custom op input shapes do not match");
-    }
-
-    std::vector<uint16_t> wire_activations((size_t) n_embd * (size_t) n_tokens);
-    for (size_t i = 0; i < wire_activations.size(); ++i) {
-        wire_activations[i] = (uint16_t) ggml_fp32_to_fp16(ggml_get_f32_1d(activations, (int) i));
-    }
-
-    std::map<int32_t, pipe_expert_assignment> by_expert;
-    for (int64_t token = 0; token < n_tokens; ++token) {
-        std::set<int32_t> token_experts;
-        for (int64_t slot = 0; slot < n_expert_used; ++slot) {
-            const int     index  = (int) (token * n_expert_used + slot);
-            const int32_t expert = ggml_get_i32_1d(selected_experts, index);
-            if (!token_experts.insert(expert).second) {
-                throw std::runtime_error("expert dispatch received a repeated expert for one token");
-            }
-            auto inserted = by_expert.emplace(expert, pipe_expert_assignment{});
-            if (inserted.second) {
-                inserted.first->second.expert_id = expert;
-                inserted.first->second.weights.resize((size_t) n_tokens, 0.0f);
-            }
-            inserted.first->second.weights[(size_t) token] = ggml_get_f32_1d(weights, index);
+    graph_dispatcher * owner = nullptr;
+    try {
+        if (ith != 0 || nth != 1) {
+            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
         }
-    }
+        op_context * context = static_cast<op_context *>(userdata);
+        if (context == nullptr || context->owner == nullptr) {
+            throw std::runtime_error("expert dispatch custom op has no dispatcher");
+        }
+        owner = context->owner;
+        if (owner->failed()) {
+            ggml_set_zero(dst);
+            return;
+        }
+        const bool collect_stats = owner->collect_stats_ && owner->decode_active_;
+        const dispatch_clock::time_point total_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
 
-    std::vector<pipe_expert_assignment> assignments;
-    assignments.reserve(by_expert.size());
-    for (auto & entry : by_expert) {
-        assignments.push_back(std::move(entry.second));
-    }
+        const int64_t n_embd        = activations->ne[0];
+        const int64_t n_tokens      = activations->ne[1];
+        const int64_t n_expert_used = selected_experts->ne[0];
+        const bool shapes_match =
+            n_embd == owner->remote.n_embd() && n_tokens > 0 &&
+            activations->ne[2] == 1 && activations->ne[3] == 1 &&
+            selected_experts->ne[1] == n_tokens &&
+            selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1 &&
+            weights->ne[0] == 1 && weights->ne[1] == n_expert_used &&
+            weights->ne[2] == n_tokens && weights->ne[3] == 1 &&
+            ggml_are_same_shape(dst, activations);
+        if (!shapes_match) {
+            throw std::runtime_error("expert dispatch custom op input shapes do not match");
+        }
 
-    graph_dispatcher *       owner  = context->owner;
-    const uint64_t           seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
-    const std::vector<float> result =
-        owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments);
-    for (size_t i = 0; i < result.size(); ++i) {
-        ggml_set_f32_1d(dst, (int) i, result[i]);
+        std::vector<uint16_t> wire_activations((size_t) n_embd * (size_t) n_tokens);
+        const dispatch_clock::time_point pack_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        if (ggml_is_contiguous(activations)) {
+            ggml_fp32_to_fp16_row(
+                (const float *) activations->data,
+                (ggml_fp16_t *) wire_activations.data(),
+                (int64_t) wire_activations.size());
+        } else {
+            for (size_t i = 0; i < wire_activations.size(); ++i) {
+                wire_activations[i] = (uint16_t) ggml_fp32_to_fp16(ggml_get_f32_1d(activations, (int) i));
+            }
+        }
+        const dispatch_clock::time_point pack_end =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+
+        std::map<int32_t, pipe_expert_assignment> by_expert;
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            std::set<int32_t> token_experts;
+            for (int64_t slot = 0; slot < n_expert_used; ++slot) {
+                const int     index  = (int) (token * n_expert_used + slot);
+                const int32_t expert = ggml_get_i32_1d(selected_experts, index);
+                if (!token_experts.insert(expert).second) {
+                    throw std::runtime_error("expert dispatch received a repeated expert for one token");
+                }
+                auto inserted = by_expert.emplace(expert, pipe_expert_assignment{});
+                if (inserted.second) {
+                    inserted.first->second.expert_id = expert;
+                    inserted.first->second.weights.resize((size_t) n_tokens, 0.0f);
+                }
+                inserted.first->second.weights[(size_t) token] = ggml_get_f32_1d(weights, index);
+            }
+        }
+
+        std::vector<pipe_expert_assignment> assignments;
+        assignments.reserve(by_expert.size());
+        for (auto & entry : by_expert) {
+            assignments.push_back(std::move(entry.second));
+        }
+
+        const uint64_t           seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
+        const std::vector<float> result =
+            owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments);
+        const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
+        const dispatch_clock::time_point unpack_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
+            std::memcpy(dst->data, result.data(), result.size() * sizeof(float));
+        } else {
+            for (size_t i = 0; i < result.size(); ++i) {
+                ggml_set_f32_1d(dst, (int) i, result[i]);
+            }
+        }
+
+        if (collect_stats) {
+            const dispatch_clock::time_point total_end = dispatch_clock::now();
+            ++owner->decode_layers_;
+            owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
+            owner->decode_ns_issue_ += layer_stats.ns_issue;
+            owner->decode_ns_wait_ += layer_stats.ns_wait;
+            owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
+            owner->decode_ns_total_ += elapsed_ns(total_start, total_end);
+            owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
+            for (const worker_dispatch_stats & worker : layer_stats.workers) {
+                for (worker_dispatch_stats & decode_worker : owner->decode_workers_) {
+                    if (decode_worker.endpoint != worker.endpoint) {
+                        continue;
+                    }
+                    decode_worker.ns_wait += worker.ns_wait;
+                    decode_worker.n_requests += worker.n_requests;
+                    decode_worker.n_experts_total += worker.n_experts_total;
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception & error) {
+        if (owner != nullptr) {
+            owner->latch_failure(error.what());
+        }
+        ggml_set_zero(dst);
+    } catch (...) {
+        if (owner != nullptr) {
+            owner->latch_failure("expert dispatch custom op failed with an unknown exception");
+        }
+        ggml_set_zero(dst);
     }
 }
 

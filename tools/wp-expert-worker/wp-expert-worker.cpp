@@ -6,6 +6,7 @@
 #include "ggml-cpu.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
+#include "weight-pager/wp-host-tier.h"
 
 extern "C" {
 #include "sha256/sha256.h"
@@ -18,11 +19,13 @@ extern "C" {
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -54,6 +57,143 @@ using json = nlohmann::json;
 namespace wp_expert_worker {
 
 static constexpr uint64_t DEFAULT_STAGING_BUFFERS = 16;
+
+struct RequestStats {
+    uint64_t ns_lookup  = 0;
+    uint64_t ns_read    = 0;
+    uint64_t ns_compute = 0;
+    uint64_t ns_send    = 0;
+    uint64_t n_hit      = 0;
+    uint64_t n_miss     = 0;
+    uint64_t n_host_hit = 0;
+    uint64_t n_host_demote = 0;
+    uint64_t bytes_read = 0;
+    uint64_t ns_host_get = 0;
+    uint64_t host_bytes = 0;
+    uint64_t n_graph_submits = 0;
+    uint64_t n_device_allocs = 0;
+    uint64_t ns_graph_build = 0;
+    uint64_t ns_submit = 0;
+    uint64_t ns_readback = 0;
+    uint64_t ns_h2d = 0;
+    uint64_t bytes_h2d = 0;
+};
+
+class WorkerStats {
+public:
+    WorkerStats() :
+        enabled_(std::getenv("WP_WORKER_STATS") != nullptr &&
+                 std::strcmp(std::getenv("WP_WORKER_STATS"), "1") == 0),
+        next_report_(clock::now() + std::chrono::seconds(5)) {
+    }
+
+    bool enabled() const {
+        return enabled_;
+    }
+
+    // Set once at startup from ExpertSlotPool::staging_kind() -- which
+    // allocation path the staging pool actually used, not what was requested.
+    void set_staging_kind(const char * kind) {
+        staging_kind_ = kind;
+    }
+
+    ~WorkerStats() {
+        report();
+    }
+
+    void record(const RequestStats & request, size_t n_experts) {
+        if (!enabled_) {
+            return;
+        }
+
+        ns_lookup_ += request.ns_lookup;
+        ns_read_ += request.ns_read;
+        ns_compute_ += request.ns_compute;
+        ns_send_ += request.ns_send;
+        n_hit_ += request.n_hit;
+        n_miss_ += request.n_miss;
+        n_host_hit_ += request.n_host_hit;
+        n_host_demote_ += request.n_host_demote;
+        bytes_read_ += request.bytes_read;
+        ns_host_get_ += request.ns_host_get;
+        host_bytes_ = request.host_bytes;
+        n_graph_submits_ += request.n_graph_submits;
+        n_device_allocs_ += request.n_device_allocs;
+        ns_graph_build_ += request.ns_graph_build;
+        ns_submit_ += request.ns_submit;
+        ns_readback_ += request.ns_readback;
+        ns_h2d_ += request.ns_h2d;
+        bytes_h2d_ += request.bytes_h2d;
+        ++n_requests_;
+        n_experts_ += n_experts;
+
+        const clock::time_point now = clock::now();
+        if (now < next_report_) {
+            return;
+        }
+        next_report_ = now + std::chrono::seconds(5);
+        report();
+    }
+
+private:
+    using clock = std::chrono::steady_clock;
+
+    void report() const {
+        if (!enabled_ || n_requests_ == 0) {
+            return;
+        }
+        std::cout << "wp expert worker stats"
+                  << " n_requests=" << n_requests_
+                  << " n_experts=" << n_experts_
+                  << " n_hit=" << n_hit_
+                  << " n_miss=" << n_miss_
+                  << " n_host_hit=" << n_host_hit_
+                  << " n_host_demote=" << n_host_demote_
+                  << " bytes_read=" << bytes_read_
+                  << " ns_recv=unavailable"
+                  << " ns_lookup=" << ns_lookup_
+                  << " ns_read=" << ns_read_
+                  << " ns_h2d=" << ns_h2d_
+                  << " bytes_h2d=" << bytes_h2d_
+                  << " gb_s_h2d=" << (ns_h2d_ == 0 ? 0.0 :
+                        (double) bytes_h2d_ / (double) ns_h2d_)
+                  << " staging_kind=" << staging_kind_
+                  << " ns_host_get=" << ns_host_get_
+                  << " ns_compute=" << ns_compute_
+                  << " n_graph_submits=" << n_graph_submits_
+                  << " n_device_allocs=" << n_device_allocs_
+                  << " ns_graph_build=" << ns_graph_build_
+                  << " ns_submit=" << ns_submit_
+                  << " ns_readback=" << ns_readback_
+                  << " ns_send=" << ns_send_
+                  << " host_bytes=" << host_bytes_
+                  << std::endl;
+    }
+
+    bool              enabled_ = false;
+    clock::time_point next_report_;
+    uint64_t          ns_lookup_  = 0;
+    uint64_t          ns_read_    = 0;
+    uint64_t          ns_compute_ = 0;
+    uint64_t          ns_send_    = 0;
+    uint64_t          n_hit_      = 0;
+    uint64_t          n_miss_     = 0;
+    uint64_t          n_host_hit_ = 0;
+    uint64_t          n_host_demote_ = 0;
+    uint64_t          bytes_read_ = 0;
+    uint64_t          ns_host_get_ = 0;
+    uint64_t          host_bytes_ = 0;
+    uint64_t          n_graph_submits_ = 0;
+    uint64_t          n_device_allocs_ = 0;
+    uint64_t          ns_graph_build_ = 0;
+    uint64_t          ns_submit_ = 0;
+    uint64_t          ns_readback_ = 0;
+    uint64_t          ns_h2d_     = 0;
+    uint64_t          bytes_h2d_  = 0;
+    std::string       staging_kind_ = "unknown";
+    uint64_t          n_requests_ = 0;
+    uint64_t          n_experts_  = 0;
+};
 
 ResourcePlan plan_resources(
         const std::vector<ResourcePage> & pages,
@@ -248,6 +388,7 @@ struct MemberSpan {
 };
 
 struct ExpertPage {
+    int                               cache_id = -1;
     int                               layer  = -1;
     int                               expert = -1;
     fs::path                          blob;
@@ -281,9 +422,16 @@ struct context_deleter {
     }
 };
 
+struct galloc_deleter {
+    void operator()(ggml_gallocr * galloc) const {
+        ggml_gallocr_free(galloc);
+    }
+};
+
 using backend_ptr = std::unique_ptr<ggml_backend, backend_deleter>;
 using buffer_ptr  = std::unique_ptr<ggml_backend_buffer, buffer_deleter>;
 using context_ptr = std::unique_ptr<ggml_context, context_deleter>;
+using galloc_ptr  = std::unique_ptr<ggml_gallocr, galloc_deleter>;
 
 json read_json(const fs::path & path) {
     std::ifstream input(path);
@@ -562,6 +710,10 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
         int expected_expert = result.descriptor.expert_first;
         for (const json & group : groups) {
             ExpertPage page;
+            if (total_groups > (uint64_t) INT32_MAX) {
+                throw std::runtime_error("expert page cache index is out of range");
+            }
+            page.cache_id = (int) total_groups;
             page.layer  = get_value<int>(group, "block_idx", index_path);
             page.expert = get_value<int>(group, "expert_idx", index_path);
             page.blob   = blob_path;
@@ -657,22 +809,107 @@ struct free_deleter {
     }
 };
 
+// WP_STAGING_PINNED=1 opts IN to page-locked staging via
+// ggml_backend_dev_host_buffer_type. DEFAULT IS OFF (posix_memalign) because
+// measurement on 2026-07-31 showed pinning is INERT AND UNSAFE:
+//   - inert: 1070 gb_s_h2d 2.971 pinned vs 3.006 pageable; R9700 14.99 vs
+//     16.10; throughput 0.865 vs 0.889 tok/s. All inside the +/-3% band. The
+//     "1.29 GB/s H2D" that motivated this was DERIVED from a subtraction, never
+//     measured; the first real ns_h2d says the 1070 was always at ~85% of its
+//     gen3 x4 ceiling. There was no bounce-copy cost to recover.
+//   - unsafe: Vulkan's host buffer type returns memory that is 4096-aligned but
+//     NOT O_DIRECT-readable (host-visible device/BAR memory, not host RAM).
+//     read() returns -1 and prefill dies at layer 3. The alignment and
+//     buffer-type checks below both PASS on it, so the pool reports
+//     staging_kind=pinned truthfully and then fails on first read.
+// Read at startup only (not a struct Options field) so it cannot reintroduce
+// the ABI mismatch that broke every worker on 2026-07-30 -- and so it stays
+// settable per worker process, which is what made the A/B above possible.
+bool staging_pinned_env_enabled() {
+    const char * env = std::getenv("WP_STAGING_PINNED");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
 class StagingPool {
 public:
-    explicit StagingPool(const ResourcePlan & resources) :
-        buffer_bytes_(resources.staging_buffer_bytes) {
+    StagingPool(const ResourcePlan & resources, ggml_backend_t backend) :
+        buffer_bytes_(resources.staging_buffer_bytes),
+        buffer_count_(resources.staging_buffers) {
         buffers_.reserve((size_t) resources.staging_buffers);
+        host_buffers_.reserve((size_t) resources.staging_buffers);
         available_.reserve((size_t) resources.staging_buffers);
-        for (int i = 0; i < resources.staging_buffers; ++i) {
-            void * raw = nullptr;
-            if (posix_memalign(
-                    &raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0) {
-                throw std::runtime_error(
-                    "failed to allocate aligned O_DIRECT staging buffer");
+
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        bool try_pinned = staging_pinned_env_enabled();
+        if (try_pinned && backend != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev != nullptr) {
+                // Portable entry point (ggml-backend.h:187). Never call a
+                // backend-specific host-alloc symbol here: this worker binary
+                // serves ROCm, CUDA and Vulkan, and #if GGML_USE_* branching
+                // in this path is the exact bug class that has recurred six
+                // times in this codebase.
+                host_buft = ggml_backend_dev_host_buffer_type(dev);
             }
-            buffers_.emplace_back(raw);
-            available_.push_back(raw);
         }
+
+        // Some backends provide no host buffer type; the allocation can also
+        // fail or come back misaligned. The O_DIRECT reads need 4096-byte
+        // alignment, so verify it now rather than discovering EINVAL at
+        // read() time. Any of these cases falls back to posix_memalign for
+        // the whole pool.
+        //
+        // Also verify the returned buffer's actual type matches host_buft.
+        // ggml_backend_cuda_host_buffer_type_alloc_buffer silently falls back
+        // to a plain CPU buffer (ggml_backend_cpu_buffer_from_ptr) when
+        // cudaHostAlloc fails (e.g. GGML_CUDA_NO_PINNED, or the allocator is
+        // just out of pinned memory) -- and only stamps buffer->buft with the
+        // host type on the success path, so the fallback buffer keeps
+        // ggml_backend_cpu_buffer_type(). That buffer is non-null, has a
+        // valid base pointer, and is 4096-aligned, so the checks above all
+        // pass on it even though the memory is pageable. Without this check
+        // we would report staging_kind=pinned while actually running
+        // pageable, and derive gb_s_h2d against a mechanism that never ran.
+        bool pinned = try_pinned && host_buft != nullptr;
+        if (pinned) {
+            for (int i = 0; i < resources.staging_buffers; ++i) {
+                buffer_ptr buf(ggml_backend_buft_alloc_buffer(
+                    host_buft, (size_t) buffer_bytes_));
+                void * raw = buf ? ggml_backend_buffer_get_base(buf.get()) : nullptr;
+                if (!buf || raw == nullptr ||
+                        (reinterpret_cast<uintptr_t>(raw) % DIRECT_ALIGNMENT) != 0 ||
+                        ggml_backend_buffer_get_type(buf.get()) != host_buft) {
+                    pinned = false;
+                    break;
+                }
+                host_buffers_.push_back(std::move(buf));
+            }
+            if (!pinned) {
+                host_buffers_.clear();
+            }
+        }
+
+        if (pinned) {
+            for (const buffer_ptr & buf : host_buffers_) {
+                available_.push_back(ggml_backend_buffer_get_base(buf.get()));
+            }
+        } else {
+            for (int i = 0; i < resources.staging_buffers; ++i) {
+                void * raw = nullptr;
+                if (posix_memalign(
+                        &raw, DIRECT_ALIGNMENT, (size_t) buffer_bytes_) != 0) {
+                    throw std::runtime_error(
+                        "failed to allocate aligned O_DIRECT staging buffer");
+                }
+                buffers_.emplace_back(raw);
+                available_.push_back(raw);
+            }
+        }
+
+        pinned_ = pinned;
+        // Logged once: one StagingPool is constructed per worker process.
+        std::cerr << "wp expert worker: staging_kind="
+                  << (pinned_ ? "pinned" : "pageable") << std::endl;
     }
 
     class Lease {
@@ -717,11 +954,16 @@ public:
     }
 
     int buffer_count() const {
-        return (int) buffers_.size();
+        return buffer_count_;
     }
 
     uint64_t buffer_bytes() const {
         return buffer_bytes_;
+    }
+
+    // Which allocation path actually ran, not what was requested.
+    bool pinned() const {
+        return pinned_;
     }
 
 private:
@@ -734,7 +976,10 @@ private:
     }
 
     uint64_t                                        buffer_bytes_ = 0;
+    int                                              buffer_count_ = 0;
+    bool                                             pinned_ = false;
     std::vector<std::unique_ptr<void, free_deleter>> buffers_;
+    std::vector<buffer_ptr>                         host_buffers_;
     std::vector<void *>                             available_;
     std::mutex                                      mutex_;
     std::condition_variable                         available_cv_;
@@ -753,6 +998,9 @@ private:
         size_t                              miss_index = 0;
         std::unique_ptr<StagingPool::Lease> staging;
         std::exception_ptr                  error;
+        std::chrono::steady_clock::time_point read_started;
+        std::chrono::steady_clock::time_point read_finished;
+        bool                                read_timed = false;
     };
 
     struct BatchState {
@@ -763,15 +1011,16 @@ private:
         std::deque<std::unique_ptr<ReadResult>> ready;
         bool                                    start  = false;
         bool                                    cancel = false;
+        bool                                    measure = false;
     };
 
 public:
     ExpertSlotPool(
             ggml_backend_t backend, ResourcePlan resources,
-            TestHooks * test_hooks) :
+            uint64_t host_victim_bytes, TestHooks * test_hooks) :
         backend_(backend),
         resources_(std::move(resources)),
-        staging_(resources_),
+        staging_(resources_, backend),
         test_hooks_(test_hooks) {
         if (resources_.slot_count <= 0 ||
             resources_.staging_buffer_bytes == 0 ||
@@ -793,6 +1042,25 @@ public:
         resources_.staging_bytes =
             resources_.staging_buffer_bytes *
             (uint64_t) resources_.staging_buffers;
+
+        if (host_victim_bytes != 0) {
+            if (host_victim_bytes >
+                (uint64_t) std::numeric_limits<size_t>::max() ||
+                !host_tier_.init((size_t) host_victim_bytes, 0)) {
+                throw std::runtime_error("failed to initialize host victim tier");
+            }
+            host_tier_.set_device_reader(
+                [this](void * dst_host, const void * src_device, size_t n) {
+                    for (const Slot & slot : slots_) {
+                        if (slot.raw != nullptr && slot.raw->data == src_device) {
+                            ggml_backend_tensor_get(slot.raw, dst_host, 0, n);
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+            host_victim_enabled_ = true;
+        }
     }
 
     ~ExpertSlotPool() {
@@ -831,6 +1099,50 @@ public:
 
         void complete();
 
+        uint64_t lookup_ns() const {
+            return ns_lookup_;
+        }
+
+        uint64_t read_ns() const {
+            return ns_read_;
+        }
+
+        uint64_t ns_h2d() const {
+            return ns_h2d_;
+        }
+
+        uint64_t bytes_h2d() const {
+            return bytes_h2d_;
+        }
+
+        uint64_t n_hit() const {
+            return n_hit_;
+        }
+
+        uint64_t n_miss() const {
+            return n_miss_;
+        }
+
+        uint64_t bytes_read() const {
+            return bytes_read_;
+        }
+
+        uint64_t n_host_hit() const {
+            return n_host_hit_;
+        }
+
+        uint64_t n_host_demote() const {
+            return n_host_demote_;
+        }
+
+        uint64_t ns_host_get() const {
+            return ns_host_get_;
+        }
+
+        uint64_t host_bytes() const {
+            return host_bytes_;
+        }
+
     private:
         friend class ExpertSlotPool;
 
@@ -850,9 +1162,23 @@ public:
         std::shared_ptr<BatchState> state_;
         std::vector<std::thread>   workers_;
         bool                       completed_ = false;
+        uint64_t                   ns_lookup_ = 0;
+        uint64_t                   ns_read_   = 0;
+        uint64_t                   n_hit_     = 0;
+        uint64_t                   n_miss_    = 0;
+        uint64_t                   bytes_read_ = 0;
+        uint64_t                   n_host_hit_ = 0;
+        uint64_t                   n_host_demote_ = 0;
+        uint64_t                   ns_host_get_ = 0;
+        uint64_t                   host_bytes_ = 0;
+        uint64_t                   ns_h2d_    = 0;
+        uint64_t                   bytes_h2d_ = 0;
     };
 
-    Batch ensure_batch(const std::vector<const ExpertPage *> & pages) {
+    Batch ensure_batch(
+            const std::vector<const ExpertPage *> & pages,
+            bool measure,
+            std::chrono::steady_clock::time_point lookup_started) {
         Batch batch(this, pages.size());
         try {
             std::vector<size_t> misses;
@@ -884,6 +1210,7 @@ public:
                     true,
                     true,
                 };
+                ++batch.n_hit_;
             }
 
             // Reserve and pin all miss slots before starting any read. Later
@@ -899,31 +1226,107 @@ public:
                 batch.entries_[entry_index].slot_index = slot_index;
             }
 
-            batch.state_ = std::make_shared<BatchState>();
-            batch.state_->misses.reserve(misses.size());
-            for (size_t entry_index : misses) {
-                const ExpertPage & page = *pages[entry_index];
-                const size_t slot_index =
-                    batch.entries_[entry_index].slot_index;
-                Slot & slot = slots_[slot_index];
-                slot.valid = false;
-                batch.state_->misses.push_back({
-                    entry_index, slot_index, &page, fd_for(page.blob)
-                });
-                if (test_hooks_ != nullptr &&
-                    test_hooks_->slot_reserved) {
-                    test_hooks_->slot_reserved(
-                        page.layer, page.expert, (int) slot_index);
+            if (measure) {
+                batch.ns_lookup_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - lookup_started).count();
+            }
+
+            struct HostHit {
+                const void *                   src = nullptr;
+                wp::HostTier::BorrowHandle borrow =
+                    wp::HostTier::kInvalidBorrowHandle;
+            };
+            std::vector<HostHit> host_hits(pages.size());
+            if (host_victim_enabled_) {
+                for (size_t entry_index : misses) {
+                    const ExpertPage & page = *pages[entry_index];
+                    if (host_tier_.borrow(
+                            page.cache_id, &host_hits[entry_index].src,
+                            (size_t) page.size, &host_hits[entry_index].borrow)) {
+                        continue;
+                    }
                 }
             }
 
-            if (misses.empty()) {
+            auto release_host_hits = [&]() {
+                for (size_t entry_index : misses) {
+                    HostHit & host_hit = host_hits[entry_index];
+                    if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
+                        host_tier_.release(
+                            pages[entry_index]->cache_id, host_hit.borrow);
+                        host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
+                    }
+                }
+            };
+
+            batch.state_ = std::make_shared<BatchState>();
+            batch.state_->misses.reserve(misses.size());
+            try {
+                for (size_t entry_index : misses) {
+                    const ExpertPage & page = *pages[entry_index];
+                    const size_t slot_index =
+                        batch.entries_[entry_index].slot_index;
+                    Slot & slot = slots_[slot_index];
+                    if (slot.valid && demote_slot(slot)) {
+                        ++batch.n_host_demote_;
+                    }
+                    slot.valid = false;
+
+                    HostHit & host_hit = host_hits[entry_index];
+                    if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
+                        const std::chrono::steady_clock::time_point host_get_started =
+                            measure ? std::chrono::steady_clock::now() :
+                                      std::chrono::steady_clock::time_point();
+                        ggml_backend_tensor_set(
+                            slot.raw, host_hit.src, 0, (size_t) page.size);
+                        host_tier_.release(page.cache_id, host_hit.borrow);
+                        host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
+                        host_tier_.erase(page.cache_id);
+                        slot.valid    = true;
+                        slot.key      = { page.layer, page.expert };
+                        slot.cache_id = page.cache_id;
+                        slot.size     = page.size;
+                        slot.tick     = ++tick_;
+                        batch.entries_[entry_index].loaded = {
+                            slot.buffer.get(),
+                            ggml_backend_buffer_get_base(slot.buffer.get())
+                        };
+                        batch.entries_[entry_index].hit   = true;
+                        batch.entries_[entry_index].ready = true;
+                        ++batch.n_host_hit_;
+                        if (measure) {
+                            batch.ns_host_get_ +=
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - host_get_started).count();
+                        }
+                    } else {
+                        batch.state_->misses.push_back({
+                            entry_index, slot_index, &page, fd_for(page.blob)
+                        });
+                        ++batch.n_miss_;
+                        batch.bytes_read_ += page.size;
+                        if (test_hooks_ != nullptr &&
+                            test_hooks_->slot_reserved) {
+                            test_hooks_->slot_reserved(
+                                page.layer, page.expert, (int) slot_index);
+                        }
+                    }
+                }
+            } catch (...) {
+                release_host_hits();
+                throw;
+            }
+            batch.host_bytes_ = host_victim_enabled_ ? host_tier_.used_bytes() : 0;
+
+            if (batch.state_->misses.empty()) {
                 batch.completed_ = true;
                 return batch;
             }
 
+            batch.state_->measure = measure;
+
             const size_t worker_count = std::min<size_t>(
-                misses.size(), (size_t) staging_.buffer_count());
+                batch.state_->misses.size(), (size_t) staging_.buffer_count());
             batch.workers_.reserve(worker_count);
             for (size_t i = 0; i < worker_count; ++i) {
                 batch.workers_.emplace_back(
@@ -948,17 +1351,30 @@ public:
         return resources_;
     }
 
+    // "pinned" or "pageable" -- whichever path the staging pool actually
+    // used, not whichever was requested.
+    const char * staging_kind() const {
+        return staging_.pinned() ? "pinned" : "pageable";
+    }
+
 private:
     struct Slot {
         context_ptr         ctx;
         buffer_ptr          buffer;
         ggml_tensor *       raw       = nullptr;
         std::pair<int, int> key;
+        int                 cache_id  = -1;
         uint64_t            capacity  = 0;
+        uint64_t            size      = 0;
         uint64_t            tick      = 0;
         int                 pin_count = 0;
         bool                valid     = false;
     };
+
+    bool demote_slot(const Slot & slot) {
+        return host_victim_enabled_ && slot.valid && slot.cache_id >= 0 && slot.size != 0 &&
+            host_tier_.store_from_device(slot.cache_id, slot.raw->data, (size_t) slot.size);
+    }
 
     size_t select_victim(uint64_t page_size) const {
         size_t victim = slots_.size();
@@ -1027,9 +1443,16 @@ private:
                     test_hooks_->read_started(
                         miss.page->layer, miss.page->expert);
                 }
+                if (state->measure) {
+                    result->read_started = std::chrono::steady_clock::now();
+                    result->read_timed = true;
+                }
                 read_page(*miss.page, miss.fd, result->staging->get());
             } catch (...) {
                 result->error = std::current_exception();
+            }
+            if (state->measure && result->read_timed) {
+                result->read_finished = std::chrono::steady_clock::now();
             }
             if (read_started && test_hooks_ != nullptr &&
                 test_hooks_->read_finished) {
@@ -1057,6 +1480,9 @@ private:
 
         std::exception_ptr first_error;
         size_t received = 0;
+        std::chrono::steady_clock::time_point first_read;
+        std::chrono::steady_clock::time_point last_read;
+        bool have_read_time = false;
         while (received < batch.state_->misses.size()) {
             std::unique_ptr<ReadResult> result;
             {
@@ -1070,19 +1496,40 @@ private:
 
             const Miss & miss =
                 batch.state_->misses[result->miss_index];
+            if (result->read_timed) {
+                if (!have_read_time || result->read_started < first_read) {
+                    first_read = result->read_started;
+                }
+                if (!have_read_time || result->read_finished > last_read) {
+                    last_read = result->read_finished;
+                }
+                have_read_time = true;
+            }
             if (result->error != nullptr) {
                 if (first_error == nullptr) {
                     first_error = result->error;
                 }
             } else {
                 Slot & slot = slots_[miss.slot_index];
+                const bool measure_h2d = batch.state_->measure;
+                const std::chrono::steady_clock::time_point h2d_started =
+                    measure_h2d ? std::chrono::steady_clock::now() :
+                                  std::chrono::steady_clock::time_point();
                 ggml_backend_tensor_set(
                     slot.raw, result->staging->get(), 0,
                     (size_t) miss.page->size);
+                if (measure_h2d) {
+                    batch.ns_h2d_ +=
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - h2d_started).count();
+                    batch.bytes_h2d_ += miss.page->size;
+                }
                 slot.valid = true;
                 slot.key   = {
                     miss.page->layer, miss.page->expert
                 };
+                slot.cache_id = miss.page->cache_id;
+                slot.size     = miss.page->size;
                 slot.tick  = ++tick_;
                 Batch::Entry & entry =
                     batch.entries_[miss.entry_index];
@@ -1101,6 +1548,10 @@ private:
         }
         batch.workers_.clear();
         batch.completed_ = true;
+        if (have_read_time) {
+            batch.ns_read_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                last_read - first_read).count();
+        }
         if (first_error != nullptr) {
             std::rethrow_exception(first_error);
         }
@@ -1220,6 +1671,8 @@ private:
     ResourcePlan               resources_;
     StagingPool                staging_;
     TestHooks *                test_hooks_ = nullptr;
+    wp::HostTier               host_tier_;
+    bool                       host_victim_enabled_ = false;
     uint64_t                   tick_ = 0;
     std::vector<Slot>          slots_;
     std::map<std::string, int> fds_;
@@ -1230,7 +1683,18 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     entries_(std::move(other.entries_)),
     state_(std::move(other.state_)),
     workers_(std::move(other.workers_)),
-    completed_(other.completed_) {
+    completed_(other.completed_),
+    ns_lookup_(other.ns_lookup_),
+    ns_read_(other.ns_read_),
+    n_hit_(other.n_hit_),
+    n_miss_(other.n_miss_),
+    bytes_read_(other.bytes_read_),
+    n_host_hit_(other.n_host_hit_),
+    n_host_demote_(other.n_host_demote_),
+    ns_host_get_(other.ns_host_get_),
+    host_bytes_(other.host_bytes_),
+    ns_h2d_(other.ns_h2d_),
+    bytes_h2d_(other.bytes_h2d_) {
     other.owner_ = nullptr;
 }
 
@@ -1257,63 +1721,6 @@ void attach_weight(
     }
 }
 
-std::vector<float> compute_expert(
-        ggml_backend_t backend,
-        const Descriptor & descriptor,
-        const ExpertPage & page,
-        const ExpertSlotPool::Loaded & loaded,
-        const std::vector<float> & activation,
-        uint32_t n_tokens) {
-    const int n_embd   = descriptor.hparams.n_embd;
-    const auto & specs = descriptor.layers.at(page.layer);
-    const size_t tensor_count = 24;
-    const ggml_init_params params = {
-        /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
-                          ggml_graph_overhead_custom(64, false),
-        /* .mem_base = */ nullptr,
-        /* .no_alloc = */ true,
-    };
-    context_ptr ctx(ggml_init(params));
-    if (!ctx) {
-        throw std::runtime_error("failed to allocate expert graph metadata");
-    }
-
-    auto make_weight = [&](const std::string & role) {
-        const RoleSpec & spec = specs.at(role);
-        ggml_tensor * tensor =
-            ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
-        attach_weight(tensor, loaded.buffer, loaded.base, page.roles.at(role).offset);
-        return tensor;
-    };
-
-    ggml_tensor * gate_weight = make_weight("gate");
-    ggml_tensor * up_weight   = make_weight("up");
-    ggml_tensor * down_weight = make_weight("down");
-    ggml_tensor * input =
-        ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_tokens);
-    ggml_set_input(input);
-
-    ggml_tensor * gate = ggml_mul_mat(ctx.get(), gate_weight, input);
-    ggml_tensor * up   = ggml_mul_mat(ctx.get(), up_weight, input);
-    ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate, up);
-    ggml_tensor * output = ggml_mul_mat(ctx.get(), down_weight, hidden);
-
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 64, false);
-    ggml_build_forward_expand(graph, output);
-    buffer_ptr compute_buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
-    if (!compute_buffer) {
-        throw std::runtime_error("failed to allocate expert compute graph");
-    }
-    ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
-    const enum ggml_status status = ggml_backend_graph_compute(backend, graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        throw std::runtime_error("expert backend graph compute failed");
-    }
-    std::vector<float> result((size_t) n_embd * n_tokens);
-    ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
-    return result;
-}
-
 class Worker {
 public:
     Worker(
@@ -1321,6 +1728,7 @@ public:
             const std::string & device,
             int slots,
             uint64_t host_budget_bytes,
+            uint64_t host_victim_bytes,
             TestHooks * test_hooks) :
         catalog_(std::move(catalog)),
         backend_(init_backend(device)),
@@ -1328,8 +1736,15 @@ public:
             backend_.get(),
             plan_resources(
                 resource_pages(catalog_), slots, host_budget_bytes),
+            host_victim_bytes,
             test_hooks),
+        compute_galloc_(ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
+        if (!compute_galloc_) {
+            throw std::runtime_error("failed to create expert graph allocator");
+        }
+        stats_.set_staging_kind(pool_.staging_kind());
     }
 
     pipe_expert_hello hello() const {
@@ -1352,7 +1767,9 @@ public:
         return hello;
     }
 
-    pipe_expert_partial dispatch(const pipe_expert_dispatch_req & request) {
+    pipe_expert_partial dispatch(
+            const pipe_expert_dispatch_req & request,
+            RequestStats & request_stats) {
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
             throw pipe_protocol_error(
                 PIPE_ERR_EXPERT_LAYER,
@@ -1384,6 +1801,10 @@ public:
         for (size_t i = 0; i < request.activations.size(); ++i) {
             activation[i] = ggml_fp16_to_fp32((ggml_fp16_t) request.activations[i]);
         }
+        const bool measure = stats_.enabled();
+        const std::chrono::steady_clock::time_point lookup_started =
+            measure ? std::chrono::steady_clock::now() :
+                      std::chrono::steady_clock::time_point();
         std::vector<const ExpertPage *> pages;
         pages.reserve(request.assignments.size());
         for (const pipe_expert_assignment & assignment : request.assignments) {
@@ -1391,41 +1812,57 @@ public:
                 request.layer, assignment.expert_id
             }));
         }
-        ExpertSlotPool::Batch batch = pool_.ensure_batch(pages);
+        ExpertSlotPool::Batch batch = pool_.ensure_batch(
+            pages, measure, lookup_started);
+        if (measure) {
+            request_stats.ns_lookup  = batch.lookup_ns();
+            request_stats.n_hit      = batch.n_hit();
+            request_stats.n_miss     = batch.n_miss();
+            request_stats.n_host_hit = batch.n_host_hit();
+            request_stats.n_host_demote = batch.n_host_demote();
+            request_stats.bytes_read = batch.bytes_read();
+            request_stats.ns_host_get = batch.ns_host_get();
+            request_stats.host_bytes = batch.host_bytes();
+        }
 
-        std::vector<std::vector<float>> values(request.assignments.size());
+        const std::chrono::steady_clock::time_point compute_started =
+            measure ? std::chrono::steady_clock::now() :
+                      std::chrono::steady_clock::time_point();
+        const size_t result_size =
+            (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd;
+        std::vector<float> sum(result_size, 0.0f);
+        bool have_hits = false;
+        bool have_misses = false;
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            if (!batch.is_hit(i)) {
-                continue;
+            have_hits |= batch.is_hit(i);
+            have_misses |= !batch.is_hit(i);
+        }
+        if (!request.assignments.empty()) {
+            prepare_io(activation, request.n_tokens, request_stats);
+            if (have_hits) {
+                compute_batch(
+                    request, pages, batch, /* hits = */ true,
+                    /* add_previous = */ false, request_stats);
             }
-            values[i] = compute_expert(
-                backend_.get(), catalog_.descriptor, *pages[i],
-                batch.loaded(i), activation, request.n_tokens);
         }
         batch.complete();
-        for (size_t i = 0; i < request.assignments.size(); ++i) {
-            if (batch.is_hit(i)) {
-                continue;
-            }
-            values[i] = compute_expert(
-                backend_.get(), catalog_.descriptor, *pages[i],
-                batch.loaded(i), activation, request.n_tokens);
+        if (measure) {
+            request_stats.ns_read = batch.read_ns();
+            request_stats.ns_h2d    = batch.ns_h2d();
+            request_stats.bytes_h2d = batch.bytes_h2d();
         }
-
-        std::vector<float> sum(
-            (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd, 0.0f);
-        for (size_t j = 0; j < request.assignments.size(); ++j) {
-            const pipe_expert_assignment & assignment =
-                request.assignments[j];
-            const std::vector<float> & value = values[j];
-            for (uint32_t token = 0; token < request.n_tokens; ++token) {
-                const float weight = assignment.weights[token];
-                const size_t base =
-                    (size_t) token * catalog_.descriptor.hparams.n_embd;
-                for (int i = 0; i < catalog_.descriptor.hparams.n_embd; ++i) {
-                    sum[base + (size_t) i] += weight * value[base + (size_t) i];
-                }
-            }
+        if (have_misses) {
+            compute_batch(
+                request, pages, batch, /* hits = */ false,
+                /* add_previous = */ have_hits, request_stats);
+        }
+        if (!request.assignments.empty()) {
+            read_result(sum, request_stats);
+        }
+        if (measure) {
+            request_stats.ns_compute =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - compute_started).count();
         }
 
         pipe_expert_partial response;
@@ -1442,10 +1879,203 @@ public:
         return pool_.resources();
     }
 
+    bool stats_enabled() const {
+        return stats_.enabled();
+    }
+
+    void record_stats(const RequestStats & request, size_t n_experts) {
+        stats_.record(request, n_experts);
+    }
+
 private:
+    void grow_io_buffer(size_t size, RequestStats & request_stats) {
+        if (io_buffer_ && io_buffer_size_ >= size) {
+            return;
+        }
+        buffer_ptr buffer(ggml_backend_alloc_buffer(backend_.get(), size));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate persistent expert IO buffer");
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        io_buffer_ = std::move(buffer);
+        io_buffer_size_ = size;
+        ++request_stats.n_device_allocs;
+    }
+
+    ggml_tensor * make_io_tensor(
+            ggml_context * ctx, uint32_t n_tokens, size_t offset) const {
+        ggml_tensor * tensor = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+        attach_weight(
+            tensor, io_buffer_.get(), ggml_backend_buffer_get_base(io_buffer_.get()), offset);
+        return tensor;
+    }
+
+    void prepare_io(
+            const std::vector<float> & activation,
+            uint32_t n_tokens,
+            RequestStats & request_stats) {
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate expert IO metadata");
+        }
+        ggml_tensor * input = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+        const ggml_backend_buffer_type_t buft =
+            ggml_backend_get_default_buffer_type(backend_.get());
+        const size_t input_size = ggml_backend_buft_get_alloc_size(buft, input);
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        io_result_offset_ = GGML_PAD(input_size, alignment);
+        const size_t result_size = ggml_backend_buft_get_alloc_size(buft, input);
+        grow_io_buffer(io_result_offset_ + result_size, request_stats);
+        attach_weight(
+            input, io_buffer_.get(), ggml_backend_buffer_get_base(io_buffer_.get()), 0);
+        ggml_backend_tensor_set(
+            input, activation.data(), 0, activation.size() * sizeof(float));
+    }
+
+    void compute_batch(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            bool hits,
+            bool add_previous,
+            RequestStats & request_stats) {
+        size_t n_selected = 0;
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            n_selected += batch.is_hit(i) == hits;
+        }
+        if (n_selected == 0) {
+            return;
+        }
+
+        const auto build_started = std::chrono::steady_clock::now();
+        const size_t tensor_count = 12 * n_selected + 8;
+        const size_t graph_nodes = 6 * n_selected + 3;
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                              ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate batched expert graph metadata");
+        }
+
+        ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
+        ggml_set_input(input);
+        ggml_tensor * result = make_io_tensor(
+            ctx.get(), request.n_tokens, io_result_offset_);
+        ggml_tensor * sum = nullptr;
+        std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
+        routing_weights.reserve(n_selected);
+
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (batch.is_hit(i) != hits) {
+                continue;
+            }
+            const ExpertPage & page = *pages[i];
+            const ExpertSlotPool::Loaded loaded = batch.loaded(i);
+            const auto & specs = catalog_.descriptor.layers.at(page.layer);
+            const auto make_weight = [&](const std::string & role) {
+                const RoleSpec & spec = specs.at(role);
+                ggml_tensor * tensor =
+                    ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
+                attach_weight(
+                    tensor, loaded.buffer, loaded.base, page.roles.at(role).offset);
+                return tensor;
+            };
+
+            ggml_tensor * gate = ggml_mul_mat(ctx.get(), make_weight("gate"), input);
+            ggml_tensor * up   = ggml_mul_mat(ctx.get(), make_weight("up"), input);
+            ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate, up);
+            ggml_tensor * output = ggml_mul_mat(ctx.get(), make_weight("down"), hidden);
+            // SHAPE MATTERS: [1, n_tokens], NOT [n_tokens]. output is
+            // [n_embd, n_tokens]; ggml_mul broadcasts src1 into src0 via
+            // ggml_can_repeat, which only checks ne[i] % src1->ne[i] == 0. A
+            // 1-D [n_tokens] tensor PASSES that check (6144 % 8 == 0) and then
+            // scales along the EMBEDDING axis instead of the token axis --
+            // silently wrong, no assert. It is correct only at n_tokens == 1,
+            // where both readings coincide, so decode looked fine while PREFILL
+            // was corrupted and poisoned the KV cache.
+            ggml_tensor * weights =
+                ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, request.n_tokens);
+            ggml_set_input(weights);
+            ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
+            sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
+            routing_weights.emplace_back(weights, &request.assignments[i]);
+        }
+        if (add_previous) {
+            sum = ggml_add(ctx.get(), sum, result);
+        }
+        ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        ggml_build_forward_expand(graph, copy);
+
+        const size_t old_compute_size =
+            ggml_gallocr_get_buffer_size(compute_galloc_.get(), 0);
+        if (!ggml_gallocr_alloc_graph(compute_galloc_.get(), graph)) {
+            throw std::runtime_error("failed to allocate batched expert compute graph");
+        }
+        if (ggml_gallocr_get_buffer_size(compute_galloc_.get(), 0) > old_compute_size) {
+            ++request_stats.n_device_allocs;
+        }
+        request_stats.ns_graph_build +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - build_started).count();
+
+        for (const auto & item : routing_weights) {
+            ggml_backend_tensor_set(
+                item.first, item.second->weights.data(), 0,
+                item.second->weights.size() * sizeof(float));
+        }
+        const auto submit_started = std::chrono::steady_clock::now();
+        const enum ggml_status status =
+            ggml_backend_graph_compute(backend_.get(), graph);
+        request_stats.ns_submit +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - submit_started).count();
+        ++request_stats.n_graph_submits;
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("batched expert backend graph compute failed");
+        }
+    }
+
+    void read_result(std::vector<float> & result, RequestStats & request_stats) {
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate expert result metadata");
+        }
+        const uint32_t n_tokens = (uint32_t) (
+            result.size() / (size_t) catalog_.descriptor.hparams.n_embd);
+        ggml_tensor * output = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
+        const auto readback_started = std::chrono::steady_clock::now();
+        ggml_backend_tensor_get(
+            output, result.data(), 0, result.size() * sizeof(float));
+        request_stats.ns_readback +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - readback_started).count();
+    }
+
     Catalog        catalog_;
     backend_ptr    backend_;
     ExpertSlotPool pool_;
+    galloc_ptr     compute_galloc_;
+    buffer_ptr     io_buffer_;
+    size_t         io_buffer_size_ = 0;
+    size_t         io_result_offset_ = 0;
+    WorkerStats    stats_;
     int            slots_ = 0;
 };
 
@@ -1525,13 +2155,26 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             const pipe_expert_dispatch_req request =
                 pipe_decode_expert_dispatch_req(
                     payload.data(), payload.size(), mine.n_embd);
-            const pipe_expert_partial response = worker.dispatch(request);
+            RequestStats request_stats;
+            const pipe_expert_partial response = worker.dispatch(
+                request, request_stats);
+            const bool measure = worker.stats_enabled();
+            const std::chrono::steady_clock::time_point send_started =
+                measure ? std::chrono::steady_clock::now() :
+                          std::chrono::steady_clock::time_point();
             const std::vector<uint8_t> encoded =
                 pipe_encode_expert_partial(response);
             if (!pipe_send_frame(
                     socket, PIPE_EXPERT_PARTIAL, seq_id,
                     encoded.data(), encoded.size())) {
                 return 1;
+            }
+            if (measure) {
+                request_stats.ns_send =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - send_started).count();
+                worker.record_stats(
+                    request_stats, request.assignments.size());
             }
         } catch (const pipe_protocol_error & error) {
             if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
@@ -1558,6 +2201,7 @@ ResourcePlan inspect_resources(const Options & options) {
         options.device,
         options.slots,
         options.host_budget_bytes,
+        options.host_victim_bytes,
         options.test_hooks);
     return worker.resources();
 }
@@ -1575,6 +2219,7 @@ int run(const Options & options) {
         options.device,
         options.slots,
         options.host_budget_bytes,
+        options.host_victim_bytes,
         options.test_hooks);
     const pipe_expert_hello advertised = worker.hello();
     const ResourcePlan & resources = worker.resources();
@@ -1596,7 +2241,8 @@ int run(const Options & options) {
               << " size_classes=" << (resources.size_classes ? 1 : 0)
               << " staging=" << resources.staging_buffers << "x"
               << resources.staging_buffer_bytes
-              << " host_budget=" << resources.host_budget_bytes << '\n';
+              << " host_budget=" << resources.host_budget_bytes
+              << " host_victim_budget=" << options.host_victim_bytes << '\n';
     for (const SlotClass & slot_class : resources.slot_classes) {
         std::cout << "expert slot class bytes=" << slot_class.size
                   << " slots=" << slot_class.slots

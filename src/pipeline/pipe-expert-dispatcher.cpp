@@ -4,6 +4,9 @@
 #include "pipe-transport.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <set>
 #include <sstream>
@@ -12,6 +15,17 @@
 
 namespace pipe_expert_dispatcher {
 namespace {
+
+using dispatch_clock = std::chrono::steady_clock;
+
+bool dispatch_stats_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_STATS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point end) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+}
 
 std::string endpoint_label(const endpoint & value) {
     return value.host + ":" + std::to_string(value.port);
@@ -43,6 +57,7 @@ struct dispatcher::impl {
         size_t                              worker_index = 0;
         std::vector<pipe_expert_assignment> assignments;
         std::vector<uint8_t>                payload;
+        dispatch_clock::time_point           issued_at;
     };
 
     std::vector<worker>                                 workers;
@@ -56,9 +71,11 @@ struct dispatcher::impl {
     int32_t                                             n_expert      = 0;
     int32_t                                             n_expert_used = 0;
     std::string                                         model_identity;
-    bool                                                usable = true;
+    bool                                                poisoned = false;
+    bool                                                collect_stats = false;
 
-    explicit impl(const std::vector<endpoint> & endpoints) {
+    explicit impl(const std::vector<endpoint> & endpoints) :
+        collect_stats(dispatch_stats_enabled()) {
         if (endpoints.empty()) {
             throw std::invalid_argument("expert dispatcher requires at least one worker endpoint");
         }
@@ -255,8 +272,8 @@ struct dispatcher::impl {
         }
     }
 
-    void invalidate() {
-        usable    = false;
+    void poison() {
+        poisoned  = true;
         in_flight = 0;
         for (worker & value : workers) {
             value.socket.reset();
@@ -291,7 +308,7 @@ struct dispatcher::impl {
                                 uint32_t                                    n_tokens,
                                 const std::vector<uint16_t> &               activations,
                                 const std::vector<pipe_expert_assignment> & assignments) {
-        if (!usable) {
+        if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
         }
         const auto route_it = routes.find(layer);
@@ -314,6 +331,8 @@ struct dispatcher::impl {
             }
         }
 
+        const dispatch_clock::time_point issue_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
         std::vector<planned_request> by_worker(workers.size());
         std::vector<size_t>          assigned_counts(workers.size(), 0);
         for (size_t i = 0; i < workers.size(); ++i) {
@@ -346,12 +365,18 @@ struct dispatcher::impl {
             stats.workers.push_back({
                 workers[request.worker_index].info.endpoint,
                 request.assignments.size(),
+                0,
+                1,
+                request.assignments.size(),
             });
         }
 
         try {
             for (planned_request & request : requests) {
                 worker & value = workers[request.worker_index];
+                if (collect_stats) {
+                    request.issued_at = dispatch_clock::now();
+                }
                 if (!pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_REQ, seq_id, request.payload.data(),
                                      request.payload.size())) {
                     throw std::runtime_error("expert dispatcher failed to send expert(s) " +
@@ -361,11 +386,22 @@ struct dispatcher::impl {
                 ++in_flight;
                 ++stats.requests_issued;
             }
+            if (collect_stats) {
+                stats.ns_issue = elapsed_ns(issue_start, dispatch_clock::now());
+            }
 
             std::vector<float> result((size_t) activation_count, 0.0f);
-            for (planned_request & request : requests) {
+            const dispatch_clock::time_point wait_start =
+                collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+            dispatch_clock::time_point last_response;
+            for (size_t request_index = 0; request_index < requests.size(); ++request_index) {
+                planned_request & request = requests[request_index];
                 std::vector<uint8_t>  payload;
                 const pipe_frame_type type  = await_response(request, seq_id, payload);
+                if (collect_stats) {
+                    last_response = dispatch_clock::now();
+                    stats.workers[request_index].ns_wait = elapsed_ns(request.issued_at, last_response);
+                }
                 worker &              value = workers[request.worker_index];
                 if (type == PIPE_ERROR) {
                     const pipe_error error = pipe_decode_error(payload.data(), payload.size());
@@ -397,13 +433,16 @@ struct dispatcher::impl {
                     result[i] += ggml_fp16_to_fp32((ggml_fp16_t) partial.partial[i]);
                 }
             }
+            if (collect_stats) {
+                stats.ns_wait = elapsed_ns(wait_start, last_response);
+            }
 
             for (const planned_request & request : requests) {
                 update_residency(request.worker_index, layer, request.assignments);
             }
             return result;
         } catch (...) {
-            invalidate();
+            poison();
             throw;
         }
     }

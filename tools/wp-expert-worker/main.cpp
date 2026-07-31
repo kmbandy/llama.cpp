@@ -14,10 +14,12 @@ void print_usage(const char * argv0) {
     std::cout
         << "usage: " << argv0
         << " --shard-manifest PATH --descriptor PATH --device DEVICE"
-        << " --listen HOST:PORT --slots N [--host-budget-bytes N]\n"
+        << " --listen HOST:PORT --slots N [--host-budget-bytes N]"
+        << " [--host-victim-bytes N]\n"
         << "       --slots is the device budget in largest-page equivalents\n"
         << "       staging defaults to up to 16 largest-page buffers\n"
-        << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n";
+        << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n"
+        << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n";
 }
 
 int parse_positive_int(const std::string & text, const char * option) {
@@ -77,6 +79,9 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         } else if (arg == "--host-budget-bytes") {
             options.host_budget_bytes =
                 parse_positive_u64(take(), "--host-budget-bytes");
+        } else if (arg == "--host-victim-bytes") {
+            options.host_victim_bytes =
+                parse_positive_u64(take(), "--host-victim-bytes");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -92,6 +97,13 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
         if (value != nullptr && value[0] != '\0') {
             options.host_budget_bytes =
                 parse_positive_u64(value, "WP_EXPERT_HOST_BUDGET_BYTES");
+        }
+    }
+    if (options.host_victim_bytes == 0) {
+        const char * value = std::getenv("WP_EXPERT_HOST_VICTIM_BYTES");
+        if (value != nullptr && value[0] != '\0') {
+            options.host_victim_bytes =
+                parse_positive_u64(value, "WP_EXPERT_HOST_VICTIM_BYTES");
         }
     }
     return options;

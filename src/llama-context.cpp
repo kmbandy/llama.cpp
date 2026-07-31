@@ -39,6 +39,25 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+class expert_dispatch_decode_scope {
+  public:
+    explicit expert_dispatch_decode_scope(pipe_expert_dispatcher::graph_dispatcher * dispatcher) :
+        dispatcher_(dispatcher) {
+        if (dispatcher_ != nullptr) {
+            dispatcher_->begin_decode();
+        }
+    }
+
+    ~expert_dispatch_decode_scope() {
+        if (dispatcher_ != nullptr) {
+            dispatcher_->end_decode();
+        }
+    }
+
+  private:
+    pipe_expert_dispatcher::graph_dispatcher * dispatcher_;
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -1451,6 +1470,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+    if (expert_dispatch && expert_dispatch->failed()) {
+        const std::string message = expert_dispatch->failure_message();
+        LLAMA_LOG_ERROR("%s: expert dispatch failed: %s\n", __func__, message.c_str());
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -1902,6 +1927,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch.get());
 
     do {
         const auto & ubatch = mctx->get_ubatch();

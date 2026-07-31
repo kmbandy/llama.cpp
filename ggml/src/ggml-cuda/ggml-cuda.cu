@@ -745,7 +745,9 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // reliable even after host-side sync of the source stream, which lets
     // graph kernels read stale input data (see ROCm/hip#3882, #3887).
     // Synchronous cudaMemcpy provides device-wide ordering before returning
-    // to the caller. Cost is negligible — input tensor sizes are small.
+    // to the caller. Cost is not negligible for large transfers (e.g. 12.2 MB
+    // expert pages) — that was true only for the KB-sized activations this
+    // comment originally described.
     CUDA_CHECK(cudaMemcpy((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice));
 }
 
