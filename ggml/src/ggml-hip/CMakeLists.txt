@@ -153,10 +153,6 @@ if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
 endif()
 
-if (GGML_HIP_ROCWMMA_FATTN)
-    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
-endif()
-
 if (NOT GGML_HIP_MMQ_MFMA)
     add_compile_definitions(GGML_HIP_NO_MMQ_MFMA)
 endif()
@@ -168,6 +164,9 @@ endif()
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
+
+# Fast math for HIP, like CUDA's -use_fast_math. Not -ffast-math: that implies -ffinite-math-only, which breaks ggml's INFINITY masking and produces NaNs.
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -funsafe-math-optimizations")
 
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
@@ -195,7 +194,10 @@ endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
-target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math>")
+# NOTE(fork): our -ffast-math was dropped here in the 2026-07-31 upstream sync.
+# Upstream now sets -funsafe-math-optimizations above instead, deliberately:
+# -ffast-math implies -ffinite-math-only, which breaks ggml's INFINITY masking
+# and produces NaNs. Do not reinstate it.
 
 # AITER Triton AOT integration (MAD-188). Off by default; opt in with
 # -DGGML_HIP_AITER=ON. Adds AOT-compiled AITER unified_attention kernels plus

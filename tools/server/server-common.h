@@ -9,9 +9,15 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cinttypes>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <vector>
-#include <cinttypes>
 
 using json = nlohmann::ordered_json;
 
@@ -207,6 +213,9 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // true if the sequence actually contains image/audio chunks.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
@@ -373,3 +382,103 @@ server_tokens format_prompt_rerank(
         mtmd_context * mctx,
         const std::string & query,
         const std::string & doc);
+
+// simple implementation of a pipe
+// used for streaming data between threads
+template<typename T>
+struct server_pipe {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable cv_space;  // fork: signals "space available" to a backpressured writer
+    std::queue<T> queue;
+    std::queue<size_t> sizes;          // fork: per-message payload bytes, parallel to queue
+    size_t queued_bytes = 0;
+    std::atomic<bool> writer_closed{false};
+    std::atomic<bool> reader_closed{false};
+
+    // 0 = unbounded (default)
+    // > 0, write() drops the oldest item once the queue is full
+    size_t max_size = 0;
+
+    // fork: caps for the BLOCKING write(data, bytes) overload below. They bound the
+    // in-flight buffer so a slow client + fast child cannot force the router to buffer
+    // an entire response in RAM. 0 = that particular cap is disabled.
+    size_t max_queue_msgs  = 8192;
+    size_t max_queue_bytes = 64ull * 1024 * 1024; // 64 MiB
+
+    void close_write() {
+        writer_closed.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+
+    void close_read() {
+        reader_closed.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        cv_space.notify_all(); // fork: wake any writer blocked on backpressure
+    }
+
+    // close_on_stop = true: should_stop means the reader is gone for good, so the writer is told the pipe is broken.
+    // close_on_stop = false: should_stop is a per-read deadline and further reads still come, so the pipe stays usable.
+    bool read(T & output, const std::function<bool()> & should_stop, bool close_on_stop = true) {
+        std::unique_lock<std::mutex> lk(mutex);
+        constexpr auto poll_interval = std::chrono::milliseconds(500);
+        while (true) {
+            if (!queue.empty()) {
+                output = std::move(queue.front());
+                queue.pop();
+                if (!sizes.empty()) {
+                    queued_bytes -= sizes.front();
+                    sizes.pop();
+                }
+                cv_space.notify_one(); // fork: a slot freed -- release a backpressured writer
+                return true;
+            }
+            if (writer_closed.load()) {
+                return false; // clean EOF
+            }
+            if (should_stop && should_stop()) { // a null should_stop means "never stop"
+                if (close_on_stop) {
+                    close_read(); // signal broken pipe to writer
+                }
+                return false; // cancelled / deadline reached
+            }
+            cv.wait_for(lk, poll_interval);
+        }
+    }
+
+    bool write(T && data) {
+        std::lock_guard<std::mutex> lk(mutex);
+        if (reader_closed.load()) {
+            return false; // broken pipe
+        }
+        if (max_size > 0) {
+            while (queue.size() >= max_size) {
+                queue.pop(); // drop oldest to stay bounded
+            }
+        }
+        queue.push(std::move(data));
+        cv.notify_one();
+        return true;
+    }
+
+    // fork: bounded, BLOCKING write with byte accounting. Unlike write() above this
+    // never DROPS data -- dropping a chunk would corrupt a proxied response body --
+    // it applies backpressure until the reader drains. At least one message is always
+    // admitted into an empty queue so a single oversized chunk cannot deadlock.
+    bool write(T && data, size_t bytes) {
+        std::unique_lock<std::mutex> lk(mutex);
+        cv_space.wait(lk, [&]() {
+            return reader_closed.load() || queue.empty() ||
+                   ((max_queue_msgs  == 0 || queue.size() < max_queue_msgs) &&
+                    (max_queue_bytes == 0 || queued_bytes + bytes <= max_queue_bytes));
+        });
+        if (reader_closed.load()) {
+            return false; // broken pipe
+        }
+        queued_bytes += bytes;
+        queue.push(std::move(data));
+        sizes.push(bytes);
+        cv.notify_one();
+        return true;
+    }
+};

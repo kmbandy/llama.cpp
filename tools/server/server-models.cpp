@@ -8,12 +8,13 @@
 #include "preset.h"
 #include "download.h"
 #include "fit.h"
+#include "http.h"
+#include "subproc.h"
 
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <cinttypes>
 #include <fstream>
 #include <optional>
-#include <sheredom/subprocess.h>
 
 #include <functional>
 #include <optional>
@@ -31,14 +32,7 @@
 #include <sstream>
 #include <cstring>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <windows.h>
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#ifndef _WIN32
 extern char **environ;
 #endif
 
@@ -65,43 +59,24 @@ static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_T
 #define CHILD_ADDR "127.0.0.1"
 
 struct server_subproc {
-    std::optional<subprocess_s> sproc; // empty while in DOWNLOADING state
+    common_subproc sproc; // not yet spawned while in DOWNLOADING state
     std::atomic<bool> stopped{false}; // set to cancel a download or signal child process exit
 
-    subprocess_s & get() {
-        GGML_ASSERT(sproc.has_value() && "subprocess not initialized");
-        return sproc.value();
-    }
-
     bool is_alive() {
-        return sproc.has_value() && subprocess_alive(&sproc.value());
+        return sproc.alive();
     }
 
     void request_exit() {
-        if (sproc.has_value()) {
-            FILE * stdin_file = subprocess_stdin(&sproc.value());
-            if (stdin_file) {
-                fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-                fflush(stdin_file);
-            }
+        FILE * stdin_file = sproc.stdin_file();
+        if (stdin_file) {
+            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
+            fflush(stdin_file);
         }
         stopped.store(true, std::memory_order_relaxed);
     }
 
     void terminate() {
-        if (!sproc.has_value()) {
-            return;
-        }
-#if defined(_WIN32)
-        if (sproc->hProcess == NULL) {
-            return;
-        }
-#else
-        if (sproc->child <= 0) {
-            return;
-        }
-#endif
-        subprocess_terminate(&sproc.value());
+        sproc.terminate();
     }
 };
 
@@ -272,13 +247,14 @@ void server_model_meta::update_caps() {
             "LLAMA_ARG_MODEL_URL",
             "LLAMA_ARG_MMPROJ",
             "LLAMA_ARG_MMPROJ_URL",
+            "LLAMA_ARG_MMPROJ_AUTO",
             "LLAMA_ARG_HF_REPO",
             "LLAMA_ARG_HF_REPO_FILE",
         });
         params.offline = true;
         common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
         common_models_handler_apply(handler, params); // note: this won't download the model because offline=true
-        if (params.mmproj.path.empty()) {
+        if (params.no_mmproj || params.mmproj.path.empty()) {
             multimodal = { false, false };
         } else {
             multimodal = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -610,25 +586,20 @@ void server_models::parse_model_placement(server_model_meta & meta) {
 void server_models::validate_gpu_slots() {
     std::vector<std::string> args = { bin_path, "--list-devices" };
     std::vector<std::string> env = base_env;
-    std::vector<char *> argv = to_char_ptr_array(args);
-    std::vector<char *> envp = to_char_ptr_array(env);
-    subprocess_s proc;
+    common_subproc proc;
     int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-    int rc = subprocess_create_ex(argv.data(), options, envp.data(), &proc);
-    if (rc != 0) {
+    if (!proc.create(args, options, env)) {
         throw std::runtime_error("failed to spawn --list-devices for router GPU validation");
     }
     std::string output;
-    FILE * stdout_file = subprocess_stdout(&proc);
+    FILE * stdout_file = proc.stdout_file();
     if (stdout_file) {
         char buffer[4096];
         while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
             output += buffer;
         }
     }
-    int exit_code = 0;
-    subprocess_join(&proc, &exit_code);
-    subprocess_destroy(&proc);
+    const int exit_code = proc.join();
     if (exit_code != 0) {
         throw std::runtime_error("--list-devices validation child exited with status " + std::to_string(exit_code));
     }
@@ -803,17 +774,14 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
     child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
     child_env.push_back("LLAMA_SERVER_CHILD_MODE=estimate");
 
-    std::vector<char *> argv = to_char_ptr_array(child_args);
-    std::vector<char *> envp = to_char_ptr_array(child_env);
-    subprocess_s proc;
+    common_subproc proc;
     int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-    int rc = subprocess_create_ex(argv.data(), options, envp.data(), &proc);
-    if (rc != 0) {
+    if (!proc.create(child_args, options, child_env)) {
         throw std::runtime_error("failed to spawn estimate child for model " + meta.name);
     }
 
     std::vector<int64_t> result;
-    FILE * stdout_file = subprocess_stdout(&proc);
+    FILE * stdout_file = proc.stdout_file();
     if (stdout_file) {
         char buffer[128 * 1024];
         while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
@@ -834,9 +802,7 @@ std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta 
             }
         }
     }
-    int exit_code = 0;
-    subprocess_join(&proc, &exit_code);
-    subprocess_destroy(&proc);
+    const int exit_code = proc.join();
     if (exit_code != 0 || result.empty()) {
         throw std::runtime_error("estimate child failed for model " + meta.name);
     }
@@ -1300,6 +1266,7 @@ void server_models::load_models() {
 
         // collect all threads to join in one pass while the lock is held:
         // - monitoring threads from just-unloaded models (to_unload)
+        // - threads of finished downloads (DOWNLOADED), they acquire the mutex on exit
         // - threads of already-UNLOADED models that are being removed from source
         std::vector<std::thread> threads_to_join;
         for (const auto & name : to_unload) {
@@ -1311,6 +1278,13 @@ void server_models::load_models() {
         for (auto & [name, inst] : mapping) {
             if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
                 continue; // downloading models are not from config sources, leave them alone
+            }
+            if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADED) {
+                // joining this thread under the lock deadlocks: it locks the mutex on its way out
+                if (inst.th.joinable()) {
+                    threads_to_join.push_back(std::move(inst.th));
+                }
+                continue;
             }
             if (final_presets.find(name) == final_presets.end() && !inst.meta.is_running() && inst.th.joinable()) {
                 threads_to_join.push_back(std::move(inst.th));
@@ -1327,10 +1301,8 @@ void server_models::load_models() {
             if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
                 ++it; // download thread is still busy, skip
             } else if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADED) {
-                // download finished, safe to erase
-                if (it->second.th.joinable()) {
-                    it->second.th.join();
-                }
+                // download finished, thread is joined above, safe to erase
+                GGML_ASSERT(!it->second.th.joinable());
                 it = mapping.erase(it);
             } else if (final_presets.find(it->first) == final_presets.end()) {
                 SRV_INF("(reload) removing model name=%s (no longer in source)\n", it->first.c_str());
@@ -1489,78 +1461,6 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         }
     }
     return std::nullopt;
-}
-
-static int get_free_port() {
-#ifdef _WIN32
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        return -1;
-    }
-    typedef SOCKET native_socket_t;
-#define INVALID_SOCKET_VAL INVALID_SOCKET
-#define CLOSE_SOCKET(s) closesocket(s)
-#else
-    typedef int native_socket_t;
-#define INVALID_SOCKET_VAL -1
-#define CLOSE_SOCKET(s) close(s)
-#endif
-
-    native_socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET_VAL) {
-#ifdef _WIN32
-        WSACleanup();
-#endif
-        return -1;
-    }
-
-    struct sockaddr_in serv_addr;
-    std::memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serv_addr.sin_port = htons(0);
-
-    if (bind(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) != 0) {
-        CLOSE_SOCKET(sock);
-#ifdef _WIN32
-        WSACleanup();
-#endif
-        return -1;
-    }
-
-#ifdef _WIN32
-    int namelen = sizeof(serv_addr);
-#else
-    socklen_t namelen = sizeof(serv_addr);
-#endif
-    if (getsockname(sock, (struct sockaddr*)&serv_addr, &namelen) != 0) {
-        CLOSE_SOCKET(sock);
-#ifdef _WIN32
-        WSACleanup();
-#endif
-        return -1;
-    }
-
-    int port = ntohs(serv_addr.sin_port);
-
-    CLOSE_SOCKET(sock);
-#ifdef _WIN32
-    WSACleanup();
-#endif
-
-    return port;
-}
-
-// helper to convert vector<string> to char **
-// pointers are only valid as long as the original vector is valid
-static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & vec) {
-    std::vector<char *> result;
-    result.reserve(vec.size() + 1);
-    for (const auto & s : vec) {
-        result.push_back(const_cast<char*>(s.c_str()));
-    }
-    result.push_back(nullptr);
-    return result;
 }
 
 std::vector<server_model_meta> server_models::get_all_meta() {
@@ -1753,7 +1653,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // prepare new instance info
     instance_t inst;
     inst.meta             = meta;
-    inst.meta.port        = get_free_port();
+    inst.meta.port        = common_http_get_free_port();
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
@@ -1786,15 +1686,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
         inst.meta.args = child_args; // save for debugging
 
-        std::vector<char *> argv = to_char_ptr_array(child_args);
-        std::vector<char *> envp = to_char_ptr_array(child_env);
-
         // TODO @ngxson : maybe separate stdout and stderr in the future
         //                so that we can use stdout for commands and stderr for logging
         int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
-        inst.subproc->sproc.emplace();
-        int result = subprocess_create_ex(argv.data(), options, envp.data(), &inst.subproc->get());
-        if (result != 0) {
+        if (!inst.subproc->sproc.create(child_args, options, child_env)) {
             load_attempt_guard.reset();
             throw std::runtime_error("failed to spawn server instance");
         }
@@ -1810,8 +1705,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
         stop_timeout = inst.meta.stop_timeout,
         child_mode = opts.mode
     ]() {
-        FILE * stdin_file = subprocess_stdin(&child_proc->get());
-        FILE * stdout_file = subprocess_stdout(&child_proc->get()); // combined stdout/stderr
+        FILE * stdin_file = child_proc->sproc.stdin_file();
+        FILE * stdout_file = child_proc->sproc.stdout_file(); // combined stdout/stderr
 
         std::thread log_thread([&]() {
             // read stdout/stderr and forward to main server log
@@ -1885,9 +1780,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
 
         // get the exit code
-        int exit_code = 0;
-        subprocess_join(&child_proc->get(), &exit_code);
-        subprocess_destroy(&child_proc->get());
+        int exit_code = child_proc->sproc.join();
 
         // update status and exit code
         if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
@@ -2159,7 +2052,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     return true;
 }
 
-server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
+server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -2193,7 +2086,10 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             req.headers,
             req.body,
             req.files,
-            req.should_stop,
+            // a detached request belongs to a replay session that outlives the client socket:
+            // it reaches the child even when the downstream died during the load wait, the
+            // session buffer is the recipient and DELETE remains the stop
+            detached ? std::function<bool()>([]() { return false; }) : req.should_stop,
             base_params.timeout_read,
             base_params.timeout_write
             );
@@ -2684,6 +2580,10 @@ static std::optional<server_model_meta> resolve_child_for_conv(
 }
 
 void server_models_routes::init_routes() {
+    if (!common_subproc::is_supported()) {
+        throw std::runtime_error("subprocess is not enabled on this build");
+    }
+
     this->get_router_props = [this](const server_http_req & req) {
         std::string name = req.get_param("model");
         if (name.empty()) {
@@ -2757,6 +2657,9 @@ void server_models_routes::init_routes() {
         if (!router_validate_model(name, models, autoload, error_res)) {
             return error_res;
         }
+        if (autoload) {
+            models.ensure_model_ready(name);
+        }
         return models.proxy_request(req, method, name, false);
     };
 
@@ -2777,12 +2680,23 @@ void server_models_routes::init_routes() {
             return error_res;
         }
         // remember which child serves this conversation so the stream routes can route straight
-        // to it without polling, keyed on the exact conv id from the header
-        std::string conv_id = stream_conv_id_from_headers(req.headers);
-        if (!conv_id.empty()) {
-            models.conv_models.remember(conv_id, name);
+        // to it without polling, keyed on the exact conv id from the header. registered before
+        // the load wait so a stop issued while the model loads can erase the entry and cancel
+        // this request instead of leaving an orphan generation
+        std::string conv_id = server_stream_conv_id_from_headers(req.headers);
+        uint64_t ticket = models.conv_models.remember(conv_id, name);
+        bool waited = autoload && models.ensure_model_ready(name);
+        if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
+            SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
+                    conv_id.c_str(), name.c_str());
+            res_err(error_res, format_error_response(
+                    "request cancelled by a stop while the model was loading", ERROR_TYPE_INVALID_REQUEST));
+            return error_res;
         }
-        return models.proxy_request(req, method, name, true); // update last usage for POST request only
+        // a session request that waited for a load detaches from the client socket: the
+        // client may have dropped during the wait (page reload) and the session buffer must
+        // still receive the generation for a later resume
+        return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
@@ -3030,7 +2944,7 @@ void server_models_routes::init_routes() {
     };
 
     this->router_stream_get = [this](const server_http_req & req) {
-        // GET /v1/stream/<conv_id>?from=N. resolve the owning child from the conv_id -> model
+        // GET /v1/stream?conv_id=<id>&from=N. resolve the owning child from the conv_id -> model
         // map, 404 when nothing maps
         auto res = std::make_unique<server_http_res>();
         std::string conv_id = req.get_param("conv_id");
@@ -3040,15 +2954,26 @@ void server_models_routes::init_routes() {
         }
         std::optional<server_model_meta> owner = resolve_child_for_conv(models, conv_id);
         if (!owner.has_value()) {
-            res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
+            // a registered conv whose model is still loading earns a retry: the session appears
+            // once the load ends and the pending request reaches the child
+            auto tracked = models.conv_models.lookup(conv_id);
+            auto meta = tracked.has_value() ? models.get_meta(*tracked) : std::nullopt;
+            bool transient = meta.has_value() && (meta->status == SERVER_MODEL_STATUS_LOADING ||
+                                                  meta->status == SERVER_MODEL_STATUS_DOWNLOADING ||
+                                                  meta->status == SERVER_MODEL_STATUS_DOWNLOADED);
+            if (transient) {
+                res_err(res, format_error_response("Stream owner model is loading, retry later", ERROR_TYPE_UNAVAILABLE));
+            } else {
+                res_err(res, format_error_response("Stream not found or expired", ERROR_TYPE_NOT_FOUND));
+            }
             return res;
         }
         std::string from = req.get_param("from");
-        std::string child_path = "/v1/stream/" + encode_qs(conv_id);
+        std::string child_path = "/v1/stream?conv_id=" + encode_qs(conv_id);
         if (!from.empty()) {
-            child_path += "?from=" + from;
+            child_path += "&from=" + from;
         }
-        SRV_INF("proxying stream resume to model %s on port %d, path=%s\n",
+        SRV_TRC("proxying stream resume to model %s on port %d, path=%s\n",
                 owner->name.c_str(), owner->port, child_path.c_str());
         auto proxy = std::make_unique<server_http_proxy>(
                 "GET",
@@ -3126,7 +3051,7 @@ void server_models_routes::init_routes() {
     };
 
     this->router_stream_delete = [this](const server_http_req & req) {
-        // DELETE /v1/stream/<conv_id>. resolve the owning child via the map and forward only to
+        // DELETE /v1/stream?conv_id=<id>. resolve the owning child via the map and forward only to
         // it, evict_and_cancel is idempotent on the child
         auto res = std::make_unique<server_http_res>();
         std::string conv_id = req.get_param("conv_id");
@@ -3134,7 +3059,7 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("Missing conversation id in path", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        std::string child_path = "/v1/stream/" + encode_qs(conv_id);
+        std::string child_path = "/v1/stream?conv_id=" + encode_qs(conv_id);
         auto owner = resolve_child_for_conv(models, conv_id);
         if (owner.has_value()) {
             httplib::Client cli(CHILD_ADDR, owner->port);
@@ -3143,6 +3068,11 @@ void server_models_routes::init_routes() {
             cli.set_write_timeout(0, STREAM_LOOKUP_TIMEOUT_MS * 1000);
             auto resp = cli.Delete(child_path.c_str());
             (void) resp; // the child logs its own miss when the session is unknown there
+        } else if (auto tracked = models.conv_models.lookup(conv_id); tracked.has_value()) {
+            // the entry exists but its model is still loading: the forget below erases it,
+            // which cancels the request parked in proxy_post before the generation starts
+            SRV_INF("router stop for conv_id=%s while model name=%s is loading, cancelling the pending request\n",
+                    conv_id.c_str(), tracked->c_str());
         } else {
             SRV_WRN("router stop for unknown conv_id=%s, no owning child in the conv map\n",
                     conv_id.c_str());
@@ -3161,76 +3091,10 @@ void server_models_routes::init_routes() {
 // server_http_proxy
 //
 
-// simple implementation of a pipe
-// used for streaming data between threads
-template<typename T>
-struct pipe_t {
-    // Bound the in-flight buffer so a slow client + fast child cannot force the
-    // router to buffer an entire response in RAM. write() blocks (backpressure)
-    // once either cap is hit; at least one message is always allowed through so
-    // an oversized single chunk can never deadlock.
-    static constexpr size_t max_queue_msgs  = 8192;
-    static constexpr size_t max_queue_bytes = 64ull * 1024 * 1024; // 64 MiB
-
-    std::mutex mutex;
-    std::condition_variable cv;        // signals "data available" to the reader
-    std::condition_variable cv_space;  // signals "space available" to the writer
-    std::queue<T> queue;
-    std::queue<size_t> sizes;          // per-message payload bytes, parallel to queue
-    size_t queued_bytes = 0;
-    std::atomic<bool> writer_closed{false};
-    std::atomic<bool> reader_closed{false};
-    void close_write() {
-        writer_closed.store(true, std::memory_order_relaxed);
-        cv.notify_all();
-    }
-    void close_read() {
-        reader_closed.store(true, std::memory_order_relaxed);
-        cv.notify_all();
-        cv_space.notify_all(); // wake any writer blocked on backpressure
-    }
-    bool read(T & output, const std::function<bool()> & should_stop) {
-        std::unique_lock<std::mutex> lk(mutex);
-        constexpr auto poll_interval = std::chrono::milliseconds(500);
-        while (true) {
-            if (!queue.empty()) {
-                output = std::move(queue.front());
-                queue.pop();
-                if (!sizes.empty()) {
-                    queued_bytes -= sizes.front();
-                    sizes.pop();
-                }
-                cv_space.notify_one(); // a slot freed — release a backpressured writer
-                return true;
-            }
-            if (writer_closed.load()) {
-                return false; // clean EOF
-            }
-            if (should_stop()) {
-                close_read(); // signal broken pipe to writer
-                return false; // cancelled / reader no longer alive
-            }
-            cv.wait_for(lk, poll_interval);
-        }
-    }
-    bool write(T && data, size_t bytes) {
-        std::unique_lock<std::mutex> lk(mutex);
-        // block while the queue is full and the reader is still alive; always
-        // admit into an empty queue so a single >cap message can't deadlock.
-        cv_space.wait(lk, [&]() {
-            return reader_closed.load() || queue.empty() ||
-                   (queue.size() < max_queue_msgs && queued_bytes + bytes <= max_queue_bytes);
-        });
-        if (reader_closed.load()) {
-            return false; // broken pipe
-        }
-        queued_bytes += bytes;
-        queue.push(std::move(data));
-        sizes.push(bytes);
-        cv.notify_one();
-        return true;
-    }
-};
+// NOTE(fork): our bounded/blocking pipe_t used to live here. Upstream added its own
+// server_pipe in server-common.h during the 2026-07-31 sync, so the byte-accounting
+// backpressure was grafted onto that type (see its write(data, bytes) overload) and
+// this duplicate was removed.
 
 static std::string to_lower_copy(const std::string & value) {
     std::string lowered(value.size(), '\0');
@@ -3341,7 +3205,7 @@ server_http_proxy::server_http_proxy(
         ) {
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
-    auto pipe = std::make_shared<pipe_t<msg_t>>();
+    auto pipe = std::make_shared<server_pipe<msg_t>>();
 
     if (scheme == "https") {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT

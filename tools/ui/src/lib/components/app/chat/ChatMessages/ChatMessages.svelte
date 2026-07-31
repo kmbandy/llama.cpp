@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { beforeNavigate, afterNavigate } from '$app/navigation';
 	import { ChatMessage, ChatMessageUserPending } from '$lib/components/app';
 	import { setChatActionsContext } from '$lib/contexts';
 	import { MessageRole } from '$lib/enums';
@@ -35,9 +33,6 @@
 	let { messages = [], onUserAction, onMessagesReady }: Props = $props();
 
 	let allConversationMessages = $state<DatabaseMessage[]>([]);
-	let isVisible = $state(false);
-	let previousConversationId = $state<string | null>(null);
-	let previousRouteId = $state<string | null>(null);
 
 	const currentConfig = config();
 
@@ -123,26 +118,10 @@
 		}
 	}
 
-	// Track conversation changes to trigger transition even on same route
+	// Refresh messages whenever the active conversation changes
 	$effect(() => {
-		const conversation = activeConversation();
-		const currentId = conversation?.id ?? null;
-
-		if (currentId !== previousConversationId && previousConversationId !== null) {
-			// Conversation changed - trigger fade out/in
-			isVisible = false;
-			requestAnimationFrame(() => {
-				refreshAllMessages();
-				previousConversationId = currentId;
-				requestAnimationFrame(() => {
-					isVisible = true;
-				});
-			});
-		} else {
-			previousConversationId = currentId;
-			if (conversation) {
-				refreshAllMessages();
-			}
+		if (activeConversation()) {
+			refreshAllMessages();
 		}
 	});
 
@@ -150,23 +129,6 @@
 		void allConversationMessages;
 
 		onMessagesReady?.(displayMessages.length);
-	});
-
-	onMount(() => {
-		requestAnimationFrame(() => {
-			isVisible = true;
-		});
-	});
-
-	beforeNavigate((navigation) => {
-		isVisible = false;
-		previousRouteId = navigation.from?.route.id ?? null;
-	});
-
-	afterNavigate(() => {
-		requestAnimationFrame(() => {
-			isVisible = true;
-		});
 	});
 
 	let siblingInfoByMessageId = $derived(buildSiblingInfoMap(allConversationMessages));
@@ -186,6 +148,8 @@
 			message: DatabaseMessage;
 			toolMessages: DatabaseMessage[];
 			isLastAssistantMessage: boolean;
+			isLastUserMessage: boolean;
+			nextAssistantMessage: DatabaseMessage | null;
 			siblingInfo: ChatMessageSiblingInfo;
 		}> = [];
 
@@ -236,15 +200,33 @@
 				message: msg,
 				toolMessages,
 				isLastAssistantMessage: false,
+				isLastUserMessage: false,
+				nextAssistantMessage: null,
 				siblingInfo
 			});
 		}
 
-		// Mark the last assistant message
+		let lastAssistantIdx = -1;
 		for (let i = result.length - 1; i >= 0; i--) {
 			if (result[i].message.role === MessageRole.ASSISTANT) {
 				result[i].isLastAssistantMessage = true;
+				lastAssistantIdx = i;
 				break;
+			}
+		}
+
+		if (lastAssistantIdx > 0 && result[lastAssistantIdx - 1].message.role === MessageRole.USER) {
+			result[lastAssistantIdx - 1].isLastUserMessage = true;
+		}
+
+		for (let i = 0; i < result.length; i++) {
+			if (result[i].message.role !== MessageRole.USER) continue;
+
+			for (let j = i + 1; j < result.length; j++) {
+				if (result[j].message.role === MessageRole.ASSISTANT) {
+					result[i].nextAssistantMessage = result[j].message;
+					break;
+				}
 			}
 		}
 
@@ -252,17 +234,15 @@
 	});
 </script>
 
-<div
-	class="transition-opacity duration-500 ease-out
-		{isVisible ? 'opacity-100' : 'opacity-0'}
-		{previousRouteId === '/(chat)/chat/[id]' ? '' : 'delay-300'}"
->
-	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, siblingInfo } (message.id)}
+<div>
+	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, isLastUserMessage, nextAssistantMessage, siblingInfo } (message.id)}
 		<ChatMessage
 			class="mx-auto mt-12 w-full max-w-3xl"
 			{message}
 			{toolMessages}
 			{isLastAssistantMessage}
+			{isLastUserMessage}
+			{nextAssistantMessage}
 			{siblingInfo}
 		/>
 	{/each}

@@ -544,6 +544,7 @@ class _Qwen35MtpMixin:
     `mtp.*` to the standard layer-indexed nextn naming so the existing
     tensor_map handles them."""
 
+    supports_mtp_export = True
     hparams: dict[str, Any]
     model_arch: gguf.MODEL_ARCH
     gguf_writer: gguf.GGUFWriter
@@ -649,23 +650,22 @@ class DFlashModel(Qwen3Model):
 
     def set_vocab(self):
         logger.info(f"DFlash: Using tokenizer from target model: {self.target_model_dir}")
+        original_dir = self.dir_model
+        self.dir_model = self.target_model_dir
 
-        vocab = gguf.BpeVocab(self.target_model_dir)
-        logger.info(f"DFlash: Converting target tokenizer {vocab}")
+        # Reuse the target model's own vocab handler (e.g. Gemma-4 needs its
+        # own tokenizer logic, not the Qwen default).
+        from . import get_model_class
+        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+            target_arch = json.load(f)["architectures"][0]
+        target_cls = get_model_class(target_arch)
 
-        tokens = []
-        toktypes = []
-        for text, _, toktype in vocab.all_tokens():
-            tokens.append(text)
-            toktypes.append(toktype)
+        if target_cls is not type(self):
+            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
+        else:
+            super().set_vocab()
 
-        self.gguf_writer.add_tokenizer_model(vocab.tokenizer_model)
-        self.gguf_writer.add_tokenizer_pre("deepseek-v3")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-
-        special_vocab = gguf.SpecialVocab(self.target_model_dir, load_merges=True, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+        self.dir_model = original_dir
 
         mask_token_id = self.hparams.get("dflash_config", {}).get("mask_token_id")
         if mask_token_id is not None:
@@ -756,3 +756,23 @@ class DFlashModel(Qwen3Model):
                 shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
                 logger.info(f"{name + ',':<30} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
                 self.gguf_writer.add_tensor(name, data, raw_dtype=data_qtype)
+
+
+@ModelBase.register("Qwen3DSparkModel")
+class DSparkModel(DFlashModel):
+    # DSpark = DFlash + a semi-autoregressive Markov head
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # normalize the flat DeepSpec schema to DFlash's nested dflash_config
+        self.hparams.setdefault("dflash_config", {
+            k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams
+        })
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
+            return None
+        return super().filter_tensors((name, gen))

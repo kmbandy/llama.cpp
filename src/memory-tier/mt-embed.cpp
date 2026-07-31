@@ -93,7 +93,8 @@ bool EmbeddingModel::ensure_loaded_locked() {
     // what makes the background (off-inference-thread) sweep safe.
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;        // CPU only
-    mparams.use_mmap     = true;     // small model, mmap is fine
+    // small model, mmap is fine (use_mmap became load_mode upstream 2026-07-31)
+    mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
 
     static std::vector<ggml_backend_dev_t> cpu_devices = [] {
         std::vector<ggml_backend_dev_t> devs;

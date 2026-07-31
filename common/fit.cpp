@@ -53,10 +53,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }, &ud);
 
     llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc       = true;
-    mparams_copy.use_mmap       = false;
-    mparams_copy.use_mlock      = false;
-    mparams_copy.use_direct_io  = false;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
     // The memory-fit dry-run only measures device buffer sizes; it must not
     // enable weight paging. With paging on, paged tensors get a null buffer and
     // the graph allocator asserts (ggml-alloc.c: buffer_id >= 0) during the
@@ -143,7 +141,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model, i));
     }
 
-    hp_ngl         = llama_model_n_layer(model);
+    hp_ngl         = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 

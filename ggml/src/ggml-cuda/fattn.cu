@@ -3,7 +3,6 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
-#include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -374,12 +373,37 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE     =   0,
-    BEST_FATTN_KERNEL_TILE     = 200,
-    BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_NONE    =   0,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
+
+static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+            return true;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+#ifndef GGML_CUDA_FA_ALL_QUANTS
+            return false;
+#endif // GGML_CUDA_FA_ALL_QUANTS
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_BF16:
+            return true;
+        // fork: TurboQuant KV cache types. Their VEC kernels are only
+        // instantiated for D in {64, 128, 256}, which the caller checks.
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -478,40 +502,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
-    switch (K->type) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-            break;
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-#ifndef GGML_CUDA_FA_ALL_QUANTS
+    if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // fork: the turbo2/3/4 VEC kernels are only instantiated for D in {64, 128, 256}.
+    // Upstream's kv_type_supported() is type-only, so the head-dim guard lives here.
+    {
+        auto is_turbo_kv = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && K->ne[0] % 64 != 0) {
             return BEST_FATTN_KERNEL_NONE;
-#endif // GGML_CUDA_FA_ALL_QUANTS
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_BF16:
-            break;
-        case GGML_TYPE_TURBO3_0:
-            // turbo3 VEC kernel instantiated for D in {64, 128, 256}.
-            if (K->ne[0] % 64 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            break;
-        case GGML_TYPE_TURBO2_0:
-            // turbo2 VEC kernel instantiated for D in {64, 128, 256}.
-            if (K->ne[0] % 64 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            break;
-        case GGML_TYPE_TURBO4_0:
-            // turbo4 VEC kernel instantiated for D in {64, 128, 256}.
-            if (K->ne[0] % 64 != 0) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            break;
-        default:
-            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     if (mask && mask->ne[2] != 1) {
@@ -576,13 +579,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // Use the WMMA kernel if possible:
-    if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576 && Q->ne[0] != 640) {
-        if (can_use_vector_kernel && Q->ne[1] <= 2) {
-            return BEST_FATTN_KERNEL_VEC;
-        }
-        return BEST_FATTN_KERNEL_WMMA_F16;
-    }
+    // NOTE(fork): the 2026-07-31 upstream sync removed the WMMA flash-attention
+    // kernel entirely (BEST_FATTN_KERNEL_WMMA_F16, ggml_cuda_should_use_wmma_fattn
+    // and fattn-wmma-f16 are all gone upstream), so the "use the WMMA kernel if
+    // possible" block that used to sit here was dropped. Cases that previously
+    // selected WMMA_F16 now fall through to the RDNA4 path below, then to
+    // upstream's general MMA/TILE/VEC tuning. Perf on the HIP cards needs re-checking.
 
     // RDNA4-specific path (tested on Radeon Pro R9700): explicit VEC routing for
     // very small Q->ne[1] (single-query / spec-decode), TILE for small gqa-eff, and
@@ -664,7 +666,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_WMMA_F16:
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -693,9 +694,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
-            break;
-        case BEST_FATTN_KERNEL_WMMA_F16:
-            ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
