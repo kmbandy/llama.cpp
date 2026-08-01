@@ -145,7 +145,7 @@ echo "  [gpu_run] LDS sidecar OK: $(od -An -tu4 -N4 "$LDSFILE" | tr -d ' ')B, pa
 #     - board POSITIVELY reports a different holder                -> REFUSE. That is a real collision.
 #   Escape hatch: DSWS_SKIP_CLAIM_CHECK=1 (say why in the logname).
 if [ "${DSWS_SKIP_CLAIM_CHECK:-0}" != "1" ]; then
-  MCP="${MAD_LAB_MCP_HTTP:-http://100.102.191.30:18800}"
+  MCP="${MAD_LAB_MCP_HTTP:-http://mad-lab-2026.tail322e50.ts.net:18800}"
   CLAIM_JSON=$(curl -s -m 5 "$MCP/board/check?machine=mad-lab-main&resource=gpu%3AR9700" 2>/dev/null)
   if [ -z "$CLAIM_JSON" ]; then
     echo "  [gpu_run] NOTE: board unreachable ($MCP) -- cannot verify claim. Proceeding." >&2
