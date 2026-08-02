@@ -321,7 +321,14 @@ int run(const Options & options) {
         gguf_find_key(first_loaded.first.get(), (architecture + ".hidden_activation").c_str());
     if (activation_id >= 0) {
         activation = required_string(first_loaded.first.get(), architecture + ".hidden_activation");
-    } else if (architecture == "glm-dsa") {
+    } else if (architecture == "glm-dsa" || architecture == "deepseek4") {
+        // NOTE 2026-07-31: this was a one-entry allowlist ("glm-dsa"), so every
+        // other SwiGLU model failed here with a message implying the MODEL was
+        // deficient rather than this list. deepseek4 added on evidence, not
+        // assumption: the GGUF carries deepseek4.swiglu_clamp_exp and
+        // .swiglu_clamp_shexp, which only a SwiGLU FFN emits.
+        // TODO: derive this from the presence of a swiglu_clamp key (or an
+        // explicit activation KV) instead of naming architectures.
         activation = "silu";
     } else {
         throw std::runtime_error(

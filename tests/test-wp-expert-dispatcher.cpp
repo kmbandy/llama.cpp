@@ -562,6 +562,229 @@ struct fault_server {
     }
 };
 
+struct selection_server {
+    int                port;
+    int                delay_ms;
+    int                per_expert_delay_ms;
+    int32_t            expert_first;
+    int32_t            expert_last;
+    uint32_t           n_slots;
+    std::thread        thread;
+    std::exception_ptr error;
+    std::promise<void> ready;
+    std::vector<int32_t> assigned_experts;
+
+    selection_server(int delay_ms, int32_t expert_first, int32_t expert_last, uint32_t n_slots,
+                     int per_expert_delay_ms = 0) :
+        port(reserve_port()),
+        delay_ms(delay_ms),
+        per_expert_delay_ms(per_expert_delay_ms),
+        expert_first(expert_first),
+        expert_last(expert_last),
+        n_slots(n_slots) {
+        std::future<void> listening = ready.get_future();
+        thread = std::thread([this, delay_ms, per_expert_delay_ms, expert_first, expert_last, n_slots]() {
+            try {
+                pipe_socket_ptr server = pipe_socket_t::create_server("127.0.0.1", port);
+                if (!server) {
+                    throw std::runtime_error("selection server failed to listen");
+                }
+                ready.set_value();
+                pipe_socket_ptr client = server->accept();
+                if (!client) {
+                    throw std::runtime_error("selection server failed to accept");
+                }
+
+                pipe_expert_hello hello;
+                hello.role           = PIPE_EXPERT_ROLE_WORKER;
+                hello.hidden_type    = PIPE_HIDDEN_F16;
+                hello.n_embd         = N_EMBD;
+                hello.n_ff_exp       = N_FF_EXP;
+                hello.n_expert       = 151;
+                hello.n_expert_used  = 151;
+                hello.expert_first   = expert_first;
+                hello.expert_last    = expert_last;
+                hello.n_slots        = n_slots;
+                hello.layers         = { LAYER };
+                hello.model_identity = MODEL_IDENTITY;
+                hello.shard_identity = "selection-shard-" + std::to_string(expert_first);
+                std::vector<uint8_t> payload = pipe_encode_expert_hello(hello);
+                require(pipe_send_frame(*client, PIPE_HELLO, 0, payload.data(), payload.size()),
+                        "selection server failed to send HELLO");
+
+                pipe_frame_type type;
+                uint64_t        seq_id = 0;
+                require(pipe_recv_frame(*client, type, seq_id, payload),
+                        "selection server failed to receive client HELLO");
+                require(type == PIPE_HELLO && seq_id == 0,
+                        "selection server expected client HELLO");
+                const std::vector<uint8_t> ack_payload = pipe_encode_expert_hello_ack({ true, "" });
+                require(pipe_send_frame(*client, PIPE_EXPERT_HELLO_ACK, 0,
+                                        ack_payload.data(), ack_payload.size()),
+                        "selection server failed to acknowledge HELLO");
+
+                while (pipe_recv_frame(*client, type, seq_id, payload)) {
+                    require(type == PIPE_EXPERT_DISPATCH_REQ,
+                            "selection server expected expert dispatch");
+                    const pipe_expert_dispatch_req request =
+                        pipe_decode_expert_dispatch_req(payload.data(), payload.size(), N_EMBD);
+                    for (const pipe_expert_assignment & assignment : request.assignments) {
+                        assigned_experts.push_back(assignment.expert_id);
+                    }
+                    const int request_delay = delay_ms + per_expert_delay_ms * (int) request.assignments.size();
+                    if (request_delay > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(request_delay));
+                    }
+                    pipe_expert_partial partial;
+                    partial.layer    = request.layer;
+                    partial.n_tokens = request.n_tokens;
+                    partial.partial.assign((size_t) request.n_tokens * N_EMBD, 0);
+                    payload = pipe_encode_expert_partial(partial);
+                    require(pipe_send_frame(*client, PIPE_EXPERT_PARTIAL, seq_id,
+                                            payload.data(), payload.size()),
+                            "selection server failed to send partial");
+                }
+            } catch (...) {
+                error = std::current_exception();
+                try {
+                    ready.set_exception(error);
+                } catch (...) {
+                }
+            }
+        });
+        listening.get();
+    }
+
+    selection_server(const selection_server &)             = delete;
+    selection_server & operator=(const selection_server &) = delete;
+
+    ~selection_server() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    void finish() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+};
+
+void selection_dispatch(pipe_expert_dispatcher::dispatcher & dispatcher, uint64_t seq_id, int32_t expert) {
+    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), {
+        { expert, { 1.0f } },
+    });
+}
+
+void selection_dispatch_batch(pipe_expert_dispatcher::dispatcher & dispatcher, uint64_t seq_id,
+                              int32_t first_expert, int32_t n_experts) {
+    std::vector<pipe_expert_assignment> assignments;
+    for (int32_t expert = first_expert; expert < first_expert + n_experts; ++expert) {
+        assignments.push_back({ expert, { 1.0f } });
+    }
+    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), assignments);
+}
+
+bool contains_expert(const selection_server & server, int32_t expert) {
+    return std::find(server.assigned_experts.begin(), server.assigned_experts.end(), expert) !=
+           server.assigned_experts.end();
+}
+
+size_t count_experts_in_range(const selection_server & server, int32_t first, int32_t last) {
+    return (size_t) std::count_if(server.assigned_experts.begin(), server.assigned_experts.end(),
+                                  [=](int32_t expert) { return expert >= first && expert <= last; });
+}
+
+void test_speed_split_equal_costs() {
+    require(setenv("WP_DISPATCH_SPEED_SPLIT", "1", 1) == 0, "failed to enable speed-aware dispatch");
+    selection_server first(1, 0, 150, 2);
+    selection_server second(1, 0, 150, 2);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", first.port, "selection-machine" },
+            { "127.0.0.1", second.port, "selection-machine" },
+        });
+        for (int expert = 0; expert < 6; ++expert) {
+            selection_dispatch_batch(dispatcher, (uint64_t) expert, 100 + expert * 6, expert + 1);
+        }
+        for (int expert = 6; expert < 14; ++expert) {
+            selection_dispatch(dispatcher, (uint64_t) expert, expert);
+        }
+    }
+    first.finish();
+    second.finish();
+    require(first.assigned_experts.size() >= 8 && second.assigned_experts.size() >= 8,
+            "equal-cost speed split did not keep the workers balanced");
+}
+
+void test_speed_split_unequal_costs() {
+    require(setenv("WP_DISPATCH_SPEED_SPLIT", "1", 1) == 0, "failed to enable speed-aware dispatch");
+    selection_server fast(8, 0, 150, 2, 1);
+    selection_server slow(1, 0, 150, 2, 2);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", fast.port, "selection-machine" },
+            { "127.0.0.1", slow.port, "selection-machine" },
+        });
+        for (int expert = 0; expert < 6; ++expert) {
+            selection_dispatch_batch(dispatcher, (uint64_t) expert, 100 + expert * 6, expert + 1);
+        }
+        for (int expert = 6; expert < 18; ++expert) {
+            selection_dispatch(dispatcher, (uint64_t) expert, expert);
+        }
+    }
+    fast.finish();
+    slow.finish();
+    const double ratio = (double) count_experts_in_range(fast, 6, 17) /
+                         (double) count_experts_in_range(slow, 6, 17);
+    require(ratio > 1.4 && ratio < 3.0,
+            "marginal-cost speed split did not approach the expected 2:1 ratio: " + std::to_string(ratio));
+}
+
+void test_speed_split_residency_precedence() {
+    require(setenv("WP_DISPATCH_SPEED_SPLIT", "1", 1) == 0, "failed to enable speed-aware dispatch");
+    selection_server fast(1, 0, 150, 2);
+    selection_server slow(8, 0, 150, 2);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", fast.port, "selection-machine" },
+            { "127.0.0.1", slow.port, "selection-machine" },
+        });
+        for (int expert = 0; expert < 6; ++expert) {
+            selection_dispatch(dispatcher, (uint64_t) expert, expert);
+        }
+        selection_dispatch(dispatcher, 6, 1);
+        require(contains_expert(slow, 1), "bootstrap did not place the residency guard expert on the slow worker");
+    }
+    fast.finish();
+    slow.finish();
+    require(slow.assigned_experts.size() > 1 && slow.assigned_experts.back() == 1,
+            "residency did not take precedence over speed");
+}
+
+void test_speed_split_bootstrap_falls_back_to_count() {
+    require(setenv("WP_DISPATCH_SPEED_SPLIT", "1", 1) == 0, "failed to enable speed-aware dispatch");
+    selection_server first(1, 0, 100, 2);
+    selection_server second(10, 0, 100, 1);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", first.port, "selection-machine" },
+            { "127.0.0.1", second.port, "selection-machine" },
+        });
+        for (int expert = 0; expert < 3; ++expert) {
+            selection_dispatch(dispatcher, (uint64_t) expert, expert);
+        }
+        selection_dispatch(dispatcher, 3, 50);
+    }
+    first.finish();
+    second.finish();
+    require(contains_expert(second, 50), "an unidentifiable slope did not fall back to count-based selection");
+}
+
 std::string expect_dispatch_error(fault_mode mode, int32_t expert_id, bool test_poisoned = false) {
     fault_server                           server(mode);
     const pipe_expert_dispatcher::endpoint endpoint = {
@@ -711,6 +934,12 @@ void test_graph_local_failure_short_circuit() {
 
 void run_test() {
     require(setenv("WP_DISPATCH_STATS", "1", 1) == 0, "failed to enable dispatch stats");
+    require(unsetenv("WP_DISPATCH_SPEED_SPLIT") == 0, "failed to disable speed-aware dispatch");
+    test_speed_split_equal_costs();
+    test_speed_split_unequal_costs();
+    test_speed_split_residency_precedence();
+    test_speed_split_bootstrap_falls_back_to_count();
+    require(unsetenv("WP_DISPATCH_SPEED_SPLIT") == 0, "failed to disable speed-aware dispatch");
     temp_dir      temp;
     weight_map    weights;
     const fixture shard_a = make_fixture(temp.path, "shard-a", 0, 1, weights);

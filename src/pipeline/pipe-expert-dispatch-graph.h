@@ -18,11 +18,15 @@ namespace pipe_expert_dispatcher {
 
 class graph_dispatcher {
   public:
+    // last_no_defer_layer: last main-graph MoE layer that must not leave
+    // deferred work pending. Pass hparams.n_layer()-1 so NextN/MTP worker
+    // layers are not treated as the fold successor. -1 = worker HELLO max.
     graph_dispatcher(const std::string & endpoints,
                      int32_t             n_embd,
                      int32_t             n_ff_exp,
                      int32_t             n_expert,
-                     int32_t             n_expert_used);
+                     int32_t             n_expert_used,
+                     int32_t             last_no_defer_layer = -1);
     ~graph_dispatcher();
 
     graph_dispatcher(const graph_dispatcher &)             = delete;
