@@ -194,8 +194,62 @@ if [ "${GPU_RUN_DRY:-0}" = "1" ]; then
   exit 0
 fi
 
+# ---- TELEMETRY: record ACHIEVED clocks/power/temp across the run (2026-07-31) ----
+#   WHY THIS EXISTS. On 2026-07-31 the IDENTICAL bin (beb031c195df, hash-verified) measured
+#   15.4 TF on 07-29 evening and 17.5 TF on 07-31 morning -- +12.5% on BYTE-IDENTICAL code, same
+#   shape, same env, same host. It was NOT thermal (55C/51W before vs 54C/49W after; a 0.69s run
+#   at 5.7% of peak does not move the die). The cause could not be diagnosed because NO RUN IN
+#   THIS PROJECT HAS EVER RECORDED ACHIEVED SCLK -- and the card idles at 42-62MHz against a
+#   2350MHz max, so clock state is very much a live variable.
+#   NOTE $LOG.journal IS NOT TELEMETRY: it is an amdgpu ERROR grep, and is CORRECTLY EMPTY on a
+#   clean run. Do not read its emptiness as missing data. See DSWS_TESTING_LOG.md 80.
+#   Until the drift is explained, ABSOLUTE TF IS SESSION-LOCAL: compare only same-session A/B
+#   against a rebuilt control bin.
+#   SAFETY: host-side sysfs reads in a background shell. Nothing enters the kernel, the hot path,
+#   or the message bus (rule 5); no GPU state is written.
+TELE_PID=""
+GPU_SYS=""
+for _d in /sys/class/drm/card*/device; do
+  if grep -q "PCI_ID=${DSWS_GPU_PCI_ID:-1002:7551}" "$_d/uevent" 2>/dev/null; then GPU_SYS="$_d"; break; fi
+done
+GPU_HWMON=$(echo "$GPU_SYS"/hwmon/hwmon*/ 2>/dev/null | awk '{print $1}')
+if [ -n "$GPU_SYS" ] && [ -r "$GPU_HWMON/freq1_input" ]; then
+  echo "t_ms,sclk_mhz,mclk_mhz,power_w,temp_c,busy_pct" > "$LOG.telemetry"
+  (
+    _t0=$(date +%s%N)
+    while :; do
+      printf '%s,%s,%s,%s,%s,%s\n' \
+        "$(( ($(date +%s%N) - _t0) / 1000000 ))" \
+        "$(( $(cat "$GPU_HWMON/freq1_input" 2>/dev/null || echo 0) / 1000000 ))" \
+        "$(( $(cat "$GPU_HWMON/freq2_input" 2>/dev/null || echo 0) / 1000000 ))" \
+        "$(( $(cat "$GPU_HWMON/power1_average" 2>/dev/null || echo 0) / 1000000 ))" \
+        "$(( $(cat "$GPU_HWMON/temp1_input" 2>/dev/null || echo 0) / 1000 ))" \
+        "$(cat "$GPU_SYS/gpu_busy_percent" 2>/dev/null || echo 0)" \
+        >> "$LOG.telemetry"
+      sleep 0.1
+    done
+  ) &
+  TELE_PID=$!
+else
+  # LOUD, not silent -- a missing instrument that fails quietly is how the drift went unnoticed.
+  echo "  [gpu_run] *** WARNING: no GPU telemetry (sysfs for ${DSWS_GPU_PCI_ID:-1002:7551} not found)." >&2
+  echo "  [gpu_run]     The run proceeds, but achieved sclk will NOT be recorded for it. ***" >&2
+fi
+
 env "$@" 2>&1 | tee "$LOG"
 RC=${PIPESTATUS[0]}
+
+# Stop the sampler AFTER RC is captured so the pipeline's PIPESTATUS is never disturbed.
+if [ -n "$TELE_PID" ]; then
+  kill "$TELE_PID" 2>/dev/null; wait "$TELE_PID" 2>/dev/null
+  awk -F, 'NR>1 && $6>0 {n++; s+=$2; if($2>mx)mx=$2; if(mn==0||$2<mn)mn=$2; m+=$3; p+=$4; if($4>pk)pk=$4; if($5>tmx)tmx=$5}
+           NR>1 {all++}
+           END {
+             if(n>0) printf "  [gpu_run] sclk while busy: mean %d / min %d / max %d MHz  |  mclk mean %d MHz  |  power mean %d / peak %d W  |  temp peak %d C  (%d busy of %d samples)\n", s/n, mn, mx, m/n, p/n, pk, tmx, n, all;
+             else    printf "  [gpu_run] telemetry: %d samples, NONE with gpu_busy>0 (sampler may have missed a short GPU window)\n", all;
+           }' "$LOG.telemetry"
+  echo "  [gpu_run] telemetry -> $LOG.telemetry"
+fi
 
 R1=$(resets)
 

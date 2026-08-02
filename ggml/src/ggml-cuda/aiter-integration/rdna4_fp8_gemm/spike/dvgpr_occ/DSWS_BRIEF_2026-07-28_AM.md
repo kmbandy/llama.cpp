@@ -1,11 +1,50 @@
 # DSWS S1 (MAD-305) — MORNING BRIEF, 2026-07-28
 
+> # ⛔⛔ FULLY SUPERSEDED BY `DSWS_BRIEF_2026-07-30_AM.md` — READ THAT INSTEAD. ⛔⛔
+> The 7.70 figure below is THREE revisions stale (7.70 → 10.2 → 15.2 → 15.4 measured).
+>
+> # ⛔ SUPERSEDED — 2026-07-29. DO NOT ACT ON §0 OR §0.5 AS WRITTEN. ⛔
+>
+> This brief was executed on 2026-07-29 and **its central model was falsified by its own sweep.**
+> Authoritative record: **`DSWS_TESTING_LOG.md` §21–38**; KG decisions `077b53ef` and `4b91ee41`.
+>
+> **1. THE HEADLINE NUMBER IS STALE. §0.5 says 7.70 TF is "THE BEST MEASURED CONFIG WE HAVE". It is not.**
+> `FM=2 FN=4 G=8 ACC_N=4` at `ML8_POOL=64` (superM=256, GROUPS=2) measured **10.2 TF** — +32%, and the
+> first time this kernel cleared 10. **Write results against 10.2.** (§36)
+>
+> **2. THE FEED-RATIO MODEL BEHIND §0 IS FALSIFIED.** §0 was built on `feed-loads/WMMA = (FM+FN)/(FM·FN)`
+> being the frag-grid lever. Two matched-ratio controls killed it: `4×2` vs `2×4` (identical ratio) came
+> in **38% apart**, and `4×1` vs `1×4` (identical ratio) **57% apart**. The real lever is `TOTAL_super` —
+> the SUPER-TILE COUNT, i.e. the number of boundary events — at roughly **1.7× the exponent** of the frag
+> grid. §0's arms E/F were run and are valid DATA; its *interpretation* is wrong. (§30–31, §36)
+>
+> **3. ARMS C AND D IN §0 CANNOT BE RUN AND WOULD HAVE HUNG THE CARD.** §0 predicted `FM=4` lands
+> "EXACTLY at the 128 dyn-VGPR cap". Wrong: the ask is `NFV = roundup16(32 + 8·FM·FN + 2·FM + 2·FN)` =
+> **176**, overshooting by 48 — a permanent 100% `s_alloc_vgpr` failure on every wave, i.e. a rule-3 hang,
+> not a slow run. Caught OFFLINE before dispatch. A build- and host-side NFV gate now refuses it. (§22, §29)
+>
+> **4. THE umr `BLOCK_SIZE=1` FLIP HAS NO REMAINING THROUGHPUT CASE.** Its entire justification was the
+> arm-D projection, which rested on the model in (2). Separately, the premise that the flip once bricked
+> appears WRONG — KG `e4e1c1ef` (2026-06-16) records it TAKING cleanly, oracle OK at 192/240 VGPR; the
+> "never touch umr BLOCK_SIZE" rule in `COOP_STATUS.md:152` postdates that by 8 days and could not be
+> sourced to any incident. Not a recommendation to flip it — a correction to why we would.
+>
+> **WHAT IN THIS BRIEF STILL STANDS:** the 1 WG/CU finding (§0.5), now *reinforced* — it replicated at
+> +63% and +66% across two frag grids, and the 10.2 run is also `ML8_POOL=64`. The `DSWS_ALLOW_NONSTD`
+> discipline. The dyn-VGPR cap algebra in §4. The Kimi consult pipeline in §3.
+
 **SUPERSEDES `DSWS_BRIEF_2026-07-27_AM.md`.** That brief's ranked levers are largely obsolete: three of
 its assumptions were falsified on 2026-07-27, including one of its headline numbers. Read this first.
 
 ---
 
-# 0. ★ FIRST THING: RUN THE 4-CELL FRAG-GRID × OCCUPANCY SWEEP ★
+# 0. ~~★ FIRST THING: RUN THE 4-CELL FRAG-GRID × OCCUPANCY SWEEP ★~~ — DONE 2026-07-29, MODEL FALSIFIED
+
+> **⛔ Arms E and F were run and are valid data (3.8 and 6.3 TF). Arms C and D ARE UNRUNNABLE — `FM=4`
+> needs NFV 176 vs a 128 cap = a permanent grow failure on every wave = a HANG. And the feed-loads/WMMA
+> model this whole section is built on WAS FALSIFIED by two matched-ratio controls. The lever is
+> `TOTAL_super` (super-tile count), not the frag grid. See the banner at the top and
+> `DSWS_TESTING_LOG.md` §21–38. Do not run the commands below as written.**
 
 Fully specified, pre-registered, and blocked last night only because the weight-pager needed the card.
 **Do this before anything else.** All four arms are legal today — no source changes required.
@@ -61,7 +100,13 @@ C/E too since `DSWS2_G` deviates. **Name the deviation in the logname** — that
 
 ---
 
-# 0.5 ★ THE SECONDARY CONFIG — 1 WG/CU, GROUPS=1. THE BEST MEASURED CONFIG WE HAVE. ★
+# 0.5 THE 1 WG/CU CONFIG — ~~THE BEST MEASURED CONFIG WE HAVE~~ **NO LONGER THE BEST (2026-07-29)**
+
+> **⛔ 7.70 TF was beaten on 2026-07-29 by `FM=2 FN=4 G=8 ACC_N=4` at `ML8_POOL=64` — superM=256,
+> GROUPS=2 — which measured 10.2 TF (+32%). WRITE RESULTS AGAINST 10.2, NOT 7.70.**
+> **THE 1 WG/CU FINDING ITSELF STANDS AND IS REINFORCED:** it replicated at +63% and +66% across two
+> different frag grids, and the 10.2 config is also `ML8_POOL=64`. What is stale here is the TF figure
+> and the specific `G=4 ACC_N=4` geometry — not the occupancy conclusion. `DSWS_TESTING_LOG.md` §36–38.
 
 **This is NOT yet the config of record** (it needs the 30-shape sweep to earn that), but it is the
 **fastest configuration ever measured on this kernel** and it should be the baseline for every

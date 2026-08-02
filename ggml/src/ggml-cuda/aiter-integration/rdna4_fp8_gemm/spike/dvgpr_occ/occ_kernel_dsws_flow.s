@@ -643,8 +643,26 @@
 .set LDS_TOTAL_DSWS2, (ARES_OFF + ARES_BYTES)
 // (old single-slot cap check retained; 16640 < 32768 -> always passes. The RING layout below is what
 //  the ring role loops actually use; its own cap check follows.)
-.if LDS_TOTAL_DSWS2 > 65536
-  .error "DSWS2 single-slot operand layout exceeds the 65536B WGP limit"
+// *** GATED ON !SELFSERVE, 2026-07-29. IT WAS BLOCKING THE BEST LEVER WE HAVE MEASURED. ***
+//   This guard sizes the PRE-FLOW SINGLE-SLOT operand layout (BRES/ARES). Under SELFSERVE=1 that
+//   layout is DEAD: the primary path (.Lflow_da_ss_rowblk) self-loads A+B from global, and the pool
+//   is reclaimed (ACC_BASE = OP_BASE, see the reclaim note ~:946). The flow role loops reference only
+//   the FLOW symbols, and LDS_TOTAL_FLOW below is the real cap.
+//   PROVEN DEAD, NOT ASSUMED (2026-07-29): changing BRES_OFF 256 -> 1024 -- which shifts BRES_OFF and
+//   ARES_OFF and nothing else -- produced a BYTE-IDENTICAL bin (sha ff7cf533..., 30,940 B .text) at
+//   FM=2 FN=4 G=4 ACC_N=2 SELFSERVE=1. If any live instruction encoded these offsets the bin would
+//   have moved. (An earlier note claimed the immediates are "emitted unconditionally in the kernel
+//   body" at :479 -- that comment is STALE; the disassembly contains zero ARES_OFF immediates.)
+//   WHY IT MATTERED: the guard enforces G*FM <= 11 at SEGK=256/FN=4, i.e. super-tile M <= 176. On
+//   2026-07-29 coordination (= TOTAL_super = the super-tile count) was measured as the DOMINANT
+//   throughput lever -- exponent -0.68/-0.61 across two independent matched-feed controls, vs -0.39
+//   for the frag grid. Cutting coordination requires RAISING super-tile M, which is exactly what this
+//   guard forbade. See DSWS_TESTING_LOG.md §30.
+//   Kept verbatim for !SELFSERVE, where the single-slot layout is still the real one.
+.if !SELFSERVE
+  .if LDS_TOTAL_DSWS2 > 65536
+    .error "DSWS2 single-slot operand layout exceeds the 65536B WGP limit"
+  .endif
 .endif
 // *** WAS `> 32768` -- a STALE guard from the PRE-FLOW single-slot layout, whose own comment said
 //   "16640 < 32768 -> always passes". It never fired because SEGK was always small. It fires now, and it
@@ -909,7 +927,16 @@
 .set GROWPERMIT_BASE, ((OCCB_PUB_OFF + 4 + 15) & ~15)   // = 336 @ bring-up geometry; [BASE, BASE+128)
 .set BATON_NEXT_OFF,  (GROWPERMIT_BASE + 32*4)          // per-WG round-robin cursor for the next grow-turn (Task 2)
 .set NCOMPUTE,        (WAVES - FIRST_COMPUTE_WID)       // # compute waves = the baton round-robin span
-.if NCOMPUTE < 1
+// *** GUARD WIDENED 1 -> 2 ON 2026-07-31. IT WAS OFF BY ONE. ***
+//   At NCOMPUTE==1 the old `< 1` test PASSED, so BATON_MAGIC evaluated to 0x100000000/1 = 2^32 -- a
+//   33-bit literal no SOP2 operand can encode. WAVES=4 therefore died at the two s_mul_hi_u32 use sites
+//   with a bare `error: invalid operand for instruction` and no hint at the cause. WAVES=3 (NCOMPUTE=0)
+//   was already caught. See DSWS_TESTING_LOG.md 84.
+//   NOTE: 0 here is a PLACEHOLDER, not a working value -- q=mulhi(idx,0) is always 0. It is only safe
+//   because the STAGGER guard below now errors out on this same condition BEFORE any code is emitted.
+//   Keep the two conditions in agreement: widening one without the other yields a kernel that assembles
+//   and silently computes the wrong baton turn.
+.if NCOMPUTE < 2
   .set BATON_MAGIC, 0                                   // invalid geometry; the STAGGER guard below errors out
 .else
   .set BATON_MAGIC, (0x100000000 / NCOMPUTE)           // floor(2^32/NCOMPUTE): unsigned-div magic for idx mod NCOMPUTE.
@@ -918,8 +945,16 @@
 .if STAGGER && ((BATON_NEXT_OFF + 4) > OP_BASE)
   .error "GROWPERMIT/BATON_NEXT overrun OP_BASE -- raise OP_BASE (and kOpBase in occ_dispatch.cpp), or lower POOL_N"
 .endif
-.if STAGGER && (WAVES <= FIRST_COMPUTE_WID)
-  .error "BATON needs WAVES > FIRST_COMPUTE_WID (3): there must be at least one compute wave to seed the opening grow-turn"
+// *** WIDENED 2026-07-31 to match the BATON_MAGIC guard above -- THE TWO MUST AGREE. ***
+//   Was `WAVES <= FIRST_COMPUTE_WID` (i.e. NCOMPUTE < 1), which let WAVES=4 (NCOMPUTE==1) through to a
+//   2^32 BATON_MAGIC and an unexplained `invalid operand` at the s_mul_hi_u32 sites. Now keyed on
+//   NCOMPUTE directly so it fires on exactly the condition that sets BATON_MAGIC=0.
+//   THIS DOES NOT MAKE WAVES=4 WORK -- it makes it FAIL LEGIBLY. A single compute wave is a degenerate
+//   round-robin (idx mod 1 == 0 always); supporting it means bypassing the baton, which is a DESIGN
+//   change, not a guard change. Consequence to know: the WAVES axis is valid only at WAVES >= 5, so
+//   every WAVES sweep in this log silently starts there. See DSWS_TESTING_LOG.md 84.
+.if STAGGER && (NCOMPUTE < 2)
+  .error "BATON needs NCOMPUTE >= 2 (i.e. WAVES >= FIRST_COMPUTE_WID+2 = 5): the grow-turn round-robin needs at least two compute waves. At NCOMPUTE==1 BATON_MAGIC would be 2^32, which no SOP2 operand can encode."
 .endif
 // ---- COUPLED-CURSOR (DECENTASN) group-zero gate. DA_ZDONE = reservation level up to which the WG's banks are
 //   zeroed (top bit ZLOCK = a wave is mid boundary-handle). Lives in the control gap just below OP_BASE; a plain
@@ -5307,17 +5342,25 @@ occ_kernel:
     .rept KSEG_STEPS
       .set ni, 0
       .rept FN
-        s_add_u32  s54, s52, (ni*256)
-        s_addc_u32 s55, s53, 0
-        global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[54:55]
+        // ADDR FOLD: ni*256 folds into the load immediate (see the KDBUF PROLOGUE note); s54/s55 retired.
+        //   Ring-compute self-load path (SELFSERVE/OVERLAP) -- same idiom, outside the measured window.
+        global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[52:53] offset:(ni*256)
         .set ni, ni+1
       .endr
       .set mi, 0
       .rept FM
-        s_mul_i32  s58, s32, mi
-        s_add_u32  s58, s56, s58
-        s_addc_u32 s59, s57, 0
-        global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
+        // MI=0 FOLD (2026-07-29): at mi==0 the three instrs below reduce to s[58:59] = s[56:57] + 0,
+        //   i.e. a pure register copy. Use s[56:57] directly. s56/s57 are set once per rowblk and are
+        //   NEVER written inside the k-loop; the old s_addc already read s57 at this same point, so
+        //   this adds no dependency and no liveness. General over FM. Saves 3 SALU per k-step.
+        .if mi == 0
+          global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[56:57] offset:(ks*16)
+        .else
+          s_mul_i32  s58, s32, mi
+          s_add_u32  s58, s56, s58
+          s_addc_u32 s59, s57, 0
+          global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
+        .endif
         .set mi, mi+1
       .endr
       s_wait_loadcnt 0x0
@@ -5330,8 +5373,14 @@ occ_kernel:
         .endr
         .set mi, mi+1
       .endr
-      s_add_u32  s52, s52, s10
-      s_addc_u32 s53, s53, 0
+      // DEAD-ADVANCE CUT (2026-07-29): same guard as the classic carry-through loop below -- the
+      //   final step's advance is dead because the next segment re-derives s[52:53] from s4/s5 at the
+      //   top of the .Lflow_jloop body. Verified no read of s52 between here and that re-derivation
+      //   (phase_stamp / JDEPTH retire / drain paths touch none of it).
+      .if ks < (KSEG_STEPS - 1)
+        s_add_u32  s52, s52, s10
+        s_addc_u32 s53, s53, 0
+      .endif
       .set ks, ks+1
     .endr
 .else
@@ -6744,6 +6793,30 @@ occ_kernel:
     s_add_u32  s56, s2, s22
     s_addc_u32 s57, s3, 0                           // s[56:57] = A base for this row block/ksi
     s_lshl_b32 s32, s9, 4                           // 16*K A-fragment stride
+// ---- MI=1 HOIST (2026-07-29). s[54:55] IS LIVE FROM HERE TO .Lflow_da_ss_rows_done. ----
+// *** SHARED GUARD -- DO NOT SPLIT THIS CONDITION. ***
+//   The hoist (which WRITES s[54:55]) and the four `.elseif A_MI1_HOISTED && mi == 1` load sites
+//   (which READ them) MUST be enabled together. They were originally two independent conditions
+//   (`.if FM > 1` here, `.rept FM` there); editing one without the other yields a load from an
+//   UNINITIALISED s[54:55] -- a SILENT WRONG C, not a build error. One symbol now gates both, so the
+//   failure mode is impossible by construction. (Kimi K3 review, 2026-07-29, flagged this as the one
+//   fragility in an otherwise-clean change.)
+.set A_MI1_HOISTED, (FM > 1)
+//   The A-frag address mi*s32 + s[56:57] is LOOP-INVARIANT (s32/s56/s57 are set here, once per
+//   rowblk, and are never written inside the k-step loop) yet the old code recomputed it on EVERY
+//   k-step -- KSEG_STEPS x FM times per burst. mi==0 is handled inline (it reduces to a pure copy
+//   of s[56:57]; see the MI=0 FOLD notes); mi==1 is precomputed ONCE, here, into the s54/s55 pair
+//   that the ADDR FOLD just retired from the B path.
+//   *** LIVENESS DECLARATION -- READ BEFORE TOUCHING s54/s55: from this point until
+//   .Lflow_da_ss_rows_done, s54/s55 HOLD THE mi==1 A BASE. Verified 2026-07-29 by scanning all 334
+//   lines of .Lflow_da_ss_rowblk..rows_done: ZERO writes to s54/s55. This file has already been
+//   burned once by an SGPR reused through a .set alias corrupting LIVE state (see :1401), so any
+//   new use of s54/s55 in this region MUST re-verify this. ***
+//   FM>2 falls through to the per-k-step computation unchanged -- correct at any FM, faster at FM<=2.
+.if A_MI1_HOISTED
+    s_add_u32  s54, s56, s32                        // s[54:55] = A base for mi==1 (hoisted, invariant)
+    s_addc_u32 s55, s57, 0
+.endif
 
 .if NOBLOAD
     // *** NOBLOAD ABLATION (2026-07-20). Drops ONLY the carry-through B operand fetch. ***
@@ -6783,18 +6856,35 @@ occ_kernel:
     // ----- PROLOGUE: issue step 0 into FA0/FB0 -----
     .set ni, 0
     .rept FN
-      s_add_u32  s54, s52, (ni*256)
-      s_addc_u32 s55, s53, 0
-      global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[54:55]
+      // ADDR FOLD (2026-07-29): ni*256 is an ASSEMBLY-TIME constant -> fold it into the saddr-form
+      //   immediate instead of materialising a fresh 64-bit base. BIT-IDENTICAL EA (the HW sums
+      //   saddr + vaddr + sign-extended offset in one 64-bit add), identical bytes, identical load
+      //   count (KDBUF_LPT = FM+FN accounting untouched) -- only two dead issue slots removed per
+      //   load. Retires the s54/s55 scratch pair. SAME IDIOM as the A path's offset:(nks*16) three
+      //   lines below, and as occ_kernel_coop.s:901/:1127 from which this B addressing was lifted.
+      //   Measured motive: s_add_co_u32 + s_add_co_ci_u32 were 522 instrs = 22% of the burst window
+      //   (4.2 address instrs per load) vs hipBLASLt's 0.11/WMMA on the same instruction.
+      global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[52:53] offset:(ni*256)
       .set ni, ni+1
     .endr
     bcnt_add BCNT_BLOAD, FN
     .set mi, 0
     .rept FM
-      s_mul_i32  s58, s32, mi
-      s_add_u32  s58, s56, s58
-      s_addc_u32 s59, s57, 0
-      global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:0
+      // MI=0 FOLD (2026-07-29): at mi==0 the three instrs below reduce to s[58:59] = s[56:57] + 0,
+      //   i.e. a pure register copy. Use s[56:57] directly. s56/s57 are set once per rowblk and are
+      //   NEVER written inside the k-loop; the old s_addc already read s57 at this same point, so
+      //   this adds no dependency and no liveness. General over FM. Saves 3 SALU per k-step.
+      .if mi == 0
+        global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[56:57] offset:0
+      .elseif A_MI1_HOISTED && mi == 1
+        // mi==1 base precomputed once per rowblk -- see MI=1 HOIST. s[54:55] is LIVE here.
+        global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[54:55] offset:0
+      .else
+        s_mul_i32  s58, s32, mi
+        s_add_u32  s58, s56, s58
+        s_addc_u32 s59, s57, 0
+        global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:0
+      .endif
       .set mi, mi+1
     .endr
     bcnt_add BCNT_ALOAD, FM
@@ -6810,36 +6900,56 @@ occ_kernel:
       .if nbuf == 0
         .set ni, 0
         .rept FN
-          s_add_u32  s54, s52, (ni*256)
-          s_addc_u32 s55, s53, 0
-          global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[54:55]
+          // ADDR FOLD: ni*256 folds into the load immediate (see the PROLOGUE note); s54/s55 retired.
+          global_load_tr_b64 v[FB0+ni*2:FB0+ni*2+1], v9, s[52:53] offset:(ni*256)
           .set ni, ni+1
         .endr
         bcnt_add BCNT_BLOAD, FN
         .set mi, 0
         .rept FM
-          s_mul_i32  s58, s32, mi
-          s_add_u32  s58, s56, s58
-          s_addc_u32 s59, s57, 0
-          global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:(nks*16)
+          // MI=0 FOLD (2026-07-29): at mi==0 the three instrs below reduce to s[58:59] = s[56:57] + 0,
+          //   i.e. a pure register copy. Use s[56:57] directly. s56/s57 are set once per rowblk and are
+          //   NEVER written inside the k-loop; the old s_addc already read s57 at this same point, so
+          //   this adds no dependency and no liveness. General over FM. Saves 3 SALU per k-step.
+          .if mi == 0
+            global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[56:57] offset:(nks*16)
+          .elseif A_MI1_HOISTED && mi == 1
+            // mi==1 base precomputed once per rowblk -- see MI=1 HOIST. s[54:55] is LIVE here.
+            global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[54:55] offset:(nks*16)
+          .else
+            s_mul_i32  s58, s32, mi
+            s_add_u32  s58, s56, s58
+            s_addc_u32 s59, s57, 0
+            global_load_b64 v[FA0+mi*2:FA0+mi*2+1], v8, s[58:59] offset:(nks*16)
+          .endif
           .set mi, mi+1
         .endr
         bcnt_add BCNT_ALOAD, FM
       .else
         .set ni, 0
         .rept FN
-          s_add_u32  s54, s52, (ni*256)
-          s_addc_u32 s55, s53, 0
-          global_load_tr_b64 v[FB1+ni*2:FB1+ni*2+1], v9, s[54:55]
+          // ADDR FOLD: ni*256 folds into the load immediate (see the PROLOGUE note); s54/s55 retired.
+          global_load_tr_b64 v[FB1+ni*2:FB1+ni*2+1], v9, s[52:53] offset:(ni*256)
           .set ni, ni+1
         .endr
         bcnt_add BCNT_BLOAD, FN
         .set mi, 0
         .rept FM
-          s_mul_i32  s58, s32, mi
-          s_add_u32  s58, s56, s58
-          s_addc_u32 s59, s57, 0
-          global_load_b64 v[FA1+mi*2:FA1+mi*2+1], v8, s[58:59] offset:(nks*16)
+          // MI=0 FOLD (2026-07-29): at mi==0 the three instrs below reduce to s[58:59] = s[56:57] + 0,
+          //   i.e. a pure register copy. Use s[56:57] directly. s56/s57 are set once per rowblk and are
+          //   NEVER written inside the k-loop; the old s_addc already read s57 at this same point, so
+          //   this adds no dependency and no liveness. General over FM. Saves 3 SALU per k-step.
+          .if mi == 0
+            global_load_b64 v[FA1+mi*2:FA1+mi*2+1], v8, s[56:57] offset:(nks*16)
+          .elseif A_MI1_HOISTED && mi == 1
+            // mi==1 base precomputed once per rowblk -- see MI=1 HOIST. s[54:55] is LIVE here.
+            global_load_b64 v[FA1+mi*2:FA1+mi*2+1], v8, s[54:55] offset:(nks*16)
+          .else
+            s_mul_i32  s58, s32, mi
+            s_add_u32  s58, s56, s58
+            s_addc_u32 s59, s57, 0
+            global_load_b64 v[FA1+mi*2:FA1+mi*2+1], v8, s[58:59] offset:(nks*16)
+          .endif
           .set mi, mi+1
         .endr
         bcnt_add BCNT_ALOAD, FM
@@ -6907,9 +7017,8 @@ occ_kernel:
 .if !NOBLOAD
       .set ni, 0
       .rept FN
-        s_add_u32  s54, s52, (ni*256)
-        s_addc_u32 s55, s53, 0
-        global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[54:55]
+        // ADDR FOLD: ni*256 folds into the load immediate (see the KDBUF PROLOGUE note); s54/s55 retired.
+        global_load_tr_b64 v[FB+ni*2:FB+ni*2+1], v9, s[52:53] offset:(ni*256)
         .set ni, ni+1
       .endr
       // BURSTCNT: FN B-load issues this k-step. Pure SALU (ACC may already be live from prior k-steps).
@@ -6917,10 +7026,21 @@ occ_kernel:
 .endif
       .set mi, 0
       .rept FM
-        s_mul_i32  s58, s32, mi
-        s_add_u32  s58, s56, s58
-        s_addc_u32 s59, s57, 0
-        global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
+        // MI=0 FOLD (2026-07-29): at mi==0 the three instrs below reduce to s[58:59] = s[56:57] + 0,
+        //   i.e. a pure register copy. Use s[56:57] directly. s56/s57 are set once per rowblk and are
+        //   NEVER written inside the k-loop; the old s_addc already read s57 at this same point, so
+        //   this adds no dependency and no liveness. General over FM. Saves 3 SALU per k-step.
+        .if mi == 0
+          global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[56:57] offset:(ks*16)
+        .elseif A_MI1_HOISTED && mi == 1
+          // mi==1 base precomputed once per rowblk -- see MI=1 HOIST. s[54:55] is LIVE here.
+          global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[54:55] offset:(ks*16)
+        .else
+          s_mul_i32  s58, s32, mi
+          s_add_u32  s58, s56, s58
+          s_addc_u32 s59, s57, 0
+          global_load_b64 v[FA+mi*2:FA+mi*2+1], v8, s[58:59] offset:(ks*16)
+        .endif
         .set mi, mi+1
       .endr
       // BURSTCNT: FM A global_load_b64 this k-step (SS path — not ds_load).
@@ -6954,8 +7074,15 @@ occ_kernel:
       //   NOTE the reported TF is MEANINGLESS here (it is derived from nominal FLOPs, and no FLOPs ran);
       //   read SPAN ONLY. NEVER SHIP WITH THIS SET.
 .endif
-      s_add_u32  s52, s52, s10
-      s_addc_u32 s53, s53, 0
+      // DEAD-ADVANCE CUT (2026-07-29): on the final k-step this advance computes the B base for a
+      //   step that is never issued -- s[52:53] are rebuilt from s4/s5 at the next .Lflow_da_ss_rowblk
+      //   entry (or die at rows_done), so the last value is dead. Guarded, NOT deleted: every earlier
+      //   step's advance feeds the next iteration's ADDR-FOLD loads, and the KSEG_STEPS==1 degenerate
+      //   loop must simply emit no advance at all. 2 SALU saved once per rowblk burst.
+      .if ks < (KSEG_STEPS - 1)
+        s_add_u32  s52, s52, s10
+        s_addc_u32 s53, s53, 0
+      .endif
       .set ks, ks+1
     .endr
 .endif                                          // DSWS2_KDBUF pipeline vs classic

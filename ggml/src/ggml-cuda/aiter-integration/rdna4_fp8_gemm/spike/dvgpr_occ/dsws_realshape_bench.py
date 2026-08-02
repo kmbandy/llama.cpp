@@ -585,10 +585,49 @@ def run_live(args: argparse.Namespace) -> list[dict[str, object]]:
     #   have been computed for a 96-row tile while the bin wanted 128 -- a silent geometry mismatch of
     #   exactly the kind that wedged the card earlier today. A knob that is a flag on one axis and a
     #   constant on a coupled axis is a trap, not a default.
-    global LIVE_G, LIVE_FM, LIVE_TM
+    # FN ADDED 2026-07-29, for exactly the reason the FM note above gives. FN became an env knob that
+    #   day (DSWS2_FN / build_flow.sh FN); LIVE_TN = LIVE_FN*16 is what every shape's N-PADDING is
+    #   computed against. Left hardcoded at 4, `--fn 2` would have padded N for a 64-col panel while
+    #   the bin wanted 32 -- the identical silent geometry mismatch the FM comment describes, on the
+    #   other axis. DSWS2_FN is also passed to the dispatcher below: without it the host defaults
+    #   FNc=4 and disagrees with the bin (fail-loud via the oracle, but there is no reason to rely on
+    #   that).
+    global LIVE_G, LIVE_FM, LIVE_TM, LIVE_FN, LIVE_TN
     LIVE_G = args.g
     LIVE_FM = args.fm
+    LIVE_FN = args.fn
     LIVE_TM = LIVE_G * 16 * LIVE_FM
+    LIVE_TN = LIVE_FN * 16
+
+    # ---- CONFIG-OF-RECORD PRE-FLIGHT (2026-07-29). Fail BEFORE the first dispatch, not after it. ----
+    # gpu_run.sh refuses a non-standard geometry, and this sweep halts on the first nonzero return --
+    # so without DSWS_ALLOW_NONSTD the run dies one shape in, having burned a card claim, with the
+    # reason buried in a subprocess log. Worse, this script never passed the flag AT ALL, so the
+    # 1 WG/CU config (--pool 64) could not be swept even deliberately.
+    # The flag is NOT auto-emitted on detected deviation: the entire point of DSWS_ALLOW_NONSTD is that
+    # deviating is an EXPLICIT act, and a harness that quietly sets it for you is the exact failure the
+    # guard exists to prevent.
+    deviations = []
+    if args.waves != 16:
+        deviations.append(f"FLOW_WAVES={args.waves} (standard 16)")
+    if args.pool != 128:
+        deviations.append(f"ML8_POOL={args.pool} (standard 128 = 2 WG/CU; 64 = 1 WG/CU)")
+    if args.segk not in (64, 128, 256):
+        deviations.append(f"DSWS2_SEGK={args.segk} (sanctioned {{64,128,256}})")
+    if deviations and not args.allow_nonstd:
+        sys.stderr.write(
+            "REFUSED: this geometry deviates from the config of record and --allow-nonstd was not passed:\n"
+            + "".join(f"    - {d}\n" for d in deviations)
+            + "  gpu_run.sh would refuse every shape. Re-run with --allow-nonstd and name the reason\n"
+              "  in --tag, so the logs record WHY the sweep deviated.\n"
+        )
+        raise SystemExit(2)   # NOT `return 2`: run_live() -> list[dict], an int would reach write_outputs()
+    if deviations and args.tag == "rs":
+        sys.stderr.write(
+            "REFUSED: --allow-nonstd with the default --tag 'rs'. The standing rule is that a deviation\n"
+            "  must be NAMED IN THE LOGNAME. Pass something like --tag secondary_1wgcu.\n"
+        )
+        raise SystemExit(2)
     for shape in SHAPES:
         label, real_m, n, k = shape
         # Ground truth for attribution: we KNOW which shape we are about to dispatch, so the parser must
@@ -615,6 +654,10 @@ def run_live(args: argparse.Namespace) -> list[dict[str, object]]:
             f"{args.tag}_{label}_M{real_m}",
             "--",
         ]
+        if args.allow_nonstd:
+            # gpu_run.sh scans the post-`--` kv list for the literal DSWS_ALLOW_NONSTD=1 (its case arm
+            #   at :83), so it must be spelled exactly and must sit in this list, not the parent env.
+            command.append("DSWS_ALLOW_NONSTD=1")
         if args.chunk:
             command.append(f"ML8_COOP_CHUNK={args.chunk}")
         if args.chunk_maxs:
@@ -626,12 +669,36 @@ def run_live(args: argparse.Namespace) -> list[dict[str, object]]:
             #   anti-brick floor that must never move) this is a designed knob: occ_dispatch.cpp:1599 names
             #   raising it as the remedy, and the check is reactive (measured AFTER the chunk completes).
             command.append(f"ML8_COOP_CHUNK_MAXS={args.chunk_maxs}")
+        # ---- AUTO-POOL (2026-07-29). ML8_POOL DERIVED FROM THE SHAPE, NOT PINNED. ----
+        # MEASURED: on ml8_moe_ffn_gate_up M64 (8 output tiles) the runtime is 100% per-dispatch FIXED
+        #   COST, and that cost SCALES WITH WORKGROUP COUNT, not with work. Sweeping ML8_POOL
+        #   64/16/8/4/2/1 gave real TF 0.1/0.4/0.5/0.5/0.4/0.2 and span/chunk 116k/38k/27.5k/24.8k/
+        #   35k/61k ticks -- a clear interior optimum at 4-8 and a 5x win. Reproduced on
+        #   ml8_moe_ffn_down M64 (different N AND K): 0.111 -> 0.5 TF. Launching all 64 CUs for 8 tiles
+        #   means most WGs ramp up, find nothing, and retire -- AND THAT RAMP IS THE RUNTIME.
+        # THE RULE: keep >=TILES_PER_WG super-tiles per workgroup, capped by --pool.
+        #   Fits both measured ends: M64 (TOTAL_super=64) -> 6, M2048 (TOTAL_super=11520) -> 64.
+        # NOTE TOTAL_super is INDEPENDENT of superM for the small shapes (M=64 gives MTLsuper=1 at both
+        #   superM=256 and 64), so this changes ONLY pool and stays comparable to the pinned-pool table.
+        # NOT ON BY DEFAULT: --pool-auto must be passed. A harness that silently retunes the dispatch
+        #   geometry per shape would make every cross-run comparison meaningless.
+        pool_used = args.pool
+        if args.pool_auto:
+            mtl_super = padded_m // LIVE_TM
+            ntl = padded_n // LIVE_TN
+            n_kseg = k // args.segk if args.segk else 0
+            total_super = mtl_super * ntl * n_kseg
+            pool_used = max(1, min(args.pool, total_super // args.tiles_per_wg))
+            print(f"  [auto-pool] {label} M{real_m}: TOTAL_super={total_super} "
+                  f"(MTLsuper={mtl_super} NTL={ntl} n_kseg={n_kseg}) -> ML8_POOL={pool_used} "
+                  f"(cap {args.pool}, >={args.tiles_per_wg}/WG)", flush=True)
         command += [
             f"SSWIN={args.sswin}",
             f"FLOW_WAVES={args.waves}",
-            f"ML8_POOL={args.pool}",     # config of record: 128 WGs = 2 WG/CU. NEVER let this default.
+            f"ML8_POOL={pool_used}",     # pinned to --pool, or derived per shape under --pool-auto
             "DSWS2_FLOW=1",
             f"DSWS2_FM={LIVE_FM}",
+            f"DSWS2_FN={LIVE_FN}",   # ADDED 2026-07-29 -- host default is FNc=4; unsent, it disagrees with an FN!=4 bin
             f"DSWS2_G={LIVE_G}",
             f"DSWS2_ACC_N={args.acc_n}",
             "FLOW_POOL_N=1",
@@ -698,8 +765,15 @@ def build_parser() -> argparse.ArgumentParser:
     # every self-validation check are untouched by them. G also sets the super-tile M (G*16*FM),
     # which is what the padding correction is computed from.
     live.add_argument("--g", type=int, default=LIVE_G, help="DSWS2_G (super-tile M = G*16*FM)")
-    live.add_argument("--fm", type=int, default=LIVE_FM, choices=(1, 2),
-                      help="DSWS2_FM; MUST match the bin (super-tile M = G*16*FM). Was hardcoded to 1 until 2026-07-26.")
+    live.add_argument("--fm", type=int, default=LIVE_FM, choices=(1, 2, 4, 8),
+                      help="DSWS2_FM; MUST match the bin (super-tile M = G*16*FM). Was hardcoded to 1 until 2026-07-26. "
+                           "Widened 1,2 -> 1,2,4,8 on 2026-07-29: the real limiter is the dyn-VGPR grow target "
+                           "NFV = roundup16(32 + 8*FM*FN + 2*FM + 2*FN) <= 128, which build_flow.sh and occ_dispatch.cpp "
+                           "both now enforce (FM=4 FN=4 needs 176 and is refused; FM=4 FN=2 needs 112 and is fine).")
+    live.add_argument("--fn", type=int, default=LIVE_FN, choices=(1, 2, 4, 8),
+                      help="DSWS2_FN; MUST match the bin (N-panel = FN*16). Hardcoded to 4 until 2026-07-29, while "
+                           "LIVE_TN = FN*16 silently drove every shape's N-PADDING -- the same coupled-axis trap "
+                           "the --fm note describes. Power-of-two only: the DSWS2_PREFETCH P2 block decode is a shift.")
     live.add_argument("--acc-n", type=int, default=3, help="DSWS2_ACC_N (GROUPS = G/ACC_N)")
     live.add_argument("--sswin", type=int, default=32, help="SSWIN control-window depth")
     # CONFIG OF RECORD (kmbandy 2026-07-26): 2 WG/CU = 16 waves x 128 WGs = 2048 resident.
@@ -709,6 +783,20 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--waves", type=int, default=16, help="FLOW_WAVES (selects occ_dsws2_w<N>_flow_gd.bin)")
     live.add_argument("--pool", type=int, default=128, help="ML8_POOL = number of WGs (128 = 2 WG/CU, the config of record)")
     live.add_argument("--tag", type=str, default="rs", help="log-name prefix, so arms do not overwrite each other")
+    # ADDED 2026-07-29. This script never passed DSWS_ALLOW_NONSTD at all, so gpu_run.sh refused every
+    #   shape at --pool 64 and the 1 WG/CU config (the fastest ever measured, +63%) could not be swept
+    #   even deliberately. NOT auto-set on detected deviation: the whole point of the flag is that
+    #   deviating is an EXPLICIT act, so a harness that quietly sets it defeats the guard it satisfies.
+    # ADDED 2026-07-29. See the AUTO-POOL block in run_live() for the measurements behind the rule.
+    live.add_argument("--pool-auto", action="store_true",
+                      help="derive ML8_POOL per shape as min(--pool, TOTAL_super/--tiles-per-wg) instead of pinning it. "
+                           "Measured 5x on ml8_moe_ffn_gate_up M64 and ml8_moe_ffn_down M64, where the runtime is "
+                           "100%% per-dispatch fixed cost that scales with WORKGROUP COUNT, not with work.")
+    live.add_argument("--tiles-per-wg", type=int, default=10,
+                      help="minimum super-tiles per workgroup under --pool-auto (default 10; fits both measured ends)")
+    live.add_argument("--allow-nonstd", action="store_true",
+                      help="pass DSWS_ALLOW_NONSTD=1 to gpu_run.sh, permitting a geometry that deviates from the "
+                           "config of record (e.g. --pool 64 = 1 WG/CU). Requires a non-default --tag naming the reason.")
     # ML8_COOP_CHUNK bounds tiles per dispatch. Unset => the dispatcher's 512-tile compositor-safe
     # default. A large value collapses the problem to ONE chunk, which is what the pre-2026-07-21
     # broken cap did; the 0.75s abort CANNOT fire mid-chunk, only between chunks/reps. RULE 7.
