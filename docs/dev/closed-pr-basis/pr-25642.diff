@@ -1,0 +1,865 @@
+diff --git a/DSV4-MTP-PLAN.md b/DSV4-MTP-PLAN.md
+new file mode 100644
+index 000000000000..2dc2eb83affd
+--- /dev/null
++++ b/DSV4-MTP-PLAN.md
+@@ -0,0 +1,105 @@
++# DeepSeek-V4 MTP for llama.cpp — project plan (started 2026-07-12)
++
++**Goal:** first working V4-Flash MTP (nextn) on llama.cpp: converter mapping + graph
++implementation → ~2× decode (proven 2.2× on Qwen3.6-27B with `--spec-type draft-mtp`).
++Ends in a potential upstream PR + the first public V4-MTP GGUF (rogerai variant).
++
++**Why it doesn't exist:** conversion/deepseek.py drops `mtp.*` ("conversion v0"),
++`src/models/deepseek4.cpp` has zero nextn code (mainline/taco/cchuter all lack it).
++V3.2 (`deepseek32.cpp`) loads nextn "preserved but unused"; qwen35/glm4/step35 have
++working driver integration via `common/speculative.cpp` (`draft-mtp`).
++
++## Authoritative reference (ON DISK)
++`/home/luis/ai/models-hf/deepseek-v4-flash-orig/inference/model.py` — DeepSeek's own
++PyTorch. `class MTPBlock(Block)` (line ~738):
++```
++e = enorm(embed(input_ids))          # embed SHARED with main model
++x = hnorm(x)                          # x = main hidden states [b,s,hc,d]
++x = e_proj(e).unsqueeze(2) + h_proj(x)
++x = Block.forward(x, ...)             # FULL standard V4 layer (MLA attn + MoE + hc)
++logits = head(x, hc_head_fn/scale/base, norm)   # head SHARED; hc_head mixes hc dim
++```
++- MTP layer_id = n_layers (43). NO indexer tensors → uses the non-indexer attn path.
++- embed + lm head shared with main model (no mtp embed/head weights).
++- `e_proj(e) + h_proj(x)` ≡ `eh_proj(concat[e;x])` with W_eh = [W_e | W_h]
++  → pack into existing LLM_TENSOR_NEXTN_EH_PROJ {2*n_embd, n_embd}.
++
++## Source tensors (1,575 under `mtp.0.*`) → GGUF mapping design
++
++| source (mtp.0.) | GGUF name | notes |
++|---|---|---|
++| attn.* (wq_a/wq_b/wkv/wo_a/wo_b, q_norm/kv_norm, attn_sink) | `blk.43.attn_*` (standard V4 names: attn_q_a, attn_q_b, attn_kv, attn_output_a, attn_output_b, attn_q_a_norm, attn_kv_a_norm, attn_sinks) | reuse regular-layer mapping at bid=43 |
++| ffn.experts.N.w1/w2/w3 (+scale) | `blk.43.ffn_{gate,down,up}_exps` | merge 256 experts + FP8-dequant + MXFP4 repack (existing code paths) |
++| ffn.shared_experts.w1/w2/w3 | `blk.43.ffn_{gate,down,up}_shexp` | standard |
++| ffn.gate.weight/bias | `blk.43.ffn_gate_inp` (+ tid2eid?) | match regular layer handling |
++| attn_norm / ffn_norm | `blk.43.attn_norm` / `blk.43.ffn_norm` | standard |
++| hc_attn_* / hc_ffn_* | `blk.43.hc_attn_*` / `blk.43.hc_ffn_*` | standard V4 hc names |
++| e_proj.weight + h_proj.weight | `blk.43.nextn.eh_proj.weight` = concat(W_e, W_h) dim-wise | EXISTING tensor type; FP8: dequant both, concat, requant |
++| enorm.weight | `blk.43.nextn.enorm.weight` | existing |
++| hnorm.weight | `blk.43.nextn.hnorm.weight` | existing |
++| norm.weight | `blk.43.nextn.shared_head_norm.weight` | existing (pre-head norm) |
++| hc_head_fn / hc_head_base / hc_head_scale | `blk.43.nextn.hc_head_{fn,base,scale}` | NEW tensor types (3, small F32) |
++
++## Phases
++- **B (converter)**: conversion/deepseek.py — remove the `mtp.` filter for a
++  `--keep-mtp` mode (or always), rename mtp.0.→model.layers.43. style mapping into
++  the existing modify_tensors flow, special-case the 6 glue tensors + eh_proj concat.
++  gguf-py: add the 3 new NEXTN_HC_HEAD_* tensor types (constants.py, tensor_mapping.py).
++  Verify: converted GGUF has ~1370 tensors incl. blk.43.* + nextn.*.
++- **C (C++)** — detailed design (recon done 2026-07-12 evening):
++  Template = `src/models/qwen35.cpp`, the complete working pattern: `load_block_mtp(il)`
++  at il=n_layer; in build_graph `if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP)
++  return graph_mtp(...)`; graph_mtp contract: input `llm_graph_input_embd_h`
++  {tokens, embd, h (ggml name "mtp_h_input")}; front-end enorm(tok_embd) + hnorm(h)
++  → ggml_concat(dim 0) → eh_proj → layer body → `res->t_h_nextn` (pre-head hidden)
++  → get_rows(inp_out_ids) → shared head → `res->t_logits`. Driver =
++  common/speculative.cpp draft-mtp "single trained head" mode (same as qwen35).
++  V4 specifics (established from reference inference/model.py):
++  1. **MTP layer attention = pure SWA MLA**: no compressor, no indexer
++     (`compress_ratio=None`), base rope_theta, NO YaRN, window=128. deepseek4.cpp
++     already builds this variant for uncompressed trunk layers → reuse at il=43.
++  2. **Hyper-connections**: MTP block is a full V4 Block → hc_attn/hc_ffn machinery
++     (already per-layer in deepseek4.cpp). Tail uses its OWN nextn.hc_head_fn/base/
++     scale to mix hc streams → 1, then nextn.shared_head_norm → shared model.output.
++     (ParallelHead.hc_head: flatten hc → rsqrt-RMS ×; mixes = hc_fn·x; pre =
++     sigmoid(mixes*scale+base)+eps; y = Σ_hc pre·x.)
++  3. **Width wrinkle**: V4 trunk state is hc_mult×n_embd wide (hc streams). MTPBlock
++     takes x [b,s,hc,d]; h_proj applies per-stream (last dim), e_proj(e) broadcast-
++     adds across hc. So: (a) target graph must expose t_h_nextn = pre-hc_head trunk
++     state (hc*d wide), (b) driver width assert
++     (`n_embd == llama_model_n_embd(tgt)`) needs hc-aware width, (c) in the MTP
++     graph, eh_proj applies per-hc-stream (3D view [d, hc, n_tokens]).
++  4. **KV cache filter**: deepseek4's llama_kv_cache_dsv4 block in llama-model.cpp
++     needs the STEP35-style ctx_type filter (MTP ctx → il >= n_layer only) so
++     ctx_dft allocates cells for just the SWA MTP layer (tiny: window 128).
++  5. **Loader**: read LLM_KV_NEXTN_PREDICT_LAYERS; loop one extra il with the
++     uncompressed-layer tensor set (compressor/indexer TENSOR_NOT_REQUIRED at
++     il>=n_layer) + glue: eh_proj {2*n_embd,n_embd}, enorm/hnorm/shared_head_norm
++     {n_embd}, hc_head_fn {hc_dim, hc_mult}, hc_head_base {hc_mult},
++     hc_head_scale {1}. llama-arch.cpp: 3 new nextn.hc_head_* names +
++     LLM_TENSOR_INFOS entries.
++  6. **Main-graph addition**: set res->t_h_nextn in deepseek4's trunk graph
++     (pre-hc_head state) so the driver can capture verify_h rows.
++- **D (validate/ship)**: draft-mtp acceptance rate + output-identity checks,
++  quantize Q4_K-MTP (pin nextn/indexer/attn Q8: llama-quantize --tensor-type),
++  benchmark tok/s vs 16.5 no-spec, upstream PR, rogerai HF GGUF.
++
++## Workspace
++- Dev tree: `/home/luis/ai/build/llama.cpp-mtp-dev` (branch `dsv4-mtp`, worktree of
++  the pr25545 clone, base e624d0f = master+#25545).
++- Source weights: `/home/luis/ai/models-hf/deepseek-v4-flash-orig` (149GiB — KEEP).
++- No-MTP convert output `/home/luis/ai/models/deepseek-v4-flash-q8-mtp.gguf` (156GB,
++  MXFP4 experts + Q8, NO nextn) — reproducible; delete if disk needed.
++- Convert cmd: `PYTHONPATH=gguf-py TMPDIR=/home/luis/ai/models/.convtmp
++  vllm-venv/bin/python convert_hf_to_gguf.py <src> --outfile <out> --outtype q8_0
++  --use-temp-file` (/tmp is 8G tmpfs; converter OOMs without temp-file).
++- Serve/fit recipe for 175GB-class: see `~/ai/build/serve-q4.sh` + `bench-env.sh down`.
++- MTP flags: `--spec-type draft-mtp --spec-draft-n-max 3 --parallel 1`.
++
++## Key files
++- conversion/deepseek.py (`DeepseekV4Model`, `filter_tensors` drops mtp.*, line ~509)
++- gguf-py/gguf/constants.py + tensor_mapping.py (tensor enums/names)
++- src/llama-arch.cpp (~line 492: NEXTN names; per-arch usage via llama-model.cpp)
++- src/models/deepseek4.cpp (no nextn yet), deepseek32.cpp (loads nextn, lines 141-150),
++  qwen35.cpp (working MTP graph), common/speculative.cpp (~line 1200: draft-mtp driver)
++- DeepSeek ref: models-hf/deepseek-v4-flash-orig/inference/model.py (MTPBlock ~738)
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 580728a2001e..7a7e6aaaad75 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1242,8 +1242,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         auto * ctx_dft = this->params.ctx_dft;
+         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
+ 
+-        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+-        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
++        n_embd = llama_model_n_embd_nextn(llama_get_model(ctx_dft));
++        GGML_ASSERT(n_embd == llama_model_n_embd_nextn(llama_get_model(ctx_tgt)) &&
+                 "MTP input row width must match the target h_nextn width");
+         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+ 
+@@ -1462,6 +1462,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+             }
+ 
++            // debug: per-row stats of the captured target h_nextn (enable with -lv 2+)
++            {
++                const float * h0 = verify_h[seq_id].data();
++                float mn = h0[0], mx = h0[0]; double sum = 0.0;
++                for (int32_t k = 0; k < n_embd; ++k) {
++                    mn = std::min(mn, h0[k]); mx = std::max(mx, h0[k]); sum += h0[k];
++                }
++                SPC_TRC("verify_h seq=%d rows=%d width=%d row0 min=%.4f max=%.4f mean=%.6f\n",
++                        (int) seq_id, n_rows, n_embd, mn, mx, sum / n_embd);
++            }
++
+             std::memcpy(pending_h[seq_id].data(),
+                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+         }
+diff --git a/conversion/deepseek.py b/conversion/deepseek.py
+index ea6ae23d58e7..fc9ece02bb79 100644
+--- a/conversion/deepseek.py
++++ b/conversion/deepseek.py
+@@ -475,10 +475,8 @@ def set_gguf_parameters(self):
+ @ModelBase.register("DeepseekV4ForCausalLM")
+ class DeepseekV4Model(TextModel):
+     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+-    _skipped_mtp_tensors = 0
+ 
+     def __init__(self, *args, **kwargs):
+-        type(self)._skipped_mtp_tensors = 0
+         super().__init__(*args, **kwargs)
+ 
+         with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+@@ -489,29 +487,37 @@ def __init__(self, *args, **kwargs):
+         self.block_count = self.hparams["num_hidden_layers"]
+         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+ 
++        # NextN/MTP blocks are stored under mtp.{i}.* and are structurally full V4
++        # layers (attention + MoE + hc) plus a few glue tensors. Rekey them to
++        # layers.{n_layer + i}.* so the standard DSV4 machinery (FP8 scale pairing,
++        # dtype collection, expert merging, MXFP4 repack) applies unchanged.
++        self._n_nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
++        if self._n_nextn:
++            n_kept = 0
++            for name in list(self.model_tensors.keys()):
++                m = re.match(r"mtp\.(\d+)\.(.*)", name)
++                if m is not None:
++                    new_key = f"layers.{self.block_count + int(m.group(1))}.{m.group(2)}"
++                    self.model_tensors[new_key] = self.model_tensors.pop(name)
++                    n_kept += 1
++            if n_kept:
++                logger.info("Keeping %d DeepSeek-V4 MTP tensor(s) as NextN layer(s) %d..%d",
++                            n_kept, self.block_count, self.block_count + self._n_nextn - 1)
++        # e_proj/h_proj pairs awaiting concat into nextn.eh_proj, keyed by layer id
++        self._mtp_proj: dict[int, dict[str, Tensor]] = {}
++
+         self._dsv4_fp8_dequantized: set[str] = set()
+         self._dsv4_bf16_tensors: set[str] = set()
+         self._dsv4_f32_tensors: set[str] = set()
+         self._dsv4_mxfp4_generated = False
+         self._collect_source_dtypes()
+ 
+-        if type(self)._skipped_mtp_tensors:
+-            logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0", type(self)._skipped_mtp_tensors)
+-
+         # add a default chat template; if the model has a built-in template, it will be overridden later
+         template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
+         if template_path.is_file():
+             with open(template_path, "r", encoding="utf-8") as f:
+                 self.gguf_writer.add_chat_template(f.read())
+ 
+-    @classmethod
+-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+-        name, _ = item
+-        if name.startswith("mtp."):
+-            cls._skipped_mtp_tensors += 1
+-            return None
+-        return super().filter_tensors(item)
+-
+     @staticmethod
+     def _float8_dtypes() -> tuple[torch.dtype, ...]:
+         return tuple(
+@@ -542,6 +548,12 @@ def set_gguf_parameters(self):
+         super().set_gguf_parameters()
+         hparams = self.hparams
+ 
++        # llama.cpp convention (matches qwen35/glm): block_count includes the
++        # NextN/MTP layer(s); n_layer() is derived as block_count - nextn_predict_layers.
++        if self._n_nextn:
++            self.gguf_writer.add_block_count(self.block_count + self._n_nextn)
++            self.gguf_writer.add_nextn_predict_layers(self._n_nextn)
++
+         self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+         self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+         self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+@@ -670,7 +682,8 @@ def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+             return ()
+ 
+         consumed: list[str] = self._write_hash_routing_tensors()
+-        for bid in range(self.block_count):
++        # includes the NextN/MTP layer(s) at bid >= block_count, which carry their own experts
++        for bid in range(self.block_count + self._n_nextn):
+             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
+             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
+             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
+@@ -737,6 +750,14 @@ def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_
+             "ffn.shared_experts.w1.weight": (gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight"),
+             "ffn.shared_experts.w2.weight": (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight"),
+             "ffn.shared_experts.w3.weight": (gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight"),
++            # NextN/MTP glue tensors — only present on the MTP layer(s) (bid >= n_layer);
++            # e_proj/h_proj are handled separately in modify_tensors (concat -> eh_proj).
++            "enorm.weight": (gguf.MODEL_TENSOR.NEXTN_ENORM, ".weight"),
++            "hnorm.weight": (gguf.MODEL_TENSOR.NEXTN_HNORM, ".weight"),
++            "norm.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
++            "hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
++            "hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
++            "hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
+         }
+ 
+         tensor_name = match.group(2)
+@@ -752,6 +773,21 @@ def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iter
+         if re.match(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$", name):
+             return []
+ 
++        # NextN/MTP e_proj + h_proj: the reference computes e_proj(e) + h_proj(x),
++        # which equals eh_proj(concat[e; x]) with W_eh = [W_e | W_h]. Stash the pair
++        # and emit a single nextn.eh_proj tensor matching the established GGUF shape
++        # {2*n_embd, n_embd} used by other MTP-capable archs.
++        m = re.match(r"layers\.(\d+)\.(e_proj|h_proj)\.weight$", name)
++        if m is not None:
++            proj_bid = int(m.group(1))
++            parts = self._mtp_proj.setdefault(proj_bid, {})
++            parts[m.group(2)] = data_torch
++            if len(parts) < 2:
++                return []
++            eh = torch.cat((parts["e_proj"], parts["h_proj"]), dim=1)  # [n_embd, 2*n_embd]
++            del self._mtp_proj[proj_bid]
++            return [(self._format_dsv4_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, proj_bid, ".weight"), eh)]
++
+         tensor_key, suffix = self._map_dsv4_tensor_name(name, bid)
+         if tensor_key == gguf.MODEL_TENSOR.FFN_GATE_TID2EID:
+             return []
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 63ac2ed1f5cf..ee2e867c9f8b 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -951,6 +951,9 @@ class MODEL_TENSOR(IntEnum):
+     NEXTN_HNORM            = auto()
+     NEXTN_SHARED_HEAD_HEAD = auto()
+     NEXTN_SHARED_HEAD_NORM = auto()
++    NEXTN_HC_HEAD_FN       = auto()  # deepseek4: MTP block's hyper-connection head mixer
++    NEXTN_HC_HEAD_BASE     = auto()
++    NEXTN_HC_HEAD_SCALE    = auto()
+     # eagle3
+     FC                     = auto()  # feature fusion layer
+     D2T                    = auto()  # draft to target vocabulary mapping
+@@ -1560,6 +1563,9 @@ class MODEL_TENSOR(IntEnum):
+     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
+     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
+     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
++    MODEL_TENSOR.NEXTN_HC_HEAD_FN:          "blk.{bid}.nextn.hc_head_fn",
++    MODEL_TENSOR.NEXTN_HC_HEAD_BASE:        "blk.{bid}.nextn.hc_head_base",
++    MODEL_TENSOR.NEXTN_HC_HEAD_SCALE:       "blk.{bid}.nextn.hc_head_scale",
+     MODEL_TENSOR.FC:                        "fc",
+     MODEL_TENSOR.D2T:                       "d2t",
+ }
+@@ -3238,6 +3244,14 @@ class MODEL_TENSOR(IntEnum):
+         MODEL_TENSOR.FFN_GATE_SHEXP,
+         MODEL_TENSOR.FFN_DOWN_SHEXP,
+         MODEL_TENSOR.FFN_UP_SHEXP,
++        # NextN/MTP block (layer id == n_layer): a full V4 layer + these glue tensors
++        MODEL_TENSOR.NEXTN_EH_PROJ,
++        MODEL_TENSOR.NEXTN_ENORM,
++        MODEL_TENSOR.NEXTN_HNORM,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
++        MODEL_TENSOR.NEXTN_HC_HEAD_FN,
++        MODEL_TENSOR.NEXTN_HC_HEAD_BASE,
++        MODEL_TENSOR.NEXTN_HC_HEAD_SCALE,
+     ],
+     MODEL_ARCH.ERNIE4_5_MOE: [
+         MODEL_TENSOR.TOKEN_EMBD,
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 72968607db80..b7bd55526c95 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -498,6 +498,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
+     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_FN,                       "blk.%d.nextn.hc_head_fn" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_BASE,                     "blk.%d.nextn.hc_head_base" },
++    { LLM_TENSOR_NEXTN_HC_HEAD_SCALE,                    "blk.%d.nextn.hc_head_scale" },
+     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
+     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
+     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
+@@ -846,6 +849,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_FN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_BASE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
++    {LLM_TENSOR_NEXTN_HC_HEAD_SCALE,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     // Nemotron 3 Super
+     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
+     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index b74d53af4a32..50bf2f1ea0da 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -608,6 +608,9 @@ enum llm_tensor {
+     LLM_TENSOR_NEXTN_HNORM,
+     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
+     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
++    LLM_TENSOR_NEXTN_HC_HEAD_FN,
++    LLM_TENSOR_NEXTN_HC_HEAD_BASE,
++    LLM_TENSOR_NEXTN_HC_HEAD_SCALE,
+     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+     LLM_TENSOR_MASKED_EMBD_ORDERING,
+     LLM_TENSOR_FC,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3a469bc90bd9..27a1efb9fb2e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -910,7 +910,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+             throw std::runtime_error("no nextn embeddings");
+         }
+ 
+-        const uint32_t n_embd = model.hparams.n_embd_out();
++        const uint32_t n_embd = model.hparams.n_embd_nextn();
+ 
+         if (!cparams.embeddings_nextn_masked) {
+             // unmasked: nextn rows are stored densely, indexed by raw token position.
+@@ -1501,9 +1501,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
+     // extract nextn embeddings (hidden state before the final output norm)
+     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
++        // note: nextn rows can be wider than n_embd_out (e.g. deepseek4 hc state)
+         GGML_ASSERT(backend_h != nullptr);
+ 
+-        const uint32_t n_embd = hparams.n_embd_out();
++        const uint32_t n_embd = hparams.n_embd_nextn();
+         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
+         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+     }
+@@ -1678,7 +1679,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     const auto & hparams = model.hparams;
+ 
+     const int64_t n_vocab = vocab.n_tokens();
+-    const int64_t n_embd  = hparams.n_embd_inp();
++    int64_t n_embd = hparams.n_embd_inp();
++    // MTP draft batches carry h_nextn rows via the embd channel; for models whose
++    // nextn state is wider than the input embedding (e.g. deepseek4 hyper-connections)
++    // the batch rows are sized accordingly.
++    if (cparams.embeddings_nextn && hparams.n_embd_nextn() > (uint32_t) n_embd) {
++        n_embd = hparams.n_embd_nextn();
++    }
+ 
+     // when computing embeddings, all tokens are output
+     const bool output_all   = cparams.embeddings;
+@@ -1956,7 +1963,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                 GGML_ASSERT(backend_h != nullptr);
+ 
+-                const uint32_t n_embd  = hparams.n_embd_out();
++                const uint32_t n_embd  = hparams.n_embd_nextn();
+                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+ 
+                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+@@ -2068,12 +2075,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+ 
+     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
+     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
+-    embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
++    const size_t n_embd_nextn = model.hparams.n_embd_nextn();
++
++    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max  : 0;
+ 
+     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
+         // unmasked: nextn row exists for every token in the batch, not just
+         // those flagged via batch.logits[i] -> size by token count instead.
+-        embd_nextn.size = (size_t) n_embd_out * n_batch;
++        embd_nextn.size = n_embd_nextn * n_batch;
+     }
+ 
+     for (bool enabled : cparams.embeddings_layer_inp) {
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 348bbae95770..d756f99a335e 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -19,6 +19,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+ // Get the default ggml_type for a given ftype.
+ LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+ 
++// width of the hidden-state rows exchanged with the NextN/MTP head
++// (n_embd_out unless the arch overrides it, e.g. deepseek4 -> hc_mult*n_embd)
++LLAMA_API int32_t llama_model_n_embd_nextn(const struct llama_model * model);
++
+ struct quantize_state_impl;
+ 
+ LLAMA_API quantize_state_impl * llama_quant_init(
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index 9d0683d2fec4..6676f2707be9 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -112,6 +112,10 @@ uint32_t llama_hparams::n_embd_out() const {
+     return n_embd_out_impl > 0 ? n_embd_out_impl : n_embd;
+ }
+ 
++uint32_t llama_hparams::n_embd_nextn() const {
++    return n_embd_nextn_impl > 0 ? n_embd_nextn_impl : n_embd_out();
++}
++
+ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
+     if (il < n_layer_all) {
+         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 8be5f28f39e6..688527581885 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -197,6 +197,11 @@ struct llama_hparams {
+     // output embedding dimension (0 = use n_embd)
+     uint32_t n_embd_out_impl = 0;
+ 
++    // width of the hidden-state rows exchanged with the NextN/MTP head.
++    // 0 = same as n_embd_out(). deepseek4 sets this to hc_mult*n_embd because the
++    // MTP block consumes the full hyper-connection state.
++    uint32_t n_embd_nextn_impl = 0;
++
+     // llama4 smallthinker
+     uint32_t n_moe_layer_step        = 0;
+     uint32_t n_no_rope_layer_step    = 4;
+@@ -325,6 +330,7 @@ struct llama_hparams {
+ 
+     // dimension of output embeddings
+     uint32_t n_embd_out() const;
++    uint32_t n_embd_nextn() const;
+ 
+     // dimension of key/value embeddings for each head (per layer)
+     uint32_t n_embd_head_k(uint32_t il = 0) const;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index e70583e64152..f5cd294ce45d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1412,7 +1412,11 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
+ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
+-    if (attn_rot_k) {
++    // n_embd_head_k_all == 0 when the layer filter selected no layers for this
++    // cache (e.g. an MTP draft context on a model whose MTP block has no
++    // compressed-attention layers); 0 % nrot never terminates the loop below
++    // and ends in a division by zero.
++    if (attn_rot_k && n_embd_head_k_all > 0) {
+         int nrot = 64;
+ 
+         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index eaf3f35d2d8e..6be0f4bbd1e3 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2171,7 +2171,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                     }
+ 
+-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
++                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_DEEPSEEK4) && hparams.n_layer_nextn > 0) {
+                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                         } else {
+@@ -2351,6 +2351,10 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
+     return model->hparams.n_embd_out();
+ }
+ 
++int32_t llama_model_n_embd_nextn(const llama_model * model) {
++    return model->hparams.n_embd_nextn();
++}
++
+ int32_t llama_model_n_layer(const llama_model * model) {
+     return model->hparams.n_layer();
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 45b054cedf1d..f596eabc0279 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -219,6 +219,11 @@ struct llama_layer_nextn {
+     struct ggml_tensor * shared_head_head_s    = nullptr;
+     struct ggml_tensor * shared_head_head_in_s = nullptr;
+     struct ggml_tensor * shared_head_norm      = nullptr;
++
++    // deepseek4: MTP block's own hyper-connection head mixer
++    struct ggml_tensor * hc_head_fn            = nullptr;
++    struct ggml_tensor * hc_head_base          = nullptr;
++    struct ggml_tensor * hc_head_scale         = nullptr;
+ };
+ 
+ struct llama_layer {
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index aebbc1ffb6f1..87bcee3a3cef 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -297,6 +297,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+     // This used to be a regex, but <regex> has an extreme cost to compile times.
+     bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
+ 
++    // never quantize integer tensors - they are lookup/routing tables
++    // (e.g. deepseek4 ffn_gate_tid2eid hash routing), not weights
++    quantize &= tensor->type != GGML_TYPE_I64 &&
++                tensor->type != GGML_TYPE_I32 &&
++                tensor->type != GGML_TYPE_I16 &&
++                tensor->type != GGML_TYPE_I8;
++
+     // do not quantize norm tensors
+     quantize &= name.find("_norm.weight") == std::string::npos;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index e64e43451f7f..4e7c7218b25c 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -4,9 +4,18 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ 
++// DSV4_MTP_DEBUG=1 enables verbose NextN/MTP logging (load shapes, graph dims)
++static bool dsv4_mtp_debug() {
++    const char * e = getenv("DSV4_MTP_DEBUG");
++    return e && atoi(e) > 0;
++}
++
++// DSV4_MTP_DEBUG=1 enables verbose NextN/MTP logging (load shapes, graph dims)
++
+ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
+     if (ext_factor == 0.0f) {
+         return 1.0f;
+@@ -16,6 +25,14 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
+ }
+ 
+ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
++    // NextN/MTP (DeepSeek-V4): extra decoder block appended beyond the main stack.
++    // Must be read FIRST: n_layer() = n_layer_all - n_layer_nextn sizes the
++    // per-layer hparam arrays below. The MTP block is a full V4 layer with
++    // compress_ratio = 0 (pure SWA MLA, no compressor/indexer) plus glue tensors
++    // (see reference inference/model.py MTPBlock).
++    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
++    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
++
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+@@ -55,6 +72,20 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+     hparams.set_swa_pattern(0);
+ 
++    if (hparams.n_layer_nextn > 0) {
++        // the MTP block consumes/produces the full hyper-connection state
++        hparams.n_embd_nextn_impl = hparams.dsv4_hc_mult * hparams.n_embd;
++
++        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
++            hparams.is_swa_impl[il]          = true; // set_swa_pattern() cleared nextn layers
++            hparams.dsv4_compress_ratios[il] = 0;    // pure sliding-window attention
++        }
++
++        LLAMA_LOG_INFO("%s: DSV4 MTP: n_layer_nextn = %u, nextn layer(s) %u..%u, n_embd_nextn = %u\n",
++                __func__, hparams.n_layer_nextn, hparams.n_layer(), hparams.n_layer_all - 1,
++                hparams.n_embd_nextn());
++    }
++
+     switch (hparams.n_layer()) {
+         case 43: type = LLM_TYPE_UNKNOWN; break;
+         default: type = LLM_TYPE_UNKNOWN;
+@@ -84,7 +115,10 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
+     hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
+     hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+ 
+-    for (int i = 0; i < n_layer; ++i) {
++    // NextN/MTP layers (il >= n_layer) are full V4 blocks with compress_ratio 0
++    // (no compressor/indexer), so the shared per-layer loading below covers them;
++    // their extra glue tensors are loaded at the end of the loop body.
++    for (int i = 0; i < n_layer_all; ++i) {
+         auto & layer = layers[i];
+ 
+         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
+@@ -143,13 +177,36 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
+         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
+         layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
++
++        if (i >= n_layer) {
++            // NextN/MTP glue tensors. eh_proj packs the reference's separate
++            // e_proj|h_proj as one {2*n_embd, n_embd} matrix (concat identity).
++            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, 0);
++            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd }, 0);
++            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd }, 0);
++            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, 0);
++            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,       "weight", i), { hc_dim, hc_mult }, 0);
++            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,     "weight", i), { hc_mult }, 0);
++            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE,    "weight", i), { 1 }, 0);
++
++            if (dsv4_mtp_debug()) {
++                LLAMA_LOG_INFO("%s: DSV4 MTP: loaded NextN block %d: eh_proj [%lld, %lld], hc_head_fn [%lld, %lld]\n",
++                        __func__, i,
++                        (long long) layer.nextn.eh_proj->ne[0],    (long long) layer.nextn.eh_proj->ne[1],
++                        (long long) layer.nextn.hc_head_fn->ne[0], (long long) layer.nextn.hc_head_fn->ne[1]);
++            }
++        }
+     }
+ }
+ 
+ std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
++        return std::make_unique<graph_mtp>(*this, params);
++    }
+     return std::make_unique<graph>(*this, params);
+ }
+ 
++
+ static size_t dsv4_elem_offset(const ggml_tensor * t, int64_t i) {
+     return ggml_row_size(t->type, i);
+ }
+@@ -1151,6 +1208,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cb(inpL, "l_out", il);
+     }
+ 
++    // expose the full hyper-connection trunk state for the NextN/MTP head.
++    // rows are n_embd*hc wide (= hparams.n_embd_nextn()) and cover ALL tokens,
++    // as required by the unmasked nextn-embeddings capture on the target context.
++    if (hparams.n_layer_nextn > 0) {
++        ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++        cb(h_nextn, "h_nextn", -1);
++        res->t_h_nextn = h_nextn;
++        ggml_build_forward_expand(gf, h_nextn);
++    }
++
+     if (inp_out_ids) {
+         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+@@ -1170,3 +1237,170 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+     ggml_build_forward_expand(gf, cur);
+ }
++
++// LLM_GRAPH_TYPE_DECODER_MTP draft head for DeepSeek-V4.
++//
++// The NextN/MTP block (reference: inference/model.py MTPBlock) is a full V4 layer
++// (pure-SWA MLA attention, MoE + shared experts, hyper-connections) with a glue
++// front-end and its own hc head mixer:
++//
++//   e  = enorm(embed(token))                          # embed shared with the trunk
++//   x  = hnorm(h)                                     # h = trunk/previous hc state
++//   x  = eh_proj(concat[e; x])  (per hc stream)       # == e_proj(e) + h_proj(x)
++//   x  = V4Block(x)                                   # standard layer at il = n_layer
++//   logits = output( shared_head_norm( hc_head(x) ) ) # lm head shared with the trunk
++//
++// The h rows exchanged with the driver are the FULL hyper-connection state
++// (hc_mult * n_embd = hparams.n_embd_nextn() floats per token).
++llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
++    : graph(params) {
++    GGML_ASSERT(hparams.n_layer_nextn > 0 && "DSV4 MTP requires n_layer_nextn > 0");
++    GGML_ASSERT(hparams.n_layer_nextn == 1 && "DSV4 MTP currently only supports a single MTP block");
++
++    const int          il    = hparams.n_layer();
++    const auto &       layer = model.layers[il];
++    const int64_t      hc    = hparams.dsv4_hc_mult;
++    const int64_t  n_embd_h  = hparams.n_embd_nextn();
++
++    GGML_ASSERT(n_embd_h == hc*n_embd);
++    GGML_ASSERT(layer.nextn.eh_proj          && "DSV4 MTP block missing nextn.eh_proj");
++    GGML_ASSERT(layer.nextn.enorm            && "DSV4 MTP block missing nextn.enorm");
++    GGML_ASSERT(layer.nextn.hnorm            && "DSV4 MTP block missing nextn.hnorm");
++    GGML_ASSERT(layer.nextn.shared_head_norm && "DSV4 MTP block missing nextn.shared_head_norm");
++    GGML_ASSERT(layer.nextn.hc_head_fn       && "DSV4 MTP block missing nextn.hc_head_fn");
++
++    if (dsv4_mtp_debug()) {
++        LLAMA_LOG_INFO("%s: DSV4 MTP graph: il=%d n_tokens=%d h_width=%lld hc=%lld swa=%d ratio=%u\n",
++                __func__, il, (int) n_tokens, (long long) n_embd_h, (long long) hc,
++                hparams.is_swa(il) ? 1 : 0, hparams.dsv4_compress_ratios[il]);
++    }
++
++    // inputs: draft tokens + hidden-state rows (full hc state) from the target /
++    // previous MTP step, fed through the batch-embd channel by the draft-mtp driver
++    auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_h);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
++    ggml_set_input(inp->embd);
++
++    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_h, n_tokens);
++    ggml_set_input(inp->h);
++    ggml_set_name(inp->h, "mtp_h_input");
++
++    GGML_ASSERT(ubatch.token && "DSV4 MTP expects token+embd batches from the draft-mtp driver");
++    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens); // embed shared with trunk
++    cb(tok_embd, "mtp_tok_embd", il);
++
++    ggml_tensor * h = inp->h;
++    res->add_input(std::move(inp));
++
++    ggml_tensor * inp_pos     = build_inp_pos();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
++    llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
++    ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
++
++    // ---- glue front-end -----------------------------------------------------
++    ggml_tensor * e = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++    cb(e, "mtp_enorm", il);
++
++    ggml_tensor * h3 = ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens);
++    h3 = build_norm(h3, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il); // per-stream RMS
++    cb(h3, "mtp_hnorm", il);
++
++    // broadcast e across the hc streams, then eh_proj per stream
++    ggml_tensor * e3 = ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens);
++    e3 = ggml_repeat_4d(ctx0, e3, n_embd, hc, n_tokens, 1);
++    ggml_tensor * concat = ggml_concat(ctx0, e3, h3, 0); // [2*n_embd, hc, n_tokens]
++    cb(concat, "mtp_concat", il);
++
++    ggml_tensor * inpL = ggml_mul_mat(ctx0, layer.nextn.eh_proj, concat); // [n_embd, hc, n_tokens]
++    cb(inpL, "mtp_eh_proj", il);
++
++    // ---- standard V4 block body at il (mirrors the trunk loop) --------------
++    ggml_tensor * cur;
++    {
++        ggml_tensor * residual = inpL;
++        ggml_tensor * post = nullptr;
++        ggml_tensor * comb = nullptr;
++
++        cur = build_hc_pre(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
++        cb(cur, "mtp_hc_attn_pre", il);
++
++        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "mtp_attn_norm", il);
++
++        cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
++        cb(cur, "mtp_attn_out", il);
++
++        inpL = build_hc_post(cur, residual, post, comb, il);
++        cb(inpL, "mtp_hc_attn_post", il);
++
++        residual = inpL;
++        cur = build_hc_pre(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
++        cb(cur, "mtp_hc_ffn_pre", il);
++
++        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "mtp_ffn_norm", il);
++
++        ggml_tensor * moe_out = build_moe_ffn(cur,
++                layer.ffn_gate_inp,
++                layer.ffn_up_exps,
++                layer.ffn_gate_exps,
++                layer.ffn_down_exps,
++                layer.ffn_exp_probs_b,
++                n_expert, hparams.n_expert_used,
++                LLM_FFN_SILU, hparams.expert_weights_norm,
++                hparams.expert_weights_scale,
++                (llama_expert_gating_func_type) hparams.expert_gating_func,
++                il,
++                nullptr,
++                nullptr,
++                nullptr,
++                nullptr,
++                nullptr,
++                nullptr);
++        cb(moe_out, "mtp_ffn_moe_out", il);
++
++        ggml_tensor * ffn_shexp = build_ffn(cur,
++                layer.ffn_up_shexp, nullptr, nullptr,
++                layer.ffn_gate_shexp, nullptr, nullptr,
++                layer.ffn_down_shexp, nullptr, nullptr,
++                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(ffn_shexp, "mtp_ffn_shexp", il);
++
++        cur = ggml_add(ctx0, moe_out, ffn_shexp);
++        cb(cur, "mtp_ffn_out", il);
++
++        inpL = build_hc_post(cur, residual, post, comb, il);
++        cb(inpL, "mtp_block_out", il);
++    }
++
++    // ---- chaining state + head ----------------------------------------------
++    // full hc rows: the next MTP step consumes this (raw, pre-hc_head) state
++    ggml_tensor * h_out = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++    cb(h_out, "h_nextn", -1);
++    res->t_h_nextn = h_out;
++    ggml_build_forward_expand(gf, h_out);
++
++    if (inp_out_ids) {
++        ggml_tensor * flat = ggml_get_rows(ctx0, h_out, inp_out_ids);
++        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
++    }
++
++    // MTP block's own hc head mixer -> pre-head norm -> shared lm head
++    cur = build_hc_head(inpL, layer.nextn.hc_head_fn, layer.nextn.hc_head_scale, layer.nextn.hc_head_base);
++    cb(cur, "mtp_hc_head", -1);
++
++    cur = build_norm(cur, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
++    cb(cur, "mtp_shared_head_norm", -1);
++
++    cur = ggml_mul_mat(ctx0, model.output, cur); // lm head shared with trunk
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++
++    ggml_build_forward_expand(gf, cur);
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index beab9f6bc7df..beb213d5272d 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1093,6 +1093,12 @@ struct llama_model_deepseek4 : public llama_model_base {
+     struct graph : public llm_graph_context {
+         graph(const llama_model & model, const llm_graph_params & params);
+ 
++    protected:
++        // tag-ctor for graph_mtp: initializes the graph context without building the trunk
++        explicit graph(const llm_graph_params & params) : llm_graph_context(params) {}
++
++    public:
++
+         ggml_tensor * build_hc_pre(
+                 ggml_tensor * x,
+                 ggml_tensor * hc_fn,
+@@ -1196,6 +1202,11 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 int il) const;
+     };
+ 
++    // LLM_GRAPH_TYPE_DECODER_MTP draft head (NextN block at il == n_layer)
++    struct graph_mtp : public graph {
++        graph_mtp(const llama_model & model, const llm_graph_params & params);
++    };
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
