@@ -301,10 +301,16 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
-    const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
-    const int64_t block_size = std::stoi(it->second);
-    GGML_ASSERT(block_size > 0);
+    // MAD-LAB: use the parsed arch-prefixed value, with a sidecar fallback.
+    int64_t block_size = model.dflash_block_size;
+    if (block_size == 0) {
+        const auto it = model.gguf_kv.find("dflash.block_size");
+        if (it != model.gguf_kv.end()) {
+            block_size = std::stoi(it->second);
+        }
+    }
+    GGML_ASSERT(block_size > 0 && "DSpark draft requires a valid block_size in GGUF metadata");
+    // MAD-LAB: end
 
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
