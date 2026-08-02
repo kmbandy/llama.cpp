@@ -21,6 +21,7 @@
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -131,15 +132,22 @@ llama_context::llama_context(
             "--expert-dispatch is missing; refusing to run without routed experts");
     }
     if (expert_dispatch_enabled) {
-        if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA) {
+        if (model.arch != LLM_ARCH_DEEPSEEK2 && model.arch != LLM_ARCH_GLM_DSA && model.arch != LLM_ARCH_DEEPSEEK4) {
             throw std::runtime_error("expert dispatch currently supports only models using the DeepSeek2 or GLM-DSA graph");
         }
+        // last_no_defer_layer = last main-graph MoE index (excludes NextN/MTP).
+        // Worker HELLO lists can include the MTP block (e.g. layer 78) which the
+        // main stack never dispatches; using that max as "last" left every
+        // token's real last MoE deferred and inflated n_deferred_late.
+        const int32_t last_no_defer =
+            hparams.n_layer() > 0 ? (int32_t) hparams.n_layer() - 1 : -1;
         expert_dispatch.reset(new pipe_expert_dispatcher::graph_dispatcher(
             params.expert_dispatch,
             (int32_t) hparams.n_embd,
             (int32_t) hparams.n_ff_exp,
             (int32_t) hparams.n_expert,
-            (int32_t) hparams.n_expert_used));
+            (int32_t) hparams.n_expert_used,
+            last_no_defer));
         LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
     }
 
@@ -1485,7 +1493,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // WP_SPINE_STATS=1: time the spine's own graph compute. The expert
+    // dispatcher already reports pack/issue/wait/unpack per token, but the DENSE
+    // side has only ever been known by subtracting that from eval time -- two
+    // numbers measured in different places. This makes it direct:
+    //   dense = spine graph compute - dispatcher total
+    // (the dispatch custom op blocks INSIDE this call, so it is included here).
+    static const char * wp_spine_env = getenv("WP_SPINE_STATS");
+    static const bool wp_spine_stats = wp_spine_env != nullptr;
+    // WP_SPINE_STATS=2 also logs EVERY call, not just the running mean. The mean
+    // concealed a 60% run-to-run swing in dense time (76.8-122.8 ms/token), and
+    // a mean cannot distinguish "a few huge outliers" from "everything shifted".
+    static const bool wp_spine_each = wp_spine_stats && wp_spine_env[0] == '2';
+    static uint64_t   wp_gc_ns = 0;
+    static uint64_t   wp_gc_n  = 0;
+    const auto wp_gc_t0 = wp_spine_stats ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (wp_spine_stats) {
+        const uint64_t wp_call_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wp_gc_t0).count();
+        wp_gc_ns += wp_call_ns;
+        ++wp_gc_n;
+        if (wp_spine_each) {
+            LLAMA_LOG_WARN("spine: gc_call %llu %.3f ms\n",
+                           (unsigned long long) wp_gc_n, wp_call_ns / 1e6);
+        }
+        if (wp_gc_n % 16 == 0) {
+            LLAMA_LOG_WARN("spine: graph_compute n=%llu total=%.2f ms mean=%.2f ms/call\n",
+                           (unsigned long long) wp_gc_n, wp_gc_ns / 1e6,
+                           wp_gc_ns / 1e6 / (double) wp_gc_n);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

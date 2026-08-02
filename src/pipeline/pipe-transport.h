@@ -28,6 +28,14 @@ struct pipe_socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // Underlying descriptor, for callers that want to poll()/select() before
+    // committing to a blocking recv_data. Returns -1 if unavailable. Added so
+    // the expert worker can do useful work while waiting for the next request
+    // instead of leaving its GPU idle -- on some cards (RX 480 / Polaris) the
+    // cost of a submit depends on how long the GPU idled beforehand.
+    // Do NOT read or write the socket through this; use send_data/recv_data.
+    int poll_fd() const;
+
     // Accept one pending connection on a server socket. Returns nullptr on
     // failure. The returned socket has TCP_NODELAY set.
     pipe_socket_ptr accept();
