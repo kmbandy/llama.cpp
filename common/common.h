@@ -331,6 +331,13 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // DSpark: min predicted acceptance from the confidence head.
+    // Default 0.9 prunes suffixes unlikely to repay their verification cost
+    // (DeepSeek / DwarfStar guidance). 0.0 disables the gate — do not ship
+    // that as the default; every ungated draft position pays real expert I/O
+    // on a paged MoE.
+    float conf_min = 0.9f;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;

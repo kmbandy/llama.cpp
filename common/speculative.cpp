@@ -963,19 +963,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         GGML_ASSERT(hc_mult > 0);
         n_embd_enc    = (int32_t) target_layer_ids_n * hc_mult * n_embd_tgt;
 
-        // read the trained block size from the dflash.block_size metadata key
+        const char * block_size_source = "default";
         block_size = 16;
-        {
+        if (const uint32_t model_block_size = llama_model_dflash_block_size(model_dft); model_block_size > 0) {
+            block_size = (int32_t) model_block_size;
+            block_size_source = "accessor";
+        } else {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
                 block_size = std::atoi(buf);
+                block_size_source = "metadata-probe";
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
-        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, hc_mult=%d\n", __func__, block_size, mask_token_id, target_layer_ids_n, hc_mult);
+        // conf_min at WARN: llama-server default logger threshold is 3; libllama
+        // INFO maps to 4 and is filtered, WARN maps to 2 and passes. A gate whose
+        // value you cannot see in the log has cost this project multiple
+        // retracted measurement sets.
+        LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f (0=gate off)\n",
+                __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
+        LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
@@ -1202,12 +1211,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.conf_min) {
                         break;
                     }
 

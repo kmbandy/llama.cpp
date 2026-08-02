@@ -16,6 +16,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     if (dflash_hc_mult == 0) {
         throw std::runtime_error("DFlash model has invalid 'dflash.hc_mult' metadata");
     }
+    ml.get_key(LLM_KV_BLOCK_SIZE, dflash_block_size, false);
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * dflash_hc_mult * hparams.n_embd;
 

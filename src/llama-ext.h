@@ -126,6 +126,7 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 // returns the DFlash hyper-connection stream multiplier
 LLAMA_API uint32_t        llama_model_dflash_hc_mult    (const struct llama_model * model);
+LLAMA_API uint32_t        llama_model_dflash_block_size (const struct llama_model * model);
 
 // Weight-pager draft-as-paging-oracle: after a draft model produces tokens,
 // map them through DS4 hash-layer tid2eid and pin/prefetch those expert

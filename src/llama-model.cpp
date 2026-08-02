@@ -3981,6 +3981,10 @@ uint32_t llama_model_dflash_hc_mult(const struct llama_model * model) {
     return model->dflash_hc_mult;
 }
 
+uint32_t llama_model_dflash_block_size(const struct llama_model * model) {
+    return model->dflash_block_size;
+}
+
 int llama_wp_on_draft_tokens(struct llama_context * ctx,
                              const llama_token * tokens,
                              int n_tokens) {

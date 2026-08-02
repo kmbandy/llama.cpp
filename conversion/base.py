@@ -2643,4 +2643,18 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
         arch = vision_config["architectures"][0]
     if arch is None:
         raise ValueError("Failed to detect model architecture")
+
+    # REMOVED 2026-07-31: a branch here routed DeepseekV4ForCausalLM to
+    # "DeepseekV4DSparkModel" whenever config.json carried flat dspark_* keys.
+    # It was wrong twice over:
+    #   1. The FULL DeepSeek-V4-Flash-0731 release ships dspark_block_size,
+    #      dspark_markov_rank, dspark_noise_token_id and dspark_target_layer_ids
+    #      in its OWN config.json. The key test therefore never distinguished a
+    #      draft from the target -- it silently hijacked whole-model conversions
+    #      into a 3-block draft (observed: "DSpark: block_count=3").
+    #   2. Its stated reason -- "the target path discards every mtp.* tensor" --
+    #      is obsolete: DeepseekV4Model now includes the mtp.* subtree as blocks
+    #      43..45, which is the entire point of the whole-model conversion.
+    # Do not reintroduce this without a test that actually separates the two.
+
     return arch

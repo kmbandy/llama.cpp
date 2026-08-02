@@ -79,6 +79,14 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
 
+    if (ml.get_tensor_meta("fc.weight") != nullptr) {
+        if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.empty()) {
+            throw std::runtime_error("DeepSeek-V4 DSpark model has no target_layers metadata");
+        }
+        ml.get_key(LLM_KV_BLOCK_SIZE, dflash_block_size);
+        dflash_hc_mult = hparams.dsv4_hc_mult;
+    }
+
     uint32_t n_compress_ratios = 0;
     ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios);
     if (n_compress_ratios < hparams.n_layer()) {
@@ -106,7 +114,7 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
+void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t q_lora_rank     = hparams.n_lora_q;
@@ -178,16 +186,17 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         }
 
         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-        if ((uint32_t) i < hparams.dsv4_hash_layer_count) {
+        if (i < n_layer && (uint32_t) i < hparams.dsv4_hash_layer_count) {
             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, 0);
         } else {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
         }
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+        const int expert_flags = routed_experts_external ? TENSOR_SKIP | TENSOR_NOT_REQUIRED : 0;
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, expert_flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, expert_flags);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, expert_flags);
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
@@ -197,22 +206,91 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
         // nextn.shared_head_head, so the MTP branch falls back to the
         // model-level tok_embd / output (hence TENSOR_NOT_REQUIRED).
         if (i >= n_layer) {
-            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, 0);
-            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, 0);
-            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, 0);
-            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, 0);
+            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+            const int last = n_layer_all - 1;
             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
 
-            layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hc_mult}, 0);
-            layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hc_mult}, 0);
-            layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, 0);
+            if (i == last) {
+                layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, 0);
+                layer.nextn.hc_head_fn       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hc_mult}, 0);
+                layer.nextn.hc_head_base     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hc_mult}, 0);
+                layer.nextn.hc_head_scale    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, 0);
+            }
         }
+    }
+
+    if (ml.get_tensor_meta("fc.weight") != nullptr) {
+        const int64_t n_target = target_layer_ids.size();
+        fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), {n_target*n_embd, n_embd}, 0);
+        output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+        const auto * markov = ml.get_tensor_meta(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight").str().c_str());
+        GGML_ASSERT(markov != nullptr);
+        const int64_t rank = markov->ne[0];
+        dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {rank, n_vocab}, 0);
+        dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), {rank, n_vocab}, 0);
+        dspark_conf_proj   = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), {n_embd + rank, 1}, 0);
+        dspark_conf_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"),   {1}, TENSOR_NOT_REQUIRED);
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
+}
+
+static void dsv4_build_dspark_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+    ggml_context * ctx0 = g.ctx0;
+    auto & res = g.res;
+    const int64_t n_vocab = res->t_logits->ne[0];
+    const int64_t n_tokens = res->t_logits->ne[1];
+    const int64_t block_size = model.dflash_block_size;
+    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    if (n_blocks <= 0 || n_tokens % n_blocks != 0 || n_tokens / n_blocks > block_size) {
+        return;
+    }
+
+    const int64_t block_tokens = n_tokens / n_blocks;
+    const size_t token_stride = block_tokens * tokens->nb[0];
+    const size_t logits_stride = block_tokens * res->t_logits->nb[1];
+    ggml_tensor * prev = ggml_cont_1d(ctx0, ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0), n_blocks);
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * confidence = nullptr;
+
+    for (int64_t i = 0; i < block_tokens; ++i) {
+        ggml_tensor * markov_embd = ggml_get_rows(ctx0, model.dspark_markov_w1, prev);
+        ggml_tensor * bias = ggml_mul_mat(ctx0, model.dspark_markov_w2, markov_embd);
+        ggml_tensor * base = ggml_view_2d(ctx0, res->t_logits, n_vocab, n_blocks,
+                logits_stride, i * res->t_logits->nb[1]);
+        ggml_tensor * col = ggml_add(ctx0, base, bias);
+        logits = logits ? ggml_concat(ctx0, logits, col, 1) : col;
+
+        ggml_tensor * embd_i = ggml_view_2d(ctx0, res->t_embd, res->t_embd->ne[0], n_blocks,
+                block_tokens * res->t_embd->nb[1], i * res->t_embd->nb[1]);
+        ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, embd_i), markov_embd, 0);
+        ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+        if (model.dspark_conf_proj_b) {
+            conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
+        }
+        conf = ggml_sigmoid(ctx0, conf);
+        confidence = confidence ? ggml_concat(ctx0, confidence, conf, 1) : conf;
+
+        if (i + 1 < block_tokens) {
+            prev = ggml_argmax(ctx0, col);
+        }
+    }
+
+    logits = ggml_reshape_3d(ctx0, logits, n_vocab, n_blocks, block_tokens);
+    logits = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, logits, 0, 2, 1, 3)), n_vocab, n_tokens);
+    confidence = ggml_reshape_3d(ctx0, confidence, 1, n_blocks, block_tokens);
+    confidence = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, confidence, 0, 2, 1, 3)), 1, n_tokens);
+    confidence = ggml_repeat(ctx0, confidence, res->t_embd);
+    res->t_logits = logits;
+    res->t_h_nextn = confidence;
+    ggml_build_forward_expand(g.gf, logits);
+    ggml_build_forward_expand(g.gf, confidence);
 }
 
 static size_t dsv4_elem_offset(const ggml_tensor * t, int64_t i) {
@@ -1188,8 +1266,84 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    if (params.gtype == LLM_GRAPH_TYPE_ENCODER && model.fc) {
+        const int64_t n_target = model.target_layer_ids.size();
+        auto inp = std::make_unique<llm_graph_input_embd>(n_target*n_embd*hparams.dsv4_hc_mult);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, inp->n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        ggml_tensor * cur = ggml_reshape_4d(ctx0, inp->embd, n_embd, hparams.dsv4_hc_mult, n_target, n_tokens);
+        cur = ggml_mean(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3));
+        cur = ggml_reshape_2d(ctx0, cur, n_embd*n_target, n_tokens);
+        cur = build_lora_mm(model.fc, cur);
+        cur = build_norm(cur, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+        res->t_h_nextn = cur;
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP && model.fc) {
+        GGML_ASSERT(hparams.n_layer_nextn == 3 && "DeepSeek-V4 DSpark expects three stages");
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        ggml_tensor * input_tokens = inp->tokens;
+        ggml_tensor * input_embd   = inp->embd;
+        res->add_input(std::move(inp));
+
+        ggml_tensor * inp_pos = build_inp_pos();
+        llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+        ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
+        const int64_t hc = hparams.dsv4_hc_mult;
+
+        if (ubatch.embd) {
+            for (int il = n_layer; il < hparams.n_layer_all; ++il) {
+                ggml_build_forward_expand(gf, build_attention(model, inp_dsv4, input_embd, inp_pos, il));
+            }
+            return;
+        }
+
+        ggml_tensor * cur = ggml_get_rows(ctx0, model.tok_embd, input_tokens);
+        cur = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        for (int il = n_layer; il < hparams.n_layer_all; ++il) {
+            const auto & layer = model.layers[il];
+            ggml_tensor * residual = cur;
+            ggml_tensor * post = nullptr;
+            ggml_tensor * comb = nullptr;
+            cur = build_hc_pre(cur, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, il);
+            cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+            cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+            cur = build_hc_post(cur, residual, post, comb, il);
+
+            residual = cur;
+            cur = build_hc_pre(cur, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, il);
+            cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * moe = build_moe_ffn(cur, layer.ffn_gate_inp,
+                    layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                    layer.ffn_exp_probs_b, n_expert, hparams.n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm, hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func, il);
+            ggml_tensor * shared = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr, layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr, nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cur = build_hc_post(ggml_add(ctx0, moe, shared), residual, post, comb, il);
+        }
+
+        const auto & last = model.layers[hparams.n_layer_all - 1];
+        ggml_tensor * hidden = build_hc_head(cur, last.nextn.hc_head_fn, last.nextn.hc_head_scale, last.nextn.hc_head_base);
+        res->t_embd = hidden;
+        cur = build_norm(hidden, last.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        dsv4_build_dspark_head(*this, model, input_tokens);
+        return;
+    }
+
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        GGML_ASSERT(hparams.n_layer_nextn == 1 && "DeepSeek4 MTP currently supports one block");
+        GGML_ASSERT(hparams.n_layer_nextn >= 1 && "DeepSeek4 MTP requires at least one block");
 
         const int il = hparams.n_layer();
         const auto & layer = model.layers[il];

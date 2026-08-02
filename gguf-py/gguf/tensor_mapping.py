@@ -1305,15 +1305,21 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
-            "model.markov_head.markov_w1", # dspark
+            "mtp.2.markov_head.markov_w1", # dspark (DeepSeek-V4-Flash release name)
+            "model.markov_head.markov_w1", # dspark (Qwen3 / DeepSpec nested)
+            "markov_head.markov_w1",       # dspark (rekey / unprefixed)
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W2: (
-            "model.markov_head.markov_w2", # dspark
+            "mtp.2.markov_head.markov_w2", # dspark (DeepSeek-V4-Flash release name)
+            "model.markov_head.markov_w2", # dspark (Qwen3 / DeepSpec nested)
+            "markov_head.markov_w2",       # dspark (rekey / unprefixed)
         ),
 
         MODEL_TENSOR.DSPARK_CONF_PROJ: (
-            "model.confidence_head.proj", # dspark
+            "mtp.2.confidence_head.proj", # dspark (DeepSeek-V4-Flash release name)
+            "model.confidence_head.proj", # dspark (Qwen3 / DeepSpec nested)
+            "confidence_head.proj",       # dspark (rekey / unprefixed)
         ),
 
         MODEL_TENSOR.CLS: (
