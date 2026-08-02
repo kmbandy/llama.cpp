@@ -292,7 +292,9 @@ private:
 
     llama_memory_ptr memory;
 
-    std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch;
+    // MAD-LAB: the target context owns the dispatcher; speculative contexts borrow it.
+    std::unique_ptr<pipe_expert_dispatcher::graph_dispatcher> expert_dispatch_owned;
+    pipe_expert_dispatcher::graph_dispatcher * expert_dispatch = nullptr;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

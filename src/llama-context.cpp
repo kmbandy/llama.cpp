@@ -126,8 +126,11 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
+    // MAD-LAB: a speculative context reuses its parent's dispatcher connection.
+    const bool expert_dispatch_borrowed =
+        params.ctx_other != nullptr && params.ctx_other->expert_dispatch != nullptr;
     const bool expert_dispatch_enabled =
-        params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0';
+        (params.expert_dispatch != nullptr && params.expert_dispatch[0] != '\0') || expert_dispatch_borrowed;
     if (model.routed_experts_external && !expert_dispatch_enabled) {
         throw std::runtime_error(
             "model metadata 'weight_pager.routed_experts_external' is true but "
@@ -143,14 +146,21 @@ llama_context::llama_context(
         // token's real last MoE deferred and inflated n_deferred_late.
         const int32_t last_no_defer =
             hparams.n_layer() > 0 ? (int32_t) hparams.n_layer() - 1 : -1;
-        expert_dispatch.reset(new pipe_expert_dispatcher::graph_dispatcher(
-            params.expert_dispatch,
-            (int32_t) hparams.n_embd,
-            (int32_t) hparams.n_ff_exp,
-            (int32_t) hparams.n_expert,
-            (int32_t) hparams.n_expert_used,
-            last_no_defer));
-        LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
+        if (expert_dispatch_borrowed) {
+            expert_dispatch = params.ctx_other->expert_dispatch;
+            LLAMA_LOG_INFO("%s: borrowing expert dispatcher from parent context (%zu workers)\n",
+                           __func__, expert_dispatch->n_workers());
+        } else {
+            expert_dispatch_owned.reset(new pipe_expert_dispatcher::graph_dispatcher(
+                params.expert_dispatch,
+                (int32_t) hparams.n_embd,
+                (int32_t) hparams.n_ff_exp,
+                (int32_t) hparams.n_expert,
+                (int32_t) hparams.n_expert_used,
+                last_no_defer));
+            expert_dispatch = expert_dispatch_owned.get();
+            LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
+        }
     }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -2004,7 +2014,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
-    expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch.get());
+    // MAD-LAB: the decode scope uses the shared dispatcher when borrowed.
+    expert_dispatch_decode_scope dispatch_stats_scope(expert_dispatch);
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2638,7 +2649,8 @@ llm_graph_params llama_context::graph_params(
         /*.ml8_reg     =*/ &model.ml8_reg,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.expert_dispatch =*/ expert_dispatch.get(),
+        // MAD-LAB: pass the borrowed or owned dispatcher to graph construction.
+        /*.expert_dispatch =*/ expert_dispatch,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
