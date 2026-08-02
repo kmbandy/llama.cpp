@@ -37,6 +37,8 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
+        // MAD-LAB: map the in-model DSpark context to its draft graph.
+        case LLAMA_CONTEXT_TYPE_DSPARK : return LLM_GRAPH_TYPE_DECODER_DSPARK;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -1873,7 +1875,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const bool    mtp_embd = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+                              cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK) && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
@@ -3910,9 +3913,9 @@ llama_context * llama_init_from_model(
                        model->hparams.pooling_type, params.pooling_type);
     }
 
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+    if ((params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || params.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK) &&
         model->hparams.n_layer_nextn == 0) {
-        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        LLAMA_LOG_WARN("%s: context type MTP/DSpark requested but model has no nextn layers\n", __func__);
         return nullptr;
     }
 

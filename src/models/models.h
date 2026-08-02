@@ -1293,7 +1293,9 @@ struct llama_model_dflash : public llama_model_base {
     };
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
-        graph_dsv4(const llama_model & model, const llm_graph_params & params);
+        // MAD-LAB: allow the DSV4 graph to target in-model stage blocks.
+        graph_dsv4(const llama_model & model, const llm_graph_params & params,
+                   int stage_base = 0, int n_stages = 0);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

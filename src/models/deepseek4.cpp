@@ -17,6 +17,11 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
+// MAD-LAB: recognize the in-GGUF DSpark Markov head when probing NextN layers.
+static bool dsv4_has_dspark_head(const llama_model_loader & ml) {
+    return ml.get_weight("markov_w1.weight") != nullptr;
+}
+
 // Pin activation to the device that owns weight so RMS/mul stay co-located.
 // Without this, hc_pre rms_norm follows residual onto the wrong GPU and the
 // residual-sized flat_norm is staged again for mul_mat(hc_fn) (node/RMS_NORM).
@@ -49,14 +54,22 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     // (swiglu_clamp_exp/shexp) are sized to the MAIN stack only (43) while
     // compress_ratios covers all of them. Reading nextn later would size those
     // reads wrong and fail the load.
+    // MAD-LAB: accept either the upstream MTP head or the in-GGUF DSpark head.
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
-        if (ml.get_weight(mtp_probe.c_str()) == nullptr) {
+        if (ml.get_weight(mtp_probe.c_str()) == nullptr && !dsv4_has_dspark_head(ml)) {
             hparams.n_layer_nextn = 0;
         }
     }
+    // WARN, not INFO: llama-server's default logger threshold is 3; libllama INFO
+    // maps to 4 and is filtered, WARN maps to 2 and passes. A silent mis-detection
+    // here reads as a working model with wrong output -- it must be visible.
+    LLAMA_LOG_WARN("%s: head=%s n_layer_nextn=%u n_layer=%u n_layer_all=%u\n", __func__,
+            dsv4_has_dspark_head(ml) ? "DSpark" : "MTP",
+            hparams.n_layer_nextn, hparams.n_layer(), hparams.n_layer_all);
+    // MAD-LAB: end
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
     hparams.n_layer_kv_from_start = hparams.n_layer_all - hparams.n_layer_nextn;
 
@@ -268,6 +281,12 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    // MAD-LAB: build in-model DSpark stages from the target model's extra blocks.
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_DSPARK) {
+        return std::make_unique<llama_model_dflash::graph_dsv4>(
+                *this, params, (int) hparams.n_layer(), (int) hparams.n_layer_nextn);
+    }
+    // MAD-LAB: end
     return std::make_unique<graph>(*this, params);
 }
 

@@ -2366,14 +2366,26 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    GGML_ASSERT(has_draft || spec_mtp);
+    // MAD-LAB: DSpark may live inside the target GGUF or in a sidecar.
+    const bool spec_dspark = std::find(params.speculative.types.begin(),
+                                       params.speculative.types.end(),
+                                       COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+    const bool spec_dspark_self = spec_dspark && !has_draft &&
+                                  llama_model_n_layer_nextn(model_tgt) > 0;
+    const bool spec_self = spec_mtp || spec_dspark_self;
+    GGML_ASSERT(has_draft || spec_self);
+    // MAD-LAB: end
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // MAD-LAB: select the graph for an in-model DSpark context.
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    } else if (spec_dspark_self) {
+        cparams.ctx_type = LLAMA_CONTEXT_TYPE_DSPARK;
     }
+    // MAD-LAB: end
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
@@ -2400,7 +2412,8 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
-    } else if (spec_mtp) {
+    // MAD-LAB: create the second context on the target for MTP or in-model DSpark.
+    } else if (spec_self) {
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
@@ -2413,6 +2426,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+    // MAD-LAB: end
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;

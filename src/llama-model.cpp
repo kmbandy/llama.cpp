@@ -3023,7 +3023,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || params.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK) {
                     const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
                         return il >= (int32_t) hparams.n_layer();
                     };
@@ -3277,7 +3277,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_DEEPSEEK4) {
+                    if ((params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || params.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK) && arch == LLM_ARCH_DEEPSEEK4) {
                         // DS4 MTP head — same shape as the qwen35 case above (MAD-388).
                         // deepseek4.cpp sets n_layer_kv_from_start = n_layer_all -
                         // n_layer_nextn, so hparams.has_kv(il) is false for exactly the

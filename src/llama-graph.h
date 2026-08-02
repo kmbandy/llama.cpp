@@ -38,6 +38,8 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
     LLM_GRAPH_TYPE_DECODER_MTP,
+    // MAD-LAB: graph for DSpark stages embedded in the target model.
+    LLM_GRAPH_TYPE_DECODER_DSPARK,
 };
 
 enum llm_fused_op {

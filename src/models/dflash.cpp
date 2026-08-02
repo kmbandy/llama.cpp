@@ -622,7 +622,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
 //   * embd batch  -> project main_x through each stage's wkv and inject K into the ring cache
 //   * token batch -> noise block through 3 full DSV4 stages (hc + MLA + MoE), markov + confidence heads
-llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_graph_params & params) :
+// MAD-LAB: reuse the sidecar DSV4 graph for stages embedded in the target model.
+llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_graph_params & params,
+                                           int stage_base, int n_stages) :
     llama_model_deepseek4::graph(params) {
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
@@ -631,6 +633,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     ggml_tensor * inp_pos = build_inp_pos();
 
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
+    const int n_st = n_stages > 0 ? n_stages : n_layer;
 
     // KV cache injection: fused target features from the encoder
     if (ubatch.embd) {
@@ -644,13 +647,14 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         res->add_input(std::move(inp));
 
-        for (int il = 0; il < n_layer; ++il) {
-            const auto & layer = model.layers[il];
+        for (int il = 0; il < n_st; ++il) {
+            const int il_m = stage_base + il;
+            const auto & layer = model.layers[il_m];
 
             // main-track KV: kv_norm(wkv(main_x)) with rope on the trailing dims, same
             // rope parameters as the uncompressed layers in build_attention_impl
             ggml_tensor * kv = build_lora_mm(layer.wkv, inp_g);
-            kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+            kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il_m);
             kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_tokens);
 
             ggml_tensor * kv_nope = ggml_view_3d(ctx0, kv, n_embd_head_nope, 1, n_tokens,
@@ -664,12 +668,12 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
             kv_pe = ggml_rope_ext(ctx0, kv_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
                     freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
-            cb(kv, "kv_injected", il);
+            cb(kv, "kv_injected", il_m);
 
             if (inp_attn->self_k_rot_swa) {
                 kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa);
             }
-            ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
+            ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il_m));
         }
 
         res->t_embd = inp_g;
@@ -705,8 +709,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
-    for (int il = 0; il < n_layer; ++il) {
-        const auto & layer = model.layers[il];
+    for (int il = 0; il < n_st; ++il) {
+        const int il_m = stage_base + il;
+        const auto & layer = model.layers[il_m];
 
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
@@ -716,27 +721,27 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                &post, &comb, il);
-        cb(cur, "hc_attn_pre", il);
+                &post, &comb, il_m);
+        cb(cur, "hc_attn_pre", il_m);
 
-        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il_m);
+        cb(cur, "attn_norm", il_m);
 
-        cur = build_attention(model, inp_attn, cur, inp_pos, il);
+        cur = build_attention(model, inp_attn, cur, inp_pos, il_m);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        cb(inpL, "hc_attn_post", il);
+        inpL = build_hc_post(cur, residual, post, comb, il_m);
+        cb(inpL, "hc_attn_post", il_m);
 
         residual = inpL;
         cur = build_hc_pre(inpL,
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                &post, &comb, il);
-        cb(cur, "hc_ffn_pre", il);
+                &post, &comb, il_m);
+        cb(cur, "hc_ffn_pre", il_m);
 
-        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il_m);
+        cb(cur, "ffn_norm", il_m);
 
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -748,21 +753,21 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
-        cb(moe_out, "ffn_moe_out", il);
+                il_m);
+        cb(moe_out, "ffn_moe_out", il_m);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
                 layer.ffn_up_shexp, nullptr, nullptr,
                 layer.ffn_gate_shexp, nullptr, nullptr,
                 layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il_m);
+        cb(ffn_shexp, "ffn_shexp", il_m);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
+        cb(cur, "ffn_out", il_m);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        cb(inpL, "l_out", il);
+        inpL = build_hc_post(cur, residual, post, comb, il_m);
+        cb(inpL, "l_out", il_m);
     }
 
     ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
@@ -792,4 +797,5 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     if (model.dspark_markov_w1) {
         build_dspark_markov_head(*this, model, inp_tokens);
     }
+    // MAD-LAB: end
 }
