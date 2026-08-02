@@ -55,12 +55,17 @@ Say so explicitly rather than doing it.
 
 ## 2. State of the tree (verified, do not re-derive)
 
-`mad-lab-main:/home/kmbandy/GitHub/llama.cpp` — Claude will have merged
-upstream/master (through `bb4e0e1b3`) onto our HEAD **before** this task
-starts. Do not run the merge yourself. If `git log --oneline -1` does not show
-a merge commit dated 2026-08-02, stop and report rather than proceeding.
+`mad-lab-main:/home/kmbandy/GitHub/llama.cpp` — the upstream merge is **DONE**.
+Both boxes are at `1bb65b7d9` ("Merge upstream/master (through bb4e0e1b3)"),
+clean trees, 0 behind upstream / 989 ahead. `libllama`, `llama-server` and
+`llama-wp-expert-worker` all build and link.
 
-After that merge the tree contains upstream's:
+If `git log --oneline -1` does not show `1bb65b7d9`, stop and report rather
+than proceeding — someone has moved the tree under you.
+
+Do not merge, rebase, or cherry-pick anything.
+
+The tree contains upstream's:
 
 - `src/models/dflash.cpp` — `llama_model_dflash::graph_dsv4`, the DSV4-flavoured
   DSpark draft graph (3 full DSV4 stages: hc + MLA + MoE, then markov +
@@ -120,7 +125,13 @@ and the trunk runs the three DSpark stages as ordinary layers. **It fails
 silently into a plausible-looking model** — wrong output, and `compress_ratios`
 indexing shifts too.
 
-Fix: the probe must accept *either* head. Add a file-static helper above
+**ALREADY DONE IN THE MERGE — DO NOT REDO.** The *tensor loader* half of this
+same bug is fixed: `layer.nextn.eh_proj/enorm/hnorm` are now
+`TENSOR_NOT_REQUIRED | flags` in `load_arch_tensors`, because upstream marked
+them required and our DSpark stages have none of them. Leave that alone.
+
+**STILL TO DO — the probe itself, verified unfixed at `deepseek4.cpp:55`.**
+The probe must accept *either* head. Add a file-static helper above
 `load_arch_hparams` and change exactly one condition:
 
 ```cpp
@@ -128,8 +139,9 @@ if (ml.get_weight(mtp_probe.c_str()) == nullptr && !dsv4_has_dspark_head(ml)) {
 ```
 
 `dsv4_has_dspark_head` returns true when `markov_w1.weight` is present (that
-tensor exists only on a DSpark-bearing checkpoint). Keep it to one condition
-change plus one added static function, both marked.
+tensor exists only on a DSpark-bearing checkpoint; the name is confirmed at
+`src/llama-arch.cpp:627`, `{ LLM_TENSOR_DSPARK_MARKOV_W1, "markov_w1" }`).
+Keep it to one condition change plus one added static function, both marked.
 
 Add an `LLAMA_LOG_INFO` line reporting which head was detected and the
 resulting `n_layer_nextn` / `n_layer()`. A silent mis-detection here is the
