@@ -3043,7 +3043,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_mtp,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            // MAD-LAB: has_kv is false for the nextn layers by construction, so this filter must be authoritative.
+                            true);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
