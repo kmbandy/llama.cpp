@@ -1425,7 +1425,13 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        // MAD-LAB: include in-model DSpark in the server speculative gate.
+        const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+        const bool spec_dspark_self = spec_dspark && !has_draft;
+        const bool has_spec = has_draft || spec_mtp || spec_dspark_self;
+        // MAD-LAB: end
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1506,8 +1512,11 @@ private:
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
+                // MAD-LAB: reserve VRAM using the selected self-speculative graph.
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                } else if (spec_dspark_self) {
+                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_DSPARK;
                 }
                 cparams_dft.n_rs_seq = 0;
 
