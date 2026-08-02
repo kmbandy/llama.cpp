@@ -81,10 +81,39 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
-    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp,   hparams.n_layer_all);
-    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,   hparams.swiglu_clamp_shexp, hparams.n_layer_all, 0)) {
+    // MAD-LAB: DS4-Flash-0731 sizes the swiglu clamp arrays to the MAIN stack
+    // (43) while compress_ratios covers all 46 blocks -- DeepSeek's config
+    // carries a single scalar swiglu_limit (10.0) and our converter expands it
+    // per trunk layer. Upstream reads both with n_layer_all because its MTP
+    // checkpoint sizes them that way, which fails this load outright with
+    // "wrong array length; expected 46, got 43".
+    // Read the length the file actually carries, then broadcast the tail: the
+    // DSpark stages have real SwiGLU FFNs and must not inherit an implicit 0,
+    // which would clamp their activations to nothing.
+    uint32_t n_clamp = hparams.n_layer_all;
+    {
+        uint32_t n = 0;
+        ml.get_arr_n(LLM_KV_SWIGLU_CLAMP_EXP, n);
+        if (n > 0 && n < hparams.n_layer_all) {
+            n_clamp = n;
+        }
+    }
+    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp,   n_clamp);
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,   hparams.swiglu_clamp_shexp, n_clamp, 0)) {
         hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
     }
+    if (n_clamp > 0 && n_clamp < hparams.n_layer_all) {
+        LLAMA_LOG_WARN("%s: swiglu clamp arrays cover %u of %u blocks; broadcasting "
+                       "[%u] = %.3f / %.3f to the remaining stages\n", __func__,
+                       n_clamp, hparams.n_layer_all, n_clamp - 1,
+                       (double) hparams.swiglu_clamp_exp[n_clamp - 1],
+                       (double) hparams.swiglu_clamp_shexp[n_clamp - 1]);
+        for (uint32_t il = n_clamp; il < hparams.n_layer_all; ++il) {
+            hparams.swiglu_clamp_exp[il]   = hparams.swiglu_clamp_exp[n_clamp - 1];
+            hparams.swiglu_clamp_shexp[il] = hparams.swiglu_clamp_shexp[n_clamp - 1];
+        }
+    }
+    // MAD-LAB: end
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
