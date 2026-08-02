@@ -148,7 +148,8 @@ llama_context::llama_context(
             hparams.n_layer() > 0 ? (int32_t) hparams.n_layer() - 1 : -1;
         if (expert_dispatch_borrowed) {
             expert_dispatch = params.ctx_other->expert_dispatch;
-            LLAMA_LOG_INFO("%s: borrowing expert dispatcher from parent context (%zu workers)\n",
+            // MAD-LAB: keep dispatcher borrowing visible at the server's default log threshold.
+            LLAMA_LOG_WARN("%s: borrowing expert dispatcher from parent context (%zu workers)\n",
                            __func__, expert_dispatch->n_workers());
         } else {
             expert_dispatch_owned.reset(new pipe_expert_dispatcher::graph_dispatcher(
