@@ -7340,7 +7340,14 @@ int main(int argc, char** argv) {
         //   run_dsws2 (the v2 PM4 launch + tiered-oracle path). DSWS2_DRYRUN=1 -> print params + return
         //   rc=0 WITHOUT touching the GPU (gate 2 of A8: must still dry-print, never dispatch). =====
         DswsCfg c = parse_dsws_cfg();
-        const int FNc = 4;                                           // FN is fixed (the shared N-reuse operand)
+        // FN BECAME A LEVER 2026-07-29 (was `const int FNc = 4`, "FN is fixed"). Same COMPILE-TIME MATCH
+        //   discipline as FM below: FNc sets the N-panel extent (TN = FN*16), the C tile bytes, the
+        //   operand-pool stride and the oracle addressing, so a host FNc that disagrees with the built
+        //   -defsym FN silently corrupts C. ALWAYS rebuild the flow bin with a matching FN.
+        //   WHY: feed-loads/WMMA = (FM+FN)/(FM*FN) is the frag-grid axis, and with FN pinned at 4 the
+        //   only reachable points at super-tile M=128 were 0.750 (FM=2) and 1.250 (FM=1) -- two points,
+        //   which is not enough to extrapolate from. See DSWS_TESTING_LOG.md §23.
+        const int FNc = getenv("DSWS2_FN") ? atoi(getenv("DSWS2_FN")) : 4;   // default 4 == legacy fixed N-reuse operand
         // FM is a LEVER (2026-07-14). FM=1 drops NFV 112->80 (Gmax 3->6) and changes the super-tile M
         //   extent from G*16*FM to G*16, so REAL shapes only need M % (G*16) instead of M % (G*32) --
         //   doubling how many rowblks/waves can compute. FMc is a COMPILE-TIME MATCH to the bin: it sets
@@ -7467,11 +7474,32 @@ int main(int argc, char** argv) {
             printf("  *** REFUSE: pool size overflows uint32_t (TOTAL=%llu TOTAL_super=%lld) -- occ[20]'s claim "
                    "counter and the kernel's sti are both 32-bit ***\n", (unsigned long long)TOTAL64, TOTAL_super);
             rc = 4;
+        } else if ( ((32 + 8*FMc*FNc + 2*FMc + 2*FNc + 15) & ~15)
+                        > (getenv("DSWS2_VGPR_CAP") ? atoi(getenv("DSWS2_VGPR_CAP")) : 128) ) {
+            // *** dyn-VGPR GROW-TARGET GATE (2026-07-29). THIS PREVENTS A HANG, NOT A DEVIATION. ***
+            // NFV = roundup16(32 + 8*FM*FN + 2*FM + 2*FN) is the kernel's s_alloc_vgpr target (same
+            // formula as :3246). Verified against disassembly: FM1FN4->80 (0x50), FM2FN4->112 (0x70),
+            // FM4FN4->176 (0xb0). The per-wave cap is (MAX_BLOCK_ALLOC+1)*BLOCK_SIZE = (7+1)*16 = 128.
+            // Over the cap, s_alloc_vgpr fails on EVERY wave PERMANENTLY -- the kernel never progresses.
+            // That is a hang (rule 3 full stop), not a slow run, and grow-fail in occ[73] looks identical
+            // to benign over-subscription pressure, so it is NOT distinguishable after the fact.
+            // Deliberately NOT covered by DSWS_ALLOW_NONSTD: that is a policy override for A/B arms.
+            // Raising this requires DSWS2_VGPR_CAP=256 AND the volatile `sudo umr` BLOCK_SIZE=1 flip,
+            // which reverts on idle -- so re-verify the flip immediately before every dispatch.
+            const int nfvReq = ((32 + 8*FMc*FNc + 2*FMc + 2*FNc + 15) & ~15);
+            const int capNow = getenv("DSWS2_VGPR_CAP") ? atoi(getenv("DSWS2_VGPR_CAP")) : 128;
+            printf("  *** REFUSE: DSWS2_FM=%d DSWS2_FN=%d needs NFV=%d VGPRs but the dyn-VGPR cap is %d. "
+                   "s_alloc_vgpr would fail on EVERY wave, permanently -- that is a HANG, not a slow run. "
+                   "Legal at cap 128: FM*FN <= 10 (2x4=112, 4x2=112, 1x4=80, 2x2=80). To exceed it, apply "
+                   "the umr BLOCK_SIZE=1 flip (cap 256, VOLATILE) and set DSWS2_VGPR_CAP=256. "
+                   "DSWS_ALLOW_NONSTD does NOT bypass this. ***\n", FMc, FNc, nfvReq, capNow);
+            rc = 4;
         } else if ( getenv("DSWS2_FLOW")
                         ? !((Gv >= 2 && Gv <= 32) &&
                             (SEGKv == 16 || SEGKv == 32 || SEGKv == 64 || SEGKv == 128 || SEGKv == 256) &&
-                            (FMc == 1 || FMc == 2))                    // flow: FM=1 (Gmax->6) or FM=2 (legacy) -- bin must match
-                        : (Gv != 6 || SEGKv != 64 || FMc != 2) ) {     // non-flow: fixed coop tile is always FM=2
+                            (FMc == 1 || FMc == 2 || FMc == 4 || FMc == 8) &&   // FM widened 2026-07-29 (was {1,2});
+                            (FNc >= 1 && FNc <= 8))                             //   the NFV gate above is the real limiter
+                        : (Gv != 6 || SEGKv != 64 || FMc != 2 || FNc != 4) ) {  // non-flow: fixed coop tile is always FM=2 FN=4
             // G RAISED TO 16 (2026-07-13 night). G == ACC_N == the number of rowblks in a super-tile ==
             //   THE NUMBER OF WAVES THAT CAN EVER COMPUTE CONCURRENTLY (SL_RBNEXT hands out 0..ACC_N-1).
             //   At G=4 only 4 of 24 waves per WG could ever run a WMMA -- 83% of the fleet was
@@ -7497,9 +7525,9 @@ int main(int argc, char** argv) {
             // FIX 1 STAGGER: the flow bin (build_flow.sh) can now be built with SEGK=32 (halves the
             //   operand footprint so the g=6 write-once accumulator banks fit LDS) -- so SEGK=32 is
             //   allowed ONLY on the DSWS2_FLOW path, where the run must pass a matching DSWS2_SEGK=32.
-            printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d DSWS2_FM=%d mismatches the built bin's compile-time geometry "
-                   "(non-flow: G=6 SEGK=64 FM=2; flow: G in [2,32] SEGK in {16,32,64,128,256} FM in {1,2}) "
-                   "-- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv, FMc);
+            printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d DSWS2_FM=%d DSWS2_FN=%d mismatches the built bin's compile-time "
+                   "geometry (non-flow: G=6 SEGK=64 FM=2 FN=4; flow: G in [2,32] SEGK in {16,32,64,128,256} "
+                   "FM in {1,2,4,8} FN in [1,8]) -- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv, FMc, FNc);
             rc = 4;
         } else {
             char dswsBin[160];

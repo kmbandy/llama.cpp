@@ -1,0 +1,1631 @@
+{
+  "formula": "TF = 2*padded_M*N*K*repetitions*tick_hz/summed_ticks/1e12; real_TF = TF*real_M/padded_M",
+  "generated_utc": "2026-07-29T23:43:59.638988+00:00",
+  "mode": "live",
+  "records": [
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 9216,
+        "padded_m": 2048,
+        "real_m": 2048,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M2048_193119.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 22,
+        "spread_percent_reported_1dp": 14.0
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 9.259175044544897,
+        "real_flop_corrected": 9.259175044544897,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 66,
+        "repetitions": 22,
+        "tick_mhz": 100.0,
+        "ticks": 22961104
+      }
+    },
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 9216,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M512_193203.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 166,
+        "spread_percent_reported_1dp": 26.8
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 8.700490596223633,
+        "real_flop_corrected": 8.700490596223633,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 166,
+        "repetitions": 166,
+        "tick_mhz": 100.0,
+        "ticks": 46094248
+      }
+    },
+    {
+      "geometry": {
+        "k": 9216,
+        "n": 2560,
+        "padded_m": 2048,
+        "real_m": 2048,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M2048_193230.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 116,
+        "spread_percent_reported_1dp": 35.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_ffn_down"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 14.689318142918596,
+        "real_flop_corrected": 14.689318142918596,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 116,
+        "repetitions": 116,
+        "tick_mhz": 100.0,
+        "ticks": 76313036
+      }
+    },
+    {
+      "geometry": {
+        "k": 9216,
+        "n": 2560,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M512_193315.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 173,
+        "spread_percent_reported_1dp": 31.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_ffn_down"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 7.514314816695265,
+        "real_flop_corrected": 7.514314816695265,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 173,
+        "repetitions": 173,
+        "tick_mhz": 100.0,
+        "ticks": 55621040
+      }
+    },
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 4096,
+        "padded_m": 2048,
+        "real_m": 2048,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M2048_193341.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 137,
+        "spread_percent_reported_1dp": 24.9
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_q"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 11.335437008576942,
+        "real_flop_corrected": 11.335437008576942,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 137,
+        "repetitions": 137,
+        "tick_mhz": 100.0,
+        "ticks": 51908940
+      }
+    },
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 4096,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M512_193411.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 192,
+        "spread_percent_reported_1dp": 18.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_q"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.003003625894789,
+        "real_flop_corrected": 5.003003625894789,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 192,
+        "repetitions": 192,
+        "tick_mhz": 100.0,
+        "ticks": 41206932
+      }
+    },
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 1024,
+        "padded_m": 2048,
+        "real_m": 2048,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M2048_193438.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 197,
+        "spread_percent_reported_1dp": 19.5
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_kv"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.487628537444848,
+        "real_flop_corrected": 5.487628537444848,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 197,
+        "repetitions": 197,
+        "tick_mhz": 100.0,
+        "ticks": 38546184
+      }
+    },
+    {
+      "geometry": {
+        "k": 2560,
+        "n": 1024,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M512_193500.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 239,
+        "spread_percent_reported_1dp": 21.7
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_kv"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 2.7203792101462105,
+        "real_flop_corrected": 2.7203792101462105,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 239,
+        "repetitions": 239,
+        "tick_mhz": 100.0,
+        "ticks": 23583504
+      }
+    },
+    {
+      "geometry": {
+        "k": 4096,
+        "n": 2560,
+        "padded_m": 2048,
+        "real_m": 2048,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M2048_193521.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 151,
+        "spread_percent_reported_1dp": 30.9
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_o"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 12.121096831058832,
+        "real_flop_corrected": 12.121096831058832,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 151,
+        "repetitions": 151,
+        "tick_mhz": 100.0,
+        "ticks": 53505064
+      }
+    },
+    {
+      "geometry": {
+        "k": 4096,
+        "n": 2560,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M512_193548.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 199,
+        "spread_percent_reported_1dp": 21.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_dense_attn_o"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.231699583588543,
+        "real_flop_corrected": 5.231699583588543,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 199,
+        "repetitions": 199,
+        "tick_mhz": 100.0,
+        "ticks": 40842296
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 512,
+        "padded_m": 256,
+        "real_m": 64,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M64_193609.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 258,
+        "spread_percent_reported_1dp": 6.9
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_kv",
+        "ml8_moe_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 0.8745027174401655,
+        "real_flop_corrected": 0.21862567936004138,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 258,
+        "repetitions": 258,
+        "tick_mhz": 100.0,
+        "ticks": 15839024
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 512,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M512_193627.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 252,
+        "spread_percent_reported_1dp": 33.5
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_kv",
+        "ml8_moe_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.49293827479609,
+        "real_flop_corrected": 1.49293827479609,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 252,
+        "repetitions": 252,
+        "tick_mhz": 100.0,
+        "ticks": 18124188
+      }
+    },
+    {
+      "geometry": {
+        "k": 512,
+        "n": 2048,
+        "padded_m": 256,
+        "real_m": 64,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M64_193646.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 252,
+        "spread_percent_reported_1dp": 35.4
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_ffn_down"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 0.8149348229329528,
+        "real_flop_corrected": 0.2037337057332382,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 252,
+        "repetitions": 252,
+        "tick_mhz": 100.0,
+        "ticks": 16601508
+      }
+    },
+    {
+      "geometry": {
+        "k": 512,
+        "n": 2048,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M512_193704.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 242,
+        "spread_percent_reported_1dp": 30.8
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_ffn_down"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.4088832441449957,
+        "real_flop_corrected": 1.4088832441449957,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 242,
+        "repetitions": 242,
+        "tick_mhz": 100.0,
+        "ticks": 18443368
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 4096,
+        "padded_m": 256,
+        "real_m": 64,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M64_193726.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 214,
+        "spread_percent_reported_1dp": 21.5
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_q"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 2.7047469618014888,
+        "real_flop_corrected": 0.6761867404503722,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 214,
+        "repetitions": 214,
+        "tick_mhz": 100.0,
+        "ticks": 33981848
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 4096,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M512_193751.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 200,
+        "spread_percent_reported_1dp": 18.9
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_q"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 4.702061430081292,
+        "real_flop_corrected": 4.702061430081292,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 200,
+        "repetitions": 200,
+        "tick_mhz": 100.0,
+        "ticks": 36536888
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 512,
+        "padded_m": 256,
+        "real_m": 64,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M64_193813.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 258,
+        "spread_percent_reported_1dp": 37.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_kv",
+        "ml8_moe_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 0.8664356172609683,
+        "real_flop_corrected": 0.21660890431524207,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 258,
+        "repetitions": 258,
+        "tick_mhz": 100.0,
+        "ticks": 15986496
+      }
+    },
+    {
+      "geometry": {
+        "k": 2048,
+        "n": 512,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M512_193833.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 252,
+        "spread_percent_reported_1dp": 32.2
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_kv",
+        "ml8_moe_ffn_gate_up"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.4968082652923043,
+        "real_flop_corrected": 1.4968082652923043,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 252,
+        "repetitions": 252,
+        "tick_mhz": 100.0,
+        "ticks": 18077328
+      }
+    },
+    {
+      "geometry": {
+        "k": 4096,
+        "n": 2048,
+        "padded_m": 256,
+        "real_m": 64,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M64_193852.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 226,
+        "spread_percent_reported_1dp": 4.8
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_o"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 3.1984544576053193,
+        "real_flop_corrected": 0.7996136144013298,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 226,
+        "repetitions": 226,
+        "tick_mhz": 100.0,
+        "ticks": 30347864
+      }
+    },
+    {
+      "geometry": {
+        "k": 4096,
+        "n": 2048,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M512_193911.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 210,
+        "spread_percent_reported_1dp": 17.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "ml8_moe_attn_o"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.01531063000388,
+        "real_flop_corrected": 5.01531063000388,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 210,
+        "repetitions": 210,
+        "tick_mhz": 100.0,
+        "ticks": 35967588
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 4224,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_mamba_in_proj_M4096_193931.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 24,
+        "spread_percent_reported_1dp": 10.4
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_mamba_in_proj"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 4.810771402684788,
+        "real_flop_corrected": 4.783437474260442,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 72,
+        "repetitions": 24,
+        "tick_mhz": 100.0,
+        "ticks": 13257804
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 4224,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_in_proj_ML8PAD_M4096_193957.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 24,
+        "spread_percent_reported_1dp": 9.3
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_in_proj_ML8PAD"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 4.835831432440424,
+        "real_flop_corrected": 4.817513889135725,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 72,
+        "repetitions": 24,
+        "tick_mhz": 100.0,
+        "ticks": 13189100
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 1536,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc1_M512_194023.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 248,
+        "spread_percent_reported_1dp": 29.7
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_MoE_expert_fc1"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.7821031840313486,
+        "real_flop_corrected": 1.7821031840313486,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 248,
+        "repetitions": 248,
+        "tick_mhz": 100.0,
+        "ticks": 16810136
+      }
+    },
+    {
+      "geometry": {
+        "k": 1536,
+        "n": 768,
+        "padded_m": 512,
+        "real_m": 512,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc2_M512_194041.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 252,
+        "spread_percent_reported_1dp": 31.2
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_MoE_expert_fc2"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.7669769174990764,
+        "real_flop_corrected": 1.7669769174990764,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 252,
+        "repetitions": 252,
+        "tick_mhz": 100.0,
+        "ticks": 17227492
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 32000,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_lm_head_M4096_194059.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 4,
+        "spread_percent_reported_1dp": 3.0
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_lm_head"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.842228772702026,
+        "real_flop_corrected": 5.842228772702026,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 64,
+        "repetitions": 4,
+        "tick_mhz": 100.0,
+        "ticks": 13784232
+      }
+    },
+    {
+      "geometry": {
+        "k": 1536,
+        "n": 768,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_mamba_out_proj_M4096_194214.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 193,
+        "spread_percent_reported_1dp": 20.2
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_mamba_out_proj"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 5.204860588120449,
+        "real_flop_corrected": 5.204860588120449,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 193,
+        "repetitions": 193,
+        "tick_mhz": 100.0,
+        "ticks": 35833612
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 768,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_o_proj_M4096_194235.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 201,
+        "spread_percent_reported_1dp": 15.6
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_attn_o_proj"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 3.16146940113951,
+        "real_flop_corrected": 3.16146940113951,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 201,
+        "repetitions": 201,
+        "tick_mhz": 100.0,
+        "ticks": 30719876
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 256,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_router_down_proj_M4096_194255.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 239,
+        "spread_percent_reported_1dp": 26.1
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_router_down_proj"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.9131094379082056,
+        "real_flop_corrected": 1.9131094379082056,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 239,
+        "repetitions": 239,
+        "tick_mhz": 100.0,
+        "ticks": 20120984
+      }
+    },
+    {
+      "geometry": {
+        "k": 256,
+        "n": 256,
+        "padded_m": 4096,
+        "real_m": 4096
+      },
+      "provenance_log": null,
+      "quality": null,
+      "reason": "UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128",
+      "shape_candidates": [
+        "mlmf_router_MLP"
+      ],
+      "status": "UNSUPPORTED",
+      "throughput_tflops": null,
+      "timing_inputs": null
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 192,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_linear_k_M4096_194320.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 248,
+        "spread_percent_reported_1dp": 30.4
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_attn_linear_k"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.7387548556800934,
+        "real_flop_corrected": 1.7387548556800934,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 248,
+        "repetitions": 248,
+        "tick_mhz": 100.0,
+        "ticks": 17229224
+      }
+    },
+    {
+      "geometry": {
+        "k": 768,
+        "n": 128,
+        "padded_m": 4096,
+        "real_m": 4096,
+        "super_tile_m": 256
+      },
+      "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_val_proj1_M4096_194340.log",
+      "quality": {
+        "assessment": "repeated",
+        "repetitions": 254,
+        "spread_percent_reported_1dp": 31.0
+      },
+      "reason": null,
+      "shape_candidates": [
+        "mlmf_attn_val_proj1"
+      ],
+      "status": "PASS",
+      "throughput_tflops": {
+        "padded_m_measured_work": 1.3165240656602062,
+        "real_flop_corrected": 0.9873930492451546,
+        "self_validation": "PASS: derived value agrees with kernel rounded TF and peak percentage"
+      },
+      "timing_inputs": {
+        "chunks": 254,
+        "repetitions": 254,
+        "tick_mhz": 100.0,
+        "ticks": 15536960
+      }
+    },
+    {
+      "geometry": {
+        "k": 256,
+        "n": 8,
+        "padded_m": 4096,
+        "real_m": 4096
+      },
+      "provenance_log": null,
+      "quality": null,
+      "reason": "UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128",
+      "shape_candidates": [
+        "mlmf_router_out"
+      ],
+      "status": "UNSUPPORTED",
+      "throughput_tflops": null,
+      "timing_inputs": null
+    },
+    {
+      "geometry": {
+        "k": 256,
+        "n": 16,
+        "padded_m": 4096,
+        "real_m": 4096
+      },
+      "provenance_log": null,
+      "quality": null,
+      "reason": "UNSUPPORTED_GEOMETRY: n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128",
+      "shape_candidates": [
+        "mlmf_routerout_ML8PAD"
+      ],
+      "status": "UNSUPPORTED",
+      "throughput_tflops": null,
+      "timing_inputs": null
+    }
+  ],
+  "schema": "dsws-realshape-bench-v1",
+  "shape_inventory": [
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_ffn_gate_up",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M2048_193119.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M2048_193119.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 9216,
+      "padded_m_live": 2048,
+      "real_m": 2048,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_ffn_gate_up",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M512_193203.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_gate_up_M512_193203.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 9216,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 9216,
+      "label": "ml8_dense_ffn_down",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M2048_193230.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M2048_193230.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2560,
+      "padded_m_live": 2048,
+      "real_m": 2048,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 9216,
+      "label": "ml8_dense_ffn_down",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M512_193315.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_ffn_down_M512_193315.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2560,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_attn_q",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M2048_193341.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M2048_193341.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4096,
+      "padded_m_live": 2048,
+      "real_m": 2048,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_attn_q",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M512_193411.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_q_M512_193411.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4096,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_attn_kv",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M2048_193438.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M2048_193438.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 1024,
+      "padded_m_live": 2048,
+      "real_m": 2048,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2560,
+      "label": "ml8_dense_attn_kv",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M512_193500.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_kv_M512_193500.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 1024,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 4096,
+      "label": "ml8_dense_attn_o",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M2048_193521.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M2048_193521.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2560,
+      "padded_m_live": 2048,
+      "real_m": 2048,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 4096,
+      "label": "ml8_dense_attn_o",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M512_193548.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_dense_attn_o_M512_193548.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2560,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_ffn_gate_up",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M64_193609.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M64_193609.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 512,
+      "padded_m_live": 256,
+      "real_m": 64,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_ffn_gate_up",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M512_193627.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_gate_up_M512_193627.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 512,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 512,
+      "label": "ml8_moe_ffn_down",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M64_193646.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M64_193646.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2048,
+      "padded_m_live": 256,
+      "real_m": 64,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 512,
+      "label": "ml8_moe_ffn_down",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M512_193704.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_ffn_down_M512_193704.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2048,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_attn_q",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M64_193726.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M64_193726.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4096,
+      "padded_m_live": 256,
+      "real_m": 64,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_attn_q",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M512_193751.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_q_M512_193751.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4096,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_attn_kv",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M64_193813.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M64_193813.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 512,
+      "padded_m_live": 256,
+      "real_m": 64,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 2048,
+      "label": "ml8_moe_attn_kv",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M512_193833.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_kv_M512_193833.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 512,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 4096,
+      "label": "ml8_moe_attn_o",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M64_193852.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M64_193852.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2048,
+      "padded_m_live": 256,
+      "real_m": 64,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 4096,
+      "label": "ml8_moe_attn_o",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M512_193911.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_ml8_moe_attn_o_M512_193911.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 2048,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "NO_ACCEPTED_LOG",
+      "k": 768,
+      "label": "mlmf_mamba_in_proj",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_mamba_in_proj_M4096_193931.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4200,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "NO_ACCEPTED_LOG",
+      "k": 768,
+      "label": "mlmf_in_proj_ML8PAD",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_in_proj_ML8PAD_M4096_193957.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 4208,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 768,
+      "label": "mlmf_MoE_expert_fc1",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc1_M512_194023.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc1_M512_194023.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 1536,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 1536,
+      "label": "mlmf_MoE_expert_fc2",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc2_M512_194041.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_MoE_expert_fc2_M512_194041.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 768,
+      "padded_m_live": 512,
+      "real_m": 512,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 768,
+      "label": "mlmf_lm_head",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_lm_head_M4096_194059.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_lm_head_M4096_194059.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 32000,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 1536,
+      "label": "mlmf_mamba_out_proj",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_mamba_out_proj_M4096_194214.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_mamba_out_proj_M4096_194214.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 768,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 768,
+      "label": "mlmf_attn_o_proj",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_o_proj_M4096_194235.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_o_proj_M4096_194235.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 768,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 768,
+      "label": "mlmf_router_down_proj",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_router_down_proj_M4096_194255.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_router_down_proj_M4096_194255.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 256,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "UNSUPPORTED_LIVE",
+      "k": 256,
+      "label": "mlmf_router_MLP",
+      "live_status": "UNSUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [],
+      "n": 256,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": "n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128"
+    },
+    {
+      "archive_status": "PASS_LOG_AVAILABLE",
+      "k": 768,
+      "label": "mlmf_attn_linear_k",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [
+        "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_linear_k_M4096_194320.log"
+      ],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_linear_k_M4096_194320.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 192,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "NO_ACCEPTED_LOG",
+      "k": 768,
+      "label": "mlmf_attn_val_proj1",
+      "live_status": "SUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [
+        {
+          "provenance_log": "/home/kmbandy/dsws_gpu_logs/poolauto_waves6_mlmf_attn_val_proj1_M4096_194340.log",
+          "reason": null,
+          "status": "PASS"
+        }
+      ],
+      "n": 96,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": null
+    },
+    {
+      "archive_status": "UNSUPPORTED_LIVE",
+      "k": 256,
+      "label": "mlmf_router_out",
+      "live_status": "UNSUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [],
+      "n": 8,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": "n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128"
+    },
+    {
+      "archive_status": "UNSUPPORTED_LIVE",
+      "k": 256,
+      "label": "mlmf_routerout_ML8PAD",
+      "live_status": "UNSUPPORTED",
+      "matching_pass_logs": [],
+      "matching_records": [],
+      "n": 16,
+      "padded_m_live": 4096,
+      "real_m": 4096,
+      "reason": "n_kseg=1<2 at SEGK=256 (ZLOCK needs >=2) -- rerun with --segk 128"
+    }
+  ],
+  "summary": {
+    "fail": 0,
+    "inputs": 33,
+    "other": 3,
+    "pass": 30
+  }
+}

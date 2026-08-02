@@ -74,12 +74,17 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
                                    int32_t             n_embd,
                                    int32_t             n_ff_exp,
                                    int32_t             n_expert,
-                                   int32_t             n_expert_used) :
+                                   int32_t             n_expert_used,
+                                   int32_t             last_no_defer_layer) :
     remote(parse_endpoints(endpoints)),
     collect_stats_(dispatch_stats_enabled()) {
     if (remote.n_embd() != n_embd || remote.n_ff_exp() != n_ff_exp || remote.n_expert() != n_expert ||
         remote.n_expert_used() != n_expert_used) {
         throw std::runtime_error("expert dispatcher workers do not match the model MoE dimensions");
+    }
+
+    if (last_no_defer_layer >= 0) {
+        remote.set_last_no_defer_layer(last_no_defer_layer);
     }
 
     // Spec §3: print the ACTUAL runtime value at WARN (logger threshold 3 filters
@@ -89,9 +94,11 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
     // (ABI mismatch 2026-07-30); env var read at startup only.
     const int k = remote.defer_k();
     LLAMA_LOG_WARN(
-        "expert dispatch: WP_DEFER_K=%d (%s; 0=off/defer nothing; K=immediate experts per token)\n",
+        "expert dispatch: WP_DEFER_K=%d (%s; 0=off/defer nothing; K=immediate experts per token) "
+        "last_no_defer_layer=%d\n",
         k,
-        k <= 0 ? "OFF" : "ON");
+        k <= 0 ? "OFF" : "ON",
+        remote.last_no_defer_layer());
 }
 
 graph_dispatcher::~graph_dispatcher() {

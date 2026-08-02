@@ -663,6 +663,7 @@ struct llama_model {
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
+    uint32_t dflash_block_size = 0;
     uint32_t dflash_hc_mult = 1;
 
     std::vector<llama_layer> layers;

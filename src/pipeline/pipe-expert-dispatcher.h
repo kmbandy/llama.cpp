@@ -99,6 +99,13 @@ class dispatcher {
     const dispatch_stats & last_dispatch_stats() const;
     const deferral_stats & get_deferral_stats() const;
     int                    defer_k() const;
+    int32_t                last_no_defer_layer() const;
+
+    // Layer that must not leave deferred work pending (no successor in the
+    // main graph to fold into). Pass hparams.n_layer()-1 from the host so
+    // NextN/MTP layers advertised by workers are not treated as the fold
+    // successor of the main stack. -1 keeps the worker-advertised max.
+    void set_last_no_defer_layer(int32_t layer) noexcept;
 
     // Sample NVMe util window and reset per-window gap accounting.
     void begin_deferral_window() noexcept;

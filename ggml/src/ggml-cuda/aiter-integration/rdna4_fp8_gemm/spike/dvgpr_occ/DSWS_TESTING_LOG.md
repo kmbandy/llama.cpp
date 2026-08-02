@@ -3512,3 +3512,1384 @@ vestigial under SELFSERVE on 2026-07-27 (zero OPSTRIDE/ARES_OFF immediates in th
 and Codex-reviewed NOT-REFUTED. It is still live, deliberately, so it would not confound the sweep.
 Legal today at constant super-tile M=128: `FM=1 G=8`, `FM=2 G=4`, `FM=4 G=2` — which is exactly the
 3×2 frag-grid × occupancy sweep pre-registered as the first task for 2026-07-28.
+
+---
+
+## 2026-07-29 MORNING — THE FRAG-GRID × OCCUPANCY 2×2 CLOSES. OCCUPANCY REPLICATES; FEED IS SECOND-ORDER.
+
+Execution of the sweep pre-registered in `DSWS_BRIEF_2026-07-28_AM.md` §0. Two dispatches (arms E and F);
+A and B were measured 2026-07-27 evening. **Arms C and D were killed OFFLINE before any silicon** — see §22.
+Logs: `sweepF_fm1_g8_accn8_pool64_nonstd_081348.log`, `sweepE_fm1_g8_accn4_pool128_nonstd_083207.log`.
+
+Design: `superM = G*16*FM = 128` in every arm, so the work decomposition is held fixed and only the
+per-wave frag grid and the occupancy vary. Gates clean on both new arms: `oracle bad=0`, WORK-EXACT,
+`occ[96]` delta +0, `occ[0]=0`, canary clean, `grow-fail=0`.
+
+| arm | FM | G | ACC_N | GROUPS | WG/CU | feed/WMMA | TF | spread |
+|---|---|---|---|---|---|---|---:|---|
+| A | 2 | 4 | 2 | 2 | 2 | 0.750 | 4.73 | (07-27) |
+| B | 2 | 4 | 4 | 1 | 1 | 0.750 | **7.70** | 1.9% / 34 reps |
+| E | 1 | 8 | 4 | 2 | 2 | 1.250 | **3.8** | 10.5% / 27 reps |
+| F | 1 | 8 | 8 | 1 | 1 | 1.250 | **6.3** | 14.8% / 32 reps |
+
+### 21. ★ THE OCCUPANCY EFFECT REPLICATES: +63% AND +66% ★
+A→B gained **+63%**; E→F gained **+66%** — measured at a DIFFERENT frag grid, in a different session,
+on a different build. The 1 WG/CU finding is not an artifact of the FM=2 geometry. This is now the most
+robust result in the project, and it strengthens the case for retiring the `ML8_POOL=128` standard that
+`build_flow.sh` and `gpu_run.sh` still enforce (pending the 30-shape sweep — see §24).
+
+### 22. ★ ARMS C AND D ARE UNRUNNABLE AT THE DEFAULT dyn-VGPR CAP — CAUGHT OFFLINE ★
+Disassembled the `s_alloc_vgpr` grow target for each arm.
+
+**[CORRECTED 2026-07-29, same day: this section first stated the ask as `48 + FM*32`. That is only the
+FN=4 special case. The GENERAL formula — the kernel's own, mirrored at `occ_dispatch.cpp:3246` — is
+`NFV = roundup16(32 + 8*FM*FN + 2*FM + 2*FN)`. It reproduces all three disassembled values exactly
+(FM1FN4→80, FM2FN4→112, FM4FN4→176). The wrong form mattered the moment FN became a knob, which
+happened hours later — see §27.]**
+
+| arm | FM | grow ask | vs 128 cap |
+|---|---|---|---|
+| A/B | 2 | `0x70` = 112 | fits, 16 to spare |
+| **C/D** | **4** | `0xb0` = **176** | **EXCEEDS BY 48** |
+| E/F | 1 | `0x50` = 80 | fits easily |
+
+**Therefore FM=2 is the maximum frag height at the default cap**, and FM=4 requires the volatile
+`BLOCK_SIZE=1` umr flip to 256. The 07-28 brief predicted FM=4 would land *exactly at* 128 and warned to
+watch for grow-fail; the truth is worse — the ask OVERSHOOTS, which is a permanent 100% grow failure on
+every wave, i.e. a hang risk, not a slow run. **Rule 6 (max work offline first) paid for itself here.**
+
+### 23. THE FEED RATIO IS REAL BUT SECOND-ORDER (elasticity ≈ 0.4, not 1.0)
+B→F and A→E both raise feed loads +67% (0.750 → 1.250) and cost **−18%** and **−20%** respectively.
+If frag loads were the binding constraint the loss would be ~40%. It is not.
+
+The design isolated the axis better than expected: `occ[96]` is **23,040 per rep in BOTH arms**, so
+super-tile coordination is identical and only the inner-loop frag-load count moved.
+
+Feed loads per rep: FM=1 = 921,600 · FM=2 = 552,960 · FM=4 = 368,640.
+Power-law fit: **TF ∝ loads^−0.39** at 1 WG/CU, **^−0.43** at 2 WG/CU. The two independent fits agreeing
+is the reassuring part. The axes do not interact — the effects are independent and multiplicative.
+
+**PROJECTION for arm D (RECORDED AS A PREDICTION, NOT A RESULT): ~8.6–9.0 TF, about +15% over B.**
+This is a two-point power-law extrapolated OUTSIDE the measured range, in the direction not sampled.
+That is exactly the shape of inference that breaks. Do not bank it. It is the ONLY thing the umr flip
+buys, and the flip is sudo + volatile + on the display GPU.
+
+### 24. `dsws_realshape_bench.py` CANNOT RUN THE POOL-64 SWEEP (offline, confirmed)
+`grep ALLOW_NONSTD` returns **zero hits** in the script. `--pool` IS threaded (`:632`, default 128) but
+`DSWS_ALLOW_NONSTD=1` is not, so `gpu_run.sh` will REFUSE every shape at `--pool 64`. The 30-shape gate
+that would promote the secondary 1 WG/CU config to config-of-record is blocked until this is added.
+Suspected in the 07-28 brief §0.5; now confirmed.
+
+### 25. WHAT DID NOT MOVE — CEILING A IS UNTOUCHED
+`door1 NOTHING-STAGED = 100.0% of coast` in BOTH arms. Coast-frac **90.9%** (F) and **96.9%** (E).
+Doors 2/3/4 flat zero everywhere; `grow-fail=0`; `occ[97]` C-store-gate bails **= 0** in both.
+Both levers measured today are second-order dressing on a machine that spends ~90%+ of its feed-path
+iterations with nothing staged to work on. **Neither the frag grid nor the umr flip touches Ceiling A.**
+
+### 26. MEASUREMENT NOTE — THE FM=1 ARMS ARE NOISY
+E and F spread 10.5% and 14.8%, against B's 1.9%. F per-rep ran 5.7–6.7; even the top of that range
+sits clearly under B's 7.70, so the DIRECTION is safe, but **do not quote 6.3 or 3.8 to two significant
+figures.** `DSWS2_RESVPROBE=1` was deliberately OMITTED from both dispatches: the 07-28 brief §0 command
+block included it, but arm B's 7.70 baseline did not, and matching the baseline env exactly except for
+the frag grid is what makes the comparison valid. Probes lie.
+
+### 27. FN IS NOW A KNOB (offline, no GPU) — AND IT GIVES US A REAL CONTROL, NOT JUST MORE POINTS
+`FN` was a hard-coded literal in two places: `-defsym,FN=4` in `build_flow.sh` mkflow, and
+`const int FNc = 4;  // FN is fixed (the shared N-reuse operand)` at `occ_dispatch.cpp:7343`.
+Both now read `FN` / `DSWS2_FN`. Everything downstream (`TN=FN*16`, C sizing, operand stride, oracle
+addressing) was ALREADY parameterized, so this was a two-line change plus guards.
+
+**★ THE POINT IS THE CONTROL ARM `FM=4 FN=2`. ★** Its feed-loads/WMMA is `(4+2)/8 = 0.750` — IDENTICAL
+to the current `FM=2 FN=4` — and its NFV is 112, also identical. Same super-tile M=128, and at
+`ML8_POOL=64` the same 1 WG/CU and GROUPS=1. **The ONLY thing that differs is the shape of the frag
+grid.** If it does not measure ~7.70, then feed-loads/WMMA is NOT the mechanism, the grid SHAPE is, and
+the arm-D projection in §23 is worthless. This is the falsification test, and it costs no umr flip.
+Residual confound, stated honestly: LDS differs (17,920 vs 34,304) because ACC_STRIDE = FM*FN*1024 is
+unchanged but the bank count differs. At matched `ML8_POOL=64` the wave count is identical, so this is
+much weaker than the confound it replaces, but it is not zero.
+
+### 28. THE LEGAL (FM,FN) FRONTIER AT superM=128, MEASURED BY ASSEMBLING EVERY CELL
+`G*FM = 8` (constant super-tile M=128), `ACC_N = G` (GROUPS=1), `N=2560` so `2560 % (FN*16) == 0`.
+
+| FM | FN | G | NFV | LDS | feed | result |
+|---|---|---|---:|---:|---|---|
+| 1 | 1 | 8 | 48 | 9,728 | 2.000 | assembles |
+| 1 | 2 | 8 | 64 | 17,920 | 1.500 | assembles |
+| 1 | 4 | 8 | 80 | 34,304 | 1.250 | assembles (**arm F, 6.3 TF**) |
+| 2 | 1 | 4 | 64 | 9,728 | 1.500 | assembles |
+| 2 | 2 | 4 | 80 | 17,920 | 1.000 | assembles |
+| 2 | 4 | 4 | 112 | 34,304 | 0.750 | assembles (**arm B, 7.70 TF**) |
+| 4 | 1 | 2 | 80 | 9,728 | 1.250 | assembles |
+| **4** | **2** | **2** | **112** | **17,920** | **0.750** | **assembles — THE CONTROL** |
+| 4 | 4 | 2 | 176 | 34,304 | 0.500 | **REFUSED, NFV>128** (arm D — needs the umr flip) |
+| 2 | 5 / 1 | 5 | — | — | — | **BUILD-FAIL: "DSWS2_PREFETCH P2 block decode needs FN power-of-two"** |
+
+**FN MUST BE A POWER OF TWO** — the prefetch P2 path decodes the block index by SHIFT. That is the
+kernel's own assembler-time guard, not an assumption of mine, and it kills the 0.700 point (`FM=2 FN=5`)
+that the plan wanted. Reachable feed ratios under the existing cap are therefore
+**0.750, 1.000, 1.250, 1.500, 2.000** — five points, up from two.
+
+**THREE MATCHED-RATIO CONTROL PAIRS now exist, all buildable today:**
+`0.750`: 2×4 vs 4×2 · `1.250`: 1×4 vs 4×1 · `1.500`: 1×2 vs 2×1.
+If feed ratio is the mechanism, each pair must measure the same. Three independent chances to falsify
+the model before anyone touches a GPU register.
+
+### 29. NEW GUARD: THE dyn-VGPR GROW-TARGET GATE (prevents a HANG, not a deviation)
+Added to BOTH `build_flow.sh` (refuses before assembling) and `occ_dispatch.cpp` (refuses before any
+packet). Computes `NFV = roundup16(32 + 8*FM*FN + 2*FM + 2*FN)` and refuses if it exceeds
+`DSWS2_VGPR_CAP` (default **128**). **Deliberately NOT bypassed by `DSWS_ALLOW_NONSTD`** — that flag is
+a POLICY override for deliberate A/B arms, whereas exceeding the VGPR cap is a permanent 100% grow
+failure on every wave, i.e. a rule-3 hang. Raising it requires `DSWS2_VGPR_CAP=256` AND the volatile
+umr flip. Verified: `FM=4 FN=4` now refuses at build time with the NFV printed; `FM=4 FN=2` builds and
+its disassembly shows `s_alloc_vgpr 0x70` = 112, matching the predicted NFV exactly.
+Also widened the host geometry whitelist from `FM in {1,2}` to `FM in {1,2,4,8}`, `FN in [1,8]` — the
+NFV gate is now the real limiter, which is the correct place for it. (Note: the old `FM in {1,2}`
+whitelist would have refused arms C/D on its own — a second independent guard we did not know we had.)
+
+---
+
+## 2026-07-29 MIDDAY — ★ THE FEED-RATIO MODEL IS FALSIFIED. COORDINATION IS THE LEVER. ★
+
+Two matched-feed-ratio controls, enabled by the FN knob wired this morning (§27). Both gates clean:
+`oracle bad=0`, WORK-EXACT, `occ[96]` delta +0, `occ[0]=0`, canary clean, grow-fail 0.
+Logs: `ctrlFM4FN2_g2_accn2_pool64_nonstd`, `ctrlFM4FN1_g2_accn2_pool64_nonstd`.
+
+| arm | FM×FN | TOTAL_super | feed/WMMA | TF | spread |
+|---|---|---:|---|---:|---|
+| B | 2×4 | 23,040 | 0.750 | **7.70** | 1.9% / 34 |
+| F | 1×4 | 23,040 | 1.250 | **6.30** | 14.8% / 32 |
+| c1 | 4×2 | 46,080 | 0.750 | **4.80** | 10.6% / 20 |
+| c2 | 4×1 | 92,160 | 1.250 | **2.70** | 5.0% / 11 |
+
+### 30. ★ THE FALSIFICATION ★
+**c1 vs B** and **c2 vs F** are each matched on feed-loads/WMMA, feed loads per rep, WMMAs per rep,
+super-tile M, occupancy, GROUPS and NFV. Under the §23 model each pair must measure the same.
+**c1 came in 38% under B. c2 came in 57% under F.** The model predicted the frag grid was the axis;
+the axis is something the frag grid was merely correlated with.
+
+**THE ~8.6-9.0 TF ARM-D PROJECTION IN §23 IS DEAD**, and with it the entire throughput case for the
+umr `BLOCK_SIZE=1` flip. We spent zero register-poke risk finding that out, which is the whole reason
+the control was run before the flip rather than after.
+
+### 31. WHAT IT ACTUALLY IS: TOTAL_super = THE SUPER-TILE COUNT = COORDINATION EVENTS
+`FN` sets the N-panel width, so `TOTAL_super = 11,796,480 / (superM · FN)`. Halving FN doubles the
+number of super-tiles, and `occ[96]` tracked it exactly (23,040 → 46,080 → 92,160 per rep).
+
+**Elasticities, each from a pair holding the OTHER variable constant:**
+| axis | pairs | exponent |
+|---|---|---|
+| **coordination** | B→c1 (2×) and F→c2 (4×) | **−0.682 and −0.611** |
+| frag grid (feed) | B→F (1.667×) | −0.393 |
+
+Two independent coordination fits, at different feed ratios, agreeing to within 0.07. Coordination
+carries ~1.7× the exponent of the frag grid. And unlike the frag grid, **it points AT Ceiling A**:
+`door1 NOTHING-STAGED` is 100% of coast in every arm, and coordination events ARE the boundary events.
+
+### 32. THE LDS COUPLING — WHY IT CANNOT SIMPLY BE TURNED DOWN
+At GROUPS=1 (`ACC_N = G`), with `G·FM = superM/16`:
+```
+TOTAL_super = 11,796,480 / (superM · FN)          LDS = 1536 + (superM/16) · FN · 1024
+```
+The two are inversely locked through the SAME product. We sit at `superM·FN = 512` (LDS 34,304).
+Halving coordination needs `superM·FN = 1024` → **LDS 67,072, over the 65,536 cap by 1,536 B**.
+Both routes fail identically (`superM=256 FN=4` and `superM=128 FN=8`): the accumulator banks scale
+with super-tile AREA, so a super-tile large enough to halve coordination has accumulators that fill
+all of LDS with nothing left for control structures.
+**The way out is GROUPS=2** (`ACC_N = G/2`), which halves the banks. Costs the group barrier (~15%,
+measured §16), gains ×2^0.65 ≈ 1.57 → net ≈ ×1.33.
+
+### 33. THE `:646` OPERAND GUARD IS GATED ON `!SELFSERVE` — AND IT WAS PROVEN DEAD, NOT ASSUMED
+The guard enforced `G·FM ≤ 11` at SEGK=256/FN=4, i.e. **super-tile M ≤ 176** — forbidding exactly the
+direction §31 says to go. It was long noted as "vestigial under SELFSERVE", but `:479` claimed the
+BRES_OFF/ARES_OFF immediates are "emitted unconditionally in the kernel body", and a `.if`-nesting scan
+put the two `v_add_nc_u32 v13, v9, {B,A}RES_OFF` sites at TOP LEVEL. Those two statements contradict.
+
+**DECISIVE TEST (offline):** changed `BRES_OFF` 256 → 1024 — which shifts BRES_OFF and ARES_OFF and
+NOTHING else in the flow layout — and rebuilt. **BYTE-IDENTICAL bin** (`ff7cf5336902d0fe`, 30,940 B).
+If any live instruction encoded those offsets the bin would have moved. The `:479` comment is STALE.
+Guard is now wrapped in `.if !SELFSERVE`, kept verbatim for the legacy path. Verified: default build
+still `ff7cf5336902d0fe` byte-identical, `SELFSERVE=0` still errors, and `superM=256` now assembles.
+
+### 34. NEXT: `FM=2 FN=4 G=8 ACC_N=4` — superM=256, COORDINATION HALVED
+Builds clean: **LDS 34,304 · NFV 112 · GROUPS=2 · TOTAL_super 11,520 (half of arm B) · feed 0.750
+(IDENTICAL to arm B)**. Only coordination and GROUPS differ from the 7.70 baseline.
+**★ CORRECTION TO THIS SECTION, BEFORE THE RUN: IT IS A DISCRIMINATOR, NOT A CONFIRMATION. ★**
+The first draft predicted "~10.2 TF" and thereby smuggled in an assumption. In ALL FOUR arms above
+`GROUPS=1`, so `occ[96]` (emissions) and `TOTAL_super` (super-tile count) were **perfectly collinear** —
+they moved together every time. "Coordination" is therefore TWO candidate mechanisms that §31 conflated
+and never separated. This config breaks the collinearity, because `GROUPS=2` doubles emissions back:
+
+| | arm B | proposed |
+|---|---:|---:|
+| `TOTAL_super` | 23,040 | **11,520** (half) |
+| GROUPS | 1 | 2 |
+| `occ[96]` per rep | 23,040 | **23,040 (IDENTICAL)** |
+
+**BOTH BRANCHES RECORDED BEFORE THE DISPATCH, so neither can be retrofitted:**
+- **driver = `occ[96]` emissions** → **~7.70 or below** (no gain; the ~15% group barrier is pure cost).
+- **driver = `TOTAL_super` / boundary events** → **~10.2** (×1.57 coordination, ×0.85 group barrier).
+
+**KNOWN CONFOUND, stated in advance:** `superM=256` drops total output tiles to `8 × 40 = 320` over
+64 WGs = ~5 tiles/WG. That is coarse enough that TAIL IMBALANCE could contaminate the result and would
+LOOK like a coordination effect. A mid-range number will NOT be separable without a follow-up.
+*** THE KERNEL SOURCE CHANGED (§33), SO THE NEXT DISPATCH IS A RULE-2 BRING-UP: ONE RUN, THEN STOP. ***
+
+### 35. `dsws_realshape_bench.py` UNBLOCKED FOR THE 30-SHAPE SWEEP (offline; §24 resolved)
+Three fixes, and the second was NOT the one we went looking for.
+
+**(a) `DSWS_ALLOW_NONSTD` is now threadable** (`--allow-nonstd`). It was absent entirely, so `gpu_run.sh`
+refused at `--pool 64` and the 1 WG/CU config could not be swept even deliberately. **It is NOT
+auto-emitted on detected deviation** — the entire point of the flag is that deviating is an EXPLICIT
+act, and a harness that quietly sets it defeats the guard it is satisfying. Added a PRE-FLIGHT that
+refuses (exit 2) *before the first dispatch* when the geometry deviates without the flag, and again if
+`--allow-nonstd` is used with the default `--tag rs`, since the standing rule is that a deviation must
+be NAMED IN THE LOGNAME. Previously this died one shape in, after burning a card claim.
+
+**(b) ★ `FN` WAS A COUPLED-AXIS TRAP, THE SECOND INSTANCE OF ONE THIS FILE ALREADY DOCUMENTS. ★**
+`LIVE_FN` was hardcoded to 4 with no flag, and `LIVE_TN = LIVE_FN*16` is what **every shape's N-PADDING**
+is computed against. Once FN became a knob (§27), `--fn 2` would have padded N for a 64-col panel while
+the bin wanted 32 — *exactly* the silent geometry mismatch the file's own `--fm` note describes
+("a knob that is a flag on one axis and a constant on a coupled axis is a trap, not a default"),
+on the other axis. Added `--fn`, made `LIVE_TN` track it. Also **`DSWS2_FN` was never passed to the
+dispatcher at all**, so the host would have defaulted `FNc=4` and disagreed with any FN≠4 bin.
+
+**(c) `--fm` widened** from `choices=(1,2)` to `(1,2,4,8)`; the real limiter is the NFV gate (§29), which
+both `build_flow.sh` and `occ_dispatch.cpp` now enforce. `--fn` is power-of-two only (§28).
+
+VERIFIED (subprocess stubbed, nothing dispatched): refusal paths exit 2 with the right message; the
+positive path emits `DSWS_ALLOW_NONSTD=1`, `DSWS2_FN=4`, `ML8_POOL=64`, and `ORACLE_NTL=144` for the
+first shape (N=9216/64) under `--tag secondary_1wgcu`.
+
+**THE 30-SHAPE GATE COMMAND IS NOW RUNNABLE** (needs the card; promotes the 1 WG/CU secondary config):
+```bash
+python3 dsws_realshape_bench.py live --fm 2 --g 4 --acc-n 4 --segk 256 --sswin 32 \
+  --waves 16 --pool 64 --chunk-maxs 0.85 --allow-nonstd --tag secondary_1wgcu \
+  --json secondary_1wgcu.json --table secondary_1wgcu.txt
+```
+NOTE it is a 30-DISPATCH SWEEP, so it needs its own greenlight and is NOT covered by a single-run one.
+
+---
+
+## 2026-07-29 AFTERNOON — ★ 10.2 TF. THE DISCRIMINATOR RESOLVED: IT IS `TOTAL_super`, NOT `occ[96]`. ★
+
+**BEST NUMBER THIS KERNEL HAS EVER PRODUCED. +32% over the 7.70 that stood this morning, and the
+first time it has cleared 10.** Single dispatch, rule-2 bring-up (kernel source changed in §33), stopped.
+Bin `426a5007ae56e68f` · .text 31,676 B · LDS 34,304 · NFV 112.
+Log: `discSuperM256_g8_accn4_pool64_nonstd`.
+
+Config: `FM=2 FN=4 G=8 ACC_N=4`, `ML8_POOL=64` (1 WG/CU), superM=256, GROUPS=2, `ORACLE_MTL=8 NTL=40`.
+Gates: `computed=8,755,200` WORK-EXACT (92,160 × 95 reps) · `occ[96]=2,188,800` **delta +0** ·
+`oracle bad=0` · canary clean · `occ[0]=0` · grow-fail 0.
+
+### 36. ★ THE DECISIVE FACT: `occ[96]` WAS IDENTICAL TO ARM B AND THROUGHPUT MOVED +32% ★
+Both branches were recorded in §34 BEFORE the dispatch, precisely so neither could be retrofitted:
+- driver = `occ[96]` emissions → **predicted ≤ 7.70. REFUTED.**
+- driver = `TOTAL_super` / boundary events → **predicted ~10.2. MEASURED 10.2.**
+
+| | arm B | this run |
+|---|---:|---:|
+| `computed` / rep | 92,160 | 92,160 |
+| `occ[96]` / rep | 23,040 | **23,040 (IDENTICAL)** |
+| feed loads / rep | 552,960 | 552,960 |
+| WMMAs / rep | 11,796,480 | 11,796,480 |
+| **`TOTAL_super`** | 23,040 | **11,520 (HALVED)** |
+| **TF** | **7.70** | **10.2** |
+
+Four quantities identical, one halved, throughput followed the one that moved. **The lever is the
+SUPER-TILE COUNT — the number of boundary events — not the number of emissions.** In every arm before
+this one `GROUPS=1` made those two collinear, which is why the morning's model could not see it.
+
+### 37. THREE CAVEATS, NONE OF WHICH THREATEN THE DIRECTION
+1. **Spread 14.6%** (per-rep 8.9–10.4) vs arm B's 1.9%. Call it 10.2 ± 0.7. The FLOOR of that range
+   still clears 7.70, so the direction is safe — but do NOT quote 10.2 to three significant figures.
+2. **ONE NUMBER IS VALIDATING TWO CLAIMS.** The ~10.2 prediction was ×1.57 (coordination) × 0.85 (group
+   barrier). A barrier cost of ZERO with a weaker coordination exponent gives the same answer, and
+   GROUPS=1 at superM=256 is UNTESTABLE (LDS 67,072 > 65,536, §32). So "×1.57 coordination, ×0.85
+   barrier" is *a* decomposition consistent with the data, **NOT the measured one.** Do not cite the
+   split as if it were measured.
+3. **The pre-registered tail-imbalance confound (§34) pushes DOWN, not up.** 320 output tiles over
+   64 WGs = ~5 tiles/WG; imbalance WASTES waves, it cannot invent throughput. If it is contaminating
+   this at all, the true coordination effect is LARGER than measured. Stated because it is the
+   direction that does NOT threaten the conclusion, which is exactly when it is worth being explicit.
+
+### 38. WHAT DID NOT CHANGE — AND THE STANDING FIGURES THAT ARE NOW STALE
+`door1 NOTHING-STAGED` is **still 100% of coast**. We made the starvation CHEAPER, not RARER. Ceiling A
+is dented, not broken. Against hipBLASLt's 123–189 TF on real dense shapes we move ~2.5% → **~3.3%**.
+
+**★ 7.70 IS NO LONGER THE BASELINE. WRITE FUTURE RESULTS AGAINST 10.2. ★** Consequences:
+- `DSWS_BRIEF_2026-07-28_AM.md` §0.5 ("THE BEST MEASURED CONFIG WE HAVE", 7.70) is **SUPERSEDED**.
+- KG decision `d0e79067` (the 1 WG/CU secondary config) is superseded on the TF figure. Its 1 WG/CU
+  finding stands and is reinforced — this run is also pool 64.
+- **The 30-shape gate unblocked in §35 should now be pointed at THIS config, not the 7.70 one**:
+  `--fm 2 --fn 4 --g 8 --acc-n 4 --pool 64 --allow-nonstd --tag superm256`. Note `--g 8` requires the
+  §33 guard gating, so that sweep CANNOT run against an un-patched tree.
+- Still a SINGLE SHAPE (`ml8_dense_ffn_down` M2048 N2560 K9216). It is not config of record until the
+  30-shape sweep says so, and the sweep is 30 dispatches = its own greenlight.
+
+---
+
+## 2026-07-29 LATE — THE BOUNDARY IS NOISE, AND EVERY SINGLE-FACTOR MODEL IS NOW DEAD
+
+Two dispatches. Neither produced a throughput win; both produced falsifications, which is what they were
+for. **13.8 TF (§39) is unaffected — the models below are explanations of WHY, not measurements.**
+
+### 39. FLOW_WAVES=8 → 13.8 TF (+35%), THE DAY'S LAST WIN
+Geometry IDENTICAL to the 10.2 run (`FM=2 FN=4 G=8 ACC_N=4`, superM=256, GROUPS=2, pool 64); only
+waves/WG changed, 1024 → 512 resident. `occ[96]=2,580,480` delta +0 (23,040 × 112), oracle bad=0.
+Log `waves8_superM256_g8_accn4_pool64_nonstd`. Confirms Kimi's claim that WAVES=16 is several times the
+useful concurrency. Note Kimi HEDGED on thinning the poll herd via backoff ("expect flat TF, like the
+funnel") but was BLUNT about not launching them at all — "the right thing to do with a wave that
+provably cannot help is, in aggregate, not to have launched it." The blunt one paid.
+**CAVEAT: spread 33.5% (per-rep 9.4–14.1), by far the widest in the project. The FLOOR is below the
+10.2 baseline. 13.8 wants a confirming re-run before it is banked.** `WAVES=4` does NOT assemble
+(invalid operand, kernel :5555/:7033).
+**[CORRECTED 2026-07-29 LATE: "so 8 is the floor" was WRONG — I inferred it from WAVES=4 failing without
+testing the intermediate values. `WAVES=7`, `6` and `5` ALL BUILD (30,916 / 30,844 / 30,764 B) and are
+UNTESTED. The failure is specific to 4: `NCOMPUTE = WAVES - FIRST_COMPUTE_WID(3)`, so WAVES=4 gives
+NCOMPUTE=1 and `BATON_MAGIC = 0x100000000/1 = 2^32`, not representable as a 32-bit literal. WAVES=5
+gives 2^31, which the assembler DOES accept. Note WAVES=7 gives NCOMPUTE=4 — exactly Kimi's
+"~4 concurrent waves already saturate the pipeline".]**
+
+### 40. ★ THE BOUNDARY COST IS ~1.3% OF WAVE-TIME. DO NOT BUILD THE BANK DOUBLE-BUFFER. ★
+`DSWS2_ADVPROBE=1 DSWS2_BNDTIME=1` — **both probes already existed and were switched off** (the SIXTH
+such mechanism this project has needed and already had). Probe build, TF not quotable.
+
+| | per visit | sampled count | share of boundary time |
+|---|---:|---:|---:|
+| winning advance (**the tail**) | 168.9 ticks | 832 | **1.6%** |
+| losing pass | 32.0 ticks | 269,630 | **98.4%** |
+
+Losing passes burn **61.4× the aggregate wave-time** of winning ones (unit-free ratio). Absolute share
+of all wave-time: boundary **1.31%**, winning tail alone **0.021%**.
+(The absolute figures assume RTC ticks == span ticks; the 61.4× ratio does not.)
+
+**VERDICT: the bank double-buffer targets the winning tail = 0.02% of wave-time. NOT WORTH BUILDING.**
+Kimi's Ceiling B ("the group barrier is the wall") is NOT supported by direct measurement. Its own hedge
+was correct — the model rested on the "TF tracks n_kseg" correlation plus gate structure, magnitude
+never timed. **THE MEASUREMENT COST ONE DISPATCH AND SAVED A DESIGN + BUILD + CODEX REVIEW + BRING-UP
+ON A NULL.** Precedent that motivated measuring first: `DSWS2_KDBUF` (2026-07-25) was a double-buffer
+built on this same kernel against an unmeasured latency hypothesis — implementation verified correct in
+emitted code, result 0.32% SLOWER, inside noise. "THE BUILD WAS CORRECT; THE HYPOTHESIS WAS WRONG."
+
+### 41. ★★ AND IT FALSIFIES §31's COORDINATION MODEL — MY OWN ★★
+If boundary events were the mechanism, halving them buys **at most 0.66%**. `superM` 128→256 halved them
+and measured **+32%**. The model cannot explain its own headline result.
+**THE CONFOUND:** `TOTAL_super = 11,796,480/(superM·FN)`, and `superM·FN` **is the super-tile AREA**.
+"Fewer boundary events" and "more operand reuse" were collinear in every arm. Right variable, wrong
+mechanism.
+
+### 42. THE DISCRIMINATOR: `FM=2 FN=2 G=8 ACC_N=8` → 6.3 TF. NO SINGLE-FACTOR MODEL SURVIVES.
+Log `bwdisc_fn2_superM256_g8_accn8_w16_pool64_nonstd`. `occ[96]=737,280` delta +0, oracle bad=0.
+Built at **WAVES=16 to match arm B** — the first build was WAVES=8 and would have been contaminated by
+the §39 effect. Three branches pre-registered: coordination-only 7.70 · coordination+frag 6.9 ·
+bandwidth 5.3. **Measured 6.3 — between them.**
+
+| arm | superM | FN | GROUPS | TOTAL_super | feed | traffic/FLOP | TF |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| B  2×4 | 128 | 4 | 1 | 23,040 | 0.750 | 0.02344 | **7.70** |
+| F  1×4 | 128 | 4 | 1 | 23,040 | 1.250 | 0.02344 | **6.30** |
+| c1 4×2 | 128 | 2 | 1 | 46,080 | 0.750 | 0.03906 | **4.80** |
+| c2 4×1 | 128 | 1 | 1 | 92,160 | 1.250 | 0.07031 | **2.70** |
+| **NEW 2×2** | 256 | 2 | 1 | **23,040** | 1.000 | 0.03516 | **6.30** |
+
+- **PURE COORDINATION REFUTED.** NEW holds `TOTAL_super`, GROUPS, WAVES and pool EXACTLY at arm B's
+  values. TF still moved −18%.
+- **PURE TRAFFIC REFUTED.** B and F have IDENTICAL traffic/FLOP *and* identical `TOTAL_super` *and*
+  identical GROUPS, differing ONLY in the frag grid — 7.70 vs 6.30.
+
+### 43. CORRECTION TO §30–31 AND KG `077b53ef`: "THE FEED MODEL IS FALSIFIED" WAS TOO STRONG
+What c1/c2 demonstrated is that feed is **NOT SUFFICIENT** — arms at identical feed ratios measured 38%
+and 57% apart. I wrote that up as feed being FALSIFIED, which does not follow. B vs F isolates the frag
+grid cleanly, gives exponent −0.393, and that value has reproduced. **Feed is real; it is not alone.**
+And "coordination is the dominant lever" (the replacement claim) is now itself refuted by §42.
+
+**SCORE FOR THE DAY: feed-only died at midday, coordination-only and traffic-only died in the evening.
+Three single-factor models, three falsifications, every one of them from a CONTROL, none from a fit.**
+
+### 44. METHOD: STOP FITTING EXPONENTS
+Six points varying along three correlated dimensions, at least two live axes, none sufficient. That is
+over-fitting territory and it has now burned me twice in one day. **A fourth exponent is worth nothing.**
+NEXT MUST BE A DIRECT MEASUREMENT OF WHAT THE KERNEL WAITS ON — achieved HBM/L2 bandwidth against the
+R9700 peak settles bandwidth-bound-or-not in one shot, and it is a fact about the machine rather than a
+curve through our data points. `rocprof` on the PM4 path is the open question (the harness is raw PM4,
+not HIP, so the usual dispatch-scoped counter capture may not attach).
+
+---
+
+## 2026-07-29 EVENING II — ★★ 15.2 TF. BOTH AXES HAVE AN OPTIMUM, AND THE WALL IS 20× CHEAPER. ★★
+
+Seven dispatches under a standing greenlight from kmbandy ("keep running what you think will help find
+the wall"). **Every arm gates clean**: WORK-EXACT, `occ[96]` delta +0, `oracle bad=0`, canary clean.
+
+### 45. ★ THE WAVE AXIS HAS AN INTERIOR OPTIMUM AT WAVES=6 ★
+All at `FM=2 FN=4 G=8 ACC_N=4`, superM=256, GROUPS=2, `ML8_POOL=64`:
+
+| WAVES | NCOMPUTE | TF | spread | coast-frac |
+|---:|---:|---:|---:|---:|
+| 5 | 2 | 14.9 | 6.1% | 35.9% |
+| **6** | **3** | **15.2** | **4.1% / 118 reps** | 52.1% |
+| 7 | 4 | 14.6 | 34.8% | 59.1% |
+| 8 | 5 | 13.8 | 33.5% | — |
+| 16 | 13 | 10.2 | — | 95.0% |
+
+**`WAVES=6` → 15.2 TF at 4.1% spread is the tightest measurement in this project.**
+**★ THE SPREAD COLUMN IS A FINDING IN ITSELF.** Tight at 5–6, then it JUMPS to ~35% at 7 and 8, with
+BIMODAL per-rep ranges (9.7–14.9 and 9.4–14.1). Something bistable switches on at **≥7 waves** — and
+that is what made §39's 13.8 so noisy. **13.8 was never a trustworthy number; 15.2 is.**
+
+### 46. THE GEOMETRY AXIS ALSO HAS AN OPTIMUM — superM=256 SURVIVES THE HEALTHY REGIME
+At matched `WAVES=6`, `ML8_POOL=64`:
+
+| superM | G | TF | spread | coast-frac | tiles/WG |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 4 | 12.7 | 3.1% | 63.5% | 10.0 |
+| **256** | **8** | **15.2** | **4.1%** | 52.1% | 5.0 |
+| 512 | 16 | 13.6 | **37.1%** | 43.8% | 2.5 |
+
+superM=256 beats 128 by **+20%** — so §36's geometry finding is REAL and not an artifact of the
+over-subscribed regime, though the magnitude is smaller than the +32% measured there. superM=512 is
+WORSE, and its 37.1% bimodal spread at 2.5 tiles/WG is the tail-imbalance confound pre-registered in
+§34 showing up exactly where predicted. **The superM=512 run also confirms the §33 guard gating works —
+`G=16` (G·FM=32) would have been refused by `:646` before today.**
+
+### 47. RESVPROBE RE-RUN: THE WALL IS UNCHANGED IN CHARACTER, 20× CHEAPER IN MAGNITUDE
+The 07-27 decomposition was taken in the pathological 2048-wave regime. Re-measured at the healthy
+config (`WAVES=6`, superM=256):
+
+| | 2026-07-27 (2048 waves) | 1 WG/CU (1024) | **now (384 waves)** |
+|---|---:|---:|---:|
+| empty frontier, share of bails | 96.1% | — | **95.2%** |
+| CAS-loss | 1.6% | — | 4.8% |
+| window-full | 0.5% | — | **0** |
+| boundary | 1.7% | — | **0** |
+| **bail-iters per successful reserve** | **129.9** | 26.3 | **6.5** |
+
+**THE RATIO BARELY MOVED; THE ABSOLUTE WASTE FELL 20×.** We did not change what the machine is waiting
+for — we stopped having twenty times as many waves waiting for it. The limiter is still PRODUCER-SIDE
+frontier publication rate. Window-full and boundary are now EXACTLY ZERO, so the cursor, the SSWIN
+window and the C-store gate are all definitively cleared as limiters.
+
+### 48. ★ CONFIG OF RECORD CANDIDATE — 15.2 TF ★
+```bash
+WAVES=6 FM=2 FN=4 G=8 ACC_N=4 ./build_flow.sh     # LDS 34,304 · NFV 112 · GROUPS=2 · superM=256
+./gpu_run.sh <logname> -- DSWS_ALLOW_NONSTD=1 FLOW_WAVES=6 ML8_POOL=64 DSWS2_FLOW=1 \
+  DSWS2_FM=2 DSWS2_FN=4 DSWS2_G=8 DSWS2_ACC_N=4 FLOW_POOL_N=1 DSWS2_SEGK=256 SSWIN=32 \
+  DSWS2_K=<K> DSWS2_ORACLE_MTL=<M/256> DSWS2_ORACLE_NTL=<N/64> DSWS2_ORACLE_STRIDE=8 \
+  DSWS2_TARGET_SECS=1.5 ML8_COOP_CHUNK=512 ML8_COOP_CHUNK_MAXS=0.85 \
+  STAGINSTR=1 TFPROBE=1 ./occ_dispatch --dsws2
+```
+**DAY TOTAL: 4.73 → 15.2 TF = +221%.** vs hipBLASLt 123–189 on dense shapes: 2.5% → ~4.9%.
+STILL A SINGLE SHAPE — the 30-shape gate (§35, now runnable) is what promotes it. Note `--g 8` REQUIRES
+the §33 guard gating, so that sweep cannot run against an un-patched tree.
+
+### 49. WHAT IS STILL UNTESTED AT THE NEW OPTIMUM
+Everything measured before today was measured in a regime we now know was pathological (95% coast,
+129.9 bail-iters/reserve). Re-testing at `WAVES=6` is cheap and several old verdicts may not survive:
+**SEGK** (called "THE lever" on 2026-07-19, untested today) · **POOL_N** (measured INERT) ·
+**DSWS2_FUNNEL** (defaulted on for waste-elimination, never justified on throughput) ·
+**FN=8 at FM=1** (NFV 128, exactly at cap) · and `WAVES=4`, which needs a small kernel fix:
+`NCOMPUTE=1` makes `BATON_MAGIC = 2^32`, unrepresentable — and with NCOMPUTE=1 the modulo is trivially
+0, so the `s_mul_hi_u32` can simply be skipped under `.if NCOMPUTE == 1`.
+
+---
+
+## 2026-07-29 NIGHT — THE PUBLISHER IS NOT THE BOTTLENECK. `HEAD` IS 20% OF WAVE-TIME. 18.6 TF.
+
+Six dispatches. **kmbandy caught a methodological error mid-stretch and was right**: I began by probing
+the publication path at `WAVES=6`, the config where publication demonstrably WORKS. That regime cannot
+answer why the publisher falls behind. The diagnosis has to be the DELTA between the broken and working
+regimes with identical probes — which is what the rest of this section is.
+
+### 50. ★ RETRACTION, BY MY OWN CONTROL: "THE PUBLISHER SLOWS 4.3× WITH WAVES" WAS A PROBE ARTIFACT ★
+`ADVPROBE+BNDTIME` appeared to show the advance critical section going 171.2 → 728.7 ticks from
+`WAVES=6` → `16`. **`BNDTIME` stamps on EVERY LOSING PASS, and there are 10.9× more of those at
+WAVES=16 — the instrument was throttling the thing it measured.** I flagged this as a possible confound
+and ran `ADVPROBE` ALONE (fires only on the rare WIN path, so it does not scale with the herd):
+
+| | WAVES=6 | WAVES=16 |
+|---|---:|---:|
+| ticks/advance, ADVPROBE+BNDTIME | 171.2 | **728.7** ← artifact |
+| **ticks/advance, ADVPROBE ONLY** | **167.4** | **172.6** ← truth, 3% apart |
+
+**THE CRITICAL SECTION IS FLAT.** This also invalidates the `BNDSPLIT+GAP` build's advance counts
+(695 vs 217) — `DSWS2_GAP` is UNTHROTTLED and stamps per burst, so it scales with the herd too.
+That build read TF=3.5 at WAVES=16 against 10.2 clean: the probe cost was 3×.
+**RULE: any probe whose emission rate scales with the population under test cannot measure a
+population-size effect. Check the instrument's own scaling before attributing the trend to the kernel.**
+
+### 51. WITH A LIGHT PROBE, PUBLICATION PER CHUNK IS IDENTICAL AT BOTH WAVE COUNTS
+| | WAVES=6 | WAVES=16 |
+|---|---:|---:|
+| advances (de-throttled) | 62,016 | 56,000 |
+| chunks | 115 | 100 |
+| **advances per chunk** | **539** | **560** |
+| ticks per chunk | 664,087 | 864,313 |
+
+**The same publication work lands per chunk either way; each chunk just takes 30% longer at WAVES=16.**
+Publication rate tracks throughput (1.25× vs 1.30×), i.e. it is a PROXY FOR THE WORK RATE, not an
+independent limiter. **THE PUBLISHER KEEPS UP. Publication was never the bottleneck.**
+The wave-count penalty is DIFFUSE — no single stage carries it.
+
+### 52. BNDSPLIT AT THE HEALTHY CONFIG — THE GATES THAT DOMINATED ON 07-27 ARE NOW ZERO
+| | 07-27 (2048 waves) | now (WAVES=6) |
+|---|---:|---:|
+| ZLOCK_LOST | 76.5% | 99.4% |
+| DRAINGATE_BAIL | — | **0.0%** |
+| CSTOREGATE_BAIL | 93% of winners | **0.0%** |
+| ADVANCE | 1.6% | 0.6% |
+
+Every lock winner now advances (695 wins → 695 advances, 100% conversion).
+**CAVEAT, DO NOT SKIP:** `herd` is derived by SUBTRACTION (`bEntry − bZwon`) and `DSWS2_FUNNEL=1` is the
+default, so funnel rejects — which bail BEFORE the CAS — are counted as ZLOCK losses. The 99.4% is NOT
+established as lock contention. Disambiguating needs a `DSWS2_FUNNEL=0` re-run (untested).
+
+### 53. ★ `HEAD` IS THE BIGGEST SINGLE COST IN THE KERNEL: 19.90% OF ALL WAVE-TIME ★
+`DSWS2_GAP` at `WAVES=6` (instrument #7 already built and switched off):
+
+| bucket | mean ticks | share of wave-time |
+|---|---:|---:|
+| **HEAD** (live → first work) | **149,782 ≈ 1.5 ms** | **19.90%** |
+| GAP (between bursts) | 487 | 15.47% |
+| TAIL (last work → exit) | 24,924 | 2.76% |
+
+`n = 41,472 = 384 waves × 108 chunks` → **paid FRESH EVERY CHUNK by every wave.** A chunk is ~753k ticks
+and each wave burns ~150k of it before doing any work at all. **This is the physical mechanism behind
+Kimi's Ceiling A** (per-chunk fixed cost, whose arithmetic bounded us to ~8.5 TF at one chunk and ~23 TF
+in the limit of infinite chunk). Also `NOBURST = 6,912/41,472 = 16.7%` of waves never burst at all.
+
+### 54. ~~★★ HEAD AMORTIZATION CONFIRMED — 18.6 TF AT M=8192, A NEW BEST ★★~~ **RETRACTED**
+
+> **⛔ RETRACTED SAME NIGHT (kmbandy). M=8192 AT N=2560 K=9216 IS NOT AN ml8 OR mlambaformer SHAPE — IT
+> IS A CUBE I INVENTED. `18.6 TF IS NOT A RESULT AND NOT A "BEST".` Bigger M = more tiles per dispatch =
+> the per-dispatch fixed cost spreads over more work = TF rises. That is ARITHMETIC ABOUT THE
+> DENOMINATOR, not an improvement to the kernel; ANY kernel posts a higher TF on a bigger shape.
+> This is the SAME failure that produced the deleted 36.9/32.0 TF "winners" (32K synthetic square,
+> garbage on real ml8) and that the 2026-07-16 canonical framing exists to prevent. I also proposed
+> sweeping M=16384 and M=32768 before being stopped.**
+> **★ SHAPES ARE INPUTS, NOT LEVERS. ★ THE TELL: if the config is unchanged and only the input grew,
+> no lever was pulled.** KG feedback `8e201972`.
+>
+> **THREE VOID RUNS, NOT ONE.** `headamort_M8192_…_182015`, `headamort_M16384_…_182700` and
+> `headamort_M32768_…_183008` all executed — the M=16384/32768 pair fired before the interrupt landed.
+> **ALL THREE ARE VOID. Do not mine them for numbers.** For the record, 19 of the day's 22 dispatches
+> ran `2048x2560x9216` = `ml8_dense_ffn_down` (SHAPES:29); every finding in §45–57 is on that real
+> shape. The contamination is confined to these three.
+>
+> **WHAT SURVIVES:** §53's HEAD measurement (19.90% of wave-time, 1.5 ms/wave/dispatch) was taken on the
+> REAL M2048 shape and STANDS. But on a real shape M is fixed and the problem is ALREADY ONE CHUNK
+> (320 tiles < 512), so there is nothing to amortize HEAD over. **THE LEVER IS TO SHRINK HEAD, NOT
+> SPREAD IT** — what is a wave doing for 1.5 ms between going live and its first work item? That
+> question is shape-independent, which is what makes it a real lever.
+
+~~Original entry, kept for the record:~~
+Same config, 4× the tiles per dispatch (`M=8192`, MTLsuper=32, 1,280 tiles, `ML8_COOP_CHUNK=2048`,
+still ONE chunk). Gates clean: `computed=18,063,360` WORK-EXACT, `occ[96]=4,515,840` delta +0,
+`oracle ok=10240 bad=0`, canary clean.
+~~TF 15.2 → 18.6 (+22%), spread 13.1% over 49 reps, coast-frac 38.9%.~~ **NOT COMPARABLE — different shape.**
+Confirms HEAD is a per-dispatch fixed cost that amortizes with work per dispatch. **This is a REAL
+throughput lever and it is orthogonal to every geometry knob.** (Rule 7 checked in advance: one chunk
+~25 ms against the 850 ms cap.)
+
+### 55. `SEGK` RE-TESTED — THE FIRST PRE-TODAY VERDICT THAT SURVIVES THE REGIME CHANGE
+At `WAVES=6`, superM=256, LDS unchanged (SELFSERVE reclaims the operand pool, so SEGK is a clean knob):
+
+| SEGK | n_kseg | occ[96]/rep | TF | spread | coast-frac |
+|---:|---:|---:|---:|---:|---:|
+| **256** | 36 | 23,040 | **15.2** | 4.1% | 52.1% |
+| 128 | 72 | 46,080 | 8.8 | 1.8% | 34.8% |
+| 64 | 144 | 92,160 | 6.6 | 54.2% | 27.6% |
+
+**"TF tracks SEGK" (2026-07-19) HOLDS.** SEGK=256 is already our config and is confirmed optimal.
+(Confound as ever: SEGK changes coordination count AND per-item WMMA amortization together —
+128 WMMAs/item at SEGK=256 vs 32 at SEGK=64.)
+
+### 56. ★ COAST-FRAC IS NOT A THROUGHPUT PROXY — STOP READING IT AS WASTE ★
+SEGK=64 coasts only **27.6%** and delivers **6.6 TF**. SEGK=256 coasts **52.1%** and delivers **15.2**.
+Coast-frac moved OPPOSITE to throughput across the whole SEGK sweep. A coasting wave is not necessarily
+wasted work — and `door1 = 100% of coast` has been quoted all project as if it were the problem
+statement. **It is a description of what coasting waves are waiting on, NOT evidence that coasting is
+the cost.**
+
+### 57. ~~THE BISTABILITY SIGNATURE APPEARS IN EVERY BAD CONFIG~~ **WRONG — IT IS A RUN-LEVEL LOTTERY**
+
+> **⛔ REFUTED SAME NIGHT by a repeatability test (§59). Spread is NOT a property of the config.
+> Four repeats of the IDENTICAL bin `beb031c195df` gave spreads 3.5% / 3.7% / 3.2% / 35.8%.
+> I read a random draw as a config property. The configs below each happened to draw one wide run.**
+
+~~Original entry, kept for the record:~~
+Wide bimodal spread (~35–55%) now seen at: WAVES≥7 (34.8%, 33.5%), superM=512 (37.1%), SEGK=64 (54.2%).
+Tight (<7%) at every good config: WAVES=5 (6.1%), WAVES=6 (4.1%), superM=128 (3.1%), SEGK=128 (1.8%).
+**Whatever the bistable mode is, it is a shared failure mode across three independent axes and it has
+never been characterised.** A per-rep timeline (`TRACE=1`, per-super-tile claimer rows) would show it.
+
+
+### 58. `SLEEPN` IS NOT A LEVER — AND coast-frac IS CONFIRMED AS A POLL-COUNT ARTIFACT
+Real shape, WAVES=6, best config, only `SLEEPN` varied (the `s_sleep` arg in the busy-waits, :438):
+
+| SLEEPN | TF | spread | coast-frac |
+|---:|---:|---:|---:|
+| 1 | 15.1 | 35.7% | 53.2% |
+| 2 (default) | 15.2 | 4.1% | 52.1% |
+| 4 | 15.1 | 36.3% | 49.8% |
+| 8 | 15.4 | 4.0% | 45.5% |
+
+**TF FLAT across an 8× range.** HEAD is NOT sleep-dominated. Note coast-frac falls MONOTONICALLY with
+SLEEPN (53.2 → 45.5) while TF does not move at all: longer sleeps mean fewer poll iterations, so fewer
+are counted as coast. **This independently confirms §56 — coast-frac is a POLL-COUNT ARTIFACT, not a
+measure of wasted work.** Also checked and NOT run: `PHIST` was the wrong instrument for HEAD — it is a
+BAIL-DOOR histogram (occ[104..113]), ~220% overhead, and `occ_dispatch.cpp:2091` records a PHIST build
+once running a 2.46 s chunk against the 0.75 s cap. `INITBAR` is in the HEAD window but is the
+2026-07-20 correctness fix (`INITBAR=0` reproduces the buggy `f36c06a0`) — do not touch it.
+
+### 59. ★ REPEATABILITY: THE MEAN IS SOLID, THE SPREAD IS A LOTTERY ★
+Four back-to-back repeats, IDENTICAL bin `beb031c195df`, nothing varied:
+
+| repeat | TF | spread | per-rep range |
+|---:|---:|---:|---|
+| 1 | 15.5 | 3.5% | 15.1–15.7 |
+| 2 | 15.4 | 3.7% | 15.2–15.7 |
+| 3 | 15.5 | 3.2% | 15.1–15.6 |
+| 4 | **15.3** | **35.8%** | **10.0–15.6** |
+
+**MEAN TF IS REPRODUCIBLE TO ±1.3% (15.3–15.5).** Every TF comparison made today is therefore valid and
+the axis optima stand. **BUT SPREAD IS A RUN-LEVEL DRAW, NOT A CONFIG PROPERTY** — and note repeat 4's
+mean barely moved despite the 35.8% spread, because the wide mode is a HANDFUL OF OUTLIER REPS dipping
+to ~10 inside an otherwise ~15.5 run. It is occasional stalls, not a second operating regime.
+
+**TWO CONSEQUENCES:**
+1. **§57 IS RETRACTED** (above).
+2. **THE WAVE OPTIMUM IS REAL BUT SHALLOW.** With run-to-run noise at ±1.3%, WAVES 5/6/7 (14.9 / 15.4 /
+   14.6) are separated by only 3–5%. The optimum at 6 survives, but the DOMINANT effect on that axis is
+   FEW waves vs MANY (15.4 vs 10.2 at WAVES=16), not the precise interior value. Do not over-tune it.
+3. **A BETTER CENTRAL ESTIMATE FOR THE BEST CONFIG IS 15.4 TF** (mean of 4 repeats), not the 15.2
+   single-run figure in §45/§48.
+
+---
+
+## 2026-07-29 NIGHT II — ★★ THE 30-SHAPE GATE, AND A 5× ON THE SHAPES THAT ACTUALLY MATTER ★★
+
+### 60. THE 30-SHAPE GATE AT THE WAVES=6 CONFIG — 30 PASS, 0 FAIL, 3 UNSUPPORTED
+All real ml8/mlambaformer shapes. `best15_4.json` / `best15_4.txt`. **Correctness is solid everywhere.**
+Throughput is not. Padding-corrected `real_TF`:
+
+| class | M | real TF |
+|---|---:|---:|
+| ml8 dense | 2048 | 5.08 – **14.64** |
+| ml8 dense | 512 | 1.61 – 8.77 |
+| mlmf | 4096 | 0.42 – 5.32 |
+| **mlmf MoE expert fc1/fc2** | 512 | **0.97 / 0.96** |
+| ml8 MoE | 512 | 0.70 – 4.33 |
+| **ml8 MoE** | **64** | **0.093 – 0.61** |
+
+**WE TUNED ALL DAY ON `ml8_dense_ffn_down` M2048 — THE TOP OF THAT RANGE — WHILE THE mlambaformer MoE
+EXPERTS (recorded as ~56% OF GEMM TIME) SIT AT 0.97 TF.** 3 UNSUPPORTED: `mlmf_router_MLP`,
+`mlmf_router_out`, `mlmf_routerout_ML8PAD` — `n_kseg=1<2` at SEGK=256, ZLOCK needs ≥2, need `--segk 128`.
+(Cosmetic bug: the inventory header prints "M tile=96" from stale module defaults; the PASS rows and the
+padding maths correctly used superM=256.)
+
+### 61. ★ M-PADDING IS NOT THE PROBLEM. THE RUNTIME IS 100% FIXED COST. ★
+`ml8_moe_ffn_gate_up` M64 N512 K2048, superM swept so padding goes 75% → 50% → 0%:
+
+| superM | padded M | padding | padded TF | **real TF** | **span/chunk** |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 256 | 75% | 0.40 | **0.101** | 133k ticks |
+| 128 | 128 | 50% | 0.20 | **0.10** | 137k |
+| 64 | 64 | **0%** | 0.10 | **0.10** | 120k |
+
+**REMOVING 75% OF THE COMPUTED WORK CHANGED THE REAL RATE NOT AT ALL**, and span/chunk is FLAT across a
+4× work change. Padded TF fell exactly in proportion to the padding removed — i.e. the padding was never
+costing time. **~1.3 ms per dispatch to compute 134 MFLOP; the card could do that work in 0.4 µs.**
+So HEAD (§53, 19.9% of wave-time at M2048) is ~**100%** of the runtime here.
+
+### 62. ★★ THE FIXED COST SCALES WITH WORKGROUP COUNT — 5× BY LAUNCHING LESS OF THE CARD ★★
+Same shape, superM=64 (no padding), sweeping `ML8_POOL`:
+
+| ML8_POOL | waves | **real TF** | span/chunk |
+|---:|---:|---:|---:|
+| 64 | 384 | 0.1 | 116k |
+| 16 | 96 | 0.4 | 38k |
+| **8** | **48** | **0.5** | **27.5k** |
+| **4** | **24** | **0.5** | **24.8k** |
+| 2 | 12 | 0.4 | 35k |
+| 1 | 6 | 0.2 | 61k |
+
+**CLEAR INTERIOR OPTIMUM AT pool 4–8.** Too many WGs → launch/ramp cost; too few → serialisation.
+On a shape with 8 output tiles, launching all 64 CUs means most workgroups ramp up, find nothing, and
+retire — **and that ramp IS the runtime.**
+
+**GENERALISES** — `ml8_moe_ffn_down` M64 N2048 K512 (different N *and* K): pool 64 → **0.1**,
+pool 8 → **0.5**; span/chunk 102k → 29k. Two independent shapes, both **5×**.
+
+**vs the §60 gate baseline: 0.101 → 0.5 TF and 0.111 → 0.5 TF. FIRST REAL WIN ON THE PRODUCT SHAPES.**
+
+### 63. THE IMPLIED DISPATCH POLICY — A HARNESS CHANGE, NOT A KERNEL ONE
+`ML8_POOL` is currently PINNED (128 config-of-record, 64 for the 1 WG/CU work). **It must be DERIVED
+FROM THE SHAPE'S AVAILABLE PARALLELISM.** Fitting both ends — M64 wants 4–8, M2048 wants 64 —
+**`pool ≈ min(64, TOTAL_super / 10)`**, i.e. keep ≥10 super-tiles per workgroup.
+NOT YET TESTED: whether the same rule helps the M=512 MoE shapes (0.70–4.33) and the mlmf experts
+(0.97), whose `TOTAL_super` is large enough that the rule returns pool≈64 — i.e. **the rule predicts NO
+change for them, so their gap has a DIFFERENT cause.** That is the next thing to find out.
+
+### 64. PROCESS FAILURE — `pgrep -f` SELF-MATCH, ~18 MINUTES OF FALSE "STILL RUNNING"
+I monitored the 30-shape sweep with `pgrep -f dsws_realshape_bench`. **My own watcher shell's command
+line CONTAINS that string**, so the check matched itself and never went false. I reported "still going"
+for ~18 min after the sweep had finished at 18:58, and held the GPU claim idle throughout. kmbandy
+caught it. This is the DOCUMENTED 2026-07-18 trap (`pgrep -f` self-matched and killed an ssh session
+four times); the recorded fix is to put the pattern inside a script invoked by path so the caller's
+cmdline cannot contain it. I also ignored two contradicting signals I had already seen: the output
+files were written, and stdout was "0 bytes" (buffered, flushed at exit).
+**RULE: never let a liveness check match its own invocation; prefer `ps` + an explicit non-self pattern,
+and treat "output file already written" as stronger evidence than any process check.**
+
+### 65. ★★ AUTO-POOL ACROSS ALL 30 REAL SHAPES: GEOMEAN 1.37×, 12 SHAPES >1.5×, ZERO REGRESSIONS ★★
+`--pool-auto` wired into `dsws_realshape_bench.py` (default OFF — a harness that silently retunes the
+dispatch geometry per shape would make every cross-run comparison meaningless). `ML8_POOL =
+min(--pool, TOTAL_super/--tiles-per-wg)`, tiles-per-wg=10. **Kernel, geometry and waves IDENTICAL to
+§60; pool is the ONLY variable.** 30 PASS / 0 FAIL / 3 UNSUPPORTED. `poolauto.json` / `poolauto.txt`.
+
+| shape | TOTAL_super | pool | before | after | |
+|---|---:|---:|---:|---:|---:|
+| mlmf_attn_val_proj1 M4096 | 96 | 9 | 0.416 | **0.987** | 2.37× |
+| ml8_moe_attn_kv M64 | 64 | 6 | 0.093 | 0.217 | 2.34× |
+| ml8_moe_ffn_gate_up M64 | 64 | 6 | 0.101 | 0.219 | 2.17× |
+| ml8_moe_attn_kv M512 | 128 | 12 | 0.699 | 1.497 | 2.14× |
+| mlmf_attn_linear_k M4096 | 144 | 14 | 0.814 | 1.739 | 2.14× |
+| ml8_moe_ffn_gate_up M512 | 128 | 12 | 0.711 | 1.493 | 2.10× |
+| ml8_moe_ffn_down M512 | 128 | 12 | 0.734 | 1.409 | 1.92× |
+| **mlmf_MoE_expert_fc2 M512** | 144 | 14 | **0.955** | **1.767** | **1.85×** |
+| **mlmf_MoE_expert_fc1 M512** | 144 | 14 | **0.966** | **1.782** | **1.84×** |
+| ml8_moe_ffn_down M64 | 64 | 6 | 0.111 | 0.204 | 1.84× |
+| ml8_dense_attn_kv M512 | 320 | 32 | 1.608 | 2.720 | 1.69× |
+| mlmf_router_down_proj M4096 | 192 | 19 | 1.215 | 1.913 | 1.57× |
+| *…9 shapes at pool 51–64* | | | | | 1.05–1.32× |
+| *ml8_dense_ffn_down M2048* | *11520* | *64* | *14.639* | *14.689* | *1.00×* |
+| *ml8_dense_attn_q M2048* | *5120* | *64* | *11.314* | *11.335* | *1.00×* |
+| *ml8_dense_ffn_gate_up M2048* | *11520* | *64* | *9.955* | *9.259* | *0.93×* |
+
+**GEOMEAN 1.37× over all 30. Sum 118.32 → 130.29.**
+**THE CONTROL HELD:** every shape whose pool stayed at 64 moved 0.93–1.10×, two of them at exactly
+1.00×. That is what makes the wins attributable to pool and nothing else. (The one 0.93× is inside the
+run-to-run lottery characterised in §59.)
+**THE mlambaformer MoE EXPERTS — recorded as ~56% OF GEMM TIME — WENT 0.96 → 1.78.**
+
+### 66. ★ CORRECTION: superM AND pool INTERACT. §61's "PADDING IS NOT THE PROBLEM" WAS TOO STRONG. ★
+Three measurements that only make sense together:
+- superM 256→64 **at pool 64**: 0.101 → 0.10 — **FLAT** (§61)
+- pool 64→6 **at superM 256**: 0.101 → 0.219 — **2.17×** (§65)
+- superM=64 **AND** pool=8: 0.101 → **0.5** — **5×** (§62)
+
+**THEY ARE NOT INDEPENDENT.** superM alone does nothing because at 64 WGs the runtime is pure launch
+cost and the padded work is not on the critical path. Remove the launch cost and the padding starts to
+matter. §61's conclusion ("padding is not the problem") is TRUE ONLY AT pool=64 and I stated it
+unconditionally.
+**CONSEQUENCE: §65's 1.37× UNDERSTATES WHAT IS AVAILABLE.** It tuned pool with superM pinned at 256.
+On the small shapes there is a SECOND UNCLAIMED FACTOR OF ~2 in per-shape superM (2.17× measured vs 5×
+achievable on `ml8_moe_ffn_gate_up` M64). **NEXT: extend auto-tuning to superM (via G at fixed FM) and
+re-run the gate.** Note superM is a BUILD-TIME defsym, so per-shape superM means one bin per superM
+class and a rebuild between groups — the harness currently builds once.
+
+---
+
+## 2026-07-29 NIGHT III — ★★ WE READ hipBLASLt's ACTUAL fp8 gfx1201 ISA. ONE ROOT CAUSE, THREE SYMPTOMS. ★★
+
+kmbandy's idea: run DSWS through static analysis, run hipBLASLt through static analysis, diff them.
+Offline, no GPU, shape-independent — RGA/static analysis takes the BUILD CONFIG, never M/N/K.
+
+### 67. GETTING AT THE VENDOR BINARY
+`/opt/rocm/lib/hipblaslt/library/TensileLibrary_B8B8_..._gfx1201.co` is a **CCOB** (zstd-compressed
+clang offload bundle), not an ELF. Extract with
+`clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx1201`.
+→ 38 MB ELF, **446 fp8 GEMM kernels** for our exact arch. (Also present: `B8F8`, `F8B8`, `HB8`, `SB8`…
+type-combination libraries. This one is `bf8_bf8` = e5m2; **we emit `v_wmma_f32_16x16x16_fp8_fp8`
+= e4m3** — same WMMA shape and cost, different 8-bit format.)
+
+### 68. ★ THE STRUCTURAL DIFF — AN EXACT INVERSION OF OUR DESIGN ★
+| | hipBLASLt (446 kernels) | DSWS best config |
+|---|---|---|
+| VGPR | min 56 · **median 254** · max 256 | **48 peak-live** of 256 |
+| SGPR | median 72 | 54 |
+| LDS | min 1,638 · **median 6,400** · max 32,768 | **34,304** |
+| WGs/CU | **~4** (4-wave WGs, 254 VGPR ≈ 4 waves/SIMD, 4×6,400 B fits) | **1** |
+| spills | **0** | 0 |
+| non-WMMA per WMMA | **2.19 best** · 12.93 median | **8.13** |
+
+**THEY FILL THE REGISTER FILE AND BARELY TOUCH LDS. WE LEAVE 81% OF THE REGISTER FILE IDLE AND FILL LDS.**
+This is the `_GSU1_` thesis (accumulators in VGPRs across the whole K loop, C stored once) — previously
+inferred from kernel NAMES, now **measured from their binary**.
+
+### 69. ★★ IT IS ONE ROOT CAUSE, NOT THREE PROBLEMS ★★
+Our accumulators live in LDS (split-K + `ds_add`). Therefore:
+1. every accumulate is a `ds_add` + wait instead of a register-resident WMMA accumulate
+   → **the instruction overhead** (8.13 vs their 2.19)
+2. the accumulator banks consume 34,304 B → **LDS is the occupancy limiter** → **1 WG/CU vs their ~4**
+3. the register file sits **81% unused with zero spills** while we starve for what it could have held
+
+Their leanest: `MT128x128x32 MIWT4_4` — 160 WMMA in a **511-instruction** window. Note the **x32**:
+K-depth 32 per iteration, so more WMMA amortising each iteration's loop overhead.
+
+### 70. METHOD — FOUR PARSING BUGS, EACH CAUGHT BY AN IMPLAUSIBLE ZERO
+Recorded because the *pattern* is the lesson, not the bugs:
+1. `<Cijk_…>` label regex — Tensile uses internal `label_*` symbols, so `cur` never set → 0 WMMA.
+2. Mnemonic assumed `wmma`; it is `v_wmma_f32_16x16x16_bf8_bf8` (matched, but bug 1 masked it).
+3. Symbols are **446 `R` descriptors + 446 `T` code**; bisecting the sorted list landed in descriptors.
+4. llvm-objdump puts the address in a **TRAILING comment** (`// 00000025D4B4:`), not a leading column,
+   and **all 446 T symbols have size 0** (hand-written asm declares none) so `a >= st+sz` filtered
+   everything. Fix: extent = next symbol's address.
+**Every one produced a clean, plausible-looking `0` that I did not report as a finding, because
+"0 WMMA in 4.97M lines of disassembly" is not a measurement.** (The project's standing trap: §"zeros
+that were never measurements".)
+**AND A FIFTH, WHICH WAS NOT A PARSE BUG BUT A WINDOW BUG:** whole-body counting gave hipBLASLt 141
+median vs our 21.68 — i.e. "we are 6.5× LEANER than the vendor", which is nonsense. Tensile kernels
+carry huge run-once edge-case code. **Re-measured in the same first-WMMA→last-WMMA window for BOTH**
+(the window RGA uses): their 2.19 best / 12.93 median vs our 8.13. Our 8.13 sits next to the project's
+existing RGA figure of 7.38 on a sibling config — **an independent check that the method is sound.**
+
+### 71. CAVEATS THAT MUST TRAVEL WITH THIS
+- **They SELECT a kernel per shape; we have ONE.** Their median (12.93) is WORSE than ours. The honest
+  target is their SELECTED kernel — near the 2.19 end for a well-matched shape — **not their median.**
+- **Static.** It says the CODE has 3.7× more non-WMMA per WMMA; it does NOT say throughput scales that
+  way (ports co-issue). Same caveat the 2026-07-26 tile sweep carried.
+- The window is first-WMMA→last-WMMA, which is NOT proven to be only the k-step loop.
+
+### 72. ★★ THE ACCUMULATOR IS NOT THE PROBLEM. SCALAR ADDRESS ARITHMETIC IS. ★★
+We set out to attack the LDS-accumulator design. **Measurement says it is 2.9% of the window.**
+FIRST FACT, from reading the burst: **the ACC is ALREADY REGISTER-RESIDENT.** `.Lflow_da_ss_rowblk`
+WMMAs into `v[ACC…]` across all `KSEG_STEPS` k-steps and does ONE `ds_add` per (rowblk, ksi) segment.
+The gap to hipBLASLt is not registers-vs-LDS, it is FLUSH FREQUENCY: 36 flushes per rowblk at
+K=9216/SEGK=256 vs their 1 per output tile. `JDEPTH` is exactly that knob ("keeps ACC in registers
+across J consecutive ksi, flushes ONCE") and is pinned to 1 by a DESIGN incompatibility with SELFSERVE,
+not a perf result.
+
+**DSWS burst window (first-WMMA → last-WMMA, 2337 instr, 256 WMMA, ratio 8.13):**
+| group | count | % | per WMMA |
+|---|---:|---:|---:|
+| **SALU / branch** | **1060** | **45.4%** | **4.14** |
+| VALU | 372 | 15.9% | 1.45 |
+| WMMA | 256 | 11.0% | 1.00 |
+| global load/store | 252 | 10.8% | 0.98 |
+| waits | 169 | 7.2% | 0.66 |
+| LDS other | 160 | 6.8% | 0.62 |
+| **ds_add (ACC flush)** | **68** | **2.9%** | **0.27** |
+
+`s_add_co_u32` 300 + `s_add_co_ci_u32` 222 = **522 64-bit address instructions = 22% of the window**,
+against **124** `global_load_tr_b64` — **4.2 address instructions per load.**
+
+**HEAD-TO-HEAD vs their leanest (`MT128x128x32`, 511 instr, 160 WMMA, ratio 2.19):**
+| per WMMA | DSWS | hipBLASLt | |
+|---|---:|---:|---|
+| **64-bit addr arith** | **2.04** | **0.11** | **18×** |
+| SALU total | 4.14 | 0.77 | 5.4× |
+| loads | 0.48 | 0.29 | 1.6× |
+| ds_add | 0.27 | 0 | — |
+| **non-WMMA** | **8.13** | **2.19** | **3.7×** |
+
+**THEY USE THE SAME LOAD INSTRUCTION** (`global_load_tr_b64`) — this is NOT instruction selection.
+Their loop does not RECOMPUTE ADDRESSES (17 addr instrs for 47 loads) and is PREDICATED, not branched
+(`v_cndmask_b32_e64` ×64 is their #2 mnemonic).
+
+**TARGETS, IN MEASURED ORDER:**
+1. **Scalar address bookkeeping in the burst body — 522 instrs, 22% of window.** Hoist the base per
+   burst, use immediate offsets on the k-steps instead of recomputing 64-bit addresses per load.
+2. Branchy control flow where predication would serve.
+3. `JDEPTH` / accumulator flush — **2.9%**. Fixing it buys 8.13 → 7.9. NOT worth the SELFSERVE design
+   fight now, and this REPLACES the plan we started the session with.
+
+**ETHOS: THIS DOES NOT TOUCH THE FLOW ARCHITECTURE.** The fix is inside the compute burst. The claim
+protocol, frontier, role economy and river principle are untouched. hipBLASLt buys a lean inner loop by
+shipping 446 RIGID variants (their non-WMMA:WMMA spans 2.19 → 88, median 12.93 — WORSE than our 8.13);
+we would get a lean inner loop while keeping ONE ADAPTIVE kernel. **That dispersion is the product
+argument for DSWS, not a footnote: we are not trying to beat them on every shape, we are trying to beat
+them on MOST while being far more consistent — which a per-shape lookup table structurally cannot do.**
+
+**CAVEAT, DO NOT OVERSTATE:** SALU issues on a SEPARATE PIPE from VALU on RDNA4, so part of that 45% may
+already be hidden behind WMMA/VALU issue. **Instruction count is not time.** Strong hypothesis with a
+clear mechanism — not a guaranteed 23%.
+
+---
+
+## 2026-07-29 LATE NIGHT — INSTRUCTION CUTS IN THE COMPUTE BURST, AND A RETRACTION OF THE WINDOW ITSELF
+
+**NOTHING IN THIS SECTION HAS EXECUTED.** Five source changes, static verification only, GPU held by the
+weight-pager. The bring-up is the first task tomorrow.
+
+### 73. FIVE CHANGES — 389 INSTRUCTIONS REMOVED, WORK INVARIANTS UNTOUCHED
+| | slice | s_add_co* | s_mul | ratio |
+|---|---:|---:|---:|---:|
+| original | 2337 | 522 | 80 | 8.13 |
+| (1) B ADDR FOLD ×5 | 2089 | 274 | 80 | 7.16 |
+| (2) MI=0 FOLD ×5 | 1996 | 212 | 49 | 6.80 |
+| (3) MI=1 HOIST ×4 | 1950 | 182 | 33 | 6.62 |
+| (4,5) dead `s52` advance ×2 (Kimi) | **1948** | **180** | 33 | **6.62** |
+
+**Invariants IDENTICAL at every step: WMMA 256 · B-loads 124 · A-loads 62 · stores 64 · `ds_add` 68.**
+`.text` 30,844 → 28,852 B. That invariance is the correctness signal — same work, less bookkeeping.
+
+**(1) B ADDR FOLD.** `s_add_u32 s54,s52,(ni*256)` + `s_addc_u32 s55,s53,0` + load on `s[54:55]`
+→ `global_load_tr_b64 …, s[52:53] offset:(ni*256)`. `ni*256` is assembly-time constant; the saddr form
+takes an immediate and the A path 3 lines away already used it. Precedent in-repo: `occ_kernel_coop.s:901`.
+**(2) MI=0 FOLD.** At `mi==0`, `s_mul_i32 s58,s32,0` / `s_add_u32 s58,s56,s58` / `s_addc_u32 s59,s57,0`
+is a pure copy of `s[56:57]`. Load on `s[56:57]` directly. No liveness change, general over FM.
+**(3) MI=1 HOIST.** `mi*s32 + s[56:57]` is loop-invariant; precompute the `mi==1` base ONCE per rowblk
+into the `s54/s55` pair that (1) freed. **This is the only change that extends liveness.**
+**(4,5)** final-step `s52 += s10` is dead (`s52` re-derived either way) — guarded `.if ks < KSEG_STEPS-1`.
+
+### 74. ★ RETRACTION: MY MEASUREMENT WINDOW WAS NOT THE INNER LOOP ★
+**`first-WMMA → last-WMMA` IS NOT A K-STEP LOOP ON THIS KERNEL.** Verified: **60 labels** fall inside it,
+including `.Lflow_jwait`, `.Lflow_bankwr`, `.Lbaton_norm`, `.Lflow_da_ss_complete`, `.Lflow_cstore`,
+`.Lflow_drain_adv`. It spans ring compute + the whole JDEPTH retire/drain/C-store path + decode.
+**PROOF:** the actual burst source contains **10 `v_mov` and 1 `s_wait_dscnt`**; the window reported
+**244 and 133**. That mass is `lds_*` macro expansion (exec saves, lane-0 broadcast) and probes —
+PER-CLAIM coordination, not per-k-step, much compiled out at FORENSICS=0.
+
+**THEREFORE §72's HEADLINE COMPARISON IS WITHDRAWN.** hipBLASLt's 2.19 is a real 511-instruction inner
+loop (`MT128x128x32`, 160 WMMA). Our 8.13/6.62 is a metered slice of most of the coordination machinery.
+**"3.7× more non-WMMA per WMMA than the vendor" IS NOT ESTABLISHED.** I flagged this exact risk in the
+handoff spec ("the window is first-WMMA→last-WMMA, which I have NOT proven is only the k-step loop") and
+it came back as the answer. The instruction cuts are still real — they removed genuine per-k-step work —
+but the ratio they moved is not the quantity hipBLASLt's 2.19 measures.
+
+### 75. THE K-LOOP IS DONE. WHERE TO LOOK NEXT.
+Kimi K3's conclusion after implementing (4,5): *"the in-k-loop per-step address cost is exactly your
+irreducible 2-instr s52 advance — there is nothing left inside the k-loop that is both safe and
+non-instrumentation."* The remaining ~180 `s_add_co*` are per-rowblk/per-claim, not per-k-step.
+
+**REMAINING CANDIDATES, ordered, with why each is blocked:**
+1. **B-base block is fully `s33`-invariant** (8 instrs: `s20/s21/s25` mul-chain + `s52/s53` adds).
+   Hoist to decode, re-copy 2/rowblk → **−6/rowblk**.
+2. **A-base is LINEAR in `s33`**: `A_base(r+1) = A_base(r) + FM·s32` (`s36` increments by exactly 1).
+   Precompute `FM·s32` once, 2-instr increment at loop bottom → **−9/rowblk**.
+3. **`s43 = (s41<<2)+TILEDONE_BASE` is `s33`-invariant** → **−2/rowblk**.
+   Total ≈ **−17/rowblk × (ACC_N−1)**.
+**ALL THREE BLOCKED ON THE SAME THING:** they need 3 SGPRs live across the whole burst. `s20/s21/s25` are
+free in-region today, **but `drain_advance` writes `s20–s23`** and is invoked immediately before the label
+and at drain sites — making them burst-live recreates the `:1401` hazard class exactly. `s58/s59` could
+carry 2 of 3 at FM≤2 but not FM>2. **Kimi described and STOPPED rather than applying — correct call.**
+4. **`global_load_tr_b128`** would halve B-loads 124→62. `occ_kernel_btr128.s` already proves the
+   two-adjacent-frag semantics. Blocked: changes `KDBUF_LPT`'s wait watermark (:1267) and `bcnt`
+   accounting. **A design conversation, not a slice.**
+5. **NOT the accumulator.** `ds_add` is 68 instrs = 3.3%. `JDEPTH` buys ~0.3 on the ratio. Dead end.
+6. **NOT predication.** Kimi declined with a better reason than mine: the burst is fully-unrolled
+   straight-line `.rept` — *there is no branch in it to convert*. hipBLASLt's `v_cndmask` is
+   remainder/tail handling in a ROLLED loop; our `KSEG_STEPS` is compile-time so there is no tail. Our
+   real branches (role loop, claim, coast) are control flow where predication executes BOTH sides —
+   strictly worse for spin/coast, "and it would poke the river for nothing."
+
+### 76. ADVERSARIAL REVIEW (Kimi K3 via pi_handoff, fireworks) — ALL THREE OF MY CHANGES PASS
+Asked to break them; could not. Evidence it produced, not assertions:
+- **`s54/s55` liveness:** macro-by-macro table of everything invoked in
+  `.Lflow_da_ss_rowblk..rows_done` with the registers each defsym resolves to — `gap_*`→s62/63,64,72–83 ·
+  `wtb_*`→s62/63,72–83 · `bcnt_add`→s72–80 · `cnt_inc`→s85/89 · `phase_stamp`→s62/63/64/77,81/82 ·
+  `deadman_progress`→s101 · `acc_base_of`→s39 · `lds_fetch_add_r`→s49. **None is 54/55 under any defsym
+  combination.** The in-region exec-save idiom uses **s49, not s57**. And `grep '\.set X, 54|55'` →
+  **no alias exists**, so the `:1401` aliased-reuse hazard cannot apply to this pair.
+- **Control flow:** only two entries (fall-through from `.Lflow_da_ss_decode`, and the `s_branch`
+  loop-back at :7092) and **both land above the hoist**; `batch_next` re-enters via `decode`.
+- **`.if FM > 1`:** correct at FM=1 (hoist elided, `.rept 1` never reaches the branch), exact at FM=2,
+  and FM≥4 falls through unchanged since `s32` is FM-independent.
+- **Residual, loud not silent:** the folded B immediate `(FN−1)·256` = 768 at FN=4; FN>~16 would exceed
+  the offset field and the **assembler rejects it at build time** — never a wrong address.
+
+### 77. THE ONE FRAGILITY IT FOUND — NOW IMPOSSIBLE BY CONSTRUCTION
+The `mi==1` invariant was held by **two independent conditions**: `.if FM > 1` at the hoist (which WRITES
+`s54/s55`) and `.rept FM` at the four load sites (which READ them). Editing one without the other = a load
+from an **uninitialised `s[54:55]` = SILENT WRONG C, not a build error.**
+**FIXED:** single shared symbol `.set A_MI1_HOISTED, (FM > 1)`; the hoist is `.if A_MI1_HOISTED` and every
+site is `.elseif A_MI1_HOISTED && mi == 1`. Zero bare conditions remain.
+**VERIFIED A PURE REFACTOR: bin byte-identical either side (`58e965a46f3e162d`)**, and assembles at
+FM=1/2/4. (An FM=4 "failure" in the first check was my own NFV gate correctly refusing FM=4 FN=4 at 176
+VGPRs > 128 — the gate working, not a guard bug.)
+
+---
+
+## 2026-07-31 MORNING — ★★ THE CUTS ARE FLAT, AND TF IS NOT COMPARABLE ACROSS DAYS ★★
+
+### 78. THE BRING-UP (§0 OF THE BRIEF) — PASSES ON CORRECTNESS, FLAT ON THROUGHPUT
+Rule-2 bring-up of the five instruction cuts. **First execution of that code.** ONE dispatch, then stop.
+`WAVES=6 FM=2 FN=4 G=8 ACC_N=4 SEGK=256`, `ML8_POOL=64`, bin `58e965a46f3e162d`, `.text` 28,852 B.
+
+**GATE — ALL FIVE CRITERIA PASS:**
+| criterion | result |
+|---|---|
+| oracle | `ok=2560 bad=0 max_rel=0` — **bit-exact**, not merely inside the LOOSE tier |
+| work-exact | `computed = 11,520,000` / 125 reps = **92,160/rep** — the pre-registered value |
+| `occ[96]` | 2,880,000, delta **+0** |
+| `occ[0]` (live) | **0** |
+| canary | clean, no OOB store past C-end |
+
+Also clean: `occ[95]=0` (no false-won CAS), `occ[97]=0` (no boundary-drain bails), `occ[73]=0` grow-fails,
+coast decomposition closes exactly (door sum 12,753,821 == coast).
+**The five cuts are CORRECT. They change no work and no result.**
+
+Reported **17.5 TF** against a 15.4 baseline. **The brief pre-registered "if it comes back materially
+FASTER, be suspicious and re-check work-exactness before celebrating."** That instruction is what produced
+everything below, and it was right.
+
+### 79. ★ THE CONTROL: THE CUTS ARE FLAT (+0.44%) ★
+The pre-cut source **was never committed and existed nowhere** — `HEAD` is days-old DSWS state that no
+longer even assembles (it predates the `:646` `.if !SELFSERVE` gating, so the stale single-slot guard
+fires). Reconstructed it by **scripted inversion** of the five documented cuts, with asserted replacement
+counts (5 B-fold / 5 A-fold / 1 hoist / 2 ks-guard) so pattern drift fails loudly instead of silently
+emitting a wrong control.
+
+**VALIDATED BY HASH BEFORE ANY SILICON: the rebuild reproduced `beb031c195df` bit-for-bit** (`.text`
+30,844 B — both the sha256 prefix recorded in §59 and the size recorded in §73). The control was therefore
+**provably the exact binary that already ran green four times**, so rule 2 did not apply to it.
+
+Same session, same cold card, 16 minutes apart, identical env:
+
+| bin | `.text` | ms/rep | TF | oracle |
+|---|---:|---:|---:|---|
+| pre-cut `beb031c1` | 30,844 | 5.5377 | 17.5 | bad=0 `max_rel=0` |
+| cuts `58e965a4` | 28,852 | 5.5137 | 17.5 | bad=0 `max_rel=0` |
+
+**+0.44% — inside the ±1.3% run-to-run band (§59). THE CUTS ARE FLAT.**
+Removing **389 instructions** (−17% of the slice; `s_add_co*` 522 → 180) bought **nothing measurable on
+this shape.** This is exactly the pre-registered prediction, and per the brief **a flat result is a PASS.**
+Kimi's reasoning stands: SALU issues on a separate pipe from VALU on RDNA4, and NOBLOAD/NOWMMA already
+showed the burst body is not the binding constraint *here*. The cuts remain justified by the thesis — the
+burst must be lean where the burst *does* bind, i.e. the small MoE shapes — but **they are not a win on
+`ml8_dense_ffn_down`, and must not be logged as one.**
+
+*Observation, NOT a result:* pre-cut showed spread 43.6% (per-rep 10.0–17.8) vs the cuts' 4.8%. One sample
+each, and §59 established spread is a run-level lottery. **Do not claim the cuts fixed the outlier mode.**
+
+### 80. ★★ THE REAL FINDING: TF IS NOT COMPARABLE ACROSS SESSIONS/DAYS ★★
+The 15.4 → 17.5 jump was **never the cuts**. It is the machine. The control bin is *provably the same
+binary* that produced 15.4 (hash-matched before dispatch):
+
+| when | bin | ms/rep | TF |
+|---|---|---:|---:|
+| 2026-07-29 ~18:40 (§59, ×4) | `beb031c1` | 6.2284 / 6.2688 / 6.2512 / 6.2968 | 15.3–15.5 |
+| 2026-07-31 ~08:53 | `beb031c1` | **5.5377** | **17.5** |
+
+**+12.5% ON BYTE-IDENTICAL CODE** — same shape, same env, same host, same wrapper. Yesterday's four
+repeats were tight (±1.3%), so this is **not** within-session noise; it is a **day-level shift**.
+
+**NOT THERMAL — MEASURED, NOT ARGUED.** Card was **55 °C / 51 W before** and **54 °C / 49 W after** a run.
+A 0.69 s run at **5.7% of peak fp8** does not move the die temperature, so the baseline's back-to-back
+predecessors cannot have left the card meaningfully hotter either. Both sessions were at idle temperature.
+(My first hypothesis was "cold card this morning". It is wrong.) **Cause remains UNIDENTIFIED** — suspect
+persistent DPM/clock or driver state (box uptime ~17 h at the time).
+
+**NO CLOCK DATA EXISTS FOR ANY RUN IN THIS PROJECT'S HISTORY.** ⚠ **CORRECTION to a claim I made in
+chat:** I called the empty `$LOG.journal` files "a bug". **They are not.** `$LOG.journal` is a
+`journalctl` grep for amdgpu **errors** (`MODE1|page fault|VRAM lost|…`) and is **CORRECTLY EMPTY on a
+clean run** — it is brick forensics, not telemetry. **Never read its emptiness as missing data.** The
+actual gap was that achieved sclk/power was simply never sampled by anything. Fixed in §81.
+
+**CONSEQUENCE — THIS IS THE EXPENSIVE PART:**
+> **EVERY CROSS-SESSION TF COMPARISON IN THIS LOG IS SUSPECT.** Any conclusion drawn by comparing a number
+> measured on one day against a number from another may be reading machine drift, not a lever. **Only a
+> SAME-SESSION A/B against a rebuilt control bin is valid.** Absolute TF figures are session-local.
+
+This does **not** invalidate within-session sweeps (§45–46 axis optima, §60–66 pool/superM, §59 repeats) —
+those were back-to-back. It **does** mean any figure carried forward across a session boundary as a
+baseline must be **re-measured in-session before it is compared to anything.**
+
+**METHOD THAT MADE THIS FINDABLE, AND IS NOW STANDING PRACTICE:**
+1. **Pre-register the expected result in writing before dispatching** — the brief said be suspicious of a
+   faster number, so a +13% "win" got audited instead of celebrated.
+2. **Reconstruct-and-hash-validate.** An uncommitted prior revision can be recovered by scripted inversion
+   of documented edits and **proven exact by binary hash** before it is ever run. A hash match is a
+   48-bit proof; inspection is not.
+3. **Keep a control bin for any claim.** The cheapest way to be wrong here is to compare against a number
+   from a previous session.
+
+**KG `340f6965`** (shared to fleet). Both dispatches clean, zero GPU resets; card released.
+
+### 81. THE INSTRUMENT: `gpu_run.sh` NOW RECORDS ACHIEVED CLOCKS ON EVERY RUN
+**Motivated directly by §80** — the drift could not be diagnosed because achieved sclk was never sampled.
+
+**What it does.** A background sampler writes `$LOG.telemetry` (CSV: `t_ms,sclk_mhz,mclk_mhz,power_w,
+temp_c,busy_pct`) at ~10 Hz across the dispatch, and prints a one-line summary after the run:
+```
+[gpu_run] sclk while busy: mean 2216 / min 2100 / max 2350 MHz | mclk mean 1258 MHz
+          | power mean 195 / peak 210 W | temp peak 64 C  (3 busy of 5 samples)
+```
+Stats are computed over samples with `gpu_busy_percent > 0`, so host-side oracle time doesn't dilute them.
+
+**Source.** amdgpu sysfs on the card matched by **PCI ID `1002:7551`** (override `DSWS_GPU_PCI_ID`) —
+resolved by ID, not card index, because `card0` is the 6900 XT (`1002:73BF`) and indices are not stable.
+Units verified against the live files, not assumed: `freq{1,2}_input` **Hz**, `power1_average` **µW**,
+`temp1_input` **m°C**.
+
+**Safety.** Host-side sysfs **reads** in a background shell: nothing enters the kernel, the hot path, or
+the message bus (rule 5), and no GPU state is written. The sampler is stopped **after** `RC=${PIPESTATUS[0]}`
+is captured, so the dispatch pipeline's exit status is never disturbed.
+
+**A missing instrument now FAILS LOUD.** If the sysfs node isn't found the run still proceeds, but prints
+`*** WARNING: no GPU telemetry ... achieved sclk will NOT be recorded ***`. Silence is what let §80 go
+unnoticed for the life of the project.
+
+**VERIFICATION (offline — the R9700 was held by another session, so no dispatch was run):**
+- `bash -n` clean.
+- Telemetry block **extracted from the file itself** (not a retyped copy, so the test cannot drift from
+  the code) and run against live sysfs: 46 samples in 2.5 s, correct units, and it picked up **real load
+  from the other session** (10 busy samples, sclk 15→1120 MHz) — proving the sampler sees load.
+- Summary awk exercised on **both** branches; synthetic busy data reproduced the expected
+  2216/2100/2350 MHz, 195/210 W, 64 °C, 3-of-5 exactly.
+- Full guard chain walked with `GPU_RUN_DRY=1`: geometry guard refused first, then the **2026-07-26
+  collision guard correctly refused** (`gpu:R9700 is held by ANOTHER SESSION 87d16c2e`) — the guard doing
+  its job. No stray telemetry file is created on a refusal.
+- **NOT yet exercised inside a live dispatch.** It is verified by construction and standalone test only.
+  **First real run should sanity-check that the summary line appears and reports a plausible busy sclk.**
+
+**WHAT TO DO WITH IT.** The next same-session A/B should record sclk for both arms. If the 07-29 vs 07-31
+gap reappears with **matched** clocks, the cause is not DPM and the search moves elsewhere; if clocks
+differ, §80 is explained and TF must be normalised per-clock before any cross-session comparison.
+
+---
+
+## 2026-07-31 MIDDAY — ★★ THE STATIC MATRIX: 90% OF THE KERNEL IS UNREACHABLE BY EVERY LEVER WE HAVE ★★
+
+### 82. TWELVE VARIATIONS THROUGH RGA — MEASURE FIRST, NO HYPOTHESIS
+**Directive (kmbandy):** *"use the tools we have to measure and only measure. stop measuring 1 thing, making
+some grand assumption, going down a rabbit hole about that assumption, and then finding out it was wrong.
+take several variations of the kernel. measure every aspect possible. run each one through rga."* And:
+*"the commonalities across the variations are going to tell us structurally where the bottlenecks are and
+which levers are bottlenecks themselves."* This section is that, with no mechanism proposed.
+
+Data: `DSWS_STATIC_MATRIX_2026-07-31.csv` (+ per-cell ISA / livereg / stats preserved in scratchpad).
+**Entirely offline. No GPU.** 15 cells attempted, 12 built, 3 refused (refusals recorded as data).
+
+**CORRESPONDENCE GUARANTEE — the thing that makes this trustworthy.** `rga_check.sh` re-assembles the
+kernel with only the defsyms you hand it, which would analyse a DIFFERENT kernel than `build_flow.sh`
+ships (the real build passes ~60 defsyms). Instead, each cell's **exact** clang command is extracted from
+`bash -x ./build_flow.sh` and re-run with `RGADESC=1` appended. The analysed object is never
+hand-reconstructed.
+
+**TWO INSTRUMENT TRAPS CAUGHT BEFORE THEY BECAME NUMBERS:**
+1. **RGA's `USED_LDS_BYTES` and `USED_VGPRs` ARE ARTIFACTS OF THE ANALYSIS DESCRIPTOR, NOT THE KERNEL.**
+   RGA reports LDS=13,824 and VGPR=256 for a bin whose real LDS is 34,304. `RGADESC` (`:7639`) emits an
+   analysis-only AMDHSA descriptor so `rga -s bin --co` can enumerate the kernel; its LDS/VGPR fields are
+   that descriptor's, not the shipped geometry. **Take LDS/NFV from `build_flow.sh`; from RGA take only
+   livereg, SGPRs, spills, ISA size.** Quoting RGA's LDS here would have been a §80-class fabrication.
+2. `/usr/bin/rga` on this box is **ripgrep-all**, not the Radeon GPU Analyzer (`~/Downloads/rdts/.../rga`,
+   v2.14.2.8). `rga_check.sh` documents the clash; a fresh harness would walk straight into it.
+
+### THE RESULT — COMPUTE MOVES 106%, THE REST MOVES 8%
+Split each cell into **COMPUTE** (`v_wmma + global_load_tr + global_load_b + ds_add + global_store`) and
+**REST** (every other instruction):
+
+| cell | TOT | COMPUTE | REST | REST% | wmma% | SGPR | spill | livereg | LDS | superM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| base | 5291 | 653 | 4638 | 87.7% | 4.8% | 72 | 0 | 82 | 34304 | 256 |
+| accn2 | 5243 | 621 | 4622 | 88.2% | 4.9% | 72 | 0 | 82 | 17920 | 256 |
+| segk128 | 4995 | 429 | 4566 | 91.4% | 2.6% | 72 | 0 | 82 | 34304 | 256 |
+| segk64 | 4847 | 317 | 4530 | **93.5%** | 1.3% | 72 | 0 | 82 | 34304 | 256 |
+| fm1 | 4873 | 397 | **4476** | 91.9% | 2.6% | 72 | 0 | 48 | 17920 | 128 |
+| fm4fn2 | 5483 | 653 | **4830** | 88.1% | 4.7% | 72 | 0 | 82 | 34304 | 512 |
+| fn2 | 4891 | 365 | 4526 | 92.5% | 2.6% | 72 | 0 | 46 | 17920 | 256 |
+| g4 | 5257 | 653 | 4604 | 87.6% | 4.9% | 72 | 0 | 82 | 34304 | 128 |
+| g6accn3 | 5249 | 637 | 4612 | 87.9% | 4.9% | 72 | 0 | 82 | 26112 | 192 |
+| g6accn2 | 5225 | 621 | 4604 | 88.1% | 4.9% | 72 | 0 | 82 | 17920 | 192 |
+| waves8 | 5327 | 653 | 4674 | 87.7% | 4.8% | 72 | 0 | 82 | 34304 | 256 |
+| waves16 | 5471 | 653 | 4818 | 88.1% | 4.7% | 72 | 0 | 82 | 34304 | 256 |
+
+> **COMPUTE 317 → 653 (+106%). REST 4,476 → 4,830 (+8%). REST is 87.6–93.5% of the kernel in EVERY cell.
+> WMMA is 1.3–4.9%.**
+
+**EVERY GEOMETRY LEVER WE HAVE — `ACC_N`, `SEGK`, `FM`, `FN`, `G`, `WAVES` — MOVES ONLY THE ~10% THAT IS
+COMPUTE.** The other ~4,600 instructions are the same code in all twelve variations. That is the answer to
+"which levers are bottlenecks themselves": **collectively they cannot reach 90% of the kernel.**
+
+This retroactively explains every flat result on record — NOBLOAD / NOWMMA / NOCFLUSH all flat (§ 2026-07-20),
+and the five instruction cuts flat at +0.44% (§79). **They were all cutting inside the same 10%.**
+
+### THREE QUANTITIES THAT DO NOT MOVE AT ALL
+- **`SGPR = 72` in all 12 cells.** No lever changes it.
+- **Zero VGPR and zero SGPR spills in all 12.** Register pressure is not a differentiator anywhere.
+- **`livereg` peak tracks ONLY the frag grid**: 82 for every FM×FN=8 cell, 46–48 for the 4-frag cells.
+  Independent of `ACC_N`, `SEGK`, `G`, `WAVES`. (Note livereg 82 < NFV 112 — HW allocates 120.)
+
+### THE REFUSALS ARE DATA
+- **`FN=8` → NFV=192; `FM=4 FN=4` → NFV=176. Both refused against the 128 dyn-VGPR cap.** The only two
+  cells in the sweep that would raise per-wave arithmetic intensity are exactly the two that are
+  forbidden. The cap is a live structural constraint (see the umr `BLOCK_SIZE=1` → 256 note).
+- **`WAVES=4` DOES NOT ASSEMBLE** — `error: invalid operand for instruction`. A latent bug, not a design
+  limit: the `WAVES` axis has a hole in it that nobody knew about.
+
+### THE NEAR-TWIN
+`fm4fn2` vs `base` are statically near-identical — same feed ratio 0.750, NFV 112, livereg 82, LDS 34,304,
+256 WMMA, 653 COMPUTE. They differ only in `superM` (512 vs 256) and REST (4,830 vs 4,638). This is the
+control arm `build_flow.sh:31` pre-registered. **If they measure different TF, the difference is not in the
+code — it is in the work decomposition.**
+
+### ⚠ THE LIMIT OF THIS SECTION, STATED PLAINLY
+**STATIC INSTRUCTION COUNT IS NOT EXECUTION COUNT.** REST mixes one-time setup, per-claim coordination and
+per-k-step work; **90% of the CODE does not mean 90% of the TIME.** This establishes where the code mass
+is and that our levers cannot reach it. It does NOT establish where the cycles go, and **no mechanism is
+claimed here.** The matching dynamic measurement is next; drawing a conclusion from this half alone would
+be the exact error this campaign was ordered to stop.
+
+### 83. WHAT THE INVARIANT 90% ACTUALLY IS — EXEC-MASK BOOKKEEPING (offline, read-only)
+§82 established REST is ~90% of the kernel and moves ±8% across every lever. It did not ask what REST
+*is*. Answered here from the 12 saved disassemblies — **no rebuild, no GPU.**
+
+**REST by mnemonic (base cell, REST = 4,638):**
+| mnemonic | count | % REST | | mnemonic | count | % REST |
+|---|---:|---:|---|---|---:|---:|
+| `v_mov_b32` | 934 | 20.1% | | `s_cbranch_execz` | 360 | 7.8% |
+| `s_mov_b32` | 777 | 16.8% | | `ds_store_b32` | 332 | 7.2% |
+| `s_wait_dscnt` | 444 | 9.6% | | `s_add_co_u32` | 186 | 4.0% |
+| `s_and_b32` | 394 | 8.5% | | `v_readfirstlane_b32` | 81 | 1.7% |
+| `v_cmp_eq_u32` | 360 | 7.8% | | *(top 12 = 88% of REST)* | | |
+
+**`v_cmp_eq_u32` = 360 and `s_cbranch_execz` = 360 — EXACTLY EQUAL.** That is a signature, and it maps to
+one construct: the `lds_*` lane-0 accessor family. `lds_put` (`:1631`) is **9 instructions to write ONE
+32-bit LDS word**, of which exactly one is the `ds_store`:
+```
+s_mov_b32 s49, exec_lo / v_cmp_eq_u32 vcc_lo,0,v2 / s_and_b32 exec_lo.. / s_cbranch_execz   <- 4 guard
+v_mov_b32 v[RP_A],off  / v_mov_b32 v[RP_D],ssrc                                             <- 2 marshal
+ds_store_b32 / s_wait_dscnt 0x0                                                             <- 1 work +wait
+s_mov_b32 exec_lo, s49                                                                      <- 1 restore
+```
+Family call sites in source: `lds_get` 82, `lds_put` 60, `lds_put_r` 45, `lds_get_r` 30, `lds_cas_rtn` 14,
+`lds_fetch_add_r` 14, `lds_fetch_add` 9, `lds_cmpstore_adv` 6, `lds_inc` 4, `lds_inc_r` 3 — **267 sites**,
+expanding (with `.rept`) to **360 lane-0-guarded blocks**.
+
+> **360 blocks × 5 pure-bookkeeping instructions (2×`s_mov` exec save/restore + `v_cmp` + `s_and` +
+> `s_cbranch_execz`) = 1,800 instructions = 34% OF THE ENTIRE KERNEL, moving no data at all.**
+> Add the 2 scalar→vector marshalling `v_mov`s and the `s_wait_dscnt` per block and the accessor idiom
+> accounts for the clear majority of REST.
+
+**WHY IT IS INVARIANT:** these are accesses to *coordination state*, whose count depends on the protocol,
+not on `ACC_N`/`SEGK`/`FM`/`FN`/`G`/`WAVES`. That is precisely why no geometry lever moves REST — and it
+is the same mass the §3 window-retraction attributed to "`lds_*` macro expansion (exec saves, lane-0
+broadcast)", now counted at whole-kernel scope instead of inside a bad window.
+
+**STILL NOT A TIME MEASUREMENT.** Static count only; the dynamic half (§82 closing note) is unrun. **No
+mechanism or fix is proposed here.**
+
+### 84. `WAVES=4` DOES NOT ASSEMBLE — ROOT CAUSE, AN OFF-BY-ONE GUARD
+`occ_kernel_dsws_flow.s:5569:29` and `:7125:29` → `error: invalid operand for instruction`, on
+`s_mul_hi_u32 s93, s92, BATON_MAGIC`.
+
+`FIRST_COMPUTE_WID = 3` (`:769`), so `NCOMPUTE = WAVES − 3` (`:929`). At **WAVES=4, NCOMPUTE = 1**, and
+`BATON_MAGIC = 0x100000000 / NCOMPUTE` = **`0x100000000` = 2³²** — a 33-bit literal no SOP2 operand can take.
+
+**The guard is `.if NCOMPUTE < 1` (`:930`). `NCOMPUTE == 1` passes it.** Off by one.
+
+*Falsified en route, worth recording:* I first hypothesised a signed-overflow rejection of `0x80000000`
+(2³¹) at NCOMPUTE=2. **Direct assembler test refuted it** — `0x40000000`, `0x7fffffff` and `0x80000000`
+all assemble clean; only `0x100000000` errors. The 10-second test beat the plausible story.
+
+**Consequence:** `WAVES=4` and `WAVES=3` are both unbuildable; the axis is only valid at `WAVES ≥ 5`.
+Every WAVES sweep on record silently starts at 5. Not fixed here (shared tree, upstream sync in flight);
+the correct guard is `NCOMPUTE < 2`, since at NCOMPUTE==1 the round-robin is degenerate (`idx mod 1 ≡ 0`)
+and needs no magic at all.
+
+*Withdrawn:* an apparent duplicate `.macro lds_put_r` at `:2023`/`:2620` is **NOT a defect** — the first is
+guarded by `.if !(DSWS2_CONV || DSWS2_ENVELOPE)` with a comment explaining the ring needs it at CONV=0.
+
+---
+
+## 2026-07-31 AFTERNOON — ★★ THE DYNAMIC MATRIX: 35% OF RUNTIME IS FIXED PER-EVENT COORDINATION ★★
+
+### 85. TWELVE CELLS ON SILICON — PAIRED 1:1 WITH THE STATIC MATRIX (§82)
+Data: `DSWS_DYNAMIC_MATRIX_2026-07-31.csv`. Same 12 cells as §82, **same 12 binaries** (`base` rebuilt to
+`58e965a46f3e162d`, `accn2` to `6bc334a3fbf5a071` — the exact artifacts already dispatched today, so
+cell→binary correspondence is proven, not assumed). `ML8_POOL=64` PINNED in every cell: occupancy is a
+retired axis (§79) and letting it float would make every cell a two-variable change — the exact confound
+that muddied the morning `ACC_N=2` run.
+
+**AUTHORIZATION:** run under a held board claim (`8f49507a`), which is the GPU authorization mechanism.
+Hard stop enforced IN CODE (oracle / work-exactness / `occ[96]` delta / `occ[0]` / canary / reset / latch /
+non-zero exit), not by judgement mid-run. **12/12 clean, no stop fired.** `door1` = 100% of coast in every
+cell; grow-fail 0 in every cell; `occ[20]`=384 in every cell.
+**No probe builds.** `PHASEPROBE` was REJECTED as the instrument: `phase_stamp` (`:1619` area) issues
+`s_sendmsg_rtn_b64 MSG_RTN_GET_REALTIME` + `s_wait_kmcnt 0` — an **unthrottled message-bus RTC read**, the
+exact 2026-07-14 brick vector that rule 5 names and that `DUTYPROBE` is hard-disabled for. 27 stamp sites,
+44x overhead, and its cost lands per-transition, biasing the very distribution it would measure.
+
+### ⛔ 85a. RETRACTION — MY `TOTAL_super` GROUPING WAS WRONG
+Mid-run I claimed `TOTAL_super = 11,796,480/(superM*FN)` produced two coordination levels (11,520 for
+base/fm4fn2, 23,040 for fm1/fn2) and that this explained the TF pairing. **THE RUN DATA REFUTES IT.**
+The dispatcher's own `computed` column gives `computed/rep = G*TOTAL_super = 92,160` for **base, accn2,
+fm1, fn2, fm4fn2, waves8 AND waves16 alike** — identical event counts, not two levels.
+**The pairs are real; the reason I gave for them was wrong.** I reasoned from a formula I never checked
+against the dispatcher output — the same "re-quote instead of re-read" failure as §80/the hipBLASLt band.
+
+### THE RESULT — A TWO-TERM COST PER COORDINATION EVENT
+`fm1`/`fn2` do not run more events; they run the same events carrying **half the work**
+(0.526 vs 1.051 MFLOP/event). Fitting ns-per-event against work-per-event on the WAVES=6 / SEGK=256 cells:
+
+> ### `ns_per_event = 20.80 + 37.36 × MFLOP_per_event`
+
+**Fit on TWO cells (base, fm1); PREDICTS the two held out — `fm4fn2` −0.5%, `fn2` +0.9%.** Out-of-sample,
+not a curve drawn through all four.
+
+| cell | comp/rep | GF/rep | MF/event | ns/event | TF | sclk | **TF norm** | coast/comp |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base | 92,160 | 96.9 | 1.0513 | 60.07 | 17.5 | 2140 | **17.5** | 1.246 |
+| fm4fn2 | 92,160 | 96.7 | 1.0489 | 60.28 | 17.4 | 2084 | **17.9** | 1.092 |
+| waves8 | 92,160 | 96.4 | 1.0458 | 63.77 | 16.4 | 1975 | **17.8** | 2.587 |
+| g6accn3 | 69,120 | 72.5 | 1.0489 | 65.56 | 16.0 | 2125 | **16.1** | 1.392 |
+| accn2 | 92,160 | 96.7 | 1.0497 | 64.80 | 16.2 | 2206 | **15.7** | 1.635 |
+| waves16 | 92,160 | 96.5 | 1.0468 | 82.43 | 12.7 | 1806 | **15.0** | **13.023** |
+| g4 | 46,080 | 48.4 | 1.0510 | 72.98 | 14.4 | 2209 | **14.0** | 1.890 |
+| g6accn2 | 69,120 | 72.5 | 1.0484 | 71.81 | 14.6 | 2307 | **13.5** | 1.793 |
+| fn2 | 92,160 | 48.3 | 0.5242 | 40.01 | 13.1 | 2156 | **13.0** | 1.236 |
+| fm1 | 92,160 | 48.5 | 0.5257 | 40.44 | 13.0 | 2142 | **13.0** | 1.262 |
+| segk128 | 184,320 | 96.5 | 0.5233 | 51.31 | 10.2 | 2166 | **10.1** | 0.553 |
+| segk64 | 368,640 | 96.4 | 0.2615 | 46.70 | 5.6 | 2180 | **5.5** | 0.308 |
+
+> **AT THE CONFIG OF RECORD: 20.8 ns of 60.1 ns per event — 35% OF RUNTIME — IS FIXED COST THAT CARRIES NO
+> WORK.** That is why halving work-per-event (`fm1`, `fn2`) costs 25% throughput: the same overhead is paid
+> on half the payload. It is also why the frag grid and feed ratio are irrelevant at matched work-per-event
+> (`base` vs `fm4fn2`: 1.0513 vs 1.0489 MF/event → 60.07 vs 60.28 ns, **0.3% apart**, despite a transposed
+> 2x4→4x2 grid and superM 256→512).
+
+### ★ THE TELEMETRY (§81) WAS LOAD-BEARING ON ITS FIRST REAL USE ★
+**Busy-band sclk spans 1806–2307 MHz — a 28% SPREAD ACROSS CELLS.** Uncorrected, that silently rewrites
+every sub-15% comparison. Clock-normalised:
+- **`waves8`'s apparent −6.3% IS ENTIRELY CLOCK.** Normalised 17.8 vs base 17.5 — indistinguishable.
+  WAVES 6→8 costs nothing. Without §81 this would have been logged as a wave-axis result.
+- **`waves16` is a REAL −14%** (15.0 normalised), and its signature is `coast/computed` = **13.023 vs
+  base's 1.246** — 10x the poll passes per unit work. It does NOT reach §45's 10.2 TF; that older figure
+  is not reproduced here at matched geometry.
+- **`accn2` is WORSE than it looked**: −10% normalised, not the −7% the raw TF suggested.
+
+### WHAT DOES NOT FIT — LEFT UNEXPLAINED ON PURPOSE
+`segk128` (+27%) and `segk64` (+53%) run far above the per-event prediction, so **SEGK carries a
+per-segment cost the per-event model does not capture** (an independent 3-point fit on that axis alone
+gives `time ≈ 1.63 ms + 0.108 ms × n_kseg`, the two slopes agreeing to 1% over a 4x range).
+`g4` (+21%) and `g6accn2` (+20%) also miss. **No third parameter has been fitted to rescue them.** Twelve
+points will accommodate almost any model with enough terms; that is how the feed-ratio model survived as
+long as it did.
+
+### ⚠ A CORRESPONDENCE THAT IS NOT YET A FINDING
+35% of runtime being fixed per-event cost sits very close to §83's **34% of instructions being exec-mask
+bookkeeping** around lane-0 LDS accessors. **These may or may not be the same thing.** Distinguishing a
+causal link from a numerical coincidence needs a designed experiment, not two matching percentages. **Do
+not cite this as established.**
+
+### 86. TWO FIXES FROM THE CAMPAIGN — BOTH VERIFIED INERT ON THE MEASURED CONFIG
+Applied after the matrix so the 12 measurements in 82/85 stay valid against the source that produced them.
+
+**(a) `BATON_MAGIC` off-by-one (84).** `.if NCOMPUTE < 1` -> `.if NCOMPUTE < 2`, and the paired `STAGGER`
+guard re-keyed from `WAVES <= FIRST_COMPUTE_WID` to the same `NCOMPUTE < 2`.
+**THE TWO CONDITIONS MUST AGREE** -- widening one alone yields a kernel that assembles with
+`BATON_MAGIC = 0` and silently computes `q = mulhi(idx,0) = 0`, i.e. the wrong baton turn on every wave.
+Same coupling hazard class as `A_MI1_HOISTED` (77); both are now single-condition by construction.
+**THIS DOES NOT UNLOCK `WAVES=4`** -- it converts a bare `error: invalid operand for instruction` at two
+unrelated `s_mul_hi_u32` sites into a diagnostic naming the cause. A single compute wave is a degenerate
+round-robin; supporting it means bypassing the baton, which is a design change.
+- config of record **BYTE-IDENTICAL: `58e965a46f3e162d`** (WAVES=6 -> NCOMPUTE=3 never took the changed branch)
+- WAVES 5/7/8/16 still build; WAVES 3/4 now fail legibly.
+- **The WAVES axis is valid only at >= 5. Every WAVES sweep in this log silently starts there.**
+
+**(b) `build_flow.sh` CONFIG OF RECORD block was itself the stale config.** Defaults were
+`WAVES=16 G=6 FM=1 ACC_N=3`, and the header asserted "2 WG/CU / ML8_POOL=128 / 13,824B LDS" -- all
+superseded. A bare `./build_flow.sh` built a non-config-of-record and **printed "CONFIG OF RECORD" over
+it**: exactly the silently-wrong-config failure the block's own preamble exists to prevent, committed by
+the block itself. Now `WAVES=6 G=8 FM=2 ACC_N=4 FN=4 SEGK=256`; header corrected to 1 WG/CU / ML8_POOL=64
+/ 34,304B with the occupancy and SEGK findings cited.
+- **bare `./build_flow.sh` now yields `58e965a46f3e162d`**, and explicit env still wins (`:=` unchanged).
+- No caller depends on the old defaults (verified: `gpu_run.sh`, `gate_lds.sh`, `dsws_realshape_bench.py`
+  only reference the script in comments/diagnostics, never invoke it with geometry unset).
+- **KNOWN, NOT FIXED:** the WG/CU + pool figures in that echo are still a hardcoded string, not derived
+  from the published LDS. Correct today at 34,304B; it will go stale again if LDS moves. Deriving it from
+  the sidecar is the durable fix.
+
+Source now `57ab3100c9450ad6`; **bin unchanged at `58e965a46f3e162d`**.

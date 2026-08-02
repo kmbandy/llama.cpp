@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
+from .dspark import DSparkDraftMixin
 
 from .qwen import QwenModel
 
@@ -475,10 +476,27 @@ class DeepseekV32Model(DeepseekV2Model):
 @ModelBase.register("DeepseekV4ForCausalLM")
 class DeepseekV4Model(TextModel):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
-    _skipped_mtp_tensors = 0
+
+    # Root (unprefixed) tensors after mtp.{stage}. rekey — DSpark / DFlash heads.
+    # Layer-local MTP body tensors are rekeyed to layers.{num_hidden+stage}.* instead.
+    _MTP_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+        "main_proj.weight": (gguf.MODEL_TENSOR.FC, ".weight"),
+        "main_norm.weight": (gguf.MODEL_TENSOR.ENC_OUTPUT_NORM, ".weight"),
+        "markov_head.markov_w1.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.markov_w2.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+        "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DSPARK_CONF_PROJ, ".weight"),
+    }
+
+    # rest values that stay unprefixed after mtp.{stage}. strip (not layers.{bid}.).
+    # Includes root-map keys plus the main_proj FP8 scale partner for dequant.
+    # Last-stage norm / hc_head_* are rekeyed to layers.{last}.* (not unprefixed)
+    # so they do not collide with the main stack's output_norm / output_hc_*.
+    _MTP_UNPREFIXED_REST: frozenset[str] = frozenset({
+        *_MTP_ROOT_MAP.keys(),
+        "main_proj.scale",
+    })
 
     def __init__(self, *args, **kwargs):
-        type(self)._skipped_mtp_tensors = 0
         super().__init__(*args, **kwargs)
 
         with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
@@ -486,8 +504,26 @@ class DeepseekV4Model(TextModel):
         for key, value in raw_hparams.items():
             self.hparams.setdefault(key, value)
 
-        self.block_count = self.hparams["num_hidden_layers"]
+        num_hidden = int(self.hparams["num_hidden_layers"])
+        # Rekey mtp.{stage}.* into the block namespace (and unprefixed DSpark roots)
+        # BEFORE block_count / tensor_map / dtype collection. Stage count is derived
+        # from the tensors actually present — config num_nextn_predict_layers is
+        # wrong for this checkpoint (says 1; ships mtp.0/1/2).
+        self._mtp_stage_count = self._integrate_mtp_tensors(num_hidden)
+        self.block_count = num_hidden + self._mtp_stage_count
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        if self._mtp_stage_count:
+            logger.info(
+                "DeepSeek-V4: including %d MTP stage(s) as blocks %d..%d "
+                "(block_count=%d = %d main + %d MTP)",
+                self._mtp_stage_count,
+                num_hidden,
+                self.block_count - 1,
+                self.block_count,
+                num_hidden,
+                self._mtp_stage_count,
+            )
 
         self._dsv4_fp8_dequantized: set[str] = set()
         self._dsv4_bf16_tensors: set[str] = set()
@@ -495,22 +531,69 @@ class DeepseekV4Model(TextModel):
         self._dsv4_mxfp4_generated = False
         self._collect_source_dtypes()
 
-        if type(self)._skipped_mtp_tensors:
-            logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0", type(self)._skipped_mtp_tensors)
-
         # add a default chat template; if the model has a built-in template, it will be overridden later
         template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
                 self.gguf_writer.add_chat_template(f.read())
 
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        name, _ = item
-        if name.startswith("mtp."):
-            cls._skipped_mtp_tensors += 1
-            return None
-        return super().filter_tensors(item)
+    def _integrate_mtp_tensors(self, num_hidden: int) -> int:
+        """Rekey mtp.{stage}.{rest} into the main block namespace; return stage count.
+
+        - Layer body: mtp.{s}.{rest} -> layers.{num_hidden+s}.{rest}
+          (stages become blocks 43,44,45 when num_hidden=43)
+        - DSpark / DFlash heads (main_proj, markov, confidence): strip to unprefixed rest
+        - Last-stage norm / hc_head_*: layers.{last}.{rest} (mapped to nextn.* enums)
+
+        Asserts stage count == 3 when any mtp.* tensor is present. Returns 0 when
+        the checkpoint has no MTP subtree (e.g. a draft path that already rekeyed).
+        """
+        mtp_names = [n for n in self.model_tensors if n.startswith("mtp.")]
+        if not mtp_names:
+            return 0
+
+        stages: set[int] = set()
+        rekeyed: dict[str, Callable[[], Tensor]] = {}
+        # Keep non-mtp tensors first.
+        for name, gen in self.model_tensors.items():
+            if not name.startswith("mtp."):
+                rekeyed[name] = gen
+
+        for name in mtp_names:
+            match = re.match(r"mtp\.(\d+)\.(.+)$", name)
+            if match is None:
+                raise ValueError(f"Unexpected DeepSeek-V4 MTP tensor {name!r}")
+            stage = int(match.group(1))
+            rest = match.group(2)
+            stages.add(stage)
+
+            if rest in self._MTP_UNPREFIXED_REST:
+                new_name = rest
+            else:
+                # last-stage specials (norm, hc_head_*) and all body tensors
+                new_name = f"layers.{num_hidden + stage}.{rest}"
+
+            if new_name in rekeyed:
+                raise ValueError(
+                    f"DeepSeek-V4 MTP rekey collision: {name!r} -> {new_name!r} "
+                    f"already present"
+                )
+            rekeyed[new_name] = self.model_tensors[name]
+
+        stage_count = 1 + max(stages)
+        if stages != set(range(stage_count)):
+            raise ValueError(
+                f"DeepSeek-V4 MTP stages must be contiguous from 0; got {sorted(stages)}"
+            )
+        # Checkpoint ships mtp.0/1/2; config.json's num_nextn_predict_layers=1 is wrong.
+        if stage_count != 3:
+            raise ValueError(
+                f"DeepSeek-V4 MTP stage count derived from tensor names is {stage_count}, "
+                f"expected 3 (mtp.0/1/2). Refusing to silently drop stages."
+            )
+
+        self.model_tensors = rekeyed
+        return stage_count
 
     @staticmethod
     def _float8_dtypes() -> tuple[torch.dtype, ...]:
@@ -550,8 +633,11 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
         self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
         self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
-        self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * self.block_count)
-        self.gguf_writer.add_swiglu_clamp_shexp([hparams["swiglu_limit"]] * self.block_count)
+        # swiglu clamps are sized to the MAIN stack only (n_layer = block_count - nextn);
+        # deepseek4.cpp reads them with hparams.n_layer(), not n_layer_all.
+        n_main = self.block_count - self._mtp_stage_count
+        self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * n_main)
+        self.gguf_writer.add_swiglu_clamp_shexp([hparams["swiglu_limit"]] * n_main)
 
         self.gguf_writer.add_indexer_head_count(hparams["index_n_heads"])
         self.gguf_writer.add_indexer_key_length(hparams["index_head_dim"])
@@ -565,6 +651,104 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
         self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
+
+        # MTP / DSpark metadata — only when the mtp.* subtree was present.
+        if self._mtp_stage_count > 0:
+            self.gguf_writer.add_nextn_predict_layers(self._mtp_stage_count)
+
+            # Prefer config values; fall back to the measured DeepSeek-V4-Flash-0731
+            # DSpark release constants when the main config omits the flat keys.
+            block_size = int(hparams.get("dspark_block_size", 5))
+            noise_token_id = int(hparams.get("dspark_noise_token_id", 128799))
+            markov_rank = int(hparams.get("dspark_markov_rank", 256))
+            target_layer_ids = hparams.get("dspark_target_layer_ids", [40, 41, 42])
+            # Runtime extract indices are 1-based (see DSparkDraftMixin / dflash loader).
+            extract_layer_ids = [int(i) + 1 for i in target_layer_ids]
+
+            self.gguf_writer.add_block_size(block_size)
+            self.gguf_writer.add_target_layers(extract_layer_ids)
+            self.gguf_writer.add_mask_token_id(noise_token_id)
+            # markov_rank is also recoverable from markov_w1.weight shape; emit KV
+            # so dumps and tooling do not have to open the tensor.
+            self.gguf_writer.add_uint32(
+                f"{self.gguf_writer.arch}.markov_rank", markov_rank
+            )
+            logger.info(
+                "DeepSeek-V4 DSpark KV: nextn=%d block_size=%d target_layers=%s "
+                "noise_token_id=%d markov_rank=%d",
+                self._mtp_stage_count,
+                block_size,
+                extract_layer_ids,
+                noise_token_id,
+                markov_rank,
+            )
+
+    # Hoisted from DeepseekV4DSparkModel 2026-07-31. The WHOLE-MODEL path needs
+    # this too: base.py:1347 get_vocab_base() calls AutoTokenizer.from_pretrained,
+    # which builds an AutoConfig, and the installed transformers does not know
+    # model_type=deepseek_v4 -- it falls back to a generic PreTrainedConfig and
+    # dies in standardize_rope_params with
+    #   AttributeError: 'PreTrainedConfig' object has no attribute 'max_position_embeddings'
+    # Observed AFTER all 46 blocks were written, wasting a full conversion pass.
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        # Avoid AutoTokenizer.from_pretrained → AutoConfig, which fails when the
+        # installed transformers does not yet know model_type=deepseek_v4.
+        # tokenizer.json is enough for a PreTrainedTokenizerFast load.
+        from transformers import PreTrainedTokenizerFast
+
+        tok_path = self.dir_model / "tokenizer.json"
+        if not tok_path.is_file():
+            raise FileNotFoundError(
+                f"DeepSeek-V4: tokenizer.json not found under {self.dir_model}"
+            )
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tok_path))
+        # Apply special tokens from tokenizer_config.json when present.
+        cfg_path = self.dir_model / "tokenizer_config.json"
+        if cfg_path.is_file():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                tok_cfg = json.load(f)
+            for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                val = tok_cfg.get(key)
+                if isinstance(val, dict):
+                    val = val.get("content")
+                if val is not None:
+                    setattr(tokenizer, key, val)
+
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        vocab_size = int(self.hparams.get("vocab_size", len(tokenizer.get_vocab())))
+        vocab = tokenizer.get_vocab()
+        assert max(vocab.values()) < vocab_size
+
+        tokpre = self.get_vocab_base_pre(tokenizer)
+        reverse_vocab = {id_: enc for enc, id_ in vocab.items()}
+        added_vocab = tokenizer.get_added_vocab()
+        added_tokens_decoder = tokenizer.added_tokens_decoder
+
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+            else:
+                token = reverse_vocab[i]
+                if token in added_vocab:
+                    if i in added_tokens_decoder and not added_tokens_decoder[i].normalized:
+                        previous = token
+                        token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))
+                        if previous != token:
+                            logger.info(
+                                f"{repr(previous)} is encoded and decoded back to {repr(token)}"
+                            )
+                    if (i in added_tokens_decoder and added_tokens_decoder[i].special) or self.does_token_look_special(token):
+                        toktypes.append(gguf.TokenType.CONTROL)
+                    else:
+                        token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")
+                        toktypes.append(gguf.TokenType.USER_DEFINED)
+                else:
+                    toktypes.append(gguf.TokenType.NORMAL)
+                tokens.append(token)
+
+        return tokens, toktypes, tokpre
 
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
@@ -685,6 +869,15 @@ class DeepseekV4Model(TextModel):
         return self.format_tensor_name(key, bid, suffix)
 
     def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        # DSpark / DFlash heads rekeyed off mtp.{stage}.* (unprefixed).
+        if name in self._MTP_ROOT_MAP:
+            return self._MTP_ROOT_MAP[name]
+        # main_proj.scale is consumed by dequant_model; should never reach here.
+        if name == "main_proj.scale":
+            raise ValueError(
+                f"DeepSeek-V4 tensor {name!r} should have been paired/dequantized before mapping"
+            )
+
         root_map: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
             "embed.weight": (gguf.MODEL_TENSOR.TOKEN_EMBD, ".weight"),
             "norm.weight": (gguf.MODEL_TENSOR.OUTPUT_NORM, ".weight"),
@@ -737,6 +930,11 @@ class DeepseekV4Model(TextModel):
             "ffn.shared_experts.w1.weight": (gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight"),
             "ffn.shared_experts.w2.weight": (gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight"),
             "ffn.shared_experts.w3.weight": (gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight"),
+            # last MTP stage specials (from mtp.2.norm / mtp.2.hc_head_*)
+            "norm.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
+            "hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
+            "hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
+            "hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
         }
 
         tensor_name = match.group(2)
@@ -745,6 +943,15 @@ class DeepseekV4Model(TextModel):
 
         if re.match(r"ffn\.experts\.\d+\.w[123]\.(weight|scale)$", tensor_name):
             return gguf.MODEL_TENSOR.FFN_GATE_EXP, ".weight"
+
+        # FP8 scale partners for dense / shared-expert weights — consumed by dequant.
+        if re.match(
+            r"(attn\.(wq_a|wq_b|wkv|wo_a|wo_b)|ffn\.shared_experts\.w[123])\.scale$",
+            tensor_name,
+        ):
+            raise ValueError(
+                f"DeepSeek-V4 tensor {name!r} should have been paired/dequantized before mapping"
+            )
 
         raise ValueError(f"Unsupported DeepSeek-V4 tensor {name!r}")
 
@@ -774,3 +981,103 @@ class DeepseekV4Model(TextModel):
         super().prepare_tensors()
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+
+
+@ModelBase.register("DeepseekV4DSparkModel")
+class DeepseekV4DSparkModel(DSparkDraftMixin, DeepseekV4Model):
+    """DSpark draft with a DeepSeek-V4 backbone (MLA + MoE + hyper-connections).
+
+    The checkpoint ships mtp.{0,1,2}.* only (no embed/head; shared with the
+    target at runtime) under the same DeepseekV4ForCausalLM architecture string
+    as the target. get_model_architecture() routes here via flat dspark_* hparams.
+    Generic DSpark logic lives in DSparkDraftMixin; only the two DeepSeek-specific
+    hparam overrides stay here.
+    """
+
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # DeepseekV4Model.__init__ already ran; model_tensors are rekeyed mtp.*.
+        # Re-derive block_count from stages present (never target num_hidden_layers).
+        self.dspark_init()
+
+    def dspark_backbone_hparams(self) -> None:
+        # MTP blocks force compress_ratio=0 (plain sliding-window attention, no
+        # lightning indexer) and never use hash-routed layers; patch shared
+        # target hparams before generate_extra_tensors reads num_hash_layers.
+        self.hparams["compress_ratios"] = [0] * self.block_count
+        self.hparams["num_hash_layers"] = 0
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        if (root := self.dspark_map_root_tensor(name)) is not None:
+            return root
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        # Avoid AutoTokenizer.from_pretrained → AutoConfig, which fails when the
+        # installed transformers does not yet know model_type=deepseek_v4.
+        # tokenizer.json is enough for a PreTrainedTokenizerFast load.
+        from transformers import PreTrainedTokenizerFast
+
+        tok_path = self.dir_model / "tokenizer.json"
+        if not tok_path.is_file():
+            raise FileNotFoundError(
+                f"DSpark draft: tokenizer.json not found under {self.dir_model} "
+                "(pass --target-model-dir to the target tokenizer directory)"
+            )
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tok_path))
+        # Apply special tokens from tokenizer_config.json when present.
+        cfg_path = self.dir_model / "tokenizer_config.json"
+        if cfg_path.is_file():
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                tok_cfg = json.load(f)
+            for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                val = tok_cfg.get(key)
+                if isinstance(val, dict):
+                    val = val.get("content")
+                if val is not None:
+                    setattr(tokenizer, key, val)
+
+        tokens: list[str] = []
+        toktypes: list[int] = []
+        vocab_size = int(self.hparams.get("vocab_size", len(tokenizer.get_vocab())))
+        vocab = tokenizer.get_vocab()
+        assert max(vocab.values()) < vocab_size
+
+        tokpre = self.get_vocab_base_pre(tokenizer)
+        reverse_vocab = {id_: enc for enc, id_ in vocab.items()}
+        added_vocab = tokenizer.get_added_vocab()
+        added_tokens_decoder = tokenizer.added_tokens_decoder
+
+        for i in range(vocab_size):
+            if i not in reverse_vocab:
+                tokens.append(f"[PAD{i}]")
+                toktypes.append(gguf.TokenType.UNUSED)
+            else:
+                token = reverse_vocab[i]
+                if token in added_vocab:
+                    if i in added_tokens_decoder and not added_tokens_decoder[i].normalized:
+                        previous = token
+                        token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))
+                        if previous != token:
+                            logger.info(
+                                f"{repr(previous)} is encoded and decoded back to {repr(token)}"
+                            )
+                    if (i in added_tokens_decoder and added_tokens_decoder[i].special) or self.does_token_look_special(token):
+                        toktypes.append(gguf.TokenType.CONTROL)
+                    else:
+                        token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")
+                        toktypes.append(gguf.TokenType.USER_DEFINED)
+                else:
+                    toktypes.append(gguf.TokenType.NORMAL)
+                tokens.append(token)
+
+        return tokens, toktypes, tokpre
+
+    def set_vocab(self):
+        self.dspark_set_vocab(super(DeepseekV4Model, self).set_vocab)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.dspark_set_gguf_parameters()

@@ -4,7 +4,9 @@
 #include "pipe-transport.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -12,7 +14,14 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
+
+// poll() for concurrent harvest of worker responses (POSIX; the dispatcher
+// already assumes POSIX sockets).
+#include <poll.h>
+#include <cerrno>
 
 namespace pipe_expert_dispatcher {
 namespace {
@@ -21,6 +30,11 @@ using dispatch_clock = std::chrono::steady_clock;
 
 bool dispatch_stats_enabled() {
     const char * value = std::getenv("WP_DISPATCH_STATS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool speed_split_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_SPEED_SPLIT");
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -59,6 +73,8 @@ std::string assignment_experts(const std::vector<pipe_expert_assignment> & assig
 }
 
 // Sum of io_ticks (ms) over all whole-disk nvme devices (not partitions).
+// Field layout matches /tmp/qd_sample.py and the kernel docs:
+//   0-based tokens: [0]=major [1]=minor [2]=name ... [12]=io_ticks [13]=weighted_ms
 // Returns false if none found or /proc/diskstats unreadable.
 bool sample_nvme_io_ticks(uint64_t & io_ticks_ms_sum) {
     std::ifstream in("/proc/diskstats");
@@ -70,36 +86,35 @@ bool sample_nvme_io_ticks(uint64_t & io_ticks_ms_sum) {
     std::string line;
     while (std::getline(in, line)) {
         std::istringstream fields(line);
-        std::string        major;
-        std::string        minor;
-        std::string        name;
-        fields >> major >> minor >> name;
+        std::vector<std::string> tok;
+        std::string              t;
+        while (fields >> t) {
+            tok.push_back(t);
+        }
+        if (tok.size() < 13) {
+            continue;
+        }
+        const std::string & name = tok[2];
         if (name.rfind("nvme", 0) != 0) {
             continue;
         }
-        // Whole devices look like nvme0n1; partitions look like nvme0n1p1.
-        if (name.find('p') != std::string::npos) {
-            // Could be nvme0n1p2 — skip partitions. Also reject names with no 'n'
-            // handled by the prefix check above.
+        // Whole devices: nvme0n1. Partitions: nvme0n1p1 / nvme0n1p2 — skip.
+        // Match "p" only after the namespace digit so we do not reject nvme0n1.
+        {
             const size_t npos = name.find('n');
             if (npos != std::string::npos && name.find('p', npos) != std::string::npos) {
                 continue;
             }
         }
-        // Fields after name: 11 stats then io_ticks (0-based index 12 of full line tokens).
-        uint64_t values[11];
-        bool     ok = true;
-        for (int i = 0; i < 11; ++i) {
-            if (!(fields >> values[i])) {
-                ok = false;
-                break;
-            }
-        }
-        uint64_t io_ticks = 0;
-        if (!ok || !(fields >> io_ticks)) {
+        // io_ticks is token[12] (1-based field 13). Do NOT read 11 values after
+        // name and then one more — that lands on token[14], which is nearly
+        // static under pure-read loads and yields util% ≈ 0.0.
+        char * end = nullptr;
+        const unsigned long long io_ticks = std::strtoull(tok[12].c_str(), &end, 10);
+        if (end == tok[12].c_str() || *end != '\0') {
             continue;
         }
-        io_ticks_ms_sum += io_ticks;
+        io_ticks_ms_sum += (uint64_t) io_ticks;
         any = true;
     }
     return any;
@@ -196,12 +211,28 @@ void split_immediate_deferred(const std::vector<pipe_expert_assignment> & assign
 }  // namespace
 
 struct dispatcher::impl {
+    static constexpr size_t speed_estimate_min_samples = 3;
+    static constexpr size_t speed_estimate_window       = 8;
+    static constexpr size_t speed_estimate_min_spread   = 2;
+
+    struct speed_sample {
+        size_t n = 0;
+        double wait_ms = 0.0;
+    };
+
     struct worker {
         endpoint                                 target;
         worker_info                              info;
         pipe_expert_hello                        hello;
         pipe_socket_ptr                          socket;
         std::vector<std::pair<int32_t, int32_t>> resident_lru;
+        std::array<speed_sample, speed_estimate_window> speed_history{};
+        size_t                                   speed_history_next      = 0;
+        size_t                                   speed_samples            = 0;
+        size_t                                   speed_n_spread            = 0;
+        double                                   estimated_fixed_ms        = 0.0;
+        double                                   estimated_ms_per_expert   = 0.0;
+        bool                                     speed_fit_valid            = false;
     };
 
     struct planned_request {
@@ -209,6 +240,7 @@ struct dispatcher::impl {
         std::vector<pipe_expert_assignment> assignments;
         std::vector<uint8_t>                payload;
         dispatch_clock::time_point          issued_at;
+        uint64_t                            wait_ns = 0;
     };
 
     // Deferred requests issued at layer N, collected at layer N+1's dispatch.
@@ -236,10 +268,24 @@ struct dispatcher::impl {
     int32_t                                             n_expert      = 0;
     int32_t                                             n_expert_used = 0;
     int32_t                                             last_routed_layer = -1;
+    // Host-provided last main-graph MoE layer that must not defer (no successor).
+    // -1 => fall back to last_routed_layer from worker HELLO. Must be set to
+    // hparams.n_layer()-1 so NextN/MTP layers (e.g. blk.78) advertised by
+    // workers are not mistaken for the fold successor of the main stack.
+    int32_t                                             last_no_defer_layer = -1;
     int                                                 defer_k_value = 0;
     std::string                                         model_identity;
     bool                                                poisoned = false;
     bool                                                collect_stats = false;
+    bool                                                speed_split   = false;
+    bool                                                stats_logging = false;
+
+    // Per-request wire log; see accumulate_partial. Off unless WP_DISPATCH_REQ_LOG
+    // is set, so it costs nothing in a normal run.
+    FILE *                                              req_log_ = [] {
+        const char * p = std::getenv("WP_DISPATCH_REQ_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    }();
 
     // Gap accounting: time spent with in_flight == 0.
     bool                       gap_at_zero = false;
@@ -250,7 +296,9 @@ struct dispatcher::impl {
     bool                       window_sample_ok = false;
 
     explicit impl(const std::vector<endpoint> & endpoints) :
-        collect_stats(dispatch_stats_enabled()) {
+                speed_split(speed_split_enabled()) {
+        stats_logging = dispatch_stats_enabled();
+        collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
         deferral.defer_k  = defer_k_value;
 
@@ -432,21 +480,49 @@ struct dispatcher::impl {
             any_resident = any_resident || is_resident(candidate, layer, expert);
         }
 
-        size_t              best_count = (size_t) -1;
-        uint32_t            best_slots = 0;
+        size_t              best_count      = (size_t) -1;
+        uint32_t            best_slots      = 0;
+        double              best_projection = 0.0;
         std::vector<size_t> tied;
+        bool                use_speed = speed_split;
+        if (use_speed) {
+            for (size_t candidate : candidates) {
+                if (any_resident && !is_resident(candidate, layer, expert)) {
+                    continue;
+                }
+                if (workers[candidate].speed_samples < speed_estimate_min_samples ||
+                    !workers[candidate].speed_fit_valid) {
+                    use_speed = false;
+                    break;
+                }
+            }
+        }
         for (size_t candidate : candidates) {
             if (any_resident && !is_resident(candidate, layer, expert)) {
                 continue;
             }
             const size_t   count = assigned_counts[candidate];
             const uint32_t slots = workers[candidate].hello.n_slots;
-            if (count < best_count || (count == best_count && slots > best_slots)) {
-                best_count = count;
-                best_slots = slots;
+            if (!use_speed) {
+                if (count < best_count || (count == best_count && slots > best_slots)) {
+                    best_count = count;
+                    best_slots = slots;
+                    tied.clear();
+                    tied.push_back(candidate);
+                } else if (count == best_count && slots == best_slots) {
+                    tied.push_back(candidate);
+                }
+                continue;
+            }
+
+            const double projection = workers[candidate].estimated_ms_per_expert * (count + 1);
+            if (tied.empty() || projection < best_projection ||
+                (projection == best_projection && slots > best_slots)) {
+                best_projection = projection;
+                best_slots      = slots;
                 tied.clear();
                 tied.push_back(candidate);
-            } else if (count == best_count && slots == best_slots) {
+            } else if (projection == best_projection && slots == best_slots) {
                 tied.push_back(candidate);
             }
         }
@@ -456,6 +532,73 @@ struct dispatcher::impl {
         const size_t        chosen  = tied[cursor % tied.size()];
         ++cursor;
         return chosen;
+    }
+
+    void update_speed_estimate(const planned_request & request) {
+        if (!speed_split || !collect_stats || request.assignments.empty() || request.wait_ns == 0) {
+            return;
+        }
+        worker & value = workers[request.worker_index];
+        value.speed_history[value.speed_history_next] = {
+            request.assignments.size(), request.wait_ns * 1.0e-6,
+        };
+        value.speed_history_next = (value.speed_history_next + 1) % speed_estimate_window;
+        if (value.speed_samples < speed_estimate_window) {
+            ++value.speed_samples;
+        }
+
+        size_t min_n = (size_t) -1;
+        size_t max_n = 0;
+        double sum_n = 0.0;
+        double sum_wait = 0.0;
+        for (size_t i = 0; i < value.speed_samples; ++i) {
+            const speed_sample & sample = value.speed_history[i];
+            min_n = std::min(min_n, sample.n);
+            max_n = std::max(max_n, sample.n);
+            sum_n += (double) sample.n;
+            sum_wait += sample.wait_ms;
+        }
+        value.speed_n_spread = max_n - min_n;
+        value.speed_fit_valid = value.speed_samples >= speed_estimate_min_samples &&
+                                value.speed_n_spread >= speed_estimate_min_spread;
+        if (!value.speed_fit_valid) {
+            return;
+        }
+
+        const double mean_n = sum_n / (double) value.speed_samples;
+        const double mean_wait = sum_wait / (double) value.speed_samples;
+        double       sxx = 0.0;
+        double       sxy = 0.0;
+        for (size_t i = 0; i < value.speed_samples; ++i) {
+            const double dn = (double) value.speed_history[i].n - mean_n;
+            sxx += dn * dn;
+            sxy += dn * (value.speed_history[i].wait_ms - mean_wait);
+        }
+        const double slope = sxy / sxx;
+        if (!(slope > 0.0)) {
+            value.speed_fit_valid = false;
+            return;
+        }
+        value.estimated_ms_per_expert = slope;
+        value.estimated_fixed_ms = mean_wait - slope * mean_n;
+    }
+
+    void update_speed_estimates(const std::vector<planned_request> & requests) {
+        for (const planned_request & request : requests) {
+            update_speed_estimate(request);
+        }
+    }
+
+    void log_speed_state(const std::vector<size_t> & assigned_counts) const {
+        if (!speed_split || !stats_logging) {
+            return;
+        }
+        for (size_t i = 0; i < workers.size(); ++i) {
+            std::fprintf(stderr, "expert dispatch speed worker %s a=%.4f ms b=%.4f ms/expert samples=%zu n-spread=%zu assigned=%zu\n",
+                         workers[i].info.endpoint.c_str(), workers[i].estimated_fixed_ms,
+                         workers[i].estimated_ms_per_expert, workers[i].speed_samples,
+                         workers[i].speed_n_spread, assigned_counts[i]);
+        }
     }
 
     void update_residency(size_t worker_index, int32_t layer, const std::vector<pipe_expert_assignment> & assignments) {
@@ -553,17 +696,48 @@ struct dispatcher::impl {
         }
     }
 
-    void accumulate_partial(std::vector<float> &             result,
-                            planned_request &                request,
-                            uint64_t                         seq_id,
-                            int32_t                          layer,
-                            uint32_t                         n_tokens,
-                            dispatch_clock::time_point *     last_response) {
+    // Receive ONE partial and decode it into `out` (does NOT accumulate). Split
+    // out of accumulate_partial so the caller can harvest partials in ARRIVAL
+    // order while still summing them in a FIXED order -- see harvest_partials.
+    void receive_partial(std::vector<float> &             out,
+                         size_t                           n_values,
+                         planned_request &                request,
+                         uint64_t                         seq_id,
+                         int32_t                          layer,
+                         uint32_t                         n_tokens,
+                         dispatch_clock::time_point *     last_response) {
         std::vector<uint8_t>  payload;
+        // WP_DISPATCH_REQ_LOG=path: one line per request --
+        //   layer worker_index n_experts ns_before_await ns_blocked
+        //
+        // ns_before_await is issue -> the moment we START awaiting this request;
+        // the spine is doing its own work (issuing others, awaiting an earlier
+        // worker) during it. ns_blocked is the recv itself. THE SPLIT IS THE
+        // POINT: per-worker `wait` in the existing stats is issue -> consumed,
+        // so for a worker awaited second or third it silently includes time the
+        // spine spent on the first, which is why those waits sum to 287 ms
+        // against a 156 ms dispatch wall. Only ns_blocked is time genuinely
+        // spent waiting on the wire and the worker.
+        //
+        // Join offline against the worker's own WP_REQ_LOG ns_wall (same request
+        // order per worker) to get wire = ns_blocked - worker_service.
+        const auto wp_await_t0 = req_log_ != nullptr ? dispatch_clock::now()
+                                                     : dispatch_clock::time_point();
         const pipe_frame_type type = await_response(request, seq_id, payload);
+        if (req_log_ != nullptr) {
+            const auto now = dispatch_clock::now();
+            fprintf(req_log_, "%d %zu %zu %llu %llu\n", layer, request.worker_index,
+                    request.assignments.size(),
+                    (unsigned long long) elapsed_ns(request.issued_at, wp_await_t0),
+                    (unsigned long long) elapsed_ns(wp_await_t0, now));
+            fflush(req_log_);
+        }
         if (collect_stats && last_response != nullptr) {
             *last_response = dispatch_clock::now();
             // per-request wait is only tracked for the primary wait loop via stats.workers
+        }
+        if (speed_split) {
+            request.wait_ns = elapsed_ns(request.issued_at, dispatch_clock::now());
         }
         worker & value = workers[request.worker_index];
         if (type == PIPE_ERROR) {
@@ -590,7 +764,7 @@ struct dispatcher::impl {
         // Partial carries (layer, n_tokens); token identity is the layout of
         // partial[token * n_embd + dim]. Do not rely on arrival ordering across
         // workers — each partial is a full [n_tokens * n_embd] block.
-        if (partial.layer != layer || partial.n_tokens != n_tokens || partial.partial.size() != result.size()) {
+        if (partial.layer != layer || partial.n_tokens != n_tokens || partial.partial.size() != n_values) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " returned the wrong partial shape for expert(s) " +
                                      assignment_experts(request.assignments) +
@@ -599,8 +773,121 @@ struct dispatcher::impl {
                                      " n_tokens=" + std::to_string(partial.n_tokens) +
                                      " want_n_tokens=" + std::to_string(n_tokens) + ")");
         }
+        out.resize(n_values);
+        for (size_t i = 0; i < n_values; ++i) {
+            out[i] = ggml_fp16_to_fp32((ggml_fp16_t) partial.partial[i]);
+        }
+    }
+
+    // Original behaviour, kept for the deferred-fold path: receive and add.
+    void accumulate_partial(std::vector<float> &             result,
+                            planned_request &                request,
+                            uint64_t                         seq_id,
+                            int32_t                          layer,
+                            uint32_t                         n_tokens,
+                            dispatch_clock::time_point *     last_response) {
+        std::vector<float> one;
+        receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response);
         for (size_t i = 0; i < result.size(); ++i) {
-            result[i] += ggml_fp16_to_fp32((ggml_fp16_t) partial.partial[i]);
+            result[i] += one[i];
+        }
+    }
+
+    // Harvest a layer's partials AS THEY ARRIVE rather than in fixed worker
+    // order, then sum them in fixed order.
+    //
+    // WHY. Measured 2026-08-02: 149.19 of the 155.8 ms/token dispatch wall is
+    // spent genuinely blocked, but the spine awaited worker 0, then 1, then 2,
+    // so a worker that had already answered sat unread until its turn came. The
+    // per-request log showed worker 1 blocking 9.6 us -- its response had been
+    // sitting in the socket the whole time. Per layer that cost ~1.6 ms beyond
+    // the slowest worker's own service, ~69 ms/token.
+    //
+    // WHY SUM IN FIXED ORDER. Floating-point addition is not associative, so
+    // summing in arrival order would make the result depend on network timing.
+    // Buffering costs 3 x n_embd floats and removes a source of run-to-run
+    // variance rather than adding one. (Worker ASSIGNMENT is already timing-
+    // dependent -- ~35% of requests differ between identical runs -- but that is
+    // no reason to add a second such source here.)
+    void harvest_partials(std::vector<float> &             result,
+                          std::vector<planned_request> &   requests,
+                          uint64_t                         seq_id,
+                          int32_t                          layer,
+                          uint32_t                         n_tokens,
+                          dispatch_clock::time_point *     last_response) {
+        const size_t n = requests.size();
+        if (n == 0) {
+            return;
+        }
+        std::vector<std::vector<float>> partials(n);
+        std::vector<char>               done(n, 0);
+        size_t                          remaining = n;
+
+        while (remaining > 0) {
+            // Poll set = the FIRST outstanding request per socket. Two requests
+            // sharing a worker must stay in FIFO order on that socket, and
+            // await_response's seq_id check would throw if they were reordered.
+            std::vector<struct pollfd> pfds;
+            std::vector<size_t>        idx;
+            std::set<int>              seen;
+            for (size_t i = 0; i < n; ++i) {
+                if (done[i]) {
+                    continue;
+                }
+                const int fd = workers[requests[i].worker_index].socket->poll_fd();
+                if (fd < 0) {
+                    pfds.clear();
+                    idx.clear();
+                    break;
+                }
+                if (!seen.insert(fd).second) {
+                    continue;
+                }
+                struct pollfd p;
+                p.fd      = fd;
+                p.events  = POLLIN;
+                p.revents = 0;
+                pfds.push_back(p);
+                idx.push_back(i);
+            }
+            if (pfds.empty()) {
+                // No pollable descriptor: fall back to the original fixed-order
+                // await so this can never be worse than what it replaced.
+                for (size_t i = 0; i < n; ++i) {
+                    if (done[i]) {
+                        continue;
+                    }
+                    receive_partial(partials[i], result.size(), requests[i], seq_id,
+                                    layer, n_tokens, last_response);
+                    done[i] = 1;
+                    --remaining;
+                }
+                break;
+            }
+            const int r = ::poll(pfds.data(), (nfds_t) pfds.size(), -1);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw std::runtime_error(std::string("expert dispatcher poll failed: ") +
+                                         std::strerror(errno));
+            }
+            for (size_t k = 0; k < pfds.size(); ++k) {
+                if (pfds[k].revents == 0) {
+                    continue;
+                }
+                const size_t i = idx[k];
+                receive_partial(partials[i], result.size(), requests[i], seq_id,
+                                layer, n_tokens, last_response);
+                done[i] = 1;
+                --remaining;
+            }
+        }
+
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = 0; j < result.size(); ++j) {
+                result[j] += partials[i][j];
+            }
         }
     }
 
@@ -628,6 +915,7 @@ struct dispatcher::impl {
                 ++deferral.n_deferred_late;
             }
             accumulate_partial(fold, request, seq_id, layer, n_tok, nullptr);
+            update_speed_estimate(request);
             update_residency(request.worker_index, layer, request.assignments);
         }
         pending_def = {};
@@ -664,11 +952,23 @@ struct dispatcher::impl {
 
         try {
             // Decide whether this layer may leave experts deferred.
-            // Last routed layer has no successor — do not defer (fold would fall off).
+            // The last main-graph MoE layer has no successor to fold into — do
+            // not defer it. Prefer the host-provided last_no_defer_layer
+            // (hparams.n_layer()-1) over the worker HELLO max: workers also
+            // advertise NextN/MTP layers (e.g. 78) that the main graph never
+            // dispatches, which previously left every token's last main MoE
+            // layer deferred and drained as n_deferred_late at end_decode.
+            const int32_t no_defer_layer =
+                last_no_defer_layer >= 0 ? last_no_defer_layer : last_routed_layer;
+            // Decode only (n_tokens == 1). Prefill shrinks the last layer via
+            // get_rows(out_ids) so a deferred partial from layer L with the full
+            // prefill width cannot fold into layer L+1's MoE output — that was a
+            // silent drop + n_deferred_late path. Spec allows disabling prefill
+            // rather than half-working it.
             const bool may_defer =
                 defer_k_value > 0 &&
-                layer != last_routed_layer &&
-                n_tokens >= 1;  // prefill and decode both handled via per-token top-K
+                layer != no_defer_layer &&
+                n_tokens == 1;
 
             std::vector<pipe_expert_assignment> immediate;
             std::vector<pipe_expert_assignment> deferred;
@@ -740,12 +1040,19 @@ struct dispatcher::impl {
 
             std::vector<float> result((size_t) activation_count, 0.0f);
             // Fold previous deferred into this layer's output (residual path).
+            // Partials carry (layer, token) via pending_def.layer + layout; the
+            // vectors must agree on n_tokens * n_embd. A mismatch means the
+            // fold crossed a token-count boundary (e.g. last-layer get_rows
+            // shrink for out_ids during prefill). Never silent-drop: count late
+            // and leave a clear trail. Callers that need late==0 must not defer
+            // across that boundary (correct last_no_defer_layer + decode n_tokens).
             if (!folded_prev.empty()) {
                 if (folded_prev.size() != result.size()) {
-                    // Token count changed between layers (shouldn't happen in
-                    // one decode step). Count as late and drop rather than
-                    // corrupt — shapes must match.
-                    deferral.n_deferred_late += 1;
+                    ++deferral.n_deferred_late;
+                    // Consume is already done (partials were awaited in
+                    // collect_pending_deferred); we refuse to add a mis-shaped
+                    // block into the residual. This is an explicit accounting
+                    // path, not a second silent approximation.
                 } else {
                     for (size_t i = 0; i < result.size(); ++i) {
                         result[i] += folded_prev[i];
@@ -756,6 +1063,36 @@ struct dispatcher::impl {
             const dispatch_clock::time_point wait_start =
                 collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
             dispatch_clock::time_point last_response;
+            // WP_DISPATCH_HARVEST=1 opts in to as-ready harvesting.
+            //
+            // DEFAULT OFF, AND THAT IS A MEASURED DECISION, not caution. Measured
+            // 2026-08-02, load-matched back-to-back: 4.197 (off) vs 4.231 (on)
+            // tok/s, i.e. +0.8%, inside noise. The mechanism DOES work -- summed
+            // blocked time falls 152.72 -> 11.85 ms/token, every recv finds its
+            // data already waiting -- but the time simply moves into the poll
+            // wait, because the workers were ALREADY overlapping. Sum over layers
+            // of the MAX worker service is 74.97 ms/token against a 155.8 ms
+            // dispatch wall, so ~81 ms/token is overhead that is NOT await
+            // ordering and this does not recover it. Keep the code (it is the
+            // instrument that measured wire latency directly: with harvest on,
+            // before_await minus worker service gives ~0.57-0.65 ms/request on
+            // the remote link and ~20 us on the R9700 loopback) but do not pay
+            // its complexity by default.
+            static const bool harvest = [] {
+                const char * e = std::getenv("WP_DISPATCH_HARVEST");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (harvest) {
+                harvest_partials(result, imm_requests, seq_id, layer, n_tokens, &last_response);
+                for (size_t request_index = 0; request_index < imm_requests.size(); ++request_index) {
+                    planned_request & request = imm_requests[request_index];
+                    if (collect_stats) {
+                        stats.workers[request_index].ns_wait =
+                            elapsed_ns(request.issued_at, last_response);
+                    }
+                    update_residency(request.worker_index, layer, request.assignments);
+                }
+            } else {
             for (size_t request_index = 0; request_index < imm_requests.size(); ++request_index) {
                 planned_request & request = imm_requests[request_index];
                 const dispatch_clock::time_point before = collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
@@ -766,9 +1103,12 @@ struct dispatcher::impl {
                 }
                 update_residency(request.worker_index, layer, request.assignments);
             }
+            }
             if (collect_stats && !imm_requests.empty()) {
                 stats.ns_wait = elapsed_ns(wait_start, last_response);
             }
+            update_speed_estimates(imm_requests);
+            log_speed_state(assigned_counts);
 
             // Stash deferred requests — do NOT wait. They stay in flight until
             // the next layer issues and then collects them (fetch-against-fetch).
@@ -903,6 +1243,14 @@ const deferral_stats & dispatcher::get_deferral_stats() const {
 
 int dispatcher::defer_k() const {
     return pimpl->defer_k_value;
+}
+
+int32_t dispatcher::last_no_defer_layer() const {
+    return pimpl->last_no_defer_layer >= 0 ? pimpl->last_no_defer_layer : pimpl->last_routed_layer;
+}
+
+void dispatcher::set_last_no_defer_layer(int32_t layer) noexcept {
+    pimpl->last_no_defer_layer = layer;
 }
 
 void dispatcher::begin_deferral_window() noexcept {

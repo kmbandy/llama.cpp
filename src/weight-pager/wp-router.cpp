@@ -11,10 +11,16 @@ namespace wp {
 
 const char * const ROUTER_EXPERT_PATTERN     = "ffn_(up|gate|down)_exps\\.";
 const char * const ROUTER_SHEXP_PATTERN      = "ffn_(up|gate|down)_shexp\\.";
+// NOTE 2026-07-31: this said ffn_exp_probs_b, which NEVER MATCHED ANY MODEL --
+// llama-arch.cpp:419 names the GGUF tensor "blk.%d.exp_probs_b"; only the C++
+// field (llama-model.h:348) carries the ffn_ prefix. The router bias therefore
+// fell through to the dense catch-all and landed on the RESIDENT card, forcing a
+// TB3 crossing per layer per token -- exactly what this island exists to avoid.
+// Matching the real name also still covers an ffn_-prefixed variant by substring.
 // FFN island on paging GPU: keeps MoE block intra-device (R9700). Residual then
 // only crosses TB3 into/out of the attention island, not per-op mid-FFN.
 const char * const ROUTER_FFN_ISLAND_PATTERN =
-        "(ffn_norm\\.|ffn_gate_inp\\.|ffn_exp_probs_b\\.|ffn_gate_tid2eid\\.|hc_ffn_)";
+        "(ffn_norm\\.|ffn_gate_inp\\.|exp_probs_b\\.|ffn_gate_tid2eid\\.|hc_ffn_)";
 const char * const ROUTER_TOKEN_EMBD_PATTERN = "token_embd\\.";
 const char * const ROUTER_DENSE_PATTERN      = ".*";
 
