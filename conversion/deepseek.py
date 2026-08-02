@@ -496,6 +496,12 @@ class DeepseekV4Model(TextModel):
         "main_proj.scale",
     })
 
+    # upstream class attributes, kept so the sidecar export path works
+    supports_mtp_export = True
+    _skipped_mtp_tensors = 0
+    _dsv4_main_layers: int | None = None
+    _dsv4_nextn_layers: int = 0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -651,6 +657,10 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
         self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
+        if self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4:
+            self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
+        if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
+            self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
         # MTP / DSpark metadata — only when the mtp.* subtree was present.
         if self._mtp_stage_count > 0:
@@ -853,11 +863,36 @@ class DeepseekV4Model(TextModel):
         if self._dsv4_mxfp4_generated:
             return ()
 
-        consumed: list[str] = self._write_hash_routing_tensors()
+        consumed: list[str] = []
+        main_layers = self.hparams["num_hidden_layers"]
+        if not self.mtp_only:
+            consumed.extend(self._write_hash_routing_tensors())
+        elif self.hparams["num_hash_layers"] > 0:
+            for bid in range(self.hparams["num_hash_layers"]):
+                name = f"layers.{bid}.ffn.gate.tid2eid"
+                if name in self.model_tensors:
+                    consumed.extend(self._write_hash_routing_tensors())
+                    break
+
         for bid in range(self.block_count):
+            if self.mtp_only and bid < main_layers:
+                continue
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
             consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
+
+        for bid in range(main_layers, self.block_count):
+            e_name = f"layers.{bid}.nextn.e_proj.weight"
+            h_name = f"layers.{bid}.nextn.h_proj.weight"
+            if e_name not in self.model_tensors and h_name not in self.model_tensors:
+                continue
+            if e_name not in self.model_tensors or h_name not in self.model_tensors:
+                raise KeyError(f"Missing DeepSeek-V4 MTP e/h projection pair for block {bid}")
+
+            e_proj = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+            h_proj = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+            yield (f"layers.{bid}.nextn.eh_proj.weight", torch.cat((e_proj, h_proj), dim=1).contiguous())
+            consumed.extend((e_name, h_name))
 
         for name in consumed:
             del self.model_tensors[name]
@@ -935,6 +970,12 @@ class DeepseekV4Model(TextModel):
             "hc_head_fn": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_FN, ".weight"),
             "hc_head_base": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_BASE, ".weight"),
             "hc_head_scale": (gguf.MODEL_TENSOR.NEXTN_HC_HEAD_SCALE, ".weight"),
+            "nextn.eh_proj.weight": (gguf.MODEL_TENSOR.NEXTN_EH_PROJ, ".weight"),
+            "nextn.enorm.weight": (gguf.MODEL_TENSOR.NEXTN_ENORM, ".weight"),
+            "nextn.hnorm.weight": (gguf.MODEL_TENSOR.NEXTN_HNORM, ".weight"),
+            "nextn.shared_head_norm.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM, ".weight"),
+            "nextn.embed_tokens.weight": (gguf.MODEL_TENSOR.NEXTN_EMBED_TOKENS, ".weight"),
+            "nextn.shared_head_head.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD, ".weight"),
         }
 
         tensor_name = match.group(2)
@@ -966,9 +1007,11 @@ class DeepseekV4Model(TextModel):
         return [(self._format_dsv4_tensor_name(tensor_key, bid, suffix), data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
-        del new_name, bid  # unused
+        del bid  # unused
 
         if name in self._dsv4_fp8_dequantized and n_dims >= 2:
+            return gguf.GGMLQuantizationType.Q8_0
+        if new_name.endswith(".nextn.eh_proj.weight"):
             return gguf.GGMLQuantizationType.Q8_0
         if name in self._dsv4_f32_tensors:
             return gguf.GGMLQuantizationType.F32
@@ -976,6 +1019,19 @@ class DeepseekV4Model(TextModel):
             return gguf.GGMLQuantizationType.BF16
 
         return False
+
+    def prepare_metadata(self, vocab_only: bool):
+        from_dir = self.fname_out.is_dir()
+        super().prepare_metadata(vocab_only=vocab_only)
+
+        if not self.mtp_only or not from_dir:
+            return
+
+        output_type: str = self.ftype.name.partition("_")[2]
+        fname_default: str = gguf.naming_convention(
+            self.metadata.name, self.metadata.basename, self.metadata.finetune,
+            self.metadata.version, size_label=None, output_type=output_type, model_type=None)
+        self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def prepare_tensors(self):
         super().prepare_tensors()
