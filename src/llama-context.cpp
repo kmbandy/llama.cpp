@@ -1063,7 +1063,8 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             throw std::runtime_error("no nextn embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd_out();
+        GGML_ASSERT(n_embd_nextn > 0);
+        const uint32_t n_embd = n_embd_nextn;
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1711,9 +1712,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_out();
-        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+        // MAD-LAB: use the width produced by this graph, not a model-wide width.
+        GGML_ASSERT(t_h_nextn->ne[0] <= UINT32_MAX);
+        n_embd_nextn = t_h_nextn->ne[0];
+        GGML_ASSERT(n_embd_nextn > 0);
+        GGML_ASSERT(n_tokens*n_embd_nextn <= (int64_t) embd_nextn.size);
+        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd_nextn*sizeof(float));
     }
 
     // TODO: hacky solution
@@ -2173,7 +2177,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_out();
+                // MAD-LAB: use the width produced by this graph, not a model-wide width.
+                GGML_ASSERT(t_h_nextn->ne[0] <= UINT32_MAX);
+                n_embd_nextn = t_h_nextn->ne[0];
+                GGML_ASSERT(n_embd_nextn > 0);
+                const uint32_t n_embd  = n_embd_nextn;
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -2467,9 +2475,9 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 void llama_context::output_reorder() {
     const uint64_t n_vocab          = model.vocab.n_tokens();
     const uint64_t n_embd           = model.hparams.n_embd;
-    // upstream: embd/embd_nextn rows are n_embd_out wide (hc_mult * n_embd on
-    // DS4), not n_embd -- swapping n_embd of them corrupted the tail.
+    // upstream: embd rows are n_embd_out wide (hc_mult * n_embd on DS4).
     const uint64_t n_embd_out       = model.hparams.n_embd_out();
+    GGML_ASSERT(embd_nextn.size == 0 || n_embd_nextn > 0);
     // ours: the per-layer-input capture has its own row width.
     const uint64_t n_embd_layer_inp = llama_context_layer_inp_size(model);
     GGML_UNUSED(n_embd);
@@ -2491,8 +2499,8 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd_out; k++) {
-                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
+            for (uint64_t k = 0; k < n_embd_nextn; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
             }
         }
 

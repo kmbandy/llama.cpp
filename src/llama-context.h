@@ -307,6 +307,8 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    // MAD-LAB: nextn rows follow the graph tensor width, which can vary by graph.
+    uint32_t n_embd_nextn = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
