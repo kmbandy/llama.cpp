@@ -67,8 +67,8 @@ struct RequestStats {
     uint64_t ns_read    = 0;
     uint64_t ns_compute = 0;
     uint64_t ns_send    = 0;
-    uint64_t n_hit      = 0;
-    uint64_t n_miss     = 0;
+    uint64_t n_resident      = 0;
+    uint64_t n_pagein     = 0;
     uint64_t n_host_hit = 0;
     uint64_t n_host_demote = 0;
     uint64_t bytes_read = 0;
@@ -86,7 +86,7 @@ struct RequestStats {
     uint64_t ns_prep_set = 0;     // the activation upload itself          // prepare_io: activation upload + io buffer growth
     uint64_t ns_hits = 0;          // compute_batch(hits) end to end
     uint64_t ns_wait = 0;          // batch.complete(): reader-thread join + I/O + H2D
-    uint64_t ns_miss_compute = 0;  // compute_batch(misses) end to end
+    uint64_t ns_pagein_compute = 0;  // compute_batch(pageins) end to end
     uint64_t ns_result = 0;        // read_result
     uint64_t ns_encode = 0;        // fp32 -> fp16 of the reply
     uint64_t ns_h2d = 0;
@@ -131,8 +131,8 @@ public:
         ns_read_ += request.ns_read;
         ns_compute_ += request.ns_compute;
         ns_send_ += request.ns_send;
-        n_hit_ += request.n_hit;
-        n_miss_ += request.n_miss;
+        n_resident_ += request.n_resident;
+        n_pagein_ += request.n_pagein;
         n_host_hit_ += request.n_host_hit;
         n_host_demote_ += request.n_host_demote;
         bytes_read_ += request.bytes_read;
@@ -165,7 +165,7 @@ public:
         ns_prep_set_ += request.ns_prep_set;
         ns_hits_ += request.ns_hits;
         ns_wait_ += request.ns_wait;
-        ns_miss_compute_ += request.ns_miss_compute;
+        ns_pagein_compute_ += request.ns_pagein_compute;
         ns_result_ += request.ns_result;
         ns_encode_ += request.ns_encode;
         ns_h2d_ += request.ns_h2d;
@@ -198,8 +198,8 @@ private:
         std::cout << "wp expert worker stats"
                   << " n_requests=" << n_requests_
                   << " n_experts=" << n_experts_
-                  << " n_hit=" << n_hit_
-                  << " n_miss=" << n_miss_
+                  << " n_resident=" << n_resident_
+                  << " n_pagein=" << n_pagein_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -227,7 +227,7 @@ private:
                   << " ns_prep_set=" << ns_prep_set_
                   << " ns_hits=" << ns_hits_
                   << " ns_wait=" << ns_wait_
-                  << " ns_misscompute=" << ns_miss_compute_
+                  << " ns_pagein_compute=" << ns_pagein_compute_
                   << " ns_result=" << ns_result_
                   << " ns_encode=" << ns_encode_
                   << " submit_us_min=" << (submit_min_ns_ == UINT64_MAX ? 0 : submit_min_ns_ / 1000)
@@ -260,8 +260,8 @@ private:
     uint64_t          ns_read_    = 0;
     uint64_t          ns_compute_ = 0;
     uint64_t          ns_send_    = 0;
-    uint64_t          n_hit_      = 0;
-    uint64_t          n_miss_     = 0;
+    uint64_t          n_resident_      = 0;
+    uint64_t          n_pagein_     = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -279,7 +279,7 @@ private:
     uint64_t          ns_prep_set_ = 0;
     uint64_t          ns_hits_ = 0;
     uint64_t          ns_wait_ = 0;
-    uint64_t          ns_miss_compute_ = 0;
+    uint64_t          ns_pagein_compute_ = 0;
     uint64_t          ns_result_ = 0;
     uint64_t          ns_encode_ = 0;
     uint64_t          ns_h2d_     = 0;
@@ -1228,7 +1228,7 @@ private:
 
 class ExpertSlotPool {
 private:
-    struct Miss {
+    struct PageIn {
         size_t             entry_index = 0;
         size_t             slot_index  = 0;
         const ExpertPage * page        = nullptr;
@@ -1236,7 +1236,7 @@ private:
     };
 
     struct ReadResult {
-        size_t                              miss_index = 0;
+        size_t                              pagein_indexb = 0;
         std::unique_ptr<StagingPool::Lease> staging;
         std::exception_ptr                  error;
         std::chrono::steady_clock::time_point read_started;
@@ -1245,7 +1245,7 @@ private:
     };
 
     struct BatchState {
-        std::vector<Miss>                       misses;
+        std::vector<PageIn>                       pageins;
         std::atomic<size_t>                     next{0};
         std::mutex                              mutex;
         std::condition_variable                 cv;
@@ -1340,7 +1340,7 @@ public:
         Batch & operator=(const Batch &) = delete;
         Batch & operator=(Batch &&) = delete;
 
-        bool is_hit(size_t index) const {
+        bool is_resident(size_t index) const {
             return entries_.at(index).hit;
         }
 
@@ -1370,12 +1370,12 @@ public:
             return bytes_h2d_;
         }
 
-        uint64_t n_hit() const {
-            return n_hit_;
+        uint64_t n_resident() const {
+            return n_resident_;
         }
 
-        uint64_t n_miss() const {
-            return n_miss_;
+        uint64_t n_pagein() const {
+            return n_pagein_;
         }
 
         uint64_t bytes_read() const {
@@ -1419,8 +1419,8 @@ public:
         bool                       completed_ = false;
         uint64_t                   ns_lookup_ = 0;
         uint64_t                   ns_read_   = 0;
-        uint64_t                   n_hit_     = 0;
-        uint64_t                   n_miss_    = 0;
+        uint64_t                   n_resident_     = 0;
+        uint64_t                   n_pagein_    = 0;
         uint64_t                   bytes_read_ = 0;
         uint64_t                   n_host_hit_ = 0;
         uint64_t                   n_host_demote_ = 0;
@@ -1436,11 +1436,11 @@ public:
             std::chrono::steady_clock::time_point lookup_started) {
         Batch batch(this, pages.size());
         try {
-            std::vector<size_t> misses;
-            misses.reserve(pages.size());
+            std::vector<size_t> pageins;
+            pageins.reserve(pages.size());
 
             // Resolve and pin every hit before selecting a victim. A hit is
-            // immediately usable while sibling misses are read.
+            // immediately usable while sibling pageins are read.
             for (size_t i = 0; i < pages.size(); ++i) {
                 const ExpertPage & page = *pages[i];
                 const std::pair<int, int> key(page.layer, page.expert);
@@ -1452,7 +1452,7 @@ public:
                     }
                 }
                 if (slot_index == slots_.size()) {
-                    misses.push_back(i);
+                    pageins.push_back(i);
                     continue;
                 }
                 Slot & slot = slots_[slot_index];
@@ -1465,12 +1465,12 @@ public:
                     true,
                     true,
                 };
-                ++batch.n_hit_;
+                ++batch.n_resident_;
             }
 
-            // Reserve and pin all miss slots before starting any read. Later
-            // allocations in this request cannot select an earlier miss.
-            for (size_t entry_index : misses) {
+            // Reserve and pin all pagein slots before starting any read. Later
+            // allocations in this request cannot select an earlier pagein.
+            for (size_t entry_index : pageins) {
                 const ExpertPage & page = *pages[entry_index];
                 const size_t slot_index = select_victim(page.size);
                 if (slot_index == slots_.size()) {
@@ -1493,7 +1493,7 @@ public:
             };
             std::vector<HostHit> host_hits(pages.size());
             if (host_victim_enabled_) {
-                for (size_t entry_index : misses) {
+                for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
                     if (host_tier_.borrow(
                             page.cache_id, &host_hits[entry_index].src,
@@ -1504,7 +1504,7 @@ public:
             }
 
             auto release_host_hits = [&]() {
-                for (size_t entry_index : misses) {
+                for (size_t entry_index : pageins) {
                     HostHit & host_hit = host_hits[entry_index];
                     if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
                         host_tier_.release(
@@ -1515,9 +1515,9 @@ public:
             };
 
             batch.state_ = std::make_shared<BatchState>();
-            batch.state_->misses.reserve(misses.size());
+            batch.state_->pageins.reserve(pageins.size());
             try {
-                for (size_t entry_index : misses) {
+                for (size_t entry_index : pageins) {
                     const ExpertPage & page = *pages[entry_index];
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
@@ -1555,10 +1555,10 @@ public:
                                     std::chrono::steady_clock::now() - host_get_started).count();
                         }
                     } else {
-                        batch.state_->misses.push_back({
+                        batch.state_->pageins.push_back({
                             entry_index, slot_index, &page, fd_for(page.blob)
                         });
-                        ++batch.n_miss_;
+                        ++batch.n_pagein_;
                         batch.bytes_read_ += page.size;
                         if (test_hooks_ != nullptr &&
                             test_hooks_->slot_reserved) {
@@ -1573,7 +1573,7 @@ public:
             }
             batch.host_bytes_ = host_victim_enabled_ ? host_tier_.used_bytes() : 0;
 
-            if (batch.state_->misses.empty()) {
+            if (batch.state_->pageins.empty()) {
                 batch.completed_ = true;
                 return batch;
             }
@@ -1581,7 +1581,7 @@ public:
             batch.state_->measure = measure;
 
             const size_t worker_count = std::min<size_t>(
-                batch.state_->misses.size(), (size_t) staging_.buffer_count());
+                batch.state_->pageins.size(), (size_t) staging_.buffer_count());
             batch.workers_.reserve(worker_count);
             for (size_t i = 0; i < worker_count; ++i) {
                 batch.workers_.emplace_back(
@@ -1676,14 +1676,14 @@ private:
         }
 
         while (true) {
-            const size_t miss_index =
+            const size_t pagein_indexb =
                 state->next.fetch_add(1, std::memory_order_relaxed);
-            if (miss_index >= state->misses.size()) {
+            if (pagein_indexb >= state->pageins.size()) {
                 return;
             }
-            const Miss & miss = state->misses[miss_index];
+            const PageIn & pagein = state->pageins[pagein_indexb];
             auto result = std::make_unique<ReadResult>();
-            result->miss_index = miss_index;
+            result->pagein_indexb = pagein_indexb;
             bool read_started = false;
             try {
                 result->staging = std::make_unique<StagingPool::Lease>(
@@ -1696,13 +1696,13 @@ private:
                 if (test_hooks_ != nullptr &&
                     test_hooks_->read_started) {
                     test_hooks_->read_started(
-                        miss.page->layer, miss.page->expert);
+                        pagein.page->layer, pagein.page->expert);
                 }
                 if (state->measure) {
                     result->read_started = std::chrono::steady_clock::now();
                     result->read_timed = true;
                 }
-                read_page(*miss.page, miss.fd, result->staging->get());
+                read_page(*pagein.page, pagein.fd, result->staging->get());
             } catch (...) {
                 result->error = std::current_exception();
             }
@@ -1713,7 +1713,7 @@ private:
                 test_hooks_->read_finished) {
                 try {
                     test_hooks_->read_finished(
-                        miss.page->layer, miss.page->expert);
+                        pagein.page->layer, pagein.page->expert);
                 } catch (...) {
                     if (result->error == nullptr) {
                         result->error = std::current_exception();
@@ -1738,7 +1738,7 @@ private:
         std::chrono::steady_clock::time_point first_read;
         std::chrono::steady_clock::time_point last_read;
         bool have_read_time = false;
-        while (received < batch.state_->misses.size()) {
+        while (received < batch.state_->pageins.size()) {
             std::unique_ptr<ReadResult> result;
             {
                 std::unique_lock<std::mutex> lock(batch.state_->mutex);
@@ -1749,8 +1749,8 @@ private:
                 batch.state_->ready.pop_front();
             }
 
-            const Miss & miss =
-                batch.state_->misses[result->miss_index];
+            const PageIn & pagein =
+                batch.state_->pageins[result->pagein_indexb];
             if (result->read_timed) {
                 if (!have_read_time || result->read_started < first_read) {
                     first_read = result->read_started;
@@ -1765,42 +1765,42 @@ private:
                     first_error = result->error;
                 }
             } else {
-                // WP_MISS_LOG=path: append "<layer> <expert>" for every page
+                // WP_PAGEIN_LOG=path: append "<layer> <expert>" for every page
                 // actually READ from disk. Intersecting the two 2026 workers'
                 // logs measures whether residency-affinity routing keeps their
                 // caches disjoint, or whether they fetch the same pages twice.
-                // Default off; one fprintf per miss, negligible against a
+                // Default off; one fprintf per pagein, negligible against a
                 // 13.37 MB O_DIRECT read.
-                if (miss_log_ != nullptr) {
-                    fprintf(miss_log_, "%d %d\n", miss.page->layer, miss.page->expert);
+                if (pagein_log_ != nullptr) {
+                    fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
                     // The harness SIGKILLs workers at teardown, so a buffered
                     // stream is lost entirely -- the first run produced two
                     // 0-byte logs. One fflush per 13.37 MB O_DIRECT read is free.
-                    fflush(miss_log_);
+                    fflush(pagein_log_);
                 }
-                Slot & slot = slots_[miss.slot_index];
+                Slot & slot = slots_[pagein.slot_index];
                 const bool measure_h2d = batch.state_->measure;
                 const std::chrono::steady_clock::time_point h2d_started =
                     measure_h2d ? std::chrono::steady_clock::now() :
                                   std::chrono::steady_clock::time_point();
                 ggml_backend_tensor_set(
                     slot.raw, result->staging->get(), 0,
-                    (size_t) miss.page->size);
+                    (size_t) pagein.page->size);
                 if (measure_h2d) {
                     batch.ns_h2d_ +=
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - h2d_started).count();
-                    batch.bytes_h2d_ += miss.page->size;
+                    batch.bytes_h2d_ += pagein.page->size;
                 }
                 slot.valid = true;
                 slot.key   = {
-                    miss.page->layer, miss.page->expert
+                    pagein.page->layer, pagein.page->expert
                 };
-                slot.cache_id = miss.page->cache_id;
-                slot.size     = miss.page->size;
+                slot.cache_id = pagein.page->cache_id;
+                slot.size     = pagein.page->size;
                 slot.tick  = ++tick_;
                 Batch::Entry & entry =
-                    batch.entries_[miss.entry_index];
+                    batch.entries_[pagein.entry_index];
                 entry.loaded = {
                     slot.buffer.get(),
                     ggml_backend_buffer_get_base(slot.buffer.get())
@@ -1862,8 +1862,8 @@ private:
         release_pins(batch);
     }
 
-    FILE * miss_log_ = [] {
-        const char * p = std::getenv("WP_MISS_LOG");
+    FILE * pagein_log_ = [] {
+        const char * p = std::getenv("WP_PAGEIN_LOG");
         return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
     }();
 
@@ -1959,8 +1959,8 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     completed_(other.completed_),
     ns_lookup_(other.ns_lookup_),
     ns_read_(other.ns_read_),
-    n_hit_(other.n_hit_),
-    n_miss_(other.n_miss_),
+    n_resident_(other.n_resident_),
+    n_pagein_(other.n_pagein_),
     bytes_read_(other.bytes_read_),
     n_host_hit_(other.n_host_hit_),
     n_host_demote_(other.n_host_demote_),
@@ -2133,8 +2133,8 @@ public:
             pages, measure, lookup_started);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
-            request_stats.n_hit      = batch.n_hit();
-            request_stats.n_miss     = batch.n_miss();
+            request_stats.n_resident      = batch.n_resident();
+            request_stats.n_pagein     = batch.n_pagein();
             request_stats.n_host_hit = batch.n_host_hit();
             request_stats.n_host_demote = batch.n_host_demote();
             request_stats.bytes_read = batch.bytes_read();
@@ -2149,10 +2149,10 @@ public:
             (size_t) request.n_tokens * catalog_.descriptor.hparams.n_embd;
         std::vector<float> sum(result_size, 0.0f);
         bool have_hits = false;
-        bool have_misses = false;
+        bool have_pageins = false;
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            have_hits |= batch.is_hit(i);
-            have_misses |= !batch.is_hit(i);
+            have_hits |= batch.is_resident(i);
+            have_pageins |= !batch.is_resident(i);
         }
         // PHASE TIMERS. ns_compute is the wall span of this whole section, but
         // ns_read/h2d/submit/readback only summed to 78% of it on the RX 480
@@ -2186,12 +2186,12 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
         }
-        if (have_misses) {
+        if (have_pageins) {
             compute_batch(
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
         }
-        request_stats.ns_miss_compute = lap();
+        request_stats.ns_pagein_compute = lap();
         if (!request.assignments.empty()) {
             read_result(sum, request_stats);
         }
@@ -2366,7 +2366,7 @@ private:
             RequestStats & request_stats) {
         size_t n_selected = 0;
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            n_selected += batch.is_hit(i) == hits;
+            n_selected += batch.is_resident(i) == hits;
         }
         if (n_selected == 0) {
             return;
@@ -2395,7 +2395,7 @@ private:
         routing_weights.reserve(n_selected);
 
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            if (batch.is_hit(i) != hits) {
+            if (batch.is_resident(i) != hits) {
                 continue;
             }
             const ExpertPage & page = *pages[i];
@@ -2560,8 +2560,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     }
 
     // WP_REQ_LOG=path -- one line per dispatch request. Columns:
-    //   layer n_exp n_hit n_miss bytes_read ns_wall ns_lookup ns_prep ns_hits
-    //   ns_wait ns_misscompute ns_result ns_read ns_h2d ns_submit ns_readback
+    //   layer n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep ns_hits
+    //   ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit ns_readback
     //   ns_encode ns_send
     // Segment into tokens by watching request.layer wrap back to its minimum.
     FILE * const req_log = [] {
@@ -2570,9 +2570,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     }();
 
     // WP_REF_LOG=path -- the full REFERENCE stream: "<layer> <expert> <expert> ..."
-    // one line per request, every expert asked for whether it hit or missed.
-    // WP_MISS_LOG cannot substitute: which pages miss is a function of the
-    // replacement policy, so a miss trace can only ever describe the policy that
+    // one line per request, every expert asked for whether it was resident or paged in.
+    // WP_PAGEIN_LOG cannot substitute: which pages pagein is a function of the
+    // replacement policy, so a pagein trace can only ever describe the policy that
     // produced it. The reference stream is policy-independent, which makes LRU /
     // LFU / ARC / Belady all simulatable OFFLINE from a single run, at zero GPU
     // cost per candidate -- and Belady gives the true ceiling, so we learn
@@ -2640,7 +2640,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             // -- so the shape is the whole question. request.layer lets the
             // reader segment this stream into tokens by layer wrap WITHOUT a
             // cross-machine clock join (the spine runs on the other box); that
-            // is what made WP_MISS_LOG unusable for the same purpose.
+            // is what made WP_PAGEIN_LOG unusable for the same purpose.
             if (ref_log != nullptr) {
                 fprintf(ref_log, "%d", request.layer);
                 for (const pipe_expert_assignment & a : request.assignments) {
@@ -2685,15 +2685,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                         "%d %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
                         "%llu %llu %llu %llu %llu %llu\n",
                         request.layer, request.assignments.size(),
-                        (unsigned long long) s.n_hit,
-                        (unsigned long long) s.n_miss,
+                        (unsigned long long) s.n_resident,
+                        (unsigned long long) s.n_pagein,
                         (unsigned long long) s.bytes_read,
                         (unsigned long long) ns_wall,
                         (unsigned long long) s.ns_lookup,
                         (unsigned long long) s.ns_prep,
                         (unsigned long long) s.ns_hits,
                         (unsigned long long) s.ns_wait,
-                        (unsigned long long) s.ns_miss_compute,
+                        (unsigned long long) s.ns_pagein_compute,
                         (unsigned long long) s.ns_result,
                         (unsigned long long) s.ns_read,
                         (unsigned long long) s.ns_h2d,
