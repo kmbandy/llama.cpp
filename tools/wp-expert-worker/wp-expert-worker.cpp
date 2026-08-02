@@ -44,6 +44,10 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+// poll() for the keepalive pump. POSIX only; the worker is already POSIX-only
+// (O_DIRECT, posix_memalign) so this adds no new portability constraint.
+#include <poll.h>            // ppoll needs _GNU_SOURCE, which glibc sets via -std=gnu++
+
 #if defined(__linux__)
 #  include <fcntl.h>
 #  include <sys/stat.h>
@@ -75,9 +79,24 @@ struct RequestStats {
     uint64_t ns_graph_build = 0;
     uint64_t ns_submit = 0;
     uint64_t ns_readback = 0;
+    uint64_t ns_prep = 0;
+    uint64_t ns_prep_setup = 0;   // ggml_init + new_tensor + buft queries
+    uint64_t ns_prep_grow = 0;    // grow_io_buffer (device alloc when it grows)
+    uint64_t ns_prep_attach = 0;  // attach_weight -> buffer_init_tensor
+    uint64_t ns_prep_set = 0;     // the activation upload itself          // prepare_io: activation upload + io buffer growth
+    uint64_t ns_hits = 0;          // compute_batch(hits) end to end
+    uint64_t ns_wait = 0;          // batch.complete(): reader-thread join + I/O + H2D
+    uint64_t ns_miss_compute = 0;  // compute_batch(misses) end to end
+    uint64_t ns_result = 0;        // read_result
+    uint64_t ns_encode = 0;        // fp32 -> fp16 of the reply
     uint64_t ns_h2d = 0;
     uint64_t bytes_h2d = 0;
 };
+
+// Forward declarations: the probe itself is defined further down, next to
+// run_self_bench, but WorkerStats::report() needs to read it.
+void self_bench_tick(ggml_backend_t backend);
+bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us);
 
 class WorkerStats {
 public:
@@ -93,6 +112,8 @@ public:
 
     // Set once at startup from ExpertSlotPool::staging_kind() -- which
     // allocation path the staging pool actually used, not what was requested.
+    void set_probe_backend(ggml_backend_t b) { probe_backend_ = b; }
+
     void set_staging_kind(const char * kind) {
         staging_kind_ = kind;
     }
@@ -121,11 +142,43 @@ public:
         n_device_allocs_ += request.n_device_allocs;
         ns_graph_build_ += request.ns_graph_build;
         ns_submit_ += request.ns_submit;
+        // PER-REQUEST DISTRIBUTION, not just the total. The cumulative ns_submit
+        // cannot distinguish "every request costs 2.1 ms" from "most cost 0.2 ms
+        // and a few cost 50 ms", and those have completely different fixes. An
+        // isolated rebuild of this exact graph at this exact shape measures
+        // ~190 us/expert on Vulkan0 and ~150 on CUDA, against ~1510 and ~254
+        // in the worker -- so the shape of this histogram is the open question.
+        if (request.n_graph_submits > 0) {
+            const uint64_t per = request.ns_submit / request.n_graph_submits;
+            if (per < submit_min_ns_) submit_min_ns_ = per;
+            if (per > submit_max_ns_) submit_max_ns_ = per;
+            // log2-ish buckets in us: <125, <250, <500, <1k, <2k, <4k, <8k, >=8k
+            size_t b = 0;
+            for (uint64_t edge = 125000; b < 7 && per >= edge; edge *= 2) ++b;
+            ++submit_bucket_[b];
+        }
         ns_readback_ += request.ns_readback;
+        ns_prep_ += request.ns_prep;
+        ns_prep_setup_ += request.ns_prep_setup;
+        ns_prep_grow_ += request.ns_prep_grow;
+        ns_prep_attach_ += request.ns_prep_attach;
+        ns_prep_set_ += request.ns_prep_set;
+        ns_hits_ += request.ns_hits;
+        ns_wait_ += request.ns_wait;
+        ns_miss_compute_ += request.ns_miss_compute;
+        ns_result_ += request.ns_result;
+        ns_encode_ += request.ns_encode;
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
         ++n_requests_;
         n_experts_ += n_experts;
+
+        // WP_SELF_BENCH_EVERY=N: re-time the static graph every N requests while
+        // serving. Costs one extra compute per N requests; default off.
+        if (self_bench_every_ > 0 && probe_backend_ != nullptr &&
+            n_requests_ % self_bench_every_ == 0) {
+            self_bench_tick(probe_backend_);
+        }
 
         const clock::time_point now = clock::now();
         if (now < next_report_) {
@@ -167,11 +220,42 @@ private:
                   << " ns_readback=" << ns_readback_
                   << " ns_send=" << ns_send_
                   << " host_bytes=" << host_bytes_
-                  << std::endl;
+                  << " ns_prep=" << ns_prep_
+                  << " ns_prep_setup=" << ns_prep_setup_
+                  << " ns_prep_grow=" << ns_prep_grow_
+                  << " ns_prep_attach=" << ns_prep_attach_
+                  << " ns_prep_set=" << ns_prep_set_
+                  << " ns_hits=" << ns_hits_
+                  << " ns_wait=" << ns_wait_
+                  << " ns_misscompute=" << ns_miss_compute_
+                  << " ns_result=" << ns_result_
+                  << " ns_encode=" << ns_encode_
+                  << " submit_us_min=" << (submit_min_ns_ == UINT64_MAX ? 0 : submit_min_ns_ / 1000)
+                  << " submit_us_max=" << (submit_max_ns_ / 1000)
+                  << " submit_hist_us[<125,<250,<500,<1k,<2k,<4k,<8k,>=8k]="
+                  << submit_bucket_[0] << ',' << submit_bucket_[1] << ','
+                  << submit_bucket_[2] << ',' << submit_bucket_[3] << ','
+                  << submit_bucket_[4] << ',' << submit_bucket_[5] << ','
+                  << submit_bucket_[6] << ',' << submit_bucket_[7];
+        {
+            uint64_t pn = 0, pmin = 0, pmean = 0;
+            if (self_bench_stats(pn, pmin, pmean)) {
+                std::cout << " probe_n=" << pn
+                          << " probe_static_us_min=" << pmin
+                          << " probe_static_us_mean=" << pmean;
+            }
+        }
+        std::cout << std::endl;
     }
 
     bool              enabled_ = false;
     clock::time_point next_report_;
+    uint64_t          self_bench_every_ =
+        std::getenv("WP_SELF_BENCH_EVERY") ? (uint64_t) atoll(std::getenv("WP_SELF_BENCH_EVERY")) : 0;
+    ggml_backend_t    probe_backend_ = nullptr;
+    uint64_t          submit_min_ns_ = UINT64_MAX;
+    uint64_t          submit_max_ns_ = 0;
+    uint64_t          submit_bucket_[8] = {0,0,0,0,0,0,0,0};
     uint64_t          ns_lookup_  = 0;
     uint64_t          ns_read_    = 0;
     uint64_t          ns_compute_ = 0;
@@ -188,6 +272,16 @@ private:
     uint64_t          ns_graph_build_ = 0;
     uint64_t          ns_submit_ = 0;
     uint64_t          ns_readback_ = 0;
+    uint64_t          ns_prep_ = 0;
+    uint64_t          ns_prep_setup_ = 0;
+    uint64_t          ns_prep_grow_ = 0;
+    uint64_t          ns_prep_attach_ = 0;
+    uint64_t          ns_prep_set_ = 0;
+    uint64_t          ns_hits_ = 0;
+    uint64_t          ns_wait_ = 0;
+    uint64_t          ns_miss_compute_ = 0;
+    uint64_t          ns_result_ = 0;
+    uint64_t          ns_encode_ = 0;
     uint64_t          ns_h2d_     = 0;
     uint64_t          bytes_h2d_  = 0;
     std::string       staging_kind_ = "unknown";
@@ -773,6 +867,17 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
     return result;
 }
 
+void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff);
+void run_self_bench_early(ggml_backend_t backend) {
+    // DS4-Flash expert shape, hardcoded: init_backend has no catalog yet and
+    // this path is diagnostic-only (WP_SELF_BENCH=2).
+    const char * saved = std::getenv("WP_SELF_BENCH");
+    (void) saved;
+    setenv("WP_SELF_BENCH", "1", 1);   // run_self_bench gates on '1'
+    run_self_bench(backend, 4096, 2048);
+    setenv("WP_SELF_BENCH", "2", 1);
+}
+
 backend_ptr init_backend(const std::string & device) {
     std::string lower = device;
     std::transform(lower.begin(), lower.end(), lower.begin(),
@@ -791,8 +896,144 @@ backend_ptr init_backend(const std::string & device) {
     if (backend == nullptr) {
         throw std::runtime_error("failed to initialize device " + device);
     }
+    // WP_SELF_BENCH=2 benchmarks HERE -- backend freshly created, no slot pool,
+    // no staging pool, nothing else in the process. WP_SELF_BENCH=1 benchmarks
+    // in the Worker ctor AFTER both pools exist. The pair bisects the ctor:
+    // fast here + slow there => a pool is responsible; slow in both => the
+    // backend/process is slow from birth. Standalone reference is ~190 us on
+    // Vulkan0, and the post-pool measurement is 1327 us (2026-08-01).
+    {
+        const char * mode = std::getenv("WP_SELF_BENCH");
+        if (mode != nullptr && mode[0] == '2') {
+            run_self_bench_early(backend);
+        }
+    }
     return backend_ptr(backend);
 }
+
+
+// WP_SELF_BENCH=1: time a STATIC pre-built expert graph inside THIS process,
+// on THIS backend instance, before serving any request.
+//
+// WHY THIS EXISTS. A standalone benchmark rebuilding the same graph at the same
+// shape measures ~190 us/compute on the RX 480, but the worker's FASTEST of
+// 1996 live submits is 618 us and its median is ~1800 us (2026-08-01). Twelve
+// reconstructed differences were tested and none reproduced the gap: shader,
+// per-graph overhead, buffer layout, 400 live buffers, graph rotation, gallocr
+// realloc per request, readback, H2D (per-BYTE, ~36 us weighted), backend
+// construction, within-process degradation, second-GPU and CPU contention.
+// So the remaining difference is either the worker's PER-REQUEST GRAPH or its
+// PROCESS/BACKEND STATE, and a standalone binary cannot tell those apart.
+// This does: same process, same backend, same device, static graph.
+//   ~190 us  -> the backend is fine; the per-request graph path is the cost.
+//   ~618 us  -> the graph is fine; something about this process/backend is.
+// Persistent handle for the periodic in-serving probe (WP_SELF_BENCH_EVERY=N).
+// The static graph is built once and re-timed every N requests WHILE the worker
+// serves real traffic. It separates two things the live ns_submit cannot:
+//   static stays ~190 us while real requests cost ~647 us => the difference is
+//     the worker's per-request GRAPH CONTENT (cpy into io buffer, gallocr-owned
+//     routing weights, attach_weight into slot buffers).
+//   static ALSO degrades to ~647 us => it is process/backend state under load
+//     (in-flight transfers, reader threads, queue depth), not the graph.
+struct SelfBenchProbe {
+    ggml_context *        wctx  = nullptr;
+    ggml_backend_buffer_t wbuf  = nullptr;
+    ggml_context *        gctx  = nullptr;
+    ggml_cgraph *         graph = nullptr;
+    ggml_gallocr_t        ga    = nullptr;
+    uint64_t              min_ns = UINT64_MAX;
+    uint64_t              total_ns = 0;
+    uint64_t              n = 0;
+    bool                  ready = false;
+};
+static SelfBenchProbe g_probe;
+
+void run_self_bench(ggml_backend_t backend, uint32_t n_embd, uint32_t n_ff) {
+    const char * env = std::getenv("WP_SELF_BENCH");
+    if (env == nullptr || env[0] != '1') {
+        return;
+    }
+    const ggml_init_params wp_params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * 16,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * wctx = ggml_init(wp_params);
+    ggml_tensor * gate  = ggml_new_tensor_2d(wctx, GGML_TYPE_MXFP4, n_embd, n_ff);
+    ggml_tensor * up    = ggml_new_tensor_2d(wctx, GGML_TYPE_MXFP4, n_embd, n_ff);
+    ggml_tensor * down  = ggml_new_tensor_2d(wctx, GGML_TYPE_MXFP4, n_ff,  n_embd);
+    ggml_tensor * input = ggml_new_tensor_2d(wctx, GGML_TYPE_F32,   n_embd, 1);
+    ggml_tensor * rw    = ggml_new_tensor_2d(wctx, GGML_TYPE_F32,   1,      1);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    if (wbuf == nullptr) {
+        std::cout << "wp self-bench: alloc failed" << std::endl;
+        ggml_free(wctx);
+        return;
+    }
+    {
+        std::vector<uint8_t> junk(ggml_nbytes(gate), 0x5a);
+        ggml_backend_tensor_set(gate, junk.data(), 0, ggml_nbytes(gate));
+        ggml_backend_tensor_set(up,   junk.data(), 0, ggml_nbytes(up));
+        ggml_backend_tensor_set(down, junk.data(), 0, ggml_nbytes(down));
+        std::vector<float> f(n_embd, 0.01f);
+        ggml_backend_tensor_set(input, f.data(), 0, ggml_nbytes(input));
+        const float one = 0.5f;
+        ggml_backend_tensor_set(rw, &one, 0, sizeof(float));
+    }
+    const size_t nodes = 32;
+    const ggml_init_params gp = {
+        /* .mem_size   = */ ggml_tensor_overhead() * nodes
+                            + ggml_graph_overhead_custom(nodes, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * gctx = ggml_init(gp);
+    ggml_tensor * g = ggml_mul_mat(gctx, gate, input);
+    ggml_tensor * u = ggml_mul_mat(gctx, up,   input);
+    ggml_tensor * h = ggml_swiglu_split(gctx, g, u);
+    ggml_tensor * o = ggml_mul_mat(gctx, down, h);
+    ggml_tensor * w = ggml_mul(gctx, o, rw);
+    ggml_cgraph * graph = ggml_new_graph_custom(gctx, nodes, false);
+    ggml_build_forward_expand(graph, w);
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(ga, graph)) {
+        std::cout << "wp self-bench: graph alloc failed" << std::endl;
+        ggml_gallocr_free(ga); ggml_free(gctx);
+        ggml_backend_buffer_free(wbuf); ggml_free(wctx);
+        return;
+    }
+    for (int i = 0; i < 5; ++i) {          // warm up: first Vulkan submit compiles pipelines
+        ggml_backend_graph_compute(backend, graph);
+    }
+    ggml_backend_synchronize(backend);
+    uint64_t best = UINT64_MAX, total = 0;
+    const int iters = 300;
+    for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_backend_graph_compute(backend, graph);
+        const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (ns < best) best = ns;
+        total += ns;
+    }
+    std::cout << "wp self-bench: static 1-expert graph on this backend"
+              << " iters=" << iters
+              << " min_us=" << best / 1000
+              << " mean_us=" << total / iters / 1000
+              << std::endl;
+    if (std::getenv("WP_SELF_BENCH_EVERY") != nullptr) {
+        g_probe.wctx = wctx; g_probe.wbuf = wbuf;
+        g_probe.gctx = gctx; g_probe.graph = graph; g_probe.ga = ga;
+        g_probe.ready = true;
+        return;   // deliberately leaked for the process lifetime; diagnostic only
+    }
+    ggml_gallocr_free(ga);
+    ggml_free(gctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+}
+
+// One timed compute of the static graph, called from the serving path.
 
 std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
     std::vector<ResourcePage> result;
@@ -1027,6 +1268,20 @@ public:
             resources_.staging_buffer_bytes >
                 (uint64_t) std::numeric_limits<size_t>::max()) {
             throw std::runtime_error("invalid expert slot pool dimensions");
+        }
+        // WP_SELF_BENCH=3 benchmarks HERE: staging_ is already built (member
+        // init list) but NO slot buffers exist yet. With =2 (before everything)
+        // measuring 183 us and =1 (after everything) measuring 1341 us, this
+        // splits the constructor: fast here => the SLOT buffers do it; slow here
+        // => the STAGING pool does it. Staging is a fixed 16 buffers regardless
+        // of --slots, which matches the observed flatness across 100..400 slots.
+        {
+            const char * mode = std::getenv("WP_SELF_BENCH");
+            if (mode != nullptr && mode[0] == '3') {
+                setenv("WP_SELF_BENCH", "1", 1);
+                run_self_bench(backend_, 4096, 2048);
+                setenv("WP_SELF_BENCH", "3", 1);
+            }
         }
         slots_.reserve((size_t) resources_.slot_count);
         resources_.device_bytes = 0;
@@ -1510,6 +1765,19 @@ private:
                     first_error = result->error;
                 }
             } else {
+                // WP_MISS_LOG=path: append "<layer> <expert>" for every page
+                // actually READ from disk. Intersecting the two 2026 workers'
+                // logs measures whether residency-affinity routing keeps their
+                // caches disjoint, or whether they fetch the same pages twice.
+                // Default off; one fprintf per miss, negligible against a
+                // 13.37 MB O_DIRECT read.
+                if (miss_log_ != nullptr) {
+                    fprintf(miss_log_, "%d %d\n", miss.page->layer, miss.page->expert);
+                    // The harness SIGKILLs workers at teardown, so a buffered
+                    // stream is lost entirely -- the first run produced two
+                    // 0-byte logs. One fflush per 13.37 MB O_DIRECT read is free.
+                    fflush(miss_log_);
+                }
                 Slot & slot = slots_[miss.slot_index];
                 const bool measure_h2d = batch.state_->measure;
                 const std::chrono::steady_clock::time_point h2d_started =
@@ -1593,6 +1861,11 @@ private:
         }
         release_pins(batch);
     }
+
+    FILE * miss_log_ = [] {
+        const char * p = std::getenv("WP_MISS_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    }();
 
     Slot make_slot(uint64_t capacity) {
         if (capacity == 0 ||
@@ -1745,7 +2018,51 @@ public:
             throw std::runtime_error("failed to create expert graph allocator");
         }
         stats_.set_staging_kind(pool_.staging_kind());
+        // Runs only under WP_SELF_BENCH=1; no-op otherwise. Placed after the
+        // slot pool is built so the backend is in the same state it will serve
+        // requests in.
+        // PRE-ALLOCATE THE IO BUFFER AT STARTUP. The first device-buffer
+        // allocation made AFTER the slot pool exists costs 1394 ms on the RX 480
+        // (vs 0.3 ms on the 1070) -- one 1 MiB host-visible allocation behind
+        // 5.35 GB of device-local slots. Paid lazily on the first request it
+        // amortised to 0.87 ms on EVERY request and was 95% of prepare_io.
+        // It is a one-time cost, so pay it here with the rest of startup.
+        {
+            RequestStats warmup;
+            grow_io_buffer(1u << 20, warmup);
+        }
+        stats_.set_probe_backend(backend_.get());
+        run_self_bench(backend_.get(),
+                       catalog_.descriptor.hparams.n_embd,
+                       catalog_.descriptor.hparams.n_ff_exp);
+        build_keepalive();
     }
+
+    // WP_KEEPALIVE_US=N (0 = off): while waiting for the next request, submit a
+    // trivial graph every N microseconds instead of leaving the GPU idle.
+    //
+    // WHY. On the RX 480 the cost of a submit depends on how long the GPU idled
+    // beforehand. Measured 2026-08-02 on this exact expert graph, clocks already
+    // pinned to max via power_dpm_force_performance_level=high:
+    //     idle gap      200us    1ms     3ms
+    //     idle          284      512     547   us/expert
+    //     keepalive     163      163     165   us/expert
+    // The keepalive removes the penalty entirely and is FLAT in gap length. It
+    // is not a clock effect -- sclk and mclk are both pinned at maximum while
+    // this happens -- so it is gating below the clock level, and occupying the
+    // GPU is the only lever available without a kernel parameter.
+    //
+    // Submitted from THIS thread, between poll() timeouts on the request socket.
+    // Do not move it to a background thread: Vulkan command pools have thread
+    // affinity, so concurrent submits risk corruption even behind a mutex.
+    void keepalive_tick() {
+        if (keepalive_graph_ != nullptr) {
+            ggml_backend_graph_compute(backend_.get(), keepalive_graph_);
+        }
+    }
+
+    bool keepalive_enabled() const { return keepalive_us_ > 0 && keepalive_graph_ != nullptr; }
+    int  keepalive_us()      const { return keepalive_us_; }
 
     pipe_expert_hello hello() const {
         pipe_expert_hello hello;
@@ -1837,15 +2154,33 @@ public:
             have_hits |= batch.is_hit(i);
             have_misses |= !batch.is_hit(i);
         }
+        // PHASE TIMERS. ns_compute is the wall span of this whole section, but
+        // ns_read/h2d/submit/readback only summed to 78% of it on the RX 480
+        // (8.95 s of 11.53 s) -- 1.34 ms per request attributed to nothing.
+        // These close the accounting: prepare_io (activation upload + io buffer
+        // growth), the blocking wait in batch.complete() (thread join + I/O),
+        // and the fp32->fp16 encode of the reply.
+        auto phase = std::chrono::steady_clock::now();
+        auto lap = [&measure, &phase]() -> uint64_t {
+            if (!measure) return 0;
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now - phase).count();
+            phase = now;
+            return ns;
+        };
         if (!request.assignments.empty()) {
             prepare_io(activation, request.n_tokens, request_stats);
+            request_stats.ns_prep = lap();
             if (have_hits) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
             }
+            request_stats.ns_hits = lap();
         }
         batch.complete();
+        request_stats.ns_wait = lap();
         if (measure) {
             request_stats.ns_read = batch.read_ns();
             request_stats.ns_h2d    = batch.ns_h2d();
@@ -1856,9 +2191,11 @@ public:
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
         }
+        request_stats.ns_miss_compute = lap();
         if (!request.assignments.empty()) {
             read_result(sum, request_stats);
         }
+        request_stats.ns_result = lap();
         if (measure) {
             request_stats.ns_compute =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1872,6 +2209,7 @@ public:
         for (size_t i = 0; i < sum.size(); ++i) {
             response.partial[i] = (uint16_t) ggml_fp32_to_fp16(sum[i]);
         }
+        request_stats.ns_encode = lap();
         return response;
     }
 
@@ -1888,17 +2226,83 @@ public:
     }
 
 private:
+    // ---- keepalive (see keepalive_tick) ----
+    int                keepalive_us_    = 0;
+    ggml_context     * keepalive_ctx_   = nullptr;
+    ggml_gallocr_t     keepalive_alloc_ = nullptr;
+    ggml_cgraph      * keepalive_graph_ = nullptr;
+
+    void build_keepalive() {
+        const char * e = std::getenv("WP_KEEPALIVE_US");
+        keepalive_us_ = (e != nullptr && e[0] != '\0') ? atoi(e) : 0;
+        if (keepalive_us_ <= 0) {
+            return;
+        }
+        // Deliberately the smallest graph that still reaches the GPU: one add on
+        // a 1-element tensor. It exists to occupy the device, not to compute.
+        ggml_init_params p = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        keepalive_ctx_ = ggml_init(p);
+        if (keepalive_ctx_ == nullptr) {
+            keepalive_us_ = 0;
+            return;
+        }
+        ggml_tensor * a   = ggml_new_tensor_1d(keepalive_ctx_, GGML_TYPE_F32, 1);
+        ggml_tensor * sum = ggml_add(keepalive_ctx_, a, a);
+        keepalive_graph_  = ggml_new_graph(keepalive_ctx_);
+        ggml_build_forward_expand(keepalive_graph_, sum);
+        keepalive_alloc_ = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend_.get()));
+        if (keepalive_alloc_ == nullptr ||
+            !ggml_gallocr_alloc_graph(keepalive_alloc_, keepalive_graph_)) {
+            if (keepalive_alloc_) { ggml_gallocr_free(keepalive_alloc_); keepalive_alloc_ = nullptr; }
+            ggml_free(keepalive_ctx_); keepalive_ctx_ = nullptr;
+            keepalive_graph_ = nullptr;
+            keepalive_us_ = 0;
+            return;
+        }
+        // Warm it once so the first real gap does not pay pipeline compilation.
+        ggml_backend_graph_compute(backend_.get(), keepalive_graph_);
+        fprintf(stderr, "wp keepalive enabled: every %d us while idle\n", keepalive_us_);
+    }
+
     void grow_io_buffer(size_t size, RequestStats & request_stats) {
         if (io_buffer_ && io_buffer_size_ >= size) {
             return;
         }
-        buffer_ptr buffer(ggml_backend_alloc_buffer(backend_.get(), size));
+        // GEOMETRIC GROWTH. This used to allocate EXACTLY `size`, so a run whose
+        // requests arrive at increasing n_tokens reallocated once per new high-
+        // water mark (observed: 65536 -> 81936 -> 81952 -> 131072 -> 163920).
+        // Only 5 allocations in a 64-token run -- but on Vulkan each one frees
+        // the previous device buffer, and that stalls: measured 1.59 s total,
+        // ~318 ms per growth, which amortised to 1.04 ms on EVERY request and
+        // was 95% of prepare_io on the RX 480 (vs 0.001 ms on CUDA, where frees
+        // are cheap). Doubling makes growth O(log n) instead of O(distinct
+        // sizes), and the floor means the common decode case allocates once.
+        static constexpr size_t IO_FLOOR = 1u << 20;   // 1 MiB: ~16 tokens of f32 activations
+        size_t want = std::max(size, IO_FLOOR);
+        if (io_buffer_ && want < io_buffer_size_ * 2) {
+            want = io_buffer_size_ * 2;
+        }
+        // n_device_allocs is shared with the gallocr growth in compute_batch, so
+        // it cannot say how many of these were io-buffer allocations. Time and
+        // count them explicitly: ns_prep_grow is a FIXED ~1.4 s total regardless
+        // of request count, so it is a few very expensive calls, not per-request.
+        const auto grow_t0 = std::chrono::steady_clock::now();
+        buffer_ptr buffer(ggml_backend_alloc_buffer(backend_.get(), want));
+        fprintf(stderr, "wp io-buffer grow #%llu: %zu -> %zu bytes, alloc took %.1f ms\n",
+                (unsigned long long) ++io_grow_count_, io_buffer_size_, want,
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - grow_t0).count() / 1000.0);
         if (!buffer) {
             throw std::runtime_error("failed to allocate persistent expert IO buffer");
         }
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         io_buffer_ = std::move(buffer);
-        io_buffer_size_ = size;
+        io_buffer_size_ = want;
         ++request_stats.n_device_allocs;
     }
 
@@ -1924,6 +2328,16 @@ private:
         if (!ctx) {
             throw std::runtime_error("failed to allocate expert IO metadata");
         }
+        // Sub-timers: prepare_io measured 1.53 ms/req on the RX 480 vs 0.07 on
+        // the 1070, and the io buffer is CONFIRMED host-visible (memcpy writes)
+        // under the size-split policy -- so the cost is not the upload. Split
+        // the function to find what it actually is.
+        auto sub = std::chrono::steady_clock::now();
+        auto sublap = [&request_stats, &sub](uint64_t & dst) {
+            const auto now = std::chrono::steady_clock::now();
+            dst += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(now - sub).count();
+            sub = now;
+        };
         ggml_tensor * input = ggml_new_tensor_2d(
             ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
         const ggml_backend_buffer_type_t buft =
@@ -1932,11 +2346,15 @@ private:
         const size_t alignment = ggml_backend_buft_get_alignment(buft);
         io_result_offset_ = GGML_PAD(input_size, alignment);
         const size_t result_size = ggml_backend_buft_get_alloc_size(buft, input);
+        sublap(request_stats.ns_prep_setup);
         grow_io_buffer(io_result_offset_ + result_size, request_stats);
+        sublap(request_stats.ns_prep_grow);
         attach_weight(
             input, io_buffer_.get(), ggml_backend_buffer_get_base(io_buffer_.get()), 0);
+        sublap(request_stats.ns_prep_attach);
         ggml_backend_tensor_set(
             input, activation.data(), 0, activation.size() * sizeof(float));
+        sublap(request_stats.ns_prep_set);
     }
 
     void compute_batch(
@@ -2074,6 +2492,7 @@ private:
     galloc_ptr     compute_galloc_;
     buffer_ptr     io_buffer_;
     size_t         io_buffer_size_ = 0;
+    uint64_t            io_grow_count_ = 0;
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
@@ -2140,7 +2559,65 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
         return 1;
     }
 
-    while (pipe_recv_frame(socket, type, seq_id, payload)) {
+    // WP_REQ_LOG=path -- one line per dispatch request. Columns:
+    //   layer n_exp n_hit n_miss bytes_read ns_wall ns_lookup ns_prep ns_hits
+    //   ns_wait ns_misscompute ns_result ns_read ns_h2d ns_submit ns_readback
+    //   ns_encode ns_send
+    // Segment into tokens by watching request.layer wrap back to its minimum.
+    FILE * const req_log = [] {
+        const char * p = std::getenv("WP_REQ_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    }();
+
+    // WP_REF_LOG=path -- the full REFERENCE stream: "<layer> <expert> <expert> ..."
+    // one line per request, every expert asked for whether it hit or missed.
+    // WP_MISS_LOG cannot substitute: which pages miss is a function of the
+    // replacement policy, so a miss trace can only ever describe the policy that
+    // produced it. The reference stream is policy-independent, which makes LRU /
+    // LFU / ARC / Belady all simulatable OFFLINE from a single run, at zero GPU
+    // cost per candidate -- and Belady gives the true ceiling, so we learn
+    // whether a policy change is worth implementing BEFORE implementing one.
+    FILE * const ref_log = [] {
+        const char * p = std::getenv("WP_REF_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    }();
+
+    // Keepalive pump: while no request is pending, occupy the GPU rather than
+    // let it idle (see Worker::keepalive_tick for the measurements). Gated on
+    // KEEPALIVE_IDLE_MS of recent activity so a genuinely idle worker still lets
+    // the card reach runtime suspend (D3), which is where its idle power saving
+    // comes from -- an unconditional pump would keep it awake forever.
+    const int keepalive_fd = socket.poll_fd();
+    const auto KEEPALIVE_IDLE_MS = std::chrono::milliseconds(2000);
+    auto last_request_at = std::chrono::steady_clock::now();
+    auto await_request = [&]() {
+        if (!worker.keepalive_enabled() || keepalive_fd < 0) {
+            return;
+        }
+        for (;;) {
+            struct pollfd pfd { keepalive_fd, POLLIN, 0 };
+            // ppoll, NOT poll: poll's timeout is in whole milliseconds, so a
+            // 200 us period silently became 1 ms and left the GPU idle for most
+            // of every interval. That cost us half the available win -- measured
+            // 0.319 ms/expert with the 1 ms pump against 0.163 in an isolated
+            // bench that occupied the device continuously.
+            const long ns = (long) worker.keepalive_us() * 1000L;
+            struct timespec ts { ns / 1000000000L, ns % 1000000000L };
+            const int r = ::ppoll(&pfd, 1, &ts, nullptr);
+            if (r != 0) {
+                return;   // data ready, or an error recv_data will surface
+            }
+            if (std::chrono::steady_clock::now() - last_request_at > KEEPALIVE_IDLE_MS) {
+                return;   // idle long enough: stop pumping, let the card sleep
+            }
+            worker.keepalive_tick();
+        }
+    };
+
+    // Comma operator so the pump runs before EVERY recv, including after the
+    // PING branch's `continue` -- appending it to the loop body would skip that.
+    while ((await_request(), pipe_recv_frame(socket, type, seq_id, payload))) {
+        last_request_at = std::chrono::steady_clock::now();
         if (type == PIPE_PING) {
             if (!pipe_send_frame(socket, PIPE_PONG, seq_id, nullptr, 0)) {
                 return 1;
@@ -2156,6 +2633,25 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 pipe_decode_expert_dispatch_req(
                     payload.data(), payload.size(), mine.n_embd);
             RequestStats request_stats;
+            // WP_REQ_LOG: per-request phase dump. The cumulative WorkerStats
+            // totals cannot separate "every request is uniformly slow" from
+            // "most are fast and a few are enormous", and on the RX 480 the
+            // per-token cost distribution is p25 140 / median 170 / max 1653 ms
+            // -- so the shape is the whole question. request.layer lets the
+            // reader segment this stream into tokens by layer wrap WITHOUT a
+            // cross-machine clock join (the spine runs on the other box); that
+            // is what made WP_MISS_LOG unusable for the same purpose.
+            if (ref_log != nullptr) {
+                fprintf(ref_log, "%d", request.layer);
+                for (const pipe_expert_assignment & a : request.assignments) {
+                    fprintf(ref_log, " %d", a.expert_id);
+                }
+                fputc('\n', ref_log);
+                fflush(ref_log);
+            }
+            const std::chrono::steady_clock::time_point req_started =
+                req_log != nullptr ? std::chrono::steady_clock::now() :
+                                     std::chrono::steady_clock::time_point();
             const pipe_expert_partial response = worker.dispatch(
                 request, request_stats);
             const bool measure = worker.stats_enabled();
@@ -2176,6 +2672,37 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 worker.record_stats(
                     request_stats, request.assignments.size());
             }
+            // Every phase field above is populated only when WP_WORKER_STATS=1,
+            // so this log is meaningless without it -- hence `measure &&`.
+            // fflush per line: the harness SIGKILLs workers at teardown, and an
+            // unflushed stdio buffer produced 0-byte files the first time.
+            if (measure && req_log != nullptr) {
+                const uint64_t ns_wall =
+                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - req_started).count();
+                const RequestStats & s = request_stats;
+                fprintf(req_log,
+                        "%d %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+                        "%llu %llu %llu %llu %llu %llu\n",
+                        request.layer, request.assignments.size(),
+                        (unsigned long long) s.n_hit,
+                        (unsigned long long) s.n_miss,
+                        (unsigned long long) s.bytes_read,
+                        (unsigned long long) ns_wall,
+                        (unsigned long long) s.ns_lookup,
+                        (unsigned long long) s.ns_prep,
+                        (unsigned long long) s.ns_hits,
+                        (unsigned long long) s.ns_wait,
+                        (unsigned long long) s.ns_miss_compute,
+                        (unsigned long long) s.ns_result,
+                        (unsigned long long) s.ns_read,
+                        (unsigned long long) s.ns_h2d,
+                        (unsigned long long) s.ns_submit,
+                        (unsigned long long) s.ns_readback,
+                        (unsigned long long) s.ns_encode,
+                        (unsigned long long) s.ns_send);
+                fflush(req_log);
+            }
         } catch (const pipe_protocol_error & error) {
             if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
                 return 1;
@@ -2189,6 +2716,25 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
 }
 
 } // namespace
+
+bool self_bench_stats(uint64_t & n, uint64_t & min_us, uint64_t & mean_us) {
+    if (g_probe.n == 0) return false;
+    n = g_probe.n;
+    min_us = g_probe.min_ns / 1000;
+    mean_us = g_probe.total_ns / g_probe.n / 1000;
+    return true;
+}
+
+void self_bench_tick(ggml_backend_t backend) {
+    if (!g_probe.ready) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_graph_compute(backend, g_probe.graph);
+    const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (ns < g_probe.min_ns) g_probe.min_ns = ns;
+    g_probe.total_ns += ns;
+    ++g_probe.n;
+}
 
 ResourcePlan inspect_resources(const Options & options) {
     if (options.slots <= 0 || options.device.empty()) {

@@ -62,7 +62,7 @@ from that asymmetry.
 | Routing distribution | sigmoid `noaux_tc`, **near-uniform** | model config |
 | Bytes fed per token | **7.33 GB** (8 × 75 × 12.22 MB) | derived |
 | NVMe main (SN850X, O_DIRECT) | **6.25 GB/s** | measured 2026-07-24 |
-| NVMe 2026 (SN550, O_DIRECT) | **3.08 GB/s** | measured 2026-07-24 |
+| NVMe 2026 (SN750, O_DIRECT) | **3.08 GB/s** | measured 2026-07-24 |
 | Inter-machine link | **104 MB/s**, RTT **0.5–0.6 ms** | measured 2026-07-24 |
 | RAM, main / 2026 | 15 GB total, **9 / 12 GB available** | measured today |
 | Disk free, main / 2026 | **98 GB** / 36 GB (**113 GB** if the 77 GB tail stage is removed) | measured today |

@@ -21,6 +21,7 @@
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -1485,7 +1486,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // WP_SPINE_STATS=1: time the spine's own graph compute. The expert
+    // dispatcher already reports its pack/issue/wait/unpack per token, but the
+    // DENSE side has only ever been known by subtracting that from eval time --
+    // two numbers measured in different places. This makes it direct:
+    //   dense = spine graph compute - dispatcher total
+    // (the dispatch custom op blocks INSIDE this call, so it is included here).
+    static const bool wp_spine_stats = getenv("WP_SPINE_STATS") != nullptr;
+    static uint64_t   wp_gc_ns = 0;
+    static uint64_t   wp_gc_n  = 0;
+    const auto wp_gc_t0 = wp_spine_stats ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (wp_spine_stats) {
+        wp_gc_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - wp_gc_t0).count();
+        if (++wp_gc_n % 16 == 0) {
+            LLAMA_LOG_WARN("spine: graph_compute n=%llu total=%.2f ms mean=%.2f ms/call\n",
+                           (unsigned long long) wp_gc_n, wp_gc_ns / 1e6,
+                           wp_gc_ns / 1e6 / (double) wp_gc_n);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

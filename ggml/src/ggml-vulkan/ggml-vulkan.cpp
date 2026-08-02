@@ -3517,8 +3517,42 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
+    // GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES: keep the host-visible-device-local
+    // preference (the BAR) for allocations up to N bytes, and force larger ones
+    // straight to plain device-local.
+    //
+    // WHY. On a card without ReBAR the host-visible device-local heap IS the
+    // small BAR window (256 MB on an RX 480). AMD does not fail an
+    // oversubscribed allocation there -- it migrates to GTT -- so bulk weight
+    // buffers past the window silently land in system RAM and every matmul
+    // against them streams over PCIe (measured 2026-08-01: 190 us -> 1413 us for
+    // one expert group). GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM avoids that, but it
+    // is all-or-nothing: it also pushes SMALL, frequently-rewritten buffers out
+    // of the BAR, and writing those then costs a staging copy + submit + fence
+    // instead of a memcpy (measured: a 16 KB per-request activation upload went
+    // 0.05 ms -> 1.69 ms, +2.44 s over a 64-token run).
+    // A size split gets both: small buffers keep memcpy writes, bulk weights keep
+    // real VRAM bandwidth. Unset (0) preserves the previous behaviour exactly.
+    static const size_t host_visible_max = [] {
+        const char * e = getenv("GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES");
+        return (e != nullptr && e[0] != '\0') ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
+    }();
+    const bool force_device_local = host_visible_max != 0 && size > host_visible_max;
+    // GGML_VK_ALLOC_LOG=1: report every device buffer and whether it ended up
+    // host-visible (memcpy writes) or device-local-only (staging + submit +
+    // fence per write, ggml_vk_buffer_write_2d).
+    const bool alloc_log = getenv("GGML_VK_ALLOC_LOG") != nullptr;
     try {
-        if (device->prefer_host_memory) {
+        if (force_device_local) {
+            // Large: never take the BAR. Mirrors the disable_host_visible_vidmem
+            // branch below, including its sysmem-fallback behaviour.
+            if (device->allow_sysmem_fallback) {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+            } else {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            }
+        } else if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal});
         } else if (device->uma) {
@@ -3544,6 +3578,12 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eDeviceLocal});
             }
+        }
+        if (alloc_log && buf) {
+            const bool hv = (bool) (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible);
+            std::cerr << "ggml_vulkan: alloc " << size << " bytes -> "
+                      << (hv ? "HOST_VISIBLE (memcpy writes)" : "device-local only (staged writes)")
+                      << (force_device_local ? " [forced by size split]" : "") << std::endl;
         }
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Device memory allocation of size " << size << " failed." << std::endl;

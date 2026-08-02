@@ -1835,6 +1835,21 @@ const int8_t kvalues_mxfp4_const[16] = {
     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
 };
 
+// This 16-entry LDS table LOOKS like an obvious optimisation target -- it is
+// only four LDS dwords, every lane indexes it with data-dependent values, and
+// the resulting bank conflicts would scale with wave width. That story even fits
+// the measurements (RX 480 wave64 0.604 ms/expert vs GTX 1070 under Vulkan
+// warp32 0.240 ms, on two cards with the SAME 256 GB/s bandwidth).
+//
+// IT IS WRONG. Replacing both lookups with pure VALU (magnitudes {0,1,2,3,4,6,8,
+// 12} packed one per nibble in 0xC8643210, sign from bit 3) was MEASURED SLOWER
+// on 2026-08-02, on both cards, warm shader cache, 5 repeats:
+//     RX 480       187-190 us/expert -> 226-229  (+21%)
+//     1070 Vulkan  205-211           -> 241-250  (+18%)
+// ds_read_u8 is cheap on GCN and its latency hides under other waves; the shift+
+// and+convert+select that replaces it is strictly more work, and this kernel is
+// not LDS-bound. Correctness was fine (test-backend-ops 991/991), so a green
+// test run is NOT evidence the change was worth making. Do not redo this.
 shared int8_t kvalues_mxfp4[16];
 #endif
 

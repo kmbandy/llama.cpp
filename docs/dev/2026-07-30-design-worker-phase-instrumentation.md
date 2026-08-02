@@ -57,10 +57,10 @@ expert dispatch worker 100.102.191.30:8804  ...
 |---|---|---|
 | one worker's avg ≫ others | that machine/backend/drive is the pace-setter | fix or rebalance that one |
 | all three roughly equal | the cost is structural, common to every worker | Part B decomposition |
-| R9700 fast, 2026 pair slow and equal | the two 2026 workers are contending on one SN550 | rebalance shard split |
+| R9700 fast, 2026 pair slow and equal | the two 2026 workers are contending on one SN750 | rebalance shard split |
 
 The third case is a live possibility we have never tested: the 1070 and RX 480 share a
-single SN550 at 3.08 GB/s while the R9700 has an SN850X at 6.25 GB/s to itself.
+single SN750 at 3.08 GB/s while the R9700 has an SN850X at 6.25 GB/s to itself.
 
 ## 3. Part B — worker-side phase timer
 

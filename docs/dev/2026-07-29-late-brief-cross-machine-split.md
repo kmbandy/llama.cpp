@@ -187,7 +187,10 @@ main  6.25 GB/s (O_DIRECT pool)      2026  3.08 GB/s (QD8), 2.1 GB/s (QD1)
 2026 target share = 3.08/(6.25+3.08) = 33.0%   ->  band 55-77 gives 32.0%
 ```
 
-2026's drive is a **WD SN550 250 GB**, DRAM-less, and is the *same SSD that hosts
+2026's drive is a **WD Black SN750 250 GB** (`WDS250G3X0C-00SJG0`, DRAM-backed --
+an earlier revision of this brief called it a DRAM-less SN550, which was wrong on
+both counts). Its ~3.1 GB/s rated sequential read matches the 3.08 GB/s measured
+here, so the drive is AT SPEC, not underperforming. It is the *same SSD that hosts
 the MCP, dashboard and mneme daemon*. Its band must always leave that box real
 headroom. Alternatives considered: 53-77 gave a better 34.6% share but left only
 21 GB free.

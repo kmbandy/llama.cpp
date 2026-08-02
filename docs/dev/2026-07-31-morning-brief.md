@@ -113,7 +113,7 @@ All measured 2026-07-30, all reproducible with the harnesses in §7.
 | per-layer scheduler barriers / GPU pipeline drains | **refuted** | dispatch `total` ≈ entire eval time; the gap outside the op is ~0 |
 | cross-worker serialization | **refuted** | `first_await_in_flight` = 2.6–2.7 of 3; requests are issued before awaiting |
 | cache coverage / slot count | **refuted** | miss rates equal across very different coverage |
-| NVMe contention as the primary cause | **refuted** | giving the 1070 the SN550 alone improved per-expert only ~20%, not the ~5× gap |
+| NVMe contention as the primary cause | **refuted** | giving the 1070 the SN750 alone improved per-expert only ~20%, not the ~5× gap |
 | expert arithmetic / GPU generation | **mostly refuted** | arithmetic is 4% of the budget; 0.34 ms/expert, ~7× above roofline |
 | "2026 workers want MORE experts per request to amortize fixed cost" | **refuted** | fixed is 1.96 ms/req vs 3.93 ms/expert marginal — marginal dominates |
 

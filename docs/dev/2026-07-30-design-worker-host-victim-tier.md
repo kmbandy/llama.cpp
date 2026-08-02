@@ -17,8 +17,8 @@ Meanwhile, measured tonight:
 | worker | miss rate | read ms/expert | effective GB/s | drive rating |
 |---|---|---|---|---|
 | R9700 `:8801` | 46.0% | 1.012 | 5.55 | 6.25 (89%) |
-| 1070 `:8803` | 53.4% | 2.965 | 2.20 | shared SN550 ~3.08 |
-| RX 480 `:8804` | 49.4% | 3.504 | 1.72 | shared SN550 ~3.08 |
+| 1070 `:8803` | 53.4% | 2.965 | 2.20 | shared SN750 ~3.08 |
+| RX 480 `:8804` | 49.4% | 3.504 | 1.72 | shared SN750 ~3.08 |
 
 **mad-lab-2026's combined read is 3.92 GB/s against a ~3.08 GB/s drive — saturated.
 mad-lab-main is at 89% of rating.** Both machines are storage-constrained while

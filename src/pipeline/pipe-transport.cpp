@@ -115,6 +115,10 @@ bool pipe_socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
+int pipe_socket_t::poll_fd() const {
+    return pimpl ? (int) pimpl->fd : -1;
+}
+
 static bool is_valid_fd(sockfd_t sockfd) {
 #ifdef _WIN32
     return sockfd != INVALID_SOCKET;
