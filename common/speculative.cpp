@@ -2343,7 +2343,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    // MAD-LAB: reserve one output row per sequence plus the largest speculative block.
+    result.n_outputs_max = std::max<uint32_t>(1, std::min<uint64_t>(
+        params.n_batch, (uint64_t) params.n_parallel * (1 + common_speculative_n_max(&params.speculative))));
 
     return result;
 }
