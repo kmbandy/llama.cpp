@@ -135,6 +135,8 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.empty()) {
             throw std::runtime_error("DeepSeek-V4 DSpark model has no target_layers metadata");
         }
+        // MAD-LAB: DS4 encoder input uses one collapsed n_embd tap per target layer.
+        hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
         ml.get_key(LLM_KV_BLOCK_SIZE, dflash_block_size);
         dflash_hc_mult = hparams.dsv4_hc_mult;
     }
