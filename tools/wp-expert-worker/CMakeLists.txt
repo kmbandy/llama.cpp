@@ -2,6 +2,7 @@ set(TARGET llama-wp-expert-worker-lib)
 
 add_library(${TARGET}
     wp-expert-worker.cpp
+    ${CMAKE_SOURCE_DIR}/src/weight-pager/wp-router.cpp
     ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
 )
 target_include_directories(${TARGET} PUBLIC

@@ -292,8 +292,9 @@ private:
 ResourcePlan plan_resources(
         const std::vector<ResourcePage> & pages,
         int requested_slots,
-        uint64_t host_budget_bytes) {
-    if (pages.empty() || requested_slots <= 0) {
+        uint64_t host_budget_bytes,
+        uint64_t pinned_bytes) {
+    if (requested_slots <= 0) {
         throw std::invalid_argument("invalid expert resource plan dimensions");
     }
 
@@ -302,12 +303,14 @@ ResourcePlan plan_resources(
     uint64_t max_page_size = 0;
     for (const ResourcePage & page : pages) {
         if (page.layer < 0 || page.size == 0 ||
-            histogram[page.size] == std::numeric_limits<int>::max() ||
-            layer_counts[page.size][page.layer] == std::numeric_limits<int>::max()) {
+            (!page.pinned && (histogram[page.size] == std::numeric_limits<int>::max() ||
+             layer_counts[page.size][page.layer] == std::numeric_limits<int>::max()))) {
             throw std::invalid_argument("invalid expert resource page");
         }
-        ++histogram[page.size];
-        ++layer_counts[page.size][page.layer];
+        if (!page.pinned) {
+            ++histogram[page.size];
+            ++layer_counts[page.size][page.layer];
+        }
         max_page_size = std::max(max_page_size, page.size);
     }
     if (max_page_size >
@@ -319,6 +322,17 @@ ResourcePlan plan_resources(
     result.requested_slots      = requested_slots;
     result.device_budget_bytes =
         max_page_size * (uint64_t) requested_slots;
+    result.pinned_bytes = pinned_bytes;
+    if (pinned_bytes > result.device_budget_bytes) {
+        throw std::invalid_argument("resident expert bytes exceed device budget");
+    }
+    result.slot_budget_bytes = result.device_budget_bytes - pinned_bytes;
+
+    if (histogram.empty()) {
+        result.host_budget_bytes = host_budget_bytes;
+        result.staging_buffers = 0;
+        return result;
+    }
 
     uint64_t    total_pages   = 0;
     long double weighted_bytes = 0.0;
@@ -341,12 +355,12 @@ ResourcePlan plan_resources(
         classes.push_back({ item.first, 0, floor, item.second });
     }
 
-    bool use_size_classes = floor_bytes <= result.device_budget_bytes;
+    bool use_size_classes = floor_bytes <= result.slot_budget_bytes;
     if (use_size_classes) {
         const long double average =
             weighted_bytes / (long double) total_pages;
         const long double remaining =
-            (long double) (result.device_budget_bytes - floor_bytes);
+            (long double) (result.slot_budget_bytes - floor_bytes);
         const long double remaining_slots = remaining / average;
         for (SlotClass & slot_class : classes) {
             const long double fraction =
@@ -367,7 +381,7 @@ ResourcePlan plan_resources(
             }
             return bytes;
         };
-        while (planned_bytes() > result.device_budget_bytes) {
+        while (planned_bytes() > result.slot_budget_bytes) {
             SlotClass * trim = nullptr;
             for (SlotClass & slot_class : classes) {
                 const int keep = std::max(1, slot_class.pin_floor);
@@ -388,16 +402,20 @@ ResourcePlan plan_resources(
         int max_layer_pages = 0;
         std::map<int, int> pages_by_layer;
         for (const ResourcePage & page : pages) {
+            if (page.pinned) {
+                continue;
+            }
             max_layer_pages =
                 std::max(max_layer_pages, ++pages_by_layer[page.layer]);
         }
-        if (requested_slots < max_layer_pages) {
+        if (result.slot_budget_bytes / max_page_size < (uint64_t) max_layer_pages) {
             throw std::invalid_argument(
                 "expert slot budget is smaller than the largest layer request");
         }
         classes.clear();
         classes.push_back({
-            max_page_size, requested_slots, max_layer_pages, (int) pages.size()
+            max_page_size, (int) (result.slot_budget_bytes / max_page_size),
+            max_layer_pages, (int) total_pages
         });
     }
 
@@ -489,6 +507,9 @@ struct ExpertPage {
     uint64_t                          offset = 0;
     uint64_t                          size   = 0;
     std::map<std::string, MemberSpan> roles;
+    bool                              is_resident = false;
+    ggml_backend_buffer_t             resident_buffer = nullptr;
+    void *                            resident_base = nullptr;
 };
 
 struct Catalog {
@@ -1039,7 +1060,8 @@ std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
     std::vector<ResourcePage> result;
     result.reserve(catalog.pages.size());
     for (const auto & item : catalog.pages) {
-        result.push_back({ item.second.layer, item.second.size });
+        result.push_back({ item.second.layer, item.second.size,
+                           item.second.is_resident });
     }
     return result;
 }
@@ -1226,6 +1248,111 @@ private:
     std::condition_variable                         available_cv_;
 };
 
+class ResidentExpertPool {
+public:
+    ResidentExpertPool(ggml_backend_t backend, Catalog & catalog,
+                       const std::vector<int> & blocks) :
+        backend_(backend) {
+        for (auto & item : catalog.pages) {
+            ExpertPage & page = item.second;
+            if (!std::binary_search(blocks.begin(), blocks.end(), page.layer)) {
+                continue;
+            }
+            Allocation allocation;
+            allocation.buffer.reset(ggml_backend_alloc_buffer(
+                backend_, (size_t) page.size));
+            if (!allocation.buffer) {
+                throw std::runtime_error("failed to allocate resident expert page");
+            }
+            ggml_backend_buffer_set_usage(
+                allocation.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            allocation.ctx.reset(ggml_init({
+                /* .mem_size = */ ggml_tensor_overhead() * 2,
+                /* .mem_buffer = */ nullptr,
+                /* .no_alloc = */ true,
+            }));
+            if (!allocation.ctx) {
+                throw std::runtime_error("failed to allocate resident expert metadata");
+            }
+            allocation.raw = ggml_new_tensor_1d(
+                allocation.ctx.get(), GGML_TYPE_I8, (int64_t) page.size);
+            allocation.raw->buffer = allocation.buffer.get();
+            allocation.raw->data = ggml_backend_buffer_get_base(allocation.buffer.get());
+            if (allocation.raw->data == nullptr ||
+                ggml_backend_buffer_init_tensor(
+                    allocation.buffer.get(), allocation.raw) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to initialize resident expert page");
+            }
+
+            void * host = nullptr;
+            if (posix_memalign(&host, DIRECT_ALIGNMENT, (size_t) page.size) != 0) {
+                throw std::runtime_error("failed to allocate resident expert staging");
+            }
+            try {
+                read_once(page, host);
+                ggml_backend_tensor_set(
+                    allocation.raw, host, 0, (size_t) page.size);
+            } catch (...) {
+                std::free(host);
+                throw;
+            }
+            std::free(host);
+
+            page.is_resident = true;
+            page.resident_buffer = allocation.buffer.get();
+            page.resident_base = allocation.raw->data;
+            pinned_bytes_ += page.size;
+            ++pinned_pages_;
+            allocations_.push_back(std::move(allocation));
+        }
+        if (pinned_pages_ != 0) {
+            ggml_backend_synchronize(backend_);
+        }
+    }
+
+    uint64_t pinned_bytes() const { return pinned_bytes_; }
+    int pinned_pages() const { return pinned_pages_; }
+
+private:
+    struct Allocation {
+        buffer_ptr buffer;
+        context_ptr ctx;
+        ggml_tensor * raw = nullptr;
+    };
+
+    static void read_once(const ExpertPage & page, void * dst) {
+#if defined(__linux__)
+        const int fd = open(page.blob.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (fd < 0) {
+            throw std::runtime_error(
+                "failed to open resident expert shard " + page.blob.string() +
+                ": " + std::strerror(errno));
+        }
+        ssize_t n = -1;
+        do {
+            n = pread(fd, dst, (size_t) page.size, (off_t) page.offset);
+        } while (n < 0 && errno == EINTR);
+        const int saved_errno = errno;
+        close(fd);
+        if (n < 0 || (uint64_t) n != page.size) {
+            throw std::runtime_error(
+                "short resident expert read from " + page.blob.string() +
+                ": got " + std::to_string(n) + " want " +
+                std::to_string(page.size) + " (" + std::strerror(saved_errno) + ")");
+        }
+#else
+        (void) page;
+        (void) dst;
+        throw std::runtime_error("resident expert loading requires Linux");
+#endif
+    }
+
+    ggml_backend_t backend_ = nullptr;
+    std::vector<Allocation> allocations_;
+    uint64_t pinned_bytes_ = 0;
+    int pinned_pages_ = 0;
+};
+
 class ExpertSlotPool {
 private:
     struct PageIn {
@@ -1263,8 +1390,9 @@ public:
         resources_(std::move(resources)),
         staging_(resources_, backend),
         test_hooks_(test_hooks) {
-        if (resources_.slot_count <= 0 ||
-            resources_.staging_buffer_bytes == 0 ||
+        if (resources_.slot_count < 0 ||
+            (resources_.slot_count == 0 && resources_.pinned_bytes == 0) ||
+            (resources_.slot_count > 0 && resources_.staging_buffer_bytes == 0) ||
             resources_.staging_buffer_bytes >
                 (uint64_t) std::numeric_limits<size_t>::max()) {
             throw std::runtime_error("invalid expert slot pool dimensions");
@@ -1452,6 +1580,16 @@ public:
                     }
                 }
                 if (slot_index == slots_.size()) {
+                    if (page.is_resident) {
+                        batch.entries_[i] = {
+                            { page.resident_buffer, page.resident_base },
+                            std::numeric_limits<size_t>::max(),
+                            true,
+                            true,
+                        };
+                        ++batch.n_resident_;
+                        continue;
+                    }
                     pageins.push_back(i);
                     continue;
                 }
@@ -2002,13 +2140,16 @@ public:
             int slots,
             uint64_t host_budget_bytes,
             uint64_t host_victim_bytes,
-            TestHooks * test_hooks) :
+            TestHooks * test_hooks,
+            const std::vector<int> & resident_expert_blocks) :
         catalog_(std::move(catalog)),
         backend_(init_backend(device)),
+        resident_(backend_.get(), catalog_, resident_expert_blocks),
         pool_(
             backend_.get(),
             plan_resources(
-                resource_pages(catalog_), slots, host_budget_bytes),
+                resource_pages(catalog_), slots, host_budget_bytes,
+                resident_.pinned_bytes()),
             host_victim_bytes,
             test_hooks),
         compute_galloc_(ggml_gallocr_new(
@@ -2018,6 +2159,12 @@ public:
             throw std::runtime_error("failed to create expert graph allocator");
         }
         stats_.set_staging_kind(pool_.staging_kind());
+        std::cerr << "WARN wp expert worker: pinned_pages="
+                  << resident_.pinned_pages()
+                  << " pinned_bytes=" << pool_.resources().pinned_bytes
+                  << " slot_count=" << pool_.resources().slot_count
+                  << " slot_budget_bytes=" << pool_.resources().slot_budget_bytes
+                  << std::endl;
         // Runs only under WP_SELF_BENCH=1; no-op otherwise. Placed after the
         // slot pool is built so the backend is in the same state it will serve
         // requests in.
@@ -2215,6 +2362,10 @@ public:
 
     const ResourcePlan & resources() const {
         return pool_.resources();
+    }
+
+    int pinned_pages() const {
+        return resident_.pinned_pages();
     }
 
     bool stats_enabled() const {
@@ -2488,6 +2639,7 @@ private:
 
     Catalog        catalog_;
     backend_ptr    backend_;
+    ResidentExpertPool resident_;
     ExpertSlotPool pool_;
     galloc_ptr     compute_galloc_;
     buffer_ptr     io_buffer_;
@@ -2748,7 +2900,8 @@ ResourcePlan inspect_resources(const Options & options) {
         options.slots,
         options.host_budget_bytes,
         options.host_victim_bytes,
-        options.test_hooks);
+        options.test_hooks,
+        options.resident_expert_blocks);
     return worker.resources();
 }
 
@@ -2766,7 +2919,8 @@ int run(const Options & options) {
         options.slots,
         options.host_budget_bytes,
         options.host_victim_bytes,
-        options.test_hooks);
+        options.test_hooks,
+        options.resident_expert_blocks);
     const pipe_expert_hello advertised = worker.hello();
     const ResourcePlan & resources = worker.resources();
 
@@ -2783,6 +2937,9 @@ int run(const Options & options) {
               << advertised.expert_last << " layers=" << advertised.layers.size()
               << " slots=" << advertised.n_slots
               << " requested_slots=" << resources.requested_slots
+              << " pinned_pages=" << worker.pinned_pages()
+              << " pinned_bytes=" << resources.pinned_bytes
+              << " slot_budget_bytes=" << resources.slot_budget_bytes
               << " device_bytes=" << resources.device_bytes
               << " size_classes=" << (resources.size_classes ? 1 : 0)
               << " staging=" << resources.staging_buffers << "x"
