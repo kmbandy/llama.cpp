@@ -72,6 +72,8 @@ struct RequestStats {
     uint64_t n_host_hit = 0;
     uint64_t n_host_demote = 0;
     uint64_t bytes_read = 0;
+    uint64_t n_pagein_reserved = 0;
+    uint64_t n_pagein_general = 0;
     uint64_t ns_host_get = 0;
     uint64_t host_bytes = 0;
     uint64_t n_graph_submits = 0;
@@ -133,6 +135,8 @@ public:
         ns_send_ += request.ns_send;
         n_resident_ += request.n_resident;
         n_pagein_ += request.n_pagein;
+        n_pagein_reserved_ += request.n_pagein_reserved;
+        n_pagein_general_ += request.n_pagein_general;
         n_host_hit_ += request.n_host_hit;
         n_host_demote_ += request.n_host_demote;
         bytes_read_ += request.bytes_read;
@@ -200,6 +204,8 @@ private:
                   << " n_experts=" << n_experts_
                   << " n_resident=" << n_resident_
                   << " n_pagein=" << n_pagein_
+                  << " n_pagein_reserved=" << n_pagein_reserved_
+                  << " n_pagein_general=" << n_pagein_general_
                   << " n_host_hit=" << n_host_hit_
                   << " n_host_demote=" << n_host_demote_
                   << " bytes_read=" << bytes_read_
@@ -262,6 +268,8 @@ private:
     uint64_t          ns_send_    = 0;
     uint64_t          n_resident_      = 0;
     uint64_t          n_pagein_     = 0;
+    uint64_t          n_pagein_reserved_ = 0;
+    uint64_t          n_pagein_general_ = 0;
     uint64_t          n_host_hit_ = 0;
     uint64_t          n_host_demote_ = 0;
     uint64_t          bytes_read_ = 0;
@@ -293,7 +301,9 @@ ResourcePlan plan_resources(
         const std::vector<ResourcePage> & pages,
         int requested_slots,
         uint64_t host_budget_bytes,
-        uint64_t pinned_bytes) {
+        uint64_t pinned_bytes,
+        const std::vector<int> & reserve_blocks,
+        uint64_t reserve_bytes) {
     if (requested_slots <= 0) {
         throw std::invalid_argument("invalid expert resource plan dimensions");
     }
@@ -429,6 +439,39 @@ ResourcePlan plan_resources(
         result.slot_count += slot_class.slots;
         result.device_bytes +=
             slot_class.size * (uint64_t) slot_class.slots;
+    }
+    if (reserve_bytes != 0 && !reserve_blocks.empty()) {
+        result.requested_reserved_bytes = reserve_bytes;
+        uint64_t named_bytes = 0;
+        for (const ResourcePage & page : pages) {
+            if (!page.pinned && std::binary_search(reserve_blocks.begin(), reserve_blocks.end(), page.layer)) {
+                if (named_bytes > UINT64_MAX - page.size) named_bytes = UINT64_MAX;
+                else named_bytes += page.size;
+            }
+        }
+        const uint64_t target = std::min(reserve_bytes, named_bytes);
+        result.named_reservable_bytes = named_bytes;
+        uint64_t remaining = target;
+        int slot_index = 0;
+        for (const SlotClass & slot_class : result.slot_classes) {
+            const int class_start = slot_index;
+            for (int i = 0; i < slot_class.slots && remaining >= slot_class.size; ++i) {
+                result.reserved_slot_indices.push_back(class_start + i);
+                result.reserved_bytes += slot_class.size;
+                remaining -= slot_class.size;
+            }
+            slot_index += slot_class.slots;
+        }
+        result.reserved_slot_count = (int) result.reserved_slot_indices.size();
+        result.general_slot_count = result.slot_count - result.reserved_slot_count;
+        if (target != 0 && result.reserved_bytes == 0) {
+            result.reserved_slot_indices.clear();
+            result.reserved_slot_count = 0;
+            result.general_slot_count = result.slot_count;
+        }
+    }
+    if (result.general_slot_count == 0 && result.reserved_slot_count == 0) {
+        result.general_slot_count = result.slot_count;
     }
 
     if (max_page_size >
@@ -1385,11 +1428,14 @@ private:
 public:
     ExpertSlotPool(
             ggml_backend_t backend, ResourcePlan resources,
-            uint64_t host_victim_bytes, TestHooks * test_hooks) :
+            uint64_t host_victim_bytes, TestHooks * test_hooks,
+            const std::vector<int> & reserve_blocks) :
         backend_(backend),
         resources_(std::move(resources)),
         staging_(resources_, backend),
         test_hooks_(test_hooks) {
+        reserve_blocks_ = reserve_blocks;
+        std::sort(reserve_blocks_.begin(), reserve_blocks_.end());
         if (resources_.slot_count < 0 ||
             (resources_.slot_count == 0 && resources_.pinned_bytes == 0) ||
             (resources_.slot_count > 0 && resources_.staging_buffer_bytes == 0) ||
@@ -1413,9 +1459,12 @@ public:
         }
         slots_.reserve((size_t) resources_.slot_count);
         resources_.device_bytes = 0;
+        std::set<int> reserved_indices(resources_.reserved_slot_indices.begin(),
+                                       resources_.reserved_slot_indices.end());
         for (const SlotClass & slot_class : resources_.slot_classes) {
             for (int i = 0; i < slot_class.slots; ++i) {
                 slots_.push_back(make_slot(slot_class.size));
+                slots_.back().reserved = reserved_indices.count((int) slots_.size() - 1) != 0;
                 resources_.device_bytes +=
                     ggml_backend_buffer_get_size(slots_.back().buffer.get());
             }
@@ -1506,6 +1555,9 @@ public:
             return n_pagein_;
         }
 
+        uint64_t n_pagein_reserved() const { return n_pagein_reserved_; }
+        uint64_t n_pagein_general() const { return n_pagein_general_; }
+
         uint64_t bytes_read() const {
             return bytes_read_;
         }
@@ -1549,6 +1601,8 @@ public:
         uint64_t                   ns_read_   = 0;
         uint64_t                   n_resident_     = 0;
         uint64_t                   n_pagein_    = 0;
+        uint64_t                   n_pagein_reserved_ = 0;
+        uint64_t                   n_pagein_general_ = 0;
         uint64_t                   bytes_read_ = 0;
         uint64_t                   n_host_hit_ = 0;
         uint64_t                   n_host_demote_ = 0;
@@ -1610,7 +1664,7 @@ public:
             // allocations in this request cannot select an earlier pagein.
             for (size_t entry_index : pageins) {
                 const ExpertPage & page = *pages[entry_index];
-                const size_t slot_index = select_victim(page.size);
+                    const size_t slot_index = select_victim(page);
                 if (slot_index == slots_.size()) {
                     throw std::runtime_error(
                         "no expert slot can hold requested page");
@@ -1697,6 +1751,11 @@ public:
                             entry_index, slot_index, &page, fd_for(page.blob)
                         });
                         ++batch.n_pagein_;
+                        if (std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer)) {
+                            ++batch.n_pagein_reserved_;
+                        } else {
+                            ++batch.n_pagein_general_;
+                        }
                         batch.bytes_read_ += page.size;
                         if (test_hooks_ != nullptr &&
                             test_hooks_->slot_reserved) {
@@ -1761,6 +1820,7 @@ private:
         uint64_t            size      = 0;
         uint64_t            tick      = 0;
         int                 pin_count = 0;
+        bool                reserved  = false;
         bool                valid     = false;
     };
 
@@ -1769,11 +1829,15 @@ private:
             host_tier_.store_from_device(slot.cache_id, slot.raw->data, (size_t) slot.size);
     }
 
-    size_t select_victim(uint64_t page_size) const {
+    size_t select_victim(const ExpertPage & page) const {
+        const uint64_t page_size = page.size;
+        const bool wants_reserved = std::binary_search(reserve_blocks_.begin(), reserve_blocks_.end(), page.layer);
         size_t victim = slots_.size();
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
             if (slot.pin_count != 0 || slot.valid ||
+                (!wants_reserved && slot.reserved) ||
+                (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
                 continue;
             }
@@ -1786,9 +1850,20 @@ private:
             return victim;
         }
 
+        if (wants_reserved) {
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                const Slot & slot = slots_[i];
+                if (slot.pin_count != 0 || slot.valid || slot.reserved || page_size > slot.capacity) continue;
+                if (victim == slots_.size() || slot.capacity < slots_[victim].capacity) victim = i;
+            }
+            if (victim != slots_.size()) return victim;
+        }
+
         for (size_t i = 0; i < slots_.size(); ++i) {
             const Slot & slot = slots_[i];
             if (slot.pin_count != 0 || !slot.valid ||
+                (!wants_reserved && slot.reserved) ||
+                (wants_reserved && !slot.reserved) ||
                 page_size > slot.capacity) {
                 continue;
             }
@@ -1797,6 +1872,14 @@ private:
                 (slot.capacity == slots_[victim].capacity &&
                  slot.tick < slots_[victim].tick)) {
                 victim = i;
+            }
+        }
+        if (wants_reserved && victim == slots_.size()) {
+            for (size_t i = 0; i < slots_.size(); ++i) {
+                const Slot & slot = slots_[i];
+                if (slot.pin_count != 0 || !slot.valid || page_size > slot.capacity) continue;
+                if (victim == slots_.size() || slot.capacity < slots_[victim].capacity ||
+                    (slot.capacity == slots_[victim].capacity && slot.tick < slots_[victim].tick)) victim = i;
             }
         }
         return victim;
@@ -2086,6 +2169,7 @@ private:
     bool                       host_victim_enabled_ = false;
     uint64_t                   tick_ = 0;
     std::vector<Slot>          slots_;
+    std::vector<int>           reserve_blocks_;
     std::map<std::string, int> fds_;
 };
 
@@ -2099,6 +2183,8 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_read_(other.ns_read_),
     n_resident_(other.n_resident_),
     n_pagein_(other.n_pagein_),
+    n_pagein_reserved_(other.n_pagein_reserved_),
+    n_pagein_general_(other.n_pagein_general_),
     bytes_read_(other.bytes_read_),
     n_host_hit_(other.n_host_hit_),
     n_host_demote_(other.n_host_demote_),
@@ -2141,7 +2227,9 @@ public:
             uint64_t host_budget_bytes,
             uint64_t host_victim_bytes,
             TestHooks * test_hooks,
-            const std::vector<int> & resident_expert_blocks) :
+            const std::vector<int> & resident_expert_blocks,
+            const std::vector<int> & expert_reserve_blocks,
+            uint64_t expert_reserve_bytes) :
         catalog_(std::move(catalog)),
         backend_(init_backend(device)),
         resident_(backend_.get(), catalog_, resident_expert_blocks),
@@ -2149,9 +2237,10 @@ public:
             backend_.get(),
             plan_resources(
                 resource_pages(catalog_), slots, host_budget_bytes,
-                resident_.pinned_bytes()),
+                resident_.pinned_bytes(), expert_reserve_blocks,
+                expert_reserve_bytes),
             host_victim_bytes,
-            test_hooks),
+            test_hooks, expert_reserve_blocks),
         compute_galloc_(ggml_gallocr_new(
             ggml_backend_get_default_buffer_type(backend_.get()))),
         slots_(pool_.resources().slot_count) {
@@ -2165,6 +2254,17 @@ public:
                   << " slot_count=" << pool_.resources().slot_count
                   << " slot_budget_bytes=" << pool_.resources().slot_budget_bytes
                   << std::endl;
+        if (pool_.resources().requested_reserved_bytes != 0) {
+            std::cerr << "WARN wp expert worker: reserved_bytes="
+                      << pool_.resources().reserved_bytes
+                      << " reserved_slots=" << pool_.resources().reserved_slot_count
+                      << " general_slots=" << pool_.resources().general_slot_count
+                      << std::endl;
+            if (pool_.resources().named_reservable_bytes < pool_.resources().requested_reserved_bytes) {
+                std::cerr << "WARN wp expert worker: reservation clamped to named pageable bytes="
+                          << pool_.resources().named_reservable_bytes << std::endl;
+            }
+        }
         // Runs only under WP_SELF_BENCH=1; no-op otherwise. Placed after the
         // slot pool is built so the backend is in the same state it will serve
         // requests in.
@@ -2282,6 +2382,8 @@ public:
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
             request_stats.n_pagein     = batch.n_pagein();
+            request_stats.n_pagein_reserved = batch.n_pagein_reserved();
+            request_stats.n_pagein_general = batch.n_pagein_general();
             request_stats.n_host_hit = batch.n_host_hit();
             request_stats.n_host_demote = batch.n_host_demote();
             request_stats.bytes_read = batch.bytes_read();
@@ -2901,7 +3003,8 @@ ResourcePlan inspect_resources(const Options & options) {
         options.host_budget_bytes,
         options.host_victim_bytes,
         options.test_hooks,
-        options.resident_expert_blocks);
+        options.resident_expert_blocks, options.expert_reserve_blocks,
+        options.expert_reserve_bytes);
     return worker.resources();
 }
 
@@ -2920,7 +3023,8 @@ int run(const Options & options) {
         options.host_budget_bytes,
         options.host_victim_bytes,
         options.test_hooks,
-        options.resident_expert_blocks);
+        options.resident_expert_blocks, options.expert_reserve_blocks,
+        options.expert_reserve_bytes);
     const pipe_expert_hello advertised = worker.hello();
     const ResourcePlan & resources = worker.resources();
 

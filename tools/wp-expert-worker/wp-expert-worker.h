@@ -26,6 +26,12 @@ struct ResourcePlan {
     int                    slot_count            = 0;
     uint64_t               device_budget_bytes  = 0;
     uint64_t               slot_budget_bytes    = 0;
+    uint64_t               reserved_bytes      = 0;
+    uint64_t               requested_reserved_bytes = 0;
+    uint64_t               named_reservable_bytes = 0;
+    int                    reserved_slot_count = 0;
+    int                    general_slot_count  = 0;
+    std::vector<int>       reserved_slot_indices;
     uint64_t               pinned_bytes         = 0;
     uint64_t               device_bytes         = 0;
     uint64_t               host_budget_bytes    = 0;
@@ -54,6 +60,9 @@ struct Options {
     uint64_t              host_victim_bytes = 0;
     std::vector<int>      resident_expert_blocks;
     bool                  resident_expert_blocks_set = false;
+    std::vector<int>      expert_reserve_blocks;
+    bool                  expert_reserve_blocks_set = false;
+    uint64_t              expert_reserve_bytes = 0;
     TestHooks *           test_hooks = nullptr;
     bool                  once        = false;
 };
@@ -66,7 +75,9 @@ ResourcePlan plan_resources(
         const std::vector<ResourcePage> & pages,
         int requested_slots,
         uint64_t host_budget_bytes = 0,
-        uint64_t pinned_bytes = 0);
+        uint64_t pinned_bytes = 0,
+        const std::vector<int> & reserve_blocks = {},
+        uint64_t reserve_bytes = 0);
 
 // Construct the same backend and resource pools used by run(), then report
 // their own allocation accounting. Intended for diagnostics and CPU tests.

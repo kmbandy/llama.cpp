@@ -3,12 +3,14 @@
 #include "weight-pager/wp-router.h"
 
 #include <charconv>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <cerrno>
 
 namespace {
 
@@ -18,12 +20,14 @@ void print_usage(const char * argv0) {
         << " --shard-manifest PATH --descriptor PATH --device DEVICE"
         << " --listen HOST:PORT --slots N [--host-budget-bytes N]"
         << " [--host-victim-bytes N]"
-        << " [--weight-paging-resident-experts BLOCKS]\n"
+        << " [--weight-paging-resident-experts BLOCKS]"
+        << " [--expert-reserve-blocks BLOCKS --expert-reserve-bytes SIZE]\n"
         << "       --slots is the device budget in largest-page equivalents\n"
         << "       staging defaults to up to 16 largest-page buffers\n"
         << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n"
         << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n"
-        << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n";
+        << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n"
+        << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n";
 }
 
 int parse_positive_int(const std::string & text, const char * option) {
@@ -42,6 +46,23 @@ uint64_t parse_positive_u64(const std::string & text, const char * option) {
         throw std::invalid_argument(std::string(option) + " requires a positive integer");
     }
     return value;
+}
+
+uint64_t parse_size(const std::string & text, const char * option) {
+    if (text.empty()) throw std::invalid_argument(std::string(option) + " requires a size");
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (errno != 0 || end == text.c_str()) throw std::invalid_argument(std::string(option) + " requires a size");
+    std::string suffix(end);
+    for (char & c : suffix) c = (char) std::tolower((unsigned char) c);
+    uint64_t multiplier = 1;
+    if (suffix == "kib" || suffix == "kb") multiplier = 1ull << 10;
+    else if (suffix == "mib" || suffix == "mb") multiplier = 1ull << 20;
+    else if (suffix == "gib" || suffix == "gb") multiplier = 1ull << 30;
+    else if (!suffix.empty()) throw std::invalid_argument(std::string(option) + " has an invalid suffix");
+    if (value == 0 || value > UINT64_MAX / multiplier) throw std::invalid_argument(std::string(option) + " is out of range");
+    return (uint64_t) value * multiplier;
 }
 
 void parse_endpoint(const std::string & text, std::string & host, int & port) {
@@ -91,6 +112,12 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
                 wp::parse_resident_expert_request(take().c_str());
             options.resident_expert_blocks = request.blocks;
             options.resident_expert_blocks_set = true;
+        } else if (arg == "--expert-reserve-blocks") {
+            const wp::ResidentExpertRequest request = wp::parse_resident_expert_request(take().c_str());
+            options.expert_reserve_blocks = request.blocks;
+            options.expert_reserve_blocks_set = true;
+        } else if (arg == "--expert-reserve-bytes") {
+            options.expert_reserve_bytes = parse_size(take(), "--expert-reserve-bytes");
         } else {
             throw std::invalid_argument("unknown option: " + arg);
         }
@@ -123,6 +150,18 @@ wp_expert_worker::Options parse_cli(int argc, char ** argv) {
             options.resident_expert_blocks = request.blocks;
             options.resident_expert_blocks_set = true;
         }
+    }
+    if (!options.expert_reserve_blocks_set) {
+        const char * value = std::getenv("WP_EXPERT_RESERVE_BLOCKS");
+        if (value != nullptr && value[0] != '\0') {
+            const wp::ResidentExpertRequest request = wp::parse_resident_expert_request(value);
+            options.expert_reserve_blocks = request.blocks;
+            options.expert_reserve_blocks_set = true;
+        }
+    }
+    if (options.expert_reserve_bytes == 0) {
+        const char * value = std::getenv("WP_EXPERT_RESERVE_BYTES");
+        if (value != nullptr && value[0] != '\0') options.expert_reserve_bytes = parse_size(value, "WP_EXPERT_RESERVE_BYTES");
     }
     return options;
 }
