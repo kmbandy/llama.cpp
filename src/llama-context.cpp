@@ -2269,7 +2269,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 static uint32_t llama_context_layer_inp_size(const llama_model & model) {
     const auto & hparams = model.hparams;
     if (model.arch == LLM_ARCH_DEEPSEEK4) {
-        return hparams.n_embd * hparams.dsv4_hc_mult;
+        // MAD-LAB: DSpark layer-input taps collapse hyper-connection streams.
+        return hparams.n_embd;
     }
     return hparams.n_embd;
 }

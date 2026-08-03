@@ -924,7 +924,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<common_sampler_ptr> smpls;
 
     int32_t n_embd_dec = 0;  // draft hidden size
-    int32_t n_embd_enc = 0;  // target_layer_ids_n * hc_mult * target_hidden_size
+    int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
     int32_t hc_mult    = 1;  // target residual streams per tapped layer
 
@@ -961,7 +961,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         hc_mult       = (int32_t) llama_model_dflash_hc_mult(model_dft);
         GGML_ASSERT(hc_mult > 0);
-        n_embd_enc    = (int32_t) target_layer_ids_n * hc_mult * n_embd_tgt;
+        // MAD-LAB: DSpark target taps are collapsed to n_embd_tgt at extraction.
+        n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
         const char * block_size_source = "default";
         block_size = 16;
@@ -1088,7 +1089,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        const int32_t n_embd_layer = hc_mult * n_embd_tgt;
+                        // MAD-LAB: DSpark taps are collapsed per layer, like EAGLE3.
+                        const int32_t n_embd_layer = n_embd_tgt;
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_layer;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_layer;
                         std::memcpy(dst, src, (size_t) n_embd_layer * sizeof(float));

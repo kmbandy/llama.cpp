@@ -1494,12 +1494,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_context(params) {
     if (params.gtype == LLM_GRAPH_TYPE_ENCODER && model.fc) {
         const int64_t n_target = model.target_layer_ids.size();
-        auto inp = std::make_unique<llm_graph_input_embd>(n_target*n_embd*hparams.dsv4_hc_mult);
+        // MAD-LAB: encoder input is the concatenation of already-collapsed taps.
+        auto inp = std::make_unique<llm_graph_input_embd>(n_target*n_embd);
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, inp->n_embd, n_tokens);
         ggml_set_input(inp->embd);
-        ggml_tensor * cur = ggml_reshape_4d(ctx0, inp->embd, n_embd, hparams.dsv4_hc_mult, n_target, n_tokens);
-        cur = ggml_mean(ctx0, ggml_permute(ctx0, cur, 1, 0, 2, 3));
-        cur = ggml_reshape_2d(ctx0, cur, n_embd*n_target, n_tokens);
+        ggml_tensor * cur = inp->embd;
         cur = build_lora_mm(model.fc, cur);
         cur = build_norm(cur, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         res->t_h_nextn = cur;
@@ -1663,9 +1662,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
-    // DFlash taps the pre-collapse multi-stream residual [n_embd, hc, n_tokens].
-    // That layout is contiguous-equivalent to [n_embd*hc, n_tokens] (ne0 innermost),
-    // so extract_layer_inputs can read n_embd*hc floats per token without a reshape.
+    // DSpark taps the collapsed residual [n_embd, n_tokens].
+    // DFlash extraction uses the same layer-input path and row width.
     // Do NOT wrap in ggml_reshape_2d: pure views often have no sched backend, and
     // extract_layer_inputs asserts ggml_backend_sched_get_tensor_backend != null
     // (seen on first decode of draft-dflash against DS4 Flash).
