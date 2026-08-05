@@ -396,7 +396,8 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
         }
         total += 4ull + (uint64_t) assignment.weights.size() * 4ull;
     }
-    total += (uint64_t) p.activations.size() * 2ull;
+    // 4 bytes per value: request activations are f32 as of PIPE_VERSION 4.
+    total += (uint64_t) p.activations.size() * 4ull;
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -414,8 +415,8 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
             wr_f32(w, weight);
         }
     }
-    for (uint16_t value : p.activations) {
-        wr_u16(w, value);
+    for (float value : p.activations) {
+        wr_f32(w, value);
     }
     return out;
 }
@@ -443,7 +444,7 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const uint64_t assignment_bytes =
         (uint64_t) n_assignments * (4ull + (uint64_t) r.n_tokens * 4ull);
     const uint64_t activation_bytes =
-        (uint64_t) r.n_tokens * (uint64_t) n_embd * 2ull;
+        (uint64_t) r.n_tokens * (uint64_t) n_embd * 4ull;
     if ((uint64_t) (end - p) != assignment_bytes + activation_bytes) {
         fail(PIPE_ERR_BAD_FRAME,
              "pipe: expert dispatch payload bytes %lld do not match dimensions",
@@ -472,7 +473,7 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const size_t n_activations = (size_t) r.n_tokens * (size_t) n_embd;
     r.activations.reserve(n_activations);
     for (size_t i = 0; i < n_activations; ++i) {
-        r.activations.push_back(rd_u16(p));
+        r.activations.push_back(rd_f32(p));
     }
     return r;
 }

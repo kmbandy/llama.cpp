@@ -306,17 +306,19 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             throw std::runtime_error("expert dispatch custom op input shapes do not match");
         }
 
-        std::vector<uint16_t> wire_activations((size_t) n_embd * (size_t) n_tokens);
+        // f32 STRAIGHT THROUGH as of PIPE_VERSION 4. This used to round to f16
+        // here, which put a ~3e-4 relative error on the input of EVERY routed
+        // expert on EVERY layer while attention, the shared expert and the
+        // residual all kept f32. See pipe_expert_dispatch_req::activations.
+        std::vector<float> wire_activations((size_t) n_embd * (size_t) n_tokens);
         const dispatch_clock::time_point pack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
         if (ggml_is_contiguous(activations)) {
-            ggml_fp32_to_fp16_row(
-                (const float *) activations->data,
-                (ggml_fp16_t *) wire_activations.data(),
-                (int64_t) wire_activations.size());
+            std::memcpy(wire_activations.data(), activations->data,
+                        wire_activations.size() * sizeof(float));
         } else {
             for (size_t i = 0; i < wire_activations.size(); ++i) {
-                wire_activations[i] = (uint16_t) ggml_fp32_to_fp16(ggml_get_f32_1d(activations, (int) i));
+                wire_activations[i] = ggml_get_f32_1d(activations, (int) i);
             }
         }
         const dispatch_clock::time_point pack_end =

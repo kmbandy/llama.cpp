@@ -682,7 +682,7 @@ struct dispatcher::impl {
 
     std::vector<planned_request> plan_requests(int32_t                                     layer,
                                                uint32_t                                    n_tokens,
-                                               const std::vector<uint16_t> &               activations,
+                                               const std::vector<float> &                  activations,
                                                const std::vector<pipe_expert_assignment> & assignments,
                                                const std::vector<std::vector<size_t>> &   layer_routes,
                                                std::vector<size_t> &                       assigned_counts,
@@ -965,7 +965,7 @@ struct dispatcher::impl {
     std::vector<float> dispatch(int32_t                                     layer,
                                 uint64_t                                    seq_id,
                                 uint32_t                                    n_tokens,
-                                const std::vector<uint16_t> &               activations,
+                                const std::vector<float> &                  activations,
                                 const std::vector<pipe_expert_assignment> & assignments,
                                 float                                       swiglu_clamp) {
         if (poisoned) {
@@ -1243,7 +1243,7 @@ dispatcher & dispatcher::operator=(dispatcher &&) noexcept = default;
 std::vector<float> dispatcher::dispatch(int32_t                                     layer,
                                         uint64_t                                    seq_id,
                                         uint32_t                                    n_tokens,
-                                        const std::vector<uint16_t> &               activations,
+                                        const std::vector<float> &                  activations,
                                         const std::vector<pipe_expert_assignment> & assignments,
                                         float                                       swiglu_clamp) {
     return pimpl->dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);

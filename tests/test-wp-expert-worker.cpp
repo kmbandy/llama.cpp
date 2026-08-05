@@ -549,10 +549,10 @@ void run_test() {
         pipe_expert_dispatch_req request;
         request.n_tokens = N_TOKENS;
         for (size_t i = 0; i < input.size(); ++i) {
+            // f32 straight through as of PIPE_VERSION 4 -- no f16 round-trip, so
+            // the reference input and the wire value are now bit-identical.
             input[i] = ((int) (i % 13) - 6) * 0.07f;
-            const ggml_fp16_t half = ggml_fp32_to_fp16(input[i]);
-            request.activations.push_back((uint16_t) half);
-            input[i] = ggml_fp16_to_fp32(half);
+            request.activations.push_back(input[i]);
         }
         request.assignments = {
             { 0, { 0.5f, 0.0f } },
@@ -595,9 +595,13 @@ void run_test() {
                 require(response.partial.size() == expected.size(),
                         "partial shape mismatch");
                 for (size_t i = 0; i < expected.size(); ++i) {
-                    const float actual =
-                        ggml_fp16_to_fp32(
-                            (ggml_fp16_t) response.partial[i]);
+                    // partial is std::vector<float> as of PIPE_VERSION 2. This
+                    // used to read it as ggml_fp16_to_fp32((ggml_fp16_t) x),
+                    // and ggml_fp16_t is uint16_t -- so the float was TRUNCATED
+                    // to an integer first and 0.35f came back as exactly 0.0f.
+                    // The assertion could then only pass while every expected
+                    // value sat within tolerance of zero, i.e. it was vacuous.
+                    const float actual = response.partial[i];
                     const float tolerance =
                         0.002f + 0.01f * std::fabs(expected[i]);
                     if (std::fabs(actual - expected[i]) > tolerance) {

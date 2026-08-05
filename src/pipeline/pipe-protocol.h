@@ -41,7 +41,10 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // before this change applies NO clamp, which is a silent correctness bug (see
 // pipe_expert_dispatch_req below), so the version must reject it rather than let
 // it compute an unclamped SwiGLU that looks perfectly healthy on the wire.
-static constexpr uint32_t PIPE_VERSION = 3u;
+// 3 -> 4 (2026-08-05): request activations are f32, not f16. A stale binary would
+// mis-decode a 2-byte stream as 4-byte values, so this MUST reject rather than
+// reinterpret. Same reasoning as the 1 -> 2 bump on the partial-return path.
+static constexpr uint32_t PIPE_VERSION = 4u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -173,12 +176,21 @@ struct pipe_expert_assignment {
 //   u32 n_assignments
 //   f32 swiglu_clamp
 //   repeated { i32 expert_id; f32 weights[n_tokens] }
-//   f16 activations[n_tokens * n_embd]
+//   f32 activations[n_tokens * n_embd]
 struct pipe_expert_dispatch_req {
     int32_t                             layer    = -1;
     uint32_t                            n_tokens = 0;
     std::vector<pipe_expert_assignment> assignments;
-    std::vector<uint16_t>               activations;
+    // *** f32, NOT f16. CHANGED 2026-08-05 -- THIS WAS A CORRECTNESS BUG. ***
+    // The 2026-08-04 fix repaired only the RETURN direction (pipe_expert_partial).
+    // The REQUEST direction stayed f16, so every routed expert RECEIVED f16(x)
+    // (~3e-4 relative) while attention, the shared expert and the residual all saw
+    // f32 x -- an asymmetric, deterministic perturbation on every single layer.
+    // WP_SELFCHECK could never see it: gather and dense both consume the SAME
+    // already-rounded activation, so the probe compares two equally-wrong paths.
+    // Costs 2x bytes on the request path; decode is page-in bound, so measure
+    // rather than assume that costs anything.
+    std::vector<float>                  activations;
 
     // *** ADDED 2026-08-05 -- THIS WAS A CORRECTNESS BUG. ***
     // hparams.swiglu_clamp_exp[layer] for this layer; <= 0 means "no clamp".

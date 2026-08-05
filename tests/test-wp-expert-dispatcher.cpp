@@ -688,7 +688,7 @@ struct selection_server {
 };
 
 void selection_dispatch(pipe_expert_dispatcher::dispatcher & dispatcher, uint64_t seq_id, int32_t expert) {
-    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), {
+    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<float>(N_EMBD, 0.0f), {
         { expert, { 1.0f } },
     }, TEST_SWIGLU_CLAMP);
 }
@@ -699,7 +699,7 @@ void selection_dispatch_batch(pipe_expert_dispatcher::dispatcher & dispatcher, u
     for (int32_t expert = first_expert; expert < first_expert + n_experts; ++expert) {
         assignments.push_back({ expert, { 1.0f } });
     }
-    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), assignments, TEST_SWIGLU_CLAMP);
+    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<float>(N_EMBD, 0.0f), assignments, TEST_SWIGLU_CLAMP);
 }
 
 bool contains_expert(const selection_server & server, int32_t expert) {
@@ -806,7 +806,7 @@ std::string expect_dispatch_error(fault_mode mode, int32_t expert_id, bool test_
         "fault-machine",
     };
     pipe_expert_dispatcher::dispatcher dispatcher({ endpoint });
-    std::vector<uint16_t>              activations((size_t) N_TOKENS * N_EMBD, (uint16_t) ggml_fp32_to_fp16(0.25f));
+    std::vector<float>                 activations((size_t) N_TOKENS * N_EMBD, 0.25f);
     std::string                        message;
     try {
         dispatcher.dispatch(LAYER, 100 + (uint64_t) expert_id, N_TOKENS, activations,
@@ -1002,14 +1002,11 @@ void run_test() {
     }
     require(model_rejected, "different logical model was not rejected: " + model_error);
 
-    std::vector<float>    activation((size_t) N_TOKENS * N_EMBD);
-    std::vector<uint16_t> activation_f16;
-    activation_f16.reserve(activation.size());
+    // f32 straight through as of PIPE_VERSION 4: the reference input and the
+    // wire value are bit-identical, so no f16 shadow copy is needed.
+    std::vector<float> activation((size_t) N_TOKENS * N_EMBD);
     for (size_t i = 0; i < activation.size(); ++i) {
-        activation[i]          = ((int) (i % 13) - 6) * 0.07f;
-        const ggml_fp16_t half = ggml_fp32_to_fp16(activation[i]);
-        activation_f16.push_back((uint16_t) half);
-        activation[i] = ggml_fp16_to_fp32(half);
+        activation[i] = ((int) (i % 13) - 6) * 0.07f;
     }
     const std::vector<pipe_expert_assignment> assignments = {
         { 0, { 0.50f, 0.00f }  },
@@ -1030,7 +1027,7 @@ void run_test() {
                 "different shard identities were not preserved");
         require(!dispatcher.model_identity().empty(), "logical model identity is empty");
         const std::vector<float> actual =
-            dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments, TEST_SWIGLU_CLAMP);
+            dispatcher.dispatch(LAYER, 42, N_TOKENS, activation, assignments, TEST_SWIGLU_CLAMP);
         require(actual.size() == expected.size(), "reduced output shape mismatch");
         for (size_t i = 0; i < expected.size(); ++i) {
             const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);

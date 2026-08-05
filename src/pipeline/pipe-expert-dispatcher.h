@@ -88,7 +88,7 @@ class dispatcher {
     std::vector<float> dispatch(int32_t                                     layer,
                                 uint64_t                                    seq_id,
                                 uint32_t                                    n_tokens,
-                                const std::vector<uint16_t> &               activations,
+                                const std::vector<float> &                  activations,
                                 const std::vector<pipe_expert_assignment> & assignments,
                                 float                                       swiglu_clamp);
 

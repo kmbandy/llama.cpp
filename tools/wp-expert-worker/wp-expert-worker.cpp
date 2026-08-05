@@ -2416,10 +2416,10 @@ public:
             }
         }
 
-        std::vector<float> activation(request.activations.size());
-        for (size_t i = 0; i < request.activations.size(); ++i) {
-            activation[i] = ggml_fp16_to_fp32((ggml_fp16_t) request.activations[i]);
-        }
+        // Already f32 on the wire as of PIPE_VERSION 4; this used to widen a
+        // f16 value back to f32, which recovered the storage type but NOT the
+        // ~3e-4 of precision the spine had already thrown away.
+        const std::vector<float> & activation = request.activations;
         const bool measure = stats_.enabled();
         const std::chrono::steady_clock::time_point lookup_started =
             measure ? std::chrono::steady_clock::now() :
