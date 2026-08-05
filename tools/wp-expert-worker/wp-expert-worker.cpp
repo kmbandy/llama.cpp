@@ -3353,6 +3353,12 @@ int run(const Options & options) {
     // measured baseline rather than silently changing the config of record.
     if (const char * warm = std::getenv("WP_WARMUP")) {
         if (warm[0] != '\0' && warm[0] != '0') {
+            // ALL LAYERS, not just the first (2026-08-05, second iteration).
+            // Warming one layer removed all 11 device allocations but left the
+            // >=8 ms submit count at 43-44 -- and the worker serves 43 layers.
+            // One stall per layer says the cost is per-LAYER tensor-set/descriptor
+            // setup, not per-shape, so the shape list is swept on one layer while
+            // every layer is touched at the cheapest shape.
             const int32_t n_embd = advertised.n_embd;
             const int32_t layer  = advertised.layers.empty() ? -1 : advertised.layers.front();
             const int32_t e_first = advertised.expert_first;
@@ -3393,10 +3399,32 @@ int run(const Options & options) {
                     std::cout << "wp warmup: skipped " << item << ": " << e.what() << std::endl;
                 }
             }
+            // Second pass: touch EVERY served layer at the cheapest shape.
+            size_t layers_done = 0;
+            for (int32_t ly : advertised.layers) {
+                if (ly == layer || e_first < 0) { continue; }   // first layer already covered
+                pipe_expert_dispatch_req req;
+                req.layer        = ly;
+                req.n_tokens     = 1;
+                req.swiglu_clamp = 10.0f;
+                pipe_expert_assignment a;
+                a.expert_id = e_first;
+                a.weights.assign(1, 0.5f);
+                req.assignments.push_back(std::move(a));
+                req.activations.assign((size_t) n_embd, 0.01f);
+                try {
+                    RequestStats throwaway;
+                    (void) worker.dispatch(req, throwaway);
+                    ++layers_done;
+                } catch (const std::exception &) {
+                    // non-fatal, same reasoning as above
+                }
+            }
             const double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
             std::cout << "wp warmup: " << done << " shape(s) from \"" << warm
-                      << "\" in " << ms << " ms (results discarded)" << std::endl;
+                      << "\" + " << layers_done << " extra layer(s) in "
+                      << ms << " ms (results discarded)" << std::endl;
         }
     }
 
