@@ -38,6 +38,15 @@ bool speed_split_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// WP_DISPATCH_UNION=1 -- measurement only, no behaviour change. Logs how many
+// token rows a worker's assignments actually need versus how many it is sent.
+// Read once at startup; a per-request getenv on the dispatch path would itself
+// distort the thing being measured.
+const bool s_union_stats = [] {
+    const char * value = std::getenv("WP_DISPATCH_UNION");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+
 // WP_DEFER_K = number of experts computed immediately per token.
 // Unset / empty / non-positive => feature off (defer nothing).
 int parse_wp_defer_k() {
@@ -703,6 +712,41 @@ struct dispatcher::impl {
             if (request.assignments.empty()) {
                 continue;
             }
+            // *** WP_DISPATCH_UNION=1: MEASUREMENT ONLY, no behaviour change. ***
+            // Every worker currently receives the FULL activation tensor
+            // [n_embd x n_tokens], but it only needs the token rows that route to
+            // ITS assigned experts -- the workers already exploit that internally
+            // via the gather path, AFTER paying to receive everything. At prefill
+            // that is ~33.5 MB per request (2048 x 4096 x f32) and `issue` is 8.2 s
+            // of a 26.4 s prefill dispatch, so the send path is on the critical
+            // path, not incidental.
+            // This logs the UNION of tokens with a nonzero routing weight across a
+            // worker's assignments -- NOT the token-expert pair count, which
+            // n_weight_nonzero already reports and which overcounts a token that
+            // hits several of the same worker's experts. |union| / n_tokens is the
+            // exact factor a spine-side gather would shrink the payload by.
+            if (s_union_stats && n_tokens > 1) {
+                std::vector<uint8_t> touched((size_t) n_tokens, 0);
+                for (const pipe_expert_assignment & a : request.assignments) {
+                    for (uint32_t t = 0; t < n_tokens; ++t) {
+                        if (a.weights[(size_t) t] != 0.0f) {
+                            touched[(size_t) t] = 1;
+                        }
+                    }
+                }
+                size_t used = 0;
+                for (uint8_t v : touched) {
+                    used += v;
+                }
+                std::fprintf(stderr,
+                    "expert dispatch union: layer=%d worker=%zu n_tokens=%u experts=%zu "
+                    "tokens_needed=%zu (%.2f%%) bytes_sent=%zu bytes_needed=%zu\n",
+                    layer, request.worker_index, n_tokens, request.assignments.size(),
+                    used, 100.0 * (double) used / (double) n_tokens,
+                    (size_t) n_tokens * (size_t) n_embd * sizeof(float),
+                    used * (size_t) n_embd * sizeof(float));
+            }
+
             pipe_expert_dispatch_req wire_request;
             wire_request.layer       = layer;
             wire_request.n_tokens    = n_tokens;
