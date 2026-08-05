@@ -81,6 +81,53 @@ static float rd_f32(const uint8_t * & p) {
 }
 
 // ---------------------------------------------------------------------------
+// BULK f32 fast path (2026-08-05).
+//
+// The scalar wr_f32/rd_f32 loops are byte-explicit and host-endianness
+// independent, which is the right default for a wire format. But the BULK
+// arrays -- request activations and returned partials -- are millions of values
+// per layer, and at prefill (n_tokens 2048 x n_embd 4096) that is ~8.4M scalar
+// reads per worker per layer, ~1.08e9 across a single prefill once you multiply
+// by 43 layers and 3 workers, plus an equally sized accumulate.
+//
+// On a little-endian host the wire representation IS the host representation,
+// so the whole loop is a memcpy and the result is BIT-IDENTICAL -- this cannot
+// change any number the model computes. The scalar path is retained verbatim for
+// big-endian, so the format stays portable; only the cost changes.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#  define PIPE_F32_WIRE_IS_HOST 1
+#else
+#  define PIPE_F32_WIRE_IS_HOST 0
+#endif
+
+static void wr_f32_bulk(uint8_t * & p, const float * src, size_t n) {
+#if PIPE_F32_WIRE_IS_HOST
+    if (n != 0) {
+        std::memcpy(p, src, n * sizeof(float));
+        p += n * sizeof(float);
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        wr_f32(p, src[i]);
+    }
+#endif
+}
+
+static void rd_f32_bulk(const uint8_t * & p, float * dst, size_t n) {
+#if PIPE_F32_WIRE_IS_HOST
+    if (n != 0) {
+        std::memcpy(dst, p, n * sizeof(float));
+        p += n * sizeof(float);
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = rd_f32(p);
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // error helper
 
 [[noreturn]] static void fail(pipe_error_code code, const char * fmt, ...) {
@@ -415,9 +462,7 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
             wr_f32(w, weight);
         }
     }
-    for (float value : p.activations) {
-        wr_f32(w, value);
-    }
+    wr_f32_bulk(w, p.activations.data(), p.activations.size());
     return out;
 }
 
@@ -472,9 +517,8 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
 
     const size_t n_activations = (size_t) r.n_tokens * (size_t) n_embd;
     r.activations.reserve(n_activations);
-    for (size_t i = 0; i < n_activations; ++i) {
-        r.activations.push_back(rd_f32(p));
-    }
+    r.activations.resize(n_activations);
+    rd_f32_bulk(p, r.activations.data(), n_activations);
     return r;
 }
 
@@ -493,9 +537,7 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
-    for (float value : p.partial) {
-        wr_f32(w, value);
-    }
+    wr_f32_bulk(w, p.partial.data(), p.partial.size());
     return out;
 }
 
@@ -513,10 +555,8 @@ pipe_expert_partial pipe_decode_expert_partial(
     if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * 4ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
     }
-    r.partial.reserve((size_t) n_values);
-    for (uint64_t i = 0; i < n_values; ++i) {
-        r.partial.push_back(rd_f32(p));
-    }
+    r.partial.resize((size_t) n_values);
+    rd_f32_bulk(p, r.partial.data(), (size_t) n_values);
     return r;
 }
 
