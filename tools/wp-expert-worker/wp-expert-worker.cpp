@@ -3327,6 +3327,79 @@ int run(const Options & options) {
     const pipe_expert_hello advertised = worker.hello();
     const ResourcePlan & resources = worker.resources();
 
+    // *** WP_WARMUP: pay the cold-start stalls BEFORE serving. Default OFF. ***
+    //
+    // MEASURED 2026-08-05 (fp3-r1, both workers). ALL of the slow submits and ALL
+    // device allocations happen in the first ~140 requests, then stop dead:
+    //     requests:      1   74   82   91   99  107  115  140  362  646 5794
+    //     >=8ms submits: 1    2   10   19   27   35   43   44   44   44   44
+    //     device allocs: 1    5    7    8    9   11   11   11   11   11   11
+    // ns_submit is 1.833 s at request 140 and 4.677 s at request 5794 -- 39% of all
+    // submit time is spent in 2.4% of the requests. The RX 480's first n_tokens=2
+    // verify block cost 6044 ms, of which 5975 ms was that one worker.
+    // This is NOT a Vulkan pathology: the CUDA worker shows 14 device allocations
+    // and an 83.8 ms worst submit against the RX 480's 11 and 74.7 ms.
+    //
+    // run_self_bench does NOT cover this: it builds a ONE-EXPERT, ONE-TOKEN graph,
+    // so it never touches verify widths, the prefill width, multi-expert graphs,
+    // the gather path, or the SwiGLU clamp.
+    //
+    // Spec: WP_WARMUP="<tokens>x<experts>[,<tokens>x<experts>...]", e.g.
+    //   WP_WARMUP="1x8,2x8,5x8,659x35"
+    // Each entry replays a synthetic request through the REAL dispatch path so the
+    // graph build, gallocr allocation, backend pipeline specialisation and clamp
+    // ops are all compiled for that shape before the first real request arrives.
+    // Results are discarded. Kept default-OFF so it can be A/B'd against the
+    // measured baseline rather than silently changing the config of record.
+    if (const char * warm = std::getenv("WP_WARMUP")) {
+        if (warm[0] != '\0' && warm[0] != '0') {
+            const int32_t n_embd = advertised.n_embd;
+            const int32_t layer  = advertised.layers.empty() ? -1 : advertised.layers.front();
+            const int32_t e_first = advertised.expert_first;
+            const int32_t e_last  = advertised.expert_last;
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t done = 0;
+            std::string spec(warm);
+            size_t pos = 0;
+            while (pos <= spec.size() && layer >= 0 && e_first >= 0) {
+                const size_t comma = spec.find(',', pos);
+                const std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                pos = (comma == std::string::npos) ? spec.size() + 1 : comma + 1;
+                const size_t x = item.find('x');
+                if (x == std::string::npos) { continue; }
+                const long toks = strtol(item.substr(0, x).c_str(), nullptr, 10);
+                const long nexp = strtol(item.substr(x + 1).c_str(), nullptr, 10);
+                if (toks <= 0 || nexp <= 0) { continue; }
+                pipe_expert_dispatch_req req;
+                req.layer        = layer;
+                req.n_tokens     = (uint32_t) toks;
+                req.swiglu_clamp = 10.0f;   // non-zero so the clamp ops get built
+                const long avail = (long) (e_last - e_first + 1);
+                for (long i = 0; i < nexp && i < avail; ++i) {
+                    pipe_expert_assignment a;
+                    a.expert_id = (int32_t) (e_first + i);
+                    a.weights.assign((size_t) toks, 0.5f);
+                    req.assignments.push_back(std::move(a));
+                }
+                req.activations.assign((size_t) toks * (size_t) n_embd, 0.01f);
+                try {
+                    RequestStats throwaway;
+                    (void) worker.dispatch(req, throwaway);
+                    ++done;
+                } catch (const std::exception & e) {
+                    // Warmup must never prevent serving. A shape we cannot warm is
+                    // simply a shape that pays its stall on the first real request,
+                    // which is exactly the status quo.
+                    std::cout << "wp warmup: skipped " << item << ": " << e.what() << std::endl;
+                }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::cout << "wp warmup: " << done << " shape(s) from \"" << warm
+                      << "\" in " << ms << " ms (results discarded)" << std::endl;
+        }
+    }
+
     pipe_socket_ptr server =
         pipe_socket_t::create_server(options.listen_host.c_str(), options.listen_port);
     if (!server) {
