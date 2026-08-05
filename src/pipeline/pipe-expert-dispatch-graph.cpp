@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -68,6 +69,11 @@ std::vector<endpoint> parse_endpoints(const std::string & text) {
 struct graph_dispatcher::op_context {
     graph_dispatcher * owner = nullptr;
     int32_t            layer = -1;
+    // hparams.swiglu_clamp_exp[layer]; <= 0 means no clamp. See the note on
+    // pipe_expert_dispatch_req::swiglu_clamp -- the spine's own clamped SwiGLU
+    // is unreachable on the dispatch path, so the worker must apply it and the
+    // limit has to travel with every request.
+    float              swiglu_clamp = 0.0f;
 };
 
 graph_dispatcher::graph_dispatcher(const std::string & endpoints,
@@ -114,7 +120,8 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
                                       ggml_tensor *  activations,
                                       ggml_tensor *  selected_experts,
                                       ggml_tensor *  weights,
-                                      int32_t        layer) {
+                                      int32_t        layer,
+                                      float          swiglu_clamp) {
     if (layer < 0) {
         throw std::invalid_argument("expert dispatch requires a non-negative layer");
     }
@@ -127,6 +134,10 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
     if (!context) {
         context.reset(new op_context{ this, layer });
     }
+    // Assign every call, not just on creation: op_contexts is cached per layer
+    // for the lifetime of the dispatcher, so a create-only assignment would pin
+    // whatever value the first graph build happened to see.
+    context->swiglu_clamp = swiglu_clamp;
     return ggml_map_custom3(ctx, activations, selected_experts, weights, compute, 1, context.get());
 }
 
@@ -169,6 +180,7 @@ void graph_dispatcher::begin_decode() noexcept {
     decode_ns_unpack_                    = 0;
     decode_ns_total_                     = 0;
     decode_first_await_in_flight_        = 0;
+    decode_n_tokens_                     = 0;
     decode_workers_.clear();
     for (const worker_info & worker : remote.workers()) {
         decode_workers_.push_back({ worker.endpoint });
@@ -215,15 +227,26 @@ void graph_dispatcher::end_decode() noexcept {
     }
 
     const double ns_to_ms = 1.0e-6;
+    // phase= and n_tokens= (2026-08-03): this block is emitted once per
+    // llama_context::decode(), so prefill and decode blocks were previously
+    // distinguishable only by their position in the log. With a real prompt and
+    // n_ubatch chunking there are several prefill blocks, and any tooling that
+    // assumed "block 1 is prefill" silently mis-attributed the rest.
+    // ms/tok is the cross-phase-comparable column: prefill amortises, decode does not.
     LLAMA_LOG_WARN(
-        "expert dispatch: layers=%zu pack=%.2f ms issue=%.2f ms wait=%.2f ms unpack=%.2f ms total=%.2f ms "
-        "first_await_in_flight avg=%.1f (workers=%zu)\n",
+        "expert dispatch: phase=%s n_tokens=%u layers=%zu pack=%.2f ms issue=%.2f ms wait=%.2f ms "
+        "unpack=%.2f ms total=%.2f ms (%.3f ms/tok) first_await_in_flight avg=%.1f (workers=%zu)\n",
+        // 3-way: n_tokens > 1 alone would call every speculative-verify batch a
+        // prefill, and with DSpark on that is ~97% of them by count.
+        decode_n_tokens_ >= 64 ? "PREFILL" : (decode_n_tokens_ > 1 ? "verify" : "decode"),
+        decode_n_tokens_,
         decode_layers_,
         decode_ns_pack_ * ns_to_ms,
         decode_ns_issue_ * ns_to_ms,
         decode_ns_wait_ * ns_to_ms,
         decode_ns_unpack_ * ns_to_ms,
         decode_ns_total_ * ns_to_ms,
+        decode_ns_total_ * ns_to_ms / (double) std::max<uint32_t>(1, decode_n_tokens_),
         (double) decode_first_await_in_flight_ / (double) decode_layers_,
         n_workers());
     for (const worker_dispatch_stats & worker : decode_workers_) {
@@ -328,7 +351,8 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         // immediate experts, and folds the previous layer's deferred partials
         // into the returned block (residual path for layer N+1).
         const std::vector<float> result =
-            owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments);
+            owner->remote.dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
+                                   context->swiglu_clamp);
         const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
         const dispatch_clock::time_point unpack_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
@@ -343,6 +367,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         if (collect_stats) {
             const dispatch_clock::time_point total_end = dispatch_clock::now();
             ++owner->decode_layers_;
+            owner->decode_n_tokens_ = (uint32_t) n_tokens;
             owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
             owner->decode_ns_issue_ += layer_stats.ns_issue;
             owner->decode_ns_wait_ += layer_stats.ns_wait;

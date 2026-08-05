@@ -82,11 +82,15 @@ class dispatcher {
     // weight experts are issued but not awaited; their partials are folded
     // into the next dispatch's return value. Deferred reads are always issued
     // before this call returns.
+    // swiglu_clamp: hparams.swiglu_clamp_exp[layer], <= 0 = no clamp. Travels
+    // with every request because the spine's clamped SwiGLU is unreachable on
+    // the dispatch path. See pipe_expert_dispatch_req::swiglu_clamp.
     std::vector<float> dispatch(int32_t                                     layer,
                                 uint64_t                                    seq_id,
                                 uint32_t                                    n_tokens,
                                 const std::vector<uint16_t> &               activations,
-                                const std::vector<pipe_expert_assignment> & assignments);
+                                const std::vector<pipe_expert_assignment> & assignments,
+                                float                                       swiglu_clamp);
 
     int32_t                          n_embd() const;
     int32_t                          n_ff_exp() const;

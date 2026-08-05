@@ -2184,7 +2184,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             up_exps_s != nullptr || gate_exps_s != nullptr || down_exps_s != nullptr) {
             throw std::runtime_error("expert dispatch does not support this expert FFN variant");
         }
-        ggml_tensor * moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il);
+        // il >= 0 guard mirrors the clamped SwiGLU switch below, which reads
+        // swiglu_clamp_exp only when il >= 0. The worker applies the clamp; this
+        // path returns before the switch, so passing it on is the ONLY way the
+        // limit reaches the expert FFN at all.
+        const float dispatch_swiglu_clamp = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        ggml_tensor * moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il,
+                                                       dispatch_swiglu_clamp);
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
         cb(moe_out, "ffn_moe_out", il);
         return moe_out;

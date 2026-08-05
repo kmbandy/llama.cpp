@@ -34,7 +34,14 @@
 // wire constants
 
 static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
-static constexpr uint32_t PIPE_VERSION = 1u;
+// VERSION 2 (2026-08-04): expert partials are f32 on the wire, not f16. The bump is
+// deliberate -- a spine and a worker built either side of this change MUST refuse each
+// other loudly rather than silently mis-decode a 2-byte stream as 4-byte values.
+// 2 -> 3 (2026-08-05): the dispatch request carries swiglu_clamp. A worker built
+// before this change applies NO clamp, which is a silent correctness bug (see
+// pipe_expert_dispatch_req below), so the version must reject it rather than let
+// it compute an unclamped SwiGLU that looks perfectly healthy on the wire.
+static constexpr uint32_t PIPE_VERSION = 3u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -164,6 +171,7 @@ struct pipe_expert_assignment {
 //   i32 layer
 //   u32 n_tokens
 //   u32 n_assignments
+//   f32 swiglu_clamp
 //   repeated { i32 expert_id; f32 weights[n_tokens] }
 //   f16 activations[n_tokens * n_embd]
 struct pipe_expert_dispatch_req {
@@ -171,6 +179,24 @@ struct pipe_expert_dispatch_req {
     uint32_t                            n_tokens = 0;
     std::vector<pipe_expert_assignment> assignments;
     std::vector<uint16_t>               activations;
+
+    // *** ADDED 2026-08-05 -- THIS WAS A CORRECTNESS BUG. ***
+    // hparams.swiglu_clamp_exp[layer] for this layer; <= 0 means "no clamp".
+    // DS4-Flash-0731 ships deepseek4.swiglu_clamp_exp = 10.0, and in the
+    // DISTRIBUTED configuration that clamp was applied NOWHERE:
+    //   1. llama-graph.cpp build_moe_ffn() returns at the `expert_dispatch != nullptr`
+    //      branch BEFORE reaching the clamped SwiGLU switch, so the spine never
+    //      applies it -- the clamp is dead code whenever --expert-dispatch is on.
+    //   2. wp-expert-worker.cpp computed a bare ggml_swiglu_split(gate, up).
+    //   3. There was no field on the wire, so the limit could not even REACH a worker.
+    // Net effect: every routed expert on every layer computed silu(g)*u instead of
+    // silu(min(g, limit)) * clamp(u, -limit, limit). Deterministic, backend- and
+    // width-independent, and invisible to WP_SELFCHECK (which compares gather vs
+    // dense -- both arms unclamped) and to WP_EXPERT_GATHER=0 (which only changes
+    // the graph shape INSIDE a worker, not the FFN nonlinearity).
+    // The shared expert is computed on the spine and goes through the normal
+    // build_ffn path, so swiglu_clamp_shexp was never affected.
+    float                               swiglu_clamp = 0.0f;
 };
 
 // Payload:
@@ -178,9 +204,23 @@ struct pipe_expert_dispatch_req {
 //   u32 n_tokens
 //   f16 partial[n_tokens * n_embd]
 struct pipe_expert_partial {
-    int32_t               layer    = -1;
-    uint32_t              n_tokens = 0;
-    std::vector<uint16_t> partial;
+    int32_t            layer    = -1;
+    uint32_t           n_tokens = 0;
+    // *** f32, NOT f16. CHANGED 2026-08-04 -- THIS WAS A CORRECTNESS BUG. ***
+    // Each worker sums ITS OWN subset of a layer's experts in f32 and the spine adds
+    // the per-worker subtotals. Sending the subtotal as f16 rounded it to an 11-bit
+    // mantissa (~5e-4 relative) AT THE PARTITION BOUNDARY, so the final MoE output
+    // depended on WHICH WORKER GOT WHICH EXPERT -- and that assignment is chosen by
+    // choose_worker() from residency, in-request assigned counts, and a rotating
+    // machine cursor, all of which move with batch width. Net effect: changing the
+    // speculative draft length (i.e. conf_min) silently changed the generated text at
+    // temperature 0, because moving one expert between workers re-rounded two
+    // subtotals and perturbed the layer output by ~1e-3 relative -- four orders of
+    // magnitude above f32 reordering noise -- which the hyper-connection gates and the
+    // discontinuous router top-k then amplified into a different trajectory.
+    // f32 removes the amplifier entirely; what remains is ordinary f32 reordering
+    // (~1e-7). Costs 2x bytes on the partial-return path only.
+    std::vector<float> partial;
 };
 
 // ---------------------------------------------------------------------------

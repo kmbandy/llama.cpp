@@ -46,6 +46,10 @@ static constexpr int          N_FF_EXP       = 32;
 static constexpr int          N_EXPERT       = 4;
 static constexpr int          LAYER          = 3;
 static constexpr int          N_TOKENS       = 2;
+// Deliberately NON-ZERO: 0 means "no clamp", so a zero here would leave the
+// swiglu_clamp wire field (PIPE_VERSION 3) untested by every dispatch test.
+// Not 10.0 either -- a distinctive value catches a field silently defaulting.
+static constexpr float        TEST_SWIGLU_CLAMP = 7.5f;
 static constexpr const char * MODEL_IDENTITY = "sha256:synthetic-shared-model";
 
 void require(bool condition, const std::string & message) {
@@ -419,7 +423,7 @@ void test_graph_op(const weight_map & weights,
 
     pipe_expert_dispatcher::graph_dispatcher dispatcher(
         endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
-    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, w, LAYER);
+    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, w, LAYER, TEST_SWIGLU_CLAMP);
     ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
     ggml_build_forward_expand(gf, out);
     dispatcher.begin_decode();
@@ -628,6 +632,15 @@ struct selection_server {
                             "selection server expected expert dispatch");
                     const pipe_expert_dispatch_req request =
                         pipe_decode_expert_dispatch_req(payload.data(), payload.size(), N_EMBD);
+                    // REGRESSION GUARD (2026-08-05): the SwiGLU clamp must actually
+                    // ARRIVE AT A WORKER. Its absence was a silent correctness bug --
+                    // the spine's clamped SwiGLU is unreachable on the dispatch path,
+                    // the worker computed a bare swiglu_split, and no wire field
+                    // existed, so every routed expert on every layer ran unclamped.
+                    // Asserting it end-to-end (encode -> frame -> decode) is what a
+                    // same-process struct round-trip would NOT have caught.
+                    require(request.swiglu_clamp == TEST_SWIGLU_CLAMP,
+                            "swiglu clamp did not survive dispatch to the worker");
                     for (const pipe_expert_assignment & assignment : request.assignments) {
                         assigned_experts.push_back(assignment.expert_id);
                     }
@@ -677,7 +690,7 @@ struct selection_server {
 void selection_dispatch(pipe_expert_dispatcher::dispatcher & dispatcher, uint64_t seq_id, int32_t expert) {
     dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), {
         { expert, { 1.0f } },
-    });
+    }, TEST_SWIGLU_CLAMP);
 }
 
 void selection_dispatch_batch(pipe_expert_dispatcher::dispatcher & dispatcher, uint64_t seq_id,
@@ -686,7 +699,7 @@ void selection_dispatch_batch(pipe_expert_dispatcher::dispatcher & dispatcher, u
     for (int32_t expert = first_expert; expert < first_expert + n_experts; ++expert) {
         assignments.push_back({ expert, { 1.0f } });
     }
-    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), assignments);
+    dispatcher.dispatch(LAYER, seq_id, 1, std::vector<uint16_t>(N_EMBD, 0), assignments, TEST_SWIGLU_CLAMP);
 }
 
 bool contains_expert(const selection_server & server, int32_t expert) {
@@ -799,7 +812,7 @@ std::string expect_dispatch_error(fault_mode mode, int32_t expert_id, bool test_
         dispatcher.dispatch(LAYER, 100 + (uint64_t) expert_id, N_TOKENS, activations,
                             {
                                 { expert_id, { 1.0f, 0.0f } }
-        });
+        }, TEST_SWIGLU_CLAMP);
     } catch (const std::runtime_error & error) {
         message = error.what();
     }
@@ -809,7 +822,7 @@ std::string expect_dispatch_error(fault_mode mode, int32_t expert_id, bool test_
             dispatcher.dispatch(LAYER, 200 + (uint64_t) expert_id, N_TOKENS, activations,
                                 {
                                     { expert_id, { 1.0f, 0.0f } }
-            });
+            }, TEST_SWIGLU_CLAMP);
         } catch (const std::runtime_error & error) {
             poisoned_message = error.what();
         }
@@ -864,7 +877,7 @@ void test_graph_failure_isolation() {
     const std::string endpoints = "127.0.0.1:" + std::to_string(server.port);
     pipe_expert_dispatcher::graph_dispatcher dispatcher(
         endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
-    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER);
+    ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER, TEST_SWIGLU_CLAMP);
     ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
     ggml_build_forward_expand(gf, out);
 
@@ -908,7 +921,7 @@ void test_graph_local_failure_short_circuit() {
         const std::string endpoints = "127.0.0.1:" + std::to_string(server.port);
         pipe_expert_dispatcher::graph_dispatcher dispatcher(
             endpoints, N_EMBD, N_FF_EXP, N_EXPERT, N_EXPERT);
-        ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER);
+        ggml_tensor * out = dispatcher.build(ctx.get(), inp, ids, weights, LAYER, TEST_SWIGLU_CLAMP);
         ggml_cgraph * gf  = ggml_new_graph_custom(ctx.get(), 16, false);
         ggml_build_forward_expand(gf, out);
 
@@ -1017,7 +1030,7 @@ void run_test() {
                 "different shard identities were not preserved");
         require(!dispatcher.model_identity().empty(), "logical model identity is empty");
         const std::vector<float> actual =
-            dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments);
+            dispatcher.dispatch(LAYER, 42, N_TOKENS, activation_f16, assignments, TEST_SWIGLU_CLAMP);
         require(actual.size() == expected.size(), "reduced output shape mismatch");
         for (size_t i = 0; i < expected.size(); ++i) {
             const float tolerance = 0.003f + 0.02f * std::fabs(expected[i]);

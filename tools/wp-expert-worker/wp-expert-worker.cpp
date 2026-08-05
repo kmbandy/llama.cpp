@@ -93,6 +93,16 @@ struct RequestStats {
     uint64_t ns_encode = 0;        // fp32 -> fp16 of the reply
     uint64_t ns_h2d = 0;
     uint64_t bytes_h2d = 0;
+    // ROUTING DENSITY (2026-08-04). compute_batch runs the FULL FFN for every
+    // assigned expert over ALL request.n_tokens and then multiplies by a
+    // per-token router weight that is ZERO for tokens not routed to that expert
+    // (pipe-protocol.h: "one final router weight per token"). So the useful
+    // fraction of the expert FLOPs is exactly the nonzero fraction of those
+    // weights. Counting it directly rather than inferring it from
+    // n_expert_used/n_expert, because the assignment list only contains experts
+    // that got at least one token, which biases the naive estimate.
+    uint64_t n_weight_nonzero = 0;   // token-expert pairs actually routed
+    uint64_t n_weight_total   = 0;   // token-expert pairs actually COMPUTED
 };
 
 // Forward declarations: the probe itself is defined further down, next to
@@ -172,6 +182,8 @@ public:
         ns_pagein_compute_ += request.ns_pagein_compute;
         ns_result_ += request.ns_result;
         ns_encode_ += request.ns_encode;
+        n_weight_nonzero_ += request.n_weight_nonzero;
+        n_weight_total_   += request.n_weight_total;
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
         ++n_requests_;
@@ -236,6 +248,8 @@ private:
                   << " ns_pagein_compute=" << ns_pagein_compute_
                   << " ns_result=" << ns_result_
                   << " ns_encode=" << ns_encode_
+                  << " n_weight_nonzero=" << n_weight_nonzero_
+                  << " n_weight_total=" << n_weight_total_
                   << " submit_us_min=" << (submit_min_ns_ == UINT64_MAX ? 0 : submit_min_ns_ / 1000)
                   << " submit_us_max=" << (submit_max_ns_ / 1000)
                   << " submit_hist_us[<125,<250,<500,<1k,<2k,<4k,<8k,>=8k]="
@@ -290,6 +304,8 @@ private:
     uint64_t          ns_pagein_compute_ = 0;
     uint64_t          ns_result_ = 0;
     uint64_t          ns_encode_ = 0;
+    uint64_t          n_weight_nonzero_ = 0;
+    uint64_t          n_weight_total_ = 0;
     uint64_t          ns_h2d_     = 0;
     uint64_t          bytes_h2d_  = 0;
     std::string       staging_kind_ = "unknown";
@@ -2276,7 +2292,46 @@ public:
         // It is a one-time cost, so pay it here with the rest of startup.
         {
             RequestStats warmup;
-            grow_io_buffer(1u << 20, warmup);
+            // *** THE 1 MiB FLOOR WAS SIZED FOR DECODE AND RE-OPENS THE BUG IT FIXED. ***
+            // prepare_io needs n_embd * n_tokens * sizeof(f32) TWICE (input + result).
+            // At n_embd=4096 that is 8 KB per buffer for a decode step (n_tokens=1)
+            // but 16.8 MB for a prefill ubatch (n_tokens=512) -- so with a 1 MiB floor
+            // ANY real prompt forces the io buffer to grow WHILE SERVING, which is
+            // precisely the allocation this pre-allocation exists to avoid.
+            //
+            // MEASURED 2026-08-03 on the RX 480, 739-token prompt, n_ubatch=512:
+            //   wp io-buffer grow #2: 1048576 -> 7307264      (during serving)
+            //   wp io-buffer grow #3: 7307264 -> 16777216     (during serving)
+            //   submit_us_max 219828 -> 1074753 -> 1290431    <- 1.29 SECOND submits
+            //   submit_hist >=8ms: 62 on the 480 vs 14 on the 1070
+            // The 480 measured 2.35x the 1070's per-request submit during prefill and
+            // only 1.26x during decode -- the gap tracks n_tokens because the GROWTHS
+            // track n_tokens. The card is not the problem; this floor is.
+            // Yesterday's parity result stands: it was taken at a 6-token prompt, where
+            // the buffer never outgrows 1 MiB and no in-serving allocation ever happens.
+            //
+            // WP_IO_PREALLOC_TOKENS overrides the assumed max ubatch. Default 512 =
+            // llama.cpp's default n_ubatch. COST IS TRIVIAL: 16.8 MB at 512, 33.6 MB at
+            // 1024, against an 8 GB card -- and it must be raised ALONGSIDE n_ubatch,
+            // or the n_ubatch lever re-triggers this exact stall at the larger size.
+            uint32_t prealloc_tokens = 512;
+            if (const char * env = std::getenv("WP_IO_PREALLOC_TOKENS")) {
+                if (env[0] != '\0') {
+                    prealloc_tokens = (uint32_t) std::strtoul(env, nullptr, 10);
+                }
+            }
+            size_t want = 1u << 20;
+            if (prealloc_tokens > 0) {
+                // Mirror prepare_io's layout: a padded input plus an equal result,
+                // with slack for buffer-type alignment.
+                const size_t one =
+                    (size_t) catalog_.descriptor.hparams.n_embd * prealloc_tokens * sizeof(float);
+                want = std::max(want, 2 * (one + 65536));
+            }
+            fprintf(stderr,
+                    "wp io-buffer prealloc: %zu bytes for n_tokens<=%u (n_embd=%u)\n",
+                    want, prealloc_tokens, (unsigned) catalog_.descriptor.hparams.n_embd);
+            grow_io_buffer(want, warmup);
         }
         stats_.set_probe_backend(backend_.get());
         run_self_bench(backend_.get(),
@@ -2418,10 +2473,29 @@ public:
             phase = now;
             return ns;
         };
+        // *** DETERMINISM: ONE PASS, INDEX ORDER, AFTER complete(). ***
+        // This used to compute the RESIDENT experts first (overlapping the
+        // page-in I/O), then the newly-paged-in ones, chaining the two partial
+        // sums. That made the floating-point ASSOCIATION depend on which pages
+        // happened to be resident when the graph was built:
+        //     all resident   : total = h1 + h2 + h3 + h4
+        //     expert 2 a miss: total = (h1 + h3 + h4) + m2
+        // Same experts, same weights, different rounding -- and membership turns
+        // on whether the PREVIOUS request's page-ins had landed yet, i.e. on I/O
+        // timing. FP addition is not associative, so the worker returned a
+        // slightly different sum run to run. f16 KV absorbed it; turbo4 amplified
+        // a last-bit delta into a 4-bit centroid flip and thence a router top-k
+        // change, which is how it surfaced (2026-08-03: 3 of 3 pairs divergent
+        // with the CPU DSpark worker, 0 of 12 without it).
+        // Measured cost of dropping the overlap: see WP_EXPERT_OVERLAP below.
+        static const bool overlap = [] {
+            const char * e = std::getenv("WP_EXPERT_OVERLAP");
+            return e != nullptr && e[0] == '1';   // default OFF = deterministic
+        }();
         if (!request.assignments.empty()) {
             prepare_io(activation, request.n_tokens, request_stats);
             request_stats.ns_prep = lap();
-            if (have_hits) {
+            if (overlap && have_hits) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
@@ -2435,7 +2509,14 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
         }
-        if (have_pageins) {
+        if (!overlap) {
+            if (!request.assignments.empty()) {
+                compute_batch(
+                    request, pages, batch, /* hits = */ true,
+                    /* add_previous = */ false, request_stats,
+                    /* all_experts = */ true);
+            }
+        } else if (have_pageins) {
             compute_batch(
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
@@ -2445,6 +2526,56 @@ public:
             read_result(sum, request_stats);
         }
         request_stats.ns_result = lap();
+
+        // *** WP_SELFCHECK=1: EQUIVALENCE PROBE (default OFF, diagnostic only). ***
+        // THE INVARIANT UNDER TEST: an expert's contribution to a token must not
+        // depend on how many OTHER tokens shared its batch. gather changes the graph
+        // shape with batch width (get_rows -> matmul at compacted width ->
+        // get_rows_back) while dense does not, so if the two disagree the expert path
+        // is batch-width-dependent and THAT is the foundational bug.
+        // WHY THIS MATTERS (2026-08-04): conf_min changes ONLY n_draft, i.e. the verify
+        // batch width -- yet it changed the generated text at temperature 0. Under
+        // correct speculative decoding the target's logits cannot depend on the draft,
+        // so something downstream of batch width is not width-invariant. This probe
+        // answers that directly instead of inferring it from throughput.
+        // PRECEDENT: this exact code already had one width-dependent defect -- the
+        // routing-weight orientation, "correct only at n_tokens == 1, so decode looked
+        // fine while PREFILL was corrupted and poisoned the KV cache."
+        static const bool s_selfcheck = [] {
+            const char * e = std::getenv("WP_SELFCHECK");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (s_selfcheck && !request.assignments.empty() && !sum.empty()) {
+            std::vector<float> dense(sum.size(), 0.0f);
+            compute_batch(
+                request, pages, batch, /* hits = */ true,
+                /* add_previous = */ false, request_stats,
+                /* all_experts = */ true, /* force_dense = */ true);
+            read_result(dense, request_stats);
+            double max_abs = 0.0, max_rel = 0.0, sum_abs = 0.0;
+            size_t worst = 0;
+            for (size_t i = 0; i < sum.size(); ++i) {
+                const double a = (double) sum[i], b = (double) dense[i];
+                const double d = std::fabs(a - b);
+                sum_abs += d;
+                if (d > max_abs) { max_abs = d; worst = i; }
+                const double den = std::max(std::fabs(a), std::fabs(b));
+                if (den > 1e-6) { max_rel = std::max(max_rel, d / den); }
+            }
+            std::fprintf(stderr,
+                "WP_SELFCHECK layer=%d n_tokens=%u n_exp=%zu "
+                "max_abs=%.6g max_rel=%.6g mean_abs=%.6g worst_i=%zu "
+                "gather=%.6g dense=%.6g %s\n",
+                request.layer, request.n_tokens, request.assignments.size(),
+                max_abs, max_rel, sum_abs / (double) sum.size(), worst,
+                (double) sum[worst], (double) dense[worst],
+                max_rel > 1e-3 ? "*** MISMATCH ***" : "ok");
+            // NOTE: `sum` already holds the GATHER result (read above) and is what the
+            // caller ships to the spine. The dense recompute overwrote only the io
+            // buffer's result region, which is not read again. Do NOT re-read into
+            // `sum` here -- that would ship the dense result and silently change what
+            // the probe is supposed to be observing.
+        }
         if (measure) {
             request_stats.ns_compute =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2454,10 +2585,11 @@ public:
         pipe_expert_partial response;
         response.layer    = request.layer;
         response.n_tokens = request.n_tokens;
-        response.partial.resize(sum.size());
-        for (size_t i = 0; i < sum.size(); ++i) {
-            response.partial[i] = (uint16_t) ggml_fp32_to_fp16(sum[i]);
-        }
+        // f32, not f16: this subtotal is only PART of the layer's expert sum -- the
+        // spine adds the other workers' subtotals to it. Rounding a partial sum to f16
+        // put a ~5e-4 relative error at the expert->worker partition boundary, so the
+        // layer output depended on which worker happened to get which expert.
+        response.partial.assign(sum.begin(), sum.end());
         request_stats.ns_encode = lap();
         return response;
     }
@@ -2610,24 +2742,94 @@ private:
         sublap(request_stats.ns_prep_set);
     }
 
+    // all_experts=true builds ONE graph over every assignment in index order,
+    // ignoring residency. See the determinism note on handle_request: splitting
+    // by residency makes the floating-point ASSOCIATION depend on I/O timing.
     void compute_batch(
             const pipe_expert_dispatch_req & request,
             const std::vector<const ExpertPage *> & pages,
             const ExpertSlotPool::Batch & batch,
             bool hits,
             bool add_previous,
-            RequestStats & request_stats) {
+            RequestStats & request_stats,
+            bool all_experts = false,
+            // force_dense: ignore the gather path for this call only. Used by
+            // WP_SELFCHECK to compute the SAME request both ways and diff them.
+            bool force_dense = false) {
         size_t n_selected = 0;
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            n_selected += batch.is_resident(i) == hits;
+            n_selected += all_experts || (batch.is_resident(i) == hits);
         }
         if (n_selected == 0) {
             return;
         }
 
+        // *** ROUTING-DENSITY GATHER/SCATTER (WP_EXPERT_GATHER=1, default OFF). ***
+        // MEASURED 2026-08-04: at n_tokens=512 an assigned expert receives only
+        // ~3.5% of the tokens, so the dense path below multiplies 96.5% of its
+        // expert FLOPs by a ZERO router weight (28.7x waste in PREFILL; VERIFY is
+        // 2.3x; decode is exactly 1.0x and thus unaffected). This path instead
+        // gathers each expert's routed tokens with ggml_get_rows, runs the FFN at
+        // the compacted width, and scatters back with ggml_get_rows_back (whose
+        // semantics are precisely scatter-ADD: it sums every source row mapping to
+        // the same destination row).
+        // RISK, WHICH IS WHY THIS IS A FLAG AND NOT A REWRITE: get_rows_back is the
+        // gradient of a gather and its kernel is O(ncols * nrows_dst * nrows_grad) --
+        // it rescans every source row for each destination row. That is ~41G scan
+        // ops per prefill run here, which could plausibly eat the ~13s of expert
+        // compute it saves. MEASURE BOTH ARMS; do not assume.
+        // *** CONFIG OF RECORD 2026-08-04: DEFAULT ON. *** Measured +25.8% prefill on
+        // its own at n_ubatch=512, and SUPER-ADDITIVE with n_ubatch: the pair
+        // (ub1024 + gather) is +67.3% against +45.3% predicted multiplicatively,
+        // because a wider ubatch manufactures more zero-weight work for gather to
+        // strip.
+        // Set WP_EXPERT_GATHER=0 to fall back to the dense masked path.
+        //
+        // *** CORRECTION 2026-08-04 EVENING: "decode is unaffected" WAS WRONG. ***
+        // That claim (previously on this line) rested on decode TOK/S, which sits
+        // inside this harness's ~11.5% same-config noise floor and so could not have
+        // resolved the effect. The spine's per-token decode dispatch wait CAN: eight
+        // paired dense-vs-gather arms, alternating within one sweep, put gather at
+        // +100 ms/token on that number, 8 for 8 (dense 177-253 ms -> gather 290-366 ms).
+        // MECHANISM, and it is not subtle: decode routing density is EXACTLY 100%
+        // (measured pre-gather; at n_tokens=1 an assigned expert has that token routed
+        // by definition). So at decode ggml_get_rows compacts NOTHING and
+        // ggml_get_rows_back scatters NOTHING back -- gather is pure added graph nodes
+        // per expert per layer buying zero saved FLOPs. It is a prefill optimisation
+        // that was billed to decode.
+        // Hence WP_EXPERT_GATHER_MIN_TOKENS: gather only once a request is wide enough
+        // for the compaction to pay for its own nodes. Default 2 = bypass at decode.
+        // Set it to 1 to restore the always-gather behaviour (the A/B control).
+        static const bool s_gather = [] {
+            const char * e = std::getenv("WP_EXPERT_GATHER");
+            return e == nullptr || e[0] != '0';   // default ON
+        }();
+        // *** DEFAULT 1 = GATHER ALWAYS, i.e. EXACTLY THE MEASURED CONFIG OF RECORD. ***
+        // This briefly defaulted to 2 on 2026-08-04, which silently put the untested
+        // decode bypass into every run -- including the arm I was calling the control.
+        // A change ships as a DEFAULT only after it is measured; until then it is an
+        // opt-in flag. Set 2 to test the bypass (#25): decode routing density is exactly
+        // 100%, so at n_tokens==1 gather compacts nothing and only adds graph nodes,
+        // measured at +100 ms/token across 8 of 8 paired arms. Still UNMEASURED as a
+        // fix, because its A/B was confounded by WP_EXPERT_OVERLAP (see #23) and killed.
+        static const int s_gather_min_tokens = [] {
+            const char * e = std::getenv("WP_EXPERT_GATHER_MIN_TOKENS");
+            const int v = e ? atoi(e) : 1;        // default 1 -> gather always (config of record)
+            return v < 1 ? 1 : v;
+        }();
+        // PER-REQUEST, not static: prefill and decode requests interleave in one
+        // worker, so this must be decided per request and never cached.
+        const bool use_gather = s_gather && !force_dense &&
+                                (int64_t) request.n_tokens >= (int64_t) s_gather_min_tokens;
         const auto build_started = std::chrono::steady_clock::now();
-        const size_t tensor_count = 12 * n_selected + 8;
-        const size_t graph_nodes = 6 * n_selected + 3;
+        // gather adds per expert: idx, sub_input, scattered (+ the add) -- budget
+        // generously, ggml_init only reserves metadata.
+        // +2 tensors / +2 nodes per expert for the SwiGLU clamp pair (up, gate)
+        // added 2026-08-05. These are budgeted unconditionally even when the
+        // clamp is off: under-budgeting the graph is a hard allocation failure,
+        // and ggml_init only reserves metadata, so the slack is free.
+        const size_t tensor_count = (s_gather ? 20 : 14) * n_selected + 8;
+        const size_t graph_nodes  = (s_gather ? 12 :  8) * n_selected + 3;
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
                               ggml_graph_overhead_custom(graph_nodes, false),
@@ -2646,9 +2848,13 @@ private:
         ggml_tensor * sum = nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
+        // Parallel to routing_weights: the gathered token indices per expert, kept
+        // alive until after ggml_gallocr_alloc_graph so they can be uploaded.
+        std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> gather_idx;
+        gather_idx.reserve(n_selected);
 
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            if (batch.is_resident(i) != hits) {
+            if (!all_experts && batch.is_resident(i) != hits) {
                 continue;
             }
             const ExpertPage & page = *pages[i];
@@ -2663,8 +2869,47 @@ private:
                 return tensor;
             };
 
-            ggml_tensor * gate = ggml_mul_mat(ctx.get(), make_weight("gate"), input);
-            ggml_tensor * up   = ggml_mul_mat(ctx.get(), make_weight("up"), input);
+            // GATHER: restrict this expert to the tokens actually routed to it.
+            ggml_tensor * ffn_in = input;
+            ggml_tensor * idx_t  = nullptr;
+            std::vector<int32_t> idx;
+            if (use_gather) {
+                const auto & wv = request.assignments[i].weights;
+                idx.reserve(wv.size());
+                for (size_t t = 0; t < wv.size(); ++t) {
+                    if (wv[t] != 0.0f) { idx.push_back((int32_t) t); }
+                }
+                if (idx.empty()) {
+                    // No token routed to this expert in this ubatch. Skipping it
+                    // outright is WRONG: if EVERY selected expert is empty, `sum`
+                    // stays nullptr and ggml_cpy(sum, result) segfaults in
+                    // ggml_nelements -- which is exactly how the first build of
+                    // this path killed the RX 480 worker mid-prefill.
+                    // Instead keep ONE row whose router weight is zero. Its
+                    // contribution is exactly 0.0, identical to what the dense
+                    // path computed, and it costs a single N=1 FFN.
+                    idx.push_back(0);
+                }
+                idx_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) idx.size());
+                ggml_set_input(idx_t);
+                ffn_in = ggml_get_rows(ctx.get(), input, idx_t);
+            }
+            ggml_tensor * gate = ggml_mul_mat(ctx.get(), make_weight("gate"), ffn_in);
+            ggml_tensor * up   = ggml_mul_mat(ctx.get(), make_weight("up"), ffn_in);
+            // *** SwiGLU CLAMP. ADDED 2026-08-05 -- ITS ABSENCE WAS A CORRECTNESS BUG. ***
+            // Mirrors the LLM_ARCH_DEEPSEEK4 branch of build_moe_ffn() in
+            // src/llama-graph.cpp EXACTLY: up is clamped symmetrically, the GATE is
+            // clamped ABOVE ONLY (-INFINITY lower bound) and fed to swiglu_split,
+            // which applies silu to it. Do not "simplify" this to a symmetric gate
+            // clamp or to silu-then-clamp -- those are the OTHER architectures'
+            // branch and give different numbers.
+            // The spine cannot do this for us: build_moe_ffn() returns at the
+            // `expert_dispatch != nullptr` branch before ever reaching the clamp.
+            const float swiglu_limit = request.swiglu_clamp;
+            if (swiglu_limit > 1e-6f) {
+                up   = ggml_clamp(ctx.get(), up,   -swiglu_limit, swiglu_limit);
+                gate = ggml_clamp(ctx.get(), gate, -INFINITY,     swiglu_limit);
+            }
             ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate, up);
             ggml_tensor * output = ggml_mul_mat(ctx.get(), make_weight("down"), hidden);
             // SHAPE MATTERS: [1, n_tokens], NOT [n_tokens]. output is
@@ -2675,15 +2920,30 @@ private:
             // silently wrong, no assert. It is correct only at n_tokens == 1,
             // where both readings coincide, so decode looked fine while PREFILL
             // was corrupted and poisoned the KV cache.
+            const int64_t n_rows = use_gather ? (int64_t) idx.size() : request.n_tokens;
             ggml_tensor * weights =
-                ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, request.n_tokens);
+                ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_rows);
             ggml_set_input(weights);
             ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
+            if (use_gather) {
+                // SCATTER-ADD back to full token width. get_rows_back sums every
+                // source row that maps to the same destination row, and rows this
+                // expert did not touch stay zero -- which is exactly the dense
+                // path's zero-weight contribution, so the sum below is unchanged.
+                weighted = ggml_get_rows_back(ctx.get(), weighted, idx_t, input);
+            }
             sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
             routing_weights.emplace_back(weights, &request.assignments[i]);
+            gather_idx.emplace_back(idx_t, std::move(idx));
         }
         if (add_previous) {
             sum = ggml_add(ctx.get(), sum, result);
+        }
+        if (sum == nullptr) {
+            // Defensive: nothing contributed. Cannot happen now that empty experts
+            // keep a zero-weight row, but a null here segfaults inside ggml_cpy
+            // with no diagnostic, so refuse loudly rather than crash the worker.
+            throw std::runtime_error("expert compute produced no contribution");
         }
         ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
@@ -2701,10 +2961,31 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - build_started).count();
 
-        for (const auto & item : routing_weights) {
-            ggml_backend_tensor_set(
-                item.first, item.second->weights.data(), 0,
-                item.second->weights.size() * sizeof(float));
+        for (size_t k = 0; k < routing_weights.size(); ++k) {
+            const auto & item = routing_weights[k];
+            const auto & wv = item.second->weights;
+            uint64_t nz = 0;
+            for (float f : wv) { nz += (f != 0.0f); }
+            request_stats.n_weight_nonzero += nz;
+            // n_weight_total is what was actually COMPUTED, so it must follow the
+            // path taken: the compacted row count when gathering, the full ubatch
+            // when not. Otherwise the density counter would report the dense
+            // figure even after the fix and hide whether it worked.
+            if (use_gather) {
+                const auto & idx = gather_idx[k].second;
+                std::vector<float> compact;
+                compact.reserve(idx.size());
+                for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
+                request_stats.n_weight_total += compact.size();
+                ggml_backend_tensor_set(
+                    item.first, compact.data(), 0, compact.size() * sizeof(float));
+                ggml_backend_tensor_set(
+                    gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t));
+            } else {
+                request_stats.n_weight_total += wv.size();
+                ggml_backend_tensor_set(
+                    item.first, wv.data(), 0, wv.size() * sizeof(float));
+            }
         }
         const auto submit_started = std::chrono::steady_clock::now();
         const enum ggml_status status =
@@ -2814,10 +3095,22 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     }
 
     // WP_REQ_LOG=path -- one line per dispatch request. Columns:
-    //   layer n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep ns_hits
-    //   ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit ns_readback
-    //   ns_encode ns_send
+    //   layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep
+    //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
+    //   ns_readback ns_encode ns_send
     // Segment into tokens by watching request.layer wrap back to its minimum.
+    //
+    // n_tokens (added 2026-08-03) IS THE PREFILL/DECODE LABEL, and it is the whole
+    // reason this log can now answer "where does prefill go". n_tokens > 1 is a
+    // prefill ubatch, n_tokens == 1 is a decode step -- the dispatcher already
+    // relies on exactly this test to disable deferral (pipe-expert-dispatcher.cpp
+    // :969), so the semantics are not invented here, only recorded.
+    //
+    // Until now EVERY phase timer in this file was un-attributable: prefill and
+    // decode requests interleave in one stream and the only way to tell them apart
+    // was to guess from n_exp. That made the 18 columns below useless for the one
+    // question that matters (prefill is 33.9 ms/token and decode is 6.5 tok/s --
+    // WHICH of these phases owns which?). One integer fixes it.
     FILE * const req_log = [] {
         const char * p = std::getenv("WP_REQ_LOG");
         return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
@@ -2936,9 +3229,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                         std::chrono::steady_clock::now() - req_started).count();
                 const RequestStats & s = request_stats;
                 fprintf(req_log,
-                        "%d %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
-                        "%llu %llu %llu %llu %llu %llu\n",
-                        request.layer, request.assignments.size(),
+                        "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+                        "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+                        request.layer, request.n_tokens, request.assignments.size(),
                         (unsigned long long) s.n_resident,
                         (unsigned long long) s.n_pagein,
                         (unsigned long long) s.bytes_read,
@@ -2954,7 +3247,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                         (unsigned long long) s.ns_submit,
                         (unsigned long long) s.ns_readback,
                         (unsigned long long) s.ns_encode,
-                        (unsigned long long) s.ns_send);
+                        (unsigned long long) s.ns_send,
+                        // ROUTING DENSITY, per request, so it can be split by
+                        // n_tokens (col 2). Appended at the END: the format is
+                        // POSITIONAL and older parsers index from the left, so
+                        // adding columns here keeps every existing parser working.
+                        (unsigned long long) s.n_weight_nonzero,
+                        (unsigned long long) s.n_weight_total);
                 fflush(req_log);
             }
         } catch (const pipe_protocol_error & error) {

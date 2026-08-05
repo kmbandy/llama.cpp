@@ -385,7 +385,11 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
     if (p.n_tokens == 0 || p.assignments.empty()) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch requires tokens and assignments");
     }
-    uint64_t total = 12;
+    if (!std::isfinite(p.swiglu_clamp) || p.swiglu_clamp < 0.0f) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has an invalid swiglu clamp");
+    }
+    // 16, not 12: + f32 swiglu_clamp as of PIPE_VERSION 3.
+    uint64_t total = 16;
     for (const pipe_expert_assignment & assignment : p.assignments) {
         if (assignment.weights.size() != p.n_tokens) {
             fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch weight count does not match n_tokens");
@@ -403,6 +407,7 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
     wr_u32(w, (uint32_t) p.assignments.size());
+    wr_f32(w, p.swiglu_clamp);
     for (const pipe_expert_assignment & assignment : p.assignments) {
         wr_i32(w, assignment.expert_id);
         for (float weight : assignment.weights) {
@@ -417,7 +422,7 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_
 
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
         const uint8_t * buf, size_t len, int32_t n_embd) {
-    if (n_embd <= 0 || len < 12) {
+    if (n_embd <= 0 || len < 16) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch payload is too small");
     }
     const uint8_t * p   = buf;
@@ -427,8 +432,12 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     r.layer               = rd_i32(p);
     r.n_tokens            = rd_u32(p);
     const uint32_t n_assignments = rd_u32(p);
+    r.swiglu_clamp        = rd_f32(p);
     if (r.layer < 0 || r.n_tokens == 0 || n_assignments == 0) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has invalid dimensions");
+    }
+    if (!std::isfinite(r.swiglu_clamp) || r.swiglu_clamp < 0.0f) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch has an invalid swiglu clamp");
     }
 
     const uint64_t assignment_bytes =
@@ -472,7 +481,10 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
 // expert partial response
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
-    const uint64_t total = 8ull + (uint64_t) p.partial.size() * 2ull;
+    // 4 bytes per value: partials are f32 as of PIPE_VERSION 2. See the note on
+    // pipe_expert_partial -- f16 subtotals made the MoE result depend on the
+    // expert->worker partition, which moves with batch width.
+    const uint64_t total = 8ull + (uint64_t) p.partial.size() * 4ull;
     if (p.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial response");
     }
@@ -480,8 +492,8 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
-    for (uint16_t value : p.partial) {
-        wr_u16(w, value);
+    for (float value : p.partial) {
+        wr_f32(w, value);
     }
     return out;
 }
@@ -497,12 +509,12 @@ pipe_expert_partial pipe_decode_expert_partial(
     r.layer    = rd_i32(p);
     r.n_tokens = rd_u32(p);
     const uint64_t n_values = (uint64_t) r.n_tokens * (uint64_t) n_embd;
-    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * 2ull) {
+    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * 4ull) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
     }
     r.partial.reserve((size_t) n_values);
     for (uint64_t i = 0; i < n_values; ++i) {
-        r.partial.push_back(rd_u16(p));
+        r.partial.push_back(rd_f32(p));
     }
     return r;
 }

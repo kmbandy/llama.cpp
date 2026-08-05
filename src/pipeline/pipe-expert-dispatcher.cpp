@@ -475,6 +475,40 @@ struct dispatcher::impl {
                          int32_t                     expert,
                          const std::vector<size_t> & candidates,
                          const std::vector<size_t> & assigned_counts) {
+        // *** STATIC ASSIGNMENT (default ON, 2026-08-04). REPRODUCIBILITY FIX. ***
+        // The balancing path below chooses from residency, in-request assigned_counts,
+        // and a rotating machine_cursor -- all of which move with batch width and
+        // request history. On this fleet THREE workers on THREE DIFFERENT BACKENDS
+        // (CUDA 1070, Vulkan RX480, CPU) all advertise experts 0..84, so the same
+        // expert could execute on a different backend from one run to the next. The
+        // comment on harvest_partials already recorded the consequence: "Worker
+        // ASSIGNMENT is already timing-dependent -- ~35% of requests differ between
+        // identical runs". Combined with the f16 subtotals (now fixed) that silently
+        // changed generated text at temperature 0 whenever the speculative draft
+        // length changed.
+        // Even with f32 partials a moving partition still re-associates the sum, so
+        // for BITWISE reproducibility the assignment must be a PURE FUNCTION of
+        // (layer, expert). A mixing hash keeps the spread without the state.
+        // WP_DISPATCH_STATIC_ASSIGN=0 restores the old load-balancing behaviour --
+        // faster in principle (it can prefer a worker that already holds the page)
+        // but NOT reproducible. Do not turn it off for any run whose OUTPUT matters.
+        static const bool s_static_assign = [] {
+            const char * e = std::getenv("WP_DISPATCH_STATIC_ASSIGN");
+            return e == nullptr || e[0] != '0';   // default ON
+        }();
+        if (s_static_assign && candidates.size() > 1) {
+            // splitmix64 on (layer, expert): deterministic, well-spread, no state.
+            uint64_t h = ((uint64_t) (uint32_t) layer << 32) ^ (uint32_t) expert;
+            h += 0x9E3779B97F4A7C15ull;
+            h  = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+            h  = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+            h ^=  h >> 31;
+            return candidates[(size_t) (h % (uint64_t) candidates.size())];
+        }
+        if (s_static_assign) {
+            return candidates.front();
+        }
+
         bool any_resident = false;
         for (size_t candidate : candidates) {
             any_resident = any_resident || is_resident(candidate, layer, expert);
@@ -651,7 +685,8 @@ struct dispatcher::impl {
                                                const std::vector<uint16_t> &               activations,
                                                const std::vector<pipe_expert_assignment> & assignments,
                                                const std::vector<std::vector<size_t>> &   layer_routes,
-                                               std::vector<size_t> &                       assigned_counts) {
+                                               std::vector<size_t> &                       assigned_counts,
+                                               float                                       swiglu_clamp) {
         std::vector<planned_request> by_worker(workers.size());
         for (size_t i = 0; i < workers.size(); ++i) {
             by_worker[i].worker_index = i;
@@ -673,6 +708,7 @@ struct dispatcher::impl {
             wire_request.n_tokens    = n_tokens;
             wire_request.assignments = request.assignments;
             wire_request.activations = activations;
+            wire_request.swiglu_clamp = swiglu_clamp;
             request.payload          = pipe_encode_expert_dispatch_req(wire_request);
             requests.push_back(std::move(request));
         }
@@ -708,7 +744,12 @@ struct dispatcher::impl {
                          dispatch_clock::time_point *     last_response) {
         std::vector<uint8_t>  payload;
         // WP_DISPATCH_REQ_LOG=path: one line per request --
-        //   layer worker_index n_experts ns_before_await ns_blocked
+        //   layer n_tokens worker_index n_experts ns_before_await ns_blocked
+        //
+        // n_tokens added 2026-08-03: prefill (>1) vs decode (==1). Without it the
+        // spine-side wire timings could not be split by phase either, so joining
+        // against the worker log to get `wire = ns_blocked - worker_service` gave
+        // one blended number across two workloads that differ by ~500x in tokens.
         //
         // ns_before_await is issue -> the moment we START awaiting this request;
         // the spine is doing its own work (issuing others, awaiting an earlier
@@ -726,8 +767,8 @@ struct dispatcher::impl {
         const pipe_frame_type type = await_response(request, seq_id, payload);
         if (req_log_ != nullptr) {
             const auto now = dispatch_clock::now();
-            fprintf(req_log_, "%d %zu %zu %llu %llu\n", layer, request.worker_index,
-                    request.assignments.size(),
+            fprintf(req_log_, "%d %u %zu %zu %llu %llu\n", layer, n_tokens,
+                    request.worker_index, request.assignments.size(),
                     (unsigned long long) elapsed_ns(request.issued_at, wp_await_t0),
                     (unsigned long long) elapsed_ns(wp_await_t0, now));
             fflush(req_log_);
@@ -773,10 +814,9 @@ struct dispatcher::impl {
                                      " n_tokens=" + std::to_string(partial.n_tokens) +
                                      " want_n_tokens=" + std::to_string(n_tokens) + ")");
         }
-        out.resize(n_values);
-        for (size_t i = 0; i < n_values; ++i) {
-            out[i] = ggml_fp16_to_fp32((ggml_fp16_t) partial.partial[i]);
-        }
+        // partials arrive as f32 (PIPE_VERSION 2) -- no conversion, no rounding.
+        out.assign(partial.partial.begin(), partial.partial.end());
+        GGML_ASSERT(out.size() == n_values);
     }
 
     // Original behaviour, kept for the deferred-fold path: receive and add.
@@ -926,7 +966,8 @@ struct dispatcher::impl {
                                 uint64_t                                    seq_id,
                                 uint32_t                                    n_tokens,
                                 const std::vector<uint16_t> &               activations,
-                                const std::vector<pipe_expert_assignment> & assignments) {
+                                const std::vector<pipe_expert_assignment> & assignments,
+                                float                                       swiglu_clamp) {
         if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
         }
@@ -991,11 +1032,13 @@ struct dispatcher::impl {
             // refresh the LRU relative to the prior order.
             std::vector<size_t> assigned_counts(workers.size(), 0);
             std::vector<planned_request> imm_requests =
-                plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts);
+                plan_requests(layer, n_tokens, activations, immediate, route_it->second, assigned_counts,
+                              swiglu_clamp);
             std::vector<planned_request> def_requests =
                 deferred.empty()
                     ? std::vector<planned_request>{}
-                    : plan_requests(layer, n_tokens, activations, deferred, route_it->second, assigned_counts);
+                    : plan_requests(layer, n_tokens, activations, deferred, route_it->second, assigned_counts,
+                                    swiglu_clamp);
 
             stats              = {};
             stats.workers_used = imm_requests.size() + def_requests.size();
@@ -1201,8 +1244,9 @@ std::vector<float> dispatcher::dispatch(int32_t                                 
                                         uint64_t                                    seq_id,
                                         uint32_t                                    n_tokens,
                                         const std::vector<uint16_t> &               activations,
-                                        const std::vector<pipe_expert_assignment> & assignments) {
-    return pimpl->dispatch(layer, seq_id, n_tokens, activations, assignments);
+                                        const std::vector<pipe_expert_assignment> & assignments,
+                                        float                                       swiglu_clamp) {
+    return pimpl->dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);
 }
 
 int32_t dispatcher::n_embd() const {

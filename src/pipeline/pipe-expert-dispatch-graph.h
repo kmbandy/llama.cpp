@@ -36,7 +36,8 @@ class graph_dispatcher {
                         ggml_tensor *  activations,
                         ggml_tensor *  selected_experts,
                         ggml_tensor *  weights,
-                        int32_t        layer);
+                        int32_t        layer,
+                        float          swiglu_clamp);
 
     size_t n_workers() const;
     bool failed() const noexcept;
@@ -72,6 +73,10 @@ class graph_dispatcher {
     uint64_t                                       decode_ns_unpack_ = 0;
     uint64_t                                       decode_ns_total_ = 0;
     uint64_t                                       decode_first_await_in_flight_ = 0;
+    // n_tokens of the ubatch this decode call is serving: >1 = prefill, 1 = decode.
+    // Recorded in compute() (where n_tokens is already in hand) rather than passed
+    // through begin_decode(), so the RAII scope in llama-context.cpp is untouched.
+    uint32_t                                       decode_n_tokens_ = 0;
     std::vector<worker_dispatch_stats>             decode_workers_;
 };
 
