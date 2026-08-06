@@ -226,7 +226,7 @@ KEEPALIVE=${KEEPALIVE:-100}
 #
 # WHY TURN IT ON ANYWAY (kmbandy, 2026-08-05): decode DOES re-reference experts
 # across tokens (72-73% resident on pure demand LRU), and the prefetch work
-# creates a NEW class of re-read that does not exist today -- a page warmed too
+# creates a NEW class of re-read that does not exist today -- a page speculated too
 # early and evicted before its layer arrives. Without the tier that is a wasted
 # NVMe read; with it, it comes back over PCIe. That is the specific interaction
 # to measure, and n_host_hit vs n_host_demote reports it directly.
@@ -246,12 +246,19 @@ HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-6442450944}   # 6 GiB, R9700
 # record. See docs/dev/2026-08-05-prefetch-brief.md.
 #   PREFETCH_HINT=1  SPINE computes hash-layer (0..2) expert ids from the token
 #                    id and sends them ahead of the dispatch. Costs no reads.
-#   EXPERT_WARM=1    WORKERS actually read hinted pages in their idle window.
-#   HINTLOG=1        the worker-side hint counters, per frame, fflushed. SET THIS
-#                    ON ANY HINT ARM -- without it those counters exist only in a
-#                    stderr line printed on clean close, which this harness's
-#                    SIGKILL teardown destroys. Arm 1 lost foreign_expert that way.
-# DELIBERATELY SEPARATE. Hints ON + warm OFF reads exactly what the config of
+#   SPEC_PAGEIN=1    WORKERS actually read hinted pages in their idle window.
+#   HINTLOG=1        the worker-side event stream, fflushed per line. SET THIS ON
+#                    ANY HINT ARM. Two reasons, both learned the hard way:
+#                    (1) the counters otherwise exist only in a stderr line printed
+#                        on clean close, which this harness's SIGKILL teardown
+#                        destroys -- arm 1 lost foreign_expert that way;
+#                    (2) it carries the hinted ids, the speculative page-ins, the
+#                        reference stream and the demand page-ins IN ORDER, which
+#                        is the only way to separate MISPREDICT (never selected)
+#                        from LATE (selected, but evicted before its layer came).
+#                        Arm 2 reported one lumped bucket and could answer neither.
+#                    Read it with docs/dev/analyze-hint-log.py.
+# DELIBERATELY SEPARATE. Hints ON + speculation OFF reads exactly what the config of
 # record reads while still reporting everything the spine offered, so a broken
 # spine side is found with ZERO changed page-ins before any extra I/O is risked.
 # Run that arm FIRST.
@@ -260,16 +267,16 @@ HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-6442450944}   # 6 GiB, R9700
 # they refuse at HELLO (deliberate: an unknown frame type closes the session,
 # which mid-run is indistinguishable from a worker crash).
 PREFETCH_HINT=${PREFETCH_HINT:-}
-EXPERT_WARM=${EXPERT_WARM:-}
-WARM_CHUNK=${WARM_CHUNK:-}
-[ -n "$EXPERT_WARM" ] && WPOST="$WPOST WP_EXPERT_WARM=$EXPERT_WARM"
-[ -n "$WARM_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_WARM_CHUNK=$WARM_CHUNK"
+SPEC_PAGEIN=${SPEC_PAGEIN:-}
+SPEC_CHUNK=${SPEC_CHUNK:-}
+[ -n "$SPEC_PAGEIN" ] && WPOST="$WPOST WP_EXPERT_SPEC_PAGEIN=$SPEC_PAGEIN"
+[ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
 # rejection. Say so at launch rather than after a wasted run.
-if [ -n "$EXPERT_WARM" ] && [ -z "$PREFETCH_HINT" ]; then
-    echo "*** EXPERT_WARM=1 with PREFETCH_HINT unset: the workers will never be" \
-         "sent anything to warm. Set PREFETCH_HINT=1 too. ***"
+if [ -n "$SPEC_PAGEIN" ] && [ -z "$PREFETCH_HINT" ]; then
+    echo "*** SPEC_PAGEIN=1 with PREFETCH_HINT unset: the workers will never be" \
+         "sent anything to page in. Set PREFETCH_HINT=1 too. ***"
 fi
 # The spine's own counters always survive (it exits cleanly); the WORKERS' do not.
 # So a hint arm without HINTLOG can still report what was OFFERED and never what
@@ -846,7 +853,7 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
      "DSPARK_TAP=${DSPARK_TAP}(1=gated,0=mean) KEEPALIVE=${KEEPALIVE:-off}" \
      "code-defaults[dispatch_gather/gather_max_frac/compute_chunks/read_stripes/stripe_max_pageins]=${WP_CODE_DEFAULTS:-1/0.90/4/4/4}" \
      "hostvictim[2026/main]=${HOSTVICTIM_2026:-0}/${HOSTVICTIM_MAIN:-0}" \
-     "prefetch[hint/warm/chunk/hintlog]=${PREFETCH_HINT:-off}/${EXPERT_WARM:-off}/${WARM_CHUNK:-default-1}/${HINTLOG:-off}" \
+     "prefetch[hint/spec/chunk/hintlog]=${PREFETCH_HINT:-off}/${SPEC_PAGEIN:-off}/${SPEC_CHUNK:-default-1}/${HINTLOG:-off}" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="

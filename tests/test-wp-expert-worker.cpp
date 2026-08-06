@@ -613,10 +613,10 @@ void run_test() {
                 }
             };
 
-        pipe_expert_dispatch_req warm = request;
-        warm.layer = OTHER_LAYER;
+        pipe_expert_dispatch_req other = request;
+        other.layer = OTHER_LAYER;
         tracker.reset(2);
-        dispatch_and_check(40, warm);
+        dispatch_and_check(40, other);
         require(tracker.read_count() == 4,
                 "cold request did not issue one read per miss");
         require(tracker.peak_reads() == 2,
@@ -657,7 +657,7 @@ void run_test() {
                 "all-hit request reserved a miss slot");
 
         tracker.reset(0);
-        dispatch_and_check(44, warm);
+        dispatch_and_check(44, other);
         require(tracker.read_count() == 0,
                 "host victim hit issued an expert read");
         require(tracker.staging_borrows() == 0,
@@ -817,7 +817,7 @@ void test_default_off_multi_expert_request() {
 }
 
 // Records WHICH pages were read, and lets the test block until an asynchronous
-// warm has landed. IoTracker only counts reads; this one needs identities,
+// a speculative page-in has landed. IoTracker only counts reads; this one needs identities,
 // because the whole question is which page got evicted.
 struct ReadLog {
     wp_expert_worker::TestHooks hooks;
@@ -860,8 +860,8 @@ struct ReadLog {
 // dispatch that follows is a hit, and (b) NEVER evict a page demand has touched.
 //
 // (b) is the one that matters. The pool is filled to capacity with one demand
-// page and three warmed ones, then one more page is warmed so an eviction is
-// forced. A warm stamped from the prefetch band takes the OLDEST WARM; a warm
+// page and three speculative ones, then one more is read so an eviction is
+// forced. A page stamped from the prefetch band takes the OLDEST SPECULATIVE one; a page
 // stamped with a fresh LRU tick would take the DEMAND page instead. The two
 // behaviours differ by exactly one extra read of (LAYER, 0), which steps 4 and 6
 // pin from both directions.
@@ -869,8 +869,8 @@ struct ReadLog {
 // slots is 4, not 2: the pool refuses a budget below the largest single layer
 // request, so 4 is the floor for this fixture. Eviction pressure comes from
 // using a second layer rather than from starving the pool.
-void test_prefetch_warm_and_eviction_order() {
-    require(setenv("WP_EXPERT_WARM", "1", 1) == 0, "failed to arm the warm path");
+void test_prefetch_spec_pagein_and_eviction_order() {
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
     const int port = reserve_port();
@@ -902,8 +902,8 @@ void test_prefetch_warm_and_eviction_order() {
         pipe_frame_type type;
         uint64_t seq_id = 0;
         std::vector<uint8_t> payload;
-        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive warm worker HELLO");
-        require(type == PIPE_HELLO && seq_id == 0, "warm worker did not send HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive spec worker HELLO");
+        require(type == PIPE_HELLO && seq_id == 0, "spec worker did not send HELLO");
         pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
         client.role         = PIPE_EXPERT_ROLE_CLIENT;
         client.expert_first = -1;
@@ -912,11 +912,11 @@ void test_prefetch_warm_and_eviction_order() {
         client.layers.clear();
         payload = pipe_encode_expert_hello(client);
         require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
-                "failed to send warm client HELLO");
+                "failed to send spec client HELLO");
         require(pipe_recv_frame(*socket, type, seq_id, payload) &&
                     type == PIPE_EXPERT_HELLO_ACK &&
                     pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
-                "warm worker rejected matching HELLO");
+                "spec worker rejected matching HELLO");
 
         const auto dispatch_one = [&](int32_t layer, int32_t expert, uint64_t seq) {
             pipe_expert_dispatch_req request;
@@ -926,14 +926,14 @@ void test_prefetch_warm_and_eviction_order() {
             request.assignments = { { expert, std::vector<float>(N_TOKENS, 0.5f) } };
             std::vector<uint8_t> buf = pipe_encode_expert_dispatch_req(request);
             require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq, buf.data(), buf.size()),
-                    "failed to send warm-test dispatch");
+                    "failed to send spec-test dispatch");
             std::vector<uint8_t> reply;
             pipe_frame_type reply_type;
             uint64_t reply_seq = 0;
             require(pipe_recv_frame(*socket, reply_type, reply_seq, reply),
-                    "failed to receive warm-test partial");
+                    "failed to receive spec-test partial");
             require(reply_type == PIPE_EXPERT_PARTIAL && reply_seq == seq,
-                    "warm-test dispatch did not complete");
+                    "spec-test dispatch did not complete");
         };
 
         const auto hint = [&](int32_t layer, std::vector<int32_t> experts) {
@@ -950,20 +950,20 @@ void test_prefetch_warm_and_eviction_order() {
         require(reads.count_of(LAYER, 0) == 1, "demand dispatch did not read its page exactly once");
         require(reads.total() == 1, "demand dispatch read more than its own page");
 
-        // 2. WARM (LAYER, 1..3). The pool is now full: 1 demand + 3 prefetched.
-        //    Ascending order on the wire, so (LAYER,1) is the OLDEST warm.
+        // 2. SPECULATE (LAYER, 1..3). The pool is now full: 1 demand + 3 prefetched.
+        //    Ascending order on the wire, so (LAYER,1) is the OLDEST speculative page.
         hint(LAYER, { 1, 2, 3 });
-        require(reads.wait_for_total(4), "prefetch hints did not warm during the idle window");
+        require(reads.wait_for_total(4), "prefetch hints did not page in during the idle window");
         require(reads.count_of(LAYER, 1) == 1 && reads.count_of(LAYER, 2) == 1 &&
                     reads.count_of(LAYER, 3) == 1,
-                "the warm read the wrong pages");
+                "the speculative read took the wrong pages");
 
-        // 3. WARM one more page. Every slot is valid, so this MUST evict.
-        //    Prefetch band => victim is (LAYER,1), the oldest warm.
+        // 3. SPECULATE one more page. Every slot is valid, so this MUST evict.
+        //    Prefetch band => victim is (LAYER,1), the oldest speculative page.
         //    Fresh tick    => victim would be (LAYER,0), the demand page.
         hint(OTHER_LAYER, { 0 });
-        require(reads.wait_for_total(5), "the forcing prefetch hint did not warm");
-        require(reads.count_of(OTHER_LAYER, 0) == 1, "the forcing warm read the wrong page");
+        require(reads.wait_for_total(5), "the forcing prefetch hint did not read");
+        require(reads.count_of(OTHER_LAYER, 0) == 1, "the forcing speculative read took the wrong page");
 
         // 4. THE ASSERTION. (LAYER,0) was demanded and never re-demanded, so it
         //    must still be resident: no second read of it.
@@ -971,22 +971,22 @@ void test_prefetch_warm_and_eviction_order() {
         require(reads.count_of(LAYER, 0) == 1,
                 "a prefetch evicted a demand-touched page -- the prefetch LRU band is not holding");
 
-        // 5. And the warm paid off: (LAYER,3) was warmed and never evicted, so
+        // 5. And it paid off: (LAYER,3) was speculatively read and never evicted, so
         //    demanding it must not read again.
         dispatch_one(LAYER, 3, 102);
         require(reads.count_of(LAYER, 3) == 1,
-                "a warmed page was not reused by the dispatch that followed");
+                "a speculatively paged-in expert was not reused by the dispatch that followed");
 
         // 6. (LAYER,1) is the page that should have gone, so demanding it reads
         //    again. This pins WHICH page was evicted, not merely that one was.
         dispatch_one(LAYER, 1, 103);
         require(reads.count_of(LAYER, 1) == 2,
-                "the oldest warm was not the victim -- eviction order within the prefetch band is wrong");
+                "the oldest speculative page was not the victim -- eviction order within the prefetch band is wrong");
 
         socket.reset();
     } catch (...) {
         server.join();
-        unsetenv("WP_EXPERT_WARM");
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
         // The worker's own failure is the useful one. Without this, a worker
         // that never started surfaces only as "failed to connect", which points
         // at the socket instead of at the reason.
@@ -996,14 +996,14 @@ void test_prefetch_warm_and_eviction_order() {
         throw;
     }
     server.join();
-    require(unsetenv("WP_EXPERT_WARM") == 0, "failed to disarm the warm path");
+    require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
     if (server_error) {
         std::rethrow_exception(server_error);
     }
-    require(server_result == 0, "warm worker returned failure");
+    require(server_result == 0, "spec worker returned failure");
 }
 
-// With WP_EXPERT_WARM unset (the default) a hint must be accepted and ignored:
+// With WP_EXPERT_SPEC_PAGEIN unset (the default) a hint must be accepted and ignored:
 // no read, no eviction, so a run is byte-for-byte the config of record while
 // still reporting what the spine offered.
 // WP_HINT_LOG must be set BEFORE the worker is constructed -- the FILE * is
@@ -1017,7 +1017,7 @@ struct ScopedEnv {
     ~ScopedEnv() { unsetenv(name); }
 };
 
-void test_prefetch_hint_without_warm_reads_nothing() {
+void test_prefetch_hint_without_spec_reads_nothing() {
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
     const int port = reserve_port();
@@ -1098,8 +1098,8 @@ void test_prefetch_hint_without_warm_reads_nothing() {
         require(type == PIPE_EXPERT_PARTIAL && seq_id == 7,
                 "dispatch after hints did not complete");
 
-        // Exactly the one page the DISPATCH needed. Nothing warmed.
-        require(reads.total() == 1, "a hint read pages with the warm path disarmed");
+        // Exactly the one page the DISPATCH needed. Nothing speculated.
+        require(reads.total() == 1, "a hint read pages with speculative page-in disarmed");
         require(reads.count_of(LAYER, 0) == 1, "the dispatch did not read its own page");
 
         // READ THE LOG WITH THE SOCKET STILL OPEN. That is the whole point: the
@@ -1114,16 +1114,61 @@ void test_prefetch_hint_without_warm_reads_nothing() {
                 lines.push_back(line);
             }
         }
-        // One line per hint frame: the valid one, then the malformed one.
-        require(lines.size() == 2, "WP_HINT_LOG did not have one flushed line per hint frame");
-        require(lines.back().find("frames=1 experts=4") != std::string::npos,
+        const auto tagged = [&](char tag) {
+            std::vector<std::string> out;
+            for (const std::string & line : lines) {
+                if (!line.empty() && line[0] == tag) {
+                    out.push_back(line);
+                }
+            }
+            return out;
+        };
+        const std::vector<std::string> c = tagged('C');
+        const std::vector<std::string> h = tagged('H');
+        const std::vector<std::string> r = tagged('R');
+        const std::vector<std::string> d = tagged('D');
+        const std::vector<std::string> s = tagged('S');
+
+        // One counter line per hint frame: the valid one, then the malformed one.
+        require(c.size() == 2, "WP_HINT_LOG did not have one flushed counter line per hint frame");
+        require(c.back().find("frames=1 experts=4") != std::string::npos,
                 "WP_HINT_LOG counters do not match the hints that were sent");
-        require(lines.back().find("malformed=1") != std::string::npos,
+        require(c.back().find("malformed=1") != std::string::npos,
                 "WP_HINT_LOG did not record the malformed hint");
         // The routing-agreement check itself: every hinted expert belongs to this
         // worker's shard, so both foreign counters must be zero.
-        require(lines.back().find("foreign_layer=0 foreign_expert=0") != std::string::npos,
+        require(c.back().find("foreign_layer=0 foreign_expert=0") != std::string::npos,
                 "WP_HINT_LOG reported a foreign layer or expert for an in-shard hint");
+
+        // The ids, which are what make mispredict and late separable at all. A
+        // counter can say 4 experts were offered; only H says WHICH, and only R
+        // says which were then actually selected.
+        require(h.size() == 1, "WP_HINT_LOG did not record the hinted expert ids");
+        require(h.front() == "H " + std::to_string(LAYER) + " 0 1 2 3",
+                "WP_HINT_LOG hinted ids do not match the frame that was sent");
+        require(r.size() == 1, "WP_HINT_LOG did not record the dispatch reference stream");
+        require(r.front() == "R " + std::to_string(LAYER) + " 0",
+                "WP_HINT_LOG reference ids do not match the dispatch that was sent");
+
+        // With speculation disarmed the ONE page read must be a demand read, and
+        // there must be no speculative read at all. This is the arm-1 invariant
+        // -- hints on, reads unchanged -- now checkable from the log itself.
+        require(s.empty(), "WP_HINT_LOG recorded a speculative page-in with speculation disarmed");
+        require(d.size() == 1, "WP_HINT_LOG did not record the dispatch's demand page-in");
+        require(d.front() == "D " + std::to_string(LAYER) + " 0",
+                "WP_HINT_LOG demand page-in does not match the page the dispatch needed");
+        // Ordering is the property the single stream exists to preserve: the
+        // prediction must precede the reference, which must precede the read it
+        // provokes. Without this, "late" is not derivable from the file.
+        const auto index_of = [&](const std::string & want) {
+            for (size_t i = 0; i < lines.size(); ++i) {
+                if (lines[i] == want) return (long) i;
+            }
+            return -1L;
+        };
+        require(index_of(h.front()) < index_of(r.front()) &&
+                    index_of(r.front()) < index_of(d.front()),
+                "WP_HINT_LOG events are out of order: hint must precede reference must precede read");
         socket.reset();
     } catch (...) {
         server.join();
@@ -1143,8 +1188,8 @@ int main() {
         test_glm_size_class_plan();
         run_test();
         test_default_off_multi_expert_request();
-        test_prefetch_hint_without_warm_reads_nothing();
-        test_prefetch_warm_and_eviction_order();
+        test_prefetch_hint_without_spec_reads_nothing();
+        test_prefetch_spec_pagein_and_eviction_order();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {
