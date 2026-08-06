@@ -44,7 +44,15 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // 3 -> 4 (2026-08-05): request activations are f32, not f16. A stale binary would
 // mis-decode a 2-byte stream as 4-byte values, so this MUST reject rather than
 // reinterpret. Same reasoning as the 1 -> 2 bump on the partial-return path.
-static constexpr uint32_t PIPE_VERSION = 4u;
+// 4 -> 5 (2026-08-05): PIPE_EXPERT_PREFETCH_HINT. This bump is NOT about decoding
+// -- the hint is a new frame TYPE and adds no field to any existing payload, so a
+// stale worker could never mis-read one. It is about the frame dispatch loop:
+// wp-expert-worker.cpp answers any frame that is not PIPE_EXPERT_DISPATCH_REQ with
+// PIPE_ERROR and CLOSES THE CONNECTION. A pre-hint worker would therefore not
+// ignore the hint, it would kill the session on the first one -- mid-run, after a
+// successful HELLO, looking exactly like a worker crash. Rejecting at HELLO turns
+// that into one clear line at startup.
+static constexpr uint32_t PIPE_VERSION = 5u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -69,6 +77,7 @@ enum pipe_frame_type : uint32_t {
     PIPE_EXPERT_DISPATCH_REQ = 8,
     PIPE_EXPERT_PARTIAL      = 9,
     PIPE_EXPERT_HELLO_ACK    = 10,
+    PIPE_EXPERT_PREFETCH_HINT = 11,
 };
 
 enum pipe_role : uint32_t {
@@ -211,6 +220,39 @@ struct pipe_expert_dispatch_req {
     float                               swiglu_clamp = 0.0f;
 };
 
+// A prefetch hint: "you are about to be asked for these experts on this layer".
+//
+// FIRE AND FORGET. There is no response frame and no seq_id correlation; the
+// header's seq_id is informational only. A worker is free to ignore the hint
+// entirely, act on part of it, or be interrupted mid-warm by a real request --
+// the hint carries NO correctness weight. That is deliberate and it is the
+// property that makes this safe to add: the dispatch path is unchanged, so a
+// hint that is wrong, late, or dropped can only cost I/O, never an answer.
+//
+// EXPERT IDS, NOT PAGES. The spine cannot resolve a page: under cross-machine
+// dispatch deepseek4.cpp marks the routed experts TENSOR_SKIP, so the spine has
+// no routed-expert catalog to resolve against (and in the config of record it has
+// no WeightPager at all -- llama-server runs the dense spine without
+// --weight-paging, so llama_wp_on_draft_tokens returns 0 at its null check before
+// doing anything). Each worker owns the shard, so each worker does its own
+// expert -> page resolution against its own catalog. This is why the hint stops
+// at expert ids: it is the last representation both sides can agree on.
+//
+// The ids are ascending and unique on the wire. Ascending is not cosmetic --
+// it is the ORDER the reads should be issued in, which is the whole point on the
+// prefill path (a sorted stream is the only regime where the drive's sequential
+// bandwidth is reachable), and it lets the decoder validate dedup in one pass
+// instead of building a set.
+//
+// Payload:
+//   i32 layer
+//   u32 n_experts
+//   i32 expert_id[n_experts]      (strictly ascending, all >= 0)
+struct pipe_expert_prefetch_hint {
+    int32_t              layer = -1;
+    std::vector<int32_t> expert_ids;
+};
+
 // Payload:
 //   i32 layer
 //   u32 n_tokens
@@ -276,6 +318,7 @@ std::vector<uint8_t> pipe_encode_error     (const pipe_error    & p);
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p);
 std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
+std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 // PING/PONG carry no payload.
 
@@ -288,6 +331,8 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
 pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len);
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
+    const uint8_t * buf, size_t len);
 pipe_expert_partial pipe_decode_expert_partial(
     const uint8_t * buf, size_t len, int32_t n_embd);
 

@@ -523,6 +523,79 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
 }
 
 // ---------------------------------------------------------------------------
+// expert prefetch hint (fire and forget; no response frame)
+
+std::vector<uint8_t> pipe_encode_expert_prefetch_hint(
+        const pipe_expert_prefetch_hint & p) {
+    // An empty hint is a wasted frame, not a valid "nothing to prefetch" signal:
+    // the caller already knows the set is empty and should simply not send. Making
+    // it an error here keeps the idle path free of frames that mean nothing, which
+    // matters because the worker's keepalive pump wakes on every arrival.
+    if (p.layer < 0 || p.expert_ids.empty()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint needs a layer and experts");
+    }
+    for (size_t i = 0; i < p.expert_ids.size(); ++i) {
+        if (p.expert_ids[i] < 0 ||
+            (i > 0 && p.expert_ids[i] <= p.expert_ids[i - 1])) {
+            fail(PIPE_ERR_BAD_FRAME,
+                 "pipe: expert prefetch hint ids must be non-negative and strictly ascending");
+        }
+    }
+    const uint64_t total = 8ull + (uint64_t) p.expert_ids.size() * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint encode size %llu exceeds max payload",
+             (unsigned long long) total);
+    }
+
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_i32(w, p.layer);
+    wr_u32(w, (uint32_t) p.expert_ids.size());
+    for (int32_t expert_id : p.expert_ids) {
+        wr_i32(w, expert_id);
+    }
+    return out;
+}
+
+pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
+        const uint8_t * buf, size_t len) {
+    if (len < 8) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint payload is too small");
+    }
+    const uint8_t * p   = buf;
+    const uint8_t * end = buf + len;
+
+    pipe_expert_prefetch_hint r;
+    r.layer = rd_i32(p);
+    const uint32_t n_experts = rd_u32(p);
+    if (r.layer < 0 || n_experts == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint has invalid dimensions");
+    }
+    if ((uint64_t) (end - p) != (uint64_t) n_experts * 4ull) {
+        fail(PIPE_ERR_BAD_FRAME,
+             "pipe: expert prefetch hint payload bytes %lld do not match n_experts %u",
+             (long long) (end - p), n_experts);
+    }
+
+    // Strictly ascending is the dedup check: it costs one comparison per id and
+    // no allocation, where a std::set would cost both. A worker that trusted an
+    // unchecked list could queue the same page twice and count the second read
+    // as a page-in, which would corrupt the one counter this whole feature is
+    // measured by (see the read-amplification gate in the prefetch brief).
+    r.expert_ids.reserve(n_experts);
+    for (uint32_t i = 0; i < n_experts; ++i) {
+        const int32_t expert_id = rd_i32(p);
+        if (expert_id < 0 ||
+            (i > 0 && expert_id <= r.expert_ids.back())) {
+            fail(PIPE_ERR_BAD_FRAME,
+                 "pipe: expert prefetch hint ids must be non-negative and strictly ascending");
+        }
+        r.expert_ids.push_back(expert_id);
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // expert partial response
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {

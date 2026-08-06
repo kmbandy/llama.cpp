@@ -13,6 +13,7 @@ file(GLOB LLAMA_MEMORY_TIER_SOURCES "memory-tier/*.cpp")
 add_library(llama-expert-dispatch STATIC
             pipeline/pipe-expert-dispatch-graph.cpp
             pipeline/pipe-expert-dispatcher.cpp
+            pipeline/pipe-hash-oracle.cpp
             pipeline/pipe-protocol.cpp
             pipeline/pipe-transport.cpp
             )

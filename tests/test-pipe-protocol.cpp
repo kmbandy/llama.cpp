@@ -547,6 +547,115 @@ static void test_hello_mismatch_matrix() {
 }
 
 // ---------------------------------------------------------------------------
+// expert prefetch hint (PIPE_VERSION 5)
+
+static void test_expert_prefetch_hint_roundtrip() {
+    pipe_expert_prefetch_hint h;
+    h.layer      = 2;
+    h.expert_ids = { 0, 7, 8, 84, 255 };
+
+    const std::vector<uint8_t> enc = pipe_encode_expert_prefetch_hint(h);
+    CHECK(enc.size() == 8 + 5 * 4);
+
+    const pipe_expert_prefetch_hint d =
+        pipe_decode_expert_prefetch_hint(enc.data(), enc.size());
+    CHECK(d.layer == h.layer);
+    CHECK(d.expert_ids == h.expert_ids);
+
+    // Layer 0 is a real hash layer, not a sentinel -- it must encode.
+    pipe_expert_prefetch_hint zero;
+    zero.layer      = 0;
+    zero.expert_ids = { 3 };
+    const std::vector<uint8_t> zenc = pipe_encode_expert_prefetch_hint(zero);
+    CHECK(pipe_decode_expert_prefetch_hint(zenc.data(), zenc.size()).layer == 0);
+}
+
+static void test_expert_prefetch_hint_rejects() {
+    // Encode side: the caller must not manufacture a frame the worker will
+    // reject, because a hint has no response and the failure would be silent.
+    {
+        pipe_expert_prefetch_hint h;
+        h.layer      = -1;
+        h.expert_ids = { 1 };
+        CHECK_THROWS_PROTO(pipe_encode_expert_prefetch_hint(h), PIPE_ERR_BAD_FRAME);
+    }
+    {
+        pipe_expert_prefetch_hint h;   // empty set is "do not send", not a valid frame
+        h.layer = 0;
+        CHECK_THROWS_PROTO(pipe_encode_expert_prefetch_hint(h), PIPE_ERR_BAD_FRAME);
+    }
+    {
+        pipe_expert_prefetch_hint h;
+        h.layer      = 0;
+        h.expert_ids = { 5, 5 };       // duplicate: would double-count a page-in
+        CHECK_THROWS_PROTO(pipe_encode_expert_prefetch_hint(h), PIPE_ERR_BAD_FRAME);
+    }
+    {
+        pipe_expert_prefetch_hint h;
+        h.layer      = 0;
+        h.expert_ids = { 9, 2 };       // descending: loses the sequential read order
+        CHECK_THROWS_PROTO(pipe_encode_expert_prefetch_hint(h), PIPE_ERR_BAD_FRAME);
+    }
+    {
+        pipe_expert_prefetch_hint h;
+        h.layer      = 0;
+        h.expert_ids = { -1 };
+        CHECK_THROWS_PROTO(pipe_encode_expert_prefetch_hint(h), PIPE_ERR_BAD_FRAME);
+    }
+
+    // Decode side: hand-built little-endian payloads, since a hostile or stale
+    // peer does not go through our encoder.
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 0);
+        put_u32(v, 0);                 // n_experts = 0
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 0);
+        put_u32(v, 3);                 // claims 3, carries 2
+        put_i32(v, 1);
+        put_i32(v, 2);
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 1);
+        put_u32(v, 2);
+        put_i32(v, 4);
+        put_i32(v, 4);                 // duplicate on the wire
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 1);
+        put_u32(v, 2);
+        put_i32(v, 4);
+        put_i32(v, 1);                 // descending on the wire
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 0);
+        put_u32(v, 1);
+        put_i32(v, -3);                // negative id
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+    {
+        std::vector<uint8_t> v;
+        put_i32(v, 0);                 // header only, no count
+        CHECK_THROWS_PROTO(pipe_decode_expert_prefetch_hint(v.data(), v.size()),
+                           PIPE_ERR_BAD_FRAME);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     test_header_roundtrip();
@@ -563,6 +672,8 @@ int main() {
     test_error_roundtrip();
     test_endianness_explicit();
     test_hello_mismatch_matrix();
+    test_expert_prefetch_hint_roundtrip();
+    test_expert_prefetch_hint_rejects();
 
     if (g_failed == 0) {
         std::printf("test-pipe-protocol: all tests passed\n");

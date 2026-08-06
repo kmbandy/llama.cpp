@@ -180,6 +180,14 @@ the falsifiers down first this time.
   page-ins, it did nothing, regardless of what throughput says. Tonight
   demonstrated four separate times that end-to-end tok/s gets the answer wrong on
   this rig; per-leg dispatch numbers are the reliable metric.
+  **AMENDED 2026-08-05, before the first run: this rule is right for DECODE and
+  wrong for PREFILL.** At UBATCH=2048 with `n_expert_used=8`, the hash-layer
+  expert union over 2048 tokens covers most of the 256 experts on all three
+  layers — the same pages get read either way. The prefill win is not *fewer*
+  page-ins, it is issuing them *earlier and in ascending order*, which is the
+  only regime where the drive's sequential bandwidth is reachable. So prefill's
+  pre-registration is: **page-ins flat, `ns_wait` down, device utilization % up.**
+  Judging the prefill arm by `n_pagein` would score a success as a failure.
 - **Read-amplification gate (the attempt-1 failure mode).** Track `bytes_read`
   alongside `n_pagein`. If bytes rise while page-ins fall by less, that is pool
   pollution — **stop**, do not tune the predictor. Attempt (1) proved predictor

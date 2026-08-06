@@ -441,6 +441,20 @@ target_include_directories(test-pipe-protocol PRIVATE
 target_compile_features(test-pipe-protocol PRIVATE cxx_std_17)
 llama_test(test-pipe-protocol)
 
+# Hash-layer expert oracle: token id -> expert ids for the DS4 tid2eid blocks.
+# Pure host memory in, expert ids out -- no model, no ggml, no weight pager.
+add_executable(
+    test-pipe-hash-oracle
+    test-pipe-hash-oracle.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-hash-oracle.cpp
+)
+target_include_directories(test-pipe-hash-oracle PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_compile_features(test-pipe-hash-oracle PRIVATE cxx_std_17)
+llama_test(test-pipe-hash-oracle)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
