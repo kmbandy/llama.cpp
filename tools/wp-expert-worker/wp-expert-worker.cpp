@@ -40,6 +40,7 @@ extern "C" {
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1737,7 +1738,9 @@ public:
                 // locking newcomers out forever, and it needs no tuned constant.
                 if (slots_[slot_index].valid) {
                     evict_age_ = slots_[slot_index].uses;
+                    ++evictions_;
                 }
+                slots_[slot_index].lease_until = 0;
                 ++slots_[slot_index].pin_count;
                 batch.entries_[entry_index].slot_index = slot_index;
             }
@@ -2026,8 +2029,9 @@ private:
                 if (slot.valid &&
                     slot.key == std::pair<int, int>(spec_inflight_[i]->layer,
                                                     spec_inflight_[i]->expert)) {
-                    slot.tick = ++spec_tick_;
-                    slot.uses = 0;
+                    slot.tick        = ++spec_tick_;
+                    slot.uses        = 0;
+                    slot.lease_until = evictions_ + spec_lease_;
                 }
             }
         } catch (const std::exception &) {
@@ -2079,6 +2083,14 @@ private:
         // stream this beats LRU by 3.2-4.0% of page-ins, against +0.2-1.7% for
         // ARC and negative for 2Q -- counting wins, and it is ten lines.
         uint64_t            uses      = 0;
+        // Eviction-counter value at which this page stops being protected.
+        // A SPECULATIVE PAGE IS USELESS IF IT DIES BEFORE ITS LAYER ARRIVES, and
+        // measured 90% of them did. uses=0 made them the first victim by
+        // construction -- which is what kept demand pages safe (layers 3+ were
+        // identical to the digit across every arm) and also what guaranteed they
+        // never survived long enough to pay. The lease is the bounded middle:
+        // protected for a fixed number of evictions, then ordinary.
+        uint64_t            lease_until = 0;
         int                 pin_count = 0;
         bool                reserved  = false;
         bool                valid     = false;
@@ -2640,6 +2652,15 @@ private:
     // than at zero. WP_EXPERT_LFU=0 falls back to pure LRU so the two policies
     // can be A/B'd on the same binary.
     uint64_t                   evict_age_ = 0;
+    uint64_t                   evictions_ = 0;
+    // WP_EXPERT_SPEC_LEASE -- evictions a speculative page survives before it
+    // becomes an ordinary eviction candidate. 0 restores the old first-victim
+    // behaviour exactly, so the lease is A/B-able on one binary.
+    const uint64_t             spec_lease_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_LEASE");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 64;
+        return v > 0 ? (uint64_t) v : (uint64_t) 0;
+    }();
     // The one speculative batch that may be in flight. Holding the Batch holds
     // its slot pins, which is what stops an in-flight read's slot from being
     // recycled underneath it.
@@ -2654,8 +2675,13 @@ private:
     }();
     // Ranking key. With LFU off this is pure LRU, byte for byte what shipped
     // before, so a control arm needs no separate build.
-    std::pair<uint64_t, uint64_t> rank(const Slot & s) const {
-        return { lfu_ ? s.uses : 0, s.tick };
+    std::tuple<int, uint64_t, uint64_t> rank(const Slot & s) const {
+        // A live lease is the FIRST key, so a leased page loses to every
+        // unleased one and is only taken when nothing else can be. That is the
+        // deadlock guard: the lease reorders candidates, it never removes them,
+        // so select_victim always has something to return.
+        const int leased = (s.lease_until > evictions_) ? 1 : 0;
+        return { leased, lfu_ ? s.uses : 0, s.tick };
     }
     // Speculative page-in accounting. spec_pageins_/spec_bytes_ are the numerator of the
     // read-amplification gate: if total bytes rise faster than demand page-ins

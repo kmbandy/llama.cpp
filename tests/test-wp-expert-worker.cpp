@@ -869,8 +869,15 @@ struct ReadLog {
 // slots is 4, not 2: the pool refuses a budget below the largest single layer
 // request, so 4 is the floor for this fixture. Eviction pressure comes from
 // using a second layer rather than from starving the pool.
-void test_prefetch_spec_pagein_and_eviction_order() {
+void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
     require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    // Lease OFF for this test. It pins the ORIGINAL two-band invariant -- a
+    // speculative page is always the first victim and can never displace a
+    // demand-touched one -- which is what kept layers 3+ identical to the digit
+    // through every arm. WP_EXPERT_SPEC_LEASE>0 deliberately relaxes exactly
+    // that, and is covered separately below.
+    require(setenv("WP_EXPERT_SPEC_LEASE", lease, 1) == 0, "failed to set the speculative lease");
+    const bool leased = std::string(lease) != "0";
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
     const int port = reserve_port();
@@ -968,42 +975,66 @@ void test_prefetch_spec_pagein_and_eviction_order() {
         // 4. THE ASSERTION. (LAYER,0) was demanded and never re-demanded, so it
         //    must still be resident: no second read of it.
         dispatch_one(LAYER, 0, 101);
-        require(reads.count_of(LAYER, 0) == 1,
-                "a prefetch evicted a demand-touched page -- the prefetch LRU band is not holding");
+        if (leased) {
+            // THE LEASE'S WHOLE POINT, AND ITS WHOLE COST. A leased speculative
+            // page outranks a cold demand page, so the demand page is what goes.
+            // That is pool pollution by definition -- bounded to the lease
+            // window, and the reason the amplification gate has to be armed
+            // whenever this is on.
+            require(reads.count_of(LAYER, 0) == 2,
+                    "the lease did not protect the speculative pages -- demand page survived");
+        } else {
+            require(reads.count_of(LAYER, 0) == 1,
+                    "a prefetch evicted a demand-touched page -- the prefetch LRU band is not holding");
+        }
 
         // 5. And it paid off: (LAYER,3) was speculatively read and never evicted, so
         //    demanding it must not read again.
         dispatch_one(LAYER, 3, 102);
-        require(reads.count_of(LAYER, 3) == 1,
-                "a speculatively paged-in expert was not reused by the dispatch that followed");
+        if (!leased) {
+            require(reads.count_of(LAYER, 3) == 1,
+                    "a speculatively paged-in expert was not reused by the dispatch that followed");
+        }
 
         // 6. (LAYER,1) is the page that should have gone, so demanding it reads
         //    again. This pins WHICH page was evicted, not merely that one was.
-        dispatch_one(LAYER, 1, 103);
-        require(reads.count_of(LAYER, 1) == 2,
-                "the oldest speculative page was not the victim -- eviction order within the prefetch band is wrong");
-
-        // 7. USE COUNT BEATS RECENCY. Ask for (LAYER,0) repeatedly so its count
-        //    climbs well above everything else, then touch three other pages so
-        //    it is the LEAST RECENTLY used of the four. Under LRU it is the next
-        //    victim. Under use-count ranking it is the last thing to go.
-        for (uint64_t seq = 110; seq < 116; ++seq) {
-            dispatch_one(LAYER, 0, seq);
+        // Only pinned for lease=0. With a lease the pool is 4 slots against a
+        // demand page plus three leased speculative ones, so SOMETHING must go
+        // once the demand page is re-read -- the lease reorders candidates, it
+        // never removes them. Which leased page goes is not determined by this
+        // sequence, and asserting it would be pinning an accident.
+        if (!leased) {
+            dispatch_one(LAYER, 1, 103);
+            require(reads.count_of(LAYER, 1) == 2,
+                    "the oldest speculative page was not the victim -- eviction order within the prefetch band is wrong");
         }
-        require(reads.count_of(LAYER, 0) == 1, "repeated demand re-read a resident page");
-        dispatch_one(LAYER, 1, 120);
-        dispatch_one(LAYER, 2, 121);
-        dispatch_one(LAYER, 3, 122);
-        // (LAYER,0) is now the oldest of the four by tick and the hottest by use.
-        dispatch_one(OTHER_LAYER, 0, 123);   // forces one eviction
-        dispatch_one(LAYER, 0, 124);
-        require(reads.count_of(LAYER, 0) == 1,
-                "the most-used page was evicted -- ranking is falling back to pure recency");
+
+        // Use-count ranking is a separate concern from the lease, and a live
+        // lease reorders these victims, so this pins the policy on its own.
+        if (!leased) {
+            // 7. USE COUNT BEATS RECENCY. Ask for (LAYER,0) repeatedly so its count
+            //    climbs well above everything else, then touch three other pages so
+            //    it is the LEAST RECENTLY used of the four. Under LRU it is the next
+            //    victim. Under use-count ranking it is the last thing to go.
+            for (uint64_t seq = 110; seq < 116; ++seq) {
+                dispatch_one(LAYER, 0, seq);
+            }
+            require(reads.count_of(LAYER, 0) == 1, "repeated demand re-read a resident page");
+            dispatch_one(LAYER, 1, 120);
+            dispatch_one(LAYER, 2, 121);
+            dispatch_one(LAYER, 3, 122);
+            // (LAYER,0) is now the oldest of the four by tick and the hottest by use.
+            dispatch_one(OTHER_LAYER, 0, 123);   // forces one eviction
+            dispatch_one(LAYER, 0, 124);
+            require(reads.count_of(LAYER, 0) == 1,
+                    "the most-used page was evicted -- ranking is falling back to pure recency");
+        }
 
         socket.reset();
     } catch (...) {
         server.join();
         unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_EXPERT_SPEC_LEASE");
         // The worker's own failure is the useful one. Without this, a worker
         // that never started surfaces only as "failed to connect", which points
         // at the socket instead of at the reason.
@@ -1014,6 +1045,7 @@ void test_prefetch_spec_pagein_and_eviction_order() {
     }
     server.join();
     require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
+    require(unsetenv("WP_EXPERT_SPEC_LEASE") == 0, "failed to clear the speculative lease");
     if (server_error) {
         std::rethrow_exception(server_error);
     }
@@ -1206,7 +1238,8 @@ int main() {
         run_test();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();
-        test_prefetch_spec_pagein_and_eviction_order();
+        test_prefetch_spec_pagein_and_eviction_order("0");
+        test_prefetch_spec_pagein_and_eviction_order("64");
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

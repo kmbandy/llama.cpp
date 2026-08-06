@@ -39,10 +39,28 @@ def analyze(path):
     # and the accounting silently stops closing -- the first version of this
     # script classified 1872 of 4326 reads and lost the rest without complaint.
     # The reconciliation check at the end of main() exists to catch exactly that.
-    spec_open = defaultdict(int)
+    # value is the PHASE the read happened in, or None when nothing outstanding.
+    # Phase is attributed at READ time, not at resolution time: the NVMe read is
+    # the cost, and the amplification gate is a statement about bytes spent.
+    spec_open = {}
     hinted = set()
     n_hint_ids = n_spec = n_demand = 0
-    used = late = 0
+    # Split by phase because the two are judged differently and always have been:
+    # during PREFILL the shared SN750 is at its ceiling, so a wasted speculative
+    # read steals bandwidth from demand. During DECODE the drive is ~78% idle, so
+    # the same wasted read is spending capacity that would otherwise go unused.
+    # A single blended rate hides which of those we are looking at.
+    used = defaultdict(int)
+    late = defaultdict(int)
+    mis  = defaultdict(int)
+    n_spec_ph = defaultdict(int)
+    # A decode request carries the draft block's experts (1-7 on this model); a
+    # prefill request carries the union over a 2048-token ubatch (19-52). The
+    # histogram is strictly bimodal with nothing between 7 and 19, and the low
+    # bucket reconciles EXACTLY with the req log's decode request count, so this
+    # is a clean partition rather than a tuned threshold.
+    PREFILL_MIN_IDS = 10
+    phase = 'prefill'   # prefill runs first
     # The reference currently being resolved, and the demand reads it provoked.
     cur_ref, cur_demand = None, set()
 
@@ -54,15 +72,15 @@ def analyze(path):
         layer, ids = cur_ref
         for e in ids:
             key = (layer, e)
-            if spec_open[key] > 0:
+            ph = spec_open.pop(key, None)
+            if ph is not None:
                 # Selected while we held an outstanding speculative read of it.
                 # If the same request still had to page it in, that read was
                 # wasted: the page was reclaimed before its layer arrived.
-                spec_open[key] -= 1
                 if e in cur_demand:
-                    late += 1
+                    late[ph] += 1
                 else:
-                    used += 1
+                    used[ph] += 1
         cur_ref = None
 
     with open(path) as fh:
@@ -90,13 +108,16 @@ def analyze(path):
                 # layer arrived. Charging it to mispredict would blame the oracle
                 # for the eviction band's behaviour, and the oracle here is a pure
                 # token-id lookup that cannot be wrong.
-                if spec_open[key] > 0:
-                    late += 1
-                else:
-                    spec_open[key] = 1
+                n_spec_ph[phase] += 1
+                prev = spec_open.get(key)
+                if prev is not None:
+                    late[prev] += 1
+                spec_open[key] = phase
             elif tag == 'R':
                 resolve()
-                cur_ref = (int(parts[1]), [int(e) for e in parts[2:]])
+                ids = [int(e) for e in parts[2:]]
+                phase = 'prefill' if len(ids) >= PREFILL_MIN_IDS else 'decode'
+                cur_ref = (int(parts[1]), ids)
                 cur_demand = set()
             elif tag == 'D':
                 n_demand += 1
@@ -104,61 +125,85 @@ def analyze(path):
     resolve()
 
     # Anything still outstanding was speculatively read and never selected after.
-    mispredict = sum(spec_open.values())   # capped at 1 per key by the S handler
-    # EVERY speculative read must land in exactly one bucket. If this trips, the
-    # classifier is dropping events and no rate below it means anything.
-    assert used + late + mispredict == n_spec, (
-        f"{path}: {n_spec} speculative page-ins but "
-        f"{used}+{late}+{mispredict}={used+late+mispredict} classified")
+    for ph in spec_open.values():
+        mis[ph] += 1
+    # EVERY speculative read must land in exactly one bucket, in its own phase.
+    # If this trips, the classifier is dropping events and no rate means anything.
+    for ph in ('prefill', 'decode'):
+        assert used[ph] + late[ph] + mis[ph] == n_spec_ph[ph], (
+            f"{path}/{ph}: {n_spec_ph[ph]} speculative page-ins but "
+            f"{used[ph]}+{late[ph]}+{mis[ph]}={used[ph]+late[ph]+mis[ph]} classified")
     return dict(path=path, hint_ids=n_hint_ids, spec=n_spec, demand=n_demand,
-                used=used, late=late, mispredict=mispredict,
-                hinted_pages=len(hinted))
+                used=dict(used), late=dict(late), mispredict=dict(mis),
+                n_spec_ph=dict(n_spec_ph), hinted_pages=len(hinted))
 
 
 def main(paths):
-    tot = defaultdict(int)
     rows = []
     for p in paths:
         try:
-            r = analyze(p)
+            rows.append(analyze(p))
         except FileNotFoundError:
             # Loud, never silent. A missing worker log means the run covered
             # fewer workers than the caller thinks, and a total that quietly
             # omits the R9700 -- which holds experts 85..255, the majority
             # shard -- is worse than no total at all.
             print(f"!! MISSING: {p} -- totals below EXCLUDE this worker", file=sys.stderr)
-            continue
-        rows.append(r)
-        for k in ('hint_ids', 'spec', 'demand', 'used', 'late', 'mispredict'):
-            tot[k] += r[k]
+    if not rows:
+        return 1
 
-    w = max(len(r['path'].split('/')[-1]) for r in rows) if rows else 10
-    print(f"{'log':{w}} {'hinted':>8} {'spec_pi':>8} {'demand_pi':>10} "
-          f"{'USED':>7} {'LATE':>7} {'MISPRED':>8} {'used%':>7}")
+    def agg(key, ph):
+        return sum(r[key].get(ph, 0) for r in rows)
+
+    w = max(len(r['path'].split('/')[-1]) for r in rows)
+    # DENOMINATOR IS THE HINT STREAM, NOT spec_pi.
+    #
+    # spec_pagein_submit skips any page already in a slot, so the number of reads
+    # ISSUED depends on pool residency, which depends on the eviction policy --
+    # the very thing an A/B varies. Measured: an identical hint stream (17377
+    # experts both arms) produced spec_pi 4401 vs 5061 and mispredict 6 vs 41
+    # purely from pool composition. A used% over that denominator is therefore
+    # not comparable across policies, and several figures quoted on 2026-08-06
+    # were wrong for exactly this reason.
+    #
+    # hinted ids ARE fixed by the spine and the token stream, so used/hinted is
+    # stable. spec_pi stays on the line as the COST, which is what it measures.
+    print(f"{'log':{w}} {'phase':>8} {'hinted':>7} {'spec_pi':>8} {'USED':>7} "
+          f"{'LATE':>7} {'MISPRED':>8} {'used/hint':>10}")
     for r in rows:
-        pct = r['used'] / r['spec'] if r['spec'] else 0.0
-        print(f"{r['path'].split('/')[-1]:{w}} {r['hint_ids']:8d} {r['spec']:8d} "
-              f"{r['demand']:10d} {r['used']:7d} {r['late']:7d} "
-              f"{r['mispredict']:8d} {pct:6.1%}")
-    if len(rows) > 1:
-        pct = tot['used'] / tot['spec'] if tot['spec'] else 0.0
-        print('-' * (w + 60))
-        print(f"{'TOTAL':{w}} {tot['hint_ids']:8d} {tot['spec']:8d} "
-              f"{tot['demand']:10d} {tot['used']:7d} {tot['late']:7d} "
-              f"{tot['mispredict']:8d} {pct:6.1%}")
+        name = r['path'].split('/')[-1]
+        for ph in ('prefill', 'decode'):
+            n = r['n_spec_ph'].get(ph, 0)
+            u = r['used'].get(ph, 0)
+            h = r['hint_ids'] if ph == 'decode' else 0
+            pct = u / h if h else 0.0
+            print(f"{name:{w}} {ph:>8} {h:7d} {n:8d} {u:7d} "
+                  f"{r['late'].get(ph, 0):7d} {r['mispredict'].get(ph, 0):8d} {pct:9.1%}")
+    print('-' * (w + 50))
+    hinted_all = sum(r['hint_ids'] for r in rows)
+    for ph in ('prefill', 'decode'):
+        n, u = agg('n_spec_ph', ph), agg('used', ph)
+        h = hinted_all if ph == 'decode' else 0
+        pct = u / h if h else 0.0
+        print(f"{'TOTAL':{w}} {ph:>8} {h:7d} {n:8d} {u:7d} "
+              f"{agg('late', ph):7d} {agg('mispredict', ph):8d} {pct:9.1%}")
 
-    if tot['spec']:
-        print()
-        print(f"speculative page-ins : {tot['spec']}")
-        print(f"  used               : {tot['used']:6d}  ({tot['used']/tot['spec']:.1%})  "
-              f"the win -- became RESIDENT instead of a demand page-in")
-        print(f"  LATE               : {tot['late']:6d}  ({tot['late']/tot['spec']:.1%})  "
-              f"right expert, evicted before its layer arrived")
-        print(f"  MISPREDICT         : {tot['mispredict']:6d}  ({tot['mispredict']/tot['spec']:.1%})  "
-              f"never selected -- pure waste")
-        print()
-        print("LATE says the eviction band is wrong. MISPREDICT says the prediction is.")
-        print("They have different fixes, which is why they must never be one bucket.")
+    print()
+    for ph in ('prefill', 'decode'):
+        n = agg('n_spec_ph', ph)
+        if not n:
+            continue
+        u, l, m = agg('used', ph), agg('late', ph), agg('mispredict', ph)
+        print(f"{ph.upper()}: {n} speculative page-ins")
+        print(f"  used       : {u:6d}  ({u/n:5.1%})  became RESIDENT instead of a demand page-in")
+        print(f"  LATE       : {l:6d}  ({l/n:5.1%})  right expert, evicted before its layer arrived")
+        print(f"  MISPREDICT : {m:6d}  ({m/n:5.1%})  never selected -- pure waste")
+    print()
+    print("LATE says the eviction band is wrong. MISPREDICT says the prediction is.")
+    print("They have different fixes, which is why they must never be one bucket.")
+    print("And the two phases have different economics: the drive is at its ceiling")
+    print("during prefill and ~78% idle during decode, so a wasted read costs")
+    print("bandwidth in one and spends spare capacity in the other.")
     return 0
 
 

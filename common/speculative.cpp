@@ -939,6 +939,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
+    // The previous block's drafted tokens, carried across draft() calls to be
+    // hinted at the top of the next one -- see the hint site in draft() for why
+    // this block's own tokens cannot buy any lead time.
+    std::vector<llama_token> prev_draft_toks;
+
+    // WP_SPEC_PREDICT_PREV=0 turns the predicted half off and leaves only
+    // id_last, which is ground truth. One binary, both arms, and it isolates
+    // exactly the part that can be wrong.
+    const bool spec_predict_prev = [] {
+        const char * e = std::getenv("WP_SPEC_PREDICT_PREV");
+        return e == nullptr || e[0] != '0';
+    }();
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1211,12 +1223,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Advisory: cannot throw, cannot block, ignores its own failures.
         {
             std::vector<llama_token> known;
-            known.reserve(n_seq);
+            known.reserve(n_seq + prev_draft_toks.size());
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_block_beg[seq_id] >= 0) {
                     known.push_back(dparams[seq_id].id_last);
                 }
             }
+
+            // *** THE PREDICTED HALF, AND WHY IT IS HERE AND NOT BELOW. ***
+            //
+            // id_last above is ONE token of a verify batch that holds about six.
+            // The other five are this block's drafted tokens -- ground truth for
+            // the verify, known only when the decode below FINISHES, which is
+            // microseconds before the pass that consumes them. So the ~38 ms of
+            // lead this site owns is currently spent on 1 token in 6. DSpark
+            // denoises the whole masked block in a single decode, so there is no
+            // earlier moment at which this block's tokens exist -- no amount of
+            // re-ordering fixes that.
+            //
+            // What DOES exist here, with the full window ahead of it, is the
+            // PREVIOUS block's tokens. Consecutive tokens share ~2.4 of 6 experts
+            // (lag-1 overlap 0.399 against a 0.023 chance baseline, measured
+            // 2026-07-19 over 1200 token-steps), so they are a 17x-chance
+            // predictor of this block's expert set with real lead time.
+            //
+            // This is a PREDICTION and it can be wrong -- unlike id_last, which
+            // cannot. That is what mispredict counts, and it is why the
+            // amplification gate has to be read before this is called a win. The
+            // 2026-07 attempts failed on lead time, not on prediction quality;
+            // this trades a little of the second for a lot of the first.
+            if (spec_predict_prev && !prev_draft_toks.empty()) {
+                known.insert(known.end(), prev_draft_toks.begin(), prev_draft_toks.end());
+            }
+
             if (!known.empty()) {
                 llama_expert_prefetch_hint(this->params.ctx_tgt, known.data(),
                                            (int) known.size());
@@ -1336,6 +1375,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_expert_prefetch_hint(this->params.ctx_tgt, draft_toks.data(),
                                        (int) draft_toks.size());
         }
+
+        // Carry this block forward. At the top of the NEXT draft these become the
+        // predicted half of the hint, with the whole draft decode as lead.
+        prev_draft_toks = draft_toks;
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
