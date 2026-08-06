@@ -824,6 +824,54 @@ void test_prefetch_hint_never_duplicates_across_sharing_workers() {
             "worker 2's hint did not match the partition the dispatch actually used");
 }
 
+// The same token set is now offered from three points in one step (top of
+// draft(), post-draft, and the per-ubatch call in llama_context::decode), so an
+// unchanged expert set must NOT re-send a frame the worker can only discard.
+// This suppression is invisible at runtime, which is exactly why it needs a test:
+// if it over-suppressed, prefetch would quietly stop working and every counter
+// would still look plausible.
+void test_prefetch_hint_suppresses_unchanged_repeats() {
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "1", 1) == 0, "failed to force static assignment");
+    require(setenv("WP_PREFETCH_HINT", "1", 1) == 0, "failed to enable prefetch hints");
+    selection_server worker(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::graph_dispatcher dispatcher(
+            "127.0.0.1:" + std::to_string(worker.port),
+            N_EMBD, N_FF_EXP, /*n_expert=*/151, /*n_expert_used=*/151);
+
+        // token 0 -> {3, 9}; token 1 -> {9, 40}. Two experts per token, so a
+        // single-token hint and a two-token hint differ.
+        static const int32_t table[] = {
+            3, 9,
+            9, 40,
+        };
+        dispatcher.register_hash_layer(LAYER, /*n_expert_used=*/2, /*n_vocab=*/2, table);
+        require(dispatcher.has_hash_oracle(), "hash oracle did not register");
+
+        const int32_t t0[] = { 0 };
+        const int32_t t01[] = { 0, 1 };
+
+        require(dispatcher.prefetch_for_tokens(t0, 1) == 1, "first hint was not sent");
+        require(dispatcher.prefetch_for_tokens(t0, 1) == 0, "an identical hint was re-sent");
+        require(dispatcher.prefetch_for_tokens(t0, 1) == 0, "an identical hint was re-sent twice");
+        // Superset: a genuinely different set must still go out. This is the
+        // draft-block case -- the post-draft hint adds the drafted tokens to the
+        // set the pre-draft hint already covered.
+        require(dispatcher.prefetch_for_tokens(t01, 2) == 1, "a CHANGED hint was suppressed");
+        require(dispatcher.prefetch_for_tokens(t01, 2) == 0, "the changed hint was re-sent");
+        // And back again is a change too -- suppression is "same as last", not
+        // "seen before", so a shrinking set is not mistaken for a repeat.
+        require(dispatcher.prefetch_for_tokens(t0, 1) == 1, "a shrinking hint was suppressed");
+
+        require(dispatcher.hint_stats().n_frames == 3, "frame count does not match what was sent");
+    }
+    worker.finish();
+    require(worker.hint_frames == 3, "the worker received a different number of frames than were sent");
+    require((worker.hinted_experts == std::vector<int32_t>{ 3, 9, 3, 9, 40, 3, 9 }),
+            "the worker did not receive exactly the three distinct expert sets");
+    require(unsetenv("WP_PREFETCH_HINT") == 0, "failed to disable prefetch hints");
+}
+
 // With WP_DISPATCH_STATIC_ASSIGN=0 the worker choice depends on live residency
 // and a rotating cursor, none of which exist at hint time. A guess would cost a
 // wasted read AND leave the real worker cold, so the hint declines outright.
@@ -1094,7 +1142,8 @@ void run_test() {
     test_prefetch_hint_routing();
     test_prefetch_hint_never_duplicates_across_sharing_workers();
     test_prefetch_hint_declines_when_choice_is_unpredictable();
-    std::cout << "prefetch hint: routing, no-duplication and decline checks passed\n";
+    test_prefetch_hint_suppresses_unchanged_repeats();
+    std::cout << "prefetch hint: routing, no-duplication, decline and dedup checks passed\n";
     test_speed_split_equal_costs();
     test_speed_split_unequal_costs();
     test_speed_split_residency_precedence();

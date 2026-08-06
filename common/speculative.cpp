@@ -1190,6 +1190,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        // *** THE PREFETCH HINT THAT ACTUALLY BUYS LEAD TIME. ***
+        //
+        // dp.id_last is the last ACCEPTED token, so it is the first token of the
+        // target's next verify batch -- ground truth, not a prediction. Its DS4
+        // hash-layer experts (blocks 0..2) are needed by that verify pass, and
+        // between here and there sits the ENTIRE draft decode below: on DSpark,
+        // three NextN layers measured at ~12.6 ms each. That is ~38 ms of lead
+        // against a ~5 ms cold expert read.
+        //
+        // Contrast with the post-draft hook further down, and with the per-ubatch
+        // hint in llama_context::decode: both fire microseconds before the pass
+        // that consumes them, so they cover the right experts with almost no time
+        // to fetch them. The whole 2026-07 cross-layer attempt failed for exactly
+        // this reason -- a sub-10 ms horizon cannot hide a 5 ms read, and a
+        // predictor at 0.973 precision@rank-1 still lost at every width. LEAD
+        // TIME, NOT PREDICTION QUALITY, IS THE VARIABLE.
+        //
+        // Before llama_decode, so no dispatch is in flight on these sockets.
+        // Advisory: cannot throw, cannot block, ignores its own failures.
+        {
+            std::vector<llama_token> known;
+            known.reserve(n_seq);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] >= 0) {
+                    known.push_back(dparams[seq_id].id_last);
+                }
+            }
+            if (!known.empty()) {
+                llama_expert_prefetch_hint(this->params.ctx_tgt, known.data(),
+                                           (int) known.size());
+            }
+        }
+
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
@@ -1286,6 +1319,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (n_sub > 0) {
             LOG_DBG("%s: draft-prefetch submitted %d expert pages (n_draft_toks=%zu)\n",
                     __func__, n_sub, draft_toks.size());
+        }
+
+        // The cross-machine half of the same idea, and a SEPARATE mechanism --
+        // the call above drives the in-process WeightPager, which is a hard no-op
+        // on this layout (no pager on the spine, and no expert pages in its
+        // catalog even with one). See llama_expert_prefetch_hint.
+        //
+        // Second-best lead time by design: this fires just before the verify
+        // pass, so it covers the drafted tokens the earlier hint could not know
+        // about, with only the target's embedding to hide the read. The hint at
+        // the top of draft() is the one with real lead. Kept because the drafted
+        // tokens genuinely are the rest of the verify batch, and the dedup in
+        // graph_dispatcher drops the frame when the expert set has not moved.
+        if (!draft_toks.empty()) {
+            llama_expert_prefetch_hint(this->params.ctx_tgt, draft_toks.data(),
+                                       (int) draft_toks.size());
         }
     }
 

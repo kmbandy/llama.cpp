@@ -99,6 +99,15 @@ class graph_dispatcher {
     // Scratch for prefetch_for_tokens, reused so a per-decode hint costs no
     // allocation. Not thread safe -- see the "no dispatch in flight" contract.
     std::vector<int32_t>                           hint_experts_;
+    // Last expert set hinted per layer. The same token set is now offered from
+    // several points in one step (draft start, post-draft, and the ubatch), and
+    // without this each would re-send an identical frame that the worker can
+    // only discard. Suppressing the repeat costs one compare and keeps
+    // hint_stats honest about how much was really offered.
+    // Trade-off, on purpose: if a set recurs after its pages were evicted, the
+    // repeat is skipped and one prefetch opportunity is lost. Strictly fewer
+    // frames, never more reads.
+    std::map<int32_t, std::vector<int32_t>>        last_hint_;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
     std::atomic<bool>                              failed_{ false };

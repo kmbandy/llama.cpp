@@ -170,6 +170,13 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
             hint_experts_.empty()) {
             continue;
         }
+        // Same set as last time for this layer: the worker would resolve it to
+        // pages it already holds and discard it. Skip the frame.
+        std::vector<int32_t> & previous = last_hint_[layer];
+        if (previous == hint_experts_) {
+            continue;
+        }
+        previous = hint_experts_;
         // Swallowing here is deliberate and is the property that makes this safe
         // to leave enabled: a hint carries no correctness weight, so no failure
         // inside it may reach the decode. A broken socket surfaces on the next

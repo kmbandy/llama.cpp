@@ -144,6 +144,26 @@ LLAMA_API int llama_wp_on_draft_tokens(struct llama_context * ctx,
 LLAMA_API int llama_wp_on_sampled_token(struct llama_context * ctx,
                                         llama_token id);
 
+// Hash-layer expert prefetch hint. Resolves `tokens` through the DS4 tid2eid
+// tables (layers 0..H, a pure token-id lookup with no prediction) and offers the
+// resulting expert ids to the cross-machine expert workers, which warm their own
+// pools in their idle windows.
+//
+// DISTINCT FROM llama_wp_on_draft_tokens ABOVE, which drives the IN-PROCESS
+// WeightPager. That path is a no-op on the cross-machine layout: the spine runs
+// without --weight-paging so model.wp_pager is null, and even with a pager the
+// routed experts are TENSOR_SKIP so its catalog holds no expert pages. This one
+// needs no pager at all.
+//
+// CALL IT AS EARLY AS THE TOKENS ARE KNOWN -- the value is entirely in how much
+// compute separates the hint from the forward pass that consumes it. Advisory:
+// never throws, never blocks, and a dropped hint costs at most a page-in the run
+// was going to pay anyway. Returns hint frames sent; 0 unless WP_PREFETCH_HINT=1
+// and the context owns (or borrows) an expert dispatcher.
+LLAMA_API int llama_expert_prefetch_hint(struct llama_context * ctx,
+                                         const llama_token * tokens,
+                                         int n_tokens);
+
 // Adaptive gate: when false, skip running the draft model this step (pool
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0
 // always returns true. No-op / true if paging disabled.
