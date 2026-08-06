@@ -1421,9 +1421,20 @@ private:
         int                fd          = -1;
     };
 
+    // One STRIPE of one page-in. A page is read in WP_EXPERT_READ_STRIPES
+    // aligned pieces so the dispatch thread can upload stripe k while the
+    // reader thread is still reading stripe k+1. With one stripe this is
+    // exactly the old whole-page result.
+    //
+    // WHY THE LEASE IS SHARED: every stripe of a page reads into a different
+    // offset of the SAME staging buffer, so the lease must outlive the last
+    // stripe's upload, not the first.
     struct ReadResult {
         size_t                              pagein_indexb = 0;
-        std::unique_ptr<StagingPool::Lease> staging;
+        std::shared_ptr<StagingPool::Lease> staging;
+        size_t                              offset = 0;   // byte offset within the page
+        size_t                              len    = 0;   // bytes in this stripe
+        bool                                last   = true; // last stripe of this page
         std::exception_ptr                  error;
         std::chrono::steady_clock::time_point read_started;
         std::chrono::steady_clock::time_point read_finished;
@@ -1547,6 +1558,14 @@ public:
 
         void complete();
 
+        // Drain reads until every entry with index < entry_end that needs a
+        // page-in has landed, leaving the rest in flight. Lets the caller
+        // compute a leading chunk of experts while the tail is still being read
+        // -- see WP_EXPERT_COMPUTE_CHUNKS at the dispatch site. complete() must
+        // still be called afterwards to join the reader threads and finalise
+        // the read timing, and remains safe to call after any number of these.
+        void complete_upto(size_t entry_end);
+
         uint64_t lookup_ns() const {
             return ns_lookup_;
         }
@@ -1626,6 +1645,15 @@ public:
         uint64_t                   host_bytes_ = 0;
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
+        // Drain state. Lives on the Batch rather than in complete_batch's frame
+        // so a drain can stop part-way (complete_upto) and be resumed. A read
+        // that FAILED never sets entry.ready, so every drain loop is bounded by
+        // received_ < pageins.size(), never by readiness alone.
+        size_t                     received_  = 0;
+        std::exception_ptr         first_error_;
+        std::chrono::steady_clock::time_point first_read_;
+        std::chrono::steady_clock::time_point last_read_;
+        bool                       have_read_time_ = false;
     };
 
     Batch ensure_batch(
@@ -1919,12 +1947,11 @@ private:
                 return;
             }
             const PageIn & pagein = state->pageins[pagein_indexb];
-            auto result = std::make_unique<ReadResult>();
-            result->pagein_indexb = pagein_indexb;
             bool read_started = false;
+            std::shared_ptr<StagingPool::Lease> staging;
+            std::exception_ptr fatal;
             try {
-                result->staging = std::make_unique<StagingPool::Lease>(
-                    staging_.borrow());
+                staging = std::make_shared<StagingPool::Lease>(staging_.borrow());
                 if (test_hooks_ != nullptr &&
                     test_hooks_->staging_borrowed) {
                     test_hooks_->staging_borrowed();
@@ -1935,47 +1962,75 @@ private:
                     test_hooks_->read_started(
                         pagein.page->layer, pagein.page->expert);
                 }
-                if (state->measure) {
-                    result->read_started = std::chrono::steady_clock::now();
-                    result->read_timed = true;
-                }
-                read_page(*pagein.page, pagein.fd, result->staging->get());
             } catch (...) {
-                result->error = std::current_exception();
+                fatal = std::current_exception();
             }
-            if (state->measure && result->read_timed) {
-                result->read_finished = std::chrono::steady_clock::now();
-            }
-            if (read_started && test_hooks_ != nullptr &&
-                test_hooks_->read_finished) {
-                try {
-                    test_hooks_->read_finished(
-                        pagein.page->layer, pagein.page->expert);
-                } catch (...) {
-                    if (result->error == nullptr) {
+
+            const auto plan = fatal ? std::vector<std::pair<size_t, size_t>>{{0, 0}}
+                                    : stripe_plan(pagein.page->size,
+                                                  state->pageins.size());
+            // Publish each stripe as soon as it lands so the dispatch thread can
+            // upload it while the next one is still being read. The LAST stripe
+            // is what flips entry.ready and advances received_, so a page is
+            // never visible to compute half-uploaded.
+            for (size_t s = 0; s < plan.size(); ++s) {
+                auto result = std::make_unique<ReadResult>();
+                result->pagein_indexb = pagein_indexb;
+                result->staging       = staging;
+                result->offset        = plan[s].first;
+                result->len           = plan[s].second;
+                result->last          = (s + 1 == plan.size());
+                result->error         = fatal;
+                if (!fatal) {
+                    try {
+                        if (state->measure) {
+                            result->read_started = std::chrono::steady_clock::now();
+                            result->read_timed = true;
+                        }
+                        read_page_range(
+                            *pagein.page, pagein.fd,
+                            (char *) staging->get() + result->offset,
+                            result->offset, result->len);
+                    } catch (...) {
                         result->error = std::current_exception();
                     }
+                    if (state->measure && result->read_timed) {
+                        result->read_finished = std::chrono::steady_clock::now();
+                    }
+                }
+                // A failed stripe ends the page: mark it last so the drain still
+                // accounts for it, and stop reading the rest.
+                const bool failed = result->error != nullptr;
+                if (failed) {
+                    result->last = true;
+                }
+                if (result->last && read_started && test_hooks_ != nullptr &&
+                    test_hooks_->read_finished) {
+                    try {
+                        test_hooks_->read_finished(
+                            pagein.page->layer, pagein.page->expert);
+                    } catch (...) {
+                        if (result->error == nullptr) {
+                            result->error = std::current_exception();
+                        }
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->ready.push_back(std::move(result));
+                }
+                state->cv.notify_one();
+                if (failed) {
+                    break;
                 }
             }
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->ready.push_back(std::move(result));
-            }
-            state->cv.notify_one();
         }
     }
 
-    void complete_batch(Batch & batch) {
-        if (batch.completed_) {
-            return;
-        }
-
-        std::exception_ptr first_error;
-        size_t received = 0;
-        std::chrono::steady_clock::time_point first_read;
-        std::chrono::steady_clock::time_point last_read;
-        bool have_read_time = false;
-        while (received < batch.state_->pageins.size()) {
+    // Process exactly ONE completed read: H2D it into its slot and mark the
+    // entry ready. Split out of complete_batch so a drain can stop part-way.
+    void drain_one_read(Batch & batch) {
+        {
             std::unique_ptr<ReadResult> result;
             {
                 std::unique_lock<std::mutex> lock(batch.state_->mutex);
@@ -1989,63 +2044,110 @@ private:
             const PageIn & pagein =
                 batch.state_->pageins[result->pagein_indexb];
             if (result->read_timed) {
-                if (!have_read_time || result->read_started < first_read) {
-                    first_read = result->read_started;
+                if (!batch.have_read_time_ || result->read_started < batch.first_read_) {
+                    batch.first_read_ = result->read_started;
                 }
-                if (!have_read_time || result->read_finished > last_read) {
-                    last_read = result->read_finished;
+                if (!batch.have_read_time_ || result->read_finished > batch.last_read_) {
+                    batch.last_read_ = result->read_finished;
                 }
-                have_read_time = true;
+                batch.have_read_time_ = true;
             }
             if (result->error != nullptr) {
-                if (first_error == nullptr) {
-                    first_error = result->error;
+                if (batch.first_error_ == nullptr) {
+                    batch.first_error_ = result->error;
                 }
             } else {
-                // WP_PAGEIN_LOG=path: append "<layer> <expert>" for every page
-                // actually READ from disk. Intersecting the two 2026 workers'
-                // logs measures whether residency-affinity routing keeps their
-                // caches disjoint, or whether they fetch the same pages twice.
-                // Default off; one fprintf per pagein, negligible against a
-                // 13.37 MB O_DIRECT read.
-                if (pagein_log_ != nullptr) {
-                    fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
-                    // The harness SIGKILLs workers at teardown, so a buffered
-                    // stream is lost entirely -- the first run produced two
-                    // 0-byte logs. One fflush per 13.37 MB O_DIRECT read is free.
-                    fflush(pagein_log_);
-                }
                 Slot & slot = slots_[pagein.slot_index];
                 const bool measure_h2d = batch.state_->measure;
                 const std::chrono::steady_clock::time_point h2d_started =
                     measure_h2d ? std::chrono::steady_clock::now() :
                                   std::chrono::steady_clock::time_point();
+                // Upload ONLY this stripe, at its own offset. With one stripe
+                // this is the original whole-page (0, page.size) call.
                 ggml_backend_tensor_set(
-                    slot.raw, result->staging->get(), 0,
-                    (size_t) pagein.page->size);
+                    slot.raw, (const char *) result->staging->get() + result->offset,
+                    result->offset, result->len);
                 if (measure_h2d) {
                     batch.ns_h2d_ +=
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - h2d_started).count();
-                    batch.bytes_h2d_ += pagein.page->size;
+                    batch.bytes_h2d_ += result->len;
                 }
-                slot.valid = true;
-                slot.key   = {
-                    pagein.page->layer, pagein.page->expert
-                };
-                slot.cache_id = pagein.page->cache_id;
-                slot.size     = pagein.page->size;
-                slot.tick  = ++tick_;
-                Batch::Entry & entry =
-                    batch.entries_[pagein.entry_index];
-                entry.loaded = {
-                    slot.buffer.get(),
-                    ggml_backend_buffer_get_base(slot.buffer.get())
-                };
-                entry.ready = true;
+                // Everything below publishes the page to the compute path and so
+                // must happen EXACTLY ONCE, on the final stripe -- otherwise a
+                // half-uploaded slot becomes visible, and the page-in log and LRU
+                // tick would fire once per stripe.
+                if (result->last) {
+                    // WP_PAGEIN_LOG=path: append "<layer> <expert>" for every page
+                    // actually READ from disk. Intersecting the two 2026 workers'
+                    // logs measures whether residency-affinity routing keeps their
+                    // caches disjoint, or whether they fetch the same pages twice.
+                    // Default off; one fprintf per pagein, negligible against a
+                    // 13.37 MB O_DIRECT read.
+                    if (pagein_log_ != nullptr) {
+                        fprintf(pagein_log_, "%d %d\n", pagein.page->layer, pagein.page->expert);
+                        // The harness SIGKILLs workers at teardown, so a buffered
+                        // stream is lost entirely -- the first run produced two
+                        // 0-byte logs. One fflush per 13.37 MB O_DIRECT read is free.
+                        fflush(pagein_log_);
+                    }
+                    slot.valid = true;
+                    slot.key   = {
+                        pagein.page->layer, pagein.page->expert
+                    };
+                    slot.cache_id = pagein.page->cache_id;
+                    slot.size     = pagein.page->size;
+                    slot.tick  = ++tick_;
+                    Batch::Entry & entry =
+                        batch.entries_[pagein.entry_index];
+                    entry.loaded = {
+                        slot.buffer.get(),
+                        ggml_backend_buffer_get_base(slot.buffer.get())
+                    };
+                    entry.ready = true;
+                }
             }
+            // received_ counts PAGES, not stripes -- complete_batch's loop is
+            // bounded by pageins.size().
+            const bool page_done = result->last;
             result.reset();
-            ++received;
+            if (page_done) {
+                ++batch.received_;
+            }
+        }
+    }
+
+    // Drain until every entry below entry_end that needs a page-in is ready.
+    // Entries at or above entry_end whose reads happen to land first are still
+    // processed -- their H2D is done here, so nothing is dropped or re-done.
+    // Does NOT join the reader threads or finalise timings; complete_batch does.
+    void complete_batch_upto(Batch & batch, size_t entry_end) {
+        if (batch.completed_) {
+            return;
+        }
+        const auto range_pending = [&]() {
+            for (const PageIn & pagein : batch.state_->pageins) {
+                if (pagein.entry_index < entry_end &&
+                    !batch.entries_[pagein.entry_index].ready) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        // received_ bounds the loop: a FAILED read never sets ready, so waiting
+        // on readiness alone would hang on exactly the error path.
+        while (batch.received_ < batch.state_->pageins.size() && range_pending()) {
+            drain_one_read(batch);
+        }
+    }
+
+    void complete_batch(Batch & batch) {
+        if (batch.completed_) {
+            return;
+        }
+
+        while (batch.received_ < batch.state_->pageins.size()) {
+            drain_one_read(batch);
         }
 
         for (std::thread & worker : batch.workers_) {
@@ -2053,12 +2155,12 @@ private:
         }
         batch.workers_.clear();
         batch.completed_ = true;
-        if (have_read_time) {
+        if (batch.have_read_time_) {
             batch.ns_read_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                last_read - first_read).count();
+                batch.last_read_ - batch.first_read_).count();
         }
-        if (first_error != nullptr) {
-            std::rethrow_exception(first_error);
+        if (batch.first_error_ != nullptr) {
+            std::rethrow_exception(batch.first_error_);
         }
     }
 
@@ -2159,27 +2261,121 @@ private:
 #endif
     }
 
-    void read_page(const ExpertPage & page, int fd, void * dst) {
+    // Read [offset, offset+len) of a page. offset is 4096-aligned by
+    // construction (see stripe_plan); the final stripe carries whatever
+    // remainder the page has, which is exactly the tail a single whole-page
+    // read submits today, so O_DIRECT sees no length it did not see before.
+    void read_page_range(const ExpertPage & page, int fd, void * dst,
+                         size_t offset, size_t len) {
 #if defined(__linux__)
         ssize_t n = -1;
         do {
-            n = pread(fd, dst, (size_t) page.size, (off_t) page.offset);
+            n = pread(fd, dst, len, (off_t) (page.offset + (uint64_t) offset));
         } while (n < 0 && errno == EINTR);
-        if (n < 0 || (uint64_t) n != page.size) {
+        if (n < 0 || (size_t) n != len) {
             throw std::runtime_error(
                 "short O_DIRECT expert read from " + page.blob.string() +
-                ": got " + std::to_string(n) + " want " + std::to_string(page.size));
+                ": got " + std::to_string(n) + " want " + std::to_string(len) +
+                " at +" + std::to_string(offset));
         }
 #else
         (void) page;
         (void) fd;
         (void) dst;
+        (void) offset;
+        (void) len;
 #endif
+    }
+
+    // Split a page into aligned stripes. Every stripe but the last is a
+    // multiple of 4096 (the alignment the staging pool already guarantees and
+    // O_DIRECT requires); the last absorbs the remainder. Returns a single
+    // whole-page stripe when striping is off or the page is too small to be
+    // worth splitting -- that path is byte-for-byte the old behaviour.
+    std::vector<std::pair<size_t, size_t>> stripe_plan(uint64_t page_size,
+                                                       size_t   n_pageins) const {
+        std::vector<std::pair<size_t, size_t>> out;
+        const size_t total = (size_t) page_size;
+        constexpr size_t kAlign   = 4096;
+        constexpr size_t kMinPart = 1u << 20;   // don't split below 1 MiB/stripe
+        size_t n = read_stripes_;
+        // *** GATE ON THE BATCH BEING READ-SPARSE. ***
+        // Striping only pays when a page has no OTHER page to overlap against.
+        // With many page-ins in one batch, drain_one_read is already uploading
+        // page N while the reader threads pull N+1, so splitting each page just
+        // multiplies preads and tensor_set calls.
+        // MEASURED 2026-08-05, identical block counts both arms: decode-side
+        // dispatch wait 72.62 -> 66.04 s (-9.1%, and consistent in sign across
+        // decode/verify-43/verify-3), but PREFILL wait 16.50 -> 18.26 s
+        // (+10.7%). Prefill averages 31.4 page-ins per request; decode averages
+        // 0.212 and verify 0.465. So stripe the sparse batches and leave the
+        // dense ones whole.
+        if (n_pageins > stripe_max_pageins_) {
+            n = 1;
+        }
+        if (n > 1 && total / n < kMinPart) {
+            n = total / kMinPart;
+        }
+        if (n <= 1) {
+            out.emplace_back(0, total);
+            return out;
+        }
+        const size_t part = ((total / n) / kAlign) * kAlign;
+        if (part == 0) {
+            out.emplace_back(0, total);
+            return out;
+        }
+        size_t off = 0;
+        while (off + part < total) {
+            out.emplace_back(off, part);
+            off += part;
+        }
+        out.emplace_back(off, total - off);   // remainder tail
+        return out;
+    }
+
+    // WP_EXPERT_READ_STRIPES=<n>: read each expert page in n aligned pieces so
+    // the dispatch thread uploads stripe k while the reader thread reads k+1.
+    // 1 = the original whole-page read, byte-for-byte.
+    //
+    // WHAT THIS DOES AND DOES NOT FIX. Across pages, read and h2d ALREADY
+    // overlap: drain_one_read uploads page N on the dispatch thread while the
+    // reader threads pull page N+1. So this only bites when there are too few
+    // pages in flight to overlap each other -- i.e. DECODE, where the RX 480
+    // averages 0.212 page-ins per request and a lone page really is read-then-
+    // upload serial. At prefill it averages 31.4 page-ins per request and is
+    // already deeply pipelined, so expect ~nothing there.
+    // Measured per page-in on the 480 at decode: read ~5.4 ms, h2d ~3.63 ms.
+    // NOTE ns_read is a SPAN and ns_h2d is a SUM, so those two do not simply add
+    // -- do not size this change by adding them.
+    static size_t read_stripes_from_env() {
+        const char * e = std::getenv("WP_EXPERT_READ_STRIPES");
+        if (e == nullptr || e[0] == '\0') {
+            return 4;
+        }
+        const long parsed = std::strtol(e, nullptr, 10);
+        return parsed > 0 ? (size_t) parsed : (size_t) 1;
+    }
+
+    // WP_EXPERT_STRIPE_MAX_PAGEINS=<n>: only stripe batches with at most n
+    // page-ins. Above that the pages already overlap each other. Default 4
+    // covers decode (0.212 page-ins/request) and verify (0.465) while leaving
+    // prefill (31.4) on the whole-page read, which is where striping measured a
+    // +10.7% regression.
+    static size_t stripe_max_pageins_from_env() {
+        const char * e = std::getenv("WP_EXPERT_STRIPE_MAX_PAGEINS");
+        if (e == nullptr || e[0] == '\0') {
+            return 4;
+        }
+        const long parsed = std::strtol(e, nullptr, 10);
+        return parsed >= 0 ? (size_t) parsed : (size_t) 4;
     }
 
     ggml_backend_t             backend_ = nullptr;
     ResourcePlan               resources_;
     StagingPool                staging_;
+    size_t                     read_stripes_ = read_stripes_from_env();
+    size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
     TestHooks *                test_hooks_ = nullptr;
     wp::HostTier               host_tier_;
     bool                       host_victim_enabled_ = false;
@@ -2222,6 +2418,13 @@ void ExpertSlotPool::Batch::complete() {
         throw std::logic_error("expert batch has no owner");
     }
     owner_->complete_batch(*this);
+}
+
+void ExpertSlotPool::Batch::complete_upto(size_t entry_end) {
+    if (owner_ == nullptr) {
+        throw std::logic_error("expert batch has no owner");
+    }
+    owner_->complete_batch_upto(*this, entry_end);
 }
 
 void attach_weight(
@@ -2492,6 +2695,23 @@ public:
             const char * e = std::getenv("WP_EXPERT_OVERLAP");
             return e != nullptr && e[0] == '1';   // default OFF = deterministic
         }();
+        // WP_EXPERT_COMPUTE_CHUNKS=<n>: split the expert compute into n fixed
+        // index chunks so all but the last can run while the tail of the page-in
+        // reads is still in flight. 1 = the original strictly-serial path.
+        // Unlike WP_EXPERT_OVERLAP this does NOT trade determinism -- see the
+        // note at the compute loop below.
+        // NOTE: this is clamped to the assignment count AND gated on n_pagein > 0
+        // at the loop. Clamping alone was NOT enough and the earlier comment here
+        // claiming "decode is unaffected" was wrong -- min(4, 2) is 2, so 2-expert
+        // decode/verify requests were splitting into two submits for nothing.
+        static const size_t s_compute_chunks = [] {
+            const char * e = std::getenv("WP_EXPERT_COMPUTE_CHUNKS");
+            if (e == nullptr || e[0] == '\0') {
+                return (size_t) 4;
+            }
+            const long parsed = std::strtol(e, nullptr, 10);
+            return parsed > 0 ? (size_t) parsed : (size_t) 1;
+        }();
         if (!request.assignments.empty()) {
             prepare_io(activation, request.n_tokens, request_stats);
             request_stats.ns_prep = lap();
@@ -2502,26 +2722,72 @@ public:
             }
             request_stats.ns_hits = lap();
         }
+        // *** READ / COMPUTE OVERLAP (WP_EXPERT_COMPUTE_CHUNKS, default 4). ***
+        //
+        // THE COST THIS ATTACKS. complete() blocks until EVERY expert page has
+        // landed and only then runs one compute pass, so read and compute are
+        // strictly serial. Measured 2026-08-05 on the RX 480 at 659-token
+        // prefill: read 198.3 ms/request against compute 43.8 ms/request. An
+        // expert only needs ITS OWN page, so all but the last chunk's compute
+        // can hide under the reads still in flight.
+        //
+        // WHY CHUNK BY INDEX AND NOT BY ARRIVAL. Computing whatever happens to
+        // be ready is what WP_EXPERT_OVERLAP does, and it is off by default
+        // precisely because it makes the FP summation order depend on I/O
+        // timing -- same experts, different association, a last-bit delta that
+        // turbo4 amplified into a different token. Fixed index chunks keep the
+        // accumulation order identical to the serial path no matter when reads
+        // land, so this is deterministic BY CONSTRUCTION rather than by luck.
+        //
+        // Chunk count is a tuning knob, not a correctness one: the summation
+        // order is the same at every value, so arms differ only in speed. =1
+        // restores the exact serial path.
+        if (!overlap && !request.assignments.empty()) {
+            const size_t n_assign = request.assignments.size();
+            // *** GATE ON THERE BEING READS TO HIDE UNDER. ***
+            // Clamping to the assignment count is NOT enough: min(4, 2) == 2, so a
+            // 2-expert request still split into TWO graph submits. Decode averages
+            // ~1.5 experts and verify ~2.0, and at 85% residency those requests
+            // usually have NOTHING in flight to overlap -- so the split bought a
+            // second submit (~0.45 ms on the RX 480, plus its idle-recovery gap
+            // penalty) for zero benefit, on the decode critical path. verify is
+            // 40.8 s of the 74.0 s decode dispatch wait, so this is not a rounding
+            // error. n_pagein == 0 means every expert is already resident and the
+            // serial path is strictly better.
+            const size_t chunks   = batch.n_pagein() == 0
+                ? 1
+                : std::max<size_t>(1, std::min(s_compute_chunks, n_assign));
+            for (size_t c = 0; c < chunks; ++c) {
+                const size_t beg = n_assign * c / chunks;
+                const size_t end = n_assign * (c + 1) / chunks;
+                if (beg == end) {
+                    continue;
+                }
+                batch.complete_upto(end);
+                request_stats.ns_wait += lap();
+                compute_batch(
+                    request, pages, batch, /* hits = */ true,
+                    /* add_previous = */ c > 0, request_stats,
+                    /* all_experts = */ true, /* force_dense = */ false,
+                    beg, end);
+                request_stats.ns_pagein_compute += lap();
+            }
+        }
+        // Always: joins the reader threads, finalises ns_read and rethrows the
+        // first read error. Cheap and already drained after the loop above.
         batch.complete();
-        request_stats.ns_wait = lap();
+        request_stats.ns_wait += lap();
         if (measure) {
             request_stats.ns_read = batch.read_ns();
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
         }
-        if (!overlap) {
-            if (!request.assignments.empty()) {
-                compute_batch(
-                    request, pages, batch, /* hits = */ true,
-                    /* add_previous = */ false, request_stats,
-                    /* all_experts = */ true);
-            }
-        } else if (have_pageins) {
+        if (overlap && have_pageins) {
             compute_batch(
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
         }
-        request_stats.ns_pagein_compute = lap();
+        request_stats.ns_pagein_compute += lap();
         if (!request.assignments.empty()) {
             read_result(sum, request_stats);
         }
@@ -2755,10 +3021,22 @@ private:
             bool all_experts = false,
             // force_dense: ignore the gather path for this call only. Used by
             // WP_SELFCHECK to compute the SAME request both ways and diff them.
-            bool force_dense = false) {
+            bool force_dense = false,
+            // Half-open ASSIGNMENT-INDEX range this call computes. Used by the
+            // read/compute overlap to run a leading chunk of experts while the
+            // tail is still being read. entries_ is indexed by assignment index
+            // (is_resident(i) reads entries_.at(i)), and pageins carry the same
+            // index, so this range selects a matching set of page-ins.
+            // Default [0, SIZE_MAX) = every expert, i.e. unchanged behaviour.
+            size_t sel_begin = 0,
+            size_t sel_end = std::numeric_limits<size_t>::max()) {
+        const auto selected = [&](size_t i) {
+            return i >= sel_begin && i < sel_end &&
+                   (all_experts || (batch.is_resident(i) == hits));
+        };
         size_t n_selected = 0;
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            n_selected += all_experts || (batch.is_resident(i) == hits);
+            n_selected += selected(i) ? 1 : 0;
         }
         if (n_selected == 0) {
             return;
@@ -2845,7 +3123,20 @@ private:
         ggml_set_input(input);
         ggml_tensor * result = make_io_tensor(
             ctx.get(), request.n_tokens, io_result_offset_);
-        ggml_tensor * sum = nullptr;
+        // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
+        // The accumulator below is a LEFT-FOLD in assignment-index order:
+        //     sum = ((((e0 + e1) + e2) + ...))
+        // A chunked caller (WP_EXPERT_COMPUTE_CHUNKS) must continue that exact
+        // fold, so the previous chunks' running total has to be the SEED. Adding
+        // it at the end instead computes
+        //     (e8 + ... + e15) + (e0 + ... + e7)
+        // which is the same experts in the same order but a DIFFERENT
+        // ASSOCIATION, and FP addition is not associative. Measured 2026-08-05:
+        // that re-association alone moved draft acceptance 0.84286 -> 0.77966,
+        // because the router's top-k is discontinuous and amplifies a last-bit
+        // delta into a different token. Seeding makes chunked output bit-identical
+        // to the unchunked path.
+        ggml_tensor * sum = add_previous ? result : nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
         // Parallel to routing_weights: the gathered token indices per expert, kept
@@ -2854,7 +3145,7 @@ private:
         gather_idx.reserve(n_selected);
 
         for (size_t i = 0; i < request.assignments.size(); ++i) {
-            if (!all_experts && batch.is_resident(i) != hits) {
+            if (!selected(i)) {
                 continue;
             }
             const ExpertPage & page = *pages[i];
@@ -2936,9 +3227,7 @@ private:
             routing_weights.emplace_back(weights, &request.assignments[i]);
             gather_idx.emplace_back(idx_t, std::move(idx));
         }
-        if (add_previous) {
-            sum = ggml_add(ctx.get(), sum, result);
-        }
+        // (add_previous is folded in as the SEED above, not appended here.)
         if (sum == nullptr) {
             // Defensive: nothing contributed. Cannot happen now that empty experts
             // keep a zero-weight row, but a null here segfaults inside ggml_cpy
