@@ -983,6 +983,23 @@ void test_prefetch_spec_pagein_and_eviction_order() {
         require(reads.count_of(LAYER, 1) == 2,
                 "the oldest speculative page was not the victim -- eviction order within the prefetch band is wrong");
 
+        // 7. USE COUNT BEATS RECENCY. Ask for (LAYER,0) repeatedly so its count
+        //    climbs well above everything else, then touch three other pages so
+        //    it is the LEAST RECENTLY used of the four. Under LRU it is the next
+        //    victim. Under use-count ranking it is the last thing to go.
+        for (uint64_t seq = 110; seq < 116; ++seq) {
+            dispatch_one(LAYER, 0, seq);
+        }
+        require(reads.count_of(LAYER, 0) == 1, "repeated demand re-read a resident page");
+        dispatch_one(LAYER, 1, 120);
+        dispatch_one(LAYER, 2, 121);
+        dispatch_one(LAYER, 3, 122);
+        // (LAYER,0) is now the oldest of the four by tick and the hottest by use.
+        dispatch_one(OTHER_LAYER, 0, 123);   // forces one eviction
+        dispatch_one(LAYER, 0, 124);
+        require(reads.count_of(LAYER, 0) == 1,
+                "the most-used page was evicted -- ranking is falling back to pure recency");
+
         socket.reset();
     } catch (...) {
         server.join();
