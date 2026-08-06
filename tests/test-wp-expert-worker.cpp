@@ -979,8 +979,7 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
             // THE LEASE'S WHOLE POINT, AND ITS WHOLE COST. A leased speculative
             // page outranks a cold demand page, so the demand page is what goes.
             // That is pool pollution by definition -- bounded to the lease
-            // window, and the reason the amplification gate has to be armed
-            // whenever this is on.
+            // window.
             require(reads.count_of(LAYER, 0) == 2,
                     "the lease did not protect the speculative pages -- demand page survived");
         } else {

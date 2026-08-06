@@ -276,7 +276,7 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 [ -n "${LFU:-}" ] && WPOST="$WPOST WP_EXPERT_LFU=$LFU"
 # LEASE=<n> -- evictions a speculative page survives before it becomes an
 # ordinary victim. 0 is the original first-victim behaviour. Anything above 0 is
-# DELIBERATE POOL POLLUTION: read the amplification gate on any arm using it.
+# Lets a speculative page outrank a cold demand page for that window.
 [ -n "${LEASE:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_LEASE=$LEASE"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is

@@ -2099,7 +2099,7 @@ private:
     // Index of the slot already holding `page`, or slots_.size(). ONE definition:
     // the speculative path must agree with ensure_batch about what "already here" means,
     // or a prefetch re-reads a page that is sitting in a slot and the extra bytes
-    // land in the read-amplification counter as if they were a real page-in.
+    // land in the speculative-read counter as if they were a real page-in.
     size_t find_slot(const ExpertPage & page) const {
         const std::pair<int, int> key(page.layer, page.expert);
         for (size_t i = 0; i < slots_.size(); ++i) {
@@ -2683,9 +2683,12 @@ private:
         const int leased = (s.lease_until > evictions_) ? 1 : 0;
         return { leased, lfu_ ? s.uses : 0, s.tick };
     }
-    // Speculative page-in accounting. spec_pageins_/spec_bytes_ are the numerator of the
-    // read-amplification gate: if total bytes rise faster than demand page-ins
-    // fall, speculation is costing more reads than it saves.
+    // Speculative page-in accounting. spec_pageins_/spec_bytes_ are what
+    // speculation SPENT; the request stream's n_pagein is what it SAVED. Both are
+    // reported, neither is a verdict -- on this rig the drive is ~78% idle during
+    // decode, so extra reads there are spending capacity that would otherwise go
+    // unused, and totalling bytes as if bandwidth were scarce answers a question
+    // the hardware is not asking.
     uint64_t                   spec_pageins_  = 0;
     uint64_t                   spec_bytes_  = 0;
     uint64_t                   spec_errors_ = 0;
@@ -2922,7 +2925,7 @@ public:
 
     // Drop the queue. Called when the connection has been idle long enough that
     // the hinted layer is certainly behind us -- speculating on a layer already
-    // computed is pure amplification with no possible upside.
+    // computed is a read with no possible upside.
     void drop_spec_work() {
         spec_dropped_ += spec_queue_.size();
         spec_queue_.clear();
@@ -2970,9 +2973,9 @@ public:
     }
 
     // The counter line, built in ONE place so stderr and WP_HINT_LOG cannot
-    // drift apart. spec_pageins/spec_bytes against the request stream's own
-    // n_pagein and bytes_read ARE the read-amplification gate -- kept on one
-    // line because those numbers are only meaningful as a ratio.
+    // drift apart. spec_pageins/spec_bytes sit next to the request stream's own
+    // n_pagein and bytes_read because spend and saving are only interpretable
+    // together.
     std::string prefetch_hint_line() const {
         char buf[512];
         std::snprintf(buf, sizeof(buf),
@@ -3989,7 +3992,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             }
             if (std::chrono::steady_clock::now() - last_request_at > KEEPALIVE_IDLE_MS) {
                 // Idle long enough that any hinted layer is far behind us.
-                // Warming for a layer already computed is amplification with no
+                // Reading for a layer already computed is a read with no
                 // possible upside, so drop it rather than carry it forward.
                 worker.drop_spec_work();
                 return;   // let the card sleep

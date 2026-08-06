@@ -41,15 +41,13 @@ def analyze(path):
     # The reconciliation check at the end of main() exists to catch exactly that.
     # value is the PHASE the read happened in, or None when nothing outstanding.
     # Phase is attributed at READ time, not at resolution time: the NVMe read is
-    # the cost, and the amplification gate is a statement about bytes spent.
+    # the cost, and cost is attributed where it is incurred.
     spec_open = {}
     hinted = set()
     n_hint_ids = n_spec = n_demand = 0
-    # Split by phase because the two are judged differently and always have been:
-    # during PREFILL the shared SN750 is at its ceiling, so a wasted speculative
-    # read steals bandwidth from demand. During DECODE the drive is ~78% idle, so
-    # the same wasted read is spending capacity that would otherwise go unused.
-    # A single blended rate hides which of those we are looking at.
+    # Split by phase because the two behave differently: during PREFILL the
+    # shared SN750 is at its ceiling, during DECODE it is ~78% idle. A blended
+    # rate hides which regime a number came from.
     used = defaultdict(int)
     late = defaultdict(int)
     mis  = defaultdict(int)
@@ -201,9 +199,6 @@ def main(paths):
     print()
     print("LATE says the eviction band is wrong. MISPREDICT says the prediction is.")
     print("They have different fixes, which is why they must never be one bucket.")
-    print("And the two phases have different economics: the drive is at its ceiling")
-    print("during prefill and ~78% idle during decode, so a wasted read costs")
-    print("bandwidth in one and spends spare capacity in the other.")
     return 0
 
 
