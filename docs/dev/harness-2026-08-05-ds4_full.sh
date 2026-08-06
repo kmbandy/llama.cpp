@@ -247,6 +247,10 @@ HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-6442450944}   # 6 GiB, R9700
 #   PREFETCH_HINT=1  SPINE computes hash-layer (0..2) expert ids from the token
 #                    id and sends them ahead of the dispatch. Costs no reads.
 #   EXPERT_WARM=1    WORKERS actually read hinted pages in their idle window.
+#   HINTLOG=1        the worker-side hint counters, per frame, fflushed. SET THIS
+#                    ON ANY HINT ARM -- without it those counters exist only in a
+#                    stderr line printed on clean close, which this harness's
+#                    SIGKILL teardown destroys. Arm 1 lost foreign_expert that way.
 # DELIBERATELY SEPARATE. Hints ON + warm OFF reads exactly what the config of
 # record reads while still reporting everything the spine offered, so a broken
 # spine side is found with ZERO changed page-ins before any extra I/O is risked.
@@ -266,6 +270,14 @@ WARM_CHUNK=${WARM_CHUNK:-}
 if [ -n "$EXPERT_WARM" ] && [ -z "$PREFETCH_HINT" ]; then
     echo "*** EXPERT_WARM=1 with PREFETCH_HINT unset: the workers will never be" \
          "sent anything to warm. Set PREFETCH_HINT=1 too. ***"
+fi
+# The spine's own counters always survive (it exits cleanly); the WORKERS' do not.
+# So a hint arm without HINTLOG can still report what was OFFERED and never what
+# was RECEIVED -- which is exactly how arm 1 ran and exactly the number it lost.
+if [ -n "$PREFETCH_HINT" ] && [ -z "${HINTLOG:-}" ]; then
+    echo "*** PREFETCH_HINT=1 with HINTLOG unset: the workers' hint counters" \
+         "(foreign_layer/foreign_expert -- the routing-agreement check) will be" \
+         "LOST to the SIGKILL teardown. Set HINTLOG=1. ***"
 fi
 # One append, at the end, rather than $WPOST at four launch sites -- a knob that
 # reaches three of four workers is worse than one that reaches none, because the
@@ -553,6 +565,11 @@ MAINENV=""
 [ -n "${REQLOG:-}"  ] && MAINENV="$MAINENV WP_REQ_LOG=$OUT/req-w-r9700.txt"
 [ -n "${REFLOG:-}"  ] && MAINENV="$MAINENV WP_REF_LOG=$OUT/ref-w-r9700.txt"
 [ -n "${PAGEINLOG:-}" ] && MAINENV="$MAINENV WP_PAGEIN_LOG=$OUT/pagein-w-r9700.txt"
+# HINTLOG=1 is the ONLY durable record of the hint counters -- the worker prints
+# them to stderr on a clean close and this harness SIGKILLs workers, so arm 1
+# lost foreign_expert (the spine-vs-worker routing-agreement check) entirely.
+# `tail -1` of each of these four files is that worker's final count.
+[ -n "${HINTLOG:-}" ] && MAINENV="$MAINENV WP_HINT_LOG=$OUT/hint-w-r9700.txt"
 [ -n "$PIN_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESIDENT_EXPERTS=$PIN_MAIN" && echo "  PIN(r9700)=$PIN_MAIN"
 [ -n "$RESERVE_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_MAIN WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(r9700)=$RESERVE_MAIN @ $RESERVE_BYTES"
 ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE $MAINENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
@@ -587,6 +604,7 @@ if [ -n "$DSPARK_HOST" ]; then
     # (:3481) so it adapts correctly. Both are set; the LIMIT is the load-bearing one.
     [ -n "${DSPARK_OMP:-}" ] && DSENV="$DSENV OMP_THREAD_LIMIT=$DSPARK_OMP OMP_NUM_THREADS=$DSPARK_OMP" && echo "  DSPARK_OMP=$DSPARK_OMP (CPU DSpark worker thread cap, via OMP_THREAD_LIMIT)"
     [ -n "${PAGEINLOG:-}" ] && DSENV="$DSENV WP_PAGEIN_LOG=$OUT/pagein-w-dspark.txt"
+    [ -n "${HINTLOG:-}" ] && DSENV="$DSENV WP_HINT_LOG=$OUT/hint-w-dspark.txt"
     [ -n "${RESERVE_DSPARK:-}" ] && DSENV="$DSENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_DSPARK WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(dspark)=$RESERVE_DSPARK @ $RESERVE_BYTES"
     ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE $DSENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
         --shard-manifest $ES_DSPARK/ds4-e000-084-experts-experts-manifest.json \
@@ -680,6 +698,9 @@ for spec in "$DEV_1070 8803 w-1070 $SLOTS_1070" ${SPEC_480:+"$SPEC_480"}; do
     # REFLOG=1 captures the policy-INDEPENDENT reference stream, so cache
     # replacement policies can be simulated offline instead of measured on GPUs.
     [ -n "${REFLOG:-}" ] && VKENV="$VKENV WP_REF_LOG=/tmp/claude-1000/ref-$ARM-$3.txt"
+    # HINTLOG=1: hint counters, per frame, fflushed -- see the R9700 block. $ARM
+    # in the path for the same reason PAGEINLOG carries it.
+    [ -n "${HINTLOG:-}" ] && VKENV="$VKENV WP_HINT_LOG=/tmp/claude-1000/hint-$ARM-$3.txt"
     [ -n "${ALLOCLOG:-}" ] && case "$1" in Vulkan*) VKENV="$VKENV GGML_VK_ALLOC_LOG=1" ;; esac
     # VKEXTRA passes arbitrary GGML_VK_* env to the Vulkan workers only, so the
     # CUDA arm stays a clean control. Quote it: it may contain several settings.
@@ -825,7 +846,7 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
      "DSPARK_TAP=${DSPARK_TAP}(1=gated,0=mean) KEEPALIVE=${KEEPALIVE:-off}" \
      "code-defaults[dispatch_gather/gather_max_frac/compute_chunks/read_stripes/stripe_max_pageins]=${WP_CODE_DEFAULTS:-1/0.90/4/4/4}" \
      "hostvictim[2026/main]=${HOSTVICTIM_2026:-0}/${HOSTVICTIM_MAIN:-0}" \
-     "prefetch[hint/warm/chunk]=${PREFETCH_HINT:-off}/${EXPERT_WARM:-off}/${WARM_CHUNK:-default-1}" \
+     "prefetch[hint/warm/chunk/hintlog]=${PREFETCH_HINT:-off}/${EXPERT_WARM:-off}/${WARM_CHUNK:-default-1}/${HINTLOG:-off}" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="

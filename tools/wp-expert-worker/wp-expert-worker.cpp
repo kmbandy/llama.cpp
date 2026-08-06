@@ -2693,6 +2693,7 @@ public:
         hint_experts_ += hint.expert_ids.size();
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), hint.layer)) {
             hint_foreign_layer_ += hint.expert_ids.size();
+            log_prefetch_hints();
             return;
         }
         for (int32_t expert_id : hint.expert_ids) {
@@ -2710,9 +2711,13 @@ public:
                 warm_queue_.push_back(&catalog_.pages.at({ hint.layer, expert_id }));
             }
         }
+        log_prefetch_hints();
     }
 
-    void note_prefetch_hint_bad() { ++hint_bad_; }
+    void note_prefetch_hint_bad() {
+        ++hint_bad_;
+        log_prefetch_hints();
+    }
 
     bool has_warm_work() const { return !warm_queue_.empty(); }
 
@@ -2744,28 +2749,36 @@ public:
         return pool_.warm(chunk) != 0;
     }
 
+    // The counter line, built in ONE place so stderr and WP_HINT_LOG cannot
+    // drift apart. warm_pages/warm_bytes against the request stream's own
+    // n_pagein and bytes_read ARE the read-amplification gate -- kept on one
+    // line because those numbers are only meaningful as a ratio.
+    std::string prefetch_hint_line() const {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "frames=%llu experts=%llu "
+                      "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
+                      "warm_pages=%llu warm_bytes=%llu warm_errors=%llu "
+                      "queued_dropped=%llu queue_left=%zu",
+                      (unsigned long long) hint_frames_,
+                      (unsigned long long) hint_experts_,
+                      (unsigned long long) hint_foreign_layer_,
+                      (unsigned long long) hint_foreign_expert_,
+                      (unsigned long long) hint_bad_,
+                      (unsigned long long) pool_.warm_pages(),
+                      (unsigned long long) pool_.warm_bytes(),
+                      (unsigned long long) pool_.warm_errors(),
+                      (unsigned long long) warm_dropped_,
+                      warm_queue_.size());
+        return buf;
+    }
+
     void report_prefetch_hints() const {
         if (hint_frames_ == 0 && hint_bad_ == 0) {
             return;
         }
-        // warm_pages/warm_bytes against the request stream's own n_pagein and
-        // bytes_read ARE the read-amplification gate. Printed together, in one
-        // line, because the two numbers are only meaningful as a ratio.
-        std::fprintf(stderr,
-                     "wp-expert-worker prefetch hints: frames=%llu experts=%llu "
-                     "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
-                     "warm_pages=%llu warm_bytes=%llu warm_errors=%llu "
-                     "queued_dropped=%llu queue_left=%zu\n",
-                     (unsigned long long) hint_frames_,
-                     (unsigned long long) hint_experts_,
-                     (unsigned long long) hint_foreign_layer_,
-                     (unsigned long long) hint_foreign_expert_,
-                     (unsigned long long) hint_bad_,
-                     (unsigned long long) pool_.warm_pages(),
-                     (unsigned long long) pool_.warm_bytes(),
-                     (unsigned long long) pool_.warm_errors(),
-                     (unsigned long long) warm_dropped_,
-                     warm_queue_.size());
+        std::fprintf(stderr, "wp-expert-worker prefetch hints: %s\n",
+                     prefetch_hint_line().c_str());
     }
 
     pipe_expert_hello hello() const {
@@ -3103,6 +3116,36 @@ private:
     uint64_t           hint_foreign_layer_  = 0;
     uint64_t           hint_foreign_expert_ = 0;
     uint64_t           hint_bad_            = 0;
+
+    // WP_HINT_LOG=path -- the counter line, appended after every hint frame and
+    // fflushed, so `tail -1` is the final answer.
+    //
+    // WHY THIS EXISTS: report_prefetch_hints() writes to stderr only on a CLEAN
+    // CONNECTION CLOSE, and the harness SIGKILLs workers at teardown. Arm 1
+    // therefore produced NO foreign_expert number at all -- and foreign_expert
+    // is the routing-agreement check, the one counter that proves spine and
+    // worker resolve (layer, expert) through the same static hash. A disagreement
+    // there would otherwise surface only much later, disguised as "prefetch
+    // mysteriously does not help". Same failure and same fix as WP_PAGEIN_LOG's
+    // per-line fflush, which was added after that flag's first run produced two
+    // 0-byte logs.
+    //
+    // One line per hint frame rather than one at exit ON PURPOSE: it survives any
+    // death, and it dates the FIRST frame at which a foreign count appears, which
+    // is the next question if one ever does. ~150 bytes per frame against a frame
+    // that already crossed WireGuard.
+    FILE * const       hint_log_ = [] {
+        const char * p = std::getenv("WP_HINT_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
+    }();
+
+    void log_prefetch_hints() {
+        if (hint_log_ == nullptr) {
+            return;
+        }
+        std::fprintf(hint_log_, "%s\n", prefetch_hint_line().c_str());
+        std::fflush(hint_log_);
+    }
 
     // ---- keepalive (see keepalive_tick) ----
     int                keepalive_us_    = 0;
@@ -3833,8 +3876,10 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             return 1;
         }
     }
-    // Only on a clean close. The harness SIGKILLs workers at teardown, so this
-    // is best effort -- WP_REQ_LOG is the durable record.
+    // Only on a clean close, and the harness SIGKILLs workers at teardown, so
+    // this line is best effort and arm 1 never saw it. WP_HINT_LOG is the
+    // durable record -- NOT WP_REQ_LOG, which carries no hint fields and was
+    // wrongly named here before.
     worker.report_prefetch_hints();
     return 0;
 }

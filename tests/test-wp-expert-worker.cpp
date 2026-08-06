@@ -1006,10 +1006,29 @@ void test_prefetch_warm_and_eviction_order() {
 // With WP_EXPERT_WARM unset (the default) a hint must be accepted and ignored:
 // no read, no eviction, so a run is byte-for-byte the config of record while
 // still reporting what the spine offered.
+// WP_HINT_LOG must be set BEFORE the worker is constructed -- the FILE * is
+// initialised once, in a member initialiser. Unset on the way out so the flag
+// does not leak into the tests that follow.
+struct ScopedEnv {
+    const char * name;
+    ScopedEnv(const char * n, const std::string & value) : name(n) {
+        setenv(name, value.c_str(), 1);
+    }
+    ~ScopedEnv() { unsetenv(name); }
+};
+
 void test_prefetch_hint_without_warm_reads_nothing() {
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
     const int port = reserve_port();
+
+    // The counters must be DURABLE, not merely printed. report_prefetch_hints()
+    // writes to stderr only on a clean close and the harness SIGKILLs workers,
+    // so arm 1 (2026-08-05) produced no foreign_expert number at all -- the one
+    // counter that proves spine and worker resolve (layer, expert) through the
+    // same static hash.
+    const fs::path hint_log = temp.path / "hint.txt";
+    const ScopedEnv hint_log_env("WP_HINT_LOG", hint_log.string());
 
     ReadLog reads;
     wp_expert_worker::Options options;
@@ -1082,6 +1101,29 @@ void test_prefetch_hint_without_warm_reads_nothing() {
         // Exactly the one page the DISPATCH needed. Nothing warmed.
         require(reads.total() == 1, "a hint read pages with the warm path disarmed");
         require(reads.count_of(LAYER, 0) == 1, "the dispatch did not read its own page");
+
+        // READ THE LOG WITH THE SOCKET STILL OPEN. That is the whole point: the
+        // worker has not closed, so report_prefetch_hints() cannot have run, and
+        // anything on disk here would equally have survived a SIGKILL. Checking
+        // after the join would pass even with the old print-on-close-only code.
+        std::vector<std::string> lines;
+        {
+            std::ifstream in(hint_log);
+            require(in.good(), "WP_HINT_LOG was never created");
+            for (std::string line; std::getline(in, line); ) {
+                lines.push_back(line);
+            }
+        }
+        // One line per hint frame: the valid one, then the malformed one.
+        require(lines.size() == 2, "WP_HINT_LOG did not have one flushed line per hint frame");
+        require(lines.back().find("frames=1 experts=4") != std::string::npos,
+                "WP_HINT_LOG counters do not match the hints that were sent");
+        require(lines.back().find("malformed=1") != std::string::npos,
+                "WP_HINT_LOG did not record the malformed hint");
+        // The routing-agreement check itself: every hinted expert belongs to this
+        // worker's shard, so both foreign counters must be zero.
+        require(lines.back().find("foreign_layer=0 foreign_expert=0") != std::string::npos,
+                "WP_HINT_LOG reported a foreign layer or expert for an in-shard hint");
         socket.reset();
     } catch (...) {
         server.join();
