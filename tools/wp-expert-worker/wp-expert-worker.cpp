@@ -1666,6 +1666,24 @@ public:
             const std::vector<const ExpertPage *> & pages,
             bool measure,
             std::chrono::steady_clock::time_point lookup_started) {
+        // Take anything the reader threads already landed -- free residency for
+        // this request, and it frees the pins. Non-blocking.
+        if (spec_batch_ && !spec_recursion_) {
+            spec_recursion_ = true;
+            spec_pagein_poll(false);
+            // An in-flight speculative slot is not yet valid, so find_slot below
+            // cannot see it and this request would issue a SECOND read of the
+            // same page. Wait for the bounded read already in flight instead.
+            if (spec_batch_) {
+                for (const ExpertPage * page : pages) {
+                    if (page != nullptr && spec_in_flight_for(*page)) {
+                        spec_pagein_poll(true);
+                        break;
+                    }
+                }
+            }
+            spec_recursion_ = false;
+        }
         Batch batch(this, pages.size());
         try {
             std::vector<size_t> pageins;
@@ -1877,12 +1895,31 @@ public:
     // ensure_batch's hit path and is promoted into the demand band like any
     // other. A wrong guess therefore costs one read and nothing else.
     //
-    // Returns the number of pages read (0 if they were all already present).
-    size_t spec_pagein(const std::vector<const ExpertPage *> & pages) {
-        if (pages.empty()) {
-            return 0;
+    // *** SPECULATIVE READS ARE ASYNCHRONOUS. THIS IS THE WHOLE POINT. ***
+    //
+    // The first version of this called batch.complete() right here -- a blocking
+    // join on the reader thread -- from the keepalive pump, which only runs when
+    // NO request is pending. So a speculative read could never overlap with
+    // compute, which is the only thing prefetching is for, and a request that
+    // arrived mid-read waited for it. That is not a prefetch, it is a stall with
+    // extra steps, and every speculation measurement taken against it is void.
+    //
+    // Now: submit and return. The reader threads carry the read while the
+    // dispatch thread goes back to poll() and, when work arrives, computes. The
+    // pages land underneath the request.
+    //
+    // SLOT SAFETY: ensure_batch reserves AND PINS every page-in slot before any
+    // read is issued, and the pins are held for as long as we hold the Batch. An
+    // in-flight speculative slot therefore cannot be recycled out from under its
+    // own read -- which is exactly the corruption found on 2026-07-21, when the
+    // speculative path allocated slots without pinning them.
+    //
+    // Returns the number of pages submitted (0 if they were all already present
+    // or a batch is still in flight).
+    size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages) {
+        if (pages.empty() || spec_batch_) {
+            return 0;   // one speculative batch in flight at a time
         }
-
         std::vector<const ExpertPage *> cold;
         cold.reserve(pages.size());
         for (const ExpertPage * page : pages) {
@@ -1894,58 +1931,108 @@ public:
         if (cold.empty()) {
             return 0;
         }
+        try {
+            // measure=false: a speculative read's cost belongs to the spec
+            // counters, not to a request's phase timers. Mixing them would make
+            // ns_read on the dispatch path stop meaning "time this request spent
+            // reading".
+            spec_batch_ = std::make_unique<Batch>(ensure_batch(cold, false, {}));
+        } catch (const std::exception &) {
+            // Advisory: a failed speculative read must not fail the worker. The
+            // same error will surface on the demand path, where it belongs.
+            ++spec_errors_;
+            spec_batch_.reset();
+            return 0;
+        }
+        spec_inflight_ = std::move(cold);
+        return spec_inflight_.size();
+    }
 
-        // measure=false: the speculative read.s cost belongs to the spec counters below, not
-        // to a request's phase timers. Mixing them would make ns_read on the
-        // dispatch path stop meaning "time this request spent reading".
+    bool spec_in_flight() const { return spec_batch_ != nullptr; }
+
+    // Is `page` currently being read speculatively? The demand path has to ask,
+    // because an in-flight slot is not yet valid, so find_slot cannot see it and
+    // the request would issue a SECOND read of the same page.
+    bool spec_in_flight_for(const ExpertPage & page) const {
+        for (const ExpertPage * p : spec_inflight_) {
+            if (p->layer == page.layer && p->expert == page.expert) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Harvest whatever has landed, WITHOUT BLOCKING. Returns true when the batch
+    // finished and was retired. Safe to call from the idle pump and from the
+    // dispatch path; both run on the dispatch thread, which is required because
+    // drain_one_read performs the H2D upload and Vulkan command pools have
+    // thread affinity.
+    bool spec_pagein_poll(bool block) {
+        if (!spec_batch_) {
+            return false;
+        }
+        Batch & batch = *spec_batch_;
+        while (batch.received_ < batch.state_->pageins.size()) {
+            if (!block) {
+                std::lock_guard<std::mutex> lock(batch.state_->mutex);
+                if (batch.state_->ready.empty()) {
+                    return false;   // still in flight; come back later
+                }
+            }
+            drain_one_read(batch);
+        }
+        retire_spec_batch();
+        return true;
+    }
+
+    // Called when a demand request needs a page this batch is reading. Bounded:
+    // at most WP_EXPERT_SPEC_CHUNK pages, and the read is already in flight.
+    void spec_pagein_finish() { spec_pagein_poll(true); }
+
+private:
+    void retire_spec_batch() {
+        Batch & batch = *spec_batch_;
         uint64_t n_read = 0;
         try {
-            Batch batch = ensure_batch(cold, false, {});
-            batch.complete();
+            complete_batch(batch);
+            n_read = batch.n_pagein();
+            spec_bytes_ += batch.bytes_read();
 
-            // Stamp by CHECKING THE SLOT, not by trusting an entry flag. `hit` is
-            // only set for pages that were already present or came from the host
-            // tier -- a fresh disk page-in sets `ready`, never `hit` -- so keying
-            // off is_resident() here would silently skip exactly the pages this
-            // path exists to stamp, leaving every prefetch with a FRESH tick and
-            // reintroducing the pollution the stale tick is here to prevent.
-            for (size_t i = 0; i < cold.size(); ++i) {
+            // Stamp by CHECKING THE SLOT, not by trusting an entry flag. `hit`
+            // is only set for pages already present or from the host tier -- a
+            // fresh disk page-in sets `ready`, never `hit` -- so keying off
+            // is_resident() here would silently skip exactly the pages this path
+            // exists to stamp, leaving every speculative page with a FRESH tick
+            // and reintroducing the pollution the stale tick prevents.
+            for (size_t i = 0; i < spec_inflight_.size(); ++i) {
                 const size_t slot_index = batch.slot_index(i);
                 if (slot_index >= slots_.size()) {
                     continue;
                 }
                 Slot & slot = slots_[slot_index];
                 if (slot.valid &&
-                    slot.key == std::pair<int, int>(cold[i]->layer, cold[i]->expert)) {
+                    slot.key == std::pair<int, int>(spec_inflight_[i]->layer,
+                                                    spec_inflight_[i]->expert)) {
                     slot.tick = ++spec_tick_;
                     slot.uses = 0;
                 }
             }
-
-            n_read = batch.n_pagein();
-            spec_bytes_ += batch.bytes_read();
-
-            // `cold` is exactly the set we spent a read on -- pages already in a
-            // slot or pinned resident were filtered out above and cost nothing.
-            // These are the bytes the amplification gate counts, so these are the
-            // ones that have to be attributable to an outcome later.
             if (spec_log_ != nullptr) {
-                for (const ExpertPage * page : cold) {
+                for (const ExpertPage * page : spec_inflight_) {
                     fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
                 }
                 fflush(spec_log_);
             }
         } catch (const std::exception &) {
-            // Advisory: a failed speculative read must not fail the worker. The same
-            // error will surface on the demand path, which is where it belongs.
             ++spec_errors_;
-            return 0;
         }
-
         spec_pageins_ += n_read;
-        return (size_t) n_read;
+        release_pins(batch);
+        spec_batch_.reset();
+        spec_inflight_.clear();
     }
 
+public:
     uint64_t spec_pageins()  const { return spec_pageins_; }
     uint64_t spec_bytes()  const { return spec_bytes_; }
     uint64_t spec_errors() const { return spec_errors_; }
@@ -2546,6 +2633,14 @@ private:
     // than at zero. WP_EXPERT_LFU=0 falls back to pure LRU so the two policies
     // can be A/B'd on the same binary.
     uint64_t                   evict_age_ = 0;
+    // The one speculative batch that may be in flight. Holding the Batch holds
+    // its slot pins, which is what stops an in-flight read's slot from being
+    // recycled underneath it.
+    std::unique_ptr<Batch>          spec_batch_;
+    std::vector<const ExpertPage *> spec_inflight_;
+    // retire_spec_batch -> complete_batch -> ... never re-enters ensure_batch,
+    // but the guard makes that explicit and cheap rather than assumed.
+    bool                            spec_recursion_ = false;
     const bool                 lfu_ = [] {
         const char * e = std::getenv("WP_EXPERT_LFU");
         return e == nullptr || e[0] != '0';   // ON by default
@@ -2791,7 +2886,6 @@ public:
         log_prefetch_hints();
     }
 
-    bool has_spec_work() const { return !spec_queue_.empty(); }
 
     // Drop the queue. Called when the connection has been idle long enough that
     // the hinted layer is certainly behind us -- speculating on a layer already
@@ -2801,16 +2895,25 @@ public:
         spec_queue_.clear();
     }
 
-    // Read at most WP_EXPERT_SPEC_CHUNK queued pages. ONE SMALL STEP AT A TIME,
-    // ON THIS THREAD, BY DESIGN:
-    //   - the caller is the keepalive pump, which returns to poll() between
-    //     steps, so a real request waits at most one chunk of read (~3-5 ms per
-    //     12.75 MB page) instead of a whole hint;
-    //   - h2d must stay on the dispatch thread. Vulkan command pools have thread
-    //     affinity, and moving the upload off this thread risks corruption even
-    //     behind a mutex -- the same constraint keepalive_tick documents.
-    // Returns true if it read anything.
+    // Keep the speculative pipeline moving. Called from the idle pump.
+    //
+    // TWO DISTINCT JOBS, and neither of them blocks:
+    //   1. harvest a batch that already landed, which frees its slot pins;
+    //   2. submit the next chunk if nothing is in flight.
+    // Between calls the read runs on the reader threads, so it proceeds WHILE
+    // the dispatch thread polls or computes. That overlap is the entire reason
+    // this path exists; the previous version completed the read inline here and
+    // therefore never overlapped anything.
+    //
+    // H2D still happens on this thread inside drain_one_read -- Vulkan command
+    // pools have thread affinity, the same constraint keepalive_tick documents.
+    // Only the DISK read moved off it, which is the part worth moving.
+    //
+    // Returns true if it did any work worth staying awake for.
     bool spec_pagein_step() {
+        if (pool_.spec_in_flight()) {
+            return pool_.spec_pagein_poll(false);
+        }
         if (spec_queue_.empty()) {
             return false;
         }
@@ -2818,7 +2921,19 @@ public:
         std::vector<const ExpertPage *> chunk(
             spec_queue_.begin(), spec_queue_.begin() + (ptrdiff_t) take);
         spec_queue_.erase(spec_queue_.begin(), spec_queue_.begin() + (ptrdiff_t) take);
-        return pool_.spec_pagein(chunk) != 0;
+        return pool_.spec_pagein_submit(chunk) != 0;
+    }
+
+    // A speculative read in flight is work in progress, not idleness -- the pump
+    // must keep spinning to harvest it even when the queue is empty.
+    bool has_spec_work() const { return !spec_queue_.empty() || pool_.spec_in_flight(); }
+
+    // Something to SUBMIT right now, as opposed to something in flight. Only the
+    // former justifies a zero-timeout poll: when a read is already running on a
+    // reader thread we are waiting on the disk, not on ourselves, and spinning
+    // would burn a core for the 3-5 ms of the read while doing nothing.
+    bool has_spec_submit_work() const {
+        return !spec_queue_.empty() && !pool_.spec_in_flight();
     }
 
     // The counter line, built in ONE place so stderr and WP_HINT_LOG cannot
@@ -3823,12 +3938,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             // of every interval. That cost us half the available win -- measured
             // 0.319 ms/expert with the 1 ms pump against 0.163 in an isolated
             // bench that occupied the device continuously.
-            // With speculative work queued the pump period is meaningless as a wait --
-            // a page read is ~3-5 ms against a 100 us period, so poll with a zero
-            // timeout and get straight to the read. Without speculative work this is the
-            // original pump, unchanged.
-            const long ns = worker.has_spec_work() ? 0L
-                                                   : (long) worker.keepalive_us() * 1000L;
+            // Zero timeout ONLY when there is something to submit -- then the
+            // pump period is dead time before issuing a read. With a read already
+            // in flight we are waiting on the reader thread, so poll on the
+            // ordinary period and harvest when it lands. Spinning there would
+            // burn a core for the whole 3-5 ms read and buy nothing.
+            const long ns = worker.has_spec_submit_work() ? 0L
+                                                          : (long) worker.keepalive_us() * 1000L;
             struct timespec ts { ns / 1000000000L, ns % 1000000000L };
             const int r = ::ppoll(&pfd, 1, &ts, nullptr);
             if (r != 0) {
