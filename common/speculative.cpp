@@ -1399,8 +1399,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // tokens genuinely are the rest of the verify batch, and the dedup in
         // graph_dispatcher drops the frame when the expert set has not moved.
         if (!draft_toks.empty()) {
+            // Ground truth: these ARE the rest of the verify batch.
             llama_expert_prefetch_hint(this->params.ctx_tgt, draft_toks.data(),
-                                       (int) draft_toks.size());
+                                       (int) draft_toks.size(), -1);
         }
 
         // Carry this block forward. At the top of the NEXT draft these become the
