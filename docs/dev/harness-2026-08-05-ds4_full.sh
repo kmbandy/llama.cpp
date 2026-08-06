@@ -274,6 +274,14 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # binary by default, so a bare run is the NEW config of record and the control
 # arm is the one that has to say so.
 [ -n "${LFU:-}" ] && WPOST="$WPOST WP_EXPERT_LFU=$LFU"
+# LEASE=<n> -- evictions a speculative page survives before it becomes an
+# ordinary victim. 0 is the original first-victim behaviour. Anything above 0 is
+# DELIBERATE POOL POLLUTION: read the amplification gate on any arm using it.
+[ -n "${LEASE:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_LEASE=$LEASE"
+# PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
+# id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
+# computed in common/speculative.cpp, which runs in the spine process.
+[ -n "${PREDICT:-}" ] && SPINEENV="${SPINEENV:-} WP_SPEC_PREDICT_PREV=$PREDICT"
 [ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
