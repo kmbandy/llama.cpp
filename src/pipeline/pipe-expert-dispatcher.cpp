@@ -47,6 +47,41 @@ const bool s_union_stats = [] {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }();
 
+// WP_DISPATCH_GATHER=0 disables the spine-side activation gather. DEFAULT ON.
+//
+// Send a worker only the token rows that route to ITS experts, instead of the
+// full [n_tokens x n_embd] tensor. NUMERICALLY EXACT: a dropped row has a zero
+// routing weight for every expert that worker owns, so it would contribute
+// exactly 0.0f to that worker's partial. This is what makes it safe where the
+// f16-partial shrink was not -- that one was reverted (071f31b92, 9d9e5e4cc)
+// for putting ~5e-4 relative error at the expert->worker partition boundary.
+//
+// Sized by WP_DISPATCH_UNION on 2026-08-05, config of record, 659-token prefill:
+// the two workers behind the 1 GbE need 68.0% / 67.9% of the rows they are sent,
+// so 263 MB of the 820.6 MB crossing the wire per prefill is removable. The
+// loopback worker needs 99.8% and is left on the identity path, which is the
+// right outcome -- bytes are cheap there and the gather would be pure overhead.
+//
+// Read once at startup; a per-request getenv on the dispatch path would itself
+// distort the thing being measured.
+const bool s_gather = [] {
+    const char * value = std::getenv("WP_DISPATCH_GATHER");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}();
+
+// WP_DISPATCH_GATHER_MAX_FRAC: gather only when a worker needs at most this
+// fraction of the rows. Default 0.90 -- see the note at the use site for why a
+// bare "needs fewer than all" test is not enough (it fires at 658 of 659 rows
+// for the R9700 and costs more than it saves). 1.0 restores the old behaviour.
+const double s_gather_max_frac = [] {
+    const char * value = std::getenv("WP_DISPATCH_GATHER_MAX_FRAC");
+    if (value == nullptr || value[0] == '\0') {
+        return 0.90;
+    }
+    const double parsed = std::atof(value);
+    return parsed > 0.0 && parsed <= 1.0 ? parsed : 0.90;
+}();
+
 // WP_DEFER_K = number of experts computed immediately per token.
 // Unset / empty / non-positive => feature off (defer nothing).
 int parse_wp_defer_k() {
@@ -250,6 +285,21 @@ struct dispatcher::impl {
         std::vector<uint8_t>                payload;
         dispatch_clock::time_point          issued_at;
         uint64_t                            wait_ns = 0;
+        // SPINE-SIDE GATHER (2026-08-05). When non-empty, this request carries
+        // only these token rows -- token_ids[r] is the ORIGINAL token index of
+        // compacted row r -- and the returned partial is [token_ids.size() x
+        // n_embd], which must be SCATTERED back through this map.
+        //
+        // Empty means identity: the request carries all n_tokens rows and the
+        // partial sums in directly. Decode (n_tokens == 1) and any worker that
+        // genuinely needs every row take this path, so they are bit-for-bit
+        // unchanged.
+        //
+        // Deliberately NOT on the wire. The worker is oblivious: its assignments'
+        // weight vectors are compacted by the same map, so it just sees a
+        // narrower batch and returns a narrower partial. That keeps PIPE_VERSION
+        // at 4 and means no worker rebuild.
+        std::vector<uint32_t>               token_ids;
     };
 
     // Deferred requests issued at layer N, collected at layer N+1's dispatch.
@@ -725,7 +775,8 @@ struct dispatcher::impl {
             // n_weight_nonzero already reports and which overcounts a token that
             // hits several of the same worker's experts. |union| / n_tokens is the
             // exact factor a spine-side gather would shrink the payload by.
-            if (s_union_stats && n_tokens > 1) {
+            std::vector<uint32_t> needed;
+            if ((s_gather || s_union_stats) && n_tokens > 1) {
                 std::vector<uint8_t> touched((size_t) n_tokens, 0);
                 for (const pipe_expert_assignment & a : request.assignments) {
                     for (uint32_t t = 0; t < n_tokens; ++t) {
@@ -734,26 +785,71 @@ struct dispatcher::impl {
                         }
                     }
                 }
-                size_t used = 0;
-                for (uint8_t v : touched) {
-                    used += v;
+                for (uint32_t t = 0; t < n_tokens; ++t) {
+                    if (touched[(size_t) t]) {
+                        needed.push_back(t);
+                    }
                 }
-                std::fprintf(stderr,
-                    "expert dispatch union: layer=%d worker=%zu n_tokens=%u experts=%zu "
-                    "tokens_needed=%zu (%.2f%%) bytes_sent=%zu bytes_needed=%zu\n",
-                    layer, request.worker_index, n_tokens, request.assignments.size(),
-                    used, 100.0 * (double) used / (double) n_tokens,
-                    (size_t) n_tokens * (size_t) n_embd * sizeof(float),
-                    used * (size_t) n_embd * sizeof(float));
+                if (s_union_stats) {
+                    std::fprintf(stderr,
+                        "expert dispatch union: layer=%d worker=%zu n_tokens=%u experts=%zu "
+                        "tokens_needed=%zu (%.2f%%) bytes_sent=%zu bytes_needed=%zu\n",
+                        layer, request.worker_index, n_tokens, request.assignments.size(),
+                        needed.size(), 100.0 * (double) needed.size() / (double) n_tokens,
+                        (size_t) n_tokens * (size_t) n_embd * sizeof(float),
+                        needed.size() * (size_t) n_embd * sizeof(float));
+                }
             }
 
             pipe_expert_dispatch_req wire_request;
-            wire_request.layer       = layer;
-            wire_request.n_tokens    = n_tokens;
-            wire_request.assignments = request.assignments;
-            wire_request.activations = activations;
+            wire_request.layer        = layer;
             wire_request.swiglu_clamp = swiglu_clamp;
-            request.payload          = pipe_encode_expert_dispatch_req(wire_request);
+            // *** SPINE-SIDE GATHER: send only the rows this worker needs. ***
+            // Skipped when it needs every row, so the loopback worker (99.8%) and
+            // every decode step take the identity path and stay bit-identical.
+            // request.assignments keeps the FULL weights on purpose -- it is what
+            // the error messages and per-request logs read expert ids from; only
+            // the WIRE copy is compacted.
+            // *** REQUIRE A MEANINGFUL SAVING, NOT MERELY A NONZERO ONE. ***
+            // "needed < n_tokens" alone fires for a worker that needs 658 of 659
+            // rows, which is exactly the R9700: it holds 130 of 256 experts, so
+            // measured union is 99.8%. It would gather to drop ONE row -- and the
+            // non-gather path copies the full activation anyway, so nothing is
+            // saved on the copy. What it costs is real: compacting 130 assignment
+            // weight vectors, building a 658-entry index, and taking scatter_add's
+            // row-by-row accumulate instead of the flat elementwise add over 658
+            // of 659 rows. All to avoid 16 KB on LOOPBACK, where bytes are free.
+            // The two workers this is for sit at 68.0% / 67.9%, far inside the
+            // threshold; the fraction is structural, 1-(1-E/256)^8, so a worker
+            // only clears it below roughly E=110 experts.
+            const size_t gather_max_rows =
+                (size_t) ((double) n_tokens * s_gather_max_frac);
+            if (s_gather && !needed.empty() && needed.size() <= gather_max_rows) {
+                const size_t rows = needed.size();
+                wire_request.n_tokens = (uint32_t) rows;
+                wire_request.assignments.reserve(request.assignments.size());
+                for (const pipe_expert_assignment & a : request.assignments) {
+                    pipe_expert_assignment compact;
+                    compact.expert_id = a.expert_id;
+                    compact.weights.resize(rows);
+                    for (size_t r = 0; r < rows; ++r) {
+                        compact.weights[r] = a.weights[(size_t) needed[r]];
+                    }
+                    wire_request.assignments.push_back(std::move(compact));
+                }
+                wire_request.activations.resize(rows * (size_t) n_embd);
+                for (size_t r = 0; r < rows; ++r) {
+                    const float * src = activations.data() + (size_t) needed[r] * (size_t) n_embd;
+                    std::copy(src, src + n_embd,
+                              wire_request.activations.begin() + (ptrdiff_t) (r * (size_t) n_embd));
+                }
+                request.token_ids = std::move(needed);
+            } else {
+                wire_request.n_tokens    = n_tokens;
+                wire_request.assignments = request.assignments;
+                wire_request.activations = activations;
+            }
+            request.payload = pipe_encode_expert_dispatch_req(wire_request);
             requests.push_back(std::move(request));
         }
         return requests;
@@ -849,18 +945,26 @@ struct dispatcher::impl {
         // Partial carries (layer, n_tokens); token identity is the layout of
         // partial[token * n_embd + dim]. Do not rely on arrival ordering across
         // workers — each partial is a full [n_tokens * n_embd] block.
-        if (partial.layer != layer || partial.n_tokens != n_tokens || partial.partial.size() != n_values) {
+        //
+        // Under the spine-side gather this request may have carried only a subset
+        // of rows, so the shape we expect back is THIS REQUEST'S row count, not
+        // the layer's. token_ids empty = identity = the layer's n_tokens.
+        const uint32_t want_rows = request.token_ids.empty()
+            ? n_tokens : (uint32_t) request.token_ids.size();
+        const size_t   want_vals = (size_t) want_rows * (size_t) n_embd;
+        if (partial.layer != layer || partial.n_tokens != want_rows || partial.partial.size() != want_vals) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " returned the wrong partial shape for expert(s) " +
                                      assignment_experts(request.assignments) +
                                      " (layer=" + std::to_string(partial.layer) +
                                      " want=" + std::to_string(layer) +
                                      " n_tokens=" + std::to_string(partial.n_tokens) +
-                                     " want_n_tokens=" + std::to_string(n_tokens) + ")");
+                                     " want_n_tokens=" + std::to_string(want_rows) + ")");
         }
         // partials arrive as f32 (PIPE_VERSION 2) -- no conversion, no rounding.
         out.assign(partial.partial.begin(), partial.partial.end());
-        GGML_ASSERT(out.size() == n_values);
+        GGML_ASSERT(out.size() == want_vals);
+        GGML_UNUSED(n_values);
     }
 
     // Original behaviour, kept for the deferred-fold path: receive and add.
@@ -872,8 +976,32 @@ struct dispatcher::impl {
                             dispatch_clock::time_point *     last_response) {
         std::vector<float> one;
         receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response);
-        for (size_t i = 0; i < result.size(); ++i) {
-            result[i] += one[i];
+        scatter_add(result, one, request);
+    }
+
+    // Add a worker's partial into the layer result. Identity (token_ids empty) is
+    // a straight elementwise add; under the gather the partial's row r belongs to
+    // original token token_ids[r]. Rows no worker asked for are left untouched,
+    // which is correct because they had a zero routing weight everywhere and the
+    // caller zero-initialises `result`.
+    void scatter_add(std::vector<float> &      result,
+                     const std::vector<float> & one,
+                     const planned_request &    request) const {
+        if (request.token_ids.empty()) {
+            GGML_ASSERT(one.size() == result.size());
+            for (size_t i = 0; i < result.size(); ++i) {
+                result[i] += one[i];
+            }
+            return;
+        }
+        const size_t width = (size_t) n_embd;
+        for (size_t r = 0; r < request.token_ids.size(); ++r) {
+            const size_t dst = (size_t) request.token_ids[r] * width;
+            const size_t src = r * width;
+            GGML_ASSERT(dst + width <= result.size());
+            for (size_t d = 0; d < width; ++d) {
+                result[dst + d] += one[src + d];
+            }
         }
     }
 
@@ -968,10 +1096,11 @@ struct dispatcher::impl {
             }
         }
 
+        // Fixed request order, not arrival order -- see the note above on why the
+        // sum must not depend on network timing. scatter_add keeps that property:
+        // a row touched by several workers is still summed in request order.
         for (size_t i = 0; i < n; ++i) {
-            for (size_t j = 0; j < result.size(); ++j) {
-                result[j] += partials[i][j];
-            }
+            scatter_add(result, partials[i], requests[i]);
         }
     }
 
