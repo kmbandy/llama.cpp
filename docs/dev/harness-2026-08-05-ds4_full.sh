@@ -734,17 +734,25 @@ for spec in "$DEV_1070 8803 w-1070 $SLOTS_1070" ${SPEC_480:+"$SPEC_480"}; do
     # Host victim tier, 2026 side. Small on purpose: this box has 15 GB TOTAL,
     # ~8 GB available, and also runs the nemotron embedder and llama-router
     # (LIVE FLEET SERVICES) plus three workers. Two GPU workers x this budget.
-    [ "${HOSTVICTIM_2026:-0}" != "0" ] && VKENV="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026"
+    [ "${HOSTVICTIM_2026:-0}" != "0" ] && VKENV="$VKENV WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026"
     # VKFIX=0 disables it, for a controlled A/B against the pre-fix behaviour.
     # VKFIX=1 (default) forces ALL Vulkan buffers device-local -- fixes the bulk
     # weight spill but costs 1.69 ms/req on the small activation upload.
     # VKSPLIT=<bytes> instead keeps the BAR for buffers <= N and forces larger
     # ones device-local, so small frequently-written buffers keep memcpy writes.
+    # *** APPEND, NEVER ASSIGN. *** These two lines used to OVERWRITE VKENV,
+    # which at this point already carries WP_EXPERT_HOST_VICTIM_BYTES -- and
+    # VKSPLIT defaults on, so the RX 480 (the only Vulkan* worker) silently ran
+    # every host-victim-tier arm with the tier OFF: n_host_hit=0, n_host_demote=0,
+    # demand page-ins byte-identical tier-on vs tier-off, while the CUDA 1070
+    # (which never enters this case) engaged it fine. Second time this worker
+    # silently dropped a feature; the engagement check after the listen gate
+    # below is what makes the third time loud.
     case "$1" in Vulkan*)
         if [ -n "${VKSPLIT:-}" ]; then
-            VKENV="GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=$VKSPLIT"
+            VKENV="$VKENV GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=$VKSPLIT"
         elif [ "${VKFIX:-1}" = "1" ]; then
-            VKENV="GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1"
+            VKENV="$VKENV GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1"
         fi ;;
     esac
     # PROBE=N re-times a STATIC pre-built graph every N requests while serving.
@@ -965,6 +973,30 @@ for ep in $(echo "$DISPATCH_ENDPOINTS" | tr ',' ' '); do
         echo "*** WORKER $wl ($ep) NEVER LISTENED -- aborting arm ***"; exit 1
     fi
 done
+
+# *** THE TIER MUST ENGAGE, NOT MERELY BE CONFIGURED. *** The worker's listen
+# line prints host_victim_budget=<bytes> -- the value it actually parsed, not
+# the one this script intended. The RX 480 ran a full day of tier arms with
+# budget=0 because the Vulkan env branch above overwrote VKENV, and nothing
+# checked. A configured-but-disengaged feature must abort the arm, not produce
+# a clean-looking run of the wrong experiment. DSpark workers are exempt: the
+# tier is deliberately withheld from them (see the MAINENV comment).
+if [ "${HOSTVICTIM_2026:-0}" != "0" ]; then
+    TIER_LOGS="$OUT/w-1070.log"
+    [ -z "$NO_480" ] && TIER_LOGS="$TIER_LOGS $OUT/w-480.log"
+    for wl in $TIER_LOGS; do
+        [ -f "$wl" ] || continue
+        if grep -q 'expert worker listening.* host_victim_budget=0$' "$wl"; then
+            echo "*** $(basename "$wl"): HOSTVICTIM_2026=$HOSTVICTIM_2026 but the worker started with host_victim_budget=0 -- the env var did not reach it. Aborting arm. ***"
+            exit 1
+        fi
+    done
+fi
+if [ "${HOSTVICTIM_MAIN:-0}" != "0" ] && \
+   ssh mad-lab-main "grep -q 'expert worker listening.* host_victim_budget=0\$' $OUT/w-r9700.log" 2>/dev/null; then
+    echo "*** w-r9700: HOSTVICTIM_MAIN=$HOSTVICTIM_MAIN but the worker started with host_victim_budget=0 -- the env var did not reach it. Aborting arm. ***"
+    exit 1
+fi
 
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
 ssh mad-lab-main "cd $MAIN_REPO; and env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
