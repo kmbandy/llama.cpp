@@ -4166,7 +4166,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     // WP_REQ_LOG=path -- one line per dispatch request. Columns:
     //   layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep
     //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
-    //   ns_readback ns_encode ns_send
+    //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
+    // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
+    // seconds; start = epoch_end - ns_wall/1e9.
     // Segment into tokens by watching request.layer wrap back to its minimum.
     //
     // n_tokens (added 2026-08-03) IS THE PREFILL/DECODE LABEL, and it is the whole
@@ -4354,10 +4356,18 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 const uint64_t ns_wall =
                     (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - req_started).count();
+                // Wall-clock request END, epoch seconds (start = end - ns_wall).
+                // Exists to correlate requests against externally-timestamped
+                // traces (GTT/VRAM sampling, iostat) -- steady_clock cannot be
+                // aligned with another process's clock. Appended LAST, per the
+                // positional-format rule below.
+                const double epoch_end =
+                    (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
                 const RequestStats & s = request_stats;
                 fprintf(req_log,
                         "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
-                        "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+                        "%llu %llu %llu %llu %llu %llu %llu %llu %.6f\n",
                         request.layer, request.n_tokens, request.assignments.size(),
                         (unsigned long long) s.n_resident,
                         (unsigned long long) s.n_pagein,
@@ -4380,7 +4390,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                         // POSITIONAL and older parsers index from the left, so
                         // adding columns here keeps every existing parser working.
                         (unsigned long long) s.n_weight_nonzero,
-                        (unsigned long long) s.n_weight_total);
+                        (unsigned long long) s.n_weight_total,
+                        epoch_end);
                 fflush(req_log);
             }
         } catch (const pipe_protocol_error & error) {
