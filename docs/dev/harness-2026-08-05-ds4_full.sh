@@ -270,6 +270,10 @@ PREFETCH_HINT=${PREFETCH_HINT:-}
 SPEC_PAGEIN=${SPEC_PAGEIN:-}
 SPEC_CHUNK=${SPEC_CHUNK:-}
 [ -n "$SPEC_PAGEIN" ] && WPOST="$WPOST WP_EXPERT_SPEC_PAGEIN=$SPEC_PAGEIN"
+# LFU=0 reverts the slot pool to pure LRU. Ranking by use count is ON in the
+# binary by default, so a bare run is the NEW config of record and the control
+# arm is the one that has to say so.
+[ -n "${LFU:-}" ] && WPOST="$WPOST WP_EXPERT_LFU=$LFU"
 [ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
@@ -854,6 +858,7 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
      "code-defaults[dispatch_gather/gather_max_frac/compute_chunks/read_stripes/stripe_max_pageins]=${WP_CODE_DEFAULTS:-1/0.90/4/4/4}" \
      "hostvictim[2026/main]=${HOSTVICTIM_2026:-0}/${HOSTVICTIM_MAIN:-0}" \
      "prefetch[hint/spec/chunk/hintlog]=${PREFETCH_HINT:-off}/${SPEC_PAGEIN:-off}/${SPEC_CHUNK:-default-1}/${HINTLOG:-off}" \
+     "evict=${LFU:-1-usecount}(0=pure-LRU)" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
