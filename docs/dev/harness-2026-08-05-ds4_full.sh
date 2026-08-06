@@ -198,8 +198,77 @@ BATCH=${BATCH:-}
 # Added to A/B WP_EXPERT_OVERLAP, whose own comment promises a measured cost that
 # was never recorded.
 [ -n "${WEXTRA:-}" ] && WPRE="$WPRE $WEXTRA"
+# Applied to EVERY worker via WPRE (see the HOST VICTIM TIER and PREFETCH blocks
+# below for what these do and what they cost). Appended after WEXTRA so an
+# explicit WEXTRA override still wins on the command line.
+WPOST=""
 VKSPLIT=${VKSPLIT:-1048576}
 KEEPALIVE=${KEEPALIVE:-100}
+# ---------------------------------------------------------------------------
+# HOST VICTIM TIER (RAM L2 between VRAM and NVMe). NOT part of the config of
+# record -- added 2026-08-05 for the prefetch work. Set to 0 to disable.
+#
+# WHAT IT DOES. On eviction a slot is copied D2H into a host arena instead of
+# being dropped; a later page-in of the same page borrows it from RAM at PCIe
+# speed instead of re-reading NVMe (counted as n_host_hit, not n_pagein).
+#
+# *** IT IS NOT FREE, AND THE COST IS ON THE DISPATCH THREAD. ***
+# ensure_batch calls demote_slot() INLINE for every evicted slot, before the
+# first NVMe read is issued, and HostTier::store_from_device does a SYNCHRONOUS
+# D2H of the whole 12.75 MB page. The RX 480 averages 31.4 page-ins per prefill
+# request, so a full-eviction prefill request pays ~400 MB of serialised D2H
+# BEFORE it starts reading. Expect prefill to get worse.
+#
+# *** AND ON PREFILL IT HAS NOTHING TO CATCH. *** Measured 2026-08-05: the 480
+# does 1381 expert references, 1352 page-ins, 16.83 GiB = exactly 12.75 MB each.
+# EVERY PAGE IS READ EXACTLY ONCE. A victim cache can only pay off on a re-read,
+# and prefill has none, so on the CURRENT prefill workload this can only cost.
+#
+# WHY TURN IT ON ANYWAY (kmbandy, 2026-08-05): decode DOES re-reference experts
+# across tokens (72-73% resident on pure demand LRU), and the prefetch work
+# creates a NEW class of re-read that does not exist today -- a page warmed too
+# early and evicted before its layer arrives. Without the tier that is a wasted
+# NVMe read; with it, it comes back over PCIe. That is the specific interaction
+# to measure, and n_host_hit vs n_host_demote reports it directly.
+#
+# SIZING. mad-lab-2026 has 15 GB TOTAL / ~8 GB available and also runs the
+# nemotron embedder and llama-router (LIVE FLEET SERVICES) plus THREE workers,
+# so its budget is deliberately small: 3 x 1 GB = 3 GB of ~8 GB available.
+# Raise HOSTVICTIM_2026 only after checking `free -g` on that box.
+# mad-lab-main's RAM was not verified when this was written -- 4 GB is a
+# placeholder, and HOSTVICTIM_MAIN should be re-set once it is known.
+HOSTVICTIM_2026=${HOSTVICTIM_2026:-1073741824}   # 1 GiB per 2026 worker
+HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-4294967296}   # 4 GiB, R9700 -- VERIFY main's RAM
+# ---------------------------------------------------------------------------
+# PREFETCH (2026-08-05). Both default OFF: a bare run must stay the config of
+# record. See docs/dev/2026-08-05-prefetch-brief.md.
+#   PREFETCH_HINT=1  SPINE computes hash-layer (0..2) expert ids from the token
+#                    id and sends them ahead of the dispatch. Costs no reads.
+#   EXPERT_WARM=1    WORKERS actually read hinted pages in their idle window.
+# DELIBERATELY SEPARATE. Hints ON + warm OFF reads exactly what the config of
+# record reads while still reporting everything the spine offered, so a broken
+# spine side is found with ZERO changed page-ins before any extra I/O is risked.
+# Run that arm FIRST.
+#
+# *** PIPE_VERSION 4 -> 5. REBUILD THE SPINE AND ALL FOUR WORKERS TOGETHER *** or
+# they refuse at HELLO (deliberate: an unknown frame type closes the session,
+# which mid-run is indistinguishable from a worker crash).
+PREFETCH_HINT=${PREFETCH_HINT:-}
+EXPERT_WARM=${EXPERT_WARM:-}
+WARM_CHUNK=${WARM_CHUNK:-}
+[ -n "$EXPERT_WARM" ] && WPOST="$WPOST WP_EXPERT_WARM=$EXPERT_WARM"
+[ -n "$WARM_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_WARM_CHUNK=$WARM_CHUNK"
+[ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
+# Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
+# rejection. Say so at launch rather than after a wasted run.
+if [ -n "$EXPERT_WARM" ] && [ -z "$PREFETCH_HINT" ]; then
+    echo "*** EXPERT_WARM=1 with PREFETCH_HINT unset: the workers will never be" \
+         "sent anything to warm. Set PREFETCH_HINT=1 too. ***"
+fi
+# One append, at the end, rather than $WPOST at four launch sites -- a knob that
+# reaches three of four workers is worse than one that reaches none, because the
+# run still looks complete.
+WPRE="$WPRE $WPOST"
 # *** CONFIG OF RECORD 2026-08-05: DSPARK_OMP=8. ***
 # Caps the CPU DSpark worker's thread count. `-` not `:-` so DSPARK_OMP=
 # (explicitly empty) still means "leave it at ggml's default", which is the
@@ -474,6 +543,11 @@ echo "=== worker: R9700 (ROCm0) experts 85..255, $SLOTS_R9700 slots ==="
 # for this card -- we could see what the spine WAITED for it, never what it SPENT.
 # Logs land in $OUT on main (created above) and are collected after the run.
 MAINENV=""
+# Host victim tier: per MACHINE, not via WPRE, because the two boxes have very
+# different RAM. The DSpark workers are deliberately excluded -- their shard fits
+# their slots (4.3% of references page in), so there is nothing for a victim
+# cache to catch and the arena would be pure RAM cost on an already tight box.
+[ "${HOSTVICTIM_MAIN:-0}" != "0" ] && MAINENV="$MAINENV WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN"
 [ -n "${REQLOG:-}"  ] && MAINENV="$MAINENV WP_REQ_LOG=$OUT/req-w-r9700.txt"
 [ -n "${REFLOG:-}"  ] && MAINENV="$MAINENV WP_REF_LOG=$OUT/ref-w-r9700.txt"
 [ -n "${PAGEINLOG:-}" ] && MAINENV="$MAINENV WP_PAGEIN_LOG=$OUT/pagein-w-r9700.txt"
@@ -570,6 +644,10 @@ for spec in "$DEV_1070 8803 w-1070 $SLOTS_1070" ${SPEC_480:+"$SPEC_480"}; do
     # with this set; the boundary is exactly at 255 MB. The worker allocates
     # 400 slots = 5.1 GiB, so ~95% of its experts were in system RAM.
     VKENV=""
+    # Host victim tier, 2026 side. Small on purpose: this box has 15 GB TOTAL,
+    # ~8 GB available, and also runs the nemotron embedder and llama-router
+    # (LIVE FLEET SERVICES) plus three workers. Two GPU workers x this budget.
+    [ "${HOSTVICTIM_2026:-0}" != "0" ] && VKENV="WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026"
     # VKFIX=0 disables it, for a controlled A/B against the pre-fix behaviour.
     # VKFIX=1 (default) forces ALL Vulkan buffers device-local -- fixes the bulk
     # weight spill but costs 1.69 ms/req on the small activation upload.
@@ -744,6 +822,8 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
      "UBATCH=$UBATCH BATCH=${BATCH:-2048-default} GATHER=${WEXTRA:-default-ON}" \
      "DSPARK_TAP=${DSPARK_TAP}(1=gated,0=mean) KEEPALIVE=${KEEPALIVE:-off}" \
      "code-defaults[dispatch_gather/gather_max_frac/compute_chunks/read_stripes/stripe_max_pageins]=${WP_CODE_DEFAULTS:-1/0.90/4/4/4}" \
+     "hostvictim[2026/main]=${HOSTVICTIM_2026:-0}/${HOSTVICTIM_MAIN:-0}" \
+     "prefetch[hint/warm/chunk]=${PREFETCH_HINT:-off}/${EXPERT_WARM:-off}/${WARM_CHUNK:-default-1}" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
