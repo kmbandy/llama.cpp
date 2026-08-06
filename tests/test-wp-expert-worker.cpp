@@ -816,6 +816,284 @@ void test_default_off_multi_expert_request() {
     require(server_result == 0, "default-off worker returned failure");
 }
 
+// Records WHICH pages were read, and lets the test block until an asynchronous
+// warm has landed. IoTracker only counts reads; this one needs identities,
+// because the whole question is which page got evicted.
+struct ReadLog {
+    wp_expert_worker::TestHooks hooks;
+
+    ReadLog() {
+        hooks.read_started = [this](int layer, int expert) {
+            std::lock_guard<std::mutex> lock(mutex);
+            reads.emplace_back(layer, expert);
+            cv.notify_all();
+        };
+    }
+
+    bool wait_for_total(size_t n) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(10),
+                           [&]() { return reads.size() >= n; });
+    }
+
+    size_t total() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return reads.size();
+    }
+
+    size_t count_of(int layer, int expert) {
+        std::lock_guard<std::mutex> lock(mutex);
+        size_t n = 0;
+        for (const auto & read : reads) {
+            n += (read.first == layer && read.second == expert) ? 1 : 0;
+        }
+        return n;
+    }
+
+  private:
+    std::mutex                        mutex;
+    std::condition_variable           cv;
+    std::vector<std::pair<int, int>>  reads;
+};
+
+// A prefetch hint must (a) actually read the page during the idle window, so the
+// dispatch that follows is a hit, and (b) NEVER evict a page demand has touched.
+//
+// (b) is the one that matters. The pool is filled to capacity with one demand
+// page and three warmed ones, then one more page is warmed so an eviction is
+// forced. A warm stamped from the prefetch band takes the OLDEST WARM; a warm
+// stamped with a fresh LRU tick would take the DEMAND page instead. The two
+// behaviours differ by exactly one extra read of (LAYER, 0), which steps 4 and 6
+// pin from both directions.
+//
+// slots is 4, not 2: the pool refuses a budget below the largest single layer
+// request, so 4 is the floor for this fixture. Eviction pressure comes from
+// using a second layer rather than from starving the pool.
+void test_prefetch_warm_and_eviction_order() {
+    require(setenv("WP_EXPERT_WARM", "1", 1) == 0, "failed to arm the warm path");
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;   // the floor for this fixture; see the note above
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive warm worker HELLO");
+        require(type == PIPE_HELLO && seq_id == 0, "warm worker did not send HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send warm client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "warm worker rejected matching HELLO");
+
+        const auto dispatch_one = [&](int32_t layer, int32_t expert, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer       = layer;
+            request.n_tokens    = N_TOKENS;
+            request.activations.resize((size_t) N_TOKENS * N_EMBD);
+            request.assignments = { { expert, std::vector<float>(N_TOKENS, 0.5f) } };
+            std::vector<uint8_t> buf = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq, buf.data(), buf.size()),
+                    "failed to send warm-test dispatch");
+            std::vector<uint8_t> reply;
+            pipe_frame_type reply_type;
+            uint64_t reply_seq = 0;
+            require(pipe_recv_frame(*socket, reply_type, reply_seq, reply),
+                    "failed to receive warm-test partial");
+            require(reply_type == PIPE_EXPERT_PARTIAL && reply_seq == seq,
+                    "warm-test dispatch did not complete");
+        };
+
+        const auto hint = [&](int32_t layer, std::vector<int32_t> experts) {
+            pipe_expert_prefetch_hint frame;
+            frame.layer      = layer;
+            frame.expert_ids = std::move(experts);
+            std::vector<uint8_t> buf = pipe_encode_expert_prefetch_hint(frame);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, buf.data(), buf.size()),
+                    "failed to send prefetch hint");
+        };
+
+        // 1. DEMAND (LAYER, 0). One read; its slot enters the demand band.
+        dispatch_one(LAYER, 0, 100);
+        require(reads.count_of(LAYER, 0) == 1, "demand dispatch did not read its page exactly once");
+        require(reads.total() == 1, "demand dispatch read more than its own page");
+
+        // 2. WARM (LAYER, 1..3). The pool is now full: 1 demand + 3 prefetched.
+        //    Ascending order on the wire, so (LAYER,1) is the OLDEST warm.
+        hint(LAYER, { 1, 2, 3 });
+        require(reads.wait_for_total(4), "prefetch hints did not warm during the idle window");
+        require(reads.count_of(LAYER, 1) == 1 && reads.count_of(LAYER, 2) == 1 &&
+                    reads.count_of(LAYER, 3) == 1,
+                "the warm read the wrong pages");
+
+        // 3. WARM one more page. Every slot is valid, so this MUST evict.
+        //    Prefetch band => victim is (LAYER,1), the oldest warm.
+        //    Fresh tick    => victim would be (LAYER,0), the demand page.
+        hint(OTHER_LAYER, { 0 });
+        require(reads.wait_for_total(5), "the forcing prefetch hint did not warm");
+        require(reads.count_of(OTHER_LAYER, 0) == 1, "the forcing warm read the wrong page");
+
+        // 4. THE ASSERTION. (LAYER,0) was demanded and never re-demanded, so it
+        //    must still be resident: no second read of it.
+        dispatch_one(LAYER, 0, 101);
+        require(reads.count_of(LAYER, 0) == 1,
+                "a prefetch evicted a demand-touched page -- the prefetch LRU band is not holding");
+
+        // 5. And the warm paid off: (LAYER,3) was warmed and never evicted, so
+        //    demanding it must not read again.
+        dispatch_one(LAYER, 3, 102);
+        require(reads.count_of(LAYER, 3) == 1,
+                "a warmed page was not reused by the dispatch that followed");
+
+        // 6. (LAYER,1) is the page that should have gone, so demanding it reads
+        //    again. This pins WHICH page was evicted, not merely that one was.
+        dispatch_one(LAYER, 1, 103);
+        require(reads.count_of(LAYER, 1) == 2,
+                "the oldest warm was not the victim -- eviction order within the prefetch band is wrong");
+
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_WARM");
+        // The worker's own failure is the useful one. Without this, a worker
+        // that never started surfaces only as "failed to connect", which points
+        // at the socket instead of at the reason.
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    require(unsetenv("WP_EXPERT_WARM") == 0, "failed to disarm the warm path");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "warm worker returned failure");
+}
+
+// With WP_EXPERT_WARM unset (the default) a hint must be accepted and ignored:
+// no read, no eviction, so a run is byte-for-byte the config of record while
+// still reporting what the spine offered.
+void test_prefetch_hint_without_warm_reads_nothing() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK,
+                "worker did not acknowledge HELLO");
+
+        pipe_expert_prefetch_hint hint;
+        hint.layer      = LAYER;
+        hint.expert_ids = { 0, 1, 2, 3 };
+        payload = pipe_encode_expert_prefetch_hint(hint);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, payload.data(), payload.size()),
+                "failed to send prefetch hint");
+
+        // A malformed hint must not kill the session either -- the next dispatch
+        // still has to work. Truncated payload: valid header, missing ids.
+        const std::vector<uint8_t> truncated(8, 0);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0,
+                                truncated.data(), truncated.size()),
+                "failed to send malformed prefetch hint");
+
+        pipe_expert_dispatch_req request;
+        request.layer       = LAYER;
+        request.n_tokens    = N_TOKENS;
+        request.activations.resize((size_t) N_TOKENS * N_EMBD);
+        request.assignments = { { 0, std::vector<float>(N_TOKENS, 0.5f) } };
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, 7, payload.data(), payload.size()),
+                "failed to send dispatch after hints");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "the session did not survive an ignored and a malformed hint");
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 7,
+                "dispatch after hints did not complete");
+
+        // Exactly the one page the DISPATCH needed. Nothing warmed.
+        require(reads.total() == 1, "a hint read pages with the warm path disarmed");
+        require(reads.count_of(LAYER, 0) == 1, "the dispatch did not read its own page");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "worker returned failure after ignored hints");
+}
+
 } // namespace
 
 int main() {
@@ -823,6 +1101,8 @@ int main() {
         test_glm_size_class_plan();
         run_test();
         test_default_off_multi_expert_request();
+        test_prefetch_hint_without_warm_reads_nothing();
+        test_prefetch_warm_and_eviction_order();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

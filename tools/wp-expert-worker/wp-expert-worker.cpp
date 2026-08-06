@@ -1548,6 +1548,12 @@ public:
             return entries_.at(index).hit;
         }
 
+        // Slot this entry landed in, or SIZE_MAX for a pinned-resident page that
+        // occupies no pool slot. Used by the warm path to re-stamp the LRU tick.
+        size_t slot_index(size_t index) const {
+            return entries_.at(index).slot_index;
+        }
+
         const Loaded & loaded(size_t index) const {
             const Entry & entry = entries_.at(index);
             if (!entry.ready) {
@@ -1669,14 +1675,7 @@ public:
             // immediately usable while sibling pageins are read.
             for (size_t i = 0; i < pages.size(); ++i) {
                 const ExpertPage & page = *pages[i];
-                const std::pair<int, int> key(page.layer, page.expert);
-                size_t slot_index = slots_.size();
-                for (size_t j = 0; j < slots_.size(); ++j) {
-                    if (slots_[j].valid && slots_[j].key == key) {
-                        slot_index = j;
-                        break;
-                    }
-                }
+                const size_t slot_index = find_slot(page);
                 if (slot_index == slots_.size()) {
                     if (page.is_resident) {
                         batch.entries_[i] = {
@@ -1843,6 +1842,88 @@ public:
         }
     }
 
+    // Read `pages` into slots WITHOUT building a compute batch and WITHOUT
+    // promoting anything in the LRU. This is the prefetch warm path.
+    //
+    // IT REUSES ensure_batch + complete_batch DELIBERATELY. A second read path
+    // would be a second place for O_DIRECT alignment, striping, staging leases
+    // and slot bookkeeping to drift, and the whole point of a prefetch is that
+    // the page it leaves behind is indistinguishable from a demand-paged one.
+    //
+    // *** THE PREFETCH LRU BAND IS THE READ-AMPLIFICATION GUARD. ***
+    // select_victim evicts invalid slots first, then the lowest tick. A warmed
+    // slot must be valid or the next request re-reads it -- but if it also took
+    // a FRESH tick it would outrank pages demand actually touched, and an unused
+    // prefetch would evict a hot page. That is pool pollution, and it is exactly
+    // what made the 2026-07 cross-layer attempt cost 2.7-3.1x the bytes at every
+    // width, with a 0.973-precision predictor. So every page warmed here is
+    // stamped from the prefetch band (see kDemandTickBase): strictly older than
+    // anything demand has ever touched, hence the first victim if the guess was
+    // wrong. A warmed page that is then actually USED gets ++tick_ from
+    // ensure_batch's hit path and is promoted into the demand band like any
+    // other. A wrong guess therefore costs one read and nothing else.
+    //
+    // Returns the number of pages read (0 if they were all already present).
+    size_t warm(const std::vector<const ExpertPage *> & pages) {
+        if (pages.empty()) {
+            return 0;
+        }
+
+        std::vector<const ExpertPage *> cold;
+        cold.reserve(pages.size());
+        for (const ExpertPage * page : pages) {
+            if (page == nullptr || page->is_resident || find_slot(*page) != slots_.size()) {
+                continue;   // pinned resident, or already in a slot: nothing to do
+            }
+            cold.push_back(page);
+        }
+        if (cold.empty()) {
+            return 0;
+        }
+
+        // measure=false: the warm's cost belongs to the warm counters below, not
+        // to a request's phase timers. Mixing them would make ns_read on the
+        // dispatch path stop meaning "time this request spent reading".
+        uint64_t n_read = 0;
+        try {
+            Batch batch = ensure_batch(cold, false, {});
+            batch.complete();
+
+            // Stamp by CHECKING THE SLOT, not by trusting an entry flag. `hit` is
+            // only set for pages that were already present or came from the host
+            // tier -- a fresh disk page-in sets `ready`, never `hit` -- so keying
+            // off is_resident() here would silently skip exactly the pages this
+            // path exists to stamp, leaving every prefetch with a FRESH tick and
+            // reintroducing the pollution the stale tick is here to prevent.
+            for (size_t i = 0; i < cold.size(); ++i) {
+                const size_t slot_index = batch.slot_index(i);
+                if (slot_index >= slots_.size()) {
+                    continue;
+                }
+                Slot & slot = slots_[slot_index];
+                if (slot.valid &&
+                    slot.key == std::pair<int, int>(cold[i]->layer, cold[i]->expert)) {
+                    slot.tick = ++warm_tick_;
+                }
+            }
+
+            n_read = batch.n_pagein();
+            warm_bytes_ += batch.bytes_read();
+        } catch (const std::exception &) {
+            // Advisory: a failed warm read must not fail the worker. The same
+            // error will surface on the demand path, which is where it belongs.
+            ++warm_errors_;
+            return 0;
+        }
+
+        warm_pages_ += n_read;
+        return (size_t) n_read;
+    }
+
+    uint64_t warm_pages()  const { return warm_pages_; }
+    uint64_t warm_bytes()  const { return warm_bytes_; }
+    uint64_t warm_errors() const { return warm_errors_; }
+
     const ResourcePlan & resources() const {
         return resources_;
     }
@@ -1867,6 +1948,20 @@ private:
         bool                reserved  = false;
         bool                valid     = false;
     };
+
+    // Index of the slot already holding `page`, or slots_.size(). ONE definition:
+    // the warm path must agree with ensure_batch about what "already here" means,
+    // or a prefetch re-reads a page that is sitting in a slot and the extra bytes
+    // land in the read-amplification counter as if they were a real page-in.
+    size_t find_slot(const ExpertPage & page) const {
+        const std::pair<int, int> key(page.layer, page.expert);
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (slots_[i].valid && slots_[i].key == key) {
+                return i;
+            }
+        }
+        return slots_.size();
+    }
 
     bool demote_slot(const Slot & slot) {
         return host_victim_enabled_ && slot.valid && slot.cache_id >= 0 && slot.size != 0 &&
@@ -2379,7 +2474,26 @@ private:
     TestHooks *                test_hooks_ = nullptr;
     wp::HostTier               host_tier_;
     bool                       host_victim_enabled_ = false;
-    uint64_t                   tick_ = 0;
+    // *** TWO LRU BANDS, NOT ONE COUNTER. ***
+    // Demand ticks start at kDemandTickBase and prefetch ticks at 0, so EVERY
+    // prefetched page is strictly older than EVERY demand-touched page and is
+    // chosen as a victim first. A single counter cannot express this: stamping a
+    // warm with "the tick at warm time" TIES with the demand that produced that
+    // tick, and select_victim breaks a tie by slot index -- so a warm would
+    // evict the very page that was just used, which is the pollution this is
+    // here to prevent. Within each band the ordinary LRU order still holds, so
+    // an older prefetch is evicted before a newer one.
+    // The bands cannot meet: reaching kDemandTickBase needs 2^40 prefetched
+    // pages, which at 12.75 MB each is ~14 EB of reads.
+    static constexpr uint64_t  kDemandTickBase = 1ull << 40;
+    uint64_t                   tick_      = kDemandTickBase;
+    uint64_t                   warm_tick_ = 0;
+    // Prefetch warm accounting. warm_pages_/warm_bytes_ are the numerator of the
+    // read-amplification gate: if total bytes rise faster than demand page-ins
+    // fall, the warm is polluting rather than helping.
+    uint64_t                   warm_pages_  = 0;
+    uint64_t                   warm_bytes_  = 0;
+    uint64_t                   warm_errors_ = 0;
     std::vector<Slot>          slots_;
     std::vector<int>           reserve_blocks_;
     std::map<std::string, int> fds_;
@@ -2586,24 +2700,72 @@ public:
                 expert_id > catalog_.descriptor.expert_last ||
                 catalog_.pages.count({ hint.layer, expert_id }) == 0) {
                 ++hint_foreign_expert_;
+                continue;
+            }
+            // Resolved here, on the frame thread, so the idle path does no map
+            // lookups between reads. Ascending on the wire, so this queue is in
+            // ascending page order per layer -- which is the order that lets the
+            // drive read something closer to a stream than a random walk.
+            if (warm_enabled_) {
+                warm_queue_.push_back(&catalog_.pages.at({ hint.layer, expert_id }));
             }
         }
     }
 
     void note_prefetch_hint_bad() { ++hint_bad_; }
 
+    bool has_warm_work() const { return !warm_queue_.empty(); }
+
+    // Drop the queue. Called when the connection has been idle long enough that
+    // the hinted layer is certainly behind us -- warming for a layer already
+    // computed is pure amplification with no possible upside.
+    void drop_warm_work() {
+        warm_dropped_ += warm_queue_.size();
+        warm_queue_.clear();
+    }
+
+    // Read at most WP_EXPERT_WARM_CHUNK queued pages. ONE SMALL STEP AT A TIME,
+    // ON THIS THREAD, BY DESIGN:
+    //   - the caller is the keepalive pump, which returns to poll() between
+    //     steps, so a real request waits at most one chunk of read (~3-5 ms per
+    //     12.75 MB page) instead of a whole hint;
+    //   - h2d must stay on the dispatch thread. Vulkan command pools have thread
+    //     affinity, and moving the upload off this thread risks corruption even
+    //     behind a mutex -- the same constraint keepalive_tick documents.
+    // Returns true if it read anything.
+    bool warm_step() {
+        if (warm_queue_.empty()) {
+            return false;
+        }
+        const size_t take = std::min(warm_chunk_, warm_queue_.size());
+        std::vector<const ExpertPage *> chunk(
+            warm_queue_.begin(), warm_queue_.begin() + (ptrdiff_t) take);
+        warm_queue_.erase(warm_queue_.begin(), warm_queue_.begin() + (ptrdiff_t) take);
+        return pool_.warm(chunk) != 0;
+    }
+
     void report_prefetch_hints() const {
         if (hint_frames_ == 0 && hint_bad_ == 0) {
             return;
         }
+        // warm_pages/warm_bytes against the request stream's own n_pagein and
+        // bytes_read ARE the read-amplification gate. Printed together, in one
+        // line, because the two numbers are only meaningful as a ratio.
         std::fprintf(stderr,
                      "wp-expert-worker prefetch hints: frames=%llu experts=%llu "
-                     "foreign_layer=%llu foreign_expert=%llu malformed=%llu\n",
+                     "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
+                     "warm_pages=%llu warm_bytes=%llu warm_errors=%llu "
+                     "queued_dropped=%llu queue_left=%zu\n",
                      (unsigned long long) hint_frames_,
                      (unsigned long long) hint_experts_,
                      (unsigned long long) hint_foreign_layer_,
                      (unsigned long long) hint_foreign_expert_,
-                     (unsigned long long) hint_bad_);
+                     (unsigned long long) hint_bad_,
+                     (unsigned long long) pool_.warm_pages(),
+                     (unsigned long long) pool_.warm_bytes(),
+                     (unsigned long long) pool_.warm_errors(),
+                     (unsigned long long) warm_dropped_,
+                     warm_queue_.size());
     }
 
     pipe_expert_hello hello() const {
@@ -2915,6 +3077,27 @@ public:
 
 private:
     // ---- prefetch hints (see note_prefetch_hint) ----
+    //
+    // WP_EXPERT_WARM=1 arms the warm path. DEFAULT OFF and separate from the
+    // spine's WP_PREFETCH_HINT on purpose: with hints on and warm off, a run
+    // reads exactly what the config of record reads while still reporting what
+    // was offered, so "the hint is wrong" and "the warm is wrong" are two
+    // separate experiments instead of one confounded one.
+    const bool         warm_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_WARM");
+        return e != nullptr && e[0] == '1';
+    }();
+    // WP_EXPERT_WARM_CHUNK -- pages read per idle step. 1 by default: this is
+    // the worst-case delay a real request can inherit from a warm already in
+    // progress, about one 12.75 MB O_DIRECT read. Raising it trades that latency
+    // for fewer round trips through poll().
+    const size_t       warm_chunk_ = [] {
+        const char * e = std::getenv("WP_EXPERT_WARM_CHUNK");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
+        return v > 0 ? (size_t) v : (size_t) 1;
+    }();
+    std::deque<const ExpertPage *> warm_queue_;
+    uint64_t           warm_dropped_        = 0;
     uint64_t           hint_frames_         = 0;
     uint64_t           hint_experts_        = 0;
     uint64_t           hint_foreign_layer_  = 0;
@@ -3471,24 +3654,52 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     const auto KEEPALIVE_IDLE_MS = std::chrono::milliseconds(2000);
     auto last_request_at = std::chrono::steady_clock::now();
     auto await_request = [&]() {
-        if (!worker.keepalive_enabled() || keepalive_fd < 0) {
+        // The warm path needs this loop even when the keepalive pump is off:
+        // they share the idle window but are independent features, and gating
+        // the warm on WP_KEEPALIVE_US would silently couple two experiments.
+        if ((!worker.keepalive_enabled() && !worker.has_warm_work()) || keepalive_fd < 0) {
             return;
         }
         for (;;) {
+            // Re-checked every iteration, not just on entry. Without this, a
+            // worker with the pump OFF that finishes its warm queue would sit in
+            // a zero-timeout ppoll spinning a core: nothing left to warm, and a
+            // keepalive_tick that is a no-op when the pump is disabled.
+            if (!worker.keepalive_enabled() && !worker.has_warm_work()) {
+                return;
+            }
             struct pollfd pfd { keepalive_fd, POLLIN, 0 };
             // ppoll, NOT poll: poll's timeout is in whole milliseconds, so a
             // 200 us period silently became 1 ms and left the GPU idle for most
             // of every interval. That cost us half the available win -- measured
             // 0.319 ms/expert with the 1 ms pump against 0.163 in an isolated
             // bench that occupied the device continuously.
-            const long ns = (long) worker.keepalive_us() * 1000L;
+            // With warm work queued the pump period is meaningless as a wait --
+            // a page read is ~3-5 ms against a 100 us period, so poll with a zero
+            // timeout and get straight to the read. Without warm work this is the
+            // original pump, unchanged.
+            const long ns = worker.has_warm_work() ? 0L
+                                                   : (long) worker.keepalive_us() * 1000L;
             struct timespec ts { ns / 1000000000L, ns % 1000000000L };
             const int r = ::ppoll(&pfd, 1, &ts, nullptr);
             if (r != 0) {
+                // A REAL REQUEST BEATS A PREFETCH, ALWAYS. Whatever is still
+                // queued stays queued -- if it is still worth reading, the next
+                // idle window will take it, and if the layer has moved on the
+                // idle timeout below discards it.
                 return;   // data ready, or an error recv_data will surface
             }
             if (std::chrono::steady_clock::now() - last_request_at > KEEPALIVE_IDLE_MS) {
-                return;   // idle long enough: stop pumping, let the card sleep
+                // Idle long enough that any hinted layer is far behind us.
+                // Warming for a layer already computed is amplification with no
+                // possible upside, so drop it rather than carry it forward.
+                worker.drop_warm_work();
+                return;   // let the card sleep
+            }
+            // Warm before pumping: the pump exists to stop the card dropping
+            // clocks while idle, and a page-in plus its H2D is not idle.
+            if (worker.warm_step()) {
+                continue;
             }
             worker.keepalive_tick();
         }
