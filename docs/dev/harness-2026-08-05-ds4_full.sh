@@ -882,6 +882,27 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
      "evict=${LFU:-1-usecount}(0=pure-LRU)" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
+# *** WAIT FOR EVERY WORKER TO BE LISTENING BEFORE STARTING THE SPINE. ***
+#
+# There was no gate here at all -- the harness launched the workers, launched the
+# spine, and relied on whatever incidental delay happened to exist. With
+# HOSTVICTIM=0 the workers win that race and it never showed. A pinned host
+# victim tier makes worker startup slower in proportion to its size (backend
+# pinning is not lazy), so at 3 GiB the spine started first and died with
+# "expert dispatcher failed to connect to worker <ip>:8803" -- which reads like a
+# crashed worker when the worker is merely still allocating.
+echo "=== waiting for all expert workers to listen ==="
+for ep in $(echo "$DISPATCH_ENDPOINTS" | tr ',' ' '); do
+    ephost="${ep%%:*}"; epport="${ep##*:}"
+    up=0
+    for _ in $(seq 1 240); do
+        if timeout 2 bash -c "echo > /dev/tcp/$ephost/$epport" 2>/dev/null; then up=1; break; fi
+        sleep 1
+    done
+    [ "$up" -eq 1 ] || { echo "*** WORKER $ep NEVER CAME UP -- aborting arm ***"; exit 1; }
+    echo "  $ep up"
+done
+
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
 ssh mad-lab-main "cd $MAIN_REPO; and env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
     -m $DENSE --device ROCm1 --fit off --no-mmap -ngl 99 -c $CTX $SPECARGS $UBARGS \
