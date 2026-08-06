@@ -1520,6 +1520,13 @@ public:
                     return false;
                 });
             host_victim_enabled_ = true;
+            // Arm HostTier's Pass 0 so an unconfirmed prediction is drained
+            // before anything VRAM actually touched. Without it spec_tier_ is
+            // false and a guess competes with a known-good victim -- the tier's
+            // own comment calls that "prefetch actively degrading the tier it is
+            // meant to fill". This line silently failed to apply once already:
+            // a str.replace with the wrong indentation is a no-op, not an error.
+            host_tier_.set_speculative_tier(true);
         }
     }
 
@@ -2003,11 +2010,12 @@ public:
         std::vector<const ExpertPage *> cold;
         cold.reserve(pages.size());
         for (const ExpertPage * page : pages) {
-            if (page == nullptr || page->is_resident || page->cache_id < 0 ||
-                find_slot(*page) != slots_.size() ||
-                host_tier_.contains(page->cache_id)) {
-                continue;   // already somewhere useful
-            }
+            // Counted, not lumped. host_landed=0 with host_errors=0 says the
+            // filter ate everything and nothing about WHICH condition did it.
+            if (page == nullptr || page->cache_id < 0) { ++host_skip_bad_;  continue; }
+            if (page->is_resident)                     { ++host_skip_pin_;  continue; }
+            if (find_slot(*page) != slots_.size())     { ++host_skip_vram_; continue; }
+            if (host_tier_.contains(page->cache_id))   { ++host_skip_tier_; continue; }
             cold.push_back(page);
         }
         if (cold.empty()) {
@@ -2063,6 +2071,10 @@ public:
     uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
     uint64_t host_spec_promotions() const { return host_tier_.speculative_promotions(); }
     uint64_t host_spec_wasted() const { return host_tier_.speculative_evicted_unused(); }
+    uint64_t host_skip_bad()   const { return host_skip_bad_; }
+    uint64_t host_skip_pin()   const { return host_skip_pin_; }
+    uint64_t host_skip_vram()  const { return host_skip_vram_; }
+    uint64_t host_skip_tier()  const { return host_skip_tier_; }
 
     // Is `page` currently being read speculatively? The demand path has to ask,
     // because an in-flight slot is not yet valid, so find_slot cannot see it and
@@ -2788,6 +2800,10 @@ private:
     std::atomic<uint64_t>           host_landed_{0};
     std::atomic<uint64_t>           host_bytes_{0};
     std::atomic<uint64_t>           host_errors_{0};
+    uint64_t                        host_skip_bad_  = 0;
+    uint64_t                        host_skip_pin_  = 0;
+    uint64_t                        host_skip_vram_ = 0;
+    uint64_t                        host_skip_tier_ = 0;
     // retire_spec_batch -> complete_batch -> ... never re-enters ensure_batch,
     // but the guard makes that explicit and cheap rather than assumed.
     bool                            spec_recursion_ = false;
@@ -3148,7 +3164,8 @@ public:
                       "spec_pageins=%llu spec_bytes=%llu spec_errors=%llu "
                       "spec_dropped=%llu spec_queue_left=%zu "
                       "host_landed=%llu host_bytes=%llu host_errors=%llu "
-                      "host_promoted=%llu host_wasted=%llu",
+                      "host_promoted=%llu host_wasted=%llu "
+                      "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -3163,7 +3180,11 @@ public:
                       (unsigned long long) pool_.host_spec_bytes(),
                       (unsigned long long) pool_.host_spec_errors(),
                       (unsigned long long) pool_.host_spec_promotions(),
-                      (unsigned long long) pool_.host_spec_wasted());
+                      (unsigned long long) pool_.host_spec_wasted(),
+                      (unsigned long long) pool_.host_skip_bad(),
+                      (unsigned long long) pool_.host_skip_pin(),
+                      (unsigned long long) pool_.host_skip_vram(),
+                      (unsigned long long) pool_.host_skip_tier());
         return buf;
     }
 
