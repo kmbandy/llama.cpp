@@ -536,6 +536,16 @@ if [ -n "$DSPARK_SPLIT" ]; then
 fi
 
 mkdir -p "$OUT"; ssh mad-lab-main "mkdir -p $OUT"
+# DELETE LAST ARM'S WORKER LOGS BEFORE ANYTHING LAUNCHES.
+#
+# The readiness gate greps these for "expert worker listening", and the worker
+# launch redirects with ">" which truncates only when the worker actually starts.
+# So a gate running against a same-named previous arm matches the OLD line,
+# passes instantly, and the spine races a worker that has not started -- which
+# is exactly the "connect to <ip>:8803 failed" that cost four arms. Removing them
+# up front makes the gate's evidence unambiguous: the line can only come from
+# this run.
+rm -f "$OUT"/w-*.log; ssh mad-lab-main "rm -f $OUT/w-*.log"
 LOCAL_PIDS=""
 
 remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
