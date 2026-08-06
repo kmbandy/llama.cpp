@@ -1945,6 +1945,19 @@ public:
             return 0;
         }
         spec_inflight_ = std::move(cold);
+        // LOG AT SUBMIT, NOT AT HARVEST. The read is issued here, so this is when
+        // the cost is paid and when the position in the stream is meaningful.
+        // Logging at harvest inverts the order against R: an async batch can be
+        // harvested INSIDE ensure_batch, i.e. after the dispatch's reference line
+        // has already been written, and the classifier -- which matches S to the
+        // next R -- then cannot credit the page to the request that used it. That
+        // alone moved USED from 686 to 424 with no change in behaviour.
+        if (spec_log_ != nullptr) {
+            for (const ExpertPage * page : spec_inflight_) {
+                fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
+            }
+            fflush(spec_log_);
+        }
         return spec_inflight_.size();
     }
 
@@ -2016,12 +2029,6 @@ private:
                     slot.tick = ++spec_tick_;
                     slot.uses = 0;
                 }
-            }
-            if (spec_log_ != nullptr) {
-                for (const ExpertPage * page : spec_inflight_) {
-                    fprintf(spec_log_, "S %d %d\n", page->layer, page->expert);
-                }
-                fflush(spec_log_);
             }
         } catch (const std::exception &) {
             ++spec_errors_;
