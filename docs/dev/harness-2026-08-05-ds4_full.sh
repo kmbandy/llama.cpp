@@ -282,6 +282,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.
 [ -n "${PREDICT:-}" ] && SPINEENV="${SPINEENV:-} WP_SPEC_PREDICT_PREV=$PREDICT"
+# PREDICT_N=<n> -- how many of the previous block's tokens to hint (0=all).
+# Volume is a separate knob from signal: hinting the whole block cost more than
+# it bought, and overlap decays with distance, so the tail is the cheap part to
+# drop. Spine-side, same as PREDICT.
+[ -n "${PREDICT_N:-}" ] && SPINEENV="${SPINEENV:-} WP_SPEC_PREDICT_N=$PREDICT_N"
 [ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO

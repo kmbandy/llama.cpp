@@ -952,6 +952,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return e == nullptr || e[0] != '0';
     }();
 
+    // How many of the previous block's tokens to hint. 0 = all.
+    const int spec_predict_n = [] {
+        const char * e = std::getenv("WP_SPEC_PREDICT_N");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 2;
+        return v > 0 ? (int) v : 0;
+    }();
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1252,8 +1259,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // amplification gate has to be read before this is called a win. The
             // 2026-07 attempts failed on lead time, not on prediction quality;
             // this trades a little of the second for a lot of the first.
+            // VOLUME IS A SEPARATE KNOB FROM SIGNAL. The first matrix run hinted
+            // the WHOLE previous block: 1222 extra expert ids, which produced 76
+            // FEWER used. Not a queueing problem -- spec_dropped was 0 and the
+            // queue never exceeded 9 -- but a POOL one. With a lease every
+            // speculative page holds a slot for its window, so extra hints and
+            // lease occupancy multiply, and the marginal hint displaces a better
+            // one already resident.
+            //
+            // Overlap also decays with distance (lag-1 0.399, lag-2 0.335, lag-3
+            // 0.301 against 0.023 chance), so the nearest tokens carry most of
+            // the signal and the tail carries most of the cost. WP_SPEC_PREDICT_N
+            // takes the first N; 0 means all of them, which is the run above.
             if (spec_predict_prev && !prev_draft_toks.empty()) {
-                known.insert(known.end(), prev_draft_toks.begin(), prev_draft_toks.end());
+                const size_t take = spec_predict_n > 0
+                    ? std::min((size_t) spec_predict_n, prev_draft_toks.size())
+                    : prev_draft_toks.size();
+                known.insert(known.end(), prev_draft_toks.begin(),
+                             prev_draft_toks.begin() + (ptrdiff_t) take);
             }
 
             if (!known.empty()) {
