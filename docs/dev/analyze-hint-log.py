@@ -33,8 +33,13 @@ from collections import defaultdict
 
 
 def analyze(path):
-    # (layer, expert) -> True once speculatively read, until its fate is decided.
-    spec_open = {}
+    # (layer, expert) -> COUNT of speculative reads whose fate is still undecided.
+    # A count, not a flag: the same page is speculatively read many times over a
+    # run (read, used, evicted, read again). A boolean collapses those into one
+    # and the accounting silently stops closing -- the first version of this
+    # script classified 1872 of 4326 reads and lost the rest without complaint.
+    # The reconciliation check at the end of main() exists to catch exactly that.
+    spec_open = defaultdict(int)
     hinted = set()
     n_hint_ids = n_spec = n_demand = 0
     used = late = 0
@@ -49,10 +54,11 @@ def analyze(path):
         layer, ids = cur_ref
         for e in ids:
             key = (layer, e)
-            if spec_open.pop(key, False):
-                # Selected while we held a speculative read of it. If the same
-                # request still had to page it in, the read was wasted: the page
-                # was reclaimed before its layer arrived.
+            if spec_open[key] > 0:
+                # Selected while we held an outstanding speculative read of it.
+                # If the same request still had to page it in, that read was
+                # wasted: the page was reclaimed before its layer arrived.
+                spec_open[key] -= 1
                 if e in cur_demand:
                     late += 1
                 else:
@@ -75,7 +81,19 @@ def analyze(path):
                     n_hint_ids += 1
             elif tag == 'S':
                 n_spec += 1
-                spec_open[(int(parts[1]), int(parts[2]))] = True
+                key = (int(parts[1]), int(parts[2]))
+                # A SECOND speculative read of a page whose first read is still
+                # unresolved means the first was reclaimed before any reference
+                # touched it -- spec_pagein skips anything still in a slot, so a
+                # re-read proves an eviction. That is LATE, not a mispredict: the
+                # expert was predicted correctly and the page was lost before its
+                # layer arrived. Charging it to mispredict would blame the oracle
+                # for the eviction band's behaviour, and the oracle here is a pure
+                # token-id lookup that cannot be wrong.
+                if spec_open[key] > 0:
+                    late += 1
+                else:
+                    spec_open[key] = 1
             elif tag == 'R':
                 resolve()
                 cur_ref = (int(parts[1]), [int(e) for e in parts[2:]])
@@ -85,18 +103,31 @@ def analyze(path):
                 cur_demand.add(int(parts[2]))
     resolve()
 
-    # Anything still open was speculatively read and never selected afterwards.
-    mispredict = len(spec_open)
+    # Anything still outstanding was speculatively read and never selected after.
+    mispredict = sum(spec_open.values())   # capped at 1 per key by the S handler
+    # EVERY speculative read must land in exactly one bucket. If this trips, the
+    # classifier is dropping events and no rate below it means anything.
+    assert used + late + mispredict == n_spec, (
+        f"{path}: {n_spec} speculative page-ins but "
+        f"{used}+{late}+{mispredict}={used+late+mispredict} classified")
     return dict(path=path, hint_ids=n_hint_ids, spec=n_spec, demand=n_demand,
                 used=used, late=late, mispredict=mispredict,
-                noop=len(hinted) and n_hint_ids - n_spec)
+                hinted_pages=len(hinted))
 
 
 def main(paths):
     tot = defaultdict(int)
     rows = []
     for p in paths:
-        r = analyze(p)
+        try:
+            r = analyze(p)
+        except FileNotFoundError:
+            # Loud, never silent. A missing worker log means the run covered
+            # fewer workers than the caller thinks, and a total that quietly
+            # omits the R9700 -- which holds experts 85..255, the majority
+            # shard -- is worse than no total at all.
+            print(f"!! MISSING: {p} -- totals below EXCLUDE this worker", file=sys.stderr)
+            continue
         rows.append(r)
         for k in ('hint_ids', 'spec', 'demand', 'used', 'late', 'mispredict'):
             tot[k] += r[k]
