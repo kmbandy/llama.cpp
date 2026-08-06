@@ -205,7 +205,13 @@ BATCH=${BATCH:-}
 # below for what these do and what they cost). Appended after WEXTRA so an
 # explicit WEXTRA override still wins on the command line.
 WPOST=""
-VKSPLIT=${VKSPLIT:-1048576}
+# *** ${VKSPLIT-...}, NOT ${VKSPLIT:-...}. *** With ":-" an explicit VKSPLIT=
+# gets the default handed straight back, so the elif below that applies VKFIX
+# could NEVER be reached from the environment -- GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM
+# has therefore never been set in any run, and VKFIX has been dead code since
+# VKSPLIT acquired a default. Same idiom as SPEC=${SPEC-1} above, and for the
+# same reason: empty must mean OFF, not "give me the default".
+VKSPLIT=${VKSPLIT-1048576}
 KEEPALIVE=${KEEPALIVE:-100}
 # ---------------------------------------------------------------------------
 # HOST VICTIM TIER (RAM L2 between VRAM and NVMe). NOT part of the config of
@@ -242,8 +248,16 @@ KEEPALIVE=${KEEPALIVE:-100}
 # (~13.5 GB of compute buffer at UBATCH=2048), the CPU DSpark worker and a
 # desktop, so this is a budget set by the owner rather than derived from a
 # reading -- `free -g` was not reachable from the session that wrote this.
-HOSTVICTIM_2026=${HOSTVICTIM_2026:-1073741824}   # 1 GiB per 2026 worker
-HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-6442450944}   # 6 GiB, R9700
+# DEFAULT OFF (2026-08-06): the tier is NOT part of the config of record (see
+# the header above), so a bare run must not turn it on. Non-zero defaults here
+# silently put a RAM tier into every "control" arm run on 2026-08-06 and
+# invalidated the day's A/Bs. Opt in explicitly, e.g.
+#   HOSTVICTIM_2026=1073741824 HOSTVICTIM_MAIN=6442450944 bash <this harness>
+# (former defaults: 1 GiB per 2026 worker / 6 GiB R9700). Mind §5.1/§5.2 of
+# docs/dev/2026-08-06-weight-pager-handoff.md before raising 2026's: the RX 480
+# transiently dumps 7.5 GB into GTT, so the practical ceiling is ~2 GiB/worker.
+HOSTVICTIM_2026=${HOSTVICTIM_2026:-0}
+HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-0}
 # ---------------------------------------------------------------------------
 # PREFETCH (2026-08-05). Both default OFF: a bare run must stay the config of
 # record. See docs/dev/2026-08-05-prefetch-brief.md.
