@@ -40,7 +40,6 @@ extern "C" {
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1451,6 +1450,16 @@ private:
         bool                                    start  = false;
         bool                                    cancel = false;
         bool                                    measure = false;
+        // True for a batch submitted by spec_pagein_submit. Its page-ins are
+        // logged as "S" AT SUBMIT; drain_one_read must NOT also log them as
+        // "D", or every harvested speculative read masquerades as the demand
+        // read it exists to prevent. Under the async path the harvest runs
+        // INSIDE ensure_batch -- i.e. AFTER the current request's "R" line --
+        // so the classifier saw S..R..D for the same page and filed a USED
+        // page as LATE. That artifact alone is what made the asynchronous
+        // rewrite look like it had made the used-rate worse (686 -> 431).
+        // Only the dispatch thread reads/writes it, and always after submit.
+        bool                                    speculative = false;
     };
 
 public:
@@ -1958,6 +1967,10 @@ public:
             // ns_read on the dispatch path stop meaning "time this request spent
             // reading".
             spec_batch_ = std::make_unique<Batch>(ensure_batch(cold, false, {}));
+            // Safe to set after the fact: reads land on reader threads, but the
+            // flag is only consulted by drain_one_read, which runs exclusively
+            // on THIS thread and cannot run before submit returns.
+            spec_batch_->state_->speculative = true;
         } catch (const std::exception &) {
             // Advisory: a failed speculative read must not fail the worker. The
             // same error will surface on the demand path, where it belongs.
@@ -2007,7 +2020,10 @@ public:
         if (!host_victim_enabled_ || pages.empty() || host_thread_.joinable()) {
             return 0;
         }
-        std::vector<const ExpertPage *> cold;
+        // (page, fd). The fd is resolved HERE, on the dispatch thread: fd_for
+        // mutates the unguarded fds_ map, and the landing thread below would
+        // otherwise race it against ensure_batch's own fd_for on this thread.
+        std::vector<std::pair<const ExpertPage *, int>> cold;
         cold.reserve(pages.size());
         for (const ExpertPage * page : pages) {
             // Counted, not lumped. host_landed=0 with host_errors=0 says the
@@ -2016,14 +2032,20 @@ public:
             if (page->is_resident)                     { ++host_skip_pin_;  continue; }
             if (find_slot(*page) != slots_.size())     { ++host_skip_vram_; continue; }
             if (host_tier_.contains(page->cache_id))   { ++host_skip_tier_; continue; }
-            cold.push_back(page);
+            try {
+                cold.emplace_back(page, fd_for(page->blob));
+            } catch (const std::exception &) {
+                // Advisory, like every failure on this path: the same open
+                // error surfaces on the demand path, where it belongs.
+                host_errors_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (cold.empty()) {
             return 0;
         }
         host_pending_.store(cold.size(), std::memory_order_release);
         host_thread_ = std::thread([this, cold]() {
-            for (const ExpertPage * page : cold) {
+            for (const auto & [page, fd] : cold) {
                 try {
                     StagingPool::Lease lease = staging_.borrow();
                     // Fire the same hooks as every other read path. A host
@@ -2032,7 +2054,7 @@ public:
                     if (test_hooks_ != nullptr && test_hooks_->read_started) {
                         test_hooks_->read_started(page->layer, page->expert);
                     }
-                    read_page_range(*page, fd_for(page->blob), (char *) lease.get(),
+                    read_page_range(*page, fd, (char *) lease.get(),
                                     0, (size_t) page->size);
                     if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                         test_hooks_->read_finished(page->layer, page->expert);
@@ -2272,7 +2294,7 @@ private:
             if (victim == slots_.size() ||
                 slot.capacity < slots_[victim].capacity ||
                 (slot.capacity == slots_[victim].capacity &&
-                 rank(slot) < rank(slots_[victim]))) {
+                 rank_less(slot, slots_[victim]))) {
                 victim = i;
             }
         }
@@ -2282,7 +2304,7 @@ private:
                 if (slot.pin_count != 0 || !slot.valid || page_size > slot.capacity) continue;
                 if (victim == slots_.size() || slot.capacity < slots_[victim].capacity ||
                     (slot.capacity == slots_[victim].capacity &&
-                     rank(slot) < rank(slots_[victim]))) victim = i;
+                     rank_less(slot, slots_[victim]))) victim = i;
             }
         }
         return victim;
@@ -2455,7 +2477,10 @@ private:
                     // WP_PAGEIN_LOG after the fact: what makes this line useful is
                     // its POSITION relative to the S line for the same page, and a
                     // separate file cannot express that.
-                    if (spec_log_ != nullptr) {
+                    // NEVER for a speculative batch: those pages were already
+                    // logged "S" at submit, and a second line here would claim
+                    // speculation provoked the very demand read it prevented.
+                    if (spec_log_ != nullptr && !batch.state_->speculative) {
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
@@ -2811,15 +2836,29 @@ private:
         const char * e = std::getenv("WP_EXPERT_LFU");
         return e == nullptr || e[0] != '0';   // ON by default
     }();
-    // Ranking key. With LFU off this is pure LRU, byte for byte what shipped
-    // before, so a control arm needs no separate build.
-    std::tuple<int, uint64_t, uint64_t> rank(const Slot & s) const {
-        // A live lease is the FIRST key, so a leased page loses to every
-        // unleased one and is only taken when nothing else can be. That is the
-        // deadlock guard: the lease reorders candidates, it never removes them,
-        // so select_victim always has something to return.
-        const int leased = (s.lease_until > evictions_) ? 1 : 0;
-        return { leased, lfu_ ? s.uses : 0, s.tick };
+    // Victim ordering: is `a` a strictly BETTER victim than `b`? With LFU off
+    // this is pure LRU, byte for byte what shipped before, so a control arm
+    // needs no separate build.
+    //
+    // A flat three-key comparison, NOT a std::tuple built per call: this runs
+    // twice per candidate inside select_victim's scan of up to 2200 slots on
+    // every page-in, on the dispatch thread. The keys, most significant first:
+    //   1. lease  -- a live lease is the FIRST key, so a leased page loses to
+    //      every unleased one and is only taken when nothing else can be. That
+    //      is the deadlock guard: the lease reorders candidates, it never
+    //      removes them, so select_victim always has something to return.
+    //   2. uses   -- the use-count policy (skipped entirely with LFU off).
+    //   3. tick   -- LRU recency, always the final tie-break.
+    bool rank_less(const Slot & a, const Slot & b) const {
+        const bool a_leased = a.lease_until > evictions_;
+        const bool b_leased = b.lease_until > evictions_;
+        if (a_leased != b_leased) {
+            return b_leased;
+        }
+        if (lfu_ && a.uses != b.uses) {
+            return a.uses < b.uses;
+        }
+        return a.tick < b.tick;
     }
     // Speculative page-in accounting. spec_pageins_/spec_bytes_ are what
     // speculation SPENT; the request stream's n_pagein is what it SAVED. Both are
@@ -2853,7 +2892,17 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     ns_host_get_(other.ns_host_get_),
     host_bytes_(other.host_bytes_),
     ns_h2d_(other.ns_h2d_),
-    bytes_h2d_(other.bytes_h2d_) {
+    bytes_h2d_(other.bytes_h2d_),
+    // Drain state travels with the batch. It was omitted here originally --
+    // harmless while every move ran before the first drain (NRVO covered the
+    // return paths), but spec_pagein_submit now moves a live batch into a
+    // unique_ptr, and losing received_/first_error_ there would silently reset
+    // a partially drained batch.
+    received_(other.received_),
+    first_error_(std::move(other.first_error_)),
+    first_read_(other.first_read_),
+    last_read_(other.last_read_),
+    have_read_time_(other.have_read_time_) {
     other.owner_ = nullptr;
 }
 
@@ -3162,7 +3211,7 @@ public:
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
                       "spec_pageins=%llu spec_bytes=%llu spec_errors=%llu "
-                      "spec_dropped=%llu spec_queue_left=%zu "
+                      "spec_dropped=%llu spec_queue_left=%zu host_queue_left=%zu "
                       "host_landed=%llu host_bytes=%llu host_errors=%llu "
                       "host_promoted=%llu host_wasted=%llu "
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu",
@@ -3176,6 +3225,7 @@ public:
                       (unsigned long long) pool_.spec_errors(),
                       (unsigned long long) spec_dropped_,
                       spec_queue_.size(),
+                      host_queue_.size(),
                       (unsigned long long) pool_.host_landed(),
                       (unsigned long long) pool_.host_spec_bytes(),
                       (unsigned long long) pool_.host_spec_errors(),

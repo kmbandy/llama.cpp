@@ -1239,6 +1239,145 @@ void test_predicted_hint_lands_in_host_ram() {
     require(server_result == 0, "host-landing worker returned failure");
 }
 
+// THE HINT LOG MUST NOT FILE A SPECULATIVE READ AS A DEMAND ONE.
+//
+// A speculative page-in is logged "S" at submit. Its harvest runs through the
+// same drain_one_read as a demand batch, and until 2026-08-06 that drain ALSO
+// wrote a "D" line for it -- so every speculative read appeared twice, once as
+// the cost and once as the demand read it existed to prevent. Under the async
+// path the harvest runs INSIDE ensure_batch, i.e. AFTER the current request's
+// "R" line, so the classifier saw S..R..D for the same page and filed a USED
+// page as LATE. That artifact is what made asynchronous speculative reads look
+// like they had made the used-rate worse (686 -> 431 on identical behaviour).
+//
+// The invariant pinned here: a page that was speculatively read and then HIT by
+// the dispatch that follows produces exactly one S and NO D; a page the
+// dispatch had to read on demand produces exactly one D.
+void test_spec_pagein_logs_s_not_d() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    const fs::path hint_log = temp.path / "hint.txt";
+    const ScopedEnv hint_log_env("WP_HINT_LOG", hint_log.string());
+    const ScopedEnv spec_env("WP_EXPERT_SPEC_PAGEIN", "1");
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK,
+                "worker did not acknowledge HELLO");
+
+        const auto dispatch_one = [&](int32_t layer, int32_t expert, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer       = layer;
+            request.n_tokens    = N_TOKENS;
+            request.activations.resize((size_t) N_TOKENS * N_EMBD);
+            request.assignments = { { expert, std::vector<float>(N_TOKENS, 0.5f) } };
+            std::vector<uint8_t> buf = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq, buf.data(), buf.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, buf) && type == PIPE_EXPERT_PARTIAL,
+                    "dispatch did not complete");
+        };
+
+        // 1. A demand read: exactly the event a "D" line is FOR.
+        dispatch_one(LAYER, 0, 100);
+        require(reads.count_of(LAYER, 0) == 1, "the demand dispatch did not read its page");
+
+        // 2. A speculative read of (LAYER, 1) in the idle window.
+        pipe_expert_prefetch_hint hint;
+        hint.layer      = LAYER;
+        hint.expert_ids = { 1 };
+        payload = pipe_encode_expert_prefetch_hint(hint);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, payload.data(), payload.size()),
+                "failed to send prefetch hint");
+        require(reads.wait_for_total(2), "the hinted page was never speculatively read");
+
+        // 3. The dispatch that uses it. Whether the read is still in flight
+        //    (ensure_batch waits for it) or already harvested by the idle pump,
+        //    the batch is retired before this reply arrives -- so by the time
+        //    the log is read below, a spurious harvest-side "D" would be there.
+        dispatch_one(LAYER, 1, 101);
+        require(reads.count_of(LAYER, 1) == 1,
+                "the speculatively read page was re-read by the dispatch that used it");
+
+        // Read the log with the socket still open, exactly like the disarmed
+        // test: nothing below may depend on a clean close.
+        std::vector<std::string> lines;
+        {
+            std::ifstream in(hint_log);
+            require(in.good(), "WP_HINT_LOG was never created");
+            for (std::string line; std::getline(in, line); ) {
+                lines.push_back(line);
+            }
+        }
+        std::vector<std::string> s_lines, d_lines;
+        for (const std::string & line : lines) {
+            if (!line.empty() && line[0] == 'S') s_lines.push_back(line);
+            if (!line.empty() && line[0] == 'D') d_lines.push_back(line);
+        }
+        require(s_lines.size() == 1 &&
+                    s_lines.front() == "S " + std::to_string(LAYER) + " 1",
+                "the speculative read was not logged as exactly one S line");
+        // THE ASSERTION THIS TEST EXISTS FOR. The only demand read in this
+        // sequence is (LAYER, 0); a second D line means the harvest of the
+        // speculative batch logged its page-in as a demand read.
+        require(d_lines.size() == 1,
+                "a speculative page-in was ALSO logged as a demand read -- "
+                "the classifier will file every used speculative page as LATE");
+        require(d_lines.front() == "D " + std::to_string(LAYER) + " 0",
+                "the demand D line is for the wrong page");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "spec-log worker returned failure");
+}
+
 void test_prefetch_hint_without_spec_reads_nothing() {
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
@@ -1411,6 +1550,7 @@ int main() {
         run_test();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();
+        test_spec_pagein_logs_s_not_d();
         test_predicted_hint_lands_in_host_ram();
         test_prefetch_spec_pagein_and_eviction_order("0");
         test_prefetch_spec_pagein_and_eviction_order("64");
