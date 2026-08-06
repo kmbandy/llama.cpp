@@ -892,15 +892,43 @@ echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=
 # "expert dispatcher failed to connect to worker <ip>:8803" -- which reads like a
 # crashed worker when the worker is merely still allocating.
 echo "=== waiting for all expert workers to listen ==="
-for ep in $(echo "$DISPATCH_ENDPOINTS" | tr ',' ' '); do
-    ephost="${ep%%:*}"; epport="${ep##*:}"
-    up=0
+# DO NOT CONNECT TO CHECK. The expert protocol opens with the SERVER sending a
+# 366-byte HELLO, so a probe that connects and hangs up makes the worker fail
+# that send and exit -- "pipe send failed (bytes_sent=0, size_to_send=366)".
+# The first version of this gate did exactly that and killed the workers it was
+# meant to be waiting for, turning an intermittent race into a reliable failure.
+#
+# Wait on the worker's own log line instead. It is written immediately after the
+# listen() succeeds, costs the worker nothing, and cannot perturb it.
+# Derive the wait list from DISPATCH_ENDPOINTS, so it covers exactly the workers
+# this arm launched -- NO_480 and DSPARK_HOST change that set, and a hardcoded
+# list would either wait forever on a worker that was never started or skip one
+# that was.
+wait_worker_log() {   # $1 = "local"|<sshhost>, $2 = logfile
     for _ in $(seq 1 240); do
-        if timeout 2 bash -c "echo > /dev/tcp/$ephost/$epport" 2>/dev/null; then up=1; break; fi
+        if [ "$1" = "local" ]; then
+            grep -q 'expert worker listening' "$2" 2>/dev/null && return 0
+        else
+            ssh -o BatchMode=yes "$1" "grep -q 'expert worker listening' '$2'" 2>/dev/null && return 0
+        fi
         sleep 1
     done
-    [ "$up" -eq 1 ] || { echo "*** WORKER $ep NEVER CAME UP -- aborting arm ***"; exit 1; }
-    echo "  $ep up"
+    return 1
+}
+for ep in $(echo "$DISPATCH_ENDPOINTS" | tr ',' ' '); do
+    case "${ep##*:}" in
+        8801) wh="mad-lab-main"; wl="$OUT/w-r9700.log" ;;
+        8802) wh="mad-lab-main"; wl="$OUT/w-dspark.log" ;;
+        8803) wh="local";        wl="$OUT/w-1070.log"  ;;
+        8804) wh="local";        wl="$OUT/w-480.log"   ;;
+        8805) wh="local";        wl="$OUT/w-dspark.log";;
+        *)    continue ;;
+    esac
+    if wait_worker_log "$wh" "$wl"; then
+        echo "  $(basename $wl) up"
+    else
+        echo "*** WORKER $wl ($ep) NEVER LISTENED -- aborting arm ***"; exit 1
+    fi
 done
 
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
