@@ -872,7 +872,8 @@ struct dispatcher::impl {
 
     // Partition `experts` across the workers that will actually be asked for
     // them and send one hint frame each. See dispatcher::send_prefetch_hints.
-    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts) {
+    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts,
+                               uint32_t provenance) {
         if (poisoned || experts.empty()) {
             return 0;
         }
@@ -899,7 +900,7 @@ struct dispatcher::impl {
         // 1070, the RX 480 and the CPU worker all advertise experts 0..84 and
         // the first two READ THE SAME SHARD OFF THE SAME DRIVE, so hinting the
         // wrong one buys a wasted read AND leaves the real one cold. That is
-        // precisely the read amplification that killed the 2026-07 attempt.
+        // precisely the wasted read that killed the 2026-07 attempt.
         if (!static_assign) {
             ++hint_stats.n_skipped_dynamic;
             return 0;
@@ -933,6 +934,7 @@ struct dispatcher::impl {
             }
             pipe_expert_prefetch_hint hint;
             hint.layer      = layer;
+            hint.provenance = provenance;
             hint.expert_ids = std::move(by_worker[i]);   // already ascending: `experts` is
             const std::vector<uint8_t> payload = pipe_encode_expert_prefetch_hint(hint);
             // seq_id 0: a hint is never correlated with a response, so it must not
@@ -1516,8 +1518,9 @@ std::vector<float> dispatcher::dispatch(int32_t                                 
     return pimpl->dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);
 }
 
-size_t dispatcher::send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts) {
-    return pimpl->send_prefetch_hints(layer, experts);
+size_t dispatcher::send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts,
+                                       uint32_t provenance) {
+    return pimpl->send_prefetch_hints(layer, experts, provenance);
 }
 
 const prefetch_hint_stats & dispatcher::get_prefetch_hint_stats() const {

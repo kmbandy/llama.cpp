@@ -1919,17 +1919,22 @@ public:
     //
     // Returns the number of pages submitted (0 if they were all already present
     // or a batch is still in flight).
-    size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages) {
+    size_t spec_pagein_submit(const std::vector<const ExpertPage *> & pages,
+                              const std::vector<uint64_t> & leases) {
         if (pages.empty() || spec_batch_) {
             return 0;   // one speculative batch in flight at a time
         }
         std::vector<const ExpertPage *> cold;
         cold.reserve(pages.size());
-        for (const ExpertPage * page : pages) {
+        spec_leases_.clear();
+        spec_leases_.reserve(pages.size());
+        for (size_t i = 0; i < pages.size(); ++i) {
+            const ExpertPage * page = pages[i];
             if (page == nullptr || page->is_resident || find_slot(*page) != slots_.size()) {
                 continue;   // pinned resident, or already in a slot: nothing to do
             }
             cold.push_back(page);
+            spec_leases_.push_back(i < leases.size() ? leases[i] : spec_lease_);
         }
         if (cold.empty()) {
             return 0;
@@ -2031,7 +2036,8 @@ private:
                                                     spec_inflight_[i]->expert)) {
                     slot.tick        = ++spec_tick_;
                     slot.uses        = 0;
-                    slot.lease_until = evictions_ + spec_lease_;
+                    slot.lease_until = evictions_ +
+                        (i < spec_leases_.size() ? spec_leases_[i] : spec_lease_);
                 }
             }
         } catch (const std::exception &) {
@@ -2057,6 +2063,11 @@ public:
     // came after the speculative one. Two log files have no shared clock, so
     // pool-side page-ins and worker-side hints must go through the SAME handle.
     void set_spec_log(FILE * f) { spec_log_ = f; }
+
+    // The lease a page gets by provenance. Read by the Worker, which owns the
+    // hint queue and resolves provenance to a lease at enqueue time.
+    uint64_t spec_lease()           const { return spec_lease_; }
+    uint64_t spec_lease_predicted() const { return spec_lease_pred_; }
 
     const ResourcePlan & resources() const {
         return resources_;
@@ -2661,11 +2672,24 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 64;
         return v > 0 ? (uint64_t) v : (uint64_t) 0;
     }();
+    // WP_EXPERT_SPEC_LEASE_PREDICTED -- the lease for a page fetched on a GUESS.
+    //
+    // A flat lease prices certainty and speculation the same, and measured, that
+    // is what broke the predictor: ~1.8 predicted tokens per block displaced ~200
+    // ground-truth pages, because a predicted page held its slot exactly as long
+    // as a page the target was already committed to. Short by default so a guess
+    // can occupy capacity nothing better wants and give it up first.
+    const uint64_t             spec_lease_pred_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_LEASE_PREDICTED");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 4;
+        return v > 0 ? (uint64_t) v : (uint64_t) 0;
+    }();
     // The one speculative batch that may be in flight. Holding the Batch holds
     // its slot pins, which is what stops an in-flight read's slot from being
     // recycled underneath it.
     std::unique_ptr<Batch>          spec_batch_;
     std::vector<const ExpertPage *> spec_inflight_;
+    std::vector<uint64_t>           spec_leases_;
     // retire_spec_batch -> complete_batch -> ... never re-enters ensure_batch,
     // but the guard makes that explicit and cheap rather than assumed.
     bool                            spec_recursion_ = false;
@@ -2911,7 +2935,10 @@ public:
             // ascending page order per layer -- which is the order that lets the
             // drive read something closer to a stream than a random walk.
             if (spec_enabled_) {
-                spec_queue_.push_back(&catalog_.pages.at({ hint.layer, expert_id }));
+                spec_queue_.emplace_back(&catalog_.pages.at({ hint.layer, expert_id }),
+                                         hint.provenance == PIPE_HINT_PREDICTED
+                                             ? pool_.spec_lease_predicted()
+                                             : pool_.spec_lease());
             }
         }
         log_prefetch_hints();
@@ -2954,10 +2981,16 @@ public:
             return false;
         }
         const size_t take = std::min(spec_chunk_, spec_queue_.size());
-        std::vector<const ExpertPage *> chunk(
-            spec_queue_.begin(), spec_queue_.begin() + (ptrdiff_t) take);
+        std::vector<const ExpertPage *> chunk;
+        std::vector<uint64_t>           leases;
+        chunk.reserve(take);
+        leases.reserve(take);
+        for (size_t i = 0; i < take; ++i) {
+            chunk.push_back(spec_queue_[i].first);
+            leases.push_back(spec_queue_[i].second);
+        }
         spec_queue_.erase(spec_queue_.begin(), spec_queue_.begin() + (ptrdiff_t) take);
-        return pool_.spec_pagein_submit(chunk) != 0;
+        return pool_.spec_pagein_submit(chunk, leases) != 0;
     }
 
     // A speculative read in flight is work in progress, not idleness -- the pump
@@ -3349,7 +3382,9 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
         return v > 0 ? (size_t) v : (size_t) 1;
     }();
-    std::deque<const ExpertPage *> spec_queue_;
+    // (page, lease) -- provenance is resolved to a lease at enqueue, so nothing
+    // downstream has to know where a page came from.
+    std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;
     uint64_t           spec_dropped_        = 0;
     uint64_t           hint_frames_         = 0;
     uint64_t           hint_experts_        = 0;

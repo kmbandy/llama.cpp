@@ -541,7 +541,11 @@ std::vector<uint8_t> pipe_encode_expert_prefetch_hint(
                  "pipe: expert prefetch hint ids must be non-negative and strictly ascending");
         }
     }
-    const uint64_t total = 8ull + (uint64_t) p.expert_ids.size() * 4ull;
+    if (p.provenance != PIPE_HINT_CERTAIN && p.provenance != PIPE_HINT_PREDICTED) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint has an unknown provenance %u",
+             p.provenance);
+    }
+    const uint64_t total = 12ull + (uint64_t) p.expert_ids.size() * 4ull;
     if (total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint encode size %llu exceeds max payload",
              (unsigned long long) total);
@@ -551,6 +555,7 @@ std::vector<uint8_t> pipe_encode_expert_prefetch_hint(
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, (uint32_t) p.expert_ids.size());
+    wr_u32(w, p.provenance);
     for (int32_t expert_id : p.expert_ids) {
         wr_i32(w, expert_id);
     }
@@ -559,7 +564,7 @@ std::vector<uint8_t> pipe_encode_expert_prefetch_hint(
 
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
         const uint8_t * buf, size_t len) {
-    if (len < 8) {
+    if (len < 12) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint payload is too small");
     }
     const uint8_t * p   = buf;
@@ -568,6 +573,11 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     pipe_expert_prefetch_hint r;
     r.layer = rd_i32(p);
     const uint32_t n_experts = rd_u32(p);
+    r.provenance = rd_u32(p);
+    if (r.provenance != PIPE_HINT_CERTAIN && r.provenance != PIPE_HINT_PREDICTED) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint has an unknown provenance %u",
+             r.provenance);
+    }
     if (r.layer < 0 || n_experts == 0) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert prefetch hint has invalid dimensions");
     }
@@ -581,7 +591,7 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     // no allocation, where a std::set would cost both. A worker that trusted an
     // unchecked list could queue the same page twice and count the second read
     // as a page-in, which would corrupt the one counter this whole feature is
-    // measured by (see the read-amplification gate in the prefetch brief).
+    // measured by.
     r.expert_ids.reserve(n_experts);
     for (uint32_t i = 0; i < n_experts; ++i) {
         const int32_t expert_id = rd_i32(p);

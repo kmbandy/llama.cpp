@@ -52,7 +52,13 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // ignore the hint, it would kill the session on the first one -- mid-run, after a
 // successful HELLO, looking exactly like a worker crash. Rejecting at HELLO turns
 // that into one clear line at startup.
-static constexpr uint32_t PIPE_VERSION = 5u;
+// 6: the prefetch hint carries PROVENANCE. A hint derived from a token the
+//    target will certainly process (id_last) and one derived from a PREDICTION
+//    cost the same to send and are worth very different amounts to keep, and a
+//    worker that cannot tell them apart has to lease them identically. Measured:
+//    predicted hints displaced ~200 ground-truth pages precisely because they
+//    held slots on equal terms.
+static constexpr uint32_t PIPE_VERSION = 6u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -247,9 +253,23 @@ struct pipe_expert_dispatch_req {
 // Payload:
 //   i32 layer
 //   u32 n_experts
+//   u32 provenance                (PIPE_HINT_*)
 //   i32 expert_id[n_experts]      (strictly ascending, all >= 0)
+//
+// PROVENANCE IS NOT A HINT ABOUT QUALITY, IT IS A STATEMENT ABOUT CERTAINTY.
+// CERTAIN ids come from a token the target is already committed to processing --
+// they cannot be wrong. PREDICTED ids come from the previous draft block, which
+// is right about 40% of the time per expert. The worker keeps both, but it must
+// not spend the same residency on them: a predicted page that outranks a certain
+// one converts a free guess into a displaced fact.
+enum pipe_hint_provenance : uint32_t {
+    PIPE_HINT_CERTAIN   = 0,
+    PIPE_HINT_PREDICTED = 1,
+};
+
 struct pipe_expert_prefetch_hint {
-    int32_t              layer = -1;
+    int32_t              layer      = -1;
+    uint32_t             provenance = PIPE_HINT_CERTAIN;
     std::vector<int32_t> expert_ids;
 };
 

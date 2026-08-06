@@ -67,7 +67,7 @@ struct llama_context {
     // Offer the hash-layer experts of `tokens` to the expert workers ahead of the
     // forward pass that will consume them. See llama_expert_prefetch_hint.
     // Returns hint frames sent; 0 whenever the feature or the dispatcher is off.
-    int expert_prefetch_hint(const llama_token * tokens, int n_tokens);
+    int expert_prefetch_hint(const llama_token * tokens, int n_tokens, int n_certain = -1);
 
     ggml_backend_sched_t get_sched() const;
 

@@ -160,31 +160,48 @@ void graph_dispatcher::register_hash_layer(int32_t         layer,
     oracle_.register_layer(layer, n_expert_used, n_vocab, remote.n_expert(), data);
 }
 
-size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_tokens) {
+size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
+                                             size_t n_certain) {
     if (!hint_enabled() || oracle_.empty() || tokens == nullptr || n_tokens == 0) {
         return 0;
     }
+    if (n_certain > n_tokens) {
+        n_certain = n_tokens;
+    }
     size_t sent = 0;
-    for (int32_t layer : oracle_.layers()) {
-        if (!oracle_.experts_for(layer, tokens, n_tokens, hint_experts_) ||
-            hint_experts_.empty()) {
+    // Two passes, two frames, because a worker that receives one merged set
+    // cannot tell which ids it may cheaply discard. The dedup below is per
+    // (layer, provenance) for the same reason -- a predicted set that happens to
+    // equal the last CERTAIN set is still a different statement.
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool     certain    = (pass == 0);
+        const size_t   beg        = certain ? 0 : n_certain;
+        const size_t   count      = certain ? n_certain : n_tokens - n_certain;
+        const uint32_t provenance = certain ? PIPE_HINT_CERTAIN : PIPE_HINT_PREDICTED;
+        if (count == 0) {
             continue;
         }
-        // Same set as last time for this layer: the worker would resolve it to
-        // pages it already holds and discard it. Skip the frame.
-        std::vector<int32_t> & previous = last_hint_[layer];
-        if (previous == hint_experts_) {
-            continue;
-        }
-        previous = hint_experts_;
-        // Swallowing here is deliberate and is the property that makes this safe
-        // to leave enabled: a hint carries no correctness weight, so no failure
-        // inside it may reach the decode. A broken socket surfaces on the next
-        // real dispatch, which is where it belongs.
-        try {
-            sent += remote.send_prefetch_hints(layer, hint_experts_);
-        } catch (...) {
-            return sent;
+        for (int32_t layer : oracle_.layers()) {
+            if (!oracle_.experts_for(layer, tokens + beg, count, hint_experts_) ||
+                hint_experts_.empty()) {
+                continue;
+            }
+            // Same set as last time for this layer and provenance: the worker
+            // would resolve it to pages it already holds and discard it. Skip.
+            std::vector<int32_t> & previous = last_hint_[layer * 2 + pass];
+            if (previous == hint_experts_) {
+                continue;
+            }
+            previous = hint_experts_;
+            // Swallowing here is deliberate and is the property that makes this
+            // safe to leave enabled: a hint carries no correctness weight, so no
+            // failure inside it may reach the decode. A broken socket surfaces on
+            // the next real dispatch, which is where it belongs.
+            try {
+                sent += remote.send_prefetch_hints(layer, hint_experts_, provenance);
+            } catch (...) {
+                return sent;
+            }
         }
     }
     return sent;

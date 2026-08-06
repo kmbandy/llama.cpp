@@ -120,20 +120,26 @@ static void register_hash_oracle(const llama_model &                        mode
                    __func__, dispatcher.hash_oracle_layers());
 }
 
-int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens) {
+int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens,
+                                        int n_certain) {
     if (expert_dispatch == nullptr || tokens == nullptr || n_tokens <= 0) {
         return 0;
     }
-    return (int) expert_dispatch->prefetch_for_tokens(tokens, (size_t) n_tokens);
+    // n_certain < 0 means "all of them", which is what every caller that has no
+    // prediction wants and keeps the common case unannotated.
+    const size_t certain = n_certain < 0 ? (size_t) n_tokens
+                                         : (size_t) std::min(n_certain, n_tokens);
+    return (int) expert_dispatch->prefetch_for_tokens(tokens, (size_t) n_tokens, certain);
 }
 
 int llama_expert_prefetch_hint(struct llama_context * ctx,
                                const llama_token * tokens,
-                               int n_tokens) {
+                               int n_tokens,
+                               int n_certain) {
     if (ctx == nullptr) {
         return 0;
     }
-    return ctx->expert_prefetch_hint(tokens, n_tokens);
+    return ctx->expert_prefetch_hint(tokens, n_tokens, n_certain);
 }
 
 struct llm_fused_op_probe {

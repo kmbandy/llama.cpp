@@ -943,13 +943,18 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
                     "spec-test dispatch did not complete");
         };
 
-        const auto hint = [&](int32_t layer, std::vector<int32_t> experts) {
+        const auto hint_p = [&](int32_t layer, std::vector<int32_t> experts,
+                                uint32_t provenance) {
             pipe_expert_prefetch_hint frame;
             frame.layer      = layer;
+            frame.provenance = provenance;
             frame.expert_ids = std::move(experts);
             std::vector<uint8_t> buf = pipe_encode_expert_prefetch_hint(frame);
             require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, buf.data(), buf.size()),
                     "failed to send prefetch hint");
+        };
+        const auto hint = [&](int32_t layer, std::vector<int32_t> experts) {
+            hint_p(layer, std::move(experts), PIPE_HINT_CERTAIN);
         };
 
         // 1. DEMAND (LAYER, 0). One read; its slot enters the demand band.
@@ -1006,6 +1011,42 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
             dispatch_one(LAYER, 1, 103);
             require(reads.count_of(LAYER, 1) == 2,
                     "the oldest speculative page was not the victim -- eviction order within the prefetch band is wrong");
+        }
+
+        // 8. PROVENANCE PRICES RESIDENCY. A CERTAIN page and a PREDICTED one,
+        //    then enough eviction pressure to outlive the PREDICTED lease (4)
+        //    but not the CERTAIN one (64). The guess must be the victim.
+        //
+        //    The demand pages cycling below are unleased and carry a use count,
+        //    so they rank ABOVE an expired speculative page -- which is what
+        //    makes the expired prediction, and only it, the thing that goes.
+        //
+        //    Discriminating by construction: with the two leases EQUAL the victim
+        //    falls to tick order, and the CERTAIN page was hinted first, so it
+        //    holds the older tick and goes instead. Run with
+        //    WP_EXPERT_SPEC_LEASE_PREDICTED=64 and this fails.
+        if (leased) {
+            hint_p(OTHER_LAYER, { 1 }, PIPE_HINT_CERTAIN);
+            require(reads.wait_for_total(reads.total() + 1), "the certain hint did not read");
+            const size_t certain_after_hint = reads.count_of(OTHER_LAYER, 1);
+            hint_p(OTHER_LAYER, { 2 }, PIPE_HINT_PREDICTED);
+            require(reads.wait_for_total(reads.total() + 1), "the predicted hint did not read");
+            const size_t predicted_after_hint = reads.count_of(OTHER_LAYER, 2);
+
+            // Enough evictions to expire the predicted lease of 4 AND then keep
+            // evicting, because expiry only makes a page ELIGIBLE -- something
+            // still has to come along and take it. Five was not enough: the lease
+            // ran out on the last eviction and nothing followed.
+            for (uint64_t seq = 200; seq < 216; ++seq) {
+                dispatch_one(LAYER, (int32_t) (seq % 4), seq);
+            }
+
+            dispatch_one(OTHER_LAYER, 1, 220);
+            dispatch_one(OTHER_LAYER, 2, 221);
+            const size_t certain_reread   = reads.count_of(OTHER_LAYER, 1) - certain_after_hint;
+            const size_t predicted_reread = reads.count_of(OTHER_LAYER, 2) - predicted_after_hint;
+            require(predicted_reread > certain_reread,
+                    "a PREDICTED page outlived a CERTAIN one -- provenance is not pricing residency");
         }
 
         // Use-count ranking is a separate concern from the lease, and a live

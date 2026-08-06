@@ -160,9 +160,16 @@ LLAMA_API int llama_wp_on_sampled_token(struct llama_context * ctx,
 // never throws, never blocks, and a dropped hint costs at most a page-in the run
 // was going to pay anyway. Returns hint frames sent; 0 unless WP_PREFETCH_HINT=1
 // and the context owns (or borrows) an expert dispatcher.
+//
+// n_certain: how many LEADING tokens the target is already committed to
+// processing. The rest are predictions and are sent as a separate frame so the
+// worker can hold them on a shorter lease -- a guess that outranks a certainty
+// converts a free fetch into a displaced fact. -1 means all of them, which is
+// what a caller with no prediction wants.
 LLAMA_API int llama_expert_prefetch_hint(struct llama_context * ctx,
                                          const llama_token * tokens,
-                                         int n_tokens);
+                                         int n_tokens,
+                                         int n_certain);
 
 // Adaptive gate: when false, skip running the draft model this step (pool
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0

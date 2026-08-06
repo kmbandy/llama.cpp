@@ -1231,11 +1231,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             std::vector<llama_token> known;
             known.reserve(n_seq + prev_draft_toks.size());
+            size_t n_certain = 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_block_beg[seq_id] >= 0) {
                     known.push_back(dparams[seq_id].id_last);
                 }
             }
+            n_certain = known.size();
 
             // *** THE PREDICTED HALF, AND WHY IT IS HERE AND NOT BELOW. ***
             //
@@ -1280,8 +1282,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             if (!known.empty()) {
+                // n_certain = the id_last entries added first. Everything after
+                // them came from the previous block and is a guess.
                 llama_expert_prefetch_hint(this->params.ctx_tgt, known.data(),
-                                           (int) known.size());
+                                           (int) known.size(), (int) n_certain);
             }
         }
 

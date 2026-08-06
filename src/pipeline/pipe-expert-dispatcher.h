@@ -129,7 +129,8 @@ class dispatcher {
     // request is in flight on the same socket.
     //
     // Returns the number of frames sent.
-    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts);
+    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts,
+                               uint32_t provenance = PIPE_HINT_CERTAIN);
 
     const prefetch_hint_stats & get_prefetch_hint_stats() const;
 

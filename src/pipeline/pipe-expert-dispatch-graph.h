@@ -65,7 +65,11 @@ class graph_dispatcher {
     // sockets. Call it between decodes, not from inside the graph.
     //
     // Returns the number of hint frames sent.
-    size_t prefetch_for_tokens(const int32_t * tokens, size_t n_tokens);
+    // n_certain of the leading tokens are ones the target WILL process; the rest
+    // are predicted. They are sent as separate frames so the worker can price
+    // them differently -- see pipe_hint_provenance.
+    size_t prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
+                               size_t n_certain = SIZE_MAX);
 
     const prefetch_hint_stats & hint_stats() const { return remote.get_prefetch_hint_stats(); }
 
