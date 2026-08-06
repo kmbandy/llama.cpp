@@ -1524,6 +1524,12 @@ public:
     }
 
     ~ExpertSlotPool() {
+        // A landing thread outliving the pool would std::terminate on a joinable
+        // thread, and it holds raw pointers into catalog pages and the staging
+        // arena. Join before anything it touches goes away.
+        if (host_thread_.joinable()) {
+            host_thread_.join();
+        }
 #if defined(__linux__)
         for (const auto & item : fds_) {
             close(item.second);
@@ -1970,6 +1976,93 @@ public:
     }
 
     bool spec_in_flight() const { return spec_batch_ != nullptr; }
+
+    // Is there anywhere for a predicted page to land? Without the host tier the
+    // answer is no and the caller must keep it on the VRAM path.
+    bool host_landing_available() const { return host_victim_enabled_; }
+
+    // *** LAND A GUESS IN HOST RAM, NOT IN VRAM. ***
+    //
+    // A predicted page in a VRAM slot is a slot a CERTAIN page cannot have, and
+    // no lease fixes that -- a short lease only lets the guess give the slot up
+    // AFTER it has taken it. Landing in the host arena costs no slot at all,
+    // and if the guess turns out right the demand path promotes it over PCIe
+    // (~1-2 ms) instead of re-reading NVMe (~5 ms) via the borrow path that
+    // already exists in ensure_batch.
+    //
+    // Runs on a reader thread, not the dispatch thread: there is no GPU work
+    // here, so the Vulkan command-pool affinity that constrains every other read
+    // path does not apply. HostTier is mutex-guarded throughout.
+    //
+    // Returns pages queued. Requires the host tier -- without it there is
+    // nowhere to land and the caller falls back to the VRAM path.
+    size_t spec_host_submit(const std::vector<const ExpertPage *> & pages) {
+        if (!host_victim_enabled_ || pages.empty() || host_thread_.joinable()) {
+            return 0;
+        }
+        std::vector<const ExpertPage *> cold;
+        cold.reserve(pages.size());
+        for (const ExpertPage * page : pages) {
+            if (page == nullptr || page->is_resident || page->cache_id < 0 ||
+                find_slot(*page) != slots_.size() ||
+                host_tier_.contains(page->cache_id)) {
+                continue;   // already somewhere useful
+            }
+            cold.push_back(page);
+        }
+        if (cold.empty()) {
+            return 0;
+        }
+        host_pending_.store(cold.size(), std::memory_order_release);
+        host_thread_ = std::thread([this, cold]() {
+            for (const ExpertPage * page : cold) {
+                try {
+                    StagingPool::Lease lease = staging_.borrow();
+                    // Fire the same hooks as every other read path. A host
+                    // landing IS a read -- instrumentation that cannot see it
+                    // would under-report exactly the bytes this feature spends.
+                    if (test_hooks_ != nullptr && test_hooks_->read_started) {
+                        test_hooks_->read_started(page->layer, page->expert);
+                    }
+                    read_page_range(*page, fd_for(page->blob), (char *) lease.get(),
+                                    0, (size_t) page->size);
+                    if (test_hooks_ != nullptr && test_hooks_->read_finished) {
+                        test_hooks_->read_finished(page->layer, page->expert);
+                    }
+                    if (host_tier_.store(page->cache_id, lease.get(),
+                                         (size_t) page->size, /*speculative=*/true)) {
+                        host_landed_.fetch_add(1, std::memory_order_relaxed);
+                        host_bytes_.fetch_add(page->size, std::memory_order_relaxed);
+                    }
+                } catch (const std::exception &) {
+                    // Advisory, exactly like the VRAM speculative path: a failed
+                    // guess must not fail the worker. The same error surfaces on
+                    // the demand path, which is where it belongs.
+                    host_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            host_pending_.store(0, std::memory_order_release);
+        });
+        return cold.size();
+    }
+
+    bool spec_host_in_flight() const {
+        return host_pending_.load(std::memory_order_acquire) != 0;
+    }
+
+    // Join a finished landing thread so the next chunk can start. Non-blocking:
+    // only reaps a thread that has already drained its queue.
+    void spec_host_reap() {
+        if (host_thread_.joinable() && !spec_host_in_flight()) {
+            host_thread_.join();
+        }
+    }
+
+    uint64_t host_landed() const { return host_landed_.load(std::memory_order_relaxed); }
+    uint64_t host_spec_bytes() const { return host_bytes_.load(std::memory_order_relaxed); }
+    uint64_t host_spec_errors() const { return host_errors_.load(std::memory_order_relaxed); }
+    uint64_t host_spec_promotions() const { return host_tier_.speculative_promotions(); }
+    uint64_t host_spec_wasted() const { return host_tier_.speculative_evicted_unused(); }
 
     // Is `page` currently being read speculatively? The demand path has to ask,
     // because an in-flight slot is not yet valid, so find_slot cannot see it and
@@ -2690,6 +2783,11 @@ private:
     std::unique_ptr<Batch>          spec_batch_;
     std::vector<const ExpertPage *> spec_inflight_;
     std::vector<uint64_t>           spec_leases_;
+    std::thread                     host_thread_;
+    std::atomic<size_t>             host_pending_{0};
+    std::atomic<uint64_t>           host_landed_{0};
+    std::atomic<uint64_t>           host_bytes_{0};
+    std::atomic<uint64_t>           host_errors_{0};
     // retire_spec_batch -> complete_batch -> ... never re-enters ensure_batch,
     // but the guard makes that explicit and cheap rather than assumed.
     bool                            spec_recursion_ = false;
@@ -2935,10 +3033,26 @@ public:
             // ascending page order per layer -- which is the order that lets the
             // drive read something closer to a stream than a random walk.
             if (spec_enabled_) {
-                spec_queue_.emplace_back(&catalog_.pages.at({ hint.layer, expert_id }),
-                                         hint.provenance == PIPE_HINT_PREDICTED
-                                             ? pool_.spec_lease_predicted()
-                                             : pool_.spec_lease());
+                const ExpertPage * page = &catalog_.pages.at({ hint.layer, expert_id });
+                // pool_.host_landing_available() is the load-bearing half of
+                // this condition. Without it a predicted hint goes onto a queue
+                // that has nowhere to drain to -- spec_host_submit returns 0 with
+                // no host tier -- and the prediction is silently discarded rather
+                // than fetched. That is worse than not predicting: the arm looks
+                // like it ran and measured nothing.
+                if (hint.provenance == PIPE_HINT_PREDICTED && spec_host_enabled_ &&
+                    pool_.host_landing_available()) {
+                    // A GUESS DOES NOT GET A VRAM SLOT. It lands in host RAM,
+                    // where a wrong guess costs only the bandwidth that fetched
+                    // it and a right one is promoted over PCIe instead of being
+                    // re-read from NVMe.
+                    host_queue_.push_back(page);
+                } else {
+                    spec_queue_.emplace_back(page,
+                                             hint.provenance == PIPE_HINT_PREDICTED
+                                                 ? pool_.spec_lease_predicted()
+                                                 : pool_.spec_lease());
+                }
             }
         }
         log_prefetch_hints();
@@ -2954,8 +3068,9 @@ public:
     // the hinted layer is certainly behind us -- speculating on a layer already
     // computed is a read with no possible upside.
     void drop_spec_work() {
-        spec_dropped_ += spec_queue_.size();
+        spec_dropped_ += spec_queue_.size() + host_queue_.size();
         spec_queue_.clear();
+        host_queue_.clear();
     }
 
     // Keep the speculative pipeline moving. Called from the idle pump.
@@ -2974,6 +3089,18 @@ public:
     //
     // Returns true if it did any work worth staying awake for.
     bool spec_pagein_step() {
+        // Host landings run on their own reader thread and never touch the GPU,
+        // so they are reaped and refilled independently of the VRAM path.
+        pool_.spec_host_reap();
+        if (!pool_.spec_host_in_flight() && !host_queue_.empty()) {
+            const size_t take = std::min(spec_chunk_, host_queue_.size());
+            std::vector<const ExpertPage *> chunk(
+                host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
+            host_queue_.erase(host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
+            if (pool_.spec_host_submit(chunk) != 0) {
+                return true;
+            }
+        }
         if (pool_.spec_in_flight()) {
             return pool_.spec_pagein_poll(false);
         }
@@ -2995,14 +3122,18 @@ public:
 
     // A speculative read in flight is work in progress, not idleness -- the pump
     // must keep spinning to harvest it even when the queue is empty.
-    bool has_spec_work() const { return !spec_queue_.empty() || pool_.spec_in_flight(); }
+    bool has_spec_work() const {
+        return !spec_queue_.empty() || !host_queue_.empty() ||
+               pool_.spec_in_flight() || pool_.spec_host_in_flight();
+    }
 
     // Something to SUBMIT right now, as opposed to something in flight. Only the
     // former justifies a zero-timeout poll: when a read is already running on a
     // reader thread we are waiting on the disk, not on ourselves, and spinning
     // would burn a core for the 3-5 ms of the read while doing nothing.
     bool has_spec_submit_work() const {
-        return !spec_queue_.empty() && !pool_.spec_in_flight();
+        return (!spec_queue_.empty() && !pool_.spec_in_flight()) ||
+               (!host_queue_.empty() && !pool_.spec_host_in_flight());
     }
 
     // The counter line, built in ONE place so stderr and WP_HINT_LOG cannot
@@ -3015,7 +3146,9 @@ public:
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
                       "spec_pageins=%llu spec_bytes=%llu spec_errors=%llu "
-                      "spec_dropped=%llu spec_queue_left=%zu",
+                      "spec_dropped=%llu spec_queue_left=%zu "
+                      "host_landed=%llu host_bytes=%llu host_errors=%llu "
+                      "host_promoted=%llu host_wasted=%llu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -3025,7 +3158,12 @@ public:
                       (unsigned long long) pool_.spec_bytes(),
                       (unsigned long long) pool_.spec_errors(),
                       (unsigned long long) spec_dropped_,
-                      spec_queue_.size());
+                      spec_queue_.size(),
+                      (unsigned long long) pool_.host_landed(),
+                      (unsigned long long) pool_.host_spec_bytes(),
+                      (unsigned long long) pool_.host_spec_errors(),
+                      (unsigned long long) pool_.host_spec_promotions(),
+                      (unsigned long long) pool_.host_spec_wasted());
         return buf;
     }
 
@@ -3385,6 +3523,15 @@ private:
     // (page, lease) -- provenance is resolved to a lease at enqueue, so nothing
     // downstream has to know where a page came from.
     std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;
+    // Predicted pages bound for host RAM. Separate queue, not a flag on the
+    // other one: they take a different read path to a different destination.
+    std::deque<const ExpertPage *> host_queue_;
+    // WP_EXPERT_SPEC_HOST=0 sends predictions back to VRAM on their short lease,
+    // which is the arm this is meant to beat.
+    const bool spec_host_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_HOST");
+        return e == nullptr || e[0] != '0';
+    }();
     uint64_t           spec_dropped_        = 0;
     uint64_t           hint_frames_         = 0;
     uint64_t           hint_experts_        = 0;

@@ -877,6 +877,12 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
     // through every arm. WP_EXPERT_SPEC_LEASE>0 deliberately relaxes exactly
     // that, and is covered separately below.
     require(setenv("WP_EXPERT_SPEC_LEASE", lease, 1) == 0, "failed to set the speculative lease");
+    // Host landing left ARMED on purpose, with no host tier configured. A
+    // predicted hint must then FALL BACK to the VRAM path -- if it instead goes
+    // onto the host queue it can never drain, and the prediction is silently
+    // discarded while the arm still looks like it ran. Step 8 below fails with
+    // "the predicted hint did not read" when that regresses.
+    require(setenv("WP_EXPERT_SPEC_HOST", "1", 1) == 0, "failed to arm host landing");
     const bool leased = std::string(lease) != "0";
     TempDir temp;
     const Fixture fixture = make_fixture(temp.path);
@@ -1026,11 +1032,17 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
         //    holds the older tick and goes instead. Run with
         //    WP_EXPERT_SPEC_LEASE_PREDICTED=64 and this fails.
         if (leased) {
+            // Baselines captured BEFORE each hint. Reading reads.total() as the
+            // argument to wait_for_total is a race: if the read has already
+            // landed the baseline is already incremented and the wait is for one
+            // more that never comes.
+            const size_t before_certain = reads.total();
             hint_p(OTHER_LAYER, { 1 }, PIPE_HINT_CERTAIN);
-            require(reads.wait_for_total(reads.total() + 1), "the certain hint did not read");
+            require(reads.wait_for_total(before_certain + 1), "the certain hint did not read");
             const size_t certain_after_hint = reads.count_of(OTHER_LAYER, 1);
+            const size_t before_predicted = reads.total();
             hint_p(OTHER_LAYER, { 2 }, PIPE_HINT_PREDICTED);
-            require(reads.wait_for_total(reads.total() + 1), "the predicted hint did not read");
+            require(reads.wait_for_total(before_predicted + 1), "the predicted hint did not read");
             const size_t predicted_after_hint = reads.count_of(OTHER_LAYER, 2);
 
             // Enough evictions to expire the predicted lease of 4 AND then keep
@@ -1075,6 +1087,7 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
         server.join();
         unsetenv("WP_EXPERT_SPEC_PAGEIN");
         unsetenv("WP_EXPERT_SPEC_LEASE");
+        unsetenv("WP_EXPERT_SPEC_HOST");
         // The worker's own failure is the useful one. Without this, a worker
         // that never started surfaces only as "failed to connect", which points
         // at the socket instead of at the reason.
@@ -1086,6 +1099,7 @@ void test_prefetch_spec_pagein_and_eviction_order(const char * lease) {
     server.join();
     require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
     require(unsetenv("WP_EXPERT_SPEC_LEASE") == 0, "failed to clear the speculative lease");
+    require(unsetenv("WP_EXPERT_SPEC_HOST") == 0, "failed to clear the host-landing flag");
     if (server_error) {
         std::rethrow_exception(server_error);
     }
@@ -1105,6 +1119,125 @@ struct ScopedEnv {
     }
     ~ScopedEnv() { unsetenv(name); }
 };
+
+// A PREDICTED hint must land in HOST RAM and take no VRAM slot at all.
+//
+// The lease can only make a guess give a slot up AFTER taking it; landing in the
+// host arena means it never competes for one. The check is therefore about what
+// is STILL RESIDENT in VRAM after the guess arrives, not about read counts --
+// the read happens either way, it is the slot that must not be spent.
+void test_predicted_hint_lands_in_host_ram() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+    const int port = reserve_port();
+
+    require(setenv("WP_EXPERT_SPEC_PAGEIN", "1", 1) == 0, "failed to arm speculative page-in");
+    require(setenv("WP_EXPERT_SPEC_HOST", "1", 1) == 0, "failed to arm host landing");
+
+    ReadLog reads;
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.host_victim_bytes = 8 * PAGE_BYTES;   // room for the guesses
+    options.once              = true;
+    options.test_hooks        = &reads.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload), "failed to receive HELLO");
+        pipe_expert_hello client = pipe_decode_expert_hello(payload.data(), payload.size());
+        client.role = PIPE_EXPERT_ROLE_CLIENT;
+        client.expert_first = -1;
+        client.expert_last  = -1;
+        client.n_slots      = 0;
+        client.layers.clear();
+        payload = pipe_encode_expert_hello(client);
+        require(pipe_send_frame(*socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_HELLO_ACK, "worker did not acknowledge HELLO");
+
+        const auto dispatch_one = [&](int32_t layer, int32_t expert, uint64_t seq) {
+            pipe_expert_dispatch_req request;
+            request.layer       = layer;
+            request.n_tokens    = N_TOKENS;
+            request.activations.resize((size_t) N_TOKENS * N_EMBD);
+            request.assignments = { { expert, std::vector<float>(N_TOKENS, 0.5f) } };
+            std::vector<uint8_t> buf = pipe_encode_expert_dispatch_req(request);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_REQ, seq, buf.data(), buf.size()),
+                    "failed to send dispatch");
+            require(pipe_recv_frame(*socket, type, seq_id, buf) && type == PIPE_EXPERT_PARTIAL,
+                    "dispatch did not complete");
+        };
+        const auto hint_p = [&](int32_t layer, std::vector<int32_t> experts, uint32_t prov) {
+            pipe_expert_prefetch_hint frame;
+            frame.layer      = layer;
+            frame.provenance = prov;
+            frame.expert_ids = std::move(experts);
+            std::vector<uint8_t> buf = pipe_encode_expert_prefetch_hint(frame);
+            require(pipe_send_frame(*socket, PIPE_EXPERT_PREFETCH_HINT, 0, buf.data(), buf.size()),
+                    "failed to send prefetch hint");
+        };
+
+        // Fill VRAM with four demand pages, then predict four more. If a guess
+        // took a slot, one of the demand pages would be gone and re-dispatching
+        // it would read again.
+        for (int32_t e = 0; e < 4; ++e) {
+            dispatch_one(LAYER, e, 100 + e);
+        }
+        require(reads.total() == 4, "the four demand pages did not read exactly once each");
+
+        hint_p(OTHER_LAYER, { 0, 1, 2, 3 }, PIPE_HINT_PREDICTED);
+        require(reads.wait_for_total(8), "the predicted hints never read");
+
+        for (int32_t e = 0; e < 4; ++e) {
+            dispatch_one(LAYER, e, 200 + e);
+        }
+        require(reads.total() == 8,
+                "a PREDICTED page displaced a demand page from VRAM -- it should have "
+                "landed in host RAM and taken no slot");
+
+        // And it is genuinely reachable: demanding one promotes from the host
+        // arena rather than reading NVMe again.
+        dispatch_one(OTHER_LAYER, 0, 300);
+        require(reads.count_of(OTHER_LAYER, 0) == 1,
+                "a predicted page was re-read from disk instead of promoted from host RAM");
+        socket.reset();
+    } catch (...) {
+        server.join();
+        unsetenv("WP_EXPERT_SPEC_PAGEIN");
+        unsetenv("WP_EXPERT_SPEC_HOST");
+        if (server_error) {
+            std::rethrow_exception(server_error);
+        }
+        throw;
+    }
+    server.join();
+    require(unsetenv("WP_EXPERT_SPEC_PAGEIN") == 0, "failed to disarm speculative page-in");
+    require(unsetenv("WP_EXPERT_SPEC_HOST") == 0, "failed to clear host landing");
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "host-landing worker returned failure");
+}
 
 void test_prefetch_hint_without_spec_reads_nothing() {
     TempDir temp;
@@ -1278,6 +1411,7 @@ int main() {
         run_test();
         test_default_off_multi_expert_request();
         test_prefetch_hint_without_spec_reads_nothing();
+        test_predicted_hint_lands_in_host_ram();
         test_prefetch_spec_pagein_and_eviction_order("0");
         test_prefetch_spec_pagein_and_eviction_order("64");
         std::cout << "test-wp-expert-worker: all tests passed\n";
