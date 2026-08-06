@@ -145,6 +145,44 @@ size_t graph_dispatcher::n_workers() const {
     return remote.workers().size();
 }
 
+bool graph_dispatcher::hint_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_PREFETCH_HINT");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+void graph_dispatcher::register_hash_layer(int32_t         layer,
+                                           int32_t         n_expert_used,
+                                           int32_t         n_vocab,
+                                           const int32_t * data) {
+    oracle_.register_layer(layer, n_expert_used, n_vocab, remote.n_expert(), data);
+}
+
+size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_tokens) {
+    if (!hint_enabled() || oracle_.empty() || tokens == nullptr || n_tokens == 0) {
+        return 0;
+    }
+    size_t sent = 0;
+    for (int32_t layer : oracle_.layers()) {
+        if (!oracle_.experts_for(layer, tokens, n_tokens, hint_experts_) ||
+            hint_experts_.empty()) {
+            continue;
+        }
+        // Swallowing here is deliberate and is the property that makes this safe
+        // to leave enabled: a hint carries no correctness weight, so no failure
+        // inside it may reach the decode. A broken socket surfaces on the next
+        // real dispatch, which is where it belongs.
+        try {
+            sent += remote.send_prefetch_hints(layer, hint_experts_);
+        } catch (...) {
+            return sent;
+        }
+    }
+    return sent;
+}
+
 void graph_dispatcher::latch_failure(const char * message) noexcept {
     try {
         std::lock_guard<std::mutex> lock(failure_mutex_);
@@ -217,6 +255,24 @@ void graph_dispatcher::end_decode() noexcept {
         dstats.ns_gap * 1.0e-6,
         (unsigned long long) dstats.n_deferred,
         (unsigned long long) dstats.n_deferred_late);
+
+    // Same treatment for the prefetch hint, and for the same reason: these are
+    // the spine's side of the mechanism, and they are what tells a run that
+    // "prefetch did nothing" apart from "prefetch was never offered". Silent
+    // when the feature is off, so a config-of-record run's log is unchanged.
+    if (hint_enabled()) {
+        const prefetch_hint_stats & hstats = remote.get_prefetch_hint_stats();
+        LLAMA_LOG_WARN(
+            "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
+            "send_failed=%llu no_route=%llu skip_dynamic=%llu skip_in_flight=%llu\n",
+            oracle_.layers().size(),
+            (unsigned long long) hstats.n_frames,
+            (unsigned long long) hstats.n_experts,
+            (unsigned long long) hstats.n_send_failed,
+            (unsigned long long) hstats.n_no_oracle,
+            (unsigned long long) hstats.n_skipped_dynamic,
+            (unsigned long long) hstats.n_skipped_in_flight);
+    }
 
     if (!collect_stats_ || !decode_active_) {
         return;

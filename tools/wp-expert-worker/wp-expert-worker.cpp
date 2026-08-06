@@ -2569,6 +2569,43 @@ public:
     bool keepalive_enabled() const { return keepalive_us_ > 0 && keepalive_graph_ != nullptr; }
     int  keepalive_us()      const { return keepalive_us_; }
 
+    // Record a prefetch hint. DOES NOT WARM ANYTHING YET -- see the frame-loop
+    // comment. Experts outside this worker's shard are counted separately rather
+    // than rejected: the spine routes by the same static hash the dispatch uses,
+    // so a nonzero foreign count means the two disagree, which is a spine bug
+    // that would otherwise show up only as prefetch mysteriously not helping.
+    void note_prefetch_hint(const pipe_expert_prefetch_hint & hint) {
+        ++hint_frames_;
+        hint_experts_ += hint.expert_ids.size();
+        if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), hint.layer)) {
+            hint_foreign_layer_ += hint.expert_ids.size();
+            return;
+        }
+        for (int32_t expert_id : hint.expert_ids) {
+            if (expert_id < catalog_.descriptor.expert_first ||
+                expert_id > catalog_.descriptor.expert_last ||
+                catalog_.pages.count({ hint.layer, expert_id }) == 0) {
+                ++hint_foreign_expert_;
+            }
+        }
+    }
+
+    void note_prefetch_hint_bad() { ++hint_bad_; }
+
+    void report_prefetch_hints() const {
+        if (hint_frames_ == 0 && hint_bad_ == 0) {
+            return;
+        }
+        std::fprintf(stderr,
+                     "wp-expert-worker prefetch hints: frames=%llu experts=%llu "
+                     "foreign_layer=%llu foreign_expert=%llu malformed=%llu\n",
+                     (unsigned long long) hint_frames_,
+                     (unsigned long long) hint_experts_,
+                     (unsigned long long) hint_foreign_layer_,
+                     (unsigned long long) hint_foreign_expert_,
+                     (unsigned long long) hint_bad_);
+    }
+
     pipe_expert_hello hello() const {
         pipe_expert_hello hello;
         hello.role          = PIPE_EXPERT_ROLE_WORKER;
@@ -2877,6 +2914,13 @@ public:
     }
 
 private:
+    // ---- prefetch hints (see note_prefetch_hint) ----
+    uint64_t           hint_frames_         = 0;
+    uint64_t           hint_experts_        = 0;
+    uint64_t           hint_foreign_layer_  = 0;
+    uint64_t           hint_foreign_expert_ = 0;
+    uint64_t           hint_bad_            = 0;
+
     // ---- keepalive (see keepalive_tick) ----
     int                keepalive_us_    = 0;
     ggml_context     * keepalive_ctx_   = nullptr;
@@ -3460,6 +3504,30 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             }
             continue;
         }
+        // Prefetch hint: accept, validate, count, DO NOTHING ELSE (yet).
+        //
+        // This half exists on its own so the wire can be proven before the pool
+        // is touched. With only this, a run is observably identical to the
+        // config of record -- no extra read, no eviction, no slot pinned -- and
+        // the hint counters still say exactly what the spine offered and when.
+        // If those counters come out wrong, the fault is on the spine side and
+        // is found without a single changed page-in.
+        //
+        // A hint gets NO response frame, so it must not fall through to the
+        // dispatch path's reply, and a malformed one must not kill the session:
+        // it is advisory, and the request stream is untouched by dropping it.
+        if (type == PIPE_EXPERT_PREFETCH_HINT) {
+            try {
+                const pipe_expert_prefetch_hint hint =
+                    pipe_decode_expert_prefetch_hint(payload.data(), payload.size());
+                worker.note_prefetch_hint(hint);
+            } catch (const pipe_protocol_error & error) {
+                worker.note_prefetch_hint_bad();
+                std::fprintf(stderr, "wp-expert-worker: ignoring malformed prefetch hint: %s\n",
+                             error.what());
+            }
+            continue;
+        }
         if (type != PIPE_EXPERT_DISPATCH_REQ) {
             pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME, "expected expert dispatch request");
             return 1;
@@ -3554,6 +3622,9 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             return 1;
         }
     }
+    // Only on a clean close. The harness SIGKILLs workers at teardown, so this
+    // is best effort -- WP_REQ_LOG is the durable record.
+    worker.report_prefetch_hints();
     return 0;
 }
 

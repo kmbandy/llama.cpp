@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pipe-expert-dispatcher.h"
+#include "pipe-hash-oracle.h"
 
 #include <atomic>
 #include <cstddef>
@@ -39,6 +40,39 @@ class graph_dispatcher {
                         int32_t        layer,
                         float          swiglu_clamp);
 
+    // ---- hash-layer prefetch ------------------------------------------------
+    //
+    // Register the host copy of blk.<layer>.ffn_gate_tid2eid. LOAD TIME ONLY --
+    // call before the first decode and never again. See hash_oracle.
+    void register_hash_layer(int32_t         layer,
+                             int32_t         n_expert_used,
+                             int32_t         n_vocab,
+                             const int32_t * data);
+
+    bool   has_hash_oracle()    const { return !oracle_.empty(); }
+    size_t hash_oracle_layers() const { return oracle_.layers().size(); }
+
+    // Drop every registered table, disabling hints. For the loader to call when
+    // it cannot register the WHOLE hash block -- see hash_oracle::clear().
+    void clear_hash_oracle() { oracle_.clear(); }
+
+    // For every registered hash layer, resolve `tokens` to expert ids and offer
+    // them to the workers that will be asked for them. Advisory: sends no
+    // request, awaits nothing, and never throws -- a failed hint costs a page-in
+    // the run was going to pay anyway.
+    //
+    // MUST NOT be called with a dispatch in flight: it writes to the same
+    // sockets. Call it between decodes, not from inside the graph.
+    //
+    // Returns the number of hint frames sent.
+    size_t prefetch_for_tokens(const int32_t * tokens, size_t n_tokens);
+
+    const prefetch_hint_stats & hint_stats() const { return remote.get_prefetch_hint_stats(); }
+
+    // WP_PREFETCH_HINT=1. DEFAULT OFF: this changes what goes on the wire, and a
+    // bare run must stay byte-identical to the config of record.
+    static bool hint_enabled();
+
     size_t n_workers() const;
     bool failed() const noexcept;
     std::string failure_message() const;
@@ -59,6 +93,12 @@ class graph_dispatcher {
                         void *              userdata);
 
     dispatcher                                     remote;
+    // Hash-layer tid2eid tables. Written only by register_hash_layer() at load
+    // time; read-only and reentrant afterwards, which is why it needs no lock.
+    hash_oracle                                    oracle_;
+    // Scratch for prefetch_for_tokens, reused so a per-decode hint costs no
+    // allocation. Not thread safe -- see the "no dispatch in flight" contract.
+    std::vector<int32_t>                           hint_experts_;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
     std::atomic<bool>                              failed_{ false };

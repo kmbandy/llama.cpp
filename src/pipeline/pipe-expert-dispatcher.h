@@ -49,6 +49,32 @@ struct dispatch_stats {
     std::vector<worker_dispatch_stats> workers;
 };
 
+// Cumulative prefetch-hint counters. MECHANISM counters, not outcome ones:
+// they answer "did the spine actually offer work" and nothing more. The outcome
+// lives on the worker (n_pagein / bytes_read), because only the worker knows
+// whether a hinted expert was already resident.
+struct prefetch_hint_stats {
+    // Hint frames handed to the transport.
+    uint64_t n_frames = 0;
+    // Expert ids across those frames (a frame carries >= 1).
+    uint64_t n_experts = 0;
+    // Frames the transport refused. A hint is advisory, so a failed send is
+    // counted and swallowed rather than thrown -- but a nonzero value here means
+    // every measurement in the run is understating what was offered.
+    uint64_t n_send_failed = 0;
+    // Calls that produced nothing because the layer has no tid2eid table.
+    uint64_t n_no_oracle = 0;
+    // Calls skipped because worker choice is not predictable this run
+    // (WP_DISPATCH_STATIC_ASSIGN=0). Hinting the wrong worker costs a read on
+    // the worker that was hinted AND a cold read on the one that was used, so
+    // this path declines rather than guesses.
+    uint64_t n_skipped_dynamic = 0;
+    // Calls declined because a request was still outstanding on the sockets
+    // (WP_DEFER_K > 0). Interleaving a hint there would desynchronise a stream
+    // whose reader matches responses by seq_id.
+    uint64_t n_skipped_in_flight = 0;
+};
+
 // Cumulative expert-deferral mechanism counters (spec section 4).
 struct deferral_stats {
     // Experts placed in the deferred set (cumulative over the process).
@@ -91,6 +117,21 @@ class dispatcher {
                                 const std::vector<float> &                  activations,
                                 const std::vector<pipe_expert_assignment> & assignments,
                                 float                                       swiglu_clamp);
+
+    // Offer `experts` on `layer` to the workers that will actually be asked for
+    // them, as PIPE_EXPERT_PREFETCH_HINT frames. `experts` must be ascending and
+    // unique (what hash_oracle::experts_for produces).
+    //
+    // ADVISORY, NOT A REQUEST. No response is awaited, in_flight is untouched,
+    // and a transport failure is counted rather than thrown -- a dropped hint
+    // costs a page-in the run was going to pay anyway, so it must never be able
+    // to fail a decode. Safe to call between dispatches; never call it while a
+    // request is in flight on the same socket.
+    //
+    // Returns the number of frames sent.
+    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts);
+
+    const prefetch_hint_stats & get_prefetch_hint_stats() const;
 
     int32_t                          n_embd() const;
     int32_t                          n_ff_exp() const;

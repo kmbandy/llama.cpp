@@ -67,6 +67,15 @@ class hash_oracle {
 
     bool empty() const { return tables_.empty(); }
 
+    // Drop every table. The caller that registers a set of layers is the only
+    // one that knows the set is a UNIT: half a hash block registered is worse
+    // than none, because it would hint some layers and silently not others,
+    // and the resulting half-measurement would look like a weak positive.
+    void clear() {
+        tables_.clear();
+        layers_.clear();
+    }
+
     // Layers that have a table, ascending. These are exactly the layers
     // experts_for() can answer for.
     const std::vector<int32_t> & layers() const { return layers_; }

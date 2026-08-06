@@ -38,6 +38,15 @@ bool speed_split_enabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+// WP_DISPATCH_STATIC_ASSIGN -- default ON. See choose_worker for the full
+// reasoning; hoisted out of that function's local static so the prefetch-hint
+// path can ask the same question, because a hint is only safe to send when the
+// worker choice is predictable. ONE definition, so the two can never disagree.
+bool static_assign_enabled() {
+    const char * value = std::getenv("WP_DISPATCH_STATIC_ASSIGN");
+    return value == nullptr || value[0] != '0';
+}
+
 // WP_DISPATCH_UNION=1 -- measurement only, no behaviour change. Logs how many
 // token rows a worker's assignments actually need versus how many it is sent.
 // Read once at startup; a per-request getenv on the dispatch path would itself
@@ -320,6 +329,7 @@ struct dispatcher::impl {
     std::map<std::string, size_t>                       machine_cursor;
     dispatch_stats                                      stats;
     deferral_stats                                      deferral;
+    prefetch_hint_stats                                 hint_stats;
     pending_deferred_batch                              pending_def;
     size_t                                              in_flight     = 0;
     int32_t                                             n_embd        = 0;
@@ -337,6 +347,10 @@ struct dispatcher::impl {
     bool                                                poisoned = false;
     bool                                                collect_stats = false;
     bool                                                speed_split   = false;
+    // WP_DISPATCH_STATIC_ASSIGN, latched once per dispatcher. Read by BOTH
+    // choose_worker and send_prefetch_hints -- one field so a hint can never be
+    // routed by a different rule than the request that follows it.
+    bool                                                static_assign = true;
     bool                                                stats_logging = false;
 
     // Per-request wire log; see accumulate_partial. Off unless WP_DISPATCH_REQ_LOG
@@ -355,7 +369,8 @@ struct dispatcher::impl {
     bool                       window_sample_ok = false;
 
     explicit impl(const std::vector<endpoint> & endpoints) :
-                speed_split(speed_split_enabled()) {
+                speed_split(speed_split_enabled()),
+                static_assign(static_assign_enabled()) {
         stats_logging = dispatch_stats_enabled();
         collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
@@ -551,10 +566,10 @@ struct dispatcher::impl {
         // WP_DISPATCH_STATIC_ASSIGN=0 restores the old load-balancing behaviour --
         // faster in principle (it can prefer a worker that already holds the page)
         // but NOT reproducible. Do not turn it off for any run whose OUTPUT matters.
-        static const bool s_static_assign = [] {
-            const char * e = std::getenv("WP_DISPATCH_STATIC_ASSIGN");
-            return e == nullptr || e[0] != '0';   // default ON
-        }();
+        // Latched per dispatcher at construction, NOT in a function-local static:
+        // the prefetch-hint path asks the same question, and a process-wide
+        // static would let the two answer differently for the same object.
+        const bool s_static_assign = static_assign;
         if (s_static_assign && candidates.size() > 1) {
             // splitmix64 on (layer, expert): deterministic, well-spread, no state.
             uint64_t h = ((uint64_t) (uint32_t) layer << 32) ^ (uint32_t) expert;
@@ -853,6 +868,85 @@ struct dispatcher::impl {
             requests.push_back(std::move(request));
         }
         return requests;
+    }
+
+    // Partition `experts` across the workers that will actually be asked for
+    // them and send one hint frame each. See dispatcher::send_prefetch_hints.
+    size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts) {
+        if (poisoned || experts.empty()) {
+            return 0;
+        }
+        // ENFORCED, not just documented. With WP_DEFER_K > 0 a partial from the
+        // previous layer is still outstanding on one of these sockets, and
+        // interleaving a hint frame ahead of it would desynchronise a stream
+        // whose reader matches responses by seq_id. Declining is free; the hint
+        // was optional.
+        if (in_flight != 0) {
+            ++hint_stats.n_skipped_in_flight;
+            return 0;
+        }
+        const auto route = routes.find(layer);
+        if (route == routes.end()) {
+            ++hint_stats.n_no_oracle;
+            return 0;
+        }
+        // WHY THIS DECLINES INSTEAD OF GUESSING. Under WP_DISPATCH_STATIC_ASSIGN
+        // (default on) choose_worker is a PURE FUNCTION of (layer, expert) -- a
+        // splitmix64 hash with no state -- so the hint can name the exact worker
+        // the dispatch will use. With it off, the choice moves with residency,
+        // in-request counts and a rotating machine cursor, none of which exist
+        // yet at hint time. A wrong guess is not neutral: on this fleet the
+        // 1070, the RX 480 and the CPU worker all advertise experts 0..84 and
+        // the first two READ THE SAME SHARD OFF THE SAME DRIVE, so hinting the
+        // wrong one buys a wasted read AND leaves the real one cold. That is
+        // precisely the read amplification that killed the 2026-07 attempt.
+        if (!static_assign) {
+            ++hint_stats.n_skipped_dynamic;
+            return 0;
+        }
+
+        const std::vector<std::vector<size_t>> & layer_routes = route->second;
+        // assigned_counts is unused under static assignment; pass a zero vector
+        // so the one call site stays identical to the dispatch path's.
+        const std::vector<size_t> no_counts(workers.size(), 0);
+
+        std::vector<std::vector<int32_t>> by_worker(workers.size());
+        for (int32_t expert : experts) {
+            if (expert < 0 || expert >= n_expert) {
+                continue;
+            }
+            const std::vector<size_t> & candidates = layer_routes[(size_t) expert];
+            if (candidates.empty()) {
+                continue;
+            }
+            by_worker[choose_worker(layer, expert, candidates, no_counts)].push_back(expert);
+        }
+
+        size_t sent = 0;
+        for (size_t i = 0; i < by_worker.size(); ++i) {
+            if (by_worker[i].empty()) {
+                continue;
+            }
+            worker & value = workers[i];
+            if (!value.socket) {
+                continue;
+            }
+            pipe_expert_prefetch_hint hint;
+            hint.layer      = layer;
+            hint.expert_ids = std::move(by_worker[i]);   // already ascending: `experts` is
+            const std::vector<uint8_t> payload = pipe_encode_expert_prefetch_hint(hint);
+            // seq_id 0: a hint is never correlated with a response, so it must not
+            // consume an id from the request sequence.
+            if (!pipe_send_frame(*value.socket, PIPE_EXPERT_PREFETCH_HINT, 0,
+                                 payload.data(), payload.size())) {
+                ++hint_stats.n_send_failed;
+                continue;
+            }
+            ++hint_stats.n_frames;
+            hint_stats.n_experts += (uint64_t) hint.expert_ids.size();
+            ++sent;
+        }
+        return sent;
     }
 
     void issue_requests(std::vector<planned_request> & requests, uint64_t seq_id) {
@@ -1420,6 +1514,14 @@ std::vector<float> dispatcher::dispatch(int32_t                                 
                                         const std::vector<pipe_expert_assignment> & assignments,
                                         float                                       swiglu_clamp) {
     return pimpl->dispatch(layer, seq_id, n_tokens, activations, assignments, swiglu_clamp);
+}
+
+size_t dispatcher::send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts) {
+    return pimpl->send_prefetch_hints(layer, experts);
+}
+
+const prefetch_hint_stats & dispatcher::get_prefetch_hint_stats() const {
+    return pimpl->hint_stats;
 }
 
 int32_t dispatcher::n_embd() const {

@@ -62,6 +62,64 @@ class expert_dispatch_decode_scope {
     pipe_expert_dispatcher::graph_dispatcher * dispatcher_;
 };
 
+// Hand the dispatcher a host copy of every hash-layer tid2eid table, so the
+// spine can answer "which experts will this token need on layers 0..H" without a
+// forward pass and without a WeightPager.
+//
+// WHY THIS LIVES HERE AND NOT UNDER THE PAGER. llama.cpp:482 already does this
+// same extraction -- but INSIDE the weight-pager setup, which llama.cpp:107
+// skips entirely when --weight-paging is absent. The spine of the cross-machine
+// layout runs the dense model with no paging at all, so that copy has never once
+// been made on this topology. The lookup does not need a pager; only the
+// expert->page half did, and that half now lives on the workers.
+//
+// Best effort by construction: prefetch is optional, so a table this cannot read
+// must not fail the model load. But it is ALL OR NOTHING -- half a hash block
+// registered would hint some layers and silently skip others, and the resulting
+// half-measurement would read as a weak positive.
+static void register_hash_oracle(const llama_model &                        model,
+                                 pipe_expert_dispatcher::graph_dispatcher & dispatcher) {
+    if (!pipe_expert_dispatcher::graph_dispatcher::hint_enabled()) {
+        return;   // do not pay ~4 MB/layer of host copies for a feature that is off
+    }
+    const uint32_t n_hash = model.hparams.dsv4_hash_layer_count;
+    if (n_hash == 0) {
+        return;   // not a hash-routed model; nothing to register, not an error
+    }
+
+    try {
+        std::vector<int32_t> host;
+        for (uint32_t il = 0; il < n_hash && il < model.layers.size(); ++il) {
+            const ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
+            if (t == nullptr || t->type != GGML_TYPE_I32 ||
+                t->ne[0] <= 0 || t->ne[1] <= 0) {
+                throw std::runtime_error(
+                    "hash layer " + std::to_string(il) + " has no usable tid2eid tensor");
+            }
+            const int32_t n_used  = (int32_t) t->ne[0];
+            const int32_t n_vocab = (int32_t) t->ne[1];
+            const size_t  n       = (size_t) n_used * (size_t) n_vocab;
+            host.resize(n);
+            if (t->buffer != nullptr) {
+                ggml_backend_tensor_get(t, host.data(), 0, n * sizeof(int32_t));
+            } else if (t->data != nullptr) {
+                std::memcpy(host.data(), t->data, n * sizeof(int32_t));
+            } else {
+                throw std::runtime_error(
+                    "hash layer " + std::to_string(il) + " tid2eid tensor has no data");
+            }
+            dispatcher.register_hash_layer((int32_t) il, n_used, n_vocab, host.data());
+        }
+    } catch (const std::exception & e) {
+        dispatcher.clear_hash_oracle();
+        LLAMA_LOG_WARN("%s: hash-layer prefetch oracle disabled: %s\n", __func__, e.what());
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: hash-layer prefetch oracle ready: %zu layer(s)\n",
+                   __func__, dispatcher.hash_oracle_layers());
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -161,6 +219,7 @@ llama_context::llama_context(
                 last_no_defer));
             expert_dispatch = expert_dispatch_owned.get();
             LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
+            register_hash_oracle(model, *expert_dispatch_owned);
         }
     }
 
@@ -2039,6 +2098,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
+        }
+
+        // Hash-layer prefetch hint, before the graph runs. Off unless
+        // WP_PREFETCH_HINT=1; a no-op without an oracle.
+        //
+        // HERE because this is the last point where the ubatch's token ids are
+        // known and NOTHING has been dispatched yet. The lead time bought is the
+        // spine's embedding + layer-0 attention, which for a 2048-token prefill
+        // ubatch is real work, and layers 1 and 2 get progressively more. That
+        // lead time is the entire reason to expect a different outcome from the
+        // 2026-07 attempt, which predicted within the token being decoded and
+        // could not cover a ~5 ms cold read.
+        //
+        // ubatch.token is null for an embedding-input batch; tid2eid is a TOKEN
+        // ID table, so there is simply nothing to look up and nothing to send.
+        if (expert_dispatch != nullptr && ubatch.token != nullptr) {
+            expert_dispatch->prefetch_for_tokens(ubatch.token, ubatch.n_tokens);
         }
 
         ggml_status status;

@@ -29,6 +29,7 @@
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -577,6 +578,10 @@ struct selection_server {
     std::exception_ptr error;
     std::promise<void> ready;
     std::vector<int32_t> assigned_experts;
+    // Experts this worker was HINTED, in arrival order. Written on the server
+    // thread, read only after finish() joins it.
+    std::vector<int32_t> hinted_experts;
+    size_t               hint_frames = 0;
 
     selection_server(int delay_ms, int32_t expert_first, int32_t expert_last, uint32_t n_slots,
                      int per_expert_delay_ms = 0) :
@@ -628,6 +633,17 @@ struct selection_server {
                         "selection server failed to acknowledge HELLO");
 
                 while (pipe_recv_frame(*client, type, seq_id, payload)) {
+                    if (type == PIPE_EXPERT_PREFETCH_HINT) {
+                        const pipe_expert_prefetch_hint hint =
+                            pipe_decode_expert_prefetch_hint(payload.data(), payload.size());
+                        require(hint.layer == LAYER, "prefetch hint carried the wrong layer");
+                        // A hint gets NO reply. Answering one would desynchronise
+                        // the stream, so the silence is part of the contract.
+                        ++hint_frames;
+                        hinted_experts.insert(hinted_experts.end(),
+                                              hint.expert_ids.begin(), hint.expert_ids.end());
+                        continue;
+                    }
                     require(type == PIPE_EXPERT_DISPATCH_REQ,
                             "selection server expected expert dispatch");
                     const pipe_expert_dispatch_req request =
@@ -710,6 +726,128 @@ bool contains_expert(const selection_server & server, int32_t expert) {
 size_t count_experts_in_range(const selection_server & server, int32_t first, int32_t last) {
     return (size_t) std::count_if(server.assigned_experts.begin(), server.assigned_experts.end(),
                                   [=](int32_t expert) { return expert >= first && expert <= last; });
+}
+
+// PIPE_EXPERT_PREFETCH_HINT reaches the worker that owns each expert, as a real
+// frame over a real socket. A same-process call would not prove any of this.
+void test_prefetch_hint_routing() {
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "1", 1) == 0, "failed to force static assignment");
+    selection_server low(0, 0, 74, 150);
+    selection_server high(0, 75, 150, 150);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", low.port, "low-machine" },
+            { "127.0.0.1", high.port, "high-machine" },
+        });
+        const size_t sent = dispatcher.send_prefetch_hints(LAYER, { 0, 5, 80, 149 });
+        require(sent == 2, "prefetch hint did not reach both owning workers");
+
+        const pipe_expert_dispatcher::prefetch_hint_stats & stats =
+            dispatcher.get_prefetch_hint_stats();
+        require(stats.n_frames == 2, "prefetch hint frame count is wrong");
+        require(stats.n_experts == 4, "prefetch hint expert count is wrong");
+        require(stats.n_send_failed == 0, "a prefetch hint frame failed to send");
+        // A hint must not enter the request accounting: nothing is awaited, so a
+        // hint that incremented in_flight would deadlock the next real wait.
+        require(dispatcher.in_flight_requests() == 0, "a prefetch hint was counted as in flight");
+
+        // An unroutable layer is declined, not sent somewhere convenient.
+        require(dispatcher.send_prefetch_hints(LAYER + 999, { 0 }) == 0,
+                "prefetch hint was sent for a layer no worker serves");
+        require(dispatcher.get_prefetch_hint_stats().n_no_oracle == 1,
+                "declined prefetch hint was not counted");
+    }
+    low.finish();
+    high.finish();
+    require(low.hint_frames == 1 && high.hint_frames == 1,
+            "each owning worker should have received exactly one hint frame");
+    require((low.hinted_experts == std::vector<int32_t>{ 0, 5 }),
+            "low-range worker did not receive exactly its own experts, ascending");
+    require((high.hinted_experts == std::vector<int32_t>{ 80, 149 }),
+            "high-range worker did not receive exactly its own experts, ascending");
+    // The hint must not disturb the request stream in either direction.
+    require(low.assigned_experts.empty() && high.assigned_experts.empty(),
+            "a prefetch hint was mistaken for a dispatch request");
+}
+
+// THE READ-AMPLIFICATION GUARD, and the single most important property here.
+// On this fleet the 1070 and the RX 480 both advertise experts 0..84 and READ
+// THE SAME SHARD OFF THE SAME DRIVE. Hinting an expert to both would double the
+// I/O for that range -- exactly the pool pollution that made the 2026-07
+// cross-layer attempt cost 2.7-3.1x the bytes. Every expert goes to exactly one
+// worker, and it is the one the dispatch will actually choose.
+void test_prefetch_hint_never_duplicates_across_sharing_workers() {
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "1", 1) == 0, "failed to force static assignment");
+    selection_server first(0, 0, 150, 150);
+    selection_server second(0, 0, 150, 150);
+    std::vector<int32_t> all;
+    for (int32_t expert = 0; expert < 151; ++expert) {
+        all.push_back(expert);
+    }
+    std::vector<pipe_expert_assignment> assignments;
+    for (int32_t expert : all) {
+        pipe_expert_assignment assignment;
+        assignment.expert_id = expert;
+        assignment.weights.assign(N_TOKENS, 0.0f);
+        assignments.push_back(std::move(assignment));
+    }
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", first.port, "shared-machine" },
+            { "127.0.0.1", second.port, "shared-machine" },
+        });
+        require(dispatcher.send_prefetch_hints(LAYER, all) == 2,
+                "both sharing workers should have been hinted a share");
+        // Then dispatch the same expert set and compare. Static assignment makes
+        // choose_worker a pure function of (layer, expert), so the hint is not
+        // merely non-overlapping -- it is the SAME partition the request uses.
+        // Anything less and a hinted read lands on the wrong card.
+        dispatcher.dispatch(LAYER, 7, N_TOKENS,
+                            std::vector<float>((size_t) N_TOKENS * N_EMBD, 0.0f),
+                            assignments, TEST_SWIGLU_CLAMP);
+    }
+    first.finish();
+    second.finish();
+
+    require(first.hinted_experts.size() + second.hinted_experts.size() == all.size(),
+            "the hinted experts did not exactly partition the requested set");
+    std::set<int32_t> union_hinted(first.hinted_experts.begin(), first.hinted_experts.end());
+    for (int32_t expert : second.hinted_experts) {
+        require(union_hinted.insert(expert).second,
+                "an expert was hinted to BOTH sharing workers -- that is a doubled read");
+    }
+    require(union_hinted.size() == all.size(), "the hint did not cover every requested expert");
+
+    require(first.hinted_experts == first.assigned_experts,
+            "worker 1's hint did not match the partition the dispatch actually used");
+    require(second.hinted_experts == second.assigned_experts,
+            "worker 2's hint did not match the partition the dispatch actually used");
+}
+
+// With WP_DISPATCH_STATIC_ASSIGN=0 the worker choice depends on live residency
+// and a rotating cursor, none of which exist at hint time. A guess would cost a
+// wasted read AND leave the real worker cold, so the hint declines outright.
+void test_prefetch_hint_declines_when_choice_is_unpredictable() {
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "0", 1) == 0, "failed to disable static assignment");
+    selection_server first(0, 0, 150, 150);
+    selection_server second(0, 0, 150, 150);
+    {
+        pipe_expert_dispatcher::dispatcher dispatcher({
+            { "127.0.0.1", first.port, "shared-machine" },
+            { "127.0.0.1", second.port, "shared-machine" },
+        });
+        require(dispatcher.send_prefetch_hints(LAYER, { 0, 5, 80 }) == 0,
+                "prefetch hint guessed a worker under dynamic assignment");
+        require(dispatcher.get_prefetch_hint_stats().n_skipped_dynamic == 1,
+                "declined prefetch hint was not counted as a dynamic skip");
+        require(dispatcher.get_prefetch_hint_stats().n_frames == 0,
+                "a frame was sent despite declining");
+    }
+    first.finish();
+    second.finish();
+    require(first.hint_frames == 0 && second.hint_frames == 0,
+            "a hint reached a worker under dynamic assignment");
+    require(setenv("WP_DISPATCH_STATIC_ASSIGN", "1", 1) == 0, "failed to restore static assignment");
 }
 
 void test_speed_split_equal_costs() {
@@ -948,6 +1086,15 @@ void test_graph_local_failure_short_circuit() {
 void run_test() {
     require(setenv("WP_DISPATCH_STATS", "1", 1) == 0, "failed to enable dispatch stats");
     require(unsetenv("WP_DISPATCH_SPEED_SPLIT") == 0, "failed to disable speed-aware dispatch");
+    // FIRST, deliberately. run_test() aborts on the first failure, and the
+    // speed-split group below currently fails on this machine for reasons that
+    // predate the prefetch work (see the note on
+    // test_speed_split_unequal_costs). Anything ordered after it is not "passing"
+    // -- it is unreached, which reads the same in a green/red summary.
+    test_prefetch_hint_routing();
+    test_prefetch_hint_never_duplicates_across_sharing_workers();
+    test_prefetch_hint_declines_when_choice_is_unpredictable();
+    std::cout << "prefetch hint: routing, no-duplication and decline checks passed\n";
     test_speed_split_equal_costs();
     test_speed_split_unequal_costs();
     test_speed_split_residency_precedence();
