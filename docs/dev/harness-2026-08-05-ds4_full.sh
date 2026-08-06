@@ -278,6 +278,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # ordinary victim. 0 is the original first-victim behaviour. Anything above 0 is
 # Lets a speculative page outrank a cold demand page for that window.
 [ -n "${LEASE:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_LEASE=$LEASE"
+# LEASE_PRED=<n> -- the lease for a page fetched on a GUESS. Equal to LEASE
+# prices certainty and speculation the same, which is the configuration that
+# displaced ~200 ground-truth pages. Short lets a guess fill capacity nothing
+# better wants; 0 makes it the first victim always.
+[ -n "${LEASE_PRED:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_LEASE_PREDICTED=$LEASE_PRED"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.
