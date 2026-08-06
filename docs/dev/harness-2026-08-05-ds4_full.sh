@@ -235,10 +235,12 @@ KEEPALIVE=${KEEPALIVE:-100}
 # nemotron embedder and llama-router (LIVE FLEET SERVICES) plus THREE workers,
 # so its budget is deliberately small: 3 x 1 GB = 3 GB of ~8 GB available.
 # Raise HOSTVICTIM_2026 only after checking `free -g` on that box.
-# mad-lab-main's RAM was not verified when this was written -- 4 GB is a
-# placeholder, and HOSTVICTIM_MAIN should be re-set once it is known.
+# mad-lab-main gets 6 GiB (kmbandy, 2026-08-05). That box also runs the spine
+# (~13.5 GB of compute buffer at UBATCH=2048), the CPU DSpark worker and a
+# desktop, so this is a budget set by the owner rather than derived from a
+# reading -- `free -g` was not reachable from the session that wrote this.
 HOSTVICTIM_2026=${HOSTVICTIM_2026:-1073741824}   # 1 GiB per 2026 worker
-HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-4294967296}   # 4 GiB, R9700 -- VERIFY main's RAM
+HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-6442450944}   # 6 GiB, R9700
 # ---------------------------------------------------------------------------
 # PREFETCH (2026-08-05). Both default OFF: a bare run must stay the config of
 # record. See docs/dev/2026-08-05-prefetch-brief.md.
