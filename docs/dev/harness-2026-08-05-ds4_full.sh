@@ -17,7 +17,10 @@
 # FLEET SERVICES. Only ever kill by the PIDs this script itself started.
 set -uo pipefail
 
-MAIN_REPO=/home/kmbandy/GitHub/llama.cpp
+# Overridable so an A/B can point two arms at two CHECKOUTS while running the
+# SAME harness script. That is the only way to compare binaries across commits
+# without also changing the harness, which has itself changed a lot today.
+MAIN_REPO=${MAIN_REPO:-/home/kmbandy/GitHub/llama.cpp}
 ES_MAIN=/home/kmbandy/models/DS4-eshard-main
 ES_2026=/mnt/nvme/models/DS4-eshard
 # 2026-08-02: the experts-0..84 shard carved by layer, so the DSpark stages
