@@ -1,5 +1,12 @@
 # DSpark-driven expert prefetch — pickup brief
 
+> **SUPERSEDED for state and next actions by
+> [`2026-08-06-prefetch-morning-brief.md`](2026-08-06-prefetch-morning-brief.md).**
+> The work described here as "to build" was built the same night and arm 1 has
+> run. What remains live in THIS document is the *reasoning*: why the previous
+> attempts failed (§4), why DSpark is different (§5), and the kill criteria (§6,
+> as amended). Read this for why; read the morning brief for where things stand.
+
 **Written 2026-08-05 evening, immediately before starting the work.** Everything
 below is measured on this fleet unless it says otherwise.
 
