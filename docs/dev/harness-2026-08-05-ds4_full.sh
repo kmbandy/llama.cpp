@@ -546,6 +546,31 @@ mkdir -p "$OUT"; ssh mad-lab-main "mkdir -p $OUT"
 # up front makes the gate's evidence unambiguous: the line can only come from
 # this run.
 rm -f "$OUT"/w-*.log; ssh mad-lab-main "rm -f $OUT/w-*.log"
+
+# WAIT FOR THE WORKER PORTS TO BE **FREE** BEFORE LAUNCHING ANYTHING.
+#
+# The readiness gate below asks "is something listening on 8803". Between two
+# back-to-back arms the answer is YES for the PREVIOUS arm's worker, which has
+# been signalled but not yet exited. The gate passes on it, the old worker then
+# dies, and the spine connects to a now-empty port and is REFUSED -- 0.13 s into
+# its life, which is why it always looked like a startup race rather than a
+# teardown one. It only bites when arms run back to back, which is exactly what
+# a sweep does and what a single manual run never did.
+echo "=== waiting for worker ports to be free ==="
+for _ in $(seq 1 120); do
+    busy=0
+    for prt in 8801 8802; do
+        n=$(ssh mad-lab-main "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)
+        [ "${n:-0}" -ge 1 ] && busy=1
+    done
+    for prt in 8803 8804 8805; do
+        [ "$(ss -ltn 2>/dev/null | grep -c ":$prt ")" -ge 1 ] && busy=1
+    done
+    [ "$busy" -eq 0 ] && break
+    sleep 1
+done
+[ "$busy" -eq 0 ] || { echo "*** WORKER PORTS STILL HELD after 120s -- aborting arm ***"; exit 1; }
+echo "  ports clear"
 LOCAL_PIDS=""
 
 remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
