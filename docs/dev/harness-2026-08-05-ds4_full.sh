@@ -901,7 +901,11 @@ if [ -n "${SPEC:-}" ]; then
     [ -n "${SPEC_PMIN:-}" ] && SPECARGS="$SPECARGS --spec-draft-p-min $SPEC_PMIN"
     [ -n "${SPEC_CONF:-}" ] && SPECARGS="$SPECARGS --spec-draft-conf-min $SPEC_CONF"
     [ -n "${SPEC_NMAX:-}" ] && SPECARGS="$SPECARGS --spec-draft-n-max $SPEC_NMAX"
-    echo "  SPEC ON: $SPECARGS  (unset knobs = DSpark defaults, conf_min=0.9 active)"
+    # The parenthetical used to claim "conf_min=0.9 active" -- stale from before
+    # the 2026-08-05 record change to 0.99, and it misled a session into
+    # misreporting every arm's gate. Print ONLY what is actually passed; the
+    # spine's speculative.cpp startup WARN is the authority on effective values.
+    echo "  SPEC ON: $SPECARGS  (knobs not shown ride DSpark's built-in defaults)"
 fi
 
 # SELF-PROVING CONFIG LINE. 2026-08-03: an A/B produced a turbo4 arm whose
