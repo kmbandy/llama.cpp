@@ -2507,6 +2507,20 @@ private:
                 shared.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
             result->last = is_last;
             if (is_last) {
+                // *** RELEASE THE PAGE'S LEASE PIN. THIS IS THE sp1/sp1r DEADLOCK
+                // FIX. *** PageShared holds a shared_ptr copy of the lease; left
+                // in place it pins the staging buffer until the BATCH is
+                // destroyed, and a prefill batch (~31 page-ins) pins more pages
+                // than the pool has buffers (16) -- the readers exhaust the pool
+                // and block in borrow() forever while the dispatch thread waits
+                // for results that can never be read. Resetting here leaves only
+                // the in-flight ReadResults holding the buffer, which is exactly
+                // the serial path's lifetime: the buffer recycles as soon as the
+                // page's stripes drain.
+                std::lock_guard<std::mutex> lock(shared.lease_mutex);
+                shared.lease.reset();
+            }
+            if (is_last) {
                 if (result->error == nullptr &&
                     shared.failed.load(std::memory_order_acquire)) {
                     // Another stripe of this page failed; the page must not
