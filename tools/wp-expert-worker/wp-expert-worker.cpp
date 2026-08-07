@@ -2056,6 +2056,10 @@ public:
     // answer is no and the caller must keep it on the VRAM path.
     bool host_landing_available() const { return host_victim_enabled_; }
 
+    // Demand-serving gate for preemptible landings. Cheap enough to set
+    // unconditionally; only consulted when WP_EXPERT_SPEC_PREEMPT=1.
+    void demand_serving(bool v) { demand_serving_.store(v, std::memory_order_relaxed); }
+
     // *** LAND A GUESS IN HOST RAM, NOT IN VRAM. ***
     //
     // A predicted page in a VRAM slot is a slot a CERTAIN page cannot have, and
@@ -2109,8 +2113,25 @@ public:
                     if (test_hooks_ != nullptr && test_hooks_->read_started) {
                         test_hooks_->read_started(page->layer, page->expert);
                     }
-                    read_page_range(*page, fd, (char *) lease.get(),
-                                    0, (size_t) page->size);
+                    if (spec_preempt_) {
+                        // Preemptible: slice the read and yield to demand
+                        // between slices. A page abandoned mid-read is fine --
+                        // the tier store below never sees it, and the partial
+                        // work cost only idle bandwidth.
+                        size_t off = 0;
+                        while (off < (size_t) page->size) {
+                            while (demand_serving_.load(std::memory_order_relaxed)) {
+                                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                            }
+                            const size_t n =
+                                std::min(spec_subread_, (size_t) page->size - off);
+                            read_page_range(*page, fd, (char *) lease.get() + off, off, n);
+                            off += n;
+                        }
+                    } else {
+                        read_page_range(*page, fd, (char *) lease.get(),
+                                        0, (size_t) page->size);
+                    }
                     if (test_hooks_ != nullptr && test_hooks_->read_finished) {
                         test_hooks_->read_finished(page->layer, page->expert);
                     }
@@ -2877,6 +2898,26 @@ private:
     std::vector<uint64_t>           spec_leases_;
     std::thread                     host_thread_;
     std::atomic<size_t>             host_pending_{0};
+    // WP_EXPERT_SPEC_PREEMPT=1 -- host landings become PREEMPTIBLE: the landing
+    // thread reads each page in WP_EXPERT_SPEC_SUBREAD-byte slices (default
+    // 1 MiB) and pauses between slices whenever a demand request is being
+    // served. Bounds the worst-case delay a demand read inherits from an
+    // in-flight speculative read to one slice (~0.2 ms at 1 MiB on this
+    // hardware) instead of a whole 12.75 MB page (~2-4 ms) -- which is what
+    // makes it safe to raise hint volume enough to actually pack the drive's
+    // idle 60-70% (kmbandy's framing, 2026-08-07). DEFAULT OFF.
+    const bool spec_preempt_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREEMPT");
+        return e != nullptr && e[0] == '1';
+    }();
+    const size_t spec_subread_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_SUBREAD");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v > 0 ? (size_t) v : (size_t) (1u << 20);
+    }();
+    // True while Worker::dispatch is serving a request. Written by the dispatch
+    // thread, read by the host landing thread between slices.
+    std::atomic<bool>               demand_serving_{false};
     std::atomic<uint64_t>           host_landed_{0};
     std::atomic<uint64_t>           host_bytes_{0};
     std::atomic<uint64_t>           host_errors_{0};
@@ -3352,6 +3393,14 @@ public:
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats) {
         spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
+        // Raise the demand gate for the whole request; preemptible landings
+        // pause between slices while it is up. RAII so every exit (including
+        // the protocol throws below) lowers it.
+        pool_.demand_serving(true);
+        struct DemandGate {
+            ExpertSlotPool & pool;
+            ~DemandGate() { pool.demand_serving(false); }
+        } demand_gate{ pool_ };
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
             throw pipe_protocol_error(
                 PIPE_ERR_EXPERT_LAYER,

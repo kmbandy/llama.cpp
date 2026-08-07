@@ -307,6 +307,12 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # was prefill-shaped (n_tokens>1). Prefill spec LATE is 84-100% = pure drive
 # contention; the gate reopens on the first decode-shaped request.
 [ -n "${PREFILL_GATE:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREFILL_GATE=$PREFILL_GATE"
+# PREEMPT=1 -- host landings read in 1 MiB slices and pause while a demand
+# request is being served: bounds spec-vs-demand collision to ~0.2 ms/slice,
+# which is what makes RAISING hint volume safe (pack the idle drive).
+# SUBREAD=<bytes> overrides the slice size.
+[ -n "${PREEMPT:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREEMPT=$PREEMPT"
+[ -n "${SUBREAD:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_SUBREAD=$SUBREAD"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.
