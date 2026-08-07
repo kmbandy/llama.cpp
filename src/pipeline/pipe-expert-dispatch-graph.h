@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,37 @@ class graph_dispatcher {
     // bare run must stay byte-identical to the config of record.
     static bool hint_enabled();
 
+    // ---- cross-layer predicted prefetch -------------------------------------
+    //
+    // Register a host f32 copy of blk.<layer>.ffn_gate_inp (w, [n_expert rows x
+    // n_embd], the layer's router) and blk.<layer>.ffn_exp_probs_b (b,
+    // [n_expert]). LOAD TIME ONLY, same contract as register_hash_layer. The
+    // dims must match the dispatcher's n_embd/n_expert or the call throws.
+    void register_router_layer(int32_t layer, int32_t n_expert, int32_t n_embd,
+                               const float * w, const float * b);
+
+    bool   has_router_oracle()    const { return !routers_.empty(); }
+    size_t router_oracle_layers() const { return routers_.size(); }
+
+    // Drop every registered router, disabling predicted hints. All or nothing,
+    // for the same reason as clear_hash_oracle().
+    void clear_router_oracle() { routers_.clear(); }
+
+    // WP_PREDICT_AHEAD=k (default 0 = off): at layer L, apply layer L+k's
+    // router to L's dispatch activations and hint the union of each token's
+    // top-M experts with PREDICTED provenance -- a constant k-layer lead for
+    // every hinted layer at one router GEMM per dispatched layer. The
+    // approximation error is the h_L -> h_{L+k} drift (measured 2026-07-19:
+    // rank-1 0.973 at k=1); k>=2 decay is measured from WP_PREDICT_CAPTURE.
+    static int predict_ahead();
+    // WP_PREDICT_TOPM=m (default 3, clamp 1..8): experts kept per token.
+    static int predict_topm();
+    // WP_PREDICT_MAX_TOKENS=n (default 16): skip prediction AND capture for
+    // wider batches. This is the prefill gate -- speculative reads during the
+    // prefill sweep are pure contention (LATE 84-100%), and a 2048-row router
+    // GEMM per layer is not free either.
+    static int predict_max_tokens();
+
     size_t n_workers() const;
     bool failed() const noexcept;
     std::string failure_message() const;
@@ -86,7 +118,29 @@ class graph_dispatcher {
   private:
     struct op_context;
 
+    struct router_layer {
+        std::vector<float> w;   // [n_expert][n_embd], expert-major
+        std::vector<float> b;   // [n_expert]
+    };
+
     void latch_failure(const char * message) noexcept;
+
+    // Compute and send the PREDICTED hint for layer+predict_ahead() from this
+    // layer's dispatch activations. Called from compute() BEFORE dispatch, on
+    // the dispatch thread, where in_flight == 0 (WP_DEFER_K=0; with deferral on,
+    // send_prefetch_hints declines and counts it). Never throws: a hint carries
+    // no correctness weight, so no predictor failure may latch the dispatcher.
+    void emit_predicted_hints(int32_t layer, const std::vector<float> & activations,
+                              int64_t n_tokens) noexcept;
+
+    // WP_PREDICT_CAPTURE=<prefix>: append (layer, h, selected experts) records
+    // to <prefix>.<pid>.bin -- the dispatch-path routing capture that replaces
+    // the pager-only WP_CAPTURE_ROUTING (whose file a GLM run overwrote; the
+    // pid suffix is the fopen("w") lesson). Never throws.
+    void capture_routing(const char * prefix, int32_t layer,
+                         const std::vector<float> & activations,
+                         const ggml_tensor * selected_experts,
+                         int64_t n_tokens, int64_t n_expert_used) noexcept;
 
     static void compute(ggml_tensor *       dst,
                         const ggml_tensor * activations,
@@ -112,6 +166,19 @@ class graph_dispatcher {
     // repeat is skipped and one prefetch opportunity is lost. Strictly fewer
     // frames, never more reads.
     std::map<int32_t, std::vector<int32_t>>        last_hint_;
+    // Router weights for predicted hints. Written only by register_router_layer()
+    // at load time; read-only afterwards (same no-lock rationale as oracle_).
+    std::map<int32_t, router_layer>                routers_;
+    // Last PREDICTED set sent per target layer -- same repeat-suppression
+    // trade-off as last_hint_, kept separate because the sets never coincide
+    // with the hash-layer CERTAIN ones.
+    std::map<int32_t, std::vector<int32_t>>        last_pred_hint_;
+    // Scratch for emit_predicted_hints, reused across layers. Only touched on
+    // the dispatch thread.
+    std::vector<float>                             pred_scores_;
+    std::vector<int32_t>                           pred_union_;
+    // WP_PREDICT_CAPTURE stream; opened on first record, closed in the dtor.
+    FILE *                                         capture_file_ = nullptr;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
     std::map<int32_t, std::unique_ptr<op_context>> op_contexts;
     std::atomic<bool>                              failed_{ false };

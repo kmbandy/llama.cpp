@@ -314,6 +314,20 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 [ -n "${PREDICT_N:-}" ] && SPINEENV="${SPINEENV:-} WP_SPEC_PREDICT_N=$PREDICT_N"
 [ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
+# PRED_AHEAD=k -- cross-layer predicted hints: at layer L the spine applies layer
+# L+k's router to L's dispatch activations and hints each token's top-M union
+# with PREDICTED provenance (constant k-layer lead, one router GEMM per layer).
+# Spine-side; pair with SPEC_HOST=1 so mispredicts cost bandwidth, not VRAM
+# slots. NOT the older PREDICT/PREDICT_N knobs above, which gate the
+# draft-block token hint in common/speculative.cpp.
+[ -n "${PRED_AHEAD:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_AHEAD=$PRED_AHEAD"
+# PRED_TOPM=m -- experts kept per token before the union (default 3).
+[ -n "${PRED_TOPM:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_TOPM=$PRED_TOPM"
+# PRED_CAPTURE=1 -- dump (layer, h, selected experts) per decode dispatch to
+# $OUT/routing-capture.<pid>.bin on the spine (main). The dispatch-path capture
+# that replaces the pager-only WP_CAPTURE_ROUTING; feeds the k=2..4 precision
+# decay measurement. Decode-shaped batches only (same gate as prediction).
+[ -n "${PRED_CAPTURE:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_CAPTURE=$OUT/routing-capture"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
 # rejection. Say so at launch rather than after a wasted run.
 if [ -n "$SPEC_PAGEIN" ] && [ -z "$PREFETCH_HINT" ]; then

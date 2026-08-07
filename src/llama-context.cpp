@@ -120,6 +120,77 @@ static void register_hash_oracle(const llama_model &                        mode
                    __func__, dispatcher.hash_oracle_layers());
 }
 
+// Hand the dispatcher a host f32 copy of every routed layer's router
+// (ffn_gate_inp + exp_probs_b) so the spine can score layer L+k's routing from
+// layer L's dispatch activations without a forward pass -- the cross-layer
+// predicted-hint oracle. ~4 MB/layer of host copies, so gated on
+// WP_PREDICT_AHEAD > 0 actually asking for it.
+//
+// Same all-or-nothing contract as the hash oracle: half a router block would
+// hint some layers and silently skip others, and the half-measurement would
+// read as a weak positive.
+static void register_router_oracle(const llama_model &                        model,
+                                   pipe_expert_dispatcher::graph_dispatcher & dispatcher) {
+    if (pipe_expert_dispatcher::graph_dispatcher::predict_ahead() <= 0) {
+        return;   // do not pay the host copies for a feature that is off
+    }
+    const uint32_t n_hash   = model.hparams.dsv4_hash_layer_count;
+    const uint32_t n_layer  = model.hparams.n_layer();
+    const int32_t  n_embd   = (int32_t) model.hparams.n_embd;
+    const int32_t  n_expert = (int32_t) model.hparams.n_expert;
+    try {
+        std::vector<uint8_t> raw;
+        std::vector<float>   w_host;
+        std::vector<float>   b_host;
+        const auto to_f32 = [&raw](const ggml_tensor * t, size_t n, std::vector<float> & out) {
+            out.resize(n);
+            const size_t bytes = ggml_nbytes(t);
+            raw.resize(bytes);
+            if (t->buffer != nullptr) {
+                ggml_backend_tensor_get(t, raw.data(), 0, bytes);
+            } else if (t->data != nullptr) {
+                std::memcpy(raw.data(), t->data, bytes);
+            } else {
+                throw std::runtime_error(std::string(t->name) + " has no data");
+            }
+            if (t->type == GGML_TYPE_F32) {
+                std::memcpy(out.data(), raw.data(), n * sizeof(float));
+                return;
+            }
+            const auto * traits = ggml_get_type_traits(t->type);
+            if (traits == nullptr || traits->to_float == nullptr) {
+                throw std::runtime_error(std::string(t->name) + " has no f32 conversion");
+            }
+            traits->to_float(raw.data(), out.data(), (int64_t) n);
+        };
+        // Main-stack layers only: n_layer excludes the NextN/MTP block, whose
+        // router must never be scored as a lookahead target. Hash layers keep
+        // their exact tid2eid hints; they are lookahead SOURCES, not targets,
+        // so their routers are not needed here.
+        for (uint32_t il = n_hash; il < n_layer && il < model.layers.size(); ++il) {
+            const ggml_tensor * w = model.layers[il].ffn_gate_inp;
+            const ggml_tensor * b = model.layers[il].ffn_exp_probs_b;
+            if (w == nullptr || b == nullptr ||
+                w->ne[0] != n_embd || w->ne[1] != n_expert || b->ne[0] != n_expert) {
+                throw std::runtime_error(
+                    "layer " + std::to_string(il) + " has no usable router tensors");
+            }
+            to_f32(w, (size_t) n_embd * (size_t) n_expert, w_host);
+            to_f32(b, (size_t) n_expert, b_host);
+            dispatcher.register_router_layer((int32_t) il, n_expert, n_embd,
+                                             w_host.data(), b_host.data());
+        }
+    } catch (const std::exception & e) {
+        dispatcher.clear_router_oracle();
+        LLAMA_LOG_WARN("%s: cross-layer router oracle disabled: %s\n", __func__, e.what());
+        return;
+    }
+    LLAMA_LOG_INFO("%s: cross-layer router oracle ready: %zu layer(s), lookahead +%d, top-%d\n",
+                   __func__, dispatcher.router_oracle_layers(),
+                   pipe_expert_dispatcher::graph_dispatcher::predict_ahead(),
+                   pipe_expert_dispatcher::graph_dispatcher::predict_topm());
+}
+
 int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens,
                                         int n_certain) {
     if (expert_dispatch == nullptr || tokens == nullptr || n_tokens <= 0) {
@@ -242,6 +313,7 @@ llama_context::llama_context(
             expert_dispatch = expert_dispatch_owned.get();
             LLAMA_LOG_INFO("%s: connected %zu expert workers\n", __func__, expert_dispatch->n_workers());
             register_hash_oracle(model, *expert_dispatch_owned);
+            register_router_oracle(model, *expert_dispatch_owned);
         }
     }
 

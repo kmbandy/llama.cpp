@@ -7,13 +7,18 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <vector>
+
+#include <unistd.h>
 
 namespace pipe_expert_dispatcher {
 namespace {
@@ -114,6 +119,10 @@ graph_dispatcher::~graph_dispatcher() {
     } catch (...) {
         // Destructor must not throw; workers will drop on socket close.
     }
+    if (capture_file_ != nullptr) {
+        std::fclose(capture_file_);
+        capture_file_ = nullptr;
+    }
 }
 
 ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
@@ -205,6 +214,140 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
         }
     }
     return sent;
+}
+
+int graph_dispatcher::predict_ahead() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_PREDICT_AHEAD");
+        if (v == nullptr || v[0] == '\0') {
+            return 0;
+        }
+        return std::max(0, std::atoi(v));
+    }();
+    return value;
+}
+
+int graph_dispatcher::predict_topm() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_PREDICT_TOPM");
+        if (v == nullptr || v[0] == '\0') {
+            return 3;
+        }
+        return std::min(8, std::max(1, std::atoi(v)));
+    }();
+    return value;
+}
+
+int graph_dispatcher::predict_max_tokens() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_PREDICT_MAX_TOKENS");
+        if (v == nullptr || v[0] == '\0') {
+            return 16;
+        }
+        return std::max(1, std::atoi(v));
+    }();
+    return value;
+}
+
+void graph_dispatcher::register_router_layer(int32_t layer, int32_t n_expert, int32_t n_embd,
+                                             const float * w, const float * b) {
+    if (n_expert != remote.n_expert() || n_embd != remote.n_embd()) {
+        throw std::invalid_argument("router layer dims do not match the dispatcher");
+    }
+    if (w == nullptr || b == nullptr) {
+        throw std::invalid_argument("router layer registered without weights");
+    }
+    router_layer & rl = routers_[layer];
+    rl.w.assign(w, w + (size_t) n_expert * (size_t) n_embd);
+    rl.b.assign(b, b + (size_t) n_expert);
+}
+
+void graph_dispatcher::emit_predicted_hints(int32_t layer, const std::vector<float> & activations,
+                                            int64_t n_tokens) noexcept {
+    // Never throws past this frame: a hint carries no correctness weight, so no
+    // failure here may latch the dispatcher (compute()'s catch would).
+    try {
+        const int k = predict_ahead();
+        if (k <= 0 || n_tokens <= 0 || n_tokens > predict_max_tokens()) {
+            return;
+        }
+        const auto it = routers_.find(layer + k);
+        if (it == routers_.end()) {
+            return;   // past the last layer, or the oracle was cleared
+        }
+        const router_layer & rl       = it->second;
+        const int32_t        n_expert = remote.n_expert();
+        const int32_t        n_embd   = remote.n_embd();
+        const int            top_m    = predict_topm();
+
+        // DS4 routing on the CPU, replicating build_moe_ffn's SQRT_SOFTPLUS
+        // branch: probs = sqrt(softplus(W @ h)); selection score = probs +
+        // exp_probs_b. No expert groups and no gate bias on this arch.
+        std::set<int32_t> unioned;
+        pred_scores_.resize((size_t) n_expert);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            const float * h = activations.data() + (size_t) token * (size_t) n_embd;
+            for (int32_t e = 0; e < n_expert; ++e) {
+                const float * row = rl.w.data() + (size_t) e * (size_t) n_embd;
+                float acc = 0.0f;
+                for (int32_t i = 0; i < n_embd; ++i) {
+                    acc += row[i] * h[i];
+                }
+                // Numerically stable softplus: max(x,0) + log1p(exp(-|x|)).
+                const float sp = std::max(acc, 0.0f) + std::log1p(std::exp(-std::fabs(acc)));
+                pred_scores_[(size_t) e] = std::sqrt(sp) + rl.b[(size_t) e];
+            }
+            for (int m = 0; m < top_m; ++m) {
+                const auto best = std::max_element(pred_scores_.begin(), pred_scores_.end());
+                unioned.insert((int32_t) (best - pred_scores_.begin()));
+                *best = -std::numeric_limits<float>::infinity();
+            }
+        }
+
+        pred_union_.assign(unioned.begin(), unioned.end());   // ascending, as send expects
+        std::vector<int32_t> & previous = last_pred_hint_[layer + k];
+        if (previous == pred_union_) {
+            return;   // the worker would resolve it to pages already queued
+        }
+        previous = pred_union_;
+        (void) remote.send_prefetch_hints(layer + k, pred_union_, PIPE_HINT_PREDICTED);
+    } catch (...) {
+        // Swallow. A broken socket surfaces on the next real dispatch.
+    }
+}
+
+void graph_dispatcher::capture_routing(const char * prefix, int32_t layer,
+                                       const std::vector<float> & activations,
+                                       const ggml_tensor * selected_experts,
+                                       int64_t n_tokens, int64_t n_expert_used) noexcept {
+    try {
+        if (n_tokens <= 0 || n_tokens > predict_max_tokens()) {
+            return;
+        }
+        if (capture_file_ == nullptr) {
+            const std::string path =
+                std::string(prefix) + "." + std::to_string((long) getpid()) + ".bin";
+            capture_file_ = std::fopen(path.c_str(), "ab");
+            if (capture_file_ == nullptr) {
+                return;
+            }
+        }
+        const int32_t n_embd = remote.n_embd();
+        // Record: magic 'WPC1', layer, n_tokens, n_embd, n_expert_used,
+        // f32 h[n_tokens * n_embd], i32 sel[n_tokens * n_expert_used].
+        const uint32_t magic  = 0x31435057;
+        const int32_t  header[4] = { layer, (int32_t) n_tokens, n_embd, (int32_t) n_expert_used };
+        std::fwrite(&magic, sizeof(magic), 1, capture_file_);
+        std::fwrite(header, sizeof(header), 1, capture_file_);
+        std::fwrite(activations.data(), sizeof(float),
+                    (size_t) n_tokens * (size_t) n_embd, capture_file_);
+        for (int64_t i = 0; i < n_tokens * n_expert_used; ++i) {
+            const int32_t expert = ggml_get_i32_1d(selected_experts, (int) i);
+            std::fwrite(&expert, sizeof(expert), 1, capture_file_);
+        }
+    } catch (...) {
+        // Capture is diagnostics; losing a record must not touch the decode.
+    }
 }
 
 void graph_dispatcher::latch_failure(const char * message) noexcept {
@@ -426,6 +569,18 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         assignments.reserve(by_expert.size());
         for (auto & entry : by_expert) {
             assignments.push_back(std::move(entry.second));
+        }
+
+        // Predicted hints go out BEFORE this layer's dispatch: the workers then
+        // hold L+k's hint for the entire time they serve layers L..L+k-1, which
+        // is the whole lead the prediction buys. At this point in_flight == 0
+        // (WP_DEFER_K=0 waits out every layer; with deferral on,
+        // send_prefetch_hints declines and counts it).
+        owner->emit_predicted_hints(context->layer, wire_activations, n_tokens);
+        if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+            capture_prefix != nullptr && capture_prefix[0] != '\0') {
+            owner->capture_routing(capture_prefix, context->layer, wire_activations,
+                                   selected_experts, n_tokens, n_expert_used);
         }
 
         const uint64_t           seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
