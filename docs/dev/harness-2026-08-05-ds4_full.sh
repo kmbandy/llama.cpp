@@ -325,6 +325,10 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # hardcoded). Sweep with READ_STRIPES: more stripes only pay if threads exist
 # to claim them, and both stay clamped to the 16 staging buffers.
 [ -n "${READ_WORKERS:-}" ] && WPOST="$WPOST WP_EXPERT_READ_WORKERS=$READ_WORKERS"
+# OFFSET_SORT=1 -- read each batch's page-ins in (blob, offset) order rather
+# than assignment order. Byte-identical (slots pre-assigned, compute order is
+# assignment order); targets prefill's ~31 page-ins/batch seek pattern.
+[ -n "${OFFSET_SORT:-}" ] && WPOST="$WPOST WP_EXPERT_OFFSET_SORT=$OFFSET_SORT"
 # ASYNC_H2D=1 -- issue staging->VRAM stripe copies with tensor_set_async on the
 # compute stream; staging reuse is fenced by per-buffer backend events at
 # borrow(). Backends without events (Vulkan today) log async_h2d=off and keep

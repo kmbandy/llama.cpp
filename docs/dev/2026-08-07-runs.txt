@@ -361,3 +361,37 @@ VERDICTS:
   the CPU DSpark worker. Canonical-trajectory arms remain exactly
   reproducible, INCLUDING under COALESCE.
 NEW CONFIG OF RECORD: + COALESCE=1 (decode ~3.94).
+
+=== ROUND 4 (evening): spec-off control, transport, hint conversion ===
+arm      decode  prefill  acceptance        trajectory
+specoff  3.05    17.15    (spec disabled)   n/a
+tcp      3.91    12.96    0.94194 146/155   CANONICAL
+k2m2     3.73    14.24    0.94194 146/155   CANONICAL
+
+VERDICTS:
+- SPEC DECODE MARGIN, ON THE RECORD: spec off = 3.05 vs 3.94 config of
+  record = spec decode buys +29%. kmbandy's "drop verify, keep hints"
+  proposal falsified cleanly -- verify at width 2.5 is CHEAPER per token
+  (5.2 ms/layer/tok) than plain decode (6.4), and it IS the pg+ amortizer.
+  Also the best prefill of the day (17.15) -- no draft contention during
+  prefill; consistent with the PREFILL_GATE thesis (untested knob).
+- TCP-vs-WIREGUARD: CLOSED NEUTRAL. 3.91 canonical ~= 3.94 band. The
+  ~26 ms/token WireGuard exposure estimate does not convert; the
+  spine-wait-vs-worker-wall gap is not transport.
+- k2m2 HOST-TIER HINTS: RE-CLOSED, now with the host tier armed. 2026
+  conversion is 2-3x the R9700's (1070 25%, 480 34% vs r9700 15%
+  promoted/landed) -- the residency-confidence entanglement IS weaker on
+  small pools, as theorized -- but 31 GB of speculative reads + scorer +
+  preempt pauses net -5% decode (3.73). Volume is not the problem;
+  precision still is. Prediction stays closed.
+- STRAGGLER ATTRIBUTION CORRECTED (keep-arm 3-way REQLOG join, n=3686
+  layer-sets): R9700 slowest in 50.5% of layers (frequent moderate pg+:
+  71% incidence x ~9 ms), 1070 26.4%, 480 23.1% (rare severe pg+: 21% x
+  14-17 ms). The layer clock is a MIXTURE TAIL, not "2026 paces decode".
+  Mean worker-side layer max 10.28 ms vs spine-observed 12.6 -> ~2.3
+  ms/layer spine-side issue/merge overhead, unexplained by transport.
+SHIPPED (untested in-run): 85c9783f3 WP_EXPERT_ASYNC_H2D (event-fenced
+async staging drain; Vulkan probes NULL and stays sync) + WP_EXPERT_OFFSET_SORT
+(byte-identical (blob,offset) read ordering) + harness knobs ASYNC_H2D/
+OFFSET_SORT. Round-4 arms all ran the round-3 binary (builds landed after
+worker launch; inode semantics).

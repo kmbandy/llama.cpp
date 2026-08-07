@@ -1933,6 +1933,25 @@ public:
                 }
             };
 
+            // WP_EXPERT_OFFSET_SORT=1 -- read page-ins in (blob, offset) order
+            // instead of assignment order. Slots are already assigned above and
+            // compute order stays assignment order regardless of read order, so
+            // output is byte-identical by construction. Prefill batches average
+            // ~31 page-ins; sequentializing the seeks is Kimi's prefill lever,
+            // aimed at the 2026 SN750 (3.1 GB/s, the slower shard) most of all.
+            static const bool s_offset_sort = [] {
+                const char * e = std::getenv("WP_EXPERT_OFFSET_SORT");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            if (s_offset_sort) {
+                std::sort(pageins.begin(), pageins.end(),
+                          [&pages](size_t a, size_t b) {
+                              const ExpertPage & pa = *pages[a];
+                              const ExpertPage & pb = *pages[b];
+                              if (pa.blob != pb.blob) { return pa.blob < pb.blob; }
+                              return pa.offset < pb.offset;
+                          });
+            }
             batch.state_ = std::make_shared<BatchState>();
             batch.state_->pageins.reserve(pageins.size());
             try {
