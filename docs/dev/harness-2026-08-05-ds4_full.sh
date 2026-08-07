@@ -343,6 +343,14 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # that replaces the pager-only WP_CAPTURE_ROUTING; feeds the k=2..4 precision
 # decay measurement. Decode-shaped batches only (same gate as prediction).
 [ -n "${PRED_CAPTURE:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_CAPTURE=$OUT/routing-capture"
+# DEFER=k -- WP_DEFER_K on the spine: compute k experts per token immediately,
+# DEFER the rest (their partials fold into the next layer's block). The 08-07
+# request-scope decomposition prices the cold-read chain at 4.5+1.7 ms of the
+# R9700's 8 ms/request -- deferral is the structural fix, and the QUALITY GATE
+# is draft acceptance (reference 0.94194 on code700 at the banked config):
+# deferral folds partials one layer late, which is an approximation. kmbandy
+# saw quality loss from deferral on another model -- gate hard.
+[ -n "${DEFER:-}" ] && SPINEENV="${SPINEENV:-} WP_DEFER_K=$DEFER"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
 # rejection. Say so at launch rather than after a wasted run.
 if [ -n "$SPEC_PAGEIN" ] && [ -z "$PREFETCH_HINT" ]; then
