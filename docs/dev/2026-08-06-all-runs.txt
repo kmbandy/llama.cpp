@@ -1,0 +1,273 @@
+RUN-LEVEL  (all arms 2026-08-06, config of record, victim tier OFF both machines)
+
+sweep  run     spec       evict       prefill  decode   accept
+------------------------------------------------------------
+arm1   ctl_1   off        LRU           22.96    3.34  0.84286
+arm1   hint_1  hint-only  LRU           23.05    3.27  0.84286
+arm1   ctl_2   off        LRU           24.86    3.28  0.84286
+arm1   hint_2  hint-only  LRU           24.18    3.30  0.84286
+arm2a  ctl_1   off        LRU           22.71    2.95  0.84286
+arm2a  warm_1  ON         LRU           17.57    3.22  0.84286
+arm2a  ctl_2   off        LRU           25.26    3.22  0.84286
+arm2a  warm_2  ON         LRU           23.78    3.18  0.84286
+arm2b  ctl_1   off        LRU           22.80    3.22  0.84286
+arm2b  spec_1  ON         LRU           23.26    3.10  0.84286
+arm2b  ctl_2   off        LRU           24.65    3.10  0.84286
+arm2b  spec_2  ON         LRU           22.58    3.12  0.84286
+evict  lru_1   off        LRU           23.80    2.92  0.84286
+evict  use_1   off        USE-COUNT     21.08    3.39  0.84286
+evict  lru_2   off        LRU           21.15    3.30  0.84286
+evict  use_2   off        USE-COUNT     23.38    3.00  0.84286
+
+
+PER-WORKER  (pi = demand page-ins, GiB = bytes read, wait = dispatch wait s)
+            spec_pi/GiB = SPECULATIVE page-ins, blank when speculation off
+
+sweep  run     worker   |  pf_pi  pf_GiB  pf_w |  de_pi  de_GiB  de_w | spec_pi spec_GiB
+----------------------------------------------------------------------------------------
+arm1   ctl_1   (no per-worker logs captured)
+arm1   hint_1  (no per-worker logs captured)
+arm1   ctl_2   (no per-worker logs captured)
+arm1   hint_2  (no per-worker logs captured)
+arm2a  ctl_1   rx480    |   1352   16.83   8.9 |   1912   23.81  13.7 |       -        -
+arm2a  ctl_1   gtx1070  |   1332   16.58   9.7 |   1945   24.22  14.8 |       -        -
+arm2a  ctl_1   r9700    |   5495   68.42  10.7 |   9124  113.60  26.5 |       -        -
+arm2a  warm_1  rx480    |   1263   15.73   8.2 |   1767   22.00  12.6 |    1118    13.92
+arm2a  warm_1  gtx1070  |   1257   15.65   9.2 |   1800   22.41  13.8 |     668     8.32
+arm2a  warm_1  r9700    |   5331   66.38  10.3 |   8985  111.87  26.1 |    2426    30.21
+arm2a  ctl_2   rx480    |   1352   16.83   8.8 |   1911   23.79  13.6 |       -        -
+arm2a  ctl_2   gtx1070  |   1332   16.58   9.8 |   1946   24.23  14.8 |       -        -
+arm2a  ctl_2   r9700    |   5495   68.42  10.6 |   9124  113.60  26.7 |       -        -
+arm2a  warm_2  rx480    |   1257   15.65   8.2 |   1769   22.03  12.7 |    1125    14.01
+arm2a  warm_2  gtx1070  |   1243   15.48   9.0 |   1792   22.31  13.6 |     682     8.49
+arm2a  warm_2  r9700    |   5290   65.87  10.2 |   8983  111.85  26.2 |    2448    30.48
+arm2b  ctl_1   rx480    |   1352   16.83   8.7 |   1911   23.79  13.8 |       -        -
+arm2b  ctl_1   gtx1070  |   1332   16.58   9.7 |   1945   24.22  14.8 |       -        -
+arm2b  ctl_1   r9700    |   5495   68.42  10.7 |   9125  113.62  26.4 |       -        -
+arm2b  spec_1  rx480    |   1246   15.51   8.2 |   1769   22.03  12.7 |    1149    14.28
+arm2b  spec_1  gtx1070  |   1236   15.39   8.9 |   1793   22.32  13.8 |     691     8.60
+arm2b  spec_1  r9700    |   5300   65.99  10.3 |   8987  111.90  26.3 |    2486    30.96
+arm2b  ctl_2   rx480    |   1352   16.83   8.8 |   1912   23.81  13.6 |       -        -
+arm2b  ctl_2   gtx1070  |   1332   16.58   9.7 |   1945   24.22  14.8 |       -        -
+arm2b  ctl_2   r9700    |   5495   68.42  10.7 |   9125  113.62  26.9 |       -        -
+arm2b  spec_2  rx480    |   1267   15.78   8.2 |   1772   22.06  12.7 |    1125    13.98
+arm2b  spec_2  gtx1070  |   1255   15.63   9.0 |   1792   22.31  13.8 |     677     8.43
+arm2b  spec_2  r9700    |   5333   66.40  10.3 |   8979  111.80  26.4 |    2437    30.34
+evict  lru_1   rx480    |   1352   16.83   8.8 |   1912   23.81  13.8 |       -        -
+evict  lru_1   gtx1070  |   1332   16.58   9.6 |   1945   24.22  14.8 |       -        -
+evict  lru_1   r9700    |   5495   68.42  10.7 |   9125  113.62  26.2 |       -        -
+evict  use_1   rx480    |   1336   16.63   8.7 |   1799   22.40  12.8 |       -        -
+evict  use_1   gtx1070  |   1325   16.50   9.6 |   1821   22.67  13.9 |       -        -
+evict  use_1   r9700    |   5447   67.82  10.6 |   8690  108.20  25.9 |       -        -
+evict  lru_2   rx480    |   1352   16.83   8.8 |   1911   23.79  13.7 |       -        -
+evict  lru_2   gtx1070  |   1332   16.58   9.7 |   1946   24.23  14.9 |       -        -
+evict  lru_2   r9700    |   5495   68.42  10.6 |   9126  113.63  27.4 |       -        -
+evict  use_2   rx480    |   1336   16.63   8.3 |   1800   22.41  12.9 |       -        -
+evict  use_2   gtx1070  |   1325   16.50   9.4 |   1820   22.66  14.0 |       -        -
+evict  use_2   r9700    |   5447   67.82  10.6 |   8692  108.23  25.5 |       -        -
+
+
+SPECULATIVE PAGE-IN OUTCOMES (only arm2b spec_1/spec_2 carry the ordered event
+stream; arm2a predates it. Both measured with evict=LRU -- NOT re-measured under
+use-count eviction, which is the arm that has not been run.)
+
+--- spec_1 ---
+log                       phase  spec_pi    USED    LATE  MISPRED   used%
+hint-spec_1-w-480.txt   prefill       38      38       0        0 100.0%
+hint-spec_1-w-480.txt    decode     1111     189     921        1  17.0%
+hint-spec_1-w-1070.txt  prefill       44      44       0        0 100.0%
+hint-spec_1-w-1070.txt   decode      647     189     457        1  29.2%
+hint-w-r9700.txt        prefill      576      90     485        1  15.6%
+hint-w-r9700.txt         decode     1910     150    1757        3   7.9%
+------------------------------------------------------------------------
+TOTAL                   prefill      658     172     485        1  26.1%
+TOTAL                    decode     3668     528    3135        5  14.4%
+
+--- spec_2 ---
+log                       phase  spec_pi    USED    LATE  MISPRED   used%
+hint-spec_2-w-480.txt   prefill       36      27       9        0  75.0%
+hint-spec_2-w-480.txt    decode     1089     180     908        1  16.5%
+hint-spec_2-w-1070.txt  prefill       43      36       7        0  83.7%
+hint-spec_2-w-1070.txt   decode      634     176     457        1  27.8%
+hint-w-r9700.txt        prefill      562      87     474        1  15.5%
+hint-w-r9700.txt         decode     1875     128    1744        3   6.8%
+------------------------------------------------------------------------
+TOTAL                   prefill      641     150     490        1  23.4%
+TOTAL                    decode     3598     484    3109        5  13.5%
+
+
+=== 2026-08-06 EVENING (next session, HEAD ff03d11d0) ===
+CONFIG-OF-RECORD RE-TAKE after fixing the HOSTVICTIM defaults (harness commit
+ff03d11d0; hostvictim now defaults 0/0, confirmed in the CONFIG echo of both
+runs). Bare runs, evict=use-count (HEAD default), SPEC=1, prose739.txt.
+
+sweep  run     spec       evict       prefill  decode   accept
+------------------------------------------------------------
+cor    cor1    off        USE-COUNT     20.67    2.92  0.81690  <- see note
+cor    cor2    off        USE-COUNT     18.48    3.03  0.84286
+
+NOTE cor1 acceptance: 0.81690 (58/71, mean len 1.82) vs the 0.84286 (59/70)
+that held across all 16 runs above and in cor2. First acceptance deviation
+seen on a BARE run at HEAD (the only prior deviation was the rejected
+WP_EXPERT_GATHER_MIN_TOKENS arm, 0.80952). n=1; not chased. If it recurs,
+determinism at HEAD is in question and that outranks everything else here.
+
+PER-WORKER final cumulative (whole run, not split by phase):
+run    worker   n_pagein   GiB_read   wait_s
+cor1   r9700       13882     172.8      37.1
+cor1   gtx1070      3054      38.0      22.8
+cor1   rx480        3100      38.6      21.4
+cor2   r9700       14073     175.2      36.6
+cor2   gtx1070      3130      39.0      23.4
+cor2   rx480        3128      38.9      21.3
+
+VERDICT: page-ins and dispatch wait match the evict-sweep use-count arms and
+each other to ~1.5% -- the system is reproducing. tok/s (18.5-20.7 prefill,
+2.9-3.0 decode) sits in the low half of the day's 17.6-25.3 / 2.9-3.4 spread;
+per trap 6 the counters, not tok/s, are the reproducibility standard.
+Baseline re-established for the GTT chase.
+
+GTT CHASE (gtt1/gtt2, tier off, REQLOG=1 + 2s GTT sampler; worker binary
+173686ac3 adds epoch_end col 22 to WP_REQ_LOG for exactly this correlation):
+
+sweep  run    prefill  decode  accept    GTT windows (gtt480>4000MB)
+gtt    gtt1    18.50    2.89   0.84286   8s at load-end, 16s at teardown
+gtt    gtt2    19.77    2.60   0.84286   10s at load-end, 16s at teardown
+
+FINDING (answers handoff §7.1/§7.2 for the tier-off case, n=2):
+- The RX 480 pool's GTT residency is BRACKETED, not random: the pool sits in
+  GTT during load (fresh Vulkan buffers land in GTT until first compute
+  validates them into VRAM, ~8-10s), and transits GTT again at teardown.
+  Across both runs, ALL generation-window samples show gtt480 at the 1478 MB
+  idle floor -- zero mid-run migration.
+- Cost: requests overlapping a window run 2-7x slower (e.g. gtt2 decode-type
+  16.1ms in-window vs 2.2ms out), but only ~0.7s of a ~133s request stream
+  overlapped -- negligible tier-off.
+- IMPLICATION: yesterday's 17-21%-of-samples GTT residency (26s..3min spells)
+  and the 11.25 t/s "control" prefill are NOT reproduced tier-off. Prime
+  suspect: the pinned host-victim tier (silently on in those arms via the
+  old harness defaults) extending the GTT-resident state. Confirming needs a
+  tier-ON arm; floor math says that run bottoms out near ~200 MB free on a
+  zero-swap box that OOM'd today -- kmbandy's call, do not run casually.
+
+*** ROOT CAUSE OF §5.1 FOUND AND FIXED (2026-08-06 evening): amdgpu RUNTIME PM.
+The RX 480 had power/control=auto (5s autosuspend). On every >=5s idle gap
+amdgpu runtime-suspends the card and EVACUATES ALL VRAM TO GTT -- that is the
+7.5 GB RAM spike, the minutes-long GTT spells, the 11.25 t/s "control", and
+the third leg of the 14:56 OOM. The idle reading of vram=5/gtt=1469 that every
+trace showed IS the suspended-evacuated state. Fixed by kmbandy:
+  echo on > /sys/class/drm/card1/device/power/control   (2026, RX 480)
+NOT YET PERSISTENT ACROSS REBOOT (udev rule still to be written). Also
+explains why KEEPALIVE=100 was worth +17.5%: it keeps the card from hitting
+the 5s autosuspend mid-run.
+
+sweep  run    config                  prefill decode  accept    GTT windows / RAM
+gtt    gtt3   bare, runpm off          19.57   2.87   0.84286   ZERO windows; min avail 9457 MB
+tier   tier1  HOSTVICTIM_2026=1G       18.53   3.04   0.82353*  max gtt 1299; min avail 7219 MB
+lease  lease1 HINT+SPEC_PAGEIN         20.43   3.06   0.84286   (pre-fix, spec knobs only)
+
+tier1 per-worker: 1070 pi=2781 (-9..11% vs ctl) hit=250 demote=2481 wait 20.3s;
+480 pi=2723 (-12%) hit=248 demote=2421 wait 18.0s. Tier budget fully used
+(host_bytes=1.07GB/worker), ~9.7 demotes/hit (was 19 in the void take), decode
+at the TOP of the control band -- the old "-21% decode" tier penalty was the
+evacuation fighting the tier, not the tier.
+
+lease1 hint outcomes (clean baseline): used% 1070=94.3 480=83.7 r9700-decode=44.4
+(vs 29/17/8 in the void arm2b take); page-ins -10..12% on 2026 workers, wait
+-11..13%; r9700 LATE=52% says its eviction band is where the remaining win is.
+
+*ACCEPTANCE WOBBLE #2: tier1 drew 0.82353 (42 acc / 51 gen) vs canonical
+0.84286 (59/70). With cor1's 0.81690 that is 2 deviations in 6 evening runs
+after 16/16 stable yesterday. Draft trajectory also shorter (51 vs 70-71
+generated). Determinism at HEAD deserves a dedicated look before banking
+fine-grained A/Bs.
+
+ts1 = tier(1G/worker, 2026) + PREFETCH_HINT + SPEC_PAGEIN, post-runpm-fix:
+  19.95 / 3.03 / 0.79592* (wobble #3: 39/49). RAM floor 7.1 GB, GTT quiet.
+  1070 pi=2428 hit=318 wait=17.7s | 480 pi=2405 hit=242 wait=15.8s
+  vs controls: page-ins -21..23%, wait -22..26% on BOTH 2026 workers.
+  TIER AND SPECULATION COMPOUND ~ADDITIVELY (each alone was -10..12%).
+  used% holds under the tier: 480=84.6 1070=94.7 r9700-decode=42.1 (no tier
+  on main; its 54.5% LATE is still the next lever).
+
+QUIET-BOX VERIFICATION (kmbandy off the desktop, ~20:15):
+cor    corq1   bare               24.58    2.94  0.84286
+cor    corq2   bare               22.53    3.36  0.84286
+CONFIG OF RECORD CONFIRMED REPRODUCING: 22.5-24.6 prefill / 2.9-3.4 decode,
+matching the 2026-08-06 daytime ctl band (21.1-25.3 / 2.92-3.39). The earlier
+evening runs' 18.5-20.7 prefill tracked desktop activity on mad-lab-main
+(spine + R9700 + DSpark-CPU box); decode's apparent sag was its own
+documented within-arm spread (corq1 2.94 vs corq2 3.36, same quiet box,
+back-to-back). Note: all 3 acceptance wobbles occurred in desktop-active
+runs; both quiet reps drew canonical 0.84286 (59/70) -- consistent with
+timing-dependent drafting, still worth a determinism look someday, but not
+blocking.
+
+ts3g = 3 GiB tier PER WORKER (all three, first tier ever on main) + HINT+SPEC,
+       post-runpm-fix, kmbandy-requested:
+  18.01 / 2.72 / 0.81250 (wobble #4 -- and this one on a quiet-ish desktop, so
+  the "wobbles track desktop load" correlate from earlier tonight DID NOT HOLD;
+  determinism look still warranted, still not blocking counters).
+  RAM: 2026 min avail 2887 MB (matches the ~3 GB projection, no OOM, watchdog
+  silent); main zram +0.2 GB only -- the 3 GiB tier stays essentially resident
+  where the old 6 GiB default swapped.
+  worker   pi     hit   demote  wait     vs ctl        vs ts1(1G)
+  r9700   12360  1551   11808   31.9s   pi -11..12%, wait -13..14%  (first tier)
+  1070     2201   535    2306   16.1s   pi -28..30%, wait -29..31%  (hit +68%)
+  480      2209   603    2397   14.7s   pi -29%,     wait -31%      (hit +149%)
+  R9700 hint: used 47.3%, LATE 50.4% (was 54.5) -- late pages now come back
+  from RAM (1551 host hits) instead of NVMe, which is the tier doing its
+  designed job for spec prefetch. The R9700 is still the slowest leg and its
+  31.9s is the best R9700 wait of the night; its eviction band remains the
+  next lever (offline REFLOG sweep).
+
+*** TIER DATA CORRUPTION FOUND AND FIXED (evening, commits c490c2d14 + bb0654986). ***
+Tier-on runs generated DIVERGENT text run-to-run (tier-off byte-identical);
+acceptance decay 0.84->0.73 was downstream of that. WP_EXPERT_TIER_VERIFY
+(re-read every tier-restored page from blob, memcmp) measured 604/605 restores
+WRONG on the RX 480, zero wrong on the GTX 1070. Root cause: the worker's
+HostTier DeviceReader matched the demoted slot by slot.raw->data==src_device;
+on Vulkan every standalone buffer's base is the SAME sentinel, so the pointer
+collides and the reader D2H'd the wrong slot -- the tier served another
+expert's weights on every host hit. Fix: reader now resolves by page_idx/
+cache_id. PROOF (tverify2, 3 GiB tier on 2026): verified=607 mismatch=0,
+canonical text, canonical acceptance 0.84286 with the tier ON.
+
+CONSEQUENCE FOR TONIGHT'S NUMBERS: RAM-safety results (floors, budgets) stand;
+tier-on COUNTER results (tier1/ts1/ts3g/refcap/lease256 page-ins & waits) were
+measured with wrong weights occasionally steering routing -- re-take post-fix
+before banking. The lease mechanism conclusion (64-eviction lease too short
+for block-shaped hints; LATE 50%->23% at LEASE=256) is structural and expected
+to survive; final1 re-validates the full stack post-fix.
+mad-lab-main's worker binary predates the fix but ROCm pointer-matching was
+correct there (unique real addresses); rebuild at next maintenance window.
+
+main6g = full stack but HOSTVICTIM_MAIN doubled to 6 GiB: STRONG NEGATIVE.
+  10.67 / 1.15 (!), canonical text+acceptance. R9700 hits 1274->1963 and pi
+  12299->11649, but ns_wait 33.7->54.0s and the spine starved (prefill halved).
+  The pinned 6 GiB pushes main into reclaim/swap during the run (§5.4) and
+  every hit pays a full-page RAM copy on the request path. 3 GiB is main's
+  ceiling. Counters-up + wait-up is the signature of a tier paying more to
+  serve than it saves -- read hits together with wait, never alone.
+
+EMBEDDING-ROUTING PROBE (specoff capture + docs/dev/probe-embed-routing.py):
+DEEP-LAYER PREDICTED HINTS FROM DRAFTED-TOKEN EMBEDDINGS ARE DEAD. The
+2026-08-02 scoping hypothesis ("a drafted token id gives its embedding
+exactly, so early-layer routers apply directly, accuracy decays with
+depth") is now MEASURED: vs the true routing of 256 aligned decode steps
+(token ids recovered exactly from hash-layer sets via tid2eid inversion --
+no tokenizer needed), raw-embedding routing scores recall@8 = 14.5% at
+layer 3 decaying to ~2% by layer 30 (random = 3.1%); with the faithful
+per-layer ffn_norm applied, the best any layer manages is R@32 = 36.7%
+(layer 5). Capturing a third of ONE layer's demand means speculating 32
+pages = 428 MB/layer/token against a ~360 MB/token TOTAL demand budget.
+No point on the curve pays. Routing below the hash layers is contextual;
+worker-side hint coverage is structurally capped at the hash layers.
+
+SIGN-FLIP OUTLOOK after tonight: (1) SPEC=0 decode measured 3.25 t/s vs
+2.87-3.06 for spec-on tier arms and 3.36 bare -- whether DSpark's verify
+expert-load costs more than acceptance saves at this config is UNRESOLVED
+and is the cheapest remaining decode lever (needs interleaved reps).
+(2) The R9700 Belady gap (37.6%) requires true-routing prefetch, which
+requires hidden states -- no viable tokens-ahead path exists after tonight.
+(3) Tier at 3 GiB main / 3 GiB 2026 + LEASE=256 is the banked steady state.
