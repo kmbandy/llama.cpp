@@ -270,3 +270,18 @@ conf 0.4 + k2m2 hints... note vs1 ran WITHOUT the pred hints -- the
 stripe win stacks with the M=2 hint config, untested combined).
 DAY TOTAL: 3.33 (prose record) -> 3.83 (code retune) -> 3.89 (stripe
 parallel), all byte-identical-quality levers.
+
+PUSH CHAIN (16:55-17:08, all on STRIPEPAR=1 base):
+  combo1 3.80  combo2 3.58   (stripe + k2m2 hints: no gain over 3.89
+                              stripe-alone; hints stay OPTIONAL tail insurance)
+  chunk1 3.53* DIVERGENT TRAJECTORY (acc 0.85535, 136/159)
+  chunk1b 2.73** canonical trajectory (deepest sag window of the day)
+  *chunk1's divergence is NOT chunk numerics -- chunk1b at the same knob is
+  canonical. It is the rig's residual nondeterminism (3rd sighting today;
+  KG suspect: CPU DSpark worker threaded reduction order, 2026-08-03).
+  **CHUNKS=1 unpriceable from this pair; park it for a quiet-window rep.
+CONFIG OF RECORD (end of day): code700 + banked stack + SPEC_CONF=0.4 +
+STRIPEPAR=1 = 3.89 decode / 16.6 prefill. THE SAG is now the dominant
+measurement hazard (5+ windows today) -- top of tomorrow's list.
+CONSULTS DISPATCHED: Codex gpt-5.6-sol (477e51fc/bc363725) + Kimi K3 via
+pi (c182cbb2), full brief, Q1-Q5, analysis-only.
