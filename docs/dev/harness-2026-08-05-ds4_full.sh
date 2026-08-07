@@ -704,6 +704,11 @@ MAINENV=""
 # lost foreign_expert (the spine-vs-worker routing-agreement check) entirely.
 # `tail -1` of each of these four files is that worker's final count.
 [ -n "${HINTLOG:-}" ] && MAINENV="$MAINENV WP_HINT_LOG=$OUT/hint-w-r9700.txt"
+# KEEPALIVE_MAIN=<us>: keepalive on the R9700 (HIP). A SEPARATE knob from
+# KEEPALIVE deliberately -- that one defaults to 100 (part of the RX 480
+# idle-recovery fix) and folding the R9700 into it would arm this card
+# silently on every run; it has never been measured here.
+[ -n "${KEEPALIVE_MAIN:-}" ] && MAINENV="$MAINENV WP_KEEPALIVE_US=$KEEPALIVE_MAIN"
 [ -n "$PIN_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESIDENT_EXPERTS=$PIN_MAIN" && echo "  PIN(r9700)=$PIN_MAIN"
 [ -n "$RESERVE_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_MAIN WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(r9700)=$RESERVE_MAIN @ $RESERVE_BYTES"
 ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE $MAINENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
