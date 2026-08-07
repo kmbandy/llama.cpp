@@ -246,3 +246,27 @@ pinned at 28.3 GB/s PCIe4 x16 SAM) vs today's 6.2 ms.
   (3) SAM/ReBAR direct NVMe->VRAM -- the roadmap build; kills h2d
       entirely. Target: request ~4-4.5 ms => decode 5.5-6 byte-identical;
       turbo4's FIXED build gated on acceptance afterward.
+
+=====================================================================
+STRIPE-PARALLEL: TWO HANGS, TWO ROOT CAUSES, THEN THE FIRST REAL
+DECODE WIN (15:35-16:36)
+=====================================================================
+sp1 hung 11 min (kmbandy caught it; watchdog monitors mandatory since).
+750faf818 stripe-parallel v1: 1070 froze on first page-in batch.
+d3d7c5630 fixed a REAL-BUT-SECONDARY shared_ptr race (lease copied
+outside the writer's mutex). sp1r STILL hung (watchdog fired at 387s,
+R9700 this time; 5 threads futex-parked, ptrace denied -- diagnosed by
+thread census + arithmetic): *** c9c0c801b THE ACTUAL DEADLOCK:
+PageShared pinned every page's staging lease for the BATCH lifetime;
+prefill batches (~31 pageins) pin > the pool's 16 buffers; readers
+exhaust the pool and sleep forever. Last-stripe COMPLETER now resets
+the pin -- serial path's exact buffer lifetime. ***
+VALIDATION (vbase/vs1, watchdog armed, clean window):
+  vbase 14.21/3.76   vs1 16.62/3.89  acc BOTH 0.94194 (byte-identical)
+  R9700 request: wall 8.07->7.38 ms (p50 6.78->5.71), read 4.55->4.09,
+  wait 4.42->3.66. +3.5% decode, zero quality cost, no hang.
+NEW CAMPAIGN BEST: 3.89 decode / 16.62 prefill (code700, banked stack +
+conf 0.4 + k2m2 hints... note vs1 ran WITHOUT the pred hints -- the
+stripe win stacks with the M=2 hint config, untested combined).
+DAY TOTAL: 3.33 (prose record) -> 3.83 (code retune) -> 3.89 (stripe
+parallel), all byte-identical-quality levers.
