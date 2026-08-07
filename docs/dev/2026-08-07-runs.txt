@@ -395,3 +395,34 @@ async staging drain; Vulkan probes NULL and stays sync) + WP_EXPERT_OFFSET_SORT
 (byte-identical (blob,offset) read ordering) + harness knobs ASYNC_H2D/
 OFFSET_SORT. Round-4 arms all ran the round-3 binary (builds landed after
 worker launch; inode semantics).
+
+=== ROUND 5 + 5b (evening): async H2D, pinned staging, offset-sort ===
+arm       decode  prefill  trajectory
+ah2d      CRASHED (480 Vulkan died mid-prefill; spine ret=-3)
+pin1      3.61    14.89    diverged 144/159
+pinah2d   CRASHED (same 480 crash)
+osort     3.76    13.69    near-canonical 146/158 (OFFSET_SORT+PREFILL_GATE)
+ah2d2     3.82    16.32    CANONICAL (Vulkan guard 0e1f... in place)
+pinah2d2  3.67    16.42    CANONICAL
+
+VERDICTS:
+- ASYNC H2D (same-stream): CLOSED NEGATIVE for decode (-3 to -7% vs 3.94).
+  Byte-identity under async CONFIRMED twice (canonical 146/155 exact) -- the
+  event-fence design is correct -- but a copy issued on the COMPUTE stream
+  cannot overlap compute (same-stream ordering still gates the graph on the
+  last stripe), so it keeps the old serialization and adds issue/event
+  overhead. A real win needs a dedicated copy stream + event edge into the
+  compute stream. Code stays, default off.
+- VULKAN ASYNC: advertises events, passes the probe, KILLS the worker
+  (both round-5 async arms). Guarded off by runtime backend name.
+- PIN=1: NEUTRAL everywhere (r9700 pg+ 9.04->8.88, 480 h2d 4.35->4.15).
+  DISCOVERY: the 1070 has been staging_kind=pinned ALL ALONG (empty
+  WP_STAGING_PINNED= counts as on, on the VKENV launch path) -- its 2.9GB/s
+  drain is PCIe/drain-path limited, not pageability.
+- OFFSET_SORT + PREFILL_GATE: no win at 493-tok prefill (13.69, low end of
+  the noisy 13-16.4 band). Long-prompt (code2000) retest still owed before
+  closing -- 31-pagein batches are where sorting should bite.
+- PREFILL SIGNAL: both async arms posted the best canonical prefills
+  (16.32/16.42). Consistent with async issue pumping the 31-pagein prefill
+  drain. Candidate PREFILL lever; needs the code2000 arm to confirm.
+DECODE CONFIG OF RECORD UNCHANGED: COALESCE=1, ~3.94.
