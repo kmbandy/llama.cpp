@@ -1253,13 +1253,25 @@ public:
         const char * async_env = std::getenv("WP_EXPERT_ASYNC_H2D");
         if (async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0' &&
                 backend != nullptr) {
-            backend_ = backend;
-            device_  = ggml_backend_get_device(backend);
-            ggml_backend_event_t probe =
-                device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
-            if (probe != nullptr) {
-                ggml_backend_event_free(probe);
-                async_h2d_ = true;
+            // RUNTIME name check, not a GGML_USE_* macro (that bug class has
+            // recurred six times here). Vulkan ADVERTISES events, so the probe
+            // below passes -- but arming this path on the RX 480 killed the
+            // worker mid-prefill on 2026-08-07 (spine: "worker :8804 died
+            // while computing", llama_decode ret=-3). Until the vk async-set +
+            // event-fence semantics are understood, Vulkan stays on the sync
+            // path by name.
+            const char * bname = ggml_backend_name(backend);
+            const bool vulkan =
+                bname != nullptr && std::strstr(bname, "Vulkan") != nullptr;
+            if (!vulkan) {
+                backend_ = backend;
+                device_  = ggml_backend_get_device(backend);
+                ggml_backend_event_t probe =
+                    device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
+                if (probe != nullptr) {
+                    ggml_backend_event_free(probe);
+                    async_h2d_ = true;
+                }
             }
         }
         // Logged once: one StagingPool is constructed per worker process.
