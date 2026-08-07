@@ -271,3 +271,77 @@ and is the cheapest remaining decode lever (needs interleaved reps).
 (2) The R9700 Belady gap (37.6%) requires true-routing prefetch, which
 requires hidden states -- no viable tokens-ahead path exists after tonight.
 (3) Tier at 3 GiB main / 3 GiB 2026 + LEASE=256 is the banked steady state.
+
+DSPARK ON/OFF INTERLEAVED A/B (soff1,son1,soff2,son2 -- banked stack: tier
+3G/3G + LEASE=256 + hint/spec-pagein):
+  arm    spec  prefill  decode   accept
+  soff1  off    23.26    3.26      -
+  son1   on     15.07    2.77    0.84286
+  soff2  off    22.33    3.27      -
+  son2   on     15.77    3.10    0.84286
+VERDICT AT CURRENT DRAFT DEPTH (conf_min=0.9, mean block 1.86): DSpark is
+NET NEGATIVE -- decode -10..15% (off dead flat 3.26/3.27 vs on 2.77/3.10),
+prefill -32% (the DSpark blk.43-45 prompt pass through the CPU worker).
+The draft's verify batches ~double expert traffic per step and acceptance
+0.84 does not pay for it. Predictions themselves are near-perfect
+(mispredict 0.2-3.8%) -- the value is in the HINTS, not the verify.
+Depth sweep (SPEC_NMAX=7, conf 0.6) running to test whether deeper blocks
+amortize verify traffic and extend hint lead time enough to flip it.
+
+DRAFT-DEPTH SWEEP (banked stack + SPEC_NMAX/SPEC_CONF):
+  arm    nmax conf  prefill  decode  accept          mean-len
+  d7a     7   0.9    (log)    3.12   0.84286 (59/70)  1.86   <- conf gate binds; nmax alone inert
+  d7c     7   0.6    (log)    3.31   0.76744 (66/86)  1.77
+  d7c2    7   0.6    (log)    3.29   0.76744 (66/86)  1.77   <- byte-identical draft trajectory
+DECODE SIGN FLIPPED: conf 0.6 spec-on (3.29-3.31) now beats same-night spec-off
+(3.26/3.27) and the old spec-on config (2.77/3.10), same conditions, n=2 each.
+More drafts attempted (86 vs 70), more accepted (66 vs 59); the rejects cost
+less than the extra accepted tokens save. NOTE mean len went DOWN (1.77) --
+the win is more blocks drafted, not longer blocks; the conf gate at 0.9 was
+suppressing draft ATTEMPTS, not only depth.
+kmbandy CORRECTION on the earlier "spec costs 32% prefill" claim: the desktop
+story was retracted (interleaved soff2 replicated soff1 exactly between the
+son arms). Real suspect: speculation-during-prefill (hints+spec page-ins fire
+in the guaranteed-eviction regime where their LATE is 84-100%, and leased
+pages force extra evictions in a 100%-miss pool). Decomposition arm queued:
+spec on + hints/spec-pagein OFF. Candidate fix if confirmed: workers ignore
+speculative reads while serving prefill-shaped requests (n_tokens>1).
+
+d7a2 (explicit SPEC_NMAX=7 SPEC_CONF=0.99, kmbandy-requested rep): 18.45 / 3.17,
+acceptance 0.84286 (59/70, len 1.86) -- same trajectory as d7a/son arms.
+NOTE the conf-0.99 spec arms tonight (son1 2.77, son2 3.10, d7a 3.12, d7a2 3.17)
+ran IDENTICAL draft trajectories yet spread 0.40 t/s, vs +-0.01/0.02 replication
+for the soff and d7c pairs. The 0.99 config carries high run-to-run variance the
+others do not; conf-0.6's 3.29-3.31 lead over 0.99@7 (3.12-3.17) is promising
+but NOT settled at n=2 vs that spread. Decider: 3 arms (0.99/0.9/0.6) x >=4
+reps, interleaved, with per-worker wait recorded to localize the 0.99 variance.
+CLERICAL: "conf_min=0.9 active" in the SPEC ON echo was STALE (record moved to
+0.99 on 2026-08-05); fixed in e27257106. All tonight's spec arms ran 0.99
+unless explicitly set to 0.6.
+
+OFFLINE DESIGN NUMBERS FOR TOMORROW'S PREFETCH BUILD (from the aligned
+specoff stream; script inline in session, method = union of 3 workers' REF
+logs, tid2eid-recovered token alignment):
+  verify-batch union economics (distinct experts/layer, mean):
+    n=1: 6.76/token | n=2: 5.61 | n=4: 4.63 | n=7: 3.99  (-41% vs singles)
+  adjacent-token overlap (prev set predicting next): 0.33-0.42 by band --
+    confirms <=1-token-ahead prediction stays dead; packing + cross-layer
+    is the play.
+  sweep-to-sweep union carryover at n=7: 0.455 (residency/tier context).
+CROSS-LAYER PRECISION BASIS: the 2026-07-19 measurement (rank1 0.973,
+rank2 0.914, rank3 0.814, control 0.98; budgeted M=2-3 = 31-45% of next
+layer pre-staged at 1.02-1.05x bytes). CAVEAT: its capture file
+(routing_capture.bin) was OVERWRITTEN Jul 29 by a GLM capture (fopen("w"),
+trap #8 again) -- the DS4 hiddens are gone, and WP_CAPTURE_ROUTING only
+exists on the single-machine pager path, so it cannot recapture in
+dispatch mode. Tomorrow's build puts the hint-emission point ON the
+dispatch path, which doubles as the new capture point; live precision
+then falls out of the hint logs (analyze-hint-log used/late/mispredict).
+
+BUILD SPEC (tomorrow): (1) conf ladder 0.99/0.9/0.6/0.4 x nmax7, >=4
+interleaved reps, per-worker waits -- picks the depth operating point and
+settles the record. (2) Spine dispatch-side per-layer emission: apply
+router_{L+1} to h_L for all verify-batch rows, top-M=2..3 per token,
+union, send as PREDICTED-provenance hint (existing wire/lease/SPEC_HOST
+machinery); mispredicts land in the host tier, not VRAM. (3) Same site
+optionally dumps (h_L, indices) for offline re-validation.
