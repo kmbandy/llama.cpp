@@ -38,6 +38,7 @@ extern "C" {
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1235,9 +1236,72 @@ public:
         }
 
         pinned_ = pinned;
+        // WP_EXPERT_ASYNC_H2D=1 -- 2026-08-07 consult lever, retargeted at the
+        // 2026 workers after the straggler finding (their staging drain runs
+        // 4.4-5.6 ms/request vs the R9700's 0.6). The drain issues
+        // ggml_backend_tensor_set_async on the backend's compute stream instead
+        // of a blocking copy; stream order keeps compute correct (the graph
+        // runs on the same stream, after the copy). The ONLY new hazard is
+        // staging-buffer reuse while a copy is still in flight, closed here:
+        // the drain records a backend event against the buffer it copied from
+        // (mark_in_flight), and borrow() waits on that event before handing
+        // the buffer out again. By the time a buffer can be re-borrowed its
+        // lease has been released, and every record for it happened before the
+        // release, so record and synchronize can never race on one event.
+        // Backends without events (ggml_backend_event_new -> NULL, e.g.
+        // Vulkan's device iface today) fall back to the sync path untouched.
+        const char * async_env = std::getenv("WP_EXPERT_ASYNC_H2D");
+        if (async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0' &&
+                backend != nullptr) {
+            backend_ = backend;
+            device_  = ggml_backend_get_device(backend);
+            ggml_backend_event_t probe =
+                device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
+            if (probe != nullptr) {
+                ggml_backend_event_free(probe);
+                async_h2d_ = true;
+            }
+        }
         // Logged once: one StagingPool is constructed per worker process.
         std::cerr << "wp expert worker: staging_kind="
-                  << (pinned_ ? "pinned" : "pageable") << std::endl;
+                  << (pinned_ ? "pinned" : "pageable")
+                  << " async_h2d=" << (async_h2d_ ? "on" : "off") << std::endl;
+    }
+
+    ~StagingPool() {
+        for (auto & kv : events_) {
+            ggml_backend_event_free(kv.second);
+        }
+    }
+
+    // True when drain paths should use tensor_set_async + mark_in_flight.
+    bool async_h2d() const { return async_h2d_; }
+
+    // Record "an async copy out of this staging buffer is in flight" on the
+    // backend stream. Dispatch-thread only (same thread as the async issue).
+    void mark_in_flight(void * data) {
+        if (!async_h2d_) {
+            return;
+        }
+        ggml_backend_event_t ev = nullptr;
+        {
+            // The map is shared with borrow(); the record itself is not.
+            std::lock_guard<std::mutex> lock(mutex_);
+            ggml_backend_event_t & slot = events_[data];
+            if (slot == nullptr) {
+                slot = ggml_backend_event_new(device_);
+            }
+            ev = slot;
+        }
+        if (ev == nullptr) {
+            // Device refused an event at runtime -- the copy already issued,
+            // so the only safe fallback is a full backend sync now, and the
+            // feature disarms for the rest of the process.
+            async_h2d_ = false;
+            ggml_backend_synchronize(backend_);
+            return;
+        }
+        ggml_backend_event_record(ev, backend_);
     }
 
     class Lease {
@@ -1274,10 +1338,30 @@ public:
     };
 
     Lease borrow() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        available_cv_.wait(lock, [&]() { return !available_.empty(); });
-        void * result = available_.back();
-        available_.pop_back();
+        void * result = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            available_cv_.wait(lock, [&]() { return !available_.empty(); });
+            result = available_.back();
+            available_.pop_back();
+        }
+        // Async H2D: wait for any in-flight copy OUT of this buffer before a
+        // reader thread refills it. Outside the pool lock -- the wait is on
+        // the GPU, and holding the lock would serialize every other borrower
+        // behind it.
+        if (async_h2d_) {
+            ggml_backend_event_t ev = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = events_.find(result);
+                if (it != events_.end()) {
+                    ev = it->second;
+                }
+            }
+            if (ev != nullptr) {
+                ggml_backend_event_synchronize(ev);
+            }
+        }
         return Lease(this, result);
     }
 
@@ -1311,6 +1395,15 @@ private:
     std::vector<void *>                             available_;
     std::mutex                                      mutex_;
     std::condition_variable                         available_cv_;
+    // Async H2D (WP_EXPERT_ASYNC_H2D). events_ maps a staging buffer's base
+    // pointer to the event that fences its last in-flight copy; guarded by
+    // mutex_. async_h2d_ is atomic only because the runtime-disarm path in
+    // mark_in_flight (dispatch thread) races borrow()'s read (reader threads)
+    // -- either value is safe to observe there.
+    std::atomic<bool>                               async_h2d_{false};
+    ggml_backend_t                                  backend_ = nullptr;
+    ggml_backend_dev_t                              device_  = nullptr;
+    std::unordered_map<void *, ggml_backend_event_t> events_;
 };
 
 class ResidentExpertPool {
@@ -2714,9 +2807,23 @@ private:
                                   std::chrono::steady_clock::time_point();
                 // Upload ONLY this stripe, at its own offset. With one stripe
                 // this is the original whole-page (0, page.size) call.
-                ggml_backend_tensor_set(
-                    slot.raw, (const char *) result->staging->get() + result->offset,
-                    result->offset, result->len);
+                // Async mode: issue on the compute stream and fence the staging
+                // buffer (see StagingPool::mark_in_flight). Compute correctness
+                // needs no fence -- the graph runs on the same stream, after
+                // this copy. NOTE ns_h2d then measures ISSUE time, not copy
+                // time; the copy overlaps reads/submit and the A/B metric is
+                // the request wall.
+                if (staging_.async_h2d()) {
+                    ggml_backend_tensor_set_async(
+                        backend_,
+                        slot.raw, (const char *) result->staging->get() + result->offset,
+                        result->offset, result->len);
+                    staging_.mark_in_flight(result->staging->get());
+                } else {
+                    ggml_backend_tensor_set(
+                        slot.raw, (const char *) result->staging->get() + result->offset,
+                        result->offset, result->len);
+                }
                 if (measure_h2d) {
                     batch.ns_h2d_ +=
                         std::chrono::duration_cast<std::chrono::nanoseconds>(

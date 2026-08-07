@@ -325,6 +325,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # hardcoded). Sweep with READ_STRIPES: more stripes only pay if threads exist
 # to claim them, and both stay clamped to the 16 staging buffers.
 [ -n "${READ_WORKERS:-}" ] && WPOST="$WPOST WP_EXPERT_READ_WORKERS=$READ_WORKERS"
+# ASYNC_H2D=1 -- issue staging->VRAM stripe copies with tensor_set_async on the
+# compute stream; staging reuse is fenced by per-buffer backend events at
+# borrow(). Backends without events (Vulkan today) log async_h2d=off and keep
+# the sync path. Retargeted at the 2026 workers (1070 drain 5.6 ms/pg+ req).
+[ -n "${ASYNC_H2D:-}" ] && WPOST="$WPOST WP_EXPERT_ASYNC_H2D=$ASYNC_H2D"
 # COALESCE=1 -- D1 (2026-08-07 consults): pack every per-expert routing-weight
 # and gather-idx upload into ONE tensor_set per compute call instead of ~17
 # sync device-wide copies per request. Byte-identical by construction; timed
