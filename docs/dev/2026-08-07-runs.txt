@@ -209,3 +209,40 @@ this pool size: conversion is bounded by landing throughput x the
 residency-confidence correlation. It is a TAIL/robustness feature.
 The mean-decode path forward is turbo4 (1.96x, byte gate pending) --
 prediction now rides along for free.
+
+=====================================================================
+THE DECODE WALL, LOCATED (14:50-15:10) -- and the deferral burial
+=====================================================================
+kmbandy's catch: decode FROZEN at 3.75-3.85 across every prefetch
+intervention -- the reads being optimized were not the marginal cost.
+CORRECTION EN ROUTE: my "GPU compute is the wall" claim from cumulative
+stat deltas was WRONG (overlapping buckets -- the 07-26 attribution
+trap). The REQLOG per-request decomposition (svc1 arm, 5142 decode
+requests, R9700) is the truth:
+  request wall mean 7.96 ms (p50 6.9), n_exp 8.5, n_pagein 1.64:
+    ns_read   4.55 ms (57%)  <- cold-read chain, request-scoped
+    ns_h2d    1.66 ms (21%)  <- pageable staging, 14.1 GB/s
+    ns_submit 0.96 ms (12%)
+  self-bench: isolated 1-expert graph 87 us -- compute was never it.
+Decode IS read-bound -- at REQUEST scope, not drive scope: the drive
+idles 80% globally while every request waits ~4.5 ms serially for its
+1-2 cold pages, 43 layers x ~8 ms = the 262 ms step.
+
+DEFERRAL PROBE (dfbase/dfk4/dfk2, kmbandy predicted failure from GLM):
+  base 3.73 / 0.94194   DEFER=4 3.47 / 0.84472   DEFER=2 3.70 / 0.92903
+PREDICTION CONFIRMED AND WORSE: K=4 loses ten acceptance points AND
+0.26 t/s. Mechanism: WP_DEFER_K defers by COUNT, not COLDNESS -- at 74%
+residency it defers mostly resident (cheap) experts while cold reads
+still block; all approximation cost, zero hiding. DS4 DEFERRAL =
+SETTLED-NO. Do not re-raise.
+
+THE RISK-FREE LADDER (kmbandy's frame: the R9700 is the only GPU on the
+fast NVMe -- get the figure out): hardware floor per request ~2-2.5 ms
+read+h2d (21 MB: ~2 ms parallel-striped at 6.2 GB/s proven + 0.75 ms
+pinned at 28.3 GB/s PCIe4 x16 SAM) vs today's 6.2 ms.
+  (1) WP_STAGING_PINNED=1 on the R9700 (pin.sh A/B RUNNING, metric =
+      per-request ns_h2d 1.66 -> ~0.8)
+  (2) parallel intra-page stripes in read_worker (~2-2.5 ms off ns_read)
+  (3) SAM/ReBAR direct NVMe->VRAM -- the roadmap build; kills h2d
+      entirely. Target: request ~4-4.5 ms => decode 5.5-6 byte-identical;
+      turbo4's FIXED build gated on acceptance afterward.
