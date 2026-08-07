@@ -321,3 +321,43 @@ PREFILL TARGET CORRECTED (Codex, verified from vs1 log): 67.55 GiB of
 prefill page-ins / 493 tok -> HARD 42 t/s ceiling on the R9700 leg at
 6.2 GB/s. My ~170 ceiling was 4x wrong. 80-100 prefill NEEDS hardware
 (faster/more storage or +35-45GiB host RAM); software ceiling ~25-40.
+
+=== ROUND 3 (evening): D1 coalesce + env arms + code2000 prefill baseline ===
+Chain /var/tmp/round3.sh on 2026, all arms config of record + noted deltas.
+Commits: 295d84fad (WP_EXPERT_PARAMS_COALESCE + WP_EXPERT_READ_WORKERS),
+8b1ad64b9 (code2000.txt), c8b378a9a (KEEPALIVE_MAIN knob).
+
+arm    decode  prefill  acceptance          trajectory
+base   3.57    15.18    0.87821 137/156     DIVERGED (first-arm pattern)
+d1     3.86    13.87    0.87952 146/166     diverged
+d1gm2  3.94    14.83    0.94194 146/155     CANONICAL
+rw8s6  3.88    16.02    0.92453 147/159     near-canonical flip
+keep   3.94    15.95    0.94194 146/155     CANONICAL
+code2k 3.39    26.15    0.86047 148/172     (2084-tok prompt, UBATCH=2048)
+
+VERDICTS:
+- COALESCE (D1): ADOPT. Both canonical arms hit 3.94 vs the 3.86-3.93
+  pre-D1 band. Trajectory-matched REQLOG (vs nobr2/3): pg0 wall 2.40/2.94
+  -> 1.70 ms (-0.7 to -1.2); pg+ ~neutral (keep 9.04 vs 9.10 baseline;
+  d1gm2's 9.74 was arm noise). ns_params_set: 0.049 ms pg0 / 0.198 pg+
+  (multiple compute waves x chunks). Kimi's 0.35-1.0 ms estimate for the
+  old 17 syncs does NOT replicate as removable time -- the win is ~0.2-0.3
+  ms/req net, concentrated in pagein-free requests. BYTE-IDENTITY CONFIRMED
+  (canonical trajectory reproduced exactly under COALESCE, twice).
+- GM2 (GATHER_MIN_TOKENS=2): NEUTRAL (d1gm2 3.94 = keep 3.94 without it).
+- READ_WORKERS=8 + READ_STRIPES=6: NO GAIN. ns_read flat 5.72->5.77 (pg+
+  cohort). The read path is at its floor; stripe lever CLOSED at decode.
+- KEEPALIVE_MAIN=100: NEUTRAL on the R9700 (3.94 = 3.94). CLOSED.
+- code2k PREFILL: 26.15 t/s at 2084 tok (4.2x tokens -> 1.72x t/s). The
+  2084=2048+36 split means the 36-token remainder sweep pays near-full
+  sweep bytes -- ~40 s/sweep vs 32.5 at 493 tok. Scaling with prompt
+  length CONFIRMED directionally but we are at ~19% of the ~135 ceiling
+  at this width (vs ~37% at 493) -- prefill levers (#10) have MORE
+  headroom at deployment widths, not less. Decode-after-long-prefill 3.39
+  on a divergent trajectory (deeper KV + nondet).
+- NONDETERMINISM WORSE TODAY: base diverged hard (137/156, acc 0.878,
+  mean 2.29 -- cost ~0.3 t/s on its arm). First-arm divergence pattern now
+  seen twice (nobr1 yesterday, base today) -- suspect cold-start state on
+  the CPU DSpark worker. Canonical-trajectory arms remain exactly
+  reproducible, INCLUDING under COALESCE.
+NEW CONFIG OF RECORD: + COALESCE=1 (decode ~3.94).
