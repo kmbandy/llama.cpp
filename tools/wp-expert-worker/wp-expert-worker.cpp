@@ -3212,6 +3212,13 @@ public:
         // Host landings run on their own reader thread and never touch the GPU,
         // so they are reaped and refilled independently of the VRAM path.
         pool_.spec_host_reap();
+        if (spec_prefill_gate_active_) {
+            // Prefill gate: harvest what is in flight, submit nothing new.
+            if (pool_.spec_in_flight()) {
+                return pool_.spec_pagein_poll(false);
+            }
+            return false;
+        }
         if (!pool_.spec_host_in_flight() && !host_queue_.empty()) {
             const size_t take = std::min(spec_chunk_, host_queue_.size());
             std::vector<const ExpertPage *> chunk(
@@ -3252,6 +3259,9 @@ public:
     // reader thread we are waiting on the disk, not on ourselves, and spinning
     // would burn a core for the 3-5 ms of the read while doing nothing.
     bool has_spec_submit_work() const {
+        if (spec_prefill_gate_active_) {
+            return false;   // gated: nothing may be submitted, so do not spin
+        }
         return (!spec_queue_.empty() && !pool_.spec_in_flight()) ||
                (!host_queue_.empty() && !pool_.spec_host_in_flight());
     }
@@ -3341,6 +3351,7 @@ public:
     pipe_expert_partial dispatch(
             const pipe_expert_dispatch_req & request,
             RequestStats & request_stats) {
+        spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
             throw pipe_protocol_error(
                 PIPE_ERR_EXPERT_LAYER,
@@ -3646,6 +3657,18 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 1;
         return v > 0 ? (size_t) v : (size_t) 1;
     }();
+    // WP_EXPERT_SPEC_PREFILL_GATE=1 -- pause speculative SUBMISSION while the
+    // last dispatch was prefill-shaped (n_tokens > 1). During the prefill sweep
+    // the pool is in a guaranteed-eviction regime and spec LATE runs 84-100%:
+    // every speculative read is pure drive contention against a demand stream
+    // that already misses ~everything. Harvest of in-flight reads continues;
+    // the gate opens on the first decode-shaped request. DEFAULT OFF until the
+    // decomposition arm prices it.
+    const bool spec_prefill_gate_enabled_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREFILL_GATE");
+        return e != nullptr && e[0] == '1';
+    }();
+    bool spec_prefill_gate_active_ = false;
     // (page, lease) -- provenance is resolved to a lease at enqueue, so nothing
     // downstream has to know where a page came from.
     std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;

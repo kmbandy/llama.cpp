@@ -303,6 +303,10 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # SPEC_HOST=1 lands PREDICTED pages in host RAM instead of a VRAM slot. Needs
 # the host victim tier; without it the worker falls back to the VRAM path.
 [ -n "${SPEC_HOST:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_HOST=$SPEC_HOST"
+# PREFILL_GATE=1 -- workers pause speculative SUBMISSION while the last dispatch
+# was prefill-shaped (n_tokens>1). Prefill spec LATE is 84-100% = pure drive
+# contention; the gate reopens on the first decode-shaped request.
+[ -n "${PREFILL_GATE:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREFILL_GATE=$PREFILL_GATE"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.
