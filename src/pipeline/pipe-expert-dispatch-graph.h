@@ -4,9 +4,11 @@
 #include "pipe-hash-oracle.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -125,13 +127,25 @@ class graph_dispatcher {
 
     void latch_failure(const char * message) noexcept;
 
-    // Compute and send the PREDICTED hint for layer+predict_ahead() from this
-    // layer's dispatch activations. Called from compute() BEFORE dispatch, on
-    // the dispatch thread, where in_flight == 0 (WP_DEFER_K=0; with deferral on,
-    // send_prefetch_hints declines and counts it). Never throws: a hint carries
-    // no correctness weight, so no predictor failure may latch the dispatcher.
-    void emit_predicted_hints(int32_t layer, const std::vector<float> & activations,
-                              int64_t n_tokens) noexcept;
+    // Predicted-hint pipeline, two halves so the router GEMM never touches the
+    // dispatch critical path (measured 2026-08-07: synchronous scoring cost
+    // +9.4s/run against -3.0s of worker wait bought -- the hints pay only if
+    // the math is free):
+    //
+    // enqueue_prediction() copies this layer's dispatch activations into a
+    // latest-wins slot for the scorer thread and returns immediately. The
+    // scorer applies router_{layer+k}, takes the per-token top-M union, and
+    // parks the result. flush_predicted_hints() -- called from compute() on
+    // the dispatch thread BEFORE dispatch, where the sockets are quiet
+    // (in_flight == 0 under WP_DEFER_K=0) -- sends whatever is parked. The
+    // hint therefore goes out at the NEXT layer's dispatch: one layer of the
+    // k-layer lead is spent on the handoff; pick WP_PREDICT_AHEAD accordingly.
+    // Neither half ever throws: a hint carries no correctness weight, so no
+    // predictor failure may latch the dispatcher.
+    void enqueue_prediction(int32_t layer, const std::vector<float> & activations,
+                            int64_t n_tokens) noexcept;
+    void flush_predicted_hints() noexcept;
+    void predictor_loop();
 
     // WP_PREDICT_CAPTURE=<prefix>: append (layer, h, selected experts) records
     // to <prefix>.<pid>.bin -- the dispatch-path routing capture that replaces
@@ -171,12 +185,27 @@ class graph_dispatcher {
     std::map<int32_t, router_layer>                routers_;
     // Last PREDICTED set sent per target layer -- same repeat-suppression
     // trade-off as last_hint_, kept separate because the sets never coincide
-    // with the hash-layer CERTAIN ones.
+    // with the hash-layer CERTAIN ones. Dispatch thread only.
     std::map<int32_t, std::vector<int32_t>>        last_pred_hint_;
-    // Scratch for emit_predicted_hints, reused across layers. Only touched on
-    // the dispatch thread.
-    std::vector<float>                             pred_scores_;
-    std::vector<int32_t>                           pred_union_;
+    // Scorer thread <-> dispatch thread handoff. pred_mutex_ guards the four
+    // fields below; the scorer owns its own scratch.
+    std::mutex                                     pred_mutex_;
+    std::condition_variable                        pred_cv_;
+    // Latest-wins inbox: a stale activation snapshot is worthless (its target
+    // layer is about to be dispatched anyway), so a new enqueue overwrites.
+    struct pred_job {
+        int32_t            layer    = -1;
+        int64_t            n_tokens = 0;
+        std::vector<float> activations;
+        bool               valid    = false;
+    };
+    pred_job                                       pred_inbox_;
+    // Ready sets awaiting flush, keyed by target layer (a newer set for the
+    // same target overwrites -- same staleness argument).
+    std::map<int32_t, std::vector<int32_t>>        pred_ready_;
+    bool                                           pred_stop_ = false;
+    std::thread                                    pred_thread_;
+    std::atomic<bool>                              pred_thread_started_{ false };
     // WP_PREDICT_CAPTURE stream; opened on first record, closed in the dtor.
     FILE *                                         capture_file_ = nullptr;
     std::atomic<uint64_t>                          next_seq_id{ 1 };

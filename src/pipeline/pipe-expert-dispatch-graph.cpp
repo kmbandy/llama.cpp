@@ -119,6 +119,16 @@ graph_dispatcher::~graph_dispatcher() {
     } catch (...) {
         // Destructor must not throw; workers will drop on socket close.
     }
+    if (pred_thread_started_.load()) {
+        {
+            std::lock_guard<std::mutex> lock(pred_mutex_);
+            pred_stop_ = true;
+        }
+        pred_cv_.notify_one();
+        if (pred_thread_.joinable()) {
+            pred_thread_.join();
+        }
+    }
     if (capture_file_ != nullptr) {
         std::fclose(capture_file_);
         capture_file_ = nullptr;
@@ -262,55 +272,109 @@ void graph_dispatcher::register_router_layer(int32_t layer, int32_t n_expert, in
     rl.b.assign(b, b + (size_t) n_expert);
 }
 
-void graph_dispatcher::emit_predicted_hints(int32_t layer, const std::vector<float> & activations,
-                                            int64_t n_tokens) noexcept {
-    // Never throws past this frame: a hint carries no correctness weight, so no
-    // failure here may latch the dispatcher (compute()'s catch would).
+void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float> & activations,
+                                          int64_t n_tokens) noexcept {
     try {
         const int k = predict_ahead();
-        if (k <= 0 || n_tokens <= 0 || n_tokens > predict_max_tokens()) {
+        if (k <= 0 || n_tokens <= 0 || n_tokens > predict_max_tokens() || routers_.empty()) {
             return;
         }
-        const auto it = routers_.find(layer + k);
-        if (it == routers_.end()) {
+        if (routers_.find(layer + k) == routers_.end()) {
             return;   // past the last layer, or the oracle was cleared
         }
-        const router_layer & rl       = it->second;
-        const int32_t        n_expert = remote.n_expert();
-        const int32_t        n_embd   = remote.n_embd();
-        const int            top_m    = predict_topm();
+        if (!pred_thread_started_.exchange(true)) {
+            pred_thread_ = std::thread([this] { predictor_loop(); });
+        }
+        {
+            std::lock_guard<std::mutex> lock(pred_mutex_);
+            pred_inbox_.layer    = layer;
+            pred_inbox_.n_tokens = n_tokens;
+            pred_inbox_.activations.assign(activations.begin(), activations.end());
+            pred_inbox_.valid    = true;
+        }
+        pred_cv_.notify_one();
+    } catch (...) {
+        // Swallow. A dropped snapshot costs one hint, never the decode.
+    }
+}
 
-        // DS4 routing on the CPU, replicating build_moe_ffn's SQRT_SOFTPLUS
-        // branch: probs = sqrt(softplus(W @ h)); selection score = probs +
-        // exp_probs_b. No expert groups and no gate bias on this arch.
-        std::set<int32_t> unioned;
-        pred_scores_.resize((size_t) n_expert);
-        for (int64_t token = 0; token < n_tokens; ++token) {
-            const float * h = activations.data() + (size_t) token * (size_t) n_embd;
-            for (int32_t e = 0; e < n_expert; ++e) {
-                const float * row = rl.w.data() + (size_t) e * (size_t) n_embd;
-                float acc = 0.0f;
-                for (int32_t i = 0; i < n_embd; ++i) {
-                    acc += row[i] * h[i];
+void graph_dispatcher::predictor_loop() {
+    std::vector<float>   scores;
+    std::vector<int32_t> unioned;
+    for (;;) {
+        pred_job job;
+        {
+            std::unique_lock<std::mutex> lock(pred_mutex_);
+            pred_cv_.wait(lock, [this] { return pred_stop_ || pred_inbox_.valid; });
+            if (pred_stop_) {
+                return;
+            }
+            job = std::move(pred_inbox_);
+            pred_inbox_.valid = false;
+        }
+        try {
+            const int  k  = predict_ahead();
+            const auto it = routers_.find(job.layer + k);
+            if (it == routers_.end()) {
+                continue;
+            }
+            const router_layer & rl       = it->second;
+            const int32_t        n_expert = remote.n_expert();
+            const int32_t        n_embd   = remote.n_embd();
+            const int            top_m    = predict_topm();
+
+            // DS4 routing, replicating build_moe_ffn's SQRT_SOFTPLUS branch:
+            // probs = sqrt(softplus(W @ h)); selection score = probs +
+            // exp_probs_b. No expert groups and no gate bias on this arch.
+            std::set<int32_t> u;
+            scores.resize((size_t) n_expert);
+            for (int64_t token = 0; token < job.n_tokens; ++token) {
+                const float * h = job.activations.data() + (size_t) token * (size_t) n_embd;
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    const float * row = rl.w.data() + (size_t) e * (size_t) n_embd;
+                    float acc = 0.0f;
+                    for (int32_t i = 0; i < n_embd; ++i) {
+                        acc += row[i] * h[i];
+                    }
+                    // Numerically stable softplus: max(x,0) + log1p(exp(-|x|)).
+                    const float sp = std::max(acc, 0.0f) + std::log1p(std::exp(-std::fabs(acc)));
+                    scores[(size_t) e] = std::sqrt(sp) + rl.b[(size_t) e];
                 }
-                // Numerically stable softplus: max(x,0) + log1p(exp(-|x|)).
-                const float sp = std::max(acc, 0.0f) + std::log1p(std::exp(-std::fabs(acc)));
-                pred_scores_[(size_t) e] = std::sqrt(sp) + rl.b[(size_t) e];
+                for (int m = 0; m < top_m; ++m) {
+                    const auto best = std::max_element(scores.begin(), scores.end());
+                    u.insert((int32_t) (best - scores.begin()));
+                    *best = -std::numeric_limits<float>::infinity();
+                }
             }
-            for (int m = 0; m < top_m; ++m) {
-                const auto best = std::max_element(pred_scores_.begin(), pred_scores_.end());
-                unioned.insert((int32_t) (best - pred_scores_.begin()));
-                *best = -std::numeric_limits<float>::infinity();
+            unioned.assign(u.begin(), u.end());   // ascending, as send expects
+            {
+                std::lock_guard<std::mutex> lock(pred_mutex_);
+                pred_ready_[job.layer + k] = unioned;
             }
+        } catch (...) {
+            // Swallow and keep serving; one lost prediction is one lost hint.
         }
+    }
+}
 
-        pred_union_.assign(unioned.begin(), unioned.end());   // ascending, as send expects
-        std::vector<int32_t> & previous = last_pred_hint_[layer + k];
-        if (previous == pred_union_) {
-            return;   // the worker would resolve it to pages already queued
+void graph_dispatcher::flush_predicted_hints() noexcept {
+    try {
+        std::map<int32_t, std::vector<int32_t>> ready;
+        {
+            std::lock_guard<std::mutex> lock(pred_mutex_);
+            if (pred_ready_.empty()) {
+                return;
+            }
+            ready.swap(pred_ready_);
         }
-        previous = pred_union_;
-        (void) remote.send_prefetch_hints(layer + k, pred_union_, PIPE_HINT_PREDICTED);
+        for (auto & entry : ready) {
+            std::vector<int32_t> & previous = last_pred_hint_[entry.first];
+            if (previous == entry.second) {
+                continue;   // the worker would resolve it to pages already queued
+            }
+            previous = entry.second;
+            (void) remote.send_prefetch_hints(entry.first, entry.second, PIPE_HINT_PREDICTED);
+        }
     } catch (...) {
         // Swallow. A broken socket surfaces on the next real dispatch.
     }
@@ -571,12 +635,14 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             assignments.push_back(std::move(entry.second));
         }
 
-        // Predicted hints go out BEFORE this layer's dispatch: the workers then
-        // hold L+k's hint for the entire time they serve layers L..L+k-1, which
-        // is the whole lead the prediction buys. At this point in_flight == 0
-        // (WP_DEFER_K=0 waits out every layer; with deferral on,
-        // send_prefetch_hints declines and counts it).
-        owner->emit_predicted_hints(context->layer, wire_activations, n_tokens);
+        // Predicted hints: flush whatever the scorer thread finished (sockets
+        // are quiet here -- in_flight == 0 under WP_DEFER_K=0; with deferral
+        // on, send_prefetch_hints declines and counts it), then hand it this
+        // layer's activations. The GEMM runs off-thread and its result ships
+        // at the NEXT layer's entry -- one layer of lead spent on the handoff
+        // instead of +26 ms/step of critical-path scoring (2026-08-07 A/B).
+        owner->flush_predicted_hints();
+        owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
         if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
             capture_prefix != nullptr && capture_prefix[0] != '\0') {
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
