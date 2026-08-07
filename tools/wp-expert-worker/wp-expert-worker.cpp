@@ -1979,8 +1979,13 @@ public:
                     }
                 }
             }
+            // Stripe mode keeps the serial path's invariant: concurrent reader
+            // threads <= staging buffers, so outstanding borrows can never
+            // exceed the pool and a blocked borrow always has a draining page
+            // ahead of it.
             const size_t worker_count = stripe_parallel_
-                ? std::min<size_t>(batch.state_->stripe_jobs.size(), (size_t) 4)
+                ? std::min<size_t>(batch.state_->stripe_jobs.size(),
+                                   std::min<size_t>((size_t) 4, (size_t) staging_.buffer_count()))
                 : std::min<size_t>(
                       batch.state_->pageins.size(), (size_t) staging_.buffer_count());
             batch.workers_.reserve(worker_count);
@@ -2460,6 +2465,13 @@ private:
                 demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
             }
             try {
+                // The lease pointer must be COPIED UNDER THE MUTEX: another
+                // thread may be assigning shared.lease inside its own critical
+                // section, and a concurrent unguarded read of a shared_ptr is a
+                // data race (this exact line, read outside the lock, hung the
+                // 1070 worker on its first stripe-parallel page-in batch,
+                // 2026-08-07 sp1).
+                std::shared_ptr<StagingPool::Lease> lease_local;
                 {
                     std::lock_guard<std::mutex> lock(shared.lease_mutex);
                     if (!shared.lease) {
@@ -2471,8 +2483,9 @@ private:
                             test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
                         }
                     }
+                    lease_local = shared.lease;
                 }
-                result->staging = shared.lease;
+                result->staging = std::move(lease_local);
                 if (state->measure) {
                     result->read_started = std::chrono::steady_clock::now();
                     result->read_timed   = true;
