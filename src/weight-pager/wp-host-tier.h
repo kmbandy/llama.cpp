@@ -97,7 +97,16 @@ public:
     // built-in hipMemcpy fallback would issue a device copy from an address
     // that does not exist. With no reader set and no HIP/CUDA build,
     // store_from_device refuses rather than guessing.
-    using DeviceReader = std::function<bool(void * dst_host, const void * src_device, size_t n)>;
+    //
+    // page_idx is the tier key for the page being stored, and the reader MUST
+    // resolve which device memory to read from IT, not from src_device: on
+    // Vulkan every standalone buffer's base is the SAME sentinel, so
+    // src_device collides across slots and pointer-matching D2H's whichever
+    // slot happens to match first. That exact bug shipped 604-of-605 wrong
+    // pages per run on the RX 480 (2026-08-06, WP_EXPERT_TIER_VERIFY).
+    // src_device is retained for raw-addressable pools and sanity checks.
+    using DeviceReader = std::function<bool(
+        void * dst_host, const void * src_device, size_t n, int page_idx)>;
     void set_device_reader(DeviceReader reader) { device_reader_ = std::move(reader); }
 
     // Remove a page from the tier (used when it is promoted back to VRAM, so a

@@ -1315,7 +1315,12 @@ bool WeightPager::init(const Config &             cfg,
             // a raw device memcpy: on Vulkan a slot pointer is a sentinel base
             // plus an offset and cannot be dereferenced by hip*/cuda*.
             host_tier->set_device_reader(
-                [this](void * dst_host, const void * src_device, size_t n) {
+                [this](void * dst_host, const void * src_device, size_t n,
+                       int /*page_idx*/) {
+                    // The transport resolves sentinel+offset pool pointers
+                    // itself, so this reader keys off src_device safely and
+                    // page_idx is unused here (see wp-host-tier.h on why the
+                    // expert worker's reader must key off page_idx instead).
                     return transport_.read_to_host(dst_host, src_device, n);
                 });
             host_tier_ = std::move(host_tier);

@@ -232,7 +232,7 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
     // in-flight transfer for this page, so the device slot is settled here.
     bool ok;
     if (device_reader_) {
-        ok = device_reader_(arena_ + offset, device_bytes, n);
+        ok = device_reader_(arena_ + offset, device_bytes, n, page_idx);
         if (!ok) {
             LLAMA_LOG_WARN("wp::HostTier::store_from_device: device read D2H(%zu) page %d failed\n",
                            n, page_idx);

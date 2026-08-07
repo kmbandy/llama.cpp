@@ -1519,9 +1519,16 @@ public:
                 throw std::runtime_error("failed to initialize host victim tier");
             }
             host_tier_.set_device_reader(
-                [this](void * dst_host, const void * src_device, size_t n) {
+                [this](void * dst_host, const void * src_device, size_t n, int page_idx) {
+                    // Match by cache_id, never by data pointer: on Vulkan every
+                    // standalone slot buffer's base is the same sentinel, so
+                    // slot.raw->data collides across slots and pointer matching
+                    // reads whichever slot comes first -- the 2026-08-06 tier
+                    // corruption (604/605 restores wrong on the RX 480, clean
+                    // on CUDA/ROCm whose addresses are real and unique).
+                    (void) src_device;
                     for (const Slot & slot : slots_) {
-                        if (slot.raw != nullptr && slot.raw->data == src_device) {
+                        if (slot.valid && slot.raw != nullptr && slot.cache_id == page_idx) {
                             ggml_backend_tensor_get(slot.raw, dst_host, 0, n);
                             return true;
                         }
