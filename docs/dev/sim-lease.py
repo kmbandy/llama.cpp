@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Lease-band sweep over a WP_HINT_LOG event stream (H/S/R records).
+
+Replays the worker's real interleaved stream -- speculative inserts (S) and
+dispatch references (R) -- against a simulated slot cache, and sweeps how long
+a speculatively-inserted page is PROTECTED from eviction ("the lease").
+
+WHY. analyze-hint-log.py on 2026-08-06 evening shows the R9700 at ~50% LATE:
+the prediction was right, the page was speculatively read, and it was evicted
+again before its layer's dispatch arrived. Hypothesis under test: with
+use-count eviction a fresh speculative page has count 0 -- the policy's FIRST
+victim -- so speculation and eviction actively fight. A lease (spec pages
+cannot be evicted until first referenced, bounded by a token TTL so
+mispredicts cannot squat) should convert LATE to used at near-zero cost.
+
+Metrics per config:
+  demand_miss  R-references not resident (the page-ins the worker would do)
+  late         S-inserted pages evicted before their first R
+  used         S-inserted pages that were resident at their first R
+  squat_max    peak slots held by never-referenced leased pages (mispredict cost)
+
+Token boundaries = R-layer wrapping back below the previous R-layer.
+
+Usage: sim-lease.py <hint-log> [cap=2200]
+"""
+import sys
+from collections import OrderedDict
+
+
+def parse(path):
+    """-> list of ('S'|'R', layer, [ids]) in stream order."""
+    ev = []
+    for line in open(path):
+        f = line.split()
+        if not f or f[0] not in ("S", "R"):
+            continue
+        ev.append((f[0], int(f[1]), [int(x) for x in f[2:]]))
+    return ev
+
+
+class Cache:
+    """One slot pool. policy: 'lru' or 'usecount' (freq persists after evict,
+    matching the worker's LFU). Lease: spec-inserted pages are unevictable
+    until first reference or ttl tokens, whichever first (ttl None = no lease,
+    ttl -1 = until referenced, unbounded)."""
+
+    def __init__(self, cap, policy, ttl):
+        self.cap, self.policy, self.ttl = cap, policy, ttl
+        self.c = OrderedDict()          # page -> last-touch clock
+        self.freq = {}                  # page -> lifetime refs (usecount)
+        self.lease = {}                 # page -> expiry token (or None=until ref)
+        self.clock = 0
+        self.token = 0
+        self.demand_miss = self.late = self.used = 0
+        self.spec_live = {}             # spec pages awaiting first R
+        self.squat_max = 0
+
+    def _evict_one(self):
+        # candidates = resident pages not under lease
+        cands = [p for p in self.c if p not in self.lease]
+        if not cands:
+            # every slot leased: lease loses, evict globally-oldest anyway
+            # (real worker must make progress too). Counted as lease overflow.
+            cands = list(self.c)
+        if self.policy == "usecount":
+            victim = min(cands, key=lambda k: (self.freq.get(k, 0), self.c[k]))
+        else:
+            victim = min(cands, key=lambda k: self.c[k])
+        if victim in self.spec_live:
+            self.late += 1
+            del self.spec_live[victim]
+        self.lease.pop(victim, None)
+        del self.c[victim]
+
+    def _insert(self, p):
+        if len(self.c) >= self.cap:
+            self._evict_one()
+        self.c[p] = self.clock
+
+    def new_token(self):
+        self.token += 1
+        if self.ttl is not None and self.ttl >= 0:
+            dead = [p for p, exp in self.lease.items() if exp is not None
+                    and self.token >= exp]
+            for p in dead:
+                del self.lease[p]
+
+    def spec_insert(self, p):
+        self.clock += 1
+        if p in self.c:
+            self.c[p] = self.clock
+            return
+        self._insert(p)
+        self.spec_live[p] = True
+        if self.ttl is not None:
+            self.lease[p] = None if self.ttl < 0 else self.token + self.ttl
+        self.squat_max = max(self.squat_max, len(self.spec_live))
+
+    def reference(self, p):
+        self.clock += 1
+        self.freq[p] = self.freq.get(p, 0) + 1
+        if p in self.spec_live:
+            del self.spec_live[p]
+            self.lease.pop(p, None)
+            self.used += 1
+        if p in self.c:
+            self.c[p] = self.clock
+        else:
+            self.demand_miss += 1
+            self._insert(p)
+
+
+def run(events, cap, policy, ttl):
+    cache = Cache(cap, policy, ttl)
+    prev_r_layer = None
+    for kind, layer, ids in events:
+        if kind == "R":
+            if prev_r_layer is not None and layer < prev_r_layer:
+                cache.new_token()
+            prev_r_layer = layer
+            for e in ids:
+                cache.reference((layer, e))
+        else:
+            for e in ids:
+                cache.spec_insert((layer, e))
+    return cache
+
+
+path = sys.argv[1]
+cap = int(sys.argv[2]) if len(sys.argv) > 2 else 2200
+events = parse(path)
+n_s = sum(len(i) for k, _, i in events if k == "S")
+n_r = sum(len(i) for k, _, i in events if k == "R")
+print("%s: %d spec inserts, %d references, cap %d" % (path, n_s, n_r, cap))
+print("%-9s %-10s %11s %6s %6s %10s" %
+      ("policy", "lease", "demand_miss", "used", "late", "squat_max"))
+for policy in ("usecount", "lru"):
+    for ttl, label in ((None, "none"), (1, "1 tok"), (2, "2 tok"),
+                       (4, "4 tok"), (8, "8 tok"), (-1, "until-ref")):
+        c = run(events, cap, policy, ttl)
+        print("%-9s %-10s %11d %6d %6d %10d" %
+              (policy, label, c.demand_miss, c.used, c.late, c.squat_max))
