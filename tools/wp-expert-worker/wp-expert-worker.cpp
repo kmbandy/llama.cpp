@@ -1815,6 +1815,54 @@ public:
 
                     HostHit & host_hit = host_hits[entry_index];
                     if (host_hit.borrow != wp::HostTier::kInvalidBorrowHandle) {
+                        // WP_EXPERT_TIER_VERIFY=1 -- re-read every tier-restored
+                        // page from its blob and memcmp against what the tier
+                        // returned. Diagnostic for the 2026-08-06 finding that
+                        // tier-on runs produce divergent text: discriminates
+                        // "restore path corrupts pages" from "timing-induced
+                        // reassociation". Costs an extra buffered read per host
+                        // hit; never enable in a measured arm.
+                        static const bool tier_verify = [] {
+                            const char * e = std::getenv("WP_EXPERT_TIER_VERIFY");
+                            return e != nullptr && e[0] == '1';
+                        }();
+                        if (tier_verify) {
+                            static uint64_t n_verified = 0, n_mismatch = 0, n_readfail = 0;
+                            std::vector<uint8_t> disk((size_t) page.size);
+                            bool read_ok = false;
+                            const int vfd = ::open(page.blob.c_str(), O_RDONLY);
+                            if (vfd >= 0) {
+                                read_ok = ::pread(vfd, disk.data(), (size_t) page.size,
+                                                  (off_t) page.offset) == (ssize_t) page.size;
+                                ::close(vfd);
+                            }
+                            ++n_verified;
+                            if (!read_ok) {
+                                ++n_readfail;
+                                fprintf(stderr,
+                                        "W tier-verify REREAD-FAIL layer=%d expert=%d\n",
+                                        page.layer, page.expert);
+                            } else if (memcmp(disk.data(), host_hit.src,
+                                              (size_t) page.size) != 0) {
+                                size_t first = 0;
+                                const uint8_t * t = (const uint8_t *) host_hit.src;
+                                while (first < (size_t) page.size && disk[first] == t[first]) {
+                                    ++first;
+                                }
+                                ++n_mismatch;
+                                fprintf(stderr,
+                                        "W tier-verify MISMATCH layer=%d expert=%d size=%llu "
+                                        "first_diff_byte=%zu disk=%02x tier=%02x\n",
+                                        page.layer, page.expert,
+                                        (unsigned long long) page.size, first,
+                                        disk[first], t[first]);
+                            }
+                            fprintf(stderr,
+                                    "W tier-verify totals verified=%llu mismatch=%llu readfail=%llu\n",
+                                    (unsigned long long) n_verified,
+                                    (unsigned long long) n_mismatch,
+                                    (unsigned long long) n_readfail);
+                        }
                         const std::chrono::steady_clock::time_point host_get_started =
                             measure ? std::chrono::steady_clock::now() :
                                       std::chrono::steady_clock::time_point();
