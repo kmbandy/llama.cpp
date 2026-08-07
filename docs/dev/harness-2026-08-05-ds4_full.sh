@@ -317,6 +317,15 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # read concurrently (QD>1/page). Attacks the decode request's ns_read (4.5 ms
 # for 1-2 pages read serially at QD1 vs the drive's 6.2 GB/s proven at depth).
 [ -n "${STRIPEPAR:-}" ] && WPOST="$WPOST WP_EXPERT_STRIPE_PARALLEL=$STRIPEPAR"
+# READ_WORKERS=<n> -- cap on concurrent stripe reader threads (default 4, was
+# hardcoded). Sweep with READ_STRIPES: more stripes only pay if threads exist
+# to claim them, and both stay clamped to the 16 staging buffers.
+[ -n "${READ_WORKERS:-}" ] && WPOST="$WPOST WP_EXPERT_READ_WORKERS=$READ_WORKERS"
+# COALESCE=1 -- D1 (2026-08-07 consults): pack every per-expert routing-weight
+# and gather-idx upload into ONE tensor_set per compute call instead of ~17
+# sync device-wide copies per request. Byte-identical by construction; timed
+# in the new trailing REQLOG column ns_params_set.
+[ -n "${COALESCE:-}" ] && WPOST="$WPOST WP_EXPERT_PARAMS_COALESCE=$COALESCE"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.

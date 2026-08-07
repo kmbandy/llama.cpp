@@ -103,6 +103,12 @@ struct RequestStats {
     // that got at least one token, which biases the naive estimate.
     uint64_t n_weight_nonzero = 0;   // token-expert pairs actually routed
     uint64_t n_weight_total   = 0;   // token-expert pairs actually COMPUTED
+    // D1 (2026-08-07): the coalesced routing-weight/gather-idx blob upload.
+    // The per-tensor uploads it replaces were never timed anywhere -- they sat
+    // in the gap between ns_graph_build and ns_submit (the "accounting hole"),
+    // so this counter is NEW time made visible, not time moved from another
+    // column. Zero when WP_EXPERT_PARAMS_COALESCE is off.
+    uint64_t ns_params_set = 0;
 };
 
 // Forward declarations: the probe itself is defined further down, next to
@@ -1983,9 +1989,18 @@ public:
             // threads <= staging buffers, so outstanding borrows can never
             // exceed the pool and a blocked borrow always has a draining page
             // ahead of it.
+            // WP_EXPERT_READ_WORKERS=<n>: cap on concurrent stripe reader
+            // threads (default 4, the value that was hardcoded here). Still
+            // clamped to the staging pool so the borrow invariant above holds.
+            static const size_t s_read_workers = [] {
+                const char * e = std::getenv("WP_EXPERT_READ_WORKERS");
+                const long parsed =
+                    (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
+                return parsed > 0 ? (size_t) parsed : (size_t) 4;
+            }();
             const size_t worker_count = stripe_parallel_
                 ? std::min<size_t>(batch.state_->stripe_jobs.size(),
-                                   std::min<size_t>((size_t) 4, (size_t) staging_.buffer_count()))
+                                   std::min<size_t>(s_read_workers, (size_t) staging_.buffer_count()))
                 : std::min<size_t>(
                       batch.state_->pageins.size(), (size_t) staging_.buffer_count());
             batch.workers_.reserve(worker_count);
@@ -4058,6 +4073,34 @@ private:
         ++request_stats.n_device_allocs;
     }
 
+    // D1: persistent device span for the per-expert routing weights and gather
+    // indices. Deliberately NOT part of io_buffer_: prepare_io uploads the
+    // activations into io_buffer_ BEFORE compute_batch runs, and chunked calls
+    // read `result` back out of it as the fold seed -- growing it mid-request
+    // would silently drop both. This buffer's content never outlives one
+    // compute_batch call, so growing it here is always safe.
+    void grow_params_buffer(size_t size, RequestStats & request_stats) {
+        if (params_buffer_ && params_buffer_size_ >= size) {
+            return;
+        }
+        // Geometric growth for the same reason as grow_io_buffer: Vulkan frees
+        // stall ~318 ms each, so reallocate O(log n) times, not per high-water
+        // mark.
+        static constexpr size_t PARAMS_FLOOR = 1u << 16;   // 64 KiB
+        size_t want = std::max(size, PARAMS_FLOOR);
+        if (params_buffer_ && want < params_buffer_size_ * 2) {
+            want = params_buffer_size_ * 2;
+        }
+        buffer_ptr buffer(ggml_backend_alloc_buffer(backend_.get(), want));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate expert params buffer");
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        params_buffer_ = std::move(buffer);
+        params_buffer_size_ = want;
+        ++request_stats.n_device_allocs;
+    }
+
     ggml_tensor * make_io_tensor(
             ggml_context * ctx, uint32_t n_tokens, size_t offset) const {
         ggml_tensor * tensor = ggml_new_tensor_2d(
@@ -4200,6 +4243,20 @@ private:
         // worker, so this must be decided per request and never cached.
         const bool use_gather = s_gather && !force_dense &&
                                 (int64_t) request.n_tokens >= (int64_t) s_gather_min_tokens;
+        // WP_EXPERT_PARAMS_COALESCE=1 -- D1 from the 2026-08-07 consults. The
+        // per-expert routing-weight and gather-idx uploads below are ~2 sync
+        // ggml_backend_tensor_set calls per expert (~17/request at 8.5 experts)
+        // of a few dozen bytes each; on HIP every one is a device-wide sync
+        // memcpy, and together they are the 0.35-1.0 ms "accounting hole"
+        // between ns_graph_build and ns_submit. Coalesced mode binds those
+        // tensors into ONE packed span of params_buffer_ at build time and
+        // uploads the whole span with a single tensor_set. The graph is
+        // unchanged -- same tensors, same values, different storage -- so the
+        // output must stay byte-identical to the per-tensor path.
+        static const bool s_params_coalesce = [] {
+            const char * e = std::getenv("WP_EXPERT_PARAMS_COALESCE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
         const auto build_started = std::chrono::steady_clock::now();
         // gather adds per expert: idx, sub_input, scattered (+ the add) -- budget
         // generously, ggml_init only reserves metadata.
@@ -4207,7 +4264,9 @@ private:
         // added 2026-08-05. These are budgeted unconditionally even when the
         // clamp is off: under-budgeting the graph is a hard allocation failure,
         // and ggml_init only reserves metadata, so the slack is free.
-        const size_t tensor_count = (s_gather ? 20 : 14) * n_selected + 8;
+        // +1 constant for the coalesced-params upload blob (D1), budgeted
+        // unconditionally -- same free-slack argument as the clamp pair.
+        const size_t tensor_count = (s_gather ? 20 : 14) * n_selected + 9;
         const size_t graph_nodes  = (s_gather ? 12 :  8) * n_selected + 3;
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
@@ -4238,6 +4297,34 @@ private:
         // delta into a different token. Seeding makes chunked output bit-identical
         // to the unchunked path.
         ggml_tensor * sum = add_previous ? result : nullptr;
+        // D1 packing state for this call. Offsets are assigned in build order;
+        // params_host mirrors the device span byte-for-byte (alignment pad = 0).
+        // The buffer is grown BEFORE any tensor attaches into it -- growing
+        // reallocates, which would orphan already-attached tensors. The bound is
+        // exact-or-over: per expert one F32 row-vector and one I32 idx, each at
+        // most n_tokens entries, each padded to the buffer alignment.
+        const size_t params_align = s_params_coalesce
+            ? ggml_backend_buft_get_alignment(
+                  ggml_backend_get_default_buffer_type(backend_.get()))
+            : 1;
+        std::vector<uint8_t> params_host;
+        size_t params_span = 0;
+        if (s_params_coalesce) {
+            const size_t per =
+                GGML_PAD((size_t) request.n_tokens * sizeof(float), params_align);
+            grow_params_buffer(2 * per * n_selected + params_align, request_stats);
+        }
+        const auto place_param = [&](ggml_tensor * t, const void * data, size_t nbytes) {
+            const size_t off = GGML_PAD(params_span, params_align);
+            params_host.resize(off, 0);   // zero-fill the alignment gap
+            params_host.insert(
+                params_host.end(),
+                (const uint8_t *) data, (const uint8_t *) data + nbytes);
+            attach_weight(
+                t, params_buffer_.get(),
+                ggml_backend_buffer_get_base(params_buffer_.get()), off);
+            params_span = off + nbytes;
+        };
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
         // Parallel to routing_weights: the gathered token indices per expert, kept
@@ -4284,6 +4371,9 @@ private:
                 }
                 idx_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) idx.size());
                 ggml_set_input(idx_t);
+                if (s_params_coalesce) {
+                    place_param(idx_t, idx.data(), idx.size() * sizeof(int32_t));
+                }
                 ffn_in = ggml_get_rows(ctx.get(), input, idx_t);
             }
             ggml_tensor * gate = ggml_mul_mat(ctx.get(), make_weight("gate"), ffn_in);
@@ -4316,6 +4406,19 @@ private:
             ggml_tensor * weights =
                 ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, n_rows);
             ggml_set_input(weights);
+            if (s_params_coalesce) {
+                // Same values the per-tensor path uploads after alloc_graph:
+                // the compacted (gather) or full (dense) router weights.
+                const auto & wv = request.assignments[i].weights;
+                if (use_gather) {
+                    std::vector<float> compact;
+                    compact.reserve(idx.size());
+                    for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
+                    place_param(weights, compact.data(), compact.size() * sizeof(float));
+                } else {
+                    place_param(weights, wv.data(), wv.size() * sizeof(float));
+                }
+            }
             ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
             if (use_gather) {
                 // SCATTER-ADD back to full token width. get_rows_back sums every
@@ -4363,19 +4466,39 @@ private:
             // figure even after the fix and hide whether it worked.
             if (use_gather) {
                 const auto & idx = gather_idx[k].second;
-                std::vector<float> compact;
-                compact.reserve(idx.size());
-                for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
-                request_stats.n_weight_total += compact.size();
-                ggml_backend_tensor_set(
-                    item.first, compact.data(), 0, compact.size() * sizeof(float));
-                ggml_backend_tensor_set(
-                    gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t));
+                request_stats.n_weight_total += idx.size();
+                if (!s_params_coalesce) {
+                    std::vector<float> compact;
+                    compact.reserve(idx.size());
+                    for (int32_t t : idx) { compact.push_back(wv[(size_t) t]); }
+                    ggml_backend_tensor_set(
+                        item.first, compact.data(), 0, compact.size() * sizeof(float));
+                    ggml_backend_tensor_set(
+                        gather_idx[k].first, idx.data(), 0, idx.size() * sizeof(int32_t));
+                }
             } else {
                 request_stats.n_weight_total += wv.size();
-                ggml_backend_tensor_set(
-                    item.first, wv.data(), 0, wv.size() * sizeof(float));
+                if (!s_params_coalesce) {
+                    ggml_backend_tensor_set(
+                        item.first, wv.data(), 0, wv.size() * sizeof(float));
+                }
             }
+        }
+        if (s_params_coalesce && params_span > 0) {
+            // THE single upload D1 exists for: every routing weight and gather
+            // idx this call packed, in one tensor_set. The blob tensor is not
+            // part of the graph -- it is only a typed window over the span so
+            // the backend API can address it.
+            ggml_tensor * blob =
+                ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) params_span);
+            attach_weight(
+                blob, params_buffer_.get(),
+                ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            const auto params_started = std::chrono::steady_clock::now();
+            ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
+            request_stats.ns_params_set +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - params_started).count();
         }
         const auto submit_started = std::chrono::steady_clock::now();
         const enum ggml_status status =
@@ -4418,6 +4541,8 @@ private:
     buffer_ptr     io_buffer_;
     size_t         io_buffer_size_ = 0;
     uint64_t            io_grow_count_ = 0;
+    buffer_ptr     params_buffer_;
+    size_t         params_buffer_size_ = 0;
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
@@ -4488,8 +4613,13 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     //   layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep
     //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
     //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
+    //   ns_params_set
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
+    // ns_params_set (added 2026-08-07): the coalesced D1 blob upload; 0 when
+    // WP_EXPERT_PARAMS_COALESCE is off. Appended AFTER epoch_end -- the format
+    // is positional-from-the-left, so trailing additions never move existing
+    // columns, but anything indexing epoch_end as [-1] must switch to [21].
     // Segment into tokens by watching request.layer wrap back to its minimum.
     //
     // n_tokens (added 2026-08-03) IS THE PREFILL/DECODE LABEL, and it is the whole
@@ -4688,7 +4818,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 const RequestStats & s = request_stats;
                 fprintf(req_log,
                         "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
-                        "%llu %llu %llu %llu %llu %llu %llu %llu %.6f\n",
+                        "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu\n",
                         request.layer, request.n_tokens, request.assignments.size(),
                         (unsigned long long) s.n_resident,
                         (unsigned long long) s.n_pagein,
@@ -4712,7 +4842,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                         // adding columns here keeps every existing parser working.
                         (unsigned long long) s.n_weight_nonzero,
                         (unsigned long long) s.n_weight_total,
-                        epoch_end);
+                        epoch_end,
+                        (unsigned long long) s.ns_params_set);
                 fflush(req_log);
             }
         } catch (const pipe_protocol_error & error) {
