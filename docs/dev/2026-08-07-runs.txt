@@ -164,3 +164,33 @@ NEXT (proposed to kmbandy, pending go): turbo4 temp-0 byte gate (the
 2026-08-03 rotation fix is IN today's binaries via the WIP tree) + timing
 arm; then WP_DEFER_K 1/2/4 sweep on the code point -- prediction-free
 read-latency hiding, built, never measured. 3.83 x 1.96 x ~1.3 ~= 10.
+
+=====================================================================
+THE PACKING THREAD (12:34-13:30) -- kmbandy: "the drive is idle 70% of
+the time... these predictions need to be packing in"
+=====================================================================
+CLAW BANKING (code conf-0.4, k=2 M=1 no-preempt, 3x interleaved):
+  clawb1 3.83  clawm1 3.82  clawb2 3.54*  clawm2 3.27*  clawb3 3.81
+  clawm3 3.85 <- campaign-best on a HINT arm. (* = sag window)
+  Counters: landed ~794, promoted 307-350 (39-44% incremental). BANKS.
+LIVE DRIVE PROFILE (new /proc/diskstats sampler on 2026): decode util
+10-24%, r_await 1.2-1.5 ms -- 76-90% IDLE, kmbandy confirmed live.
+Prefill: 80-115% util, r_await 72-93 ms (deep queue). AND THE SAG HAS AN
+ALIBI: during sag arms' decode the drive was NORMAL -- the 2026
+degradation is NOT the drive (nor swap/runpm/temps). Next suspect:
+kswapd reclaim storms (availMB ~2.3GB floor); sampler now logs
+pgscan_kswapd + MemAvailable per 2s.
+PREEMPTIBLE LANDINGS (31a22ebf1, WP_EXPERT_SPEC_PREEMPT): 1 MiB slices,
+pause while demand serving. VOLUME RAMP (pkm*): collision cost GONE --
+M=4 flat t/s (3.79/3.80 vs base 3.79/3.83) where M=3 used to cost 0.34.
+BUT promotes COLLAPSED with volume: M=1 683/126, M=2 1560/184, M=4
+4031/18(!). Mechanism: request-scope gate over-paused landings (~16
+ms/page incl. compute phases when the drive is FREE); pages landed after
+their layer passed. Deep-k as window fix REFUTED cleanly (dk*): k-axis
+monotone AGAINST depth at fixed slow landings -- promotes 12% (k=2) ->
+6.4% (k=4) -> 2.3% (k=7); staleness beats window. FRESHNESS + FAST
+LANDINGS is the recipe.
+-> 781550e9b: gate on OUTSTANDING DEMAND READS (demand_reads_pending_
+in read_worker), not request scope. Landings pause only while the drive
+is actually contended. TIGHT-GATE RERUN tg*: k=2 x M=1/2/4, prediction:
+promotes recover past ~330 at M=1 AND scale with M.
