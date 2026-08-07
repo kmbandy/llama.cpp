@@ -1441,9 +1441,36 @@ private:
         bool                                read_timed = false;
     };
 
+    // WP_EXPERT_STRIPE_PARALLEL=1: the read work unit becomes the STRIPE, not
+    // the page, so several reader threads pull ONE page's stripes concurrently
+    // (QD>1 against a drive that measured 6.2 GB/s sustained but ~3 GB/s at
+    // QD1 -- the decode request's 4.5 ms ns_read is 1-2 pages read serially).
+    // Stripes of one page share one staging lease; the LAST STRIPE TO COMPLETE
+    // (an atomic countdown, not the last index) carries `last`, preserving the
+    // exactly-once publish invariant in drain_one_read.
+    struct StripeJob {
+        size_t pagein_indexb = 0;
+        size_t offset        = 0;
+        size_t len           = 0;
+    };
+    struct PageShared {
+        std::shared_ptr<StagingPool::Lease> lease;
+        std::mutex                          lease_mutex;
+        std::atomic<size_t>                 remaining{0};
+        // Any stripe failed. The LAST completer inherits it so the page's
+        // final ReadResult carries an error and drain never publishes a
+        // half-read slot -- the serial path got this via failed-stripe-ends-
+        // the-page, which parallel stripes cannot do.
+        std::atomic<bool>                   failed{false};
+    };
+
     struct BatchState {
         std::vector<PageIn>                       pageins;
         std::atomic<size_t>                     next{0};
+        // Stripe-parallel mode only; empty otherwise. Built once in
+        // ensure_batch before the workers start, read-only afterwards.
+        std::vector<StripeJob>                  stripe_jobs;
+        std::vector<std::unique_ptr<PageShared>> page_shared;
         std::mutex                              mutex;
         std::condition_variable                 cv;
         std::deque<std::unique_ptr<ReadResult>> ready;
@@ -1932,8 +1959,30 @@ public:
 
             batch.state_->measure = measure;
 
-            const size_t worker_count = std::min<size_t>(
-                batch.state_->pageins.size(), (size_t) staging_.buffer_count());
+            // Stripe-parallel: pre-plan every (page, stripe) so reader threads
+            // claim stripes, not pages. Page-major order keeps the number of
+            // concurrently-open pages (= staging leases) near
+            // ceil(threads / stripes-per-page), so borrow() never deadlocks:
+            // a thread blocked on borrow holds no lease itself, and earlier
+            // pages retire to free buffers.
+            if (stripe_parallel_) {
+                auto & st = *batch.state_;
+                st.page_shared.reserve(st.pageins.size());
+                for (size_t pi = 0; pi < st.pageins.size(); ++pi) {
+                    const auto plan =
+                        stripe_plan(st.pageins[pi].page->size, st.pageins.size());
+                    auto ps = std::make_unique<PageShared>();
+                    ps->remaining.store(plan.size(), std::memory_order_relaxed);
+                    st.page_shared.push_back(std::move(ps));
+                    for (const auto & part : plan) {
+                        st.stripe_jobs.push_back({ pi, part.first, part.second });
+                    }
+                }
+            }
+            const size_t worker_count = stripe_parallel_
+                ? std::min<size_t>(batch.state_->stripe_jobs.size(), (size_t) 4)
+                : std::min<size_t>(
+                      batch.state_->pageins.size(), (size_t) staging_.buffer_count());
             batch.workers_.reserve(worker_count);
             for (size_t i = 0; i < worker_count; ++i) {
                 batch.workers_.emplace_back(
@@ -2386,6 +2435,92 @@ private:
         return victim;
     }
 
+    // Stripe-claiming reader (WP_EXPERT_STRIPE_PARALLEL=1). Work unit = one
+    // stripe; the first claimer of a page borrows its staging lease; the last
+    // COMPLETER (atomic countdown) publishes `last`, inheriting any stripe's
+    // failure so drain never sees a half-read page as ready.
+    void stripe_read_worker(const std::shared_ptr<BatchState> & state) {
+        while (true) {
+            const size_t j = state->next.fetch_add(1, std::memory_order_relaxed);
+            if (j >= state->stripe_jobs.size()) {
+                return;
+            }
+            const StripeJob & job    = state->stripe_jobs[j];
+            const PageIn &    pagein = state->pageins[job.pagein_indexb];
+            PageShared &      shared = *state->page_shared[job.pagein_indexb];
+            auto result = std::make_unique<ReadResult>();
+            result->pagein_indexb = job.pagein_indexb;
+            result->offset        = job.offset;
+            result->len           = job.len;
+            // Same demand accounting as the serial path, per stripe: the
+            // preemption gate (demand_reads_pending_) must see these reads or
+            // host landings would run concurrently with stripe-mode demand.
+            const bool count_demand = !state->speculative;
+            if (count_demand) {
+                demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
+            }
+            try {
+                {
+                    std::lock_guard<std::mutex> lock(shared.lease_mutex);
+                    if (!shared.lease) {
+                        shared.lease = std::make_shared<StagingPool::Lease>(staging_.borrow());
+                        if (test_hooks_ != nullptr && test_hooks_->staging_borrowed) {
+                            test_hooks_->staging_borrowed();
+                        }
+                        if (test_hooks_ != nullptr && test_hooks_->read_started) {
+                            test_hooks_->read_started(pagein.page->layer, pagein.page->expert);
+                        }
+                    }
+                }
+                result->staging = shared.lease;
+                if (state->measure) {
+                    result->read_started = std::chrono::steady_clock::now();
+                    result->read_timed   = true;
+                }
+                read_page_range(*pagein.page, pagein.fd,
+                                (char *) result->staging->get() + job.offset,
+                                job.offset, job.len);
+                if (state->measure && result->read_timed) {
+                    result->read_finished = std::chrono::steady_clock::now();
+                }
+            } catch (...) {
+                result->error = std::current_exception();
+                shared.failed.store(true, std::memory_order_release);
+            }
+            if (count_demand) {
+                demand_reads_pending_.fetch_sub(1, std::memory_order_relaxed);
+            }
+            const bool is_last =
+                shared.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
+            result->last = is_last;
+            if (is_last) {
+                if (result->error == nullptr &&
+                    shared.failed.load(std::memory_order_acquire)) {
+                    // Another stripe of this page failed; the page must not
+                    // publish. Carry a failure on the final result.
+                    try {
+                        throw std::runtime_error("stripe-parallel: sibling stripe failed");
+                    } catch (...) {
+                        result->error = std::current_exception();
+                    }
+                }
+                if (result->error == nullptr && test_hooks_ != nullptr &&
+                    test_hooks_->read_finished) {
+                    try {
+                        test_hooks_->read_finished(pagein.page->layer, pagein.page->expert);
+                    } catch (...) {
+                        result->error = std::current_exception();
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->ready.push_back(std::move(result));
+            }
+            state->cv.notify_one();
+        }
+    }
+
     void read_worker(const std::shared_ptr<BatchState> & state) {
         {
             std::unique_lock<std::mutex> lock(state->mutex);
@@ -2395,6 +2530,11 @@ private:
             if (state->cancel) {
                 return;
             }
+        }
+
+        if (!state->stripe_jobs.empty()) {
+            stripe_read_worker(state);
+            return;
         }
 
         while (true) {
@@ -2859,6 +2999,14 @@ private:
     StagingPool                staging_;
     size_t                     read_stripes_ = read_stripes_from_env();
     size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
+    // WP_EXPERT_STRIPE_PARALLEL=1 -- stripes of one page are claimed by
+    // MULTIPLE reader threads concurrently (QD>1 per page) instead of read
+    // serially by the page's claimer. Default off: bare runs stay on the
+    // measured 2026-08-05 serial-stripe pipeline.
+    const bool                 stripe_parallel_ = [] {
+        const char * e = std::getenv("WP_EXPERT_STRIPE_PARALLEL");
+        return e != nullptr && e[0] == '1';
+    }();
     TestHooks *                test_hooks_ = nullptr;
     wp::HostTier               host_tier_;
     bool                       host_victim_enabled_ = false;

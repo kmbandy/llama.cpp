@@ -313,6 +313,10 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # SUBREAD=<bytes> overrides the slice size.
 [ -n "${PREEMPT:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREEMPT=$PREEMPT"
 [ -n "${SUBREAD:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_SUBREAD=$SUBREAD"
+# STRIPEPAR=1 -- reader threads claim STRIPES, not pages: one page's stripes
+# read concurrently (QD>1/page). Attacks the decode request's ns_read (4.5 ms
+# for 1-2 pages read serially at QD1 vs the drive's 6.2 GB/s proven at depth).
+[ -n "${STRIPEPAR:-}" ] && WPOST="$WPOST WP_EXPERT_STRIPE_PARALLEL=$STRIPEPAR"
 # PREDICT=0 drops the previous-block half of the top-of-draft hint, leaving only
 # id_last, which is ground truth and cannot mispredict. SPINE-side: the hint is
 # computed in common/speculative.cpp, which runs in the spine process.
