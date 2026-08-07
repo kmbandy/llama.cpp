@@ -2120,7 +2120,7 @@ public:
                         // work cost only idle bandwidth.
                         size_t off = 0;
                         while (off < (size_t) page->size) {
-                            while (demand_serving_.load(std::memory_order_relaxed)) {
+                            while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
                                 std::this_thread::sleep_for(std::chrono::microseconds(200));
                             }
                             const size_t n =
@@ -2404,6 +2404,14 @@ private:
                 return;
             }
             const PageIn & pagein = state->pageins[pagein_indexb];
+            // Captured per page: the speculative flag is set on the batch just
+            // after submit, so the first page of a spec batch may briefly count
+            // as demand. Sub-millisecond and harmless; the flag never flips the
+            // other way.
+            const bool count_demand = !state->speculative;
+            if (count_demand) {
+                demand_reads_pending_.fetch_add(1, std::memory_order_relaxed);
+            }
             bool read_started = false;
             std::shared_ptr<StagingPool::Lease> staging;
             std::exception_ptr fatal;
@@ -2480,6 +2488,9 @@ private:
                 if (failed) {
                     break;
                 }
+            }
+            if (count_demand) {
+                demand_reads_pending_.fetch_sub(1, std::memory_order_relaxed);
             }
         }
     }
@@ -2918,6 +2929,14 @@ private:
     // True while Worker::dispatch is serving a request. Written by the dispatch
     // thread, read by the host landing thread between slices.
     std::atomic<bool>               demand_serving_{false};
+    // Outstanding DEMAND page reads (read_worker pages from a non-speculative
+    // batch). The landing thread's pause condition: gating on demand_serving_
+    // alone paused landings for a request's ENTIRE service -- including compute
+    // phases when the drive is free -- and throttled landing throughput to
+    // ~16 ms/page (2026-08-07 pkm* arms: promotes collapsed because pages
+    // landed after their layer had passed). The drive is only contended while
+    // demand reads are actually outstanding; pause exactly then.
+    std::atomic<int>                demand_reads_pending_{0};
     std::atomic<uint64_t>           host_landed_{0};
     std::atomic<uint64_t>           host_bytes_{0};
     std::atomic<uint64_t>           host_errors_{0};
