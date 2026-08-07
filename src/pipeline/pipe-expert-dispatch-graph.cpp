@@ -259,6 +259,17 @@ int graph_dispatcher::predict_max_tokens() {
     return value;
 }
 
+float graph_dispatcher::predict_conf() {
+    static const float value = [] {
+        const char * v = std::getenv("WP_PREDICT_CONF");
+        if (v == nullptr || v[0] == '\0') {
+            return 0.0f;
+        }
+        return std::max(0.0f, (float) std::atof(v));
+    }();
+    return value;
+}
+
 void graph_dispatcher::register_router_layer(int32_t layer, int32_t n_expert, int32_t n_embd,
                                              const float * w, const float * b) {
     if (n_expert != remote.n_expert() || n_embd != remote.n_embd()) {
@@ -326,8 +337,10 @@ void graph_dispatcher::predictor_loop() {
             // DS4 routing, replicating build_moe_ffn's SQRT_SOFTPLUS branch:
             // probs = sqrt(softplus(W @ h)); selection score = probs +
             // exp_probs_b. No expert groups and no gate bias on this arch.
+            const float conf = predict_conf();
             std::set<int32_t> u;
             scores.resize((size_t) n_expert);
+            std::vector<std::pair<float, int32_t>> ranked((size_t) top_m + 1);
             for (int64_t token = 0; token < job.n_tokens; ++token) {
                 const float * h = job.activations.data() + (size_t) token * (size_t) n_embd;
                 for (int32_t e = 0; e < n_expert; ++e) {
@@ -340,11 +353,23 @@ void graph_dispatcher::predictor_loop() {
                     const float sp = std::max(acc, 0.0f) + std::log1p(std::exp(-std::fabs(acc)));
                     scores[(size_t) e] = std::sqrt(sp) + rl.b[(size_t) e];
                 }
-                for (int m = 0; m < top_m; ++m) {
+                // top_m + 1 ranked picks so each kept rank is margin-gated
+                // against the NEXT one (WP_PREDICT_CONF; 0 keeps everything).
+                // Ranks are gated independently -- margins are not monotone in
+                // rank, so an unconfident rank must not veto the ones below it.
+                for (int m = 0; m < top_m + 1; ++m) {
                     const auto best = std::max_element(scores.begin(), scores.end());
-                    u.insert((int32_t) (best - scores.begin()));
+                    ranked[(size_t) m] = { *best, (int32_t) (best - scores.begin()) };
                     *best = -std::numeric_limits<float>::infinity();
                 }
+                for (int m = 0; m < top_m; ++m) {
+                    if (ranked[(size_t) m].first - ranked[(size_t) m + 1].first >= conf) {
+                        u.insert(ranked[(size_t) m].second);
+                    }
+                }
+            }
+            if (u.empty()) {
+                continue;   // every pick was below the confidence floor
             }
             unioned.assign(u.begin(), u.end());   // ascending, as send expects
             {

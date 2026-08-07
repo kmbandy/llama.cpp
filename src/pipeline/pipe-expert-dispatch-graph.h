@@ -110,6 +110,13 @@ class graph_dispatcher {
     // prefill sweep are pure contention (LATE 84-100%), and a 2048-row router
     // GEMM per layer is not free either.
     static int predict_max_tokens();
+    // WP_PREDICT_CONF=m (default 0 = off): a token contributes its top-1 pick
+    // ONLY when the selection-score margin over the runner-up is >= m, and
+    // lower ranks only when their margin over the NEXT rank clears the same
+    // bar. Calibration from the 2026-08-07 capture (rank-1, top1-top2 margin):
+    // k=7 ungated 77% precision; margin>=0.22 -> 88% emitting 50% of tokens;
+    // >=0.46 -> 92.5% emitting 25%.
+    static float predict_conf();
 
     size_t n_workers() const;
     bool failed() const noexcept;

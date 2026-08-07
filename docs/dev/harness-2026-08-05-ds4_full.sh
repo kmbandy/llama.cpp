@@ -327,6 +327,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 [ -n "${PRED_AHEAD:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_AHEAD=$PRED_AHEAD"
 # PRED_TOPM=m -- experts kept per token before the union (default 3).
 [ -n "${PRED_TOPM:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_TOPM=$PRED_TOPM"
+# PRED_CONF=<margin> -- confidence floor: a rank contributes only when its
+# selection-score margin over the next rank is >= this (0/unset = keep all).
+# Calibration (2026-08-07 capture, k=7 rank-1): 0.22 -> 88% precision @ 50%
+# emission; 0.46 -> 92.5% @ 25%.
+[ -n "${PRED_CONF:-}" ] && SPINEENV="${SPINEENV:-} WP_PREDICT_CONF=$PRED_CONF"
 # PRED_CAPTURE=1 -- dump (layer, h, selected experts) per decode dispatch to
 # $OUT/routing-capture.<pid>.bin on the spine (main). The dispatch-path capture
 # that replaces the pager-only WP_CAPTURE_ROUTING; feeds the k=2..4 precision
