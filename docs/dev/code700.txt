@@ -1,0 +1,44 @@
+Review this excerpt of a Python cache simulator. Explain what the eviction policy does so far, identify any correctness bugs, and sketch the lease-expiry method that should come next.
+
+import sys
+from collections import OrderedDict
+
+
+class Cache:
+    """One slot pool. policy: 'lru' or 'usecount' (freq persists after evict,
+    matching the worker's LFU). Lease: spec-inserted pages are unevictable
+    until first reference or ttl tokens, whichever first (ttl None = no lease,
+    ttl -1 = until referenced, unbounded)."""
+
+    def __init__(self, cap, policy, ttl):
+        self.cap, self.policy, self.ttl = cap, policy, ttl
+        self.c = OrderedDict()          # page -> last-touch clock
+        self.freq = {}                  # page -> lifetime refs (usecount)
+        self.lease = {}                 # page -> expiry token (or None=until ref)
+        self.clock = 0
+        self.token = 0
+        self.demand_miss = self.late = self.used = 0
+        self.spec_live = {}             # spec pages awaiting first R
+        self.squat_max = 0
+
+    def _evict_one(self):
+        # candidates = resident pages not under lease
+        cands = [p for p in self.c if p not in self.lease]
+        if not cands:
+            # every slot leased: lease loses, evict globally-oldest anyway
+            # (real worker must make progress too). Counted as lease overflow.
+            cands = list(self.c)
+        if self.policy == "usecount":
+            victim = min(cands, key=lambda k: (self.freq.get(k, 0), self.c[k]))
+        else:
+            victim = min(cands, key=lambda k: self.c[k])
+        if victim in self.spec_live:
+            self.late += 1
+            del self.spec_live[victim]
+        self.lease.pop(victim, None)
+        del self.c[victim]
+
+    def _insert(self, p):
+        if len(self.c) >= self.cap:
+            self._evict_one()
+        self.c[p] = self.clock
