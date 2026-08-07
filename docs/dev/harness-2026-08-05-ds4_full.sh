@@ -39,8 +39,12 @@ DENSE=/home/kmbandy/models/DS4-Flash-dense/ds4-dense.gguf
 # Was 100.102.191.30 (still in the SOP guide and four repo design docs).
 # The stale address does not refuse -- it DROPs, so the spine hangs 2m20s and
 # then reports "failed to connect to worker", which reads like a worker fault.
-IP2026=100.124.155.84
-IPMAIN=100.86.191.92
+# Overridable for the transport A/B: Tailscale (WireGuard) addresses by
+# default; set IPMAIN=192.168.1.15 IP2026=192.168.1.33 to route the dispatch
+# data path over plain LAN TCP instead. Control-path ssh uses hostnames and is
+# unaffected.
+IP2026=${IP2026:-100.124.155.84}
+IPMAIN=${IPMAIN:-100.86.191.92}
 # Per-arm output dir. A fixed OUT silently DESTROYS the previous arm's worker
 # logs, which is exactly what happened comparing CUDA0 vs Vulkan1 on 2026-08-01
 # -- the baseline survived only in a saved task transcript. ARM defaults to the
