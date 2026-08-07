@@ -194,3 +194,18 @@ LANDINGS is the recipe.
 in read_worker), not request scope. Landings pause only while the drive
 is actually contended. TIGHT-GATE RERUN tg*: k=2 x M=1/2/4, prediction:
 promotes recover past ~330 at M=1 AND scale with M.
+
+TIGHT-GATE RERUN (13:29-13:46, 781550e9b, read-scoped preemption):
+  tgbase 3.83  tgm1p 3.81  tgm2p 3.83  tgm4p 3.75  tgbase2 3.81  tgm4pb 3.75
+  Fleet promotes: M=1 292, M=2 463, M=4 479. SCALING RESTORED (the
+  coarse gate had M=4 at 18). Main's landing queue saturates at M=4
+  (its promotes dip 263->143 while 2026's climb); M=4's -0.07 replicates.
+PACKING VERDICT: PRED_AHEAD=2 PRED_TOPM=2 PREEMPT=1 IS THE OPTIMUM --
+463 promotes/run (~6% of demand reads converted NVMe->tier) at EXACTLY
+baseline t/s, tail benefits per the claw arms. BANKED into the code
+config candidate: SPEC_NMAX=7 SPEC_CONF=0.4 + tier stack + k2m2+preempt.
+STRUCTURAL CEILING REACHED for router-prefetch as a MEAN-t/s lever at
+this pool size: conversion is bounded by landing throughput x the
+residency-confidence correlation. It is a TAIL/robustness feature.
+The mean-decode path forward is turbo4 (1.96x, byte gate pending) --
+prediction now rides along for free.
