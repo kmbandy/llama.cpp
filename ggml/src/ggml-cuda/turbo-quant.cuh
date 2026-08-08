@@ -352,6 +352,44 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return TURBO_CENTROIDS_4BIT[idx] * norm;
 }
 
+// ---- LADDER RUNG 1 (2026-08-07): LDS-staged centroid LUT for the FA hot path.
+// TURBO_CENTROIDS_4BIT lives in __constant__ memory; a per-lane DIVERGENT
+// index into constant memory on AMD compiles to a VMEM gather through the
+// vector cache (~100+ cycles) and sits in the innermost loop of the FA vec
+// dot -- two gathers per qs byte. An LDS copy serves the same gather in
+// ~20 cycles with no bank conflicts (16 words). Same values consumed in the
+// same order, so results are BIT-IDENTICAL to the constant-memory path.
+//
+// __shared__ in a __device__ function has block lifetime and a SINGLE
+// instance per block regardless of inlining (CUDA/HIP static-storage
+// semantics), so every caller of turbo4_lut_lds() sees the same 16 floats.
+// The kernel prologue must call turbo4_lut_stage_lds() ONCE, convergently,
+// before any dot/dequant touches the LUT.
+// Define TURBO4_LUT_NO_LDS to fall back to the __constant__ LUT -- the
+// ladder's A/B baseline toggle. Never define it in a shipped build.
+// #define TURBO4_LUT_NO_LDS 1
+
+static __device__ __forceinline__ const float * turbo4_lut_lds() {
+#ifdef TURBO4_LUT_NO_LDS
+    return TURBO_CENTROIDS_4BIT;
+#else
+    __shared__ float s_turbo4_lut[16];
+    return s_turbo4_lut;
+#endif
+}
+
+static __device__ __forceinline__ void turbo4_lut_stage_lds() {
+#ifndef TURBO4_LUT_NO_LDS
+    float * s = const_cast<float *>(turbo4_lut_lds());
+    const int tid = (int) (threadIdx.z*blockDim.y*blockDim.x +
+                           threadIdx.y*blockDim.x + threadIdx.x);
+    if (tid < 16) {
+        s[tid] = TURBO_CENTROIDS_4BIT[tid];
+    }
+    __syncthreads();
+#endif
+}
+
 // ---- 4-bit centroids for turbo4_64 (64-element blocks), calibrated from
 // real LFM2.5-8B-A1B K/V activation statistics (2026-07-01 investigation),
 // NOT the N(0, 1/128) Gaussian assumption above. A 64-element group's

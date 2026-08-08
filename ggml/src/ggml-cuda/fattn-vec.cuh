@@ -68,6 +68,14 @@ static __global__ void flash_attn_ext_vec(
 
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
+    // LADDER RUNG 1 (2026-08-07): stage the turbo4 centroid LUT into LDS once
+    // per block, convergently, before any vec-dot/dequant reads it (see
+    // turbo-quant.cuh: the constant-memory LUT costs a VMEM gather per nibble
+    // in the hottest loop; LDS serves it at ds_read latency, bit-identically).
+    if constexpr (type_K == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_0) {
+        turbo4_lut_stage_lds();
+    }
+
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 

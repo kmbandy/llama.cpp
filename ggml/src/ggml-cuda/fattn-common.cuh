@@ -455,24 +455,44 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        // HOISTED PER BLOCK. A thread's cpy_ne consecutive k_KQ values map to
+        // elem = 2*k_KQ, i.e. 2*cpy_ne consecutive elements, and k_KQ_base is a
+        // multiple of cpy_ne -- so j0_base is a multiple of 2*cpy_ne and the whole
+        // group lands in ONE turbo4 block (j0_base + 2*cpy_ne <= QK_TURBO4). The
+        // block index and its norm are therefore invariant across the inner loop;
+        // they used to be recomputed, reloaded and __half2float-converted once per
+        // ELEMENT PAIR (cpy_ne times too often).
+        const int k_KQ_base = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne;
+        const int elem_base = k_KQ_base * 2;
+        const int ib_base   = elem_base / QK_TURBO4;
+        const int j0_base   = elem_base % QK_TURBO4;
+        const float norm    = __half2float(K_turbo[ib_base].norm);
+
+        // The cpy_ne qs bytes this thread needs are CONSECUTIVE (j0_base/2 ...
+        // +cpy_ne-1). qs starts 4 bytes into block_turbo4_0 (two ggml_halfs) and
+        // j0_base/2 is a multiple of cpy_ne, so for cpy_ne == 4 the group is one
+        // aligned dword -- take it as a single load instead of cpy_ne byte loads.
+        uint32_t qs_pack = 0;
+        if (cpy_ne == 4) {
+            qs_pack = *reinterpret_cast<const uint32_t *>(&K_turbo[ib_base].qs[j0_base / 2]);
+        }
+
 #pragma unroll
         for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
-            const int k_KQ = k_KQ_0 + (threadIdx.x % nthreads)*cpy_ne + k_KQ_1;
-
-            const int elem0 = k_KQ * 2;                   // always even
-            const int ib    = elem0 / QK_TURBO4;           // block index
-            const int j0    = elem0 % QK_TURBO4;           // always even
-
-            const float   norm    = __half2float(K_turbo[ib].norm);
             // Both j0 and j0+1 are adjacent nibbles: j0/2 == (j0+1)/2 when j0 is even
-            const uint8_t qs_byte = K_turbo[ib].qs[j0 / 2];
+            const uint8_t qs_byte = (cpy_ne == 4)
+                ? (uint8_t) ((qs_pack >> (8*k_KQ_1)) & 0xFF)
+                : K_turbo[ib_base].qs[j0_base / 2 + k_KQ_1];
 
             const uint8_t idx0 = (qs_byte >> 0) & 0xF;    // low nibble = j0
             const uint8_t idx1 = (qs_byte >> 4) & 0xF;    // high nibble = j0+1
 
+            // RUNG 1: LDS LUT (staged in the kernel prologue), not constant
+            // memory -- a divergent constant gather is a VMEM round trip here.
+            const float * lut = turbo4_lut_lds();
             float2 kv;
-            kv.x = TURBO_CENTROIDS_4BIT[idx0] * norm;
-            kv.y = TURBO_CENTROIDS_4BIT[idx1] * norm;
+            kv.x = lut[idx0] * norm;
+            kv.y = lut[idx1] * norm;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -919,37 +939,45 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
         const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
 
+        // RUNG 1: LDS LUT, staged by the fattn-vec kernel prologue. This
+        // function's only turbo4 caller is flash_attn_ext_vec (verified:
+        // lightning-indexer dispatches no turbo types), so the LUT is always
+        // staged before we get here.
+        const float * lut = turbo4_lut_lds();
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
             ((half2 *) dst)[0] = make_half2(
-                __float2half(TURBO_CENTROIDS_4BIT[idx0] * norm),
-                __float2half(TURBO_CENTROIDS_4BIT[idx1] * norm));
+                __float2half(lut[idx0] * norm),
+                __float2half(lut[idx1] * norm));
             ((half2 *) dst)[1] = make_half2(
-                __float2half(TURBO_CENTROIDS_4BIT[idx2] * norm),
-                __float2half(TURBO_CENTROIDS_4BIT[idx3] * norm));
+                __float2half(lut[idx2] * norm),
+                __float2half(lut[idx3] * norm));
         } else
 #endif // FP16_AVAILABLE
         if constexpr (std::is_same_v<T, float>) {
             ((float2 *) dst)[0] = make_float2(
-                TURBO_CENTROIDS_4BIT[idx0] * norm,
-                TURBO_CENTROIDS_4BIT[idx1] * norm);
+                lut[idx0] * norm,
+                lut[idx1] * norm);
             ((float2 *) dst)[1] = make_float2(
-                TURBO_CENTROIDS_4BIT[idx2] * norm,
-                TURBO_CENTROIDS_4BIT[idx3] * norm);
+                lut[idx2] * norm,
+                lut[idx3] * norm);
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }
     } else { // ne == 2
+        // RUNG 1: LDS LUT here too; j0 is even so both nibbles share one byte.
+        const float * lut = turbo4_lut_lds();
+        const uint8_t qs_byte = x[ib].qs[j0 / 2];
+        const float v0 = lut[(qs_byte >> 0) & 0xF] * norm;
+        const float v1 = lut[(qs_byte >> 4) & 0xF] * norm;
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
-            float v0 = turbo4_dequant_element(&x[ib], j0,   norm);
-            float v1 = turbo4_dequant_element(&x[ib], j0+1, norm);
             ((half2 *) dst)[0] = make_half2(__float2half(v0), __float2half(v1));
         } else
 #endif // FP16_AVAILABLE
         if constexpr (std::is_same_v<T, float>) {
-            ((float *) dst)[0] = turbo4_dequant_element(&x[ib], j0,   norm);
-            ((float *) dst)[1] = turbo4_dequant_element(&x[ib], j0+1, norm);
+            ((float *) dst)[0] = v0;
+            ((float *) dst)[1] = v1;
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }
