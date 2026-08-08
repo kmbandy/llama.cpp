@@ -150,6 +150,21 @@ static uint32_t server_n_outputs_max(const common_params & params) {
         return n_batch;
     }
 
+    // Any speculative run may need output rows at PREFILL positions, not just for
+    // the decode-time draft block. DS4/DSpark asked for 223 output rows on the
+    // first prompt-processing call of a 739-token prompt, against the
+    // n_parallel*(1+n_max) budget below (~28), and tripped
+    //   llama-context.cpp:2435 GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)
+    // killing the server mid-request. It only ever worked because every previous
+    // measurement used a ~5-token prompt, which fit under the budget by accident.
+    //
+    // n_batch is the true upper bound on outputs in a batch, and this cap is only
+    // an assert ceiling -- output_reserve() allocates for the REQUESTED count, not
+    // for the cap -- so raising it costs no memory until the rows are really used.
+    if (!params.speculative.types.empty()) {
+        return n_batch;
+    }
+
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
 
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;

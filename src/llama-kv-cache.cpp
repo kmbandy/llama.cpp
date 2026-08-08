@@ -102,6 +102,28 @@ static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
 #endif
 
+// see the comment on the declaration in llama-kv-cache.h -- this list must stay
+// in sync with the k->type switch in ggml_cuda_lightning_indexer_supported().
+ggml_type llama_kv_cache_indexer_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_0:
+            return type;
+        default:
+            LLAMA_LOG_WARN("%s: %s cannot be used for the lightning-indexer K cache "
+                    "(the fused indexer would be disabled and the unfused fallback would "
+                    "allocate a multi-GiB score tensor) - using f16 for it instead\n",
+                    __func__, ggml_type_name(type));
+            return GGML_TYPE_F16;
+    }
+}
+
 //
 // llama_kv_cache
 //

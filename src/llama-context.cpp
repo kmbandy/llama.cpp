@@ -20,6 +20,7 @@
 #include "llama.h"
 #include "pipeline/pipe-expert-dispatch-graph.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <chrono>
 #include <cstdlib>
@@ -1676,24 +1677,55 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // concealed a 60% run-to-run swing in dense time (76.8-122.8 ms/token), and
     // a mean cannot distinguish "a few huge outliers" from "everything shifted".
     static const bool wp_spine_each = wp_spine_stats && wp_spine_env[0] == '2';
-    static uint64_t   wp_gc_ns = 0;
-    static uint64_t   wp_gc_n  = 0;
+    // PREFILL AND DECODE ARE ACCUMULATED SEPARATELY (2026-08-03). They were folded
+    // into ONE running mean, which is worse than useless here: a prefill ubatch and
+    // a decode step differ by up to n_ubatch (512) in token count and by orders of
+    // magnitude in expert working set, so their mean describes neither and drifts
+    // with the prompt/predict ratio of whatever run produced it. A "mean ms/call"
+    // that changes when you change n_predict is not measuring the model.
+    // The per-token column is the comparable one ACROSS phases: prefill amortises
+    // its cost over n_tokens, decode cannot.
+    // THREE phases. n_tokens > 1 is NOT "prefill": with speculative decoding
+    // (DSpark is in the config of record) decode advances by verifying draft
+    // blocks of ~2-6 tokens, so a 2-way split labels every verify batch as
+    // prefill. Measured 2026-08-03: 6 real prefill ubatches (512/223) against
+    // 228 verify batches, i.e. a 2-way "prefill" bucket is ~97% verify by count.
+    // Real prefill ubatches are n_ubatch-sized; verify blocks are bounded by the
+    // draft length, so nothing lands between them and 64 is not a tuning knob.
+    static uint64_t wp_gc_ns [3] = {0, 0, 0};  // [0]=decode [1]=spec-verify [2]=prefill
+    static uint64_t wp_gc_n  [3] = {0, 0, 0};
+    static uint64_t wp_gc_tok[3] = {0, 0, 0};
+    static const char * const wp_ph_name[3] = { "decode ", "verify ", "PREFILL" };
+    const int wp_ph = ubatch.n_tokens >= 64 ? 2 : (ubatch.n_tokens > 1 ? 1 : 0);
     const auto wp_gc_t0 = wp_spine_stats ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point();
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (wp_spine_stats) {
         const uint64_t wp_call_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - wp_gc_t0).count();
-        wp_gc_ns += wp_call_ns;
-        ++wp_gc_n;
+        wp_gc_ns [wp_ph] += wp_call_ns;
+        wp_gc_tok[wp_ph] += ubatch.n_tokens;
+        ++wp_gc_n[wp_ph];
         if (wp_spine_each) {
-            LLAMA_LOG_WARN("spine: gc_call %llu %.3f ms\n",
-                           (unsigned long long) wp_gc_n, wp_call_ns / 1e6);
+            LLAMA_LOG_WARN("spine: gc_call %s n_tokens=%u %.3f ms (%.3f ms/tok)\n",
+                           wp_ph_name[wp_ph],
+                           ubatch.n_tokens, wp_call_ns / 1e6,
+                           wp_call_ns / 1e6 / (double) std::max<uint32_t>(1, ubatch.n_tokens));
         }
-        if (wp_gc_n % 16 == 0) {
-            LLAMA_LOG_WARN("spine: graph_compute n=%llu total=%.2f ms mean=%.2f ms/call\n",
-                           (unsigned long long) wp_gc_n, wp_gc_ns / 1e6,
-                           wp_gc_ns / 1e6 / (double) wp_gc_n);
+        if ((wp_gc_n[0] + wp_gc_n[1] + wp_gc_n[2]) % 16 == 0) {
+            for (int ph = 0; ph < 3; ++ph) {
+                if (wp_gc_n[ph] == 0) {
+                    continue;
+                }
+                LLAMA_LOG_WARN("spine: graph_compute %s n=%llu tok=%llu total=%.2f ms "
+                               "mean=%.2f ms/call %.3f ms/tok\n",
+                               wp_ph_name[ph],
+                               (unsigned long long) wp_gc_n [ph],
+                               (unsigned long long) wp_gc_tok[ph],
+                               wp_gc_ns[ph] / 1e6,
+                               wp_gc_ns[ph] / 1e6 / (double) wp_gc_n [ph],
+                               wp_gc_ns[ph] / 1e6 / (double) std::max<uint64_t>(1, wp_gc_tok[ph]));
+            }
         }
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2043,8 +2075,66 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
+    // *** STOPGAP, NOT THE INTENDED DESIGN. READ THIS BEFORE CHANGING IT. ***
+    //
+    // DSPARK IS SUPPOSED TO RUN ON FOUR 4096-WIDE STREAMS. n_embd_out() is exactly
+    // that: deepseek4.cpp:130 sets n_embd_out_impl = dsv4_hc_mult * n_embd
+    // = 4 * 4096 = 16384. Including LLAMA_CONTEXT_TYPE_DSPARK below (the state this
+    // fork shipped, and DELIBERATE -- we diverged from upstream, which gates on MTP
+    // alone, precisely because upstream was not faithful to real DSpark) is the
+    // CORRECT INTENT. Narrowing the reader to 4096 -- which is what excluding DSPARK
+    // does -- hard-codes a ONE-STREAM DSpark and is wrong as a design.
+    //
+    // THE ACTUAL DEFECT IS UPSTREAM OF HERE: the 4-stream path is NOT WIRED.
+    //   source  llama_get_embeddings_nextn -> ctx->n_embd_nextn = 4096  (ONE stream)
+    //   writer  speculative.cpp:1123  memcpy n_chunk * n_embd_dec (4096), contiguous
+    //   alloc   speculative.cpp:1001  llama_batch_init(n_batch, n_embd_dec=4096)
+    // The encoder emits one stream and the writer lays rows down back-to-back at
+    // 4096. MEASURED CONSEQUENCE: because batch_inject is decoded one chunk at a
+    // time with n_chunk <= n_ubatch, split_simple always yields idxs = 0..n_chunk-1,
+    // so ubatch_add's copy is contiguous from offset 0 at EITHER stride and the graph
+    // sees the SAME 4096-wide bytes both ways. Verified by A/B: 4 arms, acceptance
+    // byte-identical at 0.57616 (87/151, mean len 1.98) with the toggle on and off.
+    // So DSpark currently runs on 1 of its 4 streams REGARDLESS of this condition --
+    // consistent with mean accepted len ~2.0 against a trained block size of 5.
+    //
+    // WHY THIS LINE IS CURRENTLY MTP-ONLY ANYWAY: with the writer supplying only
+    // 4096, the 16384 stride reads past the end of batch_inject's embd buffer once
+    // n_chunk > 512 (alloc 2048*4096*4 = 32 MiB; row 512 starts at 512*16384*4 =
+    // exactly 32 MiB) -> SIGSEGV at idxs[i]==512, which is what killed n_ubatch=1024.
+    // n_ubatch=512 masked it for a year by capping the chunk one row inside the cliff.
+    //
+    // THE REAL FIX (not yet done): make the encoder produce all 4 streams and widen
+    // speculative.cpp:1001/1123 to n_embd_out(), then restore DSPARK here permanently.
+    // Do NOT "fix" a future OOB by narrowing this again.
+    // WP_DSPARK_MTP_EMBD=1 restores the PRE-FIX behaviour (DSPARK included above) so the
+    // two can be A/B'd in one harness run with NO REBUILD between arms -- one variable.
+    // WHY THIS TOGGLE EXISTS: after the fix, draft acceptance fell to 0.576/0.627 with
+    // mean len ~2.0, BELOW THE ENTIRE HISTORICAL RECORD (0.799-0.988, mean len 3.5-5.9).
+    // That is the OPPOSITE of what the fix predicts -- the old path was supposedly reading
+    // past the buffer, which should have produced WORSE drafts, not better. Either the
+    // prompt change explains it, or the 16384 stride is INTENTIONAL (the DSpark decoder
+    // consuming hc_mult=4 rows per step), in which case the allocation+writer are the
+    // broken pair and should be 4x wider instead. Do not resolve this by argument.
+    // Default (unset) = FIXED behaviour, which is also the only one that does not segfault
+    // at n_ubatch > 512.
+    // *** 2026-08-04 EVENING: DSPARK NOW TAKES n_embd_out PERMANENTLY. ***
+    // The segfault this stopgap was avoiding was never in this condition -- it was that
+    // common/speculative.cpp allocated batch_inject at n_embd (4096) while the nextn
+    // buffer's rows are n_embd_out (16384 = hc_mult*n_embd), so a chunk > 512 tokens
+    // overran the allocation. That is now fixed at source (n_embd_nextn), so excluding
+    // DSPARK here is no longer necessary -- and it was actively harmful: it fed the
+    // draft head ONE of its four Manifold-Constrained Hyper-Connection streams, which
+    // is what dropped acceptance to 0.576-0.627 / mean len ~2.0 against a historical
+    // 0.799-0.988 / 3.5-5.9. DSpark is SUPPOSED to run on four 4096-wide streams.
+    // WP_DSPARK_MTP_EMBD=0 restores the narrowed behaviour for A/B only.
+    static const bool s_dspark_mtp_embd = [](){
+        const char * e = std::getenv("WP_DSPARK_MTP_EMBD");
+        return e == nullptr || e[0] != '0';   // default ON
+    }();
     const bool    mtp_embd = (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
-                              cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK) && batch_inp.embd;
+                              (s_dspark_mtp_embd && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK)
+                             ) && batch_inp.embd;
     const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output

@@ -455,6 +455,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
+
     std::vector<float> g_embd_buf;
 
     common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
@@ -927,6 +928,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
     int32_t hc_mult    = 1;  // target residual streams per tapped layer
+    int32_t n_embd_nextn = 0; // row width of the nextn embeddings buffer = n_embd_out
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
@@ -980,6 +982,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_dec    = llama_model_n_embd(model_dft);
         hc_mult       = (int32_t) llama_model_dflash_hc_mult(model_dft);
         GGML_ASSERT(hc_mult > 0);
+        // *** THE ROW WIDTH OF THE nextn BUFFER IS n_embd_out, NOT n_embd. ***
+        // llama_get_embeddings_nextn() returns embd.data + j*n_embd_out (llama-context
+        // .cpp:1032), and for DS4-Flash n_embd_out = dsv4_hc_mult * n_embd = 4*4096 =
+        // 16384 -- the four Manifold-Constrained Hyper-Connection residual streams.
+        // Every consumer below used n_embd_dec (4096) to stride that buffer, which is
+        // correct ONLY for row 0. Two consequences, both measured on 2026-08-04:
+        //   1. the injection memcpy under-copied and the batch was under-allocated, so
+        //      a chunk > 512 tokens ran past the end (n_chunk*16384 > n_batch*4096).
+        //      That is the segfault at n_ubatch=1024 and the silent corruption at 2048.
+        //   2. the conf_min gate read conf[idx*4096] out of 16384-wide rows, i.e. a
+        //      quarter into the WRONG row for every idx > 0, so block truncation fired
+        //      on arbitrary values. That is why the drafter emitted ~3 of a trained 5
+        //      and mean accepted length sat at ~2.0 against a historical 3.5-5.9.
+        n_embd_nextn  = llama_model_n_embd_out(model_dft);
+        GGML_ASSERT(n_embd_nextn >= n_embd_dec);
         // MAD-LAB: DSpark target taps are collapsed to n_embd_tgt at extraction.
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
 
@@ -1016,8 +1033,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
 
-        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,            n_seq);
+        // n_embd_nextn, not n_embd_dec: the injected rows are n_embd_out wide.
+        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_nextn, n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1139,7 +1157,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_nextn * sizeof(float));
                 {
                     // WP_CAPTURE_DFLASH (read-only, gated): DFlash predictive hidden inp_g[i]
                     // (predicts pos+1) + target position. In the DFlash class process(). Off by default.
@@ -1148,9 +1166,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         static FILE* s_df_fp = std::fopen("/home/kmbandy/wp_logs/accounting/dflash_capture.bin","wb");
                         if (s_df_fp) {
                             for (int32_t i = 0; i < n_chunk; ++i) {
-                                int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_dec };
+                                int32_t hdr[2] = { (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i], (int32_t) n_embd_nextn };
                                 std::fwrite(hdr, sizeof(hdr), 1, s_df_fp);
-                                std::fwrite(inp_g + (size_t) i * n_embd_dec, sizeof(float), (size_t) n_embd_dec, s_df_fp);
+                                std::fwrite(inp_g + (size_t) i * n_embd_nextn, sizeof(float), (size_t) n_embd_nextn, s_df_fp);
                             }
                             std::fflush(s_df_fp);
                         }
@@ -1317,7 +1335,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.conf_min) {
+                    // n_embd_nextn: conf comes from llama_get_embeddings_nextn(), whose
+                    // rows are n_embd_out wide. Striding n_embd_dec here read a quarter
+                    // into the wrong row for every idx > 0 and truncated blocks on
+                    // arbitrary values.
+                    if (conf && conf[(size_t) idx * n_embd_nextn] < params.conf_min) {
                         break;
                     }
 
@@ -2466,8 +2488,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     // MAD-LAB: reserve one output row per sequence plus the largest speculative block.
-    result.n_outputs_max = std::max<uint32_t>(1, std::min<uint64_t>(
-        params.n_batch, (uint64_t) params.n_parallel * (1 + common_speculative_n_max(&params.speculative))));
+    //
+    // 2026-08-03: that budget is NOT sufficient. It covers only the decode-time
+    // draft block, but the DS4/DSpark PREFILL path requests output rows at prompt
+    // positions too -- measured 223 rows on the first prompt-processing call of a
+    // 739-token prompt, against a budget of n_parallel*(1+n_max) ~= 28 -- which
+    // trips llama-context.cpp:2435 and aborts the server mid-request. It only ever
+    // appeared to work because every prior measurement used a ~5-token prompt that
+    // fit under the budget by accident.
+    //
+    // n_batch is the true upper bound on outputs in a batch, and this value is only
+    // an assert ceiling: output_reserve() allocates for the REQUESTED row count, not
+    // for the ceiling, so raising it costs no memory until the rows are really used.
+    result.n_outputs_max = params.n_batch;
 
     return result;
 }

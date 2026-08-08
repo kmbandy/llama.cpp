@@ -13,6 +13,23 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// Pick the element type for a lightning-indexer K cache, given the type the
+// user asked for on the command line.
+//
+// The fused indexer kernel only accepts a fixed set of K types (see
+// ggml_cuda_lightning_indexer_supported, ggml/src/ggml-cuda/lightning-indexer.cu).
+// Handing it anything else does NOT fail loudly -- the op resolves to a
+// different device, resolve_fused_ops() disables fusion, and the unfused
+// fallback in build_lid_top_k() materializes an [n_kv, n_tokens, n_indexer_head]
+// score tensor. Measured on DS4 at 256K ctx, that reserve asked for 24875 MiB
+// and failed -- it blows up the compute buffer long before the KV cache would.
+//
+// The indexer cache is the narrowest of the DSV4 caches (indexer head_size 128
+// vs 512 for CSA/HCA), so keeping it unquantized is cheap: at 256K it is 336 MiB
+// at f16 vs 89 MiB at turbo4. Paying 247 MiB to avoid a 24 GiB allocation (and
+// to keep the fused kernel) is always the right trade.
+ggml_type llama_kv_cache_indexer_type(ggml_type type);
+
 //
 // llama_kv_cache
 //

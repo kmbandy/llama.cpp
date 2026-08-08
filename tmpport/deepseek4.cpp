@@ -1716,43 +1716,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // Do NOT wrap in ggml_reshape_2d: pure views often have no sched backend, and
     // extract_layer_inputs asserts ggml_backend_sched_get_tensor_backend != null
     // (seen on first decode of draft-dflash against DS4 Flash).
-    // MAD-LAB 2026-08-04: HOW the hyper-connection streams are collapsed for the
-    // DSpark layer taps. Each tapped layer's residual is H_t in R^(hc x n_embd)
-    // = 4 x 4096 = 16384, and it must become ONE 4096-wide row: fc.weight is
-    // [12288, 4096] = 3 taps x 4096, so the per-layer width is settled and only
-    // the REDUCTION is in question.
-    //
-    //   dsv4_hc_mean  = (1/hc) * sum_j H_j            input-INDEPENDENT (alpha_j = 1/m)
-    //   build_hc_head = sum_j sigmoid(W_f RMSNorm(vec(H)))_j * H_j    INPUT-DEPENDENT
-    //
-    // arXiv 2606.26744 (HyperDFlash, "Hyper-Connection-Aligned Block Speculative
-    // Decoding with Gated Residual Reduction") specifies the SECOND for a
-    // DeepSeek-V4 target: "Rather than using a generic dense projection,
-    // HyperDFlash employs an input-dependent gating mechanism that mirrors the
-    // target's native hc_head aggregation", with gates initialised from the
-    // target's hc_head and ~65K parameters. blk.45.nextn.hc_head_fn is [16384, 4]
-    // = 65,536 params -- exactly that W_f. The mean is its degenerate case.
-    //
-    // NOT YET PROVEN FOR THIS CHECKPOINT: DS4-Flash-0731 ships only ONE such gate
-    // and it is already consumed at the res->t_embd site below, so whether it is
-    // meant to be SHARED with the taps cannot be settled from tensor shapes.
-    // Hence a switch, measured by draft acceptance / mean accepted length rather
-    // than asserted. Default keeps the shipped behaviour (mean).
-    //   WP_DSPARK_TAP_GATED=1 -> gated reduction (the paper's formulation)
-    static const bool s_tap_gated = [](){
-        const char * e = std::getenv("WP_DSPARK_TAP_GATED");
-        return e && e[0] == '1';
-    }();
-    auto hc_collapse_tap = [&](ggml_tensor * x) -> ggml_tensor * {
-        if (s_tap_gated && hparams.n_layer_all > 0) {
-            const auto & nx = model.layers[hparams.n_layer_all - 1].nextn;
-            if (nx.hc_head_fn && nx.hc_head_scale && nx.hc_head_base) {
-                return build_hc_head(x, nx.hc_head_fn, nx.hc_head_scale, nx.hc_head_base);
-            }
-        }
-        return dsv4_hc_mean(ctx0, x);
-    };
-
     auto set_layer_boundary_inp = [&](int ib, ggml_tensor * x) {
         if (ib >= 0 && ib < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[ib]) {
             res->t_layer_inp[ib] = x;
@@ -1763,7 +1726,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = hc_collapse_tap(inpL);
+            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
@@ -1846,7 +1809,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
-        res->t_layer_inp[n_layer] = hc_collapse_tap(inpL);
+        res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
