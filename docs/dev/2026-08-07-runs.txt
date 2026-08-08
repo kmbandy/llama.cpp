@@ -453,3 +453,20 @@ WINDOW INSTABILITY (from ~20:03): not Brave (0 procs), not my compile
 UNATTRIBUTED. Evening measurement is instrument-limited until resolved.
 NEXT: interleaved A/B/A/B replication in a quiet window (or late-night cron)
 for hipg/gcache/combo before any config-of-record change.
+
+=== TURBO4 LADDER (night, gfx1030 microbench, test-backend-ops FA cases) ===
+RUNG 1 (LDS 16-entry LUT, 66b3d986a): COMMITTED, DEFAULT ON. Correct 1/1 vs
+CPU oracle, bit-identical by construction. Back-to-back A/B: decode-shape
+159.1 -> 134.4 us (-15.5%), prefill-shape 32.84 -> 29.11 ms (-11.4%).
+Plausibly closes ~half the turbo4-vs-f16 FA decode gap; model-level retest
+still owed (acceptance/KLD-gated).
+RUNG 2 (byte-pair LUT, opt-in TURBO4_LUT_PAIR): built, correct, verdict
+DEFERRED -- by measurement time the 6900XT drifted to +-14% run-to-run at
+73C junction (157-182 us on the SAME binary). The 165-us "regression"
+reading is inside that band. Needs cool-box interleaved binary A/B/A/B.
+Also swept in the pre-existing uncommitted vec-dot norm-hoist (approved).
+NEW turbo4 FA perf cases in test-backend-ops (decode nb=1 + prefill nb=512
+at hs128/GQA4/kv7680).
+INSTRUMENT NOTE: the evening instability now shows in MICROBENCHES too --
+tonight is measurement-hostile on this box, full stop. Queue definitive
+reps for a cool idle window.
