@@ -1096,7 +1096,7 @@ ssh mad-lab-main "cd $MAIN_REPO; and env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbu
     -m $DENSE --device ROCm1 --fit off --no-mmap -ngl 99 -c $CTX $SPECARGS $UBARGS \
     --cache-type-k $CACHE_TYPE_K --cache-type-v $CACHE_TYPE_V \
     --expert-dispatch ${DISPATCH_ENDPOINTS} \
-    --port 8095 --host 127.0.0.1 > $OUT/spine.log 2>&1 & echo \$last_pid > $OUT/spine.pid"
+    --port 8095 --host ${SPINE_HOST:-127.0.0.1} > $OUT/spine.log 2>&1 & echo \$last_pid > $OUT/spine.pid"
 sleep 3
 SPINE_PID=$(ssh mad-lab-main "cat $OUT/spine.pid" 2>/dev/null)
 echo "  spine pid ${SPINE_PID:-?}"
@@ -1119,6 +1119,20 @@ ssh mad-lab-main 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"
 nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
 
 # =====================================================================
+# SERVE=1 -- bring the full stack up at the requested config and LEAVE IT
+# SERVING (llama-server on main:8095, OpenAI-compatible) instead of running
+# the benchmark drive + teardown. Pair with SPINE_HOST=0.0.0.0 for access
+# over the mesh. Stop it by rerunning the harness (its startup sweep kills
+# stale listeners) or killing the recorded pids in $OUT.
+if [ -n "${SERVE:-}" ]; then
+    echo
+    echo "############ SERVING ############"
+    echo "  spine: http://${IPMAIN}:8095 (OpenAI-compatible; bound ${SPINE_HOST:-127.0.0.1})"
+    echo "  KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX UBATCH=${UBATCH:-default}"
+    echo "  workers left up; NO teardown; NO benchmark drive."
+    exit 0
+fi
+
 echo
 echo "############ GENERATION ############"
 # DEVICE-LEVEL NVMe COUNTERS. The worker's bytes_read is what we ASKED the
