@@ -38,6 +38,7 @@ extern "C" {
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -104,6 +105,9 @@ struct RequestStats {
     // that got at least one token, which biases the naive estimate.
     uint64_t n_weight_nonzero = 0;   // token-expert pairs actually routed
     uint64_t n_weight_total   = 0;   // token-expert pairs actually COMPUTED
+    // D2 (2026-08-07): shape-keyed graph cache traffic.
+    uint64_t n_gcache_hit  = 0;
+    uint64_t n_gcache_miss = 0;
     // D1 (2026-08-07): the coalesced routing-weight/gather-idx blob upload.
     // The per-tensor uploads it replaces were never timed anywhere -- they sat
     // in the gap between ns_graph_build and ns_submit (the "accounting hole"),
@@ -163,6 +167,8 @@ public:
         n_device_allocs_ += request.n_device_allocs;
         ns_graph_build_ += request.ns_graph_build;
         ns_submit_ += request.ns_submit;
+        n_gcache_hit_ += request.n_gcache_hit;
+        n_gcache_miss_ += request.n_gcache_miss;
         // PER-REQUEST DISTRIBUTION, not just the total. The cumulative ns_submit
         // cannot distinguish "every request costs 2.1 ms" from "most cost 0.2 ms
         // and a few cost 50 ms", and those have completely different fixes. An
@@ -242,6 +248,8 @@ private:
                   << " n_device_allocs=" << n_device_allocs_
                   << " ns_graph_build=" << ns_graph_build_
                   << " ns_submit=" << ns_submit_
+                  << " gcache_hit=" << n_gcache_hit_
+                  << " gcache_miss=" << n_gcache_miss_
                   << " ns_readback=" << ns_readback_
                   << " ns_send=" << ns_send_
                   << " host_bytes=" << host_bytes_
@@ -300,6 +308,8 @@ private:
     uint64_t          n_device_allocs_ = 0;
     uint64_t          ns_graph_build_ = 0;
     uint64_t          ns_submit_ = 0;
+    uint64_t          n_gcache_hit_ = 0;
+    uint64_t          n_gcache_miss_ = 0;
     uint64_t          ns_readback_ = 0;
     uint64_t          ns_prep_ = 0;
     uint64_t          ns_prep_setup_ = 0;
@@ -4208,6 +4218,7 @@ private:
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         io_buffer_ = std::move(buffer);
         io_buffer_size_ = want;
+        ++io_gen_;   // D2: cached graphs bound into the old buffer are stale
         ++request_stats.n_device_allocs;
     }
 
@@ -4236,6 +4247,7 @@ private:
         ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         params_buffer_ = std::move(buffer);
         params_buffer_size_ = want;
+        ++params_gen_;   // D2: cached graphs bound into the old buffer are stale
         ++request_stats.n_device_allocs;
     }
 
@@ -4395,52 +4407,12 @@ private:
             const char * e = std::getenv("WP_EXPERT_PARAMS_COALESCE");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
-        const auto build_started = std::chrono::steady_clock::now();
-        // gather adds per expert: idx, sub_input, scattered (+ the add) -- budget
-        // generously, ggml_init only reserves metadata.
-        // +2 tensors / +2 nodes per expert for the SwiGLU clamp pair (up, gate)
-        // added 2026-08-05. These are budgeted unconditionally even when the
-        // clamp is off: under-budgeting the graph is a hard allocation failure,
-        // and ggml_init only reserves metadata, so the slack is free.
-        // +1 constant for the coalesced-params upload blob (D1), budgeted
-        // unconditionally -- same free-slack argument as the clamp pair.
-        const size_t tensor_count = (s_gather ? 20 : 14) * n_selected + 9;
-        const size_t graph_nodes  = (s_gather ? 12 :  8) * n_selected + 3;
-        const ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
-                              ggml_graph_overhead_custom(graph_nodes, false),
-            /* .mem_base = */ nullptr,
-            /* .no_alloc = */ true,
-        };
-        context_ptr ctx(ggml_init(params));
-        if (!ctx) {
-            throw std::runtime_error("failed to allocate batched expert graph metadata");
-        }
-
-        ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
-        ggml_set_input(input);
-        ggml_tensor * result = make_io_tensor(
-            ctx.get(), request.n_tokens, io_result_offset_);
-        // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
-        // The accumulator below is a LEFT-FOLD in assignment-index order:
-        //     sum = ((((e0 + e1) + e2) + ...))
-        // A chunked caller (WP_EXPERT_COMPUTE_CHUNKS) must continue that exact
-        // fold, so the previous chunks' running total has to be the SEED. Adding
-        // it at the end instead computes
-        //     (e8 + ... + e15) + (e0 + ... + e7)
-        // which is the same experts in the same order but a DIFFERENT
-        // ASSOCIATION, and FP addition is not associative. Measured 2026-08-05:
-        // that re-association alone moved draft acceptance 0.84286 -> 0.77966,
-        // because the router's top-k is discontinuous and amplifies a last-bit
-        // delta into a different token. Seeding makes chunked output bit-identical
-        // to the unchunked path.
-        ggml_tensor * sum = add_previous ? result : nullptr;
-        // D1 packing state for this call. Offsets are assigned in build order;
-        // params_host mirrors the device span byte-for-byte (alignment pad = 0).
+        // D1 packing state (moved above the D2 cache: the hit path packs and
+        // uploads without ever building a graph). Offsets are assigned in build
+        // order; params_host mirrors the device span byte-for-byte (pad = 0).
         // The buffer is grown BEFORE any tensor attaches into it -- growing
-        // reallocates, which would orphan already-attached tensors. The bound is
-        // exact-or-over: per expert one F32 row-vector and one I32 idx, each at
-        // most n_tokens entries, each padded to the buffer alignment.
+        // reallocates, which would orphan already-attached tensors (and bumps
+        // params_gen_, which invalidates every cached graph bound into it).
         const size_t params_align = s_params_coalesce
             ? ggml_backend_buft_get_alignment(
                   ggml_backend_get_default_buffer_type(backend_.get()))
@@ -4463,6 +4435,154 @@ private:
                 ggml_backend_buffer_get_base(params_buffer_.get()), off);
             params_span = off + nbytes;
         };
+
+        // D2 cache lookup (see the member comment). Dense + COALESCE only:
+        // gather idx sizes vary per request, so gather shapes cannot key.
+        static const bool s_graph_cache = [] {
+            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        static const size_t s_graph_cache_max = [] {
+            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
+            const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
+            return v > 0 ? (size_t) v : (size_t) 16;
+        }();
+        GraphCacheEntry * gc = nullptr;
+        bool gc_hit = false;
+        if (s_graph_cache && s_params_coalesce && !use_gather) {
+            GraphKey key;
+            key.n_tokens     = request.n_tokens;
+            key.n_selected   = (uint32_t) n_selected;
+            key.add_previous = add_previous;
+            std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
+            auto it = graph_cache_.find(key);
+            // graph == nullptr marks a half-built entry (an exception hit the
+            // build path after insertion): stale, rebuild. Buffer-generation
+            // mismatch means the device buffer it was bound into was replaced.
+            if (it != graph_cache_.end() &&
+                    (it->second.graph == nullptr ||
+                     it->second.io_gen != io_gen_ ||
+                     it->second.params_gen != params_gen_)) {
+                graph_cache_.erase(it);
+                it = graph_cache_.end();
+            }
+            if (it != graph_cache_.end()) {
+                gc = &it->second;
+                gc_hit = true;
+            } else {
+                if (graph_cache_.size() >= s_graph_cache_max) {
+                    auto victim = graph_cache_.begin();
+                    for (auto j = graph_cache_.begin(); j != graph_cache_.end(); ++j) {
+                        if (j->second.last_used < victim->second.last_used) {
+                            victim = j;
+                        }
+                    }
+                    graph_cache_.erase(victim);
+                }
+                gc = &graph_cache_[key];
+                gc->io_gen = io_gen_;
+                gc->params_gen = params_gen_;
+            }
+            gc->last_used = ++graph_cache_tick_;
+        }
+
+        if (gc_hit) {
+            // *** THE D2 FAST PATH: no context, no graph build, no gallocr. ***
+            // Rebind this request's expert weights into the cached graph (src
+            // data ptrs only -- the backend's WP_HIP_GRAPHS=1 path handles it),
+            // repack the routing blob at the SAME offsets (attach is a no-op
+            // re-bind to the same place), upload once, submit the cached graph.
+            // Iteration order matches the build below exactly: assignment index.
+            ++request_stats.n_gcache_hit;
+            static const char * kRoles[3] = {"gate", "up", "down"};
+            size_t k = 0;
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                if (!selected(i)) {
+                    continue;
+                }
+                const ExpertPage & page = *pages[i];
+                const ExpertSlotPool::Loaded loaded = batch.loaded(i);
+                for (int j = 0; j < 3; ++j) {
+                    attach_weight(
+                        gc->expert_w[k * 3 + (size_t) j], loaded.buffer,
+                        loaded.base, page.roles.at(kRoles[j]).offset);
+                }
+                const auto & wv = request.assignments[i].weights;
+                uint64_t nz = 0;
+                for (float f : wv) { nz += (f != 0.0f); }
+                request_stats.n_weight_nonzero += nz;
+                request_stats.n_weight_total += wv.size();
+                place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
+                ++k;
+            }
+            if (params_span > 0) {
+                const auto params_started = std::chrono::steady_clock::now();
+                ggml_backend_tensor_set(gc->blob, params_host.data(), 0, params_span);
+                request_stats.ns_params_set +=
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - params_started).count();
+            }
+            const auto submit_started = std::chrono::steady_clock::now();
+            const enum ggml_status status =
+                ggml_backend_graph_compute(backend_.get(), gc->graph);
+            request_stats.ns_submit +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - submit_started).count();
+            ++request_stats.n_graph_submits;
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("cached expert backend graph compute failed");
+            }
+            return;
+        }
+        if (gc != nullptr) {
+            ++request_stats.n_gcache_miss;
+        }
+
+        const auto build_started = std::chrono::steady_clock::now();
+        // gather adds per expert: idx, sub_input, scattered (+ the add) -- budget
+        // generously, ggml_init only reserves metadata.
+        // +2 tensors / +2 nodes per expert for the SwiGLU clamp pair (up, gate)
+        // added 2026-08-05. These are budgeted unconditionally even when the
+        // clamp is off: under-budgeting the graph is a hard allocation failure,
+        // and ggml_init only reserves metadata, so the slack is free.
+        // +1 constant for the coalesced-params upload blob (D1), budgeted
+        // unconditionally -- same free-slack argument as the clamp pair.
+        const size_t tensor_count = (s_gather ? 20 : 14) * n_selected + 9;
+        const size_t graph_nodes  = (s_gather ? 12 :  8) * n_selected + 3;
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                              ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        // D2 miss: the context (and everything built in it) must OUTLIVE this
+        // call, so it lives in the cache entry; uncached calls keep the local.
+        // `ctx` stays a reference so the build below is unchanged either way.
+        context_ptr ctx_local;
+        context_ptr & ctx = gc != nullptr ? gc->ctx : ctx_local;
+        ctx.reset(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate batched expert graph metadata");
+        }
+
+        ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
+        ggml_set_input(input);
+        ggml_tensor * result = make_io_tensor(
+            ctx.get(), request.n_tokens, io_result_offset_);
+        // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
+        // The accumulator below is a LEFT-FOLD in assignment-index order:
+        //     sum = ((((e0 + e1) + e2) + ...))
+        // A chunked caller (WP_EXPERT_COMPUTE_CHUNKS) must continue that exact
+        // fold, so the previous chunks' running total has to be the SEED. Adding
+        // it at the end instead computes
+        //     (e8 + ... + e15) + (e0 + ... + e7)
+        // which is the same experts in the same order but a DIFFERENT
+        // ASSOCIATION, and FP addition is not associative. Measured 2026-08-05:
+        // that re-association alone moved draft acceptance 0.84286 -> 0.77966,
+        // because the router's top-k is discontinuous and amplifies a last-bit
+        // delta into a different token. Seeding makes chunked output bit-identical
+        // to the unchunked path.
+        ggml_tensor * sum = add_previous ? result : nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
         // Parallel to routing_weights: the gathered token indices per expert, kept
@@ -4483,6 +4603,12 @@ private:
                     ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
                 attach_weight(
                     tensor, loaded.buffer, loaded.base, page.roles.at(role).offset);
+                // D2 miss: record for rebinding on later hits. Creation order is
+                // gate, up, down per expert -- the hit path indexes k*3+j on
+                // exactly that order.
+                if (gc != nullptr) {
+                    gc->expert_w.push_back(tensor);
+                }
                 return tensor;
             };
 
@@ -4557,6 +4683,9 @@ private:
                     place_param(weights, wv.data(), wv.size() * sizeof(float));
                 }
             }
+            if (gc != nullptr) {
+                gc->route_w.push_back(weights);
+            }
             ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
             if (use_gather) {
                 // SCATTER-ADD back to full token width. get_rows_back sums every
@@ -4580,12 +4709,24 @@ private:
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(graph, copy);
 
+        // D2 miss: the cached graph needs its OWN allocator. Sharing
+        // compute_galloc_ would let the next uncached shape re-plan the buffer
+        // and move this graph's intermediate tensors out from under it.
+        ggml_gallocr_t galloc = compute_galloc_.get();
+        if (gc != nullptr) {
+            gc->galloc.reset(ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(backend_.get())));
+            if (!gc->galloc) {
+                throw std::runtime_error("failed to create cached graph allocator");
+            }
+            galloc = gc->galloc.get();
+        }
         const size_t old_compute_size =
-            ggml_gallocr_get_buffer_size(compute_galloc_.get(), 0);
-        if (!ggml_gallocr_alloc_graph(compute_galloc_.get(), graph)) {
+            ggml_gallocr_get_buffer_size(galloc, 0);
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
             throw std::runtime_error("failed to allocate batched expert compute graph");
         }
-        if (ggml_gallocr_get_buffer_size(compute_galloc_.get(), 0) > old_compute_size) {
+        if (ggml_gallocr_get_buffer_size(galloc, 0) > old_compute_size) {
             ++request_stats.n_device_allocs;
         }
         request_stats.ns_graph_build +=
@@ -4632,6 +4773,9 @@ private:
             attach_weight(
                 blob, params_buffer_.get(),
                 ggml_backend_buffer_get_base(params_buffer_.get()), 0);
+            if (gc != nullptr) {
+                gc->blob = blob;
+            }
             const auto params_started = std::chrono::steady_clock::now();
             ggml_backend_tensor_set(blob, params_host.data(), 0, params_span);
             request_stats.ns_params_set +=
@@ -4647,6 +4791,11 @@ private:
         ++request_stats.n_graph_submits;
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("batched expert backend graph compute failed");
+        }
+        // D2: the entry becomes valid ONLY now -- a build that threw anywhere
+        // above leaves graph == nullptr and the next lookup rebuilds it.
+        if (gc != nullptr) {
+            gc->graph = graph;
         }
     }
 
@@ -4670,6 +4819,44 @@ private:
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - readback_started).count();
     }
+
+    // *** D2 (WP_EXPERT_GRAPH_CACHE): SHAPE-KEYED PERSISTENT GRAPHS. ***
+    // The backend's CUDA/HIP graph cache keys on cgraph->nodes[0] -- a tensor
+    // address inside the per-request ggml context -- so a fresh context per
+    // request churns the key and the 2-call warmup never completes: every
+    // submit pays ~n_nodes raw kernel launches (live ns_submit 0.25-1.8 ms vs
+    // 87 us for a static graph). Cache one context+graph+gallocr per SHAPE
+    // (n_tokens, n_selected, add_previous, clamp); per request only the expert
+    // weight tensors rebind (attach_weight = src data ptrs only) and the
+    // routing-weight blob repacks at fixed offsets. With WP_HIP_GRAPHS=1 the
+    // backend then takes its src-ptrs-only capture+ExecUpdate path instead of
+    // resetting warmup. Dense + COALESCE only: gather shapes vary per request.
+    // Entries pin their gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
+    struct GraphKey {
+        uint32_t n_tokens = 0;
+        uint32_t n_selected = 0;
+        bool     add_previous = false;
+        uint32_t clamp_bits = 0;
+        bool operator<(const GraphKey & o) const {
+            return std::tie(n_tokens, n_selected, add_previous, clamp_bits) <
+                   std::tie(o.n_tokens, o.n_selected, o.add_previous, o.clamp_bits);
+        }
+    };
+    struct GraphCacheEntry {
+        context_ptr   ctx;
+        galloc_ptr    galloc;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * blob  = nullptr;
+        std::vector<ggml_tensor *> expert_w;   // gate,up,down per expert, flat
+        std::vector<ggml_tensor *> route_w;    // routing weights per expert
+        uint64_t io_gen = 0, params_gen = 0, last_used = 0;
+    };
+    std::map<GraphKey, GraphCacheEntry> graph_cache_;
+    uint64_t graph_cache_tick_ = 0;
+    // Buffer generations: a grow REPLACES the device buffer, so every cached
+    // graph holding tensors bound into the old one is stale. Bumped by the
+    // grow_* functions; checked at cache lookup.
+    uint64_t io_gen_ = 0, params_gen_ = 0;
 
     Catalog        catalog_;
     backend_ptr    backend_;

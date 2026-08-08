@@ -325,6 +325,10 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # hardcoded). Sweep with READ_STRIPES: more stripes only pay if threads exist
 # to claim them, and both stay clamped to the 16 staging buffers.
 [ -n "${READ_WORKERS:-}" ] && WPOST="$WPOST WP_EXPERT_READ_WORKERS=$READ_WORKERS"
+# GCACHE=1 -- D2: shape-keyed persistent worker graphs + the backend's
+# src-ptrs-only CUDA/HIP graph update path (WP_HIP_GRAPHS=1 unlocks it).
+# Dense+COALESCE only; pair with COALESCE=1.
+[ -n "${GCACHE:-}" ] && WPOST="$WPOST WP_EXPERT_GRAPH_CACHE=$GCACHE WP_HIP_GRAPHS=$GCACHE"
 # OFFSET_SORT=1 -- read each batch's page-ins in (blob, offset) order rather
 # than assignment order. Byte-identical (slots pre-assigned, compute order is
 # assignment order); targets prefill's ~31 page-ins/batch seek pattern.
