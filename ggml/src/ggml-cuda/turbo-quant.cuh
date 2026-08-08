@@ -378,16 +378,44 @@ static __device__ __forceinline__ const float * turbo4_lut_lds() {
 #endif
 }
 
+// ---- LADDER RUNG 2 (2026-08-07): byte-indexed PAIR LUT. Every hot-path
+// consumer reads whole qs BYTES; rung 1 still did two nibble lookups per
+// byte. Precompute all 256 byte values as float2{c[b&0xF], c[b>>4]} (2 KiB
+// LDS) so each byte costs ONE ds_read_b64. The multiplies by norm are
+// unchanged, so results stay bit-identical to rungs 0 and 1.
+// MEASURED 2026-08-07 gfx1030: the pair LUT REGRESSES (decode-shape 134->165
+// us/run, prefill 29.1->38.5 ms) -- 2 KiB LDS occupancy + divergent 8-byte
+// bank conflicts beat the saved nibble read. OPT-IN via TURBO4_LUT_PAIR for
+// other archs; default is rung 1.
+// #define TURBO4_LUT_PAIR 1
+
+static __device__ __forceinline__ const float2 * turbo4_lut2_lds() {
+#ifdef TURBO4_LUT_NO_LDS
+    return nullptr;   // rung 0: callers must not use the pair LUT
+#else
+    __shared__ float2 s_turbo4_lut2[256];
+    return s_turbo4_lut2;
+#endif
+}
+
 static __device__ __forceinline__ void turbo4_lut_stage_lds() {
 #ifndef TURBO4_LUT_NO_LDS
-    float * s = const_cast<float *>(turbo4_lut_lds());
     const int tid = (int) (threadIdx.z*blockDim.y*blockDim.x +
                            threadIdx.y*blockDim.x + threadIdx.x);
+    float * s = const_cast<float *>(turbo4_lut_lds());
     if (tid < 16) {
         s[tid] = TURBO_CENTROIDS_4BIT[tid];
     }
+#ifdef TURBO4_LUT_PAIR
+    float2 * s2 = const_cast<float2 *>(turbo4_lut2_lds());
+    const int nthreads_total = (int) (blockDim.x*blockDim.y*blockDim.z);
+    for (int b = tid; b < 256; b += nthreads_total) {
+        s2[b] = make_float2(TURBO_CENTROIDS_4BIT[b & 0xF],
+                            TURBO_CENTROIDS_4BIT[b >> 4]);
+    }
+#endif // TURBO4_LUT_PAIR
     __syncthreads();
-#endif
+#endif // TURBO4_LUT_NO_LDS
 }
 
 // ---- 4-bit centroids for turbo4_64 (64-element blocks), calibrated from

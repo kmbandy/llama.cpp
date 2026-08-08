@@ -484,15 +484,22 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
                 ? (uint8_t) ((qs_pack >> (8*k_KQ_1)) & 0xFF)
                 : K_turbo[ib_base].qs[j0_base / 2 + k_KQ_1];
 
+            float2 kv;
+#if !defined(TURBO4_LUT_NO_LDS) && defined(TURBO4_LUT_PAIR)
+            // RUNG 2: one ds_read_b64 per qs byte via the pair LUT.
+            const float2 c2 = turbo4_lut2_lds()[qs_byte];
+            kv.x = c2.x * norm;
+            kv.y = c2.y * norm;
+#else
             const uint8_t idx0 = (qs_byte >> 0) & 0xF;    // low nibble = j0
             const uint8_t idx1 = (qs_byte >> 4) & 0xF;    // high nibble = j0+1
 
             // RUNG 1: LDS LUT (staged in the kernel prologue), not constant
             // memory -- a divergent constant gather is a VMEM round trip here.
             const float * lut = turbo4_lut_lds();
-            float2 kv;
             kv.x = lut[idx0] * norm;
             kv.y = lut[idx1] * norm;
+#endif // rung select
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
@@ -934,42 +941,45 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
         const uint8_t qs_byte0 = x[ib].qs[j0 / 2];      // elements j0, j0+1
         const uint8_t qs_byte1 = x[ib].qs[j0 / 2 + 1];  // elements j0+2, j0+3
 
-        const uint8_t idx0 = (qs_byte0 >> 0) & 0xF;
-        const uint8_t idx1 = (qs_byte0 >> 4) & 0xF;
-        const uint8_t idx2 = (qs_byte1 >> 0) & 0xF;
-        const uint8_t idx3 = (qs_byte1 >> 4) & 0xF;
-
-        // RUNG 1: LDS LUT, staged by the fattn-vec kernel prologue. This
+        // RUNGS 1/2: LDS LUTs, staged by the fattn-vec kernel prologue. This
         // function's only turbo4 caller is flash_attn_ext_vec (verified:
         // lightning-indexer dispatches no turbo types), so the LUT is always
         // staged before we get here.
+        float v0, v1, v2, v3;
+#if !defined(TURBO4_LUT_NO_LDS) && defined(TURBO4_LUT_PAIR)
+        const float2 p0 = turbo4_lut2_lds()[qs_byte0];
+        const float2 p1 = turbo4_lut2_lds()[qs_byte1];
+        v0 = p0.x * norm; v1 = p0.y * norm;
+        v2 = p1.x * norm; v3 = p1.y * norm;
+#else
         const float * lut = turbo4_lut_lds();
+        v0 = lut[(qs_byte0 >> 0) & 0xF] * norm; v1 = lut[(qs_byte0 >> 4) & 0xF] * norm;
+        v2 = lut[(qs_byte1 >> 0) & 0xF] * norm; v3 = lut[(qs_byte1 >> 4) & 0xF] * norm;
+#endif // rung select
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
-            ((half2 *) dst)[0] = make_half2(
-                __float2half(lut[idx0] * norm),
-                __float2half(lut[idx1] * norm));
-            ((half2 *) dst)[1] = make_half2(
-                __float2half(lut[idx2] * norm),
-                __float2half(lut[idx3] * norm));
+            ((half2 *) dst)[0] = make_half2(__float2half(v0), __float2half(v1));
+            ((half2 *) dst)[1] = make_half2(__float2half(v2), __float2half(v3));
         } else
 #endif // FP16_AVAILABLE
         if constexpr (std::is_same_v<T, float>) {
-            ((float2 *) dst)[0] = make_float2(
-                lut[idx0] * norm,
-                lut[idx1] * norm);
-            ((float2 *) dst)[1] = make_float2(
-                lut[idx2] * norm,
-                lut[idx3] * norm);
+            ((float2 *) dst)[0] = make_float2(v0, v1);
+            ((float2 *) dst)[1] = make_float2(v2, v3);
         } else {
             static_assert(std::is_same_v<T, void>, "unsupported type");
         }
     } else { // ne == 2
-        // RUNG 1: LDS LUT here too; j0 is even so both nibbles share one byte.
-        const float * lut = turbo4_lut_lds();
+        // RUNGS 1/2 here too; j0 is even so both nibbles share one byte.
         const uint8_t qs_byte = x[ib].qs[j0 / 2];
+#if !defined(TURBO4_LUT_NO_LDS) && defined(TURBO4_LUT_PAIR)
+        const float2 pr = turbo4_lut2_lds()[qs_byte];
+        const float v0 = pr.x * norm;
+        const float v1 = pr.y * norm;
+#else
+        const float * lut = turbo4_lut_lds();
         const float v0 = lut[(qs_byte >> 0) & 0xF] * norm;
         const float v1 = lut[(qs_byte >> 4) & 0xF] * norm;
+#endif // rung select
 #ifdef FP16_AVAILABLE
         if constexpr (std::is_same_v<T, half>) {
             ((half2 *) dst)[0] = make_half2(__float2half(v0), __float2half(v1));
