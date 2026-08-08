@@ -426,3 +426,30 @@ VERDICTS:
   (16.32/16.42). Consistent with async issue pumping the 31-pagein prefill
   drain. Candidate PREFILL lever; needs the code2000 arm to confirm.
 DECODE CONFIG OF RECORD UNCHANGED: COALESCE=1, ~3.94.
+
+=== ROUNDS 6/6b/7 (night): spine graphs + D2 worker graph cache ===
+round6 (VOID -- contaminated by my own -j16 compile on main during arms):
+  ctl6 3.41 / hipg 3.50
+round6b (degraded window, all CANONICAL):
+  ctl7 3.34 | hipg2 3.58 (+7.2%) | gc16 3.49 (+4.5%, gcache 14021 hits /
+  1085 misses = 92.8%, best worker walls of window: pg0 2.02, pg+ 9.21)
+round7 (bracketed):
+  ctl8 3.47 | combo 3.55 | ctl9 3.59  <- THE CONTROL BEAT THE COMBO.
+
+VERDICT: INCONCLUSIVE ON THROUGHPUT -- the evening window drifts +-4%
+arm-to-arm on identical canonical work (3.34..3.59), same order as the
+effects under test. Round-6b's hipg2 +7.2% may be recovery drift. What IS
+established regardless of window:
+- D2 cache (WP_EXPERT_GRAPH_CACHE, 3d667c8af+) works mechanically: 92.8%
+  hit rate, no crash, BYTE-IDENTICAL through cached graphs + GM16 dense
+  switch (canonical 146/155 exact).
+- Spine WP_HIP_GRAPHS=1 byte-identical (canonical twice).
+- The fork gates the backend's src-ptrs-only CUDA-graph update path behind
+  WP_HIP_GRAPHS=1, so DEFAULT runs never engage graphs anywhere pointers
+  change per call (spine KV advance, worker fresh ctx) -- both levers
+  mechanically justified; magnitude needs a quiet window.
+WINDOW INSTABILITY (from ~20:03): not Brave (0 procs), not my compile
+(round 6b/7 clean), temps fine, R9700 slowdown spread across phases.
+UNATTRIBUTED. Evening measurement is instrument-limited until resolved.
+NEXT: interleaved A/B/A/B replication in a quiet window (or late-night cron)
+for hipg/gcache/combo before any config-of-record change.
