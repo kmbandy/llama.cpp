@@ -1125,6 +1125,12 @@ nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
 # over the mesh. Stop it by rerunning the harness (its startup sweep kills
 # stale listeners) or killing the recorded pids in $OUT.
 if [ -n "${SERVE:-}" ]; then
+    # DISARM THE EXIT TRAP. cleanup is trap'd on EXIT (line ~678); without
+    # this, exit 0 below tears down the exact stack we just brought up --
+    # which is precisely what happened on the first SERVE attempt
+    # (2026-08-07 21:38: health OK, then every process killed by our own
+    # cleanup ~seconds later; looked like a silent spine crash).
+    trap - EXIT
     echo
     echo "############ SERVING ############"
     echo "  spine: http://${IPMAIN}:8095 (OpenAI-compatible; bound ${SPINE_HOST:-127.0.0.1})"
