@@ -9255,7 +9255,7 @@ bool ggml_backend_vk_wp_event_wait(void * event) {
         return false;
     }
     std::lock_guard<std::recursive_mutex> guard(wp_event->device->mutex);
-    VK_CHECK(wp_event->device->device.waitForFences({ wp_event->fence }, true, UINT64_MAX), "wp stage_in waitForFences");
+    VK_CHECK(wp_event->device->device.waitForFences({ wp_event->fence }, true, UINT64_MAX), "wp stage_in waitForFences", wp_event->device);
     ggml_vk_queue_command_pools_cleanup(wp_event->device);
     return true;
 }
