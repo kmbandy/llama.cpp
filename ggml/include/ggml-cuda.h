@@ -3,6 +3,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+// Fork-local weight-pager copy-stream hooks. These return false when the
+// feature is unavailable or has permanently disarmed after a runtime error.
+GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_stream_enabled(ggml_backend_t backend);
+GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t backend, ggml_tensor * tensor,
+                                                             const void * data, size_t offset, size_t size);
+GGML_BACKEND_API bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t backend,
+                                                                    ggml_backend_event_t event);
+
 #ifdef  __cplusplus
 extern "C" {
 #endif

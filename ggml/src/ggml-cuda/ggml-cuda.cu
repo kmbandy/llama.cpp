@@ -706,6 +706,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (wp_copy_latest_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(wp_copy_latest_event));
+    }
+    if (wp_copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(wp_copy_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -716,6 +722,103 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
     }
+}
+
+static bool ggml_cuda_wp_copy_requested(ggml_backend_t backend) {
+    const char * env = std::getenv("WP_EXPERT_COPY_STREAM");
+    if (env == nullptr || std::strcmp(env, "1") != 0 || backend == nullptr) {
+        return false;
+    }
+    return true;
+}
+
+static cudaError_t ggml_cuda_wp_copy_stream_create(cudaStream_t * stream) {
+#if defined(GGML_USE_HIP)
+    return hipStreamCreateWithFlags(stream, hipStreamNonBlocking);
+#else
+    return cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking);
+#endif
+}
+
+static cudaError_t ggml_cuda_wp_copy_async(void * dst, const void * src, size_t size, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, stream);
+#else
+    return cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
+#endif
+}
+
+static void ggml_cuda_wp_copy_disarm(ggml_backend_cuda_context * ctx) {
+    if (ctx->wp_copy_enabled) {
+        cudaDeviceSynchronize();
+    }
+    ctx->wp_copy_enabled = false;
+}
+
+bool ggml_backend_cuda_wp_copy_stream_enabled(ggml_backend_t backend) {
+    // Check capability before reading backend->context; backend names are not type checks.
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx->wp_copy_initialized) {
+        return ctx->wp_copy_enabled;
+    }
+    ctx->wp_copy_initialized = true;
+    if (!ggml_cuda_wp_copy_requested(backend)) {
+        return false;
+    }
+    ggml_cuda_set_device(ctx->device);
+    const cudaError_t stream_status =
+        ggml_cuda_wp_copy_stream_create(&ctx->wp_copy_stream);
+    const cudaError_t event_status = stream_status == cudaSuccess
+        ? cudaEventCreateWithFlags(&ctx->wp_copy_latest_event, cudaEventDisableTiming)
+        : stream_status;
+    if (stream_status != cudaSuccess || event_status != cudaSuccess) {
+        if (ctx->wp_copy_latest_event != nullptr) {
+            cudaEventDestroy(ctx->wp_copy_latest_event);
+            ctx->wp_copy_latest_event = nullptr;
+        }
+        if (ctx->wp_copy_stream != nullptr) {
+            cudaStreamDestroy(ctx->wp_copy_stream);
+            ctx->wp_copy_stream = nullptr;
+        }
+        cudaDeviceSynchronize();
+        return false;
+    }
+    ctx->wp_copy_enabled = true;
+    return true;
+}
+
+bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t backend, ggml_tensor * tensor,
+                                            const void * data, size_t offset, size_t size) {
+    // Check capability before reading backend->context; backend names are not type checks.
+    if (!ggml_backend_is_cuda(backend) || !ggml_backend_cuda_wp_copy_stream_enabled(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    const cudaError_t copy_status = ggml_cuda_wp_copy_async(
+        (char *) tensor->data + offset, data, size, ctx->wp_copy_stream);
+    if (copy_status != cudaSuccess ||
+        cudaEventRecord(ctx->wp_copy_latest_event, ctx->wp_copy_stream) != cudaSuccess) {
+        GGML_LOG_WARN("wp copy stream: async H2D failed (%s), disabling\n", cudaGetErrorString(copy_status));
+        ggml_cuda_wp_copy_disarm(ctx);
+        return false;
+    }
+    ctx->wp_copy_pending = true;
+    return true;
+}
+
+bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t backend,
+                                                   ggml_backend_event_t event) {
+    // Check capability before reading backend->context; backend names are not type checks.
+    if (!ggml_backend_is_cuda(backend) || !ggml_backend_cuda_wp_copy_stream_enabled(backend) || event == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return cudaEventRecord((cudaEvent_t) event->context, ctx->wp_copy_stream) == cudaSuccess;
 }
 
 
@@ -3423,6 +3526,31 @@ static bool ggml_cuda_wp_hip_graphs_enabled() {
     return env != nullptr && strcmp(env, "1") == 0;
 }
 
+struct ggml_cuda_wp_graph_counters {
+    std::atomic<uint64_t> captures{0};
+    std::atomic<uint64_t> replays{0};
+    std::atomic<uint64_t> fallbacks{0};
+};
+
+static ggml_cuda_wp_graph_counters ggml_cuda_wp_graph_counts[GGML_CUDA_MAX_DEVICES];
+static std::once_flag ggml_cuda_wp_graph_atexit_once;
+
+static void ggml_cuda_wp_graph_print_counts() {
+    uint64_t captures = 0, replays = 0, fallbacks = 0;
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        captures += ggml_cuda_wp_graph_counts[i].captures.load(std::memory_order_relaxed);
+        replays += ggml_cuda_wp_graph_counts[i].replays.load(std::memory_order_relaxed);
+        fallbacks += ggml_cuda_wp_graph_counts[i].fallbacks.load(std::memory_order_relaxed);
+    }
+    fprintf(stderr, "wp hip-graphs: captures=%llu replays=%llu fallbacks=%llu\n",
+            (unsigned long long) captures, (unsigned long long) replays,
+            (unsigned long long) fallbacks);
+}
+
+static void ggml_cuda_wp_graph_count_init() {
+    std::call_once(ggml_cuda_wp_graph_atexit_once, []() { atexit(ggml_cuda_wp_graph_print_counts); });
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -5046,6 +5174,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
+            if (ggml_cuda_wp_hip_graphs_enabled()) {
+                ggml_cuda_wp_graph_count_init();
+                ggml_cuda_wp_graph_counts[cuda_ctx->device].captures.fetch_add(1, std::memory_order_relaxed);
+            }
+
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
@@ -5061,6 +5194,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
         if (cuda_graph_update_required) { // Update graph executable
+            if (ggml_cuda_wp_hip_graphs_enabled() && graph->instance != nullptr) {
+                ggml_cuda_wp_graph_count_init();
+                ggml_cuda_wp_graph_counts[cuda_ctx->device].replays.fetch_add(1, std::memory_order_relaxed);
+            }
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
@@ -5097,6 +5234,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (cuda_ctx->wp_copy_enabled && cuda_ctx->wp_copy_pending &&
+        cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->wp_copy_latest_event, 0) != cudaSuccess) {
+        ggml_cuda_wp_copy_disarm(cuda_ctx);
+    }
+    cuda_ctx->wp_copy_pending = false;
 
     // MAD-230: publish the compute stream to the weight-pager eval_cb
     // side channel so its hipMemcpyAsync(stream) for the expert-pointer
@@ -5149,6 +5292,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        }
+        if (!use_cuda_graph && ggml_cuda_wp_hip_graphs_enabled()) {
+            ggml_cuda_wp_graph_count_init();
+            ggml_cuda_wp_graph_counts[cuda_ctx->device].fallbacks.fetch_add(1, std::memory_order_relaxed);
         }
     }
 #endif // USE_CUDA_GRAPH
