@@ -97,7 +97,7 @@ struct server_model_meta {
     std::set<std::string> tags;    // informational tags, not used for routing
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
-    int64_t last_used = 0; // for LRU unloading
+    int64_t last_used = 0; // for LRU unloading and load timeout tracking
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
     json loaded_info; // info to be reflected via /v1/models endpoint ; if in DOWNLOADING state, it should contain download progress info
     json progress; // reflect load or download progress info, if any

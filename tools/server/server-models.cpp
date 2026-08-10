@@ -53,6 +53,9 @@ static constexpr const char * ROUTER_ARG_VRAM_MB      = "LLAMA_ARG_ROUTER_VRAM_M
 static constexpr const char * ROUTER_ARG_PINNED       = "LLAMA_ARG_ROUTER_PINNED";
 static constexpr const char * ROUTER_ARG_EXCLUSIVE    = "LLAMA_ARG_ROUTER_EXCLUSIVE";
 static constexpr const char * ROUTER_ARG_IDLE_TIMEOUT = "LLAMA_ARG_ROUTER_IDLE_TIMEOUT";
+static constexpr const char * ROUTER_LOAD_TIMEOUT     = "LLAMA_SERVER_ROUTER_LOAD_TIMEOUT";
+
+static constexpr int DEFAULT_ROUTER_LOAD_TIMEOUT_S = 900;
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -1556,6 +1559,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         auto it = mapping.find(name);
         if (it != mapping.end()) {
             it->second.meta.status = SERVER_MODEL_STATUS_LOADING;
+            it->second.meta.last_used = ggml_time_ms();
             marked_loading = true;
             cv.notify_all();
         }
@@ -2127,8 +2131,25 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
 //   - never unload a pinned model (pinning is a human saying "leave this alone").
 void server_models::idle_sweeper_loop() {
     const int global_timeout_s = base_params.models_idle_timeout;
+    int load_timeout_s = DEFAULT_ROUTER_LOAD_TIMEOUT_S;
+    if (const char * value = std::getenv(ROUTER_LOAD_TIMEOUT); value != nullptr && value[0] != '\0') {
+        try {
+            load_timeout_s = std::stoi(value);
+        } catch (const std::exception &) {
+            SRV_WRN("invalid %s=%s; using default %ds\n",
+                    ROUTER_LOAD_TIMEOUT, value, DEFAULT_ROUTER_LOAD_TIMEOUT_S);
+            load_timeout_s = DEFAULT_ROUTER_LOAD_TIMEOUT_S;
+        }
+    }
+    if (load_timeout_s < 0) {
+        SRV_WRN("invalid %s=%d; using default %ds\n",
+                ROUTER_LOAD_TIMEOUT, load_timeout_s, DEFAULT_ROUTER_LOAD_TIMEOUT_S);
+        load_timeout_s = DEFAULT_ROUTER_LOAD_TIMEOUT_S;
+    }
     SRV_INF("router idle sweeper: global idle-timeout=%ds (0=never); per-model idle-timeout overrides\n",
             global_timeout_s);
+    SRV_INF("router load timeout: %ds (0=never) via %s\n",
+            load_timeout_s, ROUTER_LOAD_TIMEOUT);
 
     while (!idle_stop.load(std::memory_order_relaxed)) {
         for (int i = 0; i < 10 && !idle_stop.load(std::memory_order_relaxed); ++i) {
@@ -2140,6 +2161,7 @@ void server_models::idle_sweeper_loop() {
 
         // (name, effective_timeout_s used for the log line)
         std::vector<std::pair<std::string, int>> victims;
+        std::vector<std::pair<std::string, int>> load_victims;
         {
             std::unique_lock<std::mutex> lk(mutex);
             const int64_t now = ggml_time_ms();
@@ -2148,6 +2170,13 @@ void server_models::idle_sweeper_loop() {
                     continue;
                 }
                 if (inst.meta.placement.pinned || inst.inflight > 0) {
+                    continue;
+                }
+                if (inst.meta.status == SERVER_MODEL_STATUS_LOADING) {
+                    if (load_timeout_s > 0 && inst.meta.last_used > 0 &&
+                            now - inst.meta.last_used >= (int64_t) load_timeout_s * 1000) {
+                        load_victims.emplace_back(name, load_timeout_s);
+                    }
                     continue;
                 }
                 if (inst.meta.last_used <= 0) {
@@ -2169,6 +2198,15 @@ void server_models::idle_sweeper_loop() {
                 unload(name);
             } catch (const std::exception & e) {
                 SRV_WRN("router idle sweeper: failed to unload %s: %s\n", name.c_str(), e.what());
+            }
+        }
+        for (const auto & [name, timeout_s] : load_victims) {
+            SRV_WRN("router load timeout: unloading %s (loading > %ds)\n",
+                    name.c_str(), timeout_s);
+            try {
+                unload(name);
+            } catch (const std::exception & e) {
+                SRV_WRN("router load timeout: failed to unload %s: %s\n", name.c_str(), e.what());
             }
         }
     }
