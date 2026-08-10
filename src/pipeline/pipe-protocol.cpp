@@ -522,6 +522,89 @@ pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     return r;
 }
 
+std::vector<uint8_t> pipe_encode_expert_dispatch_begin(
+        const pipe_expert_dispatch_begin & p) {
+    pipe_expert_dispatch_req request;
+    request.layer = p.layer;
+    request.n_tokens = p.n_tokens;
+    request.assignments = p.assignments;
+    request.swiglu_clamp = p.swiglu_clamp;
+    std::vector<uint8_t> out = pipe_encode_expert_dispatch_req(request);
+    return out;
+}
+
+pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
+        const uint8_t * buf, size_t len) {
+    if (len < 16) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch BEGIN payload is too small");
+    }
+    const uint8_t * p = buf;
+    const uint8_t * end = buf + len;
+    pipe_expert_dispatch_begin r;
+    r.layer = rd_i32(p);
+    r.n_tokens = rd_u32(p);
+    const uint32_t n_assignments = rd_u32(p);
+    r.swiglu_clamp = rd_f32(p);
+    if (r.layer < 0 || r.n_tokens == 0 || n_assignments == 0 ||
+        !std::isfinite(r.swiglu_clamp) || r.swiglu_clamp < 0.0f) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch BEGIN has invalid dimensions");
+    }
+    const uint64_t assignment_bytes =
+        (uint64_t) n_assignments * (4ull + (uint64_t) r.n_tokens * 4ull);
+    if ((uint64_t) (end - p) != assignment_bytes) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch BEGIN payload has trailing bytes");
+    }
+    std::set<int32_t> seen_experts;
+    r.assignments.reserve(n_assignments);
+    for (uint32_t i = 0; i < n_assignments; ++i) {
+        pipe_expert_assignment assignment;
+        assignment.expert_id = rd_i32(p);
+        if (assignment.expert_id < 0 || !seen_experts.insert(assignment.expert_id).second) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch BEGIN has an invalid or repeated expert");
+        }
+        assignment.weights.reserve(r.n_tokens);
+        for (uint32_t t = 0; t < r.n_tokens; ++t) {
+            const float weight = rd_f32(p);
+            if (!std::isfinite(weight)) {
+                fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch BEGIN has a non-finite weight");
+            }
+            assignment.weights.push_back(weight);
+        }
+        r.assignments.push_back(std::move(assignment));
+    }
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts(
+        const pipe_expert_dispatch_acts & p) {
+    const uint64_t total = (uint64_t) p.activations.size() * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    return out;
+}
+
+pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
+        const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd) {
+    if (n_embd <= 0 || n_tokens == 0 ||
+        (uint64_t) n_tokens * (uint64_t) n_embd * 4ull != len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS dimensions do not match BEGIN");
+    }
+    pipe_expert_dispatch_acts r;
+    r.activations.resize((size_t) n_tokens * (size_t) n_embd);
+    const uint8_t * p = buf;
+    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    for (float value : r.activations) {
+        if (!std::isfinite(value)) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS has a non-finite activation");
+        }
+    }
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // expert prefetch hint (fire and forget; no response frame)
 

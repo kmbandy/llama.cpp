@@ -36,6 +36,7 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -59,6 +60,15 @@ extern "C" {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+
+bool ggml_backend_cuda_wp_copy_stream_enabled(ggml_backend_t)
+    __attribute__((weak));
+bool ggml_backend_cuda_wp_copy_tensor_async(ggml_backend_t, ggml_tensor *,
+                                                        const void *, size_t, size_t)
+    __attribute__((weak));
+bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
+                                                               ggml_backend_event_t)
+    __attribute__((weak));
 
 namespace wp_expert_worker {
 
@@ -1246,6 +1256,11 @@ public:
         }
 
         pinned_ = pinned;
+        backend_ = backend;
+        device_  = backend_ != nullptr ? ggml_backend_get_device(backend_) : nullptr;
+        copy_stream_h2d_ = backend_ != nullptr && device_ != nullptr &&
+            ggml_backend_cuda_wp_copy_stream_enabled != nullptr &&
+            ggml_backend_cuda_wp_copy_stream_enabled(backend_);
         // WP_EXPERT_ASYNC_H2D=1 -- 2026-08-07 consult lever, retargeted at the
         // 2026 workers after the straggler finding (their staging drain runs
         // 4.4-5.6 ms/request vs the R9700's 0.6). The drain issues
@@ -1274,8 +1289,6 @@ public:
             const bool vulkan =
                 bname != nullptr && std::strstr(bname, "Vulkan") != nullptr;
             if (!vulkan) {
-                backend_ = backend;
-                device_  = ggml_backend_get_device(backend);
                 ggml_backend_event_t probe =
                     device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
                 if (probe != nullptr) {
@@ -1287,7 +1300,8 @@ public:
         // Logged once: one StagingPool is constructed per worker process.
         std::cerr << "wp expert worker: staging_kind="
                   << (pinned_ ? "pinned" : "pageable")
-                  << " async_h2d=" << (async_h2d_ ? "on" : "off") << std::endl;
+                  << " async_h2d=" << (async_h2d_ ? "on" : "off")
+                  << " copy_stream=" << (copy_stream_h2d_ ? "on" : "off") << std::endl;
     }
 
     ~StagingPool() {
@@ -1299,10 +1313,26 @@ public:
     // True when drain paths should use tensor_set_async + mark_in_flight.
     bool async_h2d() const { return async_h2d_; }
 
+    bool copy_stream_h2d() const { return copy_stream_h2d_; }
+
+    ggml_backend_event_t new_copy_event() const {
+        return copy_stream_h2d_ && device_ != nullptr ? ggml_backend_event_new(device_) : nullptr;
+    }
+
+    bool record_copy_event(ggml_backend_event_t event) const {
+        return event != nullptr && ggml_backend_cuda_wp_copy_stream_record_event != nullptr &&
+               ggml_backend_cuda_wp_copy_stream_record_event(backend_, event);
+    }
+
     // Record "an async copy out of this staging buffer is in flight" on the
     // backend stream. Dispatch-thread only (same thread as the async issue).
     void mark_in_flight(void * data) {
-        if (!async_h2d_) {
+        if (!async_h2d_ && !copy_stream_h2d_) {
+            return;
+        }
+        if (backend_ == nullptr || device_ == nullptr) {
+            async_h2d_ = false;
+            copy_stream_h2d_ = false;
             return;
         }
         ggml_backend_event_t ev = nullptr;
@@ -1323,7 +1353,14 @@ public:
             ggml_backend_synchronize(backend_);
             return;
         }
-        ggml_backend_event_record(ev, backend_);
+        if (copy_stream_h2d_ && ggml_backend_cuda_wp_copy_stream_record_event != nullptr) {
+            if (!ggml_backend_cuda_wp_copy_stream_record_event(backend_, ev)) {
+                copy_stream_h2d_ = false;
+                ggml_backend_synchronize(backend_);
+            }
+        } else {
+            ggml_backend_event_record(ev, backend_);
+        }
     }
 
     class Lease {
@@ -1371,7 +1408,7 @@ public:
         // reader thread refills it. Outside the pool lock -- the wait is on
         // the GPU, and holding the lock would serialize every other borrower
         // behind it.
-        if (async_h2d_) {
+        if (async_h2d_ || copy_stream_h2d_) {
             ggml_backend_event_t ev = nullptr;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1423,6 +1460,7 @@ private:
     // mark_in_flight (dispatch thread) races borrow()'s read (reader threads)
     // -- either value is safe to observe there.
     std::atomic<bool>                               async_h2d_{false};
+    std::atomic<bool>                               copy_stream_h2d_{false};
     ggml_backend_t                                  backend_ = nullptr;
     ggml_backend_dev_t                              device_  = nullptr;
     std::unordered_map<void *, ggml_backend_event_t> events_;
@@ -1742,6 +1780,12 @@ public:
 
         void complete();
 
+        void wait_copy_event(ggml_backend_t backend) const {
+            if (copy_event_ != nullptr) {
+                ggml_backend_event_wait(backend, copy_event_);
+            }
+        }
+
         // Drain reads until every entry with index < entry_end that needs a
         // page-in has landed, leaving the rest in flight. Lets the caller
         // compute a leading chunk of experts while the tail is still being read
@@ -1829,6 +1873,7 @@ public:
         uint64_t                   host_bytes_ = 0;
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
+        ggml_backend_event_t       copy_event_ = nullptr;
         // Drain state. Lives on the Batch rather than in complete_batch's frame
         // so a drain can stop part-way (complete_upto) and be resumed. A read
         // that FAILED never sets entry.ready, so every drain loop is bounded by
@@ -1975,6 +2020,7 @@ public:
                           });
             }
             batch.state_ = std::make_shared<BatchState>();
+            batch.copy_event_ = staging_.new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
             try {
                 for (size_t entry_index : pageins) {
@@ -2229,6 +2275,10 @@ public:
             // flag is only consulted by drain_one_read, which runs exclusively
             // on THIS thread and cannot run before submit returns.
             spec_batch_->state_->speculative = true;
+            if (spec_batch_->copy_event_ != nullptr) {
+                ggml_backend_event_free(spec_batch_->copy_event_);
+                spec_batch_->copy_event_ = nullptr;
+            }
         } catch (const std::exception &) {
             // Advisory: a failed speculative read must not fail the worker. The
             // same error will surface on the demand path, where it belongs.
@@ -2854,7 +2904,13 @@ private:
                 // this copy. NOTE ns_h2d then measures ISSUE time, not copy
                 // time; the copy overlaps reads/submit and the A/B metric is
                 // the request wall.
-                if (staging_.async_h2d()) {
+                if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
+                    ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
+                    ggml_backend_cuda_wp_copy_tensor_async(
+                        backend_, slot.raw, (const char *) result->staging->get() + result->offset,
+                        result->offset, result->len)) {
+                    staging_.mark_in_flight(result->staging->get());
+                } else if (!batch.state_->speculative && staging_.async_h2d()) {
                     ggml_backend_tensor_set_async(
                         backend_,
                         slot.raw, (const char *) result->staging->get() + result->offset,
@@ -2966,6 +3022,10 @@ private:
         }
         batch.workers_.clear();
         batch.completed_ = true;
+        if (batch.copy_event_ != nullptr && !staging_.record_copy_event(batch.copy_event_)) {
+            ggml_backend_event_free(batch.copy_event_);
+            batch.copy_event_ = nullptr;
+        }
         if (batch.have_read_time_) {
             batch.ns_read_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 batch.last_read_ - batch.first_read_).count();
@@ -3346,6 +3406,7 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     host_bytes_(other.host_bytes_),
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
+    copy_event_(other.copy_event_),
     // Drain state travels with the batch. It was omitted here originally --
     // harmless while every move ran before the first drain (NRVO covered the
     // return paths), but spec_pagein_submit now moves a live batch into a
@@ -3357,9 +3418,13 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     last_read_(other.last_read_),
     have_read_time_(other.have_read_time_) {
     other.owner_ = nullptr;
+    other.copy_event_ = nullptr;
 }
 
 ExpertSlotPool::Batch::~Batch() {
+    if (copy_event_ != nullptr) {
+        ggml_backend_event_free(copy_event_);
+    }
     if (owner_ != nullptr) {
         owner_->abandon_batch(*this);
     }
@@ -3391,6 +3456,10 @@ void attach_weight(
 
 class Worker {
 public:
+    struct split_pending {
+        pipe_expert_dispatch_req request;
+        std::optional<ExpertSlotPool::Batch> batch;
+    };
     Worker(
             Catalog catalog,
             const std::string & device,
@@ -3746,18 +3815,7 @@ public:
         return hello;
     }
 
-    pipe_expert_partial dispatch(
-            const pipe_expert_dispatch_req & request,
-            RequestStats & request_stats) {
-        spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
-        // Raise the demand gate for the whole request; preemptible landings
-        // pause between slices while it is up. RAII so every exit (including
-        // the protocol throws below) lowers it.
-        pool_.demand_serving(true);
-        struct DemandGate {
-            ExpertSlotPool & pool;
-            ~DemandGate() { pool.demand_serving(false); }
-        } demand_gate{ pool_ };
+    void validate_dispatch(const pipe_expert_dispatch_req & request) const {
         if (!std::binary_search(catalog_.layers.begin(), catalog_.layers.end(), request.layer)) {
             throw pipe_protocol_error(
                 PIPE_ERR_EXPERT_LAYER,
@@ -3784,6 +3842,28 @@ public:
                     "worker does not serve expert " + std::to_string(assignment.expert_id));
             }
         }
+    }
+
+    pipe_expert_partial dispatch(
+            const pipe_expert_dispatch_req & request,
+            RequestStats & request_stats,
+            std::optional<ExpertSlotPool::Batch> prepared = std::nullopt) {
+        const bool owns_gate = !prepared.has_value();
+        if (owns_gate) {
+            spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
+        }
+        // Raise the demand gate for the whole request; preemptible landings
+        // pause between slices while it is up. RAII so every exit (including
+        // the protocol throws below) lowers it.
+        if (owns_gate) {
+            pool_.demand_serving(true);
+        }
+        struct DemandGate {
+            ExpertSlotPool & pool;
+            bool active;
+            ~DemandGate() { if (active) pool.demand_serving(false); }
+        } demand_gate{ pool_, owns_gate };
+        validate_dispatch(request);
 
         // Already f32 on the wire as of PIPE_VERSION 4; this used to widen a
         // f16 value back to f32, which recovered the storage type but NOT the
@@ -3800,8 +3880,9 @@ public:
                 request.layer, assignment.expert_id
             }));
         }
-        ExpertSlotPool::Batch batch = pool_.ensure_batch(
-            pages, measure, lookup_started);
+        ExpertSlotPool::Batch batch = prepared.has_value()
+            ? std::move(*prepared)
+            : pool_.ensure_batch(pages, measure, lookup_started);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
@@ -4025,6 +4106,75 @@ public:
         request_stats.ns_encode = lap();
         return response;
     }
+
+    void begin_split_dispatch(const pipe_expert_dispatch_begin & begin, uint64_t seq_id) {
+        if (split_pending_) {
+            throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                      "expert dispatch BEGIN arrived before ACTS");
+        }
+        pipe_expert_dispatch_req request;
+        request.layer = begin.layer;
+        request.n_tokens = begin.n_tokens;
+        request.assignments = begin.assignments;
+        request.swiglu_clamp = begin.swiglu_clamp;
+        validate_dispatch(request);
+        std::vector<const ExpertPage *> pages;
+        pages.reserve(request.assignments.size());
+        for (const pipe_expert_assignment & assignment : request.assignments) {
+            pages.push_back(&catalog_.pages.at({ request.layer, assignment.expert_id }));
+        }
+        spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
+        pool_.demand_serving(true);
+        try {
+            split_pending pending;
+            pending.request = std::move(request);
+            const auto lookup_started = stats_.enabled() ? std::chrono::steady_clock::now() :
+                std::chrono::steady_clock::time_point{};
+            pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started));
+            split_pending_.emplace(std::move(pending));
+            split_seq_id_ = seq_id;
+        } catch (...) {
+            pool_.demand_serving(false);
+            spec_prefill_gate_active_ = false;
+            throw;
+        }
+    }
+
+    pipe_expert_partial finish_split_dispatch(
+            const pipe_expert_dispatch_acts & acts, uint64_t seq_id,
+            RequestStats & request_stats) {
+        if (!split_pending_) {
+            throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                      "expert dispatch ACTS has no BEGIN");
+        }
+        if (seq_id != split_seq_id_) {
+            throw pipe_protocol_error(PIPE_ERR_STALE_SEQ,
+                                      "expert dispatch ACTS sequence does not match BEGIN");
+        }
+        split_pending pending = std::move(*split_pending_);
+        split_pending_.reset();
+        pending.request.activations = acts.activations;
+        try {
+            pipe_expert_partial response = dispatch(
+                pending.request, request_stats, std::move(pending.batch));
+            pool_.demand_serving(false);
+            spec_prefill_gate_active_ = false;
+            return response;
+        } catch (...) {
+            pool_.demand_serving(false);
+            spec_prefill_gate_active_ = false;
+            throw;
+        }
+    }
+
+    void abandon_split_dispatch() noexcept {
+        split_pending_.reset();
+        pool_.demand_serving(false);
+        spec_prefill_gate_active_ = false;
+    }
+
+    bool has_split_dispatch() const { return split_pending_.has_value(); }
+    uint32_t split_n_tokens() const { return split_pending_->request.n_tokens; }
 
     const ResourcePlan & resources() const {
         return pool_.resources();
@@ -4324,6 +4474,7 @@ private:
             // Default [0, SIZE_MAX) = every expert, i.e. unchanged behaviour.
             size_t sel_begin = 0,
             size_t sel_end = std::numeric_limits<size_t>::max()) {
+        batch.wait_copy_event(backend_.get());
         const auto selected = [&](size_t i) {
             return i >= sel_begin && i < sel_end &&
                    (all_experts || (batch.is_resident(i) == hits));
@@ -4871,6 +5022,8 @@ private:
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
+    std::optional<split_pending> split_pending_;
+    uint64_t split_seq_id_ = 0;
 };
 
 bool validate_client_hello(
@@ -4901,6 +5054,10 @@ bool send_hello_ack(
 }
 
 int serve_connection(pipe_socket_t & socket, Worker & worker) {
+    struct PendingCleanup {
+        Worker & worker;
+        ~PendingCleanup() { worker.abandon_split_dispatch(); }
+    } pending_cleanup{ worker };
     const pipe_expert_hello mine = worker.hello();
     const std::vector<uint8_t> hello_payload = pipe_encode_expert_hello(mine);
     if (!pipe_send_frame(
@@ -4962,6 +5119,36 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
         const char * p = std::getenv("WP_REQ_LOG");
         return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
     }();
+    auto write_req_log = [req_log](int32_t layer, uint32_t n_tokens, size_t n_assignments,
+                                   const RequestStats & s,
+                                   std::chrono::steady_clock::time_point started) {
+        if (req_log == nullptr || started == std::chrono::steady_clock::time_point{}) {
+            return;
+        }
+        const uint64_t ns_wall = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const double epoch_end = (double) std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
+        fprintf(req_log,
+                "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+                "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu\n",
+                layer, n_tokens, n_assignments,
+                (unsigned long long) s.n_resident, (unsigned long long) s.n_pagein,
+                (unsigned long long) s.bytes_read, (unsigned long long) ns_wall,
+                (unsigned long long) s.ns_lookup, (unsigned long long) s.ns_prep,
+                (unsigned long long) s.ns_hits, (unsigned long long) s.ns_wait,
+                (unsigned long long) s.ns_pagein_compute, (unsigned long long) s.ns_result,
+                (unsigned long long) s.ns_read, (unsigned long long) s.ns_h2d,
+                (unsigned long long) s.ns_submit, (unsigned long long) s.ns_readback,
+                (unsigned long long) s.ns_encode, (unsigned long long) s.ns_send,
+                (unsigned long long) s.n_weight_nonzero,
+                (unsigned long long) s.n_weight_total, epoch_end,
+                (unsigned long long) s.ns_params_set);
+        fflush(req_log);
+    };
+    pipe_expert_dispatch_begin split_log_begin;
+    RequestStats split_log_stats;
+    std::chrono::steady_clock::time_point split_log_started;
 
     // WP_REF_LOG=path -- the full REFERENCE stream: "<layer> <expert> <expert> ..."
     // one line per request, every expert asked for whether it was resident or paged in.
@@ -5071,6 +5258,64 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             }
             continue;
         }
+        if (type == PIPE_EXPERT_DISPATCH_BEGIN) {
+            try {
+                split_log_begin = pipe_decode_expert_dispatch_begin(payload.data(), payload.size());
+                split_log_stats = RequestStats{};
+                split_log_started = req_log != nullptr ? std::chrono::steady_clock::now() :
+                    std::chrono::steady_clock::time_point{};
+                worker.begin_split_dispatch(split_log_begin, seq_id);
+            } catch (const pipe_protocol_error & error) {
+                pipe_send_error(socket, seq_id, error.code, error.what());
+                return 1;
+            } catch (const std::exception & error) {
+                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                return 1;
+            }
+            continue;
+        }
+        if (type == PIPE_EXPERT_DISPATCH_ACTS) {
+            try {
+                if (!worker.has_split_dispatch()) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "expert dispatch ACTS has no BEGIN");
+                }
+                const pipe_expert_dispatch_acts acts = pipe_decode_expert_dispatch_acts(
+                    payload.data(), payload.size(), worker.split_n_tokens(), mine.n_embd);
+                // BEGIN fixes assignment index order; splitting changes only when
+                // reads start, never the computation order or resulting bytes.
+                const pipe_expert_partial response = worker.finish_split_dispatch(
+                    acts, seq_id, split_log_stats);
+                const auto split_send_started = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
+                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                     encoded.data(), encoded.size())) {
+                    return 1;
+                }
+                if (worker.stats_enabled()) {
+                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - split_send_started).count();
+                    worker.record_stats(split_log_stats, split_log_begin.assignments.size());
+                }
+                write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                split_log_started = std::chrono::steady_clock::time_point{};
+            } catch (const pipe_protocol_error & error) {
+                pipe_send_error(socket, seq_id, error.code, error.what());
+                return 1;
+            } catch (const std::exception & error) {
+                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                return 1;
+            }
+            continue;
+        }
+        if (worker.has_split_dispatch()) {
+            pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME,
+                            "frame is not legal between dispatch BEGIN and ACTS");
+            return 1;
+        }
         if (type != PIPE_EXPERT_DISPATCH_REQ) {
             pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME, "expected expert dispatch request");
             return 1;
@@ -5093,7 +5338,15 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 for (const pipe_expert_assignment & a : request.assignments) {
                     fprintf(ref_log, " %d", a.expert_id);
                 }
-                fputc('\n', ref_log);
+                // D5 (throughput-analysis): trailing n_tokens column so the offline
+                // eviction sim can tell prefill (n_tokens > 1) from decode (==1)
+                // requests -- the prefill-aware / sweep-boundary policies need the
+                // phase boundary. Trailing, so the expert columns never move. The
+                // nt= sentinel keeps the column self-describing: a bare integer is
+                // indistinguishable from an expert id, so every REF_LOG consumer
+                // (sim-evict.py, probe-embed-routing.py) would silently misparse
+                // legacy-vs-new captures without it.
+                fprintf(ref_log, " nt=%u\n", request.n_tokens);
                 fflush(ref_log);
             }
             // Ground truth into the ordered stream. Emitted BEFORE dispatch, so

@@ -28,6 +28,9 @@ struct pipe_socket_t {
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
 
+    // Interrupt blocking I/O without closing the descriptor.
+    void shutdown();
+
     // Underlying descriptor, for callers that want to poll()/select() before
     // committing to a blocking recv_data. Returns -1 if unavailable. Added so
     // the expert worker can do useful work while waiting for the next request

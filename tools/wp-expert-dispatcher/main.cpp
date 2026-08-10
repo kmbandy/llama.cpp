@@ -127,7 +127,7 @@ options parse_cli(int argc, char ** argv) {
     return result;
 }
 
-std::vector<uint16_t> read_activations(const std::string & path, size_t count) {
+std::vector<float> read_activations(const std::string & path, size_t count) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         throw std::runtime_error("failed to open activation file " + path);
@@ -137,11 +137,7 @@ std::vector<uint16_t> read_activations(const std::string & path, size_t count) {
     if ((size_t) input.gcount() != values.size() * sizeof(float) || input.peek() != std::ifstream::traits_type::eof()) {
         throw std::runtime_error("activation file size does not equal tokens*n_embd F32 values");
     }
-    std::vector<uint16_t> result(count);
-    for (size_t i = 0; i < count; ++i) {
-        result[i] = (uint16_t) ggml_fp32_to_fp16(values[i]);
-    }
-    return result;
+    return values;
 }
 
 }  // namespace
@@ -161,9 +157,9 @@ int main(int argc, char ** argv) {
             }
         }
         const size_t                count       = (size_t) args.n_tokens * (size_t) dispatcher.n_embd();
-        const std::vector<uint16_t> activations = read_activations(args.activation_path, count);
+        const std::vector<float> activations = read_activations(args.activation_path, count);
         const std::vector<float>    result =
-            dispatcher.dispatch(args.layer, args.seq_id, args.n_tokens, activations, args.assignments);
+            dispatcher.dispatch(args.layer, args.seq_id, args.n_tokens, activations, args.assignments, 0.0f);
         for (uint32_t token = 0; token < args.n_tokens; ++token) {
             std::cout << "token " << token;
             const size_t base = (size_t) token * dispatcher.n_embd();

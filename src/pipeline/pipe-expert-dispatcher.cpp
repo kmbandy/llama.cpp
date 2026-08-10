@@ -6,15 +6,22 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <iterator>
+#include <list>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,6 +52,20 @@ bool speed_split_enabled() {
 bool static_assign_enabled() {
     const char * value = std::getenv("WP_DISPATCH_STATIC_ASSIGN");
     return value == nullptr || value[0] != '0';
+}
+
+// WP_ASYNC_ISSUE -- default OFF as of 2026-08-08 round 8. Decode measured a
+// +60 ms/dispatch net regression and an unexplained multi-second stall mode;
+// see docs/dev/2026-08-08-runs.txt. Opt in with WP_ASYNC_ISSUE=1 for the
+// prefill retest at code2000 length.
+bool async_issue_enabled() {
+    const char * value = std::getenv("WP_ASYNC_ISSUE");
+    return value != nullptr && value[0] != '0';
+}
+
+bool split_frame_enabled() {
+    const char * value = std::getenv("WP_SPLIT_FRAME");
+    return value != nullptr && value[0] != '0';
 }
 
 // WP_DISPATCH_UNION=1 -- measurement only, no behaviour change. Logs how many
@@ -261,6 +282,17 @@ void split_immediate_deferred(const std::vector<pipe_expert_assignment> & assign
     }
 }
 
+// A fully-encoded wire frame awaiting a writer thread. Only bytes are moved;
+// the request itself (assignments / token_ids) lives on the dispatch thread and
+// is untouched by the writer. seq_id is echoed so a writer failure can be
+// reported against the request sequence without decoding the payload.
+struct wire_frame {
+    pipe_frame_type      type = PIPE_HELLO;
+    uint64_t             seq_id = 0;
+    std::vector<uint8_t> payload;
+    dispatch_clock::time_point enqueued_at{};
+};
+
 }  // namespace
 
 struct dispatcher::impl {
@@ -273,12 +305,38 @@ struct dispatcher::impl {
         double wait_ms = 0.0;
     };
 
+    // D1 async issue: one FIFO writer thread per socket. The dispatch thread
+    // enqueues fully-encoded frames and returns; the writer moves bytes. A
+    // single writer per socket is what keeps frame bytes from interleaving on
+    // the wire -- do NOT pool sockets across writer threads.
+    struct socket_writer {
+        pipe_socket_ptr    socket;   // own ref: poison()'s reset cannot free it mid-send
+        std::string        endpoint;
+        std::thread        thread;
+        std::mutex         mutex;
+        std::condition_variable cv;
+        std::deque<wire_frame> queue;
+        bool               stop    = false;
+        bool               done    = false;
+        bool               failed  = false;
+        std::string        error_msg;
+        // Backpressure cap. One layer of requests is <= ~3 frames per worker
+        // (<= ~60 MB worst-case prefill), so a full queue means a wedged worker;
+        // fail loudly rather than grow without bound.
+        static constexpr size_t MAX_QUEUE = 8;
+    };
+
     struct worker {
         endpoint                                 target;
         worker_info                              info;
         pipe_expert_hello                        hello;
         pipe_socket_ptr                          socket;
-        std::vector<std::pair<int32_t, int32_t>> resident_lru;
+        std::unique_ptr<socket_writer>           writer;
+        // D9: residency LRU as std::list + unordered_map (key = layer<<32|expert)
+        // instead of an O(n_slots) vector memmove per assignment. Dispatch-thread
+        // only -- the writer threads never touch it.
+        std::list<std::pair<int32_t, int32_t>>   resident_lru;
+        std::unordered_map<uint64_t, std::list<std::pair<int32_t, int32_t>>::iterator> resident_map;
         std::array<speed_sample, speed_estimate_window> speed_history{};
         size_t                                   speed_history_next      = 0;
         size_t                                   speed_samples            = 0;
@@ -292,7 +350,13 @@ struct dispatcher::impl {
         size_t                              worker_index = 0;
         std::vector<pipe_expert_assignment> assignments;
         std::vector<uint8_t>                payload;
+        std::vector<uint8_t>                begin_payload;
+        std::vector<uint8_t>                acts_payload;
         dispatch_clock::time_point          issued_at;
+        dispatch_clock::time_point          await_started_at;
+        dispatch_clock::time_point          await_finished_at;
+        uint64_t                            response_bytes = 0;
+        uint64_t                            unpack_ns = 0;
         uint64_t                            wait_ns = 0;
         // SPINE-SIDE GATHER (2026-08-05). When non-empty, this request carries
         // only these token rows -- token_ids[r] is the ORIGINAL token index of
@@ -352,6 +416,14 @@ struct dispatcher::impl {
     // routed by a different rule than the request that follows it.
     bool                                                static_assign = true;
     bool                                                stats_logging = false;
+    // WP_ASYNC_ISSUE latch (D1). True => issue/hint frames go through per-socket
+    // writer threads instead of blocking send() on the dispatch thread.
+    bool                                                async_issue = false;
+    bool                                                split_frame = false;
+    // Per-worker static-assign weight (D6.3), default 1 = current behaviour.
+    // WP_DISPATCH_WEIGHTS="port=w[,port=w...]" and the sugar
+    // WP_DISPATCH_BIAS_1070=N (port 8803). Indexed by workers[] index.
+    std::vector<int>                                    worker_weights_;
 
     // Per-request wire log; see accumulate_partial. Off unless WP_DISPATCH_REQ_LOG
     // is set, so it costs nothing in a normal run.
@@ -359,6 +431,12 @@ struct dispatcher::impl {
         const char * p = std::getenv("WP_DISPATCH_REQ_LOG");
         return (p != nullptr && p[0] != '\0') ? fopen(p, "w") : (FILE *) nullptr;
     }();
+    FILE *                                              writer_log_ = [] {
+        const char * p = std::getenv("WP_DISPATCH_REQ_LOG");
+        return (p != nullptr && p[0] != '\0') ? fopen((std::string(p) + ".writer").c_str(), "w") : (FILE *) nullptr;
+    }();
+    std::mutex                                          writer_log_mutex_;
+    dispatch_clock::time_point                          req_dispatch_start_{};
 
     // Gap accounting: time spent with in_flight == 0.
     bool                       gap_at_zero = false;
@@ -370,7 +448,9 @@ struct dispatcher::impl {
 
     explicit impl(const std::vector<endpoint> & endpoints) :
                 speed_split(speed_split_enabled()),
-                static_assign(static_assign_enabled()) {
+                static_assign(static_assign_enabled()),
+                async_issue(async_issue_enabled()) {
+        split_frame = split_frame_enabled();
         stats_logging = dispatch_stats_enabled();
         collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
@@ -482,6 +562,206 @@ struct dispatcher::impl {
         }
 
         build_routes();
+        parse_worker_weights();
+        start_writers();
+    }
+
+    // Normal destruction lets queued frames drain before joining writers.
+    ~impl() {
+        stop_writers(false);
+        if (req_log_ != nullptr) fclose(req_log_);
+        if (writer_log_ != nullptr) fclose(writer_log_);
+    }
+
+    // Residency key (layer, expert) -> uint64 for the D9 LRU map.
+    static uint64_t residency_key(int32_t layer, int32_t expert) {
+        return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert;
+    }
+
+    // Parse WP_DISPATCH_WEIGHTS and WP_DISPATCH_BIAS_1070 into per-worker
+    // static-assign weights (D6.3). Keyed by the port of each worker's endpoint
+    // (host:port); default weight 1 = current uniform behaviour. A weight is
+    // clamped to >= 1. Never throws: a malformed knob degrades to the default.
+    void parse_worker_weights() {
+        worker_weights_.assign(workers.size(), 1);
+        auto apply_by_port = [this](int port, int weight) {
+            if (port <= 0 || weight < 1) {
+                return;
+            }
+            for (size_t i = 0; i < workers.size(); ++i) {
+                const size_t colon = workers[i].info.endpoint.rfind(':');
+                if (colon == std::string::npos) {
+                    continue;
+                }
+                const int wport = std::atoi(workers[i].info.endpoint.c_str() + colon + 1);
+                if (wport == port) {
+                    worker_weights_[i] = std::max(worker_weights_[i], weight);
+                }
+            }
+        };
+        if (const char * w = std::getenv("WP_DISPATCH_WEIGHTS"); w != nullptr && w[0] != '\0') {
+            std::istringstream stream(w);
+            std::string        item;
+            while (std::getline(stream, item, ',')) {
+                const size_t eq = item.find('=');
+                if (eq == std::string::npos || eq == 0) {
+                    continue;
+                }
+                apply_by_port(std::atoi(item.substr(0, eq).c_str()),
+                              std::atoi(item.substr(eq + 1).c_str()));
+            }
+        }
+        if (const char * b = std::getenv("WP_DISPATCH_BIAS_1070"); b != nullptr && b[0] != '\0') {
+            // Fleet convention: the GTX 1070 listens on 8803. Bias its weight so
+            // severe-tail (RX 480) layers shift to the card that drains at
+            // 2.9 GB/s. Pure function of (layer, expert) still -- see choose_worker.
+            apply_by_port(8803, std::atoi(b));
+        }
+    }
+
+    void start_writers() {
+        if (!async_issue) {
+            return;
+        }
+        try {
+            for (worker & value : workers) {
+                value.writer.reset(new socket_writer{});
+                value.writer->socket = value.socket;   // own ref for the thread
+                value.writer->endpoint = value.info.endpoint;
+                socket_writer * w = value.writer.get();
+                w->thread = std::thread([this, w]() { writer_loop(w); });
+            }
+        } catch (...) {
+            // std::thread construction can throw (rare resource exhaustion). Stop
+            // whatever writers did start so no thread is left running into impl
+            // storage when the constructor unwinds. Threads already joined are a
+            // no-op (not joinable).
+            stop_writers(true);
+            throw;
+        }
+    }
+
+    void stop_writers(bool immediate) {
+        for (worker & value : workers) {
+            socket_writer * w = value.writer.get();
+            if (!w) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(w->mutex);
+                w->stop = true;
+            }
+            w->cv.notify_all();
+        }
+        const auto deadline = dispatch_clock::now() + std::chrono::seconds(3);
+        if (!immediate) {
+            for (worker & value : workers) {
+                socket_writer * w = value.writer.get();
+                if (!w) {
+                    continue;
+                }
+                std::unique_lock<std::mutex> lock(w->mutex);
+                w->cv.wait_until(lock, deadline, [w]() { return w->done; });
+            }
+        }
+        for (worker & value : workers) {
+            socket_writer * w = value.writer.get();
+            if (!w) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(w->mutex);
+            if (!w->done && w->socket) {
+                w->socket->shutdown();
+            }
+        }
+        for (worker & value : workers) {
+            socket_writer * w = value.writer.get();
+            if (!w) {
+                continue;
+            }
+            if (w->thread.joinable()) {
+                w->thread.join();
+            }
+            w->socket.reset();
+        }
+    }
+
+    // Writer thread body: pop one encoded frame at a time and send it. On send
+    // failure, record it and exit -- the dispatch thread observes the failure at
+    // the next enqueue or await_response entry and poisons. Never throws.
+    void writer_loop(socket_writer * w) {
+        while (true) {
+            wire_frame frame;
+            bool       have = false;
+            {
+                std::unique_lock<std::mutex> lock(w->mutex);
+                w->cv.wait(lock, [w]() {
+                    return w->stop || w->failed || !w->queue.empty();
+                });
+                if (w->failed) {
+                    break;
+                }
+                if (!w->queue.empty()) {
+                    frame = std::move(w->queue.front());
+                    w->queue.pop_front();
+                    have = true;
+                } else if (w->stop) {
+                    break;
+                }
+            }
+            if (!have) {
+                continue;
+            }
+            const dispatch_clock::time_point send_started = dispatch_clock::now();
+            const bool send_ok = pipe_send_frame(*w->socket, frame.type, frame.seq_id,
+                                                 frame.payload.data(), frame.payload.size());
+            if (writer_log_ != nullptr) {
+                std::lock_guard<std::mutex> log_lock(writer_log_mutex_);
+                fprintf(writer_log_, "%llu %llu %u %llu %zu %s\n",
+                        (unsigned long long) elapsed_ns(frame.enqueued_at, send_started),
+                        (unsigned long long) elapsed_ns(send_started, dispatch_clock::now()),
+                        (unsigned) frame.type, (unsigned long long) frame.seq_id,
+                        frame.payload.size(), w->endpoint.c_str());
+                fflush(writer_log_);
+            }
+            if (!send_ok) {
+                std::lock_guard<std::mutex> lock(w->mutex);
+                if (!w->failed) {
+                    w->failed     = true;
+                    w->error_msg  = "writer send failed on seq_id " + std::to_string(frame.seq_id);
+                }
+                break;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(w->mutex);
+            w->done = true;
+        }
+        w->cv.notify_all();
+    }
+
+    // Enqueue one frame onto a worker's writer FIFO. Throws if the writer has
+    // already failed or the queue is over its cap (a wedged worker).
+    void enqueue_frame(worker & value, wire_frame frame) {
+        socket_writer * w = value.writer.get();
+        if (!w) {
+            throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                     " has no writer (async issue off)");
+        }
+        {
+            std::lock_guard<std::mutex> lock(w->mutex);
+            if (w->failed) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " writer failed: " + w->error_msg);
+            }
+            if (w->queue.size() >= socket_writer::MAX_QUEUE) {
+                throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                         " writer queue overflow (worker wedged?)");
+            }
+            frame.enqueued_at = dispatch_clock::now();
+            w->queue.push_back(std::move(frame));
+        }
+        w->cv.notify_one();
     }
 
     void build_routes() {
@@ -540,9 +820,8 @@ struct dispatcher::impl {
     }
 
     bool is_resident(size_t worker_index, int32_t layer, int32_t expert) const {
-        const std::pair<int32_t, int32_t>                key(layer, expert);
-        const std::vector<std::pair<int32_t, int32_t>> & lru = workers[worker_index].resident_lru;
-        return std::find(lru.begin(), lru.end(), key) != lru.end();
+        const worker & value = workers[worker_index];
+        return value.resident_map.find(residency_key(layer, expert)) != value.resident_map.end();
     }
 
     size_t choose_worker(int32_t                     layer,
@@ -577,7 +856,36 @@ struct dispatcher::impl {
             h  = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
             h  = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
             h ^=  h >> 31;
-            return candidates[(size_t) (h % (uint64_t) candidates.size())];
+            // D6.3 weighted static assign. With default weights (all 1) this is
+            // bit-for-bit the old `h % candidates.size()` pick. With a weight > 1
+            // for one worker (e.g. bias the GTX 1070 over the RX 480), that
+            // worker occupies that many slots in the pick table -- still a PURE
+            // function of (layer, expert), so reproducibility is preserved, and
+            // send_prefetch_hints calls the SAME choose_worker, so hints can
+            // never disagree with dispatches.
+            bool weighted = false;
+            for (size_t c : candidates) {
+                if (worker_weights_[c] != 1) {
+                    weighted = true;
+                    break;
+                }
+            }
+            if (!weighted) {
+                return candidates[(size_t) (h % (uint64_t) candidates.size())];
+            }
+            uint64_t total = 0;
+            for (size_t c : candidates) {
+                total += (uint64_t) std::max(1, worker_weights_[c]);
+            }
+            uint64_t pick = h % total;
+            for (size_t c : candidates) {
+                const uint64_t w = (uint64_t) std::max(1, worker_weights_[c]);
+                if (pick < w) {
+                    return c;
+                }
+                pick -= w;
+            }
+            return candidates.front();   // unreachable: total > pick by construction
         }
         if (s_static_assign) {
             return candidates.front();
@@ -712,14 +1020,18 @@ struct dispatcher::impl {
     void update_residency(size_t worker_index, int32_t layer, const std::vector<pipe_expert_assignment> & assignments) {
         worker & value = workers[worker_index];
         for (const pipe_expert_assignment & assignment : assignments) {
-            const std::pair<int32_t, int32_t> key(layer, assignment.expert_id);
-            auto found = std::find(value.resident_lru.begin(), value.resident_lru.end(), key);
-            if (found != value.resident_lru.end()) {
-                value.resident_lru.erase(found);
+            const uint64_t key = residency_key(layer, assignment.expert_id);
+            auto it = value.resident_map.find(key);
+            if (it != value.resident_map.end()) {
+                value.resident_lru.erase(it->second);
+                value.resident_map.erase(it);
             }
-            value.resident_lru.push_back(key);
+            value.resident_lru.emplace_back(layer, assignment.expert_id);
+            value.resident_map[key] = std::prev(value.resident_lru.end());
             while (value.resident_lru.size() > value.hello.n_slots) {
-                value.resident_lru.erase(value.resident_lru.begin());
+                value.resident_map.erase(residency_key(value.resident_lru.front().first,
+                                                       value.resident_lru.front().second));
+                value.resident_lru.pop_front();
             }
         }
     }
@@ -729,6 +1041,13 @@ struct dispatcher::impl {
         in_flight = 0;
         gap_at_zero = false;
         pending_def = {};
+        // D1 async: stop and join the writer threads first, then drop sockets.
+        // A writer blocked in send() unblocks when the peer's connection breaks
+        // (the reason we are poisoning) or once it sees the stop flag; joining
+        // here guarantees no thread is left running into impl storage. Idempotent
+        // with ~impl's stop_writers() -- the threads are already joined by the
+        // time the object is destroyed.
+        stop_writers(true);
         for (worker & value : workers) {
             value.socket.reset();
         }
@@ -742,6 +1061,19 @@ struct dispatcher::impl {
         pipe_frame_type type;
         uint64_t        seq_id = 0;
         worker &        value  = workers[request.worker_index];
+        // D1 async: if this worker's writer thread already failed (its send did
+        // not complete), the partial we are about to await will never arrive.
+        // Surface that now instead of blocking on a dead socket.
+        if (async_issue) {
+            socket_writer * w = value.writer.get();
+            if (w) {
+                std::lock_guard<std::mutex> lock(w->mutex);
+                if (w->failed) {
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " writer failed: " + w->error_msg);
+                }
+            }
+        }
         if (!pipe_recv_frame(*value.socket, type, seq_id, payload)) {
             throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
                                      " died while computing expert(s) " + assignment_experts(request.assignments));
@@ -864,7 +1196,19 @@ struct dispatcher::impl {
                 wire_request.assignments = request.assignments;
                 wire_request.activations = activations;
             }
-            request.payload = pipe_encode_expert_dispatch_req(wire_request);
+            if (split_frame) {
+                pipe_expert_dispatch_begin begin;
+                begin.layer = wire_request.layer;
+                begin.n_tokens = wire_request.n_tokens;
+                begin.assignments = wire_request.assignments;
+                begin.swiglu_clamp = wire_request.swiglu_clamp;
+                pipe_expert_dispatch_acts acts;
+                acts.activations = wire_request.activations;
+                request.begin_payload = pipe_encode_expert_dispatch_begin(begin);
+                request.acts_payload = pipe_encode_expert_dispatch_acts(acts);
+            } else {
+                request.payload = pipe_encode_expert_dispatch_req(wire_request);
+            }
             requests.push_back(std::move(request));
         }
         return requests;
@@ -939,8 +1283,25 @@ struct dispatcher::impl {
             const std::vector<uint8_t> payload = pipe_encode_expert_prefetch_hint(hint);
             // seq_id 0: a hint is never correlated with a response, so it must not
             // consume an id from the request sequence.
-            if (!pipe_send_frame(*value.socket, PIPE_EXPERT_PREFETCH_HINT, 0,
-                                 payload.data(), payload.size())) {
+            if (async_issue) {
+                // D1: hints go through the same per-socket FIFO writer queue as
+                // requests. Two threads calling send() on one socket could
+                // interleave bytes inside a frame -- routing everything through
+                // the single writer thread makes that impossible, and the FIFO
+                // preserves the wire-order invariant (a hint can never overtake a
+                // request frame on the same socket).
+                wire_frame frame;
+                frame.type    = PIPE_EXPERT_PREFETCH_HINT;
+                frame.seq_id  = 0;
+                frame.payload = payload;   // small; copy is fine
+                try {
+                    enqueue_frame(value, std::move(frame));
+                } catch (...) {
+                    ++hint_stats.n_send_failed;
+                    continue;
+                }
+            } else if (!pipe_send_frame(*value.socket, PIPE_EXPERT_PREFETCH_HINT, 0,
+                                        payload.data(), payload.size())) {
                 ++hint_stats.n_send_failed;
                 continue;
             }
@@ -954,11 +1315,40 @@ struct dispatcher::impl {
     void issue_requests(std::vector<planned_request> & requests, uint64_t seq_id) {
         for (planned_request & request : requests) {
             worker & value = workers[request.worker_index];
-            if (collect_stats) {
+            if (collect_stats || req_log_ != nullptr) {
                 request.issued_at = dispatch_clock::now();
             }
-            if (!pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_REQ, seq_id, request.payload.data(),
-                                 request.payload.size())) {
+            if (split_frame && async_issue) {
+                wire_frame begin;
+                begin.type = PIPE_EXPERT_DISPATCH_BEGIN;
+                begin.seq_id = seq_id;
+                begin.payload = std::move(request.begin_payload);
+                enqueue_frame(value, std::move(begin));
+                wire_frame acts;
+                acts.type = PIPE_EXPERT_DISPATCH_ACTS;
+                acts.seq_id = seq_id;
+                acts.payload = std::move(request.acts_payload);
+                enqueue_frame(value, std::move(acts));
+            } else if (split_frame) {
+                if (!pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_BEGIN, seq_id,
+                                     request.begin_payload.data(), request.begin_payload.size()) ||
+                    !pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_ACTS, seq_id,
+                                     request.acts_payload.data(), request.acts_payload.size())) {
+                    throw std::runtime_error("expert dispatcher failed to send split expert request to worker " +
+                                             value.info.endpoint);
+                }
+            } else if (async_issue) {
+                // D1: enqueue and return. The per-socket writer thread moves the
+                // bytes; the dispatch thread is free to issue the next worker /
+                // layer immediately. payload is moved out (bytes only) -- the
+                // request keeps its assignments/token_ids for the await path.
+                wire_frame frame;
+                frame.type    = PIPE_EXPERT_DISPATCH_REQ;
+                frame.seq_id  = seq_id;
+                frame.payload = std::move(request.payload);
+                enqueue_frame(value, std::move(frame));
+            } else if (!pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_REQ, seq_id,
+                                        request.payload.data(), request.payload.size())) {
                 throw std::runtime_error("expert dispatcher failed to send expert(s) " +
                                          assignment_experts(request.assignments) + " to worker " +
                                          value.info.endpoint);
@@ -971,6 +1361,26 @@ struct dispatcher::impl {
     // Receive ONE partial and decode it into `out` (does NOT accumulate). Split
     // out of accumulate_partial so the caller can harvest partials in ARRIVAL
     // order while still summing them in a FIXED order -- see harvest_partials.
+    void write_request_log(const planned_request & request, int32_t layer, uint32_t n_tokens) {
+        if (req_log_ == nullptr) {
+            return;
+        }
+        // Column order: layer n_tokens worker_index n_experts ns_before_await
+        // ns_blocked ns_issue_done ns_await_recv resp_bytes ns_unpack
+        // await_start_ns await_end_ns.
+        fprintf(req_log_, "%d %u %zu %zu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                layer, n_tokens, request.worker_index, request.assignments.size(),
+                (unsigned long long) elapsed_ns(request.issued_at, request.await_started_at),
+                (unsigned long long) elapsed_ns(request.await_started_at, request.await_finished_at),
+                (unsigned long long) elapsed_ns(request.issued_at, request.await_started_at),
+                (unsigned long long) elapsed_ns(request.await_started_at, request.await_finished_at),
+                (unsigned long long) request.response_bytes,
+                (unsigned long long) request.unpack_ns,
+                (unsigned long long) elapsed_ns(req_dispatch_start_, request.await_started_at),
+                (unsigned long long) elapsed_ns(req_dispatch_start_, request.await_finished_at));
+        fflush(req_log_);
+    }
+
     void receive_partial(std::vector<float> &             out,
                          size_t                           n_values,
                          planned_request &                request,
@@ -979,8 +1389,8 @@ struct dispatcher::impl {
                          uint32_t                         n_tokens,
                          dispatch_clock::time_point *     last_response) {
         std::vector<uint8_t>  payload;
-        // WP_DISPATCH_REQ_LOG=path: one line per request --
-        //   layer n_tokens worker_index n_experts ns_before_await ns_blocked
+        // WP_DISPATCH_REQ_LOG=path: one line per request. The complete column
+        // order is documented at write_request_log below.
         //
         // n_tokens added 2026-08-03: prefill (>1) vs decode (==1). Without it the
         // spine-side wire timings could not be split by phase either, so joining
@@ -1000,15 +1410,11 @@ struct dispatcher::impl {
         // order per worker) to get wire = ns_blocked - worker_service.
         const auto wp_await_t0 = req_log_ != nullptr ? dispatch_clock::now()
                                                      : dispatch_clock::time_point();
+        request.await_started_at = wp_await_t0;
         const pipe_frame_type type = await_response(request, seq_id, payload);
-        if (req_log_ != nullptr) {
-            const auto now = dispatch_clock::now();
-            fprintf(req_log_, "%d %u %zu %zu %llu %llu\n", layer, n_tokens,
-                    request.worker_index, request.assignments.size(),
-                    (unsigned long long) elapsed_ns(request.issued_at, wp_await_t0),
-                    (unsigned long long) elapsed_ns(wp_await_t0, now));
-            fflush(req_log_);
-        }
+        request.await_finished_at = req_log_ != nullptr ? dispatch_clock::now()
+                                                         : dispatch_clock::time_point();
+        request.response_bytes = req_log_ != nullptr ? payload.size() : 0;
         if (collect_stats && last_response != nullptr) {
             *last_response = dispatch_clock::now();
             // per-request wait is only tracked for the primary wait loop via stats.workers
@@ -1072,7 +1478,13 @@ struct dispatcher::impl {
                             dispatch_clock::time_point *     last_response) {
         std::vector<float> one;
         receive_partial(one, result.size(), request, seq_id, layer, n_tokens, last_response);
+        const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
+                                                   : dispatch_clock::time_point();
         scatter_add(result, one, request);
+        if (req_log_ != nullptr) {
+            request.unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
+            write_request_log(request, layer, n_tokens);
+        }
     }
 
     // Add a worker's partial into the layer result. Identity (token_ids empty) is
@@ -1196,7 +1608,13 @@ struct dispatcher::impl {
         // sum must not depend on network timing. scatter_add keeps that property:
         // a row touched by several workers is still summed in request order.
         for (size_t i = 0; i < n; ++i) {
+            const auto unpack_t0 = req_log_ != nullptr ? dispatch_clock::now()
+                                                       : dispatch_clock::time_point();
             scatter_add(result, partials[i], requests[i]);
+            if (req_log_ != nullptr) {
+                requests[i].unpack_ns = elapsed_ns(unpack_t0, dispatch_clock::now());
+                write_request_log(requests[i], layer, n_tokens);
+            }
         }
     }
 
@@ -1239,6 +1657,9 @@ struct dispatcher::impl {
                                 float                                       swiglu_clamp) {
         if (poisoned) {
             throw std::runtime_error("expert dispatcher cannot be reused after a worker or protocol failure");
+        }
+        if (req_log_ != nullptr) {
+            req_dispatch_start_ = dispatch_clock::now();
         }
         const auto route_it = routes.find(layer);
         if (route_it == routes.end()) {

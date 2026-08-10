@@ -52,7 +52,11 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // ignore the hint, it would kill the session on the first one -- mid-run, after a
 // successful HELLO, looking exactly like a worker crash. Rejecting at HELLO turns
 // that into one clear line at startup.
-// 6: the prefetch hint carries PROVENANCE. A hint derived from a token the
+// 5 -> 6 (2026-08-08): expert dispatch may be split into BEGIN and ACTS frames.
+// PIPE_EXPERT_DISPATCH_BEGIN carries the layer, token count, assignments and
+// SwiGLU clamp; PIPE_EXPERT_DISPATCH_ACTS carries only f32 activations. Version
+// 6 workers accept both this pair and the monolithic request for A/B compatibility.
+// The prefetch hint also carries PROVENANCE. A hint derived from a token the
 //    target will certainly process (id_last) and one derived from a PREDICTION
 //    cost the same to send and are worth very different amounts to keep, and a
 //    worker that cannot tell them apart has to lease them identically. Measured:
@@ -84,6 +88,8 @@ enum pipe_frame_type : uint32_t {
     PIPE_EXPERT_PARTIAL      = 9,
     PIPE_EXPERT_HELLO_ACK    = 10,
     PIPE_EXPERT_PREFETCH_HINT = 11,
+    PIPE_EXPERT_DISPATCH_BEGIN = 12,
+    PIPE_EXPERT_DISPATCH_ACTS  = 13,
 };
 
 enum pipe_role : uint32_t {
@@ -226,6 +232,19 @@ struct pipe_expert_dispatch_req {
     float                               swiglu_clamp = 0.0f;
 };
 
+// Split dispatch: the BEGIN payload is the dispatch metadata without the
+// activation tensor. The ACTS payload is the f32 activation tensor only.
+struct pipe_expert_dispatch_begin {
+    int32_t                            layer = -1;
+    uint32_t                           n_tokens = 0;
+    std::vector<pipe_expert_assignment> assignments;
+    float                              swiglu_clamp = 0.0f;
+};
+
+struct pipe_expert_dispatch_acts {
+    std::vector<float> activations;
+};
+
 // A prefetch hint: "you are about to be asked for these experts on this layer".
 //
 // FIRE AND FORGET. There is no response frame and no seq_id correlation; the
@@ -338,6 +357,8 @@ std::vector<uint8_t> pipe_encode_error     (const pipe_error    & p);
 std::vector<uint8_t> pipe_encode_expert_hello(const pipe_expert_hello & p);
 std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatch_begin & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 // PING/PONG carry no payload.
@@ -351,6 +372,10 @@ pipe_expert_hello pipe_decode_expert_hello(const uint8_t * buf, size_t len);
 pipe_expert_hello_ack pipe_decode_expert_hello_ack(const uint8_t * buf, size_t len);
 pipe_expert_dispatch_req pipe_decode_expert_dispatch_req(
     const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
+    const uint8_t * buf, size_t len);
+pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
+    const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
 pipe_expert_partial pipe_decode_expert_partial(

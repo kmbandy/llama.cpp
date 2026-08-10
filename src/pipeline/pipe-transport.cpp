@@ -49,6 +49,7 @@ struct pipe_socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    void shutdown();
 
     sockfd_t fd;
 };
@@ -101,6 +102,10 @@ bool pipe_socket_t::impl::recv_data(void * data, size_t size) {
     return true;
 }
 
+void pipe_socket_t::impl::shutdown() {
+    ::shutdown(fd, SHUT_RDWR);
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 pipe_socket_t::pipe_socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
@@ -113,6 +118,12 @@ bool pipe_socket_t::send_data(const void * data, size_t size) {
 
 bool pipe_socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+void pipe_socket_t::shutdown() {
+    if (pimpl) {
+        pimpl->shutdown();
+    }
 }
 
 int pipe_socket_t::poll_fd() const {
