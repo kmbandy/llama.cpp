@@ -284,6 +284,9 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 
     ggml_set_output(cur);
     res->t_h_nextn = cur;
+    if (cparams.embeddings_layer_inp[0]) {
+        res->t_layer_inp[0] = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }
@@ -467,6 +470,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
 
         res->t_embd = inp_g;
+        if (!cparams.embeddings_layer_inp.empty() && cparams.embeddings_layer_inp[0]) {
+            res->t_layer_inp[0] = inp_g;
+        }
 
         ggml_build_forward_expand(gf, inp_g);
         return;
@@ -589,6 +595,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     cb(cur, "result_norm", -1);
 
     res->t_embd = cur;
+    if (cparams.embeddings_layer_inp[0]) {
+        res->t_layer_inp[0] = cur;
+        cb(cur, "result_embd_capture", -1);
+        ggml_build_forward_expand(gf, cur);
+    }
 
     // lm_head from the target model (shared via ctx_other)
     auto * output = model.output;
@@ -683,6 +694,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         }
 
         res->t_embd = inp_g;
+        if (cparams.embeddings_layer_inp[0]) {
+            res->t_layer_inp[0] = inp_g;
+        }
 
         ggml_build_forward_expand(gf, inp_g);
         return;
@@ -781,6 +795,11 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // confidence head input: the reference scores the pre-norm collapsed hidden state
     res->t_embd = cur;
+    if (!cparams.embeddings_layer_inp.empty() && cparams.embeddings_layer_inp[0]) {
+        res->t_layer_inp[0] = cur;
+        cb(cur, "layer_inp", 0);
+        ggml_build_forward_expand(gf, cur);
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

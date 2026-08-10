@@ -2298,7 +2298,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // ubatch.token is null for an embedding-input batch; tid2eid is a TOKEN
         // ID table, so there is simply nothing to look up and nothing to send.
         if (expert_dispatch != nullptr && ubatch.token != nullptr) {
-            expert_dispatch->prefetch_for_tokens(ubatch.token, ubatch.n_tokens);
+            expert_dispatch->note_batch_tokens(ubatch.token, ubatch.n_tokens);
+            // Filter the mask token at the hint site (throughput-analysis §6.1):
+            // during a draft decode this ubatch is [id_last, mask x k], and the
+            // tid2eid rows for mask_token_id are noise -- the dispatcher's
+            // (layer, provenance) dedup eats the repeats after the first block,
+            // but one garbage frame-set per session still pollutes the hint logs.
+            const llama_token mask = model.vocab.token_mask();
+            if (mask == LLAMA_TOKEN_NULL) {
+                expert_dispatch->prefetch_for_tokens(ubatch.token, ubatch.n_tokens);
+            } else {
+                std::vector<int32_t> filtered;
+                filtered.reserve(ubatch.n_tokens);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    if (ubatch.token[i] != mask) {
+                        filtered.push_back(ubatch.token[i]);
+                    }
+                }
+                if (!filtered.empty()) {
+                    expert_dispatch->prefetch_for_tokens(filtered.data(), filtered.size());
+                }
+            }
         }
 
         ggml_status status;

@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <cstdlib>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -130,6 +131,14 @@ static bool common_speculative_are_compatible(
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
+static bool common_speculative_capture_enabled() {
+    static const bool enabled = [] {
+        const char * path = std::getenv("WP_DRAFT_CAPTURE");
+        return path != nullptr && path[0] != '\0';
+    }();
+    return enabled;
+}
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -178,6 +187,11 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    virtual bool get_draft_capture(
+            llama_seq_id /*seq_id*/, const float *& /*embeddings*/, int32_t & /*n_embd*/) const {
+        return false;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -946,6 +960,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // this block's own tokens cannot buy any lead time.
     std::vector<llama_token> prev_draft_toks;
 
+    std::vector<std::vector<float>> capture_embd;
+    int32_t capture_n_embd = 0;
+
     // WP_SPEC_PREDICT_PREV=0 turns the predicted half off and leaves only
     // id_last, which is ground truth. One binary, both arms, and it isolates
     // exactly the part that can be wrong.
@@ -1038,6 +1055,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_nextn, n_seq);
 
         smpls.resize(n_seq);
+        if (common_speculative_capture_enabled()) {
+            capture_embd.resize(n_seq);
+        }
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
@@ -1052,6 +1072,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        if (common_speculative_capture_enabled()) {
+            llama_set_embeddings_layer_inp(ctx_dft, 0, true);
+        }
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
     }
 
@@ -1203,6 +1226,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        if (common_speculative_capture_enabled()) {
+            capture_n_embd = 0;
+            for (auto & rows : capture_embd) {
+                rows.clear();
+            }
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
@@ -1314,6 +1344,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (common_speculative_capture_enabled()) {
+            capture_n_embd = n_embd_dec;
+        }
+        const float * capture_rows = capture_n_embd > 0 ? llama_get_embeddings_layer_inp(ctx_dft, 0) : nullptr;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1358,6 +1393,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (capture_n_embd > 0) {
+                        const float * row = capture_rows + (size_t) idx * capture_n_embd;
+                        capture_embd[seq_id].insert(capture_embd[seq_id].end(), row, row + capture_n_embd);
+                    }
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1381,11 +1421,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (capture_n_embd > 0) {
+                        const float * row = capture_rows + (size_t) (beg + i) * capture_n_embd;
+                        capture_embd[seq_id].insert(capture_embd[seq_id].end(), row, row + capture_n_embd);
+                    }
                 }
             }
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (common_speculative_capture_enabled()) {
+                    capture_embd[seq_id].clear();
+                }
             }
         }
 
@@ -1438,6 +1486,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool need_embd() const override {
         return false;
+    }
+
+    bool get_draft_capture(llama_seq_id seq_id, const float *& embeddings, int32_t & n_embd) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) capture_embd.size() || capture_n_embd <= 0 || capture_embd[seq_id].empty()) {
+            return false;
+        }
+        embeddings = capture_embd[seq_id].data();
+        n_embd = capture_n_embd;
+        return true;
     }
 };
 
@@ -2821,6 +2878,50 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
     return false;
 }
 
+static void common_speculative_capture_draft(const common_speculative_impl * impl,
+                                              llama_seq_id seq_id,
+                                              const llama_tokens & tokens) {
+    static FILE * file = []() -> FILE * {
+        const char * path = std::getenv("WP_DRAFT_CAPTURE");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        FILE * result = std::fopen(path, "ab");
+        if (result == nullptr) {
+            return nullptr;
+        }
+        return result;
+    }();
+    static uint64_t block_id = 0;
+    static bool header_written = false;
+    if (file == nullptr || impl == nullptr || tokens.empty()) {
+        return;
+    }
+    const float * embeddings = nullptr;
+    int32_t n_embd = 0;
+    if (!impl->get_draft_capture(seq_id, embeddings, n_embd) || n_embd <= 0 || embeddings == nullptr ||
+            tokens.size() * (size_t) n_embd > SIZE_MAX / sizeof(float)) {
+        return;
+    }
+    if (!header_written) {
+        std::fseek(file, 0, SEEK_END);
+        if (std::ftell(file) == 0) {
+            const uint32_t header[4] = { 0x31445057u, 1u, (uint32_t) n_embd, 1u };
+            std::fwrite(header, sizeof(header), 1, file);
+        }
+        header_written = true;
+    }
+    const uint32_t marker = 0x31445257u;
+    const uint64_t id = block_id++;
+    const uint32_t n_drafted = (uint32_t) tokens.size();
+    std::fwrite(&marker, sizeof(marker), 1, file);
+    std::fwrite(&id, sizeof(id), 1, file);
+    std::fwrite(&n_drafted, sizeof(n_drafted), 1, file);
+    std::fwrite(tokens.data(), sizeof(llama_token), tokens.size(), file);
+    std::fwrite(embeddings, sizeof(float), tokens.size() * (size_t) n_embd, file);
+    std::fflush(file);
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2879,6 +2980,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+                    common_speculative_capture_draft(impl.get(), seq_id, result);
                 }
             }
 

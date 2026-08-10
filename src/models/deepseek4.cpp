@@ -1551,6 +1551,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_lora_mm(model.fc, cur);
         cur = build_norm(cur, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         res->t_h_nextn = cur;
+        if (!cparams.embeddings_layer_inp.empty() && cparams.embeddings_layer_inp[0]) {
+            res->t_layer_inp[0] = cur;
+        }
         res->add_input(std::move(inp));
         ggml_build_forward_expand(gf, cur);
         return;
@@ -1575,6 +1578,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         if (ubatch.embd) {
             for (int il = n_layer; il < hparams.n_layer_all; ++il) {
                 ggml_build_forward_expand(gf, build_attention(model, inp_dsv4, input_embd, inp_pos, il));
+            }
+            if (!cparams.embeddings_layer_inp.empty() && cparams.embeddings_layer_inp[0]) {
+                res->t_layer_inp[0] = input_embd;
             }
             return;
         }
@@ -1607,6 +1613,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
         const auto & last = model.layers[hparams.n_layer_all - 1];
         ggml_tensor * hidden = build_hc_head(cur, last.nextn.hc_head_fn, last.nextn.hc_head_scale, last.nextn.hc_head_base);
+        if (!cparams.embeddings_layer_inp.empty() && cparams.embeddings_layer_inp[0]) {
+            res->t_layer_inp[0] = hidden;
+            cb(hidden, "layer_inp", 0);
+            ggml_build_forward_expand(gf, hidden);
+        }
         res->t_embd = hidden;
         cur = build_norm(hidden, last.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
         cur = ggml_mul_mat(ctx0, model.output, cur);

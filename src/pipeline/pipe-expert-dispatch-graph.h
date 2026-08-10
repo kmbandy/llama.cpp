@@ -74,6 +74,9 @@ class graph_dispatcher {
     size_t prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
                                size_t n_certain = SIZE_MAX);
 
+    // Append the raw token batch to the WP_PREDICT_CAPTURE stream.
+    void note_batch_tokens(const int32_t * tokens, size_t n_tokens) noexcept;
+
     const prefetch_hint_stats & hint_stats() const { return remote.get_prefetch_hint_stats(); }
 
     // WP_PREFETCH_HINT=1. DEFAULT OFF: this changes what goes on the wire, and a

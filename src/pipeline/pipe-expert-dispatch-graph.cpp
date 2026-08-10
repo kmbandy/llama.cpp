@@ -439,6 +439,33 @@ void graph_dispatcher::capture_routing(const char * prefix, int32_t layer,
     }
 }
 
+void graph_dispatcher::note_batch_tokens(const int32_t * tokens, size_t n_tokens) noexcept {
+    try {
+        if (tokens == nullptr || n_tokens == 0) {
+            return;
+        }
+        if (capture_file_ == nullptr) {
+            const char * prefix = std::getenv("WP_PREDICT_CAPTURE");
+            if (prefix == nullptr || prefix[0] == '\0') {
+                return;
+            }
+            const std::string path = std::string(prefix) + "." +
+                std::to_string((long) getpid()) + ".bin";
+            capture_file_ = std::fopen(path.c_str(), "ab");
+            if (capture_file_ == nullptr) {
+                return;
+            }
+        }
+        const uint32_t marker = 0x31425457u;
+        const uint32_t count = (uint32_t) n_tokens;
+        std::fwrite(&marker, sizeof(marker), 1, capture_file_);
+        std::fwrite(&count, sizeof(count), 1, capture_file_);
+        std::fwrite(tokens, sizeof(int32_t), n_tokens, capture_file_);
+        std::fflush(capture_file_);
+    } catch (...) {
+    }
+}
+
 void graph_dispatcher::latch_failure(const char * message) noexcept {
     try {
         std::lock_guard<std::mutex> lock(failure_mutex_);
