@@ -16,7 +16,7 @@
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-model.h"
 #include "../src/memory-tier/mt-semantic.h"
-#include "get-model.h"
+#include "common.h"
 #include "llama.h"
 #include "ggml-backend.h"
 
@@ -53,13 +53,13 @@ std::string tmp_path(const char * tag) {
 }  // namespace
 
 int main(int argc, char * argv[]) {
-    char * model_path = get_model_or_exit(argc, argv);
+    char * model_path = common_get_model_or_exit(argc, argv);
 
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
-    mparams.use_mmap     = true;
+    mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
 
     llama_model * model = llama_model_load_from_file(model_path, mparams);
     if (model == nullptr) {

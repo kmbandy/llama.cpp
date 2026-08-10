@@ -523,12 +523,12 @@ target_include_directories(test-mt-tiered-thin PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # gracefully when LLAMACPP_TEST_MODELFILE / argv[1] are unset). Links
 # the full llama lib because llama_kv_cache_paged is part of it.
 llama_build_and_test(test-paged-lifecycle.cpp)
-target_link_libraries(test-paged-lifecycle PRIVATE llama)
-target_include_directories(test-paged-lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-paged-lifecycle PRIVATE llama llama-common)
+target_include_directories(test-paged-lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/common)
 
 llama_build_and_test(test-paged-semantic.cpp)
-target_link_libraries(test-paged-semantic PRIVATE llama)
-target_include_directories(test-paged-semantic PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test-paged-semantic PRIVATE llama llama-common)
+target_include_directories(test-paged-semantic PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/common)
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)

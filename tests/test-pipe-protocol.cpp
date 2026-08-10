@@ -555,11 +555,12 @@ static void test_expert_prefetch_hint_roundtrip() {
     h.expert_ids = { 0, 7, 8, 84, 255 };
 
     const std::vector<uint8_t> enc = pipe_encode_expert_prefetch_hint(h);
-    CHECK(enc.size() == 8 + 5 * 4);
+    CHECK(enc.size() == 12 + 5 * 4);
 
     const pipe_expert_prefetch_hint d =
         pipe_decode_expert_prefetch_hint(enc.data(), enc.size());
     CHECK(d.layer == h.layer);
+    CHECK(d.provenance == h.provenance);
     CHECK(d.expert_ids == h.expert_ids);
 
     // Layer 0 is a real hash layer, not a sentinel -- it must encode.

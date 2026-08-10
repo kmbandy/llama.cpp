@@ -804,6 +804,38 @@ void test_default_off_multi_expert_request() {
                 "failed to receive default-off multi-expert partial");
         require(type == PIPE_EXPERT_PARTIAL && seq_id == 50,
                 "default-off multi-expert dispatch did not complete");
+        const pipe_expert_partial monolithic =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+
+        pipe_expert_dispatch_begin begin;
+        begin.layer = request.layer;
+        begin.n_tokens = request.n_tokens;
+        begin.assignments = request.assignments;
+        begin.swiglu_clamp = request.swiglu_clamp;
+        payload = pipe_encode_expert_dispatch_begin(begin);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_BEGIN, 51,
+                                payload.data(), payload.size()),
+                "failed to send split dispatch BEGIN");
+        pipe_expert_dispatch_acts acts;
+        acts.activations = request.activations;
+        payload = pipe_encode_expert_dispatch_acts(acts);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_ACTS, 51,
+                                payload.data(), payload.size()),
+                "failed to send split dispatch ACTS");
+        require(pipe_recv_frame(*socket, type, seq_id, payload) &&
+                    type == PIPE_EXPERT_PARTIAL && seq_id == 51,
+                "split dispatch did not complete");
+        const pipe_expert_partial split =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+        require(split.layer == monolithic.layer && split.n_tokens == monolithic.n_tokens &&
+                    split.partial == monolithic.partial,
+                "split dispatch partial differs from monolithic dispatch");
+        payload = pipe_encode_expert_dispatch_begin(begin);
+        require(pipe_send_frame(*socket, PIPE_EXPERT_DISPATCH_BEGIN, 52,
+                                payload.data(), payload.size()),
+                "failed to send pending split BEGIN");
+        // Closing here exercises the pending-batch destructor path. The worker
+        // must abandon the batch and release every slot pin before serve_connection exits.
         socket.reset();
     } catch (...) {
         server.join();

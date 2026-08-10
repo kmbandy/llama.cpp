@@ -20,7 +20,7 @@
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-model.h"
 #include "../src/llama-io.h"
-#include "get-model.h"
+#include "common.h"
 #include "llama.h"
 #include "ggml-backend.h"
 
@@ -121,7 +121,7 @@ std::string tmp_dir(const char * tag) {
 }  // namespace
 
 int main(int argc, char * argv[]) {
-    char * model_path = get_model_or_exit(argc, argv);
+    char * model_path = common_get_model_or_exit(argc, argv);
 
     // --- Load the model on CPU only. We never run a forward pass; we
     // only need hparams (n_layer, head_dim, n_kv_heads) and the model
@@ -130,8 +130,7 @@ int main(int argc, char * argv[]) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
-    mparams.use_mmap     = true;
-    mparams.use_mlock    = false;
+    mparams.load_mode    = LLAMA_LOAD_MODE_MMAP;
     mparams.vocab_only   = false;
 
     llama_model * model = llama_model_load_from_file(model_path, mparams);
