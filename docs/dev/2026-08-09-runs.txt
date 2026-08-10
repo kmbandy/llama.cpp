@@ -1,0 +1,207 @@
+=====================================================================
+2026-08-09 — DAY 4: THE §4 PREDICTOR FALSIFIER (offline, zero fleet)
+=====================================================================
+
+MORNING TEARDOWN (07:17-07:20)
+  Serve killed cleanly per runbook: spine via pid file, workers via
+  pkill 'llama-wp-expert-worke[r]' on both boxes. Router :8090 and all
+  protected services untouched. NOTE: 2026 unreachable via Tailscale
+  ssh (100.102.191.30 timed out); the wg address 100.124.155.84 works.
+  Timeline correction: DS4's session finished its last task (~27,289
+  task ids) at ~01:03; the box idled 01:04-07:17. The 07:17 mtimes are
+  shutdown buffer flushes, not activity. Final task: 11.66 prefill /
+  2.86 decode, acceptance 0.779, mean len 2.02, acc-per-pos zero
+  beyond position 2.
+
+CAPTURE INVENTORY (~/ds4-runs/2026-08-08-serve/)
+  predcap 50.4 GB: 1,262,294 WPC1 records, 46 layers exactly even
+    (27,372..27,446 per layer), 3.07M token-positions, 99.99% decode
+    widths 1-5. h at the dispatch boundary is 4096-dim (not 16384 as
+    the 08-07 plan assumed — probes got 4x smaller for free).
+  draftcap 2.24 GB: 24,457 blocks / 34,181 drafted tokens with
+    16384-dim f32 nextn embeddings. EVERY block is len 1 or 2
+    (mean 1.40): the conf-0.4 gate cut every overnight draft at <=2
+    on DSWS-analysis content.
+  STRUCTURE DECODED: stream is T<w> (WTB1, the batch token ids) then
+  W0..W42 per verify step — the target has 43 MoE layers; W43..45 are
+  the DSPARK DRAFT's expert layers, dispatched as a width-5 batch
+  after each verify (their :8802 CPU worker counters match exactly:
+  82k requests = 27.4k steps x 3, n_pagein 244 ~ 0). WTB1-before-step
+  width check: 27,446/27,446. Draft-block->step join by token ids:
+  24,457/24,457 matched. 72 tasks (211 prefill batch records; 141 are
+  1024-token chunks), median 120 steps/task, max 2,994.
+
+THE FALSIFIER (pre-registered 2026-08-07 analysis §4; run verbatim)
+  Metric: recall of the first-non-resident expert set (the miss
+  stream) vs a simulated pool fed by this run's own reference stream,
+  M in {8,16} hints/layer. Bar: router-k=2 baseline 28.3%. NOT rank-1,
+  NOT union recall. Split BY TASK (task%5: 3=val, 4=test, rest train;
+  plus last-15-tasks tail split). Warmup 300 steps excluded.
+  Pools: R9700 2200 slots LRU over (layer 0..45, expert 85..255);
+  2026 1100 slots (550+550 merged) over (layer 0..42, expert 0..84);
+  CPU dspark layers always-resident, never scored. Scored: layers
+  0..42 on 11,648 test steps. Sim residency: R9700 79.8% / 2026 80.1%;
+  misses/step p50=93 mean=106; first-miss depth p50=0.
+  Probe: ridge 16384->256 per layer (shared Gram, bias unpenalized),
+  lambda in {3e2,3e3,3e4} — val top-6 hit-rate 0.2128 IDENTICAL at all
+  three (signal saturates). Trained on 20,705 train samples.
+  Hints max-pooled over the block's 1-2 draft embeddings; width-1
+  steps have no draft -> empty hint set (live would too).
+
+RESULTS (recall of the miss stream)
+                       M=8      M=16
+  test-interleaved  probe    2.9%    7.2%   (n_miss=523,276)
+                    router2 29.6%   43.9%
+                    ngram   27.5%   45.6%
+                    pop      2.8%    7.1%
+  test-tail15       probe    3.0%    7.5%   (n_miss=846,600)
+                    router2 30.8%   45.2%
+                    ngram   30.3%   49.7%
+                    pop      2.8%    7.2%
+
+*** RETRACTED 09:40 — SEE THE RETRACTION SECTION BELOW. The probe rows
+of this table measured a corrupted capture, not the embedding. The
+router2/ngram/pop rows and the whole sim methodology stand. ***
+
+ORIGINAL (RETRACTED) VERDICT — the learned-predictor direction closed
+per the pre-registered rule.
+  1. The probe IS the popularity floor: 2.9/7.2 vs pop 2.8/7.1. And on
+     plain top-6 validation the probe scores 0.213 vs popularity's
+     0.207 — a 16384-dim learned map adds 0.6 points over a frequency
+     table. The DSpark nextn embedding carries essentially no
+     per-token routing information reachable by a linear probe. The
+     flat lambda curve says more capacity would fit noise, not signal.
+  2. Methodology validated in the same table: router2 recomputed here
+     lands 29.6-30.8% @ M=8 — replicating the 08-07 28.3% baseline on
+     a different capture, different workload, different pool state.
+  3. The n-gram cousin ties router2 at M=8 and posts the best number
+     on the board at M=16 (45.6/49.7%). HONEST CAVEATS: (a) single
+     content domain — 72 DSWS-analysis cousin tasks; n-gram is exactly
+     the method that overachieves on repetitive in-domain code, and
+     the acceptance swings (0.98 vs 0.71 between adjacent tasks) prove
+     routing is content-coupled; (b) economically it is ~router2+eps,
+     and the router2 signal was ALREADY free live and lost 18 arms in
+     the 08-07 sweep (incremental precision capped at 21% because
+     router confidence and LRU residency are the same signal). No
+     integration on this evidence. IF a cross-domain capture ever
+     shows the n-gram holding ~45% @ M=16 out-of-domain, that is the
+     one number that would justify one live arm — table lookup, no
+     GEMM, no scorer thread.
+
+WHAT WOULD HAVE CHANGED THE VERDICT: nothing marginal. The probe
+needed ~30% on the miss stream to earn an arm; it scored 3%. This is
+a 10x falsification, not a near-miss. §4 joins re-shard, top-k, and
+router-prefetch in the measured-shut column. The remaining decode
+upside is hardware (2nd R9700 + RAM) and the transport LAN arm.
+
+GOTCHAS BANKED
+  - System numpy on main links REFERENCE cblas: 5 Gflops single
+    thread. torch CPU (ROCm build) does 753 Gflops on the same box.
+    Any offline linalg on main goes through torch, with
+    HIP/ROCR/CUDA_VISIBLE_DEVICES='' to keep it off the GPUs (import
+    spews 'register fat binary failed' otherwise; harmless but loud).
+  - Bash-tool background moves do NOT lift the harness timeout; use
+    nohup for anything >10 min.
+  - predcap WPC1 h is 4096-dim; draftcap WPD1 embeddings are 16384-dim
+    f32 (not f16 — 64KB/token).
+
+ARTIFACTS
+  scripts: scan_captures.py index_captures.py prepare_dataset.py
+    train_probes.py falsify.py (session scratchpad; copies promoted to
+    docs/dev/falsifier-2026-08-09/)
+  data: capture_index.npz falsifier_dataset.npz probe_W.npy (scratch;
+    derived, reproducible from the captures)
+  captures preserved in ~/ds4-runs/2026-08-08-serve/ (52.7 GB total).
+
+=====================================================================
+RETRACTION + ROOT CAUSE (09:15-09:40) — kmbandy: "are you sure it did
+NOTHING?" He was right. Again. (8th negative-guard recurrence.)
+=====================================================================
+THE DRAFT CAPTURE IS CORRUPTED; THE PROBE WAS TRAINED ON A RANK-2
+MATRIX. The §4 falsifier has NOT actually tested the learned
+predictor. Chain of evidence, each step reproducible from the scripts
+in falsifier-2026-08-09/:
+
+1. Cross-block embeddings bit-identical: p95 of cross-block cosine =
+   1.0000 exactly; 67% of 500 random blocks share identical leading
+   512 floats. The buffer is STALE across capture calls.
+2. Row 2 of every nd=2 block is fabricated: cos(row0,row1) = 0.5000
+   exactly, norms 128.0 / 64.0 exactly — the arithmetic signature of
+   "row1 = row0 truncated to 4096 dims + zeros". The writer over-reads
+   a buffer that does not hold one 16384-float row per drafted token.
+3. The "live" back half (dims 8192:16384) clusters by token identity
+   (same-token cos 0.9997 vs 0.806 random) BUT:
+4. SVD: rank 1 = 86.2% of variance, rank 2 = 100.00%. EFFECTIVE RANK
+   2. Two scalars per sample. Nothing else in the whole 2.24 GB file.
+
+INSTRUMENTS ALL EXONERATED, ONE BY ONE:
+  - Solver: a one-hot-token ridge through the IDENTICAL torch path
+    scores 0.500 rare-true recall@16 (vs n-gram 0.485). Machinery fine.
+  - Labels/join: same-token label Jaccard 0.253 vs 0.058 random —
+    real conditioning structure, correctly aligned.
+  - Pool sim: router2 recomputed = 29.6-30.8% @ M=8, replicating the
+    08-07 28.3% baseline out-of-sample.
+  - The probe's failure replicated at every stage the input was kept:
+    full rows 2.9%, live-slice p0-only retrain 3.2-3.3%, centered-X
+    f64 ridge train-set rare-recall 0.096 (cannot even fit TRAIN —
+    the input is rank-2, q.e.d.).
+
+STANDING RESULT THAT SURVIVES (new, real, in-domain): TOKEN IDENTITY
+ALONE recalls 27.5-30.3% @ M=8 and 45.6-49.7% @ M=16 of the miss
+stream (n-gram over train-task tables, task-split, no training). At
+M=16 it beats router-k=2 (43.9-45.2%) on its own turf. Caveats as
+written in the retracted section: single content domain, and
+router-class signals already failed to convert to throughput live
+(08-07, 18 arms). It is a MEASUREMENT, not a lever yet.
+
+STATUS OF §4: OPEN, UNTESTED. The pre-registered falsifier is intact
+and now debugged end-to-end (solver canary, label canary, sim
+replication). It waits on ONE thing: a fixed capture writer and a
+fresh capture ride-along. Luna handoff for the writer fix issued
+(common_speculative_capture_draft, common/speculative.cpp:2827-2865 —
+symptoms above; required property: one real 16384-dim nextn embedding
+per drafted token, refreshed every block; acceptance = the rank/
+staleness script, not eyeballs).
+
+PROCESS LESSON BANKED: my closure report shipped ~40 minutes before
+kmbandy's question unwound it. The falsifier had a validation gap the
+pre-registration never demanded: PROVE THE CAPTURE CARRIES SIGNAL
+before letting it falsify anything (a rank check + a duplicate-rate
+check — 30 seconds of SVD — would have caught this before training).
+Rule for every future capture-based test: run the input-sanity gate
+first, and put it IN the pre-registration.
+
+=====================================================================
+CAPTURE WRITER FIXED (luna 34620fd2, ~10:20; verified independently)
+=====================================================================
+ROOT CAUSE (deeper than my diagnosis): llama_get_embeddings_nextn for
+DSpark NEVER RETURNED AN EMBEDDING — it returns the last extracted
+t_h_nextn, which for DSpark is a SCALAR CONFIDENCE repeated across
+4096 columns, never refreshed by the accessor. On top of that the old
+writer used the host allocation's 16384-float capacity as the row
+stride, so rows 2+ over-read stale storage. The 08-07 plan's
+"16384-dim nextn embedding" premise was fiction from day one.
+FIX: capture taps the real pre-normalization collapsed DSpark hidden
+state (4096-dim), stages rows immediately after each draft decode,
+writes n_embd=4096 in the WPD1 header (format otherwise unchanged);
+all capture work stays behind the lazy env check.
+INDEPENDENTLY VERIFIED (my scan of /var/tmp/wp-draft-34620q.bin, not
+luna's report): 101 blocks / 505 rows, dup-rate 0.000%, effective
+rank(99%) = 146, near-0.5 cosine rate 0.000%, median row0/row1 cos
+0.9194. ALL THREE SANITY GATES PASS. Builds: build-cpu 0, build-hip 0.
+Tests: pipe-protocol / hash-oracle / worker spec+hint / dispatcher
+hint routing all pass both builds. test-wp-expert-dispatcher still
+exits 1 on the KNOWN marginal-cost speed-split expectation (2:1 vs
+0.5) — pre-existing, documented in the test source, not luna's.
+SCOPE CAVEAT FOR REVIEW (mtimes 09:25-10:20, not just speculative.cpp):
+luna also touched src/models/dflash.cpp, deepseek4.cpp,
+llama-context.{cpp,h}, llama-ext.h (the hidden-state tap needs model-
+side plumbing — expected) AND tests/test-paged-{semantic,lifecycle}
+.cpp, test-routed-experts-external.cpp, test-pipe-protocol.cpp,
+wp-expert-dispatcher/main.cpp ("stale dirty-tree interface" fixes it
+says were needed to complete full builds). Plausible, but per the
+2026-08-01 lesson the model-side tap and those interface edits
+deserve a read-through before the next serve banks numbers on this
+binary. NOTE ALSO: new draft captures will be 4096-dim = ~16KB/token
+(4x smaller); probes retrain from scratch on the new stream — the
+old rank-2 file taught nothing a fresh capture inherits.

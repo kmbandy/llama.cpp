@@ -47,7 +47,10 @@ def load_ref(path):
         f = line.split()
         if len(f) < 2:
             continue
-        out.append((int(f[0]), set(int(x) for x in f[1:])))
+        # skip the trailing nt=<n_tokens> phase column (2026-08-08, D5) -- it is
+        # not an expert id, and int() on a bare trailing integer would silently
+        # inject a phantom expert into every step's set.
+        out.append((int(f[0]), set(int(x) for x in f[1:] if not x.startswith("nt="))))
     return out
 
 

@@ -1,0 +1,479 @@
+2026-08-08 — DS4 campaign day 3. Binaries: featire-wp-improvements @ b91a328f0
++ working tree (DS4's D1/D6.3/D9/§6.1/REF_LOG implementation, Claude's morning
+sim/probe fixes + nt= sentinel, luna's drain-then-shutdown writer teardown).
+Both boxes rebuilt (main build-hip, 2026 build-army-cachy — NOTE: build-army is
+gone, the dir is build-army-cachy now; a cmake pipe swallowed the error and
+produced a false green before this was caught).
+
+UNIT TESTS (CPU, main):
+  test-wp-expert-worker: PASS.
+  test-wp-expert-dispatcher: hint-routing PASSES both WP_ASYNC_ISSUE=0/1 after
+  luna's drain fix (v1 shutdown-before-join dropped queued hints at dtor and
+  failed the test — my spec's fault, not DS4's; DS4's writer loop drains
+  correctly). Binary still exits 1 at "marginal-cost speed split 2:1 ratio:
+  0.5" — PRE-EXISTING (reproduced on an Aug-5 build-cpu binary), out of scope,
+  belongs to the 08-01 speed-split spec flaw.
+
+ROUND 8 — D1 async issue A/B + D6.3 bias arm. code700, config of record,
+CTX=8192, daytime desktop window (bad instrument: control decode spread
+3.49-3.98, prefill 11.4-15.6 across arms; upward trend all chain = host page
+cache warming). warm arm discarded per first-arm rule.
+
+  arm   prefill  decode  acceptance
+  warm   12.88    3.07   0.94194 (discard)
+  ctl1   11.44    3.49   0.94194
+  ai1    11.67    2.50   0.94194
+  ctl2   15.62    3.62   0.94194
+  ai2    13.70    3.79   0.94194
+  bias   14.28    3.05   0.78363 (134/171, len 2.19 — trajectory legally
+                          diverged; tok/s NOT comparable)
+  ctl3   14.92    3.98   0.94194
+
+CANONICAL GATE: every ctl and ai arm exactly canonical (146/155, 0.94194,
+mean len 2.47). D1 is byte-identical in practice, as designed.
+
+D1 VERDICT (decode): OFF. The spine dispatch decomposition
+(WP_DISPATCH_STATS, phase=verify layers=43, means per 43-layer dispatch):
+
+  arm   pack   issue   wait     total
+  ctl1  0.12   3.64    550.2    555.5
+  ai1   0.12   1.13    798.6    801.2   sd 1302, max 9957.9
+  ctl2  0.12   3.60    541.6    546.9
+  ai2   0.12   1.07    603.3    605.8   sd 1152, max 846.6
+  ctl3  0.11   3.20    539.3    543.9
+
+  1. Mechanism works: issue leg 3.6 -> 1.1 ms/dispatch (send moved to the
+     writer threads). BUT the issue leg was only ~3.6 ms per BLOCK
+     (0.08 ms/layer) — the "~2.3 ms/layer unattributed spine overhead" is NOT
+     issue. D1's decode premise is falsified at verify width. (The analysis
+     doc's own gate said decompose before building; the A/B did the
+     decomposition the hard way.)
+  2. Net dispatch leg: ai2 +60 ms/block against a FLAT control bracket
+     (546.9 / 543.9 around it) — the tok/s neutrality of ai2 (3.79) was
+     window drift in the non-dispatch legs masking a real +11% dispatch
+     regression. Candidate mechanism: cv-wakeup/scheduler latency per frame
+     on a loaded box.
+  3. STALL MODE: ai1 hit five multi-second dispatch stalls (9.96 / 6.23 /
+     5.45 / 3.90 / 3.50 s ≈ 29 s of a 102 s decode = the whole -28%);
+     controls max 0.86 s; ai2 clean. Discrete events, nondeterministic
+     across runs, unique to the async path. Cause undiagnosed — candidates:
+     writer-thread scheduling starvation under desktop load, wg-path TCP RTO
+     amplification, wakeup race. Until root-caused, async issue is not safe
+     to default on.
+  ACTION: default flipped to OFF (WP_ASYNC_ISSUE=1 opt-in). Prefill retest
+  at code2000 length still owed — this chain has no prefill dispatch stats
+  (only phase=verify/decode print) and short-prompt prefill tok/s was
+  window-noise.
+
+D6.3 VERDICT (bias 1070=2): NO at this weight. Slowest-worker share per
+dispatch (phase=verify, 4-worker lines):
+
+         ctl2                    ai2                     bias                    ctl3
+  8803   4.9% / 448.5ms          2.9% / 500.6            99.1% / 622.7           6.9% / 445.4
+  8804   95.1% / 504.4           96.1% / 558.6           0.9% / 430.0            93.1% / 502.7
+  8801   0% / 371.2              1.0% / 425.9            0% / 383.1              0% / 366.7
+
+  2:1 toward the 1070 (8803) overshoots: it flips the straggler from the 480
+  (slowest 93-96% today) to the 1070 at 99.1% and RAISES the max leg
+  (505 -> 623 ms/dispatch). Plus the trajectory divergence costs acceptance
+  (0.784, one sample — no conclusion on whether that repeats). If retried:
+  finer weights (e.g. WP_DISPATCH_WEIGHTS=8803=3,8804=2) in a quiet window.
+  Headroom bound: today's 480-vs-1070 wait gap is ~55 ms/block ≈ 8% decode,
+  ceiling, before trajectory cost.
+
+NEW FINDING (free): the straggler mixture is STATE-DEPENDENT. Yesterday's
+3-way join: R9700 slowest 50.5%. Today: R9700 slowest 0-1% of dispatches
+(mean wait 371-426 ms vs 480's 504-559) — main's host page cache is warm
+today, so the R9700's read leg is cheap and 2026 dominates the tail. Any
+tail-suppression lever must be evaluated against both cache states.
+
+OBSERVATION (kmbandy, from DS4's overnight session): prefill ~33 tok/s at a
+~3k-token span on the serve config (UBATCH=1024). Extends the 08-04 ladder
+(663:22.77, 1526:25.48 @ub1024, 1526:33.06 @ub2048) — per-token prefill cost
+keeps falling with length; code700's 493-tok bench is prefill's WORST case.
+Deployment prompts (agentic, long) sit closer to 30+ t/s today.
+
+MILESTONE, for the record: DS4 ran a ~140-150k-token agentic coding session
+ON this serving stack overnight (wrote the D1/D6.3/D9 implementation on
+branch featire-wp-improvements), stack stayed up throughout. The serve mode
++ trap fix held under real sustained load.
+
+DECOMP ARM (single run, config of record, sync issue, canonical 0.94194,
+decode 3.98): THE 2.3 MS/LAYER MYSTERY IS RESOLVED BY ELIMINATION.
+  - unpack/merge: 4 µs/layer. recv machinery: sub-ms. ~40% of responses are
+    already buffered when the spine awaits them. The wire/merge path is
+    EXONERATED — no dispatcher surgery is justified for decode.
+  - In-dispatch layer wall (first issue -> last response): mean 10.93 /
+    med 10.13 ms. Stats-line in-dispatch total: 12.06 ms/layer. Layer clock
+    (from block structure): ~12.2 ms. So the old "2.3 ms/layer unattributed"
+    decomposes into (a) straggler-residual serialization inside the await
+    span — later-awaited workers finishing after the first-awaited one —
+    and (b) ~1 ms/layer of spine-side per-layer machinery around the
+    dispatch boundary (graph/custom-op territory).
+  - Consequences: the remaining decode levers are the WORKER SERVICE TIME
+    itself (D4 copy-stream: 1.66 ms of it), the straggler spread (finer
+    bias weights), and the spine per-layer machinery (WP_HIP_GRAPHS quiet
+    window, task #6 — now with a mechanism-backed prior). Note the pacing
+    worker in this arm was w0 (R9700-pattern, ne 10-13/req) while round 8's
+    was the 480 — third data point that the straggler identity is
+    state-dependent.
+  - Caveat: await_start/end_ns are relative to each dispatch call's start,
+    so inter-dispatch gaps cannot be reconstructed from this log; the
+    ~1 ms/layer figure is by subtraction (clock - in-dispatch wall), not
+    directly measured.
+
+ROUND 9 — D2 SPLIT-FRAME A/B (PIPE_VERSION 6 both boxes, luna impl bde09633).
+9 arms, all RUN VALID. SPLITFRAME=1 splits EVERY dispatch (decode too).
+
+  arm     prompt    prefill  decode  acceptance
+  warm    code700    14.22    3.70   0.87662 (135/154, len 2.30)  DIVERGED
+  ctl7a   code700    15.69    3.91   0.91250 (146/160, len 2.47)  DIVERGED
+  sf7a    code700    13.21    4.02   0.94194 (146/155)            canonical
+  ctl7b   code700    14.62    3.92   0.91772 (145/158)            DIVERGED
+  ctl2ka  code2000   25.38    3.55   0.86047 (148/172, len 2.47)
+  sf2ka   code2000   25.90    3.57   0.86047 (148/172)            = ctl EXACTLY
+  ctl2kb  code2000   23.81    3.57   0.86047
+  sf2kb   code2000   22.12    2.61   0.86905 (146/168)            DIVERGED+sag
+  ctl2kc  code2000   25.82    2.51   0.86047                      sag
+
+D2 VERDICT: mechanism proven, throughput NEUTRAL in this window; NOT adopted.
+  - Byte-identity: sf2ka's acceptance matches ctl2ka EXACTLY; sf7a hit exact
+    canonical. Split changes when reads start, not what is computed. Proven.
+  - Prefill at 2084 tok: sf 25.90 vs controls 23.81-25.82 — inside the ±4%
+    control spread. The +20-35% estimate did not materialize HERE; candidate
+    explanations: (a) warm page cache all day — reads cheap, so read-start
+    lead time buys nothing (the estimate assumed reads were the binding
+    constraint); (b) partial overlap already existed via kernel socket
+    buffering in monolithic mode. Cold-cache / quiet-window retest owed
+    before final closure. Knob stays default-off.
+  - INSTRUMENTATION GAP: the BEGIN/ACTS worker path bypasses WP_REQ_LOG
+    entirely (sf arms logged 0 rows). Fix queued to luna — split path must
+    emit the same 23-column line (ns_wait semantics now start at BEGIN).
+  - Chain-tail sag: sf2kb + ctl2kc decode collapsed to 2.6/2.5 in BOTH
+    configs — environmental (daytime), not D2.
+
+NONDETERMINISM ESCALATION (bigger news than D2): 3 of 4 code700 arms
+non-canonical INCLUDING TWO CONTROLS (acc 0.877/0.913/0.918 vs 0.94194;
+drafted counts differ: 154/160/158 vs 155) while sf7a hit canonical exactly.
+Worst frequency yet (prior record: 3 lifetime sightings; today: 4 of 9 arms
+counting sf2kb). code2000 leg was stable (4/5 arms identical 0.86047).
+Variance is in the DRAFT (drafted-token counts move), pointing again at the
+CPU DSpark worker's threaded reduction under daytime desktop load. Raises
+D7 (draft-on-GPU) from throughput-arm to measurement-hygiene priority, and
+means code700 canonical gating is UNRELIABLE in daytime windows.
+
+ROUNDS 10/10b — D4 COPY-STREAM (luna 22a42abc + guard fix 8eb655ab + staging
+fix a92ffc8c) + CAPTURE SMOKE.
+
+Round 10 first pass: BOTH cs arms crashed ~40s into prefill — two luna bugs
+caught before production:
+  1. The CUDA-context cast in the copy-stream entry points ran BEFORE any
+     backend-type check (negative "not Vulkan" guard AFTER the cast) — UB on
+     any non-CUDA backend; the HIP-built unit test caught it via corrupted
+     HELLO (build-cpu was a false green: weak symbols null there). 7th
+     recurrence of the negative-guard family. Fixed: positive
+     ggml_backend_is_cuda() first, name check deleted.
+  2. GGML_ASSERT(backend=null) in ggml_backend_synchronize via
+     StagingPool::mark_in_flight on the SPEC-PAGEIN path — staging pool
+     backend state unwired for copy-stream arming. Fixed + made null-safe
+     (missing state disarms, never aborts).
+
+Round 10b (fixed binaries): ctl 14.48/2.62(sag), cs 13.78/3.48,
+ctl 13.41/3.51, cs 13.49/3.43 — ALL FOUR EXACTLY CANONICAL (0.94194).
+Byte identity holds with the copy stream armed.
+
+D4 MECHANISM VERDICT (pg+ requests, med):
+  1070 (CUDA): ns_h2d 4.49 -> 0.05 ms (90x, genuinely async) BUT wall flat
+  (13.35 -> 13.18): ns_submit 0.54 -> 3.40 (compute stream waits the copy
+  event at graph launch) and ns_wait 7.95 -> 4.88 absorb it. At decode width
+  the copies feed the IMMEDIATELY following compute — serial dependency,
+  nothing to hide behind at 1-2 pages/request. Same physics that killed
+  same-stream async, one level up.
+  R9700 (HIP): copy_stream=on at startup but ZERO accounting change
+  (ns_h2d 2.06 -> 2.11) — silent per-copy fallback suspected. INCONCLUSIVE,
+  not negative; luna follow-up owed on the HIP branch.
+  D4's real substrate is PREFILL width (31 pageins/request = copy of page i
+  can overlap read of page i+1) — prefill arm folded into the quiet-window
+  chain. Knob stays default-off.
+
+CAPTURE SMOKE (cap10): PASS. draftcap.bin 10.2 MB, WPD1 header, n_embd
+16384; predcap 218 MB via the existing capture machinery. Capture arm ran
+full and canonical. READY for overnight collection during the next serve
+session (capture arms never bank).
+
+NOTE: rounds 10/10b code700 arms were ALL canonical — the round-9
+nondeterminism was absent this hour (main's load lower), consistent with
+the load-dependent CPU-draft theory.
+
+DRAFT YIELD STUDY (#18) — CLOSED BY ARCHAEOLOGY, NO FLEET TIME. The
+"historical 3.5-5.9 mean accepted length" gap is NOT recoverable config;
+the whole question was already answered across three KG entries:
+
+1. THE HISTORY IS CONTENT, NOT CONFIG (08-04 entry 735b919f, formally
+   retracted as a baseline then): mean len 4.94 was "The capital of France
+   is" -> repetitive capital-cities listing (near the block-5 clamp);
+   varied prose runs 1.9-2.0; code700 runs 2.47. Same official DeepSeek
+   head (kmbandy confirms unmodified), same gates — the head is honestly
+   scoring content predictability. "3.5-5.9" was doc-structured/repetitive
+   text and was NEVER a general baseline. decode ≈ 1.28 × mean_len holds
+   across content types.
+2. THE CONF KNEE IS CURRENT AND COMPLETE (08-07 midday, 2a0fb5c9 — AFTER
+   the 08-05 swiglu clamp fix, so not stale): full curve on code700:
+   conf 0.0 -> 3.29 (acc 0.514, verify traffic eats it), 0.1 -> 3.64,
+   0.2 -> 3.58-3.61, 0.4 -> 3.83 (peak, acc 0.94194), 0.6 -> 3.70-3.74.
+   Unimodal, sharp peak at today's config of record. Below the knee,
+   drafting deeper costs ~14% more verify experts than it pays — on a
+   paged model rejected drafts are NVMe, not just compute (the 07-19 MTP
+   disaster is the far end of that cliff). NMAX depth cap inert (conf gate
+   binds first).
+3. GATES ARE DELIBERATE AND ON RECORD (the standing p_min rule): every
+   run prints n_max=7->5 clamp, p_min=0.00, conf_min=0.40 at startup.
+   conf_min is the active gate; p_min redundant at 0.94 acceptance.
+
+VERDICT: no draft-yield multiplier exists at this checkpoint. Yield is
+capped by the trained block_size=5 and the head's confidence on the
+content; the conf sweep already sits at the code optimum. Remaining
+paths to more tokens/block are checkpoint-level (off-limits per standing
+constraints). The lever that remains is block TIME, not tokens/block —
+i.e. the existing campaign. D7 (draft-on-GPU) remains alive for LATENCY
+and determinism, not yield.
+
+ROUND 11 — THE CONSOLIDATED VERDICT CHAIN (run-now per kmbandy; no quiet-
+window deferrals). 11 arms, all RUN VALID.
+
+  arm     prompt    prefill  decode  acceptance
+  warm    code700    13.97    3.68   0.91139 DIVERGED (discard)
+  ctl11a  code700    15.92    3.96   0.94194
+  hipg11  code700    14.14    3.97   0.94194 canonical
+  gc8     code700    15.74    3.87   0.89506 DIVERGED (legal: dense@verify
+                                      is a different FP path than gather)
+  ctl11b  code700    16.40    3.95   0.94194
+  bias32  code700    14.48    3.67   0.88957 DIVERGED (legal: reassignment)
+  ctl11c  code700    14.13    3.71   0.91447 DIVERGED (control!)
+  ctl2kA  code2000   28.28    3.53   0.86047
+  cs2k    code2000   24.43    3.48   0.86047 = ctl EXACTLY
+  sf2k    code2000   25.04    3.57   0.86047 = ctl EXACTLY
+  ctl2kB  code2000   28.20    3.51   0.86550 (last-block drift)
+
+VERDICTS — none adopted; the config of record survives everything:
+  D3a WP_HIP_GRAPHS (spine): 3.97 vs bracket 3.96/3.95 — NEUTRAL, canonical,
+      safe. The +7.2% from the 08-07 degraded window does not replicate.
+      Caveat: no graph-hit counter exists, so "engaged and neutral" vs
+      "never engaged" (pointers change every token; warmup may never
+      complete) is unresolved — if anyone returns to this, add the counter
+      first. CLOSED for now.
+  D3b GCACHE+GM8: 3.87, no win vs bracket, AND dense-at-verify legally
+      diverges the trajectory (0.895) — so it also costs the canonical
+      gate. CLOSED.
+  D6.3 bias 3:2: 3.67, no win (2:1 overshot, 3:2 buys nothing; straggler
+      identity is cache-state-dependent anyway). Bias direction CLOSED.
+  D4 copy-stream at prefill: 24.43 vs 28.28/28.20 = -13.6% — NEGATIVE.
+      Mechanism: the coarse one-latest-event-per-device wait (fine at
+      decode) over-serializes at prefill — every graph launch waits the
+      NEWEST copy on a saturated copy stream. Fixing it means per-tensor
+      events; not funded. D4 CLOSED (decode neutral, prefill negative).
+  D2 split-frame at prefill: 25.04 vs 28.28/28.20 = -11.5% — NEGATIVE
+      (byte-identical, so the cost is real scheduling). MECHANISM: with
+      SYNC issue, BEGIN starts ensure_batch and the worker stops reading
+      its socket; the 10-40 MB ACTS fills rcvbuf; the SPINE'S SEND BLOCKS
+      mid-ACTS and cannot issue the next worker's BEGIN — worker read-
+      starts get MORE serialized, not less. Round 9's "neutral" was this
+      cost hidden in a slower window. D2 genuinely requires D1's writer
+      threads to pay (the doc's "stacks with D1" was load-bearing), and D1
+      has its own unexplained stall mode. The D1+D2 pair is PARKED as a
+      unit: not funded until the D1 stall is root-caused. CLOSED for now.
+
+  NONDETERMINISM: 2 of 5 code700 non-bias arms diverged including a
+  CONTROL (warm 0.911, ctl11c 0.914) — daytime frequency confirmed again.
+
+DAY-3 BOTTOM LINE: every built lever is now measured. NOTHING beats the
+config of record (~3.95 decode / ~16 prefill code700 / ~28 prefill
+code2000 in this window). The record config is at a local optimum for
+this hardware. Remaining upside lives in: the §4 learned predictor
+(offline, capture ready), the KV regression fix (#14, unblocks the
+serving goal), hardware (second NVMe on 2026), and measurement hygiene
+(D7 draft-on-GPU for the nondeterminism).
+
+ROUND-11 POST-MORTEM (kmbandy: "a couple of those sound fixable — look
+before closing"). He was right; the REQLOG deep-dive REOPENS three:
+
+1. hipg CLOSURE INVALID AS WRITTEN: no graph-hit counter exists, so
+   "neutral" cannot distinguish engaged-and-neutral from never-engaged
+   (pointers change every token; warmup may never complete). Closing it
+   without that proof is the "refuted a broken implementation, not the
+   technique" trap (weight-pager K=1, DSWS prefetch — twice on record).
+   REOPENED pending a counter + one arm.
+2. D2 MECHANISM NOW MEASURED, my rcvbuf story RETRACTED: sf2k per-worker
+   split shows R9700 ns_send 26.9 -> 257.3 ms (+230, the whole loss on
+   that card) — split-frame WORKED (reads started early, workers finished
+   early) and the PARTIAL responses collided with the spine's serial ACTS
+   sends; the dispatch thread cannot recv while sending, so the response
+   path backs up. On the 2026 box the loss is instead read-leg inflation
+   (1070 176->362, 480 189->331 ms — ACTS recv contending with both
+   workers' reads on 8 cores). CONCLUSION: D2 requires D1's writer threads
+   (send off the dispatch thread) — coupled in BOTH directions. The D1
+   multi-second stall root-cause is now the KEYSTONE of the whole prefill
+   stack. Next probe: TCP retransmit counters (nstat) around an async arm
+   + per-frame writer send timestamps.
+3. D4 -13.6% UNEXPLAINED by demand accounting: cs2k demand walls are
+   neutral on ALL THREE workers (1070: h2d 168->0.4, submit +82, wall
+   +14). The loss is elsewhere — leading suspect is spec-pagein copies
+   sharing the device latest-event (background copies serializing demand
+   graph launches, invisible in demand rows), plus the separate finding
+   that the R9700/HIP copies never actually route (h2d 146 unchanged with
+   copy_stream=on — the "armed but inert" bug). REOPENED: demand-only
+   exclusion + per-request events + HIP routing fix, then retest.
+
+STAY CLOSED: GCACHE+GM8 (dense-at-verify trajectory cost is inherent),
+bias (measured fairly at two weights, straggler is state-dependent).
+
+ROUNDS 12/12b — REOPENED-LEVER VERDICTS + THE STALL ROOT-CAUSE.
+
+Round 12 (code700 leg, ALL SEVEN arms exactly canonical — calmest window
+of the day): ctl 3.82/3.99/3.99, hipg12 4.00, ai12a 3.98, ai12b 3.97.
+Round 12 code2000: ctl 23.99 / cs12k 22.07 / ctl 28.22 (2k controls
+swinging 18% all afternoon; 2k-leg acceptance also went nondeterministic).
+Round 12b (code2000): ctl 22.56/26.48/26.98; d1d2a 23.75 (on the warming
+trend, ~neutral); d1d2b 25.69 prefill but DECODE 2.19 — another stall arm;
+sfonly 25.59 (-4% vs neighbors, milder than round-11's -11.5% — the sf
+cost is window-dependent).
+
+THE D1 STALL IS ROOT-CAUSED: TRANSPORT, NOT CODE.
+  - Writer wakeup latency med 9 µs / p99 121 µs / max 1.6 ms (17k frames
+    per arm) — the cv-wakeup/scheduler hypothesis is DEAD.
+  - send() itself blocked 860 ms on one frame in a CLEAN arm (ai12a,
+    tok/s neutral — the writer thread absorbed it).
+  - nstat: ~800-1000 TCP retransmitted segments PER ARM on the 2026/wg
+    path; ai12b's window caught 8 TCP timeouts. The transport loses
+    packets ROUTINELY under load.
+  - Round-8's 3.5-10 s stalls = RTO exponential-backoff chains on that
+    lossy path. Sync mode: they block the dispatch thread (round-8 ai1).
+    Async mode: small blocks are absorbed, but a long chain still stalls
+    the worker's FIFO and the await (round-12b d1d2b, decode 2.19).
+  - D1 REHABILITATED as code: decode-neutral in clean windows, protective
+    against small transport stalls, not the stall CAUSE. But no code
+    change fixes the stalls — the TRANSPORT is the disease.
+
+D1+D2 COMBO (the coupled-pair test): no recovery — d1d2 ≈ sf-alone ≈
+neutral-to-slightly-negative at prefill, and the combo inherits the
+transport stall exposure. THE PAIR IS CLOSED with mechanism fully
+documented: split-frame's collision loss is real but window-dependent,
+writer threads don't recover it (the await/harvest side still serializes),
+and both knobs stay default-off.
+
+D4: cs12k negative again WITH all fixes in (demand-only, per-request
+events, HIP routing). Three strikes across three forms. CLOSED.
+
+hipg: three fair neutral arms across two windows, but the engagement
+counter got eaten by SIGKILL teardown (atexit never runs) — "engaged and
+neutral" vs "never engaged" remains formally open. Left open-low-priority:
+next touch should make the counter print periodically, not at exit. No
+more fleet time today.
+
+NEW LEVER OUT OF THE ROOT-CAUSE (the real one): THE TRANSPORT. The
+per-arm retransmit rate taxes every cross-machine byte, sync or async.
+Candidates: wg MTU/fragmentation on the 100.x path, or moving the
+expert-dispatch data path to raw LAN TCP (IPMAIN/IP2026 overrides exist,
+commit 3f5a7c7b1; the TCP-vs-wg arm was THROUGHPUT-neutral but was never
+evaluated for LOSS/stall rate). One future chain: LAN data path × N async
+arms, watching nstat retrans + stall incidence, not tok/s.
+
+NETWORK INVESTIGATION (kmbandy: "never seen it use more than 300Mbps on a
+hardwired gigabit pair"). VERDICT: THE NETWORK IS INNOCENT — THE WIRE HAS
+THE SAME DISEASE AS THE DRIVE: DUTY CYCLE.
+
+Measured (python socket probes, boxes idle, delivery-confirmed):
+  path        bulk     10MB bursts  1MB bursts  full-duplex aggregate
+  LAN direct  941.6    896          872         1766
+  tailscale   892.2    844          695         1570   (all Mbps)
+  - Tailscale is DIRECT (192.168.1.33:41641, no DERP relay); both NICs
+    negotiate 1000/full; tailscale0 MTU 1280.
+  - The tunnel costs ~5% bulk, ~20% on 1MB bursts (packet tax + ramp) —
+    real but minor; nothing caps at 300.
+
+THE 300 Mbps IS THE APPLICATION'S SHAPE: per layer, one 10-40 MB burst
+(~100-400 ms of wire time at ~850 Mbps) followed by the rest of the
+~1.3 s layer cycle (worker reads + compute + spine work) with the wire
+IDLE. Duty cycle ~25-35% -> ~300 Mbps average. Identical structure to
+the 07-31 NVMe finding ("the drive is idle 60-70%; the storage problem
+is duty cycle, not queue depth"). The serial layer loop starves both.
+
+IMPLICATIONS:
+  1. ~3x wire headroom exists during the idle windows — a point IN FAVOR
+     of the §4 predictor: its prefetch/hint bytes ride wire time that
+     nothing else uses.
+  2. cheap sysctl worth applying anyway (kmbandy sudo, both boxes,
+     persist in /etc/sysctl.d/): net.ipv4.tcp_slow_start_after_idle=0 —
+     with =1 (current), every post-idle burst re-climbs cwnd from ~15 KB,
+     taxing exactly this traffic shape; standard practice for bursty RPC
+     on controlled LANs. Optionally raise net.core.wmem_max (4 MB now)
+     toward 32 MB so a whole ACTS-scale frame fits in kernel buffers.
+  3. The in-run retransmits/stalls (~800-1000 segs/arm, RTO chains) did
+     NOT reproduce from idle boxes — they are load-window-specific
+     (tailscaled CPU contention during compute + fq_codel drop batches
+     on burst overshoot). Next diagnosis rides a REAL run: pidstat-delta
+     on tailscaled + nstat during a prefill-heavy arm. If confirmed,
+     moving the dispatch data path to LAN IPs (IPMAIN/IP2026, 3f5a7c7b1)
+     removes tailscaled from the data plane entirely — encryption is
+     unnecessary between two boxes on the same switch.
+
+#14 RESOLVED — DS4 SERVES AT 512K F16. The Thursday-night goal, landed.
+
+MECHANISM (luna 5a5a34da, all file:line in task #14): the dsv4 cache
+explicitly disables unified sub-cache allocation (dsv4:1190-1194) — every
+sub-cache allocates per-sequence. The harness passed no --parallel, so
+llama-server's auto default made 4 slots → n_seq_max=4 → ~4× KV. All
+08-03-era budgets were np=1 convention. The "3.13× regression" was never
+a code regression — it was four slots nobody asked for.
+
+FIX (luna 6b971663): SERVE mode passes --parallel ${NPAR-1} (+ -v), echoes
+the slot count in the banner; bench path untouched (config-of-record
+continuity — every banked number ran the implicit 4 slots).
+
+VALIDATION (2026-08-08 ~16:06, live): SERVE=1 CTX=512000 UBATCH=1024
+NPAR=1 → spine up on the 6900XT at **14.3 GiB total** (model+KV+compute,
+fits 16 GB) — Thursday this config demanded 10.5 GiB for KV alone and
+OOM'd five ways. Health ok, smoke completion coherent. Endpoint:
+http://100.86.191.92:8095/v1, one slot, f16, 512k.
+  - Caveat, stated honestly: the per-cache B/token breakdown STILL isn't
+    on record — even with -v the init lines didn't surface (the -v flag
+    maps to -lv INT_MAX in this build and the log format/routing differs;
+    282 KB log, no n_slots/kv-size lines found). The fix is validated at
+    the total-VRAM level (physics), not the per-cache ledger level. A
+    future -np 1 vs 4 CPU repro can close that if anyone cares; serving
+    no longer waits on it.
+  - Predictor captures ARMED on this serve (WP_DRAFT_CAPTURE +
+    WP_PREDICT_CAPTURE in /var/tmp/ds4full-serve/) — kmbandy's pi usage
+    IS the dataset collection.
+  - Spine RSS sampler running → /var/tmp/serve-rss.tsv (the
+    memory-leak-vs-oversubscription question gets its answer from a long
+    serve; today's teardown already showed the transient stack releases
+    cleanly, 15→6.2 GB).
+
+RECV-SIDE DECOMPOSITION COLUMNS
+layer
+n_tokens
+worker_index
+n_experts
+ns_before_await
+ns_blocked
+ns_issue_done
+ns_await_recv
+resp_bytes
+ns_unpack
+await_start_ns
+await_end_ns
+CAPTURE FORMATS
+
+WP_DRAFT_CAPTURE=<path> is an append-only binary stream. Its one-time header is
+four little-endian u32 values: magic WPD1 (0x31445057), version 1, n_embd, and
+dtype (1 = f32). Each block record is marker WDR1 (0x31445257), u64 block_id,
+u32 n_drafted, n_drafted llama_token/i32 token ids, then
+n_drafted*n_embd f32 NextN embedding values. Records are flushed individually.
+
+WP_PREDICT_CAPTURE=<prefix> writes <prefix>.<pid>.bin. Existing routing records
+are unchanged: WPC1 magic, then i32 layer, n_tokens, n_embd, n_expert_used,
+n_tokens*n_embd f32 activations, and n_tokens*n_expert_used i32 selected experts.
+The added raw-token record is marker WBT1 (0x31425457), u32 n_tokens, followed
+by n_tokens i32 token ids (including mask tokens). It is flushed per record and
+can be interleaved with the existing WPC1 records in stream order.

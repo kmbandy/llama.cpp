@@ -45,12 +45,17 @@ DENSE=/home/kmbandy/models/DS4-Flash-dense/ds4-dense.gguf
 # unaffected.
 IP2026=${IP2026:-100.124.155.84}
 IPMAIN=${IPMAIN:-100.86.191.92}
+# NPAR controls llama-server's serving slot count. dsv4 allocates each KV
+# sub-cache per sequence; the server auto default is 4 slots, while 1 slot is
+# the single-user pi serving configuration. Leave the bench path untouched:
+# its implicit 4 slots are part of this week's config-of-record continuity.
+NPAR=${NPAR-}
 # Per-arm output dir. A fixed OUT silently DESTROYS the previous arm's worker
 # logs, which is exactly what happened comparing CUDA0 vs Vulkan1 on 2026-08-01
 # -- the baseline survived only in a saved task transcript. ARM defaults to the
 # 1070's backend so the common A/B needs no extra argument.
 ARM=${ARM:-${DEV_1070:-CUDA0}}
-OUT=/var/tmp/ds4full-$ARM
+OUT=${OUT:-/var/tmp/ds4full-$ARM}
 # Overridable: every trace we have is from this one prompt, so any claim about
 # which experts get touched is really a claim about this single trajectory.
 PROMPT=${PROMPT:-"The capital of France is"}
@@ -88,6 +93,9 @@ PROMPT=${PROMPT:-"The capital of France is"}
 # runs a different config:
 #   grep -c WP_EXPERT_READ_STRIPES  ~/GitHub/llama.cpp/tools/wp-expert-worker/wp-expert-worker.cpp
 #   grep -c WP_DISPATCH_GATHER_MAX_FRAC ~/GitHub/llama.cpp/src/pipeline/pipe-expert-dispatcher.cpp
+#   grep -n 'PIPE_VERSION = ' ~/GitHub/llama.cpp/src/pipeline/pipe-protocol.h
+#   # The spine and worker both include this header; a mismatch means one side
+#   # was built from a different checkout and HELLO will refuse it.
 # and check both build dirs are newer than those sources.
 #
 #   slots 500/500/2200   +10.9% over 400/400/1600   (2026-08-01 brief)
@@ -284,7 +292,7 @@ HOSTVICTIM_MAIN=${HOSTVICTIM_MAIN:-0}
 # spine side is found with ZERO changed page-ins before any extra I/O is risked.
 # Run that arm FIRST.
 #
-# *** PIPE_VERSION 4 -> 5. REBUILD THE SPINE AND ALL FOUR WORKERS TOGETHER *** or
+# *** PIPE_VERSION 5 -> 6. REBUILD THE SPINE AND ALL FOUR WORKERS TOGETHER *** or
 # they refuse at HELLO (deliberate: an unknown frame type closes the session,
 # which mid-run is indistinguishable from a worker crash).
 PREFETCH_HINT=${PREFETCH_HINT:-}
@@ -352,6 +360,7 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # it bought, and overlap decays with distance, so the tail is the cheap part to
 # drop. Spine-side, same as PREDICT.
 [ -n "${PREDICT_N:-}" ] && SPINEENV="${SPINEENV:-} WP_SPEC_PREDICT_N=$PREDICT_N"
+[ -n "${SPLITFRAME:-}" ] && SPINEENV="${SPINEENV:-} WP_SPLIT_FRAME=$SPLITFRAME"
 [ -n "$SPEC_CHUNK" ]  && WPOST="$WPOST WP_EXPERT_SPEC_CHUNK=$SPEC_CHUNK"
 [ -n "$PREFETCH_HINT" ] && SPINEENV="${SPINEENV:-} WP_PREFETCH_HINT=$PREFETCH_HINT"
 # PRED_AHEAD=k -- cross-layer predicted hints: at layer L the spine applies layer
@@ -1091,12 +1100,18 @@ if [ "${HOSTVICTIM_MAIN:-0}" != "0" ] && \
     exit 1
 fi
 
+SPINE_SERVE_ARGS=""
+if [ -n "${SERVE:-}" ]; then
+    NPAR=${NPAR:-1}
+    SPINE_SERVE_ARGS="--parallel $NPAR -v"
+fi
+
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
 ssh mad-lab-main "cd $MAIN_REPO; and env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
     -m $DENSE --device ROCm1 --fit off --no-mmap -ngl 99 -c $CTX $SPECARGS $UBARGS \
     --cache-type-k $CACHE_TYPE_K --cache-type-v $CACHE_TYPE_V \
     --expert-dispatch ${DISPATCH_ENDPOINTS} \
-    --port 8095 --host ${SPINE_HOST:-127.0.0.1} > $OUT/spine.log 2>&1 & echo \$last_pid > $OUT/spine.pid"
+    --port 8095 --host ${SPINE_HOST:-127.0.0.1} $SPINE_SERVE_ARGS > $OUT/spine.log 2>&1 & echo \$last_pid > $OUT/spine.pid"
 sleep 3
 SPINE_PID=$(ssh mad-lab-main "cat $OUT/spine.pid" 2>/dev/null)
 echo "  spine pid ${SPINE_PID:-?}"
@@ -1134,6 +1149,7 @@ if [ -n "${SERVE:-}" ]; then
     echo
     echo "############ SERVING ############"
     echo "  spine: http://${IPMAIN}:8095 (OpenAI-compatible; bound ${SPINE_HOST:-127.0.0.1})"
+    echo "  slots (--parallel): $NPAR"
     echo "  KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX UBATCH=${UBATCH:-default}"
     echo "  workers left up; NO teardown; NO benchmark drive."
     exit 0
