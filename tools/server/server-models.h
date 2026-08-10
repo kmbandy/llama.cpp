@@ -108,7 +108,6 @@ struct server_model_meta {
     int idle_timeout = -1;
     mtmd_caps multimodal; // multimodal capabilities
     server_model_placement placement;
-    // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -116,6 +115,10 @@ struct server_model_meta {
 
     bool is_running() const {
         return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_LOADING || status == SERVER_MODEL_STATUS_SLEEPING;
+    }
+
+    bool is_ready_or_sleep() const {
+        return status == SERVER_MODEL_STATUS_LOADED || status == SERVER_MODEL_STATUS_SLEEPING;
     }
 
     bool is_failed() const {
@@ -127,10 +130,12 @@ struct server_model_meta {
 };
 
 struct server_models_routes;
-struct server_subproc; // defined in server-models.cpp
+struct server_subproc;   // defined in server-models.cpp
+struct server_lru_sched; // defined in server-models.cpp
 
 struct server_models {
     friend struct server_models_routes;
+    friend struct server_lru_sched;
 
 private:
     struct instance_t {
@@ -140,7 +145,11 @@ private:
         // Requests currently being proxied to this model. The idle sweeper refuses to
         // unload a model with any in flight -- `meta.last_used` is stamped when a request
         // STARTS, so a long generation looks idle and would otherwise be killed mid-stream.
-        int inflight = 0;
+        //
+        // 2026-08-10 upstream sync: this was the fork's `inflight`; upstream added the
+        // same counter as `req_count` and its scheduler reads that name, so the two are
+        // unified here rather than kept side by side.
+        int req_count = 0; // number of active proxy requests
     };
 
     std::mutex mutex;
@@ -237,6 +246,12 @@ private:
     common_preset base_preset; // base preset from llama-server CLI args
     std::unordered_map<std::string, std::filesystem::file_time_type> models_preset_applied_mtimes;
 
+    // queue of requests waiting for a models_max slot
+    std::unique_ptr<server_lru_sched> sched;
+
+    // if true, add some delay to simulate works (useful for testing)
+    bool debug_fake_timing = false;
+
     void update_meta(const std::string & name, const server_model_meta & meta);
     std::optional<std::filesystem::file_time_type> get_models_preset_mtime() const;
     void reload_models_preset_if_changed(server_model_meta & meta);
@@ -326,7 +341,9 @@ public:
     // ensure the model is in ready state (thread-safe)
     // return false if model is ready
     // otherwise, load the model and blocking wait until it's ready, then return true (meta may need to be refreshed)
-    bool ensure_model_ready(const std::string & name);
+    // if models_max is reached, the request waits in a queue until a slot frees up
+    // throws if the load fails, or if should_stop fires while waiting
+    bool ensure_model_ready(const std::string & name, const std::function<bool()> & should_stop = nullptr);
 
     // proxy an HTTP request to the model instance
     server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
@@ -409,7 +426,6 @@ struct server_models_routes {
  */
 struct server_http_proxy : server_http_res {
     std::function<void()> cleanup = nullptr;
-public:
     server_http_proxy(const std::string & method,
                       const std::string & scheme,
                       const std::string & host,
@@ -423,11 +439,15 @@ public:
                       int32_t timeout_write
                       );
     ~server_http_proxy() {
+        if (cleanup_pipes) {
+            cleanup_pipes();
+        }
         if (cleanup) {
             cleanup();
         }
     }
 private:
+    std::function<void()> cleanup_pipes = nullptr;
     std::thread thread;
     struct msg_t {
         std::map<std::string, std::string> headers;

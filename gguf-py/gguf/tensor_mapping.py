@@ -382,7 +382,7 @@ class TensorNameMap:
         ),
 
         MODEL_TENSOR.ATTN_GATE: (
-            "model.layers.{bid}.self_attn.gate_proj", # afmoe
+            "model.layers.{bid}.self_attn.gate_proj", # afmoe muse-glimmer
             "model.layers.{bid}.linear_attn.in_proj_z",  # qwen3.5
             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
         ),
@@ -1298,10 +1298,12 @@ class TensorNameMap:
             "encoder.final_layer_norm", # t5
             "layer_norm",               # neobert
             "model.hidden_norm",        # dflash
+            "encoder.output_norm_enc",  # dflash (transformers MuseGlimmerAssistant)
         ),
 
         MODEL_TENSOR.FC: (
-            "model.fc", # dflash
+            "model.fc",   # dflash
+            "encoder.fc", # dflash (transformers MuseGlimmerAssistant)
         ),
 
         MODEL_TENSOR.DSPARK_MARKOV_W1: (
@@ -1473,6 +1475,7 @@ class TensorNameMap:
             "vision_tower.patch_embed.patchifier.proj", # dots.ocr
             "vision_model.conv1", # Step3-VL
             "model.vision_embedder.patch_dense", # gemma4 unified
+            "model.vision_tower.patch_embedder.patch_embedding", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_EMBD_NORM: (
@@ -1540,7 +1543,8 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.self_attn.q_proj", # youtuvl
             "model.vision_model.transformer.layers.{bid}.self_attn.q_proj", # Deepseek-OCR CLIP, generated
             "vision_model.model.layers.{bid}.self_attn.q_proj.linear", # gemma4
-            "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj" # Deepseek-OCR-2 qwen2
+            "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.attn.q_proj", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
@@ -1566,7 +1570,8 @@ class TensorNameMap:
             "model.vision_model.transformer.layers.{bid}.self_attn.k_proj", # Deepseek-OCR CLIP, generated
             "siglip2.vision_model.encoder.layers.{bid}.self_attn.k_proj",
             "vision_model.model.layers.{bid}.self_attn.k_proj.linear", # gemma4
-            "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj" # Deepseek-OCR-2 qwen2
+            "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.attn.k_proj", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
@@ -1592,7 +1597,8 @@ class TensorNameMap:
             "siglip2.vision_model.encoder.layers.{bid}.self_attn.v_proj",
             "model.vision_model.transformer.layers.{bid}.self_attn.v_proj", # Deepseek-OCR CLIP, generated
             "vision_model.model.layers.{bid}.self_attn.v_proj.linear", # gemma4
-            "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj" # Deepseek-OCR-2 qwen2
+            "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.attn.v_proj", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_INPUT_NORM: (
@@ -1616,6 +1622,7 @@ class TensorNameMap:
             "vision_tower.blocks.{bid}.norm1", # dots.ocr
             "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.input_layernorm", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.norm1", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_O: (
@@ -1641,6 +1648,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.self_attn.o_proj.linear", # gemma4
             "vision_tower.blocks.{bid}.attn.proj", # dots.ocr
             "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
+            "model.vision_tower.layers.{bid}.attn.proj", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_SINKS: (
@@ -1669,6 +1677,7 @@ class TensorNameMap:
             "vision_tower.blocks.{bid}.norm2", # dots.ocr
             "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.post_attention_layernorm", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.norm2", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_FFN_UP: (
@@ -1693,6 +1702,7 @@ class TensorNameMap:
             "vision_model.model.layers.{bid}.mlp.up_proj", # gemma4
             "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
             "model.qwen2_model.model.model.layers.{bid}.mlp.up_proj", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.layers.{bid}.mlp.fc1", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_FFN_GATE: (
@@ -1725,6 +1735,7 @@ class TensorNameMap:
             "model.qwen2_model.model.model.layers.{bid}.mlp.down_proj" , # Deepseek-OCR-2 qwen2
             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
             "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
+            "model.vision_tower.layers.{bid}.mlp.fc2", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_ENC_ATTN_POST_NORM: (
@@ -1759,6 +1770,7 @@ class TensorNameMap:
             "model.vision_model.pre_layrnorm", # Deepseek-OCR CLIP
             "vision_tower.patch_embed.patchifier.norm", # dots.ocr
             "vision_model.ln_pre", # Step3-VL
+            "model.vision_tower.ln_pre", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_POST_NORM: (
@@ -1772,6 +1784,7 @@ class TensorNameMap:
             "visual.post_layernorm", # glm4v
             "siglip2.vision_model.post_layernorm",
             "model.qwen2_model.model.model.norm", # Deepseek-OCR-2 qwen2
+            "model.vision_tower.ln_post", # muse-glimmer
         ),
 
         MODEL_TENSOR.V_MM_POST_NORM: (
@@ -2115,6 +2128,7 @@ class TensorNameMap:
             "conformer.subsample_conv_projection.layer{bid}.conv", # gemma4
             "sound_encoder.encoder.subsampling.layers.{bid}", # parakeet
             "encoder.conv{bid}", # mimo-audio-tokenizer
+            "speaker_encoder.blocks.{bid}.conv", # qwen3tts speaker encoder (only bid=0, the stem TDNN)
         ),
 
         MODEL_TENSOR.A_ENC_CONV1D_NORM: (
@@ -2132,6 +2146,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.A_ENC_CONV_OUT: (
             "audio_tower.conv_out", # qwen3omni
+            "speaker_encoder.mfa.conv", # qwen3tts speaker encoder: multi-layer feature aggregation
         ),
 
         MODEL_TENSOR.A_PRE_NORM: (),
@@ -2342,7 +2357,8 @@ class TensorNameMap:
         MODEL_TENSOR.A_MMPROJ_FC: (
             "audio.multi_modal_projector.linear", # qwen2audio
             "audio_tower.proj", # qwen2omni
-            "model.audio_tower.output_proj" # gemma4
+            "model.audio_tower.output_proj", # gemma4
+            "speaker_encoder.fc", # qwen3tts speaker encoder: final speaker embedding projection
         ),
 
         MODEL_TENSOR.A_MM_NORM_PRE: (
@@ -2417,6 +2433,7 @@ class TensorNameMap:
             "conformer.layers.{bid}.lconv1d.linear_start", # gemma3n
             "sound_encoder.encoder.layers.{bid}.conv.pointwise_conv1", # parakeet
             "encoder.layers.{bid}.conv.up_conv", # granite_speech
+            "speaker_encoder.blocks.{bid}.tdnn1.conv", # qwen3tts speaker encoder
         ),
 
         MODEL_TENSOR.A_ENC_CONV_PW2: (
@@ -2424,6 +2441,23 @@ class TensorNameMap:
             "conformer.layers.{bid}.lconv1d.linear_end", # gemma3n
             "sound_encoder.encoder.layers.{bid}.conv.pointwise_conv2", # parakeet
             "encoder.layers.{bid}.conv.down_conv", # granite_speech
+            "speaker_encoder.blocks.{bid}.tdnn2.conv", # qwen3tts speaker encoder
+        ),
+
+        MODEL_TENSOR.A_ENC_SE_CONV1: (
+            "speaker_encoder.blocks.{bid}.se_block.conv1", # qwen3tts
+        ),
+
+        MODEL_TENSOR.A_ENC_SE_CONV2: (
+            "speaker_encoder.blocks.{bid}.se_block.conv2", # qwen3tts
+        ),
+
+        MODEL_TENSOR.A_ENC_ASP_ATTN: (
+            "speaker_encoder.asp.conv", # qwen3tts
+        ),
+
+        MODEL_TENSOR.A_ENC_ASP_TDNN: (
+            "speaker_encoder.asp.tdnn.conv", # qwen3tts
         ),
 
         MODEL_TENSOR.A_ENC_NORM_CONV: (

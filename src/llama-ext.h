@@ -175,3 +175,9 @@ LLAMA_API int llama_expert_prefetch_hint(struct llama_context * ctx,
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0
 // always returns true. No-op / true if paging disabled.
 LLAMA_API bool llama_wp_draft_oracle_should_run(struct llama_context * ctx);
+
+// retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
+// returns total number of elements or 0 on error
+// if out is nullptr, returns the number of tokens without writing to out
+// caller must allocate enough memory for out before calling
+LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);

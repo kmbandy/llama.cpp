@@ -18,8 +18,11 @@ from .dspark import DSparkDraftMixin
 from .qwen import QwenModel
 
 
-@ModelBase.register("DeepseekOCRForCausalLM", "UnlimitedOCRForCausalLM")
+@ModelBase.register("DeepseekOCRForCausalLM")
 class DeepseekOCRVisionModel(MmprojModel):
+    # HF dynamic_preprocess() max_num, which differs per model
+    preproc_max_tiles = 9
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.clip_projector_type = gguf.VisionProjectorType.DEEPSEEKOCR
@@ -43,6 +46,9 @@ class DeepseekOCRVisionModel(MmprojModel):
             self.gguf_writer.add_vision_projector_scale_factor(proj_scale_factor)
         # @bluebread: there's no window_size in config but just add it here anyway
         self.gguf_writer.add_vision_window_size(self.hparams.get("window_size", 14))
+
+        self.gguf_writer.add_vision_preproc_min_tiles(2)
+        self.gguf_writer.add_vision_preproc_max_tiles(self.preproc_max_tiles)
 
         # SAM configuration
         sam_hparams = hparams['sam']
@@ -94,8 +100,15 @@ class DeepseekOCRVisionModel(MmprojModel):
         return super().filter_tensors((name, gen))
 
 
+@ModelBase.register("UnlimitedOCRForCausalLM")
+class UnlimitedOCRVisionModel(DeepseekOCRVisionModel):
+    preproc_max_tiles = 32
+
+
 @ModelBase.register("DeepseekOCR2ForCausalLM")
 class DeepseekOCR2VisionModel(DeepseekOCRVisionModel):
+    preproc_max_tiles = 6
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.clip_projector_type = gguf.VisionProjectorType.DEEPSEEKOCR2
@@ -448,11 +461,42 @@ class DeepseekV2Model(TextModel):
 class DeepseekV32Model(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK32
     skip_mtp = False
+    supports_mtp_export = True
+    _n_main_layers: int | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.block_count = self.hparams["num_hidden_layers"]
+        if not self.no_mtp:
+            self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None):
+        type(self)._n_main_layers = self.hparams["num_hidden_layers"]
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        if (titem := super().filter_tensors(item)) is None:
+            return None
+        name, gen = titem
+
+        # DeepSeek V3.2 appends the NextN/MTP block past num_hidden_layers
+        # (model.layers.61 -> blk.61 in the 62-block file).
+        assert cls._n_main_layers is not None
+        is_mtp = (m := re.match(r"model\.layers\.(\d+)\.", name)) is not None and int(m.group(1)) >= cls._n_main_layers
+
+        # --no-mtp: drop the appended NextN block entirely.
+        if is_mtp and cls.no_mtp:
+            return None
+        # --mtp: keep ONLY NextN-block tensors plus the shared embeddings/
+        # norm/lm_head (so the resulting GGUF carries just the draft head).
+        if cls.mtp_only and not is_mtp and name not in (
+            "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
+        ):
+            return None
+
+        return name, gen
 
     def set_vocab(self):
         from transformers import AutoTokenizer
@@ -464,7 +508,7 @@ class DeepseekV32Model(DeepseekV2Model):
         super().set_gguf_parameters()
 
         # NextN/MTP prediction layers
-        if (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+        if not self.no_mtp and (num_nextn_predict_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
         # DSA indexer parameters
@@ -510,11 +554,24 @@ class DeepseekV4Model(TextModel):
         for key, value in raw_hparams.items():
             self.hparams.setdefault(key, value)
 
+        # workaround for special rope_parameters (main/compress) in transformers 5.x
+        if self.rope_parameters.get("full_attention", self.rope_parameters).get("rope_type") is None:
+            if (rope_scaling := raw_hparams.get("rope_scaling")) is not None:
+                if "rope_type" not in rope_scaling and (rope_type := rope_scaling.get("type")) is not None:
+                    rope_scaling["rope_type"] = rope_type
+                self.rope_parameters.update(**rope_scaling)
+
         num_hidden = int(self.hparams["num_hidden_layers"])
         # Rekey mtp.{stage}.* into the block namespace (and unprefixed DSpark roots)
         # BEFORE block_count / tensor_map / dtype collection. Stage count is derived
         # from the tensors actually present — config num_nextn_predict_layers is
         # wrong for this checkpoint (says 1; ships mtp.0/1/2).
+        #
+        # 2026-08-10 upstream sync: upstream computes block_count from
+        # num_nextn_predict_layers gated on self.mtp_only. We keep the
+        # tensor-derived count -- that config key reads 1 on the DS4 checkpoint
+        # that actually ships mtp.0/1/2, which is why this was derived in the
+        # first place.
         self._mtp_stage_count = self._integrate_mtp_tensors(num_hidden)
         self.block_count = num_hidden + self._mtp_stage_count
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
@@ -538,7 +595,10 @@ class DeepseekV4Model(TextModel):
         self._collect_source_dtypes()
 
         # add a default chat template; if the model has a built-in template, it will be overridden later
-        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
+        model_id_hint = self.remote_hf_model_id or self.dir_model.name
+        is_0731 = "0731" in model_id_hint
+        template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else "deepseek-ai-DeepSeek-V4.jinja"
+        template_path = Path(__file__).parent.parent / "models" / "templates" / template_name
         if template_path.is_file():
             with open(template_path, "r", encoding="utf-8") as f:
                 self.gguf_writer.add_chat_template(f.read())
