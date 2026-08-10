@@ -44,8 +44,11 @@ fail=0
 #                                112, also identical. If it does NOT measure the same TF as FM=2 FN=4,
 #                                the feed-ratio model is wrong and the frag-grid extrapolation dies.
 : ${WAVES:=6}    ; : ${SEGK:=256} ; : ${G:=8}      ; : ${FM:=2}    ; : ${ACC_N:=4}  ; : ${FN:=4}
-: ${JDEPTH:=1}   ; : ${POOL_N:=1} ; : ${SSWIN:=32} ; : ${KMAJOR:=0}; : ${CFASSIGN:=0}
+: ${JDEPTH:=1}   ; : ${DUTY_OVERRIDE:=0} ; : ${POOL_N:=1} ; : ${SSWIN:=32} ; : ${KMAJOR:=0}; : ${CFASSIGN:=0}
 : ${SELFSERVE:=1}; : ${DECENTASN:=1}; : ${BANKZERO:=1}; : ${BATONGATE:=1}; : ${STAGGER:=1}
+: ${LEANGUARD:=0}; : ${GUARDHOIST:=0}; : ${LEANMARSH:=0}
+: ${SEGK_STAYFAT:=0}
+: ${BATCHLDS:=0}; : ${WIDESLOT:=0}
 : ${DSWS2_OVERLAP:=1}; : ${DSWS2_PREFETCH:=1}
 : ${DEADMAN:=1}  ; : ${STAGINSTR:=1}; : ${TFPROBE:=1}
 # DSWS2_FUNNEL -- ADDED TO THIS BLOCK 2026-07-27, and the reason is the whole point of this block.
@@ -78,14 +81,15 @@ fail=0
 #   NOT by a demonstrated speedup. VALIDATE ON THE FULL 30-SHAPE SWEEP before relying on it, and if a
 #   shape regresses, DSWS2_FUNNEL=0 restores the old behaviour byte-identically.
 : ${DSWS2_FUNNEL:=1}; : ${DSWS2_FUNNEL_SPIN_N:=1}
-export WAVES SEGK G FM FN ACC_N JDEPTH POOL_N SSWIN KMAJOR CFASSIGN \
+export WAVES SEGK G FM FN ACC_N JDEPTH DUTY_OVERRIDE POOL_N SSWIN KMAJOR CFASSIGN \
        SELFSERVE DECENTASN BANKZERO BATONGATE STAGGER DSWS2_OVERLAP DSWS2_PREFETCH \
+       LEANGUARD GUARDHOIST LEANMARSH SEGK_STAYFAT BATCHLDS WIDESLOT \
        DEADMAN STAGINSTR TFPROBE DSWS2_FUNNEL DSWS2_FUNNEL_SPIN_N
 
 # ---- Guard the standard. Deviating must be an EXPLICIT act, not an omission. ----
 if [ "${DSWS_ALLOW_NONSTD:-0}" != "1" ]; then
   case "$SEGK" in
-    64|128|256) ;;
+    64|128|256|512) ;;
     *) echo "  build_flow.sh REFUSED: SEGK=$SEGK is outside the sanctioned range {64,128,256}"; \
        echo "     (kmbandy 2026-07-26). Set DSWS_ALLOW_NONSTD=1 to override."; exit 3;;
   esac
@@ -96,9 +100,9 @@ if [ "${DSWS_ALLOW_NONSTD:-0}" != "1" ]; then
       echo "     set DSWS_ALLOW_NONSTD=1 and say so in the run name."; exit 3
     fi
   done
-  if [ "$JDEPTH" != "1" ]; then
-    echo "  build_flow.sh REFUSED: JDEPTH=$JDEPTH -- SELFSERVE requires JDEPTH=1 and the assembler will"
-    echo "     refuse anyway. The k-slice lead-gate is a DESIGN change, not a knob. DSWS_ALLOW_NONSTD=1 to try."; exit 3
+  if [ "$SEGK_STAYFAT" != "0" ]; then
+    echo "  build_flow.sh REFUSED: SEGK_STAYFAT=$SEGK_STAYFAT is the C1 measurement-only duty deviation."
+    echo "     Set DSWS_ALLOW_NONSTD=1 and label the build ORACLE-INVALID for silicon slope use only."; exit 3
   fi
 fi
 # ---- dyn-VGPR GROW-TARGET GATE (added 2026-07-29). THIS ONE PREVENTS A HANG, NOT A DEVIATION. ----
@@ -132,10 +136,11 @@ echo "   FUNNEL=$DSWS2_FUNNEL (boundary-advance readiness pre-gate) SPIN_N=$DSWS
 mkflow() { # EMERGENT economy: no mix args. Env: WAVES VBUDGET G SEGK POOL_N ACC_N ...
   local tag="occ_dsws2_w${WAVES:-16}_flow_gd"
   nice -19 ionice -c3 "$L/clang" -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1201 \
-     -Wa,-defsym,DSWS2=1 -Wa,-defsym,FM=${FM:-2} -Wa,-defsym,FN=${FN:-4} -Wa,-defsym,G=${G:-6} -Wa,-defsym,SEGK=${SEGK:-64} \
+     -Wa,-defsym,DSWS2=1 -Wa,-defsym,LEANGUARD=${LEANGUARD:-0} -Wa,-defsym,GUARDHOIST=${GUARDHOIST:-0} -Wa,-defsym,LEANMARSH=${LEANMARSH:-0} -Wa,-defsym,SEGK_STAYFAT=${SEGK_STAYFAT:-0} -Wa,-defsym,BATCHLDS=${BATCHLDS:-0} -Wa,-defsym,WIDESLOT=${WIDESLOT:-0} -Wa,-defsym,FM=${FM:-2} -Wa,-defsym,FN=${FN:-4} -Wa,-defsym,G=${G:-6} -Wa,-defsym,SEGK=${SEGK:-64} \
      -Wa,-defsym,SAFEPROBE=1 -Wa,-defsym,DIAG=${DIAG:-0} -Wa,-defsym,POOL_N=${POOL_N:-3} -Wa,-defsym,ACC_N=${ACC_N:-1} -Wa,-defsym,WOFLUSH=${WOFLUSH:-0} \
      -Wa,-defsym,WAVES=${WAVES:-16} -Wa,-defsym,VBUDGET=${VBUDGET:-1536} \
      -Wa,-defsym,PHASEPROBE=${PHASEPROBE:-0} -Wa,-defsym,PHSHIFT=${PHSHIFT:-8} -Wa,-defsym,PHSPLIT=${PHSPLIT:-0} -Wa,-defsym,NOCFLUSH=${NOCFLUSH:-0} -Wa,-defsym,KMAJOR=${KMAJOR:-0} -Wa,-defsym,JDEPTH=${JDEPTH:-1} -Wa,-defsym,STAGGER=${STAGGER:-0} ${RELSTART:+-Wa,-defsym,RELSTART=${RELSTART}} ${BATONGATE:+-Wa,-defsym,BATONGATE=${BATONGATE}} ${GRELAX:+-Wa,-defsym,GRELAX=${GRELAX}} ${BATON_SEED:+-Wa,-defsym,BATON_SEED=${BATON_SEED}} -Wa,-defsym,MAXFAT=${MAXFAT:-0} -Wa,-defsym,STAGERS=${STAGERS:-4} -Wa,-defsym,DUTYPROBE=${DUTYPROBE:-0} -Wa,-defsym,NTLOAD=${NTLOAD:-0} -Wa,-defsym,RBU=${RBU:-1} -Wa,-defsym,NOFEED=${NOFEED:-0} -Wa,-defsym,MULTISLOT=${MULTISLOT:-0} -Wa,-defsym,MSCOMP=${MSCOMP:-${MULTISLOT:-0}} -Wa,-defsym,MSSCAN=${MSSCAN:-${MSCOMP:-${MULTISLOT:-0}}} -Wa,-defsym,MSDRAIN=${MSDRAIN:-${MSCOMP:-${MULTISLOT:-0}}} -Wa,-defsym,MSFEED=${MSFEED:-${MULTISLOT:-0}} -Wa,-defsym,BATCHASN=${BATCHASN:-0} -Wa,-defsym,DECENTASN=${DECENTASN:-0} -Wa,-defsym,CFASSIGN=${CFASSIGN:-0} -Wa,-defsym,DSWS2_RCONV=${DSWS2_RCONV:-0} -Wa,-defsym,DSWS2_RCONV_COAST_N=${DSWS2_RCONV_COAST_N:-64} -Wa,-defsym,SELFSERVE=${SELFSERVE:-0} -Wa,-defsym,SSWIN=${SSWIN:-8} -Wa,-defsym,PHIST=${PHIST:-0} -Wa,-defsym,NOBLOAD=${NOBLOAD:-0} -Wa,-defsym,NODSADD=${NODSADD:-0} -Wa,-defsym,NOWMMA=${NOWMMA:-0} -Wa,-defsym,BNDPROBE=${BNDPROBE:-0} -Wa,-defsym,BNDSPLIT=${BNDSPLIT:-0} -Wa,-defsym,DSWS2_FUNNEL=${DSWS2_FUNNEL:-0} -Wa,-defsym,DSWS2_FUNNEL_SPIN_N=${DSWS2_FUNNEL_SPIN_N:-1024} -Wa,-defsym,RESVPROBE=${RESVPROBE:-0} -Wa,-defsym,BATCH=${BATCH:-1} -Wa,-defsym,INITBAR=${INITBAR:-1} -Wa,-defsym,TERMFIX=${TERMFIX:-1} -Wa,-defsym,DUTY_EVERY=${DUTY_EVERY:-64} -Wa,-defsym,CSTORE=${CSTORE:-0} \
+     -Wa,-defsym,DUTY_OVERRIDE=${DUTY_OVERRIDE:-0} \
      -Wa,-defsym,DSWS2_ADVPROBE=${DSWS2_ADVPROBE:-0} -Wa,-defsym,DSWS2_BNDTIME=${DSWS2_BNDTIME:-0} -Wa,-defsym,DSWS2_PASSTIME=${DSWS2_PASSTIME:-0} \
      -Wa,-defsym,DSWS2_BURSTCNT=${DSWS2_BURSTCNT:-0} \
      -Wa,-defsym,DSWS2_KDBUF=${DSWS2_KDBUF:-0} \

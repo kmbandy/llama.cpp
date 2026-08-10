@@ -7496,7 +7496,7 @@ int main(int argc, char** argv) {
             rc = 4;
         } else if ( getenv("DSWS2_FLOW")
                         ? !((Gv >= 2 && Gv <= 32) &&
-                            (SEGKv == 16 || SEGKv == 32 || SEGKv == 64 || SEGKv == 128 || SEGKv == 256) &&
+                            (SEGKv == 16 || SEGKv == 32 || SEGKv == 64 || SEGKv == 128 || SEGKv == 256 || SEGKv == 512) &&
                             (FMc == 1 || FMc == 2 || FMc == 4 || FMc == 8) &&   // FM widened 2026-07-29 (was {1,2});
                             (FNc >= 1 && FNc <= 8))                             //   the NFV gate above is the real limiter
                         : (Gv != 6 || SEGKv != 64 || FMc != 2 || FNc != 4) ) {  // non-flow: fixed coop tile is always FM=2 FN=4
@@ -7526,7 +7526,7 @@ int main(int argc, char** argv) {
             //   operand footprint so the g=6 write-once accumulator banks fit LDS) -- so SEGK=32 is
             //   allowed ONLY on the DSWS2_FLOW path, where the run must pass a matching DSWS2_SEGK=32.
             printf("  *** REFUSE: DSWS2_G=%d DSWS2_SEGK=%d DSWS2_FM=%d DSWS2_FN=%d mismatches the built bin's compile-time "
-                   "geometry (non-flow: G=6 SEGK=64 FM=2 FN=4; flow: G in [2,32] SEGK in {16,32,64,128,256} "
+                   "geometry (non-flow: G=6 SEGK=64 FM=2 FN=4; flow: G in [2,32] SEGK in {16,32,64,128,256,512} "
                    "FM in {1,2,4,8} FN in [1,8]) -- REFUSING geometry/bin mismatch ***\n", Gv, SEGKv, FMc, FNc);
             rc = 4;
         } else {

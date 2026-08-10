@@ -4893,3 +4893,208 @@ the block itself. Now `WAVES=6 G=8 FM=2 ACC_N=4 FN=4 SEGK=256`; header corrected
   the sidecar is the durable fix.
 
 Source now `57ab3100c9450ad6`; **bin unchanged at `58e965a46f3e162d`**.
+
+## 2026-08-08 AFTERNOON — ★★ THE GUARD ABLATION: §85's 35% FIXED COST IS NOT THE EXEC-GUARD IDIOM ★★
+
+### 87. LEANGUARD ON SILICON — 682 INSTRUCTIONS REMOVED, 0.0% TIME MOVED. THE §1c CORRESPONDENCE IS A COINCIDENCE.
+Design/prereg: `GUARD_ABLATION_DESIGN_2026-08-08.md`. Offline build + census: `GUARD_ABLATION_REPORT_2026-08-08.md`
+(Codex gpt-5.6-luna built; Claude specced + reviewed). Board claim fcb2236d. All dispatches via gpu_run.sh,
+DSWS_ALLOW_NONSTD (WAVES=6/ML8_POOL=64, the §85 campaign geometry).
+
+**CORRECTNESS FIRST (rule 7):** all three arms brought up at chunk=64, DSWS2_REPS=1, **full stride=1 oracle
+(320/320 tiles): bad=0** on LEANGUARD (bin b1f912df), LEANGUARD+GUARDHOIST (aead4416), LEANMARSH (430b0590).
+WORK-EXACT, occ[0]=0, canary clean, no reset, occ[95]=0 (zero lane-0-inactive events at the claim CAS — the
+LEANGUARD site audit's lane-0 assumption held on silicon).
+
+**THE MEASUREMENT (same-session A/B per §80; fixed-rep regime replicating §85):**
+
+| cell | bin | span ticks | computed | ns/event | TF |
+|---|---|---:|---:|---:|---:|
+| OFF base (B1b)      | 58e965a4 | 69,503,016 | 11,520,000 | 60.33 | 17.4 |
+| OFF base repeat (B6)| 58e965a4 | 68,965,168 | 11,520,000 | 59.87 | 17.5 |
+| LEANGUARD base (B2b)| b1f912df | 69,074,680 | 11,520,000 | 59.96 | 17.5 |
+| LG+GUARDHOIST (B5)  | aead4416 | 69,099,320 | 11,520,000 | 59.98 | 17.5 |
+| OFF fm1 (B3)        | 6e2442c4 | 57,890,912 | 14,469,120 | 40.01 | 13.1 |
+| LEANGUARD fm1 (B4)  | 6d8d3f1b | 58,215,740 | 14,469,120 | 40.23 | 13.0 |
+
+In-session OFF cells reproduce §85 to <1% (base 60.1 vs 60.07; fm1 40.01 vs 40.01 EXACTLY) — that
+reproduction is the clock control for this session. Two-point fits (MF/event 1.0513 / 0.5257):
+
+> OFF:        ns_per_event = **19.9** + 38.2 × MFLOP_per_event   (vs §85's 20.80 + 37.36)
+> LEANGUARD:  ns_per_event = **20.5** + 37.5 × MFLOP_per_event
+
+**PRE-REGISTERED PREDICTION IF CAUSAL (f=1): fixed term 20.8 → ~12.9 ns. OBSERVED: 19.9 → 20.5 — NO DROP
+(+0.6 ns, inside the ±0.5 ns repeat resolution).** Decision rule was ≥4 ns = causal, ≤2 ns = exonerated:
+**THE EXEC-GUARD IDIOM IS EXONERATED. §1c's 34%-of-instructions ≈ 35%-of-runtime match was numerical
+coincidence.** GUARDHOIST confirmed nil (B5 == B2b to 0.04%). LEANMARSH not separately timed (0.17% proxy,
+correctness-gated only).
+
+**THE STRUCTURAL RESULT — better than a win:** removing 682 instructions (−9.5% of `.text`, −38% of all
+guard bookkeeping, on the hottest coordination paths) moved per-event time **0.0%**. The per-event fixed
+cost is therefore NOT instruction-issue on the guard ALU. It survives instruction removal → it is
+LATENCY/ROUND-TRIP bound: the serialized `ds_*` + `s_wait_dscnt 0` chains (every accessor is a full LDS
+round-trip with a hard wait, and the guard ALU hides entirely under those waits) and/or the polling cadence
+itself. Consistent with waves16's coast/computed=13 signature (§85) and door1=100% everywhere.
+**Lever ranking after this result: (1) event COUNT — the 2026-07-21 counter-free assign design (fewer
+round-trips per unit work) is now the front-runner; (2) round-trips PER EVENT — fuse/batch dependent lds_*
+sequences so one wait covers several accesses (NOT the exec-guard ALU around them); (3) instruction economy
+in coordination code — DEAD as a lever, measured twice now (§79 cuts +0.44%, this −682 for 0.0%).**
+
+**METHOD/GOTCHAS (verbatim into the next brief):**
+- **The host env MUST carry `SSWIN=32`** with the telemetry-era build defaults: without it the host
+  reconstructs LDS=33,312B vs the bin's 34,304B (host default SSWIN=8; build default is now 32). Caught at
+  DSWS2_DRYRUN (which is contractually GPU-free, occ_dispatch.cpp:7430) BEFORE any dispatch — the same
+  mismatch class as the 2026-07-26 MODE1 reset. Dry-run-verify the header against a recorded §85 log before
+  every campaign.
+- **`DSWS2_TARGET_SECS` produces sagging clocks** (mean sclk ~880, per-rep spread 43%): inter-rep wall gaps
+  let the clock drop. **Fixed `DSWS2_REPS` (125/157, the §85 counts) is the regime that reproduces §85.**
+- **The telemetry busy-band mean is POLLUTED in multi-rep runs** (min samples 27–400 MHz = inter-chunk
+  yields sampled as "busy"). Do not clock-normalize from it here; the §85-reproduction of the OFF cells is
+  the valid clock control. The per-rep spread% likewise includes ramp reps (B6's honest spread: 2.3%).
+- The `SUSTAINED ... glass-flat=trustworthy` suffix prints unconditionally — it is not a verdict.
+
+Tree at close: canonical OFF bin rebuilt (58e965a4), latch clear, no resets (0 before/after), all runs
+logged under ~/dsws_gpu_logs/b*_pool64_nonstd_*. Kernel/build_flow.sh ablation edits + both .md artifacts
+remain UNCOMMITTED (kmbandy decides).
+
+### 88. CFASSIGN AT THE MODERN GEOMETRY: −4.5% — STAYS OFF. PREFETCH PRICED: +1.7%. (2026-08-08, claim 898f580b)
+The 07-21 CFASSIGN adoption (+13.5%) was at the A1 geometry (WAVES=30 FM=1 G=6); it was left at 0 through the
+occupancy pivot and never re-tested. Re-validated at the config of record, one variable at a time. CFASSIGN
+requires DSWS2_PREFETCH=0 (the :1092 assembler guard, from the 07-24 review's R1 finding), so the comparison
+runs against a matched PREFETCH=0 control:
+
+| cell | bin | span ticks | ns/event | TF | coast-frac |
+|---|---|---:|---:|---:|---:|
+| OFF record (§87 mean)     | 58e965a4 | —          | 60.10 | 17.4–17.5 | 52.5–54.9% |
+| OFF + PREFETCH=0 (C1)     | 922694c6 | 70,397,684 | 61.11 | 17.2 | 56.8% |
+| CFASSIGN + PREFETCH=0 (C2)| 5955335c | 73,545,984 | 63.84 | 16.4 | 60.6% |
+
+- **CFASSIGN vs matched control: +2.7 ns/event = −4.5% TF.** The scrum it deletes is small at WAVES=6
+  (6 contenders, not 30); its structural costs now outweigh it. **CFASSIGN stays 0. Loose end closed —
+  do not re-propose it as a design task; it is BUILT, and it LOSES at this geometry.**
+- **PREFETCH earns its default-on: +1.7%** (first isolated measurement at the modern config).
+- Correctness: CFASSIGN bring-up full-stride oracle 320/320 bad=0, WORK-EXACT, occ[95]=0, occ[96] delta +0 —
+  the counter-free wid→unit mapping is CORRECT at WAVES=6/SSWIN=32; it is only slower.
+- Both harness guards fired correctly en route (kernel .error on CFASSIGN+PREFETCH; build_flow REFUSED on a
+  silent core-mechanism deviation until DSWS_ALLOW_NONSTD=1). The system enforced one-variable discipline.
+Tree at close: canonical OFF bin restored (58e965a4), latch clear, no resets.
+
+## §89 — SEGK per-segment attribution + BATCHLDS wait-fusion A/B (2026-08-09, silicon)
+
+**Questions.** (1) What owns the 0.108 ms/n_kseg per-segment slope (~70% of runtime at the config of
+record)? Pre-registered in SEGK_ATTRIBUTION_{DESIGN,REPORT}_2026-08-08.md. (2) Is the 20.8 ns/event fixed
+term the serialized claim/peek LDS round-trips? Pre-registered in LDS_ROUNDTRIP_BATCHING_DESIGN.md §6
+(DS4 overnight design; BATCHLDS arms repaired to byte-identity 2026-08-09 AM — see the ERRATUM in
+DSWS_SESSION_SUMMARY_2026-08-08.md; Codex handoff b0be976c).
+
+**Method.** Same-session, fixed-reps (125/95/64 at SEGK 256/128/64; 157 at fm1), SSWIN=32 host env,
+stride-8 oracle on perf rows, full-stride bring-up gates, board claim 16845b14. All 18 dispatches via
+gpu_run.sh; zero resets; latch clear throughout. Fits from span ticks/computed (segk_fit.py + hand
+cross-check), never rendered TF.
+
+**Bring-up gates (both PASSED, full-stride 320/320 bad=0 max_rel=0, WORK-EXACT, occ[95]=0, canary clean):**
+- SEGK_STAYFAT (73b8456d): grow/shrink-skip arm is CORRECT on silicon → C1 rows promoted to oracle-VALID
+  (Codex's conservative ORACLE-INVALID label retired).
+- BATCHLDS (b813aa2a): the claim-path STI pre-read produces bit-exact C. The §2.2 silent-wrong-C risk is
+  retired by measurement, not argument.
+
+**(1) The 12-cell matrix (ms/rep at n_kseg 36/72/144; all WORK-EXACT):**
+
+| arm | 36 | 72 | 144 | slope ms/n_kseg | vs b0=0.1091 |
+|---|---|---|---|---|---|
+| baseline (58e965a4, 9bc29fd8, c7baa910) | 5.566 | 9.502 | 17.346 | 0.1091 | — (reproduces §85 1.63+0.108) |
+| C1 SEGK_STAYFAT (73b8456d, 3cbcda8a, 2a8f2a1e) — oracle-VALID | 5.533 | 9.533 | 17.582 | 0.1116 | +2.3% (FLAT) |
+| C2 NODSADD (92dc2a3e, a183782e, 29141ebd) — ORACLE-INVALID by construction | 2.672 | 2.802 | 3.275 | 0.0057 | **−94.7%** |
+| C3 NOBLOAD (e3301d4d, 167c5dea, b2219c5c) — ORACLE-INVALID by construction | 5.452 | 9.352 | 17.366 | 0.1105 | −1.4% (FLAT) |
+
+**VERDICT (1): the per-segment slope is the ds_add bank-flush phase — ~95% of it.** The flush
+(FM·FN·8=128 ds_add_f32 + s_wait_dscnt per segment, kernel :5575–5615) owns 0.103 of the 0.109; the C4
+residual (reservation/claim/boundary, no clean switch) is the leftover ~0.006 ≈ 5%. C1 grow/shrink is
+EXONERATED (0%, slope actually +2.3% under STAYFAT — the 07-21 "40% of wave time" figure does NOT
+transfer; consistent with 06-20 dyn==static). C3 operand staging is EXONERATED (−1.4%, intercept −0.2 ms
+= the known ~2% base effect). Predictions vs outcomes: C2 predicted 8–26%, measured 95% (direction right,
+magnitude 4× the upper bound); C1 predicted 25–40%, measured 0 (refuted). Note the flush already batches
+its waits (128 adds → ONE dscnt wait), so the cost is the atomic traffic itself (issue rate + bank
+conflicts across 6 waves), NOT wait count — wait-batching does not apply to it, and "wider stores" cannot
+apply to atomics. The levers that divide this cost are: fewer flush EVENTS (deep-J flushes once per J
+segments — DS4's §4 proposal, now aimed at a measured 3.7 ms/rep target, kmbandy sign-off required on the
+duty trade), or restructuring the reduction so adds become stores (exclusive-bank ownership design work).
+Anomaly for the record: NODSADD's intercept ROSE 1.64→2.44 ms (wrong-C arm changes coast dynamics; do not
+interpret beyond the slope).
+
+**(2) BATCHLDS A/B (config of record + fm1, same-session):**
+
+| cell | ms/rep | ns/event |
+|---|---|---|
+| OFF record (58e965a4) | 5.566 | 60.40 |
+| BATCHLDS record (b813aa2a) | 5.554 | 60.27 |
+| OFF fm1 (6e2442c4) | 3.7185 | 40.35 |
+| BATCHLDS fm1 (6928bd43) | 3.6963 | 40.11 |
+
+Two-point fits: OFF ns/event = 20.30 + 38.24×MF; BATCHLDS = 19.95 + 38.45×MF. **b0 drop = 0.35 ns —
+far below the pre-registered ≥4 ns causality threshold. VERDICT (2): fusing the claim/peek round-trips
+(−8 static dscnt waits on the hottest coordination paths) does NOT move the fixed term.** Per the
+pre-registered decision rule: the fixed cost is NOT round-trip serialization in claim/peek; the standing
+hypothesis shifts to polling cadence/contention → the pivot is right-sizing WAVES (sweep 3–8,
+clock-normalized §81 instrument), NOT more fusion sites. WIDESLOT is NOT pursued (rule-gated). BATCHLDS
+itself is perf-neutral (−0.2%) and oracle-clean; it stays default-0 as a proven-safe arm with no earned
+adoption case. This is the FOURTH null on coordination micro-cost (guards §87, CFASSIGN §88, instruction
+economy 3-strikes, now wait-fusion) — the per-EVENT fixed cost resists every within-fabric cut tried;
+the per-SEGMENT flush cost is where the measured money is.
+
+**Method gotchas banked:** segk_fit.py requires the arm token "baseline"/"off" (etc.) in the log path —
+"base" is not matched (fed it renamed copies); its x-axis is 256/SEGK (slope units = ms per 36-n_kseg;
+divide by 36), % drops unaffected. NODSADD/NOBLOAD rows exit with oracle bad=2560 as designed — WORK-EXACT
+gate only, no chain-abort, and their TF prints (36.2/34.5/29.5 at NODSADD!) are diagnostic fictions, never
+quotable.
+
+Run logs: ~/dsws_gpu_logs/{stayfat,batchlds}_bringup_*, m_{base,stayfat,nodsadd,nobload}_s{256,128,64}_*,
+ab_{batchlds_rec,off_fm1,batchlds_fm1}_* (2026-08-09). Tree at close: canonical OFF bin restored
+(58e965a4), latch clear, zero resets across 18 dispatches, all work uncommitted per standing rule.
+
+## §90 — Product-512 via SEGK=512: +55%, model-exact. Deep-J shelved at the design gate. (2026-08-09)
+
+**Arc.** §89 named the flush as ~95% of the per-segment slope; the lever is fewer flushes = larger
+J×SEGK product. kmbandy authorized DUTY_OVERRIDE measurement cells (J=[1,2,4,8]×SEGK=[64,128,256,512]).
+Two roads were pursued; one hit a sound architectural wall, the other delivered.
+
+**Deep-J (Codex, 3 offline rounds + 1 silicon): SHELVED at the design gate.**
+- v1 implemented the carrier walk on a FALLBACK path the config of record never reaches; the live
+  self-serve path (.Lflow_da_ss_rowblk) computes one segment per reservation. J=2 silicon bring-up:
+  WORK-EXACT passed, all claim-diag clean, but oracle 320/320 bad (max_rel 1.806) — uninitialized-s91
+  TILEDONE increments. One dispatch, STOP.
+- v2 (the live-path implementation) stopped honestly at the design gate: **at POOL_N=1 the single
+  physical control slot cannot represent a J-window** — lead-CAS ownership (the only sound choice) leaves
+  follower generations absent from the coupled stage/drain protocol; supporting them = frontier-protocol
+  redesign (multi-slot or per-window ownership record + new completion rules). Argument reviewed and
+  accepted. DEEPJ_SELFSERVE_DESIGN_2026-08-09.md holds the full analysis + boundary arithmetic.
+- NEW STANDING GATE from this campaign: **proof of engagement** — any new mechanism arm needs disassembly
+  evidence (addresses) that the LIVE path reaches it, before silicon. "Assembles + oracle-clean" can both
+  hold while the feature is simply absent (the s91=1 band-aid made J>1 bins functionally J=1 — a placebo
+  sweep, caught in review).
+
+**SEGK=512 (the structural ceiling raised): DELIVERED.**
+- KSEG_STEPS ladder extended to 32 (kernel, both shift-decode ladders) + occ_dispatch flow whitelist
+  gained 512 + host rebuild (2-line diff, audited). Old ceiling was structural (KSEG_STEPS ∈ {1..16}),
+  discovered only when DUTY_OVERRIDE got past DUTYGUARD.
+- Bring-up (bin 45288f12, .text 33784, LDS 34304 unchanged): full-stride oracle 320/320 bad=0 max_rel=0.
+- Perf cell (190 reps, stride-8 oracle clean, WORK-EXACT 8755200): **3.5915 ms/rep, TF=26.9** vs config
+  of record 5.566 ms / 17.4 TF = **+55%**. The §89 baseline fit extrapolated to n_kseg=18 predicts
+  3.61 ms — **measured within 0.6%**. The flush-division model is validated out-of-range.
+- Duty status: this ran under kmbandy's explicit DUTY_OVERRIDE authorization for measurement cells.
+  **Config of record UNCHANGED (SEGK=256, DUTY_KMAX=256)** — promoting 512 is kmbandy's architectural
+  decision (it doubles time-at-peak; the stagger side of the trade remains unmeasured — see the
+  invariant block at occ_kernel_dsws_flow.s:270).
+- Extrapolation on the table: n_kseg=9 (SEGK=1024, KSEG_STEPS=64) predicts ~2.63 ms ≈ 37 TF — the
+  measured flush-free floor. Each further doubling halves the remaining flush term. Where the linear
+  model breaks is the next experiment.
+
+**Process notes:** one background bring-up was killed by the harness 10-min timeout during host oracle
+verify under CPU contention (DS4 spine) — GPU work had completed cleanly; re-run when load dropped
+(board_check cpu.load FIRST, the 08-08 lesson). Codex accidentally invoked occ_dispatch --help off-claim
+(no GPU harm, journal clean) — future handoffs bar Codex from invoking occ_dispatch in ANY form.
+Codex once refused on llama.cpp AGENTS.md grounds — that doc exempts private forks; resolved.
+
+Run logs: segk512_bringup3_*, m_segk512_j1_*, deepj2_bringup_084319 (2026-08-09). Bins: SEGK=512
+45288f12 (rebuildable: DUTY_OVERRIDE=1 DSWS_ALLOW_NONSTD=1 SEGK=512), deep-J J=2 600c5661 (shelved).
+Tree at close: canonical 58e965a4 restored, latch clear, zero resets, all work uncommitted.

@@ -249,6 +249,14 @@
     .set NOBLOAD, 0      // PERF PROBE ONLY: 1 = drop the carry-through B operand fetch (see the
 .endif                   //   NOBLOAD banner in the SS burst). C becomes WRONG -> oracle MUST fail. span/TF only.
 .ifndef NODSADD
+    .set BATCHLDS, 0     // FUSE INDEPENDENT LDS READS INTO ONE WAIT (2026-08-08): replaces N serialized
+                         //   lds_get round-trips (each with its own s_wait_dscnt 0x0) with N ds_load_b32
+                         //   back-to-back + ONE wait. Pure wait-deferral -> correctness-preserving.
+                         //   Targets the §87 LEANGUARD conclusion: the 20.8 ns/event fixed term is LDS
+                         //   round-trip latency, not instruction issue. Oracle-valid; gate on full oracle.
+    .set WIDESLOT, 0     // v2 (2026-08-08): single ds_load_b128 of the 32B slot control block (STI/GEN/RBNEXT/RBDONE)
+                         //   in ONE wait. Needs BATCHLDS. Uses v15 (RM_A) as addr; read RBNEXT out of v13
+                         //   BEFORE the claim CAS clobbers v13. See LDS_ROUNDTRIP_BATCHING_DESIGN.md §2.
     .set NODSADD, 0      // PERF PROBE ONLY (2026-07-20, N4): 1 = drop the ds_add_f32 split-K LDS bank reduction
 .endif                   //   (FM*FN*8 ds_add_f32/burst) but KEEP all bookkeeping/handshake/WMMA. Isolates the
                          //   INTRINSIC LDS-reduction cost from the offloadable stamp/drain/TILEDONE handshakes.
@@ -376,7 +384,7 @@
                                                  //   30-wave/2*ACC_N cap (G>15). Tests whether more compute BREADTH lifts
                                                  //   TF past the 37-TF G=15 ceiling. Liveness (no stage-starve) is
                                                  //   EMPIRICAL -- a GRELAX build MUST pass a supervised bring-up before trust.
-.if JDEPTH > 1
+.if JDEPTH > 1 && !(SELFSERVE && DECENTASN)
   .if STAGGER && !BATONGATE
     .if WAVES < (MAXFAT_EFF + STAGERS)
       .error "JDEPTH>1 + STAGGER needs WAVES >= MAXFAT_EFF + STAGERS: only MAXFAT_EFF waves can be fat at once, but at least STAGERS lean waves must remain to stage their next segment. Lower MAXFAT, lower STAGERS, or raise WAVES."
@@ -435,6 +443,9 @@
 .ifndef DYNVGPR
     .set DYNVGPR, 1                         // 1 = compute waves s_alloc_vgpr-grow per rowblk; feeds/claimer stay lean 32
 .endif
+.ifndef SEGK_STAYFAT
+    .set SEGK_STAYFAT, 0                    // C1 measurement arm: keep a compute wave fat across consecutive bursts
+.endif                                      //   until it has no work. Default 0 is byte-identical.
 .ifndef SLEEPN
     .set SLEEPN, 2                          // s_sleep arg in the busy-waits (yield issue cycles to partner waves)
 .endif
@@ -632,6 +643,8 @@
   .set NKSEG_SHIFT, 3
 .elseif KSEG_STEPS == 16
   .set NKSEG_SHIFT, 4
+.elseif KSEG_STEPS == 32
+  .set NKSEG_SHIFT, 5
 .else
   .error "KSEG_STEPS (SEGK/16) must be a power of two in {1,2,4,8,16}"
 .endif
@@ -971,7 +984,7 @@
 .if DECENTASN && (DSWS2_STATE_END > GSTORED_OFF)
   .error "DA_ZDONE/GSTORED collide with DSWS2 Phase-B state (SNAP/QUIESCE/OCC_PUB) -- raise OP_BASE (and kOpBase)"
 .endif
-.if DECENTASN && (JDEPTH > 1) && ((POOL_N / JDEPTH) * JDEPTH != POOL_N)
+.if DECENTASN && (JDEPTH > 1) && !SELFSERVE && ((POOL_N / JDEPTH) * JDEPTH != POOL_N)
   .error "DECENTASN deep-J requires POOL_N % JDEPTH == 0: else a physical slot maps to generations of DIFFERENT ksi%J (lead-ness), so a lead-gate that passed pre-CAS can be fooled by an ABA recycle to a non-lead generation (Codex D1 variant). Set POOL_N to a multiple of JDEPTH (JDEPTH<=POOL_N already required)."
 .endif
 .set OPSTRIDE,      (BRES_BYTES + ARES_BYTES)    // 4096 + 12288 = 16384 per slot
@@ -1358,14 +1371,26 @@
                                                  //   the stagger/traveling-peak engine engages. Ring stays as opportunistic fast-path.
                                                  //   0 = byte-identical (all body gated .if SELFSERVE). Needs BANKZERO=1 (shared-bank
                                                  //   ds_add is the merge) + JDEPTH=1 (v1 scope). Enable: DECENTASN=1 for the claim path.
+.ifndef LEANGUARD
+    .set LEANGUARD, 0
+.endif
+.ifndef GUARDHOIST
+    .set GUARDHOIST, 0
+.endif
+.ifndef LEANMARSH
+    .set LEANMARSH, 0
+.endif
+.if LEANMARSH && TRACE
+  .error "LEANMARSH requires TRACE=0: resident v15 is a trace scratch register"
+.endif
 .if SELFSERVE && KMAJOR
   .error "SELFSERVE requires KMAJOR=0: carry-through builds a tile-major sti before DECODE_STI."
 .endif
 .if SELFSERVE && !DECENTASN
   .error "SELFSERVE requires DECENTASN=1: the assigning wave carries its existing reservation through compute."
 .endif
-.if SELFSERVE && (JDEPTH != 1)
-  .error "SELFSERVE requires JDEPTH=1."
+.if SELFSERVE && DECENTASN && (JDEPTH > 1) && (POOL_N != 1)
+  .error "SELFSERVE deep-J requires POOL_N=1: the serial lead window keeps one physical slot pinned until the single flush."
 .endif
 .if SELFSERVE && !BANKZERO
   .error "SELFSERVE requires BANKZERO=1 for concurrent ds_add_f32 reduction."
@@ -1629,6 +1654,7 @@
   .set RP_A, 28
   .set RP_D, 29
 .endif
+.set RM_A, 15
 
 // ============================================================================================
 // LDS helper macros (s49 = exec save; v2 = lane = tid&31, set in prologue).
@@ -1647,14 +1673,48 @@
 .endm
 .macro lds_put off, ssrc                      // lane-0-of-wave writes scalar ssrc -> LDS[off]
     s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lput_skip\@
+.endif
+.if LEANMARSH && (\off == DRAIN_HEAD_OFF)
+    v_mov_b32 v[RP_D], \ssrc
+    ds_store_b32 v[RM_A], v[RP_D]
+.else
     v_mov_b32 v[RP_A], \off
     v_mov_b32 v[RP_D], \ssrc
     ds_store_b32 v[RP_A], v[RP_D]
+.endif
     s_wait_dscnt 0x0
 .Lput_skip\@:
+    s_mov_b32 exec_lo, s49
+.endm
+.macro lds_put_nog off, ssrc
+.if LEANMARSH && (\off == DRAIN_HEAD_OFF)
+    v_mov_b32 v[RP_D], \ssrc
+    ds_store_b32 v[RM_A], v[RP_D]
+.else
+    v_mov_b32 v[RP_A], \off
+    v_mov_b32 v[RP_D], \ssrc
+    ds_store_b32 v[RP_A], v[RP_D]
+.endif
+    s_wait_dscnt 0x0
+.endm
+.macro lds_run_begin skip
+    s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
+    v_cmp_eq_u32 vcc_lo, 0, v2
+    s_and_b32 exec_lo, exec_lo, vcc_lo
+    s_cbranch_execz \skip
+.endif
+.endm
+.macro lds_run_end skip
+\skip:
     s_mov_b32 exec_lo, s49
 .endm
 .macro lds_fetch_add sdst, off, val          // sdst <- old LDS[off]; LDS[off]+=val (lane-0 atomic, broadcast)
@@ -1682,9 +1742,13 @@
 .endm
 .macro lds_inc off                            // lane-0-of-wave LDS[off] += 1 (no return)
     s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Linc_skip\@
+.endif
     v_mov_b32 v[RP_A], \off
     v_mov_b32 v[RP_D], 1
     ds_add_u32 v[RP_A], v[RP_D]
@@ -1719,9 +1783,13 @@
 .endm
 .macro lds_inc_r saddr                        // lane-0-of-wave LDS[saddr] += 1 (RUNTIME addr, no return)
     s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lincr_skip\@
+.endif
     v_mov_b32 v[RP_A], \saddr
     v_mov_b32 v[RP_D], 1
     ds_add_u32 v[RP_A], v[RP_D]
@@ -1798,8 +1866,20 @@
     //   maxed RBDONE) AND this walk is what drains the pre-completed terminal sentinel (RBDONE==ACC_N,
     //   no computer) -- so it is also invoked from the terminal drain-watch.
 .Ldadv\@:
+    // BATCHLDS (2026-08-08): fuse the two independent frontier reads (DRAIN_HEAD / STAGE_HEAD).
+    //   Only the s20/s21 pair is fused; the SL_GEN/SL_RBDONE gate below is dependency-ordered and
+    //   correctness-critical (DRAIN must never pass an unflushed segment) so it is LEFT serialized.
+.if BATCHLDS
+    v_mov_b32 v[RG_D], 0
+    ds_load_b32 v11, v[RG_D] offset:DRAIN_HEAD_OFF
+    ds_load_b32 v12, v[RG_D] offset:STAGE_HEAD_OFF
+    s_wait_dscnt 0x0
+    v_readfirstlane_b32 s20, v11
+    v_readfirstlane_b32 s21, v12
+.else
     lds_get s20, DRAIN_HEAD_OFF
     lds_get s21, STAGE_HEAD_OFF
+.endif
     s_cmp_ge_u32 s20, s21
     s_cbranch_scc1 .Ldadv_end\@                 // nothing staged -> nothing to drain
     slot_of s22, s20, s23
@@ -2039,9 +2119,13 @@
 .if !(DSWS2_CONV || DSWS2_ENVELOPE)
 .macro lds_put_r saddr, ssrc                  // lane-0 write ssrc -> LDS[saddr] (RUNTIME addr)
     s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lputr_skip\@
+.endif
     v_mov_b32 v[RP_A], \saddr
     v_mov_b32 v[RP_D], \ssrc
     ds_store_b32 v[RP_A], v[RP_D]
@@ -2636,9 +2720,13 @@
 //   pre-grow safe); s49 is the exec save (matches lds_put).
 .macro lds_put_r saddr, ssrc
     s_mov_b32 s49, exec_lo
+.if LEANGUARD
+    s_mov_b32 exec_lo, 1
+.else
     v_cmp_eq_u32 vcc_lo, 0, v2
     s_and_b32 exec_lo, exec_lo, vcc_lo
     s_cbranch_execz .Lputr_skip\@
+.endif
     v_mov_b32 v[RP_A], \saddr
     v_mov_b32 v[RP_D], \ssrc
     ds_store_b32 v[RP_A], v[RP_D]
@@ -4537,6 +4625,9 @@ occ_kernel:
     // ---- identity (lifted from coop prologue; v0=tid hardware-preloaded) ----
     v_lshrrev_b32 v1, 5, v0                  // wid  = tid >> 5
     v_and_b32     v2, 31, v0                 // lane = tid & 31
+.if LEANMARSH
+    v_mov_b32 v[RM_A], DRAIN_HEAD_OFF
+.endif
     v_and_b32     v6, 15, v0                 // lane & 15 (A vaddr)
     v_mov_b32     v4, 0
     cnt_zero                                 // STAGINSTR: zero this wave's private SGPR counters (s84..s89)
@@ -4984,6 +5075,9 @@ occ_kernel:
 .Lflow_shrink:
     s_alloc_vgpr 32
     s_cbranch_scc0 .Lflow_shrink
+.if SEGK_STAYFAT
+    s_mov_b32 s50, 0                        // next compute role must perform its first grow
+.endif
 .Lflow_resized:
 .endif
     s_mov_b32 s34, s35                            // cur_role = role
@@ -5185,11 +5279,21 @@ occ_kernel:
     // PER-BURST GROW: trapezoid peak starts here (fat through WMMA+ds_add, lean otherwise). COAST-ON-FAIL
     //   is the floodgate: if the SIMD VGPR budget is full, grow SCC0 -> coast lean, committing NO claim.
 .if DYNVGPR
+.if SEGK_STAYFAT
+    s_cmp_eq_u32 s50, 1
+    s_cbranch_scc1 .Lflow_stayfat
+.endif
     s_alloc_vgpr NFV
     s_cbranch_scc0 .Lflow_growfail
+.if SEGK_STAYFAT
+    s_mov_b32 s50, 1                        // compute wave is now fat; reuse it on the next burst
+.endif
     duty_grow                                    // *** PEAK START (SALU + RTC only -- no VGPR, no store) ***
     fat_inc                                      // grow-success: ++peak-concurrent fat gauge (STAGINSTR)
     phase_stamp s80                              // PH_GROW (SALU-only -> safe next to s_alloc_vgpr)
+.if SEGK_STAYFAT
+.Lflow_stayfat:
+.endif
 .endif
 .if DECENTASN
     // POST-GROW SLOT RE-DERIVATION (perf only; correctness comes from the POISON-UNTIL-STAGED CLAIM below).
@@ -5199,8 +5303,17 @@ occ_kernel:
     //   via the no-claim shrink+release path instead of loading a slot it will only coast on. It does NOT
     //   affect correctness -- the poison CAS makes any stale/reused slot un-claimable regardless.
     //   ASSUMES head-pinned compute (MSSCAN=0); guarded at the top of the file.
+.if BATCHLDS
+    v_mov_b32 v[RG_D], 0
+    ds_load_b32 v11, v[RG_D] offset:DRAIN_HEAD_OFF
+    ds_load_b32 v12, v[RG_D] offset:STAGE_HEAD_OFF
+    s_wait_dscnt 0x0
+    v_readfirstlane_b32 s46, v11                  // fresh dh (post-grow) -- overrides the pre-grow read
+    v_readfirstlane_b32 s44, v12                  // fresh sh
+.else
     lds_get s46, DRAIN_HEAD_OFF                   // fresh dh (post-grow) -- overrides the pre-grow read
     lds_get s44, STAGE_HEAD_OFF                   // fresh sh
+.endif
     s_cmp_ge_u32 s46, s44                          // caught up during the grow? (DRAIN >= STAGE = nothing staged)
     s_cbranch_scc1 .Lflow_cmp_tryadv              // -> fat_dec + shrink-to-lean + fat_release + loop (NO claim made)
     slot_of s45, s46, s47                          // slot = dh mod SLOT_N   (fresh)
@@ -5230,8 +5343,26 @@ occ_kernel:
     //   an obligation is a WON CAS(x -> x+1) with x<ACC_N -- and pending==clear proves the slot is fully
     //   staged and armed, so the operands are valid and there is no straddle (ABA-safe: reuse re-writes
     //   RB_PENDING first, so a stale low-x CAS can't succeed on an unstaged occupant). s33 = k = rowblk.
-    s_add_u32 s45, s48, SL_RBNEXT
+    s_add_u32 s45, s48, SL_RBNEXT                 // keep s45 = &SL_RBNEXT for the CAS target below
+.if BATCHLDS && WIDESLOT
+    // WIDESLOT: one ds_load_b128 returns STI/GEN/RBNEXT/RBDONE in ONE wait. v15 (RM_A) = addr (free here).
+    v_mov_b32 v[RM_A], s48                        // addr = &slot[0] (32B aligned -> b128-safe)
+    ds_load_b128 v[11:14], v[RM_A]
+    s_wait_dscnt 0x0
+    v_readfirstlane_b32 s17, v11                   // gsti
+    v_readfirstlane_b32 s33, v13                   // x = SL_RBNEXT
+.elseif BATCHLDS
+    // BATCHLDS: read SL_RBNEXT + SL_STI in ONE round-trip. STI is independent of the claim CAS, so
+    //   pre-load it now and drop the post-CAS SL_STI re-read. v14=addr, v11/v12=data (interior, <=v15).
+    v_mov_b32 v[RG_D], s48
+    ds_load_b32 v11, v[RG_D] offset:SL_STI        // STI  -> v11
+    ds_load_b32 v12, v[RG_D] offset:SL_RBNEXT     // x    -> v12
+    s_wait_dscnt 0x0
+    v_readfirstlane_b32 s17, v11                   // gsti (stable: slot pinned by the pending/claim protocol)
+    v_readfirstlane_b32 s33, v12                   // x = SL_RBNEXT
+.else
     lds_get_r s33, s45                            // x = current SL_RBNEXT state
+.endif
     s_and_b32 s47, s33, RB_PENDING
     s_cmp_lg_u32 s47, 0
     s_cbranch_scc1 .Lflow_cmp_tryadv              // UNSTAGED (pending bit set) -> coast, NO claim, NO wait
@@ -5254,8 +5385,12 @@ occ_kernel:
     //   now that the inflight pin is retired. (Persistence diag removed: with no inflight field it would always
     //   read inflight==0 and false-fire; occ[96]/CLAIM_NOPERSIST is kept defined and prints 0.)
     s_and_b32 s33, s33, NEXT_MASK                  // s33 = k = rowblk index (0..ACC_N-1)
+.if BATCHLDS
+    // (STI already read into s17 at the top of the claim -- no SL_STI re-read round-trip.)
+.else
     s_add_u32 s45, s48, SL_STI
     lds_get_r s17, s45                             // gsti of the CLAIMED occupant (stable: pinned by the claim)
+.endif
 .else
     s_add_u32 s45, s48, SL_RBNEXT
     lds_fetch_add_r s33, s45, 1                  // claim LOCAL rowblk (0..ACC_N-1) within this group
@@ -5310,6 +5445,10 @@ occ_kernel:
 .if !(SELFSERVE || DSWS2_OVERLAP)
     s_mul_i32 s52, s45, OPSTRIDE
     s_add_u32 s52, s52, OP_BASE                  // sob for THIS segment's slot
+.endif
+.if SELFSERVE && DECENTASN && (JDEPTH > 1)
+    // The lead slot stays pinned. Later ksi are self-loaded directly and do not consume ring slots.
+    s_and_b32 s31, s46, s67                       // ksi = cursor modulo the field width
 .endif
 .endif
 .if SELFSERVE || DSWS2_OVERLAP
@@ -5427,6 +5566,8 @@ occ_kernel:
                                                   //   here, which is fine (no VGPR write -- see the cnt_inc banner).
 .if JDEPTH > 1
     s_add_u32 s91, s91, 1
+    s_cmp_eq_u32 s31, s66
+    s_cbranch_scc1 .Lflow_jdone                  // short final window at a non-dividing tail
     s_cmp_ge_u32 s91, JDEPTH
     s_cbranch_scc1 .Lflow_jdone                  // *** LAST segment of the group: fall through to the flush and let
                                                   //   the SHARED post-flush path settle its RBDONE/DRAIN. ***
@@ -5440,6 +5581,7 @@ occ_kernel:
     // ---- mid-group segment: safe to retire the slot NOW (its operands are consumed, and it is not the
     //   tile's last segment, so no bank-zero gate can trip). This is what keeps J's LDS cost at ZERO:
     //   we never hold J slots resident -- we hold J segments' worth of SUM in the register file.
+.if !(SELFSERVE && DECENTASN)
     cnt_inc CNT_COMP
     deadman_progress                             // a J-segment was computed -> this carrier is ALIVE AND WORKING
     s_add_u32 s45, s48, SL_RBDONE
@@ -5449,8 +5591,15 @@ occ_kernel:
     s_cbranch_scc1 .Lflow_jnext                  // not the last rowblk in this slot -> nothing to drain
     drain_advance                                // (was an unconditional DRAIN++ -- under MULTISLOT slots can
                                                  //  complete OUT OF ORDER, so this must WALK. See the banner.)
+.else
+    cnt_inc CNT_COMP
+    deadman_progress                             // ACC stays live; publish completion only after the final flush
+.endif
 .Lflow_jnext:
     s_add_u32 s46, s46, 1                        // cursor++ -> the next ksi of this same tile
+.if SELFSERVE && DECENTASN
+    s_branch .Lflow_jloop                       // pinned lead window: no STAGE/DRAIN wait
+.else
 .Lflow_jwait:
     cnt_inc CNT_JWAIT                            // *** THE INVISIBLE STALL: FAT, ACC LIVE, starved. SALU-only. ***
     deadman_check_fat                            // *** was a bare deadman_check -> branched to .Lflow_retire ("ACC dead, wave
@@ -5472,6 +5621,7 @@ occ_kernel:
     s_cbranch_scc1 .Lflow_jloop                  // staged -> compute the next segment into the SAME ACC
     s_sleep 1
     s_branch .Lflow_jwait
+.endif
 .Lflow_jdone:
 .endif
 .if WOFLUSH
@@ -5563,6 +5713,10 @@ occ_kernel:
     //   the slot. This is the pin's old job, done by RBDONE. (REL_IMBAL/occ[97] retired; host still prints 0.)
 .endif
 .if DYNVGPR
+.if SEGK_STAYFAT
+    s_cmp_eq_u32 s50, 1
+    s_cbranch_scc1 .Lflow_da_ss_complete      // C1: defer shrink until the wave has no next burst
+.endif
     fat_dec                                       // burst end: --live fat gauge (STAGINSTR) before the shrink
 .if RELSTART
     fat_release                                   // *** THE BATON *** (RELSTART=1): return peak-budget to the pool AT
@@ -5601,6 +5755,9 @@ occ_kernel:
     s_cbranch_scc0 .Lflow_bshrink
     duty_shrink                                   // *** PEAK END ***
     phase_stamp s83                              // PH_SHRINK (SALU-only -> safe next to s_alloc_vgpr)
+.if SEGK_STAYFAT
+    s_mov_b32 s50, 0
+.endif
 .if !RELSTART
     fat_release                                   // RELSTART=0: pristine -- release at shrink-END (the original position)
 .endif
@@ -5622,11 +5779,15 @@ occ_kernel:
     s_mov_b32 s43, 0
 .endif
     s_add_u32 s43, s43, TILEDONE_BASE
+.if (SELFSERVE && DECENTASN) && (JDEPTH > 1)
+    lds_fetch_add_r s51, s43, s91                 // tail-safe: this flush covers the actual window length
+.else
     lds_fetch_add_r s51, s43, JDEPTH              // s51 = old TILEDONE[group].  J segments landed in ONE flush,
                                                   //   so this wave closes JDEPTH of the tile's segments at once.
                                                   //   Bumped AFTER the flush (not per-segment) so TILEDONE can never
                                                   //   reach its target while a carrier's ACC is still unflushed --
                                                   //   that would fire the C-store on half-summed banks.
+.endif
 .if GROUPS > 1
     // ROBUST first-crosser election (old < target <= old+JDEPTH). WAS exact-equality (new==target), which
     //   FIRED NEVER on any TILEDONE overshoot -> the whole group's C-store was DROPPED (measured GROUPS=3:
@@ -5637,12 +5798,20 @@ occ_kernel:
     s_mul_i32 s43, s43, ACC_N                     // target = n_kseg * ACC_N
     s_cmp_lt_u32 s51, s43                          // old < target ? (no -> a prior flush already owned it)
     s_cbranch_scc0 .Lflow_notcloser
+.if (SELFSERVE && DECENTASN) && (JDEPTH > 1)
+    s_add_u32 s51, s51, s91                      // new = old + actual window length
+.else
     s_add_u32 s51, s51, JDEPTH                    // new = old + JDEPTH
+.endif
     s_cmp_ge_u32 s51, s43                          // new >= target ? -> I crossed it, I own the C-store
     s_cbranch_scc1 .Lflow_cstore
 .Lflow_notcloser:
 .else
+.if (SELFSERVE && DECENTASN) && (JDEPTH > 1)
+    s_add_u32 s51, s51, s91                       // tail-safe window completion
+.else
     s_add_u32 s51, s51, JDEPTH                    // GROUPS=1: byte-identical original order (s_add before target calc)
+.endif
     s_add_u32 s43, s66, 1                         // n_kseg = (n_kseg-1)+1   (s66 = COUNT; mask would be WRONG at non-pow2 K)
     s_mul_i32 s43, s43, ACC_N                     // target = n_kseg * ACC_N
     s_cmp_eq_u32 s51, s43
@@ -5777,6 +5946,9 @@ occ_kernel:
     s_alloc_vgpr 32                               // grew but rowblks exhausted (no claim) -> shrink back lean
     s_cbranch_scc0 .Lflow_tashrink
     duty_shrink                                   // *** PEAK END (grew-but-exhausted still held the registers) ***
+.if SEGK_STAYFAT
+    s_mov_b32 s50, 0
+.endif
     phase_stamp s83                              // PH_SHRINK: this shrink had NO stamp (2026-07-13) -- the whole
                                                   //   grew-but-exhausted round-trip leaked into PH_FOLLOW on the next
                                                   //   iteration, inflating the exact number we are trying to drive down.
@@ -5914,7 +6086,7 @@ occ_kernel:
     //   no phantoms, 2^shift == n_kseg). The pow2 fail-safe that used to sit here is therefore obsolete.
     s_cmp_eq_u32 s66, 0                             // n_kseg == 1 (COUNT==0)? -> the bit-0 ZLOCK needs n_kseg>=2
     s_cbranch_scc1 .Lflow_da_terminal             //   n_kseg==1 -> fail SAFE (degenerate: no split-K to decentralize)
-.if JDEPTH > 1
+.if JDEPTH > 1 && !(SELFSERVE && DECENTASN)
     // *** Codex D1 residual: a deep-J carrier's J-window (J consecutive ksi) must fit WITHIN a group of n_kseg
     //   segments. If JDEPTH does not divide n_kseg (incl. JDEPTH > n_kseg), a window straddles a group boundary
     //   and the carrier waits for the NEXT group's segments -- which the DA_ZDONE/GSTORED gate won't open until
@@ -5981,12 +6153,31 @@ occ_kernel:
 .else
     s_cmp_ge_u32 s48, 8
     s_cbranch_scc1 .Lflow_feedmt_sleep            // too contended -> bail to help (hold NOTHING; retry next loop)
+    // BATCHLDS (2026-08-08): fuse the three frontier reads (DA_ZDONE / ASSIGN / DRAIN) into ONE LDS
+    //   round-trip. This is THE hottest path (stage-5 da_peek = ~30% of wave-time, 07-26 findings) and the
+    //   three reads are fully independent -- 3 serialized s_wait_dscnt become 1. Same values; the ZLOCK
+    //   check just moves after the (now single) wait, and on the boundary-bail branch s44/s45 are dead.
+    //   Loading all three from the SAME instant is also strictly MORE consistent (no torn frontier).
+.if BATCHLDS
+    v_mov_b32 v[RG_D], 0
+    ds_load_b32 v11, v[RG_D] offset:DA_ZDONE_OFF   // z
+    ds_load_b32 v12, v[RG_D] offset:ASSIGN_HEAD_OFF// r = ASSIGN
+    ds_load_b32 v13, v[RG_D] offset:DRAIN_HEAD_OFF // d = DRAIN
+    s_wait_dscnt 0x0
+    v_readfirstlane_b32 s51, v11                   // z (top bit ZLOCK = a wave is handling a boundary)
+    v_readfirstlane_b32 s44, v12                   // r = ASSIGN
+    v_readfirstlane_b32 s45, v13                   // d = DRAIN
+    s_and_b32 s47, s51, ZLOCK
+    s_cmp_lg_u32 s47, 0
+    s_cbranch_scc1 .Lflow_feedmt_sleep            // a wave is handling a group/tile boundary -> bail (retry next loop)
+.else
     lds_get s51, DA_ZDONE_OFF                       // z (top bit ZLOCK = a wave is handling a boundary)
     s_and_b32 s47, s51, ZLOCK
     s_cmp_lg_u32 s47, 0
     s_cbranch_scc1 .Lflow_feedmt_sleep            // a wave is handling a group/tile boundary -> bail (retry next loop)
     lds_get s44, ASSIGN_HEAD_OFF                   // r = ASSIGN
     lds_get s45, DRAIN_HEAD_OFF                    // d = DRAIN
+.endif
     s_cmp_ge_u32 s44, s51                           // r >= DA_ZDONE -> at a group/tile boundary (banks not zeroed past here)
     s_cbranch_scc1 .Lflow_da_boundary
     // PHANTOM-FREE POOL (2026-07-21): the ksi field is 2^shift wide but only n_kseg values are REAL. Stop
@@ -6017,7 +6208,11 @@ occ_kernel:
 .Lflow_da_realidx:
     s_sub_u32 s47, s44, s45                          // r - d
 .if SELFSERVE
+.if DECENTASN && (JDEPTH > 1)
+    s_cmp_ge_u32 s47, 1                         // deep-J pins the sole physical slot until its final flush
+.else
     s_cmp_ge_u32 s47, SSWIN
+.endif
 .else
     s_cmp_ge_u32 s47, POOL_N
 .endif
@@ -6311,22 +6506,45 @@ occ_kernel:
     // RE-BASE past the phantom gap: reservations stopped at base+n_kseg, the next field starts at z (s51).
     //   Safe here and ONLY here: we hold ZLOCK and the drain-gate above proved DRAIN>=ASSIGN (quiesced).
     //   MUST precede the DA_ZDONE store, which is what releases ZLOCK.
+.if GUARDHOIST
+    lds_run_begin .Lda_run_skip
+.endif
 .if CFASSIGN
+ .if GUARDHOIST
+    lds_put_nog DRAIN_HEAD_OFF,  s51
+    lds_put_nog STAGE_HEAD_OFF,  s51
+ .else
     lds_put DRAIN_HEAD_OFF,  s51
     lds_put STAGE_HEAD_OFF,  s51
+ .endif
     s_add_u32 s46, s67, 1                            // field width
     s_add_u32 s45, s51, s46                          // z for the next group
+ .if GUARDHOIST
+    lds_put_nog ASSIGN_HEAD_OFF, s45
+ .else
     lds_put ASSIGN_HEAD_OFF, s45                      // ASSIGN=z completion target before release
+ .endif
 .else
+ .if GUARDHOIST
+    lds_put_nog ASSIGN_HEAD_OFF, s51
+    lds_put_nog DRAIN_HEAD_OFF,  s51
+    lds_put_nog STAGE_HEAD_OFF,  s51
+ .else
     lds_put ASSIGN_HEAD_OFF, s51
     lds_put DRAIN_HEAD_OFF,  s51
     lds_put STAGE_HEAD_OFF,  s51
+ .endif
 .endif
 .if !CFASSIGN
     s_add_u32 s46, s67, 1                            // 2^shift = mask+1  (ksi FIELD width)
     s_add_u32 s45, s51, s46                          // z + 2^shift  (s51 is clean z -> top bit clears)
 .endif
+.if GUARDHOIST
+    lds_put_nog DA_ZDONE_OFF, s45
+    lds_run_end .Lda_run_skip
+.else
     lds_put DA_ZDONE_OFF, s45                        // advance (release) -> this group's ksi now reservable
+.endif
     advprobe_end                                  // sampled successful GROUP critical section
     bnd_bump BND_GRP_OFF                             // BNDPROBE: one GROUP advance (SCC dead: branch follows)
 .if DSWS2_WTBUDGET
@@ -7176,6 +7394,11 @@ occ_kernel:
     // The slot was pre-completed before compute. Seed the shared post-compute path as if its RBDONE increment
     // had returned ACC_N-1; it then performs the final TILEDONE bump, elects/stores C once, and drains normally.
     s_mov_b32 s47, (ACC_N - 1)
+.if SELFSERVE && DECENTASN && (JDEPTH > 1)
+    // This carry-through arm flushes one reservation, not a J-window. The shared completer
+    // uses s91 as the number of segments landed in that flush.
+    s_mov_b32 s91, 1
+.endif
     pollstage_leave 7                                // STAGE 7 end: burst done, rejoining at :5561
     pollstage_leave 8                                // STAGE 8 end: same exit, grow excluded
     s_branch .Lflow_da_ss_complete
@@ -7459,6 +7682,8 @@ occ_kernel:
   .set PF_KS_SHIFT, 3
 .elseif KSEG_STEPS == 16
   .set PF_KS_SHIFT, 4
+.elseif KSEG_STEPS == 32
+  .set PF_KS_SHIFT, 5
 .else
   .error "DSWS2_PREFETCH P2: unsupported KSEG_STEPS for shift decode"
 .endif
