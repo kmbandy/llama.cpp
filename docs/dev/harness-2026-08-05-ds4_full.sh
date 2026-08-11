@@ -6,6 +6,10 @@
 # command strings locally instead. Same call shape, so every former call site is
 # unchanged apart from the name.
 main_sh() { bash -c "$1"; }
+# The 1070/RX480 workers live on mad-lab-2026. This harness runs on main, so
+# they are reached over ssh (main -> 2026 works; it is only main -> main that
+# does not). Same call shape as main_sh.
+w2026_sh() { ssh -o BatchMode=yes mad-lab-2026 "$1"; }
 # DS4-Flash-0731-DSpark on the FULL cross-machine expert-dispatch layout.
 # Derived from stage7.sh (which drove GLM-5.2); only the model paths, the 2026
 # build dir, and the slot budgets change.
@@ -28,6 +32,8 @@ set -uo pipefail
 # SAME harness script. That is the only way to compare binaries across commits
 # without also changing the harness, which has itself changed a lot today.
 MAIN_REPO=${MAIN_REPO:-/home/kmbandy/GitHub/llama.cpp}
+# repo path on mad-lab-2026 (same layout); used for the ssh'd worker launch
+REPO_2026=${REPO_2026:-/home/kmbandy/GitHub/llama.cpp}
 ES_MAIN=/home/kmbandy/models/DS4-eshard-main
 ES_2026=/mnt/nvme/models/DS4-eshard
 # 2026-08-02: the experts-0..84 shard carved by layer, so the DSpark stages
@@ -635,7 +641,7 @@ if [ -n "$DSPARK_SPLIT" ]; then
     echo "    every GPU worker falls back to layers 0..42 (trunk manifests)"
 fi
 
-mkdir -p "$OUT"; main_sh "mkdir -p $OUT"
+mkdir -p "$OUT"; main_sh "mkdir -p $OUT"; w2026_sh "mkdir -p $OUT"
 # DELETE LAST ARM'S WORKER LOGS BEFORE ANYTHING LAUNCHES.
 #
 # The readiness gate greps these for "expert worker listening", and the worker
@@ -645,7 +651,7 @@ mkdir -p "$OUT"; main_sh "mkdir -p $OUT"
 # is exactly the "connect to <ip>:8803 failed" that cost four arms. Removing them
 # up front makes the gate's evidence unambiguous: the line can only come from
 # this run.
-rm -f "$OUT"/w-*.log; main_sh "rm -f $OUT/w-*.log"
+rm -f "$OUT"/w-*.log; main_sh "rm -f $OUT/w-*.log"; w2026_sh "rm -f $OUT/w-*.log"
 
 # WAIT FOR THE WORKER PORTS TO BE **FREE** BEFORE LAUNCHING ANYTHING.
 #
@@ -664,7 +670,7 @@ for _ in $(seq 1 120); do
         [ "${n:-0}" -ge 1 ] && busy=1
     done
     for prt in 8803 8804 8805; do
-        [ "$(ss -ltn 2>/dev/null | grep -c ":$prt ")" -ge 1 ] && busy=1
+        [ "$(w2026_sh "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)" -ge 1 ] && busy=1
     done
     [ "$busy" -eq 0 ] && break
     sleep 1
@@ -672,6 +678,7 @@ done
 [ "$busy" -eq 0 ] || { echo "*** WORKER PORTS STILL HELD after 120s -- aborting arm ***"; exit 1; }
 echo "  ports clear"
 LOCAL_PIDS=""
+REMOTE_2026_PIDS=""
 
 remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
     [ -z "${1:-}" ] && return
@@ -683,11 +690,13 @@ remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
 cleanup() {
     echo; echo "=== stopping ==="
     for p in $LOCAL_PIDS; do kill -INT "$p" 2>/dev/null; done
+    for p in $REMOTE_2026_PIDS; do w2026_sh "kill -INT $p" 2>/dev/null; done
     remote_kill "${SPINE_PID:-}"
     remote_kill "${MAIN_PID:-}"
     remote_kill "${DSPARK_PID:-}"
     sleep 4
     for p in $LOCAL_PIDS; do kill -9 "$p" 2>/dev/null; done
+    for p in $REMOTE_2026_PIDS; do w2026_sh "kill -9 $p" 2>/dev/null; done
     echo "  verifying nothing leaked:"
     main_sh "ss -ltn | grep -E ':8095 |:8801 |:8802 '" 2>/dev/null && echo "  *** MAIN PORTS STILL BOUND ***" || echo "  main ports free"
 }
@@ -705,8 +714,8 @@ for port in $MAIN_PORTS; do
     fi
 done
 for port in $LOCAL_PORTS; do
-    if [ "$(ss -ltn 2>/dev/null | grep -c ":$port ")" -ge 1 ]; then
-        echo "*** local port $port ALREADY BOUND -- refusing to run ***"; exit 1
+    if [ "$(w2026_sh "ss -ltn | grep -c ':$port '" 2>/dev/null | tail -1)" -ge 1 ]; then
+        echo "*** mad-lab-2026 port $port ALREADY BOUND -- refusing to run ***"; exit 1
     fi
 done
 
@@ -895,26 +904,28 @@ for spec in "$DEV_1070 8803 w-1070 $SLOTS_1070" ${SPEC_480:+"$SPEC_480"}; do
     [ -n "$WPIN" ] && VKENV="$VKENV WP_EXPERT_RESIDENT_EXPERTS=$WPIN" && echo "  PIN($3)=$WPIN"
     case "$3" in w-1070) WRES="$RESERVE_1070" ;; w-480) WRES="$RESERVE_480" ;; *) WRES="" ;; esac
     [ -n "$WRES" ] && VKENV="$VKENV WP_EXPERT_RESERVE_BLOCKS=$WRES WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE($3)=$WRES @ $RESERVE_BYTES"
-    env $VKENV $WPRE WP_STAGING_PINNED=$PIN WP_WORKER_STATS=$WSTATS setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+    w2026_sh "cd $REPO_2026 && env $VKENV $WPRE WP_STAGING_PINNED=$PIN WP_WORKER_STATS=$WSTATS setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
         --shard-manifest $ES_2026/ds4-e000-084-experts-experts-manifest.json \
         --descriptor $ES_2026/ds4-e000-084-experts.expert-descriptor.json \
-        --device "$1" --listen 0.0.0.0:"$2" --slots "$4" > "$OUT/$3.log" 2>&1 &
-    LOCAL_PIDS="$LOCAL_PIDS $!"
-    echo "  $3 on $1:$2 slots=$4 (pid $!)"
+        --device $1 --listen 0.0.0.0:$2 --slots $4 > $OUT/$3.log 2>&1 & echo \$! > $OUT/$3.pid"
+    sleep 1
+    W2026_PID=$(w2026_sh "cat $OUT/$3.pid" 2>/dev/null)
+    REMOTE_2026_PIDS="$REMOTE_2026_PIDS $W2026_PID"
+    echo "  $3 on $1:$2 slots=$4 (pid ${W2026_PID:-?} on 2026)"
 done
 
 echo "=== waiting for all workers to listen ==="
 for _ in $(seq 1 900); do
     a=$(main_sh "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
-    b=$(ss -ltn 2>/dev/null | grep -c ":8803 ")
-    if [ -n "$NO_480" ]; then c=1; else c=$(ss -ltn 2>/dev/null | grep -c ":8804 "); fi
+    b=$(w2026_sh "ss -ltn | grep -c ':8803 '" 2>/dev/null | tail -1)
+    if [ -n "$NO_480" ]; then c=1; else c=$(w2026_sh "ss -ltn | grep -c ':8804 '" 2>/dev/null | tail -1); fi
     if [ -n "$DSPARK_HOST" ] || [ -n "$DSPARK_SPLIT" ]; then
         d=$(main_sh "ss -ltn | grep -c ':8802 '" 2>/dev/null | tail -1)
     else
         d=1
     fi
     if [ -n "$DSPARK_SPLIT" ]; then
-        e=$(ss -ltn 2>/dev/null | grep -c ":8805 ")
+        e=$(w2026_sh "ss -ltn | grep -c ':8805 '" 2>/dev/null | tail -1)
     else
         e=1
     fi
@@ -923,7 +934,7 @@ for _ in $(seq 1 900); do
 done
 echo "  r9700=${a:-0} 1070=$b 480=$c dspark=${d:-0} dspark2026=${e:-0}"
 [ "${a:-0}" -ge 1 ] && [ "$b" -ge 1 ] && [ "$c" -ge 1 ] && [ "${d:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] || {
-    echo "NOT ALL WORKERS LISTENING"; tail -20 "$OUT/w-1070.log" "$OUT/w-480.log"
+    echo "NOT ALL WORKERS LISTENING"; w2026_sh "tail -20 $OUT/w-1070.log $OUT/w-480.log"
     main_sh "tail -20 $OUT/w-r9700.log"
     [ -n "$DSPARK_HOST" ] && main_sh "tail -20 $OUT/w-dspark.log"; exit 1; }
 
