@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# 2026-08-10: this harness runs ON mad-lab-main. It used to reach main over
+# `main_sh`, which needs loopback ssh (main's own key is NOT in its own
+# authorized_keys, so that failed, fell back to an impossible interactive
+# password, and tripped sshd's per-source penalty). main_sh runs the exact same
+# command strings locally instead. Same call shape, so every former call site is
+# unchanged apart from the name.
+main_sh() { bash -c "$1"; }
 # DS4-Flash-0731-DSpark on the FULL cross-machine expert-dispatch layout.
 # Derived from stage7.sh (which drove GLM-5.2); only the model paths, the 2026
 # build dir, and the slot budgets change.
@@ -628,7 +635,7 @@ if [ -n "$DSPARK_SPLIT" ]; then
     echo "    every GPU worker falls back to layers 0..42 (trunk manifests)"
 fi
 
-mkdir -p "$OUT"; ssh mad-lab-main "mkdir -p $OUT"
+mkdir -p "$OUT"; main_sh "mkdir -p $OUT"
 # DELETE LAST ARM'S WORKER LOGS BEFORE ANYTHING LAUNCHES.
 #
 # The readiness gate greps these for "expert worker listening", and the worker
@@ -638,7 +645,7 @@ mkdir -p "$OUT"; ssh mad-lab-main "mkdir -p $OUT"
 # is exactly the "connect to <ip>:8803 failed" that cost four arms. Removing them
 # up front makes the gate's evidence unambiguous: the line can only come from
 # this run.
-rm -f "$OUT"/w-*.log; ssh mad-lab-main "rm -f $OUT/w-*.log"
+rm -f "$OUT"/w-*.log; main_sh "rm -f $OUT/w-*.log"
 
 # WAIT FOR THE WORKER PORTS TO BE **FREE** BEFORE LAUNCHING ANYTHING.
 #
@@ -653,7 +660,7 @@ echo "=== waiting for worker ports to be free ==="
 for _ in $(seq 1 120); do
     busy=0
     for prt in 8801 8802; do
-        n=$(ssh mad-lab-main "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)
+        n=$(main_sh "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)
         [ "${n:-0}" -ge 1 ] && busy=1
     done
     for prt in 8803 8804 8805; do
@@ -668,9 +675,9 @@ LOCAL_PIDS=""
 
 remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
     [ -z "${1:-}" ] && return
-    ssh mad-lab-main "kill -INT $1" 2>/dev/null
+    main_sh "kill -INT $1" 2>/dev/null
     sleep 6
-    ssh mad-lab-main "kill -0 $1" 2>/dev/null && ssh mad-lab-main "kill -9 $1" 2>/dev/null
+    main_sh "kill -0 $1" 2>/dev/null && main_sh "kill -9 $1" 2>/dev/null
 }
 
 cleanup() {
@@ -682,7 +689,7 @@ cleanup() {
     sleep 4
     for p in $LOCAL_PIDS; do kill -9 "$p" 2>/dev/null; done
     echo "  verifying nothing leaked:"
-    ssh mad-lab-main "ss -ltn | grep -E ':8095 |:8801 |:8802 '" 2>/dev/null && echo "  *** MAIN PORTS STILL BOUND ***" || echo "  main ports free"
+    main_sh "ss -ltn | grep -E ':8095 |:8801 |:8802 '" 2>/dev/null && echo "  *** MAIN PORTS STILL BOUND ***" || echo "  main ports free"
 }
 trap cleanup EXIT
 
@@ -693,7 +700,7 @@ MAIN_PORTS="8095 8801"
 LOCAL_PORTS="8803 8804"
 [ -n "$DSPARK_SPLIT" ] && LOCAL_PORTS="$LOCAL_PORTS 8805"
 for port in $MAIN_PORTS; do
-    if [ "$(ssh mad-lab-main "ss -ltn | grep -c ':$port '" 2>/dev/null | tail -1)" -ge 1 ] 2>/dev/null; then
+    if [ "$(main_sh "ss -ltn | grep -c ':$port '" 2>/dev/null | tail -1)" -ge 1 ] 2>/dev/null; then
         echo "*** mad-lab-main port $port ALREADY BOUND -- refusing to run ***"; exit 1
     fi
 done
@@ -737,12 +744,12 @@ MAINENV=""
 [ -n "${KEEPALIVE_MAIN:-}" ] && MAINENV="$MAINENV WP_KEEPALIVE_US=$KEEPALIVE_MAIN"
 [ -n "$PIN_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESIDENT_EXPERTS=$PIN_MAIN" && echo "  PIN(r9700)=$PIN_MAIN"
 [ -n "$RESERVE_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_MAIN WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(r9700)=$RESERVE_MAIN @ $RESERVE_BYTES"
-ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE $MAINENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE $MAINENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $ES_MAIN/ds4-e085-255-experts-experts-manifest.json \
     --descriptor $ES_MAIN/ds4-e085-255-experts.expert-descriptor.json \
-    --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_R9700 > $OUT/w-r9700.log 2>&1 & echo \$last_pid > $OUT/w-r9700.pid"
+    --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_R9700 > $OUT/w-r9700.log 2>&1 & echo \$! > $OUT/w-r9700.pid"
 sleep 3
-MAIN_PID=$(ssh mad-lab-main "cat $OUT/w-r9700.pid" 2>/dev/null)
+MAIN_PID=$(main_sh "cat $OUT/w-r9700.pid" 2>/dev/null)
 echo "  w-r9700 pid ${MAIN_PID:-?}"
 
 # ---------- optional 4th worker: DSpark stages 43..45, experts 0..84, ON MAIN ----------
@@ -771,24 +778,24 @@ if [ -n "$DSPARK_HOST" ]; then
     [ -n "${PAGEINLOG:-}" ] && DSENV="$DSENV WP_PAGEIN_LOG=$OUT/pagein-w-dspark.txt"
     [ -n "${HINTLOG:-}" ] && DSENV="$DSENV WP_HINT_LOG=$OUT/hint-w-dspark.txt"
     [ -n "${RESERVE_DSPARK:-}" ] && DSENV="$DSENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_DSPARK WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(dspark)=$RESERVE_DSPARK @ $RESERVE_BYTES"
-    ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE $DSENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE $DSENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
         --shard-manifest $ES_DSPARK/ds4-e000-084-experts-experts-manifest.json \
         --descriptor $ES_DSPARK/ds4-e000-084-experts.expert-descriptor.json \
-        --device $DSPARK_HOST --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK > $OUT/w-dspark.log 2>&1 & echo \$last_pid > $OUT/w-dspark.pid"
+        --device $DSPARK_HOST --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK > $OUT/w-dspark.log 2>&1 & echo \$! > $OUT/w-dspark.pid"
     sleep 3
-    DSPARK_PID=$(ssh mad-lab-main "cat $OUT/w-dspark.pid" 2>/dev/null)
+    DSPARK_PID=$(main_sh "cat $OUT/w-dspark.pid" 2>/dev/null)
     echo "  w-dspark pid ${DSPARK_PID:-?}"
 fi
 
 # ---------- DSPARK_SPLIT=cpu: one CPU worker per machine, each on its own half ----------
 if [ -n "$DSPARK_SPLIT" ]; then
     echo "=== worker: DSpark blk.43-45 experts 85..255 on main CPU, $SLOTS_DSPARK_MAIN slots ==="
-    ssh mad-lab-main "cd $MAIN_REPO; and env WP_WORKER_STATS=$WSTATS $WPRE setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
         --shard-manifest $ES_MAIN_DSPARK/ds4-e085-255-experts-experts-manifest.json \
         --descriptor $ES_MAIN_DSPARK/ds4-e085-255-experts.expert-descriptor.json \
-        --device CPU --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK_MAIN > $OUT/w-dspark.log 2>&1 & echo \$last_pid > $OUT/w-dspark.pid"
+        --device CPU --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK_MAIN > $OUT/w-dspark.log 2>&1 & echo \$! > $OUT/w-dspark.pid"
     sleep 3
-    DSPARK_PID=$(ssh mad-lab-main "cat $OUT/w-dspark.pid" 2>/dev/null)
+    DSPARK_PID=$(main_sh "cat $OUT/w-dspark.pid" 2>/dev/null)
     echo "  w-dspark(main CPU) pid ${DSPARK_PID:-?}"
 
     echo "=== worker: DSpark blk.43-45 experts 0..84 on 2026 CPU, $SLOTS_DSPARK_2026 slots ==="
@@ -898,11 +905,11 @@ done
 
 echo "=== waiting for all workers to listen ==="
 for _ in $(seq 1 900); do
-    a=$(ssh mad-lab-main "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
+    a=$(main_sh "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
     b=$(ss -ltn 2>/dev/null | grep -c ":8803 ")
     if [ -n "$NO_480" ]; then c=1; else c=$(ss -ltn 2>/dev/null | grep -c ":8804 "); fi
     if [ -n "$DSPARK_HOST" ] || [ -n "$DSPARK_SPLIT" ]; then
-        d=$(ssh mad-lab-main "ss -ltn | grep -c ':8802 '" 2>/dev/null | tail -1)
+        d=$(main_sh "ss -ltn | grep -c ':8802 '" 2>/dev/null | tail -1)
     else
         d=1
     fi
@@ -917,8 +924,8 @@ done
 echo "  r9700=${a:-0} 1070=$b 480=$c dspark=${d:-0} dspark2026=${e:-0}"
 [ "${a:-0}" -ge 1 ] && [ "$b" -ge 1 ] && [ "$c" -ge 1 ] && [ "${d:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] || {
     echo "NOT ALL WORKERS LISTENING"; tail -20 "$OUT/w-1070.log" "$OUT/w-480.log"
-    ssh mad-lab-main "tail -20 $OUT/w-r9700.log"
-    [ -n "$DSPARK_HOST" ] && ssh mad-lab-main "tail -20 $OUT/w-dspark.log"; exit 1; }
+    main_sh "tail -20 $OUT/w-r9700.log"
+    [ -n "$DSPARK_HOST" ] && main_sh "tail -20 $OUT/w-dspark.log"; exit 1; }
 
 # SPEC=1 turns on DSpark speculative decoding. The DSpark stages live INSIDE the
 # DS4 model (blk.43/44/45 + the nextn heads + fc/enc.output_norm/markov/conf_proj),
@@ -1095,7 +1102,7 @@ if [ "${HOSTVICTIM_2026:-0}" != "0" ]; then
     done
 fi
 if [ "${HOSTVICTIM_MAIN:-0}" != "0" ] && \
-   ssh mad-lab-main "grep -q 'expert worker listening.* host_victim_budget=0\$' $OUT/w-r9700.log" 2>/dev/null; then
+   main_sh "grep -q 'expert worker listening.* host_victim_budget=0\$' $OUT/w-r9700.log" 2>/dev/null; then
     echo "*** w-r9700: HOSTVICTIM_MAIN=$HOSTVICTIM_MAIN but the worker started with host_victim_budget=0 -- the env var did not reach it. Aborting arm. ***"
     exit 1
 fi
@@ -1107,30 +1114,30 @@ if [ -n "${SERVE:-}" ]; then
 fi
 
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
-ssh mad-lab-main "cd $MAIN_REPO; and env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
+main_sh "cd $MAIN_REPO && env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
     -m $DENSE --device ROCm1 --fit off --no-mmap -ngl 99 -c $CTX $SPECARGS $UBARGS \
     --cache-type-k $CACHE_TYPE_K --cache-type-v $CACHE_TYPE_V \
     --expert-dispatch ${DISPATCH_ENDPOINTS} \
-    --port 8095 --host ${SPINE_HOST:-127.0.0.1} $SPINE_SERVE_ARGS > $OUT/spine.log 2>&1 & echo \$last_pid > $OUT/spine.pid"
+    --port 8095 --host ${SPINE_HOST:-127.0.0.1} $SPINE_SERVE_ARGS > $OUT/spine.log 2>&1 & echo \$! > $OUT/spine.pid"
 sleep 3
-SPINE_PID=$(ssh mad-lab-main "cat $OUT/spine.pid" 2>/dev/null)
+SPINE_PID=$(main_sh "cat $OUT/spine.pid" 2>/dev/null)
 echo "  spine pid ${SPINE_PID:-?}"
 
 echo "=== waiting for spine /health ==="
 ready=0
 for _ in $(seq 1 900); do
-    ssh mad-lab-main "curl -s -m 2 http://127.0.0.1:8095/health" 2>/dev/null | grep -q '"status"' && { ready=1; break; }
-    if [ -n "${SPINE_PID:-}" ] && ! ssh mad-lab-main "kill -0 $SPINE_PID" 2>/dev/null; then
-        echo "  *** SPINE DIED during init ***"; ssh mad-lab-main "tail -40 $OUT/spine.log"; exit 1
+    main_sh "curl -s -m 2 http://127.0.0.1:8095/health" 2>/dev/null | grep -q '"status"' && { ready=1; break; }
+    if [ -n "${SPINE_PID:-}" ] && ! main_sh "kill -0 $SPINE_PID" 2>/dev/null; then
+        echo "  *** SPINE DIED during init ***"; main_sh "tail -40 $OUT/spine.log"; exit 1
     fi
     sleep 2
 done
-[ "$ready" -eq 1 ] || { echo "SPINE NOT READY"; ssh mad-lab-main "tail -40 $OUT/spine.log"; exit 1; }
+[ "$ready" -eq 1 ] || { echo "SPINE NOT READY"; main_sh "tail -40 $OUT/spine.log"; exit 1; }
 echo "  spine up"
 
 echo
 echo "--- VRAM on all four cards, with the spine loaded and workers warm ---"
-ssh mad-lab-main 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
+main_sh 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
 nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
 
 # =====================================================================
@@ -1164,7 +1171,7 @@ echo "############ GENERATION ############"
 # could see it. Fields: 6 = sectors read (x512 = bytes), 7 = ms spent reading,
 # 13 = io_ticks (ms the device was busy at all) -> duty cycle.
 DS_2026_0=$(grep -w nvme0n1 /proc/diskstats)
-DS_MAIN_0=$(ssh mad-lab-main "bash -lc 'grep -w nvme0n1 /proc/diskstats'" 2>/dev/null)
+DS_MAIN_0=$(main_sh "bash -lc 'grep -w nvme0n1 /proc/diskstats'" 2>/dev/null)
 # Build the request body with json.dumps rather than interpolating into an
 # ssh-escaped string: a multi-KB prompt breaks that quoting outright.
 PROMPT="$PROMPT" PROMPT_FILE="$PROMPT_FILE" NPRED="$NPRED" python3 - "$OUT/payload.json" <<'PY'
@@ -1257,7 +1264,7 @@ d = json.load(open(sys.argv[1]))
 json.dump({"content": d["prompt"], "add_special": True}, open(sys.argv[2], "w"))
 PY
     scp -q "$OUT/tokreq.json" mad-lab-main:/tmp/ds4-tokreq.json
-    ssh mad-lab-main "curl -s -m 300 http://127.0.0.1:8095/tokenize \
+    main_sh "curl -s -m 300 http://127.0.0.1:8095/tokenize \
       -H 'Content-Type: application/json' --data-binary @/tmp/ds4-tokreq.json" \
       > "$OUT/tokens.json" 2>/dev/null
     PROBE_N="${PROBE_N:-64}" PROBE_NPROBS="${PROBE_NPROBS:-20}" \
@@ -1285,12 +1292,12 @@ PY
 fi
 
 GEN_T0=$(date +%s)
-ssh mad-lab-main "curl -s -m 3600 http://127.0.0.1:8095/completion \
+main_sh "curl -s -m 3600 http://127.0.0.1:8095/completion \
   -H 'Content-Type: application/json' --data-binary @/tmp/ds4-payload.json" \
   > "$OUT/gen.json" 2>/dev/null
 GEN_EL=$(( $(date +%s) - GEN_T0 ))
 DS_2026_1=$(grep -w nvme0n1 /proc/diskstats)
-DS_MAIN_1=$(ssh mad-lab-main "bash -lc 'grep -w nvme0n1 /proc/diskstats'" 2>/dev/null)
+DS_MAIN_1=$(main_sh "bash -lc 'grep -w nvme0n1 /proc/diskstats'" 2>/dev/null)
 echo
 echo "--- DEVICE-LEVEL NVMe over the generation window (${GEN_EL}s) ---"
 DS_ELAPSED="$GEN_EL" DS_A2026="$DS_2026_0" DS_B2026="$DS_2026_1" \
@@ -1362,7 +1369,7 @@ except Exception as e:
     invalid("could not read the response file (%s)" % e)
 if not raw.strip():
     invalid("EMPTY RESPONSE BODY -- the server closed the connection without replying",
-            "Check for a coredump: ssh mad-lab-main 'coredumpctl list | tail'")
+            "Check for a coredump: main_sh 'coredumpctl list | tail'")
 try:
     d=json.loads(raw)
 except Exception as e:
@@ -1419,14 +1426,14 @@ fi
 
 echo
 echo "--- VRAM after generation ---"
-ssh mad-lab-main 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
+main_sh 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
 nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
 echo
 echo "--- spine timings ---"
-ssh mad-lab-main "grep -E 'print_timing|eval time' $OUT/spine.log | tail -6"
+main_sh "grep -E 'print_timing|eval time' $OUT/spine.log | tail -6"
 echo "--- per-leg dispatch breakdown ---"
-ssh mad-lab-main "grep -E 'expert dispatch' $OUT/spine.log | tail -8"
+main_sh "grep -E 'expert dispatch' $OUT/spine.log | tail -8"
 echo "--- worker stats: R9700 / 1070 / 480 ---"
-ssh mad-lab-main "grep -iE 'worker stats|requests=' $OUT/w-r9700.log | tail -3"
+main_sh "grep -iE 'worker stats|requests=' $OUT/w-r9700.log | tail -3"
 grep -iE 'worker stats|requests=' "$OUT/w-1070.log" | tail -3
 grep -iE 'worker stats|requests=' "$OUT/w-480.log" | tail -3
