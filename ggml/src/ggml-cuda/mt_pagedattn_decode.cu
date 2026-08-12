@@ -1349,5 +1349,12 @@ template void launch_paged_attn_decode<64, 16, GGML_TYPE_TURBO4_64>(
     __half *, const __half *, const void *, const void *,
     const int32_t *, const int32_t *, const int32_t *,
     float *, int, int, int, int, int, int, float, cudaStream_t);
+// MAD-412: f16 at HEAD_SIZE=64. Uses the non-WMMA flash-decode kernel, since
+// the WMMA gate below is restricted to HS in {128, 256} -- the same path
+// TURBO4_64 already takes, and still chunk-parallel unlike the scalar kernel.
+template void launch_paged_attn_decode<64, 16, GGML_TYPE_F16>(
+    __half *, const __half *, const void *, const void *,
+    const int32_t *, const int32_t *, const int32_t *,
+    float *, int, int, int, int, int, int, float, cudaStream_t);
 
 } // namespace mt

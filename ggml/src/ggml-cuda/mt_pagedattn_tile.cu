@@ -1505,6 +1505,16 @@ template void launch_paged_attn_tile<64, 16, GGML_TYPE_TURBO4_64>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);
+// MAD-412: f16 at HEAD_SIZE=64. Without this instance a head_dim-64 model
+// running an f16 KV cache falls all the way to the scalar prefill kernel,
+// whose grid is only (n_heads, n_seqs) and which does a block-wide reduction
+// per KV token -- measured ~97x slower than turbo4 at 15k ctx on gfx1030.
+// TURBO3_0 has no HS=64 instance because QK_TURBO3=128 requires
+// HEAD_SIZE % 128 == 0; f16 carries no such constraint.
+template void launch_paged_attn_tile<64, 16, GGML_TYPE_F16>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
 
 // Multi-warp launcher instantiations — same (HEAD_SIZE, BLOCK_SIZE, CACHE_TYPE)
 // matrix as the single-warp path. TileConfig picks Q_TILES_PER_BLOCK at
@@ -1535,6 +1545,11 @@ template void launch_paged_attn_tile_mw<256, 16, GGML_TYPE_TURBO3_0>(
         int, int, int, int, int, float, cudaStream_t);
 // HEAD_SIZE=64 — MAD-301C Lever B native head_dim-64 turbo4.
 template void launch_paged_attn_tile_mw<64, 16, GGML_TYPE_TURBO4_64>(
+        __half *, const __half *, const void *, const void *,
+        const int32_t *, const int32_t *, const int32_t *,
+        int, int, int, int, int, float, cudaStream_t);
+// MAD-412: f16 at HEAD_SIZE=64, matching the single-warp instance above.
+template void launch_paged_attn_tile_mw<64, 16, GGML_TYPE_F16>(
         __half *, const __half *, const void *, const void *,
         const int32_t *, const int32_t *, const int32_t *,
         int, int, int, int, int, float, cudaStream_t);

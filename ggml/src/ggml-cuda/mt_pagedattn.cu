@@ -1728,13 +1728,21 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
             } else {
 
             // MAD-180: WMMA tile FA gate. HS=128/256 keep F16/TURBO4_0/TURBO3_0.
-            // MAD-301C Lever B adds HS=64 paired ONLY with GGML_TYPE_TURBO4_64
-            // (native head_dim-64 turbo4) — HS=64 for other cache types stays on
-            // the scalar path, so no <64,*> tile instances are needed for them.
+            // MAD-301C Lever B added HS=64 paired with GGML_TYPE_TURBO4_64
+            // (native head_dim-64 turbo4).
+            //
+            // MAD-412 adds HS=64 + F16. Leaving f16 off this gate meant a
+            // head_dim-64 model with an f16 KV cache fell to the scalar prefill
+            // kernel, which has a grid of only (n_heads, n_seqs) and performs a
+            // block-wide reduction per KV token: measured 426.5s vs turbo4's 4.4s
+            // on a 15329-token prompt on gfx1030, with the ratio widening as
+            // context grows because the scalar kernel's parallelism is fixed.
+            // TURBO3_0 stays out at HS=64 -- QK_TURBO3=128 requires
+            // HEAD_SIZE % 128 == 0, so no such instance can exist.
             if constexpr ((BS == 16)
                           && ((((HS == 128) || (HS == 256))
                                 && (CT == GGML_TYPE_F16 || CT == GGML_TYPE_TURBO4_0 || CT == GGML_TYPE_TURBO3_0))
-                              || (HS == 64 && CT == GGML_TYPE_TURBO4_64))) {
+                              || (HS == 64 && (CT == GGML_TYPE_TURBO4_64 || CT == GGML_TYPE_F16)))) {
                 const int  cc                = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const int  total_q_tokens    = (int) k_cur->ne[2];
                 const int  avg_q_len         = num_seqs > 0 ? (total_q_tokens / num_seqs) : 0;
