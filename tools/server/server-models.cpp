@@ -745,6 +745,28 @@ static int effective_idle_timeout_s(const server_model_meta & meta, int global_t
     return meta.idle_timeout >= 0 ? meta.idle_timeout : global_timeout_s;
 }
 
+// Parse preset vram-mb into meta.placement.vram_mb_override (in MiB).
+// -1 = unset, fall back to spawning the estimate child.
+static void parse_model_vram_mb(server_model_meta & meta) {
+    meta.placement.vram_mb_override = -1;
+    std::string val;
+    if (!meta.preset.get_option(ROUTER_ARG_VRAM_MB, val) || val.empty()) {
+        return;
+    }
+    try {
+        const int64_t mb = std::stoll(val);
+        if (mb <= 0) {
+            SRV_WRN("invalid vram-mb '%s' for model '%s' (must be positive); using estimate instead\n",
+                    val.c_str(), meta.name.c_str());
+            return;
+        }
+        meta.placement.vram_mb_override = mb;
+    } catch (...) {
+        SRV_WRN("invalid vram-mb '%s' for model '%s'; using estimate instead\n",
+                val.c_str(), meta.name.c_str());
+    }
+}
+
 void server_models::parse_model_placement(server_model_meta & meta) {
     meta.placement = {};
     std::string pinned;
@@ -755,6 +777,15 @@ void server_models::parse_model_placement(server_model_meta & meta) {
     // idle-timeout is not placement, but it lives in the same preset and is
     // re-parsed whenever placement is (load + hot reload paths).
     parse_model_idle_timeout(meta);
+
+    // vram-mb, likewise: capture it NOW, while the preset still has it. update_args()
+    // calls unset_reserved_args() immediately after every parse_model_placement() call
+    // site, which strips ROUTER_ARG_VRAM_MB from the preset in place -- so reading it
+    // later (as estimate_need_bytes() used to) always missed and silently fell through
+    // to the estimate child. Same hazard as idle-timeout; see the comment in reload().
+    // Parsed before the `gpu.empty() || "any"` early-return below so that models without
+    // an explicit slot still get their override.
+    parse_model_vram_mb(meta);
 
     std::string gpu;
     if (meta.preset.get_option(ROUTER_ARG_GPU, gpu)) {
@@ -897,7 +928,17 @@ void server_models::reserve_gpu_placement_locked(const std::string & name, const
         const int slot_idx = find_slot_index(gpu_slots, placement.devs[i]);
         GGML_ASSERT(slot_idx >= 0);
         auto & slot = gpu_slots[slot_idx];
-        slot.reserved_bytes += placement.need_bytes_per_dev[i];
+        // This is the ONLY unclamped mutation of reserved_bytes -- every release path
+        // clamps at 0 -- so a negative need silently poisons the ledger and disables
+        // admission control. Refuse it here rather than trusting every producer.
+        const int64_t need = placement.need_bytes_per_dev[i];
+        if (need < 0) {
+            SRV_WRN("negative need_bytes %" PRId64 " for model %s on %s -- ignoring "
+                    "(this is a bug in the placement estimate, not a config error)\n",
+                    need, name.c_str(), slot.dev_name.c_str());
+            continue;
+        }
+        slot.reserved_bytes += need;
         if (placement.exclusive) {
             slot.exclusive_holder = name;
         }
@@ -921,9 +962,12 @@ void server_models::reconcile_gpu_reservation_locked(const std::string & name) {
 }
 
 std::vector<int64_t> server_models::estimate_need_bytes(const server_model_meta & meta) {
-    std::string vram_mb;
-    if (meta.preset.get_option(ROUTER_ARG_VRAM_MB, vram_mb)) {
-        return { parse_mb_to_bytes(vram_mb) };
+    // Read the value captured by parse_model_placement(), NOT meta.preset: update_args()
+    // strips ROUTER_ARG_VRAM_MB from the preset in place at registration, so by the time
+    // we get here the option is always gone and every model silently fell through to the
+    // estimate child below -- vram-mb was never honoured at all.
+    if (meta.placement.vram_mb_override >= 0) {
+        return { meta.placement.vram_mb_override * 1024LL * 1024LL };
     }
 
     const std::string key = [&]() {
@@ -1098,7 +1142,17 @@ void server_models::ensure_gpu_placement(const std::string & name, server_model_
             meta.placement.need_bytes_per_dev.clear();
             for (const auto & dev : meta.placement.devs) {
                 const auto & slot = gpu_slots[find_slot_index(gpu_slots, dev)];
-                meta.placement.need_bytes_per_dev.push_back((total_need * slot.total_bytes) / std::max<int64_t>(1, total_weight));
+                // __int128 intermediate is REQUIRED, not defensive: both factors are byte
+                // counts in the 1e10 range, so total_need * total_bytes lands around 1e21
+                // and overflows int64 (max 9.2e18) by ~100x for any real model on any real
+                // card. That silently produced garbage shares -- including NEGATIVE ones,
+                // which then flowed into reserve_gpu_placement_locked() below and drove
+                // slot.reserved_bytes negative, at which point effective_free_bytes_locked()
+                // computes a ledger_free LARGER than the card and admission control stops
+                // binding entirely.
+                const __int128 share = ((__int128) total_need * (__int128) slot.total_bytes)
+                                       / (__int128) std::max<int64_t>(1, total_weight);
+                meta.placement.need_bytes_per_dev.push_back((int64_t) share);
             }
         } else {
             meta.placement.need_bytes_per_dev.assign(needs.begin(), needs.begin() + std::min(needs.size(), meta.placement.devs.size()));

@@ -87,6 +87,10 @@ struct server_model_placement {
     std::vector<int64_t> need_bytes_per_dev;
     bool exclusive = false;
     bool pinned = false;
+    // Parsed from the preset's `vram-mb` at placement-parse time. -1 = unset (estimate instead).
+    // MUST be captured here rather than read from the preset at use time: update_args() calls
+    // unset_reserved_args(), which strips the router-only options from the preset in place.
+    int64_t vram_mb_override = -1;
 };
 
 struct server_model_meta {

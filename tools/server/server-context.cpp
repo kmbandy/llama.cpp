@@ -1757,7 +1757,23 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
-        int n_ctx_slot = (params_base.kv_tiered_enabled && params_base.kv_tier_total_ctx > 0)
+        // The kv_tier_total_ctx override exists ONLY to undo the legacy non-paged tiered
+        // path's pre-shrink of params_base.n_ctx (see the hot-tier branch above, which does
+        // n_ctx = n_ctx * hot_pct/100). There llama_n_ctx_seq() reports the shrunken hot-tier
+        // size and the slot must be told the full logical window instead.
+        //
+        // The PAGED-blocks path deliberately does NOT pre-shrink -- the model already sees
+        // the full n_ctx and the paged cache moves blocks between tiers underneath it. So
+        // llama_n_ctx_seq() is already correct there, and applying the override anyway
+        // replaced the per-slot share (n_ctx / n_parallel) with the UNDIVIDED total, i.e.
+        // every slot got the whole context and the real KV allocation was n_parallel times
+        // what --ctx-size asked for. Stock llama.cpp semantics are that --ctx-size is the
+        // total, divided among --parallel slots; keep them.
+        const bool tiered_ctx_override = params_base.kv_tiered_enabled
+                                      && params_base.kv_tier_total_ctx > 0
+                                      && !params_base.kv_tier_paged_blocks;
+
+        int n_ctx_slot = tiered_ctx_override
                          ? params_base.kv_tier_total_ctx
                          : llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
