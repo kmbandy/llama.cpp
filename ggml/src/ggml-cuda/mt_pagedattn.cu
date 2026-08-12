@@ -1899,8 +1899,26 @@ void ggml_cuda_op_paged_attn_mt(ggml_backend_cuda_context & ctx, ggml_tensor * d
                     // (was total_q_tokens, an 8x over-allocation at par8 decode).
                     // Falls back to total_q_tokens when op_params[4] is unset.
                     const int max_q_len     = gate_q_len;
+
+                    // MAD-380: size the ALLOCATION from a quantised context bucket
+                    // rather than from the exact context.
+                    //
+                    // ggml_cuda_pool never returns memory to the driver: free()
+                    // parks the pointer in a fixed table and alloc() reuses a cached
+                    // buffer only when it is already >= the request. So sizing this
+                    // scratch by exact ctx retains one buffer per distinct prompt
+                    // length -- unbounded under agent traffic, where every turn is a
+                    // different length. Measured on gfx1030: +326 MiB retained over a
+                    // single 6k->63k ramp, released only at context teardown.
+                    //
+                    // Bucketing to powers of two bounds the distinct sizes to
+                    // ~log2(ctx), and hence the retained total to ~2x the largest
+                    // buffer. The kernels still receive the TRUE num_chunks, so all
+                    // partials indexing is unchanged -- the buffer is merely oversized.
+                    const int num_chunks_alloc = paged_attn_decode_num_chunks(
+                            paged_attn_decode_ctx_bucket(max_ctx_len, max_ctx_len_capacity));
                     const size_t partials_n = (size_t) n_heads * (size_t) num_seqs
-                                            * (size_t) num_chunks * (size_t) max_q_len
+                                            * (size_t) num_chunks_alloc * (size_t) max_q_len
                                             * (size_t) (HS + 2);
                     ggml_cuda_pool_alloc<float> partials(ctx.pool(), partials_n);
 

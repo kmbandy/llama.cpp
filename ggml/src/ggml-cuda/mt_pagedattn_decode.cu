@@ -87,6 +87,30 @@ int paged_attn_decode_num_chunks(int max_ctx_len) {
     return (max_ctx_len + CHUNK_KV - 1) / CHUNK_KV;
 }
 
+// Smallest partials bucket. Below this the scratch is a few hundred KiB and
+// per-length buckets would be pure overhead, so everything short shares one.
+static constexpr int DECODE_CTX_BUCKET_MIN = 4096;
+
+int paged_attn_decode_ctx_bucket(int ctx_len, int ctx_capacity) {
+    if (ctx_len <= 0) {
+        return 0;
+    }
+    // The allocated cache capacity is the natural ceiling: rounding past it
+    // would only waste memory. But the result must NEVER be below ctx_len --
+    // callers size a buffer from it -- so a capacity that does not cover
+    // ctx_len is ignored rather than trusted.
+    const int cap = ctx_capacity > ctx_len ? ctx_capacity : ctx_len;
+    if (ctx_len >= cap) {
+        return cap;  // == ctx_len
+    }
+    // Doubling stops before it can exceed cap, so this cannot overflow.
+    int bucket = DECODE_CTX_BUCKET_MIN;
+    while (bucket < ctx_len && bucket < cap) {
+        bucket <<= 1;
+    }
+    return bucket < cap ? bucket : cap;
+}
+
 // ── KV staging helpers (file-private) ──────────────────────────────────
 //
 // Mirror stage_k_tile / stage_v_tile / coop_stage_turbo4_tile in the

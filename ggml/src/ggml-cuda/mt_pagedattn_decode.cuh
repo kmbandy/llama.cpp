@@ -68,4 +68,11 @@ void launch_paged_attn_decode(
 // Exposed so the dispatch site can size the partials scratch.
 int paged_attn_decode_num_chunks(int max_ctx_len);
 
+// Helper: quantise a context length up to the next power-of-two bucket,
+// clamped to the cache's allocated capacity. The dispatch site sizes the
+// partials scratch from this rather than from the exact context, which bounds
+// the number of distinct allocation sizes to ~log2(ctx). See the call site in
+// mt_pagedattn.cu for why that matters (MAD-380).
+int paged_attn_decode_ctx_bucket(int ctx_len, int ctx_capacity);
+
 } // namespace mt
