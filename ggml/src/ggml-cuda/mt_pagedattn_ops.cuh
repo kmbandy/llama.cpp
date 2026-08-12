@@ -52,6 +52,29 @@ struct paged_cache_ops<GGML_TYPE_F16, HEAD_SIZE, BLOCK_SIZE> {
         return (float) k[off];
     }
 
+    // MAD-412: vector K load — K_X (=8) contiguous halves = one 16-byte load.
+    //
+    // The K layout already places dim_inner innermost precisely so that a run of
+    // K_X dims for one token is contiguous and 16-byte aligned ("F16 16-byte
+    // coalesce stride" above). k_load() returns a single element, so the compiler
+    // cannot merge across calls and emits one global_load_ushort per element --
+    // confirmed in the gfx1030 ISA, where the paged kernel contains NOTHING but
+    // 2-byte loads while the contiguous fattn-tile kernel uses dwordx4/dwordx2.
+    // This accessor hands the whole aligned run over in one instruction.
+    //
+    // Requires d0 % K_X == 0. Caller guarantees it by stepping d in units of K_X.
+    __device__ __forceinline__ static void k_load_vec(
+            const void * buf, int paged_block, int kv_head, int n_kv_heads,
+            int token_in_block, int d0, __half * out) {
+        static_assert(K_X * sizeof(__half) == sizeof(int4), "K_X halves must be exactly 16 bytes");
+        const __half * k = (const __half *) buf;
+        const int dim_outer = d0 / K_X;
+        const size_t off = ((size_t) paged_block * n_kv_heads + kv_head) * (HEAD_SIZE / K_X) * BLOCK_SIZE * K_X
+                         + (size_t) dim_outer * BLOCK_SIZE * K_X
+                         + (size_t) token_in_block * K_X;
+        *reinterpret_cast<int4 *>(out) = *reinterpret_cast<const int4 *>(k + off);
+    }
+
     __device__ __forceinline__ static float v_load(
             const void * buf, int paged_block, int kv_head, int n_kv_heads,
             int token_in_block, int d) {

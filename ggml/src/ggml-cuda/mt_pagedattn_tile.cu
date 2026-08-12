@@ -948,6 +948,52 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
                 smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
                 kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_F16) {
+            // MAD-412: vectorized F16 K staging.
+            //
+            // The per-element loop below emits one global_load_ushort per
+            // element -- verified in the gfx1030 ISA, where this kernel contains
+            // nothing but 2-byte loads while the contiguous fattn-tile kernel
+            // uses dwordx4/dwordx2. The accesses were already coalesced across
+            // lanes; the defect is LOAD WIDTH, so the cost is issue slots and
+            // address arithmetic rather than bandwidth. That matches the
+            // measurements: quartering the bytes (turbo4) bought nothing, while
+            // identical bytes through this path cost 2.2x versus contiguous.
+            //
+            // K_X consecutive dims of one token are contiguous and 16-byte
+            // aligned by construction, so one lane takes the whole run.
+            constexpr int VEC   = ops::K_X;                 // 8 halves = 16 bytes
+            constexpr int N_VEC = (K_TILE_N * HEAD_SIZE) / VEC;
+            static_assert((K_TILE_N * HEAD_SIZE) % VEC == 0,
+                          "K tile must be a whole number of vectors");
+            static_assert(HEAD_SIZE % VEC == 0,
+                          "a vector must not straddle two tokens");
+            for (int v = tid; v < N_VEC; v += N_THREADS) {
+                const int idx0  = v * VEC;
+                const int row   = idx0 / HEAD_SIZE;
+                const int col0  = idx0 % HEAD_SIZE;   // multiple of VEC
+                const int token = k_tile_start + row;
+                __align__(16) __half vals[VEC];
+                bool loaded = false;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        ops::k_load_vec(k_cache, physical, kv_head_idx, n_kv_heads,
+                                        tok_in_block, col0, vals);
+                        loaded = true;
+                    }
+                }
+                #pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    // Element-wise LDS store: smem_k carries no 16-byte alignment
+                    // guarantee, and LDS was never the bottleneck (149 ds_* ops
+                    // here against 490 in the contiguous kernel). The win being
+                    // bought is on the global side.
+                    smem_k[idx0 + e] = loaded ? vals[e] : __float2half(0.0f);
+                }
+            }
         } else {
             for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
                 const int row   = idx / HEAD_SIZE;
@@ -1260,6 +1306,38 @@ __global__ void mt_paged_attention_tile_mw_kernel(
             coop_stage_turbo3_tile<HEAD_SIZE, BLOCK_SIZE, N_WARPS>(
                 smem_k, k_cache, seq_block_table, k_tile_start, block_valid_ctx,
                 kv_head_idx, n_kv_heads, warp_id, lane_id);
+        } else if constexpr (CACHE_TYPE == GGML_TYPE_F16) {
+            // MAD-412: vectorized F16 K staging — see the matching branch in the
+            // AMD_WMMA_AVAILABLE path above. This is the copy that RDNA2 (gfx1030,
+            // no WMMA) actually compiles, so the two must be kept in step.
+            constexpr int VEC   = ops::K_X;                 // 8 halves = 16 bytes
+            constexpr int N_VEC = (K_TILE_N * HEAD_SIZE) / VEC;
+            static_assert((K_TILE_N * HEAD_SIZE) % VEC == 0,
+                          "K tile must be a whole number of vectors");
+            static_assert(HEAD_SIZE % VEC == 0,
+                          "a vector must not straddle two tokens");
+            for (int v = tid; v < N_VEC; v += N_THREADS) {
+                const int idx0  = v * VEC;
+                const int krow  = idx0 / HEAD_SIZE;
+                const int kcol0 = idx0 % HEAD_SIZE;   // multiple of VEC
+                const int token = k_tile_start + krow;
+                __align__(16) __half vals[VEC];
+                bool loaded = false;
+                if (token < block_valid_ctx) {
+                    const int logical_block = token / BLOCK_SIZE;
+                    const int tok_in_block  = token % BLOCK_SIZE;
+                    const int physical      = seq_block_table[logical_block];
+                    if (physical != kInvalidBlockTableEntry) {
+                        ops::k_load_vec(k_cache, physical, kv_head_idx, n_kv_heads,
+                                        tok_in_block, kcol0, vals);
+                        loaded = true;
+                    }
+                }
+                #pragma unroll
+                for (int e = 0; e < VEC; ++e) {
+                    smem_k[idx0 + e] = loaded ? vals[e] : __float2half(0.0f);
+                }
+            }
         } else {
             for (int idx = tid; idx < K_TILE_N * HEAD_SIZE; idx += N_THREADS) {
                 const int krow  = idx / HEAD_SIZE;
