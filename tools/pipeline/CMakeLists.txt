@@ -1,3 +1,13 @@
+# Hidden-stage decoding is shared by the legacy pipeline tool and dense
+# segment workers.
+add_library(llama-pipeline-stage STATIC pipeline-stage.cpp)
+target_include_directories(llama-pipeline-stage PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(llama-pipeline-stage PUBLIC llama)
+target_compile_features(llama-pipeline-stage PUBLIC cxx_std_17)
+
 # llama-pipeline-impl: stage driver logic, reusable by app
 
 set(TARGET llama-pipeline-impl)
@@ -18,7 +28,7 @@ target_include_directories(${TARGET} PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/pipeline
 )
-target_link_libraries(${TARGET} PUBLIC llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common llama-pipeline-stage llama ${CMAKE_THREAD_LIBS_INIT})
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)

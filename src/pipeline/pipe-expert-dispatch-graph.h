@@ -4,6 +4,7 @@
 #include "pipe-hash-oracle.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,8 @@ struct ggml_context;
 struct ggml_tensor;
 
 namespace pipe_expert_dispatcher {
+
+class ngram_hint_table;
 
 class graph_dispatcher {
   public:
@@ -42,6 +45,19 @@ class graph_dispatcher {
                         ggml_tensor *  weights,
                         int32_t        layer,
                         float          swiglu_clamp);
+
+    // Split of build() so a sibling GPU op (shared expert) can sit between
+    // the worker send and the worker recv. build_issue sends; after_issue
+    // adds a 0-valued dependence on that send; build_wait recvs and
+    // produces the MoE residual. build() remains the combined path.
+    ggml_tensor * build_issue(ggml_context * ctx,
+                              ggml_tensor *  activations,
+                              ggml_tensor *  selected_experts,
+                              ggml_tensor *  weights,
+                              int32_t        layer,
+                              float          swiglu_clamp);
+    ggml_tensor * after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer);
+    ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * shexp, int32_t layer);
 
     // ---- hash-layer prefetch ------------------------------------------------
     //
@@ -77,6 +93,10 @@ class graph_dispatcher {
     // Append the raw token batch to the WP_PREDICT_CAPTURE stream.
     void note_batch_tokens(const int32_t * tokens, size_t n_tokens) noexcept;
 
+    // Score static token-conditioned counts before graph compute and offer one
+    // PREDICTED top-M set per table layer. Wide prefill batches are skipped.
+    size_t prefetch_ngram_for_tokens(const int32_t * tokens, size_t n_tokens) noexcept;
+
     const prefetch_hint_stats & hint_stats() const { return remote.get_prefetch_hint_stats(); }
 
     // WP_PREFETCH_HINT=1. DEFAULT OFF: this changes what goes on the wire, and a
@@ -99,33 +119,23 @@ class graph_dispatcher {
     // for the same reason as clear_hash_oracle().
     void clear_router_oracle() { routers_.clear(); }
 
-    // WP_PREDICT_AHEAD=k (default 0 = off): at layer L, apply layer L+k's
-    // router to L's dispatch activations and hint the union of each token's
-    // top-M experts with PREDICTED provenance -- a constant k-layer lead for
-    // every hinted layer at one router GEMM per dispatched layer. The
-    // approximation error is the h_L -> h_{L+k} drift (measured 2026-07-19:
-    // rank-1 0.973 at k=1); k>=2 decay is measured from WP_PREDICT_CAPTURE.
-    static int predict_ahead();
-    // WP_PREDICT_TOPM=m (default 3, clamp 1..8): experts kept per token.
-    static int predict_topm();
-    // WP_PREDICT_MAX_TOKENS=n (default 16): skip prediction AND capture for
-    // wider batches. This is the prefill gate -- speculative reads during the
-    // prefill sweep are pure contention (LATE 84-100%), and a 2048-row router
-    // GEMM per layer is not free either.
+    // WP_HINT_ROUTER2=M (default 0 = off, clamp 1..16): at layer L-2,
+    // apply layer L's router to the step activations, max-pool scores over
+    // token positions, and offer the top-M experts for L as PREDICTED.
+    static int router2_topm();
+    // WP_PREDICT_MAX_TOKENS=n (default 16): skip capture for wider batches.
     static int predict_max_tokens();
-    // WP_PREDICT_CONF=m (default 0 = off): a token contributes its top-1 pick
-    // ONLY when the selection-score margin over the runner-up is >= m, and
-    // lower ranks only when their margin over the NEXT rank clears the same
-    // bar. Calibration from the 2026-08-07 capture (rank-1, top1-top2 margin):
-    // k=7 ungated 77% precision; margin>=0.22 -> 88% emitting 50% of tokens;
-    // >=0.46 -> 92.5% emitting 25%.
-    static float predict_conf();
 
     size_t n_workers() const;
     bool failed() const noexcept;
     std::string failure_message() const;
     void begin_decode() noexcept;
     void end_decode() noexcept;
+
+    // Scheduler callbacks in llama-context.cpp delimit the dense interval
+    // between the split dispatch issue and wait nodes.
+    void layer_trace_dense_begin(int32_t layer) noexcept;
+    void layer_trace_dense_end(int32_t layer) noexcept;
 
   private:
     struct op_context;
@@ -136,6 +146,7 @@ class graph_dispatcher {
     };
 
     void latch_failure(const char * message) noexcept;
+    void write_layer_trace(int32_t layer) noexcept;
 
     // Predicted-hint pipeline, two halves so the router GEMM never touches the
     // dispatch critical path (measured 2026-08-07: synchronous scoring cost
@@ -144,12 +155,12 @@ class graph_dispatcher {
     //
     // enqueue_prediction() copies this layer's dispatch activations into a
     // latest-wins slot for the scorer thread and returns immediately. The
-    // scorer applies router_{layer+k}, takes the per-token top-M union, and
-    // parks the result. flush_predicted_hints() -- called from compute() on
+    // scorer applies router_{layer+2}, max-pools over the token positions, and
+    // parks the top-M result. flush_predicted_hints() -- called from compute() on
     // the dispatch thread BEFORE dispatch, where the sockets are quiet
     // (in_flight == 0 under WP_DEFER_K=0) -- sends whatever is parked. The
     // hint therefore goes out at the NEXT layer's dispatch: one layer of the
-    // k-layer lead is spent on the handoff; pick WP_PREDICT_AHEAD accordingly.
+    // two-layer lead is spent on the handoff.
     // Neither half ever throws: a hint carries no correctness weight, so no
     // predictor failure may latch the dispatcher.
     void enqueue_prediction(int32_t layer, const std::vector<float> & activations,
@@ -173,6 +184,19 @@ class graph_dispatcher {
                         int                 ith,
                         int                 nth,
                         void *              userdata);
+    static void compute_issue(ggml_tensor *       dst,
+                              const ggml_tensor * activations,
+                              const ggml_tensor * selected_experts,
+                              const ggml_tensor * weights,
+                              int                 ith,
+                              int                 nth,
+                              void *              userdata);
+    static void compute_wait(ggml_tensor *       dst,
+                             const ggml_tensor * issued,
+                             const ggml_tensor * shexp,
+                             int                 ith,
+                             int                 nth,
+                             void *              userdata);
 
     dispatcher                                     remote;
     // Hash-layer tid2eid tables. Written only by register_hash_layer() at load
@@ -197,6 +221,9 @@ class graph_dispatcher {
     // trade-off as last_hint_, kept separate because the sets never coincide
     // with the hash-layer CERTAIN ones. Dispatch thread only.
     std::map<int32_t, std::vector<int32_t>>        last_pred_hint_;
+    // N-gram hints have their own repeat history so router2 results do not
+    // make an unchanged token-table result look new on the next step.
+    std::map<int32_t, std::vector<int32_t>>        last_ngram_hint_;
     // Scorer thread <-> dispatch thread handoff. pred_mutex_ guards the four
     // fields below; the scorer owns its own scratch.
     std::mutex                                     pred_mutex_;
@@ -210,12 +237,18 @@ class graph_dispatcher {
         bool               valid    = false;
     };
     pred_job                                       pred_inbox_;
+    struct pred_result {
+        uint32_t             n_tokens = 0;
+        std::vector<int32_t> experts;
+    };
     // Ready sets awaiting flush, keyed by target layer (a newer set for the
     // same target overwrites -- same staleness argument).
-    std::map<int32_t, std::vector<int32_t>>        pred_ready_;
+    std::map<int32_t, pred_result>                 pred_ready_;
     bool                                           pred_stop_ = false;
     std::thread                                    pred_thread_;
     std::atomic<bool>                              pred_thread_started_{ false };
+    std::unique_ptr<ngram_hint_table>              ngram_table_;
+    int32_t                                        ngram_top_m_ = 0;
     // WP_PREDICT_CAPTURE stream; opened on first record, closed in the dtor.
     FILE *                                         capture_file_ = nullptr;
     std::atomic<uint64_t>                          next_seq_id{ 1 };
@@ -224,6 +257,15 @@ class graph_dispatcher {
     mutable std::mutex                             failure_mutex_;
     std::string                                    failure_message_;
     bool                                           collect_stats_ = false;
+    FILE *                                         forward_log_ = nullptr;
+    FILE *                                         layer_trace_ = nullptr;
+    struct layer_trace_record {
+        uint64_t dense_ns = 0;
+        std::chrono::steady_clock::time_point dense_started{};
+        bool dense_active = false;
+    };
+    std::map<int32_t, layer_trace_record>          layer_traces_;
+    std::chrono::steady_clock::time_point          decode_t0_{};
     bool                                           decode_active_ = false;
     size_t                                         decode_layers_ = 0;
     uint64_t                                       decode_ns_pack_ = 0;
@@ -232,6 +274,11 @@ class graph_dispatcher {
     uint64_t                                       decode_ns_unpack_ = 0;
     uint64_t                                       decode_ns_total_ = 0;
     uint64_t                                       decode_first_await_in_flight_ = 0;
+    // Max over the decode's layers of dispatch_stats::max_in_flight -- see the
+    // comment on that field. Distinct from decode_first_await_in_flight_'s
+    // average: this is a peak-of-peaks, so it catches a single layer's
+    // cross-layer overlap even if most layers show none.
+    size_t                                         decode_max_in_flight_ = 0;
     // n_tokens of the ubatch this decode call is serving: >1 = prefill, 1 = decode.
     // Recorded in compute() (where n_tokens is already in hand) rather than passed
     // through begin_decode(), so the RAII scope in llama-context.cpp is untouched.

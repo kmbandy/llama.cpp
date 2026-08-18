@@ -36,6 +36,68 @@ struct ShardPlan {
     std::vector<size_t> group_indices;
 };
 
+// ---------------------------------------------------------------------------
+// Expert slicing (repack format v2).
+//
+// NOTE ON WORDS. "Shard" in this tool has always meant an OUTPUT FILE holding a
+// contiguous range of expert LAYERS. That meaning is unchanged. The v2 concept
+// is a "slice": a contiguous range of the FFN INTERMEDIATE dimension of a single
+// expert, held by one GPU. A slice is a strict subdivision of an expert; shards
+// and slices are orthogonal and both appear in a v2 output set.
+//
+// A slice [a, b) of expert E is:
+//   ffn_up_exps   rows    [a, b)   (contiguous in the source tensor)
+//   ffn_gate_exps rows    [a, b)   (contiguous in the source tensor)
+//   ffn_down_exps columns [a, b)   (STRIDED in the source tensor; gathered here)
+//
+// which is self-contained: it consumes the full-width activation and emits a
+// full-width n_embd output vector, so the per-slice outputs simply sum.
+// ---------------------------------------------------------------------------
+
+struct SliceSpec {
+    // Widths along the FFN intermediate dimension, in elements. Sums to n_ff_exp.
+    std::vector<int64_t> widths;
+    // The spec exactly as the user typed it, recorded in the index for provenance.
+    std::string          text;
+    // True when `text` was a ratio list and `widths` were solved from it.
+    bool                 from_ratios = false;
+    // Only set when from_ratios: the parsed ratio weights, recorded for provenance.
+    std::vector<int64_t> ratios;
+};
+
+// Accepts either an explicit width list ("1024,512,256,256") or a ratio list
+// ("4:2:1:1"). A ratio list leaves `widths` empty until resolve_slice_widths is
+// called with the model's real n_ff_exp; an explicit list is returned ready.
+// Throws std::invalid_argument on anything malformed, zero, or negative.
+SliceSpec parse_slice_spec(const std::string & text);
+
+// Fill in / validate `spec.widths` against the model's FFN intermediate size and
+// the quantization block size of the expert tensors.
+//
+// The alignment rule is the whole ballgame: every slice boundary must land on a
+// quant-block boundary, or a slice would cut a block in half and its bytes would
+// no longer be the official release bytes. So every width must be a positive
+// multiple of `blck`, and the widths must sum to EXACTLY n_ff. Ratios are solved
+// in units of `blck` by largest-remainder, which keeps the split deterministic
+// and guarantees the sum lands on n_ff with no leftover.
+//
+// Throws std::invalid_argument if n_ff is not a multiple of blck, if a resolved
+// or explicit width is not a multiple of blck, if any width is <= 0, if the
+// widths do not sum to n_ff, or if there are more slices than blocks to go round.
+void resolve_slice_widths(SliceSpec & spec, int64_t n_ff, int64_t blck);
+
+// Half-open [first, last) range along the FFN intermediate dimension.
+struct SliceRange {
+    int     index = -1;
+    int64_t first = 0;
+    int64_t last  = 0;
+
+    int64_t width() const { return last - first; }
+};
+
+// Prefix-sum `widths` into half-open ranges. widths must already be resolved.
+std::vector<SliceRange> slice_ranges(const std::vector<int64_t> & widths);
+
 std::vector<ExpertGroup> build_expert_groups(const wp::PageCatalog & catalog);
 
 std::vector<LayerRange> parse_layer_ranges(const std::string & text);

@@ -5,6 +5,7 @@
 // and every copied byte without loading a model or using a GPU.
 
 #include "nlohmann/json.hpp"
+#include "ggml.h"
 #include "wp-blob-index.h"
 #include "wp-expert-shard-lib.h"
 
@@ -341,8 +342,100 @@ static void test_expert_shard() {
     check(loaded.blob_files.size() == 2 && loaded.entries.size() == 12, "existing loader accepts the emitted blob set");
 }
 
+static void test_expert_slice_shard() {
+    std::printf("expert slice shard\n");
+    const fs::path dir = fs::temp_directory_path() / "wp-expert-slice-shard-test";
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+    fs::create_directories(dir);
+    const fs::path blob = dir / "source-experts-00001-of-00001.wpb";
+    const fs::path index_path = dir / "source-experts-00001-of-00001.wpi.json";
+    const fs::path manifest_path = dir / "source-experts-manifest.json";
+    json groups = json::array();
+    std::ofstream output(blob, std::ios::binary);
+    uint64_t offset = 0;
+    for (int expert = 0; expert < 2; ++expert) {
+        json slices = json::array();
+        for (int slice = 0; slice < 2; ++slice) {
+            const uint64_t role_bytes = slice == 0 ? 4 : 6;
+            json members = json::array();
+            for (int role = 0; role < 3; ++role) {
+                const uint64_t member_offset = offset;
+                for (uint64_t b = 0; b < role_bytes; ++b) {
+                    const char value = (char) (expert * 48 + slice * 16 + role * 7 + b);
+                    output.write(&value, 1);
+                }
+                members.push_back({
+                    { "role_mask", role == 0 ? 1 : (role == 1 ? 2 : 4) },
+                    { "size", role_bytes }, { "offset", member_offset },
+                    { "catalog_name", "expert." + std::to_string(expert) + ".role." + std::to_string(role) },
+                    { "source_tensor_name", "synthetic.role." + std::to_string(role) },
+                    { "source_file_idx", 0 }, { "source_file_offset", member_offset },
+                    { "slice_shape", role == 2 ? json({ slice == 0 ? 4 : 6, 4 }) :
+                                                     json({ 4, slice == 0 ? 4 : 6 }) },
+                    { "contiguous_in_source", role != 2 },
+                });
+                offset += role_bytes;
+            }
+            slices.push_back({ { "slice_idx", slice }, { "ff_first", slice == 0 ? 0 : 4 },
+                               { "ff_last", slice == 0 ? 4 : 10 }, { "width", slice == 0 ? 4 : 6 },
+                               { "offset", offset - role_bytes * 3 }, { "bytes", role_bytes * 3 },
+                               { "members", std::move(members) } });
+        }
+        groups.push_back({ { "block_idx", 3 }, { "expert_idx", expert }, { "slices", std::move(slices) } });
+    }
+    output.close();
+    const json slicing = { { "spec", "4,6" }, { "from_ratios", false }, { "ratios", json::array() },
+                           { "widths", { 4, 6 } }, { "slice_count", 2 }, { "n_ff_exp", 10 },
+                           { "n_embd", 4 }, { "ggml_type", (int) GGML_TYPE_F32 },
+                           { "ggml_type_name", ggml_type_name(GGML_TYPE_F32) }, { "quant_block_size", 1 },
+                           { "quant_block_bytes", 4 }, { "bytes_per_slice_per_role", { 4, 6 } } };
+    write_json(index_path, { { "format", "llama.cpp.weight-pager.expert-shard-index" }, { "version", 2 },
+                             { "blob_file", blob.filename().string() }, { "shard_index", 0 }, { "shard_count", 1 },
+                             { "layer_first", 3 }, { "layer_last", 3 }, { "group_count", 2 },
+                             { "expert_slicing", slicing }, { "blob_bytes", offset },
+                             { "content_hash", { { "algorithm", "sha256" }, { "value", "source" } } },
+                             { "model_files", { "/models/toy-model.gguf" } }, { "groups", groups } });
+    write_json(manifest_path, { { "format", "llama.cpp.weight-pager.expert-shard-manifest" }, { "version", 2 },
+                                { "input_model", "/models/toy-model.gguf" }, { "model_files", { "/models/toy-model.gguf" } },
+                                { "sharding_mode", "shard-by-layer" }, { "expert_slicing", slicing },
+                                { "total_group_count", 2 }, { "total_blob_bytes", offset }, { "shard_count", 1 },
+                                { "content_hash", { { "algorithm", "sha256" }, { "value", "source" } } },
+                                { "shards", { { { "blob_file", blob.filename().string() }, { "index_file", index_path.filename().string() },
+                                                { "shard_index", 0 }, { "layer_first", 3 }, { "layer_last", 3 },
+                                                { "group_count", 2 }, { "blob_bytes", offset },
+                                                { "content_hash", { { "algorithm", "sha256" }, { "value", "source" } } } } } } });
+    wp_expert_shard::Options options;
+    options.src_manifest = manifest_path;
+    options.out_base = dir / "slice-1";
+    options.slice_index = 1;
+    options.verify = true;
+    const wp_expert_shard::RunStats emitted = wp_expert_shard::run(options);
+    options.verify = false;
+    options.manifest_only = true;
+    (void) wp_expert_shard::run(options);
+    std::ifstream manifest_input(wp_expert_shard::output_manifest_path(options.out_base));
+    json manifest;
+    manifest_input >> manifest;
+    const fs::path output_index_path = dir / manifest.at("shards").at(0).at("index_file").get<std::string>();
+    std::ifstream output_index_input(output_index_path);
+    json output_index;
+    output_index_input >> output_index;
+    bool bytes_match = true;
+    for (const json & group : output_index.at("groups")) {
+        for (const json & member : group.at("members")) {
+            bytes_match = bytes_match && member.at("size").get<uint64_t>() == 6;
+        }
+    }
+    check(emitted.groups == 2 && emitted.members == 6 && manifest.at("sharding_mode") == "expert-slice" &&
+              manifest.at("expert_slicing").at("selected_slice") == 1 && bytes_match,
+          "format-v2 slice extraction preserves one contiguous page per expert");
+    fs::remove_all(dir, ignored);
+}
+
 int main() {
     test_expert_shard();
+    test_expert_slice_shard();
     if (g_fail != 0) {
         std::printf("\n%d check(s) FAILED\n", g_fail);
         return 1;

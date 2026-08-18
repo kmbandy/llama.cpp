@@ -435,6 +435,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
+    // NextN / MTP block (draft-mtp speculative decoding, MAD-388 family)
+    static const std::regex pattern_nextn_head    ("blk\\.\\d+\\.nextn\\.shared_head_head\\.weight");
+    static const std::regex pattern_nextn_mirrored("blk\\.\\d+\\.nextn\\.(eh_proj|embed_tokens|enorm|hnorm|shared_head_norm)\\.weight");
+
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
 
@@ -487,6 +491,43 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // NextN / MTP block.
+        //
+        // The MTP block's transformer tensors are named exactly like a trunk dense
+        // block (blk.<N>.attn_*, blk.<N>.ffn_*) and its KV cache like any other
+        // (cache_{k,v}_l<N>), so they fall through to the patterns below and are
+        // split identically: column-parallel Q/K/V + ffn_gate/up, row-parallel
+        // attn_output/ffn_down with the usual AllReduce, KV split by head. That is
+        // deliberate and is the right layout for drafting: a draft step runs at
+        // n_tokens == 1 and is purely weight-bandwidth bound, so MIRRORING the
+        // block would double the bytes each GPU reads per step in order to avoid
+        // two AllReduces of a single n_embd-wide row (a few KiB). hparams accessors
+        // (is_recr / n_ff / n_gqa / n_embd_head_k) are all valid up to n_layer_all-1,
+        // so il == n_layer() resolves correctly here.
+        //
+        // Only the nextn-specific tensors need explicit rules:
+        if (std::regex_match(tensor_name, pattern_nextn_head)) {
+            // The MTP LM head. Same layout as output.weight -- column-parallel over
+            // the vocab, logits gathered once per draft step. It is by far the
+            // largest tensor touched by a draft step, so mirroring it would be the
+            // single worst placement choice available. Models that omit this tensor
+            // fall back to model.output in the graph, which is already AXIS_1, so
+            // this keeps both cases on the same layout.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        if (std::regex_match(tensor_name, pattern_nextn_mirrored)) {
+            // Must stay replicated (this is also what the catch-all below would do;
+            // stated explicitly so a later pattern cannot capture them by accident):
+            //   - eh_proj writes the MTP block's residual stream, which every
+            //     downstream norm requires MIRRORED (a per-row op aborts on AXIS_0),
+            //   - embed_tokens is a get_rows source and get_rows only supports a
+            //     MIRRORED or AXIS_0 table,
+            //   - enorm / hnorm / shared_head_norm are norm weights.
+            // Together they are a small fraction of the block, so replicating them
+            // costs little.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -1526,6 +1567,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_DEEPSEEK2OCR:
             case LLM_ARCH_GLM_DSA:
             case LLM_ARCH_MISTRAL4:
+            case LLM_ARCH_QWEN3NEXT:
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
                 break;
             default:
                 throw std::runtime_error(format(
@@ -2118,7 +2162,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // a pipeline band deliberately leaves the other stages' tensors unread
     const bool partial_load = (arch == LLM_ARCH_QWEN35_MTP || arch == LLM_ARCH_QWEN35MOE_MTP) ||
                               pipeline_band_enabled();
-    ml.done_getting_tensors(partial_load);
+    ml.done_getting_tensors(partial_load, pipeline_band_enabled());
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -3155,6 +3199,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    // A hybrid cache owns two independent layer stores. Apply
+                    // the band before either store is constructed so neither
+                    // allocates state for a layer this process did not load.
+                    // The non-banded path keeps the original callbacks.
+                    if (pipeline_band_enabled()) {
+                        const int32_t band_first = pipeline_layer_first();
+                        const int32_t band_last  = pipeline_layer_last();
+                        const auto filter_attn_prev = filter_attn;
+                        const auto filter_recr_prev = filter_recr;
+                        filter_attn = [filter_attn_prev, band_first, band_last](uint32_t il) {
+                            return (int32_t) il >= band_first && (int32_t) il <= band_last &&
+                                (!filter_attn_prev || filter_attn_prev(il));
+                        };
+                        filter_recr = [filter_recr_prev, band_first, band_last](uint32_t il) {
+                            return (int32_t) il >= band_first && (int32_t) il <= band_last &&
+                                (!filter_recr_prev || filter_recr_prev(il));
+                        };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -3311,12 +3374,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_authoritative = true;
                     }
 
-                    // Cross-machine pipeline band: allocate KV only for owned
+    // Cross-machine pipeline band: allocate KV only for owned
                     // layers. Composes with the arch filters above. Absolute
                     // layer indices are preserved (map_layer_ids still keys on
                     // the global il), so attention inputs keep addressing the
                     // real depth.
-                    if (pipeline_band_enabled()) {
+                    //
+                    // EXCEPT draft (MTP/DSPARK) contexts: their authoritative
+                    // filters select the nextn layers (il >= n_layer), which sit
+                    // outside every trunk band by construction. The head band
+                    // carries the nextn tensors, so banding the draft cache
+                    // would intersect to an empty layer set and
+                    // map_layer_ids.at() throws (MAD-388 family, 2026-08-15).
+                    const bool draft_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+                                           params.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK;
+                    if (pipeline_band_enabled() && !(draft_ctx && filter_authoritative)) {
                         const int32_t band_first = pipeline_layer_first();
                         const int32_t band_last  = pipeline_layer_last();
                         auto filter_prev = filter;
@@ -3973,6 +4045,26 @@ const char * llama_model_chat_template(const llama_model * model, const char * n
 
 uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
+}
+
+// MAD-LAB: a sidecar speculative draft (DFlash/DSpark, EAGLE3) ships no output.weight --
+// it is trained against the target's output space and used to borrow the target's head
+// through ctx_other. Callers use this to detect that the draft cannot produce logits in
+// its own graph and that the projection must be routed through the target context.
+bool llama_model_has_output_head(const llama_model * model) {
+    return model != nullptr && model->output != nullptr;
+}
+
+void llama_model_pipeline_band(const llama_model * model, int32_t * first, int32_t * last) {
+    if (model == nullptr) {
+        return;
+    }
+    if (first) {
+        *first = model->pipeline_layer_first();
+    }
+    if (last) {
+        *last = model->pipeline_layer_last();
+    }
 }
 
 bool llama_model_has_encoder(const llama_model * model) {

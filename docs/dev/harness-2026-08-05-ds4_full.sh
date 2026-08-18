@@ -48,6 +48,23 @@ ES_2026_DSPARK=/mnt/nvme/models/DS4-eshard-dspark          # layers 43..45, expe
 ES_MAIN_TRUNK=/home/kmbandy/models/DS4-eshard-main-trunk   # layers 0..42,  experts 85..255
 ES_MAIN_DSPARK=/home/kmbandy/models/DS4-eshard-main-dspark # layers 43..45, experts 85..255
 DENSE=/home/kmbandy/models/DS4-Flash-dense/ds4-dense.gguf
+# ============================ SLICED LAYOUT (v3) ============================
+# 3-slice reshard 1408:320:320 (2026-08-17). Ported from
+# ~/ds4-runs/eslice-run4/launch_sliced_dspark_v3.sh -- the REFERENCE for correct
+# sliced worker defs. This is what the WORKERS_ONLY / ds4-stackd path launches.
+# The legacy whole-expert ES_* sets above are DEAD (DS4-eshard-main/-main-trunk
+# deleted from main); the sliced launch below does NOT read them.
+S0=/home/kmbandy/models/ds4-eslice/slice0        # R9700  width 1408 (main NVMe)
+S1=/mnt/nvme/ds4-eslice/slice1                   # 1070   width 320  (2026 NVMe)
+S2=/mnt/nvme/ds4-eslice/slice2                   # RX480  width 320  (2026 NVMe)
+D0=/home/kmbandy/models/DS4-eshard-dspark        # dspark experts 0-84   (real blobs)
+D1=/home/kmbandy/models/DS4-eshard-main-dspark   # dspark experts 85-255 (symlinks)
+SLOTS_S0=${SLOTS_S0:-3350}   # 3350*9.19MB = 30.8GB of 32GB (R9700)
+SLOTS_S1=${SLOTS_S1:-3750}   # 3750*2.09MB = 7.84GB of 8GB (1070)
+SLOTS_S2=${SLOTS_S2:-3900}   # 3900*2.09MB = 8.15GB of 8GB (RX480 + vidmem cap)
+SLOTS_D0=${SLOTS_D0:-85}
+SLOTS_D1=${SLOTS_D1:-171}
+# ===========================================================================
 # 2026-08-01: 2026's Tailscale IP CHANGED in the CachyOS reinstall.
 # Was 100.102.191.30 (still in the SOP guide and four repo design docs).
 # The stale address does not refuse -- it DROPs, so the spine hangs 2m20s and
@@ -328,6 +345,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # SPEC_HOST=1 lands PREDICTED pages in host RAM instead of a VRAM slot. Needs
 # the host victim tier; without it the worker falls back to the VRAM path.
 [ -n "${SPEC_HOST:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_HOST=$SPEC_HOST"
+# GATHER_MIN=<n> -- WP_EXPERT_GATHER_MIN_TOKENS. Binary default is 2 (decode n=1
+# stays dense; verify n>=2 gathers). 8 keeps the whole spec verify window
+# (SPEC_NMAX=7) dense so graph cache can arm; prefill ubatch still gathers.
+# Distinct from the rejected MIN=2 n=1 A/B in the header.
+[ -n "${GATHER_MIN:-}" ] && WPOST="$WPOST WP_EXPERT_GATHER_MIN_TOKENS=$GATHER_MIN"
 # PREFILL_GATE=1 -- workers pause speculative SUBMISSION while the last dispatch
 # was prefill-shaped (n_tokens>1). Prefill spec LATE is 84-100% = pure drive
 # contention; the gate reopens on the first decode-shaped request.
@@ -337,6 +359,9 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # which is what makes RAISING hint volume safe (pack the idle drive).
 # SUBREAD=<bytes> overrides the slice size.
 [ -n "${PREEMPT:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREEMPT=$PREEMPT"
+# PREEMPT_BORROW=1 -- landing thread waits for pending demand reads BEFORE
+# borrowing a staging lease (pair with PREEMPT=1).
+[ -n "${PREEMPT_BORROW:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_PREEMPT_BEFORE_BORROW=$PREEMPT_BORROW"
 [ -n "${SUBREAD:-}" ] && WPOST="$WPOST WP_EXPERT_SPEC_SUBREAD=$SUBREAD"
 # STRIPEPAR=1 -- reader threads claim STRIPES, not pages: one page's stripes
 # read concurrently (QD>1/page). Attacks the decode request's ns_read (4.5 ms
@@ -346,6 +371,13 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # hardcoded). Sweep with READ_STRIPES: more stripes only pay if threads exist
 # to claim them, and both stay clamped to the 16 staging buffers.
 [ -n "${READ_WORKERS:-}" ] && WPOST="$WPOST WP_EXPERT_READ_WORKERS=$READ_WORKERS"
+# FILL_HOST=1 -- decode/verify demand reads land a host-tier copy so a later
+# evict skips the sync D2H (WP_EXPERT_FILL_HOST_ON_READ, default off).
+[ -n "${FILL_HOST:-}" ] && WPOST="$WPOST WP_EXPERT_FILL_HOST_ON_READ=$FILL_HOST"
+# STAGING=<n> -- staging buffer count (default 16). Readers block in borrow()
+# when completed-but-undrained reads hold all leases during dispatch-thread
+# compute chunks; 32 gives headroom across those pauses (~+204 MiB host).
+[ -n "${STAGING:-}" ] && WPOST="$WPOST WP_EXPERT_STAGING_BUFFERS=$STAGING"
 # GCACHE=1 -- D2: shape-keyed persistent worker graphs + the backend's
 # src-ptrs-only CUDA/HIP graph update path (WP_HIP_GRAPHS=1 unlocks it).
 # Dense+COALESCE only; pair with COALESCE=1.
@@ -403,6 +435,11 @@ SPEC_CHUNK=${SPEC_CHUNK:-}
 # deferral folds partials one layer late, which is an approximation. kmbandy
 # saw quality loss from deferral on another model -- gate hard.
 [ -n "${DEFER:-}" ] && SPINEENV="${SPINEENV:-} WP_DEFER_K=$DEFER"
+# NOGRAPHS=1 -- GGML_CUDA_DISABLE_GRAPHS on the spine (6900XT) and the R9700
+# HIP worker. 1323 stalls were 2-18 s all-GPU freezes that ended on
+# "CUDA graph warmup complete". 1070 Pascal already cannot capture; Vulkan
+# 480 is unaffected. Opt in only for this A/B; do not leave it as SoT.
+[ "${NOGRAPHS:-}" = "1" ] && SPINEENV="${SPINEENV:-} GGML_CUDA_DISABLE_GRAPHS=1"
 # Warm without hints is a no-op, and hints without a rebuilt spine is a HELLO
 # rejection. Say so at launch rather than after a wasted run.
 if [ -n "$SPEC_PAGEIN" ] && [ -z "$PREFETCH_HINT" ]; then
@@ -522,7 +559,10 @@ CACHE_TYPE_V=${CACHE_TYPE_V:-f16}
 # that was chased through gather, ubatch, spec, and a full spine revert before the
 # harness itself turned out to be the bug. Without the colon, PROMPT_FILE="" means
 # exactly what it says: no file, use $PROMPT.
-PROMPT_FILE=${PROMPT_FILE-/tmp/claude-1000/-home-kmbandy/87d16c2e-6d13-4480-bcdf-d27bcd4d9c55/scratchpad/prose739.txt}
+# 2026-08-18: the old default (a prose739.txt under a since-deleted scratchpad dir)
+# was a dead path -- gone. Default now EMPTY = use the inline $PROMPT. Set
+# PROMPT_FILE explicitly to a real prose file for any prefill benchmark.
+PROMPT_FILE=${PROMPT_FILE-}
 
 # PIN=<blocks> holds those blocks' routed experts RESIDENT in worker VRAM instead
 # of paging them (--weight-paging-resident-experts / WP_EXPERT_RESIDENT_EXPERTS,
@@ -580,7 +620,10 @@ SLOTS_480=${SLOTS_480:-550}
 # 2026-08-02) and EVERY 2026-08-04 measurement used it. Leaving this empty gives
 # DSPARK_HOST=none, i.e. a run that looks like the config of record and is not --
 # the same class of trap as SPEC defaulting off (see the rule above).
-DSPARK_HOST=${DSPARK_HOST-CPU}
+# *** SLICED LAYOUT: default EMPTY. *** DSpark is served by the explicit d0/d1
+# sliced workers (:8807/:8808) below, not this legacy on-8802 path. Non-empty
+# would revive the dormant DSPARK_HOST block and launch a stray :8802 worker.
+DSPARK_HOST=${DSPARK_HOST-}
 
 # DSPARK_SPLIT=cpu -- BOTH machines serve their OWN DSpark half on their OWN CPU,
 # mirroring the baseline's expert-index split instead of relocating it:
@@ -598,48 +641,19 @@ DSPARK_SPLIT=${DSPARK_SPLIT:-}
 # 109 of 255 pages, so expect ~220 live here. Watch n_pagein flatline.
 SLOTS_DSPARK_MAIN=${SLOTS_DSPARK_MAIN:-256}
 SLOTS_DSPARK_2026=${SLOTS_DSPARK_2026:-256}
-
-# NO_480=1 drops the RX 480 (Vulkan) worker entirely. The 1070 already advertises
-# the SAME expert range 0-84, so coverage is preserved and build_routes stays happy
-# (both are on 2026, so the one-machine-per-expert rule is unaffected). The 1070
-# just pages harder with the whole range to itself.
-# WHY IT EXISTS: 2026-08-03 ablation. The pipeline has a GLOBAL intermittent
-# last-bit non-determinism (f16 diverged in 1 of 6 reps, turbo4 in 3 of 3 pairs).
-# Every turbo4-specific path was audited clean, so the suspect moved to the expert
-# workers, which span three backends -- and the RX 480's Vulkan path is the least
-# mature and entirely unexamined. Dropping it is the direct test.
-NO_480=${NO_480:-}
-if [ -n "$NO_480" ]; then
-    DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803"
-    echo "  NO_480: RX 480 dropped; 1070 serves all of 0-84"
-else
-    DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803,${IP2026}:8804"
-fi
-# The whole 0..84 DSpark set is 255 pages x 12.75 MiB = 3.18 GiB, so 256 slots
-# holds ALL of it resident and the reserve knob becomes irrelevant on this
-# worker -- there is nothing to evict. Lower it to force paging on purpose.
+# Kept defined so the dormant legacy A/B blocks below cannot trip `set -u` if a
+# DSPARK_HOST/DSPARK_SPLIT/NO_480 arm is ever run by hand. They are DEAD for the
+# sliced/stackd path (whole-expert data deleted from main) -- do not revive them.
 SLOTS_DSPARK=${SLOTS_DSPARK:-256}
+NO_480=${NO_480:-}
 
-if [ -n "$DSPARK_HOST" ] && [ -n "$DSPARK_SPLIT" ]; then
-    echo "*** DSPARK_HOST and DSPARK_SPLIT are mutually exclusive -- pick one ***"; exit 1
-fi
-
-if [ -n "$DSPARK_HOST" ]; then
-    ES_2026=$ES_2026_TRUNK
-    DISPATCH_ENDPOINTS="$DISPATCH_ENDPOINTS,${IPMAIN}:8802"
-    echo "=== DSpark experts 0..84 -> mad-lab-main $DSPARK_HOST ($SLOTS_DSPARK slots) ==="
-    echo "    2026 workers fall back to layers 0..42 (trunk manifest)"
-fi
-
-if [ -n "$DSPARK_SPLIT" ]; then
-    ES_2026=$ES_2026_TRUNK
-    ES_MAIN=$ES_MAIN_TRUNK
-    DISPATCH_ENDPOINTS="$DISPATCH_ENDPOINTS,${IPMAIN}:8802,${IP2026}:8805"
-    echo "=== DSpark split across BOTH CPUs (mirrors the baseline expert split) ==="
-    echo "    2026 i7-6700K : blk.43-45 experts 0..84    ($SLOTS_DSPARK_2026 slots)"
-    echo "    main  3900X   : blk.43-45 experts 85..255  ($SLOTS_DSPARK_MAIN slots)"
-    echo "    every GPU worker falls back to layers 0..42 (trunk manifests)"
-fi
+# *** SLICED DISPATCH ORDER *** -- must match [ds4-flash] expert-dispatch in
+# router-fleet-main.ini: R9700 slice0 :8801 | 1070 slice1 :8803 |
+# RX480 slice2 :8804 | CPU dspark0 :8807 | CPU dspark1 :8808. In the WORKERS_ONLY
+# / stackd path the router owns the spine and its own dispatch string; here this
+# only drives the per-worker wait list below. Legacy NO_480 / DSPARK_HOST /
+# DSPARK_SPLIT branches are DEAD (whole-expert data deleted from main) -- gone.
+DISPATCH_ENDPOINTS="${IPMAIN}:8801,${IP2026}:8803,${IP2026}:8804,${IPMAIN}:8807,${IPMAIN}:8808"
 
 mkdir -p "$OUT"; main_sh "mkdir -p $OUT"; w2026_sh "mkdir -p $OUT"
 # DELETE LAST ARM'S WORKER LOGS BEFORE ANYTHING LAUNCHES.
@@ -665,11 +679,11 @@ rm -f "$OUT"/w-*.log; main_sh "rm -f $OUT/w-*.log"; w2026_sh "rm -f $OUT/w-*.log
 echo "=== waiting for worker ports to be free ==="
 for _ in $(seq 1 120); do
     busy=0
-    for prt in 8801 8802; do
+    for prt in 8801 8807 8808; do
         n=$(main_sh "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)
         [ "${n:-0}" -ge 1 ] && busy=1
     done
-    for prt in 8803 8804 8805; do
+    for prt in 8803 8804; do
         [ "$(w2026_sh "ss -ltn | grep -c ':$prt '" 2>/dev/null | tail -1)" -ge 1 ] && busy=1
     done
     [ "$busy" -eq 0 ] && break
@@ -682,9 +696,13 @@ REMOTE_2026_PIDS=""
 
 remote_kill() {   # remote_kill <pid> -- SIGINT, then SIGKILL. Never by pattern.
     [ -z "${1:-}" ] && return
+    main_sh "kill -0 $1" 2>/dev/null || return
     main_sh "kill -INT $1" 2>/dev/null
-    sleep 6
-    main_sh "kill -0 $1" 2>/dev/null && main_sh "kill -9 $1" 2>/dev/null
+    for _ in 1 2 3 4 5 6; do
+        sleep 1
+        main_sh "kill -0 $1" 2>/dev/null || return
+    done
+    main_sh "kill -9 $1" 2>/dev/null
 }
 
 cleanup() {
@@ -698,16 +716,13 @@ cleanup() {
     for p in $LOCAL_PIDS; do kill -9 "$p" 2>/dev/null; done
     for p in $REMOTE_2026_PIDS; do w2026_sh "kill -9 $p" 2>/dev/null; done
     echo "  verifying nothing leaked:"
-    main_sh "ss -ltn | grep -E ':8095 |:8801 |:8802 '" 2>/dev/null && echo "  *** MAIN PORTS STILL BOUND ***" || echo "  main ports free"
+    main_sh "ss -ltn | grep -E ':8095 |:8801 |:8807 |:8808 '" 2>/dev/null && echo "  *** MAIN PORTS STILL BOUND ***" || echo "  main ports free"
 }
 trap cleanup EXIT
 
 # ---------- preflight: refuse to run into a stale process ----------
-MAIN_PORTS="8095 8801"
-[ -n "$DSPARK_HOST" ] && MAIN_PORTS="$MAIN_PORTS 8802"
-[ -n "$DSPARK_SPLIT" ] && MAIN_PORTS="$MAIN_PORTS 8802"
+MAIN_PORTS="8095 8801 8807 8808"
 LOCAL_PORTS="8803 8804"
-[ -n "$DSPARK_SPLIT" ] && LOCAL_PORTS="$LOCAL_PORTS 8805"
 for port in $MAIN_PORTS; do
     if [ "$(main_sh "ss -ltn | grep -c ':$port '" 2>/dev/null | tail -1)" -ge 1 ] 2>/dev/null; then
         echo "*** mad-lab-main port $port ALREADY BOUND -- refusing to run ***"; exit 1
@@ -726,40 +741,70 @@ done
 # dense model has loaded. Verified: 1270 tensors landed on ROCm1 including the
 # DSpark heads before the connect failed, so the reader is fine -- the ordering
 # is simply not negotiable.
-echo "=== worker: R9700 (ROCm0) experts 85..255, $SLOTS_R9700 slots ==="
-# The R9700 was the ONLY worker with no phase instrumentation: REQLOG/REFLOG/
-# PAGEINLOG are carried in VKENV, which is built in the 2026 loop below and never
-# reaches this launch. That is why every breakdown so far has had a blank column
-# for this card -- we could see what the spine WAITED for it, never what it SPENT.
-# Logs land in $OUT on main (created above) and are collected after the run.
-MAINENV=""
-# Host victim tier: per MACHINE, not via WPRE, because the two boxes have very
-# different RAM. The DSpark workers are deliberately excluded -- their shard fits
-# their slots (4.3% of references page in), so there is nothing for a victim
-# cache to catch and the arena would be pure RAM cost on an already tight box.
-[ "${HOSTVICTIM_MAIN:-0}" != "0" ] && MAINENV="$MAINENV WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN"
-[ -n "${REQLOG:-}"  ] && MAINENV="$MAINENV WP_REQ_LOG=$OUT/req-w-r9700.txt"
-[ -n "${REFLOG:-}"  ] && MAINENV="$MAINENV WP_REF_LOG=$OUT/ref-w-r9700.txt"
-[ -n "${PAGEINLOG:-}" ] && MAINENV="$MAINENV WP_PAGEIN_LOG=$OUT/pagein-w-r9700.txt"
-# HINTLOG=1 is the ONLY durable record of the hint counters -- the worker prints
-# them to stderr on a clean close and this harness SIGKILLs workers, so arm 1
-# lost foreign_expert (the spine-vs-worker routing-agreement check) entirely.
-# `tail -1` of each of these four files is that worker's final count.
-[ -n "${HINTLOG:-}" ] && MAINENV="$MAINENV WP_HINT_LOG=$OUT/hint-w-r9700.txt"
-# KEEPALIVE_MAIN=<us>: keepalive on the R9700 (HIP). A SEPARATE knob from
-# KEEPALIVE deliberately -- that one defaults to 100 (part of the RX 480
-# idle-recovery fix) and folding the R9700 into it would arm this card
-# silently on every run; it has never been measured here.
-[ -n "${KEEPALIVE_MAIN:-}" ] && MAINENV="$MAINENV WP_KEEPALIVE_US=$KEEPALIVE_MAIN"
-[ -n "$PIN_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESIDENT_EXPERTS=$PIN_MAIN" && echo "  PIN(r9700)=$PIN_MAIN"
-[ -n "$RESERVE_MAIN" ] && MAINENV="$MAINENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_MAIN WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(r9700)=$RESERVE_MAIN @ $RESERVE_BYTES"
-main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE $MAINENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
-    --shard-manifest $ES_MAIN/ds4-e085-255-experts-experts-manifest.json \
-    --descriptor $ES_MAIN/ds4-e085-255-experts.expert-descriptor.json \
-    --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_R9700 > $OUT/w-r9700.log 2>&1 & echo \$! > $OUT/w-r9700.pid"
+echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:8807 | d1 CPU:8808 ==="
+# Ported from launch_sliced_dspark_v3.sh (the v3 reference). Worker env (the glibc
+# arena fix etc.) is INHERITED from the environment -- ds4-stackd sources
+# ~/ds4-runs/stackd-worker.env with `set -a` before exec'ing this harness -- plus
+# WPRE (WP_IO_PREALLOC_TOKENS) and WP_WORKER_STATS via WSTATS. Nothing hardcoded.
+# Launch shape matches the rest of the harness: background ONLY the worker command
+# inside braces with stdin from /dev/null, record $! to a pidfile so teardown
+# signals the worker, not a wrapper (2026-08-10 note above still applies).
+
+# --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
+    --descriptor $S0/ds4-s0-experts-experts-manifest-dspark.expert-descriptor.json \
+    --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
 sleep 3
-MAIN_PID=$(main_sh "cat $OUT/w-r9700.pid" 2>/dev/null)
-echo "  w-r9700 pid ${MAIN_PID:-?}"
+S0_PID=$(main_sh "cat $OUT/w-s0.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $S0_PID"
+echo "  w-s0 (R9700) pid ${S0_PID:-?}"
+
+# --- d0: main CPU dspark, layers 43-45, experts 0-84 ---
+# DSPARK_THREADS=<n> sets WP_CPU_THREADS for the CPU dspark workers (d0/d1 only;
+# GPU legs ignore it). Unset => worker default (8, clamped to hw concurrency).
+# Sweep 4/6/8/12; NEVER 24 (standing NO). Gate NLL (thread count can shift CPU
+# reduction order slightly).
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${DSPARK_THREADS:+WP_CPU_THREADS=$DSPARK_THREADS }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    --shard-manifest $D0/ds4-e000-084-experts-experts-manifest.json \
+    --descriptor $D0/ds4-e000-084-experts.expert-descriptor.json \
+    --device cpu --listen 0.0.0.0:8807 --slots $SLOTS_D0 > $OUT/w-d0.log 2>&1 < /dev/null & echo \$! > $OUT/w-d0.pid; }"
+sleep 2
+D0_PID=$(main_sh "cat $OUT/w-d0.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $D0_PID"
+echo "  w-d0 (CPU 0-84) pid ${D0_PID:-?}"
+
+# --- d1: main CPU dspark, layers 43-45, experts 85-255 ---
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${DSPARK_THREADS:+WP_CPU_THREADS=$DSPARK_THREADS }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    --shard-manifest $D1/ds4-e085-255-experts-experts-manifest.json \
+    --descriptor $D1/ds4-e085-255-experts.expert-descriptor.json \
+    --device cpu --listen 0.0.0.0:8808 --slots $SLOTS_D1 > $OUT/w-d1.log 2>&1 < /dev/null & echo \$! > $OUT/w-d1.pid; }"
+sleep 2
+D1_PID=$(main_sh "cat $OUT/w-d1.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $D1_PID"
+echo "  w-d1 (CPU 85-255) pid ${D1_PID:-?}"
+
+# --- s1: 2026 GTX 1070 (CUDA0) slice1 w320, layers 0-42 ---
+# PARTIAL_DTYPE=f16 sends this leg's expert partials as f16 on the wire (halves
+# the remote bytes over the 1 GbE hop). Applied to s1/s2 ONLY -- the loopback
+# R9700 and local CPU workers keep f32 (their bytes are free and f16 adds ~5e-4
+# rounding at the partial-sum boundary). Self-describing frame; spine sums in
+# f32. REAL NLL risk -- gate before adopting.
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+    --shard-manifest $S1/ds4-s1-experts-experts-manifest-dspark.json \
+    --descriptor $S1/ds4-s1-experts-experts-manifest-dspark.expert-descriptor.json \
+    --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
+sleep 2
+S1_PID=$(w2026_sh "cat $OUT/w-s1.pid" 2>/dev/null); REMOTE_2026_PIDS="$REMOTE_2026_PIDS $S1_PID"
+echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
+
+# --- s2: 2026 RX 480 (Vulkan0) slice2 w320, layers 0-42 ---
+# The 480 has a 256 MB BAR and no ReBAR; without the host-visible-vidmem cap ~95%
+# of its slots spill into GTT and every matmul streams over PCIe (doc §1/§2).
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+    --shard-manifest $S2/ds4-s2-experts-experts-manifest-dspark.json \
+    --descriptor $S2/ds4-s2-experts-experts-manifest-dspark.expert-descriptor.json \
+    --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"
+sleep 2
+S2_PID=$(w2026_sh "cat $OUT/w-s2.pid" 2>/dev/null); REMOTE_2026_PIDS="$REMOTE_2026_PIDS $S2_PID"
+echo "  w-s2 (480) pid ${S2_PID:-?} on 2026"
 
 # ---------- optional 4th worker: DSpark stages 43..45, experts 0..84, ON MAIN ----------
 # Deliberately NOT given the reserve knob by default: at SLOTS_DSPARK=256 the
@@ -785,12 +830,15 @@ if [ -n "$DSPARK_HOST" ]; then
     # (:3481) so it adapts correctly. Both are set; the LIMIT is the load-bearing one.
     [ -n "${DSPARK_OMP:-}" ] && DSENV="$DSENV OMP_THREAD_LIMIT=$DSPARK_OMP OMP_NUM_THREADS=$DSPARK_OMP" && echo "  DSPARK_OMP=$DSPARK_OMP (CPU DSpark worker thread cap, via OMP_THREAD_LIMIT)"
     [ -n "${PAGEINLOG:-}" ] && DSENV="$DSENV WP_PAGEIN_LOG=$OUT/pagein-w-dspark.txt"
+    # REQLOG for dspark too -- it was the ONLY worker with no phase log (same
+    # blind spot the R9700 had until 08-05; layers 43-45 straggle unobserved).
+    [ -n "${REQLOG:-}" ] && DSENV="$DSENV WP_REQ_LOG=$OUT/req-w-dspark.txt"
     [ -n "${HINTLOG:-}" ] && DSENV="$DSENV WP_HINT_LOG=$OUT/hint-w-dspark.txt"
     [ -n "${RESERVE_DSPARK:-}" ] && DSENV="$DSENV WP_EXPERT_RESERVE_BLOCKS=$RESERVE_DSPARK WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE(dspark)=$RESERVE_DSPARK @ $RESERVE_BYTES"
-    main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE $DSENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE $DSENV setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
         --shard-manifest $ES_DSPARK/ds4-e000-084-experts-experts-manifest.json \
         --descriptor $ES_DSPARK/ds4-e000-084-experts.expert-descriptor.json \
-        --device $DSPARK_HOST --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK > $OUT/w-dspark.log 2>&1 & echo \$! > $OUT/w-dspark.pid"
+        --device $DSPARK_HOST --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK > $OUT/w-dspark.log 2>&1 < /dev/null & echo \$! > $OUT/w-dspark.pid; }"
     sleep 3
     DSPARK_PID=$(main_sh "cat $OUT/w-dspark.pid" 2>/dev/null)
     echo "  w-dspark pid ${DSPARK_PID:-?}"
@@ -799,10 +847,10 @@ fi
 # ---------- DSPARK_SPLIT=cpu: one CPU worker per machine, each on its own half ----------
 if [ -n "$DSPARK_SPLIT" ]; then
     echo "=== worker: DSpark blk.43-45 experts 85..255 on main CPU, $SLOTS_DSPARK_MAIN slots ==="
-    main_sh "cd $MAIN_REPO && env WP_WORKER_STATS=$WSTATS $WPRE setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+    main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
         --shard-manifest $ES_MAIN_DSPARK/ds4-e085-255-experts-experts-manifest.json \
         --descriptor $ES_MAIN_DSPARK/ds4-e085-255-experts.expert-descriptor.json \
-        --device CPU --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK_MAIN > $OUT/w-dspark.log 2>&1 & echo \$! > $OUT/w-dspark.pid"
+        --device CPU --listen 0.0.0.0:8802 --slots $SLOTS_DSPARK_MAIN > $OUT/w-dspark.log 2>&1 < /dev/null & echo \$! > $OUT/w-dspark.pid; }"
     sleep 3
     DSPARK_PID=$(main_sh "cat $OUT/w-dspark.pid" 2>/dev/null)
     echo "  w-dspark(main CPU) pid ${DSPARK_PID:-?}"
@@ -816,127 +864,22 @@ if [ -n "$DSPARK_SPLIT" ]; then
     echo "  w-dspark(2026 CPU) pid $!"
 fi
 
-echo "=== workers on 2026: 1070 (CUDA0), RX 480 (Vulkan0), experts 0..84 ==="
 cd "$MAIN_REPO" || exit 1
-# DEV_1070 selects the 1070's BACKEND. CUDA0 (default) vs Vulkan1 is the arm that
-# separates "Vulkan backend is slow" from "Polaris has no integer dot product":
-# the 1070 reports int dot:1 under Vulkan, the RX 480 reports int dot:0, so
-# Vulkan-on-1070 vs CUDA-on-1070 is pure backend cost on identical silicon, and
-# Vulkan-on-1070 vs Vulkan-on-480 is pure hardware cost on an identical backend.
-DEV_1070=${DEV_1070:-CUDA0}
-# NOTE: must stay a plain `for` in THIS shell. A `while read` over a pipe runs in a
-# subshell and LOCAL_PIDS (set in the body, used by the cleanup trap) would be lost,
-# leaking workers that hold ~7 GB each.
-SPEC_480="Vulkan0 8804 w-480 $SLOTS_480"
-[ -n "$NO_480" ] && SPEC_480=""
-for spec in "$DEV_1070 8803 w-1070 $SLOTS_1070" ${SPEC_480:+"$SPEC_480"}; do
-    set -- $spec
-    # ANY Vulkan device must use posix_memalign staging, not just Vulkan0: the
-    # host buffer type returns 4096-aligned BAR memory that passes every check
-    # and then fails O_DIRECT read() at layer 3. Matching "Vulkan0" literally
-    # would silently take the broken path for the Vulkan1 (1070) arm.
-    case "$1" in Vulkan*) PIN=0 ;; *) PIN=1 ;; esac
-    # GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM: the RX 480 has a 256 MB BAR (no
-    # ReBAR). ggml_vk_create_buffer_device prefers DeviceLocal|HostVisible,
-    # which is that BAR window -- and on AMD it OVERSUBSCRIBES into system RAM
-    # rather than failing, so every slot buffer past ~19 (255 MB) physically
-    # lives in GTT and every matmul against it streams over PCIe. Measured
-    # 2026-08-01: reading the 400th buffer costs 1413 us by default and 193 us
-    # with this set; the boundary is exactly at 255 MB. The worker allocates
-    # 400 slots = 5.1 GiB, so ~95% of its experts were in system RAM.
-    VKENV=""
-    # Host victim tier, 2026 side. Small on purpose: this box has 15 GB TOTAL,
-    # ~8 GB available, and also runs the nemotron embedder and llama-router
-    # (LIVE FLEET SERVICES) plus three workers. Two GPU workers x this budget.
-    [ "${HOSTVICTIM_2026:-0}" != "0" ] && VKENV="$VKENV WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026"
-    # VKFIX=0 disables it, for a controlled A/B against the pre-fix behaviour.
-    # VKFIX=1 (default) forces ALL Vulkan buffers device-local -- fixes the bulk
-    # weight spill but costs 1.69 ms/req on the small activation upload.
-    # VKSPLIT=<bytes> instead keeps the BAR for buffers <= N and forces larger
-    # ones device-local, so small frequently-written buffers keep memcpy writes.
-    # *** APPEND, NEVER ASSIGN. *** These two lines used to OVERWRITE VKENV,
-    # which at this point already carries WP_EXPERT_HOST_VICTIM_BYTES -- and
-    # VKSPLIT defaults on, so the RX 480 (the only Vulkan* worker) silently ran
-    # every host-victim-tier arm with the tier OFF: n_host_hit=0, n_host_demote=0,
-    # demand page-ins byte-identical tier-on vs tier-off, while the CUDA 1070
-    # (which never enters this case) engaged it fine. Second time this worker
-    # silently dropped a feature; the engagement check after the listen gate
-    # below is what makes the third time loud.
-    case "$1" in Vulkan*)
-        if [ -n "${VKSPLIT:-}" ]; then
-            VKENV="$VKENV GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=$VKSPLIT"
-        elif [ "${VKFIX:-1}" = "1" ]; then
-            VKENV="$VKENV GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1"
-        fi ;;
-    esac
-    # PROBE=N re-times a STATIC pre-built graph every N requests while serving.
-    # Static stays fast while real requests are slow => per-request graph content.
-    # Static degrades too => process/backend state under load.
-    [ -n "${PROBE:-}" ] && case "$1" in Vulkan*) VKENV="$VKENV WP_SELF_BENCH=1 WP_SELF_BENCH_EVERY=$PROBE" ;; esac
-    # PAGEINLOG=1 records every page each 2026 worker READS, so the two logs can be
-    # intersected to measure whether residency-affinity routing keeps their caches
-    # disjoint or whether they duplicate fetches of the same pages.
-    # $ARM in the path: a fixed filename here silently overwrote a previous arm's
-    # miss log, the same way a fixed OUT= destroyed a previous arm's run dir.
-    [ -n "${PAGEINLOG:-}" ] && VKENV="$VKENV WP_PAGEIN_LOG=/tmp/claude-1000/pagein-$ARM-$3.txt"
-    # REQLOG=1 dumps one line per dispatch request (layer + every phase timer).
-    # Unlike PAGEINLOG these are self-segmenting into tokens via the layer index,
-    # so no cross-machine clock join is needed to get a per-token breakdown.
-    # Requires WP_WORKER_STATS=1 -- the phase timers are gated on it.
-    [ -n "${REQLOG:-}" ] && VKENV="$VKENV WP_REQ_LOG=/tmp/claude-1000/req-$ARM-$3.txt"
-    # REFLOG=1 captures the policy-INDEPENDENT reference stream, so cache
-    # replacement policies can be simulated offline instead of measured on GPUs.
-    [ -n "${REFLOG:-}" ] && VKENV="$VKENV WP_REF_LOG=/tmp/claude-1000/ref-$ARM-$3.txt"
-    # HINTLOG=1: hint counters, per frame, fflushed -- see the R9700 block. $ARM
-    # in the path for the same reason PAGEINLOG carries it.
-    [ -n "${HINTLOG:-}" ] && VKENV="$VKENV WP_HINT_LOG=/tmp/claude-1000/hint-$ARM-$3.txt"
-    [ -n "${ALLOCLOG:-}" ] && case "$1" in Vulkan*) VKENV="$VKENV GGML_VK_ALLOC_LOG=1" ;; esac
-    # VKEXTRA passes arbitrary GGML_VK_* env to the Vulkan workers only, so the
-    # CUDA arm stays a clean control. Quote it: it may contain several settings.
-    [ -n "${VKEXTRA:-}" ] && case "$1" in Vulkan*) VKENV="$VKENV $VKEXTRA" ;; esac
-    # KEEPALIVE=<us>: occupy the GPU between requests instead of letting it idle.
-    # Vulkan-only on purpose -- it targets the RX 480's idle-recovery cost, and
-    # leaving the CUDA 1070 without it keeps a clean control in the same run.
-    [ -n "${KEEPALIVE:-}" ] && case "$1" in Vulkan*) VKENV="$VKENV WP_KEEPALIVE_US=$KEEPALIVE" ;; esac
-    # PIN is per-worker so one card can be pinned while the other stays a control
-    # in the SAME run -- the pattern that made the keepalive result credible.
-    case "$3" in w-1070) WPIN="$PIN_1070" ;; w-480) WPIN="$PIN_480" ;; *) WPIN="" ;; esac
-    [ -n "$WPIN" ] && VKENV="$VKENV WP_EXPERT_RESIDENT_EXPERTS=$WPIN" && echo "  PIN($3)=$WPIN"
-    case "$3" in w-1070) WRES="$RESERVE_1070" ;; w-480) WRES="$RESERVE_480" ;; *) WRES="" ;; esac
-    [ -n "$WRES" ] && VKENV="$VKENV WP_EXPERT_RESERVE_BLOCKS=$WRES WP_EXPERT_RESERVE_BYTES=$RESERVE_BYTES" && echo "  RESERVE($3)=$WRES @ $RESERVE_BYTES"
-    w2026_sh "cd $REPO_2026 && env $VKENV $WPRE WP_STAGING_PINNED=$PIN WP_WORKER_STATS=$WSTATS setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
-        --shard-manifest $ES_2026/ds4-e000-084-experts-experts-manifest.json \
-        --descriptor $ES_2026/ds4-e000-084-experts.expert-descriptor.json \
-        --device $1 --listen 0.0.0.0:$2 --slots $4 > $OUT/$3.log 2>&1 & echo \$! > $OUT/$3.pid"
-    sleep 1
-    W2026_PID=$(w2026_sh "cat $OUT/$3.pid" 2>/dev/null)
-    REMOTE_2026_PIDS="$REMOTE_2026_PIDS $W2026_PID"
-    echo "  $3 on $1:$2 slots=$4 (pid ${W2026_PID:-?} on 2026)"
-done
-
-echo "=== waiting for all workers to listen ==="
+echo "=== waiting for all five sliced workers to listen (main: 8801/8807/8808, 2026: 8803/8804) ==="
 for _ in $(seq 1 900); do
-    a=$(main_sh "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
+    a=$(main_sh  "ss -ltn | grep -c ':8801 '" 2>/dev/null | tail -1)
+    d0=$(main_sh "ss -ltn | grep -c ':8807 '" 2>/dev/null | tail -1)
+    d1=$(main_sh "ss -ltn | grep -c ':8808 '" 2>/dev/null | tail -1)
     b=$(w2026_sh "ss -ltn | grep -c ':8803 '" 2>/dev/null | tail -1)
-    if [ -n "$NO_480" ]; then c=1; else c=$(w2026_sh "ss -ltn | grep -c ':8804 '" 2>/dev/null | tail -1); fi
-    if [ -n "$DSPARK_HOST" ] || [ -n "$DSPARK_SPLIT" ]; then
-        d=$(main_sh "ss -ltn | grep -c ':8802 '" 2>/dev/null | tail -1)
-    else
-        d=1
-    fi
-    if [ -n "$DSPARK_SPLIT" ]; then
-        e=$(w2026_sh "ss -ltn | grep -c ':8805 '" 2>/dev/null | tail -1)
-    else
-        e=1
-    fi
-    [ "${a:-0}" -ge 1 ] && [ "$b" -ge 1 ] && [ "$c" -ge 1 ] && [ "${d:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] && break
+    c=$(w2026_sh "ss -ltn | grep -c ':8804 '" 2>/dev/null | tail -1)
+    [ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] && break
     sleep 2
 done
-echo "  r9700=${a:-0} 1070=$b 480=$c dspark=${d:-0} dspark2026=${e:-0}"
-[ "${a:-0}" -ge 1 ] && [ "$b" -ge 1 ] && [ "$c" -ge 1 ] && [ "${d:-0}" -ge 1 ] && [ "${e:-0}" -ge 1 ] || {
-    echo "NOT ALL WORKERS LISTENING"; w2026_sh "tail -20 $OUT/w-1070.log $OUT/w-480.log"
-    main_sh "tail -20 $OUT/w-r9700.log"
-    [ -n "$DSPARK_HOST" ] && main_sh "tail -20 $OUT/w-dspark.log"; exit 1; }
+echo "  s0(r9700)=${a:-0} s1(1070)=${b:-0} s2(480)=${c:-0} d0=${d0:-0} d1=${d1:-0}"
+[ "${a:-0}" -ge 1 ] && [ "${b:-0}" -ge 1 ] && [ "${c:-0}" -ge 1 ] && [ "${d0:-0}" -ge 1 ] && [ "${d1:-0}" -ge 1 ] || {
+    echo "NOT ALL SLICED WORKERS LISTENING"
+    main_sh  "tail -20 $OUT/w-s0.log $OUT/w-d0.log $OUT/w-d1.log"
+    w2026_sh "tail -20 $OUT/w-s1.log $OUT/w-s2.log"; exit 1; }
 
 # SPEC=1 turns on DSpark speculative decoding. The DSpark stages live INSIDE the
 # DS4 model (blk.43/44/45 + the nextn heads + fc/enc.output_norm/markov/conf_proj),
@@ -979,11 +922,28 @@ echo "  r9700=${a:-0} 1070=$b 480=$c dspark=${d:-0} dspark2026=${e:-0}"
 # *** THIS INVALIDATES THE 2026-08-05 BASELINE AS A COMPARATOR. *** SHA
 # 2e6e3c5985, prefill [20.00, 20.80] and decode [2.54, 2.88] were all measured at
 # conf_min=0.9. Re-baseline at 0.99 before gating anything else against them.
+# *** CONFIG OF RECORD 2026-08-16: SPEC_CONF=0 (gate OFF, full-block verify). ***
+# Supersedes the 0.99 record above. Finding (2026-08-16, three-way converged:
+# Codex/Grok/Claude + empirical validation on the Qwen3.8 rig): the fork's old
+# common.h default conf_min=0.9 CENSORED DSpark proposals to ~1.3/block, and the
+# per-position acceptance stats count never-proposed positions as FAILED -- so
+# every gated curve is proposal-censoring convolved with acceptance, and the
+# banked DS4 acceptance numbers (mean_len 1.76-2.44, incl. the 0.99-sweep table
+# above) measured the GATE, not the head. Ungated on Qwen3.8 the same driver
+# measured mean_len 2.77-4.79 (smooth decay, no cliff). The 0.9/0.99 thresholds
+# were raw uncalibrated sigmoid cutoffs; the reference (SGLang static mode)
+# verifies the FULL block = conf 0. If a gate is ever wanted again, calibrate it
+# from the measured conf histogram vs empirical acceptance (or port the paper's
+# STS + prefix-survival scheduler) -- never a raw fixed threshold.
+# CONSEQUENCE (one-variable rule): every DS4 throughput/acceptance number banked
+# under conf 0.9/0.99 is NOT comparable to runs at 0 -- re-baseline before A/B.
+# common.h's compiled default is now also 0.0f, but keep passing the explicit 0
+# so the run is self-proving regardless of binary age.
 # NO COLON. `:-` substitutes on unset OR EMPTY, so SPEC_CONF= would silently
-# become 0.99 instead of disabling the flag -- the exact ${PROMPT_FILE:-...} trap
-# recorded above, which made every "legacy replay" arm run the wrong prompt.
+# become the default instead of disabling the flag -- the exact ${PROMPT_FILE:-...}
+# trap recorded above, which made every "legacy replay" arm run the wrong prompt.
 # With `-`, SPEC_CONF= explicitly means "do not pass --spec-draft-conf-min".
-SPEC_CONF=${SPEC_CONF-0.99}
+SPEC_CONF=${SPEC_CONF-0}
 #
 # DO NOT reflexively set --spec-draft-p-min here. That is a SEPARATE, generic gate
 # on the drafted token's own sampled probability (:1254). The standing "p_min must
@@ -1037,11 +997,12 @@ DSPARK_TAP=${DSPARK_TAP:-1}
 echo "=== CONFIG: KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX NPRED=$NPRED SPEC=${SPEC:-off}" \
      "DSPARK_HOST=${DSPARK_HOST:-none} DSPARK_OMP=${DSPARK_OMP:-default} NO_480=${NO_480:-off}" \
      "IGNORE_EOS=${IGNORE_EOS:-1} slots=${SLOTS_480}/${SLOTS_1070}/${SLOTS_R9700}" \
-     "UBATCH=$UBATCH BATCH=${BATCH:-2048-default} GATHER=${WEXTRA:-default-ON}" \
+     "UBATCH=$UBATCH BATCH=${BATCH:-2048-default} GATHER=${WEXTRA:-default-ON} GATHER_MIN=${GATHER_MIN:-default-2}" \
      "DSPARK_TAP=${DSPARK_TAP}(1=gated,0=mean) KEEPALIVE=${KEEPALIVE:-off}" \
      "code-defaults[dispatch_gather/gather_max_frac/compute_chunks/read_stripes/stripe_max_pageins]=${WP_CODE_DEFAULTS:-1/0.90/4/4/4}" \
      "hostvictim[2026/main]=${HOSTVICTIM_2026:-0}/${HOSTVICTIM_MAIN:-0}" \
      "prefetch[hint/spec/chunk/hintlog]=${PREFETCH_HINT:-off}/${SPEC_PAGEIN:-off}/${SPEC_CHUNK:-default-1}/${HINTLOG:-off}" \
+     "NOGRAPHS=${NOGRAPHS:-off}" \
      "evict=${LFU:-1-usecount}(0=pure-LRU)" \
      "PROMPT=$( [ -n "$PROMPT_FILE" ] && echo "$(basename "$PROMPT_FILE")/$(wc -w < "$PROMPT_FILE" 2>/dev/null) words" || echo "inline/${#PROMPT} chars" )" \
      "ARM=$ARM ==="
@@ -1080,11 +1041,11 @@ wait_worker_log() {   # $1 = "local"|<sshhost>, $2 = logfile
 }
 for ep in $(echo "$DISPATCH_ENDPOINTS" | tr ',' ' '); do
     case "${ep##*:}" in
-        8801) wh="mad-lab-main"; wl="$OUT/w-r9700.log" ;;
-        8802) wh="mad-lab-main"; wl="$OUT/w-dspark.log" ;;
-        8803) wh="local";        wl="$OUT/w-1070.log"  ;;
-        8804) wh="local";        wl="$OUT/w-480.log"   ;;
-        8805) wh="local";        wl="$OUT/w-dspark.log";;
+        8801) wh="local";        wl="$OUT/w-s0.log" ;;
+        8803) wh="mad-lab-2026"; wl="$OUT/w-s1.log" ;;
+        8804) wh="mad-lab-2026"; wl="$OUT/w-s2.log" ;;
+        8807) wh="local";        wl="$OUT/w-d0.log" ;;
+        8808) wh="local";        wl="$OUT/w-d1.log" ;;
         *)    continue ;;
     esac
     if wait_worker_log "$wh" "$wl"; then
@@ -1105,8 +1066,9 @@ if [ "${HOSTVICTIM_2026:-0}" != "0" ]; then
     TIER_LOGS="$OUT/w-1070.log"
     [ -z "$NO_480" ] && TIER_LOGS="$TIER_LOGS $OUT/w-480.log"
     for wl in $TIER_LOGS; do
-        [ -f "$wl" ] || continue
-        if grep -q 'expert worker listening.* host_victim_budget=0$' "$wl"; then
+        # these logs live on 2026 now (the workers write them there); a local
+        # grep would silently skip via the old [ -f ] guard and disable this check
+        if w2026_sh "grep -q 'expert worker listening.* host_victim_budget=0\$' $wl" 2>/dev/null; then
             echo "*** $(basename "$wl"): HOSTVICTIM_2026=$HOSTVICTIM_2026 but the worker started with host_victim_budget=0 -- the env var did not reach it. Aborting arm. ***"
             exit 1
         fi
@@ -1124,12 +1086,25 @@ if [ -n "${SERVE:-}" ]; then
     SPINE_SERVE_ARGS="--parallel $NPAR -v"
 fi
 
+# WORKERS_ONLY=1 -- bring up and HOLD the four expert workers with NO spine, so
+# the llama-router can spawn/kill the spine itself via the [ds4-flash] preset
+# entry (router-fleet-main.ini). Workers idle cheaply between spine sessions.
+# Cleanup trap stays armed: SIGTERM/ds4-stop on this process tears workers down.
+if [ -n "${WORKERS_ONLY:-}" ]; then
+    echo
+    echo "############ WORKERS ONLY ############"
+    echo "  four expert workers up and holding; NO spine started."
+    echo "  spawn the spine via llama-router alias ds4-flash (or run the"
+    echo "  harness normally). stop workers: kill $$  or  ds4-stop"
+    while true; do sleep 60; done
+fi
+
 echo "=== spine: 6900 XT (ROCm1), dense fully resident ==="
-main_sh "cd $MAIN_REPO && env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
+main_sh "cd $MAIN_REPO && { env WP_DISPATCH_STATS=1 ${SPINEENV:-} stdbuf -o0 -e0 nohup ./build-hip/bin/llama-server \
     -m $DENSE --device ROCm1 --fit off --no-mmap -ngl 99 -c $CTX $SPECARGS $UBARGS \
     --cache-type-k $CACHE_TYPE_K --cache-type-v $CACHE_TYPE_V \
     --expert-dispatch ${DISPATCH_ENDPOINTS} \
-    --port 8095 --host ${SPINE_HOST:-127.0.0.1} $SPINE_SERVE_ARGS > $OUT/spine.log 2>&1 & echo \$! > $OUT/spine.pid"
+    --port 8095 --host ${SPINE_HOST:-127.0.0.1} $SPINE_SERVE_ARGS > $OUT/spine.log 2>&1 < /dev/null & echo \$! > $OUT/spine.pid; }"
 sleep 3
 SPINE_PID=$(main_sh "cat $OUT/spine.pid" 2>/dev/null)
 echo "  spine pid ${SPINE_PID:-?}"
@@ -1149,27 +1124,33 @@ echo "  spine up"
 echo
 echo "--- VRAM on all four cards, with the spine loaded and workers warm ---"
 main_sh 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
-nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
+w2026_sh "nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null" 2>/dev/null
 
 # =====================================================================
 # SERVE=1 -- bring the full stack up at the requested config and LEAVE IT
 # SERVING (llama-server on main:8095, OpenAI-compatible) instead of running
-# the benchmark drive + teardown. Pair with SPINE_HOST=0.0.0.0 for access
-# over the mesh. Stop it by rerunning the harness (its startup sweep kills
-# stale listeners) or killing the recorded pids in $OUT.
+# the benchmark drive. Pair with SPINE_HOST=0.0.0.0 for access over the mesh.
+#
+# Do NOT disarm the EXIT trap and exit 0. That was the 2026-08-07 21:38
+# "silent teardown" fix, and it is how serve-20260812-2001 left the CPU
+# DSpark worker (3.1 GiB anonymous, swapped) listening on :8802 after the
+# spine died. Stay in this process, keep cleanup armed, and wait on the
+# spine. Spine death, SIGTERM/SIGINT to this watchdog, or `ds4-stop` all
+# take the same path: EXIT -> cleanup -> workers die. Kill -9 on this
+# process still leaks (no trap); don't do that.
 if [ -n "${SERVE:-}" ]; then
-    # DISARM THE EXIT TRAP. cleanup is trap'd on EXIT (line ~678); without
-    # this, exit 0 below tears down the exact stack we just brought up --
-    # which is precisely what happened on the first SERVE attempt
-    # (2026-08-07 21:38: health OK, then every process killed by our own
-    # cleanup ~seconds later; looked like a silent spine crash).
-    trap - EXIT
+    echo $$ > "$OUT/watchdog.pid"
     echo
     echo "############ SERVING ############"
     echo "  spine: http://${IPMAIN}:8095 (OpenAI-compatible; bound ${SPINE_HOST:-127.0.0.1})"
     echo "  slots (--parallel): $NPAR"
     echo "  KV=${CACHE_TYPE_K}/${CACHE_TYPE_V} CTX=$CTX UBATCH=${UBATCH:-default}"
-    echo "  workers left up; NO teardown; NO benchmark drive."
+    echo "  watchdog pid $$ (waiting on spine ${SPINE_PID:-?}; EXIT trap still armed)"
+    echo "  stop: ds4-stop   or   kill $SPINE_PID   or   kill $$"
+    while [ -n "${SPINE_PID:-}" ] && main_sh "kill -0 $SPINE_PID" 2>/dev/null; do
+        sleep 2
+    done
+    echo "  spine ${SPINE_PID:-?} gone — teardown via EXIT trap"
     exit 0
 fi
 
@@ -1247,7 +1228,7 @@ json.dump({"prompt": p, "n_predict": npred,
           open(sys.argv[1], "w"))
 print("  payload: %d chars of prompt" % len(p))
 PY
-scp -q "$OUT/payload.json" mad-lab-main:/tmp/ds4-payload.json
+cp "$OUT/payload.json" /tmp/ds4-payload.json
 
 # *** PROBE MODE (#27, 2026-08-05). PROBE_FROM_ARM=<arm> PROBE_N=<k>. ***
 # Replays an EXACT prefix -- the prompt's own token IDs plus the first PROBE_N
@@ -1274,7 +1255,7 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 json.dump({"content": d["prompt"], "add_special": True}, open(sys.argv[2], "w"))
 PY
-    scp -q "$OUT/tokreq.json" mad-lab-main:/tmp/ds4-tokreq.json
+    cp "$OUT/tokreq.json" /tmp/ds4-tokreq.json
     main_sh "curl -s -m 300 http://127.0.0.1:8095/tokenize \
       -H 'Content-Type: application/json' --data-binary @/tmp/ds4-tokreq.json" \
       > "$OUT/tokens.json" 2>/dev/null
@@ -1299,7 +1280,7 @@ json.dump({"prompt": prefix, "n_predict": 1,
 print("  PROBE: prompt %d tok (%d prompt + %d generated), asking top-%s"
       % (len(prefix), len(ptoks), n, os.environ["PROBE_NPROBS"]))
 PY
-    scp -q "$OUT/payload.json" mad-lab-main:/tmp/ds4-payload.json
+    cp "$OUT/payload.json" /tmp/ds4-payload.json
 fi
 
 GEN_T0=$(date +%s)
@@ -1438,7 +1419,7 @@ fi
 echo
 echo "--- VRAM after generation ---"
 main_sh 'rocm-smi --showmeminfo vram 2>/dev/null | grep -E "GPU\[|Used"'
-nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null
+w2026_sh "nvidia-smi --query-gpu=name,memory.used --format=csv 2>/dev/null" 2>/dev/null
 echo
 echo "--- spine timings ---"
 main_sh "grep -E 'print_timing|eval time' $OUT/spine.log | tail -6"
@@ -1446,5 +1427,5 @@ echo "--- per-leg dispatch breakdown ---"
 main_sh "grep -E 'expert dispatch' $OUT/spine.log | tail -8"
 echo "--- worker stats: R9700 / 1070 / 480 ---"
 main_sh "grep -iE 'worker stats|requests=' $OUT/w-r9700.log | tail -3"
-grep -iE 'worker stats|requests=' "$OUT/w-1070.log" | tail -3
-grep -iE 'worker stats|requests=' "$OUT/w-480.log" | tail -3
+w2026_sh "grep -iE 'worker stats|requests=' $OUT/w-1070.log | tail -3" 2>/dev/null
+w2026_sh "grep -iE 'worker stats|requests=' $OUT/w-480.log | tail -3" 2>/dev/null

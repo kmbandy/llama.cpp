@@ -100,6 +100,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool is_pipeline_band = false;
 
     llama_files files;
     llama_ftype ftype;
@@ -210,7 +211,7 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
-    void done_getting_tensors(bool partial = false) const;
+    void done_getting_tensors(bool partial = false, bool pipeline_band = false);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

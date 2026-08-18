@@ -72,7 +72,89 @@ bool ggml_backend_cuda_wp_copy_stream_record_event(ggml_backend_t,
 
 namespace wp_expert_worker {
 
+int parse_gather_min_tokens(const char * env) {
+    if (env == nullptr || env[0] == '\0') {
+        return 2;
+    }
+    const int v = std::atoi(env);
+    return v < 1 ? 1 : v;
+}
+
+bool parse_env_default_on(const char * env) {
+    return env == nullptr || env[0] == '\0' || env[0] != '0';
+}
+
+bool parse_env_default_off(const char * env) {
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool use_expert_gather(uint32_t n_tokens, bool force_dense, int min_tokens, bool gather_enabled) {
+    return gather_enabled && !force_dense && (int64_t) n_tokens >= (int64_t) min_tokens;
+}
+
+CompactRouting compact_routing_rows(const std::vector<float> & wv) {
+    CompactRouting out;
+    out.idx.reserve(wv.size());
+    out.weights.reserve(wv.size());
+    for (size_t t = 0; t < wv.size(); ++t) {
+        if (wv[t] != 0.0f) {
+            out.idx.push_back((int32_t) t);
+            out.weights.push_back(wv[t]);
+        }
+    }
+    if (out.idx.empty()) {
+        // Same dummy as compute_batch: skip-the-expert is wrong if every
+        // selected expert is empty — sum stays nullptr and ggml_cpy blows up.
+        out.idx.push_back(0);
+        out.weights.push_back(0.0f);
+    }
+    return out;
+}
+
+ggml_tensor * scatter_add_compact_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor * dest,
+        struct ggml_tensor * compact,
+        struct ggml_tensor * idx) {
+    // dest[idx] += compact. get_rows / add / set_rows are all O(n_sel).
+    // dest is the io result (already allocated) so gallocr does not grow a
+    // second [n_embd, n_tokens] workspace — that 127 MiB cudaMalloc is what
+    // OOM'd the 1070 on a 2048-wide prefill.
+    ggml_tensor * prev = ggml_get_rows(ctx, dest, idx);
+    ggml_tensor * acc  = ggml_add(ctx, prev, compact);
+    return ggml_set_rows(ctx, dest, acc, idx);
+}
+
+ggml_tensor * scatter_compact_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor * compact,
+        struct ggml_tensor * idx,
+        struct ggml_tensor * full_shape) {
+    // Standalone zeros dest, for the byte-match test vs get_rows_back.
+    ggml_tensor * dest = ggml_scale(ctx, full_shape, 0.0f);
+    return ggml_set_rows(ctx, dest, compact, idx);
+}
+
 static constexpr uint64_t DEFAULT_STAGING_BUFFERS = 16;
+
+// WP_EXPERT_STAGING_BUFFERS=<n> changes the staging depth only when the
+// caller did not set --host-budget.  Default-off: an unset, empty, zero, or
+// invalid value retains the historical 16-buffer host-budget default.  An
+// explicit --host-budget remains an upper bound on the number of whole-page
+// buffers; this knob must not silently allocate beyond an operator's budget.
+uint64_t staging_buffers_from_env() {
+    const char * env = std::getenv("WP_EXPERT_STAGING_BUFFERS");
+    if (env == nullptr || env[0] == '\0' || env[0] == '-') {
+        return DEFAULT_STAGING_BUFFERS;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno == ERANGE || end == env || *end != '\0' || parsed == 0) {
+        return DEFAULT_STAGING_BUFFERS;
+    }
+    return (uint64_t) parsed;
+}
 
 struct RequestStats {
     uint64_t ns_lookup  = 0;
@@ -124,6 +206,12 @@ struct RequestStats {
     // so this counter is NEW time made visible, not time moved from another
     // column. Zero when WP_EXPERT_PARAMS_COALESCE is off.
     uint64_t ns_params_set = 0;
+    // Time inside ensure_batch AFTER ns_lookup is snapshotted: sync host-victim
+    // demote D2H + host-tier restore + reader-thread spawn. This is the gap
+    // that made 40s walls look unaccounted on 1547/1752 (lookup ends before
+    // demote_slot). ns_demote is the D2H subset; ns_host_get is the restore.
+    uint64_t ns_demote = 0;
+    uint64_t ns_ensure_post = 0;
 };
 
 // Forward declarations: the probe itself is defined further down, next to
@@ -209,6 +297,8 @@ public:
         n_weight_total_   += request.n_weight_total;
         ns_h2d_ += request.ns_h2d;
         bytes_h2d_ += request.bytes_h2d;
+        ns_demote_ += request.ns_demote;
+        ns_ensure_post_ += request.ns_ensure_post;
         ++n_requests_;
         n_experts_ += n_experts;
 
@@ -253,6 +343,8 @@ private:
                         (double) bytes_h2d_ / (double) ns_h2d_)
                   << " staging_kind=" << staging_kind_
                   << " ns_host_get=" << ns_host_get_
+                  << " ns_demote=" << ns_demote_
+                  << " ns_ensure_post=" << ns_ensure_post_
                   << " ns_compute=" << ns_compute_
                   << " n_graph_submits=" << n_graph_submits_
                   << " n_device_allocs=" << n_device_allocs_
@@ -334,6 +426,8 @@ private:
     uint64_t          n_weight_nonzero_ = 0;
     uint64_t          n_weight_total_ = 0;
     uint64_t          ns_h2d_     = 0;
+    uint64_t          ns_demote_ = 0;
+    uint64_t          ns_ensure_post_ = 0;
     uint64_t          bytes_h2d_  = 0;
     std::string       staging_kind_ = "unknown";
     uint64_t          n_requests_ = 0;
@@ -354,6 +448,7 @@ ResourcePlan plan_resources(
     std::map<uint64_t, int> histogram;
     std::map<uint64_t, std::map<int, int>> layer_counts;
     uint64_t max_page_size = 0;
+    uint64_t max_staging_size = 0;
     for (const ResourcePage & page : pages) {
         if (page.layer < 0 || page.size == 0 ||
             (!page.pinned && (histogram[page.size] == std::numeric_limits<int>::max() ||
@@ -365,6 +460,8 @@ ResourcePlan plan_resources(
             ++layer_counts[page.size][page.layer];
         }
         max_page_size = std::max(max_page_size, page.size);
+        max_staging_size = std::max(
+            max_staging_size, page.staging_size == 0 ? page.size : page.staging_size);
     }
     if (max_page_size >
         std::numeric_limits<uint64_t>::max() / (uint64_t) requested_slots) {
@@ -517,29 +614,54 @@ ResourcePlan plan_resources(
         result.general_slot_count = result.slot_count;
     }
 
-    if (max_page_size >
-        std::numeric_limits<uint64_t>::max() / DEFAULT_STAGING_BUFFERS) {
+    const uint64_t requested_staging_buffers = staging_buffers_from_env();
+    const uint64_t default_staging_buffers =
+        std::min<uint64_t>((uint64_t) result.slot_count, requested_staging_buffers);
+    if (default_staging_buffers != 0 &&
+        max_staging_size > std::numeric_limits<uint64_t>::max() / default_staging_buffers) {
         throw std::overflow_error("default expert host budget overflows");
     }
     result.host_budget_bytes = host_budget_bytes == 0
-        ? max_page_size * std::min<uint64_t>(
-              (uint64_t) result.slot_count, DEFAULT_STAGING_BUFFERS)
+        ? max_staging_size * default_staging_buffers
         : host_budget_bytes;
-    if (result.host_budget_bytes < max_page_size) {
+    if (result.host_budget_bytes < max_staging_size) {
         throw std::invalid_argument(
             "expert host budget is smaller than the largest page");
     }
     const uint64_t staging_count =
         std::min<uint64_t>(
             (uint64_t) result.slot_count,
-            result.host_budget_bytes / max_page_size);
+            result.host_budget_bytes / max_staging_size);
     if (staging_count == 0 ||
         staging_count > (uint64_t) std::numeric_limits<int>::max()) {
         throw std::overflow_error("invalid expert staging buffer count");
     }
     result.staging_buffers      = (int) staging_count;
-    result.staging_buffer_bytes = max_page_size;
-    result.staging_bytes        = max_page_size * staging_count;
+    result.staging_buffer_bytes = max_staging_size;
+    result.staging_bytes        = max_staging_size * staging_count;
+    return result;
+}
+
+std::vector<DeviceMemberLayout> plan_device_member_layout(
+        const std::vector<uint64_t> & sizes, uint64_t alignment) {
+    if (alignment == 0) {
+        throw std::invalid_argument("invalid device member alignment");
+    }
+
+    std::vector<DeviceMemberLayout> result;
+    result.reserve(sizes.size());
+    uint64_t offset = 0;
+    for (const uint64_t size : sizes) {
+        if (size == 0 || offset > UINT64_MAX - (alignment - 1)) {
+            throw std::overflow_error("expert member layout overflows");
+        }
+        offset = GGML_PAD(offset, alignment);
+        if (offset > UINT64_MAX - size) {
+            throw std::overflow_error("expert member layout overflows");
+        }
+        result.push_back({ offset, size });
+        offset += size;
+    }
     return result;
 }
 
@@ -573,6 +695,10 @@ struct Descriptor {
     HParams                                      hparams;
     int                                          expert_first = -1;
     int                                          expert_last  = -1;
+    bool                                         sliced = false;
+    int64_t                                      slice_first = 0;
+    int64_t                                      slice_last  = 0;
+    json                                         expert_slicing;
     std::string                                  input_model;
     std::string                                  identity_algorithm;
     std::string                                  identity_value;
@@ -583,6 +709,7 @@ struct Descriptor {
 struct MemberSpan {
     uint64_t offset = 0;
     uint64_t size   = 0;
+    uint64_t device_offset = 0;
 };
 
 struct ExpertPage {
@@ -592,6 +719,7 @@ struct ExpertPage {
     fs::path                          blob;
     uint64_t                          offset = 0;
     uint64_t                          size   = 0;
+    uint64_t                          device_size = 0;
     std::map<std::string, MemberSpan> roles;
     bool                              is_resident = false;
     ggml_backend_buffer_t             resident_buffer = nullptr;
@@ -775,6 +903,26 @@ Descriptor load_descriptor(const fs::path & path) {
         result.expert_last >= result.hparams.n_expert) {
         throw std::runtime_error(path.string() + ": invalid retained expert range");
     }
+    if (value.contains("expert_slicing")) {
+        const json & slicing = value.at("expert_slicing");
+        const int slice_index = get_value<int>(slicing, "selected_slice", path);
+        const json & widths = get_array(slicing, "widths", path);
+        if (get_value<int64_t>(slicing, "n_ff_exp", path) != result.hparams.n_ff_exp ||
+            get_value<int64_t>(slicing, "n_embd", path) != result.hparams.n_embd ||
+            slice_index < 0 || slice_index >= (int) widths.size()) {
+            throw std::runtime_error(path.string() + ": invalid expert slice geometry");
+        }
+        result.sliced = true;
+        result.expert_slicing = slicing;
+        for (int i = 0; i < slice_index; ++i) {
+            result.slice_first += widths.at(i).get<int64_t>();
+        }
+        result.slice_last = result.slice_first + widths.at(slice_index).get<int64_t>();
+        if (result.slice_first < 0 || result.slice_last <= result.slice_first ||
+            result.slice_last > result.hparams.n_ff_exp) {
+            throw std::runtime_error(path.string() + ": invalid selected expert slice");
+        }
+    }
 
     const json & identity = value.at("shard_manifest_identity");
     result.identity_algorithm = get_value<std::string>(identity, "algorithm", path);
@@ -802,11 +950,12 @@ Descriptor load_descriptor(const fs::path & path) {
         for (const std::string name : { "gate", "up", "down" }) {
             parsed.emplace(name, parse_role(roles.at(name), path));
         }
+        const int64_t n_ff = result.sliced ? result.slice_last - result.slice_first : result.hparams.n_ff_exp;
         if (parsed.at("gate").ne0 != result.hparams.n_embd ||
-            parsed.at("gate").ne1 != result.hparams.n_ff_exp ||
+            parsed.at("gate").ne1 != n_ff ||
             parsed.at("up").ne0 != result.hparams.n_embd ||
-            parsed.at("up").ne1 != result.hparams.n_ff_exp ||
-            parsed.at("down").ne0 != result.hparams.n_ff_exp ||
+            parsed.at("up").ne1 != n_ff ||
+            parsed.at("down").ne0 != n_ff ||
             parsed.at("down").ne1 != result.hparams.n_embd) {
             throw std::runtime_error(path.string() + ": descriptor role shapes disagree with hparams");
         }
@@ -834,9 +983,13 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
 
     const json manifest = read_json(manifest_path);
     check_format(manifest, MANIFEST_FORMAT, manifest_path);
-    if (get_value<std::string>(manifest, "sharding_mode", manifest_path) !=
-        "expert-index-range") {
-        throw std::runtime_error("worker requires an expert-index-range shard manifest");
+    const std::string sharding_mode = get_value<std::string>(manifest, "sharding_mode", manifest_path);
+    if ((result.descriptor.sliced && sharding_mode != "expert-slice") ||
+        (!result.descriptor.sliced && sharding_mode != "expert-index-range")) {
+        throw std::runtime_error("worker descriptor and shard manifest sharding modes disagree");
+    }
+    if (result.descriptor.sliced && manifest.at("expert_slicing") != result.descriptor.expert_slicing) {
+        throw std::runtime_error("descriptor and shard manifest expert slicing disagree");
     }
     const json & identity = manifest.at("content_hash");
     if (get_value<std::string>(identity, "algorithm", manifest_path) !=
@@ -872,6 +1025,9 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
             get_value<std::string>(shard, "index_file", manifest_path);
         const json index = read_json(index_path);
         check_format(index, INDEX_FORMAT, index_path);
+        if (result.descriptor.sliced && index.at("expert_slicing") != result.descriptor.expert_slicing) {
+            throw std::runtime_error(index_path.string() + ": expert slicing disagrees with descriptor");
+        }
         const int shard_index = get_value<int>(index, "shard_index", index_path);
         const int layer_first = get_value<int>(index, "layer_first", index_path);
         const int layer_last  = get_value<int>(index, "layer_last", index_path);
@@ -922,6 +1078,13 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
             if (page.layer != layer_first || page.expert != expected_expert++) {
                 throw std::runtime_error(index_path.string() + ": expert groups are not dense and ordered");
             }
+            if (result.descriptor.sliced &&
+                (get_value<int>(group, "slice_idx", index_path) !=
+                     get_value<int>(result.descriptor.expert_slicing, "selected_slice", descriptor_path) ||
+                 get_value<int64_t>(group, "ff_first", index_path) != result.descriptor.slice_first ||
+                 get_value<int64_t>(group, "ff_last", index_path) != result.descriptor.slice_last)) {
+                throw std::runtime_error(index_path.string() + ": expert group slice span disagrees with descriptor");
+            }
             const json & members = get_array(group, "members", index_path);
             if (members.size() != 3 ||
                 get_value<uint64_t>(group, "member_count", index_path) != 3) {
@@ -941,7 +1104,11 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
                     throw std::runtime_error(
                         index_path.string() + ": member spans disagree with descriptor");
                 }
-                page.roles.emplace(role, MemberSpan{ offset - page.offset, size });
+                if (result.descriptor.sliced && get_array(member, "slice_shape", index_path) !=
+                        json({ role_specs.at(role).ne0, role_specs.at(role).ne1 })) {
+                    throw std::runtime_error(index_path.string() + ": member slice shape disagrees with descriptor");
+                }
+                page.roles.emplace(role, MemberSpan{ offset - page.offset, size, offset - page.offset });
                 next_offset += size;
                 page.size += size;
             }
@@ -951,6 +1118,7 @@ Catalog load_catalog(const fs::path & manifest_path, const fs::path & descriptor
                     index_path.string() +
                     ": expert page is not aligned for one O_DIRECT read");
             }
+            page.device_size = page.size;
             result.max_page_size = std::max(result.max_page_size, page.size);
             if (!result.pages.emplace(
                     std::make_pair(page.layer, page.expert), std::move(page)).second) {
@@ -985,6 +1153,85 @@ void run_self_bench_early(ggml_backend_t backend) {
     setenv("WP_SELF_BENCH", "2", 1);
 }
 
+// Thread count for the CPU expert backend. ggml_backend_cpu_set_n_threads()
+// bakes an EXPLICIT num_threads(n) clause onto every OpenMP region, which
+// OVERRIDES OMP_NUM_THREADS -- so passing hardware_concurrency() (24 SMT on the
+// 3900X) forced 24 threads no matter the env. Measured 2026-08-05: 24 threads
+// is ~2x SLOWER than 8 on ns_submit (raw matmul), because the 3900X is
+// 12-core/24-thread and also runs the spine + R9700 worker + desktop, so 24
+// oversubscribes and every tiny per-request graph pays full OpenMP barrier cost
+// on threads mostly waiting on each other. The DSPARK_OMP=8 fix used to live
+// only in the launch harness (OMP_THREAD_LIMIT), silently lost on any other
+// launcher. Default to the measured optimum in the worker itself; WP_CPU_THREADS
+// overrides (clamped to [1, hw]).
+int cpu_worker_n_threads() {
+    const unsigned int hw = std::thread::hardware_concurrency();
+    const unsigned int hw_clamped = hw == 0 ? 1 : hw;
+    unsigned int n = hw_clamped > 8 ? 8u : hw_clamped;   // measured optimum
+    if (const char * e = std::getenv("WP_CPU_THREADS")) {
+        const long parsed = std::strtol(e, nullptr, 10);
+        if (parsed > 0) {
+            n = (unsigned int) std::min<long>(parsed, (long) hw_clamped);
+        }
+    }
+    return (int) n;
+}
+
+// WP_EXPERT_PARTIAL_DTYPE=f32|f16 (default f32, CONFIG NOT HARDCODE). Wire
+// encoding of the PARTIAL this worker sends back to the spine after summing
+// its own subset of a layer's routed experts -- see the dtype note on
+// pipe_expert_partial in pipe-protocol.h for the full history and the wire
+// format. THE WORKER DECIDES: this is read once, here, at worker startup, and
+// stamped onto every response.dtype in Worker::dispatch() below. The spine
+// never needs its own copy of this knob -- pipe_encode_expert_partial() tags
+// the frame with whatever this resolves to, and pipe_decode_expert_partial()
+// on the spine side decodes strictly from that tag, so a worker that sets
+// WP_EXPERT_PARTIAL_DTYPE=f16 and a spine that has never heard of the env var
+// still interoperate correctly. That self-describing tag is also why this is
+// safe to flip on PER WORKER: two workers on the same layer's expert split can
+// disagree about dtype (e.g. the two remote 1GbE workers run f16, the local one
+// stays f32) and the spine's scatter_add still sums correct f32 values from
+// both, because each partial is converted to f32 on receipt regardless of how
+// it arrived.
+//
+// WHY THIS IS OPT-IN AND DEFAULT OFF: f16 partials reintroduce the same
+// quantization the 2026-08-04 f32 fix (see pipe_expert_partial) was written to
+// remove -- rounding a worker's subtotal to an 11-bit mantissa (~5e-4 relative)
+// AT THE EXPERT-TO-WORKER PARTITION BOUNDARY, which the hyper-connection gates
+// and the discontinuous router top-k can amplify into a different generated
+// token at temperature 0. That risk does not go away with the dtype tag; the
+// tag only makes it IMPOSSIBLE for the wire to silently misinterpret bytes,
+// not impossible for f16 rounding to perturb a sum. Acceptable to trade for
+// halved bytes on a bandwidth-bound 1GbE hop under f16 KV; risky under turbo4
+// KV, where the same amplification mechanism that motivated the f32 default
+// lives. Hence: opt-in, per-worker, and off unless a human explicitly asks for
+// it on the specific link that needs it.
+int32_t wp_expert_partial_dtype() {
+    static const int32_t dtype = [] {
+        const char * e = std::getenv("WP_EXPERT_PARTIAL_DTYPE");
+        int32_t      resolved = PIPE_HIDDEN_F32;
+        const char * label    = "f32";
+        if (e != nullptr && e[0] != '\0') {
+            if (std::strcmp(e, "f16") == 0) {
+                resolved = PIPE_HIDDEN_F16;
+                label    = "f16";
+            } else if (std::strcmp(e, "f32") != 0) {
+                std::fprintf(stderr,
+                    "wp-expert-worker: WP_EXPERT_PARTIAL_DTYPE=\"%s\" is not "
+                    "\"f32\" or \"f16\" -- defaulting to f32\n", e);
+            }
+        }
+        // Logged unconditionally (not just on override) so a run's log always
+        // states the resolved config, per the "CONFIG NOT HARDCODE" requirement --
+        // a silent default is indistinguishable from a hardcode from the log alone.
+        std::cout << "wp-expert-worker: WP_EXPERT_PARTIAL_DTYPE=" << label
+                  << " (partial responses encoded as " << label << " on the wire)"
+                  << std::endl;
+        return resolved;
+    }();
+    return dtype;
+}
+
 backend_ptr init_backend(const std::string & device) {
     std::string lower = device;
     std::transform(lower.begin(), lower.end(), lower.begin(),
@@ -993,8 +1240,7 @@ backend_ptr init_backend(const std::string & device) {
     if (lower == "cpu") {
         backend = ggml_backend_cpu_init();
         if (backend != nullptr) {
-            const unsigned int hw = std::thread::hardware_concurrency();
-            ggml_backend_cpu_set_n_threads(backend, hw == 0 ? 1 : (int) hw);
+            ggml_backend_cpu_set_n_threads(backend, cpu_worker_n_threads());
         }
     } else {
         ggml_backend_load_all();
@@ -1146,10 +1392,104 @@ std::vector<ResourcePage> resource_pages(const Catalog & catalog) {
     std::vector<ResourcePage> result;
     result.reserve(catalog.pages.size());
     for (const auto & item : catalog.pages) {
-        result.push_back({ item.second.layer, item.second.size,
-                           item.second.is_resident });
+        result.push_back({ item.second.layer, item.second.device_size,
+                           item.second.is_resident, item.second.size });
     }
     return result;
+}
+
+Catalog & layout_sliced_pages(
+        Catalog & catalog, ggml_backend_buffer_type_t buft) {
+    if (!catalog.descriptor.sliced) {
+        return catalog;
+    }
+
+    const uint64_t alignment = ggml_backend_buft_get_alignment(buft);
+    for (auto & item : catalog.pages) {
+        ExpertPage & page = item.second;
+        const auto & specs = catalog.descriptor.layers.at(page.layer);
+        std::vector<std::pair<std::string, MemberSpan *>> members;
+        members.reserve(page.roles.size());
+        for (auto & role : page.roles) {
+            members.emplace_back(role.first, &role.second);
+        }
+        std::sort(members.begin(), members.end(),
+                  [](const auto & a, const auto & b) {
+                      return a.second->offset < b.second->offset;
+                  });
+
+        context_ptr ctx(ggml_init({
+            /* .mem_size = */ ggml_tensor_overhead() * members.size(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc = */ true,
+        }));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate expert slice layout metadata");
+        }
+        std::vector<uint64_t> allocation_sizes;
+        allocation_sizes.reserve(members.size());
+        for (const auto & member : members) {
+            const RoleSpec & spec = specs.at(member.first);
+            ggml_tensor * tensor =
+                ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
+            const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+            if (alloc_size < member.second->size) {
+                throw std::runtime_error("invalid expert slice device allocation size");
+            }
+            allocation_sizes.push_back((uint64_t) alloc_size);
+        }
+        const std::vector<DeviceMemberLayout> layout =
+            plan_device_member_layout(allocation_sizes, alignment);
+        uint64_t device_size = 0;
+        for (size_t i = 0; i < members.size(); ++i) {
+            members[i].second->device_offset = layout[i].offset;
+            if (layout[i].offset > UINT64_MAX - layout[i].size) {
+                throw std::overflow_error("expert slice device layout overflows");
+            }
+            device_size = std::max(device_size, layout[i].offset + layout[i].size);
+        }
+        page.device_size = device_size;
+    }
+    return catalog;
+}
+
+template <typename F>
+void for_each_page_chunk(
+        const ExpertPage & page, size_t page_offset, size_t size, F && fn) {
+    if (page_offset > page.size || size > page.size - page_offset) {
+        throw std::runtime_error("expert page transfer is outside the blob page");
+    }
+    const uint64_t range_end = (uint64_t) page_offset + size;
+    for (const auto & role : page.roles) {
+        const MemberSpan & member = role.second;
+        const uint64_t member_end = member.offset + member.size;
+        const uint64_t begin = std::max<uint64_t>(page_offset, member.offset);
+        const uint64_t end = std::min(range_end, member_end);
+        if (begin < end) {
+            fn((size_t) (begin - page_offset),
+               (size_t) (member.device_offset + begin - member.offset),
+               (size_t) (end - begin));
+        }
+    }
+}
+
+void tensor_set_page_range(
+        ggml_tensor * tensor, const ExpertPage & page, const void * source,
+        size_t page_offset, size_t size) {
+    for_each_page_chunk(page, page_offset, size,
+                        [tensor, source](size_t source_offset, size_t device_offset, size_t n) {
+        ggml_backend_tensor_set(
+            tensor, (const char *) source + source_offset, device_offset, n);
+    });
+}
+
+void tensor_get_page(
+        ggml_tensor * tensor, const ExpertPage & page, void * destination) {
+    for_each_page_chunk(page, 0, (size_t) page.size,
+                        [tensor, destination](size_t destination_offset, size_t device_offset, size_t n) {
+        ggml_backend_tensor_get(
+            tensor, (char *) destination + destination_offset, device_offset, n);
+    });
 }
 
 struct free_deleter {
@@ -1261,20 +1601,12 @@ public:
         copy_stream_h2d_ = backend_ != nullptr && device_ != nullptr &&
             ggml_backend_cuda_wp_copy_stream_enabled != nullptr &&
             ggml_backend_cuda_wp_copy_stream_enabled(backend_);
-        // WP_EXPERT_ASYNC_H2D=1 -- 2026-08-07 consult lever, retargeted at the
-        // 2026 workers after the straggler finding (their staging drain runs
-        // 4.4-5.6 ms/request vs the R9700's 0.6). The drain issues
-        // ggml_backend_tensor_set_async on the backend's compute stream instead
-        // of a blocking copy; stream order keeps compute correct (the graph
-        // runs on the same stream, after the copy). The ONLY new hazard is
-        // staging-buffer reuse while a copy is still in flight, closed here:
-        // the drain records a backend event against the buffer it copied from
-        // (mark_in_flight), and borrow() waits on that event before handing
-        // the buffer out again. By the time a buffer can be re-borrowed its
-        // lease has been released, and every record for it happened before the
-        // release, so record and synchronize can never race on one event.
-        // Backends without events (ggml_backend_event_new -> NULL, e.g.
-        // Vulkan's device iface today) fall back to the sync path untouched.
+        // WP_EXPERT_ASYNC_H2D=1 -- opt IN. Default OFF: 2026-08-07 it lost
+        // decode (3.82/3.67 vs 3.94) because a copy on the COMPUTE stream
+        // cannot overlap the graph. The dedicated-stream path is
+        // WP_EXPERT_COPY_STREAM=1. Vulkan stays OFF even when =1: it killed
+        // :8804 mid-prefill. Drain uses tensor_set_async on the compute
+        // stream; mark_in_flight / borrow() fence staging reuse.
         const char * async_env = std::getenv("WP_EXPERT_ASYNC_H2D");
         if (async_env != nullptr && async_env[0] != '\0' && async_env[0] != '0' &&
                 backend != nullptr) {
@@ -1478,7 +1810,7 @@ public:
             }
             Allocation allocation;
             allocation.buffer.reset(ggml_backend_alloc_buffer(
-                backend_, (size_t) page.size));
+                backend_, (size_t) page.device_size));
             if (!allocation.buffer) {
                 throw std::runtime_error("failed to allocate resident expert page");
             }
@@ -1493,7 +1825,7 @@ public:
                 throw std::runtime_error("failed to allocate resident expert metadata");
             }
             allocation.raw = ggml_new_tensor_1d(
-                allocation.ctx.get(), GGML_TYPE_I8, (int64_t) page.size);
+                allocation.ctx.get(), GGML_TYPE_I8, (int64_t) page.device_size);
             allocation.raw->buffer = allocation.buffer.get();
             allocation.raw->data = ggml_backend_buffer_get_base(allocation.buffer.get());
             if (allocation.raw->data == nullptr ||
@@ -1508,8 +1840,8 @@ public:
             }
             try {
                 read_once(page, host);
-                ggml_backend_tensor_set(
-                    allocation.raw, host, 0, (size_t) page.size);
+                tensor_set_page_range(
+                    allocation.raw, page, host, 0, (size_t) page.size);
             } catch (...) {
                 std::free(host);
                 throw;
@@ -1519,7 +1851,7 @@ public:
             page.is_resident = true;
             page.resident_buffer = allocation.buffer.get();
             page.resident_base = allocation.raw->data;
-            pinned_bytes_ += page.size;
+            pinned_bytes_ += page.device_size;
             ++pinned_pages_;
             allocations_.push_back(std::move(allocation));
         }
@@ -1646,6 +1978,10 @@ private:
         // rewrite look like it had made the used-rate worse (686 -> 431).
         // Only the dispatch thread reads/writes it, and always after submit.
         bool                                    speculative = false;
+        // Decode/verify demand reads land a host-tier copy from staging so
+        // eviction does not need a sync D2H. Prefill (n_tokens>8) stays out
+        // so a 108-pagein ubatch cannot wipe the 3 GiB decode working set.
+        bool                                    admit_host_on_read = false;
     };
 
 public:
@@ -1684,12 +2020,30 @@ public:
         resources_.device_bytes = 0;
         std::set<int> reserved_indices(resources_.reserved_slot_indices.begin(),
                                        resources_.reserved_slot_indices.end());
+        allocate_slot_arenas();
+        size_t arena_index  = 0;
+        uint64_t arena_used = 0;
         for (const SlotClass & slot_class : resources_.slot_classes) {
             for (int i = 0; i < slot_class.slots; ++i) {
-                slots_.push_back(make_slot(slot_class.size));
+                const uint64_t need = arena_slot_stride(slot_class.size);
+                if (arena_index >= arenas_.size()) {
+                    throw std::runtime_error("expert slot arenas exhausted");
+                }
+                uint64_t cap = (uint64_t) ggml_backend_buffer_get_size(arenas_[arena_index].get());
+                if (arena_used + need > cap) {
+                    ++arena_index;
+                    arena_used = 0;
+                    if (arena_index >= arenas_.size()) {
+                        throw std::runtime_error("expert slot arenas exhausted");
+                    }
+                }
+                slots_.push_back(
+                    make_slot_in(arenas_[arena_index].get(), arena_used, slot_class.size));
+                arena_used += need;
                 slots_.back().reserved = reserved_indices.count((int) slots_.size() - 1) != 0;
-                resources_.device_bytes +=
-                    ggml_backend_buffer_get_size(slots_.back().buffer.get());
+                // Count the SLOT bytes, not the buffer size: one arena backs many
+                // slots, so summing buffer sizes would multiply-count it.
+                resources_.device_bytes += slot_class.size;
             }
         }
         resources_.staging_buffers      = staging_.buffer_count();
@@ -1714,8 +2068,9 @@ public:
                     // on CUDA/ROCm whose addresses are real and unique).
                     (void) src_device;
                     for (const Slot & slot : slots_) {
-                        if (slot.valid && slot.raw != nullptr && slot.cache_id == page_idx) {
-                            ggml_backend_tensor_get(slot.raw, dst_host, 0, n);
+                        if (slot.valid && slot.raw != nullptr && slot.page != nullptr &&
+                            slot.cache_id == page_idx && n == slot.page->size) {
+                            tensor_get_page(slot.raw, *slot.page, dst_host);
                             return true;
                         }
                     }
@@ -1729,6 +2084,9 @@ public:
             // meant to fill". This line silently failed to apply once already:
             // a str.replace with the wrong indentation is a no-op, not an error.
             host_tier_.set_speculative_tier(true);
+            fprintf(stderr,
+                    "wp::HostTier: fill_on_read=%d (decode n_tokens<=8) demote_d2h=%d\n",
+                    (int) fill_host_on_read_, (int) demote_d2h_);
         }
     }
 
@@ -1837,6 +2195,14 @@ public:
             return ns_host_get_;
         }
 
+        uint64_t ns_demote() const {
+            return ns_demote_;
+        }
+
+        uint64_t ns_ensure_post() const {
+            return ns_ensure_post_;
+        }
+
         uint64_t host_bytes() const {
             return host_bytes_;
         }
@@ -1870,6 +2236,8 @@ public:
         uint64_t                   n_host_hit_ = 0;
         uint64_t                   n_host_demote_ = 0;
         uint64_t                   ns_host_get_ = 0;
+        uint64_t                   ns_demote_ = 0;
+        uint64_t                   ns_ensure_post_ = 0;
         uint64_t                   host_bytes_ = 0;
         uint64_t                   ns_h2d_    = 0;
         uint64_t                   bytes_h2d_ = 0;
@@ -1888,7 +2256,8 @@ public:
     Batch ensure_batch(
             const std::vector<const ExpertPage *> & pages,
             bool measure,
-            std::chrono::steady_clock::time_point lookup_started) {
+            std::chrono::steady_clock::time_point lookup_started,
+            uint32_t n_tokens = 0) {
         // Take anything the reader threads already landed -- free residency for
         // this request, and it frees the pins. Non-blocking.
         if (spec_batch_ && !spec_recursion_) {
@@ -1936,8 +2305,9 @@ public:
                 slot.tick = ++tick_;
                 ++slot.uses;
                 batch.entries_[i] = {
-                    { slot.buffer.get(),
-                      ggml_backend_buffer_get_base(slot.buffer.get()) },
+                    // raw->data, NOT the buffer base: one arena backs many slots,
+                    // so the buffer base is slot 0's address for every slot.
+                    { slot.buffer, slot.raw->data },
                     slot_index,
                     true,
                     true,
@@ -1971,6 +2341,14 @@ public:
                 batch.ns_lookup_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - lookup_started).count();
             }
+            const auto ensure_post_t0 = std::chrono::steady_clock::now();
+            auto stamp_ensure_post = [&]() {
+                if (measure) {
+                    batch.ns_ensure_post_ =
+                        (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - ensure_post_t0).count();
+                }
+            };
 
             struct HostHit {
                 const void *                   src = nullptr;
@@ -2020,6 +2398,9 @@ public:
                           });
             }
             batch.state_ = std::make_shared<BatchState>();
+            batch.state_->admit_host_on_read =
+                host_victim_enabled_ && fill_host_on_read_ && !demote_d2h_ &&
+                n_tokens > 0 && n_tokens <= 8;
             batch.copy_event_ = staging_.new_copy_event();
             batch.state_->pageins.reserve(pageins.size());
             try {
@@ -2028,8 +2409,17 @@ public:
                     const size_t slot_index =
                         batch.entries_[entry_index].slot_index;
                     Slot & slot = slots_[slot_index];
-                    if (slot.valid && demote_slot(slot)) {
-                        ++batch.n_host_demote_;
+                    if (slot.valid) {
+                        const auto demote_t0 = measure ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
+                        if (demote_slot(slot)) {
+                            ++batch.n_host_demote_;
+                        }
+                        if (measure) {
+                            batch.ns_demote_ +=
+                                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - demote_t0).count();
+                        }
                     }
                     slot.valid = false;
 
@@ -2086,14 +2476,17 @@ public:
                         const std::chrono::steady_clock::time_point host_get_started =
                             measure ? std::chrono::steady_clock::now() :
                                       std::chrono::steady_clock::time_point();
-                        ggml_backend_tensor_set(
-                            slot.raw, host_hit.src, 0, (size_t) page.size);
+                        tensor_set_page_range(
+                            slot.raw, page, host_hit.src, 0, (size_t) page.size);
                         host_tier_.release(page.cache_id, host_hit.borrow);
                         host_hit.borrow = wp::HostTier::kInvalidBorrowHandle;
-                        host_tier_.erase(page.cache_id);
+                        if (!fill_host_on_read_ || demote_d2h_) {
+                            host_tier_.erase(page.cache_id);
+                        }
                         slot.valid    = true;
                         slot.key      = { page.layer, page.expert };
                         slot.cache_id = page.cache_id;
+                        slot.page     = &page;
                         slot.size     = page.size;
                         slot.tick     = ++tick_;
                         // Admit at the age of the last page we evicted, not at
@@ -2103,8 +2496,7 @@ public:
                         // reasons plain use-counting loses to LRU.
                         slot.uses     = evict_age_ + 1;
                         batch.entries_[entry_index].loaded = {
-                            slot.buffer.get(),
-                            ggml_backend_buffer_get_base(slot.buffer.get())
+                            slot.buffer, slot.raw->data
                         };
                         batch.entries_[entry_index].hit   = true;
                         batch.entries_[entry_index].ready = true;
@@ -2140,6 +2532,7 @@ public:
 
             if (batch.state_->pageins.empty()) {
                 batch.completed_ = true;
+                stamp_ensure_post();
                 return batch;
             }
 
@@ -2195,6 +2588,7 @@ public:
                 batch.state_->start = true;
             }
             batch.state_->cv.notify_all();
+            stamp_ensure_post();
             return batch;
         } catch (...) {
             cancel_workers(batch);
@@ -2359,6 +2753,11 @@ public:
         host_thread_ = std::thread([this, cold]() {
             for (const auto & [page, fd] : cold) {
                 try {
+                    if (spec_preempt_before_borrow_) {
+                        while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(200));
+                        }
+                    }
                     StagingPool::Lease lease = staging_.borrow();
                     // Fire the same hooks as every other read path. A host
                     // landing IS a read -- instrumentation that cannot see it
@@ -2538,8 +2937,26 @@ public:
 private:
     struct Slot {
         context_ptr         ctx;
-        buffer_ptr          buffer;
+        // NON-OWNING. Slots are carved out of a few large ARENA buffers owned by
+        // arenas_, not allocated one-per-slot, because one backend allocation per
+        // slot walks straight into the allocators' per-allocation limits:
+        //   RX 480 / RADV : maxMemoryAllocationCount is 4096, and ggml's fallback
+        //     list ends in HostVisible|HostCoherent, so allocation 4097 SILENTLY
+        //     lands in GTT (system RAM) instead of failing. Measured 2026-08-16:
+        //     4096 slots -> 6526 MiB in VRAM, 4400 -> 6528 MiB in VRAM plus
+        //     574 MiB in GTT. 1.6 GB of an 8 GB card unreachable.
+        //   GTX 1070 / CUDA: rounds every allocation up to a 2 MiB granule, so a
+        //     1.594 MiB slice page wastes 25%. 3800 slots consumed 7600 MiB of
+        //     VRAM to hold 6057 MiB of experts.
+        // Both are consequences of the SLICED page being 1.594 MiB where the old
+        // whole-expert page was 12.75 MiB -- 8x the slot count at the same bytes.
+        // An arena is one allocation per ~GB, under both limits, with no rounding.
+        ggml_backend_buffer_t buffer  = nullptr;
+        // Byte offset of this slot within `buffer`. raw->data is the authoritative
+        // slot address; this is kept for accounting and assertions.
+        uint64_t            offset    = 0;
         ggml_tensor *       raw       = nullptr;
+        const ExpertPage *   page      = nullptr;
         std::pair<int, int> key;
         int                 cache_id  = -1;
         uint64_t            capacity  = 0;
@@ -2578,7 +2995,13 @@ private:
     }
 
     bool demote_slot(const Slot & slot) {
-        return host_victim_enabled_ && slot.valid && slot.cache_id >= 0 && slot.size != 0 &&
+        if (!host_victim_enabled_ || !slot.valid || slot.cache_id < 0 || slot.size == 0) {
+            return false;
+        }
+        if (fill_host_on_read_ && !demote_d2h_ && host_tier_.contains(slot.cache_id)) {
+            return true;
+        }
+        return slot.page != nullptr &&
             host_tier_.store_from_device(slot.cache_id, slot.raw->data, (size_t) slot.size);
     }
 
@@ -2904,11 +3327,34 @@ private:
                 // this copy. NOTE ns_h2d then measures ISSUE time, not copy
                 // time; the copy overlaps reads/submit and the A/B metric is
                 // the request wall.
-                if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
-                    ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
-                    ggml_backend_cuda_wp_copy_tensor_async(
-                        backend_, slot.raw, (const char *) result->staging->get() + result->offset,
-                        result->offset, result->len)) {
+                if (pagein.page->device_size != pagein.page->size) {
+                    bool async_copy = false;
+                    for_each_page_chunk(
+                        *pagein.page, result->offset, result->len,
+                        [&](size_t source_offset, size_t device_offset, size_t n) {
+                        const char * source =
+                            (const char *) result->staging->get() + result->offset + source_offset;
+                        if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
+                            ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
+                            ggml_backend_cuda_wp_copy_tensor_async(
+                                backend_, slot.raw, source, device_offset, n)) {
+                            async_copy = true;
+                        } else if (!batch.state_->speculative && staging_.async_h2d()) {
+                            ggml_backend_tensor_set_async(
+                                backend_, slot.raw, source, device_offset, n);
+                            async_copy = true;
+                        } else {
+                            ggml_backend_tensor_set(slot.raw, source, device_offset, n);
+                        }
+                    });
+                    if (async_copy) {
+                        staging_.mark_in_flight(result->staging->get());
+                    }
+                } else if (!batch.state_->speculative && staging_.copy_stream_h2d() &&
+                           ggml_backend_cuda_wp_copy_tensor_async != nullptr &&
+                           ggml_backend_cuda_wp_copy_tensor_async(
+                               backend_, slot.raw, (const char *) result->staging->get() + result->offset,
+                               result->offset, result->len)) {
                     staging_.mark_in_flight(result->staging->get());
                 } else if (!batch.state_->speculative && staging_.async_h2d()) {
                     ggml_backend_tensor_set_async(
@@ -2957,19 +3403,28 @@ private:
                         fprintf(spec_log_, "D %d %d\n", pagein.page->layer, pagein.page->expert);
                         fflush(spec_log_);
                     }
+                    // Land the full page (all stripes share one staging lease)
+                    // in the host tier so the next evict skips D2H. CPU memcpy
+                    // of 12.75 MiB; not a GPU sync.
+                    if (batch.state_->admit_host_on_read &&
+                        result->staging && pagein.page->cache_id >= 0) {
+                        host_tier_.store(pagein.page->cache_id,
+                                         result->staging->get(),
+                                         (size_t) pagein.page->size);
+                    }
                     slot.valid = true;
                     slot.key   = {
                         pagein.page->layer, pagein.page->expert
                     };
                     slot.cache_id = pagein.page->cache_id;
+                    slot.page     = pagein.page;
                     slot.size     = pagein.page->size;
                     slot.tick  = ++tick_;
                     slot.uses  = evict_age_ + 1;
                     Batch::Entry & entry =
                         batch.entries_[pagein.entry_index];
                     entry.loaded = {
-                        slot.buffer.get(),
-                        ggml_backend_buffer_get_base(slot.buffer.get())
+                        slot.buffer, slot.raw->data
                     };
                     entry.ready = true;
                 }
@@ -3079,20 +3534,88 @@ private:
 
     FILE * spec_log_ = nullptr;
 
-    Slot make_slot(uint64_t capacity) {
+    // Per-slot stride inside an arena: the slot's bytes rounded up to the
+    // backend's tensor alignment, so every slot's base is legally aligned for
+    // ggml_backend_buffer_init_tensor. The slice page (1671168 B) is already a
+    // multiple of 4096, so on both backends here this rounds to itself -- the
+    // round-up is for correctness on any future page geometry, not padding we
+    // expect to pay.
+    uint64_t arena_slot_stride(uint64_t size) const {
+        const size_t align =
+            ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(backend_));
+        const uint64_t a = align == 0 ? 1 : (uint64_t) align;
+        return ((size + a - 1) / a) * a;
+    }
+
+    // Allocate the arena buffers that back every slot. A few large allocations
+    // instead of one per slot -- see the comment on Slot::buffer for why.
+    void allocate_slot_arenas() {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend_);
+        uint64_t total = 0;
+        for (const SlotClass & slot_class : resources_.slot_classes) {
+            total += arena_slot_stride(slot_class.size) * (uint64_t) slot_class.slots;
+        }
+        if (total == 0) {
+            return;
+        }
+        // Respect the backend's max single-allocation size; split across as many
+        // arenas as that requires. Vulkan reports a real cap here (and a 4 GB
+        // buffer would exceed maxStorageBufferRange on Polaris anyway).
+        size_t max_buf = ggml_backend_buft_get_max_size(buft);
+        if (max_buf == 0 || max_buf > SIZE_MAX / 2) {
+            max_buf = (size_t) 1 << 30;
+        }
+        // Never split a slot across arenas: cap each arena at a whole number of
+        // the largest stride in play.
+        uint64_t max_stride = 0;
+        for (const SlotClass & slot_class : resources_.slot_classes) {
+            max_stride = std::max(max_stride, arena_slot_stride(slot_class.size));
+        }
+        if (max_stride == 0) {
+            return;
+        }
+        uint64_t arena_bytes = (uint64_t) max_buf / max_stride * max_stride;
+        if (arena_bytes == 0) {
+            arena_bytes = max_stride;
+        }
+        uint64_t remaining = total;
+        while (remaining > 0) {
+            const uint64_t want = std::min(arena_bytes, remaining);
+            buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, (size_t) want));
+            if (!buf) {
+                throw std::runtime_error(
+                    "failed to allocate expert slot arena of " + std::to_string(want) + " bytes");
+            }
+            ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            arenas_.push_back(std::move(buf));
+            remaining -= want;
+        }
+    }
+
+    // Carve one slot out of an already-allocated arena buffer at `offset`.
+    // The slot does NOT own the buffer; arenas_ does.
+    Slot make_slot_in(ggml_backend_buffer_t arena, uint64_t offset, uint64_t capacity) {
         if (capacity == 0 ||
             capacity > (uint64_t) std::numeric_limits<size_t>::max() ||
             capacity > (uint64_t) std::numeric_limits<int64_t>::max()) {
             throw std::runtime_error("invalid expert slot capacity");
         }
+        if (arena == nullptr) {
+            throw std::runtime_error("expert slot arena is null");
+        }
+        // The arena must actually contain the slot. A silent overrun here would
+        // scribble into the neighbouring slot's page, which is exactly the
+        // failure mode the CUDA slot-padding fix existed to end -- so it is a
+        // hard check, not an assert compiled out in release.
+        const uint64_t arena_bytes = (uint64_t) ggml_backend_buffer_get_size(arena);
+        if (offset > arena_bytes || capacity > arena_bytes - offset) {
+            throw std::runtime_error("expert slot does not fit its arena");
+        }
 
         Slot slot;
         slot.capacity = capacity;
-        slot.buffer.reset(ggml_backend_alloc_buffer(backend_, (size_t) capacity));
-        if (!slot.buffer) {
-            throw std::runtime_error("failed to allocate device expert slot");
-        }
-        ggml_backend_buffer_set_usage(slot.buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        slot.buffer   = arena;
+        slot.offset   = offset;
 
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * 2,
@@ -3105,10 +3628,13 @@ private:
         }
         slot.raw = ggml_new_tensor_1d(
             slot.ctx.get(), GGML_TYPE_I8, (int64_t) capacity);
-        slot.raw->buffer = slot.buffer.get();
-        slot.raw->data   = ggml_backend_buffer_get_base(slot.buffer.get());
-        if (slot.raw->data == nullptr ||
-            ggml_backend_buffer_init_tensor(slot.buffer.get(), slot.raw) != GGML_STATUS_SUCCESS) {
+        slot.raw->buffer = arena;
+        uint8_t * const base = (uint8_t *) ggml_backend_buffer_get_base(arena);
+        if (base == nullptr) {
+            throw std::runtime_error("expert slot arena has no base pointer");
+        }
+        slot.raw->data = base + offset;
+        if (ggml_backend_buffer_init_tensor(arena, slot.raw) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("failed to initialize expert slot tensor");
         }
         return slot;
@@ -3170,7 +3696,12 @@ private:
         std::vector<std::pair<size_t, size_t>> out;
         const size_t total = (size_t) page_size;
         constexpr size_t kAlign   = 4096;
-        constexpr size_t kMinPart = 1u << 20;   // don't split below 1 MiB/stripe
+        // kMinPart: don't split a stripe below this many bytes. THIS VALUE MUST
+        // TRACK THE PAGE SIZE OF THE RIG, NOT BE A FIXED CONSTANT -- see
+        // stripe_min_part_ below for why a 1 MiB floor (correct for the OLD
+        // 12.75 MiB whole-expert page) silently disables striping on the sliced
+        // rig's ~1.5-9 MiB width-slice pages.
+        const size_t kMinPart = stripe_min_part_;
         size_t n = read_stripes_;
         // *** GATE ON THE BATCH BEING READ-SPARSE. ***
         // Striping only pays when a page has no OTHER page to overlap against.
@@ -3191,19 +3722,27 @@ private:
         }
         if (n <= 1) {
             out.emplace_back(0, total);
-            return out;
+        } else {
+            const size_t part = ((total / n) / kAlign) * kAlign;
+            if (part == 0) {
+                out.emplace_back(0, total);
+            } else {
+                size_t off = 0;
+                while (off + part < total) {
+                    out.emplace_back(off, part);
+                    off += part;
+                }
+                out.emplace_back(off, total - off);   // remainder tail
+            }
         }
-        const size_t part = ((total / n) / kAlign) * kAlign;
-        if (part == 0) {
-            out.emplace_back(0, total);
-            return out;
+        // Test-only observation point: reports how many stripes THIS call
+        // actually chose for (page_size, n_pageins), independent of the
+        // per-page read_started/read_finished hooks (which fire once per
+        // page, not once per stripe, and so cannot tell a test whether the
+        // sliced-page-size fix above actually engaged striping).
+        if (test_hooks_ != nullptr && test_hooks_->stripe_planned) {
+            test_hooks_->stripe_planned(page_size, n_pageins, out.size());
         }
-        size_t off = 0;
-        while (off + part < total) {
-            out.emplace_back(off, part);
-            off += part;
-        }
-        out.emplace_back(off, total - off);   // remainder tail
         return out;
     }
 
@@ -3221,6 +3760,14 @@ private:
     // Measured per page-in on the 480 at decode: read ~5.4 ms, h2d ~3.63 ms.
     // NOTE ns_read is a SPAN and ns_h2d is a SUM, so those two do not simply add
     // -- do not size this change by adding them.
+    //
+    // 2026-08-17: on the DS4-Flash SLICED rig this knob alone stopped being
+    // enough -- see stripe_min_part_from_env() below. The old whole-expert
+    // page (12.75 MiB) was large enough that n=4 always cleared the old 1 MiB
+    // floor; the sliced page (~1.5-9 MiB, e.g. the 1.594 MiB slice page noted
+    // on ResidentExpertPool::Slot) is small enough that it often did not, so
+    // stripe_plan silently fell back to n=1 (no striping) on exactly the
+    // small lone-miss decode pages this knob exists to pipeline.
     static size_t read_stripes_from_env() {
         const char * e = std::getenv("WP_EXPERT_READ_STRIPES");
         if (e == nullptr || e[0] == '\0') {
@@ -3244,11 +3791,47 @@ private:
         return parsed >= 0 ? (size_t) parsed : (size_t) 4;
     }
 
+    // WP_EXPERT_STRIPE_MIN_PART=<bytes>: floor below which stripe_plan will
+    // not split a page further (rounded down to a 4096 multiple at use).
+    //
+    // WHY THIS EXISTS. stripe_plan's old floor was a hardcoded 1 MiB
+    // (`kMinPart`), sized for the pre-sliced rig's ~12.75 MiB whole-expert
+    // page. On THIS (DS4-Flash sliced) rig the catalog's own page-size
+    // comment (ResidentExpertPool::Slot, above) records a 1671168-byte
+    // (1.594 MiB) slice page, and the decode miss pages this worker actually
+    // sees run ~1.5-9 MiB -- close enough to the 1 MiB floor that
+    // total/read_stripes_ (4) undercuts it: 1.594 MiB / 4 = 408 KiB < 1 MiB,
+    // so the old floor forced n = total/kMinPart = 1, i.e. NO STRIPING AT
+    // ALL, silently, for exactly the smallest and most common decode-miss
+    // pages. That defeated the striped read/H2D pipeline (read_worker /
+    // drain_one_read: reader thread reads stripe k+1 on its own thread while
+    // the dispatch thread uploads stripe k) for a lone small slice read --
+    // the read and the H2D ran fully serially because there was only ever
+    // one "stripe" to run them on.
+    //
+    // 256 KiB keeps stripe_plan from collapsing back to n=1 until a page is
+    // itself under ~1 MiB (256 KiB * read_stripes_ default of 4), which is
+    // below every sliced page size observed on this rig, while still leaving
+    // each stripe's O_DIRECT pread comfortably above the 4096-byte alignment
+    // floor. It does NOT touch WP_EXPERT_STRIPE_MAX_PAGEINS (still default
+    // 4): prefill's ~31 page-ins/request stays on the whole-page path
+    // regardless of this value, so this cannot reintroduce the +10.7% prefill
+    // regression measured 2026-08-05 for striping dense batches.
+    static size_t stripe_min_part_from_env() {
+        const char * e = std::getenv("WP_EXPERT_STRIPE_MIN_PART");
+        if (e == nullptr || e[0] == '\0') {
+            return 256u << 10;   // 256 KiB
+        }
+        const long parsed = std::strtol(e, nullptr, 10);
+        return parsed > 0 ? (size_t) parsed : (size_t) (256u << 10);
+    }
+
     ggml_backend_t             backend_ = nullptr;
     ResourcePlan               resources_;
     StagingPool                staging_;
     size_t                     read_stripes_ = read_stripes_from_env();
     size_t                     stripe_max_pageins_ = stripe_max_pageins_from_env();
+    size_t                     stripe_min_part_ = stripe_min_part_from_env();
     // WP_EXPERT_STRIPE_PARALLEL=1 -- stripes of one page are claimed by
     // MULTIPLE reader threads concurrently (QD>1 per page) instead of read
     // serially by the page's claimer. Default off: bare runs stay on the
@@ -3260,6 +3843,18 @@ private:
     TestHooks *                test_hooks_ = nullptr;
     wp::HostTier               host_tier_;
     bool                       host_victim_enabled_ = false;
+    // WP_EXPERT_FILL_HOST_ON_READ=1 keeps decode reads in the host tier so a
+    // later eviction can skip the synchronous D2H. Default off for A/B.
+    const bool                 fill_host_on_read_ = [] {
+        const char * e = std::getenv("WP_EXPERT_FILL_HOST_ON_READ");
+        return e != nullptr && e[0] == '1';
+    }();
+    // WP_EXPERT_DEMOTE_D2H=1 forces the old synchronous D2H path, including
+    // when fill-on-read is enabled.
+    const bool                 demote_d2h_ = [] {
+        const char * e = std::getenv("WP_EXPERT_DEMOTE_D2H");
+        return e != nullptr && e[0] == '1';
+    }();
     // *** TWO LRU BANDS, NOT ONE COUNTER. ***
     // Demand ticks start at kDemandTickBase and prefetch ticks at 0, so EVERY
     // prefetched page is strictly older than EVERY demand-touched page and is
@@ -3317,6 +3912,13 @@ private:
     // idle 60-70% (kmbandy's framing, 2026-08-07). DEFAULT OFF.
     const bool spec_preempt_ = [] {
         const char * e = std::getenv("WP_EXPERT_SPEC_PREEMPT");
+        return e != nullptr && e[0] == '1';
+    }();
+    // WP_EXPERT_SPEC_PREEMPT_BEFORE_BORROW=1 keeps a speculative host landing
+    // from holding a shared staging lease while demand I/O is already pending.
+    // Default off for an A/B against the original preemption behaviour.
+    const bool spec_preempt_before_borrow_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREEMPT_BEFORE_BORROW");
         return e != nullptr && e[0] == '1';
     }();
     const size_t spec_subread_ = [] {
@@ -3382,6 +3984,9 @@ private:
     uint64_t                   spec_pageins_  = 0;
     uint64_t                   spec_bytes_  = 0;
     uint64_t                   spec_errors_ = 0;
+    // The large backing allocations every slot is carved from. Declared BEFORE
+    // slots_ so it outlives them: Slot::buffer points in here and does not own.
+    std::vector<buffer_ptr>    arenas_;
     std::vector<Slot>          slots_;
     std::vector<int>           reserve_blocks_;
     std::map<std::string, int> fds_;
@@ -3403,6 +4008,8 @@ ExpertSlotPool::Batch::Batch(Batch && other) noexcept :
     n_host_hit_(other.n_host_hit_),
     n_host_demote_(other.n_host_demote_),
     ns_host_get_(other.ns_host_get_),
+    ns_demote_(other.ns_demote_),
+    ns_ensure_post_(other.ns_ensure_post_),
     host_bytes_(other.host_bytes_),
     ns_h2d_(other.ns_h2d_),
     bytes_h2d_(other.bytes_h2d_),
@@ -3447,6 +4054,12 @@ void ExpertSlotPool::Batch::complete_upto(size_t entry_end) {
 void attach_weight(
         ggml_tensor * tensor, ggml_backend_buffer_t buffer, void * base,
         uint64_t offset) {
+    const size_t buffer_size = ggml_backend_buffer_get_size(buffer);
+    const size_t allocation_size = ggml_backend_buft_get_alloc_size(
+        ggml_backend_buffer_get_type(buffer), tensor);
+    if (offset > buffer_size || allocation_size > buffer_size - (size_t) offset) {
+        throw std::runtime_error("expert weight allocation does not fit its buffer");
+    }
     tensor->buffer = buffer;
     tensor->data   = (uint8_t *) base + offset;
     if (ggml_backend_buffer_init_tensor(buffer, tensor) != GGML_STATUS_SUCCESS) {
@@ -3472,7 +4085,10 @@ public:
             uint64_t expert_reserve_bytes) :
         catalog_(std::move(catalog)),
         backend_(init_backend(device)),
-        resident_(backend_.get(), catalog_, resident_expert_blocks),
+        resident_(backend_.get(),
+                  layout_sliced_pages(
+                      catalog_, ggml_backend_get_default_buffer_type(backend_.get())),
+                  resident_expert_blocks),
         pool_(
             backend_.get(),
             plan_resources(
@@ -3810,6 +4426,7 @@ public:
         hello.model_identity = source_model_identity(
             catalog_.descriptor.input_model, catalog_.descriptor.model_files);
         hello.shard_identity =
+            (catalog_.descriptor.sliced ? "slice:" : "") +
             catalog_.descriptor.identity_algorithm + ":" +
             catalog_.descriptor.identity_value;
         return hello;
@@ -3882,7 +4499,7 @@ public:
         }
         ExpertSlotPool::Batch batch = prepared.has_value()
             ? std::move(*prepared)
-            : pool_.ensure_batch(pages, measure, lookup_started);
+            : pool_.ensure_batch(pages, measure, lookup_started, request.n_tokens);
         if (measure) {
             request_stats.ns_lookup  = batch.lookup_ns();
             request_stats.n_resident      = batch.n_resident();
@@ -3893,6 +4510,8 @@ public:
             request_stats.n_host_demote = batch.n_host_demote();
             request_stats.bytes_read = batch.bytes_read();
             request_stats.ns_host_get = batch.ns_host_get();
+            request_stats.ns_demote = batch.ns_demote();
+            request_stats.ns_ensure_post = batch.ns_ensure_post();
             request_stats.host_bytes = batch.host_bytes();
         }
 
@@ -4098,10 +4717,15 @@ public:
         pipe_expert_partial response;
         response.layer    = request.layer;
         response.n_tokens = request.n_tokens;
-        // f32, not f16: this subtotal is only PART of the layer's expert sum -- the
+        // f32 by default: this subtotal is only PART of the layer's expert sum -- the
         // spine adds the other workers' subtotals to it. Rounding a partial sum to f16
         // put a ~5e-4 relative error at the expert->worker partition boundary, so the
-        // layer output depended on which worker happened to get which expert.
+        // layer output depended on which worker happened to get which expert. See
+        // wp_expert_partial_dtype() above for the full opt-in-f16 rationale and why
+        // stamping response.dtype here (rather than hardcoding PIPE_HIDDEN_F32) is
+        // safe: the tag travels with the bytes, so the spine decodes correctly no
+        // matter what this worker -- or any other worker on the same layer -- chose.
+        response.dtype = wp_expert_partial_dtype();
         response.partial.assign(sum.begin(), sum.end());
         request_stats.ns_encode = lap();
         return response;
@@ -4130,7 +4754,8 @@ public:
             pending.request = std::move(request);
             const auto lookup_started = stats_.enabled() ? std::chrono::steady_clock::now() :
                 std::chrono::steady_clock::time_point{};
-            pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started));
+            pending.batch.emplace(pool_.ensure_batch(pages, stats_.enabled(), lookup_started,
+                                                     pending.request.n_tokens));
             split_pending_.emplace(std::move(pending));
             split_seq_id_ = seq_id;
         } catch (...) {
@@ -4401,6 +5026,30 @@ private:
         ++request_stats.n_device_allocs;
     }
 
+    // D3 (WP_EXPERT_BATCH_MOE): scratch buffer for the N whole-page device-to-
+    // device copies compute_batch_grouped issues per request. NOT gen-tracked
+    // like io_/params_buffer_ -- compute_batch_grouped bypasses the D2 graph
+    // cache entirely (see its header comment), so nothing outlives one call
+    // that could be left dangling by a grow-triggered reallocation.
+    void grow_batch_scratch(size_t size, RequestStats & request_stats) {
+        if (batch_scratch_ && batch_scratch_size_ >= size) {
+            return;
+        }
+        static constexpr size_t BATCH_FLOOR = 1u << 20;   // 1 MiB
+        size_t want = std::max(size, BATCH_FLOOR);
+        if (batch_scratch_ && want < batch_scratch_size_ * 2) {
+            want = batch_scratch_size_ * 2;
+        }
+        buffer_ptr buffer(ggml_backend_alloc_buffer(backend_.get(), want));
+        if (!buffer) {
+            throw std::runtime_error("failed to allocate expert batch scratch buffer");
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        batch_scratch_ = std::move(buffer);
+        batch_scratch_size_ = want;
+        ++request_stats.n_device_allocs;
+    }
+
     ggml_tensor * make_io_tensor(
             ggml_context * ctx, uint32_t n_tokens, size_t offset) const {
         ggml_tensor * tensor = ggml_new_tensor_2d(
@@ -4493,14 +5142,10 @@ private:
         // expert FLOPs by a ZERO router weight (28.7x waste in PREFILL; VERIFY is
         // 2.3x; decode is exactly 1.0x and thus unaffected). This path instead
         // gathers each expert's routed tokens with ggml_get_rows, runs the FFN at
-        // the compacted width, and scatters back with ggml_get_rows_back (whose
-        // semantics are precisely scatter-ADD: it sums every source row mapping to
-        // the same destination row).
-        // RISK, WHICH IS WHY THIS IS A FLAG AND NOT A REWRITE: get_rows_back is the
-        // gradient of a gather and its kernel is O(ncols * nrows_dst * nrows_grad) --
-        // it rescans every source row for each destination row. That is ~41G scan
-        // ops per prefill run here, which could plausibly eat the ~13s of expert
-        // compute it saves. MEASURE BOTH ARMS; do not assume.
+        // the compacted width, and scatters back with scatter_compact_rows
+        // (zero dest + ggml_set_rows). idx is unique per expert so overwrite
+        // equals the old get_rows_back scatter-ADD. Kill switch
+        // WP_EXPERT_SCATTER_SET_ROWS=0 restores get_rows_back.
         // *** CONFIG OF RECORD 2026-08-04: DEFAULT ON. *** Measured +25.8% prefill on
         // its own at n_ubatch=512, and SUPER-ADDITIVE with n_ubatch: the pair
         // (ub1024 + gather) is +67.3% against +45.3% predicted multiplicatively,
@@ -4517,47 +5162,30 @@ private:
         // MECHANISM, and it is not subtle: decode routing density is EXACTLY 100%
         // (measured pre-gather; at n_tokens=1 an assigned expert has that token routed
         // by definition). So at decode ggml_get_rows compacts NOTHING and
-        // ggml_get_rows_back scatters NOTHING back -- gather is pure added graph nodes
+        // scatter writes NOTHING back -- gather is pure added graph nodes
         // per expert per layer buying zero saved FLOPs. It is a prefill optimisation
         // that was billed to decode.
         // Hence WP_EXPERT_GATHER_MIN_TOKENS: gather only once a request is wide enough
         // for the compaction to pay for its own nodes. Default 2 = bypass at decode.
         // Set it to 1 to restore the always-gather behaviour (the A/B control).
-        static const bool s_gather = [] {
-            const char * e = std::getenv("WP_EXPERT_GATHER");
-            return e == nullptr || e[0] != '0';   // default ON
-        }();
-        // *** DEFAULT 1 = GATHER ALWAYS, i.e. EXACTLY THE MEASURED CONFIG OF RECORD. ***
-        // This briefly defaulted to 2 on 2026-08-04, which silently put the untested
-        // decode bypass into every run -- including the arm I was calling the control.
-        // A change ships as a DEFAULT only after it is measured; until then it is an
-        // opt-in flag. Set 2 to test the bypass (#25): decode routing density is exactly
-        // 100%, so at n_tokens==1 gather compacts nothing and only adds graph nodes,
-        // measured at +100 ms/token across 8 of 8 paired arms. Still UNMEASURED as a
-        // fix, because its A/B was confounded by WP_EXPERT_OVERLAP (see #23) and killed.
-        static const int s_gather_min_tokens = [] {
-            const char * e = std::getenv("WP_EXPERT_GATHER_MIN_TOKENS");
-            const int v = e ? atoi(e) : 1;        // default 1 -> gather always (config of record)
-            return v < 1 ? 1 : v;
-        }();
+        static const bool s_gather = parse_env_default_on(std::getenv("WP_EXPERT_GATHER"));
+        // Default 2: decode (n_tokens==1) is 100% dense, so gather is pure
+        // extra nodes. Prefill/verify (n_tokens>=2) still gather. =1 restores
+        // always-gather. Static assign makes this bit-stable (the 2026-08-04
+        // determinism miss was timing-dependent placement, now gone).
+        static const int s_gather_min_tokens =
+            parse_gather_min_tokens(std::getenv("WP_EXPERT_GATHER_MIN_TOKENS"));
+        // Default ON: linear set_rows scatter. =0 restores get_rows_back.
+        static const bool s_set_rows =
+            parse_env_default_on(std::getenv("WP_EXPERT_SCATTER_SET_ROWS"));
         // PER-REQUEST, not static: prefill and decode requests interleave in one
         // worker, so this must be decided per request and never cached.
-        const bool use_gather = s_gather && !force_dense &&
-                                (int64_t) request.n_tokens >= (int64_t) s_gather_min_tokens;
-        // WP_EXPERT_PARAMS_COALESCE=1 -- D1 from the 2026-08-07 consults. The
-        // per-expert routing-weight and gather-idx uploads below are ~2 sync
-        // ggml_backend_tensor_set calls per expert (~17/request at 8.5 experts)
-        // of a few dozen bytes each; on HIP every one is a device-wide sync
-        // memcpy, and together they are the 0.35-1.0 ms "accounting hole"
-        // between ns_graph_build and ns_submit. Coalesced mode binds those
-        // tensors into ONE packed span of params_buffer_ at build time and
-        // uploads the whole span with a single tensor_set. The graph is
-        // unchanged -- same tensors, same values, different storage -- so the
-        // output must stay byte-identical to the per-tensor path.
-        static const bool s_params_coalesce = [] {
-            const char * e = std::getenv("WP_EXPERT_PARAMS_COALESCE");
-            return e != nullptr && e[0] != '\0' && e[0] != '0';
-        }();
+        const bool use_gather = use_expert_gather(
+            request.n_tokens, force_dense, s_gather_min_tokens, s_gather);
+        // Default ON: one tensor_set for routing weights (+ gather idx).
+        // Byte-identical to the per-tensor path. Decode graph-cache requires it.
+        static const bool s_params_coalesce =
+            parse_env_default_on(std::getenv("WP_EXPERT_PARAMS_COALESCE"));
         // D1 packing state (moved above the D2 cache: the hit path packs and
         // uploads without ever building a graph). Offsets are assigned in build
         // order; params_host mirrors the device span byte-for-byte (pad = 0).
@@ -4568,6 +5196,29 @@ private:
             ? ggml_backend_buft_get_alignment(
                   ggml_backend_get_default_buffer_type(backend_.get()))
             : 1;
+
+        // *** D3 (WP_EXPERT_BATCH_MOE): GROUPED mul_mat_id ACROSS ALL SELECTED
+        // EXPERTS. Default OFF -- opt-in until measured on real hardware. ***
+        // Collapses the per-expert loop's 3 ggml_mul_mat (gate/up/down) into 3
+        // ggml_mul_mat_id calls total, batched over every selected expert. See
+        // compute_batch_grouped for the full rationale, the mul_mat_id layout,
+        // and why gate+up are NOT merged into one call (that would require
+        // clamping a non-contiguous split view, which ggml_cuda_op_clamp gets
+        // silently wrong for n_rows > 1 -- see the comment there).
+        // Dense-only, whole-request-only: gather's per-expert idx varies (breaks
+        // one shared ids tensor), and a partial [sel_begin,sel_end) chunk covers
+        // only some assignments, so both fall back to the per-expert loop. The
+        // D2 graph cache is a separate rebind model -- this path never uses it.
+        static const bool s_batch_moe = [] {
+            const char * e = std::getenv("WP_EXPERT_BATCH_MOE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        if (s_batch_moe && !use_gather && sel_begin == 0 &&
+                sel_end >= request.assignments.size()) {
+            compute_batch_grouped(
+                request, pages, batch, selected, n_selected, add_previous, request_stats);
+            return;
+        }
         std::vector<uint8_t> params_host;
         size_t params_span = 0;
         if (s_params_coalesce) {
@@ -4587,23 +5238,45 @@ private:
             params_span = off + nbytes;
         };
 
-        // D2 cache lookup (see the member comment). Dense + COALESCE only:
-        // gather idx sizes vary per request, so gather shapes cannot key.
-        static const bool s_graph_cache = [] {
-            const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE");
-            return e != nullptr && e[0] != '\0' && e[0] != '0';
-        }();
+        // D2 cache lookup (see the member comment). COALESCE required so the
+        // hit path can repack routing (+ gather idx) at fixed offsets.
+        // Dense (decode n=1) always keys. Gather keys only when every selected
+        // expert has the SAME idx rank — verify n=2-8 is almost always rank 1
+        // per expert, so those graphs now hit instead of rebuilding. Mixed
+        // ranks (rare; one expert got 2 tokens, another 1) skip the cache.
+        static const bool s_graph_cache =
+            parse_env_default_on(std::getenv("WP_EXPERT_GRAPH_CACHE"));
         static const size_t s_graph_cache_max = [] {
             const char * e = std::getenv("WP_EXPERT_GRAPH_CACHE_MAX");
             const long v = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 0;
             return v > 0 ? (size_t) v : (size_t) 16;
         }();
+        uint32_t gather_rank = 0;
+        bool     gather_rank_uniform = !use_gather;
+        if (use_gather) {
+            gather_rank_uniform = true;
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                if (!selected(i)) {
+                    continue;
+                }
+                const uint32_t k =
+                    (uint32_t) compact_routing_rows(request.assignments[i].weights).idx.size();
+                if (gather_rank == 0) {
+                    gather_rank = k;
+                } else if (k != gather_rank) {
+                    gather_rank_uniform = false;
+                    gather_rank = 0;
+                    break;
+                }
+            }
+        }
         GraphCacheEntry * gc = nullptr;
         bool gc_hit = false;
-        if (s_graph_cache && s_params_coalesce && !use_gather) {
+        if (s_graph_cache && s_params_coalesce && gather_rank_uniform) {
             GraphKey key;
             key.n_tokens     = request.n_tokens;
             key.n_selected   = (uint32_t) n_selected;
+            key.idx_rank     = gather_rank;
             key.add_previous = add_previous;
             std::memcpy(&key.clamp_bits, &request.swiglu_clamp, sizeof(key.clamp_bits));
             auto it = graph_cache_.find(key);
@@ -4656,14 +5329,26 @@ private:
                 for (int j = 0; j < 3; ++j) {
                     attach_weight(
                         gc->expert_w[k * 3 + (size_t) j], loaded.buffer,
-                        loaded.base, page.roles.at(kRoles[j]).offset);
+                        loaded.base, page.roles.at(kRoles[j]).device_offset);
                 }
                 const auto & wv = request.assignments[i].weights;
-                uint64_t nz = 0;
-                for (float f : wv) { nz += (f != 0.0f); }
-                request_stats.n_weight_nonzero += nz;
-                request_stats.n_weight_total += wv.size();
-                place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
+                if (use_gather) {
+                    const CompactRouting compact = compact_routing_rows(wv);
+                    uint64_t nz = 0;
+                    for (float f : compact.weights) { nz += (f != 0.0f); }
+                    request_stats.n_weight_nonzero += nz;
+                    request_stats.n_weight_total += compact.idx.size();
+                    place_param(gc->gather_idx[k], compact.idx.data(),
+                                compact.idx.size() * sizeof(int32_t));
+                    place_param(gc->route_w[k], compact.weights.data(),
+                                compact.weights.size() * sizeof(float));
+                } else {
+                    uint64_t nz = 0;
+                    for (float f : wv) { nz += (f != 0.0f); }
+                    request_stats.n_weight_nonzero += nz;
+                    request_stats.n_weight_total += wv.size();
+                    place_param(gc->route_w[k], wv.data(), wv.size() * sizeof(float));
+                }
                 ++k;
             }
             if (params_span > 0) {
@@ -4733,7 +5418,13 @@ private:
         // because the router's top-k is discontinuous and amplifies a last-bit
         // delta into a different token. Seeding makes chunked output bit-identical
         // to the unchunked path.
-        ggml_tensor * sum = add_previous ? result : nullptr;
+        //
+        // Gather+set_rows writes into `result` (the io buffer). Zero it on the
+        // first chunk so scatter-add starts from 0; later chunks keep the seed.
+        if (use_gather && s_set_rows && !add_previous) {
+            result = ggml_scale_inplace(ctx.get(), result, 0.0f);
+        }
+        ggml_tensor * sum = (add_previous || (use_gather && s_set_rows)) ? result : nullptr;
         std::vector<std::pair<ggml_tensor *, const pipe_expert_assignment *>> routing_weights;
         routing_weights.reserve(n_selected);
         // Parallel to routing_weights: the gathered token indices per expert, kept
@@ -4753,7 +5444,7 @@ private:
                 ggml_tensor * tensor =
                     ggml_new_tensor_2d(ctx.get(), spec.type, spec.ne0, spec.ne1);
                 attach_weight(
-                    tensor, loaded.buffer, loaded.base, page.roles.at(role).offset);
+                    tensor, loaded.buffer, loaded.base, page.roles.at(role).device_offset);
                 // D2 miss: record for rebinding on later hits. Creation order is
                 // gate, up, down per expert -- the hit path indexes k*3+j on
                 // exactly that order.
@@ -4768,26 +5459,16 @@ private:
             ggml_tensor * idx_t  = nullptr;
             std::vector<int32_t> idx;
             if (use_gather) {
-                const auto & wv = request.assignments[i].weights;
-                idx.reserve(wv.size());
-                for (size_t t = 0; t < wv.size(); ++t) {
-                    if (wv[t] != 0.0f) { idx.push_back((int32_t) t); }
-                }
-                if (idx.empty()) {
-                    // No token routed to this expert in this ubatch. Skipping it
-                    // outright is WRONG: if EVERY selected expert is empty, `sum`
-                    // stays nullptr and ggml_cpy(sum, result) segfaults in
-                    // ggml_nelements -- which is exactly how the first build of
-                    // this path killed the RX 480 worker mid-prefill.
-                    // Instead keep ONE row whose router weight is zero. Its
-                    // contribution is exactly 0.0, identical to what the dense
-                    // path computed, and it costs a single N=1 FFN.
-                    idx.push_back(0);
-                }
+                const CompactRouting compact =
+                    compact_routing_rows(request.assignments[i].weights);
+                idx = compact.idx;
                 idx_t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) idx.size());
                 ggml_set_input(idx_t);
                 if (s_params_coalesce) {
                     place_param(idx_t, idx.data(), idx.size() * sizeof(int32_t));
+                }
+                if (gc != nullptr) {
+                    gc->gather_idx.push_back(idx_t);
                 }
                 ffn_in = ggml_get_rows(ctx.get(), input, idx_t);
             }
@@ -4839,13 +5520,21 @@ private:
             }
             ggml_tensor * weighted = ggml_mul(ctx.get(), output, weights);
             if (use_gather) {
-                // SCATTER-ADD back to full token width. get_rows_back sums every
-                // source row that maps to the same destination row, and rows this
-                // expert did not touch stay zero -- which is exactly the dense
-                // path's zero-weight contribution, so the sum below is unchanged.
-                weighted = ggml_get_rows_back(ctx.get(), weighted, idx_t, input);
+                // Scatter compacted rows back to [n_embd, n_tokens]. Default is
+                // set_rows into a zero dest (linear in n_sel). get_rows_back is
+                // the O(n_tokens * n_sel) dest scan; keep it behind =0.
+                if (s_set_rows) {
+                    // Accumulate into the io result. Do not scale(input,0) —
+                    // that is a second [n_embd, n_tokens] compute-buffer tensor
+                    // and is what OOM'd the 1070 at ubatch 2048.
+                    sum = scatter_add_compact_rows(ctx.get(), sum, weighted, idx_t);
+                } else {
+                    weighted = ggml_get_rows_back(ctx.get(), weighted, idx_t, input);
+                    sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
+                }
+            } else {
+                sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
             }
-            sum = sum ? ggml_add(ctx.get(), sum, weighted) : weighted;
             routing_weights.emplace_back(weights, &request.assignments[i]);
             gather_idx.emplace_back(idx_t, std::move(idx));
         }
@@ -4950,6 +5639,308 @@ private:
         }
     }
 
+    // *** D3: GROUPED mul_mat_id ACROSS EVERY SELECTED EXPERT. ***
+    //
+    // WHY. The per-expert loop above issues 3 ggml_mul_mat (gate, up, down) +
+    // 2 ggml_clamp + 1 swiglu_split + 1 ggml_mul (router weight) + 1 ggml_add
+    // (fold) PER SELECTED EXPERT -- ~8 kernel dispatches/expert, ~64 for an
+    // 8-expert request. At n_tokens 2-3 (spec-verify) this worker is
+    // dispatch-launch-overhead-bound (~0.15 ms/dispatch), not FLOP-bound, so
+    // dispatch COUNT is the lever, not per-op efficiency.
+    //
+    // WHAT THIS DOES NOT DO: merge gate+up into ONE mul_mat_id call. That was
+    // investigated first (concatenate the byte-contiguous up+gate weight
+    // region -- confirmed by wp-repack-lib.cpp's build_expert_groups, which
+    // sorts group members by role_mask ascending, i.e. UP(1) < GATE(2) <
+    // DOWN(4) -- into a [n_embd, 2*n_ff_slice] weight and split the mul_mat_id
+    // OUTPUT into gate/up views). That output split is a ROW-CONTIGUOUS but
+    // MATRIX-STRIDED view whenever n_expert_used*n_tokens > 1 (nb1 spans the
+    // full 2*n_ff_slice row, ne0 only covers half of it), and
+    // ggml_cuda_op_clamp (ggml/src/ggml-cuda/clamp.cu) computes
+    // `dst[i] = clamp(x[i])` over a FLAT `ggml_nelements(src0)` range with NO
+    // stride awareness at all -- it is only correct when src0 is fully
+    // contiguous. ggml-cuda's CLAMP supports_op() (ggml-cuda.cu, the
+    // GGML_OP_CLAMP case) returns true unconditionally, so nothing catches
+    // this: the merged path would silently compute wrong gate/up values for
+    // every request with n_expert_used*n_tokens > 1, i.e. every request this
+    // worker actually serves. (The exact same hazard exists, unaudited, in
+    // src/llama-graph.cpp build_moe_ffn's own "merged gate_up path" --
+    // ggml_view_3d + ggml_clamp on the split -- for any model that ships a
+    // consolidated ffn_gate_up_exps tensor and runs on CUDA/HIP with
+    // n_tokens > 1. Out of scope here: that file belongs to the graph
+    // builder, not this worker.) Keeping gate and up as SEPARATE mul_mat_id
+    // calls costs one extra matmul dispatch but means their outputs are
+    // freshly-allocated, genuinely contiguous tensors -- clamp is then
+    // provably safe regardless of n_tokens.
+    //
+    // HOW THE BATCHED WEIGHT TENSOR IS BUILT. mul_mat_id's `as` argument needs
+    // one tensor with UNIFORM per-expert stride (nb2); this worker's expert
+    // weights live in independently-allocated LRU slot buffers (ExpertSlotPool
+    // ::Slot owns its own buffer_ptr -- there is no shared base+stride across
+    // slots), so no view can present them as one tensor for free. This copies
+    // each selected expert's WHOLE PAGE (up|gate|down, already byte-contiguous
+    // per page) into one scratch buffer at regular page_size-spaced offsets --
+    // N device-to-device ggml_cpy dispatches, one per expert, unavoidable
+    // without a custom multi-source-gather kernel (out of scope: no GPU/build
+    // access to test one). Once copied, a role's batched weight is a FREE
+    // tensor attach (no dispatch): ne=[n_embd, n_ff_slice, n_selected],
+    // nb1=row_size(n_embd) (standard, contiguous per expert; ggml_new_tensor_3d's
+    // default), nb2 overridden to page_size (skips the OTHER two roles' bytes
+    // -- this is a plain strided BATCH view, which ggml's GEMM kernels index
+    // via nb1/nb2 directly, not a per-row split like the rejected merged path
+    // above). Not a ggml_view_3d call: views inherit the PARENT tensor's type,
+    // so a view over an I8 byte-anchor cannot become an MXFP4-typed tensor --
+    // see batched_role() below for the actual construction.
+    //
+    // NET: N copies + 3 mul_mat_id + 2 clamp + 1 swiglu_split + 1 weight-mul
+    // + (n_selected - 1) fold-adds + 1 final ggml_cpy into `result`
+    // ~= 2*n_selected + 7 dispatches, vs ~8*n_selected before -- e.g. 23 vs 64
+    // at n_selected=8. Not the aspirational "3 dispatches total" (that would
+    // need the multi-source gather above), but a real ~2.8x cut, achievable
+    // with stock ggml ops whose stride/contiguity behaviour is verifiable from
+    // source without a GPU.
+    //
+    // MATH: identical to the existing dense (non-gather) path. Every selected
+    // expert is computed for every token (weights[i][t] is 0 for tokens not
+    // routed to expert i, exactly as the per-expert dense loop already does),
+    // clamp bounds and swiglu_split are byte-for-byte the same calls, and the
+    // final reduction folds in ASSIGNMENT-INDEX order via sequential
+    // ggml_add -- the same left-fold association documented at the top of
+    // compute_batch (SEED THE FOLD, DO NOT ADD AT THE END), using the exact
+    // per-expert-view + sequential-add idiom already proven in
+    // src/llama-graph.cpp build_moe_ffn's own expert aggregation loop
+    // (ggml_view_2d(experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1])
+    // then ggml_add), which is stride-safe: ggml-cuda's binbcast kernel
+    // (add.cu/binbcast.cu) is a proper multi-dim indexed kernel, not a flat
+    // one like clamp -- unlike clamp, ADD/MUL over these per-expert-per-token
+    // views is safe on CUDA/HIP for any n_tokens.
+    //
+    // NOT SUPPORTED (falls back to the per-expert loop): gather (variable
+    // per-expert token counts break the single shared `ids` tensor), the
+    // sel_begin/sel_end chunked-compute overlap, and the D2 persistent graph
+    // cache (D2's rebind model reattaches weight tensors directly into live
+    // slot buffers each request; this path instead copies into a private
+    // scratch buffer every request, which is a different graph shape D2 was
+    // never taught about). Integrating D2 here -- caching the graph and only
+    // reissuing the N copies + two small uploads per request -- is a
+    // reasonable follow-up once this path is validated on real hardware.
+    void compute_batch_grouped(
+            const pipe_expert_dispatch_req & request,
+            const std::vector<const ExpertPage *> & pages,
+            const ExpertSlotPool::Batch & batch,
+            const std::function<bool(size_t)> & selected,
+            size_t n_selected,
+            bool add_previous,
+            RequestStats & request_stats) {
+        const auto build_started = std::chrono::steady_clock::now();
+
+        // Assignment indices selected for this call, in order -- this IS the
+        // fold order (see the header comment).
+        std::vector<size_t> sel;
+        sel.reserve(n_selected);
+        for (size_t i = 0; i < request.assignments.size(); ++i) {
+            if (selected(i)) {
+                sel.push_back(i);
+            }
+        }
+        const size_t n = sel.size();
+        // compute_batch already returned early for n_selected == 0.
+
+        // One layer per request (pipe_expert_dispatch_req::layer is a single
+        // field), so every selected page shares one RoleSpec map and one
+        // page size -- both required for the uniform nb2 stride below.
+        const int layer = pages[sel[0]]->layer;
+        const auto & specs = catalog_.descriptor.layers.at(layer);
+        const RoleSpec & gate_spec = specs.at("gate");
+        const RoleSpec & up_spec   = specs.at("up");
+        const RoleSpec & down_spec = specs.at("down");
+        const uint64_t page_size = pages[sel[0]]->size;
+        const int64_t  n_embd    = catalog_.descriptor.hparams.n_embd;
+        const uint32_t n_tokens  = request.n_tokens;
+
+        // 1) Copy each selected expert's WHOLE PAGE (up|gate|down, already
+        // byte-contiguous -- see the header comment) into scratch at
+        // page_size-spaced offsets. N dispatches; unavoidable, see above.
+        grow_batch_scratch(page_size * n, request_stats);
+        void * scratch_base = ggml_backend_buffer_get_base(batch_scratch_.get());
+
+        // Generously budgeted -- ggml_init only reserves metadata (no device
+        // memory), so slack here is free, and undersizing is a hard abort in
+        // ggml_new_graph_custom / ggml_build_forward_expand. Actual usage is
+        // roughly: 2n (page copies: src+dst) + 3 (batched role weights) + n
+        // (per-expert contrib views) + (n-1) (fold adds) + ~15 fixed
+        // (ids, input, gate/up/down outputs, clamps, swiglu, weighted mul,
+        // result, final copy) tensors; nodes are the same set minus the
+        // non-graph leaves (as_gate/as_up/as_down/ids/route_w/input/result).
+        const size_t tensor_count = 10 * n + 60;
+        const size_t graph_nodes  = 5 * n + 24;
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                              ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate grouped expert graph metadata");
+        }
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+
+        for (size_t k = 0; k < n; ++k) {
+            const ExpertSlotPool::Loaded loaded = batch.loaded(sel[k]);
+            ggml_tensor * src = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) page_size);
+            attach_weight(src, loaded.buffer, loaded.base, 0);
+            ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) page_size);
+            attach_weight(dst, batch_scratch_.get(), scratch_base, (uint64_t) k * page_size);
+            ggml_tensor * cpy = ggml_cpy(ctx.get(), src, dst);
+            // Not reachable from the graph's data-flow root (as_gate/as_up/
+            // as_down below are independently-attached leaves that ALIAS this
+            // memory rather than consuming `cpy` as a src) -- expand it as its
+            // own root NOW so it lands in cgraph->nodes[] ahead of the
+            // mul_mat_id calls below. ggml_backend_graph_compute submits nodes
+            // to one stream in array order with no reordering, so this
+            // ordering is what makes the copy happen-before the reads; the
+            // same "expand a side-effect node early" idiom src/llama-graph.cpp
+            // build_moe_ffn uses for its `weights` tensor.
+            ggml_build_forward_expand(graph, cpy);
+        }
+
+        // 2) Batched per-role weight views: NOT a ggml_view_* call (those
+        // inherit the PARENT tensor's type -- ggml_view_impl passes a->type
+        // straight through -- so a view over an I8 byte-anchor cannot become
+        // an MXFP4-typed tensor). Instead: create the tensor with the REAL
+        // role type/shape directly, like make_weight() already does for the
+        // per-expert case, then override nb[2] before attaching. This is safe
+        // -- ggml_backend_cuda_buffer_init_tensor (called by attach_weight)
+        // never reads or recomputes nb, it only conditionally zero-pads
+        // quantized tensors on non-COMPUTE-usage buffers, and
+        // grow_batch_scratch marks batch_scratch_ COMPUTE usage, so that
+        // branch never fires here.
+        const auto batched_role = [&](const RoleSpec & spec, uint64_t role_offset) {
+            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), spec.type, spec.ne0, spec.ne1, (int64_t) n);
+            t->nb[2] = page_size;   // per-expert stride: skip the other two roles' bytes
+            attach_weight(t, batch_scratch_.get(), scratch_base, role_offset);
+            return t;
+        };
+        const ExpertPage & page0 = *pages[sel[0]];
+        ggml_tensor * as_gate = batched_role(gate_spec, page0.roles.at("gate").offset);
+        ggml_tensor * as_up   = batched_role(up_spec,   page0.roles.at("up").offset);
+        ggml_tensor * as_down = batched_role(down_spec, page0.roles.at("down").offset);
+
+        // 3) `ids`: mul_mat_id's expert-selection tensor. This call computes
+        // EVERY selected expert for EVERY token (the existing dense/masked
+        // semantics -- router weight is 0 for tokens not actually routed to
+        // an expert, applied in step 6), so ids[e,t] = e for all t: a
+        // constant identity mapping, not real per-token routing. n_selected
+        // is small (single digits), so building this on the host per request
+        // is negligible.
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, (int64_t) n, (int64_t) n_tokens);
+        ggml_set_input(ids);
+        std::vector<int32_t> ids_host((size_t) n * n_tokens);
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            for (size_t e = 0; e < n; ++e) {
+                ids_host[(size_t) t * n + e] = (int32_t) e;
+            }
+        }
+
+        // input: [n_embd, 1, n_tokens] -- ne1=1 broadcasts to `n` via
+        // mul_mat_id's documented "b can be broadcast to match ids" rule.
+        ggml_tensor * input2d = make_io_tensor(ctx.get(), n_tokens, 0);
+        ggml_set_input(input2d);
+        ggml_tensor * input3d = ggml_reshape_3d(ctx.get(), input2d, n_embd, 1, (int64_t) n_tokens);
+
+        // 4) gate/up: TWO SEPARATE mul_mat_id calls (see header for why this
+        // is not merged into one). Each output is a fresh, fully contiguous
+        // [n_ff, n, n_tokens] tensor, so the clamp calls below are safe
+        // regardless of n_tokens.
+        ggml_tensor * gate_out = ggml_mul_mat_id(ctx.get(), as_gate, input3d, ids);
+        ggml_tensor * up_out   = ggml_mul_mat_id(ctx.get(), as_up,   input3d, ids);
+
+        // *** SwiGLU CLAMP -- byte-for-byte the same bounds/order as the
+        // per-expert loop (see the comment there): up symmetric, gate
+        // above-only. ***
+        const float swiglu_limit = request.swiglu_clamp;
+        if (swiglu_limit > 1e-6f) {
+            up_out   = ggml_clamp(ctx.get(), up_out,   -swiglu_limit, swiglu_limit);
+            gate_out = ggml_clamp(ctx.get(), gate_out, -INFINITY,     swiglu_limit);
+        }
+        ggml_tensor * hidden = ggml_swiglu_split(ctx.get(), gate_out, up_out);   // [n_ff, n, n_tokens]
+
+        // 5) down: hidden already has one row per (expert, token) (b->ne[1]
+        // == n == ids->ne[0]), so this call is NOT a broadcast -- each
+        // token's expert-e row multiplies as_down's expert-e slice.
+        ggml_tensor * down_out = ggml_mul_mat_id(ctx.get(), as_down, hidden, ids);   // [n_embd, n, n_tokens]
+
+        // 6) Router weights, ONE ggml_mul for the whole batch (vs one per
+        // expert before). Layout matches down_out: ne0=1 (broadcasts over
+        // n_embd), ne1=n (expert slot), ne2=n_tokens.
+        ggml_tensor * route_w =
+            ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 1, (int64_t) n, (int64_t) n_tokens);
+        ggml_set_input(route_w);
+        std::vector<float> route_w_host((size_t) n * n_tokens);
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            for (size_t k = 0; k < n; ++k) {
+                route_w_host[(size_t) t * n + k] = request.assignments[sel[k]].weights[t];
+            }
+        }
+        ggml_tensor * weighted = ggml_mul(ctx.get(), down_out, route_w);   // [n_embd, n, n_tokens]
+
+        // 7) Fold over experts in ASSIGNMENT-INDEX order (sel[] is already in
+        // that order), seeding with the running total exactly like the
+        // per-expert loop's "SEED THE FOLD, DO NOT ADD AT THE END" -- see
+        // that comment for why the association matters (draft-acceptance
+        // sensitivity). Per-expert views + sequential ggml_add is the exact
+        // idiom src/llama-graph.cpp build_moe_ffn uses for its own expert
+        // aggregation; ggml-cuda's ADD is a strided multi-dim kernel
+        // (binbcast.cu), unlike CLAMP, so this is stride-safe for any
+        // n_tokens.
+        ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
+        ggml_tensor * sum = add_previous ? result : nullptr;
+        for (size_t k = 0; k < n; ++k) {
+            ggml_tensor * contrib = ggml_view_2d(
+                ctx.get(), weighted, n_embd, (int64_t) n_tokens,
+                weighted->nb[2], (size_t) k * weighted->nb[1]);
+            sum = sum ? ggml_add(ctx.get(), sum, contrib) : contrib;
+        }
+        if (sum == nullptr) {
+            throw std::runtime_error("grouped expert compute produced no contribution");
+        }
+        ggml_tensor * copy = ggml_cpy(ctx.get(), sum, result);
+        ggml_build_forward_expand(graph, copy);
+
+        ggml_gallocr_t galloc = compute_galloc_.get();
+        const size_t old_compute_size = ggml_gallocr_get_buffer_size(galloc, 0);
+        if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+            throw std::runtime_error("failed to allocate grouped expert compute graph");
+        }
+        if (ggml_gallocr_get_buffer_size(galloc, 0) > old_compute_size) {
+            ++request_stats.n_device_allocs;
+        }
+        request_stats.ns_graph_build +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - build_started).count();
+
+        ggml_backend_tensor_set(ids, ids_host.data(), 0, ids_host.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(route_w, route_w_host.data(), 0, route_w_host.size() * sizeof(float));
+
+        const auto submit_started = std::chrono::steady_clock::now();
+        const enum ggml_status status = ggml_backend_graph_compute(backend_.get(), graph);
+        request_stats.ns_submit +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - submit_started).count();
+        ++request_stats.n_graph_submits;
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("grouped expert backend graph compute failed");
+        }
+        for (size_t k = 0; k < n; ++k) {
+            const auto & wv = request.assignments[sel[k]].weights;
+            uint64_t nz = 0;
+            for (float f : wv) { nz += (f != 0.0f); }
+            request_stats.n_weight_nonzero += nz;
+            request_stats.n_weight_total   += wv.size();
+        }
+    }
+
     void read_result(std::vector<float> & result, RequestStats & request_stats) {
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead(),
@@ -4977,20 +5968,22 @@ private:
     // request churns the key and the 2-call warmup never completes: every
     // submit pays ~n_nodes raw kernel launches (live ns_submit 0.25-1.8 ms vs
     // 87 us for a static graph). Cache one context+graph+gallocr per SHAPE
-    // (n_tokens, n_selected, add_previous, clamp); per request only the expert
-    // weight tensors rebind (attach_weight = src data ptrs only) and the
-    // routing-weight blob repacks at fixed offsets. With WP_HIP_GRAPHS=1 the
-    // backend then takes its src-ptrs-only capture+ExecUpdate path instead of
-    // resetting warmup. Dense + COALESCE only: gather shapes vary per request.
-    // Entries pin their gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
+    // (n_tokens, n_selected, idx_rank, add_previous, clamp); per request only
+    // the expert weight tensors rebind (attach_weight = src data ptrs only)
+    // and the routing-weight blob repacks at fixed offsets. With WP_HIP_GRAPHS=1
+    // the backend then takes its src-ptrs-only capture+ExecUpdate path instead
+    // of resetting warmup. Gather caches when every selected expert has the
+    // same idx rank (verify). Mixed ranks skip the cache. Entries pin their
+    // gallocr VRAM (~2-4 MB each); the LRU cap bounds it.
     struct GraphKey {
         uint32_t n_tokens = 0;
         uint32_t n_selected = 0;
+        uint32_t idx_rank = 0;   // 0 = dense; else gather row count per expert
         bool     add_previous = false;
         uint32_t clamp_bits = 0;
         bool operator<(const GraphKey & o) const {
-            return std::tie(n_tokens, n_selected, add_previous, clamp_bits) <
-                   std::tie(o.n_tokens, o.n_selected, o.add_previous, o.clamp_bits);
+            return std::tie(n_tokens, n_selected, idx_rank, add_previous, clamp_bits) <
+                   std::tie(o.n_tokens, o.n_selected, o.idx_rank, o.add_previous, o.clamp_bits);
         }
     };
     struct GraphCacheEntry {
@@ -5000,6 +5993,7 @@ private:
         ggml_tensor * blob  = nullptr;
         std::vector<ggml_tensor *> expert_w;   // gate,up,down per expert, flat
         std::vector<ggml_tensor *> route_w;    // routing weights per expert
+        std::vector<ggml_tensor *> gather_idx; // I32 idx per expert (gather only)
         uint64_t io_gen = 0, params_gen = 0, last_used = 0;
     };
     std::map<GraphKey, GraphCacheEntry> graph_cache_;
@@ -5019,6 +6013,17 @@ private:
     uint64_t            io_grow_count_ = 0;
     buffer_ptr     params_buffer_;
     size_t         params_buffer_size_ = 0;
+    // WP_EXPERT_BATCH_MOE (D3): scratch VRAM for the grouped mul_mat_id path
+    // (see compute_batch_grouped). Holds N whole-page copies (up|gate|down,
+    // byte-contiguous per page -- see load_catalog/wp-repack's role_mask sort)
+    // at uniform page_size-spaced offsets, so a per-role tensor attached at
+    // its role offset with nb[2] overridden to page_size (see
+    // compute_batch_grouped::batched_role) turns them into mul_mat_id's
+    // required [n_embd, n_ff_slice, n_selected] batched weight tensor.
+    // Content never outlives one compute_batch_grouped call (same invariant
+    // as params_buffer_), so growing it here is always safe.
+    buffer_ptr     batch_scratch_;
+    size_t         batch_scratch_size_ = 0;
     size_t         io_result_offset_ = 0;
     WorkerStats    stats_;
     int            slots_ = 0;
@@ -5095,7 +6100,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
     //   layer n_tokens n_exp n_resident n_pagein bytes_read ns_wall ns_lookup ns_prep
     //   ns_hits ns_wait ns_pagein_compute ns_result ns_read ns_h2d ns_submit
     //   ns_readback ns_encode ns_send n_weight_nonzero n_weight_total epoch_end
-    //   ns_params_set
+    //   ns_params_set n_host_hit n_host_demote ns_host_get ns_demote ns_ensure_post
     // epoch_end (added 2026-08-06) is the request's wall-clock END in epoch
     // seconds; start = epoch_end - ns_wall/1e9.
     // ns_params_set (added 2026-08-07): the coalesced D1 blob upload; 0 when
@@ -5131,7 +6136,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
         fprintf(req_log,
                 "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
-                "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu\n",
+                "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu "
+                "%llu %llu %llu %llu %llu\n",
                 layer, n_tokens, n_assignments,
                 (unsigned long long) s.n_resident, (unsigned long long) s.n_pagein,
                 (unsigned long long) s.bytes_read, (unsigned long long) ns_wall,
@@ -5143,7 +6149,12 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 (unsigned long long) s.ns_encode, (unsigned long long) s.ns_send,
                 (unsigned long long) s.n_weight_nonzero,
                 (unsigned long long) s.n_weight_total, epoch_end,
-                (unsigned long long) s.ns_params_set);
+                (unsigned long long) s.ns_params_set,
+                (unsigned long long) s.n_host_hit,
+                (unsigned long long) s.n_host_demote,
+                (unsigned long long) s.ns_host_get,
+                (unsigned long long) s.ns_demote,
+                (unsigned long long) s.ns_ensure_post);
         fflush(req_log);
     };
     pipe_expert_dispatch_begin split_log_begin;
@@ -5382,47 +6393,8 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             // fflush per line: the harness SIGKILLs workers at teardown, and an
             // unflushed stdio buffer produced 0-byte files the first time.
             if (measure && req_log != nullptr) {
-                const uint64_t ns_wall =
-                    (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - req_started).count();
-                // Wall-clock request END, epoch seconds (start = end - ns_wall).
-                // Exists to correlate requests against externally-timestamped
-                // traces (GTT/VRAM sampling, iostat) -- steady_clock cannot be
-                // aligned with another process's clock. Appended LAST, per the
-                // positional-format rule below.
-                const double epoch_end =
-                    (double) std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
-                const RequestStats & s = request_stats;
-                fprintf(req_log,
-                        "%d %u %zu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
-                        "%llu %llu %llu %llu %llu %llu %llu %llu %.6f %llu\n",
-                        request.layer, request.n_tokens, request.assignments.size(),
-                        (unsigned long long) s.n_resident,
-                        (unsigned long long) s.n_pagein,
-                        (unsigned long long) s.bytes_read,
-                        (unsigned long long) ns_wall,
-                        (unsigned long long) s.ns_lookup,
-                        (unsigned long long) s.ns_prep,
-                        (unsigned long long) s.ns_hits,
-                        (unsigned long long) s.ns_wait,
-                        (unsigned long long) s.ns_pagein_compute,
-                        (unsigned long long) s.ns_result,
-                        (unsigned long long) s.ns_read,
-                        (unsigned long long) s.ns_h2d,
-                        (unsigned long long) s.ns_submit,
-                        (unsigned long long) s.ns_readback,
-                        (unsigned long long) s.ns_encode,
-                        (unsigned long long) s.ns_send,
-                        // ROUTING DENSITY, per request, so it can be split by
-                        // n_tokens (col 2). Appended at the END: the format is
-                        // POSITIONAL and older parsers index from the left, so
-                        // adding columns here keeps every existing parser working.
-                        (unsigned long long) s.n_weight_nonzero,
-                        (unsigned long long) s.n_weight_total,
-                        epoch_end,
-                        (unsigned long long) s.ns_params_set);
-                fflush(req_log);
+                write_req_log(request.layer, request.n_tokens, request.assignments.size(),
+                              request_stats, req_started);
             }
         } catch (const pipe_protocol_error & error) {
             if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
@@ -5608,6 +6580,13 @@ int run(const Options & options) {
             "failed to listen on " + options.listen_host + ":" +
             std::to_string(options.listen_port));
     }
+    // Resolve + log WP_EXPERT_PARTIAL_DTYPE BEFORE serving, not lazily on the
+    // first request -- "read once at startup, logged at startup" per the config
+    // knob's own contract. wp_expert_partial_dtype() prints its own resolved-value
+    // line on first call (see its definition); forcing that call here, ahead of
+    // the summary line below, is what makes it a startup log rather than a
+    // first-request log.
+    const int32_t partial_dtype = wp_expert_partial_dtype();
     std::cout << "expert worker listening on " << options.listen_host << ":"
               << options.listen_port << " device=" << options.device
               << " experts=" << advertised.expert_first << "-"
@@ -5622,7 +6601,9 @@ int run(const Options & options) {
               << " staging=" << resources.staging_buffers << "x"
               << resources.staging_buffer_bytes
               << " host_budget=" << resources.host_budget_bytes
-              << " host_victim_budget=" << options.host_victim_bytes << '\n';
+              << " host_victim_budget=" << options.host_victim_bytes
+              << " partial_dtype=" << (partial_dtype == PIPE_HIDDEN_F16 ? "f16" : "f32")
+              << '\n';
     for (const SlotClass & slot_class : resources.slot_classes) {
         std::cout << "expert slot class bytes=" << slot_class.size
                   << " slots=" << slot_class.slots

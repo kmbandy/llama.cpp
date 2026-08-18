@@ -11,17 +11,24 @@ file(GLOB LLAMA_WEIGHT_PAGER_SOURCES CONFIGURE_DEPENDS "weight-pager/*.cpp")
 file(GLOB LLAMA_MEMORY_TIER_SOURCES "memory-tier/*.cpp")
 
 add_library(llama-expert-dispatch STATIC
+            pipeline/pipe-channel.cpp
+            pipeline/pipe-dense-segment-client.cpp
+            pipeline/pipe-dense-segment-manifest.cpp
             pipeline/pipe-expert-dispatch-graph.cpp
             pipeline/pipe-expert-dispatcher.cpp
             pipeline/pipe-hash-oracle.cpp
+            pipeline/pipe-prefetch-hints.cpp
             pipeline/pipe-protocol.cpp
+            pipeline/pipe-reduce-simd.cpp
             pipeline/pipe-transport.cpp
+            ../examples/gguf-hash/deps/sha256/sha256.c
             )
 target_include_directories(llama-expert-dispatch PUBLIC
             .
             pipeline
             ../ggml/include
             )
+target_include_directories(llama-expert-dispatch PRIVATE ../vendor ../examples/gguf-hash/deps)
 target_compile_features(llama-expert-dispatch PUBLIC cxx_std_17)
 target_link_libraries(llama-expert-dispatch PUBLIC ggml)
 set_target_properties(llama-expert-dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)

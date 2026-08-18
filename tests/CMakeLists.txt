@@ -258,6 +258,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-layer-split.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -433,16 +434,79 @@ llama_test(test-routed-experts-external)
 add_executable(
     test-pipe-protocol
     test-pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-channel.cpp
     ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-protocol.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-reduce-simd.cpp
     ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-transport.cpp
     ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
 )
 target_include_directories(test-pipe-protocol PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/include
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/pipeline
 )
+# pipe-protocol.cpp now calls ggml_fp32_to_fp16_row / ggml_fp16_to_fp32_row for
+# the WP_EXPERT_PARTIAL_DTYPE=f16 wire path (2026-08-17), and pipe_simd_convert_f16_to_f32
+# (pipe-reduce-simd.cpp) for the decode-side f16->f32 convert (2026-08-17).
+target_link_libraries(test-pipe-protocol PRIVATE ggml)
 target_compile_features(test-pipe-protocol PRIVATE cxx_std_17)
 llama_test(test-pipe-protocol)
+
+# Correctness + microbench for the vectorized unpack helpers
+# (pipe_simd_accumulate_f32 / pipe_simd_convert_f16_to_f32 /
+# pipe_simd_decode_f16_accumulate) used by pipe-protocol.cpp's decode path
+# and (at integration) by pipe-expert-dispatcher.cpp's per-partial harvest.
+# Self-contained -- no ggml dependency, see file header.
+add_executable(
+    test-pipe-reduce-simd
+    test-pipe-reduce-simd.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-reduce-simd.cpp
+)
+target_include_directories(test-pipe-reduce-simd PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_compile_features(test-pipe-reduce-simd PRIVATE cxx_std_17)
+llama_test(test-pipe-reduce-simd)
+
+# Dense-segment manifest validation is pure JSON and filesystem work. Keep it
+# independent of a model and GPU so malformed placements fail before launch.
+add_executable(
+    test-pipe-dense-segment
+    test-pipe-dense-segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-dense-segment-manifest.cpp
+)
+target_include_directories(test-pipe-dense-segment PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/vendor
+)
+target_compile_features(test-pipe-dense-segment PRIVATE cxx_std_17)
+llama_test(test-pipe-dense-segment)
+
+add_executable(
+    test-pipe-dense-segment-client
+    test-pipe-dense-segment-client.cpp
+    ${CMAKE_SOURCE_DIR}/src/llama-pipeline.cpp
+)
+target_include_directories(test-pipe-dense-segment-client PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/vendor
+)
+target_link_libraries(test-pipe-dense-segment-client PRIVATE llama-expert-dispatch)
+target_compile_features(test-pipe-dense-segment-client PRIVATE cxx_std_17)
+llama_test(test-pipe-dense-segment-client)
+
+add_executable(test-wp-segment-worker test-wp-segment-worker.cpp)
+target_include_directories(test-wp-segment-worker PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/tools/pipeline
+    ${CMAKE_SOURCE_DIR}/tools/wp-segment-worker
+    ${CMAKE_SOURCE_DIR}/vendor
+)
+target_link_libraries(test-wp-segment-worker PRIVATE llama-wp-segment-worker-lib)
+target_compile_features(test-wp-segment-worker PRIVATE cxx_std_17)
+llama_test(test-wp-segment-worker)
 
 # Hash-layer expert oracle: token id -> expert ids for the DS4 tid2eid blocks.
 # Pure host memory in, expert ids out -- no model, no ggml, no weight pager.
@@ -457,6 +521,18 @@ target_include_directories(test-pipe-hash-oracle PRIVATE
 )
 target_compile_features(test-pipe-hash-oracle PRIVATE cxx_std_17)
 llama_test(test-pipe-hash-oracle)
+
+# Router2 and n-gram hint scoring plus the static n-gram table format.
+add_executable(
+    test-wp-prefetch-hints
+    test-wp-prefetch-hints.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/pipe-prefetch-hints.cpp
+)
+target_include_directories(test-wp-prefetch-hints PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+)
+target_compile_features(test-wp-prefetch-hints PRIVATE cxx_std_17)
+llama_test(test-wp-prefetch-hints)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
@@ -528,6 +604,13 @@ target_include_directories(test-mt-tiered-thin PRIVATE ${CMAKE_SOURCE_DIR}/src)
 llama_build_and_test(test-paged-lifecycle.cpp)
 target_link_libraries(test-paged-lifecycle PRIVATE llama llama-common)
 target_include_directories(test-paged-lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/common)
+
+llama_build_and_test(test-dsv4-comp-plan.cpp)
+target_link_libraries(test-dsv4-comp-plan PRIVATE llama llama-common)
+target_include_directories(test-dsv4-comp-plan PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+llama_build_and_test(test-cuda-graph-cache.cpp)
+target_include_directories(test-cuda-graph-cache PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cuda)
 
 llama_build_and_test(test-paged-semantic.cpp)
 target_link_libraries(test-paged-semantic PRIVATE llama llama-common)

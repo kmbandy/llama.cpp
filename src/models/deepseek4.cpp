@@ -1543,6 +1543,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    // WP_DISPATCH_SPLIT_SHEXP=0 uses grok's COMBINED dispatch op per layer (one
+    // GPU->CPU transition/layer) instead of terra's split (build_issue -> shexp(GPU)
+    // -> build_wait = two transitions/layer). The split overlaps shexp with the
+    // dispatch wait, but it fragments the decode graph into ~2 subgraphs/layer, which
+    // defeats HIP-graph capture (100% fallback). Gated so we can A/B capture+throughput.
+    // Default: split ON (current behavior).
+    {
+        const char * e = std::getenv("WP_DISPATCH_SPLIT_SHEXP");
+        const bool split_on = (e == nullptr) || (e[0] != '0');
+        moe_dispatch_split_shexp = (expert_dispatch != nullptr) && split_on;
+    }
     if (params.gtype == LLM_GRAPH_TYPE_ENCODER && model.fc) {
         const int64_t n_target = model.target_layer_ids.size();
         // MAD-LAB: encoder input is the concatenation of already-collapsed taps.
@@ -1694,7 +1705,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_gate_shexp, nullptr, nullptr,
                 layer.ffn_down_shexp, nullptr, nullptr,
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, -1);
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        cur = complete_moe_dispatch(moe_out, ffn_shexp, -1);
         inpL = build_hc_post(cur, residual, post, comb, il);
 
         cur = build_hc_head(inpL, layer.nextn.hc_head_fn, layer.nextn.hc_head_scale, layer.nextn.hc_head_base);
@@ -1849,8 +1860,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
+        cur = complete_moe_dispatch(moe_out, ffn_shexp, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
@@ -2001,8 +2011,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
     cb(ffn_shexp, "mtp_ffn_shexp", il);
 
-    cur = ggml_add(ctx0, moe_out, ffn_shexp);
-    cb(cur, "mtp_ffn_out", il);
+    cur = complete_moe_dispatch(moe_out, ffn_shexp, il);
 
     inpL = build_hc_post(cur, residual, post, comb, il);
     inpL = build_cvec(inpL, il);

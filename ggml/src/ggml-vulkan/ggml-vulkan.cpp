@@ -388,7 +388,13 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
 static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// Upper bound on the batch width the mat-vec (GEMV) path can serve, and hence
+// the size of the per-NUM_COLS pipeline arrays. The *effective* cap is per
+// device (vk_device::mul_mat_vec_max_cols): only architectures that have been
+// measured to stay below the mul_mm path at these widths go above 8, so nobody
+// else pays the pipeline-compile cost for the extra instantiations.
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
+static constexpr uint32_t mul_mat_vec_max_cols_default = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
@@ -789,6 +795,10 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    // VK_KHR_external_semaphore_fd: lets two vk::Devices in this process share
+    // one timeline semaphore payload, which the tensor-parallel AllReduce
+    // (ggml-vulkan-allreduce.hpp) uses for cross-device ordering.
+    bool external_semaphore_fd {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -806,6 +816,9 @@ struct vk_device_struct {
     uint32_t subgroup_size;
     uint32_t subgroup_size_log2;
     uint32_t shader_core_count;
+    // Effective GEMV batch-width cap for this device, <= mul_mat_vec_max_cols.
+    // Set in ggml_vk_load_shaders before any mat-vec pipeline is created.
+    uint32_t mul_mat_vec_max_cols_eff = mul_mat_vec_max_cols_default;
     bool uma;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
@@ -1075,6 +1088,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    // chunked (UT-transform) variant, [size_idx]; GDA only, null when unsupported
+    vk_pipeline pipeline_gated_delta_net_chunked[4];
+    // columns covered by one chunked workgroup, [size_idx] (0 when the pipeline is null)
+    uint32_t    gated_delta_net_chunked_cols[4] = {0, 0, 0, 0};
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -2329,7 +2346,9 @@ class vk_perf_logger {
             const uint64_t k     = node->src[1]->ne[0];
             const uint64_t batch = node->ne[2] * node->ne[3];
             std::string    name  = ggml_op_name(node->op);
-            if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols) ||
+            // Naming heuristic only; the perf logger has no device handle, so it
+            // uses the stock cap rather than this device's effective one.
+            if ((node->op == GGML_OP_MUL_MAT && n <= mul_mat_vec_max_cols_default) ||
                 (node->op == GGML_OP_MUL_MAT_ID && node->src[2]->ne[1] == 1)) {
                 name += "_VEC";
             }
@@ -5315,18 +5334,44 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     uint32_t rm_kq = 2;
     uint32_t rm_stdq_int = 1;
     uint32_t rm_kq_int = 1;
+    // Rows per workgroup for the BF16 mat-vec shader. It takes the
+    // iter_aligned_nonquant path, where after the rows-outside restructure each
+    // A load is fanned across all NUM_COLS columns. More rows per workgroup then
+    // amortizes the per-column B loads and the final reduction over more useful
+    // work, which is what the multi-column BF16 GEMV needs on GCN. Left at the
+    // stock 2 elsewhere so RDNA/NVIDIA/Intel keep byte-identical pipelines.
+    uint32_t rm_bf16 = 2;
     auto const &rm_iq_int = [](uint32_t i) { return i == 0 ? 8u : 4u; };
     if (device->vendor_id == VK_VENDOR_ID_AMD) {
         if (device->architecture == AMD_GCN) {
             rm_stdq = 2;
             rm_kq = 4;
             rm_stdq_int = 4;
+            rm_bf16 = 4;
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
     uint32_t rm_iq = 2 * rm_kq;
+
+    // How wide a batch still belongs on the mat-vec path rather than mul_mm.
+    // GCN goes to 16: with the A load hoisted out of the column loop the GEMV
+    // cost is close to flat in NUM_COLS, so it stays well under the mul_mm
+    // crossover that otherwise bites at n=9. Every other architecture keeps the
+    // stock 8 -- both because the crossover has not been measured there and
+    // because each extra column instantiates another pipeline per type.
+    device->mul_mat_vec_max_cols_eff = mul_mat_vec_max_cols_default;
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_GCN) {
+        device->mul_mat_vec_max_cols_eff = 16;
+    }
+    // Escape hatch for A/B measurement without a rebuild.
+    if (const char * e = getenv("GGML_VK_MMV_MAX_COLS")) {
+        const int v = atoi(e);
+        if (v >= 1 && v <= (int)mul_mat_vec_max_cols) {
+            device->mul_mat_vec_max_cols_eff = (uint32_t)v;
+        }
+    }
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
@@ -5361,10 +5406,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                               (use_subgroups16 && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
                                               SHADER_REDUCTION_MODE_SHMEM;
 
-        for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+        for (uint32_t i = 0; i < device->mul_mat_vec_max_cols_eff; ++i) {
+            // Rows per workgroup for BF16, as a function of the batch width.
+            // After the rows-outside restructure the shader holds NUM_COLS B
+            // vec4s plus NUM_COLS*NUM_ROWS accumulators live at once, so the
+            // register footprint grows with the product of the two. Cap that
+            // product so wide batches do not spill and crater occupancy: on
+            // GCN this yields 4 rows up to 8 columns, tapering to 2 at 16.
+            // Where rm_bf16 is the stock 2 (everything except GCN) this clamp
+            // never binds, so those pipelines are unchanged.
+            const uint32_t rm_bf16_i = std::max(1u, std::min(rm_bf16, 32u / (i + 1)));
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_bf16_i, 1, 1}, {wg_size_subgroup, rm_bf16_i, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f32_f32", arr_dmmv_q4_0_f32_f32_len[reduc], arr_dmmv_q4_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -5391,7 +5445,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f16_f32", arr_dmmv_bf16_f16_f32_len[reduc], arr_dmmv_bf16_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_bf16_i, 1, 1}, {wg_size_subgroup, rm_bf16_i, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f16_f32", arr_dmmv_q1_0_f16_f32_len[reduc], arr_dmmv_q1_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f16_f32", arr_dmmv_q2_0_f16_f32_len[reduc], arr_dmmv_q2_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_f16_f32", arr_dmmv_q4_0_f16_f32_len[reduc], arr_dmmv_q4_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
@@ -6014,6 +6068,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_chunked_names[] = {
+            "gated_delta_net_chunked_f32_d16",
+            "gated_delta_net_chunked_f32_d32",
+            "gated_delta_net_chunked_f32_d64",
+            "gated_delta_net_chunked_f32_d128",
+        };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
@@ -6047,7 +6107,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool need_partial_subgroup_reduce = lanes_per_column != 1u && lanes_per_column < device->subgroup_size;
             const bool use_clustered_reduce = device->subgroup_arithmetic && device->subgroup_clustered && need_partial_subgroup_reduce;
             const bool use_subgroup_reduce = device->subgroup_arithmetic && !need_partial_subgroup_reduce;
-            const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
+            // Barrier-free fallback: the shared-memory reduction costs three workgroup
+            // barriers plus an LDS round trip per butterfly level, which dominates the
+            // per-token cost of the recurrence on older GPUs. Subgroup shuffle needs
+            // neither and is available on every GCN/RDNA driver.
+            const bool use_shuffle_reduce = !use_clustered_reduce && !use_subgroup_reduce && device->subgroup_shuffle;
+            const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce || use_shuffle_reduce;
             size_t gdn_len;
             const void * gdn_data;
             if (use_clustered_reduce) {
@@ -6056,6 +6121,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+            } else if (use_shuffle_reduce) {
+                gdn_len = gated_delta_net_f32_shuffle_len;
+                gdn_data = (const void *)gated_delta_net_f32_shuffle_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
@@ -6068,6 +6136,38 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+            }
+
+            // Chunked (UT-transform) variant for short token blocks. Uses subgroup shuffle
+            // butterflies only, so it needs neither subgroup arithmetic nor clustered ops.
+            // The workgroup spans several subgroups to amortise the LDS staging of k/q and
+            // the Gram blocks over more output columns.
+            device->gated_delta_net_chunked_cols[si] = 0;
+            if (device->subgroup_shuffle && device->subgroup_require_full_support) {
+                uint32_t nsg = 1;
+                while (nsg < 4 &&
+                       cols_per_wg * nsg * 2 <= S_V &&
+                       (S_V % (cols_per_wg * nsg * 2)) == 0 &&
+                       device->subgroup_size * nsg * 2 <= device->properties.limits.maxComputeWorkGroupInvocations) {
+                    nsg *= 2;
+                }
+
+                const uint32_t cols_per_block = cols_per_wg * nsg;
+
+                // 2 staging buffers of T_MAX*S_V floats + the two T_MAX^2 Gram blocks + 3*T_MAX scalars
+                const size_t chunked_lds = (size_t) 2 * 16 * S_V * sizeof(float) +
+                                           (size_t) 2 * 16 * 16 * sizeof(float) +
+                                           (size_t) 3 * 16 * sizeof(float);
+
+                if ((S_V % cols_per_block) == 0 && chunked_lds <= device->properties.limits.maxComputeSharedMemorySize) {
+                    const std::array<uint32_t, 3> chunked_wg_denoms = {1u, 1u, cols_per_block};
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_chunked[si],
+                        gdn_chunked_names[si], gated_delta_net_chunked_f32_len, gated_delta_net_chunked_f32_data,
+                        "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                        chunked_wg_denoms, {S_V, device->subgroup_size, lanes_per_column, nsg},
+                        1, true, true, device->subgroup_size);
+                    device->gated_delta_net_chunked_cols[si] = cols_per_block;
+                }
             }
         }
     }
@@ -6442,6 +6542,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore_fd = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -6792,6 +6894,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
+        }
+
+        if (device->external_semaphore_fd) {
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
         }
 
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -7933,7 +8039,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
-    GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+    GGML_ASSERT(num_cols >= 1 && num_cols <= ctx->device->mul_mat_vec_max_cols_eff);
 
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
@@ -7992,6 +8098,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+        // NOTE (2026-08-17): tried adding AMD_GCN here (DMMV_WG_SIZE_LARGE for the
+        // MoE expert mat-vec) -- MEASURED a REGRESSION on gfx803/RX480: 9.74 ->
+        // 13.63 ms/req. The larger workgroup's barrier/tree-reduction overhead
+        // outweighs the extra parallelism on Polaris. GCN stays on SUBGROUP.
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -8157,6 +8267,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+        // NOTE (2026-08-17): tried adding AMD_GCN here (DMMV_WG_SIZE_LARGE for the
+        // MoE expert mat-vec) -- MEASURED a REGRESSION on gfx803/RX480: 9.74 ->
+        // 13.63 ms/req. The larger workgroup's barrier/tree-reduction overhead
+        // outweighs the extra parallelism on Polaris. GCN stays on SUBGROUP.
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -10641,7 +10755,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ctx->device->mul_mat_vec_max_cols_eff && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
@@ -13756,6 +13870,35 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
+
+    // Chunked (UT-transform) path for short multi-token blocks with a scalar gate: the
+    // autoregressive shader serialises one cross-lane reduction per token, which is what
+    // makes MTP verify blocks cost ~n tokens. KDA, n_tokens == 1 and long blocks keep the
+    // autoregressive shader. GGML_GDN_CHUNKED=0 forces it off for A/B.
+    {
+        static const bool chunked_enabled = []() {
+            const char * s = getenv("GGML_GDN_CHUNKED");
+            return s == nullptr || atoi(s) != 0;
+        }();
+
+        const bool kda = (dst->src[3]->ne[0] == (int64_t) S_v);
+
+        int si = -1;
+        switch (S_v) {
+            case 16:  si = 0; break;
+            case 32:  si = 1; break;
+            case 64:  si = 2; break;
+            case 128: si = 3; break;
+            default:  si = -1; break;
+        }
+
+        if (chunked_enabled && !kda && si >= 0 &&
+            n_tokens >= 2 && n_tokens <= 16 &&
+            ctx->device->gated_delta_net_chunked_cols[si] != 0 &&
+            ctx->device->pipeline_gated_delta_net_chunked[si] != nullptr) {
+            pipeline = ctx->device->pipeline_gated_delta_net_chunked[si];
+        }
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -19940,11 +20083,31 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// Tensor-parallel AllReduce.  Textually included (not a separate TU) because
+// every type and helper it needs has internal linkage in this file.  Must come
+// after ggml_backend_is_vk and the pipeline / context / buffer helpers.
+#include "ggml-vulkan-allreduce.hpp"
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    // Communication context used by the meta backend for tensor parallelism.
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) ggml_backend_vk_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) ggml_backend_vk_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) ggml_backend_vk_comm_allreduce_tensor;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

@@ -35,6 +35,14 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    // MAD-LAB logits-on-head: stop the graph after output_norm and never build
+    // the LM head. Used by the dense-segment TAIL worker, which ships the normed
+    // hidden state (n_embd) instead of logits (n_vocab) and lets the head do the
+    // projection. Saves the tail an n_embd x n_vocab matmul AND the matching
+    // device->host copy every ubatch. The graph builder must gate on this
+    // *after* setting res->t_embd so llama_get_embeddings() still returns the
+    // post-output_norm hidden state.
+    bool no_output_head = false;
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -55,6 +63,14 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    // [n_layer()] EXTERNALLY SUPPLIED layer inputs. Same host buffer as above, but the
+    // rows are written in by the caller instead of being extracted from this context's
+    // graph. Deliberately a separate vector: embeddings_layer_inp also makes
+    // llm_graph_result::set_outputs mark t_layer_inp[il] a graph output and assert it is
+    // non-null, which a process whose band does not contain `il` can never satisfy.
+    // These layers are skipped by extract_layer_inputs() and by the output reorder --
+    // wire data already arrives in batch order.
+    std::vector<bool> embeddings_layer_inp_external;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

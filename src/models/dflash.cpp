@@ -292,15 +292,32 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
-    ggml_context * ctx0 = g.ctx0;
-    auto         & res  = g.res;
-
+// MAD-LAB: pure-ggml core of the DSpark Markov/confidence head.
+//
+// Split out of build_dspark_markov_head() so it can also be built into a STANDALONE
+// graph by llama_context::dspark_markov_head(). A sidecar draft whose target is
+// Meta-split cannot compute the LM head in its own graph, so the driver projects the
+// hidden state through the target context and then replays just this head here, with
+// `base` supplied as a plain input instead of being produced upstream in the graph.
+//
+// Takes no llm_graph_context on purpose: `base` and `conf_inp` are parameters rather
+// than res->t_logits / res->t_embd, and nothing is expanded into a graph -- the caller
+// owns gf and decides what to build. Returns false if the ubatch carries more drafts
+// per block than the head was trained for, in which case the caller keeps `base`
+// unbiased (the same early-out the in-graph path has always had).
+bool llama_dspark_build_markov_graph(
+        ggml_context      * ctx0,
+        const llama_model & model,
+        ggml_tensor       * tokens,    // I32 [n_tok]
+        ggml_tensor       * base,      // F32 [n_vocab, n_tok]
+        ggml_tensor       * conf_inp,  // F32 [n_embd, n_tok]
+        int64_t             n_blocks,
+        ggml_tensor      ** out_logits,
+        ggml_tensor      ** out_conf) {
     ggml_tensor * w1 = model.dspark_markov_w1;
     ggml_tensor * w2 = model.dspark_markov_w2;
     GGML_ASSERT(w1 && w2 && model.dspark_conf_proj && "DSpark markov/confidence weights not loaded");
 
-    ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
@@ -315,12 +332,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     GGML_ASSERT(block_size > 0 && "DSpark draft requires a valid block_size in GGUF metadata");
     // MAD-LAB: end
 
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
     if (block_drafts > block_size) {
-        return;
+        return false;
     }
 
     // anchor (committed last) token of every block: token 0 of each block, i.e. a strided view
@@ -329,9 +345,6 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     prev = ggml_cont_1d(ctx0, prev, n_blocks);
-
-    // confidence head input: predicts per-position acceptance
-    ggml_tensor * conf_inp = res->t_embd; // [n_embd, n_tok]
 
     ggml_tensor * cat      = nullptr;
     ggml_tensor * cat_conf = nullptr;
@@ -375,13 +388,37 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
         conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
 
-        // note: broadcast the [1, n_tok] confidences to n_embd-wide rows to be able to reuse `llama_get_embeddings_nextn`
-        conf = ggml_repeat(ctx0, conf, res->t_embd);
-        res->t_h_nextn = conf;
-        ggml_build_forward_expand(g.gf, conf);
+        // note: returned as [1, n_tok]. The in-graph wrapper broadcasts to n_embd-wide
+        // rows so it can reuse `llama_get_embeddings_nextn`; the standalone path wants
+        // the compact form and would otherwise read back n_embd copies of every value.
+        *out_conf = conf;
     }
 
-    res->t_logits = out;
+    *out_logits = out;
+
+    return true;
+}
+
+// In-graph wrapper: used by the DFlash/DSV4 decoders when the LM head IS reachable
+// from the draft context, so `base` is res->t_logits produced upstream in the same
+// graph and `conf_inp` is res->t_embd. Keeps one implementation of the head shared
+// with the standalone (services-mode) path.
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+    ggml_tensor * out  = nullptr;
+    ggml_tensor * conf = nullptr;
+
+    if (!llama_dspark_build_markov_graph(g.ctx0, model, tokens,
+                g.res->t_logits, g.res->t_embd, g.ubatch.n_seqs_unq, &out, &conf)) {
+        return;
+    }
+
+    // broadcast the [1, n_tok] confidences to n_embd-wide rows to reuse `llama_get_embeddings_nextn`
+    conf = ggml_repeat(g.ctx0, conf, g.res->t_embd);
+
+    g.res->t_h_nextn = conf;
+    ggml_build_forward_expand(g.gf, conf);
+
+    g.res->t_logits = out;
     ggml_build_forward_expand(g.gf, out);
 }
 
@@ -410,7 +447,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     // KV cache injection
-    if (ubatch.embd) {
+    //
+    // MAD-LAB: `!ubatch.token`, not just `ubatch.embd`. This dual-mode switch used to key
+    // on embd alone, which was unambiguous while an embd batch could only ever be target
+    // features for injection -- llama_batch_init(ctx, n_embd_enc, n_seq) allocates embd
+    // and leaves token null, so an injection batch never carries ids. A services-mode
+    // draft batch carries BOTH: precomputed token embeddings (because this model has no
+    // embedding table of its own) AND the ids (because the driver needs them for the
+    // out-of-graph Markov head). Without this guard that batch would be misrouted into
+    // the injection path and the draft body would never run.
+    if (ubatch.embd && !ubatch.token) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
@@ -478,16 +524,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    // tok_embd from the target model (shared via ctx_other)
-    auto * tok_embd = model.tok_embd;
-    if (tok_embd == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-
-        GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
-    }
-
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -495,7 +531,47 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    // MAD-LAB: token embeddings, own table or supplied by the driver.
+    //
+    // A sidecar DFlash/DSpark GGUF ships no token_embd of its own -- it is trained
+    // against the target's embedding space and used to borrow model_other->tok_embd
+    // through ctx_other. That cannot work when the target is Meta-split (-sm tensor):
+    // the borrowed tensor is pre-allocated in the target's Meta buffer, and a draft
+    // scheduler that does not own that buffer type cannot schedule it. Co-scheduling
+    // the target's Meta backend into this context was tried and abandoned -- the meta
+    // backend's split-state algebra recurses into every src and has no representation
+    // for "resident on one foreign device", so mixed meta/simple graphs fail in ways
+    // that get progressively harder to detect.
+    //
+    // Instead the driver gathers the rows through the TARGET context
+    // (llama_token_embed_gather) and hands them in on the SAME ubatch that carries the
+    // token ids. llm_graph_input_embd::set_input fills `tokens` and `embd` from
+    // independent branches, and llama_batch_allocr propagates both independently, so a
+    // dual-carry batch is well formed. We still need the token ids: the DSpark Markov
+    // head conditions on them, not on the embeddings.
+    ggml_tensor * inpL;
+    if (model.tok_embd != nullptr) {
+        inpL = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    } else {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_input(inp->embd);
+        inpL = inp->embd;
+
+        // Nothing in THIS graph consumes the ids: the embeddings arrive precomputed and
+        // the Markov head that used to read the ids now runs out-of-graph. But an input
+        // leaf that never reaches the graph is never seen by ggml-alloc, so it would be
+        // handed to llm_graph_input_embd::set_input with a null buffer -- and set_input
+        // writes `tokens` for ANY ubatch carrying ids, including the token-only probe
+        // decode that common_context_can_seq_rm() runs against this context at load time
+        // (tools/server/server-context.cpp). Keep the leaf in the graph so it is still
+        // allocated; it stays a dead input, which costs n_tokens*4 bytes.
+        //
+        // The mirror case is safe by construction: on that probe the ubatch carries no
+        // embd, so inp->embd is allocated but unwritten and the body computes from
+        // uninitialised memory -- which is fine, because the probe only checks the
+        // return code and discards the result.
+        ggml_build_forward_expand(gf, inp->tokens);
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     res->add_input(std::move(inp));
@@ -601,14 +677,45 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_build_forward_expand(gf, cur);
     }
 
-    // lm_head from the target model (shared via ctx_other)
-    auto * output = model.output;
-    if (output == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-        GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output = model_other->output;
+    // MAD-LAB: services mode -- the LM head is not reachable from this context.
+    //
+    // A sidecar ships no output.weight and used to borrow model_other->output here.
+    // Under -sm tensor that tensor lives in the target's Meta buffer, which this
+    // scheduler cannot own (see the note on the embedding path above). So graph A
+    // ENDS at the post-norm hidden state, which res->t_embd already exposes through
+    // the ordinary embeddings output path -- no new export plumbing needed.
+    //
+    // The driver completes the step in two more calls:
+    //   1. llama_output_project(ctx_tgt, hidden, n_tokens)  -> base logits, computed
+    //      tensor-parallel on the target where the head actually lives.
+    //   2. llama_dspark_markov_head(ctx_dft, base, tokens, hidden, ...) -> final
+    //      logits + confidences, using the sidecar's OWN markov weights on this device.
+    //
+    // Splitting here is cheap because the head is ONE batched mul_mat over all block
+    // positions: build_dspark_markov_head consumes res->t_logits only through
+    // ggml_view_2d slices, and its argmax chain feeds ggml_get_rows(w1, prev) -- the
+    // sidecar's weights -- not the head. So this costs one projection per draft step,
+    // not one per block position.
+    if (model.output == nullptr) {
+        // Export through the NEXTN channel, not the embeddings one.
+        //
+        // res->t_embd is set just above, but reading it would mean turning on
+        // cparams.embeddings, and llm_graph_context::build_pooling() gates ONLY on that
+        // flag -- not on pooling_type -- so enabling it makes pooling run on this arch's
+        // ENCODER graph too, which sets t_h_nextn and deliberately never sets t_embd.
+        // That aborts at llama-graph.cpp:4252 on a null pooling input.
+        //
+        // t_h_nextn is already the channel this arch exports on (see the encoder), it is
+        // gated by cparams.embeddings_nextn which the driver already enables, and in
+        // services mode it is otherwise unused because the Markov head that used to write
+        // it now runs out-of-graph. So the hidden state rides a path that already works.
+        res->t_h_nextn = cur;
+
+        ggml_build_forward_expand(gf, cur);
+        return;
     }
+
+    ggml_tensor * output = model.output;
 
     cur = build_lora_mm(output, cur);
     if (model.d2t) {
@@ -803,6 +910,20 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
+
+    // Slice to output rows BEFORE the vocab projection. Draft only needs logits
+    // for the speculative block; prefill injects via the embd path (no logits).
+    // Unsliced this is n_vocab * n_tokens * 4 — 1.01 GiB at 129280 x 2048 —
+    // for a 3-layer head that never fills those rows.
+    {
+        ggml_tensor * out_ids = build_inp_out_ids();
+        const int64_t nt  = n_tokens;
+        const int64_t row = ggml_nelements(cur) / nt;
+        GGML_ASSERT(row * nt == ggml_nelements(cur));
+        cur = ggml_reshape_2d(ctx0, cur, row, nt);
+        cur = ggml_get_rows(ctx0, cur, out_ids);
+        cb(cur, "result_out_ids", -1);
+    }
 
     // lm_head from the target model (shared via ctx_other)
     auto * output = model.output;

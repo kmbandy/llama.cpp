@@ -12,6 +12,7 @@
 #include "memory-tier/mt-tiered.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-ml8-registry.h"
 #include "llama-weight-pager.h"
 #include "weight-pager/wp-pager.h"
 #include "weight-pager/wp-eval-cb.h"
@@ -28,8 +29,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -43,6 +47,293 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_DSPARK : return LLM_GRAPH_TYPE_DECODER_DSPARK;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+// Token-path DSpark/MTP graphs run a vocab lm_head. Prefill injects via the
+// embd path (logits off) and can realloc. Draft itself is SPEC_NMAX/block_size
+// tokens. Reserving n_ubatch here is a 2048-wide 3-layer graph (~1 GiB) on the
+// spine that the 3-layer head never needs at init. n_outputs_max stays n_batch
+// so encoder output_reserve(n_tokens) still passes.
+static constexpr uint32_t k_draft_graph_tokens = 32;
+
+static bool is_draft_ctx(const llama_cparams & cparams) {
+    // MAD-LAB: a SIDECAR draft (a separate DFlash/DSpark or EAGLE3 GGUF passed with
+    // -md) keeps ctx_type DEFAULT -- its graph is chosen by arch, and asking for
+    // LLAMA_CONTEXT_TYPE_DSPARK here would be rejected outright by
+    // llama_init_from_model, which requires n_layer_nextn > 0 and a sidecar has none.
+    // Without a second signal such a context misses the reserve clamp below and
+    // reserves n_vocab * min(n_ubatch, n_outputs_max) floats of logits it can never
+    // fill -- half a gigabyte at n_vocab 248320 -- next to an already-split target.
+    //
+    // cparams.ctx_other is propagated only to a context that borrows the target's
+    // tok_embd/output (see the arch gate in the constructor), which is exactly the
+    // set of sidecar draft contexts, so it is a sound stand-in here.
+    return cparams.ctx_type == LLAMA_CONTEXT_TYPE_DSPARK ||
+           cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP    ||
+           cparams.ctx_other != nullptr;
+}
+
+static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_tokens) {
+    return is_draft_ctx(cparams) ? std::min(n_tokens, k_draft_graph_tokens) : n_tokens;
+}
+
+static uint32_t draft_graph_n_outputs(const llama_cparams & cparams, uint32_t n_tokens) {
+    const uint32_t cap = std::min(n_tokens, cparams.n_outputs_max);
+    return is_draft_ctx(cparams) ? std::min(cap, k_draft_graph_tokens) : cap;
+}
+
+// WP_DS4_LAYER_TRACE observes the split MoE graph boundaries without changing
+// its scheduling: ffn_moe_issued has completed the request issue, while
+// ffn_moe_out is about to run the wait custom op.  The interval between them is
+// the layer's dense spine graph work.  The scheduler callback is composed with
+// the pager/user callback so the existing callback's ask/observe contract is
+// preserved.
+struct ds4_layer_trace_eval_state {
+    ggml_backend_sched_eval_callback inner = nullptr;
+    void * user_data = nullptr;
+    pipe_expert_dispatcher::graph_dispatcher * dispatcher = nullptr;
+    std::unordered_set<ggml_tensor *> inner_observed;
+};
+
+static std::mutex ds4_layer_trace_eval_mutex;
+static std::map<ggml_backend_sched_t, ds4_layer_trace_eval_state> ds4_layer_trace_eval_states;
+
+static int ds4_layer_trace_marker(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return 0;
+    }
+    const char * name = tensor->name;
+    static constexpr const char issued[] = "ffn_moe_issued-";
+    static constexpr const char out[] = "ffn_moe_out-";
+    const char * suffix = nullptr;
+    int sign = 0;
+    if (std::strncmp(name, issued, sizeof(issued) - 1) == 0) {
+        suffix = name + sizeof(issued) - 1;
+        sign = 1;
+    } else if (std::strncmp(name, out, sizeof(out) - 1) == 0) {
+        suffix = name + sizeof(out) - 1;
+        sign = -1;
+    } else {
+        return 0;
+    }
+    char * end = nullptr;
+    const long layer = std::strtol(suffix, &end, 10);
+    if (end == suffix || *end != '\0' || layer < 0 || layer > std::numeric_limits<int>::max()) {
+        return 0;
+    }
+    return sign * ((int) layer + 1);
+}
+
+static bool ds4_layer_trace_eval_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(user_data);
+    ggml_backend_sched_eval_callback inner = nullptr;
+    void * inner_user_data = nullptr;
+    pipe_expert_dispatcher::graph_dispatcher * dispatcher = nullptr;
+    if (ask) {
+        std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
+        const auto it = ds4_layer_trace_eval_states.find(sched);
+        if (it == ds4_layer_trace_eval_states.end()) {
+            return true;
+        }
+        inner = it->second.inner;
+        inner_user_data = it->second.user_data;
+        dispatcher = it->second.dispatcher;
+    }
+
+    if (ask) {
+        const int marker = ds4_layer_trace_marker(tensor);
+        if (marker < 0 && dispatcher != nullptr) {
+            dispatcher->layer_trace_dense_end(-marker - 1);
+        }
+        const bool inner_need = inner != nullptr && inner(tensor, true, inner_user_data);
+        {
+            std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
+            const auto it = ds4_layer_trace_eval_states.find(sched);
+            if (it != ds4_layer_trace_eval_states.end() && inner_need) {
+                it->second.inner_observed.insert(tensor);
+            }
+        }
+        return inner_need || marker != 0;
+    }
+
+    bool inner_needed_observe = false;
+    {
+        std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
+        const auto it = ds4_layer_trace_eval_states.find(sched);
+        if (it == ds4_layer_trace_eval_states.end()) {
+            return true;
+        }
+        inner = it->second.inner;
+        inner_user_data = it->second.user_data;
+        dispatcher = it->second.dispatcher;
+        inner_needed_observe = it->second.inner_observed.erase(tensor) != 0;
+    }
+    const bool keep_going = !inner_needed_observe || inner(tensor, false, inner_user_data);
+    const int marker = ds4_layer_trace_marker(tensor);
+    if (marker > 0 && dispatcher != nullptr) {
+        dispatcher->layer_trace_dense_begin(marker - 1);
+    }
+    return keep_going;
+}
+
+static bool ds4_layer_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_DS4_LAYER_TRACE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
+}
+
+// WP_SPINE_PROFILE=1: WP_SPINE_STATS times the whole spine graph_compute() call;
+// the expert-dispatch custom op reports its own pack/issue/wait/unpack from
+// inside that same call. Subtracting the two leaves ~70-90 ms/token of "dense"
+// time that neither number explains, and a bandwidth estimate says the raw
+// matmuls should cost ~5 ms -- so the rest is suspected HOST OVERHEAD (graph
+// splits / GPU syncs forced by the per-layer CPU dispatch op), not GPU compute.
+// This buckets WALL TIME by graph section via a per-node ggml_backend_sched eval
+// callback so we can see where it actually goes, plus n_nodes/n_sched_splits --
+// the number that says whether the CPU dispatch op is forcing ~43+ syncs/token.
+//
+// Composes with whatever eval callback is already chosen for this sched (pager
+// / ds4 layer trace / caller-supplied cb_eval) using the same inner-callback
+// chaining pattern as ds4_layer_trace_eval_cb above: WP_SPINE_PROFILE, when
+// enabled, is installed as the OUTERMOST callback and forwards ask/observe to
+// whatever was going to be installed otherwise, preserving that callback's own
+// ask/observe contract via the same inner_observed bookkeeping.
+enum class wp_spine_section {
+    ATTN = 0,
+    SHEXP,
+    MOE_ISSUE,
+    MOE_WAIT,
+    FFN_NORM,
+    OTHER,
+    N_SECTIONS,
+};
+
+// Op type is the ONLY reliable signal for the dispatch issue/wait nodes: their
+// tensor NAMES collide. build_moe_ffn() (llama-graph.cpp:2256) cb()s the issued
+// tensor "ffn_moe_issued-<il>", but deepseek4.cpp:1844 immediately cb()s that
+// same tensor pointer again as "ffn_moe_out-<il>" before complete_moe_dispatch()
+// ever runs -- and complete_moe_dispatch() (llama-graph.cpp:1625) separately
+// cb()s the actual wait-output tensor "ffn_moe_out-<il>" too. So two distinct
+// tensors end up named "ffn_moe_out-<il>" and "ffn_moe_issued-<il>" never
+// survives on the graph node. build_issue() is ggml_map_custom3 (3 inputs:
+// activations, selected_experts, weights) and build_wait() is ggml_map_custom2
+// (2 inputs: issued, shexp) -- pipeline/pipe-expert-dispatch-graph.cpp:289-340 --
+// so GGML_OP_MAP_CUSTOM3 vs GGML_OP_MAP_CUSTOM2 cleanly disambiguates them
+// regardless of the name collision.
+static wp_spine_section wp_spine_classify(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return wp_spine_section::OTHER;
+    }
+    if (t->op == GGML_OP_MAP_CUSTOM3) {
+        return wp_spine_section::MOE_ISSUE;
+    }
+    if (t->op == GGML_OP_MAP_CUSTOM2) {
+        return wp_spine_section::MOE_WAIT;
+    }
+    const char * name = t->name;
+    if (name == nullptr || name[0] == '\0') {
+        return wp_spine_section::OTHER;
+    }
+    if (std::strstr(name, "shexp") != nullptr) {
+        return wp_spine_section::SHEXP;
+    }
+    // src/models/deepseek4.cpp: hc_attn_pre/attn_norm/build_attention(qr, q_pe,
+    // q_norm, q, kv_pe, kv_norm, kv, hca_*, csa_*, lid_*, attn_raw, attn_derope,
+    // attn_wo_a, attn_out)/hc_attn_post.
+    static const char * const attn_prefixes[] = {
+        "attn", "hc_attn", "qr", "q_pe", "q_norm", "kv_pe", "kv_norm",
+        "hca_", "csa_", "lid_",
+    };
+    for (const char * p : attn_prefixes) {
+        if (std::strncmp(name, p, std::strlen(p)) == 0) {
+            return wp_spine_section::ATTN;
+        }
+    }
+    if (std::strcmp(name, "q") == 0 || std::strcmp(name, "kv") == 0) {
+        return wp_spine_section::ATTN;
+    }
+    // src/models/deepseek4.cpp: hc_ffn_pre/ffn_norm/ffn_moe_*/ffn_out/l_last,
+    // plus the hyper-connections and layer-boundary bookkeeping nodes.
+    static const char * const ffn_norm_prefixes[] = {
+        "ffn_", "hc_ffn", "hc_init", "hc_mixes", "hc_pre", "hc_post", "hc_comb",
+        "norm", "l_last", "layer_inp", "result_", "h_nextn", "mtp_",
+    };
+    for (const char * p : ffn_norm_prefixes) {
+        if (std::strncmp(name, p, std::strlen(p)) == 0) {
+            return wp_spine_section::FFN_NORM;
+        }
+    }
+    return wp_spine_section::OTHER;
+}
+
+struct wp_spine_profile_state {
+    ggml_backend_sched_eval_callback inner = nullptr;
+    void * user_data = nullptr;
+    std::chrono::steady_clock::time_point last_ts;
+    bool have_last = false;
+    std::unordered_set<ggml_tensor *> inner_observed;
+    uint64_t section_ns[(size_t) wp_spine_section::N_SECTIONS] = {};
+    uint64_t calls = 0;
+};
+
+static std::mutex wp_spine_profile_mutex;
+static std::map<ggml_backend_sched_t, wp_spine_profile_state> wp_spine_profile_states;
+
+static bool wp_spine_profile_eval_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const ggml_backend_sched_t sched = static_cast<ggml_backend_sched_t>(user_data);
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
+    const auto it = wp_spine_profile_states.find(sched);
+    if (it == wp_spine_profile_states.end()) {
+        return true;
+    }
+    auto & st = it->second;
+
+    // Attribute the wall time since the PREVIOUS callback (ask or observe, on
+    // any node) to the section of THIS node. This is exhaustive: the sum of
+    // every bucket equals the total wall time spanned by the eval-callback-
+    // covered part of graph_compute, whether that time was spent inside the
+    // node's own op or in the scheduler's per-node host/sync bookkeeping
+    // immediately around it (exactly the host-overhead hypothesis this is for).
+    if (st.have_last) {
+        const uint64_t dt = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - st.last_ts).count();
+        st.section_ns[(size_t) wp_spine_classify(tensor)] += dt;
+    }
+    st.last_ts   = now;
+    st.have_last = true;
+
+    if (ask) {
+        const bool inner_need = st.inner != nullptr && st.inner(tensor, true, st.user_data);
+        if (inner_need) {
+            st.inner_observed.insert(tensor);
+        }
+        // Always report "need" so ggml_backend_sched gives this node its own
+        // single-node subgraph and its own ggml_backend_synchronize() before the
+        // matching ask==false call (ggml-backend.cpp: compute_splits(), the
+        // `need` flag controls exactly this batching). That per-node sync is
+        // what makes "wall time between consecutive callbacks" a real per-node
+        // measurement instead of a blurred multi-node batch average -- and it is
+        // the entire WP_SPINE_PROFILE cost, which is why this is strictly
+        // opt-in and never installed when the env var is unset.
+        return true;
+    }
+
+    const bool inner_needed_observe = st.inner_observed.erase(tensor) != 0;
+    const bool keep_going = !inner_needed_observe || st.inner == nullptr ||
+                             st.inner(tensor, false, st.user_data);
+    return keep_going;
+}
+
+static bool wp_spine_profile_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_SPINE_PROFILE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
 }
 
 class expert_dispatch_decode_scope {
@@ -122,21 +413,15 @@ static void register_hash_oracle(const llama_model &                        mode
                    __func__, dispatcher.hash_oracle_layers());
 }
 
-// Hand the dispatcher a host f32 copy of every routed layer's router
-// (ffn_gate_inp + exp_probs_b) so the spine can score layer L+k's routing from
-// layer L's dispatch activations without a forward pass -- the cross-layer
-// predicted-hint oracle. ~4 MB/layer of host copies, so gated on
-// WP_PREDICT_AHEAD > 0 actually asking for it.
-//
-// Same all-or-nothing contract as the hash oracle: half a router block would
-// hint some layers and silently skip others, and the half-measurement would
-// read as a weak positive.
+// Hand the dispatcher a host f32 copy of each available routed layer's router
+// (ffn_gate_inp + exp_probs_b) so the spine can score layer L from layer L-2's
+// dispatch activations. The loaded tensors are reused; the gguf is not read
+// again. The host copies are gated on WP_HINT_ROUTER2 actually asking for them.
 static void register_router_oracle(const llama_model &                        model,
                                    pipe_expert_dispatcher::graph_dispatcher & dispatcher) {
-    if (pipe_expert_dispatcher::graph_dispatcher::predict_ahead() <= 0) {
+    if (pipe_expert_dispatcher::graph_dispatcher::router2_topm() <= 0) {
         return;   // do not pay the host copies for a feature that is off
     }
-    const uint32_t n_hash   = model.hparams.dsv4_hash_layer_count;
     const uint32_t n_layer  = model.hparams.n_layer();
     const int32_t  n_embd   = (int32_t) model.hparams.n_embd;
     const int32_t  n_expert = (int32_t) model.hparams.n_expert;
@@ -144,6 +429,8 @@ static void register_router_oracle(const llama_model &                        mo
         std::vector<uint8_t> raw;
         std::vector<float>   w_host;
         std::vector<float>   b_host;
+        std::vector<uint32_t> skipped;
+        size_t registered = 0;
         const auto to_f32 = [&raw](const ggml_tensor * t, size_t n, std::vector<float> & out) {
             out.resize(n);
             const size_t bytes = ggml_nbytes(t);
@@ -165,32 +452,54 @@ static void register_router_oracle(const llama_model &                        mo
             }
             traits->to_float(raw.data(), out.data(), (int64_t) n);
         };
-        // Main-stack layers only: n_layer excludes the NextN/MTP block, whose
-        // router must never be scored as a lookahead target. Hash layers keep
-        // their exact tid2eid hints; they are lookahead SOURCES, not targets,
-        // so their routers are not needed here.
-        for (uint32_t il = n_hash; il < n_layer && il < model.layers.size(); ++il) {
+        // Inspect all main-stack layers for coverage. Register targets 2..N only;
+        // layers 0 and 1 have no two-layer lead.
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (il >= model.layers.size()) {
+                skipped.push_back(il);
+                continue;
+            }
             const ggml_tensor * w = model.layers[il].ffn_gate_inp;
             const ggml_tensor * b = model.layers[il].ffn_exp_probs_b;
-            if (w == nullptr || b == nullptr ||
-                w->ne[0] != n_embd || w->ne[1] != n_expert || b->ne[0] != n_expert) {
+            if (w == nullptr || b == nullptr) {
+                skipped.push_back(il);
+                continue;
+            }
+            if (il < 2) {
+                continue;
+            }
+            if (w->ne[0] != n_embd || w->ne[1] != n_expert ||
+                ggml_nelements(w) != (int64_t) n_embd * n_expert ||
+                ggml_nelements(b) != n_expert) {
                 throw std::runtime_error(
-                    "layer " + std::to_string(il) + " has no usable router tensors");
+                    "layer " + std::to_string(il) + " has inconsistent router tensor dimensions");
             }
             to_f32(w, (size_t) n_embd * (size_t) n_expert, w_host);
             to_f32(b, (size_t) n_expert, b_host);
             dispatcher.register_router_layer((int32_t) il, n_expert, n_embd,
                                              w_host.data(), b_host.data());
+            ++registered;
         }
+        if (registered == 0) {
+            throw std::runtime_error("no layers have usable router tensors");
+        }
+
+        std::string skipped_text = "[";
+        for (size_t i = 0; i < skipped.size(); ++i) {
+            if (i > 0) {
+                skipped_text += ",";
+            }
+            skipped_text += std::to_string(skipped[i]);
+        }
+        skipped_text += "]";
+        LLAMA_LOG_INFO("%s: router2 oracle ready: %zu layer(s), skipped %s (missing tensors), lookahead +2, top-%d\n",
+                       __func__, dispatcher.router_oracle_layers(), skipped_text.c_str(),
+                       pipe_expert_dispatcher::graph_dispatcher::router2_topm());
     } catch (const std::exception & e) {
         dispatcher.clear_router_oracle();
         LLAMA_LOG_WARN("%s: cross-layer router oracle disabled: %s\n", __func__, e.what());
         return;
     }
-    LLAMA_LOG_INFO("%s: cross-layer router oracle ready: %zu layer(s), lookahead +%d, top-%d\n",
-                   __func__, dispatcher.router_oracle_layers(),
-                   pipe_expert_dispatcher::graph_dispatcher::predict_ahead(),
-                   pipe_expert_dispatcher::graph_dispatcher::predict_topm());
 }
 
 int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens,
@@ -346,6 +655,7 @@ llama_context::llama_context(
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    cparams.embeddings_layer_inp_external.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type     = params.ctx_type;
@@ -864,9 +1174,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens_ubatch = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = draft_graph_n_tokens(cparams, n_tokens_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_ubatch);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -888,6 +1199,11 @@ void llama_context::sched_reserve() {
     const int n_outputs = n_seqs;
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    if (is_draft_ctx(cparams)) {
+        LLAMA_LOG_INFO("%s: draft graph reserve n_tokens=%u n_outputs=%u (n_ubatch=%u n_outputs_max=%u)\n",
+                       __func__, n_tokens, draft_graph_n_outputs(cparams, n_tokens),
+                       (unsigned) cparams.n_ubatch, (unsigned) cparams.n_outputs_max);
+    }
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
@@ -898,7 +1214,11 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // DSpark/MTP token-path graphs include a full-vocab lm_head. Prefill uses
+    // the embd-inject path (logits off). Reserving n_outputs == n_ubatch here
+    // materializes 129280 * n_ubatch * 4 bytes of dead logits (~1 GiB at 2048).
+    // n_outputs_max stays n_batch so encoder output_reserve(n_tokens) still fits.
+    const uint32_t n_outputs_pp = draft_graph_n_outputs(cparams, n_tokens);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -1095,9 +1415,9 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, cparams.n_ubatch));
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+        const uint32_t n_outputs_max = draft_graph_n_outputs(cparams, n_tokens);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
@@ -1116,6 +1436,336 @@ float * llama_context::get_logits() {
     output_reorder();
 
     return logits.data;
+}
+
+// MAD-LAB logits-on-head. Project already-output_norm'd hidden states through the
+// LM head into this context's logits buffer.
+//
+// This exists because a dense-segment HEAD never builds the LM head: its band ends
+// mid-model, so llama_model_qwen35::graph returns at the band check long before
+// output_norm/output. The head still LOADS output.weight (the stage GGUF carries
+// it and the MTP draft graph uses it live), so the weights are resident and
+// correctly split -- only the graph node is missing. Rather than perturb the decode
+// graph, we run a two-node graph on a DEDICATED scheduler:
+//
+//   logits[n_vocab, n_tokens] = output[n_embd, n_vocab] @ hidden[n_embd, n_tokens]
+//
+// A dedicated sched is deliberate: llama_context caches gf_res_prev and relies on
+// ggml_backend_sched graph reuse across decodes. Borrowing the decode sched would
+// force a reset between every decode and the projection, throwing away that reuse
+// and re-running allocation twice per token.
+//
+// SPLIT-TENSOR NOTE: under -sm tensor, model.output is GGML_BACKEND_SPLIT_AXIS_1
+// (split along n_vocab, the OUTPUT rows) and `inp` -- a leaf in a compute buffer --
+// is GGML_OP_NONE => MIRRORED. ggml-backend-meta's handle_mul_mat maps
+// (AXIS_1, MIRRORED) to an AXIS_0 result: every device computes a DISJOINT SLICE OF
+// VOCAB ROWS over the full K=n_embd, and the gather is a concatenation. There is no
+// cross-device reduction and therefore no summation-order change from the split
+// itself. See the report for the residual per-device kernel-shape risk.
+// MAD-LAB: `out`, when non-null, redirects the result away from this context's logits
+// buffer into a caller buffer ([n_tokens][n_vocab] F32 row-major). The speculative
+// services path needs that: it projects a DRAFT hidden state through the TARGET's head,
+// and writing into the target's logits would clobber the verification state that the
+// spec loop is about to read. With out == nullptr the behaviour is exactly as before.
+bool llama_context::output_project(const float * hidden, int32_t n_tokens, float * out) {
+    if (hidden == nullptr || n_tokens <= 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return false;
+    }
+    if (model.output == nullptr) {
+        LLAMA_LOG_ERROR("%s: model has no LM head (output.weight)\n", __func__);
+        return false;
+    }
+    if (!loras->empty()) {
+        // build_lora_mm would add adapter terms we do not replicate here; refuse
+        // rather than silently produce logits that differ from the decode path.
+        LLAMA_LOG_ERROR("%s: LoRA adapters are not supported on the head projection path\n", __func__);
+        return false;
+    }
+
+    // Drain any pending output swaps BEFORE we write. The path this replaces went
+    // through get_logits(), which calls output_reorder() and then CLEARS
+    // output_swaps; skipping it would leave the swaps pending and a later
+    // get_logits_ith() would permute the rows we are about to write. The reorder
+    // itself operates on pre-projection buffer contents and is inconsequential --
+    // draining the queue is the part that matters.
+    //
+    // Skipped entirely when writing to a caller buffer: this context's outputs are then
+    // neither read nor written, so its pending state must be left exactly as it was.
+    if (out == nullptr) {
+        output_reorder();
+    }
+
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    if (out == nullptr && (logits.data == nullptr || (size_t) n_tokens * n_vocab > logits.size)) {
+        LLAMA_LOG_ERROR("%s: logits buffer holds %zu floats, need %" PRId64 "\n",
+                __func__, logits.size, (int64_t) n_tokens * n_vocab);
+        return false;
+    }
+
+    if (!sched_proj) {
+        // input leaf + mul_mat (+ optional output_s scale); the meta backend may
+        // expand each into per-device nodes, so leave generous headroom.
+        sched_proj.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            /*graph_size =*/ 64, /*parallel =*/ false, cparams.op_offload));
+        if (!sched_proj) {
+            LLAMA_LOG_ERROR("%s: failed to create the projection scheduler\n", __func__);
+            return false;
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(64, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_proj { ggml_init(params) };
+    if (!ctx_proj) {
+        LLAMA_LOG_ERROR("%s: failed to create the projection ggml context\n", __func__);
+        return false;
+    }
+    ggml_context * ctx0 = ctx_proj.get();
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp, "proj_inp_hidden");
+    ggml_set_input(inp);
+
+    // Mirror llm_graph_context::build_lora_mm exactly (minus LoRA, refused above):
+    // the ml8 helper is a pure pass-through to ggml_mul_mat for non-ml8 weights and
+    // registry misses, so this is byte-identical for a BF16 head and still correct
+    // if the LM head is ever ml8-typed.
+    ggml_tensor * cur = build_ml8_or_mul_mat(ctx0, model.ml8_reg, model.output, inp);
+    if (model.output_s) {
+        cur = ggml_mul(ctx0, cur, model.output_s);
+    }
+    ggml_set_name(cur, "proj_result_output");
+    ggml_set_output(cur);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 64, false);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_backend_sched_reset(sched_proj.get());
+    if (!ggml_backend_sched_alloc_graph(sched_proj.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the projection graph\n", __func__);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, hidden, 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    const ggml_status status = ggml_backend_sched_graph_compute(sched_proj.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: projection compute failed with status %d\n", __func__, (int) status);
+        return false;
+    }
+
+    // cur is [n_vocab, n_tokens]; the logits buffer is row-major [n_tokens][n_vocab],
+    // which is the same byte layout.
+    ggml_backend_tensor_get(cur, out != nullptr ? out : logits.data, 0,
+            (size_t) n_tokens * n_vocab * sizeof(float));
+
+    return true;
+}
+
+// MAD-LAB speculative service: gather token_embd rows on the context that OWNS them.
+//
+// A sidecar DFlash/DSpark draft has no embedding table of its own and used to reach
+// into model_other->tok_embd through ctx_other. Under -sm tensor that tensor is
+// pre-allocated in this context's Meta buffer, which the draft's scheduler cannot own,
+// so the draft asks us to do the lookup and hands the rows in on its next ubatch.
+//
+// Shares sched_proj with output_project(): both are tiny, synchronous, and reset the
+// scheduler before building, so they can never be in flight at the same time.
+bool llama_context::token_embed_gather(const llama_token * tokens, int32_t n_tokens, float * out) {
+    if (tokens == nullptr || out == nullptr || n_tokens <= 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return false;
+    }
+    if (model.tok_embd == nullptr) {
+        LLAMA_LOG_ERROR("%s: model has no token embeddings (token_embd.weight)\n", __func__);
+        return false;
+    }
+
+    const int64_t n_embd = model.hparams.n_embd;
+
+    if (!sched_proj) {
+        sched_proj.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            /*graph_size =*/ 64, /*parallel =*/ false, cparams.op_offload));
+        if (!sched_proj) {
+            LLAMA_LOG_ERROR("%s: failed to create the projection scheduler\n", __func__);
+            return false;
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(64, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_gather { ggml_init(params) };
+    if (!ctx_gather) {
+        LLAMA_LOG_ERROR("%s: failed to create the gather ggml context\n", __func__);
+        return false;
+    }
+    ggml_context * ctx0 = ctx_gather.get();
+
+    ggml_tensor * inp = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp, "gather_inp_tokens");
+    ggml_set_input(inp);
+
+    // get_rows dequantizes to F32 regardless of the table's storage type, so the BF16
+    // target head/table is read, never rewritten -- storage stays untouched.
+    ggml_tensor * cur = ggml_get_rows(ctx0, model.tok_embd, inp);
+    ggml_set_name(cur, "gather_result_embd");
+    ggml_set_output(cur);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 64, false);
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_backend_sched_reset(sched_proj.get());
+    if (!ggml_backend_sched_alloc_graph(sched_proj.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the gather graph\n", __func__);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp, tokens, 0, (size_t) n_tokens * sizeof(llama_token));
+
+    const ggml_status status = ggml_backend_sched_graph_compute(sched_proj.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: gather compute failed with status %d\n", __func__, (int) status);
+        return false;
+    }
+
+    ggml_backend_tensor_get(cur, out, 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    return true;
+}
+
+// MAD-LAB speculative service: replay the DSpark Markov/confidence head standalone.
+//
+// Runs on the DRAFT context, whose model owns markov_w1/w2 and conf_proj. `base` is the
+// LM-head projection computed on the TARGET context (output_project), because the head
+// itself is not reachable from here. Everything the head actually chains over --
+// get_rows(w1, prev) and the argmax feeding it -- uses this model's own weights, which
+// is why one projection per draft step suffices rather than one per block position.
+bool llama_context::dspark_markov_head(const float * base,
+                                       const llama_token * tokens,
+                                       const float * hidden,
+                                       int32_t n_tokens,
+                                       int32_t n_blocks,
+                                       float * out_conf) {
+    if (base == nullptr || tokens == nullptr || hidden == nullptr ||
+            n_tokens <= 0 || n_blocks <= 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return false;
+    }
+    if (model.dspark_markov_w1 == nullptr) {
+        LLAMA_LOG_ERROR("%s: model has no DSpark Markov head\n", __func__);
+        return false;
+    }
+
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.vocab.n_tokens();
+
+    // Land the result in this context's logits buffer, exactly where a local decode
+    // would have put it, so common_sampler_sample(ctx_dft, idx) needs no changes.
+    if (logits.data == nullptr || (size_t) n_tokens * n_vocab > logits.size) {
+        LLAMA_LOG_ERROR("%s: logits buffer holds %zu floats, need %" PRId64 "\n",
+                __func__, logits.size, (int64_t) n_tokens * n_vocab);
+        return false;
+    }
+
+    output_reorder();
+
+    // The head builds ~10 nodes per block position plus the trailing permutes; block_size
+    // is single digits, so 512 is generous. The meta backend never sees this graph (the
+    // draft context is single-device by construction), so no per-device expansion.
+    static constexpr int k_graph_size = 512;
+
+    if (!sched_proj) {
+        sched_proj.reset(ggml_backend_sched_new(
+            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+            /*graph_size =*/ k_graph_size, /*parallel =*/ false, cparams.op_offload));
+        if (!sched_proj) {
+            LLAMA_LOG_ERROR("%s: failed to create the markov scheduler\n", __func__);
+            return false;
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*k_graph_size + ggml_graph_overhead_custom(k_graph_size, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_head { ggml_init(params) };
+    if (!ctx_head) {
+        LLAMA_LOG_ERROR("%s: failed to create the markov ggml context\n", __func__);
+        return false;
+    }
+    ggml_context * ctx0 = ctx_head.get();
+
+    ggml_tensor * inp_base = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab, n_tokens);
+    ggml_set_name(inp_base, "markov_inp_base");
+    ggml_set_input(inp_base);
+
+    ggml_tensor * inp_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_tok, "markov_inp_tokens");
+    ggml_set_input(inp_tok);
+
+    ggml_tensor * inp_hid = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_set_name(inp_hid, "markov_inp_hidden");
+    ggml_set_input(inp_hid);
+
+    ggml_tensor * out  = nullptr;
+    ggml_tensor * conf = nullptr;
+
+    if (!llama_dspark_build_markov_graph(ctx0, model, inp_tok, inp_base, inp_hid,
+                n_blocks, &out, &conf)) {
+        // The head declines this shape (more drafts per block than it was trained for).
+        // Mirror the in-graph behaviour: leave the projected logits unbiased. Confidence
+        // is unknown, so report 1.0 and let the caller's own conf_min gate be a no-op
+        // rather than silently truncating the block on a fabricated low score.
+        std::memcpy(logits.data, base, (size_t) n_tokens * n_vocab * sizeof(float));
+        if (out_conf) {
+            std::fill_n(out_conf, n_tokens, 1.0f);
+        }
+        return true;
+    }
+
+    ggml_set_output(out);
+    ggml_set_output(conf);
+
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, k_graph_size, false);
+    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, conf);
+
+    ggml_backend_sched_reset(sched_proj.get());
+    if (!ggml_backend_sched_alloc_graph(sched_proj.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the markov graph\n", __func__);
+        return false;
+    }
+
+    ggml_backend_tensor_set(inp_base, base,   0, (size_t) n_tokens * n_vocab * sizeof(float));
+    ggml_backend_tensor_set(inp_tok,  tokens, 0, (size_t) n_tokens * sizeof(llama_token));
+    ggml_backend_tensor_set(inp_hid,  hidden, 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    const ggml_status status = ggml_backend_sched_graph_compute(sched_proj.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: markov compute failed with status %d\n", __func__, (int) status);
+        return false;
+    }
+
+    // out is [n_vocab, n_tokens]; the logits buffer is row-major [n_tokens][n_vocab],
+    // which is the same byte layout.
+    ggml_backend_tensor_get(out, logits.data, 0, (size_t) n_tokens * n_vocab * sizeof(float));
+    if (out_conf) {
+        ggml_backend_tensor_get(conf, out_conf, 0, (size_t) n_tokens * sizeof(float));
+    }
+
+    return true;
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1439,6 +2089,78 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_no_output_head(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (cparams.no_output_head == value) {
+        return;
+    }
+
+    cparams.no_output_head = value;
+
+    // the graph SHAPE changes (the LM head disappears), so the reserved
+    // worst-case graph and any cached graph must be rebuilt.
+    gf_res_prev->reset();
+    sched_need_reserve = true;
+}
+
+// MAD-LAB: arm a layer whose rows this context cannot compute and will be given.
+//
+// Deliberately NOT set_embeddings_layer_inp(): that also makes
+// llm_graph_result::set_outputs mark t_layer_inp[lid] a graph output and assert it is
+// non-null, which is impossible when `lid` lies outside this process's pipeline band --
+// the graph never builds that layer. This only reserves the host buffer.
+void llama_context::set_embeddings_layer_inp_external(uint32_t lid, bool enable) {
+    LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+
+    GGML_ASSERT(lid < cparams.embeddings_layer_inp_external.size());
+
+    if (cparams.embeddings_layer_inp[lid] && enable) {
+        // Both producers for one buffer: whichever wrote last would win, silently.
+        GGML_ABORT("layer %u is already extracted locally; it cannot also be supplied externally", lid);
+    }
+
+    cparams.embeddings_layer_inp_external[lid] = enable;
+
+    // output_reserve() sizes the tap buffers, so the change only lands on the next one.
+    sched_need_reserve = true;
+}
+
+bool llama_context::is_embeddings_layer_inp_external(uint32_t lid) const {
+    return lid < cparams.embeddings_layer_inp_external.size() &&
+           cparams.embeddings_layer_inp_external[lid];
+}
+
+bool llama_context::set_layer_inp_data(uint32_t lid, const float * data, int32_t n_tokens) {
+    if (data == nullptr || n_tokens <= 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments\n", __func__);
+        return false;
+    }
+    if (lid >= embd_layer_inp.size() || !cparams.embeddings_layer_inp_external[lid]) {
+        LLAMA_LOG_ERROR("%s: layer %u is not armed for external supply\n", __func__, lid);
+        return false;
+    }
+    if (!embd_layer_inp[lid].has_data()) {
+        LLAMA_LOG_ERROR("%s: layer %u buffer is not allocated\n", __func__, lid);
+        return false;
+    }
+
+    const size_t row = (size_t) model.hparams.n_embd;
+    const size_t n   = (size_t) n_tokens * row;
+
+    if (n > embd_layer_inp[lid].size) {
+        LLAMA_LOG_ERROR("%s: layer %u buffer holds %zu floats, need %zu\n",
+                __func__, lid, embd_layer_inp[lid].size, n);
+        return false;
+    }
+
+    // Row-major, token-major, in BATCH order -- the same layout extract_layer_inputs()
+    // produces and the same one the DFlash tap reader indexes by absolute batch index.
+    std::memcpy(embd_layer_inp[lid].data, data, n * sizeof(float));
+
+    return true;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1632,13 +2354,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // Note: GGML_CUDA_DISABLE_GRAPHS is now managed by wp::WeightPager
         // itself (RAII over init/shutdown — fixes B-P5 env-var leak), so
         // we no longer setenv here.
+        ggml_backend_sched_eval_callback eval_cb = cparams.cb_eval;
+        void * eval_cb_user_data = cparams.cb_eval_user_data;
         if (model.wp_pager) {
-            ggml_backend_sched_set_eval_callback(sched.get(),
-                wp::weight_pager_eval_cb, model.wp_pager.get());
-        } else {
-            ggml_backend_sched_set_eval_callback(sched.get(),
-                cparams.cb_eval, cparams.cb_eval_user_data);
+            eval_cb = wp::weight_pager_eval_cb;
+            eval_cb_user_data = model.wp_pager.get();
         }
+        if (ds4_layer_trace_enabled() && model.arch == LLM_ARCH_DEEPSEEK4 && expert_dispatch != nullptr) {
+            {
+                std::lock_guard<std::mutex> lock(ds4_layer_trace_eval_mutex);
+                ds4_layer_trace_eval_states[sched.get()] = {
+                    eval_cb, eval_cb_user_data, expert_dispatch, {}
+                };
+            }
+            eval_cb = ds4_layer_trace_eval_cb;
+            eval_cb_user_data = sched.get();
+        }
+        // WP_SPINE_PROFILE=1: install as the OUTERMOST eval callback, wrapping
+        // whatever was just chosen (pager / ds4 layer trace / caller cb_eval) as
+        // its "inner" callback. See wp_spine_profile_eval_cb above for why this
+        // has to be a real per-node callback rather than a cheaper alternative.
+        if (wp_spine_profile_enabled()) {
+            {
+                std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
+                auto & st = wp_spine_profile_states[sched.get()];
+                st.inner       = eval_cb;
+                st.user_data   = eval_cb_user_data;
+                st.have_last   = false;
+                st.inner_observed.clear();
+                // section_ns / calls persist across rebuilds so the periodic
+                // (every-64-decode-tokens) log below keeps a continuous window.
+            }
+            eval_cb = wp_spine_profile_eval_cb;
+            eval_cb_user_data = sched.get();
+        }
+        ggml_backend_sched_set_eval_callback(sched.get(), eval_cb, eval_cb_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1730,6 +2480,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                wp_gc_ns[ph] / 1e6 / (double) wp_gc_n [ph],
                                wp_gc_ns[ph] / 1e6 / (double) std::max<uint64_t>(1, wp_gc_tok[ph]));
             }
+        }
+    }
+    // WP_SPINE_PROFILE=1: log the per-section wall-time breakdown accumulated by
+    // wp_spine_profile_eval_cb (installed above), plus n_nodes / n_sched_splits.
+    // Decode-only (n_tokens==1): "per token" means the spine's steady-state
+    // single-token forward, not a prefill ubatch or a speculative verify batch.
+    if (wp_spine_profile_enabled() && ubatch.n_tokens == 1) {
+        static constexpr uint64_t wp_spine_profile_window = 64;
+        bool     do_log = false;
+        uint64_t section_ns_snap[(size_t) wp_spine_section::N_SECTIONS] = {};
+        const int n_nodes   = ggml_graph_n_nodes(res->get_gf());
+        const int n_splits  = ggml_backend_sched_get_n_splits(sched.get());
+        {
+            std::lock_guard<std::mutex> lock(wp_spine_profile_mutex);
+            const auto it = wp_spine_profile_states.find(sched.get());
+            if (it != wp_spine_profile_states.end()) {
+                auto & st = it->second;
+                ++st.calls;
+                if (st.calls % wp_spine_profile_window == 0) {
+                    std::memcpy(section_ns_snap, st.section_ns, sizeof(section_ns_snap));
+                    std::fill(std::begin(st.section_ns), std::end(st.section_ns), (uint64_t) 0);
+                    do_log = true;
+                }
+            }
+        }
+        if (do_log) {
+            const double denom = (double) wp_spine_profile_window;
+            LLAMA_LOG_WARN(
+                "spine dense profile (per token, mean over %llu): attn=%.1f ms  shexp=%.1f ms  "
+                "moe_issue=%.1f ms  moe_wait=%.1f ms  ffn/norm=%.1f ms  other=%.1f ms  "
+                "n_nodes=%d  n_sched_splits=%d\n",
+                (unsigned long long) wp_spine_profile_window,
+                section_ns_snap[(size_t) wp_spine_section::ATTN]      / 1e6 / denom,
+                section_ns_snap[(size_t) wp_spine_section::SHEXP]     / 1e6 / denom,
+                section_ns_snap[(size_t) wp_spine_section::MOE_ISSUE] / 1e6 / denom,
+                section_ns_snap[(size_t) wp_spine_section::MOE_WAIT]  / 1e6 / denom,
+                section_ns_snap[(size_t) wp_spine_section::FFN_NORM]  / 1e6 / denom,
+                section_ns_snap[(size_t) wp_spine_section::OTHER]     / 1e6 / denom,
+                n_nodes, n_splits);
         }
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -2230,8 +3019,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-        // Hash-layer prefetch hint, before the graph runs. Off unless
-        // WP_PREFETCH_HINT=1; a no-op without an oracle.
+        // Token-derived prefetch hints before the graph runs. Hash hints use
+        // WP_PREFETCH_HINT; n-gram hints use WP_HINT_NGRAM.
         //
         // HERE because this is the last point where the ubatch's token ids are
         // known and NOTHING has been dispatched yet. The lead time bought is the
@@ -2252,6 +3041,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // but one garbage frame-set per session still pollutes the hint logs.
             const llama_token mask = model.vocab.token_mask();
             if (mask == LLAMA_TOKEN_NULL) {
+                expert_dispatch->prefetch_ngram_for_tokens(ubatch.token, ubatch.n_tokens);
                 expert_dispatch->prefetch_for_tokens(ubatch.token, ubatch.n_tokens);
             } else {
                 std::vector<int32_t> filtered;
@@ -2262,6 +3052,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
                 if (!filtered.empty()) {
+                    expert_dispatch->prefetch_ngram_for_tokens(filtered.data(), filtered.size());
                     expert_dispatch->prefetch_for_tokens(filtered.data(), filtered.size());
                 }
             }
@@ -2533,8 +3324,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
-    for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled) {
+    for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        // An externally supplied layer needs exactly the same host buffer; only the
+        // producer differs (the wire, not this context's graph).
+        if (cparams.embeddings_layer_inp[il] || cparams.embeddings_layer_inp_external[il]) {
             embd_layer_inp_float_count += (size_t) n_embd_layer_inp * n_batch;
         }
     }
@@ -2606,7 +3399,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
+        if (cparams.embeddings_layer_inp[il] || cparams.embeddings_layer_inp_external[il]) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd_layer_inp * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -2701,7 +3494,12 @@ void llama_context::output_reorder() {
     const uint64_t n_embd           = model.hparams.n_embd;
     // upstream: embd rows are n_embd_out wide (hc_mult * n_embd on DS4).
     const uint64_t n_embd_out       = model.hparams.n_embd_out();
-    GGML_ASSERT(embd_nextn.size == 0 || n_embd_nextn > 0);
+    // n_embd_nextn is only set when the LOCAL graph produces the nextn tap.
+    // A pipeline-band head keeps embd_nextn as a landing zone for the tail
+    // segment's wire sideband (filled AFTER decode by the server), so
+    // size > 0 with width == 0 is legitimate there -- the swap loop below is
+    // then a no-op, which is correct: wire data arrives already in batch order.
+    // (Was a hard assert; relaxed 2026-08-15 for dense-segment MTP.)
     // ours: the per-layer-input capture has its own row width.
     const uint64_t n_embd_layer_inp = llama_context_layer_inp_size(model);
     GGML_UNUSED(n_embd);
@@ -2730,6 +3528,12 @@ void llama_context::output_reorder() {
 
         if (embd_layer_inp.size() > 0) {
             for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
+                // Externally supplied rows arrive from the wire already in batch order,
+                // so the output permutation does not apply to them -- applying it would
+                // scramble them against the batch indices their reader uses.
+                if (cparams.embeddings_layer_inp_external[lid]) {
+                    continue;
+                }
                 if (embd_layer_inp[lid].size > 0) {
                     for (uint64_t k = 0; k < n_embd_layer_inp; ++k) {
                         std::swap(embd_layer_inp[lid].data[i0*n_embd_layer_inp + k], embd_layer_inp[lid].data[i1*n_embd_layer_inp + k]);
@@ -4373,6 +5177,44 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_no_output_head(llama_context * ctx, bool value) {
+    ctx->set_no_output_head(value);
+}
+
+bool llama_token_embed_gather(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, float * out) {
+    return ctx->token_embed_gather(tokens, n_tokens, out);
+}
+
+bool llama_dspark_markov_head(llama_context * ctx,
+                              const float * base,
+                              const llama_token * tokens,
+                              const float * hidden,
+                              int32_t n_tokens,
+                              int32_t n_blocks,
+                              float * out_conf) {
+    return ctx->dspark_markov_head(base, tokens, hidden, n_tokens, n_blocks, out_conf);
+}
+
+bool llama_output_project_to(llama_context * ctx, const float * hidden, int32_t n_tokens, float * out) {
+    return ctx->output_project(hidden, n_tokens, out);
+}
+
+bool llama_output_project(llama_context * ctx, const float * hidden, int32_t n_tokens) {
+    return ctx->output_project(hidden, n_tokens);
+}
+
+void llama_set_embeddings_layer_inp_external(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_embeddings_layer_inp_external(lid, value);
+}
+
+bool llama_set_layer_inp_data(llama_context * ctx, uint32_t lid, const float * data, int32_t n_tokens) {
+    return ctx->set_layer_inp_data(lid, data, n_tokens);
+}
+
+bool llama_get_embeddings_layer_inp_external(const llama_context * ctx, uint32_t lid) {
+    return ctx->is_embeddings_layer_inp_external(lid);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

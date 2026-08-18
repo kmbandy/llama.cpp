@@ -1451,6 +1451,10 @@ class TextModel(ModelBase):
         if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
             # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
             res = "qwen35"
+        if chkhsh == "83da2d60bc3af501461acc232cdd6ab771e031260d7ccc8e3b39b0018cd7250b":
+            # ref: https://huggingface.co/Qwen/Qwen3.8-27B (tokenizer.json rev used by
+            # the RadixArk DSpark sidecar conversion, 2026-08-16)
+            res = "qwen35"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"

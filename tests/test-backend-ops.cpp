@@ -10245,6 +10245,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));   // Qwen3.5-like: 32 heads, d=128
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64,  1, 1));   // smaller model
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, true)); // KDA
+    // BF16 verify-block GEMV/GEMM crossover: live attn shape at ne11 = 1..16
+    for (int64_t n11 : {1, 2, 4, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 5120, n11, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 17408, n11, 5120, {1, 1}, {1, 1}));
+    }
+    // MTP verify blocks: multi-token with K=9 snapshot slots (live spec-decode shape)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1, 1, false, false, 9)); // verify n1 K9
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 4, 1, 1, false, false, 9)); // verify n4 K9
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 8, 1, 1, false, false, 9)); // verify n8 K9
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 4, 1));   // verify n4 K1 control
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 8, 1));   // verify n8 K1 control
     // PP: n_seq_tokens=64,256 (prompt processing)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));  // PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256

@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 #include "wp-expert-worker.h"
@@ -413,6 +414,38 @@ const wp_expert_worker::SlotClass & find_class(
         throw std::runtime_error("missing planned size class");
     }
     return *found;
+}
+
+void test_slice_device_member_layout() {
+    // These are the allocation sizes returned by CUDA for the 256-wide DS4
+    // MXFP4 slice: up/gate have ne0=4096, while down gets one padded 256-wide
+    // quantized row. The blob itself still contains only the three raw members.
+    const uint64_t up_gate_bytes = ggml_row_size(GGML_TYPE_MXFP4, 4096) * 256;
+    const uint64_t down_bytes = ggml_row_size(GGML_TYPE_MXFP4, 256) * 4096;
+    const uint64_t down_alloc = down_bytes + ggml_row_size(GGML_TYPE_MXFP4, 256);
+    const std::vector<wp_expert_worker::DeviceMemberLayout> layout =
+        wp_expert_worker::plan_device_member_layout(
+            { up_gate_bytes, up_gate_bytes, down_alloc }, 128);
+
+    require(up_gate_bytes == 557056 && down_bytes == 557056,
+            "DS4 256-wide MXFP4 raw member size changed");
+    require(layout.size() == 3 && layout[0].offset == 0 &&
+                layout[1].offset == up_gate_bytes &&
+                layout[2].offset == 2 * up_gate_bytes,
+            "slice device members are not independently placed");
+    const uint64_t slot_bytes = layout.back().offset + layout.back().size;
+    require(slot_bytes == 1671304 && slot_bytes > 3 * up_gate_bytes,
+            "slice slot does not contain CUDA down-row padding");
+
+    const wp_expert_worker::ResourcePlan resources =
+        wp_expert_worker::plan_resources(
+            { { LAYER, slot_bytes, false, 3 * up_gate_bytes } }, 1,
+            3 * up_gate_bytes);
+    require(resources.slot_classes.size() == 1 &&
+                resources.slot_classes[0].size >= slot_bytes,
+            "slice size class does not cover padded member allocations");
+    require(resources.staging_buffer_bytes == 3 * up_gate_bytes,
+            "slice staging must hold raw blob bytes, not device padding");
 }
 
 void test_glm_size_class_plan() {
@@ -1576,8 +1609,353 @@ void test_prefetch_hint_without_spec_reads_nothing() {
 
 } // namespace
 
+static void test_scatter_compact_rows_matches_get_rows_back() {
+    // Unique idx: set_rows into zeros must match get_rows_back byte-for-byte
+    // on CPU, including an all-zero compact row written at dest 0 (the empty-
+    // expert placeholder).
+    const int n_embd = 8;
+    const int n_tokens = 16;
+    const int n_sel = 3;
+    const int32_t idx_h[3] = {2, 0, 11};
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create scatter ggml context");
+
+    ggml_tensor * full = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * compact = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_sel);
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sel);
+    require(full->data && compact->data && idx->data, "scatter tensors must be allocated");
+
+    std::vector<float> compact_h((size_t) n_embd * n_sel);
+    for (size_t i = 0; i < compact_h.size(); ++i) {
+        compact_h[i] = (i < (size_t) n_embd) ? 0.0f : 0.25f * (float) (i + 1);
+    }
+    std::vector<float> full_h((size_t) n_embd * n_tokens, 3.0f);
+    std::memcpy(compact->data, compact_h.data(), compact_h.size() * sizeof(float));
+    std::memcpy(idx->data, idx_h, sizeof(idx_h));
+    std::memcpy(full->data, full_h.data(), full_h.size() * sizeof(float));
+
+    ggml_tensor * via_back = ggml_get_rows_back(ctx.get(), compact, idx, full);
+    ggml_tensor * via_set  = wp_expert_worker::scatter_compact_rows(ctx.get(), compact, idx, full);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
+    ggml_build_forward_expand(gf, via_back);
+    ggml_build_forward_expand(gf, via_set);
+    require(ggml_graph_compute_with_ctx(ctx.get(), gf, 1) == GGML_STATUS_SUCCESS,
+            "scatter equivalence graph failed");
+
+    const int n = n_embd * n_tokens;
+    for (int i = 0; i < n; ++i) {
+        const float a = ggml_get_f32_1d(via_back, i);
+        const float b = ggml_get_f32_1d(via_set, i);
+        if (a != b) {
+            throw std::runtime_error(
+                "scatter_compact_rows != get_rows_back at i=" + std::to_string(i) +
+                " back=" + std::to_string(a) + " set=" + std::to_string(b));
+        }
+    }
+    // Untouched dest rows stay 0 (not the 3.0 filler in `full`).
+    require(ggml_get_f32_1d(via_set, 1 * n_embd) == 0.0f,
+            "row 1 is not in idx and must stay zero");
+    // idx[0]=2 maps compact row 0 (all zeros) onto dest row 2.
+    require(ggml_get_f32_1d(via_set, 2 * n_embd) == 0.0f,
+            "dest row 2 must receive the all-zero compact row");
+    // idx[1]=0 maps compact row 1 (nonzero) onto dest row 0.
+    require(ggml_get_f32_1d(via_set, 0) != 0.0f,
+            "dest row 0 must receive a nonzero compact row");
+}
+
+static void test_scatter_add_compact_rows_accumulates() {
+    // Production path: dest is the io result (already allocated). Two experts
+    // can share a token; set_rows overwrites, so we RMW-add. Dest rows not in
+    // idx stay put — no full-ubatch zero tensor.
+    const int n_embd = 4;
+    const int n_tokens = 8;
+    const int n_sel = 2;
+    const int32_t idx_h[2] = {1, 4};
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    require(ctx != nullptr, "failed to create scatter-add ggml context");
+
+    ggml_tensor * dest = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * compact = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_sel);
+    ggml_tensor * idx = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_sel);
+    require(dest->data && compact->data && idx->data, "scatter-add tensors must be allocated");
+
+    std::vector<float> dest_h((size_t) n_embd * n_tokens, 1.0f);
+    std::vector<float> compact_h((size_t) n_embd * n_sel, 10.0f);
+    std::memcpy(dest->data, dest_h.data(), dest_h.size() * sizeof(float));
+    std::memcpy(compact->data, compact_h.data(), compact_h.size() * sizeof(float));
+    std::memcpy(idx->data, idx_h, sizeof(idx_h));
+
+    ggml_tensor * out = wp_expert_worker::scatter_add_compact_rows(ctx.get(), dest, compact, idx);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 32, false);
+    ggml_build_forward_expand(gf, out);
+    require(ggml_graph_compute_with_ctx(ctx.get(), gf, 1) == GGML_STATUS_SUCCESS,
+            "scatter-add graph failed");
+
+    require(ggml_get_f32_1d(out, 1 * n_embd) == 11.0f, "idx row 1 must be 1+10");
+    require(ggml_get_f32_1d(out, 4 * n_embd) == 11.0f, "idx row 4 must be 1+10");
+    require(ggml_get_f32_1d(out, 0) == 1.0f, "untouched row 0 stays 1");
+    require(ggml_get_f32_1d(out, 2 * n_embd) == 1.0f, "untouched row 2 stays 1");
+}
+
+static void test_decode_prefill_compute_profile() {
+    // Unset / empty / missing → new defaults (min tokens 2, coalesce on, cache on).
+    require(wp_expert_worker::parse_gather_min_tokens(nullptr) == 2,
+            "default WP_EXPERT_GATHER_MIN_TOKENS must be 2 so decode skips gather");
+    require(wp_expert_worker::parse_gather_min_tokens("") == 2,
+            "empty WP_EXPERT_GATHER_MIN_TOKENS must be 2");
+    require(wp_expert_worker::parse_gather_min_tokens("1") == 1,
+            "WP_EXPERT_GATHER_MIN_TOKENS=1 must still be honoured for A/B");
+    require(wp_expert_worker::parse_gather_min_tokens("8") == 8,
+            "WP_EXPERT_GATHER_MIN_TOKENS=8 must be honoured");
+    require(wp_expert_worker::parse_gather_min_tokens("0") == 1,
+            "non-positive gather min tokens must clamp to 1");
+
+    require(wp_expert_worker::parse_env_default_on(nullptr),
+            "WP_EXPERT_PARAMS_COALESCE / GRAPH_CACHE default ON when unset");
+    require(wp_expert_worker::parse_env_default_on(""),
+            "empty value must keep the default-ON knobs on");
+    require(wp_expert_worker::parse_env_default_on("1"),
+            "explicit 1 must enable a default-ON knob");
+    require(!wp_expert_worker::parse_env_default_on("0"),
+            "explicit 0 must disable a default-ON knob");
+
+    require(wp_expert_worker::use_expert_gather(1, false, 2, true) == false,
+            "decode (n_tokens==1) must not gather at the default min of 2");
+    require(wp_expert_worker::use_expert_gather(2, false, 2, true) == true,
+            "verify/prefill at n_tokens==2 must still gather");
+    require(wp_expert_worker::use_expert_gather(2048, false, 2, true) == true,
+            "prefill must still gather");
+    require(wp_expert_worker::use_expert_gather(1, false, 1, true) == true,
+            "min_tokens=1 is the always-gather A/B");
+    require(wp_expert_worker::use_expert_gather(64, true, 2, true) == false,
+            "force_dense (WP_SELFCHECK) must disable gather");
+    require(wp_expert_worker::use_expert_gather(64, false, 2, false) == false,
+            "WP_EXPERT_GATHER=0 must disable gather");
+
+    const auto empty = wp_expert_worker::compact_routing_rows({ 0.0f, 0.0f, 0.0f });
+    require(empty.idx.size() == 1 && empty.idx[0] == 0 && empty.weights[0] == 0.0f,
+            "all-zero routing must keep a dummy idx 0 / weight 0");
+    const auto mixed = wp_expert_worker::compact_routing_rows({ 0.0f, 0.5f, 0.0f, 1.25f });
+    require(mixed.idx.size() == 2 && mixed.idx[0] == 1 && mixed.idx[1] == 3,
+            "compact idx must be the nonzero token positions");
+    require(mixed.weights.size() == 2 && mixed.weights[0] == 0.5f && mixed.weights[1] == 1.25f,
+            "compact weights must follow idx");
+}
+
+// Records every ExpertSlotPool::stripe_plan() call so a test can see how
+// many stripes a given (page_size, n_pageins) actually produced. This is
+// independent of the read_started/read_finished hooks, which fire once per
+// PAGE regardless of stripe count and so cannot show whether striping
+// actually engaged.
+struct StripePlanLog {
+    struct Entry {
+        uint64_t page_size;
+        size_t   n_pageins;
+        size_t   n_stripes;
+    };
+
+    wp_expert_worker::TestHooks hooks;
+
+    StripePlanLog() {
+        hooks.stripe_planned =
+            [this](uint64_t page_size, size_t n_pageins, size_t n_stripes) {
+                std::lock_guard<std::mutex> lock(mutex);
+                entries.push_back({ page_size, n_pageins, n_stripes });
+            };
+    }
+
+    std::vector<Entry> snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return entries;
+    }
+
+private:
+    std::mutex          mutex;
+    std::vector<Entry>  entries;
+};
+
+// Runs one cold, single-expert dispatch (exactly one miss, one page-in of
+// PAGE_BYTES -- the "lone small slice read" the sliced DECODE path sees) and
+// returns the worker's partial plus every stripe_plan() call the miss made.
+std::pair<std::vector<float>, std::vector<StripePlanLog::Entry>>
+run_single_miss_stripe_case(const Fixture & fixture, const std::vector<float> & input) {
+    const int port = reserve_port();
+
+    wp_expert_worker::Options options;
+    options.shard_manifest    = fixture.manifest;
+    options.descriptor        = fixture.descriptor;
+    options.device            = "CPU";
+    options.listen_host       = "127.0.0.1";
+    options.listen_port       = port;
+    options.slots             = 4;
+    options.host_budget_bytes = 2 * PAGE_BYTES;
+    options.once              = true;
+    StripePlanLog log;
+    options.test_hooks = &log.hooks;
+
+    int server_result = -1;
+    std::exception_ptr server_error;
+    std::thread server([&]() {
+        try {
+            server_result = wp_expert_worker::run(options);
+        } catch (...) {
+            server_error = std::current_exception();
+        }
+    });
+
+    std::vector<float> partial;
+    try {
+        pipe_socket_ptr socket = connect_with_retry(port);
+        pipe_frame_type type;
+        uint64_t seq_id = 0;
+        std::vector<uint8_t> payload;
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "stripe-case worker did not send HELLO");
+        pipe_expert_hello worker_hello =
+            pipe_decode_expert_hello(payload.data(), payload.size());
+        pipe_expert_hello client_hello = worker_hello;
+        client_hello.role         = PIPE_EXPERT_ROLE_CLIENT;
+        client_hello.expert_first = -1;
+        client_hello.expert_last  = -1;
+        client_hello.n_slots      = 0;
+        client_hello.layers.clear();
+        payload = pipe_encode_expert_hello(client_hello);
+        require(pipe_send_frame(
+                    *socket, PIPE_HELLO, 0, payload.data(), payload.size()),
+                "failed to send stripe-case client HELLO");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive stripe-case HELLO ack");
+        require(type == PIPE_EXPERT_HELLO_ACK &&
+                    pipe_decode_expert_hello_ack(payload.data(), payload.size()).accepted,
+                "stripe-case worker rejected matching HELLO");
+
+        pipe_expert_dispatch_req request;
+        request.layer    = LAYER;
+        request.n_tokens = N_TOKENS;
+        request.activations = input;
+        // One assignment == one miss == one page-in: the lone-slice-read
+        // shape this fix targets, not a dense prefill-shaped batch.
+        request.assignments = { { 0, { 1.0f, 0.5f } } };
+        payload = pipe_encode_expert_dispatch_req(request);
+        require(pipe_send_frame(
+                    *socket, PIPE_EXPERT_DISPATCH_REQ, 60,
+                    payload.data(), payload.size()),
+                "failed to send stripe-case dispatch");
+        require(pipe_recv_frame(*socket, type, seq_id, payload),
+                "failed to receive stripe-case partial");
+        require(type == PIPE_EXPERT_PARTIAL && seq_id == 60,
+                "stripe-case dispatch did not complete");
+        const pipe_expert_partial response =
+            pipe_decode_expert_partial(payload.data(), payload.size(), N_EMBD);
+        partial = response.partial;
+        socket.reset();
+    } catch (...) {
+        server.join();
+        throw;
+    }
+    server.join();
+    if (server_error) {
+        std::rethrow_exception(server_error);
+    }
+    require(server_result == 0, "stripe-case worker returned failure");
+    return { partial, log.snapshot() };
+}
+
+// THE BUG THIS PROVES: stripe_plan's split-below-this-many-bytes floor used
+// to be a hardcoded 1 MiB (`kMinPart`), sized for the pre-sliced rig's
+// ~12.75 MiB whole-expert page. On the sliced rig's much smaller page (this
+// fixture's PAGE_BYTES stands in for it -- three roles, O_DIRECT aligned,
+// exactly the shape a real slice page has), that floor silently forced
+// n = total/kMinPart = 0, i.e. NO STRIPING AT ALL, for exactly the lone
+// small-page decode miss the read/H2D pipeline exists to overlap.
+// WP_EXPERT_STRIPE_MIN_PART reproduces both arms directly: a large value
+// (1 MiB, the old fixed floor) collapses the miss to one whole-page stripe;
+// a small value lets WP_EXPERT_READ_STRIPES actually engage. THE FIX MUST
+// NOT CHANGE THE ANSWER: the two arms' partial results must be bit-for-bit
+// identical, because striping only changes how the SAME page bytes are
+// grouped into pread()/tensor_set() calls, never what ends up in the slot.
+void test_stripe_min_part_restores_overlap_byte_identical() {
+    TempDir temp;
+    const Fixture fixture = make_fixture(temp.path);
+
+    std::vector<float> input((size_t) N_TOKENS * N_EMBD);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = ((int) (i % 13) - 6) * 0.07f;
+    }
+
+    std::vector<float> no_stripe_partial;
+    std::vector<float> striped_partial;
+    std::vector<StripePlanLog::Entry> no_stripe_log;
+    std::vector<StripePlanLog::Entry> striped_log;
+    {
+        const ScopedEnv stripes("WP_EXPERT_READ_STRIPES", "2");
+        {
+            // Old fixed 1 MiB floor, reproduced explicitly: total/n (6144 B)
+            // is far below it, so stripe_plan must fall back to n<=1.
+            const ScopedEnv min_part("WP_EXPERT_STRIPE_MIN_PART", "1048576");
+            auto result = run_single_miss_stripe_case(fixture, input);
+            no_stripe_partial = std::move(result.first);
+            no_stripe_log     = std::move(result.second);
+        }
+        {
+            // Sliced-rig-appropriate floor: small enough that a ~12 KiB
+            // synthetic page (standing in for a real ~1.5-9 MiB slice page)
+            // still gets split.
+            const ScopedEnv min_part("WP_EXPERT_STRIPE_MIN_PART", "2048");
+            auto result = run_single_miss_stripe_case(fixture, input);
+            striped_partial = std::move(result.first);
+            striped_log     = std::move(result.second);
+        }
+    }
+
+    require(!no_stripe_log.empty() && !striped_log.empty(),
+            "stripe_plan hook did not fire for either arm");
+    const auto miss_entry = [&](const std::vector<StripePlanLog::Entry> & log) {
+        for (const auto & entry : log) {
+            if (entry.page_size == PAGE_BYTES && entry.n_pageins == 1) {
+                return entry;
+            }
+        }
+        throw std::runtime_error("no stripe_plan() call matched the lone miss");
+    };
+    const StripePlanLog::Entry no_stripe = miss_entry(no_stripe_log);
+    const StripePlanLog::Entry striped   = miss_entry(striped_log);
+
+    require(no_stripe.n_stripes == 1,
+            "old 1 MiB floor should still collapse the sliced page to one "
+            "whole-page read -- this is the bug being fixed");
+    require(striped.n_stripes > 1,
+            "WP_EXPERT_STRIPE_MIN_PART did not restore striping for a "
+            "small sliced-rig page-sized read");
+
+    require(no_stripe_partial.size() == striped_partial.size(),
+            "striped and non-striped responses have different shapes");
+    for (size_t i = 0; i < no_stripe_partial.size(); ++i) {
+        require(no_stripe_partial[i] == striped_partial[i],
+                "striped read/H2D pipeline changed the computed result -- "
+                "page contents must be byte-identical regardless of "
+                "stripe scheduling");
+    }
+}
+
 int main() {
     try {
+        test_decode_prefill_compute_profile();
+        test_scatter_compact_rows_matches_get_rows_back();
+        test_scatter_add_compact_rows_accumulates();
+        test_slice_device_member_layout();
         test_glm_size_class_plan();
         run_test();
         test_default_off_multi_expert_request();
@@ -1586,6 +1964,7 @@ int main() {
         test_predicted_hint_lands_in_host_ram();
         test_prefetch_spec_pagein_and_eviction_order("0");
         test_prefetch_spec_pagein_and_eviction_order("64");
+        test_stripe_min_part_restores_overlap_byte_identical();
         std::cout << "test-wp-expert-worker: all tests passed\n";
         return 0;
     } catch (const std::exception & error) {

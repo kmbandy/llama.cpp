@@ -1,6 +1,9 @@
 #include "common.cuh"
 
-#define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
+// Max. batch size (ncols_dst) for which MMVF kernels are instantiated.
+// 9..16 are only *routed* to for BF16 on hardware without fast BF16 GEMM
+// (see ggml_cuda_should_use_mmvf); the instantiations exist for all f-types.
+#define MMVF_MAX_BATCH_SIZE 16
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);

@@ -1,6 +1,6 @@
 #include "allreduce.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
 #include "ggml-impl.h"
@@ -11,12 +11,22 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// CUDA AllReduce for tensor-parallel inference across two GPUs.
+// CUDA / HIP AllReduce for tensor-parallel inference across two GPUs.
 //
-// Provides an in-place sum reduction over matching tensors on two CUDA
-// devices in the same process.  Used by the tensor-split path alongside
-// NCCL; targets setups without NVLink, where data is exchanged between the
-// GPUs by staging it through pinned host memory over PCIe.
+// Provides an in-place sum reduction over matching tensors on two CUDA (or,
+// under GGML_USE_HIP, ROCm) devices in the same process.  Used by the
+// tensor-split path alongside NCCL/RCCL; targets setups without NVLink/XGMI,
+// where data is exchanged between the GPUs by staging it through pinned host
+// memory over PCIe.
+//
+// HIP notes (see the individual sites for detail):
+//   * Host staging is allocated with hipHostMalloc(Portable|Mapped|Coherent)
+//     where the device polls/writes it, so the mapping is fine-grained and
+//     device stores land in host memory rather than in the GPU's L2.
+//   * The in-kernel spin uses __builtin_amdgcn_s_sleep instead of __nanosleep.
+//   * The arrival handshake uses __hip_atomic_load/store at
+//     __HIP_MEMORY_SCOPE_SYSTEM instead of volatile accesses.
+//   * MUSA still gets the nullptr stub at the bottom of this file.
 //
 // Two reduction strategies are selected per call by tensor size:
 //
@@ -56,13 +66,53 @@
 // atomicAdd_system() requires hostNativeAtomicSupported, which is unavailable
 // on PCIe-attached consumer GPUs without NVLink, so the volatile path is the
 // portable choice.
+//
+// HIP: volatile is explicitly *not* a cross-agent ordering primitive in the HIP
+// memory model -- it only stops the compiler from eliding the access, it does
+// not control the sc0/sc1 (glc/dlc) cache bits on the generated load/store.  We
+// therefore use __hip_atomic_load / __hip_atomic_store at
+// __HIP_MEMORY_SCOPE_SYSTEM, which lower to relaxed-size (4 B) accesses that
+// bypass/invalidate the device caches and carry the acquire/release waitcnt +
+// cache-maintenance instructions.  These are plain load/store atomics (no
+// read-modify-write), so they do *not* need PCIe atomics / native host atomic
+// support -- unlike atomicAdd_system.
 // ---------------------------------------------------------------------------
 
 static __device__ __forceinline__ void ggml_cuda_ar_signal_set(int * p, int token) {
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store(p, token, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     *(volatile int *)p = token;
+#endif // defined(GGML_USE_HIP)
 }
 static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     return *(const volatile int *)p;
+#endif // defined(GGML_USE_HIP)
+}
+
+// Backoff inside the arrival spin loop.
+//
+// NVIDIA: __nanosleep(100), sm70+.
+// AMD:    s_sleep, whose operand is an immediate bounded to a small range
+//         (only the low bits are honoured by the hardware); s_sleep(2) parks
+//         the wave for ~128 core clocks, i.e. the same tens-of-nanoseconds
+//         order as __nanosleep(100).  Called from a loop, so the total wait is
+//         unbounded by design -- see the note at the call site.
+//
+// NOTE: vendors/hip.h #defines __CUDA_ARCH__ to 1300 unconditionally (host pass
+// included), so the GGML_USE_HIP branch MUST come first; a bare
+// "__CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA" test is always true under HIP.
+static __device__ __forceinline__ void ggml_cuda_ar_spin_pause() {
+#if defined(GGML_USE_HIP)
+    __builtin_amdgcn_s_sleep(2);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __nanosleep(100);
+#else
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP)
 }
 
 // Byte spacing between adjacent arrival ints.  64 bytes (one cache line)
@@ -153,6 +203,15 @@ static __global__ void ggml_cuda_ar_kernel(
     // Phase 2: thread 0 of each block signals on its own arrival slot, then
     // spins for the matching slot from peer.  Per-block tokens mean blocks
     // proceed independently -- no inter-block barrier needed.
+    //
+    // Wave-size independence: the handshake is expressed purely in terms of
+    // threadIdx.x == 0 plus __syncthreads(), with no warp-level primitives, no
+    // warpSize/32 arithmetic and no ballot/shfl.  It is therefore correct for
+    // both wave32 and wave64 (RDNA defaults to wave64 under HIP).  The spin
+    // sits in divergent control flow inside wave 0; the remaining lanes of that
+    // wave fall through to the __syncthreads() below, which is the
+    // reconvergence point on both vendors.  Do NOT reintroduce any
+    // warp-granular assumption here.
     if (tid == 0) {
         int       * my_slot    = arrival_mine  + bid * ARRIVAL_INTS;
         const int * other_slot = arrival_other + bid * ARRIVAL_INTS;
@@ -160,12 +219,14 @@ static __global__ void ggml_cuda_ar_kernel(
         ggml_cuda_ar_signal_set(my_slot, token);
         __threadfence_system(); // make our signal visible system-wide
 
+        // Deliberately unbounded.  Bailing out after N iterations would let the
+        // kernel proceed to phase 3 and read a stale/partial host_other, i.e.
+        // silently wrong numerics; a hang is at least diagnosable.  The
+        // fail-safe for this pipeline is at init time (nullptr -> generic
+        // AllReduce), not mid-kernel.  On ROCm a genuine deadlock here trips
+        // the HSA queue watchdog and surfaces as a GPU fault.
         while (ggml_cuda_ar_signal_get(other_slot) != token) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-            __nanosleep(100);
-#else
-            NO_DEVICE_CODE;
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            ggml_cuda_ar_spin_pause();
         }
     }
 
@@ -267,13 +328,34 @@ struct ggml_cuda_ar_event_slot {
 // mapped device pointer.  Required on systems where cudaDevAttrCanUseHost-
 // PointerForRegisteredMem is 0 and the host pointer can't be used as a
 // device pointer.
+//
+// HIP: hipHostMalloc's *coherence* is not part of the CUDA API surface and, for
+// hipHostMallocDefault, has historically been switchable by environment
+// (HIP_HOST_COHERENT).  Buffers that the device polls or writes while the peer
+// device concurrently reads them MUST be fine-grained, so we request
+// hipHostMallocCoherent explicitly rather than trusting the default.  Buffers
+// touched only by the copy engine (SDMA) are left at the default coherence --
+// their ordering comes from stream/event handshakes, not from cache behaviour,
+// and fine-grained mappings can cost D2H/H2D bandwidth.
+enum ggml_cuda_ar_host_coherence {
+    GGML_CUDA_AR_HOST_DEFAULT,   // copy-engine staging: SDMA only
+    GGML_CUDA_AR_HOST_COHERENT,  // kernel-visible: device polls / stores here
+};
+
 struct ggml_cuda_ar_host_mapping {
     uint8_t * host = nullptr;   // cudaFreeHost handle; also the H-side ptr for cudaMemcpyAsync
     uint8_t * dev  = nullptr;   // device-side pointer for kernels / cudaMemset
 
-    cudaError_t alloc(size_t bytes) {
-        cudaError_t rc = cudaHostAlloc(reinterpret_cast<void **>(&host), bytes,
-                                       cudaHostAllocPortable | cudaHostAllocMapped);
+    cudaError_t alloc(size_t bytes, ggml_cuda_ar_host_coherence coherence = GGML_CUDA_AR_HOST_DEFAULT) {
+        unsigned int flags = cudaHostAllocPortable | cudaHostAllocMapped;
+#if defined(GGML_USE_HIP)
+        if (coherence == GGML_CUDA_AR_HOST_COHERENT) {
+            flags |= hipHostMallocCoherent;
+        }
+#else
+        GGML_UNUSED(coherence);
+#endif // defined(GGML_USE_HIP)
+        cudaError_t rc = cudaHostAlloc(reinterpret_cast<void **>(&host), bytes, flags);
         if (rc != cudaSuccess) {
             host = nullptr;
             return rc;
@@ -401,6 +483,24 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
+#if defined(GGML_USE_HIP)
+    // HIP: there is no cc gate equivalent to the Volta/__nanosleep one below --
+    // s_sleep and system-scope load/store atomics exist on every supported
+    // gfx target, and the wire path only ever *converts* through bf16 (via
+    // ggml_cuda_cast), never does bf16 arithmetic, so bf16-arithmetic-less
+    // parts like gfx1030 (RDNA2) are fine.  What we do need is host-memory
+    // mapping, so query it directly and fall back if it is unavailable.
+    for (size_t i = 0; i < n_devices; ++i) {
+        int can_map = 0;
+        const cudaError_t rc = cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, devices[i]);
+        if (rc != cudaSuccess || !can_map) {
+            GGML_LOG_DEBUG("%s: internal AllReduce requires host-memory mapping "
+                           "(device %d: rc=%d can_map=%d); falling back\n",
+                           __func__, devices[i], (int) rc, can_map);
+            return nullptr;
+        }
+    }
+#else
     // The chunked kernel uses __nanosleep, which is sm70+ (Volta+).
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
@@ -411,6 +511,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             return nullptr;
         }
     }
+#endif // defined(GGML_USE_HIP)
 
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
@@ -479,12 +580,21 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
         GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
-    if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
+    // Device-coherent: polled from inside the chunked kernel by both GPUs.
+    if (p->arrival.alloc(arrival_bytes, GGML_CUDA_AR_HOST_COHERENT) != cudaSuccess) {
         GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
                        __func__, arrival_bytes);
         ggml_cuda_ar_pipeline_free(p);
         return nullptr;
     }
+#if defined(GGML_USE_HIP)
+    // HIP: zero the ring through the host handle.  This is init time -- no
+    // device work references the ring yet -- and the mapping is fine-grained,
+    // so plain host stores are the cheapest and most portable way to do it.
+    // (hipMemset on a host-mapped pointer is accepted but relies on the
+    // pointer-attribute lookup classifying it as device-accessible.)
+    std::memset(p->arrival.host, 0, arrival_bytes);
+#else
     ggml_cuda_set_device(p->devices[0]);
     if (cudaMemset(p->arrival.dev, 0, arrival_bytes) != cudaSuccess) {
         GGML_LOG_ERROR("%s: cudaMemset for arrival ring failed (%zu bytes)\n",
@@ -492,6 +602,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         ggml_cuda_ar_pipeline_free(p);
         return nullptr;
     }
+#endif // defined(GGML_USE_HIP)
 
     // Per-device pinned staging buffers -- POOL_SIZE-deep ring so the chunked-
     // kernel can write the next slot's data while the peer is still reading
@@ -499,7 +610,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->buf_bytes = GGML_CUDA_AR_MAX_BYTES;
     const size_t host_buf_total = (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes;
     for (size_t i = 0; i < n_devices; ++i) {
-        if (p->host_buf[i].alloc(host_buf_total) != cudaSuccess) {
+        // Device-coherent: written and read directly by the chunked kernel on
+        // both GPUs (no copy engine involved on this path).
+        if (p->host_buf[i].alloc(host_buf_total, GGML_CUDA_AR_HOST_COHERENT) != cudaSuccess) {
             GGML_LOG_ERROR("%s: alloc for staging failed (%zu bytes)\n",
                            __func__, host_buf_total);
             ggml_cuda_ar_pipeline_free(p);
@@ -524,6 +637,27 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                            __func__, p->copy_bytes, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
+        }
+    }
+
+    // The chunked kernel running on device i dereferences host_buf[peer].dev and
+    // the arrival ring, i.e. mapped-host device pointers obtained while some
+    // *other* device was current.  That is only sound if the mapping is a single
+    // process-wide virtual address (unified addressing), which both CUDA UVA and
+    // ROCm provide -- in which case cudaHostGetDevicePointer returns the host
+    // pointer unchanged.  If a runtime ever hands back a per-device alias,
+    // cross-device use would silently read the wrong memory, so bail out to the
+    // generic AllReduce instead.
+    {
+        const ggml_cuda_ar_host_mapping * shared[] = { &p->arrival, &p->host_buf[0], &p->host_buf[1] };
+        for (const ggml_cuda_ar_host_mapping * m : shared) {
+            if (m->dev != m->host) {
+                GGML_LOG_WARN("%s: mapped host pointer is not device-uniform (host=%p dev=%p); "
+                              "cross-device access would be unsafe -- falling back\n",
+                              __func__, (void *) m->host, (void *) m->dev);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
         }
     }
 
@@ -952,11 +1086,13 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#else // defined(GGML_USE_MUSA)
 
-// HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and __nanosleep that this
-// implementation relies on, so the internal AllReduce is a CUDA-only feature.
+// MUSA has not been audited for the host-mapped pinned-memory APIs
+// (cudaHostAllocPortable / cudaHostAllocMapped / cudaHostGetDevicePointer),
+// the in-kernel sleep primitive, or the system-scope atomics this
+// implementation relies on, so the internal AllReduce is disabled there.
+// (HIP/ROCm *is* supported -- see the main implementation above.)
 // The dispatcher in ggml-cuda.cu treats a nullptr pipeline as "init failed"
 // and silently falls back to the meta backend's generic AllReduce.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
@@ -968,4 +1104,4 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
     return false;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)

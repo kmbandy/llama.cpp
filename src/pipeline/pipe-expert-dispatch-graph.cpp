@@ -1,4 +1,5 @@
 #include "pipe-expert-dispatch-graph.h"
+#include "pipe-prefetch-hints.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +30,14 @@ using dispatch_clock = std::chrono::steady_clock;
 bool dispatch_stats_enabled() {
     const char * value = std::getenv("WP_DISPATCH_STATS");
     return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool layer_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("WP_DS4_LAYER_TRACE");
+        return value != nullptr && value[0] != '\0';
+    }();
+    return enabled;
 }
 
 uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point end) {
@@ -69,6 +79,34 @@ std::vector<endpoint> parse_endpoints(const std::string & text) {
     return result;
 }
 
+struct ngram_env_config {
+    std::string path;
+    int32_t     top_m = 0;
+};
+
+ngram_env_config get_ngram_env_config() {
+    ngram_env_config result;
+    const char * value = std::getenv("WP_HINT_NGRAM");
+    if (value == nullptr || value[0] == '\0') {
+        return result;
+    }
+    result.path = value;
+    result.top_m = PREFETCH_HINT_MAX_EXPERTS;
+    const size_t comma = result.path.rfind(',');
+    if (comma == std::string::npos || comma + 1 == result.path.size()) {
+        return result;
+    }
+    int parsed = 0;
+    const char * begin = result.path.data() + comma + 1;
+    const char * end = result.path.data() + result.path.size();
+    const auto number = std::from_chars(begin, end, parsed);
+    if (number.ec == std::errc() && number.ptr == end) {
+        result.path.resize(comma);
+        result.top_m = std::min<int32_t>(PREFETCH_HINT_MAX_EXPERTS, std::max(0, parsed));
+    }
+    return result;
+}
+
 }  // namespace
 
 struct graph_dispatcher::op_context {
@@ -79,6 +117,7 @@ struct graph_dispatcher::op_context {
     // is unreachable on the dispatch path, so the worker must apply it and the
     // limit has to travel with every request.
     float              swiglu_clamp = 0.0f;
+    ggml_tensor *      issued = nullptr;
 };
 
 graph_dispatcher::graph_dispatcher(const std::string & endpoints,
@@ -89,9 +128,45 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
                                    int32_t             last_no_defer_layer) :
     remote(parse_endpoints(endpoints)),
     collect_stats_(dispatch_stats_enabled()) {
+    if (layer_trace_enabled()) {
+        const char * p = std::getenv("WP_DS4_LAYER_TRACE");
+        layer_trace_ = std::fopen(p, "w");
+        if (layer_trace_ != nullptr) {
+            LLAMA_LOG_WARN("expert dispatch: WP_DS4_LAYER_TRACE=%s (one line per layer)\n", p);
+        }
+    }
+    if (const char * p = std::getenv("WP_FORWARD_LOG"); p != nullptr && p[0] != '\0') {
+        forward_log_ = std::fopen(p, "w");
+        if (forward_log_ != nullptr) {
+            LLAMA_LOG_WARN(
+                "expert dispatch: WP_FORWARD_LOG=%s (one line per llama_decode: "
+                "n_tokens n_layers ns_wall ns_pack ns_issue ns_wait ns_unpack "
+                "ns_dispatch ns_other epoch_end)\n",
+                p);
+        }
+    }
     if (remote.n_embd() != n_embd || remote.n_ff_exp() != n_ff_exp || remote.n_expert() != n_expert ||
         remote.n_expert_used() != n_expert_used) {
         throw std::runtime_error("expert dispatcher workers do not match the model MoE dimensions");
+    }
+
+    const ngram_env_config ngram = get_ngram_env_config();
+    if (ngram.top_m > 0 && !ngram.path.empty()) {
+        try {
+            std::unique_ptr<ngram_hint_table> table(new ngram_hint_table(ngram.path));
+            if (table->n_experts() != remote.n_expert()) {
+                throw std::runtime_error("n-gram table expert count does not match the model");
+            }
+            if (last_no_defer_layer >= 0 && table->n_layers() > last_no_defer_layer + 1) {
+                throw std::runtime_error("n-gram table layer count exceeds the model main stack");
+            }
+            ngram_top_m_ = std::min<int32_t>(ngram.top_m, table->row_width());
+            LLAMA_LOG_WARN("expert dispatch: WP_HINT_NGRAM=%s,%d (%d layers, %zu token-layer rows)\n",
+                           ngram.path.c_str(), ngram_top_m_, table->n_layers(), table->row_count());
+            ngram_table_ = std::move(table);
+        } catch (const std::exception & error) {
+            LLAMA_LOG_WARN("expert dispatch: WP_HINT_NGRAM disabled: %s\n", error.what());
+        }
     }
 
     if (last_no_defer_layer >= 0) {
@@ -115,6 +190,9 @@ graph_dispatcher::graph_dispatcher(const std::string & endpoints,
 graph_dispatcher::~graph_dispatcher() {
     // Best-effort drain so a short-lived context does not leave workers hanging.
     try {
+        if (remote.has_open_dispatch()) {
+            (void) remote.finish_dispatch();
+        }
         (void) remote.drain_deferred();
     } catch (...) {
         // Destructor must not throw; workers will drop on socket close.
@@ -133,6 +211,57 @@ graph_dispatcher::~graph_dispatcher() {
         std::fclose(capture_file_);
         capture_file_ = nullptr;
     }
+    if (forward_log_ != nullptr) {
+        std::fclose(forward_log_);
+        forward_log_ = nullptr;
+    }
+    if (layer_trace_ != nullptr) {
+        std::fclose(layer_trace_);
+        layer_trace_ = nullptr;
+    }
+}
+
+void graph_dispatcher::layer_trace_dense_begin(int32_t layer) noexcept {
+    if (layer_trace_ == nullptr) {
+        return;
+    }
+    layer_trace_record & record = layer_traces_[layer];
+    record.dense_ns = 0;
+    record.dense_started = dispatch_clock::now();
+    record.dense_active = true;
+}
+
+void graph_dispatcher::layer_trace_dense_end(int32_t layer) noexcept {
+    if (layer_trace_ == nullptr) {
+        return;
+    }
+    const auto it = layer_traces_.find(layer);
+    if (it == layer_traces_.end() || !it->second.dense_active) {
+        return;
+    }
+    it->second.dense_ns += elapsed_ns(it->second.dense_started, dispatch_clock::now());
+    it->second.dense_active = false;
+}
+
+void graph_dispatcher::write_layer_trace(int32_t layer) noexcept {
+    if (layer_trace_ == nullptr) {
+        return;
+    }
+    layer_trace_record & record = layer_traces_[layer];
+    if (record.dense_active) {
+        record.dense_ns += elapsed_ns(record.dense_started, dispatch_clock::now());
+        record.dense_active = false;
+    }
+    const layer_trace_stats transport = remote.layer_trace(layer);
+    std::fprintf(layer_trace_, "DS4 layer=%d dense_ns=%llu encode_ns=%llu send_ns=%llu recv_ns=%llu decode_ns=%llu scatter_ns=%llu\n",
+                 layer,
+                 (unsigned long long) record.dense_ns,
+                 (unsigned long long) transport.encode_ns,
+                 (unsigned long long) transport.send_ns,
+                 (unsigned long long) transport.recv_ns,
+                 (unsigned long long) transport.decode_ns,
+                 0ull);
+    std::fflush(layer_trace_);
 }
 
 ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
@@ -158,6 +287,57 @@ ggml_tensor * graph_dispatcher::build(ggml_context * ctx,
     // whatever value the first graph build happened to see.
     context->swiglu_clamp = swiglu_clamp;
     return ggml_map_custom3(ctx, activations, selected_experts, weights, compute, 1, context.get());
+}
+
+ggml_tensor * graph_dispatcher::build_issue(ggml_context * ctx,
+                                            ggml_tensor *  activations,
+                                            ggml_tensor *  selected_experts,
+                                            ggml_tensor *  weights,
+                                            int32_t        layer,
+                                            float          swiglu_clamp) {
+    if (layer < 0) {
+        throw std::invalid_argument("expert dispatch requires a non-negative layer");
+    }
+    if (activations->type != GGML_TYPE_F32 || selected_experts->type != GGML_TYPE_I32 ||
+        weights->type != GGML_TYPE_F32) {
+        throw std::invalid_argument("expert dispatch requires F32 activations, I32 expert ids, and F32 weights");
+    }
+
+    auto & context = op_contexts[layer];
+    if (!context) {
+        context.reset(new op_context{ this, layer });
+    }
+    context->swiglu_clamp = swiglu_clamp;
+    ggml_tensor * issued =
+        ggml_map_custom3(ctx, activations, selected_experts, weights, compute_issue, 1, context.get());
+    context->issued = issued;
+    return issued;
+}
+
+ggml_tensor * graph_dispatcher::after_issue(ggml_context * ctx, ggml_tensor * tensor, int32_t layer) {
+    if (tensor == nullptr) {
+        throw std::invalid_argument("after_issue requires a tensor");
+    }
+    const auto it = op_contexts.find(layer);
+    if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
+        throw std::runtime_error("after_issue has no issue node for layer " + std::to_string(layer));
+    }
+    // 0 * issued[0], broadcast and added. Identity on finite values; the only
+    // purpose is a compute edge so shexp cannot be scheduled before the send.
+    ggml_tensor * gate = ggml_view_1d(ctx, it->second->issued, 1, 0);
+    ggml_tensor * zero = ggml_scale(ctx, gate, 0.0f);
+    return ggml_add(ctx, tensor, ggml_repeat(ctx, zero, tensor));
+}
+
+ggml_tensor * graph_dispatcher::build_wait(ggml_context * ctx, ggml_tensor * shexp, int32_t layer) {
+    const auto it = op_contexts.find(layer);
+    if (it == op_contexts.end() || it->second == nullptr || it->second->issued == nullptr) {
+        throw std::runtime_error("build_wait has no issue node for layer " + std::to_string(layer));
+    }
+    if (shexp == nullptr) {
+        throw std::invalid_argument("build_wait requires the shexp tensor so wait cannot overtake it");
+    }
+    return ggml_map_custom2(ctx, it->second->issued, shexp, compute_wait, 1, it->second.get());
 }
 
 size_t graph_dispatcher::n_workers() const {
@@ -217,7 +397,7 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
             // failure inside it may reach the decode. A broken socket surfaces on
             // the next real dispatch, which is where it belongs.
             try {
-                sent += remote.send_prefetch_hints(layer, hint_experts_, provenance);
+                sent += remote.send_prefetch_hints(layer, hint_experts_, provenance, (uint32_t) count);
             } catch (...) {
                 return sent;
             }
@@ -226,24 +406,13 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
     return sent;
 }
 
-int graph_dispatcher::predict_ahead() {
+int graph_dispatcher::router2_topm() {
     static const int value = [] {
-        const char * v = std::getenv("WP_PREDICT_AHEAD");
+        const char * v = std::getenv("WP_HINT_ROUTER2");
         if (v == nullptr || v[0] == '\0') {
             return 0;
         }
-        return std::max(0, std::atoi(v));
-    }();
-    return value;
-}
-
-int graph_dispatcher::predict_topm() {
-    static const int value = [] {
-        const char * v = std::getenv("WP_PREDICT_TOPM");
-        if (v == nullptr || v[0] == '\0') {
-            return 3;
-        }
-        return std::min(8, std::max(1, std::atoi(v)));
+        return std::min<int32_t>(PREFETCH_HINT_MAX_EXPERTS, std::max(0, std::atoi(v)));
     }();
     return value;
 }
@@ -255,17 +424,6 @@ int graph_dispatcher::predict_max_tokens() {
             return 16;
         }
         return std::max(1, std::atoi(v));
-    }();
-    return value;
-}
-
-float graph_dispatcher::predict_conf() {
-    static const float value = [] {
-        const char * v = std::getenv("WP_PREDICT_CONF");
-        if (v == nullptr || v[0] == '\0') {
-            return 0.0f;
-        }
-        return std::max(0.0f, (float) std::atof(v));
     }();
     return value;
 }
@@ -286,11 +444,11 @@ void graph_dispatcher::register_router_layer(int32_t layer, int32_t n_expert, in
 void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float> & activations,
                                           int64_t n_tokens) noexcept {
     try {
-        const int k = predict_ahead();
-        if (k <= 0 || n_tokens <= 0 || n_tokens > predict_max_tokens() || routers_.empty()) {
+        if (router2_topm() <= 0 || n_tokens <= 0 ||
+            n_tokens > (int64_t) PREFETCH_HINT_MAX_TOKENS || routers_.empty()) {
             return;
         }
-        if (routers_.find(layer + k) == routers_.end()) {
+        if (routers_.find(layer + 2) == routers_.end()) {
             return;   // past the last layer, or the oracle was cleared
         }
         if (!pred_thread_started_.exchange(true)) {
@@ -310,8 +468,6 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
 }
 
 void graph_dispatcher::predictor_loop() {
-    std::vector<float>   scores;
-    std::vector<int32_t> unioned;
     for (;;) {
         pred_job job;
         {
@@ -324,57 +480,22 @@ void graph_dispatcher::predictor_loop() {
             pred_inbox_.valid = false;
         }
         try {
-            const int  k  = predict_ahead();
-            const auto it = routers_.find(job.layer + k);
+            const auto it = routers_.find(job.layer + 2);
             if (it == routers_.end()) {
                 continue;
             }
             const router_layer & rl       = it->second;
             const int32_t        n_expert = remote.n_expert();
             const int32_t        n_embd   = remote.n_embd();
-            const int            top_m    = predict_topm();
-
-            // DS4 routing, replicating build_moe_ffn's SQRT_SOFTPLUS branch:
-            // probs = sqrt(softplus(W @ h)); selection score = probs +
-            // exp_probs_b. No expert groups and no gate bias on this arch.
-            const float conf = predict_conf();
-            std::set<int32_t> u;
-            scores.resize((size_t) n_expert);
-            std::vector<std::pair<float, int32_t>> ranked((size_t) top_m + 1);
-            for (int64_t token = 0; token < job.n_tokens; ++token) {
-                const float * h = job.activations.data() + (size_t) token * (size_t) n_embd;
-                for (int32_t e = 0; e < n_expert; ++e) {
-                    const float * row = rl.w.data() + (size_t) e * (size_t) n_embd;
-                    float acc = 0.0f;
-                    for (int32_t i = 0; i < n_embd; ++i) {
-                        acc += row[i] * h[i];
-                    }
-                    // Numerically stable softplus: max(x,0) + log1p(exp(-|x|)).
-                    const float sp = std::max(acc, 0.0f) + std::log1p(std::exp(-std::fabs(acc)));
-                    scores[(size_t) e] = std::sqrt(sp) + rl.b[(size_t) e];
-                }
-                // top_m + 1 ranked picks so each kept rank is margin-gated
-                // against the NEXT one (WP_PREDICT_CONF; 0 keeps everything).
-                // Ranks are gated independently -- margins are not monotone in
-                // rank, so an unconfident rank must not veto the ones below it.
-                for (int m = 0; m < top_m + 1; ++m) {
-                    const auto best = std::max_element(scores.begin(), scores.end());
-                    ranked[(size_t) m] = { *best, (int32_t) (best - scores.begin()) };
-                    *best = -std::numeric_limits<float>::infinity();
-                }
-                for (int m = 0; m < top_m; ++m) {
-                    if (ranked[(size_t) m].first - ranked[(size_t) m + 1].first >= conf) {
-                        u.insert(ranked[(size_t) m].second);
-                    }
-                }
+            std::vector<int32_t> experts = router2_top_experts(
+                rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
+                n_expert, n_embd, router2_topm());
+            if (experts.empty()) {
+                continue;
             }
-            if (u.empty()) {
-                continue;   // every pick was below the confidence floor
-            }
-            unioned.assign(u.begin(), u.end());   // ascending, as send expects
             {
                 std::lock_guard<std::mutex> lock(pred_mutex_);
-                pred_ready_[job.layer + k] = unioned;
+                pred_ready_[job.layer + 2] = { (uint32_t) job.n_tokens, std::move(experts) };
             }
         } catch (...) {
             // Swallow and keep serving; one lost prediction is one lost hint.
@@ -384,7 +505,7 @@ void graph_dispatcher::predictor_loop() {
 
 void graph_dispatcher::flush_predicted_hints() noexcept {
     try {
-        std::map<int32_t, std::vector<int32_t>> ready;
+        std::map<int32_t, pred_result> ready;
         {
             std::lock_guard<std::mutex> lock(pred_mutex_);
             if (pred_ready_.empty()) {
@@ -394,15 +515,42 @@ void graph_dispatcher::flush_predicted_hints() noexcept {
         }
         for (auto & entry : ready) {
             std::vector<int32_t> & previous = last_pred_hint_[entry.first];
-            if (previous == entry.second) {
+            if (previous == entry.second.experts) {
                 continue;   // the worker would resolve it to pages already queued
             }
-            previous = entry.second;
-            (void) remote.send_prefetch_hints(entry.first, entry.second, PIPE_HINT_PREDICTED);
+            previous = entry.second.experts;
+            (void) remote.send_prefetch_hints(entry.first, entry.second.experts,
+                                              PIPE_HINT_PREDICTED, entry.second.n_tokens);
         }
     } catch (...) {
         // Swallow. A broken socket surfaces on the next real dispatch.
     }
+}
+
+size_t graph_dispatcher::prefetch_ngram_for_tokens(const int32_t * tokens, size_t n_tokens) noexcept {
+    if (ngram_table_ == nullptr || tokens == nullptr || n_tokens == 0 ||
+        n_tokens > PREFETCH_HINT_MAX_TOKENS) {
+        return 0;
+    }
+    size_t sent = 0;
+    try {
+        for (int32_t layer = 0; layer < ngram_table_->n_layers(); ++layer) {
+            std::vector<int32_t> experts =
+                ngram_table_->top_experts(tokens, n_tokens, layer, ngram_top_m_);
+            if (experts.empty()) {
+                continue;
+            }
+            std::vector<int32_t> & previous = last_ngram_hint_[layer];
+            if (previous == experts) {
+                continue;
+            }
+            previous = experts;
+            sent += remote.send_prefetch_hints(layer, experts, PIPE_HINT_PREDICTED,
+                                               (uint32_t) n_tokens);
+        }
+    } catch (...) {
+    }
+    return sent;
 }
 
 void graph_dispatcher::capture_routing(const char * prefix, int32_t layer,
@@ -490,7 +638,8 @@ std::string graph_dispatcher::failure_message() const {
 
 void graph_dispatcher::begin_decode() noexcept {
     remote.begin_deferral_window();
-    if (!collect_stats_) {
+    decode_t0_ = dispatch_clock::now();
+    if (!collect_stats_ && forward_log_ == nullptr) {
         return;
     }
     decode_active_                       = true;
@@ -501,6 +650,7 @@ void graph_dispatcher::begin_decode() noexcept {
     decode_ns_unpack_                    = 0;
     decode_ns_total_                     = 0;
     decode_first_await_in_flight_        = 0;
+    decode_max_in_flight_                = 0;
     decode_n_tokens_                     = 0;
     decode_workers_.clear();
     for (const worker_info & worker : remote.workers()) {
@@ -543,7 +693,7 @@ void graph_dispatcher::end_decode() noexcept {
     // the spine's side of the mechanism, and they are what tells a run that
     // "prefetch did nothing" apart from "prefetch was never offered". Silent
     // when the feature is off, so a config-of-record run's log is unchanged.
-    if (hint_enabled()) {
+    if (hint_enabled() || router2_topm() > 0 || ngram_table_ != nullptr) {
         const prefetch_hint_stats & hstats = remote.get_prefetch_hint_stats();
         LLAMA_LOG_WARN(
             "expert dispatch prefetch hint: layers=%zu frames=%llu experts=%llu "
@@ -557,7 +707,29 @@ void graph_dispatcher::end_decode() noexcept {
             (unsigned long long) hstats.n_skipped_in_flight);
     }
 
+    const uint64_t ns_wall = elapsed_ns(decode_t0_, dispatch_clock::now());
+    if (forward_log_ != nullptr && decode_active_ && decode_layers_ > 0) {
+        const uint64_t ns_dispatch = decode_ns_total_;
+        const uint64_t ns_other = ns_wall > ns_dispatch ? ns_wall - ns_dispatch : 0;
+        const double epoch_end =
+            (double) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count() / 1e6;
+        std::fprintf(forward_log_,
+                     "%u %zu %llu %llu %llu %llu %llu %llu %llu %.6f\n",
+                     decode_n_tokens_,
+                     decode_layers_,
+                     (unsigned long long) ns_wall,
+                     (unsigned long long) decode_ns_pack_,
+                     (unsigned long long) decode_ns_issue_,
+                     (unsigned long long) decode_ns_wait_,
+                     (unsigned long long) decode_ns_unpack_,
+                     (unsigned long long) ns_dispatch,
+                     (unsigned long long) ns_other,
+                     epoch_end);
+        std::fflush(forward_log_);
+    }
     if (!collect_stats_ || !decode_active_) {
+        decode_active_ = false;
         return;
     }
     decode_active_ = false;
@@ -574,7 +746,8 @@ void graph_dispatcher::end_decode() noexcept {
     // ms/tok is the cross-phase-comparable column: prefill amortises, decode does not.
     LLAMA_LOG_WARN(
         "expert dispatch: phase=%s n_tokens=%u layers=%zu pack=%.2f ms issue=%.2f ms wait=%.2f ms "
-        "unpack=%.2f ms total=%.2f ms (%.3f ms/tok) first_await_in_flight avg=%.1f (workers=%zu)\n",
+        "unpack=%.2f ms total=%.2f ms (%.3f ms/tok) first_await_in_flight avg=%.1f max_in_flight=%zu "
+        "(workers=%zu)\n",
         // 3-way: n_tokens > 1 alone would call every speculative-verify batch a
         // prefill, and with DSpark on that is ~97% of them by count.
         decode_n_tokens_ >= 64 ? "PREFILL" : (decode_n_tokens_ > 1 ? "verify" : "decode"),
@@ -587,6 +760,7 @@ void graph_dispatcher::end_decode() noexcept {
         decode_ns_total_ * ns_to_ms,
         decode_ns_total_ * ns_to_ms / (double) std::max<uint32_t>(1, decode_n_tokens_),
         (double) decode_first_await_in_flight_ / (double) decode_layers_,
+        decode_max_in_flight_,
         n_workers());
     for (const worker_dispatch_stats & worker : decode_workers_) {
         const double avg_wait_ms = worker.n_requests == 0
@@ -623,7 +797,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             ggml_set_zero(dst);
             return;
         }
-        const bool collect_stats = owner->collect_stats_ && owner->decode_active_;
+        const bool collect_stats = owner->decode_active_;
         const dispatch_clock::time_point total_start =
             collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
 
@@ -693,8 +867,10 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
         // layer's activations. The GEMM runs off-thread and its result ships
         // at the NEXT layer's entry -- one layer of lead spent on the handoff
         // instead of +26 ms/step of critical-path scoring (2026-08-07 A/B).
-        owner->flush_predicted_hints();
-        owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
+        if (owner->router2_topm() > 0) {
+            owner->flush_predicted_hints();
+            owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
+        }
         if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
             capture_prefix != nullptr && capture_prefix[0] != '\0') {
             owner->capture_routing(capture_prefix, context->layer, wire_activations,
@@ -729,6 +905,7 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
             owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
             owner->decode_ns_total_ += elapsed_ns(total_start, total_end);
             owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
+            owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_, layer_stats.max_in_flight);
             for (const worker_dispatch_stats & worker : layer_stats.workers) {
                 for (worker_dispatch_stats & decode_worker : owner->decode_workers_) {
                     if (decode_worker.endpoint != worker.endpoint) {
@@ -749,6 +926,191 @@ void graph_dispatcher::compute(ggml_tensor *       dst,
     } catch (...) {
         if (owner != nullptr) {
             owner->latch_failure("expert dispatch custom op failed with an unknown exception");
+        }
+        ggml_set_zero(dst);
+    }
+}
+
+void graph_dispatcher::compute_issue(ggml_tensor *       dst,
+                                     const ggml_tensor * activations,
+                                     const ggml_tensor * selected_experts,
+                                     const ggml_tensor * weights,
+                                     int                 ith,
+                                     int                 nth,
+                                     void *              userdata) {
+    graph_dispatcher * owner = nullptr;
+    try {
+        if (ith != 0 || nth != 1) {
+            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
+        }
+        op_context * context = static_cast<op_context *>(userdata);
+        if (context == nullptr || context->owner == nullptr) {
+            throw std::runtime_error("expert dispatch custom op has no dispatcher");
+        }
+        owner = context->owner;
+        if (owner->failed()) {
+            if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
+                *static_cast<float *>(dst->data) = 0.0f;
+            }
+            return;
+        }
+        const bool collect_stats = owner->decode_active_;
+
+        const int64_t n_embd        = activations->ne[0];
+        const int64_t n_tokens      = activations->ne[1];
+        const int64_t n_expert_used = selected_experts->ne[0];
+        const bool shapes_match =
+            n_embd == owner->remote.n_embd() && n_tokens > 0 &&
+            activations->ne[2] == 1 && activations->ne[3] == 1 &&
+            selected_experts->ne[1] == n_tokens &&
+            selected_experts->ne[2] == 1 && selected_experts->ne[3] == 1 &&
+            weights->ne[0] == 1 && weights->ne[1] == n_expert_used &&
+            weights->ne[2] == n_tokens && weights->ne[3] == 1;
+        if (!shapes_match) {
+            throw std::runtime_error("expert dispatch issue op input shapes do not match");
+        }
+
+        std::vector<float> wire_activations((size_t) n_embd * (size_t) n_tokens);
+        const dispatch_clock::time_point pack_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        if (ggml_is_contiguous(activations)) {
+            std::memcpy(wire_activations.data(), activations->data,
+                        wire_activations.size() * sizeof(float));
+        } else {
+            for (size_t i = 0; i < wire_activations.size(); ++i) {
+                wire_activations[i] = ggml_get_f32_1d(activations, (int) i);
+            }
+        }
+        const dispatch_clock::time_point pack_end =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+
+        std::map<int32_t, pipe_expert_assignment> by_expert;
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            std::set<int32_t> token_experts;
+            for (int64_t slot = 0; slot < n_expert_used; ++slot) {
+                const int     index  = (int) (token * n_expert_used + slot);
+                const int32_t expert = ggml_get_i32_1d(selected_experts, index);
+                if (!token_experts.insert(expert).second) {
+                    throw std::runtime_error("expert dispatch received a repeated expert for one token");
+                }
+                auto inserted = by_expert.emplace(expert, pipe_expert_assignment{});
+                if (inserted.second) {
+                    inserted.first->second.expert_id = expert;
+                    inserted.first->second.weights.resize((size_t) n_tokens, 0.0f);
+                }
+                inserted.first->second.weights[(size_t) token] = ggml_get_f32_1d(weights, index);
+            }
+        }
+
+        std::vector<pipe_expert_assignment> assignments;
+        assignments.reserve(by_expert.size());
+        for (auto & entry : by_expert) {
+            assignments.push_back(std::move(entry.second));
+        }
+
+        if (owner->router2_topm() > 0) {
+            owner->flush_predicted_hints();
+            owner->enqueue_prediction(context->layer, wire_activations, n_tokens);
+        }
+        if (const char * capture_prefix = std::getenv("WP_PREDICT_CAPTURE");
+            capture_prefix != nullptr && capture_prefix[0] != '\0') {
+            owner->capture_routing(capture_prefix, context->layer, wire_activations,
+                                   selected_experts, n_tokens, n_expert_used);
+        }
+
+        const uint64_t seq_id = owner->next_seq_id.fetch_add(1, std::memory_order_relaxed);
+        owner->remote.begin_dispatch(context->layer, seq_id, (uint32_t) n_tokens, wire_activations, assignments,
+                                     context->swiglu_clamp);
+        if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
+            *static_cast<float *>(dst->data) = 0.0f;
+        }
+        if (collect_stats) {
+            const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
+            owner->decode_n_tokens_ = (uint32_t) n_tokens;
+            owner->decode_ns_pack_ += elapsed_ns(pack_start, pack_end);
+            owner->decode_ns_issue_ += layer_stats.ns_issue;
+        }
+    } catch (const std::exception & error) {
+        if (owner != nullptr) {
+            owner->latch_failure(error.what());
+        }
+        if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
+            *static_cast<float *>(dst->data) = 0.0f;
+        }
+    } catch (...) {
+        if (owner != nullptr) {
+            owner->latch_failure("expert dispatch issue op failed with an unknown exception");
+        }
+        if (dst->data != nullptr && dst->type == GGML_TYPE_F32 && ggml_nelements(dst) > 0) {
+            *static_cast<float *>(dst->data) = 0.0f;
+        }
+    }
+}
+
+void graph_dispatcher::compute_wait(ggml_tensor *       dst,
+                                    const ggml_tensor * issued,
+                                    const ggml_tensor * shexp,
+                                    int                 ith,
+                                    int                 nth,
+                                    void *              userdata) {
+    GGML_UNUSED(issued);
+    GGML_UNUSED(shexp);
+    graph_dispatcher * owner = nullptr;
+    try {
+        if (ith != 0 || nth != 1) {
+            throw std::runtime_error("expert dispatch custom op must run as one CPU task");
+        }
+        op_context * context = static_cast<op_context *>(userdata);
+        if (context == nullptr || context->owner == nullptr) {
+            throw std::runtime_error("expert dispatch wait op has no dispatcher");
+        }
+        owner = context->owner;
+        if (owner->failed()) {
+            ggml_set_zero(dst);
+            return;
+        }
+        const bool collect_stats = owner->decode_active_;
+        const dispatch_clock::time_point unpack_start =
+            collect_stats ? dispatch_clock::now() : dispatch_clock::time_point{};
+        const std::vector<float> result = owner->remote.finish_dispatch();
+        const dispatch_stats & layer_stats = owner->remote.last_dispatch_stats();
+        if (ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32) {
+            std::memcpy(dst->data, result.data(), result.size() * sizeof(float));
+        } else {
+            for (size_t i = 0; i < result.size(); ++i) {
+                ggml_set_f32_1d(dst, (int) i, result[i]);
+            }
+        }
+        owner->write_layer_trace(context->layer);
+        if (collect_stats) {
+            const dispatch_clock::time_point total_end = dispatch_clock::now();
+            ++owner->decode_layers_;
+            owner->decode_ns_wait_ += layer_stats.ns_wait;
+            owner->decode_ns_unpack_ += elapsed_ns(unpack_start, total_end);
+            owner->decode_ns_total_ += layer_stats.ns_issue + layer_stats.ns_wait +
+                                       elapsed_ns(unpack_start, total_end);
+            owner->decode_first_await_in_flight_ += layer_stats.first_await_in_flight;
+            owner->decode_max_in_flight_ = std::max(owner->decode_max_in_flight_, layer_stats.max_in_flight);
+            for (const worker_dispatch_stats & worker : layer_stats.workers) {
+                for (worker_dispatch_stats & decode_worker : owner->decode_workers_) {
+                    if (decode_worker.endpoint != worker.endpoint) {
+                        continue;
+                    }
+                    decode_worker.ns_wait += worker.ns_wait;
+                    decode_worker.n_requests += worker.n_requests;
+                    decode_worker.n_experts_total += worker.n_experts_total;
+                    break;
+                }
+            }
+        }
+    } catch (const std::exception & error) {
+        if (owner != nullptr) {
+            owner->latch_failure(error.what());
+        }
+        ggml_set_zero(dst);
+    } catch (...) {
+        if (owner != nullptr) {
+            owner->latch_failure("expert dispatch wait op failed with an unknown exception");
         }
         ggml_set_zero(dst);
     }

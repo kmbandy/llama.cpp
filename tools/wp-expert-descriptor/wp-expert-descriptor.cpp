@@ -275,9 +275,10 @@ Options parse_cli(int argc, char ** argv) {
 int run(const Options & options) {
     const json manifest = read_json(options.manifest);
     check_format(manifest, MANIFEST_FORMAT, options.manifest);
-    if (get_value<std::string>(manifest, "sharding_mode", options.manifest) !=
-        "expert-index-range") {
-        throw std::runtime_error("descriptor requires an expert-index-range shard manifest");
+    const std::string sharding_mode = get_value<std::string>(manifest, "sharding_mode", options.manifest);
+    const bool sliced = sharding_mode == "expert-slice";
+    if (!sliced && sharding_mode != "expert-index-range") {
+        throw std::runtime_error("descriptor requires an expert-index-range or expert-slice shard manifest");
     }
     const json & retained = manifest.at("retained_expert_range");
     const int expert_first = get_value<int>(retained, "first", options.manifest);
@@ -314,6 +315,27 @@ int run(const Options & options) {
     }
     if (expert_last >= (int) n_expert) {
         throw std::runtime_error("manifest retained range exceeds model expert count");
+    }
+    int64_t slice_first = 0;
+    int64_t slice_last  = (int64_t) n_ff_exp;
+    int64_t slice_width = (int64_t) n_ff_exp;
+    if (sliced) {
+        const json & slicing = manifest.at("expert_slicing");
+        const int slice_index = get_value<int>(slicing, "selected_slice", options.manifest);
+        const json & widths = get_array(slicing, "widths", options.manifest);
+        if (get_value<int64_t>(slicing, "n_ff_exp", options.manifest) != (int64_t) n_ff_exp ||
+            get_value<int64_t>(slicing, "n_embd", options.manifest) != (int64_t) n_embd ||
+            slice_index < 0 || slice_index >= (int) widths.size()) {
+            throw std::runtime_error("manifest has invalid expert slice geometry");
+        }
+        slice_width = widths.at(slice_index).get<int64_t>();
+        for (int i = 0; i < slice_index; ++i) {
+            slice_first += widths.at(i).get<int64_t>();
+        }
+        slice_last = slice_first + slice_width;
+        if (slice_width <= 0 || slice_last > (int64_t) n_ff_exp) {
+            throw std::runtime_error("manifest has an invalid selected expert slice");
+        }
     }
 
     std::string activation;
@@ -455,7 +477,17 @@ int run(const Options & options) {
                 const uint64_t size   = get_value<uint64_t>(member, "size", index_path);
                 const std::string source_name =
                     get_value<std::string>(member, "source_tensor_name", index_path);
-                if (offset != next_offset || size != role.bytes ||
+                const int64_t want0 = sliced ? (role_name == "down" ? slice_width : (int64_t) n_embd) : role.ne0;
+                const int64_t want1 = sliced ? (role_name == "down" ? (int64_t) n_embd : slice_width) : role.ne1;
+                const uint64_t want_bytes = ggml_row_size(role.type, want0) * (uint64_t) want1;
+                if (sliced && (get_array(member, "slice_shape", index_path) != json({ want0, want1 }) ||
+                               get_value<int>(group, "slice_idx", index_path) !=
+                                   get_value<int>(manifest.at("expert_slicing"), "selected_slice", options.manifest) ||
+                               get_value<int64_t>(group, "ff_first", index_path) != slice_first ||
+                               get_value<int64_t>(group, "ff_last", index_path) != slice_last)) {
+                    throw std::runtime_error(index_path.string() + ": expert slice metadata disagrees with manifest");
+                }
+                if (offset != next_offset || size != want_bytes ||
                     source_name != role.source_tensor_name) {
                     throw std::runtime_error(
                         index_path.string() + ": layer " + std::to_string(layer_first) +
@@ -521,17 +553,29 @@ int run(const Options & options) {
           } },
         { "layers", json::array() },
     };
+    if (sliced) {
+        descriptor["expert_slicing"] = manifest.at("expert_slicing");
+    }
 
     std::map<std::string, std::map<std::pair<int, std::string>, int>> distribution;
     for (int layer : served_layers) {
         const LayerRoles & roles = layers.at(layer);
+        const auto sliced_role = [&](const RoleDesc & role) {
+            RoleDesc result = role;
+            if (sliced) {
+                result.ne0 = role.role == "down" ? slice_width : (int64_t) n_embd;
+                result.ne1 = role.role == "down" ? (int64_t) n_embd : slice_width;
+                result.bytes = ggml_row_size(result.type, result.ne0) * (uint64_t) result.ne1;
+            }
+            return result;
+        };
         json layer_json = {
             { "layer", layer },
             { "roles",
               {
-                  { "gate", role_to_json(roles.at("gate")) },
-                  { "up",   role_to_json(roles.at("up"))   },
-                  { "down", role_to_json(roles.at("down")) },
+                  { "gate", role_to_json(sliced_role(roles.at("gate"))) },
+                  { "up",   role_to_json(sliced_role(roles.at("up")))   },
+                  { "down", role_to_json(sliced_role(roles.at("down"))) },
               } },
         };
         descriptor["layers"].push_back(std::move(layer_json));

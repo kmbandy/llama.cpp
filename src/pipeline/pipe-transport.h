@@ -44,7 +44,9 @@ struct pipe_socket_t {
     pipe_socket_ptr accept();
 
     static pipe_socket_ptr create_server(const char * host, int port);
-    static pipe_socket_ptr connect(const char * host, int port);
+    // When `retryable` is supplied, it is set only for a TCP refusal or
+    // timeout.  Callers must not retry protocol, DNS, or local setup errors.
+    static pipe_socket_ptr connect(const char * host, int port, bool * retryable = nullptr);
 
 private:
     struct impl;

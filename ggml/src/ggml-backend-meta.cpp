@@ -643,35 +643,44 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
-            return handle_reshape(src_ss);
+        // a view node can carry only view_src and no src[0] (e.g. views emitted
+        // by graph passes that rewire sources); the data parent is equivalent
+        const ggml_tensor * vsrc = tensor->src[0] != nullptr ? tensor->src[0] : tensor->view_src;
+        GGML_ASSERT(vsrc != nullptr);
+        const ggml_backend_meta_split_state ss0 = tensor->src[0] != nullptr
+            ? src_ss[0]
+            : ggml_backend_meta_get_split_state(stc, vsrc, /*assume_sync =*/ true);
+        if (ggml_is_contiguous(tensor) && ggml_is_contiguous(vsrc)) {
+            std::vector<ggml_backend_meta_split_state> vsrc_ss(src_ss);
+            vsrc_ss[0] = ss0;
+            return handle_reshape(vsrc_ss);
         }
-        const int axis = src_ss[0].axis;
+        const int axis = ss0.axis;
         {
             bool all_strides_the_same = true;
             for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
-                if (tensor->ne[dim] == 1 && tensor->src[0]->ne[dim] == 1) {
+                if (tensor->ne[dim] == 1 && vsrc->ne[dim] == 1) {
                     continue;
                 }
-                if (tensor->nb[dim] != tensor->src[0]->nb[dim]) {
+                if (tensor->nb[dim] != vsrc->nb[dim]) {
                     all_strides_the_same = false;
                     break;
                 }
             }
             if (all_strides_the_same) {
-                return src_ss[0];
+                return ss0;
             }
         }
-        if (!ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
+        if (!ggml_is_permuted(tensor) && !ggml_is_permuted(vsrc) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
             for (int dim = 0; dim < GGML_MAX_DIMS-1; dim++) {
-                if (tensor->nb[dim+1] == tensor->src[0]->nb[axis+1]) {
+                if (tensor->nb[dim+1] == vsrc->nb[axis+1]) {
                     return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
                 }
             }
             GGML_ABORT("fatal error");
         }
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-            return src_ss[0];
+        if (ss0.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || ss0.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            return ss0;
         }
         GGML_ABORT("view of permuted tensor not implemented");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};

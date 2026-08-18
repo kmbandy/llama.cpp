@@ -5,11 +5,14 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "../src/llama-model.h"
+#include "../src/llama-context.h"
 #include "../src/llama-kv-cache-paged.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/memory-tier/mt-tiered.h"
 #include "../src/weight-pager/wp-pager.h"
 #include "../src/weight-pager/wp-pager-set.h"
+#include "../src/pipeline/pipe-dense-segment-client.h"
+#include "../src/pipeline/pipe-dense-segment-manifest.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -26,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <condition_variable>
@@ -276,6 +280,12 @@ struct server_batch {
     void set_output(int32_t idx, bool output) {
         GGML_ASSERT(idx >= 0 && idx < (int32_t)tokens.size());
         tokens[idx].output = output;
+    }
+
+    void set_all_output() {
+        for (auto & token : tokens) {
+            token.output = true;
+        }
     }
 
     void render() {
@@ -664,6 +674,46 @@ struct server_slot {
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true);
             }
+
+            // MAD-LAB / WP_SPEC_CONST_WIDTH (HIP-graph shape invariance):
+            // Every tensor leading dim in the DSV4 decode graph is ubatch.n_tokens
+            // (comp/lid kq_mask ne[1], lid_top_k, raw k_idxs, the top-k SET_ROWS
+            // index/value counts -- the whole (a)/(b)/(c)/(d) set from the shape
+            // map). A spec verify batch is 1 + (accepted-forward drafts), and that
+            // draft count varies 0..n_max EVERY step, so n_tokens churns and the
+            // HIP-graph capture key never repeats -> capture never holds. Pad the
+            // draft portion up to a CONSTANT width with masked phantom tokens so
+            // every spec verify step submits exactly the same token count.
+            //
+            // Phantoms are pure batch padding: SAME sequence (keeps n_seqs_unq==1 ->
+            // plan.n_stream constant), output=false (no logits extracted), and they
+            // are deliberately NOT recorded in spec_i_batch and NOT pushed into
+            // prompt.tokens -- so they are invisible to sampling/acceptance and to
+            // the prompt. They occupy the positions a full-length draft would have
+            // used; real tokens never attend to them (causal mask, strictly higher
+            // positions); their KV is discarded by the unconditional
+            // seq_rm(slot.id, pos_next, -1) that runs after every verify step (see
+            // the accept path). Best-effort: a phantom that would overflow the batch
+            // is simply skipped (never trips the real-token assert below).
+            //
+            // Config, not hardcode: default off preserves current serving; set it to
+            // the configured spec draft n-max and enable alongside WP_HIP_GRAPHS for
+            // the capture run.
+            static const int32_t s_spec_const_width = []() {
+                const char * e = getenv("WP_SPEC_CONST_WIDTH");
+                return e ? atoi(e) : 0;
+            }();
+            if (s_spec_const_width > 0 && (int32_t) spec_draft.size() < s_spec_const_width) {
+                const llama_token mask_tok =
+                    llama_vocab_mask(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                if (mask_tok != LLAMA_TOKEN_NULL) {
+                    for (int32_t i = (int32_t) spec_draft.size(); i < s_spec_const_width; ++i) {
+                        if (!batch.add(this->id, mask_tok, pos0++, /*output=*/ false)) {
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
@@ -822,7 +872,17 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
-            SLT_TRC(*this,
+            // Promoted from TRC to INF (2026-08-16). This is a cumulative SURVIVAL curve
+            // -- n_accepted_per_pos[i] counts verification steps that accepted at least
+            // i+1 tokens, so entry i is P(accepted length > i) and the series is
+            // monotonically non-increasing. It is the only line that distinguishes "the
+            // drafter is weak everywhere" from "position 0 is fine and the chain dies
+            // after it", and a conf gate that clamps drafting to ~1 token/block hides
+            // that difference from every aggregate number, including mean length.
+            //
+            // It prints once per slot at task completion, not per token, so making it
+            // visible costs nothing.
+            SLT_INF(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
@@ -1113,6 +1173,11 @@ private:
 
     common_speculative_ptr spec;
 
+    std::unique_ptr<pipe_dense_segment_client::client> segment_client;
+    uint64_t segment_session_id = 1;
+    uint64_t segment_cache_epoch = 1;
+    uint64_t segment_next_seq_id = 1;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1148,6 +1213,7 @@ private:
     mt::llama_memory_tiered *  fp_embedder_ = nullptr;
 
     int trace = 0;
+    int spec_phase = 0; // WP_SPEC_PHASE: per-block phase timing for speculative decode
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
@@ -1330,6 +1396,7 @@ private:
 
         spec.reset();
         spec_init.reset();
+        segment_client.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
@@ -1429,6 +1496,10 @@ private:
         }
 
         params_base = params;
+        if (!params_base.segment_manifest.empty() && params_base.n_cache_reuse > 0) {
+            SRV_WRN("%s", "dense segments do not support shifted prompt reuse; disabling --cache-reuse\n");
+            params_base.n_cache_reuse = 0;
+        }
         if (params_base.kv_tiered_enabled && params_base.kv_tier_hot_pct > 0.0f && params_base.kv_tier_hot_pct < 100.0f) {
             // Save the original n_ctx so the cache layer can size pools
             // based on the full ctx budget, not just the hot slice.
@@ -1538,7 +1609,28 @@ private:
 
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
-            if (has_spec) {
+            if (has_spec && params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                // Tensor parallelism: skip the draft/MTP reservation entirely.
+                //
+                // Two reasons. (1) It cannot produce a usable answer: under
+                // SPLIT_MODE_TENSOR the model owns a single Meta device wrapping the
+                // real GPUs (llama_prepare_model_devices, src/llama.cpp), so the
+                // `devs` list that common_get_device_memory_data reports back is that
+                // Meta device, which never compares equal to any entry of
+                // params.devices in the accumulation loop below -- every measured byte
+                // would be silently dropped. And common_params_fit_impl aborts up
+                // front for SPLIT_MODE_TENSOR (common/fit.cpp), so there is no fit
+                // step for the reservation to feed in the first place.
+                // (2) It is not free: common_get_device_memory_data does a full second
+                // llama_model_load_from_file + llama_init_from_model, which builds a
+                // *second* Meta device over the same GPUs and reserves a whole graph
+                // on it. It is a dry run (no_alloc), but it is a path nothing else
+                // exercises, and a GGML_ASSERT inside it would abort the server rather
+                // than land in the catch below.
+                SRV_WRN("%s", "[spec] SPLIT_MODE_TENSOR: skipping the draft/MTP VRAM reservation "
+                              "(--fit is not implemented for tensor parallelism); size --tensor-split "
+                              "and --spec-draft-n-ctx by hand\n");
+            } else if (has_spec) {
                 // MTP draft context lives on the target model, only context+compute are new
                 bool measure_model_bytes = has_draft;
 
@@ -1626,6 +1718,104 @@ private:
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (!params_base.segment_manifest.empty()) {
+            const auto manifest = pipe_dense_segment::load_manifest(params_base.segment_manifest);
+            const auto & head = manifest.segments.front();
+            if (head.layer_first != params_base.pipeline_layer_first ||
+                head.layer_last != params_base.pipeline_layer_last ||
+                llama_model_n_layer(model_tgt) != manifest.n_layer ||
+                llama_model_n_embd(model_tgt) != manifest.n_embd) {
+                SRV_ERR("%s", "dense segment manifest does not match the local head stage\n");
+                return false;
+            }
+            // NEXTN SIDEBAND NEED. Only draft-mtp reads the target's nextn -- see the
+            // consume site further down, which gates on
+            // common_speculative_need_embd_nextn(), a predicate only
+            // common_speculative_impl_draft_mtp answers true. Declaring it here lets the
+            // tail skip serializing an n_embd f32 run per token on every other arm,
+            // including the production draft-dspark default.
+            //
+            // spec_mtp is the right source rather than the built `spec`: the client
+            // performs its HELLO in this constructor, well before the speculative stack
+            // exists, and the spec TYPE is known from params from the start.
+            //
+            // WP_SEGMENT_PROJ_CHECK also reads terminal.nextn (it projects the tail's
+            // hidden state on the head and diffs against the tail's own logits), so it
+            // has to keep the sideband alive even without draft-mtp -- otherwise the
+            // diagnostic would quietly measure nothing.
+            const bool segment_proj_check = [] {
+                const char * v = std::getenv("WP_SEGMENT_PROJ_CHECK");
+                return v != nullptr && v[0] == '1';
+            }();
+            segment_client = std::make_unique<pipe_dense_segment_client::client>(
+                manifest, (uint32_t) llama_vocab_n_tokens(vocab), spec_mtp || segment_proj_check);
+            if (segment_client->has_remote_segments()) {
+                // Logits-on-head: under PIPE_SEGMENT_TERMINAL_HIDDEN the terminal
+                // response is the post-output_norm hidden state (n_embd), and this
+                // server finishes the LM head locally with llama_output_project().
+                // Under the legacy LOGITS arm it is n_vocab and is memcpy'd
+                // straight into the logits buffer as before.
+                const bool terminal_hidden =
+                    segment_client->terminal_kind() == PIPE_SEGMENT_TERMINAL_HIDDEN;
+                const uint32_t expect_width = terminal_hidden
+                    ? (uint32_t) llama_model_n_embd(model_tgt)
+                    : (uint32_t) llama_vocab_n_tokens(vocab);
+                if (segment_client->terminal_width() != expect_width) {
+                    SRV_ERR("dense segment terminal width %u does not match the expected %u\n",
+                            segment_client->terminal_width(), expect_width);
+                    return false;
+                }
+                // Fail here, not on the first token: under logits-on-head the head
+                // stage GGUF MUST carry output.weight, because nothing else in the
+                // pipeline computes the projection any more.
+                if (terminal_hidden && model_tgt->output == nullptr) {
+                    SRV_ERR("%s", "logits-on-head requires output.weight in the head stage; "
+                                  "rerun with WP_SEGMENT_TAIL_LOGITS=1 on head and tail\n");
+                    return false;
+                }
+                SRV_INF("dense segment terminal payload = %s (%u f32/token)\n",
+                        terminal_hidden ? "HIDDEN (logits-on-head)" : "LOGITS", expect_width);
+                // Make the negotiated sideband visible at startup: this is the number
+                // the bytes-on-wire measurement should be read against.
+                SRV_INF("dense segment nextn sideband = %s (%u f32/token)\n",
+                        segment_client->nextn_width() != 0 ? "NEEDED" : "not needed",
+                        segment_client->nextn_width());
+            }
+            // INTERIOR TAPS. Arm the head's host buffers for every layer a remote
+            // segment will forward, BEFORE the speculative stack is constructed at the
+            // bottom of load_model: the draft's band check consults these to tell
+            // "outside my band, impossible" from "outside my band, supplied by a peer".
+            //
+            // Arming is driven by the manifest rather than by the draft's
+            // target_layers because the segment client performs its HELLO while
+            // constructing, above, and the draft model is not loaded until later --
+            // there is no point at which the draft's requirements are known early
+            // enough to negotiate. The two are cross-checked in the draft instead, so a
+            // manifest that under-declares fails loudly there.
+            for (size_t i = 1; i < segment_client->manifest().segments.size(); ++i) {
+                for (const uint32_t lid : segment_client->manifest().segments[i].tap_layers) {
+                    llama_set_embeddings_layer_inp_external(ctx_tgt, lid, true);
+                    SRV_INF("dense segment %u forwards interior tap for layer %u\n",
+                            segment_client->manifest().segments[i].id, lid);
+                }
+            }
+
+            segment_client->reset(segment_session_id, segment_cache_epoch);
+            if (spec_mtp && segment_client->has_remote_segments()) {
+                const uint32_t depth = segment_client->recurrent_snapshots();
+                const uint32_t requested = (uint32_t) std::max(0, params_base.speculative.draft.n_max);
+                if (depth == 0) {
+                    SRV_ERR("%s", "dense segments report no recurrent snapshots for draft-mtp\n");
+                    return false;
+                }
+                if (requested > depth) {
+                    SRV_WRN("dense segments have %u recurrent snapshots; clamping --spec-draft-n from %u\n",
+                            depth, requested);
+                    params_base.speculative.draft.n_max = (int32_t) depth;
+                }
+            }
+        }
 
         if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
@@ -1850,6 +2040,15 @@ private:
 
             if (trace) {
                 SRV_WRN("LLAMA_TRACE = %d\n", trace);
+            }
+        }
+
+        {
+            const char * WP_SPEC_PHASE = getenv("WP_SPEC_PHASE");
+            spec_phase = WP_SPEC_PHASE ? atoi(WP_SPEC_PHASE) : 0;
+
+            if (spec_phase) {
+                SRV_WRN("WP_SPEC_PHASE = %d\n", spec_phase);
             }
         }
 
@@ -3458,7 +3657,12 @@ private:
                 slot_batched->lora[alora_disabled_id].scale = alora_scale;
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            llama_set_embeddings(ctx_tgt, slot_batched->need_embd() ||
+                (segment_client && segment_client->has_remote_segments()));
+        }
+
+        if (segment_client && segment_client->has_remote_segments()) {
+            batch.set_all_output();
         }
 
         llama_batch batch_view;
@@ -3700,10 +3904,19 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const int64_t t0 = spec_phase ? ggml_time_us() : 0;
             common_speculative_draft(spec.get());
+            if (spec_phase && !drafting.empty()) {
+                size_t n_drafted = 0;
+                for (const auto * s : drafting) {
+                    n_drafted += s->spec_draft.size();
+                }
+                SRV_INF("SPECPHASE draft_us=%" PRId64 " n_drafted=%zu\n", ggml_time_us() - t0, n_drafted);
+            }
         }
 
         // make checkpoints if needed
+        const int64_t t_ckpt0 = spec_phase ? ggml_time_us() : 0;
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3750,6 +3963,9 @@ private:
                 }
             }
         });
+        if (spec_phase && !drafting.empty()) {
+            SRV_INF("SPECPHASE ckpt_us=%" PRId64 "\n", ggml_time_us() - t_ckpt0);
+        }
 
         // update the batch with the sampled/drafted tokens.
         // MAD-120: this is the admission pass — gate handle_last_sampled_token on
@@ -4109,6 +4325,18 @@ private:
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
+                                n_past = 0;
+                            }
+
+                            if (segment_client && segment_client->has_remote_segments()) {
+                                // v1: every request starts from a clean slate on every segment.
+                                // Cross-segment prompt reuse is a later optimization; the
+                                // reuse negotiation left head/segment state inconsistent and
+                                // cost determinism (2026-08-15).
+                                if (segment_cache_epoch == UINT64_MAX) {
+                                    throw std::runtime_error("dense segment cache epoch is exhausted");
+                                }
+                                segment_client->reset(segment_session_id, ++segment_cache_epoch);
                                 n_past = 0;
                             }
 
@@ -4480,7 +4708,13 @@ private:
             }
         }
 
+        const int64_t t_local0 = spec_phase ? ggml_time_us() : 0;
+
         const int ret = llama_decode(ctx_tgt, batch_view);
+
+        if (spec_phase) {
+            SRV_INF("SPECPHASE local_decode_us=%" PRId64 " n_tokens=%d\n", ggml_time_us() - t_local0, batch_view.n_tokens);
+        }
 
         metrics.on_decoded(slots);
 
@@ -4534,14 +4768,169 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        if (segment_client && segment_client->has_remote_segments()) {
+            const int32_t n_embd = llama_model_n_embd(model_tgt);
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            const float * hidden = llama_get_embeddings(ctx_tgt);
+            if (hidden == nullptr) {
+                throw std::runtime_error("local dense segment did not return hidden activations");
+            }
+            std::vector<float> activations(hidden, hidden + (size_t) batch_view.n_tokens * n_embd);
+            std::vector<int32_t> positions(batch_view.pos, batch_view.pos + batch_view.n_tokens);
+            if (segment_next_seq_id == 0 || segment_next_seq_id == UINT64_MAX) {
+                throw std::runtime_error("dense segment sequence space is exhausted");
+            }
+            const int64_t t_seg0 = spec_phase ? ggml_time_us() : 0;
+            segment_client->begin_forward(
+                segment_session_id, segment_next_seq_id++, (uint32_t) batch_view.n_tokens,
+                positions, activations);
+            const pipe_segment_fwd_resp terminal = segment_client->finish_forward();
+            if (spec_phase) {
+                SRV_INF("SPECPHASE seg_fwd_us=%" PRId64 " n_tokens=%d terminal_bytes=%zu nextn_bytes=%zu\n",
+                        ggml_time_us() - t_seg0, batch_view.n_tokens,
+                        terminal.activations.size() * sizeof(float),
+                        terminal.nextn.size() * sizeof(float));
+            }
+
+            if (segment_client->terminal_kind() == PIPE_SEGMENT_TERMINAL_HIDDEN) {
+                // LOGITS-ON-HEAD. terminal.activations is the tail's
+                // post-output_norm hidden state ([n_tokens][n_embd] f32) -- exactly
+                // the tensor the tail's LM head would have consumed. Finish the
+                // projection here, straight into ctx_tgt's logits buffer, so the
+                // sampler and common_speculative_process see the same thing they
+                // always did. 5120 vs 248320 floats per token on the wire.
+                if (terminal.activations.size() != (size_t) batch_view.n_tokens * n_embd) {
+                    throw std::runtime_error("dense segment terminal hidden state has an invalid width");
+                }
+                const int64_t t_proj0 = spec_phase ? ggml_time_us() : 0;
+                if (!llama_output_project(ctx_tgt, terminal.activations.data(), batch_view.n_tokens)) {
+                    throw std::runtime_error("head-side LM head projection failed");
+                }
+                if (spec_phase) {
+                    SRV_INF("SPECPHASE head_project_us=%" PRId64 " n_tokens=%d\n",
+                            ggml_time_us() - t_proj0, batch_view.n_tokens);
+                }
+            } else {
+                float * logits = ctx_tgt->get_logits();
+                if (terminal.activations.size() != (size_t) batch_view.n_tokens * n_vocab || logits == nullptr) {
+                    throw std::runtime_error("dense segment terminal logits have an invalid width");
+                }
+                std::memcpy(logits, terminal.activations.data(),
+                            terminal.activations.size() * sizeof(float));
+
+                // WP_SEGMENT_PROJ_CHECK=1: measure the head-side projection against
+                // the tail's, IN THE SAME PROCESS AND THE SAME STEP, without changing
+                // what the sampler consumes.
+                //
+                // This works because terminal.nextn is ALREADY the post-output_norm
+                // hidden state for every token (qwen35.cpp sets t_h_nextn from the
+                // output_norm output, and the tail runs unmasked so it covers all
+                // rows) -- the exact input the tail's own LM head consumed. So we can
+                // project it here and diff against the logits the tail computed, with
+                // the tail's arm still driving generation. That quantifies the
+                // Vulkan-vs-HIP/split-matmul deviation on real activations BEFORE
+                // switching the wire over, and reports argmax agreement, which is the
+                // only thing temp-0 token parity actually depends on.
+                static const bool proj_check = [] {
+                    const char * v = std::getenv("WP_SEGMENT_PROJ_CHECK");
+                    return v != nullptr && v[0] == '1';
+                }();
+                if (proj_check && !terminal.nextn.empty() &&
+                    terminal.nextn.size() == (size_t) batch_view.n_tokens * n_embd &&
+                    model_tgt->output != nullptr) {
+                    std::vector<float> reference(terminal.activations);
+                    if (llama_output_project(ctx_tgt, terminal.nextn.data(), batch_view.n_tokens)) {
+                        double max_abs = 0.0;
+                        double max_rel = 0.0;
+                        int    n_argmax_diff = 0;
+                        for (int t = 0; t < batch_view.n_tokens; ++t) {
+                            const float * a = reference.data() + (size_t) t * n_vocab; // tail
+                            const float * b = logits          + (size_t) t * n_vocab; // head
+                            int am_a = 0;
+                            int am_b = 0;
+                            for (int v = 0; v < n_vocab; ++v) {
+                                const double d = std::fabs((double) a[v] - (double) b[v]);
+                                max_abs = std::max(max_abs, d);
+                                const double m = std::fabs((double) a[v]);
+                                if (m > 1e-3) {
+                                    max_rel = std::max(max_rel, d / m);
+                                }
+                                if (a[v] > a[am_a]) am_a = v;
+                                if (b[v] > b[am_b]) am_b = v;
+                            }
+                            if (am_a != am_b) {
+                                ++n_argmax_diff;
+                                SRV_WRN("PROJCHECK ARGMAX FLIP tok=%d tail=%d head=%d "
+                                        "tail_logit=%.6f head_logit=%.6f\n",
+                                        t, am_a, am_b, a[am_a], b[am_b]);
+                            }
+                        }
+                        SRV_INF("PROJCHECK n_tokens=%d max_abs=%.6e max_rel=%.6e argmax_flips=%d\n",
+                                batch_view.n_tokens, max_abs, max_rel, n_argmax_diff);
+                    }
+                    // restore the tail's logits: the LOGITS arm must remain the one
+                    // driving generation, so the check never perturbs the trajectory
+                    std::memcpy(logits, reference.data(), reference.size() * sizeof(float));
+                }
+            }
+            // Consume the tail's NextN sideband only if the speculative arm actually
+            // reads it. Only draft-mtp does -- see
+            // common_speculative_impl_draft_mtp::need_embd_nextn(); every other impl
+            // inherits the base `false`. A DFlash/DSpark SIDECAR conditions on interior
+            // layer taps plus its OWN draft context's nextn, and never on the target's.
+            //
+            // The tail ships this payload unconditionally (nextn_width is decided at the
+            // worker's load time and is not negotiated), so on the dspark arm it arrives
+            // for a context that never allocated the receiving buffer: only draft-mtp
+            // calls llama_set_embeddings_nextn(ctx_tgt, ...). Keying on presence rather
+            // than on need therefore tripped the null check on a payload nobody wanted.
+            //
+            // Pairs with the need && empty check below: need+present consumes,
+            // need+absent errors, !need+present is ignored.
+            if (spec && common_speculative_need_embd_nextn(spec.get()) && !terminal.nextn.empty()) {
+                float * nextn = ctx_tgt->get_embeddings_nextn();
+                if (terminal.nextn.size() != (size_t) batch_view.n_tokens * n_embd || nextn == nullptr) {
+                    throw std::runtime_error("dense segment terminal NextN activations have an invalid width");
+                }
+                std::memcpy(nextn, terminal.nextn.data(),
+                            terminal.nextn.size() * sizeof(float));
+                // the local graph never produces the tap on a banded head, so
+                // declare the wire width for the *_ith accessors
+                ctx_tgt->set_embeddings_nextn_width((uint32_t) n_embd);
+            }
+
+            // INTERIOR TAPS: install every layer hidden state the remote segments
+            // forwarded, so llama_get_embeddings_layer_inp() returns it as if this
+            // process had computed it. Safe here because llama_decode() has already
+            // completed for this batch_view -- extract_layer_inputs() has run and was a
+            // no-op for these layers -- and nothing reads the taps until
+            // common_speculative_process() below.
+            for (const auto & tap : segment_client->taps()) {
+                if (tap.width != (uint32_t) n_embd ||
+                    tap.rows.size() != (size_t) batch_view.n_tokens * n_embd) {
+                    throw std::runtime_error("dense segment interior tap has an invalid width");
+                }
+                if (!llama_set_layer_inp_data(ctx_tgt, tap.layer, tap.rows.data(), batch_view.n_tokens)) {
+                    throw std::runtime_error("failed to install a forwarded interior tap");
+                }
+            }
+            if (spec && common_speculative_need_embd_nextn(spec.get()) && terminal.nextn.empty()) {
+                throw std::runtime_error("dense segment terminal did not return NextN activations");
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+        const int64_t t_proc0 = spec_phase ? ggml_time_us() : 0;
         if (!common_speculative_process(spec.get(), batch_view)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
+        }
+        if (spec_phase && spec) {
+            SRV_INF("SPECPHASE process_us=%" PRId64 "\n", ggml_time_us() - t_proc0);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -4699,6 +5088,7 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            bool segment_trim_required = false;
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
@@ -4709,6 +5099,7 @@ private:
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                segment_trim_required = n_rollback > 0;
 
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -4735,6 +5126,10 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        if (segment_client && segment_client->has_remote_segments()) {
+                            segment_client->trim(segment_session_id, segment_cache_epoch,
+                                                 (uint32_t) (ckpt.pos_max + 1));
+                        }
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
@@ -4783,6 +5178,14 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            if (segment_trim_required && segment_client && segment_client->has_remote_segments()) {
+                const int64_t t_trim0 = spec_phase ? ggml_time_us() : 0;
+                segment_client->trim(segment_session_id, segment_cache_epoch,
+                                     (uint32_t) slot.prompt.tokens.pos_next());
+                if (spec_phase) {
+                    SRV_INF("SPECPHASE trim_us=%" PRId64 "\n", ggml_time_us() - t_trim0);
+                }
+            }
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {

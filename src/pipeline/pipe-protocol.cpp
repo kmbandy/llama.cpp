@@ -1,5 +1,8 @@
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
+#include "pipe-reduce-simd.h"
+
+#include "ggml.h"
 
 #include <cstdarg>
 #include <cmath>
@@ -123,6 +126,43 @@ static void rd_f32_bulk(const uint8_t * & p, float * dst, size_t n) {
 #else
     for (size_t i = 0; i < n; ++i) {
         dst[i] = rd_f32(p);
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// BULK f16 wire path (2026-08-17, WP_EXPERT_PARTIAL_DTYPE).
+//
+// ggml_fp16_t is a plain uint16_t holding an IEEE754 binary16, which is
+// exactly the wire representation this struct's comment promises. On a
+// little-endian host that IS the wire byte order, so -- same reasoning as
+// PIPE_F32_WIRE_IS_HOST above -- the bulk path is a memcpy and the scalar
+// byte-explicit path is kept for big-endian portability only. This never
+// touches VALUE precision: the fp32<->fp16 rounding happens once, in
+// ggml_fp32_to_fp16_row / ggml_fp16_to_fp32_row (bulk row conversions, not a
+// hand-rolled per-element loop), before or after these bytes ever move.
+static void wr_u16_bulk(uint8_t * & p, const uint16_t * src, size_t n) {
+#if PIPE_F32_WIRE_IS_HOST
+    if (n != 0) {
+        std::memcpy(p, src, n * sizeof(uint16_t));
+        p += n * sizeof(uint16_t);
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        wr_u16(p, src[i]);
+    }
+#endif
+}
+
+static void rd_u16_bulk(const uint8_t * & p, uint16_t * dst, size_t n) {
+#if PIPE_F32_WIRE_IS_HOST
+    if (n != 0) {
+        std::memcpy(dst, p, n * sizeof(uint16_t));
+        p += n * sizeof(uint16_t);
+    }
+#else
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = rd_u16(p);
     }
 #endif
 }
@@ -692,10 +732,16 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
 // expert partial response
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
-    // 4 bytes per value: partials are f32 as of PIPE_VERSION 2. See the note on
-    // pipe_expert_partial -- f16 subtotals made the MoE result depend on the
-    // expert->worker partition, which moves with batch width.
-    const uint64_t total = 8ull + (uint64_t) p.partial.size() * 4ull;
+    // dtype is self-describing on the wire as of PIPE_VERSION 13 (see the version
+    // history and the struct comment in pipe-protocol.h): the WORKER decides f32
+    // vs f16 per WP_EXPERT_PARTIAL_DTYPE, tags the frame with what it actually
+    // sent, and the spine decodes whatever the tag says regardless of its own
+    // config -- so a worker/spine mismatch can misdecode nothing.
+    if (p.dtype != PIPE_HIDDEN_F32 && p.dtype != PIPE_HIDDEN_F16) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial has unknown dtype %d", p.dtype);
+    }
+    const uint32_t elt = pipe_hidden_elt_size(p.dtype);
+    const uint64_t total = 12ull + (uint64_t) p.partial.size() * (uint64_t) elt;
     if (p.n_tokens == 0 || total > PIPE_MAX_PAYLOAD) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: invalid expert partial response");
     }
@@ -703,13 +749,26 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     uint8_t * w = out.data();
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
-    wr_f32_bulk(w, p.partial.data(), p.partial.size());
+    wr_i32(w, p.dtype);
+    if (p.dtype == PIPE_HIDDEN_F16) {
+        // Bulk row conversion (ggml_fp32_to_fp16_row), not a hand-rolled
+        // per-element cast -- see the BULK f16 wire path note above.
+        std::vector<ggml_fp16_t> half(p.partial.size());
+        if (!half.empty()) {
+            ggml_fp32_to_fp16_row(p.partial.data(), half.data(), (int64_t) half.size());
+        }
+        wr_u16_bulk(w, half.data(), half.size());
+    } else {
+        // dtype == PIPE_HIDDEN_F32: bit-for-bit the same encoding this frame
+        // used before the dtype tag existed -- only the 4-byte tag itself is new.
+        wr_f32_bulk(w, p.partial.data(), p.partial.size());
+    }
     return out;
 }
 
 pipe_expert_partial pipe_decode_expert_partial(
         const uint8_t * buf, size_t len, int32_t n_embd) {
-    if (n_embd <= 0 || len < 8) {
+    if (n_embd <= 0 || len < 12) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial payload is too small");
     }
     const uint8_t * p   = buf;
@@ -717,12 +776,40 @@ pipe_expert_partial pipe_decode_expert_partial(
     pipe_expert_partial r;
     r.layer    = rd_i32(p);
     r.n_tokens = rd_u32(p);
+    r.dtype    = rd_i32(p);
+    if (r.dtype != PIPE_HIDDEN_F32 && r.dtype != PIPE_HIDDEN_F16) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial has unknown dtype %d", r.dtype);
+    }
+    const uint32_t elt = pipe_hidden_elt_size(r.dtype);
     const uint64_t n_values = (uint64_t) r.n_tokens * (uint64_t) n_embd;
-    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * 4ull) {
+    if (r.layer < 0 || r.n_tokens == 0 || (uint64_t) (end - p) != n_values * (uint64_t) elt) {
         fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial dimensions do not match payload");
     }
     r.partial.resize((size_t) n_values);
-    rd_f32_bulk(p, r.partial.data(), (size_t) n_values);
+    if (r.dtype == PIPE_HIDDEN_F16) {
+        std::vector<ggml_fp16_t> half((size_t) n_values);
+        rd_u16_bulk(p, half.data(), half.size());
+        // Convert to f32 HERE, once, on the receive side -- the caller (spine
+        // scatter_add) must never sum in f16. Vectorized convert
+        // (pipe_simd_convert_f16_to_f32: AVX-512/AVX2+F16C with a scalar
+        // fallback, see pipe-reduce-simd.h) -- bit-identical to the previous
+        // ggml_fp16_to_fp32_row bulk conversion since f16->f32 widening is
+        // exact, but ~4-5x faster on the unpack hot path (measured
+        // 2026-08-17: this convert is ~48% of a decode token's wall time
+        // across 43 layers x 3 workers). ggml_fp16_t and uint16_t are the
+        // same 16-bit wire representation, so no reinterpretation is needed.
+        if (!half.empty()) {
+            if (pipe_simd_unpack_enabled()) {
+                pipe_simd_convert_f16_to_f32(r.partial.data(), half.data(), half.size());
+            } else {
+                // Legacy bulk convert (scalar). Bit-identical to the SIMD path
+                // (f16->f32 widening is exact); WP_SIMD_UNPACK toggles which runs.
+                ggml_fp16_to_fp32_row(half.data(), r.partial.data(), (int64_t) half.size());
+            }
+        }
+    } else {
+        rd_f32_bulk(p, r.partial.data(), (size_t) n_values);
+    }
     return r;
 }
 
@@ -930,6 +1017,489 @@ pipe_error pipe_decode_error(const uint8_t * buf, size_t len) {
              (long long) (end - p), msg_len);
     }
     r.msg.assign((const char *) p, msg_len);
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// dense-segment payloads
+
+static void validate_segment_fwd_shape(uint32_t n_tokens, uint32_t n_pos_per_token,
+                                       uint32_t n_seqs, size_t n_positions,
+                                       size_t n_seq_token_counts, size_t n_activations,
+                                       int32_t n_embd) {
+    if (n_embd <= 0 || n_tokens == 0 || n_pos_per_token == 0 || n_seqs == 0 ||
+        n_seqs > n_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward shape");
+    }
+    const uint64_t want_positions = (uint64_t) n_tokens * n_pos_per_token;
+    const uint64_t want_activations = (uint64_t) n_tokens * (uint32_t) n_embd;
+    if (want_positions != n_positions || n_seq_token_counts != n_seqs ||
+        want_activations != n_activations) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward dimensions do not match payload");
+    }
+}
+
+static void validate_segment_seq_token_counts(const std::vector<uint32_t> & counts,
+                                              uint32_t n_tokens) {
+    uint64_t sum = 0;
+    for (uint32_t count : counts) {
+        if (count == 0) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward has an empty sequence");
+        }
+        sum += count;
+    }
+    if (sum != n_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward sequence tokens do not sum to n_tokens");
+    }
+}
+
+static bool segment_terminal_kind_valid(uint32_t kind) {
+    return kind == PIPE_SEGMENT_TERMINAL_LOGITS || kind == PIPE_SEGMENT_TERMINAL_HIDDEN;
+}
+
+// Interior taps must be strictly ascending (hence unique) and, where the band is known,
+// inside it. Ascending order is the wire contract: the response concatenates one
+// [n_tokens, tap_width] block per tap in this order and carries no per-block layer id,
+// so both peers must derive the same mapping from the negotiated list alone.
+// The HELLO ACK does not carry a band, and passes the widest range.
+static bool segment_tap_layers_valid(const std::vector<uint32_t> & taps,
+                                     int32_t layer_first, int32_t layer_last) {
+    for (size_t i = 0; i < taps.size(); ++i) {
+        if (i > 0 && taps[i] <= taps[i - 1]) {
+            return false;
+        }
+        if ((int64_t) taps[i] < (int64_t) layer_first || (int64_t) taps[i] > (int64_t) layer_last) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<uint8_t> pipe_encode_segment_hello(const pipe_segment_hello & p) {
+    if (p.version != PIPE_SEGMENT_HELLO_VERSION || p.layer_first < 0 ||
+        p.layer_last < p.layer_first || p.model_identity_sha256.empty() ||
+        p.n_embd <= 0 || p.n_vocab == 0 || p.wire_precision != PIPE_SEGMENT_WIRE_F32 ||
+        !segment_terminal_kind_valid(p.terminal_kind) ||
+        !segment_tap_layers_valid(p.tap_layers, p.layer_first, p.layer_last)) {
+        fail(PIPE_ERR_HELLO, "pipe: invalid segment HELLO");
+    }
+    if (p.model_identity_sha256.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO identity is too long");
+    }
+    if (p.tap_layers.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO tap list is too long");
+    }
+    if (p.nextn_need > 1) {
+        fail(PIPE_ERR_HELLO, "pipe: invalid segment HELLO");
+    }
+    // 52 -> 56: the tap count. The tap ids follow it, and nextn_need follows those.
+    // 56 -> 60: nextn_need.
+    const uint64_t total = 60ull + p.model_identity_sha256.size() + (uint64_t) p.tap_layers.size() * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO exceeds max payload");
+    }
+
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u32(w, p.segment_id);
+    wr_i32(w, p.layer_first);
+    wr_i32(w, p.layer_last);
+    wr_u32(w, (uint32_t) p.model_identity_sha256.size());
+    std::memcpy(w, p.model_identity_sha256.data(), p.model_identity_sha256.size());
+    w += p.model_identity_sha256.size();
+    wr_i32(w, p.n_embd);
+    wr_u32(w, p.n_vocab);
+    wr_u32(w, p.wire_precision);
+    wr_u64(w, p.capabilities);
+    wr_u64(w, p.cache_epoch);
+    wr_u32(w, p.terminal_kind);
+    wr_u32(w, (uint32_t) p.tap_layers.size());
+    for (const uint32_t lid : p.tap_layers) {
+        wr_u32(w, lid);
+    }
+    wr_u32(w, p.nextn_need);
+    return out;
+}
+
+pipe_segment_hello pipe_decode_segment_hello(const uint8_t * buf, size_t len) {
+    if (len < 60) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO payload is too small");
+    }
+    const uint8_t * p = buf;
+    const uint8_t * end = buf + len;
+    pipe_segment_hello r;
+    r.version = rd_u32(p);
+    r.segment_id = rd_u32(p);
+    r.layer_first = rd_i32(p);
+    r.layer_last = rd_i32(p);
+    const uint32_t identity_len = rd_u32(p);
+    // The tap list makes the tail variable-length, so this can only be a lower bound
+    // (40 = the post-identity fixed fields, including the tap count and nextn_need). The
+    // exact length is settled once the count is known, below.
+    if ((uint64_t) (end - p) < (uint64_t) identity_len + 40ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO identity bytes do not match payload");
+    }
+    r.model_identity_sha256.assign((const char *) p, identity_len);
+    p += identity_len;
+    r.n_embd = rd_i32(p);
+    r.n_vocab = rd_u32(p);
+    r.wire_precision = rd_u32(p);
+    r.capabilities = rd_u64(p);
+    r.cache_epoch = rd_u64(p);
+    r.terminal_kind = rd_u32(p);
+    const uint32_t n_taps = rd_u32(p);
+    // taps, then the fixed nextn_need trailer
+    if ((uint64_t) (end - p) != (uint64_t) n_taps * 4ull + 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO tap bytes do not match payload");
+    }
+    r.tap_layers.reserve(n_taps);
+    for (uint32_t i = 0; i < n_taps; ++i) {
+        r.tap_layers.push_back(rd_u32(p));
+    }
+    r.nextn_need = rd_u32(p);
+    if (r.version != PIPE_SEGMENT_HELLO_VERSION || r.layer_first < 0 ||
+        r.layer_last < r.layer_first || r.model_identity_sha256.empty() ||
+        r.n_embd <= 0 || r.n_vocab == 0 || r.wire_precision != PIPE_SEGMENT_WIRE_F32 ||
+        !segment_terminal_kind_valid(r.terminal_kind) || r.nextn_need > 1 ||
+        !segment_tap_layers_valid(r.tap_layers, r.layer_first, r.layer_last)) {
+        fail(PIPE_ERR_HELLO, "pipe: invalid segment HELLO");
+    }
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_segment_hello_ack(const pipe_segment_hello_ack & p) {
+    if (p.version != PIPE_SEGMENT_HELLO_VERSION ||
+        (p.accepted && (p.n_vocab == 0 || !p.reason.empty())) || (!p.accepted && p.reason.empty()) ||
+        (p.accepted && (!segment_terminal_kind_valid(p.terminal_kind) || p.terminal_width == 0)) ||
+        // A tap list is only meaningful with a width to slice it by; requiring the pair
+        // keeps a width/kind disagreement from reaching the decode path, the same way
+        // terminal_width does for the terminal payload.
+        (p.accepted && !p.tap_layers.empty() && p.tap_width == 0) ||
+        !segment_tap_layers_valid(p.tap_layers, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max()) ||
+        p.reason.size() > std::numeric_limits<uint32_t>::max() ||
+        p.tap_layers.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_HELLO, "pipe: invalid segment HELLO acknowledgement");
+    }
+    // 28 -> 36: tap_width and the tap count. 36 -> 40: nextn_width.
+    const uint64_t total = 40ull + (uint64_t) p.tap_layers.size() * 4ull + p.reason.size();
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO acknowledgement exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u32(w, p.accepted ? 1u : 0u);
+    wr_u32(w, p.n_vocab);
+    wr_u32(w, p.rs_snapshots);
+    wr_u32(w, p.terminal_kind);
+    wr_u32(w, p.terminal_width);
+    wr_u32(w, p.tap_width);
+    wr_u32(w, p.nextn_width);
+    wr_u32(w, (uint32_t) p.tap_layers.size());
+    for (const uint32_t lid : p.tap_layers) {
+        wr_u32(w, lid);
+    }
+    wr_u32(w, (uint32_t) p.reason.size());
+    std::memcpy(w, p.reason.data(), p.reason.size());
+    return out;
+}
+
+pipe_segment_hello_ack pipe_decode_segment_hello_ack(const uint8_t * buf, size_t len) {
+    if (len < 40) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO acknowledgement is too small");
+    }
+    const uint8_t * p = buf;
+    const uint8_t * end = buf + len;
+    pipe_segment_hello_ack r;
+    r.version = rd_u32(p);
+    const uint32_t accepted = rd_u32(p);
+    r.n_vocab = rd_u32(p);
+    r.rs_snapshots = rd_u32(p);
+    r.terminal_kind = rd_u32(p);
+    r.terminal_width = rd_u32(p);
+    r.tap_width = rd_u32(p);
+    r.nextn_width = rd_u32(p);
+    const uint32_t n_taps = rd_u32(p);
+    // Two variable-length tails now (taps, then reason), so bound the first before
+    // reading it and settle the exact length on the second.
+    if ((uint64_t) (end - p) < (uint64_t) n_taps * 4ull + 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment HELLO acknowledgement tap bytes do not match payload");
+    }
+    r.tap_layers.reserve(n_taps);
+    for (uint32_t i = 0; i < n_taps; ++i) {
+        r.tap_layers.push_back(rd_u32(p));
+    }
+    const uint32_t reason_len = rd_u32(p);
+    if ((accepted != 0 && accepted != 1) || (uint64_t) (end - p) != reason_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment HELLO acknowledgement payload");
+    }
+    r.accepted = accepted != 0;
+    r.reason.assign((const char *) p, reason_len);
+    if (r.version != PIPE_SEGMENT_HELLO_VERSION ||
+        (r.accepted && (r.n_vocab == 0 || !r.reason.empty())) || (!r.accepted && r.reason.empty()) ||
+        (r.accepted && (!segment_terminal_kind_valid(r.terminal_kind) || r.terminal_width == 0)) ||
+        (r.accepted && !r.tap_layers.empty() && r.tap_width == 0) ||
+        !segment_tap_layers_valid(r.tap_layers, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max())) {
+        fail(PIPE_ERR_HELLO, "pipe: invalid segment HELLO acknowledgement");
+    }
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_segment_fwd_req(const pipe_segment_fwd_req & p, int32_t n_embd) {
+    validate_segment_fwd_shape(p.n_tokens, p.n_pos_per_token, p.n_seqs,
+                               p.positions.size(), p.seq_token_counts.size(), p.activations.size(), n_embd);
+    if (p.version != PIPE_SEGMENT_FWD_VERSION || p.seq_id == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward request version or sequence");
+    }
+    validate_segment_seq_token_counts(p.seq_token_counts, p.n_tokens);
+    const uint64_t total = 32ull + (uint64_t) p.positions.size() * 4ull +
+                           (uint64_t) p.seq_token_counts.size() * 4ull +
+                           (uint64_t) p.activations.size() * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward request exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u64(w, p.session_id);
+    wr_u64(w, p.seq_id);
+    wr_u32(w, p.n_tokens);
+    wr_u32(w, p.n_pos_per_token);
+    wr_u32(w, p.n_seqs);
+    for (int32_t pos : p.positions) {
+        wr_i32(w, pos);
+    }
+    for (uint32_t count : p.seq_token_counts) {
+        wr_u32(w, count);
+    }
+    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    return out;
+}
+
+pipe_segment_fwd_req pipe_decode_segment_fwd_req(const uint8_t * buf, size_t len, int32_t n_embd) {
+    if (len < 32) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward request is too small");
+    }
+    const uint8_t * p = buf;
+    pipe_segment_fwd_req r;
+    r.version = rd_u32(p);
+    r.session_id = rd_u64(p);
+    r.seq_id = rd_u64(p);
+    r.n_tokens = rd_u32(p);
+    r.n_pos_per_token = rd_u32(p);
+    r.n_seqs = rd_u32(p);
+    if (r.version != PIPE_SEGMENT_FWD_VERSION || r.seq_id == 0 || n_embd <= 0 ||
+        r.n_tokens == 0 || r.n_pos_per_token == 0 || r.n_seqs == 0 || r.n_seqs > r.n_tokens) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward request header");
+    }
+    const uint64_t n_positions = (uint64_t) r.n_tokens * r.n_pos_per_token;
+    const uint64_t n_activations = (uint64_t) r.n_tokens * (uint32_t) n_embd;
+    const uint64_t want = 32ull + n_positions * 4ull + (uint64_t) r.n_seqs * 4ull + n_activations * 4ull;
+    if (want != len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward request dimensions do not match payload");
+    }
+    r.positions.reserve((size_t) n_positions);
+    for (uint64_t i = 0; i < n_positions; ++i) {
+        r.positions.push_back(rd_i32(p));
+    }
+    r.seq_token_counts.reserve(r.n_seqs);
+    for (uint32_t i = 0; i < r.n_seqs; ++i) {
+        r.seq_token_counts.push_back(rd_u32(p));
+    }
+    validate_segment_seq_token_counts(r.seq_token_counts, r.n_tokens);
+    r.activations.resize((size_t) n_activations);
+    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_segment_fwd_resp(const pipe_segment_fwd_resp & p) {
+    // NEXTN DEDUP: when nextn_aliased is set the nextn run is omitted from the payload
+    // and the head rebuilds it from `activations`, so the two must be the same shape and
+    // the caller must have cleared `nextn` -- a non-empty vector here means the producer
+    // set the flag without dropping the copy, which would encode a length the decoder
+    // cannot reproduce.
+    if (p.nextn_aliased > 1 ||
+        (p.nextn_aliased != 0 &&
+         (p.nextn_width == 0 || p.nextn_width != p.output_width || !p.nextn.empty()))) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward response nextn aliasing");
+    }
+    if (p.version != PIPE_SEGMENT_FWD_VERSION || p.seq_id == 0 || p.n_tokens == 0 ||
+        p.output_width == 0 ||
+        p.activations.size() != (uint64_t) p.n_tokens * p.output_width ||
+        (p.nextn_aliased == 0 && p.nextn.size() != (uint64_t) p.n_tokens * p.nextn_width) ||
+        // one [n_tokens, tap_width] block per negotiated tap, concatenated
+        p.taps.size() != (uint64_t) p.n_tokens * p.tap_width * p.n_taps ||
+        (p.n_taps != 0 && p.tap_width == 0)) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward response");
+    }
+    // 32 -> 40: tap_width and the tap count. 40 -> 44: nextn_aliased.
+    const uint64_t total = 44ull + ((uint64_t) p.activations.size() + p.nextn.size() + p.taps.size()) * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward response exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u64(w, p.session_id);
+    wr_u64(w, p.seq_id);
+    wr_u32(w, p.n_tokens);
+    wr_u32(w, p.output_width);
+    wr_u32(w, p.nextn_width);
+    wr_u32(w, p.tap_width);
+    wr_u32(w, p.n_taps);
+    wr_u32(w, p.nextn_aliased);
+    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    wr_f32_bulk(w, p.nextn.data(), p.nextn.size());
+    wr_f32_bulk(w, p.taps.data(), p.taps.size());
+    return out;
+}
+
+pipe_segment_fwd_resp pipe_decode_segment_fwd_resp(
+        const uint8_t * buf, size_t len, int32_t output_width, int32_t nextn_width,
+        int32_t tap_width, int32_t n_taps) {
+    if (len < 44) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward response is too small");
+    }
+    const uint8_t * p = buf;
+    pipe_segment_fwd_resp r;
+    r.version = rd_u32(p);
+    r.session_id = rd_u64(p);
+    r.seq_id = rd_u64(p);
+    r.n_tokens = rd_u32(p);
+    r.output_width = rd_u32(p);
+    r.nextn_width = rd_u32(p);
+    r.tap_width = rd_u32(p);
+    r.n_taps = rd_u32(p);
+    r.nextn_aliased = rd_u32(p);
+    // The tap width and count are what the head negotiated at HELLO for THIS hop. A
+    // segment that quietly stopped extracting would otherwise leave the head reading a
+    // stale buffer, which changes no verified output and so cannot be caught later.
+    // nextn_width is now negotiated the same way, so a tail that ignored the head's
+    // nextn_need and appended the sideband anyway fails here rather than desynchronising
+    // the stream.
+    if (r.version != PIPE_SEGMENT_FWD_VERSION || r.seq_id == 0 || output_width <= 0 || nextn_width < 0 ||
+        tap_width < 0 || n_taps < 0 ||
+        r.n_tokens == 0 || r.output_width != (uint32_t) output_width ||
+        r.nextn_width != (uint32_t) nextn_width ||
+        r.tap_width != (uint32_t) tap_width || r.n_taps != (uint32_t) n_taps) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward response header");
+    }
+    // Aliasing is decided per response by the tail, so it is not negotiated -- but it is
+    // only representable when the two runs have the same shape, and claiming it with no
+    // negotiated sideband would leave the head rebuilding a buffer nobody asked for.
+    if (r.nextn_aliased > 1 ||
+        (r.nextn_aliased != 0 && (r.nextn_width == 0 || r.nextn_width != r.output_width))) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment forward response nextn aliasing");
+    }
+    const uint64_t n_activations = (uint64_t) r.n_tokens * r.output_width;
+    // aliased => the run is not on the wire at all; the client rebuilds it
+    const uint64_t n_nextn = r.nextn_aliased != 0 ? 0ull : (uint64_t) r.n_tokens * r.nextn_width;
+    const uint64_t n_tap_floats = (uint64_t) r.n_tokens * r.tap_width * r.n_taps;
+    if (44ull + (n_activations + n_nextn + n_tap_floats) * 4ull != len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment forward response dimensions do not match payload");
+    }
+    r.activations.resize((size_t) n_activations);
+    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    r.nextn.resize((size_t) n_nextn);
+    rd_f32_bulk(p, r.nextn.data(), r.nextn.size());
+    r.taps.resize((size_t) n_tap_floats);
+    rd_f32_bulk(p, r.taps.data(), r.taps.size());
+    return r;
+}
+
+static void validate_segment_ctrl(uint32_t version, uint32_t control, uint32_t n_past,
+                                  const std::string & prompt_identity_sha256) {
+    if (version != PIPE_SEGMENT_CTRL_VERSION ||
+        (control != PIPE_SEGMENT_CTRL_RESET && control != PIPE_SEGMENT_CTRL_KV_TRIM &&
+         control != PIPE_SEGMENT_CTRL_PROMPT_REUSE)) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment control version or type");
+    }
+    if ((control == PIPE_SEGMENT_CTRL_RESET && (n_past != 0 || !prompt_identity_sha256.empty())) ||
+        (control == PIPE_SEGMENT_CTRL_KV_TRIM && !prompt_identity_sha256.empty()) ||
+        (control == PIPE_SEGMENT_CTRL_PROMPT_REUSE && prompt_identity_sha256.empty())) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment control payload");
+    }
+}
+
+std::vector<uint8_t> pipe_encode_segment_ctrl(const pipe_segment_ctrl & p) {
+    validate_segment_ctrl(p.version, p.control, p.n_past, p.prompt_identity_sha256);
+    if (p.prompt_identity_sha256.size() > std::numeric_limits<uint32_t>::max()) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment control prompt identity is too long");
+    }
+    const uint64_t total = 32ull + p.prompt_identity_sha256.size();
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment control exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u32(w, p.control);
+    wr_u64(w, p.session_id);
+    wr_u64(w, p.cache_epoch);
+    wr_u32(w, p.n_past);
+    wr_u32(w, (uint32_t) p.prompt_identity_sha256.size());
+    std::memcpy(w, p.prompt_identity_sha256.data(), p.prompt_identity_sha256.size());
+    return out;
+}
+
+pipe_segment_ctrl pipe_decode_segment_ctrl(const uint8_t * buf, size_t len) {
+    if (len < 32) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment control is too small");
+    }
+    const uint8_t * p = buf;
+    const uint8_t * end = buf + len;
+    pipe_segment_ctrl r;
+    r.version = rd_u32(p);
+    r.control = rd_u32(p);
+    r.session_id = rd_u64(p);
+    r.cache_epoch = rd_u64(p);
+    r.n_past = rd_u32(p);
+    const uint32_t identity_len = rd_u32(p);
+    if ((uint64_t) (end - p) != identity_len) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment control identity bytes do not match payload");
+    }
+    r.prompt_identity_sha256.assign((const char *) p, identity_len);
+    validate_segment_ctrl(r.version, r.control, r.n_past, r.prompt_identity_sha256);
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_segment_ctrl_ack(const pipe_segment_ctrl_ack & p) {
+    if (p.version != PIPE_SEGMENT_CTRL_ACK_VERSION ||
+        (p.control != PIPE_SEGMENT_CTRL_RESET && p.control != PIPE_SEGMENT_CTRL_KV_TRIM &&
+         p.control != PIPE_SEGMENT_CTRL_PROMPT_REUSE) ||
+        (p.status != PIPE_SEGMENT_CTRL_APPLIED && p.status != PIPE_SEGMENT_CTRL_MISS)) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment control acknowledgement");
+    }
+    std::vector<uint8_t> out(32);
+    uint8_t * w = out.data();
+    wr_u32(w, p.version);
+    wr_u32(w, p.control);
+    wr_u64(w, p.session_id);
+    wr_u64(w, p.cache_epoch);
+    wr_u32(w, p.status);
+    wr_u32(w, p.n_past);
+    return out;
+}
+
+pipe_segment_ctrl_ack pipe_decode_segment_ctrl_ack(const uint8_t * buf, size_t len) {
+    if (len != 32) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: segment control acknowledgement has the wrong size");
+    }
+    const uint8_t * p = buf;
+    pipe_segment_ctrl_ack r;
+    r.version = rd_u32(p);
+    r.control = rd_u32(p);
+    r.session_id = rd_u64(p);
+    r.cache_epoch = rd_u64(p);
+    r.status = rd_u32(p);
+    r.n_past = rd_u32(p);
+    if (r.version != PIPE_SEGMENT_CTRL_ACK_VERSION ||
+        (r.control != PIPE_SEGMENT_CTRL_RESET && r.control != PIPE_SEGMENT_CTRL_KV_TRIM &&
+         r.control != PIPE_SEGMENT_CTRL_PROMPT_REUSE) ||
+        (r.status != PIPE_SEGMENT_CTRL_APPLIED && r.status != PIPE_SEGMENT_CTRL_MISS)) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: invalid segment control acknowledgement");
+    }
     return r;
 }
 

@@ -1,0 +1,270 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Chunked (UT-transform) gated delta net for short token blocks (2 <= n_tokens <= T_MAX),
+// scalar-gate (GDA) only. See gated_delta_net.cu for the derivation; in short, unrolling
+//     S_t = g_t * S_{t-1} + k_t d_t^T,  d_t = beta_t (v_t - S_{t-1}^T (g_t k_t))
+// with G_t = sum_{u<=t} gl_u and c_t = exp(G_t) gives
+//     d_t = u_t - sum_{j<t} A[t][j] d_j,  u_t     = beta_t (v_t - c_t * (S_0^T k_t))
+//                                         A[t][j] = beta_t * exp(G_t-G_j) * (k_t . k_j)
+//     o_t = c_t * (S_0^T q_t) + sum_{j<=t} P[t][j] d_j
+//                                         P[t][j] = exp(G_t-G_j) * (k_j . q_t)
+// so the only serial-in-t step is the substitution for d, which is a scalar FMA chain with
+// no cross-lane op. Every cross-lane reduction in the shader is independent of every other.
+//
+// Reductions use subgroupShuffleXor butterflies only: no clustered ops, no subgroup
+// arithmetic, no integer dot, f32 accumulation throughout. The butterflies are
+// subgroup-size agnostic -- they never assume a width of 32 and are correct on wave64.
+
+// NOTE: specialization constant IDs are assigned sequentially from 0 by
+// ggml_vk_create_pipeline, so these must stay dense and in this order.
+layout(constant_id = 0) const uint S_V = 128;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 32;
+layout(constant_id = 2) const uint LANES_PER_COLUMN = 32;
+layout(constant_id = 3) const uint NSG = 1;   // subgroups per workgroup
+
+// Caller guarantees: S_V % LANES_PER_COLUMN == 0, SUBGROUP_SIZE % LANES_PER_COLUMN == 0,
+// and S_V % (COLS_PER_WG * NSG) == 0, so no bounds checks on the column axis are needed.
+const uint COLS_PER_WG    = SUBGROUP_SIZE / LANES_PER_COLUMN;  // columns per subgroup
+const uint COLS_PER_BLOCK = COLS_PER_WG * NSG;                 // columns per workgroup
+const uint ROWS_PER_LANE  = S_V / LANES_PER_COLUMN;            // state rows per lane
+// rows per lane when the whole subgroup sweeps the row axis (Gram phase); guarded, so a
+// subgroup wider than S_V is fine.
+const uint SG_ROWS_PER_LANE = (S_V + SUBGROUP_SIZE - 1) / SUBGROUP_SIZE;
+
+const uint T_MAX = 16u;
+
+layout(local_size_x_id = 1, local_size_y_id = 3, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint n_tokens;
+    uint n_seqs;
+    uint s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+};
+
+layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
+layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
+layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
+layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
+layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
+layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+
+shared float sh_k [T_MAX * S_V];
+shared float sh_q [T_MAX * S_V];
+shared float sh_gl[T_MAX];          // per-token raw log decay
+shared float sh_G [T_MAX];          // inclusive prefix sum of sh_gl
+shared float sh_bt[T_MAX];          // beta
+shared float sh_A [T_MAX * T_MAX];  // beta_t * exp(G_t-G_j) * (k_t . k_j), j <  t
+shared float sh_P [T_MAX * T_MAX];  // exp(G_t-G_j) * (k_j . q_t),          j <= t
+
+// The gate is -exp(A_log)*softplus(...) <= 0, so every exponent below is <= 0 in exact
+// arithmetic. The clamp only guards f32 overflow if a model ever produces a positive gate.
+const float EXP_CLAMP = 30.0;
+
+// butterfly across the LANES_PER_COLUMN lanes that share one output column
+vec2 reduce_col(vec2 partial) {
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0u; s >>= 1u) {
+        partial += subgroupShuffleXor(partial, s);
+    }
+    return partial;
+}
+
+// butterfly across the whole subgroup (Gram phase sweeps the row axis with all lanes)
+vec2 reduce_sg(vec2 partial) {
+    [[unroll]] for (uint s = SUBGROUP_SIZE / 2u; s > 0u; s >>= 1u) {
+        partial += subgroupShuffleXor(partial, s);
+    }
+    return partial;
+}
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint seq_id  = gl_WorkGroupID.y;
+
+    const uint sgi  = gl_SubgroupInvocationID;
+    const uint sg   = gl_LocalInvocationID.y;
+    const uint lane = sgi % LANES_PER_COLUMN;
+    const uint col  = gl_WorkGroupID.z * COLS_PER_BLOCK + sg * COLS_PER_WG + (sgi / LANES_PER_COLUMN);
+
+    const uint tid       = gl_LocalInvocationIndex;
+    const uint nthreads  = SUBGROUP_SIZE * NSG;
+
+    const uint iq1 = head_id % neq1;
+    const uint iq3 = seq_id / rq3;
+
+    // ---- phase 0: stage k / q / beta / gate -------------------------------------------
+    for (uint t = 0; t < n_tokens; t++) {
+        const uint kq_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
+        for (uint i = tid; i < S_V; i += nthreads) {
+            sh_k[t * S_V + i] = float(data_k[kq_off + i]);
+            sh_q[t * S_V + i] = float(data_q[kq_off + i]);
+        }
+    }
+    // zero the Gram blocks: the substitution loops below are unrolled to T_MAX and must
+    // never pick up an uninitialised entry
+    for (uint i = tid; i < T_MAX * T_MAX; i += nthreads) {
+        sh_A[i] = 0.0;
+        sh_P[i] = 0.0;
+    }
+    // strided, not "if (tid < n_tokens)": a workgroup can be narrower than n_tokens
+    for (uint t = tid; t < n_tokens; t += nthreads) {
+        const uint gb = seq_id * sb3 + t * sb2 + head_id * sb1;
+        sh_gl[t] = float(data_g[gb]);
+        sh_bt[t] = float(data_beta[gb]);
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float acc = 0.0;
+        for (uint t = 0; t < n_tokens; t++) {
+            acc     += sh_gl[t];
+            sh_G[t]  = acc;
+        }
+    }
+    barrier();
+
+    // ---- phase 1: Gram blocks (all reductions independent) ----------------------------
+    // pair p enumerates (t,j) with j <= t, distributed over the subgroups. p is
+    // subgroup-uniform, so every subgroupShuffleXor below sits in uniform control flow.
+    const uint npairs = (n_tokens * (n_tokens + 1u)) / 2u;
+    const uint niter  = (npairs + NSG - 1u) / NSG;
+
+    for (uint it = 0; it < niter; it++) {
+        const uint p     = it * NSG + sg;
+        const bool valid = p < npairs;
+
+        uint t = 0u;
+        uint j = valid ? p : 0u;
+        while (j > t) {
+            j -= t + 1u;
+            t++;
+        }
+
+        vec2 part = vec2(0.0);
+        if (valid) {
+            [[unroll]] for (uint r = 0; r < SG_ROWS_PER_LANE; r++) {
+                const uint i = r * SUBGROUP_SIZE + sgi;
+                if (i < S_V) {
+                    const float kt = sh_k[t * S_V + i];
+                    const float kj = sh_k[j * S_V + i];
+                    const float qt = sh_q[t * S_V + i];
+                    part.x += kt * kj;
+                    part.y += kj * qt;
+                }
+            }
+        }
+
+        const vec2 red = reduce_sg(part);
+
+        if (valid && sgi == 0u) {
+            const float e = exp(min(sh_G[t] - sh_G[j], EXP_CLAMP));
+            if (j < t) {
+                sh_A[t * T_MAX + j] = sh_bt[t] * e * red.x;
+            }
+            sh_P[t * T_MAX + j] = e * red.y;
+        }
+    }
+    barrier();
+
+    // ---- state into registers ---------------------------------------------------------
+    const uint state_size          = S_V * S_V;
+    const uint state_base          = (seq_id * H + head_id) * state_size;
+    const uint state_size_per_snap = state_size * H * n_seqs;
+
+    float s_shard[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        s_shard[r] = float(data_state[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+    }
+
+    // ---- phase 2: u_t and the S_0 part of o_t (independent reductions) -----------------
+    float u [T_MAX];
+    float ob[T_MAX];
+    [[unroll]] for (uint t = 0; t < T_MAX; t++) {
+        vec2 part = vec2(0.0);
+        if (t < n_tokens) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                part.x += s_shard[r] * sh_k[t * S_V + i];
+                part.y += s_shard[r] * sh_q[t * S_V + i];
+            }
+        }
+
+        const vec2 red = reduce_col(part);
+
+        if (t < n_tokens) {
+            const float ct = exp(min(sh_G[t], EXP_CLAMP));
+            const float vt = float(data_v[seq_id * sv3 + t * sv2 + head_id * sv1 + col]);
+            u [t] = sh_bt[t] * (vt - ct * red.x);
+            ob[t] = ct * red.y;
+        } else {
+            u [t] = 0.0;
+            ob[t] = 0.0;
+        }
+    }
+
+    // ---- phase 3: forward substitution -- serial in t, no cross-lane op ----------------
+    float d[T_MAX];
+    [[unroll]] for (uint t = 0; t < T_MAX; t++) {
+        float acc = u[t];
+        [[unroll]] for (uint j = 0; j < T_MAX; j++) {
+            if (j < t) {
+                acc -= sh_A[t * T_MAX + j] * d[j];
+            }
+        }
+        d[t] = acc;
+    }
+
+    // ---- phase 4a: outputs -------------------------------------------------------------
+    const uint attn_base = (seq_id * n_tokens * H + head_id) * S_V;
+    [[unroll]] for (uint t = 0; t < T_MAX; t++) {
+        if (t < n_tokens) {
+            float o = ob[t];
+            [[unroll]] for (uint j = 0; j < T_MAX; j++) {
+                if (j <= t) {
+                    o += sh_P[t * T_MAX + j] * d[j];
+                }
+            }
+            if (lane == 0u) {
+                data_dst[attn_base + t * S_V * H + col] = o * scale;
+            }
+        }
+    }
+
+    // ---- phase 4b: state updates and snapshots ------------------------------------------
+    [[unroll]] for (uint t = 0; t < T_MAX; t++) {
+        if (t < n_tokens) {
+            const float gam = exp(min(sh_gl[t], EXP_CLAMP));
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                const uint i = r * LANES_PER_COLUMN + lane;
+                s_shard[r] = gam * s_shard[r] + sh_k[t * S_V + i] * d[t];
+            }
+
+            if (K > 1u) {
+                const int target_slot = int(n_tokens) - 1 - int(t);
+                if (target_slot >= 0 && target_slot < int(K)) {
+                    const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_base;
+                    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                        data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                    }
+                }
+            }
+        }
+    }
+
+    if (K == 1u) {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+    }
+}

@@ -36,7 +36,7 @@ if(GGML_HIP)
     target_include_directories(${TARGET} PRIVATE /opt/rocm/include)
     target_compile_definitions(${TARGET} PRIVATE __HIP_PLATFORM_AMD__)
 endif()
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common llama-expert-dispatch mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 # llama-server-impl: server logic, reusable by app
 

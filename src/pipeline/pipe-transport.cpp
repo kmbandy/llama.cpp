@@ -1,5 +1,6 @@
 #include "pipe-transport.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 
@@ -54,12 +55,16 @@ struct pipe_socket_t::impl {
     sockfd_t fd;
 };
 
-pipe_socket_t::impl::~impl() {
+static void close_socket_fd(sockfd_t fd) {
 #ifdef _WIN32
     if (fd != INVALID_SOCKET) closesocket(fd);
 #else
     if (fd >= 0) close(fd);
 #endif
+}
+
+pipe_socket_t::impl::~impl() {
+    close_socket_fd(fd);
 }
 
 bool pipe_socket_t::impl::send_data(const void * data, size_t size) {
@@ -207,17 +212,22 @@ pipe_socket_ptr pipe_socket_t::create_server(const char * host, int port) {
     return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(sockfd)));
 }
 
-pipe_socket_ptr pipe_socket_t::connect(const char * host, int port) {
+pipe_socket_ptr pipe_socket_t::connect(const char * host, int port, bool * retryable) {
+    if (retryable != nullptr) {
+        *retryable = false;
+    }
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
     if (!set_no_delay(sockfd)) {
         PIPE_LOG_ERROR("pipe: failed to set TCP_NODELAY\n");
+        close_socket_fd(sockfd);
         return nullptr;
     }
     if (!set_no_sigpipe(sockfd)) {
         PIPE_LOG_ERROR("pipe: failed to suppress SIGPIPE\n");
+        close_socket_fd(sockfd);
         return nullptr;
     }
     struct sockaddr_in addr;
@@ -226,11 +236,23 @@ pipe_socket_ptr pipe_socket_t::connect(const char * host, int port) {
     struct hostent * server = gethostbyname(host);
     if (server == NULL) {
         PIPE_LOG_ERROR("pipe: cannot resolve host '%s'\n", host);
+        close_socket_fd(sockfd);
         return nullptr;
     }
     memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
     if (::connect(sockfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+#ifdef _WIN32
+        const int error = WSAGetLastError();
+        if (retryable != nullptr) {
+            *retryable = error == WSAECONNREFUSED || error == WSAETIMEDOUT;
+        }
+#else
+        if (retryable != nullptr) {
+            *retryable = errno == ECONNREFUSED || errno == ETIMEDOUT;
+        }
+#endif
         PIPE_LOG_ERROR("pipe: connect to %s:%d failed\n", host, port);
+        close_socket_fd(sockfd);
         return nullptr;
     }
     return pipe_socket_ptr(new pipe_socket_t(std::make_unique<impl>(sockfd)));

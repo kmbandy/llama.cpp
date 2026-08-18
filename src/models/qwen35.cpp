@@ -279,7 +279,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = model.pipeline_layer_first() == 0
+        ? build_inp_embd(model.tok_embd)
+        : build_inp_hidden();
 
     cb(inpL, "model.input_embed", -1);
 
@@ -289,7 +291,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = model.pipeline_layer_first(); il <= model.pipeline_layer_last(); ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -340,6 +342,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    if (model.pipeline_layer_last() != n_layer - 1) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
@@ -351,6 +359,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // MAD-LAB logits-on-head: the dense-segment TAIL worker stops here. res->t_embd
+    // is exactly the tensor the LM head would consume, so the head can finish the
+    // projection from the n_embd-wide wire payload and get the SAME matmul input
+    // the tail would have fed it. Gating AFTER t_embd is deliberate -- the cut is
+    // "post output_norm, pre projection", which keeps the RMS norm on the device
+    // that runs it today and moves exactly one op across the wire boundary.
+    if (cparams.no_output_head) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);

@@ -725,8 +725,18 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 static bool ggml_cuda_wp_copy_requested(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    // Default ON for real CUDA/HIP backends (opt OUT with WP_EXPERT_COPY_STREAM=0).
+    // The dedicated copy stream hides the paged-in expert's H2D under the
+    // compute-stream graph. The 2026-08-07 null that kept this opt-in was the
+    // CLASSIC whole-expert rig (few page-ins); the SLICED rig pages ~0.95/req,
+    // a regime where hiding the H2D should pay. Unreachable for Vulkan (the
+    // caller gates on ggml_backend_is_cuda first); any stream/event/async-copy
+    // failure self-disarms to the sync path for the process (ggml_cuda_wp_copy_disarm).
     const char * env = std::getenv("WP_EXPERT_COPY_STREAM");
-    if (env == nullptr || std::strcmp(env, "1") != 0 || backend == nullptr) {
+    if (env != nullptr && std::strcmp(env, "0") == 0) {
         return false;
     }
     return true;
@@ -2463,6 +2473,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
+    } else if (compute_type == GGML_TYPE_BF16 && !bf16_mma_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+        // Mirrors the F16 arm above. Without BF16 tensor cores cuBLAS emulates the BF16 compute
+        // type extremely slowly; F32 (not F16) is the fallback because the BF16 -> compute-type
+        // conversion must stay exact - F16 would round the exponent range away.
+        compute_type = GGML_TYPE_F32;
     }
     if (dst->op_params[0] == GGML_PREC_F32) {
         compute_type = GGML_TYPE_F32;
@@ -2723,7 +2738,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+    // NOTE: the threshold here is deliberately MMVQ_MAX_BATCH_SIZE (8) and not
+    // MMVF_MAX_BATCH_SIZE: MMVF was widened to 16 for BF16 on pre-Ampere/pre-RDNA3, but this
+    // transposed-vector fallback is an F32 heuristic whose tuning point did not move.
+    if (ne01 == 1 && ne11 > MMVQ_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
@@ -2776,7 +2794,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool routing_active = ggml_cuda_has_routed_expert_ptrs();
 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+        // MMVF is instantiated at least as wide as MMVQ, so the single MMVQ-sized gate below
+        // bounds both the quantized (MMVQ) and non-quantized (MMVF) MUL_MAT_ID branches.
+        // MUL_MAT_ID routing intentionally stays at the MMVQ width.
+        static_assert(MMVF_MAX_BATCH_SIZE >= MMVQ_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
@@ -3598,13 +3619,41 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    if (cgraph->n_nodes == 0) {
+        return cgraph;
+    }
+    if (!ggml_cuda_wp_hip_graphs_enabled()) {
+        // Upstream default: key on the first node's address.
+        return cgraph->nodes[0];
+    }
+    // WP_HIP_GRAPHS: the backend scheduler splits the decode forward on every
+    // in-graph CPU dispatch op, then throws the split cgraph away. Keying on
+    // nodes[0] (a fresh pointer) makes the capture cache a 100% miss.
+    //
+    // Key on the full structural fingerprint (every node's name/op/type/ne/nb)
+    // so (a) the same logical segment hits across rebuilds and (b) a different
+    // n_tokens / shape is a different cache slot, not a warmup reset of the
+    // previous shape. A hash collision is safe: node_props still have to match
+    // before replay; a mismatch degrades to fallback, never a wrong graph.
+    uint64_t h = 1469598103934665603ULL;
+    h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (unsigned) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (cgraph->nodes[i]->src[j]) {
+                h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]->src[j]);
+            } else {
+                h = ggml_cuda_graph_fnv1a_mix(h, 0);
+            }
+        }
+    }
+    return (const void *) (uintptr_t) h;
 }
 
-static bool ggml_cuda_graph_node_props_equal_except_src_data_ptrs(
+static bool ggml_cuda_graph_node_topo_equal(
         const ggml_cuda_graph::node_properties & a,
         const ggml_cuda_graph::node_properties & b) {
-    if (memcmp(&a.node, &b.node, sizeof(a.node)) != 0) {
+    if (!ggml_cuda_graph_tensor_topo_equal(a.node, b.node)) {
         return false;
     }
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
@@ -3612,6 +3661,23 @@ static bool ggml_cuda_graph_node_props_equal_except_src_data_ptrs(
             return false;
         }
         if (memcmp(a.node_src_nb[j], b.node_src_nb[j], sizeof(a.node_src_nb[j])) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_cuda_graph_node_addrs_equal(
+        const ggml_cuda_graph::node_properties & a,
+        const ggml_cuda_graph::node_properties & b) {
+    // View/noop nodes do not launch. Their dest pointer is only relevant as
+    // a later kernel's src, which is compared via node_src_data_ptrs.
+    if (!ggml_cuda_graph_tensor_is_view_or_noop(&a.node) &&
+        a.node.data != b.node.data) {
+        return false;
+    }
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (a.node_src_data_ptrs[j] != b.node_src_data_ptrs[j]) {
             return false;
         }
     }
@@ -3631,6 +3697,16 @@ static bool ggml_cuda_graph_update_required(
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // WP_HIP_GRAPHS churn diagnostic (throttled)
+    static std::atomic<int> churn_log_budget{60};
+    const bool churn_log = ggml_cuda_wp_hip_graphs_enabled() &&
+        churn_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0;
+    if (churn_log) {
+        fprintf(stderr, "wp hip-graphs churn: key=%p cgraph_uid=%zu graph_uid=%zu n_nodes=%d prev_props=%d\n",
+                graph_key, (size_t) cgraph->uid, (size_t) graph->uid, cgraph->n_nodes,
+                (int) graph->node_props.size());
+    }
+
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -3642,11 +3718,16 @@ static bool ggml_cuda_graph_update_required(
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (churn_log) {
+            fprintf(stderr, "wp hip-graphs churn: SIZE changed %d -> %d\n",
+                    (int) graph->node_props.size(), cgraph->n_nodes);
+        }
         res = true;
         only_src_data_ptrs_changed = false;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    int churn_nodes_logged = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -3659,12 +3740,31 @@ static bool ggml_cuda_graph_update_required(
             }
         }
 
+        const bool stored = graph->node_props[i].node.op != GGML_OP_NONE ||
+                            graph->node_props[i].node.ne[0] != 0 ||
+                            graph->node_props[i].node.data != nullptr;
         if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            if (!ggml_cuda_graph_node_props_equal_except_src_data_ptrs(graph->node_props[i], prop)) {
+            const bool topo_changed  = stored && !ggml_cuda_graph_node_topo_equal(graph->node_props[i], prop);
+            const bool addrs_changed = stored && !ggml_cuda_graph_node_addrs_equal(graph->node_props[i], prop);
+            if (topo_changed) {
                 only_src_data_ptrs_changed = false;
             }
+            // WP_HIP_GRAPHS churn diagnostic: log the first few differing nodes.
+            if (churn_log && churn_nodes_logged < 6) {
+                ++churn_nodes_logged;
+                const char * kind = !stored ? "first_snapshot" :
+                                   (topo_changed ? "TOPOLOGY(ne/nb/op)" :
+                                   (addrs_changed ? "addr_ptr_only" : "object_ptr_only"));
+                fprintf(stderr, "wp hip-graphs churn: node[%d] op=%s name='%s' %s\n",
+                        i, ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name, kind);
+            }
             graph->node_props[i] = prop;
-            res = true;
+            // Object-pointer churn (src[] / buffer / extra) is expected on
+            // ephemeral split rebuilds and is not a capture miss. Only topology
+            // or resolved device addresses require an update.
+            if (!stored || topo_changed || addrs_changed) {
+                res = true;
+            }
         }
     }
 
@@ -5285,14 +5385,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
         if (cuda_graph_update_required) { // Update graph executable
-            if (ggml_cuda_wp_hip_graphs_enabled() && graph->instance != nullptr) {
-                ggml_cuda_wp_graph_count_init();
-                ggml_cuda_wp_graph_counts[cuda_ctx->device].replays.fetch_add(1, std::memory_order_relaxed);
-            }
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (ggml_cuda_wp_hip_graphs_enabled() && !cuda_graph_update_required) {
+            ggml_cuda_wp_graph_count_init();
+            ggml_cuda_wp_graph_counts[cuda_ctx->device].replays.fetch_add(1, std::memory_order_relaxed);
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -5357,14 +5457,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 cuda_ctx, cgraph, &properties_src_data_ptrs_only);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                // Warmup: the first visit of a key always looks like a size
+                // change (empty -> N). The second visit of the SAME structural
+                // key is enough to arm capture — including the case where only
+                // resolved device addresses moved. Requiring a bitwise-identical
+                // ggml_tensor (the old rule) can never complete on scheduler
+                // split subgraphs, because src[] object pointers are rebuilt
+                // every compute.
+                const bool stable_enough = !properties_changed || properties_src_data_ptrs_only;
+                if (stable_enough && graph->node_props.size() == (size_t) cgraph->n_nodes) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                 }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {

@@ -411,6 +411,82 @@ static void dsv4_state_read_k_cache(
     }
 }
 
+static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq);
+
+// Stretch a live plan's index tensors up to the reserve ranks. Extra slots
+// repeat the last real index (or the masked last cache row for an empty
+// write). The graph always sees the same shapes; dummy writes land on the
+// already-masked scratch row CSA uses for non-boundary decode.
+static void dsv4_pad_live_plan_to_reserve_rank(
+        llama_kv_cache_dsv4_context::comp_plan & plan,
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        bool overlap,
+        uint32_t state_size,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t n_rs_seq) {
+    const auto reserve = dsv4_build_reserve_comp_plan(
+            ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq);
+
+    auto pad_i32 = [](std::vector<int32_t> & v, size_t n) {
+        if (v.size() >= n) {
+            return;
+        }
+        v.resize(n, v.empty() ? 0 : v.back());
+    };
+    auto pad_i64 = [](std::vector<int64_t> & v, size_t n, int64_t empty_fill) {
+        if (v.size() >= n) {
+            return;
+        }
+        v.resize(n, v.empty() ? empty_fill : v.back());
+    };
+
+    pad_i32(plan.state_pos, reserve.state_pos.size());
+    pad_i32(plan.state_persist_src_idxs, reserve.state_persist_src_idxs.size());
+    pad_i32(plan.state_persist_dst_idxs, reserve.state_persist_dst_idxs.size());
+    pad_i32(plan.state_restore_src_idxs, reserve.state_restore_src_idxs.size());
+    pad_i32(plan.state_restore_dst_idxs, reserve.state_restore_dst_idxs.size());
+    pad_i32(plan.state_snapshot_src_idxs, reserve.state_snapshot_src_idxs.size());
+    pad_i32(plan.state_snapshot_dst_idxs, reserve.state_snapshot_dst_idxs.size());
+    pad_i32(plan.state_read_idxs, reserve.state_read_idxs.size());
+    pad_i64(plan.state_write_idxs, reserve.state_write_idxs.size(),
+            kv_size > 0 ? (int64_t) kv_size - 1 : 0);
+    pad_i32(plan.state_write_pos, reserve.state_write_pos.size());
+
+    // Decode/verify: pin kq_mask width at the allocated cache size so it
+    // does not step every 256 visible rows. Prefill keeps the 256-aligned
+    // grow — a 2048 x kv_size mask would be hundreds of MiB per compressor.
+    //
+    // WP_HIP_GRAPHS (2026-08-17): this used to gate on ubatch.n_tokens, but
+    // n_tokens == n_seq_tokens * n_seqs (llama-batch.h) conflates "how many
+    // tokens does each sequence contribute" with "how many sequences are
+    // packed into this ubatch". On the cross-machine expert-dispatch spine,
+    // many concurrently-decoding requests get batched into one ubatch, so a
+    // single-token-per-sequence (n_seq_tokens == 1) decode step regularly
+    // has ubatch.n_tokens well past any small constant once enough requests
+    // land in the same step -- it would fail an n_tokens-based check and
+    // fall through to the 256-aligned grow below, which then steps plan.n_kv
+    // (and therefore the comp kq_mask / lid_top_k / SET_ROWS shapes derived
+    // from it) essentially every step in a busy server, because *some*
+    // sequence in the batch crosses a 256-row boundary on almost every step.
+    // Gate on n_seq_tokens instead -- it is invariant to how many sequences
+    // share the step and matches the same decode/prefill split
+    // dsv4_build_reserve_comp_plan() already uses (see n_seq_tokens below),
+    // so the live plan and the reserve/warmup plan agree on which regime
+    // they are in.
+    if (ubatch.n_seq_tokens <= 32) {
+        plan.n_kv = kv_size;
+    }
+}
+
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     std::ostringstream ss;
     ss << "[";
@@ -424,7 +500,7 @@ static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     return ss.str();
 }
 
-static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+llama_kv_cache_dsv4_context::comp_plan llama_dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
         bool overlap,
@@ -682,6 +758,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         return env && atoi(env) > 0;
     }();
 
+    dsv4_pad_live_plan_to_reserve_rank(
+            plan, ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq);
+
     if (debug) {
         LLAMA_LOG_INFO("%s: ratio=%u, n_tokens=%u, state_persist_dst=%s, state_write_pos=%s\n",
                 __func__, ratio, ubatch.n_tokens,
@@ -705,7 +784,7 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
+        plans.push_back(llama_dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
     }
 
     return plans;

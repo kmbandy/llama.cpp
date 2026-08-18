@@ -101,6 +101,19 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+// Host-mapped pinned allocations (used by the internal AllReduce pipeline).
+// hipHostMalloc takes the same (ptr, bytes, flags) signature as cudaHostAlloc
+// and hipHostGetDevicePointer the same (devPtr, hostPtr, flags) as
+// cudaHostGetDevicePointer, so these are straight renames.  Note that HIP also
+// exposes hipHostMallocCoherent / hipHostMallocNonCoherent, which have no CUDA
+// equivalent and are therefore used directly (under GGML_USE_HIP) by callers
+// that need device-coherent (fine-grained) host memory.
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocDefault hipHostMallocDefault
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaDevAttrCanMapHostMemory hipDeviceAttributeCanMapHostMemory
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly

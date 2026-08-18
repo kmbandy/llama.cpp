@@ -41,12 +41,33 @@ struct dispatch_stats {
     size_t                             requests_issued       = 0;
     size_t                             first_await_in_flight = 0;
     bool                               first_await_recorded  = false;
+    // Peak value of the global in_flight counter observed anywhere during this
+    // dispatch's issue/collect window (begin_dispatch through finish_dispatch),
+    // not just at the first await. MECHANISM COUNTER, distinct from
+    // first_await_in_flight: for a slice-mode layer with WP_DEFER_K == 0,
+    // first_await_in_flight and max_in_flight are both just "how many workers
+    // cover this layer" (in_flight rises to workers_used before the first
+    // await and never higher after that). They diverge ONLY when a previous
+    // layer's deferred requests (WP_DEFER_K > 0) are still outstanding when
+    // this layer's requests are issued -- max_in_flight > workers_used is the
+    // proof that cross-layer overlap actually happened, not just that this
+    // layer fanned out to N workers.
+    size_t                             max_in_flight         = 0;
     uint64_t                           ns_pack               = 0;
     uint64_t                           ns_issue              = 0;
     uint64_t                           ns_wait               = 0;
     uint64_t                           ns_unpack             = 0;
     uint64_t                           ns_total              = 0;
     std::vector<worker_dispatch_stats> workers;
+};
+
+// Per-layer spine-side transport timings for WP_DS4_LAYER_TRACE. Values are
+// sums across the requests issued for a layer; tracing is otherwise off.
+struct layer_trace_stats {
+    uint64_t encode_ns = 0;
+    uint64_t send_ns   = 0;
+    uint64_t recv_ns   = 0;
+    uint64_t decode_ns = 0;
 };
 
 // Cumulative prefetch-hint counters. MECHANISM counters, not outcome ones:
@@ -118,6 +139,25 @@ class dispatcher {
                                 const std::vector<pipe_expert_assignment> & assignments,
                                 float                                       swiglu_clamp);
 
+    // Split of dispatch() so a sibling GPU op (shared expert) can run after
+    // the sends and before the recvs. begin_dispatch issues every worker
+    // request and returns with those requests in flight. finish_dispatch
+    // awaits them and returns the folded partial. dispatch() is
+    // begin+finish. One open begin at a time; a second begin or a finish
+    // with nothing open throws.
+    void begin_dispatch(int32_t                                     layer,
+                        uint64_t                                    seq_id,
+                        uint32_t                                    n_tokens,
+                        const std::vector<float> &                  activations,
+                        const std::vector<pipe_expert_assignment> & assignments,
+                        float                                       swiglu_clamp);
+    std::vector<float> finish_dispatch();
+    bool               has_open_dispatch() const;
+
+    // Snapshot the transport timings for `layer`'s current dispatch. Zero when
+    // WP_DS4_LAYER_TRACE is unset.
+    layer_trace_stats layer_trace(int32_t layer) const;
+
     // Offer `experts` on `layer` to the workers that will actually be asked for
     // them, as PIPE_EXPERT_PREFETCH_HINT frames. `experts` must be ascending and
     // unique (what hash_oracle::experts_for produces).
@@ -130,7 +170,8 @@ class dispatcher {
     //
     // Returns the number of frames sent.
     size_t send_prefetch_hints(int32_t layer, const std::vector<int32_t> & experts,
-                               uint32_t provenance = PIPE_HINT_CERTAIN);
+                               uint32_t provenance = PIPE_HINT_CERTAIN,
+                               uint32_t n_tokens = 0);
 
     const prefetch_hint_stats & get_prefetch_hint_stats() const;
 

@@ -27,6 +27,43 @@
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// MAD-LAB / WP_DSPARK_DEBUG: env-gated DSpark draft instrumentation.
+//
+// Read once. Off by default and costs one predictable branch per draft call when off.
+// Everything behind this gate is read-only: no cache mutation, no sampler state change,
+// no effect on which tokens are drafted. A run with the gate on must produce byte-identical
+// draft/accept counts to a run with it off -- if it does not, the instrumentation itself is
+// perturbing the path and nothing measured under it can be trusted.
+static bool wp_dspark_debug() {
+    static const bool s_on = [](){
+        const char * e = std::getenv("WP_DSPARK_DEBUG");
+        return e && e[0] == '1';
+    }();
+    return s_on;
+}
+
+// MAD-LAB / WP_DSPARK_ANCHOR_ABLATE: anchor-sensitivity probe.
+//
+// Set to a token id to REPLACE the anchor (dp.id_last) in the DSpark noise block with that
+// fixed id, every step, while leaving the injected context KV and everything else alone.
+//
+// This is the controlled experiment the fantasy-shift observation demands. The anchor is the
+// ONLY channel through which the target's correction reaches the drafter: the correction sits
+// at position n_past and its target features are not injected until the NEXT process() call,
+// so at draft time it exists solely as the anchor slot's token embedding. Therefore:
+//   corrupt the anchor and acceptance barely moves -> the anchor is provably being ignored,
+//     and the defect is somewhere on the anchor's path into the graph
+//   corrupt the anchor and acceptance collapses    -> the anchor is working, the drafter is
+//     simply self-consistent, and the fantasy-shift has an innocent explanation
+// 0 / unset = off.
+static llama_token wp_dspark_anchor_ablate() {
+    static const llama_token s_tok = [](){
+        const char * e = std::getenv("WP_DSPARK_ANCHOR_ABLATE");
+        return e ? (llama_token) std::atoi(e) : 0;
+    }();
+    return s_tok;
+}
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -955,6 +992,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
+
+    // MAD-LAB / WP_DSPARK_DEBUG: instrumentation state only, never read by the decode path.
+    // dbg_n_draft counts draft() calls so the expensive per-slot dump can be capped at the
+    // first few. dbg_blk_* remember the previous block's position span per seq so process()
+    // can report whether it is injecting features over positions the last block drafted.
+    int32_t              dbg_n_draft = 0;
+    std::vector<int32_t> dbg_blk_pos0;   // anchor position of the previous block, -1 = none
+    std::vector<int32_t> dbg_blk_pos1;   // last MASK position of the previous block
+
+    // MAD-LAB: sidecar services mode. True when the draft model carries no LM head of
+    // its own, i.e. it used to borrow the target's tok_embd/output through ctx_other.
+    // That borrowing is impossible once the target is Meta-split (-sm tensor), so the
+    // two borrowed ops run on the target and the results cross as host buffers:
+    //   embd_buf  [n_tokens, n_embd_dec]  gathered token embeddings, fed in on the batch
+    //   base_buf  [n_tokens, n_vocab]     LM-head projection of the exported hidden state
+    //   conf_buf  [n_tokens]              Markov-head acceptance confidences
+    bool               services_mode = false;
+    int32_t            n_vocab_dft   = 0;
+    std::vector<float> embd_buf;
+    std::vector<float> hidden_buf;
+    std::vector<float> base_buf;
+    std::vector<float> conf_buf;
+
     // The previous block's drafted tokens, carried across draft() calls to be
     // hinted at the top of the next one -- see the hint site in draft() for why
     // this block's own tokens cannot buy any lead time.
@@ -1031,6 +1091,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        // MAD-LAB: a sidecar GGUF ships no LM head, which is the signal that this draft
+        // cannot produce logits in its own graph and that the two borrowed ops
+        // (token_embd gather, LM-head projection) must be routed through the target.
+        services_mode = !llama_model_has_output_head(model_dft);
+        n_vocab_dft   = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         // conf_min at WARN: llama-server default logger threshold is 3; libllama
         // INFO maps to 4 and is filtered, WARN maps to 2 and passes. A gate whose
@@ -1039,6 +1105,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_WRN("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f (0=gate off)\n",
                 __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
         LOG_WRN("%s: - block_size=%d (source=%s), mask_token_id=%d, n_extract=%u, hc_mult=%d\n", __func__, block_size, block_size_source, mask_token_id, target_layer_ids_n, hc_mult);
+        LOG_WRN("%s: - services_mode=%d (1 = sidecar without an LM head: token_embd gather and head projection run on the target)\n",
+                __func__, (int) services_mode);
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
@@ -1058,6 +1126,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (common_speculative_capture_enabled()) {
             capture_embd.resize(n_seq);
         }
+        dbg_blk_pos0.assign(n_seq, -1);
+        dbg_blk_pos1.assign(n_seq, -1);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
@@ -1066,9 +1136,80 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // MAD-LAB: every target tap must be resident in THIS process.
+        //
+        // A DFlash/DSpark sidecar conditions on the target's hidden states at fixed layers
+        // (dflash.target_layers). Under a cross-machine dense pipeline this head builds
+        // only the layers in its own band, so a tap outside the band is never produced:
+        // llama_set_embeddings_layer_inp() accepts the id -- it IS a valid layer of the
+        // full model -- but t_layer_inp[il] stays null and llm_graph_result::set_outputs
+        // aborts on the first real decode, a long way from the cause. Fail here instead,
+        // with the numbers that explain it. The server catches this and runs without
+        // speculative decoding rather than dying.
+        {
+            const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+            int32_t band_first = 0;
+            int32_t band_last  = 0;
+            llama_model_pipeline_band(model_tgt, &band_first, &band_last);
+
+            // MAD-LAB: a target_layer of n_layer() taps the boundary AFTER the last main
+            // layer, not the (nonexistent) input to a layer n_layer() -- see
+            // set_layer_boundary_inp(il+1, ...) in src/models/deepseek4.cpp, called once
+            // per il from *inside* the per-layer loop, so the tap at n_layer() falls out
+            // of the very last loop iteration (il = n_layer()-1) rather than requiring a
+            // layer n_layer() to be built. This is exactly how DSpark's nextn head taps
+            // the target: target_layer_ids holds n_layer() itself (43 here), meaning
+            // "everything the main stack produced", and any process that has computed
+            // through the model's last main layer already holds it -- no extra graph
+            // output, no cross-process forward needed.
+            //
+            // band_last = pipeline_layer_last() is the index of the last main layer this
+            // process COMPUTES, so the boundary tap immediately after it (band_last + 1)
+            // is always available in-band too. Only extend that far when this process
+            // owns the model's main layers end-to-end (band_first == 0 and band_last ==
+            // n_layer()-1) -- i.e. not pipeline-banded, or banded but the band happens to
+            // cover the whole thing. A dense-segment worker that owns only a prefix or
+            // middle slice must still get that boundary tap from the manifest, same as
+            // before: this does not change behavior for band_last < n_layer()-1.
+            const int32_t n_layer_tgt   = llama_model_n_layer(model_tgt);
+            const int32_t band_last_eff = (band_first == 0 && band_last == n_layer_tgt - 1)
+                ? band_last + 1
+                : band_last;
+
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const int32_t il = target_layer_ids[k];
+                if (il >= band_first && il <= band_last_eff) {
+                    continue;
+                }
+                // Out of band, but a dense-segment peer may be forwarding it. The head
+                // arms those before constructing us (tools/server/server-context.cpp),
+                // so this is the point where the manifest's declared taps are checked
+                // against what the draft actually needs. A manifest that under-declares
+                // fails HERE rather than leaving the draft on a stale buffer -- which
+                // would change no verified token and so survive every parity test.
+                if (llama_get_embeddings_layer_inp_external(ctx_tgt, (uint32_t) il)) {
+                    continue;
+                }
+                throw std::runtime_error(string_format(
+                    "%s: the draft taps target layer %d, but this process owns only target layers "
+                    "[%d, %d] and no dense segment is forwarding it. Add %d to the owning segment's "
+                    "\"tap_layers\" in the manifest (on the head AND the worker), run against a target "
+                    "that owns the whole model, or use a draft whose target_layers fit the band.",
+                    __func__, il, band_first, band_last, il));
+            }
+        }
+
+        // turn on extraction of the target layers' input embeddings -- but only for the
+        // layers this process actually computes. An externally supplied tap already has
+        // its buffer reserved, and arming it here would additionally demand a graph
+        // output the banded graph cannot produce.
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            const uint32_t il = (uint32_t) target_layer_ids[k];
+            if (llama_get_embeddings_layer_inp_external(ctx_tgt, il)) {
+                continue;
+            }
+            llama_set_embeddings_layer_inp(ctx_tgt, il, true);
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1144,6 +1285,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            // (c) MAD-LAB / WP_DSPARK_DEBUG: encoder/injection census.
+            //
+            // Reports how many context tokens get feature cells this call and over which
+            // positions, plus the draft cache's state BEFORE the injection decode, plus
+            // whether any of these positions was drafted by the previous block. The last
+            // one is the "wrong-token features at committed positions" suspect: a position
+            // the previous block MASK-drafted and the target then rejected must still be
+            // injected with the TARGET's features, never left carrying draft-derived ones.
+            if (wp_dspark_debug()) {
+                const int32_t p_beg = batch_in.pos[i_batch_beg[seq_id]];
+                const int32_t p_end = batch_in.pos[i_batch_end[seq_id]];
+
+                int32_t   n_cells = -1, n_ge = -1, n_dup = -1;
+                llama_pos p_min   = -1, p_max = -1;
+                const bool ok = llama_dspark_kv_census(llama_get_memory(ctx_dft), seq_id,
+                        p_beg, &n_cells, &n_ge, &n_dup, &p_min, &p_max);
+
+                const int32_t b0 = dbg_blk_pos0[seq_id];
+                const int32_t b1 = dbg_blk_pos1[seq_id];
+                const bool overlaps_prev_block = (b0 >= 0) && (p_beg <= b1) && (p_end >= b0);
+
+                SPC_INF("DBG inject seq=%d rows=%d pos=[%d,%d] | pre-inject cache: ok=%d "
+                        "cells=%d pos=[%d,%d] at_or_above_%d=%d dup=%d | prev_block=[%d,%d] overlap=%d\n",
+                        seq_id, n_rows, p_beg, p_end,
+                        (int) ok, n_cells, (int) p_min, (int) p_max, p_beg, n_ge, n_dup,
+                        b0, b1, (int) overlaps_prev_block);
+            }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
@@ -1255,9 +1424,46 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+            // MAD-LAB / WP_DSPARK_ANCHOR_ABLATE: normally anchor_id == dp.id_last.
+            llama_token anchor_id = dp.id_last;
+            if (wp_dspark_anchor_ablate() != 0) {
+                anchor_id = wp_dspark_anchor_ablate();
+                if (dbg_n_draft < 3) {
+                    SPC_WRN("ANCHOR ABLATION ACTIVE: replacing id_last=%d with %d "
+                            "(this run's acceptance numbers are a probe, not a measurement)\n",
+                            dp.id_last, anchor_id);
+                }
             }
+
+            for (int32_t i = 0; i < n_block_tokens; ++i) {
+                common_batch_add(batch, i == 0 ? anchor_id : mask_token_id, n + i, { seq_id }, true);
+            }
+
+            // (a) MAD-LAB / WP_DSPARK_DEBUG: draft-cache census, BEFORE the block decode.
+            //
+            // This is the measurement that settles the stale-cell question. The drafter is
+            // non-causal with no sliding window, so every resident cell of this sequence is
+            // visible to every slot of the block regardless of position. Therefore:
+            //   dup  == 0 and at_or_above_n == 0  -> cache is clean, pollution ruled OUT
+            //   dup  >  0                         -> duplicate cells stacked on positions
+            //   at_or_above_n > 0                 -> leftover cells from previous blocks
+            // A clean cache here retires the hypothesis for good and explains the zero
+            // delta from the seq_rm attempt: it was removing nothing.
+            if (wp_dspark_debug()) {
+                int32_t   n_cells = -1, n_ge = -1, n_dup = -1;
+                llama_pos p_min   = -1, p_max = -1;
+                const bool ok = llama_dspark_kv_census(llama_get_memory(ctx_dft), seq_id,
+                        n, &n_cells, &n_ge, &n_dup, &p_min, &p_max);
+
+                SPC_INF("DBG census seq=%d call=%d n_past=%d block=[%d,%d] | ok=%d cells=%d "
+                        "pos=[%d,%d] at_or_above_%d=%d dup=%d | expect clean: cells==n_past, "
+                        "at_or_above==0, dup==0\n",
+                        seq_id, dbg_n_draft, n, n, n + n_block_tokens - 1,
+                        (int) ok, n_cells, (int) p_min, (int) p_max, n, n_ge, n_dup);
+            }
+
+            dbg_blk_pos0[seq_id] = n;
+            dbg_blk_pos1[seq_id] = n + n_block_tokens - 1;
         }
 
         if (batch.n_tokens == 0) {
@@ -1344,11 +1550,87 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // MAD-LAB: services mode -- gather the token embeddings on the TARGET.
+        //
+        // The draft graph consumes them as the embd half of this batch instead of doing
+        // get_rows on a table it does not own. llm_graph_input_embd::set_input fills
+        // `tokens` and `embd` from independent branches and llama_batch_allocr carries
+        // both through, so the dual carry is well formed. The ids still have to be there:
+        // the Markov head conditions on them, not on the embeddings.
+        if (services_mode) {
+            embd_buf.resize((size_t) batch.n_tokens * n_embd_dec);
+
+            if (!llama_token_embed_gather(this->params.ctx_tgt, batch.token, batch.n_tokens, embd_buf.data())) {
+                LOG_ERR("%s: token_embed_gather failed\n", __func__);
+                return;
+            }
+
+            batch.embd = embd_buf.data();
+        }
+
         // decode all sequence's noise block in a single batch
         int ret = llama_decode(ctx_dft, batch);
+
+        // Detach before any path can free the batch: llama_batch_free() frees ->embd,
+        // and this buffer is owned by embd_buf.
+        batch.embd = nullptr;
+
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
+        }
+
+        // MAD-LAB: services mode -- finish the step the draft graph could not.
+        //
+        // Graph A stopped after output_norm and exported the hidden state on the ordinary
+        // embeddings path. Project it through the TARGET's head -- into our OWN buffer, so
+        // the target's verification logits are left exactly as the spec loop expects them
+        // -- then replay the Markov head on the draft. That writes the biased logits into
+        // ctx_dft's own logits buffer, so every sampler call below is unchanged.
+        //
+        // One projection per draft step, not one per block position: the head is a single
+        // batched mul_mat and the Markov chain conditions only on the sidecar's own w1/w2.
+        if (services_mode) {
+            const int32_t n_tok = batch.n_tokens;
+
+            int32_t n_blocks_drafting = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] >= 0) {
+                    n_blocks_drafting++;
+                }
+            }
+
+            // The decoder exported the post-output_norm hidden state on the nextn channel
+            // (see src/models/dflash.cpp). Those rows are n_embd_nextn wide, which equals
+            // n_embd_dec only when hc_mult == 1; compact to a tight [n_tok][n_embd_dec]
+            // block, which is what both services below expect.
+            const float * nextn = llama_get_embeddings_nextn(ctx_dft);
+            if (nextn == nullptr) {
+                LOG_ERR("%s: draft exported no hidden state on the nextn channel\n", __func__);
+                return;
+            }
+
+            hidden_buf.resize((size_t) n_tok * n_embd_dec);
+            for (int32_t i = 0; i < n_tok; ++i) {
+                std::memcpy(hidden_buf.data() + (size_t) i * n_embd_dec,
+                            nextn              + (size_t) i * n_embd_nextn,
+                            (size_t) n_embd_dec * sizeof(float));
+            }
+
+            const float * hidden = hidden_buf.data();
+
+            base_buf.resize((size_t) n_tok * n_vocab_dft);
+            if (!llama_output_project_to(this->params.ctx_tgt, hidden, n_tok, base_buf.data())) {
+                LOG_ERR("%s: output_project_to(ctx_tgt) failed\n", __func__);
+                return;
+            }
+
+            conf_buf.assign(n_tok, 1.0f);
+            if (!llama_dspark_markov_head(ctx_dft, base_buf.data(), batch.token, hidden,
+                        n_tok, n_blocks_drafting, conf_buf.data())) {
+                LOG_ERR("%s: dspark_markov_head(ctx_dft) failed\n", __func__);
+                return;
+            }
         }
 
         if (common_speculative_capture_enabled()) {
@@ -1369,10 +1651,74 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
+            // (b) MAD-LAB / WP_DSPARK_DEBUG: per-slot dump, first few draft calls only.
+            //
+            // THE decisive distinction we do not currently have: do deep slots emit
+            // plausible-but-wrong continuations (a QUALITY problem -- the head is working,
+            // it just is not good enough) or degenerate output (a CORRUPTION problem --
+            // repeats of slot 0, the MASK id itself, punctuation/byte junk, or a near-flat
+            // top-1/top-2 gap)? Read the top-3 and the logit gap, not just the argmax.
+            //
+            // Read-only: uses llama_get_logits_ith directly and never touches the sampler,
+            // so the tokens actually drafted below are unaffected.
+            if (wp_dspark_debug() && dbg_n_draft < 3) {
+                // Anchor identity, so the log shows WHICH committed token each call was
+                // conditioned on. If call N+1's proposals repeat call N's at the same
+                // absolute positions while THIS line changes, the anchor is being ignored.
+                SPC_INF("DBG anchor seq=%d call=%d n_past=%d id_last=%d '%s'\n",
+                        seq_id, dbg_n_draft, (int) dp.n_past, dp.id_last,
+                        common_token_to_piece(ctx_dft, dp.id_last).c_str());
+
+                const float * conf_dbg = services_mode
+                    ? (conf_buf.empty() ? nullptr : conf_buf.data())
+                    : llama_get_embeddings_nextn(ctx_dft);
+                const size_t conf_stride_dbg = services_mode ? 1 : (size_t) n_embd_nextn;
+
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    const int32_t idx = beg + i;
+
+                    const float * lg = llama_get_logits_ith(ctx_dft, idx);
+                    if (lg == nullptr) {
+                        SPC_INF("DBG slot seq=%d call=%d i=%d: no logits\n", seq_id, dbg_n_draft, i);
+                        continue;
+                    }
+
+                    // -FLT_MAX rather than -INFINITY: no <cmath> dependency needed here,
+                    // and it seeds the top-3 scan identically for any real logit.
+                    int32_t t[3] = { -1, -1, -1 };
+                    float   v[3] = { -3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f };
+                    for (int32_t k = 0; k < n_vocab_dft; ++k) {
+                        const float x = lg[k];
+                        if (x > v[0]) { v[2]=v[1]; t[2]=t[1]; v[1]=v[0]; t[1]=t[0]; v[0]=x; t[0]=k; }
+                        else if (x > v[1]) { v[2]=v[1]; t[2]=t[1]; v[1]=x; t[1]=k; }
+                        else if (x > v[2]) { v[2]=x; t[2]=k; }
+                    }
+
+                    const float c = conf_dbg ? conf_dbg[(size_t) idx * conf_stride_dbg] : -1.0f;
+
+                    SPC_INF("DBG slot seq=%d call=%d i=%d pos=%d conf=%.4f gap=%.3f | "
+                            "top1=%6d (%8.3f) '%s' | top2=%6d (%8.3f) '%s' | top3=%6d (%8.3f) '%s'%s\n",
+                            seq_id, dbg_n_draft, i, (int) dp.n_past + i, c, v[0] - v[1],
+                            t[0], v[0], common_token_to_piece(ctx_dft, t[0]).c_str(),
+                            t[1], v[1], common_token_to_piece(ctx_dft, t[1]).c_str(),
+                            t[2], v[2], common_token_to_piece(ctx_dft, t[2]).c_str(),
+                            t[0] == mask_token_id ? "  <<< ARGMAX IS THE MASK TOKEN" : "");
+                }
+            }
+
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // MAD-LAB: in services mode the Markov head ran out-of-graph, so its
+                // confidences are in conf_buf -- one float per token -- instead of being
+                // broadcast across the n_embd_out-wide nextn embeddings buffer. Carry the
+                // stride explicitly rather than assuming either layout.
+                const float * conf        = nullptr;
+                size_t        conf_stride = 0;
+                if (params.conf_min > 0.0f) {
+                    conf        = services_mode ? conf_buf.data() : llama_get_embeddings_nextn(ctx_dft);
+                    conf_stride = services_mode ? 1 : (size_t) n_embd_nextn;
+                }
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
@@ -1381,7 +1727,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // rows are n_embd_out wide. Striding n_embd_dec here read a quarter
                     // into the wrong row for every idx > 0 and truncated blocks on
                     // arbitrary values.
-                    if (conf && conf[(size_t) idx * n_embd_nextn] < params.conf_min) {
+                    if (i > 0 && conf && conf[(size_t) idx * conf_stride] < params.conf_min) {
                         break;
                     }
 
@@ -1484,6 +1830,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Carry this block forward. At the top of the NEXT draft these become the
         // predicted half of the hint, with the whole draft decode as lead.
         prev_draft_toks = draft_toks;
+
+        // MAD-LAB / WP_DSPARK_DEBUG: draft-call counter (instrumentation only).
+        dbg_n_draft++;
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
@@ -2543,6 +2892,30 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+        // MAD-LAB: a sidecar draft must never inherit the target's split mode.
+        //
+        // split_mode is a top-level common_params field, not part of
+        // common_params_model, so `result = params` above carries the target's
+        // -sm through even though result.devices has just been replaced by the
+        // draft's own -devd list. Under -sm tensor that makes
+        // llama_prepare_model_devices() wrap the draft's devices in a SECOND Meta
+        // device -- a degenerate one-device Meta for `-devd ROCm0` -- with its own
+        // split-state userdata, distinct from the target's Meta device.
+        //
+        // Two different Meta devices in one scheduler is not a supported state. The
+        // draft's meta buffers hold 1 simple buffer while the target's meta backend
+        // indexes 2, so the first draft decode aborts in
+        // ggml_backend_meta_buffer_simple_tensor() at ggml-backend-meta.cpp:476.
+        //
+        // The draft is a small standalone model that wants to sit whole on its own
+        // device; tensor-parallelising it would add an AllReduce per layer to a
+        // latency-critical path for no bandwidth win. There is also no CLI surface
+        // to request it (there is no -smd to pair with -devd). LAYER is the default
+        // and the right answer: the borrowed target tensors still run
+        // tensor-parallel on the target's Meta backend, which the draft context
+        // co-schedules (see the MAD-LAB note in llama_context's backend init).
+        result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
@@ -2561,9 +2934,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // appeared to work because every prior measurement used a ~5-token prompt that
     // fit under the budget by accident.
     //
-    // n_batch is the true upper bound on outputs in a batch, and this value is only
-    // an assert ceiling: output_reserve() allocates for the REQUESTED row count, not
-    // for the ceiling, so raising it costs no memory until the rows are really used.
+    // n_batch is the host-buffer / encoder ceiling (output_reserve asserts against
+    // it). It is NOT free: sched_reserve sizes the GPU logits tensor to
+    // min(n_ubatch, n_outputs_max). Draft graphs now cap that reserve separately
+    // (draft_graph_n_outputs) so this ceiling does not materialize
+    // n_vocab*n_ubatch*4 of dead logits.
     result.n_outputs_max = params.n_batch;
 
     // 2026-08-10 upstream sync: upstream sets n_outputs_max_per_seq = 1 here.
@@ -2629,13 +3004,52 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        // The draft is a whole standalone model: never inherit the target's
+        // cross-machine pipeline band. common_base_params_to_speculative() does
+        // `result = params` and then overrides only result.model (a
+        // common_params_model), but pipeline_layer_first/last are top-level
+        // common_params fields, so they survive into the draft's mparams via
+        // common_model_params_to_llama(). A banded head then rejects the draft at
+        // llama-model.cpp:2514, whose layer range lies outside the target's band.
+        //
+        // This is also what severs the segment-manifest coupling: the manifest
+        // itself is only ever read from params_base in the server, and the sole way
+        // it reaches the draft is that the head sets pipeline_layer_first/last from
+        // it (server-context.cpp:1675). Clearing them here is the complete fix.
+        mparams.pipeline_layer_first = -1;
+        mparams.pipeline_layer_last  = -1;
+
+        // NOTE: passing model_path rather than params.model.path is a readability
+        // change, NOT a bug fix -- the two are the same string here, because
+        // common_base_params_to_speculative() already assigned
+        // `result.model = params_spec.mparams` for the has_draft case. Keep them in
+        // sync if that assignment ever becomes conditional.
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
         }
 
         pimpl->model.reset(model_dft);
+
+        // MAD-LAB: a sidecar draft that ships no LM head cannot produce logits in its own
+        // graph. Its decoder stops after output_norm and exports the hidden state, which
+        // the driver then projects through the target's head.
+        //
+        // That export rides the NEXTN channel (res->t_h_nextn), which the DFlash impl
+        // already turns on with llama_set_embeddings_nextn(), so nothing extra is needed
+        // here. Deliberately NOT cparams.embeddings: build_pooling() gates only on that
+        // flag and would then run on this arch's encoder graph, which never sets t_embd.
+        if (!llama_model_has_output_head(model_dft)) {
+            LOG_INF("%s: draft has no LM head -- hidden state will be exported via the nextn channel (services mode)\n", __func__);
+
+            // The nextn copy in llama_context::decode is guarded on pooling being NONE.
+            // The DFlash arm already depends on that for its confidence read, but it was
+            // only ever inherited from the defaults; make it explicit, because the hidden
+            // state the whole services path is built on now rides the same guard. A draft
+            // context never wants pooling, so this is unconditionally right here.
+            cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
@@ -3096,7 +3510,12 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        // Promoted from TRC to INF (2026-08-16), alongside the server-side "acc per pos"
+        // line. This counter (n_acc_tokens_per_pos) is tallied independently of the
+        // server's n_accepted_per_pos, so having both visible gives a cross-check: if
+        // the two per-position curves disagree, the accounting itself is wrong, which is
+        // worth knowing before reading anything into either. Prints once per stats call.
+        SPC_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,

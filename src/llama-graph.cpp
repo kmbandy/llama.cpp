@@ -225,6 +225,14 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
+    // a pipeline-band context that does not own the final layer never consumes
+    // out_ids (models gate its ggml_get_rows on il == n_layer - 1), so gallocr
+    // leaves it unallocated; likewise a zero-output ubatch has nothing to
+    // write. In both cases the input is inert -- skip it.
+    if (n_outputs == 0 || out_ids->buffer == nullptr) {
+        return;
+    }
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
@@ -1606,6 +1614,25 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+ggml_tensor * llm_graph_context::complete_moe_dispatch(ggml_tensor * moe_or_issued,
+                                                       ggml_tensor * shexp,
+                                                       int           il) {
+    if (moe_dispatch_split_shexp && expert_dispatch != nullptr && il >= 0) {
+        // REVERTED 2026-08-17: an earlier HIP-graph-fallback fix pinned shexp to
+        // backend_cpu here, which broke compute (500 "Compute error") -- shexp is the
+        // GPU shared-expert FFN result, real GPU work, NOT a CPU dispatch op. Forcing
+        // GPU compute onto CPU is invalid. after_issue is a dependency edge; leave the
+        // backend to the scheduler. The captures=0 HIP-graph churn is elsewhere (chase
+        // with LLAMA_GRAPH_RESULT_DEBUG=2, which prints the failing can_reuse check).
+        shexp = expert_dispatch->after_issue(ctx0, shexp, il);
+        moe_or_issued = expert_dispatch->build_wait(ctx0, shexp, il);
+        cb(moe_or_issued, "ffn_moe_out", il);
+    }
+    ggml_tensor * out = ggml_add(ctx0, moe_or_issued, shexp);
+    cb(out, "ffn_out", il);
+    return out;
+}
+
 
 
 ggml_tensor * llm_graph_context::build_cvec(
@@ -2225,10 +2252,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // path returns before the switch, so passing it on is the ONLY way the
         // limit reaches the expert FFN at all.
         const float dispatch_swiglu_clamp = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        ggml_tensor * moe_out = expert_dispatch->build(ctx0, cur, selected_experts, weights, il,
-                                                       dispatch_swiglu_clamp);
+        const bool  split_shexp = moe_dispatch_split_shexp && il >= 0;
+        ggml_tensor * moe_out = split_shexp
+            ? expert_dispatch->build_issue(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp)
+            : expert_dispatch->build(ctx0, cur, selected_experts, weights, il, dispatch_swiglu_clamp);
         ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
-        cb(moe_out, "ffn_moe_out", il);
+        cb(moe_out, split_shexp ? "ffn_moe_issued" : "ffn_moe_out", il);
         return moe_out;
     }
 

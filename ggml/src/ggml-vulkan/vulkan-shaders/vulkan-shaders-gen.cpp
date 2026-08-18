@@ -913,6 +913,11 @@ void process_shaders() {
 
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
+    // tensor-parallel 2-device AllReduce (see ggml-vulkan-allreduce.hpp)
+    string_to_spv("allreduce_pack_bf16", "allreduce_pack_bf16.comp", {});
+    string_to_spv("allreduce_add_f32",   "allreduce_add.comp",       {});
+    string_to_spv("allreduce_add_bf16",  "allreduce_add.comp",       {{"WIRE_BF16", "1"}});
+
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
@@ -1109,9 +1114,15 @@ void process_shaders() {
 
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
-    string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
-    string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
-    string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
+    string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_SUBGROUP_SHUFFLE", "0"}}));
+    string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SUBGROUP_SHUFFLE", "0"}}));
+    // barrier-free fallback for devices without subgroup arithmetic but with subgroup shuffle
+    // (all GCN/RDNA drivers). Same butterfly order as the shmem path, so bit-identical to it.
+    string_to_spv("gated_delta_net_f32_shuffle", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SUBGROUP_SHUFFLE", "1"}}));
+    string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SUBGROUP_SHUFFLE", "0"}}));
+    // chunked (UT-transform) path for short token blocks; S_V / subgroup geometry are
+    // specialization constants, so a single module covers every head size
+    string_to_spv("gated_delta_net_chunked_f32", "gated_delta_net_chunked.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

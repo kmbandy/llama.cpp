@@ -336,7 +336,13 @@ struct common_params_speculative_draft {
     // (DeepSeek / DwarfStar guidance). 0.0 disables the gate — do not ship
     // that as the default; every ungated draft position pays real expert I/O
     // on a paged MoE.
-    float conf_min = 0.9f;
+    // 0 = disabled (reference-compatible: SGLang static mode verifies the full
+    // block). The old fork default of 0.9f censored DSpark proposals to ~1.3
+    // per block and manufactured a per-position acceptance "cliff" (positions
+    // never proposed were counted as failed) — found 2026-08-16. A raw sigmoid
+    // 0.9 is not a calibrated threshold across heads/positions; treat any
+    // nonzero value as an explicit experiment.
+    float conf_min = 0.0f;
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
@@ -591,6 +597,8 @@ struct common_params {
     std::string weight_paging_resident_experts = "off"; // routed-expert blocks resident on the island device: off/auto/SIZE/BLOCKS
     std::string weight_paging_device_layers; // explicit paged bands: "ROCm0:0-37;ROCm1:38-74"
     std::string expert_dispatch; // remote MoE workers: "host:port,host:port"
+    std::string segment_manifest; // dense pipeline head manifest
+    bool        rpc_enabled = false;
     // wp-repack expert-major blob set: path to its -manifest.json, empty = off.
     // When set, routed experts are read from the blobs (one contiguous read per
     // expert) instead of from the source GGUFs (three scattered reads).

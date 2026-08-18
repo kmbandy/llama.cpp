@@ -1055,6 +1055,15 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     pipe_expert_dispatcher::graph_dispatcher * expert_dispatch;
+    // When true, build_moe_ffn's dispatch branch returns the ISSUE node and
+    // the caller must complete_moe_dispatch() after building shexp so shexp
+    // runs between send and recv. DS4 sets this; other arches keep the
+    // combined custom-op.
+    bool moe_dispatch_split_shexp = false;
+
+    ggml_tensor * complete_moe_dispatch(ggml_tensor * moe_or_issued,
+                                        ggml_tensor * shexp,
+                                        int           il);
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

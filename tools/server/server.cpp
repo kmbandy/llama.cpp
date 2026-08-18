@@ -11,10 +11,12 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "pipe-dense-segment-manifest.h"
 
 #include <atomic>
 #include <clocale>
 #include <exception>
+#include <filesystem>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -127,6 +129,43 @@ int llama_server(common_params & params, int argc, char ** argv) {
             }
         } catch (const std::exception & e) {
             SRV_ERR("failed to fetch model metadata: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    if (!params.segment_manifest.empty()) {
+        if (!params.expert_dispatch.empty()) {
+            SRV_ERR("%s", "--segment-manifest cannot be combined with --expert-dispatch\n");
+            return 1;
+        }
+        if (params.rpc_enabled) {
+            SRV_ERR("%s", "--segment-manifest cannot be combined with --rpc\n");
+            return 1;
+        }
+        if (params.n_parallel > 1) {
+            SRV_ERR("%s", "--segment-manifest requires --parallel 1\n");
+            return 1;
+        }
+        if (!params.mmproj.path.empty()) {
+            SRV_ERR("%s", "--segment-manifest does not support multimodal input\n");
+            return 1;
+        }
+        try {
+            const auto manifest = pipe_dense_segment::load_manifest(params.segment_manifest);
+            const auto & head = manifest.segments.front();
+            std::filesystem::path stage = head.stage_gguf;
+            if (stage.is_relative()) {
+                stage = std::filesystem::path(params.segment_manifest).parent_path() / stage;
+            }
+            params.model.path = stage.lexically_normal().string();
+            params.model.hf_repo.clear();
+            params.model.hf_file.clear();
+            params.pipeline_layer_first = head.layer_first;
+            params.pipeline_layer_last = head.layer_last;
+            params.n_parallel = 1;
+            params.kv_unified = false;
+        } catch (const std::exception & error) {
+            SRV_ERR("--segment-manifest: %s\n", error.what());
             return 1;
         }
     }

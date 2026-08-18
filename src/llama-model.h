@@ -611,6 +611,25 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// MAD-LAB: build the DSpark Markov/confidence head into an arbitrary ggml context.
+//
+// Defined in src/models/dflash.cpp. Used both in-graph by the DFlash/DSV4 decoders and
+// standalone by llama_context::dspark_markov_head(), which replays just this head after
+// the LM-head projection has been computed on the target context (services mode, needed
+// when the target is Meta-split and the draft cannot schedule the borrowed head).
+//
+// Returns false when block_drafts exceeds the trained block_size; the caller should then
+// use `base` unbiased. Does not expand anything into a graph -- the caller owns gf.
+bool llama_dspark_build_markov_graph(
+        struct ggml_context      * ctx0,
+        const struct llama_model & model,
+        struct ggml_tensor       * tokens,    // I32 [n_tok]
+        struct ggml_tensor       * base,      // F32 [n_vocab, n_tok]
+        struct ggml_tensor       * conf_inp,  // F32 [n_embd, n_tok]
+        int64_t                    n_blocks,
+        struct ggml_tensor      ** out_logits,
+        struct ggml_tensor      ** out_conf);
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;

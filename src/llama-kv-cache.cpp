@@ -3072,3 +3072,64 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+
+// MAD-LAB / WP_DSPARK_DEBUG: read-only census of one sequence's resident KV cells.
+//
+// Instrumentation only -- nothing in the decode path calls this. It exists because the
+// public memory API exposes only seq_pos_min/seq_pos_max, which cannot distinguish "one
+// clean cell per position" from "several cells stacked on the same position". That
+// distinction is the whole question for the DSpark draft cache: the drafter runs
+// non-causal, so if duplicate cells DO accumulate at a position, every one of them is
+// visible to every slot of the noise block.
+bool llama_dspark_kv_census(
+        llama_memory_t mem,
+        llama_seq_id   seq_id,
+        llama_pos      pos_thresh,
+        int32_t      * out_n_cells,
+        int32_t      * out_n_at_or_above,
+        int32_t      * out_n_dup,
+        llama_pos    * out_pos_min,
+        llama_pos    * out_pos_max) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (kv == nullptr) {
+        return false;
+    }
+
+    const auto & cells = kv->get_cells(seq_id);
+
+    int32_t   n_cells = 0;
+    int32_t   n_ge    = 0;
+    llama_pos pos_min = std::numeric_limits<llama_pos>::max();
+    llama_pos pos_max = -1;
+
+    std::vector<llama_pos> seen;
+    seen.reserve(cells.size());
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+
+        const llama_pos p = cells.pos_get(i);
+
+        n_cells++;
+        if (p >= pos_thresh) {
+            n_ge++;
+        }
+        pos_min = std::min(pos_min, p);
+        pos_max = std::max(pos_max, p);
+        seen.push_back(p);
+    }
+
+    // duplicates = resident cells minus distinct positions
+    std::sort(seen.begin(), seen.end());
+    const int32_t n_distinct = (int32_t) (std::unique(seen.begin(), seen.end()) - seen.begin());
+
+    if (out_n_cells)       { *out_n_cells       = n_cells; }
+    if (out_n_at_or_above) { *out_n_at_or_above = n_ge; }
+    if (out_n_dup)         { *out_n_dup         = n_cells - n_distinct; }
+    if (out_pos_min)       { *out_pos_min       = n_cells > 0 ? pos_min : -1; }
+    if (out_pos_max)       { *out_pos_max       = pos_max; }
+
+    return true;
+}

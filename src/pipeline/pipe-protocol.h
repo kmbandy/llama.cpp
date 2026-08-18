@@ -62,7 +62,86 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 //    worker that cannot tell them apart has to lease them identically. Measured:
 //    predicted hints displaced ~200 ground-truth pages precisely because they
 //    held slots on equal terms.
-static constexpr uint32_t PIPE_VERSION = 6u;
+// 6 -> 7 (2026-08-15): dense-segment frames. The segment HELLO, forward and
+// control payloads have their own versions, but a pre-7 peer does not know
+// their frame types and must fail during the connection handshake.
+// 7 -> 8 (2026-08-15): the dense-segment HELLO and response now carry the
+// vocabulary/output widths. A terminal response is logits, not hidden state,
+// so using n_embd there would silently corrupt the server sampler.
+// 8 -> 9 (2026-08-15): HELLO ACK reports recurrent snapshot depth so the
+// head can clamp a speculative draft before it asks a segment to roll back.
+// 9 -> 10 (2026-08-15): LOGITS-ON-HEAD. The terminal segment may now return the
+// post-output_norm HIDDEN STATE (n_embd) instead of LOGITS (n_vocab), leaving the
+// LM head projection to the head. That is 5120 vs 248320 f32 per token -- a 48x
+// cut on the terminal leg, ~993 KB -> ~20 KB, worth ~9 ms/token of wire at the
+// measured ~888 Mbps. The two payloads are BOTH f32 arrays of [n_tokens, W] with
+// nothing self-describing about W, so a head and a tail that disagree about the
+// kind do not fail -- they mis-slice the same bytes and the head samples from a
+// buffer of hidden states. That is a silent, catastrophic correctness failure, so
+// it MUST be rejected at the handshake. The negotiation lives in the segment HELLO
+// (below) and this framing bump makes a pre-10 peer fail even earlier.
+// 10 -> 11 (2026-08-16): INTERIOR TAPS. A segment may now be asked to extract the input
+// hidden state of one or more layers INSIDE its band and return them alongside the
+// forward response, so that a speculative draft running on the head can condition on
+// target activations the head does not compute itself. A DFlash/DSpark draft taps fixed
+// target layers (dflash.target_layers, e.g. [5,17,29,41,53]); with a 0-48 head those
+// last taps live on another machine.
+//
+// This is version-gated for the same reason terminal_kind was, and the failure is even
+// quieter. If a head expects taps and a peer does not send them, the head reads a stale
+// or zero buffer as if it were the tap. Nothing mis-sizes and nothing crashes: the
+// drafter simply conditions on garbage and proposes worse tokens. Speculative decoding
+// is exact by construction -- the target verifies every draft token -- so the OUTPUT
+// STAYS BIT-IDENTICAL and even a temp-0 parity test passes. The only symptom is a
+// degraded acceptance rate, which is indistinguishable from an ordinary bad draft model.
+// That is strictly harder to detect than the terminal_kind mis-slice, so it must be
+// rejected at the handshake and the framing bump makes a pre-11 peer fail earlier still.
+// 11 -> 12 (2026-08-16): NEXTN WIRE DEDUP. The terminal segment used to ship the
+// nextn sideband on EVERY forward response, unconditionally, because nextn_width was
+// a load-time property of the worker and was never negotiated. Measured on the
+// dense-segment tail under the HIDDEN terminal payload: 2 x 40960 bytes per token at
+// n_embd=5120 -- the post-output_norm hidden state travelled twice, once as
+// `activations` and once as `nextn`, and on every arm except draft-mtp the second copy
+// was read by nobody (server-context.cpp gates the consume on
+// common_speculative_need_embd_nextn(), which only draft-mtp answers true).
+//
+// Version 12 negotiates it: the segment HELLO carries nextn_need, the ACK answers with
+// the nextn_width the segment WILL send (0 when the head declared no need), and the
+// forward response carries nextn_aliased so a tail whose nextn is bit-identical to the
+// terminal hidden state can ship it ONCE and let the head reconstruct.
+//
+// This MUST be version-gated. The response encodes nextn as a bare f32 run whose length
+// is implied by nextn_width and nextn_aliased; a pre-12 tail sends the run
+// unconditionally and knows no aliasing flag, so a v12 head that negotiated
+// nextn_width=0 would read the tail's 40960 extra bytes per token as part of the frame
+// and fail the length check -- loudly, but only after a successful HELLO, which looks
+// exactly like a worker crash mid-run. Worse in the other direction: a pre-12 HEAD
+// cannot express need, so a v12 tail would default it to "no need" and silently starve
+// draft-mtp of the sideband it verifies against. Rejecting at the handshake turns both
+// into one clear line at startup.
+// 12 -> 13 (2026-08-17): PARTIAL DTYPE TAG. pipe_expert_partial now carries an
+// explicit `dtype` field (pipe_hidden_type: F32=0 default, F16=1) ahead of the
+// partial array, so the SPINE decodes whatever a worker actually sent rather
+// than assuming f32. This is what makes WP_EXPERT_PARTIAL_DTYPE=f16 (worker-side,
+// per-process, default OFF -- see wp-expert-worker.cpp) safe to enable on some
+// workers and not others: the tag is self-describing, so a spine that has never
+// heard of the env var still decodes correctly, and a worker/spine version
+// mismatch cannot silently reinterpret one dtype's bytes as the other's.
+//
+// This MUST still be version-gated even though the tag is self-describing,
+// because the tag itself is a NEW field: a pre-13 peer's decoder expects the
+// partial array to start immediately after (layer, n_tokens) and has no idea a
+// dtype word was inserted. Without the bump, a v13 worker talking to a pre-13
+// spine would have its `dtype` word (0 for the default f32 case) misread as the
+// first 4 bytes of the partial's row 0 -- a silent off-by-4-bytes corruption of
+// exactly the kind this file's whole version history exists to prevent. The
+// bump makes that pairing fail loudly at HELLO instead. Once both peers are on
+// version 13, the tag alone is what keeps a WORKER-side config knob from ever
+// being able to corrupt the SPINE's sum: the spine does not need to know or
+// agree with WP_EXPERT_PARTIAL_DTYPE, it only needs to trust the tag on the
+// frame it just received, which it always can because the tag was written by
+// the same process that wrote the bytes after it.
+static constexpr uint32_t PIPE_VERSION = 13u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -90,6 +169,12 @@ enum pipe_frame_type : uint32_t {
     PIPE_EXPERT_PREFETCH_HINT = 11,
     PIPE_EXPERT_DISPATCH_BEGIN = 12,
     PIPE_EXPERT_DISPATCH_ACTS  = 13,
+    PIPE_SEGMENT_HELLO         = 14,
+    PIPE_SEGMENT_HELLO_ACK     = 15,
+    PIPE_SEGMENT_FWD_REQ       = 16,
+    PIPE_SEGMENT_FWD_RESP      = 17,
+    PIPE_SEGMENT_CTRL          = 18,
+    PIPE_SEGMENT_CTRL_ACK      = 19,
 };
 
 enum pipe_role : uint32_t {
@@ -101,6 +186,40 @@ enum pipe_role : uint32_t {
 enum pipe_hidden_type : int32_t {
     PIPE_HIDDEN_F32 = 0,
     PIPE_HIDDEN_F16 = 1,
+};
+
+enum pipe_segment_wire_precision : uint32_t {
+    PIPE_SEGMENT_WIRE_F32 = 1,
+};
+
+// What the TERMINAL (tail) segment puts in pipe_segment_fwd_resp::activations.
+// Non-terminal segments always return hidden state and ignore this entirely.
+enum pipe_segment_terminal_kind : uint32_t {
+    // Legacy: the tail runs output_norm AND the LM head and returns
+    // [n_tokens, n_vocab] logits. Kept for A/B (WP_SEGMENT_TAIL_LOGITS=1).
+    PIPE_SEGMENT_TERMINAL_LOGITS = 1,
+    // Logits-on-head: the tail runs output_norm and STOPS, returning
+    // [n_tokens, n_embd] normed hidden state. The head does the projection.
+    PIPE_SEGMENT_TERMINAL_HIDDEN = 2,
+};
+
+enum pipe_segment_capability : uint64_t {
+    PIPE_SEGMENT_CAP_FWD          = 1ull << 0,
+    PIPE_SEGMENT_CAP_RESET        = 1ull << 1,
+    PIPE_SEGMENT_CAP_KV_TRIM      = 1ull << 2,
+    PIPE_SEGMENT_CAP_PROMPT_REUSE = 1ull << 3,
+    PIPE_SEGMENT_CAP_RECURRENT    = 1ull << 4,
+};
+
+enum pipe_segment_ctrl_type : uint32_t {
+    PIPE_SEGMENT_CTRL_RESET        = 1,
+    PIPE_SEGMENT_CTRL_KV_TRIM      = 2,
+    PIPE_SEGMENT_CTRL_PROMPT_REUSE = 3,
+};
+
+enum pipe_segment_ctrl_status : uint32_t {
+    PIPE_SEGMENT_CTRL_APPLIED = 1,
+    PIPE_SEGMENT_CTRL_MISS    = 2,
 };
 
 enum pipe_error_code : uint32_t {
@@ -295,11 +414,16 @@ struct pipe_expert_prefetch_hint {
 // Payload:
 //   i32 layer
 //   u32 n_tokens
-//   f16 partial[n_tokens * n_embd]
+//   i32 dtype                        (pipe_hidden_type: F32=0 default, F16=1)
+//   u8[] partial   n_tokens*n_embd elements, elt_size(dtype) bytes each,
+//                  f32 or f16 per IEEE754 depending on dtype
 struct pipe_expert_partial {
     int32_t            layer    = -1;
     uint32_t           n_tokens = 0;
-    // *** f32, NOT f16. CHANGED 2026-08-04 -- THIS WAS A CORRECTNESS BUG. ***
+    // *** f32 ON THE WIRE BY DEFAULT. CHANGED 2026-08-04 -- THIS WAS A CORRECTNESS
+    // BUG (see the full history below); f32 is the safe default and stays that way
+    // unless a worker opts in to f16 via WP_EXPERT_PARTIAL_DTYPE=f16.
+    //
     // Each worker sums ITS OWN subset of a layer's experts in f32 and the spine adds
     // the per-worker subtotals. Sending the subtotal as f16 rounded it to an 11-bit
     // mantissa (~5e-4 relative) AT THE PARTITION BOUNDARY, so the final MoE output
@@ -313,7 +437,179 @@ struct pipe_expert_partial {
     // discontinuous router top-k then amplified into a different trajectory.
     // f32 removes the amplifier entirely; what remains is ordinary f32 reordering
     // (~1e-7). Costs 2x bytes on the partial-return path only.
+    //
+    // *** dtype ADDED 2026-08-17 (WP_EXPERT_PARTIAL_DTYPE). ***
+    // The correctness bug above was about f16 being UNCONDITIONAL and UN-TAGGED: the
+    // spine had no way to know a partial had been rounded, so a partition-dependent
+    // subtotal error looked like ordinary noise. This is different: it is an OPT-IN,
+    // PER-WORKER, SELF-DESCRIBING encoding. `dtype` says exactly what `partial`'s
+    // bytes mean on THIS frame, so the spine always decodes correctly regardless of
+    // what any worker's env var says -- a worker/spine version or config mismatch can
+    // misinterpret nothing, because the tag travels with the bytes it describes.
+    // What f16 partials reintroduce is the SAME quantization risk the 2026-08-04 note
+    // describes (~5e-4 relative per worker, amplified by hyper-connection gates and
+    // top-k), which is why it is default OFF and meant for links that are bandwidth-
+    // bound (e.g. a 1 GbE hop to a remote worker) rather than for every deployment.
+    // Acceptable under f16 KV; risky under turbo4 KV, per the same amplification
+    // mechanism documented above -- that is why this stays opt-in rather than becoming
+    // the new default.
+    int32_t             dtype = PIPE_HIDDEN_F32;
     std::vector<float> partial;
+};
+
+// ---------------------------------------------------------------------------
+// dense-segment payloads
+
+// The fixed framing version is PIPE_VERSION. Each segment payload starts with
+// its own version so fields can evolve without ambiguity once the segment
+// family is deployed.
+// HELLO 3 -> 4 (2026-08-15): terminal_kind negotiation (logits-on-head).
+// HELLO 4 -> 5 (2026-08-16): interior tap negotiation (tap_layers / tap_width).
+// HELLO 5 -> 6 (2026-08-16): nextn sideband negotiation (nextn_need / nextn_width).
+static constexpr uint32_t PIPE_SEGMENT_HELLO_VERSION    = 6;
+// FWD 2 -> 3 (2026-08-16): the response may carry interior tap rows after `nextn`.
+// FWD 3 -> 4 (2026-08-16): nextn_aliased. When set, the `nextn` run is OMITTED from the
+// payload and is bit-identical to `activations`; the head reconstructs it locally.
+static constexpr uint32_t PIPE_SEGMENT_FWD_VERSION      = 4;
+static constexpr uint32_t PIPE_SEGMENT_CTRL_VERSION     = 1;
+static constexpr uint32_t PIPE_SEGMENT_CTRL_ACK_VERSION = 1;
+
+struct pipe_segment_hello {
+    uint32_t    version                 = PIPE_SEGMENT_HELLO_VERSION;
+    uint32_t    segment_id              = 0;
+    int32_t     layer_first              = -1;
+    int32_t     layer_last               = -1;
+    std::string model_identity_sha256;
+    int32_t     n_embd                  = 0;
+    uint32_t    n_vocab                 = 0;
+    uint32_t    wire_precision          = PIPE_SEGMENT_WIRE_F32;
+    uint64_t    capabilities            = 0;
+    uint64_t    cache_epoch             = 0;
+    // What the head REQUIRES the terminal segment to return. A tail that cannot
+    // serve this kind must reject the HELLO, never quietly send the other one.
+    uint32_t    terminal_kind           = PIPE_SEGMENT_TERMINAL_HIDDEN;
+    // INTERIOR TAPS the head REQUIRES this segment to extract, ascending, all inside
+    // the segment's band. A segment that was not configured to extract exactly these
+    // must reject the HELLO: silently returning none leaves the head conditioning a
+    // speculative draft on a stale buffer, which does not change the verified output
+    // and therefore cannot be caught by any parity test.
+    std::vector<uint32_t> tap_layers;
+    // Whether the head will actually READ the terminal segment's nextn sideband. True
+    // only under --spec-type draft-mtp, whose drafter verifies against the target's
+    // pre-LM-head hidden state; draft-dspark conditions on interior taps plus its own
+    // draft context's nextn, and a no-spec run reads nothing. A tail must serialize the
+    // sideband ONLY when this is set -- shipping it unasked cost a full duplicate
+    // n_embd f32 run per token on the production arm.
+    //
+    // Declared as a need rather than inferred from terminal_kind because the two are
+    // independent: the LOGITS arm also has a nextn sideband, and it is the only arm
+    // where the sideband is genuinely different data from the terminal payload.
+    uint32_t              nextn_need = 0;
+};
+
+struct pipe_segment_hello_ack {
+    uint32_t    version = PIPE_SEGMENT_HELLO_VERSION;
+    bool        accepted = false;
+    uint32_t    n_vocab = 0;
+    uint32_t    rs_snapshots = 0;
+    // What this segment WILL return. On an accepted HELLO the head asserts this
+    // equals what it asked for; terminal_width is the f32 column count that
+    // implies (n_vocab for LOGITS, n_embd for HIDDEN) and is what the head sizes
+    // its decode against. Non-terminal segments echo the request and report
+    // terminal_width = n_embd.
+    uint32_t    terminal_kind = PIPE_SEGMENT_TERMINAL_HIDDEN;
+    uint32_t    terminal_width = 0;
+    std::string reason;
+    // Interior taps this segment WILL extract, echoing the request, plus the f32 column
+    // count of one tap row (n_embd). tap_width is negotiated rather than assumed --
+    // nextn_width is hardcoded on both sides today and only fails safe by accident.
+    //
+    // Declared AFTER `reason` on purpose, even though the wire order puts them before
+    // it: this struct is aggregate-initialized positionally at several call sites, and
+    // appending keeps every existing 7-field initializer valid.
+    std::vector<uint32_t> tap_layers;
+    uint32_t    tap_width = 0;
+    // The f32 column count this segment WILL put in pipe_segment_fwd_resp::nextn, or 0
+    // when it will send none. A terminal segment answers n_embd_out if the head declared
+    // nextn_need and 0 otherwise; a non-terminal segment always answers 0. The head
+    // asserts this against what it asked for, so a worker that ignores the need flag
+    // fails at the handshake instead of appending bytes the head's frame-length check
+    // would reject on the first forward.
+    //
+    // Appended for the same positional-initializer reason as tap_layers/tap_width above,
+    // even though the wire puts it in the fixed region next to tap_width.
+    uint32_t    nextn_width = 0;
+};
+
+// F32 activations are [n_tokens, n_embd] in token-major order. The header's
+// seq_id and this payload seq_id must agree; carrying it in both places makes
+// a bad or stale forwarding implementation detectable before it computes.
+struct pipe_segment_fwd_req {
+    uint32_t             version          = PIPE_SEGMENT_FWD_VERSION;
+    uint64_t             session_id       = 0;
+    uint64_t             seq_id           = 0;
+    uint32_t             n_tokens         = 0;
+    uint32_t             n_pos_per_token  = 1;
+    uint32_t             n_seqs           = 1;
+    std::vector<int32_t> positions;
+    std::vector<uint32_t> seq_token_counts;
+    std::vector<float>   activations;
+};
+
+struct pipe_segment_fwd_resp {
+    uint32_t           version    = PIPE_SEGMENT_FWD_VERSION;
+    uint64_t           session_id = 0;
+    uint64_t           seq_id     = 0;
+    uint32_t           n_tokens   = 0;
+    uint32_t           output_width = 0;
+    uint32_t           nextn_width = 0;
+    // Interior taps: n_taps rows-blocks of [n_tokens, tap_width] f32, concatenated in
+    // the ascending tap_layers order negotiated at HELLO. n_taps is carried explicitly
+    // so the decoder can check the exact length without a second out-of-band value.
+    uint32_t           tap_width = 0;
+    uint32_t           n_taps = 0;
+    std::vector<float> activations;
+    std::vector<float> nextn;
+    std::vector<float> taps;
+    // NEXTN DEDUP. When set, `nextn` is bit-identical to `activations` and its f32 run is
+    // OMITTED from the payload entirely -- the frame carries one copy, not two. Requires
+    // nextn_width == output_width and nextn_width != 0.
+    //
+    // Decided PER RESPONSE by the tail, by comparing the two buffers it already holds,
+    // NOT by assuming they must match. They coincide only under the HIDDEN terminal
+    // payload and only for architectures whose t_h_nextn is the post-output_norm tensor
+    // that t_embd is also taken from (qwen35.cpp:350-361 is the production case). Under
+    // LOGITS they are categorically different (n_vocab logits vs n_embd hidden), and
+    // architectures such as deepseek4.cpp:373 / dflash.cpp:418 set t_h_nextn to a
+    // confidence vector instead. An equality TEST covers all of them without the
+    // protocol having to know which model is loaded, and the reconstruction is exact by
+    // construction, so nothing here can perturb a token.
+    //
+    // The DECODER leaves `nextn` empty and only reports the flag; reconstruction happens
+    // in pipe-dense-segment-client, so encode/decode stays a pure byte transform and a
+    // round-trip test still compares like with like.
+    uint32_t           nextn_aliased = 0;
+};
+
+// RESET starts an empty cache epoch. KV_TRIM makes speculative rollback
+// ordered at every segment. PROMPT_REUSE asks whether a content-addressed
+// prefix of n_past tokens is available in this epoch.
+struct pipe_segment_ctrl {
+    uint32_t               version                = PIPE_SEGMENT_CTRL_VERSION;
+    uint32_t               control                = PIPE_SEGMENT_CTRL_RESET;
+    uint64_t               session_id             = 0;
+    uint64_t               cache_epoch            = 0;
+    uint32_t               n_past                 = 0;
+    std::string            prompt_identity_sha256;
+};
+
+struct pipe_segment_ctrl_ack {
+    uint32_t version     = PIPE_SEGMENT_CTRL_ACK_VERSION;
+    uint32_t control     = PIPE_SEGMENT_CTRL_RESET;
+    uint64_t session_id  = 0;
+    uint64_t cache_epoch = 0;
+    uint32_t status      = PIPE_SEGMENT_CTRL_APPLIED;
+    uint32_t n_past      = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -361,6 +657,12 @@ std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatc
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
+std::vector<uint8_t> pipe_encode_segment_hello(const pipe_segment_hello & p);
+std::vector<uint8_t> pipe_encode_segment_hello_ack(const pipe_segment_hello_ack & p);
+std::vector<uint8_t> pipe_encode_segment_fwd_req(const pipe_segment_fwd_req & p, int32_t n_embd);
+std::vector<uint8_t> pipe_encode_segment_fwd_resp(const pipe_segment_fwd_resp & p);
+std::vector<uint8_t> pipe_encode_segment_ctrl(const pipe_segment_ctrl & p);
+std::vector<uint8_t> pipe_encode_segment_ctrl_ack(const pipe_segment_ctrl_ack & p);
 // PING/PONG carry no payload.
 
 pipe_hello     pipe_decode_hello     (const uint8_t * buf, size_t len);
@@ -380,6 +682,22 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
 pipe_expert_partial pipe_decode_expert_partial(
     const uint8_t * buf, size_t len, int32_t n_embd);
+pipe_segment_hello pipe_decode_segment_hello(const uint8_t * buf, size_t len);
+pipe_segment_hello_ack pipe_decode_segment_hello_ack(const uint8_t * buf, size_t len);
+pipe_segment_fwd_req pipe_decode_segment_fwd_req(const uint8_t * buf, size_t len, int32_t n_embd);
+// tap_width / n_taps are what the head negotiated with THIS segment at HELLO; the
+// decoder rejects a response that does not match, so a segment that silently stopped
+// extracting fails here rather than leaving the head on a stale buffer.
+//
+// Deliberately NOT defaulted to 0. Defaults let an existing call site keep compiling
+// while silently claiming "no taps negotiated", which turns a caller's oversight into a
+// runtime frame mismatch instead of a compile error -- exactly how the tap-enabled
+// worker roundtrip first failed. Every caller must state what it negotiated.
+pipe_segment_fwd_resp pipe_decode_segment_fwd_resp(const uint8_t * buf, size_t len,
+                                                    int32_t output_width, int32_t nextn_width,
+                                                    int32_t tap_width, int32_t n_taps);
+pipe_segment_ctrl pipe_decode_segment_ctrl(const uint8_t * buf, size_t len);
+pipe_segment_ctrl_ack pipe_decode_segment_ctrl_ack(const uint8_t * buf, size_t len);
 
 // ---------------------------------------------------------------------------
 // HELLO validation

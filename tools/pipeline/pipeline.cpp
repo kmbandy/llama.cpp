@@ -37,6 +37,7 @@
 #include "pipe-protocol.h"
 #include "pipe-transport.h"
 #include "llama-pipeline.h"
+#include "pipeline-stage.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -182,45 +183,6 @@ bool do_handshake(pipe_socket_t & sock, const stage_ctx & s,
 }
 
 // ---------------------------------------------------------------------------
-// build an embd-driven llama_batch for a middle/tail stage
-//
-// hidden: n_embd * n_tokens floats (F32 on the wire in Phase 2).
-// pos/seq: from the FWD_REQ frame. All tokens marked as outputs so the middle
-// can read t_embd for every token and the tail can read logits for the last.
-
-void fill_embd_batch(llama_batch & batch, const pipe_fwd_req & req, int32_t n_embd,
-                     const float * hidden) {
-    const int32_t n = (int32_t) req.n_tokens;
-    batch.n_tokens = n;
-
-    // llama_batch_init allocated batch.embd with n_tokens*n_embd floats; copy
-    // the received hidden into it (never repoint batch.embd -- llama_batch_free
-    // frees the buffer llama_batch_init allocated).
-    std::memcpy(batch.embd, hidden, (size_t) n * n_embd * sizeof(float));
-
-    for (int32_t i = 0; i < n; ++i) {
-        batch.pos     [i]    = req.pos[(size_t) i * req.n_pos_per_embd];
-        batch.n_seq_id[i]    = 1;
-        batch.seq_id  [i][0] = 0; // Phase 2: single sequence
-        batch.logits  [i]    = 1; // all tokens are outputs
-    }
-}
-
-// read the per-token hidden states out of a middle/head stage after decode.
-// Requires cparams.embeddings = true and all tokens marked as outputs, so
-// llama_get_embeddings returns n_tokens * n_embd contiguous floats.
-bool read_hidden_out(llama_context * ctx, int32_t n_tokens, int32_t n_embd,
-                     std::vector<float> & out) {
-    const float * embd = llama_get_embeddings(ctx);
-    if (embd == nullptr) {
-        LOG_ERR("pipe: llama_get_embeddings returned null (embeddings ctx off?)\n");
-        return false;
-    }
-    out.assign(embd, embd + (size_t) n_tokens * n_embd);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // middle / tail serving loop: one FWD_REQ in flight, blocking
 
 int run_stage_server(stage_ctx & s, pipe_socket_ptr server,
@@ -304,18 +266,15 @@ int run_stage_server(stage_ctx & s, pipe_socket_ptr server,
         // F32 on the wire: interpret the hidden bytes directly as floats.
         const float * hidden = reinterpret_cast<const float *>(req.hidden.data());
 
-        llama_batch batch = llama_batch_init((int32_t) req.n_tokens, s.n_embd, 1);
-        fill_embd_batch(batch, req, s.n_embd, hidden);
-
-        if (llama_decode(s.ctx, batch) != 0) {
+        if (!llama_pipeline_stage_decode_hidden(
+                s.ctx, s.n_embd, hidden, (int32_t) req.n_tokens,
+                req.pos.data(), req.n_pos_per_embd)) {
             LOG_ERR("pipe: llama_decode failed on stage\n");
             pipe_send_error(*client, seq_id, PIPE_ERR_DECODE, "llama_decode failed on stage");
-            llama_batch_free(batch);
             running = false;
             rc = 1;
             break;
         }
-        llama_batch_free(batch);
 
         if (s.is_tail()) {
             // Only the LAST output row yields the next token. Sampling and
@@ -338,7 +297,7 @@ int run_stage_server(stage_ctx & s, pipe_socket_ptr server,
         } else {
             // middle: return the band's hidden output for every token
             std::vector<float> hidden_out;
-            if (!read_hidden_out(s.ctx, (int32_t) req.n_tokens, s.n_embd, hidden_out)) {
+            if (!llama_pipeline_stage_read_hidden(s.ctx, (int32_t) req.n_tokens, s.n_embd, hidden_out)) {
                 pipe_send_error(*client, seq_id, PIPE_ERR_DECODE, "no embedding output on middle");
                 running = false;
                 rc = 1;
@@ -413,7 +372,7 @@ int run_head_driver(stage_ctx & s, pipe_socket_ptr next,
 
         // 2) read t_embd at the band boundary (all tokens, F32)
         std::vector<float> hidden;
-        if (!read_hidden_out(s.ctx, n, s.n_embd, hidden)) {
+        if (!llama_pipeline_stage_read_hidden(s.ctx, n, s.n_embd, hidden)) {
             return false;
         }
 

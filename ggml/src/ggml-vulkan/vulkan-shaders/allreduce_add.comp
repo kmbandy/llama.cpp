@@ -1,0 +1,79 @@
+#version 450
+
+// Tensor-parallel AllReduce: accumulate the peer's contribution into the local
+// F32 tensor.  Two variants, selected by the WIRE_BF16 define:
+//
+//   * default   -- the peer's data arrived as F32 (binding 1 is float[]).
+//   * WIRE_BF16 -- the peer's data arrived as BF16 pairs packed into uint32
+//                  (binding 1 is uint[]); each invocation handles 2 elements.
+//
+// In the BF16 variant the local value is first rounded through BF16 before the
+// add.  The peer performs the identical rounding on its own copy, so both
+// devices compute bit-identical sums -- which matters because the reduced
+// tensor feeds the next layer independently on each device and any divergence
+// compounds across the ~128 reductions per token.
+//
+// Accumulation is always F32.  No subgroup ops, no integer dot, no 16-bit
+// storage: safe on RADV wave64 (Polaris / GCN) and RDNA alike.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// binding 0 is read-modify-write (the destination tensor).
+layout(binding = 0)          buffer D { float data_d[]; };
+#ifdef WIRE_BF16
+layout(binding = 1) readonly buffer A { uint  data_a[]; };
+#else
+layout(binding = 1) readonly buffer A { float data_a[]; };
+#endif
+
+layout(push_constant) uniform parameter {
+    uint ne;     // number of F32 elements to reduce
+    uint off_a;  // element offset into data_a (F32 units, or uint32 pairs when WIRE_BF16)
+    uint off_d;  // element offset into data_d (F32 units)
+} p;
+
+#ifdef WIRE_BF16
+uint f32_to_bf16(float f) {
+    const uint u = floatBitsToUint(f);
+    if ((u & 0x7F800000u) == 0x7F800000u && (u & 0x007FFFFFu) != 0u) {
+        return ((u >> 16) & 0xFFFFu) | 0x0040u;
+    }
+    return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0xFFFFu;
+}
+
+float bf16_to_f32(uint b) {
+    return uintBitsToFloat((b & 0xFFFFu) << 16);
+}
+
+// Round x through BF16 precision, staying in F32.
+float bf16_round(float x) {
+    return bf16_to_f32(f32_to_bf16(x));
+}
+#endif
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+
+#ifdef WIRE_BF16
+    const uint n_pairs = (p.ne + 1u) / 2u;
+    if (i >= n_pairs) {
+        return;
+    }
+
+    const uint packed = data_a[p.off_a + i];
+
+    const uint e0 = 2u * i;
+    data_d[p.off_d + e0] = bf16_round(data_d[p.off_d + e0]) + bf16_to_f32(packed & 0xFFFFu);
+
+    const uint e1 = e0 + 1u;
+    if (e1 < p.ne) {
+        data_d[p.off_d + e1] = bf16_round(data_d[p.off_d + e1]) + bf16_to_f32(packed >> 16);
+    }
+#else
+    if (i >= p.ne) {
+        return;
+    }
+
+    data_d[p.off_d + i] = data_d[p.off_d + i] + data_a[p.off_a + i];
+#endif
+}

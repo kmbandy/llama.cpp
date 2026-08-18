@@ -4,18 +4,70 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+// Smallest power of 2 >= n. Used to size/reduce the inter-warp partial-sum buffer.
+static constexpr __host__ __device__ int mmvf_next_pow2(int n) {
+    int p = 1;
+    while (p < n) {
+        p *= 2;
+    }
+    return p;
+}
+
+// Number of src0 rows handled by a single block.
+//
+// Rationale (mirrors the rows_per_cuda_block precedent in mmvq.cu): one block/one row issues
+// (1 + ncols_dst) loads per k-step to feed 2*ncols_dst FMAs, so for ncols_dst > 2 the kernel is
+// load-issue bound on hardware with a narrow LSU (Pascal, GCN: 1/4 of the FP32 issue width).
+// Handling R rows per block reuses each src1 (y) load across R dot products, so the per-k-step
+// load count becomes (R + ncols_dst) for 2*R*ncols_dst FMAs, i.e. loads/FMA drops by ~R.
+//
+// Register budget: the accumulators are R*ncols_dst floats. R = 4 caps that at 64 registers for
+// the widest instantiation (ncols_dst = 16); together with __launch_bounds__(block_size) (which
+// lifts nvcc's default "assume 1024 threads" 64-register cap) that stays spill-free.
+// ncols_dst <= 2 keeps R = 1: those shapes are already bandwidth- rather than issue-bound, and
+// R = 1 also keeps the ncols_dst == 1 token-generation path bit-for-bit and scheduling-identical.
+static constexpr __host__ __device__ int mmvf_rows_per_block(int ncols_dst) {
+    return ncols_dst <= 2 ? 1 : 4;
+}
+
+// Reduce np per-warp partial sums held in shared memory.
+// This reproduces, bit-for-bit, what warp_reduce_sum<warp_size>() computed in the previous
+// implementation: that was a descending xor-butterfly over warp_size lanes in which every lane
+// >= nwarps held an exact +0.0f. Adding zeros is exact, so the result equals the same balanced
+// binary tree over the np = next_pow2(nwarps) leading slots (slots nwarps..np-1 are zeroed).
+template <int np>
+static __device__ __forceinline__ float mmvf_reduce_partials(const float * buf) {
+    float v[np];
+#pragma unroll
+    for (int w = 0; w < np; ++w) {
+        v[w] = buf[w];
+    }
+#pragma unroll
+    for (int s = np/2; s > 0; s >>= 1) {
+#pragma unroll
+        for (int w = 0; w < s; ++w) {
+            v[w] += v[w + s];
+        }
+    }
+    return v[0];
+}
+
+template <typename T, typename type_acc, int ncols_dst, int nrows_per_block, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+__launch_bounds__(block_size, 1)
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-        const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
+        const int ncols2, const int nrows, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride) {
+    static_assert(!has_fusion         || nrows_per_block == 1, "fusion requires nrows_per_block == 1");
+    static_assert(!is_multi_token_id  || nrows_per_block == 1, "multi-token MUL_MAT_ID requires nrows_per_block == 1");
+
     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-    const int row         = blockIdx.x;
+    const int row         = nrows_per_block*blockIdx.x; // first src0 row of this block
     // for MUL_MAT_ID - blockIdx.y = n_expert_used, blockIdx.z = ncols_dst (tokens)
     const int channel_dst = blockIdx.y;
     const int tid         = threadIdx.x;
@@ -96,31 +148,63 @@ static __global__ void mul_mat_vec_f(
 
     const float2 * y2 = (const float2 *) y;
 
+    // Inter-warp reduction buffer: one np-wide slot per (column, row) output of this block.
+    // Only the first nwarps entries of a slot are written by the warps; the remaining
+    // (np - nwarps) are zeroed below so that mmvf_reduce_partials() reproduces the old
+    // warp_reduce_sum-over-warp_size summation order exactly.
+    constexpr int nwarps_blk = (block_size + warp_size - 1) / warp_size;
+    constexpr int np         = mmvf_next_pow2(nwarps_blk);
+    constexpr int nsums      = nrows_per_block*ncols_dst;
+
     extern __shared__ char data_mmv[];
-    float * buf_iw = (float *) data_mmv;
+    [[maybe_unused]] float * buf_iw = (float *) data_mmv;
     [[maybe_unused]] float * buf_iw_gate = nullptr;
     if constexpr (has_fusion) {
-        buf_iw_gate = (float *) (data_mmv + warp_size*sizeof(float));
+        buf_iw_gate = (float *) (data_mmv + nsums*np*sizeof(float));
     }
 
-    if (block_size > warp_size) {
-        if (tid < warp_size) {
-            buf_iw[tid] = 0.0f;
+    if constexpr (block_size > warp_size && np > nwarps_blk) {
+        // Zero only the padding slots. They are disjoint from what the warps write, so no
+        // barrier is needed here - the single __syncthreads() in the reduction below covers both.
+        constexpr int npad = np - nwarps_blk;
+        for (int t = tid; t < nsums*npad; t += block_size) {
+            const int idx = t / npad;
+            const int w   = nwarps_blk + t % npad;
+            buf_iw[idx*np + w] = 0.0f;
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    buf_iw_gate[tid] = 0.0f;
+                    buf_iw_gate[idx*np + w] = 0.0f;
                 }
             }
         }
-        __syncthreads();
     }
 
-    float sumf[ncols_dst] = {0.0f};
-    float sumf_gate[ncols_dst];
-    if constexpr (has_fusion) {
+    // Per-row offsets into x, in units of the packed 2-element type. Rows past the end of the
+    // matrix are clamped onto row 0 of this block: they read valid memory, and their (duplicate)
+    // results are simply not written back.
+    const int stride_row2 = stride_row / 2;
+    int x_off[nrows_per_block];
+#pragma unroll
+    for (int i = 0; i < nrows_per_block; ++i) {
+        x_off[i] = (row + i < nrows ? i : 0) * stride_row2;
+    }
+
+    float sumf[nrows_per_block][ncols_dst];
+#pragma unroll
+    for (int i = 0; i < nrows_per_block; ++i) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
-            sumf_gate[j] = 0.0f;
+            sumf[i][j] = 0.0f;
+        }
+    }
+    float sumf_gate[nrows_per_block][ncols_dst];
+    if constexpr (has_fusion) {
+#pragma unroll
+        for (int i = 0; i < nrows_per_block; ++i) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf_gate[i][j] = 0.0f;
+            }
         }
     }
 
@@ -134,7 +218,11 @@ static __global__ void mul_mat_vec_f(
         }
 
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-            const float2 tmpx = x2[col2];
+            float2 tmpx[nrows_per_block];
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+                tmpx[i] = x2[x_off[i] + col2];
+            }
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
                 if (use_gate) {
@@ -145,13 +233,16 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
-                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
-                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+#pragma unroll
+                for (int i = 0; i < nrows_per_block; ++i) {
+                    ggml_cuda_mad(sumf[i][j], tmpx[i].x, tmpy.x);
+                    ggml_cuda_mad(sumf[i][j], tmpx[i].y, tmpy.y);
+                }
 
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.x, tmpy.x);
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.y, tmpy.y);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.x, tmpy.x);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.y, tmpy.y);
                     }
                 }
             }
@@ -167,7 +258,11 @@ static __global__ void mul_mat_vec_f(
 
         if (std::is_same_v<type_acc, float>) {
             for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-                const float2 tmpx = __half22float2(x2[col2]);
+                float2 tmpx[nrows_per_block];
+#pragma unroll
+                for (int i = 0; i < nrows_per_block; ++i) {
+                    tmpx[i] = __half22float2(x2[x_off[i] + col2]);
+                }
                 float2 tmpx_gate = make_float2(0.0f, 0.0f);
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -177,24 +272,38 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float2 tmpy = y2[j*stride_col_y2 + col2];
-                    ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
-                    ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+#pragma unroll
+                    for (int i = 0; i < nrows_per_block; ++i) {
+                        ggml_cuda_mad(sumf[i][j], tmpx[i].x, tmpy.x);
+                        ggml_cuda_mad(sumf[i][j], tmpx[i].y, tmpy.y);
+                    }
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            ggml_cuda_mad(sumf_gate[j], tmpx_gate.x, tmpy.x);
-                            ggml_cuda_mad(sumf_gate[j], tmpx_gate.y, tmpy.y);
+                            ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.x, tmpy.x);
+                            ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.y, tmpy.y);
                         }
                     }
                 }
             }
         } else {
 #ifdef FP16_AVAILABLE
-            half2 sumh2[ncols_dst] = {{0.0f, 0.0f}};
+            half2 sumh2[nrows_per_block][ncols_dst];
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    sumh2[i][j] = make_half2(0.0f, 0.0f);
+                }
+            }
             half2 sumh2_gate[ncols_dst] = {{0.0f, 0.0f}};
 
             for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-                const half2 tmpx = x2[col2];
+                half2 tmpx[nrows_per_block];
+#pragma unroll
+                for (int i = 0; i < nrows_per_block; ++i) {
+                    tmpx[i] = x2[x_off[i] + col2];
+                }
                 half2 tmpx_gate = make_half2(0.0f, 0.0f);
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -204,26 +313,33 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
                     const float2 tmpy = y2[j*stride_col_y2 + col2];
-                    sumh2[j] += tmpx * make_half2(tmpy.x, tmpy.y);
+                    const half2  tmpy2 = make_half2(tmpy.x, tmpy.y);
+#pragma unroll
+                    for (int i = 0; i < nrows_per_block; ++i) {
+                        sumh2[i][j] += tmpx[i] * tmpy2;
+                    }
 
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            sumh2_gate[j] += tmpx_gate * make_half2(tmpy.x, tmpy.y);
+                            sumh2_gate[j] += tmpx_gate * tmpy2;
                         }
                     }
                 }
             }
 
 #pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-                sumf[j] = __low2float(sumh2[j]) + __high2float(sumh2[j]);
+            for (int i = 0; i < nrows_per_block; ++i) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    sumf[i][j] = __low2float(sumh2[i][j]) + __high2float(sumh2[i][j]);
+                }
             }
 
             if constexpr (has_fusion) {
                 if (use_gate) {
 #pragma unroll
                     for (int j = 0; j < ncols_dst; ++j) {
-                        sumf_gate[j] = __low2float(sumh2_gate[j]) + __high2float(sumh2_gate[j]);
+                        sumf_gate[0][j] = __low2float(sumh2_gate[j]) + __high2float(sumh2_gate[j]);
                     }
                 }
             }
@@ -242,7 +358,11 @@ static __global__ void mul_mat_vec_f(
             }
         }
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-            const int tmpx = x2[col2];
+            int tmpx[nrows_per_block];
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+                tmpx[i] = x2[x_off[i] + col2];
+            }
             int tmpx_gate = 0;
             if constexpr (has_fusion) {
                 if (use_gate) {
@@ -252,17 +372,20 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
-                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
-                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
-                ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
-                ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
+#pragma unroll
+                for (int i = 0; i < nrows_per_block; ++i) {
+                    const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[0]);
+                    const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[i])[1]);
+                    ggml_cuda_mad(sumf[i][j], tmpx0, tmpy.x);
+                    ggml_cuda_mad(sumf[i][j], tmpx1, tmpy.y);
+                }
 
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         const float tmpx0_gate = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx_gate)[0]);
                         const float tmpx1_gate = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx_gate)[1]);
-                        ggml_cuda_mad(sumf_gate[j], tmpx0_gate, tmpy.x);
-                        ggml_cuda_mad(sumf_gate[j], tmpx1_gate, tmpy.y);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx0_gate, tmpy.x);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx1_gate, tmpy.y);
                     }
                 }
             }
@@ -276,7 +399,11 @@ static __global__ void mul_mat_vec_f(
             }
         }
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-            const nv_bfloat162 tmpx = x2[col2];
+            nv_bfloat162 tmpx[nrows_per_block];
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+                tmpx[i] = x2[x_off[i] + col2];
+            }
             [[maybe_unused]] nv_bfloat162 tmpx_gate;
             if constexpr (has_fusion) {
                 if (use_gate) {
@@ -286,13 +413,16 @@ static __global__ void mul_mat_vec_f(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
                 const float2 tmpy = y2[j*stride_col_y2 + col2];
-                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
-                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+#pragma unroll
+                for (int i = 0; i < nrows_per_block; ++i) {
+                    ggml_cuda_mad(sumf[i][j], tmpx[i].x, tmpy.x);
+                    ggml_cuda_mad(sumf[i][j], tmpx[i].y, tmpy.y);
+                }
 
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.x, tmpy.x);
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.y, tmpy.y);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.x, tmpy.x);
+                        ggml_cuda_mad(sumf_gate[0][j], tmpx_gate.y, tmpy.y);
                     }
                 }
             }
@@ -303,85 +433,117 @@ static __global__ void mul_mat_vec_f(
     }
 
     ggml_cuda_pdl_lc();
-#pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
-        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
 
+    // Epilogue: apply optional bias/gate fusion to one output element.
+    auto finalize = [&](float value, float gate_value, int j) -> float {
         if constexpr (has_fusion) {
-            if (use_gate) {
-                sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
+            if (use_bias) {
+                value += x_bias[j*stride_col_dst + row];
             }
-        }
 
-        if (block_size > warp_size) {
-            buf_iw[tid/warp_size] = sumf[j];
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    buf_iw_gate[tid/warp_size] = sumf_gate[j];
+            if (use_gate) {
+                if (use_gate_bias) {
+                    gate_value += gate_bias[j*stride_col_dst + row];
+                }
+                switch (glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        value *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        value *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI: {
+                        value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                        break;
+                    }
+                    default:
+                        break;
                 }
             }
-            __syncthreads();
-            if (tid < warp_size) {
-                sumf[j] = buf_iw[tid];
-                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+        } else {
+            GGML_UNUSED(gate_value);
+            GGML_UNUSED(j);
+        }
+        return value;
+    };
+
+    if constexpr (block_size > warp_size) {
+        // All nsums = nrows_per_block*ncols_dst partial sums are staged at once, so the whole
+        // block reduction costs a single __syncthreads() instead of two per column.
+        const int lane    = tid % warp_size;
+        const int warp_id = tid / warp_size;
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+                const float v = warp_reduce_sum<warp_size>(sumf[i][j]);
+                if (lane == 0) {
+                    buf_iw[(j*nrows_per_block + i)*np + warp_id] = v;
+                }
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        sumf_gate[j] = buf_iw_gate[tid];
-                        sumf_gate[j] = warp_reduce_sum<warp_size>(sumf_gate[j]);
+                        const float vg = warp_reduce_sum<warp_size>(sumf_gate[i][j]);
+                        if (lane == 0) {
+                            buf_iw_gate[(j*nrows_per_block + i)*np + warp_id] = vg;
+                        }
                     }
                 }
             }
-
-            if (j < ncols_dst) {
-                __syncthreads();
-            }
-        }
-    }
-
-    if (tid >= ncols_dst) {
-        return;
-    }
-
-    float value = sumf[tid];
-
-    if constexpr (has_fusion) {
-        if (use_bias) {
-            value += x_bias[tid*stride_col_dst + row];
         }
 
-        if (use_gate) {
-            float gate_value = sumf_gate[tid];
-            if (use_gate_bias) {
-                gate_value += gate_bias[tid*stride_col_dst + row];
+        __syncthreads();
+
+        for (int t = tid; t < nsums; t += block_size) {
+            const int i = t % nrows_per_block;
+            const int j = t / nrows_per_block;
+            if (row + i >= nrows) {
+                continue;
             }
-            switch (glu_op) {
-                case GGML_GLU_OP_SWIGLU:
-                    value *= ggml_cuda_op_silu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_GEGLU:
-                    value *= ggml_cuda_op_gelu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_SWIGLU_OAI: {
-                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
-                    break;
+
+            float value      = mmvf_reduce_partials<np>(buf_iw + t*np);
+            float gate_value = 0.0f;
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    gate_value = mmvf_reduce_partials<np>(buf_iw_gate + t*np);
                 }
-                default:
-                    break;
+            }
+
+            dst[j*stride_col_dst + row + i] = finalize(value, gate_value, j);
+        }
+    } else {
+        // Single-warp block: every lane holds the full sum after the warp reduction, so the
+        // results are written straight out without touching shared memory (this keeps the
+        // ncols_dst == 1 token-generation path identical to before).
+        const int lane = tid % warp_size;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < nrows_per_block; ++i) {
+                const float value_r = warp_reduce_sum<warp_size>(sumf[i][j]);
+                float gate_value = 0.0f;
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        gate_value = warp_reduce_sum<warp_size>(sumf_gate[i][j]);
+                    }
+                }
+                const int t = j*nrows_per_block + i;
+                if (lane == t % warp_size && row + i < nrows) {
+                    dst[j*stride_col_dst + row + i] = finalize(value_r, gate_value, j);
+                }
             }
         }
     }
-
-    dst[tid*stride_col_dst + row] = value;
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
     }
 }
 
-template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
+template<typename T, typename type_acc, int ncols_dst, int nrows_per_block, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const int64_t ncols, const uint3 nchannels_y,
+        const int64_t ncols, const int64_t nrows, const uint3 nchannels_y,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -392,8 +554,8 @@ static void mul_mat_vec_f_switch_fusion(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
-            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
-                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, nrows_per_block, block_size, true, is_multi_token_id>, launch_params,
+                x, y, ids, fusion, dst, ncols, nrows, nchannels_y, stride_row, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
             return;
@@ -402,8 +564,8 @@ static void mul_mat_vec_f_switch_fusion(
 
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
-    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
-        x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+    ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, nrows_per_block, block_size, false, is_multi_token_id>, launch_params,
+        x, y, ids, fusion, dst, ncols, nrows, nchannels_y, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 
@@ -446,55 +608,61 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
-    const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
+    // Must mirror the kernel-side computation of nsums*np.
+    constexpr int nrows_per_block = mmvf_rows_per_block(ncols_dst);
+    const int nwarps_blk    = (int) ((block_size_best + warp_size - 1) / warp_size);
+    const int np            = mmvf_next_pow2(nwarps_blk);
+    const int nbuf          = nrows_per_block*ncols_dst*np;
+
+    const int nbytes_shared = nbuf*sizeof(float) + (has_fusion ? nbuf*sizeof(float) : 0);
+    const dim3 block_nums((nrows + nrows_per_block - 1) / nrows_per_block, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
     switch (block_size_best) {
         case   32: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 32, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case   64: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 64, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 64, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case   96: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 96, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 96, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  128: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 128, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 128, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  160: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 160, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 160, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  192: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 192, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 192, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  224: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 224, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 224, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
         case  256: {
-            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
-                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, nrows_per_block, 256, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nrows, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
         } break;
@@ -590,6 +758,62 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
             break;
         case 8:
             launch_mul_mat_vec_f_cuda<T, type_acc, 8>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 9:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 9>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 10:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 10>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 11:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 11>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 12:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 12>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 13:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 13>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 14:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 14>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 15:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 15>
+                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 nsamples_dst, ids_stride, stream);
+            break;
+        case 16:
+            launch_mul_mat_vec_f_cuda<T, type_acc, 16>
                 (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
                  stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
@@ -855,12 +1079,16 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 if (bf16_mma_hardware_available(cc)) {
                     return src0_small && ne11 <= 3;
                 }
-                return ne11 <= 8;
+                // Pre-Ampere NVIDIA (Pascal/Volta/Turing) has no BF16 tensor cores and cuBLAS
+                // has no fast BF16 GEMM arm here, so the batched GEMV - now that rows-per-block
+                // amortizes the src1 loads - wins up to the widest instantiation.
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (bf16_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                // Same reasoning as above for pre-RDNA3 / GCN.
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             }
             return ne11 <= 8;
         default:

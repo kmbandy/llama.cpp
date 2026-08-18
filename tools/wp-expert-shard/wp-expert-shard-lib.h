@@ -12,6 +12,7 @@ struct Options {
     std::filesystem::path              out_base;
     int                                expert_first = -1;
     int                                expert_last  = -1;
+    int                                slice_index  = -1;
     std::optional<std::pair<int, int>> layers;
     bool                               verify        = false;
     bool                               manifest_only = false;

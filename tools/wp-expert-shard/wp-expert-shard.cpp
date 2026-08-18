@@ -33,12 +33,16 @@ std::pair<int, int> parse_range(const std::string & text, const char * option) {
 
 void print_usage(const char * argv0) {
     std::cout << "usage:\n"
-              << "  " << argv0 << " --src-manifest PATH --out-base PATH --experts FIRST-LAST [options]\n\n"
+              << "  " << argv0 << " --src-manifest PATH --out-base PATH (--experts FIRST-LAST | --slice INDEX) [options]\n\n"
               << "options:\n"
               << "  --layers FIRST-LAST  emit only these source layers in this invocation\n"
+              << "  --slice INDEX         extract this format-v2 FFN slice for every expert\n"
               << "  --verify              re-read output and compare every member byte with the source\n"
               << "  --manifest-only       write the complete manifest and sidecars without emitting blob files\n"
               << "  -h, --help            show this help\n\n"
+              << "--slice consumes a format-v2 --expert-slices source set and emits an\n"
+              << "expert-slice manifest. It copies each contiguous (expert, slice) range from\n"
+              << "the source blob and --verify compares those ranges with that source blob.\n"
               << "Data emission writes blobs and sidecars only. Run --manifest-only separately and\n"
               << "copy that manifest after all per-layer files have reached their destination.\n"
               << "Existing output files are never overwritten.\n";
@@ -49,6 +53,7 @@ wp_expert_shard::Options parse_cli(int argc, char ** argv) {
     bool                     have_src     = false;
     bool                     have_out     = false;
     bool                     have_experts = false;
+    bool                     have_slice   = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -80,6 +85,16 @@ wp_expert_shard::Options parse_cli(int argc, char ** argv) {
                 throw std::invalid_argument("--layers requires FIRST-LAST");
             }
             options.layers = parse_range(argv[i], "--layers");
+        } else if (arg == "--slice") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--slice requires an index");
+            }
+            const std::string text = argv[i];
+            const auto result = std::from_chars(text.data(), text.data() + text.size(), options.slice_index);
+            if (result.ec != std::errc() || result.ptr != text.data() + text.size() || options.slice_index < 0) {
+                throw std::invalid_argument("--slice requires a non-negative integer");
+            }
+            have_slice = true;
         } else if (arg == "--verify") {
             options.verify = true;
         } else if (arg == "--manifest-only") {
@@ -89,8 +104,8 @@ wp_expert_shard::Options parse_cli(int argc, char ** argv) {
         }
     }
 
-    if (!have_src || !have_out || !have_experts) {
-        throw std::invalid_argument("--src-manifest, --out-base, and --experts are required");
+    if (!have_src || !have_out || have_experts == have_slice) {
+        throw std::invalid_argument("--src-manifest, --out-base, and exactly one of --experts or --slice are required");
     }
     if (options.manifest_only && options.layers.has_value()) {
         throw std::invalid_argument("--layers is not valid with --manifest-only");

@@ -47,6 +47,179 @@ void append_layer(ShardPlan & shard, const LayerGroups & layer) {
 
 }  // namespace
 
+namespace {
+
+int64_t parse_positive_i64(const std::string & item, const char * what) {
+    if (item.empty()) {
+        throw std::invalid_argument(std::string("empty ") + what + " in expert slice spec");
+    }
+    size_t    used  = 0;
+    long long value = 0;
+    try {
+        value = std::stoll(item, &used, 10);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string("invalid ") + what + " in expert slice spec: " + item);
+    }
+    if (used != item.size() || value <= 0) {
+        throw std::invalid_argument(std::string("invalid ") + what + " in expert slice spec: " + item);
+    }
+    return static_cast<int64_t>(value);
+}
+
+std::vector<std::string> split_on(const std::string & text, char sep) {
+    std::vector<std::string> items;
+    size_t                   start = 0;
+    while (true) {
+        const size_t pos = text.find(sep, start);
+        if (pos == std::string::npos) {
+            items.push_back(text.substr(start));
+            return items;
+        }
+        items.push_back(text.substr(start, pos - start));
+        start = pos + 1;
+    }
+}
+
+}  // namespace
+
+SliceSpec parse_slice_spec(const std::string & text) {
+    if (text.empty()) {
+        throw std::invalid_argument("expert slice spec cannot be empty");
+    }
+
+    const bool has_colon = text.find(':') != std::string::npos;
+    const bool has_comma = text.find(',') != std::string::npos;
+    if (has_colon && has_comma) {
+        throw std::invalid_argument("expert slice spec mixes ':' (ratios) and ',' (explicit widths): " + text);
+    }
+
+    SliceSpec spec;
+    spec.text = text;
+
+    const std::vector<std::string> items = split_on(text, has_colon ? ':' : ',');
+    if (items.size() < 2) {
+        // A one-way split is a v1 repack with extra steps, and almost certainly a typo.
+        throw std::invalid_argument("expert slice spec needs at least two slices: " + text);
+    }
+
+    if (has_colon) {
+        spec.from_ratios = true;
+        for (const std::string & item : items) {
+            spec.ratios.push_back(parse_positive_i64(item, "ratio"));
+        }
+    } else {
+        for (const std::string & item : items) {
+            spec.widths.push_back(parse_positive_i64(item, "width"));
+        }
+    }
+    return spec;
+}
+
+void resolve_slice_widths(SliceSpec & spec, int64_t n_ff, int64_t blck) {
+    if (blck <= 0) {
+        throw std::invalid_argument("expert tensor quant block size must be positive");
+    }
+    if (n_ff <= 0 || n_ff % blck != 0) {
+        // Nothing downstream can fix this: no slicing of this tensor lands on
+        // block boundaries, so refuse rather than emit re-cut blocks.
+        throw std::invalid_argument("FFN intermediate size " + std::to_string(n_ff) +
+                                    " is not a multiple of the quant block size " + std::to_string(blck));
+    }
+
+    const int64_t total_units = n_ff / blck;
+
+    if (spec.from_ratios) {
+        const size_t n = spec.ratios.size();
+        if (static_cast<int64_t>(n) > total_units) {
+            throw std::invalid_argument("expert slice spec asks for " + std::to_string(n) + " slices but only " +
+                                        std::to_string(total_units) + " quant block(s) are available to split");
+        }
+
+        int64_t ratio_sum = 0;
+        for (const int64_t r : spec.ratios) {
+            if (r > std::numeric_limits<int64_t>::max() - ratio_sum) {
+                throw std::overflow_error("expert slice ratios overflow");
+            }
+            ratio_sum += r;
+        }
+
+        // Largest-remainder apportionment in units of one quant block, with a
+        // floor of one block per slice. Deterministic, and the assigned units
+        // always sum to total_units exactly, so the widths always cover n_ff.
+        std::vector<int64_t> units(n, 0);
+        std::vector<int64_t> remainder(n, 0);
+        int64_t              assigned = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t scaled = total_units * spec.ratios[i];
+            units[i]             = std::max<int64_t>(1, scaled / ratio_sum);
+            remainder[i]         = scaled % ratio_sum;
+            assigned += units[i];
+        }
+        if (assigned > total_units) {
+            throw std::invalid_argument("expert slice ratios cannot be met: the one-block floor for " +
+                                        std::to_string(n) + " slices already exceeds " + std::to_string(total_units) +
+                                        " block(s)");
+        }
+
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) {
+            order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(),
+                         [&](size_t a, size_t b) { return remainder[a] > remainder[b]; });
+        for (size_t k = 0; assigned < total_units; ++k) {
+            units[order[k % n]] += 1;
+            ++assigned;
+        }
+
+        spec.widths.assign(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            spec.widths[i] = units[i] * blck;
+        }
+    }
+
+    if (spec.widths.size() < 2) {
+        throw std::invalid_argument("expert slice spec needs at least two slices");
+    }
+
+    int64_t sum = 0;
+    for (size_t i = 0; i < spec.widths.size(); ++i) {
+        const int64_t w = spec.widths[i];
+        if (w <= 0) {
+            throw std::invalid_argument("expert slice width must be positive (slice " + std::to_string(i) + ")");
+        }
+        if (w % blck != 0) {
+            throw std::invalid_argument("expert slice width " + std::to_string(w) + " (slice " + std::to_string(i) +
+                                        ") is not a multiple of the quant block size " + std::to_string(blck) +
+                                        "; a slice boundary inside a quant block would cut the block");
+        }
+        if (w > n_ff - sum) {
+            throw std::invalid_argument("expert slice widths exceed the FFN intermediate size " +
+                                        std::to_string(n_ff));
+        }
+        sum += w;
+    }
+    if (sum != n_ff) {
+        throw std::invalid_argument("expert slice widths sum to " + std::to_string(sum) + " but the FFN intermediate "
+                                    "size is " + std::to_string(n_ff) + "; every element must be covered exactly once");
+    }
+}
+
+std::vector<SliceRange> slice_ranges(const std::vector<int64_t> & widths) {
+    std::vector<SliceRange> ranges;
+    ranges.reserve(widths.size());
+    int64_t cursor = 0;
+    for (size_t i = 0; i < widths.size(); ++i) {
+        SliceRange range;
+        range.index = static_cast<int>(i);
+        range.first = cursor;
+        range.last  = cursor + widths[i];
+        cursor      = range.last;
+        ranges.push_back(range);
+    }
+    return ranges;
+}
+
 std::vector<ExpertGroup> build_expert_groups(const wp::PageCatalog & catalog) {
     std::map<std::pair<int, int>, ExpertGroup> grouped;
 

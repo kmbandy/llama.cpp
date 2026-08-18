@@ -90,12 +90,45 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // MAD-LAB logits-on-head: project already-output_norm'd hidden states
+    // ([n_tokens][n_embd], F32, row-major) through the LM head straight into this
+    // context's logits buffer. For a dense-segment HEAD whose band graph stops
+    // before the LM head but which still holds output.weight. See the definition.
+    // `out` (optional) redirects the result into a caller buffer instead of this
+    // context's logits, leaving this context's output state untouched.
+    bool output_project(const float * hidden, int32_t n_tokens, float * out = nullptr);
+
+    // MAD-LAB speculative services. A sidecar draft (DFlash/DSpark) ships neither a
+    // token_embd nor an output.weight and used to borrow the target's through
+    // ctx_other. That is impossible when the target is Meta-split, so the two borrowed
+    // ops are performed HERE, on the context that owns the tensors, and the results are
+    // handed to the draft as plain buffers. See the definitions.
+
+    // gather token_embd rows on THIS context: out is [n_tokens][n_embd] F32 row-major.
+    bool token_embed_gather(const llama_token * tokens, int32_t n_tokens, float * out);
+
+    // replay the DSpark Markov/confidence head on THIS (draft) context, over base
+    // logits projected elsewhere. base is [n_tokens][n_vocab] row-major, hidden is
+    // [n_tokens][n_embd]; the biased logits land in this context's own logits buffer
+    // and out_conf ([n_tokens], may be null) receives the acceptance confidences.
+    bool dspark_markov_head(const float * base,
+                            const llama_token * tokens,
+                            const float * hidden,
+                            int32_t n_tokens,
+                            int32_t n_blocks,
+                            float * out_conf);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+
+    // dense-segment head: the nextn buffer is filled from the tail segment's
+    // wire sideband instead of the local graph, which never sets the width.
+    // The wire owner declares it here so *_ith accessors stride correctly.
+    void set_embeddings_nextn_width(uint32_t w) { n_embd_nextn = w; }
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -123,7 +156,17 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_no_output_head(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+
+    // MAD-LAB interior taps: reserve the host buffer for a layer whose rows this
+    // context cannot compute (it lies outside this process's pipeline band) and will be
+    // handed over the wire instead. Unlike set_embeddings_layer_inp() this does NOT arm
+    // the graph-output path, which would assert on the missing tensor.
+    void set_embeddings_layer_inp_external(uint32_t lid, bool enable);
+    bool is_embeddings_layer_inp_external(uint32_t lid) const;
+    // Install [n_tokens][n_embd] F32 row-major rows, in batch order, for an armed layer.
+    bool set_layer_inp_data(uint32_t lid, const float * data, int32_t n_tokens);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -357,6 +400,11 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // MAD-LAB logits-on-head: dedicated scheduler for output_project(). Kept
+    // separate from `sched` so the decode path's graph reuse is never reset.
+    // Created lazily -- nothing allocates it on a non-segment head.
+    ggml_backend_sched_ptr sched_proj;
 
     bool sched_need_reserve = true;
 

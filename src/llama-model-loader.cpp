@@ -1383,7 +1383,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
-void llama_model_loader::done_getting_tensors(bool partial) const {
+void llama_model_loader::done_getting_tensors(bool partial, bool pipeline_band) {
+    is_pipeline_band = pipeline_band;
+
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
@@ -1506,11 +1508,16 @@ bool llama_model_loader::load_all_data(
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
+    std::vector<bool> events_recorded;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
+    const bool sync_load = is_pipeline_band && [] {
+        const char * env = getenv("WP_SEGMENT_SYNC_LOAD");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
 
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if (use_mmap || check_tensors || sync_load) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1571,6 +1578,7 @@ bool llama_model_loader::load_all_data(
             }
 
             events.emplace_back(event);
+            events_recorded.push_back(false);
         }
 
         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
@@ -1583,11 +1591,19 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    const bool use_event_fences = !upload_backend || !is_pipeline_band ||
+        std::strncmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))), "ROCm", 4) != 0;
+
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
+        if (!use_event_fences) {
+            LLAMA_LOG_INFO("%s: using stream synchronization for ROCm pipeline-band staging-buffer reuse\n", __func__);
+        }
+    } else if (sync_load) {
+        LLAMA_LOG_INFO("%s: WP_SEGMENT_SYNC_LOAD=1, using synchronous uploads for this partial model\n", __func__);
     }
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1693,8 +1709,15 @@ bool llama_model_loader::load_all_data(
                         // Align the destination pointer within the pinned buffer
                         uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
-                        // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
+                        // Wait for the previous upload before reusing this buffer.
+                        if (events_recorded[buffer_idx]) {
+                            if (use_event_fences) {
+                                ggml_backend_event_synchronize(events[buffer_idx]);
+                            } else {
+                                ggml_backend_synchronize(upload_backend);
+                                std::fill(events_recorded.begin(), events_recorded.end(), false);
+                            }
+                        }
 
                         // Read aligned chunk from file
                         file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
@@ -1718,6 +1741,7 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_tensor_set_async(upload_backend, cur,
                                                       reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
                         ggml_backend_event_record(events[buffer_idx], upload_backend);
+                        events_recorded[buffer_idx] = true;
 
                         data_read += data_to_copy;
                         bytes_read += read_size;
@@ -1741,9 +1765,14 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
+    if (!use_event_fences && std::any_of(events_recorded.begin(), events_recorded.end(), [](bool recorded) { return recorded; })) {
+        ggml_backend_synchronize(upload_backend);
+    }
+    for (size_t i = 0; i < events.size(); ++i) {
+        if (use_event_fences && events_recorded[i]) {
+            ggml_backend_event_synchronize(events[i]);
+        }
+        ggml_backend_event_free(events[i]);
     }
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);

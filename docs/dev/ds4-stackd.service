@@ -1,0 +1,18 @@
+[Unit]
+Description=DS4 elastic expert-worker supervisor (does not manage llama-router)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The router-spawned spine inherits the router's environment.  The preset INI
+# only maps recognized CLI options (no per-child env mapping), so before using
+# this unit add Environment=WP_DISPATCH_CONNECT_RETRY_S=180 to
+# llama-router.service, then separately daemon-reload/restart the router.
+# Do NOT put that variable here: ds4-stackd is not the spine's parent.
+ExecStart=/usr/bin/bash /home/kmbandy/GitHub/llama.cpp/docs/dev/ds4-stackd.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

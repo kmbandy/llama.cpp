@@ -95,6 +95,82 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// MAD-LAB logits-on-head. Stop the decode graph after output_norm and never build
+// the LM head, so llama_get_logits() is not produced but llama_get_embeddings()
+// returns the post-output_norm hidden state. Set on a dense-segment TAIL worker,
+// which then ships n_embd floats per token instead of n_vocab and lets the head do
+// the projection with llama_output_project(). Changes the graph shape, so it forces
+// a graph reserve -- call it once, before the first decode.
+LLAMA_API void llama_set_no_output_head(struct llama_context * ctx, bool value);
+
+// MAD-LAB logits-on-head. Project `hidden` ([n_tokens][n_embd] F32, row-major,
+// ALREADY passed through output_norm) through this context's LM head and write the
+// result into the context's logits buffer, exactly where a local decode would have
+// put it -- llama_get_logits()/llama_get_logits_ith() then behave as usual.
+//
+// For a dense-segment HEAD: its band graph stops mid-model and never builds the LM
+// head, but the head stage GGUF still carries output.weight. Returns false (and
+// logs) if the model has no LM head, if a LoRA adapter is attached, or if the
+// logits buffer is too small for n_tokens.
+LLAMA_API bool llama_output_project(struct llama_context * ctx,
+                                    const float * hidden,
+                                    int32_t n_tokens);
+
+// As llama_output_project(), but writes the result into `out` ([n_tokens][n_vocab] F32
+// row-major) and leaves this context's logits buffer and pending output state untouched.
+// Used to project a DRAFT hidden state through the TARGET's head without disturbing the
+// verification logits the speculative loop is about to read.
+LLAMA_API bool llama_output_project_to(struct llama_context * ctx,
+                                       const float * hidden,
+                                       int32_t n_tokens,
+                                       float * out);
+
+// True if this model carries its own LM head (output.weight). False for a sidecar
+// speculative draft, which is the signal that the services path below is required.
+LLAMA_API bool llama_model_has_output_head(const struct llama_model * model);
+
+// The INCLUSIVE layer band this process actually builds. For a cross-machine dense
+// pipeline segment that is the band it owns; otherwise the whole model. Callers that
+// need a specific layer's activations must check it lies inside this range -- a layer
+// outside it is computed on a different segment and is simply not available here.
+LLAMA_API void llama_model_pipeline_band(const struct llama_model * model,
+                                         int32_t * first,
+                                         int32_t * last);
+
+// MAD-LAB speculative services for a SIDECAR draft (a separate DFlash/DSpark GGUF
+// passed with -md). Such a sidecar ships neither token_embd nor output.weight: it is
+// trained against the target's embedding space and used to reach into the target's
+// tensors through ctx_other. That is impossible once the target is Meta-split
+// (-sm tensor), because those tensors are pre-allocated in a buffer type the draft's
+// scheduler does not own. So the two borrowed ops are performed on the context that
+// owns the tensors and the results are handed across as plain host buffers.
+
+// Gather token_embd rows on THIS context. `out` is [n_tokens][n_embd] F32 row-major.
+// Call on the TARGET; feed the result to the draft as the embd half of a batch that
+// also carries the token ids (the DSpark Markov head conditions on the ids).
+LLAMA_API bool llama_token_embed_gather(struct llama_context * ctx,
+                                        const llama_token * tokens,
+                                        int32_t n_tokens,
+                                        float * out);
+
+// Replay the DSpark Markov/confidence head on THIS context, over base logits that were
+// projected elsewhere. Call on the DRAFT, whose model owns markov_w1/w2 and conf_proj.
+// `base` is [n_tokens][n_vocab] row-major, `hidden` is [n_tokens][n_embd] (the
+// post-output_norm state the draft graph exported), `out_conf` is [n_tokens] and may be
+// NULL. n_blocks is the number of speculative blocks in the batch (ubatch n_seqs_unq);
+// n_tokens must be a multiple of it.
+//
+// The biased logits are written into this context's own logits buffer, exactly where a
+// local decode would have put them, so llama_get_logits_ith() and the samplers behave
+// as usual and no sampling code needs to know the head ran out-of-graph.
+LLAMA_API bool llama_dspark_markov_head(struct llama_context * ctx,
+                                        const float * base,
+                                        const llama_token * tokens,
+                                        const float * hidden,
+                                        int32_t n_tokens,
+                                        int32_t n_blocks,
+                                        float * out_conf);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
@@ -113,6 +189,26 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+// MAD-LAB INTERIOR TAPS. Arm a layer whose input hidden state this process cannot
+// compute -- it lies outside this process's pipeline band -- and will instead be handed
+// over the dense-segment wire by the segment that owns it. This reserves the same host
+// buffer llama_get_embeddings_layer_inp() reads, so every existing reader (notably the
+// DFlash/DSpark draft's target-feature gather) works unchanged and cannot tell the
+// difference. It does NOT arm the graph-output path: that asserts the layer's tensor
+// exists, which is exactly what a banded graph cannot provide.
+LLAMA_API void llama_set_embeddings_layer_inp_external(struct llama_context * ctx, uint32_t lid, bool value);
+
+// True if `lid` was armed by llama_set_embeddings_layer_inp_external(). Lets a caller
+// that is about to require a tap distinguish "outside my band and therefore impossible"
+// from "outside my band but supplied by a peer".
+LLAMA_API bool llama_get_embeddings_layer_inp_external(const struct llama_context * ctx, uint32_t lid);
+
+// Install [n_tokens][n_embd] F32 row-major rows, in BATCH order, for an armed layer.
+// Call once per forward, after the remote segments have returned and before anything
+// reads the tap. Fails if the layer was not armed or the buffer is too small.
+LLAMA_API bool llama_set_layer_inp_data(struct llama_context * ctx, uint32_t lid,
+                                        const float * data, int32_t n_tokens);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
@@ -181,3 +277,20 @@ LLAMA_API bool llama_wp_draft_oracle_should_run(struct llama_context * ctx);
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// MAD-LAB / WP_DSPARK_DEBUG: read-only census of one sequence's resident KV cells.
+//
+// Diagnostic only. The public memory API exposes seq_pos_min/seq_pos_max, which cannot
+// tell "one clean cell per position" apart from "several cells stacked on one position".
+// out_n_dup is the load-bearing number: resident cells minus distinct positions, i.e.
+// how many duplicate cells this sequence is carrying. out_n_at_or_above counts cells at
+// pos >= pos_thresh (pass the committed prefix to isolate leftover draft-block cells).
+// Returns false if mem is not a unified KV cache; all out params are optional.
+LLAMA_API bool llama_dspark_kv_census(llama_memory_t mem,
+                                      llama_seq_id   seq_id,
+                                      llama_pos      pos_thresh,
+                                      int32_t      * out_n_cells,
+                                      int32_t      * out_n_at_or_above,
+                                      int32_t      * out_n_dup,
+                                      llama_pos    * out_pos_min,
+                                      llama_pos    * out_pos_max);

@@ -2843,7 +2843,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "comma-separated list of RPC servers (host:port)",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
-                GGML_UNUSED(params);
+                params.rpc_enabled = true;
             }
         ).set_env("LLAMA_ARG_RPC"));
     }
@@ -2978,6 +2978,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_dispatch = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_DISPATCH"));
+    add_opt(common_arg(
+        {"--segment-manifest"}, "PATH",
+        "serve a dense pipeline manifest from its first segment (single server slot only)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.segment_manifest = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SEGMENT_MANIFEST"));
     add_opt(common_arg(
         {"--weight-paging"},
         "enable NVMe->VRAM demand paging for model weights (allows models larger than VRAM); forces --no-mmap",

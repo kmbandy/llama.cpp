@@ -1,0 +1,51 @@
+#version 450
+
+// Tensor-parallel AllReduce: pack a contiguous F32 range into BF16 pairs.
+//
+// Used by the Vulkan 2-device AllReduce (ggml-vulkan-allreduce.hpp) to halve
+// the number of bytes pushed across PCIe into the shared host staging buffer.
+//
+// Invocation i handles the element pair (2i, 2i+1) and writes one uint32 that
+// packs element 2i into the low 16 bits and element 2i+1 into the high 16.
+//
+// Deliberately subgroup-size agnostic (no subgroup ops, no integer-dot, no
+// 16-bit storage): this has to run unchanged on RADV wave64 parts (Polaris /
+// GCN) as well as RDNA.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer D { uint  data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint ne;     // number of F32 elements to pack
+    uint off_a;  // element offset into data_a (F32 units)
+    uint off_d;  // element offset into data_d (uint32 units)
+} p;
+
+// Round-to-nearest-even F32 -> BF16, returned in the low 16 bits.
+uint f32_to_bf16(float f) {
+    const uint u = floatBitsToUint(f);
+    // NaN: keep it a NaN after truncation instead of collapsing to Inf.
+    if ((u & 0x7F800000u) == 0x7F800000u && (u & 0x007FFFFFu) != 0u) {
+        return ((u >> 16) & 0xFFFFu) | 0x0040u;
+    }
+    return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0xFFFFu;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+
+    const uint n_pairs = (p.ne + 1u) / 2u;
+    if (i >= n_pairs) {
+        return;
+    }
+
+    const uint e0 = 2u * i;
+    const uint e1 = e0 + 1u;
+
+    const uint lo = f32_to_bf16(data_a[p.off_a + e0]);
+    const uint hi = (e1 < p.ne) ? f32_to_bf16(data_a[p.off_a + e1]) : 0u;
+
+    data_d[p.off_d + i] = lo | (hi << 16);
+}

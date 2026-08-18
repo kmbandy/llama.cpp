@@ -8,6 +8,9 @@
 #if USE_SUBGROUP_ADD
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #endif
+#if USE_SUBGROUP_SHUFFLE
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 // Caller guarantees valid spec constants: S_V % COLS_PER_WG == 0 and S_V % LANES_PER_COLUMN == 0,
 // so no bounds checking is needed.
@@ -42,28 +45,49 @@ layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 
-#if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
-shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+// Two independent sums are reduced together (see the pipelining comment in main()), so the
+// reduction operates on a 2-vector. Both components keep the same butterfly order the
+// scalar reduction used, so results are unchanged.
+#define REDUCE_TYPE vec2
 
-// This does a reduction across groups of LANES_PER_COLUMN
-FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
+#if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED && !USE_SUBGROUP_SHUFFLE
+shared REDUCE_TYPE temp[SUBGROUP_SIZE];
+
+// This does a reduction across groups of LANES_PER_COLUMN.
+// Last-resort path: needs LDS round trips and full workgroup barriers. Every device that
+// exposes VK_KHR_shader_subgroup_shuffle (which includes all GCN/RDNA drivers) uses the
+// barrier-free variant below instead.
+REDUCE_TYPE reduce_add_shmem(REDUCE_TYPE partial) {
     const uint lane = gl_SubgroupInvocationID;
     temp[lane] = partial;
     barrier();
-    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
-        FLOAT_TYPE other = temp[lane ^ s];
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0u; s >>= 1u) {
+        REDUCE_TYPE other = temp[lane ^ s];
         barrier();
         temp[lane] += other;
         barrier();
     }
-    const FLOAT_TYPE result = temp[lane];
+    const REDUCE_TYPE result = temp[lane];
     barrier();
     return result;
 }
 #endif
 
+#if USE_SUBGROUP_SHUFFLE
+// Barrier-free butterfly over LANES_PER_COLUMN lanes. LANES_PER_COLUMN is a power of two
+// that divides the subgroup size and the lanes of one column are contiguous, so XOR-ing by
+// s < LANES_PER_COLUMN never leaves the column group. This is subgroup-size agnostic: it is
+// correct for wave32 and wave64 alike and never assumes a shuffle width of 32.
+REDUCE_TYPE reduce_add_shuffle(REDUCE_TYPE partial) {
+    [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0u; s >>= 1u) {
+        partial += subgroupShuffleXor(partial, s);
+    }
+    return partial;
+}
+#endif
+
 // clusterSize for subgroupClusteredAdd must be a compile-time constant; branch on spec constant
-FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
+REDUCE_TYPE reduce_partial(REDUCE_TYPE partial) {
     switch (LANES_PER_COLUMN) {
         case 1u:
             return partial;
@@ -86,6 +110,8 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
         default:
 #if USE_SUBGROUP_ADD
             return subgroupAdd(partial);
+#elif USE_SUBGROUP_SHUFFLE
+            return reduce_add_shuffle(partial);
 #else
             return reduce_add_shmem(partial);
 #endif
@@ -116,59 +142,89 @@ void main() {
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
-    uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
+    const uint attn_base = (seq_id * n_tokens * H + head_id) * S_V;
 
-    for (uint t = 0; t < n_tokens; t++) {
-        const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const uint k_off = q_off;
-        const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
-        const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+    // Software pipeline over the token loop.
+    //
+    // The recurrence is serial in t and its critical path runs
+    //   s_shard -> kv partial -> CROSS-LANE REDUCTION -> delta_col -> s_shard'
+    // The previous version issued *two* cross-lane reductions per token (kv and attn). Only
+    // the kv one is a real dependency for the next token, but both sat in the same issue
+    // stream, so on devices where cross-lane ops are expensive (GCN ds_swizzle / DPP, and
+    // worse, the LDS+barrier fallback) each token paid roughly two reduction latencies.
+    //
+    // Now token t's inputs are loaded and its kv partial formed *before* the reduction, and
+    // token t-1's attention partial rides along in the same butterfly as the second vector
+    // component. Both component sums keep their original operand order, so the results are
+    // unchanged. Loading token t before the reduction also lets its global loads overlap the
+    // cross-lane traffic.
+    //
+    // The loop runs one extra iteration (t == n_tokens) to drain the last attention
+    // reduction. n_tokens is workgroup-uniform, so every invocation still reaches every
+    // barrier in the shared-memory fallback.
+    FLOAT_TYPE k_reg[ROWS_PER_LANE];
+    FLOAT_TYPE q_reg[ROWS_PER_LANE];
+    FLOAT_TYPE g_exp[ROWS_PER_LANE];
+    FLOAT_TYPE beta_val = FLOAT_TYPE(0);
+    FLOAT_TYPE v_val    = FLOAT_TYPE(0);
+    FLOAT_TYPE attn_partial = FLOAT_TYPE(0);
 
-        FLOAT_TYPE k_reg[ROWS_PER_LANE];
-        FLOAT_TYPE q_reg[ROWS_PER_LANE];
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            const uint i = r * LANES_PER_COLUMN + lane;
-            k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
-            q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
-        }
+    for (uint t = 0; t <= n_tokens; t++) {
+        FLOAT_TYPE kv_shard = FLOAT_TYPE(0);
 
-        FLOAT_TYPE g_exp[ROWS_PER_LANE];
-        if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
-            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                g_exp[r] = g_val;
-            }
-        } else {
-            const uint g_base = gb_off * S_V;
+        if (t < n_tokens) {
+            const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const uint k_off = q_off;
+            const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+            const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
+
+            beta_val = FLOAT_TYPE(data_beta[gb_off]);
+            v_val    = FLOAT_TYPE(data_v[v_off + col]);
+
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 const uint i = r * LANES_PER_COLUMN + lane;
-                g_exp[r] = exp(FLOAT_TYPE(data_g[g_base + i]));
+                k_reg[r] = FLOAT_TYPE(data_k[k_off + i]);
+                q_reg[r] = FLOAT_TYPE(data_q[q_off + i]);
+            }
+
+            if (KDA == 0) {
+                const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    g_exp[r] = g_val;
+                }
+            } else {
+                const uint g_base = gb_off * S_V;
+                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                    const uint i = r * LANES_PER_COLUMN + lane;
+                    g_exp[r] = exp(FLOAT_TYPE(data_g[g_base + i]));
+                }
+            }
+
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
             }
         }
 
-        const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
+        // one fused cross-lane reduction: kv[t] in .x, attn[t-1] in .y
+        const REDUCE_TYPE red = reduce_partial(REDUCE_TYPE(kv_shard, attn_partial));
 
-        FLOAT_TYPE kv_shard = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+        // token t-1's attention output (at t == 0 this reduces a zero, which is discarded)
+        if (t > 0u && lane == 0u) {
+            data_dst[attn_base + (t - 1u) * S_V * H + col] = red.y * scale;
         }
-        FLOAT_TYPE kv_col = reduce_partial(kv_shard);
 
-        FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
+        if (t == n_tokens) {
+            break;
+        }
 
-        FLOAT_TYPE attn_partial = 0.0;
+        const FLOAT_TYPE delta_col = (v_val - FLOAT_TYPE(red.x)) * beta_val;
+
+        FLOAT_TYPE ap = FLOAT_TYPE(0);
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             s_shard[r] = g_exp[r] * s_shard[r] + k_reg[r] * delta_col;
-            attn_partial += s_shard[r] * q_reg[r];
+            ap += s_shard[r] * q_reg[r];
         }
-        FLOAT_TYPE attn_col = reduce_partial(attn_partial);
-
-        if (lane == 0) {
-            data_dst[attn_off + col] = attn_col * scale;
-        }
-
-        attn_off += S_V * H;
+        attn_partial = ap;
 
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);

@@ -30,6 +30,7 @@ namespace {
 constexpr const char * INDEX_FORMAT     = "llama.cpp.weight-pager.expert-shard-index";
 constexpr const char * MANIFEST_FORMAT  = "llama.cpp.weight-pager.expert-shard-manifest";
 constexpr int          FORMAT_VERSION   = 1;
+constexpr int          SLICED_VERSION   = 2;
 constexpr size_t       COPY_BUFFER_SIZE = 8u * 1024u * 1024u;
 
 struct ShardPaths {
@@ -49,6 +50,10 @@ struct PlannedShard {
 struct Plan {
     fs::path                  out_base;
     json                      source_manifest;
+    bool                      sliced = false;
+    json                      expert_slicing;
+    int                       expert_first = -1;
+    int                       expert_last  = -1;
     std::vector<PlannedShard> shards;
 };
 
@@ -86,9 +91,9 @@ const json & get_array(const json & value, const char * key, const fs::path & pa
     return *it;
 }
 
-void check_format(const json & value, const char * format, const fs::path & path) {
+void check_format(const json & value, const char * format, const fs::path & path, int version = FORMAT_VERSION) {
     if (get_value<std::string>(value, "format", path) != format ||
-        get_value<int>(value, "version", path) != FORMAT_VERSION) {
+        get_value<int>(value, "version", path) != version) {
         throw std::runtime_error("unsupported or invalid weight-pager metadata format in " + path.string());
     }
 }
@@ -116,6 +121,11 @@ void sha_update_string(sha256_t & hash, const std::string & value) {
 void sha_update_group(sha256_t & hash, const json & group) {
     sha_update_u64(hash, static_cast<uint64_t>(group.at("block_idx").get<int>()));
     sha_update_u64(hash, static_cast<uint64_t>(group.at("expert_idx").get<int>()));
+    if (group.contains("slice_idx")) {
+        sha_update_u64(hash, static_cast<uint64_t>(group.at("slice_idx").get<int>()));
+        sha_update_u64(hash, group.at("ff_first").get<uint64_t>());
+        sha_update_u64(hash, group.at("ff_last").get<uint64_t>());
+    }
     const json & members = group.at("members");
     sha_update_u64(hash, members.size());
     for (const json & member : members) {
@@ -238,7 +248,12 @@ Plan build_plan(const Options & options) {
     const fs::path source_manifest_path = fs::canonical(options.src_manifest);
     const fs::path source_dir           = source_manifest_path.parent_path();
     json           manifest             = read_json(source_manifest_path);
-    check_format(manifest, MANIFEST_FORMAT, source_manifest_path);
+    const bool sliced = options.slice_index >= 0;
+    check_format(manifest, MANIFEST_FORMAT, source_manifest_path,
+                 sliced ? SLICED_VERSION : FORMAT_VERSION);
+    if (sliced && !manifest.contains("expert_slicing")) {
+        throw std::runtime_error("--slice requires a format-v2 expert-slices manifest");
+    }
 
     get_value<std::string>(manifest, "input_model", source_manifest_path);
     const json & model_files = get_array(manifest, "model_files", source_manifest_path);
@@ -271,7 +286,10 @@ Plan build_plan(const Options & options) {
             source_dir / get_value<std::string>(source_shard, "index_file", source_manifest_path);
         const fs::path blob_path = source_dir / get_value<std::string>(source_shard, "blob_file", source_manifest_path);
         const json     index     = read_json(index_path);
-        check_format(index, INDEX_FORMAT, index_path);
+        check_format(index, INDEX_FORMAT, index_path, sliced ? SLICED_VERSION : FORMAT_VERSION);
+        if (sliced && index.at("expert_slicing") != manifest.at("expert_slicing")) {
+            throw std::runtime_error("source manifest and sidecar expert_slicing disagree for " + index_path.string());
+        }
 
         const int layer_first = get_value<int>(index, "layer_first", index_path);
         const int layer_last  = get_value<int>(index, "layer_last", index_path);
@@ -321,31 +339,72 @@ Plan build_plan(const Options & options) {
                 throw std::runtime_error("invalid or repeated source expert group in " + index_path.string());
             }
 
-            const json & members = get_array(group, "members", index_path);
-            if (members.size() != 3 || get_value<uint64_t>(group, "member_count", index_path) != members.size()) {
-                throw std::runtime_error("source expert group does not contain exactly three members in " +
-                                         index_path.string());
-            }
-
-            uint64_t group_bytes = 0;
-            for (const json & member : members) {
-                const uint64_t offset = get_value<uint64_t>(member, "offset", index_path);
-                const uint64_t size   = get_value<uint64_t>(member, "size", index_path);
-                get_value<uint64_t>(member, "role_mask", index_path);
-                get_value<std::string>(member, "catalog_name", index_path);
-                get_value<std::string>(member, "source_tensor_name", index_path);
-                get_value<uint64_t>(member, "source_file_idx", index_path);
-                get_value<uint64_t>(member, "source_file_offset", index_path);
-                if (size == 0 || offset != source_next_offset) {
-                    throw std::runtime_error("source groups are not gapless and contiguous in " + index_path.string());
+            const auto consume_members = [&](const json & members, uint64_t & bytes) {
+                if (members.size() != 3) {
+                    throw std::runtime_error("source expert group does not contain exactly three members in " +
+                                             index_path.string());
                 }
-                source_next_offset = checked_add(source_next_offset, size, "source blob");
-                group_bytes        = checked_add(group_bytes, size, "source group");
+                for (const json & member : members) {
+                    const uint64_t offset = get_value<uint64_t>(member, "offset", index_path);
+                    const uint64_t size   = get_value<uint64_t>(member, "size", index_path);
+                    get_value<uint64_t>(member, "role_mask", index_path);
+                    get_value<std::string>(member, "catalog_name", index_path);
+                    get_value<std::string>(member, "source_tensor_name", index_path);
+                    get_value<uint64_t>(member, "source_file_idx", index_path);
+                    get_value<uint64_t>(member, "source_file_offset", index_path);
+                    if (size == 0 || offset != source_next_offset) {
+                        throw std::runtime_error("source groups are not gapless and contiguous in " + index_path.string());
+                    }
+                    source_next_offset = checked_add(source_next_offset, size, "source blob");
+                    bytes              = checked_add(bytes, size, "source group");
+                }
+            };
+
+            if (!sliced) {
+                const json & members = get_array(group, "members", index_path);
+                if (get_value<uint64_t>(group, "member_count", index_path) != members.size()) {
+                    throw std::runtime_error("source expert group member count mismatch in " + index_path.string());
+                }
+                uint64_t group_bytes = 0;
+                consume_members(members, group_bytes);
+                if (expert_idx >= options.expert_first && expert_idx <= options.expert_last) {
+                    planned.groups.push_back(group);
+                    planned.blob_bytes = checked_add(planned.blob_bytes, group_bytes, "output shard");
+                }
+                continue;
             }
 
-            if (expert_idx >= options.expert_first && expert_idx <= options.expert_last) {
-                planned.groups.push_back(group);
-                planned.blob_bytes = checked_add(planned.blob_bytes, group_bytes, "output shard");
+            const json & slices = get_array(group, "slices", index_path);
+            const json & widths = manifest.at("expert_slicing").at("widths");
+            if (options.slice_index >= (int) slices.size() || slices.size() != widths.size()) {
+                throw std::runtime_error("source expert group has an invalid slice count in " + index_path.string());
+            }
+            for (size_t slice_pos = 0; slice_pos < slices.size(); ++slice_pos) {
+                const json & source_slice = slices.at(slice_pos);
+                if (get_value<int>(source_slice, "slice_idx", index_path) != (int) slice_pos ||
+                    get_value<uint64_t>(source_slice, "offset", index_path) != source_next_offset ||
+                    get_value<int64_t>(source_slice, "width", index_path) != widths.at(slice_pos).get<int64_t>()) {
+                    throw std::runtime_error("source expert slice metadata is invalid in " + index_path.string());
+                }
+                uint64_t slice_bytes = 0;
+                consume_members(get_array(source_slice, "members", index_path), slice_bytes);
+                if (slice_bytes != get_value<uint64_t>(source_slice, "bytes", index_path)) {
+                    throw std::runtime_error("source expert slice byte count mismatch in " + index_path.string());
+                }
+                if ((int) slice_pos == options.slice_index) {
+                    json output_group = {
+                        { "block_idx", block_idx },
+                        { "expert_idx", expert_idx },
+                        { "member_count", 3 },
+                        { "slice_idx", get_value<int>(source_slice, "slice_idx", index_path) },
+                        { "ff_first", get_value<int64_t>(source_slice, "ff_first", index_path) },
+                        { "ff_last", get_value<int64_t>(source_slice, "ff_last", index_path) },
+                        { "width", get_value<int64_t>(source_slice, "width", index_path) },
+                        { "members", source_slice.at("members") },
+                    };
+                    planned.groups.push_back(std::move(output_group));
+                    planned.blob_bytes = checked_add(planned.blob_bytes, slice_bytes, "output shard");
+                }
             }
         }
 
@@ -369,6 +428,11 @@ Plan build_plan(const Options & options) {
 
     Plan plan;
     plan.out_base        = fs::absolute(options.out_base).lexically_normal();
+    plan.sliced          = sliced;
+    if (sliced) {
+        plan.expert_slicing = manifest.at("expert_slicing");
+        plan.expert_slicing["selected_slice"] = options.slice_index;
+    }
     plan.source_manifest = std::move(manifest);
     for (std::optional<PlannedShard> & selected : selected_by_source) {
         if (selected.has_value()) {
@@ -377,8 +441,16 @@ Plan build_plan(const Options & options) {
             plan.shards.push_back(std::move(*selected));
         }
     }
+    for (const PlannedShard & shard : plan.shards) {
+        for (const json & group : shard.groups) {
+            const int expert = group.at("expert_idx").get<int>();
+            plan.expert_first = plan.expert_first < 0 ? expert : std::min(plan.expert_first, expert);
+            plan.expert_last  = std::max(plan.expert_last, expert);
+        }
+    }
     if (plan.shards.empty()) {
-        throw std::runtime_error("the requested expert range retains no groups");
+        throw std::runtime_error(sliced ? "the requested slice retains no groups" :
+                                 "the requested expert range retains no groups");
     }
     return plan;
 }
@@ -403,6 +475,9 @@ json build_output_index(const Plan & plan, const PlannedShard & shard) {
         { "model_files",  plan.source_manifest.at("model_files") },
         { "groups",       json::array()                          },
     };
+    if (plan.sliced) {
+        index["expert_slicing"] = plan.expert_slicing;
+    }
 
     uint64_t output_offset = 0;
     for (const json & source_group : shard.groups) {
@@ -629,15 +704,15 @@ RunStats write_manifest(const Plan & plan, const Options & options) {
 
     const RunStats stats    = plan_stats(plan);
     json           manifest = {
-        { "format",                plan.source_manifest.at("format")      },
-        { "version",               plan.source_manifest.at("version")     },
+        { "format",                MANIFEST_FORMAT                         },
+        { "version",               FORMAT_VERSION                          },
         { "input_model",           plan.source_manifest.at("input_model") },
         { "model_files",           plan.source_manifest.at("model_files") },
-        { "sharding_mode",         "expert-index-range"                   },
+        { "sharding_mode",         plan.sliced ? "expert-slice" : "expert-index-range" },
         { "retained_expert_range",
          {
-              { "first", options.expert_first },
-              { "last", options.expert_last },
+              { "first", plan.sliced ? plan.expert_first : options.expert_first },
+              { "last", plan.sliced ? plan.expert_last : options.expert_last },
           }                                                               },
         { "total_group_count",     stats.groups                           },
         { "total_blob_bytes",      stats.bytes                            },
@@ -649,6 +724,9 @@ RunStats write_manifest(const Plan & plan, const Options & options) {
           }                                                               },
         { "shards",                json::array()                          },
     };
+    if (plan.sliced) {
+        manifest["expert_slicing"] = plan.expert_slicing;
+    }
 
     for (const PlannedShard & shard : plan.shards) {
         const ShardPaths paths = shard_paths(plan.out_base, shard.output_index, plan.shards.size());
@@ -686,7 +764,7 @@ fs::path output_manifest_path(const fs::path & out_base) {
 }
 
 RunStats run(const Options & options) {
-    if (options.expert_first < 0 || options.expert_last < options.expert_first) {
+    if (options.slice_index < 0 && (options.expert_first < 0 || options.expert_last < options.expert_first)) {
         throw std::invalid_argument("invalid retained expert range");
     }
     if (options.manifest_only && (options.verify || options.layers.has_value())) {
@@ -710,7 +788,8 @@ RunStats run(const Options & options) {
         add_stats(emitted, write_shard(plan, shard, options.verify));
     }
     if (emitted.shards == 0) {
-        throw std::runtime_error("the requested layer range retains no expert groups");
+        throw std::runtime_error(options.slice_index >= 0 ? "the requested layer range retains no slice groups" :
+                                 "the requested layer range retains no expert groups");
     }
     std::cout << "shard emission complete: shards=" << emitted.shards << " groups=" << emitted.groups
               << " bytes=" << emitted.bytes << "; manifest not written (run --manifest-only separately)\n";
