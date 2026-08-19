@@ -15,9 +15,14 @@ static constexpr size_t  PREFETCH_HINT_MAX_TOKENS  = 16;
 // an earlier layer, max-pooled over token positions, and return the top-M
 // ASCENDING (the wire's dedup invariant).
 //
-// min_conf is a SOFTMAX PROBABILITY FLOOR over all n_expert pooled scores: an
+// min_conf is a SOFTMAX PROBABILITY FLOOR over the max-pooled RAW LOGITS: an
 // expert is emitted only if its share of the routing mass clears it. 0 = no
 // gate, which is what this function did before and is kept for the A/B.
+//
+// Ranking uses DS4's selection score, sqrt(softplus(logit))+bias, but the GATE
+// must use the raw logits -- that transform compresses the dynamic range far
+// enough that no expert can reach even a 0.10 share across 256 experts, so
+// gating on it rejects everything at every threshold (measured 2026-08-19).
 //
 // WHY THE GATE IS NOT OPTIONAL IN PRACTICE. The whole-expert pager shipped this
 // exact predictor without a confidence floor and it lost: taking a flat top-M

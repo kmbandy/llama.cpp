@@ -70,13 +70,16 @@ std::vector<int32_t> rank_top(const std::vector<double> & scores, int32_t top_m)
 //
 // Emission stops at the FIRST expert below the floor rather than skipping it:
 // the candidates are in descending score order, so every later one is lower too.
-std::vector<int32_t> rank_top_gated(const std::vector<double> & scores, int32_t top_m, float min_conf) {
-    if (scores.empty()) {
+std::vector<int32_t> rank_top_gated(const std::vector<double> & scores,
+                                    const std::vector<double> & logits,
+                                    int32_t top_m, float min_conf) {
+    if (scores.empty() || logits.size() != scores.size()) {
         return {};
     }
-    const double max_score = *std::max_element(scores.begin(), scores.end());
+    // RANK on `scores` (the model's own selection rule), GATE on `logits`.
+    const double max_score = *std::max_element(logits.begin(), logits.end());
     double denom = 0.0;
-    for (const double s : scores) {
+    for (const double s : logits) {
         denom += std::exp(s - max_score);
     }
     if (!(denom > 0.0)) {
@@ -98,7 +101,7 @@ std::vector<int32_t> rank_top_gated(const std::vector<double> & scores, int32_t 
     std::vector<int32_t> kept;
     kept.reserve(ranked.size());
     for (const int32_t expert : ranked) {
-        const double p = std::exp(scores[(size_t) expert] - max_score) / denom;
+        const double p = std::exp(logits[(size_t) expert] - max_score) / denom;
         if (p < (double) min_conf) {
             break;
         }
@@ -123,7 +126,23 @@ std::vector<int32_t> router2_top_experts(const float * weights,
         return {};
     }
 
+    // TWO pooled quantities, and they are NOT interchangeable.
+    //
+    // `pooled` is DS4's actual selection score, sqrt(softplus(logit)) + bias --
+    // that is what the model ranks by, so it is what the hint ranks by.
+    //
+    // `pooled_logit` is the RAW logit, and it is what the confidence gate needs.
+    // Softmaxing the selection score does not work: sqrt(softplus(.)) compresses
+    // logits of +-5 into roughly 0.08..2.24, so across 256 experts the largest
+    // achievable share is ~0.05 and ANY floor at or above that rejects every
+    // expert on every layer. Measured 2026-08-19 before this fix: floors of
+    // 0.10, 0.5 and 0.8 all produced identical hint volume, because router2 was
+    // emitting nothing at all and the traffic seen was the unrelated hash-layer
+    // hints. Raw logits keep their exponential spread, which is what makes a
+    // softmax share meaningful and comparable across layers -- and it is the
+    // quantity the whole-expert pager gates on (wp-router-predictor.cpp).
     std::vector<double> pooled((size_t) n_expert, -std::numeric_limits<double>::infinity());
+    std::vector<double> pooled_logit((size_t) n_expert, -std::numeric_limits<double>::infinity());
     for (int64_t token = 0; token < n_tokens; ++token) {
         const float * h = activations + (size_t) token * (size_t) n_embd;
         for (int32_t expert = 0; expert < n_expert; ++expert) {
@@ -135,10 +154,12 @@ std::vector<int32_t> router2_top_experts(const float * weights,
             const float  softplus   = std::max(logits, 0.0f) + std::log1p(std::exp(-std::fabs(logits)));
             const double score      = (double) std::sqrt(softplus) + (double) bias[expert];
             pooled[(size_t) expert] = std::max(pooled[(size_t) expert], score);
+            pooled_logit[(size_t) expert] =
+                std::max(pooled_logit[(size_t) expert], (double) logits);
         }
     }
     if (min_conf > 0.0f) {
-        return rank_top_gated(pooled, top_m, min_conf);
+        return rank_top_gated(pooled, pooled_logit, top_m, min_conf);
     }
     return rank_top(pooled, top_m);
 }
