@@ -102,8 +102,8 @@ int main() {
     }
 
     {
-        require(ggml_cuda_graph_cache_policy{}.cap == 0,
-                "default cap is 0 so a split decode working set is not evicted");
+        require(ggml_cuda_graph_cache_policy{}.cap == 256,
+                "default cap covers split-decode working set and bounds prefill misses");
     }
 
     {

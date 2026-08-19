@@ -995,6 +995,11 @@ private:
 
 using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
+// Vocab lm_head rows materialized in a reserved or live graph. Prefill
+// embeddings / nextn stay full-width; the lm_head does not. Shared with
+// llama_context::output_reserve so the host logits arena matches the graph.
+static constexpr uint32_t llm_graph_logit_row_cap = 32;
+
 //
 // llm_graph_context
 //
@@ -1222,6 +1227,9 @@ struct llm_graph_context {
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
+    // Slice `cur` [n_embd, n_rows] to the last llm_graph_logit_row_cap rows
+    // before the vocab mul_mat. Embeddings/nextn stay on the unsliced tensor.
+    ggml_tensor * cap_lm_head_rows(ggml_tensor * cur) const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
 

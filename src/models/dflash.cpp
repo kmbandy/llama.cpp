@@ -717,6 +717,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * output = model.output;
 
+    cur = cap_lm_head_rows(cur);
     cur = build_lora_mm(output, cur);
     if (model.d2t) {
         const int64_t n_draft_vocab = cur->ne[0];
@@ -934,6 +935,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         output = model_other->output;
     }
 
+    cur = cap_lm_head_rows(cur);
     cur = build_lora_mm(output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;

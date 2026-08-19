@@ -2779,6 +2779,31 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     return cur;
 }
 
+ggml_tensor * llm_graph_context::cap_lm_head_rows(ggml_tensor * cur) const {
+    if (cur == nullptr) {
+        return nullptr;
+    }
+
+    // Pooling embedding graphs need every output row through the head.
+    if (cparams.embeddings &&
+        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
+         cparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) {
+        return cur;
+    }
+
+    const int64_t n_rows = cur->ne[1];
+    if (n_rows <= (int64_t) llm_graph_logit_row_cap) {
+        return cur;
+    }
+
+    // Last-window view: spec/decode logits sit at the end of the ubatch.
+    // Prefill embeddings stay on `cur`; only the vocab mul_mat shrinks.
+    ggml_tensor * view = ggml_view_2d(ctx0, cur, cur->ne[0], (int64_t) llm_graph_logit_row_cap,
+                                      cur->nb[1], cur->nb[1] * (n_rows - (int64_t) llm_graph_logit_row_cap));
+    ggml_set_name(view, "lm_head_rows");
+    return view;
+}
+
 ggml_tensor * llm_graph_context::build_inp_mean() const {
     auto inp = std::make_unique<llm_graph_input_mean>(cparams);
 

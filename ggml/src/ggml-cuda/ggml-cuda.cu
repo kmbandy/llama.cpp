@@ -3572,6 +3572,24 @@ static void ggml_cuda_wp_graph_count_init() {
     std::call_once(ggml_cuda_wp_graph_atexit_once, []() { atexit(ggml_cuda_wp_graph_print_counts); });
 }
 
+// Prefill-shaped graphs (activation width > decode/spec window) must not be
+// captured. Each distinct prompt length would otherwise park a HIP graph and
+// its host-visible scratch for the process lifetime — the 2057/1136/1010 MiB
+// /dev/zero set on the sliced spine. Decode/spec stay capturable (ne <= 32).
+static bool ggml_cuda_graph_is_prefill_shaped(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] == nullptr) {
+            continue;
+        }
+        const int64_t n_act = node->src[1]->ne[1];
+        if (n_act > 32 && node->src[1]->ne[0] <= 16384) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -5450,7 +5468,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph) &&
+            !ggml_cuda_graph_is_prefill_shaped(cgraph);
         if (graph_compatible) {
             bool properties_src_data_ptrs_only = false;
             const bool properties_changed = ggml_cuda_graph_update_required(

@@ -54,7 +54,7 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 // tokens. Reserving n_ubatch here is a 2048-wide 3-layer graph (~1 GiB) on the
 // spine that the 3-layer head never needs at init. n_outputs_max stays n_batch
 // so encoder output_reserve(n_tokens) still passes.
-static constexpr uint32_t k_draft_graph_tokens = 32;
+static constexpr uint32_t k_draft_graph_tokens = llm_graph_logit_row_cap;
 
 static bool is_draft_ctx(const llama_cparams & cparams) {
     // MAD-LAB: a SIDECAR draft (a separate DFlash/DSpark or EAGLE3 GGUF passed with
@@ -80,6 +80,32 @@ static uint32_t draft_graph_n_tokens(const llama_cparams & cparams, uint32_t n_t
 static uint32_t draft_graph_n_outputs(const llama_cparams & cparams, uint32_t n_tokens) {
     const uint32_t cap = std::min(n_tokens, cparams.n_outputs_max);
     return is_draft_ctx(cparams) ? std::min(cap, k_draft_graph_tokens) : cap;
+}
+
+// Worst-case pp reserve used to pass n_outputs == n_ubatch. On DS4 that
+// makes build_inp_out_ids take the identity path (n_outputs == n_tokens)
+// and materializes n_vocab*n_ubatch logits (~1 GiB) plus matching
+// ROCm_Host output/sampler arenas — parked for the life of the process.
+// Runtime can grow via output_reserve/gallocr; n_outputs_max stays n_batch
+// so a DSpark prefill that really asks for 223 rows still fits the assert.
+// Keep n_outputs strictly below n_tokens so get_rows stays on.
+static uint32_t reserve_graph_n_outputs(const llama_cparams & cparams, uint32_t n_tokens) {
+    uint32_t n = draft_graph_n_outputs(cparams, n_tokens);
+    // Pooling graphs need n_outputs == n_tokens (graph_reserve re-establishes
+    // that). DSpark sets embeddings so it can tap nextn/hidden — that must
+    // NOT uncap the vocab lm_head or we re-park n_vocab*n_ubatch on host.
+    if (cparams.embeddings &&
+        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
+         cparams.pooling_type == LLAMA_POOLING_TYPE_RANK)) {
+        return n == 0 ? 1 : n;
+    }
+    if (n_tokens > 1) {
+        n = std::min(n, k_draft_graph_tokens);
+        if (n >= n_tokens) {
+            n = n_tokens - 1;
+        }
+    }
+    return n == 0 ? 1 : n;
 }
 
 // WP_DS4_LAYER_TRACE observes the split MoE graph boundaries without changing
@@ -1216,9 +1242,14 @@ void llama_context::sched_reserve() {
 
     // DSpark/MTP token-path graphs include a full-vocab lm_head. Prefill uses
     // the embd-inject path (logits off). Reserving n_outputs == n_ubatch here
-    // materializes 129280 * n_ubatch * 4 bytes of dead logits (~1 GiB at 2048).
-    // n_outputs_max stays n_batch so encoder output_reserve(n_tokens) still fits.
-    const uint32_t n_outputs_pp = draft_graph_n_outputs(cparams, n_tokens);
+    // materializes 129280 * n_ubatch * 4 bytes of dead logits (~1 GiB at 2048)
+    // AND a matching ROCm_Host output arena that never shrinks. The 08-12
+    // draft_graph_n_outputs cap only hit the draft ctx; the main spine still
+    // reserved n_outputs == n_tokens and skipped get_rows. Same cap on main.
+    // n_outputs_max stays n_batch so a live DSpark prefill can still grow.
+    const uint32_t n_outputs_pp = reserve_graph_n_outputs(cparams, n_tokens);
+    LLAMA_LOG_INFO("%s: reserve graph logit rows = %u (n_tokens=%u n_outputs_max=%u)\n",
+                   __func__, n_outputs_pp, n_tokens, (unsigned) cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -1417,7 +1448,7 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = draft_graph_n_tokens(cparams, std::min(cparams.n_ctx, cparams.n_ubatch));
 
-        const uint32_t n_outputs_max = draft_graph_n_outputs(cparams, n_tokens);
+        const uint32_t n_outputs_max = reserve_graph_n_outputs(cparams, n_tokens);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
@@ -1806,7 +1837,13 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        const int64_t n_vocab = model.vocab.n_tokens();
+        const int64_t n_logit_rows = n_vocab > 0 ? (int64_t) (logits.size / (size_t) n_vocab) : 0;
+        const int64_t first_logit = std::max<int64_t>(0, (int64_t) n_outputs - n_logit_rows);
+        if (j < first_logit) {
+            throw std::runtime_error("no logits for embedding-only output row");
+        }
+        return logits.data + (j - first_logit)*n_vocab;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -2584,17 +2621,40 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     n_queued_tokens += n_tokens;
 
+    // Encoder outputs are the rows that actually produce logits, not every
+    // token in the ubatch. Passing n_tokens here used to allocate
+    // n_vocab*n_ubatch of pinned host logits on every DSpark encode.
+    uint32_t n_enc_outputs = n_tokens;
+    if (batch_inp.logits) {
+        n_enc_outputs = 0;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            n_enc_outputs += batch_inp.logits[i] != 0;
+        }
+        if (n_enc_outputs == 0) {
+            n_enc_outputs = 1;
+        }
+    }
+
     // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
+    if (output_reserve(n_enc_outputs) < n_enc_outputs) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_enc_outputs);
         return -2;
     };
 
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        output_ids[i] = i;
+    if (batch_inp.logits) {
+        uint32_t o = 0;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            if (batch_inp.logits[i] != 0 && o < n_enc_outputs) {
+                output_ids[o++] = (int32_t) i;
+            }
+        }
+        n_outputs = o;
+    } else {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            output_ids[i] = i;
+        }
+        n_outputs = n_tokens;
     }
-
-    n_outputs = n_tokens;
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -2627,7 +2687,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        const int64_t n_graph_rows = t_logits->ne[1];
+        const int64_t n_copy = std::min<int64_t>({ (int64_t) n_enc_outputs, n_graph_rows,
+                n_vocab > 0 ? (int64_t) (logits.size / (size_t) n_vocab) : 0 });
+        if (n_copy > 0) {
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_copy*n_vocab*sizeof(float));
+        }
     }
 
     // extract embeddings
@@ -3112,12 +3177,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            const int64_t n_graph_rows = t_logits->ne[1];
+            const int64_t n_copy = std::min<int64_t>({ n_outputs, n_graph_rows,
+                    n_vocab > 0 ? (int64_t) (logits.size / (size_t) n_vocab) : 0 });
+            const int64_t dst_row = n_outputs_prev + n_outputs - n_copy;
 
-            if (n_outputs) {
+            if (n_copy > 0) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                GGML_ASSERT((dst_row + n_copy)*n_vocab <= (int64_t) logits.size);
+                float * logits_out = logits.data + dst_row*n_vocab;
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_copy*n_vocab*sizeof(float));
             }
         }
 
@@ -3314,7 +3383,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
-    logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
+    // Vocab logits are only needed for the decode/spec window. DSpark prefill
+    // asks for hundreds of *embedding* rows; sizing logits by that request is
+    // what parked n_vocab*2048 on ROCm_Host after the sampling copies were cut.
+    const int64_t n_logit_rows = has_logits
+        ? ((cparams.embeddings &&
+            (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
+             cparams.pooling_type == LLAMA_POOLING_TYPE_RANK))
+                ? n_outputs_max
+                : std::min(n_outputs_max, (int64_t) k_draft_graph_tokens))
+        : 0;
+
+    logits.size     = has_logits     ? n_vocab*n_logit_rows      : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
@@ -3333,7 +3413,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
-    const bool has_sampling = !sampling.samplers.empty();
+    // Sampling only runs on the decode/spec window (a handful of rows). Prefill
+    // that asks for many logit rows still needs `logits`, not 3 extra vocab
+    // copies — those are what turned a 1 GiB logits buffer into ~4 GiB of
+    // pinned ROCm_Host and parked it for the process lifetime.
+    const bool has_sampling = !sampling.samplers.empty() &&
+                              n_outputs_max <= (int64_t) k_draft_graph_tokens;
     if (has_sampling) {
         backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
@@ -3382,6 +3467,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+        LLAMA_LOG_INFO("%s: host logits rows = %u (requested=%ld n_outputs_max=%ld) buffer = %.2f MiB\n",
+                __func__, (unsigned) n_logit_rows, (long) n_outputs, (long) n_outputs_max,
+                new_size / (1024.0 * 1024.0));
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -3508,7 +3596,8 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        const uint64_t n_logit_rows = n_vocab > 0 ? (uint64_t) (logits.size / n_vocab) : 0;
+        if (logits.size > 0 && i0 < n_logit_rows && i1 < n_logit_rows) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -3542,7 +3631,7 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (!sampling.samplers.empty()) {
+        if (!sampling.samplers.empty() && sampling.logits.size > 0) {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
             assert(sampling.candidates.size > 0);

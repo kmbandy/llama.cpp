@@ -463,26 +463,16 @@ static void dsv4_pad_live_plan_to_reserve_rank(
 
     // Decode/verify: pin kq_mask width at the allocated cache size so it
     // does not step every 256 visible rows. Prefill keeps the 256-aligned
-    // grow — a 2048 x kv_size mask would be hundreds of MiB per compressor.
+    // grow — a 2048 x kv_size F16 mask is ~500 MiB per compressor (CSA+LID
+    // ≈ 1 GiB, F32 ≈ 2 GiB) parked in gallocr for the process lifetime.
     //
-    // WP_HIP_GRAPHS (2026-08-17): this used to gate on ubatch.n_tokens, but
-    // n_tokens == n_seq_tokens * n_seqs (llama-batch.h) conflates "how many
-    // tokens does each sequence contribute" with "how many sequences are
-    // packed into this ubatch". On the cross-machine expert-dispatch spine,
-    // many concurrently-decoding requests get batched into one ubatch, so a
-    // single-token-per-sequence (n_seq_tokens == 1) decode step regularly
-    // has ubatch.n_tokens well past any small constant once enough requests
-    // land in the same step -- it would fail an n_tokens-based check and
-    // fall through to the 256-aligned grow below, which then steps plan.n_kv
-    // (and therefore the comp kq_mask / lid_top_k / SET_ROWS shapes derived
-    // from it) essentially every step in a busy server, because *some*
-    // sequence in the batch crosses a 256-row boundary on almost every step.
-    // Gate on n_seq_tokens instead -- it is invariant to how many sequences
-    // share the step and matches the same decode/prefill split
-    // dsv4_build_reserve_comp_plan() already uses (see n_seq_tokens below),
-    // so the live plan and the reserve/warmup plan agree on which regime
-    // they are in.
-    if (ubatch.n_seq_tokens <= 32) {
+    // Gate on n_tokens, NOT n_seq_tokens. split_simple() builds a prefill
+    // ubatch as n_seqs = n_tokens, n_seq_tokens = 1 (llama-batch.cpp), so
+    // n_seq_tokens<=32 is true for EVERY simple prefill and was pinning the
+    // full-ctx mask on the first 2048-token prompt. Decode/verify on this
+    // serve is n_tokens <= 32 (parallel=1, spec window). Packed multi-seq
+    // decode with n_tokens>32 can recapture; that is cheaper than 2 GiB swap.
+    if (ubatch.n_tokens <= 32) {
         plan.n_kv = kv_size;
     }
 }
@@ -876,14 +866,22 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
-    plan.n_kv = kv_size;
 
     if (ubatch.n_tokens == 0) {
+        plan.n_kv = kv_size;
         return plan;
     }
 
     const uint32_t n_seqs       = std::max<uint32_t>(1, ubatch.n_seqs);
     const uint32_t n_seq_tokens = std::max<uint32_t>(1, ubatch.n_seq_tokens);
+    // Same decode/prefill split as the live pad (gate on n_tokens, not
+    // n_seq_tokens — split_simple prefill has n_seq_tokens == 1).
+    if (ubatch.n_tokens <= 32) {
+        plan.n_kv = kv_size;
+    } else {
+        const uint32_t vis = (std::max(n_seq_tokens, ubatch.n_tokens) + ratio - 1) / ratio;
+        plan.n_kv = std::min(kv_size, GGML_PAD(std::max<uint32_t>(1, vis), 256u));
+    }
     const uint64_t n_blocks_u64 = (uint64_t) n_seqs*((n_seq_tokens + ratio - 1)/ratio);
     const size_t n_blocks = (size_t) std::max<uint64_t>(1, n_blocks_u64);
     GGML_ASSERT((uint64_t) n_blocks == std::max<uint64_t>(1, n_blocks_u64));

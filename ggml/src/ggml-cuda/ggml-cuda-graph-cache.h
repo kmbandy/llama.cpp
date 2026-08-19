@@ -31,7 +31,7 @@
 #include <cstring>
 
 struct ggml_cuda_graph_cache_policy {
-    size_t  cap      = 0;
+    size_t  cap      = 256;
     int64_t ttl_us   = 10'000'000;
     int64_t sweep_us =  5'000'000;
 };

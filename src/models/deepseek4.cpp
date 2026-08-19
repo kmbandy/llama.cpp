@@ -1714,6 +1714,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         res->t_h_nextn = cur;
 
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = cap_lm_head_rows(cur);
         cur = ggml_mul_mat(ctx0, layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output, cur);
         cb(cur, "result_output", -1);
         res->t_logits = cur;
@@ -1894,6 +1895,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    cur = cap_lm_head_rows(cur);
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -2035,6 +2037,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "DEEPSEEK4 MTP missing LM head");
+    cur = cap_lm_head_rows(cur);
     cur = ggml_mul_mat(ctx0, head_w, cur);
     cb(cur, "result_output", -1);
 
