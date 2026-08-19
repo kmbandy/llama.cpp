@@ -4224,6 +4224,7 @@ public:
             log_prefetch_hints();
             return;
         }
+        size_t predicted_this_frame = 0;
         for (int32_t expert_id : hint.expert_ids) {
             if (expert_id < catalog_.descriptor.expert_first ||
                 expert_id > catalog_.descriptor.expert_last ||
@@ -4249,12 +4250,20 @@ public:
                     // where a wrong guess costs only the bandwidth that fetched
                     // it and a right one is promoted over PCIe instead of being
                     // re-read from NVMe.
-                    host_queue_.push_back(page);
+                    if (spec_predict_topm_ != 0 && predicted_this_frame >= spec_predict_topm_) {
+                        ++spec_dropped_;
+                        continue;
+                    }
+                    ++predicted_this_frame;
+                    enqueue_newest(host_queue_, page);
                 } else {
-                    spec_queue_.emplace_back(page,
-                                             hint.provenance == PIPE_HINT_PREDICTED
-                                                 ? pool_.spec_lease_predicted()
-                                                 : pool_.spec_lease());
+                    // CERTAIN (or host-less) -> VRAM spec_queue_. Newest-wins:
+                    // when full, drop the OLDEST page (already late) so the
+                    // incoming hint -- the one with remaining lead -- stays.
+                    enqueue_newest(spec_queue_,
+                                   { page, hint.provenance == PIPE_HINT_PREDICTED
+                                             ? pool_.spec_lease_predicted()
+                                             : pool_.spec_lease() });
                 }
             }
         }
@@ -4276,6 +4285,16 @@ public:
         host_queue_.clear();
     }
 
+    // After a dispatch RESPONSE: submit the next spec chunk so the read overlaps
+    // the following layer. Do NOT harvest/H2D here -- drain_one_read copies
+    // ~9 MiB on this thread and would stall the next recv. Harvest stays on
+    // the idle pump.
+    void spec_pagein_after_dispatch() {
+        if (spec_submit_interleave_enabled_ && spec_enabled_) {
+            (void) spec_pagein_step(/*harvest=*/ false);
+        }
+    }
+
     // Keep the speculative pipeline moving. Called from the idle pump.
     //
     // TWO DISTINCT JOBS, and neither of them blocks:
@@ -4291,13 +4310,13 @@ public:
     // Only the DISK read moved off it, which is the part worth moving.
     //
     // Returns true if it did any work worth staying awake for.
-    bool spec_pagein_step() {
+    bool spec_pagein_step(bool harvest = true) {
         // Host landings run on their own reader thread and never touch the GPU,
         // so they are reaped and refilled independently of the VRAM path.
         pool_.spec_host_reap();
         if (spec_prefill_gate_active_) {
             // Prefill gate: harvest what is in flight, submit nothing new.
-            if (pool_.spec_in_flight()) {
+            if (harvest && pool_.spec_in_flight()) {
                 return pool_.spec_pagein_poll(false);
             }
             return false;
@@ -4312,7 +4331,7 @@ public:
             }
         }
         if (pool_.spec_in_flight()) {
-            return pool_.spec_pagein_poll(false);
+            return harvest ? pool_.spec_pagein_poll(false) : false;
         }
         if (spec_queue_.empty()) {
             return false;
@@ -4850,6 +4869,39 @@ private:
         return e != nullptr && e[0] == '1';
     }();
     bool spec_prefill_gate_active_ = false;
+    // WP_SPEC_QUEUE_MAX -- bound each of spec_queue_/host_queue_. Newest-wins:
+    // a full queue drops the OLDEST page (already the latest to land) so the
+    // incoming hint keeps its lead. 64 ~= next-token L0-2 (3 x ~6) plus slack.
+    // 0 = unbounded. Dropping the incoming page kept the stale backlog and
+    // rejected the only useful hints.
+    const size_t       spec_queue_max_ = [] {
+        const char * e = std::getenv("WP_SPEC_QUEUE_MAX");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 64;
+        return v >= 0 ? (size_t) v : (size_t) 64;
+    }();
+    // WP_SPEC_PREDICT_TOPM -- cap the PREDICTED (host_queue_) contribution per
+    // frame. Predictions are the low-value half; keep only the first M.
+    // 0 = uncapped. Default 6 (= n_expert_used).
+    const size_t       spec_predict_topm_ = [] {
+        const char * e = std::getenv("WP_SPEC_PREDICT_TOPM");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 6;
+        return v >= 0 ? (size_t) v : (size_t) 6;
+    }();
+    // WP_SPEC_SUBMIT_INTERLEAVE=1 (default on) -- submit one spec chunk after
+    // each dispatch RESPONSE. Harvest/H2D stays on the idle pump.
+    const bool         spec_submit_interleave_enabled_ = [] {
+        const char * e = std::getenv("WP_SPEC_SUBMIT_INTERLEAVE");
+        return e == nullptr || e[0] != '0';
+    }();
+
+    template <typename T>
+    void enqueue_newest(std::deque<T> & q, T item) {
+        if (spec_queue_max_ != 0 && q.size() >= spec_queue_max_) {
+            q.pop_front();
+            ++spec_dropped_;
+        }
+        q.push_back(std::move(item));
+    }
     // (page, lease) -- provenance is resolved to a lease at enqueue, so nothing
     // downstream has to know where a page came from.
     std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;
@@ -6313,6 +6365,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
                               split_log_begin.assignments.size(), split_log_stats, split_log_started);
                 split_log_started = std::chrono::steady_clock::time_point{};
+                worker.spec_pagein_after_dispatch();
             } catch (const pipe_protocol_error & error) {
                 pipe_send_error(socket, seq_id, error.code, error.what());
                 return 1;
@@ -6396,6 +6449,7 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
                 write_req_log(request.layer, request.n_tokens, request.assignments.size(),
                               request_stats, req_started);
             }
+            worker.spec_pagein_after_dispatch();
         } catch (const pipe_protocol_error & error) {
             if (!pipe_send_error(socket, seq_id, error.code, error.what())) {
                 return 1;

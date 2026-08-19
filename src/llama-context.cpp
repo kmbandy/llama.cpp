@@ -3104,22 +3104,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // tid2eid rows for mask_token_id are noise -- the dispatcher's
             // (layer, provenance) dedup eats the repeats after the first block,
             // but one garbage frame-set per session still pollutes the hint logs.
+            //
+            // Prefill: only the last K tokens feed the following decode. Hinting
+            // the whole 2048-token ubatch stuffed thousands of L0-2 pages onto
+            // the worker queue; they could not land and evicted the useful tail.
+            static const uint32_t hint_last_k = [] {
+                const char * e = std::getenv("WP_PREFETCH_LAST_K");
+                const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 32;
+                return v > 0 ? (uint32_t) v : 32u;
+            }();
             const llama_token mask = model.vocab.token_mask();
-            if (mask == LLAMA_TOKEN_NULL) {
-                expert_dispatch->prefetch_ngram_for_tokens(ubatch.token, ubatch.n_tokens);
-                expert_dispatch->prefetch_for_tokens(ubatch.token, ubatch.n_tokens);
-            } else {
-                std::vector<int32_t> filtered;
-                filtered.reserve(ubatch.n_tokens);
-                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    if (ubatch.token[i] != mask) {
-                        filtered.push_back(ubatch.token[i]);
-                    }
+            std::vector<int32_t> filtered;
+            filtered.reserve(std::min(ubatch.n_tokens, hint_last_k));
+            const uint32_t start = ubatch.n_tokens > hint_last_k ? ubatch.n_tokens - hint_last_k : 0;
+            for (uint32_t i = start; i < ubatch.n_tokens; ++i) {
+                if (mask == LLAMA_TOKEN_NULL || ubatch.token[i] != mask) {
+                    filtered.push_back(ubatch.token[i]);
                 }
-                if (!filtered.empty()) {
-                    expert_dispatch->prefetch_ngram_for_tokens(filtered.data(), filtered.size());
-                    expert_dispatch->prefetch_for_tokens(filtered.data(), filtered.size());
-                }
+            }
+            if (!filtered.empty()) {
+                expert_dispatch->prefetch_ngram_for_tokens(filtered.data(), filtered.size());
+                expert_dispatch->prefetch_for_tokens(filtered.data(), filtered.size());
             }
         }
 

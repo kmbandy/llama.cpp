@@ -1810,22 +1810,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     __func__, n_sub, draft_toks.size());
         }
 
-        // The cross-machine half of the same idea, and a SEPARATE mechanism --
-        // the call above drives the in-process WeightPager, which is a hard no-op
-        // on this layout (no pager on the spine, and no expert pages in its
-        // catalog even with one). See llama_expert_prefetch_hint.
-        //
-        // Second-best lead time by design: this fires just before the verify
-        // pass, so it covers the drafted tokens the earlier hint could not know
-        // about, with only the target's embedding to hide the read. The hint at
-        // the top of draft() is the one with real lead. Kept because the drafted
-        // tokens genuinely are the rest of the verify batch, and the dedup in
-        // graph_dispatcher drops the frame when the expert set has not moved.
-        if (!draft_toks.empty()) {
-            // Ground truth: these ARE the rest of the verify batch.
-            llama_expert_prefetch_hint(this->params.ctx_tgt, draft_toks.data(),
-                                       (int) draft_toks.size(), -1);
-        }
+        // Do NOT hint the just-drafted tokens here. Verify is the next thing
+        // on the wire, so those pages have ~0 lead: they only lengthen the
+        // worker's late list. The hint at the top of draft() (id_last + optional
+        // previous block) is the one with real lead. llama_wp_on_draft_tokens
+        // above still pins the in-process pager for layouts that have one.
 
         // Carry this block forward. At the top of the NEXT draft these become the
         // predicted half of the hint, with the whole draft decode as lead.
