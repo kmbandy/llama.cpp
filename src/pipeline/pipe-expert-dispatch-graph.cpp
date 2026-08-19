@@ -517,7 +517,14 @@ int graph_dispatcher::router2_lookahead() {
         if (v == nullptr || v[0] == '\0') {
             return 1;
         }
-        return std::min(8, std::max(1, std::atoi(v)));
+        // Clamped only to the model's layer count -- 8 was a number I picked,
+        // and it was cutting off exactly the horizon that makes prefetch work.
+        // Lead time IS the mechanism: at K=1 the target is ~10 ms out, which is
+        // inside the window where the demand path already holds the page, so
+        // every candidate skipped as VRAM-resident. K=7 produced the first host
+        // landings this rig has ever recorded. Precision decays with distance,
+        // which is what the top-M halving and the rising floor are for.
+        return std::min(128, std::max(1, std::atoi(v)));
     }();
     return value;
 }
