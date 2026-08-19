@@ -2125,9 +2125,12 @@ public:
     ~ExpertSlotPool() {
         // A landing thread outliving the pool would std::terminate on a joinable
         // thread, and it holds raw pointers into catalog pages and the staging
-        // arena. Join before anything it touches goes away.
-        if (host_thread_.joinable()) {
-            host_thread_.join();
+        // arena. Join every one of them -- possibly several now -- before
+        // anything they touch goes away. No detached threads, ever.
+        for (auto & w : host_threads_) {
+            if (w.thread.joinable()) {
+                w.thread.join();
+            }
         }
 #if defined(__linux__)
         for (const auto & item : fds_) {
@@ -2452,6 +2455,12 @@ public:
                                 (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now() - demote_t0).count();
                         }
+                        // The slot is about to hold a different page; drop the
+                        // OLD key from the index now, or find_slot(old key) would
+                        // keep returning this slot until something overwrites the
+                        // map entry (the defensive check in find_slot catches a
+                        // stale hit, but there is no reason to rely on it here).
+                        slot_index_.erase(slot_key(slot.key.first, slot.key.second));
                     }
                     slot.valid = false;
 
@@ -2517,6 +2526,7 @@ public:
                         }
                         slot.valid    = true;
                         slot.key      = { page.layer, page.expert };
+                        slot_index_[slot_key(page.layer, page.expert)] = slot_index;
                         slot.cache_id = page.cache_id;
                         slot.page     = &page;
                         slot.size     = page.size;
@@ -2755,8 +2765,15 @@ public:
     // Returns pages queued. Requires the host tier -- without it there is
     // nowhere to land and the caller falls back to the VRAM path.
     size_t spec_host_submit(const std::vector<const ExpertPage *> & pages) {
-        if (!host_victim_enabled_ || pages.empty() || host_thread_.joinable()) {
+        if (!host_victim_enabled_ || pages.empty()) {
             return 0;
+        }
+        // Free any landing threads that finished since the last check. Capacity
+        // below is measured against host_threads_.size(), so a finished-but-
+        // unreaped entry would wrongly look like it is still holding a slot.
+        spec_host_reap();
+        if (host_threads_.size() >= host_thread_cap_) {
+            return 0;   // at capacity -- caller retries on the next pump tick
         }
         // (page, fd). The fd is resolved HERE, on the dispatch thread: fd_for
         // mutates the unguarded fds_ map, and the landing thread below would
@@ -2781,8 +2798,14 @@ public:
         if (cold.empty()) {
             return 0;
         }
-        host_pending_.store(cold.size(), std::memory_order_release);
-        host_thread_ = std::thread([this, cold]() {
+        host_pending_.fetch_add(cold.size(), std::memory_order_release);
+        // 'finished' is set by the thread itself, just before it returns, so
+        // spec_host_reap() can tell a completed thread from a running one and
+        // join() only ever costs the few instructions between that store and
+        // the actual return -- never a real wait. Same non-blocking convention
+        // the original single-thread code relied on via host_pending_==0.
+        auto finished = std::make_shared<std::atomic<bool>>(false);
+        std::thread landing_thread([this, cold, finished]() {
             for (const auto & [page, fd] : cold) {
                 try {
                     if (spec_preempt_before_borrow_) {
@@ -2802,10 +2825,49 @@ public:
                         // between slices. A page abandoned mid-read is fine --
                         // the tier store below never sees it, and the partial
                         // work cost only idle bandwidth.
+                        //
+                        // ANTI-STARVATION (WP_EXPERT_SPEC_PREEMPT_DEADLINE=1):
+                        // under continuous decode the demand path is almost
+                        // never idle (measured 2026-08-19: the host reader was
+                        // in-flight 63% of the time yet completed only 660
+                        // reads over 128 tokens -- ~43 ms to land a page that
+                        // should take ~3 ms, because every one of a 9 MB
+                        // page's 9 slices waits for demand_reads_pending_ to
+                        // hit zero, and it almost never does). That starved
+                        // prefetch to under 2% of the paging the demand path
+                        // does, so it could not move throughput no matter how
+                        // good the predictions are (~99% precise). The
+                        // preemption intent is still correct -- a speculative
+                        // read must never make a demand read WAIT -- what was
+                        // missing is a bound on how long a slice itself can be
+                        // starved. Track how long the CURRENT slice has been
+                        // waiting; once it exceeds
+                        // WP_EXPERT_SPEC_PREEMPT_MAX_WAIT_US (default 2000 us)
+                        // proceed with that one slice anyway, then resume
+                        // yielding for the next. DEFAULT OFF -- gated so this
+                        // is exactly today's unbounded-yield behaviour unless
+                        // opted in.
                         size_t off = 0;
                         while (off < (size_t) page->size) {
-                            while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
-                                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                            if (spec_preempt_deadline_) {
+                                const auto wait_start = std::chrono::steady_clock::now();
+                                while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                                    const auto waited =
+                                        std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - wait_start).count();
+                                    if ((uint64_t) waited >= spec_preempt_max_wait_us_) {
+                                        // Waited long enough -- take this one
+                                        // slice even though a demand read is
+                                        // still outstanding, then go back to
+                                        // yielding for the next slice.
+                                        break;
+                                    }
+                                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                                }
+                            } else {
+                                while (demand_reads_pending_.load(std::memory_order_relaxed) > 0) {
+                                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                                }
                             }
                             const size_t n =
                                 std::min(spec_subread_, (size_t) page->size - off);
@@ -2830,21 +2892,49 @@ public:
                     // the demand path, which is where it belongs.
                     host_errors_.fetch_add(1, std::memory_order_relaxed);
                 }
+                // Per-page, not per-batch: with multiple concurrent landing
+                // threads host_pending_ has to be a real count of pages still
+                // in flight across ALL of them, not a single thread's
+                // all-or-nothing flag. (With the default cap of 1 thread and
+                // chunk of 1 page this decrements exactly once, at the same
+                // moment the old store(0) did -- byte-identical externally.)
+                host_pending_.fetch_sub(1, std::memory_order_release);
             }
-            host_pending_.store(0, std::memory_order_release);
+            finished->store(true, std::memory_order_release);
         });
+        host_threads_.push_back(HostLandingThread{std::move(landing_thread), finished});
         return cold.size();
     }
 
+    // Is ANY landing thread still working? Used to keep the pump alive
+    // (has_spec_work) even when there is nothing left to submit.
     bool spec_host_in_flight() const {
         return host_pending_.load(std::memory_order_acquire) != 0;
     }
 
-    // Join a finished landing thread so the next chunk can start. Non-blocking:
-    // only reaps a thread that has already drained its queue.
+    // Is the landing pool at capacity right now? Distinct from
+    // spec_host_in_flight(): with host_thread_cap_ > 1, several threads can be
+    // busy landing pages while there is STILL room to submit another chunk --
+    // that overlap is the entire point of allowing concurrency here. Read-only
+    // on host_threads_, which (like spec_host_submit/spec_host_reap) only ever
+    // mutates on the dispatch thread.
+    bool spec_host_busy() const {
+        return host_threads_.size() >= host_thread_cap_;
+    }
+
+    // Join any landing threads that have finished so their capacity slot can
+    // be reused. Non-blocking: only ever joins a thread whose 'finished' flag
+    // is already set, so join() costs at most the instructions between that
+    // store and the thread's actual return -- never a real wait. Safe to call
+    // from the dispatch thread on every pump tick.
     void spec_host_reap() {
-        if (host_thread_.joinable() && !spec_host_in_flight()) {
-            host_thread_.join();
+        for (auto it = host_threads_.begin(); it != host_threads_.end(); ) {
+            if (it->finished->load(std::memory_order_acquire)) {
+                it->thread.join();
+                it = host_threads_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -3012,18 +3102,37 @@ private:
         bool                valid     = false;
     };
 
+    // (layer, expert) -> uint64 for slot_index_. Same packing as SPINE's
+    // residency_key (pipe-expert-dispatcher.cpp) -- no reason for the two caches
+    // to disagree about what identifies a page.
+    static uint64_t slot_key(int layer, int expert) {
+        return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert;
+    }
+
     // Index of the slot already holding `page`, or slots_.size(). ONE definition:
     // the speculative path must agree with ensure_batch about what "already here" means,
     // or a prefetch re-reads a page that is sitting in a slot and the extra bytes
     // land in the speculative-read counter as if they were a real page-in.
+    //
+    // O(1) VIA slot_index_, NOT A SCAN. At ~2200 slots and ~40 assignments/layer *
+    // 43 layers/token this was tens of thousands of key compares per token on the
+    // serial dispatch thread, ahead of any disk read. slot_index_ is maintained at
+    // every site that changes what a slot holds (assign, invalidate, reset) -- see
+    // the comment on slot_index_'s declaration for the full list.
     size_t find_slot(const ExpertPage & page) const {
-        const std::pair<int, int> key(page.layer, page.expert);
-        for (size_t i = 0; i < slots_.size(); ++i) {
-            if (slots_[i].valid && slots_[i].key == key) {
-                return i;
-            }
+        const auto it = slot_index_.find(slot_key(page.layer, page.expert));
+        if (it == slot_index_.end()) {
+            return slots_.size();
         }
-        return slots_.size();
+        const size_t i = it->second;
+        // Defensive, not load-bearing: if every mutation site keeps slot_index_ in
+        // sync this is always true. Cheap enough (one extra compare on a hit) to
+        // leave in unconditionally rather than gate it behind a debug flag.
+        if (i >= slots_.size() || !slots_[i].valid ||
+            slots_[i].key != std::make_pair(page.layer, page.expert)) {
+            return slots_.size();
+        }
+        return i;
     }
 
     bool demote_slot(const Slot & slot) {
@@ -3448,6 +3557,8 @@ private:
                     slot.key   = {
                         pagein.page->layer, pagein.page->expert
                     };
+                    slot_index_[slot_key(pagein.page->layer, pagein.page->expert)] =
+                        pagein.slot_index;
                     slot.cache_id = pagein.page->cache_id;
                     slot.page     = pagein.page;
                     slot.size     = pagein.page->size;
@@ -3932,8 +4043,65 @@ private:
     std::unique_ptr<Batch>          spec_batch_;
     std::vector<const ExpertPage *> spec_inflight_;
     std::vector<uint64_t>           spec_leases_;
-    std::thread                     host_thread_;
+    // WP_EXPERT_SPEC_HOST_THREADS -- concurrent host-landing reader threads.
+    // Default 1 = today's EXACT behaviour: submit one page -> read it -> reap
+    // -> submit the next page, one landing thread at a time.
+    //
+    // MEASURED 2026-08-19: between decode tokens each GPU worker is idle for
+    // the draft phase (~38 ms) with ZERO demand reads outstanding -- the drive
+    // is completely free. At ~3 ms/page (~9 MB) that window has room for ~12
+    // pages per worker per token. We land ~1.7. So even the fully unblocked
+    // window runs at ~14% utilisation, purely because delivery is serialized
+    // to one page, one thread, at a time (spec_host_submit refused any new
+    // work while host_thread_.joinable(), and reaping required host_pending_
+    // to hit 0 first). That caps prefetch coverage under 2% of the demand
+    // paging, which is why an ~99%-precise predictor moved throughput not at
+    // all: the bottleneck was never prediction quality, it was delivery
+    // concurrency. Raising this env var lets several landing reads run at
+    // once inside that same idle window.
+    struct HostLandingThread {
+        std::thread thread;
+        // Set true by the thread itself, just before it returns. Lets
+        // spec_host_reap() join it without ever blocking the dispatch thread.
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    std::vector<HostLandingThread>  host_threads_;
+    // Pages currently being read by ANY landing thread combined (not thread
+    // count -- see spec_host_in_flight() vs spec_host_busy()).
     std::atomic<size_t>             host_pending_{0};
+    // *** STAGING-POOL SAFETY BOUND, NOT JUST THE RAW ENV VALUE. ***
+    //
+    // staging_ is shared with the demand and spec-VRAM read paths: ensure_batch
+    // caps THEIR concurrent readers at min(WP_EXPERT_READ_WORKERS, default 4,
+    // staging_.buffer_count()), and a demand batch's readers and the one
+    // in-flight spec-VRAM batch's readers (spec_pagein_submit) can be
+    // outstanding at the same time -- worst case up to 2x that default, i.e. 8
+    // buffers of a pool that is "a fixed 16 buffers regardless of --slots" (see
+    // the WP_SELF_BENCH=3 comment in the ExpertSlotPool ctor).
+    //
+    // StagingPool::borrow() is a plain counting semaphore (condition_variable
+    // over a free list, see StagingPool::Lease) and no borrower ever holds one
+    // lease while waiting on a second, so going over the pool size CANNOT
+    // deadlock -- every leased buffer is released, unconditionally, when its
+    // Lease goes out of scope, so there is always a draining page ahead of any
+    // blocked borrow. What going over the pool size DOES cost is latency: a
+    // demand borrow can queue behind however many host-landing borrows are
+    // currently holding buffers. To keep that bounded, reserve half of
+    // staging_.buffer_count() for demand/spec-VRAM and cap host landings at the
+    // other half (floor 1, so the pool is never host-landing-only). At the
+    // documented default of 16 buffers that is a cap of 8 -- comfortably above
+    // the demand path's own default of 4 concurrent readers, leaving headroom
+    // even when a spec-VRAM batch is ALSO reading at the same time.
+    const size_t host_thread_cap_ = [this] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_HOST_THREADS");
+        long requested = (e != nullptr && e[0] != '\0') ? std::strtol(e, nullptr, 10) : 1;
+        if (requested < 1) {
+            requested = 1;
+        }
+        const size_t buffers    = (size_t) staging_.buffer_count();
+        const size_t max_allowed = std::max<size_t>(1, buffers / 2);
+        return std::min<size_t>((size_t) requested, max_allowed);
+    }();
     // WP_EXPERT_SPEC_PREEMPT=1 -- host landings become PREEMPTIBLE: the landing
     // thread reads each page in WP_EXPERT_SPEC_SUBREAD-byte slices (default
     // 1 MiB) and pauses between slices whenever a demand request is being
@@ -3957,6 +4125,23 @@ private:
         const char * e = std::getenv("WP_EXPERT_SPEC_SUBREAD");
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
         return v > 0 ? (size_t) v : (size_t) (1u << 20);
+    }();
+    // WP_EXPERT_SPEC_PREEMPT_DEADLINE=1 -- bound how long a single slice's
+    // yield-to-demand wait can run before proceeding anyway. Only consulted
+    // when spec_preempt_ is also on. See the big comment at the yield loop in
+    // spec_host_submit for the 2026-08-19 measurement that motivated this.
+    // DEFAULT OFF: preserves today's unbounded-yield spec_preempt_ behaviour
+    // exactly until this is A/B'd on hardware.
+    const bool spec_preempt_deadline_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREEMPT_DEADLINE");
+        return e != nullptr && e[0] == '1';
+    }();
+    // Max microseconds a slice will yield to demand before proceeding anyway,
+    // when spec_preempt_deadline_ is on. Suggested/default 2000 us.
+    const uint64_t spec_preempt_max_wait_us_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREEMPT_MAX_WAIT_US");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v > 0 ? (uint64_t) v : (uint64_t) 2000;
     }();
     // True while Worker::dispatch is serving a request. Written by the dispatch
     // thread, read by the host landing thread between slices.
@@ -4020,6 +4205,16 @@ private:
     // slots_ so it outlives them: Slot::buffer points in here and does not own.
     std::vector<buffer_ptr>    arenas_;
     std::vector<Slot>          slots_;
+    // find_slot's O(1) index: slot_key(layer, expert) -> slot index, for every
+    // currently-VALID slot. Maintained at every write to Slot::valid/Slot::key,
+    // which is exactly three sites: the invalidate in ensure_batch's pagein loop
+    // (erase, before `slot.valid = false`), and the two page-landed sites that set
+    // both fields together -- the host-tier hit in ensure_batch and the disk-read
+    // completion in drain_one_read. select_victim is NOT indexed here: its choice
+    // depends on capacity/lease/uses/tick, not key lookup, so a hash index buys it
+    // nothing -- it would need a real policy structure (e.g. a clock hand) to stop
+    // scanning, which is out of scope for this change.
+    std::unordered_map<uint64_t, size_t> slot_index_;
     std::vector<int>           reserve_blocks_;
     std::map<std::string, int> fds_;
 };
@@ -4374,12 +4569,18 @@ public:
             }
             return false;
         }
-        if (pool_.spec_host_in_flight()) {
+        // Capacity, not activity: with WP_EXPERT_SPEC_HOST_THREADS > 1 several
+        // landing threads can be busy at once while there is STILL room for
+        // another submission -- spec_host_busy() is the "may I submit" gate,
+        // spec_host_in_flight() (below, in has_spec_work) is "is there work
+        // still outstanding". At the default of 1 thread the two agree, so
+        // this is byte-identical to today's submit-one-at-a-time behaviour.
+        if (pool_.spec_host_busy()) {
             ++pump_host_busy_;
         } else if (host_queue_.empty()) {
             ++pump_host_empty_;
         }
-        if (!pool_.spec_host_in_flight() && !host_queue_.empty()) {
+        if (!pool_.spec_host_busy() && !host_queue_.empty()) {
             const size_t take = std::min(spec_chunk_, host_queue_.size());
             std::vector<const ExpertPage *> chunk(
                 host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
@@ -4432,7 +4633,7 @@ public:
             return false;   // gated: nothing may be submitted, so do not spin
         }
         return (!spec_queue_.empty() && !pool_.spec_in_flight()) ||
-               (!host_queue_.empty() && !pool_.spec_host_in_flight());
+               (!host_queue_.empty() && !pool_.spec_host_busy());
     }
 
     // The counter line, built in ONE place so stderr and WP_HINT_LOG cannot
@@ -4676,10 +4877,97 @@ public:
             const long parsed = std::strtol(e, nullptr, 10);
             return parsed > 0 ? (size_t) parsed : (size_t) 1;
         }();
+        // *** WP_EXPERT_RESIDENT_FIRST: overlap reads with compute WITHOUT
+        // giving up determinism (default OFF -- opt-in until A/B'd on real
+        // hardware, 2026-08-19). ***
+        //
+        // WP_EXPERT_COMPUTE_CHUNKS above already overlaps read and compute,
+        // but only by waiting for INDEX-ORDERED chunks to land -- if expert 0
+        // is a miss and expert 1 is a hit, chunk 0 (which covers both) still
+        // blocks on expert 0's read before computing EITHER. WP_EXPERT_OVERLAP
+        // computes hits immediately instead, which hides the read fully, but
+        // it accumulates hits and pageins into the SAME device sum in two
+        // GROUPS (all hits, then all misses) -- a different FP association
+        // than the canonical index-order fold, hence off by default (see the
+        // determinism note above).
+        //
+        // THE SEPARATION THIS PATH MAKES: "compute resident experts while
+        // reads are in flight" and "accumulate in arrival order" are
+        // independent choices. Determinism only cares about the SECOND one.
+        // So: compute each hit into its OWN buffer slot (compute_batch's new
+        // result_offset param) the moment we know it's resident -- before any
+        // read has to finish -- then, after complete(), compute each miss
+        // into its own slot the same way. Nothing is summed until every slot
+        // is filled; fold_resident_first_partials() then does ONE sequential
+        // ggml_add pass over the slots in ASSIGNMENT-INDEX order, exactly the
+        // association the fully-serial path would produce. Bit-identical
+        // output, read time hidden under compute time.
+        //
+        // MEMORY: n_embd * n_tokens floats per assignment (~128 KiB at
+        // n_embd=4096, n_tokens<=8), times tens of experts -- a few MB. That
+        // is why this is gated on n_tokens: at PREFILL widths (n_tokens up to
+        // 2048) the same per-assignment slot is hundreds of MB, which is NOT
+        // an acceptable amount of device memory to hold live for one request.
+        // WP_EXPERT_RESIDENT_FIRST_MAX_TOKENS defaults to 32, the same
+        // decode/spec-window threshold used elsewhere in this worker (see
+        // spec_prefill_gate_width_) -- wide (prefill) requests always fall
+        // through to the chunked-serial path below, unchanged.
+        static const bool s_resident_first = [] {
+            const char * e = std::getenv("WP_EXPERT_RESIDENT_FIRST");
+            return e != nullptr && e[0] == '1';   // default OFF
+        }();
+        static const uint32_t s_resident_first_max_tokens = [] {
+            const char * e = std::getenv("WP_EXPERT_RESIDENT_FIRST_MAX_TOKENS");
+            if (e == nullptr || e[0] == '\0') {
+                return (uint32_t) 32;
+            }
+            const long parsed = std::strtol(e, nullptr, 10);
+            return parsed > 0 ? (uint32_t) parsed : (uint32_t) 32;
+        }();
+        // Gate on there being a read to hide under (have_pageins) same as the
+        // chunked path above: if everything is already resident there is
+        // nothing to overlap and the plain serial path is strictly better
+        // (no extra per-expert graph submits, no fold pass).
+        const bool resident_first_eligible =
+            s_resident_first &&
+            !request.assignments.empty() &&
+            request.n_tokens <= s_resident_first_max_tokens &&
+            have_pageins;
+        size_t resident_first_base_offset = 0;
+        size_t resident_first_slot_size   = 0;
+        if (resident_first_eligible) {
+            // Pre-size io_buffer_ for the canonical input+result slot PLUS
+            // one partial-result slot per assignment BEFORE prepare_io runs.
+            // grow_io_buffer() reallocates a FRESH device buffer on growth
+            // (see its comment) rather than resizing in place, so growing
+            // AFTER prepare_io uploads the activation would silently drop it.
+            const IoSlotLayout layout = compute_io_slot_layout(request.n_tokens);
+            resident_first_slot_size = GGML_PAD(layout.result_size, layout.alignment);
+            resident_first_base_offset =
+                GGML_PAD(layout.result_offset + layout.result_size, layout.alignment);
+            const size_t total = resident_first_base_offset +
+                resident_first_slot_size * request.assignments.size();
+            grow_io_buffer(total, request_stats);
+        }
         if (!request.assignments.empty()) {
             prepare_io(activation, request.n_tokens, request_stats);
             request_stats.ns_prep = lap();
-            if (overlap && have_hits) {
+            if (resident_first_eligible) {
+                // Compute every already-resident expert NOW, each into its
+                // own slot -- this is what overlaps with the reader threads
+                // still pulling the missing pages. See the fold below for
+                // why each expert gets its own slot instead of one shared sum.
+                for (size_t i = 0; i < request.assignments.size(); ++i) {
+                    if (batch.is_resident(i)) {
+                        compute_batch(
+                            request, pages, batch, /* hits = */ true,
+                            /* add_previous = */ false, request_stats,
+                            /* all_experts = */ true, /* force_dense = */ false,
+                            i, i + 1,
+                            resident_first_base_offset + i * resident_first_slot_size);
+                    }
+                }
+            } else if (overlap && have_hits) {
                 compute_batch(
                     request, pages, batch, /* hits = */ true,
                     /* add_previous = */ false, request_stats);
@@ -4706,7 +4994,7 @@ public:
         // Chunk count is a tuning knob, not a correctness one: the summation
         // order is the same at every value, so arms differ only in speed. =1
         // restores the exact serial path.
-        if (!overlap && !request.assignments.empty()) {
+        if (!overlap && !resident_first_eligible && !request.assignments.empty()) {
             const size_t n_assign = request.assignments.size();
             // *** GATE ON THERE BEING READS TO HIDE UNDER. ***
             // Clamping to the assignment count is NOT enough: min(4, 2) == 2, so a
@@ -4746,7 +5034,30 @@ public:
             request_stats.ns_h2d    = batch.ns_h2d();
             request_stats.bytes_h2d = batch.bytes_h2d();
         }
-        if (overlap && have_pageins) {
+        if (resident_first_eligible) {
+            // Reads are drained (batch.complete() above): compute every
+            // formerly-missing expert now, each into its own slot, same as
+            // the hits loop before prepare_io returned.
+            for (size_t i = 0; i < request.assignments.size(); ++i) {
+                if (!batch.is_resident(i)) {
+                    compute_batch(
+                        request, pages, batch, /* hits = */ false,
+                        /* add_previous = */ false, request_stats,
+                        /* all_experts = */ true, /* force_dense = */ false,
+                        i, i + 1,
+                        resident_first_base_offset + i * resident_first_slot_size);
+                }
+            }
+            // *** THE FOLD: CANONICAL ASSIGNMENT-INDEX ORDER. *** Every slot
+            // (hit or miss, computed above at whatever time it became ready)
+            // now holds exactly what compute_batch would have contributed for
+            // that assignment on the plain serial path. Summing them
+            // left-to-right by index -- not by which finished first -- is
+            // what makes this bit-identical to WP_EXPERT_RESIDENT_FIRST=0.
+            fold_resident_first_partials(
+                request.n_tokens, request.assignments.size(),
+                resident_first_base_offset, resident_first_slot_size, request_stats);
+        } else if (overlap && have_pageins) {
             compute_batch(
                 request, pages, batch, /* hits = */ false,
                 /* add_previous = */ have_hits, request_stats);
@@ -5290,7 +5601,23 @@ private:
             // index, so this range selects a matching set of page-ins.
             // Default [0, SIZE_MAX) = every expert, i.e. unchanged behaviour.
             size_t sel_begin = 0,
-            size_t sel_end = std::numeric_limits<size_t>::max()) {
+            size_t sel_end = std::numeric_limits<size_t>::max(),
+            // Overrides where `result` (and the D2/D3 fast paths, which
+            // assume io_result_offset_) land. SIZE_MAX (default) = the
+            // existing single shared slot at io_result_offset_, i.e.
+            // unchanged behaviour for every pre-existing caller.
+            //
+            // WP_EXPERT_RESIDENT_FIRST (see dispatch()) is the only caller
+            // that sets this: it computes each assignment into its OWN
+            // buffer slot instead of accumulating into the shared one, so a
+            // later fold can re-associate them in canonical index order.
+            // D2's cache key does NOT include this offset, so a cache hit
+            // would happily replay a graph built for a DIFFERENT slot and
+            // silently write the wrong buffer -- correctness bug, not a perf
+            // one. D3 (compute_batch_grouped) is hardwired to
+            // io_result_offset_ the same way. Both are disabled below
+            // whenever this is overridden; see the two guards further down.
+            size_t result_offset = std::numeric_limits<size_t>::max()) {
         batch.wait_copy_event(backend_.get());
         const auto selected = [&](size_t i) {
             return i >= sel_begin && i < sel_end &&
@@ -5382,7 +5709,8 @@ private:
             return e != nullptr && e[0] != '\0' && e[0] != '0';
         }();
         if (s_batch_moe && !use_gather && sel_begin == 0 &&
-                sel_end >= request.assignments.size()) {
+                sel_end >= request.assignments.size() &&
+                result_offset == std::numeric_limits<size_t>::max()) {
             compute_batch_grouped(
                 request, pages, batch, selected, n_selected, add_previous, request_stats);
             return;
@@ -5440,7 +5768,8 @@ private:
         }
         GraphCacheEntry * gc = nullptr;
         bool gc_hit = false;
-        if (s_graph_cache && s_params_coalesce && gather_rank_uniform) {
+        if (s_graph_cache && s_params_coalesce && gather_rank_uniform &&
+                result_offset == std::numeric_limits<size_t>::max()) {
             GraphKey key;
             key.n_tokens     = request.n_tokens;
             key.n_selected   = (uint32_t) n_selected;
@@ -5571,8 +5900,10 @@ private:
 
         ggml_tensor * input = make_io_tensor(ctx.get(), request.n_tokens, 0);
         ggml_set_input(input);
+        const size_t effective_result_offset =
+            result_offset == std::numeric_limits<size_t>::max() ? io_result_offset_ : result_offset;
         ggml_tensor * result = make_io_tensor(
-            ctx.get(), request.n_tokens, io_result_offset_);
+            ctx.get(), request.n_tokens, effective_result_offset);
         // *** SEED THE FOLD, DO NOT ADD AT THE END. ***
         // The accumulator below is a LEFT-FOLD in assignment-index order:
         //     sum = ((((e0 + e1) + e2) + ...))
@@ -6128,6 +6459,101 @@ private:
         request_stats.ns_readback +=
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - readback_started).count();
+    }
+
+    // *** WP_EXPERT_RESIDENT_FIRST support: per-slot IO layout + the final
+    // fold. See the big comment on WP_EXPERT_RESIDENT_FIRST in dispatch() for
+    // the overlap argument; these two are just the plumbing. ***
+
+    struct IoSlotLayout {
+        size_t result_offset;   // where the canonical (single, shared) result lands
+        size_t result_size;     // bytes of one [n_embd, n_tokens] slot
+        size_t alignment;
+    };
+
+    // Mirrors prepare_io's offset math EXACTLY (input at 0, result padded
+    // right after it) without touching io_buffer_ -- called BEFORE prepare_io
+    // so the resident-first path can pre-size the buffer for its extra
+    // per-assignment slots before anything is uploaded. Keep this in sync
+    // with prepare_io if that offset math ever changes.
+    IoSlotLayout compute_io_slot_layout(uint32_t n_tokens) const {
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate expert IO layout metadata");
+        }
+        ggml_tensor * probe = ggml_new_tensor_2d(
+            ctx.get(), GGML_TYPE_F32, catalog_.descriptor.hparams.n_embd, n_tokens);
+        const ggml_backend_buffer_type_t buft =
+            ggml_backend_get_default_buffer_type(backend_.get());
+        const size_t input_size = ggml_backend_buft_get_alloc_size(buft, probe);
+        const size_t alignment  = ggml_backend_buft_get_alignment(buft);
+        IoSlotLayout layout;
+        layout.result_offset = GGML_PAD(input_size, alignment);
+        layout.result_size   = input_size;   // input and result are the same [n_embd, n_tokens] shape
+        layout.alignment     = alignment;
+        return layout;
+    }
+
+    // Sums the per-assignment partial buffers written by the
+    // WP_EXPERT_RESIDENT_FIRST path -- one ggml_add per partial, IN
+    // ASSIGNMENT-INDEX ORDER -- and copies the total into the canonical
+    // result slot that read_result() (and every other caller) expects.
+    //
+    // *** THIS IS THE ENTIRE CORRECTNESS ARGUMENT. *** Each partial i already
+    // holds exactly what compute_batch would have contributed for expert i on
+    // the ordinary serial path (same op, same inputs -- compute_batch's
+    // result_offset override changes WHERE it lands, never the per-expert
+    // math). Folding left-to-right over i = 0..n-1 reproduces the exact same
+    // association as the serial path's
+    // `sum = sum ? ggml_add(sum, weighted) : weighted` loop, so the total is
+    // bit-identical to today's default (WP_EXPERT_RESIDENT_FIRST=0) path no
+    // matter which experts were hits, which were pageins, or what order the
+    // reads happened to land in. Fold in arrival or hit/miss-GROUP order
+    // instead (the WP_EXPERT_OVERLAP mistake this path exists to avoid
+    // repeating) and the numbers still look plausible but are NOT
+    // bit-identical -- see the determinism note above WP_EXPERT_OVERLAP.
+    void fold_resident_first_partials(
+            uint32_t n_tokens, size_t n_assign, size_t base_offset,
+            size_t slot_size, RequestStats & request_stats) {
+        const size_t tensor_count = n_assign + 3;
+        const size_t graph_nodes  = n_assign + 1;
+        const ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
+                              ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        context_ptr ctx(ggml_init(params));
+        if (!ctx) {
+            throw std::runtime_error("failed to allocate resident-first fold metadata");
+        }
+        // Left-fold in assignment-index order -- see the correctness note above.
+        ggml_tensor * fold = nullptr;
+        for (size_t i = 0; i < n_assign; ++i) {
+            ggml_tensor * part = make_io_tensor(ctx.get(), n_tokens, base_offset + i * slot_size);
+            fold = fold ? ggml_add(ctx.get(), fold, part) : part;
+        }
+        ggml_tensor * result = make_io_tensor(ctx.get(), n_tokens, io_result_offset_);
+        ggml_tensor * copy = ggml_cpy(ctx.get(), fold, result);
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        ggml_build_forward_expand(graph, copy);
+        if (!ggml_gallocr_alloc_graph(compute_galloc_.get(), graph)) {
+            throw std::runtime_error("failed to allocate resident-first fold graph");
+        }
+        const auto submit_started = std::chrono::steady_clock::now();
+        const enum ggml_status status = ggml_backend_graph_compute(backend_.get(), graph);
+        request_stats.ns_submit +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - submit_started).count();
+        ++request_stats.n_graph_submits;
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("resident-first fold graph compute failed");
+        }
     }
 
     // *** D2 (WP_EXPERT_GRAPH_CACHE): SHAPE-KEYED PERSISTENT GRAPHS. ***
