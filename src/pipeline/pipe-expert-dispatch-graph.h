@@ -275,6 +275,23 @@ class graph_dispatcher {
     // Ready sets awaiting flush, keyed by target layer (a newer set for the
     // same target overwrites -- same staleness argument).
     std::map<int32_t, pred_result>                 pred_ready_;
+    // Prediction-cadence census (2026-08-19). offered = enqueue_prediction calls
+    // (once per layer per forward pass); dropped = snapshots the latest-wins
+    // mailbox overwrote before the scorer could take them; scored = snapshots
+    // the scorer actually processed. offered - dropped should equal scored.
+    // A high drop rate means the predictor is running far below once-per-layer
+    // and the layers it does predict are chosen by thread timing.
+    std::atomic<uint64_t>                          pred_offered_{0};
+    std::atomic<uint64_t>                          pred_dropped_{0};
+    std::atomic<uint64_t>                          pred_scored_{0};
+
+  public:
+    // Exposed so the decode path can log the cadence at end_decode.
+    uint64_t pred_offered() const { return pred_offered_.load(std::memory_order_relaxed); }
+    uint64_t pred_dropped() const { return pred_dropped_.load(std::memory_order_relaxed); }
+    uint64_t pred_scored()  const { return pred_scored_.load(std::memory_order_relaxed); }
+
+  private:
     bool                                           pred_stop_ = false;
     std::thread                                    pred_thread_;
     std::atomic<bool>                              pred_thread_started_{ false };

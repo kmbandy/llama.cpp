@@ -431,13 +431,22 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
                 // that knows how likely each id was.
                 const float  conf_min = predicted_conf_min();
                 const size_t top_m    = predicted_top_m();
+                // *** THE FLOOR IS A PER-LAYER TRUST DECISION, NOT A PER-EXPERT FILTER. ***
+                // Dropping individual experts below the floor has the same defect as
+                // halving top-M: it leaves a layer partially covered, and a partially
+                // covered layer pages in exactly like an uncovered one. So the floor
+                // now asks "is this layer's prediction trustworthy at all" -- if the
+                // BEST expert clears it, emit the whole set; if not, emit nothing and
+                // spend no bandwidth. That still gates volume (an undecided layer
+                // costs zero) without ever producing a useless partial set.
                 if (conf_min > 0.0f) {
-                    hint_ranked_.erase(
-                        std::remove_if(hint_ranked_.begin(), hint_ranked_.end(),
-                                       [conf_min](const hash_oracle::ranked_expert & e) {
-                                           return e.conf < conf_min;
-                                       }),
-                        hint_ranked_.end());
+                    float best = 0.0f;
+                    for (const hash_oracle::ranked_expert & e : hint_ranked_) {
+                        best = std::max(best, e.conf);
+                    }
+                    if (best < conf_min) {
+                        hint_ranked_.clear();
+                    }
                 }
                 if (top_m != 0 && hint_ranked_.size() > top_m) {
                     // Partial sort by DESCENDING confidence, ties by ascending id
@@ -510,6 +519,14 @@ float graph_dispatcher::router2_conf_min() {
     }();
     return value;
 }
+
+// WP_HINT_ROUTER2_DEPTH_DECAY=1 restores the halving of top-M with depth.
+// DEFAULT OFF -- see the note at its use site: emitting fewer experts than a
+// layer consumes cannot stop that layer paging in.
+static const bool s_depth_decay = [] {
+    const char * v = std::getenv("WP_HINT_ROUTER2_DEPTH_DECAY");
+    return v != nullptr && v[0] == '1';
+}();
 
 int graph_dispatcher::router2_lookahead() {
     static const int value = [] {
@@ -587,6 +604,21 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
         }
         {
             std::lock_guard<std::mutex> lock(pred_mutex_);
+            // *** LATEST-WINS MAILBOX: COUNT WHAT IT THROWS AWAY. ***
+            // This is a ONE-SLOT handoff. enqueue_prediction is called once per
+            // LAYER (43x per token); if the scorer thread is still working on
+            // the previous snapshot, this overwrite silently discards a whole
+            // layer's prediction. The scorer does an n_expert x n_embd GEMV per
+            // target layer per snapshot, so at 43 layers/token it plausibly
+            // cannot keep up -- meaning the effective prediction rate, and
+            // WHICH layers get predicted, are decided by thread timing rather
+            // than by anything principled. Until 2026-08-19 nothing recorded
+            // that, so every conclusion about K and conf was drawn without
+            // knowing how often the predictor actually ran.
+            if (pred_inbox_.valid) {
+                ++pred_dropped_;
+            }
+            ++pred_offered_;
             pred_inbox_.layer    = layer;
             pred_inbox_.n_tokens = n_tokens;
             pred_inbox_.activations.assign(activations.begin(), activations.end());
@@ -609,6 +641,7 @@ void graph_dispatcher::predictor_loop() {
             }
             job = std::move(pred_inbox_);
             pred_inbox_.valid = false;
+            ++pred_scored_;
         }
         try {
             const int32_t n_expert = remote.n_expert();
@@ -627,7 +660,18 @@ void graph_dispatcher::predictor_loop() {
                 if (it == routers_.end()) {
                     continue;
                 }
-                const int32_t m = std::max(1, base_m >> d);
+                // *** M IS NEVER LESS THAN n_expert_used. ***
+                // This used to halve top-M with depth (base_m >> d), ported from
+                // the whole-expert pager's submit_xlayer_prefetch. That is wrong
+                // here and it is not a tuning knob, it is a defect: a layer routes
+                // to n_expert_used experts, so prefetching FEWER than that leaves
+                // the layer paging in anyway. The read is spent and the stall
+                // still happens. Partial coverage of a layer is worth nothing --
+                // coverage is all-or-nothing per layer.
+                // At K=36 the old rule emitted 6,3,1,1,1... i.e. one expert against
+                // a layer needing six, which cannot prevent a single page-in.
+                // WP_HINT_ROUTER2_DEPTH_DECAY=1 restores the old behaviour for A/B.
+                const int32_t m = s_depth_decay ? std::max(1, base_m >> d) : base_m;
                 // Clamp at 1.0 -- the bound of a PROBABILITY -- not at an
                 // arbitrary 0.99. The whole-expert pager hardcodes 0.99 here
                 // (wp-pager.cpp:838 and :960) and that ceiling silently
@@ -811,6 +855,24 @@ void graph_dispatcher::begin_decode() noexcept {
 }
 
 void graph_dispatcher::end_decode() noexcept {
+    // PREDICTION CADENCE. Emitted once per decode so a run's log says how often
+    // the predictor actually ran, rather than how often it was asked to. See the
+    // latest-wins comment in enqueue_prediction.
+    if (router2_topm() > 0) {
+        const uint64_t offered = pred_offered();
+        const uint64_t dropped = pred_dropped();
+        if (offered > 0) {
+            // stderr, not LLAMA_LOG_INFO: the library log level filters INFO out of
+            // the router's journal (verified 2026-08-19 -- the same reason the
+            // union diagnostic uses fprintf).
+            std::fprintf(stderr,
+                "expert dispatch predictor: offered=%llu scored=%llu dropped=%llu (%.1f%% dropped)\n",
+                (unsigned long long) offered,
+                (unsigned long long) pred_scored(),
+                (unsigned long long) dropped,
+                100.0 * (double) dropped / (double) offered);
+        }
+    }
     // Last-layer path should have left nothing pending; if anything remains it
     // missed its fold point (bug). Drain and count as late inside the dispatcher.
     try {

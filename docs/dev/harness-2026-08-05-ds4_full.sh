@@ -761,7 +761,7 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # The CPU workers (d0/d1) get neither: their experts are already in RAM.
 #
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
-main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }${REQLOG_S0:+WP_REQ_LOG=$REQLOG_S0 }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
     --descriptor $S0/ds4-s0-experts-experts-manifest-dspark.expert-descriptor.json \
     --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
