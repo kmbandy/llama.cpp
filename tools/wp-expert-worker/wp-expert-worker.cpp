@@ -4564,7 +4564,8 @@ public:
             std::optional<ExpertSlotPool::Batch> prepared = std::nullopt) {
         const bool owns_gate = !prepared.has_value();
         if (owns_gate) {
-            spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
+            spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
+                                        request.n_tokens > spec_prefill_gate_width_;
         }
         // Raise the demand gate for the whole request; preemptible landings
         // pause between slices while it is up. RAII so every exit (including
@@ -4844,7 +4845,8 @@ public:
         for (const pipe_expert_assignment & assignment : request.assignments) {
             pages.push_back(&catalog_.pages.at({ request.layer, assignment.expert_id }));
         }
-        spec_prefill_gate_active_ = spec_prefill_gate_enabled_ && request.n_tokens > 1;
+        spec_prefill_gate_active_ = spec_prefill_gate_enabled_ &&
+                                        request.n_tokens > spec_prefill_gate_width_;
         pool_.demand_serving(true);
         try {
             split_pending pending;
@@ -4942,6 +4944,24 @@ private:
     // that already misses ~everything. Harvest of in-flight reads continues;
     // the gate opens on the first decode-shaped request. DEFAULT OFF until the
     // decomposition arm prices it.
+    // *** WHAT COUNTS AS PREFILL. ***
+    // This gate used to key on n_tokens > 1, which is NOT a prefill test on a
+    // rig running speculative decode: a DSpark verify batch is 1 + n_draft
+    // tokens (~8 at spec-draft-n-max=7), so EVERY decode step tripped it and
+    // the speculative path was switched off permanently -- during exactly the
+    // phase it exists to serve. Measured 2026-08-19: 61,803,183 of 61,845,095
+    // pump calls exited here, 99.93%, while host_landed sat at 3.
+    //
+    // Same conflation as the dsv4 kq_mask gate (llama-kv-cache-dsv4.cpp): a
+    // width that is >1 is not thereby a prompt. Prefill on this serve is
+    // ubatch-wide (2048); the decode/spec window is a couple of dozen at most,
+    // so 32 separates them with two orders of magnitude of margin -- and it is
+    // the same 32 llm_graph_logit_row_cap uses for the same distinction.
+    const uint32_t spec_prefill_gate_width_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_PREFILL_WIDTH");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 32;
+        return v > 0 ? (uint32_t) v : (uint32_t) 32;
+    }();
     const bool spec_prefill_gate_enabled_ = [] {
         const char * e = std::getenv("WP_EXPERT_SPEC_PREFILL_GATE");
         return e != nullptr && e[0] == '1';
