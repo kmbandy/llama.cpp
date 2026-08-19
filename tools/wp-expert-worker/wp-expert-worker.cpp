@@ -4355,16 +4355,29 @@ public:
     // Only the DISK read moved off it, which is the part worth moving.
     //
     // Returns true if it did any work worth staying awake for.
+    // *** PUMP CENSUS (WP_HINT_LOG). ***
+    // spec_pagein_step runs on every dispatch response -- ~5500 times per 128
+    // tokens -- and submits a handful. Which EXIT it takes is the difference
+    // between "the queue is empty", "the reader is busy", and "everything we
+    // predicted is already resident", and those need completely different fixes.
+    // Counting them costs an increment on a path that is already doing I/O.
     bool spec_pagein_step(bool harvest = true) {
+        ++pump_calls_;
         // Host landings run on their own reader thread and never touch the GPU,
         // so they are reaped and refilled independently of the VRAM path.
         pool_.spec_host_reap();
         if (spec_prefill_gate_active_) {
+            ++pump_gated_;
             // Prefill gate: harvest what is in flight, submit nothing new.
             if (harvest && pool_.spec_in_flight()) {
                 return pool_.spec_pagein_poll(false);
             }
             return false;
+        }
+        if (pool_.spec_host_in_flight()) {
+            ++pump_host_busy_;
+        } else if (host_queue_.empty()) {
+            ++pump_host_empty_;
         }
         if (!pool_.spec_host_in_flight() && !host_queue_.empty()) {
             const size_t take = std::min(spec_chunk_, host_queue_.size());
@@ -4372,15 +4385,24 @@ public:
                 host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
             host_queue_.erase(host_queue_.begin(), host_queue_.begin() + (ptrdiff_t) take);
             if (pool_.spec_host_submit(chunk) != 0) {
+                ++pump_host_submit_;
                 return true;
             }
+            // The chunk was consumed but nothing was read: every page in it was
+            // filtered (resident, pinned, or already in the tier). This is the
+            // exit that says the PREDICTIONS are wrong-but-harmless rather than
+            // the pipeline being busy.
+            ++pump_host_filtered_;
         }
         if (pool_.spec_in_flight()) {
+            ++pump_vram_busy_;
             return harvest ? pool_.spec_pagein_poll(false) : false;
         }
         if (spec_queue_.empty()) {
+            ++pump_vram_empty_;
             return false;
         }
+        ++pump_vram_submit_;
         const size_t take = std::min(spec_chunk_, spec_queue_.size());
         std::vector<const ExpertPage *> chunk;
         std::vector<uint64_t>           leases;
@@ -4418,7 +4440,7 @@ public:
     // n_pagein and bytes_read because spend and saving are only interpretable
     // together.
     std::string prefetch_hint_line() const {
-        char buf[512];
+        char buf[1024];
         std::snprintf(buf, sizeof(buf),
                       "frames=%llu experts=%llu "
                       "foreign_layer=%llu foreign_expert=%llu malformed=%llu "
@@ -4426,7 +4448,9 @@ public:
                       "spec_dropped=%llu spec_queue_left=%zu host_queue_left=%zu "
                       "host_landed=%llu host_bytes=%llu host_errors=%llu "
                       "host_promoted=%llu host_wasted=%llu "
-                      "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu",
+                      "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
+                      "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit]="
+                      "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu",
                       (unsigned long long) hint_frames_,
                       (unsigned long long) hint_experts_,
                       (unsigned long long) hint_foreign_layer_,
@@ -4446,7 +4470,16 @@ public:
                       (unsigned long long) pool_.host_skip_bad(),
                       (unsigned long long) pool_.host_skip_pin(),
                       (unsigned long long) pool_.host_skip_vram(),
-                      (unsigned long long) pool_.host_skip_tier());
+                      (unsigned long long) pool_.host_skip_tier(),
+                      (unsigned long long) pump_calls_,
+                      (unsigned long long) pump_gated_,
+                      (unsigned long long) pump_host_busy_,
+                      (unsigned long long) pump_host_empty_,
+                      (unsigned long long) pump_host_submit_,
+                      (unsigned long long) pump_host_filtered_,
+                      (unsigned long long) pump_vram_busy_,
+                      (unsigned long long) pump_vram_empty_,
+                      (unsigned long long) pump_vram_submit_);
         return buf;
     }
 
@@ -4956,6 +4989,17 @@ private:
     }
     // (page, lease) -- provenance is resolved to a lease at enqueue, so nothing
     // downstream has to know where a page came from.
+    // Pump census, dispatch-thread only (spec_pagein_step is never concurrent
+    // with itself), so plain counters -- no atomics needed.
+    uint64_t                        pump_calls_         = 0;
+    uint64_t                        pump_gated_         = 0;
+    uint64_t                        pump_host_busy_     = 0;
+    uint64_t                        pump_host_empty_    = 0;
+    uint64_t                        pump_host_submit_   = 0;
+    uint64_t                        pump_host_filtered_ = 0;
+    uint64_t                        pump_vram_busy_     = 0;
+    uint64_t                        pump_vram_empty_    = 0;
+    uint64_t                        pump_vram_submit_   = 0;
     std::deque<std::pair<const ExpertPage *, uint64_t>> spec_queue_;
     // Predicted pages bound for host RAM. Separate queue, not a flag on the
     // other one: they take a different read path to a different destination.
