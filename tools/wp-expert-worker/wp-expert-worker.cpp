@@ -6575,8 +6575,17 @@ private:
     void fold_resident_first_partials(
             uint32_t n_tokens, size_t n_assign, size_t base_offset,
             size_t slot_size, RequestStats & request_stats) {
-        const size_t tensor_count = n_assign + 3;
-        const size_t graph_nodes  = n_assign + 1;
+        // TENSOR BUDGET -- got this wrong once and it aborted the worker on the
+        // first real request (2026-08-19: "ggml_new_object: not enough space in
+        // the context's memory pool (needed 4048, available 3776)", GGML_ASSERT
+        // in ggml_new_tensor_impl). The fold creates MORE than one tensor per
+        // assignment: n_assign part tensors, n_assign-1 ggml_add results, the
+        // result tensor and the ggml_cpy -- about 2*n_assign+2 -- and
+        // make_io_tensor may add a view per part on top of that. This is
+        // METADATA ONLY (no_alloc = true), so headroom costs a few hundred
+        // bytes and a wrong estimate costs a crash. Be generous.
+        const size_t tensor_count = 4 * n_assign + 16;
+        const size_t graph_nodes  = 2 * n_assign + 8;
         const ggml_init_params params = {
             /* .mem_size = */ ggml_tensor_overhead() * tensor_count +
                               ggml_graph_overhead_custom(graph_nodes, false),
