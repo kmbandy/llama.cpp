@@ -4880,12 +4880,19 @@ private:
         return v >= 0 ? (size_t) v : (size_t) 64;
     }();
     // WP_SPEC_PREDICT_TOPM -- cap the PREDICTED (host_queue_) contribution per
-    // frame. Predictions are the low-value half; keep only the first M.
-    // 0 = uncapped. Default 6 (= n_expert_used).
+    // frame. 0 = uncapped, AND THAT IS THE DEFAULT, deliberately.
+    //
+    // A frame arrives strictly ascending by expert id (the wire's dedup
+    // invariant), so truncating it here keeps the M LOWEST-NUMBERED experts --
+    // selection by nothing. The spine is the only side that knows how likely
+    // each id was, so the real gate and cap live there
+    // (WP_PREFETCH_CONF_MIN / WP_PREFETCH_TOPM); by the time a frame is on the
+    // wire it has already been reduced to the ids worth reading. Set this
+    // non-zero only as a blunt backstop against a spine that is not gating.
     const size_t       spec_predict_topm_ = [] {
         const char * e = std::getenv("WP_SPEC_PREDICT_TOPM");
-        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 6;
-        return v >= 0 ? (size_t) v : (size_t) 6;
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v >= 0 ? (size_t) v : (size_t) 0;
     }();
     // WP_SPEC_SUBMIT_INTERLEAVE=1 (default on) -- submit one spec chunk after
     // each dispatch RESPONSE. Harvest/H2D stays on the idle pump.

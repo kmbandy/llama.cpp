@@ -1020,6 +1020,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // this block's own tokens cannot buy any lead time.
     std::vector<llama_token> prev_draft_toks;
 
+    // The Markov head's acceptance confidence for each of those tokens, same
+    // order and length. Without it the hint site can only say "these tokens
+    // might come next"; with it, it can say how likely each one is, which is
+    // what the expert-level gate in prefetch_for_tokens spends its budget on.
+    std::vector<float> prev_draft_conf;
+
     std::vector<std::vector<float>> capture_embd;
     int32_t capture_n_embd = 0;
 
@@ -1534,19 +1540,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // 0.301 against 0.023 chance), so the nearest tokens carry most of
             // the signal and the tail carries most of the cost. WP_SPEC_PREDICT_N
             // takes the first N; 0 means all of them, which is the run above.
+            //
+            // SIGNAL, NOT JUST VOLUME. WP_SPEC_PREDICT_N cuts the tail by
+            // POSITION, which is a proxy: it assumes token 3 is worth less than
+            // token 1 because it is further away. The drafter already computed
+            // the thing that proxy stands in for -- the acceptance confidence it
+            // uses for its own conf_min truncation -- so carry it. Downstream,
+            // an expert's confidence is the chance any token wanting it is real,
+            // and WP_PREFETCH_CONF_MIN drops the rest. Without this the
+            // predicted frame is the union of everything the block touched and
+            // the only available cap truncates by expert id.
+            std::vector<float> conf(known.size(), 1.0f);   // certain half: 1.0
             if (spec_predict_prev && !prev_draft_toks.empty()) {
                 const size_t take = spec_predict_n > 0
                     ? std::min((size_t) spec_predict_n, prev_draft_toks.size())
                     : prev_draft_toks.size();
                 known.insert(known.end(), prev_draft_toks.begin(),
                              prev_draft_toks.begin() + (ptrdiff_t) take);
+                for (size_t i = 0; i < take; ++i) {
+                    conf.push_back(i < prev_draft_conf.size() ? prev_draft_conf[i] : 1.0f);
+                }
             }
 
             if (!known.empty()) {
                 // n_certain = the id_last entries added first. Everything after
                 // them came from the previous block and is a guess.
                 llama_expert_prefetch_hint(this->params.ctx_tgt, known.data(),
-                                           (int) known.size(), (int) n_certain);
+                                           (int) known.size(), (int) n_certain,
+                                           conf.data());
             }
         }
 
@@ -1638,6 +1659,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         const float * capture_rows = capture_n_embd > 0 ? llama_get_embeddings_layer_inp(ctx_dft, 0) : nullptr;
 
+        // Parallel to each sequence's `result`: how likely the drafter thinks
+        // each token it just proposed is. Carried to the next draft() for the
+        // predicted half of the prefetch hint.
+        std::vector<std::vector<float>> draft_conf(n_seq);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1713,12 +1739,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // confidences are in conf_buf -- one float per token -- instead of being
                 // broadcast across the n_embd_out-wide nextn embeddings buffer. Carry the
                 // stride explicitly rather than assuming either layout.
-                const float * conf        = nullptr;
-                size_t        conf_stride = 0;
-                if (params.conf_min > 0.0f) {
-                    conf        = services_mode ? conf_buf.data() : llama_get_embeddings_nextn(ctx_dft);
-                    conf_stride = services_mode ? 1 : (size_t) n_embd_nextn;
-                }
+                // Resolved UNCONDITIONALLY now: conf_min decides whether to
+                // TRUNCATE the block, but the prefetch hint wants the per-token
+                // confidence either way. The gate below stays keyed on conf_min
+                // so behaviour with the gate off is unchanged.
+                const float * conf        = services_mode
+                    ? (conf_buf.empty() ? nullptr : conf_buf.data())
+                    : llama_get_embeddings_nextn(ctx_dft);
+                const size_t  conf_stride = services_mode ? 1 : (size_t) n_embd_nextn;
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
@@ -1727,7 +1755,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // rows are n_embd_out wide. Striding n_embd_dec here read a quarter
                     // into the wrong row for every idx > 0 and truncated blocks on
                     // arbitrary values.
-                    if (i > 0 && conf && conf[(size_t) idx * conf_stride] < params.conf_min) {
+                    if (i > 0 && conf && params.conf_min > 0.0f &&
+                        conf[(size_t) idx * conf_stride] < params.conf_min) {
                         break;
                     }
 
@@ -1746,6 +1775,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    draft_conf[seq_id].push_back(
+                            conf ? conf[(size_t) idx * conf_stride] : 1.0f);
 
                     if (capture_n_embd > 0) {
                         const float * row = capture_rows + (size_t) idx * capture_n_embd;
@@ -1774,6 +1805,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                    draft_conf[seq_id].push_back(cur_p->data[0].p);
 
                     if (capture_n_embd > 0) {
                         const float * row = capture_rows + (size_t) (beg + i) * capture_n_embd;
@@ -1784,6 +1816,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                draft_conf[seq_id].clear();
                 if (common_speculative_capture_enabled()) {
                     capture_embd[seq_id].clear();
                 }
@@ -1794,12 +1827,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // pager can resolve DS4 hash-layer tid2eid experts (cold pages) and
         // pin last-pass actives across the draft->verify gap. Empty clears.
         std::vector<llama_token> draft_toks;
+        std::vector<float>       draft_confs;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
             }
             const auto & res = *dparams[seq_id].result;
             draft_toks.insert(draft_toks.end(), res.begin(), res.end());
+            // Same concatenation order, so draft_confs[i] belongs to
+            // draft_toks[i]. A sequence that produced no confidences (a path
+            // that pushed tokens without one) pads to 1.0 rather than shifting
+            // every later token onto the wrong confidence.
+            const auto & cf = draft_conf[seq_id];
+            draft_confs.insert(draft_confs.end(), cf.begin(),
+                               cf.begin() + (ptrdiff_t) std::min(cf.size(), res.size()));
+            draft_confs.resize(draft_toks.size(), 1.0f);
         }
         const int n_sub = draft_toks.empty()
             ? llama_wp_on_draft_tokens(this->params.ctx_tgt, nullptr, 0)
@@ -1819,6 +1861,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // Carry this block forward. At the top of the NEXT draft these become the
         // predicted half of the hint, with the whole draft decode as lead.
         prev_draft_toks = draft_toks;
+        prev_draft_conf = draft_confs;
 
         // MAD-LAB / WP_DSPARK_DEBUG: draft-call counter (instrumentation only).
         dbg_n_draft++;

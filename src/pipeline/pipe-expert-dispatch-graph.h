@@ -87,8 +87,24 @@ class graph_dispatcher {
     // n_certain of the leading tokens are ones the target WILL process; the rest
     // are predicted. They are sent as separate frames so the worker can price
     // them differently -- see pipe_hint_provenance.
+    //
+    // `conf` (optional, n_tokens long) is the probability each token is real.
+    // The leading n_certain entries are ignored -- a committed token is 1.0 by
+    // definition -- so this only prices the PREDICTED tail. Without it every
+    // predicted token counts as certain, which is what made the predicted frame
+    // an undifferentiated union that any downstream cap had to truncate by
+    // expert id. See WP_PREFETCH_CONF_MIN / WP_PREFETCH_TOPM.
     size_t prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
-                               size_t n_certain = SIZE_MAX);
+                               size_t n_certain = SIZE_MAX,
+                               const float * conf = nullptr);
+
+    // Minimum per-expert confidence for a PREDICTED hint (WP_PREFETCH_CONF_MIN,
+    // default 0.4 -- the draft head's own conf_min). CERTAIN is never gated.
+    static float predicted_conf_min();
+
+    // Cap on PREDICTED experts per layer frame, highest confidence first
+    // (WP_PREFETCH_TOPM, default 6 = n_expert_used). 0 = uncapped.
+    static size_t predicted_top_m();
 
     // Append the raw token batch to the WP_PREDICT_CAPTURE stream.
     void note_batch_tokens(const int32_t * tokens, size_t n_tokens) noexcept;
@@ -205,6 +221,9 @@ class graph_dispatcher {
     // Scratch for prefetch_for_tokens, reused so a per-decode hint costs no
     // allocation. Not thread safe -- see the "no dispatch in flight" contract.
     std::vector<int32_t>                           hint_experts_;
+    // Scratch for the ranked lookup behind the confidence gate. Same
+    // no-allocation, dispatch-thread-only contract as hint_experts_.
+    std::vector<hash_oracle::ranked_expert>        hint_ranked_;
     // Last expert set hinted per layer. The same token set is now offered from
     // several points in one step (draft start, post-draft, and the ubatch), and
     // without this each would re-send an identical frame that the worker can

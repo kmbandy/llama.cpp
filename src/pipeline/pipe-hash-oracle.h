@@ -97,6 +97,38 @@ class hash_oracle {
                      size_t                 n_tokens,
                      std::vector<int32_t> & out) const;
 
+    // One expert and the confidence that it will actually be needed.
+    struct ranked_expert {
+        int32_t expert_id = -1;
+        float   conf      = 0.0f;
+    };
+
+    // Same lookup as experts_for(), but carrying WHY each expert is in the set.
+    //
+    // experts_for() returns a flat union, and a union is exactly the wrong shape
+    // for a prefetch budget: an expert that one weak draft token selects is
+    // indistinguishable from one that every token selects, so any downstream cap
+    // ends up truncating by expert id -- i.e. by nothing. This keeps the mass.
+    //
+    // `weights[i]` is the probability that token i is real (1.0 for a token the
+    // target is committed to; the draft head's acceptance confidence otherwise).
+    // nullptr means "all 1.0", which reproduces experts_for() exactly.
+    //
+    // An expert's confidence is the probability that AT LEAST ONE token needing
+    // it is real: 1 - prod(1 - w_t) over the tokens t that select it. That is the
+    // quantity the fetch decision actually turns on -- a page is worth reading if
+    // any of the tokens that want it survives -- and it makes two medium tokens
+    // agreeing outrank one medium token alone, which max() would not.
+    //
+    // `out` is cleared first and returned ASCENDING BY EXPERT ID (the wire's
+    // dedup invariant), not by confidence. Rank downstream on `conf`; re-sort
+    // before encoding.
+    bool experts_ranked(int32_t                      layer,
+                        const int32_t *              tokens,
+                        size_t                       n_tokens,
+                        const float *                weights,
+                        std::vector<ranked_expert> & out) const;
+
   private:
     struct table {
         int32_t              layer         = -1;

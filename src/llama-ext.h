@@ -262,10 +262,17 @@ LLAMA_API int llama_wp_on_sampled_token(struct llama_context * ctx,
 // worker can hold them on a shorter lease -- a guess that outranks a certainty
 // converts a free fetch into a displaced fact. -1 means all of them, which is
 // what a caller with no prediction wants.
+//
+// conf: optional, n_tokens long -- the probability each token is real. Entries
+// before n_certain are ignored (a committed token is 1.0 by definition), so this
+// only prices the predicted tail. Pass nullptr and every prediction counts as a
+// certainty, which is what turned the predicted frame into an undifferentiated
+// union of everything the draft block touched. See WP_PREFETCH_CONF_MIN.
 LLAMA_API int llama_expert_prefetch_hint(struct llama_context * ctx,
                                          const llama_token * tokens,
                                          int n_tokens,
-                                         int n_certain);
+                                         int n_certain,
+                                         const float * conf);
 
 // Adaptive gate: when false, skip running the draft model this step (pool
 // already warm for hash-layer experts). Default adaptive ON; WP_DRAFT_ADAPTIVE=0

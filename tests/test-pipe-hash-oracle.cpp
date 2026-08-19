@@ -10,6 +10,7 @@
 
 #include "pipe-hash-oracle.h"
 
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
@@ -174,6 +175,93 @@ static void test_bad_registration_throws() {
     CHECK(oracle.layers() == std::vector<int32_t>({ 0 }));
 }
 
+// ---- experts_ranked: the confidence behind each expert ---------------------
+
+static float conf_of(const std::vector<hash_oracle::ranked_expert> & v, int32_t id) {
+    for (const auto & e : v) {
+        if (e.expert_id == id) {
+            return e.conf;
+        }
+    }
+    return -1.0f;
+}
+
+static bool near(float a, float b) { return std::fabs(a - b) < 1e-5f; }
+
+static void test_ranked_matches_flat_union_without_weights() {
+    const hash_oracle oracle = make_oracle();
+
+    // tokens 0,1 -> {3,1} U {1,5} = {1,3,5}. No weights means every token is
+    // certain, which must reproduce experts_for() exactly, ids and all.
+    const int32_t tokens[] = { 0, 1 };
+    std::vector<int32_t> flat;
+    CHECK(oracle.experts_for(0, tokens, 2, flat));
+
+    std::vector<hash_oracle::ranked_expert> ranked;
+    CHECK(oracle.experts_ranked(0, tokens, 2, nullptr, ranked));
+    CHECK(ranked.size() == flat.size());
+    for (size_t i = 0; i < ranked.size() && i < flat.size(); ++i) {
+        CHECK(ranked[i].expert_id == flat[i]);   // ascending by id, as the wire needs
+        CHECK(near(ranked[i].conf, 1.0f));
+    }
+}
+
+static void test_ranked_agreement_beats_a_single_token() {
+    const hash_oracle oracle = make_oracle();
+
+    // token 0 -> {3,1}, token 1 -> {1,5}. Expert 1 is wanted by BOTH, expert 3
+    // and 5 by one each. With both tokens at 0.5, expert 1 must outrank them:
+    // 1 - 0.5*0.5 = 0.75 vs 0.5. This is the property max() would lose and the
+    // whole reason the frame can be ranked at all.
+    const int32_t tokens[] = { 0, 1 };
+    const float   w[]      = { 0.5f, 0.5f };
+    std::vector<hash_oracle::ranked_expert> ranked;
+    CHECK(oracle.experts_ranked(0, tokens, 2, w, ranked));
+    CHECK(ranked.size() == 3);
+    CHECK(near(conf_of(ranked, 1), 0.75f));
+    CHECK(near(conf_of(ranked, 3), 0.5f));
+    CHECK(near(conf_of(ranked, 5), 0.5f));
+}
+
+static void test_ranked_zero_weight_token_contributes_nothing() {
+    const hash_oracle oracle = make_oracle();
+
+    // A token the drafter is sure is wrong must not put its experts in the set
+    // at all -- not at conf 0, which would still occupy a top-M slot.
+    const int32_t tokens[] = { 0, 2 };
+    const float   w[]      = { 1.0f, 0.0f };
+    std::vector<hash_oracle::ranked_expert> ranked;
+    CHECK(oracle.experts_ranked(0, tokens, 2, w, ranked));
+    CHECK(ranked.size() == 2);              // {1,3} from token 0 only
+    CHECK(conf_of(ranked, 7) < 0.0f);       // token 2's experts absent
+    CHECK(conf_of(ranked, 0) < 0.0f);
+    CHECK(near(conf_of(ranked, 1), 1.0f));
+    CHECK(near(conf_of(ranked, 3), 1.0f));
+}
+
+static void test_ranked_skips_padding_and_bad_tokens() {
+    const hash_oracle oracle = make_oracle();
+
+    // token 3 -> {3, -1}: the padding slot must not become expert -1, and an
+    // out-of-vocab id is skipped rather than throwing (a draft model may
+    // propose one).
+    const int32_t tokens[] = { 3, 99, -4 };
+    const float   w[]      = { 0.25f, 1.0f, 1.0f };
+    std::vector<hash_oracle::ranked_expert> ranked;
+    CHECK(oracle.experts_ranked(0, tokens, 3, w, ranked));
+    CHECK(ranked.size() == 1);
+    CHECK(ranked[0].expert_id == 3);
+    CHECK(near(ranked[0].conf, 0.25f));
+}
+
+static void test_ranked_unknown_layer_is_false_not_throw() {
+    const hash_oracle oracle = make_oracle();
+    const int32_t token = 0;
+    std::vector<hash_oracle::ranked_expert> ranked;
+    CHECK(!oracle.experts_ranked(1, &token, 1, nullptr, ranked));
+    CHECK(ranked.empty());
+}
+
 int main() {
     test_empty();
     test_registration();
@@ -183,6 +271,11 @@ int main() {
     test_out_of_range_tokens_are_skipped();
     test_saturation_early_exit();
     test_bad_registration_throws();
+    test_ranked_matches_flat_union_without_weights();
+    test_ranked_agreement_beats_a_single_token();
+    test_ranked_zero_weight_token_contributes_nothing();
+    test_ranked_skips_padding_and_bad_tokens();
+    test_ranked_unknown_layer_is_false_not_throw();
 
     if (g_failed == 0) {
         std::printf("test-pipe-hash-oracle: all tests passed\n");

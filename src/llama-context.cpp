@@ -529,7 +529,7 @@ static void register_router_oracle(const llama_model &                        mo
 }
 
 int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens,
-                                        int n_certain) {
+                                        int n_certain, const float * conf) {
     if (expert_dispatch == nullptr || tokens == nullptr || n_tokens <= 0) {
         return 0;
     }
@@ -537,17 +537,18 @@ int llama_context::expert_prefetch_hint(const llama_token * tokens, int n_tokens
     // prediction wants and keeps the common case unannotated.
     const size_t certain = n_certain < 0 ? (size_t) n_tokens
                                          : (size_t) std::min(n_certain, n_tokens);
-    return (int) expert_dispatch->prefetch_for_tokens(tokens, (size_t) n_tokens, certain);
+    return (int) expert_dispatch->prefetch_for_tokens(tokens, (size_t) n_tokens, certain, conf);
 }
 
 int llama_expert_prefetch_hint(struct llama_context * ctx,
                                const llama_token * tokens,
                                int n_tokens,
-                               int n_certain) {
+                               int n_certain,
+                               const float * conf) {
     if (ctx == nullptr) {
         return 0;
     }
-    return ctx->expert_prefetch_hint(tokens, n_tokens, n_certain);
+    return ctx->expert_prefetch_hint(tokens, n_tokens, n_certain, conf);
 }
 
 struct llm_fused_op_probe {

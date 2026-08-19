@@ -359,8 +359,34 @@ void graph_dispatcher::register_hash_layer(int32_t         layer,
     oracle_.register_layer(layer, n_expert_used, n_vocab, remote.n_expert(), data);
 }
 
+float graph_dispatcher::predicted_conf_min() {
+    static const float value = [] {
+        const char * v = std::getenv("WP_PREFETCH_CONF_MIN");
+        if (v == nullptr || v[0] == '\0') {
+            // Same 0.4 the draft head's own conf_min uses. A token the drafter
+            // would not have kept is not worth a 9 MiB read either.
+            return 0.4f;
+        }
+        const float f = strtof(v, nullptr);
+        return f > 0.0f ? std::min(f, 1.0f) : 0.0f;   // 0 = gate off
+    }();
+    return value;
+}
+
+size_t graph_dispatcher::predicted_top_m() {
+    static const size_t value = [] {
+        const char * v = std::getenv("WP_PREFETCH_TOPM");
+        if (v == nullptr || v[0] == '\0') {
+            return (size_t) 6;   // n_expert_used: one token's worth of pages
+        }
+        const long m = strtol(v, nullptr, 10);
+        return m > 0 ? (size_t) m : (size_t) 0;   // 0 = uncapped
+    }();
+    return value;
+}
+
 size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_tokens,
-                                             size_t n_certain) {
+                                             size_t n_certain, const float * conf) {
     if (!hint_enabled() || oracle_.empty() || tokens == nullptr || n_tokens == 0) {
         return 0;
     }
@@ -380,10 +406,66 @@ size_t graph_dispatcher::prefetch_for_tokens(const int32_t * tokens, size_t n_to
         if (count == 0) {
             continue;
         }
+        // CERTAIN tokens are ground truth, so their experts are certainties and
+        // the flat union is exactly right. Only the PREDICTED tail carries a
+        // confidence worth spending a fetch budget against.
+        const float * pass_conf = (!certain && conf != nullptr) ? conf + beg : nullptr;
         for (int32_t layer : oracle_.layers()) {
-            if (!oracle_.experts_for(layer, tokens + beg, count, hint_experts_) ||
-                hint_experts_.empty()) {
-                continue;
+            if (certain) {
+                if (!oracle_.experts_for(layer, tokens + beg, count, hint_experts_) ||
+                    hint_experts_.empty()) {
+                    continue;
+                }
+            } else {
+                if (!oracle_.experts_ranked(layer, tokens + beg, count, pass_conf, hint_ranked_) ||
+                    hint_ranked_.empty()) {
+                    continue;
+                }
+
+                // *** THE CONFIDENCE GATE. ***
+                // Before this, a predicted frame was the UNION of every expert
+                // every drafted token touches -- ~6 ids per token into a space of
+                // 256, all indistinguishable. The worker then took the first M in
+                // ASCENDING EXPERT ID, i.e. it selected by nothing. Both the gate
+                // and the cap have to run HERE, because this is the only place
+                // that knows how likely each id was.
+                const float  conf_min = predicted_conf_min();
+                const size_t top_m    = predicted_top_m();
+                if (conf_min > 0.0f) {
+                    hint_ranked_.erase(
+                        std::remove_if(hint_ranked_.begin(), hint_ranked_.end(),
+                                       [conf_min](const hash_oracle::ranked_expert & e) {
+                                           return e.conf < conf_min;
+                                       }),
+                        hint_ranked_.end());
+                }
+                if (top_m != 0 && hint_ranked_.size() > top_m) {
+                    // Partial sort by DESCENDING confidence, ties by ascending id
+                    // so the surviving set is a deterministic function of the
+                    // tokens -- last_hint_ dedup depends on that.
+                    std::nth_element(hint_ranked_.begin(), hint_ranked_.begin() + (ptrdiff_t) top_m,
+                                     hint_ranked_.end(),
+                                     [](const hash_oracle::ranked_expert & a,
+                                        const hash_oracle::ranked_expert & b) {
+                                         return a.conf != b.conf ? a.conf > b.conf
+                                                                 : a.expert_id < b.expert_id;
+                                     });
+                    hint_ranked_.resize(top_m);
+                }
+                if (hint_ranked_.empty()) {
+                    continue;
+                }
+
+                // Back to ascending expert id: that is the wire's dedup invariant
+                // (pipe_encode_expert_prefetch_hint rejects anything else), and
+                // the worker no longer needs the ranking -- the selection it used
+                // to approximate has already happened.
+                hint_experts_.clear();
+                hint_experts_.reserve(hint_ranked_.size());
+                for (const hash_oracle::ranked_expert & e : hint_ranked_) {
+                    hint_experts_.push_back(e.expert_id);
+                }
+                std::sort(hint_experts_.begin(), hint_experts_.end());
             }
             // Same set as last time for this layer and provenance: the worker
             // would resolve it to pages it already holds and discard it. Skip.
