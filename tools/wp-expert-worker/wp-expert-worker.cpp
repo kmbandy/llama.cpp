@@ -4805,6 +4805,15 @@ public:
             request_stats.host_bytes = batch.host_bytes();
         }
 
+        // WP_EXPERT_DOUBLE_BUFFER: see double_buffer_reads_'s comment for the
+        // full argument. Short version -- THIS request's own pages are already
+        // pinned and (if cold) reading by this point, so it is now safe to let
+        // the NEXT layer's already-hinted pages start reading too: submit-only,
+        // reads land underneath whatever this request's compute does next.
+        if (double_buffer_reads_ && spec_enabled_) {
+            (void) spec_pagein_step(/*harvest=*/ false);
+        }
+
         const std::chrono::steady_clock::time_point compute_started =
             measure ? std::chrono::steady_clock::now() :
                       std::chrono::steady_clock::time_point();
@@ -5299,6 +5308,61 @@ private:
     const bool         spec_submit_interleave_enabled_ = [] {
         const char * e = std::getenv("WP_SPEC_SUBMIT_INTERLEAVE");
         return e == nullptr || e[0] != '0';
+    }();
+    // WP_EXPERT_DOUBLE_BUFFER=1 (default OFF) -- submit the NEXT layer's
+    // ALREADY-HINTED page-in reads at the moment THIS request's own compute
+    // begins, instead of waiting for spec_pagein_after_dispatch (fires only
+    // after THIS request's response has been sent) or the idle pump in
+    // await_request (fires only when the socket has nothing waiting). Under a
+    // pipelined spine the gap between "response sent" and "next frame recv'd"
+    // is close to zero, so those two existing call sites almost never gave a
+    // hinted read this request's whole compute span to run under -- only the
+    // recv gap, which is the exact serialization this flag targets: "the next
+    // layer's reads cannot start while the current layer computes."
+    //
+    // *** READS ONLY -- NO SECOND GPU SUBMIT. ***
+    // spec_pagein_step(harvest=false) takes the submit branches only: it may
+    // spawn an spec_host_submit landing thread (host RAM, no GPU at all) or,
+    // if no spec-VRAM batch is already in flight, call spec_pagein_submit,
+    // whose ensure_batch call spins up plain reader threads that only pread()
+    // pages into staging buffers (see spec_pagein_submit's own comment: "READ
+    // pages... WITHOUT building a compute batch"). It never reaches
+    // pool_.spec_pagein_poll, which is the harvest half that runs
+    // drain_one_read's H2D upload -- so this call issues no ggml/backend work
+    // and never touches the backend off the dispatch thread. See
+    // keepalive_tick's comment above: "Vulkan command pools have thread
+    // affinity, so concurrent submits risk corruption even behind a mutex."
+    // That upload still happens later, on this same dispatch thread, inside a
+    // future batch.complete()/spec_pagein_poll -- exactly as it does today.
+    //
+    // *** STAGING BOUND: NOT A NEW ONE -- THE ALREADY-SHIPPED ONE. ***
+    // ensure_batch clamps concurrent reader threads to
+    // min(WP_EXPERT_READ_WORKERS, staging_.buffer_count()) FOR EVERY CALLER,
+    // demand or spec-VRAM alike (see the s_read_workers comment ~30 lines
+    // above ensure_batch's read_worker spawn loop), and spec_pagein_submit
+    // refuses to start a second spec-VRAM batch while one is already in
+    // flight (spec_batch_ != nullptr in spec_pagein_submit). So the worst
+    // case this flag can produce is exactly the one host_thread_cap_'s own
+    // comment already derives with numbers: one demand batch (<=4 readers by
+    // default) plus one spec-VRAM batch (<=4 readers by default) concurrently
+    // = <=8 of the pool's default 16 buffers, with host landings capped
+    // separately at buffer_count()/2. This flag does not raise that ceiling;
+    // it only makes the two batches overlap in time far more often than they
+    // used to (previously the timing rarely lined up). StagingPool::borrow()
+    // was already proven sound for exactly that overlap: no borrower holds a
+    // lease while waiting on a second, so a blocked borrow always has a
+    // draining page ahead of it and cannot deadlock.
+    //
+    // *** WHY dispatch() AND NOT serve_connection(). ***
+    // finish_split_dispatch() (the BEGIN/ACTS split path) calls this same
+    // dispatch() with its batch already ensured at BEGIN time, so hooking
+    // dispatch() covers both the plain PIPE_EXPERT_DISPATCH_REQ path and the
+    // split path from one call site, and fires at each one's own true
+    // compute-start instead of guessing a single point in serve_connection
+    // that is right for neither.
+    const bool         double_buffer_reads_ = [] {
+        const char * e = std::getenv("WP_EXPERT_DOUBLE_BUFFER");
+        return e != nullptr && e[0] == '1';
     }();
 
     template <typename T>
