@@ -499,6 +499,41 @@ int graph_dispatcher::router2_topm() {
     return value;
 }
 
+float graph_dispatcher::router2_conf_min() {
+    static const float value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_CONF");
+        if (v == nullptr || v[0] == '\0') {
+            return 0.10f;   // the whole-expert pager's WP_HOST_PREFETCH_MIN_CONF default
+        }
+        const float f = strtof(v, nullptr);
+        return f > 0.0f ? std::min(f, 1.0f) : 0.0f;   // 0 = gate off, for the A/B
+    }();
+    return value;
+}
+
+int graph_dispatcher::router2_lookahead() {
+    static const int value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_K");
+        if (v == nullptr || v[0] == '\0') {
+            return 1;
+        }
+        return std::min(8, std::max(1, std::atoi(v)));
+    }();
+    return value;
+}
+
+float graph_dispatcher::router2_conf_step() {
+    static const float value = [] {
+        const char * v = std::getenv("WP_HINT_ROUTER2_CONF_STEP");
+        if (v == nullptr || v[0] == '\0') {
+            return 0.05f;
+        }
+        const float f = strtof(v, nullptr);
+        return f > 0.0f ? f : 0.0f;
+    }();
+    return value;
+}
+
 int graph_dispatcher::predict_max_tokens() {
     static const int value = [] {
         const char * v = std::getenv("WP_PREDICT_MAX_TOKENS");
@@ -530,7 +565,14 @@ void graph_dispatcher::enqueue_prediction(int32_t layer, const std::vector<float
             n_tokens > (int64_t) PREFETCH_HINT_MAX_TOKENS || routers_.empty()) {
             return;
         }
-        if (routers_.find(layer + 2) == routers_.end()) {
+        bool any_target = false;
+        for (int d = 0; d < router2_lookahead(); ++d) {
+            if (routers_.find(layer + 2 + d) != routers_.end()) {
+                any_target = true;
+                break;
+            }
+        }
+        if (!any_target) {
             return;   // past the last layer, or the oracle was cleared
         }
         if (!pred_thread_started_.exchange(true)) {
@@ -562,22 +604,36 @@ void graph_dispatcher::predictor_loop() {
             pred_inbox_.valid = false;
         }
         try {
-            const auto it = routers_.find(job.layer + 2);
-            if (it == routers_.end()) {
-                continue;
-            }
-            const router_layer & rl       = it->second;
-            const int32_t        n_expert = remote.n_expert();
-            const int32_t        n_embd   = remote.n_embd();
-            std::vector<int32_t> experts = router2_top_experts(
-                rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
-                n_expert, n_embd, router2_topm());
-            if (experts.empty()) {
-                continue;
-            }
-            {
-                std::lock_guard<std::mutex> lock(pred_mutex_);
-                pred_ready_[job.layer + 2] = { (uint32_t) job.n_tokens, std::move(experts) };
+            const int32_t n_expert = remote.n_expert();
+            const int32_t n_embd   = remote.n_embd();
+            const int     K        = router2_lookahead();
+            const int     base_m   = router2_topm();
+            // DECAYING HORIZON, same policy as the whole-expert pager's
+            // submit_xlayer_prefetch: the nearest target gets the full top-M at
+            // the base floor, and each layer further out gets HALF the width and
+            // a HIGHER floor. Prediction quality falls with distance, so a fixed
+            // (M, conf) at depth 3 spends real bandwidth on noise -- and on this
+            // rig speculative bytes compete with demand reads for the same queue.
+            for (int d = 0; d < K; ++d) {
+                const int32_t target = job.layer + 2 + d;
+                const auto    it     = routers_.find(target);
+                if (it == routers_.end()) {
+                    continue;
+                }
+                const int32_t m = std::max(1, base_m >> d);
+                const float   conf =
+                    std::min(0.99f, router2_conf_min() + (float) d * router2_conf_step());
+                const router_layer & rl = it->second;
+                std::vector<int32_t> experts = router2_top_experts(
+                    rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
+                    n_expert, n_embd, m, conf);
+                if (experts.empty()) {
+                    continue;   // the gate rejected the whole layer: correct, not a failure
+                }
+                {
+                    std::lock_guard<std::mutex> lock(pred_mutex_);
+                    pred_ready_[target] = { (uint32_t) job.n_tokens, std::move(experts) };
+                }
             }
         } catch (...) {
             // Swallow and keep serving; one lost prediction is one lost hint.

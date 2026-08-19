@@ -59,6 +59,55 @@ std::vector<int32_t> rank_top(const std::vector<double> & scores, int32_t top_m)
     return ranked;
 }
 
+// rank_top plus a softmax probability floor. Ported from the whole-expert
+// pager's RouterPredictor::predict (wp-router-predictor.cpp), which is the
+// version this mechanism was proven in.
+//
+// The softmax runs over ALL n_expert pooled scores, so the denominator is the
+// layer's whole routing mass and the resulting p is comparable across layers --
+// that is what makes ONE threshold meaningful for every layer. Scores are
+// shifted by the max before exp() for the usual overflow reason.
+//
+// Emission stops at the FIRST expert below the floor rather than skipping it:
+// the candidates are in descending score order, so every later one is lower too.
+std::vector<int32_t> rank_top_gated(const std::vector<double> & scores, int32_t top_m, float min_conf) {
+    if (scores.empty()) {
+        return {};
+    }
+    const double max_score = *std::max_element(scores.begin(), scores.end());
+    double denom = 0.0;
+    for (const double s : scores) {
+        denom += std::exp(s - max_score);
+    }
+    if (!(denom > 0.0)) {
+        denom = 1.0;
+    }
+
+    // Rank first, then gate: rank_top already resolves ties deterministically
+    // (score desc, then expert id asc), and the hint dedup downstream depends
+    // on the surviving set being a pure function of the activations.
+    std::vector<int32_t> ranked = rank_top(scores, top_m);
+    // rank_top returns ASCENDING ids, so re-order by score to apply the floor.
+    std::sort(ranked.begin(), ranked.end(), [&scores](int32_t a, int32_t b) {
+        if (scores[(size_t) a] != scores[(size_t) b]) {
+            return scores[(size_t) a] > scores[(size_t) b];
+        }
+        return a < b;
+    });
+
+    std::vector<int32_t> kept;
+    kept.reserve(ranked.size());
+    for (const int32_t expert : ranked) {
+        const double p = std::exp(scores[(size_t) expert] - max_score) / denom;
+        if (p < (double) min_conf) {
+            break;
+        }
+        kept.push_back(expert);
+    }
+    std::sort(kept.begin(), kept.end());   // back to the wire's ascending order
+    return kept;
+}
+
 }  // namespace
 
 std::vector<int32_t> router2_top_experts(const float * weights,
@@ -67,7 +116,8 @@ std::vector<int32_t> router2_top_experts(const float * weights,
                                          int64_t       n_tokens,
                                          int32_t       n_expert,
                                          int32_t       n_embd,
-                                         int32_t       top_m) {
+                                         int32_t       top_m,
+                                         float         min_conf) {
     if (weights == nullptr || bias == nullptr || activations == nullptr || n_tokens <= 0 || n_expert <= 0 ||
         n_embd <= 0 || top_m <= 0) {
         return {};
@@ -86,6 +136,9 @@ std::vector<int32_t> router2_top_experts(const float * weights,
             const double score      = (double) std::sqrt(softplus) + (double) bias[expert];
             pooled[(size_t) expert] = std::max(pooled[(size_t) expert], score);
         }
+    }
+    if (min_conf > 0.0f) {
+        return rank_top_gated(pooled, top_m, min_conf);
     }
     return rank_top(pooled, top_m);
 }

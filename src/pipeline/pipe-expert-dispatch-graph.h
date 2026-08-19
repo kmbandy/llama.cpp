@@ -142,6 +142,18 @@ class graph_dispatcher {
     // WP_PREDICT_MAX_TOKENS=n (default 16): skip capture for wider batches.
     static int predict_max_tokens();
 
+    // Softmax probability floor for router-predicted hints (WP_HINT_ROUTER2_CONF,
+    // default 0.10 -- the value the whole-expert pager settled on). 0 = no gate.
+    static float router2_conf_min();
+    // How many layers ahead to predict (WP_HINT_ROUTER2_K, default 1 = just the
+    // L+2 target this path has always had). Depth d gets a HALVED top-M and a
+    // RAISED floor, because prediction quality decays with distance and the
+    // whole-expert measurements showed the tail is where the wasted bytes are.
+    static int   router2_lookahead();
+    // Added to the floor per extra layer of depth (WP_HINT_ROUTER2_CONF_STEP,
+    // default 0.05).
+    static float router2_conf_step();
+
     size_t n_workers() const;
     bool failed() const noexcept;
     std::string failure_message() const;

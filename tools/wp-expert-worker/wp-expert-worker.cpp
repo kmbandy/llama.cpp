@@ -4317,13 +4317,26 @@ public:
         host_queue_.clear();
     }
 
-    // After a dispatch RESPONSE: submit the next spec chunk so the read overlaps
-    // the following layer. Do NOT harvest/H2D here -- drain_one_read copies
-    // ~9 MiB on this thread and would stall the next recv. Harvest stays on
-    // the idle pump.
+    // After a dispatch RESPONSE: keep the speculative pipeline moving so a read
+    // overlaps the following layer.
+    //
+    // THIS MUST HARVEST, AND THE SUBMIT-ONLY VERSION WAS A DEADLOCK. The step
+    // short-circuits on `spec_in_flight()`, and the ONLY place that clears it is
+    // a harvest. The idle pump was supposed to do that, but await_request()
+    // returns the moment a frame is ready, and during continuous decode a frame
+    // is essentially always ready -- so the pump body never ran. Net effect:
+    // exactly ONE speculative read per connection, never reaped, every later
+    // submit dead. Measured 2026-08-19: spec_pageins=+1 against spec_dropped
+    // =+22066 over 128 tokens.
+    //
+    // The harvest is non-blocking (spec_pagein_poll(false) takes only what has
+    // already landed), so the recv thread pays an H2D copy solely on the step
+    // where a read actually completed -- which is the step that also frees the
+    // pipeline to issue the next one. That cost is why this was written
+    // submit-only; a permanently wedged pipeline is the higher price.
     void spec_pagein_after_dispatch() {
         if (spec_submit_interleave_enabled_ && spec_enabled_) {
-            (void) spec_pagein_step(/*harvest=*/ false);
+            (void) spec_pagein_step(/*harvest=*/ true);
         }
     }
 
