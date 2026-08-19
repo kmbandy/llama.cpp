@@ -122,8 +122,9 @@ class dispatcher {
     dispatcher(dispatcher &&) noexcept;
     dispatcher & operator=(dispatcher &&) noexcept;
 
-    // Activations are F16 on the wire. Router weights remain F32, and the
-    // returned reduced block is F32. Calls on one dispatcher are serialized.
+    // Activations are F32 on the wire (since PIPE_VERSION 4). Router weights
+    // remain F32, and the returned reduced block is F32. Calls on one
+    // dispatcher are serialized.
     //
     // When WP_DEFER_K > 0 and this is not the last routed layer, the lowest
     // weight experts are issued but not awaited; their partials are folded

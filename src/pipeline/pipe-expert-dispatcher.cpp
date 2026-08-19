@@ -242,6 +242,27 @@ int parse_wp_defer_k() {
     return (int) parsed;
 }
 
+// WP_DEFER_MAX_WIDTH = upper bound on n_tokens for a dispatch to be eligible
+// for WP_DEFER_K deferral. Default 32.
+//
+// The gate used to be n_tokens == 1, meant to mean "this is decode, not
+// prefill". With speculative decoding ON, a decode forward pass is a VERIFY
+// BATCH of 1 + up to 7 draft tokens, never a single token -- so n_tokens == 1
+// was never true here and the whole WP_DEFER_K mechanism was dead code in
+// production. A batch wider than one token is not thereby a prompt: prefill
+// dispatches the full ubatch (2048 tokens) in one shot, while the decode/
+// spec-verify window is at most a couple dozen tokens, so width -- not
+// exact-one -- is the real prefill/decode discriminator. This is the third
+// time this same width/prompt conflation has been found in this codebase.
+uint32_t defer_max_width_enabled() {
+    const char * value = std::getenv("WP_DEFER_MAX_WIDTH");
+    if (value == nullptr || value[0] == '\0') {
+        return 32;
+    }
+    const int n = std::atoi(value);
+    return n < 0 ? 0u : (uint32_t) n;
+}
+
 uint64_t elapsed_ns(dispatch_clock::time_point begin, dispatch_clock::time_point end) {
     return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
 }
@@ -576,6 +597,7 @@ struct dispatcher::impl {
     // rather than re-deriving it.
     std::map<int32_t, bool>                             layer_slice_mode;
     int                                                 defer_k_value = 0;
+    uint32_t                                            defer_max_width_ = 32;
     std::string                                         model_identity;
     bool                                                poisoned = false;
     bool                                                collect_stats = false;
@@ -637,6 +659,7 @@ struct dispatcher::impl {
         collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
         deferral.defer_k  = defer_k_value;
+        defer_max_width_  = defer_max_width_enabled();
 
         if (endpoints.empty()) {
             throw std::invalid_argument("expert dispatcher requires at least one worker endpoint");
@@ -2305,15 +2328,26 @@ struct dispatcher::impl {
             // layer deferred and drained as n_deferred_late at end_decode.
             const int32_t no_defer_layer =
                 last_no_defer_layer >= 0 ? last_no_defer_layer : last_routed_layer;
-            // Decode only (n_tokens == 1). Prefill shrinks the last layer via
-            // get_rows(out_ids) so a deferred partial from layer L with the full
-            // prefill width cannot fold into layer L+1's MoE output — that was a
-            // silent drop + n_deferred_late path. Spec allows disabling prefill
-            // rather than half-working it.
+            // Decode/spec-verify only, gated on WIDTH (n_tokens <=
+            // defer_max_width_, default 32 via WP_DEFER_MAX_WIDTH) rather than
+            // n_tokens == 1. Prefill dispatches the full ubatch (2048 tokens);
+            // decode is a spec-decode VERIFY BATCH of 1 + up to 7 draft tokens
+            // -- never a single token -- so n_tokens == 1 was never true here
+            // and previously left WP_DEFER_K permanently inert. See
+            // defer_max_width_enabled() above for the width-vs-exact-one
+            // rationale; a batch wider than one token is not thereby a
+            // prompt, and this conflation has now been found three times in
+            // this codebase. Prefill shrinks the last layer via
+            // get_rows(out_ids) so a deferred partial from layer L with the
+            // full prefill width cannot fold into layer L+1's MoE output —
+            // that was a silent drop + n_deferred_late path. Spec allows
+            // disabling prefill rather than half-working it; the width gate
+            // is what keeps prefill (2048 tokens) out of deferral, same as
+            // n_tokens == 1 did, without also excluding every decode step.
             const bool may_defer =
                 defer_k_value > 0 &&
                 layer != no_defer_layer &&
-                n_tokens == 1;
+                n_tokens <= defer_max_width_;
 
             std::vector<pipe_expert_assignment> immediate;
             std::vector<pipe_expert_assignment> deferred;
