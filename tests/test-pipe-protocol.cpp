@@ -539,6 +539,8 @@ static void test_expert_partial_f32_default_bit_identical() {
                        PIPE_ERR_BAD_FRAME);
 }
 
+// Renamed in spirit 2026-08-19: encode-side f16 is gone; this now guards the
+// backward-compatible DECODE path plus the encoder's refusal.
 static void test_expert_partial_f16_roundtrip_tolerance() {
     const int32_t n_embd = 8;
     pipe_expert_partial r;
@@ -560,7 +562,43 @@ static void test_expert_partial_f16_roundtrip_tolerance() {
     };
     CHECK(r.partial.size() == (size_t) r.n_tokens * n_embd);
 
-    std::vector<uint8_t> enc = pipe_encode_expert_partial(r);
+    // *** f16 PRODUCTION WAS REMOVED 2026-08-19. ***
+    // The encoder now REFUSES dtype=F16 outright, so this test can no longer
+    // build its input through it. What still matters -- and what this test now
+    // guards -- is the DECODE half: a worker built from an older commit may
+    // still be sending f16 partials during a rolling restart, and the spine
+    // must keep widening them correctly. So hand-build the wire bytes and
+    // assert (a) encode refuses, (b) decode is unchanged.
+    {
+        bool refused = false;
+        try {
+            (void) pipe_encode_expert_partial(r);
+        } catch (const pipe_protocol_error &) {
+            refused = true;
+        }
+        CHECK(refused);   // encoding an f16 partial must be impossible now
+    }
+
+    // The exact bytes an older worker would have put on the wire:
+    //   i32 layer | u32 n_tokens | i32 dtype | u16[] half-precision payload
+    std::vector<uint8_t> enc(12 + r.partial.size() * 2);
+    {
+        uint8_t * w = enc.data();
+        const auto put32 = [&w](uint32_t v) {
+            w[0] = (uint8_t) (v & 0xff);         w[1] = (uint8_t) ((v >> 8)  & 0xff);
+            w[2] = (uint8_t) ((v >> 16) & 0xff); w[3] = (uint8_t) ((v >> 24) & 0xff);
+            w += 4;
+        };
+        put32((uint32_t) r.layer);
+        put32(r.n_tokens);
+        put32((uint32_t) PIPE_HIDDEN_F16);
+        for (float v : r.partial) {
+            const uint16_t h = ggml_fp32_to_fp16(v);
+            w[0] = (uint8_t) (h & 0xff);
+            w[1] = (uint8_t) ((h >> 8) & 0xff);
+            w += 2;
+        }
+    }
     // half the bytes/value versus f32.
     CHECK(enc.size() == 12 + r.partial.size() * 2);
 

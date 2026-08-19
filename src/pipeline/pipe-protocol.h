@@ -122,7 +122,7 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // 12 -> 13 (2026-08-17): PARTIAL DTYPE TAG. pipe_expert_partial now carries an
 // explicit `dtype` field (pipe_hidden_type: F32=0 default, F16=1) ahead of the
 // partial array, so the SPINE decodes whatever a worker actually sent rather
-// than assuming f32. This is what makes WP_EXPERT_PARTIAL_DTYPE=f16 (worker-side,
+// than assuming f32. This is what made WP_EXPERT_PARTIAL_DTYPE=f16 (worker-side,
 // per-process, default OFF -- see wp-expert-worker.cpp) safe to enable on some
 // workers and not others: the tag is self-describing, so a spine that has never
 // heard of the env var still decodes correctly, and a worker/spine version
@@ -138,9 +138,19 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // bump makes that pairing fail loudly at HELLO instead. Once both peers are on
 // version 13, the tag alone is what keeps a WORKER-side config knob from ever
 // being able to corrupt the SPINE's sum: the spine does not need to know or
-// agree with WP_EXPERT_PARTIAL_DTYPE, it only needs to trust the tag on the
+// agree with a worker's dtype choice, it only needs to trust the tag on the
 // frame it just received, which it always can because the tag was written by
 // the same process that wrote the bytes after it.
+//
+// REMOVED 2026-08-19: WP_EXPERT_PARTIAL_DTYPE=f16 (the worker-side knob that
+// opted a partial into f16) has been deleted -- see the struct comment on
+// `dtype` below for why. PIPE_VERSION stays at 13 and the wire format is
+// UNCHANGED: `dtype` remains on the wire and decoders (this file and the
+// spine) still accept and correctly widen an f16 partial, because a worker
+// built from an older commit can still be running against a newer spine
+// during a rolling restart. What is gone is this process's ability to ever
+// WRITE dtype=F16 into a frame it sends -- see pipe_encode_expert_partial()
+// in pipe-protocol.cpp.
 static constexpr uint32_t PIPE_VERSION = 13u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
@@ -420,9 +430,9 @@ struct pipe_expert_prefetch_hint {
 struct pipe_expert_partial {
     int32_t            layer    = -1;
     uint32_t           n_tokens = 0;
-    // *** f32 ON THE WIRE BY DEFAULT. CHANGED 2026-08-04 -- THIS WAS A CORRECTNESS
-    // BUG (see the full history below); f32 is the safe default and stays that way
-    // unless a worker opts in to f16 via WP_EXPERT_PARTIAL_DTYPE=f16.
+    // *** f32 ON THE WIRE, ALWAYS. CHANGED 2026-08-04 -- THIS WAS A CORRECTNESS
+    // BUG (see the full history below); f32 is the safe default and, as of
+    // 2026-08-19, the ONLY thing this process will ever encode here.
     //
     // Each worker sums ITS OWN subset of a layer's experts in f32 and the spine adds
     // the per-worker subtotals. Sending the subtotal as f16 rounded it to an 11-bit
@@ -438,21 +448,29 @@ struct pipe_expert_partial {
     // f32 removes the amplifier entirely; what remains is ordinary f32 reordering
     // (~1e-7). Costs 2x bytes on the partial-return path only.
     //
-    // *** dtype ADDED 2026-08-17 (WP_EXPERT_PARTIAL_DTYPE). ***
+    // *** dtype ADDED 2026-08-17 (WP_EXPERT_PARTIAL_DTYPE), REMOVED 2026-08-19. ***
     // The correctness bug above was about f16 being UNCONDITIONAL and UN-TAGGED: the
     // spine had no way to know a partial had been rounded, so a partition-dependent
-    // subtotal error looked like ordinary noise. This is different: it is an OPT-IN,
-    // PER-WORKER, SELF-DESCRIBING encoding. `dtype` says exactly what `partial`'s
-    // bytes mean on THIS frame, so the spine always decodes correctly regardless of
-    // what any worker's env var says -- a worker/spine version or config mismatch can
-    // misinterpret nothing, because the tag travels with the bytes it describes.
-    // What f16 partials reintroduce is the SAME quantization risk the 2026-08-04 note
-    // describes (~5e-4 relative per worker, amplified by hyper-connection gates and
-    // top-k), which is why it is default OFF and meant for links that are bandwidth-
-    // bound (e.g. a 1 GbE hop to a remote worker) rather than for every deployment.
-    // Acceptable under f16 KV; risky under turbo4 KV, per the same amplification
-    // mechanism documented above -- that is why this stays opt-in rather than becoming
-    // the new default.
+    // subtotal error looked like ordinary noise. The dtype tag fixed the DETECTION
+    // problem -- `dtype` says exactly what `partial`'s bytes mean on THIS frame, so
+    // the spine always decodes correctly regardless of what any worker's env var
+    // says -- but it never fixed the underlying risk: an f16 partial reintroduces
+    // the SAME quantization amplification the 2026-08-04 note above describes
+    // (~5e-4 relative per worker, amplified by hyper-connection gates and the
+    // discontinuous router top-k), which still makes a temperature-0 trajectory depend on worker
+    // assignment. Measured savings were ~16 KB per layer per remote worker (~0.13 ms)
+    // against that risk, and f16 partials independently measured at -10% decode
+    // throughput anyway -- worst cost/risk ratio in the codebase per external review.
+    // WP_EXPERT_PARTIAL_DTYPE=f16 has been DELETED: this process can no longer
+    // PRODUCE an f16 partial (see pipe_encode_expert_partial() in
+    // pipe-protocol.cpp, which now rejects any dtype other than PIPE_HIDDEN_F32).
+    // DO NOT REINTRODUCE A WORKER-SIDE F16-ENCODE KNOB FOR THIS FIELD.
+    //
+    // The `dtype` field itself and PIPE_HIDDEN_F16 stay on the wire and in
+    // pipe_decode_expert_partial() on purpose: a worker built from an older
+    // commit may still be running against a newer spine during a rolling
+    // restart (and vice versa), and it must keep decoding correctly rather than
+    // erroring on a frame a stale peer legitimately sent.
     int32_t             dtype = PIPE_HIDDEN_F32;
     std::vector<float> partial;
 };

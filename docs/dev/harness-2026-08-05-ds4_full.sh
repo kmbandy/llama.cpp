@@ -791,12 +791,7 @@ D1_PID=$(main_sh "cat $OUT/w-d1.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $D1_P
 echo "  w-d1 (CPU 85-255) pid ${D1_PID:-?}"
 
 # --- s1: 2026 GTX 1070 (CUDA0) slice1 w320, layers 0-42 ---
-# PARTIAL_DTYPE=f16 sends this leg's expert partials as f16 on the wire (halves
-# the remote bytes over the 1 GbE hop). Applied to s1/s2 ONLY -- the loopback
-# R9700 and local CPU workers keep f32 (their bytes are free and f16 adds ~5e-4
-# rounding at the partial-sum boundary). Self-describing frame; spine sums in
-# f32. REAL NLL risk -- gate before adopting.
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S1/ds4-s1-experts-experts-manifest-dspark.json \
     --descriptor $S1/ds4-s1-experts-experts-manifest-dspark.expert-descriptor.json \
     --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
@@ -807,7 +802,7 @@ echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
 # --- s2: 2026 RX 480 (Vulkan0) slice2 w320, layers 0-42 ---
 # The 480 has a 256 MB BAR and no ReBAR; without the host-visible-vidmem cap ~95%
 # of its slots spill into GTT and every matmul streams over PCIe (doc §1/§2).
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S2/ds4-s2-experts-experts-manifest-dspark.json \
     --descriptor $S2/ds4-s2-experts-experts-manifest-dspark.expert-descriptor.json \
     --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"

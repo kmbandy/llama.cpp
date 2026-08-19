@@ -31,12 +31,6 @@ static void wr_u64(uint8_t * & p, uint64_t v) {
     p += 8;
 }
 
-static void wr_u16(uint8_t * & p, uint16_t v) {
-    p[0] = (uint8_t) (v >> 0);
-    p[1] = (uint8_t) (v >> 8);
-    p += 2;
-}
-
 static void wr_i32(uint8_t * & p, int32_t v) {
     wr_u32(p, (uint32_t) v);
 }
@@ -131,29 +125,25 @@ static void rd_f32_bulk(const uint8_t * & p, float * dst, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// BULK f16 wire path (2026-08-17, WP_EXPERT_PARTIAL_DTYPE).
+// BULK f16 wire path (added 2026-08-17 for WP_EXPERT_PARTIAL_DTYPE).
+//
+// Only the READ side survives here. The knob that let this process WRITE an
+// f16 expert partial (wr_u16_bulk, plus the encode-side fp32->fp16 branch in
+// pipe_encode_expert_partial()) was removed 2026-08-19 -- see the struct
+// comment on pipe_expert_partial::dtype in pipe-protocol.h for why. The read
+// side stays: a worker built from an older commit may still send dtype=F16
+// during a rolling restart, and this spine (and any future spine) must keep
+// decoding it correctly rather than erroring, so pipe_decode_expert_partial()
+// below still needs a bulk f16 reader.
 //
 // ggml_fp16_t is a plain uint16_t holding an IEEE754 binary16, which is
 // exactly the wire representation this struct's comment promises. On a
 // little-endian host that IS the wire byte order, so -- same reasoning as
 // PIPE_F32_WIRE_IS_HOST above -- the bulk path is a memcpy and the scalar
 // byte-explicit path is kept for big-endian portability only. This never
-// touches VALUE precision: the fp32<->fp16 rounding happens once, in
-// ggml_fp32_to_fp16_row / ggml_fp16_to_fp32_row (bulk row conversions, not a
-// hand-rolled per-element loop), before or after these bytes ever move.
-static void wr_u16_bulk(uint8_t * & p, const uint16_t * src, size_t n) {
-#if PIPE_F32_WIRE_IS_HOST
-    if (n != 0) {
-        std::memcpy(p, src, n * sizeof(uint16_t));
-        p += n * sizeof(uint16_t);
-    }
-#else
-    for (size_t i = 0; i < n; ++i) {
-        wr_u16(p, src[i]);
-    }
-#endif
-}
-
+// touches VALUE precision: the fp16->fp32 widening happens once, in
+// ggml_fp16_to_fp32_row / pipe_simd_convert_f16_to_f32 (bulk row conversions,
+// not a hand-rolled per-element loop), after these bytes have moved.
 static void rd_u16_bulk(const uint8_t * & p, uint16_t * dst, size_t n) {
 #if PIPE_F32_WIRE_IS_HOST
     if (n != 0) {
@@ -732,13 +722,22 @@ pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
 // expert partial response
 
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
-    // dtype is self-describing on the wire as of PIPE_VERSION 13 (see the version
-    // history and the struct comment in pipe-protocol.h): the WORKER decides f32
-    // vs f16 per WP_EXPERT_PARTIAL_DTYPE, tags the frame with what it actually
-    // sent, and the spine decodes whatever the tag says regardless of its own
-    // config -- so a worker/spine mismatch can misdecode nothing.
-    if (p.dtype != PIPE_HIDDEN_F32 && p.dtype != PIPE_HIDDEN_F16) {
-        fail(PIPE_ERR_BAD_FRAME, "pipe: expert partial has unknown dtype %d", p.dtype);
+    // `dtype` is still self-describing on the wire as of PIPE_VERSION 13 (see the
+    // version history and the struct comment in pipe-protocol.h), and
+    // pipe_decode_expert_partial() below still accepts PIPE_HIDDEN_F16 from a
+    // stale worker during a rolling restart. But as of 2026-08-19 this process
+    // will not PRODUCE one: WP_EXPERT_PARTIAL_DTYPE=f16 rounded a per-worker
+    // partial subtotal at the expert-partition boundary, which made generated
+    // text at temperature 0 depend on which worker an expert happened to land
+    // on -- a correctness risk the ~16 KB/layer/worker bandwidth saving (and a
+    // measured -10% decode throughput) did not justify. The knob is gone; only
+    // f32 is ever written here. Do not resurrect an f16 branch in this
+    // function -- if a future change legitimately needs to send f16 partials,
+    // that needs a new correctness case, not simply restoring this code.
+    if (p.dtype != PIPE_HIDDEN_F32) {
+        fail(PIPE_ERR_BAD_FRAME,
+             "pipe: expert partial encode only supports PIPE_HIDDEN_F32 (got dtype %d) -- "
+             "f16 partial production was removed, see pipe-protocol.h", p.dtype);
     }
     const uint32_t elt = pipe_hidden_elt_size(p.dtype);
     const uint64_t total = 12ull + (uint64_t) p.partial.size() * (uint64_t) elt;
@@ -750,19 +749,9 @@ std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p) {
     wr_i32(w, p.layer);
     wr_u32(w, p.n_tokens);
     wr_i32(w, p.dtype);
-    if (p.dtype == PIPE_HIDDEN_F16) {
-        // Bulk row conversion (ggml_fp32_to_fp16_row), not a hand-rolled
-        // per-element cast -- see the BULK f16 wire path note above.
-        std::vector<ggml_fp16_t> half(p.partial.size());
-        if (!half.empty()) {
-            ggml_fp32_to_fp16_row(p.partial.data(), half.data(), (int64_t) half.size());
-        }
-        wr_u16_bulk(w, half.data(), half.size());
-    } else {
-        // dtype == PIPE_HIDDEN_F32: bit-for-bit the same encoding this frame
-        // used before the dtype tag existed -- only the 4-byte tag itself is new.
-        wr_f32_bulk(w, p.partial.data(), p.partial.size());
-    }
+    // Bit-for-bit the same f32 encoding this frame has always used -- only the
+    // 4-byte dtype tag ahead of it (added in PIPE_VERSION 13) is new.
+    wr_f32_bulk(w, p.partial.data(), p.partial.size());
     return out;
 }
 

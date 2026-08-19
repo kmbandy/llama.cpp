@@ -2021,11 +2021,15 @@ struct dispatcher::impl {
                                      " want_n_tokens=" + std::to_string(want_rows) + ")");
         }
         // `partial.partial` is ALWAYS f32 here regardless of what dtype the worker
-        // put on the wire (PIPE_VERSION 13, WP_EXPERT_PARTIAL_DTYPE): the tag lives
-        // on the frame and pipe_decode_expert_partial() does the fp16->fp32 widening
-        // internally before this function ever sees the vector. The spine does not
-        // need to know or configure anything about a worker's dtype choice -- it
-        // only ever operates on f32, and scatter_add below sums in f32 either way.
+        // put on the wire (PIPE_VERSION 13's self-describing dtype tag): the tag
+        // lives on the frame and pipe_decode_expert_partial() does the fp16->fp32
+        // widening internally before this function ever sees the vector. The spine
+        // does not need to know or configure anything about a worker's dtype choice
+        // -- it only ever operates on f32, and scatter_add below sums in f32 either
+        // way. Current workers only ever send f32 (WP_EXPERT_PARTIAL_DTYPE=f16 was
+        // removed 2026-08-19, see pipe-protocol.h), but the decode path still
+        // accepts f16 from a stale worker mid-rolling-restart, so this comment and
+        // the code below make no assumption about which one arrives.
         out.assign(partial.partial.begin(), partial.partial.end());
         GGML_ASSERT(out.size() == want_vals);
         GGML_UNUSED(n_values);

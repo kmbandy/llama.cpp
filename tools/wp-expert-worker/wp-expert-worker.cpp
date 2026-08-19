@@ -1206,31 +1206,18 @@ int cpu_worker_n_threads() {
 // KV, where the same amplification mechanism that motivated the f32 default
 // lives. Hence: opt-in, per-worker, and off unless a human explicitly asks for
 // it on the specific link that needs it.
-int32_t wp_expert_partial_dtype() {
-    static const int32_t dtype = [] {
-        const char * e = std::getenv("WP_EXPERT_PARTIAL_DTYPE");
-        int32_t      resolved = PIPE_HIDDEN_F32;
-        const char * label    = "f32";
-        if (e != nullptr && e[0] != '\0') {
-            if (std::strcmp(e, "f16") == 0) {
-                resolved = PIPE_HIDDEN_F16;
-                label    = "f16";
-            } else if (std::strcmp(e, "f32") != 0) {
-                std::fprintf(stderr,
-                    "wp-expert-worker: WP_EXPERT_PARTIAL_DTYPE=\"%s\" is not "
-                    "\"f32\" or \"f16\" -- defaulting to f32\n", e);
-            }
-        }
-        // Logged unconditionally (not just on override) so a run's log always
-        // states the resolved config, per the "CONFIG NOT HARDCODE" requirement --
-        // a silent default is indistinguishable from a hardcode from the log alone.
-        std::cout << "wp-expert-worker: WP_EXPERT_PARTIAL_DTYPE=" << label
-                  << " (partial responses encoded as " << label << " on the wire)"
-                  << std::endl;
-        return resolved;
-    }();
-    return dtype;
-}
+// WP_EXPERT_PARTIAL_DTYPE REMOVED 2026-08-19. The knob let a worker send its
+// expert partial as f16, rounding the subtotal to an 11-bit mantissa AT THE
+// EXPERT->WORKER PARTITION BOUNDARY -- and which expert lands on which worker
+// moves with batch width, so the model's output depended on the assignment. It
+// changed generated text at temperature 0. The self-describing dtype tag made
+// that DETECTABLE, never SAFE. It bought ~16 KiB per layer per remote worker
+// (~0.13 ms) and measured -10% decode besides. DO NOT REINTRODUCE.
+//
+// The WIRE FORMAT is unchanged and PIPE_VERSION is NOT bumped: the spine still
+// decodes an f16 partial correctly, because a worker built from an older commit
+// may still be sending one during a rolling restart. What is gone is this
+// process's ability to PRODUCE one.
 
 backend_ptr init_backend(const std::string & device) {
     std::string lower = device;
@@ -5130,11 +5117,11 @@ public:
         // spine adds the other workers' subtotals to it. Rounding a partial sum to f16
         // put a ~5e-4 relative error at the expert->worker partition boundary, so the
         // layer output depended on which worker happened to get which expert. See
-        // wp_expert_partial_dtype() above for the full opt-in-f16 rationale and why
-        // stamping response.dtype here (rather than hardcoding PIPE_HIDDEN_F32) is
-        // safe: the tag travels with the bytes, so the spine decodes correctly no
-        // matter what this worker -- or any other worker on the same layer -- chose.
-        response.dtype = wp_expert_partial_dtype();
+        // f32 UNCONDITIONALLY since 2026-08-19 -- the f16 opt-in was removed, see
+        // the tombstone above wp_expert_partial_dtype()'s former definition. The
+        // tag is still stamped (not omitted) so the frame stays self-describing
+        // for a spine decoding partials from mixed-vintage workers.
+        response.dtype = PIPE_HIDDEN_F32;
         response.partial.assign(sum.begin(), sum.end());
         request_stats.ns_encode = lap();
         return response;
@@ -7176,13 +7163,6 @@ int run(const Options & options) {
             "failed to listen on " + options.listen_host + ":" +
             std::to_string(options.listen_port));
     }
-    // Resolve + log WP_EXPERT_PARTIAL_DTYPE BEFORE serving, not lazily on the
-    // first request -- "read once at startup, logged at startup" per the config
-    // knob's own contract. wp_expert_partial_dtype() prints its own resolved-value
-    // line on first call (see its definition); forcing that call here, ahead of
-    // the summary line below, is what makes it a startup log rather than a
-    // first-request log.
-    const int32_t partial_dtype = wp_expert_partial_dtype();
     std::cout << "expert worker listening on " << options.listen_host << ":"
               << options.listen_port << " device=" << options.device
               << " experts=" << advertised.expert_first << "-"
@@ -7198,7 +7178,7 @@ int run(const Options & options) {
               << resources.staging_buffer_bytes
               << " host_budget=" << resources.host_budget_bytes
               << " host_victim_budget=" << options.host_victim_bytes
-              << " partial_dtype=" << (partial_dtype == PIPE_HIDDEN_F16 ? "f16" : "f32")
+              << " partial_dtype=f32"
               << '\n';
     for (const SlotClass & slot_class : resources.slot_classes) {
         std::cout << "expert slot class bytes=" << slot_class.size
