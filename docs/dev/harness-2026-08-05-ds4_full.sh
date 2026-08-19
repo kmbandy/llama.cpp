@@ -750,6 +750,15 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # inside braces with stdin from /dev/null, record $! to a pidfile so teardown
 # signals the worker, not a wrapper (2026-08-10 note above still applies).
 
+# HOSTVICTIM_* / HOSTSPEC_* size the two halves of each GPU worker's host tier:
+# victim bytes (evicted VRAM pages) and reserved prefetch-landing bytes. EVERY
+# GPU worker needs both. This rig is sliced by WIDTH, not by expert index --
+# s0/s1/s2 each hold their own slice of EVERY expert across layers 0-42 -- so a
+# hash-oracle hint for layers 0-2 resolves to a page on ALL THREE, and each has
+# to land it locally or the layer still waits on the slowest arrival. Sizing the
+# reservation on s0 alone would leave the long pole exactly where it was.
+# The CPU workers (d0/d1) get neither: their experts are already in RAM.
+#
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
 main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
