@@ -621,8 +621,15 @@ void graph_dispatcher::predictor_loop() {
                     continue;
                 }
                 const int32_t m = std::max(1, base_m >> d);
+                // Clamp at 1.0 -- the bound of a PROBABILITY -- not at an
+                // arbitrary 0.99. The whole-expert pager hardcodes 0.99 here
+                // (wp-pager.cpp:838 and :960) and that ceiling silently
+                // overrides an explicit setting: ask for a 0.995 floor and you
+                // get 0.99 with nothing reporting the difference. A floor that
+                // reaches 1.0 at depth d means "emit nothing that far out",
+                // which is a legitimate answer and needs no magic number.
                 const float   conf =
-                    std::min(0.99f, router2_conf_min() + (float) d * router2_conf_step());
+                    std::min(1.0f, router2_conf_min() + (float) d * router2_conf_step());
                 const router_layer & rl = it->second;
                 std::vector<int32_t> experts = router2_top_experts(
                     rl.w.data(), rl.b.data(), job.activations.data(), job.n_tokens,
