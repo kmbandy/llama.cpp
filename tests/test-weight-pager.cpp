@@ -1330,6 +1330,99 @@ static int test_host_tier_speculative_evicts_before_victim() {
     return fails;
 }
 
+static int test_host_tier_spec_budget_reservation() {
+    int fails = 0;
+    std::vector<uint8_t> bytes(32, 0x11);
+    std::vector<uint8_t> out(bytes.size());
+
+    // 128-byte arena = 4 pages, split 2 victim / 2 speculative.
+    // THE PROPERTY UNDER TEST: demand traffic cannot consume the speculative
+    // reservation. Eviction ORDER alone does not give this -- with one shared
+    // pool a demand-saturated tier leaves a landing nowhere to go, which is
+    // exactly the sliced rig's host_landed == 0 against a full 3 GiB tier.
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "reserved tier init");
+        tier.set_speculative_tier(true);
+        tier.set_spec_budget(64);   // 2 pages reserved for predictions
+        EXPECT_EQ_INT((int) tier.spec_budget_bytes(), 64, "spec budget set");
+
+        // Four victims into a 2-page victim side: the last two must evict the
+        // first two and NEVER spill into the reservation.
+        EXPECT(tier.store(1, bytes.data(), bytes.size(), /*speculative=*/false), "victim 1");
+        EXPECT(tier.store(2, bytes.data(), bytes.size(), /*speculative=*/false), "victim 2");
+        EXPECT(tier.store(3, bytes.data(), bytes.size(), /*speculative=*/false), "victim 3");
+        EXPECT(tier.store(4, bytes.data(), bytes.size(), /*speculative=*/false), "victim 4");
+        EXPECT(!tier.lookup(1, out.data(), out.size()), "oldest victim evicted by victim pressure");
+        EXPECT(!tier.lookup(2, out.data(), out.size()), "second victim evicted too");
+        EXPECT(tier.lookup(3, out.data(), out.size()), "victim 3 resident");
+        EXPECT(tier.lookup(4, out.data(), out.size()), "victim 4 resident");
+
+        // The reservation is still empty and still available -- this is the
+        // whole point. Before the split these stores would have failed or
+        // displaced a victim.
+        EXPECT_EQ_INT((int) tier.spec_used_bytes(), 0, "reservation untouched by demand");
+        EXPECT(tier.store(101, bytes.data(), bytes.size(), /*speculative=*/true), "landing 101 fits");
+        EXPECT(tier.store(102, bytes.data(), bytes.size(), /*speculative=*/true), "landing 102 fits");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 2, "both landings resident");
+        EXPECT(tier.lookup(3, out.data(), out.size()), "landings did not evict a victim");
+        EXPECT(tier.lookup(4, out.data(), out.size()), "landings did not evict a victim");
+    }
+
+    // The reservation is a CEILING as well as a floor: predictions may not
+    // grow past it and eat the victim side.
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "ceiling tier init");
+        tier.set_speculative_tier(true);
+        tier.set_spec_budget(64);
+
+        EXPECT(tier.store(1, bytes.data(), bytes.size(), /*speculative=*/false), "victim 1");
+        EXPECT(tier.store(101, bytes.data(), bytes.size(), /*speculative=*/true), "landing 101");
+        EXPECT(tier.store(102, bytes.data(), bytes.size(), /*speculative=*/true), "landing 102");
+        EXPECT(tier.store(103, bytes.data(), bytes.size(), /*speculative=*/true), "landing 103");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 2, "predictions capped at the reservation");
+        EXPECT(!tier.lookup(101, out.data(), out.size()), "oldest prediction evicted by prediction");
+        EXPECT(tier.lookup(1, out.data(), out.size()), "victim untouched by prediction pressure");
+    }
+
+    // A promotion moves bytes across the line: the confirmed page now counts
+    // against the victim side, freeing its reserved slot for a new landing.
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/128, /*device_idx=*/-1), "promote tier init");
+        tier.set_speculative_tier(true);
+        tier.set_spec_budget(64);
+
+        EXPECT(tier.store(101, bytes.data(), bytes.size(), /*speculative=*/true), "landing 101");
+        EXPECT_EQ_INT((int) tier.spec_used_bytes(), 32, "reservation holds the landing");
+        EXPECT(tier.lookup(101, out.data(), out.size()), "demand hit confirms it");
+        EXPECT_EQ_INT((int) tier.spec_used_bytes(), 0, "confirmed page left the reservation");
+        EXPECT_EQ_INT((int) tier.speculative_promotions(), 1, "promotion counted");
+
+        EXPECT(tier.store(102, bytes.data(), bytes.size(), /*speculative=*/true), "landing 102");
+        EXPECT(tier.store(103, bytes.data(), bytes.size(), /*speculative=*/true), "landing 103");
+        EXPECT_EQ_INT((int) tier.speculative_count(), 2, "reservation refilled after promotion");
+        EXPECT(tier.lookup(101, out.data(), out.size()), "promoted page still resident as a victim");
+    }
+
+    // spec_budget 0 (default) must be byte-identical to the old single pool.
+    {
+        wp::HostTier tier;
+        EXPECT(tier.init(/*budget_bytes=*/96, /*device_idx=*/-1), "unpartitioned tier init");
+        tier.set_speculative_tier(true);
+        EXPECT_EQ_INT((int) tier.spec_budget_bytes(), 0, "no reservation by default");
+        EXPECT(tier.store(10, bytes.data(), bytes.size(), /*speculative=*/false), "victim 10");
+        EXPECT(tier.store(11, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 11");
+        EXPECT(tier.store(12, bytes.data(), bytes.size(), /*speculative=*/true),  "prediction 12");
+        EXPECT(tier.store(13, bytes.data(), bytes.size(), /*speculative=*/false), "victim 13 forces evict");
+        EXPECT(tier.lookup(10, out.data(), out.size()), "unchanged: spec-first still protects the victim");
+        EXPECT(!tier.lookup(11, out.data(), out.size()), "unchanged: LRU prediction evicted");
+    }
+
+    return fails;
+}
+
 static int test_host_tier_lookup_touch_keeps_mru() {
     int fails = 0;
 
@@ -3186,6 +3279,7 @@ int main() {
         { "host_tier_size_class_reuse",          test_host_tier_size_class_reuse          },
         { "host_tier_lru_eviction_order",        test_host_tier_lru_eviction_order        },
         { "host_tier_speculative_evicts_before_victim", test_host_tier_speculative_evicts_before_victim },
+        { "host_tier_spec_budget_reservation", test_host_tier_spec_budget_reservation },
         { "host_tier_lookup_touch_keeps_mru",    test_host_tier_lookup_touch_keeps_mru    },
         { "host_tier_over_budget_evict",         test_host_tier_over_budget_evict         },
         { "host_tier_lookup_miss",               test_host_tier_lookup_miss               },

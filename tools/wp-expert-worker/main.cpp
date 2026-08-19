@@ -26,6 +26,7 @@ void print_usage(const char * argv0) {
         << "       staging defaults to up to 16 largest-page buffers\n"
         << "       WP_EXPERT_HOST_BUDGET_BYTES supplies the same optional staging budget\n"
         << "       WP_EXPERT_HOST_VICTIM_BYTES supplies the optional VRAM victim tier\n"
+        << "       WP_EXPERT_HOST_SPEC_BYTES reserves additional host RAM for prefetch landings\n"
         << "       WP_EXPERT_RESIDENT_EXPERTS supplies resident block ranges\n"
         << "       WP_EXPERT_RESERVE_BLOCKS and WP_EXPERT_RESERVE_BYTES supply the reserved partition\n";
 }

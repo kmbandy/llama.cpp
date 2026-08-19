@@ -116,6 +116,28 @@ public:
     // When on, evict_one_lru_() drains the speculative tier before touching
     // any victim entry. Off by default so the tier stays byte-identical.
     void   set_speculative_tier(bool on);
+
+    // *** RESERVE part of the arena for speculative landings. ***
+    //
+    // set_speculative_tier() only fixes eviction ORDER, and order is no help
+    // when the arena is already full of victims: acquire_slot_ then evicts a
+    // victim to seat a prediction (or fails), so a demand-heavy run drives
+    // speculative residency to zero and prefetch lands nothing. That is
+    // exactly what the sliced rig measured -- host_landed stuck at 0 against a
+    // 3 GiB tier saturated by demand experts.
+    //
+    // With a non-zero spec budget the arena is HARD-PARTITIONED by bytes:
+    // speculative entries may occupy at most spec_budget_bytes, victims at
+    // most budget - spec_budget. Neither can starve the other, so a landing
+    // always has somewhere to go and a victim is never evicted by a guess.
+    // 0 (default) keeps the single shared pool and the old behaviour.
+    //
+    // A promotion (a guess a demand hit confirmed) moves those bytes from the
+    // speculative side to the victim side, which can leave the victim side
+    // transiently over its cap; the next victim store evicts it back down.
+    void   set_spec_budget(size_t spec_budget_bytes);
+    size_t spec_budget_bytes() const;
+    size_t spec_used_bytes()   const;
     size_t   speculative_count()          const;
     uint64_t speculative_evicted_unused() const;  // predictions thrown away unused
     uint64_t speculative_promotions()     const;  // predictions a demand hit confirmed
@@ -138,8 +160,15 @@ private:
         bool         speculative  = false; // prefetched prediction, not yet demand-used
     };
 
-    bool acquire_slot_(int page_idx, size_t n, size_t & offset_out);
-    bool evict_one_lru_();
+    // Which side of the partition an eviction may take from. Any preserves
+    // the historic behaviour (spec-first when set_speculative_tier is on).
+    enum class EvictScope { Any, SpecOnly, VictimOnly };
+
+    bool acquire_slot_(int page_idx, size_t n, bool speculative, size_t & offset_out);
+    bool evict_one_lru_(EvictScope scope = EvictScope::Any);
+    size_t spec_cap_() const;      // bytes speculative entries may hold
+    size_t victim_cap_() const;    // bytes victim entries may hold
+    size_t victim_bytes_() const;  // used_bytes_ - spec_bytes_, floored at 0
     void erase_resident_(int page_idx);
     void promote_(Resident & r);   // demand hit clears speculative; landing does not
     void touch_lru_(int page_idx);
@@ -160,6 +189,11 @@ private:
     // speculative entry.
     bool      spec_tier_      = false;
     size_t    spec_count_     = 0;
+    // Reservation. spec_budget_ == 0 means one shared pool (historic).
+    // spec_bytes_ is maintained at every site that creates, promotes, evicts
+    // or erases a speculative entry -- the same discipline as spec_count_.
+    size_t    spec_budget_    = 0;
+    size_t    spec_bytes_     = 0;
     uint64_t  spec_evicted_unused_ = 0;
     uint64_t  spec_promotions_     = 0;
 

@@ -2052,11 +2052,39 @@ public:
             resources_.staging_buffer_bytes *
             (uint64_t) resources_.staging_buffers;
 
+        // *** WP_EXPERT_HOST_SPEC_BYTES: RAM RESERVED FOR PREFETCH LANDINGS. ***
+        //
+        // Added ON TOP of the victim budget, so the two knobs mean exactly what
+        // they say: WP_EXPERT_HOST_VICTIM_BYTES is what evicted VRAM pages may
+        // hold, this is what speculative landings may hold, and the arena is
+        // their sum. Unset (0) keeps one shared pool and the historic behaviour.
+        //
+        // WHY A HARD RESERVATION AND NOT JUST EVICTION ORDER: set_speculative_tier
+        // below already drains guesses before victims, but ORDER cannot help when
+        // the arena is already full of victims -- a landing then has to evict a
+        // page the GPU actually used, or fail. On the sliced rig it failed, every
+        // time: host_landed sat at 0 against a 3 GiB tier saturated by demand
+        // experts, so the whole prefetch path was measuring a tier it could never
+        // get into. Reserved bytes cannot be taken by the demand path at all.
+        static const uint64_t host_spec_bytes = [] {
+            const char * e = std::getenv("WP_EXPERT_HOST_SPEC_BYTES");
+            if (e == nullptr || e[0] == '\0') {
+                return (uint64_t) 0;
+            }
+            const long long v = atoll(e);
+            return v > 0 ? (uint64_t) v : (uint64_t) 0;
+        }();
+
         if (host_victim_bytes != 0) {
-            if (host_victim_bytes >
+            const uint64_t arena_bytes = host_victim_bytes + host_spec_bytes;
+            if (arena_bytes >
                 (uint64_t) std::numeric_limits<size_t>::max() ||
-                !host_tier_.init((size_t) host_victim_bytes, 0)) {
+                arena_bytes < host_victim_bytes ||   // overflow
+                !host_tier_.init((size_t) arena_bytes, 0)) {
                 throw std::runtime_error("failed to initialize host victim tier");
+            }
+            if (host_spec_bytes != 0) {
+                host_tier_.set_spec_budget((size_t) host_spec_bytes);
             }
             host_tier_.set_device_reader(
                 [this](void * dst_host, const void * src_device, size_t n, int page_idx) {
@@ -2085,7 +2113,11 @@ public:
             // a str.replace with the wrong indentation is a no-op, not an error.
             host_tier_.set_speculative_tier(true);
             fprintf(stderr,
-                    "wp::HostTier: fill_on_read=%d (decode n_tokens<=8) demote_d2h=%d\n",
+                    "wp::HostTier: victim=%llu MiB spec_reserved=%llu MiB arena=%llu MiB "
+                    "fill_on_read=%d (decode n_tokens<=8) demote_d2h=%d\n",
+                    (unsigned long long) (host_victim_bytes >> 20),
+                    (unsigned long long) (host_spec_bytes   >> 20),
+                    (unsigned long long) ((host_victim_bytes + host_spec_bytes) >> 20),
                     (int) fill_host_on_read_, (int) demote_d2h_);
         }
     }

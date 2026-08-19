@@ -751,7 +751,7 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # signals the worker, not a wrapper (2026-08-10 note above still applies).
 
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
-main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
     --descriptor $S0/ds4-s0-experts-experts-manifest-dspark.expert-descriptor.json \
     --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
@@ -787,7 +787,7 @@ echo "  w-d1 (CPU 85-255) pid ${D1_PID:-?}"
 # R9700 and local CPU workers keep f32 (their bytes are free and f16 adds ~5e-4
 # rounding at the partial-sum boundary). Self-describing frame; spine sums in
 # f32. REAL NLL risk -- gate before adopting.
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S1/ds4-s1-experts-experts-manifest-dspark.json \
     --descriptor $S1/ds4-s1-experts-experts-manifest-dspark.expert-descriptor.json \
     --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
@@ -798,7 +798,7 @@ echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
 # --- s2: 2026 RX 480 (Vulkan0) slice2 w320, layers 0-42 ---
 # The 480 has a 256 MB BAR and no ReBAR; without the host-visible-vidmem cap ~95%
 # of its slots spill into GTT and every matmul streams over PCIe (doc §1/§2).
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${PARTIAL_DTYPE:+WP_EXPERT_PARTIAL_DTYPE=$PARTIAL_DTYPE }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S2/ds4-s2-experts-experts-manifest-dspark.json \
     --descriptor $S2/ds4-s2-experts-experts-manifest-dspark.expert-descriptor.json \
     --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"

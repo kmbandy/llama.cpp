@@ -176,13 +176,13 @@ bool HostTier::store(int page_idx, const void * src_bytes, size_t n, bool specul
     erase_resident_(page_idx);
 
     size_t offset = 0;
-    if (!acquire_slot_(page_idx, n, offset)) {
+    if (!acquire_slot_(page_idx, n, speculative, offset)) {
         return false;
     }
 
     std::memcpy(arena_ + offset, src_bytes, n);
     resident_[page_idx] = Resident{offset, n, /*borrow_count=*/0, next_gen_++, speculative};
-    if (speculative) ++spec_count_;
+    if (speculative) { ++spec_count_; spec_bytes_ += n; }
     used_bytes_ += n;
     lru_.push_back(page_idx);
     lru_pos_[page_idx] = std::prev(lru_.end());
@@ -224,7 +224,9 @@ bool HostTier::store_from_device(int page_idx, const void * device_bytes, size_t
 
     erase_resident_(page_idx);
     size_t offset = 0;
-    if (!acquire_slot_(page_idx, n, offset)) {
+    // The victim path by definition: a VRAM slot the GPU used, demoted to RAM.
+    // It draws on the victim side of the partition, never the reservation.
+    if (!acquire_slot_(page_idx, n, /*speculative=*/false, offset)) {
         return false;
     }
 
@@ -366,12 +368,49 @@ bool HostTier::mlocked() const {
     return mlocked_;
 }
 
-bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
+size_t HostTier::spec_cap_() const {
+    return spec_budget_ < budget_bytes_ ? spec_budget_ : budget_bytes_;
+}
+
+size_t HostTier::victim_cap_() const {
+    return budget_bytes_ - spec_cap_();
+}
+
+size_t HostTier::victim_bytes_() const {
+    return used_bytes_ >= spec_bytes_ ? used_bytes_ - spec_bytes_ : 0;
+}
+
+bool HostTier::acquire_slot_(int page_idx, size_t n, bool speculative, size_t & offset_out) {
     if (n > budget_bytes_) {
         return false;
     }
 
+    const bool partitioned = spec_budget_ > 0;
+    // The requester's own side of the partition. A page bigger than its own
+    // cap can never be seated, however much the other side has free -- that is
+    // the point of a reservation, so fail rather than borrow across.
+    const size_t own_cap = partitioned ? (speculative ? spec_cap_() : victim_cap_())
+                                       : budget_bytes_;
+    if (partitioned && n > own_cap) {
+        return false;
+    }
+
     for (;;) {
+        // Pass 1, LOGICAL: is this side of the partition within its budget?
+        // Over-cap can only be worked off by evicting from that SAME side --
+        // taking from the other side would just move the overrun.
+        if (partitioned) {
+            const size_t own_used = speculative ? spec_bytes_ : victim_bytes_();
+            if (own_used + n > own_cap) {
+                if (!evict_one_lru_(speculative ? EvictScope::SpecOnly
+                                                : EvictScope::VictimOnly)) {
+                    return false;
+                }
+                continue;
+            }
+        }
+
+        // Pass 2, PHYSICAL: bytes exist somewhere in the arena for this size.
         auto & slots = free_lists_[n];
         if (!slots.empty()) {
             offset_out = slots.back();
@@ -385,7 +424,27 @@ bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
             return true;
         }
 
-        if (!evict_one_lru_()) {
+        // Physically full while this side is under its cap: the other side is
+        // over (a promotion moves bytes across and can do that), or the arena
+        // is fragmented across size classes. Take from whoever is over first,
+        // and only then from our own side.
+        EvictScope scope = EvictScope::Any;
+        if (partitioned) {
+            const bool spec_over   = spec_bytes_    > spec_cap_();
+            const bool victim_over = victim_bytes_() > victim_cap_();
+            if (spec_over && !speculative) {
+                scope = EvictScope::SpecOnly;
+            } else if (victim_over && speculative) {
+                scope = EvictScope::VictimOnly;
+            } else {
+                scope = speculative ? EvictScope::SpecOnly : EvictScope::VictimOnly;
+            }
+        }
+        if (!evict_one_lru_(scope)) {
+            // Last resort under a partition: our own side had nothing
+            // evictable (all borrowed, or empty). Anything else would violate
+            // the reservation, so fail cleanly -- a dropped landing is a
+            // non-event, and a dropped victim just re-reads.
             LLAMA_LOG_WARN("wp::HostTier::store: could not acquire %zu-byte slot for page %d; arena is saturated by other size classes\n",
                            n, page_idx);
             return false;
@@ -393,7 +452,7 @@ bool HostTier::acquire_slot_(int page_idx, size_t n, size_t & offset_out) {
     }
 }
 
-bool HostTier::evict_one_lru_() {
+bool HostTier::evict_one_lru_(EvictScope scope) {
     // Pass 0 (only when the speculative tier is enabled): drain the LRU
     // SPECULATIVE entry before touching anything the GPU actually used.
     //
@@ -406,7 +465,8 @@ bool HostTier::evict_one_lru_() {
     //
     // Borrowed entries are skipped here for exactly the reason they are skipped
     // below: their arena bytes are in flight to a caller.
-    if (spec_tier_ && spec_count_ > 0) {
+    if ((scope == EvictScope::SpecOnly || (scope == EvictScope::Any && spec_tier_)) &&
+        spec_count_ > 0) {
         for (auto lit = lru_.begin(); lit != lru_.end(); ++lit) {
             auto it = resident_.find(*lit);
             if (it == resident_.end() || it->second.borrow_count > 0 ||
@@ -419,9 +479,15 @@ bool HostTier::evict_one_lru_() {
             lru_.erase(lit);
             reclaim_(r);
             if (spec_count_ > 0) --spec_count_;
+            spec_bytes_ = spec_bytes_ >= r.bytes ? spec_bytes_ - r.bytes : 0;
             ++spec_evicted_unused_;
             return true;
         }
+    }
+    // A scoped request never falls through to the general pass: that is what
+    // makes the reservation hard rather than advisory.
+    if (scope == EvictScope::SpecOnly) {
+        return false;
     }
 
     // Walk from the LRU front (least recently used) to the first entry with
@@ -436,6 +502,9 @@ bool HostTier::evict_one_lru_() {
         if (it == resident_.end() || it->second.borrow_count > 0) {
             continue;
         }
+        if (scope == EvictScope::VictimOnly && it->second.speculative) {
+            continue;
+        }
 
         const Resident r = it->second;
         resident_.erase(it);
@@ -445,6 +514,7 @@ bool HostTier::evict_one_lru_() {
         used_bytes_ = used_bytes_ >= r.bytes ? used_bytes_ - r.bytes : 0;
         if (r.speculative) {
             if (spec_count_ > 0) --spec_count_;
+            spec_bytes_ = spec_bytes_ >= r.bytes ? spec_bytes_ - r.bytes : 0;
             ++spec_evicted_unused_;
         }
         return true;
@@ -463,7 +533,25 @@ void HostTier::promote_(Resident & r) {
     }
     r.speculative = false;
     if (spec_count_ > 0) --spec_count_;
+    // The bytes change sides. This can push the victim side transiently over
+    // its cap; the next victim store works it back down (acquire_slot_ Pass 1).
+    spec_bytes_ = spec_bytes_ >= r.bytes ? spec_bytes_ - r.bytes : 0;
     ++spec_promotions_;
+}
+
+void HostTier::set_spec_budget(size_t spec_budget_bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    spec_budget_ = spec_budget_bytes;
+}
+
+size_t HostTier::spec_budget_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_budget_;
+}
+
+size_t HostTier::spec_used_bytes() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return spec_bytes_;
 }
 
 void HostTier::set_speculative_tier(bool on) {
@@ -503,8 +591,11 @@ void HostTier::erase_resident_(int page_idx) {
     // Pass-0 `spec_count_ > 0` guard drifts and starts scanning for entries
     // that no longer exist. Not counted as evicted-unused: this is erase() /
     // promotion-back-to-VRAM / displacement by re-store, not eviction.
-    if (r.speculative && spec_count_ > 0) {
-        --spec_count_;
+    if (r.speculative) {
+        if (spec_count_ > 0) {
+            --spec_count_;
+        }
+        spec_bytes_ = spec_bytes_ >= r.bytes ? spec_bytes_ - r.bytes : 0;
     }
 
     auto pos_it = lru_pos_.find(page_idx);
