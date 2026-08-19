@@ -59,8 +59,11 @@ S1=/mnt/nvme/ds4-eslice/slice1                   # 1070   width 320  (2026 NVMe)
 S2=/mnt/nvme/ds4-eslice/slice2                   # RX480  width 320  (2026 NVMe)
 D0=/home/kmbandy/models/DS4-eshard-dspark        # dspark experts 0-84   (real blobs)
 D1=/home/kmbandy/models/DS4-eshard-main-dspark   # dspark experts 85-255 (symlinks)
-SLOTS_S0=${SLOTS_S0:-3450}   # 3450*9.19MB = 31.7GB of 32GB (R9700). Raised from
-                             # 3350 on 2026-08-19: ~1.9GB was sitting unused, take ~1GB.
+SLOTS_S0=${SLOTS_S0:-3400}   # 3400*9.19MB = 31.2GB of 32GB (R9700). 3450 plateaued at
+                             # 99.0-99.3% (0.2-0.3GB free) -- by design, the pool fills
+                             # lazily to its configured size and stops, not a leak -- but
+                             # that is under our 95% working ceiling. 3400 keeps half the
+                             # headroom we took and still beats the old 3350.
 SLOTS_S1=${SLOTS_S1:-3750}   # 3750*2.09MB = 7.84GB of 8GB (1070)
 SLOTS_S2=${SLOTS_S2:-3900}   # 3900*2.09MB = 8.15GB of 8GB (RX480 + vidmem cap)
 SLOTS_D0=${SLOTS_D0:-85}
