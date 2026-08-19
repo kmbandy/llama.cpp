@@ -151,7 +151,33 @@ static constexpr uint32_t PIPE_MAGIC   = 0x4C4C5050u; // "LLPP"
 // during a rolling restart. What is gone is this process's ability to ever
 // WRITE dtype=F16 into a frame it sends -- see pipe_encode_expert_partial()
 // in pipe-protocol.cpp.
-static constexpr uint32_t PIPE_VERSION = 13u;
+// 13 -> 14 (2026-08-19): WP_DISPATCH_DEDUP_ACTIVATIONS. Measured 2026-08-19 on a
+// 2322-token prefill: s1 and s2 are two SEPARATE worker processes on the SAME
+// remote machine (192.168.1.33), each holding a width slice of every expert, so
+// WP_DISPATCH_UNION showed tokens_needed==100.0% for both -- the existing
+// spine-side gather (WP_DISPATCH_GATHER) never fires on this layout and each
+// process receives its own full 1633 MB copy of the activation tensor, i.e. the
+// SAME bytes cross the 1 GbE link twice to reach two processes on one host.
+//
+// Three new frame types let the spine send those bytes to ONE process on the
+// machine (PIPE_EXPERT_DISPATCH_ACTS_PUBLISH) and hand the other a reference
+// (PIPE_EXPERT_DISPATCH_ACTS_REF) that resolves to a local POSIX shm segment
+// instead of a second wire copy; PIPE_EXPERT_ACTS_PUBLISH_ACK is the publisher's
+// synchronous confirmation, which the spine waits for BEFORE it ever sends a REF
+// -- see the long comment on dedup_publish_and_ref() in
+// pipe-expert-dispatcher.cpp for why that ordering is what keeps this safe.
+// A pre-14 worker has no idea any of these three types exist and would answer
+// PIPE_EXPERT_DISPATCH_ACTS_PUBLISH with PIPE_ERROR + close the connection (the
+// same "unknown frame kills the session" behaviour every prior bump in this file
+// documents), which would look exactly like a worker crash mid-prefill instead
+// of one clear line at HELLO. The feature is ALSO gated OFF by default via
+// WP_DISPATCH_DEDUP_ACTIVATIONS (unset spine never emits the new frame types,
+// so an old worker is never actually exposed to this even pre-bump), but the
+// version bump is the load-bearing guarantee for the case where the spine is
+// upgraded and the env var flipped on before every worker in the fleet has been
+// rebuilt -- exactly the "spine and workers cycle independently" scenario this
+// whole file exists to make safe.
+static constexpr uint32_t PIPE_VERSION = 14u;
 
 // NOTE: the design doc says "24-byte fixed header" but its own field list
 // (4x u32 + u64 seq_id + u64 length = 16 + 8 + 8) sums to 32 bytes. The field
@@ -185,6 +211,18 @@ enum pipe_frame_type : uint32_t {
     PIPE_SEGMENT_FWD_RESP      = 17,
     PIPE_SEGMENT_CTRL          = 18,
     PIPE_SEGMENT_CTRL_ACK      = 19,
+    // WP_DISPATCH_DEDUP_ACTIVATIONS (PIPE_VERSION 14). Spine -> primary worker:
+    // full activations, same as PIPE_EXPERT_DISPATCH_ACTS, plus a request to
+    // publish them to a local shm segment for co-located siblings.
+    PIPE_EXPERT_DISPATCH_ACTS_PUBLISH = 20,
+    // Primary worker -> spine, sent BEFORE the worker's PIPE_EXPERT_PARTIAL,
+    // same seq_id: did the shm publish succeed? The spine will not send a
+    // REF frame to any sibling until it has this in hand -- see
+    // dedup_publish_and_ref() in pipe-expert-dispatcher.cpp.
+    PIPE_EXPERT_ACTS_PUBLISH_ACK      = 21,
+    // Spine -> secondary (co-located) worker: activations already published by
+    // the primary are available locally; no activation bytes on this frame.
+    PIPE_EXPERT_DISPATCH_ACTS_REF     = 22,
 };
 
 enum pipe_role : uint32_t {
@@ -241,6 +279,15 @@ enum pipe_error_code : uint32_t {
     PIPE_ERR_EXPERT_RANGE  = 5, // requested expert is not owned by this worker
     PIPE_ERR_EXPERT_LAYER  = 6, // requested layer is not served by this worker
     PIPE_ERR_EXPERT_COMPUTE = 7,
+    // WP_DISPATCH_DEDUP_ACTIVATIONS: a secondary worker could not resolve the
+    // shm reference in PIPE_EXPERT_DISPATCH_ACTS_REF within its bounded local
+    // wait (segment never appeared, wrong size, or never reached ready state).
+    // Sent INSTEAD OF a partial, same seq_id. NOT necessarily connection-fatal
+    // -- see the PIPE_EXPERT_DISPATCH_ACTS_REF handler in wp-expert-worker.cpp
+    // and the retry in receive_partial() in pipe-expert-dispatcher.cpp. The
+    // worker must never compute on a segment that is not confirmed ready; this
+    // code exists so that requirement never has to be satisfied by guessing.
+    PIPE_ERR_ACTS_UNAVAILABLE = 8,
 };
 
 // ---------------------------------------------------------------------------
@@ -372,6 +419,37 @@ struct pipe_expert_dispatch_begin {
 
 struct pipe_expert_dispatch_acts {
     std::vector<float> activations;
+};
+
+// WP_DISPATCH_DEDUP_ACTIVATIONS. Payload: u32 n_subscribers, f32
+// activations[n_tokens * n_embd] (n_tokens from the matching BEGIN, same
+// validation as pipe_expert_dispatch_acts). n_subscribers is the number of
+// co-located secondaries that will be told to read this segment; the worker
+// seeds its shm refcount with n_subscribers + 1 (itself) so the LAST reader
+// out -- publisher or a subscriber, whichever finishes last -- unlinks it.
+// n_subscribers == 0 is legal (a "primary" with no siblings this round, e.g.
+// residency made a normally-secondary worker cheapest to dispatch through) and
+// just means the worker publishes for no one and unlinks once it is done with
+// its own compute.
+struct pipe_expert_dispatch_acts_publish {
+    uint32_t            n_subscribers = 0;
+    std::vector<float>  activations;
+};
+
+// Primary -> spine, before the primary's PIPE_EXPERT_PARTIAL. success=false on
+// ANY publish failure (shm_open/ftruncate/mmap/short write) -- the primary
+// still computes its own partial from the activations it already has in hand
+// either way, so a publish failure costs a sibling's fallback, never the
+// primary's own correctness.
+struct pipe_expert_acts_publish_ack {
+    bool success = false;
+};
+
+// Spine -> secondary. Payload: u32 n_tokens (redundant with BEGIN; a sanity
+// check the worker uses against the shm segment's own header rather than
+// trusting either source alone).
+struct pipe_expert_dispatch_acts_ref {
+    uint32_t n_tokens = 0;
 };
 
 // A prefetch hint: "you are about to be asked for these experts on this layer".
@@ -673,6 +751,9 @@ std::vector<uint8_t> pipe_encode_expert_hello_ack(const pipe_expert_hello_ack & 
 std::vector<uint8_t> pipe_encode_expert_dispatch_req(const pipe_expert_dispatch_req & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_begin(const pipe_expert_dispatch_begin & p);
 std::vector<uint8_t> pipe_encode_expert_dispatch_acts(const pipe_expert_dispatch_acts & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(const pipe_expert_dispatch_acts_publish & p);
+std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_publish_ack & p);
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p);
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(const pipe_expert_prefetch_hint & p);
 std::vector<uint8_t> pipe_encode_expert_partial(const pipe_expert_partial & p);
 std::vector<uint8_t> pipe_encode_segment_hello(const pipe_segment_hello & p);
@@ -696,6 +777,12 @@ pipe_expert_dispatch_begin pipe_decode_expert_dispatch_begin(
     const uint8_t * buf, size_t len);
 pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
     const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
+pipe_expert_dispatch_acts_publish pipe_decode_expert_dispatch_acts_publish(
+    const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd);
+pipe_expert_acts_publish_ack pipe_decode_expert_acts_publish_ack(
+    const uint8_t * buf, size_t len);
+pipe_expert_dispatch_acts_ref pipe_decode_expert_dispatch_acts_ref(
+    const uint8_t * buf, size_t len);
 pipe_expert_prefetch_hint pipe_decode_expert_prefetch_hint(
     const uint8_t * buf, size_t len);
 pipe_expert_partial pipe_decode_expert_partial(

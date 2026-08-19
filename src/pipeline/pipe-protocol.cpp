@@ -636,6 +636,76 @@ pipe_expert_dispatch_acts pipe_decode_expert_dispatch_acts(
 }
 
 // ---------------------------------------------------------------------------
+// WP_DISPATCH_DEDUP_ACTIVATIONS (PIPE_VERSION 14)
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_publish(
+        const pipe_expert_dispatch_acts_publish & p) {
+    const uint64_t total = 4ull + (uint64_t) p.activations.size() * 4ull;
+    if (total > PIPE_MAX_PAYLOAD) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH exceeds max payload");
+    }
+    std::vector<uint8_t> out((size_t) total);
+    uint8_t * w = out.data();
+    wr_u32(w, p.n_subscribers);
+    wr_f32_bulk(w, p.activations.data(), p.activations.size());
+    return out;
+}
+
+pipe_expert_dispatch_acts_publish pipe_decode_expert_dispatch_acts_publish(
+        const uint8_t * buf, size_t len, uint32_t n_tokens, int32_t n_embd) {
+    if (n_embd <= 0 || n_tokens == 0 || len < 4 ||
+        (uint64_t) n_tokens * (uint64_t) n_embd * 4ull != (uint64_t) len - 4ull) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH dimensions do not match BEGIN");
+    }
+    pipe_expert_dispatch_acts_publish r;
+    const uint8_t * p = buf;
+    r.n_subscribers = rd_u32(p);
+    r.activations.resize((size_t) n_tokens * (size_t) n_embd);
+    rd_f32_bulk(p, r.activations.data(), r.activations.size());
+    for (float value : r.activations) {
+        if (!std::isfinite(value)) {
+            fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_PUBLISH has a non-finite activation");
+        }
+    }
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_expert_acts_publish_ack(const pipe_expert_acts_publish_ack & p) {
+    std::vector<uint8_t> out(1);
+    out[0] = p.success ? 1 : 0;
+    return out;
+}
+
+pipe_expert_acts_publish_ack pipe_decode_expert_acts_publish_ack(const uint8_t * buf, size_t len) {
+    if (len != 1) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert acts publish ack has the wrong size");
+    }
+    pipe_expert_acts_publish_ack r;
+    r.success = buf[0] != 0;
+    return r;
+}
+
+std::vector<uint8_t> pipe_encode_expert_dispatch_acts_ref(const pipe_expert_dispatch_acts_ref & p) {
+    std::vector<uint8_t> out(4);
+    uint8_t * w = out.data();
+    wr_u32(w, p.n_tokens);
+    return out;
+}
+
+pipe_expert_dispatch_acts_ref pipe_decode_expert_dispatch_acts_ref(const uint8_t * buf, size_t len) {
+    if (len != 4) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_REF has the wrong size");
+    }
+    pipe_expert_dispatch_acts_ref r;
+    const uint8_t * p = buf;
+    r.n_tokens = rd_u32(p);
+    if (r.n_tokens == 0) {
+        fail(PIPE_ERR_BAD_FRAME, "pipe: expert dispatch ACTS_REF has n_tokens == 0");
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // expert prefetch hint (fire and forget; no response frame)
 
 std::vector<uint8_t> pipe_encode_expert_prefetch_hint(

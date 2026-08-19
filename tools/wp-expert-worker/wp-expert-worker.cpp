@@ -56,6 +56,10 @@ extern "C" {
 #  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <unistd.h>
+// WP_DISPATCH_DEDUP_ACTIVATIONS: POSIX shm (shm_open/mmap) for the
+// same-machine activation rendezvous. Same portability tier as the O_DIRECT /
+// posix_memalign / poll() usage already gated behind __linux__ above.
+#  include <sys/mman.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -6639,6 +6643,181 @@ bool send_hello_ack(
         socket, PIPE_EXPERT_HELLO_ACK, 0, payload.data(), payload.size());
 }
 
+#if defined(__linux__)
+// ---------------------------------------------------------------------------
+// WP_DISPATCH_DEDUP_ACTIVATIONS: POSIX shm rendezvous between worker
+// PROCESSES that share a machine. See the PIPE_VERSION 14 comment in
+// pipe-protocol.h for the wire-level design and dedup_publish_and_ref() in
+// pipe-expert-dispatcher.cpp for the ordering guarantee this relies on (a REF
+// frame is never sent by the spine before the matching PUBLISH's ack is
+// received there) -- that ordering is why `subscribe` below can treat its
+// poll loop as defense in depth rather than the primary correctness
+// mechanism: by construction the segment already exists and is READY by the
+// time any ACTS_REF naming it can possibly arrive here.
+namespace wp_dedup {
+
+struct ShmHeader {
+    std::atomic<uint32_t> state;      // 0 = writing, 1 = ready
+    std::atomic<int32_t>  remaining;  // holders left to check in; last one unlinks
+    uint32_t              n_tokens;
+    uint32_t              n_embd;
+};
+
+constexpr uint32_t STATE_WRITING = 0;
+constexpr uint32_t STATE_READY   = 1;
+// Bounded wait for a segment to appear/become ready. Generous relative to a
+// same-host mmap + memcpy, tiny relative to the tens-of-seconds prefill this
+// mechanism targets -- a worker stuck here for the full window is reporting a
+// genuine local fault, not slow hardware.
+constexpr auto SHM_WAIT_BUDGET = std::chrono::milliseconds(500);
+
+std::string segment_name(uint64_t seq_id, int32_t layer) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "/wp_acts_%016llx_%d",
+                  (unsigned long long) seq_id, layer);
+    return std::string(buf);
+}
+
+// Publish `activations` so `n_subscribers` co-located siblings can read them
+// without their own wire copy. Never throws: a publish failure is reported to
+// the spine via PIPE_EXPERT_ACTS_PUBLISH_ACK{success=false} and the caller
+// still computes its OWN partial from the activations it already holds in
+// memory regardless of the return value here -- see the ACTS_PUBLISH frame
+// handler below. A publish failure therefore costs a sibling's fallback
+// round trip, never this worker's own correctness.
+bool publish(uint64_t seq_id, int32_t layer, const std::vector<float> & activations,
+            uint32_t n_tokens, uint32_t n_embd, uint32_t n_subscribers, std::string & error) {
+    const std::string name = segment_name(seq_id, layer);
+    // O_EXCL: a name collision means a segment from a crashed prior run
+    // (seq_id/layer pairs are not expected to repeat within a spine's
+    // lifetime, but "not expected" is not a guarantee across a spine
+    // restart that reuses a low seq_id). One unlink+retry clears garbage
+    // rather than silently reusing or corrupting someone else's segment.
+    int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        shm_unlink(name.c_str());
+        fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    }
+    if (fd < 0) {
+        error = std::string("shm_open: ") + std::strerror(errno);
+        return false;
+    }
+    const size_t total = sizeof(ShmHeader) + (size_t) n_tokens * (size_t) n_embd * sizeof(float);
+    if (ftruncate(fd, (off_t) total) != 0) {
+        error = std::string("ftruncate: ") + std::strerror(errno);
+        close(fd);
+        shm_unlink(name.c_str());
+        return false;
+    }
+    void * mapped = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd); // the mapping keeps the segment usable regardless of the fd
+    if (mapped == MAP_FAILED) {
+        error = std::string("mmap: ") + std::strerror(errno);
+        shm_unlink(name.c_str());
+        return false;
+    }
+    ShmHeader * hdr = reinterpret_cast<ShmHeader *>(mapped);
+    hdr->n_tokens = n_tokens;
+    hdr->n_embd   = n_embd;
+    // Plain writes here are fine: nothing else can see this segment's
+    // contents until the release-store of state below, which is the
+    // synchronization point a subscriber's acquire-load pairs with.
+    hdr->remaining.store((int32_t) n_subscribers + 1, std::memory_order_relaxed);
+    std::memcpy(reinterpret_cast<uint8_t *>(mapped) + sizeof(ShmHeader),
+               activations.data(), activations.size() * sizeof(float));
+    hdr->state.store(STATE_READY, std::memory_order_release);
+    munmap(mapped, total); // the NAME, not this mapping, is what matters now
+    return true;
+}
+
+// Called by whichever holder (the publisher or a subscriber) finishes with a
+// segment last. Decrements the shared refcount seeded in publish() and
+// unlinks once nobody is left. Best-effort: a missing segment (already
+// unlinked+fully released) is not an error.
+void release(uint64_t seq_id, int32_t layer) {
+    const std::string name = segment_name(seq_id, layer);
+    const int fd = shm_open(name.c_str(), O_RDWR, 0600);
+    if (fd < 0) {
+        return;
+    }
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || (size_t) st.st_size < sizeof(ShmHeader)) {
+        close(fd);
+        return;
+    }
+    void * mapped = mmap(nullptr, sizeof(ShmHeader), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        return;
+    }
+    ShmHeader * hdr = reinterpret_cast<ShmHeader *>(mapped);
+    const int32_t left = hdr->remaining.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    munmap(mapped, sizeof(ShmHeader));
+    if (left <= 0) {
+        shm_unlink(name.c_str());
+    }
+}
+
+// Subscribe (secondary side): bounded poll for the segment to exist and reach
+// STATE_READY, then copy its payload out to a plain vector so the caller's
+// compute path never touches the shm mapping again. Returns nullopt on ANY
+// failure -- the caller MUST treat that as "activations unavailable" and
+// never compute on a partial, stale, or default-initialised buffer; see the
+// ACTS_REF frame handler below, which is the only place a nullopt here is
+// allowed to turn into anything other than closing the connection.
+std::optional<std::vector<float>> subscribe(uint64_t seq_id, int32_t layer, uint32_t n_tokens,
+                                            uint32_t n_embd, std::string & error) {
+    const std::string name = segment_name(seq_id, layer);
+    const auto deadline = std::chrono::steady_clock::now() + SHM_WAIT_BUDGET;
+    int fd = -1;
+    for (;;) {
+        fd = shm_open(name.c_str(), O_RDONLY, 0600);
+        if (fd >= 0) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "shm segment never appeared";
+            return std::nullopt;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    struct stat st{};
+    const size_t expect = sizeof(ShmHeader) + (size_t) n_tokens * (size_t) n_embd * sizeof(float);
+    if (fstat(fd, &st) != 0 || (size_t) st.st_size != expect) {
+        close(fd);
+        error = "shm segment has the wrong size";
+        return std::nullopt;
+    }
+    void * mapped = mmap(nullptr, expect, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        error = std::string("mmap: ") + std::strerror(errno);
+        return std::nullopt;
+    }
+    const ShmHeader * hdr = reinterpret_cast<const ShmHeader *>(mapped);
+    bool ready = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (hdr->state.load(std::memory_order_acquire) == STATE_READY) {
+            ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!ready || hdr->n_tokens != n_tokens || hdr->n_embd != n_embd) {
+        munmap(mapped, expect);
+        error = "shm segment never became ready or has the wrong shape";
+        return std::nullopt;
+    }
+    std::vector<float> out((size_t) n_tokens * (size_t) n_embd);
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t *>(mapped) + sizeof(ShmHeader),
+               out.size() * sizeof(float));
+    munmap(mapped, expect);
+    return out;
+}
+
+} // namespace wp_dedup
+#endif // __linux__
+
 int serve_connection(pipe_socket_t & socket, Worker & worker) {
     struct PendingCleanup {
         Worker & worker;
@@ -6904,6 +7083,149 @@ int serve_connection(pipe_socket_t & socket, Worker & worker) {
             }
             continue;
         }
+#if defined(__linux__)
+        // WP_DISPATCH_DEDUP_ACTIVATIONS: primary role. Full activations arrive
+        // exactly as PIPE_EXPERT_DISPATCH_ACTS would carry them, plus a
+        // request to publish them for co-located siblings. See the
+        // PIPE_VERSION 14 comment in pipe-protocol.h and the wp_dedup
+        // namespace above.
+        if (type == PIPE_EXPERT_DISPATCH_ACTS_PUBLISH) {
+            try {
+                if (!worker.has_split_dispatch()) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "expert dispatch ACTS_PUBLISH has no BEGIN");
+                }
+                const int32_t layer_for_shm = split_log_begin.layer;
+                pipe_expert_dispatch_acts_publish publish = pipe_decode_expert_dispatch_acts_publish(
+                    payload.data(), payload.size(), worker.split_n_tokens(), mine.n_embd);
+                std::string publish_error;
+                const bool published = wp_dedup::publish(
+                    seq_id, layer_for_shm, publish.activations, worker.split_n_tokens(),
+                    (uint32_t) mine.n_embd, publish.n_subscribers, publish_error);
+                if (!published) {
+                    // Advisory to the log only -- the spine finds out via the
+                    // ack below and falls back to sending siblings the
+                    // ordinary full payload. This worker's own compute below
+                    // is unaffected either way.
+                    std::fprintf(stderr,
+                                 "wp-expert-worker: dedup publish failed (seq=%llu layer=%d): %s\n",
+                                 (unsigned long long) seq_id, layer_for_shm, publish_error.c_str());
+                }
+                const std::vector<uint8_t> ack_payload =
+                    pipe_encode_expert_acts_publish_ack({ published });
+                if (!pipe_send_frame(socket, PIPE_EXPERT_ACTS_PUBLISH_ACK, seq_id,
+                                     ack_payload.data(), ack_payload.size())) {
+                    return 1;
+                }
+                // Compute from the inline bytes already in hand. This is the
+                // guarantee that makes a publish failure harmless to THIS
+                // worker: it never reads back its own shm segment.
+                pipe_expert_dispatch_acts acts;
+                acts.activations = std::move(publish.activations);
+                const pipe_expert_partial response = worker.finish_split_dispatch(
+                    acts, seq_id, split_log_stats);
+                const auto split_send_started = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
+                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                     encoded.data(), encoded.size())) {
+                    return 1;
+                }
+                if (published) {
+                    // This worker is one of the n_subscribers+1 holders
+                    // publish() seeded remaining with; check in now that its
+                    // own compute (the last thing that needed the bytes) is
+                    // done. Skipped when publish failed -- nothing to
+                    // release.
+                    wp_dedup::release(seq_id, layer_for_shm);
+                }
+                if (worker.stats_enabled()) {
+                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - split_send_started).count();
+                    worker.record_stats(split_log_stats, split_log_begin.assignments.size());
+                }
+                write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                split_log_started = std::chrono::steady_clock::time_point{};
+                worker.spec_pagein_after_dispatch();
+            } catch (const pipe_protocol_error & error) {
+                pipe_send_error(socket, seq_id, error.code, error.what());
+                return 1;
+            } catch (const std::exception & error) {
+                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                return 1;
+            }
+            continue;
+        }
+        // WP_DISPATCH_DEDUP_ACTIVATIONS: secondary role. No activation bytes
+        // on this frame -- read them out of the primary's shm segment.
+        //
+        // PIPE_ERR_ACTS_UNAVAILABLE is the ONE error on this frame pair that
+        // does NOT close the connection (`continue` instead of `return 1`).
+        // Every other branch here keeps the existing "any protocol error on
+        // BEGIN/ACTS is fatal to the connection" behaviour unchanged; this is
+        // a new, narrow, fully self-contained failure mode with its own
+        // spine-side recovery (see receive_partial()'s dedup fallback in
+        // pipe-expert-dispatcher.cpp), not a general relaxation of that rule.
+        if (type == PIPE_EXPERT_DISPATCH_ACTS_REF) {
+            try {
+                if (!worker.has_split_dispatch()) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "expert dispatch ACTS_REF has no BEGIN");
+                }
+                const pipe_expert_dispatch_acts_ref ref =
+                    pipe_decode_expert_dispatch_acts_ref(payload.data(), payload.size());
+                if (ref.n_tokens != worker.split_n_tokens()) {
+                    throw pipe_protocol_error(PIPE_ERR_BAD_FRAME,
+                                              "expert dispatch ACTS_REF n_tokens does not match BEGIN");
+                }
+                const int32_t layer_for_shm = split_log_begin.layer;
+                std::string   sub_error;
+                std::optional<std::vector<float>> acts_vec = wp_dedup::subscribe(
+                    seq_id, layer_for_shm, ref.n_tokens, (uint32_t) mine.n_embd, sub_error);
+                if (!acts_vec.has_value()) {
+                    std::fprintf(stderr,
+                                 "wp-expert-worker: dedup subscribe failed (seq=%llu layer=%d): %s\n",
+                                 (unsigned long long) seq_id, layer_for_shm, sub_error.c_str());
+                    worker.abandon_split_dispatch();
+                    if (!pipe_send_error(socket, seq_id, PIPE_ERR_ACTS_UNAVAILABLE, sub_error)) {
+                        return 1;
+                    }
+                    continue;
+                }
+                wp_dedup::release(seq_id, layer_for_shm);
+                pipe_expert_dispatch_acts acts;
+                acts.activations = std::move(*acts_vec);
+                const pipe_expert_partial response = worker.finish_split_dispatch(
+                    acts, seq_id, split_log_stats);
+                const auto split_send_started = worker.stats_enabled()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                const std::vector<uint8_t> encoded = pipe_encode_expert_partial(response);
+                if (!pipe_send_frame(socket, PIPE_EXPERT_PARTIAL, seq_id,
+                                     encoded.data(), encoded.size())) {
+                    return 1;
+                }
+                if (worker.stats_enabled()) {
+                    split_log_stats.ns_send = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - split_send_started).count();
+                    worker.record_stats(split_log_stats, split_log_begin.assignments.size());
+                }
+                write_req_log(split_log_begin.layer, split_log_begin.n_tokens,
+                              split_log_begin.assignments.size(), split_log_stats, split_log_started);
+                split_log_started = std::chrono::steady_clock::time_point{};
+                worker.spec_pagein_after_dispatch();
+            } catch (const pipe_protocol_error & error) {
+                pipe_send_error(socket, seq_id, error.code, error.what());
+                return 1;
+            } catch (const std::exception & error) {
+                pipe_send_error(socket, seq_id, PIPE_ERR_EXPERT_COMPUTE, error.what());
+                return 1;
+            }
+            continue;
+        }
+#endif // __linux__
         if (worker.has_split_dispatch()) {
             pipe_send_error(socket, seq_id, PIPE_ERR_BAD_FRAME,
                             "frame is not legal between dispatch BEGIN and ACTS");

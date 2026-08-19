@@ -218,6 +218,38 @@ const bool s_slice_encode_once = [] {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }();
 
+// WP_DISPATCH_DEDUP_ACTIVATIONS=1: DEFAULT OFF. See the PIPE_VERSION 14 comment
+// block in pipe-protocol.h and dedup_publish_and_ref() below for the full
+// design. One-line version: on a SLICED layer wide enough to matter, two or
+// more workers on the SAME machine (worker_info::machine) need the identical
+// full activation tensor -- measured 2026-08-19, s1+s2 on 192.168.1.33 each
+// pulled their own 1633 MB copy of one 2322-token prefill's activations over
+// the SAME 1 GbE link, 3266 MB for bytes that only needed to cross the wire
+// once. This sends the tensor to ONE worker on the machine and has it publish
+// to a local POSIX shm segment the rest read directly, instead of paying the
+// wire cost twice.
+const bool s_dedup_activations = [] {
+    const char * value = std::getenv("WP_DISPATCH_DEDUP_ACTIVATIONS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}();
+
+// WP_DISPATCH_DEDUP_MIN_TOKENS: only engage dedup when n_tokens exceeds this.
+// Default 32, matching WP_DEFER_MAX_WIDTH's decode/prefill boundary elsewhere
+// in this file. Decode (a spec-verify batch, a few tokens wide) gains nothing
+// -- the remote workers already finish before the local one and their wire
+// time is hidden -- and every synchronization this mechanism adds (the
+// publish-ack round trip, the shm rendezvous) is pure downside on a path this
+// latency-sensitive. Prefill (hundreds to thousands of tokens) is where the
+// multi-megabyte-per-worker cost above actually lives.
+const uint32_t s_dedup_min_tokens = [] {
+    const char * value = std::getenv("WP_DISPATCH_DEDUP_MIN_TOKENS");
+    if (value == nullptr || value[0] == '\0') {
+        return (uint32_t) 32;
+    }
+    const long parsed = std::atol(value);
+    return parsed > 0 ? (uint32_t) parsed : (uint32_t) 32;
+}();
+
 // WP_ISSUE_WIDEST_FIRST=1: order the per-layer wire SEND so the widest-slice
 // worker (most expert-compute, the long pole) is issued earliest. Bit-exact:
 // only the send/enqueue order changes; planning, harvest, and the fixed-order
@@ -511,6 +543,22 @@ struct dispatcher::impl {
         // narrower batch and returns a narrower partial. That keeps PIPE_VERSION
         // at 4 and means no worker rebuild.
         std::vector<uint32_t>               token_ids;
+
+        // WP_DISPATCH_DEDUP_ACTIVATIONS (see dedup_publish_and_ref()). Set only
+        // for requests this mechanism sent as PIPE_EXPERT_DISPATCH_ACTS_REF
+        // instead of a normal ACTS. already_issued tells issue_requests() this
+        // request's BEGIN+ACTS(-variant) pair was already put on the wire by
+        // dedup_publish_and_ref() -- issue_requests must not send it again.
+        bool                                 already_issued        = false;
+        bool                                 dedup_role_secondary  = false;
+        // At most one retry per request; see receive_partial's fallback branch.
+        bool                                 dedup_retried         = false;
+        // Ordinary (non-dedup) ACTS payload for the SAME activations this
+        // request's ACTS_REF pointed at, built once at plan time so the
+        // fallback in receive_partial never has to re-touch `activations` or
+        // re-derive anything -- it resends literally the bytes this request
+        // would have carried had dedup never been attempted.
+        std::vector<uint8_t>                dedup_fallback_acts_payload;
     };
 
     struct temporal_layer_stats {
@@ -611,6 +659,21 @@ struct dispatcher::impl {
     // writer threads instead of blocking send() on the dispatch thread.
     bool                                                async_issue = false;
     bool                                                split_frame = false;
+    // WP_DISPATCH_DEDUP_ACTIVATIONS latch. Requires split_frame (the mechanism
+    // extends the BEGIN/ACTS split with two more per-machine-role ACTS
+    // variants) and is incompatible with async_issue's writer-thread queue --
+    // dedup_publish_and_ref() does its own synchronous send+recv of the
+    // publish ack on the dispatch thread, which a writer thread could reorder
+    // against. Both are enforced where dedup_activations is latched, in the
+    // constructor, so a request never has to re-check them.
+    bool                                                dedup_activations = false;
+    uint32_t                                            dedup_min_tokens_ = 32;
+    // machine -> indices into `workers` sharing that machine, precomputed once
+    // (machine membership is a property of the worker set, not of any one
+    // dispatch). Only machines with >= 2 workers matter to dedup; kept as a
+    // plain map indexed by machine string, filtered per-layer against which of
+    // those workers are actually covering the layer being dispatched.
+    std::map<std::string, std::vector<size_t>>          machine_workers_;
     // Per-worker static-assign weight (D6.3), default 1 = current behaviour.
     // WP_DISPATCH_WEIGHTS="port=w[,port=w...]" and the sugar
     // WP_DISPATCH_BIAS_1070=N (port 8803). Indexed by workers[] index.
@@ -655,6 +718,16 @@ struct dispatcher::impl {
         const int connect_retry_s = dispatch_connect_retry_seconds();
         const auto connect_deadline = dispatch_clock::now() + std::chrono::seconds(connect_retry_s);
         split_frame = split_frame_enabled();
+        // See the field comment: dedup requires split_frame and is mutually
+        // exclusive with async_issue by construction, not by a runtime check
+        // on the dispatch path.
+        dedup_activations = s_dedup_activations && split_frame && !async_issue;
+        dedup_min_tokens_ = s_dedup_min_tokens;
+        if (s_dedup_activations && !dedup_activations) {
+            std::fprintf(stderr,
+                         "expert dispatch: WP_DISPATCH_DEDUP_ACTIVATIONS requested but disabled "
+                         "(requires WP_SPLIT_FRAME=1 and WP_ASYNC_ISSUE unset)\n");
+        }
         stats_logging = dispatch_stats_enabled();
         collect_stats = stats_logging || speed_split;
         defer_k_value     = parse_wp_defer_k();
@@ -799,6 +872,9 @@ struct dispatcher::impl {
                              [&](size_t a, size_t b) { return width(a) > width(b); });
         }
 
+        for (size_t i = 0; i < workers.size(); ++i) {
+            machine_workers_[workers[i].info.machine].push_back(i);
+        }
         build_routes();
         parse_worker_weights();
         if (decode_prefer_port_ > 0 && decode_max_tokens_ > 0) {
@@ -1832,6 +1908,159 @@ struct dispatcher::impl {
         return sent;
     }
 
+    // WP_DISPATCH_DEDUP_ACTIVATIONS. `requests` is plan_requests()'s IMMEDIATE
+    // output for one layer -- one entry per worker with a non-empty
+    // assignment. Group requests by machine; for every machine with >= 2
+    // members here, elect the lowest worker_index as PRIMARY and send it the
+    // full activations with a publish request. Synchronously await that
+    // primary's publish ack (this call blocks on the primary's socket) BEFORE
+    // sending anything to the rest of the group ("secondaries"):
+    //
+    //   ack.success == true  -> secondaries get PIPE_EXPERT_DISPATCH_ACTS_REF
+    //                           (no activation bytes; they read the shm the
+    //                           primary just published).
+    //   ack.success == false -> secondaries get the ORDINARY full ACTS, i.e.
+    //                           today's path, exactly as if dedup had never
+    //                           been attempted for this group. Zero secondary-
+    //                           side risk: nothing was ever promised to them.
+    //
+    // WHY THE ACK MUST BE AWAITED BEFORE THE REF IS SENT (this is the whole
+    // safety argument, not an optimisation detail). The primary sets its shm
+    // segment's ready flag and unlinks-on-last-out using a refcount seeded at
+    // publish time; it can only send PIPE_EXPERT_ACTS_PUBLISH_ACK AFTER that
+    // segment exists and is marked ready (see the ACTS_PUBLISH handler in
+    // wp-expert-worker.cpp). The spine's own program order then makes it
+    // impossible to send a REF before that ack has been read on THIS thread --
+    // there is no race to win, because there is nothing to race: the REF is
+    // simply never sent until the fact it depends on is already true. A
+    // secondary can therefore only ever open a segment that has already been
+    // created and marked ready by the time the REF that names it exists. The
+    // remaining failure mode (secondary-side shm_open/mmap failure despite the
+    // segment being real and ready -- a purely local fault: permissions,
+    // memory pressure, a kernel shm limit) is handled by the retry in
+    // receive_partial(), not here.
+    //
+    // COST OF THIS ORDERING: the primary's publish-ack round trip is
+    // synchronous on the dispatch thread, so secondaries in a dedup group are
+    // issued strictly after the primary's ack, not concurrently with it. That
+    // ack is small (2 bytes of payload) and local-ish (one 1 GbE round trip to
+    // the SAME machine the bytes were already being sent to), which is why
+    // this is gated to n_tokens > WP_DISPATCH_DEDUP_MIN_TOKENS -- at that
+    // width the ack's cost is noise next to the multi-hundred-KB-to-multi-MB
+    // per-worker payload it is replacing.
+    //
+    // BIT-EXACTNESS. layer_is_slice callers only: in slice mode every covering
+    // worker's wire activations are the FULL, un-gathered [n_tokens x n_embd]
+    // tensor (WP_DISPATCH_UNION measured tokens_needed==100% for exactly this
+    // reason -- see the PIPE_VERSION 14 comment in pipe-protocol.h), so the
+    // primary and every secondary in a machine group are computing on
+    // byte-identical activations by construction: the secondary's copy IS the
+    // primary's copy, read out of the same shm bytes the primary wrote, not a
+    // re-encode. request.token_ids must be empty for every group member or
+    // this function declines the whole group (defensive; should be
+    // unreachable for a slice-mode layer under WP_DISPATCH_GATHER, which never
+    // fires there, but this is not the place to assume that silently).
+    void dedup_publish_and_ref(std::vector<planned_request> & requests, uint64_t seq_id,
+                               int32_t layer, uint32_t n_tokens,
+                               const std::vector<float> & activations) {
+        if (!dedup_activations || n_tokens <= dedup_min_tokens_ || !layer_slice_mode.at(layer)) {
+            return;
+        }
+        std::map<std::string, std::vector<size_t>> groups; // machine -> indices into `requests`
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (!requests[i].token_ids.empty()) {
+                // A gathered (compacted) request on a layer this function
+                // otherwise treats as slice-mode-identical. Should not happen
+                // (see the comment above) but bit-exactness is not something
+                // to gamble on: skip dedup for this request's worker entirely
+                // by simply never adding it to a group.
+                continue;
+            }
+            groups[workers[requests[i].worker_index].info.machine].push_back(i);
+        }
+        for (auto & [machine, idxs] : groups) {
+            if (idxs.size() < 2) {
+                continue; // nothing co-located this round; ordinary path.
+            }
+            std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) {
+                return requests[a].worker_index < requests[b].worker_index;
+            });
+            const size_t primary_i = idxs.front();
+            planned_request & primary = requests[primary_i];
+            worker &          primary_worker = workers[primary.worker_index];
+
+            pipe_expert_dispatch_acts_publish publish;
+            publish.n_subscribers = (uint32_t) (idxs.size() - 1);
+            publish.activations   = activations; // one copy; see below for why.
+            const std::vector<uint8_t> publish_payload = pipe_encode_expert_dispatch_acts_publish(publish);
+
+            if (!pipe_send_frame(*primary_worker.socket, PIPE_EXPERT_DISPATCH_BEGIN, seq_id,
+                                 primary.begin_payload.data(), primary.begin_payload.size()) ||
+                !pipe_send_frame(*primary_worker.socket, PIPE_EXPERT_DISPATCH_ACTS_PUBLISH, seq_id,
+                                 publish_payload.data(), publish_payload.size())) {
+                throw std::runtime_error("expert dispatcher failed to send dedup publish to worker " +
+                                         primary_worker.info.endpoint);
+            }
+            note_in_flight_delta(+1);
+            ++stats.requests_issued;
+            primary.already_issued = true;
+
+            // Synchronous: block on the primary's own ack before touching any
+            // secondary. This frame is NOT the primary's PIPE_EXPERT_PARTIAL --
+            // that is awaited later, normally, through the regular harvest
+            // path, exactly like every other request in `requests`.
+            pipe_frame_type      ack_type;
+            uint64_t             ack_seq = 0;
+            std::vector<uint8_t> ack_payload;
+            if (!pipe_recv_frame(*primary_worker.socket, ack_type, ack_seq, ack_payload)) {
+                throw std::runtime_error("expert dispatcher worker " + primary_worker.info.endpoint +
+                                         " died while publishing dedup activations");
+            }
+            if (ack_seq != seq_id || ack_type != PIPE_EXPERT_ACTS_PUBLISH_ACK) {
+                throw std::runtime_error("expert dispatcher worker " + primary_worker.info.endpoint +
+                                         " sent an unexpected frame in place of the dedup publish ack");
+            }
+            const pipe_expert_acts_publish_ack ack =
+                pipe_decode_expert_acts_publish_ack(ack_payload.data(), ack_payload.size());
+
+            // Built once regardless of ack.success: needed as the fallback
+            // payload on every secondary either way (immediately, if the
+            // publish failed; later from receive_partial, if a secondary's
+            // own shm read fails despite success). Same bytes primary just
+            // published -- pipe_encode_expert_dispatch_acts encodes the exact
+            // same `activations` vector, not a re-derivation.
+            pipe_expert_dispatch_acts plain;
+            plain.activations = activations;
+            const std::vector<uint8_t> fallback_payload = pipe_encode_expert_dispatch_acts(plain);
+
+            pipe_expert_dispatch_acts_ref ref;
+            ref.n_tokens = n_tokens;
+            const std::vector<uint8_t> ref_payload = pipe_encode_expert_dispatch_acts_ref(ref);
+
+            for (size_t k = 1; k < idxs.size(); ++k) {
+                planned_request & secondary = requests[idxs[k]];
+                worker &          secondary_worker = workers[secondary.worker_index];
+                secondary.dedup_role_secondary       = ack.success;
+                secondary.dedup_fallback_acts_payload = fallback_payload;
+                const bool sent =
+                    pipe_send_frame(*secondary_worker.socket, PIPE_EXPERT_DISPATCH_BEGIN, seq_id,
+                                    secondary.begin_payload.data(), secondary.begin_payload.size()) &&
+                    (ack.success
+                         ? pipe_send_frame(*secondary_worker.socket, PIPE_EXPERT_DISPATCH_ACTS_REF, seq_id,
+                                           ref_payload.data(), ref_payload.size())
+                         : pipe_send_frame(*secondary_worker.socket, PIPE_EXPERT_DISPATCH_ACTS, seq_id,
+                                           fallback_payload.data(), fallback_payload.size()));
+                if (!sent) {
+                    throw std::runtime_error("expert dispatcher failed to send dedup request to worker " +
+                                             secondary_worker.info.endpoint);
+                }
+                note_in_flight_delta(+1);
+                ++stats.requests_issued;
+                secondary.already_issued = true;
+            }
+        }
+    }
+
     void issue_requests(std::vector<planned_request> & requests, uint64_t seq_id) {
         // WP_ISSUE_WIDEST_FIRST: walk `requests` in issue_order (widest slice
         // first) so the long-pole worker's bytes hit the wire earliest. requests
@@ -1849,6 +2078,15 @@ struct dispatcher::impl {
                 continue;
             }
             planned_request & request = *req_ptr;
+            if (request.already_issued) {
+                // WP_DISPATCH_DEDUP_ACTIVATIONS already put this request's
+                // BEGIN+ACTS(-variant) on the wire synchronously in
+                // dedup_publish_and_ref() (a secondary's ACTS_REF cannot be
+                // sent before its primary's publish is acknowledged, so it
+                // cannot go through this generic per-worker loop). in_flight
+                // and stats.requests_issued were already updated there too.
+                continue;
+            }
             worker & value = workers[request.worker_index];
             const auto send_frame = [&](pipe_frame_type type, const std::vector<uint8_t> & payload) {
                 if (!layer_trace_enabled()) {
@@ -1958,7 +2196,52 @@ struct dispatcher::impl {
         request.await_started_at = wp_await_t0;
         const dispatch_clock::time_point recv_started =
             layer_trace_enabled() ? dispatch_clock::now() : dispatch_clock::time_point{};
-        const pipe_frame_type type = await_response(request, seq_id, payload);
+        uint64_t         wanted_seq_id = seq_id;
+        pipe_frame_type  type          = await_response(request, wanted_seq_id, payload);
+        // WP_DISPATCH_DEDUP_ACTIVATIONS FALLBACK. A secondary sent
+        // PIPE_EXPERT_DISPATCH_ACTS_REF answers PIPE_ERR_ACTS_UNAVAILABLE,
+        // never a partial, when its bounded local wait on the shm segment came
+        // up empty (see the frame's handler in wp-expert-worker.cpp). That is
+        // the ONE failure mode this mechanism is allowed to have: the primary
+        // already confirmed (PIPE_EXPERT_ACTS_PUBLISH_ACK, awaited BEFORE this
+        // REF was ever sent -- see dedup_publish_and_ref()) that the segment
+        // was published and ready, so a secondary that still cannot read it is
+        // hitting a purely LOCAL fault (permissions, memory pressure, a kernel
+        // shm limit) with no route to a correct answer over this frame. Retry
+        // ONCE, same worker, ordinary inline bytes -- exactly what would have
+        // been sent had dedup never been attempted for this one request. This
+        // is the ONLY place fallback happens; it is deliberately NOT triggered
+        // by a general PIPE_ERROR (a real protocol/compute error on a normal
+        // request must still throw, never silently retry with different
+        // bytes) and it is bounded to one attempt so a wedged worker still
+        // fails loudly rather than looping.
+        if (type == PIPE_ERROR && request.dedup_role_secondary && !request.dedup_retried) {
+            const pipe_error probe = pipe_decode_error(payload.data(), payload.size());
+            if (probe.code == (uint32_t) PIPE_ERR_ACTS_UNAVAILABLE) {
+                request.dedup_retried = true;
+                worker & value = workers[request.worker_index];
+                // Bit-exactness: dedup_fallback_acts_payload was encoded from the
+                // SAME `activations` slice the primary published, at plan time --
+                // this is not a re-derivation, it is the untouched fallback copy
+                // this mechanism exists to make available. See
+                // dedup_publish_and_ref() for where it is populated.
+                const uint64_t retry_seq = wanted_seq_id | (1ull << 63);
+                note_in_flight_delta(+1);
+                const bool sent =
+                    pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_BEGIN, retry_seq,
+                                    request.begin_payload.data(), request.begin_payload.size()) &&
+                    pipe_send_frame(*value.socket, PIPE_EXPERT_DISPATCH_ACTS, retry_seq,
+                                    request.dedup_fallback_acts_payload.data(),
+                                    request.dedup_fallback_acts_payload.size());
+                if (!sent) {
+                    throw std::runtime_error("expert dispatcher worker " + value.info.endpoint +
+                                             " failed to send the dedup fallback for expert(s) " +
+                                             assignment_experts(request.assignments));
+                }
+                wanted_seq_id = retry_seq;
+                type = await_response(request, wanted_seq_id, payload);
+            }
+        }
         if (layer_trace_enabled()) {
             add_layer_trace(layer, &layer_trace_stats::recv_ns,
                             elapsed_ns(recv_started, dispatch_clock::now()));
@@ -2408,6 +2691,14 @@ struct dispatcher::impl {
             // all deferred. Both batches share this layer's seq_id; TCP FIFO per
             // socket plus await_response's seq_id check disambiguate. Do not
             // invent a separate seq_id band — a mismatch throws loudly.
+            // WP_DISPATCH_DEDUP_ACTIVATIONS: only the immediate set. Deferred
+            // requests (WP_DEFER_K > 0) are a decode/spec-verify mechanism
+            // (width-gated to n_tokens <= WP_DEFER_MAX_WIDTH, default 32) and
+            // dedup is gated to n_tokens > WP_DISPATCH_DEDUP_MIN_TOKENS
+            // (default 32) -- the two windows do not overlap in practice, and
+            // folding dedup into the deferred-fold's own cross-layer bookkeeping
+            // is not a safe thing to do without its own dedicated design.
+            dedup_publish_and_ref(imm_requests, seq_id, layer, n_tokens, activations);
             issue_requests(imm_requests, seq_id);
             if (!def_requests.empty()) {
                 issue_requests(def_requests, seq_id);
