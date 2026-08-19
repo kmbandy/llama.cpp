@@ -59,7 +59,8 @@ S1=/mnt/nvme/ds4-eslice/slice1                   # 1070   width 320  (2026 NVMe)
 S2=/mnt/nvme/ds4-eslice/slice2                   # RX480  width 320  (2026 NVMe)
 D0=/home/kmbandy/models/DS4-eshard-dspark        # dspark experts 0-84   (real blobs)
 D1=/home/kmbandy/models/DS4-eshard-main-dspark   # dspark experts 85-255 (symlinks)
-SLOTS_S0=${SLOTS_S0:-3350}   # 3350*9.19MB = 30.8GB of 32GB (R9700)
+SLOTS_S0=${SLOTS_S0:-3450}   # 3450*9.19MB = 31.7GB of 32GB (R9700). Raised from
+                             # 3350 on 2026-08-19: ~1.9GB was sitting unused, take ~1GB.
 SLOTS_S1=${SLOTS_S1:-3750}   # 3750*2.09MB = 7.84GB of 8GB (1070)
 SLOTS_S2=${SLOTS_S2:-3900}   # 3900*2.09MB = 8.15GB of 8GB (RX480 + vidmem cap)
 SLOTS_D0=${SLOTS_D0:-85}
@@ -760,7 +761,7 @@ echo "=== SLICED workers: s0 R9700:8801 | s1 1070:8803 | s2 RX480:8804 | d0 CPU:
 # The CPU workers (d0/d1) get neither: their experts are already in RAM.
 #
 # --- s0: R9700 (ROCm0) slice0 w1408, layers 0-42 ---
-main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
+main_sh "cd $MAIN_REPO && { env WP_WORKER_STATS=$WSTATS $WPRE ${HOSTVICTIM_MAIN:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_MAIN }${HOSTSPEC_MAIN:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_MAIN }${SPEC_MAX_SLOTS_MAIN:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_MAIN }setsid nohup stdbuf -o0 -e0 ./build-hip/bin/llama-wp-expert-worker \
     --shard-manifest $S0/ds4-s0-experts-experts-manifest-dspark.json \
     --descriptor $S0/ds4-s0-experts-experts-manifest-dspark.expert-descriptor.json \
     --device ROCm0 --listen 0.0.0.0:8801 --slots $SLOTS_S0 > $OUT/w-s0.log 2>&1 < /dev/null & echo \$! > $OUT/w-s0.pid; }"
@@ -791,7 +792,7 @@ D1_PID=$(main_sh "cat $OUT/w-d1.pid" 2>/dev/null); LOCAL_PIDS="$LOCAL_PIDS $D1_P
 echo "  w-d1 (CPU 85-255) pid ${D1_PID:-?}"
 
 # --- s1: 2026 GTX 1070 (CUDA0) slice1 w320, layers 0-42 ---
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S1/ds4-s1-experts-experts-manifest-dspark.json \
     --descriptor $S1/ds4-s1-experts-experts-manifest-dspark.expert-descriptor.json \
     --device CUDA0 --listen 0.0.0.0:8803 --slots $SLOTS_S1 > $OUT/w-s1.log 2>&1 < /dev/null & echo \$! > $OUT/w-s1.pid; }"
@@ -802,7 +803,7 @@ echo "  w-s1 (1070) pid ${S1_PID:-?} on 2026"
 # --- s2: 2026 RX 480 (Vulkan0) slice2 w320, layers 0-42 ---
 # The 480 has a 256 MB BAR and no ReBAR; without the host-visible-vidmem cap ~95%
 # of its slots spill into GTT and every matmul streams over PCIe (doc §1/§2).
-w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
+w2026_sh "cd $REPO_2026 && { env WP_WORKER_STATS=$WSTATS $WPRE WP_KEEPALIVE_US=200 GGML_VK_HOST_VISIBLE_VIDMEM_MAX_BYTES=1048576 ${WP_HIP_GRAPHS:+WP_HIP_GRAPHS=$WP_HIP_GRAPHS }${HOSTVICTIM_2026:+WP_EXPERT_HOST_VICTIM_BYTES=$HOSTVICTIM_2026 }${HOSTSPEC_2026:+WP_EXPERT_HOST_SPEC_BYTES=$HOSTSPEC_2026 }${SPEC_MAX_SLOTS_2026:+WP_EXPERT_SPEC_MAX_SLOTS=$SPEC_MAX_SLOTS_2026 }setsid nohup stdbuf -o0 -e0 ./build-army-cachy/bin/llama-wp-expert-worker \
     --shard-manifest $S2/ds4-s2-experts-experts-manifest-dspark.json \
     --descriptor $S2/ds4-s2-experts-experts-manifest-dspark.expert-descriptor.json \
     --device Vulkan0 --listen 0.0.0.0:8804 --slots $SLOTS_S2 > $OUT/w-s2.log 2>&1 < /dev/null & echo \$! > $OUT/w-s2.pid; }"

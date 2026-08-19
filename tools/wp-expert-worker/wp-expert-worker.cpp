@@ -2330,6 +2330,14 @@ public:
                 ++slot.pin_count;
                 slot.tick = ++tick_;
                 ++slot.uses;
+                // Promotion: a demand hit on a still-unconfirmed speculative
+                // slot confirms the guess. It stops counting against
+                // WP_EXPERT_SPEC_MAX_SLOTS from this point on, same as the
+                // pager's speculative_[slot]=0 on a demand hit (wp-pool.cpp).
+                if (slot.spec_pending) {
+                    slot.spec_pending = false;
+                    --n_spec_pending_;
+                }
                 batch.entries_[i] = {
                     // raw->data, NOT the buffer base: one arena backs many slots,
                     // so the buffer base is slot 0's address for every slot.
@@ -2452,6 +2460,14 @@ public:
                         // map entry (the defensive check in find_slot catches a
                         // stale hit, but there is no reason to rely on it here).
                         slot_index_.erase(slot_key(slot.key.first, slot.key.second));
+                        // Evicted before a demand hit ever confirmed it: the
+                        // unconfirmed-speculative occupancy this slot held ends
+                        // here, whether it is being evicted to serve a demand
+                        // page-in or another speculative one (WP_EXPERT_SPEC_MAX_SLOTS).
+                        if (slot.spec_pending) {
+                            slot.spec_pending = false;
+                            --n_spec_pending_;
+                        }
                     }
                     slot.valid = false;
 
@@ -2691,6 +2707,24 @@ public:
         }
         if (cold.empty()) {
             return 0;
+        }
+        // WP_EXPERT_SPEC_MAX_SLOTS: cap CONCURRENT occupancy of unconfirmed
+        // speculative pages against the pool, ported from wp-pager.cpp:860's
+        // xlayer_max_slots_/n_speculative() budget check. Clamp the chunk to
+        // the remaining budget HERE, before any read is issued -- not submit
+        // then free, which would pay for a read only to throw it away.
+        // Default 0 = uncapped = byte-identical to today.
+        if (spec_max_slots_ > 0) {
+            const size_t cap = (size_t) spec_max_slots_;
+            const size_t budget = cap > n_spec_pending_ ? cap - n_spec_pending_ : 0;
+            if (budget == 0) {
+                ++spec_blocked_budget_;
+                return 0;
+            }
+            if (cold.size() > budget) {
+                cold.resize(budget);
+                spec_leases_.resize(budget);
+            }
         }
         try {
             // measure=false: a speculative read's cost belongs to the spec
@@ -3006,6 +3040,14 @@ private:
                     slot.uses        = 0;
                     slot.lease_until = evictions_ +
                         (i < spec_leases_.size() ? spec_leases_[i] : spec_lease_);
+                    // This landed page has not been touched by any demand
+                    // request yet -- mark it unconfirmed-speculative for
+                    // WP_EXPERT_SPEC_MAX_SLOTS. Guarded on !spec_pending so a
+                    // slot can never be double-counted.
+                    if (!slot.spec_pending) {
+                        slot.spec_pending = true;
+                        ++n_spec_pending_;
+                    }
                 }
             }
         } catch (const std::exception &) {
@@ -3021,6 +3063,10 @@ public:
     uint64_t spec_pageins()  const { return spec_pageins_; }
     uint64_t spec_bytes()  const { return spec_bytes_; }
     uint64_t spec_errors() const { return spec_errors_; }
+    // Live occupancy against WP_EXPERT_SPEC_MAX_SLOTS, and how many times
+    // submission was blocked or shrunk by it.
+    size_t   n_spec_pending()     const { return n_spec_pending_; }
+    uint64_t spec_blocked_budget() const { return spec_blocked_budget_; }
 
     // BORROWED, NOT OWNED -- the Worker opens WP_HINT_LOG and outlives the pool.
     //
@@ -3091,6 +3137,16 @@ private:
         int                 pin_count = 0;
         bool                reserved  = false;
         bool                valid     = false;
+        // Set true ONLY by retire_spec_batch, when a speculative page-in lands
+        // and has not yet been confirmed by a demand hit. Cleared (with the
+        // matching n_spec_pending_ decrement) at exactly the two places that end
+        // that state: the demand-hit path in ensure_batch (promotion -- the page
+        // was actually wanted) and the victim-eviction path in ensure_batch
+        // (the slot's content is discarded before it was ever confirmed). Backs
+        // WP_EXPERT_SPEC_MAX_SLOTS -- see n_spec_pending_ for why this must be
+        // exact rather than inferred from lease_until (a lease can expire while
+        // the page is still sitting there unconfirmed, and that must still count).
+        bool                spec_pending = false;
     };
 
     // (layer, expert) -> uint64 for slot_index_. Same packing as SPINE's
@@ -4028,6 +4084,34 @@ private:
         const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 4;
         return v > 0 ? (uint64_t) v : (uint64_t) 0;
     }();
+    // WP_EXPERT_SPEC_MAX_SLOTS -- cap on how many pool slots may concurrently
+    // hold an UNCONFIRMED speculative page (a page landed by spec_pagein_submit
+    // that no demand hit has touched yet). Ported from the sister subsystem's
+    // xlayer_max_slots_ (wp-pager.cpp): same idea, VRAM-slot pool instead of
+    // wp-pager's. Speculative and demand pages share ONE pool here with no cap
+    // at all -- measured 2026-08-19: 5,845 speculative page-ins against a
+    // 3,350-slot pool (1.7x the pool) with monotonically decaying throughput
+    // (3.016 -> 2.256 -> 1.767 t/s) versus no decay with prefetch off. DEFAULT 0
+    // = UNCAPPED = today's behaviour exactly; the operator sets this explicitly.
+    // A slot count, not a rate: enforced once, at submission, against a live
+    // occupancy count (n_spec_pending_), never against a moving window.
+    const long                 spec_max_slots_ = [] {
+        const char * e = std::getenv("WP_EXPERT_SPEC_MAX_SLOTS");
+        const long   v = (e != nullptr && e[0] != '\0') ? strtol(e, nullptr, 10) : 0;
+        return v > 0 ? v : 0;
+    }();
+    // Live count of pool slots currently holding an unconfirmed speculative
+    // page -- i.e. slots with spec_pending==true. Maintained at every site that
+    // makes a slot speculative (retire_spec_batch), promotes one (the demand-hit
+    // branch in ensure_batch), or evicts one (the victim-eviction branch in
+    // ensure_batch). Do not read this as "leased": a lease can expire while the
+    // page is still occupying the slot unconfirmed, and that must still count
+    // against the budget until the slot is either hit or evicted.
+    size_t                      n_spec_pending_ = 0;
+    // Times spec_pagein_submit refused to submit (or had to shrink a chunk)
+    // because WP_EXPERT_SPEC_MAX_SLOTS was already spent. Surfaced on the
+    // WP_HINT_LOG counter line so the cap binding is visible.
+    uint64_t                    spec_blocked_budget_ = 0;
     // The one speculative batch that may be in flight. Holding the Batch holds
     // its slot pins, which is what stops an in-flight read's slot from being
     // recycled underneath it.
@@ -4641,6 +4725,7 @@ public:
                       "host_landed=%llu host_bytes=%llu host_errors=%llu "
                       "host_promoted=%llu host_wasted=%llu "
                       "host_skip[bad/pin/vram/tier]=%llu/%llu/%llu/%llu "
+                      "spec_cap[pending/blocked_budget]=%zu/%llu "
                       "pump[calls/gated/hbusy/hempty/hsubmit/hfiltered/vbusy/vempty/vsubmit]="
                       "%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu",
                       (unsigned long long) hint_frames_,
@@ -4663,6 +4748,8 @@ public:
                       (unsigned long long) pool_.host_skip_pin(),
                       (unsigned long long) pool_.host_skip_vram(),
                       (unsigned long long) pool_.host_skip_tier(),
+                      pool_.n_spec_pending(),
+                      (unsigned long long) pool_.spec_blocked_budget(),
                       (unsigned long long) pump_calls_,
                       (unsigned long long) pump_gated_,
                       (unsigned long long) pump_host_busy_,
