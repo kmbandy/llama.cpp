@@ -684,6 +684,24 @@ rm -f "$OUT"/w-*.log; main_sh "rm -f $OUT/w-*.log"; w2026_sh "rm -f $OUT/w-*.log
 # its life, which is why it always looked like a startup race rather than a
 # teardown one. It only bites when arms run back to back, which is exactly what
 # a sweep does and what a single manual run never did.
+# REAP SURVIVORS FIRST, THEN WAIT.
+#
+# The wait below is correct but was PURELY PASSIVE, and this path is reached
+# from ds4-stackd, which relaunches the harness on failure. So one worker that
+# outlives a cycle -- typically the 2026 pair, because a stackd restart tears
+# down the local process group but not the remote one -- makes the wait time out
+# at 120 s, abort the arm, and get relaunched, forever. Measured 2026-08-20:
+# two separate 25-minute relaunch loops (12:13-12:22 and 12:56-13:07), each
+# ended only by killing the remote workers by hand.
+#
+# This path is WORKERS_ONLY: it is about to start fresh workers on exactly these
+# ports, so anything already listening on them is stale by definition. SIGTERM
+# it and let the existing wait do what it was written for -- absorb the teardown
+# race -- instead of blocking on it.
+echo "=== reaping any surviving workers ==="
+main_sh  "pkill -f '[l]lama-wp-expert-worker' 2>/dev/null; true"
+w2026_sh "pkill -f '[l]lama-wp-expert-worker' 2>/dev/null; true"
+
 echo "=== waiting for worker ports to be free ==="
 for _ in $(seq 1 120); do
     busy=0
