@@ -3648,18 +3648,20 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // in-graph CPU dispatch op, then throws the split cgraph away. Keying on
     // nodes[0] (a fresh pointer) makes the capture cache a 100% miss.
     //
-    // Key on the full structural fingerprint (every node's name/op/type/ne/nb)
-    // so (a) the same logical segment hits across rebuilds and (b) a different
-    // n_tokens / shape is a different cache slot, not a warmup reset of the
-    // previous shape. A hash collision is safe: node_props still have to match
-    // before replay; a mismatch degrades to fallback, never a wrong graph.
+    // Key on structural fingerprint (name/op/type/ne/nb) PLUS resolved device
+    // addresses. Topology-only keys made every expert on the worker look like
+    // "same graph, new src ptrs" and took hipGraphExecUpdate — which SIGSEGV'd
+    // (2026-08-20 s0, SEGV_MAPERR, 17-expert verify union). A resident expert
+    // in the same slot now hashes to the same key and is a pure Launch.
     uint64_t h = 1469598103934665603ULL;
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (unsigned) cgraph->n_nodes);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]);
+        h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]);
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 h = ggml_cuda_graph_mix_tensor_topo(h, cgraph->nodes[i]->src[j]);
+                h = ggml_cuda_graph_mix_tensor_addrs(h, cgraph->nodes[i]->src[j]);
             } else {
                 h = ggml_cuda_graph_fnv1a_mix(h, 0);
             }
@@ -5375,12 +5377,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            // EndCapture first. Destroying the live graph/exec while the
+            // stream is still capturing, then hipGraphExecUpdate on the stale
+            // instance, is the 2026-08-20 s0 SIGSEGV (SEGV_MAPERR inside
+            // hipGraphExecUpdate <- compute_batch). HIP's GraphExec is not
+            // independent of the Graph it was instantiated from.
+            cudaGraph_t captured = nullptr;
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &captured));
+#if defined(GGML_USE_HIP)
+            if (graph->instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+            }
+#endif
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
             }
-
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            graph->graph = captured;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             if (ggml_cuda_wp_hip_graphs_enabled()) {
@@ -5402,9 +5415,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
-        if (cuda_graph_update_required) { // Update graph executable
+        // CUDA: ExecUpdate patches kernel params in the existing exec.
+        // HIP: never. hipGraphExecUpdate SIGSEGV'd on this path (s0 2026-08-20);
+        // recapture already replaced graph->graph and dropped the exec above,
+        // so Instantiate is the whole update.
+#if !defined(GGML_USE_HIP)
+        if (cuda_graph_update_required) {
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
+#endif
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
         if (ggml_cuda_wp_hip_graphs_enabled() && !cuda_graph_update_required) {
@@ -5475,7 +5494,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(
                 cuda_ctx, cgraph, &properties_src_data_ptrs_only);
 
-            if (!graph->warmup_complete) {
+            if (ggml_cuda_wp_hip_graphs_enabled()) {
+                // Key is (topo, device addrs). First visit of that identity is
+                // enough to capture — the 2-call warmup existed because the
+                // key was an ephemeral nodes[0] pointer that never repeated.
+                // Do NOT take the src-ptrs-only ExecUpdate path: that is the
+                // crash (hipGraphExecUpdate SEGV_MAPERR) and the decode
+                // regression (recapture+Update every expert instead of replay).
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required =
+                    graph->instance == nullptr || properties_changed;
+            } else if (!graph->warmup_complete) {
                 // Warmup: the first visit of a key always looks like a size
                 // change (empty -> N). The second visit of the SAME structural
                 // key is enough to arm capture — including the case where only
@@ -5493,16 +5523,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    if (ggml_cuda_wp_hip_graphs_enabled() &&
-                        properties_src_data_ptrs_only &&
-                        graph->instance != nullptr) {
-                        use_cuda_graph = true;
-                        cuda_graph_update_required = true;
-                    } else {
-                        // Properties changed - reset warmup, execute directly until stable again
-                        graph->warmup_complete = false;
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                    }
+                    graph->warmup_complete = false;
+                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;

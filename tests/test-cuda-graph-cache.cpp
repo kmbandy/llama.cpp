@@ -161,6 +161,30 @@ int main() {
         require(hx != hz, "fingerprint changes with name");
     }
 
+    {
+        ggml_tensor x = make_node("ffn_down", GGML_OP_MUL_MAT, 1408, 1);
+        ggml_tensor y = x;
+        y.data = (void *) 0x1000;
+        ggml_tensor w1 = make_node("w", GGML_OP_NONE, 1408, 2048);
+        ggml_tensor w2 = w1;
+        w1.data = (void *) 0xaaa000;
+        w2.data = (void *) 0xbbb000;
+        x.src[0] = &w1;
+        y.src[0] = &w2;
+        y.data = x.data;
+        const uint64_t seed = 1469598103934665603ULL;
+        require(ggml_cuda_graph_mix_tensor_topo(seed, &x) ==
+                    ggml_cuda_graph_mix_tensor_topo(seed, &y),
+                "same shape different expert slots is the same topology");
+        require(ggml_cuda_graph_mix_tensor_addrs(seed, &x) !=
+                    ggml_cuda_graph_mix_tensor_addrs(seed, &y),
+                "different expert slots hash as different addr identity");
+        y.src[0] = &w1;
+        require(ggml_cuda_graph_mix_tensor_addrs(seed, &x) ==
+                    ggml_cuda_graph_mix_tensor_addrs(seed, &y),
+                "same slot replays");
+    }
+
     std::printf("ok: cuda graph cache ttl + lru cap + topo identity\n");
     return 0;
 }

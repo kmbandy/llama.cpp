@@ -14,13 +14,19 @@
 //      never complete.
 //
 // Replay identity:
-//   Object pointers (src[], buffer, extra, view_src) are NOT part of
-//   capture identity. The backend scheduler rebuilds split subgraphs
-//   every compute, so those pointers never repeat. Topology is
-//   (op, type, flags, name, ne, nb, src ne/nb). Resolved device
-//   addresses (dst->data and src data) are compared separately: equal
-//   addresses can replay; address-only diffs need an update, not a
-//   topology recapture.
+//   Object pointers (src[], buffer, extra, view_src) are NOT topology.
+//   The backend scheduler rebuilds split subgraphs every compute, so
+//   those never repeat. Topology is (op, type, flags, name, ne, nb).
+//
+//   Device addresses (dst->data and src data) ARE part of the WP_HIP_GRAPHS
+//   cache key. HIP's hipGraphExecUpdate is not a safe pointer-patch: s0
+//   SIGSEGV'd SEGV_MAPERR in it (2026-08-20, compute_batch of a 17-expert
+//   verify union) after we destroyed the source graph the exec was built
+//   from. One shape-key + Update-per-expert was also why worker graphs
+//   never replayed (every layer's experts looked like "same graph, new
+//   ptrs"). Keying by (topo, addrs) makes a resident expert in the same
+//   slot a pure Launch; a new slot is a new capture. CUDA without
+//   WP_HIP_GRAPHS still keys on nodes[0] and uses ExecUpdate.
 
 #pragma once
 
@@ -107,6 +113,20 @@ inline uint64_t ggml_cuda_graph_mix_tensor_topo(uint64_t h, const ggml_tensor * 
     h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) t->flags);
     h = ggml_cuda_graph_fnv1a_bytes(h, t->ne, sizeof(t->ne));
     h = ggml_cuda_graph_fnv1a_bytes(h, t->nb, sizeof(t->nb));
+    return h;
+}
+
+// Device addresses only. Combined with mix_tensor_topo under WP_HIP_GRAPHS
+// so a resident expert in the same slot hashes to the same cache entry.
+inline uint64_t ggml_cuda_graph_mix_tensor_addrs(uint64_t h, const ggml_tensor * t) {
+    if (t == nullptr) {
+        return ggml_cuda_graph_fnv1a_mix(h, 0);
+    }
+    h = ggml_cuda_graph_fnv1a_mix(h, (uint64_t) (uintptr_t) t->data);
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * s = t->src[j];
+        h = ggml_cuda_graph_fnv1a_mix(h, s ? (uint64_t) (uintptr_t) s->data : 0);
+    }
     return h;
 }
 
